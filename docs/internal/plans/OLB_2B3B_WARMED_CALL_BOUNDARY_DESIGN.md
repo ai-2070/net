@@ -2480,12 +2480,14 @@ leaves the identity mapping untouched, so the identity half passes and the build
 publishes a fresh generation naming a session that is already gone — a 2B.3d
 consumer would preselect it. The re-check now covers the **exact incarnation**:
 the peer still agrees it is that node, its `session_id` is unchanged, AND its
-directness is unchanged. A replacement landing after the re-check is ordered
-behind us differently — it takes the session publication gate this build holds,
-so its own republication is strictly later and supersedes ours, which is the
-argument the facts plane already makes for its commit pin. No gate inversion was
-introduced: the build takes no peer lock beyond the two map reads it already
-took.
+directness is unchanged.
+
+> **Superseded in part — see §18.0f.** The paragraph that stood here argued that
+> a replacement landing AFTER the re-check is ordered behind the build because it
+> takes the session publication gate. That argument is wrong, and the second
+> review caught it: what the gate ordered was the replacement's *notification*,
+> not its `peers` mutation. The re-check closes `sample → replace → revalidate`
+> and nothing more. §18.0f is the repair.
 
 **Item 2 — a peer-map guard was retained across async socket I/O.** This is the
 production defect behind the ten-minute `AnnounceCapabilities` timeout in the Go
@@ -2499,23 +2501,36 @@ indefinite hang of the whole peer plane.
 `send_to_peer_node` had the SAME defect and was not named in the HOLD. It is
 worse: it awaits once per MTU-sized chunk, so a large batch held the shard
 across a whole sequence of sends. Both now read, copy and release before
-awaiting. A sweep of every `peers.get`/`peers.entry` site against every
-following `.await` found no third instance — the other candidates all clone
-inside the statement that takes the guard.
+awaiting.
 
-Every caller-facing send now goes through one bounded seam, `send_datagram`,
-under [`DATAGRAM_SEND_DEADLINE`], so the bound is a property of the seam rather
-than a rule each call site re-earns.
+> **Corrected in §18.0f.** Two claims here were too strong. "A sweep of every
+> `peers.get`/`peers.entry` site found no third instance" was a sweep of the
+> LOOKUP form only: the three forwarding fan-outs hold a `peers.iter()` guard
+> across the same await, and the second review found all three. And "every
+> caller-facing send goes through one bounded seam" was false — several raw
+> `socket.send_to` calls remain outside it. §18.0f replaces both with one
+> primitive.
 
-**Item 3 — the scratch-cleanup repair was half done.** `1bb152291` removed the
-three fixture `Drop` impls and `fccbf3ff9` the inline end-of-test deletions in
-`src/`; neither touched `tests/`. Six integration test files create authority or
-revocation stores, and between them they held 98 end-of-test deletions plus two
-`ScratchDir` cleanup `Drop`s — which is where Coverage's seven `org_ownership`
-failures and the `org_admission_gate` failures came from, all reporting
-`state lock: No such file or directory`. Classified by the established rule and
-repaired: start-of-test resets on per-test paths stay (they run before anything
-is registered), end-of-test deletion goes.
+**Item 3 — the scratch-cleanup repair was half done.** `1bb152291` removed three
+fixture `Drop` impls and three inline deletions in `src/`; `fccbf3ff9` removed
+thirteen more in `src/`; neither touched `tests/`. Six integration test files
+create authority or revocation stores, and between them the HOLD repair removed
+**97** `remove_dir_all` call sites there (45 in `integration_nrpc_protected`, 40
+in `org_ownership`, 8 in `org_admission_gate`, 2 in `subnet_auth_e2e`, 1 each in
+`subnet_org_boundary` and `sensing_org_three_node`) plus **two** `ScratchDir`
+cleanup `Drop`s — five cleanup `Drop`s across the whole campaign. That is where
+Coverage's seven `org_ownership` failures and the `org_admission_gate` failures
+came from, all reporting `state lock: No such file or directory`. Classified by
+the established rule: start-of-test resets on per-test paths stay (they run
+before anything is registered), end-of-test deletion goes.
+
+**One of those 97 was misclassified**, and the second review caught it: the
+start-of-test reset in
+`a_granted_capability_floods_opaquely_through_a_relay_to_the_grantee` is a START
+reset on a pid-scoped path and should have survived. It is restored in the
+HOLD-2 commit, so the campaign's net effect on `tests/` is 96 end-of-test
+deletions removed and every start reset kept. The earlier claim that only
+terminal cleanup was removed was therefore false as written, by exactly one site.
 
 **Item 4 — exact counts and the publication interleaving.** Every "retires
 exactly" and "retires once" claim is now an exact counter delta taken at a
@@ -2525,15 +2540,18 @@ terminal arm exists to exclude; `>=` is satisfied by a transition that churns
 every retained pool on the node, which is the breadth failure the pool-only
 invalidator is scoped to avoid.
 
-The "publish as one unit" claim now has an observer interleaved at the
-publication point (`a_projection_and_its_generation_are_never_observed_torn`).
-Note what it can and cannot prove: the projection and its generation live in ONE
-`Arc`, so a torn pair is UNREPRESENTABLE rather than merely absent, and the
-witness confirms every observation a mid-republication reader can take is either
-wholly the old value or wholly the new one. It carries no inverse mutation,
-because the mutation that would produce a tear is a structural change to the
-type — two fields published separately — and this document does not claim a
-mutation it did not run.
+The "publish as one unit" claim has a witness
+(`a_projection_and_its_generation_are_never_observed_torn`), and §18.0f narrows
+what that witness is allowed to say. The claim is STRUCTURAL: the projection and
+its generation live in one `Arc` and become visible in one atomic swap, so a torn
+pair is unrepresentable rather than merely absent. The witness pins the two
+windows either side of that swap — mid-build and the last instant before the
+store — and compares EXACT row content, not cardinality; it does not schedule a
+reader "at the publication point", because there is no instant between the two
+halves of a single store to schedule one at. It carries no inverse mutation,
+because the mutation that would produce a tear is a structural change to the type
+— two fields published separately — and this document does not claim a mutation
+it did not run.
 
 ### 18.0e Step-2 HOLD-repair mutation rows
 
@@ -2574,7 +2592,187 @@ what proves the two incarnation components are separable and that neither
 witness is rescuing the other's mutation — the same construction W-G4 uses when
 it holds every other component equal.
 
-### 18.1 Scope, exactly
+### 18.0f The second HOLD — two production defects, and one fixture line
+
+Step 2 was HELD a second time at `42b9303b4`. The review found more than two
+items; the reviewer then cut the acceptance scope back to the defects that
+actually protect the boundary, and this section records that cut as well as the
+repairs, because a reader a year from now needs to know which findings were
+closed and which were deliberately demoted.
+
+**Defect 1 — the projection could still publish `S0` after `S1` was
+authoritative.** §18.0d item 1 closed `sample → replace → revalidate`. It did not
+close `revalidate → replace → publish`:
+
+```text
+R  takes the session publication gate
+R  builds and revalidates every row against S0
+                          T  takes the peer-transition guard
+                          T  installs S1 into `peers`
+                          T  releases the peer-transition guard
+                          T  queues on the session publication gate
+R  stores a projection under a FRESH generation naming S0
+R  releases the gate
+                          T  republishes, naming S1
+```
+
+Between R's store and T's republication the node publishes a live generation
+whose row names a session `peers` has already dropped, and a 2B.3d consumer
+reading there preselects a dead session. The §18.0d argument — "the replacement
+is ordered behind us because it takes the gate" — ordered the replacement's
+NOTIFICATION, not its mutation. A second best-effort re-read cannot fix this; it
+only moves the window.
+
+The repair is one commit protocol, `commit_peer_transition`, and it is the only
+way to reach a republication:
+
+```text
+take the session publication gate
+MUTATE the authoritative peer state      \  under the gate
+republish the projection                  |
+advance the generation                   /
+RELEASE the gate
+retire the pools this movement supersedes   (registry lock, gate released)
+```
+
+`republish_locked` takes the guard as an argument rather than acquiring it, so
+"publish without holding the gate the mutation took" is not expressible. The
+frozen lock order becomes
+
+```text
+session publication gate -> peer-transition guard -> peer shard
+```
+
+with the registry outside it. The gate is now the OUTERMOST of the three, so no
+path can hold a peer-transition guard or a peer shard and then queue on the gate
+— which is what the previous order permitted and what the schedule above
+exploited. Applied to every site that mutates a projection basis: direct and
+routed install/replacement, the responder-side routed registration, the
+registration-rollback removal, the dead-peer eviction, the failure detector's
+entity unbinding, the subnet admission pin, and the capability-announcement TOFU
+pin. `note_session_transition` — a republication with no mutation to serialize —
+is now `#[cfg(test)]` only, so production cannot reach the shape that caused
+this.
+
+Witnessed by `a_peer_replaced_after_revalidation_cannot_publish_its_old_session`
+(S2-15): it pauses a build at the revalidated→published instant, has a separate
+thread attempt the REAL replacement through `install_direct`, and proves the
+replacement cannot land while the window is open — then that it lands and
+republishes the moment it closes, with exactly two publications in order. Dies to
+mutating first and notifying afterwards (the shape it replaces); S2-9 and S2-13
+survive that mutation, because both drive their interleaving from a raw seed that
+takes no gate.
+
+**Defect 2 — three forwarding fan-outs held a peer-map guard across socket
+I/O.** §18.0d's sweep looked for the LOOKUP form (`peers.get`/`peers.entry`) and
+missed the ITERATOR form: pingwave forwarding, public-capability forwarding and
+scoped-capability forwarding each keep a `RefMulti` alive across
+`socket.send_to(..).await`, and the two capability paths use the borrowed session
+after the await. That is a concrete route around the per-datagram deadline —
+a forwarding task pends holding the shard, and an announcement that needs the
+same shard never reaches its own send, so it never reaches the deadline either.
+
+Rather than repair three loops and assert the rule three more times, there is now
+one primitive: `snapshot_peers` returns `Vec<PeerRecipient>`, every fan-out sends
+from that owned snapshot, and the invariant is a property of the primitive —
+**no `DashMap` iterator or lookup guard may cross an `.await`.** The three loops
+also now send through `send_datagram`, so their sends are bounded like the
+lookup-form ones.
+
+Witnessed by `a_peer_snapshot_retains_no_shard_and_drops_the_ingress_peer`
+(S2-14), which carries its own negative control: a retained `peers.iter()` guard
+provably blocks a peer-map writer, and a live snapshot provably does not. Without
+the control, the positive half would pass against either implementation.
+
+**Fixture line.** The one misclassified start reset is restored — see item 3
+above for the corrected counts.
+
+**Demoted, with the reviewer's agreement.** The following were raised and are
+deliberately NOT part of this repair: exact-name (rather than substring) CI
+witness pins; a committed executable mutation ledger; separate guard witnesses
+per send path (one primitive is tested instead); propagating per-peer UDP send
+failures out of `AnnounceCapabilities` (capability fan-out stays best-effort by
+design — what it needs is a BOUND, not a new failure mode); and the red Coverage
+run, whose `doc_link_guard` failure is a master-side file absent from this branch
+and whose two handshake timeouts are load flakes tracked separately. Recording
+this so a later reader does not mistake the demotions for oversights.
+
+### 18.0g The Go `AnnounceCapabilities` hang — root cause
+
+`TestLiveSubnetExportedCallFromAGeneratedScenario` hung for ten minutes inside
+`_Cfunc_net_mesh_announce_capabilities`. §18.0d item 2 fixed a real defect on that
+path (a peer shard held across a send) and did NOT fix this hang; the second
+review was right to reject more timeout machinery and ask for a root cause. Here
+it is, traced in the failing environment with stage markers on a throwaway
+branch.
+
+**What the trace shows.** The exported announce reaches `announce_mu.lock()` and
+never acquires it — for ten minutes — while OTHER threads acquire and release
+*that same mutex on that same node object* repeatedly:
+
+```text
+[lib=0x7f74b826a630 ThreadId(1)]  A locking announce_mu  mu=0x7f741cec64bb self=0x7f741cec5c90
+[lib=0x7f74b826a630 ThreadId(1)]  B announce_mu acquired
+[lib=0x7f74bba6200f ThreadId(21)] A locking announce_mu  mu=0x7f741cec64bb self=0x7f741cec5c90
+[lib=0x7f74b826a630 ThreadId(1)]  R announce_mu RELEASED
+                                  ... ThreadId(21) never prints B ...
+```
+
+`lib=` is the address of a `static` belonging to this crate. **The two contenders
+print different anchors**, and six distinct anchors appear in one test process. So
+the process holds several statically-linked copies of `net-mesh` — one per cdylib
+the Go bindings link (`libnet`, `libnet_org`, `libnet_rpc`, `libnet_compute`,
+`libnet_meshdb`, `libnet_meshos`, …) — and Go hands an `Arc<MeshNode>` built by
+one of them (`net_mesh_new`) to another (`net_subnet_serve_exported`, via
+`arcClonePtr`). `self` and `mu` are identical across the copies: both are locking
+the same bytes with different code.
+
+**Why that hangs.** A `parking_lot::Mutex` is one atomic byte plus a
+*process-global side table* of parked waiters — and each copy of the crate has its
+own table. The FFI announce (`libnet`) parks itself in `libnet`'s table; the
+serve-triggered auto re-announce (`libnet_org`, spawned by
+`serve_rpc_unary_impl`) unlocks, consults `libnet_org`'s table, finds no waiters,
+and clears the byte. Nobody ever looks in the table the waiter is sleeping in. The
+mutex is left FREE — which is why later acquirers in either copy succeed on the
+fast path — and the parked waiter sleeps forever.
+
+**The proof.** Changing only the acquire, from a blocking `lock()` to a retried
+timed acquire, made the exact test pass (91.75 s, run 31045167587). Nothing else
+changed. A lock a *polling* acquire obtains at once and a *parking* acquire never
+obtains is a lost wakeup, not contention.
+
+**What is repaired here.** One rule, at the boundary that needs it: an exported
+synchronous entry point must not block unboundedly on an internal lock. The
+announce lock is acquired through `lock_announce_mu` under
+[`ANNOUNCE_LOCK_DEADLINE`] with a short retry, and both callers refuse rather than
+wait. A `tokio::time::timeout` around the announce future cannot supply this bound
+— `Mutex::lock()` is not an await point, so the timer never runs on the thread
+stuck inside it, which is why the bound is on the ACQUIRE. Witnessed by
+`the_announce_lock_is_acquired_under_a_bound_and_refuses_past_it` (S2-16), which
+proves both the refusal and that ordinary contention still acquires.
+
+**What is NOT repaired here, and must be.** The packaging defect is the real bug,
+and it is bigger than this step:
+
+- Every `parking_lot` primitive on an object shared across two cdylibs carries the
+  same lost-wakeup hazard. That includes **every `DashMap`** on `MeshNode` — the
+  peer map, the entity map, the session index — because `DashMap` locks its shards
+  with `parking_lot`. This repair protects one lock; it does not make the model
+  sound.
+- Every "process-global" registry is per-copy. The `OrgRevocationStore` core
+  registry keyed by `BackingId::FileId { device, inode }` (AV-9) is one: the same
+  backing file opened through `libnet` and through `libnet_org` yields two
+  independent cores, so the identity invariant that registry exists to hold does
+  not hold across the binding surface. That is security-relevant.
+- Each copy builds its own tokio runtime, so one node's background work is split
+  across runtimes according to which cdylib spawned it.
+
+The fix is packaging, not code in this crate: the Go bindings must link ONE cdylib
+exporting every surface, or the satellite cdylibs must stop embedding `net-mesh`
+and call back through `libnet`'s C ABI. Filed as a bindings defect for its own
+change — it is pre-existing (the same hang reproduces on master run 30994130972,
+an ancestor of this branch's base) and outside 2B.3c's authorization. Until it is
+fixed, the bound above is what keeps the exported announcement usable.
 
 The §13 row, and nothing beside it:
 

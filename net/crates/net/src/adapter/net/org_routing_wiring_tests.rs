@@ -7657,62 +7657,87 @@ async fn a_stable_peer_observed_twice_still_publishes_its_row() {
     );
 }
 
-/// (S2-11) **HOLD item 4 — projection content and its generation publish as ONE
-/// unit.** A reader interleaved at the publication point can never observe the
-/// new generation beside the old rows, or the new rows beside the old
-/// generation.
+/// (S2-11) A republication becomes visible in ONE store, and the generation
+/// travels inside the value it names.
 ///
-/// Final-state equality cannot prove this: both stores complete before any
-/// assertion runs, so a torn intermediate state is invisible to it. The reader
-/// here samples the published value from INSIDE the build, which is the only
-/// window in which a tear could be observed — and observes a single `Arc`,
-/// which is what makes tearing unrepresentable rather than merely absent.
+/// What this proves, exactly — and no more: every observation a reader can take
+/// while a republication is in flight is WHOLLY the old value, rows and
+/// generation together, right up to the last instant before the store. It does
+/// not schedule a reader *during* the store, because there is no during: the
+/// projection and its generation live in one `Arc` and become visible in one
+/// atomic swap, which is what makes a torn pair unrepresentable rather than
+/// merely unobserved. That structural fact is the claim; this witness pins the
+/// two windows either side of it, with EXACT row content rather than
+/// cardinality — two projections with different rows and the same count would
+/// otherwise be indistinguishable.
 #[tokio::test]
 async fn a_projection_and_its_generation_are_never_observed_torn() {
+    use crate::adapter::net::behavior::org_routing_registry::DirectEligibility;
+    type Rows = std::collections::BTreeMap<EntityId, DirectEligibility>;
     let node = node().await;
     let entity = EntityId::from_bytes([0xa1u8; 32]);
     const N: u64 = 0xa001;
     seed_peer(&node, N, true);
     node.test_pin_peer_entity(N, entity.clone());
+    // A SECOND entity, pinned but sessionless, so the rebuild about to run
+    // changes the row set rather than only the generation.
+    let arriving = EntityId::from_bytes([0xa2u8; 32]);
+    const M: u64 = 0xa002;
+    node.test_pin_peer_entity(M, arriving.clone());
+    seed_peer(&node, M, false);
 
-    // Every sample a reader can take while a republication is in flight.
-    let samples: Arc<parking_lot::Mutex<Vec<(u64, usize)>>> =
-        Arc::new(parking_lot::Mutex::new(Vec::new()));
-    {
+    // Every sample a reader can take while the next republication is in flight:
+    // one from inside the build, one from the last instant before the store.
+    type Samples = Arc<parking_lot::Mutex<Vec<(&'static str, u64, Rows)>>>;
+    let samples: Samples = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let sample = {
         let node_for_hook = node.clone();
         let samples = samples.clone();
+        move |where_: &'static str| {
+            // The lock-free reader: ONE load, so the generation and the rows it
+            // names come from one value.
+            let seen = node_for_hook.session_routing.published.load_full();
+            samples
+                .lock()
+                .push((where_, seen.generation, seen.rows.clone()));
+        }
+    };
+    {
+        let sample = sample.clone();
         node.session_routing
-            .observe_build_for_test(Arc::new(move |_| {
-                // The lock-free reader, mid-republication: ONE load, so the
-                // generation and the rows it names come from one value.
-                let seen = node_for_hook.session_routing.published.load_full();
-                samples.lock().push((seen.generation, seen.rows.len()));
-            }));
+            .observe_build_for_test(Arc::new(move |_| sample("mid-build")));
+    }
+    {
+        let sample = sample.clone();
+        node.session_routing
+            .observe_revalidated_for_test(Arc::new(move || sample("pre-store")));
     }
 
     let before = node.session_routing.published.load_full();
     node.note_session_transition();
     let after = node.session_routing.published.load_full();
+    assert_ne!(
+        after.rows, before.rows,
+        "precondition: this republication must actually change the row set, or \
+         old and new are indistinguishable and the witness proves nothing"
+    );
 
     let samples = samples.lock().clone();
-    assert!(
-        !samples.is_empty(),
-        "the reader must have been scheduled inside the republication, or this \
-         witness proves nothing"
+    let mut seen_where: Vec<&str> = samples.iter().map(|(w, _, _)| *w).collect();
+    seen_where.sort_unstable();
+    seen_where.dedup();
+    assert_eq!(
+        seen_where,
+        vec!["mid-build", "pre-store"],
+        "both observation points must have been reached, or this witness proves \
+         nothing"
     );
-    for (generation, rows) in samples {
-        // The only two coherent observations are the projection as it was and
-        // the projection as it becomes. A generation from one paired with a row
-        // count from the other is a tear.
-        assert!(
-            (generation, rows) == (before.generation, before.rows.len())
-                || (generation, rows) == (after.generation, after.rows.len()),
-            "observed a torn pair: generation {generation} with {rows} rows, \
-             while before = ({}, {}) and after = ({}, {})",
-            before.generation,
-            before.rows.len(),
-            after.generation,
-            after.rows.len()
+    for (where_, generation, rows) in samples {
+        assert_eq!(
+            (generation, &rows),
+            (before.generation, &before.rows),
+            "a reader at {where_} observed neither the old projection nor the \
+             old generation: the two do not travel together"
         );
     }
     assert!(
@@ -7920,5 +7945,311 @@ async fn a_transport_flipped_mid_build_cannot_publish_its_old_directness() {
             session_id: s0,
         },
         "and the rebuild annotates it RELAYED, on the same session"
+    );
+}
+
+/// (S2-14) **HOLD-2 item 2 — the forwarding primitive holds no peer-map
+/// guard.**
+///
+/// Every fan-out (pingwave, public capability, scoped capability) now sends from
+/// the OWNED snapshot [`snapshot_peers`] returns, so the property is a property
+/// of one primitive rather than of five call sites remembering the rule.
+///
+/// The witness carries its own negative control, which is what gives it teeth: a
+/// retained `DashMap` iterator — the exact shape the three forwarding loops had
+/// — provably blocks a peer-map writer, and the snapshot provably does not. A
+/// witness with only the second half would pass against either implementation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_snapshot_retains_no_shard_and_drops_the_ingress_peer() {
+    let node = node().await;
+    const A: u64 = 0xe001;
+    const B: u64 = 0xe002;
+    let _session_a = seed_peer(&node, A, true);
+    let _session_b = seed_peer(&node, B, false);
+
+    // A peer-map WRITE, on demand, from another thread. Returns whether it was
+    // still blocked after a bounded wait, and the handle to join once whatever
+    // was blocking it is gone.
+    let write_attempt = || -> (bool, std::thread::JoinHandle<()>) {
+        let node = node.clone();
+        let writer = std::thread::spawn(move || {
+            seed_peer(&node, A, false);
+        });
+        let until = std::time::Instant::now() + Duration::from_millis(300);
+        while !writer.is_finished() {
+            if std::time::Instant::now() >= until {
+                return (true, writer);
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        (false, writer)
+    };
+
+    // THE NEGATIVE CONTROL: guards alive, writer blocked.
+    let control = {
+        let held: Vec<_> = node.peers.iter().collect();
+        assert!(!held.is_empty(), "precondition: the iterator holds guards");
+        let (blocked, writer) = write_attempt();
+        assert!(
+            blocked,
+            "a retained peer-map iterator must block a writer — without this the \
+             positive half below proves nothing"
+        );
+        drop(held);
+        writer
+    };
+    control.join().expect("control writer thread");
+
+    // THE PROPERTY: the snapshot is owned, so the same writer proceeds.
+    let snapshot = snapshot_peers(&node.peers, Some(B));
+    assert_eq!(
+        snapshot.len(),
+        1,
+        "the ingress peer is excluded and every other peer is present"
+    );
+    let owned_session = snapshot[0].session.session_id();
+    let (blocked, writer) = write_attempt();
+    assert!(!blocked, "a live snapshot must retain no peer shard");
+    writer.join().expect("writer thread");
+    assert_ne!(
+        node.peers
+            .get(&A)
+            .map(|p| p.session.session_id())
+            .expect("peer A"),
+        owned_session,
+        "precondition: that write REPLACED the session the snapshot holds"
+    );
+    assert_eq!(
+        snapshot[0].session.session_id(),
+        owned_session,
+        "and the snapshot owns the session it was taken with — the replacement \
+         cannot retroactively change what this fan-out is sending on"
+    );
+}
+
+/// (S2-16) **HOLD-2 backstop — the announce lock is acquired under a bound.**
+///
+/// An exported, synchronous entry point must not block unboundedly on an
+/// internal lock: the caller is on the far side of `extern "C"` and has no
+/// cancellation, so whatever the acquire waits for, it waits for on the caller's
+/// thread forever. §18.0g traces the failure this was found by — a wakeup lost
+/// between two statically-linked copies of this crate in one process, where the
+/// mutex is free and the parked waiter is never woken.
+///
+/// A `tokio::time::timeout` around the announce future cannot supply this bound,
+/// which is why the bound is on the ACQUIRE: `Mutex::lock()` is not an await
+/// point, so the timer never runs on the thread stuck inside it.
+///
+/// Both halves matter. The refusal proves the bound exists; the acquire-on-
+/// release proves the bound did not turn ordinary contention into a refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_announce_lock_is_acquired_under_a_bound_and_refuses_past_it() {
+    let node = node().await;
+
+    // THE BOUND: a holder that outlives the deadline yields a refusal, not a
+    // wait. Driven through the parameterized form so the witness does not sit
+    // out the production deadline; production passes the constant.
+    let held = node.announce_mu.lock();
+    let started = std::time::Instant::now();
+    assert!(
+        node.lock_announce_mu_within(Duration::from_millis(150))
+            .is_none(),
+        "an acquire that cannot complete within its bound must REFUSE"
+    );
+    let waited = started.elapsed();
+    assert!(
+        waited < Duration::from_secs(5),
+        "and it must refuse promptly — waited {waited:?}"
+    );
+
+    drop(held);
+
+    // THE CONTROL: ordinary contention still acquires. Without this, "always
+    // refuse" would pass the half above and silently disable announcing.
+    // Sequenced by a channel rather than a sleep, so the acquire below really
+    // does start while another thread holds the lock.
+    let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+    let holder = {
+        let node = node.clone();
+        std::thread::spawn(move || {
+            let guard = node.announce_mu.lock();
+            acquired_tx.send(()).expect("signal");
+            std::thread::sleep(Duration::from_millis(100));
+            drop(guard);
+        })
+    };
+    acquired_rx.recv().expect("the holder must have acquired");
+    assert!(
+        node.lock_announce_mu_within(Duration::from_secs(10))
+            .is_some(),
+        "a lock released inside the bound must be acquired, not refused"
+    );
+    holder.join().expect("holder thread");
+}
+
+/// (S2-15) **HOLD-2 item 1 — the revalidated→published window.** The
+/// authoritative peer state cannot move between a build's last revalidation and
+/// its store.
+///
+/// This is the schedule the incarnation re-read cannot close, and the reason the
+/// re-read alone was not the repair. The re-read closes `sample → replace →
+/// revalidate`. It says nothing about `revalidate → replace → publish`: there,
+/// the replacement takes the separate peer-transition guard, mutates `peers`,
+/// releases it, and only then queues on the session gate — so the build ahead of
+/// it stores a projection under a FRESH generation naming a session `peers` has
+/// already dropped, and a 2B.3d consumer reading in that window preselects a
+/// dead session. A second best-effort re-read would only move the window.
+///
+/// So the mutation and the publication are ONE unit
+/// ([`commit_peer_transition`]), and this witness observes exactly that: it
+/// pauses a build after every row has been revalidated and before anything is
+/// stored, has a SEPARATE thread attempt the real replacement through
+/// `install_direct`, and proves the replacement cannot land while the window is
+/// open — then that it lands, and republishes, the moment it closes.
+///
+/// Dies to: publishing from outside the gate the mutation takes — i.e. mutating
+/// first and notifying afterwards, which is the shape this replaces. The
+/// replacement then lands mid-window and `stable` is false. S2-9 and S2-13
+/// survive that mutation, because both drive their interleaving from a raw seed
+/// that takes no gate at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_replaced_after_revalidation_cannot_publish_its_old_session() {
+    use crate::adapter::net::behavior::org_routing_registry::DirectEligibility;
+    let node = node().await;
+    let entity = EntityId::from_bytes([0xd1u8; 32]);
+    const N: u64 = 0xd001;
+    let addr: SocketAddr = "10.9.8.1:9000".parse().expect("addr");
+    let replacement_addr: SocketAddr = "10.9.8.2:9000".parse().expect("addr");
+
+    // Seeded through the REAL installer, so the state under test was published
+    // by the production transition rather than written past it.
+    assert!(
+        node.install_direct(N, addr, fresh_session_keys(), None)
+            .owned,
+        "precondition: the seed install owned the peer"
+    );
+    node.test_pin_peer_entity(N, entity.clone());
+    let s0 = node
+        .peers
+        .get(&N)
+        .map(|p| p.session.session_id())
+        .expect("the seeded peer");
+    assert_eq!(
+        eligibility_of(&node, &entity),
+        DirectEligibility::Direct {
+            node_id: N,
+            session_id: s0,
+        },
+        "precondition: the projection names S0"
+    );
+
+    let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stable = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let blocked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    #[allow(clippy::type_complexity)]
+    let replacer: Arc<parking_lot::Mutex<Option<std::thread::JoinHandle<bool>>>> =
+        Arc::new(parking_lot::Mutex::new(None));
+    {
+        let node_for_hook = node.clone();
+        let (fired, stable, blocked, replacer) = (
+            fired.clone(),
+            stable.clone(),
+            blocked.clone(),
+            replacer.clone(),
+        );
+        node.session_routing
+            .observe_revalidated_for_test(Arc::new(move || {
+                fired.store(true, Ordering::Release);
+                let node_for_thread = node_for_hook.clone();
+                let handle = std::thread::spawn(move || {
+                    node_for_thread
+                        .install_direct(N, replacement_addr, fresh_session_keys(), None)
+                        .owned
+                });
+                // For as long as this window is open the authoritative peer
+                // state must not move. Polled rather than sampled once, so a
+                // replacement landing late in the window is caught too.
+                let until = std::time::Instant::now() + Duration::from_millis(300);
+                let mut held = true;
+                while std::time::Instant::now() < until {
+                    if node_for_hook.peers.get(&N).map(|p| p.session.session_id()) != Some(s0) {
+                        held = false;
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                stable.store(held, Ordering::Release);
+                // And it is BLOCKED, not merely slow: the replacement is queued
+                // on the very gate this build holds.
+                blocked.store(!handle.is_finished(), Ordering::Release);
+                // Handed out rather than joined — joining here would wait on a
+                // thread that cannot proceed until this window closes.
+                *replacer.lock() = Some(handle);
+            }));
+    }
+
+    let publications_before = node.org_routing_session_publications();
+    let generation_before = node
+        .org_routing_session_generation()
+        .expect("a live generation");
+    node.note_session_transition();
+    assert!(
+        fired.load(Ordering::Acquire),
+        "precondition: the revalidated→published window must have been reached"
+    );
+
+    // THE PROPERTY.
+    assert!(
+        stable.load(Ordering::Acquire),
+        "a peer replacement landed between the build's revalidation and its \
+         store: the projection about to be published names a session `peers` no \
+         longer holds"
+    );
+    assert!(
+        blocked.load(Ordering::Acquire),
+        "the replacement must have been BLOCKED for the whole window, not \
+         merely late"
+    );
+
+    // CONVERGENCE: the moment the window closes the replacement proceeds, and
+    // publishes its own generation.
+    let handle = replacer.lock().take().expect("the replacement thread");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !handle.is_finished() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the replacement never proceeded after the window closed"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        handle.join().expect("replacement thread"),
+        "the replacement transition owned the peer"
+    );
+    let s1 = node
+        .peers
+        .get(&N)
+        .map(|p| p.session.session_id())
+        .expect("the replaced peer");
+    assert_ne!(s1, s0, "precondition: the replacement is a NEW incarnation");
+    assert_eq!(
+        node.org_routing_session_publications(),
+        publications_before + 2,
+        "exactly two publications, in order: this build, then the replacement's \
+         own — which is what makes the generation naming S1 strictly newer than \
+         the one naming S0"
+    );
+    assert_eq!(
+        node.org_routing_session_generation(),
+        Some(generation_before + 2),
+        "and the generation advanced once per publication"
+    );
+    assert_eq!(
+        eligibility_of(&node, &entity),
+        DirectEligibility::Direct {
+            node_id: N,
+            session_id: s1,
+        },
+        "the live projection names the LIVE incarnation"
     );
 }

@@ -2174,6 +2174,14 @@ async fn a_granted_capability_floods_opaquely_through_a_relay_to_the_grantee() {
     let org_b = OrgKeypair::from_bytes([0x8Bu8; 32]); // provider org
     let org_a = OrgKeypair::from_bytes([0x8Au8; 32]); // grantee org (distinct)
     let base = std::env::temp_dir().join(format!("net-oa34b2-relay-{}", std::process::id()));
+    // START-of-test reset, on this test's OWN pid-scoped path. This is the half
+    // of the cleanup rule that stays: a previous run's residue under the same
+    // path would be adopted as live authority state, and nothing else in the
+    // process can be holding a core on a path that is about to be created.
+    // (What was removed everywhere is the END-of-test deletion, which frees a
+    // `.lock` sidecar inode while its process-global core is still live and lets
+    // the next store join a dead test's core.)
+    let _ = std::fs::remove_dir_all(&base);
 
     // The single B→A grant: P holds it as a PROVIDER record (to emit), A holds it
     // as a CONSUMER record (to open) — same grant_id, same audience key.

@@ -231,6 +231,30 @@ const COMMITTED_FLUSH_STALL_BUDGET: Duration = Duration::from_secs(30);
 /// waited on.
 const DATAGRAM_SEND_DEADLINE: Duration = Duration::from_secs(5);
 
+/// Whole-operation bound on acquiring the announce lock (HOLD-2 backstop).
+///
+/// An EXPORTED, synchronous entry point must not block unboundedly on an
+/// internal lock. `announce_capabilities` is reached that way through the C ABI,
+/// and a caller on the far side of `extern "C"` has no cancellation: whatever
+/// this waits for, it waits for on the caller's thread, forever.
+///
+/// A `tokio::time::timeout` around the future cannot supply this bound. A
+/// blocking `Mutex::lock()` is not an await point, so the timer never gets to
+/// run on the thread that is stuck inside it — the deadline has to be on the
+/// ACQUIRE itself.
+///
+/// See §18.0g of the 2B.3b design note for the failure this was traced to: a
+/// wakeup lost between two statically-linked copies of this crate in one
+/// process, where the mutex is demonstrably free and the waiter is never
+/// unparked. The bound is what keeps the boundary usable; it is NOT a fix for
+/// that packaging defect, and it protects only this one lock.
+const ANNOUNCE_LOCK_DEADLINE: Duration = Duration::from_secs(30);
+
+/// How often the bounded acquire retries the fast path. Short enough that a lost
+/// wakeup costs a caller milliseconds rather than the whole deadline, long enough
+/// that an ordinary contended acquire still parks rather than spins.
+const ANNOUNCE_LOCK_POLL: Duration = Duration::from_millis(50);
+
 /// Back off, then report whether the committed-prefix flush retry may
 /// continue. Returns `Err(StreamError::Transport)` once `deadline` has
 /// passed — a receiver that has granted no credit by then is treated as
@@ -992,65 +1016,68 @@ impl Drop for PeerRegistrationGuard {
         let peer_addrs = &self.peer_addrs;
         let session_id_to_node = &self.session_id_to_node;
         let router = &self.router;
-        let mut removed = false;
-        self.peer_transitions.with(peer_node_id, || {
-            // Undo only OUR registration — and only while it is still
-            // ours.
-            //
-            // The peer entry is matched on the exact SESSION we
-            // registered, not on its address: a concurrent retry can
-            // legitimately install a different session at the same
-            // address (a re-handshake to the same relay). When that
-            // match FAILS, a replacement owns this peer, and every
-            // sidecar below now describes the replacement rather than
-            // us. Running the sidecar removals anyway was the defect:
-            // both were keyed on the shared address, so a stale
-            // rollback stripped a live session's address mapping and
-            // route while leaving the live session itself in place —
-            // reachable in `peers`, unreachable in fact.
-            //
-            // The rollback owns the whole transition or none of it.
-            if peers
-                .remove_if(&peer_node_id, |_, pi| {
-                    pi.session.session_id() == registered_session_id
-                })
-                .is_none()
-            {
-                return;
-            }
-            peer_addrs.remove_if(&peer_node_id, |_, addr| *addr == registered_next_hop);
-            // PERF_AUDIT §2.4: drop the reverse-index entry only when
-            // it still points at our registered node_id. A concurrent
-            // retry that installed a fresh session under the same
-            // peer_node_id would have replaced it; we must not undo
-            // that successful registration.
-            session_id_to_node.remove_if(&registered_session_id, |_, n| *n == peer_node_id);
-            // Remove exactly the candidate this registration installed,
-            // named by the TOKEN its install produced. A routed
-            // registration writes the ORDINARY slot, so the rollback
-            // must not scan both provenances — an earlier shape used
-            // the both-slot address helper and let a cancelled routed
-            // handshake erase a pre-existing PROTECTED candidate at the
-            // same address. Address alone is not enough either: a
-            // replacement registration through the same relay writes an
-            // identical `(dest, next_hop)` pair, which an address-keyed
-            // removal cannot tell from ours.
-            router
-                .routing_table()
-                .remove_ordinary_route_if_token_is(peer_node_id, registered_route_token);
-            removed = true;
-        });
-        if removed {
-            // OLB-2B.3c step 2, with the peer shard released. A rollback that
-            // did NOT own the registration returns from the closure above
-            // having removed nothing, and publishes nothing here.
-            note_session_transition(
-                &self.session_routing,
-                &self.routing_registry,
-                &self.peers,
-                &self.peer_entity_ids,
-            );
-        }
+        // HOLD-2 item 1: the removal and the republication it causes are ONE
+        // serialized transition, taken in the frozen order `session gate ->
+        // peer-transition guard -> peer shard`. A rollback that did NOT own the
+        // registration removes nothing inside the closure and publishes
+        // nothing.
+        commit_peer_transition(
+            &self.session_routing,
+            &self.routing_registry,
+            &self.peers,
+            &self.peer_entity_ids,
+            || {
+                let mut removed = false;
+                self.peer_transitions.with(peer_node_id, || {
+                    // Undo only OUR registration — and only while it is still
+                    // ours.
+                    //
+                    // The peer entry is matched on the exact SESSION we
+                    // registered, not on its address: a concurrent retry can
+                    // legitimately install a different session at the same
+                    // address (a re-handshake to the same relay). When that
+                    // match FAILS, a replacement owns this peer, and every
+                    // sidecar below now describes the replacement rather than
+                    // us. Running the sidecar removals anyway was the defect:
+                    // both were keyed on the shared address, so a stale
+                    // rollback stripped a live session's address mapping and
+                    // route while leaving the live session itself in place —
+                    // reachable in `peers`, unreachable in fact.
+                    //
+                    // The rollback owns the whole transition or none of it.
+                    if peers
+                        .remove_if(&peer_node_id, |_, pi| {
+                            pi.session.session_id() == registered_session_id
+                        })
+                        .is_none()
+                    {
+                        return;
+                    }
+                    peer_addrs.remove_if(&peer_node_id, |_, addr| *addr == registered_next_hop);
+                    // PERF_AUDIT §2.4: drop the reverse-index entry only when
+                    // it still points at our registered node_id. A concurrent
+                    // retry that installed a fresh session under the same
+                    // peer_node_id would have replaced it; we must not undo
+                    // that successful registration.
+                    session_id_to_node.remove_if(&registered_session_id, |_, n| *n == peer_node_id);
+                    // Remove exactly the candidate this registration installed,
+                    // named by the TOKEN its install produced. A routed
+                    // registration writes the ORDINARY slot, so the rollback
+                    // must not scan both provenances — an earlier shape used
+                    // the both-slot address helper and let a cancelled routed
+                    // handshake erase a pre-existing PROTECTED candidate at the
+                    // same address. Address alone is not enough either: a
+                    // replacement registration through the same relay writes an
+                    // identical `(dest, next_hop)` pair, which an address-keyed
+                    // removal cannot tell from ours.
+                    router
+                        .routing_table()
+                        .remove_ordinary_route_if_token_is(peer_node_id, registered_route_token);
+                    removed = true;
+                });
+                ((), removed)
+            },
+        );
     }
 }
 
@@ -6449,12 +6476,25 @@ impl NodeSessionRouting {
     /// exhausted space publishes NOTHING rather than a projection under a
     /// frozen or aliased generation; the commit happens last so the counter
     /// never names a projection that is not yet visible.
-    fn republish(
+    ///
+    /// # Why the gate is the CALLER's
+    ///
+    /// The guard is passed in rather than taken here, and that is the whole
+    /// commit protocol (HOLD-2 item 1). Taking it here would serialize
+    /// republications against each other and nothing else: the authoritative
+    /// `peers` mutation would still be free to land between this build's
+    /// revalidation and its store, and the projection published under the fresh
+    /// generation would name a session that `peers` no longer holds. Ordering
+    /// the mutation's *notification* behind the gate is not enough, because a
+    /// notification is not the mutation. So the mutation runs under this same
+    /// guard — see [`commit_peer_transition`] — and the only way to reach this
+    /// function is to hold it.
+    fn republish_locked(
         &self,
+        _gate: &parking_lot::MutexGuard<'_, ()>,
         peers: &DashMap<u64, PeerInfo>,
         peer_entity_ids: &DashMap<u64, EntityId>,
     ) -> Option<u64> {
-        let _gate = self.gate.lock();
         if self.is_exhausted() {
             return None;
         }
@@ -6471,6 +6511,12 @@ impl NodeSessionRouting {
             return None;
         };
         let rows = build_session_rows(peers, peer_entity_ids, &self.build_observer);
+        // Test-only, at the ONE instant the commit protocol is about: every
+        // incarnation has been revalidated and NOTHING has been stored yet. A
+        // witness scheduled here drives the exact interleaving that a
+        // re-read-only repair cannot close — see
+        // `a_peer_replaced_after_revalidation_cannot_publish_its_old_session`.
+        self.build_observer.observe_revalidated();
         self.published
             .store(Arc::new(SessionProjection { generation, rows }));
         self.currentness.commit(generation);
@@ -6489,6 +6535,14 @@ impl NodeSessionRouting {
     fn observe_build_for_test(&self, hook: Arc<dyn Fn(u64) + Send + Sync>) {
         *self.build_observer.hook.lock() = Some(hook);
     }
+
+    /// Test-only: arm the one-shot revalidated→published interleaving. Fires
+    /// after every row's incarnation has been revalidated and before the
+    /// projection is stored.
+    #[cfg(test)]
+    fn observe_revalidated_for_test(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.build_observer.revalidated.lock() = Some(hook);
+    }
 }
 
 /// Test-only observation point INSIDE the projection build: fires once, after a
@@ -6503,6 +6557,10 @@ struct SessionBuildObserver {
     #[cfg(test)]
     #[allow(clippy::type_complexity)]
     hook: parking_lot::Mutex<Option<Arc<dyn Fn(u64) + Send + Sync>>>,
+    /// The second window: everything revalidated, nothing published yet.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    revalidated: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl SessionBuildObserver {
@@ -6515,6 +6573,18 @@ impl SessionBuildObserver {
             let hook = self.hook.lock().take();
             if let Some(hook) = hook {
                 hook(_node_id);
+            }
+        }
+    }
+
+    /// One-shot, same discipline: the revalidated→published window.
+    #[inline]
+    fn observe_revalidated(&self) {
+        #[cfg(test)]
+        {
+            let hook = self.revalidated.lock().take();
+            if let Some(hook) = hook {
+                hook();
             }
         }
     }
@@ -6830,6 +6900,43 @@ struct ScopedSourceSnapshot {
     >,
 }
 
+/// One forwarding recipient, OWNED: everything a send needs, and no borrow of
+/// the peer map (HOLD-2 item 2).
+///
+/// The invariant this type exists to make mechanical: **no `DashMap` iterator or
+/// lookup guard may cross an `.await`.** A `RefMulti` held across
+/// `socket.send_to(..).await` wedges that shard for as long as the send pends —
+/// blocking peer replacement, eviction, and every other reader of the same
+/// shard — and the announcement path funnels through the same map, so a
+/// forwarding task that pends there can stop an exported FFI entry point from
+/// ever reaching its own send.
+struct PeerRecipient {
+    addr: SocketAddr,
+    session: Arc<NetSession>,
+}
+
+/// Snapshot every live peer as an OWNED [`PeerRecipient`] list.
+///
+/// THE forwarding primitive: one place iterates the peer map, the iteration
+/// completes before anything awaits, and every fan-out sends from the owned
+/// snapshot. `exclude` drops the ingress peer (never send back to whoever gave
+/// it to us) without the caller needing a second pass.
+///
+/// A snapshot is deliberately a point-in-time view: a peer evicted mid-fan-out
+/// is sent one datagram it will drop, which is the same best-effort semantics
+/// every forwarding path here already had — and strictly better than holding the
+/// map still to avoid it.
+fn snapshot_peers(peers: &DashMap<u64, PeerInfo>, exclude: Option<u64>) -> Vec<PeerRecipient> {
+    peers
+        .iter()
+        .filter(|entry| exclude != Some(entry.value().node_id))
+        .map(|entry| PeerRecipient {
+            addr: entry.value().addr(),
+            session: entry.value().session.clone(),
+        })
+        .collect()
+}
+
 /// Send ONE datagram under [`DATAGRAM_SEND_DEADLINE`].
 ///
 /// Every send on a caller-facing path goes through here, so the bound is a
@@ -6935,37 +7042,70 @@ fn move_routing_authority<R>(
     result
 }
 
-/// Publish ONE session/direct-state transition to routing (OLB-2B.3c step 2).
+/// Run a peer-state mutation and the session republication it causes as ONE
+/// serialized transition (OLB-2B.3c step 2; HOLD-2 item 1).
 ///
 /// The order is normative, and each step is where it is for a reason the
 /// consumer-Grant edge already paid for once (design §2A.2, item 10):
 ///
 /// ```text
-/// republish the projection            \  under the session publication gate
+/// take the session publication gate   \
+/// MUTATE the authoritative peer state  |  under the session publication gate
+/// republish the projection             |
 /// advance the generation              /
 /// RELEASE the gate
 /// retire the pools this movement supersedes   (takes the registry lock)
 /// mark actor work                             (inside the invalidation)
 /// ```
 ///
-/// Publishing the state before advancing the generation is what stops an
-/// observer naming a projection it cannot see. Releasing the gate before
-/// touching the registry is what keeps `peer transition → session gate →
-/// registry lock` acyclic; taking the registry lock beneath the gate would
-/// invert it against nothing today and against the first future caller that
-/// republishes from under the registry.
+/// # Why the mutation is inside the gate
 ///
-/// A transition that publishes nothing must not reach here at all: every call
-/// site is on the far side of the check that says its mutation actually
-/// happened, so "a non-publishing outcome wakes nothing" is a property of the
-/// call sites rather than of a predicate here.
-fn note_session_transition(
+/// Because ordering the *notification* behind the gate is not ordering the
+/// mutation. The repair this replaces re-read each peer's exact incarnation
+/// before publishing, which closes `sample → replace → revalidate`; it does not
+/// close `revalidate → replace → publish`. In that schedule the replacement
+/// takes the separate peer-transition guard, mutates `peers`, releases it, and
+/// only then queues on this gate — so the build ahead of it stores a projection
+/// under a FRESH generation naming a session `peers` has already dropped, and a
+/// 2B.3d consumer reading in that window preselects a dead session. A second
+/// best-effort re-read cannot fix that; it only moves the window. The mutation
+/// and the publication have to be one unit, which is what this is.
+///
+/// `mutate` returns `(value, published)`. `published` is the call site's own
+/// answer to "did my mutation actually happen" — a lost compare-and-swap, a
+/// refused rotation, a declined eviction — and a mutation that did not happen
+/// publishes nothing and wakes nothing.
+///
+/// # Lock order
+///
+/// ```text
+/// session publication gate -> peer-transition guard -> peer shard
+/// ```
+///
+/// then the registry lock, with the gate RELEASED. Acyclic: the gate is now
+/// always the OUTERMOST of the three, so no path can hold a peer-transition
+/// guard or a peer shard and then queue on the gate. The registry stays outside
+/// it, because taking the registry lock beneath the gate would invert against
+/// the first future caller that republishes from under the registry.
+fn commit_peer_transition<T>(
     session_routing: &NodeSessionRouting,
     registry: &super::behavior::org_routing_registry::NodeOrgRoutingRegistry,
     peers: &DashMap<u64, PeerInfo>,
     peer_entity_ids: &DashMap<u64, EntityId>,
-) {
-    let Some(live) = session_routing.republish(peers, peer_entity_ids) else {
+    mutate: impl FnOnce() -> (T, bool),
+) -> T {
+    let (value, outcome) = {
+        let gate = session_routing.gate.lock();
+        let (value, published) = mutate();
+        // `None` = nothing was mutated. `Some(None)` = mutated, and the
+        // generation space is spent. The two are NOT the same wake.
+        let outcome: Option<Option<u64>> =
+            published.then(|| session_routing.republish_locked(&gate, peers, peer_entity_ids));
+        (value, outcome)
+    };
+    match outcome {
+        // The mutation did not happen. Nothing to supersede.
+        None => {}
         // The generation space is spent. Retire every pool ONCE — they were
         // computed under views nothing can witness any more, and leaving them
         // published would keep a reader's validation comparing against a
@@ -6976,10 +7116,33 @@ fn note_session_transition(
         // This cannot spin: the re-queued rebuilds install facts and publish
         // no pool (a spent space projects nothing), so the next arm finds
         // nothing owed and the actor parks.
-        registry.invalidate_session_older_than(u64::MAX);
-        return;
-    };
-    registry.invalidate_session_older_than(live);
+        Some(None) => {
+            registry.invalidate_session_older_than(u64::MAX);
+        }
+        Some(Some(live)) => {
+            registry.invalidate_session_older_than(live);
+        }
+    }
+    value
+}
+
+/// [`commit_peer_transition`] for a call site that has no mutation to
+/// serialize — a bare republication of the CURRENT peer state.
+///
+/// Test/fixture only, and gated rather than merely discouraged: a production
+/// caller reaching for this would be publishing a projection whose basis it
+/// mutated outside the gate, which is the exact defect the commit protocol
+/// exists to make unreachable.
+#[cfg(test)]
+fn republish_session_projection(
+    session_routing: &NodeSessionRouting,
+    registry: &super::behavior::org_routing_registry::NodeOrgRoutingRegistry,
+    peers: &DashMap<u64, PeerInfo>,
+    peer_entity_ids: &DashMap<u64, EntityId>,
+) {
+    commit_peer_transition(session_routing, registry, peers, peer_entity_ids, || {
+        ((), true)
+    });
 }
 
 /// Test-only: a routing registry with an idle source, for witnesses that need
@@ -9824,19 +9987,24 @@ impl MeshNode {
             // Pull `entity_id` BEFORE removing it so we know which
             // origin_hash slot to demote / drop. A node disappearing
             // releases its claim on the wire hash.
-            let removed_entity_id = peer_entity_ids_failure.remove(&node_id).map(|(_, eid)| eid);
+            // OLB-2B.3c step 2, HOLD-2 item 1: this node id no longer resolves
+            // to a provider entity, so every pool annotating that provider
+            // through this session is superseded. The unbinding and the
+            // republication it causes are ONE serialized transition — a verdict
+            // for a node that never had a binding removes nothing and publishes
+            // nothing.
+            let removed_entity_id = commit_peer_transition(
+                &session_routing_failure,
+                &routing_registry_failure,
+                &peers_failure,
+                &peer_entity_ids_failure,
+                || {
+                    let removed = peer_entity_ids_failure.remove(&node_id).map(|(_, eid)| eid);
+                    let published = removed.is_some();
+                    (removed, published)
+                },
+            );
             if let Some(eid) = removed_entity_id {
-                // OLB-2B.3c step 2: this node id no longer resolves to a
-                // provider entity, so every pool annotating that provider
-                // through this session is superseded. Republished only when a
-                // binding was actually removed — a verdict for a node that
-                // never had one publishes nothing and wakes nothing.
-                note_session_transition(
-                    &session_routing_failure,
-                    &routing_registry_failure,
-                    &peers_failure,
-                    &peer_entity_ids_failure,
-                );
                 // Same key the inbound announcement handler uses —
                 // the full 64-bit `EntityId::origin_hash()` since the
                 // `WIRE_ORIGIN_HASH_64BIT` cutover. Slot is
@@ -11870,13 +12038,16 @@ impl MeshNode {
     #[doc(hidden)]
     #[cfg(any(test, feature = "fixtures"))]
     pub fn test_pin_peer_entity(&self, node_id: u64, entity_id: EntityId) {
-        self.peer_entity_ids.entry(node_id).or_insert(entity_id);
         // OLB-2B.3c step 2: a pin resolves a node id to a provider entity, so
-        // it changes which providers the projection can annotate. Republished
-        // here for the same reason the production pin sites republish — a
-        // fixture that seeded a pin and got no projection would be modelling a
-        // node this code cannot produce.
-        self.note_session_transition();
+        // it changes which providers the projection can annotate. Serialized
+        // with its republication for the same reason the production pin sites
+        // are — a fixture that seeded a pin and got no projection, or got one
+        // that raced its own pin, would be modelling a node this code cannot
+        // produce.
+        self.commit_peer_transition(|| {
+            self.peer_entity_ids.entry(node_id).or_insert(entity_id);
+            ((), true)
+        });
     }
 
     /// Test/debug accessor for the live [`NetSession`] to a peer.
@@ -12239,29 +12410,32 @@ impl MeshNode {
         if ctx.subject_node != from_node {
             return Err(SubnetAuthError::WrongSubject);
         }
-        let mut pinned = false;
-        match self.peer_entity_ids.entry(from_node) {
-            dashmap::mapref::entry::Entry::Occupied(slot) => {
-                if slot.get() != &ctx.subject {
-                    tracing::warn!(
-                        from_node = format!("{from_node:#x}"),
-                        "subnet: admission refused — a different entity is already pinned to this routing id"
-                    );
-                    return Err(SubnetAuthError::IdentityPinConflict);
+        // OLB-2B.3c step 2, HOLD-2 item 1: the pin and the republication it
+        // causes are ONE serialized transition, so no build can publish a
+        // projection between its revalidation and its store while this pin
+        // lands. The Occupied arm published NOTHING — it either matched or
+        // refused — and so wakes nothing.
+        self.commit_peer_transition(|| {
+            let outcome = match self.peer_entity_ids.entry(from_node) {
+                dashmap::mapref::entry::Entry::Occupied(slot) => {
+                    if slot.get() != &ctx.subject {
+                        tracing::warn!(
+                            from_node = format!("{from_node:#x}"),
+                            "subnet: admission refused — a different entity is already pinned to this routing id"
+                        );
+                        Err(SubnetAuthError::IdentityPinConflict)
+                    } else {
+                        Ok(false)
+                    }
                 }
-            }
-            dashmap::mapref::entry::Entry::Vacant(slot) => {
-                slot.insert(ctx.subject.clone());
-                pinned = true;
-            }
-        }
-        if pinned {
-            // OLB-2B.3c step 2: this node id now resolves to a provider
-            // entity, so the session/direct-state projection moved. The
-            // Occupied arm published NOTHING — it either matched or refused —
-            // and so wakes nothing.
-            self.note_session_transition();
-        }
+                dashmap::mapref::entry::Entry::Vacant(slot) => {
+                    slot.insert(ctx.subject.clone());
+                    Ok(true)
+                }
+            };
+            let published = matches!(outcome, Ok(true));
+            (outcome, published)
+        })?;
 
         self.subnet_contexts.install(from_node, ctx.clone());
         Ok(ctx)
@@ -15075,11 +15249,57 @@ impl MeshNode {
     /// already received it, re-signs, and self-indexes to the same
     /// proof standard as the wire. A concurrent writer that already
     /// reconciled the cache to `desired` makes this a no-op.
+    /// Acquire the announce lock under [`ANNOUNCE_LOCK_DEADLINE`], retrying the
+    /// fast path every [`ANNOUNCE_LOCK_POLL`].
+    ///
+    /// `None` means the deadline expired. Every caller refuses rather than
+    /// waiting, because every caller is reachable from an exported synchronous
+    /// entry point — see the constant for why a `timeout` around the future
+    /// cannot supply this bound, and §18.0g for the lost wakeup it was traced
+    /// to.
+    fn lock_announce_mu(&self) -> Option<parking_lot::MutexGuard<'_, ()>> {
+        let acquired = self.lock_announce_mu_within(ANNOUNCE_LOCK_DEADLINE);
+        if acquired.is_none() {
+            tracing::error!(
+                "capability: the announce lock was not obtainable within \
+                 {ANNOUNCE_LOCK_DEADLINE:?}"
+            );
+        }
+        acquired
+    }
+
+    /// [`Self::lock_announce_mu`] with the bound supplied by the caller, so a
+    /// witness can drive the refusal without waiting out the production
+    /// deadline. Production has exactly one caller, and it passes the constant.
+    fn lock_announce_mu_within(&self, within: Duration) -> Option<parking_lot::MutexGuard<'_, ()>> {
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            // A TIMED park, retried: the retry is the point. It re-reads the
+            // mutex state on every iteration, so an acquire that would otherwise
+            // sleep forever on a wakeup that never arrives costs one poll
+            // interval instead.
+            if let Some(guard) = self
+                .announce_mu
+                .try_lock_for(ANNOUNCE_LOCK_POLL.min(within))
+            {
+                return Some(guard);
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+        }
+    }
+
     fn rebuild_cached_announcement(
         &self,
         desired: Option<super::behavior::org::OrgMembershipCert>,
     ) {
-        let _announce_guard = self.announce_mu.lock();
+        let Some(_announce_guard) = self.lock_announce_mu() else {
+            // The cache stays as it is: the next send re-derives the desired
+            // certificate and tries again. Refusing here costs one stale-cert
+            // rebuild; waiting here would cost the exported caller its thread.
+            return;
+        };
         let Some(cached) = self.local_emission.load_full() else {
             return;
         };
@@ -15323,20 +15543,20 @@ impl MeshNode {
         keys: SessionKeys,
         expected_prior_session_id: Option<u64>,
     ) -> PeerTransitionOutcome {
-        let outcome = self.peer_transitions.with(peer_node_id, || {
-            self.install_peer_locked(peer_node_id, transport, keys, expected_prior_session_id)
-        });
-        if outcome.owned {
-            // OLB-2B.3c step 2: this transition published a new session, so the
-            // node's session/direct-state projection moved. Run with the peer
-            // shard RELEASED, exactly as every other transition site does — the
-            // republication takes its own gate and then the registry lock, and
-            // stacking the registry beneath a peer shard is the inversion that
-            // discipline exists to prevent. A LOST compare-and-swap leaves
-            // `owned` false and wakes nothing.
-            self.note_session_transition();
-        }
-        outcome
+        // OLB-2B.3c step 2, HOLD-2 item 1: the peer swap and the republication
+        // it causes are ONE serialized transition. The session publication gate
+        // is taken FIRST and held across both, so no build can be sitting
+        // between its revalidation and its store while this install lands —
+        // which is the schedule a post-sample re-read cannot close. A LOST
+        // compare-and-swap leaves `owned` false, publishes nothing, and wakes
+        // nothing.
+        self.commit_peer_transition(|| {
+            let outcome = self.peer_transitions.with(peer_node_id, || {
+                self.install_peer_locked(peer_node_id, transport, keys, expected_prior_session_id)
+            });
+            let published = outcome.owned;
+            (outcome, published)
+        })
     }
 
     /// The install body, running under this peer's transition guard.
@@ -16435,17 +16655,29 @@ impl MeshNode {
         (pool.session_generation() == live).then_some(pool)
     }
 
-    /// Publish a session/direct-state transition from a `&self` call site.
-    ///
-    /// Every peer transition that actually published or removed a session
-    /// reaches here; the ones that lost a compare-and-swap return before it.
+    /// Republish the session/direct-state projection with no mutation to
+    /// serialize — see [`republish_session_projection`] for why production
+    /// cannot reach this.
+    #[cfg(test)]
     pub(crate) fn note_session_transition(&self) {
-        note_session_transition(
+        republish_session_projection(
             &self.session_routing,
             &self.routing_registry,
             &self.peers,
             &self.peer_entity_ids,
         );
+    }
+
+    /// Run `mutate` and the republication it causes as ONE serialized
+    /// transition, from a `&self` call site. See [`commit_peer_transition`].
+    fn commit_peer_transition<T>(&self, mutate: impl FnOnce() -> (T, bool)) -> T {
+        commit_peer_transition(
+            &self.session_routing,
+            &self.routing_registry,
+            &self.peers,
+            &self.peer_entity_ids,
+            mutate,
+        )
     }
 
     /// Test-only: arm the one-shot "guard released, about to await" observation
@@ -17715,8 +17947,11 @@ impl MeshNode {
                     // backward loop.
                     tokio::spawn(async move {
                         let next_hop = router.routing_table().lookup(origin_nid);
-                        for entry in peers.iter() {
-                            let addr = entry.value().addr();
+                        // Snapshot FIRST: the iteration completes before the
+                        // first await, so no peer shard is held across a send
+                        // (HOLD-2 item 2).
+                        for peer in snapshot_peers(&peers, None) {
+                            let addr = peer.addr;
                             if addr == source {
                                 continue; // never send back to sender
                             }
@@ -17726,7 +17961,7 @@ impl MeshNode {
                             if filter.contains(&addr) {
                                 continue;
                             }
-                            let _ = socket.send_to(&fwd_bytes, addr).await;
+                            let _ = send_datagram(&socket, &fwd_bytes, addr).await;
                         }
                     });
                 }
@@ -18415,161 +18650,165 @@ impl MeshNode {
         // outside any transition — so a concurrent install could
         // interleave with it, and the rollback guard below could not
         // name the exact route it was undoing.
-        let Some((registered_session_id, registered_route_token)) =
-            ctx.peer_transitions.with(peer_node_id, || {
-                let registered: Option<u64> = match ctx.peers.entry(peer_node_id) {
-                    dashmap::mapref::entry::Entry::Occupied(mut occ) => {
-                        match routed_rotation_outcome(
-                            occ.get(),
-                            &remote_static_pub,
-                            &initiator_ephemeral,
-                            ctx.session_timeout,
-                        ) {
-                            RoutedRotationOutcome::DropReplay => {
-                                tracing::warn!(
-                                    peer_node_id,
-                                    "routed handshake: dropping msg1 — live session already \
-                                     established for this peer with matching remote_static_pub \
-                                     AND identical initiator ephemeral (replay guard)"
-                                );
-                                None
-                            }
-                            RoutedRotationOutcome::RefuseFresh => {
-                                tracing::warn!(
-                                    peer_node_id,
-                                    "routed handshake: refusing key rotation — existing \
-                                     session is still within session_timeout. New keys \
-                                     can be installed once the live session has gone \
-                                     silent for at least session_timeout (rotation gate)"
-                                );
-                                None
-                            }
-                            RoutedRotationOutcome::DeferBusy => {
-                                tracing::debug!(
-                                    peer_node_id,
-                                    "routed handshake: deferring key rotation — existing \
-                                     session is live and busy (open streams / unacked \
-                                     in-flight data). Swapping now would drop that state; \
-                                     the initiator retries once the session is quiescent \
-                                     (direct-path upgrade C3 busy gate)"
-                                );
-                                None
-                            }
-                            RoutedRotationOutcome::AcceptRotation => {
-                                // PERF_AUDIT §2.4: the rotation displaces
-                                // the existing session — evict its reverse-
-                                // index entry, otherwise every accepted
-                                // rotation leaks one stale entry forever.
-                                let displaced_session_id = occ.get().session.session_id();
-                                ctx.session_id_to_node
-                                    .remove_if(&displaced_session_id, |_, n| *n == peer_node_id);
-                                let session = Arc::new(NetSession::new(
-                                    keys,
-                                    source,
-                                    ctx.packet_pool_size,
-                                    ctx.default_reliable,
-                                ));
-                                let session_id = session.session_id();
-                                occ.insert(PeerInfo {
-                                    node_id: peer_node_id,
-                                    // The msg1 arrived through `source`,
-                                    // which is the immediate upstream
-                                    // relay — not necessarily the remote
-                                    // endpoint. Routed is the honest
-                                    // claim; a Direct one here would
-                                    // assert an adjacency the handshake
-                                    // never established.
-                                    transport: PeerTransport::Routed {
-                                        relay_addr: source,
-                                        adjacent_relay_identity: ctx
-                                            .addr_to_node
-                                            .get(&source)
-                                            .map(|e| *e.value())
-                                            .filter(|nid| *nid != peer_node_id),
-                                    },
-                                    session,
-                                    remote_static_pub,
-                                    last_initiator_ephemeral: Some(initiator_ephemeral),
-                                });
-                                Some(session_id)
-                            }
-                        }
-                    }
-                    dashmap::mapref::entry::Entry::Vacant(vac) => {
-                        let session = Arc::new(NetSession::new(
-                            keys,
-                            source,
-                            ctx.packet_pool_size,
-                            ctx.default_reliable,
-                        ));
-                        let session_id = session.session_id();
-                        vac.insert(PeerInfo {
-                            node_id: peer_node_id,
-                            transport: PeerTransport::Routed {
-                                relay_addr: source,
-                                adjacent_relay_identity: ctx
-                                    .addr_to_node
-                                    .get(&source)
-                                    .map(|e| *e.value())
-                                    .filter(|nid| *nid != peer_node_id),
-                            },
-                            session,
-                            remote_static_pub,
-                            last_initiator_ephemeral: Some(initiator_ephemeral),
-                        });
-                        Some(session_id)
-                    }
-                };
-                let registered_session_id = registered?;
-                ctx.peer_addrs.insert(peer_node_id, source);
-                // ORDINARY on purpose. `peer_node_id` is the remote
-                // end-to-end peer; `source` is the immediate upstream
-                // relay's address. For a routed handshake those are not
-                // the same node, so binding `next_hop_id =
-                // peer_node_id` here would assert a false adjacency: a
-                // route claiming the remote endpoint as its next-hop
-                // identity while pointing at an intermediate relay's
-                // address. Protected forwarding would then select the
-                // remote endpoint's session and seal a tag the adjacent
-                // relay cannot verify.
-                //
-                // Route-hop authority is selected from the exact
-                // authenticated ADJACENT peer. Until this path can
-                // supply that identity from the ingress session that
-                // actually carried the handshake, the route stays
-                // address-only and protected forwarding fails closed on
-                // it.
-                let route_token = ctx.router.add_route(peer_node_id, source);
-                ctx.session_id_to_node
-                    .insert(registered_session_id, peer_node_id);
-                // Fresh session incarnation (Vacant or accepted
-                // rotation) → the peer's withdrawal seq counter
-                // restarts, so purge its gate history, exactly as the
-                // direct `connect`/`accept` install paths do. Without
-                // this, a peer reconnecting through a relay
-                // (`connect_via`) has its reset-sequence withdrawals
-                // rejected as stale until the gate ages them out
-                // (cubic P2).
-                ctx.route_withdraw_gate.forget_sender(peer_node_id);
-                Some((registered_session_id, route_token))
-            })
-        else {
-            return;
-        };
-
-        // OLB-2B.3c step 2: a session was published, so the node's
-        // session/direct-state projection moved. Run with the peer-transition
-        // shard RELEASED — the republication takes its own gate and then the
-        // registry lock, and the documented order only holds because nothing
-        // stacks the registry beneath a peer shard. The `else` arm above is
-        // every non-publishing outcome (replay drop, refused rotation,
-        // deferred busy rotation), and it returns without waking anything.
-        note_session_transition(
+        //
+        // HOLD-2 item 1: that transition and the republication it causes are
+        // serialized under the session publication gate, taken FIRST — so no
+        // projection build can be sitting between its revalidation and its
+        // store while this registration lands.
+        let Some((registered_session_id, registered_route_token)) = commit_peer_transition(
             &ctx.session_routing,
             &ctx.routing_registry,
             &ctx.peers,
             &ctx.peer_entity_ids,
-        );
+            || {
+                let committed = ctx.peer_transitions.with(peer_node_id, || {
+                    let registered: Option<u64> = match ctx.peers.entry(peer_node_id) {
+                        dashmap::mapref::entry::Entry::Occupied(mut occ) => {
+                            match routed_rotation_outcome(
+                                occ.get(),
+                                &remote_static_pub,
+                                &initiator_ephemeral,
+                                ctx.session_timeout,
+                            ) {
+                                RoutedRotationOutcome::DropReplay => {
+                                    tracing::warn!(
+                                        peer_node_id,
+                                        "routed handshake: dropping msg1 — live session already \
+                                     established for this peer with matching remote_static_pub \
+                                     AND identical initiator ephemeral (replay guard)"
+                                    );
+                                    None
+                                }
+                                RoutedRotationOutcome::RefuseFresh => {
+                                    tracing::warn!(
+                                        peer_node_id,
+                                        "routed handshake: refusing key rotation — existing \
+                                     session is still within session_timeout. New keys \
+                                     can be installed once the live session has gone \
+                                     silent for at least session_timeout (rotation gate)"
+                                    );
+                                    None
+                                }
+                                RoutedRotationOutcome::DeferBusy => {
+                                    tracing::debug!(
+                                        peer_node_id,
+                                        "routed handshake: deferring key rotation — existing \
+                                     session is live and busy (open streams / unacked \
+                                     in-flight data). Swapping now would drop that state; \
+                                     the initiator retries once the session is quiescent \
+                                     (direct-path upgrade C3 busy gate)"
+                                    );
+                                    None
+                                }
+                                RoutedRotationOutcome::AcceptRotation => {
+                                    // PERF_AUDIT §2.4: the rotation displaces
+                                    // the existing session — evict its reverse-
+                                    // index entry, otherwise every accepted
+                                    // rotation leaks one stale entry forever.
+                                    let displaced_session_id = occ.get().session.session_id();
+                                    ctx.session_id_to_node
+                                        .remove_if(&displaced_session_id, |_, n| {
+                                            *n == peer_node_id
+                                        });
+                                    let session = Arc::new(NetSession::new(
+                                        keys,
+                                        source,
+                                        ctx.packet_pool_size,
+                                        ctx.default_reliable,
+                                    ));
+                                    let session_id = session.session_id();
+                                    occ.insert(PeerInfo {
+                                        node_id: peer_node_id,
+                                        // The msg1 arrived through `source`,
+                                        // which is the immediate upstream
+                                        // relay — not necessarily the remote
+                                        // endpoint. Routed is the honest
+                                        // claim; a Direct one here would
+                                        // assert an adjacency the handshake
+                                        // never established.
+                                        transport: PeerTransport::Routed {
+                                            relay_addr: source,
+                                            adjacent_relay_identity: ctx
+                                                .addr_to_node
+                                                .get(&source)
+                                                .map(|e| *e.value())
+                                                .filter(|nid| *nid != peer_node_id),
+                                        },
+                                        session,
+                                        remote_static_pub,
+                                        last_initiator_ephemeral: Some(initiator_ephemeral),
+                                    });
+                                    Some(session_id)
+                                }
+                            }
+                        }
+                        dashmap::mapref::entry::Entry::Vacant(vac) => {
+                            let session = Arc::new(NetSession::new(
+                                keys,
+                                source,
+                                ctx.packet_pool_size,
+                                ctx.default_reliable,
+                            ));
+                            let session_id = session.session_id();
+                            vac.insert(PeerInfo {
+                                node_id: peer_node_id,
+                                transport: PeerTransport::Routed {
+                                    relay_addr: source,
+                                    adjacent_relay_identity: ctx
+                                        .addr_to_node
+                                        .get(&source)
+                                        .map(|e| *e.value())
+                                        .filter(|nid| *nid != peer_node_id),
+                                },
+                                session,
+                                remote_static_pub,
+                                last_initiator_ephemeral: Some(initiator_ephemeral),
+                            });
+                            Some(session_id)
+                        }
+                    };
+                    let registered_session_id = registered?;
+                    ctx.peer_addrs.insert(peer_node_id, source);
+                    // ORDINARY on purpose. `peer_node_id` is the remote
+                    // end-to-end peer; `source` is the immediate upstream
+                    // relay's address. For a routed handshake those are not
+                    // the same node, so binding `next_hop_id =
+                    // peer_node_id` here would assert a false adjacency: a
+                    // route claiming the remote endpoint as its next-hop
+                    // identity while pointing at an intermediate relay's
+                    // address. Protected forwarding would then select the
+                    // remote endpoint's session and seal a tag the adjacent
+                    // relay cannot verify.
+                    //
+                    // Route-hop authority is selected from the exact
+                    // authenticated ADJACENT peer. Until this path can
+                    // supply that identity from the ingress session that
+                    // actually carried the handshake, the route stays
+                    // address-only and protected forwarding fails closed on
+                    // it.
+                    let route_token = ctx.router.add_route(peer_node_id, source);
+                    ctx.session_id_to_node
+                        .insert(registered_session_id, peer_node_id);
+                    // Fresh session incarnation (Vacant or accepted
+                    // rotation) → the peer's withdrawal seq counter
+                    // restarts, so purge its gate history, exactly as the
+                    // direct `connect`/`accept` install paths do. Without
+                    // this, a peer reconnecting through a relay
+                    // (`connect_via`) has its reset-sequence withdrawals
+                    // rejected as stale until the gate ages them out
+                    // (cubic P2).
+                    ctx.route_withdraw_gate.forget_sender(peer_node_id);
+                    Some((registered_session_id, route_token))
+                });
+                // Every non-publishing outcome (replay drop, refused rotation,
+                // deferred busy rotation) is `None` here, and publishes
+                // nothing.
+                let published = committed.is_some();
+                (committed, published)
+            },
+        ) else {
+            return;
+        };
 
         // Spawn the send. If it fails, roll back all three registrations
         // (peer session, peer-addr map, and routing table entry). Leaving
@@ -21224,6 +21463,20 @@ impl MeshNode {
                             // delete parts of it — the same
                             // published-then-torn shape the install
                             // path takes the guard to prevent.
+                            // HOLD-2 item 1: the eviction and the republication
+                            // it causes are ONE serialized transition. Losing a
+                            // session moves the projection in the direction
+                            // that matters most — a pool still annotating this
+                            // provider DIRECT would preselect a session that no
+                            // longer exists — so a build must not be able to
+                            // publish between its revalidation and its store
+                            // while this removal lands.
+                            let evicted = commit_peer_transition(
+                                &session_routing_evict,
+                                &routing_registry_evict,
+                                &peers,
+                                &peer_entity_ids_evict,
+                                || {
                             let evicted = peer_transitions_evict.with(node_id, || {
                                 let evicted = peers.remove_if(&node_id, |_, info| {
                                     info.session.session_id() == observed_session_id
@@ -21266,25 +21519,16 @@ impl MeshNode {
                                 subnet_contexts_evict.forget_peer(node_id);
                                 true
                             });
+                                    // An eviction that declined (the
+                                    // exact-session guard) leaves `evicted`
+                                    // false and wakes nothing.
+                                    (evicted, evicted)
+                                },
+                            );
                             if evicted {
                                 tracing::info!(
                                     node_id = format!("{:#x}", node_id),
                                     "evicted permanently-dead peer from peer map",
-                                );
-                                // OLB-2B.3c step 2: losing a session moves the
-                                // projection exactly as gaining one does — and
-                                // in the direction that matters most, because a
-                                // pool still annotating this provider DIRECT
-                                // would preselect a session that no longer
-                                // exists. Run with the peer shard released. An
-                                // eviction that declined (the exact-session
-                                // guard) leaves `evicted` false and wakes
-                                // nothing.
-                                note_session_transition(
-                                    &session_routing_evict,
-                                    &routing_registry_evict,
-                                    &peers,
-                                    &peer_entity_ids_evict,
                                 );
                             }
                             // Also drop the failure-detector entry so
@@ -26021,41 +26265,52 @@ impl MeshNode {
         //    the entity binding is deferred to the eventual direct
         //    announcement.
         if signature_verified && ann.hop_count == 0 {
-            if let Some(existing) = ctx.peer_entity_ids.get(&from_node) {
-                if *existing.value() != ann.entity_id {
-                    tracing::trace!(
-                        from_node = format!("{:#x}", from_node),
-                        "capability: entity_id rebind rejected (TOFU)"
-                    );
-                    return;
-                }
-            } else {
-                ctx.peer_entity_ids.insert(from_node, ann.entity_id.clone());
-                // Mirror the entity-id pin into the origin_hash
-                // reverse index. First-write-wins: an existing
-                // claimant keeps the slot; a different node_id
-                // grinding the same u64 (2^32 adversarial work,
-                // accidental 2^-32) is rejected. Post-
-                // `WIRE_ORIGIN_HASH_64BIT` the wire header carries
-                // the full `EntityId::origin_hash()` u64 so the
-                // reverse-index key matches the application-layer
-                // value verbatim — accidental collisions are
-                // effectively impossible.
-                let origin_hash = ann.entity_id.origin_hash();
-                let _ = ctx
-                    .origin_hash_to_node
-                    .entry(origin_hash)
-                    .or_insert(from_node);
-                // OLB-2B.3c step 2: `from_node` now resolves to a provider
-                // entity, so the session/direct-state projection moved. Only
-                // this arm reaches here — a rejected rebind and a matching
-                // re-announcement both publish nothing and wake nothing.
-                note_session_transition(
-                    &ctx.session_routing,
-                    &ctx.routing_registry,
-                    &ctx.peers,
-                    &ctx.peer_entity_ids,
-                );
+            // HOLD-2 item 1: the pin and the republication it causes are ONE
+            // serialized transition. `Err(())` is the rejected rebind, which
+            // returns without pinning; `Ok(false)` is a matching
+            // re-announcement. Both publish nothing.
+            let pinned = commit_peer_transition(
+                &ctx.session_routing,
+                &ctx.routing_registry,
+                &ctx.peers,
+                &ctx.peer_entity_ids,
+                || {
+                    let outcome: Result<bool, ()> =
+                        if let Some(existing) = ctx.peer_entity_ids.get(&from_node) {
+                            if *existing.value() != ann.entity_id {
+                                tracing::trace!(
+                                    from_node = format!("{:#x}", from_node),
+                                    "capability: entity_id rebind rejected (TOFU)"
+                                );
+                                Err(())
+                            } else {
+                                Ok(false)
+                            }
+                        } else {
+                            ctx.peer_entity_ids.insert(from_node, ann.entity_id.clone());
+                            // Mirror the entity-id pin into the origin_hash
+                            // reverse index. First-write-wins: an existing
+                            // claimant keeps the slot; a different node_id
+                            // grinding the same u64 (2^32 adversarial work,
+                            // accidental 2^-32) is rejected. Post-
+                            // `WIRE_ORIGIN_HASH_64BIT` the wire header carries
+                            // the full `EntityId::origin_hash()` u64 so the
+                            // reverse-index key matches the application-layer
+                            // value verbatim — accidental collisions are
+                            // effectively impossible.
+                            let origin_hash = ann.entity_id.origin_hash();
+                            let _ = ctx
+                                .origin_hash_to_node
+                                .entry(origin_hash)
+                                .or_insert(from_node);
+                            Ok(true)
+                        };
+                    let published = matches!(outcome, Ok(true));
+                    (outcome, published)
+                },
+            );
+            if pinned.is_err() {
+                return;
             }
         }
 
@@ -26313,12 +26568,11 @@ impl MeshNode {
         let partition_filter = ctx.partition_filter.clone();
 
         tokio::spawn(async move {
-            for entry in peers.iter() {
-                let peer = entry.value();
-                if peer.node_id == from_node {
-                    continue; // never send back to the ingress peer
-                }
-                if partition_filter.contains(&peer.addr()) {
+            // Snapshot FIRST (HOLD-2 item 2): this path used the borrowed
+            // session AFTER awaiting, so the shard stayed wedged for the whole
+            // fan-out rather than for one send.
+            for peer in snapshot_peers(&peers, Some(from_node)) {
+                if partition_filter.contains(&peer.addr) {
                     continue;
                 }
                 let session = &peer.session;
@@ -26337,7 +26591,7 @@ impl MeshNode {
                     PacketFlags::NONE,
                     SUBPROTOCOL_SCOPED_CAPABILITY_ANN,
                 );
-                let _ = socket.send_to(&packet, peer.addr()).await;
+                let _ = send_datagram(&socket, &packet, peer.addr).await;
                 drop(builder);
                 session.touch();
             }
@@ -26363,15 +26617,12 @@ impl MeshNode {
             // invariant.
             let next_hop_addr = router.routing_table().lookup(origin_node_id);
 
-            for entry in peers.iter() {
-                let peer = entry.value();
-                if peer.node_id == sender_node_id {
-                    continue; // never send back to whoever gave it to us
-                }
-                if Some(peer.addr()) == next_hop_addr {
+            // Snapshot FIRST (HOLD-2 item 2), same as the scoped path above.
+            for peer in snapshot_peers(&peers, Some(sender_node_id)) {
+                if Some(peer.addr) == next_hop_addr {
                     continue; // split horizon: that's our path to the origin
                 }
-                if partition_filter.contains(&peer.addr()) {
+                if partition_filter.contains(&peer.addr) {
                     continue;
                 }
 
@@ -26394,7 +26645,7 @@ impl MeshNode {
                     PacketFlags::NONE,
                     SUBPROTOCOL_CAPABILITY_ANN,
                 );
-                let _ = socket.send_to(&packet, peer.addr()).await;
+                let _ = send_datagram(&socket, &packet, peer.addr).await;
                 drop(builder);
                 session.touch();
             }
@@ -29005,7 +29256,13 @@ impl MeshNode {
         // serialized at send time through the epoch-checked path);
         // `None` = the announce was rate-limit-deferred or coalesced.
         let to_broadcast = {
-            let _announce_guard = self.announce_mu.lock();
+            let Some(_announce_guard) = self.lock_announce_mu() else {
+                return Err(AdapterError::Connection(format!(
+                    "announce: the announce lock was not obtainable within \
+                     {ANNOUNCE_LOCK_DEADLINE:?}; refusing rather than blocking an \
+                     exported call indefinitely"
+                )));
+            };
             // Set a new baseline or re-read the current one — both
             // under `announce_mu` so a re-announce never clobbers a
             // concurrent explicit announce's newer baseline. The
