@@ -15090,8 +15090,11 @@ impl MeshNode {
         &self,
         desired: Option<super::behavior::org::OrgMembershipCert>,
     ) {
+        probe!("X node={:#x} rebuild_cached_announcement locking announce_mu", self.node_id);
         let _announce_guard = self.announce_mu.lock();
+        probe!("X node={:#x} rebuild_cached_announcement acquired", self.node_id);
         let Some(cached) = self.local_emission.load_full() else {
+            probe!("X node={:#x} rebuild early-return RELEASING", self.node_id);
             return;
         };
         if cached.public.owner_cert == desired {
@@ -15162,6 +15165,7 @@ impl MeshNode {
             "cached announcement re-validated: owner certificate no longer \
              matches emission state; republished"
         );
+        probe!("X node={:#x} rebuild done RELEASING", self.node_id);
     }
 
     /// Returns `true` iff a migration subprotocol handler is
@@ -29019,9 +29023,9 @@ impl MeshNode {
         // serialized at send time through the epoch-checked path);
         // `None` = the announce was rate-limit-deferred or coalesced.
         let to_broadcast = {
-            probe!("A attempt: locking announce_mu");
+            probe!("A node={:#x} locking announce_mu mode={mode:?}", self.node_id);
             let _announce_guard = self.announce_mu.lock();
-            probe!("B attempt: announce_mu acquired");
+            probe!("B node={:#x} announce_mu acquired", self.node_id);
             // Set a new baseline or re-read the current one — both
             // under `announce_mu` so a re-announce never clobbers a
             // concurrent explicit announce's newer baseline. The
@@ -29498,6 +29502,7 @@ impl MeshNode {
                         // flush will pick up the `local_announcement`
                         // we just stored. Nothing to schedule.
                         if gate.deferred_scheduled {
+                            probe!("G node={:#x} arm=already-deferred RELEASING", self.node_id);
                             return Ok(AnnounceOutcome::Coalesced);
                         }
                         // Bare-start node (no `start_arc`): there is no
@@ -29507,6 +29512,7 @@ impl MeshNode {
                         // change on the next out-of-window announce or
                         // the keep-alive).
                         if self.self_weak.get().is_none() {
+                            probe!("G node={:#x} arm=no-arc RELEASING", self.node_id);
                             tracing::debug!(
                                 "capability: in-window announce not deferred \
                              (node not started via start_arc)"
@@ -29522,7 +29528,9 @@ impl MeshNode {
                         let (delay, generation) = (min_interval - e, gate.deferral_generation);
                         // Never spawn under the gate lock (unchanged ordering).
                         drop(gate);
+                        probe!("G node={:#x} arm=defer spawn enter", self.node_id);
                         self.spawn_deferred_announce(delay, generation);
+                        probe!("G node={:#x} arm=defer spawn done RELEASING", self.node_id);
                         None
                     }
                     _ => {
@@ -29530,11 +29538,15 @@ impl MeshNode {
                         // out what it held: if the send below is refused nothing
                         // actually shipped, and the claim must be released rather
                         // than coalesce away the corrective re-announce.
-                        Some(Self::claim_broadcast_window_locked(&mut gate, now))
+                        {
+                            probe!("G node={:#x} arm=claim", self.node_id);
+                            Some(Self::claim_broadcast_window_locked(&mut gate, now))
+                        }
                     }
                 }
             }
         };
+        probe!("R node={:#x} announce_mu RELEASED", self.node_id);
         // `announce_mu` is released here — the peer broadcast is
         // network I/O and must never hold the announce lock.
 

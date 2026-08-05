@@ -3810,7 +3810,18 @@ impl MeshNode {
         let mesh_for_announce = Arc::clone(self);
         let service_for_log = service.to_string();
         tokio::spawn(async move {
-            if let Err(e) = mesh_for_announce.reannounce_current_capabilities().await {
+            eprintln!(
+                "[probe {:?}] S serve auto-reannounce task START node={:#x}",
+                std::thread::current().id(),
+                mesh_for_announce.node_id()
+            );
+            let __r = mesh_for_announce.reannounce_current_capabilities().await;
+            eprintln!(
+                "[probe {:?}] S serve auto-reannounce task END ok={}",
+                std::thread::current().id(),
+                __r.is_ok()
+            );
+            if let Err(e) = __r {
                 tracing::warn!(
                     error = %e,
                     service = %service_for_log,
