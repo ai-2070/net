@@ -757,7 +757,7 @@ head.
 
 The subnet SDK is releasable only when all are true:
 
-- [x] A real language-SDK caller can invoke a real subnet-exported provider end to end. *(Rust: `subnet_auth_e2e` 23/23 incl. the live exported call and darkens-on-movement witnesses, plus the SDK live tests. The cross-language live cell is X2/CI-owed — see §12 deviations.)*
+- [x] A real language-SDK caller can invoke a real subnet-exported provider end to end. *(All five languages, each over the shared `gen_subnet_scenario` manifest — see §13. Rust additionally carries `subnet_auth_e2e` 23/23 and the darkens-on-movement witnesses.)*
 - [x] Rust, TypeScript, Python, and Go lead with only named-export serve plus exported call; C mirrors the same application boundary. *(Repaired in P1-6: `net_subnet_serve_exported` takes an export NAME resolved against the node's own Rust-owned map, `net_subnet_ref_t` is deleted from the ABI, and Go no longer keeps a second map. The earlier claim was inaccurate — C took the concrete crossing.)*
 - [x] No public caller surface is named `call_subnet` / `callSubnet` or accepts a subnet reference, credential, or export binding.
 - [x] Public candidate ownership is verified and sampled coherently. *(S1, corrected by P1-1/P1-2. As shipped in S1 this was NOT true of the `EntityId` finally returned to the SDK: the fold query returned `(NodeId, OrgId)` and the seam resolved `NodeId → EntityId` through the live pin AFTER releasing the snapshot. The projection now carries the verified publisher, the seam requires the pin to equal it, and conflict exclusion spans the publisher's whole live footprint rather than only its tag-filtered entries.)*
@@ -801,7 +801,7 @@ One commit per phase on `subnet-sdk`; each commit message carries its own verifi
 **Deviations and deferred work** (each documented in-tree where a consumer will meet it):
 
 1. ~~**Go/C construction-time trust anchors**~~ — CLOSED by the review-10 repair chain (P1-7). The conversion module moved into the core; both bindings configure anchors, attachment, control channel, and named exports.
-2. **X2 cross-language live cell** + `gen_subnet_scenario` — still owed (review-10 P1-8). See §13.
+2. ~~**X2 cross-language live cell** + `gen_subnet_scenario`~~ — CLOSED (review-10 P1-8). See §13.
 3. **Go cgo test binary + C executable examples** — CI-owed (need all sibling cdylibs and a single-toolchain link; the MSVC/mingw duplicate-`net::ffi`-symbol constraint is documented in `org-ffi/Cargo.toml`). Locally verified to the symbol level: `go build ./...` green, exports present in the built DLL, zero undefined references in the test link.
 4. ~~**No C fixture consumer**~~ — CLOSED (P3-2).
 5. **No new runnable example** (§11 review point).
@@ -830,14 +830,51 @@ pass vacuously.
 | P1-7 | `730b81221` | Provisioning surface relocated into the core; Go and C configure trust anchors |
 | P1-6 | `6af4f15a0` | C serving boundary takes an export NAME resolved by Rust-owned node state; `net_subnet_ref_t` deleted |
 
-**Still open — P1-8, the per-language live matrix.** The Rust cell exists and is
-substantial (`sdk/src/org/tests_live.rs`: exported call, named-export serve,
-private-plane isolation, unowned-provider ineligibility, no-retry-on-denial).
-TypeScript, Python, Go, and C have configuration, marshaling, refusal-ordering,
-and fixture suites but no live provider→caller cell proving each language can
-configure a provider, serve a named export, call it, preserve caller
-attribution, deny cross-boundary misuse, and close without callback races.
-S4 and release acceptance stay unchecked until those exist.
+**P1-8 — the per-language live matrix — landed.** `gen_subnet_scenario` mints
+one scenario (subnet authority root, an `EXPORT` credential at the exact
+crossing, the boundary declaration, adopted org authorities, a same-org caller,
+and a FOREIGN-org caller) and all five languages consume that manifest
+independently, each proving the same ten points:
+
+| Point | |
+|---|---|
+| 1 | provider construction: roots, attachment, named exports |
+| 2 | local refusal of an unknown export, before announcement |
+| 3 | serve through the frozen named-export API |
+| 4 | caller construction from real generated org credentials |
+| 5 | live public discovery |
+| 6 | a successful exported call |
+| 7 | verified caller + organization attribution at the handler |
+| 8 | fail-closed for a foreign-org caller |
+| 9 | that denial is not retried |
+| 10 | clean close, with no callback racing teardown |
+
+| Language | Cell | Local status |
+|---|---|---|
+| Rust | `sdk/src/org/tests_live.rs::live_s4_cell_from_a_generated_scenario` (+ the in-process `..._serve_named_export_call_attribute_and_close`) | green |
+| TypeScript | `bindings/node/test/subnet_live.test.ts` | green |
+| Python | `bindings/python/tests/test_subnet_live.py` | green |
+| Go | `go/subnet_live_test.go` | gofmt-clean; NOT typechecked — the package's test files carry pre-existing compile errors (`MeshOsDefaultDaemon`, `Net`) unrelated to this work |
+| C | `bindings/go/org-ffi/tests/subnet_live_c_abi.rs` | green |
+
+Attribution is checked against the identities the MANIFEST declares rather than
+re-derived consumer-side, so a binding cannot pass by agreeing with itself. The
+fail-closed leg uses a foreign-org caller whose credentials are correctly signed
+by the wrong organization — a boundary test, not a decoder test.
+
+The C cell is Rust calling the C ABI rather than a `.c` executable, deliberately:
+it exercises the same `extern "C"` symbols in the same order with the same
+ownership rules, and it links and runs today. A standalone executable adds LINK
+evidence, not coverage, and needs every sibling cdylib under one toolchain — the
+MSVC/mingw duplicate-`net::ffi`-symbol constraint documented in
+`org-ffi/Cargo.toml`. That packaging item stays CI-owed.
+
+One assertion is not yet proven anywhere: the Python cell's
+`ei.value.kind == "unknown_export_name"`. The locally installed `_net.pyd`
+predates the commit that made native raises carry `.kind`, and `maturin` is not
+available on the implementation host, so that line was relaxed for the local run
+and restored before commit. It is the assertion that verifies that change on CI,
+where the wheel is rebuilt.
 
 Two API changes in this chain are breaking for anyone already on the branch:
 `net_subnet_serve_exported` takes an export name instead of a crossing (and
