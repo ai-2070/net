@@ -3483,7 +3483,15 @@ pub unsafe extern "C" fn net_mesh_announce_capabilities(
     };
     let caps = capability_set_from_json(parsed);
     let node = h.inner.clone();
-    match block_on(async move { node.announce_capabilities(caps).await }) {
+    eprintln!("[probe FFI] net_mesh_announce_capabilities: enter block_on");
+    let out = block_on(async move {
+        eprintln!("[probe FFI] inside block_on, awaiting announce_capabilities");
+        let r = node.announce_capabilities(caps).await;
+        eprintln!("[probe FFI] announce_capabilities returned ok={}", r.is_ok());
+        r
+    });
+    eprintln!("[probe FFI] net_mesh_announce_capabilities: exit");
+    match out {
         Ok(()) => 0,
         Err(_) => NET_ERR_CAPABILITY,
     }

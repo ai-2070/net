@@ -6830,6 +6830,17 @@ struct ScopedSourceSnapshot {
     >,
 }
 
+/// TEMPORARY diagnostic probe (Go-bindings announce hang). Throwaway branch.
+macro_rules! probe {
+    ($($a:tt)*) => {
+        eprintln!(
+            "[probe {:?}] {}",
+            std::thread::current().id(),
+            format_args!($($a)*)
+        )
+    };
+}
+
 /// Send ONE datagram under [`DATAGRAM_SEND_DEADLINE`].
 ///
 /// Every send on a caller-facing path goes through here, so the bound is a
@@ -28677,6 +28688,7 @@ impl MeshNode {
         // the capability-announcement path, which an exported FFI entry point
         // reaches synchronously — so a pending send used to stop being this
         // call's problem and become the whole peer plane's.
+        probe!("L send_subprotocol_to_node {node_id:#x} sub={subprotocol_id:#x} lookup");
         let (peer_addr, session) = {
             let peer = self
                 .peers
@@ -28712,7 +28724,9 @@ impl MeshNode {
         let packet =
             builder.build_subprotocol(stream_id, seq, &events, PacketFlags::NONE, subprotocol_id);
 
+        probe!("L send_datagram enter");
         send_datagram(&self.socket, &packet, peer_addr).await?;
+        probe!("L send_datagram done");
 
         drop(builder);
         session.touch();
@@ -29005,7 +29019,9 @@ impl MeshNode {
         // serialized at send time through the epoch-checked path);
         // `None` = the announce was rate-limit-deferred or coalesced.
         let to_broadcast = {
+            probe!("A attempt: locking announce_mu");
             let _announce_guard = self.announce_mu.lock();
+            probe!("B attempt: announce_mu acquired");
             // Set a new baseline or re-read the current one — both
             // under `announce_mu` so a re-announce never clobbers a
             // concurrent explicit announce's newer baseline. The
@@ -29220,7 +29236,9 @@ impl MeshNode {
             #[cfg(feature = "nat-traversal")]
             let (caps, reflex_snapshot) = {
                 use super::traversal::classify::NatClass;
+                probe!("C locking traversal_publish_mu");
                 let _g = self.traversal_publish_mu.lock();
+                probe!("C traversal_publish_mu acquired");
                 let class =
                     NatClass::from_u8(self.nat_class.load(std::sync::atomic::Ordering::Acquire));
                 let reflex = self.reflex_addr.load_full().map(|arc| *arc);
@@ -29389,6 +29407,7 @@ impl MeshNode {
             // precondition is `sign` — an unsigned announcement
             // projects no ownership even for ourselves. Uses the FULL
             // (self-fold) announcement so owner-scoped tags land locally.
+            probe!("E verified_owner: revocation snapshot");
             let verified_owner = {
                 let store = self.org_revocation.load();
                 let floors = store.as_ref().map(|s| s.snapshot());
@@ -29450,7 +29469,9 @@ impl MeshNode {
             let now = std::time::Instant::now();
             let min_interval = self.config.min_announce_interval;
             {
+                probe!("G locking announce_gate");
                 let mut gate = self.announce_gate.lock();
+                probe!("G announce_gate acquired");
                 let elapsed = gate
                     .last_broadcast_at
                     .map(|t| now.saturating_duration_since(t));
@@ -29525,6 +29546,7 @@ impl MeshNode {
         let Some((claim_id, previous_broadcast_at)) = to_broadcast else {
             return Ok(AnnounceOutcome::Coalesced);
         };
+        probe!("H emission build (send seqlock)");
         let Some(emission) = self.announcement_bytes_for_send_probed(
             probe.map(|p| p as &dyn Fn()),
             super::behavior::org::current_timestamp(),
@@ -29540,7 +29562,9 @@ impl MeshNode {
             return Ok(AnnounceOutcome::RefusedBySecurity);
         };
         let shipped_generation = emission.exposure_generation;
+        probe!("I broadcast_emission enter");
         self.broadcast_emission(&emission).await;
+        probe!("I broadcast_emission done");
         self.record_broadcast_exposure_generation(shipped_generation);
         Ok(AnnounceOutcome::Sent)
     }
@@ -29558,11 +29582,13 @@ impl MeshNode {
         // peer learns to trust THIS node's identity, so it has to reach
         // every peer we have a session with — including the ones we
         // reach through a relay, which no address-keyed send can name.
+        probe!("K addr lookup {node_id:#x}");
         let addr = self
             .peers
             .get(&node_id)
             .map(|p| p.value().addr())
             .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
+        probe!("K addr={addr} scoped={}", emission.scoped.len());
         if let Err(e) = self
             .send_subprotocol_to_node(node_id, SUBPROTOCOL_CAPABILITY_ANN, &emission.public)
             .await
@@ -29594,9 +29620,13 @@ impl MeshNode {
     /// fan-out. Shared by the immediate announce path and the RT-1 trailing-edge
     /// flush so the two can't drift (RT-1 review Finding 14).
     async fn broadcast_emission(&self, emission: &SendEmission) {
+        probe!("J collecting peer ids");
         let peer_ids: Vec<u64> = self.peers.iter().map(|e| *e.key()).collect();
+        probe!("J peers={}", peer_ids.len());
         for node_id in peer_ids {
+            probe!("J send_emission_to {node_id:#x} enter");
             self.send_emission_to(node_id, emission).await;
+            probe!("J send_emission_to {node_id:#x} done");
         }
     }
 
