@@ -69,7 +69,7 @@ The consequence for applications is the **exported service**. A provider inside 
 mesh.serve_subnet_exported("fleet.telemetry", "factory-export", handler)?;
 ```
 
-The caller stays an ordinary organization client and calls `org.call_exported("fleet.telemetry", &req)`. It never names a subnet, never joins the provider's subnet, and receives no subnet context; discovery runs on the public plane through a verified ownership projection, and admission is the same per-call organization proof as any protected call. Dispatch revalidates the exported crossing against the provider's live gateway authority on every call — a revoked or epoch-stale export stops serving even though its registration succeeded.
+The caller stays an ordinary organization client and calls `org.call_exported("fleet.telemetry", &req)` — the whole path from offline ceremony to live call is walked in [Subnet-Exported Services](/docs/guides/subnet-exported-services). It never names a subnet, never joins the provider's subnet, and receives no subnet context; discovery runs on the public plane through a verified ownership projection, and admission is the same per-call organization proof as any protected call. Dispatch revalidates the exported crossing against the provider's live gateway authority on every call — a revoked or epoch-stale export stops serving even though its registration succeeded.
 
 An authority-qualified crossing is not a `SubnetId`: equal paths under two different authorities are unrelated. That is what keeps one tenant's `[3, 7]` from meaning anything about another's.
 

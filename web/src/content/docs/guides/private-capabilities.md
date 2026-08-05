@@ -21,6 +21,8 @@ Net has four authorization surfaces and they answer different questions. Reach f
 
 If you find yourself reaching for capability `scope:*` tags to keep tenants apart, stop — those filter *your own* query and don't stop anyone from querying without them. That's the case org auth exists for.
 
+And if the provider sits **inside a protected subnet** and the caller outside it, org auth is still the caller's half of the answer — the provider's half is a subnet-authority export, walked end-to-end in [Subnet-Exported Services](/docs/guides/subnet-exported-services).
+
 ## Step 1: issue credentials offline
 
 Nothing in the SDK issues credentials. This is a ceremony against an org root key that never touches a node, run through [`net-mesh org`](/docs/reference/cli).

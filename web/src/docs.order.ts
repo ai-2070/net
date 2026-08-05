@@ -110,6 +110,7 @@ export const DOCS_ORDER: DocsOrderConfig = {
       "discover-and-invoke",
       "nrpc",
       "private-capabilities",
+      "subnet-exported-services",
       "mesh-streams",
       // Integrations and agent handoff.
       "wrap-mcp-server",
