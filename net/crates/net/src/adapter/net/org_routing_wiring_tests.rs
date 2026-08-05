@@ -826,7 +826,33 @@ async fn drop_fences_and_aborts_rather_than_detaching_the_supervisor() {
     );
 }
 
-/// A scratch directory that cleans itself up.
+/// A scratch directory for one witness's revocation sidecar.
+///
+/// **It deliberately does not delete itself, and the path carries a
+/// process-unique sequence number.** Both halves are load-bearing on unix, and
+/// neither is tidiness.
+///
+/// `OrgRevocationStore` keys its PROCESS-GLOBAL core registry by the `.lock`
+/// sidecar's FILE IDENTITY — `BackingId::FileId { device, inode }` on unix —
+/// so that two path aliases of one sidecar share one live view (AV-9). That is
+/// correct, and it is also why a witness must never free a sidecar inode while
+/// its core can still be joined: Linux reuses a freed inode immediately, so the
+/// NEXT witness's sidecar can land on it, derive the SAME `BackingId`, and
+/// `join_or_create_core` will join the finished witness's still-live core by
+/// design — inheriting its floors, its poison bit and its
+/// generation-exhaustion latch.
+///
+/// That aliasing is exactly how a witness which never touched poison reads its
+/// own freshly-installed facts as cold, and how a witness holding a brand-new
+/// store finds its generation already exhausted. It is scheduling-dependent,
+/// so it presents as four witnesses failing in varying combinations rather
+/// than as one deterministic break — which is what it did on the OLB-2B.3c
+/// step-2 candidate, on Linux only, while every one of them passed locally.
+///
+/// Keeping the sidecar alive for the life of the process makes the aliasing
+/// UNREACHABLE rather than unlikely; the sequence number additionally makes
+/// two scratch paths in one process impossible. The residue is a few bytes of
+/// JSON per witness under the OS temp directory.
 struct Scratch(std::path::PathBuf);
 
 impl Scratch {
@@ -834,11 +860,13 @@ impl Scratch {
         &self.0
     }
     fn new(tag: &str, node: &MeshNode) -> Self {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         // Entity component restored for collision isolation; truncated because
         // the full id pushes the authority `.lock` path past the Windows limit.
         let entity = format!("{}", node.entity_id());
         let path = std::env::temp_dir().join(format!(
-            "olb-{tag}-{}-{}",
+            "olb-{tag}-{}-{seq}-{}",
             std::process::id(),
             &entity[..entity.len().min(8)]
         ));
@@ -854,12 +882,6 @@ impl Scratch {
             )
             .expect("init revocation store"),
         )
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
