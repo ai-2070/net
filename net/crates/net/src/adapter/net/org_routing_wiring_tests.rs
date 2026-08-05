@@ -330,6 +330,7 @@ async fn a_mutation_during_reconstruction_defeats_the_production_commit_pin() {
     let registry = NodeOrgRoutingRegistry::new(
         Arc::new(PausingSource {
             inner: ScopedSlotSource {
+                session_routing: node.session_routing.clone(),
                 scoped_discovery: scoped.clone(),
                 publication: publication.clone(),
                 org_revocation: node.org_revocation.clone(),
@@ -437,6 +438,7 @@ async fn a_mutation_during_reconstruction_defeats_the_production_commit_pin() {
 async fn the_production_source_is_scope_exact_and_counts_unserved_scopes() {
     let node = node().await;
     let source = ScopedSlotSource {
+        session_routing: node.session_routing.clone(),
         scoped_discovery: node.scoped_discovery.clone(),
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
@@ -609,6 +611,7 @@ async fn startup_that_loses_to_shutdown_spawns_nothing() {
 async fn revocation_authority_movement_alone_defeats_the_commit_pin() {
     let node = node().await;
     let source = ScopedSlotSource {
+        session_routing: node.session_routing.clone(),
         scoped_discovery: node.scoped_discovery.clone(),
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
@@ -886,6 +889,7 @@ fn arm_authority_contention(node: &MeshNode) -> std::sync::mpsc::Receiver<()> {
 async fn a_production_store_swap_cannot_publish_while_a_commit_pin_is_alive() {
     let node = node().await;
     let source = ScopedSlotSource {
+        session_routing: node.session_routing.clone(),
         scoped_discovery: node.scoped_discovery.clone(),
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
@@ -1030,6 +1034,7 @@ async fn facts_built_against_superseded_floors_read_cold() {
 async fn an_exhausted_authority_epoch_fences_rather_than_aliasing() {
     let node = node().await;
     let source = ScopedSlotSource {
+        session_routing: node.session_routing.clone(),
         scoped_discovery: node.scoped_discovery.clone(),
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
@@ -1094,6 +1099,7 @@ async fn an_exhausted_store_generation_makes_every_scope_unserved() {
         .expect("install");
 
     let source = ScopedSlotSource {
+        session_routing: node.session_routing.clone(),
         scoped_discovery: node.scoped_discovery.clone(),
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
@@ -1305,6 +1311,7 @@ async fn an_exhausted_store_generation_parks_apply_without_spinning_and_recovers
     );
 
     let source = ScopedSlotSource {
+        session_routing: node.session_routing.clone(),
         scoped_discovery: node.scoped_discovery.clone(),
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
@@ -1412,6 +1419,7 @@ async fn an_empty_registry_whose_authority_moves_under_the_probe_is_redriven() {
     let registry = NodeOrgRoutingRegistry::new(
         Arc::new(PausingSource {
             inner: ScopedSlotSource {
+                session_routing: node.session_routing.clone(),
                 scoped_discovery: node.scoped_discovery.clone(),
                 publication: node.scoped_publication.clone(),
                 org_revocation: node.org_revocation.clone(),
@@ -1548,6 +1556,7 @@ async fn an_exhausted_scoped_generation_fences_the_routing_source() {
 
     let node = node().await;
     let source = ScopedSlotSource {
+        session_routing: node.session_routing.clone(),
         scoped_discovery: node.scoped_discovery.clone(),
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
@@ -2048,6 +2057,7 @@ async fn a_recapture_across_two_authority_epochs_does_not_settle_current() {
     let work: Arc<RegistryWork> = Arc::default();
     let registry = NodeOrgRoutingRegistry::new(
         Arc::new(ScopedSlotSource {
+            session_routing: node.session_routing.clone(),
             scoped_discovery: node.scoped_discovery.clone(),
             publication: node.scoped_publication.clone(),
             org_revocation: node.org_revocation.clone(),
@@ -2158,6 +2168,7 @@ async fn a_recapture_across_two_authority_epochs_does_not_settle_current() {
 async fn a_snapshot_cannot_straddle_a_store_publication() {
     let node = node().await;
     let source = ScopedSlotSource {
+        session_routing: node.session_routing.clone(),
         scoped_discovery: node.scoped_discovery.clone(),
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
@@ -2206,6 +2217,7 @@ async fn a_snapshot_cannot_straddle_a_store_publication() {
         (
             tokio::task::spawn_blocking(move || {
                 let src = ScopedSlotSource {
+                    session_routing: node.session_routing.clone(),
                     scoped_discovery: node.scoped_discovery.clone(),
                     publication: node.scoped_publication.clone(),
                     org_revocation: node.org_revocation.clone(),
@@ -2347,6 +2359,7 @@ async fn a_floor_publication_under_the_pin_cannot_settle_current() {
     let registry = NodeOrgRoutingRegistry::new(
         Arc::new(PausingSource {
             inner: ScopedSlotSource {
+                session_routing: node.session_routing.clone(),
                 scoped_discovery: node.scoped_discovery.clone(),
                 publication: node.scoped_publication.clone(),
                 org_revocation: node.org_revocation.clone(),
@@ -2542,6 +2555,7 @@ async fn a_publication_cannot_occupy_the_gap_between_validation_and_settlement()
         .expect("install");
 
     let source = ScopedSlotSource {
+        session_routing: node.session_routing.clone(),
         scoped_discovery: node.scoped_discovery.clone(),
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
@@ -2663,6 +2677,7 @@ async fn poison_cannot_occupy_the_gap_between_validation_and_settlement() {
         .expect("install");
 
     let source = ScopedSlotSource {
+        session_routing: node.session_routing.clone(),
         scoped_discovery: node.scoped_discovery.clone(),
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
@@ -2800,6 +2815,7 @@ async fn poison_before_the_validation_is_detected() {
     let registry = NodeOrgRoutingRegistry::new(
         Arc::new(PausingSource {
             inner: ScopedSlotSource {
+                session_routing: node.session_routing.clone(),
                 scoped_discovery: node.scoped_discovery.clone(),
                 publication: node.scoped_publication.clone(),
                 org_revocation: node.org_revocation.clone(),
@@ -3910,6 +3926,7 @@ async fn a_handles_lockfree_read_observes_the_registrys_published_artifact() {
         .expect("install");
 
     let source = ScopedSlotSource {
+        session_routing: node.session_routing.clone(),
         scoped_discovery: node.scoped_discovery.clone(),
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
@@ -4033,6 +4050,7 @@ async fn consumer_with_installed_grant(tag: &str) -> (Arc<MeshNode>, [u8; 32], [
 async fn a_stale_audience_handle_is_unserved_beside_its_installed_sibling() {
     let (node, grant_id, installed_handle) = consumer_with_installed_grant("pairkey").await;
     let source = ScopedSlotSource {
+        session_routing: node.session_routing.clone(),
         scoped_discovery: node.scoped_discovery.clone(),
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
@@ -4135,6 +4153,7 @@ async fn a_consumer_grant_removal_cannot_occupy_the_gap_between_validation_and_s
     );
 
     let source = ScopedSlotSource {
+        session_routing: node.session_routing.clone(),
         scoped_discovery: node.scoped_discovery.clone(),
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
@@ -4517,6 +4536,7 @@ impl GrantFixture {
     /// capture rather than on the read seam.
     fn source(&self) -> ScopedSlotSource {
         ScopedSlotSource {
+            session_routing: self.node.session_routing.clone(),
             scoped_discovery: self.node.scoped_discovery.clone(),
             publication: self.node.scoped_publication.clone(),
             org_revocation: self.node.org_revocation.clone(),
@@ -6873,4 +6893,511 @@ async fn a_second_installed_grant_still_withdraws_terminally_after_the_first() {
     drop(held_a);
     drop(held_b);
     let _ = f.node.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// OLB-2B.3c step 2 — the session/direct-state projection and the actor build
+// cycle, driven through the PRODUCTION node.
+// ---------------------------------------------------------------------------
+
+/// A completed Noise handshake's initiator-side session keys.
+fn fresh_session_keys() -> crate::adapter::net::crypto::SessionKeys {
+    use crate::adapter::net::crypto::{NoiseHandshake, StaticKeypair};
+    let psk = [0x42u8; 32];
+    let responder_kp = StaticKeypair::generate();
+    let mut initiator =
+        NoiseHandshake::initiator(&psk, &responder_kp.public).expect("noise initiator");
+    let mut responder = NoiseHandshake::responder(&psk, &responder_kp).expect("noise responder");
+    let msg1 = initiator.write_message(&[]).expect("msg1");
+    responder.read_message(&msg1).expect("read msg1");
+    let msg2 = responder.write_message(&[]).expect("msg2");
+    initiator.read_message(&msg2).expect("read msg2");
+    initiator.into_session_keys().expect("session keys")
+}
+
+/// Install a live peer session directly into the node's peer table.
+///
+/// The production installers reach it through `install_peer_transition`, which
+/// needs a completed handshake AND a socket; these witnesses are about what the
+/// PROJECTION makes of the peer table, so they seed it and then drive the same
+/// republication every production transition drives. The witness that asserts
+/// on the TRANSITION itself uses `install_direct`, the real path.
+fn seed_peer(node: &MeshNode, node_id: u64, direct: bool) -> u64 {
+    let keys = fresh_session_keys();
+
+    let addr: SocketAddr = format!("10.9.0.{}:9000", (node_id % 250) + 1)
+        .parse()
+        .expect("addr");
+    let session = Arc::new(NetSession::new(keys, addr, 4, false));
+    let session_id = session.session_id();
+    node.peers.insert(
+        node_id,
+        PeerInfo {
+            node_id,
+            transport: if direct {
+                PeerTransport::Direct { owned_addr: addr }
+            } else {
+                PeerTransport::Routed {
+                    relay_addr: addr,
+                    adjacent_relay_identity: None,
+                }
+            },
+            session,
+            remote_static_pub: [0u8; 32],
+            last_initiator_ephemeral: None,
+        },
+    );
+    session_id
+}
+
+/// The eligibility the production projection currently reports for `entity`.
+fn eligibility_of(
+    node: &MeshNode,
+    entity: &EntityId,
+) -> crate::adapter::net::behavior::org_routing_registry::DirectEligibility {
+    use crate::adapter::net::behavior::org_routing_registry::SessionEligibility;
+    node.session_routing.published.load().eligibility(entity)
+}
+
+/// (S2-1) The production join: a pinned entity with ONE live session is
+/// annotated with that session's identity and its directness, and an entity
+/// with no session is COLD.
+///
+/// The control is the third entity: without it, an implementation that
+/// annotates nothing at all passes every assertion about the first — the
+/// "comparison that never fails" shape this process has been rescued from
+/// twice.
+#[tokio::test]
+async fn a_live_peer_session_annotates_the_provider_it_resolves_to() {
+    use crate::adapter::net::behavior::org_routing_registry::DirectEligibility;
+    let node = node().await;
+    let direct_entity = EntityId::from_bytes([0x21u8; 32]);
+    let relayed_entity = EntityId::from_bytes([0x22u8; 32]);
+    let sessionless = EntityId::from_bytes([0x23u8; 32]);
+
+    let direct_session = seed_peer(&node, 0x2001, true);
+    let relayed_session = seed_peer(&node, 0x2002, false);
+    node.test_pin_peer_entity(0x2001, direct_entity.clone());
+    node.test_pin_peer_entity(0x2002, relayed_entity.clone());
+
+    assert_eq!(
+        eligibility_of(&node, &direct_entity),
+        DirectEligibility::Direct {
+            node_id: 0x2001,
+            session_id: direct_session,
+        },
+        "an adjacent session is DIRECT and names the exact session it is"
+    );
+    assert_eq!(
+        eligibility_of(&node, &relayed_entity),
+        DirectEligibility::Relayed {
+            node_id: 0x2002,
+            session_id: relayed_session,
+        },
+        "a relayed session is annotated, and annotated as relayed — directness \
+         is a property of the transport, not of having a session at all"
+    );
+    assert_eq!(
+        eligibility_of(&node, &sessionless),
+        DirectEligibility::Cold,
+        "and an entity with no session is COLD"
+    );
+}
+
+/// (S2-2) An entity claimed by TWO live sessions is never guessed.
+///
+/// There is no answer to "which session would a call use", and picking one
+/// would make a routing decision out of a map iteration order. Absence — which
+/// reads back as `Cold` — is the only honest answer.
+///
+/// Dies to: last-write-wins on the entity key, which every other projection
+/// witness survives.
+#[tokio::test]
+async fn an_entity_claimed_by_two_live_sessions_is_never_annotated() {
+    use crate::adapter::net::behavior::org_routing_registry::DirectEligibility;
+    let node = node().await;
+    let contested = EntityId::from_bytes([0x31u8; 32]);
+    let clean = EntityId::from_bytes([0x32u8; 32]);
+
+    seed_peer(&node, 0x3001, true);
+    seed_peer(&node, 0x3002, true);
+    seed_peer(&node, 0x3003, true);
+    node.test_pin_peer_entity(0x3001, contested.clone());
+    node.test_pin_peer_entity(0x3002, contested.clone());
+    // The control: an entity with exactly one claimant in the SAME
+    // republication must still be annotated, or "annotate nothing when
+    // anything is ambiguous" would pass.
+    node.test_pin_peer_entity(0x3003, clean.clone());
+
+    assert_eq!(
+        eligibility_of(&node, &contested),
+        DirectEligibility::Cold,
+        "two live sessions claim this provider: there is no determinate \
+         session, so there is no annotation"
+    );
+    assert!(
+        matches!(
+            eligibility_of(&node, &clean),
+            DirectEligibility::Direct {
+                node_id: 0x3003,
+                ..
+            }
+        ),
+        "while an unambiguous provider in the same projection is annotated"
+    );
+}
+
+/// (S2-3) A pinned entity whose node has NO live session is cold, and a live
+/// session with no pinned entity annotates nothing.
+///
+/// The `NodeId -> EntityId` map is mutable and is consulted only while the
+/// projection is built. A row that survived without a live peer record would
+/// be attaching a session to a provider on the strength of a mapping alone.
+#[tokio::test]
+async fn a_pin_without_a_live_session_annotates_nothing() {
+    use crate::adapter::net::behavior::org_routing_registry::DirectEligibility;
+    let node = node().await;
+    let orphan = EntityId::from_bytes([0x41u8; 32]);
+    node.test_pin_peer_entity(0x4001, orphan.clone());
+    assert_eq!(
+        eligibility_of(&node, &orphan),
+        DirectEligibility::Cold,
+        "a mapping is not a session"
+    );
+
+    // And the inverse: a live session whose node id is unpinned contributes no
+    // row at all, because there is no provider identity to key one by.
+    seed_peer(&node, 0x4002, true);
+    node.note_session_transition();
+    assert_eq!(
+        node.session_routing.published.load().rows.len(),
+        0,
+        "an unpinned session names no provider, so it annotates none"
+    );
+}
+
+/// (S2-4) A transition republishes the projection and advances the generation
+/// as ONE unit, and an idempotent pin cannot change what the projection says.
+///
+/// The generation lives inside the published value, so a witness can assert
+/// they moved together rather than inferring it.
+#[tokio::test]
+async fn a_republication_moves_the_projection_and_its_generation_together() {
+    let node = node().await;
+    let entity = EntityId::from_bytes([0x51u8; 32]);
+    seed_peer(&node, 0x5001, true);
+
+    let before = node.org_routing_session_publications();
+    node.test_pin_peer_entity(0x5001, entity.clone());
+    let after_pin = node.org_routing_session_publications();
+    assert_eq!(after_pin, before + 1, "a real pin publishes exactly once");
+    let published = node.session_routing.published.load_full();
+    assert_eq!(
+        Some(published.generation),
+        node.org_routing_session_generation(),
+        "the generation names the projection that is actually visible"
+    );
+    assert_eq!(published.rows.len(), 1);
+
+    // A repeat pin for the SAME binding is first-write-wins: whatever the
+    // republication does, it cannot change what the projection SAYS.
+    node.test_pin_peer_entity(0x5001, entity.clone());
+    let republished = node.session_routing.published.load_full();
+    assert_eq!(
+        republished.rows, published.rows,
+        "an idempotent pin cannot change the projection's content"
+    );
+    assert!(
+        republished.generation >= published.generation,
+        "and the generation is monotone across it"
+    );
+}
+
+/// (S2-5) **End to end.** The production actor publishes a pool beside the
+/// facts it derived it from; a peer transition then retires exactly the pool,
+/// preserves the facts, re-queues the slot, and the actor republishes the pool
+/// under the NEW session generation.
+///
+/// This is the whole build cycle against the real node: real source, real
+/// commit pin, real supervisor, real session projection.
+#[tokio::test]
+async fn a_session_transition_retires_the_pool_and_the_actor_republishes_it() {
+    let node = node().await;
+    node.start();
+    assert!(
+        until(|| node.org_routing_ready()).await,
+        "precondition: the actor must reach Healthy before anything is demanded"
+    );
+
+    let key = slot(60, "nrpc:s2e2e");
+    let family = node.org_routing_family().expect("family");
+    let held = family.demand(key.clone()).expect("demand");
+    assert!(
+        until(|| node
+            .routing_registry
+            .unsensed_pool_unvalidated(&key)
+            .is_some())
+        .await,
+        "the production actor publishes a pool beside the facts it built"
+    );
+
+    let facts = node.org_routing_base_facts(&key).expect("facts");
+    let pool = node
+        .org_routing_unsensed_pool(&key)
+        .expect("validated pool");
+    assert!(
+        pool.derives_from(&facts),
+        "the validated read proves the pairing rather than assuming it"
+    );
+    let generation = pool.session_generation();
+    assert_eq!(
+        Some(generation),
+        node.org_routing_session_generation(),
+        "and the pool was computed under the LIVE session view"
+    );
+
+    // A real session transition.
+    seed_peer(&node, 0x6001, true);
+    node.test_pin_peer_entity(0x6001, EntityId::from_bytes([0x61u8; 32]));
+    let moved = node
+        .org_routing_session_generation()
+        .expect("a live generation");
+    assert!(moved > generation, "the transition advanced the generation");
+
+    assert!(
+        until(|| node
+            .routing_registry
+            .unsensed_pool_unvalidated(&key)
+            .is_some_and(|p| p.session_generation() == moved))
+        .await,
+        "the actor republishes the pool under the new session view"
+    );
+    assert!(
+        node.org_routing_base_facts(&key).is_some(),
+        "and the discovery facts were preserved throughout — session movement \
+         is not a reason to re-reconstruct the source"
+    );
+    let counts = node.org_routing_pool_counts();
+    assert!(
+        counts[0] >= 2,
+        "two publications: the original and the rebuild"
+    );
+    assert!(
+        counts[1] >= 1,
+        "and exactly the superseded pool was retired"
+    );
+
+    drop(held);
+    let _ = node.shutdown().await;
+}
+
+/// (S2-6) The VALIDATED pool read refuses a pool that does not name the facts
+/// beside it, AND a pool computed under a superseded session view.
+///
+/// Both are cold, and neither invalidates anything: the facts are valid and
+/// the rebuild is already owed. The two arms are asserted separately because
+/// each hides a distinct defect — the publication order makes a mismatched
+/// pair unreachable in production, while a superseded view is the ORDINARY
+/// state of a pool between a session transition and the rebuild that follows
+/// it.
+#[tokio::test]
+async fn the_validated_pool_read_refuses_a_mispaired_or_superseded_pool() {
+    let node = node().await;
+    node.start();
+    assert!(until(|| node.org_routing_ready()).await, "precondition");
+
+    // One session transition BEFORE anything warms, so the live generation is
+    // past the one `for_test` stamps. Without it the superseded arm would
+    // compare two zeroes and pass on a coincidence.
+    seed_peer(&node, 0x6101, true);
+    node.test_pin_peer_entity(0x6101, EntityId::from_bytes([0x62u8; 32]));
+
+    let key = slot(61, "nrpc:s2read");
+    let family = node.org_routing_family().expect("family");
+    let held = family.demand(key.clone()).expect("demand");
+    assert!(
+        until(|| node.org_routing_unsensed_pool(&key).is_some()).await,
+        "precondition: a validated pool must exist to be refused"
+    );
+    let facts = node.org_routing_base_facts(&key).expect("facts");
+
+    // A pool naming a DIFFERENT artifact with identical content: pointer
+    // identity is the artifact's identity, so a content comparison would
+    // accept this and a pointer comparison must not.
+    let foreign = Arc::new(
+        crate::adapter::net::behavior::org_routing_registry::ScopedUnsensedRoutePool::for_test(
+            Arc::new((*facts).clone()),
+        ),
+    );
+    node.routing_registry
+        .install_unsensed_pool_for_test(&key, foreign);
+    assert!(
+        node.org_routing_unsensed_pool(&key).is_none(),
+        "a pool that does not name the published facts is COLD"
+    );
+    assert!(
+        node.org_routing_base_facts(&key).is_some(),
+        "and refusing it invalidates nothing — the facts are current"
+    );
+
+    // The SUPERSEDED-view arm. This pool names the EXACT published facts, so
+    // the pairing check passes; what it does not carry is the live session
+    // generation, and a pool whose annotations describe sessions that may be
+    // gone is not usable.
+    let superseded = Arc::new(
+        crate::adapter::net::behavior::org_routing_registry::ScopedUnsensedRoutePool::for_test(
+            facts.clone(),
+        ),
+    );
+    assert!(
+        superseded.derives_from(&facts),
+        "precondition: this pool DOES name the published facts, so only the \
+         session check can refuse it"
+    );
+    assert_ne!(
+        Some(superseded.session_generation()),
+        node.org_routing_session_generation(),
+        "precondition: and it was computed under an older view"
+    );
+    node.routing_registry
+        .install_unsensed_pool_for_test(&key, superseded);
+    assert!(
+        node.org_routing_unsensed_pool(&key).is_none(),
+        "a pool from a superseded session view is COLD"
+    );
+    assert!(
+        node.org_routing_base_facts(&key).is_some(),
+        "and refusing THAT invalidates nothing either"
+    );
+
+    drop(held);
+    let _ = node.shutdown().await;
+}
+
+/// (S2-7) A terminally exhausted session-generation space fences the pool
+/// plane: nothing publishes, every retained pool is retired once, the
+/// validated read is cold, and the actor does not spin.
+///
+/// Fail-closed and irreversible, on the same discipline as the routing
+/// authority epoch and the consumer-Grant publication identity — a wrapped
+/// generation would let a pool built under one view compare current against an
+/// unrelated later one.
+#[tokio::test]
+async fn an_exhausted_session_generation_fences_the_pool_plane() {
+    let node = node().await;
+    node.start();
+    assert!(until(|| node.org_routing_ready()).await, "precondition");
+
+    let key = slot(62, "nrpc:s2spent");
+    let family = node.org_routing_family().expect("family");
+    let held = family.demand(key.clone()).expect("demand");
+    assert!(
+        until(|| node.org_routing_unsensed_pool(&key).is_some()).await,
+        "precondition: a pool must exist for the exhaustion to retire"
+    );
+
+    // Position the counter so the NEXT reservation would reach the reserved
+    // terminal marker, then drive one real transition.
+    node.session_routing.currentness.set_for_test(u64::MAX - 1);
+    seed_peer(&node, 0x7001, true);
+    node.test_pin_peer_entity(0x7001, EntityId::from_bytes([0x71u8; 32]));
+
+    assert_eq!(
+        node.org_routing_session_generation(),
+        None,
+        "the space is terminally spent"
+    );
+    assert!(
+        until(|| node
+            .routing_registry
+            .unsensed_pool_unvalidated(&key)
+            .is_none())
+        .await,
+        "every retained pool is retired once, rather than left published under \
+         a view nothing can witness"
+    );
+    assert!(
+        node.org_routing_unsensed_pool(&key).is_none(),
+        "and the validated read is cold"
+    );
+    assert!(
+        until(|| node.org_routing_base_facts(&key).is_some()).await,
+        "discovery is unaffected: the facts plane keeps reconciling"
+    );
+
+    // No spin. The evidence is an ITERATION BOUNDARY with nothing owed on the
+    // far side of it: `quiesced_counts` drives two complete passes and panics
+    // if the plane never settles, which is exactly what a self-sustaining wake
+    // would produce.
+    let published_before = node.org_routing_pool_counts()[0];
+    let _ = quiesced_counts(&node).await;
+    let (_retained, pending) = node.org_routing_slots();
+    assert_eq!(
+        pending, 0,
+        "the actor parks rather than spinning on a plane it can never publish"
+    );
+    assert_eq!(
+        node.org_routing_pool_counts()[0],
+        published_before,
+        "and nothing is published under a spent generation"
+    );
+
+    drop(held);
+    let _ = node.shutdown().await;
+}
+
+/// (S2-8) A peer transition that publishes NOTHING publishes no session
+/// generation, through the real installer.
+///
+/// `install_direct` with an `expected_prior_session_id` that is not the live
+/// incarnation is a lost compare-and-swap: it mutates no peer state at all.
+/// The republication is gated on that outcome, so nothing moves — no
+/// generation, no projection, no pool invalidation, no actor wake.
+///
+/// Dies to: republishing unconditionally at the transition site. That mutation
+/// leaves every other witness in this file green while making every refused
+/// rotation, every replay drop and every lost upgrade churn the pool plane of
+/// the whole node.
+#[tokio::test]
+async fn a_lost_peer_install_publishes_no_session_generation() {
+    let node = node().await;
+    let addr: SocketAddr = "10.9.9.1:9000".parse().expect("addr");
+    let other: SocketAddr = "10.9.9.2:9000".parse().expect("addr");
+
+    // The control, first: a transition that DOES own its peer record
+    // republishes exactly once. Without it, "never republish" passes.
+    let before = node.org_routing_session_publications();
+    let installed = node.install_direct(0x8001, addr, fresh_session_keys(), None);
+    assert!(
+        installed.owned,
+        "precondition: this transition owned the peer"
+    );
+    assert_eq!(
+        node.org_routing_session_publications(),
+        before + 1,
+        "a transition that published a session publishes a generation"
+    );
+    let generation = node.org_routing_session_generation();
+    let published = node.org_routing_session_publications();
+
+    // A compare-and-swap against a session that is not the live one. The
+    // installer bails before touching `peers`, so there is no transition to
+    // notify anyone about.
+    let lost = node.install_direct(
+        0x8001,
+        other,
+        fresh_session_keys(),
+        Some(0xdead_beef_dead_beef),
+    );
+    assert!(!lost.owned, "precondition: the compare-and-swap must lose");
+    assert_eq!(
+        node.org_routing_session_publications(),
+        published,
+        "a non-publishing transition publishes no session generation"
+    );
+    assert_eq!(
+        node.org_routing_session_generation(),
+        generation,
+        "and the live generation does not move"
+    );
 }

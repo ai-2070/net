@@ -19,8 +19,11 @@ steps and all 16 scope items. Its record is §16.
 is §17. 2B.3b's exact content is the §13 row, its accounting is §4/§4.1, its
 lookup shape is §8, and its refusal semantics are §9.
 
-**`2B.3c` is AUTHORIZED** from that exact head; its scope is §18. `2B.3d-pre`,
-`2B.3d` and every later OLB slice are not authorized.
+**`2B.3c` is AUTHORIZED** from that exact head; its scope is §18. Step 1 (the
+second publication cell) was ACCEPTED and its lineage merged; **step 2 (the
+actor build cycle) is IMPLEMENTED at a candidate and NOT SIGNED** — §18.0.
+`2B.3d-pre`, `2B.3d` and every later OLB slice are not authorized, and step 2's
+candidate does not authorize `2B.3d-pre`.
 
 **Substrate:** `OLB_2B3A_SIGNED_HEAD = fd05a89ba` — the per-slot
 `Arc<ArcSwapOption<SlotBaseFacts>>` publication cell — plus
@@ -932,8 +935,8 @@ it true:
 | Divergence in `ORG_CAPABILITY_LOAD_BALANCING_PLAN.md` | Corrected by |
 |---|---|
 | `max warmed capabilities per OrgRoutingState clone family: 64` — **both** detailed bound blocks (§7, §13) **and the earlier summary wording near the top** (pin 10) | **2B.3b** — **DONE**. Five occurrences, not three: the two literal bound blocks, pin 10, §7's "Bound the cache" prose, and §13's OLB-2 exit criterion. The plan now carries a §7/§13 divergence note beside the bounds |
-| Node-shared `OrgRouteSet` with a single `next_authority_deadline` → scoped node-owned pool deadlines + family route deadlines + **no family timer** | **2B.3c** (pool half) and **2B.3d** (family half) |
-| `RouteSourceGeneration` as one flat vector → split across `ScopedUnsensedRoutePool` and family `OrgRouteSet` | **2B.3c** |
+| Node-shared `OrgRouteSet` with a single `next_authority_deadline` → scoped node-owned pool deadlines + family route deadlines + **no family timer** | **2B.3c** (pool half) — **DONE at step 2**, as the plan's §7 divergence note; **2B.3d** owes the family half |
+| `RouteSourceGeneration` as one flat vector → split across `ScopedUnsensedRoutePool` and family `OrgRouteSet` | **2B.3c** — **DONE at step 2**, in the same note: the pool's half is the whole captured `SourceEpoch` plus the exact per-slot authority stamp plus ONE node-owned session generation, and the session generation is deliberately NOT folded into the source token |
 | The complete source/currentness vector omits the **exact installed consumer Grant identity**, and consumer-Grant publication is absent from routing wake/invalidation | **2B.3c-pre** — **DONE**, step 3 |
 
 The 2B.3c-pre edit must state that a Grant-scoped source is current **only** under
@@ -2050,14 +2053,97 @@ in this section.
   The routing payload is deliberately absent — the type's only producer is
   step 2, and production pool cells are `None` until it lands. The
   candidate-bound mutation evidence for this step is §18.0a.
-- **Step 2 — the actor build cycle: NOT STARTED, and not authorized to
-  proceed until the Step 1 evidence packet is independently accepted.** The
-  pool payload (provider and proven owner relation, direct/session
-  eligibility under ONE coherent session generation, scoped source vector,
-  scoped deadlines), capture → build off-lock → revalidate →
-  publish-if-current, pool-side exact invalidation, mixed-generation refusal,
-  the deferred publication-order interleaving evidence, and the remaining
-  §18.3 witnesses.
+- **Step 2 — the actor build cycle: IMPLEMENTED at the candidate, NOT
+  SIGNED.** Authorized after the Step 1 evidence packet was independently
+  accepted and its lineage merged. The pool payload, the capture → build
+  off-lock → revalidate → publish-if-current cycle, the coherent session
+  projection, pool-side exact invalidation, mixed-generation refusal, the
+  deferred publication-order interleaving evidence and the §18.3 witnesses
+  all land here. Independent review signs the boundary; this record does not.
+
+  **What it adds, mechanism first.**
+
+  ```text
+  capture      one source snapshot + ONE session observation, off-lock
+  build        the COMPLETE pool off-lock: row join, proven owner relation,
+               session annotation, deterministic order, scoped deadline
+  pin          the commit pin (source token), before the registry lock
+  revalidate   actor incarnation, slot incarnation, source token, exact facts
+               identity, session generation — the last read BENEATH the
+               registry lock, because it is an atomic load and acquires
+               nothing
+  publish      facts always; the POOL only if every component is current
+  ```
+
+  A session generation that moved publishes facts with no pool beside them —
+  the ordinary cold-pool state — re-queues the live slot, and rebuilds on the
+  next pass. The stale pool is never observable because it is never stored.
+
+  **The coherent session projection is node-owned and PUBLISHED, not
+  sampled.** `NodeSessionRouting` holds one immutable `SessionProjection`
+  carrying its own generation, republished as a whole by every session
+  transition, plus a `SessionCurrentness` counter the registry compares
+  lock-free. Building annotations by reading `peers` and `peer_entity_ids` at
+  annotation time would sample two independently-mutable maps once per
+  provider, so one pool could carry rows from several states of the world —
+  the mixed observation §3 forbids. Publishing makes the actor's capture one
+  `ArcSwap::load_full`, which cannot straddle anything, and puts the
+  generation INSIDE the value so the two can never be sampled apart.
+
+  The join refuses rather than guesses, in three ways, and every refusal
+  produces ABSENCE (which reads back `Cold`): a pinned entity with no live
+  peer record; a peer record that does not agree it is that node; and an
+  entity claimed by more than one live session, where "which session would a
+  call use" has no determinate answer. A mutable `NodeId → EntityId` mapping
+  is consulted only while the projection is built, never at lookup time.
+
+  **Ordering, normative, at every transition:**
+
+  ```text
+  republish the projection   \  under the session publication gate
+  advance the generation     /
+  RELEASE the gate
+  retire the pools this movement supersedes   (takes the registry lock)
+  mark actor work
+  ```
+
+  ```text
+  lock order:  peer-transition shard -> session publication gate -> registry lock
+  ```
+
+  Acyclic and disjoint from the frozen `source commit pin → registry lock`:
+  routing never takes a peer shard or the session gate, and the actor's
+  capture takes no lock at all.
+
+  **Exhaustion is terminal and fail-closed.** `u64::MAX` is reserved as the
+  session-generation marker and never handed out; reservation is checked;
+  crossing the ceiling latches terminal, retires every published pool once,
+  and publishes no pool thereafter. Facts keep reconciling — discovery is
+  unaffected — so the plane converges and the actor parks rather than
+  spinning on work it can never complete.
+
+  **The asymmetric invalidation, both directions.** Facts invalidation clears
+  a pool only through the shared pool-first helper, so it clears exactly the
+  pool derived from the facts it removed. `invalidate_session_older_than`
+  clears ONLY pools stamped strictly older than the movement, preserves every
+  facts artifact, and leaves a pool-less slot entirely alone — no clear and no
+  re-queue, because waking on absence would make every peer transition
+  re-queue every retained slot on the node.
+
+  **The step-1 publication-order debt is paid.** `install_facts_and_pool` is
+  the one implementation of the ordering, and a test-only observer fires
+  between its two adjacent stores so a lock-free reader can be scheduled
+  exactly there. Every intermediate state is a cold-pool state; a pool beside
+  facts it was not derived from is unreachable.
+
+  **Deliberately NOT claimed.** Two guards in `build_session_rows` are
+  defence in depth and are NOT independently observable: the
+  `peer.node_id == node_id` agreement check (unreachable through a DashMap
+  keyed by that same id) and the post-read stability re-check of the identity
+  mapping (reachable only under a race no deterministic witness can schedule).
+  They stay in the code and this document says plainly that no witness claims
+  them, rather than carrying a test constructed to imply otherwise — the same
+  discipline §17.6a's fourth finding applies.
 
 ### 18.0a Candidate-bound mutation campaign — the Step 1 evidence packet
 
@@ -2235,6 +2321,60 @@ the row records what happened.
 Evidence is reproducible from `run.py` + `ledger.tsv` under the out-of-repo
 scratch directory; nothing from it is committed.
 
+### 18.0b Step 2 — where it lives, and what it runs
+
+```text
+behavior/org_routing_registry.rs   ScopedUnsensedRoutePool's payload and its
+                                   accessors; UnsensedRouteRow;
+                                   DirectEligibility; ProviderProvenance;
+                                   SessionCurrentness; SessionEligibility;
+                                   SessionObservation; PreparedRoutePool;
+                                   prepare_route_pool; BuiltSlot;
+                                   SlotCells::install_facts_and_pool +
+                                   take_pool; PublicationGap/Observer;
+                                   invalidate_session_older_than;
+                                   unsensed_pool_unvalidated;
+                                   SlotSource::session_view; the phase-2/3/5
+                                   build cycle
+
+mesh.rs                            SessionProjection; NodeSessionRouting;
+                                   build_session_rows; note_session_transition;
+                                   MeshNode::note_session_transition;
+                                   MeshNode::org_routing_unsensed_pool;
+                                   ScopedSlotSource::session_view; the
+                                   transition call sites
+
+org_routing_wiring_tests.rs        the seven production-node witnesses
+```
+
+**Production session-transition call sites**, each on the far side of the
+check that says its mutation actually happened:
+
+```text
+install_peer_transition           direct/routed install and rotation, with the
+                                  peer shard RELEASED and gated on `owned`
+handle_routed_handshake           responder-side registration, after its
+                                  transition returns
+PeerRegistrationGuard::drop       the registration ROLLBACK (a removal)
+the dead-peer sweep               eviction, on the exact-session guard
+the failure detector              verdict eviction, on a removed binding
+the subnet admission pin          the routing-id pin, Vacant arm only
+the capability-announcement TOFU  the first-write-wins pin
+```
+
+A lost compare-and-swap, a refused rotation, a replay drop, a rejected rebind
+and a matching re-announcement all return before reaching the notification, so
+"a non-publishing outcome wakes nothing" is a property of the call sites rather
+than a predicate that could be got wrong in one place.
+
+**Validation commands and results** are recorded in the closure report for the
+candidate; the gates are `cargo fmt --all -- --check`, the three focused
+filters (`behavior::org_routing_registry::`, `org_routing_wiring_tests`,
+`behavior::org_routing_state::`), the full `--lib` suite, `--doc`,
+`clippy --lib --tests -D warnings`, `doc_link_guard`, and `git diff --check`.
+No filtered command may execute zero tests, and the CI floors were raised to
+the new actual minimum in this same commit.
+
 ### 18.1 Scope, exactly
 
 The §13 row, and nothing beside it:
@@ -2280,16 +2420,55 @@ Grant rows remain Unknown/Potential until SENSE exists (§2), and
 
 ### 18.3 Witness obligations
 
-To be filled in as the slice lands, in the §17.6 style — pinned up front:
+Pinned up front at authorization, and discharged as follows. Step 1's eight
+lifecycle witnesses stand unchanged; the twelve step-2 registry witnesses and
+eight step-2 wiring witnesses below are new (registry 50 -> 62, wiring
+70 -> 78).
 
-- both cells cloned under ONE acquisition (extend the 2B.3a coupling witness);
-- publish-if-current: a pool built under a stamp that moved discards and
-  re-enqueues, and the stale pool never publishes;
-- each direction of the asymmetric invalidation, separately (each conditional
-  hides a distinct defect — §1.1);
-- retirement clears BOTH cells; a transfer clears neither (extend W-S1/W-S2);
-- mixed session generations refuse to publish;
-- the structural 256 pool bound.
+| Obligation | Discharged by | Where |
+|---|---|---|
+| both cells cloned under ONE acquisition | `a_demand_handle_couples_both_publication_cells`, `a_demand_set_couples_both_cells_per_contributor` | step 1 |
+| retirement clears BOTH cells; a transfer clears neither | `retiring_the_last_reference_clears_both_cells`, `a_transfer_leaves_the_common_keys_pool_published` | step 1 |
+| production pool construction, complete payload | `an_actor_pass_publishes_the_pool_it_derived` | registry |
+| `Unserved` publishes no pool; `Served(0)` does | `an_unserved_reconstruction_publishes_no_pool_but_a_served_empty_one_does` | registry |
+| publish-if-current — SESSION moved during the build | `a_session_view_that_moved_during_the_build_publishes_no_pool` | registry |
+| publish-if-current — SOURCE moved during the build | `a_source_that_moved_during_the_build_publishes_neither_plane` | registry |
+| mixed session generations refuse to publish | `a_pool_cannot_compose_two_session_generations` | registry |
+| asymmetric invalidation — pool-only preserves facts | `session_movement_clears_the_pool_and_preserves_the_facts` | registry |
+| asymmetric invalidation — facts-side clears the derived pool | `facts_invalidation_clears_the_derived_pool` | step 1 |
+| a delayed POOL invalidator deletes no successor (both the `<` and the `==` arms, with the adjacent control) | `an_obsolete_session_invalidator_cannot_delete_a_newer_pool` | registry |
+| a delayed FACTS invalidator deletes neither plane | `a_stale_observation_invalidates_neither_plane` | step 1 |
+| session movement does not widen to pool-less slots | `session_movement_does_not_requeue_a_slot_with_no_pool` | registry |
+| a spent session-generation space fails closed and does not spin | `an_exhausted_session_generation_publishes_no_pool_without_spinning` | registry |
+| **the publication-order interleaving step 1 deferred** — see its "What is deliberately NOT claimed" paragraph in §18.0 | `no_reader_can_observe_a_pool_beside_foreign_facts` | registry |
+| provider / installed-authority expiry retires BOTH planes and re-arms, with no spin | `an_authority_deadline_with_zero_providers_retires_both_planes_and_rearms` | registry |
+| the structural 256 pool bound | `the_two_hundred_fifty_seventh_slot_can_publish_no_pool` | registry |
+| lock discipline: the pool build holds no registry lock | asserted INSIDE the annotation join (`TestProjection::eligibility`) and inside the session capture, so every pool-building witness carries it | registry |
+| the production join: direct / relayed / cold | `a_live_peer_session_annotates_the_provider_it_resolves_to` | wiring |
+| ambiguity is never guessed, with the unambiguous control | `an_entity_claimed_by_two_live_sessions_is_never_annotated` | wiring |
+| a mapping is not a session, and a session with no mapping names no provider | `a_pin_without_a_live_session_annotates_nothing` | wiring |
+| the projection and its generation move as ONE unit | `a_republication_moves_the_projection_and_its_generation_together` | wiring |
+| end-to-end: the production actor publishes a pool, a real session transition retires exactly it, the actor republishes under the new view | `a_session_transition_retires_the_pool_and_the_actor_republishes_it` | wiring |
+| the validated read refuses a mispaired pool AND a superseded-view pool | `the_validated_pool_read_refuses_a_mispaired_or_superseded_pool` | wiring |
+| terminal session exhaustion fences the plane, retires once, and parks | `an_exhausted_session_generation_fences_the_pool_plane` | wiring |
+| a NON-publishing peer transition publishes no generation, with the owning control | `a_lost_peer_install_publishes_no_session_generation` | wiring |
+
+Three of these carry controls that exist because their assertions would
+otherwise be satisfied by a strictly worse implementation:
+
+- **`an_unserved_..._but_a_served_empty_one_does` is its own control.** "Never
+  publish a pool" satisfies the `Unserved` half perfectly, and would delete
+  the artifact W-G13's zero-provider Grant case depends on.
+- **`an_entity_claimed_by_two_live_sessions...` carries an unambiguous
+  entity** in the same republication. Without it, "annotate nothing whenever
+  anything is ambiguous" passes.
+- **`an_obsolete_session_invalidator...` carries the adjacent clearing
+  control.** Without it, "never invalidate a pool" satisfies both the `<` and
+  the `==` arms.
+- **`a_lost_peer_install_publishes_no_session_generation` opens with an
+  OWNING install.** Without it, "never republish at all" satisfies the
+  non-publishing assertion perfectly, and it is the mutation that would make
+  every pool on the node permanently stale rather than merely churned.
 
 ## Open questions
 

@@ -33,10 +33,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use super::org::OrgId;
 use super::org_grant::CapabilityAuthorityId;
 use super::org_routing::{ApplyOutcome, ApplyRequest, DirtyApply, RegistryWork};
 use super::org_scoped_ingest::CapabilityAudienceScope;
 use super::org_scoped_store::{DirtyCapabilities, PrivateCapabilityProvider};
+use crate::adapter::net::identity::EntityId;
 
 /// Max demand handles ONE clone family may hold.
 ///
@@ -397,6 +399,22 @@ pub(crate) trait SlotSource: Send + Sync + 'static {
     fn liveness(&self) -> SourceLiveness {
         SourceLiveness::Live
     }
+
+    /// Capture ONE coherent observation of the node's session/direct-state
+    /// projection (OLB-2B.3c step 2).
+    ///
+    /// Called with NO registry lock held, exactly like [`Self::snapshot`], and
+    /// exactly once per quantum: every annotation in every pool the quantum
+    /// publishes comes from THIS observation, which is what makes "one
+    /// coherent session generation" structural rather than a rule the build
+    /// loop has to remember.
+    ///
+    /// The default observes no sessions, so every provider is annotated COLD.
+    /// That is the correct answer for a source with no session plane — not a
+    /// placeholder — and it is the same answer an unresolvable sample gets.
+    fn session_view(&self) -> SessionObservation {
+        SessionObservation::cold()
+    }
 }
 
 /// Whether a [`SlotSource`] can settle, and — when it cannot — who owns the wake
@@ -449,40 +467,482 @@ impl SourceLiveness {
     }
 }
 
+/// The node-owned, monotone, NON-ALIASING session/direct-state generation
+/// (OLB-2B.3c step 2; design §3).
+///
+/// One generation for the whole node, not one per peer: a pool's annotations
+/// must all come from ONE coherent view, and per-peer counters cannot express
+/// that — a pool assembled from two peers at two counters is exactly the mixed
+/// observation §3 forbids.
+///
+/// Held by the node (which advances it) and by the registry (which compares
+/// it). Every read is a single atomic load and takes no lock whatsoever, which
+/// is what lets the actor compare it BENEATH the registry lock without
+/// touching the frozen `source commit pin → registry lock` order: an atomic
+/// load acquires nothing and can re-enter nothing.
+///
+/// `u64::MAX` is RESERVED as the terminal marker and never handed out.
+/// Exhaustion is irreversible and FAIL-CLOSED: no pool may be published under
+/// it and nothing may be armed on it, because a wrapped or saturated
+/// generation would let a pool built under one session view compare current
+/// against an unrelated later one — the same aliasing the routing authority
+/// epoch and the consumer-Grant installation identity are already fenced
+/// against.
+#[derive(Debug)]
+pub(crate) struct SessionCurrentness {
+    generation: AtomicU64,
+}
+
+impl Default for SessionCurrentness {
+    fn default() -> Self {
+        Self {
+            generation: AtomicU64::new(0),
+        }
+    }
+}
+
+impl SessionCurrentness {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// The published generation, or `None` once the space is terminally spent.
+    ///
+    /// LOCK-FREE. See the type doc for why that is load-bearing rather than
+    /// incidental.
+    pub(crate) fn generation(&self) -> Option<u64> {
+        match self.generation.load(Ordering::Acquire) {
+            u64::MAX => None,
+            live => Some(live),
+        }
+    }
+
+    /// Reserve the next generation, or `None` when reserving one would reach
+    /// the terminal marker.
+    ///
+    /// Reserve-then-commit, exactly like the consumer-Grant publication
+    /// identity: the caller publishes the new session state, and only then
+    /// commits. A counter advanced before the content is visible would let an
+    /// observer read a generation naming a projection it cannot see yet, and a
+    /// counter advanced by an unchecked add would alias at the ceiling with
+    /// the new projection ALREADY published — a partial publication.
+    pub(crate) fn reserve(&self) -> Option<u64> {
+        let next = self.generation.load(Ordering::Acquire).checked_add(1)?;
+        (next != u64::MAX).then_some(next)
+    }
+
+    /// Commit a reservation. Called AFTER the new projection is visible.
+    pub(crate) fn commit(&self, generation: u64) {
+        self.generation.store(generation, Ordering::Release);
+    }
+
+    /// Latch the terminal marker. Irreversible.
+    ///
+    /// Reached only when [`Self::reserve`] refuses, and it is the one
+    /// direction that must not fail closed by REFUSING to move: a node that
+    /// cannot record that its session view changed must stop publishing pools
+    /// altogether rather than keep publishing under a frozen generation.
+    pub(crate) fn exhaust(&self) {
+        self.generation.store(u64::MAX, Ordering::Release);
+    }
+
+    /// Test-only: position the counter so a witness can reach the terminal
+    /// transition without performing 2^64 session transitions.
+    #[cfg(test)]
+    pub(crate) fn set_for_test(&self, generation: u64) {
+        self.generation.store(generation, Ordering::Release);
+    }
+}
+
+/// One coherent, immutable observation's answer for one provider.
+///
+/// Implemented by the node's published session projection. It is queried
+/// entirely off-lock, during phase-3 reconstruction, and must therefore
+/// acquire nothing and observe nothing beyond the immutable value it was
+/// captured from — a lookup that consulted live state would reintroduce the
+/// independently-sampled maps design §3 forbids.
+pub(crate) trait SessionEligibility: Send + Sync {
+    fn eligibility(&self, provider: &EntityId) -> DirectEligibility;
+}
+
+/// A projection that knows about no sessions at all.
+///
+/// Not a stub: a source with no session plane annotates every provider COLD,
+/// which is the correct answer and the same one an unresolvable sample gets.
+struct ColdSessionProjection;
+
+impl SessionEligibility for ColdSessionProjection {
+    fn eligibility(&self, _provider: &EntityId) -> DirectEligibility {
+        DirectEligibility::Cold
+    }
+}
+
+/// ONE coherent observation of the node's session/direct-state, captured
+/// off-lock beside the source snapshot.
+///
+/// The generation travels INSIDE the observation rather than being read
+/// separately, so the rows and the generation naming them cannot come from two
+/// different samples. `currentness` is the lock-free handle the publication
+/// phase re-reads to decide whether this observation is still the live one.
+pub(crate) struct SessionObservation {
+    /// The generation these rows were published under, or `None` when the
+    /// space is terminally exhausted and no pool may be published at all.
+    generation: Option<u64>,
+    rows: Arc<dyn SessionEligibility>,
+    currentness: Arc<SessionCurrentness>,
+}
+
+impl std::fmt::Debug for SessionObservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionObservation")
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SessionObservation {
+    pub(crate) fn new(
+        generation: Option<u64>,
+        rows: Arc<dyn SessionEligibility>,
+        currentness: Arc<SessionCurrentness>,
+    ) -> Self {
+        Self {
+            generation,
+            rows,
+            currentness,
+        }
+    }
+
+    /// A source with no session plane: everything cold, at its own private
+    /// generation that nothing can move.
+    fn cold() -> Self {
+        Self {
+            generation: Some(0),
+            rows: Arc::new(ColdSessionProjection),
+            currentness: SessionCurrentness::new(),
+        }
+    }
+
+    fn eligibility(&self, provider: &EntityId) -> DirectEligibility {
+        self.rows.eligibility(provider)
+    }
+
+    /// Is this observation still the live one?
+    ///
+    /// False when the projection moved, and false when the generation space is
+    /// spent on EITHER side — an exhausted space can witness nothing, so it
+    /// refuses rather than comparing two markers equal.
+    fn still_current(&self) -> bool {
+        match (self.generation, self.currentness.generation()) {
+            (Some(observed), Some(live)) => observed == live,
+            _ => false,
+        }
+    }
+}
+
+/// Where ONE provider row was discovered, exactly (design §1 artifact 3:
+/// "discovery provenance for THAT scope").
+///
+/// Derived from the slot's exact [`ScopedDiscoveryAuthorityStamp`] rather than
+/// recorded independently, so it cannot drift from the authority that made the
+/// row query-visible. It is a property of the SCOPE, so it is carried once per
+/// pool rather than once per row: every row in a scoped pool came through the
+/// same authority by construction, and a per-row copy would be a second
+/// statement of the same fact, free to disagree with the first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProviderProvenance {
+    /// The owner plane of this exact audience scope.
+    OwnerPlane,
+    /// An exact installed consumer DISCOVER grant. `DISCOVER ≠ INVOKE`: this
+    /// says how the provider was SEEN, and claims nothing about the caller's
+    /// right to invoke it.
+    GrantPlane {
+        grant_id: [u8; 32],
+        audience_handle: [u8; 32],
+    },
+}
+
+impl ProviderProvenance {
+    /// The provenance implied by the authority the rows were captured under.
+    fn of(authority: &ScopedDiscoveryAuthorityStamp) -> Self {
+        match authority {
+            ScopedDiscoveryAuthorityStamp::Owner => Self::OwnerPlane,
+            ScopedDiscoveryAuthorityStamp::Grant {
+                grant_id,
+                audience_handle,
+                ..
+            } => Self::GrantPlane {
+                grant_id: *grant_id,
+                audience_handle: *audience_handle,
+            },
+        }
+    }
+}
+
+/// Whether a provider is reachable over a live session, computed under ONE
+/// coherent session generation (design §3).
+///
+/// It ANNOTATES and never creates authority: a `Direct` row is not authorized
+/// to be called, and a `Cold` row is not forbidden. 2B.3d's projection uses it
+/// only to preselect among candidates its own INVOKE matching already
+/// admitted.
+///
+/// `Cold` is the deterministic answer for absence AND for every sample that
+/// could not be resolved coherently — no session, a `NodeId → EntityId`
+/// mapping that moved while it was being read, or an entity that resolves to
+/// more than one live session. A guess would attach a session to a provider on
+/// the strength of a mutable mapping, which is the identity confusion design
+/// §3's join rules exist to forbid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DirectEligibility {
+    /// Exactly one live session, terminating at the peer's own address.
+    Direct { node_id: u64, session_id: u64 },
+    /// Exactly one live session, reached through a relay.
+    Relayed { node_id: u64, session_id: u64 },
+    /// No session, or no coherent answer. Never guessed.
+    Cold,
+}
+
+impl DirectEligibility {
+    /// Is this provider reachable without a relay?
+    #[allow(dead_code)] // consumer: the family projection (OLB-2B.3d).
+    pub(crate) fn is_direct(&self) -> bool {
+        matches!(self, Self::Direct { .. })
+    }
+}
+
+/// One provider of one authority-scoped pool: the discovery row, its proven
+/// owner relation, and its session annotation.
+///
+/// Deliberately NOT a candidate. It carries no matched INVOKE grant, no caller
+/// eligibility, no order relative to a caller's credentials, no selection and
+/// no sensed health or score — those are 2B.3d's and OLB-4's, and a row that
+/// looked like a candidate is exactly how a scoped fact becomes a caller
+/// decision by accident.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UnsensedRouteRow {
+    /// The verified provider entity that announced the capability.
+    pub provider: EntityId,
+    /// The organization proved to own the provider by its membership
+    /// certificate at ingest. Carried, never re-derived: re-deriving it here
+    /// would be a second owner determination free to disagree with the one the
+    /// ingest path verified.
+    pub owner_org: OrgId,
+    /// The announcement generation the row was learned from — provenance for
+    /// THIS row, beside the pool-wide plane provenance.
+    pub generation: u64,
+    /// The row's own effective expiry.
+    pub expires_at: u64,
+    /// Reachability under the pool's ONE coherent session generation.
+    pub direct: DirectEligibility,
+}
+
 /// The node-shared PRECOMPUTED routing substrate for ONE authority-scoped slot
 /// (OLB-2B.3c; design §1 artifact 3) — the same `(PrivateAudienceScope,
 /// capability)` key as the facts cell beside it.
 ///
-/// This revision (design §18 step 1) pins the PUBLICATION LIFECYCLE: the
-/// second per-slot cell, both-cells handle coupling, and the pool-first
-/// ordering at every site that moves facts. The routing payload — provider and
-/// proven owner relation, direct/session eligibility under ONE coherent
-/// session generation, the exact scoped source vector, scoped deadlines — is
-/// the actor build cycle's to add (§18 step 2), which is also this type's only
-/// producer; until it lands, production cells are permanently `None` and every
-/// pool in the tree is a witness's.
+/// Immutable, node-shared and published per slot. What it carries is exactly
+/// design §1's artifact-3 row, and every field is identity as well as payload:
+/// a 2B.3d reader that loaded a pool and a facts artifact with two separate
+/// atomics can prove they belong together, and can refuse a pool built under a
+/// session view older than the one it is validating against.
+///
+/// **It claims none of the following**, and the type is shaped so it cannot:
+/// a matched caller INVOKE grant, caller membership or dispatcher eligibility,
+/// final caller-specific authority, caller order, a selected provider, or any
+/// sensed health or score. Grant-scoped rows stay Unknown/Potential until
+/// SENSE exists (design §2).
 #[derive(Debug)]
 pub(crate) struct ScopedUnsensedRoutePool {
     /// The EXACT facts artifact this pool was derived from (design §1.1).
     ///
     /// Publication identity, compared by `Arc::ptr_eq` exactly as
     /// `invalidate_if_stale` compares facts: installation always allocates a
-    /// fresh `Arc`, so pointer identity is the artifact's identity. This is
-    /// what the delayed pool invalidator (§18 step 2) will compare, and what
+    /// fresh `Arc`, so pointer identity is the artifact's identity. It is what
     /// lets a 2B.3d reader verify the pool it loaded was derived from the
     /// facts it loaded — the two cells are read with two separate atomics, so
     /// the pairing must be checkable, not assumed.
-    #[allow(dead_code)]
-    // consumers: the actor build cycle + exact pool invalidation (§18 step 2).
     derived_from: Arc<SlotBaseFacts>,
+    /// The exact authority-scoped source identity this pool speaks for.
+    ///
+    /// The whole key, never the capability alone: two demands under different
+    /// acting identities are different pools, and a pool that could not name
+    /// its own scope could be paired with another scope's facts by a reader
+    /// that only compared capabilities.
+    key: SlotKey,
+    /// The EXACT scope authority the rows were reconstructed under — the same
+    /// per-slot stamp the facts carry, restated here so a pool can be rejected
+    /// on its own without re-reading the facts beside it.
+    authority: ScopedDiscoveryAuthorityStamp,
+    /// The whole source epoch (the exact scoped source vector) the rows were
+    /// captured under.
+    epoch: SourceEpoch,
+    /// How this scope's providers were discovered.
+    provenance: ProviderProvenance,
+    /// The scoped source/provider vector, in the same deterministic provider
+    /// order the facts carry.
+    providers: Arc<[UnsensedRouteRow]>,
+    /// The ONE coherent session generation every annotation above was computed
+    /// under (design §3).
+    ///
+    /// This is what makes "a later session view" detectable: a reader
+    /// validating against generation `g` refuses a pool stamped `< g`, and the
+    /// pool-side invalidator orders by exactly this.
+    session_generation: u64,
+    /// The earliest instant this pool stops being usable — the same bound its
+    /// facts carry (`min(provider rows, installed DISCOVER authority)`),
+    /// restated so a pool can be validated on its own.
+    ///
+    /// Identical to `derived_from.earliest_expiry` BY CONSTRUCTION, which is
+    /// why the actor's deadline arm reads the facts plane only: a second
+    /// deadline source would be a second statement of one fact, free to
+    /// disagree with the first, and arming on it would be a comparison that
+    /// can never fail. `u64::MAX` means nothing here can expire.
+    earliest_deadline: u64,
 }
 
+#[allow(dead_code)] // consumer: the family projection (OLB-2B.3d).
 impl ScopedUnsensedRoutePool {
-    /// Test-only: a pool naming `derived_from`, for lifecycle witnesses. The
-    /// production constructor is the actor build cycle (§18 step 2).
+    /// The exact facts artifact this pool derives from.
+    pub(crate) fn derived_from(&self) -> &Arc<SlotBaseFacts> {
+        &self.derived_from
+    }
+
+    /// Does this pool derive from EXACTLY `facts`?
+    ///
+    /// Pointer identity, matching `invalidate_if_stale`: every installation
+    /// allocates a fresh `Arc`, so this is the artifact's identity and not a
+    /// content comparison that two equal reconstructions could both satisfy.
+    pub(crate) fn derives_from(&self, facts: &Arc<SlotBaseFacts>) -> bool {
+        Arc::ptr_eq(&self.derived_from, facts)
+    }
+
+    pub(crate) fn key(&self) -> &SlotKey {
+        &self.key
+    }
+
+    pub(crate) fn authority(&self) -> &ScopedDiscoveryAuthorityStamp {
+        &self.authority
+    }
+
+    pub(crate) fn epoch(&self) -> SourceEpoch {
+        self.epoch
+    }
+
+    pub(crate) fn provenance(&self) -> ProviderProvenance {
+        self.provenance
+    }
+
+    pub(crate) fn providers(&self) -> &[UnsensedRouteRow] {
+        &self.providers
+    }
+
+    /// The ONE session generation every annotation was computed under.
+    pub(crate) fn session_generation(&self) -> u64 {
+        self.session_generation
+    }
+
+    pub(crate) fn earliest_deadline(&self) -> u64 {
+        self.earliest_deadline
+    }
+
+    /// Test-only: a pool naming `derived_from` and nothing else, for the
+    /// lifecycle witnesses signed at step 1. The production constructor is
+    /// [`PreparedRoutePool::seal`].
     #[cfg(test)]
     pub(crate) fn for_test(derived_from: Arc<SlotBaseFacts>) -> Self {
-        Self { derived_from }
+        Self {
+            key: SlotKey {
+                scope: PrivateAudienceScope(CapabilityAudienceScope::Owner {
+                    org_id: OrgId::from_bytes([0; 32]),
+                    audience_handle: [0; 32],
+                }),
+                capability: CapabilityAuthorityId::for_tag("test:pool"),
+            },
+            authority: derived_from.authority,
+            epoch: derived_from.epoch,
+            provenance: ProviderProvenance::of(&derived_from.authority),
+            providers: Arc::from(Vec::new()),
+            session_generation: 0,
+            earliest_deadline: derived_from.earliest_expiry,
+            derived_from,
+        }
+    }
+}
+
+/// A COMPLETE pool, built entirely off-lock, waiting only to be bound to the
+/// facts artifact it derives from.
+///
+/// The split exists because of the ordering the design demands: the pool names
+/// the exact `Arc<SlotBaseFacts>` it was derived from, and that `Arc` is
+/// allocated at installation. Everything that reads the source or the session
+/// projection — the row join, the session annotation, the deterministic order —
+/// happens here, in phase 3, holding nothing. [`Self::seal`] then binds the
+/// finished payload to the artifact; it reads no source, takes no lock, and
+/// copies no row.
+#[derive(Debug)]
+struct PreparedRoutePool {
+    key: SlotKey,
+    authority: ScopedDiscoveryAuthorityStamp,
+    provenance: ProviderProvenance,
+    providers: Arc<[UnsensedRouteRow]>,
+    session_generation: u64,
+}
+
+impl PreparedRoutePool {
+    /// Bind the finished payload to the exact facts artifact it derives from.
+    fn seal(self, derived_from: Arc<SlotBaseFacts>) -> Arc<ScopedUnsensedRoutePool> {
+        Arc::new(ScopedUnsensedRoutePool {
+            key: self.key,
+            authority: self.authority,
+            epoch: derived_from.epoch,
+            provenance: self.provenance,
+            providers: self.providers,
+            session_generation: self.session_generation,
+            earliest_deadline: derived_from.earliest_expiry,
+            derived_from,
+        })
+    }
+}
+
+/// Where a lock-free reader may be scheduled between the two adjacent
+/// publication stores.
+///
+/// Both gaps are observation points because both are reachable: the invariant
+/// is that NO reader can observe a pool beside facts it was not derived from,
+/// and a witness that samples only one gap proves only half of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PublicationGap {
+    /// After the superseded pool was cleared, before the facts were installed.
+    PoolCleared,
+    /// After the facts were installed, before their pool was published.
+    FactsInstalled,
+}
+
+/// Test-only observation of the publication-order interleaving.
+///
+/// A production build has NO field here, so `observe` compiles to nothing.
+/// This exists because the pool-first ordering inside [`SlotCells`] cannot be
+/// distinguished by any final-state assertion — both stores complete before
+/// any assertion runs — so the only evidence is a reader timed BETWEEN them
+/// (design §18.0, the step-1 debt this slice owes).
+#[derive(Default)]
+struct PublicationObserver {
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    hook: parking_lot::Mutex<Option<Arc<dyn Fn(PublicationGap) + Send + Sync>>>,
+}
+
+impl PublicationObserver {
+    #[inline]
+    fn observe(&self, _gap: PublicationGap) {
+        #[cfg(test)]
+        {
+            let hook = self.hook.lock().clone();
+            if let Some(hook) = hook {
+                hook(_gap);
+            }
+        }
     }
 }
 
@@ -545,13 +1005,64 @@ impl SlotCells {
         self.facts.swap(None)
     }
 
-    /// Install a fresh facts artifact — POOL FIRST, for the same reason: a
-    /// pool present at this moment was derived from the SUPERSEDED facts, and
-    /// storing the new facts first would let a reader pair them with it. The
-    /// actor rebuilds the pool from the new facts afterwards (§18 step 2).
+    /// Drop ONLY the routing pool, leaving the facts exactly as they are —
+    /// the POOL-ONLY half of the asymmetric contract (design §1.1).
+    ///
+    /// Session projection moving does not make discovery facts stale, and
+    /// clearing them would re-queue a full reconstruction for a change that
+    /// touched no discovery row. Returns the removed pool.
+    fn take_pool(&self) -> Option<Arc<ScopedUnsensedRoutePool>> {
+        self.unsensed.swap(None)
+    }
+
+    /// Install a fresh facts artifact with NO pool beside it — POOL FIRST, for
+    /// the same reason: a pool present at this moment was derived from the
+    /// SUPERSEDED facts, and storing the new facts first would let a reader
+    /// pair them with it.
+    ///
+    /// Test-only. Production installs go through
+    /// [`Self::install_facts_and_pool`], which is the same ordering with the
+    /// pool half filled in — there is no production path that publishes facts
+    /// and then decides separately about their pool.
+    #[cfg(test)]
     fn install_facts(&self, facts: Arc<SlotBaseFacts>) {
+        self.install_facts_and_pool(facts, None, &PublicationObserver::default());
+    }
+
+    /// Publish `facts` and, when the build stayed current, the pool derived
+    /// from them — in the ONE order in which no lock-free reader can observe a
+    /// mismatched pair (design §1.1, §18.0's deferred publication-order
+    /// obligation).
+    ///
+    /// ```text
+    /// unsensed <- None        a reader here sees (old facts, no pool)
+    /// facts    <- new         a reader here sees (new facts, no pool)
+    /// unsensed <- new pool    a reader here sees (new facts, its own pool)
+    /// ```
+    ///
+    /// Every intermediate state is a COLD-POOL state, which is exactly the
+    /// state a reader must already handle. What is unreachable is the only
+    /// dangerous one: a pool beside facts it was not derived from. The
+    /// ordering has ONE implementation, here, so no publication site can get
+    /// it individually wrong.
+    fn install_facts_and_pool(
+        &self,
+        facts: Arc<SlotBaseFacts>,
+        pool: Option<Arc<ScopedUnsensedRoutePool>>,
+        observer: &PublicationObserver,
+    ) {
+        debug_assert!(
+            pool.as_ref()
+                .is_none_or(|pool| Arc::ptr_eq(&pool.derived_from, &facts)),
+            "a published pool names the facts it is published beside"
+        );
         self.unsensed.store(None);
+        observer.observe(PublicationGap::PoolCleared);
         self.facts.store(Some(facts));
+        observer.observe(PublicationGap::FactsInstalled);
+        if pool.is_some() {
+            self.unsensed.store(pool);
+        }
     }
 }
 
@@ -759,6 +1270,20 @@ pub(crate) struct RegistryMetrics {
     /// LIFECYCLE churn: conflating them steers an operator at supervisor restarts
     /// during what is actually revocation-publication pressure.
     settlements_refused: AtomicU64,
+    /// Routing pools PUBLISHED beside their facts (OLB-2B.3c step 2).
+    pools_published: AtomicU64,
+    /// Pools retired by pool-only invalidation — session projection moved
+    /// while the discovery facts stayed current.
+    pools_invalidated: AtomicU64,
+    /// Builds whose facts installed but whose POOL was discarded because the
+    /// session view moved underneath them, or because the session generation
+    /// space is spent.
+    ///
+    /// Distinct from `settlements_refused` and from `discarded_obsolete`: the
+    /// pass installed real facts and made real progress, and only the session
+    /// annotation was refused. Conflating it with either would report a
+    /// converging plane as a failing one.
+    pools_refused_stale_session: AtomicU64,
 }
 
 impl RegistryMetrics {
@@ -791,6 +1316,25 @@ impl RegistryMetrics {
     }
     pub(crate) fn settlements_refused(&self) -> u64 {
         self.settlements_refused.load(Ordering::Acquire)
+    }
+    /// The three pool counters are WITNESS surfaces for as long as the second
+    /// cell is dark. The counters themselves are production state — every one
+    /// of them is advanced by the production apply path — but nothing outside a
+    /// witness can act on them until 2B.3d gives the plane a consumer, and an
+    /// operator-facing surface published before then would describe a plane
+    /// that never moves. Widening the existing `pub` metrics array instead
+    /// would be a source-breaking public API change, which this slice excludes.
+    #[cfg(test)]
+    pub(crate) fn pools_published(&self) -> u64 {
+        self.pools_published.load(Ordering::Acquire)
+    }
+    #[cfg(test)]
+    pub(crate) fn pools_invalidated(&self) -> u64 {
+        self.pools_invalidated.load(Ordering::Acquire)
+    }
+    #[cfg(test)]
+    pub(crate) fn pools_refused_stale_session(&self) -> u64 {
+        self.pools_refused_stale_session.load(Ordering::Acquire)
     }
 }
 
@@ -836,6 +1380,9 @@ pub(crate) struct NodeOrgRoutingRegistry {
     /// Read lock-free, mutated under the registry lock, published after the
     /// bookkeeping it describes.
     ref_release_generation: AtomicU64,
+    /// Test-only observation of the two adjacent publication stores. Empty in
+    /// a production build — see [`PublicationObserver`].
+    publication_observer: PublicationObserver,
 }
 
 /// A clone family: one private identity and one shared 64-handle budget.
@@ -1227,7 +1774,24 @@ impl NodeOrgRoutingRegistry {
             metrics,
             node_capacity_generation: AtomicU64::new(0),
             ref_release_generation: AtomicU64::new(0),
+            publication_observer: PublicationObserver::default(),
         })
+    }
+
+    /// Test-only: observe the publication-order interleaving from a lock-free
+    /// reader scheduled BETWEEN the two adjacent stores.
+    ///
+    /// This seam exists because the pool-first ordering is invisible to every
+    /// final-state assertion — both stores complete before any of them runs
+    /// (design §18.0). The hook fires under the registry lock, and the reader
+    /// it drives takes none, which is exactly the observer the invariant is
+    /// about.
+    #[cfg(test)]
+    pub(crate) fn observe_publication_for_test(
+        &self,
+        hook: Arc<dyn Fn(PublicationGap) + Send + Sync>,
+    ) {
+        *self.publication_observer.hook.lock() = Some(hook);
     }
 
     /// The node capacity generation (OLB-2B.3b §9). See the field.
@@ -1879,6 +2443,86 @@ impl NodeOrgRoutingRegistry {
         }
     }
 
+    /// The node's session/direct-state projection moved to `live`: drop every
+    /// pool computed under an OLDER session view, re-queue exactly those
+    /// slots, wake the actor, and PRESERVE every facts artifact (OLB-2B.3c
+    /// step 2; design §1.1's pool-only half).
+    ///
+    /// Returns the number of pools retired.
+    ///
+    /// **The asymmetry is the whole point.** Session projection moving says
+    /// nothing about discovery: the providers, their proven owners, their
+    /// expiries and the authority that made them query-visible are all exactly
+    /// as current as they were. Clearing the facts too would re-queue a full
+    /// source reconstruction for a peer connecting — and would do it on every
+    /// peer transition, which is the loudest churn source a node has.
+    ///
+    /// **Conditional on the generation the pool was COMPUTED under, and
+    /// strictly less than.** A notification can be delayed arbitrarily between
+    /// its publication and this call, so an obsolete transition can arrive
+    /// after a newer projection has already been published and a newer pool
+    /// built from it. Two survivors, and both are reachable:
+    ///
+    /// - a pool from a LATER session view — the ordinary delayed-invalidator
+    ///   case;
+    /// - a pool from THIS view — an actor pass that captured the projection
+    ///   after it was published and before this notification ran already
+    ///   reflects the transition, exactly as `<` versus `<=` decides for the
+    ///   consumer-Grant fence.
+    ///
+    /// It cannot delete a newer pool derived from NEWER facts either, and not
+    /// by luck: generations are monotone, so a build that observed the
+    /// projection after this transition necessarily stamped `>= live`.
+    ///
+    /// A retained slot whose pool is ABSENT is left entirely alone — no clear
+    /// and no re-queue. The build that will publish its pool is either already
+    /// owed (its identity is in `pending`) or already in flight, and an
+    /// in-flight one revalidates the generation before it publishes. Waking on
+    /// absence instead would make every peer transition re-queue every retained
+    /// slot on the node, which is the "invalidate everything on any movement"
+    /// breadth failure W-W3 exists to refuse.
+    ///
+    /// The caller must NOT hold the session publication gate: this takes the
+    /// registry lock, and the documented order is
+    /// `peer-transition/session publication → registry lock`. Publishing the
+    /// new projection, advancing the generation and RELEASING the gate all
+    /// happen before this runs, on the same discipline as the consumer-Grant
+    /// edge (design §2A.2, item 10).
+    pub(crate) fn invalidate_session_older_than(&self, live: u64) -> u64 {
+        let (retired, owed) = {
+            let mut inner = self.inner.lock();
+            let superseded: Vec<SlotKey> = inner
+                .slots
+                .iter()
+                .filter(|(_, slot)| {
+                    slot.cells
+                        .unsensed
+                        .load()
+                        .as_ref()
+                        .is_some_and(|pool| pool.session_generation < live)
+                })
+                .map(|(key, _)| key.clone())
+                .collect();
+            let mut retired = 0u64;
+            for key in superseded {
+                if let Some(slot) = inner.slots.get(&key) {
+                    if slot.cells.take_pool().is_some() {
+                        retired += 1;
+                    }
+                }
+                inner.pending.insert(key);
+            }
+            self.metrics
+                .pools_invalidated
+                .fetch_add(retired, Ordering::AcqRel);
+            (retired, !inner.pending.is_empty())
+        };
+        if owed {
+            self.work.mark();
+        }
+        retired
+    }
+
     /// A consumer Grant moved: retire every retained artifact of that exact
     /// audience scope which the transition SUPERSEDES, re-queue exactly those
     /// slots, and wake the actor (items 10/11).
@@ -2101,6 +2745,26 @@ impl NodeOrgRoutingRegistry {
         retired
     }
 
+    /// Test-only: re-queue `key` WITHOUT invalidating either plane, so a
+    /// witness can drive a fresh quantum over a slot that still holds its
+    /// published artifacts. That is the state the publication-order witness
+    /// needs: a SUPERSEDED pool must be present when the next install starts,
+    /// or every observation gap is trivially pool-free.
+    #[cfg(test)]
+    pub(crate) fn requeue_for_test(&self, key: &SlotKey) {
+        self.inner.lock().pending.insert(key.clone());
+    }
+
+    /// Test-only: drop ONLY `key`'s pool, leaving its facts — the state a slot
+    /// is in between a refused pool publication and its rebuild.
+    #[cfg(test)]
+    pub(crate) fn take_pool_for_test(&self, key: &SlotKey) {
+        let inner = self.inner.lock();
+        if let Some(slot) = inner.slots.get(key) {
+            slot.cells.take_pool();
+        }
+    }
+
     /// Test-only: drop `key`'s facts and re-queue it, so a witness can drive
     /// another quantum over the same slot.
     #[cfg(test)]
@@ -2165,10 +2829,15 @@ impl NodeOrgRoutingRegistry {
         }
     }
 
-    /// Test-only: the published routing pool, retention only — the second
-    /// cell's twin of [`Self::base_facts_unvalidated`].
-    #[cfg(test)]
-    pub(crate) fn unsensed_pool_for_test(
+    /// The RAW retained routing pool for `key` — the second cell's twin of
+    /// [`Self::base_facts_unvalidated`], with the same warning.
+    ///
+    /// **Not a read seam.** Production callers want
+    /// `MeshNode::org_routing_unsensed_pool` (`mesh.rs`), which validates the
+    /// facts beneath it, proves the pool derives from exactly those facts, and
+    /// refuses a pool computed under a superseded session view. None of that
+    /// lives here, and the name says so for the same reason its twin's does.
+    pub(crate) fn unsensed_pool_unvalidated(
         &self,
         key: &SlotKey,
     ) -> Option<Arc<ScopedUnsensedRoutePool>> {
@@ -2450,16 +3119,37 @@ impl DirtyApply for NodeOrgRoutingRegistry {
         let keys: Vec<SlotKey> = selected.iter().map(|(key, _)| key.clone()).collect();
         let snapshot = self.source.snapshot(&keys);
         let snapshot_token = snapshot.token();
+        // ONE coherent session observation for the WHOLE quantum (design §3).
+        //
+        // Captured once, beside the source snapshot and with no registry lock
+        // held. Every annotation in every pool this pass publishes comes from
+        // this value, so "one coherent session generation" is structural: there
+        // is no second sample for a row to be annotated from, and no window in
+        // which two rows of one pool could observe different projections.
+        let sessions = self.source.session_view();
 
         // --- phase 3: reconstruct holding NOTHING ---
         // Not the registry lock, and not the source's publication gate: this is the
         // expensive part of a quantum, and blocking private-discovery ingest,
         // expiry and floor mutation behind it is exactly what the snapshot/commit
         // split exists to prevent (Kyra OLB-2B-E3b).
-        let built: Vec<(SlotKey, u64, ScopedSourceFacts)> = selected
+        //
+        // The routing pool is built COMPLETELY here too — the row join, the
+        // session annotation and the deterministic order are all source/session
+        // work, and none of it may happen beneath a lock. What phase 5 does is
+        // bind the finished payload to the facts artifact it derives from,
+        // which reads nothing and copies no row.
+        let built: Vec<BuiltSlot> = selected
             .iter()
             .map(|(key, slot_incarnation)| {
-                (key.clone(), *slot_incarnation, snapshot.providers(key))
+                let facts = snapshot.providers(key);
+                let prepared = prepare_route_pool(key, &facts, &sessions);
+                BuiltSlot {
+                    key: key.clone(),
+                    slot_incarnation: *slot_incarnation,
+                    facts,
+                    prepared,
+                }
             })
             .collect();
         drop(snapshot);
@@ -2481,13 +3171,13 @@ impl DirtyApply for NodeOrgRoutingRegistry {
             let mut inner = self.inner.lock();
             if liveness.may_requeue() {
                 // Install nothing, and put every still-live selected slot back.
-                for (key, slot_incarnation, _) in &built {
+                for built in &built {
                     if inner
                         .slots
-                        .get(key)
-                        .is_some_and(|slot| slot.incarnation == *slot_incarnation)
+                        .get(&built.key)
+                        .is_some_and(|slot| slot.incarnation == built.slot_incarnation)
                     {
-                        inner.pending.insert(key.clone());
+                        inner.pending.insert(built.key.clone());
                     }
                 }
             }
@@ -2517,13 +3207,13 @@ impl DirtyApply for NodeOrgRoutingRegistry {
                 // Authority was revoked while we built. Every still-live slot we
                 // selected still owes work — requeue it rather than dropping it,
                 // and never report a current installation.
-                for (key, slot_incarnation, _) in &built {
+                for built in &built {
                     if inner
                         .slots
-                        .get(key)
-                        .is_some_and(|slot| slot.incarnation == *slot_incarnation)
+                        .get(&built.key)
+                        .is_some_and(|slot| slot.incarnation == built.slot_incarnation)
                     {
-                        inner.pending.insert(key.clone());
+                        inner.pending.insert(built.key.clone());
                     }
                 }
                 self.metrics
@@ -2537,8 +3227,32 @@ impl DirtyApply for NodeOrgRoutingRegistry {
                 return ApplyOutcome::Superseded;
             }
 
+            // The COMPLETE currentness stamp's session half, revalidated here
+            // and nowhere earlier (design §18 step 2's publish-if-current).
+            //
+            // Read BENEATH the registry lock deliberately, and it is sound to
+            // do so because it is a single atomic load: it acquires nothing, so
+            // the frozen `source commit pin → registry lock` order is untouched
+            // and no source method is called under the lock.
+            //
+            // Reading it before the lock would leave a hole rather than merely
+            // being weaker. A transition publishes its projection, advances the
+            // generation, and only THEN takes this lock to retire superseded
+            // pools; a pre-lock read could pass, the transition could then
+            // advance and complete its whole invalidation, and this pass would
+            // still store a pool the transition had already decided to remove.
+            // Reading under the lock orders the two: either we see the newer
+            // generation and publish nothing, or the transition's invalidation
+            // is strictly after our store and clears it.
+            let session_current = sessions.still_current();
             let RegistryInner { slots, pending, .. } = &mut *inner;
-            for (key, slot_incarnation, facts) in built {
+            for BuiltSlot {
+                key,
+                slot_incarnation,
+                facts,
+                prepared,
+            } in built
+            {
                 let Some(slot) = slots.get_mut(&key) else {
                     // Retired while we built: do NOT resurrect it.
                     self.metrics
@@ -2579,12 +3293,7 @@ impl DirtyApply for NodeOrgRoutingRegistry {
                 // while the authority behind it expires in an hour — and nothing
                 // else in the artifact could ever retire it.
                 let earliest_expiry = row_expiry.min(authority_deadline);
-                // Pool first, inside `install_facts` (§1.1): a pool present at
-                // this moment was derived from the facts being SUPERSEDED, and
-                // storing the new facts first would let a lock-free reader
-                // pair them with it. The pool rebuild is the actor build
-                // cycle's (§18 step 2).
-                slot.cells.install_facts(Arc::new(SlotBaseFacts {
+                let facts = Arc::new(SlotBaseFacts {
                     providers: facts,
                     epoch,
                     authority,
@@ -2592,8 +3301,46 @@ impl DirtyApply for NodeOrgRoutingRegistry {
                     actor_incarnation: incarnation,
                     slot_incarnation,
                     earliest_expiry,
-                }));
+                });
+                // PUBLISH-IF-CURRENT, the pool half. The facts are current —
+                // the commit pin proved it, and nothing about session movement
+                // makes a discovery row stale — so they install either way. The
+                // POOL installs only if the session view it was computed under
+                // is still the live one; otherwise this pass publishes facts
+                // with no pool beside them, which is the ordinary cold-pool
+                // state, and re-queues the slot so the next pass rebuilds the
+                // annotation. The stale pool is never observable, because it is
+                // never stored.
+                let pool = match prepared {
+                    Some(prepared) if session_current => Some(prepared.seal(facts.clone())),
+                    Some(_) => {
+                        self.metrics
+                            .pools_refused_stale_session
+                            .fetch_add(1, Ordering::AcqRel);
+                        // The transition that moved the projection cannot have
+                        // re-queued this slot on our behalf: it retires pools
+                        // it can SEE, and this one was never published. The
+                        // re-queue is ours, and it is the one legitimate wake —
+                        // `owed` below marks exactly once for the whole pass.
+                        pending.insert(key.clone());
+                        None
+                    }
+                    // `Unserved`, or a spent session-generation space: no
+                    // annotation can be made, and a pool is not published over
+                    // absent evidence.
+                    None => None,
+                };
+                let published = pool.is_some();
+                // Pool first, inside `install_facts_and_pool` (§1.1): a pool
+                // present at this moment was derived from the facts being
+                // SUPERSEDED, and storing the new facts first would let a
+                // lock-free reader pair them with it.
+                slot.cells
+                    .install_facts_and_pool(facts, pool, &self.publication_observer);
                 self.metrics.installs.fetch_add(1, Ordering::AcqRel);
+                if published {
+                    self.metrics.pools_published.fetch_add(1, Ordering::AcqRel);
+                }
             }
 
             // FINAL complete-vector validation, still under the pin and the
@@ -2661,6 +3408,72 @@ impl DirtyApply for NodeOrgRoutingRegistry {
         drop(commit);
         outcome
     }
+}
+
+/// One slot's complete off-lock reconstruction: the facts, and the routing
+/// pool derived from them, waiting for the artifact identity phase 5 mints.
+struct BuiltSlot {
+    key: SlotKey,
+    slot_incarnation: u64,
+    facts: ScopedSourceFacts,
+    /// `None` when no pool may be published for this slot at all — `Unserved`
+    /// facts, or a terminally exhausted session-generation space.
+    prepared: Option<PreparedRoutePool>,
+}
+
+/// Project ONE slot's routing pool, entirely off-lock (design §18 step 2).
+///
+/// Runs in phase 3 with no registry lock, no source lock and no session lock:
+/// `facts` is owned material the snapshot already returned, and `sessions` is
+/// an immutable observation captured once for the whole quantum.
+///
+/// Returns `None` — publish no pool — in exactly two cases, and both are
+/// refusals rather than empty answers:
+///
+/// - **`SourceFacts::Unserved`.** The source has no evidence about this scope,
+///   so there is nothing to project. A pool with zero rows would be exact
+///   negative evidence, which is precisely what `Unserved` is not (see
+///   [`SourceFacts`]). A `Served` bucket with zero providers DOES get a pool:
+///   that is the exact fresh negative evidence, and W-G13's zero-provider
+///   Grant case depends on it existing;
+/// - **a spent session-generation space.** Nothing can witness that an
+///   annotation is current, so nothing is annotated. Fail closed, and note
+///   that this publishes no pool rather than publishing an un-annotated one:
+///   a pool whose rows all read `Cold` because the generation space ran out is
+///   indistinguishable from one whose providers genuinely have no sessions.
+fn prepare_route_pool(
+    key: &SlotKey,
+    facts: &ScopedSourceFacts,
+    sessions: &SessionObservation,
+) -> Option<PreparedRoutePool> {
+    let SourceFacts::Served(providers) = &facts.facts else {
+        return None;
+    };
+    let session_generation = sessions.generation?;
+    // Provider order is the snapshot's own deterministic order, preserved
+    // exactly. Re-sorting here would be a second ordering rule, free to
+    // disagree with the one the source already imposed off-lock.
+    let rows: Vec<UnsensedRouteRow> = providers
+        .iter()
+        .map(|provider| UnsensedRouteRow {
+            provider: provider.provider.clone(),
+            // The owner relation the ingest path PROVED, carried through.
+            owner_org: provider.owner_org,
+            generation: provider.generation,
+            expires_at: provider.expires_at,
+            // Annotated from the ONE observation this quantum captured. A
+            // provider the projection cannot resolve unambiguously is `Cold`,
+            // never a guess (design §3's join rules).
+            direct: sessions.eligibility(&provider.provider),
+        })
+        .collect();
+    Some(PreparedRoutePool {
+        key: key.clone(),
+        authority: facts.authority,
+        provenance: ProviderProvenance::of(&facts.authority),
+        providers: rows.into(),
+        session_generation,
+    })
 }
 
 /// Settle the pass: `Current` only when no work is owed.
@@ -2743,6 +3556,100 @@ mod tests {
     type Hook = Box<dyn Fn() + Send + Sync>;
     type SharedHook = Arc<dyn Fn() + Send + Sync>;
 
+    fn entity(seed: u8) -> EntityId {
+        EntityId::from_bytes([seed; 32])
+    }
+
+    fn provider_row(seed: u8, generation: u64, expires_at: u64) -> PrivateCapabilityProvider {
+        PrivateCapabilityProvider {
+            provider: entity(seed),
+            owner_org: OrgId::from_bytes([seed.wrapping_add(0x40); 32]),
+            expires_at,
+            generation,
+        }
+    }
+
+    /// The test double for the node's published session/direct-state
+    /// projection.
+    ///
+    /// Shaped exactly like the production one: an immutable value carrying its
+    /// own generation, republished as a whole, ordered by a shared
+    /// [`SessionCurrentness`]. A witness that could move rows without moving
+    /// the generation would be modelling a node this code cannot produce.
+    #[derive(Default)]
+    struct TestProjection {
+        generation: u64,
+        rows: BTreeMap<EntityId, DirectEligibility>,
+        /// The registry, so the ANNOTATION JOIN can assert directly that it
+        /// runs with no registry lock held. `providers` already asserts it for
+        /// the row capture; this is the pool-build half, and it is the one the
+        /// design's lock-discipline obligation is about.
+        registry: Option<Arc<NodeOrgRoutingRegistry>>,
+    }
+
+    impl SessionEligibility for TestProjection {
+        fn eligibility(&self, provider: &EntityId) -> DirectEligibility {
+            if let Some(registry) = self.registry.as_ref() {
+                assert!(
+                    registry.inner.try_lock().is_some(),
+                    "no registry lock may be held while the pool is built"
+                );
+            }
+            self.rows
+                .get(provider)
+                .copied()
+                .unwrap_or(DirectEligibility::Cold)
+        }
+    }
+
+    struct TestSessions {
+        currentness: Arc<SessionCurrentness>,
+        published: parking_lot::Mutex<Arc<TestProjection>>,
+        registry: parking_lot::Mutex<Option<Arc<NodeOrgRoutingRegistry>>>,
+        /// `session_view` calls, so a witness can assert the quantum captured
+        /// EXACTLY ONE observation — the structural half of "one coherent
+        /// session generation".
+        observations: AtomicU64,
+    }
+
+    impl TestSessions {
+        fn new() -> Self {
+            Self {
+                currentness: SessionCurrentness::new(),
+                published: parking_lot::Mutex::new(Arc::new(TestProjection::default())),
+                registry: parking_lot::Mutex::new(None),
+                observations: AtomicU64::new(0),
+            }
+        }
+
+        /// Republish, in the production order: reserve, store, commit.
+        fn publish(&self, rows: BTreeMap<EntityId, DirectEligibility>) -> u64 {
+            let generation = self.currentness.reserve().expect("generation space");
+            let registry = self.registry.lock().clone();
+            *self.published.lock() = Arc::new(TestProjection {
+                generation,
+                rows,
+                registry,
+            });
+            self.currentness.commit(generation);
+            generation
+        }
+
+        fn observe(&self) -> SessionObservation {
+            self.observations.fetch_add(1, Ordering::AcqRel);
+            let published = self.published.lock().clone();
+            let generation = self.currentness.generation().map(|_| published.generation);
+            SessionObservation::new(generation, published, self.currentness.clone())
+        }
+    }
+
+    fn direct(node_id: u64) -> DirectEligibility {
+        DirectEligibility::Direct {
+            node_id,
+            session_id: node_id ^ 0xfeed,
+        }
+    }
+
     /// The observable state of the source the witnesses drive.
     ///
     /// `gate` stands in for BOTH the query-visible generation and the scoped
@@ -2765,6 +3672,18 @@ mod tests {
         queried: parking_lot::Mutex<Vec<SlotKey>>,
         snapshots: AtomicU64,
         registry: parking_lot::Mutex<Option<Arc<NodeOrgRoutingRegistry>>>,
+        /// The provider rows every captured scope reconstructs with. Empty by
+        /// default, which is `Served(0 providers)` — exact negative evidence,
+        /// and the shape most of the pre-2B.3c witnesses assert against.
+        rows: parking_lot::Mutex<Vec<PrivateCapabilityProvider>>,
+        /// The captured scope's own authority deadline, so the deadline
+        /// witnesses can place the ZERO-provider case exactly.
+        authority_deadline: AtomicU64,
+        /// Reconstruct every scope as `Unserved` — the source cannot speak for
+        /// it at all, which is NOT the same as a served empty bucket.
+        unserved: AtomicBool,
+        /// The node's session/direct-state projection (OLB-2B.3c step 2).
+        sessions: TestSessions,
     }
 
     impl SourceState {
@@ -2778,6 +3697,10 @@ mod tests {
                 queried: parking_lot::Mutex::new(Vec::new()),
                 snapshots: AtomicU64::new(0),
                 registry: parking_lot::Mutex::new(None),
+                rows: parking_lot::Mutex::new(Vec::new()),
+                authority_deadline: AtomicU64::new(u64::MAX),
+                unserved: AtomicBool::new(false),
+                sessions: TestSessions::new(),
             })
         }
         fn queries(&self) -> Vec<SlotKey> {
@@ -2825,11 +3748,24 @@ mod tests {
             if let Some(hook) = hook {
                 hook();
             }
+            let unserved = self.state.unserved.load(Ordering::Acquire);
+            let facts = if unserved {
+                SourceFacts::Unserved
+            } else {
+                SourceFacts::Served(self.state.rows.lock().clone().into())
+            };
             ScopedSourceFacts {
-                facts: SourceFacts::Served(Arc::from(Vec::new())),
+                facts,
                 authority: ScopedDiscoveryAuthorityStamp::Owner,
                 grant_fence: GrantArtifactFence::Publication(0),
-                authority_deadline: u64::MAX,
+                // An `Unserved` reconstruction carries NO deadline, exactly as
+                // the production source's does: there is no authority here to
+                // expire, and the artifact reads cold at every read anyway.
+                authority_deadline: if unserved {
+                    u64::MAX
+                } else {
+                    self.state.authority_deadline.load(Ordering::Acquire)
+                },
             }
         }
     }
@@ -2883,6 +3819,12 @@ mod tests {
             })
         }
 
+        fn session_view(&self) -> SessionObservation {
+            self.0
+                .assert_no_registry_lock("no registry lock may be held across the session capture");
+            self.0.sessions.observe()
+        }
+
         fn pin_if_current(
             &self,
             _keys: &[SlotKey],
@@ -2925,6 +3867,7 @@ mod tests {
             metrics.clone(),
         );
         *source.registry.lock() = Some(registry.clone());
+        *source.sessions.registry.lock() = Some(registry.clone());
         registry.activate_incarnation(1);
         Fixture {
             registry,
@@ -3173,7 +4116,7 @@ mod tests {
             Arc::new(ScopedUnsensedRoutePool::for_test(base)),
         );
         assert!(
-            f.registry.unsensed_pool_for_test(&first).is_some(),
+            f.registry.unsensed_pool_unvalidated(&first).is_some(),
             "a retained slot owns its pool publication"
         );
         f.registry.install_unsensed_pool_for_test(
@@ -3181,7 +4124,7 @@ mod tests {
             Arc::new(ScopedUnsensedRoutePool::for_test(facts())),
         );
         assert!(
-            f.registry.unsensed_pool_for_test(&beyond).is_none(),
+            f.registry.unsensed_pool_unvalidated(&beyond).is_none(),
             "no slot, no cell, no 257th pool — the bound is structural, not \
              counted"
         );
@@ -3589,7 +4532,7 @@ mod tests {
         }
         for (index, k) in set.keys().to_vec().iter().enumerate() {
             let through_set = set.unsensed_pool_unvalidated(index).expect("pool");
-            let through_registry = f.registry.unsensed_pool_for_test(k).expect("pool");
+            let through_registry = f.registry.unsensed_pool_unvalidated(k).expect("pool");
             assert!(
                 Arc::ptr_eq(&through_set, &through_registry),
                 "contributor {index} reads its own slot's pool — the planes \
@@ -3684,7 +4627,7 @@ mod tests {
         f.registry.invalidate_for_test(&k);
         assert!(f.registry.base_facts_unvalidated(&k).is_none());
         assert!(
-            f.registry.unsensed_pool_for_test(&k).is_none(),
+            f.registry.unsensed_pool_unvalidated(&k).is_none(),
             "the pool's basis is gone, so the pool is gone"
         );
     }
@@ -3719,7 +4662,7 @@ mod tests {
         );
         assert!(
             f.registry
-                .unsensed_pool_for_test(&k)
+                .unsensed_pool_unvalidated(&k)
                 .is_some_and(|read| Arc::ptr_eq(&read, &pool)),
             "and so does the pool derived from them"
         );
@@ -3727,7 +4670,7 @@ mod tests {
         // The control: observing the CURRENT artifact clears both planes.
         f.registry.invalidate_if_stale(&k, &current);
         assert!(f.registry.base_facts_unvalidated(&k).is_none());
-        assert!(f.registry.unsensed_pool_for_test(&k).is_none());
+        assert!(f.registry.unsensed_pool_unvalidated(&k).is_none());
     }
 
     /// Installing NEWER facts leaves no pool published: the pool present at
@@ -3752,7 +4695,7 @@ mod tests {
             "the newer facts are published"
         );
         assert!(
-            f.registry.unsensed_pool_for_test(&k).is_none(),
+            f.registry.unsensed_pool_unvalidated(&k).is_none(),
             "and the superseded facts' pool is not beside them"
         );
     }
@@ -3804,13 +4747,585 @@ mod tests {
                 "successor contributor {index} reads its OWN key's facts"
             );
             let pool_via_set = successor.unsensed_pool_unvalidated(index).expect("pool");
-            let pool_via_registry = f.registry.unsensed_pool_for_test(k).expect("pool");
+            let pool_via_registry = f.registry.unsensed_pool_unvalidated(k).expect("pool");
             assert!(
                 Arc::ptr_eq(&pool_via_set, &pool_via_registry),
                 "and its OWN key's pool — the pairing survives a replacement"
             );
         }
         drop(old);
+    }
+
+    // ------------------- OLB-2B.3c §18 step 2: the actor build cycle
+
+    /// **Production pool construction.** A real actor pass installs facts AND
+    /// the pool derived from them, and the pool carries every component §1
+    /// requires: the exact provider, its PROVEN owner org, the discovery
+    /// provenance of the scope, the exact scoped source vector, the session
+    /// annotation, the coherent generation, and the scoped deadline.
+    ///
+    /// The facts identity is checked by POINTER, not by content: that is what
+    /// a 2B.3d reader has to be able to do, and two equal reconstructions
+    /// would satisfy a content comparison.
+    #[test]
+    fn an_actor_pass_publishes_the_pool_it_derived() {
+        let f = fixture();
+        let family = f.family();
+        let k = key(1, "nrpc:build");
+        *f.source.rows.lock() = vec![provider_row(7, 42, 9_000), provider_row(8, 43, 4_000)];
+        let generation = f.source.sessions.publish(
+            [(entity(7), direct(0xabc))]
+                .into_iter()
+                .collect::<BTreeMap<_, _>>(),
+        );
+        let handle = family.demand(k.clone()).expect("retained");
+
+        let outcome = f.registry.apply(1, request(true, DirtyCapabilities::Clean));
+        assert!(matches!(outcome, ApplyOutcome::Current { .. }));
+
+        let facts = f.registry.base_facts_unvalidated(&k).expect("facts");
+        let pool = f.registry.unsensed_pool_unvalidated(&k).expect("pool");
+        assert!(
+            pool.derives_from(&facts),
+            "the pool names the EXACT facts artifact published beside it"
+        );
+        assert_eq!(pool.key(), &k, "and its own authority-scoped identity");
+        assert_eq!(pool.authority(), &facts.authority);
+        assert_eq!(
+            pool.epoch(),
+            facts.epoch,
+            "the exact scoped source vector, not a re-derived one"
+        );
+        assert_eq!(pool.provenance(), ProviderProvenance::OwnerPlane);
+        assert_eq!(pool.session_generation(), generation);
+        assert_eq!(
+            pool.earliest_deadline(),
+            4_000,
+            "the earliest provider expiry bounds the pool exactly as it bounds \
+             the facts"
+        );
+        assert_eq!(
+            f.registry.next_artifact_deadline(),
+            Some(4_000),
+            "and PRIVATE-DISCOVERY expiry ARMS the actor on it: the pool's \
+             bound is the artifact's, so one arm covers both planes"
+        );
+
+        let rows = pool.providers();
+        assert_eq!(rows.len(), 2, "the whole scoped provider vector");
+        assert_eq!(rows[0].provider, entity(7));
+        assert_eq!(
+            rows[0].owner_org,
+            OrgId::from_bytes([7u8.wrapping_add(0x40); 32]),
+            "the owner relation the ingest path PROVED, carried through"
+        );
+        assert_eq!(rows[0].generation, 42, "per-row announcement provenance");
+        assert_eq!(rows[0].expires_at, 9_000);
+        assert_eq!(
+            rows[0].direct,
+            direct(0xabc),
+            "annotated under the ONE captured session view"
+        );
+        assert_eq!(
+            rows[1].direct,
+            DirectEligibility::Cold,
+            "a provider the projection does not resolve is COLD, never guessed"
+        );
+
+        assert!(
+            handle
+                .unsensed_pool_unvalidated()
+                .is_some_and(|read| Arc::ptr_eq(&read, &pool)),
+            "and the lock-free handle reads the very pool the actor published"
+        );
+        assert_eq!(f.metrics.pools_published(), 1);
+        assert_eq!(f.metrics.pools_refused_stale_session(), 0);
+    }
+
+    /// `Unserved` publishes NO pool; `Served(0 providers)` publishes one.
+    ///
+    /// The control is the whole witness: a pool over `Unserved` would be an
+    /// artifact claiming an empty provider vector for a scope the source has
+    /// no evidence about, which is exactly the conflation [`SourceFacts`]
+    /// exists to refuse. The zero-provider SERVED case must still publish, or
+    /// W-G13's empty-bucket Grant scope would have no pool to retire.
+    #[test]
+    fn an_unserved_reconstruction_publishes_no_pool_but_a_served_empty_one_does() {
+        let f = fixture();
+        let family = f.family();
+        let k = key(1, "nrpc:unserved");
+        f.source.sessions.publish(BTreeMap::new());
+        let _held = family.demand(k.clone()).expect("retained");
+
+        f.source.unserved.store(true, Ordering::Release);
+        f.registry.apply(1, request(true, DirtyCapabilities::Clean));
+        assert!(
+            f.registry.base_facts_unvalidated(&k).is_some(),
+            "the Unserved artifact IS published — it is exact structural \
+             evidence that the source cannot speak for this scope"
+        );
+        assert!(
+            f.registry.unsensed_pool_unvalidated(&k).is_none(),
+            "but no pool is published over it"
+        );
+
+        // The control: exact fresh negative evidence DOES get a pool.
+        f.source.unserved.store(false, Ordering::Release);
+        f.registry.invalidate_for_test(&k);
+        f.registry.apply(1, request(true, DirtyCapabilities::Clean));
+        let pool = f
+            .registry
+            .unsensed_pool_unvalidated(&k)
+            .expect("a served empty bucket is exact evidence and gets a pool");
+        assert!(pool.providers().is_empty());
+    }
+
+    /// **Publish-if-current, session half.** The session view moves DURING the
+    /// build: the facts install (nothing about session movement makes a
+    /// discovery row stale), the pool does not, the live slot is re-queued,
+    /// and the stale pool is never observable.
+    ///
+    /// Dies to: publishing the pool unconditionally, or gating it on a
+    /// generation read BEFORE the registry lock.
+    #[test]
+    fn a_session_view_that_moved_during_the_build_publishes_no_pool() {
+        let f = fixture();
+        let family = f.family();
+        let k = key(1, "nrpc:race");
+        *f.source.rows.lock() = vec![provider_row(7, 1, u64::MAX)];
+        let captured = f
+            .source
+            .sessions
+            .publish([(entity(7), direct(1))].into_iter().collect());
+        let _held = family.demand(k.clone()).expect("retained");
+
+        // The projection moves after the observation is captured and before
+        // the publication phase — the exact window publish-if-current exists
+        // for.
+        let sessions = f.source.clone();
+        *f.source.during_build.lock() = Some(Box::new(move || {
+            sessions
+                .sessions
+                .publish([(entity(7), direct(2))].into_iter().collect());
+        }));
+
+        let outcome = f.registry.apply(1, request(true, DirtyCapabilities::Clean));
+        assert!(
+            matches!(outcome, ApplyOutcome::Progress { .. }),
+            "the pass made progress and still owes the pool"
+        );
+        assert!(
+            f.registry.base_facts_unvalidated(&k).is_some(),
+            "the facts are CURRENT — the commit pin proved it, and sessions \
+             say nothing about discovery"
+        );
+        assert!(
+            f.registry.unsensed_pool_unvalidated(&k).is_none(),
+            "the pool built under the superseded view is never observable"
+        );
+        assert_eq!(f.metrics.pools_published(), 0);
+        assert_eq!(f.metrics.pools_refused_stale_session(), 1);
+        assert_eq!(
+            f.registry.pending_slots(),
+            1,
+            "the live slot is re-queued, so the next pass rebuilds the pool"
+        );
+
+        // …and it converges: one more pass publishes the pool at the CURRENT
+        // generation. Without this the witness would accept a plane that
+        // refuses forever.
+        let outcome = f.registry.apply(1, request(true, DirtyCapabilities::Clean));
+        assert!(matches!(outcome, ApplyOutcome::Current { .. }));
+        let pool = f.registry.unsensed_pool_unvalidated(&k).expect("pool");
+        assert!(pool.session_generation() > captured);
+        assert_eq!(pool.providers()[0].direct, direct(2));
+    }
+
+    /// **Publish-if-current, source half.** Source movement during the build
+    /// discards BOTH planes — there is nothing current to publish either half
+    /// of — and re-queues the live slot.
+    #[test]
+    fn a_source_that_moved_during_the_build_publishes_neither_plane() {
+        let f = fixture();
+        let family = f.family();
+        let k = key(1, "nrpc:srcrace");
+        f.source
+            .sessions
+            .publish([(entity(7), direct(1))].into_iter().collect());
+        *f.source.rows.lock() = vec![provider_row(7, 1, u64::MAX)];
+        let _held = family.demand(k.clone()).expect("retained");
+
+        let source = f.source.clone();
+        *f.source.during_build.lock() = Some(Box::new(move || source.advance()));
+
+        let outcome = f.registry.apply(1, request(true, DirtyCapabilities::Clean));
+        assert!(matches!(outcome, ApplyOutcome::Superseded));
+        assert!(f.registry.base_facts_unvalidated(&k).is_none());
+        assert!(f.registry.unsensed_pool_unvalidated(&k).is_none());
+        assert_eq!(f.metrics.pools_published(), 0);
+        assert_eq!(f.registry.pending_slots(), 1);
+    }
+
+    /// **Mixed-generation refusal.** A quantum captures EXACTLY ONE session
+    /// observation, so no pool can be assembled from two views — and a pass
+    /// whose observation is superseded publishes nothing rather than accepting
+    /// the mixed one.
+    ///
+    /// The projection moves between the FIRST and SECOND provider's
+    /// annotation. Every row still carries the captured view (a per-row
+    /// re-sample would show `direct(2)` on the second row), and the whole pool
+    /// is then refused.
+    ///
+    /// Dies to: re-observing the projection per row or per slot instead of
+    /// once per quantum.
+    #[test]
+    fn a_pool_cannot_compose_two_session_generations() {
+        let f = fixture();
+        let family = f.family();
+        let a = key(1, "nrpc:mixed");
+        let b = key(2, "nrpc:mixed");
+        *f.source.rows.lock() = vec![provider_row(7, 1, u64::MAX)];
+        f.source
+            .sessions
+            .publish([(entity(7), direct(1))].into_iter().collect());
+        let _held = family
+            .demand_set(vec![a.clone(), b.clone()])
+            .expect("retained");
+
+        let moved = f.source.clone();
+        *f.source.during_build.lock() = Some(Box::new(move || {
+            moved
+                .sessions
+                .publish([(entity(7), direct(2))].into_iter().collect());
+        }));
+
+        f.registry.apply(1, request(true, DirtyCapabilities::Clean));
+        assert_eq!(
+            f.source.sessions.observations.load(Ordering::Acquire),
+            1,
+            "ONE observation for the whole quantum — there is no second sample \
+             for a row to be annotated from"
+        );
+        assert_eq!(
+            f.metrics.pools_refused_stale_session(),
+            2,
+            "and both slots refuse rather than publishing a mixed observation"
+        );
+        assert!(f.registry.unsensed_pool_unvalidated(&a).is_none());
+        assert!(f.registry.unsensed_pool_unvalidated(&b).is_none());
+    }
+
+    /// **Pool-only invalidation.** Session movement clears the pool, PRESERVES
+    /// the facts, and re-queues the slot.
+    ///
+    /// Dies to: clearing both planes (which would re-queue a full source
+    /// reconstruction on every peer transition), or clearing neither.
+    #[test]
+    fn session_movement_clears_the_pool_and_preserves_the_facts() {
+        let f = fixture();
+        let family = f.family();
+        let k = key(1, "nrpc:sessmove");
+        f.source.sessions.publish(BTreeMap::new());
+        let _held = family.demand(k.clone()).expect("retained");
+        f.registry.apply(1, request(true, DirtyCapabilities::Clean));
+        let facts = f.registry.base_facts_unvalidated(&k).expect("facts");
+        assert!(f.registry.unsensed_pool_unvalidated(&k).is_some());
+
+        let live = f.source.sessions.publish(BTreeMap::new());
+        assert_eq!(f.registry.invalidate_session_older_than(live), 1);
+        assert!(
+            f.registry
+                .base_facts_unvalidated(&k)
+                .is_some_and(|live| Arc::ptr_eq(&live, &facts)),
+            "the discovery facts are exactly as current as they were"
+        );
+        assert!(
+            f.registry.unsensed_pool_unvalidated(&k).is_none(),
+            "and only the annotation is gone"
+        );
+        assert_eq!(f.registry.pending_slots(), 1);
+        assert_eq!(f.metrics.pools_invalidated(), 1);
+    }
+
+    /// **The delayed pool invalidator.** An obsolete session transition can
+    /// delete neither a pool from a LATER view, nor a pool from its OWN view,
+    /// nor a pool derived from newer facts.
+    ///
+    /// The equality arm is separate on purpose: `<=` would have every
+    /// transition destroy the pool its own publication produced, which is the
+    /// self-inflicted churn `invalidate_grant_scope`'s fence already had to be
+    /// corrected for once.
+    #[test]
+    fn an_obsolete_session_invalidator_cannot_delete_a_newer_pool() {
+        let f = fixture();
+        let family = f.family();
+        let k = key(1, "nrpc:delayed");
+        let obsolete = f.source.sessions.publish(BTreeMap::new());
+        let _held = family.demand(k.clone()).expect("retained");
+
+        // A pool built under a LATER view than the parked transition names.
+        let newer = f.source.sessions.publish(BTreeMap::new());
+        assert!(newer > obsolete);
+        f.registry.apply(1, request(true, DirtyCapabilities::Clean));
+        let pool = f.registry.unsensed_pool_unvalidated(&k).expect("pool");
+        assert_eq!(pool.session_generation(), newer);
+
+        assert_eq!(
+            f.registry.invalidate_session_older_than(obsolete),
+            0,
+            "the obsolete transition retires nothing"
+        );
+        assert!(
+            f.registry
+                .unsensed_pool_unvalidated(&k)
+                .is_some_and(|read| Arc::ptr_eq(&read, &pool)),
+            "the newer pool survives it"
+        );
+
+        // The EQUALITY arm: a transition at the pool's OWN generation is the
+        // "a demand arriving after publication is safe" case.
+        assert_eq!(f.registry.invalidate_session_older_than(newer), 0);
+        assert!(f
+            .registry
+            .unsensed_pool_unvalidated(&k)
+            .is_some_and(|read| Arc::ptr_eq(&read, &pool)));
+
+        // The control, adjacent: a genuinely newer transition DOES retire it.
+        let live = f.source.sessions.publish(BTreeMap::new());
+        assert_eq!(f.registry.invalidate_session_older_than(live), 1);
+        assert!(f.registry.unsensed_pool_unvalidated(&k).is_none());
+    }
+
+    /// A retained slot with NO published pool is left entirely alone by
+    /// session movement — no clear, and no re-queue.
+    ///
+    /// Dies to: re-queueing on absence. That mutation satisfies every other
+    /// pool witness perfectly and makes each peer transition re-queue every
+    /// retained slot on the node — the breadth failure W-W3 exists to refuse,
+    /// arriving on the session plane.
+    #[test]
+    fn session_movement_does_not_requeue_a_slot_with_no_pool() {
+        let f = fixture();
+        let family = f.family();
+        let cold = key(1, "nrpc:nopool");
+        let warm = key(2, "nrpc:nopool");
+        f.source.sessions.publish(BTreeMap::new());
+        let _held = family
+            .demand_set(vec![cold.clone(), warm.clone()])
+            .expect("retained");
+        f.registry.apply(1, request(true, DirtyCapabilities::Clean));
+        // Strip ONE slot's pool, leaving its facts — the state a slot is in
+        // between a refused publication and its rebuild.
+        f.registry.take_pool_for_test(&cold);
+        assert_eq!(f.registry.pending_slots(), 0, "precondition");
+
+        let live = f.source.sessions.publish(BTreeMap::new());
+        assert_eq!(
+            f.registry.invalidate_session_older_than(live),
+            1,
+            "only the slot that HAD a superseded pool is retired"
+        );
+        assert_eq!(
+            f.registry.pending_slots(),
+            1,
+            "and only that slot is re-queued — a pool-less slot's rebuild is \
+             already owed or already in flight"
+        );
+    }
+
+    /// A terminally exhausted session-generation space publishes NO pool, and
+    /// does not spin doing it.
+    ///
+    /// Fail-closed in the direction that matters: a wrapped or saturated
+    /// generation would let a pool built under one view compare current
+    /// against an unrelated later one. Facts still install — discovery is
+    /// unaffected — so the pass settles and the actor parks.
+    #[test]
+    fn an_exhausted_session_generation_publishes_no_pool_without_spinning() {
+        let f = fixture();
+        let family = f.family();
+        let k = key(1, "nrpc:spent");
+        f.source.sessions.publish(BTreeMap::new());
+        let _held = family.demand(k.clone()).expect("retained");
+        f.source.sessions.currentness.exhaust();
+
+        let outcome = f.registry.apply(1, request(true, DirtyCapabilities::Clean));
+        assert!(
+            matches!(outcome, ApplyOutcome::Current { .. }),
+            "the pass is COMPLETE: it owes no pool it could ever build"
+        );
+        assert!(f.registry.base_facts_unvalidated(&k).is_some());
+        assert!(f.registry.unsensed_pool_unvalidated(&k).is_none());
+        assert_eq!(
+            f.registry.pending_slots(),
+            0,
+            "nothing is re-queued, so nothing spins"
+        );
+        assert_eq!(
+            f.metrics.pools_refused_stale_session(),
+            0,
+            "and it is not counted as a refused RACE — nothing raced"
+        );
+    }
+
+    /// **The step-1 publication-order debt, paid.** A lock-free reader
+    /// scheduled BETWEEN the two adjacent publication stores can never observe
+    /// a pool beside facts it was not derived from.
+    ///
+    /// Final-state assertions cannot see this — both stores complete before
+    /// any of them runs (design §18.0) — so the reader is placed inside the
+    /// gaps by the production publication path itself.
+    ///
+    /// Dies to: swapping the two stores, which makes the first gap expose the
+    /// SUPERSEDED pool beside the new facts.
+    #[test]
+    fn no_reader_can_observe_a_pool_beside_foreign_facts() {
+        let f = fixture();
+        let family = f.family();
+        let k = key(1, "nrpc:interleave");
+        f.source.sessions.publish(BTreeMap::new());
+        let handle = family.demand(k.clone()).expect("retained");
+
+        // A first publication, so a SUPERSEDED pool is present when the second
+        // one starts. Without it every gap is trivially pool-free.
+        f.registry.apply(1, request(true, DirtyCapabilities::Clean));
+        assert!(
+            f.registry.unsensed_pool_unvalidated(&k).is_some(),
+            "precondition: a superseded pool must be published when the second \
+             installation begins, or every gap is trivially pool-free"
+        );
+
+        let observed: Arc<parking_lot::Mutex<Vec<(PublicationGap, bool, bool)>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        {
+            let observed = observed.clone();
+            let handle_facts = handle.cells.facts.clone();
+            let handle_pool = handle.cells.unsensed.clone();
+            f.registry
+                .observe_publication_for_test(Arc::new(move |gap| {
+                    // The lock-free reader: two separate atomics, exactly as a
+                    // 2B.3d consumer would load them.
+                    let facts = handle_facts.load_full();
+                    let pool = handle_pool.load_full();
+                    let paired = match (&facts, &pool) {
+                        (Some(facts), Some(pool)) => pool.derives_from(facts),
+                        // No pool is the ordinary cold-pool state; facts absent
+                        // with a pool present is a mismatch by construction.
+                        (_, None) => true,
+                        (None, Some(_)) => false,
+                    };
+                    observed.lock().push((gap, pool.is_some(), paired));
+                }));
+        }
+
+        // Re-queued WITHOUT invalidating, so the superseded pool is still
+        // published when the next installation begins.
+        f.registry.requeue_for_test(&k);
+        f.registry.apply(1, request(true, DirtyCapabilities::Clean));
+
+        let observed = observed.lock().clone();
+        assert_eq!(
+            observed.len(),
+            2,
+            "both gaps must be observed — a witness that samples one proves \
+             half the invariant"
+        );
+        assert!(
+            observed.iter().all(|(_, _, paired)| *paired),
+            "no reader observed a pool beside facts it was not derived from: \
+             {observed:?}"
+        );
+        assert!(
+            observed.iter().all(|(_, pool_present, _)| !*pool_present),
+            "and every intermediate state is a COLD-POOL state, which is the \
+             state a reader already has to handle: {observed:?}"
+        );
+        let final_pool = f.registry.unsensed_pool_unvalidated(&k).expect("pool");
+        let final_facts = f.registry.base_facts_unvalidated(&k).expect("facts");
+        assert!(final_pool.derives_from(&final_facts));
+    }
+
+    /// A pool's deadline retires BOTH planes and re-arms the actor, and the
+    /// rebuild converges rather than spinning.
+    ///
+    /// The ZERO-provider case is the one that matters: with no rows, the
+    /// artifact's only deadline is its installed authority's, so a rows-only
+    /// bound would leave the pool published under dead authority forever
+    /// (W-G13, extended to the second cell).
+    #[test]
+    fn an_authority_deadline_with_zero_providers_retires_both_planes_and_rearms() {
+        let f = fixture();
+        let family = f.family();
+        let k = key(1, "nrpc:deadline");
+        f.source.sessions.publish(BTreeMap::new());
+        f.source.authority_deadline.store(1_000, Ordering::Release);
+        let _held = family.demand(k.clone()).expect("retained");
+        f.registry.apply(1, request(true, DirtyCapabilities::Clean));
+
+        let pool = f.registry.unsensed_pool_unvalidated(&k).expect("pool");
+        assert!(
+            pool.providers().is_empty(),
+            "zero rows: the authority deadline is the only one there is"
+        );
+        assert_eq!(pool.earliest_deadline(), 1_000);
+        assert_eq!(
+            f.registry.next_artifact_deadline(),
+            Some(1_000),
+            "and the actor ARMS on it"
+        );
+
+        assert_eq!(f.registry.retire_expired(1_000), 1);
+        assert!(f.registry.base_facts_unvalidated(&k).is_none());
+        assert!(
+            f.registry.unsensed_pool_unvalidated(&k).is_none(),
+            "the pool goes with the facts it derived from"
+        );
+        assert_eq!(f.registry.pending_slots(), 1, "the rebuild is armed");
+
+        // No spin: the rebuild against dead authority installs `Unserved`,
+        // which carries no deadline and no pool, so the next arm finds nothing.
+        f.source.unserved.store(true, Ordering::Release);
+        f.registry.apply(1, request(true, DirtyCapabilities::Clean));
+        assert_eq!(f.registry.next_artifact_deadline(), None);
+        assert_eq!(f.registry.pending_slots(), 0);
+    }
+
+    /// The 256 bound is STRUCTURAL on the pool plane too: pool ownership is
+    /// physically attached to the source slot, so a refused 257th slot owns no
+    /// cell and can publish no pool.
+    #[test]
+    fn the_two_hundred_fifty_seventh_slot_can_publish_no_pool() {
+        let f = fixture();
+        f.source.sessions.publish(BTreeMap::new());
+        let mut held = Vec::new();
+        for index in 0..MAX_NODE_SLOTS {
+            let family = f.family();
+            let key = key(1, &format!("nrpc:cap{index}"));
+            held.push(family.demand(key).expect("within the node bound"));
+        }
+        assert_eq!(f.registry.retained_slots(), MAX_NODE_SLOTS);
+
+        let refused = key(1, "nrpc:cap256");
+        let overflow = f.family();
+        assert_eq!(
+            overflow.demand(refused.clone()).err(),
+            Some(DemandRefused::NodeAtCapacity)
+        );
+
+        // Rebuild everything the node DOES retain, in as many quanta as it
+        // takes, then count the pools.
+        for _ in 0..16 {
+            if f.registry.pending_slots() == 0 {
+                break;
+            }
+            f.registry.apply(1, request(true, DirtyCapabilities::Clean));
+        }
+        assert_eq!(f.metrics.pools_published(), MAX_NODE_SLOTS as u64);
+        assert!(
+            f.registry.unsensed_pool_unvalidated(&refused).is_none(),
+            "the refused slot owns no cell, so no pool can exist for it"
+        );
+        assert_eq!(f.registry.retained_slots(), MAX_NODE_SLOTS);
     }
 
     /// `release_one` cannot decrement a global slot reference for a family that

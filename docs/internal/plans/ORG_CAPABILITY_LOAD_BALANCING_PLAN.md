@@ -999,6 +999,97 @@ struct OrgAuthorityEpoch {
 > the artifact deadline from provider rows alone leaves it permanently warm under
 > dead authority.
 
+> ### §7 divergence — the scoped pool, its deadlines and its source stamp (CORRECTED)
+>
+> **Corrected by OLB-2B.3c step 2.** Authoritative design:
+> [`OLB_2B3B_WARMED_CALL_BOUNDARY_DESIGN.md`](OLB_2B3B_WARMED_CALL_BOUNDARY_DESIGN.md)
+> §1, §3, §7 and §18.
+>
+> **What this plan got wrong.** It described ONE node-shared `OrgRouteSet` with
+> one flat `RouteSourceGeneration` and one `next_authority_deadline`, and left
+> "the reconciler rebuilds a capability's route set" ambiguous about who owns
+> which half. Three separate corrections follow, and each of them is a
+> correctness statement rather than a naming one.
+>
+> **1. The artifact is SPLIT, and so is its currentness vector.** There are two
+> artifacts, not one:
+>
+> ```text
+> ScopedUnsensedRoutePool   node-shared, key (PrivateAudienceScope, capability)
+>                           discovery provenance for THAT scope; provider and
+>                           PROVEN owner relation; direct/session eligibility
+>                           under ONE coherent session generation; the exact
+>                           scoped source vector; scoped deadlines
+>
+> OrgRouteSet               family-specific, invocation-ready (OLB-2B.3d)
+>                           exact matched INVOKE grant; final deterministic
+>                           order; one preselected fallback; family deadlines
+> ```
+>
+> `RouteSourceGeneration` as a single flat vector no longer describes either.
+> The pool's half is **the whole `SourceEpoch` it was captured under** (scoped
+> revision, routing authority epoch, barriered revocation floor generation,
+> poison state) **plus the exact per-slot installed-authority stamp, plus one
+> node-owned session generation**. The family's half is the contributor vector
+> (slot identity, slot incarnation, pool identity/generation, source epoch).
+>
+> **The session generation is a member in its own right and is NOT folded into
+> the source token.** Folding it in would make every peer connect and eviction
+> defeat every discovery commit in flight, on a node where session churn is the
+> loudest signal there is — the same "one global bit" failure the §2A note
+> refuses for consumer Grants, arriving on the session plane. It is compared
+> separately, at publication, and it gates ONLY the pool.
+>
+> **2. Deadlines are split by OWNER, and only one kind arms anything.**
+>
+> ```text
+> ACTOR-ARMED (node-owned scoped-pool deadlines)
+>   private-discovery / provider row expiry
+>   installed DISCOVER Grant expiry, INCLUDING the zero-provider case
+>   provider authority expiry
+>   session / source movement
+>
+> ARMS NOTHING (family OrgRouteSet deadlines — OLB-2B.3d)
+>   membership expiry, dispatcher expiry, matched INVOKE grant expiry,
+>   the family minimum effective deadline
+> ```
+>
+> The second group is checked on every warmed call and refreshed by
+> reprojection; it enqueues no actor work and clears no pool. A single
+> `next_authority_deadline` on one node-shared artifact cannot express that
+> split, and the version of this plan that carried it also carried "no family
+> timer" four sections away — two statements that cannot both be true of one
+> deadline field.
+>
+> **3. The node ACTOR owns scoped-pool construction and deadline arming. There
+> is no family actor and no family timer.**
+>
+> ```text
+> scoped-pool rebuild          actor only, never inline, never per family
+> family credential projection bounded cold-path copy-on-write publication
+> ```
+>
+> The actor's cycle is capture → build OFF-LOCK → revalidate the complete
+> source/session stamp → publish IF CURRENT. It holds no authority, source,
+> session or registry lock across decoding, sorting, I/O, await or network
+> work, and it publishes nothing when any component of the stamp moved: it
+> re-queues the live slot instead and rebuilds on the next pass. The family
+> projection performs no session query and no store reconstruction, which is
+> what makes "calls never rebuild" true rather than aspirational.
+>
+> **4. The installed consumer-Grant authority stays a PER-SLOT stamp.** It is
+> retained as such in the pool as well as in the facts beneath it — grant id,
+> installation identity, signed Grant identity, audience handle and Grant
+> authority deadline — and is never reduced to a global generation. The §2A
+> note above says why for the facts plane; the pool plane inherits the same
+> reason unchanged, because a pool derives from exactly one facts artifact and
+> carries that artifact's identity.
+>
+> **Bound.** Pool count = retained source-slot count ≤ 256, STRUCTURAL: the
+> pool cell is physically attached to the source slot, so there is no second
+> map and no "every pool must remain backed by a slot" invariant to keep in
+> step. A refused 257th slot owns no cell and can publish no pool.
+
 `OrgAuthorityEpoch` is the SDK-facing INTERNAL analogue of the sensing gate's
 `SensingAuthorityStamp`: it includes authority/store identity, installation
 generation, `OrgRevocationStore::barriered_generation()`, and poison state. It
@@ -1145,6 +1236,15 @@ owner base facts. Publication remains per-route-set publish-if-current against
 the COMPLETE source vector; calls continue reading prior immutable snapshots
 while work proceeds.
 
+**The actor is the ONLY producer of a scoped pool** (OLB-2B.3c step 2, §7
+divergence). It captures the source snapshot and ONE coherent session
+observation, builds the pool entirely off-lock, then revalidates the complete
+stamp — actor incarnation, slot incarnation, source token, exact facts
+identity, session generation — under the registry lock and publishes only if
+every component is still current. Nothing on the request path builds a pool,
+and no family has an actor or a timer of its own. A pass whose stamp moved
+publishes no pool, re-queues the live slot, and arranges exactly one wake.
+
 **Authority validity edges use the node deadline heap.** Certificate and grant
 expiry are wall-clock transitions that emit no network or sensing event.
 Without a timer, a route set preferring a grant that expires at T keeps
@@ -1166,6 +1266,29 @@ earliest node deadline reached
 
 The per-call temporal recheck remains mandatory for wall-clock validity; the
 heap improves availability, not authority.
+
+> **§7 divergence, continued — WHICH deadlines that heap holds.** The passage
+> above describes ONE deadline structure over "all retained route slots" and
+> derives it from membership, dispatcher and matched-grant `not_after`. That
+> derivation belongs to the FAMILY artifact, and the family artifact
+> deliberately has no timer at all (design §7). Corrected by OLB-2B.3c step 2
+> for the pool half:
+>
+> - the node actor's deadline structure holds **scoped-pool deadlines only** —
+>   provider-row expiry, installed DISCOVER Grant expiry (including the
+>   zero-provider case, which has no other deadline), and provider authority
+>   expiry. It arms on the earliest retained artifact deadline, retires what
+>   that deadline names, re-queues those slots, and rebuilds. Retiring the
+>   facts retires the pool derived from them, so one arm covers both planes;
+> - **membership, dispatcher and matched-INVOKE-grant expiry arm nothing.**
+>   They are family deadlines, checked on every warmed call. The first call
+>   past one takes the coherent cold plan and the family reprojects for later
+>   calls, which removes the liveness failure this passage was written to
+>   remove — without a family timer, and without a node timer that would have
+>   to know one family's credentials;
+> - a rebuild against expired authority reconstructs `Unserved`, whose deadline
+>   is `u64::MAX` and which publishes no pool, so the next arm finds nothing and
+>   the actor parks. The heap cannot spin on an authority that stayed expired.
 
 **Mandatory warmed-call currentness checks.** Immediately before proof
 construction/send, compare wall clock with both route-set deadlines and load the
@@ -1830,7 +1953,10 @@ Exit witnesses:
   discards its result and re-enqueues; the stale result never
   publishes (publish-if-current);
 - a grant expires with no network or sensing event;
-- the route set rebuilds at the recorded `next_authority_deadline`;
+- the artifact rebuilds at its recorded deadline — for a SCOPED POOL that is
+  the node actor's arm (provider rows and installed DISCOVER authority, §7
+  divergence); for a FAMILY route set it is the warmed-call check and the
+  reprojection that follows it, never a timer;
 - another valid provider becomes selectable after the deadline
   rebuild;
 - a call racing the deadline either uses a still-current proof or

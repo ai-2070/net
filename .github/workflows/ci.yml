@@ -133,8 +133,18 @@ jobs:
       # authority moves inside the probe->settle window is re-driven rather than
       # stranded at `Rebuilding`, that the read seam fences a DEAD incarnation's
       # still-retained facts, and that its authority sample cannot straddle a
-      # store install. Losing any of them silently would be worse than losing
-      # them loudly.
+      # store install -- plus, since OLB-2B.3c step 2, that the node's
+      # session/direct-state projection annotates a live peer's provider with
+      # the exact session it is, refuses to guess when two sessions claim one
+      # provider, treats a mapping without a session (and a session without a
+      # mapping) as no annotation at all, moves the projection and the
+      # generation naming it as ONE unit, retires exactly the pools a real peer
+      # transition supersedes while preserving their discovery facts, refuses a
+      # pool that is mispaired OR computed under a superseded view at the
+      # validated read seam, and fences the whole pool plane fail-closed when
+      # the session-generation space is spent, and that a peer transition which
+      # publishes NOTHING publishes no session generation. Losing any of them silently
+      # would be worse than losing them loudly.
       #
       # NOTE: they are gated `#[cfg(test)]`, NOT `feature = "fixtures"` —
       # `$UNIT_FEATURES` deliberately excludes `fixtures`, so a fixtures gate
@@ -143,7 +153,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           set -o pipefail
-          MIN=70
+          MIN=78
           out=$(cargo test --lib --features "$UNIT_FEATURES" \
                   org_routing_wiring_tests 2>&1 | tee /dev/stderr)
           n=$(printf '%s\n' "$out" \
@@ -203,7 +213,15 @@ jobs:
           the_read_seam_fences_a_dead_incarnations_facts
           the_read_seams_authority_sample_cannot_straddle_a_store_install
           an_exhausted_scoped_generation_fences_the_routing_source
-          an_unserved_scope_reads_cold_rather_than_authoritatively_empty"
+          an_unserved_scope_reads_cold_rather_than_authoritatively_empty
+          a_live_peer_session_annotates_the_provider_it_resolves_to
+          an_entity_claimed_by_two_live_sessions_is_never_annotated
+          a_pin_without_a_live_session_annotates_nothing
+          a_republication_moves_the_projection_and_its_generation_together
+          a_session_transition_retires_the_pool_and_the_actor_republishes_it
+          the_validated_pool_read_refuses_a_mispaired_or_superseded_pool
+          an_exhausted_session_generation_fences_the_pool_plane
+          a_lost_peer_install_publishes_no_session_generation"
           for required in $REQUIRED; do
             if ! printf "%s" "$out" | grep -q "$required"; then
               echo "::error::required routing witness missing: $required"
@@ -273,8 +291,15 @@ jobs:
       # module whose entire consumer is still dark (OLB-2B.3d), which makes it
       # exactly the kind of file a future cleanup pass deletes as unreachable.
       #
-      # Both filters are asserted SEPARATELY. A combined floor would let the 36
+      # Both filters are asserted SEPARATELY. A combined floor would let the
       # registry witnesses cover the disappearance of the whole state module.
+      #
+      # The registry floor also covers OLB-2B.3c: step 1's second publication
+      # cell and step 2's ACTOR BUILD CYCLE — production pool construction,
+      # publish-if-current against the complete source/session stamp, the
+      # asymmetric two-cell invalidation in both directions, mixed-generation
+      # refusal, the deferred publication-order interleaving, the scoped
+      # deadline arm and the structural 256-pool bound.
       #
       # NOTE: `#[cfg(test)]`, NOT `feature = "fixtures"` — `$UNIT_FEATURES`
       # deliberately excludes `fixtures`, so a fixtures gate would compile these
@@ -283,7 +308,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           set -o pipefail
-          REG_MIN=50
+          REG_MIN=62
           STATE_MIN=41
           reg=$(cargo test --lib --features "$UNIT_FEATURES" \
                   behavior::org_routing_registry:: 2>&1 | tee /dev/stderr)
@@ -332,7 +357,19 @@ jobs:
           facts_invalidation_clears_the_derived_pool
           a_stale_observation_invalidates_neither_plane
           installing_newer_facts_clears_the_superseded_pool
-          a_replacement_successor_stays_index_aligned_across_both_planes"
+          a_replacement_successor_stays_index_aligned_across_both_planes
+          an_actor_pass_publishes_the_pool_it_derived
+          an_unserved_reconstruction_publishes_no_pool_but_a_served_empty_one_does
+          a_session_view_that_moved_during_the_build_publishes_no_pool
+          a_source_that_moved_during_the_build_publishes_neither_plane
+          a_pool_cannot_compose_two_session_generations
+          session_movement_clears_the_pool_and_preserves_the_facts
+          an_obsolete_session_invalidator_cannot_delete_a_newer_pool
+          session_movement_does_not_requeue_a_slot_with_no_pool
+          an_exhausted_session_generation_publishes_no_pool_without_spinning
+          no_reader_can_observe_a_pool_beside_foreign_facts
+          an_authority_deadline_with_zero_providers_retires_both_planes_and_rearms
+          the_two_hundred_fifty_seventh_slot_can_publish_no_pool"
           for required in $REQUIRED; do
             if ! printf "%s" "$reg" | grep -q "$required"; then
               echo "::error::required org_routing_registry witness missing: $required"

@@ -924,6 +924,13 @@ struct PeerRegistrationGuard {
     /// The control-path transition handle, so the rollback is one
     /// serialized peer transition like every other publisher/remover.
     peer_transitions: PeerTransitions,
+    /// OLB-2B.3c step 2: a rollback REMOVES a session, which moves the
+    /// session/direct-state projection exactly as installing one does. The
+    /// handles ride the guard because the rollback runs from `Drop`, where
+    /// there is no `&MeshNode` to reach them through.
+    session_routing: Arc<NodeSessionRouting>,
+    routing_registry: Arc<super::behavior::org_routing_registry::NodeOrgRoutingRegistry>,
+    peer_entity_ids: Arc<DashMap<u64, EntityId>>,
 }
 
 impl PeerRegistrationGuard {
@@ -971,6 +978,7 @@ impl Drop for PeerRegistrationGuard {
         let peer_addrs = &self.peer_addrs;
         let session_id_to_node = &self.session_id_to_node;
         let router = &self.router;
+        let mut removed = false;
         self.peer_transitions.with(peer_node_id, || {
             // Undo only OUR registration — and only while it is still
             // ours.
@@ -1016,7 +1024,19 @@ impl Drop for PeerRegistrationGuard {
             router
                 .routing_table()
                 .remove_ordinary_route_if_token_is(peer_node_id, registered_route_token);
+            removed = true;
         });
+        if removed {
+            // OLB-2B.3c step 2, with the peer shard released. A rollback that
+            // did NOT own the registration returns from the closure above
+            // having removed nothing, and publishes nothing here.
+            note_session_transition(
+                &self.session_routing,
+                &self.routing_registry,
+                &self.peers,
+                &self.peer_entity_ids,
+            );
+        }
     }
 }
 
@@ -1282,6 +1302,14 @@ struct DispatchCtx {
     /// review-pass-3 §10: per-outcome private-discovery intake counters. See the
     /// matching `MeshNode` field.
     scoped_ingest_counters: Arc<super::behavior::org_scoped_store::ScopedIngestCounters>,
+    /// OLB-2B.3c step 2: the node's session/direct-state projection and the
+    /// routing registry it publishes to. Carried here because the TOFU
+    /// entity-id pin — which is what makes a node id resolve to a provider —
+    /// happens on the dispatch path, and a pin that moved the projection
+    /// without republishing it would leave every pool annotating that provider
+    /// cold forever.
+    session_routing: Arc<NodeSessionRouting>,
+    routing_registry: Arc<super::behavior::org_routing_registry::NodeOrgRoutingRegistry>,
     /// OA3-5 §3.2: the bounded relay dedup gate for opaque scoped-announcement
     /// propagation. See the matching field doc on `MeshNode`.
     scoped_relay_gate: Arc<super::behavior::org_scoped_relay::ScopedAnnRelayGate>,
@@ -6272,7 +6300,255 @@ fn advance_fenced_generation(counter: &std::sync::atomic::AtomicU64, what: &'sta
 /// a mutation's state-lock section but preceded its publication still reads the
 /// post-mutation revision, and the pin then blocks until that publication is
 /// ordered — so the wake the discarded attempt relies on is already queued.
+/// One coherent, IMMUTABLE observation of the node's session/direct-state,
+/// published as a whole (OLB-2B.3c step 2; design §3).
+///
+/// The generation lives INSIDE the value rather than beside it, which is what
+/// makes "these rows were observed at this generation" unfalsifiable: there is
+/// no second place for the two to be sampled from and disagree.
+///
+/// Keyed by the PROVIDER entity, because that is the identity discovery
+/// produces. The `NodeId → EntityId` mapping is mutable and is consulted only
+/// while this value is being built, never at lookup time — a lookup that
+/// re-resolved it would attach a session to a provider on the strength of
+/// whatever the map happens to say at that instant, which is exactly the
+/// identity confusion design §3 forbids.
+#[derive(Debug, Default)]
+struct SessionProjection {
+    /// The generation this whole observation was published under.
+    generation: u64,
+    /// Entities with EXACTLY ONE unambiguously resolved live session.
+    ///
+    /// An entity absent here is `Cold`, and absence deliberately conflates
+    /// three cases the projection refuses to distinguish by guessing: no live
+    /// session, a `(node_id, entity)` pair that moved while it was being read,
+    /// and an entity that resolves to more than one live session. In the last
+    /// case there is no answer to "which session would a call use", and
+    /// picking one would be a routing decision made by a map iteration order.
+    rows: std::collections::BTreeMap<
+        EntityId,
+        super::behavior::org_routing_registry::DirectEligibility,
+    >,
+}
+
+impl super::behavior::org_routing_registry::SessionEligibility for SessionProjection {
+    fn eligibility(
+        &self,
+        provider: &EntityId,
+    ) -> super::behavior::org_routing_registry::DirectEligibility {
+        self.rows
+            .get(provider)
+            .copied()
+            .unwrap_or(super::behavior::org_routing_registry::DirectEligibility::Cold)
+    }
+}
+
+/// The node's session/direct-state projection, and the one generation that
+/// orders it (OLB-2B.3c step 2).
+///
+/// # Why the projection is PUBLISHED rather than sampled on demand
+///
+/// A pool's annotations must all come from one coherent view. Building them by
+/// reading `peers` and `peer_entity_ids` at annotation time would sample two
+/// independently-mutable maps once per provider, so one pool could carry rows
+/// from several different states of the world — the mixed observation design
+/// §3 refuses. Publishing an immutable value makes the actor's capture a single
+/// `ArcSwap::load_full`, which cannot straddle anything.
+///
+/// # Lock order
+///
+/// ```text
+/// peer-transition shard  ->  session publication gate  ->  registry lock
+/// ```
+///
+/// Acyclic, and disjoint from the frozen `source commit pin → registry lock`:
+/// routing never takes a peer-transition shard or this gate, and the actor's
+/// capture takes no lock at all. The registry invalidation that follows a
+/// republication runs with the gate RELEASED, on the same discipline the
+/// consumer-Grant edge already carries (design §2A.2, item 10) — taking the
+/// registry lock beneath a publication gate is the inversion that discipline
+/// exists to prevent.
+struct NodeSessionRouting {
+    /// The currently published observation.
+    published: arc_swap::ArcSwap<SessionProjection>,
+    /// The monotone, checked, terminal generation ordering it. Shared with the
+    /// registry, which compares it lock-free beneath its own lock.
+    currentness: Arc<super::behavior::org_routing_registry::SessionCurrentness>,
+    /// Serializes republication, so two transitions cannot interleave a build
+    /// with a store and publish a projection older than the generation naming
+    /// it. Held ONLY across the rebuild and the two stores.
+    gate: parking_lot::Mutex<()>,
+    /// Republications that produced a new generation. Observable so a witness
+    /// can prove a NON-transition published nothing.
+    publications: AtomicU64,
+}
+
+impl NodeSessionRouting {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            published: arc_swap::ArcSwap::from_pointee(SessionProjection::default()),
+            currentness: super::behavior::org_routing_registry::SessionCurrentness::new(),
+            gate: parking_lot::Mutex::new(()),
+            publications: AtomicU64::new(0),
+        })
+    }
+
+    /// Capture the current observation for one actor quantum. Lock-free.
+    fn observe(&self) -> super::behavior::org_routing_registry::SessionObservation {
+        let published = self.published.load_full();
+        // The generation comes from the VALUE, not from a second read of the
+        // counter: a counter read here could observe a newer generation than
+        // the projection it is about to stamp, which is the over-stating
+        // direction — an annotation looking newer than it is survives the very
+        // movement meant to clear it.
+        //
+        // The counter is read only to decide LIVENESS, and it is read twice on
+        // purpose. That is not redundancy that can be simplified away: the two
+        // reads can disagree, and the only way they can is exhaustion landing
+        // between them — in which case the second one drops the observation.
+        // Both orders of the check fail closed, and this one fails closed
+        // sooner.
+        let generation = self
+            .currentness
+            .generation()
+            .map(|_| published.generation)
+            // A spent space can witness nothing.
+            .filter(|_| !self.is_exhausted());
+        super::behavior::org_routing_registry::SessionObservation::new(
+            generation,
+            published,
+            self.currentness.clone(),
+        )
+    }
+
+    fn is_exhausted(&self) -> bool {
+        self.currentness.generation().is_none()
+    }
+
+    /// Rebuild and publish the projection, returning the generation it was
+    /// published under — or `None` when the generation space is spent.
+    ///
+    /// Reserve, build, store, commit. The reservation happens first so an
+    /// exhausted space publishes NOTHING rather than a projection under a
+    /// frozen or aliased generation; the commit happens last so the counter
+    /// never names a projection that is not yet visible.
+    fn republish(
+        &self,
+        peers: &DashMap<u64, PeerInfo>,
+        peer_entity_ids: &DashMap<u64, EntityId>,
+    ) -> Option<u64> {
+        let _gate = self.gate.lock();
+        if self.is_exhausted() {
+            return None;
+        }
+        let Some(generation) = self.currentness.reserve() else {
+            // Irreversible, and loud. Refusing to move is not an option in this
+            // direction: a node that can no longer record that its session view
+            // changed must stop publishing pools rather than keep publishing
+            // under a generation that can no longer distinguish views.
+            self.currentness.exhaust();
+            tracing::error!(
+                "org routing: session generation space exhausted; routing pools \
+                 are fenced rather than reusing a session identity"
+            );
+            return None;
+        };
+        let rows = build_session_rows(peers, peer_entity_ids);
+        self.published
+            .store(Arc::new(SessionProjection { generation, rows }));
+        self.currentness.commit(generation);
+        self.publications.fetch_add(1, Ordering::AcqRel);
+        Some(generation)
+    }
+
+    #[cfg(test)]
+    fn publications(&self) -> u64 {
+        self.publications.load(Ordering::Acquire)
+    }
+}
+
+/// Join the peer table with the TOFU-pinned entity map, coherently.
+///
+/// Three refusals, and each one is a case where an answer would have to be
+/// guessed:
+///
+/// - the mapped node has no live session — nothing to annotate;
+/// - the peer record does not agree that it is that node — a torn read;
+/// - the `(node_id, entity)` pair changed while it was being read, or the
+///   entity resolves to a second live node. Both leave "which session" without
+///   a determinate answer.
+///
+/// Every refusal produces ABSENCE, which reads back as
+/// [`DirectEligibility::Cold`]. That is the conservative direction: a provider
+/// wrongly called cold loses a preference, a provider wrongly called direct
+/// would have a session attached to it that it does not own.
+fn build_session_rows(
+    peers: &DashMap<u64, PeerInfo>,
+    peer_entity_ids: &DashMap<u64, EntityId>,
+) -> std::collections::BTreeMap<EntityId, super::behavior::org_routing_registry::DirectEligibility>
+{
+    use super::behavior::org_routing_registry::DirectEligibility;
+    let mut rows: std::collections::BTreeMap<EntityId, DirectEligibility> =
+        std::collections::BTreeMap::new();
+    let mut ambiguous: std::collections::BTreeSet<EntityId> = std::collections::BTreeSet::new();
+    // Snapshot the pairs FIRST, so no `peer_entity_ids` iteration guard is
+    // alive while the loop below looks that same map up again. `DashMap`'s
+    // shard locks are not recursive-read-safe — a writer queued between the
+    // two acquisitions wedges both — and the second lookup here is exactly the
+    // stability re-check, so the recursive shape would be on the hot side of
+    // every peer transition. This is the same idiom, and the same reason, as
+    // `sweep_expired_subscribers`.
+    let pinned: Vec<(u64, EntityId)> = peer_entity_ids
+        .iter()
+        .map(|entry| (*entry.key(), entry.value().clone()))
+        .collect();
+    for (node_id, entity) in pinned {
+        let Some(peer) = peers.get(&node_id) else {
+            continue;
+        };
+        if peer.node_id != node_id {
+            // The peer record does not agree it is this node. Refuse rather
+            // than trusting the key over the record.
+            continue;
+        }
+        let eligibility = if peer.is_direct() {
+            DirectEligibility::Direct {
+                node_id,
+                session_id: peer.session.session_id(),
+            }
+        } else {
+            DirectEligibility::Relayed {
+                node_id,
+                session_id: peer.session.session_id(),
+            }
+        };
+        drop(peer);
+        // STABILITY: the identity mapping is mutable and may have moved while
+        // the peer record was being read. A row whose basis changed underneath
+        // it is dropped, never repaired.
+        if peer_entity_ids
+            .get(&node_id)
+            .is_none_or(|live| *live.value() != entity)
+        {
+            ambiguous.insert(entity);
+            continue;
+        }
+        if rows.insert(entity.clone(), eligibility).is_some() {
+            // A second live session claims this entity. There is no answer to
+            // "which session would a call use", so there is no row.
+            ambiguous.insert(entity);
+        }
+    }
+    for entity in ambiguous {
+        rows.remove(&entity);
+    }
+    rows
+}
+
 struct ScopedSlotSource {
+    /// The node's published session/direct-state projection (OLB-2B.3c step
+    /// 2). Observed once per actor quantum, lock-free.
+    session_routing: Arc<NodeSessionRouting>,
     scoped_discovery:
         Arc<parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryState>>,
     publication: Arc<ScopedMutationPublication>,
@@ -6558,6 +6834,110 @@ fn move_routing_authority<R>(
         AuthorityAdvance::AlreadyExhausted => {}
     }
     result
+}
+
+/// Publish ONE session/direct-state transition to routing (OLB-2B.3c step 2).
+///
+/// The order is normative, and each step is where it is for a reason the
+/// consumer-Grant edge already paid for once (design §2A.2, item 10):
+///
+/// ```text
+/// republish the projection            \  under the session publication gate
+/// advance the generation              /
+/// RELEASE the gate
+/// retire the pools this movement supersedes   (takes the registry lock)
+/// mark actor work                             (inside the invalidation)
+/// ```
+///
+/// Publishing the state before advancing the generation is what stops an
+/// observer naming a projection it cannot see. Releasing the gate before
+/// touching the registry is what keeps `peer transition → session gate →
+/// registry lock` acyclic; taking the registry lock beneath the gate would
+/// invert it against nothing today and against the first future caller that
+/// republishes from under the registry.
+///
+/// A transition that publishes nothing must not reach here at all: every call
+/// site is on the far side of the check that says its mutation actually
+/// happened, so "a non-publishing outcome wakes nothing" is a property of the
+/// call sites rather than of a predicate here.
+fn note_session_transition(
+    session_routing: &NodeSessionRouting,
+    registry: &super::behavior::org_routing_registry::NodeOrgRoutingRegistry,
+    peers: &DashMap<u64, PeerInfo>,
+    peer_entity_ids: &DashMap<u64, EntityId>,
+) {
+    let Some(live) = session_routing.republish(peers, peer_entity_ids) else {
+        // The generation space is spent. Retire every pool ONCE — they were
+        // computed under views nothing can witness any more, and leaving them
+        // published would keep a reader's validation comparing against a
+        // generation that no longer exists. `u64::MAX` is the reserved
+        // terminal marker and is never a live generation, so every published
+        // pool is strictly older than it.
+        //
+        // This cannot spin: the re-queued rebuilds install facts and publish
+        // no pool (a spent space projects nothing), so the next arm finds
+        // nothing owed and the actor parks.
+        registry.invalidate_session_older_than(u64::MAX);
+        return;
+    };
+    registry.invalidate_session_older_than(live);
+}
+
+/// Test-only: a routing registry with an idle source, for witnesses that need
+/// a [`PeerRegistrationGuard`] and nothing else from the routing plane.
+///
+/// The guard carries the routing handles because its rollback REMOVES a
+/// session; a witness about the rollback's peer-map bookkeeping still has to
+/// supply them, and supplying a detached registry keeps that witness about the
+/// thing it is about.
+#[cfg(test)]
+fn detached_routing_registry_for_test(
+) -> Arc<super::behavior::org_routing_registry::NodeOrgRoutingRegistry> {
+    use super::behavior::org_routing as routing;
+    use super::behavior::org_routing_registry as reg;
+
+    struct IdleSource;
+    struct IdleSnapshot;
+    struct IdlePin;
+
+    impl reg::SourceSnapshot for IdleSnapshot {
+        fn token(&self) -> reg::SourceToken {
+            reg::SourceToken::new(Vec::new())
+        }
+        fn providers(&self, _key: &reg::SlotKey) -> reg::ScopedSourceFacts {
+            reg::ScopedSourceFacts {
+                facts: reg::SourceFacts::Unserved,
+                authority: reg::ScopedDiscoveryAuthorityStamp::Owner,
+                authority_deadline: u64::MAX,
+                grant_fence: reg::GrantArtifactFence::Publication(0),
+            }
+        }
+    }
+    impl reg::SourceCommitPin for IdlePin {
+        fn epoch(&self) -> reg::SourceEpoch {
+            reg::SourceEpoch::default()
+        }
+        fn settle_if_current(
+            &self,
+            settle: &mut dyn FnMut() -> routing::ApplyOutcome,
+        ) -> Option<routing::ApplyOutcome> {
+            Some(settle())
+        }
+    }
+    impl reg::SlotSource for IdleSource {
+        fn snapshot(&self, _keys: &[reg::SlotKey]) -> Box<dyn reg::SourceSnapshot> {
+            Box::new(IdleSnapshot)
+        }
+        fn pin_if_current(
+            &self,
+            _keys: &[reg::SlotKey],
+            _expected: &reg::SourceToken,
+        ) -> Option<Box<dyn reg::SourceCommitPin + '_>> {
+            Some(Box::new(IdlePin))
+        }
+    }
+
+    reg::NodeOrgRoutingRegistry::new(Arc::new(IdleSource), Arc::default(), Arc::default())
 }
 
 /// Test-only RAII flag: set while a joiner waits on the routing-task slot.
@@ -7325,6 +7705,18 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
         }))
     }
 
+    /// ONE coherent observation of the node's session/direct-state, for the
+    /// whole quantum (OLB-2B.3c step 2).
+    ///
+    /// Lock-free and instantaneous: the projection is an immutable published
+    /// value, so this cannot straddle a transition the way a pair of live map
+    /// reads could. It deliberately takes NO gate — a capture that serialized
+    /// against peer transitions would put the routing actor on the peer
+    /// control path.
+    fn session_view(&self) -> super::behavior::org_routing_registry::SessionObservation {
+        self.session_routing.observe()
+    }
+
     fn liveness(&self) -> super::behavior::org_routing_registry::SourceLiveness {
         use super::behavior::org_routing_registry::SourceLiveness;
         // Two TERMINAL latches: the node-owned authority epoch and the scoped
@@ -7687,6 +8079,11 @@ pub struct MeshNode {
     /// actor incarnation; the actor's authority over it is claimed and revoked by
     /// the incarnation lifecycle, not by construction.
     routing_registry: Arc<super::behavior::org_routing_registry::NodeOrgRoutingRegistry>,
+    /// OLB-2B.3c step 2: the node's ONE session/direct-state projection and the
+    /// generation ordering it. Every session transition republishes through
+    /// this handle and then invalidates the pools the republication superseded;
+    /// the routing actor observes it lock-free, once per quantum.
+    session_routing: Arc<NodeSessionRouting>,
     /// OLB-2B-E3a: the registry-work wake — the second source in the actor's wait
     /// set, for the transitions private-discovery movement cannot signal (first
     /// demand, slot lifecycle).
@@ -9117,6 +9514,63 @@ impl MeshNode {
         let upgrade_cache: Arc<DashMap<u64, UpgradeCacheEntry>> = Arc::new(DashMap::new());
         #[cfg(feature = "nat-traversal")]
         let upgrade_cache_failure = upgrade_cache.clone();
+        // OLB-2B-E3c: the routing plane. Built here, before the node literal, so
+        // the registry binds to the very same scoped state, publication gate and
+        // revocation slot the ingest paths use — one source of truth, not a
+        // parallel copy. The SUPERVISOR is deliberately NOT built here: it owns the
+        // exclusive destructive drain, and its single production construction path
+        // is `spawn_org_routing_supervisor`, reached only from `start`.
+        let scoped_discovery = Arc::new(parking_lot::Mutex::new(
+            super::behavior::org_scoped_store::ScopedDiscoveryState::new(),
+        ));
+        let scoped_publication = Arc::new(ScopedMutationPublication::new());
+        let scoped_ingest_counters: Arc<super::behavior::org_scoped_store::ScopedIngestCounters> =
+            Arc::default();
+        let org_revocation: Arc<
+            ArcSwapOption<super::behavior::org_revocation::OrgRevocationStore>,
+        > = Arc::new(ArcSwapOption::empty());
+        let routing_work: Arc<super::behavior::org_routing::RegistryWork> = Arc::default();
+        let routing_registry_metrics: Arc<super::behavior::org_routing_registry::RegistryMetrics> =
+            Arc::default();
+        let routing_unserved_scope = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // Hoisted: the routing source shares this exact slot, because installed
+        // consumer Grants are AUTHORITY for the grant plane (OLB-2B.3c-pre) —
+        // and the exact WRITER gate with it, so the commit pin can exclude Grant
+        // movement for the life of an installation (review 2026-07-29 §1).
+        let consumer_grant_audiences = Arc::new(arc_swap::ArcSwap::from_pointee(
+            super::behavior::org_grant_registry::ConsumerGrantSnapshot::empty(),
+        ));
+        let consumer_grant_gate = Arc::new(ConsumerGrantGate::new());
+        let routing_authority = Arc::new(RoutingAuthority::new());
+        // OLB-2B.3c step 2: the node-owned session/direct-state projection.
+        // Built here, beside the discovery source, because the pool's session
+        // annotation and its discovery rows must be produced by ONE node — a
+        // second owner would be a second view of reachability, free to
+        // disagree with this one.
+        let session_routing = NodeSessionRouting::new();
+        let routing_registry = super::behavior::org_routing_registry::NodeOrgRoutingRegistry::new(
+            Arc::new(ScopedSlotSource {
+                session_routing: session_routing.clone(),
+                scoped_discovery: scoped_discovery.clone(),
+                publication: scoped_publication.clone(),
+                org_revocation: org_revocation.clone(),
+                consumer_grants: consumer_grant_audiences.clone(),
+                consumer_grant_gate: consumer_grant_gate.clone(),
+                authority: routing_authority.clone(),
+                #[cfg(test)]
+                settle_gap_hook: parking_lot::Mutex::new(None),
+                unserved_scope: routing_unserved_scope.clone(),
+            }),
+            routing_work.clone(),
+            routing_registry_metrics.clone(),
+        );
+        // The failure callback below evicts peers, which moves the
+        // session/direct-state projection, so it needs both routing handles
+        // (OLB-2B.3c step 2). That is why the whole routing plane is
+        // constructed above the detector rather than beside the node literal:
+        // a callback registered before its consumer exists cannot notify it.
+        let session_routing_failure = session_routing.clone();
+        let routing_registry_failure = routing_registry.clone();
         let failure_detector = FailureDetector::with_config(FailureDetectorConfig {
             timeout: config.session_timeout,
             miss_threshold: 3,
@@ -9267,6 +9721,17 @@ impl MeshNode {
             // releases its claim on the wire hash.
             let removed_entity_id = peer_entity_ids_failure.remove(&node_id).map(|(_, eid)| eid);
             if let Some(eid) = removed_entity_id {
+                // OLB-2B.3c step 2: this node id no longer resolves to a
+                // provider entity, so every pool annotating that provider
+                // through this session is superseded. Republished only when a
+                // binding was actually removed — a verdict for a node that
+                // never had one publishes nothing and wakes nothing.
+                note_session_transition(
+                    &session_routing_failure,
+                    &routing_registry_failure,
+                    &peers_failure,
+                    &peer_entity_ids_failure,
+                );
                 // Same key the inbound announcement handler uses —
                 // the full 64-bit `EntityId::origin_hash()` since the
                 // `WIRE_ORIGIN_HASH_64BIT` cutover. Slot is
@@ -9426,50 +9891,6 @@ impl MeshNode {
         // registries, so the signal is echo-safe by construction.
         let local_caps_changed = Arc::new(tokio::sync::watch::channel(0u64).0);
 
-        // OLB-2B-E3c: the routing plane. Built here, before the node literal, so
-        // the registry binds to the very same scoped state, publication gate and
-        // revocation slot the ingest paths use — one source of truth, not a
-        // parallel copy. The SUPERVISOR is deliberately NOT built here: it owns the
-        // exclusive destructive drain, and its single production construction path
-        // is `spawn_org_routing_supervisor`, reached only from `start`.
-        let scoped_discovery = Arc::new(parking_lot::Mutex::new(
-            super::behavior::org_scoped_store::ScopedDiscoveryState::new(),
-        ));
-        let scoped_publication = Arc::new(ScopedMutationPublication::new());
-        let scoped_ingest_counters: Arc<super::behavior::org_scoped_store::ScopedIngestCounters> =
-            Arc::default();
-        let org_revocation: Arc<
-            ArcSwapOption<super::behavior::org_revocation::OrgRevocationStore>,
-        > = Arc::new(ArcSwapOption::empty());
-        let routing_work: Arc<super::behavior::org_routing::RegistryWork> = Arc::default();
-        let routing_registry_metrics: Arc<super::behavior::org_routing_registry::RegistryMetrics> =
-            Arc::default();
-        let routing_unserved_scope = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        // Hoisted: the routing source shares this exact slot, because installed
-        // consumer Grants are AUTHORITY for the grant plane (OLB-2B.3c-pre) —
-        // and the exact WRITER gate with it, so the commit pin can exclude Grant
-        // movement for the life of an installation (review 2026-07-29 §1).
-        let consumer_grant_audiences = Arc::new(arc_swap::ArcSwap::from_pointee(
-            super::behavior::org_grant_registry::ConsumerGrantSnapshot::empty(),
-        ));
-        let consumer_grant_gate = Arc::new(ConsumerGrantGate::new());
-        let routing_authority = Arc::new(RoutingAuthority::new());
-        let routing_registry = super::behavior::org_routing_registry::NodeOrgRoutingRegistry::new(
-            Arc::new(ScopedSlotSource {
-                scoped_discovery: scoped_discovery.clone(),
-                publication: scoped_publication.clone(),
-                org_revocation: org_revocation.clone(),
-                consumer_grants: consumer_grant_audiences.clone(),
-                consumer_grant_gate: consumer_grant_gate.clone(),
-                authority: routing_authority.clone(),
-                #[cfg(test)]
-                settle_gap_hook: parking_lot::Mutex::new(None),
-                unserved_scope: routing_unserved_scope.clone(),
-            }),
-            routing_work.clone(),
-            routing_registry_metrics.clone(),
-        );
-
         // Close the loop between the detector and the reroute policy.
         // The detector's callbacks hold the policy, so the policy is
         // built first and cannot take this as a constructor argument —
@@ -9534,6 +9955,7 @@ impl MeshNode {
             scoped_publication,
             scoped_ingest_counters,
             routing_registry,
+            session_routing,
             routing_work,
             routing_health: super::behavior::org_routing::new_routing_health(),
             routing_metrics: Arc::default(),
@@ -11342,6 +11764,12 @@ impl MeshNode {
     #[cfg(any(test, feature = "fixtures"))]
     pub fn test_pin_peer_entity(&self, node_id: u64, entity_id: EntityId) {
         self.peer_entity_ids.entry(node_id).or_insert(entity_id);
+        // OLB-2B.3c step 2: a pin resolves a node id to a provider entity, so
+        // it changes which providers the projection can annotate. Republished
+        // here for the same reason the production pin sites republish — a
+        // fixture that seeded a pin and got no projection would be modelling a
+        // node this code cannot produce.
+        self.note_session_transition();
     }
 
     /// Test/debug accessor for the live [`NetSession`] to a peer.
@@ -11704,6 +12132,7 @@ impl MeshNode {
         if ctx.subject_node != from_node {
             return Err(SubnetAuthError::WrongSubject);
         }
+        let mut pinned = false;
         match self.peer_entity_ids.entry(from_node) {
             dashmap::mapref::entry::Entry::Occupied(slot) => {
                 if slot.get() != &ctx.subject {
@@ -11716,7 +12145,15 @@ impl MeshNode {
             }
             dashmap::mapref::entry::Entry::Vacant(slot) => {
                 slot.insert(ctx.subject.clone());
+                pinned = true;
             }
+        }
+        if pinned {
+            // OLB-2B.3c step 2: this node id now resolves to a provider
+            // entity, so the session/direct-state projection moved. The
+            // Occupied arm published NOTHING — it either matched or refused —
+            // and so wakes nothing.
+            self.note_session_transition();
         }
 
         self.subnet_contexts.install(from_node, ctx.clone());
@@ -14779,9 +15216,20 @@ impl MeshNode {
         keys: SessionKeys,
         expected_prior_session_id: Option<u64>,
     ) -> PeerTransitionOutcome {
-        self.peer_transitions.with(peer_node_id, || {
+        let outcome = self.peer_transitions.with(peer_node_id, || {
             self.install_peer_locked(peer_node_id, transport, keys, expected_prior_session_id)
-        })
+        });
+        if outcome.owned {
+            // OLB-2B.3c step 2: this transition published a new session, so the
+            // node's session/direct-state projection moved. Run with the peer
+            // shard RELEASED, exactly as every other transition site does — the
+            // republication takes its own gate and then the registry lock, and
+            // stacking the registry beneath a peer shard is the inversion that
+            // discipline exists to prevent. A LOST compare-and-swap leaves
+            // `owned` false and wakes nothing.
+            self.note_session_transition();
+        }
+        outcome
     }
 
     /// The install body, running under this peer's transition guard.
@@ -15566,6 +16014,22 @@ impl MeshNode {
         ]
     }
 
+    /// Routing-POOL counters (OLB-2B.3c step 2):
+    /// `[published, invalidated, refused_stale_session]`.
+    ///
+    /// Deliberately a SEPARATE crate-private surface rather than three more
+    /// slots on the public array above. Widening a `pub fn`'s return type is a
+    /// source-breaking change, and the second cell is dark until 2B.3d — the
+    /// slice that publishes a routing surface is the slice that may change one.
+    #[cfg(test)]
+    pub(crate) fn org_routing_pool_counts(&self) -> [u64; 3] {
+        [
+            self.routing_registry_metrics.pools_published(),
+            self.routing_registry_metrics.pools_invalidated(),
+            self.routing_registry_metrics.pools_refused_stale_session(),
+        ]
+    }
+
     /// Routing-actor loop iterations COMPLETED (OLB-2B.3b).
     ///
     /// The only externally-visible statement that no reconciliation pass is in
@@ -15825,6 +16289,73 @@ impl MeshNode {
             .load()
             .allows(facts.actor_incarnation)
             .then_some(facts)
+    }
+
+    /// The VALIDATED routing pool for `key`, with the facts it was derived
+    /// from (OLB-2B.3c step 2).
+    ///
+    /// Its registry-side twin, `DemandHandle::unsensed_pool_unvalidated`,
+    /// returns whatever is published; this is where a pool becomes usable. The
+    /// facts half runs every check [`Self::org_routing_base_facts`] runs — it
+    /// IS that call — and the pool half then adds the two the second cell
+    /// needs:
+    ///
+    /// - **the pool derives from EXACTLY these facts.** The two cells are read
+    ///   with two separate atomics, so the pairing is checked and never
+    ///   assumed. The publication order makes a mismatched pair unreachable,
+    ///   but a reader that relied on that would be trusting a producer's
+    ///   discipline for a property it can verify itself in one pointer
+    ///   comparison;
+    /// - **the pool was computed under the LIVE session view.** A pool from an
+    ///   older projection annotates providers with sessions that may be gone.
+    ///   Refusing it is cold, which is the same answer a caller gets before
+    ///   the first pool is ever published.
+    ///
+    /// `None` is the deterministic cold outcome for every one of those, and
+    /// none of them invalidates anything: the facts are still valid, and the
+    /// pool the actor is about to publish is already owed.
+    #[allow(dead_code)] // consumer: the family projection (OLB-2B.3d).
+    pub(crate) fn org_routing_unsensed_pool(
+        &self,
+        key: &super::behavior::org_routing_registry::SlotKey,
+    ) -> Option<Arc<super::behavior::org_routing_registry::ScopedUnsensedRoutePool>> {
+        let facts = self.org_routing_base_facts(key)?;
+        let pool = self.routing_registry.unsensed_pool_unvalidated(key)?;
+        if !pool.derives_from(&facts) {
+            return None;
+        }
+        let live = self.session_routing.currentness.generation()?;
+        (pool.session_generation() == live).then_some(pool)
+    }
+
+    /// Publish a session/direct-state transition from a `&self` call site.
+    ///
+    /// Every peer transition that actually published or removed a session
+    /// reaches here; the ones that lost a compare-and-swap return before it.
+    pub(crate) fn note_session_transition(&self) {
+        note_session_transition(
+            &self.session_routing,
+            &self.routing_registry,
+            &self.peers,
+            &self.peer_entity_ids,
+        );
+    }
+
+    /// Test-only: session republications that produced a new generation.
+    ///
+    /// The direct evidence for "a non-publishing transition wakes nothing" — a
+    /// witness that inferred it from a pool count could not tell a suppressed
+    /// republication from one that happened to change nothing.
+    #[cfg(test)]
+    pub(crate) fn org_routing_session_publications(&self) -> u64 {
+        self.session_routing.publications()
+    }
+
+    /// Test-only: the live session generation, or `None` once the space is
+    /// terminally spent.
+    #[cfg(test)]
+    pub(crate) fn org_routing_session_generation(&self) -> Option<u64> {
+        self.session_routing.currentness.generation()
     }
 
     /// Spawn the NAT classification loop. Waits until at least 2
@@ -16631,6 +17162,8 @@ impl MeshNode {
             scoped_discovery: self.scoped_discovery.clone(),
             scoped_publication: self.scoped_publication.clone(),
             scoped_ingest_counters: self.scoped_ingest_counters.clone(),
+            session_routing: self.session_routing.clone(),
+            routing_registry: self.routing_registry.clone(),
             scoped_relay_gate: self.scoped_relay_gate.clone(),
             consumer_grant_audiences: self.consumer_grant_audiences.clone(),
             #[cfg(feature = "redex")]
@@ -17910,6 +18443,20 @@ impl MeshNode {
             return;
         };
 
+        // OLB-2B.3c step 2: a session was published, so the node's
+        // session/direct-state projection moved. Run with the peer-transition
+        // shard RELEASED — the republication takes its own gate and then the
+        // registry lock, and the documented order only holds because nothing
+        // stacks the registry beneath a peer shard. The `else` arm above is
+        // every non-publishing outcome (replay drop, refused rotation,
+        // deferred busy rotation), and it returns without waking anything.
+        note_session_transition(
+            &ctx.session_routing,
+            &ctx.routing_registry,
+            &ctx.peers,
+            &ctx.peer_entity_ids,
+        );
+
         // Spawn the send. If it fails, roll back all three registrations
         // (peer session, peer-addr map, and routing table entry). Leaving
         // the route behind would silently blackhole future routed traffic
@@ -17946,6 +18493,9 @@ impl MeshNode {
             peer_addrs: ctx.peer_addrs.clone(),
             session_id_to_node: ctx.session_id_to_node.clone(),
             router: ctx.router.clone(),
+            session_routing: ctx.session_routing.clone(),
+            routing_registry: ctx.routing_registry.clone(),
+            peer_entity_ids: ctx.peer_entity_ids.clone(),
         };
         tokio::spawn(async move {
             match socket.send_to(&payload, next_hop).await {
@@ -19898,6 +20448,12 @@ impl MeshNode {
         // Eviction is a peer-state transition like any other and runs
         // through the same handle as the installers.
         let peer_transitions_evict = self.peer_transitions.clone();
+        // OLB-2B.3c step 2: an eviction moves the session/direct-state
+        // projection, so the sweep republishes it and retires the pools that
+        // movement supersedes.
+        let session_routing_evict = self.session_routing.clone();
+        let routing_registry_evict = self.routing_registry.clone();
+        let peer_entity_ids_evict = self.peer_entity_ids.clone();
         let route_withdraw_gate = self.route_withdraw_gate.clone();
         let failure_detector = self.failure_detector.clone();
         // SI-2a: sensing soft-state expiry rides this loop's tick —
@@ -20600,6 +21156,21 @@ impl MeshNode {
                                 tracing::info!(
                                     node_id = format!("{:#x}", node_id),
                                     "evicted permanently-dead peer from peer map",
+                                );
+                                // OLB-2B.3c step 2: losing a session moves the
+                                // projection exactly as gaining one does — and
+                                // in the direction that matters most, because a
+                                // pool still annotating this provider DIRECT
+                                // would preselect a session that no longer
+                                // exists. Run with the peer shard released. An
+                                // eviction that declined (the exact-session
+                                // guard) leaves `evicted` false and wakes
+                                // nothing.
+                                note_session_transition(
+                                    &session_routing_evict,
+                                    &routing_registry_evict,
+                                    &peers,
+                                    &peer_entity_ids_evict,
                                 );
                             }
                             // Also drop the failure-detector entry so
@@ -25361,6 +25932,16 @@ impl MeshNode {
                     .origin_hash_to_node
                     .entry(origin_hash)
                     .or_insert(from_node);
+                // OLB-2B.3c step 2: `from_node` now resolves to a provider
+                // entity, so the session/direct-state projection moved. Only
+                // this arm reaches here — a rejected rebind and a matching
+                // re-announcement both publish nothing and wake nothing.
+                note_session_transition(
+                    &ctx.session_routing,
+                    &ctx.routing_registry,
+                    &ctx.peers,
+                    &ctx.peer_entity_ids,
+                );
             }
         }
 
@@ -35044,6 +35625,9 @@ mod heartbeat_aead_tests {
                 peer_addrs: peer_addrs.clone(),
                 session_id_to_node: session_id_to_node.clone(),
                 router: router.clone(),
+                session_routing: NodeSessionRouting::new(),
+                routing_registry: detached_routing_registry_for_test(),
+                peer_entity_ids: Arc::new(DashMap::new()),
             };
         } // Drop runs here.
 
@@ -35112,6 +35696,9 @@ mod heartbeat_aead_tests {
                 peer_addrs: peer_addrs.clone(),
                 session_id_to_node: session_id_to_node.clone(),
                 router: router.clone(),
+                session_routing: NodeSessionRouting::new(),
+                routing_registry: detached_routing_registry_for_test(),
+                peer_entity_ids: Arc::new(DashMap::new()),
             };
             // Successful-send path consumes the guard without
             // running Drop's rollback.
@@ -35185,6 +35772,9 @@ mod heartbeat_aead_tests {
                 peer_addrs: peer_addrs.clone(),
                 session_id_to_node: session_id_to_node.clone(),
                 router: router.clone(),
+                session_routing: NodeSessionRouting::new(),
+                routing_registry: detached_routing_registry_for_test(),
+                peer_entity_ids: Arc::new(DashMap::new()),
             };
         }
 
@@ -35285,6 +35875,9 @@ mod heartbeat_aead_tests {
                 peer_addrs: peer_addrs.clone(),
                 session_id_to_node: session_id_to_node.clone(),
                 router: router.clone(),
+                session_routing: NodeSessionRouting::new(),
+                routing_registry: detached_routing_registry_for_test(),
+                peer_entity_ids: Arc::new(DashMap::new()),
             };
         }
 
@@ -35369,6 +35962,9 @@ mod heartbeat_aead_tests {
                 peer_addrs: peer_addrs.clone(),
                 session_id_to_node: session_id_to_node.clone(),
                 router: router.clone(),
+                session_routing: NodeSessionRouting::new(),
+                routing_registry: detached_routing_registry_for_test(),
+                peer_entity_ids: Arc::new(DashMap::new()),
             };
         }
 
