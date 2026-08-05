@@ -29023,9 +29023,33 @@ impl MeshNode {
         // serialized at send time through the epoch-checked path);
         // `None` = the announce was rate-limit-deferred or coalesced.
         let to_broadcast = {
-            probe!("A node={:#x} locking announce_mu mode={mode:?}", self.node_id);
-            let _announce_guard = self.announce_mu.lock();
-            probe!("B node={:#x} announce_mu acquired", self.node_id);
+            probe!(
+                "A node={:#x} locking announce_mu mode={mode:?} mu={:p} self={:p}",
+                self.node_id,
+                &self.announce_mu,
+                self
+            );
+            // Cycle-3 diagnostic: a bounded poll instead of a blocking acquire,
+            // so the trace distinguishes "queued behind a fair/unfair handoff"
+            // from "the mutex is permanently held by someone".
+            let mut __waits = 0u32;
+            let _announce_guard = loop {
+                if let Some(g) = self.announce_mu.try_lock_for(Duration::from_millis(500)) {
+                    break g;
+                }
+                __waits += 1;
+                probe!(
+                    "A2 node={:#x} STILL waiting on announce_mu after {}ms mu={:p}",
+                    self.node_id,
+                    __waits * 500,
+                    &self.announce_mu
+                );
+            };
+            probe!(
+                "B node={:#x} announce_mu acquired after {} waits",
+                self.node_id,
+                __waits
+            );
             // Set a new baseline or re-read the current one — both
             // under `announce_mu` so a re-announce never clobbers a
             // concurrent explicit announce's newer baseline. The
