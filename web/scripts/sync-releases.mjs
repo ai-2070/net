@@ -100,6 +100,7 @@ const TITLES = {
   "RELEASE_v0.31_HOLD_THE_LINE.md": "v0.31.0 — Hold the Line",
   "RELEASE_v0.32_SUMMER_MADNESS.md": "v0.32.0 — Summer Madness",
   "RELEASE_v0.33_CIRCUS_MAXIMUS.md": "v0.33.0 — Circus Maximus",
+  "RELEASE_v0.34_HOTEL_CALIFORNIA.md": "v0.34.0 — Hotel California",
   "RELEASE_v0.8_KILLING_MOON.md": "v0.8 — Killing Moon",
   "RELEASE_v0.9_FIRST_BLOOD.md": "v0.9 — First Blood",
 };

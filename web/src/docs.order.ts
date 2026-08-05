@@ -168,6 +168,7 @@ export const DOCS_ORDER: DocsOrderConfig = {
     ],
     // Releases — newest first.
     releases: [
+      "RELEASE_v0.34_HOTEL_CALIFORNIA",
       "RELEASE_v0.33_CIRCUS_MAXIMUS",
       "RELEASE_v0.32_SUMMER_MADNESS",
       "RELEASE_v0.31_HOLD_THE_LINE",
