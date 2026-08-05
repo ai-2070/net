@@ -42,34 +42,32 @@ import type { IslandCriteria, IslandTopologyInput } from '@net-mesh/core';
 // low-level package's `./subnet` entry, which classifies the stable
 // `subnet:` envelope; `getNapiMesh` supplies the handle.
 import { serveSubnetExported as serveSubnetExportedNative } from '@net-mesh/core/subnet';
+import type {
+  OrgCaller as NapiOrgCaller,
+  OrgServeHandle as NapiOrgServeHandle,
+} from '@net-mesh/core';
 
 export type { IslandCriteria, IslandTopologyInput } from '@net-mesh/core';
 
 /**
- * The verified admission facts a subnet-exported handler receives —
- * the same shape `serveOrg` projects, because it is the same admission
+ * The verified admission facts a subnet-exported handler receives — the
+ * same shape `serveOrg` projects, because it is the same admission
  * engine. Every field is provider-verified, never caller-claimed.
+ *
+ * An ALIAS of the binding's `OrgCaller`, not a parallel declaration. A
+ * hand-written copy drifted immediately (it named the acting entity
+ * `caller` where the binding calls it `entity`), and a copy can only
+ * ever be right by coincidence — the binding's `.d.ts` is generated from
+ * the Rust struct.
  */
-export interface SubnetExportedCaller {
-  /** The acting entity — the caller. */
-  caller: Buffer;
-  /** The organization the caller acted for. */
-  actingOrg: Buffer;
-  /** This provider's owner organization. */
-  providerOrg: Buffer;
-  /** This exact provider node. */
-  provider: Buffer;
-  /** The capability that was invoked. */
-  capability: Buffer;
-  /** Whether caller and provider share an organization. */
-  isSameOrg: boolean;
-}
+export type SubnetExportedCaller = NapiOrgCaller;
 
-/** Handle for a served subnet export; `close()` unregisters. */
-export interface SubnetServeHandle {
-  /** Unregister the service. Idempotent. */
-  close(): void;
-}
+/**
+ * Handle for a served subnet export; `close()` unregisters and is
+ * idempotent. Aliased from the binding for the same reason as
+ * {@link SubnetExportedCaller}.
+ */
+export type SubnetServeHandle = NapiOrgServeHandle;
 
 /** Outcome of a reserve/release/claim. */
 export type ClaimOutcome = 'won' | 'lost';
@@ -900,13 +898,13 @@ export class MeshNode {
     // public escape hatch (review-10 P1-5). Before this existed, an
     // application using the ergonomic constructor had no way to serve a
     // named export without deep-importing `_internal` itself.
-    return serveSubnetExportedNative(
+    return serveSubnetExportedNative<Req, Resp>(
       getNapiMesh(this),
       service,
       exportName,
-      handler as (caller: SubnetExportedCaller, req: unknown) => unknown,
+      handler,
       handlerTimeoutMs,
-    ) as SubnetServeHandle;
+    );
   }
 
   /** Shutdown the mesh node. */
