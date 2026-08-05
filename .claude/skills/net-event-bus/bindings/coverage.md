@@ -90,7 +90,7 @@ A mode is written after the status: `supported · core-only`.
 | Gang-claim scheduler | supported | supported | supported | supported | supported |
 | A2A — agent task handoff | supported | supported · core-only | supported · core-only | not exposed | not exposed |
 | Organization capability auth | supported | supported | supported | supported | supported |
-| Subnet gateway provisioning | supported | supported | supported | partial | partial |
+| Subnet gateway provisioning | supported | supported | supported | supported | supported |
 | Subnet-exported nRPC serve | supported | supported | supported | supported | supported |
 | Subnet-exported organization call | supported | supported | supported | supported | supported |
 | MCP bridge | supported | supported | supported | supported | supported |
@@ -156,19 +156,18 @@ back. What is missing is the discovery-driven path — no equivalent of
 `fetch_blob_discovered`, so Go cannot fetch a blob it has only a reference to
 without knowing who holds it.
 
-**Go and C subnet gateway provisioning is `supported`** (was `partial` until
-review-10 P1-7). Every *runtime* administration verb is present — installing
-gateway credential sets, declaring boundaries, applying signed control facts —
-and both bindings now also declare the node's subnet **trust anchors**.
+**Go and C subnet gateway provisioning is `supported`.** Every *runtime*
+administration verb is present — installing gateway credential sets, declaring
+boundaries, applying signed control facts — and both bindings also declare the
+node's subnet **trust anchors**.
 
 `subnet_authorities`, `subnet_attachment`, `subnet_control_channel`, and
 `subnet_exports` are construction-time state, supplied on Go's `MeshConfig` and
-in the JSON C already passes to `net_mesh_new`. They used to be unreachable:
-the DTO conversion lived in `net-mesh-sdk`, which base `libnet`'s constructor
-cannot depend on. It now lives in the core
-(`net::adapter::net::subnet::provision`), reachable from every constructor, with
-`net_sdk::subnet` re-exporting it so there is still one definition. A standalone
-Go or C program can stand up a subnet gateway on its own.
+in the JSON C already passes to `net_mesh_new`. The conversion lives in the core
+(`net::adapter::net::subnet::provision`) so every constructor reaches it,
+including base `libnet`'s, with `net_sdk::subnet` re-exporting it so there is
+still one definition. A standalone Go or C program can stand up a subnet
+gateway on its own.
 
 ## Same operation, different shape
 

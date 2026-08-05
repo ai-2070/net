@@ -555,10 +555,10 @@
     "Subnet gateway provisioning": {
       "bindings": {
         "C": {
-          "status": "partial"
+          "status": "supported"
         },
         "Go": {
-          "status": "partial"
+          "status": "supported"
         },
         "Node / TS": {
           "status": "supported"

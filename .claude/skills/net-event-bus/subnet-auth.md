@@ -84,7 +84,7 @@ The handler receives the same verified `OrgCaller` as `serve_org` — the serve 
 
 ### Go and C are first-class
 
-Both bindings serve exports, call exported services, run every runtime admin verb, and declare subnet **trust anchors**. Go sets `SubnetAuthorities` / `SubnetAttachment` / `SubnetControlChannel` / `SubnetExports` on `MeshConfig`; C supplies the same four keys in the JSON `net_mesh_new` already takes. Rust converts and validates them through the frozen DTOs before the node exists. A standalone Go or C program can stand up a gateway on its own (review-10 P1-7). See `bindings/coverage.md` for the rows and anchors.
+Both bindings serve exports, call exported services, run every runtime admin verb, and declare subnet **trust anchors**. Go sets `SubnetAuthorities` / `SubnetAttachment` / `SubnetControlChannel` / `SubnetExports` on `MeshConfig`; C supplies the same four keys in the JSON `net_mesh_new` already takes. Rust converts and validates them through the frozen DTOs before the node exists. A standalone Go or C program can stand up a gateway on its own. See `bindings/coverage.md` for the rows and anchors.
 
 ## Errors — one stable envelope, one fixture
 
