@@ -145,6 +145,8 @@ let customer: CustomerRecord = org.call("customer.read", &request).await?;
 Also on `OrgClient`: `call_bytes`, `call_bytes_deadline`, `reserve_cancel_token()` / `cancel(token)`, `acting_org()`, `caller()`, `grants()`, `check_current()`.
 `OrgCredentials::new(membership, dispatcher, grants, secrets)` is the in-process constructor when you already hold typed objects.
 
+`OrgClient` also carries **`call_exported`** (`callExported` / `CallExported` / `net_org_call_exported` across the bindings) — the caller half of a **subnet-exported** service. Same client, same credentials, same four error domains, one difference: discovery runs on the *public* plane through the verified ownership projection, because the provider sits behind a protected subnet boundary the caller never joins. If the provider side of that story is your task, read `subnet-auth.md`.
+
 ### TypeScript / Node (`@net-mesh/core`)
 
 ```ts
@@ -313,6 +315,7 @@ Everything `OrgClient` does is expressible by hand through `OrgProofIntent` on `
 - `error-codes.md` — the `RpcError` kinds `org:rpc:` reuses.
 - `cli.md` — `net-mesh org` / `net-mesh node adopt` argument reference.
 - `mcp.md` — `net-mesh wrap` publishes owner-scoped capabilities; org auth is the general form of that scoping.
+- `subnet-auth.md` — serving a subnet-**exported** service (`serve_subnet_exported`, named exports, gateway provisioning). The caller half lives here on `OrgClient` as `call_exported`; the provider half and the `subnet:<kind>` errors live there.
 
 ## Further reading
 

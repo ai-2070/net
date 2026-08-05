@@ -45,6 +45,10 @@ export {
 } from './mesh';
 export type {
   MeshNodeConfig,
+  SubnetAuthorityConfig,
+  SubnetPath,
+  SubnetRef,
+  SubnetNamedExport,
   MeshStream,
   StreamConfig,
   StreamStats,

@@ -184,7 +184,7 @@ async fn run_export(
 ///   space takes precedence over any would-be decimal literal
 ///   syntax. A name IS the canonical identity: the hash is a pure
 ///   function of it, no mesh attachment needed.
-fn parse_channel_hash(raw: &str) -> Result<u64, CliError> {
+pub(crate) fn parse_channel_hash(raw: &str) -> Result<u64, CliError> {
     let s = raw.trim();
     if s.is_empty() {
         return Err(invalid_args("channel cannot be empty"));

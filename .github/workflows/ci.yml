@@ -607,6 +607,8 @@ jobs:
           --test subnet_org_boundary
           --test subnet_revocation
           --test subnet_route_hop_alloc
+          --test subnet_relay_alloc_e2e
+          --test subnet_assign_alloc
           --test subnet_session_auth
           --test subnet_control_facts
           --test integration_placement_filter_callback
@@ -2202,6 +2204,24 @@ jobs:
         if: matrix.crate.name != 'node'
         working-directory: ${{ matrix.crate.path }}
         run: cargo test --lib ${{ matrix.crate.features }}
+
+      # org-ffi is the one FFI crate with INTEGRATION targets — the S4 C
+      # live cell, which drives the real C ABI end to end (net_mesh_new
+      # from JSON, net_mesh_arc_clone per consuming call, the net_subnet_*
+      # admin + serve entry points, net_org_credentials_new / _bind /
+      # _call_exported, and a process-wide handler trampoline) against the
+      # same generated scenario the Node, Python, and Go cells load. The
+      # `--lib` step above does not reach those.
+      #
+      # `--test '*'` on purpose, not `--test <name>`: auto-discovery means a
+      # future integration test here runs for free, which is exactly the
+      # silent-skip failure mode the "Integration test pin guard" job exists
+      # to catch for the core crate's by-name pins. Nothing to enforce if
+      # nothing is pinned by name.
+      - name: Run integration tests (org-ffi — the S4 C ABI live cell)
+        if: matrix.crate.name == 'go-org-ffi'
+        working-directory: ${{ matrix.crate.path }}
+        run: cargo test --test '*'
 
   cli-tests:
     # `net-cli`'s test surface is broader than the FFI shims:

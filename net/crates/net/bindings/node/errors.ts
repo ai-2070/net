@@ -317,6 +317,78 @@ export function classifyOrgError(e: unknown): unknown {
 }
 
 
+// ---------------------------------------------------------------------------
+// Subnet authority provisioning — one LOCAL envelope, no domains.
+//
+// Same native-free rationale as the org section above: the stable-kind
+// fixture test runs without a compiled cdylib.
+// ---------------------------------------------------------------------------
+
+const ERR_SUBNET_PREFIX = 'subnet:'
+
+/**
+ * A subnet provisioning/configuration failure — the stable
+ * `subnet:<kind>` envelope (`SUBNET_AUTH_SDK_PLAN.md` R4).
+ *
+ * Always LOCAL and startup-shaped: configuration, decode, or install
+ * refused before (or without) any node-state mutation. These are never
+ * call-path domains — a remote exported-call refusal surfaces through
+ * the org taxonomy above, and this class never impersonates one.
+ *
+ * `kind` is either a core reason code (e.g. `invalid_format`,
+ * `scope_not_ancestor`) or a local configuration kind (e.g.
+ * `unknown_export_name`), pinned for every language by
+ * `tests/cross_lang_subnet/stable_kinds.json`.
+ */
+export class SubnetProvisionError extends Error {
+  /** The stable kind token after the `subnet:` prefix. */
+  readonly kind: string
+
+  constructor(message: string, kind: string) {
+    super(message)
+    this.name = 'SubnetProvisionError'
+    this.kind = kind
+  }
+}
+
+/**
+ * Recover the stable kind token from a `subnet:` wire string, or
+ * `undefined` when the message carries no envelope at all.
+ *
+ * The envelope is SCANNED for, not required at position 0. Construction
+ * and admin failures lead with it (`subnet:invalid_format`), but serve
+ * registration WRAPS it in provider-setup prose (`subnet-exported serve
+ * registration failed: … subnet:unknown_export_name: …`) — and a
+ * bare-prefix parse silently declined to classify exactly the failure
+ * applications hit most. Matches Go's `ParseSubnetKind` and Python's
+ * `net.subnet.parse_subnet_kind`: the token runs to the next colon or
+ * whitespace.
+ */
+export function parseSubnetKind(e: unknown): string | undefined {
+  const msg = extractMessage(e)
+  const marker = msg.indexOf(ERR_SUBNET_PREFIX)
+  if (marker < 0) return undefined
+  const rest = msg.slice(marker + ERR_SUBNET_PREFIX.length)
+  const end = rest.search(/[:\s]/)
+  const kind = (end === -1 ? rest : rest.slice(0, end)).trim()
+  return kind.length === 0 ? undefined : kind
+}
+
+/**
+ * Reclassify a thrown error into {@link SubnetProvisionError}.
+ *
+ * The kind is taken verbatim from the wire — an unrecognized kind still
+ * classifies (the class asserts "local provisioning failure", which the
+ * envelope alone establishes; the kind is data, and inventing a
+ * substitute for one we don't know would be the counterfeit the org
+ * taxonomy's `unknown` rule exists to prevent).
+ */
+export function classifySubnetError(e: unknown): unknown {
+  const kind = parseSubnetKind(e)
+  if (kind === undefined) return e
+  return new SubnetProvisionError(extractMessage(e), kind)
+}
+
 export function classifyError(e: unknown): unknown {
   const msg = extractMessage(e)
   if (msg.startsWith(ERR_CORTEX_PREFIX)) {
@@ -333,6 +405,13 @@ export function classifyError(e: unknown): unknown {
   }
   if (msg.startsWith(ERR_ORG_PREFIX)) {
     return classifyOrgError(e)
+  }
+  // Scanned, not prefix-matched — the serve-registration wrap carries the
+  // envelope mid-message. Runs LAST so a leading `org:` / `nrpc:` / … wins
+  // its own taxonomy even if the detail clause mentions a subnet.
+  const subnetKind = parseSubnetKind(e)
+  if (subnetKind !== undefined) {
+    return new SubnetProvisionError(msg, subnetKind)
   }
   return e
 }

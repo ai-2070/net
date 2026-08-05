@@ -429,6 +429,23 @@ required-features = ["net"]
 name = "subnet_control_facts"
 required-features = ["net"]
 
+# `SubnetPolicy::assign` allocates one borrowed view, not one String
+# per tag (PERF_AUDIT_2026_08_04_SUBNET_PATHS §2). One test per binary
+# — it installs a `#[global_allocator]`.
+[[test]]
+name = "subnet_assign_alloc"
+required-features = ["net"]
+
+# The production-path relay allocation witness. `fixtures` is
+# load-bearing twice over: the measured-section marker in
+# `relay_protected_hop` and the `alloc_probe` module it reads are both
+# compiled only behind it, and the harness drives admission through
+# the fixtures-gated witness seams. One test per binary — it installs
+# a `#[global_allocator]`.
+[[test]]
+name = "subnet_relay_alloc_e2e"
+required-features = ["net", "fixtures"]
+
 [[bench]]
 name = "ingestion"
 harness = false

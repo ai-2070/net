@@ -203,6 +203,57 @@ operations:
     C:
       status: supported
       anchor: net_org_call
+- operation: Subnet gateway provisioning
+  bindings:
+    Rust:
+      status: supported
+      anchor: install_gateway_credentials_node
+    Node / TS:
+      status: supported
+      anchor: installSubnetGatewayCredentials
+    Python:
+      status: supported
+      anchor: install_subnet_gateway_credentials
+    Go:
+      status: supported
+      anchor: InstallSubnetGatewayCredentials
+    C:
+      status: supported
+      anchor: net_subnet_install_gateway_credentials
+- operation: Subnet-exported nRPC serve
+  bindings:
+    Rust:
+      status: supported
+      anchor: serve_subnet_exported
+    Node / TS:
+      status: supported
+      anchor: serveSubnetExported
+    Python:
+      status: supported
+      anchor: serve_subnet_exported
+    Go:
+      status: supported
+      anchor: ServeSubnetExported
+    C:
+      status: supported
+      anchor: net_subnet_serve_exported
+- operation: Subnet-exported organization call
+  bindings:
+    Rust:
+      status: supported
+      anchor: call_exported
+    Node / TS:
+      status: supported
+      anchor: callExported
+    Python:
+      status: supported
+      anchor: call_exported
+    Go:
+      status: supported
+      anchor: CallExportedBytes
+    C:
+      status: supported
+      anchor: net_org_call_exported
 - operation: MCP bridge
   bindings:
     Rust:

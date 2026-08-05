@@ -109,6 +109,11 @@ mod deck;
 mod placement;
 #[cfg(feature = "redis")]
 mod redis_dedup;
+// The subnet AUTHORITY surface (SSDK S4a): DTO structs are plain data
+// (any build); the conversions, admin verbs, and the named-export serve
+// self-gate on `org` inside, since they ride the SDK dependency.
+#[cfg(feature = "net")]
+mod subnet;
 #[cfg(feature = "net")]
 mod subnets;
 #[cfg(feature = "tool")]
@@ -1223,6 +1228,28 @@ mod mesh_bindings {
         /// `permissive_channels`. Leave `false` for
         /// production nodes that pre-register their channels.
         pub permissive_channels: Option<bool>,
+        /// Subnet AUTHORITY trust anchors (SSDK §3.3) — one per
+        /// authority; empty root sets, duplicates, and zero lifetimes
+        /// fail before the node exists. An empty overall list means
+        /// every protected subnet assertion fails closed. Requires an
+        /// `org`-feature build.
+        pub subnet_authorities: Option<Vec<crate::subnet::SubnetAuthorityConfigJs>>,
+        /// This node's own SECURITY attachment point — the local
+        /// topology coordinate credentials are checked against.
+        /// Distinct from `subnet` above (unauthenticated routing
+        /// state); omitting it preserves the core compatibility
+        /// fallback, which protected deployments should not rely on.
+        pub subnet_attachment: Option<crate::subnet::SubnetPathJs>,
+        /// Treat an ordinary configured channel as a subnet
+        /// control-fact ARRIVAL path. Confers no authority — facts
+        /// verify by signature regardless of how they arrive.
+        pub subnet_control_channel: Option<String>,
+        /// NAMED subnet exports (SSDK §3.3): provider-local labels
+        /// resolved ONCE here into checked bindings and retained
+        /// beside this handle; `serveSubnetExported` registers against
+        /// a name and constructs no authority objects. Empty or
+        /// duplicate names fail before the node exists.
+        pub subnet_exports: Option<Vec<crate::subnet::SubnetNamedExportJs>>,
     }
 
     /// JS-facing channel config, mirroring the core `ChannelConfig`
@@ -1473,6 +1500,12 @@ mod mesh_bindings {
         /// `register_channel` inserts here; the node's membership ACL
         /// path reads from this same registry.
         channel_configs: Arc<net::adapter::net::ChannelConfigRegistry>,
+        /// The immutable named-export map resolved at `create()`
+        /// (SSDK §3.3) — the checked map this binding retains beside
+        /// its `Arc<MeshNode>`, exactly as the plan orders. Empty when
+        /// no `subnetExports` were configured.
+        #[cfg(feature = "org")]
+        subnet_exports: Arc<net_sdk::subnet::NamedSubnetExports>,
     }
 
     #[napi]
@@ -1539,6 +1572,45 @@ mod mesh_bindings {
                 config = config.with_auto_direct_upgrade(enabled);
             }
 
+            // SSDK S4a — the subnet AUTHORITY plane. Conversion + validation
+            // happen through the frozen Rust DTOs BEFORE the node exists; the
+            // checked named-export map is retained beside this handle below.
+            // A build without the SDK dependency refuses loudly rather than
+            // silently ignoring authority configuration (plan §6.5).
+            #[cfg(not(feature = "org"))]
+            if options.subnet_authorities.is_some()
+                || options.subnet_attachment.is_some()
+                || options.subnet_control_channel.is_some()
+                || options.subnet_exports.is_some()
+            {
+                return Err(Error::from_reason(
+                    "subnet authority configuration requires an `org`-feature build of \
+                     @net-mesh/core",
+                ));
+            }
+            #[cfg(feature = "org")]
+            let subnet_exports = {
+                let construction = crate::subnet::convert_subnet_construction(
+                    options.subnet_authorities.as_deref().unwrap_or(&[]),
+                    options.subnet_attachment.as_ref(),
+                    options.subnet_control_channel.as_deref(),
+                    options.subnet_exports.as_deref().unwrap_or(&[]),
+                )?;
+                for authority in construction.authorities {
+                    config = config.with_subnet_authority(authority);
+                }
+                if let Some(attachment) = construction.attachment {
+                    // Direct field write — the core deliberately has no
+                    // `with_subnet_attachment` (the `configured_identity`
+                    // precedent).
+                    config.subnet_attachment = Some(attachment);
+                }
+                if let Some(channel) = construction.control_channel {
+                    config = config.with_subnet_control_channel(channel);
+                }
+                Arc::new(construction.exports)
+            };
+
             // OSDK-L N: an explicitly supplied seed IS a configured identity.
             // The org facade refuses to bind credentials to a generated
             // fallback, so this provenance must be recorded here exactly as
@@ -1594,6 +1666,8 @@ mod mesh_bindings {
             Ok(NetMesh {
                 node: Arc::new(ArcSwapOption::from_pointee(node)),
                 channel_configs,
+                #[cfg(feature = "org")]
+                subnet_exports,
             })
         }
 
@@ -2224,6 +2298,14 @@ mod mesh_bindings {
                 Some(arc) => Ok(arc.clone()),
                 None => Err(Error::from_reason("MeshNode has been shut down")),
             }
+        }
+
+        /// The checked named-export map this mesh was created with
+        /// (SSDK §3.3) — consumed by `serve_subnet_exported` in
+        /// `subnet.rs`. Immutable after construction.
+        #[cfg(feature = "org")]
+        pub(crate) fn subnet_exports_arc(&self) -> Arc<net_sdk::subnet::NamedSubnetExports> {
+            self.subnet_exports.clone()
         }
 
         /// Share the `ChannelConfigRegistry` for sibling-module

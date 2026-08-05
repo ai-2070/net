@@ -13,12 +13,15 @@
 //! `SubnetGrant`s for protected transport rights.
 
 pub mod admission;
+#[cfg(any(test, feature = "fixtures"))]
+pub mod alloc_probe;
 mod assignment;
 pub mod auth;
 pub mod control;
 mod error;
 mod gateway;
 mod id;
+pub mod provision;
 pub mod route_hop;
 
 pub use admission::{SubnetChallengeStore, SubnetContextStore};

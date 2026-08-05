@@ -44,7 +44,7 @@ The reply-channel-per-caller convention keeps subscriptions cheap: a server hold
 
 If both ends are in your control AND you want a return value, pick nRPC. The bus has no return-value mechanism — folding it in via "two channels + correlation id" is exactly what nRPC does, except already implemented with deadlines, cancellation, and resilience helpers.
 
-**If only certain organizations may call the service**, you want `serve_org` / `mesh.org(..).call(..)` rather than `serve_rpc` plus a hand-rolled gate — same nRPC transport, but with an offline-issued per-call admission proof and an announcement encrypted to an audience. Read `org.md` before writing that yourself.
+**If only certain organizations may call the service**, you want `serve_org` / `mesh.org(..).call(..)` rather than `serve_rpc` plus a hand-rolled gate — same nRPC transport, but with an offline-issued per-call admission proof and an announcement encrypted to an audience. Read `org.md` before writing that yourself. **And if the provider additionally sits inside a protected subnet** and must be reachable from outside its boundary, that is `serve_subnet_exported` / `org.call_exported` — still nRPC underneath, still org admission, plus a live gateway-authority check on the exported crossing. Read `subnet-auth.md`.
 
 ---
 

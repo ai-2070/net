@@ -168,6 +168,29 @@ impl OrgClient {
         Ok(Buffer::from(reply.to_vec()))
     }
 
+    /// Call a subnet-exported service — bytes in, bytes out
+    /// (SSDK §3.6; the typed `callExported` lives in `org.ts` over this).
+    ///
+    /// Discovers on the PUBLIC plane through the verified ownership
+    /// projection (candidate and owner sampled from one snapshot),
+    /// derives the same-org/granted relation from the VERIFIED owner,
+    /// mints the same canonical proof as `callBytes`, and sends exactly
+    /// once — never a retry. Deliberately `callExported`, not
+    /// `callSubnet`: the caller names no subnet, joins no subnet, and
+    /// receives no subnet context.
+    #[napi]
+    pub async fn call_exported_bytes(&self, service: String, request: Buffer) -> Result<Buffer> {
+        let client = self.inner.load_full().ok_or_else(|| {
+            Error::from_reason("org:credentials:closed: this OrgClient has been closed")
+        })?;
+        let body = bytes::Bytes::from(request.to_vec());
+        let reply = client
+            .call_exported_bytes(&service, body)
+            .await
+            .map_err(org_error)?;
+        Ok(Buffer::from(reply.to_vec()))
+    }
+
     /// The organization this client acts for, as 32 raw bytes.
     #[napi(getter)]
     pub fn acting_org(&self) -> Result<Buffer> {
@@ -315,12 +338,26 @@ const ORG_HANDLER_ERROR: u16 = 0x8001;
 /// The trailing `false` means NOT callee-handled, so a JS throw surfaces as a
 /// `Result::Err` in the callback rather than crashing the process — the
 /// invariant every TSFN site in this crate holds.
-type OrgHandlerTsfn = ThreadsafeFunction<OrgRequest, Promise<Buffer>, OrgRequest, Status, false>;
+///
+/// `pub(crate)`: the subnet-exported serve (`subnet.rs`) bridges the SAME
+/// handler shape through the SAME dispatch, deliberately not a second copy.
+pub(crate) type OrgHandlerTsfn =
+    ThreadsafeFunction<OrgRequest, Promise<Buffer>, OrgRequest, Status, false>;
 
 /// Handle for a served organization service. `close()` unregisters.
 #[napi]
 pub struct OrgServeHandle {
     inner: parking_lot::Mutex<Option<net_sdk::mesh_rpc::ServeHandle>>,
+}
+
+impl OrgServeHandle {
+    /// Wrap a registered serve handle — shared with the subnet-exported
+    /// serve, which returns the same RAII shape.
+    pub(crate) fn from_handle(handle: net_sdk::mesh_rpc::ServeHandle) -> Self {
+        OrgServeHandle {
+            inner: parking_lot::Mutex::new(Some(handle)),
+        }
+    }
 }
 
 #[napi]
@@ -409,7 +446,7 @@ pub fn serve_org(
 /// same shape `org-ffi` uses on the C ABI — keeps the API sync. The bridge task
 /// lives here for the service's lifetime; the TSFN it calls is threadsafe, so
 /// cross-runtime dispatch to the JS thread is sound.
-fn org_serve_runtime() -> &'static tokio::runtime::Runtime {
+pub(crate) fn org_serve_runtime() -> &'static tokio::runtime::Runtime {
     static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
     RT.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
@@ -429,7 +466,7 @@ fn org_serve_runtime() -> &'static tokio::runtime::Runtime {
 /// always async and all latency lives in stage 2). `NonBlocking` is always
 /// used, and a dropped receiver is swallowed (napi-rs escalates an unhandled
 /// one to a fatal process exit).
-async fn dispatch_to_js(
+pub(crate) async fn dispatch_to_js(
     tsfn: Arc<OrgHandlerTsfn>,
     caller: net_sdk::org::OrgCaller,
     body: bytes::Bytes,

@@ -199,6 +199,23 @@ extern void topGoMeshOsOnControlTrampoline(
 extern int topGoMeshOsHealthTrampoline(void* user_ctx);
 extern float topGoMeshOsSaturationTrampoline(void* user_ctx);
 
+// Carry a `runtime/cgo.Handle` through the ABI's opaque `void* user_ctx`.
+//
+// A cgo.Handle is an integer TOKEN, not a pointer: the substrate never
+// dereferences `user_ctx`, it only hands the value back to a trampoline,
+// which converts it straight back to a Handle. Doing the integer->pointer
+// cast on the GO side (`unsafe.Pointer(uintptr(h))`) is invalid under Go's
+// unsafe.Pointer rules — `go vet` flags it as "possible misuse", and under
+// `-d=checkptr`, which `go test -race` enables, it can fault. Casting here
+// is well-defined for a value that is never dereferenced, and it keeps the
+// Go side free of a synthesized pointer the GC would have to ignore.
+//
+// The reverse direction stays in Go: `cgo.Handle(uintptr(userCtx))` is a
+// pointer->integer conversion, which is legal and unflagged.
+static inline void* topGoMeshOsCtxFromHandle(uintptr_t handle) {
+    return (void*)handle;
+}
+
 static inline NetMeshOsDaemonVtable topGoMeshOsBuildVtable(void) {
     NetMeshOsDaemonVtable vt;
     // Cast `process` / `restore` through their typedefs to bridge
@@ -712,7 +729,10 @@ func (s *MeshOsDaemonSdk) RegisterDaemonWithCallbacks(daemon MeshOsDaemon, seed 
 		nameLen = C.size_t(len(nameBytes))
 	}
 	seedPtr := (*C.uint8_t)(unsafe.Pointer(&seed[0]))
-	userCtx := unsafe.Pointer(uintptr(cgoHandle))
+	// The integer->pointer cast happens in C (see
+	// `topGoMeshOsCtxFromHandle`): a cgo.Handle is an opaque token, and
+	// synthesizing an `unsafe.Pointer` from it in Go is invalid.
+	userCtx := C.topGoMeshOsCtxFromHandle(C.uintptr_t(cgoHandle))
 	status := C.net_meshos_register_daemon_with_vtable(
 		s.ptr, namePtr, nameLen, seedPtr, &vt, userCtx, &raw,
 	)

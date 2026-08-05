@@ -99,6 +99,15 @@ extern int net_org_call(
     const uint8_t* req_ptr, size_t req_len,
     uint64_t deadline_ms, uint64_t cancel_token,
     uint8_t** out_resp_ptr, size_t* out_resp_len, char** out_err);
+// The subnet-exported caller verb (SSDK §3.6) — same contract as net_org_call,
+// but discovery runs on the PUBLIC plane through the verified ownership
+// projection. Declared here because it takes the org client handle.
+extern int net_org_call_exported(
+    NetOrgClient* client,
+    const char* service_ptr, size_t service_len,
+    const uint8_t* req_ptr, size_t req_len,
+    uint64_t deadline_ms, uint64_t cancel_token,
+    uint8_t** out_resp_ptr, size_t* out_resp_len, char** out_err);
 extern uint64_t net_org_reserve_cancel_token(NetOrgClient* client);
 extern int      net_org_cancel_call(NetOrgClient* client, uint64_t cancel_token);
 
@@ -575,6 +584,59 @@ func (c *OrgClient) CallBytes(ctx context.Context, service string, req []byte) (
 	return readOrgCallResult(ctx, code, outResp, outRespLen, outErr)
 }
 
+// CallExportedBytes calls a subnet-EXPORTED service with raw bytes. Identical
+// contract to CallBytes — one send, never a retry, ctx deadline and cancel
+// honored — but discovery runs on the PUBLIC plane through the verified
+// ownership projection.
+//
+// Deliberately CallExported, not CallSubnet: this client presents organization
+// authority only. It names no subnet, joins no subnet, and receives no subnet
+// context; the provider's topology stays the provider's business. Failures are
+// the same four org domains (an exported call is an organization call), NOT the
+// local subnet: envelope.
+func (c *OrgClient) CallExportedBytes(ctx context.Context, service string, req []byte) ([]byte, error) {
+	deadlineMs := contextDeadlineMs(ctx)
+	cService := stringToCBytes(service)
+	defer C.free(cService.ptr)
+	cReq, freeReq := bytesToCBytes(req)
+	defer freeReq()
+
+	cancelToken, stopWatcher := installOrgCancelWatcher(ctx, c)
+	defer stopWatcher()
+
+	var outResp *C.uint8_t
+	var outRespLen C.size_t
+	var outErr *C.char
+	var code C.int
+	if err := c.withHandle(func(h *C.NetOrgClient) {
+		code = C.net_org_call_exported(
+			h,
+			(*C.char)(cService.ptr), cService.len,
+			cReq.ptr, cReq.len,
+			C.uint64_t(deadlineMs), C.uint64_t(cancelToken),
+			&outResp, &outRespLen, &outErr,
+		)
+	}); err != nil {
+		return nil, err
+	}
+	return readOrgCallResult(ctx, code, outResp, outRespLen, outErr)
+}
+
+// CallExported calls a subnet-exported service with JSON marshaling. Free
+// function because Go forbids type params on methods (matching OrgCall).
+func CallExported[Req, Resp any](ctx context.Context, c *OrgClient, service string, req Req) (Resp, error) {
+	var zero Resp
+	body, err := jsonEncodeTyped(req)
+	if err != nil {
+		return zero, err
+	}
+	respBody, err := c.CallExportedBytes(ctx, service, body)
+	if err != nil {
+		return zero, err
+	}
+	return jsonDecodeTyped[Resp](respBody)
+}
+
 func readOrgCallResult(
 	ctx context.Context,
 	code C.int,
@@ -769,6 +831,32 @@ func go_net_org_handler_trampoline(
 	*outRespPtr = (*C.uint8_t)(respBuf)
 	*outRespLen = C.size_t(len(resp))
 	return 0
+}
+
+// The registry accessors below exist so subnet.go shares this ONE handler
+// registry and dispatcher rather than standing up a second callback framework
+// (SSDK §6.3). They are the same reserve → store → serve ordering ServeOrgBytes
+// uses; the subnet serve path differs only in which C entry point it calls.
+
+// reserveOrgHandlerID reserves a fresh handler id from the shared counter.
+func reserveOrgHandlerID() uint64 { return uint64(C.net_org_reserve_handler_id()) }
+
+// storeOrgHandler registers a callable under a reserved id. Store BEFORE
+// serving — pre-registration closes the request-arrives-before-store race.
+func storeOrgHandler(id uint64, h OrgHandler) { orgHandlerRegistry.Store(id, h) }
+
+// deleteOrgHandler removes a callable after a failed registration.
+func deleteOrgHandler(id uint64) { orgHandlerRegistry.Delete(id) }
+
+// newOrgServeHandleFromPtr wraps a serve handle minted by another cgo file.
+// Each cgo file is its own translation unit, so subnet.go's opaque handle type
+// is a different Go type; the pointer crosses as unsafe.Pointer (the same
+// convention mesh_arc uses) and is re-typed here, where the C namespace that
+// owns NetOrgServeHandle lives.
+func newOrgServeHandleFromPtr(p unsafe.Pointer, handlerID uint64) *OrgServeHandle {
+	sh := &OrgServeHandle{handle: (*C.NetOrgServeHandle)(p), handlerID: handlerID}
+	runtime.SetFinalizer(sh, (*OrgServeHandle).finalize)
+	return sh
 }
 
 func safeCallOrgHandler(h OrgHandler, caller OrgCaller, req []byte) (resp []byte, err error) {

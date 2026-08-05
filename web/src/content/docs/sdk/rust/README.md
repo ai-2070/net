@@ -32,5 +32,25 @@ The crate imports as `net_sdk`.
 6. [Artifacts](/docs/sdk/rust/artifacts)
 7. [Errors](/docs/sdk/rust/errors)
 
+## Protected services
+
+Two authority surfaces sit on top of the mesh, both marshaling-free in Rust:
+
+- **Organization auth** ([concepts](/docs/concepts/organizations)) —
+  `mesh.serve_org(service, OrgAccess::…, handler)` on the provider,
+  `mesh.org(credentials)?.call(service, &req)` on the caller. The service is
+  invisible outside its audience, not merely refused.
+- **Subnet authority** ([concepts](/docs/concepts/subnets)) — a provider inside
+  a protected subnet exports one service against a *named export* configured on
+  the builder (`.subnet_export(..)`):
+  `mesh.serve_subnet_exported(service, export_name, handler)`. The caller stays
+  an ordinary org client and uses `org.call_exported(service, &req)` — it never
+  joins the provider's subnet. Runtime gateway administration lives under
+  `net_sdk::subnet::admin`.
+
+Every signed artifact for either surface is minted offline by
+[`net-mesh org` / `net-mesh subnet`](/docs/reference/cli); nothing in the SDK
+signs.
+
 Runnable examples live under `sdk/examples/`. Use [Concepts](/docs/concepts) for
 the model and this section for Rust call shapes and lifecycle.

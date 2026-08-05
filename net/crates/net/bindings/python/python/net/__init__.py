@@ -983,5 +983,30 @@ else:
         ]
     )
 
+# Subnet authority (SSDK S4b, the `org` feature): the native provider verb,
+# admin functions, and `SubnetProvisionError`, plus the pure-Python typed /
+# vocabulary layer in `net.subnet`.
+try:
+    from ._net import (
+        SubnetProvisionError,
+        apply_subnet_control_fact,
+        declare_subnet_boundaries,
+        install_subnet_gateway_credentials,
+        serve_subnet_exported,
+    )
+except ImportError:
+    # `org` feature not compiled in; the symbols stay undefined.
+    pass
+else:
+    __all__.extend(
+        [
+            "SubnetProvisionError",
+            "apply_subnet_control_fact",
+            "declare_subnet_boundaries",
+            "install_subnet_gateway_credentials",
+            "serve_subnet_exported",
+        ]
+    )
+
 
 __version__ = "0.34.0"

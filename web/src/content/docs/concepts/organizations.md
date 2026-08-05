@@ -57,6 +57,12 @@ Certificates carry a revocation *generation*. To revoke, the organization signs 
 
 The practical consequence is that v1 renewal is re-issue plus a raised floor, rather than extension in place. Grants are correspondingly short-lived: seven days by default, thirty at the absolute ceiling, rejected both at issue time and at every verifier. Long-lived org credentials are not a configuration you can opt into.
 
+## Exported services ride organization authority
+
+When a provider sits inside a protected [subnet](/docs/concepts/subnets) and one of its services must be reachable from outside that boundary, the caller's side of the story does not change. The same org client that makes ordinary protected calls makes exported ones — `call_exported` instead of `call` — with the same credentials, the same per-call proof, and the same four error domains. Discovery runs on the public plane through a verified ownership projection, because the provider's encrypted announcement planes stop at its boundary.
+
+The name is deliberate. It is `call_exported`, not `call_subnet`: the caller never joins the provider's subnet, never names one, and receives no subnet context. Which crossings a provider may export is that provider's business, proved against its own subnet authority on every dispatch; *who is calling* remains the organization's business, proved exactly as above. The two authorities compose without either leaking into the other's vocabulary.
+
 ## What you actually do with this
 
 Issuance is an offline ceremony against the org root key, run through [`net-mesh org`](/docs/reference/cli). Nothing in the SDK issues credentials, and the org key never needs to be on a node.

@@ -447,6 +447,30 @@ fn parse_axis_body(axis: TaxonomyAxis, body: &str) -> Tag {
     }
 }
 
+impl Tag {
+    /// The canonical wire string, BORROWED when the tag already stores
+    /// it whole.
+    ///
+    /// Byte-identical to [`fmt::Display`] for every variant — the two
+    /// are pinned against each other by `as_wire_matches_display`.
+    ///
+    /// `Tag::Legacy` holds its wire form verbatim, so rendering it
+    /// through `to_string()` is a pure copy. That matters on the
+    /// announcement-ingest path: `SubnetPolicy::assign` runs for every
+    /// signature-verified direct announcement (gossip rate × mesh
+    /// size), and operator subnet rules key on `region:` / `fleet:`
+    /// shapes, which parse to exactly that variant
+    /// (PERF_AUDIT_2026_08_04_SUBNET_PATHS §2). The variants whose wire
+    /// form is split across fields still render — there is nothing
+    /// contiguous to borrow.
+    pub fn as_wire(&self) -> std::borrow::Cow<'_, str> {
+        match self {
+            Self::Legacy(s) => std::borrow::Cow::Borrowed(s.as_str()),
+            other => std::borrow::Cow::Owned(other.to_string()),
+        }
+    }
+}
+
 impl fmt::Display for Tag {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -731,5 +755,65 @@ mod tests {
         // variant, which the fold-side synthesis path relies on.
         let expected: &[&str] = &["causal:", "dataforts:", "fork-of:", "heat:", "scope:"];
         assert_eq!(RESERVED_PREFIXES, expected);
+    }
+
+    /// `as_wire` is byte-identical to `Display` for EVERY variant
+    /// (PERF_AUDIT_2026_08_04_SUBNET_PATHS §2).
+    ///
+    /// `as_wire` exists to skip a copy on the borrowable variant, and
+    /// `SubnetPolicy::assign` matches operator rule prefixes against
+    /// whatever it returns. If the two ever disagreed, a node would
+    /// assign itself a different subnet depending on which renderer its
+    /// code path happened to use — so the borrowed fast path is only
+    /// sound while this holds.
+    #[test]
+    fn as_wire_matches_display_for_every_variant() {
+        let variants = [
+            Tag::AxisPresent {
+                axis: TaxonomyAxis::Hardware,
+                key: "gpu".to_string(),
+            },
+            Tag::AxisValue {
+                axis: TaxonomyAxis::Hardware,
+                key: "gpu.vram_gb".to_string(),
+                value: "80".to_string(),
+                separator: AxisSeparator::Eq,
+            },
+            Tag::AxisValue {
+                axis: TaxonomyAxis::Dataforts,
+                key: "has_chain".to_string(),
+                value: "deadbeef".to_string(),
+                separator: AxisSeparator::Colon,
+            },
+            Tag::Reserved {
+                prefix: "scope:".to_string(),
+                body: "tenant:oem-123".to_string(),
+            },
+            Tag::Legacy("region:us".to_string()),
+        ];
+
+        // Wildcard-free destructuring: a NEW variant fails to compile
+        // here until it is added to `variants` above, so this can never
+        // silently stop covering the enum.
+        for tag in &variants {
+            match tag {
+                Tag::AxisPresent { .. }
+                | Tag::AxisValue { .. }
+                | Tag::Reserved { .. }
+                | Tag::Legacy(_) => {}
+            }
+            assert_eq!(
+                tag.as_wire().as_ref(),
+                tag.to_string(),
+                "as_wire diverged from Display for {tag:?}",
+            );
+        }
+
+        // The one that must BORROW — the variant the ingest fast path
+        // depends on. A `Cow::Owned` here is the regression.
+        assert!(matches!(
+            Tag::Legacy("region:us".to_string()).as_wire(),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 }

@@ -55,12 +55,19 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 use tokio::runtime::Runtime;
 
+use net::adapter::net::identity::EntityId;
 use net::adapter::net::mesh_rpc::{ServeError, ServeHandle};
 use net::adapter::net::MeshNode;
 use net_sdk::org::{
     install_org_authority_node, install_provider_grant_audience_node, OrgAccess, OrgCaller,
     OrgClient, OrgCredentials, OrgErrorDomain, OrgHandlerError, OrgSdkError,
 };
+// SSDK S4c — the subnet AUTHORITY surface rides libnet_org (it already
+// depends on net-sdk; the base libnet FFI lives inside the `net` crate
+// and cannot, so a separate `libnet_subnet` would be the only
+// alternative — the "concrete link analysis" the plan invites resolves
+// to this existing home, no new cdylib).
+use net_sdk::subnet::{admin as subnet_admin, TopologySubnetId};
 
 // =========================================================================
 // FFI guard — wraps every entry point in `catch_unwind`
@@ -134,6 +141,11 @@ pub const NET_ORG_ERR_SERVE: c_int = -11;
 /// provider grant audience. NOT a call-domain result: a node either starts
 /// correctly or it does not.
 pub const NET_ORG_ERR_PROVISION: c_int = -12;
+/// SSDK S4c — a subnet provisioning / configuration / serve-registration
+/// failure. Its own code so a Go `errors.Is` distinguishes it from an org
+/// provisioning failure; the stable `subnet:<kind>` envelope is written to
+/// `out_err` for classification (`net.subnet`). NOT a call domain.
+pub const NET_ORG_ERR_SUBNET: c_int = -13;
 
 /// Map a canonical `OrgSdkError` domain onto its coarse `c_int` code. The full
 /// `org:<domain>:<kind>` string still crosses via `out_err`; this exists so a
@@ -810,6 +822,60 @@ pub extern "C" fn net_org_call(
     })
 }
 
+/// Call a subnet-EXPORTED service (SSDK §3.6). Same signature and contract as
+/// [`net_org_call`] — bytes in, bytes out, one send, never a retry — but
+/// discovery runs on the PUBLIC plane through the verified ownership
+/// projection. The caller presents organization authority only; it names no
+/// subnet, joins no subnet, and receives no subnet context. Belongs on the org
+/// client handle deliberately: this is an organization call to a publicly
+/// discoverable service.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_org_call_exported(
+    client: *mut NetOrgClient,
+    service_ptr: *const c_char,
+    service_len: usize,
+    req_ptr: *const u8,
+    req_len: usize,
+    deadline_ms: u64,
+    cancel_token: u64,
+    out_resp_ptr: *mut *mut u8,
+    out_resp_len: *mut usize,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    ffi_guard!(NET_ORG_ERR_NULL, {
+        let Some(h) = (unsafe { client.as_ref() }) else {
+            return NET_ORG_ERR_NULL;
+        };
+        let Some(service) = cstr_to_string(service_ptr, service_len) else {
+            write_err(out_err, "service name is NULL or non-UTF-8".into());
+            return NET_ORG_ERR_INVALID_UTF8;
+        };
+        let Some(req) = (unsafe { copy_body(req_ptr, req_len) }) else {
+            write_err(out_err, "request body length exceeds isize::MAX".into());
+            return NET_ORG_ERR_NULL;
+        };
+
+        let result = block_on(async {
+            h.inner
+                .call_exported_bytes_deadline(&service, req, deadline_ms, cancel_token)
+                .await
+        });
+
+        match result {
+            Ok(body) => {
+                write_response(body.to_vec(), out_resp_ptr, out_resp_len);
+                NET_ORG_OK
+            }
+            Err(e) => {
+                let code = org_error_code(&e);
+                write_err(out_err, e.to_wire());
+                code
+            }
+        }
+    })
+}
+
 /// Reserve a cancel token scoped to this client's node, for a subsequent
 /// cancellable [`net_org_call`]. Reserve BEFORE the call so a cancel that races
 /// registration is still delivered. Returns `0` if `client` is NULL.
@@ -876,12 +942,18 @@ pub extern "C" fn net_org_serve(
     out_err: *mut *mut c_char,
 ) -> c_int {
     ffi_guard!(NET_ORG_ERR_NULL, {
-        if mesh_arc.is_null() || out_handle.is_null() {
+        if mesh_arc.is_null() {
             return NET_ORG_ERR_NULL;
         }
         // Own the mesh arc immediately (Go does not free it) so the validation
-        // early-returns below drop the node rather than leaking it.
+        // early-returns below drop the node rather than leaking it. The
+        // `out_handle` check moved BELOW this line for the same reason
+        // (review-10 P1-4) — it used to share the guard above.
         let node: Arc<MeshNode> = unsafe { *Box::from_raw(mesh_arc) };
+        if out_handle.is_null() {
+            write_err(out_err, "out_handle must be non-NULL".into());
+            return NET_ORG_ERR_NULL;
+        }
         let Some(service) = cstr_to_string(service_ptr, service_len) else {
             write_err(out_err, "service name is NULL or non-UTF-8".into());
             return NET_ORG_ERR_INVALID_UTF8;
@@ -1075,6 +1147,369 @@ pub extern "C" fn net_org_install_provider_grant_audience(
     })
 }
 
+// =========================================================================
+// SSDK S4c — the subnet AUTHORITY surface (SUBNET_AUTH_SDK_PLAN.md §6.4).
+//
+// Hosted here rather than in the base libnet FFI because the base FFI
+// lives inside the `net` crate and cannot depend on `net-mesh-sdk`
+// (circular); org-ffi already carries that dependency. No new cdylib —
+// the plan's "existing home" with base-libnet placement defeated by the
+// link analysis it invites.
+// =========================================================================
+
+/// `#[repr(C)]` mirror of `net_subnet_path_t`: a compact hierarchy path.
+/// `depth` is `0..=4`; `levels[depth..]` MUST be zero (the canonical
+/// form). `depth == 0` is the authority-root (global) path.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NetSubnetPath {
+    /// Active level count, `0..=4`.
+    pub depth: u8,
+    /// Path labels; inactive tail must be zero.
+    pub levels: [u8; 4],
+}
+
+impl NetSubnetPath {
+    /// Convert to the core compact id, rejecting a non-canonical form:
+    /// `depth > 4` or a non-zero inactive tail. Returns `None` on either,
+    /// which the caller maps to `subnet:invalid_path_level` /
+    /// `subnet:path_too_deep`.
+    fn to_core(self) -> Option<TopologySubnetId> {
+        if self.depth > 4 {
+            return None;
+        }
+        // Inactive levels must be zero — a caller-supplied garbage tail
+        // must never silently become part of the path.
+        if self.levels[self.depth as usize..].iter().any(|&b| b != 0) {
+            return None;
+        }
+        Some(TopologySubnetId::new(&self.levels[..self.depth as usize]))
+    }
+}
+
+/// `SubnetExportAccess::SameOrg`.
+pub const NET_SUBNET_ACCESS_SAME_ORG: c_int = 0;
+/// `SubnetExportAccess::Granted`.
+pub const NET_SUBNET_ACCESS_GRANTED: c_int = 1;
+
+/// The maximum element count `std::slice::from_raw_parts` accepts for
+/// `T`: its documented precondition is that the slice's TOTAL byte
+/// length not exceed `isize::MAX`, so the element bound scales with
+/// `size_of::<T>()`.
+///
+/// A C caller supplies these counts, and `(size_t)-1` is one typo away.
+/// Exceeding the bound is immediate undefined behavior at the
+/// `from_raw_parts` call — it happens BEFORE any code that could
+/// observe a bad value, so `catch_unwind` cannot help and neither can a
+/// later per-element check. Every array count crossing this ABI is
+/// therefore bounded before its slice is constructed
+/// (`net_org_credentials_new` set the precedent; review-10 P1-3 extends
+/// it to the subnet entry points).
+const fn max_slice_elems<T>() -> usize {
+    isize::MAX as usize / std::mem::size_of::<T>()
+}
+
+/// Copy a slice of `(ptr,len)` byte artifacts into owned buffers. `None`
+/// if the outer array is null with a non-zero count, either array count
+/// exceeds the `from_raw_parts` bound, or any element is null /
+/// oversized.
+unsafe fn copy_credential_sets(
+    ptrs: *const *const u8,
+    lens: *const usize,
+    count: usize,
+) -> Option<Vec<Vec<u8>>> {
+    if count == 0 {
+        return Some(Vec::new());
+    }
+    if ptrs.is_null() || lens.is_null() {
+        return None;
+    }
+    // Bounded INDEPENDENTLY for the pointer array and the length array:
+    // they hold different element types, so one bound does not imply the
+    // other. Checked before either slice exists.
+    if count > max_slice_elems::<*const u8>() || count > max_slice_elems::<usize>() {
+        return None;
+    }
+    let ptr_slice = unsafe { std::slice::from_raw_parts(ptrs, count) };
+    let len_slice = unsafe { std::slice::from_raw_parts(lens, count) };
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        out.push(unsafe { copy_bytes_required(ptr_slice[i], len_slice[i]) }?);
+    }
+    Some(out)
+}
+
+/// Install this node's own gateway credential sets — WHOLESALE REPLACE
+/// (SSDK §3.4). `mesh_arc` is **consumed** (a fresh clone per call; Go
+/// must NOT free it). Every artifact decodes BEFORE anything installs, so
+/// one malformed set refuses the whole batch with no node-state mutation.
+/// A failure returns `NET_ORG_ERR_SUBNET` with the `subnet:<kind>` wire on
+/// `out_err`.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_subnet_install_gateway_credentials(
+    mesh_arc: *mut Arc<MeshNode>,
+    set_ptrs: *const *const u8,
+    set_lens: *const usize,
+    set_count: usize,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    ffi_guard!(NET_ORG_ERR_NULL, {
+        if mesh_arc.is_null() {
+            return NET_ORG_ERR_NULL;
+        }
+        let node: Arc<MeshNode> = unsafe { *Box::from_raw(mesh_arc) };
+        let Some(sets) = (unsafe { copy_credential_sets(set_ptrs, set_lens, set_count) }) else {
+            write_err(out_err, "credential set array is NULL or oversized".into());
+            return NET_ORG_ERR_NULL;
+        };
+        match subnet_admin::install_gateway_credentials_node(&node, &sets) {
+            Ok(()) => NET_ORG_OK,
+            Err(e) => {
+                write_err(out_err, e.to_string());
+                NET_ORG_ERR_SUBNET
+            }
+        }
+    })
+}
+
+/// Declare this node's protected boundary inventory — also WHOLESALE.
+/// `mesh_arc` is **consumed**. `authority` is a 32-byte entity id;
+/// `boundaries` is `boundary_count` `net_subnet_path_t` values. A
+/// non-canonical path or bad pointer returns `NET_ORG_ERR_SUBNET`.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_subnet_declare_boundaries(
+    mesh_arc: *mut Arc<MeshNode>,
+    authority: *const u8,
+    topology_epoch: u32,
+    boundaries: *const NetSubnetPath,
+    boundary_count: usize,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    ffi_guard!(NET_ORG_ERR_NULL, {
+        if mesh_arc.is_null() {
+            return NET_ORG_ERR_NULL;
+        }
+        // Own the mesh arc IMMEDIATELY, before every other check (review-10
+        // P1-4). The header documents this clone as consumed on all paths,
+        // so a C caller does not reclaim it; a validation early-return that
+        // skipped the `Box::from_raw` stranded one Arc reference per
+        // malformed call and could keep a node alive past shutdown.
+        let node: Arc<MeshNode> = unsafe { *Box::from_raw(mesh_arc) };
+        if authority.is_null() {
+            write_err(out_err, "subnet:invalid_format: authority is NULL".into());
+            return NET_ORG_ERR_NULL;
+        }
+        let authority = EntityId::from_bytes(unsafe {
+            let mut a = [0u8; 32];
+            std::ptr::copy_nonoverlapping(authority, a.as_mut_ptr(), 32);
+            a
+        });
+        // Bound the count BEFORE the slice exists (review-10 P1-3).
+        if boundary_count > max_slice_elems::<NetSubnetPath>() {
+            write_err(
+                out_err,
+                "subnet:invalid_format: boundary count exceeds the maximum slice length".into(),
+            );
+            return NET_ORG_ERR_SUBNET;
+        }
+        let mut paths = Vec::with_capacity(boundary_count);
+        if boundary_count > 0 {
+            if boundaries.is_null() {
+                write_err(
+                    out_err,
+                    "subnet:invalid_format: boundaries array is NULL".into(),
+                );
+                return NET_ORG_ERR_SUBNET;
+            }
+            let slice = unsafe { std::slice::from_raw_parts(boundaries, boundary_count) };
+            for p in slice {
+                let Some(core) = p.to_core() else {
+                    write_err(
+                        out_err,
+                        "subnet:path_too_deep: non-canonical boundary path".into(),
+                    );
+                    return NET_ORG_ERR_SUBNET;
+                };
+                paths.push(core);
+            }
+        }
+        match subnet_admin::declare_boundaries_node(&node, authority, topology_epoch, paths) {
+            Ok(()) => NET_ORG_OK,
+            Err(e) => {
+                write_err(out_err, e.to_string());
+                NET_ORG_ERR_SUBNET
+            }
+        }
+    })
+}
+
+/// Apply one signed control fact from its outer wire frame — the ONE door
+/// (SSDK §3.4). `mesh_arc` is **consumed**. On success writes the outcome
+/// kind to `out_kind` (a malloc'd CString, free with `net_org_free_cstring`)
+/// and `applied` to `out_applied`. `applied == false` is an authenticated
+/// stale/idempotent outcome, not a failure.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_subnet_apply_control_fact(
+    mesh_arc: *mut Arc<MeshNode>,
+    fact_ptr: *const u8,
+    fact_len: usize,
+    out_kind: *mut *mut c_char,
+    out_applied: *mut bool,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    ffi_guard!(NET_ORG_ERR_NULL, {
+        if mesh_arc.is_null() {
+            return NET_ORG_ERR_NULL;
+        }
+        // Consume-on-all-paths (review-10 P1-4): own the clone first, then
+        // validate — the out-params below are checked AFTER this line so
+        // their refusals still drop the node.
+        let node: Arc<MeshNode> = unsafe { *Box::from_raw(mesh_arc) };
+        if out_kind.is_null() || out_applied.is_null() {
+            write_err(
+                out_err,
+                "subnet:invalid_format: out_kind and out_applied must be non-NULL".into(),
+            );
+            return NET_ORG_ERR_NULL;
+        }
+        let Some(fact) = (unsafe { copy_bytes_required(fact_ptr, fact_len) }) else {
+            write_err(out_err, "fact bytes are NULL or oversized".into());
+            return NET_ORG_ERR_NULL;
+        };
+        match subnet_admin::apply_control_fact_node(&node, &fact) {
+            Ok(outcome) => {
+                let dto = net_sdk::subnet::dto::SubnetControlOutcomeDto::from(outcome);
+                if let Ok(k) = CString::new(dto.kind) {
+                    unsafe {
+                        *out_kind = k.into_raw();
+                        *out_applied = dto.applied;
+                    }
+                    NET_ORG_OK
+                } else {
+                    write_err(out_err, "outcome kind contained an interior NUL".into());
+                    NET_ORG_ERR_SUBNET
+                }
+            }
+            Err(e) => {
+                write_err(out_err, e.to_string());
+                NET_ORG_ERR_SUBNET
+            }
+        }
+    })
+}
+
+/// Serve a subnet-EXPORTED, organization-protected service against a
+/// NAMED export (SSDK §3.5).
+///
+/// The export NAME is resolved by Rust-owned provider state — the
+/// checked map the node was constructed with (`subnet_exports` in
+/// `net_mesh_new`'s JSON). C application code therefore names a service
+/// and a locally configured export and constructs NO authority objects:
+/// no `SubnetRef`, no topology epoch, no access mode. That is the same
+/// boundary every other language has (review-10 P1-6).
+///
+/// Before this, the concrete binding crossed the ABI directly and Rust
+/// invented a fixed internal name for it, which put authority-object
+/// construction in ordinary C application code and moved name resolution
+/// out of Rust at the one boundary with no wrapper to hold a map.
+///
+/// An unknown name fails HERE, before any registration or announcement,
+/// with `subnet:unknown_export_name` on `out_err`.
+///
+/// `mesh_arc` is **consumed** on every path. `handler_id` MUST already be
+/// reserved via [`net_org_reserve_handler_id`] and stored in the caller's
+/// registry. Announcement visibility is always public; the external
+/// caller never joins this node's subnet. Requires an installed node
+/// authority.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_subnet_serve_exported(
+    mesh_arc: *mut Arc<MeshNode>,
+    service_ptr: *const c_char,
+    service_len: usize,
+    export_name_ptr: *const c_char,
+    export_name_len: usize,
+    handler_id: u64,
+    out_handle: *mut *mut NetOrgServeHandle,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    ffi_guard!(NET_ORG_ERR_NULL, {
+        if mesh_arc.is_null() {
+            return NET_ORG_ERR_NULL;
+        }
+        // Consume-on-all-paths (review-10 P1-4).
+        let node: Arc<MeshNode> = unsafe { *Box::from_raw(mesh_arc) };
+        if out_handle.is_null() {
+            write_err(
+                out_err,
+                "subnet:invalid_format: out_handle must be non-NULL".into(),
+            );
+            return NET_ORG_ERR_NULL;
+        }
+        let Some(service) = cstr_to_string(service_ptr, service_len) else {
+            write_err(out_err, "service name is NULL or non-UTF-8".into());
+            return NET_ORG_ERR_INVALID_UTF8;
+        };
+        let Some(export_name) = cstr_to_string(export_name_ptr, export_name_len) else {
+            write_err(out_err, "export name is NULL or non-UTF-8".into());
+            return NET_ORG_ERR_INVALID_UTF8;
+        };
+        if ORG_DISPATCHER.get().is_none() {
+            write_err(
+                out_err,
+                "net_org_set_handler_dispatcher must be called before net_subnet_serve_exported"
+                    .into(),
+            );
+            return NET_ORG_ERR_NO_DISPATCHER;
+        }
+        if handler_id == 0 {
+            write_err(out_err, "handler_id must be non-zero".into());
+            return NET_ORG_ERR_NULL;
+        }
+
+        let timeout = DEFAULT_ORG_HANDLER_TIMEOUT;
+        let handler = move |caller: OrgCaller, body: Bytes| {
+            let caller_c = NetOrgCaller::from(&caller);
+            async move { org_dispatch(handler_id, caller_c, body, timeout).await }
+        };
+
+        // The node's OWN checked map — not one synthesized here from
+        // caller-supplied values.
+        let exports = node.subnet_exports().clone();
+
+        // Same ambient-runtime rationale as `net_org_serve`.
+        let _rt_guard = runtime().enter();
+        match net_sdk::subnet::serve_subnet_exported_bytes_node(
+            node,
+            &exports,
+            &service,
+            &export_name,
+            handler,
+        ) {
+            Ok(inner) => {
+                unsafe {
+                    *out_handle = Box::into_raw(Box::new(NetOrgServeHandle {
+                        inner: Arc::new(Mutex::new(Some(inner))),
+                        handler_id,
+                    }));
+                }
+                NET_ORG_OK
+            }
+            Err(e) => {
+                let code = match e {
+                    ServeError::AlreadyServing(_) => NET_ORG_ERR_ALREADY_SERVING,
+                    _ => NET_ORG_ERR_SUBNET,
+                };
+                write_err(out_err, format!("subnet-exported serve failed: {e}"));
+                code
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1101,6 +1536,77 @@ mod tests {
         assert_eq!(net_org_abi_version(), 0x0001);
         assert_eq!(net_org_check_abi_version(0x0001), NET_ORG_OK);
         assert_eq!(net_org_check_abi_version(0x0002), NET_ORG_ERR_NULL);
+    }
+
+    /// `net_subnet_path_t` layout is part of the ABI: a reorder or retype
+    /// shifts these and the C header reads a garbage path.
+    ///
+    /// `net_subnet_ref_t` is deliberately GONE (review-10 P1-6) — no entry
+    /// point takes an authority-qualified crossing from C any more, because
+    /// ordinary C application code names a configured export instead of
+    /// constructing one.
+    #[test]
+    fn net_subnet_path_layout_is_pinned() {
+        use std::mem::{align_of, offset_of, size_of};
+        assert_eq!(
+            size_of::<NetSubnetPath>(),
+            5,
+            "1 depth + 4 levels, no padding"
+        );
+        assert_eq!(align_of::<NetSubnetPath>(), 1);
+        assert_eq!(offset_of!(NetSubnetPath, depth), 0);
+        assert_eq!(offset_of!(NetSubnetPath, levels), 1);
+    }
+
+    /// The path canonicalizer accepts exactly the well-formed shapes and
+    /// rejects `depth > 4` and a non-zero inactive tail — the two ways a C
+    /// caller can smuggle garbage into a path.
+    #[test]
+    fn subnet_path_canonicalization_is_strict() {
+        // Global (depth 0) and a full 4-level path round-trip.
+        assert!(NetSubnetPath {
+            depth: 0,
+            levels: [0, 0, 0, 0]
+        }
+        .to_core()
+        .is_some());
+        assert!(NetSubnetPath {
+            depth: 4,
+            levels: [3, 9, 1, 4]
+        }
+        .to_core()
+        .is_some());
+        // depth == active levels; the inactive tail is ignored ONLY when zero.
+        assert!(NetSubnetPath {
+            depth: 2,
+            levels: [3, 9, 0, 0]
+        }
+        .to_core()
+        .is_some());
+        // depth > 4 is impossible in the 4-slot array.
+        assert!(NetSubnetPath {
+            depth: 5,
+            levels: [1, 2, 3, 4]
+        }
+        .to_core()
+        .is_none());
+        // A non-zero inactive tail is refused, not silently truncated.
+        assert!(NetSubnetPath {
+            depth: 2,
+            levels: [3, 9, 7, 0]
+        }
+        .to_core()
+        .is_none());
+    }
+
+    /// The subnet error code is distinct from the org provisioning code, so a
+    /// Go `errors.Is` can tell subnet config/provisioning apart from org.
+    #[test]
+    fn subnet_error_code_is_distinct() {
+        assert_eq!(NET_ORG_ERR_SUBNET, -13);
+        assert_ne!(NET_ORG_ERR_SUBNET, NET_ORG_ERR_PROVISION);
+        assert_eq!(NET_SUBNET_ACCESS_SAME_ORG, 0);
+        assert_eq!(NET_SUBNET_ACCESS_GRANTED, 1);
     }
 
     /// Malformed credential bytes are refused through the real entrypoint, and
@@ -1182,6 +1688,178 @@ mod tests {
         assert_eq!(distinct.len(), 4, "call-domain codes must be distinct");
     }
 
+    fn parse_c_value(tok: &str) -> Option<i64> {
+        if let Some(hex) = tok.strip_prefix("0x").or_else(|| tok.strip_prefix("0X")) {
+            i64::from_str_radix(hex, 16).ok()
+        } else {
+            tok.parse::<i64>().ok()
+        }
+    }
+
+    /// Collect `#define <prefix><NAME> <value>` pairs out of a header,
+    /// keyed by the FULL macro name.
+    fn header_defines(header: &str, prefix: &str) -> std::collections::HashMap<String, i64> {
+        let mut defines = std::collections::HashMap::new();
+        for line in header.lines() {
+            let line = line.trim();
+            let Some(rest) = line
+                .strip_prefix("#define ")
+                .and_then(|r| r.strip_prefix(prefix))
+            else {
+                continue;
+            };
+            let mut toks = rest.split_whitespace();
+            let (Some(name), Some(val)) = (toks.next(), toks.next()) else {
+                continue;
+            };
+            if let Some(v) = parse_c_value(val) {
+                defines.insert(format!("{prefix}{name}"), v);
+            }
+        }
+        defines
+    }
+
+    fn assert_defines_match(
+        header_name: &str,
+        defines: &std::collections::HashMap<String, i64>,
+        want: &[(&str, i64)],
+    ) {
+        for (name, val) in want {
+            let got = defines
+                .get(*name)
+                .unwrap_or_else(|| panic!("{header_name} is missing #define {name}"));
+            assert_eq!(
+                got, val,
+                "drift between {header_name} and Rust on {name}: header {got}, rust {val}",
+            );
+        }
+    }
+
+    /// `include/net_subnet.h`'s numeric contract must match the Rust
+    /// `pub const`s (review-10 P3-4).
+    ///
+    /// `NET_SUBNET_ACCESS_SAME_ORG` / `_GRANTED` exist in THREE places —
+    /// here in Rust, in `net_subnet.h`, and again in `go/subnet.go`'s cgo
+    /// preamble — and none of them was guarded: the org mirror below
+    /// reads `net_org.h` and matches `NET_ORG_*` only, so a
+    /// `NET_SUBNET_*` value could be changed on one side and silently
+    /// mean something else on the other. Go's preamble comment claimed
+    /// the mirror covered it; now it does.
+    #[test]
+    fn subnet_header_numeric_contract_matches_rust() {
+        let header = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../include/net_subnet.h"
+        ))
+        .expect("read include/net_subnet.h");
+        let defines = header_defines(&header, "NET_SUBNET_");
+
+        assert_defines_match(
+            "include/net_subnet.h",
+            &defines,
+            &[
+                (
+                    "NET_SUBNET_ACCESS_SAME_ORG",
+                    NET_SUBNET_ACCESS_SAME_ORG as i64,
+                ),
+                (
+                    "NET_SUBNET_ACCESS_GRANTED",
+                    NET_SUBNET_ACCESS_GRANTED as i64,
+                ),
+            ],
+        );
+
+        // The guard must actually have found something — an empty map
+        // would make every assertion above vacuous if the `#define`
+        // spelling ever changed.
+        assert!(
+            defines.len() >= 2,
+            "expected at least the two NET_SUBNET_ACCESS_* defines, found {:?}",
+            defines.keys().collect::<Vec<_>>(),
+        );
+    }
+
+    /// The C/FFI consumer of the shared stable-kind fixture
+    /// (review-10 P3-2).
+    ///
+    /// The plan says Node, Python, Go, AND C consume
+    /// `tests/cross_lang_subnet/stable_kinds.json`, and
+    /// `go/subnet_golden_vectors_test.go` asserts as much — but nothing
+    /// on the C side read it, so the claim was three-for-four. This is
+    /// the missing consumer: every pinned kind must survive the round
+    /// trip through the exact scanner a C caller reaches, and the C
+    /// header's access spellings must match the fixture's.
+    ///
+    /// A renamed kind now fails here too, before any cdylib consumer
+    /// notices at runtime.
+    #[test]
+    fn c_surface_consumes_the_shared_stable_kind_fixture() {
+        let body = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../tests/cross_lang_subnet/stable_kinds.json"
+        ))
+        .expect("read tests/cross_lang_subnet/stable_kinds.json");
+        let fixture: serde_json::Value = serde_json::from_str(&body).expect("fixture parses");
+
+        assert_eq!(
+            fixture["prefix"], "subnet:",
+            "the envelope prefix is pinned"
+        );
+
+        let strings = |key: &str| -> Vec<String> {
+            fixture[key]
+                .as_array()
+                .unwrap_or_else(|| panic!("fixture field {key} is an array"))
+                .iter()
+                .map(|v| v.as_str().expect("string entry").to_string())
+                .collect()
+        };
+
+        let kinds: Vec<String> = strings("auth_kinds")
+            .into_iter()
+            .chain(strings("local_kinds"))
+            .collect();
+        assert!(!kinds.is_empty(), "the fixture must pin at least one kind");
+
+        for kind in &kinds {
+            // The bare envelope, as construction and admin failures emit.
+            let bare = format!("subnet:{kind}");
+            assert_eq!(
+                scan_subnet_kind_for_test(&bare).as_deref(),
+                Some(kind.as_str()),
+                "the C-surface scanner lost the kind in {bare:?}",
+            );
+            // The WRAPPED envelope, as a serve-registration failure
+            // crosses `out_err` — the shape a C consumer actually has to
+            // parse, and the one a bare-prefix parser missed.
+            let wrapped = format!("subnet-exported serve failed: subnet:{kind}: detail here");
+            assert_eq!(
+                scan_subnet_kind_for_test(&wrapped).as_deref(),
+                Some(kind.as_str()),
+                "the C-surface scanner lost the kind in {wrapped:?}",
+            );
+        }
+
+        // The access spellings the C ABI's constants stand for.
+        assert_eq!(strings("access"), ["sameOrg", "granted"]);
+        assert_eq!(NET_SUBNET_ACCESS_SAME_ORG, 0);
+        assert_eq!(NET_SUBNET_ACCESS_GRANTED, 1);
+    }
+
+    /// The scan a C consumer performs over an `out_err` wire, mirroring
+    /// Go's `ParseSubnetKind`, Node's `parseSubnetKind`, and Python's
+    /// `parse_subnet_kind`: find the envelope anywhere in the message,
+    /// then take the token up to the next colon or whitespace.
+    fn scan_subnet_kind_for_test(message: &str) -> Option<String> {
+        const MARKER: &str = "subnet:";
+        let rest = &message[message.find(MARKER)? + MARKER.len()..];
+        let end = rest
+            .find(|c: char| c == ':' || c.is_whitespace())
+            .unwrap_or(rest.len());
+        let kind = rest[..end].trim();
+        (!kind.is_empty()).then(|| kind.to_string())
+    }
+
     /// The hand-written `include/net_org.h` numeric contract (error codes,
     /// access modes, ABI stamp) must match the Rust `pub const`s. This is the
     /// standalone-header drift guard — `net_org.h` is not part of
@@ -1191,11 +1869,7 @@ mod tests {
     #[test]
     fn header_numeric_contract_matches_rust() {
         fn parse_value(tok: &str) -> Option<i64> {
-            if let Some(hex) = tok.strip_prefix("0x").or_else(|| tok.strip_prefix("0X")) {
-                i64::from_str_radix(hex, 16).ok()
-            } else {
-                tok.parse::<i64>().ok()
-            }
+            parse_c_value(tok)
         }
 
         let header = std::fs::read_to_string(concat!(
@@ -1243,6 +1917,9 @@ mod tests {
             ),
             ("NET_ORG_ERR_SERVE", NET_ORG_ERR_SERVE as i64),
             ("NET_ORG_ERR_PROVISION", NET_ORG_ERR_PROVISION as i64),
+            // SSDK S4c — the subnet code lives in net_org.h's block (an
+            // org-namespace code) so this same mirror guards it.
+            ("NET_ORG_ERR_SUBNET", NET_ORG_ERR_SUBNET as i64),
             ("NET_ORG_ACCESS_SAME_ORG", NET_ORG_ACCESS_SAME_ORG as i64),
             ("NET_ORG_ACCESS_GRANTED", NET_ORG_ACCESS_GRANTED as i64),
         ];
@@ -1319,5 +1996,306 @@ mod tests {
             baseline,
             "mesh_arc leaked on the input-validation error path"
         );
+    }
+
+    // =====================================================================
+    // Review-10 P1-3 / P1-4 — the subnet entry points' C ABI preconditions.
+    // =====================================================================
+
+    /// A live node plus a baseline strong count, for the ownership
+    /// witnesses below.
+    fn witness_node() -> Arc<MeshNode> {
+        let identity = net_sdk::identity::Identity::generate();
+        let cfg =
+            net::adapter::net::MeshNodeConfig::new("127.0.0.1:0".parse().expect("addr"), [0u8; 32]);
+        Arc::new(
+            runtime()
+                .block_on(MeshNode::new((**identity.keypair()).clone(), cfg))
+                .expect("MeshNode::new"),
+        )
+    }
+
+    /// Hand `call` a fresh boxed clone (exactly what `net_mesh_arc_clone`
+    /// produces), assert it refused, and assert the node's strong count
+    /// returned to baseline — i.e. the documented consume-on-all-paths
+    /// contract held for THAT refusal.
+    fn assert_consumes_arc(
+        node: &Arc<MeshNode>,
+        what: &str,
+        call: impl FnOnce(*mut Arc<MeshNode>, *mut *mut c_char) -> c_int,
+    ) {
+        let baseline = Arc::strong_count(node);
+        let arc_box: *mut Arc<MeshNode> = Box::into_raw(Box::new(node.clone()));
+        assert_eq!(Arc::strong_count(node), baseline + 1);
+
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let rc = call(arc_box, &mut err);
+        assert_ne!(rc, NET_ORG_OK, "{what}: expected a refusal");
+        if !err.is_null() {
+            net_org_free_cstring(err);
+        }
+        assert_eq!(
+            Arc::strong_count(node),
+            baseline,
+            "{what}: mesh_arc was not consumed on this refusal path",
+        );
+    }
+
+    /// P1-4 — EVERY nullable argument of every subnet entry point must
+    /// still drop the consumed clone. One witness per argument, because
+    /// the defect was per-argument: each early return that sat above the
+    /// `Box::from_raw` stranded a reference.
+    #[test]
+    fn subnet_entrypoints_consume_the_mesh_arc_on_every_null_argument() {
+        let node = witness_node();
+        let service = b"svc";
+
+        // declare_boundaries: NULL authority.
+        assert_consumes_arc(&node, "declare_boundaries/authority", |arc, err| {
+            net_subnet_declare_boundaries(arc, std::ptr::null(), 0, std::ptr::null(), 0, err)
+        });
+
+        // apply_control_fact: NULL out_kind, then NULL out_applied.
+        assert_consumes_arc(&node, "apply_control_fact/out_kind", |arc, err| {
+            let mut applied = false;
+            net_subnet_apply_control_fact(
+                arc,
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                &mut applied,
+                err,
+            )
+        });
+        assert_consumes_arc(&node, "apply_control_fact/out_applied", |arc, err| {
+            let mut kind: *mut c_char = std::ptr::null_mut();
+            net_subnet_apply_control_fact(
+                arc,
+                std::ptr::null(),
+                0,
+                &mut kind,
+                std::ptr::null_mut(),
+                err,
+            )
+        });
+        // apply_control_fact: valid out-params, NULL fact bytes — the
+        // refusal that lives BELOW the out-param checks.
+        assert_consumes_arc(&node, "apply_control_fact/fact", |arc, err| {
+            let mut kind: *mut c_char = std::ptr::null_mut();
+            let mut applied = false;
+            net_subnet_apply_control_fact(arc, std::ptr::null(), 0, &mut kind, &mut applied, err)
+        });
+
+        // serve_exported: NULL out_handle. `export_ref` is gone — the C
+        // boundary takes an export NAME resolved by Rust-owned state
+        // (review-10 P1-6), so there is no authority-object argument to
+        // null. A NULL/garbage name is a UTF-8 refusal, also below the
+        // consume line.
+        let export_name = b"factory-export";
+        assert_consumes_arc(&node, "serve_exported/out_handle", |arc, err| {
+            net_subnet_serve_exported(
+                arc,
+                service.as_ptr() as *const c_char,
+                service.len(),
+                export_name.as_ptr() as *const c_char,
+                export_name.len(),
+                1,
+                std::ptr::null_mut(),
+                err,
+            )
+        });
+        assert_consumes_arc(&node, "serve_exported/export_name", |arc, err| {
+            let mut handle: *mut NetOrgServeHandle = std::ptr::null_mut();
+            net_subnet_serve_exported(
+                arc,
+                service.as_ptr() as *const c_char,
+                service.len(),
+                std::ptr::null(),
+                0,
+                1,
+                &mut handle,
+                err,
+            )
+        });
+
+        // install_gateway_credentials: NULL pointer array with a non-zero
+        // count.
+        assert_consumes_arc(&node, "install_gateway_credentials/array", |arc, err| {
+            net_subnet_install_gateway_credentials(arc, std::ptr::null(), std::ptr::null(), 1, err)
+        });
+
+        // net_org_serve: NULL out_handle (the same defect shape, inherited
+        // rather than introduced by the subnet work).
+        assert_consumes_arc(&node, "org_serve/out_handle", |arc, err| {
+            net_org_serve(
+                arc,
+                service.as_ptr() as *const c_char,
+                service.len(),
+                NET_ORG_ACCESS_SAME_ORG,
+                1,
+                std::ptr::null_mut(),
+                err,
+            )
+        });
+    }
+
+    /// Review-10 P1-6 — the C boundary resolves an export NAME against
+    /// the node's OWN checked map, and an unknown name fails before any
+    /// registration or announcement.
+    ///
+    /// The ordering half matters as much as the refusal: a KNOWN name
+    /// must get past resolution and fail for a different reason (this
+    /// node has no org authority installed), proving the name was
+    /// actually resolved rather than the call failing early for
+    /// unrelated reasons. Before this, C passed a concrete crossing and
+    /// Rust invented a fixed internal name, so there was no resolution
+    /// to witness at all.
+    #[test]
+    fn serve_exported_resolves_the_name_against_the_nodes_own_map() {
+        use net::adapter::net::subnet::provision::{NamedSubnetExport, SubnetExportAccess};
+        use net::adapter::net::subnet::{SubnetRef, TopologySubnetId};
+
+        let identity = net_sdk::identity::Identity::generate();
+        let authority = net::adapter::net::identity::EntityKeypair::from_bytes([0x11; 32]);
+        let cfg =
+            net::adapter::net::MeshNodeConfig::new("127.0.0.1:0".parse().expect("addr"), [0u8; 32])
+                .with_subnet_export(NamedSubnetExport {
+                    name: "factory-export".to_string(),
+                    access: SubnetExportAccess::Granted,
+                    subnet: SubnetRef {
+                        authority: authority.entity_id().clone(),
+                        path: TopologySubnetId::new(&[3, 9]),
+                    },
+                    topology_epoch: 0,
+                });
+        let node = Arc::new(
+            runtime()
+                .block_on(MeshNode::new((**identity.keypair()).clone(), cfg))
+                .expect("MeshNode::new"),
+        );
+
+        // A dispatcher must exist or the call short-circuits before
+        // resolution; register a trivial one.
+        unsafe extern "C" fn noop(
+            _: u64,
+            _: *const NetOrgCaller,
+            _: *const u8,
+            _: usize,
+            _: *mut *mut u8,
+            _: *mut usize,
+            _: *mut *mut c_char,
+        ) -> c_int {
+            NET_ORG_OK
+        }
+        net_org_set_handler_dispatcher(noop);
+
+        let service = b"fleet.telemetry";
+        let call = |name: &[u8]| -> (c_int, String) {
+            let arc_box: *mut Arc<MeshNode> = Box::into_raw(Box::new(node.clone()));
+            let mut handle: *mut NetOrgServeHandle = std::ptr::null_mut();
+            let mut err: *mut c_char = std::ptr::null_mut();
+            let rc = net_subnet_serve_exported(
+                arc_box,
+                service.as_ptr() as *const c_char,
+                service.len(),
+                name.as_ptr() as *const c_char,
+                name.len(),
+                net_org_reserve_handler_id(),
+                &mut handle,
+                &mut err,
+            );
+            let msg = if err.is_null() {
+                String::new()
+            } else {
+                let s = unsafe { std::ffi::CStr::from_ptr(err) }
+                    .to_string_lossy()
+                    .into_owned();
+                net_org_free_cstring(err);
+                s
+            };
+            if !handle.is_null() {
+                net_org_serve_handle_free(&mut handle);
+            }
+            (rc, msg)
+        };
+
+        let (rc, msg) = call(b"no-such-export");
+        assert_eq!(rc, NET_ORG_ERR_SUBNET, "an unknown name must be refused");
+        assert_eq!(
+            scan_subnet_kind_for_test(&msg).as_deref(),
+            Some("unknown_export_name"),
+            "expected the stable kind on out_err, got {msg:?}",
+        );
+
+        // The configured name resolves; the failure that surfaces is the
+        // CORE's, not a name lookup.
+        let (rc, msg) = call(b"factory-export");
+        assert_ne!(
+            rc, NET_ORG_OK,
+            "no org authority is installed, so serve must fail"
+        );
+        assert_ne!(
+            scan_subnet_kind_for_test(&msg).as_deref(),
+            Some("unknown_export_name"),
+            "a configured name must get PAST resolution, got {msg:?}",
+        );
+    }
+
+    /// P1-3 — an oversized count must be refused deterministically,
+    /// WITHOUT constructing the slice.
+    ///
+    /// The pointers are non-null sentinels: a bound check that ran after
+    /// `from_raw_parts` would already have invoked undefined behavior by
+    /// the time any per-element check could reject them, so the test
+    /// deliberately supplies arrays that are only safe to look at if the
+    /// count is rejected first. `catch_unwind` cannot rescue this — the
+    /// bound is a Rust slice precondition, not a panic.
+    #[test]
+    fn subnet_entrypoints_refuse_counts_above_the_slice_bound() {
+        let node = witness_node();
+        // A single valid element behind each pointer; the COUNT is the lie.
+        let one_byte: u8 = 0;
+        let byte_ptr: *const u8 = &one_byte;
+        let ptr_array: [*const u8; 1] = [byte_ptr];
+        let len_array: [usize; 1] = [1];
+        let path = NetSubnetPath {
+            depth: 0,
+            levels: [0; 4],
+        };
+
+        let over_ptr = max_slice_elems::<*const u8>() + 1;
+        assert_consumes_arc(&node, "install_gateway_credentials/count", |arc, err| {
+            net_subnet_install_gateway_credentials(
+                arc,
+                ptr_array.as_ptr(),
+                len_array.as_ptr(),
+                over_ptr,
+                err,
+            )
+        });
+
+        let over_path = max_slice_elems::<NetSubnetPath>() + 1;
+        let authority = [0x22u8; 32];
+        assert_consumes_arc(&node, "declare_boundaries/count", |arc, err| {
+            net_subnet_declare_boundaries(arc, authority.as_ptr(), 0, &path, over_path, err)
+        });
+    }
+
+    /// The bound is derived per element type, not hardcoded — a
+    /// pointer-sized element admits fewer entries than a byte, and
+    /// `NetSubnetPath` (5 bytes) fewer than a `u8`.
+    #[test]
+    fn slice_element_bound_scales_with_element_size() {
+        assert_eq!(max_slice_elems::<u8>(), isize::MAX as usize);
+        assert_eq!(
+            max_slice_elems::<*const u8>(),
+            isize::MAX as usize / std::mem::size_of::<*const u8>(),
+        );
+        assert_eq!(
+            max_slice_elems::<NetSubnetPath>(),
+            isize::MAX as usize / 5,
+            "NetSubnetPath is the 5-byte POD the layout test pins",
+        );
+        assert!(max_slice_elems::<NetSubnetPath>() < max_slice_elems::<u8>());
     }
 }

@@ -16,7 +16,7 @@ cargo build --release --features cli   # → target/release/net-mesh
 
 Every command runs against a **live `MeshNode`** resolved through the standard `CliContext` — the same connection-and-keypair plumbing the SDK uses. Target a remote daemon with `--node-addr <ip:port> --node-pubkey <hex>` (live-discovery commands also take `--node-id`, `--psk-hex`), or omit them to attach to the local node in the surrounding environment.
 
-Three command groups covered here: **`transfer`** (blob/dir transport), **`typegen`** (typed bindings from discovered AI tools), and **`org` / `node adopt`** (organization capability-auth issuance and node ownership).
+Four command groups covered here: **`transfer`** (blob/dir transport), **`typegen`** (typed bindings from discovered AI tools), **`org` / `node adopt`** (organization capability-auth issuance and node ownership), and **`subnet`** (topology inspection + subnet-authority issuance).
 
 **Colour.** `--no-color` is global. `$NO_COLOR` is also honoured *per the convention* — colour is off when the variable is **present and non-empty**, whatever the value (`NO_COLOR=1`, `NO_COLOR=x`, and `NO_COLOR=false` all disable it; only absent or empty leaves it on).
 
@@ -112,6 +112,31 @@ Things that will bite:
 - **`--accept-windows-dacl` and `--insecure-permissions` are deliberately separate flags.** The first suppresses a warning about a freshly written **output** secret; the second relaxes a mode check on an **input** you already control (e.g. an org key checked out of git at 0644). Sharing one flag meant operators carried a Linux-motivated `--insecure-permissions` onto Windows and silently killed the only warning that platform has.
 - **No default falls back to the CWD.** If the platform config directory can't be resolved, `keygen` and `adopt` refuse and tell you to pass an explicit path rather than writing key material wherever you happened to be standing.
 
+## `net-mesh subnet` — topology views + authority issuance
+
+Two deliberately distinct groups under one noun (they share the noun and nothing else — topology is not authority):
+
+**Topology inspection** — `show` (this node's `SubnetId` + deriving policy), `ls` (every known subnet with member node ids), `tree` (the hierarchy, indented). Read-only views against a live node; with no node attached they print their natural empty shape rather than erroring.
+
+**Authority issuance** — offline ceremonies over files, like `net-mesh org`: no live node, artifacts as canonical wire bytes the runtime admin surface installs (`subnet-auth.md` § Provisioning). Nothing in any SDK signs.
+
+| Command | Produces |
+|---|---|
+| `net-mesh subnet keygen --out <path> [--note <s>] [--force]` | a subnet authority keypair — usable as an authority root **or** a delegated issuer. Prints the public entity id, never the seed. Refuses to overwrite a *different kind* of secret (an org key, an operator identity) however the path is spelled. |
+| `net-mesh subnet issue-direct --root-key <path> --authority <hex> --subject <hex> --scope <path\|global> --rights attach,route,export --topology-epoch N --generation N --out <path>` | one DIRECT credential set (root → subject), framed wire bytes a gateway installs. |
+| `net-mesh subnet issue-issuer --root-key <path> --authority <hex> --issuer <hex> --scope <ceiling> --max-rights <r,…> --topology-epoch N --out <path>` | one bounded ISSUER grant (root → delegated issuer). One-hop depth is structural, not policy. |
+| `net-mesh subnet issue-delegated --issuer-grant <path> --issuer-key <path> --subject <hex> --scope <path> --rights <r,…> --out <path>` | one DELEGATED credential set — the leaf framed *together with* its issuer grant, one file. Leaf scope must sit inside the grant's; leaf rights must not exceed its maximum. |
+| `net-mesh subnet issue-control-fact (descriptor\|gateway-advertisement\|export-policy\|revocation-floor) --root-key <path> --authority <hex> --scope <path\|global> --topology-epoch N --revision N --out <path> [kind-specific args]` | one signed control fact in the outer wire frame `apply_control_fact` consumes. `gateway-advertisement` adds `--gateway <hex> --gateway-node <id>`; `export-policy` adds repeatable `--channel`; `revocation-floor` adds `--minimum-generation N`. |
+| `net-mesh subnet inspect <file>` | decode + summary of any subnet artifact, **without private material**; exits non-zero on malformed or non-canonical bytes. |
+
+Things that will bite:
+
+- **`--authority` is always explicit.** An authority may trust multiple roots, so the id is never silently derived from the signing key. Passing the wrong id mints an artifact every verifier refuses as `wrong_authority`.
+- **`--scope global` is the whole-authority root scope** — a deliberate word, never an "unscoped" default you can reach by omission.
+- **`--topology-epoch` is explicit on facts** on purpose: a fact never invents authority movement. Reparenting is an operator decision recorded by a new epoch.
+- **Grant TTLs default to 7 days**, capped by the core; revocation is monotonic floors (`revocation-floor` facts) exactly as in the org surface — a lower floor never rolls back.
+- The org key-hygiene rules apply unchanged: 0600 secrets, `--insecure-permissions` for permissive **input** modes on Unix, `--accept-windows-dacl` for the Windows **output** warning, no CWD fallback for default paths.
+
 ## Exit codes (all subcommands)
 
 | Code | Meaning |
@@ -139,6 +164,7 @@ Subcommands may also emit a JSON `{"error": …, "detail": …}` line to **stder
 - `nrpc.md` — the discovered-tool / typed-call surface `typegen` generates against.
 - `capabilities.md` — the `ai-tool:*` capability tags `typegen` discovers.
 - `org.md` — what the `net-mesh org` artifacts mean, the startup-side `install_org_authority` / `install_provider_grant_audience` calls that consume them, and the `org:<domain>:<kind>` errors.
+- `subnet-auth.md` — what the `net-mesh subnet` artifacts mean, the runtime admin surface that installs them (`install_gateway_credentials` / `declare_boundaries` / `apply_control_fact`), and the `subnet:<kind>` errors.
 
 ## Further reading
 

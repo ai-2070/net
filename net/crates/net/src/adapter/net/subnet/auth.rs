@@ -212,9 +212,54 @@ pub enum SubnetAuthError {
     ClockSkewTooLarge,
 }
 
-impl std::fmt::Display for SubnetAuthError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let code = match self {
+impl SubnetAuthError {
+    /// Every reason code, in canonical order. `ALL` and
+    /// [`Self::wire_kind`] are the ONE source of the `subnet:` kind
+    /// vocabulary: `Display` renders through `wire_kind`, and the
+    /// cross-language fixture generator enumerates `ALL` and calls
+    /// `wire_kind` on each — so a renamed token moves everywhere at
+    /// once, and there is no second spelling table to drift.
+    ///
+    /// Completeness is compiler-enforced by the wildcard-free match in
+    /// `wire_kind` plus the `all_is_complete` test below, which walks
+    /// `ALL` and asserts the length against a locally exhaustive
+    /// destructuring — a new variant fails to compile until it is added
+    /// to both.
+    pub const ALL: &'static [SubnetAuthError] = &[
+        Self::UnknownAuthority,
+        Self::WrongSubject,
+        Self::WrongAuthority,
+        Self::WrongTopologyEpoch,
+        Self::ScopeNotAncestor,
+        Self::InvalidRights,
+        Self::Expired,
+        Self::NotYetValid,
+        Self::LifetimeTooWide,
+        Self::Revoked,
+        Self::IssuerNotAuthorized,
+        Self::IssuerAttenuationBroadened,
+        Self::RightNotGranted,
+        Self::WrongSession,
+        Self::WrongVerifier,
+        Self::WrongChallenge,
+        Self::IdentityPinConflict,
+        Self::TooManyGatewayContexts,
+        Self::MixedGatewayEpochs,
+        Self::InvalidSignature,
+        Self::InvalidFormat,
+        Self::InvalidValidityWindow,
+        Self::ClockSkewTooLarge,
+    ];
+
+    /// The stable wire token for this reason code — the `<kind>` in a
+    /// `subnet:<kind>` envelope.
+    ///
+    /// Returns `&'static str` rather than going through `Display` so
+    /// callers that need the token (the fixture generator, the binding
+    /// error mappers) do not allocate, and so the tokens can be
+    /// enumerated without formatting.
+    pub const fn wire_kind(&self) -> &'static str {
+        match self {
             Self::UnknownAuthority => "unknown_authority",
             Self::WrongSubject => "wrong_subject",
             Self::WrongAuthority => "wrong_authority",
@@ -238,8 +283,13 @@ impl std::fmt::Display for SubnetAuthError {
             Self::InvalidFormat => "invalid_format",
             Self::InvalidValidityWindow => "invalid_validity_window",
             Self::ClockSkewTooLarge => "clock_skew_too_large",
-        };
-        f.write_str(code)
+        }
+    }
+}
+
+impl std::fmt::Display for SubnetAuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.wire_kind())
     }
 }
 
@@ -2363,4 +2413,79 @@ pub(super) fn read_u64(bytes: &[u8], off: &mut usize) -> u64 {
     let out = u64::from_le_bytes(bytes[*off..*off + 8].try_into().unwrap());
     *off += 8;
     out
+}
+
+#[cfg(test)]
+mod wire_kind_tests {
+    use super::SubnetAuthError as E;
+
+    /// `ALL` really is every variant, and every token is distinct and
+    /// non-empty.
+    ///
+    /// The destructuring below is wildcard-free, so adding a variant
+    /// fails THIS compile until it is listed here; the length assertion
+    /// then fails until it is added to `ALL` too. Together they close
+    /// the gap a plain array cannot: an array can be short, and a match
+    /// can be exhaustive, but only both can prove they agree.
+    #[test]
+    fn all_is_complete_and_tokens_are_distinct() {
+        fn assert_exhaustive(e: E) -> u32 {
+            match e {
+                E::UnknownAuthority => 0,
+                E::WrongSubject => 1,
+                E::WrongAuthority => 2,
+                E::WrongTopologyEpoch => 3,
+                E::ScopeNotAncestor => 4,
+                E::InvalidRights => 5,
+                E::Expired => 6,
+                E::NotYetValid => 7,
+                E::LifetimeTooWide => 8,
+                E::Revoked => 9,
+                E::IssuerNotAuthorized => 10,
+                E::IssuerAttenuationBroadened => 11,
+                E::RightNotGranted => 12,
+                E::WrongSession => 13,
+                E::WrongVerifier => 14,
+                E::WrongChallenge => 15,
+                E::IdentityPinConflict => 16,
+                E::TooManyGatewayContexts => 17,
+                E::MixedGatewayEpochs => 18,
+                E::InvalidSignature => 19,
+                E::InvalidFormat => 20,
+                E::InvalidValidityWindow => 21,
+                E::ClockSkewTooLarge => 22,
+            }
+        }
+        const EXPECTED: usize = 23;
+        assert_eq!(
+            E::ALL.len(),
+            EXPECTED,
+            "a variant was added to the enum but not to SubnetAuthError::ALL",
+        );
+
+        // Every ordinal appears exactly once — catches a duplicate or a
+        // transposition in `ALL`, which a length check alone would miss.
+        let mut ordinals: Vec<u32> = E::ALL.iter().map(|e| assert_exhaustive(*e)).collect();
+        ordinals.sort_unstable();
+        assert_eq!(ordinals, (0..EXPECTED as u32).collect::<Vec<_>>());
+
+        let tokens: std::collections::BTreeSet<&str> =
+            E::ALL.iter().map(|e| e.wire_kind()).collect();
+        assert_eq!(
+            tokens.len(),
+            EXPECTED,
+            "reason-code tokens must be distinct"
+        );
+        assert!(E::ALL.iter().all(|e| !e.wire_kind().is_empty()));
+    }
+
+    /// `Display` renders exactly `wire_kind` — for EVERY variant, not
+    /// just the ends of the list. This is what stops an intermediate
+    /// token from being renamed in one place and not the other.
+    #[test]
+    fn display_is_wire_kind_for_every_variant() {
+        for e in E::ALL {
+            assert_eq!(e.to_string(), e.wire_kind());
+        }
+    }
 }

@@ -237,6 +237,70 @@ Three behaviors of these two commands surprise people:
 - **On Windows the audience secret's 0600 mode is unenforceable.** The file inherits its parent directory's NTFS DACL, and a loud warning fires unless you pass `--accept-windows-dacl`. Point `--audience-out` at an owner-only parent directory.
 - **`--accept-windows-dacl` and `--insecure-permissions` are separate flags on purpose.** The first suppresses a warning about a freshly written *output* secret; the second relaxes a mode check on an *input* you already control, such as an org key checked out of git at 0644. They were one flag once, and operators who added it on Linux carried it to Windows and silently killed the only warning that platform has.
 
+## `net-mesh subnet`
+
+Two unrelated groups share this verb. `show`, `ls`, and `tree` inspect a live node's *topology* view (where traffic propagates). Everything below authors subnet *authority* — the signed credentials and control facts that gate protected attachment, routing, and export. Like `net-mesh org`, these are offline ceremonies over files: no node, no mesh, no network. Every signed artifact is written as its framed **canonical wire bytes** (the exact form `install`/`apply` on a node consumes), never a JSON mirror.
+
+### `keygen`
+
+Generate a subnet authority keypair — usable as an authority root or as a delegated issuer. It signs grants, issuer grants, revocation floors, and control facts; it belongs offline.
+
+```
+net-mesh subnet keygen [--out <PATH>] [--note <TEXT>] [--force]
+```
+
+Defaults to `$XDG_CONFIG_HOME/net-mesh/subnets/subnet-<id>.toml`, written owner-only, and refuses rather than falling back to the working directory when the config directory cannot be resolved. The summary prints the public entity id — never the seed. `--force` replaces a subnet key only; it always refuses to replace a different kind of secret (an org key, an operator identity), however the path is spelled.
+
+### `issue-direct`
+
+Issue one direct credential set: authority root → subject.
+
+```
+net-mesh subnet issue-direct --root-key <PATH> --authority <HEX> --subject <HEX>
+                             --scope <PATH|global> --rights <attach,route,export>
+                             --out <PATH> [--topology-epoch <N>] [--generation <N>]
+                             [--not-before <UNIX>] [--ttl-secs <N>] [--force]
+```
+
+`--authority` is explicit on purpose: an authority may trust several roots, so the id is never silently derived from the signing key. `--scope global` is the **whole-authority root scope** — it covers every present and future path under the authority, and is never an "unscoped" default. Rights are a comma-separated subset of `attach`, `route`, `export`; anything else is refused. TTL defaults to 7 days, hard-capped at 30 by the core — rejected at issue *and* at every verifier.
+
+### `issue-issuer` and `issue-delegated`
+
+One provisioning hop, structurally: the root signs a bounded issuer grant, and only that issuer signs leaves — there is no depth flag and no second hop.
+
+```
+net-mesh subnet issue-issuer   --root-key <PATH> --authority <HEX> --issuer <HEX>
+                               --scope <PATH|global> --max-rights <…> --out <PATH> [.]
+net-mesh subnet issue-delegated --issuer-grant <PATH> --issuer-key <PATH> --subject <HEX>
+                               --scope <PATH|global> --rights <…> --out <PATH> [.]
+```
+
+`issue-delegated` writes **one complete framed credential set** containing both the issuer grant and the leaf. A leaf scope escaping the issuer scope or rights exceeding the issuer maximum are refused up front with the core's own predicates — and re-checked by every verifier regardless.
+
+:::caution[Issuance validates structure and attenuation, not root authenticity]
+`issue-delegated` checks that the leaf stays inside the issuer grant it was handed. It does **not** verify that issuer grant's signature against an authority root — this is an offline ceremony and no trusted root is supplied to it. A forged or corrupted `--issuer-grant` therefore frames cleanly and produces a credential set that **every node will reject**. Successful issuance is not proof of deployability. Verify an artifact before distributing it with `net-mesh subnet inspect`, and confirm the authority id is the one you expect.
+:::
+
+### `issue-control-fact`
+
+Author one signed control fact, written as the outer `SubnetControlFact` frame a node's `apply` door consumes.
+
+```
+net-mesh subnet issue-control-fact <descriptor|gateway-advertisement|export-policy|revocation-floor>
+                                   --root-key <PATH> --authority <HEX> --scope <PATH|global>
+                                   --topology-epoch <N> --revision <N> --out <PATH> [kind-specific flags]
+```
+
+The topology epoch is **explicit**: a fact never invents authority movement — reparenting is an operator decision recorded by a new epoch. `revocation-floor` takes `--minimum-generation`; `gateway-advertisement` takes `--gateway`/`--gateway-node`; `export-policy` takes repeatable `--channel` (a canonical channel *name*, or exactly lowercase `0x` + 16 lowercase hex digits — other hex-looking forms are refused, since a shortened value is indistinguishable from the collidable 16-bit wire hint).
+
+### `inspect`
+
+Decode and summarize any subnet artifact file — credential set, issuer grant, or control fact — without private material. Malformed or non-canonical bytes exit non-zero. Pointing it at a key file is refused, and no output path ever renders a seed.
+
+```
+net-mesh subnet inspect <FILE>
+```
+
 ## `net-mesh node`
 
 ### `adopt`

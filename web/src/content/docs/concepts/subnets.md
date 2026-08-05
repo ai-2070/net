@@ -45,6 +45,34 @@ The gateway also enforces a TTL on every forwarded packet, so a loop in the mesh
 
 Importantly, **the gateway never decrypts**. The channel's visibility is policy that lives in the channel's configuration; the gateway has a copy of that configuration in its `ChannelConfigRegistry` and applies it directly to the header. A subnet boundary is a strong boundary by construction, not a polite request that the destination might choose to honor.
 
+## Authority: proving the right to cross
+
+Everything above is the *topology* plane: where a node sits, and which channels a gateway forwards. Topology is not authority — a node's `SubnetId` says where it is, never what it may do. The *authority* plane answers the questions topology cannot: which nodes may act as gateways for a protected boundary, and how a service inside a sealed subnet becomes reachable from outside it. The whole model fits in five lines:
+
+```text
+topology places
+subnet credentials authorize local attachment/routing/export
+organization credentials authorize the caller
+export binding authorizes one provider-local crossing
+named export keeps that binding out of application code
+```
+
+A **subnet authority** is an offline root key (or a one-hop delegated issuer under it) that signs three kinds of artifact, all minted by [`net-mesh subnet`](/docs/reference/cli) and installed at runtime as opaque wire bytes:
+
+- **Credential sets** grant a subject `attach` / `route` / `export` rights over a scope — a dotted path, or `global` for the whole authority. They are epoch-pinned, short-lived (seven days by default), and revoked by monotonic generation floors, exactly like [organization](/docs/concepts/organizations) grants.
+- **Boundary declarations** name the subtree roots whose edge a gateway protects.
+- **Control facts** — descriptors, gateway advertisements, export policies, revocation floors — flow through one door (`apply_control_fact`) and apply idempotently: a stale fact reports `applied: false`, which is an authenticated no-op, not a failure.
+
+The consequence for applications is the **exported service**. A provider inside a protected subnet configures a *named export* — a provider-local label bound to one exact authority-qualified crossing — when its mesh is built, then serves against the name:
+
+```rust
+mesh.serve_subnet_exported("fleet.telemetry", "factory-export", handler)?;
+```
+
+The caller stays an ordinary organization client and calls `org.call_exported("fleet.telemetry", &req)`. It never names a subnet, never joins the provider's subnet, and receives no subnet context; discovery runs on the public plane through a verified ownership projection, and admission is the same per-call organization proof as any protected call. Dispatch revalidates the exported crossing against the provider's live gateway authority on every call — a revoked or epoch-stale export stops serving even though its registration succeeded.
+
+An authority-qualified crossing is not a `SubnetId`: equal paths under two different authorities are unrelated. That is what keeps one tenant's `[3, 7]` from meaning anything about another's.
+
 ## What this lets you do
 
 Subnets are how you compose the mesh into something larger than a single trust domain.
@@ -60,5 +88,7 @@ Subnets are how you compose the mesh into something larger than a single trust d
 Subnets are about scope, not encryption. Two nodes in the same subnet still use end-to-end encrypted sessions; two nodes in different subnets can still talk on a globally visible channel; the subnet doesn't grant or revoke key material, and it doesn't change what's on the wire beyond deciding which packets are allowed to cross which boundary.
 
 Subnets are also not consensus groups. There's no leader election within a subnet, no quorum decisions, no shared state that the subnet maintains. A subnet is a labeling convention plus a gateway-enforced visibility model — the heavyweight semantics live elsewhere, on the channels and the entities and the causal links.
+
+And the topology plane never authorizes. Sitting in a subnet grants nothing; carrying a matching `SubnetId` proves nothing. When a boundary must be *proved* rather than merely drawn — a gateway demonstrating its right to carry protected traffic, a service exported across a sealed edge — that is the authority plane above, with its own credentials and its own [error vocabulary](/docs/reference/error-codes).
 
 The right way to think about subnets is as the _spatial_ dimension of the mesh, complementary to the _temporal_ dimension that causal links provide. Subnets answer "who can see this"; causal links answer "what happened before this." Most operational questions about a Net deployment land somewhere in the intersection of those two.

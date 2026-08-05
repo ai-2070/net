@@ -30,5 +30,18 @@ Node.js finalizers are not deterministic. Always `await node.shutdown()` and cal
 6. [Artifacts](/docs/sdk/typescript/artifacts)
 7. [Errors](/docs/sdk/typescript/errors)
 
+## Protected services
+
+Both authority surfaces live in `@net-mesh/core`: organization auth
+(`serveOrgTyped`, `TypedOrgClient` — [concepts](/docs/concepts/organizations))
+and the subnet authority plane ([concepts](/docs/concepts/subnets)) —
+`mesh.serveSubnetExported(service, exportName, handler)` for a provider
+inside a protected subnet, `org.callExported(service, req)` for the caller, and
+`subnet.admin.*` for runtime gateway administration. Named exports and trust
+anchors are configured on the mesh constructor (`subnetExports`,
+`subnetAuthorities`, …) and validated before the node exists. `subnet:<kind>`
+failures classify through `classifySubnetError`
+([reference](/docs/reference/error-codes)).
+
 The concepts match the other SDKs, while method names, lifecycle, and error shapes
 follow TypeScript and Node.js conventions.

@@ -28,7 +28,14 @@ cdylib, and which surface each covers — is in
 | `net_meshos.h` | `NET_MESHOS_H` | Daemon authoring | `libnet_meshos` |
 | `net_deck.h` | `NET_DECK_H` | Operator surface | `libnet_deck` |
 | `net_org.h` | `NET_ORG_H` | Organization capability auth | `libnet_org` |
+| `net_subnet.h` | `NET_SUBNET_H` | Subnet authority (provision / serve / call) | `libnet_org` |
 | `net_mcp.h` | `NET_MCP_H` | MCP bridge, consent / pin surface | `libnet_mcp_ffi` |
+
+> **`net_subnet.h` ships in `libnet_org`**, not a separate cdylib: the base
+> `libnet` FFI cannot depend on `net-mesh-sdk` (circular), while `libnet_org`
+> already does, so the subnet surface reuses the org handler dispatcher,
+> `net_org_caller_t`, and the `Arc<MeshNode>` contract. It includes
+> `net_org.h`.
 
 > **`net.h` and `net.go.h` share the `NET_SDK_H` guard** — only one can be
 > active per translation unit, and `net.go.h` is *not* a superset

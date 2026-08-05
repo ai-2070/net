@@ -16,7 +16,7 @@ cargo build --release --features ffi,net
 
 ## Surface
 
-The ABI is split across ten headers and five shared libraries. Together they cover
+The ABI is split across eleven headers and five shared libraries. Together they cover
 the event bus, mesh transport, capability announce/discover, channels, nRPC,
 RedEX/CortEX storage, blob and directory transfer, federated queries, daemon
 operations, and the Deck operator surface.
@@ -40,3 +40,21 @@ The C ABI exposes capability discovery and nRPC directly. `net.go.h` declares
 `net_mesh_announce_capabilities`, `net_mesh_find_best_node_scoped`, and
 `net_mesh_subscribe_channel_with_token`; `net_rpc.h` declares the `net_rpc_call*`
 variants. The CLI is optional.
+
+## Protected services
+
+`net_org.h` carries organization capability auth, including the subnet-exported
+caller verb `net_org_call_exported`. Its companion `net_subnet.h` (same
+library, `libnet_org` — there is no `libnet_subnet`) carries the provider and
+gateway side: `net_subnet_serve_exported` against a NAMED export, plus
+`net_subnet_install_gateway_credentials`, `net_subnet_declare_boundaries`, and
+`net_subnet_apply_control_fact`. Subnet failures return `NET_ORG_ERR_SUBNET`
+with the stable `subnet:<kind>` wire string on `out_err`
+([reference](/docs/reference/error-codes)).
+
+C application code constructs no authority objects: the export name is resolved
+against the checked map the node holds, and trust anchors, attachment, control
+channel, and named exports are all supplied in the JSON `net_mesh_new` already
+takes (`subnet_authorities`, `subnet_attachment`, `subnet_control_channel`,
+`subnet_exports`). A standalone C program can stand up a subnet gateway on its
+own.

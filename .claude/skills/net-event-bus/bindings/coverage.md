@@ -25,7 +25,7 @@ meant to be vendored or copied into your own module. It covers surfaces the
 shipped module does not. Nothing below describes it; if a cell says `not
 exposed`, check there before concluding the work has not been done.
 
-### C is ten headers over six libraries, not one SDK
+### C is eleven headers over six libraries, not one SDK
 
 A `supported` C cell tells you a symbol exists. It does not tell you that you can
 reach it from the translation unit you are already in.
@@ -41,6 +41,7 @@ reach it from the translation unit you are already in.
 | `net_meshos.h` | `NET_MESHOS_H` | Daemon authoring | `libnet_meshos` |
 | `net_deck.h` | `NET_DECK_H` | Operator surface | `libnet_deck` |
 | `net_org.h` | `NET_ORG_H` | Organization capability auth | `libnet_org` |
+| `net_subnet.h` | `NET_SUBNET_H` | Subnet authority — exported serve, gateway provisioning | `libnet_org` |
 | `net_mcp.h` | `NET_MCP_H` | MCP bridge, consent / pin surface | `libnet_mcp_ffi` |
 
 **`net.h` and `net.go.h` share the `NET_SDK_H` guard, and `net.go.h` is not a
@@ -89,6 +90,9 @@ A mode is written after the status: `supported · core-only`.
 | Gang-claim scheduler | supported | supported | supported | supported | supported |
 | A2A — agent task handoff | supported | supported · core-only | supported · core-only | not exposed | not exposed |
 | Organization capability auth | supported | supported | supported | supported | supported |
+| Subnet gateway provisioning | supported | supported | supported | supported | supported |
+| Subnet-exported nRPC serve | supported | supported | supported | supported | supported |
+| Subnet-exported organization call | supported | supported | supported | supported | supported |
 | MCP bridge | supported | supported | supported | supported | supported |
 | Dataforts — blobs | supported | supported | supported | partial | supported |
 | RedEX — durable log | supported | supported | supported | supported | supported |
@@ -118,6 +122,9 @@ should not infer one binding's API from another's.
 | Gang-claim scheduler | `claim_island` | `claimIsland` | `claim_island` | `ClaimIsland` | `net_mesh_claim_island` |
 | A2A — agent task handoff | `serve_a2a` | `serveA2a` | `serve_a2a` | — | — |
 | Organization capability auth | `serve_org` | `serveOrgTyped` | `serve_org_typed` | `ServeOrgBytes` | `net_org_call` |
+| Subnet gateway provisioning | `install_gateway_credentials_node` | `installSubnetGatewayCredentials` | `install_subnet_gateway_credentials` | `InstallSubnetGatewayCredentials` | `net_subnet_install_gateway_credentials` |
+| Subnet-exported nRPC serve | `serve_subnet_exported` | `serveSubnetExported` | `serve_subnet_exported` | `ServeSubnetExported` | `net_subnet_serve_exported` |
+| Subnet-exported organization call | `call_exported` | `callExported` | `call_exported` | `CallExportedBytes` | `net_org_call_exported` |
 | MCP bridge | `serve_tool` | `tool` | `tool` | `McpError` | `net_mcp_classify` |
 | Dataforts — blobs | `fetch_blob` | `fetchBlob` | `fetch_blob` | `NewMeshBlobAdapter` | `net_fetch_blob` |
 | RedEX — durable log | `redex` | `RedexFile` | `redex` | `NewRedex` | `net_redex_file_append` |
@@ -148,6 +155,19 @@ why this is `not exposed` and not `n/a`.
 back. What is missing is the discovery-driven path — no equivalent of
 `fetch_blob_discovered`, so Go cannot fetch a blob it has only a reference to
 without knowing who holds it.
+
+**Go and C subnet gateway provisioning is `supported`.** Every *runtime*
+administration verb is present — installing gateway credential sets, declaring
+boundaries, applying signed control facts — and both bindings also declare the
+node's subnet **trust anchors**.
+
+`subnet_authorities`, `subnet_attachment`, `subnet_control_channel`, and
+`subnet_exports` are construction-time state, supplied on Go's `MeshConfig` and
+in the JSON C already passes to `net_mesh_new`. The conversion lives in the core
+(`net::adapter::net::subnet::provision`) so every constructor reaches it,
+including base `libnet`'s, with `net_sdk::subnet` re-exporting it so there is
+still one definition. A standalone Go or C program can stand up a subnet
+gateway on its own.
 
 ## Same operation, different shape
 

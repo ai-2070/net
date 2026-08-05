@@ -19,7 +19,10 @@ const ORG_HANDLER_ERROR: u16 = 0x8001;
 
 /// Build the `caller` dict handed to the Python handler: the five verified
 /// fields plus `is_same_org`, all ids as `bytes`.
-fn caller_dict<'py>(
+///
+/// `pub(crate)`: the subnet-exported serve (`subnet.rs`) hands the SAME
+/// admitted `OrgCaller` shape to its handler, through the SAME bridge.
+pub(crate) fn caller_dict<'py>(
     py: Python<'py>,
     caller: &net_sdk::org::OrgCaller,
 ) -> PyResult<Bound<'py, PyDict>> {
@@ -40,6 +43,16 @@ fn caller_dict<'py>(
 #[pyclass(name = "OrgServeHandle", module = "_net")]
 pub struct PyOrgServeHandle {
     inner: parking_lot::Mutex<Option<net_sdk::mesh_rpc::ServeHandle>>,
+}
+
+impl PyOrgServeHandle {
+    /// Wrap a registered serve handle — shared with the subnet-exported
+    /// serve, which returns the same RAII shape.
+    pub(crate) fn from_handle(handle: net_sdk::mesh_rpc::ServeHandle) -> Self {
+        PyOrgServeHandle {
+            inner: parking_lot::Mutex::new(Some(handle)),
+        }
+    }
 }
 
 #[pymethods]
@@ -143,7 +156,11 @@ pub fn serve_org(
 ///
 /// A raised exception maps to the application band (the handler said no); a
 /// marshaling failure maps to internal. Neither is ever an admission denial.
-async fn run_py_org_handler(
+///
+/// `pub(crate)`: the subnet-exported serve reuses this one bridge rather
+/// than a second copy — the admitted facts and the return contract are
+/// identical.
+pub(crate) async fn run_py_org_handler(
     callable: Arc<Py<PyAny>>,
     caller: net_sdk::org::OrgCaller,
     body: bytes::Bytes,

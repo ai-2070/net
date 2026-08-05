@@ -1891,6 +1891,19 @@ pub struct MeshNodeConfig {
     /// fail-closed for authority claims, no effect on plain
     /// topology/visibility operation.
     pub subnet_authorities: Vec<SubnetAuthorityConfig>,
+    /// NAMED subnet exports — provider-local labels resolved once
+    /// here into checked bindings (review-10 P1-6).
+    ///
+    /// Owned by the node rather than by each language wrapper so the
+    /// name→binding resolution is Rust-owned at EVERY boundary,
+    /// including the C ABI, which has no wrapper object to hang a map
+    /// on. Immutable after construction: a name is never announced and
+    /// never accepted from a caller, and nothing at runtime adds to
+    /// this map.
+    ///
+    /// Empty and duplicate names are refused at `MeshNode::new`,
+    /// before the node exists.
+    pub subnet_exports: Vec<super::subnet::provision::NamedSubnetExport>,
     /// This node's own attachment point inside its authority's
     /// hierarchy, for protected forwarding (SUBNET_AUTH_PLAN.md D6).
     /// Defaults to [Self::subnet] — the topology coordinate and the
@@ -2251,6 +2264,7 @@ impl MeshNodeConfig {
             subnet: SubnetId::GLOBAL,
             subnet_policy: None,
             subnet_authorities: Vec::new(),
+            subnet_exports: Vec::new(),
             subnet_attachment: None,
             subnet_control_channel: None,
             default_visibility: Visibility::Global,
@@ -2583,6 +2597,21 @@ impl MeshNodeConfig {
     /// set fails closed.
     pub fn with_subnet_authority(mut self, config: SubnetAuthorityConfig) -> Self {
         self.subnet_authorities.push(config);
+        self
+    }
+
+    /// Configure a NAMED subnet export (review-10 P1-6): a
+    /// provider-local label an application later serves against,
+    /// resolved once at `MeshNode::new` into a checked access mode +
+    /// export binding held by the node.
+    ///
+    /// Repeatable. The name is neither announced nor accepted from a
+    /// caller; empty or duplicate names fail at construction.
+    pub fn with_subnet_export(
+        mut self,
+        export: super::subnet::provision::NamedSubnetExport,
+    ) -> Self {
+        self.subnet_exports.push(export);
         self
     }
 
@@ -8386,6 +8415,10 @@ pub struct MeshNode {
     /// dispatch context can verify channel-borne control facts
     /// against the same anchors without a copy.
     subnet_authorities: Arc<Vec<SubnetAuthorityConfig>>,
+    /// The checked NAMED EXPORT map, resolved once at construction
+    /// (review-10 P1-6). Immutable: nothing at runtime adds to it, and
+    /// a name is never announced or accepted from a caller.
+    subnet_exports: Arc<super::subnet::provision::NamedSubnetExports>,
     /// Applied revocation-floor state + per-authority auth epochs
     /// for subnet credentials. Session admission (S3) verifies
     /// against this registry and pins the epoch it saw.
@@ -8695,6 +8728,18 @@ impl MeshNode {
         config: MeshNodeConfig,
     ) -> Result<Self, AdapterError> {
         let node_id = identity.node_id();
+
+        // Review-10 P1-6: freeze the NAMED EXPORT map before any
+        // networking starts. Empty and duplicate labels are
+        // configuration mistakes, and a node must never come up holding
+        // an ambiguous map — the same fail-before-the-node-exists rule
+        // the trust anchors follow. The map lives on the node so
+        // name→binding resolution is Rust-owned at every boundary,
+        // including the C ABI, which has no wrapper to hang it on.
+        let subnet_exports = Arc::new(
+            super::subnet::provision::NamedSubnetExports::try_new(config.subnet_exports.clone())
+                .map_err(|e| AdapterError::Fatal(e.to_string()))?,
+        );
 
         // OA-1 (review-8 §2): resolve the configured node authority
         // BEFORE any networking starts. A configured-but-missing,
@@ -9659,6 +9704,7 @@ impl MeshNode {
             local_subnet,
             local_subnet_policy,
             subnet_authorities,
+            subnet_exports,
             subnet_floors: Arc::new(SubnetFloorRegistry::new()),
             subnet_control: Arc::new(SubnetControlStore::new()),
             subnet_control_stream_id,
@@ -9760,6 +9806,18 @@ impl MeshNode {
     /// tests that assert a rejected subscribe retains nothing.
     pub fn subscriber_chain_count(&self) -> usize {
         self.subscriber_chains.len()
+    }
+
+    /// The checked NAMED EXPORT map this node was constructed with
+    /// (review-10 P1-6). Immutable after construction.
+    ///
+    /// Every language boundary resolves an export NAME against this one
+    /// Rust-owned map, rather than each wrapper keeping its own copy and
+    /// the C ABI keeping none at all. An unknown name therefore fails
+    /// identically everywhere, and no boundary can accept a
+    /// caller-supplied binding in place of a configured one.
+    pub fn subnet_exports(&self) -> &Arc<super::subnet::provision::NamedSubnetExports> {
+        &self.subnet_exports
     }
 
     /// Get this node's ed25519 entity id (derived from the
@@ -17297,6 +17355,13 @@ impl MeshNode {
     ///    hop. The inner packet is copied through byte for byte.
     fn relay_protected_hop(data: &[u8], ctx: &DispatchCtx) {
         use super::subnet::route_hop;
+
+        // Measured-section marker for the production allocation witness
+        // (`tests/subnet_relay_alloc_e2e.rs`). RAII, so it covers every
+        // early return below. Compiled out of production builds; see
+        // `subnet::alloc_probe` for why the witness needs it.
+        #[cfg(any(test, feature = "fixtures"))]
+        let _relay_section = super::subnet::alloc_probe::RelaySection::enter();
 
         // ONE authority snapshot for the whole relay decision:
         // credentials and boundaries come from the same published
@@ -27229,14 +27294,35 @@ impl MeshNode {
             None
         };
         let export_targets = export_targets.as_deref();
+        // PERF_AUDIT_2026_08_04_SUBNET_PATHS §1 — `subnet_visible`
+        // answers `Visibility::Global => true` before it reads `dest`
+        // at all, and `Global` is `default_visibility`. Probing
+        // `peer_subnets` per subscriber to feed an argument the verdict
+        // never consults cost one DashMap hash, one shard lock, and a
+        // `Ref` construct/drop per subscriber per publish — 1 000 of
+        // them on a 1 000-subscriber channel, all discarded. Resolve
+        // the constant verdict once, beside the `visibility` /
+        // `channel_hash` / `export_targets` hoists already here.
+        //
+        // Deliberately narrow: only the `Global` arm is
+        // subscriber-independent by inspection of `subnet_visible`
+        // itself. The audit's second-order form (the map is provably
+        // empty with no policy installed, so EVERY mode is hoistable)
+        // is not taken — that invariant is a production one, not a
+        // type-level one, and two in-crate tests write `peer_subnets`
+        // directly with no policy installed.
+        let subnet_verdict_is_constant = matches!(visibility, Visibility::Global);
         subscribers.retain(|peer_id| {
             // (1) Subnet visibility. Cheap check first — a peer in
             // the wrong subnet should short-circuit before any
             // auth-cache probing.
             // `None` = subnet not derived; see `subnet_visible`.
-            let peer_subnet = self.peer_subnets.get(peer_id).map(|e| *e.value());
-            let visible =
-                Self::subnet_visible(self.local_subnet, peer_subnet, visibility, export_targets);
+            let visible = if subnet_verdict_is_constant {
+                true
+            } else {
+                let peer_subnet = self.peer_subnets.get(peer_id).map(|e| *e.value());
+                Self::subnet_visible(self.local_subnet, peer_subnet, visibility, export_targets)
+            };
             if let Some(gw) = self.subnet_gateway.as_ref() {
                 if visible {
                     gw.record_forward();
@@ -40257,6 +40343,58 @@ mod subnet_visible_unknown_tests {
         );
     }
 
+    /// PERF_AUDIT_2026_08_04_SUBNET_PATHS §1 — the publish fan-out
+    /// hoists the `Visibility::Global` verdict out of its per-subscriber
+    /// `retain`, skipping the `peer_subnets` probe entirely in that arm.
+    ///
+    /// That is only sound if `Global` really is independent of every
+    /// other argument. Pinned exhaustively over the inputs the fan-out
+    /// can present: an unresolved peer, a peer in our subnet, a peer
+    /// elsewhere, a deeper peer, with and without export targets, from a
+    /// scoped and an unscoped source. The hoist becomes wrong the moment
+    /// one of these answers `false`.
+    #[test]
+    fn global_visibility_is_independent_of_every_other_argument() {
+        let dests = [
+            None,
+            Some(SubnetId::GLOBAL),
+            Some(SubnetId::new(&[3, 7])),
+            Some(SubnetId::new(&[9])),
+            Some(SubnetId::new(&[3, 7, 1, 2])),
+        ];
+        let targets: [Option<&[SubnetId]>; 3] = [
+            None,
+            Some(&[]),
+            Some(&[SubnetId::new(&[9]), SubnetId::new(&[3, 7])]),
+        ];
+        for source in [SubnetId::GLOBAL, SCOPED(), SubnetId::new(&[9, 9, 9])] {
+            for dest in dests {
+                for export_targets in targets {
+                    assert!(
+                        MeshNode::subnet_visible(source, dest, Visibility::Global, export_targets),
+                        "Global must be unconditionally visible — the publish fan-out \
+                         skips the peer_subnets probe on the strength of it \
+                         (source={source:?} dest={dest:?} targets={export_targets:?})",
+                    );
+                }
+            }
+        }
+    }
+
+    /// The companion negative: no OTHER visibility mode is
+    /// unconditionally true, so the hoist must stay narrow to `Global`.
+    /// If a future mode became constant it would need its own witness
+    /// here before joining the fast arm.
+    #[test]
+    fn no_other_visibility_mode_is_unconditionally_visible() {
+        for visibility in [Visibility::SubnetLocal, Visibility::ParentVisible] {
+            assert!(
+                !MeshNode::subnet_visible(SCOPED(), None, visibility, None),
+                "{visibility:?} depends on the peer subnet and must keep probing",
+            );
+        }
+    }
+
     /// The same coercion on the strict arm was already fail-closed;
     /// pin it so a future refactor doesn't loosen it.
     #[test]
@@ -41193,6 +41331,106 @@ mod protected_forward_allocation_pins {
             decl.contains("const {"),
             "FORWARD_BUF must be const-initialized so no thread pays a first-touch \
              allocation, got: {decl}",
+        );
+    }
+}
+
+#[cfg(all(test, feature = "cortex"))]
+mod exported_discovery_pin_coherence_tests {
+    //! `public_owned_service_providers` must require the live session
+    //! pin to name the EXACT entity whose ownership projection it
+    //! sampled (review-10 P1-1).
+    //!
+    //! A `NodeId` is the low 8 bytes of an entity id, so it routes but
+    //! does not identify. The fold query and the pin map are separate
+    //! structures updated by separate operations: peer death clears the
+    //! pin and the fold record independently, and a fresh direct
+    //! announcement installs its pin BEFORE applying its fold record.
+    //! Resolving `NodeId -> EntityId` through the pin after sampling the
+    //! projection could therefore pair entity A's verified owner org
+    //! with entity B, and the caller would disclose its request-bound
+    //! signed organization proof and capability grant to B — which never
+    //! published the sampled owned capability.
+    //!
+    //! Both tests fail if the seam goes back to trusting the resolved
+    //! pin instead of comparing it.
+    use super::*;
+    use crate::adapter::net::behavior::capability::{CapabilityAnnouncement, CapabilitySet};
+    use crate::adapter::net::behavior::org::{OrgKeypair, OrgMembershipCert};
+
+    const SERVICE: &str = "fleet.telemetry";
+
+    async fn observer() -> Arc<MeshNode> {
+        let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr");
+        Arc::new(
+            MeshNode::new(
+                EntityKeypair::generate(),
+                MeshNodeConfig::new(addr, [0x5Au8; 32]),
+            )
+            .await
+            .expect("MeshNode::new"),
+        )
+    }
+
+    /// A signature-verified announcement carrying `org`'s membership
+    /// cert for `kp` — the shape that projects a verified owner.
+    fn owned_ann(kp: &EntityKeypair, org: &OrgKeypair) -> CapabilityAnnouncement {
+        let cert = OrgMembershipCert::try_issue(org, kp.entity_id().clone(), 1, 3600)
+            .expect("issue membership cert");
+        let caps = CapabilitySet::new().add_tag(format!("nrpc:{SERVICE}"));
+        let mut ann = CapabilityAnnouncement::new(kp.node_id(), kp.entity_id().clone(), 1, caps)
+            .with_ttl(300)
+            .with_owner_cert(Some(cert));
+        ann.sign(kp);
+        ann
+    }
+
+    /// The load-bearing inverse: entity A's owned projection is live,
+    /// but the pin for A's node id names a DIFFERENT entity B. The
+    /// candidate must be dropped, not returned as `(B, owner_of(A))`.
+    #[tokio::test]
+    async fn a_pin_naming_a_different_entity_yields_no_candidate() {
+        let node = observer().await;
+        let org = OrgKeypair::generate();
+        let entity_a = EntityKeypair::generate();
+        let entity_b = EntityKeypair::generate();
+        let node_id = entity_a.node_id();
+
+        node.test_inject_capability_announcement(owned_ann(&entity_a, &org));
+
+        // Coherent: the pin names the entity that published.
+        node.peer_entity_ids
+            .insert(node_id, entity_a.entity_id().clone());
+        let found = node.public_owned_service_providers(SERVICE);
+        assert_eq!(found.len(), 1, "the coherent pairing is a candidate");
+        assert_eq!(&found[0].provider, entity_a.entity_id());
+        assert_eq!(found[0].owner_org, org.org_id());
+
+        // Torn: the same node id now pins a DIFFERENT entity, exactly as
+        // a colliding direct announcement would leave it. The fold still
+        // holds A's verified projection.
+        node.peer_entity_ids
+            .insert(node_id, entity_b.entity_id().clone());
+        assert!(
+            node.public_owned_service_providers(SERVICE).is_empty(),
+            "a pin naming a different entity must drop the candidate, never pair \
+             entity B with entity A's verified owner org",
+        );
+    }
+
+    /// A candidate with no pin at all stays excluded — the check added
+    /// for P1-1 is an identity comparison layered ON the existing
+    /// liveness requirement, not a replacement for it.
+    #[tokio::test]
+    async fn an_unpinned_candidate_yields_no_candidate() {
+        let node = observer().await;
+        let org = OrgKeypair::generate();
+        let entity_a = EntityKeypair::generate();
+
+        node.test_inject_capability_announcement(owned_ann(&entity_a, &org));
+        assert!(
+            node.public_owned_service_providers(SERVICE).is_empty(),
+            "no live pin means no entity-layer identity to authorize against",
         );
     }
 }

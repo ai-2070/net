@@ -120,6 +120,46 @@ type MeshConfig struct {
 	// true. Leave nil/false for the core default (accept unsigned in v1).
 	RequireSignedCapabilities bool `json:"require_signed_capabilities,omitempty"`
 
+	// SubnetExports is this provider's named-export map (SSDK §3.3): the
+	// provider-local labels ServeSubnetExported resolves against. A name is
+	// never announced and never accepted from a caller.
+	//
+	// Serialized to the constructor (review-10 P1-6): Rust resolves and
+	// freezes the checked map on the node, and ServeSubnetExported passes the
+	// NAME through. Go keeps no copy — a second map on this side meant name
+	// resolution happened outside Rust at the one boundary with no wrapper to
+	// own it. Empty and duplicate labels are refused before the node exists.
+	SubnetExports []SubnetNamedExport `json:"subnet_exports,omitempty"`
+
+	// SubnetAuthorities are this node's subnet AUTHORITY trust anchors —
+	// which authorities it will accept protected subnet assertions from
+	// (review-10 P1-7). Distinct from Subnet / SubnetPolicy below, which are
+	// unauthenticated routing state.
+	//
+	// An empty or nil list means every protected subnet assertion fails
+	// closed. Duplicate authorities, empty root sets, duplicate roots, and
+	// zero lifetimes are refused by Rust before the node exists.
+	//
+	// A node that must act as a subnet GATEWAY needs these; without them it
+	// can still CALL exported services, but cannot serve behind a protected
+	// boundary.
+	SubnetAuthorities []SubnetAuthorityConfig `json:"subnet_authorities,omitempty"`
+
+	// SubnetAttachment is this node's own SECURITY attachment point — the
+	// local topology coordinate credentials are checked against, as 0–4
+	// levels each 0–255. Distinct from Subnet; omitting it preserves the
+	// core compatibility fallback, which protected deployments should not
+	// rely on.
+	//
+	// `[]uint32` for the same reason as Subnet above and SubnetPath.Levels:
+	// encoding/json emits `[]uint8` as base64, which the constructor rejects.
+	SubnetAttachment []uint32 `json:"subnet_attachment,omitempty"`
+
+	// SubnetControlChannel treats an ordinary configured channel as a subnet
+	// control-fact ARRIVAL path. Confers no authority — facts verify by
+	// signature regardless of how they arrive.
+	SubnetControlChannel string `json:"subnet_control_channel,omitempty"`
+
 	// Subnet constrains the node to a hierarchical subnet (1–4 bytes
 	// each 0–255). Empty / nil means `SubnetId::GLOBAL`.
 	Subnet []uint32 `json:"subnet,omitempty"`

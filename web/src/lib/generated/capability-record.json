@@ -552,6 +552,66 @@
       },
       "domain": "payments"
     },
+    "Subnet gateway provisioning": {
+      "bindings": {
+        "C": {
+          "status": "supported"
+        },
+        "Go": {
+          "status": "supported"
+        },
+        "Node / TS": {
+          "status": "supported"
+        },
+        "Python": {
+          "status": "supported"
+        },
+        "Rust": {
+          "status": "supported"
+        }
+      },
+      "domain": "event-bus"
+    },
+    "Subnet-exported nRPC serve": {
+      "bindings": {
+        "C": {
+          "status": "supported"
+        },
+        "Go": {
+          "status": "supported"
+        },
+        "Node / TS": {
+          "status": "supported"
+        },
+        "Python": {
+          "status": "supported"
+        },
+        "Rust": {
+          "status": "supported"
+        }
+      },
+      "domain": "event-bus"
+    },
+    "Subnet-exported organization call": {
+      "bindings": {
+        "C": {
+          "status": "supported"
+        },
+        "Go": {
+          "status": "supported"
+        },
+        "Node / TS": {
+          "status": "supported"
+        },
+        "Python": {
+          "status": "supported"
+        },
+        "Rust": {
+          "status": "supported"
+        }
+      },
+      "domain": "event-bus"
+    },
     "Verification tiers / chain checker": {
       "bindings": {
         "C": {

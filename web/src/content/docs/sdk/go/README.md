@@ -33,5 +33,25 @@ to the compiler and at runtime; see the [Go install guide](/docs/start/install/g
 6. [Artifacts](/docs/sdk/go/artifacts)
 7. [Errors](/docs/sdk/go/errors)
 
+## Protected services
+
+Organization auth ([concepts](/docs/concepts/organizations)) is at parity:
+`net.ServeOrg[Req, Resp]` / `net.OrgCall[Req, Resp]` over `libnet_org`. The
+subnet authority plane ([concepts](/docs/concepts/subnets)) adds
+`net.ServeSubnetExported[Req, Resp](node, service, exportName, handler)` for a
+provider inside a protected subnet (`exportName` resolves against
+`MeshConfig.SubnetExports`), `net.CallExported[Req, Resp](ctx, client, service,
+req)` on the org client, and the runtime admin verbs
+(`InstallSubnetGatewayCredentials`, `DeclareSubnetBoundaries`,
+`ApplySubnetControlFact`). Classify `subnet:<kind>` failures with
+`errors.Is(err, net.ErrSubnet)` and `net.ParseSubnetKind`
+([reference](/docs/reference/error-codes)).
+
+Subnet **trust anchors** are construction-time state on `MeshConfig`:
+`SubnetAuthorities`, `SubnetAttachment`, `SubnetControlChannel`, and
+`SubnetExports`. Rust converts and validates them through the same frozen DTOs
+every other SDK uses, before the node exists, so a standalone Go program can
+stand up a subnet *gateway* on its own.
+
 The [Artifacts](/docs/sdk/go/artifacts) page records the current cross-peer transfer
 gap rather than substituting another language's API.

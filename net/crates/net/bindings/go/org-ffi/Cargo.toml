@@ -51,6 +51,22 @@ parking_lot = "0.12"
 # via the matching `free` (mirrors rpc-ffi / compute-ffi).
 libc = "0.2"
 
+[dev-dependencies]
+# The C-surface consumer of the shared cross-language stable-kind
+# fixture (review-10 P3-2) reads `stable_kinds.json`. Test-only: the
+# cdylib itself parses no JSON.
+serde_json = "1"
+# The S4 live cell drives the C ABI end to end against the SAME generated
+# scenario the Node / Python / Go harnesses load, so it needs the
+# generator. `fixtures` is dev-only: the shipped cdylib mints no
+# credentials and writes no files.
+net-sdk = { package = "net-mesh-sdk", version = "0.34.0", path = "../../../sdk", features = [
+    "net",
+    "cortex",
+    "fixtures",
+] }
+tokio = { version = "1.48", features = ["rt-multi-thread", "sync", "time", "macros"] }
+
 # `[profile.release]` intentionally omitted — cargo ignores non-root
 # profiles ("profiles for the non root package will be ignored"). The
 # workspace root governs release-profile settings (lto = true and
