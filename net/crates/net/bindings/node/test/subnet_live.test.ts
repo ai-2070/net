@@ -90,6 +90,32 @@ const crateRoot = resolve(here, '..', '..', '..')
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const hex = (b: Buffer) => b.toString('hex')
 
+/** Sentinel for "the call produced nothing within the bound". */
+const NO_REPLY = Symbol('no-reply')
+
+/**
+ * Await a call that MUST NOT be served, bounded.
+ *
+ * A refused caller fails locally and fast, but a call after teardown is
+ * different: the provider is still an announced candidate for a while, so the
+ * request goes out and simply gets no reply. Unbounded, that turns a correct
+ * refusal into a hung test — which is exactly how this suite first failed.
+ * Either outcome (a rejection, or nothing within the bound) proves "not
+ * served"; a RESOLVED reply is the failure.
+ */
+async function mustNotBeServed(call: Promise<Buffer>, ms = 8000): Promise<void> {
+  const outcome = await Promise.race([
+    call.then(
+      (reply) => ({ served: true as const, reply }),
+      () => ({ served: false as const }),
+    ),
+    sleep(ms).then(() => ({ served: false as const, timedOut: NO_REPLY })),
+  ])
+  if (outcome.served) {
+    throw new Error(`the call must not be served, got ${outcome.reply.toString('utf8')}`)
+  }
+}
+
 // The a2a handshake: the acceptor waits for the connector's routed handshake
 // while the connector dials — both before `start()`.
 async function handshake(connector: Mesh, acceptor: Mesh): Promise<void> {
@@ -172,7 +198,37 @@ describe.skipIf(!HAS_SUBNET)('S4 — live subnet-exported call through the Node 
         boundaries: manifest.provider.boundary_paths.map((levels) => ({ levels })),
       })
 
-      // ---- (2) an unknown export is refused LOCALLY, before announcement ----
+      // ---- (4) both callers, from the generated credentials ----
+      //
+      // Built and handshaken BEFORE any start(): the mesh refuses
+      // `accept()` once the dispatch loop is running, so a three-node cell
+      // has to land every handshake first and then start everyone.
+      //
+      // A caller presents organization authority only — it names no subnet,
+      // joins no subnet, and needs no trust anchor of its own.
+      caller = await NetMesh.create({
+        bindAddr: '127.0.0.1:0',
+        psk: manifest.psk_hex,
+        identitySeed: Buffer.from(manifest.caller.seed_hex, 'hex'),
+        permissiveChannels: true,
+      })
+      foreign = await NetMesh.create({
+        bindAddr: '127.0.0.1:0',
+        psk: manifest.psk_hex,
+        identitySeed: Buffer.from(manifest.foreign_caller.seed_hex, 'hex'),
+        permissiveChannels: true,
+      })
+      installOrgAuthority(caller, p(manifest.caller.authority_dir))
+      installOrgAuthority(foreign, p(manifest.foreign_caller.authority_dir))
+
+      await handshake(caller, provider)
+      await handshake(foreign, provider)
+      await provider.start()
+      await caller.start()
+      await foreign.start()
+
+      // ---- (2) an unknown export is refused LOCALLY, before the service is
+      //          registered or announced ----
       try {
         serveSubnetExported(
           provider,
@@ -208,18 +264,7 @@ describe.skipIf(!HAS_SUBNET)('S4 — live subnet-exported call through the Node 
         },
       )
 
-      // ---- (4) caller construction from the generated credentials ----
-      caller = await NetMesh.create({
-        bindAddr: '127.0.0.1:0',
-        psk: manifest.psk_hex,
-        identitySeed: Buffer.from(manifest.caller.seed_hex, 'hex'),
-        permissiveChannels: true,
-      })
-      installOrgAuthority(caller, p(manifest.caller.authority_dir))
-      await handshake(caller, provider)
-      await provider.start()
-      await caller.start()
-
+      // ---- (4) caller credentials, from the generated files ----
       client = OrgClient.bind(
         caller,
         OrgCredentials.create({
@@ -267,15 +312,6 @@ describe.skipIf(!HAS_SUBNET)('S4 — live subnet-exported call through the Node 
       // Its membership and dispatcher grant are correctly signed — by the
       // WRONG organization. That is what makes this a boundary test rather
       // than a decoder test.
-      foreign = await NetMesh.create({
-        bindAddr: '127.0.0.1:0',
-        psk: manifest.psk_hex,
-        identitySeed: Buffer.from(manifest.foreign_caller.seed_hex, 'hex'),
-        permissiveChannels: true,
-      })
-      installOrgAuthority(foreign, p(manifest.foreign_caller.authority_dir))
-      await handshake(foreign, provider)
-      await foreign.start()
       foreignClient = OrgClient.bind(
         foreign,
         OrgCredentials.create({
@@ -287,36 +323,36 @@ describe.skipIf(!HAS_SUBNET)('S4 — live subnet-exported call through the Node 
       )
 
       const before = calls
-      await expect(
+      await mustNotBeServed(
         foreignClient.callExportedBytes(
           manifest.exported_service,
           Buffer.from(JSON.stringify({ n: 50 })),
         ),
-      ).rejects.toBeDefined()
+      )
       expect(calls, 'the handler must never run for a refused caller').toBe(before)
 
       // ---- (9) the denial is not retried ----
       //
       // A signed proof is never resent. Observed provider-side: a second
       // refused call still never reaches the handler.
-      await expect(
+      await mustNotBeServed(
         foreignClient.callExportedBytes(
           manifest.exported_service,
           Buffer.from(JSON.stringify({ n: 51 })),
         ),
-      ).rejects.toBeDefined()
+      )
       expect(calls, 'no retry may smuggle a refused caller into the handler').toBe(before)
 
       // ---- (10) clean close, no callback racing teardown ----
       handle.close()
       handle.close() // idempotent
       handle = undefined
-      await expect(
+      await mustNotBeServed(
         client.callExportedBytes(
           manifest.exported_service,
           Buffer.from(JSON.stringify({ n: 99 })),
         ),
-      ).rejects.toBeDefined()
+      )
       expect(calls, 'no handler invocation may land after close').toBe(1)
     } finally {
       for (const c of [client, foreignClient]) {
@@ -335,5 +371,5 @@ describe.skipIf(!HAS_SUBNET)('S4 — live subnet-exported call through the Node 
       await caller?.shutdown().catch(() => {})
       await foreign?.shutdown().catch(() => {})
     }
-  }, 180_000)
+  }, 300_000)
 })

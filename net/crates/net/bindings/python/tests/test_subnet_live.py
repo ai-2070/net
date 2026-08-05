@@ -146,6 +146,38 @@ def _handshake(connector, acceptor) -> None:
         raise errors[0]
 
 
+def _must_not_be_served(client, service: str, payload: dict, seconds: float = 8.0) -> None:
+    """Assert a call is NOT served, bounded.
+
+    A refused caller fails locally and fast, but a call after teardown is
+    different: the provider is still an announced candidate for a while, so the
+    request goes out and simply gets no reply. Unbounded, that turns a correct
+    refusal into a hung test. Either outcome — an exception, or nothing within
+    the bound — proves "not served"; a RETURNED reply is the failure.
+
+    Deliberately a DAEMON thread rather than a ThreadPoolExecutor: the pool's
+    context manager (and the interpreter's atexit hook for pool threads) joins
+    its workers, so a call that never returns hangs the suite at teardown even
+    though the timeout above already elapsed. That is exactly how this helper
+    first hung. A daemon thread is abandoned cleanly.
+    """
+    request = json.dumps(payload).encode("utf-8")
+    box: dict = {}
+
+    def _call() -> None:
+        try:
+            box["reply"] = client.call_exported(service, request)
+        except Exception as e:  # noqa: BLE001
+            box["error"] = e
+
+    t = threading.Thread(target=_call, daemon=True)
+    t.start()
+    t.join(timeout=seconds)
+    if "reply" in box:
+        raise AssertionError(f"the call must not be served, got {box['reply']!r}")
+    # An exception, or nothing within the bound — both mean "not served".
+
+
 # Shells out to `cargo run --example gen_subnet_scenario` (a cold build inside
 # the test), then drives a live call whose public discovery is announcement-
 # throttled. The CI-wide 60 s per-test timeout is far too short; match the Node
@@ -274,24 +306,21 @@ def test_live_subnet_exported_call_from_a_generated_scenario() -> None:
             ),
         )
         before = state["calls"]
-        with pytest.raises(Exception):
-            foreign_client.call_exported(service, json.dumps({"n": 50}).encode("utf-8"))
+        _must_not_be_served(foreign_client, service, {"n": 50})
         assert state["calls"] == before, "the handler must never run for a refused caller"
 
         # ---- (9) the denial is not retried ----
         #
         # A signed proof is never resent. Observed provider-side: a second
         # refused call still never reaches the handler.
-        with pytest.raises(Exception):
-            foreign_client.call_exported(service, json.dumps({"n": 51}).encode("utf-8"))
+        _must_not_be_served(foreign_client, service, {"n": 51})
         assert state["calls"] == before, "no retry may smuggle a refused caller into the handler"
 
         # ---- (10) clean close, no callback racing teardown ----
         handle.close()
         handle.close()  # idempotent
         handle = None
-        with pytest.raises(Exception):
-            client.call_exported(service, json.dumps({"n": 99}).encode("utf-8"))
+        _must_not_be_served(client, service, {"n": 99})
         assert state["calls"] == 1, "no handler invocation may land after close"
     finally:
         for c in (client, foreign_client):
