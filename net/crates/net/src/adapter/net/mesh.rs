@@ -6830,11 +6830,18 @@ struct ScopedSourceSnapshot {
     >,
 }
 
+/// Cycle-4 diagnostic: the address of a crate static. If two probe lines print
+/// DIFFERENT anchors, this process contains two statically-linked copies of
+/// `net-mesh` — and therefore two copies of every static it and its
+/// dependencies own, including `parking_lot`'s global parking-lot table.
+static PROBE_ANCHOR: u8 = 0;
+
 /// TEMPORARY diagnostic probe (Go-bindings announce hang). Throwaway branch.
 macro_rules! probe {
     ($($a:tt)*) => {
         eprintln!(
-            "[probe {:?}] {}",
+            "[probe lib={:p} {:?}] {}",
+            &PROBE_ANCHOR,
             std::thread::current().id(),
             format_args!($($a)*)
         )
