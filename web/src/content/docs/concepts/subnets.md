@@ -1,94 +1,212 @@
 ---
 title: Subnets
-description: A subnet is a way of grouping nodes that should share scope.
+description: "Authority-qualified local topology for channel scope, protected forwarding, and exported services."
 ---
 
 # Subnets
 
-A subnet is a way of grouping nodes that should share scope. Nodes in the same subnet see each other's local traffic by default; nodes in different subnets see each other only when a channel's visibility explicitly says they should. Gateways at subnet boundaries enforce this — without decrypting payloads, without per-flow state, without a central authority deciding what crosses.
+A subnet describes local topology inside one installation: a machine, vehicle,
+site, or other system whose internal paths have one authority. It gives channels
+a bounded scope and gives gateways an exact boundary to protect.
 
-Subnets define which channels may cross a topology boundary. They can separate
-fleet telemetry, tenant traffic, or a vehicle's internal channels while selected
-exports continue to a parent or peer subnet.
+A subnet coordinate does not establish identity, organization membership, or
+permission. Those are separate decisions:
 
-## The hierarchy
-
-A `SubnetId` packs four levels of hierarchy into a single 32-bit integer — eight bits per level, 256 children per level. The conventional read of the four levels is region, fleet, vehicle, subsystem, but nothing in Net imposes that interpretation; the hierarchy is structural and the labels are yours to assign.
-
+```text
+topology places a node
+channel visibility limits ordinary traffic
+subnet authority permits attachment, routing, and export
+organization authority admits an exported caller
+provider policy remains final
 ```
+
+Keeping these decisions separate lets independently owned systems communicate
+without turning one operator's topology into a global control plane.
+
+## A compact local hierarchy
+
+`SubnetId` encodes up to four local hierarchy levels in one `u32`, with eight
+bits per level:
+
+```text
 subnet_id (u32):
-  [ level 0: 8 bits ][ level 1: 8 bits ][ level 2: 8 bits ][ level 3: 8 bits ]
+  [ level 0 ][ level 1 ][ level 2 ][ level 3 ]
 ```
 
-A `SubnetId` of `[3]` is a region-level subnet. `[3, 7]` is a fleet inside that region. `[3, 7, 1, 4]` is a fully qualified subsystem. The all-zero `SubnetId::GLOBAL` is the unrestricted root.
+The labels are installation-specific. A machine might use:
 
-Parent, child, sibling, and distance relationships all resolve with bitwise operations at wire speed. A gateway can decide whether a packet should cross a boundary by reading the header's `subnet_id`, comparing it to its own, and looking up the channel's visibility — three integer operations and one map probe, with no decryption involved.
+```text
+machine → security domain → controller → device
+```
 
-## Assignment
+A vehicle might use:
 
-Nodes are assigned to subnets by policy, not by hand. A `SubnetPolicy` is a list of `SubnetRule`s; each rule maps a capability-tag _prefix_ to a hierarchy _level_ (0–3) and a set of tag-value→byte mappings, and rules combine across levels to fill the subnet id. Any level no rule fills stays `0` — i.e. unrestricted (`GLOBAL`); there is no separate "default subnet."
+```text
+vehicle → compute domain → controller → sensor or actuator
+```
 
-This means subnet membership is data-driven and changes as capabilities change. Add a `fleet=west-coast` tag to a node and it moves into the west-coast fleet's subnet automatically; the matching gateway picks it up; the matching channel scopes start applying. There's no separate config to push, and there's no opportunity for the node's claimed subnet to disagree with its capability set.
+The four bytes are not a directory for millions of vehicles, customers, or
+regions. Fleet and company membership belong in the
+[organization plane](/docs/concepts/organizations). Each vehicle or installation
+can reuse the same compact local paths under its own authority.
 
-## Gateways
+Path `0` is the root of one authority's hierarchy. Trailing zeroes leave deeper
+levels unspecified, so `3.7` contains `3.7.1` and `3.7.2`. Parent, child, and
+common-ancestor operations are fixed-width prefix comparisons.
 
-A subnet gateway is a node that sits between two subnets and applies channel visibility to packets crossing the boundary. The gateway reads only the header — `channel_hash` and `subnet_id` — and consults the channel's `Visibility`:
+## Topology becomes security only when qualified
 
-| Visibility      | Decision                                                       |
-| --------------- | -------------------------------------------------------------- |
-| `SubnetLocal`   | Always dropped at the boundary.                                |
-| `ParentVisible` | Forwarded only toward ancestor subnets.                        |
-| `Exported`      | Forwarded only to subnets named in the channel's export table. |
-| `Global`        | Always forwarded.                                              |
+The security-facing name for the compact path is `TopologySubnetId`. A protected
+scope is a `SubnetRef`:
 
-The gateway also enforces a TTL on every forwarded packet, so a loop in the mesh can't burn forever. Drop reasons are tracked with atomic counters, so you can see at a glance whether a gateway is rejecting traffic for visibility, for TTL, or for an unknown subnet (which usually means a configuration drift).
+```text
+SubnetRef {
+  authority: installation root identity,
+  path: local topology path,
+}
+```
 
-Importantly, **the gateway never decrypts**. The channel's visibility is policy that lives in the channel's configuration; the gateway has a copy of that configuration in its `ChannelConfigRegistry` and applies it directly to the header. A subnet boundary is a strong boundary by construction, not a polite request that the destination might choose to honor.
+Equal path bytes under different authorities are unrelated. Path `3.7` in one
+vehicle grants no standing in another vehicle that also uses `3.7`.
+
+The local node's attachment is configured explicitly. A `SubnetPolicy` may map
+capability tags to the topology coordinates assigned to peers, but that policy
+does not authorize the peer and does not silently assign the local node. An
+unknown peer coordinate fails closed for scoped traffic.
+
+## Channel visibility
+
+Channel configuration determines which ordinary publications are eligible to
+cross topology scopes:
+
+| Visibility      | Behavior                                                                            |
+| --------------- | ----------------------------------------------------------------------------------- |
+| `SubnetLocal`   | Visible only within the same resolved subnet.                                       |
+| `ParentVisible` | May travel from a descendant toward an ancestor, never downward or sideways.        |
+| `Exported`      | May travel only to destinations named in that channel's export table.               |
+| `Global`        | Not restricted by subnet topology. Other channel and provider policy still applies. |
+
+Visibility is not an access token. Channel permission checks remain independent,
+and a globally visible channel is not automatically executable by every peer.
+Likewise, a matching subnet coordinate never grants a channel action.
+
+## Protected gateways
+
+Protected forwarding does not trust a packet's claimed subnet coordinate. Each
+adjacent hop authenticates a route-hop envelope, and admitted session state binds
+the peer's full entity identity to its exact local attachment. A gateway then
+evaluates the transition using its own current authority state.
+
+Three rights are deliberately separate:
+
+- `ATTACH` permits a subject to occupy an exact authority-qualified scope;
+- `ROUTE` permits internal movement covered by a gateway credential;
+- `EXPORT` permits crossing a declared protected boundary.
+
+A gateway also holds a boundary declaration. If a transition crosses a declared
+boundary, `EXPORT` is required at every crossed boundary. A broad `ROUTE` grant
+cannot substitute for it. If the transition remains internal, one current
+`ROUTE` credential must cover both admitted attachments.
+
+The gateway authenticates and authorizes before route lookup, TTL mutation, or
+send. It forwards the inner encrypted packet byte-for-byte; it does not decrypt
+the application payload. Missing context, stale epochs, revoked credentials,
+undeclared authority state, bad hop authentication, and replay all fail closed.
 
 ## Authority: proving the right to cross
 
-Everything above is the *topology* plane: where a node sits, and which channels a gateway forwards. Topology is not authority — a node's `SubnetId` says where it is, never what it may do. The *authority* plane answers the questions topology cannot: which nodes may act as gateways for a protected boundary, and how a service inside a sealed subnet becomes reachable from outside it. The whole model fits in five lines:
+A subnet authority is an installation root identity, normally held offline.
+Operator tooling under [`net-mesh subnet`](/docs/reference/cli) creates the
+artifacts consumed by a node:
+
+- authority roots and topology epochs;
+- direct or one-hop credential sets carrying `ATTACH`, `ROUTE`, or `EXPORT`;
+- protected-boundary declarations;
+- monotonic revocation floors;
+- signed control facts when authority state is distributed through a control
+  channel.
+
+Signed artifacts cross SDK and ABI boundaries as canonical opaque bytes. A stale
+but authentic control fact is an idempotent no-op, reported as `applied: false`;
+it does not roll authority backward.
+
+## Exported services
+
+An exported service composes subnet authority with organization admission. The
+provider configures a provider-local named export when constructing its mesh:
 
 ```text
-topology places
-subnet credentials authorize local attachment/routing/export
-organization credentials authorize the caller
-export binding authorizes one provider-local crossing
-named export keeps that binding out of application code
+"factory-export"
+  → exact SubnetRef
+  → topology epoch
+  → same-org or granted organization access
 ```
 
-A **subnet authority** is an offline root key (or a one-hop delegated issuer under it) that signs three kinds of artifact, all minted by [`net-mesh subnet`](/docs/reference/cli) and installed at runtime as opaque wire bytes:
-
-- **Credential sets** grant a subject `attach` / `route` / `export` rights over a scope — a dotted path, or `global` for the whole authority. They are epoch-pinned, short-lived (seven days by default), and revoked by monotonic generation floors, exactly like [organization](/docs/concepts/organizations) grants.
-- **Boundary declarations** name the subtree roots whose edge a gateway protects.
-- **Control facts** — descriptors, gateway advertisements, export policies, revocation floors — flow through one door (`apply_control_fact`) and apply idempotently: a stale fact reports `applied: false`, which is an authenticated no-op, not a failure.
-
-The consequence for applications is the **exported service**. A provider inside a protected subnet configures a *named export* — a provider-local label bound to one exact authority-qualified crossing — when its mesh is built, then serves against the name:
+Ordinary provider code selects that name:
 
 ```rust
 mesh.serve_subnet_exported("fleet.telemetry", "factory-export", handler)?;
 ```
 
-The caller stays an ordinary organization client and calls `org.call_exported("fleet.telemetry", &req)`. It never names a subnet, never joins the provider's subnet, and receives no subnet context; discovery runs on the public plane through a verified ownership projection, and admission is the same per-call organization proof as any protected call. Dispatch revalidates the exported crossing against the provider's live gateway authority on every call — a revoked or epoch-stale export stops serving even though its registration succeeded.
+The caller names only the service:
 
-An authority-qualified crossing is not a `SubnetId`: equal paths under two different authorities are unrelated. That is what keeps one tenant's `[3, 7]` from meaning anything about another's.
+```rust
+let reply = org.call_exported("fleet.telemetry", &request).await?;
+```
 
-## What this lets you do
+The export name and binding never leave the provider as caller inputs. The
+caller does not construct a `SubnetRef`, hold the provider's subnet credentials,
+join the provider subnet, or receive provider-local topology context.
 
-Subnets are how you compose the mesh into something larger than a single trust domain.
+Discovery uses the public capability plane, but only candidates with a coherent,
+verified organization owner are eligible. The caller then presents the normal
+request-bound organization proof. At dispatch, the provider independently
+rechecks:
 
-**Multi-tenancy.** Each tenant lives in its own subnet. Channels marked `SubnetLocal` stay inside the tenant. Channels marked `ParentVisible` or `Exported` are the explicit, audited interfaces between tenants. There's no "accidentally exposed an internal topic" failure mode — the gateway is the failure mode, and it can be inspected.
+1. the exact export binding and topology epoch;
+2. the current boundary declaration;
+3. current `EXPORT` authority at that crossing;
+4. organization admission for this caller and request;
+5. provider-local policy.
 
-**Hierarchical fleets.** Regions contain fleets, fleets contain vehicles, vehicles contain subsystems. Telemetry from a subsystem stays local; aggregated metrics propagate upward via `ParentVisible`; cross-fleet commands ride on explicit `Exported` channels with a small allowed-destinations list.
+Organization admission and subnet export are independent gates. Passing one
+never bypasses the other. If authority changes after discovery, the call is
+denied without charge and the SDK does not replay the signed request
+automatically.
 
-**Edge deployments.** A vehicle's onboard mesh is its own subnet. It talks to the cloud over a gateway that exports specific channels (telemetry uplink, command downlink, OTA updates) and drops everything else. The vehicle's internal channels are guaranteed not to leak, because the gateway physically cannot forward them.
+## How subnets compose at scale
 
-## What it doesn't do
+Subnets scale vertically inside an installation. Organizations federate those
+installations horizontally.
 
-Subnets are about scope, not encryption. Two nodes in the same subnet still use end-to-end encrypted sessions; two nodes in different subnets can still talk on a globally visible channel; the subnet doesn't grant or revoke key material, and it doesn't change what's on the wire beyond deciding which packets are allowed to cross which boundary.
+```text
+organization or fleet
+  ├─ vehicle / installation authority A
+  │    └─ local four-level subnet hierarchy
+  ├─ vehicle / installation authority B
+  │    └─ local four-level subnet hierarchy
+  └─ provider grants and exported services between them
+```
 
-Subnets are also not consensus groups. There's no leader election within a subnet, no quorum decisions, no shared state that the subnet maintains. A subnet is a labeling convention plus a gateway-enforced visibility model — the heavyweight semantics live elsewhere, on the channels and the entities and the causal links.
+This keeps local paths compact and makes authority explicit. A fleet does not
+need one enormous shared subnet tree, and an external caller does not become a
+member of each provider's internal topology.
 
-And the topology plane never authorizes. Sitting in a subnet grants nothing; carrying a matching `SubnetId` proves nothing. When a boundary must be *proved* rather than merely drawn — a gateway demonstrating its right to carry protected traffic, a service exported across a sealed edge — that is the authority plane above, with its own credentials and its own [error vocabulary](/docs/reference/error-codes).
+## What subnets do not do
 
-The right way to think about subnets is as the _spatial_ dimension of the mesh, complementary to the _temporal_ dimension that causal links provide. Subnets answer "who can see this"; causal links answer "what happened before this." Most operational questions about a Net deployment land somewhere in the intersection of those two.
+Subnets are not organization membership, a global service directory, a scheduler,
+or a consensus group. They do not choose which GPU runs a model, replicate state,
+or decide whether an application effect is safe. Provider-local systems retain
+those responsibilities.
+
+Subnets provide topology scope and a protected crossing mechanism. Organizations
+identify the parties. Capabilities describe available work. The provider decides
+whether to perform it.
+
+## Where to read next
+
+- [Organizations](/docs/concepts/organizations)
+- [Security model](/docs/concepts/security-model)
+- [Private capabilities](/docs/guides/private-capabilities)
+- [CLI reference](/docs/reference/cli)
+- [Error codes](/docs/reference/error-codes)

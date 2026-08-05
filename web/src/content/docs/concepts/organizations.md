@@ -1,70 +1,223 @@
 ---
 title: Organizations
-description: Identity answers who is this entity. Permission tokens answer what is this entity allowed to do on a channel.
+description: "Cryptographic company identity, caller delegation, private discovery, and cross-organization invocation."
 ---
+
 # Organizations
 
-[Identity](/docs/concepts/identity) answers *who is this entity*. Permission tokens answer *what is this entity allowed to do on a channel*. Organizations answer a third question that neither one can: **which company is this caller acting for, and did my company authorize them?**
+[Identity](/docs/concepts/identity) answers _which entity is this?_
+Organizations answer two additional questions:
 
-That distinction matters as soon as a mesh spans more than one commercial party. A partner's inference service, a customer's data plane, and your own internal tooling can all be peers on the same mesh, but "peer on the mesh" is not "may call my billing service." An organization is the unit of authority that closes that gap — and unlike every other authorization surface in Net, it governs *visibility* as well as access.
+1. which organization owns this node or caller;
+2. what authority lets this caller act for that organization here?
 
-## An organization is a key, and belonging is a certificate
+A transport session proves a peer identity. It does not prove company membership
+or permission to invoke a service. Organization authority supplies that missing
+relation without requiring every participant to share one cloud account, cluster,
+or control plane.
 
-An organization is an ed25519 root keypair, kept offline. It never runs on a node and it never appears on the wire. Everything an organization asserts, it asserts by signing a small, structured, time-bound object with that key.
+## The organization root
 
-There are three such objects, and the most common mistake is to read any of them as permission to invoke something.
+An organization is identified by an Ed25519 root key. The private root is designed
+to remain offline; nodes consume signed artifacts rather than the signing key.
+The public organization identity can appear in credentials, grants, ownership
+projections, and verified caller attribution.
 
-An **organization membership certificate** says "this entity belongs to this organization." It is issued by the org root to a specific node identity, carries a revocation generation, and defaults to roughly a year of validity with a hard two-year ceiling. It establishes belonging and nothing else.
+Three artifact types establish different facts:
 
-A **dispatcher grant** says "this entity may act *for* this organization," over one named capability or over all of them. It is also issued by the org root, and it is what lets a caller speak in its organization's name. It is not permission to invoke anything either — it says *whose* authority the caller is drawing on, not that the authority extends anywhere in particular.
+| Artifact               | What it proves                                                                                            | What it does not prove                       |
+| ---------------------- | --------------------------------------------------------------------------------------------------------- | -------------------------------------------- |
+| Membership certificate | One exact entity belongs to the organization.                                                             | That the member may invoke a capability.     |
+| Dispatcher grant       | One exact entity may act for the organization over a bounded capability scope.                            | That any provider has granted access.        |
+| Capability grant       | A provider organization grants another organization explicit rights over a capability and provider scope. | That a particular request has been admitted. |
 
-A **capability grant** says "this other organization holds these rights on this capability, over these providers." Crucially, it is issued by the **provider's** organization, not the caller's. If org B wants org A to be able to reach one of B's services, B signs a grant naming A as grantee, and the rights are explicit: `INVOKE` to call it, `DISCOVER` to find it, or both.
+Membership is not invocation authority. A valid call proof composes the necessary
+artifacts, binds the exact provider, capability, request digest, call identity,
+and validity window, and is signed by the caller entity. The provider verifies it
+against current authority on every protected invocation.
 
-Even holding all three is not authority to invoke. Every protected call carries a freshly constructed proof, and the provider verifies that proof against its own installed authority on every single call. The grants are what make a valid proof *constructible*; the provider's verification is what makes it *accepted*. Nothing is cached into a session, and no credential is ever a bearer token that skips the check.
+The credentials make a valid proof constructible. The provider's live verification
+and policy make it accepted.
 
-## Access implies visibility
+## Ownership, acting authority, and provider grants
 
-The property that separates org auth from a conventional access-control layer is that a protected service is not merely refused to outsiders — it is **invisible** to them.
+A node has one verified owner organization. Foreign organizations do not become
+additional owners; they receive explicit grants from the provider organization.
 
-When a node serves a capability under organization protection, it picks one of two access modes, and each one implies its own form of encrypted announcement:
+For an internal call, a member presents its membership and dispatcher authority.
+For a cross-organization call, the provider's organization additionally grants
+the caller's organization `DISCOVER`, `INVOKE`, or both over an exact capability
+and provider scope.
 
-- **Same-org** access admits members of the serving node's own organization, and the capability is announced only inside that organization's encrypted audience.
-- **Granted** access admits members of another organization holding a capability grant, and the capability is announced only inside the encrypted per-grant audiences.
+The direction is important:
 
-Neither ever appears on the plaintext capability-announcement plane. A peer outside the audience cannot decrypt the announcement, so the service simply does not exist as far as its capability index is concerned. There is no separate visibility setting to configure, and therefore no way to get access and visibility out of sync — a mismatch that is a recurring source of leaks in systems that model the two independently.
+```text
+provider organization B
+  signs a grant to caller organization A
+  over capability C and provider scope P
+```
 
-This has a direct consequence for how you read a query result: an empty discovery result is the correct, expected outcome for an unauthorized caller, and it is deliberately indistinguishable from "nobody serves this."
+Organization A cannot grant itself access to B's service. Transport reachability,
+a shared PSK, or knowledge of a service name cannot manufacture the missing
+provider grant.
 
-## Denials are coarse, on purpose
+## Ordinary protected discovery is private
 
-When a provider's admission engine does refuse a call, the caller learns one of three things: `denied`, `not_supported`, or `unavailable`. That is the entire vocabulary, and it carries no detail.
+An ordinary organization-protected service chooses one of two access classes:
 
-This is not an oversight, and it will not be refined. A precise remote reason — "your dispatcher grant expired," "no grant covers this capability," "your membership was revoked at generation 4" — is a credential oracle. An attacker holding a partial or stale credential set could walk those responses to map exactly which piece to forge or replay. The detailed reason is recorded on the provider side for audit, where the party that already knows everything can see it, and never crosses the wire.
+- **Same-org** admits callers acting for the provider's owner organization.
+- **Granted** admits another organization under a current provider-issued
+  capability grant.
 
-The caller-side errors are correspondingly organized around a more useful question than *why*: **did anything leave this process?** Credential and discovery failures are local — the call was never sent. Admission denials and transport errors are remote. Every language binding exposes that distinction directly rather than making you parse a message. The full vocabulary is in the [error-code reference](/docs/reference/error-codes).
+These services announce into encrypted audiences rather than the public capability
+plane. A same-org caller receives the owner audience. A granted caller receives
+the audience associated with its `DISCOVER` grant. Peers outside those audiences
+cannot index the capability.
+
+That is why an empty private-discovery result is deliberately ambiguous: the
+caller cannot distinguish an absent provider from a provider it lacks authority
+to discover.
+
+Visibility and invocation remain separate even here. `DISCOVER` permits learning
+that the capability exists. `INVOKE`, dispatcher authority, request binding, and
+provider admission determine whether one call may run.
+
+## Exported services are publicly discoverable, not publicly invocable
+
+A service exported from a protected [subnet](/docs/concepts/subnets) uses a
+different discovery path. Its capability announcement is public because an
+external caller does not share the provider subnet's private announcement plane.
+The announcement must carry a coherent, verified owner projection; unowned or
+identity-mismatched candidates are ineligible.
+
+Public discovery reveals that an organization-owned provider offers the service.
+It does not grant invocation authority. The caller still needs the same
+organization relationship:
+
+- same verified owner organization; or
+- a provider-issued capability grant covering the caller organization and
+  service.
+
+The caller uses `call_exported`, not `call_subnet`:
+
+```rust
+let reply = org.call_exported("fleet.telemetry", &request).await?;
+```
+
+The caller names no subnet and receives no provider-local subnet context. The
+provider separately proves that its gateway may export through the configured
+crossing. Organization admission and subnet export are independent gates:
+
+```text
+organization proof: may this caller ask?
+subnet authority: may this provider expose the service here?
+provider policy: will this exact request run?
+```
+
+All three must pass.
+
+## Provider attribution is four-party
+
+A protected handler receives verified attribution rather than caller-asserted
+labels:
+
+```text
+caller entity
+acting organization
+provider organization
+exact provider entity
+```
+
+The capability and request are bound into the proof as well. This distinguishes
+"organization A invoked organization B" from the operational fact that entity S
+acted for A, against a grant issued by B, on exact provider P.
+
+That distinction remains available to provider policy and audit without exposing
+detailed credential failures to the remote caller.
+
+## Denials are coarse and requests are not replayed
+
+Remote admission exposes only coarse outcomes such as denied, unsupported, or
+unavailable. Detailed failures—expired membership, insufficient dispatcher scope,
+revoked grant, stale generation, or provider policy—remain provider-local. Fine-
+grained remote reasons would turn admission into a credential oracle.
+
+The caller can still distinguish local planning failures from a request that
+reached a remote provider. SDK error types preserve that boundary; applications
+do not need to parse error strings.
+
+A protected call is sent at most once by the organization facade. The request
+proof binds a particular call and payload. Net does not automatically replay it
+after denial, timeout, authority movement, or ambiguous transport failure.
+Application policy decides whether a fresh call is safe.
 
 ## Secrets that never enter your process
 
-A capability grant carrying `DISCOVER` rights mints an **audience secret**: the raw key that decrypts that grant's encrypted announcements. It is the one piece of org credential material that is not designed to transit.
+A capability grant with `DISCOVER` rights creates an audience secret used to
+decrypt the corresponding private announcements. Signed memberships and grants
+are public artifacts and cross SDK or ABI boundaries as bytes. Audience secrets
+are supplied by checked filesystem path.
 
-The signed credentials — membership, dispatcher grant, capability grants — are public objects meant to be handed around, and they cross language boundaries as bytes. The audience secret does not. In every language binding, always, it is supplied as a **filesystem path** and never as a buffer, and there is deliberately no bytes-accepting constructor anywhere in the API.
+The native loader rejects the wrong file type, symlinks, unsafe permissions, and
+invalid lengths, then holds the key in scrub-on-drop memory. Garbage-collected
+language runtimes never receive the raw secret as an ordinary byte buffer.
 
-The reason is specific rather than ceremonial. Handing a raw key to a garbage-collected runtime puts it in memory that is never zeroized, is freely copied by the collector, and shows up in a heap dump. Instead the file is opened by Rust through a checked loader — it must be a regular file, not a symlink, owner-only, and exactly the right size — read into scrub-on-drop storage, and never handed back to the caller. The key's entire lifetime stays on one side of the boundary.
+## Revocation uses monotonic floors
 
-## Revocation is a floor, not a list
+Membership and capability artifacts carry generations and bounded validity
+windows. A signed revocation floor invalidates older generations for an exact
+subject or scope. Nodes merge floors monotonically: stale state cannot lower the
+current floor and make an old credential valid again.
 
-Certificates carry a revocation *generation*. To revoke, the organization signs a floor bundle: "for this member, every certificate below generation N is now invalid." Nodes merge bundles monotonically — a lower floor never rolls back a higher one, and the state survives a restart.
+Renewal is re-issuance under a current generation, not extension of an accepted
+session. Providers re-evaluate the live floors on protected calls.
 
-The practical consequence is that v1 renewal is re-issue plus a raised floor, rather than extension in place. Grants are correspondingly short-lived: seven days by default, thirty at the absolute ceiling, rejected both at issue time and at every verifier. Long-lived org credentials are not a configuration you can opt into.
+## Organizations federate; they do not merge
 
-## Exported services ride organization authority
+Organizations are the horizontal federation plane. Each participant retains its
+own root, members, grants, provider policy, and operational systems. A grant
+creates one bounded relationship; it does not create a shared super-organization.
 
-When a provider sits inside a protected [subnet](/docs/concepts/subnets) and one of its services must be reachable from outside that boundary, the caller's side of the story does not change. The same org client that makes ordinary protected calls makes exported ones — `call_exported` instead of `call` — with the same credentials, the same per-call proof, and the same four error domains. Discovery runs on the public plane through a verified ownership projection, because the provider's encrypted announcement planes stop at its boundary.
+Subnets provide the vertical topology inside each installation:
 
-The name is deliberate. It is `call_exported`, not `call_subnet`: the caller never joins the provider's subnet, never names one, and receives no subnet context. Which crossings a provider may export is that provider's business, proved against its own subnet authority on every dispatch; *who is calling* remains the organization's business, proved exactly as above. The two authorities compose without either leaking into the other's vocabulary.
+```text
+organization A                     organization B
+  callers and internal providers    exported provider
+          │                                │
+          └──── bounded org grant ─────────┘
+                                           │
+                                  provider-local subnet
+```
 
-## What you actually do with this
+This is how independent inference providers, enterprise systems, vehicles, and
+applications can participate in one mesh without transferring ownership to one
+scheduler or cloud account. Provider-local runtimes continue to own execution,
+batching, storage, and admission behind the capability they expose.
 
-Issuance is an offline ceremony against the org root key, run through [`net-mesh org`](/docs/reference/cli). Nothing in the SDK issues credentials, and the org key never needs to be on a node.
+## Operator and application responsibilities
 
-In application code you touch two verbs — bind a credential set to your mesh and call, or serve a capability under an access mode — and one startup step that installs what the ceremony produced. [Private capabilities](/docs/guides/private-capabilities) walks the whole path, in every supported language.
+Operator tooling under [`net-mesh org`](/docs/reference/cli) creates memberships,
+dispatcher grants, capability grants, audience material, and revocation state.
+Application SDKs consume those artifacts; they do not carry the organization root
+or issue new authority.
+
+Application code normally:
+
+1. constructs a mesh with its adopted node authority;
+2. binds organization credentials;
+3. serves a protected capability or invokes one through `call` or
+   `call_exported`;
+4. handles local discovery, remote denial, timeout, and application-level retry
+   as distinct outcomes.
+
+See [Private capabilities](/docs/guides/private-capabilities) for the ordinary
+same-org and granted workflow.
+
+## Where to read next
+
+- [Subnets](/docs/concepts/subnets)
+- [Identity](/docs/concepts/identity)
+- [Capabilities](/docs/concepts/capabilities)
+- [Security model](/docs/concepts/security-model)
+- [Private capabilities](/docs/guides/private-capabilities)
+- [Error codes](/docs/reference/error-codes)
