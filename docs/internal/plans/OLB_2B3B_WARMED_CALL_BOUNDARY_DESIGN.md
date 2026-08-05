@@ -2465,6 +2465,115 @@ observable. Evidence is reproducible from `run.py` + `mutations.json` +
 `ledger.tsv` under the out-of-repo scratch directory, with the round-1 ledger
 kept beside the final one. Nothing from it is committed.
 
+### 18.0d The HOLD repair — four items, and what each one turned out to be
+
+Step 2's candidate was HELD at `7ffd29fa3`. The mutation packet was accepted;
+four repairs were required. Two were production defects, one was the unfinished
+half of an earlier repair, and one was an evidence-strength item. All four are
+additive.
+
+**Item 1 — the session projection was not coherent with the exact peer
+incarnation.** `build_session_rows` sampled a peer's session and directness,
+released the peer guard, and then revalidated only `NodeId → EntityId`. A
+concurrent peer replacement installs `S1` after the build sampled `S0` and
+leaves the identity mapping untouched, so the identity half passes and the build
+publishes a fresh generation naming a session that is already gone — a 2B.3d
+consumer would preselect it. The re-check now covers the **exact incarnation**:
+the peer still agrees it is that node, its `session_id` is unchanged, AND its
+directness is unchanged. A replacement landing after the re-check is ordered
+behind us differently — it takes the session publication gate this build holds,
+so its own republication is strictly later and supersedes ours, which is the
+argument the facts plane already makes for its commit pin. No gate inversion was
+introduced: the build takes no peer lock beyond the two map reads it already
+took.
+
+**Item 2 — a peer-map guard was retained across async socket I/O.** This is the
+production defect behind the ten-minute `AnnounceCapabilities` timeout in the Go
+bindings. `send_subprotocol_to_node` held its `DashMap` peer guard across
+`socket.send_to(..).await` and used it afterwards, so a send that pends wedged
+that shard for as long as it pended: no peer replacement, no eviction, no other
+reader — and the capability-announcement path funnels through it, so an exported
+FFI entry point reaching it synchronously turned a pending socket into an
+indefinite hang of the whole peer plane.
+
+`send_to_peer_node` had the SAME defect and was not named in the HOLD. It is
+worse: it awaits once per MTU-sized chunk, so a large batch held the shard
+across a whole sequence of sends. Both now read, copy and release before
+awaiting. A sweep of every `peers.get`/`peers.entry` site against every
+following `.await` found no third instance — the other candidates all clone
+inside the statement that takes the guard.
+
+Every caller-facing send now goes through one bounded seam, `send_datagram`,
+under [`DATAGRAM_SEND_DEADLINE`], so the bound is a property of the seam rather
+than a rule each call site re-earns.
+
+**Item 3 — the scratch-cleanup repair was half done.** `1bb152291` removed the
+three fixture `Drop` impls and `fccbf3ff9` the inline end-of-test deletions in
+`src/`; neither touched `tests/`. Six integration test files create authority or
+revocation stores, and between them they held 98 end-of-test deletions plus two
+`ScratchDir` cleanup `Drop`s — which is where Coverage's seven `org_ownership`
+failures and the `org_admission_gate` failures came from, all reporting
+`state lock: No such file or directory`. Classified by the established rule and
+repaired: start-of-test resets on per-test paths stay (they run before anything
+is registered), end-of-test deletion goes.
+
+**Item 4 — exact counts and the publication interleaving.** Every "retires
+exactly" and "retires once" claim is now an exact counter delta taken at a
+proven-idle point, not `>= 1` and not eventual absence. Absence alone is also
+produced by retiring the same pool again on every pass, which is the spin the
+terminal arm exists to exclude; `>=` is satisfied by a transition that churns
+every retained pool on the node, which is the breadth failure the pool-only
+invalidator is scoped to avoid.
+
+The "publish as one unit" claim now has an observer interleaved at the
+publication point (`a_projection_and_its_generation_are_never_observed_torn`).
+Note what it can and cannot prove: the projection and its generation live in ONE
+`Arc`, so a torn pair is UNREPRESENTABLE rather than merely absent, and the
+witness confirms every observation a mid-republication reader can take is either
+wholly the old value or wholly the new one. It carries no inverse mutation,
+because the mutation that would produce a tear is a structural change to the
+type — two fields published separately — and this document does not claim a
+mutation it did not run.
+
+### 18.0e Step-2 HOLD-repair mutation rows
+
+Run against the repaired tree under the same harness and discipline as §18.0c.
+
+| # | ID | Production change | Selected witness | Outcome |
+|---|---|---|---|---|
+| 23 | M-Z23 | restore the peer-map guard across the send await | `a_send_in_flight_retains_no_peer_shard` | RED |
+| 24 | M-Z24 | drop the peer-INCARNATION half of the stability re-check | `a_peer_replaced_mid_build_cannot_publish_its_old_session` | RED |
+| 25 | M-Z25 | `send_datagram` without the deadline | `a_send_in_flight_retains_no_peer_shard` | **GREEN — not claimed; see below** |
+| 26 | M-Z26 | the incarnation re-check compares only `session_id` | `a_transport_flipped_mid_build_cannot_publish_its_old_directness` | RED |
+| 26c | M-Z26c | **shared** with #26, against S2-9 | `a_peer_replaced_mid_build_cannot_publish_its_old_session` | **GREEN — the intended control** |
+
+**M-Z23 is why the send witness was rewritten before it was trusted.** Its first
+form sent to a black-hole address and then checked that a peer replacement
+succeeded. That proves nothing: a UDP `send_to` to an unroutable address does
+not pend — the datagram is accepted and the call returns at once — so the send
+was already over before the replacement was attempted, and all three of its
+properties were trivially satisfied. It would have gone GREEN under the very
+defect it claimed to catch. The witness now observes the ONE instant the
+property is about, from inside the send: the hook fires with the guard released
+and the await not started, and from there a separate thread takes the same shard
+for WRITING under a bounded join. That form dies to restoring the guard.
+
+**M-Z25 is a survivor this document does NOT resolve by re-aiming.** The
+deadline's timeout arm is not independently observable: no reachable test input
+makes a UDP `send_to` pend, so the arm never fires, and every assertion the
+witness makes holds with or without it. The deadline stays as defence in depth
+for the case the witness cannot construct — a socket that is genuinely
+unwritable — and this document says plainly that no witness claims it, rather
+than carrying one built to imply otherwise. Same discipline as §17.6a's fourth
+finding.
+
+**M-Z26c is GREEN deliberately, and it is evidence rather than a gap.** S2-9
+must NOT die to the directness-only mutation: its replacement mints a new
+session id, so the session-id comparison catches it either way. Its surviving is
+what proves the two incarnation components are separable and that neither
+witness is rescuing the other's mutation — the same construction W-G4 uses when
+it holds every other component equal.
+
 ### 18.1 Scope, exactly
 
 The §13 row, and nothing beside it:
@@ -2512,8 +2621,8 @@ Grant rows remain Unknown/Potential until SENSE exists (§2), and
 
 Pinned up front at authorization, and discharged as follows. Step 1's eight
 lifecycle witnesses stand unchanged; the twelve step-2 registry witnesses and
-eight step-2 wiring witnesses below are new (registry 50 -> 62, wiring
-70 -> 78).
+eight step-2 wiring witnesses below are new, plus five more from the HOLD
+repair (registry 50 -> 62, wiring 70 -> 83).
 
 | Obligation | Discharged by | Where |
 |---|---|---|
@@ -2542,6 +2651,10 @@ eight step-2 wiring witnesses below are new (registry 50 -> 62, wiring
 | the validated read refuses a mispaired pool AND a superseded-view pool — each arm refusable by ONE check only, so neither rescues the other's mutation (§18.0c) | `the_validated_pool_read_refuses_a_mispaired_or_superseded_pool` | wiring |
 | terminal session exhaustion fences the plane, retires once, parks, and publishes NO projection for the refused transition (§18.0c) | `an_exhausted_session_generation_fences_the_pool_plane` | wiring |
 | a NON-publishing peer transition publishes no generation, with the owning control | `a_lost_peer_install_publishes_no_session_generation` | wiring |
+| **HOLD 1** — a peer replaced mid-build cannot publish its old session, with the stable-peer control | `a_peer_replaced_mid_build_cannot_publish_its_old_session`, `a_stable_peer_observed_twice_still_publishes_its_row` | wiring |
+| **HOLD 1** — the DIRECTNESS component on its own, session id held equal | `a_transport_flipped_mid_build_cannot_publish_its_old_directness` | wiring |
+| **HOLD 2** — a send in flight retains no peer shard, observed at the release instant | `a_send_in_flight_retains_no_peer_shard` | wiring |
+| **HOLD 4** — projection content and generation are never observed torn (structural: one `Arc`) | `a_projection_and_its_generation_are_never_observed_torn` | wiring |
 
 Three of these carry controls that exist because their assertions would
 otherwise be satisfied by a strictly worse implementation:

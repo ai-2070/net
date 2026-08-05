@@ -7205,6 +7205,11 @@ async fn a_session_transition_retires_the_pool_and_the_actor_republishes_it() {
         "and the pool was computed under the LIVE session view"
     );
 
+    // Baseline at a PROVEN-IDLE point, so the deltas below are the
+    // transition's own work and not a warm-up pass's (HOLD item 4).
+    let _ = quiesced_counts(&node).await;
+    let before = node.org_routing_pool_counts();
+
     // A real session transition.
     seed_peer(&node, 0x6001, true);
     node.test_pin_peer_entity(0x6001, EntityId::from_bytes([0x61u8; 32]));
@@ -7226,14 +7231,26 @@ async fn a_session_transition_retires_the_pool_and_the_actor_republishes_it() {
         "and the discovery facts were preserved throughout — session movement \
          is not a reason to re-reconstruct the source"
     );
-    let counts = node.org_routing_pool_counts();
-    assert!(
-        counts[0] >= 2,
-        "two publications: the original and the rebuild"
+    // EXACT deltas, at another proven-idle point. `>=` would have accepted a
+    // transition that churned every retained pool on the node -- the breadth
+    // failure the pool-only invalidator is scoped to avoid, and precisely the
+    // assertion an over-broad implementation passes.
+    let _ = quiesced_counts(&node).await;
+    let after = node.org_routing_pool_counts();
+    assert_eq!(
+        after[1] - before[1],
+        1,
+        "the transition retired EXACTLY the one superseded pool this node holds"
     );
-    assert!(
-        counts[1] >= 1,
-        "and exactly the superseded pool was retired"
+    assert_eq!(
+        after[0] - before[0],
+        1,
+        "and the actor republished EXACTLY one pool for it"
+    );
+    assert_eq!(
+        after[2] - before[2],
+        0,
+        "with no build refused: the rebuild ran after the projection settled"
     );
 
     drop(held);
@@ -7369,6 +7386,7 @@ async fn an_exhausted_session_generation_fences_the_pool_plane() {
     // terminal marker, then drive one real transition.
     node.session_routing.currentness.set_for_test(u64::MAX - 1);
     let publications_before = node.org_routing_session_publications();
+    let retired_before = node.org_routing_pool_counts()[1];
     seed_peer(&node, 0x7001, true);
     node.test_pin_peer_entity(0x7001, EntityId::from_bytes([0x71u8; 32]));
 
@@ -7404,6 +7422,16 @@ async fn an_exhausted_session_generation_fences_the_pool_plane() {
         .await,
         "every retained pool is retired once, rather than left published under \
          a view nothing can witness"
+    );
+    // "retires ONCE" as an EXACT delta, not as eventual absence (HOLD item 4).
+    // Absence alone is also produced by retiring the same pool again on every
+    // subsequent pass, which is the spin this arm exists to exclude.
+    let _ = quiesced_counts(&node).await;
+    assert_eq!(
+        node.org_routing_pool_counts()[1] - retired_before,
+        1,
+        "exactly ONE retirement for the one pool this node held; a spinning \
+         terminal arm would keep counting them"
     );
     assert!(
         node.org_routing_unsensed_pool(&key).is_none(),
@@ -7488,5 +7516,409 @@ async fn a_lost_peer_install_publishes_no_session_generation() {
         node.org_routing_session_generation(),
         generation,
         "and the live generation does not move"
+    );
+}
+
+/// (S2-9) **HOLD item 1 — the sample→revalidate interleaving.** A peer
+/// replacement landing INSIDE the projection build cannot make that build
+/// publish a generation naming the session it replaced.
+///
+/// The build samples peer `N`'s session `S0`, is paused there, `S1` is
+/// installed over it, and the build is released. The `NodeId → EntityId`
+/// mapping never moves, so the identity half of the stability check passes —
+/// which is exactly why the INCARNATION half has to exist. Without it the
+/// build publishes a fresh generation whose row names `S0`, and a 2B.3d
+/// consumer preselects a session that is already gone.
+///
+/// Dies to: dropping the incarnation re-read (session id or directness) from
+/// `build_session_rows`. The seven other projection witnesses all survive that
+/// mutation, because none of them replaces a peer mid-build.
+#[tokio::test]
+async fn a_peer_replaced_mid_build_cannot_publish_its_old_session() {
+    use crate::adapter::net::behavior::org_routing_registry::DirectEligibility;
+    let node = node().await;
+    let entity = EntityId::from_bytes([0x81u8; 32]);
+    const N: u64 = 0x8001;
+
+    let s0 = seed_peer(&node, N, true);
+    node.test_pin_peer_entity(N, entity.clone());
+    assert_eq!(
+        eligibility_of(&node, &entity),
+        DirectEligibility::Direct {
+            node_id: N,
+            session_id: s0,
+        },
+        "precondition: the projection names S0"
+    );
+
+    // Arm the one-shot interleaving: when the build has sampled N's peer and
+    // is about to revalidate it, replace the live session.
+    let replaced: Arc<parking_lot::Mutex<Option<u64>>> = Arc::new(parking_lot::Mutex::new(None));
+    {
+        let node_for_hook = node.clone();
+        let replaced = replaced.clone();
+        node.session_routing
+            .observe_build_for_test(Arc::new(move |sampled| {
+                if sampled != N {
+                    return;
+                }
+                // `seed_peer` overwrites the peer entry, so the map now holds a
+                // different session id under the same node id — the exact shape
+                // a re-handshake or a direct-path upgrade produces.
+                let s1 = seed_peer(&node_for_hook, N, true);
+                *replaced.lock() = Some(s1);
+            }));
+    }
+
+    // Drive one republication straight through the production notifier.
+    node.note_session_transition();
+
+    let s1 = replaced
+        .lock()
+        .take()
+        .expect("the interleaving must have run");
+    assert_ne!(s1, s0, "precondition: the replacement is a NEW incarnation");
+
+    // THE PROPERTY: nothing published names S0.
+    let published = node.session_routing.published.load_full();
+    let row = published.rows.get(&entity).copied();
+    assert!(
+        !matches!(row, Some(DirectEligibility::Direct { session_id, .. })
+                     | Some(DirectEligibility::Relayed { session_id, .. })
+                  if session_id == s0),
+        "a build that sampled S0 must not publish it once S1 is installed; \
+         published {row:?} with S0 = {s0}"
+    );
+    // And the pool plane cannot name it either, because no pool can be built
+    // from a projection that does not contain it.
+    assert!(
+        !matches!(eligibility_of(&node, &entity),
+                  DirectEligibility::Direct { session_id, .. }
+                  | DirectEligibility::Relayed { session_id, .. } if session_id == s0),
+        "and the eligibility a pool would be annotated from names no S0 either"
+    );
+
+    // CONVERGENCE: the next republication — the one the real replacement
+    // transition performs — names S1. Without this the witness would accept a
+    // plane that refuses forever.
+    node.note_session_transition();
+    assert_eq!(
+        eligibility_of(&node, &entity),
+        DirectEligibility::Direct {
+            node_id: N,
+            session_id: s1,
+        },
+        "the rebuild after the replacement names the LIVE incarnation"
+    );
+}
+
+/// (S2-10) The inverse control for S2-9: the same interleaving over a STABLE
+/// peer publishes the row.
+///
+/// Without it, "never publish a row whose peer was observed twice" satisfies
+/// S2-9 perfectly — and would make every provider on the node permanently
+/// cold, which is the strictly-worse implementation this pair exists to
+/// separate from the correct one.
+#[tokio::test]
+async fn a_stable_peer_observed_twice_still_publishes_its_row() {
+    use crate::adapter::net::behavior::org_routing_registry::DirectEligibility;
+    let node = node().await;
+    let entity = EntityId::from_bytes([0x91u8; 32]);
+    const N: u64 = 0x9001;
+
+    let s0 = seed_peer(&node, N, true);
+    node.test_pin_peer_entity(N, entity.clone());
+
+    // The same observation point, firing over a peer nothing touches.
+    let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let observed = observed.clone();
+        node.session_routing
+            .observe_build_for_test(Arc::new(move |sampled| {
+                if sampled == N {
+                    observed.store(true, Ordering::Release);
+                }
+            }));
+    }
+    node.note_session_transition();
+    assert!(
+        observed.load(Ordering::Acquire),
+        "precondition: the interleaving point must actually have been reached, \
+         or this control proves nothing"
+    );
+
+    assert_eq!(
+        eligibility_of(&node, &entity),
+        DirectEligibility::Direct {
+            node_id: N,
+            session_id: s0,
+        },
+        "a peer that did not move is annotated with the session it has"
+    );
+}
+
+/// (S2-11) **HOLD item 4 — projection content and its generation publish as ONE
+/// unit.** A reader interleaved at the publication point can never observe the
+/// new generation beside the old rows, or the new rows beside the old
+/// generation.
+///
+/// Final-state equality cannot prove this: both stores complete before any
+/// assertion runs, so a torn intermediate state is invisible to it. The reader
+/// here samples the published value from INSIDE the build, which is the only
+/// window in which a tear could be observed — and observes a single `Arc`,
+/// which is what makes tearing unrepresentable rather than merely absent.
+#[tokio::test]
+async fn a_projection_and_its_generation_are_never_observed_torn() {
+    let node = node().await;
+    let entity = EntityId::from_bytes([0xa1u8; 32]);
+    const N: u64 = 0xa001;
+    seed_peer(&node, N, true);
+    node.test_pin_peer_entity(N, entity.clone());
+
+    // Every sample a reader can take while a republication is in flight.
+    let samples: Arc<parking_lot::Mutex<Vec<(u64, usize)>>> =
+        Arc::new(parking_lot::Mutex::new(Vec::new()));
+    {
+        let node_for_hook = node.clone();
+        let samples = samples.clone();
+        node.session_routing
+            .observe_build_for_test(Arc::new(move |_| {
+                // The lock-free reader, mid-republication: ONE load, so the
+                // generation and the rows it names come from one value.
+                let seen = node_for_hook.session_routing.published.load_full();
+                samples.lock().push((seen.generation, seen.rows.len()));
+            }));
+    }
+
+    let before = node.session_routing.published.load_full();
+    node.note_session_transition();
+    let after = node.session_routing.published.load_full();
+
+    let samples = samples.lock().clone();
+    assert!(
+        !samples.is_empty(),
+        "the reader must have been scheduled inside the republication, or this \
+         witness proves nothing"
+    );
+    for (generation, rows) in samples {
+        // The only two coherent observations are the projection as it was and
+        // the projection as it becomes. A generation from one paired with a row
+        // count from the other is a tear.
+        assert!(
+            (generation, rows) == (before.generation, before.rows.len())
+                || (generation, rows) == (after.generation, after.rows.len()),
+            "observed a torn pair: generation {generation} with {rows} rows, \
+             while before = ({}, {}) and after = ({}, {})",
+            before.generation,
+            before.rows.len(),
+            after.generation,
+            after.rows.len()
+        );
+    }
+    assert!(
+        after.generation > before.generation,
+        "and the republication did advance the generation"
+    );
+}
+
+/// (S2-12) **HOLD item 2 — the peer shard is RELEASED before the send awaits.**
+///
+/// The defect: `send_subprotocol_to_node` and `send_to_peer_node` held the
+/// `DashMap` peer guard across `socket.send_to(..).await`, and used it after. A
+/// send that pends therefore wedged that shard for as long as it pended — no
+/// peer replacement, no eviction, no other reader of the same shard — and
+/// because the capability-announcement path funnels through the first of them,
+/// an exported FFI entry point reaching it synchronously turned a pending
+/// socket into an indefinite hang of the whole peer plane.
+///
+/// **Why this is driven from an observation point and not from a slow send.**
+/// A UDP `send_to` to a black-hole address does not pend: the datagram is
+/// accepted by the socket and the call returns at once. So a witness that just
+/// sends somewhere unroutable and then checks that a replacement succeeds
+/// proves nothing at all — the send is already over. The property is about the
+/// window between releasing the guard and awaiting, so it is observed exactly
+/// there: the hook fires at that instant, and from it a SEPARATE thread takes
+/// the same shard for WRITING under a bounded join.
+///
+/// Dies to: restoring the guard across the await. The bounded join then expires
+/// — the writer is blocked on the shard the send is holding — instead of
+/// completing in microseconds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_send_in_flight_retains_no_peer_shard() {
+    let node = node().await;
+    const N: u64 = 0xb001;
+    let _s0 = seed_peer(&node, N, true);
+
+    // Fired with the guard released and the await not yet started. From here a
+    // writer must be able to take the very shard the send used.
+    let wrote = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let node_for_hook = node.clone();
+        let wrote = wrote.clone();
+        node.observe_send_guard_release_for_test(Arc::new(move || {
+            let node_for_thread = node_for_hook.clone();
+            let writer = std::thread::spawn(move || {
+                // A WRITE on the same shard: `insert` needs the write half, so a
+                // retained read guard blocks it outright.
+                seed_peer(&node_for_thread, N, false);
+            });
+            // Bounded rather than a bare join, so the mutated build fails
+            // loudly instead of hanging the suite.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !writer.is_finished() {
+                if std::time::Instant::now() >= deadline {
+                    panic!(
+                        "a peer-map WRITE could not proceed while a send was in \
+                         flight: the send is retaining its peer shard across the \
+                         await"
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            writer.join().expect("writer thread");
+            wrote.store(true, Ordering::Release);
+        }));
+    }
+
+    let sent = node
+        .send_subprotocol_to_node(N, SUBPROTOCOL_CAPABILITY_ANN, b"probe")
+        .await;
+    assert!(
+        wrote.load(Ordering::Acquire),
+        "the observation point must have been reached, or this witness proves \
+         nothing"
+    );
+    // The send's own outcome is not the property — a black-hole address may
+    // succeed or fail at the socket. What matters is that it got here at all.
+    let _ = sent;
+
+    // And the announcement path is usable afterwards: it is not queued behind a
+    // shard the send never gave back.
+    assert!(
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            node.announce_capabilities(
+                crate::adapter::net::behavior::capability::CapabilitySet::new()
+            )
+        )
+        .await
+        .is_ok(),
+        "AnnounceCapabilities must not be wedged behind a completed send"
+    );
+}
+
+/// Re-insert `node_id`'s peer with the OPPOSITE transport, keeping the very
+/// same `NetSession`.
+///
+/// The session id is deliberately unchanged: that is what makes the DIRECTNESS
+/// half of the incarnation re-check observable on its own. A replacement that
+/// also minted a new session would be caught by the session-id comparison, so
+/// it could never separate the two components.
+fn flip_peer_transport(node: &MeshNode, node_id: u64) -> bool {
+    let Some(existing) = node.peers.get(&node_id).map(|p| {
+        (
+            p.session.clone(),
+            p.transport,
+            p.remote_static_pub,
+            p.last_initiator_ephemeral,
+        )
+    }) else {
+        return false;
+    };
+    let (session, transport, remote_static_pub, last_initiator_ephemeral) = existing;
+    let addr = transport.send_addr();
+    let flipped = match transport {
+        PeerTransport::Direct { .. } => PeerTransport::Routed {
+            relay_addr: addr,
+            adjacent_relay_identity: None,
+        },
+        PeerTransport::Routed { .. } => PeerTransport::Direct { owned_addr: addr },
+    };
+    node.peers.insert(
+        node_id,
+        PeerInfo {
+            node_id,
+            transport: flipped,
+            session,
+            remote_static_pub,
+            last_initiator_ephemeral,
+        },
+    );
+    true
+}
+
+/// (S2-13) The DIRECTNESS half of the incarnation re-check, on its own.
+///
+/// The peer's transport flips mid-build while its session id stays identical,
+/// so the session-id comparison cannot catch it. Without the directness
+/// component the build publishes `Direct` for a provider that is now only
+/// reachable through a relay — an annotation that would have 2B.3d preselect a
+/// route the peer no longer owns, which is the "directness annotates and never
+/// creates authority" line read the wrong way round.
+///
+/// Dies to: comparing only `session_id` in the incarnation re-check. S2-9
+/// survives that mutation, because its replacement mints a new session id.
+#[tokio::test]
+async fn a_transport_flipped_mid_build_cannot_publish_its_old_directness() {
+    use crate::adapter::net::behavior::org_routing_registry::DirectEligibility;
+    let node = node().await;
+    let entity = EntityId::from_bytes([0xc1u8; 32]);
+    const N: u64 = 0xc001;
+
+    let s0 = seed_peer(&node, N, true);
+    node.test_pin_peer_entity(N, entity.clone());
+    assert_eq!(
+        eligibility_of(&node, &entity),
+        DirectEligibility::Direct {
+            node_id: N,
+            session_id: s0,
+        },
+        "precondition: the projection names a DIRECT S0"
+    );
+
+    let flipped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let node_for_hook = node.clone();
+        let flipped = flipped.clone();
+        node.session_routing
+            .observe_build_for_test(Arc::new(move |sampled| {
+                if sampled != N {
+                    return;
+                }
+                assert!(
+                    flip_peer_transport(&node_for_hook, N),
+                    "the interleaving must actually have flipped the transport"
+                );
+                flipped.store(true, Ordering::Release);
+            }));
+    }
+    node.note_session_transition();
+    assert!(
+        flipped.load(Ordering::Acquire),
+        "precondition: the interleaving must have run"
+    );
+
+    // The session id did NOT change, so only the directness component can
+    // refuse this row.
+    let published = node.session_routing.published.load_full();
+    assert_ne!(
+        published.rows.get(&entity).copied(),
+        Some(DirectEligibility::Direct {
+            node_id: N,
+            session_id: s0,
+        }),
+        "a build that sampled DIRECT must not publish it once the transport is \
+         relayed, even though the session id never moved"
+    );
+
+    // CONVERGENCE: the rebuild names the transport the peer actually has.
+    node.note_session_transition();
+    assert_eq!(
+        eligibility_of(&node, &entity),
+        DirectEligibility::Relayed {
+            node_id: N,
+            session_id: s0,
+        },
+        "and the rebuild annotates it RELAYED, on the same session"
     );
 }

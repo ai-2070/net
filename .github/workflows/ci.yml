@@ -143,7 +143,13 @@ jobs:
       # pool that is mispaired OR computed under a superseded view at the
       # validated read seam, and fences the whole pool plane fail-closed when
       # the session-generation space is spent, and that a peer transition which
-      # publishes NOTHING publishes no session generation. Losing any of them silently
+      # publishes NOTHING publishes no session generation -- plus, since the
+      # step-2 HOLD repair, that a peer REPLACED inside the projection build
+      # cannot publish the session it replaced (both the session-id and the
+      # directness components, each observable on its own, with the stable-peer
+      # control), that a send in flight retains no peer shard at the instant the
+      # guard is released, and that a projection and the generation naming it are
+      # never observed torn. Losing any of them silently
       # would be worse than losing them loudly.
       #
       # NOTE: they are gated `#[cfg(test)]`, NOT `feature = "fixtures"` —
@@ -153,7 +159,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           set -o pipefail
-          MIN=78
+          MIN=83
           out=$(cargo test --lib --features "$UNIT_FEATURES" \
                   org_routing_wiring_tests 2>&1 | tee /dev/stderr)
           n=$(printf '%s\n' "$out" \
@@ -221,7 +227,12 @@ jobs:
           a_session_transition_retires_the_pool_and_the_actor_republishes_it
           the_validated_pool_read_refuses_a_mispaired_or_superseded_pool
           an_exhausted_session_generation_fences_the_pool_plane
-          a_lost_peer_install_publishes_no_session_generation"
+          a_lost_peer_install_publishes_no_session_generation
+          a_peer_replaced_mid_build_cannot_publish_its_old_session
+          a_stable_peer_observed_twice_still_publishes_its_row
+          a_transport_flipped_mid_build_cannot_publish_its_old_directness
+          a_send_in_flight_retains_no_peer_shard
+          a_projection_and_its_generation_are_never_observed_torn"
           for required in $REQUIRED; do
             if ! printf "%s" "$out" | grep -q "$required"; then
               echo "::error::required routing witness missing: $required"

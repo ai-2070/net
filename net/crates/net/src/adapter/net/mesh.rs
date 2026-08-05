@@ -217,6 +217,20 @@ impl ControlPlaneStats {
 /// caller does NOT replay) rather than spin forever (#4 follow-up).
 const COMMITTED_FLUSH_STALL_BUDGET: Duration = Duration::from_secs(30);
 
+/// Bound on ONE datagram send (OLB-2B.3c step-2 HOLD item 2).
+///
+/// `NetSocket::send_to` pends while the socket is unwritable, and a socket that
+/// never becomes writable turns a send into an indefinite await with no error
+/// to report. That is survivable on a background task and is NOT survivable on
+/// a path an exported FFI entry point reaches synchronously: the caller has no
+/// cancellation, so the hang becomes the process's. The deadline converts it
+/// into a typed refusal the caller can surface.
+///
+/// Generous relative to any healthy send — a local datagram completes in
+/// microseconds — and short enough that a wedged socket is reported rather than
+/// waited on.
+const DATAGRAM_SEND_DEADLINE: Duration = Duration::from_secs(5);
+
 /// Back off, then report whether the committed-prefix flush retry may
 /// continue. Returns `Err(StreamError::Transport)` once `deadline` has
 /// passed — a receiver that has granted no credit by then is treated as
@@ -6381,6 +6395,8 @@ struct NodeSessionRouting {
     /// Republications that produced a new generation. Observable so a witness
     /// can prove a NON-transition published nothing.
     publications: AtomicU64,
+    /// Test-only observation of the sample→revalidate window inside the build.
+    build_observer: SessionBuildObserver,
 }
 
 impl NodeSessionRouting {
@@ -6390,6 +6406,7 @@ impl NodeSessionRouting {
             currentness: super::behavior::org_routing_registry::SessionCurrentness::new(),
             gate: parking_lot::Mutex::new(()),
             publications: AtomicU64::new(0),
+            build_observer: SessionBuildObserver::default(),
         })
     }
 
@@ -6453,7 +6470,7 @@ impl NodeSessionRouting {
             );
             return None;
         };
-        let rows = build_session_rows(peers, peer_entity_ids);
+        let rows = build_session_rows(peers, peer_entity_ids, &self.build_observer);
         self.published
             .store(Arc::new(SessionProjection { generation, rows }));
         self.currentness.commit(generation);
@@ -6464,6 +6481,42 @@ impl NodeSessionRouting {
     #[cfg(test)]
     fn publications(&self) -> u64 {
         self.publications.load(Ordering::Acquire)
+    }
+
+    /// Test-only: arm the one-shot sample→revalidate interleaving. The hook
+    /// receives the `node_id` whose peer was just sampled.
+    #[cfg(test)]
+    fn observe_build_for_test(&self, hook: Arc<dyn Fn(u64) + Send + Sync>) {
+        *self.build_observer.hook.lock() = Some(hook);
+    }
+}
+
+/// Test-only observation point INSIDE the projection build: fires once, after a
+/// peer's session has been sampled and before that sample is revalidated.
+///
+/// A production build has no field here, so `observe` compiles to nothing. It
+/// exists because the sample→revalidate window is invisible to every
+/// final-state assertion: the interleaving that matters is a peer replacement
+/// landing exactly inside it, and only a reader scheduled there can drive one.
+#[derive(Default)]
+struct SessionBuildObserver {
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    hook: parking_lot::Mutex<Option<Arc<dyn Fn(u64) + Send + Sync>>>,
+}
+
+impl SessionBuildObserver {
+    /// One-shot: the hook is TAKEN, so a witness arms exactly one interleaving
+    /// and the rebuild that follows it runs clean.
+    #[inline]
+    fn observe_sampled(&self, _node_id: u64) {
+        #[cfg(test)]
+        {
+            let hook = self.hook.lock().take();
+            if let Some(hook) = hook {
+                hook(_node_id);
+            }
+        }
     }
 }
 
@@ -6485,6 +6538,7 @@ impl NodeSessionRouting {
 fn build_session_rows(
     peers: &DashMap<u64, PeerInfo>,
     peer_entity_ids: &DashMap<u64, EntityId>,
+    observer: &SessionBuildObserver,
 ) -> std::collections::BTreeMap<EntityId, super::behavior::org_routing_registry::DirectEligibility>
 {
     use super::behavior::org_routing_registry::DirectEligibility;
@@ -6503,36 +6557,58 @@ fn build_session_rows(
         .map(|entry| (*entry.key(), entry.value().clone()))
         .collect();
     for (node_id, entity) in pinned {
-        let Some(peer) = peers.get(&node_id) else {
-            continue;
-        };
-        if peer.node_id != node_id {
+        // SAMPLE the peer: its exact session incarnation and its transport.
+        let Some((session_id, direct)) = peers.get(&node_id).and_then(|peer| {
             // The peer record does not agree it is this node. Refuse rather
             // than trusting the key over the record.
+            (peer.node_id == node_id).then(|| (peer.session.session_id(), peer.is_direct()))
+        }) else {
+            continue;
+        };
+        observer.observe_sampled(node_id);
+        // STABILITY, both halves. The sample above is two mutable maps read
+        // without a lock spanning them, so BOTH bases have to be revalidated
+        // before the row can be published, and a row whose basis moved is
+        // dropped rather than repaired.
+        //
+        // The identity half was always here. The INCARNATION half was not, and
+        // its absence was a real hole: a concurrent peer replacement installs
+        // `S1` after this build sampled `S0`, leaves the `NodeId → EntityId`
+        // mapping untouched — so the identity check passes — and the build then
+        // publishes a fresh generation naming a session that is already gone.
+        // A 2B.3d consumer would preselect it, which is exactly the "never
+        // attach a session to a provider on the strength of a mutable read"
+        // rule this join exists to keep.
+        //
+        // Re-reading the peer closes the sampled-then-replaced case
+        // deterministically. A replacement landing AFTER this check is ordered
+        // behind us differently: it takes the session publication gate this
+        // build already holds, so its own republication is strictly later and
+        // supersedes whatever we publish — the same argument the facts plane
+        // makes for its commit pin.
+        let identity_current = peer_entity_ids
+            .get(&node_id)
+            .is_some_and(|live| *live.value() == entity);
+        let incarnation_current = peers.get(&node_id).is_some_and(|peer| {
+            peer.node_id == node_id
+                && peer.session.session_id() == session_id
+                && peer.is_direct() == direct
+        });
+        if !identity_current || !incarnation_current {
+            ambiguous.insert(entity);
             continue;
         }
-        let eligibility = if peer.is_direct() {
+        let eligibility = if direct {
             DirectEligibility::Direct {
                 node_id,
-                session_id: peer.session.session_id(),
+                session_id,
             }
         } else {
             DirectEligibility::Relayed {
                 node_id,
-                session_id: peer.session.session_id(),
+                session_id,
             }
         };
-        drop(peer);
-        // STABILITY: the identity mapping is mutable and may have moved while
-        // the peer record was being read. A row whose basis changed underneath
-        // it is dropped, never repaired.
-        if peer_entity_ids
-            .get(&node_id)
-            .is_none_or(|live| *live.value() != entity)
-        {
-            ambiguous.insert(entity);
-            continue;
-        }
         if rows.insert(entity.clone(), eligibility).is_some() {
             // A second live session claims this entity. There is no answer to
             // "which session would a call use", so there is no row.
@@ -6752,6 +6828,29 @@ struct ScopedSourceSnapshot {
             u64,
         ),
     >,
+}
+
+/// Send ONE datagram under [`DATAGRAM_SEND_DEADLINE`].
+///
+/// Every send on a caller-facing path goes through here, so the bound is a
+/// property of the seam rather than a rule each call site re-earns.
+///
+/// **Callers must not hold a peer-map guard across this.** It awaits, and a
+/// `DashMap` shard guard held across an await wedges that shard for as long as
+/// the send pends — blocking peer replacement, eviction, and every other
+/// reader of the same shard. Clone what you need and release the guard first.
+async fn send_datagram(
+    socket: &NetSocket,
+    packet: &[u8],
+    addr: SocketAddr,
+) -> Result<(), AdapterError> {
+    match tokio::time::timeout(DATAGRAM_SEND_DEADLINE, socket.send_to(packet, addr)).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(AdapterError::Connection(format!("send failed: {e}"))),
+        Err(_) => Err(AdapterError::Connection(format!(
+            "send to {addr} exceeded the {DATAGRAM_SEND_DEADLINE:?} datagram deadline"
+        ))),
+    }
 }
 
 /// Publish an authority change and advance the routing epoch as ONE ordered unit
@@ -8079,6 +8178,12 @@ pub struct MeshNode {
     /// actor incarnation; the actor's authority over it is claimed and revoked by
     /// the incarnation lifecycle, not by construction.
     routing_registry: Arc<super::behavior::org_routing_registry::NodeOrgRoutingRegistry>,
+    /// Test-only: fires inside `send_subprotocol_to_node` at the instant the
+    /// peer-map guard has been RELEASED and before the socket await. The only
+    /// place from which "no peer shard is retained across the send" is
+    /// observable — see the witness for why a black-hole address cannot show it.
+    #[cfg(test)]
+    send_guard_released_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// OLB-2B.3c step 2: the node's ONE session/direct-state projection and the
     /// generation ordering it. Every session transition republishes through
     /// this handle and then invalidates the pools the republication superseded;
@@ -9955,6 +10060,8 @@ impl MeshNode {
             scoped_publication,
             scoped_ingest_counters,
             routing_registry,
+            #[cfg(test)]
+            send_guard_released_hook: parking_lot::Mutex::new(None),
             session_routing,
             routing_work,
             routing_health: super::behavior::org_routing::new_routing_health(),
@@ -16341,6 +16448,13 @@ impl MeshNode {
         );
     }
 
+    /// Test-only: arm the one-shot "guard released, about to await" observation
+    /// inside [`Self::send_subprotocol_to_node`].
+    #[cfg(test)]
+    pub(crate) fn observe_send_guard_release_for_test(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.send_guard_released_hook.lock() = Some(hook);
+    }
+
     /// Test-only: session republications that produced a new generation.
     ///
     /// The direct evidence for "a non-publishing transition wakes nothing" — a
@@ -21238,17 +21352,23 @@ impl MeshNode {
     /// address, so a relayed peer is reachable without anyone having to
     /// claim the relay's address belongs to it.
     pub async fn send_to_peer_node(&self, node_id: u64, batch: &Batch) -> Result<(), AdapterError> {
-        let peer = self
-            .peers
-            .get(&node_id)
-            .ok_or_else(|| AdapterError::Connection("unknown peer".into()))?;
-        let peer_addr = peer.addr();
+        // Read, COPY, release — before the loop below awaits (HOLD item 2).
+        // This path is worse than the subprotocol one it shares the defect
+        // with: it awaits once per MTU-sized chunk, so a large batch held the
+        // peer shard across a whole sequence of sends.
+        let (peer_addr, session) = {
+            let peer = self
+                .peers
+                .get(&node_id)
+                .ok_or_else(|| AdapterError::Connection("unknown peer".into()))?;
+            (peer.addr(), peer.session.clone())
+        };
         // Partition filter: silently drop sends to blocked peers
         if self.partition_filter.contains(&peer_addr) {
             return Ok(());
         }
 
-        let session = &peer.session;
+        let session = &session;
         let stream_id = batch.shard_id as u64;
 
         let reliable = {
@@ -21277,10 +21397,7 @@ impl MeshNode {
                     PacketFlags::NONE
                 };
                 let packet = builder.build(stream_id, seq, &current_batch, flags);
-                self.socket
-                    .send_to(&packet, peer_addr)
-                    .await
-                    .map_err(|e| AdapterError::Connection(format!("send failed: {}", e)))?;
+                send_datagram(&self.socket, &packet, peer_addr).await?;
 
                 current_batch.clear();
                 current_size = 0;
@@ -21301,10 +21418,7 @@ impl MeshNode {
                 PacketFlags::NONE
             };
             let packet = builder.build(stream_id, seq, &current_batch, flags);
-            self.socket
-                .send_to(&packet, peer_addr)
-                .await
-                .map_err(|e| AdapterError::Connection(format!("send failed: {}", e)))?;
+            send_datagram(&self.socket, &packet, peer_addr).await?;
         }
 
         // builder is dropped here — auto-released back to the pool
@@ -28556,16 +28670,34 @@ impl MeshNode {
         subprotocol_id: u16,
         payload: &[u8],
     ) -> Result<(), AdapterError> {
-        let peer = self
-            .peers
-            .get(&node_id)
-            .ok_or_else(|| AdapterError::Connection("unknown peer".into()))?;
-        let peer_addr = peer.addr();
+        // The peer record is read, COPIED, and released before anything awaits
+        // (HOLD item 2). A `DashMap` shard guard held across `.await` wedges
+        // that shard for as long as the send pends: no peer replacement, no
+        // eviction, and no other reader of the same shard. This function is on
+        // the capability-announcement path, which an exported FFI entry point
+        // reaches synchronously — so a pending send used to stop being this
+        // call's problem and become the whole peer plane's.
+        let (peer_addr, session) = {
+            let peer = self
+                .peers
+                .get(&node_id)
+                .ok_or_else(|| AdapterError::Connection("unknown peer".into()))?;
+            (peer.addr(), peer.session.clone())
+        };
         if self.partition_filter.contains(&peer_addr) {
             return Ok(());
         }
 
-        let session = &peer.session;
+        // Test-only, at the ONE instant that matters: the guard above is out of
+        // scope and the await below has not started.
+        #[cfg(test)]
+        {
+            let hook = self.send_guard_released_hook.lock().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        let session = &session;
         let stream_id = subprotocol_id as u64;
 
         let pool = session.thread_local_pool();
@@ -28580,10 +28712,7 @@ impl MeshNode {
         let packet =
             builder.build_subprotocol(stream_id, seq, &events, PacketFlags::NONE, subprotocol_id);
 
-        self.socket
-            .send_to(&packet, peer_addr)
-            .await
-            .map_err(|e| AdapterError::Connection(format!("send failed: {}", e)))?;
+        send_datagram(&self.socket, &packet, peer_addr).await?;
 
         drop(builder);
         session.touch();

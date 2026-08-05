@@ -44,6 +44,22 @@ use net::adapter::net::behavior::sensing::{
 };
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
 
+// A scratch directory holding an authority's revocation `.lock` sidecar is
+// deliberately LEFT BEHIND when its test finishes.
+//
+// `OrgRevocationStore` keys its PROCESS-GLOBAL core registry by that sidecar's
+// `(device, inode)`, so two path aliases of one sidecar share one live view
+// (AV-9). Deleting the directory frees the inode while this test's core is
+// still registered; Linux recycles a freed inode immediately, so the next store
+// opened anywhere in this binary can land on it, derive the same `BackingId`,
+// and join THIS test's core — inheriting its floors, its poison bit and its
+// generation, and writing through a path that no longer exists
+// (`state lock: No such file or directory`).
+//
+// The victims are whichever tests are scheduled next, so it surfaces as
+// unrelated failures in varying combinations rather than as one deterministic
+// break. Start-of-test resets stay: they run before anything is registered.
+
 /// Provider soft-state lifetime — generous against CI hiccups (a refresh every
 /// 200 ms gives ~7 attempts per window).
 const TTL: Duration = Duration::from_millis(1500);
@@ -71,9 +87,11 @@ fn org() -> OrgKeypair {
     OrgKeypair::from_bytes([0x42u8; 32])
 }
 
-/// An RAII scratch authority directory: created on construction, removed on
-/// drop. The live `OrgRevocationStore` is backed by this dir, so the guard is
-/// held for the whole test and cleaned up afterward (no PID-named residue).
+/// A scratch authority directory: created on construction, and deliberately
+/// NOT removed on drop — see the note at the top of this file. The live
+/// `OrgRevocationStore` is backed by this dir, and freeing its `.lock` inode
+/// while the core keyed on it is still registered is what lets the next store
+/// in this binary alias it.
 struct ScratchDir(PathBuf);
 
 impl ScratchDir {
@@ -85,11 +103,12 @@ impl ScratchDir {
     }
 }
 
-impl Drop for ScratchDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+// NO cleanup `Drop`, deliberately — see the note at `ScratchDir`.
+//
+// Freeing this directory's revocation `.lock` inode while the core keyed
+// on it is still live lets the NEXT store in this binary alias it. The
+// residue a reused PID would trip over is handled by `fresh`'s
+// start-of-test reset, which runs before anything is registered.
 
 /// Adopt `node` into `org()` (real ceremony, tempdir authority) and install the
 /// authority as the production object — so this node can VERIFY inbound org

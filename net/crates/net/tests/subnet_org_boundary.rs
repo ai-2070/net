@@ -82,6 +82,22 @@ use net::adapter::net::subnet::{
 };
 use net::adapter::net::{MeshNode, MeshNodeConfig, SocketBufferConfig};
 
+// A scratch directory holding an authority's revocation `.lock` sidecar is
+// deliberately LEFT BEHIND when its test finishes.
+//
+// `OrgRevocationStore` keys its PROCESS-GLOBAL core registry by that sidecar's
+// `(device, inode)`, so two path aliases of one sidecar share one live view
+// (AV-9). Deleting the directory frees the inode while this test's core is
+// still registered; Linux recycles a freed inode immediately, so the next store
+// opened anywhere in this binary can land on it, derive the same `BackingId`,
+// and join THIS test's core — inheriting its floors, its poison bit and its
+// generation, and writing through a path that no longer exists
+// (`state lock: No such file or directory`).
+//
+// The victims are whichever tests are scheduled next, so it surfaces as
+// unrelated failures in varying combinations rather than as one deterministic
+// break. Start-of-test resets stay: they run before anything is registered.
+
 const PSK: [u8; 32] = [0x5Au8; 32];
 
 /// Mirrors the protected-path node config used by
@@ -301,9 +317,7 @@ async fn vehicle_b(tag: &str) -> VehicleB {
 }
 
 impl Drop for VehicleB {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self._dir);
-    }
+    fn drop(&mut self) {}
 }
 
 /// Everything the caller side needs to mint one admission proof.
