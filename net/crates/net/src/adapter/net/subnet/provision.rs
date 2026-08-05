@@ -64,15 +64,18 @@ pub struct NamedSubnetExport {
     pub topology_epoch: u32,
 }
 
-/// The immutable, Rust-owned named-export map resolved once at mesh
+/// The immutable, Rust-owned named-export map resolved once at node
 /// construction (`SUBNET_AUTH_SDK_PLAN.md` §3.3/§3.5).
 ///
-/// Stored beside the mesh handle — the SDK [`Mesh`](crate::adapter::net::MeshNode)
-/// carries one, and every language binding retains the same checked map
-/// beside its `Arc<MeshNode>` — never inside capability discovery or
-/// mutable core authority state. Registration resolves a name with one
-/// immutable map lookup; there is no registry, cache invalidation,
-/// sensing, or load-balancing behavior here.
+/// Held by the NODE — [`MeshNode::subnet_exports`] — so one name resolves
+/// against one map at every language boundary, including the C ABI, which
+/// has no wrapper object to hang a map on. It is construction state, not
+/// capability discovery and not mutable authority state: nothing at
+/// runtime adds to it, and a name is never announced or accepted from a
+/// caller. Registration is one immutable lookup; there is no registry,
+/// cache invalidation, sensing, or load-balancing behavior here.
+///
+/// [`MeshNode::subnet_exports`]: crate::adapter::net::MeshNode::subnet_exports
 #[derive(Debug, Default)]
 pub struct NamedSubnetExports {
     entries: BTreeMap<String, (SubnetExportAccess, SubnetExportBinding)>,
@@ -415,8 +418,10 @@ pub mod dto {
     }
 
     impl SubnetBoundaryDeclarationDto {
-        /// Convert into the pieces
-        /// [`admin::declare_boundaries_node`] consumes.
+        /// Convert into the `(authority, epoch, boundaries)` triple
+        /// [`MeshNode::declare_subnet_boundaries`] consumes.
+        ///
+        /// [`MeshNode::declare_subnet_boundaries`]: crate::adapter::net::MeshNode::declare_subnet_boundaries
         pub fn to_core(
             &self,
         ) -> Result<(EntityId, u32, Vec<TopologySubnetId>), SubnetProvisionError> {
