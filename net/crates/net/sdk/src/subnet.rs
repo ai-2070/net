@@ -130,6 +130,12 @@ pub fn subnet_auth_kinds() -> Vec<&'static str> {
         .collect()
 }
 
+// The cross-language S4 scenario generator. Gated behind `fixtures`
+// (and `test`) so it is NOT compiled into a production dependency —
+// it mints credentials and writes them to disk.
+#[cfg(any(test, feature = "fixtures"))]
+pub mod fixtures;
+
 // ---------------------------------------------------------------------------
 // Administration — explicitly advanced (plan §3.4/§6)
 // ---------------------------------------------------------------------------

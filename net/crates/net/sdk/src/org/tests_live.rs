@@ -49,6 +49,50 @@ struct Pong {
     served_by: String,
 }
 
+/// [`bring_up`] for MORE than one caller against one provider.
+///
+/// Every `accept()` must complete before `start()` — the node refuses a
+/// `start` while an accept is in flight, and refuses an accept once
+/// started. A three-node cell therefore cannot call `bring_up` twice: it
+/// has to land every handshake first, then start everyone.
+async fn bring_up_all(callers: &[&Mesh], provider: &Mesh) {
+    let provider_pub = *provider.public_key();
+    let provider_addr = provider.local_addr().to_string();
+    for caller in callers {
+        let p_clone = provider.node().clone();
+        let caller_id = caller.node_id();
+        let accept = tokio::spawn(async move { p_clone.accept(caller_id).await });
+        caller
+            .connect(&provider_addr, &provider_pub, provider.node_id())
+            .await
+            .expect("connect");
+        accept.await.expect("accept task").expect("accept");
+    }
+    provider.start();
+    for caller in callers {
+        caller.start();
+    }
+    for m in callers.iter().copied().chain([provider]) {
+        m.node()
+            .announce_capabilities(CapabilitySet::new())
+            .await
+            .expect("announce");
+    }
+
+    let provider_id = provider.node_id();
+    for _ in 0..100 {
+        let pinned = callers.iter().all(|c| {
+            c.node().peer_entity_id(provider_id).is_some()
+                && provider.node().peer_entity_id(c.node_id()).is_some()
+        });
+        if pinned {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("entity pins were not established in both directions for every caller");
+}
+
 /// Handshake two meshes and wait for both entity pins — protected RPC is
 /// direct-session-only, so the pins ARE the precondition.
 async fn bring_up(caller: &Mesh, provider: &Mesh) {
@@ -1568,6 +1612,17 @@ async fn live_binding_rehearsal_from_files_through_the_raw_seams() {
 // X2 — the live cross-language scenario, driven from generated on-disk artifacts
 // ---------------------------------------------------------------------------
 
+/// Render bytes as lowercase hex — for comparing a verified admission
+/// fact against the identity the manifest declares, without either side
+/// re-deriving the other.
+fn hex_of(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
 /// Decode a 64-char hex string into a 32-byte seed/psk.
 fn seed32(hex: &str) -> [u8; 32] {
     assert_eq!(hex.len(), 64, "expected 64 hex chars");
@@ -1608,6 +1663,294 @@ async fn mesh_from_manifest_role(
         .set_owner_cert_emission(true)
         .expect("enable owner-cert emission");
     mesh
+}
+
+/// S4 — the Rust cell over the GENERATED subnet scenario, proving all
+/// ten contract points from the manifest alone.
+///
+/// `live_s4_cell_serve_named_export_call_attribute_and_close` drives the
+/// same verbs from an in-process fixture. This one loads the exact
+/// bytes-and-paths a TypeScript / Python / Go / C harness loads, so the
+/// manifest is proven to be a workable contract BEFORE four other
+/// languages are written against it — and a generator change that
+/// silently breaks a consumer fails here first.
+///
+/// The ten points, in order:
+///
+/// ```text
+///  1 provider construction: roots, attachment, named exports
+///  2 local refusal of an unknown export, before announcement
+///  3 serve through the frozen named-export API
+///  4 caller construction from real generated org credentials
+///  5 live public discovery
+///  6 a successful call_exported
+///  7 verified caller + organization attribution at the handler
+///  8 fail-closed for a foreign-org caller
+///  9 that denial is not retried
+/// 10 clean close, with no callback racing teardown
+/// ```
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_s4_cell_from_a_generated_scenario() {
+    use crate::subnet::dto;
+    use crate::subnet::fixtures;
+
+    let dir = std::env::temp_dir().join(format!(
+        "net-ssdk-s4-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scenario dir");
+    let manifest = fixtures::write_subnet_scenario(&dir).expect("generate subnet scenario");
+
+    // ---- (1) provider construction: roots, attachment, named export ----
+    let identity = Identity::from_seed(seed32(&manifest.provider.seed_hex));
+    let mut cfg = MeshNodeConfig::new(
+        "127.0.0.1:0".parse().expect("addr"),
+        seed32(&manifest.psk_hex),
+    )
+    .with_heartbeat_interval(Duration::from_millis(200))
+    .with_session_timeout(Duration::from_secs(5));
+    cfg.min_announce_interval = Duration::from_millis(50);
+    cfg.configured_identity = true;
+    for a in &manifest.subnet_authorities {
+        cfg = cfg.with_subnet_authority(
+            dto::SubnetAuthorityConfigDto {
+                authority_hex: a.authority_hex.clone(),
+                root_hexes: a.root_hexes.clone(),
+                maximum_grant_lifetime_secs: a.maximum_grant_lifetime_secs,
+            }
+            .to_core()
+            .expect("manifest trust anchor converts"),
+        );
+    }
+    cfg.subnet_attachment = Some(TopologySubnetId::new(&manifest.provider.attachment));
+    cfg = cfg.with_subnet_export(
+        dto::SubnetNamedExportDto {
+            name: manifest.export_name.clone(),
+            access: manifest.export_access.clone(),
+            binding: dto::SubnetExportBindingDto {
+                subnet: dto::SubnetRefDto {
+                    authority_hex: manifest.export_binding.authority_hex.clone(),
+                    path: dto::SubnetPathDto {
+                        levels: manifest.export_binding.path.clone(),
+                    },
+                },
+                topology_epoch: manifest.export_binding.topology_epoch,
+            },
+        }
+        .to_core()
+        .expect("manifest export converts"),
+    );
+
+    let mut node = MeshNode::new((**identity.keypair()).clone(), cfg)
+        .await
+        .expect("MeshNode::new from the manifest");
+    let channel_configs = Arc::new(ChannelConfigRegistry::new());
+    node.set_channel_configs(channel_configs.clone());
+    let provider = Mesh::from_node_arc(Arc::new(node), channel_configs, Some(identity));
+    provider
+        .install_org_authority(&dir.join(&manifest.provider.authority_dir))
+        .expect("install the generated org authority");
+    provider
+        .node()
+        .set_owner_cert_emission(true)
+        .expect("enable owner-cert emission");
+
+    // Gateway provisioning, from the generated artifacts.
+    crate::subnet::admin::install_gateway_credentials_node(
+        provider.node(),
+        &[
+            std::fs::read(dir.join(&manifest.provider.gateway_credentials_path))
+                .expect("read gateway credentials"),
+        ],
+    )
+    .expect("install the generated gateway credentials");
+    crate::subnet::admin::declare_boundaries_node(
+        provider.node(),
+        dto::entity_id_from_hex(&manifest.export_binding.authority_hex).expect("authority hex"),
+        manifest.export_binding.topology_epoch,
+        manifest
+            .provider
+            .boundary_paths
+            .iter()
+            .map(|p| TopologySubnetId::new(p))
+            .collect(),
+    )
+    .expect("declare the generated boundaries");
+
+    // ---- (4) both callers, from the generated credentials ----
+    //
+    // Built BEFORE the handshake because every `accept()` must complete
+    // before `start()` — a three-node cell cannot bring peers up one at a
+    // time the way the two-node cells do.
+    let caller = mesh_from_manifest_role(
+        &manifest.caller.seed_hex,
+        &manifest.psk_hex,
+        &dir.join(&manifest.caller.authority_dir),
+    )
+    .await;
+    let foreign = mesh_from_manifest_role(
+        &manifest.foreign_caller.seed_hex,
+        &manifest.psk_hex,
+        &dir.join(&manifest.foreign_caller.authority_dir),
+    )
+    .await;
+    bring_up_all(&[&caller, &foreign], &provider).await;
+
+    // ---- (2) an unknown export is refused locally, before the service is
+    //          registered or announced ----
+    let refused = provider.serve_subnet_exported::<Ping, Pong, _, _>(
+        &manifest.exported_service,
+        &manifest.unknown_export_name,
+        |_c, r: Ping| async move {
+            Ok(Pong {
+                n: r.n,
+                served_by: "unreachable".to_string(),
+            })
+        },
+    );
+    let Err(err) = refused else {
+        panic!("an unconfigured export name must be refused");
+    };
+    assert!(
+        err.to_string().contains("unknown_export_name"),
+        "the stable kind must ride the refusal, got {err}",
+    );
+
+    // ---- (3) serve through the frozen named-export API ----
+    let calls = Arc::new(AtomicUsize::new(0));
+    let attribution_ok = Arc::new(AtomicBool::new(false));
+    let calls_in = calls.clone();
+    let attribution_in = attribution_ok.clone();
+    let expected_caller = Identity::from_seed(seed32(&manifest.caller.seed_hex))
+        .entity_id()
+        .clone();
+    let expected_org_hex = manifest.caller.org_id_hex.clone();
+    let handle = provider
+        .serve_subnet_exported::<Ping, Pong, _, _>(
+            &manifest.exported_service,
+            &manifest.export_name,
+            move |c: OrgCaller, req: Ping| {
+                let calls_in = calls_in.clone();
+                let attribution_in = attribution_in.clone();
+                let expected_caller = expected_caller.clone();
+                let expected_org_hex = expected_org_hex.clone();
+                async move {
+                    calls_in.fetch_add(1, Ordering::SeqCst);
+                    // (7) attribution: the provider's VERIFIED view, checked
+                    // against the manifest's own declared identities.
+                    let acting = hex_of(c.acting_org.as_bytes());
+                    let provider_org = hex_of(c.provider_org.as_bytes());
+                    if c.entity == expected_caller
+                        && acting == expected_org_hex
+                        && provider_org == expected_org_hex
+                        && c.is_same_org()
+                    {
+                        attribution_in.store(true, Ordering::SeqCst);
+                    }
+                    Ok(Pong {
+                        n: req.n + 1,
+                        served_by: "s4-generated".to_string(),
+                    })
+                }
+            },
+        )
+        .expect("the configured export serves");
+
+    // ---- (4) caller credentials, from the generated files ----
+    let credentials = OrgCredentials::from_parts(
+        &std::fs::read(dir.join(&manifest.caller.membership_path)).expect("membership"),
+        &std::fs::read(dir.join(&manifest.caller.dispatcher_path)).expect("dispatcher"),
+        &[],
+        &[],
+    )
+    .expect("caller credentials from the generated files");
+    let org = caller.org(credentials).expect("bind");
+
+    // ---- (5) live public discovery ----
+    assert!(
+        converge_public_discovery(&provider, &caller, &manifest.exported_service).await,
+        "the named export must become publicly discoverable with a verified owner",
+    );
+
+    // ---- (6) the call ----
+    let pong: Pong = org
+        .call_exported(&manifest.exported_service, &Ping { n: 1 })
+        .await
+        .expect("the exported call is admitted");
+    assert_eq!(
+        pong,
+        Pong {
+            n: 2,
+            served_by: "s4-generated".to_string()
+        }
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "handler ran exactly once");
+    // ---- (7) ----
+    assert!(
+        attribution_ok.load(Ordering::SeqCst),
+        "the handler saw the verified caller and organization attribution",
+    );
+
+    // ---- (8) fail-closed: a FOREIGN-org caller, valid credentials ----
+    let foreign_credentials = OrgCredentials::from_parts(
+        &std::fs::read(dir.join(&manifest.foreign_caller.membership_path)).expect("membership"),
+        &std::fs::read(dir.join(&manifest.foreign_caller.dispatcher_path)).expect("dispatcher"),
+        &[],
+        &[],
+    )
+    .expect("foreign credentials are internally valid — only the ORG is wrong");
+    let foreign_org = foreign.org(foreign_credentials).expect("bind");
+
+    let before = calls.load(Ordering::SeqCst);
+    let denied: Result<Pong, _> = foreign_org
+        .call_exported(&manifest.exported_service, &Ping { n: 50 })
+        .await;
+    assert!(
+        denied.is_err(),
+        "a caller from a different organization must be refused; got {denied:?}",
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        before,
+        "the handler must never run for a refused caller",
+    );
+
+    // ---- (9) the denial is not retried ----
+    //
+    // A signed proof is never resent. Observed provider-side: a second
+    // refused call still never reaches the handler, so no retry smuggled
+    // one through.
+    let denied_again: Result<Pong, _> = foreign_org
+        .call_exported(&manifest.exported_service, &Ping { n: 51 })
+        .await;
+    assert!(denied_again.is_err(), "still refused");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        before,
+        "no retry may smuggle a refused caller into the handler",
+    );
+
+    // ---- (10) clean close, no callback racing teardown ----
+    drop(handle);
+    let after = tokio::time::timeout(
+        Duration::from_secs(5),
+        org.call_exported::<Ping, Pong>(&manifest.exported_service, &Ping { n: 99 }),
+    )
+    .await;
+    match after {
+        Err(_elapsed) => {}
+        Ok(Err(_refused)) => {}
+        Ok(Ok(reply)) => panic!("a call after teardown must not be served; got {reply:?}"),
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "no handler invocation may land after teardown",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The strongest parity witness the Rust tier can carry alone (OSDK-L X2): the

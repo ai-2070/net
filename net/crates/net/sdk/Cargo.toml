@@ -314,6 +314,13 @@ required-features = ["net", "fixtures"]
 name = "gen_org_error_fixtures"
 required-features = ["net", "cortex", "fixtures"]
 
+# SSDK S4 — generate the cross-language subnet-exported live scenario
+# every language's S4 cell loads. `fixtures` because it mints credentials
+# and writes them to disk; `cortex` for the org credential types.
+[[example]]
+name = "gen_subnet_scenario"
+required-features = ["net", "cortex", "fixtures"]
+
 # SSDK R4 — regenerate the canonical `subnet:` stable-kind fixture
 # (`tests/cross_lang_subnet/stable_kinds.json`) every language binding
 # consumes. Explicitly declared so a build without `net` cleanly skips it.
