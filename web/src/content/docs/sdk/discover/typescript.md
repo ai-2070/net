@@ -32,8 +32,10 @@ const target: bigint | null = node.findBestNode({
 
 `findBestNode` applies the requirement's weights and returns one winner instead
 of the whole matching set. The four weights — `preferMoreMemory`,
-`preferMoreVram`, `preferFasterInference`, `preferLoadedModels` — are read from
-each candidate's announced capability tags. They must be **finite**: `NaN` and
+`preferMoreVram`, `preferFasterInference`, `preferLoadedModels` — each score one
+axis of what a candidate announced about itself: system memory, GPU VRAM, model
+inference speed, and the share of its models already loaded. They must be
+**finite**: `NaN` and
 `Infinity` throw, while finite values outside `[0, 1]` are clamped by the
 substrate. Ties, including the case where every weight is omitted, resolve to
 the lowest matching node id.

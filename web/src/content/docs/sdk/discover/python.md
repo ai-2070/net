@@ -74,9 +74,11 @@ target = native.find_best_node({
 
 `find_best_node` applies the requirement's weights and returns one winner
 instead of the whole matching set. The four weights — `prefer_more_memory`,
-`prefer_more_vram`, `prefer_faster_inference`, `prefer_loaded_models` — are read
-from each candidate's announced capability tags, and every key of the dict is
-optional. They must be **finite**: `nan` and `inf` raise `ValueError`, a
+`prefer_more_vram`, `prefer_faster_inference`, `prefer_loaded_models` — each
+score one axis of what a candidate announced about itself: system memory, GPU
+VRAM, model inference speed, and the share of its models already loaded. Every
+key of the dict is optional. They must be **finite**: `nan` and `inf` raise
+`ValueError`, a
 non-numeric weight raises `TypeError`, and finite values outside `[0.0, 1.0]`
 are clamped by the substrate. Ties, including the case where every weight is
 omitted, resolve to the lowest matching node id.

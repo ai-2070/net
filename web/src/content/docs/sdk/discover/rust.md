@@ -54,10 +54,11 @@ let target: Option<u64> = mesh.find_best_node(&req);
 ```
 
 `find_best_node` applies the requirement's weights and returns one winner instead
-of the whole matching set. The four weights — memory, VRAM, tokens/sec and the
-share of models already loaded — are read from each candidate's announced
-capability tags, and each is clamped to `[0.0, 1.0]`. Ties, including the case
-where every weight is zero, resolve to the lowest matching node id.
+of the whole matching set. Each weight scores one axis of what a candidate
+announced about itself — system memory, GPU VRAM, model inference speed in
+tokens/sec, and the share of its models already loaded — and each is clamped to
+`[0.0, 1.0]`. Ties, including the case where every weight is zero, resolve to
+the lowest matching node id.
 
 `None` means nothing matched; node id `0` is a real id, so match on the `Option`
 rather than comparing against zero. `find_best_node_scoped` applies a scope

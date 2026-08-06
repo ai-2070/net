@@ -409,8 +409,9 @@ git status --short
 
 ## Outcome (implemented 2026-08-06)
 
-Landed as five commits: core snapshot + comments, core witnesses, Node/TS,
-Python, docs/records.
+Landed as five commits — core snapshot + comments, core witnesses, Node/TS,
+Python, docs/records — then four more from review, recorded under
+[Review round](#review-round-2026-08-06) below.
 
 **The stop gate passed.** All four weighted axes move the winner against a
 two-candidate fold whose node-id order is the opposite of its capacity order.
@@ -436,10 +437,12 @@ and `CapabilitySet::views()` decodes hardware and models back for scoring.
   from source.** The verification block's maturin step is still the right
   instruction for a machine that has it.
 
-### Found while implementing — NOT fixed here
+### Found while implementing — both since fixed
 
-Both predate this work and are out of its scope; each is a behavior change that
-deserves its own decision.
+Both predate this work. They were left out of the parity commits because each
+is a behavior change deserving its own decision; both were then fixed on this
+branch once that decision was made. Kept here as the record of what the parity
+work surfaced.
 
 1. **The TS SDK's memory and VRAM filter axes never reach the native layer.**
    `NapiCapabilityFilter` in `sdk-ts/src/capabilities.ts` declares
@@ -451,9 +454,50 @@ deserves its own decision.
    passes, because the assertion holds without the filter. This now also
    affects `findBestNode`, whose `filter` rides the same converter. Fixing it
    narrows queries that today return extra nodes.
-2. **`net-event-bus`'s SKILL.md description is 3011 chars against a 3000
-   budget**, so `check-skills.sh` fails on a clean tree. Unrelated to this
-   change; verified by stashing.
+
+   Fixed in `8a380ef95` by renaming to the gigabyte spellings the native layer
+   reads, in the public interface as well as the converter, and rescaling every
+   literal. Source-breaking on purpose: silently honouring a `16_384` that
+   meant megabytes trades "too many results" for "none".
+2. ~~**`net-event-bus`'s SKILL.md description is 3011 chars against a 3000
+   budget.**~~ **Wrong — the description is 2991 characters and within budget.**
+   `check-skills.sh` measured it with `open(path).read()`, no encoding, so on a
+   cp1252 shell every em-dash decoded as three characters. The stash test
+   proved only that the failure was not mine; it did not test whether the
+   finding was real, and stopping there is what let a false positive be
+   recorded as a defect. Fixed in `0dc375352` by pinning the encoding — which
+   then exposed several checkers that had been reporting success without
+   running at all, and `964cc6857` after review closed the rest.
+
+### Review round (2026-08-06)
+
+Four more commits, each addressing a finding no local check could have caught:
+
+- **`ec1ec5ded` — scoring ran under both fold read guards.** The caller's
+  `score` closure was invoked inside `with_state_and_index`. Coherence needed
+  the capability sets to come from one read, not the guards held across
+  scoring; a scorer that touched the fold would have deadlocked, and every
+  scorer stalled writers across candidate-controlled work. Candidate synthesis
+  now returns owned pairs and scoring happens after the guards drop.
+- **The snapshot witness was vacuous.** It evicted before the query started, so
+  the split-read shape passed it too. The scorer now evicts mid-selection,
+  which is only possible with the guards released. Confirmed to fail against a
+  reinstated per-candidate re-read.
+- **`46bea0f04` — the SDK peered `@net-mesh/core >=0.34.0`** while calling
+  `findBestNode` unconditionally; the published 0.34.0 core has no such symbol.
+  Raised to `>=0.35.0`, the same boundary the filter rename already documents.
+  Cutting 0.35.0 across the workspace remains a release-time action.
+- **`964cc6857` — the checker repair was incomplete.** `run_checker` still
+  discarded the exit status, two Python calls bypassed it, `python3` was
+  hard-coded (fatal where Python installs as `python`, or where the Store shim
+  squats on the name), and `check-docs.sh` had the pre-fix shape entirely. The
+  runner is now shared and status-aware.
+
+Two documentation corrections went with them: the `findBestNode` JSDoc example
+awaited a synchronous `openStream` and omitted its required config, and all
+three discover pages described the weights as read from "announced capability
+tags", which exposes the canonical fold storage shape and reads as though an
+application's own `tags` drive scoring.
 
 ### Verification actually run
 
@@ -466,7 +510,16 @@ files, including 8 new); PyO3 converter unit tests (7); pytest
 `test_stub_drift.py` + ABI/interop/cross-lang (168); `capability_records.py
 --check`; `check-spine-symbols.py`; `check-docs.sh`; `cargo fmt`.
 
-Not green locally, both pre-existing and reproduced without this change: the
-full pytest run dies inside `test_capability_gateway.py` on a locally-built
-extension missing feature-gated symbols (that file passes in isolation), and
-`check-skills.sh` reports the description-budget failure above.
+After the review round, all three shell checkers (`check-skills.sh`,
+`check-docs.sh`, `check-skills-depth.sh`) plus `capability_records.py --check`,
+its self-test and `check-spine-symbols.py` exit 0 on Windows with no
+environment workarounds — previously `check-docs.sh` needed
+`MSYS_NO_PATHCONV=1` to avoid 78 phantom findings and `check-skills.sh` needed
+a `python3` shim.
+
+Not green locally, pre-existing and reproduced without this change: the full
+pytest run dies inside `test_capability_gateway.py` on a locally-built
+extension missing feature-gated symbols (that file passes in isolation), the
+`sensing_*` integration test binaries need `--features fixtures`, and
+`tests/doc_link_guard.rs` fails on dangling links in
+`RELEASE_v0.34_HOTEL_CALIFORNIA.md`, which arrived on `master` in `c28b8d6fb`.

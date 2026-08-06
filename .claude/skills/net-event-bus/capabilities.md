@@ -289,7 +289,7 @@ if let Some(node_id) = node.find_best_node(&req) { /* unicast to node_id */ }
 
 **Key facts:**
 - Public types live under `net_sdk::capabilities::*` (re-exports in `net/crates/net/sdk/src/capabilities.rs:62-67`).
-- Mesh wrapper is `net_sdk::mesh::Mesh`, built via `MeshBuilder`. All five methods (`announce_capabilities`, `announce_capabilities_with`, `find_nodes`, `find_nodes_scoped`, `find_best_node`, `find_best_node_scoped`) live on it (`net/crates/net/sdk/src/mesh.rs:714-775`).
+- Mesh wrapper is `net_sdk::mesh::Mesh`, built via `MeshBuilder`. All six methods live on it (`net/crates/net/sdk/src/mesh.rs:1046-1174`): `announce_capabilities` and `announce_capabilities_with` are `async`; `find_nodes`, `find_nodes_scoped`, `find_best_node` and `find_best_node_scoped` are synchronous local-index reads.
 - `ScopeFilter<'a>` borrows its tenant / region strings — keep them alive across the call.
 
 ### TypeScript
