@@ -42,6 +42,7 @@ use super::capability::{
 // lockstep with the helper below.
 #[cfg(any(test, feature = "fixtures"))]
 use super::state::FoldError;
+use super::state::FoldState;
 #[cfg(any(test, feature = "fixtures"))]
 use super::ApplyOutcome;
 use super::{EnvelopeMeta, Fold, FoldKind, NodeId, NodeState, SignedAnnouncement};
@@ -727,24 +728,47 @@ pub fn synthesize_capability_set_if_known(
     fold: &Fold<CapabilityFold>,
     node_id: NodeId,
 ) -> Option<super::super::capability::CapabilitySet> {
-    fold.with_state(|state| {
-        let keys = state.by_node.get(&node_id)?;
-        let mut caps = super::super::capability::CapabilitySet::new();
-        for k in keys {
-            let Some(entry) = state.entries.get(k) else {
-                continue;
-            };
-            for s in &entry.payload.tags {
-                if let Ok(tag) = super::super::tag::Tag::parse(s) {
-                    caps.tags.insert(tag);
-                }
-            }
-            for (mk, mv) in &entry.payload.metadata {
-                caps.metadata.insert(mk.clone(), mv.clone());
+    fold.with_state(|state| synthesize_capability_set_in_state(state, node_id))
+}
+
+/// [`synthesize_capability_set_if_known`] against a state that is
+/// ALREADY BORROWED, for callers running inside
+/// [`Fold::with_state`] / [`Fold::with_state_and_index`].
+///
+/// The fold-taking forms re-enter the fold, so a caller that has
+/// already selected candidates under one snapshot cannot use them
+/// without dropping its locks first. That split is what lets a
+/// selection combine membership observed in one fold generation
+/// with capability facts from another — a result that never existed
+/// in any single state. Selection paths take this form and stay
+/// inside one snapshot; see [`best_node_matching`].
+///
+/// Merges EVERY key in `state.by_node[node_id]`, not just the entry
+/// that matched the query. Today the legacy announcement path gives
+/// a publisher exactly one `(class=0, node)` entry, so the merge is
+/// a one-element loop — but per-class sharding would otherwise make
+/// the synthesized set depend on whichever class the index happened
+/// to resolve first.
+pub(crate) fn synthesize_capability_set_in_state(
+    state: &FoldState<CapabilityFold>,
+    node_id: NodeId,
+) -> Option<super::super::capability::CapabilitySet> {
+    let keys = state.by_node.get(&node_id)?;
+    let mut caps = super::super::capability::CapabilitySet::new();
+    for k in keys {
+        let Some(entry) = state.entries.get(k) else {
+            continue;
+        };
+        for s in &entry.payload.tags {
+            if let Ok(tag) = super::super::tag::Tag::parse(s) {
+                caps.tags.insert(tag);
             }
         }
-        Some(caps)
-    })
+        for (mk, mv) in &entry.payload.metadata {
+            caps.metadata.insert(mk.clone(), mv.clone());
+        }
+    }
+    Some(caps)
 }
 
 /// Default capacity for the per-fold capability-set cache. Covers
@@ -757,9 +781,15 @@ const CAPABILITY_SET_CACHE_DEFAULT_CAPACITY: usize = 256;
 /// ([`Fold::change_generation`]). Eliminates the multi-µs
 /// re-parse + re-allocate that `synthesize_capability_set` does
 /// per call on the hot paths (per-packet greedy admission at
-/// mesh.rs:5181, per-candidate `placement_score`, per-candidate
-/// `best_by_score`, per-call `may_execute` retain loops). Per
+/// mesh.rs:5181, per-candidate `placement_score`, per-call
+/// `may_execute` retain loops). Per
 /// PERF_AUDIT_2026_06_10_FULL_CRATE.md §4.1.
+///
+/// [`best_node_matching`] deliberately does NOT come through here:
+/// a cache lookup re-enters the fold for its generation stamp, and
+/// that path scores inside the snapshot that selected its
+/// candidates. It pays the synthesis per candidate to keep
+/// selection and scoring on one fold state.
 ///
 /// The generation is global to the fold — any fold change
 /// invalidates every cached entry. That's coarse but accurate:
@@ -1551,6 +1581,136 @@ pub fn find_nodes_matching_scoped(
     out.sort_unstable();
     out.dedup();
     out
+}
+
+/// Highest-scoring publisher matching `legacy`, or `None` when
+/// nothing matches. Single-winner counterpart to
+/// [`find_nodes_matching`].
+///
+/// `score` is applied to each admitted candidate's synthesized
+/// [`CapabilitySet`](super::super::capability::CapabilitySet) —
+/// canonical tags merged across the publisher's fold entries, which
+/// the set's lazy `views()` projections decode back into hardware
+/// and model facts. The caller supplies it (typically
+/// `CapabilityRequirement::score`) because the bridge holds no
+/// placement policy.
+///
+/// Ties resolve to the lowest `node_id`: candidates are scored in
+/// ascending id order and a later candidate only wins on a strictly
+/// greater score. A `NaN` score therefore never displaces an
+/// incumbent, and the first candidate is accepted regardless — so a
+/// requirement whose weights are all zero (every score equal)
+/// returns the lowest matching id, matching
+/// [`find_nodes_matching`]'s leading element.
+pub fn best_node_matching(
+    fold: &Fold<CapabilityFold>,
+    legacy: &LegacyFilter,
+    score: impl Fn(&super::super::capability::CapabilitySet) -> f32,
+) -> Option<NodeId> {
+    best_node_inner(fold, legacy, None, |_, _| false, score)
+}
+
+/// Scoped variant of [`best_node_matching`] — the single-winner
+/// counterpart to [`find_nodes_matching_scoped`], with that
+/// function's scope semantics and `same_subnet_lookup` contract
+/// (fold-pure, invoked only under [`ScopeFilter::SameSubnet`],
+/// against tags borrowed from the selecting snapshot).
+///
+/// Scope narrows the candidate set BEFORE scoring, so an
+/// out-of-scope publisher cannot win on score.
+pub fn best_node_matching_scoped(
+    fold: &Fold<CapabilityFold>,
+    legacy: &LegacyFilter,
+    scope: &ScopeFilter<'_>,
+    same_subnet_lookup: impl Fn(NodeId, &[String]) -> bool,
+    score: impl Fn(&super::super::capability::CapabilitySet) -> f32,
+) -> Option<NodeId> {
+    best_node_inner(fold, legacy, Some(scope), same_subnet_lookup, score)
+}
+
+/// # One snapshot
+///
+/// Filtering, scope evaluation, per-candidate capability synthesis
+/// and scoring all run inside a single `with_state_and_index`.
+///
+/// The composed alternative — `find_nodes_matching*` for the ids,
+/// then `synthesize_capability_set` per id — reads the fold once
+/// for membership and again per candidate for scoring. A
+/// replacement landing between those reads yields a winner selected
+/// on one generation's capabilities and scored on another's, or
+/// scored against `CapabilitySet::default()` after an eviction: a
+/// zero-capacity node beating a live one under a memory weight.
+/// Neither result existed in any single fold state. Hence the
+/// state-local synthesis helper rather than the fold-taking one —
+/// re-entering here would also deadlock on the read guards this
+/// closure holds.
+fn best_node_inner(
+    fold: &Fold<CapabilityFold>,
+    legacy: &LegacyFilter,
+    scope: Option<&ScopeFilter<'_>>,
+    same_subnet_lookup: impl Fn(NodeId, &[String]) -> bool,
+    score: impl Fn(&super::super::capability::CapabilitySet) -> f32,
+) -> Option<NodeId> {
+    let fold_filter = translate_filter(legacy);
+    // Same hoisting as `find_nodes_matching_scoped`: prepare the
+    // selector sets before taking the locks, and let the subnet
+    // closure decide alone under `SameSubnet` (where the candidate's
+    // own tags cannot change the verdict).
+    let subnet_decides = matches!(scope, Some(ScopeFilter::SameSubnet));
+    let prepared = scope.map(PreparedScope::new);
+    fold.with_state_and_index(|state, index| {
+        let candidates = resolve_candidate_keys(state, index, &fold_filter);
+        let candidates = candidates.as_set();
+        let mut admitted: Vec<NodeId> = Vec::with_capacity(candidates.len());
+        for &key in candidates {
+            let Some(entry) = state.entries.get(&key) else {
+                continue;
+            };
+            let membership = &entry.payload;
+            if !membership_passes_range_filter(membership, legacy) {
+                continue;
+            }
+            if let Some(prepared) = prepared.as_ref() {
+                let in_scope = if subnet_decides {
+                    same_subnet_lookup(key.1, &membership.tags)
+                } else {
+                    // `same_subnet` is unread on every arm reachable
+                    // here, so the placeholder cannot affect it.
+                    prepared.matches(&membership.tags, false)
+                };
+                if !in_scope {
+                    continue;
+                }
+            }
+            admitted.push(key.1);
+        }
+        // Ascending ids, one entry per publisher — this ordering IS
+        // the tie-break, since scoring below only displaces on a
+        // strictly greater score.
+        admitted.sort_unstable();
+        admitted.dedup();
+
+        let mut best: Option<(NodeId, f32)> = None;
+        for node_id in admitted {
+            // A candidate resolved from the index always has a
+            // `by_node` entry in this same state, so the `None` arm
+            // is unreachable; skipping rather than scoring an empty
+            // set keeps an unindexed candidate from outscoring a
+            // real one if that ever stops holding.
+            let Some(caps) = synthesize_capability_set_in_state(state, node_id) else {
+                continue;
+            };
+            let s = score(&caps);
+            let displaces = match best {
+                Some((_, incumbent)) => s > incumbent,
+                None => true,
+            };
+            if displaces {
+                best = Some((node_id, s));
+            }
+        }
+        best.map(|(node_id, _)| node_id)
+    })
 }
 
 #[cfg(test)]
