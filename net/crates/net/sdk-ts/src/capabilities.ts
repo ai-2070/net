@@ -262,6 +262,40 @@ export interface NapiCapabilitySet {
   limits?: NapiLimits;
 }
 
+/**
+ * A placement requirement: a base {@link CapabilityFilter} plus
+ * optional scoring weights. Input to {@link MeshNode.findBestNode}.
+ *
+ * Where a filter answers "which nodes qualify", the weights answer
+ * "which qualifying node to pick". Each is a finite number in
+ * `[0, 1]`; higher tips selection toward more memory / more VRAM /
+ * faster inference / a larger share of models already loaded. Finite
+ * values outside the range are clamped by the substrate, so one clamp
+ * implementation serves every binding. `NaN` and `Infinity` are
+ * rejected — they have no meaningful clamp, and a `NaN` weight would
+ * quietly select as if the axis were unweighted.
+ *
+ * An omitted weight is `0` — that axis is not consulted. With every
+ * weight omitted, all matches score equally and the lowest node id
+ * wins.
+ *
+ * @example
+ * ```typescript
+ * // Any GPU node, but give me the one with the most VRAM.
+ * const target = node.findBestNode({
+ *   filter: { requireTags: ['gpu'] },
+ *   preferMoreVram: 1,
+ * });
+ * ```
+ */
+export interface CapabilityRequirement {
+  filter: CapabilityFilter;
+  preferMoreMemory?: number;
+  preferMoreVram?: number;
+  preferFasterInference?: number;
+  preferLoadedModels?: number;
+}
+
 /** Shape that napi-rs expects for `findNodes`. */
 export interface NapiCapabilityFilter {
   requireTags?: string[];
@@ -371,6 +405,27 @@ export function capabilityFilterToNapi(f: CapabilityFilter): NapiCapabilityFilte
     minVramMb: f.minVramMb,
     minContextLength: f.minContextLength,
     requireModalities: f.requireModalities as string[] | undefined,
+  };
+}
+
+/** Shape that napi-rs expects for `findBestNode`. */
+export interface NapiCapabilityRequirement {
+  filter: NapiCapabilityFilter;
+  preferMoreMemory?: number;
+  preferMoreVram?: number;
+  preferFasterInference?: number;
+  preferLoadedModels?: number;
+}
+
+export function capabilityRequirementToNapi(
+  r: CapabilityRequirement,
+): NapiCapabilityRequirement {
+  return {
+    filter: capabilityFilterToNapi(r.filter),
+    preferMoreMemory: r.preferMoreMemory,
+    preferMoreVram: r.preferMoreVram,
+    preferFasterInference: r.preferFasterInference,
+    preferLoadedModels: r.preferLoadedModels,
   };
 }
 
