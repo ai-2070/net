@@ -789,7 +789,10 @@ const CAPABILITY_SET_CACHE_DEFAULT_CAPACITY: usize = 256;
 /// a cache lookup re-enters the fold for its generation stamp, and
 /// that path synthesizes inside the snapshot that admitted its
 /// candidates. It pays the synthesis per candidate to keep
-/// membership and capabilities on one fold state.
+/// membership and capabilities on one fold state — and pays it
+/// while holding both read guards, so fold writers queue behind it.
+/// See `candidates_for_selection` for why that is the accepted trade
+/// there and what would make it stop being one.
 ///
 /// The generation is global to the fold — any fold change
 /// invalidates every cached entry. That's coarse but accurate:
@@ -1706,6 +1709,33 @@ fn best_node_inner(
 /// membership decision that admitted it. The ordering IS
 /// [`best_node_inner`]'s tie-break, since scoring there only
 /// displaces an incumbent on a strictly greater score.
+///
+/// # What coherence costs here
+///
+/// Both of these follow from doing the synthesis inside the read,
+/// and neither is free:
+///
+/// - **Lock hold time scales with the candidate set, not with the
+///   membership decision.** A full `Tag::parse` per tag plus a
+///   metadata clone per entry, for every admitted candidate, runs
+///   under both fold read guards — where [`find_nodes_matching`]
+///   holds them only long enough to decide membership and hands back
+///   bare ids. Fold writers queue behind all of it. That is the
+///   multi-µs-per-node cost `CapabilitySetCache` exists to keep off
+///   the hot paths, and this path cannot use the cache: a lookup
+///   re-enters the fold for its generation stamp, which is the
+///   second read the whole shape exists to avoid.
+/// - **Peak memory holds every candidate's set at once**, rather
+///   than one at a time as a scored-in-a-loop shape would.
+///
+/// Both are bounded by the candidate set the filter admits, and
+/// accepted because the callers are the FFI and binding surfaces —
+/// operator-initiated placement queries, not per-packet work.
+/// `placement_score` and greedy admission, which ARE per-packet,
+/// stay on the cached single-node path. A hot caller appearing on
+/// this one is the signal to revisit, not a reason to widen it:
+/// re-splitting the read is what let a winner be selected on one
+/// generation's capabilities and scored on another's.
 fn candidates_for_selection(
     fold: &Fold<CapabilityFold>,
     legacy: &LegacyFilter,
