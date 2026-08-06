@@ -187,6 +187,38 @@ else
 the sourcing script now runs without path translation, not just the checkers"
 fi
 
+# ------------------------------------------------------- nobody opts back out
+# The library only protects the scripts that use it, and the failure mode of
+# NOT using it is silence — a bare `python3` on a machine where that name is a
+# Microsoft Store shim exits 49 without running, the capture comes back empty,
+# and the caller reads the emptiness as "nothing to check" and exits green.
+# `check-skill-example-ts.sh` and `run-skill-examples.sh` both did exactly that
+# for as long as they existed, and neither went red while doing it.
+#
+# So the rule is structural rather than behavioural: no shell checker resolves
+# its own interpreter. It is the only assertion here that reads the real tree,
+# and it is cheap — the next sibling written with a hardcoded `python3` fails on
+# the way in rather than after it has quietly skipped a release.
+echo "==> No shell checker resolves its own interpreter"
+
+offenders=0
+for script in .github/scripts/*.sh; do
+  # This file alone names the pattern as data — the grep below is written in it.
+  # It sources the library like everything else, so it has no interpreter of its
+  # own to resolve either way.
+  case "$script" in */check-checker-lib.sh) continue ;; esac
+  # Comment lines are prose about the defect, including in this file's siblings.
+  # A trailing comment on a code line is not worth the regex.
+  hits=$(grep -nE '(^|[^#[:alnum:]_.-])python3' "$script" \
+         | grep -vE '^[0-9]+:[[:space:]]*#')
+  if [ -n "$hits" ]; then
+    note "$(basename "$script") invokes python3 directly — source lib/checker.sh and use \`py\`"
+    printf '%s\n' "$hits" | sed 's/^/      /'
+    offenders=$((offenders + 1))
+  fi
+done
+[ "$offenders" -eq 0 ] && ok "every shell checker takes its interpreter from the library"
+
 echo
 if [ "$fail" -eq 0 ]; then
   echo "Checker verdicts are classified correctly."

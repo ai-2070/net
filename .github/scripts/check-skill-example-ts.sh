@@ -24,9 +24,12 @@ ROOT=$(pwd)
 SDK_TS="$ROOT/net/crates/net/sdk-ts"
 NAPI_DTS="$ROOT/net/crates/net/bindings/node/index.d.ts"
 
-fail=0
-note() { printf '  \033[31m✗\033[0m %s\n' "$1"; fail=$((fail + 1)); }
-ok()   { printf '  \033[32m✓\033[0m %s\n' "$1"; }
+# Relative to the repo root we just entered — see `check-skills.sh` for why an
+# absolute path breaks the Python checkers under Git Bash. `$ROOT` is fine for
+# the Node-side paths below, which never cross into a native interpreter.
+CHECKER_DIR=".github/scripts"
+# `note`, `ok`, `fail`, `$TMP`, a resolved `$PYTHON`, and `py`.
+. "$CHECKER_DIR/lib/checker.sh"
 
 echo "==> TypeScript — skill hello-world against the SDK source"
 
@@ -42,15 +45,42 @@ if [ ! -d "$SDK_TS/node_modules" ]; then
   exit 1
 fi
 
-cleanup() { rm -f "$SDK_TS"/skill-example-*.ts "$SDK_TS/tsconfig.skill-example.json"; }
+# `lib/checker.sh` installs an EXIT trap for its own scratch directory, and a
+# second `trap ... EXIT` replaces rather than appends — so this one cleans up
+# both, or `$TMP` leaks on every run.
+cleanup() {
+  rm -f "$SDK_TS"/skill-example-*.ts "$SDK_TS/tsconfig.skill-example.json"
+  rm -rf "$TMP"
+}
 trap cleanup EXIT
 
 # Driven from the same manifest as check-skill-examples.sh, so the two cannot
 # disagree about which examples exist.
-TS_FILES=$(python3 "$ROOT/.github/scripts/skill_examples.py" --list \
+#
+# The manifest lookup is the whole input to this check, and an empty result has
+# two causes that must not share a green tick: the manifest genuinely lists no
+# TypeScript example, or the lister never ran — no interpreter, an unreadable
+# manifest, a traceback. This script used to treat both as "nothing to check"
+# and exit 0, so on a machine without a working `python3` it reported the
+# TypeScript examples green having compiled none of them.
+#
+# The status is what tells them apart: `--list` returns 0 whenever it ran, and
+# non-zero (with its diagnostic on stdout) when it could not read the manifest.
+list_err="$TMP/examples-list.err"
+ALL_EXAMPLES=$(py "$CHECKER_DIR/skill_examples.py" --list 2>"$list_err")
+list_status=$?
+if [ "$list_status" -ne 0 ] || [ -s "$list_err" ]; then
+  note "skill_examples.py --list did not run (exit $list_status) — no example was type-checked"
+  printf '%s\n' "$ALL_EXAMPLES" | sed 's/^/      /'
+  sed 's/^/      /' "$list_err" >&2
+  exit 1
+fi
+
+TS_FILES=$(printf '%s\n' "$ALL_EXAMPLES" \
            | awk -F'\t' '$1 == "typescript" { print $2 "\t" $3 }')
 
 if [ -z "$TS_FILES" ]; then
+  # Now a real verdict from a lister that ran, not the absence of one.
   ok "no TypeScript examples in the manifest"
   echo
   echo "Nothing to check."
