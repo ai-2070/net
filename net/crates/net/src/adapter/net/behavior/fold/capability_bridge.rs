@@ -3893,20 +3893,14 @@ mod tests {
             announce(
                 &fold,
                 LOW_ID,
-                CapabilitySet::new()
-                    .with_hardware(HardwareCapabilities::new().with_gpu(gpu(8))),
+                CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_gpu(gpu(8))),
             );
             announce(
                 &fold,
                 HIGH_ID,
-                CapabilitySet::new()
-                    .with_hardware(HardwareCapabilities::new().with_gpu(gpu(80))),
+                CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_gpu(gpu(80))),
             );
-            assert_weight_flips_the_winner(
-                &fold,
-                unweighted().prefer_vram(1.0),
-                "vram",
-            );
+            assert_weight_flips_the_winner(&fold, unweighted().prefer_vram(1.0), "vram");
         }
 
         #[test]
@@ -3922,11 +3916,7 @@ mod tests {
                 HIGH_ID,
                 CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(256)),
             );
-            assert_weight_flips_the_winner(
-                &fold,
-                unweighted().prefer_memory(1.0),
-                "memory",
-            );
+            assert_weight_flips_the_winner(&fold, unweighted().prefer_memory(1.0), "memory");
         }
 
         #[test]
@@ -3935,22 +3925,16 @@ mod tests {
             announce(
                 &fold,
                 LOW_ID,
-                CapabilitySet::new().add_model(
-                    ModelCapability::new("slow-model", "test").with_tokens_per_sec(10),
-                ),
+                CapabilitySet::new()
+                    .add_model(ModelCapability::new("slow-model", "test").with_tokens_per_sec(10)),
             );
             announce(
                 &fold,
                 HIGH_ID,
-                CapabilitySet::new().add_model(
-                    ModelCapability::new("fast-model", "test").with_tokens_per_sec(900),
-                ),
+                CapabilitySet::new()
+                    .add_model(ModelCapability::new("fast-model", "test").with_tokens_per_sec(900)),
             );
-            assert_weight_flips_the_winner(
-                &fold,
-                unweighted().prefer_speed(1.0),
-                "tokens/sec",
-            );
+            assert_weight_flips_the_winner(&fold, unweighted().prefer_speed(1.0), "tokens/sec");
         }
 
         #[test]
@@ -3971,8 +3955,7 @@ mod tests {
             announce(
                 &fold,
                 HIGH_ID,
-                CapabilitySet::new()
-                    .add_model(ModelCapability::new("c", "test").with_loaded(true)),
+                CapabilitySet::new().add_model(ModelCapability::new("c", "test").with_loaded(true)),
             );
             assert_weight_flips_the_winner(
                 &fold,
@@ -4079,14 +4062,12 @@ mod tests {
             announce(
                 &fold,
                 LOW_ID,
-                CapabilitySet::new()
-                    .with_hardware(HardwareCapabilities::new().with_gpu(gpu(8))),
+                CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_gpu(gpu(8))),
             );
             announce(
                 &fold,
                 HIGH_ID,
-                CapabilitySet::new()
-                    .with_hardware(HardwareCapabilities::new().with_gpu(gpu(80))),
+                CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_gpu(gpu(80))),
             );
             fold.evict_node(HIGH_ID, "test: publisher left before the query");
 

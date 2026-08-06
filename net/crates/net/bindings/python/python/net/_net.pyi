@@ -909,6 +909,46 @@ class NetMesh:
         ``min_context_length``, ``require_modalities``."""
         ...
 
+    def find_nodes_scoped(self, filter: dict, scope: dict) -> list[int]:
+        """Scoped variant of :meth:`find_nodes`. `scope` is a dict
+        derived from each peer's ``scope:*`` reserved tags:
+        ``{"kind": "any" | "global_only" | "same_subnet" | "tenant" |
+        "tenants" | "region" | "regions", ...}`` (``camelCase`` kinds
+        are accepted too), with the selector under ``tenant`` /
+        ``tenants`` / ``region`` / ``regions``.
+
+        Untagged peers stay visible under most filters by design;
+        peers tagged ``scope:subnet-local`` only show up under
+        ``{"kind": "same_subnet"}``. A kind that requires a selector
+        and does not get one raises rather than widening the query."""
+        ...
+
+    def find_best_node(self, requirement: dict) -> Optional[int]:
+        """Highest-scoring node for a placement `requirement`, or
+        ``None`` when nothing matches.
+
+        Where :meth:`find_nodes` returns every match, this returns one
+        winner. `requirement` is
+        ``{"filter": {...}, "prefer_more_memory": 0.0,
+        "prefer_more_vram": 0.0, "prefer_faster_inference": 0.0,
+        "prefer_loaded_models": 0.0}`` — every key optional, a missing
+        filter matching every publisher and a missing weight meaning
+        that axis is not consulted. Weights must be finite numbers;
+        finite values outside ``[0.0, 1.0]`` are clamped, ``nan`` and
+        ``inf`` raise ``ValueError``.
+
+        Ties — including the no-weights case — resolve to the lowest
+        matching node id. ``None`` means no match; ``0`` is a real
+        node id, so test against ``None``, not truthiness."""
+        ...
+
+    def find_best_node_scoped(self, requirement: dict, scope: dict) -> Optional[int]:
+        """Scoped variant of :meth:`find_best_node`, with the scope
+        semantics of :meth:`find_nodes_scoped`. Scope narrows the
+        candidate set before scoring, so a peer outside the scope
+        cannot win on capacity."""
+        ...
+
     # -- NAT traversal (requires the `nat-traversal` build) ---------
     def traversal_stats(self) -> dict:
         """Cumulative NAT-traversal counters — the full stage-5
@@ -2417,7 +2457,17 @@ class AsyncNetMesh:
     def stream_stats(
         self, peer_node_id: int, stream_id: int
     ) -> Optional[NetStreamStats]: ...
+    # Local capability discovery — synchronous, like NetMesh's. These
+    # read the local fold and return the result directly; there is
+    # nothing to await.
     def find_nodes(self, filter: Dict[str, Any]) -> List[int]: ...
+    def find_nodes_scoped(
+        self, filter: Dict[str, Any], scope: Dict[str, Any]
+    ) -> List[int]: ...
+    def find_best_node(self, requirement: Dict[str, Any]) -> Optional[int]: ...
+    def find_best_node_scoped(
+        self, requirement: Dict[str, Any], scope: Dict[str, Any]
+    ) -> Optional[int]: ...
     async def shutdown(self) -> None: ...
     def __repr__(self) -> str: ...
 

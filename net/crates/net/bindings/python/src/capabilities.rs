@@ -12,9 +12,9 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use net::adapter::net::behavior::capability::{
-    AcceleratorInfo, AcceleratorType, CapabilityFilter, CapabilitySet, GpuInfo, GpuVendor,
-    HardwareCapabilities, Modality, ModelCapability, ResourceLimits, SoftwareCapabilities,
-    ToolCapability,
+    AcceleratorInfo, AcceleratorType, CapabilityFilter, CapabilityRequirement, CapabilitySet,
+    GpuInfo, GpuVendor, HardwareCapabilities, Modality, ModelCapability, ResourceLimits,
+    SoftwareCapabilities, ToolCapability,
 };
 use net::adapter::net::behavior::Tag;
 
@@ -403,6 +403,75 @@ pub fn capability_filter_from_py(d: &Bound<'_, PyDict>) -> PyResult<CapabilityFi
     Ok(cf)
 }
 
+/// One placement-requirement weight. Absent, or `None`, means the
+/// axis is not consulted — weight `0.0`.
+///
+/// Refuses a non-finite weight rather than narrowing it. Python
+/// floats carry `nan` and `inf`, and neither survives the core's
+/// `clamp(0.0, 1.0)` meaningfully: `nan.clamp` is `nan`, which
+/// poisons the candidate's score so it loses every comparison — a
+/// requirement written as "strongly prefer VRAM" would then select
+/// exactly as if unweighted. `inf` clamps to `1.0`, in range but not
+/// what the caller wrote.
+///
+/// The C ABI takes JSON, which cannot spell either value, so this
+/// check has no counterpart there. Python is a boundary where they
+/// are expressible, so it is a boundary that has to refuse.
+///
+/// Finite out-of-range values are NOT refused — they clamp in the
+/// core, keeping one clamp contract across every binding.
+fn get_weight(d: &Bound<'_, PyDict>, key: &str) -> PyResult<f32> {
+    use pyo3::exceptions::PyValueError;
+    let Some(v) = dict_get(d, key)? else {
+        return Ok(0.0);
+    };
+    if v.is_none() {
+        return Ok(0.0);
+    }
+    let w: f64 = v.extract().map_err(|_| {
+        PyTypeError::new_err(format!(
+            "capability requirement weight {:?} must be a number",
+            key
+        ))
+    })?;
+    if !w.is_finite() {
+        return Err(PyValueError::new_err(format!(
+            "capability requirement weight {:?} must be finite, got {}; finite \
+             values outside [0.0, 1.0] are clamped, but nan and inf have no \
+             meaningful clamp",
+            key, w
+        )));
+    }
+    Ok(w as f32)
+}
+
+/// Convert a placement-requirement dict to the core
+/// [`CapabilityRequirement`]:
+///
+/// ```python
+/// {
+///     "filter": {"require_tags": ["gpu"]},
+///     "prefer_more_memory": 0.0,
+///     "prefer_more_vram": 1.0,
+///     "prefer_faster_inference": 0.0,
+///     "prefer_loaded_models": 0.0,
+/// }
+/// ```
+///
+/// Every key is optional: a missing `filter` matches every publisher
+/// and a missing weight is `0.0`, matching the C ABI's JSON DTO.
+pub fn capability_requirement_from_py(d: &Bound<'_, PyDict>) -> PyResult<CapabilityRequirement> {
+    let filter = match get_opt_dict(d, "filter")? {
+        Some(f) => capability_filter_from_py(&f)?,
+        None => CapabilityFilter::new(),
+    };
+    Ok(CapabilityRequirement::from_filter(filter)
+        .prefer_memory(get_weight(d, "prefer_more_memory")?)
+        .prefer_vram(get_weight(d, "prefer_more_vram")?)
+        .prefer_speed(get_weight(d, "prefer_faster_inference")?)
+        .prefer_loaded(get_weight(d, "prefer_loaded_models")?))
+}
+
 // =========================================================================
 // Scope filter (reserved-tag discovery filter)
 // =========================================================================
@@ -554,5 +623,176 @@ mod tests {
         assert_eq!(saturating_u16(u16::MAX as u32), u16::MAX);
         assert_eq!(saturating_u16(u16::MAX as u32 + 1), u16::MAX);
         assert_eq!(saturating_u16(u32::MAX), u16::MAX);
+    }
+
+    /// Run `f` with an interpreter attached.
+    ///
+    /// The crate builds as a `cdylib` extension module and does not
+    /// enable pyo3's `auto-initialize`, because a production import
+    /// already has a live interpreter and auto-initialize would let a
+    /// stray call spin up a second one. A `cargo test` binary is the
+    /// one context with no interpreter, so these tests start it
+    /// explicitly. `Python::initialize` is idempotent, so every test
+    /// can call it.
+    fn with_py<R>(f: impl FnOnce(Python<'_>) -> R) -> R {
+        Python::initialize();
+        Python::attach(f)
+    }
+
+    /// Build a requirement dict from `(key, value)` pairs, where each
+    /// value is anything Python can put in a dict.
+    fn requirement<'py>(
+        py: Python<'py>,
+        entries: &[(&str, Bound<'py, PyAny>)],
+    ) -> Bound<'py, PyDict> {
+        let d = PyDict::new(py);
+        for (k, v) in entries {
+            d.set_item(k, v).expect("set_item");
+        }
+        d
+    }
+
+    /// An empty dict is a valid requirement: match everything, prefer
+    /// nothing. Same defaults the C ABI's JSON DTO applies.
+    #[test]
+    fn requirement_defaults_missing_filter_and_weights() {
+        with_py(|py| {
+            let req = capability_requirement_from_py(&PyDict::new(py)).expect("convert");
+            assert_eq!(req.prefer_more_memory, 0.0);
+            assert_eq!(req.prefer_more_vram, 0.0);
+            assert_eq!(req.prefer_faster_inference, 0.0);
+            assert_eq!(req.prefer_loaded_models, 0.0);
+            assert!(
+                req.filter.require_tags.is_empty(),
+                "a missing filter must match every publisher, not none"
+            );
+        });
+    }
+
+    /// Distinct values per axis, so a transposition can't hide behind
+    /// four equal weights. `None` is spelled as Python `None`, which
+    /// must read the same as an absent key.
+    #[test]
+    fn requirement_passes_each_finite_weight_to_its_own_axis() {
+        with_py(|py| {
+            let d = requirement(
+                py,
+                &[
+                    (
+                        "prefer_more_memory",
+                        0.25f64.into_pyobject(py).unwrap().into_any(),
+                    ),
+                    (
+                        "prefer_more_vram",
+                        0.5f64.into_pyobject(py).unwrap().into_any(),
+                    ),
+                    (
+                        "prefer_faster_inference",
+                        0.75f64.into_pyobject(py).unwrap().into_any(),
+                    ),
+                    ("prefer_loaded_models", py.None().into_bound(py)),
+                ],
+            );
+            let req = capability_requirement_from_py(&d).expect("convert");
+            assert_eq!(req.prefer_more_memory, 0.25);
+            assert_eq!(req.prefer_more_vram, 0.5);
+            assert_eq!(req.prefer_faster_inference, 0.75);
+            assert_eq!(req.prefer_loaded_models, 0.0, "None reads as absent");
+        });
+    }
+
+    /// Python `int` is as natural a weight literal as `float`, and
+    /// finite out-of-range values clamp in the core so every binding
+    /// shares one clamp.
+    #[test]
+    fn requirement_accepts_ints_and_clamps_finite_out_of_range_weights() {
+        with_py(|py| {
+            let d = requirement(
+                py,
+                &[
+                    (
+                        "prefer_more_memory",
+                        (-3i64).into_pyobject(py).unwrap().into_any(),
+                    ),
+                    (
+                        "prefer_more_vram",
+                        1i64.into_pyobject(py).unwrap().into_any(),
+                    ),
+                    (
+                        "prefer_faster_inference",
+                        1e300f64.into_pyobject(py).unwrap().into_any(),
+                    ),
+                ],
+            );
+            let req = capability_requirement_from_py(&d).expect("convert");
+            assert_eq!(req.prefer_more_memory, 0.0);
+            assert_eq!(req.prefer_more_vram, 1.0);
+            assert_eq!(req.prefer_faster_inference, 1.0);
+        });
+    }
+
+    /// `nan` survives `clamp` and then loses every score comparison,
+    /// silently turning a weighted requirement into an unweighted one.
+    /// `inf` clamps to a value the caller never wrote. Both are
+    /// refused with `ValueError` — the value is the wrong value, not
+    /// the wrong type.
+    #[test]
+    fn requirement_rejects_non_finite_weights_on_every_axis() {
+        with_py(|py| {
+            for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                for axis in [
+                    "prefer_more_memory",
+                    "prefer_more_vram",
+                    "prefer_faster_inference",
+                    "prefer_loaded_models",
+                ] {
+                    let d = requirement(py, &[(axis, bad.into_pyobject(py).unwrap().into_any())]);
+                    let err = capability_requirement_from_py(&d)
+                        .expect_err("non-finite weight must be rejected");
+                    assert!(
+                        err.is_instance_of::<pyo3::exceptions::PyValueError>(py),
+                        "{axis}={bad} must raise ValueError, got {err}"
+                    );
+                }
+            }
+        });
+    }
+
+    /// A non-numeric weight is a type error, distinct from the value
+    /// error a non-finite number raises.
+    #[test]
+    fn requirement_rejects_non_numeric_weights() {
+        with_py(|py| {
+            let d = requirement(
+                py,
+                &[(
+                    "prefer_more_vram",
+                    "1.0".into_pyobject(py).unwrap().into_any(),
+                )],
+            );
+            let err =
+                capability_requirement_from_py(&d).expect_err("a string weight must be rejected");
+            assert!(
+                err.is_instance_of::<PyTypeError>(py),
+                "a non-numeric weight must raise TypeError, got {err}"
+            );
+        });
+    }
+
+    /// A non-dict `filter` is a type error, not a silently-ignored
+    /// key that would widen the query to the whole mesh.
+    #[test]
+    fn requirement_rejects_non_dict_filter() {
+        with_py(|py| {
+            let d = requirement(
+                py,
+                &[(
+                    "filter",
+                    "require_tags".into_pyobject(py).unwrap().into_any(),
+                )],
+            );
+            let err = capability_requirement_from_py(&d).expect_err("filter must be a dict");
+            assert!(err.is_instance_of::<PyTypeError>(py), "got {err}");
+        });
     }
 }
