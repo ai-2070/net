@@ -93,6 +93,14 @@ print("planted: and stopped early", file=sys.stderr)
 raise SystemExit(1)
 PY
 
+# Reports back the argument it was handed, so the caller can see what actually
+# arrived rather than what was written.
+cat > "$CHECKER_DIR/echo_argv.py" <<'PY'
+import sys
+print("got=" + " ".join(sys.argv[1:]))
+raise SystemExit(1)
+PY
+
 # ---------------------------------------------------------------- the harness
 # `run_checker` is run in a subshell, so its `note` calls cannot move this
 # script's own `fail` counter — the assertions read the notes it PRINTED, which
@@ -101,10 +109,10 @@ PY
 # render U+2717.
 notes_in() { printf '%s' "$1" | grep -c "$(printf '\033\[31m')"; }
 
-expect() { # <label> <script> <expected-notes> <regex or "-">
-  local label=$1 script=$2 want=$3 pattern=$4
+expect() { # <label> <script> <expected-notes> <regex or "-"> [checker args...]
+  local label=$1 script=$2 want=$3 pattern=$4; shift 4
   local out got
-  out=$(run_checker "$script" 2>/dev/null)
+  out=$(run_checker "$script" "$@" 2>/dev/null)
   got=$(notes_in "$out")
   if [ "$got" -ne "$want" ]; then
     note "$label — expected $want note(s), got $got"
@@ -156,6 +164,28 @@ fi
 
 expect "a suppressed-category warning leaves the verdict standing" \
   warns.py 0 -
+
+# --------------------------------------------------- the path-conversion scope
+# `check-docs.sh` passes `--exclude /releases/`. Under Git Bash that reached
+# Python as `C:/Program Files/Git/releases/`, matched nothing, and the dated
+# release notes were audited as current claims — 78 phantom findings on a tree
+# that is clean in CI. The suppression is applied by `py`, per invocation.
+echo "==> Checker arguments are not rewritten on the way in"
+
+expect "a unix-absolute argument arrives as written" \
+  echo_argv.py 1 'got=--exclude /releases/$' --exclude /releases/
+
+# The other half of "per invocation". Exporting the suppression would also work
+# for the case above, and would silently disarm path translation for every other
+# native command the sourcing script runs, and everything those spawn. This is
+# the assertion that keeps the fix scoped; it holds on every platform, because
+# what it checks is that the library did not export anything.
+if [ -z "${MSYS_NO_PATHCONV:-}" ] && [ -z "${MSYS2_ARG_CONV_EXCL:-}" ]; then
+  ok "the suppression is not exported into the sourcing script's environment"
+else
+  note "the suppression leaked into the environment — every native command in \
+the sourcing script now runs without path translation, not just the checkers"
+fi
 
 echo
 if [ "$fail" -eq 0 ]; then

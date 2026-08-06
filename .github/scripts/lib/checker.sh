@@ -20,17 +20,6 @@ ok()   { printf '  \033[32m✓\033[0m %s\n' "$1"; }
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-# Git Bash rewrites any argument that looks like a Unix absolute path into a
-# Windows one before handing it to a native executable, so `check-docs.sh`'s
-# `--exclude /releases/` reached Python as `C:/Program Files/Git/releases/`,
-# matched nothing, and the dated release notes were scanned as current claims —
-# 78 findings, every one of them phantom, on a run that is clean in CI. None of
-# these checkers takes a Windows path, so the conversion has nothing to do here.
-# `MSYS2_ARG_CONV_EXCL` covers the msys2 runtime, `MSYS_NO_PATHCONV` the older
-# MSYS one; both are inert everywhere else.
-export MSYS_NO_PATHCONV=1
-export MSYS2_ARG_CONV_EXCL='*'
-
 # More than half of each checker is Python. Resolve the interpreter ONCE, and
 # refuse to run without one — a missing `python3` is not a reason to skip those
 # checks, it is a reason to stop. Hard-coding `python3` meant that on a machine
@@ -83,6 +72,30 @@ PYTHON_WARN_FLAGS=(
   -W ignore::ResourceWarning
 )
 
+# THE way to invoke a checker. Applies the interpreter, the warning filters, and
+# the path-conversion suppression as one thing, so a new call site cannot get
+# two of the three.
+#
+# Git Bash rewrites any argument that looks like a Unix absolute path into a
+# Windows one before handing it to a native executable, so `check-docs.sh`'s
+# `--exclude /releases/` reached Python as `C:/Program Files/Git/releases/`,
+# matched nothing, and the dated release notes were scanned as current claims —
+# 78 findings, every one of them phantom, on a run that is clean in CI. None of
+# these checkers takes a Windows path, so the conversion has nothing to do here.
+# `MSYS2_ARG_CONV_EXCL` covers the msys2 runtime, `MSYS_NO_PATHCONV` the older
+# MSYS one; both are inert everywhere else.
+#
+# Per invocation, deliberately, rather than exported once at the top of sourced
+# plumbing. `MSYS2_ARG_CONV_EXCL='*'` suppresses the conversion for EVERY native
+# command in the sourcing script and everything it spawns — `git`, an editor, a
+# hook, a future step that does want a translated path — for the sake of one
+# argument to one interpreter. A prefix assignment reaches the child that needs
+# it and nothing else.
+py() {
+  MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' \
+    "$PYTHON" "${PYTHON_WARN_FLAGS[@]}" "$@"
+}
+
 # Run one of the sibling Python checkers, with any extra args passed through.
 # Findings arrive on stdout, one per line, and each becomes a `note`.
 #
@@ -117,7 +130,7 @@ run_checker() {
   local script="$1"; shift
   local err out status
   err="$TMP/$(basename "$script").err"
-  out=$("$PYTHON" "${PYTHON_WARN_FLAGS[@]}" "$CHECKER_DIR/$script" "$@" 2>"$err")
+  out=$(py "$CHECKER_DIR/$script" "$@" 2>"$err")
   status=$?
   if [ -n "$out" ]; then
     while IFS= read -r line; do

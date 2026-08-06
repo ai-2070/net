@@ -73,7 +73,7 @@ for skill in "$SKILLS"/*/SKILL.md; do
   # put net-event-bus 11 over budget locally while CI, reading UTF-8, saw it
   # 9 under. A checker whose verdict depends on the developer's locale is
   # worse than no checker: it trains people to ignore it.
-  len=$("$PYTHON" - "$skill" <<'PY' 2>"$TMP/desc.err"
+  len=$(py - "$skill" <<'PY' 2>"$TMP/desc.err"
 import re, sys
 t = open(sys.argv[1], encoding="utf-8").read()
 m = re.search(r'^description:\s*"(.*?)"\s*$', t, re.S | re.M)
@@ -158,7 +158,7 @@ before=$fail
 # turns every legitimately-generated citation below into a finding. Worse in the
 # other direction if the allowlist is ever the only thing keeping this section
 # green: a failed lookup should stop the section, not decorate it.
-GENERATED=$("$PYTHON" "$CHECKER_DIR/check-skill-source-paths.py" --generated \
+GENERATED=$(py "$CHECKER_DIR/check-skill-source-paths.py" --generated \
             2>"$TMP/source-paths.err")
 generated_status=$?
 if [ "$generated_status" -ne 0 ] || [ -s "$TMP/source-paths.err" ]; then
@@ -259,7 +259,7 @@ before=$fail
 # line, so its output is echoed as a block. The status handling is the same
 # though — a report means drift, any other status means the checker itself did
 # not get far enough to have an opinion.
-"$PYTHON" "$CHECKER_DIR/capability_records.py" --check >"$TMP/cap.out" 2>&1
+py "$CHECKER_DIR/capability_records.py" --check >"$TMP/cap.out" 2>&1
 cap_status=$?
 if [ "$cap_status" -ne 0 ]; then
   sed 's/^/  /' "$TMP/cap.out"
