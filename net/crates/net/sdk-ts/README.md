@@ -47,6 +47,12 @@ npm install @net-mesh/sdk @net-mesh/core
 native binding it dispatches into. Prebuilt `.node` artifacts ship with every
 feature enabled.
 
+Upgrade both together. The wrapper is a thin typed layer over the binding, so
+a version skew surfaces as a missing method at the call site rather than at
+install time. [CHANGELOG.md](CHANGELOG.md) records what each release asks a
+caller to change — read it before upgrading, especially if you filter on
+`minVramGb` / `minMemoryGb`.
+
 ## The loop: announce → discover → invoke
 
 **Announce** a tool, and it becomes discoverable across the mesh:
