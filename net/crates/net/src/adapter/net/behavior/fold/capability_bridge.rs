@@ -1597,11 +1597,19 @@ pub fn find_nodes_matching_scoped(
 ///
 /// Ties resolve to the lowest `node_id`: candidates are scored in
 /// ascending id order and a later candidate only wins on a strictly
-/// greater score. A `NaN` score therefore never displaces an
-/// incumbent, and the first candidate is accepted regardless — so a
-/// requirement whose weights are all zero (every score equal)
-/// returns the lowest matching id, matching
-/// [`find_nodes_matching`]'s leading element.
+/// greater score. A requirement whose weights are all zero scores
+/// every candidate equally and so returns the lowest matching id,
+/// matching [`find_nodes_matching`]'s leading element.
+///
+/// A `NaN` score is not a low score, it is the absence of one: the
+/// candidate is skipped rather than ranked. Comparison against `NaN`
+/// is false in both directions, so a `NaN` incumbent could not be
+/// displaced by anything — one unscoreable candidate arriving first
+/// would win outright over every real one behind it. If EVERY
+/// candidate is unscoreable the result is still the lowest matching
+/// id: they matched the filter, so "no winner" would be the wrong
+/// answer, and the tie-break is what an all-equal set already
+/// returns.
 ///
 /// `score` runs after the fold guards are released, so it may read
 /// or even mutate the fold without deadlocking. It sees the
@@ -1665,8 +1673,19 @@ fn best_node_inner(
     score: impl Fn(&super::super::capability::CapabilitySet) -> f32,
 ) -> Option<NodeId> {
     let mut best: Option<(NodeId, f32)> = None;
+    // The lowest matching id, held separately so an all-unscoreable candidate
+    // set still resolves to the tie-break rather than to "no match". Candidates
+    // arrive in ascending id order, so this is the first one seen.
+    let mut lowest_matching: Option<NodeId> = None;
     for (node_id, caps) in candidates_for_selection(fold, legacy, scope, same_subnet_lookup) {
+        lowest_matching.get_or_insert(node_id);
         let s = score(&caps);
+        // Skipped, not ranked. `NaN` compares false against everything, so a
+        // `NaN` incumbent is one nothing can displace — leaving the winner
+        // decided by whichever unscoreable candidate happened to sort first.
+        if s.is_nan() {
+            continue;
+        }
         let displaces = match best {
             Some((_, incumbent)) => s > incumbent,
             None => true,
@@ -1675,7 +1694,7 @@ fn best_node_inner(
             best = Some((node_id, s));
         }
     }
-    best.map(|(node_id, _)| node_id)
+    best.map(|(node_id, _)| node_id).or(lowest_matching)
 }
 
 /// Every publisher matching `legacy` — and `scope`, when given —
@@ -4074,6 +4093,105 @@ mod tests {
                 winner(&fold, &unsatisfiable),
                 None,
                 "a filter nothing matches must return None, not the id-0 node",
+            );
+        }
+
+        /// An unscoreable candidate loses to every scoreable one, no
+        /// matter which order they arrive in.
+        ///
+        /// `NaN` compares false in both directions, so the natural
+        /// "later candidates win only on a strictly greater score"
+        /// loop admits the first candidate unconditionally and then
+        /// can never displace it — a `NaN` on the LOWEST id wins
+        /// outright over every real score behind it, which is the
+        /// opposite of what a scorer returning `NaN` means. Both
+        /// orders are staged here because only the low-id case fails
+        /// under that shape; scoring the high id `NaN` passes either
+        /// way and would have proved nothing on its own.
+        ///
+        /// Unreachable through `CapabilityRequirement::score`, which
+        /// divides by constants and guards its one ratio — and
+        /// unreachable through the Node and Python surfaces, which
+        /// refuse a non-finite weight outright. The bridge takes an
+        /// arbitrary caller-supplied `Fn` though, so it is reachable
+        /// here, and total is cheaper than documented-as-impossible.
+        #[test]
+        fn an_unscoreable_candidate_never_beats_a_scoreable_one() {
+            let fold = new_fold();
+            announce(
+                &fold,
+                LOW_ID,
+                CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_gpu(gpu(8))),
+            );
+            announce(
+                &fold,
+                HIGH_ID,
+                CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_gpu(gpu(80))),
+            );
+            let filter = LegacyFilter::default();
+            let vram = |caps: &CapabilitySet| caps.views().hardware().total_vram_gb();
+
+            assert_eq!(
+                best_node_matching(&fold, &filter, |caps| {
+                    if vram(caps) == 8 {
+                        f32::NAN
+                    } else {
+                        1.0
+                    }
+                }),
+                Some(HIGH_ID),
+                "the unscoreable candidate sorts first, so a shape that lets it \
+                 become an undisplaceable incumbent returns it here",
+            );
+
+            assert_eq!(
+                best_node_matching(&fold, &filter, |caps| {
+                    if vram(caps) == 80 {
+                        f32::NAN
+                    } else {
+                        1.0
+                    }
+                }),
+                Some(LOW_ID),
+                "and it loses from the other side too, where it never had a \
+                 chance to become the incumbent",
+            );
+        }
+
+        /// When NOTHING is scoreable the answer is still the lowest
+        /// matching id, not `None`.
+        ///
+        /// Skipping unscoreable candidates outright would make this
+        /// report no match at all — but they did match the filter,
+        /// and "no winner among equals" is exactly the case the
+        /// tie-break already answers.
+        #[test]
+        fn every_candidate_unscoreable_falls_back_to_the_tie_break() {
+            let fold = new_fold();
+            announce(&fold, LOW_ID, CapabilitySet::new());
+            announce(&fold, HIGH_ID, CapabilitySet::new());
+
+            assert_eq!(
+                best_node_matching(&fold, &LegacyFilter::default(), |_| f32::NAN),
+                Some(LOW_ID),
+                "both candidates matched the filter, so an unrankable set is a \
+                 tie, not an empty result",
+            );
+
+            // And a filter nothing matches is still `None`, so the
+            // fallback above cannot manufacture a winner.
+            assert_eq!(
+                best_node_matching(
+                    &fold,
+                    &LegacyFilter {
+                        require_tags: vec!["tag-nobody-announced".into()],
+                        ..LegacyFilter::default()
+                    },
+                    |_| f32::NAN,
+                ),
+                None,
+                "the fallback is the lowest MATCHING id — with no match there is \
+                 nothing to fall back to",
             );
         }
 
