@@ -45,6 +45,7 @@ on:
     paths:
       - ".claude/skills/**"
       - ".github/workflows/skills.yml"
+      - ".github/scripts/lib/checker.sh"
       - ".github/scripts/check-skills.sh"
       - ".github/scripts/check-skills-depth.sh"
       - ".github/scripts/check-skill-source-paths.py"
@@ -92,6 +93,7 @@ on:
     paths:
       - ".claude/skills/**"
       - ".github/workflows/skills.yml"
+      - ".github/scripts/lib/checker.sh"
       - ".github/scripts/check-skills.sh"
       - ".github/scripts/check-skills-depth.sh"
       - ".github/scripts/check-skill-source-paths.py"

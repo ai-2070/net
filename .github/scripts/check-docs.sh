@@ -35,15 +35,13 @@
 set -uo pipefail
 
 cd "$(dirname "$0")/../.."
+# Relative to the repo root we just entered — see `check-skills.sh` for why an
+# absolute path breaks the Python checkers under Git Bash.
+CHECKER_DIR=".github/scripts"
 DOCS="web/src/content/docs"
 EXCLUDE="/releases/"
-fail=0
-
-# A counter, not a flag — each section's success line compares `fail` against
-# `before`, and as a 0/1 flag the first failure made every later section print a
-# green tick it had not earned.
-note() { printf '  \033[31m✗\033[0m %s\n' "$1"; fail=$((fail + 1)); }
-ok()   { printf '  \033[32m✓\033[0m %s\n' "$1"; }
+# `note`, `ok`, `fail`, `$TMP`, a resolved `$PYTHON`, and `run_checker`.
+. "$CHECKER_DIR/lib/checker.sh"
 
 docs_files() {
   find "$DOCS" -name "*.md" -o -name "*.mdx" | grep -v "$EXCLUDE"
@@ -73,10 +71,7 @@ done < <(grep -ohE '`(net|go|web)/[A-Za-z0-9_/.-]+`' $(docs_files) 2>/dev/null \
 # one document set's deliberate absence cannot silence another's real defect.
 echo "==> Enum variants and metric/config identifiers"
 before=$fail
-while read -r line; do
-  [ -n "$line" ] && note "$line"
-done < <(python3 "$(dirname "$0")/check-skill-refs.py" \
-           --corpus "$DOCS" --exclude "$EXCLUDE" || true)
+run_checker check-skill-refs.py --corpus "$DOCS" --exclude "$EXCLUDE"
 [ "$fail" -eq "$before" ] && ok "documented variants and identifiers all resolve"
 
 # ------------------------------------------------------------------ CLI verbs
