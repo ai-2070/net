@@ -68,9 +68,10 @@ pages:
   discover:
     rust: [list_tools, watch_tools, find_nodes, CapabilityFilter, find_best_node,
            find_nodes_scoped, to_openai_tool]
-    typescript: [findNodes, findNodesScoped, listTools, watchTools, toOpenaiTool,
-                 inputSchema]
-    python: [list_tools, watch_tools, find_nodes, tool_id, node_count]
+    typescript: [findNodes, findNodesScoped, findBestNode, findBestNodeScoped,
+                 listTools, watchTools, toOpenaiTool, inputSchema]
+    python: [list_tools, watch_tools, find_nodes, find_best_node,
+             find_best_node_scoped, tool_id, node_count]
     go: [FindNodes, CapabilityFilter, NewMeshRpc, NewTypedMeshRpc, ListTools,
          WatchTools, WatchOptions, ToolID]
 

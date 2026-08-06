@@ -109,7 +109,9 @@ mixing them up is the standard TypeScript bug here.
   NetNode(...)` has no TypeScript analogue and `await NetNode.create(...)` has no
   Python one.
 - Rust has no `channel()` at all — do not port a channel example to Rust.
-- Discovery is `findNodes` / `findNodesScoped` / `findServiceNodes` and returns
-  a **list**. There is no `findBestNode`; that is Rust and Go only.
+- Discovery is `findNodes` / `findNodesScoped` / `findServiceNodes`, returning a
+  **list**, plus `findBestNode` / `findBestNodeScoped`, which apply the
+  requirement's weights and return one `bigint | null`. `null` is no match;
+  `0n` is a real node id, so test `=== null`, never falsiness.
 - The three-way return convention above is TypeScript's alone. Python raises,
   Go and C return error codes.

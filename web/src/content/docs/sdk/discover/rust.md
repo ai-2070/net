@@ -42,8 +42,29 @@ let nodes: Vec<u64> = mesh.find_nodes(&filter);
 ```
 
 `find_nodes` is **not async** — it reads the local index and returns node ids
-directly. `find_best_node` returns a single highest-scoring node for a weighted
-requirement; `find_nodes_scoped` narrows to a tenant, region or subnet pool.
+directly. `find_nodes_scoped` narrows to a tenant, region or subnet pool.
+
+### Pick one node
+
+```rust
+use net_sdk::capabilities::CapabilityRequirement;
+
+let req = CapabilityRequirement::from_filter(filter).prefer_vram(1.0);
+let target: Option<u64> = mesh.find_best_node(&req);
+```
+
+`find_best_node` applies the requirement's weights and returns one winner instead
+of the whole matching set. The four weights — memory, VRAM, tokens/sec and the
+share of models already loaded — are read from each candidate's announced
+capability tags, and each is clamped to `[0.0, 1.0]`. Ties, including the case
+where every weight is zero, resolve to the lowest matching node id.
+
+`None` means nothing matched; node id `0` is a real id, so match on the `Option`
+rather than comparing against zero. `find_best_node_scoped` applies a scope
+first, so a peer outside the scope cannot win on capacity.
+
+Same local-index read as `find_nodes`: no network, no `await`, and only peers
+whose announcements have already arrived.
 
 ### Lower a descriptor for an LLM
 

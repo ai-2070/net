@@ -124,11 +124,11 @@ operations:
       anchor: find_best_node
     Node / TS:
       status: supported
-      anchor: findNodes
+      anchor: findBestNode
     Python:
       status: supported
       mode: core-only
-      anchor: find_nodes
+      anchor: find_best_node
     Go:
       status: supported
       anchor: FindBestNode

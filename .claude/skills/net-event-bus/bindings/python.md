@@ -73,8 +73,10 @@ Spelt `buffer_capacity=1024` in this binding.
 - `node.channel('name', Model)` — the named-channel surface. The model may be a
   `@dataclass`, a Pydantic model (anything with `model_dump()`), or a plain
   class (anything with `__dict__`).
-- Discovery is `find_nodes` / `find_nodes_scoped` / `find_service_nodes` and
-  returns a **list**. There is no `find_best_node`.
+- Discovery is `find_nodes` / `find_nodes_scoped` / `find_service_nodes`,
+  returning a **list**, plus `find_best_node` / `find_best_node_scoped`, which
+  apply the requirement's weights and return one `int | None`. `None` is no
+  match; `0` is a real node id, so test `is None`.
 - The predicate DSL is exposed as functions and a builder: `p`, `tag_key`,
   `evaluate_predicate`, `evaluate_predicate_with_trace`, `predicate_debug_report`.
 

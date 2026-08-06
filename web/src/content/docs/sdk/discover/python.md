@@ -63,6 +63,33 @@ typed filter object. The predicate model is identical across bindings — see
 [Capabilities](/docs/concepts/capabilities) for the full surface and the CLI
 equivalent.
 
+### Picking one node
+
+```python
+target = native.find_best_node({
+    "filter": {"require_tags": ["gpu"]},
+    "prefer_more_vram": 1.0,
+})
+```
+
+`find_best_node` applies the requirement's weights and returns one winner
+instead of the whole matching set. The four weights — `prefer_more_memory`,
+`prefer_more_vram`, `prefer_faster_inference`, `prefer_loaded_models` — are read
+from each candidate's announced capability tags, and every key of the dict is
+optional. They must be **finite**: `nan` and `inf` raise `ValueError`, a
+non-numeric weight raises `TypeError`, and finite values outside `[0.0, 1.0]`
+are clamped by the substrate. Ties, including the case where every weight is
+omitted, resolve to the lowest matching node id.
+
+`None` means nothing matched. `0` is a real node id, so test `is None` rather
+than truthiness. `find_best_node_scoped(requirement, scope)` applies the scope
+first, so a peer outside it cannot win on capacity.
+
+Same local-index read as `find_nodes`: synchronous, no network, and only peers
+whose announcements have already arrived. `AsyncNetMesh` carries all four
+methods and they stay synchronous there — awaiting the returned `list` or `int`
+raises `TypeError`.
+
 ### Verify it worked
 
 ```python

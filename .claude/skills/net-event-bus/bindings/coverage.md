@@ -117,7 +117,7 @@ should not infer one binding's API from another's.
 | Channels — pub/sub with capability auth | `subscribe_channel` | `subscribeChannel` | `subscribe_channel` | `SubscribeChannel` | `net_mesh_subscribe_channel_with_token` |
 | Mesh streams | `open_stream` | `openStream` | `open_stream` | `OpenStream` | `net_mesh_open_stream` |
 | Capability announce | `announce_capabilities` | `announceCapabilities` | `announce_capabilities` | `AnnounceCapabilities` | `net_mesh_announce_capabilities` |
-| Capability discovery | `find_best_node` | `findNodes` | `find_nodes` | `FindBestNode` | `net_mesh_find_best_node` |
+| Capability discovery | `find_best_node` | `findBestNode` | `find_best_node` | `FindBestNode` | `net_mesh_find_best_node` |
 | nRPC — typed request/response + streaming | `call_typed` | `TypedMeshRpc` | `call_streaming` | `NewTypedMeshRpc` | `net_rpc_call` |
 | Gang-claim scheduler | `claim_island` | `claimIsland` | `claim_island` | `ClaimIsland` | `net_mesh_claim_island` |
 | A2A — agent task handoff | `serve_a2a` | `serveA2a` | `serve_a2a` | — | — |
@@ -174,11 +174,18 @@ gateway on its own.
 All `supported`, and still not interchangeable. Two worth knowing before you
 generate code:
 
-**Discovery returns one node in Rust and Go, a list in Node and Python.** Rust's
-`find_best_node` and Go's `FindBestNode` apply the selection policy for you.
-Node and Python expose `findNodes` / `find_nodes` (plus scoped and service-scoped
-variants) and leave the choice to you — there is no `findBestNode`. Porting a
-Rust snippet by transliterating the name produces a call that does not exist.
+**Discovery has two shapes everywhere, and only the spelling differs.** Every
+binding offers both the list (`find_nodes` / `findNodes` / `FindNodes` /
+`net_mesh_find_nodes`, plus scoped variants) and the single winner
+(`find_best_node` / `findBestNode` / `FindBestNode` /
+`net_mesh_find_best_node`). The list leaves the choice to you; the
+single-winner form applies the requirement's weights and returns one node.
+
+How "no match" comes back is what differs. Rust returns `Option<u64>`, Node
+`bigint | null`, Python `int | None`; Go returns `(uint64, bool, error)` and C
+writes an `out_has_match` flag, because neither can express absence in a `u64`
+where `0` is a valid node id. Transliterating a Rust snippet gets you the right
+method name in Node and Python, and a compile error in Go.
 
 **nRPC is a free function in Rust and a class everywhere else.** Rust has
 `call_typed` on the mesh; Node, Python and Go route through a `TypedMeshRpc`
