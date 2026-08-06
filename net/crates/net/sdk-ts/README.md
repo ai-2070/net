@@ -13,7 +13,7 @@ leave the node that holds them: the machine with the secret runs the work.
 
 ```typescript
 // Find something that can do the job, then do it — no registry, no config.
-const peers = node.findNodes({ requireTags: ['gpu'], minVramMb: 16_384 });
+const peers = node.findNodes({ requireTags: ['gpu'], minVramGb: 16 });
 const resp = await callTool(node, 'summarize', { text });
 ```
 

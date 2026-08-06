@@ -5,13 +5,19 @@
 ```typescript
 const peers: bigint[] = node.findNodes({
   requireTags: ['gpu'],
-  minVramMb: 16_384,
+  minVramGb: 16,
 });
 ```
 
 `findNodes` is a method on the **`MeshNode`** and is **synchronous** — it reads the
 local index. Node ids come back as `bigint[]` because they are 64-bit; `===`
 against a number literal is always false.
+
+`minVramGb` and `minMemoryGb` are in **gigabytes**, matching every other binding
+and the substrate. They were spelled `minVramMb` / `minMemoryMb` before 0.35,
+which is a different name from the one the native layer reads — so both were
+dropped and the threshold matched everything. Rename and rescale together: a
+`minVramMb: 16_384` that used to be ignored is `minVramGb: 16`, not `16_384`.
 
 `findNodesScoped(filter, scope)` narrows to a tenant, region or subnet pool.
 

@@ -307,7 +307,7 @@ await node.announceCapabilities({
   models: [{ modelId: 'llama-3.1-70b', family: 'llama', loaded: true }],
 });
 const peers: bigint[] = node.findNodes({
-  requireGpu: true, gpuVendor: normalizeGpuVendor('NVIDIA'), minVramGb: 16_384,
+  requireGpu: true, gpuVendor: normalizeGpuVendor('NVIDIA'), minVramGb: 16,
 });
 
 // Or one winner, weights applied for you:

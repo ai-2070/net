@@ -94,10 +94,19 @@ describe('MeshNode capabilities', () => {
     });
 
     const aId = a.nodeId();
-    const filter: CapabilityFilter = { requireGpu: true, minVramMb: 16_384 };
+    const filter: CapabilityFilter = { requireGpu: true, minVramGb: 16 };
 
     const arrived = await waitUntil(() => b.findNodes(filter).includes(aId));
     expect(arrived).toBe(true);
+
+    // The range axes have to actually range. Until 2026-08 the SDK
+    // spelled these `minVramMb` / `minMemoryMb` while napi generated
+    // `minVramGb` / `minMemoryGb`, so both were dropped before
+    // reaching the substrate and every threshold matched everything —
+    // which the positive assertion above cannot detect on its own.
+    expect(b.findNodes({ requireGpu: true, minVramGb: 25 })).not.toContain(aId);
+    expect(b.findNodes({ minMemoryGb: 64 })).toContain(aId);
+    expect(b.findNodes({ minMemoryGb: 65 })).not.toContain(aId);
   });
 
   it('late joiner receives session-open push', async () => {
@@ -166,7 +175,11 @@ describe('MeshNode capabilities', () => {
     expect(a.findNodes({ requireModels: ['llama-3.1-70b'] })).toContain(a.nodeId());
     expect(a.findNodes({ requireTools: ['web_search'] })).toContain(a.nodeId());
     expect(a.findNodes({ requireModalities: ['code'] })).toContain(a.nodeId());
-    expect(a.findNodes({ gpuVendor: 'nvidia', minVramMb: 40_000 })).toContain(a.nodeId());
+    // The announced H100 carries 80 GB, so 40 admits and 96 excludes.
+    expect(a.findNodes({ gpuVendor: 'nvidia', minVramGb: 40 })).toContain(a.nodeId());
+    expect(a.findNodes({ gpuVendor: 'nvidia', minVramGb: 96 })).not.toContain(
+      a.nodeId(),
+    );
   });
 
   it('drops expired entries after TTL + a GC sweep', async () => {

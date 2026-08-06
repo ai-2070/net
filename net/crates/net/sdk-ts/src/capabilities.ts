@@ -22,7 +22,7 @@
  *   models: [{ modelId: 'llama-3.1-70b', family: 'llama' }],
  * });
  *
- * const peers = node.findNodes({ requireTags: ['gpu'], minVramMb: 16_384 });
+ * const peers = node.findNodes({ requireTags: ['gpu'], minVramGb: 16 });
  * ```
  *
  * Multi-hop propagation is deferred; today peers more than one hop
@@ -171,10 +171,12 @@ export interface CapabilityFilter {
   requireTags?: string[];
   requireModels?: string[];
   requireTools?: string[];
-  minMemoryMb?: number;
+  /** Minimum system memory, in **gigabytes**. */
+  minMemoryGb?: number;
   requireGpu?: boolean;
   gpuVendor?: GpuVendor;
-  minVramMb?: number;
+  /** Minimum total GPU VRAM, in **gigabytes**. */
+  minVramGb?: number;
   minContextLength?: number;
   requireModalities?: Modality[];
 }
@@ -296,15 +298,25 @@ export interface CapabilityRequirement {
   preferLoadedModels?: number;
 }
 
-/** Shape that napi-rs expects for `findNodes`. */
+/**
+ * Shape that napi-rs expects for `findNodes`.
+ *
+ * These names must match the camelCase napi derives from
+ * `CapabilityFilterJs` in `bindings/node/src/capabilities.rs` EXACTLY.
+ * A key that does not match is not a type error on either side — napi
+ * reads the fields it knows and ignores the rest, so a misspelling
+ * makes the filter silently vanish and the query returns MORE nodes
+ * than the caller asked for. `minMemoryMb` / `minVramMb` did exactly
+ * that until 2026-08: two axes that never once reached the substrate.
+ */
 export interface NapiCapabilityFilter {
   requireTags?: string[];
   requireModels?: string[];
   requireTools?: string[];
-  minMemoryMb?: number;
+  minMemoryGb?: number;
   requireGpu?: boolean;
   gpuVendor?: string;
-  minVramMb?: number;
+  minVramGb?: number;
   minContextLength?: number;
   requireModalities?: string[];
 }
@@ -399,10 +411,10 @@ export function capabilityFilterToNapi(f: CapabilityFilter): NapiCapabilityFilte
     requireTags: f.requireTags,
     requireModels: f.requireModels,
     requireTools: f.requireTools,
-    minMemoryMb: f.minMemoryMb,
+    minMemoryGb: f.minMemoryGb,
     requireGpu: f.requireGpu,
     gpuVendor: f.gpuVendor,
-    minVramMb: f.minVramMb,
+    minVramGb: f.minVramGb,
     minContextLength: f.minContextLength,
     requireModalities: f.requireModalities as string[] | undefined,
   };
