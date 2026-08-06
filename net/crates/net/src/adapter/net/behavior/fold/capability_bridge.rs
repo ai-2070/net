@@ -3793,4 +3793,332 @@ mod tests {
             );
         }
     }
+
+    // ================================================================
+    // Weighted selection witnesses
+    // ================================================================
+    //
+    // `best_node_matching` is the single-winner discovery path, and
+    // every binding that exposes it (Rust, Go, C, and now Node and
+    // Python) documents its four preference weights as load-bearing.
+    // That claim is only worth making while these tests pass.
+    //
+    // Each witness stages TWO matching candidates whose node-id order
+    // is the OPPOSITE of their capacity order, then asserts the same
+    // fold twice, mutating only the requirement:
+    //
+    //   - all weights zero  → the lower node id wins (the tie-break);
+    //   - the axis weighted → the higher-capacity node wins.
+    //
+    // A single candidate would pass both assertions no matter what
+    // scoring did, and same-order ids would let a lexicographic
+    // selection masquerade as a weighted one. Both halves are needed:
+    // the first pins the tie-break, the second proves the weight
+    // actually moved the winner.
+    //
+    // This is the shape that catches a regression to the pre-2026-08
+    // behavior, where the fold payload carried no hardware/model
+    // projection, every score tied, and selection silently degraded to
+    // "lowest matching node id" while still being documented as
+    // weighted.
+    mod weighted_selection {
+        use super::*;
+        use crate::adapter::net::behavior::capability::{
+            CapabilityAnnouncement, CapabilityRequirement, CapabilitySet, GpuInfo,
+            GpuVendor as LegacyGpuVendor, HardwareCapabilities, ModelCapability,
+        };
+        use crate::adapter::net::identity::EntityId;
+
+        /// The lower of the two node ids used by every witness, and
+        /// the one an unweighted requirement must return.
+        const LOW_ID: NodeId = 0x11;
+        /// The higher node id — always given the STRONGER capability,
+        /// so a weighted requirement has to overcome the tie-break to
+        /// pick it.
+        const HIGH_ID: NodeId = 0x22;
+
+        /// Publish `caps` for `node_id` through the production
+        /// translate → apply path, so the fold entry carries exactly
+        /// the canonical tags a real announcement would.
+        fn announce(fold: &Fold<CapabilityFold>, node_id: NodeId, caps: CapabilitySet) {
+            let ann = CapabilityAnnouncement::new(
+                node_id,
+                EntityId::from_bytes([node_id as u8; 32]),
+                1,
+                caps,
+            );
+            apply_legacy_announcement(fold, ann, None, 0).expect("apply");
+        }
+
+        fn gpu(vram_gb: u32) -> GpuInfo {
+            GpuInfo::new(LegacyGpuVendor::Nvidia, "test-gpu", vram_gb)
+        }
+
+        /// A requirement with an empty filter (matches every
+        /// publisher) and no weights — the tie-break baseline.
+        fn unweighted() -> CapabilityRequirement {
+            CapabilityRequirement::from_filter(LegacyFilter::default())
+        }
+
+        fn winner(fold: &Fold<CapabilityFold>, req: &CapabilityRequirement) -> Option<NodeId> {
+            best_node_matching(fold, &req.filter, |caps| req.score(caps))
+        }
+
+        /// The paired assertion every axis witness runs: same fold,
+        /// same candidates, only the preference changes.
+        fn assert_weight_flips_the_winner(
+            fold: &Fold<CapabilityFold>,
+            weighted: CapabilityRequirement,
+            axis: &str,
+        ) {
+            assert_eq!(
+                winner(fold, &unweighted()),
+                Some(LOW_ID),
+                "{axis}: with no weights the lowest matching node id must win — \
+                 if this fails the tie-break changed, and the weighted half below \
+                 proves nothing",
+            );
+            assert_eq!(
+                winner(fold, &weighted),
+                Some(HIGH_ID),
+                "{axis}: weighting the axis must pick the higher-capacity node \
+                 over the lower node id — a dead weight leaves the tie-break \
+                 winner in place",
+            );
+        }
+
+        #[test]
+        fn find_best_node_prefers_higher_vram_over_lower_node_id() {
+            let fold = new_fold();
+            announce(
+                &fold,
+                LOW_ID,
+                CapabilitySet::new()
+                    .with_hardware(HardwareCapabilities::new().with_gpu(gpu(8))),
+            );
+            announce(
+                &fold,
+                HIGH_ID,
+                CapabilitySet::new()
+                    .with_hardware(HardwareCapabilities::new().with_gpu(gpu(80))),
+            );
+            assert_weight_flips_the_winner(
+                &fold,
+                unweighted().prefer_vram(1.0),
+                "vram",
+            );
+        }
+
+        #[test]
+        fn find_best_node_prefers_more_memory_over_lower_node_id() {
+            let fold = new_fold();
+            announce(
+                &fold,
+                LOW_ID,
+                CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(8)),
+            );
+            announce(
+                &fold,
+                HIGH_ID,
+                CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(256)),
+            );
+            assert_weight_flips_the_winner(
+                &fold,
+                unweighted().prefer_memory(1.0),
+                "memory",
+            );
+        }
+
+        #[test]
+        fn find_best_node_prefers_faster_inference_over_lower_node_id() {
+            let fold = new_fold();
+            announce(
+                &fold,
+                LOW_ID,
+                CapabilitySet::new().add_model(
+                    ModelCapability::new("slow-model", "test").with_tokens_per_sec(10),
+                ),
+            );
+            announce(
+                &fold,
+                HIGH_ID,
+                CapabilitySet::new().add_model(
+                    ModelCapability::new("fast-model", "test").with_tokens_per_sec(900),
+                ),
+            );
+            assert_weight_flips_the_winner(
+                &fold,
+                unweighted().prefer_speed(1.0),
+                "tokens/sec",
+            );
+        }
+
+        #[test]
+        fn find_best_node_prefers_loaded_models_over_lower_node_id() {
+            let fold = new_fold();
+            // The axis is the LOADED RATIO, not the loaded count, so
+            // the low-id node carries more models — one loaded out of
+            // two (0.5) against one out of one (1.0). A scorer that
+            // counted instead of ratioing would tie here and fall back
+            // to the node id, failing the second assertion.
+            announce(
+                &fold,
+                LOW_ID,
+                CapabilitySet::new()
+                    .add_model(ModelCapability::new("a", "test").with_loaded(true))
+                    .add_model(ModelCapability::new("b", "test").with_loaded(false)),
+            );
+            announce(
+                &fold,
+                HIGH_ID,
+                CapabilitySet::new()
+                    .add_model(ModelCapability::new("c", "test").with_loaded(true)),
+            );
+            assert_weight_flips_the_winner(
+                &fold,
+                unweighted().prefer_loaded(1.0),
+                "loaded-model ratio",
+            );
+        }
+
+        /// Scope narrows the candidate set BEFORE scoring. The
+        /// strongest node in the fold belongs to another tenant, so a
+        /// scoped query must not return it however heavily the axis is
+        /// weighted — and the unscoped query on the same fold must,
+        /// or the test would pass on a fold where the strong candidate
+        /// simply wasn't there.
+        #[test]
+        fn scoped_selection_filters_before_scoring() {
+            let fold = new_fold();
+            announce(
+                &fold,
+                LOW_ID,
+                CapabilitySet::new()
+                    .with_hardware(HardwareCapabilities::new().with_gpu(gpu(8)))
+                    .with_tenant_scope("red"),
+            );
+            announce(
+                &fold,
+                HIGH_ID,
+                CapabilitySet::new()
+                    .with_hardware(HardwareCapabilities::new().with_gpu(gpu(80)))
+                    .with_tenant_scope("blue"),
+            );
+
+            let req = unweighted().prefer_vram(1.0);
+            assert_eq!(
+                winner(&fold, &req),
+                Some(HIGH_ID),
+                "unscoped, the 80GB blue-tenant node is the strongest candidate",
+            );
+            assert_eq!(
+                best_node_matching_scoped(
+                    &fold,
+                    &req.filter,
+                    &ScopeFilter::Tenant("red"),
+                    |_, _| false,
+                    |caps| req.score(caps),
+                ),
+                Some(LOW_ID),
+                "scoped to tenant red, the stronger blue-tenant node must be \
+                 excluded before scoring, not out-scored after it",
+            );
+        }
+
+        #[test]
+        fn no_match_returns_none_and_node_id_zero_is_a_valid_winner() {
+            let fold = new_fold();
+            assert_eq!(
+                winner(&fold, &unweighted()),
+                None,
+                "an empty fold has no winner",
+            );
+
+            // Node id 0 is a legitimate id, not a sentinel — this is
+            // why the C and Go surfaces carry a separate has-match
+            // out-param and the Node/Python surfaces return
+            // `null` / `None` rather than 0.
+            announce(&fold, 0, CapabilitySet::new());
+            assert_eq!(
+                winner(&fold, &unweighted()),
+                Some(0),
+                "node id 0 must be returned as a winner, not read as no-match",
+            );
+
+            let unsatisfiable = CapabilityRequirement::from_filter(LegacyFilter {
+                require_tags: vec!["tag-nobody-announced".into()],
+                ..LegacyFilter::default()
+            });
+            assert_eq!(
+                winner(&fold, &unsatisfiable),
+                None,
+                "a filter nothing matches must return None, not the id-0 node",
+            );
+        }
+
+        /// Every candidate is scored against the capability set the
+        /// SAME fold read admitted it from.
+        ///
+        /// The shape this replaced resolved ids from one fold read and
+        /// then re-entered the fold once per candidate to synthesize
+        /// scoring input. The negative control below is the value that
+        /// second read returns once an entry is gone: an empty default
+        /// set, which scores 1.0 — enough for an evicted node to beat
+        /// a live 80GB one under a VRAM weight. Selection and scoring
+        /// now come from one snapshot, so there is no second read to
+        /// disagree with the first.
+        ///
+        /// Single-threaded, so this witnesses the structure rather
+        /// than the absence of a race: it pins that scoring input is
+        /// state-local synthesis of an admitted candidate, never a
+        /// defaulted set, and that an id the fold no longer holds is
+        /// neither admitted nor scored.
+        #[test]
+        fn selection_scores_each_candidate_against_the_state_that_admitted_it() {
+            let fold = new_fold();
+            announce(
+                &fold,
+                LOW_ID,
+                CapabilitySet::new()
+                    .with_hardware(HardwareCapabilities::new().with_gpu(gpu(8))),
+            );
+            announce(
+                &fold,
+                HIGH_ID,
+                CapabilitySet::new()
+                    .with_hardware(HardwareCapabilities::new().with_gpu(gpu(80))),
+            );
+            fold.evict_node(HIGH_ID, "test: publisher left before the query");
+
+            let req = unweighted().prefer_vram(1.0);
+            // `RefCell` because the bridge takes `Fn`, not `FnMut` —
+            // a scorer has no business mutating anything; this one is
+            // a test probe.
+            let observed: std::cell::RefCell<Vec<u32>> = std::cell::RefCell::new(Vec::new());
+            let winner = best_node_matching(&fold, &req.filter, |caps| {
+                observed
+                    .borrow_mut()
+                    .push(caps.views().hardware().total_vram_gb());
+                req.score(caps)
+            });
+
+            assert_eq!(
+                observed.into_inner(),
+                vec![8],
+                "exactly the surviving candidate is scored, and it is scored \
+                 against its real VRAM — an evicted id must not reach the scorer",
+            );
+            assert_eq!(winner, Some(LOW_ID));
+
+            // Negative control: what the composed shape's second fold
+            // read would have handed the scorer for the evicted node.
+            let stale = synthesize_capability_set(&fold, HIGH_ID);
+            assert_eq!(
+                stale.views().hardware().total_vram_gb(),
+                0,
+                "the fold-taking synthesis defaults an unknown publisher to an \
+                 empty set — the value a split-read selection would have scored",
+            );
+        }
+    }
 }
