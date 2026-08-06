@@ -787,9 +787,9 @@ const CAPABILITY_SET_CACHE_DEFAULT_CAPACITY: usize = 256;
 ///
 /// [`best_node_matching`] deliberately does NOT come through here:
 /// a cache lookup re-enters the fold for its generation stamp, and
-/// that path scores inside the snapshot that selected its
+/// that path synthesizes inside the snapshot that admitted its
 /// candidates. It pays the synthesis per candidate to keep
-/// selection and scoring on one fold state.
+/// membership and capabilities on one fold state.
 ///
 /// The generation is global to the fold — any fold change
 /// invalidates every cached entry. That's coarse but accurate:
@@ -1602,7 +1602,11 @@ pub fn find_nodes_matching_scoped(
 /// requirement whose weights are all zero (every score equal)
 /// returns the lowest matching id, matching
 /// [`find_nodes_matching`]'s leading element.
-pub fn best_node_matching(
+///
+/// `score` runs after the fold guards are released, so it may read
+/// or even mutate the fold without deadlocking. It sees the
+/// capability sets captured by the selecting snapshot regardless.
+pub(crate) fn best_node_matching(
     fold: &Fold<CapabilityFold>,
     legacy: &LegacyFilter,
     score: impl Fn(&super::super::capability::CapabilitySet) -> f32,
@@ -1618,7 +1622,7 @@ pub fn best_node_matching(
 ///
 /// Scope narrows the candidate set BEFORE scoring, so an
 /// out-of-scope publisher cannot win on score.
-pub fn best_node_matching_scoped(
+pub(crate) fn best_node_matching_scoped(
     fold: &Fold<CapabilityFold>,
     legacy: &LegacyFilter,
     scope: &ScopeFilter<'_>,
@@ -1628,22 +1632,31 @@ pub fn best_node_matching_scoped(
     best_node_inner(fold, legacy, Some(scope), same_subnet_lookup, score)
 }
 
-/// # One snapshot
+/// # One snapshot, then score
 ///
-/// Filtering, scope evaluation, per-candidate capability synthesis
-/// and scoring all run inside a single `with_state_and_index`.
+/// Filtering, scope evaluation and per-candidate capability
+/// synthesis all happen inside a single `with_state_and_index`,
+/// which hands back OWNED `(NodeId, CapabilitySet)` pairs. Scoring
+/// runs afterwards, with both fold guards released.
 ///
-/// The composed alternative — `find_nodes_matching*` for the ids,
-/// then `synthesize_capability_set` per id — reads the fold once
-/// for membership and again per candidate for scoring. A
-/// replacement landing between those reads yields a winner selected
-/// on one generation's capabilities and scored on another's, or
-/// scored against `CapabilitySet::default()` after an eviction: a
+/// Capturing the sets under one read is what makes the result
+/// coherent; holding the guards across `score` is not. The composed
+/// alternative — `find_nodes_matching*` for the ids, then
+/// `synthesize_capability_set` per id — reads the fold once for
+/// membership and again per candidate for scoring. A replacement
+/// landing between those reads yields a winner selected on one
+/// generation's capabilities and scored on another's, or scored
+/// against `CapabilitySet::default()` after an eviction: a
 /// zero-capacity node beating a live one under a memory weight.
-/// Neither result existed in any single fold state. Hence the
-/// state-local synthesis helper rather than the fold-taking one —
-/// re-entering here would also deadlock on the read guards this
-/// closure holds.
+/// Neither result existed in any single fold state.
+///
+/// Scoring is deliberately outside. `score` is caller-supplied and
+/// carries no fold-purity contract — unlike `same_subnet_lookup`,
+/// which is documented fold-pure precisely because it IS called
+/// under the guards. A scorer that touched the fold would otherwise
+/// deadlock against the read guards its own caller holds, and every
+/// scorer would hold both guards, and each writer queued behind
+/// them, across candidate-controlled work.
 fn best_node_inner(
     fold: &Fold<CapabilityFold>,
     legacy: &LegacyFilter,
@@ -1651,6 +1664,35 @@ fn best_node_inner(
     same_subnet_lookup: impl Fn(NodeId, &[String]) -> bool,
     score: impl Fn(&super::super::capability::CapabilitySet) -> f32,
 ) -> Option<NodeId> {
+    let mut best: Option<(NodeId, f32)> = None;
+    for (node_id, caps) in candidates_for_selection(fold, legacy, scope, same_subnet_lookup) {
+        let s = score(&caps);
+        let displaces = match best {
+            Some((_, incumbent)) => s > incumbent,
+            None => true,
+        };
+        if displaces {
+            best = Some((node_id, s));
+        }
+    }
+    best.map(|(node_id, _)| node_id)
+}
+
+/// Every publisher matching `legacy` — and `scope`, when given —
+/// paired with the capability set the admitting fold state held for
+/// it, in ascending node-id order.
+///
+/// One `with_state_and_index` covers the whole traversal, so each
+/// returned set comes from the same fold generation as the
+/// membership decision that admitted it. The ordering IS
+/// [`best_node_inner`]'s tie-break, since scoring there only
+/// displaces an incumbent on a strictly greater score.
+fn candidates_for_selection(
+    fold: &Fold<CapabilityFold>,
+    legacy: &LegacyFilter,
+    scope: Option<&ScopeFilter<'_>>,
+    same_subnet_lookup: impl Fn(NodeId, &[String]) -> bool,
+) -> Vec<(NodeId, super::super::capability::CapabilitySet)> {
     let fold_filter = translate_filter(legacy);
     // Same hoisting as `find_nodes_matching_scoped`: prepare the
     // selector sets before taking the locks, and let the subnet
@@ -1685,31 +1727,27 @@ fn best_node_inner(
             admitted.push(key.1);
         }
         // Ascending ids, one entry per publisher — this ordering IS
-        // the tie-break, since scoring below only displaces on a
+        // the caller's tie-break, since scoring only displaces on a
         // strictly greater score.
         admitted.sort_unstable();
         admitted.dedup();
 
-        let mut best: Option<(NodeId, f32)> = None;
-        for node_id in admitted {
-            // A candidate resolved from the index always has a
-            // `by_node` entry in this same state, so the `None` arm
-            // is unreachable; skipping rather than scoring an empty
-            // set keeps an unindexed candidate from outscoring a
-            // real one if that ever stops holding.
-            let Some(caps) = synthesize_capability_set_in_state(state, node_id) else {
-                continue;
-            };
-            let s = score(&caps);
-            let displaces = match best {
-                Some((_, incumbent)) => s > incumbent,
-                None => true,
-            };
-            if displaces {
-                best = Some((node_id, s));
-            }
-        }
-        best.map(|(node_id, _)| node_id)
+        admitted
+            .into_iter()
+            .filter_map(|node_id| {
+                // A candidate resolved from the index always has a
+                // `by_node` entry in this same state, so the `None`
+                // arm is unreachable; dropping the candidate rather
+                // than substituting an empty set keeps an unindexed
+                // one from outscoring a real one if that ever stops
+                // holding.
+                //
+                // The state-local helper, not the fold-taking one:
+                // re-entering the fold here would deadlock on the
+                // read guards this closure holds.
+                Some((node_id, synthesize_capability_set_in_state(state, node_id)?))
+            })
+            .collect()
     })
 }
 
@@ -4040,22 +4078,30 @@ mod tests {
         }
 
         /// Every candidate is scored against the capability set the
-        /// SAME fold read admitted it from.
+        /// SAME fold read admitted it from, even when the fold moves
+        /// on between admission and scoring.
+        ///
+        /// The mutation is the point. An eviction staged BEFORE the
+        /// query proves nothing: the evicted node is simply absent
+        /// from both the coherent and the split-read shape, and both
+        /// pass. So the scorer itself evicts `HIGH_ID` while scoring
+        /// `LOW_ID` — deterministically between candidate
+        /// materialization and the scoring of the candidate that
+        /// eviction would change.
         ///
         /// The shape this replaced resolved ids from one fold read and
         /// then re-entered the fold once per candidate to synthesize
-        /// scoring input. The negative control below is the value that
-        /// second read returns once an entry is gone: an empty default
-        /// set, which scores 1.0 — enough for an evicted node to beat
-        /// a live 80GB one under a VRAM weight. Selection and scoring
-        /// now come from one snapshot, so there is no second read to
-        /// disagree with the first.
+        /// scoring input. Restore it and `HIGH_ID`'s second read finds
+        /// nothing, defaults to an empty set (the negative control
+        /// below), and the 8GB node wins a VRAM-weighted query over an
+        /// 80GB one that was live when it was admitted.
         ///
-        /// Single-threaded, so this witnesses the structure rather
-        /// than the absence of a race: it pins that scoring input is
-        /// state-local synthesis of an admitted candidate, never a
-        /// defaulted set, and that an id the fold no longer holds is
-        /// neither admitted nor scored.
+        /// This also witnesses that scoring runs with the fold guards
+        /// released: `evict_node` takes both write locks, and
+        /// `parking_lot`'s locks are not reentrant, so a scorer called
+        /// from inside `with_state_and_index` would deadlock here.
+        /// The failure mode for that regression is a hung test, not a
+        /// failed assertion.
         #[test]
         fn selection_scores_each_candidate_against_the_state_that_admitted_it() {
             let fold = new_fold();
@@ -4069,7 +4115,6 @@ mod tests {
                 HIGH_ID,
                 CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_gpu(gpu(80))),
             );
-            fold.evict_node(HIGH_ID, "test: publisher left before the query");
 
             let req = unweighted().prefer_vram(1.0);
             // `RefCell` because the bridge takes `Fn`, not `FnMut` —
@@ -4077,19 +4122,31 @@ mod tests {
             // a test probe.
             let observed: std::cell::RefCell<Vec<u32>> = std::cell::RefCell::new(Vec::new());
             let winner = best_node_matching(&fold, &req.filter, |caps| {
-                observed
-                    .borrow_mut()
-                    .push(caps.views().hardware().total_vram_gb());
+                let vram = caps.views().hardware().total_vram_gb();
+                observed.borrow_mut().push(vram);
+                // Candidates arrive in ascending id order, so this
+                // fires while scoring LOW_ID — after both candidates
+                // were materialized, before HIGH_ID is scored.
+                if vram == 8 {
+                    fold.evict_node(HIGH_ID, "test: publisher leaves mid-selection");
+                }
                 req.score(caps)
             });
 
             assert_eq!(
                 observed.into_inner(),
-                vec![8],
-                "exactly the surviving candidate is scored, and it is scored \
-                 against its real VRAM — an evicted id must not reach the scorer",
+                vec![8, 80],
+                "both candidates are scored against the state that admitted \
+                 them — a publisher evicted after admission must still be \
+                 scored on the capabilities it was admitted with, not on a \
+                 set re-read from the fold it has since left",
             );
-            assert_eq!(winner, Some(LOW_ID));
+            assert_eq!(
+                winner,
+                Some(HIGH_ID),
+                "the 80GB node was live when the snapshot was taken, so it \
+                 wins the VRAM-weighted query",
+            );
 
             // Negative control: what the composed shape's second fold
             // read would have handed the scorer for the evicted node.
