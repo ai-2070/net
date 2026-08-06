@@ -808,7 +808,9 @@ export class MeshNode {
    *   filter: { requireTags: ['gpu'] },
    *   preferMoreVram: 1,
    * });
-   * if (target !== null) await node.openStream(target);
+   * if (target !== null) {
+   *   const stream = node.openStream(target, { streamId: 1n });
+   * }
    * ```
    */
   findBestNode(requirement: CapabilityRequirement): bigint | null {
