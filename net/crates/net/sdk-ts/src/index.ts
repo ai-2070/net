@@ -116,6 +116,7 @@ export type { TokenScope, TokenErrorKind, IssueTokenOptions } from './identity';
 export type {
   CapabilitySet,
   CapabilityFilter,
+  CapabilityRequirement,
   CapabilityLimits,
   Hardware,
   Software,

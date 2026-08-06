@@ -30,13 +30,23 @@ import pathlib
 import re
 import sys
 
+# Every check in this suite prints its verdict with U+2713 / U+2717, and some
+# of the identifiers it echoes carry em-dashes. Python picks stdout's encoding
+# from the platform, so on a cp1252 console those characters raise
+# UnicodeEncodeError mid-report — the checker dies partway through and its
+# caller sees a truncated run rather than a verdict. Force UTF-8 so the output
+# is the same everywhere the checker runs.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
 SKILLS = pathlib.Path(".claude/skills")
 
 
 def nrpc_wire_kinds():
     """The eight `nrpc:` kind segments, from the mapping block that every
     binding is written against."""
-    src = pathlib.Path("net/crates/net/bindings/node/errors.ts").read_text()
+    src = pathlib.Path("net/crates/net/bindings/node/errors.ts").read_text(encoding="utf-8")
     block = re.search(r"//\s+nrpc:no_route.*?//\s+nrpc:\* \(anything else\)", src, re.S)
     if not block:
         return None
@@ -48,7 +58,7 @@ def go_rpc_kinds():
     disagreement between the two is itself a finding."""
     kinds = set()
     for p in pathlib.Path("go").glob("*.go"):
-        kinds |= set(re.findall(r'RpcKind\w+\s+RpcKind\s*=\s*"([a-z_]+)"', p.read_text()))
+        kinds |= set(re.findall(r'RpcKind\w+\s+RpcKind\s*=\s*"([a-z_]+)"', p.read_text(encoding="utf-8")))
     return kinds
 
 
@@ -56,7 +66,7 @@ def documented_nrpc_kinds():
     """Kind segments the skills tabulate: a leading `| \\`kind\\`` table cell."""
     kinds = set()
     for md in SKILLS.rglob("*.md"):
-        for line in md.read_text().splitlines():
+        for line in md.read_text(encoding="utf-8").splitlines():
             m = re.match(r"^\|\s+`([a-z_]+)`\s+\|", line)
             if m:
                 kinds.add(m.group(1))

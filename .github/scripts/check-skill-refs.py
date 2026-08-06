@@ -43,6 +43,16 @@ import pathlib
 import re
 import sys
 
+# Every check in this suite prints its verdict with U+2713 / U+2717, and some
+# of the identifiers it echoes carry em-dashes. Python picks stdout's encoding
+# from the platform, so on a cp1252 console those characters raise
+# UnicodeEncodeError mid-report — the checker dies partway through and its
+# caller sees a truncated run rather than a verdict. Force UTF-8 so the output
+# is the same everywhere the checker runs.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
 SKILLS = pathlib.Path(".claude/skills")
 SOURCE_ROOTS = [pathlib.Path("net/crates"), pathlib.Path("go")]
 SOURCE_EXT = {".rs", ".ts", ".py", ".go", ".toml", ".h"}
@@ -50,6 +60,10 @@ SOURCE_EXT = {".rs", ".ts", ".py", ".go", ".toml", ".h"}
 # Identifiers a corpus names on purpose despite their absence from source.
 # Keyed by corpus so one document set's deliberate absence cannot silence
 # another's genuine defect.
+#
+# Keys are POSIX-separated and looked up through `corpus_key`, never through a
+# raw `str(Path(...))`: on Windows that renders `.claude\skills`, misses every
+# entry here, and reports all four deliberate absences as drift.
 ABSENT_OK_BY_CORPUS = {
     ".claude/skills": {
         # org.md names this to say it must never exist.
@@ -73,6 +87,15 @@ VARIANT_REF = re.compile(r"`([A-Z][A-Za-z]+)::([A-Z][A-Za-z]+)([^`]*)`")
 IDENT_REF = re.compile(r"`([a-z][a-z0-9]*(?:_[a-z0-9]+){2,})`")
 
 
+def corpus_key(corpus):
+    """Normalize a corpus path to the POSIX form `ABSENT_OK_BY_CORPUS` uses.
+
+    Also strips a trailing separator, so `--corpus .claude/skills/` selects the
+    same allowlist as `--corpus .claude/skills`.
+    """
+    return pathlib.PurePath(corpus).as_posix().rstrip("/")
+
+
 def read_sources():
     """One read of the tree: (joined corpus, {enum name: (variants, path)})."""
     corpus, enums = [], {}
@@ -83,7 +106,7 @@ def read_sources():
             if path.suffix not in SOURCE_EXT or "target" in path.parts:
                 continue
             try:
-                src = path.read_text()
+                src = path.read_text(encoding="utf-8")
             except (UnicodeDecodeError, OSError):
                 continue
             corpus.append(src)
@@ -134,13 +157,19 @@ def main():
     if not root.exists():
         print(f"corpus does not exist: {root}")
         return 1
-    absent_ok = ABSENT_OK_BY_CORPUS.get(args.corpus, set())
+    absent_ok = ABSENT_OK_BY_CORPUS.get(corpus_key(args.corpus), set())
 
     corpus, enums = read_sources()
+    # Match exclusions against the POSIX rendering, not `str(p)`. Callers spell
+    # them with forward slashes — `check-docs.sh` passes `/releases/` — while
+    # `str(p)` renders backslashes on Windows, so no such exclusion could ever
+    # match and the release notes were scanned after all. They are dated
+    # records full of identifiers that were true when written, so every one
+    # that has since been renamed reports as drift.
     files = [
         p
         for p in sorted(root.rglob("*.md*"))
-        if not any(x in str(p) for x in args.exclude)
+        if not any(x in p.as_posix() for x in args.exclude)
     ]
     if not files:
         print(f"no markdown found under {root} after exclusions — check the args")
@@ -149,7 +178,7 @@ def main():
     bad = 0
     variants, idents = set(), set()
     for p in files:
-        text = p.read_text()
+        text = p.read_text(encoding="utf-8")
         variants |= set(VARIANT_REF.findall(text))
         idents |= set(IDENT_REF.findall(text))
 

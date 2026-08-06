@@ -40,12 +40,17 @@ ROOT=$(pwd)
 MANIFEST="$ROOT/docs/data/examples.yaml"
 REQUIRE_ALL="${REQUIRE_ALL:-0}"
 
-WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
+# Relative to the repo root we just entered — see `check-skills.sh` for why an
+# absolute path breaks the Python checkers under Git Bash. `$ROOT` stays for the
+# example paths below, which are handed to compilers directly.
+CHECKER_DIR=".github/scripts"
+# `note`, `ok`, `fail`, `$TMP`, a resolved `$PYTHON`, and `py`.
+. "$CHECKER_DIR/lib/checker.sh"
 
-fail=0
-note() { printf '  \033[31m✗\033[0m %s\n' "$1"; fail=$((fail + 1)); }
-ok()   { printf '  \033[32m✓\033[0m %s\n' "$1"; }
+# Under the library's scratch directory, so its EXIT trap cleans this up too.
+WORK="$TMP/work"
+mkdir -p "$WORK"
+
 skip() {
   if [ "$REQUIRE_ALL" = "1" ]; then
     note "$1 (REQUIRE_ALL=1)"
@@ -58,14 +63,28 @@ skip() {
 # Validated before anything is compiled: a manifest that silently drops a
 # binding would make this whole script report coverage it does not have.
 echo "==> Manifest"
-if ! python3 "$ROOT/.github/scripts/skill_examples.py" --validate; then
+if ! py "$CHECKER_DIR/skill_examples.py" --validate; then
   echo "  manifest is invalid — refusing to report coverage from it"
   exit 1
 fi
 ok "every binding is listed as a file or an explicit absence"
 
 # `<lang>\t<path>\t<id>` for each present file.
-ENTRIES=$(python3 "$ROOT/.github/scripts/skill_examples.py" --list)
+# The status is checked, not just the output: an empty `ENTRIES` makes every
+# `files_for` below return nothing, and every language section then prints "no
+# <lang> examples in the manifest" and exits green having compiled none of
+# them. `--validate` above catches an unreadable manifest, but not a lister
+# that dies between the two calls.
+entries_err="$TMP/entries.err"
+ENTRIES=$(py "$CHECKER_DIR/skill_examples.py" --list 2>"$entries_err")
+entries_status=$?
+if [ "$entries_status" -ne 0 ] || [ -s "$entries_err" ]; then
+  note "skill_examples.py --list did not run (exit $entries_status) — no example was compiled"
+  printf '%s
+' "$ENTRIES" | sed 's/^/      /'
+  sed 's/^/      /' "$entries_err" >&2
+  exit 1
+fi
 
 files_for() { # <lang>  -> newline-separated "<path>\t<id>"
   printf '%s\n' "$ENTRIES" | awk -F'\t' -v l="$1" '$1 == l { print $2 "\t" $3 }'
@@ -183,8 +202,8 @@ echo "==> Python — type check against the SDK source"
 PY_FILES=$(files_for python)
 if [ -z "$PY_FILES" ]; then
   ok "no Python examples in the manifest"
-elif command -v mypy >/dev/null 2>&1 || python3 -c "import mypy" >/dev/null 2>&1; then
-  MYPY=$(command -v mypy || echo "python3 -m mypy")
+elif command -v mypy >/dev/null 2>&1 || "$PYTHON" -c "import mypy" >/dev/null 2>&1; then
+  MYPY=$(command -v mypy || echo "$PYTHON -m mypy")
   while IFS=$'\t' read -r path id; do
     [ -z "$path" ] && continue
     if MYPYPATH="$ROOT/net/crates/net/sdk-py/src" $MYPY \
@@ -219,7 +238,7 @@ printf '      (ci.yml "TypeScript SDK tests" and skills.yml "typescript")\n'
 # Printed unconditionally, including on success: a green run that quietly
 # covered three languages out of five is the failure mode this replaces.
 echo
-python3 "$ROOT/.github/scripts/skill_examples.py" --report
+py "$CHECKER_DIR/skill_examples.py" --report
 
 echo
 if [ "$fail" -eq 0 ]; then

@@ -289,7 +289,7 @@ if let Some(node_id) = node.find_best_node(&req) { /* unicast to node_id */ }
 
 **Key facts:**
 - Public types live under `net_sdk::capabilities::*` (re-exports in `net/crates/net/sdk/src/capabilities.rs:62-67`).
-- Mesh wrapper is `net_sdk::mesh::Mesh`, built via `MeshBuilder`. All five methods (`announce_capabilities`, `announce_capabilities_with`, `find_nodes`, `find_nodes_scoped`, `find_best_node`, `find_best_node_scoped`) live on it (`net/crates/net/sdk/src/mesh.rs:714-775`).
+- Mesh wrapper is `net_sdk::mesh::Mesh`, built via `MeshBuilder`. All six methods live on it (`net/crates/net/sdk/src/mesh.rs:1046-1174`): `announce_capabilities` and `announce_capabilities_with` are `async`; `find_nodes`, `find_nodes_scoped`, `find_best_node` and `find_best_node_scoped` are synchronous local-index reads.
 - `ScopeFilter<'a>` borrows its tenant / region strings — keep them alive across the call.
 
 ### TypeScript
@@ -307,13 +307,21 @@ await node.announceCapabilities({
   models: [{ modelId: 'llama-3.1-70b', family: 'llama', loaded: true }],
 });
 const peers: bigint[] = node.findNodes({
-  requireGpu: true, gpuVendor: normalizeGpuVendor('NVIDIA'), minVramGb: 16_384,
+  requireGpu: true, gpuVendor: normalizeGpuVendor('NVIDIA'), minVramGb: 16,
+});
+
+// Or one winner, weights applied for you:
+const target: bigint | null = node.findBestNode({
+  filter: { requireGpu: true },
+  preferMoreVram: 1,
 });
 ```
 
 **Key facts:**
-- `MeshNode` exposes `announceCapabilities`, `findNodes`, `findNodesScoped` (`net/crates/net/sdk-ts/src/mesh.ts:528-566`). Types: `net/crates/net/sdk-ts/src/capabilities.ts`.
-- **No `findBestNode` in the TS SDK or NAPI binding today** (`net/crates/net/bindings/node/src/capabilities.rs` exposes only the filter path). For best-match scoring in TS, use `findNodes` + score on the caller side, or drop to Rust / Go on the placement node.
+- `MeshNode` exposes `announceCapabilities`, `findNodes`, `findNodesScoped`, `findBestNode`, `findBestNodeScoped` (`net/crates/net/sdk-ts/src/mesh.ts`). Types: `net/crates/net/sdk-ts/src/capabilities.ts`.
+- `findBestNode(requirement)` takes `{ filter, preferMoreMemory?, preferMoreVram?, preferFasterInference?, preferLoadedModels? }` and returns `bigint | null`. Local and synchronous — it reads this node's fold, so it only sees announcements that already arrived.
+- Weights must be **finite**; `NaN` / `Infinity` throw at the boundary. Finite values outside `[0, 1]` are clamped by the substrate.
+- `null` means no match; `0n` is a real node id. Test `=== null`, never falsiness.
 - Node ids are `bigint` — routinely exceed `Number.MAX_SAFE_INTEGER`. Don't naively `JSON.stringify`.
 - `ScopeFilter` is a tagged union: `{ kind: 'any' | 'globalOnly' | 'sameSubnet' | 'tenant' | 'tenants' | 'region' | 'regions', ... }`.
 
@@ -333,13 +341,22 @@ node.announce_capabilities({
 peers = node.find_nodes({
     "require_gpu": True, "gpu_vendor": normalize_gpu_vendor("NVIDIA"), "min_vram_gb": 16,
 })
+
+# Or one winner, weights applied for you:
+target = node.find_best_node({
+    "filter": {"require_gpu": True},
+    "prefer_more_vram": 1.0,
+})
 ```
 
 **Key facts:**
 - Capability surface lives on the **native** `_net.NetMesh` PyO3 class — `from net import NetMesh`. The `net_sdk.MeshNode` wrapper does not re-export these methods today; reach through `mesh._native` if you're already holding a wrapper.
 - POJO shape is `dict`s with `snake_case` keys (mirrors the C/Go JSON contract). Source: `net/crates/net/bindings/python/src/capabilities.rs`.
-- **No `find_best_node` in the PyO3 binding today** (parallel gap with NAPI). Use `find_nodes` and pick on the caller side, or drop to Rust / Go for scoring.
-- Scope dict `kind` accepts both `snake_case` and `camelCase`: `same_subnet` and `sameSubnet` both work (`bindings/python/src/capabilities.rs:454-457`).
+- `find_best_node(requirement)` takes `{"filter": {...}, "prefer_more_memory": …, "prefer_more_vram": …, "prefer_faster_inference": …, "prefer_loaded_models": …}` — every key optional — and returns `int | None`. Local and synchronous.
+- Weights must be **finite**: `nan` / `inf` raise `ValueError`, a non-numeric weight raises `TypeError`. Finite values outside `[0.0, 1.0]` are clamped by the substrate.
+- `None` means no match; `0` is a real node id. Test `is None`, never truthiness.
+- `AsyncNetMesh` carries the same four discovery methods, and they stay **synchronous** — awaiting the returned `list` / `int` raises `TypeError`.
+- Scope dict `kind` accepts both `snake_case` and `camelCase`: `same_subnet` and `sameSubnet` both work (`bindings/python/src/capabilities.rs`).
 
 ### Go and C
 

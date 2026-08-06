@@ -45,8 +45,10 @@ on:
     paths:
       - ".claude/skills/**"
       - ".github/workflows/skills.yml"
+      - ".github/scripts/lib/checker.sh"
       - ".github/scripts/check-skills.sh"
       - ".github/scripts/check-skills-depth.sh"
+      - ".github/scripts/check-checker-lib.sh"
       - ".github/scripts/check-skill-source-paths.py"
       - ".github/scripts/check-skill-refs.py"
       - ".github/scripts/check-skill-workflow.py"
@@ -92,8 +94,10 @@ on:
     paths:
       - ".claude/skills/**"
       - ".github/workflows/skills.yml"
+      - ".github/scripts/lib/checker.sh"
       - ".github/scripts/check-skills.sh"
       - ".github/scripts/check-skills-depth.sh"
+      - ".github/scripts/check-checker-lib.sh"
       - ".github/scripts/check-skill-source-paths.py"
       - ".github/scripts/check-skill-refs.py"
       - ".github/scripts/check-skill-workflow.py"
@@ -166,6 +170,14 @@ jobs:
       # asserts all four are reported.
       - name: Check nested skill content is still discovered
         run: .github/scripts/check-skills-depth.sh
+
+      # Also guards the checker rather than the content, one level lower: every
+      # Python-backed section above decides "clean" or "drifted" through
+      # `run_checker`, so if that classifier ever reads a dead checker as
+      # silence, all of them go green having audited nothing. Planted checkers,
+      # no real corpus — its verdict cannot move when the skills change.
+      - name: Check the checker library classifies verdicts correctly
+        run: .github/scripts/check-checker-lib.sh
 
       # Cited paths and line anchors. `check-skills.sh` above already checks the
       # repo-rooted citations against git; this covers the forms its character

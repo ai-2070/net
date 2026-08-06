@@ -26,6 +26,13 @@ set -uo pipefail
 cd "$(dirname "$0")/../.."
 ROOT=$(pwd)
 
+# Relative to the repo root we just entered — see `check-skills.sh` for why an
+# absolute path breaks the Python checkers under Git Bash. `$ROOT` stays for the
+# example paths below, which are handed to compilers and interpreters directly.
+CHECKER_DIR=".github/scripts"
+# `note`, `fail`, `$TMP`, a resolved `$PYTHON`, and `py`.
+. "$CHECKER_DIR/lib/checker.sh"
+
 LANG_ARG=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -38,15 +45,35 @@ if [ -z "$LANG_ARG" ]; then
   exit 2
 fi
 
-WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
+# Under the library's scratch directory, so its EXIT trap cleans this up too.
+WORK="$TMP/work"
+mkdir -p "$WORK"
 
-fail=0
-note() { printf '  \033[31m✗\033[0m %s\n' "$1"; fail=$((fail + 1)); }
-ok()   { printf '  \033[32m▶\033[0m %s\n' "$1"; }
+# ▶ rather than the library's ✓, deliberately: `--report` prints ▶ for executed
+# against ✓ for compiled-only, so a partially-executed route can never read as a
+# fully-executed one. Overriding after the source is what keeps that true.
+ok() { printf '  \033[32m▶\033[0m %s\n' "$1"; }
 
-SPEC=$(python3 "$ROOT/.github/scripts/skill_examples.py" --run-spec "$LANG_ARG")
+# `--run-spec` is the whole input to this script, and an empty result has two
+# causes that must not share the same quiet exit 0: nothing is wired to run for
+# this language (a real answer, recorded in `run.not_wired`), or the lister
+# never ran — no interpreter, an unreadable manifest, a traceback. This used to
+# treat both as "not wired", so on a machine without a working `python3` it
+# announced that no examples were wired and exited green having executed none.
+#
+# The status tells them apart: `--run-spec` returns 0 whenever it ran, and
+# non-zero with its diagnostic when it could not read the manifest.
+spec_err="$TMP/run-spec.err"
+SPEC=$(py "$CHECKER_DIR/skill_examples.py" --run-spec "$LANG_ARG" 2>"$spec_err")
+spec_status=$?
+if [ "$spec_status" -ne 0 ] || [ -s "$spec_err" ]; then
+  note "skill_examples.py --run-spec did not run (exit $spec_status) — no example was executed"
+  printf '%s\n' "$SPEC" | sed 's/^/      /'
+  sed 's/^/      /' "$spec_err" >&2
+  exit 1
+fi
 if [ -z "$SPEC" ]; then
+  # Now a real answer from a lister that ran, not the absence of one.
   echo "==> No $LANG_ARG examples are wired to run here."
   echo "    (See run.not_wired in docs/data/examples.yaml.)"
   exit 0
@@ -56,10 +83,15 @@ echo "==> Executing $LANG_ARG examples"
 
 # Run one binary with a hard timeout and match its stdout. Returns non-zero and
 # explains itself; never inherits the child's exit code silently.
+#
+# `"$PYTHON"` directly rather than `py`: this is not a checker being asked for a
+# verdict, it is a subprocess driver being handed a real filesystem path to the
+# example binary. `py` suppresses MSYS path translation, which is right for a
+# `--exclude /releases/` selector and wrong for a path that has to resolve.
 assert_run() { # <label> <timeout_s> <expect-regex> <cmd...>
   local label=$1 timeout=$2 expect=$3; shift 3
   local out rc
-  out=$(python3 - "$timeout" "$@" <<'PY'
+  out=$("$PYTHON" - "$timeout" "$@" <<'PY'
 import subprocess, sys
 timeout = int(sys.argv[1])
 try:
@@ -143,7 +175,8 @@ EOF
       note "sdk-ts/node_modules is absent — run 'npm i' there first"
       exit 1
     fi
-    trap 'rm -rf "$WORK"; rm -f "$SDK_TS"/skill-run-*.ts' EXIT
+    # Replaces the library's trap, so it has to clean up $TMP as well.
+    trap 'rm -rf "$TMP"; rm -f "$SDK_TS"/skill-run-*.ts' EXIT
     while IFS=$'\t' read -r path id timeout expect; do
       [ -z "$path" ] && continue
       sed "s|from '@net-mesh/sdk'|from './src/index'|" "$ROOT/$path" \
@@ -165,7 +198,7 @@ EOF
     # was actively misleading when the true problem was a `net` binding from a
     # different checkout missing a symbol `net_sdk` imports.
     for mod in net net_sdk; do
-      if ! err=$(python3 -c "import $mod" 2>&1); then
+      if ! err=$("$PYTHON" -c "import $mod" 2>&1); then
         note "cannot import \`$mod\`"
         printf '%s\n' "$err" | sed 's/^/      /' | tail -6
         echo "      net       <- 'maturin develop' in net/crates/net/bindings/python"
@@ -178,7 +211,7 @@ EOF
     while IFS=$'\t' read -r path id timeout expect; do
       [ -z "$path" ] && continue
       assert_run "$id: $(basename "$path")" "$timeout" "$expect" \
-        python3 "$ROOT/$path"
+        "$PYTHON" "$ROOT/$path"
     done <<< "$SPEC"
     ;;
 

@@ -21,6 +21,13 @@
 set -uo pipefail
 
 cd "$(dirname "$0")/../.."
+# Relative to the repo root we just entered, deliberately. An absolute
+# `$(cd … && pwd)` is an MSYS path (`/c/Users/…`) under Git Bash, which the
+# native Python interpreter these checkers run under reads as `C:\c\Users\…`
+# and cannot open — every Python-backed section fails to start.
+CHECKER_DIR=".github/scripts"
+# `note`, `ok`, `fail`, `$TMP`, a resolved `$PYTHON`, and `run_checker`.
+. "$CHECKER_DIR/lib/checker.sh"
 
 # The corpus root. Overridable *only* so `check-skills-depth.sh` can point this
 # same script at a throwaway copy: the depth guarantee needs a probe file, and a
@@ -28,17 +35,6 @@ cd "$(dirname "$0")/../.."
 # rsynced to users. Everything else — cited paths, git resolution, the source
 # tree — is still read relative to the repo root.
 SKILLS="${SKILLS_DIR:-.claude/skills}"
-fail=0
-
-TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
-
-# A counter, not a flag. Each section reports success with
-# `[ "$fail" -eq "$before" ]`, which is only meaningful if `note` keeps
-# incrementing — as a 0/1 flag the first failure made every *later* section
-# print its green tick, because `before` and `fail` were both 1.
-note() { printf '  \033[31m✗\033[0m %s\n' "$1"; fail=$((fail + 1)); }
-ok()   { printf '  \033[32m✓\033[0m %s\n' "$1"; }
 
 # The corpus, at any depth. One definition, used by every check below, so a file
 # is never visible to some checks and invisible to others — three of them used
@@ -70,14 +66,28 @@ for skill in "$SKILLS"/*/SKILL.md; do
   fi
   # A description is loaded into context for every session in every project
   # where the skill is installed. Keep it a budget, not a dumping ground.
-  len=$(python3 - "$skill" <<'PY'
+  #
+  # `encoding="utf-8"` is load-bearing, not decoration. Python's default
+  # encoding is the platform's, so on a cp1252 Windows shell each em-dash in
+  # these descriptions decoded as three characters instead of one — enough to
+  # put net-event-bus 11 over budget locally while CI, reading UTF-8, saw it
+  # 9 under. A checker whose verdict depends on the developer's locale is
+  # worse than no checker: it trains people to ignore it.
+  len=$(py - "$skill" <<'PY' 2>"$TMP/desc.err"
 import re, sys
-t = open(sys.argv[1]).read()
+t = open(sys.argv[1], encoding="utf-8").read()
 m = re.search(r'^description:\s*"(.*?)"\s*$', t, re.S | re.M)
 print(len(m.group(1)) if m else 0)
 PY
 )
-  [ "$len" -gt 3000 ] && note "$name: description is $len chars (budget 3000)"
+  # An empty `len` is a failed measurement, not a zero-length description, and
+  # `[ "" -gt 3000 ]` prints `integer expected` to stderr and evaluates false —
+  # so the budget silently stopped being enforced.
+  if ! [ "$len" -ge 0 ] 2>/dev/null; then
+    note "$name: description length could not be measured: $(tail -1 "$TMP/desc.err")"
+  elif [ "$len" -gt 3000 ]; then
+    note "$name: description is $len chars (budget 3000)"
+  fi
 done
 [ "$fail" -eq 0 ] && ok "frontmatter keys, net-version, description budget"
 
@@ -144,7 +154,17 @@ done < <(skill_md)
 # a `:`), cited without one it failed.
 echo "==> Source paths cited by the skills"
 before=$fail
-GENERATED=$(python3 "$(dirname "$0")/check-skill-source-paths.py" --generated)
+# An empty GENERATED is indistinguishable from "nothing is generated", which
+# turns every legitimately-generated citation below into a finding. Worse in the
+# other direction if the allowlist is ever the only thing keeping this section
+# green: a failed lookup should stop the section, not decorate it.
+GENERATED=$(py "$CHECKER_DIR/check-skill-source-paths.py" --generated \
+            2>"$TMP/source-paths.err")
+generated_status=$?
+if [ "$generated_status" -ne 0 ] || [ -s "$TMP/source-paths.err" ]; then
+  note "check-skill-source-paths.py --generated did not run (exit $generated_status) — every generated path below reports as untracked"
+  sed 's/^/      /' "$TMP/source-paths.err" >&2
+fi
 while read -r p; do
   git ls-files --error-unmatch "$p" >/dev/null 2>&1 && continue   # tracked file
   [ -n "$(git ls-files "$p" | head -1)" ] && continue             # tracked directory
@@ -166,9 +186,7 @@ done < <(grep -ohE '`(net|go|web)/[A-Za-z0-9_/.-]+`' $(skill_md) \
 # mirror publishes anyway, reads as coverage while providing none.
 echo "==> Workflow wiring (triggers + publish gating)"
 before=$fail
-while read -r line; do
-  [ -n "$line" ] && note "$line"
-done < <(python3 "$(dirname "$0")/check-skill-workflow.py" || true)
+run_checker check-skill-workflow.py
 [ "$fail" -eq "$before" ] && ok "triggers cover every cited path; every job gates publish"
 
 # ------------------------------------------------------------ symbol canaries
@@ -211,9 +229,7 @@ done
 # for what each catches and why symbol-existence alone was not enough.
 echo "==> Enum variants and metric/config identifiers"
 before=$fail
-while read -r line; do
-  [ -n "$line" ] && note "$line"
-done < <(python3 "$(dirname "$0")/check-skill-refs.py" || true)
+run_checker check-skill-refs.py
 [ "$fail" -eq "$before" ] && ok "documented variants and identifiers all resolve"
 
 # ------------------------------------------------- cross-language vocabularies
@@ -222,9 +238,7 @@ done < <(python3 "$(dirname "$0")/check-skill-refs.py" || true)
 # drift silently — the nRPC kind table was missing two real wire kinds.
 echo "==> Cross-language vocabularies"
 before=$fail
-while read -r line; do
-  [ -n "$line" ] && note "$line"
-done < <(python3 "$(dirname "$0")/check-skill-vocab.py" || true)
+run_checker check-skill-vocab.py
 [ "$fail" -eq "$before" ] && ok "documented vocabularies match every binding"
 
 # ------------------------------------------------------------ coverage matrices
@@ -241,11 +255,20 @@ done < <(python3 "$(dirname "$0")/check-skill-vocab.py" || true)
 # unchecked: one record renders both tables.
 echo "==> Binding coverage matrices"
 before=$fail
-if ! python3 "$(dirname "$0")/capability_records.py" --check >/tmp/cap.$$ 2>&1; then
-  sed 's/^/  /' /tmp/cap.$$
-  fail=$((fail + 1))
+# Not `run_checker`: this one prints a human report rather than one finding per
+# line, so its output is echoed as a block. The status handling is the same
+# though — a report means drift, any other status means the checker itself did
+# not get far enough to have an opinion.
+py "$CHECKER_DIR/capability_records.py" --check >"$TMP/cap.out" 2>&1
+cap_status=$?
+if [ "$cap_status" -ne 0 ]; then
+  sed 's/^/  /' "$TMP/cap.out"
+  if [ "$cap_status" -gt 1 ]; then
+    note "capability_records.py --check exited $cap_status — treat its verdict as unrun"
+  else
+    fail=$((fail + 1))
+  fi
 fi
-rm -f /tmp/cap.$$
 [ "$fail" -eq "$before" ] && ok "coverage records validate; every generated copy matches"
 
 # ------------------------------------------------------------------ CLI verbs

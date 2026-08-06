@@ -43,6 +43,16 @@ except ModuleNotFoundError:  # pragma: no cover - environment problem, not a def
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from docs_pages import page_slugs  # noqa: E402  (after sys.path fix-up)
 
+# Every check in this suite prints its verdict with U+2713 / U+2717, and some
+# of the identifiers it echoes carry em-dashes. Python picks stdout's encoding
+# from the platform, so on a cp1252 console those characters raise
+# UnicodeEncodeError mid-report — the checker dies partway through and its
+# caller sees a truncated run rather than a verdict. Force UTF-8 so the output
+# is the same everywhere the checker runs.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 DOCS = os.environ.get("DOCS_CONTENT_DIR", "web/src/content/docs")
 TIERS = os.environ.get("TIERS_FILE", "docs/data/tiers.yaml")

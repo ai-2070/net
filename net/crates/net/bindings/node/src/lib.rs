@@ -2157,6 +2157,54 @@ mod mesh_bindings {
             Ok(ids.into_iter().map(BigInt::from).collect())
         }
 
+        /// Pick the single highest-scoring node for a placement
+        /// requirement, or `null` when nothing matches.
+        ///
+        /// Where [`Self::find_nodes`] returns every match and leaves
+        /// the choice to the caller, this applies the requirement's
+        /// weights and returns one winner. Weights must be finite
+        /// numbers; the core clamps them to `[0, 1]`. Ties — including
+        /// the all-weights-zero case — resolve to the lowest matching
+        /// node id.
+        ///
+        /// `null` means no match. `0n` is a REAL node id, not a
+        /// sentinel, which is why this returns `null` rather than
+        /// signalling absence with a zero.
+        ///
+        /// Local and synchronous: reads this node's capability fold,
+        /// sends nothing on the wire.
+        #[napi]
+        pub fn find_best_node(
+            &self,
+            requirement: crate::capabilities::CapabilityRequirementJs,
+        ) -> Result<Option<BigInt>> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            let core = crate::capabilities::capability_requirement_from_js(requirement)?;
+            Ok(node.find_best_node(&core).map(BigInt::from))
+        }
+
+        /// Scoped variant of [`Self::find_best_node`], with the scope
+        /// semantics of [`Self::find_nodes_scoped`].
+        ///
+        /// Scope narrows the candidate set BEFORE scoring, so a node
+        /// outside the scope cannot win on capacity.
+        #[napi]
+        pub fn find_best_node_scoped(
+            &self,
+            requirement: crate::capabilities::CapabilityRequirementJs,
+            scope: crate::capabilities::ScopeFilterJs,
+        ) -> Result<Option<BigInt>> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            let core = crate::capabilities::capability_requirement_from_js(requirement)?;
+            let owned = crate::capabilities::scope_filter_from_js(scope)?;
+            let winner = crate::capabilities::with_scope_filter(&owned, |f| {
+                node.find_best_node_scoped(&core, f)
+            });
+            Ok(winner.map(BigInt::from))
+        }
+
         /// Bucketed aggregation over the local capability fold —
         /// `Fold::aggregate(matcher, groupBy, agg)`. Arguments are
         /// JSON-encoded tagged unions; the TS SDK ships ergonomic

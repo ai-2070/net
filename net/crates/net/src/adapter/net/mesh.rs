@@ -30008,9 +30008,6 @@ impl MeshNode {
         filter: &CapabilityFilter,
         scope: &ScopeFilter<'_>,
     ) -> Vec<u64> {
-        let my_subnet = self.local_subnet;
-        let local_node_id = self.node_id;
-        let policy = self.local_subnet_policy.clone();
         super::behavior::fold::capability_bridge::find_nodes_matching_scoped(
             &self.capability_fold,
             filter,
@@ -30018,19 +30015,7 @@ impl MeshNode {
             // Fold-pure, as the bridge requires: reads only the policy
             // and the borrowed tags it is handed, never the fold and
             // never `peer_subnets`.
-            |nid, tags| {
-                if nid == local_node_id {
-                    return true;
-                }
-                // Every other candidate resolves from the tags of the
-                // entry the snapshot just selected. Without a policy
-                // there is nothing to resolve them with, so the
-                // candidate stays unknown and is excluded.
-                match policy.as_ref() {
-                    Some(policy) => policy.assign_from_rendered_tags(tags) == my_subnet,
-                    None => false,
-                }
-            },
+            self.same_subnet_resolver(),
         )
     }
 
@@ -30658,77 +30643,93 @@ impl MeshNode {
     /// Rank peers for a scored requirement. Returns the best-
     /// scoring node's id, or `None` if no peer matches.
     ///
-    /// Phase 3b note: scoring runs against a tag-only
+    /// # How a candidate is scored
+    ///
+    /// Candidate membership comes from one capability-fold
+    /// snapshot. Within that same snapshot each candidate's
     /// [`CapabilitySet`](super::behavior::capability::CapabilitySet)
-    /// synthesized from the fold (the fold's
-    /// [`CapabilityMembership`](super::behavior::fold::CapabilityMembership)
-    /// doesn't carry the full legacy hardware/models projection).
-    /// Hardware- and model-based preference weights (memory,
-    /// vram, tokens/sec, loaded) read zero, so this method
-    /// degrades to "any matching candidate, lex-sorted by
-    /// node_id." That's the same shape as the cap-propagation-
-    /// race fallback; production has no rich-scoring caller per
-    /// the Phase 3b survey.
+    /// is synthesized by merging the canonical tags of every fold
+    /// entry the publisher owns, and
+    /// [`CapabilitySet::views`](super::behavior::capability::CapabilitySet::views)
+    /// lazily decodes those tags back into the hardware and model
+    /// projections
+    /// [`CapabilityRequirement::score`](super::behavior::capability::CapabilityRequirement::score)
+    /// reads. The memory, VRAM, tokens/sec and loaded-model weights
+    /// are therefore live: canonical tags are the storage shape, so
+    /// no separate hardware/model sidecar is needed to recover them.
+    ///
+    /// Ties resolve to the lowest `node_id`, so an all-zero-weight
+    /// requirement returns the first id
+    /// [`Self::find_nodes_by_filter`] would list.
+    ///
+    /// Local and synchronous — reads the local fold, sends nothing.
+    ///
+    /// (This supersedes a Phase 3b note claiming those weights read
+    /// zero and every score ties. That was true of a fold payload
+    /// that did not carry the projection; it is not true of the
+    /// canonical tag set, and
+    /// `find_best_node_prefers_higher_vram_over_lower_node_id` and
+    /// its siblings in `capability_bridge` fail if it becomes true
+    /// again.)
     pub fn find_best_node(
         &self,
         req: &super::behavior::capability::CapabilityRequirement,
     ) -> Option<u64> {
-        let candidates = super::behavior::fold::capability_bridge::find_nodes_matching(
+        super::behavior::fold::capability_bridge::best_node_matching(
             &self.capability_fold,
             &req.filter,
-        );
-        Self::best_by_score(&self.capability_fold, candidates, req)
+            |caps| req.score(caps),
+        )
     }
 
     /// Scoped variant of [`Self::find_best_node`]. See
     /// [`Self::find_nodes_by_filter_scoped`] for the scope
-    /// resolution semantics; selection picks the highest-scoring
-    /// candidate within the scoped set.
+    /// resolution semantics, and [`Self::find_best_node`] for how a
+    /// candidate is scored.
     ///
-    /// Phase 3b note: same scoring caveat as
-    /// [`Self::find_best_node`] — the fold's
-    /// [`CapabilityMembership`](super::behavior::fold::CapabilityMembership)
-    /// doesn't carry the legacy hardware/models projection, so
-    /// scoring degrades to "any matching candidate, lex-sorted."
+    /// Scope narrows the candidate set BEFORE scoring, so an
+    /// out-of-scope peer cannot win on capacity.
     pub fn find_best_node_scoped(
         &self,
         req: &super::behavior::capability::CapabilityRequirement,
         scope: &ScopeFilter<'_>,
     ) -> Option<u64> {
-        let candidates = self.find_nodes_by_filter_scoped(&req.filter, scope);
-        Self::best_by_score(&self.capability_fold, candidates, req)
+        super::behavior::fold::capability_bridge::best_node_matching_scoped(
+            &self.capability_fold,
+            &req.filter,
+            scope,
+            self.same_subnet_resolver(),
+            |caps| req.score(caps),
+        )
     }
 
-    /// Pick the highest-scoring candidate against `req`. Synthesizes
-    /// each candidate's [`CapabilitySet`] from the fold exactly once
-    /// (sort by score key, lex-tiebreak on `node_id` for stable
-    /// output), instead of re-synthesizing twice per
-    /// `max_by` comparison.
-    fn best_by_score(
-        fold: &Arc<super::behavior::fold::Fold<super::behavior::fold::CapabilityFold>>,
-        candidates: Vec<u64>,
-        req: &super::behavior::capability::CapabilityRequirement,
-    ) -> Option<u64> {
-        let mut scored: Vec<(u64, f32)> = candidates
-            .into_iter()
-            .map(|node_id| {
-                let caps = super::behavior::fold::capability_bridge::synthesize_capability_set(
-                    fold, node_id,
-                );
-                (node_id, req.score(&caps))
-            })
-            .collect();
-        // Sort by descending score, lex-asc node_id tiebreak —
-        // matches `find_nodes_matching`'s sort ordering when scores
-        // tie (which they always do today, per the docstring's
-        // "scoring degrades to lex-sorted" caveat) so the result
-        // is byte-stable across runs.
-        scored.sort_by(|(na, sa), (nb, sb)| {
-            sb.partial_cmp(sa)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| na.cmp(nb))
-        });
-        scored.into_iter().next().map(|(node_id, _)| node_id)
+    /// The fold-pure `same_subnet` resolver the scoped discovery
+    /// paths hand to the capability bridge.
+    ///
+    /// Captures owned copies of the local node id, subnet and
+    /// policy, so the returned closure reads NEITHER the fold nor
+    /// `peer_subnets` — the purity the bridge requires of a closure
+    /// it invokes while holding the selecting snapshot's read
+    /// guards. Shared by [`Self::find_nodes_by_filter_scoped`] and
+    /// [`Self::find_best_node_scoped`] so list and single-winner
+    /// discovery cannot drift on subnet membership.
+    fn same_subnet_resolver(&self) -> impl Fn(u64, &[String]) -> bool {
+        let my_subnet = self.local_subnet;
+        let local_node_id = self.node_id;
+        let policy = self.local_subnet_policy.clone();
+        move |nid, tags| {
+            if nid == local_node_id {
+                return true;
+            }
+            // Every other candidate resolves from the tags of the
+            // entry the snapshot just selected. Without a policy
+            // there is nothing to resolve them with, so the
+            // candidate stays unknown and is excluded.
+            match policy.as_ref() {
+                Some(policy) => policy.assign_from_rendered_tags(tags) == my_subnet,
+                None => false,
+            }
+        }
     }
 
     /// Shared reference to the capability fold — the canonical

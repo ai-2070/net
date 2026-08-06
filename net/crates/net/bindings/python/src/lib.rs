@@ -2469,6 +2469,48 @@ mod mesh_bindings {
             }))
         }
 
+        /// Pick the single highest-scoring node for a placement
+        /// `requirement`, or `None` when nothing matches.
+        ///
+        /// Where :meth:`find_nodes` returns every match and leaves the
+        /// choice to the caller, this applies the requirement's
+        /// weights and returns one winner. See
+        /// `super::capabilities::capability_requirement_from_py` for
+        /// the accepted dict shape.
+        ///
+        /// Ties — including the no-weights case, where every match
+        /// scores the same — resolve to the lowest matching node id.
+        ///
+        /// `None` means no match. `0` is a REAL node id, not a
+        /// sentinel, so test against `None` rather than truthiness.
+        ///
+        /// Local and synchronous: reads this node's capability fold
+        /// and sends nothing, so it only sees peers whose
+        /// announcements have already arrived.
+        fn find_best_node(&self, requirement: &Bound<'_, PyDict>) -> PyResult<Option<u64>> {
+            let node = self.get_node()?;
+            let core = super::capabilities::capability_requirement_from_py(requirement)?;
+            Ok(node.find_best_node(&core))
+        }
+
+        /// Scoped variant of :meth:`find_best_node`, with the scope
+        /// semantics of :meth:`find_nodes_scoped`.
+        ///
+        /// Scope narrows the candidate set BEFORE scoring, so a peer
+        /// outside the scope cannot win on capacity.
+        fn find_best_node_scoped(
+            &self,
+            requirement: &Bound<'_, PyDict>,
+            scope: &Bound<'_, PyDict>,
+        ) -> PyResult<Option<u64>> {
+            let node = self.get_node()?;
+            let core = super::capabilities::capability_requirement_from_py(requirement)?;
+            let owned = super::capabilities::scope_filter_from_py(scope)?;
+            Ok(super::capabilities::with_scope_filter(&owned, |sf| {
+                node.find_best_node_scoped(&core, sf)
+            }))
+        }
+
         /// Walk the local capability fold for every published AI
         /// tool. Returns a list of dicts mirroring the substrate's
         /// `ToolDescriptor` (one row per `(tool_id, version)`
@@ -3484,10 +3526,53 @@ mod mesh_bindings {
                 })
         }
 
+        // ---- Local capability discovery ----
+        //
+        // All four read the local fold and return their result
+        // directly. They are NOT awaitable: an `await` on a plain
+        // `list` / `int` raises `TypeError`, so the shape is its own
+        // documentation. Semantics are `NetMesh`'s — see that class
+        // for the dict shapes, the tie-break, and why a winner of `0`
+        // is not the same as no winner.
+
         /// Query the local capability index.
         fn find_nodes(&self, filter: &Bound<'_, PyDict>) -> PyResult<Vec<u64>> {
             let core = super::capabilities::capability_filter_from_py(filter)?;
             Ok(self.node.find_nodes_by_filter(&core))
+        }
+
+        /// Scoped variant of :meth:`find_nodes`.
+        fn find_nodes_scoped(
+            &self,
+            filter: &Bound<'_, PyDict>,
+            scope: &Bound<'_, PyDict>,
+        ) -> PyResult<Vec<u64>> {
+            let core = super::capabilities::capability_filter_from_py(filter)?;
+            let owned = super::capabilities::scope_filter_from_py(scope)?;
+            Ok(super::capabilities::with_scope_filter(&owned, |sf| {
+                self.node.find_nodes_by_filter_scoped(&core, sf)
+            }))
+        }
+
+        /// Highest-scoring node for a placement `requirement`, or
+        /// `None` when nothing matches.
+        fn find_best_node(&self, requirement: &Bound<'_, PyDict>) -> PyResult<Option<u64>> {
+            let core = super::capabilities::capability_requirement_from_py(requirement)?;
+            Ok(self.node.find_best_node(&core))
+        }
+
+        /// Scoped variant of :meth:`find_best_node`. Scope narrows
+        /// the candidate set before scoring.
+        fn find_best_node_scoped(
+            &self,
+            requirement: &Bound<'_, PyDict>,
+            scope: &Bound<'_, PyDict>,
+        ) -> PyResult<Option<u64>> {
+            let core = super::capabilities::capability_requirement_from_py(requirement)?;
+            let owned = super::capabilities::scope_filter_from_py(scope)?;
+            Ok(super::capabilities::with_scope_filter(&owned, |sf| {
+                self.node.find_best_node_scoped(&core, sf)
+            }))
         }
 
         /// Shutdown the underlying mesh node. Idempotent. Returns

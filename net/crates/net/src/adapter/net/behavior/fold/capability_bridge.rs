@@ -42,6 +42,7 @@ use super::capability::{
 // lockstep with the helper below.
 #[cfg(any(test, feature = "fixtures"))]
 use super::state::FoldError;
+use super::state::FoldState;
 #[cfg(any(test, feature = "fixtures"))]
 use super::ApplyOutcome;
 use super::{EnvelopeMeta, Fold, FoldKind, NodeId, NodeState, SignedAnnouncement};
@@ -727,24 +728,47 @@ pub fn synthesize_capability_set_if_known(
     fold: &Fold<CapabilityFold>,
     node_id: NodeId,
 ) -> Option<super::super::capability::CapabilitySet> {
-    fold.with_state(|state| {
-        let keys = state.by_node.get(&node_id)?;
-        let mut caps = super::super::capability::CapabilitySet::new();
-        for k in keys {
-            let Some(entry) = state.entries.get(k) else {
-                continue;
-            };
-            for s in &entry.payload.tags {
-                if let Ok(tag) = super::super::tag::Tag::parse(s) {
-                    caps.tags.insert(tag);
-                }
-            }
-            for (mk, mv) in &entry.payload.metadata {
-                caps.metadata.insert(mk.clone(), mv.clone());
+    fold.with_state(|state| synthesize_capability_set_in_state(state, node_id))
+}
+
+/// [`synthesize_capability_set_if_known`] against a state that is
+/// ALREADY BORROWED, for callers running inside
+/// [`Fold::with_state`] / [`Fold::with_state_and_index`].
+///
+/// The fold-taking forms re-enter the fold, so a caller that has
+/// already selected candidates under one snapshot cannot use them
+/// without dropping its locks first. That split is what lets a
+/// selection combine membership observed in one fold generation
+/// with capability facts from another — a result that never existed
+/// in any single state. Selection paths take this form and stay
+/// inside one snapshot; see [`best_node_matching`].
+///
+/// Merges EVERY key in `state.by_node[node_id]`, not just the entry
+/// that matched the query. Today the legacy announcement path gives
+/// a publisher exactly one `(class=0, node)` entry, so the merge is
+/// a one-element loop — but per-class sharding would otherwise make
+/// the synthesized set depend on whichever class the index happened
+/// to resolve first.
+pub(crate) fn synthesize_capability_set_in_state(
+    state: &FoldState<CapabilityFold>,
+    node_id: NodeId,
+) -> Option<super::super::capability::CapabilitySet> {
+    let keys = state.by_node.get(&node_id)?;
+    let mut caps = super::super::capability::CapabilitySet::new();
+    for k in keys {
+        let Some(entry) = state.entries.get(k) else {
+            continue;
+        };
+        for s in &entry.payload.tags {
+            if let Ok(tag) = super::super::tag::Tag::parse(s) {
+                caps.tags.insert(tag);
             }
         }
-        Some(caps)
-    })
+        for (mk, mv) in &entry.payload.metadata {
+            caps.metadata.insert(mk.clone(), mv.clone());
+        }
+    }
+    Some(caps)
 }
 
 /// Default capacity for the per-fold capability-set cache. Covers
@@ -757,9 +781,18 @@ const CAPABILITY_SET_CACHE_DEFAULT_CAPACITY: usize = 256;
 /// ([`Fold::change_generation`]). Eliminates the multi-µs
 /// re-parse + re-allocate that `synthesize_capability_set` does
 /// per call on the hot paths (per-packet greedy admission at
-/// mesh.rs:5181, per-candidate `placement_score`, per-candidate
-/// `best_by_score`, per-call `may_execute` retain loops). Per
+/// mesh.rs:5181, per-candidate `placement_score`, per-call
+/// `may_execute` retain loops). Per
 /// PERF_AUDIT_2026_06_10_FULL_CRATE.md §4.1.
+///
+/// [`best_node_matching`] deliberately does NOT come through here:
+/// a cache lookup re-enters the fold for its generation stamp, and
+/// that path synthesizes inside the snapshot that admitted its
+/// candidates. It pays the synthesis per candidate to keep
+/// membership and capabilities on one fold state — and pays it
+/// while holding both read guards, so fold writers queue behind it.
+/// See `candidates_for_selection` for why that is the accepted trade
+/// there and what would make it stop being one.
 ///
 /// The generation is global to the fold — any fold change
 /// invalidates every cached entry. That's coarse but accurate:
@@ -1551,6 +1584,220 @@ pub fn find_nodes_matching_scoped(
     out.sort_unstable();
     out.dedup();
     out
+}
+
+/// Highest-scoring publisher matching `legacy`, or `None` when
+/// nothing matches. Single-winner counterpart to
+/// [`find_nodes_matching`].
+///
+/// `score` is applied to each admitted candidate's synthesized
+/// [`CapabilitySet`](super::super::capability::CapabilitySet) —
+/// canonical tags merged across the publisher's fold entries, which
+/// the set's lazy `views()` projections decode back into hardware
+/// and model facts. The caller supplies it (typically
+/// `CapabilityRequirement::score`) because the bridge holds no
+/// placement policy.
+///
+/// Ties resolve to the lowest `node_id`: candidates are scored in
+/// ascending id order and a later candidate only wins on a strictly
+/// greater score. A requirement whose weights are all zero scores
+/// every candidate equally and so returns the lowest matching id,
+/// matching [`find_nodes_matching`]'s leading element.
+///
+/// A `NaN` score is not a low score, it is the absence of one: the
+/// candidate is skipped rather than ranked. Comparison against `NaN`
+/// is false in both directions, so a `NaN` incumbent could not be
+/// displaced by anything — one unscoreable candidate arriving first
+/// would win outright over every real one behind it. If EVERY
+/// candidate is unscoreable the result is still the lowest matching
+/// id: they matched the filter, so "no winner" would be the wrong
+/// answer, and the tie-break is what an all-equal set already
+/// returns.
+///
+/// `score` runs after the fold guards are released, so it may read
+/// or even mutate the fold without deadlocking. It sees the
+/// capability sets captured by the selecting snapshot regardless.
+pub(crate) fn best_node_matching(
+    fold: &Fold<CapabilityFold>,
+    legacy: &LegacyFilter,
+    score: impl Fn(&super::super::capability::CapabilitySet) -> f32,
+) -> Option<NodeId> {
+    best_node_inner(fold, legacy, None, |_, _| false, score)
+}
+
+/// Scoped variant of [`best_node_matching`] — the single-winner
+/// counterpart to [`find_nodes_matching_scoped`], with that
+/// function's scope semantics and `same_subnet_lookup` contract
+/// (fold-pure, invoked only under [`ScopeFilter::SameSubnet`],
+/// against tags borrowed from the selecting snapshot).
+///
+/// Scope narrows the candidate set BEFORE scoring, so an
+/// out-of-scope publisher cannot win on score.
+pub(crate) fn best_node_matching_scoped(
+    fold: &Fold<CapabilityFold>,
+    legacy: &LegacyFilter,
+    scope: &ScopeFilter<'_>,
+    same_subnet_lookup: impl Fn(NodeId, &[String]) -> bool,
+    score: impl Fn(&super::super::capability::CapabilitySet) -> f32,
+) -> Option<NodeId> {
+    best_node_inner(fold, legacy, Some(scope), same_subnet_lookup, score)
+}
+
+/// # One snapshot, then score
+///
+/// Filtering, scope evaluation and per-candidate capability
+/// synthesis all happen inside a single `with_state_and_index`,
+/// which hands back OWNED `(NodeId, CapabilitySet)` pairs. Scoring
+/// runs afterwards, with both fold guards released.
+///
+/// Capturing the sets under one read is what makes the result
+/// coherent; holding the guards across `score` is not. The composed
+/// alternative — `find_nodes_matching*` for the ids, then
+/// `synthesize_capability_set` per id — reads the fold once for
+/// membership and again per candidate for scoring. A replacement
+/// landing between those reads yields a winner selected on one
+/// generation's capabilities and scored on another's, or scored
+/// against `CapabilitySet::default()` after an eviction: a
+/// zero-capacity node beating a live one under a memory weight.
+/// Neither result existed in any single fold state.
+///
+/// Scoring is deliberately outside. `score` is caller-supplied and
+/// carries no fold-purity contract — unlike `same_subnet_lookup`,
+/// which is documented fold-pure precisely because it IS called
+/// under the guards. A scorer that touched the fold would otherwise
+/// deadlock against the read guards its own caller holds, and every
+/// scorer would hold both guards, and each writer queued behind
+/// them, across candidate-controlled work.
+fn best_node_inner(
+    fold: &Fold<CapabilityFold>,
+    legacy: &LegacyFilter,
+    scope: Option<&ScopeFilter<'_>>,
+    same_subnet_lookup: impl Fn(NodeId, &[String]) -> bool,
+    score: impl Fn(&super::super::capability::CapabilitySet) -> f32,
+) -> Option<NodeId> {
+    let mut best: Option<(NodeId, f32)> = None;
+    // The lowest matching id, held separately so an all-unscoreable candidate
+    // set still resolves to the tie-break rather than to "no match". Candidates
+    // arrive in ascending id order, so this is the first one seen.
+    let mut lowest_matching: Option<NodeId> = None;
+    for (node_id, caps) in candidates_for_selection(fold, legacy, scope, same_subnet_lookup) {
+        lowest_matching.get_or_insert(node_id);
+        let s = score(&caps);
+        // Skipped, not ranked. `NaN` compares false against everything, so a
+        // `NaN` incumbent is one nothing can displace — leaving the winner
+        // decided by whichever unscoreable candidate happened to sort first.
+        if s.is_nan() {
+            continue;
+        }
+        let displaces = match best {
+            Some((_, incumbent)) => s > incumbent,
+            None => true,
+        };
+        if displaces {
+            best = Some((node_id, s));
+        }
+    }
+    best.map(|(node_id, _)| node_id).or(lowest_matching)
+}
+
+/// Every publisher matching `legacy` — and `scope`, when given —
+/// paired with the capability set the admitting fold state held for
+/// it, in ascending node-id order.
+///
+/// One `with_state_and_index` covers the whole traversal, so each
+/// returned set comes from the same fold generation as the
+/// membership decision that admitted it. The ordering IS
+/// [`best_node_inner`]'s tie-break, since scoring there only
+/// displaces an incumbent on a strictly greater score.
+///
+/// # What coherence costs here
+///
+/// Both of these follow from doing the synthesis inside the read,
+/// and neither is free:
+///
+/// - **Lock hold time scales with the candidate set, not with the
+///   membership decision.** A full `Tag::parse` per tag plus a
+///   metadata clone per entry, for every admitted candidate, runs
+///   under both fold read guards — where [`find_nodes_matching`]
+///   holds them only long enough to decide membership and hands back
+///   bare ids. Fold writers queue behind all of it. That is the
+///   multi-µs-per-node cost `CapabilitySetCache` exists to keep off
+///   the hot paths, and this path cannot use the cache: a lookup
+///   re-enters the fold for its generation stamp, which is the
+///   second read the whole shape exists to avoid.
+/// - **Peak memory holds every candidate's set at once**, rather
+///   than one at a time as a scored-in-a-loop shape would.
+///
+/// Both are bounded by the candidate set the filter admits, and
+/// accepted because the callers are the FFI and binding surfaces —
+/// operator-initiated placement queries, not per-packet work.
+/// `placement_score` and greedy admission, which ARE per-packet,
+/// stay on the cached single-node path. A hot caller appearing on
+/// this one is the signal to revisit, not a reason to widen it:
+/// re-splitting the read is what let a winner be selected on one
+/// generation's capabilities and scored on another's.
+fn candidates_for_selection(
+    fold: &Fold<CapabilityFold>,
+    legacy: &LegacyFilter,
+    scope: Option<&ScopeFilter<'_>>,
+    same_subnet_lookup: impl Fn(NodeId, &[String]) -> bool,
+) -> Vec<(NodeId, super::super::capability::CapabilitySet)> {
+    let fold_filter = translate_filter(legacy);
+    // Same hoisting as `find_nodes_matching_scoped`: prepare the
+    // selector sets before taking the locks, and let the subnet
+    // closure decide alone under `SameSubnet` (where the candidate's
+    // own tags cannot change the verdict).
+    let subnet_decides = matches!(scope, Some(ScopeFilter::SameSubnet));
+    let prepared = scope.map(PreparedScope::new);
+    fold.with_state_and_index(|state, index| {
+        let candidates = resolve_candidate_keys(state, index, &fold_filter);
+        let candidates = candidates.as_set();
+        let mut admitted: Vec<NodeId> = Vec::with_capacity(candidates.len());
+        for &key in candidates {
+            let Some(entry) = state.entries.get(&key) else {
+                continue;
+            };
+            let membership = &entry.payload;
+            if !membership_passes_range_filter(membership, legacy) {
+                continue;
+            }
+            if let Some(prepared) = prepared.as_ref() {
+                let in_scope = if subnet_decides {
+                    same_subnet_lookup(key.1, &membership.tags)
+                } else {
+                    // `same_subnet` is unread on every arm reachable
+                    // here, so the placeholder cannot affect it.
+                    prepared.matches(&membership.tags, false)
+                };
+                if !in_scope {
+                    continue;
+                }
+            }
+            admitted.push(key.1);
+        }
+        // Ascending ids, one entry per publisher — this ordering IS
+        // the caller's tie-break, since scoring only displaces on a
+        // strictly greater score.
+        admitted.sort_unstable();
+        admitted.dedup();
+
+        admitted
+            .into_iter()
+            .filter_map(|node_id| {
+                // A candidate resolved from the index always has a
+                // `by_node` entry in this same state, so the `None`
+                // arm is unreachable; dropping the candidate rather
+                // than substituting an empty set keeps an unindexed
+                // one from outscoring a real one if that ever stops
+                // holding.
+                //
+                // The state-local helper, not the fold-taking one:
+                // re-entering the fold here would deadlock on the
+                // read guards this closure holds.
+                Some((node_id, synthesize_capability_set_in_state(state, node_id)?))
+            })
+            .collect()
+    })
 }
 
 #[cfg(test)]
@@ -3630,6 +3877,433 @@ mod tests {
             assert!(
                 !may_execute(&fold, kp.entity_id().node_id(), "nrpc:echo", caller),
                 "restricted verdict must not depend on owner_org (with_cert={with_cert})"
+            );
+        }
+    }
+
+    // ================================================================
+    // Weighted selection witnesses
+    // ================================================================
+    //
+    // `best_node_matching` is the single-winner discovery path, and
+    // every binding that exposes it (Rust, Go, C, and now Node and
+    // Python) documents its four preference weights as load-bearing.
+    // That claim is only worth making while these tests pass.
+    //
+    // Each witness stages TWO matching candidates whose node-id order
+    // is the OPPOSITE of their capacity order, then asserts the same
+    // fold twice, mutating only the requirement:
+    //
+    //   - all weights zero  → the lower node id wins (the tie-break);
+    //   - the axis weighted → the higher-capacity node wins.
+    //
+    // A single candidate would pass both assertions no matter what
+    // scoring did, and same-order ids would let a lexicographic
+    // selection masquerade as a weighted one. Both halves are needed:
+    // the first pins the tie-break, the second proves the weight
+    // actually moved the winner.
+    //
+    // This is the shape that catches a regression to the pre-2026-08
+    // behavior, where the fold payload carried no hardware/model
+    // projection, every score tied, and selection silently degraded to
+    // "lowest matching node id" while still being documented as
+    // weighted.
+    mod weighted_selection {
+        use super::*;
+        use crate::adapter::net::behavior::capability::{
+            CapabilityAnnouncement, CapabilityRequirement, CapabilitySet, GpuInfo,
+            GpuVendor as LegacyGpuVendor, HardwareCapabilities, ModelCapability,
+        };
+        use crate::adapter::net::identity::EntityId;
+
+        /// The lower of the two node ids used by every witness, and
+        /// the one an unweighted requirement must return.
+        const LOW_ID: NodeId = 0x11;
+        /// The higher node id — always given the STRONGER capability,
+        /// so a weighted requirement has to overcome the tie-break to
+        /// pick it.
+        const HIGH_ID: NodeId = 0x22;
+
+        /// Publish `caps` for `node_id` through the production
+        /// translate → apply path, so the fold entry carries exactly
+        /// the canonical tags a real announcement would.
+        fn announce(fold: &Fold<CapabilityFold>, node_id: NodeId, caps: CapabilitySet) {
+            let ann = CapabilityAnnouncement::new(
+                node_id,
+                EntityId::from_bytes([node_id as u8; 32]),
+                1,
+                caps,
+            );
+            apply_legacy_announcement(fold, ann, None, 0).expect("apply");
+        }
+
+        fn gpu(vram_gb: u32) -> GpuInfo {
+            GpuInfo::new(LegacyGpuVendor::Nvidia, "test-gpu", vram_gb)
+        }
+
+        /// A requirement with an empty filter (matches every
+        /// publisher) and no weights — the tie-break baseline.
+        fn unweighted() -> CapabilityRequirement {
+            CapabilityRequirement::from_filter(LegacyFilter::default())
+        }
+
+        fn winner(fold: &Fold<CapabilityFold>, req: &CapabilityRequirement) -> Option<NodeId> {
+            best_node_matching(fold, &req.filter, |caps| req.score(caps))
+        }
+
+        /// The paired assertion every axis witness runs: same fold,
+        /// same candidates, only the preference changes.
+        fn assert_weight_flips_the_winner(
+            fold: &Fold<CapabilityFold>,
+            weighted: CapabilityRequirement,
+            axis: &str,
+        ) {
+            assert_eq!(
+                winner(fold, &unweighted()),
+                Some(LOW_ID),
+                "{axis}: with no weights the lowest matching node id must win — \
+                 if this fails the tie-break changed, and the weighted half below \
+                 proves nothing",
+            );
+            assert_eq!(
+                winner(fold, &weighted),
+                Some(HIGH_ID),
+                "{axis}: weighting the axis must pick the higher-capacity node \
+                 over the lower node id — a dead weight leaves the tie-break \
+                 winner in place",
+            );
+        }
+
+        #[test]
+        fn find_best_node_prefers_higher_vram_over_lower_node_id() {
+            let fold = new_fold();
+            announce(
+                &fold,
+                LOW_ID,
+                CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_gpu(gpu(8))),
+            );
+            announce(
+                &fold,
+                HIGH_ID,
+                CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_gpu(gpu(80))),
+            );
+            assert_weight_flips_the_winner(&fold, unweighted().prefer_vram(1.0), "vram");
+        }
+
+        #[test]
+        fn find_best_node_prefers_more_memory_over_lower_node_id() {
+            let fold = new_fold();
+            announce(
+                &fold,
+                LOW_ID,
+                CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(8)),
+            );
+            announce(
+                &fold,
+                HIGH_ID,
+                CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(256)),
+            );
+            assert_weight_flips_the_winner(&fold, unweighted().prefer_memory(1.0), "memory");
+        }
+
+        #[test]
+        fn find_best_node_prefers_faster_inference_over_lower_node_id() {
+            let fold = new_fold();
+            announce(
+                &fold,
+                LOW_ID,
+                CapabilitySet::new()
+                    .add_model(ModelCapability::new("slow-model", "test").with_tokens_per_sec(10)),
+            );
+            announce(
+                &fold,
+                HIGH_ID,
+                CapabilitySet::new()
+                    .add_model(ModelCapability::new("fast-model", "test").with_tokens_per_sec(900)),
+            );
+            assert_weight_flips_the_winner(&fold, unweighted().prefer_speed(1.0), "tokens/sec");
+        }
+
+        #[test]
+        fn find_best_node_prefers_loaded_models_over_lower_node_id() {
+            let fold = new_fold();
+            // The axis is the LOADED RATIO, not the loaded count, so
+            // the low-id node carries more models — one loaded out of
+            // two (0.5) against one out of one (1.0). A scorer that
+            // counted instead of ratioing would tie here and fall back
+            // to the node id, failing the second assertion.
+            announce(
+                &fold,
+                LOW_ID,
+                CapabilitySet::new()
+                    .add_model(ModelCapability::new("a", "test").with_loaded(true))
+                    .add_model(ModelCapability::new("b", "test").with_loaded(false)),
+            );
+            announce(
+                &fold,
+                HIGH_ID,
+                CapabilitySet::new().add_model(ModelCapability::new("c", "test").with_loaded(true)),
+            );
+            assert_weight_flips_the_winner(
+                &fold,
+                unweighted().prefer_loaded(1.0),
+                "loaded-model ratio",
+            );
+        }
+
+        /// Scope narrows the candidate set BEFORE scoring. The
+        /// strongest node in the fold belongs to another tenant, so a
+        /// scoped query must not return it however heavily the axis is
+        /// weighted — and the unscoped query on the same fold must,
+        /// or the test would pass on a fold where the strong candidate
+        /// simply wasn't there.
+        #[test]
+        fn scoped_selection_filters_before_scoring() {
+            let fold = new_fold();
+            announce(
+                &fold,
+                LOW_ID,
+                CapabilitySet::new()
+                    .with_hardware(HardwareCapabilities::new().with_gpu(gpu(8)))
+                    .with_tenant_scope("red"),
+            );
+            announce(
+                &fold,
+                HIGH_ID,
+                CapabilitySet::new()
+                    .with_hardware(HardwareCapabilities::new().with_gpu(gpu(80)))
+                    .with_tenant_scope("blue"),
+            );
+
+            let req = unweighted().prefer_vram(1.0);
+            assert_eq!(
+                winner(&fold, &req),
+                Some(HIGH_ID),
+                "unscoped, the 80GB blue-tenant node is the strongest candidate",
+            );
+            assert_eq!(
+                best_node_matching_scoped(
+                    &fold,
+                    &req.filter,
+                    &ScopeFilter::Tenant("red"),
+                    |_, _| false,
+                    |caps| req.score(caps),
+                ),
+                Some(LOW_ID),
+                "scoped to tenant red, the stronger blue-tenant node must be \
+                 excluded before scoring, not out-scored after it",
+            );
+        }
+
+        #[test]
+        fn no_match_returns_none_and_node_id_zero_is_a_valid_winner() {
+            let fold = new_fold();
+            assert_eq!(
+                winner(&fold, &unweighted()),
+                None,
+                "an empty fold has no winner",
+            );
+
+            // Node id 0 is a legitimate id, not a sentinel — this is
+            // why the C and Go surfaces carry a separate has-match
+            // out-param and the Node/Python surfaces return
+            // `null` / `None` rather than 0.
+            announce(&fold, 0, CapabilitySet::new());
+            assert_eq!(
+                winner(&fold, &unweighted()),
+                Some(0),
+                "node id 0 must be returned as a winner, not read as no-match",
+            );
+
+            let unsatisfiable = CapabilityRequirement::from_filter(LegacyFilter {
+                require_tags: vec!["tag-nobody-announced".into()],
+                ..LegacyFilter::default()
+            });
+            assert_eq!(
+                winner(&fold, &unsatisfiable),
+                None,
+                "a filter nothing matches must return None, not the id-0 node",
+            );
+        }
+
+        /// An unscoreable candidate loses to every scoreable one, no
+        /// matter which order they arrive in.
+        ///
+        /// `NaN` compares false in both directions, so the natural
+        /// "later candidates win only on a strictly greater score"
+        /// loop admits the first candidate unconditionally and then
+        /// can never displace it — a `NaN` on the LOWEST id wins
+        /// outright over every real score behind it, which is the
+        /// opposite of what a scorer returning `NaN` means. Both
+        /// orders are staged here because only the low-id case fails
+        /// under that shape; scoring the high id `NaN` passes either
+        /// way and would have proved nothing on its own.
+        ///
+        /// Unreachable through `CapabilityRequirement::score`, which
+        /// divides by constants and guards its one ratio — and
+        /// unreachable through the Node and Python surfaces, which
+        /// refuse a non-finite weight outright. The bridge takes an
+        /// arbitrary caller-supplied `Fn` though, so it is reachable
+        /// here, and total is cheaper than documented-as-impossible.
+        #[test]
+        fn an_unscoreable_candidate_never_beats_a_scoreable_one() {
+            let fold = new_fold();
+            announce(
+                &fold,
+                LOW_ID,
+                CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_gpu(gpu(8))),
+            );
+            announce(
+                &fold,
+                HIGH_ID,
+                CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_gpu(gpu(80))),
+            );
+            let filter = LegacyFilter::default();
+            let vram = |caps: &CapabilitySet| caps.views().hardware().total_vram_gb();
+
+            assert_eq!(
+                best_node_matching(&fold, &filter, |caps| {
+                    if vram(caps) == 8 {
+                        f32::NAN
+                    } else {
+                        1.0
+                    }
+                }),
+                Some(HIGH_ID),
+                "the unscoreable candidate sorts first, so a shape that lets it \
+                 become an undisplaceable incumbent returns it here",
+            );
+
+            assert_eq!(
+                best_node_matching(&fold, &filter, |caps| {
+                    if vram(caps) == 80 {
+                        f32::NAN
+                    } else {
+                        1.0
+                    }
+                }),
+                Some(LOW_ID),
+                "and it loses from the other side too, where it never had a \
+                 chance to become the incumbent",
+            );
+        }
+
+        /// When NOTHING is scoreable the answer is still the lowest
+        /// matching id, not `None`.
+        ///
+        /// Skipping unscoreable candidates outright would make this
+        /// report no match at all — but they did match the filter,
+        /// and "no winner among equals" is exactly the case the
+        /// tie-break already answers.
+        #[test]
+        fn every_candidate_unscoreable_falls_back_to_the_tie_break() {
+            let fold = new_fold();
+            announce(&fold, LOW_ID, CapabilitySet::new());
+            announce(&fold, HIGH_ID, CapabilitySet::new());
+
+            assert_eq!(
+                best_node_matching(&fold, &LegacyFilter::default(), |_| f32::NAN),
+                Some(LOW_ID),
+                "both candidates matched the filter, so an unrankable set is a \
+                 tie, not an empty result",
+            );
+
+            // And a filter nothing matches is still `None`, so the
+            // fallback above cannot manufacture a winner.
+            assert_eq!(
+                best_node_matching(
+                    &fold,
+                    &LegacyFilter {
+                        require_tags: vec!["tag-nobody-announced".into()],
+                        ..LegacyFilter::default()
+                    },
+                    |_| f32::NAN,
+                ),
+                None,
+                "the fallback is the lowest MATCHING id — with no match there is \
+                 nothing to fall back to",
+            );
+        }
+
+        /// Every candidate is scored against the capability set the
+        /// SAME fold read admitted it from, even when the fold moves
+        /// on between admission and scoring.
+        ///
+        /// The mutation is the point. An eviction staged BEFORE the
+        /// query proves nothing: the evicted node is simply absent
+        /// from both the coherent and the split-read shape, and both
+        /// pass. So the scorer itself evicts `HIGH_ID` while scoring
+        /// `LOW_ID` — deterministically between candidate
+        /// materialization and the scoring of the candidate that
+        /// eviction would change.
+        ///
+        /// The shape this replaced resolved ids from one fold read and
+        /// then re-entered the fold once per candidate to synthesize
+        /// scoring input. Restore it and `HIGH_ID`'s second read finds
+        /// nothing, defaults to an empty set (the negative control
+        /// below), and the 8GB node wins a VRAM-weighted query over an
+        /// 80GB one that was live when it was admitted.
+        ///
+        /// This also witnesses that scoring runs with the fold guards
+        /// released: `evict_node` takes both write locks, and
+        /// `parking_lot`'s locks are not reentrant, so a scorer called
+        /// from inside `with_state_and_index` would deadlock here.
+        /// The failure mode for that regression is a hung test, not a
+        /// failed assertion.
+        #[test]
+        fn selection_scores_each_candidate_against_the_state_that_admitted_it() {
+            let fold = new_fold();
+            announce(
+                &fold,
+                LOW_ID,
+                CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_gpu(gpu(8))),
+            );
+            announce(
+                &fold,
+                HIGH_ID,
+                CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_gpu(gpu(80))),
+            );
+
+            let req = unweighted().prefer_vram(1.0);
+            // `RefCell` because the bridge takes `Fn`, not `FnMut` —
+            // a scorer has no business mutating anything; this one is
+            // a test probe.
+            let observed: std::cell::RefCell<Vec<u32>> = std::cell::RefCell::new(Vec::new());
+            let winner = best_node_matching(&fold, &req.filter, |caps| {
+                let vram = caps.views().hardware().total_vram_gb();
+                observed.borrow_mut().push(vram);
+                // Candidates arrive in ascending id order, so this
+                // fires while scoring LOW_ID — after both candidates
+                // were materialized, before HIGH_ID is scored.
+                if vram == 8 {
+                    fold.evict_node(HIGH_ID, "test: publisher leaves mid-selection");
+                }
+                req.score(caps)
+            });
+
+            assert_eq!(
+                observed.into_inner(),
+                vec![8, 80],
+                "both candidates are scored against the state that admitted \
+                 them — a publisher evicted after admission must still be \
+                 scored on the capabilities it was admitted with, not on a \
+                 set re-read from the fold it has since left",
+            );
+            assert_eq!(
+                winner,
+                Some(HIGH_ID),
+                "the 80GB node was live when the snapshot was taken, so it \
+                 wins the VRAM-weighted query",
+            );
+
+            // Negative control: what the composed shape's second fold
+            // read would have handed the scorer for the evicted node.
+            let stale = synthesize_capability_set(&fold, HIGH_ID);
+            assert_eq!(
+                stale.views().hardware().total_vram_gb(),
+                0,
+                "the fold-taking synthesis defaults an unknown publisher to an \
+                 empty set — the value a split-read selection would have scored",
             );
         }
     }

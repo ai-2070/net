@@ -13,7 +13,7 @@ leave the node that holds them: the machine with the secret runs the work.
 
 ```typescript
 // Find something that can do the job, then do it — no registry, no config.
-const peers = node.findNodes({ requireTags: ['gpu'], minVramMb: 16_384 });
+const peers = node.findNodes({ requireTags: ['gpu'], minVramGb: 16 });
 const resp = await callTool(node, 'summarize', { text });
 ```
 
@@ -46,6 +46,12 @@ npm install @net-mesh/sdk @net-mesh/core
 `@net-mesh/sdk` is the TypeScript wrapper; `@net-mesh/core` is the napi-rs
 native binding it dispatches into. Prebuilt `.node` artifacts ship with every
 feature enabled.
+
+Upgrade both together. The wrapper is a thin typed layer over the binding, so
+a version skew surfaces as a missing method at the call site rather than at
+install time. [CHANGELOG.md](CHANGELOG.md) records what each release asks a
+caller to change — read it before upgrading, especially if you filter on
+`minVramGb` / `minMemoryGb`.
 
 ## The loop: announce → discover → invoke
 

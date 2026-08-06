@@ -16,9 +16,9 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
 use net::adapter::net::behavior::capability::{
-    AcceleratorInfo, AcceleratorType, CapabilityFilter, CapabilitySet, GpuInfo, GpuVendor,
-    HardwareCapabilities, Modality, ModelCapability, ResourceLimits, SoftwareCapabilities,
-    ToolCapability,
+    AcceleratorInfo, AcceleratorType, CapabilityFilter, CapabilityRequirement, CapabilitySet,
+    GpuInfo, GpuVendor, HardwareCapabilities, Modality, ModelCapability, ResourceLimits,
+    SoftwareCapabilities, ToolCapability,
 };
 use net::adapter::net::behavior::Tag;
 
@@ -131,6 +131,27 @@ pub struct CapabilityFilterJs {
     pub min_vram_gb: Option<u32>,
     pub min_context_length: Option<u32>,
     pub require_modalities: Option<Vec<String>>,
+}
+
+/// A placement requirement: the base [`CapabilityFilterJs`] plus four
+/// optional scoring weights.
+///
+/// Every candidate that passes the filter is scored; a higher weight
+/// tips the choice toward more memory / more VRAM / faster inference /
+/// a larger share of models already loaded. Weights are finite numbers
+/// in `[0, 1]`; the core clamps anything outside that range, and
+/// [`capability_requirement_from_js`] refuses `NaN` and the infinities
+/// outright. An absent weight is `0.0` — the axis is not consulted.
+///
+/// With every weight at `0.0` (or absent) all candidates score equally
+/// and selection falls back to the lowest matching node id.
+#[napi(object)]
+pub struct CapabilityRequirementJs {
+    pub filter: CapabilityFilterJs,
+    pub prefer_more_memory: Option<f64>,
+    pub prefer_more_vram: Option<f64>,
+    pub prefer_faster_inference: Option<f64>,
+    pub prefer_loaded_models: Option<f64>,
 }
 
 // =========================================================================
@@ -443,6 +464,56 @@ pub fn capability_filter_from_js(f: CapabilityFilterJs) -> CapabilityFilter {
     cf
 }
 
+/// Convert a JS placement requirement to the core
+/// [`CapabilityRequirement`].
+///
+/// Rejects a non-finite weight instead of narrowing it. JS numbers are
+/// f64 and carry `NaN` / `Infinity`, neither of which the core's
+/// `clamp(0.0, 1.0)` maps to anything sensible: `NaN.clamp` returns
+/// `NaN`, which poisons the candidate's score and makes it lose every
+/// comparison, so a requirement that reads as "strongly prefer VRAM"
+/// would silently select as if unweighted. `Infinity` clamps to `1.0`,
+/// which is at least in range but is not what the caller wrote.
+///
+/// The C ABI never had this problem — it takes JSON, which cannot
+/// spell either value. This is the boundary where a dynamic language
+/// can, so it is the boundary that has to refuse.
+///
+/// Finite out-of-range values are NOT rejected: they pass to the core
+/// builders and clamp there, keeping one clamp contract across Rust,
+/// Go, C, Node and Python.
+pub fn capability_requirement_from_js(
+    req: CapabilityRequirementJs,
+) -> napi::Result<CapabilityRequirement> {
+    fn weight(name: &str, v: Option<f64>) -> napi::Result<f32> {
+        match v {
+            None => Ok(0.0),
+            Some(w) if w.is_finite() => Ok(w as f32),
+            Some(w) => Err(napi::Error::new(
+                napi::Status::InvalidArg,
+                format!(
+                    "capability requirement weight '{name}' must be a finite \
+                     number, got {w}; finite values outside [0, 1] are clamped, \
+                     but NaN and Infinity have no meaningful clamp"
+                ),
+            )),
+        }
+    }
+
+    let prefer_more_memory = weight("preferMoreMemory", req.prefer_more_memory)?;
+    let prefer_more_vram = weight("preferMoreVram", req.prefer_more_vram)?;
+    let prefer_faster_inference = weight("preferFasterInference", req.prefer_faster_inference)?;
+    let prefer_loaded_models = weight("preferLoadedModels", req.prefer_loaded_models)?;
+
+    Ok(
+        CapabilityRequirement::from_filter(capability_filter_from_js(req.filter))
+            .prefer_memory(prefer_more_memory)
+            .prefer_vram(prefer_more_vram)
+            .prefer_speed(prefer_faster_inference)
+            .prefer_loaded(prefer_loaded_models),
+    )
+}
+
 // =========================================================================
 // Scope filter (reserved-tag discovery filter)
 // =========================================================================
@@ -633,6 +704,97 @@ mod tests {
         let hw = hardware_from_js(h);
         assert_eq!(hw.cpu_cores, u16::MAX);
         assert_eq!(hw.cpu_threads, u16::MAX);
+    }
+
+    fn empty_filter_js() -> CapabilityFilterJs {
+        CapabilityFilterJs {
+            require_tags: None,
+            require_models: None,
+            require_tools: None,
+            min_memory_gb: None,
+            require_gpu: None,
+            gpu_vendor: None,
+            min_vram_gb: None,
+            min_context_length: None,
+            require_modalities: None,
+        }
+    }
+
+    fn requirement_js(weights: [Option<f64>; 4]) -> CapabilityRequirementJs {
+        CapabilityRequirementJs {
+            filter: empty_filter_js(),
+            prefer_more_memory: weights[0],
+            prefer_more_vram: weights[1],
+            prefer_faster_inference: weights[2],
+            prefer_loaded_models: weights[3],
+        }
+    }
+
+    /// An absent weight means "don't consult this axis", which is
+    /// weight zero — not some default preference.
+    #[test]
+    fn requirement_defaults_absent_weights_to_zero() {
+        let req = capability_requirement_from_js(requirement_js([None; 4])).expect("convert");
+        assert_eq!(req.prefer_more_memory, 0.0);
+        assert_eq!(req.prefer_more_vram, 0.0);
+        assert_eq!(req.prefer_faster_inference, 0.0);
+        assert_eq!(req.prefer_loaded_models, 0.0);
+    }
+
+    /// Each weight must land on its own axis. Distinct values catch a
+    /// transposition that four equal values would hide.
+    #[test]
+    fn requirement_passes_each_finite_weight_to_its_own_axis() {
+        let req = capability_requirement_from_js(requirement_js([
+            Some(0.25),
+            Some(0.5),
+            Some(0.75),
+            Some(1.0),
+        ]))
+        .expect("convert");
+        assert_eq!(req.prefer_more_memory, 0.25);
+        assert_eq!(req.prefer_more_vram, 0.5);
+        assert_eq!(req.prefer_faster_inference, 0.75);
+        assert_eq!(req.prefer_loaded_models, 1.0);
+    }
+
+    /// Finite out-of-range values clamp in the core, so Node, Python,
+    /// Go, C and Rust all share one clamp implementation.
+    #[test]
+    fn requirement_clamps_finite_out_of_range_weights() {
+        let req = capability_requirement_from_js(requirement_js([
+            Some(-1.0),
+            Some(2.0),
+            Some(1e300),
+            Some(-0.0),
+        ]))
+        .expect("convert");
+        assert_eq!(req.prefer_more_memory, 0.0);
+        assert_eq!(req.prefer_more_vram, 1.0);
+        assert_eq!(req.prefer_faster_inference, 1.0);
+        assert_eq!(req.prefer_loaded_models, 0.0);
+    }
+
+    /// `NaN` would survive `clamp` and then lose every score
+    /// comparison, turning "strongly prefer this axis" into an
+    /// unweighted query. `Infinity` clamps to a value the caller never
+    /// wrote. Both are refused at the boundary rather than narrowed.
+    #[test]
+    fn requirement_rejects_non_finite_weights_on_every_axis() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for axis in 0..4 {
+                let mut weights = [None; 4];
+                weights[axis] = Some(bad);
+                let err = capability_requirement_from_js(requirement_js(weights))
+                    .expect_err("non-finite weight must be rejected");
+                assert_eq!(err.status, napi::Status::InvalidArg);
+                assert!(
+                    err.reason.contains("finite"),
+                    "error must name the constraint, got: {}",
+                    err.reason
+                );
+            }
+        }
     }
 
     fn scope_kind(kind: &str) -> ScopeFilterJs {

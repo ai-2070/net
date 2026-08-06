@@ -22,7 +22,7 @@
  *   models: [{ modelId: 'llama-3.1-70b', family: 'llama' }],
  * });
  *
- * const peers = node.findNodes({ requireTags: ['gpu'], minVramMb: 16_384 });
+ * const peers = node.findNodes({ requireTags: ['gpu'], minVramGb: 16 });
  * ```
  *
  * Multi-hop propagation is deferred; today peers more than one hop
@@ -171,10 +171,12 @@ export interface CapabilityFilter {
   requireTags?: string[];
   requireModels?: string[];
   requireTools?: string[];
-  minMemoryMb?: number;
+  /** Minimum system memory, in **gigabytes**. */
+  minMemoryGb?: number;
   requireGpu?: boolean;
   gpuVendor?: GpuVendor;
-  minVramMb?: number;
+  /** Minimum total GPU VRAM, in **gigabytes**. */
+  minVramGb?: number;
   minContextLength?: number;
   requireModalities?: Modality[];
 }
@@ -262,15 +264,59 @@ export interface NapiCapabilitySet {
   limits?: NapiLimits;
 }
 
-/** Shape that napi-rs expects for `findNodes`. */
+/**
+ * A placement requirement: a base {@link CapabilityFilter} plus
+ * optional scoring weights. Input to {@link MeshNode.findBestNode}.
+ *
+ * Where a filter answers "which nodes qualify", the weights answer
+ * "which qualifying node to pick". Each is a finite number in
+ * `[0, 1]`; higher tips selection toward more memory / more VRAM /
+ * faster inference / a larger share of models already loaded. Finite
+ * values outside the range are clamped by the substrate, so one clamp
+ * implementation serves every binding. `NaN` and `Infinity` are
+ * rejected — they have no meaningful clamp, and a `NaN` weight would
+ * quietly select as if the axis were unweighted.
+ *
+ * An omitted weight is `0` — that axis is not consulted. With every
+ * weight omitted, all matches score equally and the lowest node id
+ * wins.
+ *
+ * @example
+ * ```typescript
+ * // Any GPU node, but give me the one with the most VRAM.
+ * const target = node.findBestNode({
+ *   filter: { requireTags: ['gpu'] },
+ *   preferMoreVram: 1,
+ * });
+ * ```
+ */
+export interface CapabilityRequirement {
+  filter: CapabilityFilter;
+  preferMoreMemory?: number;
+  preferMoreVram?: number;
+  preferFasterInference?: number;
+  preferLoadedModels?: number;
+}
+
+/**
+ * Shape that napi-rs expects for `findNodes`.
+ *
+ * These names must match the camelCase napi derives from
+ * `CapabilityFilterJs` in `bindings/node/src/capabilities.rs` EXACTLY.
+ * A key that does not match is not a type error on either side — napi
+ * reads the fields it knows and ignores the rest, so a misspelling
+ * makes the filter silently vanish and the query returns MORE nodes
+ * than the caller asked for. `minMemoryMb` / `minVramMb` did exactly
+ * that until 2026-08: two axes that never once reached the substrate.
+ */
 export interface NapiCapabilityFilter {
   requireTags?: string[];
   requireModels?: string[];
   requireTools?: string[];
-  minMemoryMb?: number;
+  minMemoryGb?: number;
   requireGpu?: boolean;
   gpuVendor?: string;
-  minVramMb?: number;
+  minVramGb?: number;
   minContextLength?: number;
   requireModalities?: string[];
 }
@@ -365,12 +411,33 @@ export function capabilityFilterToNapi(f: CapabilityFilter): NapiCapabilityFilte
     requireTags: f.requireTags,
     requireModels: f.requireModels,
     requireTools: f.requireTools,
-    minMemoryMb: f.minMemoryMb,
+    minMemoryGb: f.minMemoryGb,
     requireGpu: f.requireGpu,
     gpuVendor: f.gpuVendor,
-    minVramMb: f.minVramMb,
+    minVramGb: f.minVramGb,
     minContextLength: f.minContextLength,
     requireModalities: f.requireModalities as string[] | undefined,
+  };
+}
+
+/** Shape that napi-rs expects for `findBestNode`. */
+export interface NapiCapabilityRequirement {
+  filter: NapiCapabilityFilter;
+  preferMoreMemory?: number;
+  preferMoreVram?: number;
+  preferFasterInference?: number;
+  preferLoadedModels?: number;
+}
+
+export function capabilityRequirementToNapi(
+  r: CapabilityRequirement,
+): NapiCapabilityRequirement {
+  return {
+    filter: capabilityFilterToNapi(r.filter),
+    preferMoreMemory: r.preferMoreMemory,
+    preferMoreVram: r.preferMoreVram,
+    preferFasterInference: r.preferFasterInference,
+    preferLoadedModels: r.preferLoadedModels,
   };
 }
 

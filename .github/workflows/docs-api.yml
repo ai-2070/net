@@ -24,6 +24,7 @@ on:
     paths:
       - "web/src/content/docs/**"
       - ".github/workflows/docs-api.yml"
+      - ".github/scripts/lib/checker.sh"
       - ".github/scripts/check-docs.sh"
       - ".github/scripts/check-skill-refs.py"
       # The surfaces the docs describe. Same roots as skills.yml, for the same
@@ -43,6 +44,7 @@ on:
     paths:
       - "web/src/content/docs/**"
       - ".github/workflows/docs-api.yml"
+      - ".github/scripts/lib/checker.sh"
       - ".github/scripts/check-docs.sh"
       - ".github/scripts/check-skill-refs.py"
       - "go/**"

@@ -132,11 +132,30 @@ fn crate_doc_links_resolve() {
         }
     }
 
+    // The site-absolute case gets its own hint. `/docs/concepts/subnets` is not
+    // a missing file, it is a real docs-site route written in a form that
+    // resolves only inside Astro — which is exactly why it reads as correct to
+    // the author and renders dead everywhere this file is actually read.
+    // `RELEASE_v0.34_HOTEL_CALIFORNIA.md` landed on master with fourteen of
+    // them, and "dangling link" alone did not say what to write instead.
+    let site_absolute: Vec<&String> = broken.iter().filter(|b| b.contains("-> /docs/")).collect();
+    let hint = if site_absolute.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\n{} of these are site-absolute `/docs/…` routes. These files are \
+             read on GitHub and inside the published crate, where that path does \
+             not resolve — write the full URL instead \
+             (`https://ai2070.net/docs/…`), or a relative path for a target \
+             inside this crate's `docs/`.",
+            site_absolute.len(),
+        )
+    };
     assert!(
         broken.is_empty(),
-        "{} dangling link(s) in the crate docs:\n{}",
+        "{} dangling link(s) in the crate docs:\n{}{hint}",
         broken.len(),
-        broken.into_iter().collect::<Vec<_>>().join("\n"),
+        broken.iter().cloned().collect::<Vec<_>>().join("\n"),
     );
 }
 

@@ -78,9 +78,11 @@ export type SelectionPolicy = 'least_loaded' | 'pack' | 'load_band' | 'lowest_id
 import { getNapiMesh, setNapiMesh } from './_internal.js';
 import {
   capabilityFilterToNapi,
+  capabilityRequirementToNapi,
   capabilitySetToNapi,
   scopeFilterToNapi,
   type CapabilityFilter,
+  type CapabilityRequirement,
   type CapabilitySet,
   type ScopeFilter,
 } from './capabilities';
@@ -775,6 +777,60 @@ export class MeshNode {
   findNodesScoped(filter: CapabilityFilter, scope: ScopeFilter): bigint[] {
     return this.native.findNodesScoped(
       capabilityFilterToNapi(filter),
+      scopeFilterToNapi(scope),
+    );
+  }
+
+  /**
+   * Pick the single highest-scoring node for a placement
+   * {@link CapabilityRequirement}, or `null` when nothing matches.
+   *
+   * {@link findNodes} returns every match and leaves the choice to
+   * you; this applies the requirement's weights and returns one
+   * winner. Ties — including the all-weights-omitted case, where
+   * every match scores the same — resolve to the lowest matching
+   * node id.
+   *
+   * `null` means no match. `0n` is a REAL node id, not a sentinel:
+   * check for `null`, never for falsiness, or a node whose id is zero
+   * reads as "nothing found".
+   *
+   * Weights must be finite; `NaN` and `Infinity` throw. Finite values
+   * outside `[0, 1]` are clamped by the substrate.
+   *
+   * Local and synchronous — reads this node's capability fold and
+   * sends nothing on the wire, so it only sees peers whose
+   * announcements have already arrived.
+   *
+   * @example
+   * ```typescript
+   * const target = node.findBestNode({
+   *   filter: { requireTags: ['gpu'] },
+   *   preferMoreVram: 1,
+   * });
+   * if (target !== null) {
+   *   const stream = node.openStream(target, { streamId: 1n });
+   * }
+   * ```
+   */
+  findBestNode(requirement: CapabilityRequirement): bigint | null {
+    return this.native.findBestNode(capabilityRequirementToNapi(requirement));
+  }
+
+  /**
+   * Scoped variant of {@link findBestNode}, with the scope semantics
+   * of {@link findNodesScoped}.
+   *
+   * Scope narrows the candidate set BEFORE scoring, so a peer outside
+   * the scope cannot win on capacity — a bigger GPU in another
+   * tenant's pool is not a reason to leak across the boundary.
+   */
+  findBestNodeScoped(
+    requirement: CapabilityRequirement,
+    scope: ScopeFilter,
+  ): bigint | null {
+    return this.native.findBestNodeScoped(
+      capabilityRequirementToNapi(requirement),
       scopeFilterToNapi(scope),
     );
   }

@@ -5,7 +5,7 @@
 ```typescript
 const peers: bigint[] = node.findNodes({
   requireTags: ['gpu'],
-  minVramMb: 16_384,
+  minVramGb: 16,
 });
 ```
 
@@ -13,7 +13,39 @@ const peers: bigint[] = node.findNodes({
 local index. Node ids come back as `bigint[]` because they are 64-bit; `===`
 against a number literal is always false.
 
+`minVramGb` and `minMemoryGb` are in **gigabytes**, matching every other binding
+and the substrate. They were spelled `minVramMb` / `minMemoryMb` before 0.35,
+which is a different name from the one the native layer reads — so both were
+dropped and the threshold matched everything. Rename and rescale together: a
+`minVramMb: 16_384` that used to be ignored is `minVramGb: 16`, not `16_384`.
+
 `findNodesScoped(filter, scope)` narrows to a tenant, region or subnet pool.
+
+### Pick one node
+
+```typescript
+const target: bigint | null = node.findBestNode({
+  filter: { requireTags: ['gpu'] },
+  preferMoreVram: 1,
+});
+```
+
+`findBestNode` applies the requirement's weights and returns one winner instead
+of the whole matching set. The four weights — `preferMoreMemory`,
+`preferMoreVram`, `preferFasterInference`, `preferLoadedModels` — each score one
+axis of what a candidate announced about itself: system memory, GPU VRAM, model
+inference speed, and the share of its models already loaded. They must be
+**finite**: `NaN` and
+`Infinity` throw, while finite values outside `[0, 1]` are clamped by the
+substrate. Ties, including the case where every weight is omitted, resolve to
+the lowest matching node id.
+
+`null` means nothing matched. `0n` is a real node id, so test `=== null` rather
+than falsiness. `findBestNodeScoped(requirement, scope)` applies the scope
+first, so a peer outside it cannot win on capacity.
+
+Same local-index read as `findNodes`: synchronous, no network, and only peers
+whose announcements have already arrived.
 
 ### List tools
 

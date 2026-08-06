@@ -1,238 +1,525 @@
-# Implementation Plan: `find_best_node` — TS + Python binding parity
+# Implementation Plan: `find_best_node` — core witness + TS/Python parity
 
-**Implements:** the last capability-discovery parity gap in the binding
-matrix (`docs/data/capabilities/event-bus.yaml`, "Capability discovery"):
+**Implements:** the last capability-discovery surface gap in the binding matrix
+(`docs/data/capabilities/event-bus.yaml`, "Capability discovery"):
 `find_best_node` / `find_best_node_scoped` exist in Rust
 (`net/crates/net/sdk/src/mesh.rs:1161`), Go (`go/capabilities.go` —
 `FindBestNode` / `FindBestNodeScoped`) and C (`net_mesh_find_best_node` /
-`net_mesh_find_best_node_scoped`, `net/crates/net/src/ffi/mesh.rs:3761`),
-but neither the NAPI binding (`net/crates/net/bindings/node`) nor the PyO3
-binding (`net/crates/net/bindings/python`) exposes them. The coverage doc
-records the gap explicitly ("there is no `findBestNode`" —
-`.claude/skills/net-event-bus/bindings/coverage.md` § Same operation,
-different shape).
+`net_mesh_find_best_node_scoped`, `net/crates/net/src/ffi/mesh.rs:3761`), but
+neither the NAPI binding (`net/crates/net/bindings/node`) nor the PyO3 binding
+(`net/crates/net/bindings/python`) exposes them.
 
-**The sentence:** Node and Python gain the single-winner discovery call the
-other three bindings already have — a marshaling layer over the core's
-`MeshNode::find_best_node(&CapabilityRequirement)` scoring, deciding
-nothing itself — so a TS or Python placement node no longer has to
-re-implement the selection policy caller-side or drop to Rust / Go.
+**The sentence:** first prove that the canonical tag-backed capability fold still
+makes the four placement weights load-bearing, then give Node/TS and Python the
+same single-winner local-discovery call as Rust, Go and C. The bindings only
+marshal a requirement and project `Option<u64>`; filtering, scoring,
+tie-breaking and scope evaluation remain core behavior.
 
 ---
 
-## Ground truth (as surveyed 2026-08-06)
+## Ground truth (surveyed 2026-08-06)
 
 | Surface | Rust | Go | C | Node / TS | Python |
 |---|---|---|---|---|---|
-| `find_nodes` (+ scoped) | ✅ | ✅ | ✅ | ✅ `findNodes` / `findNodesScoped` | ✅ `find_nodes` / `find_nodes_scoped` |
+| `find_nodes` (+ scoped) | ✅ | ✅ | ✅ | ✅ `findNodes` / `findNodesScoped` | ✅ `find_nodes` / `find_nodes_scoped` on `NetMesh`; only unscoped on `AsyncNetMesh` |
 | `find_best_node` (+ scoped) | ✅ | ✅ | ✅ | ❌ | ❌ |
 
 Structural facts that shape the work:
 
-1. **Neither binding goes through the C FFI.** Both call the core
-   `MeshNode` directly — NAPI's `find_nodes` calls
-   `node.find_nodes_by_filter(&core)`
-   (`bindings/node/src/lib.rs:2125`), PyO3's calls the same
-   (`bindings/python/src/lib.rs:2444`). `find_best_node` is one more
-   method on the same object; no FFI or header work exists.
-2. **All conversion scaffolding already exists.** NAPI has
-   `CapabilityFilterJs` / `capability_filter_from_js` /
-   `ScopeFilterJs` / `scope_filter_from_js` / `with_scope_filter`
-   (`bindings/node/src/capabilities.rs`); Python has
+1. **Neither binding goes through the C FFI.** Both call the core `MeshNode`
+   directly. NAPI's `find_nodes` calls `node.find_nodes_by_filter(&core)`
+   (`bindings/node/src/lib.rs:2125`), and PyO3's does the same
+   (`bindings/python/src/lib.rs:2444`). No C ABI or header change belongs in
+   this plan.
+2. **The fold is tag-backed, and weighted scoring is intended to remain
+   functional.** `capability_bridge::synthesize_capability_set` merges each
+   candidate's canonical tags into a `CapabilitySet`
+   (`behavior/fold/capability_bridge.rs:687-748`).
+   `CapabilityRequirement::score` reads `CapabilitySet::views()`, whose lazy
+   hardware/model projections decode those canonical tags through
+   `hardware_from_tags` and `models_from_tags`
+   (`behavior/capability.rs:1975-2047`). Memory, VRAM, tokens/sec and loaded
+   model facts therefore do not require a second rich-state sidecar.
+3. **The current core comments, evidence and snapshot shape are
+   stale/inadequate.**
+   `MeshNode::find_best_node`, `find_best_node_scoped` and `best_by_score`
+   (`adapter/net/mesh.rs:30658-30731`) still claim those decoded values are zero
+   and every score ties. That contradicts the canonical `views()` path. The Go
+   test uses one candidate and explicitly says its weights are not
+   load-bearing (`go/capabilities_test.go:297-303`). In addition, current
+   `find_best_node*` first obtains candidate ids from one fold read, then
+   `best_by_score` re-enters the fold once per candidate to synthesize scoring
+   input. A replacement/removal can therefore mix candidate membership from
+   one fold state with scores from later states. Before exposing two more
+   bindings, Part 0 must make candidate filtering + scoring one coherent fold
+   snapshot, replace the stale comments, and add inverse two-candidate core
+   witnesses. If a witness fails, stop: this becomes a core scoring repair,
+   not a binding-parity patch.
+4. **All binding conversion scaffolding already exists.** NAPI has
+   `CapabilityFilterJs` / `capability_filter_from_js` / `ScopeFilterJs` /
+   `scope_filter_from_js` / `with_scope_filter`
+   (`bindings/node/src/capabilities.rs`). Python has
    `capability_filter_from_py` / `scope_filter_from_py` /
-   `with_scope_filter` (`bindings/python/src/capabilities.rs`). The only
-   new conversion is the requirement wrapper: filter + four weight
-   fields.
-3. **The weight semantics are decided in core.**
-   `CapabilityRequirement` (`net/crates/net/src/adapter/net/behavior/capability.rs:2962`)
-   carries `prefer_more_memory` / `prefer_more_vram` /
-   `prefer_faster_inference` / `prefer_loaded_models`, each clamped to
-   `[0.0, 1.0]` by the builder (`from_filter(..).prefer_memory(w)…`).
-   Bindings pass weights through and let the clamp happen Rust-side —
-   exactly what the C FFI does (`ffi/mesh.rs:3739-3749`) and what Go
-   documents ("values outside the range are silently capped").
-   *Disambiguation:* there is a second, unrelated `CapabilityRequirement`
-   in `adapter/net/cortex/workflow/step.rs:44` (the scheduler claim
-   seam). Do not touch it; everything here is the behavior/capability
-   one.
-4. **"No match" vs node id 0 needs no out-param trick here.** Go and C
-   needed `(uint64, bool)` / `*out_has_match` because 0 is a valid node
-   id. Node returns `bigint | null` and Python `int | None` — the
-   language-native `Option` projection of Rust's `Option<u64>`.
-5. **Python discovery is core-only by design** (coverage matrix mode
-   `core-only`): the surface lives on `net._net.NetMesh`, and
-   `net_sdk.MeshNode` does not re-export it. This plan keeps that
-   placement; lifting discovery into `net_sdk` is a separate decision
-   (Open Decision 1).
+   `with_scope_filter` (`bindings/python/src/capabilities.rs`). The only new
+   conversion is the requirement wrapper: filter plus four weights.
+5. **The requirement type is the behavior/capability one.**
+   `CapabilityRequirement` (`adapter/net/behavior/capability.rs:2962`) carries
+   `prefer_more_memory`, `prefer_more_vram`, `prefer_faster_inference` and
+   `prefer_loaded_models`, each stored as `f32` and clamped to `[0.0, 1.0]` by
+   the builder. The unrelated scheduler-claim type in
+   `adapter/net/cortex/workflow/step.rs` is out of scope.
+6. **Finite-number behavior must be explicit at dynamic-language boundaries.**
+   C receives JSON and cannot represent `NaN` or infinities. JS and Python can.
+   NAPI and PyO3 reject non-finite weights before narrowing to `f32`; finite
+   values outside `[0.0, 1.0]` pass to the core builder and are clamped there.
+7. **No-match needs no out-param trick here.** Go and C need `(uint64, bool)` /
+   `*out_has_match` because node id `0` is valid. Node returns
+   `bigint | null`; Python returns `int | None`.
+8. **Python discovery remains core-only.** The surface lives on
+   `net._net.NetMesh` / `AsyncNetMesh`; `net_sdk.MeshNode` does not re-export
+   discovery. This plan does not change that coverage mode.
 
-## Doctrine (unchanged)
+## Locked decisions
 
-- **No logic in bindings.** Scoring, tie-breaking, and weight clamping
-  are core behavior. Bindings marshal a requirement in and a
-  `Option<u64>` out.
-- **One wire shape, three spellings.** The requirement is the same
-  object everywhere: a base filter plus four optional weights. Python
-  dicts use the snake_case keys the C/Go JSON contract already fixed
-  (`prefer_more_memory`, …); the TS POJO uses the camelCase
-  (`preferMoreMemory`, …) that napi-rs derives, same as the existing
-  filter/scope shapes.
-- **Local index, sync call.** Like `find_nodes`, this reads the local
-  capability fold — no network, no `await`. It stays sync in both
-  bindings (including on `AsyncNetMesh`, whose sync helpers are already
-  documented as staying sync).
+1. **No `net_sdk` Python lift.** Keep discovery `core-only`; lifting the whole
+   discovery row is separate work.
+2. **Complete `AsyncNetMesh` local-discovery parity.** Add all four synchronous
+   helpers: `find_nodes`, `find_nodes_scoped`, `find_best_node`, and
+   `find_best_node_scoped`. `find_nodes` already exists; this patch adds the
+   other three and their stubs.
+3. **Reject non-finite weights.** NAPI and PyO3 return boundary type/value
+   errors for `NaN`, `+∞`, and `-∞`. Finite out-of-range values retain the
+   existing Rust/C/Go clamp contract.
+4. **Use real announcements for binding E2E tests.** Existing Python test-only
+   injectors accept only an empty capability set or tags; they cannot stage
+   candidates with different VRAM. Do not widen production or test-only APIs
+   merely for this patch.
 
-## The parity target (what this plan closes)
+## Doctrine
 
-| Call | Rust | Go | C | Node / TS → | Python → |
-|---|---|---|---|---|---|
-| `find_best_node(req)` | ✅ | ✅ | ✅ | **A1/B1** | **C1** |
-| `find_best_node_scoped(req, scope)` | ✅ | ✅ | ✅ | **A1/B1** | **C1** |
-| Docs / coverage record truthful again | — | — | — | **D** | **D** |
+- **One scoring authority.** Bindings do not score, sort, break ties or decode
+  capability tags. They call core `MeshNode::find_best_node*`.
+- **One semantic shape, idiomatic spellings.** A requirement is a base filter
+  plus four optional weights. Python dicts use snake_case; TS uses camelCase.
+- **Local index, synchronous call.** Like `find_nodes`, these methods read the
+  local fold. They perform no network operation and return no awaitable,
+  including on `AsyncNetMesh`.
+- **No false parity.** Declaration/import tests are insufficient. A
+  two-candidate core inverse test must prove that a weight can change the
+  winner before docs call the operation weighted selection.
+- **One coherent selection snapshot.** Candidate membership, scope filtering,
+  tag projection and scores come from one fold state. Do not select ids, drop
+  the fold locks, and re-read each candidate for scoring.
+
+---
+
+## Part 0 — prove the core contract before widening it
+
+### 0.1 — Make filtering and scoring one coherent fold snapshot
+
+- [x] Add a capability-bridge selection helper that performs candidate
+  filtering, optional scope evaluation, candidate tag/metadata projection and
+  scoring inside one `Fold::with_state` read. Extract/reuse a state-local
+  synthesis helper; do not call `synthesize_capability_set` from inside the
+  snapshot because it would re-enter the fold.
+- [x] Preserve the existing announcement-path invariant correctly: a
+  publisher currently owns one class-0 entry, but the state-local synthesis
+  must still merge every key in `state.by_node[node_id]` so future per-class
+  sharding does not make the score depend on whichever entry matched first.
+- [x] Keep `SameSubnet` evaluation fold-pure and based on the selected entry's
+  borrowed tags, exactly as `find_nodes_matching_scoped` does today. The
+  closure may read captured local policy, but must not read the fold or the
+  `peer_subnets` sidecar.
+- [x] Return only the winning node id after the snapshot closes. Preserve
+  descending score and ascending node-id tie-break.
+- [x] Rewire both `MeshNode::find_best_node` and
+  `MeshNode::find_best_node_scoped` through this helper. Do not compose
+  `find_nodes_*` followed by per-candidate fold reads.
+
+### 0.2 — Replace stale scoring comments
+
+- [x] Update only the comments on `MeshNode::find_best_node`,
+  `find_best_node_scoped`, and `best_by_score` in
+  `net/crates/net/src/adapter/net/mesh.rs:30658-30731`.
+- [x] State the actual path: candidate membership comes from one canonical
+  capability-fold snapshot; state-local synthesis merges canonical tags;
+  `CapabilitySet::views()` lazily reconstructs hardware/models; scoring uses
+  those decoded projections; ties resolve by ascending node id.
+- [x] Do not add a hardware/model sidecar or restore removed duplicate fields.
+  Canonical tags remain the source of truth.
+
+### 0.3 — Add inverse core witnesses
+
+Add focused Rust tests beside the existing mesh/capability-fold discovery tests:
+
+- [x] Inject two candidates whose node-id ordering is opposite their capacity
+  ordering: lower node id has less VRAM, higher node id has more VRAM.
+- [x] With all weights zero, assert the documented ascending-node-id tie-break.
+- [x] With `prefer_vram(1.0)`, assert the higher-VRAM candidate wins.
+- [x] Add equivalent independent witnesses for memory, maximum model
+  tokens/sec, and loaded-model ratio. Each witness must have at least two
+  matching candidates; no single-candidate scoring smoke test counts.
+- [x] For scoped selection, stage an out-of-scope candidate with the strongest
+  score and prove filtering occurs before scoring.
+- [x] Add a mutation/replacement witness around the new bridge helper proving
+  a selection cannot retain membership from one fold generation while scoring
+  replacement or missing data from another. Prefer a deterministic helper-
+  level test over a timing-dependent concurrent test.
+- [x] Prove no match returns `None` and node id `0` remains a valid winner.
+- [x] Where practical, mutate only the preference or candidate fact between
+  paired assertions so a dead weight makes the inverse test fail.
+
+**Stop gate:** if any weighted witness shows lexicographic selection instead of
+capacity/model selection, do not proceed to Parts A-D. Repair the canonical
+fold-to-views scoring path first and rerun all Part 0 witnesses.
 
 ---
 
 ## Part A — NAPI binding (`net/crates/net/bindings/node`)
 
-### A1 — Requirement type + the two methods
+### A1 — Requirement DTO and conversion
 
-- [ ] `CapabilityRequirementJs` in `bindings/node/src/capabilities.rs`:
-  `#[napi(object)]` with `filter: CapabilityFilterJs` and four
-  `Option<f64>` weights (`prefer_more_memory`, `prefer_more_vram`,
-  `prefer_faster_inference`, `prefer_loaded_models` — napi renders them
-  camelCase). Plus `capability_requirement_from_js` building
-  `CapabilityRequirement::from_filter(capability_filter_from_js(f))
-  .prefer_memory(..).prefer_vram(..).prefer_speed(..).prefer_loaded(..)`
-  with missing weights defaulting to `0.0` — mirroring
-  `capability_requirement_from_json` in `ffi/mesh.rs`.
-- [ ] `find_best_node(&self, req: CapabilityRequirementJs) ->
-  Result<Option<BigInt>>` and `find_best_node_scoped(&self, req, scope:
-  ScopeFilterJs) -> Result<Option<BigInt>>` as `#[napi]` methods next to
-  `find_nodes` / `find_nodes_scoped` (`bindings/node/src/lib.rs:2125` /
-  `:2145`), calling `node.find_best_node(&core)` /
-  `with_scope_filter(&owned, |f| node.find_best_node_scoped(&core, f))`.
-  Same `load_node` guard, same doc-comment style (state the scoped
-  scope-tag semantics the `find_nodes_scoped` comment states).
-- [ ] Rust unit test for the conversion (weight passthrough, absent
-  weights → 0.0), following the existing in-crate test style
-  (cf. the `saturating_u16` regression test in the same crate).
+- [x] Add `CapabilityRequirementJs` in
+  `bindings/node/src/capabilities.rs` as `#[napi(object)]`:
+  `filter: CapabilityFilterJs` plus four `Option<f64>` fields
+  (`prefer_more_memory`, `prefer_more_vram`,
+  `prefer_faster_inference`, `prefer_loaded_models`; napi-rs emits camelCase).
+- [x] Add `capability_requirement_from_js` returning
+  `Result<CapabilityRequirement>`:
+  1. reject any supplied non-finite `f64` with `InvalidArg`;
+  2. narrow finite values to `f32`;
+  3. build through `CapabilityRequirement::from_filter(...)` and the four core
+     preference builders;
+  4. default absent weights to `0.0`.
+- [x] Add Rust unit tests for defaults, exact finite passthrough, finite clamp
+  behavior, and rejection of `NaN` / infinities.
 
-## Part B — TS SDK (`net/crates/net/sdk-ts`)
+### A2 — Native methods
 
-### B1 — Ergonomic surface
+- [x] Add `find_best_node(&self, req: CapabilityRequirementJs) ->
+  Result<Option<BigInt>>` and `find_best_node_scoped(&self, req,
+  scope: ScopeFilterJs) -> Result<Option<BigInt>>` beside `find_nodes` /
+  `find_nodes_scoped` in `bindings/node/src/lib.rs`.
+- [x] Use the same `load_node` guard and the existing scope borrow trampoline.
+  Convert `Some(id)` with `BigInt::from(id)`; preserve `None` as `null`.
+- [x] Doc comments must say local/synchronous, `null` means no match, `0n` is a
+  valid node id, weights are finite numbers clamped to `[0, 1]`, and scope is
+  applied before scoring.
 
-- [ ] `CapabilityRequirement` interface +
-  `capabilityRequirementToNapi` in `sdk-ts/src/capabilities.ts`, next to
-  `CapabilityFilter` / `capabilityFilterToNapi`: `{ filter:
-  CapabilityFilter; preferMoreMemory?: number; preferMoreVram?: number;
-  preferFasterInference?: number; preferLoadedModels?: number }`. Doc
-  comment states the `[0, 1]` range and the Rust-side clamp.
-- [ ] `findBestNode(req: CapabilityRequirement): bigint | null` and
-  `findBestNodeScoped(req, scope: ScopeFilter): bigint | null` on
-  `MeshNode` (`sdk-ts/src/mesh.ts`, next to `findNodes:702` /
-  `findNodesScoped:775`), delegating to the native methods. Docstrings:
-  one-winner semantics, `null` = no match (and that a `0n` result is a
-  valid node id, not a sentinel), bigint caveat already documented for
-  `findNodes` applies.
-- [ ] Tests in `sdk-ts/test/capabilities.test.ts` (conversion unit
-  tests) plus an e2e in the existing capability e2e style: announce two
-  nodes with different VRAM, assert the VRAM-weighted requirement picks
-  the bigger one, a scope filter narrows the candidate set, and a
-  non-matching filter returns `null`. Follow whatever
-  announce-injection path the existing `findNodes` tests use.
+---
+
+## Part B — TypeScript SDK (`net/crates/net/sdk-ts`)
+
+### B1 — Ergonomic DTO and wrapper
+
+- [x] Add exported `CapabilityRequirement` and internal
+  `capabilityRequirementToNapi` in `sdk-ts/src/capabilities.ts` next to
+  `CapabilityFilter` / `capabilityFilterToNapi`:
+
+  ```ts
+  export interface CapabilityRequirement {
+    filter: CapabilityFilter;
+    preferMoreMemory?: number;
+    preferMoreVram?: number;
+    preferFasterInference?: number;
+    preferLoadedModels?: number;
+  }
+  ```
+
+- [x] Add `findBestNode(req): bigint | null` and
+  `findBestNodeScoped(req, scope): bigint | null` on `MeshNode`, delegating to
+  the native methods after DTO conversion.
+- [x] Document winner/no-match semantics, the valid `0n` result, finite-number
+  requirement, Rust-side finite clamp, local/synchronous behavior, and scoped
+  filtering before scoring.
+
+### B2 — Tests
+
+- [x] Conversion tests cover all fields and absence/default behavior.
+- [x] Boundary tests prove `NaN` and infinities are rejected through the native
+  call; finite negative and >1 values are accepted and clamped.
+- [x] E2E: create real connected nodes, announce two matching capability sets
+  with node-id ordering recorded at runtime, then choose capacity values so the
+  high-VRAM winner is not merely the ascending-id tie winner. Wait until the
+  querying node sees both announcements before asserting.
+- [x] Add scoped narrowing and no-match → `null` assertions.
+- [x] Do not duplicate all four core scoring-axis witnesses in TS; Part 0 owns
+  scoring semantics. TS proves DTO/native/wrapper continuity with VRAM.
+
+---
 
 ## Part C — PyO3 binding (`net/crates/net/bindings/python`)
 
-### C1 — Methods on `NetMesh` (+ `AsyncNetMesh`)
+### C1 — Requirement conversion
 
-- [ ] `capability_requirement_from_py(&Bound<'_, PyDict>)` in
-  `bindings/python/src/capabilities.rs`: accepts `{"filter": {...},
-  "prefer_more_memory": 0.5, ...}` — snake_case keys, all optional,
-  filter defaulting to empty, weights to `0.0`; routes through the same
-  core builder as A1. Reject non-numeric weights with `TypeError`
-  (consistent with the crate's existing strictness on dict shapes).
-- [ ] `find_best_node(&self, requirement: &Bound<'_, PyDict>) ->
-  PyResult<Option<u64>>` and `find_best_node_scoped(requirement, scope)`
-  on `NetMesh` next to `find_nodes` (`bindings/python/src/lib.rs:2444`);
-  `find_best_node` also on `AsyncNetMesh` next to its `find_nodes`
-  (`lib.rs:3488`) — sync, like the other local-index helpers there.
-- [ ] Stubs in `bindings/python/python/net/_net.pyi` for the new
-  methods (`def find_best_node(self, requirement: dict) -> int | None`).
-  **Drive-by:** the stub file has no `find_nodes_scoped` entry even
-  though the binding exposes it (only `find_nodes` at `:902` / `:2420`)
-  — add it while in the file.
-- [ ] Tests in `bindings/python/tests/test_capabilities.py` using
-  `test_inject_capability_announcement` (`lib.rs:2435`): weighted pick,
-  scoped narrowing, no-match → `None`, and a node-id-0 injection to
-  prove `None` vs `0` disambiguation.
-- [ ] Rust unit test for `capability_requirement_from_py` (weight
-  passthrough, defaults, type errors).
+- [x] Add a float helper and
+  `capability_requirement_from_py(&Bound<'_, PyDict>)` in
+  `bindings/python/src/capabilities.rs` accepting:
 
-## Part D — Docs, coverage record, skills
+  ```python
+  {
+      "filter": {...},
+      "prefer_more_memory": 0.5,
+      "prefer_more_vram": 1.0,
+      "prefer_faster_inference": 0.0,
+      "prefer_loaded_models": 0.0,
+  }
+  ```
 
-Sequencing: land A–C first; every doc claim below must anchor to a
-symbol that exists, and `check-skills.sh` proves exactly that.
+- [x] Default a missing `filter` to an empty filter and missing weights to
+  `0.0`, matching the C JSON DTO.
+- [x] Reject non-numeric values with `TypeError`; reject non-finite numeric
+  values with `ValueError`; narrow finite values to `f32` and route through the
+  core builders so finite out-of-range values clamp centrally.
+- [x] Add Rust unit tests for defaults, passthrough, clamp, wrong types and
+  non-finite values.
 
-- [ ] `docs/data/capabilities/event-bus.yaml`, "Capability discovery":
-  flip the Node/TS anchor `findNodes` → `findBestNode` and the Python
-  anchor `find_nodes` → `find_best_node` so the record's evidence proves
-  the *new* symbols (statuses stay `supported`, Python keeps
-  `core-only`). Regenerate the skill's matrix copy via
-  `capability_records.py` so `check-skills.sh`'s
-  `capability_records.py --check` stays green.
-- [ ] `.claude/skills/net-event-bus/bindings/coverage.md`: rewrite the
-  "Discovery returns one node in Rust and Go, a list in Node and
-  Python" paragraph (§ Same operation, different shape) — all five
-  bindings now have both shapes; keep the note that the *names* differ
-  per binding.
-- [ ] `.claude/skills/net-event-bus/capabilities.md`: delete the two
-  negative bullets ("No `findBestNode` in the TS SDK or NAPI binding
-  today", `:316`; "No `find_best_node` in the PyO3 binding today",
-  `:341`) and replace with the new signatures; update the "Both have
-  the full surface" framing (`:346`) now that it's all five.
-- [ ] `docs/data/spine-symbols.yaml` `discover` lens (`:69-75`): add
-  `findBestNode` / `findBestNodeScoped` to the typescript list and
-  `find_best_node` / `find_best_node_scoped` to the python list.
-- [ ] `web/src/content/docs/sdk/discover/typescript.md` and
-  `python.md`: add the best-node paragraph the Rust page already has
-  (`rust.md:44-46`), in each page's own idiom.
-- [ ] Sweep for stale absence claims:
-  `grep -ri "findBestNode\|find_best_node" docs web .claude | grep -i "no \|not \|absent"`.
+### C2 — `NetMesh`, `AsyncNetMesh`, and stubs
+
+- [x] Add synchronous `find_best_node(requirement) -> Option<u64>` and
+  `find_best_node_scoped(requirement, scope) -> Option<u64>` on `NetMesh`
+  beside the existing discovery methods.
+- [x] Add synchronous `find_nodes_scoped`, `find_best_node`, and
+  `find_best_node_scoped` on `AsyncNetMesh`, using the same converters and
+  scope borrow trampoline as `NetMesh`.
+- [x] Update both class sections in
+  `bindings/python/python/net/_net.pyi`. Include the pre-existing missing
+  `NetMesh.find_nodes_scoped` stub and the three new `AsyncNetMesh` methods.
+  Use `dict` / `Dict[str, Any]` consistently with each surrounding class and
+  `int | None` / `Optional[int]` consistently with that section's style.
+
+### C3 — Python tests
+
+- [x] Use real `NetMesh` peers and `announce_capabilities` to stage candidates
+  with different VRAM. The helpers around `lib.rs:2393-2437` are unsuitable:
+  they inject empty or tag-only sets and do not accept arbitrary capability
+  dicts.
+- [x] Wait for both announcements before asserting a VRAM-weighted winner whose
+  node-id order would otherwise choose the other candidate.
+- [x] Add scoped narrowing, no-match → `None`, and node-id-0 disambiguation
+  where an existing safe test injector can represent it without weakening the
+  production surface.
+- [x] Add wrong-type, `NaN`, and infinity refusal tests plus finite clamp tests.
+- [x] Exercise the new synchronous methods on `AsyncNetMesh`; do not `await`
+  them.
+
+---
+
+## Part D — docs, coverage records, and generated skills
+
+Sequence: land and verify Parts 0 and A-C first. Every claim below must anchor
+to a symbol that exists, and weighted-selection prose is allowed only while the
+Part 0 inverse witnesses stay green.
+
+- [x] `docs/data/capabilities/event-bus.yaml`, "Capability discovery": change
+  the Node/TS anchor from `findNodes` to `findBestNode` and the Python anchor
+  from `find_nodes` to `find_best_node`; statuses remain `supported`, Python
+  remains `core-only`. Regenerate the generated skill matrix with
+  `.github/scripts/capability_records.py`.
+- [x] `.claude/skills/net-event-bus/bindings/coverage.md`: remove the stale
+  one-node-vs-list asymmetry; all bindings now expose both list and
+  single-winner discovery with idiomatic names.
+- [x] `.claude/skills/net-event-bus/capabilities.md`: replace the Node and
+  Python absence bullets with exact signatures and retain the local-index /
+  finite-weight contract.
+- [x] `docs/data/spine-symbols.yaml` `discover` lens: add
+  `findBestNode` / `findBestNodeScoped` to TypeScript and
+  `find_best_node` / `find_best_node_scoped` to Python.
+- [x] Update `web/src/content/docs/sdk/discover/rust.md` together with the new
+  TypeScript and Python best-node paragraphs. The Rust page currently says
+  “highest-scoring” without describing the canonical tag-backed projection;
+  make all three pages agree on local index, finite clamped weights, tie-break,
+  scope-before-score, and no-match behavior.
+- [x] Sweep for stale absence and stale “weights always tie” claims:
+
+  ```bash
+  git grep -n -i -E 'no .*findBestNode|no .*find_best_node|find_best_node.*(zero|tie|lex)|weights.*not load-bearing' -- docs web .claude net go
+  ```
+
+---
 
 ## Verification
 
-- [ ] `cargo test` in `bindings/node` and `bindings/python` (conversion
-  unit tests compile + pass).
-- [ ] Node: build + `npm test` in `bindings/node` (regenerates the napi
-  typings — confirm `findBestNode` appears); `npm test` in `sdk-ts`.
-- [ ] Python: maturin build + pytest in `bindings/python`
-  (`test_capabilities.py`).
-- [ ] `.github/scripts/check-skills.sh` — symbol list (`:199` already
-  names `find_best_node`; satisfied by Rust today, unchanged), coverage
-  record check, vocab check against the updated
-  `spine-symbols.yaml`.
-- [ ] Optional: extend `bindings/node/test/cross_lang_compat.test.ts`
-  if it covers discovery shapes — same requirement, same winner across
-  bindings.
+### Core gate
 
-## Open decisions
+- [x] Run the focused Part 0 Rust tests and record the exact test names/results.
+- [x] Run the containing capability-fold / mesh discovery test target.
 
-1. **Lift discovery into `net_sdk` (Python) / keep TS SDK-only?** Python
-   discovery stays `core-only` here (placement parity with `find_nodes`;
-   changing the mode is a bigger, separate decision that would touch the
-   whole discovery row, cf. `DOCS_SDK_SPINE_PLAN.md`). TS gets the
-   ergonomic method because `findNodes` already lives on the SDK
-   `MeshNode` there — no mode change either way.
-2. **`AsyncNetMesh` scoped variants.** `AsyncNetMesh` today has
-   `find_nodes` but not `find_nodes_scoped` — a pre-existing asymmetry.
-   This plan adds `find_best_node` there to match its `find_nodes`;
-   whether to also add the two scoped variants to `AsyncNetMesh` is
-   cheap but widens the diff. Default: add all of them in C1 unless
-   review prefers the minimal surface.
+### Node / TypeScript
+
+From `net/crates/net/bindings/node`:
+
+```bash
+npm run build
+npm run typecheck
+npm run typecheck:tests
+npm test
+```
+
+- [x] Confirm regenerated `index.d.ts` contains both native methods and the
+  expected `CapabilityRequirementJs` shape.
+
+From `net/crates/net/sdk-ts`:
+
+```bash
+npm run build
+npm test
+```
+
+### Python
+
+From `net/crates/net/bindings/python`, inside the repository's Python virtual
+environment:
+
+```bash
+cargo test
+maturin develop
+pytest tests/test_capabilities.py tests/test_stub_drift.py tests/test_pyi_stub_coverage.py
+```
+
+`maturin build` alone is not sufficient for pytest because it creates a wheel
+without installing the rebuilt extension.
+
+### Repository synchronization
+
+```bash
+.github/scripts/capability_records.py --check
+.github/scripts/check-skills.sh
+git diff --check
+git status --short
+```
+
+- [x] Confirm only intended implementation, tests, generated records, docs and
+  this plan changed.
+- [x] Confirm package declarations/stubs are synchronized with the runtime
+  surfaces.
+- [ ] Confirm exact-head CI is green before merge.
 
 ## Non-goals
 
-- No change to core scoring, `CapabilityRequirement`, the C ABI, the C
-  headers, or the Go module — all already correct.
-- No multi-hop or remote discovery semantics — `find_best_node` reads
-  the local index, same as `find_nodes`.
-- No `net_sdk` (sdk-py) wrapper re-export (Open Decision 1).
+- No change to the C ABI, C headers or Go API.
+- No second rich capability-state sidecar; canonical fold tags and
+  `CapabilitySet::views()` remain the projection path.
+- No multi-hop or remote-query semantics; discovery reads the local fold.
+- No Python `net_sdk` wrapper re-export.
+- No new scoring dimensions or normalization constants beyond proving and
+  preserving the four existing core weights.
+
+---
+
+## Outcome (implemented 2026-08-06)
+
+Landed as five commits — core snapshot + comments, core witnesses, Node/TS,
+Python, docs/records — then four more from review, recorded under
+[Review round](#review-round-2026-08-06) below.
+
+**The stop gate passed.** All four weighted axes move the winner against a
+two-candidate fold whose node-id order is the opposite of its capacity order.
+Ground-truth item 3 was correct: the Phase 3b note claiming the weights read
+zero described a fold payload that no longer exists, not live behavior.
+Canonical tags are the storage shape, `synthesize_capability_set` merges them,
+and `CapabilitySet::views()` decodes hardware and models back for scoring.
+
+### Deviations from the plan as written
+
+- **`best_by_score` was deleted, not re-commented.** 0.1 routed both
+  `find_best_node*` through the new bridge helper, which left it with no
+  callers. 0.2's "update its comments" had nothing to attach to. The stale
+  scoring claim it carried now lives, corrected, on `find_best_node`.
+- **`same_subnet_resolver` was extracted on `MeshNode`.** `find_best_node_scoped`
+  needs the same fold-pure closure `find_nodes_by_filter_scoped` builds.
+  Duplicating a security-relevant closure invites drift, so both now share one.
+- **PyO3 unit tests call `Python::initialize()`.** The crate is a `cdylib`
+  without pyo3's `auto-initialize`, so `Python::attach` panics in a `cargo test`
+  binary. A `with_py` test helper starts the interpreter; production is
+  untouched.
+- **`maturin develop` is not on PATH locally; `uv sync` builds the extension
+  from source.** The verification block's maturin step is still the right
+  instruction for a machine that has it.
+
+### Found while implementing — both since fixed
+
+Both predate this work. They were left out of the parity commits because each
+is a behavior change deserving its own decision; both were then fixed on this
+branch once that decision was made. Kept here as the record of what the parity
+work surfaced.
+
+1. **The TS SDK's memory and VRAM filter axes never reach the native layer.**
+   `NapiCapabilityFilter` in `sdk-ts/src/capabilities.ts` declares
+   `minMemoryMb` / `minVramMb`, but napi generates `minMemoryGb` / `minVramGb`
+   from `CapabilityFilterJs` (confirmed in the regenerated `index.d.ts`). The
+   keys never match, so both filters are silently dropped and the query is
+   wider than the caller asked for — the unit mismatch is a second bug behind
+   the first. `test/capabilities.test.ts` passes `minVramMb: 16_384` and still
+   passes, because the assertion holds without the filter. This now also
+   affects `findBestNode`, whose `filter` rides the same converter. Fixing it
+   narrows queries that today return extra nodes.
+
+   Fixed in `8a380ef95` by renaming to the gigabyte spellings the native layer
+   reads, in the public interface as well as the converter, and rescaling every
+   literal. Source-breaking on purpose: silently honouring a `16_384` that
+   meant megabytes trades "too many results" for "none".
+2. ~~**`net-event-bus`'s SKILL.md description is 3011 chars against a 3000
+   budget.**~~ **Wrong — the description is 2991 characters and within budget.**
+   `check-skills.sh` measured it with `open(path).read()`, no encoding, so on a
+   cp1252 shell every em-dash decoded as three characters. The stash test
+   proved only that the failure was not mine; it did not test whether the
+   finding was real, and stopping there is what let a false positive be
+   recorded as a defect. Fixed in `0dc375352` by pinning the encoding — which
+   then exposed several checkers that had been reporting success without
+   running at all, and `964cc6857` after review closed the rest.
+
+### Review round (2026-08-06)
+
+Four more commits, each addressing a finding no local check could have caught:
+
+- **`ec1ec5ded` — scoring ran under both fold read guards.** The caller's
+  `score` closure was invoked inside `with_state_and_index`. Coherence needed
+  the capability sets to come from one read, not the guards held across
+  scoring; a scorer that touched the fold would have deadlocked, and every
+  scorer stalled writers across candidate-controlled work. Candidate synthesis
+  now returns owned pairs and scoring happens after the guards drop.
+- **The snapshot witness was vacuous.** It evicted before the query started, so
+  the split-read shape passed it too. The scorer now evicts mid-selection,
+  which is only possible with the guards released. Confirmed to fail against a
+  reinstated per-candidate re-read.
+- **`46bea0f04` — the SDK peered `@net-mesh/core >=0.34.0`** while calling
+  `findBestNode` unconditionally; the published 0.34.0 core has no such symbol.
+  Raised to `>=0.35.0`, the same boundary the filter rename already documents.
+  Cutting 0.35.0 across the workspace remains a release-time action.
+- **`964cc6857` — the checker repair was incomplete.** `run_checker` still
+  discarded the exit status, two Python calls bypassed it, `python3` was
+  hard-coded (fatal where Python installs as `python`, or where the Store shim
+  squats on the name), and `check-docs.sh` had the pre-fix shape entirely. The
+  runner is now shared and status-aware.
+
+Two documentation corrections went with them: the `findBestNode` JSDoc example
+awaited a synchronous `openStream` and omitted its required config, and all
+three discover pages described the weights as read from "announced capability
+tags", which exposes the canonical fold storage shape and reads as though an
+application's own `tags` drive scoring.
+
+### Verification actually run
+
+Green: the seven core witnesses and the full `--lib capability` set (274);
+`tests/capability_scope.rs` (8); NAPI converter unit tests (11) and the node
+binding's vitest suite (555, after `npm run build:ts` — four `meshdb` failures
+before that were missing build artifacts, not code); `sdk-ts` (436 across 25
+files, including 8 new); PyO3 converter unit tests (7); pytest
+`test_capabilities.py` + `test_pyi_stub_coverage.py` (34) and
+`test_stub_drift.py` + ABI/interop/cross-lang (168); `capability_records.py
+--check`; `check-spine-symbols.py`; `check-docs.sh`; `cargo fmt`.
+
+After the review round, all three shell checkers (`check-skills.sh`,
+`check-docs.sh`, `check-skills-depth.sh`) plus `capability_records.py --check`,
+its self-test and `check-spine-symbols.py` exit 0 on Windows with no
+environment workarounds — previously `check-docs.sh` needed
+`MSYS_NO_PATHCONV=1` to avoid 78 phantom findings and `check-skills.sh` needed
+a `python3` shim.
+
+Not green locally, pre-existing and reproduced without this change: the full
+pytest run dies inside `test_capability_gateway.py` on a locally-built
+extension missing feature-gated symbols (that file passes in isolation), the
+`sensing_*` integration test binaries need `--features fixtures`, and
+`tests/doc_link_guard.rs` fails on dangling links in
+`RELEASE_v0.34_HOTEL_CALIFORNIA.md`, which arrived on `master` in `c28b8d6fb`.

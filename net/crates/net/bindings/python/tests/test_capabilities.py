@@ -8,9 +8,14 @@ integration suite (`tests/capability_broadcast.rs`).
 
 from __future__ import annotations
 
+import contextlib
+import threading
+import time
+from collections.abc import Iterator
+
 import pytest
 
-from net import NetMesh, normalize_gpu_vendor
+from net import AsyncNetMesh, NetMesh, normalize_gpu_vendor
 
 
 PSK = "42" * 32
@@ -367,5 +372,222 @@ def test_find_nodes_scoped_regions_with_only_empty_strings_raises() -> None:
                     {"require_tags": ["relay-capable"]},
                     {"kind": "regions", "regions": regions},
                 )
+    finally:
+        m.shutdown()
+
+
+# -------------------------------------------------------------------------
+# Single-winner discovery (`find_best_node` / `find_best_node_scoped`)
+# -------------------------------------------------------------------------
+#
+# Scoring semantics live in the substrate and are pinned there by the
+# four inverse witnesses in `capability_bridge.rs`. What these tests
+# own is the Python side of the boundary: the dict conversion, the
+# refusal of weights that cannot be clamped meaningfully, and that a
+# weight set from Python still reaches the scorer and moves the winner.
+
+
+def _gpu_caps(vram_gb: int, model: str) -> dict:
+    return {
+        "hardware": {"gpu": {"vendor": "nvidia", "model": model, "vram_gb": vram_gb}},
+        "tags": ["gpu-pool"],
+    }
+
+
+@contextlib.contextmanager
+def _vram_pool(seed: int) -> Iterator[tuple[NetMesh, int, int]]:
+    """One querier connected to two announcing peers.
+
+    Yields ``(querier, low_id, high_id)`` where the peer holding the
+    HIGHER node id was given the BIGGER GPU. Node ids derive from a
+    fresh keypair per node, so which peer sorts first is not knowable
+    until runtime — hence the sort. Without it, a run where the strong
+    peer happened to hold the lower id would pass even with a dead
+    weight, because the lowest id is exactly what an unweighted query
+    returns.
+
+    The querier announces nothing, so it never self-indexes and the
+    only candidates are the two peers.
+    """
+    q = NetMesh(_port(seed), PSK, heartbeat_interval_ms=200)
+    p1 = NetMesh(_port(seed + 1), PSK, heartbeat_interval_ms=200)
+    p2 = NetMesh(_port(seed + 2), PSK, heartbeat_interval_ms=200)
+    try:
+        for peer, addr in ((p1, _port(seed + 1)), (p2, _port(seed + 2))):
+            errors: list[Exception] = []
+
+            def _accept(peer: NetMesh = peer, errors: list = errors) -> None:
+                try:
+                    peer.accept(q.node_id)
+                except Exception as e:  # noqa: BLE001
+                    errors.append(e)
+
+            t = threading.Thread(target=_accept, daemon=True)
+            t.start()
+            time.sleep(0.05)
+            q.connect(addr, peer.public_key, peer.node_id)
+            t.join(timeout=5)
+            if errors:
+                raise errors[0]
+        q.start()
+        p1.start()
+        p2.start()
+
+        low, high = sorted((p1, p2), key=lambda m: m.node_id)
+        low.announce_capabilities(_gpu_caps(8, "weak"))
+        high.announce_capabilities(_gpu_caps(80, "strong"))
+
+        # Both announcements must be visible before a winner means
+        # anything: a query that has seen only one peer returns that
+        # peer whatever the weights say.
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if len(q.find_nodes({"require_tags": ["gpu-pool"]})) == 2:
+                break
+            time.sleep(0.025)
+        else:
+            raise AssertionError("both announcements did not arrive within 5 s")
+
+        yield q, low.node_id, high.node_id
+    finally:
+        for m in (q, p1, p2):
+            m.shutdown()
+
+
+def test_find_best_node_prefers_more_vram_over_lower_node_id() -> None:
+    with _vram_pool(40) as (q, low_id, high_id):
+        pool = {"filter": {"require_tags": ["gpu-pool"]}}
+        # Unweighted: every match scores the same, so the tie-break
+        # decides. This half is what makes the next assertion mean
+        # something.
+        assert q.find_best_node(pool) == low_id
+        # Same fold, same candidates — only the weight changes.
+        assert q.find_best_node({**pool, "prefer_more_vram": 1.0}) == high_id
+
+
+def test_find_best_node_clamps_finite_out_of_range_weights() -> None:
+    with _vram_pool(45) as (q, low_id, high_id):
+        pool = {"filter": {"require_tags": ["gpu-pool"]}}
+        # 5.0 clamps to 1.0 in the substrate and selects like a full
+        # weight rather than raising — one clamp contract shared with
+        # Rust, Go, C and Node. -1.0 clamps to 0.0, "don't consult".
+        assert q.find_best_node({**pool, "prefer_more_vram": 5.0}) == high_id
+        assert q.find_best_node({**pool, "prefer_more_vram": -1.0}) == low_id
+        # An int is as natural a literal here as a float.
+        assert q.find_best_node({**pool, "prefer_more_vram": 1}) == high_id
+
+
+def test_find_best_node_scoped_filters_before_scoring() -> None:
+    m = NetMesh(_port(50), PSK)
+    try:
+        m.announce_capabilities(
+            {
+                "hardware": {
+                    "gpu": {"vendor": "nvidia", "model": "h100", "vram_gb": 80}
+                },
+                "tags": ["gpu-pool", "scope:tenant:oem-123"],
+            }
+        )
+        req = {"filter": {"require_tags": ["gpu-pool"]}, "prefer_more_vram": 1.0}
+        assert (
+            m.find_best_node_scoped(req, {"kind": "tenant", "tenant": "oem-123"})
+            == m.node_id
+        )
+        # Out of scope: excluded before scoring, so its 80 GB GPU
+        # cannot buy it back in.
+        assert (
+            m.find_best_node_scoped(req, {"kind": "tenant", "tenant": "corp-acme"})
+            is None
+        )
+    finally:
+        m.shutdown()
+
+
+def test_find_best_node_returns_none_when_nothing_matches() -> None:
+    m = NetMesh(_port(52), PSK)
+    try:
+        # `None` means no match. A node id of 0 is a real id, so
+        # callers must test against `None` rather than truthiness —
+        # which is why this returns `None` and not 0.
+        assert m.find_best_node({"filter": {"require_tags": ["gpu"]}}) is None
+        m.announce_capabilities({"tags": ["gpu"]})
+        assert m.find_best_node({"filter": {"require_tags": ["gpu"]}}) == m.node_id
+    finally:
+        m.shutdown()
+
+
+def test_find_best_node_defaults_missing_filter_and_weights() -> None:
+    m = NetMesh(_port(54), PSK)
+    try:
+        m.announce_capabilities({"tags": ["gpu"]})
+        # An empty requirement is valid: match everything, prefer
+        # nothing. Same defaults the C ABI's JSON DTO applies.
+        assert m.find_best_node({}) == m.node_id
+    finally:
+        m.shutdown()
+
+
+def test_find_best_node_rejects_non_finite_weights() -> None:
+    m = NetMesh(_port(56), PSK)
+    try:
+        m.announce_capabilities({"tags": ["gpu"]})
+        req = {"filter": {"require_tags": ["gpu"]}}
+        axes = (
+            "prefer_more_memory",
+            "prefer_more_vram",
+            "prefer_faster_inference",
+            "prefer_loaded_models",
+        )
+        # `nan` survives clamping and then loses every score
+        # comparison, so a weighted requirement would silently select
+        # as if unweighted. `inf` clamps to a value the caller never
+        # wrote. Both are the wrong VALUE, hence ValueError.
+        for axis in axes:
+            for bad in (float("nan"), float("inf"), float("-inf")):
+                with pytest.raises(ValueError):
+                    m.find_best_node({**req, axis: bad})
+    finally:
+        m.shutdown()
+
+
+def test_find_best_node_rejects_wrong_types() -> None:
+    m = NetMesh(_port(58), PSK)
+    try:
+        # A non-numeric weight and a non-dict filter are the wrong
+        # TYPE, distinct from the ValueError a non-finite number
+        # raises. Neither may be silently ignored: a dropped filter
+        # would widen the query to the whole mesh.
+        with pytest.raises(TypeError):
+            m.find_best_node({"prefer_more_vram": "1.0"})
+        with pytest.raises(TypeError):
+            m.find_best_node({"filter": "require_tags"})
+    finally:
+        m.shutdown()
+
+
+def test_async_mesh_exposes_synchronous_local_discovery() -> None:
+    m = NetMesh(_port(60), PSK)
+    try:
+        am = AsyncNetMesh(m)
+        m.announce_capabilities(
+            {
+                "hardware": {
+                    "gpu": {"vendor": "nvidia", "model": "h100", "vram_gb": 80}
+                },
+                "tags": ["gpu-pool", "scope:tenant:oem-123"],
+            }
+        )
+        tags = {"require_tags": ["gpu-pool"]}
+        tenant = {"kind": "tenant", "tenant": "oem-123"}
+        req = {"filter": tags, "prefer_more_vram": 1.0}
+
+        # All four read the local fold and return the value directly.
+        # They are NOT awaitable — awaiting a plain list or int raises
+        # TypeError, so returning the value IS the contract.
+        assert am.find_nodes(tags) == [m.node_id]
+        assert am.find_nodes_scoped(tags, tenant) == [m.node_id]
+        assert am.find_best_node(req) == m.node_id
+        assert am.find_best_node_scoped(req, tenant) == m.node_id
+        assert am.find_best_node_scoped(req, {"kind": "tenant", "tenant": "x"}) is None
     finally:
         m.shutdown()
