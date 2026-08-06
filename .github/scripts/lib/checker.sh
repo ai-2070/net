@@ -61,14 +61,37 @@ if [ -z "$PYTHON" ]; then
   exit 1
 fi
 
+# Warning categories that say something about the interpreter or a dependency
+# and nothing about the corpus. They are silenced at the source, because
+# `run_checker` below treats whatever is left on stderr as a reason to distrust
+# the verdict — and that rule is only safe if benign noise never gets there.
+#
+# Python's own default filters already hide `DeprecationWarning` *except* in
+# `__main__`, which is precisely where these single-file checkers live: a
+# deprecation on a checker's own module-level `import` does reach stderr, and
+# would have failed the build with "treat its verdict as unrun" for a checker
+# that ran perfectly.
+#
+# The list is deliberately short and enumerated rather than pattern-matched. A
+# category not named here still fails the run, which is the right default:
+# widening it is a deliberate edit a reviewer sees, not a regex that quietly
+# swallows the next real diagnostic.
+PYTHON_WARN_FLAGS=(
+  -W ignore::DeprecationWarning
+  -W ignore::PendingDeprecationWarning
+  -W ignore::ImportWarning
+  -W ignore::ResourceWarning
+)
+
 # Run one of the sibling Python checkers, with any extra args passed through.
 # Findings arrive on stdout, one per line, and each becomes a `note`.
 #
-# Three outcomes, and telling them apart is the whole point:
+# Four outcomes, and telling them apart is the whole point:
 #
-#   exit 0, silent      the corpus is clean
-#   exit 1 with output  the corpus drifted; every line becomes a `note`
-#   anything else       the CHECKER failed, which is also a `note`
+#   exit 0, silent           the corpus is clean
+#   exit 1 with output       the corpus drifted; every line becomes a `note`
+#   exit non-0, no output    the CHECKER died before it had a verdict
+#   anything on stderr       the checker said something it was not asked to
 #
 # A checker exits non-zero precisely when it HAS findings, so under `pipefail`
 # these calls need their status suppressed — and suppressing it is exactly what
@@ -78,15 +101,23 @@ fi
 # `check-skill-vocab.py` and `check-skill-refs.py` raised UnicodeDecodeError on
 # the first source file containing an em-dash, every run, reported as success.
 #
-# Deciding from stderr alone is not enough either. A checker can die with a
-# status and no diagnostic — `sys.exit(2)`, a segfault in a C extension, an OOM
-# kill — so the status is checked too, and any status that is not the documented
-# 0-or-1 is a failure of the checker rather than a verdict from it.
+# That case — exit 1, a traceback, no findings — is caught by the STATUS rule,
+# not by the stderr one. It used to be the other way round, which made the
+# stderr rule load-bearing for the defect this whole file exists to prevent and
+# left it unable to soften for a mere warning without reopening it. The status
+# rule now stands alone: a checker that exits non-zero having written no finding
+# has not audited anything, traceback or not.
+#
+# Status alone is still not enough. A checker can die with a status and no
+# diagnostic — `sys.exit(2)`, a segfault in a C extension, an OOM kill — and can
+# equally write a diagnostic and exit 0, having skipped whatever it was
+# complaining about. So both are checked, in order of how precisely they name
+# the cause, and exactly one note is emitted per failed run.
 run_checker() {
   local script="$1"; shift
   local err out status
   err="$TMP/$(basename "$script").err"
-  out=$("$PYTHON" "$CHECKER_DIR/$script" "$@" 2>"$err")
+  out=$("$PYTHON" "${PYTHON_WARN_FLAGS[@]}" "$CHECKER_DIR/$script" "$@" 2>"$err")
   status=$?
   if [ -n "$out" ]; then
     while IFS= read -r line; do
@@ -95,11 +126,16 @@ run_checker() {
   fi
   if [ "$status" -gt 1 ]; then
     note "$script exited $status, which is neither clean nor findings — treat its verdict as unrun"
-  elif [ "$status" -ne 0 ] && [ -z "$out" ] && [ ! -s "$err" ]; then
-    note "$script exited $status but reported nothing — treat its verdict as unrun"
+  elif [ "$status" -ne 0 ] && [ -z "$out" ]; then
+    note "$script exited $status without writing a finding — treat its verdict as unrun"
+  elif [ -s "$err" ]; then
+    # Reached only when the status was within contract, so this is a checker
+    # that ran and also had something to say. Silence it at the source if it is
+    # noise (see `PYTHON_WARN_FLAGS`); everything else is a checker inspecting
+    # less than it claims.
+    note "$script wrote to stderr — treat its verdict as unrun: $(tail -1 "$err")"
   fi
   if [ -s "$err" ]; then
-    note "$script wrote to stderr — treat its verdict as unrun: $(tail -1 "$err")"
     sed 's/^/      /' "$err" >&2
   fi
 }
