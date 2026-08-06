@@ -7758,6 +7758,21 @@ mod roster_fallback_tests {
         let org_b = OrgKeypair::from_bytes([0x42u8; 32]);
         let node_cert =
             OrgMembershipCert::try_issue(&org_b, node_entity.clone(), 1, 3600).expect("node cert");
+        // The directory is deliberately LEFT BEHIND when the test finishes, and
+        // that is not an oversight. It holds the authority's revocation
+        // `.lock` sidecar, and `OrgRevocationStore` keys its PROCESS-GLOBAL
+        // core registry by that sidecar's `(device, inode)` so two path
+        // aliases of one sidecar share one live view (AV-9). Deleting it frees
+        // the inode while this node's core is still registered; Linux recycles
+        // a freed inode immediately, so the NEXT store opened anywhere in this
+        // test binary can land on it, derive the same `BackingId`, and join
+        // THIS test's core — reading its floors, its poison bit and its
+        // generation, and writing to a path that no longer exists.
+        //
+        // The victims are whichever tests are scheduled next, so it surfaces
+        // as unrelated failures in varying combinations rather than as one
+        // deterministic break. Only the deletion at the START of the helper
+        // remains, and it can free nothing: the path is per-test.
         let dir = std::env::temp_dir().join(format!("net-oa2-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let authority =
@@ -7821,7 +7836,7 @@ mod roster_fallback_tests {
             }
         }
 
-        let (server, node_entity, org_b, dir) = protected_provider("b2").await;
+        let (server, node_entity, org_b, _dir) = protected_provider("b2").await;
         const CALLER_NODE: u64 = 0x9b;
         let caller_kp = EntityKeypair::generate();
         let caller_origin = caller_kp.entity_id().origin_hash();
@@ -7895,8 +7910,6 @@ mod roster_fallback_tests {
             1,
             "the replayed proof was DENIED across re-registration (node-owned guard)",
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Kyra #47 B2 (cross-service): the node-owned replay guard keys on
@@ -7928,7 +7941,7 @@ mod roster_fallback_tests {
             }
         }
 
-        let (server, node_entity, org_b, dir) = protected_provider("b2-xsvc").await;
+        let (server, node_entity, org_b, _dir) = protected_provider("b2-xsvc").await;
         const CALLER_NODE: u64 = 0x9c;
         let caller_kp = std::sync::Arc::new(EntityKeypair::generate());
         let caller_origin = caller_kp.entity_id().origin_hash();
@@ -8063,7 +8076,6 @@ mod roster_fallback_tests {
 
         drop(serve_a);
         drop(serve_b);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Kyra #47 mixed-version: `strip_public_admission_header` removes ONLY the
@@ -8743,8 +8755,6 @@ mod roster_fallback_tests {
         assert_eq!(admitted.provider_org, org_b.org_id(), "provider org B");
         assert_eq!(admitted.provider, node_entity, "exact provider P");
         assert_eq!(admitted.capability, cap, "capability C");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// §T1 — a byte-identical REPLAY of an admitted proof frame is denied, and
@@ -8921,8 +8931,6 @@ mod roster_fallback_tests {
             1,
             "a wire-tampered proof must never reach the handler",
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// E1 fail-closed, end-to-end: a REQUEST whose proof binds a DIFFERENT
@@ -9059,8 +9067,6 @@ mod roster_fallback_tests {
             1,
             "the tampered-binding call was denied (handler never ran for it)",
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// E2.1 witness 26: the CALLER-side proof builder — `sign_admission_proof`,
@@ -9180,8 +9186,6 @@ mod roster_fallback_tests {
         assert_eq!(admitted.caller, caller_entity);
         assert_eq!(admitted.provider, node_entity);
         assert_eq!(admitted.capability, cap);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// E1 witness 10 (cross-org), end-to-end: a caller in org A holding a
@@ -9311,8 +9315,6 @@ mod roster_fallback_tests {
             admitted.acting_org, admitted.provider_org,
             "cross-org: A and B are distinct",
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// OA-4 slice 2 (Tier 2) — the cross-org `CrossOrgGranted` DENIAL matrix,
@@ -9732,8 +9734,6 @@ mod roster_fallback_tests {
             "exactly the two genuine calls admitted — every adversarial frame was denied \
              (handler dark) and the replay of the first genuine call was refused",
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// OA-4 slice 3 (Tier 2) — the OwnerDelegated DENIAL matrix, table-driven
@@ -10109,8 +10109,6 @@ mod roster_fallback_tests {
             "exactly the two genuine calls admitted — every adversarial frame was denied \
              (handler dark) and the replay of the first genuine call was refused",
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// OA-4 slice 5 (review-7 RED) — `OrgAdmission` is load-bearing, independent
@@ -10407,7 +10405,6 @@ mod roster_fallback_tests {
         );
 
         drop(serve_disabled);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Kyra #47 B1: the gate binds the AUTHENTICATED session entity's origin to
@@ -10528,8 +10525,6 @@ mod roster_fallback_tests {
             1,
             "the origin-mismatched call was denied — the handler stayed dark",
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Like [`build_server`], but installs a channel-config registry that
