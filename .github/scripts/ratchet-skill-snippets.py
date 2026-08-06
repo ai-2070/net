@@ -21,13 +21,23 @@ import pathlib
 import re
 import sys
 
+# Every check in this suite prints its verdict with U+2713 / U+2717, and some
+# of the identifiers it echoes carry em-dashes. Python picks stdout's encoding
+# from the platform, so on a cp1252 console those characters raise
+# UnicodeEncodeError mid-report — the checker dies partway through and its
+# caller sees a truncated run rather than a verdict. Force UTF-8 so the output
+# is the same everywhere the checker runs.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
 
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
         return 2
 
-    log = pathlib.Path(sys.argv[1]).read_text()
+    log = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
     # Lines look like: `  .claude/skills/x/y.md:123  (snippet 4, generated line 261)`
     failing = {}
     for m in re.finditer(r"^\s+(\.claude/skills/\S+\.md):(\d+)\s+\(snippet", log, re.M):
@@ -40,7 +50,7 @@ def main():
     removed = 0
     for path, lines in sorted(failing.items()):
         p = pathlib.Path(path)
-        text = p.read_text().splitlines(keepends=True)
+        text = p.read_text(encoding="utf-8").splitlines(keepends=True)
         # `line` is the marker's own 1-based line. Delete highest first so
         # earlier indices stay valid.
         for line in sorted(lines, reverse=True):

@@ -37,6 +37,16 @@ import shutil
 import subprocess
 import sys
 
+# Every check in this suite prints its verdict with U+2713 / U+2717, and some
+# of the identifiers it echoes carry em-dashes. Python picks stdout's encoding
+# from the platform, so on a cp1252 console those characters raise
+# UnicodeEncodeError mid-report — the checker dies partway through and its
+# caller sees a truncated run rather than a verdict. Force UTF-8 so the output
+# is the same everywhere the checker runs.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 SKILLS = ROOT / ".claude/skills"
 PREAMBLE = ROOT / ".github/skill-snippets/rust-preamble.rs"
@@ -51,7 +61,7 @@ def scan():
     """(marked, totals, errors). `marked` is [(file, lang, body, line)]."""
     marked, totals, errors = [], {}, []
     for md in sorted(SKILLS.rglob("*.md")):
-        text = md.read_text()
+        text = md.read_text(encoding="utf-8")
         rel = md.relative_to(ROOT)
 
         for m in FENCE.finditer(text):
@@ -95,7 +105,7 @@ def build_crate(marked):
         shutil.rmtree(OUT)
     (OUT / "src").mkdir(parents=True)
 
-    preamble = PREAMBLE.read_text()
+    preamble = PREAMBLE.read_text(encoding="utf-8")
     mods, index = [], []
     for i, (rel, _lang, body, line) in enumerate(marked):
         # Everything is wrapped in a function body, unconditionally. Rust allows
@@ -226,7 +236,7 @@ def main():
                 if f"snippet_{i}" in out:
                     print(f"  from {rel}:{line}  (mod snippet_{i})")
         print("\n--- preamble in scope for every snippet ---")
-        print("\n".join("  " + l for l in PREAMBLE.read_text().splitlines()))
+        print("\n".join("  " + l for l in PREAMBLE.read_text(encoding="utf-8").splitlines()))
         print("\n--- cargo ---")
         print("\n".join("  " + l for l in out.splitlines()[:60]))
         return 1

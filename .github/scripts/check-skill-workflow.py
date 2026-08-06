@@ -52,6 +52,16 @@ import re
 import subprocess
 import sys
 
+# Every check in this suite prints its verdict with U+2713 / U+2717, and some
+# of the identifiers it echoes carry em-dashes. Python picks stdout's encoding
+# from the platform, so on a cp1252 console those characters raise
+# UnicodeEncodeError mid-report — the checker dies partway through and its
+# caller sees a truncated run rather than a verdict. Force UTF-8 so the output
+# is the same everywhere the checker runs.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
 WORKFLOW = pathlib.Path(".github/workflows/skills.yml")
 SKILLS = pathlib.Path(".claude/skills")
 CITED = re.compile(r"`((?:net|go|web)/[A-Za-z0-9_/.-]+)`")
@@ -66,7 +76,7 @@ def norm(expr):
 def trigger_globs():
     """Every quoted entry under a `paths:` block, until the block dedents."""
     globs, in_paths = set(), False
-    for line in WORKFLOW.read_text().splitlines():
+    for line in WORKFLOW.read_text(encoding="utf-8").splitlines():
         if re.match(r"^\s+paths:\s*$", line):
             in_paths = True
             continue
@@ -109,7 +119,7 @@ def to_regex(glob):
 def cited_paths():
     paths = set()
     for md in SKILLS.rglob("*.md"):
-        for hit in CITED.findall(md.read_text()):
+        for hit in CITED.findall(md.read_text(encoding="utf-8")):
             paths.add(re.sub(r":[0-9,-]*$", "", hit))
     return paths
 
@@ -141,7 +151,7 @@ def jobs_and_gating():
     advisory_next = in_needs_block = False
     in_if_block = False
 
-    for line in WORKFLOW.read_text().splitlines():
+    for line in WORKFLOW.read_text(encoding="utf-8").splitlines():
         if re.match(r"^jobs:\s*$", line):
             in_jobs = True
             continue

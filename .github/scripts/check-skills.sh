@@ -40,6 +40,32 @@ trap 'rm -rf "$TMP"' EXIT
 note() { printf '  \033[31m✗\033[0m %s\n' "$1"; fail=$((fail + 1)); }
 ok()   { printf '  \033[32m✓\033[0m %s\n' "$1"; }
 
+# Run one of the sibling Python checkers. Findings arrive on stdout, one per
+# line, and each becomes a `note`.
+#
+# Anything on stderr is treated as a failure of the CHECKER, not of the corpus.
+# Without that, a checker that dies before reporting anything writes zero
+# findings, `fail` never moves, and the `[ "$fail" -eq "$before" ]` line below
+# prints a green tick for a check that did not run. That is not hypothetical:
+# on a cp1252 shell, `check-skill-vocab.py` and `check-skill-refs.py` raised
+# UnicodeDecodeError on the first source file containing an em-dash — every
+# run, reported as success. The `|| true` these calls need (a checker exits
+# non-zero when it has findings, and `pipefail` is on) is exactly what hid it.
+run_checker() {
+  local script="$1" err out
+  err="$TMP/$(basename "$script").err"
+  out=$(python3 "$(dirname "$0")/$script" 2>"$err" || true)
+  if [ -n "$out" ]; then
+    while IFS= read -r line; do
+      [ -n "$line" ] && note "$line"
+    done <<<"$out"
+  fi
+  if [ -s "$err" ]; then
+    note "$script did not run to completion: $(tail -1 "$err")"
+    sed 's/^/      /' "$err" >&2
+  fi
+}
+
 # The corpus, at any depth. One definition, used by every check below, so a file
 # is never visible to some checks and invisible to others — three of them used
 # to stop at `*/*.md`, which a `bindings/rust.md` sits one level below.
@@ -70,9 +96,16 @@ for skill in "$SKILLS"/*/SKILL.md; do
   fi
   # A description is loaded into context for every session in every project
   # where the skill is installed. Keep it a budget, not a dumping ground.
+  #
+  # `encoding="utf-8"` is load-bearing, not decoration. Python's default
+  # encoding is the platform's, so on a cp1252 Windows shell each em-dash in
+  # these descriptions decoded as three characters instead of one — enough to
+  # put net-event-bus 11 over budget locally while CI, reading UTF-8, saw it
+  # 9 under. A checker whose verdict depends on the developer's locale is
+  # worse than no checker: it trains people to ignore it.
   len=$(python3 - "$skill" <<'PY'
 import re, sys
-t = open(sys.argv[1]).read()
+t = open(sys.argv[1], encoding="utf-8").read()
 m = re.search(r'^description:\s*"(.*?)"\s*$', t, re.S | re.M)
 print(len(m.group(1)) if m else 0)
 PY
@@ -166,9 +199,7 @@ done < <(grep -ohE '`(net|go|web)/[A-Za-z0-9_/.-]+`' $(skill_md) \
 # mirror publishes anyway, reads as coverage while providing none.
 echo "==> Workflow wiring (triggers + publish gating)"
 before=$fail
-while read -r line; do
-  [ -n "$line" ] && note "$line"
-done < <(python3 "$(dirname "$0")/check-skill-workflow.py" || true)
+run_checker check-skill-workflow.py
 [ "$fail" -eq "$before" ] && ok "triggers cover every cited path; every job gates publish"
 
 # ------------------------------------------------------------ symbol canaries
@@ -211,9 +242,7 @@ done
 # for what each catches and why symbol-existence alone was not enough.
 echo "==> Enum variants and metric/config identifiers"
 before=$fail
-while read -r line; do
-  [ -n "$line" ] && note "$line"
-done < <(python3 "$(dirname "$0")/check-skill-refs.py" || true)
+run_checker check-skill-refs.py
 [ "$fail" -eq "$before" ] && ok "documented variants and identifiers all resolve"
 
 # ------------------------------------------------- cross-language vocabularies
@@ -222,9 +251,7 @@ done < <(python3 "$(dirname "$0")/check-skill-refs.py" || true)
 # drift silently — the nRPC kind table was missing two real wire kinds.
 echo "==> Cross-language vocabularies"
 before=$fail
-while read -r line; do
-  [ -n "$line" ] && note "$line"
-done < <(python3 "$(dirname "$0")/check-skill-vocab.py" || true)
+run_checker check-skill-vocab.py
 [ "$fail" -eq "$before" ] && ok "documented vocabularies match every binding"
 
 # ------------------------------------------------------------ coverage matrices
