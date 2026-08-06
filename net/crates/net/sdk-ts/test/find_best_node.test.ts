@@ -207,19 +207,32 @@ describe('MeshNode.findBestNodeScoped', () => {
     );
   });
 
+  it('keeps untagged peers visible under a tenant nobody claimed', async () => {
+    const { q, peers } = await trio();
+    await stageByVram(peers, 8, 80);
+    expect(await waitUntil(() => q.findNodes(POOL.filter).length === 2)).toBe(true);
+
+    // Neither peer carries a `scope:*` tag, and an untagged peer resolves
+    // to Global — which `tenant` admits by design. Naming a tenant nobody
+    // claimed narrows nothing, so a winner still comes back. This is the
+    // shape that makes the next test's `null` mean something: not every
+    // scope can empty a set.
+    expect(
+      q.findBestNodeScoped(POOL, { kind: 'tenant', tenant: 'nobody' }),
+    ).not.toBeNull();
+  });
+
   it('returns null when the scope admits nobody', async () => {
     const { q, peers } = await trio();
     await stageByVram(peers, 8, 80);
     expect(await waitUntil(() => q.findNodes(POOL.filter).length === 2)).toBe(true);
 
-    expect(
-      q.findBestNodeScoped(POOL, { kind: 'tenant', tenant: 'nobody' }),
-    ).not.toBeNull();
-    // Both peers are untagged, and untagged peers resolve to Global —
-    // which `tenant` admits by design. `globalOnly` is the filter that
-    // would exclude a tenant-tagged peer, so use a scope that can
-    // genuinely empty the set: subnet-local peers under `sameSubnet`
-    // with no policy configured.
+    // `sameSubnet` with no subnet policy configured is the scope that can
+    // genuinely empty a set of untagged peers: every candidate but the
+    // querier itself is unresolvable, and unresolved is excluded. The
+    // unscoped query on the same fold still finds both, so this is an
+    // empty scope rather than an empty fold.
+    expect(q.findNodes(POOL.filter)).toHaveLength(2);
     expect(q.findBestNodeScoped(POOL, { kind: 'sameSubnet' })).toBeNull();
   });
 });
