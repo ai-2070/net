@@ -1676,85 +1676,16 @@ jobs:
       # `integration_test.go` gates its suite behind RUN_INTEGRATION_TESTS=1
       # so local developers can run quick unit-style passes without the
       # full mesh setup. CI wants the full coverage.
+      #
+      # Through the shared runner so a hang reports NATIVE frames rather than
+      # stopping at the cgo boundary — see that script for why, and for why
+      # every Go suite entry point in this job has to go through it.
       - name: Run Go tests
         working-directory: go
         env:
           LD_LIBRARY_PATH: ${{ github.workspace }}/net/crates/net/target/release
           RUN_INTEGRATION_TESTS: "1"
-          # A test-timeout panic in this package stops at the cgo boundary.
-          # `TestLiveSubnetExportedCallFromAGeneratedScenario` has twice
-          # reported 9 minutes inside `_Cfunc_net_mesh_announce_capabilities`
-          # with nothing under it — and the Rust frames it is not printing are
-          # the half that would say what is actually stuck. Every fix attempted
-          # off that trace has been inference.
-          #
-          # `crash` turns the panic into a SIGABRT, and the core it leaves
-          # carries native frames for every thread, including the runtime
-          # workers no goroutine dump can see. The step below reads them back.
-          # Costs nothing on a green run: nothing aborts, so no core is written.
-          GOTRACEBACK: crash
-        # Compiled to a fixed path instead of run through `go test`, because
-        # postmortem symbolization needs the binary to still exist — `go test`
-        # builds into a temp dir and deletes it, which would leave gdb with a
-        # core and nothing to map it against.
-        #
-        # Coverage is unchanged: `./...` resolves to this one package here
-        # (`example/` carries its own go.mod, so it was never in that set).
-        # `-test.timeout` has to be spelled out because a test binary run
-        # directly defaults to NO timeout — inheriting `go test`'s implicit 10m
-        # is exactly what must not silently change, or a hang stops tripping
-        # the alarm this step exists to capture.
-        #
-        # The dump runs INLINE here rather than in a `failure()`-gated step of
-        # its own. That is the whole point: a separate step puts the stacks in a
-        # separate log block, and the block anyone reads — or copies out of a
-        # failing run — is the one that went red. Two runs' worth of native
-        # stacks were captured into a step nobody was looking at. Same output,
-        # attached to the failure it explains.
-        run: |
-          ulimit -c unlimited
-          sudo sysctl -w kernel.core_pattern=/tmp/core.%e.%p
-          go test -c -o /tmp/go-net.test .
-
-          set +e
-          /tmp/go-net.test -test.v -test.timeout 10m
-          rc=$?
-          set -e
-          [ $rc -eq 0 ] && exit 0
-
-          shopt -s nullglob
-          cores=(/tmp/core.*)
-          if [ ${#cores[@]} -eq 0 ]; then
-            echo "No core file — this was an ordinary test failure, not a hang."
-            exit $rc
-          fi
-          sudo apt-get update -qq || true
-          sudo apt-get install -y -qq gdb
-          for c in "${cores[@]}"; do
-            # `info sharedlibrary` first, and it is not incidental: this binary
-            # links eight cdylibs that each embed and re-export a full copy of
-            # net-mesh's `net::ffi` (verified — libnet_org defines all 57
-            # `net_mesh_*` symbols itself). Link order resolves the FUNCTIONS to
-            # one copy; every internal `static` stays per-object, including
-            # `ffi::mesh::runtime()`'s OnceLock and tokio's own TLS. So the map
-            # says how many runtimes could be in play before the backtrace says
-            # which one is stuck.
-            #
-            # `info threads` next, because the threads that matter are the ones
-            # Rust created — Go's traceback cannot see them, which is the entire
-            # reason any of this exists.
-            echo "===== shared libraries + threads ($c) ====="
-            gdb -batch -n \
-              -ex 'info sharedlibrary' \
-              -ex 'info threads' \
-              /tmp/go-net.test "$c" 2>&1 | head -300 || true
-            # No `head -500` here any more. Go's own threads print first and
-            # there are dozens, so a 500-line cut landed before the Rust ones
-            # every time — truncating away the only frames worth having.
-            echo "===== native backtrace ($c) ====="
-            gdb -batch -n -ex 'thread apply all bt' /tmp/go-net.test "$c" 2>&1 | head -4000 || true
-          done
-          exit $rc
+        run: $GITHUB_WORKSPACE/.github/scripts/go-test-with-native-stacks.sh
 
       # Run again with `-tags test_helpers` so the test-only files
       # (`groups_testhelpers.go`, `groups_test.go`,
@@ -1768,7 +1699,7 @@ jobs:
         env:
           LD_LIBRARY_PATH: ${{ github.workspace }}/net/crates/net/target/release
           RUN_INTEGRATION_TESTS: "1"
-        run: go test -v -tags test_helpers ./...
+        run: $GITHUB_WORKSPACE/.github/scripts/go-test-with-native-stacks.sh test_helpers
 
       # `abi_stability_cgo_test.go` (+ its self-contained `_cgo.go`
       # helper) is gated behind the DISTINCT `abi_stability` build tag —
