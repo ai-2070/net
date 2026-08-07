@@ -785,7 +785,7 @@ const CAPABILITY_SET_CACHE_DEFAULT_CAPACITY: usize = 256;
 /// `may_execute` retain loops). Per
 /// PERF_AUDIT_2026_06_10_FULL_CRATE.md §4.1.
 ///
-/// [`best_node_matching`] deliberately does NOT come through here:
+/// `best_node_matching` deliberately does NOT come through here:
 /// a cache lookup re-enters the fold for its generation stamp, and
 /// that path synthesizes inside the snapshot that admitted its
 /// candidates. It pays the synthesis per candidate to keep

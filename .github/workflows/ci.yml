@@ -1456,14 +1456,24 @@ jobs:
           echo "${PWD}/.venv/bin" >> "$GITHUB_PATH"
           echo "VIRTUAL_ENV=${PWD}/.venv" >> "$GITHUB_ENV"
 
-      - name: Install maturin and pytest
+      - name: Install maturin, pytest and PyYAML
         # pytest-timeout surfaces the offending test on hangs —
         # without it, a deadlock anywhere in the suite ticks the
         # job-level timeout-minutes and the CI log gives no hint
         # which test was stuck. 60 s is generous for unit/integration
         # mesh tests on GHA; the longest legitimate test in the
         # suite is well under that.
-        run: pip install --upgrade pip maturin pytest pytest-timeout
+        #
+        # PyYAML for the "Run the Python skill examples" step below:
+        # `run-skill-examples.sh` reads `docs/data/examples.yaml` through
+        # `skill_examples.py`, which imports yaml and exits 1 without it.
+        # The venv above is what makes this job need the explicit install —
+        # it goes on PATH ahead of the runner's system python3, and the
+        # system one is where ubuntu-latest's preinstalled PyYAML lives.
+        # `go-tests` calls the same script for --lang go / --lang c and
+        # passes because it never shadows that interpreter. Same fix, and
+        # same reasoning, as the `examples` job in skills.yml.
+        run: pip install --upgrade pip maturin pytest pytest-timeout pyyaml
 
       # `net,cortex,compute,groups,meshdb,meshos,deck` mirrors the
       # Node binding's feature set for tests. `groups` is needed so

@@ -27975,16 +27975,32 @@ impl MeshNode {
         subprotocol_id: u16,
         payload: &[u8],
     ) -> Result<(), AdapterError> {
-        let peer = self
-            .peers
-            .get(&node_id)
-            .ok_or_else(|| AdapterError::Connection("unknown peer".into()))?;
-        let peer_addr = peer.addr();
+        // Snapshot the address + session and RELEASE the shard guard before
+        // the send below awaits. `DashMap::get` hands back a per-shard read
+        // guard, and this function is the one `peers` reader that used to
+        // hold one across an `.await` — every other reader on these paths
+        // clones out what it needs and drops the guard in the same statement.
+        //
+        // Holding it parks the task with the shard still locked. The map's
+        // locks are synchronous, so a `peers` insert/remove hashing to that
+        // shard does not yield — it blocks its runtime worker outright. Under
+        // enough concurrent registration churn that consumes the workers that
+        // would drive the I/O this send is waiting on, and the guard is
+        // released only when the send completes: a stall no timeout unwinds,
+        // and on the FFI announce path (`net_mesh_announce_capabilities`,
+        // which `block_on`s this fan-out) it wedges the calling C / cgo
+        // thread with it.
+        let (peer_addr, session) = {
+            let peer = self
+                .peers
+                .get(&node_id)
+                .ok_or_else(|| AdapterError::Connection("unknown peer".into()))?;
+            (peer.addr(), Arc::clone(&peer.session))
+        };
         if self.partition_filter.contains(&peer_addr) {
             return Ok(());
         }
 
-        let session = &peer.session;
         let stream_id = subprotocol_id as u64;
 
         let pool = session.thread_local_pool();
