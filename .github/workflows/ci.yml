@@ -1643,24 +1643,26 @@ jobs:
         working-directory: net/crates/net
         env:
           # Line tables + frame pointers so a core from a hung run actually
-          # unwinds. The last capture proved the mechanism works and then hit
-          # this exact wall: gdb reported "Shared library is missing debugging
-          # information" for all eight cdylibs, and the ONE thread that mattered
-          # — a libnet worker parked in a futex INSIDE a task poll, i.e. the
-          # thread holding the lock the cgo caller is blocked on — unwound two
-          # frames and stopped. The blocked side was legible only because
-          # `net_mesh_announce_capabilities` is an exported symbol; the holder
-          # is not, so it needs real unwind data.
+          # unwinds. Without them gdb reports "Shared library is missing
+          # debugging information" for all eight cdylibs, and the ONE thread
+          # that matters — the one holding the lock the cgo caller is blocked
+          # on — unwinds two frames and stops. The blocked side is legible only
+          # because `net_mesh_announce_capabilities` is an exported symbol; the
+          # holder is not, so it needs real unwind data.
           #
-          # `debuginfo=1` (line tables, not full DWARF) plus frame pointers is
-          # the cheap end of that: enough to walk and name the stack, without
-          # the size and link time of `-g`. `lto = true` still inlines
-          # aggressively, so expect merged frames — the goal is a readable
-          # chain, not a faithful one.
+          # Set through the cargo profile variable rather than `-Cdebuginfo` in
+          # RUSTFLAGS. Same result, but it cannot be silently displaced by a
+          # `rustflags` key in `.cargo/config.toml` (the one at
+          # net/crates/net/.cargo/config.toml has its `[build] rustflags`
+          # commented out today — this does not depend on it staying that way).
+          # `1` is line tables, not full DWARF: enough to walk and name a stack
+          # without `-g`'s size and link time. `lto = true` still inlines hard,
+          # so frames will be merged — legible is the goal, not faithful.
           #
           # Diagnostic setting. Drop it once the hang is understood; it is not
           # something the shipped cdylibs should carry.
-          RUSTFLAGS: "-Cdebuginfo=1 -Cforce-frame-pointers=yes"
+          CARGO_PROFILE_RELEASE_DEBUG: "1"
+          RUSTFLAGS: "-Cforce-frame-pointers=yes"
         run: >
           cargo build --release
           -p net-mesh -p net-compute-ffi -p net-meshdb-ffi -p net-meshos-ffi -p net-deck-ffi -p net-rpc-ffi -p net-mcp-ffi -p net-org-ffi
@@ -1684,14 +1686,32 @@ jobs:
       # Informational, not a gate: it prints the count so the next hang can be
       # read against a known map rather than an assumed one. Wire it to a
       # threshold only once we know what the right number is.
-      - name: Report duplicate net::ffi copies across the cdylibs
+      - name: Report duplicate net::ffi copies, assert the cdylibs can unwind
         if: ${{ !cancelled() }}
         working-directory: net/crates/net/target/release
         run: |
+          missing=0
           for so in libnet*.so; do
             n=$(nm -D --defined-only "$so" 2>/dev/null | grep -c ' T net_mesh_' || true)
-            printf '%-28s %s net_mesh_* definitions\n' "$so" "${n:-0}"
+            if readelf -S "$so" 2>/dev/null | grep -q '\.debug_'; then
+              dbg=dwarf
+            else
+              dbg=NONE
+              missing=1
+            fi
+            printf '%-28s %s net_mesh_* definitions, debug=%s\n' "$so" "${n:-0}" "$dbg"
           done
+          # A hard failure, not a note. The build carrying no DWARF is exactly
+          # how a hang dump comes back unreadable, and the last two did — the
+          # backtrace stops at the frame that would have named the holder, and
+          # the run still looks like it captured something. Silence must not
+          # read as success; that is the same lesson `check-checker-lib.sh`
+          # exists to enforce for the Python checkers.
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::cdylibs built without DWARF — a hang dump will not unwind past the FFI entry point."
+            echo "CARGO_PROFILE_RELEASE_DEBUG on the build step above is what sets this; check it survived."
+            exit 1
+          fi
 
       # `integration_test.go` gates its suite behind RUN_INTEGRATION_TESTS=1
       # so local developers can run quick unit-style passes without the
