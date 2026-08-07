@@ -1654,7 +1654,55 @@ jobs:
         env:
           LD_LIBRARY_PATH: ${{ github.workspace }}/net/crates/net/target/release
           RUN_INTEGRATION_TESTS: "1"
-        run: go test -v ./...
+          # A test-timeout panic in this package stops at the cgo boundary.
+          # `TestLiveSubnetExportedCallFromAGeneratedScenario` has twice
+          # reported 9 minutes inside `_Cfunc_net_mesh_announce_capabilities`
+          # with nothing under it — and the Rust frames it is not printing are
+          # the half that would say what is actually stuck. Every fix attempted
+          # off that trace has been inference.
+          #
+          # `crash` turns the panic into a SIGABRT, and the core it leaves
+          # carries native frames for every thread, including the runtime
+          # workers no goroutine dump can see. The step below reads them back.
+          # Costs nothing on a green run: nothing aborts, so no core is written.
+          GOTRACEBACK: crash
+        # Compiled to a fixed path instead of run through `go test`, because
+        # postmortem symbolization needs the binary to still exist — `go test`
+        # builds into a temp dir and deletes it, which would leave gdb with a
+        # core and nothing to map it against.
+        #
+        # Coverage is unchanged: `./...` resolves to this one package here
+        # (`example/` carries its own go.mod, so it was never in that set).
+        # `-test.timeout` has to be spelled out because a test binary run
+        # directly defaults to NO timeout — inheriting `go test`'s implicit 10m
+        # is exactly what must not silently change, or a hang stops tripping
+        # the alarm this step exists to capture.
+        run: |
+          ulimit -c unlimited
+          sudo sysctl -w kernel.core_pattern=/tmp/core.%e.%p
+          go test -c -o /tmp/go-net.test .
+          /tmp/go-net.test -test.v -test.timeout 10m
+
+      # Reads back what the step above dumped. Deliberately not `continue-on-
+      # error` on that step: the failure must stay a failure — this only adds
+      # the stack to it. gdb is installed lazily here rather than in setup so a
+      # green run never pays for it.
+      - name: Native stacks from a hung Go test
+        if: failure()
+        run: |
+          shopt -s nullglob
+          cores=(/tmp/core.*)
+          if [ ${#cores[@]} -eq 0 ]; then
+            echo "No core file — this failure was not a GOTRACEBACK=crash abort,"
+            echo "so it was an ordinary test failure rather than a hang."
+            exit 0
+          fi
+          sudo apt-get update -qq && sudo apt-get install -y -qq gdb
+          for c in "${cores[@]}"; do
+            echo "::group::native backtrace ($c)"
+            gdb -batch -n -ex 'thread apply all bt' /tmp/go-net.test "$c" 2>&1 | head -500
+            echo "::endgroup::"
+          done
 
       # Run again with `-tags test_helpers` so the test-only files
       # (`groups_testhelpers.go`, `groups_test.go`,
