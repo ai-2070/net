@@ -1646,6 +1646,33 @@ jobs:
           -p net-mesh -p net-compute-ffi -p net-meshdb-ffi -p net-meshos-ffi -p net-deck-ffi -p net-rpc-ffi -p net-mcp-ffi -p net-org-ffi
           --features "net-mesh/netdb,net-mesh/dataforts,net-mesh/redex-disk,net-mesh/nat-traversal,net-mesh/redis,net-compute-ffi/test-helpers"
 
+      # How many copies of `net::ffi` this binary is about to load.
+      #
+      # Each sibling cdylib takes `net-mesh` as an ordinary path dependency, so
+      # each statically embeds it AND re-exports its `#[no_mangle]` symbols;
+      # there is no version script under `bindings/go` restricting that. On a
+      # PE build libnet_org exports all 57 `net_mesh_*` entry points itself,
+      # and the ELF layout here is the same shape. `org-ffi/Cargo.toml` records
+      # the duplication and reasons about field OFFSETS staying consistent —
+      # which the single unifying `cargo build` above does guarantee. It says
+      # nothing about per-object `static`s, and those do NOT unify: link order
+      # collapses the functions to one copy while each `.so` keeps its own
+      # `ffi::mesh::runtime()` OnceLock and its own tokio TLS. `block_on`'s
+      # runtime-in-runtime guard reads that TLS, so it is blind across the
+      # boundary.
+      #
+      # Informational, not a gate: it prints the count so the next hang can be
+      # read against a known map rather than an assumed one. Wire it to a
+      # threshold only once we know what the right number is.
+      - name: Report duplicate net::ffi copies across the cdylibs
+        if: ${{ !cancelled() }}
+        working-directory: net/crates/net/target/release
+        run: |
+          for so in libnet*.so; do
+            n=$(nm -D --defined-only "$so" 2>/dev/null | grep -c ' T net_mesh_' || true)
+            printf '%-28s %s net_mesh_* definitions\n' "$so" "${n:-0}"
+          done
+
       # `integration_test.go` gates its suite behind RUN_INTEGRATION_TESTS=1
       # so local developers can run quick unit-style passes without the
       # full mesh setup. CI wants the full coverage.
@@ -1699,8 +1726,29 @@ jobs:
           fi
           sudo apt-get update -qq && sudo apt-get install -y -qq gdb
           for c in "${cores[@]}"; do
+            # `info sharedlibrary` first, and it is not incidental: the Go test
+            # binary links eight cdylibs that each embed and re-export a full
+            # copy of net-mesh's `net::ffi` (verified — libnet_org.so defines
+            # all 57 `net_mesh_*` symbols itself). Link order resolves the
+            # FUNCTIONS to one copy; every internal `static` stays per-object,
+            # including `ffi::mesh::runtime()`'s OnceLock and tokio's own TLS.
+            # So the map tells us how many runtimes could be in play before the
+            # backtrace tells us which one is stuck.
+            #
+            # `info threads` next, because the interesting threads are the ones
+            # Rust created — Go's traceback cannot see them, which is the entire
+            # reason this step exists.
+            echo "::group::shared libraries + threads ($c)"
+            gdb -batch -n \
+              -ex 'info sharedlibrary' \
+              -ex 'info threads' \
+              /tmp/go-net.test "$c" 2>&1 | head -300
+            echo "::endgroup::"
+            # No `head -500` here any more. Go's own threads print first and
+            # there are dozens, so a 500-line cut landed before the Rust ones
+            # every time — truncating away the only frames worth having.
             echo "::group::native backtrace ($c)"
-            gdb -batch -n -ex 'thread apply all bt' /tmp/go-net.test "$c" 2>&1 | head -500
+            gdb -batch -n -ex 'thread apply all bt' /tmp/go-net.test "$c" 2>&1 | head -4000
             echo "::endgroup::"
           done
 
