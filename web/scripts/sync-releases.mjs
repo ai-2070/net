@@ -16,6 +16,12 @@
 //      (`../plans/FOO.md`, `../../LICENSE-APACHE`) — correct in the repo,
 //      404s on the site, since those files were never published. They're
 //      rewritten to GitHub blob URLs.
+//   3. Site links. The notes link published pages absolutely
+//      (`https://ai2070.net/docs/...`), which is the only form that resolves
+//      from a GitHub blob view. On the site itself that same link is a full
+//      page load instead of a client-side navigation, and it sends preview
+//      deploys and local dev to production. It's rewritten back to
+//      root-relative.
 //
 // Run: `npm run sync:releases`  (or `-- --check` to fail on drift, as CI does)
 
@@ -126,6 +132,16 @@ function releaseUrl(filename) {
 function rewriteLinks(source, siblings) {
   let out = source;
   for (const [from, to] of LEGACY) out = out.split(`(${from}`).join(`(${to}`);
+
+  // Absolute site links back to root-relative — see (3) in the header. The
+  // crate copy has to spell them absolutely to resolve on GitHub, so this is
+  // a difference between the two copies by construction, not drift. Without
+  // it the check fails the moment anyone links a published page from a
+  // release note, which is what it did.
+  out = out.replace(
+    /(\[[^\]]*\]\()https:\/\/ai2070\.net(\/[^)\s]*)?(\))/g,
+    (_all, pre, path, post) => `${pre}${path ?? "/"}${post}`,
+  );
 
   // A bare sibling reference points at another release note, and those *are*
   // published — so it becomes a site link rather than a GitHub one. Handled
