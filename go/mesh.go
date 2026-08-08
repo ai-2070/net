@@ -223,10 +223,32 @@ type MeshConfig struct {
 type StreamConfig struct {
 	// Reliability: "reliable" | "fire_and_forget" (default).
 	Reliability string `json:"reliability,omitempty"`
-	// WindowBytes sets the initial send-credit window. 0 disables
-	// backpressure entirely. Default: 64 KiB.
-	WindowBytes    uint32 `json:"window_bytes,omitempty"`
-	FairnessWeight uint8  `json:"fairness_weight,omitempty"`
+
+	// WindowBytes sets the initial send-credit window. Nil inherits the
+	// 64 KiB default; a pointer to 0 disables backpressure entirely.
+	//
+	// Pointer for the same reason as AutoDirectUpgrade above: under
+	// `omitempty` a plain uint32 collapses "unset" into "0", so the
+	// documented unbounded mode was erased from the JSON before it
+	// reached the C parser, which then applied the default. A caller
+	// asking for no backpressure silently got 64 KiB of it. Use
+	// UnboundedWindow() to spell it.
+	WindowBytes *uint32 `json:"window_bytes,omitempty"`
+
+	FairnessWeight uint8 `json:"fairness_weight,omitempty"`
+}
+
+// UnboundedWindow returns the WindowBytes value that disables
+// backpressure. `WindowBytes: net.UnboundedWindow()` reads better than
+// an inline pointer-to-zero, and is harder to write by accident.
+func UnboundedWindow() *uint32 {
+	var zero uint32
+	return &zero
+}
+
+// WindowBytesOf returns a WindowBytes pointer for an explicit size.
+func WindowBytesOf(n uint32) *uint32 {
+	return &n
 }
 
 // StreamStats is a snapshot of a live stream's stats.

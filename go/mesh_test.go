@@ -129,7 +129,7 @@ func TestMeshOpenStreamAndSend(t *testing.T) {
 	bID := b.NodeID()
 	stream, err := a.OpenStream(bID, 0x1337, StreamConfig{
 		Reliability: "reliable",
-		WindowBytes: 1 << 14, // 16 KiB
+		WindowBytes: WindowBytesOf(1 << 14), // 16 KiB
 	})
 	if err != nil {
 		t.Fatalf("open_stream: %v", err)
@@ -172,7 +172,7 @@ func TestMeshSendBackpressureSurfaces(t *testing.T) {
 	// admits exactly one packet at a time.
 	stream, err := a.OpenStream(bID, 0x2001, StreamConfig{
 		Reliability: "fire_and_forget",
-		WindowBytes: 96,
+		WindowBytes: WindowBytesOf(96),
 	})
 	if err != nil {
 		t.Fatalf("open_stream: %v", err)
@@ -204,7 +204,7 @@ func TestMeshSendWithRetryAbsorbsBackpressure(t *testing.T) {
 	bID := b.NodeID()
 	stream, err := a.OpenStream(bID, 0x2002, StreamConfig{
 		Reliability: "fire_and_forget",
-		WindowBytes: 96,
+		WindowBytes: WindowBytesOf(96),
 	})
 	if err != nil {
 		t.Fatalf("open_stream: %v", err)

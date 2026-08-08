@@ -113,7 +113,12 @@ stream = mesh.open_stream(
 
 ### Go / C
 
-The Go and C bindings do **not** expose the stream surface today. The poll-based API there covers `IngestRaw` / `Poll` against the bus only. If a Go or C consumer needs streams, that's a binding extension, not an existing call site.
+Both expose the stream surface. What they lack is the *bus* async-iterator ergonomics, not streams.
+
+- **Go:** `MeshNode.OpenStream(peerNodeID, streamID, StreamConfig)` → `MeshStream` with `Send`, `SendWithRetry`, `SendBlocking`, `Stats`, `Close` (`go/mesh.go:788+`).
+- **C:** `net_mesh_open_stream` and the surrounding stream ABI (`net/crates/net/include/net.go.h:398+`).
+
+**Go's `WindowBytes` is a `*uint32`, and that is load-bearing.** `nil` inherits the 64 KiB default; `net.UnboundedWindow()` (a pointer to zero) is the escape hatch that disables backpressure. It was a plain `uint32` with `omitempty`, which erased an explicit zero from the JSON before it reached the C parser — so a caller requesting the documented unbounded mode silently got bounded backpressure instead. Use `net.WindowBytesOf(n)` for an explicit size.
 
 ---
 
