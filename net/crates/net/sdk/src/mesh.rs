@@ -791,9 +791,18 @@ impl Mesh {
     /// `cfg` rather than `#[allow(dead_code)]` on purpose: the allow
     /// would also silence the day this genuinely loses its last caller,
     /// which for a security-policy hop is worth being told about.
+    ///
+    /// Now that core installs this from its own serve seams, the only
+    /// reason to call this is a path that registers policy WITHOUT
+    /// serving — there is currently none, which is why the SDK hops
+    /// that used to call it are empty. Kept so such a path has a
+    /// correct entry point rather than reinventing one.
     #[cfg(any(feature = "cortex", feature = "aggregator"))]
-    pub(crate) fn register_rpc_service_channels(&self, service: &str) {
-        self.channel_configs.install_rpc_service_defaults(service);
+    pub(crate) fn register_rpc_service_channels(
+        &self,
+        service: &str,
+    ) -> std::result::Result<(), ::net::adapter::net::mesh_rpc::ServeError> {
+        self.channel_configs.install_rpc_service_defaults(service)
     }
 
     /// Register a **prefix-matched** channel config. Any channel name

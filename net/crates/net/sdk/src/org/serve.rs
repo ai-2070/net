@@ -287,11 +287,15 @@ where
 /// `pub(crate)`: the subnet-exported serve seam registers through the
 /// SAME implementation (SUBNET_AUTH_SDK_PLAN.md §3.5 — promoted, not
 /// copied).
-pub(crate) fn auto_register_org_channels(node: &MeshNode, service: &str) {
-    let Some(registry) = node.channel_configs() else {
-        return;
-    };
-    registry.install_rpc_service_defaults(service);
+pub(crate) fn auto_register_org_channels(_node: &MeshNode, _service: &str) {
+    // Deliberately empty. Every org serve path reaches a core seam —
+    // `serve_rpc_owner_scoped`, `serve_rpc_granted` and
+    // `serve_rpc_subnet_exported` all land in `serve_rpc_unary_impl`,
+    // which installs the policy itself now. Pre-registering here would
+    // make this a second owner of a requirement that already has one,
+    // and a second owner is exactly how this path drifted before: it
+    // carried a replacing insert that destroyed operator ACLs and an
+    // unbound reply prefix, long after both were fixed elsewhere.
 }
 
 /// Wrap a facade byte closure in the one `RpcHandler` bridge —

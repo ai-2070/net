@@ -3412,6 +3412,23 @@ impl MeshNode {
         let request_channel = ChannelName::new(&format!("{service}.requests"))
             .map_err(|e| ServeError::InvalidServiceName(e.to_string()))?;
         let channel_hash = request_channel.hash();
+        // The channel policy nRPC requires is installed here, by the
+        // one seam every serve shape passes through, before anything
+        // is registered, advertised, or spawned.
+        //
+        // It used to be the SDK wrapper's job. Node, Python and Go/C
+        // call `MeshNode::serve_rpc*` directly and never did it, so on
+        // their strict-by-default registries a successful registration
+        // still could not complete a single call: `<service>.requests`
+        // and `<service>.replies.*` were unknown channels and every
+        // request was refused. A protocol prerequisite belongs to the
+        // protocol, not to whichever wrapper remembers.
+        //
+        // Install-if-absent, so an operator ACL registered before
+        // serving survives untouched.
+        if let Some(registry) = self.channel_configs() {
+            registry.install_rpc_service_defaults(service)?;
+        }
 
         // Captured before `mode` is consumed below. An org-protected
         // registration NEVER roster-fans its responses — see
@@ -3849,6 +3866,23 @@ impl MeshNode {
         let request_channel = ChannelName::new(&format!("{service}.requests"))
             .map_err(|e| ServeError::InvalidServiceName(e.to_string()))?;
         let channel_hash = request_channel.hash();
+        // The channel policy nRPC requires is installed here, by the
+        // one seam every serve shape passes through, before anything
+        // is registered, advertised, or spawned.
+        //
+        // It used to be the SDK wrapper's job. Node, Python and Go/C
+        // call `MeshNode::serve_rpc*` directly and never did it, so on
+        // their strict-by-default registries a successful registration
+        // still could not complete a single call: `<service>.requests`
+        // and `<service>.replies.*` were unknown channels and every
+        // request was refused. A protocol prerequisite belongs to the
+        // protocol, not to whichever wrapper remembers.
+        //
+        // Install-if-absent, so an operator ACL registered before
+        // serving survives untouched.
+        if let Some(registry) = self.channel_configs() {
+            registry.install_rpc_service_defaults(service)?;
+        }
         let (tx, mut rx) = tokio::sync::mpsc::channel::<RpcInboundEvent>(1024);
 
         // T1.2 cache: bridge populates from inbound.from_node, emit
@@ -4044,6 +4078,23 @@ impl MeshNode {
         let request_channel = ChannelName::new(&format!("{service}.requests"))
             .map_err(|e| ServeError::InvalidServiceName(e.to_string()))?;
         let channel_hash = request_channel.hash();
+        // The channel policy nRPC requires is installed here, by the
+        // one seam every serve shape passes through, before anything
+        // is registered, advertised, or spawned.
+        //
+        // It used to be the SDK wrapper's job. Node, Python and Go/C
+        // call `MeshNode::serve_rpc*` directly and never did it, so on
+        // their strict-by-default registries a successful registration
+        // still could not complete a single call: `<service>.requests`
+        // and `<service>.replies.*` were unknown channels and every
+        // request was refused. A protocol prerequisite belongs to the
+        // protocol, not to whichever wrapper remembers.
+        //
+        // Install-if-absent, so an operator ACL registered before
+        // serving survives untouched.
+        if let Some(registry) = self.channel_configs() {
+            registry.install_rpc_service_defaults(service)?;
+        }
         let (tx, mut rx) = tokio::sync::mpsc::channel::<RpcInboundEvent>(1024);
 
         // T1.2 cache — see serve_rpc above for full rationale.
@@ -4380,6 +4431,23 @@ impl MeshNode {
         let request_channel = ChannelName::new(&format!("{service}.requests"))
             .map_err(|e| ServeError::InvalidServiceName(e.to_string()))?;
         let channel_hash = request_channel.hash();
+        // The channel policy nRPC requires is installed here, by the
+        // one seam every serve shape passes through, before anything
+        // is registered, advertised, or spawned.
+        //
+        // It used to be the SDK wrapper's job. Node, Python and Go/C
+        // call `MeshNode::serve_rpc*` directly and never did it, so on
+        // their strict-by-default registries a successful registration
+        // still could not complete a single call: `<service>.requests`
+        // and `<service>.replies.*` were unknown channels and every
+        // request was refused. A protocol prerequisite belongs to the
+        // protocol, not to whichever wrapper remembers.
+        //
+        // Install-if-absent, so an operator ACL registered before
+        // serving survives untouched.
+        if let Some(registry) = self.channel_configs() {
+            registry.install_rpc_service_defaults(service)?;
+        }
         let (tx, mut rx) = tokio::sync::mpsc::channel::<RpcInboundEvent>(1024);
 
         // T1.2 cache — see serve_rpc above for full rationale.

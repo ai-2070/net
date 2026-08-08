@@ -7,6 +7,10 @@
 use super::name::{ChannelHash, ChannelId, ChannelName};
 use crate::adapter::net::behavior::capability::{CapabilityFilter, CapabilitySet};
 use crate::adapter::net::identity::{EntityId, RevocationRegistry, TokenChain, TokenScope};
+// `ServeError` lives with the nRPC surface; the registry owns the
+// policy that surface requires, so it reports failure in that
+// surface's vocabulary rather than inventing a parallel one.
+use crate::adapter::net::mesh_rpc::ServeError;
 use dashmap::DashMap;
 
 /// How a channel binds its dynamic name suffix to the subscribing
@@ -801,6 +805,19 @@ impl ChannelConfigRegistry {
         prefix: impl Into<String>,
         config: ChannelConfig,
     ) -> bool {
+        let _w = self.write_lock.lock();
+        self.insert_prefix_if_absent_locked(prefix, config)
+    }
+
+    /// [`Self::insert_prefix_if_absent`] with the write lock already
+    /// held. See [`Self::insert_if_absent_locked`].
+    ///
+    /// Caller MUST hold `write_lock`.
+    fn insert_prefix_if_absent_locked(
+        &self,
+        prefix: impl Into<String>,
+        config: ChannelConfig,
+    ) -> bool {
         match self.prefix_configs.entry(prefix.into()) {
             dashmap::mapref::entry::Entry::Occupied(_) => false,
             dashmap::mapref::entry::Entry::Vacant(slot) => {
@@ -874,15 +891,24 @@ impl ChannelConfigRegistry {
     /// Hence the concrete probe below. The sentinel is still what gets
     /// STORED — it must stay unroutable — but what gets VALIDATED is a
     /// real per-caller name.
-    pub fn install_rpc_service_defaults(&self, service: &str) {
+    /// Returns `ServeError::InvalidServiceName` when any of the three
+    /// names fails validation, having mutated nothing.
+    ///
+    /// This returned `()` and swallowed those failures. A serve call
+    /// then succeeded against a registry that had silently installed
+    /// no policy, so every request to that service was refused as an
+    /// unknown channel — with the refusal surfacing on the caller's
+    /// side, far from the registration that caused it.
+    pub fn install_rpc_service_defaults(&self, service: &str) -> Result<(), ServeError> {
+        let invalid = || ServeError::InvalidServiceName(service.to_string());
         let Ok(req_channel) = ChannelName::new(&format!("{service}.requests")) else {
-            return;
+            return Err(invalid());
         };
         // Probe, not a channel: every origin hash renders as exactly 16
         // hex digits, so any value answers "does a per-caller reply
         // channel fit under this service name?" for all of them.
         if ChannelName::new(&format!("{service}.replies.{:016x}", 0u64)).is_err() {
-            return;
+            return Err(invalid());
         }
         // The sentinel name is never routed — it exists so the prefix
         // entry has a `ChannelId` to carry. Token gates on a prefix
@@ -891,15 +917,46 @@ impl ChannelConfigRegistry {
         // probe: `<service>.replies.0000000000000000` is a name a real
         // caller could hold, and a sentinel should not collide with one.
         let Ok(sentinel) = ChannelName::new(&format!("{service}.replies.prefix")) else {
-            return;
+            return Err(invalid());
         };
 
+        let req_cfg = ChannelConfig::new(ChannelId::new(req_channel));
+        let reply_cfg = ChannelConfig::new(ChannelId::new(sentinel))
+            .with_subscriber_origin_binding(OriginBinding::OriginHashHex16);
+
+        // One lock across both inserts, and the REPLY PREFIX GOES IN
+        // FIRST. Both halves matter, for different races.
+        //
+        // The lock closes the writer/writer race: two concurrent
+        // registrations of the same service can no longer interleave
+        // their two inserts.
+        //
+        // The ordering closes the reader race, which the lock alone
+        // does not. Readers go straight to the DashMaps — `get_by_name`
+        // deliberately does not take this lock, because it is the
+        // per-packet authorization path — so a reader can still land
+        // between the two inserts. What it observes there is decided
+        // entirely by which one happened first:
+        //
+        // - exact first: the request channel looks deliberately
+        //   configured while replies still fall through to the
+        //   unregistered-channel policy, UNBOUND. That is the H3
+        //   posture — any peer may subscribe to another caller's reply
+        //   channel — reached by accident.
+        // - prefix first: the reply prefix is already origin-bound, and
+        //   the request channel is briefly unregistered, so a request
+        //   arriving in the window is refused as an unknown channel.
+        //
+        // The second window is fail-closed and self-healing; the first
+        // is fail-open on the exact property H3 exists to protect. So
+        // the order here is load-bearing, not stylistic.
+        //
         // Return values ignored on purpose: "already registered" is the
         // operator-configured case, which is exactly what this protects.
-        let _ = self.insert_if_absent(ChannelConfig::new(ChannelId::new(req_channel)));
-        let cfg = ChannelConfig::new(ChannelId::new(sentinel))
-            .with_subscriber_origin_binding(OriginBinding::OriginHashHex16);
-        let _ = self.insert_prefix_if_absent(format!("{service}.replies."), cfg);
+        let _w = self.write_lock.lock();
+        self.insert_prefix_if_absent_locked(format!("{service}.replies."), reply_cfg);
+        self.insert_if_absent_locked(req_cfg);
+        Ok(())
     }
 
     /// Register a channel configuration, **replacing** any existing
@@ -937,10 +994,21 @@ impl ChannelConfigRegistry {
     /// callers observes `true`, and its index update is not visible
     /// before its `configs` entry.
     pub fn insert_if_absent(&self, config: ChannelConfig) -> bool {
+        let _w = self.write_lock.lock();
+        self.insert_if_absent_locked(config)
+    }
+
+    /// [`Self::insert_if_absent`] with the write lock already held.
+    ///
+    /// Exists so `install_rpc_service_defaults` can put its exact and
+    /// prefix entries in under one lock — two separately locked inserts
+    /// leave a window where a concurrent reader sees half the policy.
+    ///
+    /// Caller MUST hold `write_lock`.
+    fn insert_if_absent_locked(&self, config: ChannelConfig) -> bool {
         let name = config.channel_id.name().to_string();
         let hash = config.channel_id.hash();
         let wire_hash = config.channel_id.wire_hash();
-        let _w = self.write_lock.lock();
         let installed = match self.configs.entry(name.clone()) {
             dashmap::mapref::entry::Entry::Occupied(_) => false,
             dashmap::mapref::entry::Entry::Vacant(slot) => {
@@ -2604,7 +2672,7 @@ mod tests {
                 .with_token_roots(vec![root.entity_id().clone()]),
         );
 
-        reg.install_rpc_service_defaults("svc");
+        reg.install_rpc_service_defaults("svc").expect("valid service name");
 
         assert!(
             reg.get_by_name("svc.requests").unwrap().token_required(),
@@ -2621,7 +2689,7 @@ mod tests {
 
         // …and on a clean registry it installs both, with the binding.
         let fresh = ChannelConfigRegistry::new();
-        fresh.install_rpc_service_defaults("svc");
+        fresh.install_rpc_service_defaults("svc").expect("valid service name");
 
         assert!(
             fresh.get_by_name("svc.requests").is_some(),
@@ -2637,6 +2705,155 @@ mod tests {
              can hold a live subscription to another caller's reply channel and \
              receive that caller's response bodies whenever the server's direct \
              route misses and the response falls back to roster fan-out."
+        );
+    }
+
+    /// Partial operator configuration receives only the missing half.
+    ///
+    /// The two entries live in different maps — one exact, one prefix —
+    /// so "already registered" has to be decided per entry. Deciding it
+    /// for the pair would either skip an install the operator needs or
+    /// overwrite one they made.
+    #[test]
+    fn rpc_service_defaults_fill_only_the_missing_half() {
+        let root = EntityKeypair::generate();
+
+        // Operator configured the REQUEST side only.
+        let reg = ChannelConfigRegistry::new();
+        reg.insert(
+            ChannelConfig::new(ChannelId::parse("svc.requests").unwrap())
+                .with_token_roots(vec![root.entity_id().clone()]),
+        );
+        reg.install_rpc_service_defaults("svc").expect("install");
+
+        assert!(
+            reg.get_by_name("svc.requests").unwrap().token_required(),
+            "the operator's request ACL must survive",
+        );
+        assert_eq!(
+            reg.get_by_name("svc.replies.abcdef0123456789")
+                .expect("the missing reply prefix must be installed")
+                .subscriber_origin_binding,
+            Some(OriginBinding::OriginHashHex16),
+        );
+
+        // Operator configured the REPLY side only.
+        let reg = ChannelConfigRegistry::new();
+        reg.insert_prefix(
+            "svc.replies.",
+            ChannelConfig::new(ChannelId::parse("svc.replies.prefix").unwrap())
+                .with_token_roots(vec![root.entity_id().clone()]),
+        );
+        reg.install_rpc_service_defaults("svc").expect("install");
+
+        assert!(
+            reg.get_by_name("svc.requests").is_some(),
+            "the missing request channel must be installed",
+        );
+        assert!(
+            reg.get_by_name("svc.replies.abcdef0123456789")
+                .unwrap()
+                .token_required(),
+            "the operator's reply ACL must survive",
+        );
+    }
+
+    /// Repeated registration is idempotent — `serve_rpc` calls this on
+    /// every registration, and a node may re-serve the same name.
+    #[test]
+    fn rpc_service_defaults_are_idempotent() {
+        let reg = ChannelConfigRegistry::new();
+        for _ in 0..5 {
+            reg.install_rpc_service_defaults("svc").expect("install");
+        }
+        assert_eq!(reg.len(), 1, "one exact entry, however many calls");
+        assert_eq!(reg.snapshot_prefixes().len(), 1, "one prefix entry");
+    }
+
+    /// A reader must never see the request channel configured while the
+    /// reply prefix is still absent.
+    ///
+    /// Perfect simultaneity is not available: `get_by_name` is the
+    /// per-packet authorization path and deliberately does not take the
+    /// registry write lock, so a reader CAN land between the two
+    /// inserts. What matters is which half it finds there.
+    ///
+    /// Request-first leaves replies falling through to the
+    /// unregistered-channel policy, unbound — the H3 posture, reached
+    /// by accident. Prefix-first leaves the request channel briefly
+    /// unregistered, so a request in that window is refused as an
+    /// unknown channel: fail-closed and self-healing.
+    ///
+    /// So this asserts the ordering, which is the property that is
+    /// actually achievable and the one that is safe.
+    #[test]
+    fn rpc_service_defaults_never_expose_an_unbound_reply_window() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+        use std::sync::{Arc as StdArc, Mutex as StdMutex};
+
+        // The observer has to watch registries that are actively being
+        // populated. Watching one already-installed registry sees the
+        // window at most once, and `install_rpc_service_defaults` is
+        // idempotent, so there is no second chance on the same object.
+        // The writer therefore publishes a FRESH registry each round
+        // and installs into it while the observer reads whatever is
+        // current.
+        let current = StdArc::new(StdMutex::new(StdArc::new(ChannelConfigRegistry::new())));
+        let stop = StdArc::new(AtomicBool::new(false));
+        let saw_unbound_window = StdArc::new(AtomicBool::new(false));
+        let observations = StdArc::new(AtomicU64::new(0));
+
+        let observer = {
+            let current = StdArc::clone(&current);
+            let stop = StdArc::clone(&stop);
+            let saw = StdArc::clone(&saw_unbound_window);
+            let observations = StdArc::clone(&observations);
+            std::thread::spawn(move || {
+                while !stop.load(AtomicOrdering::Relaxed) {
+                    let reg = {
+                        let guard = current.lock().expect("registry slot");
+                        StdArc::clone(&guard)
+                    };
+                    // Read the REQUEST first, then the reply. Entries
+                    // are only ever added, and the writer installs the
+                    // prefix before the request — so observing the
+                    // request as present means the prefix was already
+                    // in, and the second read cannot produce a false
+                    // positive. Reading reply-first inverts that: a
+                    // reply read taken before either insert, paired
+                    // with a request read taken after both, reports a
+                    // window that never existed.
+                    let has_request = reg.get_by_name("svc.requests").is_some();
+                    let has_reply = reg.get_by_name("svc.replies.abcdef0123456789").is_some();
+                    observations.fetch_add(1, AtomicOrdering::Relaxed);
+                    if has_request && !has_reply {
+                        saw.store(true, AtomicOrdering::Relaxed);
+                    }
+                }
+            })
+        };
+
+        for _ in 0..20_000 {
+            let fresh = StdArc::new(ChannelConfigRegistry::new());
+            {
+                let mut guard = current.lock().expect("registry slot");
+                *guard = StdArc::clone(&fresh);
+            }
+            fresh
+                .install_rpc_service_defaults("svc")
+                .expect("install");
+        }
+
+        stop.store(true, AtomicOrdering::Relaxed);
+        observer.join().expect("observer thread");
+
+        assert!(
+            observations.load(AtomicOrdering::Relaxed) > 0,
+            "the observer never ran; this test proves nothing",
+        );
+        assert!(
+            !saw_unbound_window.load(AtomicOrdering::Relaxed),
+            "a reader observed the request channel configured while the reply              prefix was still absent — that window leaves replies unbound,              which is the H3 posture. Install the prefix first.",
         );
     }
 
@@ -2692,7 +2909,10 @@ mod tests {
             ("invalid characters", "bad name#with/invalid chars"),
         ] {
             let reg = ChannelConfigRegistry::new();
-            reg.install_rpc_service_defaults(service);
+            assert!(
+                reg.install_rpc_service_defaults(service).is_err(),
+                "[{band}] an unrepresentable service name must report the                  failure, not swallow it — a serve call that succeeds against                  a registry with no policy refuses every request later, far                  from the registration that caused it"
+            );
             assert_eq!(
                 reg.len(),
                 0,
@@ -2722,7 +2942,8 @@ mod tests {
 
         let longest = "s".repeat(MAX_NAME_LEN - ".replies.0123456789abcdef".len());
         let reg = ChannelConfigRegistry::new();
-        reg.install_rpc_service_defaults(&longest);
+        reg.install_rpc_service_defaults(&longest)
+            .expect("the longest representable service name must install");
 
         assert!(
             reg.get_by_name(&format!("{longest}.requests")).is_some(),
