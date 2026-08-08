@@ -137,6 +137,7 @@ export class NetNode {
       events: response.events.map((e) => ({
         id: e.id,
         raw: e.raw,
+        rawBytes: e.rawBytes,
         insertionTs: e.insertionTs,
         shardId: e.shardId,
       })),

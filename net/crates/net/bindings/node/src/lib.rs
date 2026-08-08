@@ -412,6 +412,11 @@ pub struct Stats {
     pub events_ingested: BigInt,
     /// Events dropped due to backpressure
     pub events_dropped: BigInt,
+    /// Batches handed to the adapter. The direct observer for
+    /// dispatch progress, and the only counter that moves under the
+    /// default `drop_oldest` mode — where the producer always
+    /// succeeds and `eventsDropped` never increments.
+    pub batches_dispatched: BigInt,
 }
 
 /// High-performance event bus for Node.js.
@@ -723,6 +728,11 @@ impl Net {
             events_dropped: BigInt::from(
                 stats
                     .events_dropped
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            batches_dispatched: BigInt::from(
+                stats
+                    .batches_dispatched
                     .load(std::sync::atomic::Ordering::Relaxed),
             ),
         })

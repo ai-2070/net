@@ -76,6 +76,17 @@ class Stats:
         """Events dropped due to backpressure."""
         ...
 
+    @property
+    def batches_dispatched(self) -> int:
+        """Batches handed to the adapter.
+
+        The direct observer for dispatch progress, and the only counter
+        that moves under the default ``drop_oldest`` mode — there the
+        producer always succeeds and ``events_dropped`` never
+        increments.
+        """
+        ...
+
 class Net:
     """
     High-performance event bus for Python.

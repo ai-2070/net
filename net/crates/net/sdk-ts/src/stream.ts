@@ -70,6 +70,7 @@ export class EventStream implements AsyncIterable<StoredEvent> {
           yield {
             id: event.id,
             raw: event.raw,
+            rawBytes: event.rawBytes,
             insertionTs: event.insertionTs,
             shardId: event.shardId,
           };

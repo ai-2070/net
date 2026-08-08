@@ -252,14 +252,20 @@ pub struct Stats {
     pub events_ingested: u64,
     #[pyo3(get)]
     pub events_dropped: u64,
+    /// Batches handed to the adapter. The direct observer for
+    /// dispatch progress, and the only counter that moves under the
+    /// default `drop_oldest` mode — where the producer always
+    /// succeeds and `events_dropped` never increments.
+    #[pyo3(get)]
+    pub batches_dispatched: u64,
 }
 
 #[pymethods]
 impl Stats {
     fn __repr__(&self) -> String {
         format!(
-            "Stats(events_ingested={}, events_dropped={})",
-            self.events_ingested, self.events_dropped
+            "Stats(events_ingested={}, events_dropped={}, batches_dispatched={})",
+            self.events_ingested, self.events_dropped, self.batches_dispatched
         )
     }
 }
@@ -826,7 +832,30 @@ impl Net {
             events_dropped: stats
                 .events_dropped
                 .load(std::sync::atomic::Ordering::Relaxed),
+            batches_dispatched: stats
+                .batches_dispatched
+                .load(std::sync::atomic::Ordering::Relaxed),
         })
+    }
+
+    /// Flush pending batches to the adapter.
+    ///
+    /// A reusable delivery barrier. Python had no way to wait for
+    /// in-flight batches short of `shutdown()`, which is terminal —
+    /// so "publish, make sure it landed, keep publishing" was
+    /// inexpressible here while Rust, Node, Go and C all had it.
+    fn flush(&self) -> PyResult<()> {
+        // Holds the read guard across `block_on`, matching `shutdown`
+        // below (which holds the write guard). A concurrent shutdown
+        // waits for the flush rather than racing it, which is the
+        // ordering a caller flushing before teardown wants anyway.
+        let bus_guard = self.bus.read();
+        let bus = bus_guard
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("EventBus has been shut down"))?;
+        self.runtime
+            .block_on(bus.flush())
+            .map_err(|e| PyRuntimeError::new_err(format!("flush: {}", e)))
     }
 
     /// Gracefully shutdown the event bus.

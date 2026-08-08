@@ -298,6 +298,19 @@ class NetNode:
         """Get the number of active shards."""
         return self._bus.num_shards()
 
+    def flush(self) -> None:
+        """Flush pending batches to the adapter.
+
+        A reusable delivery barrier: publish, wait for what is in
+        flight to reach the adapter, then keep publishing. `shutdown()`
+        also drains, but it is terminal — before this existed there was
+        no way to express the barrier in Python at all, while Rust,
+        Node, Go and C all had one.
+
+        Raises if the bus has already been shut down.
+        """
+        self._bus.flush()
+
     def shutdown(self) -> None:
         """Gracefully shut down the node."""
         self._bus.shutdown()

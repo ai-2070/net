@@ -57,8 +57,24 @@ export interface Receipt {
 export interface StoredEvent {
   /** Backend-specific event ID. */
   id: string;
-  /** Raw JSON payload. */
+  /**
+   * Raw payload decoded as UTF-8.
+   *
+   * Deliberately **empty** when the payload is not valid UTF-8 — the
+   * native binding does not substitute a lossy decode. A payload
+   * emitted through `emitBuffer()` may well not be UTF-8, so check
+   * `rawBytes` rather than treating an empty `raw` as an empty event.
+   */
   raw: string;
+  /**
+   * Raw payload bytes, exactly as ingested.
+   *
+   * The native binding has always preserved these; this wrapper used
+   * to drop them from both `poll()` and the streaming projection, so
+   * binary accepted through the wrapper's own `emitBuffer()` could not
+   * be read back through the same wrapper at all.
+   */
+  rawBytes: Buffer;
   /** Insertion timestamp (nanoseconds). */
   insertionTs: number;
   /** Shard ID. */

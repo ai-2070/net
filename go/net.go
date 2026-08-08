@@ -360,15 +360,34 @@ func (bs *Net) Ingest(event interface{}) error {
 //
 // Returns the number of successfully ingested events.
 func (bs *Net) IngestBatch(events []interface{}) int {
+	n, _ := bs.IngestBatchChecked(events)
+	return n
+}
+
+// IngestBatchChecked marshals and ingests a batch, reporting the first
+// value that could not be serialized.
+//
+// IngestBatch skips values whose `json.Marshal` fails and ingests the
+// rest, returning only the accepted count — so a caller cannot tell a
+// serialization omission from a ring-buffer drop. The two need
+// different responses: a drop is backpressure and may be retried, a
+// marshal failure is a bug in the payload that will fail identically
+// forever. Rust, TypeScript and Python all serialize the whole batch
+// before ingesting, so a bad element aborts instead of silently
+// deleting itself.
+//
+// Nothing is ingested when serialization fails: the error names the
+// index, and the returned count is 0.
+func (bs *Net) IngestBatchChecked(events []interface{}) (int, error) {
 	jsons := make([]string, 0, len(events))
-	for _, e := range events {
+	for i, e := range events {
 		data, err := json.Marshal(e)
 		if err != nil {
-			continue
+			return 0, fmt.Errorf("marshal event at index %d: %w", i, err)
 		}
 		jsons = append(jsons, string(data))
 	}
-	return bs.IngestRawBatch(jsons)
+	return bs.IngestRawBatch(jsons), nil
 }
 
 // PollOptions carries the full poll request shape.
