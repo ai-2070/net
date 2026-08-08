@@ -136,7 +136,7 @@ def _parse_status(msg: str) -> int | None:
 
 def test_fixture_metadata_matches_canonical_contract() -> None:
     assert FIXTURE["service"] == "cross_lang_echo_sum"
-    assert FIXTURE["abi_version_expected"] == 0x0001
+    assert FIXTURE["abi_version_expected"] == 0x0004
     assert NRPC_TYPED_BAD_REQUEST == 0x8000
     assert len(FIXTURE["ok_cases"]) > 0
     assert len(FIXTURE["error_cases"]) > 0

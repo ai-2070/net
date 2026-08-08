@@ -102,23 +102,47 @@ extern "C" {
  *            _duplex_*_call_id, _duplex_free). Server-side
  *            handlers ship in B8-5. ADDITIVE: every 0x0001 function
  *            keeps identical signature + semantics, so a 0x0001
- *            consumer compiled against a 0x0002 library still works. */
-#define NET_RPC_ABI_VERSION 0x0002
+ *            consumer compiled against a 0x0002 library still works.
+ *   0x0003 — server-side streaming handlers + the observer
+ *            snapshot surface. Additive.
+ *   0x0004 — BREAKING. `net_rpc_reserve_cancel_token` and
+ *            `net_rpc_cancel_call` gain a leading `MeshRpcHandle*`
+ *            so cancellation routes through the substrate's
+ *            per-mesh CancelRegistry, which is what makes
+ *            mid-stream cancel work uniformly across every
+ *            streaming shape. Every consumer must update both
+ *            signatures and rebuild.
+ *
+ * This header sat at 0x0002 while the implementation was 0x0004,
+ * declaring both cancellation functions without their handle
+ * argument. A consumer compiled against it passed whatever was in
+ * the first register as a mesh pointer. */
+#define NET_RPC_ABI_VERSION 0x0004
 
 uint32_t net_rpc_abi_version(void);
 
-/* Returns 0 (NET_RPC_OK) iff `net_rpc_abi_version()` is >=
+/* Returns 0 (NET_RPC_OK) iff `net_rpc_abi_version()` EQUALS
  * `expected`. Otherwise returns NET_RPC_ERR_CALL_FAILED — letting
  * consumers wedge a hard fail at process init when the loaded
- * library is older than what the compile-time headers declared.
+ * library does not match the compile-time headers.
  *
  *   if (net_rpc_check_abi_version(NET_RPC_ABI_VERSION) != 0) {
  *       fprintf(stderr, "net_rpc: ABI version mismatch\n");
  *       abort();
  *   }
  *
+ * Exact equality, not `>=`. A newer integer is not proof of
+ * compatibility once a breaking signature change has landed: the
+ * old `>=` check passed a stale 0x0002 header against a 0x0004
+ * library whose cancellation functions had gained a leading handle
+ * argument — precisely the case it existed to catch. Equality may
+ * reject a future purely-additive release unnecessarily; that
+ * failure is safe, and additive compatibility can be reintroduced
+ * later through an explicit major/minor or supported-range
+ * contract.
+ *
  * Idiomatic for the cross-language bindings — they want to reject
- * an old shared library before any call surface is touched. */
+ * a mismatched shared library before any call surface is touched. */
 int net_rpc_check_abi_version(uint32_t expected);
 
 /* =========================================================================
@@ -197,8 +221,8 @@ uint64_t net_rpc_id(const MeshRpcHandle* handle);
  *
  * Cancellation tokens are reserved BEFORE the call, then passed
  * to `net_rpc_call` / `_call_service`. A parallel
- * `net_rpc_cancel_call(token)` from another thread aborts the
- * in-flight future — the SDK fires CANCEL on the wire, the
+ * `net_rpc_cancel_call(handle, token)` from another thread aborts
+ * the in-flight future — the SDK fires CANCEL on the wire, the
  * call returns a `cancelled:` error. Reserving up-front closes
  * the "cancel arrives before registration" race: a token MUST
  * be reserved before the call starts, otherwise cancel is a
@@ -208,8 +232,11 @@ uint64_t net_rpc_id(const MeshRpcHandle* handle);
  * are monotonic from 1 and never reused.
  * ========================================================================= */
 
-uint64_t net_rpc_reserve_cancel_token(void);
-void     net_rpc_cancel_call(uint64_t token);
+/* Both take the MeshRpcHandle* as of ABI 0x0004, so the token
+ * routes through that mesh's CancelRegistry. Reserve and cancel
+ * must use the SAME handle. */
+uint64_t net_rpc_reserve_cancel_token(MeshRpcHandle* handle);
+void     net_rpc_cancel_call(MeshRpcHandle* handle, uint64_t token);
 
 /* =========================================================================
  * Handler dispatcher (consumer-side trampoline)

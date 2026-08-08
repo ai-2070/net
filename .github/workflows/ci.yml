@@ -1660,6 +1660,20 @@ jobs:
           RUSTFLAGS: "-Cforce-frame-pointers=yes"
         run: cargo build --release -p net-ffi --features net-ffi/test-helpers
 
+      # The public nRPC header must describe the library being built.
+      #
+      # `net_rpc.h` shipped at ABI 0x0002 against a 0x0004
+      # implementation, declaring both cancellation functions without
+      # the leading `MeshRpcHandle*` that 0x0004 added — so a consumer
+      # compiled against it passed whatever was in the first argument
+      # register as a mesh pointer. The only guard was
+      # `net_rpc_check_abi_version`, which compared `runtime >=
+      # expected` and therefore passed the stale header. Text-only, so
+      # it runs before the build finishes mattering.
+      - name: Guard — nRPC header matches the implementation ABI
+        if: ${{ !cancelled() }}
+        run: python3 "$GITHUB_WORKSPACE/.github/scripts/check-rpc-abi-parity.py"
+
       # The invariant this hang cost a lot to find: the Go binary loads exactly
       # one copy of `net::ffi`.
       #

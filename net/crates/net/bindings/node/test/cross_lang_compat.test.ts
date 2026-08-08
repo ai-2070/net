@@ -182,7 +182,7 @@ describe('Cross-language nRPC wire-format compat (Node side)', () => {
 
   it('fixture metadata matches the canonical contract constants', () => {
     expect(fixture.service).toBe('cross_lang_echo_sum')
-    expect(fixture.abi_version_expected).toBe(0x0001)
+    expect(fixture.abi_version_expected).toBe(0x0004)
     expect(NRPC_TYPED_BAD_REQUEST).toBe(0x8000)
     expect(fixture.ok_cases.length).toBeGreaterThan(0)
     expect(fixture.error_cases.length).toBeGreaterThan(0)
