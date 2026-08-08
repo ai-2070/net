@@ -28,13 +28,13 @@ Every other header has its own guard and composes freely.
 | `net.go.h` | `NET_SDK_H` | Mesh + compute — sessions, channels, capabilities, NAT, daemon dispatch, placement filters, predicate helpers | `libnet` |
 | `net_cortex.h` | `NET_CORTEX_H` | RedEX logs, CortEX Tasks/Memories adapters, NetDb bundle + snapshot | `libnet` |
 | `net_transport.h` | `NET_TRANSPORT_H` | Blob and directory transfer over the stream transport | `libnet` |
-| `net_rpc.h` | `NET_RPC_H` | nRPC request/response | `libnet_rpc` |
-| `net_meshdb.h` | `NET_MESHDB_H` | Federated query layer over capability queries + CortEX folds | `libnet_meshdb` |
-| `net_meshos.h` | `NET_MESHOS_H` | Daemon-author SDK — operator handle + control-event channel | `libnet_meshos` |
-| `net_deck.h` | `NET_DECK_H` | Deck operator-side SDK | `libnet_deck` |
-| `net_org.h` | `NET_ORG_H` | Organization capability auth | `libnet_org` |
-| `net_subnet.h` | `NET_SUBNET_H` | Subnet authority — exported serve + gateway provisioning | `libnet_org` |
-| `net_mcp.h` | `NET_MCP_H` | MCP bridge helpers, graduated consent / pin surface | `libnet_mcp_ffi` |
+| `net_rpc.h` | `NET_RPC_H` | nRPC request/response | `libnet` |
+| `net_meshdb.h` | `NET_MESHDB_H` | Federated query layer over capability queries + CortEX folds | `libnet` |
+| `net_meshos.h` | `NET_MESHOS_H` | Daemon-author SDK — operator handle + control-event channel | `libnet` |
+| `net_deck.h` | `NET_DECK_H` | Deck operator-side SDK | `libnet` |
+| `net_org.h` | `NET_ORG_H` | Organization capability auth | `libnet` |
+| `net_subnet.h` | `NET_SUBNET_H` | Subnet authority — exported serve + gateway provisioning | `libnet` |
+| `net_mcp.h` | `NET_MCP_H` | MCP bridge helpers, graduated consent / pin surface | `libnet` |
 
 `net_cortex.h` is deliberately self-contained — it depends only on `<stdint.h>`
 and `<stddef.h>`, so a consumer who wants just the storage slice can include it
@@ -44,23 +44,21 @@ resolve when the cdylib is built with `--features "netdb redex-disk"`.
 `net.go.h` is the in-crate mirror of `go/net.h` at the repo root, and pulls in
 `net_cortex.h` for its storage half.
 
-`net_subnet.h` ships in `libnet_org`, not a separate library — it `#include`s
-`net_org.h` and shares its error namespace (`NET_ORG_ERR_SUBNET`) and handle
-model. The subnet-exported *caller* verb, `net_org_call_exported`, is declared
+Every header resolves out of the same `libnet`. That is not a simplification
+of the table — it is the whole shipping model, and the reason is in
+[One library, on purpose](#one-library-on-purpose) below.
+
+`net_subnet.h` shares `net_org.h`'s error namespace (`NET_ORG_ERR_SUBNET`) and
+handle model, and `#include`s it. The subnet-exported *caller* verb, `net_org_call_exported`, is declared
 in `net_org.h` because it takes the org client handle.
 
 ## Building the libraries
 
 ```bash
-# libnet — the main library, also serves net_cortex.h and net_transport.h
-cargo build --release --features ffi,net
-
-# The others, one crate each
-cargo build --release -p net-compute-ffi     # libnet_compute
-cargo build --release -p net-rpc-ffi         # libnet_rpc
-cargo build --release -p net-meshdb-ffi      # libnet_meshdb
-cargo build --release -p net-meshos-ffi      # libnet_meshos
+cargo build --release -p net-ffi
 ```
+
+One command, one library, every header served.
 
 Output lands in `target/release/`:
 
@@ -76,8 +74,35 @@ Output lands in `target/release/`:
 gcc -o app app.c -L target/release -lnet -lpthread -ldl -lm
 ```
 
-Add `-lnet_rpc`, `-lnet_meshdb`, `-lnet_meshos`, `-lnet_deck` or `-lnet_org`
-for whichever additional surfaces you included.
+`-lnet` regardless of which headers you included. There is no second `-l` to
+add.
+
+## One library, on purpose
+
+Net used to ship a cdylib per surface — `libnet_rpc`, `libnet_org`,
+`libnet_meshdb` and the rest — and this page used to tell you to link the ones
+you needed alongside `-lnet`. **Do not do that**, on any version. If you have
+a build script carrying those flags, drop them.
+
+Each of those libraries statically embedded its own copy of the core, and
+re-exported the core's symbols. Linking two therefore put two copies of Net's
+internal state in one process. The exported *functions* deduplicate — the
+dynamic linker resolves each name once — which is why the arrangement worked
+for a long time and why it was documented here in good faith.
+
+`static`s do not deduplicate. Each copy keeps its own. One of them is the
+registry `parking_lot` uses to track threads blocked on a lock: a thread that
+blocks through one copy is recorded in that copy's registry, and an unlock
+that runs through the other consults a registry the waiter was never in. The
+lock is released; the waiter is never woken.
+
+It surfaces as a hang with no visible cause. The case that found it sat ten
+minutes inside a capability announcement while every worker thread in the
+process was idle — a held lock owned by nobody. It is timing-dependent, so it
+passes far more often than it fails.
+
+One library makes that unreachable. The per-surface libraries are no longer
+built.
 
 At run time the loader has to find the library:
 

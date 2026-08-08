@@ -23,18 +23,24 @@ cdylib, and which surface each covers — is in
 | `net.go.h` | `NET_SDK_H` | Mesh, capabilities, channels, compute | `libnet` |
 | `net_cortex.h` | `NET_CORTEX_H` | RedEX, CortEX, NetDb | `libnet` |
 | `net_transport.h` | `NET_TRANSPORT_H` | Blob + directory transfer | `libnet` |
-| `net_rpc.h` | `NET_RPC_H` | nRPC | `libnet_rpc` |
-| `net_meshdb.h` | `NET_MESHDB_H` | Federated queries | `libnet_meshdb` |
-| `net_meshos.h` | `NET_MESHOS_H` | Daemon authoring | `libnet_meshos` |
-| `net_deck.h` | `NET_DECK_H` | Operator surface | `libnet_deck` |
-| `net_org.h` | `NET_ORG_H` | Organization capability auth | `libnet_org` |
-| `net_subnet.h` | `NET_SUBNET_H` | Subnet authority (provision / serve / call) | `libnet_org` |
-| `net_mcp.h` | `NET_MCP_H` | MCP bridge, consent / pin surface | `libnet_mcp_ffi` |
+| `net_rpc.h` | `NET_RPC_H` | nRPC | `libnet` |
+| `net_meshdb.h` | `NET_MESHDB_H` | Federated queries | `libnet` |
+| `net_meshos.h` | `NET_MESHOS_H` | Daemon authoring | `libnet` |
+| `net_deck.h` | `NET_DECK_H` | Operator surface | `libnet` |
+| `net_org.h` | `NET_ORG_H` | Organization capability auth | `libnet` |
+| `net_subnet.h` | `NET_SUBNET_H` | Subnet authority (provision / serve / call) | `libnet` |
+| `net_mcp.h` | `NET_MCP_H` | MCP bridge, consent / pin surface | `libnet` |
 
-> **`net_subnet.h` ships in `libnet_org`**, not a separate cdylib: the base
-> `libnet` FFI cannot depend on `net-mesh-sdk` (circular), while `libnet_org`
-> already does, so the subnet surface reuses the org handler dispatcher,
-> `net_org_caller_t`, and the `Arc<MeshNode>` contract. It includes
+> **Every header resolves out of one `libnet`.** The surfaces are built as
+> rlibs and linked together by `bindings/go/net-ffi`, which is the crate that
+> emits the cdylib. Net used to ship one cdylib per surface; each embedded its
+> own copy of the core, so linking two put two copies of the core's `static`s
+> in a process — including the registry `parking_lot` uses to track blocked
+> threads, which made a lock releasable without waking its waiter. One library
+> makes that unreachable. Do not add a second `-l`; there is nothing to add.
+
+> **`net_subnet.h` reuses the org surface** — the org handler dispatcher,
+> `net_org_caller_t`, and the `Arc<MeshNode>` contract — and `#include`s
 > `net_org.h`.
 
 > **`net.h` and `net.go.h` share the `NET_SDK_H` guard** — only one can be
@@ -45,8 +51,7 @@ cdylib, and which surface each covers — is in
 ## Build
 
 ```bash
-cargo build --release --features ffi,net       # libnet
-cargo build --release -p net-rpc-ffi           # libnet_rpc, etc.
+cargo build --release -p net-ffi               # libnet — every surface
 ```
 
 ```bash
