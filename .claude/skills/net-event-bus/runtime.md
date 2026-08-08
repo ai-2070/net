@@ -51,7 +51,7 @@ This is a forgiving contract, but the recommended order in the previous section 
 
 ### Tests
 
-Use the **memory transport** in tests. Always `shutdown` in a tear-down hook. If a test asserts on subscriber output, set the subscriber up *before* the publisher emits — subscriptions are hot and you'll race.
+Use the **memory transport** for tests about construction, config, ingestion, backpressure, counters and shutdown. It selects the Noop adapter and never delivers, so a test that asserts on subscriber output **hangs** on it rather than failing — use a loopback mesh pair, Redis or JetStream for those. Always `shutdown` in a tear-down hook. And whichever transport: set the subscriber up *before* the publisher emits — subscriptions are hot and you'll race. `testing.md` has the full split.
 
 ---
 

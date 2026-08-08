@@ -32,14 +32,24 @@ class TempReading:
     sensor_id: str
     celsius: float
 
-with NetNode(shards=4) as node:
-    # Other transports: redis_url=, jetstream_url=, or mesh_* kwargs
+# A transport that STORES. The default (memory) selects the Noop
+# adapter, which counts batches and discards them — publish succeeds
+# and `subscribe()` then blocks forever with nothing to yield. Use
+# memory for ingestion, batching, backpressure, counters and lifecycle;
+# use redis_url= / jetstream_url= / mesh_* the moment a consumer has to
+# receive something.
+with NetNode(shards=4, redis_url='redis://127.0.0.1:6379') as node:
     temps = node.channel('sensors/temperature', TempReading)
     temps.publish(TempReading(sensor_id='A1', celsius=22.5))
 
     for r in temps.subscribe():           # sync generator
         print(f'{r.sensor_id}: {r.celsius}°C')
 ```
+
+That is a **tagged EventBus topic** — one node, many logical streams over its
+own bus. It is not distributed pub/sub: for two nodes to exchange events by
+channel name, use the `net.NetMesh` channel methods (`core-only` in Python —
+`net_sdk.MeshNode` does not wrap them). See `concepts.md` § Channel.
 
 **`NetNode(...)` is synchronous** — no `await`, no factory. Use the context
 manager for automatic shutdown.

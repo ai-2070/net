@@ -124,13 +124,26 @@ console.log(`${stats.eventsIngested} ingested, ${stats.eventsDropped} dropped`);
 await node.shutdown();   // explicit — Node finalizers are non-deterministic
 ```
 
-Consume what you emit:
+Consume what you emit — **on a transport that stores**. The default is memory,
+which selects the Noop adapter: it counts batches and discards them, so
+`subscribe()` on the node above would block forever with nothing to yield.
 
 ```typescript
+const node = await NetNode.create({
+  shards: 4,
+  transport: { type: 'redis', url: 'redis://127.0.0.1:6379' },
+});
+
+node.emit({ sensor: 'lidar', range_m: 12.5 });
+
 for await (const event of node.subscribe({ limit: 100 })) {
   console.log('event', event);
 }
 ```
+
+Memory is the right choice for ingestion, batching, backpressure, counters and
+lifecycle — everything above this snippet. Use redis, jetstream or mesh the
+moment a consumer has to receive something.
 
 `emit` returns once the event is **accepted into the local ring buffer** — not
 that anyone processed it. Under backpressure it drops, and

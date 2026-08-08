@@ -128,7 +128,7 @@ In Net, backpressure is **immediate and unilateral**. A node that can't keep up 
 Silence propagates through the proximity graph. Neighbors observe the missed heartbeat within a heartbeat interval, mark the node as degraded, open the circuit breaker, and **route new traffic to other capable nodes**. The sender does not slow down. The mesh has other nodes.
 
 **Practical implication for the SDK user:**
-- `emit` / `publish` may silently lose data under backpressure. Check return values: TS returns `null`, batch APIs return ingested counts, Rust returns `Result`.
+- `emit` / `publish` may silently lose data under backpressure. Check return values, and note they differ per surface (see the Publisher table above): TS `emit` throws, TS `channel.publish` returns `false`, Python raises, batch APIs return ingested counts to compare against the input length, Rust returns `Result`. Under the default `drop_oldest` nothing reports at all — the producer always succeeds and the counter never moves.
 - "Lossy by default" is the design. If the user needs reliability, they need either `Reliability::Reliable` per-stream (mesh transport), an explicit persistence layer, or end-to-end acks at the application level.
 - Don't add timeouts and retries against the bus. Backpressure handling is the bus's job.
 
@@ -146,7 +146,7 @@ A node's transport is what physically moves bytes between nodes. In TS, Python, 
 
 | Transport | When to use | Notes |
 |---|---|---|
-| **Memory** (default) | Single process, multiple components, tests | No network, no encryption, no persistence. Pure in-process ring buffer. Fastest. |
+| **Memory** (default) | Construction, ingestion, batching, backpressure, counters, lifecycle | **Does not deliver.** It selects the Noop adapter, which counts batches and discards them (`adapter/noop.rs`); `poll_shard` always returns empty. Publish succeeds, `subscribe()` yields nothing, forever — a round-trip **hangs** rather than failing. No network, no encryption, no persistence. |
 | **Mesh** (UDP, peer-to-peer) | Production multi-host deployments | Encrypted (Noise + ChaCha20-Poly1305), no broker, NAT traversal opt-in, automatic rerouting. The "real" Net. |
 | **Redis** | When you already run Redis and need cross-process pub/sub with optional persistence | Net publishes to Redis Streams; subscribers read from them. You get Redis's durability semantics. |
 | **JetStream** (NATS) | When you already run NATS JetStream and want its durability/retention | Same idea as Redis adapter, different backend. |
@@ -154,6 +154,8 @@ A node's transport is what physically moves bytes between nodes. In TS, Python, 
 Selection happens via constructor parameters — see `apis.md`. **A node can have only one transport at a time** (it's set at construction). To bridge transports, run two nodes in the same process.
 
 In TS, Python, and Rust, application code does not know which transport it got. Code written for the memory transport runs unmodified on mesh transport. This is the "location-transparent consumption" property — the call signature for `publish` is identical whether the subscriber is in the same process or five hops away on a different continent. (Go and C are an exception: their poll-based surface and current binding shape can require explicit changes when switching transports — `NewMeshNode` for mesh, etc.)
+
+**Transparent does not mean equivalent.** Memory is the one entry in that table that never hands an event to a consumer, so "runs unmodified" is a statement about the *code*, not the *behaviour*: the same snippet that round-trips on Redis blocks indefinitely on memory. Write round-trip examples and delivery tests against a loopback mesh pair, Redis, or JetStream. `testing.md` has the split by what you are asserting.
 
 ## Encryption (for mesh transport)
 

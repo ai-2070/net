@@ -25,9 +25,16 @@ is missing.
 ```typescript
 interface TempReading { sensor_id: string; celsius: number }
 
-const node = await NetNode.create({ shards: 4 });
-// Other transports: pass `transport: { type: 'redis' | 'jetstream' | 'mesh', ... }`
-// to create() — per-transport fields are on `Transport` in src/types.ts.
+// A transport that STORES. The default (memory) selects the Noop
+// adapter, which counts batches and discards them — publish succeeds
+// and `subscribe()` then yields nothing, forever. Use memory for
+// ingestion, batching, backpressure, counters and lifecycle; use
+// redis / jetstream / mesh the moment a consumer has to receive
+// something. Per-transport fields are on `Transport` in src/types.ts.
+const node = await NetNode.create({
+  shards: 4,
+  transport: { type: 'redis', url: 'redis://127.0.0.1:6379' },
+});
 
 const temps = node.channel<TempReading>('sensors/temperature');
 temps.publish({ sensor_id: 'A1', celsius: 22.5 });
@@ -38,6 +45,11 @@ for await (const r of temps.subscribe()) {
 
 await node.shutdown();
 ```
+
+That is a **tagged EventBus topic** — one node, many logical streams over its
+own bus. It is not distributed pub/sub: for two nodes to exchange events by
+channel name, use `MeshNode.registerChannel` / `subscribeChannel` /
+`publishChannel`. See `concepts.md` § Channel.
 
 **`NetNode.create(config)` is async — you must `await` it.** This is the first
 thing that differs from Python, where construction is synchronous.
