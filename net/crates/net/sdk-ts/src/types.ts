@@ -49,8 +49,22 @@ export interface NetNodeConfig {
 export interface Receipt {
   /** The shard the event was assigned to. */
   shardId: number;
-  /** Insertion timestamp (nanoseconds). */
-  timestamp: number;
+  /**
+   * Insertion timestamp in **nanoseconds**, as a `bigint`.
+   *
+   * Not a `number`. Unix-epoch nanoseconds crossed JavaScript's
+   * exact-integer ceiling (`2^53 - 1`) around 104 days past 1970, so
+   * every realistic value on this field was already losing its
+   * low-order digits before this changed.
+   *
+   * `JSON.stringify` throws on `bigint`. Convert explicitly at the
+   * point of display rather than storing a lossy copy:
+   *
+   * ```ts
+   * const timestampMs = Number(timestamp / 1_000_000n);
+   * ```
+   */
+  timestamp: bigint;
 }
 
 /** A stored event from the bus. */
@@ -75,8 +89,22 @@ export interface StoredEvent {
    * be read back through the same wrapper at all.
    */
   rawBytes: Buffer;
-  /** Insertion timestamp (nanoseconds). */
-  insertionTs: number;
+  /**
+   * Insertion timestamp in **nanoseconds**, as a `bigint`.
+   *
+   * Not a `number`. Unix-epoch nanoseconds crossed JavaScript's
+   * exact-integer ceiling (`2^53 - 1`) around 104 days past 1970, so
+   * every realistic value on this field was already losing its
+   * low-order digits before this changed.
+   *
+   * `JSON.stringify` throws on `bigint`. Convert explicitly at the
+   * point of display rather than storing a lossy copy:
+   *
+   * ```ts
+   * const timestampMs = Number(insertionTs / 1_000_000n);
+   * ```
+   */
+  insertionTs: bigint;
   /** Shard ID. */
   shardId: number;
 }

@@ -66,7 +66,7 @@ class TrickleBus {
       this.accumulator.push({
         id: String(this.nextSeq++),
         raw: '{"x":1}',
-        insertionTs: Date.now(),
+        insertionTs: BigInt(Date.now()),
         shardId: 0,
       });
     }

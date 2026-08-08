@@ -53,3 +53,45 @@ Drift is now checked mechanically by
 names, argument count and order, pointer-versus-value, return types),
 wired into the Go FFI job in `ci.yml`. Reverting either half of this
 change reproduces a failure there.
+
+---
+
+## Node nanosecond timestamps become `bigint`
+
+**Who is affected:** every TypeScript and JavaScript consumer that reads
+`Receipt.timestamp` or `StoredEvent.insertionTs`.
+
+Both were `number`. Unix-epoch nanoseconds crossed JavaScript's
+exact-integer ceiling (`2^53 - 1`) around 104 days past 1970, so every
+realistic value on these fields had already lost its low-order digits
+— `9007199254740993` read back as `9007199254740992`. The native path
+also cast the core `u64` through `i64`, a second narrowing.
+
+```typescript
+// was
+interface Receipt { shardId: number; timestamp: number }
+interface StoredEvent { insertionTs: number; /* ... */ }
+
+// now
+interface Receipt { shardId: number; timestamp: bigint }
+interface StoredEvent { insertionTs: bigint; /* ... */ }
+```
+
+No compatibility alias was added. One would have preserved incorrect
+data rather than compatibility, and Node already used `BigInt` for
+large counters and stream timestamps — these fields were the
+inconsistency.
+
+**What to do:** arithmetic on these fields needs `bigint` literals
+(`ts - start` where both are `bigint`; `1_000_000n`, not `1_000_000`).
+Mixing `bigint` and `number` in one expression is a `TypeError`.
+
+**`JSON.stringify` throws on a `bigint`.** Convert explicitly where you
+serialize or log:
+
+```typescript
+const timestampMs = Number(insertionTs / 1_000_000n);
+```
+
+Sub-microsecond latency deltas are now trustworthy, which they were not
+before.

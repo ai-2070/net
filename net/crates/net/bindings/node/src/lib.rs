@@ -372,8 +372,17 @@ pub struct StoredEvent {
     /// fidelity should prefer this over `raw`. For UTF-8 payloads the
     /// two fields carry the same content in different representations.
     pub raw_bytes: Buffer,
-    /// Insertion timestamp (nanoseconds)
-    pub insertion_ts: i64,
+    /// Insertion timestamp (nanoseconds).
+    ///
+    /// `BigInt`, not `number`. Unix-epoch nanoseconds crossed
+    /// JavaScript's exact-integer ceiling (`2^53 - 1`) around 104 days
+    /// past 1970, so *every* realistic value on this field was already
+    /// losing its low-order digits — `9007199254740993` came back as
+    /// `9007199254740992`. The cast also went through `i64`, which is
+    /// a second narrowing of a `u64`. Node already uses `BigInt` for
+    /// large counters and stream timestamps; this field was the
+    /// inconsistency.
+    pub insertion_ts: BigInt,
     /// Shard ID
     pub shard_id: u32,
 }
@@ -394,8 +403,17 @@ pub struct PollResponse {
 pub struct IngestResult {
     /// Shard the event was assigned to
     pub shard_id: u32,
-    /// Insertion timestamp
-    pub timestamp: i64,
+    /// Insertion timestamp (nanoseconds).
+    ///
+    /// `BigInt`, not `number`. Unix-epoch nanoseconds crossed
+    /// JavaScript's exact-integer ceiling (`2^53 - 1`) around 104 days
+    /// past 1970, so *every* realistic value on this field was already
+    /// losing its low-order digits — `9007199254740993` came back as
+    /// `9007199254740992`. The cast also went through `i64`, which is
+    /// a second narrowing of a `u64`. Node already uses `BigInt` for
+    /// large counters and stream timestamps; this field was the
+    /// inconsistency.
+    pub timestamp: BigInt,
 }
 
 /// Ingestion statistics.
@@ -556,7 +574,7 @@ impl Net {
 
         Ok(IngestResult {
             shard_id: shard_id as u32,
-            timestamp: ts as i64,
+            timestamp: BigInt::from(ts),
         })
     }
 
@@ -686,7 +704,7 @@ impl Net {
                     id: e.id,
                     raw,
                     raw_bytes,
-                    insertion_ts: e.insertion_ts as i64,
+                    insertion_ts: BigInt::from(e.insertion_ts),
                     shard_id: e.shard_id as u32,
                 }
             })
@@ -1896,7 +1914,7 @@ mod mesh_bindings {
                         id: e.id,
                         raw,
                         raw_bytes,
-                        insertion_ts: e.insertion_ts as i64,
+                        insertion_ts: BigInt::from(e.insertion_ts),
                         shard_id: e.shard_id as u32,
                     }
                 })

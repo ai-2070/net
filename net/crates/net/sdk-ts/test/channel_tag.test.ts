@@ -36,7 +36,7 @@ function recordingBus(): NapiNet & { ingested: string[] } {
       const events = ingested.slice(served).map((raw, i) => ({
         id: String(served + i),
         raw,
-        insertionTs: 0,
+        insertionTs: 0n,
         shardId: 0,
       }));
       served = ingested.length;
