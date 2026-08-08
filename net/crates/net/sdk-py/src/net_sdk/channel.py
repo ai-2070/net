@@ -12,6 +12,75 @@ from net_sdk.stream import EventStream, SubscribeOpts, TypedEventStream
 
 T = TypeVar("T")
 
+#: Maximum channel-name length in bytes. Mirrors `MAX_NAME_LEN` in
+#: `net/crates/net/src/adapter/net/channel/name.rs`.
+MAX_CHANNEL_NAME_LEN = 255
+
+_ALLOWED_CHANNEL_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyz" "0123456789" "-_./"
+)
+
+
+class ChannelNameError(ValueError):
+    """A channel name violated the canonical Net naming grammar.
+
+    Raised by :func:`validate_channel_name` and, transitively, by the
+    :class:`TypedChannel` constructor.
+    """
+
+
+def validate_channel_name(name: str) -> str:
+    """Validate `name` against the canonical Net channel-name grammar.
+
+    This is the Python mirror of `ChannelName::validate` in
+    `net/crates/net/src/adapter/net/channel/name.rs`. The Rust type is
+    the only constructor for a distributed mesh channel name and has no
+    `From<&str>` escape hatch, but the ergonomic tagged-topic wrapper
+    here never reaches it: `TypedChannel.publish` embeds the name in
+    generic EventBus JSON as `_channel`. Without this check a name that
+    the mesh would reject is accepted locally and only fails — or,
+    worse, silently splits a namespace — once the same string is used
+    against a real mesh channel.
+
+    Returns `name` unchanged so callers can validate inline.
+    Raises `ChannelNameError` on any violation.
+    """
+    if not isinstance(name, str):
+        raise ChannelNameError(
+            f"channel name must be a str, got {type(name).__name__}"
+        )
+    if not name:
+        raise ChannelNameError("channel name must not be empty")
+    encoded_len = len(name.encode("utf-8"))
+    if encoded_len > MAX_CHANNEL_NAME_LEN:
+        raise ChannelNameError(
+            f"channel name too long: {encoded_len} bytes "
+            f"(max {MAX_CHANNEL_NAME_LEN})"
+        )
+    if name.startswith("/") or name.endswith("/"):
+        raise ChannelNameError("channel name must not start or end with '/'")
+    if "//" in name:
+        raise ChannelNameError("channel name must not contain '//'")
+    for ch in name:
+        # Uppercase gets its own message: `foo.bar` and `FOO.BAR` would
+        # otherwise be distinct channels with distinct hashes, registry
+        # entries, and ACL entries — an operator who locked down
+        # `prod.deploy` would silently leave `Prod.deploy` open.
+        if "A" <= ch <= "Z":
+            raise ChannelNameError(
+                f"uppercase character {ch!r} not allowed — "
+                "channel names are lowercase only"
+            )
+        if ch not in _ALLOWED_CHANNEL_CHARS:
+            raise ChannelNameError(f"invalid character {ch!r} in channel name")
+    # Channel names double as on-disk directory segments under the
+    # `redex-disk` feature: `..` would escape the persistence root and
+    # `.` would alias the current directory.
+    for seg in name.split("/"):
+        if seg in (".", ".."):
+            raise ChannelNameError(f"path segment {seg!r} is reserved")
+    return name
+
 
 def _to_dict(event: Any) -> dict:
     """Convert an event to a dict copy, never mutating the original."""
@@ -44,7 +113,7 @@ class TypedChannel(Generic[T]):
         parse: Optional[Callable[[str], T]] = None,
     ) -> None:
         self._bus = bus
-        self._name = name
+        self._name = validate_channel_name(name)
         self._model = model
         self._parse = parse
         # Filter is a constant for the lifetime of the channel; build

@@ -97,7 +97,12 @@ from net_sdk.capability_schema import (
     WarningUnknownKey,
     validate_capabilities,
 )
-from net_sdk.channel import TypedChannel
+from net_sdk.channel import (
+    MAX_CHANNEL_NAME_LEN,
+    ChannelNameError,
+    TypedChannel,
+    validate_channel_name,
+)
 from net_sdk.mesh import (
     BackpressureError,
     MeshNode,
@@ -114,6 +119,9 @@ __all__ = [
     "EventStream",
     "TypedEventStream",
     "TypedChannel",
+    "ChannelNameError",
+    "validate_channel_name",
+    "MAX_CHANNEL_NAME_LEN",
     "MeshNode",
     "MeshStream",
     "StreamStats",

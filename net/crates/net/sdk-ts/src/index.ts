@@ -33,7 +33,12 @@ export { NetNode } from './node';
 export { EventStream, TypedEventStream } from './stream';
 
 // Typed channels.
-export { TypedChannel } from './channel';
+export {
+  TypedChannel,
+  ChannelNameError,
+  validateChannelName,
+  MAX_CHANNEL_NAME_LEN,
+} from './channel';
 
 // Mesh + streams.
 export {

@@ -40,10 +40,13 @@ Consequences:
 
 `ChannelName::new` validates; there is no `From<&str>` escape hatch. Names are hierarchical paths:
 
-- **Max 255 bytes** (`MAX_NAME_LEN`).
-- Valid characters: alphanumeric plus `-`, `_`, `.`, `/`.
+- **Max 255 bytes** (`MAX_NAME_LEN`) — bytes, not characters.
+- Valid characters: **lowercase** ASCII `a-z`, digits `0-9`, and `-`, `_`, `.`, `/`. Nothing else — no spaces, no `:`, `*`, `+`, `#`, no non-ASCII.
+- **Uppercase is rejected outright.** Not "case-sensitive" — `Sensors/Temp` is not a different channel from `sensors/temp`, it is an error. Lowercase-only eliminates the split-namespace footgun where `prod.deploy` is locked down by ACL and `Prod.deploy` silently is not.
 - Must not be empty, must not start or end with `/`, must not contain `//`.
-- **Matched case-sensitively.** `Sensors/Temp` and `sensors/temp` are different channels — this is the #1 "why is my subscriber silent" cause after transport mismatch.
+- **`.` and `..` are rejected as whole path segments** (`a/../b`, `./x`, a bare `..`). Channel names double as on-disk directory segments under the `redex-disk` feature, so `..` would escape the persistence root.
+
+The ergonomic TS/Python `node.channel(name)` wrappers apply the **same** grammar in the `TypedChannel` constructor (`validateChannelName` / `validate_channel_name`, throwing `ChannelNameError`). They previously did not, so a name the mesh rejects was accepted locally and diverged only later.
 
 Prefix matching is first-class: a subscriber to `sensors/lidar` receives `sensors/lidar/front` and `sensors/lidar/rear` alike (subject to capabilities).
 
