@@ -17,6 +17,9 @@ members = [
     "bindings/go/meshos-ffi",
     "bindings/go/deck-ffi",
     "bindings/go/mcp-ffi",
+    # The single cdylib the Go binding links; the seven above are its rlib
+    # inputs and are no longer linked individually.
+    "bindings/go/net-ffi",
 ]
 
 [package]

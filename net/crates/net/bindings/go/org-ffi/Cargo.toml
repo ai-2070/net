@@ -24,15 +24,25 @@ default = []
 # `Arc<MeshNode>` references handed in by the existing Go binding via
 # `net::ffi::mesh::net_mesh_arc_clone`.
 #
-# The feature list MUST match what the standalone `libnet.dylib` build
-# enables (see `compute-ffi/Cargo.toml`'s note on cfg-gated field
-# offsets). Every Go-binding cdylib (`libnet`, `libnet_compute`,
-# `libnet_rpc`, `libnet_org`, …) exports the same `#[no_mangle]` FFI
-# symbols from `net::ffi`; the Go test binary's link order resolves
-# them to one copy. If two crates compile `net` with different
-# features, cfg-gated fields on shared types (`CapabilitySet`,
-# `MeshNode`, etc.) shift offsets and shared paths read through the
-# wrong layout — a subtle UB. Kept identical to `compute-ffi`'s list.
+# This crate is no longer linked on its own. `bindings/go/net-ffi` pulls it in
+# as an rlib and emits the single `libnet_go` cdylib the Go binding links, so
+# there is exactly one copy of `net-mesh` in the process.
+#
+# The note that used to live here said the duplication was fine because link
+# order resolved the exported FFI symbols to one copy, and worried only about
+# cfg-gated field offsets staying consistent. The offsets part was right. The
+# conclusion was not: link order unifies FUNCTIONS, never `static`s, and each
+# cdylib kept its own `ffi::mesh::runtime()` OnceLock, its own tokio TLS, and —
+# the one that actually bit — its own `parking_lot_core` parked-thread
+# registry. A thread blocking on `MeshNode::announce_mu` parked in libnet's
+# registry; the unlock ran out of this crate's copy, found nothing parked in
+# ITS registry, and never woke it. That is the Go CI hang: ~9 minutes inside
+# `net_mesh_announce_capabilities`, every worker thread idle, lock held by
+# nobody.
+#
+# The feature list below is still kept aligned with `compute-ffi`'s for the
+# offset reason, though `net-ffi/Cargo.toml` now declares the authoritative
+# union.
 net = { package = "net-mesh", version = "0.34.0", path = "../../..", features = ["net", "netdb", "redex-disk", "tool"] }
 # SDK org surface — `OrgCredentials`, `OrgClient`, `OrgAccess`,
 # `OrgCaller`, `OrgSdkError`, and the provisioning entrypoints. The Go

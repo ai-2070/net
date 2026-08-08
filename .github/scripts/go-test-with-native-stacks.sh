@@ -72,15 +72,13 @@ sudo apt-get update -qq || true
 sudo apt-get install -y -qq gdb
 
 for c in "${cores[@]}"; do
-  # `info sharedlibrary` first, and it is not incidental. This binary links
-  # EIGHT cdylibs that each embed and re-export a full copy of net-mesh's
-  # `net::ffi` — verified by parsing the export tables: libnet_org defines all
-  # 57 `net_mesh_*` entry points itself, alongside its own 24. Link order
-  # resolves the FUNCTIONS to one copy, but every internal `static` stays
-  # per-object, including `ffi::mesh::runtime()`'s OnceLock and tokio's own
-  # TLS — which is what `block_on`'s runtime-in-runtime guard reads, so that
-  # guard cannot see across the boundary. The map says how many runtimes could
-  # be in play before the backtrace says which one is stuck.
+  # `info sharedlibrary` first, and it is not incidental: it is the check that
+  # the one-cdylib layout still holds. The binding used to link EIGHT cdylibs
+  # that each embedded and re-exported a full copy of net-mesh's `net::ffi`,
+  # and the duplicate per-object `static`s — specifically `parking_lot_core`'s
+  # parked-thread registry — are what produced the announce_mu hang this
+  # harness was built to catch. `libnet_go.so` should now be the only net
+  # library in the map; anything else beside it means the collapse regressed.
   #
   # `info threads` next, because the threads that matter are the ones Rust
   # created, which is the entire reason any of this exists.

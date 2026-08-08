@@ -16,7 +16,7 @@
 package net
 
 /*
-#cgo LDFLAGS: -L${SRCDIR}/../net/crates/net/target/release -lnet
+#cgo LDFLAGS: -L${SRCDIR}/../net/crates/net/target/release -lnet_go
 #include <stdint.h>
 #include <stdlib.h>
 

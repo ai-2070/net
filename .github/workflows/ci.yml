@@ -1639,79 +1639,92 @@ jobs:
       #
       # Built as one cargo invocation so feature unification on the
       # shared `net-mesh` dep doesn't cause a second compilation pass.
-      - name: Build net + net_compute + net_meshdb + net_meshos + net_deck + net_rpc + net_mcp + net_org cdylibs
+      # ONE cdylib for the Go binding: `net-go-ffi` links `net-mesh` and the
+      # seven C-ABI surfaces together and emits `libnet_go.so`. `net-mesh` is
+      # still built as its own cdylib because the C skill example below links
+      # `-lnet`; the Go binary never loads it.
+      #
+      # This replaced eight separately-linked cdylibs, each of which embedded
+      # and re-exported its own copy of `net::ffi`. Link order unified the
+      # FUNCTIONS, which is why it looked fine for months. It does not unify
+      # `static`s, and `parking_lot_core` keeps its parked-thread registry in
+      # one — so a thread that parked on `MeshNode::announce_mu` in libnet's
+      # registry was never woken by an unlock that ran out of libnet_org's.
+      # That was the Go CI hang.
+      #
+      # The feature set now lives in `net-ffi/Cargo.toml` rather than here.
+      # Relying on cargo unifying the siblings' requests made it a property of
+      # this command line, so building any subset silently produced a
+      # differently-configured `net-mesh`.
+      - name: Build the Go binding cdylib (net_go) + libnet for the C example
         working-directory: net/crates/net
         env:
-          # Line tables + frame pointers so a core from a hung run actually
-          # unwinds. Without them gdb reports "Shared library is missing
-          # debugging information" for all eight cdylibs, and the ONE thread
-          # that matters — the one holding the lock the cgo caller is blocked
-          # on — unwinds two frames and stops. The blocked side is legible only
-          # because `net_mesh_announce_capabilities` is an exported symbol; the
-          # holder is not, so it needs real unwind data.
+          # Line tables + frame pointers so a core from a hung run unwinds.
+          # Without them gdb reports "missing debugging information" and the
+          # one thread that matters stops two frames in — which is how three
+          # captures in a row came back unreadable.
           #
           # Set through the cargo profile variable rather than `-Cdebuginfo` in
-          # RUSTFLAGS. Same result, but it cannot be silently displaced by a
-          # `rustflags` key in `.cargo/config.toml` (the one at
-          # net/crates/net/.cargo/config.toml has its `[build] rustflags`
-          # commented out today — this does not depend on it staying that way).
-          # `1` is line tables, not full DWARF: enough to walk and name a stack
-          # without `-g`'s size and link time. `lto = true` still inlines hard,
-          # so frames will be merged — legible is the goal, not faithful.
+          # RUSTFLAGS so a `rustflags` key in `.cargo/config.toml` cannot
+          # displace it. `1` is line tables, not full DWARF.
           #
-          # Diagnostic setting. Drop it once the hang is understood; it is not
-          # something the shipped cdylibs should carry.
+          # Diagnostic setting, kept while the fix is confirmed. Drop it after
+          # a few green runs; shipped cdylibs should not carry it.
           CARGO_PROFILE_RELEASE_DEBUG: "1"
           RUSTFLAGS: "-Cforce-frame-pointers=yes"
         run: >
           cargo build --release
-          -p net-mesh -p net-compute-ffi -p net-meshdb-ffi -p net-meshos-ffi -p net-deck-ffi -p net-rpc-ffi -p net-mcp-ffi -p net-org-ffi
-          --features "net-mesh/netdb,net-mesh/dataforts,net-mesh/redex-disk,net-mesh/nat-traversal,net-mesh/redis,net-compute-ffi/test-helpers"
+          -p net-go-ffi -p net-mesh
+          --features "net-go-ffi/test-helpers"
 
-      # How many copies of `net::ffi` this binary is about to load.
+      # The invariant this hang cost a lot to find: the Go binary loads exactly
+      # one copy of `net::ffi`.
       #
-      # Each sibling cdylib takes `net-mesh` as an ordinary path dependency, so
-      # each statically embeds it AND re-exports its `#[no_mangle]` symbols;
-      # there is no version script under `bindings/go` restricting that. On a
-      # PE build libnet_org exports all 57 `net_mesh_*` entry points itself,
-      # and the ELF layout here is the same shape. `org-ffi/Cargo.toml` records
-      # the duplication and reasons about field OFFSETS staying consistent —
-      # which the single unifying `cargo build` above does guarantee. It says
-      # nothing about per-object `static`s, and those do NOT unify: link order
-      # collapses the functions to one copy while each `.so` keeps its own
-      # `ffi::mesh::runtime()` OnceLock and its own tokio TLS. `block_on`'s
-      # runtime-in-runtime guard reads that TLS, so it is blind across the
-      # boundary.
+      # Three ways it can regress, so three assertions — "does it build" passes
+      # through all of them:
       #
-      # Informational, not a gate: it prints the count so the next hang can be
-      # read against a known map rather than an assumed one. Wire it to a
-      # threshold only once we know what the right number is.
-      - name: Report duplicate net::ffi copies, assert the cdylibs can unwind
+      #   1. a `go/*.go` file reintroduces a second `-l...` and links a sibling
+      #      surface directly again;
+      #   2. an `extern crate` line goes missing from `net-ffi/src/lib.rs`, in
+      #      which case that surface's symbols are silently absent and the
+      #      failure surfaces as a link error somewhere unrelated;
+      #   3. the cdylib builds without DWARF — not a correctness bug, but it
+      #      makes the next hang unreadable while still looking like success.
+      - name: Assert the Go binding links exactly one net::ffi
         if: ${{ !cancelled() }}
-        working-directory: net/crates/net/target/release
         run: |
-          missing=0
-          for so in libnet*.so; do
-            n=$(nm -D --defined-only "$so" 2>/dev/null | grep -c ' T net_mesh_' || true)
-            if readelf -S "$so" 2>/dev/null | grep -q '\.debug_'; then
-              dbg=dwarf
-            else
-              dbg=NONE
-              missing=1
-            fi
-            printf '%-28s %s net_mesh_* definitions, debug=%s\n' "$so" "${n:-0}" "$dbg"
-          done
-          # A hard failure, not a note. The build carrying no DWARF is exactly
-          # how a hang dump comes back unreadable, and the last two did — the
-          # backtrace stops at the frame that would have named the holder, and
-          # the run still looks like it captured something. Silence must not
-          # read as success; that is the same lesson `check-checker-lib.sh`
-          # exists to enforce for the Python checkers.
-          if [ "$missing" -ne 0 ]; then
-            echo "::error::cdylibs built without DWARF — a hang dump will not unwind past the FFI entry point."
-            echo "CARGO_PROFILE_RELEASE_DEBUG on the build step above is what sets this; check it survived."
-            exit 1
+          cd "$GITHUB_WORKSPACE"
+          fail=0
+
+          # (1) every cgo directive names net_go and nothing else.
+          if grep -h "cgo LDFLAGS" go/*.go | grep -qv -- "-lnet_go$"; then
+            echo "::error::a go/*.go cgo directive links something other than -lnet_go"
+            grep -h "cgo LDFLAGS" go/*.go | grep -v -- "-lnet_go$"
+            echo "Every surface is in libnet_go.so. Linking a sibling cdylib beside it"
+            echo "puts a second copy of net::ffi in the process, which is the hang."
+            fail=1
           fi
+
+          cd net/crates/net/target/release
+
+          # (2) every surface actually made it into the one library.
+          for pfx in net_mesh_ net_org_ net_rpc_ net_compute_ net_meshdb_ net_meshos_ net_deck_ net_mcp_; do
+            n=$(nm -D --defined-only libnet_go.so 2>/dev/null | grep -c " T $pfx" || true)
+            echo "  $pfx exported: ${n:-0}"
+            if [ "${n:-0}" -eq 0 ]; then
+              echo "::error::libnet_go.so exports no ${pfx}* symbols; the matching extern crate line in bindings/go/net-ffi/src/lib.rs is probably gone"
+              fail=1
+            fi
+          done
+
+          # (3) unwind data, so a hang dump is readable.
+          if ! readelf -S libnet_go.so 2>/dev/null | grep -q debug_; then
+            echo "::error::libnet_go.so has no DWARF; a hang dump will not unwind past the FFI entry point"
+            echo "CARGO_PROFILE_RELEASE_DEBUG on the build step above is what sets this."
+            fail=1
+          fi
+
+          exit $fail
 
       # `integration_test.go` gates its suite behind RUN_INTEGRATION_TESTS=1
       # so local developers can run quick unit-style passes without the
