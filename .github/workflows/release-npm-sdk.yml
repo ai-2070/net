@@ -35,6 +35,17 @@ jobs:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
 
+      # Everything below builds against `@net-mesh/core` via the
+      # `file:../bindings/node` devDependency, which has no version — so a
+      # green build here says nothing about whether the pair a user installs
+      # can resolve. `@net-mesh/sdk` 0.34.0 has shipped a
+      # `@net-mesh/core >=0.35.0` peer range against an in-tree core of
+      # 0.34.0 with no step objecting. Strict mode: at publish time the
+      # manifest version is final, so a pending bump is not an excuse.
+      - name: Gate — SDK peer range admits the core being released
+        working-directory: ${{ github.workspace }}
+        run: python3 .github/scripts/check-npm-peer-range.py --strict
+
       # The sdk-ts `prebuild` script runs `napi build` in
       # `bindings/node` when `index.d.ts` is missing (which it always
       # is in a fresh CI checkout — the file is gitignored). napi-rs

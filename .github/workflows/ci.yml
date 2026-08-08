@@ -1346,6 +1346,16 @@ jobs:
         with:
           node-version: "24"
 
+      # `sdk-ts` resolves `@net-mesh/core` through a `file:` devDependency,
+      # which carries no version — so a peerDependency range that excludes
+      # the core it ships with is invisible to every other step in this job.
+      # It surfaces only at `npm install` on a user's machine. Non-strict
+      # here: a floor aimed at an unreleased version is fine as long as the
+      # CHANGELOG says so. `release-npm-sdk.yml` runs the strict form.
+      - name: Guard — SDK peer range admits the in-tree core
+        working-directory: ${{ github.workspace }}
+        run: python3 .github/scripts/check-npm-peer-range.py
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
