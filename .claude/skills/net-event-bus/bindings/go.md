@@ -50,9 +50,16 @@ Mesh transport is a **separate constructor**: `net.NewMeshNode(cfg)` with its ow
 
 ## The runtime model — you write the loop
 
-**There is no async iterator and no named-channel API.** Write the polling loop
-yourself and carry `NextID` across calls. Filter by inspecting the JSON in the
-loop.
+**On the bus there is no async iterator and no tagged-topic API.** Write the
+polling loop yourself and carry `NextID` across calls. Filter by inspecting the
+JSON in the loop.
+
+This is about `net.New` (the bus). **Distributed mesh channels are a separate,
+fully present surface** on `net.NewMeshNode`: `RegisterChannel`,
+`SubscribeChannel` / `SubscribeChannelWithToken`, `Publish`, `RecvShard`. What
+Go lacks is the TS/Python `node.channel()` convenience label over local
+ingestion — not distributed pub/sub. See `bindings/coverage.md` for what the
+mesh surface does and does not carry here.
 
 All methods are thread-safe.
 

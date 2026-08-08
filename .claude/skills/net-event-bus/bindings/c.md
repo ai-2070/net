@@ -58,8 +58,14 @@ Configuration is a JSON string to `net_init`, which returns `NULL` on failure.
 
 ## The runtime model — synchronous polling only
 
-No async, no callbacks, no subscribe. A live consumer is this loop on an
-interval. Pass `NULL` as the cursor on the first call.
+No async, no callbacks, no subscribe **on the bus**. A live consumer is this
+loop on an interval. Pass `NULL` as the cursor on the first call.
+
+The mesh handle is a different story: `net_mesh_register_channel`,
+`net_mesh_subscribe_channel` / `..._with_token`, and `net_mesh_publish` give C
+the full distributed-channel surface, with `net_mesh_recv_shard` for delivery.
+What C lacks is the TS/Python `node.channel()` convenience label over local
+ingestion.
 
 **The cursor trap:** `net_free_poll_result` frees `next_id` along with the
 events. Copy the cursor *before* freeing, or you have a use-after-free that will

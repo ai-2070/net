@@ -7,11 +7,13 @@ description: A channel is a named endpoint that carries events through the mesh.
 
 A channel is a named endpoint that carries events through the mesh. Channels are the primary thing you program against: you publish to a channel, you subscribe to a channel, and everything else Net does — durable logs, materialized views, RPC, distributed daemons — is expressed in terms of one channel or another.
 
-A channel name looks like a path: `sensors/lidar/front`, `chat/lobby`, `metrics/$node`. The hierarchy isn't decorative. It controls how packets propagate across subnet boundaries, how authorization composes from broader scopes to narrower ones, and how you can subscribe to whole subtrees at once.
+A channel name looks like a path: `sensors/lidar/front`, `chat/lobby`, `metrics/$node`. The hierarchy isn't decorative. It controls how packets propagate across subnet boundaries and how authorization composes from broader scopes to narrower ones. It does **not** give you subtree subscription — see Naming below.
 
 ## Naming
 
-Channel names are slash-separated paths, up to 255 bytes, drawn from `a-z`, `A-Z`, `0-9`, and the characters `-`, `_`, `.`, `/`. They can't start or end with a slash, can't contain a double slash, and are matched case-sensitively.
+Channel names are slash-separated paths, up to 255 bytes, drawn from `a-z`, `0-9`, and the characters `-`, `_`, `.`, `/`. They can't start or end with a slash, can't contain a double slash, and can't use `.` or `..` as a whole path segment — names double as on-disk directory segments under the `redex-disk` feature, so `..` would escape the persistence root.
+
+**Uppercase is rejected, not case-sensitive.** `Sensors/Temp` is an error, not a different channel from `sensors/temp`. Lowercase-only removes the split-namespace footgun where `prod.deploy` is locked down by ACL while `Prod.deploy` — a different hash, a different registry entry, a different ACL entry — silently is not.
 
 Every channel name is reduced to _two_ hashes, and the distinction matters.
 
@@ -21,7 +23,7 @@ The **wire `channel_hash`** is a 16-bit value carried in the packet header. It's
 
 Those collisions are harmless precisely because the wire hint decides nothing that matters: access control, config lookup, and storage all key on the canonical 64-bit hash. Keep the two apart when you're writing a relay or reading a capture — the header's `channel_hash` tells you where a packet is probably headed, never what it's allowed to do. (The split is deliberate. The canonical key used to be a 32-bit truncation, which meant roughly 2^32 of grinding could produce a token issued for one channel that satisfied the token cache's fast path for an unrelated victim channel that landed in the same bucket.)
 
-Names are hierarchical, and prefix matching is a first-class operation. A subscriber to `sensors/lidar` receives events from `sensors/lidar/front` and `sensors/lidar/rear` alike — provided it's authorized on them.
+Names are hierarchical, and prefix matching is a first-class operation — **for authorization, not for delivery**. `Mesh::register_channel_prefix` lets one config cover every channel under a prefix, which is how nRPC authorizes `<service>.replies.<caller_origin>` without pre-registering each caller. Subscriptions themselves are exact: rosters key on the exact `ChannelId`, so a subscriber to `sensors/lidar` does **not** receive `sensors/lidar/front`. Subscribe to each name you want.
 
 ## Visibility
 

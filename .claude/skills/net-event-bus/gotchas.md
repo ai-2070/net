@@ -14,9 +14,12 @@ What to do: explain that "the broker" maps to "the publisher's local roster + th
 
 ## "How do I create a topic?"
 
-**You don't.** A channel exists as soon as someone publishes or subscribes to a name. There is no "create topic" call, no metadata to register, no replication factor to set.
+**There is no cluster-wide create step** — no metadata to register with a broker, no replication factor to set. Whether there is a *local* step depends on which channel surface they are on (`concepts.md` § Channel opens with the split):
 
-What to do: just call `node.channel("sensors/temp")` (TS/Python) and start publishing. If no one is subscribing, the publish is a no-op (zero-cost). If a subscriber later asks to join, the publisher's roster updates and they start receiving.
+- **Tagged EventBus topic** (TS/Python `node.channel("sensors/temp")`): genuinely nothing to create. The name becomes a `_channel` label on locally ingested events and a filter on the subscribe side. No roster, no authorization, and no delivery to another process unless the node's transport was already carrying those events.
+- **Distributed mesh channel**: the publisher calls `register_channel(config)` first. That config is what joins are validated against, and a subscribe for a name with no exact entry and no covering prefix ACL is rejected with `UnknownChannel`. Publishing to an unsubscribed channel is still a zero-cost no-op — the roster is empty and the fan-out loop runs zero times.
+
+What to do: find out whether they need cross-process delivery. If yes, they want the mesh surface and they do have a registration step.
 
 ## "What's the partitioning strategy / partition count / partition key?"
 
