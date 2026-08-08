@@ -220,16 +220,32 @@ fn parse_accelerator_type(s: &str) -> AcceleratorType {
     }
 }
 
-fn bigint_to_u64_or_zero(b: Option<BigInt>) -> u64 {
-    b.and_then(|v| {
-        let (signed, value, lossless) = v.get_u64();
-        if signed || !lossless {
-            None
-        } else {
-            Some(value)
-        }
-    })
-    .unwrap_or(0)
+/// Convert an optional JS `BigInt` to `u64`, rejecting values that do
+/// not survive the conversion.
+///
+/// This used to fall back to `0`, which is indistinguishable from a
+/// genuine zero. `storageGb: -1n` and `storageGb: 2n ** 64n` both
+/// announced "no storage" rather than failing, so a node advertised a
+/// hardware profile its operator never described and the caller had no
+/// way to tell. Every other boundary already refuses these: PyO3's
+/// integer extraction rejects out-of-`u64`, Go's field is `uint64`,
+/// and the C JSON deserializer rejects negative and overflowing input.
+fn bigint_to_u64(field: &str, b: Option<BigInt>) -> napi::Result<Option<u64>> {
+    let Some(v) = b else {
+        return Ok(None);
+    };
+    let (signed, value, lossless) = v.get_u64();
+    if signed {
+        return Err(napi::Error::from_reason(format!(
+            "{field} must not be negative"
+        )));
+    }
+    if !lossless {
+        return Err(napi::Error::from_reason(format!(
+            "{field} exceeds the u64 range and would be truncated"
+        )));
+    }
+    Ok(Some(value))
 }
 
 fn pair_vec(xs: Option<Vec<Vec<String>>>) -> Vec<(String, String)> {
@@ -301,7 +317,7 @@ fn accelerator_from_js(a: AcceleratorJs) -> AcceleratorInfo {
     }
 }
 
-fn hardware_from_js(h: HardwareJs) -> HardwareCapabilities {
+fn hardware_from_js(h: HardwareJs) -> napi::Result<HardwareCapabilities> {
     let mut hw = HardwareCapabilities::new();
     if let (Some(cores), Some(threads)) = (h.cpu_cores, h.cpu_threads) {
         hw = hw.with_cpu(saturating_u16(cores), saturating_u16(threads));
@@ -318,8 +334,8 @@ fn hardware_from_js(h: HardwareJs) -> HardwareCapabilities {
     for g in h.additional_gpus.unwrap_or_default() {
         hw = hw.add_gpu(gpu_info_from_js(g));
     }
-    if h.storage_gb.is_some() {
-        hw = hw.with_storage(bigint_to_u64_or_zero(h.storage_gb));
+    if let Some(storage) = bigint_to_u64("storageGb", h.storage_gb)? {
+        hw = hw.with_storage(storage);
     }
     if let Some(gbps) = h.network_gbps {
         hw = hw.with_network(gbps);
@@ -327,7 +343,7 @@ fn hardware_from_js(h: HardwareJs) -> HardwareCapabilities {
     for a in h.accelerators.unwrap_or_default() {
         hw = hw.add_accelerator(accelerator_from_js(a));
     }
-    hw
+    Ok(hw)
 }
 
 fn software_from_js(s: SoftwareJs) -> SoftwareCapabilities {
@@ -420,7 +436,7 @@ fn limits_from_js(l: CapabilityLimitsJs) -> ResourceLimits {
 pub fn capability_set_from_js(caps: CapabilitySetJs) -> napi::Result<CapabilitySet> {
     let mut cs = CapabilitySet::new();
     if let Some(h) = caps.hardware {
-        cs = cs.with_hardware(hardware_from_js(h));
+        cs = cs.with_hardware(hardware_from_js(h)?);
     }
     if let Some(s) = caps.software {
         cs = cs.with_software(software_from_js(s));
