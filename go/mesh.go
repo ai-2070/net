@@ -249,8 +249,19 @@ type ChannelConfig struct {
 	Visibility   string `json:"visibility,omitempty"` // "subnet-local" | "parent-visible" | "exported" | "global"
 	Reliable     bool   `json:"reliable,omitempty"`
 	RequireToken bool   `json:"require_token,omitempty"`
-	Priority     uint8  `json:"priority,omitempty"`
-	MaxRatePps   uint32 `json:"max_rate_pps,omitempty"`
+
+	// TokenRoots anchors token authorization: hex-encoded 32-byte
+	// entity ids (64 hex chars each) whose signature may root a
+	// presented token chain.
+	//
+	// Required whenever RequireToken is set. Core rejects every
+	// authorization when token enforcement is on and no roots are
+	// installed, so `RequireToken: true` on its own does not produce a
+	// token-gated channel — it produces a permanently closed one.
+	TokenRoots []string `json:"token_roots,omitempty"`
+
+	Priority   uint8  `json:"priority,omitempty"`
+	MaxRatePps uint32 `json:"max_rate_pps,omitempty"`
 
 	// PublishCaps restricts who may publish on this channel. Set
 	// when the publisher wants to limit publishing to its own

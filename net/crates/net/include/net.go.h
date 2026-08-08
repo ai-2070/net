@@ -453,10 +453,17 @@ int      net_mesh_recv_shard(net_meshnode_t* handle,
  *     "visibility": "global" | "subnet-local" | "parent-visible" | "exported",
  *     "reliable":      false,
  *     "require_token": false,
+ *     "token_roots":   ["<64 hex chars>", ...],
  *     "priority":      0,
  *     "max_rate_pps":  1000,
  *     "publish_caps":   { ... CapabilityFilter ... },   // Stage G-4
  *     "subscribe_caps": { ... CapabilityFilter ... } }  // Stage G-4
+ *
+ * `token_roots` are hex-encoded 32-byte entity ids whose signature may
+ * root a presented token chain. Required whenever `require_token` is
+ * true: core rejects every authorization when token enforcement is on
+ * and no roots are installed, so `require_token` alone does not give
+ * you a token-gated channel — it gives you a permanently closed one.
  */
 int      net_mesh_register_channel(net_meshnode_t* handle, const char* config_json);
 int      net_mesh_subscribe_channel(net_meshnode_t* handle,
