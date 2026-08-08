@@ -9,8 +9,7 @@ None. Not a header, not a symbol, not a library.
 - No `net_payments.h`, and none of the ten shipped headers in
   `net/crates/net/include/` declares a payments function.
 - No `net_payment_*` or `net_x402_*` symbol anywhere in the C surface.
-- No payments cdylib alongside `libnet_rpc`, `libnet_org`, `libnet_meshdb`,
-  `libnet_meshos`, `libnet_deck` and `libnet_mcp_ffi`.
+- No payments surface inside `libnet`, which is where every other C ABI lives.
 
 The word "payments" appears once in `net/crates/net/include/README.md` and
 nowhere else in the C tree.
@@ -32,7 +31,7 @@ asking for it.
 
 Put the paid capability behind a Rust, Python or Node provider and have the C
 process call it over the mesh as an ordinary capability — the C nRPC surface
-(`net_rpc.h`, `libnet_rpc`) and the org auth surface (`net_org.h`, `libnet_org`)
+(`net_rpc.h`) and the org auth surface (`net_org.h`) — both in `libnet`
 are both available for that. The payment boundary lives where the payment code
 is.
 

@@ -78,7 +78,7 @@ At runtime, the **admin namespace** (deliberately apart from the ordinary verbs)
 | Python (`net_sdk`) | `mesh.serve_subnet_exported(service, export_name, handler)` | `client.call_exported(service, request)` | `net.subnet.admin.*` |
 | Python low-level (`net.subnet`) | `serve_subnet_exported(mesh, service, export_name, handler)` (+ `…_bytes`) | as above | `net.subnet.admin.*` |
 | Go (`go/subnet.go`) | `ServeSubnetExported[Req, Resp](node, service, exportName, handler)` / `ServeSubnetExportedBytes` | `CallExported[Req, Resp](ctx, client, service, req)` / `CallExportedBytes` | `InstallSubnetGatewayCredentials` / `DeclareSubnetBoundaries` / `ApplySubnetControlFact` |
-| C (`net_subnet.h`, ships in `libnet_org`) | `net_subnet_serve_exported(mesh_arc, service, export_name, …)` — Rust resolves the name against the node's own map | `net_org_call_exported` (on the org client, in `net_org.h`) | `net_subnet_install_gateway_credentials` / `_declare_boundaries` / `_apply_control_fact` |
+| C (`net_subnet.h`, links `-lnet`) | `net_subnet_serve_exported(mesh_arc, service, export_name, …)` — Rust resolves the name against the node's own map | `net_org_call_exported` (on the org client, in `net_org.h`) | `net_subnet_install_gateway_credentials` / `_declare_boundaries` / `_apply_control_fact` |
 
 The handler receives the same verified `OrgCaller` as `serve_org` — the serve pipeline, dispatcher, and teardown rules are shared (`org.md` § Teardown applies unchanged).
 

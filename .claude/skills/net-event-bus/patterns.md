@@ -93,7 +93,7 @@ with rpc.serve('echo_sum', handler):
 
 If the user is in **Go**, the consumer-side reference cgo wrapper is at `bindings/go/net/mesh_rpc.go` (Go module ships downstream; the upstream net repo only ships the C-ABI cdylib at `bindings/go/rpc-ffi/`).
 
-If the user is in **C**, nRPC is **not in `net.h`** — the C-ABI lives in the separate `libnet_rpc` cdylib. See `nrpc.md` § C-not-in-net.h.
+If the user is in **C**, nRPC is **not in `net.h`** — it has its own header, `net_rpc.h`, though it links out of the same `libnet`. See `nrpc.md` § C-not-in-net.h.
 
 ## "I need streaming responses for one request"
 

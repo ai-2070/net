@@ -352,7 +352,7 @@ Two Go trees exist and they are not the same thing:
   `go.mod` — meant to be vendored or copied into your own module. It covers
   some surfaces the shipped module does not.
 
-The C-ABI cdylib `libnet_rpc` is built from `net/crates/net/bindings/go/rpc-ffi/`.
+The C ABI is written in `net/crates/net/bindings/go/rpc-ffi/` and linked into the single `libnet` cdylib by `bindings/go/net-ffi`.
 
 ```go
 import "github.com/ai-2070/net/go"
@@ -396,7 +396,7 @@ Pure-Go resilience helpers (`RetryPolicy` + `CallWithRetry`, `HedgePolicy` + `Ca
 
 nRPC is **not** in `net.h`, and that is a header-layout fact rather than a gap: the C SDK is ten headers over six cdylibs. nRPC lives in its own pair.
 
-Include `net/crates/net/include/net_rpc.h` and link `libnet_rpc`, built with `cargo build --release -p net-rpc-ffi`. The header is the canonical drop-in for C, C++, Zig, Swift, JNI and anything else with a C ABI — it is not Go-specific, though the Go binding is its most-exercised consumer. It carries the full surface: `net_rpc_call` and the service/header/streaming/cancellable variants, `net_rpc_serve_streaming`, `net_rpc_find_service_nodes`, plus `net_rpc_abi_version()` / `net_rpc_check_abi_version()` for the version handshake.
+Include `net/crates/net/include/net_rpc.h` and link `-lnet`, built with `cargo build --release -p net-ffi`. One library carries every surface — never add a second `-l`, which puts two copies of Net's internals in one process and can leave a lock released with its waiter still asleep. The header is the canonical drop-in for C, C++, Zig, Swift, JNI and anything else with a C ABI — it is not Go-specific, though the Go binding is its most-exercised consumer. It carries the full surface: `net_rpc_call` and the service/header/streaming/cancellable variants, `net_rpc_serve_streaming`, `net_rpc_find_service_nodes`, plus `net_rpc_abi_version()` / `net_rpc_check_abi_version()` for the version handshake.
 
 Call `net_rpc_check_abi_version(NET_RPC_ABI_VERSION)` at process init and refuse to continue on mismatch. See `net/crates/net/include/README.md` § nRPC for the entry-point listing and error codes.
 

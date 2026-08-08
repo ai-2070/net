@@ -192,7 +192,7 @@ with TypedOrgClient.bind(mesh, credentials) as org:      # CONSUMES credentials
 
 The native symbols are gated behind the wheel's `org` feature: if it wasn't compiled in, `from net import OrgCredentials` raises `ImportError` rather than failing later at bind. `net.org`'s pure-Python layer (`parse_org_error`, `classify_org_error`, the typed wrappers) is always importable.
 
-### Go (`go/org.go`, over `libnet_org`)
+### Go (`go/org.go`, over `libnet`)
 
 ```go
 if err := net.InstallOrgAuthority(node, "/etc/net/authority"); err != nil { ... }
@@ -215,7 +215,7 @@ customer, err := net.OrgCall[GetCustomer, CustomerRecord](ctx, client, "customer
 
 `OrgCall` / `ServeOrg` are free functions because Go forbids type params on methods (same reason as `TypedCall` / `TypedServe`). `CallBytes` is the raw seam and honours `ctx` cancellation.
 
-### C (`net_org.h`, `libnet_org`)
+### C (`net_org.h`, `libnet`)
 
 Its own header and its own cdylib next to `net_rpc.h`, with an **independently versioned ABI** starting at `0x0001`:
 
@@ -227,7 +227,7 @@ Link both libraries — the org cdylib wraps `Arc<MeshNode>` handles minted by t
 
 ```sh
 cargo build --release -p net-org-ffi
-gcc -o app app.c -L target/release -lnet_org -lnet -lpthread -ldl -lm
+gcc -o app app.c -L target/release -lnet -lpthread -ldl -lm
 ```
 
 Handles are `Box`ed pointers; every `_free` takes a **double pointer** and NULLs your slot, so a finalizer racing an explicit close cannot double-free. Return codes map the four call domains to distinct negative constants (`NET_ORG_ERR_CREDENTIALS` … `NET_ORG_ERR_RPC`) so you can branch **without parsing**, with the full `org:` wire string in the `out_err` param (free it via `net_org_free_cstring`). `NET_ORG_ERR_PROVISION` is deliberately *not* a call domain.

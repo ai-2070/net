@@ -14,12 +14,12 @@ first thing that goes wrong.
 | `net.go.h` | `NET_SDK_H` | Mesh, capabilities, channels, compute | `libnet` |
 | `net_cortex.h` | `NET_CORTEX_H` | RedEX, CortEX, NetDb | `libnet` |
 | `net_transport.h` | `NET_TRANSPORT_H` | Blob + directory transfer | `libnet` |
-| `net_rpc.h` | `NET_RPC_H` | nRPC | `libnet_rpc` |
-| `net_meshdb.h` | `NET_MESHDB_H` | Federated queries | `libnet_meshdb` |
-| `net_meshos.h` | `NET_MESHOS_H` | Daemon authoring | `libnet_meshos` |
-| `net_deck.h` | `NET_DECK_H` | Operator surface | `libnet_deck` |
-| `net_org.h` | `NET_ORG_H` | Organization capability auth | `libnet_org` |
-| `net_mcp.h` | `NET_MCP_H` | MCP bridge, consent / pin surface | `libnet_mcp_ffi` |
+| `net_rpc.h` | `NET_RPC_H` | nRPC | `libnet` |
+| `net_meshdb.h` | `NET_MESHDB_H` | Federated queries | `libnet` |
+| `net_meshos.h` | `NET_MESHOS_H` | Daemon authoring | `libnet` |
+| `net_deck.h` | `NET_DECK_H` | Operator surface | `libnet` |
+| `net_org.h` | `NET_ORG_H` | Organization capability auth | `libnet` |
+| `net_mcp.h` | `NET_MCP_H` | MCP bridge, consent / pin surface | `libnet` |
 
 **`net.h` and `net.go.h` share the `NET_SDK_H` guard, and `net.go.h` is not a
 superset.** Include one and the other silently vanishes. `net_ingest_raw_ex`,
@@ -30,7 +30,7 @@ implicit-declaration error that reads like a missing feature flag.
 
 ```bash
 cargo build --release --features ffi,net       # libnet
-cargo build --release -p net-rpc-ffi           # libnet_rpc
+cargo build --release -p net-ffi               # libnet — every surface
 gcc -o app app.c -L target/release -lnet -lpthread -ldl -lm
 ```
 
