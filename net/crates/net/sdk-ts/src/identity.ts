@@ -39,14 +39,29 @@ import {
 // Scope — string-array alias with a fixed set of values.
 // ----------------------------------------------------------------------------
 
-/** Discrete permissions a token can authorize. */
-export type TokenScope = 'publish' | 'subscribe' | 'admin' | 'delegate';
+/**
+ * Discrete permissions a token can authorize.
+ *
+ * `wildcard` authorizes the token's actions on **every** channel,
+ * regardless of its `channel` field. It was missing from this union,
+ * so a wildcard grant could not be issued from TypeScript, and a
+ * Rust-issued one arriving over the wire had the bit dropped when
+ * parsed — under-reporting the credential's authority to the caller
+ * deciding whether to trust it.
+ */
+export type TokenScope =
+  | 'publish'
+  | 'subscribe'
+  | 'admin'
+  | 'delegate'
+  | 'wildcard';
 
-const VALID_SCOPES: ReadonlySet<TokenScope> = new Set([
+const VALID_SCOPES: ReadonlySet<TokenScope> = new Set<TokenScope>([
   'publish',
   'subscribe',
   'admin',
   'delegate',
+  'wildcard',
 ]);
 
 // ----------------------------------------------------------------------------
@@ -243,7 +258,10 @@ function parseTokenBytes(bytes: Buffer): TokenFields {
 export interface IssueTokenOptions {
   /** 32-byte entity id of the grantee. */
   subject: Buffer;
-  /** Scopes granted; union of `'publish' | 'subscribe' | 'admin' | 'delegate'`. */
+  /**
+   * Scopes granted. `wildcard` authorizes the token's actions on every
+   * channel, regardless of `channel` below.
+   */
   scope: readonly TokenScope[];
   /** Channel name. Hashed to u64 canonical; the wire-side fast-path
    *  hint is the low 16 bits of that hash. */

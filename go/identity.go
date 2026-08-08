@@ -40,13 +40,13 @@ var (
 	// sentinels below.
 	ErrIdentity = errors.New("identity: malformed input")
 
-	ErrTokenInvalidFormat         = errors.New("token: invalid_format")
-	ErrTokenInvalidSignature      = errors.New("token: invalid_signature")
-	ErrTokenExpired               = errors.New("token: expired")
-	ErrTokenNotYetValid           = errors.New("token: not_yet_valid")
-	ErrTokenDelegationExhausted   = errors.New("token: delegation_exhausted")
-	ErrTokenDelegationNotAllowed  = errors.New("token: delegation_not_allowed")
-	ErrTokenNotAuthorized         = errors.New("token: not_authorized")
+	ErrTokenInvalidFormat        = errors.New("token: invalid_format")
+	ErrTokenInvalidSignature     = errors.New("token: invalid_signature")
+	ErrTokenExpired              = errors.New("token: expired")
+	ErrTokenNotYetValid          = errors.New("token: not_yet_valid")
+	ErrTokenDelegationExhausted  = errors.New("token: delegation_exhausted")
+	ErrTokenDelegationNotAllowed = errors.New("token: delegation_not_allowed")
+	ErrTokenNotAuthorized        = errors.New("token: not_authorized")
 )
 
 func identityErrorFromCode(code C.int) error {
@@ -362,8 +362,16 @@ type ParsedToken struct {
 	NotBefore       uint64   `json:"not_before"`
 	NotAfter        uint64   `json:"not_after"`
 	DelegationDepth uint8    `json:"delegation_depth"`
-	Nonce           uint64   `json:"nonce"`
-	SignatureHex    string   `json:"signature_hex"`
+
+	// IssuerGeneration is the issuer generation this token was minted
+	// under. The revocation registry rejects tokens below the issuer's
+	// monotonic floor, so this is what explains a refusal that
+	// otherwise looks like a valid credential being rejected for no
+	// visible reason.
+	IssuerGeneration uint32 `json:"issuer_generation"`
+
+	Nonce        uint64 `json:"nonce"`
+	SignatureHex string `json:"signature_hex"`
 }
 
 // ParseToken decodes a serialized `PermissionToken`. Returns

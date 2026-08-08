@@ -81,9 +81,17 @@ fn parse_scope(scopes: &[String]) -> PyResult<TokenScope> {
             "subscribe" => TokenScope::SUBSCRIBE,
             "admin" => TokenScope::ADMIN,
             "delegate" => TokenScope::DELEGATE,
+            // WILDCARD authorizes the token's actions on *every*
+            // channel, regardless of its `channel_hash`. It was absent
+            // here, so a wildcard grant could not be issued from this
+            // binding at all, and a Rust-issued one crossing the wire
+            // had the bit dropped on parse — misrepresenting the
+            // credential's authority to the very caller deciding
+            // whether to trust it.
+            "wildcard" => TokenScope::WILDCARD,
             other => {
                 return Err(identity_err(format!(
-                    "unknown scope {:?}; expected publish | subscribe | admin | delegate",
+                    "unknown scope {:?}; expected publish | subscribe | admin |                      delegate | wildcard",
                     other
                 )));
             }
@@ -105,6 +113,11 @@ fn scope_to_strings(scope: TokenScope) -> Vec<String> {
     }
     if scope.contains(TokenScope::DELEGATE) {
         out.push("delegate".into());
+    }
+    // Rendered last so the common scopes keep their existing order in
+    // fixtures; the set is what matters, not the sequence.
+    if scope.contains(TokenScope::WILDCARD) {
+        out.push("wildcard".into());
     }
     out
 }
@@ -288,7 +301,8 @@ impl Identity {
 
 /// Parse a serialized `PermissionToken`. Returns a dict with
 /// `issuer`, `subject`, `scope`, `channel_hash`, `not_before`,
-/// `not_after`, `delegation_depth`, `nonce`, `signature`.
+/// `not_after`, `delegation_depth`, `issuer_generation`, `nonce`,
+/// `signature`.
 /// Raises `TokenError(kind="invalid_format")` on bad length / layout.
 #[pyfunction]
 pub fn parse_token<'py>(py: Python<'py>, token: &[u8]) -> PyResult<Bound<'py, PyDict>> {
@@ -301,6 +315,10 @@ pub fn parse_token<'py>(py: Python<'py>, token: &[u8]) -> PyResult<Bound<'py, Py
     out.set_item("not_before", parsed.not_before)?;
     out.set_item("not_after", parsed.not_after)?;
     out.set_item("delegation_depth", parsed.delegation_depth)?;
+    // `RevocationRegistry` rejects tokens below the issuer's
+    // monotonic floor. Without this an operator could see a
+    // credential refused but not that its generation was the reason.
+    out.set_item("issuer_generation", parsed.issuer_generation)?;
     out.set_item("nonce", parsed.nonce)?;
     out.set_item("signature", parsed.signature.to_vec())?;
     Ok(out)

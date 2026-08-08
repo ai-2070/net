@@ -1077,7 +1077,7 @@ class Identity:
         delegation_depth: int = 0,
     ) -> bytes:
         """Issue a scoped token to ``subject`` (32-byte entity id).
-        Scope is a subset of ``['publish', 'subscribe', 'admin',
+        Scope is a subset of ``['publish', 'subscribe', 'admin', 'wildcard',
         'delegate']``. Returns the 169-byte serialized
         ``PermissionToken``."""
         ...

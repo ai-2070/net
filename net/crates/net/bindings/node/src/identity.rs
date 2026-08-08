@@ -84,9 +84,17 @@ fn parse_scope(scopes: Vec<String>) -> Result<TokenScope> {
             "subscribe" => TokenScope::SUBSCRIBE,
             "admin" => TokenScope::ADMIN,
             "delegate" => TokenScope::DELEGATE,
+            // WILDCARD authorizes the token's actions on *every*
+            // channel, regardless of its `channel_hash`. It was absent
+            // here, so a wildcard grant could not be issued from this
+            // binding at all, and a Rust-issued one crossing the wire
+            // had the bit dropped on parse — misrepresenting the
+            // credential's authority to the very caller deciding
+            // whether to trust it.
+            "wildcard" => TokenScope::WILDCARD,
             other => {
                 return Err(identity_err(format!(
-                    "unknown scope {:?}; expected publish | subscribe | admin | delegate",
+                    "unknown scope {:?}; expected publish | subscribe | admin |                      delegate | wildcard",
                     other
                 )));
             }
@@ -108,6 +116,11 @@ fn scope_to_strings(scope: TokenScope) -> Vec<String> {
     }
     if scope.contains(TokenScope::DELEGATE) {
         out.push("delegate".into());
+    }
+    // Rendered last so the common scopes keep their existing order in
+    // fixtures; the set is what matters, not the sequence.
+    if scope.contains(TokenScope::WILDCARD) {
+        out.push("wildcard".into());
     }
     out
 }
@@ -357,6 +370,13 @@ pub struct TokenInfo {
     pub not_before: BigInt,
     pub not_after: BigInt,
     pub delegation_depth: u8,
+    /// Issuer generation this token was minted under.
+    ///
+    /// `RevocationRegistry` rejects tokens below the issuer's
+    /// monotonic floor. Without this field an operator could see that
+    /// a credential was refused but not that its generation was the
+    /// reason, which is the one thing that explains the refusal.
+    pub issuer_generation: u32,
     pub nonce: BigInt,
     pub signature: Buffer,
 }
@@ -375,6 +395,7 @@ pub fn parse_token(bytes: Buffer) -> Result<TokenInfo> {
         not_before: BigInt::from(token.not_before),
         not_after: BigInt::from(token.not_after),
         delegation_depth: token.delegation_depth,
+        issuer_generation: token.issuer_generation,
         nonce: BigInt::from(token.nonce),
         signature: Buffer::from(token.signature.to_vec()),
     })

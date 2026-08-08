@@ -2484,6 +2484,14 @@ fn parse_scope_list(raw: &str) -> Option<TokenScope> {
             "subscribe" => TokenScope::SUBSCRIBE,
             "admin" => TokenScope::ADMIN,
             "delegate" => TokenScope::DELEGATE,
+            // WILDCARD authorizes the token's actions on *every*
+            // channel, regardless of its `channel_hash`. It was absent
+            // here, so a wildcard grant could not be issued from this
+            // binding at all, and a Rust-issued one crossing the wire
+            // had the bit dropped on parse — misrepresenting the
+            // credential's authority to the very caller deciding
+            // whether to trust it.
+            "wildcard" => TokenScope::WILDCARD,
             _ => return None,
         });
     }
@@ -2503,6 +2511,11 @@ fn scope_to_strings(scope: TokenScope) -> Vec<&'static str> {
     }
     if scope.contains(TokenScope::DELEGATE) {
         out.push("delegate");
+    }
+    // See the parse side: absent here, a Rust-issued wildcard token
+    // rendered as if it carried no cross-channel authority.
+    if scope.contains(TokenScope::WILDCARD) {
+        out.push("wildcard");
     }
     out
 }
@@ -2843,6 +2856,12 @@ struct ParsedTokenJson {
     not_before: u64,
     not_after: u64,
     delegation_depth: u8,
+    /// Issuer generation this token was minted under.
+    ///
+    /// `RevocationRegistry` rejects tokens below the issuer's
+    /// monotonic floor; without this field a C or Go operator could
+    /// see a credential refused but not why.
+    issuer_generation: u32,
     nonce: u64,
     signature_hex: String,
 }
@@ -2878,6 +2897,7 @@ pub unsafe extern "C" fn net_parse_token(
         not_before: parsed.not_before,
         not_after: parsed.not_after,
         delegation_depth: parsed.delegation_depth,
+        issuer_generation: parsed.issuer_generation,
         nonce: parsed.nonce,
         signature_hex: hex::encode(parsed.signature),
     };
@@ -4642,6 +4662,47 @@ mod tests {
     /// believed declared `audio` and which silently did not, so a
     /// scheduler matched on the difference and the operator had no
     /// signal.
+    /// A wildcard grant must survive the C/Go boundary in both
+    /// directions.
+    ///
+    /// `WILDCARD` authorizes the token's actions on every channel
+    /// regardless of its `channel_hash`. The scope converters listed
+    /// only publish/subscribe/admin/delegate, so this binding could
+    /// not issue one, and a Rust-issued wildcard token crossing the
+    /// wire rendered without the bit — under-reporting the
+    /// credential's authority to the caller deciding whether to trust
+    /// it.
+    #[test]
+    fn wildcard_scope_round_trips_through_the_c_converters() {
+        let parsed = parse_scope_list(r#"["publish","wildcard"]"#)
+            .expect("wildcard must parse");
+        assert!(parsed.contains(TokenScope::WILDCARD));
+        assert!(parsed.contains(TokenScope::PUBLISH));
+
+        let rendered = scope_to_strings(parsed);
+        assert!(
+            rendered.contains(&"wildcard"),
+            "wildcard must render, got {rendered:?}",
+        );
+    }
+
+    /// The other four still round-trip, and an unknown name is still
+    /// refused — widening the vocabulary must not have opened it.
+    #[test]
+    fn scope_vocabulary_is_exactly_the_five_names() {
+        for name in ["publish", "subscribe", "admin", "delegate", "wildcard"] {
+            let json = format!(r#"["{name}"]"#);
+            let parsed = parse_scope_list(&json).expect("documented scope must parse");
+            assert!(scope_to_strings(parsed).contains(&name));
+        }
+        for bad in [r#"["wild"]"#, r#"["WILDCARD"]"#, r#"["all"]"#, r#"["none"]"#] {
+            assert!(
+                parse_scope_list(bad).is_none(),
+                "unknown scope must be refused: {bad}",
+            );
+        }
+    }
+
     #[test]
     fn unknown_modality_rejects_the_announcement() {
         let json = r#"{"models":[{"model_id":"m","modalities":["audoi"]}]}"#;
