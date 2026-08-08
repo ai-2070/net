@@ -556,9 +556,15 @@ Shared fixture: `net/crates/net/tests/cross_lang_nrpc/golden_vectors.json`. Ever
 | Node    | `net/crates/net/bindings/node/test/cross_lang_compat.test.ts` |
 | Python  | `net/crates/net/bindings/python/tests/test_cross_lang_compat.py` |
 
-If a binding's encoder, status-code map, or error-prefix convention drifts, that binding's compat test fails in its own CI. The fixture is versioned via `abi_version_expected` mirroring `NET_RPC_ABI_VERSION = 0x0001` from `bindings/go/rpc-ffi/src/lib.rs` — bumping the ABI invalidates the fixture and forces every binding's compat test to update.
+If a binding's encoder, status-code map, or error-prefix convention drifts, that binding's compat test fails in its own CI. The fixture is versioned via `abi_version_expected` mirroring `NET_RPC_ABI_VERSION` from `bindings/go/rpc-ffi/src/lib.rs`, which is **`0x0004`** — bumping the ABI invalidates the fixture and forces every binding's compat test to update.
 
-True subprocess-based interop tests (Node caller → Rust server, Python caller → Rust server, Node ↔ Python) are out of scope. When Cargo can portably orchestrate Node / Python subprocesses AND both bindings ship pre-built native modules in CI, add a `tests/cross_lang_nrpc.rs` driver gated on `CROSS_LANG_NRPC=1` + `NET_NODE_BUILT=1` / `NET_PYTHON_BUILT=1`.
+### What these tests do not prove
+
+**They are codec fixtures, not interoperability tests.** Every one runs the handler in-process against a stub `RawMeshRpc`; none starts a mesh, registers a native service, or connects two processes. They pin JSON shape, status constants, and error-prefix conventions — nothing about whether a service can actually be served.
+
+That distinction is load-bearing rather than pedantic. These suites stayed green through a period when the first live `MeshRpc.serve()` on Node terminated the process outright, because registration reached `tokio::spawn` with no runtime entered. A green "cross-language" suite told nobody. Read a pass here as "the encoders agree", never as "the bindings talk to each other".
+
+True subprocess-based interop (Node caller → Rust server, Python caller → Rust server, Node ↔ Python) is still out of scope. When Cargo can portably orchestrate Node / Python subprocesses AND both bindings ship pre-built native modules in CI, add a `tests/cross_lang_nrpc.rs` driver gated on `CROSS_LANG_NRPC=1` + `NET_NODE_BUILT=1` / `NET_PYTHON_BUILT=1`.
 
 ---
 

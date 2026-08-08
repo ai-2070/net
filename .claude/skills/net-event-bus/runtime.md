@@ -36,7 +36,7 @@ If you skip step 1, late emits race with step 4 and surface as `Shutdown` errors
 | SDK | Call | Async? | Multi-call safety |
 |---|---|---|---|
 | Rust | `node.shutdown().await?` | Yes | **Consumes `self`** (single call enforced by ownership), but the work is reference-based — outstanding `EventStream` clones do **not** block shutdown. See "Rust: subscribe streams and shutdown" below. |
-| TypeScript | `await node.shutdown()` | Yes | Idempotent — safe to call twice |
+| TypeScript | `await node.shutdown()` | Yes | **Not idempotent on `MeshNode`** — the native binding returns `"already shut down"` on a second call, and the SDK forwards it. Python, Go and C are idempotent, so this is a real cross-language difference, not just a doc slip. Guard the second call or catch it. |
 | Python | `node.shutdown()` or context manager exit | No | Idempotent |
 | Go | `bus.Shutdown()` (typically `defer bus.Shutdown()`) | No | Idempotent |
 | C | `net_shutdown(handle)` then stop using the handle | No | Calling twice is undefined — don't |
@@ -92,7 +92,7 @@ once those causes get their own variants.
 
 ### TypeScript
 
-Bus-level (`NetNode`) errors are not thrown for backpressure — `emit` / `emitRaw` return `null`, and `publish` / `emitBuffer` / `fire*` return `false`/short counts. **Check return values.** Construction and other unrecoverable problems arrive as plain `Error`.
+Bus-level (`NetNode`) error shapes differ by method and mixing them up is the standard bug. `emit` / `emitRaw` return a `Receipt` and **throw** on ingestion failure — they never return `null`, despite an older `Receipt | null` declaration that no branch could produce. `publish` / `emitBuffer` / `fire*` return `false` or a short count. **Check return values on the second group, catch on the first.** Note that under the default `drop_oldest` mode neither reports: the producer always succeeds and `eventsDropped` stays at zero, so compare against what the adapter received. Construction and other unrecoverable problems arrive as plain `Error`. `bindings/typescript.md` has the per-method table.
 
 `BackpressureError` and `NotConnectedError` (with `instanceof` support) are **mesh-stream-only** — they're thrown by `MeshNode.send(...)` / `MeshStream.send(...)` when a per-stream credit window is full or the peer session is gone. The `sendWithRetry` helper on `MeshNode` retries `BackpressureError` (5–200 ms exponential). None of this applies to bus emit.
 

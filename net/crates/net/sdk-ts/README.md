@@ -63,8 +63,15 @@ caller to change — read it before upgrading, especially if you filter on
 ```typescript
 import { MeshNode, serveTool } from '@net-mesh/sdk';
 
-const psk = new Uint8Array(32).fill(0x42);   // both peers share the same PSK
+// `psk` is a 64-character hex string, not bytes — it is hex-decoded at
+// the native boundary. A `Uint8Array` here does not type-check and
+// does not satisfy the runtime constructor.
+const psk = '42'.repeat(32);                 // both peers share the same PSK
 const node = await MeshNode.create({ bindAddr: '127.0.0.1:0', psk });
+
+// Port 0 means the OS chooses; `localAddr()` is how the peer learns
+// which port to connect to.
+console.log(node.localAddr());
 
 const handle = serveTool(node, {
   name: 'web_search',

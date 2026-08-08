@@ -83,10 +83,21 @@ return SummarizeResp{}, net.AppError(net.NrpcTypedBadRequest, body)
 ```
 
 `AppError(code, body)` is how a handler returns a typed application status rather
-than an opaque failure — the caller sees the code and the body. **Any other error
-a handler returns surfaces as `Internal`**, so a handler that returns a bare
-`fmt.Errorf` has thrown away the distinction the caller needs to decide whether to
-retry.
+than an opaque failure. **Any other error a handler returns surfaces as
+`Internal`**, so a handler that returns a bare `fmt.Errorf` has thrown away the
+distinction the caller needs to decide whether to retry.
+
+**On the caller side, Go does not give you the code and body as fields.**
+`RpcError` carries `Kind` (a coarse transport-level discriminator: `no_route`,
+`timeout`, `server_error`, `transport`, `codec_encode`, `codec_decode`,
+`capability_denied`, `unknown`) and `Message`. The application status and body
+arrive inside `Message`, so a Go caller that needs to branch on them has to parse
+the string. Rust preserves the structured shape.
+
+Go also has no `cancelled` kind. A context cancellation surfaces as Go's own
+`context.Canceled` or `context.DeadlineExceeded` from the call, not as an
+`RpcError` — so check the context error first and `errors.As` into `*RpcError`
+second.
 
 `TypedServe` already does this for you on a request that will not unmarshal: the
 caller gets `Application(NrpcTypedBadRequest)` with
