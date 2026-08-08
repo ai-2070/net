@@ -137,7 +137,47 @@
       },
       "domain": "event-bus"
     },
-    "Channels — pub/sub with capability auth": {
+    "Channel policy — origin binding + queue-group policy": {
+      "bindings": {
+        "C": {
+          "status": "not exposed"
+        },
+        "Go": {
+          "status": "not exposed"
+        },
+        "Node / TS": {
+          "status": "not exposed"
+        },
+        "Python": {
+          "status": "not exposed"
+        },
+        "Rust": {
+          "status": "supported"
+        }
+      },
+      "domain": "event-bus"
+    },
+    "Channel subscribe with a full TokenChain": {
+      "bindings": {
+        "C": {
+          "status": "not exposed"
+        },
+        "Go": {
+          "status": "not exposed"
+        },
+        "Node / TS": {
+          "status": "not exposed"
+        },
+        "Python": {
+          "status": "not exposed"
+        },
+        "Rust": {
+          "status": "not exposed"
+        }
+      },
+      "domain": "event-bus"
+    },
+    "Channel token roots (require_token anchoring)": {
       "bindings": {
         "C": {
           "status": "supported"
@@ -149,6 +189,7 @@
           "status": "supported"
         },
         "Python": {
+          "mode": "core-only",
           "status": "supported"
         },
         "Rust": {
@@ -258,6 +299,67 @@
       },
       "domain": "event-bus"
     },
+    "Delegated publish chain (set_publish_chain)": {
+      "bindings": {
+        "C": {
+          "status": "not exposed"
+        },
+        "Go": {
+          "status": "not exposed"
+        },
+        "Node / TS": {
+          "status": "not exposed"
+        },
+        "Python": {
+          "status": "not exposed"
+        },
+        "Rust": {
+          "status": "not exposed"
+        }
+      },
+      "domain": "event-bus"
+    },
+    "Distributed batch fan-out (publish_many)": {
+      "bindings": {
+        "C": {
+          "status": "not exposed"
+        },
+        "Go": {
+          "status": "not exposed"
+        },
+        "Node / TS": {
+          "status": "not exposed"
+        },
+        "Python": {
+          "status": "not exposed"
+        },
+        "Rust": {
+          "status": "supported"
+        }
+      },
+      "domain": "event-bus"
+    },
+    "Distributed mesh channels — register / subscribe / publish": {
+      "bindings": {
+        "C": {
+          "status": "supported"
+        },
+        "Go": {
+          "status": "supported"
+        },
+        "Node / TS": {
+          "status": "supported"
+        },
+        "Python": {
+          "mode": "core-only",
+          "status": "supported"
+        },
+        "Rust": {
+          "status": "supported"
+        }
+      },
+      "domain": "event-bus"
+    },
     "Event bus — ingest + poll": {
       "bindings": {
         "C": {
@@ -341,6 +443,26 @@
       },
       "domain": "event-bus"
     },
+    "Membership rejection reason (AckReason taxonomy)": {
+      "bindings": {
+        "C": {
+          "status": "partial"
+        },
+        "Go": {
+          "status": "partial"
+        },
+        "Node / TS": {
+          "status": "partial"
+        },
+        "Python": {
+          "status": "partial"
+        },
+        "Rust": {
+          "status": "supported"
+        }
+      },
+      "domain": "event-bus"
+    },
     "Mesh streams": {
       "bindings": {
         "C": {
@@ -394,6 +516,48 @@
         },
         "Python": {
           "status": "supported"
+        },
+        "Rust": {
+          "status": "supported"
+        }
+      },
+      "domain": "event-bus"
+    },
+    "Permissive channel registry (opt out of strict default)": {
+      "bindings": {
+        "C": {
+          "status": "not exposed"
+        },
+        "Go": {
+          "status": "not exposed"
+        },
+        "Node / TS": {
+          "mode": "core-only",
+          "status": "supported"
+        },
+        "Python": {
+          "mode": "core-only",
+          "status": "supported"
+        },
+        "Rust": {
+          "status": "not exposed"
+        }
+      },
+      "domain": "event-bus"
+    },
+    "Prefix-matched channel ACL registration": {
+      "bindings": {
+        "C": {
+          "status": "not exposed"
+        },
+        "Go": {
+          "status": "not exposed"
+        },
+        "Node / TS": {
+          "status": "not exposed"
+        },
+        "Python": {
+          "status": "not exposed"
         },
         "Rust": {
           "status": "supported"
@@ -488,6 +652,26 @@
         }
       },
       "domain": "payments"
+    },
+    "Queue-group channel subscription": {
+      "bindings": {
+        "C": {
+          "status": "not exposed"
+        },
+        "Go": {
+          "status": "not exposed"
+        },
+        "Node / TS": {
+          "status": "not exposed"
+        },
+        "Python": {
+          "status": "not exposed"
+        },
+        "Rust": {
+          "status": "not exposed"
+        }
+      },
+      "domain": "event-bus"
     },
     "RedEX — durable log": {
       "bindings": {
@@ -608,6 +792,26 @@
         },
         "Rust": {
           "status": "supported"
+        }
+      },
+      "domain": "event-bus"
+    },
+    "Tagged EventBus topics (node.channel)": {
+      "bindings": {
+        "C": {
+          "status": "n/a"
+        },
+        "Go": {
+          "status": "n/a"
+        },
+        "Node / TS": {
+          "status": "supported"
+        },
+        "Python": {
+          "status": "supported"
+        },
+        "Rust": {
+          "status": "n/a"
         }
       },
       "domain": "event-bus"

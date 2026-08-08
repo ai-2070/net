@@ -65,7 +65,7 @@ operations:
     C:
       status: supported
       anchor: net_predicate_evaluate
-- operation: Channels — pub/sub with capability auth
+- operation: Distributed mesh channels — register / subscribe / publish
   bindings:
     Rust:
       status: supported
@@ -75,6 +75,7 @@ operations:
       anchor: subscribeChannel
     Python:
       status: supported
+      mode: core-only
       anchor: subscribe_channel
     Go:
       status: supported
@@ -82,6 +83,146 @@ operations:
     C:
       status: supported
       anchor: net_mesh_subscribe_channel_with_token
+- operation: Tagged EventBus topics (node.channel)
+  bindings:
+    Rust:
+      status: n/a
+    Node / TS:
+      status: supported
+      anchor: TypedChannel
+    Python:
+      status: supported
+      anchor: TypedChannel
+    Go:
+      status: n/a
+    C:
+      status: n/a
+- operation: Channel subscribe with a full TokenChain
+  bindings:
+    Rust:
+      status: not exposed
+    Node / TS:
+      status: not exposed
+    Python:
+      status: not exposed
+    Go:
+      status: not exposed
+    C:
+      status: not exposed
+- operation: Delegated publish chain (set_publish_chain)
+  bindings:
+    Rust:
+      status: not exposed
+    Node / TS:
+      status: not exposed
+    Python:
+      status: not exposed
+    Go:
+      status: not exposed
+    C:
+      status: not exposed
+- operation: Prefix-matched channel ACL registration
+  bindings:
+    Rust:
+      status: supported
+      anchor: register_channel_prefix
+    Node / TS:
+      status: not exposed
+    Python:
+      status: not exposed
+    Go:
+      status: not exposed
+    C:
+      status: not exposed
+- operation: Channel policy — origin binding + queue-group policy
+  bindings:
+    Rust:
+      status: supported
+      anchor: with_subscriber_origin_binding
+    Node / TS:
+      status: not exposed
+    Python:
+      status: not exposed
+    Go:
+      status: not exposed
+    C:
+      status: not exposed
+- operation: Queue-group channel subscription
+  bindings:
+    Rust:
+      status: not exposed
+    Node / TS:
+      status: not exposed
+    Python:
+      status: not exposed
+    Go:
+      status: not exposed
+    C:
+      status: not exposed
+- operation: Channel token roots (require_token anchoring)
+  bindings:
+    Rust:
+      status: supported
+      anchor: with_token_roots
+    Node / TS:
+      status: supported
+      anchor: tokenRoots
+    Python:
+      status: supported
+      mode: core-only
+      anchor: token_roots
+    Go:
+      status: supported
+      anchor: TokenRoots
+    C:
+      status: supported
+      anchor: net_mesh_register_channel
+- operation: Distributed batch fan-out (publish_many)
+  bindings:
+    Rust:
+      status: supported
+      anchor: publish_many
+    Node / TS:
+      status: not exposed
+    Python:
+      status: not exposed
+    Go:
+      status: not exposed
+    C:
+      status: not exposed
+- operation: Membership rejection reason (AckReason taxonomy)
+  bindings:
+    Rust:
+      status: supported
+      anchor: AckReason
+    Node / TS:
+      status: partial
+      anchor: ChannelAuthError
+    Python:
+      status: partial
+      anchor: ChannelAuthError
+    Go:
+      status: partial
+      anchor: ErrChannelAuth
+    C:
+      status: partial
+      anchor: NET_ERR_CHANNEL_AUTH
+- operation: Permissive channel registry (opt out of strict default)
+  bindings:
+    Rust:
+      status: not exposed
+    Node / TS:
+      status: supported
+      mode: core-only
+      anchor: permissiveChannels
+    Python:
+      status: supported
+      mode: core-only
+      anchor: permissive_channels
+    Go:
+      status: not exposed
+    C:
+      status: not exposed
 - operation: Mesh streams
   bindings:
     Rust:
