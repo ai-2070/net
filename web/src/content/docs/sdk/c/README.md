@@ -45,7 +45,7 @@ variants. The CLI is optional.
 
 `net_org.h` carries organization capability auth, including the subnet-exported
 caller verb `net_org_call_exported`. Its companion `net_subnet.h` (same
-library, `libnet_org` — there is no `libnet_subnet`) carries the provider and
+library — everything is in `libnet`) carries the provider and
 gateway side: `net_subnet_serve_exported` against a NAMED export, plus
 `net_subnet_install_gateway_credentials`, `net_subnet_declare_boundaries`, and
 `net_subnet_apply_control_fact`. Subnet failures return `NET_ORG_ERR_SUBNET`

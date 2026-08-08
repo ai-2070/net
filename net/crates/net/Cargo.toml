@@ -17,6 +17,9 @@ members = [
     "bindings/go/meshos-ffi",
     "bindings/go/deck-ffi",
     "bindings/go/mcp-ffi",
+    # The single cdylib the Go binding links; the seven above are its rlib
+    # inputs and are no longer linked individually.
+    "bindings/go/net-ffi",
 ]
 
 [package]
@@ -65,7 +68,12 @@ multiple_unsafe_ops_per_block = "warn"
 # resolve without code changes. The published artifact is
 # `net-mesh` on crates.io.
 name = "net"
-crate-type = ["lib", "cdylib", "staticlib"]
+# NOT `cdylib`. `bindings/go/net-ffi` is what emits `libnet`, because it is
+# the only crate that can link this one together with the seven C-ABI
+# surfaces. Two cdylibs both carrying `net::ffi` is the bug that hung Go CI:
+# link order unifies the duplicate functions, never the `static`s, and
+# `parking_lot_core`'s parked-thread registry is one of those.
+crate-type = ["lib", "staticlib"]
 
 [features]
 # Test/bench-only fixture helpers that bypass a production invariant.

@@ -48,8 +48,8 @@ The honest options, in order:
 2. **Use the outbound HTTP-402 path from one of those languages** if the thing
    being paid for is an external x402 API.
 3. **Request the binding.** It is `not exposed`, not `n/a` — nothing about Go
-   makes a payments API unnatural, and the C-ABI groundwork (`libnet_org`,
-   `libnet_rpc`) shows the shape such a thing would take.
+   makes a payments API unnatural, and the C-ABI groundwork (the org and nRPC
+   surfaces in `libnet`) shows the shape such a thing would take.
 
 ## Where to look
 

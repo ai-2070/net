@@ -49,26 +49,37 @@ needed.
 
 ### Prerequisites
 
-The bindings link against the `libnet` cdylib through cgo, so you need a
+The bindings link against the `libnet_go` cdylib through cgo, so you need a
 [Rust toolchain](https://rustup.rs) and **Go 1.21+**, and the shared library
 has to exist before the Go package will link. From the Cargo workspace root
 (`net/crates/net/`):
 
 ```bash
-cargo build --release
-cargo build --release --features "netdb redex-disk"   # for the cortex.go surface
+cargo build --release -p net-go-ffi
 ```
 
 | Platform | Output |
 |---|---|
-| Linux | `target/release/libnet.so` |
-| macOS | `target/release/libnet.dylib` |
-| Windows | `target/release/net.dll` |
+| Linux | `target/release/libnet_go.so` |
+| macOS | `target/release/libnet_go.dylib` |
+| Windows | `target/release/net_go.dll` |
 
-Several surfaces live in their own cdylibs — `libnet_rpc`, `libnet_meshdb`,
-`libnet_meshos`, `libnet_deck`, `libnet_org` — built with `-p net-rpc-ffi` and
-friends. [Headers and Linking](https://ai2070.net/docs/sdk/c/headers-and-linking)
-maps every surface to its library.
+One library, deliberately. Every surface — mesh, nRPC, MeshDB, MeshOS, Deck,
+MCP, organization/subnet — is linked into it by `bindings/go/net-ffi`, and
+`go/*.go` links `-lnet_go` and nothing else.
+
+That is not a packaging preference. The binding previously linked eight
+separate cdylibs, each of which had embedded and re-exported its own copy of
+`net::ffi`. Link order collapsed the duplicate *functions* to one, so it worked
+in practice for a long time; it does not collapse `static`s. `parking_lot_core`
+holds its registry of parked threads in one, per shared object — so a thread
+that blocked on a mesh mutex parked in libnet's registry and was never woken by
+an unlock that ran out of libnet_org's copy. The symptom was a Go test hanging
+for ten minutes inside `net_mesh_announce_capabilities` with every worker
+thread in the process idle: a held lock with no owner.
+
+Adding a second `-l...` to any file here brings that back. CI asserts it
+doesn't.
 
 ## The loop: announce → discover → invoke
 

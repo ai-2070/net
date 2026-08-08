@@ -104,7 +104,7 @@ one in its own example.)*
 **C has no payments at all.** The word appears once in
 `net/crates/net/include/README.md` and in no header. There is no `net_payment_*`
 or `net_x402_*` symbol anywhere in the C surface, and no payments cdylib
-alongside `libnet_rpc`, `libnet_org` and the rest.
+inside `libnet` alongside the nRPC and org surfaces.
 
 **Verification tiers are Rust-only.** The `observed / confirmed(n) / final`
 ladder and the independent `ChainChecker` — including reorg freeze and replay

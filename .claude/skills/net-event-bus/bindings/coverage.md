@@ -36,13 +36,13 @@ reach it from the translation unit you are already in.
 | `net.go.h` | `NET_SDK_H` | Mesh, capabilities, channels, compute | `libnet` |
 | `net_cortex.h` | `NET_CORTEX_H` | RedEX, CortEX, NetDb | `libnet` |
 | `net_transport.h` | `NET_TRANSPORT_H` | Blob + directory transfer | `libnet` |
-| `net_rpc.h` | `NET_RPC_H` | nRPC | `libnet_rpc` |
-| `net_meshdb.h` | `NET_MESHDB_H` | Federated queries | `libnet_meshdb` |
-| `net_meshos.h` | `NET_MESHOS_H` | Daemon authoring | `libnet_meshos` |
-| `net_deck.h` | `NET_DECK_H` | Operator surface | `libnet_deck` |
-| `net_org.h` | `NET_ORG_H` | Organization capability auth | `libnet_org` |
-| `net_subnet.h` | `NET_SUBNET_H` | Subnet authority — exported serve, gateway provisioning | `libnet_org` |
-| `net_mcp.h` | `NET_MCP_H` | MCP bridge, consent / pin surface | `libnet_mcp_ffi` |
+| `net_rpc.h` | `NET_RPC_H` | nRPC | `libnet` |
+| `net_meshdb.h` | `NET_MESHDB_H` | Federated queries | `libnet` |
+| `net_meshos.h` | `NET_MESHOS_H` | Daemon authoring | `libnet` |
+| `net_deck.h` | `NET_DECK_H` | Operator surface | `libnet` |
+| `net_org.h` | `NET_ORG_H` | Organization capability auth | `libnet` |
+| `net_subnet.h` | `NET_SUBNET_H` | Subnet authority — exported serve, gateway provisioning | `libnet` |
+| `net_mcp.h` | `NET_MCP_H` | MCP bridge, consent / pin surface | `libnet` |
 
 **`net.h` and `net.go.h` share the `NET_SDK_H` guard, and `net.go.h` is not a
 superset.** Include one and the other silently vanishes. `net_ingest_raw_ex`,
@@ -190,7 +190,7 @@ method name in Node and Python, and a compile error in Go.
 **nRPC is a free function in Rust and a class everywhere else.** Rust has
 `call_typed` on the mesh; Node, Python and Go route through a `TypedMeshRpc`
 handle you construct first (`NewTypedMeshRpc` in Go), and C goes through
-`net_rpc_call` in a separate library, `libnet_rpc`.
+`net_rpc_call`, in the same `libnet` as everything else.
 
 ## What CI proves here, precisely
 

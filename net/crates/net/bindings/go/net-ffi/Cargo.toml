@@ -1,0 +1,77 @@
+[package]
+name = "net-ffi"
+version = "0.34.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "The single cdylib carrying every C-ABI surface Net exposes"
+# Lives under bindings/go/ for historical reasons — it predates C linking
+# it too. Not published; it is a link-time artifact, not a library anyone
+# depends on as a crate.
+publish = false
+
+[lib]
+# ONE shared object for every C-ABI consumer. `libnet` carries `net::ffi` plus
+# all seven surfaces, `go/*.go` links `-lnet` and nothing else, and a C program
+# links `-lnet` and nothing else. That is the entire point of this crate.
+#
+# It takes the `net` lib name, and `net-mesh` gives up its `cdylib` crate-type
+# to make room, so that the `-lnet` in every existing C doc and example stays
+# correct and simply means more than it used to.
+#
+# Before it, the binding linked eight cdylibs (`libnet`, `libnet_org`,
+# `libnet_rpc`, …), each of which took `net-mesh` as an ordinary path
+# dependency and therefore embedded AND re-exported its own full copy of
+# `net::ffi` — verified by reading the export tables: libnet_org defined all 57
+# `net_mesh_*` entry points itself.
+#
+# Link-order interposition unified the FUNCTIONS to one copy, which is why that
+# arrangement looked fine. It does not unify `static`s, and those are where the
+# damage was. `parking_lot_core` keeps its registry of parked threads in a
+# process-global static hashtable, one copy per shared object. A thread that
+# blocked on `MeshNode::announce_mu` parked itself in libnet's table; when a
+# different copy of the same inlined code unlocked that same mutex address, its
+# `unlock_slow` consulted ITS table, found nothing parked, cleared the bit and
+# returned. The waiter was never woken.
+#
+# That is the Go CI hang: `net_mesh_announce_capabilities` blocked ~9 minutes in
+# `RawMutex::lock_slow` under `announce_attempt` (mesh.rs:28314) while a core
+# dump showed every net worker thread in the process parked idle — a held mutex
+# with no owner anywhere. One copy in the address space is what makes that
+# state unreachable.
+name = "net"
+crate-type = ["cdylib"]
+
+[features]
+default = []
+# Passthrough for the FFI symbol `net_compute_test_inject_synthetic_peer`, which
+# `go/groups_testhelpers.go` references under the `test_helpers` build tag.
+test-helpers = ["net-compute-ffi/test-helpers"]
+
+[dependencies]
+# The core crate, and the union of every feature the sibling surfaces below ask
+# of it plus the set the Go suite exercises. Declared here so building this one
+# package is sufficient — cargo would unify them anyway when the siblings are
+# built together, but relying on that made the feature set a property of the
+# build command rather than of the manifest.
+net = { package = "net-mesh", version = "0.34.0", path = "../../..", features = [
+    "net",
+    "netdb",
+    "redex-disk",
+    "tool",
+    "meshos",
+    "meshdb",
+    "dataforts",
+    "nat-traversal",
+    "redis",
+] }
+
+# The seven C-ABI surfaces, linked as rlibs. Their `#[no_mangle]` entry points
+# are re-exported from this cdylib; `src/lib.rs` carries the `extern crate`
+# lines that keep the linker from dropping them as unreferenced.
+net-compute-ffi = { version = "0.34.0", path = "../compute-ffi" }
+net-deck-ffi = { version = "0.34.0", path = "../deck-ffi" }
+net-mcp-ffi = { version = "0.34.0", path = "../mcp-ffi" }
+net-meshdb-ffi = { version = "0.34.0", path = "../meshdb-ffi" }
+net-meshos-ffi = { version = "0.34.0", path = "../meshos-ffi" }
+net-org-ffi = { version = "0.34.0", path = "../org-ffi" }
+net-rpc-ffi = { version = "0.34.0", path = "../rpc-ffi" }

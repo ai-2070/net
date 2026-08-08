@@ -1602,59 +1602,120 @@ jobs:
           shared-key: go
           workspaces: net/crates/net -> target
 
-      # The Go bindings link against EIGHT cdylibs via cgo:
-      #   - `-lnet` (libnet.so, the main `net-mesh` crate) from net.go
-      #   - `-lnet_compute` (libnet_compute.so, the `net-compute-ffi`
-      #     workspace member at bindings/go/compute-ffi) from compute.go
-      #   - `-lnet_meshdb` (libnet_meshdb.so, the `net-meshdb-ffi`
-      #     workspace member at bindings/go/meshdb-ffi) from meshdb.go
-      #   - `-lnet_meshos` (libnet_meshos.so, the `net-meshos-ffi`
-      #     workspace member at bindings/go/meshos-ffi) from meshos.go
-      #   - `-lnet_deck` (libnet_deck.so, the `net-deck-ffi`
-      #     workspace member at bindings/go/deck-ffi) from deck.go
-      #   - `-lnet_rpc` (libnet_rpc.so, the `net-rpc-ffi`
-      #     workspace member at bindings/go/rpc-ffi) from
-      #     mesh_rpc.go / mesh_rpc_typed.go / tool.go. Added in the
-      #     NET_GO_NRPC_PORT slices (G-1..G-5) — without it the
-      #     typed/streaming/tool tests fail at link.
-      #   - `-lnet_mcp` (libnet_mcp_ffi.so, the `net-mcp-ffi`
-      #     workspace member at bindings/go/mcp-ffi) from mcp.go
-      #   - `-lnet_org` (libnet_org.so, the `net-org-ffi`
-      #     workspace member at bindings/go/org-ffi) from org.go.
-      #     The organization capability-auth verb facade (OSDK-L).
-      # All eight end up in `net/crates/net/target/release/`.
+      # ONE cdylib, for every consumer. `net-ffi` links `net-mesh` and the seven
+      # C-ABI surfaces (compute, deck, mcp, meshdb, meshos, org, rpc) into
+      # `libnet.so`; `go/*.go` links `-lnet` and the C skill example links
+      # `-lnet`, and neither links anything else. `net-mesh` gave up its own
+      # `cdylib` crate-type so `net-ffi` could take the `net` lib name, which is
+      # why every existing `-lnet` in the docs stayed correct.
       #
-      # Features:
-      #   - `net-mesh` needs `netdb,dataforts,redex-disk,nat-traversal,redis`
-      #     for the mesh + cortex + blob + NAT + redis-dedup FFI surfaces
-      #     exercised by the Go test suite. `redis` only gates the
-      #     `RedisStreamDedup` symbol export — the dedup helper itself is
-      #     an in-memory LRU and does not need a Redis server at runtime.
-      #   - `net-compute-ffi` needs `test-helpers` so the FFI symbol
-      #     `net_compute_test_inject_synthetic_peer` (referenced by
-      #     `groups_testhelpers.go`) is exported.
-      #   - `net-meshdb-ffi`, `net-meshos-ffi`, `net-deck-ffi`,
-      #     `net-rpc-ffi`, `net-mcp-ffi`, `net-org-ffi` have no extra
-      #     features beyond their defaults.
+      # This replaced eight separately-linked cdylibs, each of which embedded
+      # and re-exported its own copy of `net::ffi`. Link order unified the
+      # FUNCTIONS, which is why it looked fine for months. It does not unify
+      # `static`s, and `parking_lot_core` keeps its parked-thread registry in
+      # one — so a thread that parked on `MeshNode::announce_mu` through one
+      # copy was never woken by an unlock through another. That was the Go CI
+      # hang, and the same arrangement was documented for C consumers.
       #
-      # Built as one cargo invocation so feature unification on the
-      # shared `net-mesh` dep doesn't cause a second compilation pass.
-      - name: Build net + net_compute + net_meshdb + net_meshos + net_deck + net_rpc + net_mcp + net_org cdylibs
+      # The seven surfaces are `rlib`-only now, so there is no second cdylib
+      # left to link by accident.
+      #
+      # Features live in `net-ffi/Cargo.toml`, not here. Relying on cargo
+      # unifying the siblings' requests made the feature set a property of this
+      # command line, so building any subset silently produced a
+      # differently-configured `net-mesh`.
+      - name: Build the single libnet cdylib
         working-directory: net/crates/net
-        run: >
-          cargo build --release
-          -p net-mesh -p net-compute-ffi -p net-meshdb-ffi -p net-meshos-ffi -p net-deck-ffi -p net-rpc-ffi -p net-mcp-ffi -p net-org-ffi
-          --features "net-mesh/netdb,net-mesh/dataforts,net-mesh/redex-disk,net-mesh/nat-traversal,net-mesh/redis,net-compute-ffi/test-helpers"
+        env:
+          # Line tables + frame pointers so a core from a hung run unwinds.
+          # Without them gdb reports "missing debugging information" and the
+          # one thread that matters stops two frames in — which is how three
+          # captures in a row came back unreadable.
+          #
+          # Set through the cargo profile variable rather than `-Cdebuginfo` in
+          # RUSTFLAGS so a `rustflags` key in `.cargo/config.toml` cannot
+          # displace it. `1` is line tables, not full DWARF.
+          #
+          # Diagnostic setting, kept while the fix is confirmed. Drop it after
+          # a few green runs; shipped cdylibs should not carry it.
+          CARGO_PROFILE_RELEASE_DEBUG: "1"
+          RUSTFLAGS: "-Cforce-frame-pointers=yes"
+        run: cargo build --release -p net-ffi --features net-ffi/test-helpers
+
+      # The invariant this hang cost a lot to find: the Go binary loads exactly
+      # one copy of `net::ffi`.
+      #
+      # Three ways it can regress, so three assertions — "does it build" passes
+      # through all of them:
+      #
+      #   1. a `go/*.go` file reintroduces a second `-l...` and links a sibling
+      #      surface directly again;
+      #   2. an `extern crate` line goes missing from `net-ffi/src/lib.rs`, in
+      #      which case that surface's symbols are silently absent and the
+      #      failure surfaces as a link error somewhere unrelated;
+      #   3. the cdylib builds without DWARF — not a correctness bug, but it
+      #      makes the next hang unreadable while still looking like success.
+      - name: Assert the Go binding links exactly one net::ffi
+        if: ${{ !cancelled() }}
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          fail=0
+
+          # (1) every cgo directive names net_go and nothing else.
+          if grep -h "cgo LDFLAGS" go/*.go | grep -qv -- "-lnet$"; then
+            echo "::error::a go/*.go cgo directive links something other than -lnet"
+            grep -h "cgo LDFLAGS" go/*.go | grep -v -- "-lnet$"
+            echo "Every surface is in libnet.so. Linking a sibling cdylib beside it"
+            echo "puts a second copy of net::ffi in the process, which is the hang."
+            fail=1
+          fi
+
+          cd net/crates/net/target/release
+
+          # (2) every surface actually made it into the one library.
+          for pfx in net_mesh_ net_org_ net_rpc_ net_compute_ net_meshdb_ net_meshos_ net_deck_ net_mcp_; do
+            n=$(nm -D --defined-only libnet.so 2>/dev/null | grep -c " T $pfx" || true)
+            echo "  $pfx exported: ${n:-0}"
+            if [ "${n:-0}" -eq 0 ]; then
+              echo "::error::libnet.so exports no ${pfx}* symbols; the matching extern crate line in bindings/go/net-ffi/src/lib.rs is probably gone"
+              fail=1
+            fi
+          done
+
+          # (3) no sibling cdylib exists to be linked beside it. They are
+          # rlib-only now; a crate-type regression would silently make the old
+          # two-copies arrangement buildable again.
+          stray=$(ls libnet_*.so 2>/dev/null || true)
+          if [ -n "$stray" ]; then
+            echo "::error::a sibling FFI crate emitted a cdylib again:"
+            echo "$stray"
+            echo "Those surfaces belong inside libnet.so via bindings/go/net-ffi."
+            echo "A second cdylib carrying net::ffi is the announce_mu hang."
+            fail=1
+          fi
+
+          # (4) unwind data, so a hang dump is readable.
+          if ! readelf -S libnet.so 2>/dev/null | grep -q debug_; then
+            echo "::error::libnet.so has no DWARF; a hang dump will not unwind past the FFI entry point"
+            echo "CARGO_PROFILE_RELEASE_DEBUG on the build step above is what sets this."
+            fail=1
+          fi
+
+          exit $fail
 
       # `integration_test.go` gates its suite behind RUN_INTEGRATION_TESTS=1
       # so local developers can run quick unit-style passes without the
       # full mesh setup. CI wants the full coverage.
+      #
+      # Through the shared runner so a hang reports NATIVE frames rather than
+      # stopping at the cgo boundary — see that script for why, and for why
+      # every Go suite entry point in this job has to go through it.
       - name: Run Go tests
         working-directory: go
         env:
           LD_LIBRARY_PATH: ${{ github.workspace }}/net/crates/net/target/release
           RUN_INTEGRATION_TESTS: "1"
-        run: go test -v ./...
+        run: $GITHUB_WORKSPACE/.github/scripts/go-test-with-native-stacks.sh
 
       # Run again with `-tags test_helpers` so the test-only files
       # (`groups_testhelpers.go`, `groups_test.go`,
@@ -1668,7 +1729,7 @@ jobs:
         env:
           LD_LIBRARY_PATH: ${{ github.workspace }}/net/crates/net/target/release
           RUN_INTEGRATION_TESTS: "1"
-        run: go test -v -tags test_helpers ./...
+        run: $GITHUB_WORKSPACE/.github/scripts/go-test-with-native-stacks.sh test_helpers
 
       # `abi_stability_cgo_test.go` (+ its self-contained `_cgo.go`
       # helper) is gated behind the DISTINCT `abi_stability` build tag —

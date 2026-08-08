@@ -4,22 +4,23 @@ version = "0.34.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "C ABI for the MCP bridge pure helpers + consent/pin surface (Go binding of Net)"
-# Distributed as a cdylib alongside the Go binding, not via crates.io.
+# Linked into the single `libnet` cdylib, not distributed on its own.
 # Block accidental `cargo publish`.
 publish = false
 
 [lib]
-# `cdylib` for the shared object Go links against; `staticlib` for
-# platforms that prefer `.a` archives. `rlib` lets in-crate
-# `#[cfg(test)] mod tests` blocks compile (cargo requires rlib for the
-# test harness). The shipped artifact is the cdylib.
+# `rlib` only. This surface is linked into the single `libnet` cdylib by
+# `bindings/go/net-ffi`, never on its own.
 #
-# The lib name is `net_mcp_ffi` (NOT `net_mcp`) on purpose: the MCP
-# bridge adapter crate `net-mesh-mcp` already owns the lib name
-# `net_mcp`, so an rlib output collision would occur. The Go side links
-# `-lnet_mcp_ffi`; the exported C symbols keep the `net_mcp_*` prefix.
+# It used to emit a cdylib too, and anything that linked that beside `libnet`
+# put two copies of `net::ffi` in one process. Link order unifies the duplicate
+# functions, so it looked correct; it does not unify `static`s, and
+# `parking_lot_core`'s parked-thread registry is one — a thread parking on a
+# mesh mutex through one copy was never woken by an unlock through the other.
+# Dropping the cdylib makes that arrangement unrepresentable rather than merely
+# undocumented.
 name = "net_mcp_ffi"
-crate-type = ["cdylib", "staticlib", "rlib"]
+crate-type = ["rlib"]
 
 [features]
 default = []

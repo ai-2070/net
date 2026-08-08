@@ -2770,6 +2770,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "net-ffi"
+version = "0.34.0"
+dependencies = [
+ "net-compute-ffi",
+ "net-deck-ffi",
+ "net-mcp-ffi",
+ "net-mesh",
+ "net-meshdb-ffi",
+ "net-meshos-ffi",
+ "net-org-ffi",
+ "net-rpc-ffi",
+]
+
+[[package]]
 name = "net-mcp-ffi"
 version = "0.34.0"
 dependencies = [

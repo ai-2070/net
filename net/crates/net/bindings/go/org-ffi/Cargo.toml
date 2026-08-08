@@ -4,17 +4,23 @@ version = "0.34.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "C ABI organization-capability-auth surface for the Go binding of Net"
-# Distributed as a cdylib alongside the Go binding, not via crates.io.
+# Linked into the single `libnet` cdylib, not distributed on its own.
 # Block accidental `cargo publish`.
 publish = false
 
 [lib]
-# `cdylib` for the shared object Go links against; `staticlib` for
-# platforms that prefer `.a` archives. `rlib` alongside lets any
-# in-crate `#[cfg(test)] mod tests` compile — cargo requires an rlib
-# to link the unit-test harness. The shipped artifact is the cdylib.
+# `rlib` only. This surface is linked into the single `libnet` cdylib by
+# `bindings/go/net-ffi`, never on its own.
+#
+# It used to emit a cdylib too, and anything that linked that beside `libnet`
+# put two copies of `net::ffi` in one process. Link order unifies the duplicate
+# functions, so it looked correct; it does not unify `static`s, and
+# `parking_lot_core`'s parked-thread registry is one — a thread parking on a
+# mesh mutex through one copy was never woken by an unlock through the other.
+# Dropping the cdylib makes that arrangement unrepresentable rather than merely
+# undocumented.
 name = "net_org"
-crate-type = ["cdylib", "staticlib", "rlib"]
+crate-type = ["rlib"]
 
 [features]
 default = []
@@ -24,15 +30,25 @@ default = []
 # `Arc<MeshNode>` references handed in by the existing Go binding via
 # `net::ffi::mesh::net_mesh_arc_clone`.
 #
-# The feature list MUST match what the standalone `libnet.dylib` build
-# enables (see `compute-ffi/Cargo.toml`'s note on cfg-gated field
-# offsets). Every Go-binding cdylib (`libnet`, `libnet_compute`,
-# `libnet_rpc`, `libnet_org`, …) exports the same `#[no_mangle]` FFI
-# symbols from `net::ffi`; the Go test binary's link order resolves
-# them to one copy. If two crates compile `net` with different
-# features, cfg-gated fields on shared types (`CapabilitySet`,
-# `MeshNode`, etc.) shift offsets and shared paths read through the
-# wrong layout — a subtle UB. Kept identical to `compute-ffi`'s list.
+# This crate is no longer linked on its own. `bindings/go/net-ffi` pulls it in
+# as an rlib and emits the single `libnet_go` cdylib the Go binding links, so
+# there is exactly one copy of `net-mesh` in the process.
+#
+# The note that used to live here said the duplication was fine because link
+# order resolved the exported FFI symbols to one copy, and worried only about
+# cfg-gated field offsets staying consistent. The offsets part was right. The
+# conclusion was not: link order unifies FUNCTIONS, never `static`s, and each
+# cdylib kept its own `ffi::mesh::runtime()` OnceLock, its own tokio TLS, and —
+# the one that actually bit — its own `parking_lot_core` parked-thread
+# registry. A thread blocking on `MeshNode::announce_mu` parked in libnet's
+# registry; the unlock ran out of this crate's copy, found nothing parked in
+# ITS registry, and never woke it. That is the Go CI hang: ~9 minutes inside
+# `net_mesh_announce_capabilities`, every worker thread idle, lock held by
+# nobody.
+#
+# The feature list below is still kept aligned with `compute-ffi`'s for the
+# offset reason, though `net-ffi/Cargo.toml` now declares the authoritative
+# union.
 net = { package = "net-mesh", version = "0.34.0", path = "../../..", features = ["net", "netdb", "redex-disk", "tool"] }
 # SDK org surface — `OrgCredentials`, `OrgClient`, `OrgAccess`,
 # `OrgCaller`, `OrgSdkError`, and the provisioning entrypoints. The Go
