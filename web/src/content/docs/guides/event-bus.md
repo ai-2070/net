@@ -242,7 +242,9 @@ JetStream or a mesh pair as soon as something has to come back out.
 **Rust** — the core crate, with every knob reachable:
 
 ```rust
-use net::{AdapterConfig, ConsumeRequest, Event, EventBus, EventBusConfig, RedisAdapterConfig};
+use net::{
+    AdapterConfig, ConsumeRequest, Event, EventBus, EventBusConfig, RedisAdapterConfig,
+};
 
 let mut config = EventBusConfig::default();
 config.adapter = AdapterConfig::Redis(RedisAdapterConfig::new("redis://127.0.0.1:6379"));
