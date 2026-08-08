@@ -268,15 +268,31 @@ class NetNode:
         self,
         name: str,
         model: Optional[type[T]] = None,
+        parse: Optional[Callable[[str], T]] = None,
     ) -> TypedChannel[T]:
         """
         Create a typed channel for pub/sub.
 
+        `name` must satisfy the canonical Net channel-name grammar or
+        `ChannelNameError` is raised — see `net_sdk.channel.
+        validate_channel_name`.
+
+        `model` deserializes with `model(**payload)`. Pass `parse`
+        instead when the type needs its own constructor: a Pydantic v2
+        model wants `model_validate_json` (coercion and validators),
+        which `Model(**payload)` skips. `parse` receives payload-only
+        JSON — the `_channel` routing tag is already stripped.
+
         Example:
             >>> temps = node.channel('sensors/temperature', TemperatureReading)
             >>> temps.publish(TemperatureReading(sensor_id='A1', celsius=22.5))
+
+            >>> readings = node.channel(
+            ...     'sensors/temperature',
+            ...     parse=lambda raw: Reading.model_validate_json(raw),
+            ... )
         """
-        return TypedChannel(self._bus, name, model=model)
+        return TypedChannel(self._bus, name, model=model, parse=parse)
 
     # ---- Lifecycle ----
 

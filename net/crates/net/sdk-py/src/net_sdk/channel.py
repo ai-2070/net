@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from dataclasses import replace
 from typing import Any, Callable, Generic, Iterator, Optional, TypeVar
@@ -11,6 +12,11 @@ from net import Net
 from net_sdk.stream import EventStream, SubscribeOpts, TypedEventStream
 
 T = TypeVar("T")
+
+#: The reserved key `TypedChannel` stamps on every published payload so
+#: subscribers can filter on it. Routing metadata, not part of the
+#: caller's event type — stripped before typed delivery.
+CHANNEL_TAG_KEY = "_channel"
 
 #: Maximum channel-name length in bytes. Mirrors `MAX_NAME_LEN` in
 #: `net/crates/net/src/adapter/net/channel/name.rs`.
@@ -82,21 +88,79 @@ def validate_channel_name(name: str) -> str:
     return name
 
 
+#: Types JSON can encode directly. Anything else must be converted to a
+#: mapping first, or `json.dumps` fails at publish time.
+_JSON_SCALARS = (str, int, float, bool, type(None))
+
+
 def _to_dict(event: Any) -> dict:
     """Convert an event to a dict copy, never mutating the original."""
     if hasattr(event, "model_dump"):
+        # Pydantic v2 — honours the model's own field serializers.
         return event.model_dump()
     elif isinstance(event, dict):
         return dict(event)
+    elif dataclasses.is_dataclass(event) and not isinstance(event, type):
+        # Checked before `__dict__` because `@dataclass(slots=True)` has
+        # no instance `__dict__` at all. The old duck-typed chain fell
+        # through to the `_value` wrapper for slotted dataclasses, which
+        # then died inside `json.dumps` — "any dataclass works" was only
+        # true without `slots=True`. `asdict` also recurses into nested
+        # dataclasses, which `dict(__dict__)` did not.
+        return dataclasses.asdict(event)
     elif hasattr(event, "__dict__"):
         return dict(event.__dict__)
+    elif isinstance(event, _JSON_SCALARS) or isinstance(event, (list, tuple)):
+        return {"_value": list(event) if isinstance(event, tuple) else event}
+    elif hasattr(type(event), "__slots__"):
+        # Plain (non-dataclass) slotted class. Same failure mode as
+        # above; gather the declared slots instead of guessing.
+        slots: dict[str, Any] = {}
+        for cls in type(event).__mro__:
+            for slot in getattr(cls, "__slots__", ()):
+                if slot not in slots and hasattr(event, slot):
+                    slots[slot] = getattr(event, slot)
+        return slots
     else:
-        return {"_value": event}
+        raise TypeError(
+            f"cannot serialize {type(event).__name__} to a channel event: "
+            "pass a dict, a dataclass, a Pydantic model, or an object with "
+            "__dict__/__slots__"
+        )
+
+
+def _strip_channel_tag(raw: str) -> str:
+    """Remove the `_channel` routing tag from a raw JSON event.
+
+    Custom `parse=` callables receive payload-only JSON, the same shape
+    the model and default paths hand back. Otherwise a strict Pydantic
+    model (`extra="forbid"`) passed through
+    `parse=lambda raw: Model.model_validate_json(raw)` would reject
+    every event on the channel purely because of routing metadata it
+    never declared.
+
+    The substring guard keeps the common case to one scan instead of a
+    parse/re-serialize round trip. Any standard JSON serializer writes
+    the key literally, so a miss means the key is genuinely absent.
+    """
+    if f'"{CHANNEL_TAG_KEY}"' not in raw:
+        return raw
+    data = json.loads(raw)
+    if not isinstance(data, dict) or CHANNEL_TAG_KEY not in data:
+        return raw
+    data.pop(CHANNEL_TAG_KEY)
+    return json.dumps(data)
 
 
 class TypedChannel(Generic[T]):
     """
     A strongly typed channel for publishing and subscribing to events.
+
+    Deserialization picks one of three paths, in order: an explicit
+    `parse` callable, a `model` (constructed as `model(**payload)`), or
+    a plain dict. All three receive payload-only JSON — the `_channel`
+    routing tag `publish()` stamps on the wire is stripped first. Use
+    `subscribe_raw()` if you want the tag.
 
     Example:
         >>> temps = node.channel('sensors/temperature', TemperatureReading)
@@ -119,7 +183,7 @@ class TypedChannel(Generic[T]):
         # Filter is a constant for the lifetime of the channel; build
         # the JSON string once instead of regenerating it on every
         # subscribe / subscribe_raw call.
-        self._filter = json.dumps({"path": "_channel", "value": name})
+        self._filter = json.dumps({"path": CHANNEL_TAG_KEY, "value": name})
 
     @property
     def name(self) -> str:
@@ -129,7 +193,7 @@ class TypedChannel(Generic[T]):
     def publish(self, event: T) -> None:
         """Publish a typed event to this channel."""
         data = _to_dict(event)
-        data["_channel"] = self._name
+        data[CHANNEL_TAG_KEY] = self._name
         self._bus.ingest_raw(json.dumps(data))
 
     def publish_batch(self, events: list[T]) -> int:
@@ -137,7 +201,7 @@ class TypedChannel(Generic[T]):
         payloads = []
         for event in events:
             data = _to_dict(event)
-            data["_channel"] = self._name
+            data[CHANNEL_TAG_KEY] = self._name
             payloads.append(json.dumps(data))
         return self._bus.ingest_raw_batch(payloads)
 
@@ -156,19 +220,26 @@ class TypedChannel(Generic[T]):
             merged.filter = self._filter
 
         if self._parse is not None:
-            parse_fn = self._parse
+            user_parse = self._parse
+
+            def parse_fn(raw: str) -> T:
+                # Payload-only JSON, matching the model and default
+                # paths below. A custom parser used to be the one path
+                # that still saw `_channel`, so a strict Pydantic model
+                # rejected every event on the channel.
+                return user_parse(_strip_channel_tag(raw))
         elif self._model is not None:
             model = self._model
 
             def parse_fn(raw: str) -> T:
                 data = json.loads(raw)
-                data.pop("_channel", None)
+                data.pop(CHANNEL_TAG_KEY, None)
                 return model(**data)  # type: ignore[return-value]
         else:
 
             def parse_fn(raw: str) -> T:
                 data = json.loads(raw)
-                data.pop("_channel", None)
+                data.pop(CHANNEL_TAG_KEY, None)
                 return data  # type: ignore[return-value]
 
         return TypedEventStream(self._bus, parse_fn, merged)

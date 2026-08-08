@@ -98,6 +98,7 @@ from net_sdk.capability_schema import (
     validate_capabilities,
 )
 from net_sdk.channel import (
+    CHANNEL_TAG_KEY,
     MAX_CHANNEL_NAME_LEN,
     ChannelNameError,
     TypedChannel,
@@ -122,6 +123,7 @@ __all__ = [
     "ChannelNameError",
     "validate_channel_name",
     "MAX_CHANNEL_NAME_LEN",
+    "CHANNEL_TAG_KEY",
     "MeshNode",
     "MeshStream",
     "StreamStats",

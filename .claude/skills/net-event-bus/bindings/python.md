@@ -70,9 +70,15 @@ Spelt `buffer_capacity=1024` in this binding.
 
 ## Names and shapes
 
-- `node.channel('name', Model)` — the named-channel surface. The model may be a
-  `@dataclass`, a Pydantic model (anything with `model_dump()`), or a plain
-  class (anything with `__dict__`).
+- `node.channel('name', Model)` — the tagged-topic surface. The model may be a
+  `@dataclass` (including `slots=True`), a Pydantic model (anything with
+  `model_dump()`), or a plain class (anything with `__dict__` or `__slots__`).
+  `name` is validated against the canonical channel grammar and raises
+  `ChannelNameError` — lowercase only, no `//`, no leading/trailing `/`, no
+  `.`/`..` segments, ≤ 255 bytes.
+- `node.channel('name', parse=fn)` — third argument for types whose
+  constructor is not `Model(**payload)`. `fn` takes payload-only JSON (the
+  `_channel` routing tag is already stripped) and returns the event.
 - Discovery is `find_nodes` / `find_nodes_scoped` / `find_service_nodes`,
   returning a **list**, plus `find_best_node` / `find_best_node_scoped`, which
   apply the requirement's weights and return one `int | None`. `None` is no
