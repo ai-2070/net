@@ -3,7 +3,7 @@
 // Mirrors the Rust SDK's `Identity` / `PermissionToken` one-for-one,
 // matching the PyO3 / NAPI shape so cross-binding fixtures round-
 // trip. Tokens cross the C boundary as opaque `[]byte` buffers
-// (159 bytes each); entity ids as 32-byte slices. The Go side owns
+// (169 bytes each); entity ids as 32-byte slices. The Go side owns
 // token storage; `net_free_bytes` is invoked inline on the return
 // path via `freeBytes`.
 //
@@ -237,7 +237,7 @@ type IssueTokenRequest struct {
 }
 
 // IssueToken issues a permission token to `req.Subject` for `req.Channel`.
-// Returns the serialized 159-byte token; treat it as opaque bytes
+// Returns the serialized 169-byte token; treat it as opaque bytes
 // (persist / ship / hand to peers as-is).
 func (id *Identity) IssueToken(req IssueTokenRequest) ([]byte, error) {
 	id.mu.RLock()

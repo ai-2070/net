@@ -1022,7 +1022,9 @@ func (m *MeshNode) SubscribeChannel(publisherNodeID uint64, channel string) erro
 
 // SubscribeChannelWithToken subscribes to `channel` on
 // `publisherNodeID` while presenting a serialized `PermissionToken`
-// (typically 159 bytes — whatever `Identity.IssueToken` returned).
+// (169 bytes — whatever `Identity.IssueToken` returned). This is one
+// token, not a serialized `TokenChain` (`1 + count*169` bytes); chains
+// are core-only and cannot be presented through this binding.
 // Required when the publisher set `RequireToken=true` or when the
 // subscriber's announced caps don't satisfy the publisher's
 // `SubscribeCaps` filter.

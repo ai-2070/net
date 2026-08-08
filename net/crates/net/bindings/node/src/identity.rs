@@ -11,7 +11,7 @@
 //! tokens in ahead-of-time flows (e.g., minting tokens at a central
 //! issuer and distributing them out of band).
 //!
-//! Tokens cross the NAPI boundary as opaque `Buffer`s (the 161-byte
+//! Tokens cross the NAPI boundary as opaque `Buffer`s (the 169-byte
 //! serialized `PermissionToken`). The TS SDK wraps them in a `Token`
 //! class that parses fields client-side — NAPI exposes one
 //! [`parse_token`] helper to keep the wire format in a single place.
@@ -215,7 +215,7 @@ impl Identity {
     }
 
     /// Issue a scoped permission token to `subject`. Returns the
-    /// 161-byte serialized token as a Buffer; hand it to the
+    /// 169-byte serialized token as a Buffer; hand it to the
     /// subscriber who will then call `installToken(bytes)`.
     ///
     /// `scope` is a subset of `["publish", "subscribe", "admin",

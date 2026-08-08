@@ -134,7 +134,7 @@ func TestSubscribeWithToken_RejectsMalformedBytes(t *testing.T) {
 	m := newMeshForCaps(t)
 	defer m.Shutdown()
 
-	// 16 bytes is far too short for a 159-byte PermissionToken —
+	// 16 bytes is far too short for a 169-byte PermissionToken —
 	// `from_bytes` must reject with `ErrTokenInvalidFormat` *before*
 	// any network I/O, so there's no peer-missing timeout.
 	err := m.SubscribeChannelWithToken(0, "some/channel", make([]byte, 16))

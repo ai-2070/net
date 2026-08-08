@@ -106,6 +106,16 @@ done < <(grep -rnE "(\`|^|\$ )net ($POST_RENAME_VERBS)\b" \
            2>/dev/null || true)
 [ "$fail" -eq "$before" ] && ok "all CLI invocations use net-mesh (post-rename verbs checked in releases too)"
 
+# ------------------------------------------------- PermissionToken wire size
+# Scans the whole tracked tree, not just `$DOCS` — the stale sizes lived in
+# binding docstrings and C headers, where nothing else looks. Release notes,
+# internal plans, and audits are excluded inside the checker for the same
+# reason this file excludes them: they are dated records.
+echo "==> PermissionToken wire size"
+before=$fail
+run_checker check-token-wire-size.py
+[ "$fail" -eq "$before" ] && ok "every documented token size matches WIRE_SIZE"
+
 echo
 if [ "$fail" -eq 0 ]; then
   echo "Docs agree with the tree."
