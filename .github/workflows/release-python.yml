@@ -24,6 +24,22 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+  # THE canonical release feature set for the `net-mesh` wheel.
+  #
+  # `org` and `deck` are NOT in the crate's default features, so the
+  # previous `--features redis,extension-module` shipped wheels without
+  # them — while `docs/data/capabilities/event-bus.yaml` marked Python
+  # organization auth and Deck `supported`, the v0.34 release notes
+  # claimed the authority verbs in five languages, and the SDK README
+  # said PyPI wheels ship every feature enabled. CI masked it by
+  # enabling both explicitly in its own test wheel, so the tested
+  # artifact and the published artifact had different surfaces.
+  #
+  # Keep this in step with `ci.yml`'s `maturin develop` feature list.
+  # If you add a feature to one, add it to the other, or CI goes green
+  # against a wheel users cannot install.
+  PY_RELEASE_FEATURES: redis,org,deck,extension-module
+
 jobs:
   linux:
     runs-on: ubuntu-latest
@@ -44,7 +60,7 @@ jobs:
           # `extension-module` (the cdylib must not link libpython) is
           # passed explicitly rather than trusting maturin to merge
           # `[tool.maturin] features` from pyproject.toml with CLI args.
-          args: --release --out dist --find-interpreter --features redis,extension-module
+          args: --release --out dist --find-interpreter --features ${{ env.PY_RELEASE_FEATURES }}
           sccache: "true"
           # Use manylinux_2_28 (Rocky 8, gcc 11+) instead of the
           # default `auto` (which picks manylinux2014 with gcc 4.8).
@@ -87,7 +103,7 @@ jobs:
           # `extension-module` (the cdylib must not link libpython) is
           # passed explicitly rather than trusting maturin to merge
           # `[tool.maturin] features` from pyproject.toml with CLI args.
-          args: --release --out dist --find-interpreter --features redis,extension-module
+          args: --release --out dist --find-interpreter --features ${{ env.PY_RELEASE_FEATURES }}
           sccache: "true"
           working-directory: net/crates/net/bindings/python
 
@@ -123,7 +139,7 @@ jobs:
           # `extension-module` (the cdylib must not link libpython) is
           # passed explicitly rather than trusting maturin to merge
           # `[tool.maturin] features` from pyproject.toml with CLI args.
-          args: --release --out dist --find-interpreter --features redis,extension-module
+          args: --release --out dist --find-interpreter --features ${{ env.PY_RELEASE_FEATURES }}
           sccache: "true"
           working-directory: net/crates/net/bindings/python
 

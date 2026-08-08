@@ -49,24 +49,24 @@ needed.
 
 ### Prerequisites
 
-The bindings link against the `libnet_go` cdylib through cgo, so you need a
-[Rust toolchain](https://rustup.rs) and **Go 1.21+**, and the shared library
-has to exist before the Go package will link. From the Cargo workspace root
-(`net/crates/net/`):
+The bindings link against the `libnet` cdylib through cgo, so you need a
+[Rust toolchain](https://rustup.rs) and **Go 1.26+** (`go/go.mod`), and the
+shared library has to exist before the Go package will link. From the Cargo
+workspace root (`net/crates/net/`):
 
 ```bash
-cargo build --release -p net-go-ffi
+cargo build --release -p net-ffi
 ```
 
 | Platform | Output |
 |---|---|
-| Linux | `target/release/libnet_go.so` |
-| macOS | `target/release/libnet_go.dylib` |
-| Windows | `target/release/net_go.dll` |
+| Linux | `target/release/libnet.so` |
+| macOS | `target/release/libnet.dylib` |
+| Windows | `target/release/net.dll` |
 
 One library, deliberately. Every surface — mesh, nRPC, MeshDB, MeshOS, Deck,
 MCP, organization/subnet — is linked into it by `bindings/go/net-ffi`, and
-`go/*.go` links `-lnet_go` and nothing else.
+`go/*.go` links `-lnet` and nothing else.
 
 That is not a packaging preference. The binding previously linked eight
 separate cdylibs, each of which had embedded and re-exported its own copy of

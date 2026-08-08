@@ -12,7 +12,14 @@ description = "Ergonomic Python SDK for the Net mesh network"
 license = "MIT OR Apache-2.0"
 license-files = ["LICENSE-APACHE", "LICENSE-MIT"]
 requires-python = ">=3.10"
-dependencies = ["net-mesh>=0.34.0"]
+# Compatible-release, not an open lower bound. `net-mesh-sdk` is a thin
+# wrapper over the native `net-mesh` module, and
+# `web/src/content/docs/reference/versioning.md` says the two must
+# match, that mixing versions is unsupported, and that pre-1.0 minors
+# may break APIs. `>=0.34.0` let pip resolve or retain this 0.34 wrapper
+# against a 0.35+ core anyway, and the failure only surfaced later, at
+# the first call into a changed or removed native method.
+dependencies = ["net-mesh>=0.34.0,<0.35.0"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",

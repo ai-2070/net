@@ -1441,6 +1441,14 @@ jobs:
         with:
           python-version: "3.12"
 
+      # This job's wheel enables features the *release* wheel did not,
+      # so everything below could pass against a surface users cannot
+      # install. `org` and `deck` shipped that way. Compare the two
+      # feature sets before trusting any of it.
+      - name: Guard — release wheel carries what this job tests
+        working-directory: ${{ github.workspace }}
+        run: python3 .github/scripts/check-python-wheel-features.py
+
       # Match `net/crates/net/rust-toolchain.toml` directly so the
       # pinned 1.96.0 toolchain is installed up-front rather than
       # auto-fetched mid-`maturin develop` by rustup (which has flaked
