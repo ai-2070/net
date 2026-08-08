@@ -63,6 +63,19 @@ export interface CallOptions {
    */
   streamWindowInitial?: number
   /**
+   * Client-streaming and duplex only: initial credit window for
+   * UPLOAD-direction flow control. `undefined` → unbounded.
+   *
+   * The napi `CallOptions` has always carried this and mapped it into
+   * core, and this file already referenced it in `callDuplex`'s docs
+   * and on `flowControlled()` — but the interface omitted it, so a
+   * typed caller could not set it without an `as any` cast. `tsc`
+   * answered `TS2353: 'requestWindowInitial' does not exist in type
+   * 'CallOptions'`, which reads like the feature is missing rather
+   * than the declaration.
+   */
+  requestWindowInitial?: number
+  /**
    * Caller-driven cancellation. Pass an `AbortSignal`; the typed
    * wrapper attaches a one-shot listener that aborts the in-
    * flight call. The call rejects with `RpcCancelledError`.
@@ -646,13 +659,33 @@ export class TypedMeshRpc {
     opts?: CallOptions,
   ): Promise<TypedRpcStream<Resp>> {
     const reqBuf = jsonEncode(req)
-    const inner = await this._raw.callStreaming(
-      targetNodeId,
-      service,
-      reqBuf,
-      opts,
-    )
-    return new TypedRpcStream<Resp>(inner)
+    // Route through `wireAbortSignal` like every other call shape.
+    // These two passed the JS `AbortSignal` object straight into the
+    // raw napi options, which do not know it: no cancel token was
+    // reserved and no listener called `cancelCall`, so aborting a
+    // server-streaming call did nothing at all.
+    // Route through `wireAbortSignal` like every other call shape.
+    // These two passed the JS `AbortSignal` object straight into the
+    // raw napi options, which do not know it: no cancel token was
+    // reserved and no listener called `cancelCall`, so aborting a
+    // server-streaming call did nothing at all.
+    const { rawOpts, detach } = wireAbortSignal(this._raw, opts)
+    try {
+      const inner = await this._raw.callStreaming(
+        targetNodeId,
+        service,
+        reqBuf,
+        rawOpts,
+      )
+      // Hand the detach to the stream so the listener's lifetime ends
+      // at EOF/close/error rather than leaking for the life of the
+      // signal — a reused `AbortSignal` would otherwise accumulate one
+      // handler per call.
+      return new TypedRpcStream<Resp>(inner, detach)
+    } catch (err) {
+      detach()
+      throw err
+    }
   }
 
   /**
@@ -676,8 +709,18 @@ export class TypedMeshRpc {
       )
     }
     const reqBuf = jsonEncode(req)
-    const inner = await this._raw.callServiceStreaming(service, reqBuf, opts)
-    return new TypedRpcStream<Resp>(inner)
+    const { rawOpts, detach } = wireAbortSignal(this._raw, opts)
+    try {
+      const inner = await this._raw.callServiceStreaming(
+        service,
+        reqBuf,
+        rawOpts,
+      )
+      return new TypedRpcStream<Resp>(inner, detach)
+    } catch (err) {
+      detach()
+      throw err
+    }
   }
 
   /** Pass-through to `MeshRpc.findServiceNodes`. */
@@ -948,10 +991,24 @@ export class TypedMeshRpc {
 export class TypedRpcStream<Resp = unknown> implements AsyncIterable<Resp> {
   private readonly _raw: RawRpcStream
   private _done: boolean
+  /**
+   * Abort-listener teardown transferred in from `wireAbortSignal`.
+   * Run once the stream can no longer be cancelled — EOF, close, or a
+   * decode error — so a reused `AbortSignal` does not accumulate a
+   * handler per call.
+   */
+  private readonly _detach: () => void
 
-  constructor(rawRpcStream: RawRpcStream) {
+  constructor(rawRpcStream: RawRpcStream, detach: () => void = () => {}) {
     this._raw = rawRpcStream
     this._done = false
+    this._detach = detach
+  }
+
+  /** Run the abort-listener teardown exactly once. */
+  private _finish(): void {
+    if (!this._done) return
+    this._detach()
   }
 
   /**
@@ -967,10 +1024,12 @@ export class TypedRpcStream<Resp = unknown> implements AsyncIterable<Resp> {
       buf = await this._raw.next()
     } catch (e) {
       this._done = true
+      this._finish()
       throw e // user catch site classifies via classifyError
     }
     if (buf === null || buf === undefined) {
       this._done = true
+      this._finish()
       return null
     }
     try {
@@ -985,6 +1044,7 @@ export class TypedRpcStream<Resp = unknown> implements AsyncIterable<Resp> {
       } catch {
         /* swallow — best-effort */
       }
+      this._finish()
       throw e
     }
   }
@@ -1016,6 +1076,7 @@ export class TypedRpcStream<Resp = unknown> implements AsyncIterable<Resp> {
     } catch {
       /* swallow — best-effort */
     }
+    this._finish()
   }
 }
 
