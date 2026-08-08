@@ -1812,27 +1812,55 @@ mod mesh_bindings {
             Ok(true)
         }
 
-        /// Poll for received events.
-        fn poll(&self, limit: usize) -> PyResult<Vec<StoredEvent>> {
+        /// Number of shards inbound stream traffic is spread across.
+        ///
+        /// Inbound events land on ``stream_id % num_shards``, so this
+        /// is what makes a targeted ``poll_shard`` possible.
+        fn num_shards(&self) -> PyResult<u16> {
+            Ok(self.get_node()?.num_shards())
+        }
+
+        /// The inbound shard a given stream's events land on.
+        fn shard_for_stream(&self, stream_id: u64) -> PyResult<u16> {
+            Ok(self.get_node()?.shard_for_stream(stream_id))
+        }
+
+        /// Poll a specific inbound shard.
+        ///
+        /// Pair with ``shard_for_stream`` when you want one stream
+        /// rather than a merge across all of them.
+        fn poll_shard(&self, shard_id: u16, limit: usize) -> PyResult<Vec<StoredEvent>> {
             let node = self.get_node()?;
             let result = self
                 .runtime
-                .block_on(node.poll_shard(0, None, limit))
+                .block_on(node.poll_shard(shard_id, None, limit))
                 .map_err(|e| PyRuntimeError::new_err(format!("poll: {}", e)))?;
+            Ok(Self::map_events(result.events))
+        }
 
-            Ok(result
-                .events
-                .into_iter()
-                .map(|e| {
-                    let raw = e.raw_str().unwrap_or("").to_string();
-                    StoredEvent {
-                        id: e.id,
-                        raw,
-                        insertion_ts: e.insertion_ts,
-                        shard_id: e.shard_id,
-                    }
-                })
-                .collect())
+        /// Poll for received events across **every** shard.
+        ///
+        /// This polled shard 0 only. Inbound traffic is placed on
+        /// ``stream_id % num_shards``, so at the default of four
+        /// shards a caller silently saw only the stream ids congruent
+        /// to 0 — three quarters of ordinary stream ids were
+        /// unreadable through this binding.
+        fn poll(&self, limit: usize) -> PyResult<Vec<StoredEvent>> {
+            let node = self.get_node()?;
+            let shards = node.num_shards().max(1);
+            let mut events = Vec::new();
+            for shard in 0..shards {
+                if events.len() >= limit {
+                    break;
+                }
+                let remaining = limit - events.len();
+                let result = self
+                    .runtime
+                    .block_on(node.poll_shard(shard, None, remaining))
+                    .map_err(|e| PyRuntimeError::new_err(format!("poll: {}", e)))?;
+                events.extend(result.events);
+            }
+            Ok(Self::map_events(events))
         }
 
         /// Add a route.
@@ -3029,6 +3057,22 @@ mod mesh_bindings {
             self.node
                 .as_deref()
                 .ok_or_else(|| PyRuntimeError::new_err("MeshNode has been shut down"))
+        }
+
+        /// Shared projection for both poll paths.
+        fn map_events(events: Vec<net::event::StoredEvent>) -> Vec<StoredEvent> {
+            events
+                .into_iter()
+                .map(|e| {
+                    let raw = e.raw_str().unwrap_or("").to_string();
+                    StoredEvent {
+                        id: e.id,
+                        raw,
+                        insertion_ts: e.insertion_ts,
+                        shard_id: e.shard_id,
+                    }
+                })
+                .collect()
         }
 
         /// Clone the `Arc<MeshNode>` backing this `NetMesh`. Used

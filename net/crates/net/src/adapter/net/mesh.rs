@@ -9773,6 +9773,33 @@ impl MeshNode {
         self.node_id
     }
 
+    /// Number of shards inbound stream traffic is spread across.
+    ///
+    /// Callers need this to consume a stream: inbound events are placed
+    /// on `stream_id % num_shards`, so polling one shard sees only the
+    /// stream ids congruent to it. See [`Self::shard_for_stream`].
+    pub fn num_shards(&self) -> u16 {
+        self.config.num_shards
+    }
+
+    /// The inbound shard a given stream's events land on.
+    ///
+    /// The mapping is `stream_id % num_shards`, applied at
+    /// packet-dispatch time. Stream ids are otherwise opaque to
+    /// callers, so exposing this is what makes "which shard do I
+    /// poll?" answerable without reading the dispatch source — the
+    /// question that made every shard-0-only receive path silently
+    /// lossy for three quarters of stream ids at the default of four
+    /// shards.
+    pub fn shard_for_stream(&self, stream_id: u64) -> u16 {
+        let n = self.config.num_shards;
+        if n > 0 {
+            (stream_id % n as u64) as u16
+        } else {
+            0
+        }
+    }
+
     /// This node's `origin_hash` — the 8-byte BLAKE2s of its entity public
     /// key, and the value the bus stamps on this node's outbound RPCs. A
     /// remote handler sees it as `RpcContext::caller_origin`, so it is the

@@ -691,19 +691,56 @@ impl Mesh {
 
     // ---- Receiving ----
 
-    /// Poll for received events.
+    /// Poll for received events across **every** shard.
     ///
-    /// Returns up to `limit` events from all shards.
+    /// Returns up to `limit` events in total, drawing from each shard
+    /// in turn.
+    ///
+    /// This previously polled shard 0 only, on the reasoning that
+    /// "most events land here for single-stream sends". They do not:
+    /// inbound traffic is placed on `stream_id % num_shards`, so at
+    /// the default of four shards a caller saw only the stream ids
+    /// congruent to 0 and silently missed three quarters of them. The
+    /// doc comment already claimed all shards; the body now matches
+    /// it.
+    ///
+    /// Use [`Self::recv_shard`] with [`Self::shard_for_stream`] when
+    /// you want one specific stream and not a merge.
     pub async fn recv(&self, limit: usize) -> Result<Vec<StoredEvent>> {
-        // Poll shard 0 (most events land here for single-stream sends)
-        let result = self.node.poll_shard(0, None, limit).await?;
-        Ok(result.events)
+        let shards = self.node.num_shards().max(1);
+        let mut out = Vec::new();
+        for shard in 0..shards {
+            if out.len() >= limit {
+                break;
+            }
+            let remaining = limit - out.len();
+            let result = self.node.poll_shard(shard, None, remaining).await?;
+            out.extend(result.events);
+        }
+        Ok(out)
     }
 
     /// Poll a specific shard for events.
+    ///
+    /// Pair with [`Self::shard_for_stream`]: polling an arbitrary
+    /// shard for a known stream id is how the shard-0 assumption went
+    /// unnoticed.
     pub async fn recv_shard(&self, shard_id: u16, limit: usize) -> Result<Vec<StoredEvent>> {
         let result = self.node.poll_shard(shard_id, None, limit).await?;
         Ok(result.events)
+    }
+
+    /// Number of shards inbound stream traffic is spread across.
+    pub fn num_shards(&self) -> u16 {
+        self.node.num_shards()
+    }
+
+    /// The inbound shard `stream_id`'s events land on.
+    ///
+    /// `mesh.recv_shard(mesh.shard_for_stream(id), limit)` is the
+    /// targeted read; [`Self::recv`] is the merge.
+    pub fn shard_for_stream(&self, stream_id: u64) -> u16 {
+        self.node.shard_for_stream(stream_id)
     }
 
     // ---- Channels (distributed pub/sub) ----

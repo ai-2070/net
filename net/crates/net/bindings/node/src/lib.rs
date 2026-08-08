@@ -1808,18 +1808,71 @@ mod mesh_bindings {
             Ok(true)
         }
 
-        /// Poll for received events.
+        /// Number of shards inbound stream traffic is spread across.
+        ///
+        /// Inbound events land on `stream_id % numShards`, so this is
+        /// what makes a targeted `pollShard` possible.
+        #[napi]
+        pub fn num_shards(&self) -> Result<u32> {
+            let guard = self.load_node()?;
+            Ok(guard.as_ref().unwrap().num_shards() as u32)
+        }
+
+        /// The inbound shard a given stream's events land on.
+        #[napi]
+        pub fn shard_for_stream(&self, stream_id: BigInt) -> Result<u32> {
+            let guard = self.load_node()?;
+            let (_, id, _) = stream_id.get_u64();
+            Ok(guard.as_ref().unwrap().shard_for_stream(id) as u32)
+        }
+
+        /// Poll a specific inbound shard.
+        ///
+        /// Pair with `shardForStream` when you want one stream rather
+        /// than a merge across all of them.
+        #[napi]
+        pub async fn poll_shard(&self, shard_id: u32, limit: u32) -> Result<Vec<StoredEvent>> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            let shard = u16::try_from(shard_id)
+                .map_err(|_| Error::from_reason(format!("shard id {shard_id} exceeds u16")))?;
+            let result = node
+                .poll_shard(shard, None, limit as usize)
+                .await
+                .map_err(|e| Error::from_reason(format!("poll failed: {}", e)))?;
+            Ok(Self::map_events(result.events))
+        }
+
+        /// Poll for received events across **every** shard.
+        ///
+        /// This polled shard 0 only. Inbound traffic is placed on
+        /// `stream_id % numShards`, so at the default of four shards
+        /// a caller silently saw only the stream ids congruent to 0 —
+        /// three quarters of ordinary stream ids were unreadable
+        /// through this binding.
         #[napi]
         pub async fn poll(&self, limit: u32) -> Result<Vec<StoredEvent>> {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
-            let result = node
-                .poll_shard(0, None, limit as usize)
-                .await
-                .map_err(|e| Error::from_reason(format!("poll failed: {}", e)))?;
+            let shards = node.num_shards().max(1);
+            let mut events = Vec::new();
+            for shard in 0..shards {
+                if events.len() >= limit as usize {
+                    break;
+                }
+                let remaining = limit as usize - events.len();
+                let result = node
+                    .poll_shard(shard, None, remaining)
+                    .await
+                    .map_err(|e| Error::from_reason(format!("poll failed: {}", e)))?;
+                events.extend(result.events);
+            }
+            Ok(Self::map_events(events))
+        }
 
-            Ok(result
-                .events
+        /// Shared projection for both poll paths.
+        fn map_events(events: Vec<net::event::StoredEvent>) -> Vec<StoredEvent> {
+            events
                 .into_iter()
                 .map(|e| {
                     // Preserve binary payloads in `raw_bytes`. `raw` is
@@ -1837,7 +1890,7 @@ mod mesh_bindings {
                         shard_id: e.shard_id as u32,
                     }
                 })
-                .collect())
+                .collect()
         }
 
         /// Add a route to a destination node.
