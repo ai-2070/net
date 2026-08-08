@@ -21,6 +21,57 @@ The audit also found binding-level gaps in delegated credentials, prefix and que
 
 ---
 
+## Resolution status
+
+**Remediated:** 2026-08-08, on `master` from `51641125d`. The findings below are unedited — they record what was true at the audited commit, and the stale values they quote (161-byte tokens, `A-Z` in channel names) are evidence, not claims. Each `Required closure` now carries a status line.
+
+| # | Finding | Status | Commit |
+|---|---|---|---|
+| 1 | Name-validation bypass | Closed | `90cbd4d1e` |
+| 2 | Docs conflate the two surfaces | Closed | `4e3263ba1` |
+| 3 | Prefix subscription unimplemented | Closed | `4e3263ba1` |
+| 4 | Creation / replay / roster not universal | Closed | `4e3263ba1` |
+| 5 | Memory transport cannot deliver | Closed | `15565832b` |
+| 6 | Delegated credentials unreachable | Closed as documented gap | `36afee7e9` |
+| 7 | Prefix + queue-group policy Rust-only | Closed as documented gap | `36afee7e9` |
+| 8 | Go fail-closed switch without roots | Closed; cgo tests unverified locally | `a44397916` |
+| 9 | TS leaks `_channel` into payloads | Closed | `439f1e1b4` |
+| 10 | Python model/parser contract broken | Closed | `a30d635ef` |
+| 11 | Publish return/error contracts conflated | Closed | `bd57d5285` |
+| 12 | Batch fan-out Rust-only | Closed as documented gap | `36afee7e9` |
+| 13 | Rejection taxonomy collapses | **Outstanding** — recorded, not fixed | `36afee7e9` |
+| 14 | Token wire-size drift | Closed, with a canary | `b7cc155e3` |
+| 15 | TS quickstart inverts `emit()` failure | Closed | `bd57d5285` |
+| 16 | TS package versions contradict peer | Gate added; **bump outstanding** | `2cd16f781` |
+| 17 | Stale lifecycle obligations | Closed | `02ee556e7` |
+| 18 | Registry permissiveness asymmetric | Closed as documented gap | `36afee7e9` |
+
+**"Closed as documented gap"** means the finding offered "expose it consistently, or mark it explicitly and remove the impossible guidance" and the second branch was taken: the capability record now carries a cell per gap, every positive cell anchored to a symbol CI resolves, and the prose that told readers to call unreachable APIs is gone. Exposing these is new public API across five languages and is deliberately not in this pass.
+
+### What is genuinely still open
+
+1. **Finding 13 offered no alternative branch and was not closed.** Its required closure — expose a stable machine-readable rejection reason across every binding — is a wire-to-binding change in C, Go, Node, and Python. The taxonomy is now *recorded* as `partial` outside Rust, so a reader is no longer misled, but a C or Go caller still cannot distinguish rate-limited from unknown-channel from too-many-channels, which are three different remediations.
+2. **Finding 16's version bump.** The strict gate fails today, by design. Publishing needs `@net-mesh/core` 0.35.0 to land first; the manifests are untouched because that is a release-ordering decision, not a code fix.
+3. **Finding 8's end-to-end tests are unverified in this tree.** `go vet ./...` does not build here — `meshos_test.go` needs the generated native binding configuration, the same limitation this audit hit. `gofmt` is clean and the JSON-marshalling tests are pure Go; the four cgo-backed registration tests need a CI run.
+4. **No semantic canary for API homonyms.** Three new checkers landed (below); none is the homonym check the "Checker and release propagation gap" section asks for. Items 1–3 and 5–8 of that list remain unautomated.
+
+### Guards added
+
+The audit's central point — that copy-equality checks propagated a false interpretation into released artifacts — produced checkers rather than only one-off edits:
+
+- `.github/scripts/check-token-wire-size.py` derives `PermissionToken::WIRE_SIZE` from `token.rs` and fails on any disagreeing claim across the tracked tree. It found two stale comments the manual sweep missed. Wired into `check-docs.sh`; release notes, internal plans, and this document are excluded as dated records.
+- `.github/scripts/check-npm-peer-range.py` verifies `@net-mesh/sdk`'s peer range admits the in-tree `@net-mesh/core`. Non-strict in CI, strict in `release-npm-sdk.yml`.
+- Nine new capability-record operations replace the single coarse `Channels — pub/sub with capability auth` row, each positive cell anchored.
+
+### Verification run on the remediated tree
+
+- `check-skills.sh`, `check-docs.sh`, `capability_records.py --check`: pass.
+- `sdk-py` pytest: 327 passed (was 303; +24 new).
+- `sdk-ts` vitest on the channel suites: 94 passed. `tsc` build clean.
+- `go vet ./...`: does not build, for the pre-existing reason in item 3 above.
+
+---
+
 ## 1. High — High-level Python and TypeScript bypass canonical channel-name validation
 
 Rust's canonical constructor validates channel names at:
@@ -57,6 +108,8 @@ The lower distributed channel entrypoints do validate names. Examples include:
 - Validate inside `TypedChannel` constructors so direct construction is covered.
 - Add inverse tests for every Rust boundary.
 - Decide whether these wrappers are meant to represent distributed channels or only tagged EventBus topics.
+
+**Status: closed** (`90cbd4d1e`). `validate_channel_name` / `validateChannelName` mirror the Rust grammar and run in the `TypedChannel` constructor, so direct construction is covered and not only `NetNode.channel()`. Both are exported so a caller can pre-check a name without building a channel. Inverse tests cover every Rust boundary — empty, over 255 bytes (byte-counted, so a 128-character two-byte name fails), leading and trailing `/`, `//`, uppercase, invalid characters, and `.` / `..` segments — 52 in Python, 74 in TypeScript. The fourth question is answered by finding 2: these are tagged EventBus topics, and are now named that way everywhere.
 
 ---
 
@@ -118,6 +171,8 @@ Split all documentation into two explicitly named surfaces:
 
 Do not let examples, behavior claims, or coverage anchors for one surface stand as evidence for the other.
 
+**Status: closed** (`4e3263ba1`). `concepts.md` § Channel opens with a side-by-side table of the two surfaces and states which one the rest of the section describes. `apis.md` lists five surfaces rather than four, with the tagged and distributed rows separate and a routing question that sends cross-process work to the mesh surface. The false "Rust has no named channels" prose is corrected in `bindings/rust.md`, `go.md`, and `c.md` — what those bindings lack is the tagged wrapper, not distributed pub/sub. Python is marked `core-only`. Both package README surface tables now read "Distributed mesh channels".
+
 ---
 
 ## 3. High — Prefix subscription is documented but unimplemented
@@ -139,6 +194,8 @@ However, it performs publisher-side ACL/config resolution for dynamically named 
 ### Required closure
 
 Remove the prefix-subscription claim unless wildcard membership and delivery are intentionally implemented. Document prefix ACL resolution separately.
+
+**Status: closed** (`4e3263ba1`) — removed. Gone from `concepts.md` and from `web/src/content/docs/concepts/channels.md`, in both the naming section and the page intro that promised subscribing to whole subtrees. Replaced with an explicit denial (subscribing to `sensors/lidar` does *not* deliver `sensors/lidar/front`, because rosters key on the exact `ChannelId` and the tagged filter is an exact match) and a separate paragraph on `register_channel_prefix` as publisher-side ACL resolution: it decides whether a join is allowed, never what a subscriber receives.
 
 ---
 
@@ -165,6 +222,8 @@ Conversely, tagged TypeScript/Python topics are implicit labels over EventBus ev
 
 Document creation, membership, history, and delivery independently for each surface. Do not describe joining a roster as gaining replay or describe tagged ingestion as roster fan-out.
 
+**Status: closed** (`4e3263ba1`). The surface table covers creation, state ownership, authorization, and network crossing per surface. The implicit-creation bullet now separates the missing *cluster-wide* step from the required *local* one, and notes that creation really is implicit on the tagged surface. § Subscriber states that hot-not-cold holds on both, that joining a roster is not a replay, and that the tagged surface has no membership step to reject and nothing that can evict you. § Publisher notes there is no publisher role on the tagged surface at all.
+
 ---
 
 ## 5. High — Default memory transport cannot support documented publish/subscribe examples
@@ -186,6 +245,8 @@ The examples wait forever. Internal guidance is self-contradictory: `.claude/ski
 ### Required closure
 
 Use Redis, JetStream, or a connected mesh pair for round-trip examples. Restrict memory examples to ingestion, batching, backpressure, counters, and lifecycle behavior.
+
+**Status: closed** (`15565832b`). Both package READMEs, `web/src/content/docs/guides/event-bus.md` (all four language snippets), and the TS/Python skill quickstarts configure a delivering transport, with the reason inline in the snippet rather than in a caveat further down. `SKILL.md`'s transport-transparency claim and its "default to memory for tests" step are reconciled with `apis.md`, `testing.md`, and the runnable `examples/hello.*`, which already had it right; `runtime.md` § Tests likewise. The `concepts.md` transport table now states that memory does not deliver, and that transparency is a statement about the code rather than the behaviour.
 
 ---
 
@@ -218,6 +279,8 @@ This contradicts `.claude/skills/net-event-bus/concepts.md:135`, which says a fu
 
 Expose full `TokenChain` subscription and delegated publish-chain installation across the SDK spine, or mark both operations core-only and remove impossible workflow guidance.
 
+**Status: closed as documented gap** (`36afee7e9`) — second branch. Both operations are `not exposed` in all five bindings in the capability record, with the rationale in `coverage.md`. The impossible guidance is gone: `concepts.md` no longer says a full chain is surfaced as `SubscribeOptions.token`, and now states that every published surface carries exactly one `PermissionToken`, with two workarounds — mint a token issued directly to the subscriber by a root the channel trusts, or drive the core `MeshNode` from Rust. Exposing `TokenChain` across the spine remains open work.
+
 ---
 
 ## 7. High — Prefix and queue-group security controls are Rust-only
@@ -245,6 +308,8 @@ Non-Rust operators therefore cannot install custom dynamic-prefix ACLs or config
 
 Add explicit parity records for prefix ACLs, origin binding, queue-group policy, and queue-group membership. Either expose them consistently or mark them Rust-only with concrete alternatives.
 
+**Status: closed as documented gap** (`36afee7e9`) — second branch. Three new record rows: prefix ACL registration (Rust-only), origin binding plus queue-group policy (Rust-only, reachable because the SDK re-exports the core `ChannelConfig` builder), and queue-group subscription (`not exposed` everywhere including the Rust SDK — it is on the core `MeshNode`). `coverage.md` notes that the auto-installed nRPC defaults stay protected either way; what a non-Rust operator cannot do is install custom policy of their own.
+
 ---
 
 ## 8. High — Go exposes a fail-closed token switch without token roots
@@ -266,6 +331,8 @@ But the public C header omits that field from its documented config shape:
 ### Required closure
 
 Expose `TokenRoots` in Go and document `token_roots` in C. Add positive end-to-end tests proving a token-gated channel can be configured and used through each binding.
+
+**Status: closed; cgo tests unverified locally** (`a44397916`). Go's `ChannelConfig` gains `TokenRoots []string` carrying the `token_roots` JSON tag the C FFI's `ChannelConfigInput` already parsed, with `omitempty` so an untouched config marshals byte-identically to before. Both hand-maintained C headers document the field and state that `require_token` without roots is a permanently closed channel; `mesh.md` says the same and gives the spelling per binding. A new capability-record row covers token roots across all five. Tests cover the JSON key (a tag typo silently drops the roots and leaves the channel closed with no error anywhere), the omitempty path, and registration with valid and malformed roots — but `go vet ./...` does not build in this tree for an unrelated reason, so the cgo-backed cases need a CI run.
 
 ---
 
@@ -291,6 +358,8 @@ A strict runtime validator that rejects unknown properties consequently rejects 
 ### Required closure
 
 Strip `_channel` before TypeScript's default parser and runtime validator, or return an explicit envelope with payload and metadata separated.
+
+**Status: closed** (`439f1e1b4`) — strip rather than envelope, for parity with Python's existing behaviour. Both TypeScript parse paths strip the tag; `subscribeRaw()` still yields the stored event verbatim and is documented as the escape hatch for readers that want it. `CHANNEL_TAG_KEY` is exported so callers can name it. Tests cover the default cast, the validator path, a strict validator that rejects unknown properties, batch publishes, the raw passthrough, and a non-object payload.
 
 ---
 
@@ -342,6 +411,8 @@ Direct custom parsers receive raw JSON containing `_channel`, while model/defaul
 
 Expose `parse` through `NetNode.channel` or remove the example; serialize dataclasses with `dataclasses.is_dataclass` / `asdict`; and define whether custom parsers receive payload-only JSON or an explicit envelope.
 
+**Status: closed** (`a30d635ef`) — all three, and expose rather than remove. `_to_dict` checks `is_dataclass` before `__dict__` (so `slots=True` works) and uses `asdict`, which also recurses into nested dataclasses; plain slotted classes gather their declared slots; anything else raises a named `TypeError` at publish rather than building a payload that dies one frame deeper inside `json.dumps`. Custom parsers receive payload-only JSON, matching the model and default paths and the TypeScript SDK. The `payloads.md` rationale is corrected too: `Model(**data)` does run Pydantic validation — what it skips is the coercion and validators `model_validate_json` applies.
+
 ---
 
 ## 11. Medium — Publish return-value and error contracts are conflated
@@ -374,6 +445,8 @@ Python discards the native `ingest_raw()` result for a single tagged publish and
 
 Document return and error behavior per surface and per binding. Do not use a generic `publish` contract across EventBus ingestion and distributed fan-out.
 
+**Status: closed** (`bd57d5285`). `concepts.md` replaces the single-contract sentence with a four-row table — tagged TS, tagged Python, bus ingestion, distributed mesh — and notes that even a `PublishReport` reports what was sent, not what arrived. Python's `TypedChannel.publish` returns the `Receipt` it was discarding; `Receipt` moved to a small `net_sdk.types` module so `channel` can use it without an import cycle, and is still re-exported from `net_sdk.node`. `bindings/typescript.md` narrows "never throws" to ingestion only and names the `JSON.stringify` throw that precedes it.
+
 ---
 
 ## 12. Medium — Distributed batch fan-out exists only in Rust
@@ -394,6 +467,8 @@ The ergonomic TypeScript/Python `publishBatch` methods perform local generic Eve
 ### Required closure
 
 Expose distributed `publish_many` consistently or mark mesh batch fan-out as Rust-only in the capability record and binding guides.
+
+**Status: closed as documented gap** (`36afee7e9`) — second branch. New record row, Rust-only. `coverage.md` notes that looping single publishes changes batching, per-call overhead, and report granularity, so it is not a drop-in substitute, and that the ergonomic `publishBatch` / `publish_batch` is local ingestion rather than this.
 
 ---
 
@@ -426,6 +501,8 @@ Rate limiting, capacity rejection, unknown channels, and local validation are no
 
 Expose a stable machine-readable rejection reason across every binding.
 
+**Status: OUTSTANDING** — `36afee7e9` records it, and does not fix it. This finding offered no alternative branch, and the required closure is a wire-to-binding change across C, Go, Node, and Python that was out of scope for this pass. What landed is a capability-record row marking the taxonomy `partial` outside Rust, plus `coverage.md` prose spelling out the cost: a caller outside Rust cannot tell "retry later" (rate-limited) from "fix your config" (unknown channel) from "raise a limit" (too many channels). Readers are no longer misled; callers still cannot branch correctly.
+
 ---
 
 ## 14. Low — Permission-token wire-size documentation disagrees with the implementation and itself
@@ -450,6 +527,8 @@ The bindings currently pass opaque byte buffers, so this is primarily caller-con
 
 Replace stale lengths with the canonical size and add one generated cross-binding wire-format canary.
 
+**Status: closed** (`b7cc155e3`) — both halves. Every claim now reads 169: the Python binding and its `.pyi` stub, the Node binding and its `index.d.ts`, the C header, Go (from 159), and the docs site's security model and glossary. The C headers and Go also note that a full `TokenChain` (`1 + count * 169` bytes) will not fit where one token is accepted — the two shapes were being used interchangeably. `check-token-wire-size.py` derives the size from `token.rs` rather than hardcoding it and runs over the tracked tree; it found two stale comments in the Go and Python channel-auth tests that the manual sweep had missed.
+
 ---
 
 ## 15. Medium — TypeScript quickstart documents the opposite `emit()` failure behavior
@@ -471,6 +550,8 @@ That becomes a thrown JavaScript exception. There is no branch that returns `nul
 ### Required closure
 
 Correct the quickstart and narrow the return type to `Receipt`, unless null-on-backpressure is intentionally restored.
+
+**Status: closed** (`bd57d5285`) — narrow, not restore. `emit()` and `emitRaw()` are typed `Receipt`. The quickstart now says a backpressure drop arrives as a throw rather than a `null`, and points at `fire()` for genuine fire-and-forget. `bindings/typescript.md`'s error table is updated and no longer describes the `| null` as vestigial, because it is gone.
 
 ---
 
@@ -495,6 +576,8 @@ The raised TypeScript minimum closes the prior compatibility hole with old core 
 ### Required closure
 
 Treat this as a release-ordering gate: publish matching core and SDK versions atomically, then verify the installed pair rather than only the file-linked development dependency.
+
+**Status: gate added; bump outstanding** (`2cd16f781`). The manifests are untouched — which version to publish is a release decision, not a code fix. What landed is the verification this closure asks for. `check-npm-peer-range.py` compares the peer range against the in-tree core rather than the `file:` devDependency that carries no version and made this invisible to every build step. Non-strict in the `sdk-ts-tests` CI job, accepting a floor aimed at an unreleased version when the SDK CHANGELOG declares it — the current state of the tree. Strict in `release-npm-sdk.yml`, where the manifest version is final by definition: **it fails today, which is the point**. The README also now tells callers not to `--force` past an unmet peer warning.
 
 ---
 
@@ -521,6 +604,8 @@ But `TypedChannel` has no `close` method or independent lifecycle:
 
 Document lifecycle operations that actually exist. Explain that tagged channels are lightweight wrappers owned by the node rather than independently closable resources.
 
+**Status: closed** (`02ee556e7`). `bindings/rust.md` no longer claims `shutdown()` reports outstanding references — it contradicted its own `runtime.md` section — and the troubleshooting entry that existed to handle that error now describes the real hazard: events left undrained by a stream that outlived the call. The error does exist, on `MeshNode` shutdown where an un-closed client holds a genuine strong reference, and the entry points there. `bindings/typescript.md` states there is nothing to close first: a `TypedChannel` is a name, a prebuilt filter string, and an optional validator, all owned by the node; a live subscription is what needs `stop()`.
+
 ---
 
 ## 18. Medium — Channel-registry permissiveness differs across bindings
@@ -539,6 +624,8 @@ This difference may be intentional, but it is not represented clearly in binding
 ### Required closure
 
 Document strictness defaults and opt-outs per binding. If permissive mode is test-only, name and gate it accordingly rather than presenting it as ordinary channel behavior.
+
+**Status: closed as documented gap** (`36afee7e9`). New record row: `permissive_channels` / `permissiveChannels` is `supported · core-only` in Python and Node, `not exposed` in Rust, Go, and C. `coverage.md` states the full asymmetry — raw core permissive when no registry is installed, Rust SDK and C and Go strict, Python and Node strict with an opt-out — and names the flag a bootstrap and test affordance for the dynamic channel names the enrollment nRPC path needs, not ordinary channel behaviour. It is documented rather than code-gated; gating it is separate work.
 
 ---
 
@@ -614,6 +701,30 @@ Add semantic canaries for:
 8. **Complete coordinated package versioning before release.** Verify installed artifacts, not only file-linked development builds.
 9. **Add semantic documentation gates.** Preserve copy-equality checks, but do not treat them as behavioral proof.
 
+### Sequence outcome
+
+| Step | Outcome |
+|---|---|
+| 1. Split the two surfaces in documentation | Done — `4e3263ba1` |
+| 2. Canonical name validation + inverse tests | Done — `90cbd4d1e` |
+| 3. Repair the parity matrix | Done — `36afee7e9`, nine new record rows replacing one coarse row |
+| 4. Close security configuration dead ends | Partly — Go token roots done (`a44397916`); delegated workflows explicitly rejected in docs rather than exposed |
+| 5. Normalize payload and parser semantics | Done — `439f1e1b4` (strip, not envelope) and `a30d635ef` |
+| 6. Correct returns, failure, lifecycle, token size | Done — `bd57d5285`, `02ee556e7`, `b7cc155e3` |
+| 7. Replace non-delivering memory examples | Done — `15565832b` |
+| 8. Coordinated package versioning | Gate added (`2cd16f781`); the bump itself is a release action and is not done |
+| 9. Semantic documentation gates | Partly — two new checkers; the API-homonym canary is not built |
+
+The sequence was followed in a different order than listed: the code fixes (steps 2, 5, 6) went first because they are independently testable and their tests pin the contracts the documentation then describes, and the documentation split (step 1) landed once those contracts were settled. The mental-model-first ordering is right for a reader; commit-first ordering was right for verification.
+
 ## Audit conclusion
 
 The original channel-name report should be accepted. It understated the scope: both ergonomic SDKs bypass canonical validation, and the public documentation merges that tagged-event abstraction with a separate authenticated distributed channel protocol. Several security and delivery features are implemented only in core or Rust while the cross-SDK prose presents them as generally available. The repair must establish separate, testable contracts for the two surfaces and then make binding parity explicit rather than inferred from shared method names.
+
+### Remediation conclusion (2026-08-08)
+
+Fifteen findings are closed, five of those by explicitly recording a gap rather than filling it — the branch each of those findings offered. Three items remain genuinely open and are listed under **What is genuinely still open** above: the rejection-reason taxonomy (finding 13, the only closure with no alternative branch that was not implemented), the coordinated version bump (finding 16), and the API-homonym canary.
+
+The audit's own framing held up under repair. Every code defect it named was real and reproducible, and the two it flagged as scope-understating — the TypeScript validation bypass and the surface conflation — were the ones that cascaded furthest. Its one imprecision, noted in the original report on this repository, was mechanical rather than substantive: the wrappers do not pass an unchecked name into a channel FFI, they serialize it into generic event JSON, so `ChannelName::new` was never on the path at all. That distinction is what made the fix a constructor-side validator in each SDK rather than a plumbing change.
+
+What the remediation added beyond the findings is the guard layer. The audit's sharpest observation was structural rather than per-defect: the green checks proved that symbols resolve, generated copies match, and mirrors are synchronized, while proving nothing about ownership, transport, policy, return values, or lifecycle — and so propagated a false interpretation into released artifacts. Two of the three new checkers exist because a stale number and an unsatisfiable version range each survived a full audit cycle behind exactly that kind of green check. Both fail on real drift today: `check-token-wire-size.py` found two stale comments the manual sweep missed, and `check-npm-peer-range.py --strict` fails on the shipped peer range by design, and will keep failing until the release lands.
