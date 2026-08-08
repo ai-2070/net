@@ -94,8 +94,8 @@ A mode is written after the status: `supported · core-only`.
 | Membership rejection reason (AckReason taxonomy) | supported | partial | partial | partial | partial |
 | Permissive channel registry (opt out of strict default) | not exposed | supported · core-only | supported · core-only | not exposed | not exposed |
 | Mesh streams | supported | supported | supported | supported | supported |
-| Capability announce | supported | supported | supported · core-only | supported | supported |
-| Capability discovery | supported | supported | supported · core-only | supported | supported |
+| Capability announce | supported | supported | supported | supported | supported |
+| Capability discovery | supported | supported | supported | supported | supported |
 | nRPC — typed request/response + streaming | supported | supported | supported | supported | supported |
 | Gang-claim scheduler | supported | supported | supported | supported | supported |
 | A2A — agent task handoff | supported | supported · core-only | supported · core-only | not exposed | not exposed |
@@ -191,6 +191,13 @@ evidence about the other — `concepts.md` § Channel opens with the split.
 a Python program that only imports `net_sdk` cannot reach the channel surface
 at all. Same for `permissive_channels`, which is a constructor argument on the
 low-level binding.
+
+Capability announce and discovery **are** on the wrapper —
+`announce_capabilities`, `find_nodes` / `find_nodes_scoped`, `find_best_node` /
+`find_best_node_scoped` — so those rows are no longer `core-only`. They used to
+require reaching through the private `node._native`, which the published Python
+guides documented as the supported route. The **tool** surface (`list_tools`,
+`watch_tools`, `serve_tool`) still takes the native handle.
 
 **Delegated channel credentials are `not exposed` everywhere.** Core has both
 halves — `MeshNode::subscribe_channel_with_chain(TokenChain)` and

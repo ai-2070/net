@@ -402,6 +402,19 @@ int      net_mesh_open_stream(net_meshnode_t* handle,
                               net_mesh_stream_t** out_stream);
 void     net_mesh_stream_free(net_mesh_stream_t* handle);
 
+/* Close the underlying core stream, then free the handle.
+ *
+ * `net_mesh_stream_free` above only drops the FFI handle; core stream
+ * state survives until node shutdown. Use this to release it eagerly,
+ * to enforce a close/reopen epoch, or to reopen the same stream id
+ * under a new configuration — without it the original "first open
+ * wins" config stays in force for the life of the node.
+ *
+ * Returns 0 on success or a negative NET_ERR_* code. Null your handle
+ * afterwards; calling it or net_mesh_stream_free twice on the same
+ * pointer is undefined. */
+int      net_mesh_close_stream(net_mesh_stream_t* handle);
+
 /* Send a batch of payloads on an open stream.
  *
  * `payloads` is a pointer to an array of `count` byte-pointers;

@@ -250,7 +250,6 @@ operations:
       anchor: announceCapabilities
     Python:
       status: supported
-      mode: core-only
       anchor: announce_capabilities
     Go:
       status: supported
@@ -268,7 +267,6 @@ operations:
       anchor: findBestNode
     Python:
       status: supported
-      mode: core-only
       anchor: find_best_node
     Go:
       status: supported

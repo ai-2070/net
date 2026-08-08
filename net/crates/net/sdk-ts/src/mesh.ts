@@ -459,6 +459,18 @@ export class MeshNode {
     return this.native.nodeId();
   }
 
+  /**
+   * The resolved local socket address.
+   *
+   * Required whenever `bindAddr` ends in `:0` — the OS picks the port
+   * and this is the only way to learn which one, so a peer can be told
+   * where to connect. The README's own `127.0.0.1:0` example could not
+   * be completed without it.
+   */
+  localAddr(): string {
+    return this.native.localAddr();
+  }
+
   /** Connect to a peer as initiator. */
   async connect(peerAddr: string, peerPublicKey: string, peerNodeId: bigint): Promise<void> {
     await this.native.connect(peerAddr, peerPublicKey, peerNodeId);

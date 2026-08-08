@@ -1651,6 +1651,42 @@ pub unsafe extern "C" fn net_mesh_open_stream(
     }
 }
 
+/// Close the underlying core stream, then free the handle.
+///
+/// `net_mesh_stream_free` only drops the FFI handle and its `Arc`. It
+/// does not call `MeshNode::close_stream`, so core stream state
+/// survived until node shutdown: a long-lived C or Go node could not
+/// release stream state eagerly, could not enforce a close/reopen
+/// epoch, and could not reopen the same stream id under a new
+/// configuration — the original "first open wins" config stayed in
+/// force. Rust, Node and Python have always had the core close.
+///
+/// Idempotent at the Go/C level in the same sense as
+/// `net_mesh_stream_free`: calling it twice on the same pointer is
+/// undefined, so callers must null their handle after the first call
+/// (Go's `MeshStream.Close` does).
+///
+/// Returns `0` on success, or a negative `NetError` code.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_close_stream(handle: *mut MeshStreamHandle) -> c_int {
+    if handle.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let h: &MeshStreamHandle = unsafe { &*handle };
+    // Read the ids before `stream_free` takes the inner apart.
+    let peer_node_id = h.stream.peer_node_id();
+    let stream_id = h.stream.stream_id();
+    {
+        let _op = match h.guard.try_enter() {
+            Some(op) => op,
+            None => return NetError::ShuttingDown.into(),
+        };
+        h._node.close_stream(peer_node_id, stream_id);
+    }
+    unsafe { net_mesh_stream_free(handle) };
+    0
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn net_mesh_stream_free(handle: *mut MeshStreamHandle) {
     if handle.is_null() {

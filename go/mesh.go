@@ -820,9 +820,25 @@ func (s *MeshStream) free() {
 	}
 }
 
-// Close releases the stream handle. Idempotent.
+// Close closes the underlying core stream and releases the handle.
+// Idempotent.
+//
+// This used to call only `net_mesh_stream_free`, which drops the FFI
+// handle and its Arc without touching core stream state. The state
+// then survived until node shutdown, so a long-lived Go node could not
+// release it eagerly, could not enforce a close/reopen epoch, and
+// could not reopen the same stream id under a new configuration — the
+// first open's config stayed in force. `net_mesh_close_stream` does
+// both halves.
 func (s *MeshStream) Close() {
-	s.free()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.handle == nil {
+		return
+	}
+	C.net_mesh_close_stream(s.handle)
+	s.handle = nil
+	runtime.SetFinalizer(s, nil)
 }
 
 // payloadPtrs builds the parallel (pointers, lengths) arrays the C

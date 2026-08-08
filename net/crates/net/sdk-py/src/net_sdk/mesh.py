@@ -174,6 +174,17 @@ class MeshNode:
         """This node's id."""
         return self._native.node_id
 
+    @property
+    def local_addr(self) -> str:
+        """The resolved local socket address.
+
+        Required whenever ``bind_addr`` ends in ``:0`` — the OS picks
+        the port and this is the only way to learn which one, so a peer
+        can be told where to connect. The README's own ``127.0.0.1:0``
+        example could not be completed without it.
+        """
+        return self._native.local_addr
+
     def connect(self, peer_addr: str, peer_public_key: str, peer_node_id: int) -> None:
         """Connect to a peer as initiator."""
         self._native.connect(peer_addr, peer_public_key, peer_node_id)
@@ -189,6 +200,46 @@ class MeshNode:
     def peer_count(self) -> int:
         """Number of connected peers."""
         return self._native.peer_count()
+
+    # ── Capabilities and discovery ───────────────────────────────────
+    #
+    # These forward to the low-level binding. Without them the whole
+    # announce/discover lifecycle was reachable only through the
+    # private ``node._native`` attribute, and the published Python
+    # guides said so — application code was being pushed onto an
+    # internal name with no stability promise.
+
+    def announce_capabilities(self, caps: dict) -> None:
+        """Announce this node's capabilities to connected peers.
+
+        Also self-indexes, so :meth:`find_nodes` can match this node.
+        """
+        self._native.announce_capabilities(caps)
+
+    def find_nodes(self, filter: dict) -> List[int]:
+        """Node ids whose latest announcement matches ``filter``.
+
+        Returns a list — possibly empty. Compare with
+        :meth:`find_best_node`, which applies the requirement's weights
+        and returns a single winner.
+        """
+        return self._native.find_nodes(filter)
+
+    def find_nodes_scoped(self, filter: dict, scope: dict) -> List[int]:
+        """:meth:`find_nodes`, narrowed by a scope filter."""
+        return self._native.find_nodes_scoped(filter, scope)
+
+    def find_best_node(self, requirement: dict) -> Optional[int]:
+        """The single best-scoring node for ``requirement``.
+
+        ``None`` means no match. ``0`` is a real node id, so test
+        ``is None`` rather than truthiness.
+        """
+        return self._native.find_best_node(requirement)
+
+    def find_best_node_scoped(self, requirement: dict, scope: dict) -> Optional[int]:
+        """:meth:`find_best_node`, narrowed by a scope filter."""
+        return self._native.find_best_node_scoped(requirement, scope)
 
     # ── Gang-claim resource-island scheduler ─────────────────────────
 

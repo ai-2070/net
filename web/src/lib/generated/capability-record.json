@@ -107,7 +107,6 @@
           "status": "supported"
         },
         "Python": {
-          "mode": "core-only",
           "status": "supported"
         },
         "Rust": {
@@ -128,7 +127,6 @@
           "status": "supported"
         },
         "Python": {
-          "mode": "core-only",
           "status": "supported"
         },
         "Rust": {
