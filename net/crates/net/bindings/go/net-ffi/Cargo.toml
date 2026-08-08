@@ -1,15 +1,22 @@
 [package]
-name = "net-go-ffi"
+name = "net-ffi"
 version = "0.34.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "Single cdylib carrying every C-ABI surface the Go binding links"
-# Distributed alongside the Go binding, not via crates.io.
+description = "The single cdylib carrying every C-ABI surface Net exposes"
+# Lives under bindings/go/ for historical reasons — it predates C linking
+# it too. Not published; it is a link-time artifact, not a library anyone
+# depends on as a crate.
 publish = false
 
 [lib]
-# ONE shared object for the whole Go binding. `go/*.go` links `-lnet_go` and
-# nothing else, and that is the entire point of this crate.
+# ONE shared object for every C-ABI consumer. `libnet` carries `net::ffi` plus
+# all seven surfaces, `go/*.go` links `-lnet` and nothing else, and a C program
+# links `-lnet` and nothing else. That is the entire point of this crate.
+#
+# It takes the `net` lib name, and `net-mesh` gives up its `cdylib` crate-type
+# to make room, so that the `-lnet` in every existing C doc and example stays
+# correct and simply means more than it used to.
 #
 # Before it, the binding linked eight cdylibs (`libnet`, `libnet_org`,
 # `libnet_rpc`, …), each of which took `net-mesh` as an ordinary path
@@ -31,8 +38,8 @@ publish = false
 # dump showed every net worker thread in the process parked idle — a held mutex
 # with no owner anywhere. One copy in the address space is what makes that
 # state unreachable.
-name = "net_go"
-crate-type = ["cdylib", "staticlib"]
+name = "net"
+crate-type = ["cdylib"]
 
 [features]
 default = []

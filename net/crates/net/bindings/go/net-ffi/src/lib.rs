@@ -1,8 +1,9 @@
-//! The Go binding's single shared object.
+//! Net's single shared object.
 //!
 //! This crate defines almost nothing. Its job is to be the one place the seven
 //! C-ABI surfaces and `net::ffi` are linked together, so a process loads ONE
-//! copy of `net-mesh` instead of eight. See `Cargo.toml` for why that matters —
+//! copy of `net-mesh` instead of eight. Go and C both link `-lnet` and get
+//! everything. See `Cargo.toml` for why that matters —
 //! short version: per-`.so` `static`s do not unify the way exported functions
 //! do, and `parking_lot_core`'s parked-thread registry is one of them.
 //!
@@ -12,7 +13,7 @@
 //! reason to pull an rlib whose items are all unreachable from this crate's
 //! root, and `#[no_mangle]` does not make an item reachable. Each line below is
 //! load-bearing — dropping one silently removes that surface's symbols from
-//! `libnet_go.so`, and the failure lands at `go build` link time in whichever
+//! `libnet`, and the failure lands at `go build` link time in whichever
 //! `go/*.go` file happened to call into it.
 //!
 //! The `#[allow(unused_extern_crates)]` is therefore deliberate: this is
@@ -48,6 +49,6 @@ extern crate net;
 /// `1` is the collapse-to-one-cdylib layout. Bump it only for a change that
 /// alters which surfaces are present, never for ordinary version bumps.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_go_ffi_abi_version() -> u32 {
+pub extern "C" fn net_ffi_abi_version() -> u32 {
     1
 }

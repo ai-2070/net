@@ -2770,7 +2770,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "net-go-ffi"
+name = "net-ffi"
 version = "0.34.0"
 dependencies = [
  "net-compute-ffi",
