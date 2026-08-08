@@ -371,6 +371,52 @@ func (bs *Net) IngestBatch(events []interface{}) int {
 	return bs.IngestRawBatch(jsons)
 }
 
+// PollOptions carries the full poll request shape.
+//
+// Go previously hard-coded limit + cursor, which was the only shape
+// the C parser read — the other three fields are on the Rust,
+// TypeScript and Python poll surfaces and were unreachable from here.
+type PollOptions struct {
+	// Limit is the maximum number of events to return.
+	Limit int
+
+	// Cursor resumes from a previous poll. Empty means from the start.
+	Cursor string
+
+	// Ordering is "none" (default, fastest) or "insertion_ts"
+	// (cross-shard ordering). Any other value is rejected — it is not
+	// silently treated as "none".
+	Ordering string
+
+	// Filter is a JSON predicate object, e.g.
+	// `{"path":"kind","value":"lidar"}`. Empty means no filter.
+	Filter string
+
+	// Shards restricts the poll to specific shard ids. Nil means all
+	// shards. Note inbound stream traffic lands on
+	// `stream_id % num_shards`, so a single-shard poll sees only the
+	// stream ids congruent to it.
+	Shards []uint16
+}
+
+// OrderingModes are the values PollOptions.Ordering accepts.
+var OrderingModes = []string{"none", "insertion_ts"}
+
+func (o *PollOptions) validate() error {
+	if o.Ordering == "" {
+		return nil
+	}
+	for _, mode := range OrderingModes {
+		if o.Ordering == mode {
+			return nil
+		}
+	}
+	return fmt.Errorf(
+		"invalid ordering %q: use one of %v (values are case-sensitive)",
+		o.Ordering, OrderingModes,
+	)
+}
+
 // Poll retrieves events from the bus.
 //
 // Parameters:
@@ -378,7 +424,17 @@ func (bs *Net) IngestBatch(events []interface{}) int {
 //   - cursor: Optional cursor from a previous poll for pagination.
 //
 // Returns the poll response containing events and pagination info.
+// Use PollWith for ordering, filtering, or shard selection.
 func (bs *Net) Poll(limit int, cursor string) (*PollResponse, error) {
+	return bs.PollWith(PollOptions{Limit: limit, Cursor: cursor})
+}
+
+// PollWith retrieves events using the full request shape.
+func (bs *Net) PollWith(opts PollOptions) (*PollResponse, error) {
+	if err := opts.validate(); err != nil {
+		return nil, err
+	}
+
 	bs.mu.RLock()
 	defer bs.mu.RUnlock()
 
@@ -393,7 +449,7 @@ func (bs *Net) Poll(limit int, cursor string) (*PollResponse, error) {
 	// boundary. Hand-rolling produces a single null-terminated
 	// byte slice and passes it directly via the Go-managed
 	// pointer — kept alive across the cgo call by KeepAlive.
-	cRequestBuf := buildPollRequest(limit, cursor)
+	cRequestBuf := buildPollRequest(opts)
 	cRequest := (*C.char)(unsafe.Pointer(&cRequestBuf[0]))
 
 	// Allocate output buffer (start with 64KB, grow if needed)
@@ -448,15 +504,37 @@ func (bs *Net) Poll(limit int, cursor string) (*PollResponse, error) {
 // quotes / control bytes / backslashes in a future cursor format
 // stay correctly encoded. The simple-limit-only path skips Marshal
 // entirely.
-func buildPollRequest(limit int, cursor string) []byte {
-	// Capacity guess: prefix + ~20 digits for limit + cursor block + close + null.
-	buf := make([]byte, 0, 32+len(cursor)+8)
+func buildPollRequest(opts PollOptions) []byte {
+	// Capacity guess: prefix + ~20 digits for limit + cursor block +
+	// the optional tail + close + null.
+	buf := make([]byte, 0, 32+len(opts.Cursor)+len(opts.Filter)+len(opts.Ordering)+24)
 	buf = append(buf, `{"limit":`...)
-	buf = strconv.AppendInt(buf, int64(limit), 10)
-	if cursor != "" {
+	buf = strconv.AppendInt(buf, int64(opts.Limit), 10)
+	if opts.Cursor != "" {
 		buf = append(buf, `,"cursor":`...)
-		cursorJSON, _ := json.Marshal(cursor)
+		cursorJSON, _ := json.Marshal(opts.Cursor)
 		buf = append(buf, cursorJSON...)
+	}
+	if opts.Ordering != "" {
+		buf = append(buf, `,"ordering":`...)
+		orderingJSON, _ := json.Marshal(opts.Ordering)
+		buf = append(buf, orderingJSON...)
+	}
+	if opts.Filter != "" {
+		// Already a JSON object; embed verbatim rather than as a
+		// string, matching the C parser's nested-object shape.
+		buf = append(buf, `,"filter":`...)
+		buf = append(buf, opts.Filter...)
+	}
+	if len(opts.Shards) > 0 {
+		buf = append(buf, `,"shards":[`...)
+		for i, shard := range opts.Shards {
+			if i > 0 {
+				buf = append(buf, ',')
+			}
+			buf = strconv.AppendUint(buf, uint64(shard), 10)
+		}
+		buf = append(buf, ']')
 	}
 	buf = append(buf, '}', 0)
 	return buf
