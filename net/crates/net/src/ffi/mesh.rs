@@ -2082,10 +2082,16 @@ pub unsafe extern "C" fn net_mesh_register_channel(
         cfg = cfg.with_rate_limit(pps);
     }
     if let Some(filter_json) = input.publish_caps {
-        cfg = cfg.with_publish_caps(capability_filter_from_json(filter_json));
+        cfg = match capability_filter_from_json(filter_json) {
+            Ok(f) => cfg.with_publish_caps(f),
+            Err(_) => return NetError::InvalidJson.into(),
+        };
     }
     if let Some(filter_json) = input.subscribe_caps {
-        cfg = cfg.with_subscribe_caps(capability_filter_from_json(filter_json));
+        cfg = match capability_filter_from_json(filter_json) {
+            Ok(f) => cfg.with_subscribe_caps(f),
+            Err(_) => return NetError::InvalidJson.into(),
+        };
     }
     h.channel_configs.insert(cfg);
     0
@@ -3277,7 +3283,7 @@ fn software_from_json(s: SoftwareJson) -> SoftwareCapabilities {
     sw
 }
 
-fn model_from_json(m: ModelJson) -> ModelCapability {
+fn model_from_json(m: ModelJson) -> Result<ModelCapability, String> {
     let mut mc = ModelCapability::new(m.model_id, m.family);
     if let Some(p) = m.parameters_b_x10 {
         mc.parameters_b_x10 = p;
@@ -3289,17 +3295,16 @@ fn model_from_json(m: ModelJson) -> ModelCapability {
         mc = mc.with_quantization(q);
     }
     for modality in m.modalities {
+        // Reject, rather than skip. Skipping was already better
+        // than the original silent fallback to Text — which
+        // advertised a capability the node does not have — but it
+        // still let a typo through as a successfully announced set
+        // with one modality quietly missing. The caller cannot see
+        // the difference between "I did not claim audio" and "my
+        // spelling of audio was dropped".
         match parse_modality_cap(&modality) {
             Some(parsed) => mc = mc.add_modality(parsed),
-            None => {
-                tracing::warn!(
-                    modality = %modality,
-                    "announce_capabilities: unknown modality string (typo?), \
-                     skipping rather than the pre-fix silent fallback to Text — \
-                     advertising a Text capability the node doesn't actually \
-                     have produced wrong scheduling decisions on the receiver",
-                );
-            }
+            None => return Err(modality),
         }
     }
     if let Some(t) = m.tokens_per_sec {
@@ -3308,7 +3313,7 @@ fn model_from_json(m: ModelJson) -> ModelCapability {
     if let Some(l) = m.loaded {
         mc = mc.with_loaded(l);
     }
-    mc
+    Ok(mc)
 }
 
 fn tool_from_json(t: ToolJson) -> ToolCapability {
@@ -3357,7 +3362,7 @@ fn limits_from_json(l: LimitsJson) -> ResourceLimits {
     rl
 }
 
-fn capability_set_from_json(caps: CapabilitySetJson) -> CapabilitySet {
+fn capability_set_from_json(caps: CapabilitySetJson) -> Result<CapabilitySet, String> {
     let mut cs = CapabilitySet::new();
     if let Some(h) = caps.hardware {
         cs = cs.with_hardware(hardware_from_json(h));
@@ -3366,7 +3371,7 @@ fn capability_set_from_json(caps: CapabilitySetJson) -> CapabilitySet {
         cs = cs.with_software(software_from_json(s));
     }
     for m in caps.models {
-        cs = cs.add_model(model_from_json(m));
+        cs = cs.add_model(model_from_json(m)?);
     }
     for t in caps.tools {
         cs = cs.add_tool(tool_from_json(t));
@@ -3392,10 +3397,10 @@ fn capability_set_from_json(caps: CapabilitySetJson) -> CapabilitySet {
     if let Some(l) = caps.limits {
         cs = cs.with_limits(limits_from_json(l));
     }
-    cs
+    Ok(cs)
 }
 
-fn capability_filter_from_json(f: CapabilityFilterJson) -> CapabilityFilter {
+fn capability_filter_from_json(f: CapabilityFilterJson) -> Result<CapabilityFilter, String> {
     let mut cf = CapabilityFilter::new();
     for t in f.require_tags {
         cf = cf.require_tag(t);
@@ -3422,33 +3427,21 @@ fn capability_filter_from_json(f: CapabilityFilterJson) -> CapabilityFilter {
         cf = cf.with_min_context(n);
     }
     for m in f.require_modalities {
+        // Reject. On a filter this is the fail-open direction: the
+        // previous behaviour dropped the unrecognized constraint,
+        // so a typo widened the query to every otherwise-eligible
+        // node and the scheduler picked one that cannot do the
+        // work. The comment this replaces conceded exactly that
+        // ("the resulting filter is too permissive"), reasoning
+        // that matching too broadly beats matching the wrong type.
+        // Both are wrong answers to a question the caller can be
+        // told to fix.
         match parse_modality_cap(&m) {
             Some(parsed) => cf = cf.require_modality(parsed),
-            None => {
-                // For a filter, the lossy direction matters even
-                // more than for announce: pre-fix the typo'd
-                // string was re-interpreted as `require Text`,
-                // returning Text-capable nodes that did NOT
-                // satisfy the operator's intended constraint.
-                // Skipping the unknown is also imperfect (the
-                // resulting filter is too permissive — it
-                // returns more nodes than intended), but the
-                // failure mode is "scheduler matched too
-                // broadly" rather than "scheduler matched the
-                // wrong type." The loud warn surfaces the typo
-                // so operators can fix it.
-                tracing::warn!(
-                    modality = %m,
-                    "find_nodes: unknown modality string in require_modalities \
-                     filter (typo?), dropping the constraint; the resulting \
-                     filter is too permissive — pre-fix it was silently \
-                     re-interpreted as `require Text`, which returned the \
-                     wrong nodes",
-                );
-            }
+            None => return Err(m),
         }
     }
-    cf
+    Ok(cf)
 }
 
 // ----- Exports ---------------------------------------------------------------
@@ -3481,7 +3474,13 @@ pub unsafe extern "C" fn net_mesh_announce_capabilities(
         Ok(v) => v,
         Err(_) => return NetError::InvalidJson.into(),
     };
-    let caps = capability_set_from_json(parsed);
+    // An unrecognized modality rejects the whole announcement. It
+    // used to be dropped with a warning, which shipped a set that
+    // silently lacked the capability the caller believed it declared.
+    let caps = match capability_set_from_json(parsed) {
+        Ok(c) => c,
+        Err(_) => return NetError::InvalidJson.into(),
+    };
     let node = h.inner.clone();
     match block_on(async move { node.announce_capabilities(caps).await }) {
         Ok(()) => 0,
@@ -3513,7 +3512,13 @@ pub unsafe extern "C" fn net_mesh_find_nodes(
         Ok(v) => v,
         Err(_) => return NetError::InvalidJson.into(),
     };
-    let filter = capability_filter_from_json(parsed);
+    // An unrecognized modality rejects the query. Dropping it widened
+    // the filter to every otherwise-eligible node — fail-open
+    // scheduling.
+    let filter = match capability_filter_from_json(parsed) {
+        Ok(f) => f,
+        Err(_) => return NetError::InvalidJson.into(),
+    };
     let ids = h.inner.find_nodes_by_filter(&filter);
     write_json_out(&ids, out_json, out_len)
 }
@@ -3698,7 +3703,10 @@ pub unsafe extern "C" fn net_mesh_find_nodes_scoped(
         Ok(v) => v,
         Err(_) => return NetError::InvalidJson.into(),
     };
-    let filter = capability_filter_from_json(parsed_filter);
+    let filter = match capability_filter_from_json(parsed_filter) {
+        Ok(f) => f,
+        Err(_) => return NetError::InvalidJson.into(),
+    };
     let owned = match scope_filter_from_json(parsed_scope) {
         Ok(v) => v,
         Err(e) => return e.into(),
@@ -3738,14 +3746,16 @@ struct CapabilityRequirementJson {
 
 fn capability_requirement_from_json(
     j: CapabilityRequirementJson,
-) -> crate::adapter::net::behavior::capability::CapabilityRequirement {
-    crate::adapter::net::behavior::capability::CapabilityRequirement::from_filter(
-        capability_filter_from_json(j.filter),
+) -> Result<crate::adapter::net::behavior::capability::CapabilityRequirement, String> {
+    Ok(
+        crate::adapter::net::behavior::capability::CapabilityRequirement::from_filter(
+            capability_filter_from_json(j.filter)?,
+        )
+        .prefer_memory(j.prefer_more_memory)
+        .prefer_vram(j.prefer_more_vram)
+        .prefer_speed(j.prefer_faster_inference)
+        .prefer_loaded(j.prefer_loaded_models),
     )
-    .prefer_memory(j.prefer_more_memory)
-    .prefer_vram(j.prefer_more_vram)
-    .prefer_speed(j.prefer_faster_inference)
-    .prefer_loaded(j.prefer_loaded_models)
 }
 
 /// Pick the best-scoring node for a placement requirement. Writes
@@ -3783,7 +3793,10 @@ pub unsafe extern "C" fn net_mesh_find_best_node(
         Ok(v) => v,
         Err(_) => return NetError::InvalidJson.into(),
     };
-    let req = capability_requirement_from_json(parsed);
+    let req = match capability_requirement_from_json(parsed) {
+        Ok(r) => r,
+        Err(_) => return NetError::InvalidJson.into(),
+    };
     match h.inner.find_best_node(&req) {
         Some(node_id) => unsafe {
             *out_node_id = node_id;
@@ -3839,7 +3852,10 @@ pub unsafe extern "C" fn net_mesh_find_best_node_scoped(
         Ok(v) => v,
         Err(_) => return NetError::InvalidJson.into(),
     };
-    let req = capability_requirement_from_json(parsed_req);
+    let req = match capability_requirement_from_json(parsed_req) {
+        Ok(r) => r,
+        Err(_) => return NetError::InvalidJson.into(),
+    };
     let owned = match scope_filter_from_json(parsed_scope) {
         Ok(v) => v,
         Err(e) => return e.into(),
@@ -4539,7 +4555,10 @@ mod tests {
     /// didn't have; in find-nodes filters, the same typo was
     /// reinterpreted as `require Text` and returned the wrong
     /// nodes. The strict shape lets callers handle the unknown
-    /// case explicitly (callers in this file warn-and-skip).
+    /// case explicitly; callers in this file now reject the whole
+    /// request (see `unknown_modality_rejects_*` below), because
+    /// warn-and-skip still shipped an announcement missing a
+    /// capability, and a filter missing a constraint.
     #[test]
     fn parse_modality_cap_returns_none_on_unknown_strings() {
         // Known values still parse.
@@ -4571,6 +4590,57 @@ mod tests {
                 "unknown modality `{s}` must return None — pre-fix this \
                  fell back to Modality::Text, advertising a capability \
                  the node didn't actually have",
+            );
+        }
+    }
+
+    /// An unknown modality must reject the whole announcement rather
+    /// than being dropped from it. Dropping produced a set the caller
+    /// believed declared `audio` and which silently did not, so a
+    /// scheduler matched on the difference and the operator had no
+    /// signal.
+    #[test]
+    fn unknown_modality_rejects_the_announcement() {
+        let json = r#"{"models":[{"model_id":"m","modalities":["audoi"]}]}"#;
+        let parsed: CapabilitySetJson = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            capability_set_from_json(parsed).unwrap_err(),
+            "audoi",
+            "the error must name the offending value",
+        );
+    }
+
+    /// The filter direction is the fail-open one: a dropped constraint
+    /// widens the query to every otherwise-eligible node, so the
+    /// scheduler can pick a node that cannot do the work.
+    #[test]
+    fn unknown_modality_rejects_the_filter() {
+        let json = r#"{"require_modalities":["audoi"]}"#;
+        let parsed: CapabilityFilterJson = serde_json::from_str(json).unwrap();
+        assert_eq!(capability_filter_from_json(parsed).unwrap_err(), "audoi");
+    }
+
+    /// The whole documented vocabulary still round-trips through both
+    /// conversions, so rejection did not narrow what callers can say.
+    #[test]
+    fn every_documented_modality_still_converts() {
+        for name in [
+            "text",
+            "image",
+            "audio",
+            "video",
+            "code",
+            "embedding",
+            "tool-use",
+            "tool_use",
+            "tooluse",
+            "TEXT",
+        ] {
+            let json = format!(r#"{{"require_modalities":["{name}"]}}"#);
+            let parsed: CapabilityFilterJson = serde_json::from_str(&json).unwrap();
+            assert!(
+                capability_filter_from_json(parsed).is_ok(),
+                "documented modality {name:?} must convert",
             );
         }
     }
@@ -5296,7 +5366,7 @@ mod nat_traversal_stub_tests {
     fn capability_set_from_go_marshal_preserves_gpu_vendor() {
         let json = r#"{"hardware":{"cpu_cores":16,"memory_gb":64,"gpu":{"vendor":"nvidia","model":"h100","vram_gb":80}},"tags":["gpu"]}"#;
         let parsed: CapabilitySetJson = serde_json::from_str(json).expect("JSON should parse");
-        let caps = capability_set_from_json(parsed);
+        let caps = capability_set_from_json(parsed).expect("valid capability set");
         // Phase A.5.5: read through views() so the test asserts
         // the projection — the same surface every consumer sees
         // post-Phase-A.5.N when typed-struct fields are removed.

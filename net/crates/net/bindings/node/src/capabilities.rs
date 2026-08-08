@@ -180,16 +180,32 @@ fn gpu_vendor_to_string(v: GpuVendor) -> String {
     }
 }
 
-fn parse_modality(s: &str) -> Modality {
+/// The modality vocabulary, for error messages. Kept beside the parser
+/// so a new `Modality` variant cannot be added to one and not the other.
+const MODALITY_NAMES: &str = "text, image, audio, video, code, embedding, tool-use";
+
+/// Parse a modality name, rejecting anything outside the vocabulary.
+///
+/// Fallible on purpose. This used to fall through to `Modality::Text`,
+/// which was wrong in two different directions depending on where the
+/// value came from: on an *announcement* a typo advertised a Text
+/// capability the node does not have, and on a *filter* it silently
+/// selected Text nodes instead of the intended ones. Neither surfaced
+/// an error. The C/Go path had the mirror-image bug — it dropped
+/// unknown values, which on a filter removes the constraint and
+/// broadens matching to every otherwise-eligible node.
+fn parse_modality(s: &str) -> napi::Result<Modality> {
     match s.to_ascii_lowercase().as_str() {
-        "text" => Modality::Text,
-        "image" => Modality::Image,
-        "audio" => Modality::Audio,
-        "video" => Modality::Video,
-        "code" => Modality::Code,
-        "embedding" => Modality::Embedding,
-        "tool-use" | "tool_use" | "tooluse" => Modality::ToolUse,
-        _ => Modality::Text,
+        "text" => Ok(Modality::Text),
+        "image" => Ok(Modality::Image),
+        "audio" => Ok(Modality::Audio),
+        "video" => Ok(Modality::Video),
+        "code" => Ok(Modality::Code),
+        "embedding" => Ok(Modality::Embedding),
+        "tool-use" | "tool_use" | "tooluse" => Ok(Modality::ToolUse),
+        other => Err(napi::Error::from_reason(format!(
+            "Invalid modality: {other}. Use one of: {MODALITY_NAMES}"
+        ))),
     }
 }
 
@@ -330,7 +346,7 @@ fn software_from_js(s: SoftwareJs) -> SoftwareCapabilities {
     sw
 }
 
-fn model_from_js(m: ModelJs) -> ModelCapability {
+fn model_from_js(m: ModelJs) -> napi::Result<ModelCapability> {
     let mut mc = ModelCapability::new(m.model_id, m.family.unwrap_or_default());
     if let Some(p) = m.parameters_b_x10 {
         // Field is public + stable — set directly to avoid the
@@ -344,7 +360,7 @@ fn model_from_js(m: ModelJs) -> ModelCapability {
         mc = mc.with_quantization(q);
     }
     for mod_name in m.modalities.unwrap_or_default() {
-        mc = mc.add_modality(parse_modality(&mod_name));
+        mc = mc.add_modality(parse_modality(&mod_name)?);
     }
     if let Some(t) = m.tokens_per_sec {
         mc = mc.with_tokens_per_sec(t);
@@ -352,7 +368,7 @@ fn model_from_js(m: ModelJs) -> ModelCapability {
     if let Some(l) = m.loaded {
         mc = mc.with_loaded(l);
     }
-    mc
+    Ok(mc)
 }
 
 fn tool_from_js(t: ToolJs) -> ToolCapability {
@@ -401,7 +417,7 @@ fn limits_from_js(l: CapabilityLimitsJs) -> ResourceLimits {
     rl
 }
 
-pub fn capability_set_from_js(caps: CapabilitySetJs) -> CapabilitySet {
+pub fn capability_set_from_js(caps: CapabilitySetJs) -> napi::Result<CapabilitySet> {
     let mut cs = CapabilitySet::new();
     if let Some(h) = caps.hardware {
         cs = cs.with_hardware(hardware_from_js(h));
@@ -410,7 +426,7 @@ pub fn capability_set_from_js(caps: CapabilitySetJs) -> CapabilitySet {
         cs = cs.with_software(software_from_js(s));
     }
     for m in caps.models.unwrap_or_default() {
-        cs = cs.add_model(model_from_js(m));
+        cs = cs.add_model(model_from_js(m)?);
     }
     for t in caps.tools.unwrap_or_default() {
         cs = cs.add_tool(tool_from_js(t));
@@ -429,10 +445,10 @@ pub fn capability_set_from_js(caps: CapabilitySetJs) -> CapabilitySet {
     if let Some(l) = caps.limits {
         cs = cs.with_limits(limits_from_js(l));
     }
-    cs
+    Ok(cs)
 }
 
-pub fn capability_filter_from_js(f: CapabilityFilterJs) -> CapabilityFilter {
+pub fn capability_filter_from_js(f: CapabilityFilterJs) -> napi::Result<CapabilityFilter> {
     let mut cf = CapabilityFilter::new();
     for t in f.require_tags.unwrap_or_default() {
         cf = cf.require_tag(t);
@@ -459,9 +475,9 @@ pub fn capability_filter_from_js(f: CapabilityFilterJs) -> CapabilityFilter {
         cf = cf.with_min_context(n);
     }
     for m in f.require_modalities.unwrap_or_default() {
-        cf = cf.require_modality(parse_modality(&m));
+        cf = cf.require_modality(parse_modality(&m)?);
     }
-    cf
+    Ok(cf)
 }
 
 /// Convert a JS placement requirement to the core
@@ -506,7 +522,7 @@ pub fn capability_requirement_from_js(
     let prefer_loaded_models = weight("preferLoadedModels", req.prefer_loaded_models)?;
 
     Ok(
-        CapabilityRequirement::from_filter(capability_filter_from_js(req.filter))
+        CapabilityRequirement::from_filter(capability_filter_from_js(req.filter)?)
             .prefer_memory(prefer_more_memory)
             .prefer_vram(prefer_more_vram)
             .prefer_speed(prefer_faster_inference)

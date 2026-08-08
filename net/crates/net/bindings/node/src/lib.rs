@@ -1338,11 +1338,12 @@ mod mesh_bindings {
                 cfg = cfg.with_rate_limit(pps);
             }
             if let Some(filter) = self.publish_caps {
-                cfg = cfg.with_publish_caps(crate::capabilities::capability_filter_from_js(filter));
+                cfg = cfg
+                    .with_publish_caps(crate::capabilities::capability_filter_from_js(filter)?);
             }
             if let Some(filter) = self.subscribe_caps {
-                cfg =
-                    cfg.with_subscribe_caps(crate::capabilities::capability_filter_from_js(filter));
+                cfg = cfg
+                    .with_subscribe_caps(crate::capabilities::capability_filter_from_js(filter)?);
             }
             Ok(cfg)
         }
@@ -2123,7 +2124,7 @@ mod mesh_bindings {
         ) -> Result<()> {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
-            let core = crate::capabilities::capability_set_from_js(caps);
+            let core = crate::capabilities::capability_set_from_js(caps)?;
             node.announce_capabilities(core)
                 .await
                 .map_err(|e| Error::from_reason(format!("capability: {}", e)))
@@ -2139,7 +2140,7 @@ mod mesh_bindings {
         ) -> Result<Vec<BigInt>> {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
-            let core = crate::capabilities::capability_filter_from_js(filter);
+            let core = crate::capabilities::capability_filter_from_js(filter)?;
             Ok(node
                 .find_nodes_by_filter(&core)
                 .into_iter()
@@ -2160,7 +2161,7 @@ mod mesh_bindings {
         ) -> Result<Vec<BigInt>> {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
-            let core = crate::capabilities::capability_filter_from_js(filter);
+            let core = crate::capabilities::capability_filter_from_js(filter)?;
             let owned = crate::capabilities::scope_filter_from_js(scope)?;
             let ids = crate::capabilities::with_scope_filter(&owned, |f| {
                 node.find_nodes_by_filter_scoped(&core, f)

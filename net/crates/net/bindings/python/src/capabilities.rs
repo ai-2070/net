@@ -7,7 +7,7 @@
 //! quirks (vendor casing, modality aliases, x10 integer encodings)
 //! stay in sync across the two bindings.
 
-use pyo3::exceptions::PyTypeError;
+use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
@@ -122,16 +122,30 @@ fn gpu_vendor_to_string(v: GpuVendor) -> String {
     }
 }
 
-fn parse_modality(s: &str) -> Modality {
+/// The modality vocabulary, for error messages. Kept beside the parser
+/// so a new `Modality` variant cannot be added to one and not the other.
+const MODALITY_NAMES: &str = "text, image, audio, video, code, embedding, tool-use";
+
+/// Parse a modality name, rejecting anything outside the vocabulary.
+///
+/// Fallible on purpose. This used to fall through to `Modality::Text`,
+/// which was wrong in two different directions depending on where the
+/// value came from: on an *announcement* a typo advertised a Text
+/// capability the node does not have, and on a *filter* it silently
+/// selected Text nodes instead of the intended ones. Neither surfaced
+/// an error.
+fn parse_modality(s: &str) -> PyResult<Modality> {
     match s.to_ascii_lowercase().as_str() {
-        "text" => Modality::Text,
-        "image" => Modality::Image,
-        "audio" => Modality::Audio,
-        "video" => Modality::Video,
-        "code" => Modality::Code,
-        "embedding" => Modality::Embedding,
-        "tool-use" | "tool_use" | "tooluse" => Modality::ToolUse,
-        _ => Modality::Text,
+        "text" => Ok(Modality::Text),
+        "image" => Ok(Modality::Image),
+        "audio" => Ok(Modality::Audio),
+        "video" => Ok(Modality::Video),
+        "code" => Ok(Modality::Code),
+        "embedding" => Ok(Modality::Embedding),
+        "tool-use" | "tool_use" | "tooluse" => Ok(Modality::ToolUse),
+        other => Err(PyValueError::new_err(format!(
+            "Invalid modality: {other}. Use one of: {MODALITY_NAMES}"
+        ))),
     }
 }
 
@@ -267,7 +281,7 @@ fn model_from_dict(d: &Bound<'_, PyDict>) -> PyResult<ModelCapability> {
         mc = mc.with_quantization(q);
     }
     for m in get_opt_str_list(d, "modalities")? {
-        mc = mc.add_modality(parse_modality(&m));
+        mc = mc.add_modality(parse_modality(&m)?);
     }
     if let Some(t) = get_opt_u32(d, "tokens_per_sec")? {
         mc = mc.with_tokens_per_sec(t);
@@ -398,7 +412,7 @@ pub fn capability_filter_from_py(d: &Bound<'_, PyDict>) -> PyResult<CapabilityFi
         cf = cf.with_min_context(n);
     }
     for m in get_opt_str_list(d, "require_modalities")? {
-        cf = cf.require_modality(parse_modality(&m));
+        cf = cf.require_modality(parse_modality(&m)?);
     }
     Ok(cf)
 }
