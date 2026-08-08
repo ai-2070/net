@@ -78,7 +78,35 @@ export type TokenErrorKind =
   | 'delegation_exhausted'
   | 'delegation_not_allowed'
   | 'not_authorized'
-  | 'invalid_format';
+  | 'invalid_format'
+  // The four below are emitted by the native binding and were missing
+  // from this union, so `toIdentityError` remapped each of them to
+  // `invalid_format`. A caller could not distinguish "this credential
+  // was revoked" from "these bytes are malformed", and a `ttlSeconds:
+  // 0` reported `invalid_format` with the message `token: zero_ttl` —
+  // the right answer visible only in prose.
+  | 'revoked'
+  | 'read_only'
+  | 'zero_ttl'
+  | 'ttl_too_long';
+
+/**
+ * Every kind the native binding emits, in one place so the union above
+ * and the runtime guard below cannot drift apart.
+ */
+const TOKEN_ERROR_KINDS: ReadonlySet<string> = new Set<TokenErrorKind>([
+  'invalid_signature',
+  'not_yet_valid',
+  'expired',
+  'delegation_exhausted',
+  'delegation_not_allowed',
+  'not_authorized',
+  'invalid_format',
+  'revoked',
+  'read_only',
+  'zero_ttl',
+  'ttl_too_long',
+]);
 
 export class TokenError extends Error {
   readonly kind: TokenErrorKind;
@@ -94,17 +122,14 @@ function toIdentityError(e: unknown): never {
   const msg = (e as Error | undefined)?.message ?? String(e);
   if (msg.startsWith('token:')) {
     const kind = msg.slice('token:'.length).trim() as TokenErrorKind;
-    // Unknown kind → treat as invalid_format defensively so the type is sound.
-    const known: ReadonlySet<string> = new Set<TokenErrorKind>([
-      'invalid_signature',
-      'not_yet_valid',
-      'expired',
-      'delegation_exhausted',
-      'delegation_not_allowed',
-      'not_authorized',
-      'invalid_format',
-    ]);
-    throw new TokenError(known.has(kind) ? kind : 'invalid_format', msg);
+    // A kind this build does not know about still falls back to
+    // `invalid_format` so the type stays sound — but the set is now
+    // the complete native inventory, so the fallback fires only for a
+    // kind added to the core after this SDK was built.
+    throw new TokenError(
+      TOKEN_ERROR_KINDS.has(kind) ? kind : 'invalid_format',
+      msg,
+    );
   }
   if (msg.startsWith('identity:')) {
     throw new IdentityError(msg.slice('identity:'.length).trim());
@@ -223,10 +248,53 @@ export interface IssueTokenOptions {
   /** Channel name. Hashed to u64 canonical; the wire-side fast-path
    *  hint is the low 16 bits of that hash. */
   channel: string;
-  /** Validity window in seconds. Pick a short TTL + re-issue instead of building a revocation list. */
+  /**
+   * Validity window in seconds. Pick a short TTL + re-issue instead of
+   * building a revocation list.
+   *
+   * Must be a safe integer in `1..=4294967295`. Fractions and
+   * out-of-range values are rejected rather than coerced — see
+   * `issueToken`.
+   */
   ttlSeconds: number;
-  /** How many times the grantee can re-delegate. Default 0 (forbidden). */
+  /**
+   * How many times the grantee can re-delegate. Default 0 (forbidden).
+   *
+   * Must be a safe integer in `0..=255`.
+   */
   delegationDepth?: number;
+}
+
+/**
+ * Reject a numeric option that NAPI would otherwise coerce.
+ *
+ * The native signature takes `u32` TTL and `u8` delegation depth, and
+ * napi truncates or wraps to fit: `ttlSeconds: 1.5` silently became
+ * `1`, `2 ** 32` became `0` (which then failed as `zero_ttl`, blaming
+ * the wrong thing), and `delegationDepth: 1.5` became `1`. A
+ * credential's validity window is not a value to round on the caller's
+ * behalf. Python already rejects incompatible argument types here.
+ */
+function requireIntInRange(
+  name: string,
+  value: number,
+  min: number,
+  max: number,
+): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new IdentityError(`${name} must be a finite number`);
+  }
+  if (!Number.isSafeInteger(value)) {
+    throw new IdentityError(
+      `${name} must be a safe integer, got ${value}`,
+    );
+  }
+  if (value < min || value > max) {
+    throw new IdentityError(
+      `${name} must be in ${min}..=${max}, got ${value}`,
+    );
+  }
+  return value;
 }
 
 /**
@@ -297,13 +365,23 @@ export class Identity {
         throw new IdentityError(`unknown scope ${JSON.stringify(s)}`);
       }
     }
+    // Validate before NAPI so the error names the offending option,
+    // rather than arriving as a downstream `zero_ttl` from a value
+    // that wrapped on the way in.
+    const ttlSeconds = requireIntInRange('ttlSeconds', opts.ttlSeconds, 1, 0xffff_ffff);
+    const delegationDepth = requireIntInRange(
+      'delegationDepth',
+      opts.delegationDepth ?? 0,
+      0,
+      0xff,
+    );
     const bytes = runMapped(() =>
       this.inner.issueToken(
         opts.subject,
         Array.from(opts.scope),
         opts.channel,
-        opts.ttlSeconds,
-        opts.delegationDepth ?? 0,
+        ttlSeconds,
+        delegationDepth,
       ),
     );
     return Token.parse(bytes);
