@@ -38,6 +38,7 @@ export {
   ChannelNameError,
   validateChannelName,
   MAX_CHANNEL_NAME_LEN,
+  CHANNEL_TAG_KEY,
 } from './channel';
 
 // Mesh + streams.

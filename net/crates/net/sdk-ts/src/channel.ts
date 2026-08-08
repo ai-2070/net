@@ -87,6 +87,32 @@ export function validateChannelName(name: string): string {
 }
 
 /**
+ * The reserved key `TypedChannel` stamps on every published payload so
+ * subscribers can filter on it. It is routing metadata, not part of the
+ * caller's event type, and is stripped before typed delivery.
+ */
+export const CHANNEL_TAG_KEY = '_channel';
+
+/**
+ * Strip the routing tag from a parsed payload.
+ *
+ * Returns the value untouched when it is not a plain object (a channel
+ * payload always is — `publish()` spreads the event into an object
+ * literal — but a raw `ingest` of a JSON scalar can still land in a
+ * channel-filtered stream).
+ */
+function stripChannelTag(data: unknown): unknown {
+  if (typeof data !== 'object' || data === null || Array.isArray(data)) {
+    return data;
+  }
+  if (!(CHANNEL_TAG_KEY in data)) {
+    return data;
+  }
+  const { [CHANNEL_TAG_KEY]: _tag, ...rest } = data as Record<string, unknown>;
+  return rest;
+}
+
+/**
  * A strongly typed channel for publishing and subscribing to events.
  *
  * @example
@@ -158,6 +184,14 @@ export class TypedChannel<T> {
    *
    * Returns an async iterable that deserializes and optionally validates
    * each event.
+   *
+   * The `_channel` routing tag added by `publish()` is removed before
+   * the value reaches the validator or the `T` cast, so the payload
+   * matches the type the caller declared. Without that strip a strict
+   * runtime validator (one that rejects unknown properties) rejected
+   * every event on the channel, and a plain `subscribe<T>()` handed
+   * back an object with an undeclared extra key. Use `subscribeRaw()`
+   * if you want the tag.
    */
   subscribe(opts: SubscribeOpts = {}): TypedEventStream<T> {
     const mergedOpts: SubscribeOpts = {
@@ -166,14 +200,17 @@ export class TypedChannel<T> {
     };
 
     const parse = this.validator
-      ? (raw: string) => this.validator!(JSON.parse(raw))
-      : (raw: string) => JSON.parse(raw) as T;
+      ? (raw: string) => this.validator!(stripChannelTag(JSON.parse(raw)))
+      : (raw: string) => stripChannelTag(JSON.parse(raw)) as T;
 
     return new TypedEventStream<T>(this.bus, mergedOpts, parse);
   }
 
   /**
    * Subscribe to raw events on this channel.
+   *
+   * Unlike `subscribe()`, this yields the stored event verbatim — the
+   * `_channel` routing tag is still present in `event.raw`.
    */
   subscribeRaw(opts: SubscribeOpts = {}): EventStream {
     const mergedOpts: SubscribeOpts = {
