@@ -227,6 +227,7 @@ impl Identity {
         Buffer::from(sig.to_bytes().to_vec())
     }
 
+
     /// Issue a scoped permission token to `subject`. Returns the
     /// 169-byte serialized token as a Buffer; hand it to the
     /// subscriber who will then call `installToken(bytes)`.
@@ -399,6 +400,34 @@ pub fn parse_token(bytes: Buffer) -> Result<TokenInfo> {
         nonce: BigInt::from(token.nonce),
         signature: Buffer::from(token.signature.to_vec()),
     })
+}
+
+/// Verify a detached ed25519 signature against a 32-byte entity id.
+///
+/// The verifying half of [`Self::sign`]. Every binding exposed signing
+/// and none exposed verification for an arbitrary message, so a
+/// signature produced here could only be checked from Rust — and the
+/// binding tests asserted the signature's *length* rather than a
+/// round trip, which passes for any 64 bytes.
+///
+/// Strict verification (`verify_strict`): the malleable `(R, S + L)`
+/// variant is rejected, so one logical message cannot appear under two
+/// byte encodings.
+///
+/// Returns `true` when the signature is valid for this exact
+/// `(entityId, message)` pair, `false` when it is not. Throws only on
+/// a malformed argument — a wrong-length entity id or signature — so
+/// a `false` means "this did not verify", never "you called it wrong".
+#[napi]
+pub fn verify_signature(entity_id: Buffer, message: Buffer, signature: Buffer) -> Result<bool> {
+    let id = buffer_to_entity_id(&entity_id)?;
+    let sig: [u8; 64] = signature.as_ref().try_into().map_err(|_| {
+        identity_err(format!(
+            "signature must be exactly 64 bytes, got {}",
+            signature.len()
+        ))
+    })?;
+    Ok(id.verify_bytes(message.as_ref(), &sig).is_ok())
 }
 
 /// Verify a serialized token's signature. Returns `true` on valid.

@@ -229,6 +229,7 @@ impl Identity {
         self.keypair.sign(message).to_bytes().to_vec()
     }
 
+
     /// Issue a scoped permission token to `subject`.
     ///
     /// `scope` is a list of `'publish' | 'subscribe' | 'admin' |
@@ -322,6 +323,34 @@ pub fn parse_token<'py>(py: Python<'py>, token: &[u8]) -> PyResult<Bound<'py, Py
     out.set_item("nonce", parsed.nonce)?;
     out.set_item("signature", parsed.signature.to_vec())?;
     Ok(out)
+}
+
+/// Verify a detached ed25519 signature against a 32-byte entity id.
+///
+/// The verifying half of ``Identity.sign``. Every binding exposed signing
+/// and none exposed verification for an arbitrary message, so a
+/// signature produced here could only be checked from Rust — and the
+/// binding tests asserted the signature's *length* rather than a
+/// round trip, which passes for any 64 bytes.
+///
+/// Strict verification (`verify_strict`): the malleable `(R, S + L)`
+/// variant is rejected, so one logical message cannot appear under two
+/// byte encodings.
+///
+/// Returns ``True`` when the signature is valid for this exact
+/// ``(entity_id, message)`` pair, ``False`` when it is not. Raises
+/// only on a malformed argument, so ``False`` means "did not verify",
+/// never "called wrong".
+#[pyfunction]
+pub fn verify_signature(entity_id: &[u8], message: &[u8], signature: &[u8]) -> PyResult<bool> {
+    let id = bytes_to_entity_id(entity_id)?;
+    let sig: [u8; 64] = signature.try_into().map_err(|_| {
+        identity_err(format!(
+            "signature must be exactly 64 bytes, got {}",
+            signature.len()
+        ))
+    })?;
+    Ok(id.verify_bytes(message, &sig).is_ok())
 }
 
 /// Verify a serialized token's ed25519 signature. `True` on

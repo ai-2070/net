@@ -225,6 +225,51 @@ func (id *Identity) Sign(msg []byte) ([]byte, error) {
 	return out, nil
 }
 
+// VerifySignature reports whether `signature` is a valid detached
+// ed25519 signature over `msg` for the 32-byte `entityID`.
+//
+// The verifying half of Sign. Go exposed signing and no verification
+// for an arbitrary message, so a signature produced here could only be
+// checked from Rust — and the Go tests asserted the signature's length
+// rather than a round trip, which passes for any 64 bytes.
+//
+// Strict verification: the malleable (R, S+L) variant is rejected, so
+// one logical message cannot appear under two byte encodings.
+//
+// A `false` with a nil error means the signature did not verify. An
+// error means an argument was malformed (wrong-length id or
+// signature), never that verification failed.
+func VerifySignature(entityID, msg, signature []byte) (bool, error) {
+	if len(entityID) != 32 {
+		return false, fmt.Errorf("entity id must be 32 bytes, got %d", len(entityID))
+	}
+	if len(signature) != 64 {
+		return false, fmt.Errorf("signature must be 64 bytes, got %d", len(signature))
+	}
+
+	var msgPtr *C.uint8_t
+	if len(msg) > 0 {
+		msgPtr = (*C.uint8_t)(unsafe.Pointer(&msg[0]))
+	}
+	var valid C.int
+	code := C.net_verify_signature(
+		(*C.uint8_t)(unsafe.Pointer(&entityID[0])),
+		C.size_t(len(entityID)),
+		msgPtr,
+		C.size_t(len(msg)),
+		(*C.uint8_t)(unsafe.Pointer(&signature[0])),
+		C.size_t(len(signature)),
+		&valid,
+	)
+	runtime.KeepAlive(entityID)
+	runtime.KeepAlive(msg)
+	runtime.KeepAlive(signature)
+	if err := identityErrorFromCode(code); err != nil {
+		return false, err
+	}
+	return valid != 0, nil
+}
+
 // IssueTokenRequest describes a token the identity is issuing as
 // signer. `Scope` is any non-empty subset of
 // `{"publish", "subscribe", "admin", "delegate"}`.

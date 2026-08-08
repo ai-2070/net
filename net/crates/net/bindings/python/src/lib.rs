@@ -3750,6 +3750,7 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<identity::Identity>()?;
         m.add_function(wrap_pyfunction!(identity::parse_token, m)?)?;
         m.add_function(wrap_pyfunction!(identity::verify_token, m)?)?;
+        m.add_function(wrap_pyfunction!(identity::verify_signature, m)?)?;
         m.add_function(wrap_pyfunction!(identity::token_is_expired, m)?)?;
         m.add_function(wrap_pyfunction!(identity::delegate_token, m)?)?;
         m.add_function(wrap_pyfunction!(identity::channel_hash, m)?)?;

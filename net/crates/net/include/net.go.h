@@ -547,6 +547,23 @@ uint64_t net_identity_node_id(net_identity_t* handle);
 uint64_t net_identity_origin_hash(net_identity_t* handle);
 
 /* Signs `msg[len]`; writes a 64-byte ed25519 signature into `out_sig[64]`. */
+/* Verify a detached ed25519 signature against a 32-byte entity id.
+ *
+ * The verifying half of net_identity_sign. Writes 1 to *out_valid when
+ * the signature is valid for this exact (entity_id, msg) pair and 0
+ * when it is not; returns 0 on success, or a negative code only for a
+ * malformed argument. So a 0 return with *out_valid == 0 means "did
+ * not verify", never "called wrong".
+ *
+ * Strict verification — the malleable (R, S + L) signature variant is
+ * rejected, so one logical message cannot appear under two encodings.
+ *
+ * `signature_len` must be exactly 64 and `entity_id_len` exactly 32. */
+int      net_verify_signature(const uint8_t* entity_id, size_t entity_id_len,
+                              const uint8_t* msg, size_t msg_len,
+                              const uint8_t* signature, size_t signature_len,
+                              int* out_valid);
+
 int      net_identity_sign(net_identity_t* handle,
                            const uint8_t* msg, size_t len,
                            uint8_t* out_sig);
