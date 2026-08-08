@@ -10,6 +10,7 @@ from typing import Any, Callable, Generic, Iterator, Optional, TypeVar
 from net import Net
 
 from net_sdk.stream import EventStream, SubscribeOpts, TypedEventStream
+from net_sdk.types import Receipt
 
 T = TypeVar("T")
 
@@ -190,14 +191,26 @@ class TypedChannel(Generic[T]):
         """The channel name."""
         return self._name
 
-    def publish(self, event: T) -> None:
-        """Publish a typed event to this channel."""
+    def publish(self, event: T) -> Receipt:
+        """Publish a typed event to this channel.
+
+        This is local EventBus ingestion tagged with `_channel`, not
+        distributed mesh fan-out — there is no roster and no per-peer
+        `PublishReport`. Returns the same `Receipt` as `NetNode.emit`
+        (the native `ingest_raw` result, which this used to discard and
+        return `None`), and raises on ingestion failure.
+        """
         data = _to_dict(event)
         data[CHANNEL_TAG_KEY] = self._name
-        self._bus.ingest_raw(json.dumps(data))
+        result = self._bus.ingest_raw(json.dumps(data))
+        return Receipt(shard_id=result.shard_id, timestamp=result.timestamp)
 
     def publish_batch(self, events: list[T]) -> int:
-        """Publish a batch of typed events. Returns number ingested."""
+        """Publish a batch of typed events. Returns number ingested.
+
+        The count can be lower than `len(events)` — a partial batch is
+        not an error and does not raise.
+        """
         payloads = []
         for event in events:
             data = _to_dict(event)

@@ -62,8 +62,14 @@ export class NetNode {
 
   /**
    * Emit a typed event (serializes to JSON).
+   *
+   * Returns a `Receipt` on success and **throws** on failure — a drop
+   * under backpressure surfaces as a thrown error from the native
+   * `ingestRawSync`, not as a `null` return. The declared type used to
+   * be `Receipt | null` even though no branch could produce `null`.
+   * Wrap in try/catch, or use `fire()` for fire-and-forget.
    */
-  emit(event: object): Receipt | null {
+  emit(event: object): Receipt {
     const json = JSON.stringify(event);
     const result = this.bus.ingestRawSync(json);
     return { shardId: result.shardId, timestamp: result.timestamp };
@@ -71,8 +77,10 @@ export class NetNode {
 
   /**
    * Emit a raw JSON string.
+   *
+   * Same contract as `emit()`: `Receipt` or throw, never `null`.
    */
-  emitRaw(json: string): Receipt | null {
+  emitRaw(json: string): Receipt {
     const result = this.bus.ingestRawSync(json);
     return { shardId: result.shardId, timestamp: result.timestamp };
   }

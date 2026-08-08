@@ -23,10 +23,11 @@ await node.flush();
 await node.shutdown();   // explicit — Node finalizers are non-deterministic
 ```
 
-`emit` returns synchronously with a `Receipt` — or **`null`**, which is how a drop
-under backpressure reaches you. It does not throw. A producer that ignores the
-return value and reads only `stats().eventsDropped` is reading the right counter;
-one that ignores both is silently lossy.
+`emit` returns synchronously with a `Receipt`, or **throws**. A drop under
+backpressure reaches you as a thrown error, not as a `null` return — the native
+`ingestRawSync` returns an error and the wrapper dereferences it unconditionally.
+A producer that neither catches nor reads `stats().eventsDropped` is silently
+lossy. Use `fire()` when you genuinely want fire-and-forget.
 
 `shutdown()` is not optional housekeeping. Node's finalizers run at a time nobody
 promises, so a process that exits without it can lose whatever the drain worker

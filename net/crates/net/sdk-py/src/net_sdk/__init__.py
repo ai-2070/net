@@ -113,10 +113,12 @@ from net_sdk.mesh import (
     StreamStats,
 )
 from net_sdk.node import NetNode
+from net_sdk.types import Receipt
 from net_sdk.stream import EventStream, TypedEventStream
 
 __all__ = [
     "NetNode",
+    "Receipt",
     "EventStream",
     "TypedEventStream",
     "TypedChannel",

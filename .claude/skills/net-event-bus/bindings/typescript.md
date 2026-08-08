@@ -70,12 +70,17 @@ mixing them up is the standard TypeScript bug here.
 
 | Method | Returns | On failure |
 |---|---|---|
-| `emit(obj)`, `emitRaw(json)` | `Receipt \| null` | **throws** |
+| `emit(obj)`, `emitRaw(json)` | `Receipt` | **throws** |
 | `emitBatch(objs)`, `emitRawBatch(jsons)` | `number` ingested | throws on shutdown; short count on `drop_*` |
-| `channel.publish`, `channel.publishBatch`, `emitBuffer`, `fire`, `fireBatch` | `boolean` / `number` | returns `false` or a short count — **never throws** |
+| `channel.publish`, `channel.publishBatch`, `emitBuffer`, `fire`, `fireBatch` | `boolean` / `number` | returns `false` or a short count — see the `JSON.stringify` caveat below |
 
-- The `| null` on `emit` is **vestigial**. The underlying napi binding throws on
-  ingestion failure. Wrap in `try/catch`; do not null-check.
+- `emit` used to be typed `Receipt | null` even though no branch could return
+  `null`; the underlying napi binding throws on ingestion failure. The type is
+  now `Receipt`. Wrap in `try/catch`; do not null-check.
+- "Never throws" holds only for *ingestion*. `channel.publish` and
+  `channel.publishBatch` call `JSON.stringify` first, which throws on cyclic
+  structures and `bigint` values and runs any getter on your event. That throw
+  happens before the bus is reached, so nothing was published.
 - For the batch forms, compare the returned count against the input length to
   detect partial drops.
 - Under the default `drop_oldest` / `drop_newest` modes the throwing methods

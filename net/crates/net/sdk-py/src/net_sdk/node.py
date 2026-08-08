@@ -3,23 +3,17 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
 from typing import Any, Callable, Generic, Iterator, Optional, TypeVar, overload
 
 from net import Net, IngestResult, StoredEvent, PollResponse, Stats
 
 from net_sdk.stream import EventStream, SubscribeOpts, TypedEventStream
 from net_sdk.channel import TypedChannel
+from net_sdk.types import Receipt
+
+__all__ = ["NetNode", "Receipt"]
 
 T = TypeVar("T")
-
-
-@dataclass
-class Receipt:
-    """Receipt from a successful ingestion."""
-
-    shard_id: int
-    timestamp: int
 
 
 class NetNode:

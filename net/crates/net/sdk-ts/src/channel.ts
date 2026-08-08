@@ -155,7 +155,14 @@ export class TypedChannel<T> {
   /**
    * Publish a typed event to this channel.
    *
-   * The event is serialized to JSON with the channel name embedded.
+   * This is local EventBus ingestion tagged with `_channel`, not
+   * distributed mesh fan-out — there is no roster and no per-peer
+   * `PublishReport`. Returns whether the event was accepted; `false`
+   * means it was dropped (backpressure).
+   *
+   * It can still throw: `JSON.stringify` rejects cyclic structures and
+   * `bigint`, and runs any getters on the event, before ingestion is
+   * reached.
    */
   publish(event: T): boolean {
     const payload = JSON.stringify({

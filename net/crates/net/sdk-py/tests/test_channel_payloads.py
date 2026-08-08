@@ -22,6 +22,15 @@ import pytest
 
 from net_sdk.channel import CHANNEL_TAG_KEY, TypedChannel, _to_dict
 from net_sdk.node import NetNode
+from net_sdk.types import Receipt
+
+
+@dataclass
+class _IngestResult:
+    """Stand-in for the native `net.IngestResult`."""
+
+    shard_id: int
+    timestamp: int
 
 
 class _RecordingBus:
@@ -30,9 +39,9 @@ class _RecordingBus:
     def __init__(self) -> None:
         self.ingested: list[str] = []
 
-    def ingest_raw(self, raw: str) -> bool:
+    def ingest_raw(self, raw: str) -> _IngestResult:
         self.ingested.append(raw)
-        return True
+        return _IngestResult(shard_id=len(self.ingested) % 4, timestamp=1_000)
 
     def ingest_raw_batch(self, raws: list[str]) -> int:
         self.ingested.extend(raws)
@@ -251,6 +260,47 @@ def test_untagged_payload_passes_through_untouched() -> None:
     raw = '{"sensor_id": "a1"}'
     _parse_fn(ch)(raw)
     assert seen == [raw]
+
+
+# --- 4. Publish return contract -------------------------------------
+
+
+def test_publish_returns_the_ingest_receipt() -> None:
+    """`publish` used to discard the native `ingest_raw` result and
+    return `None`, so a Python caller had no way to correlate an event
+    with the shard that took it."""
+    bus = _RecordingBus()
+    ch = TypedChannel(bus, "sensors/temperature")
+
+    receipt = ch.publish({"sensor_id": "a1"})
+
+    assert isinstance(receipt, Receipt)
+    assert receipt.timestamp == 1_000
+
+
+def test_publish_propagates_ingestion_failure() -> None:
+    """Failure surfaces as a raise, not a falsy return."""
+
+    class _FailingBus(_RecordingBus):
+        def ingest_raw(self, raw: str):  # type: ignore[override]
+            raise RuntimeError("EventBus has been shut down")
+
+    ch = TypedChannel(_FailingBus(), "sensors/temperature")
+    with pytest.raises(RuntimeError, match="shut down"):
+        ch.publish({"sensor_id": "a1"})
+
+
+def test_publish_batch_reports_a_short_count_without_raising() -> None:
+    """A partial batch is not an error — compare against the input
+    length to detect drops."""
+
+    class _PartialBus(_RecordingBus):
+        def ingest_raw_batch(self, raws: list[str]) -> int:
+            self.ingested.extend(raws)
+            return len(raws) - 1
+
+    ch = TypedChannel(_PartialBus(), "sensors/temperature")
+    assert ch.publish_batch([{"a": 1}, {"a": 2}]) == 1
 
 
 def test_publish_subscribe_round_trip_is_symmetric() -> None:

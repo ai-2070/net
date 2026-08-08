@@ -76,7 +76,16 @@ If a subscriber goes silent (overload, crash, network partition), the publisher'
 
 A publisher is a node that holds a roster and emits to it. Publisher and subscriber are not separate types — they are roles a `NetNode` plays per channel. The same node can publish on `sensors/temp` and subscribe to `commands/actuator` simultaneously.
 
-When a publisher emits, the call returns a `Receipt` (or null/error under backpressure). The receipt confirms the event was accepted into the local ring buffer for fan-out — it does **not** confirm delivery to all subscribers. Net does not guarantee delivery; it guarantees fast attempts.
+What a publish call hands back depends on which surface you are on, and the two are not interchangeable:
+
+| Surface | Single publish | Batch publish |
+|---|---|---|
+| Tagged EventBus topic — TS `channel.publish` | `boolean` accepted | `number` accepted |
+| Tagged EventBus topic — Python `channel.publish` | `Receipt`; raises on failure | `int` accepted |
+| Bus ingestion — `node.emit` / `emit_raw` | `Receipt`; throws/raises on failure | `number` accepted |
+| Distributed mesh channel — `mesh.publish_channel` | per-peer `PublishReport` | `PublishReport` (Rust `publish_many` only) |
+
+In every case the return value confirms the event was accepted **locally** — into the ring buffer, or handed to the per-peer fan-out. It does **not** confirm delivery. Net does not guarantee delivery; it guarantees fast attempts. Even a `PublishReport` reports what was sent, not what arrived.
 
 ## Backpressure: silence, not a signal
 
