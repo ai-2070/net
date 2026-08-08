@@ -977,10 +977,21 @@ fn build_config(options: Option<EventBusOptions>) -> Result<EventBusConfig> {
 
                 // Apply optional settings
                 if let Some(reliability) = net.reliability {
+                    // Fail closed, like `role` above. Mapping an
+                    // unrecognized value to `None` silently downgraded
+                    // delivery from acknowledged/retransmitted to
+                    // fire-and-forget, so a typo like "ful" or "FULL"
+                    // constructed successfully and lost data quietly.
                     net_config = net_config.with_reliability(match reliability.as_str() {
+                        "none" => ReliabilityConfig::None,
                         "light" => ReliabilityConfig::Light,
                         "full" => ReliabilityConfig::Full,
-                        _ => ReliabilityConfig::None,
+                        other => {
+                            return Err(Error::from_reason(format!(
+                                "Invalid reliability: {}. Use 'none', 'light', or 'full'",
+                                other
+                            )));
+                        }
                     });
                 }
                 if let Some(interval_ms) = net.heartbeat_interval_ms {

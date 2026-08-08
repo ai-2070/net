@@ -727,10 +727,17 @@ fn parse_config_json(json_str: &str) -> Option<EventBusConfig> {
 
         // Apply optional settings
         if let Some(reliability) = net.get("reliability").and_then(|v| v.as_str()) {
+            // Fail closed, like `role` above: an unrecognized value
+            // rejects the whole config rather than silently selecting
+            // `None`, which downgraded delivery from
+            // acknowledged/retransmitted to fire-and-forget. Go reaches
+            // this parser with an unchecked string, so this is also
+            // Go's only guard.
             net_config = net_config.with_reliability(match reliability {
+                "none" => ReliabilityConfig::None,
                 "light" => ReliabilityConfig::Light,
                 "full" => ReliabilityConfig::Full,
-                _ => ReliabilityConfig::None,
+                _ => return None,
             });
         }
 
@@ -2188,6 +2195,62 @@ mod tests {
         // u16::MAX (65535) should be valid
         let config = parse_config_json(r#"{"num_shards": 65535}"#);
         assert!(config.is_some(), "num_shards at u16::MAX should be valid");
+    }
+
+    /// Build a minimal valid `net` adapter block with the given
+    /// reliability spelling. Everything else is a well-formed
+    /// initiator config, so a `None` result isolates reliability.
+    #[cfg(feature = "net")]
+    fn net_config_with_reliability(reliability: &str) -> String {
+        format!(
+            r#"{{"net":{{"bind_addr":"127.0.0.1:0","peer_addr":"127.0.0.1:1",
+               "psk":"{psk}","role":"initiator","peer_public_key":"{pk}",
+               "reliability":"{reliability}"}}}}"#,
+            psk = "42".repeat(32),
+            pk = "ab".repeat(32),
+        )
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn reliability_accepts_exactly_the_documented_vocabulary() {
+        for mode in ["none", "light", "full"] {
+            assert!(
+                parse_config_json(&net_config_with_reliability(mode)).is_some(),
+                "documented reliability {mode:?} must parse"
+            );
+        }
+    }
+
+    /// An unrecognized reliability used to fall through to
+    /// `ReliabilityConfig::None`, so a typo constructed successfully
+    /// and silently downgraded delivery from acknowledged and
+    /// retransmitted to fire-and-forget. Role and backpressure already
+    /// rejected unknown values; this boundary was the inconsistent one.
+    /// Go reaches this parser with an unchecked string, so this is also
+    /// Go's server-side guard.
+    #[cfg(feature = "net")]
+    #[test]
+    fn reliability_rejects_every_near_miss() {
+        for bad in [
+            "ful",     // truncation
+            "fully",   // extension
+            "FULL",    // case — the vocabulary is case-sensitive
+            "Full",    //
+            "Light",   //
+            "NONE",    //
+            " full",   // leading whitespace
+            "full ",   // trailing whitespace
+            "",        // empty
+            "reliable",// plausible synonym that is not the vocabulary
+            "best",    // a future mode that does not exist yet
+        ] {
+            assert!(
+                parse_config_json(&net_config_with_reliability(bad)).is_none(),
+                "reliability {bad:?} must be rejected, not silently \
+                 downgraded to fire-and-forget"
+            );
+        }
     }
 
     #[test]

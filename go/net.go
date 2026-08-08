@@ -111,6 +111,29 @@ type Config struct {
 	Net *NetConfig `json:"net,omitempty"`
 }
 
+// ReliabilityModes are the values NetConfig.Reliability accepts. The
+// vocabulary mirrors the core `ReliabilityConfig` enum; the string
+// boundary is the only place a typo can survive.
+var ReliabilityModes = []string{"none", "light", "full"}
+
+// validateReliability rejects any reliability spelling outside
+// ReliabilityModes. An empty string means "unset" and leaves the core
+// default in place.
+func (c *Config) validateReliability() error {
+	if c == nil || c.Net == nil || c.Net.Reliability == "" {
+		return nil
+	}
+	for _, mode := range ReliabilityModes {
+		if c.Net.Reliability == mode {
+			return nil
+		}
+	}
+	return fmt.Errorf(
+		"invalid reliability %q: use one of %v (values are case-sensitive)",
+		c.Net.Reliability, ReliabilityModes,
+	)
+}
+
 // NetConfig represents Net encrypted UDP adapter configuration.
 type NetConfig struct {
 	// BindAddr is the local bind address (e.g., "127.0.0.1:9000").
@@ -134,7 +157,10 @@ type NetConfig struct {
 	// PublicKey is the hex-encoded public key (required for responder).
 	PublicKey string `json:"public_key,omitempty"`
 
-	// Reliability is the reliability mode: "none" (default), "light", or "full".
+	// Reliability is the reliability mode: "none" (default), "light",
+	// or "full". Any other value — including a case variant like
+	// "FULL" — is rejected by New; it is not silently treated as
+	// "none", which used to turn a typo into fire-and-forget delivery.
 	Reliability string `json:"reliability,omitempty"`
 
 	// HeartbeatIntervalMs is the heartbeat interval in milliseconds (default: 5000).
@@ -200,6 +226,15 @@ type Net struct {
 func New(config *Config) (*Net, error) {
 	var configJSON *C.char
 	if config != nil {
+		// The C parser rejects an unrecognized reliability value, but
+		// it can only answer with a generic init failure. Check here so
+		// a typo names itself: `Reliability` is a plain string field
+		// with no compiler check behind it, and mapping an unknown
+		// value to "none" used to downgrade delivery from
+		// acknowledged/retransmitted to fire-and-forget in silence.
+		if err := config.validateReliability(); err != nil {
+			return nil, err
+		}
 		data, err := json.Marshal(config)
 		if err != nil {
 			return nil, fmt.Errorf("failed to marshal config: %w", err)

@@ -595,10 +595,21 @@ impl Net {
 
                 // Apply optional settings
                 if let Some(reliability) = net_reliability {
+                    // Fail closed, like `net_role` above. Mapping an
+                    // unrecognized value to `None` silently downgraded
+                    // delivery from acknowledged/retransmitted to
+                    // fire-and-forget, so a typo like "ful" or "FULL"
+                    // constructed successfully and lost data quietly.
                     net_config = net_config.with_reliability(match reliability {
+                        "none" => ReliabilityConfig::None,
                         "light" => ReliabilityConfig::Light,
                         "full" => ReliabilityConfig::Full,
-                        _ => ReliabilityConfig::None,
+                        other => {
+                            return Err(PyValueError::new_err(format!(
+                                "Invalid net_reliability: {}. Use 'none', 'light', or 'full'",
+                                other
+                            )));
+                        }
                     });
                 }
                 if let Some(interval_ms) = net_heartbeat_interval_ms {
