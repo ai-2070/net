@@ -246,9 +246,17 @@ Typed subscribe (`subscribeTyped<T>`, `subscribe(MyDataclass)`, `subscribe_typed
 
 **Check:** subscribe raw (no type), log the bytes, then debug deserialization separately.
 
-### 10. Rust only: did `shutdown()` return `Adapter("cannot shutdown: outstanding references exist")`?
+### 10. Rust only: did you call `shutdown()` while a subscribe stream was still live?
 
-Means a subscribe stream (or anything else holding the inner `Arc<EventBus>`) is still alive. The bus didn't drain — events from that point on are lost. See "Rust: subscribe streams hold the bus" above; drop the stream first.
+Not an error — `Net::shutdown` is reference-based and does not report outstanding
+`Arc<EventBus>` clones. But it is still a lost-events condition: the stream sees
+the bus as shut down on its next poll and terminates, so whatever it had not yet
+drained is gone. Drop your subscribe loops first, then shut down. See "Rust:
+subscribe streams and shutdown" above.
+
+(There is no `Adapter("cannot shutdown: outstanding references exist")` on this
+path. That error belongs to `MeshNode` shutdown, where an un-closed client
+genuinely does hold a strong reference — see `org.md`.)
 
 ### 11. Last resort: are you sure both processes are running the same SDK version?
 

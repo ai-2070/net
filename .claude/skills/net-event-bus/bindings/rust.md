@@ -136,9 +136,10 @@ taxonomy is in `error-codes.md`.
 
 `node.shutdown().await?` is reference-based and **tolerates outstanding
 `subscribe` stream clones** — both `subscribe()` and `subscribe_typed()` clone
-the inner `Arc<EventBus>`. If references are genuinely still held, shutdown
-returns `SdkError::Adapter("cannot shutdown: outstanding references exist")`
-rather than hanging. This is the one binding that reports that condition; see
+the inner `Arc<EventBus>`. There is no "outstanding references exist" error to
+handle: `shutdown_via_ref` is idempotent and runs the shutdown work regardless
+of strong-ref count, and the surviving clones observe the bus as shut down on
+their next operation. Nothing hangs and nothing needs draining first. See
 `runtime.md` § "Rust: subscribe streams and shutdown".
 
 Call `flush()` before `shutdown()` if you cannot tolerate losing in-flight

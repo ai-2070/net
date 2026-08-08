@@ -92,7 +92,15 @@ mixing them up is the standard TypeScript bug here.
 
 ## Shutdown
 
-`await node.shutdown()`. Close channels before shutting the node down.
+`await node.shutdown()`, and it is idempotent.
+
+**There is nothing to close first.** A `TypedChannel` from `node.channel(...)`
+has no `close()` and no lifecycle of its own — it is a name, a prebuilt filter
+string, and an optional validator, all owned by the node. Construct as many as
+you like and drop them by letting them go out of scope. What *does* need
+stopping is a live subscription: call `stream.stop()` on any `subscribe()` /
+`subscribeRaw()` iterator you are not draining, or the polling loop keeps
+running against a shut-down bus.
 
 ## Gaps
 
