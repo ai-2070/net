@@ -36,20 +36,24 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 // Each case gets its own PSK, so it gets its own mesh.
 //
-// It has to. `MeshRpc.fromMesh()` clones the node's `Arc<MeshNode>`
-// and — unlike `CapabilityGateway`, which grew a `close()` for exactly
-// this — offers no way to release it. `NetMesh.shutdown()` needs sole
-// ownership, so it fails with "outstanding references exist" and the
-// node keeps running until V8 finalizes the MeshRpc, which is not on
-// any schedule the test controls. Sharing one PSK left every earlier
-// case's nodes live and talking on the same mesh; the duplex case,
-// running fourth, hung. Distinct PSKs make the survivors unable to
-// reach each other, which is isolation rather than a cure — the
-// retention itself is a real gap, filed separately.
+// `MeshRpc.close()` now releases the node reference, so `shutdown()`
+// succeeds and nothing survives a case — but the isolation stays. It
+// costs nothing, and it keeps a failure in one case from showing up as
+// a hang in another, which is how the duplex defect below first
+// presented.
 let pskCounter = 0
 const nextPsk = () => (pskCounter += 1).toString(16).padStart(2, '0').repeat(32)
 
 const meshes: Mesh[] = []
+const rpcs: Rpc[] = []
+
+/// Set by a case that knowingly leaves a node reference behind.
+///
+/// `afterEach` asserts shutdown succeeds, because a shutdown that
+/// silently cannot run leaves live nodes behind — which is what made
+/// this suite order-dependent before `MeshRpc.close()` existed. One
+/// case opts out, and says why at the opt-out.
+let tolerateShutdownFailure = false
 
 async function node(psk: string): Promise<Mesh> {
   const mesh = await NetMesh.create({ bindAddr: '127.0.0.1:0', psk })
@@ -89,18 +93,25 @@ async function pair(): Promise<{
   ])
   await sleep(300)
 
-  return {
-    server,
-    client,
-    serverRpc: MeshRpc.fromMesh(server),
-    clientRpc: MeshRpc.fromMesh(client),
-  }
+  const serverRpc = MeshRpc.fromMesh(server)
+  const clientRpc = MeshRpc.fromMesh(client)
+  rpcs.push(serverRpc, clientRpc)
+
+  return { server, client, serverRpc, clientRpc }
 }
 
 afterEach(async () => {
-  // Best-effort: see the PSK note above for why this cannot succeed
-  // while a `MeshRpc` for the node is still reachable.
-  await Promise.all(meshes.splice(0).map((m) => m.shutdown().catch(() => {})))
+  // Every `MeshRpc` must be closed before its mesh can shut down: the
+  // envelope holds an `Arc<MeshNode>` and `shutdown()` needs sole
+  // ownership.
+  rpcs.splice(0).forEach((rpc) => rpc.close())
+  const tolerate = tolerateShutdownFailure
+  tolerateShutdownFailure = false
+  await Promise.all(
+    meshes
+      .splice(0)
+      .map((m) => (tolerate ? m.shutdown().catch(() => {}) : m.shutdown())),
+  )
 })
 
 describe('live nRPC registration through the Node binding', () => {
@@ -226,7 +237,23 @@ describe('live nRPC registration through the Node binding', () => {
     }
     expect(got).toEqual(['re:one', 're:two'])
 
+    await call.close()
     handle.close()
+
+    // Even so, this case cannot shut its nodes down.
+    //
+    // `MeshRpc.close()` releases the envelope's reference and the call
+    // above releases its own, but something on the server side of an
+    // un-drained duplex call still holds one — most likely the
+    // handler's `JsRequestStream` / `JsResponseSink`, which are
+    // arguments the caller never owns and so has no way to release.
+    // Every other case here shuts down cleanly, so the strict
+    // assertion stays on for them; this one opts out rather than
+    // pretending the reference is gone.
+    //
+    // It is downstream of the same un-drained call the note above is
+    // about. Both belong to the duplex-termination investigation.
+    tolerateShutdownFailure = true
   }, 30_000)
 
   it('all four shapes register on one MeshRpc', async () => {
@@ -277,5 +304,50 @@ describe('live nRPC registration through the Node binding', () => {
     // defect as the serve seams, one method over.
     expect(() => serverRpc.setObserver(() => {})).not.toThrow()
     expect(() => serverRpc.setObserver(null)).not.toThrow()
+  }, 30_000)
+
+  it('close releases the node so the mesh can shut down', async () => {
+    const { server, client, serverRpc, clientRpc } = await pair()
+
+    // The envelope holds an `Arc<MeshNode>`; `shutdown()` needs sole
+    // ownership. Before `close()` existed there was no way to give it
+    // up, and this rejected until V8 finalized the class.
+    await expect(server.shutdown()).rejects.toThrow(/outstanding references/)
+
+    expect(serverRpc.isClosed).toBe(false)
+    serverRpc.close()
+    expect(serverRpc.isClosed).toBe(true)
+    serverRpc.close() // idempotent
+
+    await expect(server.shutdown()).resolves.toBeUndefined()
+
+    clientRpc.close()
+    await client.shutdown()
+    // Already drained; keep afterEach from double-shutting them.
+    meshes.length = 0
+    rpcs.length = 0
+  }, 30_000)
+
+  it('a closed MeshRpc refuses work instead of using a stale node', async () => {
+    const { server, serverRpc, clientRpc } = await pair()
+    const handle = serverRpc.serve('live.after.close', async () =>
+      Buffer.from('ok'),
+    )
+
+    clientRpc.close()
+
+    expect(() => clientRpc.reserveCancelToken()).toThrow(/nrpc:closed/)
+    expect(() => clientRpc.findServiceNodes('live.after.close')).toThrow(
+      /nrpc:closed/,
+    )
+    expect(() => clientRpc.metricsSnapshot()).toThrow(/nrpc:closed/)
+    await expect(
+      clientRpc.call(server.nodeId(), 'live.after.close', Buffer.alloc(0)),
+    ).rejects.toThrow(/nrpc:closed/)
+
+    // A handle issued before the close still owns its registration —
+    // it holds the serve handle, not this envelope.
+    expect(handle.isClosed()).toBe(false)
+    handle.close()
   }, 30_000)
 })

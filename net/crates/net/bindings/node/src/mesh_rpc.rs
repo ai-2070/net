@@ -1675,9 +1675,16 @@ impl RpcDuplexHandler for NodeDuplexRpcHandler {
 /// live mesh.
 #[napi]
 pub struct MeshRpc {
-    /// Shared with the parent NetMesh — no second socket, no
-    /// second handshake table.
-    node: Arc<MeshNode>,
+    /// Shared with the parent NetMesh — no second socket, no second
+    /// handshake table.
+    ///
+    /// Behind a lock so `close()` can release it from any thread while
+    /// methods clone out. `None` once closed. A `#[napi]` class is
+    /// GC-finalized rather than scope-dropped, so without an explicit
+    /// release this clone kept `NetMesh.shutdown()` — which needs sole
+    /// ownership of the node — failing until V8 got around to it. Same
+    /// arrangement, and the same reason, as `CapabilityGateway`.
+    node: Mutex<Option<Arc<MeshNode>>>,
     /// The runtime the parent `NetMesh` was created on.
     ///
     /// `serve_rpc*` is synchronous but spawns an inbound-event
@@ -1700,7 +1707,41 @@ impl MeshRpc {
     pub fn from_mesh(mesh: &crate::NetMesh) -> Result<MeshRpc> {
         let node = mesh.node_arc_clone()?;
         let runtime = mesh.runtime_handle();
-        Ok(MeshRpc { node, runtime })
+        Ok(MeshRpc {
+            node: Mutex::new(Some(node)),
+            runtime,
+        })
+    }
+
+    /// Release this envelope's reference to the mesh node so
+    /// [`NetMesh.shutdown`] can take sole ownership.
+    ///
+    /// Call it before `mesh.shutdown()`. Idempotent. Afterwards every
+    /// operation on this `MeshRpc` throws `nrpc:closed`; already-issued
+    /// `ServeHandle`s keep working until their own `close()`, because
+    /// they hold the registration, not this envelope.
+    ///
+    /// Without this there was no way to release the reference at all —
+    /// `shutdown()` failed with "outstanding references exist" until
+    /// V8 finalized the class, which is on no schedule the caller
+    /// controls.
+    #[napi]
+    pub fn close(&self) {
+        let _ = self.node.lock().take();
+    }
+
+    /// `true` once [`Self::close`] has been called.
+    #[napi(getter)]
+    pub fn is_closed(&self) -> bool {
+        self.node.lock().is_none()
+    }
+
+    /// The node, or the typed error a closed envelope owes its caller.
+    fn node(&self) -> Result<Arc<MeshNode>> {
+        self.node
+            .lock()
+            .clone()
+            .ok_or_else(|| nrpc_err("closed", "MeshRpc has been closed"))
     }
 
     // ---- serve ----------------------------------------------------------
@@ -1738,7 +1779,7 @@ impl MeshRpc {
         // does not run on a runtime, so name the mesh's own.
         let _enter = self.runtime.enter();
         let inner = self
-            .node
+            .node()?
             .serve_rpc(&service, rust_handler)
             .map_err(|e| nrpc_err("serve_failed", e))?;
         Ok(ServeHandle {
@@ -1760,8 +1801,8 @@ impl MeshRpc {
     /// Delegates to the substrate's [`MeshNode::reserve_cancel_token`]
     /// (v3 / C-S1).
     #[napi]
-    pub fn reserve_cancel_token(&self) -> BigInt {
-        BigInt::from(self.node.reserve_cancel_token())
+    pub fn reserve_cancel_token(&self) -> Result<BigInt> {
+        Ok(BigInt::from(self.node()?.reserve_cancel_token()))
     }
 
     /// Abort the in-flight call associated with `token`.
@@ -1778,7 +1819,7 @@ impl MeshRpc {
     #[napi]
     pub fn cancel_call(&self, token: BigInt) -> Result<()> {
         let token = crate::common::bigint_u64(token)?;
-        self.node.cancel(token);
+        self.node()?.cancel(token);
         Ok(())
     }
 
@@ -1800,7 +1841,7 @@ impl MeshRpc {
         // cancel_token lives on inner_opts; substrate handles cancel
         // uniformly across shapes. RpcError::Cancelled maps to
         // `nrpc:cancelled:` via the error-kind table.
-        self.node
+        self.node()?
             .call(target, &service, req_bytes, inner_opts)
             .await
             .map(|reply| Buffer::from(reply.body.as_ref()))
@@ -1819,7 +1860,7 @@ impl MeshRpc {
     ) -> Result<Buffer> {
         let inner_opts = opts.unwrap_or_default().into_inner();
         let req_bytes = Bytes::copy_from_slice(request.as_ref());
-        self.node
+        self.node()?
             .call_service(&service, req_bytes, inner_opts)
             .await
             .map(|reply| Buffer::from(reply.body.as_ref()))
@@ -1842,7 +1883,7 @@ impl MeshRpc {
         let target = crate::common::bigint_u64(target_node_id)?;
         let opts = opts.unwrap_or_default().into_inner();
         let inner = self
-            .node
+            .node()?
             .call_streaming(
                 target,
                 &service,
@@ -1876,7 +1917,7 @@ impl MeshRpc {
     ) -> Result<RpcStream> {
         let opts = opts.unwrap_or_default().into_inner();
         let inner = self
-            .node
+            .node()?
             .call_service_streaming(&service, Bytes::copy_from_slice(request.as_ref()), opts)
             .await
             .map_err(nrpc_err_from_inner)?;
@@ -1904,7 +1945,7 @@ impl MeshRpc {
         let target = crate::common::bigint_u64(target_node_id)?;
         let opts = opts.unwrap_or_default().into_inner();
         let inner = self
-            .node
+            .node()?
             .call_client_stream(target, &service, opts)
             .await
             .map_err(nrpc_err_from_inner)?;
@@ -1931,7 +1972,7 @@ impl MeshRpc {
         let target = crate::common::bigint_u64(target_node_id)?;
         let opts = opts.unwrap_or_default().into_inner();
         let inner = self
-            .node
+            .node()?
             .call_duplex(target, &service, opts)
             .await
             .map_err(nrpc_err_from_inner)?;
@@ -1968,7 +2009,7 @@ impl MeshRpc {
         });
         let _enter = self.runtime.enter();
         let inner = self
-            .node
+            .node()?
             .serve_rpc_client_stream(&service, inner_handler)
             .map_err(|e| nrpc_err("serve_failed", format!("{e}")))?;
         Ok(ServeHandle {
@@ -2003,7 +2044,7 @@ impl MeshRpc {
         });
         let _enter = self.runtime.enter();
         let inner = self
-            .node
+            .node()?
             .serve_rpc_duplex(&service, inner_handler)
             .map_err(|e| nrpc_err("serve_failed", format!("{e}")))?;
         Ok(ServeHandle {
@@ -2046,7 +2087,7 @@ impl MeshRpc {
         });
         let _enter = self.runtime.enter();
         let inner = self
-            .node
+            .node()?
             .serve_rpc_streaming(&service, inner_handler)
             .map_err(|e| nrpc_err("serve_failed", format!("{e}")))?;
         Ok(ServeHandle {
@@ -2062,12 +2103,13 @@ impl MeshRpc {
     /// caller-side routing logic. Returns BigInt array (each
     /// node id is a 64-bit value).
     #[napi]
-    pub fn find_service_nodes(&self, service: String) -> Vec<BigInt> {
-        self.node
+    pub fn find_service_nodes(&self, service: String) -> Result<Vec<BigInt>> {
+        Ok(self
+            .node()?
             .find_service_nodes(&service)
             .into_iter()
             .map(BigInt::from)
-            .collect()
+            .collect())
     }
 
     // ---- observer + metrics (S2-A1) ------------------------------------
@@ -2102,10 +2144,10 @@ impl MeshRpc {
                         let _ = tsfn.call(js_evt, ThreadsafeFunctionCallMode::NonBlocking);
                     });
                 let obs: Arc<dyn RpcObserver> = Arc::new(channel);
-                self.node.set_rpc_observer(Some(obs));
+                self.node()?.set_rpc_observer(Some(obs));
             }
             None => {
-                self.node.set_rpc_observer(None);
+                self.node()?.set_rpc_observer(None);
             }
         }
         Ok(())
@@ -2118,8 +2160,10 @@ impl MeshRpc {
     /// JS POD (BigInts for u64 fields); read fields directly or
     /// feed into your own exporter.
     #[napi]
-    pub fn metrics_snapshot(&self) -> RpcMetricsSnapshotJs {
-        RpcMetricsSnapshotJs::build(&self.node.rpc_metrics_snapshot())
+    pub fn metrics_snapshot(&self) -> Result<RpcMetricsSnapshotJs> {
+        Ok(RpcMetricsSnapshotJs::build(
+            &self.node()?.rpc_metrics_snapshot(),
+        ))
     }
 }
 
