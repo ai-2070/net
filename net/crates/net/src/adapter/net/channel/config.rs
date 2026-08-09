@@ -2672,7 +2672,8 @@ mod tests {
                 .with_token_roots(vec![root.entity_id().clone()]),
         );
 
-        reg.install_rpc_service_defaults("svc").expect("valid service name");
+        reg.install_rpc_service_defaults("svc")
+            .expect("valid service name");
 
         assert!(
             reg.get_by_name("svc.requests").unwrap().token_required(),
@@ -2689,7 +2690,9 @@ mod tests {
 
         // …and on a clean registry it installs both, with the binding.
         let fresh = ChannelConfigRegistry::new();
-        fresh.install_rpc_service_defaults("svc").expect("valid service name");
+        fresh
+            .install_rpc_service_defaults("svc")
+            .expect("valid service name");
 
         assert!(
             fresh.get_by_name("svc.requests").is_some(),
@@ -2839,9 +2842,7 @@ mod tests {
                 let mut guard = current.lock().expect("registry slot");
                 *guard = StdArc::clone(&fresh);
             }
-            fresh
-                .install_rpc_service_defaults("svc")
-                .expect("install");
+            fresh.install_rpc_service_defaults("svc").expect("install");
         }
 
         stop.store(true, AtomicOrdering::Relaxed);

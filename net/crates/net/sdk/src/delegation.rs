@@ -36,10 +36,13 @@
 //!
 //! Two tiers, both already supported by the core:
 //! * **Gateway / machine** — bump the issuer's floor in the shared
-//!   [`RevocationRegistry`]. Because every link inherits its parent's
-//!   `issuer_generation` and `verify_authorizes` revocation-checks *every*
-//!   link, revoking the machine's floor invalidates the whole subtree
-//!   immediately.
+//!   [`RevocationRegistry`]. Every link carries the generation of the
+//!   identity that signed *that* link, and `verify_authorizes`
+//!   revocation-checks *every* link, so raising the machine's floor
+//!   breaks the machine-issued link and with it the whole subtree
+//!   beneath. The break is at the link the machine actually signed;
+//!   descendants are not stamped with the machine's epoch and do not
+//!   need to be.
 //! * **Individual subagent** — the SDK's documented v1 answer: short TTLs
 //!   plus stop renewing that subagent's leaf. There is no per-token CRL.
 

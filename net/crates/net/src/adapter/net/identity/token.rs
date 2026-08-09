@@ -123,13 +123,20 @@ pub struct ScopedToken {
 /// signature:          64 bytes (ed25519)
 /// ```
 ///
-/// `issuer_generation` participates in revocation: an issuer that
-/// wants to invalidate every outstanding token (including delegated
-/// children) bumps its floor in the [`RevocationRegistry`]; the
-/// cache rejects any token whose generation is below the current
-/// floor. Children inherit their parent's generation at delegation
-/// time, so revoking a parent transitively revokes its descendants
-/// without a parent-chain walk.
+/// `issuer_generation` is the **signing** identity's credential epoch,
+/// and it participates in revocation: an issuer that wants to
+/// invalidate every token it has outstanding bumps its floor in the
+/// [`RevocationRegistry`], and the cache rejects any token of its whose
+/// generation is below that floor.
+///
+/// Each token carries the generation of whoever signed *it*. A
+/// delegated child does not inherit its parent's — the child's issuer
+/// is the signer, so the floor consulted at verify time is the
+/// signer's, and stamping an ancestor's epoch would compare it against
+/// the wrong rotation history. Revocation stays transitive anyway,
+/// because [`TokenChain::verify_inner`] checks every link against the
+/// floor for that link's own issuer: revoking the root breaks the
+/// root-issued link, which is the one the root actually signed.
 #[derive(Clone)]
 pub struct PermissionToken {
     /// Who issued this token.
@@ -227,8 +234,55 @@ impl PermissionToken {
     /// of panicking. The FFI bindings route through this function
     /// so a panic doesn't unwind across `extern "C"` into
     /// C/Go-cgo/NAPI/PyO3 callers — undefined behaviour.
+    /// Legacy generation-zero convenience path.
+    ///
+    /// Equivalent to [`Self::try_issue_with_generation`] at generation
+    /// `0`. Kept for compatibility and for callers that genuinely have
+    /// no rotation story; anything that maintains issuer state should
+    /// name its generation explicitly, because a token minted here is
+    /// permanently unrevocable-by-rotation — floor 1 kills it along
+    /// with every other generation-zero token that issuer ever signed.
     pub fn try_issue(
         issuer_keypair: &EntityKeypair,
+        subject: EntityId,
+        scope: TokenScope,
+        channel_hash: ChannelHash,
+        duration_secs: u64,
+        delegation_depth: u8,
+    ) -> Result<Self, TokenError> {
+        Self::try_issue_with_generation(
+            issuer_keypair,
+            0,
+            subject,
+            scope,
+            channel_hash,
+            duration_secs,
+            delegation_depth,
+        )
+    }
+
+    /// Issue a token bound to a specific issuer generation.
+    ///
+    /// `issuer_generation` is the signing identity's current credential
+    /// epoch — the issuer's own durable state, not a verifier's floor.
+    /// A verifier rejects the token once its `RevocationRegistry` floor
+    /// for this issuer exceeds `issuer_generation`, so bumping the
+    /// floor to `N + 1` retires every token this issuer signed at `N`
+    /// and below in one step, without a per-token revocation list.
+    ///
+    /// Core never infers this value. Deriving it from a floor would
+    /// mean one verifier's opinion decided what an issuer had signed,
+    /// and a verifier that had not yet heard about a rotation would
+    /// silently mint at a stale epoch. The caller — operator, vault, or
+    /// SDK `Identity` — persists it beside the signing seed and passes
+    /// it in.
+    ///
+    /// Persist the new state *before* publishing floor `N`. The other
+    /// order leaves a crashed issuer permanently unable to satisfy a
+    /// floor it already announced.
+    pub fn try_issue_with_generation(
+        issuer_keypair: &EntityKeypair,
+        issuer_generation: u32,
         subject: EntityId,
         scope: TokenScope,
         channel_hash: ChannelHash,
@@ -276,12 +330,7 @@ impl PermissionToken {
             subject,
             scope,
             channel_hash,
-            // Default to generation 0. Callers that maintain a
-            // RevocationRegistry can mint a token bound to a specific
-            // generation via direct struct construction, or rotate
-            // by bumping their floor and re-issuing with a higher
-            // value — see `try_issue_with_generation`.
-            issuer_generation: 0,
+            issuer_generation,
             not_before: now,
             not_after: now.saturating_add(duration_secs),
             delegation_depth,
@@ -461,9 +510,55 @@ impl PermissionToken {
     /// `not_after` avoids the double-read and guarantees the
     /// child's lifetime is `parent.not_after - child.not_before`
     /// exactly.
+    ///
+    /// Legacy generation-zero convenience path: the child carries
+    /// **signer generation zero**, not the parent's generation. See
+    /// [`Self::delegate_with_generation`] for why inheriting was
+    /// wrong, and use it whenever the signer maintains issuer state.
     pub fn delegate(
         &self,
         signer: &EntityKeypair,
+        new_subject: EntityId,
+        restricted_scope: TokenScope,
+    ) -> Result<Self, TokenError> {
+        self.delegate_with_generation(signer, 0, new_subject, restricted_scope)
+    }
+
+    /// Delegate, stamping the child with the **signer's** current
+    /// generation.
+    ///
+    /// The child is issued by `signer` — the parent token's subject —
+    /// so the epoch that governs it is the signer's, and nobody
+    /// else's. `issuer_generation` is checked against the floor for
+    /// `token.issuer`, and this child's issuer is `signer`.
+    ///
+    /// This used to copy `parent.issuer_generation` into the child.
+    /// That was wrong on both ends. It stamped the child with an epoch
+    /// belonging to an entity that did not sign it, so the floor
+    /// actually consulted at verify time — the signer's — was compared
+    /// against a number that had nothing to do with the signer's
+    /// rotation history. In a chain `root -> machine -> gateway`, the
+    /// `machine -> gateway` link would carry root's generation while
+    /// being checked against machine's floor.
+    ///
+    /// The transitivity it was reaching for does not need it.
+    /// `TokenChain::verify_inner` already checks *every* link against
+    /// the floor for that link's own issuer, so revoking root still
+    /// invalidates the whole chain — through the root-issued link,
+    /// which is the link root actually signed. Inheritance added
+    /// nothing except a second, incorrect claim about who had rotated.
+    ///
+    /// Each link therefore carries its own signer's generation:
+    ///
+    /// ```text
+    /// root    -> machine     root's generation
+    /// machine -> gateway     machine's generation
+    /// gateway -> subagent    gateway's generation
+    /// ```
+    pub fn delegate_with_generation(
+        &self,
+        signer: &EntityKeypair,
+        signer_generation: u32,
         new_subject: EntityId,
         restricted_scope: TokenScope,
     ) -> Result<Self, TokenError> {
@@ -512,13 +607,9 @@ impl PermissionToken {
             subject: new_subject,
             scope: new_scope,
             channel_hash: self.channel_hash,
-            // Children inherit the parent's issuer_generation. When the
-            // signer's floor is bumped in the RevocationRegistry, every
-            // outstanding token from that issuer — including this
-            // child — falls below the floor and TokenCache::check
-            // rejects them. That makes a single floor bump transitively
-            // invalidate the chain without a per-link revocation walk.
-            issuer_generation: self.issuer_generation,
+            // The signer's epoch — this child's issuer is `signer`, and
+            // the floor it will be checked against is the signer's.
+            issuer_generation: signer_generation,
             not_before: now,
             not_after: self.not_after,
             delegation_depth: self.delegation_depth - 1,
@@ -2002,11 +2093,12 @@ mod tests {
     }
 
     /// Bumping an issuer's revocation floor invalidates every
-    /// outstanding token from that issuer (including delegated
-    /// children, which inherit `issuer_generation` from their
-    /// parent). Pre-fix there was no revocation at all — a leaked
-    /// parent token's children outlived any "rotate" intent on the
-    /// parent's key.
+    /// outstanding token that issuer signed. Pre-fix there was no
+    /// revocation at all — a leaked parent token's children outlived
+    /// any "rotate" intent on the parent's key.
+    ///
+    /// Chains stay covered per link, not by inheritance: see
+    /// `revoking_an_ancestor_still_kills_the_chain_per_link`.
     #[test]
     fn revocation_floor_bump_invalidates_outstanding_tokens() {
         let issuer = EntityKeypair::generate();
@@ -2278,37 +2370,154 @@ mod tests {
         assert_eq!(registry.floor(issuer.entity_id()), 10);
     }
 
-    /// A delegated child must inherit its parent's
-    /// `issuer_generation` so a floor bump on the issuer's key
-    /// invalidates the child transitively without a chain walk.
+    /// A delegated child carries its **signer's** generation, never
+    /// the parent's.
+    ///
+    /// The old rule copied `parent.issuer_generation` down. The child's
+    /// issuer is the signer, so that stamped an epoch belonging to an
+    /// entity that did not sign the child, and the floor consulted at
+    /// verify time — the signer's — was compared against a number from
+    /// someone else's rotation history.
     #[test]
-    fn delegate_inherits_parent_issuer_generation() {
+    fn delegate_carries_the_signers_generation_not_the_parents() {
         let issuer = EntityKeypair::generate();
         let intermediate = EntityKeypair::generate();
         let leaf = EntityKeypair::generate();
 
-        let mut parent = PermissionToken::issue(
+        let parent = PermissionToken::try_issue_with_generation(
             &issuer,
+            7,
             intermediate.entity_id().clone(),
             TokenScope::PUBLISH.union(TokenScope::DELEGATE),
             0xCAFE_BABE,
             3600,
             2,
+        )
+        .expect("issue at generation 7");
+        assert_eq!(parent.issuer_generation, 7);
+
+        let child = parent
+            .delegate_with_generation(
+                &intermediate,
+                3,
+                leaf.entity_id().clone(),
+                TokenScope::PUBLISH,
+            )
+            .expect("delegate should succeed");
+        assert_eq!(
+            child.issuer_generation, 3,
+            "child must carry the signer's generation, not the parent's 7"
         );
-        // Simulate a parent issued at generation 7.
-        parent.issuer_generation = 7;
-        // Re-sign so the modified payload still verifies — bypass
-        // the public `delegate` because it's the issuer's keypair
-        // that signs the parent.
-        let payload = parent.signed_payload();
-        parent.signature = issuer.sign(&payload).to_bytes();
+        assert_eq!(
+            child.issuer,
+            *intermediate.entity_id(),
+            "test premise: the child's issuer is the signer"
+        );
+        child.verify().expect("child signature must verify");
+    }
+
+    /// The legacy `delegate()` stamps signer generation zero.
+    ///
+    /// It must not inherit. With the public issuance surface as it
+    /// stands, every reachable parent is already generation zero, so
+    /// this preserves observable behaviour while fixing the model —
+    /// which is exactly why the old rule could be wrong for this long
+    /// without anything failing.
+    #[test]
+    fn legacy_delegate_uses_signer_generation_zero() {
+        let issuer = EntityKeypair::generate();
+        let intermediate = EntityKeypair::generate();
+        let leaf = EntityKeypair::generate();
+
+        let parent = PermissionToken::try_issue_with_generation(
+            &issuer,
+            9,
+            intermediate.entity_id().clone(),
+            TokenScope::PUBLISH.union(TokenScope::DELEGATE),
+            0xCAFE_BABE,
+            3600,
+            2,
+        )
+        .expect("issue at generation 9");
 
         let child = parent
             .delegate(&intermediate, leaf.entity_id().clone(), TokenScope::PUBLISH)
             .expect("delegate should succeed");
         assert_eq!(
-            child.issuer_generation, 7,
-            "child must inherit parent's issuer_generation"
+            child.issuer_generation, 0,
+            "legacy delegate must stamp signer generation zero, not \
+             inherit the parent's 9"
+        );
+    }
+
+    /// Revocation stays transitive without inheritance.
+    ///
+    /// This is the property the old inheritance rule existed to
+    /// provide, shown holding without it: revoking the root invalidates
+    /// the chain through the link the root actually signed, and a
+    /// sibling issuer at the same depth is untouched.
+    #[test]
+    fn revoking_an_ancestor_still_kills_the_chain_per_link() {
+        let root = EntityKeypair::generate();
+        let machine = EntityKeypair::generate();
+        let gateway = EntityKeypair::generate();
+        let sibling = EntityKeypair::generate();
+
+        let full = TokenScope::PUBLISH.union(TokenScope::DELEGATE);
+        let root_link = PermissionToken::try_issue_with_generation(
+            &root,
+            4,
+            machine.entity_id().clone(),
+            full,
+            0xFEED_FACE,
+            3600,
+            3,
+        )
+        .expect("root -> machine");
+        let machine_link = root_link
+            .delegate_with_generation(&machine, 2, gateway.entity_id().clone(), full)
+            .expect("machine -> gateway");
+
+        assert_eq!(root_link.issuer_generation, 4);
+        assert_eq!(machine_link.issuer_generation, 2);
+
+        let registry = RevocationRegistry::new();
+        assert!(!registry.is_revoked(&root_link));
+        assert!(!registry.is_revoked(&machine_link));
+
+        // Revoke the root. The root-issued link dies; that is the link
+        // the root signed and the one a chain walk checks against
+        // root's floor.
+        registry.revoke_below(root.entity_id(), 5);
+        assert!(
+            registry.is_revoked(&root_link),
+            "the root-issued link must fall below root's new floor"
+        );
+        assert!(
+            !registry.is_revoked(&machine_link),
+            "machine's own link is governed by machine's floor — chain \
+             invalidation comes from the broken root link, not from \
+             stamping root's epoch onto machine's signature"
+        );
+
+        // Revoking machine kills the machine-issued link.
+        registry.revoke_below(machine.entity_id(), 3);
+        assert!(registry.is_revoked(&machine_link));
+
+        // A sibling issuer at the same depth is untouched by either.
+        let sibling_link = PermissionToken::try_issue_with_generation(
+            &sibling,
+            0,
+            gateway.entity_id().clone(),
+            full,
+            0xFEED_FACE,
+            3600,
+            1,
+        )
+        .expect("sibling -> gateway");
+        assert!(
+            !registry.is_revoked(&sibling_link),
+            "floors are per-issuer; a sibling must survive"
         );
     }
 

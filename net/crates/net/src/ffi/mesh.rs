@@ -4787,8 +4787,7 @@ mod tests {
     /// it.
     #[test]
     fn wildcard_scope_round_trips_through_the_c_converters() {
-        let parsed = parse_scope_list(r#"["publish","wildcard"]"#)
-            .expect("wildcard must parse");
+        let parsed = parse_scope_list(r#"["publish","wildcard"]"#).expect("wildcard must parse");
         assert!(parsed.contains(TokenScope::WILDCARD));
         assert!(parsed.contains(TokenScope::PUBLISH));
 
@@ -4808,7 +4807,12 @@ mod tests {
             let parsed = parse_scope_list(&json).expect("documented scope must parse");
             assert!(scope_to_strings(parsed).contains(&name));
         }
-        for bad in [r#"["wild"]"#, r#"["WILDCARD"]"#, r#"["all"]"#, r#"["none"]"#] {
+        for bad in [
+            r#"["wild"]"#,
+            r#"["WILDCARD"]"#,
+            r#"["all"]"#,
+            r#"["none"]"#,
+        ] {
             assert!(
                 parse_scope_list(bad).is_none(),
                 "unknown scope must be refused: {bad}",
@@ -4881,11 +4885,11 @@ mod tests {
     fn gpu_info_from_json_preserves_full_u32_fp16_tflops() {
         for declared in [
             0u32,
-            825,                    // 82.5 TFLOPS — an ordinary GPU
-            u16::MAX as u32,        // the old cap
-            u16::MAX as u32 + 1,    // one past it
-            16_777_217,             // one past f32's exact-integer range
-            1_000_000_000,          // the value the old test pinned to 65_535
+            825,                 // 82.5 TFLOPS — an ordinary GPU
+            u16::MAX as u32,     // the old cap
+            u16::MAX as u32 + 1, // one past it
+            16_777_217,          // one past f32's exact-integer range
+            1_000_000_000,       // the value the old test pinned to 65_535
             u32::MAX,
         ] {
             let g = GpuJson {

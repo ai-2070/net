@@ -2291,8 +2291,7 @@ mod tests {
         let req = parse_poll_request_json(r#"{"limit":5,"shards":[0,2,3]}"#).unwrap();
         assert_eq!(req.shards, Some(vec![0, 2, 3]));
 
-        let req =
-            parse_poll_request_json(r#"{"filter":{"path":"kind","value":"lidar"}}"#).unwrap();
+        let req = parse_poll_request_json(r#"{"filter":{"path":"kind","value":"lidar"}}"#).unwrap();
         assert!(req.filter.is_some(), "filter must reach the request");
 
         // Out-of-range shard ids and wrong types are refused.
@@ -2367,17 +2366,17 @@ mod tests {
     #[test]
     fn reliability_rejects_every_near_miss() {
         for bad in [
-            "ful",     // truncation
-            "fully",   // extension
-            "FULL",    // case — the vocabulary is case-sensitive
-            "Full",    //
-            "Light",   //
-            "NONE",    //
-            " full",   // leading whitespace
-            "full ",   // trailing whitespace
-            "",        // empty
-            "reliable",// plausible synonym that is not the vocabulary
-            "best",    // a future mode that does not exist yet
+            "ful",      // truncation
+            "fully",    // extension
+            "FULL",     // case — the vocabulary is case-sensitive
+            "Full",     //
+            "Light",    //
+            "NONE",     //
+            " full",    // leading whitespace
+            "full ",    // trailing whitespace
+            "",         // empty
+            "reliable", // plausible synonym that is not the vocabulary
+            "best",     // a future mode that does not exist yet
         ] {
             assert!(
                 parse_config_json(&net_config_with_reliability(bad)).is_none(),
