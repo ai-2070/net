@@ -196,8 +196,7 @@ async fn a_continuously_fed_shard_does_not_starve_the_others() {
         tokio::spawn(async move {
             let mut i = 0u32;
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                if b
-                    .send_with_retry(&busy, &[Bytes::from(format!("busy-{i}"))], 16)
+                if b.send_with_retry(&busy, &[Bytes::from(format!("busy-{i}"))], 16)
                     .await
                     .is_err()
                 {
