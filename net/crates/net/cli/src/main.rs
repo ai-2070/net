@@ -89,7 +89,7 @@ struct Cli {
     /// Disable ANSI colour in table / text output.
     ///
     /// Setting `NO_COLOR` in the environment to any non-empty value does the
-    /// same thing, per the https://no-color.org convention.
+    /// same thing, per the <https://no-color.org> convention.
     //
     // Everything below this line is a plain comment, not a doc comment, and
     // that is the point: clap renders doc comments as long help, so this
