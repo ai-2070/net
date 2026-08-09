@@ -1818,13 +1818,17 @@ jobs:
       #   $ go run .
       #   go: module .. requires go >= 1.26 (running go 1.25.5)
       #
-      # The directive comparison is the readable diagnostic; the build is what
-      # actually proves the example still compiles against the module it
-      # replaces. Both are cheap — the library is already built by this job.
-      - name: Build the checked-in Go example
+      # The directive comparison is the readable diagnostic; building and
+      # RUNNING it is what proves the example still works against the module
+      # it replaces. Running matters now that the example asserts its own
+      # success condition — the producer boundary accepted all 7 events —
+      # rather than printing `Done!` over an empty poll. Both are cheap: the
+      # library is already built by this job.
+      - name: Build and run the checked-in Go example
         working-directory: go/example
         env:
           CGO_LDFLAGS: -L${{ github.workspace }}/net/crates/net/target/release
+          LD_LIBRARY_PATH: ${{ github.workspace }}/net/crates/net/target/release
         run: |
           sdk=$(awk '/^go /{print $2; exit}' ../go.mod)
           ex=$(awk '/^go /{print $2; exit}' go.mod)
@@ -1837,7 +1841,7 @@ jobs:
             echo "A local-replace example cannot consume a module with a higher go directive."
             exit 1
           fi
-          go build -o /dev/null .
+          go run .
 
       # The Go and C skill examples, executed against the cdylibs built above.
       # This job is the only place they can run: cgo links against libnet, and

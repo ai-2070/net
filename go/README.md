@@ -148,6 +148,10 @@ if err := bus.Ingest(map[string]any{"sensor": "radar", "range_m": 45.0}); err !=
 }
 
 // Poll — cursor-paginated. "" starts from the earliest buffered event.
+//
+// With the default (memory) config this returns ZERO events: that adapter
+// counts and discards. The loop below is the shape you will use once a
+// Redis, JetStream, or mesh adapter is configured — it is not a round trip.
 resp, err := bus.Poll(100, "")
 for _, ev := range resp.Events {
     fmt.Println("event", string(ev))

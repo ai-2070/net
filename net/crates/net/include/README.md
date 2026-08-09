@@ -61,6 +61,14 @@ LD_LIBRARY_PATH=target/release ./app           # DYLD_LIBRARY_PATH on macOS
 
 ## Quickstart
 
+This program prints one line and exits 0, and the line says the poll was
+empty. `net_init` with no adapter configured selects the default memory
+adapter, which counts events and discards them — so ingest succeeds, poll
+succeeds, and `out.count` is 0. What the snippet teaches is the call shape,
+the return codes, and who owns which allocation; it is not evidence that an
+event travelled anywhere. Configure a Redis, JetStream, or mesh adapter
+before treating a non-empty poll as the success condition.
+
 ```c
 #include "net.h"
 #include <stdio.h>
@@ -78,6 +86,9 @@ int main(void) {
 
     net_poll_result_t out;
     if (net_poll_ex(node, 100, NULL, &out) == 0) {
+        if (out.count == 0) {
+            printf("polled 0 events: the default adapter discards them\n");
+        }
         for (size_t i = 0; i < out.count; i++) {
             printf("event: %.*s\n", (int)out.events[i].raw_len, out.events[i].raw);
         }

@@ -1,10 +1,21 @@
 ---
 title: Quickstart
-description: Ingest events and poll them back, freeing what the ABI hands you.
+description: Ingest events and page through the poll API, freeing what the ABI hands you.
 ---
 # C — Quickstart
 
-Ingest events and poll them back, freeing what the ABI hands you.
+Ingest events and page through the poll API, freeing what the ABI hands you.
+
+**This program prints nothing and exits 0.** That is the correct result, and
+it is worth understanding before you run it: `net_init` with no adapter
+configured selects the default memory adapter, which counts events and
+discards them. So `net_ingest_raw` succeeds, `net_poll_ex` succeeds, and
+`out.count` is `0` — there is nothing to read back. Point the node at a Redis,
+JetStream, or mesh adapter and the same loop starts returning events.
+
+What the snippet below teaches is the *shape*: the call sequence, the return
+codes to check, and who owns which allocation. It is not a demonstration that
+an event travelled anywhere.
 
 ```c
 #include "net.h"
@@ -28,8 +39,14 @@ int main(void) {
 
     // Poll. `out` is owned by you and MUST be freed with net_free_poll_result.
     // A NULL cursor starts from the earliest buffered event.
+    //
+    // out.count is 0 on the default adapter — it discarded the event above.
+    // Say so, rather than letting an empty loop read as "it worked".
     net_poll_result_t out;
     if (net_poll_ex(node, 100, NULL, &out) == 0) {
+        if (out.count == 0) {
+            printf("polled 0 events: the default adapter discards them\n");
+        }
         for (size_t i = 0; i < out.count; i++) {
             printf("event: %.*s\n", (int)out.events[i].raw_len, out.events[i].raw);
         }
