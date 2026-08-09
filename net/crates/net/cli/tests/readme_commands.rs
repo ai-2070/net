@@ -43,12 +43,12 @@ fn documented_commands() -> Vec<(usize, Vec<String>)> {
     for (idx, raw) in README.lines().enumerate() {
         let line = raw.trim();
 
-        if line.starts_with("```") {
+        if let Some(info) = line.strip_prefix("```") {
             // Any fence toggles; only shell-ish ones are inspected.
             in_shell_fence = if in_shell_fence {
                 false
             } else {
-                matches!(&line[3..], "sh" | "bash" | "shell" | "console")
+                matches!(info, "sh" | "bash" | "shell" | "console")
             };
             continue;
         }
