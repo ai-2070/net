@@ -733,7 +733,10 @@ mod tests {
             network_gbps: None,
             accelerators: None,
         };
-        let hw = hardware_from_js(h);
+        // Fallible since the modality-parsing fail-closed change; this
+        // input carries no modalities, so the only way it errors is a
+        // regression in a field this test is not about.
+        let hw = hardware_from_js(h).expect("valid hardware");
         assert_eq!(hw.cpu_cores, u16::MAX);
         assert_eq!(hw.cpu_threads, u16::MAX);
     }
