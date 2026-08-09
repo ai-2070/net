@@ -479,7 +479,10 @@ pub fn delegate_token(
     let subject_id = bytes_to_entity_id(new_subject)?;
     let restricted = parse_scope(&restricted_scope)?;
     let child = parent_tok
-        .delegate(&signer.keypair, subject_id, restricted)
+        // The child is issued by `signer`, so it carries the signer's
+        // generation — not the parent's. The floor it is checked
+        // against is the signer's.
+        .delegate_with_generation(&signer.keypair, signer.generation, subject_id, restricted)
         .map_err(token_err)?;
     Ok(child.to_bytes())
 }

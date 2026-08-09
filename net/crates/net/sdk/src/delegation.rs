@@ -147,8 +147,16 @@ impl DelegationChain {
         )?;
 
         // machine → gateway (machine signs; must be the root token's subject).
-        let machine_to_gateway =
-            root_to_machine.delegate(machine.keypair(), gateway.clone(), delegable)?;
+        // Signed by the machine, so it carries the *machine's*
+        // generation. Not the root's: the floor this link is checked
+        // against is the machine's, and stamping root's epoch here
+        // would compare it against the wrong rotation history.
+        let machine_to_gateway = root_to_machine.delegate_with_generation(
+            machine.keypair(),
+            machine.issuer_generation(),
+            gateway.clone(),
+            delegable,
+        )?;
 
         Ok(Self {
             chain: TokenChain {
@@ -212,7 +220,13 @@ impl DelegationChain {
     ) -> Result<Self, TokenError> {
         let parent = self.chain.tokens.last().ok_or(TokenError::InvalidFormat)?;
         let delegable = INVOKE_ACTION.union(TokenScope::DELEGATE);
-        let child_tok = parent.delegate(leaf_signer.keypair(), child.clone(), delegable)?;
+        // The signer's generation — `leaf_signer` issues this link.
+        let child_tok = parent.delegate_with_generation(
+            leaf_signer.keypair(),
+            leaf_signer.issuer_generation(),
+            child.clone(),
+            delegable,
+        )?;
         let mut tokens = self.chain.tokens.clone();
         tokens.push(child_tok);
         Ok(Self {
@@ -234,7 +248,13 @@ impl DelegationChain {
         subagent: &EntityId,
     ) -> Result<Self, TokenError> {
         let parent = self.chain.tokens.last().ok_or(TokenError::InvalidFormat)?;
-        let child = parent.delegate(leaf_signer.keypair(), subagent.clone(), INVOKE_ACTION)?;
+        // The signer's generation — `leaf_signer` issues this link.
+        let child = parent.delegate_with_generation(
+            leaf_signer.keypair(),
+            leaf_signer.issuer_generation(),
+            subagent.clone(),
+            INVOKE_ACTION,
+        )?;
         let mut tokens = self.chain.tokens.clone();
         tokens.push(child);
         Ok(Self {
@@ -648,5 +668,150 @@ mod tests {
             c2.verify(g2.entity_id(), root.entity_id(), &reg, 0).is_ok(),
             "revoking one device must not touch a sibling's chain"
         );
+    }
+
+    // ---- Per-link issuer generation (decision 4c) --------------------
+
+    /// Every link carries the generation of the identity that signed
+    /// **that** link.
+    ///
+    /// The builders used to reach `PermissionToken::delegate`, which
+    /// copied the parent's generation down the chain. So a chain built
+    /// from a root at 3 and a machine at 7 came out `[3, 3]` — the
+    /// machine-issued link claiming the root's epoch while being
+    /// checked against the machine's floor.
+    #[test]
+    fn each_link_carries_its_own_signers_generation() {
+        let root = Identity::generate().at_generation(3).unwrap();
+        let machine = Identity::generate().at_generation(7).unwrap();
+        let gateway = Identity::generate().at_generation(11).unwrap();
+        let subagent = Identity::generate();
+
+        let chain = DelegationChain::derive_gateway(
+            &root,
+            &machine,
+            gateway.entity_id(),
+            Duration::from_secs(3600),
+            DEFAULT_DELEGATION_DEPTH,
+        )
+        .expect("derive_gateway");
+
+        let gens: Vec<u32> = chain
+            .inner()
+            .tokens
+            .iter()
+            .map(|t| t.issuer_generation)
+            .collect();
+        assert_eq!(
+            gens,
+            vec![3, 7],
+            "root-issued link carries 3, machine-issued link carries 7"
+        );
+
+        // Extending adds the extending signer's own generation.
+        let extended = chain
+            .extend_to_subagent(&gateway, subagent.entity_id())
+            .expect("extend_to_subagent");
+        let gens: Vec<u32> = extended
+            .inner()
+            .tokens
+            .iter()
+            .map(|t| t.issuer_generation)
+            .collect();
+        assert_eq!(gens, vec![3, 7, 11]);
+
+        // And the chain still verifies end to end.
+        let reg = RevocationRegistry::new();
+        extended
+            .verify(subagent.entity_id(), root.entity_id(), &reg, 0)
+            .expect("a chain across three generations must verify");
+    }
+
+    /// `extend_delegate` follows the same rule.
+    #[test]
+    fn extend_delegate_carries_the_extending_signers_generation() {
+        let root = Identity::generate().at_generation(2).unwrap();
+        let device = Identity::generate().at_generation(5).unwrap();
+        let gateway = Identity::generate();
+
+        let chain = DelegationChain::derive_device(
+            &root,
+            device.entity_id(),
+            Duration::from_secs(3600),
+            DEFAULT_DELEGATION_DEPTH,
+        )
+        .expect("derive_device")
+        .extend_delegate(&device, gateway.entity_id())
+        .expect("extend_delegate");
+
+        let gens: Vec<u32> = chain
+            .inner()
+            .tokens
+            .iter()
+            .map(|t| t.issuer_generation)
+            .collect();
+        assert_eq!(gens, vec![2, 5]);
+    }
+
+    /// Revoking a rotated machine kills its subtree and spares a
+    /// sibling — the property the old inheritance rule was reaching
+    /// for, holding without it and with issuers on different epochs.
+    #[test]
+    fn revoking_a_rotated_machine_kills_only_its_own_subtree() {
+        let root = Identity::generate().at_generation(4).unwrap();
+        let machine_a = Identity::generate().at_generation(9).unwrap();
+        let machine_b = Identity::generate().at_generation(1).unwrap();
+        let gw_a = Identity::generate();
+        let gw_b = Identity::generate();
+        let ttl = Duration::from_secs(3600);
+
+        let chain_a = DelegationChain::derive_gateway(
+            &root,
+            &machine_a,
+            gw_a.entity_id(),
+            ttl,
+            DEFAULT_DELEGATION_DEPTH,
+        )
+        .unwrap();
+        let chain_b = DelegationChain::derive_gateway(
+            &root,
+            &machine_b,
+            gw_b.entity_id(),
+            ttl,
+            DEFAULT_DELEGATION_DEPTH,
+        )
+        .unwrap();
+
+        let reg = RevocationRegistry::new();
+        assert!(chain_a
+            .verify(gw_a.entity_id(), root.entity_id(), &reg, 0)
+            .is_ok());
+        assert!(chain_b
+            .verify(gw_b.entity_id(), root.entity_id(), &reg, 0)
+            .is_ok());
+
+        // Machine A rotates past its outstanding grants. The floor has
+        // to clear 9, not 0 — under the old rule A's link carried the
+        // root's epoch, so a floor keyed to A's real history would have
+        // missed it.
+        reg.revoke_below(machine_a.entity_id(), 10);
+        assert!(
+            chain_a
+                .verify(gw_a.entity_id(), root.entity_id(), &reg, 0)
+                .is_err(),
+            "machine A's own link must fall below machine A's floor"
+        );
+        assert!(
+            chain_b
+                .verify(gw_b.entity_id(), root.entity_id(), &reg, 0)
+                .is_ok(),
+            "a sibling machine must be untouched"
+        );
+
+        // Revoking the root takes both, through the links root signed.
+        reg.revoke_below(root.entity_id(), 5);
+        assert!(chain_b
+            .verify(gw_b.entity_id(), root.entity_id(), &reg, 0)
+            .is_err());
     }
 }

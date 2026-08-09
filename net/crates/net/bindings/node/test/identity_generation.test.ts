@@ -14,7 +14,7 @@ import { describe, expect, it } from 'vitest'
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const binding: any = await import('../index')
-const { Identity, parseToken } = binding
+const { Identity, parseToken, delegateToken } = binding
 
 const CHANNEL = 'issuer/rotation'
 const STATE_SIZE = 37
@@ -102,5 +102,28 @@ describe('issuer generation', () => {
     expect(() => Identity.fromStateBytes(future)).toThrow(
       /unsupported_state_version/,
     )
+  })
+
+  it('delegation stamps the signer generation, not the parent token one', () => {
+    // `delegateToken` used to copy the parent's generation onto the
+    // child. The child's issuer is the signer, so that stamped an
+    // epoch belonging to an entity that had not signed it.
+    const root = Identity.generate().atGeneration(3)
+    const machine = Identity.generate().atGeneration(7)
+    const leaf = Identity.generate()
+
+    const rootLink = root.issueToken(
+      machine.entityId,
+      ['publish', 'delegate'],
+      CHANNEL,
+      3600,
+      2,
+    )
+    expect(parseToken(rootLink).issuerGeneration).toBe(3)
+
+    const machineLink = delegateToken(machine, rootLink, leaf.entityId, [
+      'publish',
+    ])
+    expect(parseToken(machineLink).issuerGeneration).toBe(7)
   })
 })

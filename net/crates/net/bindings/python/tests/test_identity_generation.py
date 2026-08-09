@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import pytest
 
-from net import Identity, IdentityError, parse_token
+from net import Identity, IdentityError, delegate_token, parse_token
 
 CHANNEL = "issuer/rotation"
 STATE_SIZE = 37
@@ -108,3 +108,20 @@ def test_malformed_and_future_state_is_refused() -> None:
     with pytest.raises(IdentityError) as excinfo:
         Identity.from_state_bytes(bytes(future))
     assert "unsupported_state_version" in str(excinfo.value)
+
+
+def test_delegation_stamps_the_signer_generation() -> None:
+    # `delegate_token` used to copy the parent's generation onto the
+    # child. The child's issuer is the signer, so that stamped an epoch
+    # belonging to an entity that had not signed it.
+    root = Identity.generate().at_generation(3)
+    machine = Identity.generate().at_generation(7)
+    leaf = Identity.generate()
+
+    root_link = root.issue_token(
+        machine.entity_id, ["publish", "delegate"], CHANNEL, 3600, 2
+    )
+    assert parse_token(root_link)["issuer_generation"] == 3
+
+    machine_link = delegate_token(machine, root_link, leaf.entity_id, ["publish"])
+    assert parse_token(machine_link)["issuer_generation"] == 7

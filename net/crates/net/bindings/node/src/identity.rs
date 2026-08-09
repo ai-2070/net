@@ -573,8 +573,16 @@ pub fn delegate_token(
     let parent = PermissionToken::from_bytes(parent_bytes.as_ref()).map_err(map_token_err)?;
     let subject_id = buffer_to_entity_id(&new_subject)?;
     let restricted = parse_scope(restricted_scope)?;
+    // The child is issued by `signer`, so it carries the signer's
+    // generation — not the parent's. The floor it is checked against
+    // is the signer's.
     let child = parent
-        .delegate(&signer.keypair, subject_id, restricted)
+        .delegate_with_generation(
+            &signer.keypair,
+            signer.issuer_generation(),
+            subject_id,
+            restricted,
+        )
         .map_err(map_token_err)?;
     Ok(Buffer::from(child.to_bytes()))
 }
