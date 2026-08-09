@@ -122,10 +122,17 @@ fn issued_tokens_carry_the_handles_generation() {
     }
 }
 
-/// Backwards and past-the-ceiling rotations are refused, and refusal
-/// hands back nothing to free.
+/// Backwards rotations are refused, refusal hands back nothing to
+/// free, and re-applying is idempotent at every generation.
+///
+/// This used to assert idempotence at generation 5 and then deny it at
+/// `UINT32_MAX` two statements later. The ceiling case was the wrong
+/// half: `at_generation` names a target, and at `UINT32_MAX` the only
+/// nameable target is `UINT32_MAX` — a re-apply, not a rotation. An
+/// issuer that had legitimately reached the last generation could not
+/// re-apply its own persisted state on restart.
 #[test]
-fn rotation_is_monotonic_and_capped() {
+fn rotation_is_monotonic_and_idempotent_at_the_ceiling() {
     let h = generate();
     let mut at5: *mut IdentityHandle = std::ptr::null_mut();
     assert_eq!(unsafe { net_identity_at_generation(h, 5, &mut at5) }, 0);
@@ -150,18 +157,32 @@ fn rotation_is_monotonic_and_capped() {
         unsafe { net_identity_at_generation(at5, u32::MAX, &mut ceiling) },
         0
     );
-    let mut past: *mut IdentityHandle = std::ptr::null_mut();
+    // Re-applying AT the ceiling is idempotent like anywhere else.
+    // There is no generation above UINT32_MAX to ask for, so this is
+    // the restart path, not an attempt to advance.
+    let mut reapplied: *mut IdentityHandle = std::ptr::null_mut();
     assert_eq!(
-        unsafe { net_identity_at_generation(ceiling, u32::MAX, &mut past) },
-        NET_ERR_IDENTITY,
-        "at the ceiling the answer is a new key, not a new generation"
+        unsafe { net_identity_at_generation(ceiling, u32::MAX, &mut reapplied) },
+        0,
+        "an issuer at the ceiling must still be able to re-apply its \
+         own persisted generation"
     );
+    assert_eq!(unsafe { net_identity_generation(reapplied) }, u32::MAX);
+
+    // Backwards is still backwards at the ceiling.
+    let mut down: *mut IdentityHandle = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { net_identity_at_generation(ceiling, u32::MAX - 1, &mut down) },
+        NET_ERR_IDENTITY
+    );
+    assert!(down.is_null());
 
     unsafe {
         net_identity_free(h);
         net_identity_free(at5);
         net_identity_free(same);
         net_identity_free(ceiling);
+        net_identity_free(reapplied);
     }
 }
 

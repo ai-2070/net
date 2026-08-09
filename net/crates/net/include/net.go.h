@@ -572,9 +572,10 @@ uint32_t net_identity_generation(net_identity_t* handle);
 
 /* The same key at a later generation, as a NEW handle. The input is
  * unchanged; free both. `next` equal to the current generation is
- * accepted and idempotent. Returns NET_ERR_IDENTITY when `next` is
- * lower, or when the current generation is already UINT32_MAX — past
- * that, rotate the identity key.
+ * accepted and idempotent at every generation, UINT32_MAX included.
+ * Returns NET_ERR_IDENTITY when `next` is lower. There is no
+ * generation above UINT32_MAX to name, so an issuer there can
+ * re-apply but not advance; past that, rotate the identity key.
  *
  * Rotation order: build the generation-N handle, persist
  * net_identity_to_state atomically and durably, distribute verifier

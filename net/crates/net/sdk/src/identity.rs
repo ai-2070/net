@@ -150,10 +150,17 @@ impl Identity {
     /// call site rather than something a background thread can do to a
     /// caller mid-issuance.
     ///
-    /// `next == issuer_generation()` is accepted and idempotent, so
-    /// re-applying a persisted generation on restart is not an error.
-    /// Going backwards is rejected — it would re-mint at an epoch the
-    /// issuer has already retired.
+    /// `next == issuer_generation()` is accepted and idempotent at
+    /// every generation including `u32::MAX`, so re-applying a
+    /// persisted generation on restart is never an error. Going
+    /// backwards is rejected — it would re-mint at an epoch the issuer
+    /// has already retired.
+    ///
+    /// There is no generation above `u32::MAX` to name, so an issuer
+    /// there can re-apply but not advance. Use
+    /// [`IdentityState::next_generation`] to advance without hand-rolling
+    /// `n + 1`; it reports [`IdentityStateError::GenerationExhausted`]
+    /// at the ceiling.
     ///
     /// # Rotation order
     ///

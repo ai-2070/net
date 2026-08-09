@@ -299,10 +299,12 @@ impl Identity {
     /// therefore explicit at the call site rather than something that
     /// happens to a caller mid-issuance.
     ///
-    /// `next === issuerGeneration` is accepted and idempotent, so
-    /// re-applying a persisted generation on restart is not an error.
-    /// Going backwards throws, and so does any rotation once the
-    /// generation reaches `2^32 - 1` — past that, rotate the key.
+    /// `next === issuerGeneration` is accepted and idempotent at every
+    /// generation including `2^32 - 1`, so re-applying a persisted
+    /// generation on restart is never an error. Going backwards throws.
+    ///
+    /// There is no generation above `2^32 - 1` to name, so an issuer
+    /// there can re-apply but not advance; past that, rotate the key.
     ///
     /// ## Rotation order
     ///

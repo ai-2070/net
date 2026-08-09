@@ -2656,10 +2656,13 @@ pub unsafe extern "C" fn net_identity_generation(handle: *mut IdentityHandle) ->
 /// `*out_handle`. The input handle is unchanged; free both separately.
 ///
 /// `next == net_identity_generation(handle)` is accepted and
-/// idempotent, so re-applying a persisted generation on restart is not
-/// an error. Going backwards returns `NET_ERR_IDENTITY`, and so does
-/// any rotation once the generation reaches `UINT32_MAX` — past that,
-/// rotate the identity key.
+/// idempotent at every generation including `UINT32_MAX`, so
+/// re-applying a persisted generation on restart is never an error.
+/// Going backwards returns `NET_ERR_IDENTITY`.
+///
+/// There is no generation above `UINT32_MAX` to name, so an issuer
+/// there can re-apply but not advance; past that, rotate the identity
+/// key.
 ///
 /// Rotation order: build the generation-N handle here, persist
 /// `net_identity_to_state` atomically and durably, distribute verifier

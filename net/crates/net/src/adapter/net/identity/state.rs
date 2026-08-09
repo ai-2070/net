@@ -62,6 +62,10 @@ pub enum IdentityStateError {
     },
     /// `u32::MAX` is the last usable generation. Further rotation means
     /// rotating the identity key itself.
+    ///
+    /// Reported by [`IdentityState::next_generation`], which is the
+    /// operation that can run out. `check_rotation` never returns it:
+    /// re-applying `u32::MAX` is idempotent, not exhaustion.
     GenerationExhausted,
 }
 
@@ -131,16 +135,15 @@ impl IdentityState {
     /// The generation to rotate to, or why the move is refused.
     ///
     /// `next == current` is accepted and idempotent, so re-applying a
-    /// persisted generation on restart is not an error. Going backwards
-    /// is refused, and so is any move once `current` is `u32::MAX`.
+    /// persisted generation on restart is not an error — at every
+    /// generation including `u32::MAX`. Going backwards is refused.
+    /// Running *out* of generations is [`Self::next_generation`]'s
+    /// answer to give, not this one's: see there for why.
     ///
     /// Shared by every SDK's `at_generation` so the rules do not have
     /// to be restated — and cannot be restated slightly differently —
     /// in five bindings.
     pub fn check_rotation(current: u32, next: u32) -> Result<u32, IdentityStateError> {
-        if current == u32::MAX {
-            return Err(IdentityStateError::GenerationExhausted);
-        }
         if next < current {
             return Err(IdentityStateError::GenerationWentBackwards {
                 current,
@@ -148,6 +151,29 @@ impl IdentityState {
             });
         }
         Ok(next)
+    }
+
+    /// The generation after `current`, or [`IdentityStateError::GenerationExhausted`]
+    /// at the ceiling.
+    ///
+    /// Where exhaustion actually lives. [`Self::check_rotation`]
+    /// validates a generation the caller *names*, and at `u32::MAX` the
+    /// only nameable target is `u32::MAX` itself — which is a re-apply,
+    /// not a rotation. Rejecting it there made
+    /// `check_rotation(MAX, MAX)` an error and contradicted the
+    /// idempotence every SDK documents ("re-applying a persisted
+    /// generation on restart is not an error") for the one issuer that
+    /// most needs it: an issuer at the ceiling is still perfectly
+    /// usable, it just cannot go further.
+    ///
+    /// Advancing is the operation that can genuinely run out, so it is
+    /// the one that reports it. It also spares every caller the manual
+    /// `n + 1` — an off-by-one there is a skipped epoch, which retires
+    /// nothing and looks like it worked.
+    pub fn next_generation(current: u32) -> Result<u32, IdentityStateError> {
+        current
+            .checked_add(1)
+            .ok_or(IdentityStateError::GenerationExhausted)
     }
 }
 
@@ -219,7 +245,7 @@ mod tests {
     }
 
     #[test]
-    fn rotation_rules_are_monotonic_and_capped() {
+    fn rotation_rules_are_monotonic() {
         assert_eq!(IdentityState::check_rotation(3, 4).unwrap(), 4);
         assert_eq!(
             IdentityState::check_rotation(3, 3).unwrap(),
@@ -233,10 +259,60 @@ mod tests {
                 requested: 2
             }
         );
+    }
+
+    /// Idempotence holds at the ceiling too.
+    ///
+    /// `check_rotation(MAX, MAX)` used to return `GenerationExhausted`,
+    /// which contradicted the idempotence every SDK documents for
+    /// exactly the issuer that most needs it: one at `u32::MAX`
+    /// restarting and re-applying its own persisted generation could
+    /// not, and had no other way back.
+    ///
+    /// An issuer at the ceiling is still usable. What it cannot do is
+    /// go further, and `next_generation` is what says so.
+    #[test]
+    fn the_ceiling_is_reappliable_but_not_advanceable() {
         assert_eq!(
-            IdentityState::check_rotation(u32::MAX, u32::MAX).unwrap_err(),
-            IdentityStateError::GenerationExhausted
+            IdentityState::check_rotation(u32::MAX, u32::MAX).unwrap(),
+            u32::MAX,
+            "an issuer at the ceiling must be able to re-apply its own \
+             persisted generation on restart"
         );
+        // Backwards is still backwards, ceiling or not.
+        assert_eq!(
+            IdentityState::check_rotation(u32::MAX, u32::MAX - 1).unwrap_err(),
+            IdentityStateError::GenerationWentBackwards {
+                current: u32::MAX,
+                requested: u32::MAX - 1
+            }
+        );
+
+        assert_eq!(IdentityState::next_generation(0).unwrap(), 1);
+        assert_eq!(
+            IdentityState::next_generation(u32::MAX - 1).unwrap(),
+            u32::MAX,
+            "the last generation is reachable, not skipped"
+        );
+        assert_eq!(
+            IdentityState::next_generation(u32::MAX).unwrap_err(),
+            IdentityStateError::GenerationExhausted,
+            "advancing is the operation that runs out"
+        );
+    }
+
+    /// The two compose: whatever `next_generation` hands back is a
+    /// legal target for `check_rotation`.
+    #[test]
+    fn next_generation_output_always_passes_check_rotation() {
+        for current in [0u32, 1, 7, 65_535, u32::MAX - 2, u32::MAX - 1] {
+            let next = IdentityState::next_generation(current).expect("not at the ceiling");
+            assert_eq!(
+                IdentityState::check_rotation(current, next).unwrap(),
+                next,
+                "advancing from {current} must produce an acceptable target"
+            );
+        }
     }
 
     #[test]
