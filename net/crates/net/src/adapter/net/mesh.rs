@@ -938,12 +938,26 @@ impl Drop for TrainSlot {
 ///
 /// This guard moves the rollback into `Drop`, which runs
 /// synchronously whenever the spawned future is dropped. The
-/// successful-send arm calls `commit()` to consume the guard
-/// without invoking `Drop` (`std::mem::forget`); cancellation,
-/// panic, or any non-success path lets the guard drop naturally,
-/// and `Drop` reverts all three registrations.
+/// successful-send arm calls `commit()`, which DISARMS the guard and
+/// then lets it drop like any other value; cancellation, panic, or any
+/// non-success path leaves it armed, and `Drop` reverts all three
+/// registrations.
+///
+/// The disarm flag replaces an earlier `ManuallyDrop`/`ptr::read`
+/// shape that skipped `Drop` outright and had to name every
+/// `Arc`-typed field by hand so it could be read back out and dropped.
+/// That list is exactly the kind that goes stale: three routing
+/// handles were later added to the guard and not added to it, so every
+/// successful routed registration leaked three strong references. A
+/// flag owns no field list, so a field added tomorrow is dropped
+/// correctly by construction.
 struct PeerRegistrationGuard {
     peer_node_id: u64,
+    /// `true` from construction until `commit()`. `Drop` rolls back
+    /// only while armed — that, and nothing about which fields the
+    /// struct happens to hold, is what distinguishes the successful
+    /// path from every other one.
+    armed: bool,
     /// Session-id of the registered peer; the rollback uses this to
     /// drop the `session_id_to_node` reverse-index entry alongside
     /// the other peer-keyed maps (PERF_AUDIT §2.4).
@@ -972,40 +986,31 @@ struct PeerRegistrationGuard {
 }
 
 impl PeerRegistrationGuard {
-    /// Mark the registration as durable. Drops `self` *without*
-    /// running the rollback — the post-handshake send completed
-    /// successfully, so the registrations should stay in place.
-    fn commit(self) {
-        // `mem::forget` skips `Drop`. The Arc fields would
-        // normally decrement on drop, but since we want them
-        // alive (they're shared with the rest of the bus), we
-        // need to drop them manually before forgetting the
-        // wrapper. SAFETY: reading the Arc fields out of the
-        // struct via `ptr::read` and forgetting the rest is the
-        // standard cancel-Drop pattern.
-        let me = std::mem::ManuallyDrop::new(self);
-        #[expect(
-            clippy::multiple_unsafe_ops_per_block,
-            reason = "the ptr::read calls form a single semantic op (consume ManuallyDrop fields together so they drop normally)"
-        )]
-        // SAFETY: `me` is `ManuallyDrop`, so its fields won't be
-        // dropped automatically. We read them out and let them
-        // drop normally, which decrements the Arc strong counts
-        // — exactly what would happen on a non-guarded path. EVERY
-        // Arc field must appear here; one left out leaks a strong
-        // reference on every committed registration.
-        unsafe {
-            let _peers = std::ptr::read(&me.peers);
-            let _peer_addrs = std::ptr::read(&me.peer_addrs);
-            let _session_id_to_node = std::ptr::read(&me.session_id_to_node);
-            let _router = std::ptr::read(&me.router);
-            let _peer_transitions = std::ptr::read(&me.peer_transitions);
-        }
+    /// Mark the registration as durable. Disarms the rollback — the
+    /// post-handshake send completed successfully, so the
+    /// registrations should stay in place — and then drops `self`
+    /// ordinarily, releasing every guard-owned reference exactly as an
+    /// unguarded path would have.
+    ///
+    /// No `mem::forget`, no `ManuallyDrop`, no `unsafe`: `Drop` still
+    /// runs, it just finds the guard disarmed and returns. That is what
+    /// makes the release of the fields total rather than enumerated.
+    fn commit(mut self) {
+        self.armed = false;
+        // `self` drops here. Every field — including any added later —
+        // is released by the ordinary drop glue.
     }
 }
 
 impl Drop for PeerRegistrationGuard {
     fn drop(&mut self) {
+        // Committed: the registration is durable and there is nothing to
+        // undo. Returning here is the whole of the successful path's
+        // special-casing; the fields below are untouched and drop
+        // normally after this returns.
+        if !self.armed {
+            return;
+        }
         // Roll back as ONE peer transition, so the removals cannot
         // interleave with a concurrent install's publications.
         let peer_node_id = self.peer_node_id;
@@ -6424,6 +6429,20 @@ struct NodeSessionRouting {
     publications: AtomicU64,
     /// Test-only observation of the sample→revalidate window inside the build.
     build_observer: SessionBuildObserver,
+    /// Test-only, one-shot: fires immediately BEFORE a transition takes
+    /// [`Self::gate`], and therefore before it takes any lock at all.
+    ///
+    /// This exists because "the replacement is blocked" and "the replacement
+    /// has not started yet" are the same observation from outside, and only the
+    /// first is the property. A witness that arms this and waits for it knows
+    /// the contending thread is AT the production gate; anything it asserts
+    /// afterwards is about contention rather than about scheduling luck.
+    ///
+    /// It paces the real path — `commit_peer_transition` is the only caller —
+    /// so it cannot drift from the transition it is supposed to be observing.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    transition_attempt_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl NodeSessionRouting {
@@ -6434,7 +6453,32 @@ impl NodeSessionRouting {
             gate: parking_lot::Mutex::new(()),
             publications: AtomicU64::new(0),
             build_observer: SessionBuildObserver::default(),
+            #[cfg(test)]
+            transition_attempt_hook: parking_lot::Mutex::new(None),
         })
+    }
+
+    /// One-shot, TAKEN like the build observations: a witness arms exactly one
+    /// transition attempt and every attempt after it runs unobserved.
+    #[inline]
+    fn observe_transition_attempt(&self) {
+        #[cfg(test)]
+        {
+            let hook = self.transition_attempt_hook.lock().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+    }
+
+    /// Test-only: arm [`Self::observe_transition_attempt`].
+    ///
+    /// Arm it from INSIDE a window that already owns the gate. Armed from
+    /// outside one, the next transition to come along consumes it — which may
+    /// be any transition, not the one under test.
+    #[cfg(test)]
+    pub(crate) fn observe_transition_attempt_for_test(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.transition_attempt_hook.lock() = Some(hook);
     }
 
     /// Capture the current observation for one actor quantum. Lock-free.
@@ -7095,6 +7139,9 @@ fn commit_peer_transition<T>(
     mutate: impl FnOnce() -> (T, bool),
 ) -> T {
     let (value, outcome) = {
+        // The pre-lock seam. Nothing is held here, so a witness that waits for
+        // it knows the next thing this thread does is queue on the gate.
+        session_routing.observe_transition_attempt();
         let gate = session_routing.gate.lock();
         let (value, published) = mutate();
         // `None` = nothing was mutated. `Some(None)` = mutated, and the
@@ -18822,9 +18869,9 @@ impl MeshNode {
         // `peer_node_id` already installed a newer (valid) route, we must
         // not overwrite it.
         //
-        // A Drop guard owns the rollback. The send marks the
-        // guard `completed` only on success; cancellation, panic,
-        // or any non-success drops the guard, which runs the
+        // A Drop guard owns the rollback. The send DISARMS the
+        // guard only on success; cancellation, panic, or any
+        // non-success drops it still armed, which runs the
         // rollback. Drop is invoked synchronously when the spawned
         // future is dropped (whether by cancellation or normal
         // completion), so the rollback is no longer dependent on
@@ -18838,6 +18885,9 @@ impl MeshNode {
         let payload = routed.freeze();
         let guard = PeerRegistrationGuard {
             peer_node_id,
+            // Armed from construction: until the send is known to have
+            // succeeded, every exit from here owes the rollback.
+            armed: true,
             registered_session_id,
             registered_next_hop: source,
             registered_route_token,
@@ -18853,9 +18903,10 @@ impl MeshNode {
         tokio::spawn(async move {
             match socket.send_to(&payload, next_hop).await {
                 Ok(_) => {
-                    // `commit` consumes the guard via `mem::forget`,
-                    // so the rollback Drop is skipped and the
-                    // registrations stay in place.
+                    // `commit` disarms the guard and drops it, so the
+                    // rollback is skipped, the registrations stay in
+                    // place, and the guard's own references are
+                    // released.
                     guard.commit();
                 }
                 Err(e) => {
@@ -36003,6 +36054,7 @@ mod heartbeat_aead_tests {
         {
             let _guard = PeerRegistrationGuard {
                 peer_node_id: peer_id,
+                armed: true,
                 peer_transitions: PeerTransitions::new(),
                 registered_route_token,
                 registered_session_id,
@@ -36035,6 +36087,26 @@ mod heartbeat_aead_tests {
         );
     }
 
+    /// `commit()` must preserve the REGISTRATIONS and release the
+    /// guard's own REFERENCES — both halves, in one witness.
+    ///
+    /// The second half is the one that was missing, and its absence was
+    /// a live defect: the pre-repair `commit()` skipped `Drop` with
+    /// `ManuallyDrop` and hand-read only the five fields the guard had
+    /// when that code was written. Three routing handles were added
+    /// afterwards and never added to the list, so every successful
+    /// routed registration leaked three strong references — invisible
+    /// to a witness that only checked the maps still had their entries.
+    ///
+    /// So this asserts strong counts directly, and it asserts them for
+    /// EVERY `Arc`-backed field rather than for the three that
+    /// happened to be leaking. A field added tomorrow is covered the
+    /// moment it is added to the construction below; the counts either
+    /// return to baseline or they do not.
+    ///
+    /// Dies to: reinstating any `commit()` that skips `Drop` while
+    /// enumerating fields, and to a `Drop` that leaks on the disarmed
+    /// path.
     #[tokio::test]
     async fn peer_registration_guard_is_no_op_on_drop_when_completed() {
         let peer_id = 0xCAFE_F00Du64;
@@ -36071,10 +36143,39 @@ mod heartbeat_aead_tests {
         peer_addrs.insert(peer_id, next_hop);
         router.add_route(peer_id, next_hop);
 
+        // Every Arc-backed field, held EXTERNALLY for the whole test —
+        // so the only thing a count can be measuring is the guard.
+        // `peer_transitions` is a newtype over its `Arc`, so it is
+        // counted through the field it wraps.
+        let session_routing = NodeSessionRouting::new();
+        let routing_registry = detached_routing_registry_for_test();
+        let peer_entity_ids: Arc<DashMap<u64, EntityId>> = Arc::new(DashMap::new());
+        let peer_transitions = PeerTransitions::new();
+
+        // BASELINE, taken with the guard not yet constructed. Read as
+        // absolute numbers rather than assumed to be 1: the registry
+        // and the router may legitimately be referenced elsewhere, and
+        // the invariant is "returns to where it started", not "returns
+        // to one".
+        let counts = |pt: &PeerTransitions| {
+            [
+                ("peers", Arc::strong_count(&peers)),
+                ("peer_addrs", Arc::strong_count(&peer_addrs)),
+                ("session_id_to_node", Arc::strong_count(&session_id_to_node)),
+                ("router", Arc::strong_count(&router)),
+                ("peer_transitions", Arc::strong_count(&pt.shards)),
+                ("session_routing", Arc::strong_count(&session_routing)),
+                ("routing_registry", Arc::strong_count(&routing_registry)),
+                ("peer_entity_ids", Arc::strong_count(&peer_entity_ids)),
+            ]
+        };
+        let baseline = counts(&peer_transitions);
+
         {
             let guard = PeerRegistrationGuard {
                 peer_node_id: peer_id,
-                peer_transitions: PeerTransitions::new(),
+                armed: true,
+                peer_transitions: peer_transitions.clone(),
                 registered_route_token: 0,
                 registered_session_id,
                 registered_next_hop: next_hop,
@@ -36082,15 +36183,46 @@ mod heartbeat_aead_tests {
                 peer_addrs: peer_addrs.clone(),
                 session_id_to_node: session_id_to_node.clone(),
                 router: router.clone(),
-                session_routing: NodeSessionRouting::new(),
-                routing_registry: detached_routing_registry_for_test(),
-                peer_entity_ids: Arc::new(DashMap::new()),
+                session_routing: session_routing.clone(),
+                routing_registry: routing_registry.clone(),
+                peer_entity_ids: peer_entity_ids.clone(),
             };
-            // Successful-send path consumes the guard without
-            // running Drop's rollback.
+
+            // The guard really is holding a reference to each — without
+            // this half, a field the guard never took would "return to
+            // baseline" vacuously.
+            let held = counts(&peer_transitions);
+            for (i, (name, n)) in held.iter().enumerate() {
+                assert_eq!(
+                    *n,
+                    baseline[i].1 + 1,
+                    "constructing the guard must take exactly one reference to \
+                     `{name}` (baseline {}, observed {n})",
+                    baseline[i].1
+                );
+            }
+
+            // Successful-send path: disarms the rollback, then drops
+            // ordinarily.
             guard.commit();
         }
 
+        // THE OWNERSHIP PROPERTY. Every count is back where it started,
+        // so `commit()` released everything it took.
+        let after = counts(&peer_transitions);
+        for (i, (name, n)) in after.iter().enumerate() {
+            assert_eq!(
+                *n, baseline[i].1,
+                "commit() leaked a strong reference to `{name}`: baseline {}, \
+                 after commit {n}. Every field of the guard must be released \
+                 on the successful path, not an enumerated subset of them",
+                baseline[i].1
+            );
+        }
+
+        // AND the registrations survive — the other half of commit's
+        // contract, which the ownership half must not be read as
+        // replacing.
         assert!(peers.contains_key(&peer_id));
         assert!(peer_addrs.contains_key(&peer_id));
         assert!(
@@ -36150,6 +36282,7 @@ mod heartbeat_aead_tests {
         {
             let _guard = PeerRegistrationGuard {
                 peer_node_id: peer_id,
+                armed: true,
                 peer_transitions: PeerTransitions::new(),
                 registered_route_token: 0,
                 registered_session_id: stale_session_id, // NOT the live session_id
@@ -36251,6 +36384,7 @@ mod heartbeat_aead_tests {
         {
             let _guard = PeerRegistrationGuard {
                 peer_node_id: peer_id,
+                armed: true,
                 peer_transitions: PeerTransitions::new(),
                 registered_route_token: stale_route_token,
                 registered_session_id: stale_session_id,
@@ -36340,6 +36474,7 @@ mod heartbeat_aead_tests {
         {
             let _guard = PeerRegistrationGuard {
                 peer_node_id: peer_id,
+                armed: true,
                 peer_transitions: PeerTransitions::new(),
                 registered_route_token,
                 registered_session_id,

@@ -8107,6 +8107,20 @@ async fn the_announce_lock_is_acquired_under_a_bound_and_refuses_past_it() {
 /// `install_direct`, and proves the replacement cannot land while the window is
 /// open — then that it lands, and republishes, the moment it closes.
 ///
+/// **The contention is proven, not inferred.** An earlier shape spawned the
+/// replacement, polled peer state for 300 ms, and read `!handle.is_finished()`.
+/// That is satisfied just as well by a thread the scheduler had not started
+/// yet, so it could not tell BLOCKED from LATE — and "late" would pass against
+/// an implementation with no gate on the path at all: nothing in it required
+/// the replacement to have TOUCHED the gate. The witness now arms the
+/// production pre-lock seam
+/// (`observe_transition_attempt`, fired immediately before
+/// `commit_peer_transition` takes the session gate) and waits for its ack
+/// before asserting anything: when the assertions run, the replacement is
+/// known to be at the real gate. Armed from inside the window, so the build
+/// under test already owns that gate and the one-shot can only be consumed by
+/// the replacement below.
+///
 /// Dies to: publishing from outside the gate the mutation takes — i.e. mutating
 /// first and notifying afterwards, which is the shape this replaces. The
 /// replacement then lands mid-window and `stable` is false. S2-9 and S2-13
@@ -8146,26 +8160,48 @@ async fn a_peer_replaced_after_revalidation_cannot_publish_its_old_session() {
     let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stable = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let blocked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let at_gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
     #[allow(clippy::type_complexity)]
     let replacer: Arc<parking_lot::Mutex<Option<std::thread::JoinHandle<bool>>>> =
         Arc::new(parking_lot::Mutex::new(None));
     {
         let node_for_hook = node.clone();
-        let (fired, stable, blocked, replacer) = (
+        let (fired, stable, blocked, at_gate, replacer) = (
             fired.clone(),
             stable.clone(),
             blocked.clone(),
+            at_gate.clone(),
             replacer.clone(),
         );
         node.session_routing
             .observe_revalidated_for_test(Arc::new(move || {
                 fired.store(true, Ordering::Release);
+                // Arm the pre-lock seam BEFORE spawning, so the replacement
+                // cannot slip past it. This build holds the gate right now, so
+                // the only transition that can consume the one-shot is the one
+                // spawned below.
+                let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel::<()>(1);
+                node_for_hook
+                    .session_routing
+                    .observe_transition_attempt_for_test(Arc::new(move || {
+                        // `try_send` — the seam must never block the
+                        // production path it rides.
+                        let _ = reached_tx.try_send(());
+                    }));
                 let node_for_thread = node_for_hook.clone();
                 let handle = std::thread::spawn(move || {
                     node_for_thread
                         .install_direct(N, replacement_addr, fresh_session_keys(), None)
                         .owned
                 });
+                // THE ACK. Until this returns, "not finished" would be
+                // ambiguous between blocked and not-yet-started; after it, the
+                // replacement is at the production session gate with nothing
+                // else held.
+                at_gate.store(
+                    reached_rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+                    Ordering::Release,
+                );
                 // For as long as this window is open the authoritative peer
                 // state must not move. Polled rather than sampled once, so a
                 // replacement landing late in the window is caught too.
@@ -8179,8 +8215,8 @@ async fn a_peer_replaced_after_revalidation_cannot_publish_its_old_session() {
                     std::thread::sleep(Duration::from_millis(5));
                 }
                 stable.store(held, Ordering::Release);
-                // And it is BLOCKED, not merely slow: the replacement is queued
-                // on the very gate this build holds.
+                // And it is BLOCKED, not merely slow: it reached the gate (the
+                // ack above) and has still not finished.
                 blocked.store(!handle.is_finished(), Ordering::Release);
                 // Handed out rather than joined — joining here would wait on a
                 // thread that cannot proceed until this window closes.
@@ -8196,6 +8232,16 @@ async fn a_peer_replaced_after_revalidation_cannot_publish_its_old_session() {
     assert!(
         fired.load(Ordering::Acquire),
         "precondition: the revalidated→published window must have been reached"
+    );
+
+    // The contention precondition: the replacement really did reach the
+    // production session gate. Everything below is about a thread that is
+    // queued there, and this is what says so.
+    assert!(
+        at_gate.load(Ordering::Acquire),
+        "the replacement never reached the pre-lock seam ahead of \
+         `session_routing.gate.lock()` — without that, `!is_finished()` below \
+         would be satisfied by a thread that had merely not started yet"
     );
 
     // THE PROPERTY.

@@ -2693,9 +2693,30 @@ witness pins; a committed executable mutation ledger; separate guard witnesses
 per send path (one primitive is tested instead); propagating per-peer UDP send
 failures out of `AnnounceCapabilities` (capability fan-out stays best-effort by
 design — what it needs is a BOUND, not a new failure mode); and the red Coverage
-run, whose `doc_link_guard` failure is a master-side file absent from this branch
-and whose two handshake timeouts are load flakes tracked separately. Recording
-this so a later reader does not mistake the demotions for oversights.
+run, whose three failures the next paragraph names exactly. Recording this so a
+later reader does not mistake the demotions for oversights.
+
+**The exact-head Coverage run, described accurately.** The sentence that stood
+above called the run's failures "two handshake timeouts". That was wrong, and
+the error mattered: it filed a failure under a heading — load flake — that its
+symptom does not support. Coverage run `31047320964`, at the exact head, was RED
+on three things:
+
+1. `doc_link_guard` — 14 dangling release-document links, to documents present
+   on master and absent from this branch;
+2. `nat_classify::nat_tag_propagates_through_capability_broadcast` — a handshake
+   timeout. This is the ONE handshake timeout in the run, not two;
+3. `reflex_override::deferral_after_reset_still_flushes_new_content` — not a
+   timeout of any kind. The fresh post-reset deferred announcement never
+   flushed.
+
+What is known about the third is exactly this: it failed in that run, and it
+passed on an isolated rerun at the same exact head. A single isolated pass is
+not enough to call it either way, so it is claimed as NEITHER — not as a proven
+Step 2 production regression, and not as pre-existing evidence. It is open, and
+recorded as open.
+
+Coverage at this head is RED. Nothing here should be read as reporting it green.
 
 ### 18.0g The Go `AnnounceCapabilities` hang — root cause
 
