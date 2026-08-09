@@ -1778,6 +1778,37 @@ jobs:
           LD_LIBRARY_PATH: ${{ github.workspace }}/net/crates/net/target/release
         run: go test -v -tags abi_stability -run TestABIStabilityU64FFIRoundTrip ./...
 
+      # With CGO_ENABLED=0 — the default on a Go install with no C compiler
+      # on PATH — the toolchain drops every cgo file in this package and
+      # compiles it down to the few plain-Go type declarations that remain.
+      # The package still exists, so the caller gets type-checked against an
+      # almost-empty API and told `undefined: net.New` about their OWN file,
+      # with nothing anywhere naming cgo. `go/cgo_disabled.go` replaces that
+      # with a message that does. Assert the guard is still wired: the build
+      # must fail, the failure must name cgo, and the misleading diagnostic
+      # must be gone.
+      - name: Assert the cgo-disabled build explains itself
+        working-directory: go
+        run: |
+          set +e
+          out=$(CGO_ENABLED=0 go build ./... 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+
+          if [ "$rc" -eq 0 ]; then
+            echo "::error::CGO_ENABLED=0 build succeeded — the cgo_disabled.go guard is gone"
+            exit 1
+          fi
+          if ! printf '%s' "$out" | grep -q "requires_cgo"; then
+            echo "::error::the cgo-disabled build failed without naming cgo"
+            exit 1
+          fi
+          if printf '%s' "$out" | grep -q "undefined: net\."; then
+            echo "::error::the misleading 'undefined: net.New' diagnostic is back"
+            exit 1
+          fi
+
       # `go/example` is the checked-in "run this and watch it work" program,
       # and until now NOTHING in this workflow compiled it. So its manifest
       # drifted: it still declared `go 1.21` long after `go/go.mod` moved to

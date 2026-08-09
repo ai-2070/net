@@ -14,6 +14,18 @@ Linux and macOS, MSVC on Windows. Not just yours: anywhere this builds, includin
 CI and any container that compiles rather than copies a binary. A pure-Go
 cross-compile will not work.
 
+Check it before anything else, because Go turns cgo *off* by default when it
+cannot find a C compiler and says nothing:
+
+```sh
+go env CGO_ENABLED   # must print 1
+```
+
+If it prints `0`, install a compiler and set `CGO_ENABLED=1`. Building without
+it fails inside the binding with a message naming this requirement — the
+package deliberately refuses to compile rather than presenting a hollowed-out
+API and blaming your call to `net.New`.
+
 **The module needs the Rust shared libraries present to link.** `go vet`
 type-checks without them, which is why it is the fastest way to catch a mistake
 before dealing with linking; a `go build` needs the real `libnet`.
