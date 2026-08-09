@@ -5,7 +5,7 @@ allowed-tools: ["Read", "Grep", "Glob", "Bash", "Edit", "Write"]
 metadata:
   skill-version: 1.9.0
   last-updated: 2026-07-30
-  net-version: 0.34.0
+  net-version: 0.35.0
   x402-spec: "v2 @ 087922a5eecc06ea773636b75df205814ba295b5 (2026-05-29)"
 ---
 

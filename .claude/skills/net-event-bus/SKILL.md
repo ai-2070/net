@@ -5,7 +5,7 @@ allowed-tools: ["Read", "Grep", "Glob", "Bash", "Edit", "Write"]
 metadata:
   skill-version: 1.11.0
   last-updated: 2026-08-04
-  net-version: 0.34.0
+  net-version: 0.35.0
 ---
 
 # Net as an Event Bus

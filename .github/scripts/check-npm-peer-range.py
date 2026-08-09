@@ -5,8 +5,8 @@ The two packages are released together and the README tells callers to
 upgrade them together. Nothing enforced it. `sdk-ts/package.json` raised
 its peer floor to `@net-mesh/core >=0.35.0` — deliberately, to require a
 core that actually has `findBestNode` — while both manifests still read
-`0.34.0`. Published as-is, `npm install @net-mesh/sdk@0.34.0
-@net-mesh/core@0.34.0` cannot satisfy its own peer range.
+`0.35.0`. Published as-is, `npm install @net-mesh/sdk@0.35.0
+@net-mesh/core@0.35.0` cannot satisfy its own peer range.
 
 CI never saw it: `sdk-ts` resolves core through a
 `file:../bindings/node` devDependency, which has no version at all. The
