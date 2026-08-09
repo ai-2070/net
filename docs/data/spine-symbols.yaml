@@ -78,7 +78,10 @@ pages:
   invoke:
     rust: [call_tool, serve_rpc_typed, call_typed, call_service_typed,
            CallOptionsTyped, Codec]
-    typescript: [callTool, TypedMeshRpc, fromMesh, callService, classifyError,
+    # `rpc`, not `fromMesh`: the page used to build the RPC handle with
+    # `TypedMeshRpc.fromMesh(node._native)`, a private-field reach-around that
+    # never worked. `MeshNode.rpc()` is the supported bridge now.
+    typescript: [callTool, TypedMeshRpc, rpc, callService, classifyError,
                  RpcServerError, NRPC_TYPED_BAD_REQUEST]
     python: [call_tool, call_tool_async, call_tool_streaming, TypedMeshRpc,
              call_service, RpcServerError, NRPC_TYPED_BAD_REQUEST]
