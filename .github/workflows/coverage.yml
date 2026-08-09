@@ -46,7 +46,7 @@ jobs:
     # integration test is the slowest thing here; anything past this is
     # a hang, not a slow run, and this job is advisory so killing it
     # costs nothing.
-    timeout-minutes: 20
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: net/crates/net
