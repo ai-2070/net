@@ -21,15 +21,15 @@ node matches its own announcement.
 The tool API takes a **`TypedMeshRpc`**, not the node:
 
 ```typescript
-import { TypedMeshRpc } from '@net-mesh/core/mesh_rpc';
 import { serveTool, descriptorFrom, addToolCapabilitiesToAnnounce } from '@net-mesh/sdk';
 
-// The whole tool surface — serve, call, list, watch — lives on the NATIVE mesh
-// handle, not on the ergonomic `MeshNode` that wraps it. `@net-mesh/sdk` has no
-// public accessor for it yet, so it is reached through `_native`. This is the
-// one private field the docs touch; expect a public accessor to replace it.
-const native = (node as unknown as { _native: object })._native;
-const rpc = TypedMeshRpc.fromMesh(native);
+// The tool surface — serve, call, list, watch — hangs off the RPC handle
+// rather than the node. `node.rpc()` is the bridge.
+//
+// Hold the handle rather than calling `rpc()` per tool: each call builds a
+// new one with its own reference to the mesh, and an outstanding reference
+// makes `shutdown()` fail. Release it with `rpc.raw.close()` when done.
+const rpc = node.rpc();
 
 const options = {
   name: 'web_search',
@@ -69,21 +69,22 @@ From a peer that folded the announcement:
 ```typescript
 import { listTools } from '@net-mesh/sdk';
 
-const agentNative = (agent as unknown as { _native: object })._native;
-
 const deadline = Date.now() + 3000;
-while (Date.now() < deadline && listTools(agentNative).length === 0) {
+while (Date.now() < deadline && listTools(agent).length === 0) {
   await new Promise((r) => setTimeout(r, 20));
 }
-if (listTools(agentNative).length === 0) {
+if (listTools(agent).length === 0) {
   throw new Error('the announcement did not fold');
 }
 ```
 
-Three surfaces, and the difference is not cosmetic: `announceCapabilities` is a
-method on the **`MeshNode`**, `listTools` takes the **native handle**, and
-`serveTool` takes a **`TypedMeshRpc`** built over that handle. Reach for the wrong
-one and TypeScript will tell you, which is the good case — the same mistake in
-Python surfaces as an `AttributeError` at call time.
+Folding is asynchronous, so the loop is the point — an immediate `listTools`
+after a peer announces will usually be empty, and that is not a failure.
+
+Two surfaces, and the difference is not cosmetic: `announceCapabilities` and
+`listTools` work on the **`MeshNode`**, while `serveTool` takes the
+**`TypedMeshRpc`** that `node.rpc()` returns. Reach for the wrong one and
+TypeScript will tell you, which is the good case — the same mistake in Python
+surfaces as an `AttributeError` at call time.
 
 Next: [Discover a capability](/docs/sdk/typescript/discover).

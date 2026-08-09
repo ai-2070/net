@@ -42,6 +42,10 @@ import type { IslandCriteria, IslandTopologyInput } from '@net-mesh/core';
 // low-level package's `./subnet` entry, which classifies the stable
 // `subnet:` envelope; `getNapiMesh` supplies the handle.
 import { serveSubnetExported as serveSubnetExportedNative } from '@net-mesh/core/subnet';
+// `TypedMeshRpc` is what the whole tool surface takes — `serveTool`,
+// `callTool`, and friends. `MeshNode.rpc()` below is the supported bridge
+// from a node to one.
+import { TypedMeshRpc } from '@net-mesh/core/mesh_rpc';
 import type {
   OrgCaller as NapiOrgCaller,
   OrgServeHandle as NapiOrgServeHandle,
@@ -460,6 +464,38 @@ export class MeshNode {
   }
 
   /**
+   * The typed RPC handle for this node.
+   *
+   * `serveTool`, `serveToolStreaming`, `callTool` and the rest of the
+   * tool surface take a {@link TypedMeshRpc}, not a `MeshNode` — so
+   * this is the bridge between the two:
+   *
+   * ```typescript
+   * const node = await MeshNode.create({ bindAddr, psk });
+   * const handle = serveTool(node.rpc(), { name: 'web_search' }, handler);
+   * ```
+   *
+   * It exists because there was no supported way to get one. The
+   * announce guide told readers to cast the node and read a `_native`
+   * property, which fails twice over: `MeshNode` keeps its native
+   * pointer in a WeakMap rather than as a property (see
+   * `./_internal.ts`), so the cast yields `undefined`, and passing that
+   * to `TypedMeshRpc.fromMesh` throws
+   * `InvalidArg: Failed to recover 'NetMesh' type from napi value`.
+   * Documenting a private-field reach-around for an ordinary task was
+   * the real defect; this is the accessor that should have existed.
+   *
+   * Each call builds a NEW handle holding its own reference to the
+   * mesh, so hold one rather than calling this per tool — and release
+   * it with `rpc.raw.close()` before `shutdown()`. An outstanding handle
+   * makes shutdown fail with
+   * `GenericFailure: cannot shutdown: outstanding references exist`.
+   */
+  rpc(): TypedMeshRpc {
+    return TypedMeshRpc.fromMesh(getNapiMesh(this) as unknown as object);
+  }
+
+  /**
    * The resolved local socket address.
    *
    * Required whenever `bindAddr` ends in `:0` — the OS picks the port
@@ -715,6 +751,90 @@ export class MeshNode {
    */
   findNodes(filter: CapabilityFilter): bigint[] {
     return this.native.findNodes(capabilityFilterToNapi(filter));
+  }
+
+  /**
+   * Tool descriptors visible in the local capability fold.
+   *
+   * The free `listTools` helper accepts anything with this method, so
+   * having it here means a `MeshNode` can be passed straight in:
+   *
+   * ```typescript
+   * import { listTools } from '@net-mesh/sdk';
+   * const tools = listTools(node);
+   * ```
+   *
+   * Without it the announce guide had readers cast the node and read a
+   * `_native` property that does not exist on this class — see
+   * {@link MeshNode.rpc} for why that never worked.
+   *
+   * Reads local folded state only: a peer's announcement appears here
+   * once it has folded, so poll rather than expecting it immediately
+   * after the peer announces.
+   */
+  listTools(): ReturnType<NapiNetMesh['listTools']> {
+    return this.native.listTools();
+  }
+
+  /**
+   * Live stream of tool-set changes from the local capability fold.
+   *
+   * The companion to {@link MeshNode.listTools}, and present for the same
+   * reason: the free `watchTools` helper accepts anything with this
+   * method, so `watchTools(node)` works without a cast.
+   *
+   * Prefer the free helper — it decodes each change into a typed
+   * `ToolListChange`, where this returns the raw native iterator.
+   */
+  watchTools(intervalMs?: number | null): ReturnType<NapiNetMesh['watchTools']> {
+    return this.native.watchTools(intervalMs);
+  }
+
+  // ---- Blob and directory transfer ----
+  //
+  // Straight delegations. They live here because the artifacts guide had
+  // readers cast the node to a hand-written interface listing these five
+  // methods and read a `_native` property — which this class does not have,
+  // so the cast produced `undefined` and every call threw. The SDK's own
+  // transport module re-exports the wire contract (`TransferControl`,
+  // `TransferHeader`, stream-id helpers) but not the node-driven verbs;
+  // these are them.
+
+  /** Serve blob-transfer requests from this node. Call once per node. */
+  serveBlobTransfer(adapter: Parameters<NapiNetMesh['serveBlobTransfer']>[0]): void {
+    this.native.serveBlobTransfer(adapter);
+  }
+
+  /** Fetch a blob from a known holder. */
+  async fetchBlob(
+    holderId: bigint,
+    blobRef: Parameters<NapiNetMesh['fetchBlob']>[1],
+  ): Promise<Buffer> {
+    return this.native.fetchBlob(holderId, blobRef);
+  }
+
+  /** Fetch a blob, letting the mesh locate a holder. */
+  async fetchBlobDiscovered(
+    blobRef: Parameters<NapiNetMesh['fetchBlobDiscovered']>[0],
+  ): Promise<Buffer> {
+    return this.native.fetchBlobDiscovered(blobRef);
+  }
+
+  /** Store a directory tree, returning the manifest ref. */
+  async storeDir(
+    adapter: Parameters<NapiNetMesh['storeDir']>[0],
+    root: string,
+  ): Promise<ReturnType<NapiNetMesh['storeDir']> extends Promise<infer T> ? T : never> {
+    return this.native.storeDir(adapter, root);
+  }
+
+  /** Fetch a directory tree published by `storeDir` into `dest`. */
+  async fetchDir(
+    sourceId: bigint,
+    manifestRef: Parameters<NapiNetMesh['fetchDir']>[1],
+    dest: string,
+  ): Promise<ReturnType<NapiNetMesh['fetchDir']> extends Promise<infer T> ? T : never> {
+    return this.native.fetchDir(sourceId, manifestRef, dest);
   }
 
   // ---- Gang-claim resource-island scheduler ----

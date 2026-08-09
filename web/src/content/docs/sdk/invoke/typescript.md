@@ -3,11 +3,12 @@
 ### Call a tool
 
 ```typescript
-import { TypedMeshRpc } from '@net-mesh/core/mesh_rpc';
 import { callTool } from '@net-mesh/sdk';
 
-const native = (node as unknown as { _native: object })._native;
-const rpc = TypedMeshRpc.fromMesh(native);
+// The tool surface hangs off the RPC handle; `node.rpc()` bridges the two.
+// Hold it — each call builds a new handle with its own reference to the
+// mesh, and an outstanding reference blocks `shutdown()`.
+const rpc = node.rpc();
 
 const resp = await callTool<{ query: string }, { results: string[] }>(
   rpc,
@@ -28,15 +29,13 @@ not the `MeshNode`. This is the same handle `serveTool` takes on the
 interface SummarizeReq  { text: string }
 interface SummarizeResp { summary: string }
 
-const serverNative = (server as unknown as { _native: object })._native;
-const serverRpc = TypedMeshRpc.fromMesh(serverNative);
+const serverRpc = server.rpc();
 const handle = serverRpc.serve<SummarizeReq, SummarizeResp>(
   'summarize',
   async (req) => ({ summary: req.text.slice(0, 40) }),
 );
 
-const clientNative = (client as unknown as { _native: object })._native;
-const clientRpc = TypedMeshRpc.fromMesh(clientNative);
+const clientRpc = client.rpc();
 const reply = await clientRpc.call<SummarizeReq, SummarizeResp>(
   server.nodeId(),
   'summarize',

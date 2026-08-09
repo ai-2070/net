@@ -49,21 +49,19 @@ whose announcements have already arrived.
 
 ### List tools
 
-`listTools` and `watchTools` take the **native** mesh handle, not the `MeshNode`:
+`listTools` and `watchTools` take the node directly:
 
 ```typescript
 import { listTools, watchTools } from '@net-mesh/sdk';
 
-const native = (node as unknown as { _native: object })._native;
-
-for (const t of listTools(native)) {
+for (const t of listTools(node)) {
   console.log(`${t.toolId} v${t.version}  tags=${t.tags}`);   // baseline
 }
 ```
 
-That asymmetry — `findNodes` on the node, `listTools` on the handle underneath it —
-is the current state of the binding rather than a convention. There is no public
-accessor for the native handle yet.
+`findNodes`, `listTools` and `watchTools` all take the `MeshNode`. Only the
+tool-*serving* and tool-*calling* surface needs the RPC handle, which
+`node.rpc()` returns.
 
 Schemas arrive as **JSON-encoded strings** on `descriptor.inputSchema` and
 `descriptor.outputSchema`. Call `JSON.parse` before handing them to anything that
@@ -74,7 +72,7 @@ expects an object.
 ```typescript
 const controller = new AbortController();
 
-for await (const change of watchTools(native, { signal: controller.signal })) {
+for await (const change of watchTools(node, { signal: controller.signal })) {
   console.log(change);   // pushed on fold mutation — no timer, no re-diff
 }
 ```
@@ -88,7 +86,7 @@ call time, so a change published before you start iterating is still observed.
 ```typescript
 import { openai } from '@net-mesh/sdk';
 
-const lowered = listTools(native).map(openai.toOpenaiTool);
+const lowered = listTools(node).map(openai.toOpenaiTool);
 ```
 
 `anthropic`, `mcp` and `gemini` are namespaced objects beside it, each with a
@@ -97,7 +95,7 @@ const lowered = listTools(native).map(openai.toOpenaiTool);
 ### Verify it worked
 
 ```typescript
-const found = listTools(native).some((t) => t.toolId === 'web_search');
+const found = listTools(node).some((t) => t.toolId === 'web_search');
 if (!found) {
   throw new Error('web_search did not fold — is the pair handshaked and started?');
 }
