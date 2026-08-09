@@ -134,7 +134,7 @@ pub struct ScopedToken {
 /// is the signer, so the floor consulted at verify time is the
 /// signer's, and stamping an ancestor's epoch would compare it against
 /// the wrong rotation history. Revocation stays transitive anyway,
-/// because [`TokenChain::verify_inner`] checks every link against the
+/// because [`TokenChain`]'s verification checks every link against the
 /// floor for that link's own issuer: revoking the root breaks the
 /// root-issued link, which is the one the root actually signed.
 #[derive(Clone)]

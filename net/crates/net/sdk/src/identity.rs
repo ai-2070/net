@@ -133,8 +133,12 @@ impl Identity {
     ///
     /// Every token [`Self::issue_token`] and the delegation builders
     /// produce carries this value, and a verifier rejects it once its
-    /// [`crate::revocation::RevocationRegistry`] floor for this entity
-    /// exceeds it.
+    /// `RevocationRegistry` floor for this entity exceeds it.
+    ///
+    /// Unlinked deliberately: `crate::revocation` uses the type without
+    /// re-exporting it, and the path that does re-export it
+    /// (`crate::delegation`) is feature-gated, so a link here resolves
+    /// under some feature sets and not others.
     pub fn issuer_generation(&self) -> u32 {
         self.generation
     }
