@@ -664,11 +664,6 @@ export class TypedMeshRpc {
     // raw napi options, which do not know it: no cancel token was
     // reserved and no listener called `cancelCall`, so aborting a
     // server-streaming call did nothing at all.
-    // Route through `wireAbortSignal` like every other call shape.
-    // These two passed the JS `AbortSignal` object straight into the
-    // raw napi options, which do not know it: no cancel token was
-    // reserved and no listener called `cancelCall`, so aborting a
-    // server-streaming call did nothing at all.
     const { rawOpts, detach } = wireAbortSignal(this._raw, opts)
     try {
       const inner = await this._raw.callStreaming(

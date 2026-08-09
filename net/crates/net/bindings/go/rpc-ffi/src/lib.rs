@@ -4225,7 +4225,8 @@ mod tests {
         assert_eq!(
             net_rpc_check_abi_version(0x0002),
             NET_RPC_ERR_CALL_FAILED,
-            "a 0x0002 expectation must be refused against a 0x0004              library — the cancel signatures differ",
+            "a 0x0002 expectation must be refused against a 0x0004 \
+             library — the cancel signatures differ",
         );
 
         // Older and newer alike: without a stated compatibility

@@ -109,7 +109,8 @@ fn parse_scope(scopes: Vec<String>) -> Result<TokenScope> {
             "wildcard" => TokenScope::WILDCARD,
             other => {
                 return Err(identity_err(format!(
-                    "unknown scope {:?}; expected publish | subscribe | admin |                      delegate | wildcard",
+                    "unknown scope {:?}; expected publish | subscribe | \
+                     admin | delegate | wildcard",
                     other
                 )));
             }

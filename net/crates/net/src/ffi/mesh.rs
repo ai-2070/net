@@ -5229,7 +5229,8 @@ mod tests {
         let larger = gpu_info_from_json(make(2_000_000_000)).fp16_tflops_x10;
         assert!(
             smaller < larger,
-            "both values used to saturate to 65_535 and compare equal,              so a placement scorer could not rank them",
+            "both values used to saturate to 65_535 and compare equal, \
+             so a placement scorer could not rank them",
         );
     }
 

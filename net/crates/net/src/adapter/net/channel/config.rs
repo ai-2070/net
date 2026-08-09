@@ -2858,7 +2858,9 @@ mod tests {
         );
         assert!(
             !saw_unbound_window.load(AtomicOrdering::Relaxed),
-            "a reader observed the request channel configured while the reply              prefix was still absent — that window leaves replies unbound,              which is the H3 posture. Install the prefix first.",
+            "a reader observed the request channel configured while the \
+             reply prefix was still absent — that window leaves replies \
+             unbound, which is the H3 posture. Install the prefix first.",
         );
     }
 
@@ -2916,7 +2918,10 @@ mod tests {
             let reg = ChannelConfigRegistry::new();
             assert!(
                 reg.install_rpc_service_defaults(service).is_err(),
-                "[{band}] an unrepresentable service name must report the                  failure, not swallow it — a serve call that succeeds against                  a registry with no policy refuses every request later, far                  from the registration that caused it"
+                "[{band}] an unrepresentable service name must report the \
+                 failure, not swallow it — a serve call that succeeds \
+                 against a registry with no policy refuses every request \
+                 later, far from the registration that caused it"
             );
             assert_eq!(
                 reg.len(),

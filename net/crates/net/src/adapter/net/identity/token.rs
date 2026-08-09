@@ -234,7 +234,8 @@ impl PermissionToken {
     /// of panicking. The FFI bindings route through this function
     /// so a panic doesn't unwind across `extern "C"` into
     /// C/Go-cgo/NAPI/PyO3 callers — undefined behaviour.
-    /// Legacy generation-zero convenience path.
+    ///
+    /// **Legacy generation-zero convenience path.**
     ///
     /// Equivalent to [`Self::try_issue_with_generation`] at generation
     /// `0`. Kept for compatibility and for callers that genuinely have
