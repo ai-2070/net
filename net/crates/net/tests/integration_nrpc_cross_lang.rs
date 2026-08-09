@@ -218,6 +218,27 @@ fn load_fixture() -> GoldenFixture {
     serde_json::from_str(raw).expect("golden_vectors.json is valid JSON")
 }
 
+/// `NET_RPC_ABI_VERSION` as the public header declares it.
+fn header_abi_version() -> u32 {
+    let header = include_str!("../include/net_rpc.h");
+    let line = header
+        .lines()
+        .find(|l| l.contains("#define NET_RPC_ABI_VERSION"))
+        .expect("net_rpc.h must define NET_RPC_ABI_VERSION");
+    let literal = line
+        .split_whitespace()
+        .last()
+        .expect("the #define must have a value");
+    let hex = literal
+        .strip_prefix("0x")
+        .or_else(|| literal.strip_prefix("0X"));
+    match hex {
+        Some(digits) => u32::from_str_radix(digits, 16),
+        None => literal.parse(),
+    }
+    .unwrap_or_else(|_| panic!("NET_RPC_ABI_VERSION is not a number: {literal}"))
+}
+
 // =====================================================================
 // Tests.
 // =====================================================================
@@ -231,9 +252,19 @@ fn fixture_metadata_matches_canonical_contract() {
         fx.service, SERVICE_NAME,
         "fixture's service name must match the constant in this file",
     );
+    // Read the version out of the public header rather than restating
+    // it. It said "must track NET_RPC_ABI_VERSION" while hardcoding
+    // `0x0001`, so it tracked nothing — it went on passing while the
+    // header sat at `0x0002` and the implementation had moved to
+    // `0x0004`, which is the exact drift the ABI work went looking for.
+    //
+    // That closes the chain: `check-rpc-abi-parity.py` holds the header
+    // to the implementation, and this holds the fixture to the header.
+    // No link in it is a number typed twice.
     assert_eq!(
-        fx.abi_version_expected, 0x0001,
-        "fixture ABI version must track NET_RPC_ABI_VERSION (0x0001)",
+        fx.abi_version_expected,
+        header_abi_version(),
+        "fixture ABI version must match NET_RPC_ABI_VERSION in net_rpc.h",
     );
     assert!(!fx.ok_cases.is_empty(), "ok_cases must not be empty");
     assert!(!fx.error_cases.is_empty(), "error_cases must not be empty");
