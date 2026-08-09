@@ -436,3 +436,88 @@ This is a breaking correction and belongs in the `0.35` release notes.
 5. **Node timestamps should take the breaking `bigint` correction now** while the SDK packages are staging `0.35`.
 
 These decisions supersede any narrower repair that fixes only the immediate panic, adds only a generation parameter, preserves generation inheritance, or retains lossy timestamp aliases.
+
+---
+
+# Remediation status — 2026-08-09
+
+Implemented on `sdk-bugs-2`. Every fix has a negative control that was
+run: the pre-fix code was restored and the new test watched to fail.
+
+| Decision | Commit | State |
+|---|---|---|
+| 3 — C nRPC ABI | `52814abd9` | Landed; cross-process witness owed to CI |
+| 5 — Node timestamps | `0b9faf9c5` | Closed |
+| 2 — nRPC channel policy | `f01714190` | Closed, with one deviation (below) |
+| 1 — nRPC runtime entry | `ee1e60cda` | Landed; **HOLD — native witness pending** |
+| 4a — per-link generation | `0288ed72d` | Closed |
+| 4b — durable issuer state | `502175a19`, `eafc1e71b` | Landed; Python witnesses owed to CI |
+| 4c — delegation builders | `67e190ca5` | Landed; Python witnesses owed to CI |
+
+`f0bbf4630` is a follow-up, not a decision: `f01714190` left
+`Mesh::register_rpc_service_channels` with no caller outside its own
+tests, and the dead-code warning was missed because `cargo test`
+compiles with `cfg(test)`, which counts tests as callers.
+
+Verified locally: 5708 core, 261 SDK, 45 rpc-ffi, 575 Node, 551
+sdk-ts. `check-skills.sh`, `check-docs.sh`,
+`check-rpc-abi-parity.py`, `check-doc-code-width.py` and
+`capability_records.py` all clean.
+
+## Deviation: decision 2's atomicity requirement
+
+The decision asks that the exact `<service>.requests` entry and the
+`<service>.replies.` prefix "become visible atomically". They do not,
+and cannot without a change the decision does not authorise.
+
+A single write lock closes the writer/writer race, and that is in
+place. But `ChannelConfigRegistry::get_by_name` is the per-packet
+authorization path and deliberately takes no lock, so a reader can
+still observe the interval between the two inserts. True simultaneity
+would mean putting a lock on that hot path.
+
+What ships instead makes the interval fail-closed: the **prefix goes
+in first**. Exact-first leaves reply channels resolving to nothing —
+unbound, which is the H3 posture the decision exists to prevent.
+Prefix-first leaves the request channel briefly unregistered, so a
+request arriving in the window is refused as unknown. A concurrent
+test over 20,000 freshly-published registries fails deterministically
+if the two inserts are swapped.
+
+If true atomicity is wanted, it is a read-lock on `get_by_name` and a
+separate decision about that cost.
+
+## Witnesses that could not run in this environment
+
+Recorded rather than assumed:
+
+- **Decision 1, native serve/call.** No cgo-backed Go test ran at all;
+  `go vet ./...` fails on a pre-existing `meshos_test.go` binding-config
+  issue unrelated to this work. In place of the cross-process witness:
+  five `rpc-ffi` tests drive each C serve export from a thread with no
+  runtime in context, and `bindings/node/test/mesh_rpc_live.test.ts` is
+  the first live `MeshRpc.fromMesh` in the repo — all four call shapes
+  registered and dispatched between two nodes over loopback UDP. Two OS
+  processes against a packaged artifact still belong in CI.
+- **Decision 3, cross-language fixture.** Same reason.
+- **Decisions 4b and 4c, Python.** No maturin and no importable `net`
+  module here. The binding compiles under `--all-features`; the tests
+  are syntax-checked and written to mirror the Node suite
+  assertion-for-assertion, and need CI before they count.
+
+## Adjacent defects found, not fixed
+
+Both surfaced while writing the first live nRPC test. Neither is in
+scope for these decisions; both are recorded at the relevant assertions.
+
+1. **`MeshRpc` pins the node forever.** `MeshRpc.fromMesh()` clones the
+   node's `Arc<MeshNode>` and offers no way to release it, unlike
+   `CapabilityGateway`, which grew `close()` for exactly this.
+   `NetMesh.shutdown()` needs sole ownership, so it fails with
+   "outstanding references exist" until V8 finalizes the `MeshRpc` — on
+   no schedule the caller controls.
+2. **A completed `callStreaming` breaks the next `callDuplex`.** In the
+   same process, the duplex call's chunks arrive but its terminal frame
+   does not, so a drain-to-EOF loop hangs. Registering a
+   server-streaming handler is harmless; it is the completed call that
+   does it. Narrowed no further.
