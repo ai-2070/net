@@ -1403,6 +1403,22 @@ jobs:
       - name: Type-check (tsc)
         run: npm run build
 
+      # The step above compiles the SDK's own sources with
+      # `skipLibCheck: true`, which is exactly the blind spot: a declaration
+      # file that names a type nothing declares type-checks fine as long as
+      # nobody reads it. A consumer who turns skipLibCheck off reads it, and
+      # the errors land in OUR shipped files where they cannot fix them:
+      #
+      #   @net-mesh/core/index.d.ts(507,48): error TS2304:
+      #       Cannot find name 'DaemonBridgeTsfns'.
+      #   @net-mesh/sdk/dist/meshdb.d.ts(67,10): error TS2305:
+      #       Module '"@net-mesh/core"' has no exported member 'InMemoryChainReader'.
+      #
+      # This runs the check a careful consumer runs — a trivial program
+      # against the built pair, dependency declarations checked.
+      - name: Type-check a trivial consumer against the shipped declarations
+        run: "$GITHUB_WORKSPACE/.github/scripts/check-ts-consumer.sh"
+
       # The skill's TypeScript hello-world, type-checked against this same
       # surface. It runs here because it needs the napi-generated `index.d.ts`
       # the step above produced — that file is gitignored, so a clean checkout

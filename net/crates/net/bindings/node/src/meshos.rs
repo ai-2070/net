@@ -1069,7 +1069,24 @@ impl MeshOsDaemonSdk {
     /// the handle to unregister (the Rust-side `Drop` impl still
     /// cleans up the registry slot); call `gracefulShutdown` for
     /// the explicit drain path.
-    #[napi]
+    // `ts_args_type` because `DaemonObjectTsfns` is a plain Rust struct with
+    // hand-written napi impls rather than a `#[napi(object)]`. napi-rs put
+    // its `TypeName` in index.d.ts with nothing to declare it, so the
+    // generated file referenced an undefined name:
+    //
+    //   index.d.ts(1752,26): error TS2304: Cannot find name 'DaemonObjectTsfns'.
+    //
+    // Spell the object `from_napi_value` below destructures; keep the two in
+    // step if a property is added there.
+    #[napi(ts_args_type = "daemon: {
+    name?: string
+    process: (event: CausalEventJs) => Array<Buffer>
+    snapshot?: () => Buffer | undefined | null
+    restore?: (snapshot: Buffer) => unknown
+    onControl?: (control: DaemonControlJs) => unknown
+    health?: () => string | HealthObjJs
+    saturation?: () => number
+  }, identity: Identity")]
     pub async fn register_daemon(
         &self,
         daemon: DaemonObjectTsfns,
