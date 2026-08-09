@@ -1352,6 +1352,24 @@ jobs:
       # It surfaces only at `npm install` on a user's machine. Non-strict
       # here: a floor aimed at an unreleased version is fine as long as the
       # CHANGELOG says so. `release-npm-sdk.yml` runs the strict form.
+      # A `run:` step naming a script by path needs the executable bit in
+      # git's INDEX. The bit is not in the working tree, and a Windows
+      # checkout has core.filemode off — so `chmod +x` there is a no-op
+      # against the index and the script commits as 100644 with nothing
+      # locally to show for it. Every test passes on the author's machine
+      # and the step still cannot start:
+      #
+      #   .../check-ts-consumer.sh: Permission denied
+      #   Error: Process completed with exit code 126.
+      #
+      # Cheap, no network, and it runs early because a 126 wastes a whole job.
+      - name: Guard — workflow scripts invoked by path are executable
+        working-directory: ${{ github.workspace }}
+        run: |
+          python3 -m pip install --quiet pyyaml
+          python3 .github/scripts/check-script-permissions.py
+          python3 .github/scripts/check-script-permissions.py --self-test
+
       - name: Guard — SDK peer range admits the in-tree core
         working-directory: ${{ github.workspace }}
         run: python3 .github/scripts/check-npm-peer-range.py
