@@ -1658,12 +1658,21 @@ pub unsafe extern "C" fn net_num_shards(handle: *mut NetHandle) -> u16 {
 
 /// Get the library version.
 ///
+/// This is the *release* identity of the shared library — the same number
+/// the crate, the bindings, and the published packages carry. It is not the
+/// ABI number; use `net_ffi_abi_version` for compatibility checks, since
+/// the two move independently.
+///
 /// # Returns
 ///
 /// Version string (static, do not free).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn net_version() -> *const c_char {
-    static VERSION: &[u8] = b"0.8.0\0";
+    // Derived from the crate manifest rather than written out by hand. The
+    // literal that used to live here said "0.8.0" long after the crate
+    // reached 0.35.0, so every C and Go consumer — `net.Version()` included
+    // — reported a release that had not shipped in years.
+    static VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "\0");
     VERSION.as_ptr() as *const c_char
 }
 
@@ -2155,6 +2164,44 @@ pub unsafe extern "C" fn net_stats_ex(handle: *mut NetHandle, out: *mut NetStats
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `net_version` reports release identity to every C and Go consumer,
+    /// so it must track the crate it is compiled from. It was a hand-written
+    /// `b"0.8.0\0"` literal for 27 minor releases, which made `net.Version()`
+    /// and C telemetry name a release that had not shipped in years while
+    /// the ABI guard still passed — a stale answer is worse than no answer
+    /// here, because it looks authoritative.
+    #[test]
+    fn net_version_matches_the_crate_it_is_built_from() {
+        let raw = unsafe { net_version() };
+        assert!(!raw.is_null(), "net_version must never return NULL");
+
+        let reported = unsafe { CStr::from_ptr(raw) }
+            .to_str()
+            .expect("net_version must be valid UTF-8");
+
+        assert_eq!(
+            reported,
+            env!("CARGO_PKG_VERSION"),
+            "net_version reported {reported}, but this crate is version {}. \
+             The C ABI version string must be derived from the manifest, \
+             never written out by hand.",
+            env!("CARGO_PKG_VERSION"),
+        );
+    }
+
+    /// The pointer is documented as static and must not be freed, so
+    /// repeated calls have to hand back the same storage rather than
+    /// leaking a fresh allocation per call.
+    #[test]
+    fn net_version_returns_stable_static_storage() {
+        let first = unsafe { net_version() };
+        let second = unsafe { net_version() };
+        assert_eq!(
+            first, second,
+            "net_version must return the same static pointer on every call"
+        );
+    }
 
     /// Build a `ConsumeResponse` with the given raw event payloads —
     /// shared fixture for the PERF_AUDIT §1.6 envelope tests.
