@@ -1674,15 +1674,29 @@ pub unsafe extern "C" fn net_mesh_close_stream(handle: *mut MeshStreamHandle) ->
         return NetError::NullPointer.into();
     }
     let h: &MeshStreamHandle = unsafe { &*handle };
-    // Read the ids before `stream_free` takes the inner apart.
-    let peer_node_id = h.stream.peer_node_id();
-    let stream_id = h.stream.stream_id();
     {
+        // Enter the guard BEFORE touching `stream`. This read used to
+        // sit above the `try_enter`, which is the one thing
+        // `HandleGuard` documents a caller must not do: a `None` return
+        // means a concurrent `net_mesh_stream_free` is taking the inner
+        // apart, and every field except the guard itself is off-limits.
+        // `MeshStreamHandle`'s own doc names this exact hazard — "a
+        // concurrent `net_mesh_stream_free` while `net_mesh_send` was
+        // reading `sh.stream` / `sh._node` would UAF the dropped
+        // fields". Every other op in this file enters first; this was
+        // the outlier.
+        //
+        // The read was survivable in practice — `CoreStream` is `Copy`,
+        // so `ManuallyDrop::take` leaves the bytes behind, and the box
+        // is deliberately leaked across `_free` — but it was correct by
+        // accident, and the accident belongs to a type that could stop
+        // being `Copy`.
         let _op = match h.guard.try_enter() {
             Some(op) => op,
             None => return NetError::ShuttingDown.into(),
         };
-        h._node.close_stream(peer_node_id, stream_id);
+        h._node
+            .close_stream(h.stream.peer_node_id(), h.stream.stream_id());
     }
     unsafe { net_mesh_stream_free(handle) };
     0
@@ -5317,6 +5331,67 @@ mod tests {
         }
         unsafe { net_mesh_free(nh_a) };
         unsafe { net_mesh_free(nh_b) };
+    }
+
+    /// `net_mesh_close_stream` on an already-freed handle must report
+    /// `ShuttingDown` from the guard alone, without reading `stream`.
+    ///
+    /// The guard's contract is that a `None` from `try_enter` means
+    /// every field but the guard is off-limits — `net_mesh_stream_free`
+    /// has taken `stream` and dropped `_node` by then. This function
+    /// read `h.stream.peer_node_id()` and `h.stream.stream_id()` ABOVE
+    /// the `try_enter`, the only op in this file that touched a field
+    /// first.
+    ///
+    /// A plain assertion cannot see the difference: `CoreStream` is
+    /// `Copy`, so `ManuallyDrop::take` leaves readable bytes, and the
+    /// box is deliberately leaked across `_free`. What this pins is the
+    /// reachable half — the call is defined, returns the typed code,
+    /// and does not touch the dropped `_node` — so the path stays
+    /// exercised for a Miri or ASan run, and a future `CoreStream` that
+    /// stops being `Copy` fails here rather than in the field.
+    #[test]
+    fn close_stream_after_free_reports_shutting_down() {
+        let cfg = serde_json::json!({
+            "bind_addr": "127.0.0.1:0",
+            "psk_hex": "0".repeat(64),
+        });
+        let cfg_c = CString::new(cfg.to_string()).unwrap();
+        let mut nh: *mut MeshNodeHandle = std::ptr::null_mut();
+        assert_eq!(unsafe { net_mesh_new(cfg_c.as_ptr(), &mut nh) }, 0);
+
+        // Direct field init, as in `handles_match_rejects_stream_node_mismatch`:
+        // `open_stream` needs an established session a unit test cannot
+        // synthesize, and neither the guard nor the ids depend on one.
+        let sh = Box::into_raw(Box::new(MeshStreamHandle {
+            stream: ManuallyDrop::new(CoreStream {
+                peer_node_id: 0xDEAD,
+                stream_id: 7,
+                epoch: 0,
+                config: StreamConfig::new(),
+            }),
+            _node: ManuallyDrop::new(Arc::clone(&unsafe { &*nh }.inner)),
+            guard: HandleGuard::new(),
+        }));
+
+        // First close: the guard is open, so this closes the core
+        // stream and frees the inner.
+        assert_eq!(unsafe { net_mesh_close_stream(sh) }, 0);
+
+        // Second close: `freeing` is latched, so the guard refuses. The
+        // box is still valid memory (leaked on purpose), so reading the
+        // guard is defined — reading `stream` is what is not.
+        assert_eq!(
+            unsafe { net_mesh_close_stream(sh) },
+            c_int::from(NetError::ShuttingDown),
+            "a close after free must come from the guard, not from a \
+             field read that happens to survive",
+        );
+
+        // And the plain free stays idempotent alongside it.
+        unsafe { net_mesh_stream_free(sh) };
+
+        unsafe { net_mesh_free(nh) };
     }
 
     /// `net_mesh_free` must be idempotent — the post-fix protocol
