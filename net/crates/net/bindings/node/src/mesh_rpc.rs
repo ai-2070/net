@@ -596,6 +596,15 @@ type RpcObserverTsfn = ThreadsafeFunction<RpcCallEventJs, (), RpcCallEventJs, na
 #[napi]
 pub struct ServeHandle {
     inner: Arc<Mutex<Option<InnerServeHandle>>>,
+    /// The runtime registration ran on, carried forward.
+    ///
+    /// The bridge task `serve_rpc*` spawned must outlive the
+    /// registration call and live until this handle closes, so the
+    /// registration *owner* — not just the `MeshRpc` that happened
+    /// to create it — names the runtime that task belongs to. JS
+    /// can drop the `MeshRpc` and keep the `ServeHandle`; the
+    /// association has to survive that.
+    runtime: tokio::runtime::Handle,
 }
 
 #[napi]
@@ -605,6 +614,11 @@ impl ServeHandle {
     /// completion but no new requests will be dispatched.
     #[napi]
     pub fn close(&self) {
+        // `close()` is sync and runs on the JS thread. Dropping the
+        // inner handle tears down runtime-bound resources, so enter
+        // the same runtime registration used rather than leaving the
+        // drop to run with no reactor in context.
+        let _enter = self.runtime.enter();
         // Recover from a poisoned mutex (a thread panicked while
         // holding it) — partial state is fine here, we just want
         // to drop the inner ServeHandle if it's still present.
@@ -1664,6 +1678,17 @@ pub struct MeshRpc {
     /// Shared with the parent NetMesh — no second socket, no
     /// second handshake table.
     node: Arc<MeshNode>,
+    /// The runtime the parent `NetMesh` was created on.
+    ///
+    /// `serve_rpc*` is synchronous but spawns an inbound-event
+    /// bridge with a bare `tokio::spawn`, and every `serve*` below
+    /// is a sync `#[napi]` method — so it runs on the JS thread,
+    /// which is not a Tokio worker. Asking for `Handle::current()`
+    /// there panics "there is no reactor running"; that was the
+    /// defect. We carry the mesh's own handle instead and enter it
+    /// for the duration of registration, so the bridge task lands
+    /// on the same runtime as the rest of the mesh.
+    runtime: tokio::runtime::Handle,
 }
 
 #[napi]
@@ -1674,7 +1699,8 @@ impl MeshRpc {
     #[napi(factory)]
     pub fn from_mesh(mesh: &crate::NetMesh) -> Result<MeshRpc> {
         let node = mesh.node_arc_clone()?;
-        Ok(MeshRpc { node })
+        let runtime = mesh.runtime_handle();
+        Ok(MeshRpc { node, runtime })
     }
 
     // ---- serve ----------------------------------------------------------
@@ -1708,12 +1734,16 @@ impl MeshRpc {
             None => DEFAULT_HANDLER_TIMEOUT,
         };
         let rust_handler = Arc::new(NodeRpcHandler { tsfn, timeout });
+        // See `MeshRpc::runtime`: registration spawns, this method
+        // does not run on a runtime, so name the mesh's own.
+        let _enter = self.runtime.enter();
         let inner = self
             .node
             .serve_rpc(&service, rust_handler)
             .map_err(|e| nrpc_err("serve_failed", e))?;
         Ok(ServeHandle {
             inner: Arc::new(Mutex::new(Some(inner))),
+            runtime: self.runtime.clone(),
         })
     }
 
@@ -1936,12 +1966,14 @@ impl MeshRpc {
             tsfn,
             timeout: DEFAULT_HANDLER_TIMEOUT,
         });
+        let _enter = self.runtime.enter();
         let inner = self
             .node
             .serve_rpc_client_stream(&service, inner_handler)
             .map_err(|e| nrpc_err("serve_failed", format!("{e}")))?;
         Ok(ServeHandle {
             inner: Arc::new(Mutex::new(Some(inner))),
+            runtime: self.runtime.clone(),
         })
     }
 
@@ -1969,12 +2001,14 @@ impl MeshRpc {
             tsfn,
             timeout: DEFAULT_HANDLER_TIMEOUT,
         });
+        let _enter = self.runtime.enter();
         let inner = self
             .node
             .serve_rpc_duplex(&service, inner_handler)
             .map_err(|e| nrpc_err("serve_failed", format!("{e}")))?;
         Ok(ServeHandle {
             inner: Arc::new(Mutex::new(Some(inner))),
+            runtime: self.runtime.clone(),
         })
     }
 
@@ -2010,12 +2044,14 @@ impl MeshRpc {
             tsfn,
             timeout: DEFAULT_HANDLER_TIMEOUT,
         });
+        let _enter = self.runtime.enter();
         let inner = self
             .node
             .serve_rpc_streaming(&service, inner_handler)
             .map_err(|e| nrpc_err("serve_failed", format!("{e}")))?;
         Ok(ServeHandle {
             inner: Arc::new(Mutex::new(Some(inner))),
+            runtime: self.runtime.clone(),
         })
     }
 
@@ -2055,9 +2091,13 @@ impl MeshRpc {
         match observer {
             Some(f) => {
                 let tsfn: RpcObserverTsfn = f.build_threadsafe_function().build()?;
-                let handle = tokio::runtime::Handle::current();
+                // Same defect as the serve seams, one method over:
+                // `ObserverChannel::install` spawns a drain task, and
+                // this is a sync `#[napi]` method with no current
+                // runtime. Use the mesh's handle, not `current()`.
+                let handle = &self.runtime;
                 let channel =
-                    ::net::adapter::net::cortex::ObserverChannel::install(&handle, move |evt| {
+                    ::net::adapter::net::cortex::ObserverChannel::install(handle, move |evt| {
                         let js_evt = RpcCallEventJs::from(evt.as_ref());
                         let _ = tsfn.call(js_evt, ThreadsafeFunctionCallMode::NonBlocking);
                     });

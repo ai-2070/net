@@ -1536,6 +1536,21 @@ mod mesh_bindings {
     #[napi]
     pub struct NetMesh {
         node: Arc<ArcSwapOption<MeshNode>>,
+        /// The Tokio runtime this mesh was created on, captured in
+        /// `create()`.
+        ///
+        /// `create()` is `async`, so napi-rs invokes it *inside* the
+        /// napi runtime and `Handle::current()` there is exactly the
+        /// runtime the mesh's background tasks live on. Synchronous
+        /// `#[napi]` methods run on the JS thread instead, which is
+        /// not a Tokio worker — `Handle::current()` panics there
+        /// ("there is no reactor running"). So sync methods that
+        /// register work spawning tasks (nRPC serve) clone this
+        /// handle and `.enter()` it rather than asking for a current
+        /// one. Runtime ownership stays with the binding; nothing
+        /// downstream constructs a private runtime or guesses.
+        #[cfg_attr(not(feature = "cortex"), allow(dead_code))]
+        runtime: tokio::runtime::Handle,
         /// Channel config registry shared with the underlying MeshNode.
         /// `register_channel` inserts here; the node's membership ACL
         /// path reads from this same registry.
@@ -1705,6 +1720,10 @@ mod mesh_bindings {
 
             Ok(NetMesh {
                 node: Arc::new(ArcSwapOption::from_pointee(node)),
+                // Captured here, and only here: this `async fn` is the
+                // one place in the binding guaranteed to be running on
+                // the napi runtime.
+                runtime: tokio::runtime::Handle::current(),
                 channel_configs,
                 #[cfg(feature = "org")]
                 subnet_exports,
@@ -2439,6 +2458,19 @@ mod mesh_bindings {
                 Some(arc) => Ok(arc.clone()),
                 None => Err(Error::from_reason("MeshNode has been shut down")),
             }
+        }
+
+        /// The runtime `create()` ran on, for sibling modules whose
+        /// synchronous `#[napi]` methods spawn tasks.
+        ///
+        /// Cloning a `Handle` is cheap and does not keep the runtime
+        /// alive by itself; napi's runtime lives for the process. The
+        /// point is to name *which* runtime, deterministically,
+        /// instead of asking the JS thread for a current one it does
+        /// not have.
+        #[cfg(feature = "cortex")]
+        pub(crate) fn runtime_handle(&self) -> tokio::runtime::Handle {
+            self.runtime.clone()
         }
 
         /// The checked named-export map this mesh was created with

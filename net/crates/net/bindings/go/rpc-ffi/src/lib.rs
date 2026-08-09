@@ -1122,6 +1122,17 @@ pub extern "C" fn net_rpc_serve(
             handler_id,
             timeout,
         });
+        // Registration is synchronous, but `serve_rpc*` spawns an
+        // inbound-event bridge with a bare `tokio::spawn`. cgo calls
+        // this on a Go-owned OS thread that is not a tokio worker, so
+        // without an entered runtime the spawn panics "there is no
+        // reactor running". Enter the FFI's own runtime — not
+        // `block_on`: nothing here is awaited, the spawned task just
+        // needs a runtime to land on, and `block_on` from a thread
+        // already inside a runtime is the abort case `block_on_ffi`
+        // exists to catch.
+        let runtime = runtime();
+        let _enter = runtime.enter();
         match h.node.serve_rpc(&service, rust_handler) {
             Ok(inner) => Box::into_raw(Box::new(ServeHandleC {
                 inner: Arc::new(Mutex::new(Some(inner))),
@@ -3240,6 +3251,10 @@ pub extern "C" fn net_rpc_serve_client_stream(
             handler_id,
             timeout,
         });
+        // See `net_rpc_serve`: registration spawns, cgo threads are
+        // not tokio workers.
+        let runtime = runtime();
+        let _enter = runtime.enter();
         match h.node.serve_rpc_client_stream(&service, rust_handler) {
             Ok(inner) => Box::into_raw(Box::new(ServeHandleC {
                 inner: Arc::new(Mutex::new(Some(inner))),
@@ -3407,6 +3422,10 @@ pub extern "C" fn net_rpc_serve_streaming(
             handler_id,
             timeout,
         });
+        // See `net_rpc_serve`: registration spawns, cgo threads are
+        // not tokio workers.
+        let runtime = runtime();
+        let _enter = runtime.enter();
         match h.node.serve_rpc_streaming(&service, rust_handler) {
             Ok(inner) => Box::into_raw(Box::new(ServeHandleC {
                 inner: Arc::new(Mutex::new(Some(inner))),
@@ -3464,6 +3483,10 @@ pub extern "C" fn net_rpc_serve_duplex(
             handler_id,
             timeout,
         });
+        // See `net_rpc_serve`: registration spawns, cgo threads are
+        // not tokio workers.
+        let runtime = runtime();
+        let _enter = runtime.enter();
         match h.node.serve_rpc_duplex(&service, rust_handler) {
             Ok(inner) => Box::into_raw(Box::new(ServeHandleC {
                 inner: Arc::new(Mutex::new(Some(inner))),
@@ -4021,6 +4044,12 @@ pub extern "C" fn net_rpc_watch_tools_free(watch: *mut ToolWatchHandleC) {
 // =========================================================================
 // Tests for pure-logic helpers.
 // =========================================================================
+
+// Its own file rather than another block in `tests` below: it stands
+// up real mesh nodes and its own runtimes, which is a different weight
+// class from the null-safety and formatting pins there.
+#[cfg(test)]
+mod runtime_entry_tests;
 
 #[cfg(test)]
 mod tests {
