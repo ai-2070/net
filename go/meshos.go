@@ -1,7 +1,7 @@
 // Package net — MeshOS daemon-author SDK.
 //
-// Wraps the C ABI exported by `libnet_meshos` (the cdylib shipped with
-// the `meshos` Cargo feature). Provides:
+// Wraps the MeshOS C ABI, compiled into `libnet` behind the `meshos`
+// Cargo feature. Provides:
 //
 //   - StartMeshOsDaemonSdk → MeshOsDaemonSdk (lifecycle + tear-down).
 //   - MeshOsDaemonSdk.RegisterDaemon(name, seed)  — lifecycle-only;
@@ -14,7 +14,8 @@
 //
 // Port of the reference impl at net/crates/net/bindings/go/net/meshos.go.
 // Same C ABI, same callback model. Build prerequisite: `cargo build
-// --release -p net-meshos-ffi`.
+// --release -p net-ffi` — `bindings/go/meshos-ffi` is an rlib linked into
+// that library and emits nothing of its own.
 
 package net
 

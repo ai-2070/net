@@ -11,10 +11,10 @@ Dart, Swift, Kotlin, Haskell, Erlang, PHP.
 [Headers and linking](https://ai2070.net/docs/sdk/c/headers-and-linking) ·
 [Memory and threading](https://ai2070.net/docs/sdk/c/memory-and-threading)
 
-## Ten headers, five libraries
+## Eleven headers, one library
 
-This is not one header. The full map — which header resolves against which
-cdylib, and which surface each covers — is in
+This is not one header. It is eleven — and every one of them resolves against
+the same `libnet`. The full map, with the surface each header covers, is in
 [Headers and Linking](https://ai2070.net/docs/sdk/c/headers-and-linking).
 
 | Header | Guard | Surface | Library |

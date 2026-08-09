@@ -1,7 +1,9 @@
 // Package net — MeshDB query layer.
 //
-// The MeshDB surface is compiled into the `libnet_meshdb` cdylib (separate
-// from `libnet`). Build with `cargo build --release -p net-meshdb-ffi`.
+// The MeshDB surface is compiled into `libnet`, the one shared library
+// every surface resolves against. Build with `cargo build --release -p
+// net-ffi`; `bindings/go/meshdb-ffi` is an rlib linked into it and emits
+// nothing of its own, so there is no second `-l` to add.
 //
 // This file exposes the minimal Reader / Runner / Query / Iterator path:
 // build an in-memory chain reader, append events, construct a runner,

@@ -1,7 +1,8 @@
 // Subnet authority — the exported-service surface (SSDK S4d).
 //
-// Two ordinary verbs and one advanced namespace, over the subnet symbols in
-// the `libnet_org` cdylib (see net/crates/net/include/net_subnet.h). Every
+// Two ordinary verbs and one advanced namespace, over the subnet symbols that
+// sit beside the org surface in `libnet` (see
+// net/crates/net/include/net_subnet.h). Every
 // authority decision already happened in Rust; this file is marshaling.
 //
 // The ordinary surface — a provider exporting one service, a caller invoking

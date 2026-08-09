@@ -2,7 +2,7 @@
 //
 // Two verbs (OrgCall, ServeOrg), five concepts (OrgCredentials, OrgClient,
 // OrgAccess, OrgCaller, OrgError), and four error domains — the same surface
-// the Rust, Node, and Python SDKs expose, over the `libnet_org` C ABI. Every
+// the Rust, Node, and Python SDKs expose, over the org C ABI in `libnet`. Every
 // authority decision already happened in Rust; this file is marshaling.
 //
 // The one rule that shapes the API: audience secrets cross as file PATHS, never

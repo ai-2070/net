@@ -1,8 +1,10 @@
 // Package net — MCP bridge pure helpers + the graduated consent / pin
 // surface (`MCP_BRIDGE_SDK_PLAN.md` P3).
 //
-// Compiled into the `libnet_mcp_ffi` cdylib (separate from `libnet`).
-// Build with `cargo build --release -p net-mcp-ffi`.
+// Compiled into `libnet`, the one shared library every surface resolves
+// against. Build with `cargo build --release -p net-ffi`;
+// `bindings/go/mcp-ffi` is an rlib linked into it and emits nothing of
+// its own, so the cgo prelude below links `-lnet` and nothing else.
 //
 // This is the Go face of exactly what the Python and Node bindings expose
 // — one Rust implementation, three faces (doctrine #1: no logic in

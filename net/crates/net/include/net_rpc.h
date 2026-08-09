@@ -1,25 +1,34 @@
 /*
- * net_rpc.h — C SDK header for libnet_rpc (the nRPC C ABI).
+ * net_rpc.h — C SDK header for the nRPC C ABI.
  *
- * One header, one shared library. Mirrors the layout of `net.h` /
- * `net.go.h` next to it. Symbols live in the `libnet_rpc.{so,
- * dylib,dll}` cdylib built from `bindings/go/rpc-ffi`. The Go
- * binding's `bindings/go/net/mesh_rpc.go` cgo include block has
- * been the de-facto contract for non-Go consumers since v0.10;
- * this file is the canonical drop-in for C / C++ / Zig / Swift /
- * Java JNI / etc.
+ * One of eleven headers, all resolving against a single shared library.
+ * Mirrors the layout of `net.h` / `net.go.h` next to it. The Go binding's
+ * `go/mesh_rpc.go` cgo include block has been the de-facto contract for
+ * non-Go consumers since v0.10; this file is the canonical drop-in for
+ * C / C++ / Zig / Swift / Java JNI / etc.
+ *
+ * These symbols are compiled into `libnet`. `bindings/go/rpc-ffi` is an
+ * rlib linked into it and emits no library of its own — there is no
+ * `libnet_rpc` to build or link, and there has not been since the
+ * one-library consolidation.
  *
  * # Build
  *
- *   cargo build --release -p net-rpc-ffi
+ *   cargo build --release -p net-ffi
  *
- *   Linux:   target/release/libnet_rpc.so
- *   macOS:   target/release/libnet_rpc.dylib
- *   Windows: target/release/net_rpc.dll
+ *   Linux:   target/release/libnet.so
+ *   macOS:   target/release/libnet.dylib
+ *   Windows: target/release/net.dll  (+ net.dll.lib import library)
  *
  * # Link
  *
- *   gcc -o app app.c -L target/release -lnet_rpc -lpthread -ldl -lm
+ *   gcc -o app app.c -L target/release -lnet -lpthread -ldl -lm
+ *
+ * Link `-lnet` and nothing else. Net used to ship one cdylib per surface,
+ * and each embedded its own copy of the core — so linking two put two
+ * copies of the core's statics in one process, including the registry
+ * `parking_lot` uses to track blocked threads. That made a lock
+ * releasable without waking its waiter. There is no second `-l` to add.
  *
  * # ABI versioning
  *

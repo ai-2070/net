@@ -1,11 +1,14 @@
 /*
- * net_mcp.h — C SDK header for libnet_mcp_ffi (the MCP bridge pure
- * helpers + the graduated consent / pin surface, C ABI).
+ * net_mcp.h — C SDK header for the MCP bridge pure helpers + the
+ * graduated consent / pin surface (C ABI).
  *
- * One header, one shared library. Mirrors the layout of `net.h` /
- * `net_meshdb.h` next to it. Symbols live in the
- * `libnet_mcp_ffi.{so,dylib}` / `net_mcp_ffi.dll` cdylib built from
- * `bindings/go/mcp-ffi`. This is the C face of exactly what the Python
+ * One of eleven headers, all resolving against a single shared library.
+ * Mirrors the layout of `net.h` / `net_meshdb.h` next to it. These
+ * symbols are compiled into `libnet`; `bindings/go/mcp-ffi` is an rlib
+ * linked into it and emits no library of its own — there is no
+ * `libnet_mcp_ffi` to build or link.
+ *
+ * This is the C face of exactly what the Python
  * (`bindings/python/src/{consent,mcp_helpers}.rs`) and Node
  * (`bindings/node/src/{consent,mcp_helpers}.rs`) bindings expose — one
  * Rust implementation, three faces. The Go binding's `go/mcp.go` cgo
@@ -14,15 +17,17 @@
  *
  * # Build
  *
- *   cargo build --release -p net-mcp-ffi
+ *   cargo build --release -p net-ffi
  *
- *   Linux:   target/release/libnet_mcp_ffi.so
- *   macOS:   target/release/libnet_mcp_ffi.dylib
- *   Windows: target/release/net_mcp_ffi.dll
+ *   Linux:   target/release/libnet.so
+ *   macOS:   target/release/libnet.dylib
+ *   Windows: target/release/net.dll  (+ net.dll.lib import library)
  *
  * # Link
  *
- *   gcc -o app app.c -L target/release -lnet_mcp_ffi -lpthread -ldl -lm
+ *   gcc -o app app.c -L target/release -lnet -lpthread -ldl -lm
+ *
+ * Link `-lnet` and nothing else; there is no second library to add.
  *
  * # Scope
  *

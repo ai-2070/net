@@ -3,8 +3,15 @@
  *
  * Network Event Transport — a latency-first encrypted mesh protocol.
  *
- * One header, one shared library. This is the entire C SDK.
- * Links against libnet.so (Linux), libnet.dylib (macOS), or net.dll (Windows).
+ * The narrow event-bus surface: init / ingest / poll / stats / shutdown.
+ * It is one of eleven headers, NOT the entire C SDK — mesh, capabilities,
+ * nRPC, CortEX, MCP and the rest have their own headers. See include/README.md
+ * for the map. All eleven resolve against one shared library: libnet.so
+ * (Linux), libnet.dylib (macOS), or net.dll (Windows). Link `-lnet` and
+ * nothing else.
+ *
+ * `net.go.h` shares this header's NET_SDK_H guard, so only one of the two can
+ * be active per translation unit — and net.go.h is not a superset.
  *
  * Thread Safety: All functions are thread-safe. Handles can be shared across threads.
  *

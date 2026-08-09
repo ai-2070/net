@@ -1,12 +1,13 @@
 ---
 title: Headers and Linking
-description: The eleven headers, which shared library each one resolves against, and the net.h / net.go.h choice you have to make per translation unit.
+description: The eleven headers, the one shared library they all resolve against, and the net.h / net.go.h choice you have to make per translation unit.
 ---
 
 # C — Headers and Linking
 
-The C surface is not one header. It is eleven, spread across five shared
-libraries, and one of the pairings is mutually exclusive. This page is the map.
+The C surface is not one header. It is eleven — and they all resolve out of a
+single shared library, `libnet`. One of the header pairings is mutually
+exclusive. This page is the map.
 
 ## The one decision that bites
 

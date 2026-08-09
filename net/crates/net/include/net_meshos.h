@@ -1,17 +1,18 @@
 /*
- * net_meshos.h — C SDK header for libnet_meshos (the MeshOS
- * daemon-author SDK C ABI).
+ * net_meshos.h — C SDK header for the MeshOS daemon-author SDK C ABI.
  *
- * One header, one shared library. Mirrors the layout of `net.h` /
- * `net_meshdb.h` / `net_rpc.h` next to it. Symbols live in the
- * `libnet_meshos.{so,dylib,dll}` cdylib built from
- * `bindings/go/meshos-ffi`. The Go binding's
- * `bindings/go/net/meshos.go` cgo include block is the
- * sister-consumer contract; this file is the canonical drop-in
- * for C / C++ / Zig / Swift / Java JNI / etc.
+ * One of eleven headers, all resolving against a single shared
+ * library. Mirrors the layout of `net.h` / `net_meshdb.h` /
+ * `net_rpc.h` next to it. The Go binding's `go/meshos.go` cgo
+ * include block is the sister-consumer contract; this file is the
+ * canonical drop-in for C / C++ / Zig / Swift / Java JNI / etc.
  *
- * Companion to `MESHOS_SDK_PLAN.md` Phase 5; consumes the cdylib
- * built for Phase 4 (Go) without modification.
+ * These symbols are compiled into `libnet`.
+ * `bindings/go/meshos-ffi` is an rlib linked into it and emits no
+ * library of its own — there is no `libnet_meshos` to build or link.
+ *
+ * Companion to `MESHOS_SDK_PLAN.md` Phase 5; consumes the same
+ * library built for Phase 4 (Go) without modification.
  *
  * # Scope (slice 1b)
  *
@@ -32,15 +33,17 @@
  *
  * # Build
  *
- *   cargo build --release -p net-meshos-ffi
+ *   cargo build --release -p net-ffi
  *
- *   Linux:   target/release/libnet_meshos.so
- *   macOS:   target/release/libnet_meshos.dylib
- *   Windows: target/release/net_meshos.dll
+ *   Linux:   target/release/libnet.so
+ *   macOS:   target/release/libnet.dylib
+ *   Windows: target/release/net.dll  (+ net.dll.lib import library)
  *
  * # Link
  *
- *   gcc -o app app.c -L target/release -lnet_meshos -lpthread -ldl -lm
+ *   gcc -o app app.c -L target/release -lnet -lpthread -ldl -lm
+ *
+ * Link `-lnet` and nothing else; there is no second library to add.
  *
  * # Handle model
  *
