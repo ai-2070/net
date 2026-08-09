@@ -17,7 +17,7 @@ use std::time::Duration;
 use net::adapter::net::identity::RevocationRegistry;
 use net::adapter::net::ChannelName;
 
-use crate::identity::{Identity, IdentityStateError, IDENTITY_STATE_SIZE};
+use crate::identity::{Identity, IdentityState, IdentityStateError, IDENTITY_STATE_SIZE};
 use crate::TokenScope;
 
 fn channel() -> ChannelName {
@@ -146,21 +146,57 @@ fn generation_may_not_go_backwards() {
     assert_eq!(issuer.at_generation(6).unwrap().issuer_generation(), 6);
 }
 
-/// Maximum generation requires key rotation.
+/// The ceiling is fully usable; only *advancing* past it is refused.
+///
+/// This used to assert that `at_generation(u32::MAX)` on an issuer
+/// already at `u32::MAX` returned `GenerationExhausted`, which
+/// contradicted the idempotence the same surface documents — and did so
+/// for the one issuer that most needs it, since an issuer at the
+/// ceiling re-applying its persisted generation on restart had no other
+/// way back.
+///
+/// `at_generation` names a target, and at the ceiling the only nameable
+/// target is the ceiling itself: a re-apply, not a rotation. Running
+/// out of generations is `IdentityState::next_generation`'s answer to
+/// give.
 #[test]
-fn generation_ceiling_demands_a_key_rotation() {
+fn the_generation_ceiling_is_usable_but_not_advanceable() {
     let issuer = Identity::generate()
         .at_generation(u32::MAX)
         .expect("rotate to the ceiling");
     assert_eq!(issuer.issuer_generation(), u32::MAX);
 
-    // The ceiling is still usable for issuance...
+    // The ceiling is usable for issuance...
     let subject = Identity::generate();
     assert_eq!(issue(&issuer, &subject).issuer_generation, u32::MAX);
 
-    // ...but there is nothing above it, so the answer is a new key.
+    // ...and for the restart path.
+    let restored = Identity::from_state_bytes(&issuer.to_state_bytes())
+        .expect("an issuer at the ceiling must survive a restart");
+    assert_eq!(restored.issuer_generation(), u32::MAX);
     assert_eq!(
-        issuer.at_generation(u32::MAX).unwrap_err(),
+        restored
+            .at_generation(u32::MAX)
+            .unwrap()
+            .issuer_generation(),
+        u32::MAX,
+        "re-applying the persisted generation must be idempotent at the \
+         ceiling like anywhere else",
+    );
+
+    // Backwards is still backwards here.
+    assert_eq!(
+        issuer.at_generation(u32::MAX - 1).unwrap_err(),
+        IdentityStateError::GenerationWentBackwards {
+            current: u32::MAX,
+            requested: u32::MAX - 1,
+        }
+    );
+
+    // There is nothing above the ceiling, so advancing is where the
+    // answer "rotate the key" comes from.
+    assert_eq!(
+        IdentityState::next_generation(u32::MAX).unwrap_err(),
         IdentityStateError::GenerationExhausted
     );
 }
