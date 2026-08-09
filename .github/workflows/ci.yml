@@ -1778,6 +1778,36 @@ jobs:
           LD_LIBRARY_PATH: ${{ github.workspace }}/net/crates/net/target/release
         run: go test -v -tags abi_stability -run TestABIStabilityU64FFIRoundTrip ./...
 
+      # `go/example` is the checked-in "run this and watch it work" program,
+      # and until now NOTHING in this workflow compiled it. So its manifest
+      # drifted: it still declared `go 1.21` long after `go/go.mod` moved to
+      # `go 1.26`, and since it consumes that module through a local
+      # `replace`, running it as supplied failed before reaching main:
+      #
+      #   $ go run .
+      #   go: module .. requires go >= 1.26 (running go 1.25.5)
+      #
+      # The directive comparison is the readable diagnostic; the build is what
+      # actually proves the example still compiles against the module it
+      # replaces. Both are cheap — the library is already built by this job.
+      - name: Build the checked-in Go example
+        working-directory: go/example
+        env:
+          CGO_LDFLAGS: -L${{ github.workspace }}/net/crates/net/target/release
+        run: |
+          sdk=$(awk '/^go /{print $2; exit}' ../go.mod)
+          ex=$(awk '/^go /{print $2; exit}' go.mod)
+          echo "go/go.mod declares go $sdk; go/example/go.mod declares go $ex"
+          # The example may declare a NEWER language version than the module
+          # it replaces, but never an older one — that combination cannot
+          # resolve at all. `sort -V` puts the lower version first.
+          if [ "$(printf '%s\n%s\n' "$sdk" "$ex" | sort -V | head -1)" != "$sdk" ]; then
+            echo "::error::go/example/go.mod declares go $ex but replaces a module requiring go $sdk"
+            echo "A local-replace example cannot consume a module with a higher go directive."
+            exit 1
+          fi
+          go build -o /dev/null .
+
       # The Go and C skill examples, executed against the cdylibs built above.
       # This job is the only place they can run: cgo links against libnet, and
       # the C example links against it directly, so the *compile* checks
