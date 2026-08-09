@@ -1512,16 +1512,13 @@ mod auto_register_covers_every_serve_variant {
         );
     }
 
-    /// Every serve path must reach the ONE registration implementation.
+    /// Core owns the nRPC channel policy, and every SDK hop stays out
+    /// of it.
     ///
-    /// Only the delegation chain is scanned here. The implementation
-    /// moved out of this crate entirely, onto
-    /// `ChannelConfigRegistry::install_rpc_service_defaults`, and its
-    /// H2/H3 content is pinned by
-    /// `rpc_service_defaults_are_install_if_absent_and_origin_bound` next
-    /// to it in `net`'s `channel/config.rs`. Reaching across the crate
-    /// boundary with `include_str!("../../src/...")` would pin it from
-    /// here too, at the cost of a path that breaks on any layout change.
+    /// Only ownership is scanned here. The H2/H3 content of the
+    /// implementation is pinned by
+    /// `rpc_service_defaults_are_install_if_absent_and_origin_bound`
+    /// next to it in `net`'s `channel/config.rs`.
     ///
     /// Why the policy is on the registry at all: the serve paths do not
     /// share a receiver. `serve_rpc*` and the aggregator go through
@@ -1531,25 +1528,32 @@ mod auto_register_covers_every_serve_variant {
     /// each missing H2 and H3 after they were fixed for `serve_rpc`. The
     /// registry is the object all of them already hold.
     #[test]
-    fn every_serve_path_delegates_to_the_shared_registration() {
+    fn core_owns_the_nrpc_channel_policy() {
         let rpc_src = include_str!("mesh_rpc.rs");
         let hop_start = rpc_src
             .find("pub(crate) fn auto_register_rpc_channels(")
             .expect("auto_register_rpc_channels must exist");
         let hop = &rpc_src[hop_start..(hop_start + 1_000).min(rpc_src.len())];
         assert!(
-            !hop.contains("self.register_rpc_service_channels(service)"),
-            "regression: the SDK is pre-registering nRPC channel policy again. \n             Core installs it from its own serve seams now, and this hop \n             must stay empty — the wrapper-owned version is why Node, \n             Python and Go/C had no policy at all."
+            !hop.contains("install_rpc_service_defaults("),
+            "regression: the SDK is pre-registering nRPC channel policy \
+             again. Core installs it from its own serve seams now, and \
+             this hop must stay empty — the wrapper-owned version is why \
+             Node, Python and Go/C had no policy at all."
         );
 
+        // `Mesh` used to carry a hop into the registry for these paths
+        // to share. Core taking ownership left it with no caller, and a
+        // security-policy entry point nothing calls is a trap: the next
+        // person who needs one reaches for it, and a second owner is
+        // exactly how this drifted before. It is gone.
         let mesh_src = include_str!("mesh.rs");
-        let shared_start = mesh_src
-            .find("pub(crate) fn register_rpc_service_channels(")
-            .expect("register_rpc_service_channels must exist");
-        let shared = &mesh_src[shared_start..(shared_start + 600).min(mesh_src.len())];
         assert!(
-            shared.contains("install_rpc_service_defaults(service)"),
-            "regression: `Mesh::register_rpc_service_channels` must delegate to              the registry, not carry its own copy of the H2/H3 policy."
+            !mesh_src.contains("fn register_rpc_service_channels("),
+            "regression: the `Mesh`-shaped registration hop is back. A \
+             path that installs policy WITHOUT serving may well deserve \
+             one — but it must have a caller, and core must still own \
+             the serving case."
         );
 
         // ---- Core owns the install; the SDK paths must not ----
@@ -1565,10 +1569,14 @@ mod auto_register_covers_every_serve_variant {
             env!("CARGO_MANIFEST_DIR"),
             "/../src/adapter/net/mesh_rpc.rs"
         ));
-        let installs = core_src.matches("install_rpc_service_defaults(service)?").count();
+        let installs = core_src
+            .matches("install_rpc_service_defaults(service)?")
+            .count();
         assert_eq!(
             installs, 4,
-            "each of the four core serve seams (unary, server-streaming,              client-streaming, duplex) must install the nRPC channel policy;              found {installs}"
+            "each of the four core serve seams (unary, server-streaming, \
+             client-streaming, duplex) must install the nRPC channel \
+             policy; found {installs}"
         );
 
         for (path, src) in [
@@ -1582,7 +1590,9 @@ mod auto_register_covers_every_serve_variant {
             assert!(
                 !hop.contains("install_rpc_service_defaults(")
                     && !hop.contains("register_rpc_service_channels("),
-                "regression: {path} is pre-registering nRPC channel policy                  again. Both of its serve paths reach a core seam, which                  installs it — a second owner is how this drifted before."
+                "regression: {path} is pre-registering nRPC channel policy \
+                 again. Both of its serve paths reach a core seam, which \
+                 installs it — a second owner is how this drifted before."
             );
             assert!(
                 !hop.contains("registry.insert(") && !hop.contains("registry.insert_prefix("),

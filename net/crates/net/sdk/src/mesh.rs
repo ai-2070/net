@@ -760,51 +760,6 @@ impl Mesh {
         self.channel_configs.insert(config);
     }
 
-    /// Install the standard channel policy for an RPC-style service:
-    /// the exact `<service>.requests` channel and the
-    /// `<service>.replies.` prefix, the latter bound to each caller's
-    /// own origin.
-    ///
-    /// **Install-if-absent, never replace** — an ACL the operator
-    /// registered before serving survives untouched (H2).
-    ///
-    /// The `Mesh`-shaped hop to
-    /// [`ChannelConfigRegistry::install_rpc_service_defaults`], which
-    /// holds the implementation.
-    ///
-    /// It lives on the registry rather than here because the serve paths
-    /// do not share a receiver — `serve_rpc*` (gated on `cortex`) and
-    /// the `aggregator` module (gated on `aggregator`) go through
-    /// `Mesh`, while the org facade's `serve_org_bytes_node` holds an
-    /// `Arc<MeshNode>` for the language bindings. Each copy that existed
-    /// per receiver drifted from the others; the registry is the one
-    /// object all of them already hold.
-    ///
-    /// Gated to match its callers exactly. `Mesh` itself is `net`-only,
-    /// but both hops into here are narrower — `mesh_rpc` needs `cortex`,
-    /// `aggregator` needs `aggregator` — so a `--features net` build has
-    /// no caller and this is genuinely dead there. The org path is NOT a
-    /// caller: it holds a `MeshNode`, so it reaches
-    /// `install_rpc_service_defaults` on the registry directly and needs
-    /// no `Mesh`-shaped hop.
-    ///
-    /// `cfg` rather than `#[allow(dead_code)]` on purpose: the allow
-    /// would also silence the day this genuinely loses its last caller,
-    /// which for a security-policy hop is worth being told about.
-    ///
-    /// Now that core installs this from its own serve seams, the only
-    /// reason to call this is a path that registers policy WITHOUT
-    /// serving — there is currently none, which is why the SDK hops
-    /// that used to call it are empty. Kept so such a path has a
-    /// correct entry point rather than reinventing one.
-    #[cfg(any(feature = "cortex", feature = "aggregator"))]
-    pub(crate) fn register_rpc_service_channels(
-        &self,
-        service: &str,
-    ) -> std::result::Result<(), ::net::adapter::net::mesh_rpc::ServeError> {
-        self.channel_configs.install_rpc_service_defaults(service)
-    }
-
     /// Register a **prefix-matched** channel config. Any channel name
     /// starting with `prefix` that has no exact-match entry resolves
     /// to `config`; when several prefixes match, the longest wins.
@@ -1634,24 +1589,23 @@ fn parse_ack_reason(s: &str) -> Option<AckReason> {
     }
 }
 
-// Gated to match `register_rpc_service_channels`, which these exercise
-// through its `Mesh`-shaped hop. Under `--features net` alone the method
-// does not exist, and the policy it installs is unreachable from `Mesh`
-// — `ChannelConfigRegistry::install_rpc_service_defaults` has its own
-// tests in the `net` crate, so the property stays covered there.
-#[cfg(all(test, feature = "net", any(feature = "cortex", feature = "aggregator")))]
+#[cfg(all(test, feature = "net"))]
 mod rpc_service_channel_registration_tests {
-    //! The aggregator module registers RPC channels through its own
-    //! entry points, and used to carry a hand-copied version of the
+    //! H2 and H3, as seen through a real `Mesh`.
+    //!
+    //! The aggregator module used to carry a hand-copied version of the
     //! auto-registration helper. The copy drifted: it kept replacing
     //! inserts (so it discarded operator ACLs, H2) and never gained the
     //! reply-channel origin binding (so aggregator reply channels stayed
     //! world-subscribable, H3) — both long after those were fixed for
     //! `serve_rpc`.
     //!
-    //! Both callers now route through `register_rpc_service_channels`.
-    //! These pin the two properties ON THE SHARED HELPER, so a future
-    //! divergence fails here rather than in only one subsystem's tests.
+    //! The implementation now lives on `ChannelConfigRegistry` in the
+    //! `net` crate and has its own tests there. What these add is the
+    //! `Mesh` end of it: that a `MeshBuilder`-built mesh hands its node
+    //! the same registry the policy lands in, so a serve through this
+    //! mesh is governed by the entries below. Testing that needs a
+    //! `Mesh`, which is why they stay here.
 
     use super::*;
     use net::adapter::net::identity::EntityKeypair;
@@ -1665,6 +1619,11 @@ mod rpc_service_channel_registration_tests {
             .unwrap()
     }
 
+    /// The registry the mesh installed on its node at build time.
+    fn registry(mesh: &Mesh) -> &ChannelConfigRegistry {
+        &mesh.channel_configs
+    }
+
     /// An operator ACL registered first must survive auto-registration.
     #[tokio::test]
     async fn shared_registration_preserves_an_operator_acl() {
@@ -1676,7 +1635,9 @@ mod rpc_service_channel_registration_tests {
                 .with_token_roots(vec![root.entity_id().clone()]),
         );
 
-        mesh.register_rpc_service_channels("agg.svc");
+        registry(&mesh)
+            .install_rpc_service_defaults("agg.svc")
+            .unwrap();
 
         let cfg = mesh
             .channel_configs
@@ -1695,7 +1656,9 @@ mod rpc_service_channel_registration_tests {
     #[tokio::test]
     async fn shared_registration_binds_the_reply_prefix_to_the_caller_origin() {
         let mesh = mesh().await;
-        mesh.register_rpc_service_channels("agg.svc2");
+        registry(&mesh)
+            .install_rpc_service_defaults("agg.svc2")
+            .unwrap();
 
         let resolved = mesh
             .channel_configs
@@ -1718,7 +1681,9 @@ mod rpc_service_channel_registration_tests {
     #[tokio::test]
     async fn shared_registration_still_installs_defaults() {
         let mesh = mesh().await;
-        mesh.register_rpc_service_channels("agg.svc3");
+        registry(&mesh)
+            .install_rpc_service_defaults("agg.svc3")
+            .unwrap();
 
         assert!(mesh
             .channel_configs

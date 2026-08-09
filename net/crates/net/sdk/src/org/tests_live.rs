@@ -505,7 +505,9 @@ async fn subnet_provider_mesh(
     // SUBNET_AUTH_SDK_PLAN.md §3.5). Without it a strict registry
     // refuses the caller's reply-channel subscribe (`UnknownChannel`).
     if preinstall_channel_defaults {
-        channel_configs.install_rpc_service_defaults(EXPORT_SERVICE);
+        channel_configs
+            .install_rpc_service_defaults(EXPORT_SERVICE)
+            .expect("the fixture's export service name must be installable");
     }
     node.set_channel_configs(channel_configs.clone());
     let node = Arc::new(node);

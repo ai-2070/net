@@ -149,15 +149,17 @@ pub fn install_fold_query_service(
 
 /// Internal: install the standard RPC channel policy for `service`.
 ///
-/// Delegates to [`Mesh::register_rpc_service_channels`] rather than
-/// carrying its own copy. It previously did carry one — mirroring
+/// Installs nothing, on purpose — core does it.
+///
+/// This function once carried its own copy of the policy, mirroring
 /// `serve_rpc`'s pattern by hand because the SDK's registry accessor is
-/// `cortex`-gated while this module is not — and the copy drifted: it
-/// kept using replacing inserts (so it discarded operator ACLs, H2) and
+/// `cortex`-gated while this module is not. The copy drifted: it kept
+/// using replacing inserts (so it discarded operator ACLs, H2) and
 /// never gained the reply-channel origin binding (so aggregator reply
 /// channels stayed world-subscribable, H3), both long after those were
-/// fixed for `serve_rpc`. The shared helper is gated only on `net`, so
-/// there is no longer a reason to duplicate it.
+/// fixed for `serve_rpc`. The implementation now lives on
+/// [`ChannelConfigRegistry::install_rpc_service_defaults`], and core's
+/// serve seams call it, so there is nothing left for this hop to do.
 fn auto_register_rpc_channels(_mesh: &Mesh, _service: &str) {
     // Deliberately empty. `install_query_service` reaches
     // `MeshNode::serve_rpc`, and core installs the policy from that
