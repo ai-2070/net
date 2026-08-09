@@ -85,3 +85,11 @@ net/crates/net/docs/BRAINSTORMING.md
 # than a temp dir so local re-runs reuse the incremental build; the Rust
 # workspace root is net/crates/net, so its own /target rule does not cover this.
 /target/
+
+# setuptools build output for the Python SDK. Tracked once by accident,
+# where it drifted 55 lines from `sdk-py/src/` — it lacked the newer
+# subnet constructor arguments and the `serve_subnet_exported` facade.
+# It never reached a wheel (`[tool.setuptools.packages.find] where =
+# ["src"]`), so it was purely a misleading second copy that a future
+# packaging change could have promoted to the real one.
+net/crates/net/sdk-py/build/

@@ -342,6 +342,8 @@ Treat capability filters as **matchmaking / intent routing, not a security bound
 
 The actual boundary is `require_token` + `token_roots`: a root-anchored `TokenChain` can't be forged, because every link is signature-verified up to a root the channel explicitly trusts. **Any channel that must restrict who publishes or subscribes needs token enforcement — a cap-filter alone restricts nothing.** See `concepts.md` § Permission tokens for the chain rules (root-anchor, leaf-binding, per-link scope).
 
+**`require_token` without `token_roots` is not a strict channel — it is a dead one.** Core rejects every authorization when token enforcement is on and no trusted roots are installed, so the pair is all-or-nothing: set both or neither. Spelt `require_token` + `token_roots` (Rust, Python, Node, C JSON) and `RequireToken` + `TokenRoots` (Go); roots are hex-encoded 32-byte entity ids, 64 hex chars each.
+
 Both checks run at subscription time; on success `(origin_hash, channel_hash)` lands in the `AuthGuard` and the per-packet path is a constant-time bloom probe thereafter. That caching is also why revocation is checked at session/subscription time rather than per packet.
 
 ---

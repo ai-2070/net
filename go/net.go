@@ -111,6 +111,29 @@ type Config struct {
 	Net *NetConfig `json:"net,omitempty"`
 }
 
+// ReliabilityModes are the values NetConfig.Reliability accepts. The
+// vocabulary mirrors the core `ReliabilityConfig` enum; the string
+// boundary is the only place a typo can survive.
+var ReliabilityModes = []string{"none", "light", "full"}
+
+// validateReliability rejects any reliability spelling outside
+// ReliabilityModes. An empty string means "unset" and leaves the core
+// default in place.
+func (c *Config) validateReliability() error {
+	if c == nil || c.Net == nil || c.Net.Reliability == "" {
+		return nil
+	}
+	for _, mode := range ReliabilityModes {
+		if c.Net.Reliability == mode {
+			return nil
+		}
+	}
+	return fmt.Errorf(
+		"invalid reliability %q: use one of %v (values are case-sensitive)",
+		c.Net.Reliability, ReliabilityModes,
+	)
+}
+
 // NetConfig represents Net encrypted UDP adapter configuration.
 type NetConfig struct {
 	// BindAddr is the local bind address (e.g., "127.0.0.1:9000").
@@ -134,7 +157,10 @@ type NetConfig struct {
 	// PublicKey is the hex-encoded public key (required for responder).
 	PublicKey string `json:"public_key,omitempty"`
 
-	// Reliability is the reliability mode: "none" (default), "light", or "full".
+	// Reliability is the reliability mode: "none" (default), "light",
+	// or "full". Any other value — including a case variant like
+	// "FULL" — is rejected by New; it is not silently treated as
+	// "none", which used to turn a typo into fire-and-forget delivery.
 	Reliability string `json:"reliability,omitempty"`
 
 	// HeartbeatIntervalMs is the heartbeat interval in milliseconds (default: 5000).
@@ -200,6 +226,15 @@ type Net struct {
 func New(config *Config) (*Net, error) {
 	var configJSON *C.char
 	if config != nil {
+		// The C parser rejects an unrecognized reliability value, but
+		// it can only answer with a generic init failure. Check here so
+		// a typo names itself: `Reliability` is a plain string field
+		// with no compiler check behind it, and mapping an unknown
+		// value to "none" used to downgrade delivery from
+		// acknowledged/retransmitted to fire-and-forget in silence.
+		if err := config.validateReliability(); err != nil {
+			return nil, err
+		}
 		data, err := json.Marshal(config)
 		if err != nil {
 			return nil, fmt.Errorf("failed to marshal config: %w", err)
@@ -323,7 +358,20 @@ func (bs *Net) Ingest(event interface{}) error {
 
 // IngestBatch ingests multiple events by marshaling them to JSON.
 //
-// Returns the number of successfully ingested events.
+// Returns the number of successfully ingested events. A value whose
+// `json.Marshal` fails is skipped and the rest of the batch is still
+// ingested, so the count can be lower than `len(events)` for two
+// different reasons — a marshal failure or a ring-buffer drop — which
+// this signature cannot distinguish.
+//
+// Use IngestBatchChecked when that distinction matters. It is the
+// same work with the marshal failure reported instead of swallowed,
+// and it is the shape Rust, TypeScript and Python already have.
+//
+// This deliberately does NOT delegate to IngestBatchChecked. Doing so
+// made one unserializable element discard the whole batch and return
+// 0, silently — a strictly worse answer than the documented skip, and
+// invisible at a call site with no error to inspect.
 func (bs *Net) IngestBatch(events []interface{}) int {
 	jsons := make([]string, 0, len(events))
 	for _, e := range events {
@@ -336,6 +384,117 @@ func (bs *Net) IngestBatch(events []interface{}) int {
 	return bs.IngestRawBatch(jsons)
 }
 
+// IngestBatchChecked marshals and ingests a batch, reporting the first
+// value that could not be serialized.
+//
+// IngestBatch skips values whose `json.Marshal` fails and ingests the
+// rest, returning only the accepted count — so a caller cannot tell a
+// serialization omission from a ring-buffer drop. The two need
+// different responses: a drop is backpressure and may be retried, a
+// marshal failure is a bug in the payload that will fail identically
+// forever. Rust, TypeScript and Python all serialize the whole batch
+// before ingesting, so a bad element aborts instead of silently
+// deleting itself.
+//
+// Nothing is ingested when serialization fails: the error names the
+// index, and the returned count is 0.
+func (bs *Net) IngestBatchChecked(events []interface{}) (int, error) {
+	jsons := make([]string, 0, len(events))
+	for i, e := range events {
+		data, err := json.Marshal(e)
+		if err != nil {
+			return 0, fmt.Errorf("marshal event at index %d: %w", i, err)
+		}
+		jsons = append(jsons, string(data))
+	}
+	return bs.IngestRawBatch(jsons), nil
+}
+
+// PollOptions carries the full poll request shape.
+//
+// Go previously hard-coded limit + cursor, which was the only shape
+// the C parser read — the other three fields are on the Rust,
+// TypeScript and Python poll surfaces and were unreachable from here.
+type PollOptions struct {
+	// Limit is the maximum number of events to return.
+	Limit int
+
+	// Cursor resumes from a previous poll. Empty means from the start.
+	Cursor string
+
+	// Ordering is "none" (default, fastest) or "insertion_ts"
+	// (cross-shard ordering). Any other value is rejected — it is not
+	// silently treated as "none".
+	Ordering string
+
+	// Filter is a JSON predicate object, e.g.
+	// `{"path":"kind","value":"lidar"}`. Empty means no filter.
+	//
+	// Embedded verbatim into the request, so it must be a
+	// well-formed JSON *object*. PollWith checks that before the cgo
+	// call: a malformed value would otherwise splice into the request
+	// body and come back as a generic InvalidJson naming nothing —
+	// and a bare scalar or array would reach a parser that only
+	// accepts an object.
+	Filter string
+
+	// Shards restricts the poll to specific shard ids. Nil means all
+	// shards. Note inbound stream traffic lands on
+	// `stream_id % num_shards`, so a single-shard poll sees only the
+	// stream ids congruent to it.
+	Shards []uint16
+}
+
+// OrderingModes are the values PollOptions.Ordering accepts.
+var OrderingModes = []string{"none", "insertion_ts"}
+
+func (o *PollOptions) validate() error {
+	if err := o.validateFilter(); err != nil {
+		return err
+	}
+	if o.Ordering == "" {
+		return nil
+	}
+	for _, mode := range OrderingModes {
+		if o.Ordering == mode {
+			return nil
+		}
+	}
+	return fmt.Errorf(
+		"invalid ordering %q: use one of %v (values are case-sensitive)",
+		o.Ordering, OrderingModes,
+	)
+}
+
+// validateFilter rejects a Filter that is not a well-formed JSON
+// object.
+//
+// Filter is spliced into the request body verbatim — it has to be, so
+// the C parser receives a nested object rather than a string. That
+// makes it the one PollOptions field where a bad value corrupts the
+// whole request instead of just itself: `{"path":` produces malformed
+// JSON, and `"lidar"` or `[1,2]` produce well-formed JSON the parser
+// then refuses. Both come back as a bare InvalidJson that names
+// nothing, and Ordering already refuses its bad values here by name.
+func (o *PollOptions) validateFilter() error {
+	if o.Filter == "" {
+		return nil
+	}
+	var probe map[string]interface{}
+	if err := json.Unmarshal([]byte(o.Filter), &probe); err != nil {
+		return fmt.Errorf(
+			"invalid filter %q: must be a JSON object such as "+
+				`{"path":"kind","value":"lidar"}: %w`,
+			o.Filter, err,
+		)
+	}
+	if probe == nil {
+		// `null` unmarshals into a nil map without error.
+		return fmt.Errorf("invalid filter %q: must be a JSON object, not null", o.Filter)
+	}
+	return nil
+}
+
 // Poll retrieves events from the bus.
 //
 // Parameters:
@@ -343,7 +502,17 @@ func (bs *Net) IngestBatch(events []interface{}) int {
 //   - cursor: Optional cursor from a previous poll for pagination.
 //
 // Returns the poll response containing events and pagination info.
+// Use PollWith for ordering, filtering, or shard selection.
 func (bs *Net) Poll(limit int, cursor string) (*PollResponse, error) {
+	return bs.PollWith(PollOptions{Limit: limit, Cursor: cursor})
+}
+
+// PollWith retrieves events using the full request shape.
+func (bs *Net) PollWith(opts PollOptions) (*PollResponse, error) {
+	if err := opts.validate(); err != nil {
+		return nil, err
+	}
+
 	bs.mu.RLock()
 	defer bs.mu.RUnlock()
 
@@ -358,7 +527,7 @@ func (bs *Net) Poll(limit int, cursor string) (*PollResponse, error) {
 	// boundary. Hand-rolling produces a single null-terminated
 	// byte slice and passes it directly via the Go-managed
 	// pointer — kept alive across the cgo call by KeepAlive.
-	cRequestBuf := buildPollRequest(limit, cursor)
+	cRequestBuf := buildPollRequest(opts)
 	cRequest := (*C.char)(unsafe.Pointer(&cRequestBuf[0]))
 
 	// Allocate output buffer (start with 64KB, grow if needed)
@@ -413,15 +582,37 @@ func (bs *Net) Poll(limit int, cursor string) (*PollResponse, error) {
 // quotes / control bytes / backslashes in a future cursor format
 // stay correctly encoded. The simple-limit-only path skips Marshal
 // entirely.
-func buildPollRequest(limit int, cursor string) []byte {
-	// Capacity guess: prefix + ~20 digits for limit + cursor block + close + null.
-	buf := make([]byte, 0, 32+len(cursor)+8)
+func buildPollRequest(opts PollOptions) []byte {
+	// Capacity guess: prefix + ~20 digits for limit + cursor block +
+	// the optional tail + close + null.
+	buf := make([]byte, 0, 32+len(opts.Cursor)+len(opts.Filter)+len(opts.Ordering)+24)
 	buf = append(buf, `{"limit":`...)
-	buf = strconv.AppendInt(buf, int64(limit), 10)
-	if cursor != "" {
+	buf = strconv.AppendInt(buf, int64(opts.Limit), 10)
+	if opts.Cursor != "" {
 		buf = append(buf, `,"cursor":`...)
-		cursorJSON, _ := json.Marshal(cursor)
+		cursorJSON, _ := json.Marshal(opts.Cursor)
 		buf = append(buf, cursorJSON...)
+	}
+	if opts.Ordering != "" {
+		buf = append(buf, `,"ordering":`...)
+		orderingJSON, _ := json.Marshal(opts.Ordering)
+		buf = append(buf, orderingJSON...)
+	}
+	if opts.Filter != "" {
+		// Already a JSON object; embed verbatim rather than as a
+		// string, matching the C parser's nested-object shape.
+		buf = append(buf, `,"filter":`...)
+		buf = append(buf, opts.Filter...)
+	}
+	if len(opts.Shards) > 0 {
+		buf = append(buf, `,"shards":[`...)
+		for i, shard := range opts.Shards {
+			if i > 0 {
+				buf = append(buf, ',')
+			}
+			buf = strconv.AppendUint(buf, uint64(shard), 10)
+		}
+		buf = append(buf, ']')
 	}
 	buf = append(buf, '}', 0)
 	return buf

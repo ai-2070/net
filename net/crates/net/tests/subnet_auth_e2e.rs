@@ -2265,7 +2265,9 @@ async fn channel_authority_remains_independent_of_subnet_authority() {
         // provider phase below rides on must be registered too — the
         // fixture registry would otherwise answer UnknownChannel for
         // the reply channel before admission is ever consulted.
-        registry.install_rpc_service_defaults("vehicle-b.protected.telemetry");
+        registry
+            .install_rpc_service_defaults("vehicle-b.protected.telemetry")
+            .expect("the fixture's service name must be installable");
         node.set_channel_configs(registry);
         node.set_token_cache(Arc::new(TokenCache::new()));
         Arc::new(node)

@@ -252,14 +252,20 @@ pub struct Stats {
     pub events_ingested: u64,
     #[pyo3(get)]
     pub events_dropped: u64,
+    /// Batches handed to the adapter. The direct observer for
+    /// dispatch progress, and the only counter that moves under the
+    /// default `drop_oldest` mode — where the producer always
+    /// succeeds and `events_dropped` never increments.
+    #[pyo3(get)]
+    pub batches_dispatched: u64,
 }
 
 #[pymethods]
 impl Stats {
     fn __repr__(&self) -> String {
         format!(
-            "Stats(events_ingested={}, events_dropped={})",
-            self.events_ingested, self.events_dropped
+            "Stats(events_ingested={}, events_dropped={}, batches_dispatched={})",
+            self.events_ingested, self.events_dropped, self.batches_dispatched
         )
     }
 }
@@ -595,10 +601,21 @@ impl Net {
 
                 // Apply optional settings
                 if let Some(reliability) = net_reliability {
+                    // Fail closed, like `net_role` above. Mapping an
+                    // unrecognized value to `None` silently downgraded
+                    // delivery from acknowledged/retransmitted to
+                    // fire-and-forget, so a typo like "ful" or "FULL"
+                    // constructed successfully and lost data quietly.
                     net_config = net_config.with_reliability(match reliability {
+                        "none" => ReliabilityConfig::None,
                         "light" => ReliabilityConfig::Light,
                         "full" => ReliabilityConfig::Full,
-                        _ => ReliabilityConfig::None,
+                        other => {
+                            return Err(PyValueError::new_err(format!(
+                                "Invalid net_reliability: {}. Use 'none', 'light', or 'full'",
+                                other
+                            )));
+                        }
                     });
                 }
                 if let Some(interval_ms) = net_heartbeat_interval_ms {
@@ -815,7 +832,30 @@ impl Net {
             events_dropped: stats
                 .events_dropped
                 .load(std::sync::atomic::Ordering::Relaxed),
+            batches_dispatched: stats
+                .batches_dispatched
+                .load(std::sync::atomic::Ordering::Relaxed),
         })
+    }
+
+    /// Flush pending batches to the adapter.
+    ///
+    /// A reusable delivery barrier. Python had no way to wait for
+    /// in-flight batches short of `shutdown()`, which is terminal —
+    /// so "publish, make sure it landed, keep publishing" was
+    /// inexpressible here while Rust, Node, Go and C all had it.
+    fn flush(&self) -> PyResult<()> {
+        // Holds the read guard across `block_on`, matching `shutdown`
+        // below (which holds the write guard). A concurrent shutdown
+        // waits for the flush rather than racing it, which is the
+        // ordering a caller flushing before teardown wants anyway.
+        let bus_guard = self.bus.read();
+        let bus = bus_guard
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("EventBus has been shut down"))?;
+        self.runtime
+            .block_on(bus.flush())
+            .map_err(|e| PyRuntimeError::new_err(format!("flush: {}", e)))
     }
 
     /// Gracefully shutdown the event bus.
@@ -1148,6 +1188,18 @@ mod mesh_bindings {
         /// at construction; `register_channel` inserts into this same
         /// Arc so the core's membership-ACL path sees every add.
         channel_configs: Arc<ChannelConfigRegistry>,
+        /// Which shard `poll` starts its sweep from, advanced once per
+        /// call.
+        ///
+        /// Starting at 0 every time and stopping at `limit` is the
+        /// shard-0 bug in a thinner disguise: a busy shard 0 that can
+        /// fill the limit alone means shards 1..n are never reached, so
+        /// a quiet stream on shard 3 stays invisible for as long as
+        /// shard 0 is saturated. Rotating bounds that wait at
+        /// `num_shards` calls.
+        ///
+        /// `Relaxed`: a fairness hint, not a synchronization point.
+        recv_cursor: Arc<std::sync::atomic::AtomicU16>,
     }
 
     /// Build the core `MatchCriteria` from flat Python kwargs (so callers
@@ -1472,6 +1524,7 @@ mod mesh_bindings {
                 #[cfg(feature = "org")]
                 subnet_exports: subnet_exports_map,
                 channel_configs,
+                recv_cursor: Arc::new(std::sync::atomic::AtomicU16::new(0)),
             })
         }
 
@@ -1801,27 +1854,68 @@ mod mesh_bindings {
             Ok(true)
         }
 
-        /// Poll for received events.
-        fn poll(&self, limit: usize) -> PyResult<Vec<StoredEvent>> {
+        /// Number of shards inbound stream traffic is spread across.
+        ///
+        /// Inbound events land on ``stream_id % num_shards``, so this
+        /// is what makes a targeted ``poll_shard`` possible.
+        fn num_shards(&self) -> PyResult<u16> {
+            Ok(self.get_node()?.num_shards())
+        }
+
+        /// The inbound shard a given stream's events land on.
+        fn shard_for_stream(&self, stream_id: u64) -> PyResult<u16> {
+            Ok(self.get_node()?.shard_for_stream(stream_id))
+        }
+
+        /// Poll a specific inbound shard.
+        ///
+        /// Pair with ``shard_for_stream`` when you want one stream
+        /// rather than a merge across all of them.
+        fn poll_shard(&self, shard_id: u16, limit: usize) -> PyResult<Vec<StoredEvent>> {
             let node = self.get_node()?;
             let result = self
                 .runtime
-                .block_on(node.poll_shard(0, None, limit))
+                .block_on(node.poll_shard(shard_id, None, limit))
                 .map_err(|e| PyRuntimeError::new_err(format!("poll: {}", e)))?;
+            Ok(Self::map_events(result.events))
+        }
 
-            Ok(result
-                .events
-                .into_iter()
-                .map(|e| {
-                    let raw = e.raw_str().unwrap_or("").to_string();
-                    StoredEvent {
-                        id: e.id,
-                        raw,
-                        insertion_ts: e.insertion_ts,
-                        shard_id: e.shard_id,
-                    }
-                })
-                .collect())
+        /// Poll for received events across **every** shard.
+        ///
+        /// This polled shard 0 only. Inbound traffic is placed on
+        /// ``stream_id % num_shards``, so at the default of four
+        /// shards a caller silently saw only the stream ids congruent
+        /// to 0 — three quarters of ordinary stream ids were
+        /// unreadable through this binding.
+        ///
+        /// The sweep starts from a rotating shard, so no shard can be
+        /// starved by a busier one and events are not returned in
+        /// shard order.
+        fn poll(&self, limit: usize) -> PyResult<Vec<StoredEvent>> {
+            let node = self.get_node()?;
+            let shards = node.num_shards().max(1);
+            // Rotate the starting shard so a saturated shard 0 cannot
+            // starve the rest — see `recv_cursor`. Events therefore
+            // arrive in no fixed shard order; use `poll_shard` with
+            // `shard_for_stream` when a specific stream is wanted.
+            let start = self
+                .recv_cursor
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                % shards;
+            let mut events = Vec::new();
+            for offset in 0..shards {
+                if events.len() >= limit {
+                    break;
+                }
+                let shard = (start + offset) % shards;
+                let remaining = limit - events.len();
+                let result = self
+                    .runtime
+                    .block_on(node.poll_shard(shard, None, remaining))
+                    .map_err(|e| PyRuntimeError::new_err(format!("poll: {}", e)))?;
+                events.extend(result.events);
+            }
+            Ok(Self::map_events(events))
         }
 
         /// Add a route.
@@ -2103,7 +2197,7 @@ mod mesh_bindings {
         /// arrives or the membership-ack timeout elapses.
         ///
         /// Optional `token` is the serialized `PermissionToken`
-        /// bytes (161 bytes) — attach it when the publisher sets
+        /// bytes (169 bytes) — attach it when the publisher sets
         /// `require_token=True` on the channel, or when the
         /// caller's caps don't satisfy `subscribe_caps` on their
         /// own.
@@ -3020,6 +3114,22 @@ mod mesh_bindings {
                 .ok_or_else(|| PyRuntimeError::new_err("MeshNode has been shut down"))
         }
 
+        /// Shared projection for both poll paths.
+        fn map_events(events: Vec<net::event::StoredEvent>) -> Vec<StoredEvent> {
+            events
+                .into_iter()
+                .map(|e| {
+                    let raw = e.raw_str().unwrap_or("").to_string();
+                    StoredEvent {
+                        id: e.id,
+                        raw,
+                        insertion_ts: e.insertion_ts,
+                        shard_id: e.shard_id,
+                    }
+                })
+                .collect()
+        }
+
         /// Clone the `Arc<MeshNode>` backing this `NetMesh`. Used
         /// by sibling-feature modules (`compute`, `mesh_rpc`) to
         /// share the live mesh node without opening a second
@@ -3666,6 +3776,7 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<identity::Identity>()?;
         m.add_function(wrap_pyfunction!(identity::parse_token, m)?)?;
         m.add_function(wrap_pyfunction!(identity::verify_token, m)?)?;
+        m.add_function(wrap_pyfunction!(identity::verify_signature, m)?)?;
         m.add_function(wrap_pyfunction!(identity::token_is_expired, m)?)?;
         m.add_function(wrap_pyfunction!(identity::delegate_token, m)?)?;
         m.add_function(wrap_pyfunction!(identity::channel_hash, m)?)?;

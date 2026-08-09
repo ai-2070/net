@@ -315,13 +315,15 @@ impl napi::bindgen_prelude::FromNapiValue for DaemonBridgeTsfns {
         // FFI roundtrip.
         let required_caps_js: Option<crate::capabilities::CapabilitySetJs> =
             obj.get_named_property("requiredCapabilities")?;
-        let required_capabilities =
-            required_caps_js.map(crate::capabilities::capability_set_from_js);
+        let required_capabilities = required_caps_js
+            .map(crate::capabilities::capability_set_from_js)
+            .transpose()?;
 
         let optional_caps_js: Option<crate::capabilities::CapabilitySetJs> =
             obj.get_named_property("optionalCapabilities")?;
-        let optional_capabilities =
-            optional_caps_js.map(crate::capabilities::capability_set_from_js);
+        let optional_capabilities = optional_caps_js
+            .map(crate::capabilities::capability_set_from_js)
+            .transpose()?;
 
         Ok(DaemonBridgeTsfns {
             process,

@@ -136,9 +136,10 @@ taxonomy is in `error-codes.md`.
 
 `node.shutdown().await?` is reference-based and **tolerates outstanding
 `subscribe` stream clones** — both `subscribe()` and `subscribe_typed()` clone
-the inner `Arc<EventBus>`. If references are genuinely still held, shutdown
-returns `SdkError::Adapter("cannot shutdown: outstanding references exist")`
-rather than hanging. This is the one binding that reports that condition; see
+the inner `Arc<EventBus>`. There is no "outstanding references exist" error to
+handle: `shutdown_via_ref` is idempotent and runs the shutdown work regardless
+of strong-ref count, and the surviving clones observe the bus as shut down on
+their next operation. Nothing hangs and nothing needs draining first. See
 `runtime.md` § "Rust: subscribe streams and shutdown".
 
 Call `flush()` before `shutdown()` if you cannot tolerate losing in-flight
@@ -146,10 +147,18 @@ batches.
 
 ## Gaps
 
-- **No `node.channel()` API.** Rust has only the raw firehose. To split topics,
-  use distinct types or enum variants in the payload and match on the consumer,
-  or run separate `Net` instances per logical channel. This is the most common
-  thing ported wrongly from the TypeScript or Python docs.
+- **No `node.channel()` API on the bus.** For splitting topics *within one
+  node*, Rust has only the raw firehose: use distinct types or enum variants in
+  the payload and match on the consumer, or run separate `Net` instances per
+  logical channel. This is the most common thing ported wrongly from the
+  TypeScript or Python docs.
+
+  It is **not** a distributed-channel gap. `Mesh::register_channel`,
+  `subscribe_channel`, `publish_channel`, and `publish_many` are all here — and
+  `register_channel_prefix`, `TokenChain` subscription, and queue-group
+  membership are here and *only* here. If you ported a `node.channel()` snippet
+  and want cross-process delivery, the mesh surface is what you actually
+  wanted; `node.channel()` never delivered across processes either.
 - Everything else: `bindings/coverage.md`.
 
 ## Where to look when this page is not enough
@@ -164,8 +173,11 @@ batches.
 
 ## Never infer from another binding
 
-- Rust has **no named channels**. `node.channel(...)` in a TypeScript or Python
-  snippet has no Rust equivalent.
+- Rust has no **tagged-topic** wrapper. `node.channel(...)` in a TypeScript or
+  Python snippet has no Rust equivalent — but it was never distributed pub/sub
+  in those bindings either, so do not reach for `Mesh::*_channel` as a
+  translation without first checking that cross-process delivery is what the
+  snippet needed. (It has the richest distributed-channel surface of the five.)
 - Discovery returns **one** node here (`find_best_node`); Node and Python return
   a list from `findNodes` / `find_nodes` and make you choose.
 - nRPC is a method on the mesh here (`call_typed`), not a handle you construct.

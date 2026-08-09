@@ -372,8 +372,17 @@ pub struct StoredEvent {
     /// fidelity should prefer this over `raw`. For UTF-8 payloads the
     /// two fields carry the same content in different representations.
     pub raw_bytes: Buffer,
-    /// Insertion timestamp (nanoseconds)
-    pub insertion_ts: i64,
+    /// Insertion timestamp (nanoseconds).
+    ///
+    /// `BigInt`, not `number`. Unix-epoch nanoseconds crossed
+    /// JavaScript's exact-integer ceiling (`2^53 - 1`) around 104 days
+    /// past 1970, so *every* realistic value on this field was already
+    /// losing its low-order digits — `9007199254740993` came back as
+    /// `9007199254740992`. The cast also went through `i64`, which is
+    /// a second narrowing of a `u64`. Node already uses `BigInt` for
+    /// large counters and stream timestamps; this field was the
+    /// inconsistency.
+    pub insertion_ts: BigInt,
     /// Shard ID
     pub shard_id: u32,
 }
@@ -394,8 +403,17 @@ pub struct PollResponse {
 pub struct IngestResult {
     /// Shard the event was assigned to
     pub shard_id: u32,
-    /// Insertion timestamp
-    pub timestamp: i64,
+    /// Insertion timestamp (nanoseconds).
+    ///
+    /// `BigInt`, not `number`. Unix-epoch nanoseconds crossed
+    /// JavaScript's exact-integer ceiling (`2^53 - 1`) around 104 days
+    /// past 1970, so *every* realistic value on this field was already
+    /// losing its low-order digits — `9007199254740993` came back as
+    /// `9007199254740992`. The cast also went through `i64`, which is
+    /// a second narrowing of a `u64`. Node already uses `BigInt` for
+    /// large counters and stream timestamps; this field was the
+    /// inconsistency.
+    pub timestamp: BigInt,
 }
 
 /// Ingestion statistics.
@@ -412,6 +430,11 @@ pub struct Stats {
     pub events_ingested: BigInt,
     /// Events dropped due to backpressure
     pub events_dropped: BigInt,
+    /// Batches handed to the adapter. The direct observer for
+    /// dispatch progress, and the only counter that moves under the
+    /// default `drop_oldest` mode — where the producer always
+    /// succeeds and `eventsDropped` never increments.
+    pub batches_dispatched: BigInt,
 }
 
 /// High-performance event bus for Node.js.
@@ -551,7 +574,7 @@ impl Net {
 
         Ok(IngestResult {
             shard_id: shard_id as u32,
-            timestamp: ts as i64,
+            timestamp: BigInt::from(ts),
         })
     }
 
@@ -681,7 +704,7 @@ impl Net {
                     id: e.id,
                     raw,
                     raw_bytes,
-                    insertion_ts: e.insertion_ts as i64,
+                    insertion_ts: BigInt::from(e.insertion_ts),
                     shard_id: e.shard_id as u32,
                 }
             })
@@ -723,6 +746,11 @@ impl Net {
             events_dropped: BigInt::from(
                 stats
                     .events_dropped
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            batches_dispatched: BigInt::from(
+                stats
+                    .batches_dispatched
                     .load(std::sync::atomic::Ordering::Relaxed),
             ),
         })
@@ -977,10 +1005,21 @@ fn build_config(options: Option<EventBusOptions>) -> Result<EventBusConfig> {
 
                 // Apply optional settings
                 if let Some(reliability) = net.reliability {
+                    // Fail closed, like `role` above. Mapping an
+                    // unrecognized value to `None` silently downgraded
+                    // delivery from acknowledged/retransmitted to
+                    // fire-and-forget, so a typo like "ful" or "FULL"
+                    // constructed successfully and lost data quietly.
                     net_config = net_config.with_reliability(match reliability.as_str() {
+                        "none" => ReliabilityConfig::None,
                         "light" => ReliabilityConfig::Light,
                         "full" => ReliabilityConfig::Full,
-                        _ => ReliabilityConfig::None,
+                        other => {
+                            return Err(Error::from_reason(format!(
+                                "Invalid reliability: {}. Use 'none', 'light', or 'full'",
+                                other
+                            )));
+                        }
                     });
                 }
                 if let Some(interval_ms) = net.heartbeat_interval_ms {
@@ -1327,11 +1366,12 @@ mod mesh_bindings {
                 cfg = cfg.with_rate_limit(pps);
             }
             if let Some(filter) = self.publish_caps {
-                cfg = cfg.with_publish_caps(crate::capabilities::capability_filter_from_js(filter));
+                cfg =
+                    cfg.with_publish_caps(crate::capabilities::capability_filter_from_js(filter)?);
             }
             if let Some(filter) = self.subscribe_caps {
-                cfg =
-                    cfg.with_subscribe_caps(crate::capabilities::capability_filter_from_js(filter));
+                cfg = cfg
+                    .with_subscribe_caps(crate::capabilities::capability_filter_from_js(filter)?);
             }
             Ok(cfg)
         }
@@ -1496,6 +1536,21 @@ mod mesh_bindings {
     #[napi]
     pub struct NetMesh {
         node: Arc<ArcSwapOption<MeshNode>>,
+        /// The Tokio runtime this mesh was created on, captured in
+        /// `create()`.
+        ///
+        /// `create()` is `async`, so napi-rs invokes it *inside* the
+        /// napi runtime and `Handle::current()` there is exactly the
+        /// runtime the mesh's background tasks live on. Synchronous
+        /// `#[napi]` methods run on the JS thread instead, which is
+        /// not a Tokio worker — `Handle::current()` panics there
+        /// ("there is no reactor running"). So sync methods that
+        /// register work spawning tasks (nRPC serve) clone this
+        /// handle and `.enter()` it rather than asking for a current
+        /// one. Runtime ownership stays with the binding; nothing
+        /// downstream constructs a private runtime or guesses.
+        #[cfg_attr(not(feature = "cortex"), allow(dead_code))]
+        runtime: tokio::runtime::Handle,
         /// Channel config registry shared with the underlying MeshNode.
         /// `register_channel` inserts here; the node's membership ACL
         /// path reads from this same registry.
@@ -1665,6 +1720,10 @@ mod mesh_bindings {
 
             Ok(NetMesh {
                 node: Arc::new(ArcSwapOption::from_pointee(node)),
+                // Captured here, and only here: this `async fn` is the
+                // one place in the binding guaranteed to be running on
+                // the napi runtime.
+                runtime: tokio::runtime::Handle::current(),
                 channel_configs,
                 #[cfg(feature = "org")]
                 subnet_exports,
@@ -1796,18 +1855,71 @@ mod mesh_bindings {
             Ok(true)
         }
 
-        /// Poll for received events.
+        /// Number of shards inbound stream traffic is spread across.
+        ///
+        /// Inbound events land on `stream_id % numShards`, so this is
+        /// what makes a targeted `pollShard` possible.
+        #[napi]
+        pub fn num_shards(&self) -> Result<u32> {
+            let guard = self.load_node()?;
+            Ok(guard.as_ref().unwrap().num_shards() as u32)
+        }
+
+        /// The inbound shard a given stream's events land on.
+        #[napi]
+        pub fn shard_for_stream(&self, stream_id: BigInt) -> Result<u32> {
+            let guard = self.load_node()?;
+            let (_, id, _) = stream_id.get_u64();
+            Ok(guard.as_ref().unwrap().shard_for_stream(id) as u32)
+        }
+
+        /// Poll a specific inbound shard.
+        ///
+        /// Pair with `shardForStream` when you want one stream rather
+        /// than a merge across all of them.
+        #[napi]
+        pub async fn poll_shard(&self, shard_id: u32, limit: u32) -> Result<Vec<StoredEvent>> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            let shard = u16::try_from(shard_id)
+                .map_err(|_| Error::from_reason(format!("shard id {shard_id} exceeds u16")))?;
+            let result = node
+                .poll_shard(shard, None, limit as usize)
+                .await
+                .map_err(|e| Error::from_reason(format!("poll failed: {}", e)))?;
+            Ok(Self::map_events(result.events))
+        }
+
+        /// Poll for received events across **every** shard.
+        ///
+        /// This polled shard 0 only. Inbound traffic is placed on
+        /// `stream_id % numShards`, so at the default of four shards
+        /// a caller silently saw only the stream ids congruent to 0 —
+        /// three quarters of ordinary stream ids were unreadable
+        /// through this binding.
         #[napi]
         pub async fn poll(&self, limit: u32) -> Result<Vec<StoredEvent>> {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
-            let result = node
-                .poll_shard(0, None, limit as usize)
-                .await
-                .map_err(|e| Error::from_reason(format!("poll failed: {}", e)))?;
+            let shards = node.num_shards().max(1);
+            let mut events = Vec::new();
+            for shard in 0..shards {
+                if events.len() >= limit as usize {
+                    break;
+                }
+                let remaining = limit as usize - events.len();
+                let result = node
+                    .poll_shard(shard, None, remaining)
+                    .await
+                    .map_err(|e| Error::from_reason(format!("poll failed: {}", e)))?;
+                events.extend(result.events);
+            }
+            Ok(Self::map_events(events))
+        }
 
-            Ok(result
-                .events
+        /// Shared projection for both poll paths.
+        fn map_events(events: Vec<net::event::StoredEvent>) -> Vec<StoredEvent> {
+            events
                 .into_iter()
                 .map(|e| {
                     // Preserve binary payloads in `raw_bytes`. `raw` is
@@ -1821,11 +1933,11 @@ mod mesh_bindings {
                         id: e.id,
                         raw,
                         raw_bytes,
-                        insertion_ts: e.insertion_ts as i64,
+                        insertion_ts: BigInt::from(e.insertion_ts),
                         shard_id: e.shard_id as u32,
                     }
                 })
-                .collect())
+                .collect()
         }
 
         /// Add a route to a destination node.
@@ -2017,7 +2129,7 @@ mod mesh_bindings {
         /// or the membership-ack timeout elapses.
         ///
         /// Optional `token` is the serialized `PermissionToken` bytes
-        /// (161 bytes) — attach it when the publisher set
+        /// (169 bytes) — attach it when the publisher set
         /// `requireToken = true` on the channel, or when the caller's
         /// caps don't satisfy `subscribeCaps` on their own.
         #[napi]
@@ -2112,7 +2224,7 @@ mod mesh_bindings {
         ) -> Result<()> {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
-            let core = crate::capabilities::capability_set_from_js(caps);
+            let core = crate::capabilities::capability_set_from_js(caps)?;
             node.announce_capabilities(core)
                 .await
                 .map_err(|e| Error::from_reason(format!("capability: {}", e)))
@@ -2128,7 +2240,7 @@ mod mesh_bindings {
         ) -> Result<Vec<BigInt>> {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
-            let core = crate::capabilities::capability_filter_from_js(filter);
+            let core = crate::capabilities::capability_filter_from_js(filter)?;
             Ok(node
                 .find_nodes_by_filter(&core)
                 .into_iter()
@@ -2149,7 +2261,7 @@ mod mesh_bindings {
         ) -> Result<Vec<BigInt>> {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
-            let core = crate::capabilities::capability_filter_from_js(filter);
+            let core = crate::capabilities::capability_filter_from_js(filter)?;
             let owned = crate::capabilities::scope_filter_from_js(scope)?;
             let ids = crate::capabilities::with_scope_filter(&owned, |f| {
                 node.find_nodes_by_filter_scoped(&core, f)
@@ -2346,6 +2458,19 @@ mod mesh_bindings {
                 Some(arc) => Ok(arc.clone()),
                 None => Err(Error::from_reason("MeshNode has been shut down")),
             }
+        }
+
+        /// The runtime `create()` ran on, for sibling modules whose
+        /// synchronous `#[napi]` methods spawn tasks.
+        ///
+        /// Cloning a `Handle` is cheap and does not keep the runtime
+        /// alive by itself; napi's runtime lives for the process. The
+        /// point is to name *which* runtime, deterministically,
+        /// instead of asking the JS thread for a current one it does
+        /// not have.
+        #[cfg(feature = "cortex")]
+        pub(crate) fn runtime_handle(&self) -> tokio::runtime::Handle {
+            self.runtime.clone()
         }
 
         /// The checked named-export map this mesh was created with

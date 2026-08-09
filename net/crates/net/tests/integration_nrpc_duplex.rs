@@ -627,3 +627,91 @@ async fn duplex_window_grant_unblocks_blocked_send() {
     );
     assert_eq!(collected, vec!["total:3".to_string()]);
 }
+
+/// A completed `call_streaming` must not disturb a later
+/// `call_duplex` — including across a different pair of nodes in the
+/// same process.
+///
+/// Written while chasing a terminal-frame stall that presented as
+/// exactly this sequence breaking through the Node binding. It was not
+/// the substrate — this passed then and passes now, with one pair and
+/// with two — which is what localised the defect to the napi layer,
+/// where the JS-side response sink was being released by garbage
+/// collection rather than when the handler finished.
+///
+/// Kept because that is worth stating permanently: if a future change
+/// does break the core sequence, it fails here on its own terms rather
+/// than being mistaken for a binding problem.
+#[tokio::test]
+async fn a_completed_streaming_call_does_not_disturb_a_later_duplex() {
+    use net::adapter::net::cortex::RpcStreamingHandler;
+
+    struct Emit3;
+    #[async_trait::async_trait]
+    impl RpcStreamingHandler for Emit3 {
+        async fn call(
+            &self,
+            _ctx: net::adapter::net::cortex::RpcContext,
+            responses: RpcResponseSink,
+        ) -> Result<(), RpcHandlerError> {
+            for i in 0..3 {
+                responses.send(format!("s-{i}").into_bytes());
+            }
+            Ok(())
+        }
+    }
+
+    // Phase 1 gets its own pair, exactly as the Node cases do — the
+    // poison crossed meshes there, so it would have to cross them here.
+    let server = build_node().await;
+    let caller = build_node().await;
+    handshake_pair(&caller, &server).await;
+    let _s1 = server
+        .serve_rpc_streaming("ss", Arc::new(Emit3))
+        .expect("serve_rpc_streaming");
+
+    let mut stream = caller
+        .call_streaming(
+            server.node_id(),
+            "ss",
+            Bytes::from_static(b"go"),
+            CallOptions::default(),
+        )
+        .await
+        .expect("call_streaming");
+    let mut got = Vec::new();
+    while let Some(item) = stream.next().await {
+        got.push(String::from_utf8(item.expect("chunk").to_vec()).unwrap());
+    }
+    assert_eq!(got, vec!["s-0", "s-1", "s-2"], "streaming phase");
+    drop(stream);
+
+    // Phase 2: a fresh pair, a duplex call, drained to EOF.
+    let server = build_node().await;
+    let caller = build_node().await;
+    handshake_pair(&caller, &server).await;
+    let _s2 = server
+        .serve_rpc_duplex("echo", Arc::new(EchoDuplexHandler))
+        .expect("serve_rpc_duplex");
+
+    let mut call = caller
+        .call_duplex(server.node_id(), "echo", CallOptions::default())
+        .await
+        .expect("call_duplex");
+    call.send(Bytes::from_static(b"one")).await.expect("send");
+    call.finish_sending().await.expect("finish_sending");
+
+    // Bounded, so a regression here reports as a failure with a
+    // sentence rather than as a hung test run.
+    let collected = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut out: Vec<String> = Vec::new();
+        while let Some(item) = call.next().await {
+            out.push(String::from_utf8(item.expect("chunk").to_vec()).unwrap());
+        }
+        out
+    })
+    .await
+    .expect("the duplex response stream never terminated after a completed call_streaming");
+
+    assert_eq!(collected, vec!["echo:one", "total:1"]);
+}

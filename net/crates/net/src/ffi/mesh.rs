@@ -59,7 +59,8 @@ use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 
 use crate::adapter::net::identity::{
-    EntityId, PermissionToken, TokenCache, TokenError as CoreTokenError, TokenScope,
+    EntityId, IdentityState as InnerIdentityState, PermissionToken, TokenCache,
+    TokenError as CoreTokenError, TokenScope, IDENTITY_STATE_SIZE,
 };
 use crate::adapter::net::{
     ChannelConfig as InnerChannelConfig, ChannelConfigRegistry, ChannelHash, ChannelId,
@@ -1651,6 +1652,56 @@ pub unsafe extern "C" fn net_mesh_open_stream(
     }
 }
 
+/// Close the underlying core stream, then free the handle.
+///
+/// `net_mesh_stream_free` only drops the FFI handle and its `Arc`. It
+/// does not call `MeshNode::close_stream`, so core stream state
+/// survived until node shutdown: a long-lived C or Go node could not
+/// release stream state eagerly, could not enforce a close/reopen
+/// epoch, and could not reopen the same stream id under a new
+/// configuration — the original "first open wins" config stayed in
+/// force. Rust, Node and Python have always had the core close.
+///
+/// Idempotent at the Go/C level in the same sense as
+/// `net_mesh_stream_free`: calling it twice on the same pointer is
+/// undefined, so callers must null their handle after the first call
+/// (Go's `MeshStream.Close` does).
+///
+/// Returns `0` on success, or a negative `NetError` code.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_close_stream(handle: *mut MeshStreamHandle) -> c_int {
+    if handle.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let h: &MeshStreamHandle = unsafe { &*handle };
+    {
+        // Enter the guard BEFORE touching `stream`. This read used to
+        // sit above the `try_enter`, which is the one thing
+        // `HandleGuard` documents a caller must not do: a `None` return
+        // means a concurrent `net_mesh_stream_free` is taking the inner
+        // apart, and every field except the guard itself is off-limits.
+        // `MeshStreamHandle`'s own doc names this exact hazard — "a
+        // concurrent `net_mesh_stream_free` while `net_mesh_send` was
+        // reading `sh.stream` / `sh._node` would UAF the dropped
+        // fields". Every other op in this file enters first; this was
+        // the outlier.
+        //
+        // The read was survivable in practice — `CoreStream` is `Copy`,
+        // so `ManuallyDrop::take` leaves the bytes behind, and the box
+        // is deliberately leaked across `_free` — but it was correct by
+        // accident, and the accident belongs to a type that could stop
+        // being `Copy`.
+        let _op = match h.guard.try_enter() {
+            Some(op) => op,
+            None => return NetError::ShuttingDown.into(),
+        };
+        h._node
+            .close_stream(h.stream.peer_node_id(), h.stream.stream_id());
+    }
+    unsafe { net_mesh_stream_free(handle) };
+    0
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn net_mesh_stream_free(handle: *mut MeshStreamHandle) {
     if handle.is_null() {
@@ -2082,10 +2133,16 @@ pub unsafe extern "C" fn net_mesh_register_channel(
         cfg = cfg.with_rate_limit(pps);
     }
     if let Some(filter_json) = input.publish_caps {
-        cfg = cfg.with_publish_caps(capability_filter_from_json(filter_json));
+        cfg = match capability_filter_from_json(filter_json) {
+            Ok(f) => cfg.with_publish_caps(f),
+            Err(_) => return NetError::InvalidJson.into(),
+        };
     }
     if let Some(filter_json) = input.subscribe_caps {
-        cfg = cfg.with_subscribe_caps(capability_filter_from_json(filter_json));
+        cfg = match capability_filter_from_json(filter_json) {
+            Ok(f) => cfg.with_subscribe_caps(f),
+            Err(_) => return NetError::InvalidJson.into(),
+        };
     }
     h.channel_configs.insert(cfg);
     0
@@ -2330,6 +2387,12 @@ pub unsafe extern "C" fn net_mesh_publish(
 pub struct IdentityHandle {
     keypair: ManuallyDrop<Arc<EntityKeypair>>,
     cache: ManuallyDrop<Arc<TokenCache>>,
+    /// This issuer's credential epoch, stamped onto every token
+    /// `net_identity_issue_token` mints. Plain `u32`, not shared:
+    /// `net_identity_at_generation` produces a *new* handle rather
+    /// than mutating this one, so a rotation cannot change what
+    /// another thread is in the middle of signing.
+    generation: u32,
     guard: HandleGuard,
 }
 
@@ -2442,6 +2505,14 @@ fn parse_scope_list(raw: &str) -> Option<TokenScope> {
             "subscribe" => TokenScope::SUBSCRIBE,
             "admin" => TokenScope::ADMIN,
             "delegate" => TokenScope::DELEGATE,
+            // WILDCARD authorizes the token's actions on *every*
+            // channel, regardless of its `channel_hash`. It was absent
+            // here, so a wildcard grant could not be issued from this
+            // binding at all, and a Rust-issued one crossing the wire
+            // had the bit dropped on parse — misrepresenting the
+            // credential's authority to the very caller deciding
+            // whether to trust it.
+            "wildcard" => TokenScope::WILDCARD,
             _ => return None,
         });
     }
@@ -2462,6 +2533,11 @@ fn scope_to_strings(scope: TokenScope) -> Vec<&'static str> {
     if scope.contains(TokenScope::DELEGATE) {
         out.push("delegate");
     }
+    // See the parse side: absent here, a Rust-issued wildcard token
+    // rendered as if it carried no cross-channel authority.
+    if scope.contains(TokenScope::WILDCARD) {
+        out.push("wildcard");
+    }
     out
 }
 
@@ -2479,6 +2555,8 @@ pub unsafe extern "C" fn net_identity_generate(out_handle: *mut *mut IdentityHan
     let handle = Box::new(IdentityHandle {
         keypair: ManuallyDrop::new(Arc::new(EntityKeypair::generate())),
         cache: ManuallyDrop::new(Arc::new(TokenCache::new())),
+        // A fresh key has no rotation history.
+        generation: 0,
         guard: HandleGuard::new(),
     });
     unsafe {
@@ -2507,6 +2585,11 @@ pub unsafe extern "C" fn net_identity_from_seed(
     let handle = Box::new(IdentityHandle {
         keypair: ManuallyDrop::new(Arc::new(EntityKeypair::from_bytes(arr))),
         cache: ManuallyDrop::new(Arc::new(TokenCache::new())),
+        // The seed carries no epoch. An issuer that has rotated and
+        // comes back through here mints at zero — below its own
+        // published floor. `net_identity_from_state` is the path that
+        // restores the issuer rather than just the key.
+        generation: 0,
         guard: HandleGuard::new(),
     });
     unsafe {
@@ -2537,6 +2620,149 @@ pub unsafe extern "C" fn net_identity_free(handle: *mut IdentityHandle) {
              leaking inner to avoid use-after-free"
         );
     }
+}
+
+/// Size of the buffer `net_identity_to_state` writes, in bytes.
+///
+/// The header carries this as `NET_IDENTITY_STATE_SIZE`; this export
+/// exists so a stale header is detectable rather than silently
+/// under-allocating a buffer the implementation then writes past. A C
+/// caller that wants the check can assert the two agree at startup.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_identity_state_size() -> usize {
+    IDENTITY_STATE_SIZE
+}
+
+/// This issuer's current credential epoch.
+///
+/// Every token `net_identity_issue_token` mints carries it, and a
+/// verifier rejects that token once its revocation floor for this
+/// entity exceeds it. Returns `0` for a NULL or shutting-down handle —
+/// indistinguishable from a genuine generation zero, which is the
+/// conservative reading (zero is the epoch that claims the least).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_identity_generation(handle: *mut IdentityHandle) -> u32 {
+    if handle.is_null() {
+        return 0;
+    }
+    let h = unsafe { &*handle };
+    let Some(_op) = h.guard.try_enter() else {
+        return 0;
+    };
+    h.generation
+}
+
+/// The same key at a later generation, as a **new** handle written to
+/// `*out_handle`. The input handle is unchanged; free both separately.
+///
+/// `next == net_identity_generation(handle)` is accepted and
+/// idempotent at every generation including `UINT32_MAX`, so
+/// re-applying a persisted generation on restart is never an error.
+/// Going backwards returns `NET_ERR_IDENTITY`.
+///
+/// There is no generation above `UINT32_MAX` to name, so an issuer
+/// there can re-apply but not advance; past that, rotate the identity
+/// key.
+///
+/// Rotation order: build the generation-N handle here, persist
+/// `net_identity_to_state` atomically and durably, distribute verifier
+/// floor N, then start issuing. Publishing floor N before the state is
+/// durable leaves a crashed issuer announcing a floor it cannot
+/// satisfy — it can mint nothing a verifier accepts, and only a key
+/// rotation recovers it.
+///
+/// The token cache is NOT shared with the source handle: the C ABI
+/// hands out owning pointers, and sharing an `Arc<TokenCache>` across
+/// two independently-freeable handles would make one `_free` observable
+/// through the other.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_identity_at_generation(
+    handle: *mut IdentityHandle,
+    next: u32,
+    out_handle: *mut *mut IdentityHandle,
+) -> c_int {
+    if handle.is_null() || out_handle.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let h = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let Ok(generation) = InnerIdentityState::check_rotation(h.generation, next) else {
+        return NET_ERR_IDENTITY;
+    };
+    let rotated = Box::new(IdentityHandle {
+        keypair: ManuallyDrop::new(Arc::clone(&h.keypair)),
+        cache: ManuallyDrop::new(Arc::new(TokenCache::new())),
+        generation,
+        guard: HandleGuard::new(),
+    });
+    unsafe {
+        *out_handle = Box::into_raw(rotated);
+    }
+    0
+}
+
+/// Write the versioned issuer state — version, seed, generation —
+/// into `out[NET_IDENTITY_STATE_SIZE]`.
+///
+/// **Secret material**: these bytes contain the ed25519 signing seed,
+/// exactly as `net_identity_to_seed` does. Encrypt at rest, and write
+/// atomically; a torn write here is an issuer that cannot come back.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_identity_to_state(handle: *mut IdentityHandle, out: *mut u8) -> c_int {
+    if handle.is_null() || out.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let h = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let bytes = InnerIdentityState {
+        seed: *h.keypair.secret_bytes(),
+        generation: h.generation,
+    }
+    .to_bytes();
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len());
+    }
+    0
+}
+
+/// Restore an issuer — key *and* generation — from
+/// `net_identity_to_state` output.
+///
+/// The restart path for anything that rotates. `net_identity_from_seed`
+/// restores the key only and comes back at generation zero, which for a
+/// rotated issuer is below its own floor. Returns `NET_ERR_IDENTITY`
+/// for a wrong length or a version this build does not understand —
+/// a partial parse of credential state is how an issuer silently comes
+/// back on the wrong epoch.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_identity_from_state(
+    state: *const u8,
+    state_len: usize,
+    out_handle: *mut *mut IdentityHandle,
+) -> c_int {
+    if state.is_null() || out_handle.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(state, state_len) };
+    let Ok(parsed) = InnerIdentityState::from_bytes(bytes) else {
+        return NET_ERR_IDENTITY;
+    };
+    let handle = Box::new(IdentityHandle {
+        keypair: ManuallyDrop::new(Arc::new(EntityKeypair::from_bytes(parsed.seed))),
+        cache: ManuallyDrop::new(Arc::new(TokenCache::new())),
+        generation: parsed.generation,
+        guard: HandleGuard::new(),
+    });
+    unsafe {
+        *out_handle = Box::into_raw(handle);
+    }
+    0
 }
 
 /// Write the 32-byte ed25519 seed into `out[32]`. Caller must pass
@@ -2642,6 +2868,65 @@ pub unsafe extern "C" fn net_identity_sign(
     0
 }
 
+/// Verify a detached ed25519 signature against a 32-byte entity id.
+///
+/// The verifying half of `net_identity_sign`. Every binding exposed
+/// signing and none exposed verification for an arbitrary message, so
+/// a signature produced through the C ABI could only be checked from
+/// Rust — and the binding tests asserted the signature's *length*
+/// rather than a round trip, which passes for any 64 bytes.
+///
+/// Strict verification: the malleable `(R, S + L)` variant is
+/// rejected, so one logical message cannot appear under two byte
+/// encodings.
+///
+/// Writes `1` to `*out_valid` when the signature is valid for this
+/// exact `(entity_id, message)` pair and `0` when it is not. Returns
+/// `0` on success, or a negative code only for a malformed argument —
+/// so a `0` result with `*out_valid == 0` means "did not verify",
+/// never "called wrong".
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_verify_signature(
+    entity_id: *const u8,
+    entity_id_len: usize,
+    msg: *const u8,
+    msg_len: usize,
+    signature: *const u8,
+    signature_len: usize,
+    out_valid: *mut c_int,
+) -> c_int {
+    if out_valid.is_null() {
+        return NetError::NullPointer.into();
+    }
+    if (msg_len > 0 && msg.is_null()) || signature.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let Some(id) = entity_id_from_bytes(entity_id, entity_id_len) else {
+        return NET_ERR_IDENTITY;
+    };
+    if signature_len != 64 {
+        return NET_ERR_IDENTITY;
+    }
+    // `slice::from_raw_parts` requires `len <= isize::MAX`.
+    if msg_len > isize::MAX as usize {
+        return NetError::InvalidJson.into();
+    }
+    let msg_slice = if msg_len == 0 {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(msg, msg_len) }
+    };
+    let sig_slice = unsafe { std::slice::from_raw_parts(signature, 64) };
+    let Ok(sig) = <[u8; 64]>::try_from(sig_slice) else {
+        return NET_ERR_IDENTITY;
+    };
+    let valid = id.verify_bytes(msg_slice, &sig).is_ok();
+    unsafe {
+        *out_valid = c_int::from(valid);
+    }
+    0
+}
+
 /// Issue a token to `subject`. Writes a newly-allocated blob to
 /// `*out_token`; caller frees via `net_free_bytes(ptr, *out_len)`.
 #[unsafe(no_mangle)]
@@ -2687,8 +2972,9 @@ pub unsafe extern "C" fn net_identity_issue_token(
     // `TokenError::ReadOnly` → `NET_ERR_IDENTITY` instead of
     // panic-unwinding across this `extern "C"` frame into the
     // caller's binding.
-    let token = match PermissionToken::try_issue(
+    let token = match PermissionToken::try_issue_with_generation(
         &h.keypair,
+        h.generation,
         subject_id,
         scope,
         channel_hash,
@@ -2801,6 +3087,12 @@ struct ParsedTokenJson {
     not_before: u64,
     not_after: u64,
     delegation_depth: u8,
+    /// Issuer generation this token was minted under.
+    ///
+    /// `RevocationRegistry` rejects tokens below the issuer's
+    /// monotonic floor; without this field a C or Go operator could
+    /// see a credential refused but not why.
+    issuer_generation: u32,
     nonce: u64,
     signature_hex: String,
 }
@@ -2836,6 +3128,7 @@ pub unsafe extern "C" fn net_parse_token(
         not_before: parsed.not_before,
         not_after: parsed.not_after,
         delegation_depth: parsed.delegation_depth,
+        issuer_generation: parsed.issuer_generation,
         nonce: parsed.nonce,
         signature_hex: hex::encode(parsed.signature),
     };
@@ -3202,21 +3495,28 @@ fn gpu_info_from_json(g: GpuJson) -> GpuInfo {
         info = info.with_tensor_cores(saturating_u16_cap(tc));
     }
     if let Some(tf) = g.fp16_tflops_x10 {
-        // Saturate at `u16::MAX` before the f32 conversion. Pre-fix
-        // `tf as f32` lost precision for u32 values ≥ 2²⁴ (f32 has
-        // a 24-bit mantissa), so the round-trip
-        // `u32 → f32/10.0 → with_fp16_tflops → *10.0 as u32`
-        // could land a different `fp16_tflops_x10` than the
-        // operator declared. The neighboring `tops_x10` field
-        // already routes through `saturating_u16_cap` for the same
-        // reason; the matching cap here keeps the round-trip exact
-        // (u16::MAX = 65 535 is far below the f32 precision
-        // boundary of 2²⁴ = 16 777 216) and aligns the two fields'
-        // surfaces. The dynamic range loss (2³² → 2¹⁶) is
-        // acceptable: 6 553.5 TFLOPS is far above any current or
-        // near-future GPU's fp16 throughput.
-        let tf_capped = saturating_u16_cap(tf);
-        info = info.with_fp16_tflops(tf_capped as f32 / 10.0);
+        // Write the integer field directly — the same fix the Node
+        // binding already carries (CR-25).
+        //
+        // This used to saturate at `u16::MAX` before an f32
+        // round-trip. The round-trip was the real problem: f32 has a
+        // 24-bit mantissa, so `u32 → f32/10.0 → with_fp16_tflops →
+        // *10.0 as u32` could land a different value than the
+        // operator declared. Capping at `u16::MAX` did keep the
+        // round-trip exact, but at the cost of narrowing a field
+        // whose public type is `u32` on every other binding — a
+        // caller could submit a value its own types allow and have it
+        // silently changed only on C and Go.
+        //
+        // That matters more than the dynamic range argument the old
+        // comment made. The field was deliberately widened from u16
+        // to u32 in core because per-node and per-mesh rollups exceed
+        // the u16 ceiling, and saturation is especially unsuitable
+        // for a *scheduling* metric: two nodes above the cap compare
+        // equal, so the placement scorer stops being able to order
+        // them at all. Bypassing f32 preserves both the full range
+        // and the exactness.
+        info.fp16_tflops_x10 = tf;
     }
     info
 }
@@ -3277,7 +3577,7 @@ fn software_from_json(s: SoftwareJson) -> SoftwareCapabilities {
     sw
 }
 
-fn model_from_json(m: ModelJson) -> ModelCapability {
+fn model_from_json(m: ModelJson) -> Result<ModelCapability, String> {
     let mut mc = ModelCapability::new(m.model_id, m.family);
     if let Some(p) = m.parameters_b_x10 {
         mc.parameters_b_x10 = p;
@@ -3289,17 +3589,16 @@ fn model_from_json(m: ModelJson) -> ModelCapability {
         mc = mc.with_quantization(q);
     }
     for modality in m.modalities {
+        // Reject, rather than skip. Skipping was already better
+        // than the original silent fallback to Text — which
+        // advertised a capability the node does not have — but it
+        // still let a typo through as a successfully announced set
+        // with one modality quietly missing. The caller cannot see
+        // the difference between "I did not claim audio" and "my
+        // spelling of audio was dropped".
         match parse_modality_cap(&modality) {
             Some(parsed) => mc = mc.add_modality(parsed),
-            None => {
-                tracing::warn!(
-                    modality = %modality,
-                    "announce_capabilities: unknown modality string (typo?), \
-                     skipping rather than the pre-fix silent fallback to Text — \
-                     advertising a Text capability the node doesn't actually \
-                     have produced wrong scheduling decisions on the receiver",
-                );
-            }
+            None => return Err(modality),
         }
     }
     if let Some(t) = m.tokens_per_sec {
@@ -3308,7 +3607,7 @@ fn model_from_json(m: ModelJson) -> ModelCapability {
     if let Some(l) = m.loaded {
         mc = mc.with_loaded(l);
     }
-    mc
+    Ok(mc)
 }
 
 fn tool_from_json(t: ToolJson) -> ToolCapability {
@@ -3357,7 +3656,7 @@ fn limits_from_json(l: LimitsJson) -> ResourceLimits {
     rl
 }
 
-fn capability_set_from_json(caps: CapabilitySetJson) -> CapabilitySet {
+fn capability_set_from_json(caps: CapabilitySetJson) -> Result<CapabilitySet, String> {
     let mut cs = CapabilitySet::new();
     if let Some(h) = caps.hardware {
         cs = cs.with_hardware(hardware_from_json(h));
@@ -3366,7 +3665,7 @@ fn capability_set_from_json(caps: CapabilitySetJson) -> CapabilitySet {
         cs = cs.with_software(software_from_json(s));
     }
     for m in caps.models {
-        cs = cs.add_model(model_from_json(m));
+        cs = cs.add_model(model_from_json(m)?);
     }
     for t in caps.tools {
         cs = cs.add_tool(tool_from_json(t));
@@ -3392,10 +3691,10 @@ fn capability_set_from_json(caps: CapabilitySetJson) -> CapabilitySet {
     if let Some(l) = caps.limits {
         cs = cs.with_limits(limits_from_json(l));
     }
-    cs
+    Ok(cs)
 }
 
-fn capability_filter_from_json(f: CapabilityFilterJson) -> CapabilityFilter {
+fn capability_filter_from_json(f: CapabilityFilterJson) -> Result<CapabilityFilter, String> {
     let mut cf = CapabilityFilter::new();
     for t in f.require_tags {
         cf = cf.require_tag(t);
@@ -3422,33 +3721,21 @@ fn capability_filter_from_json(f: CapabilityFilterJson) -> CapabilityFilter {
         cf = cf.with_min_context(n);
     }
     for m in f.require_modalities {
+        // Reject. On a filter this is the fail-open direction: the
+        // previous behaviour dropped the unrecognized constraint,
+        // so a typo widened the query to every otherwise-eligible
+        // node and the scheduler picked one that cannot do the
+        // work. The comment this replaces conceded exactly that
+        // ("the resulting filter is too permissive"), reasoning
+        // that matching too broadly beats matching the wrong type.
+        // Both are wrong answers to a question the caller can be
+        // told to fix.
         match parse_modality_cap(&m) {
             Some(parsed) => cf = cf.require_modality(parsed),
-            None => {
-                // For a filter, the lossy direction matters even
-                // more than for announce: pre-fix the typo'd
-                // string was re-interpreted as `require Text`,
-                // returning Text-capable nodes that did NOT
-                // satisfy the operator's intended constraint.
-                // Skipping the unknown is also imperfect (the
-                // resulting filter is too permissive — it
-                // returns more nodes than intended), but the
-                // failure mode is "scheduler matched too
-                // broadly" rather than "scheduler matched the
-                // wrong type." The loud warn surfaces the typo
-                // so operators can fix it.
-                tracing::warn!(
-                    modality = %m,
-                    "find_nodes: unknown modality string in require_modalities \
-                     filter (typo?), dropping the constraint; the resulting \
-                     filter is too permissive — pre-fix it was silently \
-                     re-interpreted as `require Text`, which returned the \
-                     wrong nodes",
-                );
-            }
+            None => return Err(m),
         }
     }
-    cf
+    Ok(cf)
 }
 
 // ----- Exports ---------------------------------------------------------------
@@ -3481,7 +3768,13 @@ pub unsafe extern "C" fn net_mesh_announce_capabilities(
         Ok(v) => v,
         Err(_) => return NetError::InvalidJson.into(),
     };
-    let caps = capability_set_from_json(parsed);
+    // An unrecognized modality rejects the whole announcement. It
+    // used to be dropped with a warning, which shipped a set that
+    // silently lacked the capability the caller believed it declared.
+    let caps = match capability_set_from_json(parsed) {
+        Ok(c) => c,
+        Err(_) => return NetError::InvalidJson.into(),
+    };
     let node = h.inner.clone();
     match block_on(async move { node.announce_capabilities(caps).await }) {
         Ok(()) => 0,
@@ -3513,7 +3806,13 @@ pub unsafe extern "C" fn net_mesh_find_nodes(
         Ok(v) => v,
         Err(_) => return NetError::InvalidJson.into(),
     };
-    let filter = capability_filter_from_json(parsed);
+    // An unrecognized modality rejects the query. Dropping it widened
+    // the filter to every otherwise-eligible node — fail-open
+    // scheduling.
+    let filter = match capability_filter_from_json(parsed) {
+        Ok(f) => f,
+        Err(_) => return NetError::InvalidJson.into(),
+    };
     let ids = h.inner.find_nodes_by_filter(&filter);
     write_json_out(&ids, out_json, out_len)
 }
@@ -3698,7 +3997,10 @@ pub unsafe extern "C" fn net_mesh_find_nodes_scoped(
         Ok(v) => v,
         Err(_) => return NetError::InvalidJson.into(),
     };
-    let filter = capability_filter_from_json(parsed_filter);
+    let filter = match capability_filter_from_json(parsed_filter) {
+        Ok(f) => f,
+        Err(_) => return NetError::InvalidJson.into(),
+    };
     let owned = match scope_filter_from_json(parsed_scope) {
         Ok(v) => v,
         Err(e) => return e.into(),
@@ -3738,14 +4040,16 @@ struct CapabilityRequirementJson {
 
 fn capability_requirement_from_json(
     j: CapabilityRequirementJson,
-) -> crate::adapter::net::behavior::capability::CapabilityRequirement {
-    crate::adapter::net::behavior::capability::CapabilityRequirement::from_filter(
-        capability_filter_from_json(j.filter),
+) -> Result<crate::adapter::net::behavior::capability::CapabilityRequirement, String> {
+    Ok(
+        crate::adapter::net::behavior::capability::CapabilityRequirement::from_filter(
+            capability_filter_from_json(j.filter)?,
+        )
+        .prefer_memory(j.prefer_more_memory)
+        .prefer_vram(j.prefer_more_vram)
+        .prefer_speed(j.prefer_faster_inference)
+        .prefer_loaded(j.prefer_loaded_models),
     )
-    .prefer_memory(j.prefer_more_memory)
-    .prefer_vram(j.prefer_more_vram)
-    .prefer_speed(j.prefer_faster_inference)
-    .prefer_loaded(j.prefer_loaded_models)
 }
 
 /// Pick the best-scoring node for a placement requirement. Writes
@@ -3783,7 +4087,10 @@ pub unsafe extern "C" fn net_mesh_find_best_node(
         Ok(v) => v,
         Err(_) => return NetError::InvalidJson.into(),
     };
-    let req = capability_requirement_from_json(parsed);
+    let req = match capability_requirement_from_json(parsed) {
+        Ok(r) => r,
+        Err(_) => return NetError::InvalidJson.into(),
+    };
     match h.inner.find_best_node(&req) {
         Some(node_id) => unsafe {
             *out_node_id = node_id;
@@ -3839,7 +4146,10 @@ pub unsafe extern "C" fn net_mesh_find_best_node_scoped(
         Ok(v) => v,
         Err(_) => return NetError::InvalidJson.into(),
     };
-    let req = capability_requirement_from_json(parsed_req);
+    let req = match capability_requirement_from_json(parsed_req) {
+        Ok(r) => r,
+        Err(_) => return NetError::InvalidJson.into(),
+    };
     let owned = match scope_filter_from_json(parsed_scope) {
         Ok(v) => v,
         Err(e) => return e.into(),
@@ -4539,7 +4849,10 @@ mod tests {
     /// didn't have; in find-nodes filters, the same typo was
     /// reinterpreted as `require Text` and returned the wrong
     /// nodes. The strict shape lets callers handle the unknown
-    /// case explicitly (callers in this file warn-and-skip).
+    /// case explicitly; callers in this file now reject the whole
+    /// request (see `unknown_modality_rejects_*` below), because
+    /// warn-and-skip still shipped an announcement missing a
+    /// capability, and a filter missing a constraint.
     #[test]
     fn parse_modality_cap_returns_none_on_unknown_strings() {
         // Known values still parse.
@@ -4575,52 +4888,349 @@ mod tests {
         }
     }
 
-    /// Regression: `gpu_info_from_json` must saturate large
-    /// `fp16_tflops_x10` values at `u16::MAX` before the f32
-    /// conversion. Pre-fix `tf as f32` lost precision for u32
-    /// values above 2²⁴ (f32 has a 24-bit mantissa) — the
-    /// round-trip `u32 → f32/10.0 → with_fp16_tflops → *10.0
-    /// as u32` could land a different `fp16_tflops_x10` than
-    /// the operator declared. The matching saturation aligns
-    /// with the neighboring `tops_x10` field's surface and
-    /// keeps the round-trip exact.
-    #[test]
-    fn gpu_info_from_json_saturates_fp16_tflops_to_u16_max() {
-        // A hostile or just unrealistically large value well
-        // above the f32 precision boundary (2^24 = 16_777_216).
-        let g = GpuJson {
-            vendor: None,
-            model: "test".to_string(),
-            vram_gb: 0,
-            compute_units: None,
-            tensor_cores: None,
-            fp16_tflops_x10: Some(1_000_000_000u32),
+    /// Call `net_verify_signature` the way C does, and read
+    /// `*out_valid`.
+    ///
+    /// The tests below went through `EntityId::verify_bytes` instead,
+    /// which is the layer *underneath* the export — so the null guards,
+    /// the 64-byte length check, the zero-length message branch and the
+    /// `out_valid` write were all unexercised. That is the same shape of
+    /// gap the export exists to close: the binding tests asserted the
+    /// signature's *length*, which passes for any 64 bytes.
+    fn abi_verify(entity_id: &[u8], msg: &[u8], sig: &[u8]) -> (c_int, c_int) {
+        let mut valid: c_int = -1;
+        let rc = unsafe {
+            net_verify_signature(
+                entity_id.as_ptr(),
+                entity_id.len(),
+                // A zero-length slice's `as_ptr` is a dangling non-null
+                // pointer; pass a real NULL so the empty-message branch
+                // is what C would actually hit.
+                if msg.is_empty() {
+                    std::ptr::null()
+                } else {
+                    msg.as_ptr()
+                },
+                msg.len(),
+                sig.as_ptr(),
+                sig.len(),
+                &mut valid,
+            )
         };
-        let info = gpu_info_from_json(g);
-        // The cap is u16::MAX = 65535; the f32 round-trip back to
-        // x10 storage must reproduce 65_535, NOT some lossily
-        // rounded approximation of 1_000_000_000.
+        (rc, valid)
+    }
+
+    /// Sign then verify, through the C ABI, in one round trip.
+    ///
+    /// Every binding exposed `sign` and none exposed verification for
+    /// an arbitrary message, so a signature produced through the ABI
+    /// could only be checked from Rust. The binding tests asserted the
+    /// signature's *length* — which passes for any 64 bytes, including
+    /// 64 zeros.
+    #[test]
+    fn verify_signature_round_trips_and_rejects_tampering() {
+        use crate::adapter::net::identity::EntityKeypair;
+
+        let keypair = EntityKeypair::generate();
+        let entity = keypair.entity_id().as_bytes().to_vec();
+        let message = b"the exact bytes that were signed";
+        let sig = keypair.sign(message).to_bytes();
+
         assert_eq!(
-            info.fp16_tflops_x10,
-            u16::MAX as u32,
-            "fp16_tflops_x10 must saturate at u16::MAX (65535) instead of \
-             losing precision through the f32 round-trip; got {}",
-            info.fp16_tflops_x10,
+            abi_verify(&entity, message, &sig),
+            (0, 1),
+            "a freshly produced signature must verify",
         );
 
-        // Sanity: a small in-range value round-trips exactly.
-        let g_small = GpuJson {
+        // Wrong message. `rc == 0` with `valid == 0` is the contract:
+        // "did not verify", never "called wrong".
+        assert_eq!(
+            abi_verify(&entity, b"different bytes", &sig),
+            (0, 0),
+            "a signature must not verify against another message",
+        );
+
+        // Wrong key.
+        let other = EntityKeypair::generate();
+        assert_eq!(
+            abi_verify(other.entity_id().as_bytes(), message, &sig),
+            (0, 0),
+            "a signature must not verify under another entity",
+        );
+
+        // Tampered signature — and the all-zero signature the
+        // length-only assertions would have accepted.
+        let mut bad = sig;
+        bad[0] ^= 0xff;
+        assert_eq!(abi_verify(&entity, message, &bad), (0, 0));
+        assert_eq!(
+            abi_verify(&entity, message, &[0u8; 64]),
+            (0, 0),
+            "64 zero bytes is the signature a length check accepts",
+        );
+    }
+
+    /// An empty message is a legitimate thing to sign, and the ABI's
+    /// null-pointer guard must not confuse "zero-length" with
+    /// "missing".
+    ///
+    /// `msg == NULL` with `msg_len == 0` must succeed, because that is
+    /// what a C caller with no message has to pass.
+    #[test]
+    fn verify_signature_handles_an_empty_message() {
+        use crate::adapter::net::identity::EntityKeypair;
+
+        let keypair = EntityKeypair::generate();
+        let entity = keypair.entity_id().as_bytes().to_vec();
+        let sig = keypair.sign(b"").to_bytes();
+
+        assert_eq!(
+            abi_verify(&entity, b"", &sig),
+            (0, 1),
+            "a NULL message with length 0 is an empty message, not a \
+             missing argument",
+        );
+        // And it must not verify some other message's signature.
+        let other_sig = keypair.sign(b"not empty").to_bytes();
+        assert_eq!(abi_verify(&entity, b"", &other_sig), (0, 0));
+    }
+
+    /// Malformed arguments return a negative code and never claim a
+    /// verdict.
+    ///
+    /// The split matters: `0` with `*out_valid == 0` means the
+    /// signature did not verify, and a caller that cannot tell that
+    /// from "you passed a 63-byte signature" will treat a bug as a
+    /// failed check.
+    #[test]
+    fn verify_signature_rejects_malformed_arguments() {
+        use crate::adapter::net::identity::EntityKeypair;
+
+        let keypair = EntityKeypair::generate();
+        let entity = keypair.entity_id().as_bytes().to_vec();
+        let msg = b"payload";
+        let sig = keypair.sign(msg).to_bytes();
+
+        // Wrong entity-id length, both directions.
+        for bad_id_len in [0usize, 31, 33] {
+            let bad_id = vec![0u8; bad_id_len];
+            let (rc, _) = abi_verify(&bad_id, msg, &sig);
+            assert_eq!(
+                rc, NET_ERR_IDENTITY,
+                "a {bad_id_len}-byte entity id must be refused",
+            );
+        }
+
+        // Wrong signature length, both directions.
+        for bad_sig_len in [0usize, 63, 65] {
+            let bad_sig = vec![0u8; bad_sig_len];
+            let (rc, _) = abi_verify(&entity, msg, &bad_sig);
+            assert_eq!(
+                rc, NET_ERR_IDENTITY,
+                "a {bad_sig_len}-byte signature must be refused",
+            );
+        }
+
+        // NULL out_valid: nowhere to write the verdict, so the call
+        // cannot report anything and must say so.
+        let rc = unsafe {
+            net_verify_signature(
+                entity.as_ptr(),
+                entity.len(),
+                msg.as_ptr(),
+                msg.len(),
+                sig.as_ptr(),
+                sig.len(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, c_int::from(NetError::NullPointer));
+
+        // NULL signature, and a NULL message with a non-zero length —
+        // the latter is the case the `msg_len > 0` guard exists for.
+        let mut valid: c_int = -1;
+        let rc = unsafe {
+            net_verify_signature(
+                entity.as_ptr(),
+                entity.len(),
+                msg.as_ptr(),
+                msg.len(),
+                std::ptr::null(),
+                64,
+                &mut valid,
+            )
+        };
+        assert_eq!(rc, c_int::from(NetError::NullPointer));
+
+        let rc = unsafe {
+            net_verify_signature(
+                entity.as_ptr(),
+                entity.len(),
+                std::ptr::null(),
+                7,
+                sig.as_ptr(),
+                sig.len(),
+                &mut valid,
+            )
+        };
+        assert_eq!(
+            rc,
+            c_int::from(NetError::NullPointer),
+            "a NULL message with a non-zero length must not be \
+             dereferenced",
+        );
+    }
+
+    /// A wildcard grant must survive the C/Go boundary in both
+    /// directions.
+    ///
+    /// `WILDCARD` authorizes the token's actions on every channel
+    /// regardless of its `channel_hash`. The scope converters listed
+    /// only publish/subscribe/admin/delegate, so this binding could
+    /// not issue one, and a Rust-issued wildcard token crossing the
+    /// wire rendered without the bit — under-reporting the
+    /// credential's authority to the caller deciding whether to trust
+    /// it.
+    #[test]
+    fn wildcard_scope_round_trips_through_the_c_converters() {
+        let parsed = parse_scope_list(r#"["publish","wildcard"]"#).expect("wildcard must parse");
+        assert!(parsed.contains(TokenScope::WILDCARD));
+        assert!(parsed.contains(TokenScope::PUBLISH));
+
+        let rendered = scope_to_strings(parsed);
+        assert!(
+            rendered.contains(&"wildcard"),
+            "wildcard must render, got {rendered:?}",
+        );
+    }
+
+    /// The other four still round-trip, and an unknown name is still
+    /// refused — widening the vocabulary must not have opened it.
+    #[test]
+    fn scope_vocabulary_is_exactly_the_five_names() {
+        for name in ["publish", "subscribe", "admin", "delegate", "wildcard"] {
+            let json = format!(r#"["{name}"]"#);
+            let parsed = parse_scope_list(&json).expect("documented scope must parse");
+            assert!(scope_to_strings(parsed).contains(&name));
+        }
+        for bad in [
+            r#"["wild"]"#,
+            r#"["WILDCARD"]"#,
+            r#"["all"]"#,
+            r#"["none"]"#,
+        ] {
+            assert!(
+                parse_scope_list(bad).is_none(),
+                "unknown scope must be refused: {bad}",
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_modality_rejects_the_announcement() {
+        let json = r#"{"models":[{"model_id":"m","modalities":["audoi"]}]}"#;
+        let parsed: CapabilitySetJson = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            capability_set_from_json(parsed).unwrap_err(),
+            "audoi",
+            "the error must name the offending value",
+        );
+    }
+
+    /// The filter direction is the fail-open one: a dropped constraint
+    /// widens the query to every otherwise-eligible node, so the
+    /// scheduler can pick a node that cannot do the work.
+    #[test]
+    fn unknown_modality_rejects_the_filter() {
+        let json = r#"{"require_modalities":["audoi"]}"#;
+        let parsed: CapabilityFilterJson = serde_json::from_str(json).unwrap();
+        assert_eq!(capability_filter_from_json(parsed).unwrap_err(), "audoi");
+    }
+
+    /// The whole documented vocabulary still round-trips through both
+    /// conversions, so rejection did not narrow what callers can say.
+    #[test]
+    fn every_documented_modality_still_converts() {
+        for name in [
+            "text",
+            "image",
+            "audio",
+            "video",
+            "code",
+            "embedding",
+            "tool-use",
+            "tool_use",
+            "tooluse",
+            "TEXT",
+        ] {
+            let json = format!(r#"{{"require_modalities":["{name}"]}}"#);
+            let parsed: CapabilityFilterJson = serde_json::from_str(&json).unwrap();
+            assert!(
+                capability_filter_from_json(parsed).is_ok(),
+                "documented modality {name:?} must convert",
+            );
+        }
+    }
+
+    /// `gpu_info_from_json` must preserve the declared
+    /// `fp16_tflops_x10` exactly.
+    ///
+    /// Two things used to go wrong here in sequence. The original code
+    /// ran the value through `with_fp16_tflops(tf as f32 / 10.0)`,
+    /// and f32's 24-bit mantissa loses precision above 16,777,216, so
+    /// the round-trip could land a different number than the operator
+    /// declared. The fix for that capped the input at `u16::MAX`
+    /// first — exact, but it narrowed a field whose public type is
+    /// `u32` everywhere else, and silently, only on C and Go.
+    ///
+    /// Saturation is the worse failure for a scheduling metric: two
+    /// nodes above the cap compare equal, so the placement scorer can
+    /// no longer order them. Writing the integer field directly keeps
+    /// both the range and the exactness.
+    #[test]
+    fn gpu_info_from_json_preserves_full_u32_fp16_tflops() {
+        for declared in [
+            0u32,
+            825,                 // 82.5 TFLOPS — an ordinary GPU
+            u16::MAX as u32,     // the old cap
+            u16::MAX as u32 + 1, // one past it
+            16_777_217,          // one past f32's exact-integer range
+            1_000_000_000,       // the value the old test pinned to 65_535
+            u32::MAX,
+        ] {
+            let g = GpuJson {
+                vendor: None,
+                model: "test".to_string(),
+                vram_gb: 0,
+                compute_units: None,
+                tensor_cores: None,
+                fp16_tflops_x10: Some(declared),
+            };
+            assert_eq!(
+                gpu_info_from_json(g).fp16_tflops_x10,
+                declared,
+                "fp16_tflops_x10 must survive the C boundary unchanged",
+            );
+        }
+    }
+
+    /// Ordering must survive too — the property saturation destroyed.
+    #[test]
+    fn gpu_info_from_json_keeps_large_fp16_values_orderable() {
+        let make = |tf: u32| GpuJson {
             vendor: None,
             model: "test".to_string(),
             vram_gb: 0,
             compute_units: None,
             tensor_cores: None,
-            fp16_tflops_x10: Some(425), // 42.5 TFLOPS
+            fp16_tflops_x10: Some(tf),
         };
-        let info_small = gpu_info_from_json(g_small);
-        assert_eq!(
-            info_small.fp16_tflops_x10, 425,
-            "small fp16_tflops_x10 must round-trip exactly"
+        let smaller = gpu_info_from_json(make(1_000_000_000)).fp16_tflops_x10;
+        let larger = gpu_info_from_json(make(2_000_000_000)).fp16_tflops_x10;
+        assert!(
+            smaller < larger,
+            "both values used to saturate to 65_535 and compare equal, \
+             so a placement scorer could not rank them",
         );
     }
 
@@ -4859,6 +5469,67 @@ mod tests {
         }
         unsafe { net_mesh_free(nh_a) };
         unsafe { net_mesh_free(nh_b) };
+    }
+
+    /// `net_mesh_close_stream` on an already-freed handle must report
+    /// `ShuttingDown` from the guard alone, without reading `stream`.
+    ///
+    /// The guard's contract is that a `None` from `try_enter` means
+    /// every field but the guard is off-limits — `net_mesh_stream_free`
+    /// has taken `stream` and dropped `_node` by then. This function
+    /// read `h.stream.peer_node_id()` and `h.stream.stream_id()` ABOVE
+    /// the `try_enter`, the only op in this file that touched a field
+    /// first.
+    ///
+    /// A plain assertion cannot see the difference: `CoreStream` is
+    /// `Copy`, so `ManuallyDrop::take` leaves readable bytes, and the
+    /// box is deliberately leaked across `_free`. What this pins is the
+    /// reachable half — the call is defined, returns the typed code,
+    /// and does not touch the dropped `_node` — so the path stays
+    /// exercised for a Miri or ASan run, and a future `CoreStream` that
+    /// stops being `Copy` fails here rather than in the field.
+    #[test]
+    fn close_stream_after_free_reports_shutting_down() {
+        let cfg = serde_json::json!({
+            "bind_addr": "127.0.0.1:0",
+            "psk_hex": "0".repeat(64),
+        });
+        let cfg_c = CString::new(cfg.to_string()).unwrap();
+        let mut nh: *mut MeshNodeHandle = std::ptr::null_mut();
+        assert_eq!(unsafe { net_mesh_new(cfg_c.as_ptr(), &mut nh) }, 0);
+
+        // Direct field init, as in `handles_match_rejects_stream_node_mismatch`:
+        // `open_stream` needs an established session a unit test cannot
+        // synthesize, and neither the guard nor the ids depend on one.
+        let sh = Box::into_raw(Box::new(MeshStreamHandle {
+            stream: ManuallyDrop::new(CoreStream {
+                peer_node_id: 0xDEAD,
+                stream_id: 7,
+                epoch: 0,
+                config: StreamConfig::new(),
+            }),
+            _node: ManuallyDrop::new(Arc::clone(&unsafe { &*nh }.inner)),
+            guard: HandleGuard::new(),
+        }));
+
+        // First close: the guard is open, so this closes the core
+        // stream and frees the inner.
+        assert_eq!(unsafe { net_mesh_close_stream(sh) }, 0);
+
+        // Second close: `freeing` is latched, so the guard refuses. The
+        // box is still valid memory (leaked on purpose), so reading the
+        // guard is defined — reading `stream` is what is not.
+        assert_eq!(
+            unsafe { net_mesh_close_stream(sh) },
+            c_int::from(NetError::ShuttingDown),
+            "a close after free must come from the guard, not from a \
+             field read that happens to survive",
+        );
+
+        // And the plain free stays idempotent alongside it.
+        unsafe { net_mesh_stream_free(sh) };
+
+        unsafe { net_mesh_free(nh) };
     }
 
     /// `net_mesh_free` must be idempotent — the post-fix protocol
@@ -5296,7 +5967,7 @@ mod nat_traversal_stub_tests {
     fn capability_set_from_go_marshal_preserves_gpu_vendor() {
         let json = r#"{"hardware":{"cpu_cores":16,"memory_gb":64,"gpu":{"vendor":"nvidia","model":"h100","vram_gb":80}},"tags":["gpu"]}"#;
         let parsed: CapabilitySetJson = serde_json::from_str(json).expect("JSON should parse");
-        let caps = capability_set_from_json(parsed);
+        let caps = capability_set_from_json(parsed).expect("valid capability set");
         // Phase A.5.5: read through views() so the test asserts
         // the projection — the same surface every consumer sees
         // post-Phase-A.5.N when typed-struct fields are removed.

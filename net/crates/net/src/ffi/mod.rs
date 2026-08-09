@@ -152,7 +152,7 @@ use tokio::runtime::Runtime;
 
 use crate::bus::EventBus;
 use crate::config::EventBusConfig;
-use crate::consumer::{ConsumeRequest, ConsumeResponse};
+use crate::consumer::{ConsumeRequest, ConsumeResponse, Filter, Ordering};
 use crate::event::{Event, RawEvent};
 
 /// C FFI for CortEX / NetDb / RedexFile. Requires `netdb` (for the
@@ -206,6 +206,12 @@ pub mod blob_stubs;
 #[cfg(feature = "net")]
 #[allow(missing_docs)]
 pub mod mesh;
+
+// Its own file rather than another block inside `mesh.rs`: these drive
+// the raw identity exports through real handle lifecycles, which is a
+// different shape from the parsing pins in that module's `tests`.
+#[cfg(all(test, feature = "net"))]
+mod identity_state_tests;
 
 /// C FFI for the transport surface (blob + directory transfer over the
 /// fairscheduler stream transport — Transport SDK plan T-C). Drives the
@@ -727,10 +733,17 @@ fn parse_config_json(json_str: &str) -> Option<EventBusConfig> {
 
         // Apply optional settings
         if let Some(reliability) = net.get("reliability").and_then(|v| v.as_str()) {
+            // Fail closed, like `role` above: an unrecognized value
+            // rejects the whole config rather than silently selecting
+            // `None`, which downgraded delivery from
+            // acknowledged/retransmitted to fire-and-forget. Go reaches
+            // this parser with an unchecked string, so this is also
+            // Go's only guard.
             net_config = net_config.with_reliability(match reliability {
+                "none" => ReliabilityConfig::None,
                 "light" => ReliabilityConfig::Light,
                 "full" => ReliabilityConfig::Full,
-                _ => ReliabilityConfig::None,
+                _ => return None,
             });
         }
 
@@ -1069,16 +1082,47 @@ pub unsafe extern "C" fn net_ingest_batch(
     c_int::try_from(count).unwrap_or_else(|_| NetError::IntOverflow.into())
 }
 
+/// Keys `parse_poll_request_json` understands. Anything else is
+/// rejected rather than ignored — see the function docs.
+const POLL_REQUEST_KEYS: [&str; 5] = ["limit", "cursor", "filter", "ordering", "shards"];
+
 /// Parse the JSON request body passed to `net_poll` into a
 /// `ConsumeRequest`. Returns the negative `NetError` code on parse
-/// failure so the caller can surface it back across FFI. Both `limit`
-/// and `cursor` are optional, but if either key is present with the
-/// wrong JSON type it is an explicit error — silently falling back to
-/// the default would hide caller bugs (e.g. the Go binding that
-/// previously serialized `cursor` but had it dropped server-side).
+/// failure so the caller can surface it back across FFI.
+///
+/// Every key is optional, but a key present with the wrong JSON type
+/// is an explicit error — silently falling back to the default would
+/// hide caller bugs (e.g. the Go binding that previously serialized
+/// `cursor` but had it dropped server-side).
+///
+/// **Unrecognized keys are also an error.** This parser used to read
+/// only `limit` and `cursor` while the `net_poll` docs advertised an
+/// `ordering` field, so a caller that asked for cross-shard ordering
+/// got an unordered response and a success code. Accepting an option
+/// and ignoring it is worse than not offering it: the caller has no
+/// way to detect that its intent was dropped. `ordering`, `filter`
+/// and `shards` are now honoured, matching the Rust, TypeScript and
+/// Python poll surfaces, and a typo like `"order"` is refused instead
+/// of quietly reverting to the default.
 fn parse_poll_request_json(json_str: &str) -> Result<ConsumeRequest, c_int> {
     let value: serde_json::Value =
         serde_json::from_str(json_str).map_err(|_| c_int::from(NetError::InvalidJson))?;
+
+    // A poll request is an object. `if let Some(obj)` skipped the whole
+    // unknown-key check for anything else, and every `value.get(...)`
+    // below returns `None` on a non-object — so `[]`, `"limit"` and
+    // `42` all parsed as a fully-default request and returned events
+    // the caller never asked for, with a success code. That is the same
+    // "accepted and ignored" failure the unknown-key check exists to
+    // stop, one level up.
+    let Some(obj) = value.as_object() else {
+        return Err(NetError::InvalidJson.into());
+    };
+    for key in obj.keys() {
+        if !POLL_REQUEST_KEYS.contains(&key.as_str()) {
+            return Err(NetError::InvalidJson.into());
+        }
+    }
 
     let limit = match value.get("limit") {
         None | Some(serde_json::Value::Null) => 100usize,
@@ -1098,8 +1142,45 @@ fn parse_poll_request_json(json_str: &str) -> Result<ConsumeRequest, c_int> {
             None => return Err(NetError::InvalidJson.into()),
         },
     };
+    // Vocabulary matches the Node and Python bindings exactly
+    // ("none" / "insertion_ts"). The old doc example spelled it
+    // "InsertionTs", which no binding accepts and which this parser
+    // never read anyway.
+    let ordering = match value.get("ordering") {
+        None | Some(serde_json::Value::Null) => Ordering::None,
+        Some(v) => match v.as_str() {
+            Some("none") => Ordering::None,
+            Some("insertion_ts") => Ordering::InsertionTs,
+            _ => return Err(NetError::InvalidJson.into()),
+        },
+    };
+    // `filter` is the same JSON predicate the other bindings accept,
+    // passed as a nested object rather than a pre-serialized string.
+    let filter = match value.get("filter") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => Some(
+            serde_json::from_value::<Filter>(v.clone())
+                .map_err(|_| c_int::from(NetError::InvalidJson))?,
+        ),
+    };
+    let shards = match value.get("shards") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => {
+            let arr = v.as_array().ok_or(c_int::from(NetError::InvalidJson))?;
+            let mut ids = Vec::with_capacity(arr.len());
+            for entry in arr {
+                let n = entry.as_u64().ok_or(c_int::from(NetError::InvalidJson))?;
+                ids.push(u16::try_from(n).map_err(|_| c_int::from(NetError::InvalidJson))?);
+            }
+            Some(ids)
+        }
+    };
+
     let mut req = ConsumeRequest::new(limit);
     req.from_id = cursor;
+    req.ordering = ordering;
+    req.filter = filter;
+    req.shards = shards;
     Ok(req)
 }
 
@@ -1165,7 +1246,11 @@ fn build_poll_envelope_json(response: &ConsumeResponse) -> Result<String, serde_
 ///
 /// - `handle`: Event bus handle.
 /// - `request_json`: JSON request string (UTF-8, null-terminated).
-///   Example: `{"limit": 100, "ordering": "InsertionTs"}`
+///   Example: `{"limit": 100, "ordering": "insertion_ts"}`
+///   Optional keys: `limit`, `cursor`, `filter`, `ordering`
+///   (`"none"` | `"insertion_ts"`), `shards` (array of shard ids).
+///   An unrecognized key or value is rejected with `InvalidJson`
+///   rather than ignored.
 /// - `out_buffer`: Output buffer for JSON response.
 /// - `buffer_len`: Size of the output buffer.
 ///
@@ -2160,6 +2245,107 @@ mod tests {
         assert_eq!(v["events"][0]["ok"], 1);
     }
 
+    /// `net_poll` documented an `ordering` field that the parser never
+    /// read. The call succeeded, so a caller asking for cross-shard
+    /// ordering silently received an unordered response — the worst
+    /// shape for an option, because there is no way to detect it.
+    #[test]
+    fn poll_request_honours_ordering() {
+        let req = parse_poll_request_json(r#"{"limit":10,"ordering":"insertion_ts"}"#)
+            .expect("documented ordering must parse");
+        assert_eq!(req.ordering, Ordering::InsertionTs);
+
+        let req = parse_poll_request_json(r#"{"limit":10,"ordering":"none"}"#).unwrap();
+        assert_eq!(req.ordering, Ordering::None);
+
+        // Absent means the default, not an error.
+        let req = parse_poll_request_json(r#"{"limit":10}"#).unwrap();
+        assert_eq!(req.ordering, Ordering::None);
+    }
+
+    /// The vocabulary matches Node and Python exactly. `"InsertionTs"`
+    /// was the spelling in the old doc example and is accepted by no
+    /// binding; it must be refused rather than silently defaulted.
+    #[test]
+    fn poll_request_rejects_unknown_ordering() {
+        for bad in [
+            r#"{"ordering":"InsertionTs"}"#,
+            r#"{"ordering":"insertionTs"}"#,
+            r#"{"ordering":"timestamp"}"#,
+            r#"{"ordering":""}"#,
+            r#"{"ordering":1}"#,
+        ] {
+            assert!(
+                parse_poll_request_json(bad).is_err(),
+                "unknown ordering must be rejected: {bad}"
+            );
+        }
+    }
+
+    /// An unrecognized key is a caller bug. Ignoring it is how the
+    /// `ordering` gap survived: the request looked accepted.
+    #[test]
+    fn poll_request_rejects_unknown_keys() {
+        for bad in [
+            r#"{"limit":10,"order":"insertion_ts"}"#, // typo
+            r#"{"limit":10,"orderingg":"none"}"#,
+            r#"{"limit":10,"unknown":true}"#,
+        ] {
+            assert!(
+                parse_poll_request_json(bad).is_err(),
+                "unknown key must be rejected: {bad}"
+            );
+        }
+    }
+
+    /// A request that is not an object at all is refused too.
+    ///
+    /// The unknown-key check ran under `if let Some(obj)`, and every
+    /// field read below it returns `None` on a non-object — so `[]`,
+    /// `"limit"` and `42` were each accepted as a fully-default request
+    /// and answered with events the caller never asked for, under a
+    /// success code. That is the same "accepted and ignored" shape the
+    /// unknown-key check exists to stop, one level up from it.
+    ///
+    /// An empty object is still a valid request: every key is optional.
+    #[test]
+    fn poll_request_requires_a_json_object() {
+        for bad in [
+            "[]",
+            r#"[{"limit":10}]"#,
+            r#""limit""#,
+            "42",
+            "true",
+            "null",
+        ] {
+            assert!(
+                parse_poll_request_json(bad).is_err(),
+                "a non-object request must be rejected, not read as \
+                 defaults: {bad}"
+            );
+        }
+
+        let req = parse_poll_request_json("{}").expect("an empty object is all-defaults");
+        assert_eq!(req.limit, 100);
+        assert_eq!(req.from_id, None);
+    }
+
+    /// Filter and shard selection were feature gaps rather than
+    /// correctness defects, but they are on every other poll surface.
+    #[test]
+    fn poll_request_honours_filter_and_shards() {
+        let req = parse_poll_request_json(r#"{"limit":5,"shards":[0,2,3]}"#).unwrap();
+        assert_eq!(req.shards, Some(vec![0, 2, 3]));
+
+        let req = parse_poll_request_json(r#"{"filter":{"path":"kind","value":"lidar"}}"#).unwrap();
+        assert!(req.filter.is_some(), "filter must reach the request");
+
+        // Out-of-range shard ids and wrong types are refused.
+        assert!(parse_poll_request_json(r#"{"shards":[65536]}"#).is_err());
+        assert!(parse_poll_request_json(r#"{"shards":"0"}"#).is_err());
+        assert!(parse_poll_request_json(r#"{"filter":"not-an-object"}"#).is_err());
+    }
+
     #[test]
     fn test_parse_config_valid() {
         let config = parse_config_json(r#"{"num_shards": 8}"#);
@@ -2188,6 +2374,62 @@ mod tests {
         // u16::MAX (65535) should be valid
         let config = parse_config_json(r#"{"num_shards": 65535}"#);
         assert!(config.is_some(), "num_shards at u16::MAX should be valid");
+    }
+
+    /// Build a minimal valid `net` adapter block with the given
+    /// reliability spelling. Everything else is a well-formed
+    /// initiator config, so a `None` result isolates reliability.
+    #[cfg(feature = "net")]
+    fn net_config_with_reliability(reliability: &str) -> String {
+        format!(
+            r#"{{"net":{{"bind_addr":"127.0.0.1:0","peer_addr":"127.0.0.1:1",
+               "psk":"{psk}","role":"initiator","peer_public_key":"{pk}",
+               "reliability":"{reliability}"}}}}"#,
+            psk = "42".repeat(32),
+            pk = "ab".repeat(32),
+        )
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn reliability_accepts_exactly_the_documented_vocabulary() {
+        for mode in ["none", "light", "full"] {
+            assert!(
+                parse_config_json(&net_config_with_reliability(mode)).is_some(),
+                "documented reliability {mode:?} must parse"
+            );
+        }
+    }
+
+    /// An unrecognized reliability used to fall through to
+    /// `ReliabilityConfig::None`, so a typo constructed successfully
+    /// and silently downgraded delivery from acknowledged and
+    /// retransmitted to fire-and-forget. Role and backpressure already
+    /// rejected unknown values; this boundary was the inconsistent one.
+    /// Go reaches this parser with an unchecked string, so this is also
+    /// Go's server-side guard.
+    #[cfg(feature = "net")]
+    #[test]
+    fn reliability_rejects_every_near_miss() {
+        for bad in [
+            "ful",      // truncation
+            "fully",    // extension
+            "FULL",     // case — the vocabulary is case-sensitive
+            "Full",     //
+            "Light",    //
+            "NONE",     //
+            " full",    // leading whitespace
+            "full ",    // trailing whitespace
+            "",         // empty
+            "reliable", // plausible synonym that is not the vocabulary
+            "best",     // a future mode that does not exist yet
+        ] {
+            assert!(
+                parse_config_json(&net_config_with_reliability(bad)).is_none(),
+                "reliability {bad:?} must be rejected, not silently \
+                 downgraded to fire-and-forget"
+            );
+        }
     }
 
     #[test]

@@ -596,6 +596,15 @@ type RpcObserverTsfn = ThreadsafeFunction<RpcCallEventJs, (), RpcCallEventJs, na
 #[napi]
 pub struct ServeHandle {
     inner: Arc<Mutex<Option<InnerServeHandle>>>,
+    /// The runtime registration ran on, carried forward.
+    ///
+    /// The bridge task `serve_rpc*` spawned must outlive the
+    /// registration call and live until this handle closes, so the
+    /// registration *owner* — not just the `MeshRpc` that happened
+    /// to create it — names the runtime that task belongs to. JS
+    /// can drop the `MeshRpc` and keep the `ServeHandle`; the
+    /// association has to survive that.
+    runtime: tokio::runtime::Handle,
 }
 
 #[napi]
@@ -605,6 +614,11 @@ impl ServeHandle {
     /// completion but no new requests will be dispatched.
     #[napi]
     pub fn close(&self) {
+        // `close()` is sync and runs on the JS thread. Dropping the
+        // inner handle tears down runtime-bound resources, so enter
+        // the same runtime registration used rather than leaving the
+        // drop to run with no reactor in context.
+        let _enter = self.runtime.enter();
         // Recover from a poisoned mutex (a thread panicked while
         // holding it) — partial state is fine here, we just want
         // to drop the inner ServeHandle if it's still present.
@@ -1411,10 +1425,24 @@ impl RpcStreamingHandler for NodeStreamingRpcHandler {
         ctx: RpcContext,
         sink: InnerRpcResponseSink,
     ) -> std::result::Result<(), RpcHandlerError> {
+        // Keep our own handle on the sink slot.
+        //
+        // Everything below hands `JsResponseSink` to JS, and JS is the
+        // only owner from then on. A `#[napi]` class is released by V8
+        // finalization, not by scope, so the inner
+        // `RpcResponseSink` — whose drop is what tells the substrate
+        // fold the response side is done — survived until a garbage
+        // collection happened to run. The handler returned in 0 ms and
+        // the caller saw the terminal frame seconds later, quantised to
+        // GC cycles: measured at 7.6 s, 7.7 s and 15.8 s on loopback,
+        // and unaffected by mesh traffic, because GC is not driven by
+        // the mesh. Retaining the slot lets us drop it ourselves the
+        // moment the handler's promise settles.
+        let sink_slot = Arc::new(Mutex::new(Some(sink)));
         let args = StreamingHandlerArgs {
             req: Buffer::from(ctx.payload.body.to_vec()),
             sink: JsResponseSink {
-                inner: Arc::new(Mutex::new(Some(sink))),
+                inner: sink_slot.clone(),
             },
         };
         let (tx, rx) = tokio::sync::oneshot::channel::<napi::Result<Promise<Buffer>>>();
@@ -1453,7 +1481,12 @@ impl RpcStreamingHandler for NodeStreamingRpcHandler {
                 )))
             }
         };
-        match tokio::time::timeout_at(deadline, promise).await {
+        let settled = tokio::time::timeout_at(deadline, promise).await;
+        // The handler is done with the sink the instant its promise
+        // settles, whichever way it settled. Drop it here rather than
+        // waiting for V8 to collect the JS-side wrapper.
+        drop(sink_slot.lock().take());
+        match settled {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(e)) => {
                 let msg: String = format!("{e}");
@@ -1578,6 +1611,20 @@ impl RpcDuplexHandler for NodeDuplexRpcHandler {
         requests: InnerRequestStream,
         responses: InnerRpcResponseSink,
     ) -> std::result::Result<(), RpcHandlerError> {
+        // Keep our own handle on the sink slot.
+        //
+        // Everything below hands `JsResponseSink` to JS, and JS is the
+        // only owner from then on. A `#[napi]` class is released by V8
+        // finalization, not by scope, so the inner
+        // `RpcResponseSink` — whose drop is what tells the substrate
+        // fold the response side is done — survived until a garbage
+        // collection happened to run. The handler returned in 0 ms and
+        // the caller saw the terminal frame seconds later, quantised to
+        // GC cycles: measured at 7.6 s, 7.7 s and 15.8 s on loopback,
+        // and unaffected by mesh traffic, because GC is not driven by
+        // the mesh. Retaining the slot lets us drop it ourselves the
+        // moment the handler's promise settles.
+        let sink_slot = Arc::new(Mutex::new(Some(responses)));
         let args = DuplexHandlerArgs {
             stream: JsRequestStream {
                 inner: Arc::new(tokio::sync::Mutex::new(Some(requests))),
@@ -1587,7 +1634,7 @@ impl RpcDuplexHandler for NodeDuplexRpcHandler {
                 headers: Arc::new(ctx.headers),
             },
             sink: JsResponseSink {
-                inner: Arc::new(Mutex::new(Some(responses))),
+                inner: sink_slot.clone(),
             },
         };
         let (tx, rx) = tokio::sync::oneshot::channel::<napi::Result<Promise<Buffer>>>();
@@ -1627,7 +1674,12 @@ impl RpcDuplexHandler for NodeDuplexRpcHandler {
                 )))
             }
         };
-        match tokio::time::timeout_at(deadline, promise).await {
+        let settled = tokio::time::timeout_at(deadline, promise).await;
+        // See the streaming handler: drop the sink as soon as the
+        // handler is done with it, so the fold's terminal frame does
+        // not wait on a garbage collection.
+        drop(sink_slot.lock().take());
+        match settled {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(e)) => {
                 let msg: String = format!("{e}");
@@ -1661,9 +1713,27 @@ impl RpcDuplexHandler for NodeDuplexRpcHandler {
 /// live mesh.
 #[napi]
 pub struct MeshRpc {
-    /// Shared with the parent NetMesh — no second socket, no
-    /// second handshake table.
-    node: Arc<MeshNode>,
+    /// Shared with the parent NetMesh — no second socket, no second
+    /// handshake table.
+    ///
+    /// Behind a lock so `close()` can release it from any thread while
+    /// methods clone out. `None` once closed. A `#[napi]` class is
+    /// GC-finalized rather than scope-dropped, so without an explicit
+    /// release this clone kept `NetMesh.shutdown()` — which needs sole
+    /// ownership of the node — failing until V8 got around to it. Same
+    /// arrangement, and the same reason, as `CapabilityGateway`.
+    node: Mutex<Option<Arc<MeshNode>>>,
+    /// The runtime the parent `NetMesh` was created on.
+    ///
+    /// `serve_rpc*` is synchronous but spawns an inbound-event
+    /// bridge with a bare `tokio::spawn`, and every `serve*` below
+    /// is a sync `#[napi]` method — so it runs on the JS thread,
+    /// which is not a Tokio worker. Asking for `Handle::current()`
+    /// there panics "there is no reactor running"; that was the
+    /// defect. We carry the mesh's own handle instead and enter it
+    /// for the duration of registration, so the bridge task lands
+    /// on the same runtime as the rest of the mesh.
+    runtime: tokio::runtime::Handle,
 }
 
 #[napi]
@@ -1674,7 +1744,42 @@ impl MeshRpc {
     #[napi(factory)]
     pub fn from_mesh(mesh: &crate::NetMesh) -> Result<MeshRpc> {
         let node = mesh.node_arc_clone()?;
-        Ok(MeshRpc { node })
+        let runtime = mesh.runtime_handle();
+        Ok(MeshRpc {
+            node: Mutex::new(Some(node)),
+            runtime,
+        })
+    }
+
+    /// Release this envelope's reference to the mesh node so
+    /// [`NetMesh.shutdown`] can take sole ownership.
+    ///
+    /// Call it before `mesh.shutdown()`. Idempotent. Afterwards every
+    /// operation on this `MeshRpc` throws `nrpc:closed`; already-issued
+    /// `ServeHandle`s keep working until their own `close()`, because
+    /// they hold the registration, not this envelope.
+    ///
+    /// Without this there was no way to release the reference at all —
+    /// `shutdown()` failed with "outstanding references exist" until
+    /// V8 finalized the class, which is on no schedule the caller
+    /// controls.
+    #[napi]
+    pub fn close(&self) {
+        let _ = self.node.lock().take();
+    }
+
+    /// `true` once [`Self::close`] has been called.
+    #[napi(getter)]
+    pub fn is_closed(&self) -> bool {
+        self.node.lock().is_none()
+    }
+
+    /// The node, or the typed error a closed envelope owes its caller.
+    fn node(&self) -> Result<Arc<MeshNode>> {
+        self.node
+            .lock()
+            .clone()
+            .ok_or_else(|| nrpc_err("closed", "MeshRpc has been closed"))
     }
 
     // ---- serve ----------------------------------------------------------
@@ -1708,12 +1813,16 @@ impl MeshRpc {
             None => DEFAULT_HANDLER_TIMEOUT,
         };
         let rust_handler = Arc::new(NodeRpcHandler { tsfn, timeout });
+        // See `MeshRpc::runtime`: registration spawns, this method
+        // does not run on a runtime, so name the mesh's own.
+        let _enter = self.runtime.enter();
         let inner = self
-            .node
+            .node()?
             .serve_rpc(&service, rust_handler)
             .map_err(|e| nrpc_err("serve_failed", e))?;
         Ok(ServeHandle {
             inner: Arc::new(Mutex::new(Some(inner))),
+            runtime: self.runtime.clone(),
         })
     }
 
@@ -1730,8 +1839,8 @@ impl MeshRpc {
     /// Delegates to the substrate's [`MeshNode::reserve_cancel_token`]
     /// (v3 / C-S1).
     #[napi]
-    pub fn reserve_cancel_token(&self) -> BigInt {
-        BigInt::from(self.node.reserve_cancel_token())
+    pub fn reserve_cancel_token(&self) -> Result<BigInt> {
+        Ok(BigInt::from(self.node()?.reserve_cancel_token()))
     }
 
     /// Abort the in-flight call associated with `token`.
@@ -1748,7 +1857,7 @@ impl MeshRpc {
     #[napi]
     pub fn cancel_call(&self, token: BigInt) -> Result<()> {
         let token = crate::common::bigint_u64(token)?;
-        self.node.cancel(token);
+        self.node()?.cancel(token);
         Ok(())
     }
 
@@ -1770,7 +1879,7 @@ impl MeshRpc {
         // cancel_token lives on inner_opts; substrate handles cancel
         // uniformly across shapes. RpcError::Cancelled maps to
         // `nrpc:cancelled:` via the error-kind table.
-        self.node
+        self.node()?
             .call(target, &service, req_bytes, inner_opts)
             .await
             .map(|reply| Buffer::from(reply.body.as_ref()))
@@ -1789,7 +1898,7 @@ impl MeshRpc {
     ) -> Result<Buffer> {
         let inner_opts = opts.unwrap_or_default().into_inner();
         let req_bytes = Bytes::copy_from_slice(request.as_ref());
-        self.node
+        self.node()?
             .call_service(&service, req_bytes, inner_opts)
             .await
             .map(|reply| Buffer::from(reply.body.as_ref()))
@@ -1812,7 +1921,7 @@ impl MeshRpc {
         let target = crate::common::bigint_u64(target_node_id)?;
         let opts = opts.unwrap_or_default().into_inner();
         let inner = self
-            .node
+            .node()?
             .call_streaming(
                 target,
                 &service,
@@ -1846,7 +1955,7 @@ impl MeshRpc {
     ) -> Result<RpcStream> {
         let opts = opts.unwrap_or_default().into_inner();
         let inner = self
-            .node
+            .node()?
             .call_service_streaming(&service, Bytes::copy_from_slice(request.as_ref()), opts)
             .await
             .map_err(nrpc_err_from_inner)?;
@@ -1874,7 +1983,7 @@ impl MeshRpc {
         let target = crate::common::bigint_u64(target_node_id)?;
         let opts = opts.unwrap_or_default().into_inner();
         let inner = self
-            .node
+            .node()?
             .call_client_stream(target, &service, opts)
             .await
             .map_err(nrpc_err_from_inner)?;
@@ -1901,7 +2010,7 @@ impl MeshRpc {
         let target = crate::common::bigint_u64(target_node_id)?;
         let opts = opts.unwrap_or_default().into_inner();
         let inner = self
-            .node
+            .node()?
             .call_duplex(target, &service, opts)
             .await
             .map_err(nrpc_err_from_inner)?;
@@ -1936,12 +2045,14 @@ impl MeshRpc {
             tsfn,
             timeout: DEFAULT_HANDLER_TIMEOUT,
         });
+        let _enter = self.runtime.enter();
         let inner = self
-            .node
+            .node()?
             .serve_rpc_client_stream(&service, inner_handler)
             .map_err(|e| nrpc_err("serve_failed", format!("{e}")))?;
         Ok(ServeHandle {
             inner: Arc::new(Mutex::new(Some(inner))),
+            runtime: self.runtime.clone(),
         })
     }
 
@@ -1969,12 +2080,14 @@ impl MeshRpc {
             tsfn,
             timeout: DEFAULT_HANDLER_TIMEOUT,
         });
+        let _enter = self.runtime.enter();
         let inner = self
-            .node
+            .node()?
             .serve_rpc_duplex(&service, inner_handler)
             .map_err(|e| nrpc_err("serve_failed", format!("{e}")))?;
         Ok(ServeHandle {
             inner: Arc::new(Mutex::new(Some(inner))),
+            runtime: self.runtime.clone(),
         })
     }
 
@@ -2010,12 +2123,14 @@ impl MeshRpc {
             tsfn,
             timeout: DEFAULT_HANDLER_TIMEOUT,
         });
+        let _enter = self.runtime.enter();
         let inner = self
-            .node
+            .node()?
             .serve_rpc_streaming(&service, inner_handler)
             .map_err(|e| nrpc_err("serve_failed", format!("{e}")))?;
         Ok(ServeHandle {
             inner: Arc::new(Mutex::new(Some(inner))),
+            runtime: self.runtime.clone(),
         })
     }
 
@@ -2026,12 +2141,13 @@ impl MeshRpc {
     /// caller-side routing logic. Returns BigInt array (each
     /// node id is a 64-bit value).
     #[napi]
-    pub fn find_service_nodes(&self, service: String) -> Vec<BigInt> {
-        self.node
+    pub fn find_service_nodes(&self, service: String) -> Result<Vec<BigInt>> {
+        Ok(self
+            .node()?
             .find_service_nodes(&service)
             .into_iter()
             .map(BigInt::from)
-            .collect()
+            .collect())
     }
 
     // ---- observer + metrics (S2-A1) ------------------------------------
@@ -2055,17 +2171,21 @@ impl MeshRpc {
         match observer {
             Some(f) => {
                 let tsfn: RpcObserverTsfn = f.build_threadsafe_function().build()?;
-                let handle = tokio::runtime::Handle::current();
+                // Same defect as the serve seams, one method over:
+                // `ObserverChannel::install` spawns a drain task, and
+                // this is a sync `#[napi]` method with no current
+                // runtime. Use the mesh's handle, not `current()`.
+                let handle = &self.runtime;
                 let channel =
-                    ::net::adapter::net::cortex::ObserverChannel::install(&handle, move |evt| {
+                    ::net::adapter::net::cortex::ObserverChannel::install(handle, move |evt| {
                         let js_evt = RpcCallEventJs::from(evt.as_ref());
                         let _ = tsfn.call(js_evt, ThreadsafeFunctionCallMode::NonBlocking);
                     });
                 let obs: Arc<dyn RpcObserver> = Arc::new(channel);
-                self.node.set_rpc_observer(Some(obs));
+                self.node()?.set_rpc_observer(Some(obs));
             }
             None => {
-                self.node.set_rpc_observer(None);
+                self.node()?.set_rpc_observer(None);
             }
         }
         Ok(())
@@ -2078,8 +2198,10 @@ impl MeshRpc {
     /// JS POD (BigInts for u64 fields); read fields directly or
     /// feed into your own exporter.
     #[napi]
-    pub fn metrics_snapshot(&self) -> RpcMetricsSnapshotJs {
-        RpcMetricsSnapshotJs::build(&self.node.rpc_metrics_snapshot())
+    pub fn metrics_snapshot(&self) -> Result<RpcMetricsSnapshotJs> {
+        Ok(RpcMetricsSnapshotJs::build(
+            &self.node()?.rpc_metrics_snapshot(),
+        ))
     }
 }
 

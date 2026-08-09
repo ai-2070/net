@@ -25,7 +25,17 @@
 //! assert!(filter.matches(&caps));
 //! ```
 //!
-//! # Cross-node (direct-peer, one-hop)
+//! # Cross-node (multi-hop, up to 16)
+//!
+//! Announcements are forwarded up to `MAX_CAPABILITY_HOPS = 16`
+//! (`adapter/net/behavior/capability.rs`), so a node several hops away
+//! is discoverable — a three-node witness lives in
+//! `tests/capability_multihop.rs`. This module used to say
+//! "direct-peer, one-hop" and that discovery beyond one hop was
+//! deferred; it is not.
+//!
+//! Discovery propagation and transport connectivity are separate
+//! questions: finding a node does not mean you have a session to it.
 //!
 //! With `--features net`, `Mesh` has
 //! [`announce_capabilities`](crate::mesh::Mesh::announce_capabilities)

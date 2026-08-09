@@ -17,6 +17,7 @@ from net import (
     delegate_token,
     parse_token,
     token_is_expired,
+    verify_signature,
     verify_token,
 )
 
@@ -74,6 +75,59 @@ def test_sign_returns_64_bytes() -> None:
     sig = ident.sign(b"hello world")
     assert isinstance(sig, bytes)
     assert len(sig) == 64
+
+
+def test_sign_verify_round_trip() -> None:
+    """Sign then verify, in one round trip.
+
+    The length assertion above passes for any 64 bytes, including 64
+    zeros. Nothing checked that a signature produced here actually
+    verifies, because until ``verify_signature`` there was no way to
+    check it outside Rust.
+    """
+    ident = Identity.generate()
+    message = b"the exact bytes that were signed"
+    sig = ident.sign(message)
+
+    assert verify_signature(ident.entity_id, message, sig) is True
+
+    # Wrong message, wrong key, and the all-zero signature a length
+    # check accepts.
+    assert verify_signature(ident.entity_id, b"different bytes", sig) is False
+    other = Identity.generate()
+    assert verify_signature(other.entity_id, message, sig) is False
+    assert verify_signature(ident.entity_id, message, b"\x00" * 64) is False
+
+    tampered = bytearray(sig)
+    tampered[0] ^= 0xFF
+    assert verify_signature(ident.entity_id, message, bytes(tampered)) is False
+
+
+def test_verify_signature_empty_message() -> None:
+    ident = Identity.generate()
+    sig = ident.sign(b"")
+    assert verify_signature(ident.entity_id, b"", sig) is True
+    # An empty message must not accept some other message's signature.
+    assert verify_signature(ident.entity_id, b"", ident.sign(b"x")) is False
+
+
+def test_verify_signature_rejects_malformed_arguments() -> None:
+    """A malformed argument raises; it never returns ``False``.
+
+    A caller that cannot tell the two apart treats its own bug as a
+    failed signature check.
+    """
+    ident = Identity.generate()
+    message = b"payload"
+    sig = ident.sign(message)
+
+    for bad_id_len in (0, 31, 33):
+        with pytest.raises(IdentityError):
+            verify_signature(b"\x00" * bad_id_len, message, sig)
+
+    for bad_sig_len in (0, 63, 65):
+        with pytest.raises(IdentityError):
+            verify_signature(ident.entity_id, message, b"\x00" * bad_sig_len)
 
 
 # -------------------------------------------------------------------------

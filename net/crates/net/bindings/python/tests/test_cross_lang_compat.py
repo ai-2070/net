@@ -1,5 +1,11 @@
 """Cross-binding nRPC wire-format compat — Phase B7.
 
+NOT an interoperability test. The handler runs in-process against a
+stub raw MeshRpc; no mesh is started, no native service is registered,
+and no second process is involved. It pins the JSON codec, the status
+constants, and the error-prefix convention — that the encoders agree,
+not that the bindings can talk to each other.
+
 Loads the shared ``tests/cross_lang_nrpc/golden_vectors.json``
 fixture (the same one driving the Rust + Node tests) and asserts
 the canonical ``cross_lang_echo_sum`` service round-trips
@@ -130,7 +136,7 @@ def _parse_status(msg: str) -> int | None:
 
 def test_fixture_metadata_matches_canonical_contract() -> None:
     assert FIXTURE["service"] == "cross_lang_echo_sum"
-    assert FIXTURE["abi_version_expected"] == 0x0001
+    assert FIXTURE["abi_version_expected"] == 0x0004
     assert NRPC_TYPED_BAD_REQUEST == 0x8000
     assert len(FIXTURE["ok_cases"]) > 0
     assert len(FIXTURE["error_cases"]) > 0

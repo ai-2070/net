@@ -2981,27 +2981,52 @@ impl CapabilityRequirement {
         }
     }
 
+    /// Normalize a caller-supplied placement weight to `0.0..=1.0`.
+    ///
+    /// `f32::clamp` returns `NaN` unchanged — clamping is defined in
+    /// terms of comparisons, and every comparison with `NaN` is false.
+    /// So a `NaN` weight used to survive into the stored requirement,
+    /// where the scoring guards (`if weight > 0.0`) are also false and
+    /// silently treated the axis as omitted. The caller asked for a
+    /// preference, got no error, and got scoring that ignored it.
+    ///
+    /// Node and PyO3 already reject non-finite weights at their
+    /// boundaries, and Go and C cannot represent them in JSON, which
+    /// made Rust the one permissive surface. Map `NaN` to `0.0`
+    /// explicitly so "this axis is off" is a decision in one place
+    /// rather than an accident of comparison semantics. The
+    /// infinities already clamp correctly (`+inf → 1.0`,
+    /// `-inf → 0.0`) and keep doing so.
+    #[inline]
+    fn normalize_weight(weight: f32) -> f32 {
+        if weight.is_nan() {
+            0.0
+        } else {
+            weight.clamp(0.0, 1.0)
+        }
+    }
+
     /// Set memory preference weight
     pub fn prefer_memory(mut self, weight: f32) -> Self {
-        self.prefer_more_memory = weight.clamp(0.0, 1.0);
+        self.prefer_more_memory = Self::normalize_weight(weight);
         self
     }
 
     /// Set VRAM preference weight
     pub fn prefer_vram(mut self, weight: f32) -> Self {
-        self.prefer_more_vram = weight.clamp(0.0, 1.0);
+        self.prefer_more_vram = Self::normalize_weight(weight);
         self
     }
 
     /// Set inference speed preference
     pub fn prefer_speed(mut self, weight: f32) -> Self {
-        self.prefer_faster_inference = weight.clamp(0.0, 1.0);
+        self.prefer_faster_inference = Self::normalize_weight(weight);
         self
     }
 
     /// Set loaded model preference
     pub fn prefer_loaded(mut self, weight: f32) -> Self {
-        self.prefer_loaded_models = weight.clamp(0.0, 1.0);
+        self.prefer_loaded_models = Self::normalize_weight(weight);
         self
     }
 
@@ -3087,6 +3112,61 @@ pub trait CardinalityProvider {
 
 #[cfg(test)]
 mod tests {
+
+    /// A `NaN` placement weight must not survive into a requirement.
+    ///
+    /// `f32::clamp` returns `NaN` unchanged, and the scoring guards
+    /// (`if weight > 0.0`) are also false for `NaN`, so the axis was
+    /// silently dropped: the caller expressed a preference, got no
+    /// error, and got scoring that ignored it. Node and PyO3 reject
+    /// non-finite weights and Go/C cannot encode them, so Rust was the
+    /// one surface that accepted the value and then discarded it.
+    #[test]
+    fn non_finite_placement_weights_are_normalized() {
+        let req = CapabilityRequirement::from_filter(CapabilityFilter::new())
+            .prefer_memory(f32::NAN)
+            .prefer_vram(f32::INFINITY)
+            .prefer_speed(f32::NEG_INFINITY)
+            .prefer_loaded(0.5);
+
+        assert!(
+            !req.prefer_more_memory.is_nan(),
+            "NaN must not reach the stored requirement",
+        );
+        assert_eq!(req.prefer_more_memory, 0.0, "NaN means the axis is off");
+        assert_eq!(req.prefer_more_vram, 1.0, "+inf clamps to the maximum");
+        assert_eq!(req.prefer_faster_inference, 0.0, "-inf clamps to zero");
+        assert_eq!(req.prefer_loaded_models, 0.5, "finite weights unchanged");
+    }
+
+    /// The ordinary clamp behaviour must be untouched by the NaN guard.
+    #[test]
+    fn finite_placement_weights_clamp_as_before() {
+        let req = CapabilityRequirement::from_filter(CapabilityFilter::new())
+            .prefer_memory(-1.0)
+            .prefer_vram(2.0)
+            .prefer_speed(0.0)
+            .prefer_loaded(1.0);
+
+        assert_eq!(req.prefer_more_memory, 0.0);
+        assert_eq!(req.prefer_more_vram, 1.0);
+        assert_eq!(req.prefer_faster_inference, 0.0);
+        assert_eq!(req.prefer_loaded_models, 1.0);
+    }
+
+    /// Scoring must stay finite. A `NaN` weight that reached `score`
+    /// through any unguarded arithmetic would poison the comparison
+    /// that ranks candidates.
+    #[test]
+    fn scoring_stays_finite_under_non_finite_weights() {
+        let req = CapabilityRequirement::from_filter(CapabilityFilter::new())
+            .prefer_memory(f32::NAN)
+            .prefer_vram(f32::NAN)
+            .prefer_speed(f32::NAN)
+            .prefer_loaded(f32::NAN);
+        let score = req.score(&CapabilitySet::new());
+        assert!(score.is_finite(), "score must be finite, got {score}");
+    }
     use super::*;
     /// Fixed-bytes `EntityId` for unit-test fixtures. Valid as a
     /// *value* (it's just 32 bytes) but not a valid ed25519 public

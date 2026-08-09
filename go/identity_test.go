@@ -130,6 +130,126 @@ func TestSign_EmptyMessage(t *testing.T) {
 	}
 }
 
+// Sign then verify, in one round trip, through the Go binding.
+//
+// The two tests above assert the signature's LENGTH, which passes for
+// any 64 bytes — including 64 zeros. Nothing here checked that a
+// signature produced through this binding actually verifies, because
+// until VerifySignature there was no way to check it outside Rust.
+func TestVerifySignature_RoundTripAndRejections(t *testing.T) {
+	id, err := GenerateIdentity()
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	defer id.Close()
+
+	entityID, err := id.EntityID()
+	if err != nil {
+		t.Fatalf("entity id: %v", err)
+	}
+	msg := []byte("the exact bytes that were signed")
+	sig, err := id.Sign(msg)
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+
+	ok, err := VerifySignature(entityID, msg, sig)
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if !ok {
+		t.Fatal("a freshly produced signature must verify")
+	}
+
+	// Wrong message.
+	if ok, err := VerifySignature(entityID, []byte("different bytes"), sig); err != nil || ok {
+		t.Fatalf("a signature must not verify against another message (ok=%v err=%v)", ok, err)
+	}
+
+	// Wrong key.
+	other, err := GenerateIdentity()
+	if err != nil {
+		t.Fatalf("generate other: %v", err)
+	}
+	defer other.Close()
+	otherID, err := other.EntityID()
+	if err != nil {
+		t.Fatalf("entity id: %v", err)
+	}
+	if ok, err := VerifySignature(otherID, msg, sig); err != nil || ok {
+		t.Fatalf("a signature must not verify under another entity (ok=%v err=%v)", ok, err)
+	}
+
+	// The all-zero signature a length check accepts.
+	if ok, err := VerifySignature(entityID, msg, make([]byte, 64)); err != nil || ok {
+		t.Fatalf("64 zero bytes must not verify (ok=%v err=%v)", ok, err)
+	}
+
+	// Tampered.
+	tampered := append([]byte(nil), sig...)
+	tampered[0] ^= 0xff
+	if ok, err := VerifySignature(entityID, msg, tampered); err != nil || ok {
+		t.Fatalf("a tampered signature must not verify (ok=%v err=%v)", ok, err)
+	}
+}
+
+// An empty message is a legitimate thing to sign, and a nil slice must
+// not be confused with a missing argument.
+func TestVerifySignature_EmptyMessage(t *testing.T) {
+	id, err := GenerateIdentity()
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	defer id.Close()
+
+	entityID, err := id.EntityID()
+	if err != nil {
+		t.Fatalf("entity id: %v", err)
+	}
+	sig, err := id.Sign(nil)
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	ok, err := VerifySignature(entityID, nil, sig)
+	if err != nil {
+		t.Fatalf("verify empty: %v", err)
+	}
+	if !ok {
+		t.Fatal("an empty message must verify against its own signature")
+	}
+}
+
+// A malformed argument is an error, never a `false` verdict. A caller
+// that cannot tell them apart treats its own bug as a failed check.
+func TestVerifySignature_MalformedArgumentsError(t *testing.T) {
+	id, err := GenerateIdentity()
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	defer id.Close()
+
+	entityID, err := id.EntityID()
+	if err != nil {
+		t.Fatalf("entity id: %v", err)
+	}
+	msg := []byte("payload")
+	sig, err := id.Sign(msg)
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+
+	for _, n := range []int{0, 31, 33} {
+		if _, err := VerifySignature(make([]byte, n), msg, sig); err == nil {
+			t.Fatalf("a %d-byte entity id must be an error, not a false verdict", n)
+		}
+	}
+	for _, n := range []int{0, 63, 65} {
+		if _, err := VerifySignature(entityID, msg, make([]byte, n)); err == nil {
+			t.Fatalf("a %d-byte signature must be an error, not a false verdict", n)
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // issue / parse / verify
 // ---------------------------------------------------------------------------

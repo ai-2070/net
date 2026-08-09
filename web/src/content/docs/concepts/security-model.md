@@ -22,7 +22,7 @@ identifier is derived from it by domain-separated BLAKE2s-MAC — a 4-byte
 network address, which is what lets an entity migrate between nodes and keep
 being itself.
 
-**Authorization.** A `PermissionToken` is a 161-byte signed grant: issuer,
+**Authorization.** A `PermissionToken` is a 169-byte signed grant: issuer,
 subject, a scope bitfield (`PUBLISH` / `SUBSCRIBE` / `ADMIN` / `DELEGATE`), a
 channel hash, a validity window, a delegation depth, and a nonce for revocation.
 Tokens are delegatable, and a delegated token's scope is the intersection of its

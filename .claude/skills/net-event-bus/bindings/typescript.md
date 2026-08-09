@@ -25,9 +25,16 @@ is missing.
 ```typescript
 interface TempReading { sensor_id: string; celsius: number }
 
-const node = await NetNode.create({ shards: 4 });
-// Other transports: pass `transport: { type: 'redis' | 'jetstream' | 'mesh', ... }`
-// to create() — per-transport fields are on `Transport` in src/types.ts.
+// A transport that STORES. The default (memory) selects the Noop
+// adapter, which counts batches and discards them — publish succeeds
+// and `subscribe()` then yields nothing, forever. Use memory for
+// ingestion, batching, backpressure, counters and lifecycle; use
+// redis / jetstream / mesh the moment a consumer has to receive
+// something. Per-transport fields are on `Transport` in src/types.ts.
+const node = await NetNode.create({
+  shards: 4,
+  transport: { type: 'redis', url: 'redis://127.0.0.1:6379' },
+});
 
 const temps = node.channel<TempReading>('sensors/temperature');
 temps.publish({ sensor_id: 'A1', celsius: 22.5 });
@@ -38,6 +45,11 @@ for await (const r of temps.subscribe()) {
 
 await node.shutdown();
 ```
+
+That is a **tagged EventBus topic** — one node, many logical streams over its
+own bus. It is not distributed pub/sub: for two nodes to exchange events by
+channel name, use `MeshNode.registerChannel` / `subscribeChannel` /
+`publishChannel`. See `concepts.md` § Channel.
 
 **`NetNode.create(config)` is async — you must `await` it.** This is the first
 thing that differs from Python, where construction is synchronous.
@@ -70,12 +82,17 @@ mixing them up is the standard TypeScript bug here.
 
 | Method | Returns | On failure |
 |---|---|---|
-| `emit(obj)`, `emitRaw(json)` | `Receipt \| null` | **throws** |
+| `emit(obj)`, `emitRaw(json)` | `Receipt` | **throws** |
 | `emitBatch(objs)`, `emitRawBatch(jsons)` | `number` ingested | throws on shutdown; short count on `drop_*` |
-| `channel.publish`, `channel.publishBatch`, `emitBuffer`, `fire`, `fireBatch` | `boolean` / `number` | returns `false` or a short count — **never throws** |
+| `channel.publish`, `channel.publishBatch`, `emitBuffer`, `fire`, `fireBatch` | `boolean` / `number` | returns `false` or a short count — see the `JSON.stringify` caveat below |
 
-- The `| null` on `emit` is **vestigial**. The underlying napi binding throws on
-  ingestion failure. Wrap in `try/catch`; do not null-check.
+- `emit` used to be typed `Receipt | null` even though no branch could return
+  `null`; the underlying napi binding throws on ingestion failure. The type is
+  now `Receipt`. Wrap in `try/catch`; do not null-check.
+- "Never throws" holds only for *ingestion*. `channel.publish` and
+  `channel.publishBatch` call `JSON.stringify` first, which throws on cyclic
+  structures and `bigint` values and runs any getter on your event. That throw
+  happens before the bus is reached, so nothing was published.
 - For the batch forms, compare the returned count against the input length to
   detect partial drops.
 - Under the default `drop_oldest` / `drop_newest` modes the throwing methods
@@ -87,7 +104,15 @@ mixing them up is the standard TypeScript bug here.
 
 ## Shutdown
 
-`await node.shutdown()`. Close channels before shutting the node down.
+`await node.shutdown()`, and it is idempotent.
+
+**There is nothing to close first.** A `TypedChannel` from `node.channel(...)`
+has no `close()` and no lifecycle of its own — it is a name, a prebuilt filter
+string, and an optional validator, all owned by the node. Construct as many as
+you like and drop them by letting them go out of scope. What *does* need
+stopping is a live subscription: call `stream.stop()` on any `subscribe()` /
+`subscribeRaw()` iterator you are not draining, or the polling loop keeps
+running against a shut-down bus.
 
 ## Gaps
 

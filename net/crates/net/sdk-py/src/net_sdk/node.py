@@ -3,23 +3,17 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
 from typing import Any, Callable, Generic, Iterator, Optional, TypeVar, overload
 
 from net import Net, IngestResult, StoredEvent, PollResponse, Stats
 
 from net_sdk.stream import EventStream, SubscribeOpts, TypedEventStream
 from net_sdk.channel import TypedChannel
+from net_sdk.types import Receipt
+
+__all__ = ["NetNode", "Receipt"]
 
 T = TypeVar("T")
-
-
-@dataclass
-class Receipt:
-    """Receipt from a successful ingestion."""
-
-    shard_id: int
-    timestamp: int
 
 
 class NetNode:
@@ -268,15 +262,31 @@ class NetNode:
         self,
         name: str,
         model: Optional[type[T]] = None,
+        parse: Optional[Callable[[str], T]] = None,
     ) -> TypedChannel[T]:
         """
         Create a typed channel for pub/sub.
 
+        `name` must satisfy the canonical Net channel-name grammar or
+        `ChannelNameError` is raised — see `net_sdk.channel.
+        validate_channel_name`.
+
+        `model` deserializes with `model(**payload)`. Pass `parse`
+        instead when the type needs its own constructor: a Pydantic v2
+        model wants `model_validate_json` (coercion and validators),
+        which `Model(**payload)` skips. `parse` receives payload-only
+        JSON — the `_channel` routing tag is already stripped.
+
         Example:
             >>> temps = node.channel('sensors/temperature', TemperatureReading)
             >>> temps.publish(TemperatureReading(sensor_id='A1', celsius=22.5))
+
+            >>> readings = node.channel(
+            ...     'sensors/temperature',
+            ...     parse=lambda raw: Reading.model_validate_json(raw),
+            ... )
         """
-        return TypedChannel(self._bus, name, model=model)
+        return TypedChannel(self._bus, name, model=model, parse=parse)
 
     # ---- Lifecycle ----
 
@@ -287,6 +297,19 @@ class NetNode:
     def shards(self) -> int:
         """Get the number of active shards."""
         return self._bus.num_shards()
+
+    def flush(self) -> None:
+        """Flush pending batches to the adapter.
+
+        A reusable delivery barrier: publish, wait for what is in
+        flight to reach the adapter, then keep publishing. `shutdown()`
+        also drains, but it is terminal — before this existed there was
+        no way to express the barrier in Python at all, while Rust,
+        Node, Go and C all had one.
+
+        Raises if the bus has already been shut down.
+        """
+        self._bus.flush()
 
     def shutdown(self) -> None:
         """Gracefully shut down the node."""

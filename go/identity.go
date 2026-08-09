@@ -3,7 +3,7 @@
 // Mirrors the Rust SDK's `Identity` / `PermissionToken` one-for-one,
 // matching the PyO3 / NAPI shape so cross-binding fixtures round-
 // trip. Tokens cross the C boundary as opaque `[]byte` buffers
-// (159 bytes each); entity ids as 32-byte slices. The Go side owns
+// (169 bytes each); entity ids as 32-byte slices. The Go side owns
 // token storage; `net_free_bytes` is invoked inline on the return
 // path via `freeBytes`.
 //
@@ -40,13 +40,13 @@ var (
 	// sentinels below.
 	ErrIdentity = errors.New("identity: malformed input")
 
-	ErrTokenInvalidFormat         = errors.New("token: invalid_format")
-	ErrTokenInvalidSignature      = errors.New("token: invalid_signature")
-	ErrTokenExpired               = errors.New("token: expired")
-	ErrTokenNotYetValid           = errors.New("token: not_yet_valid")
-	ErrTokenDelegationExhausted   = errors.New("token: delegation_exhausted")
-	ErrTokenDelegationNotAllowed  = errors.New("token: delegation_not_allowed")
-	ErrTokenNotAuthorized         = errors.New("token: not_authorized")
+	ErrTokenInvalidFormat        = errors.New("token: invalid_format")
+	ErrTokenInvalidSignature     = errors.New("token: invalid_signature")
+	ErrTokenExpired              = errors.New("token: expired")
+	ErrTokenNotYetValid          = errors.New("token: not_yet_valid")
+	ErrTokenDelegationExhausted  = errors.New("token: delegation_exhausted")
+	ErrTokenDelegationNotAllowed = errors.New("token: delegation_not_allowed")
+	ErrTokenNotAuthorized        = errors.New("token: not_authorized")
 )
 
 func identityErrorFromCode(code C.int) error {
@@ -225,6 +225,51 @@ func (id *Identity) Sign(msg []byte) ([]byte, error) {
 	return out, nil
 }
 
+// VerifySignature reports whether `signature` is a valid detached
+// ed25519 signature over `msg` for the 32-byte `entityID`.
+//
+// The verifying half of Sign. Go exposed signing and no verification
+// for an arbitrary message, so a signature produced here could only be
+// checked from Rust — and the Go tests asserted the signature's length
+// rather than a round trip, which passes for any 64 bytes.
+//
+// Strict verification: the malleable (R, S+L) variant is rejected, so
+// one logical message cannot appear under two byte encodings.
+//
+// A `false` with a nil error means the signature did not verify. An
+// error means an argument was malformed (wrong-length id or
+// signature), never that verification failed.
+func VerifySignature(entityID, msg, signature []byte) (bool, error) {
+	if len(entityID) != 32 {
+		return false, fmt.Errorf("entity id must be 32 bytes, got %d", len(entityID))
+	}
+	if len(signature) != 64 {
+		return false, fmt.Errorf("signature must be 64 bytes, got %d", len(signature))
+	}
+
+	var msgPtr *C.uint8_t
+	if len(msg) > 0 {
+		msgPtr = (*C.uint8_t)(unsafe.Pointer(&msg[0]))
+	}
+	var valid C.int
+	code := C.net_verify_signature(
+		(*C.uint8_t)(unsafe.Pointer(&entityID[0])),
+		C.size_t(len(entityID)),
+		msgPtr,
+		C.size_t(len(msg)),
+		(*C.uint8_t)(unsafe.Pointer(&signature[0])),
+		C.size_t(len(signature)),
+		&valid,
+	)
+	runtime.KeepAlive(entityID)
+	runtime.KeepAlive(msg)
+	runtime.KeepAlive(signature)
+	if err := identityErrorFromCode(code); err != nil {
+		return false, err
+	}
+	return valid != 0, nil
+}
+
 // IssueTokenRequest describes a token the identity is issuing as
 // signer. `Scope` is any non-empty subset of
 // `{"publish", "subscribe", "admin", "delegate"}`.
@@ -237,7 +282,7 @@ type IssueTokenRequest struct {
 }
 
 // IssueToken issues a permission token to `req.Subject` for `req.Channel`.
-// Returns the serialized 159-byte token; treat it as opaque bytes
+// Returns the serialized 169-byte token; treat it as opaque bytes
 // (persist / ship / hand to peers as-is).
 func (id *Identity) IssueToken(req IssueTokenRequest) ([]byte, error) {
 	id.mu.RLock()
@@ -362,8 +407,16 @@ type ParsedToken struct {
 	NotBefore       uint64   `json:"not_before"`
 	NotAfter        uint64   `json:"not_after"`
 	DelegationDepth uint8    `json:"delegation_depth"`
-	Nonce           uint64   `json:"nonce"`
-	SignatureHex    string   `json:"signature_hex"`
+
+	// IssuerGeneration is the issuer generation this token was minted
+	// under. The revocation registry rejects tokens below the issuer's
+	// monotonic floor, so this is what explains a refusal that
+	// otherwise looks like a valid credential being rejected for no
+	// visible reason.
+	IssuerGeneration uint32 `json:"issuer_generation"`
+
+	Nonce        uint64 `json:"nonce"`
+	SignatureHex string `json:"signature_hex"`
 }
 
 // ParseToken decodes a serialized `PermissionToken`. Returns

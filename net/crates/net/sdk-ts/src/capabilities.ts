@@ -25,8 +25,12 @@
  * const peers = node.findNodes({ requireTags: ['gpu'], minVramGb: 16 });
  * ```
  *
- * Multi-hop propagation is deferred; today peers more than one hop
- * away are not visible.
+ * Announcements are forwarded up to `MAX_CAPABILITY_HOPS = 16`, so a
+ * node several hops away is discoverable. This previously said
+ * multi-hop was deferred and distant peers invisible; it is not.
+ *
+ * Discovery propagation and transport connectivity are separate
+ * questions — finding a node does not mean you have a session to it.
  */
 
 // ----------------------------------------------------------------------------

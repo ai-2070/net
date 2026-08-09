@@ -32,14 +32,24 @@ class TempReading:
     sensor_id: str
     celsius: float
 
-with NetNode(shards=4) as node:
-    # Other transports: redis_url=, jetstream_url=, or mesh_* kwargs
+# A transport that STORES. The default (memory) selects the Noop
+# adapter, which counts batches and discards them — publish succeeds
+# and `subscribe()` then blocks forever with nothing to yield. Use
+# memory for ingestion, batching, backpressure, counters and lifecycle;
+# use redis_url= / jetstream_url= / mesh_* the moment a consumer has to
+# receive something.
+with NetNode(shards=4, redis_url='redis://127.0.0.1:6379') as node:
     temps = node.channel('sensors/temperature', TempReading)
     temps.publish(TempReading(sensor_id='A1', celsius=22.5))
 
     for r in temps.subscribe():           # sync generator
         print(f'{r.sensor_id}: {r.celsius}°C')
 ```
+
+That is a **tagged EventBus topic** — one node, many logical streams over its
+own bus. It is not distributed pub/sub: for two nodes to exchange events by
+channel name, use the `net.NetMesh` channel methods (`core-only` in Python —
+`net_sdk.MeshNode` does not wrap them). See `concepts.md` § Channel.
 
 **`NetNode(...)` is synchronous** — no `await`, no factory. Use the context
 manager for automatic shutdown.
@@ -70,9 +80,15 @@ Spelt `buffer_capacity=1024` in this binding.
 
 ## Names and shapes
 
-- `node.channel('name', Model)` — the named-channel surface. The model may be a
-  `@dataclass`, a Pydantic model (anything with `model_dump()`), or a plain
-  class (anything with `__dict__`).
+- `node.channel('name', Model)` — the tagged-topic surface. The model may be a
+  `@dataclass` (including `slots=True`), a Pydantic model (anything with
+  `model_dump()`), or a plain class (anything with `__dict__` or `__slots__`).
+  `name` is validated against the canonical channel grammar and raises
+  `ChannelNameError` — lowercase only, no `//`, no leading/trailing `/`, no
+  `.`/`..` segments, ≤ 255 bytes.
+- `node.channel('name', parse=fn)` — third argument for types whose
+  constructor is not `Model(**payload)`. `fn` takes payload-only JSON (the
+  `_channel` routing tag is already stripped) and returns the event.
 - Discovery is `find_nodes` / `find_nodes_scoped` / `find_service_nodes`,
   returning a **list**, plus `find_best_node` / `find_best_node_scoped`, which
   apply the requirement's weights and return one `int | None`. `None` is no

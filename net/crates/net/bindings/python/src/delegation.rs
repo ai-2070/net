@@ -39,7 +39,11 @@ pub const GATEWAY_DELEGATION_CHANNEL: &str = net_sdk::delegation::GATEWAY_DELEGA
 /// handle. Stays inside the crate — the seed bytes are read from the
 /// opaque handle and never surface to Python.
 pub(crate) fn to_sdk(id: &Identity) -> SdkIdentity {
-    SdkIdentity::from_seed(*id.keypair.secret_bytes())
+    let sdk = SdkIdentity::from_seed(*id.keypair.secret_bytes());
+    // Carry the epoch. `from_seed` restores the key at generation
+    // zero, and a delegation signed by a zero-generation copy of a
+    // rotated issuer lands below that issuer's own floor.
+    sdk.at_generation(id.generation).unwrap_or(sdk)
 }
 
 pub(crate) fn entity_id_from_bytes(bytes: &[u8]) -> PyResult<EntityId> {
@@ -68,6 +72,8 @@ pub fn derive_child_identity(parent: &Identity, label: &str) -> Identity {
     Identity {
         keypair: Arc::new(EntityKeypair::from_bytes(child_seed)),
         cache: Arc::new(TokenCache::new()),
+        // A freshly-derived child has no rotation history of its own.
+        generation: 0,
     }
 }
 

@@ -76,6 +76,17 @@ class Stats:
         """Events dropped due to backpressure."""
         ...
 
+    @property
+    def batches_dispatched(self) -> int:
+        """Batches handed to the adapter.
+
+        The direct observer for dispatch progress, and the only counter
+        that moves under the default ``drop_oldest`` mode — there the
+        producer always succeeds and ``events_dropped`` never
+        increments.
+        """
+        ...
+
 class Net:
     """
     High-performance event bus for Python.
@@ -864,7 +875,7 @@ class NetMesh:
         """Subscribe to `channel` on `publisher_node_id`.
 
         Optional ``token`` is the serialized ``PermissionToken`` bytes
-        (161 bytes) — attach it when the publisher set
+        (169 bytes) — attach it when the publisher set
         ``require_token=True`` on the channel, or when the caller's
         caps don't satisfy ``subscribe_caps`` on their own.
 
@@ -1036,7 +1047,59 @@ class Identity:
         """Alias for :meth:`from_seed`."""
         ...
     def to_bytes(self) -> bytes:
-        """Serialize as the 32-byte seed. Treat as secret."""
+        """Serialize as the 32-byte seed. Treat as secret.
+
+        **Key-only.** The seed carries no issuer generation, so an
+        issuer that has rotated and comes back through
+        :meth:`from_seed` / :meth:`from_bytes` starts at generation 0 —
+        below its own published floor, unable to mint anything a
+        verifier accepts. Use :meth:`to_state_bytes` /
+        :meth:`from_state_bytes` for anything that rotates."""
+        ...
+    @property
+    def issuer_generation(self) -> int:
+        """This issuer's credential epoch, stamped on every token
+        :meth:`issue_token` mints.
+
+        A verifier rejects that token once its ``RevocationRegistry``
+        floor for this entity exceeds this value."""
+        ...
+    def at_generation(self, next: int) -> "Identity":
+        """The same key at a later generation, as a **new** Identity.
+
+        This one is unchanged, so rotation is explicit at the call site
+        rather than something that happens to a caller mid-issuance.
+
+        ``next == issuer_generation`` is accepted and idempotent at
+        every generation including ``2**32 - 1``, so re-applying a
+        persisted generation on restart is never an error. Going
+        backwards raises :class:`IdentityError`. There is no generation
+        above ``2**32 - 1`` to name, so an issuer there can re-apply but
+        not advance; past that, rotate the key.
+
+        Rotation order: build the generation-N identity, persist
+        :meth:`to_state_bytes` atomically and durably, distribute
+        verifier floor N, then issue. Publishing floor N before the
+        state is durable leaves a crashed issuer announcing a floor it
+        cannot satisfy."""
+        ...
+    def to_state_bytes(self) -> bytes:
+        """Serialize the full issuer state: version, seed, generation.
+
+        **Secret material**, exactly like :meth:`to_bytes` — these bytes
+        contain the ed25519 signing seed. Encrypt at rest and write
+        atomically; a torn write here is an issuer that cannot come
+        back."""
+        ...
+    @staticmethod
+    def from_state_bytes(data: bytes) -> "Identity":
+        """Restore an issuer — key *and* generation — from
+        :meth:`to_state_bytes`.
+
+        The restart path for anything that rotates. Raises
+        :class:`IdentityError` on a wrong length or a version this build
+        does not understand: a partial parse of credential state is how
+        an issuer silently comes back on the wrong epoch."""
         ...
     @property
     def entity_id(self) -> bytes:
@@ -1066,8 +1129,8 @@ class Identity:
         delegation_depth: int = 0,
     ) -> bytes:
         """Issue a scoped token to ``subject`` (32-byte entity id).
-        Scope is a subset of ``['publish', 'subscribe', 'admin',
-        'delegate']``. Returns the 161-byte serialized
+        Scope is a subset of ``['publish', 'subscribe', 'admin', 'wildcard',
+        'delegate']``. Returns the 169-byte serialized
         ``PermissionToken``."""
         ...
     def install_token(self, token: bytes) -> None:
@@ -1089,6 +1152,20 @@ def parse_token(token: bytes) -> dict:
 def verify_token(token: bytes) -> bool:
     """Verify the ed25519 signature. ``True`` = valid. Does NOT
     check time-bound validity — see :func:`token_is_expired`."""
+    ...
+
+def verify_signature(entity_id: bytes, message: bytes, signature: bytes) -> bool:
+    """Verify a detached ed25519 signature against a 32-byte entity id.
+
+    The verifying half of :meth:`Identity.sign`. Strict verification:
+    the malleable ``(R, S + L)`` variant is rejected, so one logical
+    message cannot appear under two byte encodings.
+
+    ``True`` when the signature is valid for this exact
+    ``(entity_id, message)`` pair, ``False`` when it is not. Raises
+    :class:`IdentityError` only on a malformed argument — a
+    wrong-length entity id or signature — so ``False`` means "this did
+    not verify", never "you called it wrong"."""
     ...
 
 def token_is_expired(token: bytes) -> bool:

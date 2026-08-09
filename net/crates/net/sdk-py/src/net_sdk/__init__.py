@@ -97,7 +97,13 @@ from net_sdk.capability_schema import (
     WarningUnknownKey,
     validate_capabilities,
 )
-from net_sdk.channel import TypedChannel
+from net_sdk.channel import (
+    CHANNEL_TAG_KEY,
+    MAX_CHANNEL_NAME_LEN,
+    ChannelNameError,
+    TypedChannel,
+    validate_channel_name,
+)
 from net_sdk.mesh import (
     BackpressureError,
     MeshNode,
@@ -107,13 +113,19 @@ from net_sdk.mesh import (
     StreamStats,
 )
 from net_sdk.node import NetNode
+from net_sdk.types import Receipt
 from net_sdk.stream import EventStream, TypedEventStream
 
 __all__ = [
     "NetNode",
+    "Receipt",
     "EventStream",
     "TypedEventStream",
     "TypedChannel",
+    "ChannelNameError",
+    "validate_channel_name",
+    "MAX_CHANNEL_NAME_LEN",
+    "CHANNEL_TAG_KEY",
     "MeshNode",
     "MeshStream",
     "StreamStats",
@@ -372,4 +384,4 @@ else:
         "fingerprint",
     ]
 
-__version__ = "0.34.0"
+__version__ = "0.35.0"

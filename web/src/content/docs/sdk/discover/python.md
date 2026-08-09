@@ -1,13 +1,26 @@
 ## Discover it — Python
 
+### Find nodes
+
+Node discovery is on the wrapper:
+
+```python
+ids = node.find_nodes({"require_tags": ["gpu"]})
+best = node.find_best_node({"filter": {"require_tags": ["gpu"]},
+                            "prefer_more_vram": 1.0})
+```
+
+`find_nodes` returns a list, possibly empty. `find_best_node` returns one id or
+`None` — and `0` is a real node id, so test `is None` rather than truthiness.
+
 ### List tools
 
-`list_tools` and `watch_tools` take the **native** mesh handle:
+The **tool** surface is separate and still takes the native handle:
 
 ```python
 from net_sdk import list_tools
 
-native = node._native          # no public accessor yet
+native = node._native          # tool surface only
 
 for t in list_tools(native):
     print(t.tool_id, "v" + t.version, "tags=", t.tags)

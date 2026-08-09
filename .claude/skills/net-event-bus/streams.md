@@ -113,7 +113,12 @@ stream = mesh.open_stream(
 
 ### Go / C
 
-The Go and C bindings do **not** expose the stream surface today. The poll-based API there covers `IngestRaw` / `Poll` against the bus only. If a Go or C consumer needs streams, that's a binding extension, not an existing call site.
+Both expose the stream surface. What they lack is the *bus* async-iterator ergonomics, not streams.
+
+- **Go:** `MeshNode.OpenStream(peerNodeID, streamID, StreamConfig)` → `MeshStream` with `Send`, `SendWithRetry`, `SendBlocking`, `Stats`, `Close` (`go/mesh.go:788+`).
+- **C:** `net_mesh_open_stream` and the surrounding stream ABI (`net/crates/net/include/net.go.h:398+`).
+
+**Go's `WindowBytes` is a `*uint32`, and that is load-bearing.** `nil` inherits the 64 KiB default; `net.UnboundedWindow()` (a pointer to zero) is the escape hatch that disables backpressure. It was a plain `uint32` with `omitempty`, which erased an explicit zero from the JSON before it reached the C parser — so a caller requesting the documented unbounded mode silently got bounded backpressure instead. Use `net.WindowBytesOf(n)` for an explicit size.
 
 ---
 
@@ -193,13 +198,22 @@ mesh.send_blocking(stream, payloads)              # releases the GIL
 
 Streams have no async iterator. You poll the underlying `MeshNode`'s shard buffers and demultiplex on `(peer, stream_id)` yourself.
 
+**Inbound events land on `stream_id % num_shards`.** This is the single thing to get right on this page. `num_shards` defaults to **4**, so polling shard 0 alone sees only the stream ids congruent to 0 — three quarters of ordinary ids are invisible. Stream ids are otherwise opaque, so the mapping is not something you can eyeball.
+
+Two correct shapes:
+
+- **Merge:** `recv(limit)` (Rust), `poll(limit)` (Node/Python) drain every shard. Use this unless you have a reason not to. All three polled shard 0 only until this was fixed, while documenting all-shard behaviour.
+- **Targeted:** `recv_shard(shard_for_stream(id), limit)` / `pollShard(shardForStream(id), limit)` when you want exactly one stream and not a merge. `shard_for_stream` / `shardForStream` / `num_shards` are exposed for this — do not recompute the modulo yourself.
+
 ### Rust
 
 ```rust
 use net::event::StoredEvent;
 
 loop {
-    let events: Vec<StoredEvent> = mesh.recv_shard(0, /* limit */ 256).await?;
+    // Every shard. `recv_shard(0, ...)` here would have missed any
+    // stream whose id is not congruent to 0 mod num_shards.
+    let events: Vec<StoredEvent> = mesh.recv(/* limit */ 256).await?;
     for ev in events {
         // ev.raw is the payload bytes; parse, then route on stream_id
         // if you're multiplexing several streams onto the same peer.
@@ -216,14 +230,14 @@ loop {
 
 ### TypeScript / Python — high-level SDK gap
 
-The high-level `MeshNode` wrappers in `@net-mesh/sdk` and `net_sdk` (Python) **do not currently expose a per-shard receive API**. The TS SDK's `MeshNode` class (`sdk-ts/src/mesh.ts`) has no `recv` / `recvShard` method; the Python SDK's `MeshNode` class (`sdk-py/src/net_sdk/mesh.py`) has no `recv` / `poll` method.
+The high-level `MeshNode` wrappers in `@net-mesh/sdk` and `net_sdk` (Python) **do not expose a receive API**. The TS SDK's `MeshNode` class (`sdk-ts/src/mesh.ts`) has no `recv` / `recvShard` method; the Python SDK's `MeshNode` class (`sdk-py/src/net_sdk/mesh.py`) has no `recv` / `poll` method. This is an ergonomic gap, not a capability gap.
 
-If you need to receive on a stream from TS or Python today, drop to the underlying napi / PyO3 binding:
+To receive on a stream from TS or Python, drop to the underlying napi / PyO3 binding, which now has the full shape:
 
-- **TypeScript:** `mesh._native.poll(limit)` on the napi `NetMesh` class — `poll(limit: number): Promise<StoredEvent[]>` polls **shard 0 only** (`net/crates/net/bindings/node/index.d.ts:667`). There is no multi-shard `recvShard` in the napi surface today.
-- **Python:** `mesh._native.poll(limit)` on the PyO3 `_net.NetMesh` — same single-shard limitation (`net/crates/net/bindings/python/src/lib.rs:1342-1363`).
+- **TypeScript:** `mesh._native.poll(limit)` drains **every** shard; `pollShard(shardId, limit)` targets one; `numShards()` and `shardForStream(streamId)` answer which.
+- **Python:** `mesh._native.poll(limit)`, `poll_shard(shard_id, limit)`, `num_shards()`, `shard_for_stream(stream_id)` — same shape.
 
-This is a real divergence: Rust callers have multi-shard receive, TS and Python callers are single-shard via the binding. If your workload needs full shard coverage from TS/Python, file an issue against the SDK rather than working around it; faking it with multiple polls is fine until then.
+Both `poll` methods used to read shard 0 only, so a TS or Python consumer could not receive most stream traffic at all at the default of four shards. Rust's `Mesh::recv` had the same body under an all-shards doc comment.
 
 Streams do not have an async-iterator shape on any SDK. Loop the poll yourself.
 
@@ -290,9 +304,12 @@ for chunk in payload.chunks(60_000) {         // headroom under the 64 KB window
     mesh.send_with_retry(&stream, &chunks, 16).await?; // absorbs grant lag
 }
 
-// B side — drain shards, route on (peer, stream_id) if multiplexing
+// B side — drain shards, route on (peer, stream_id) if multiplexing.
+// `0xCAFE % 4 == 2`, so a shard-0 poll would never see this stream;
+// `recv` merges every shard, and `recv_shard(mesh.shard_for_stream(
+// 0xCAFE), 256)` is the targeted form.
 loop {
-    let evs = mesh.recv_shard(0, 256).await?;
+    let evs = mesh.recv(256).await?;
     if evs.is_empty() { tokio::time::sleep(Duration::from_millis(5)).await; continue; }
     for ev in evs { write_to_disk(ev.raw)?; }
 }

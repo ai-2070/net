@@ -223,10 +223,32 @@ type MeshConfig struct {
 type StreamConfig struct {
 	// Reliability: "reliable" | "fire_and_forget" (default).
 	Reliability string `json:"reliability,omitempty"`
-	// WindowBytes sets the initial send-credit window. 0 disables
-	// backpressure entirely. Default: 64 KiB.
-	WindowBytes    uint32 `json:"window_bytes,omitempty"`
-	FairnessWeight uint8  `json:"fairness_weight,omitempty"`
+
+	// WindowBytes sets the initial send-credit window. Nil inherits the
+	// 64 KiB default; a pointer to 0 disables backpressure entirely.
+	//
+	// Pointer for the same reason as AutoDirectUpgrade above: under
+	// `omitempty` a plain uint32 collapses "unset" into "0", so the
+	// documented unbounded mode was erased from the JSON before it
+	// reached the C parser, which then applied the default. A caller
+	// asking for no backpressure silently got 64 KiB of it. Use
+	// UnboundedWindow() to spell it.
+	WindowBytes *uint32 `json:"window_bytes,omitempty"`
+
+	FairnessWeight uint8 `json:"fairness_weight,omitempty"`
+}
+
+// UnboundedWindow returns the WindowBytes value that disables
+// backpressure. `WindowBytes: net.UnboundedWindow()` reads better than
+// an inline pointer-to-zero, and is harder to write by accident.
+func UnboundedWindow() *uint32 {
+	var zero uint32
+	return &zero
+}
+
+// WindowBytesOf returns a WindowBytes pointer for an explicit size.
+func WindowBytesOf(n uint32) *uint32 {
+	return &n
 }
 
 // StreamStats is a snapshot of a live stream's stats.
@@ -249,8 +271,19 @@ type ChannelConfig struct {
 	Visibility   string `json:"visibility,omitempty"` // "subnet-local" | "parent-visible" | "exported" | "global"
 	Reliable     bool   `json:"reliable,omitempty"`
 	RequireToken bool   `json:"require_token,omitempty"`
-	Priority     uint8  `json:"priority,omitempty"`
-	MaxRatePps   uint32 `json:"max_rate_pps,omitempty"`
+
+	// TokenRoots anchors token authorization: hex-encoded 32-byte
+	// entity ids (64 hex chars each) whose signature may root a
+	// presented token chain.
+	//
+	// Required whenever RequireToken is set. Core rejects every
+	// authorization when token enforcement is on and no roots are
+	// installed, so `RequireToken: true` on its own does not produce a
+	// token-gated channel — it produces a permanently closed one.
+	TokenRoots []string `json:"token_roots,omitempty"`
+
+	Priority   uint8  `json:"priority,omitempty"`
+	MaxRatePps uint32 `json:"max_rate_pps,omitempty"`
 
 	// PublishCaps restricts who may publish on this channel. Set
 	// when the publisher wants to limit publishing to its own
@@ -787,9 +820,25 @@ func (s *MeshStream) free() {
 	}
 }
 
-// Close releases the stream handle. Idempotent.
+// Close closes the underlying core stream and releases the handle.
+// Idempotent.
+//
+// This used to call only `net_mesh_stream_free`, which drops the FFI
+// handle and its Arc without touching core stream state. The state
+// then survived until node shutdown, so a long-lived Go node could not
+// release it eagerly, could not enforce a close/reopen epoch, and
+// could not reopen the same stream id under a new configuration — the
+// first open's config stayed in force. `net_mesh_close_stream` does
+// both halves.
 func (s *MeshStream) Close() {
-	s.free()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.handle == nil {
+		return
+	}
+	C.net_mesh_close_stream(s.handle)
+	s.handle = nil
+	runtime.SetFinalizer(s, nil)
 }
 
 // payloadPtrs builds the parallel (pointers, lengths) arrays the C
@@ -1011,7 +1060,9 @@ func (m *MeshNode) SubscribeChannel(publisherNodeID uint64, channel string) erro
 
 // SubscribeChannelWithToken subscribes to `channel` on
 // `publisherNodeID` while presenting a serialized `PermissionToken`
-// (typically 159 bytes — whatever `Identity.IssueToken` returned).
+// (169 bytes — whatever `Identity.IssueToken` returned). This is one
+// token, not a serialized `TokenChain` (`1 + count*169` bytes); chains
+// are core-only and cannot be presented through this binding.
 // Required when the publisher set `RequireToken=true` or when the
 // subscriber's announced caps don't satisfy the publisher's
 // `SubscribeCaps` filter.

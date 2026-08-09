@@ -75,7 +75,7 @@ decisions need no crypto.
 **PSK** — the 32-byte pre-shared key both sides of a Noise `NKpsk0` handshake
 must hold. A mesh-membership secret you distribute yourself.
 
-**Permission token** — a 161-byte signed grant (scope bitfield, channel, validity
+**Permission token** — a 169-byte signed grant (scope bitfield, channel, validity
 window, delegation depth, nonce). Verified at subscription time, cached for the
 packet path.
 

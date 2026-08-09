@@ -1,23 +1,31 @@
 ## Announce it — Python
 
-### The native handle, first
+### Capabilities are on the wrapper; tools are one layer down
 
-Everything on this page runs against the **native** mesh handle, not the
-`net_sdk.MeshNode` that wraps it. `MeshNode` has no `announce_capabilities`, no
-`list_tools` and no tool surface at all; those live one layer down.
+`net_sdk.MeshNode` now carries the capability lifecycle directly —
+`announce_capabilities`, `find_nodes` / `find_nodes_scoped`, and
+`find_best_node` / `find_best_node_scoped`:
 
 ```python
 from net_sdk import MeshNode
-from net.mesh_rpc import TypedMeshRpc
 
 node = MeshNode(bind_addr="127.0.0.1:9001", psk="42" * 32)
-native = node._native                       # no public accessor yet
+node.announce_capabilities({"tags": ["gpu"], "hardware": {"memory_gb": 64}})
+```
+
+The **tool** surface still lives on the native handle, and so does nRPC:
+
+```python
+from net.mesh_rpc import TypedMeshRpc
+
+native = node._native                       # tools/nRPC only
 rpc = TypedMeshRpc.from_mesh(native)
 ```
 
 Reaching a private attribute is not a recommendation, it is the current state of
-the binding. It is called out here rather than hidden because the alternative is a
-reader concluding Python cannot announce capabilities — it can, one layer down.
+the binding for those surfaces. It is called out here rather than hidden because
+the alternative is a reader concluding Python cannot serve tools — it can, one
+layer down.
 
 ### Serve a tool
 

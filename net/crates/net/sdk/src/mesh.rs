@@ -34,6 +34,7 @@
 //! ```
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU16, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -432,6 +433,7 @@ impl MeshBuilder {
         Ok(Mesh {
             node: Arc::new(node),
             channel_configs,
+            recv_cursor: Arc::new(AtomicU16::new(0)),
             identity: sdk_identity,
             #[cfg(feature = "tool")]
             tool_metadata_fetch: Arc::new(parking_lot::Mutex::new(None)),
@@ -459,6 +461,20 @@ pub struct Mesh {
     /// so `register_channel` / subscriber ACL checks operate on the
     /// same live data.
     channel_configs: Arc<ChannelConfigRegistry>,
+    /// Which shard [`Mesh::recv`] starts its sweep from, advanced once
+    /// per call.
+    ///
+    /// Without it, `recv` always starts at shard 0 and stops once it
+    /// has `limit` events — so a continuously-fed shard 0 means shards
+    /// 1..n are never reached. That is the same starvation as the
+    /// shard-0-only bug this replaced, just needing sustained load to
+    /// show up. Rotating the start makes every shard the head of the
+    /// sweep within `num_shards` calls.
+    ///
+    /// `Relaxed`: a fairness hint, not a synchronization point. Two
+    /// concurrent `recv`s racing to the same start offset costs one
+    /// round of fairness, nothing more.
+    recv_cursor: Arc<AtomicU16>,
     /// Held onto so the caller's `TokenCache` (and future capability
     /// announcement state) stays alive for the mesh's lifetime —
     /// `MeshNode` was already handed a clone of the keypair, so this
@@ -691,19 +707,71 @@ impl Mesh {
 
     // ---- Receiving ----
 
-    /// Poll for received events.
+    /// Poll for received events across **every** shard.
     ///
-    /// Returns up to `limit` events from all shards.
+    /// Returns up to `limit` events in total, drawing from each shard
+    /// in turn.
+    ///
+    /// This previously polled shard 0 only, on the reasoning that
+    /// "most events land here for single-stream sends". They do not:
+    /// inbound traffic is placed on `stream_id % num_shards`, so at
+    /// the default of four shards a caller saw only the stream ids
+    /// congruent to 0 and silently missed three quarters of them. The
+    /// doc comment already claimed all shards; the body now matches
+    /// it.
+    ///
+    /// **The sweep starts from a rotating shard**, advanced once per
+    /// call. Starting at 0 every time and stopping at `limit` is the
+    /// same starvation in a thinner disguise: a continuously-fed shard
+    /// 0 that can fill the limit alone means shards 1..n are never
+    /// reached, so a quiet stream on shard 3 stays invisible for as
+    /// long as shard 0 keeps up. Rotating bounds that wait at
+    /// `num_shards` calls.
+    ///
+    /// A consequence worth knowing: events are not returned in shard
+    /// order, and the shard a sweep starts from changes between calls.
+    /// Use [`Self::recv_shard`] with [`Self::shard_for_stream`] when
+    /// you want one specific stream and not a merge.
     pub async fn recv(&self, limit: usize) -> Result<Vec<StoredEvent>> {
-        // Poll shard 0 (most events land here for single-stream sends)
-        let result = self.node.poll_shard(0, None, limit).await?;
-        Ok(result.events)
+        let shards = self.node.num_shards().max(1);
+        // `fetch_add` wraps at u16::MAX; `start` is reduced modulo
+        // `shards` at use, so a wrap costs at most one round of
+        // fairness — the same as the concurrent-caller race above.
+        let start = self.recv_cursor.fetch_add(1, AtomicOrdering::Relaxed) % shards;
+        let mut out = Vec::new();
+        for offset in 0..shards {
+            if out.len() >= limit {
+                break;
+            }
+            let shard = (start + offset) % shards;
+            let remaining = limit - out.len();
+            let result = self.node.poll_shard(shard, None, remaining).await?;
+            out.extend(result.events);
+        }
+        Ok(out)
     }
 
     /// Poll a specific shard for events.
+    ///
+    /// Pair with [`Self::shard_for_stream`]: polling an arbitrary
+    /// shard for a known stream id is how the shard-0 assumption went
+    /// unnoticed.
     pub async fn recv_shard(&self, shard_id: u16, limit: usize) -> Result<Vec<StoredEvent>> {
         let result = self.node.poll_shard(shard_id, None, limit).await?;
         Ok(result.events)
+    }
+
+    /// Number of shards inbound stream traffic is spread across.
+    pub fn num_shards(&self) -> u16 {
+        self.node.num_shards()
+    }
+
+    /// The inbound shard `stream_id`'s events land on.
+    ///
+    /// `mesh.recv_shard(mesh.shard_for_stream(id), limit)` is the
+    /// targeted read; [`Self::recv`] is the merge.
+    pub fn shard_for_stream(&self, stream_id: u64) -> u16 {
+        self.node.shard_for_stream(stream_id)
     }
 
     // ---- Channels (distributed pub/sub) ----
@@ -721,42 +789,6 @@ impl Mesh {
     /// config.
     pub fn register_channel(&self, config: ChannelConfig) {
         self.channel_configs.insert(config);
-    }
-
-    /// Install the standard channel policy for an RPC-style service:
-    /// the exact `<service>.requests` channel and the
-    /// `<service>.replies.` prefix, the latter bound to each caller's
-    /// own origin.
-    ///
-    /// **Install-if-absent, never replace** — an ACL the operator
-    /// registered before serving survives untouched (H2).
-    ///
-    /// The `Mesh`-shaped hop to
-    /// [`ChannelConfigRegistry::install_rpc_service_defaults`], which
-    /// holds the implementation.
-    ///
-    /// It lives on the registry rather than here because the serve paths
-    /// do not share a receiver — `serve_rpc*` (gated on `cortex`) and
-    /// the `aggregator` module (gated on `aggregator`) go through
-    /// `Mesh`, while the org facade's `serve_org_bytes_node` holds an
-    /// `Arc<MeshNode>` for the language bindings. Each copy that existed
-    /// per receiver drifted from the others; the registry is the one
-    /// object all of them already hold.
-    ///
-    /// Gated to match its callers exactly. `Mesh` itself is `net`-only,
-    /// but both hops into here are narrower — `mesh_rpc` needs `cortex`,
-    /// `aggregator` needs `aggregator` — so a `--features net` build has
-    /// no caller and this is genuinely dead there. The org path is NOT a
-    /// caller: it holds a `MeshNode`, so it reaches
-    /// `install_rpc_service_defaults` on the registry directly and needs
-    /// no `Mesh`-shaped hop.
-    ///
-    /// `cfg` rather than `#[allow(dead_code)]` on purpose: the allow
-    /// would also silence the day this genuinely loses its last caller,
-    /// which for a security-policy hop is worth being told about.
-    #[cfg(any(feature = "cortex", feature = "aggregator"))]
-    pub(crate) fn register_rpc_service_channels(&self, service: &str) {
-        self.channel_configs.install_rpc_service_defaults(service);
     }
 
     /// Register a **prefix-matched** channel config. Any channel name
@@ -1308,6 +1340,7 @@ impl Mesh {
         Self {
             node,
             channel_configs,
+            recv_cursor: Arc::new(AtomicU16::new(0)),
             identity,
             #[cfg(feature = "tool")]
             tool_metadata_fetch: Arc::new(parking_lot::Mutex::new(None)),
@@ -1588,24 +1621,23 @@ fn parse_ack_reason(s: &str) -> Option<AckReason> {
     }
 }
 
-// Gated to match `register_rpc_service_channels`, which these exercise
-// through its `Mesh`-shaped hop. Under `--features net` alone the method
-// does not exist, and the policy it installs is unreachable from `Mesh`
-// — `ChannelConfigRegistry::install_rpc_service_defaults` has its own
-// tests in the `net` crate, so the property stays covered there.
-#[cfg(all(test, feature = "net", any(feature = "cortex", feature = "aggregator")))]
+#[cfg(all(test, feature = "net"))]
 mod rpc_service_channel_registration_tests {
-    //! The aggregator module registers RPC channels through its own
-    //! entry points, and used to carry a hand-copied version of the
+    //! H2 and H3, as seen through a real `Mesh`.
+    //!
+    //! The aggregator module used to carry a hand-copied version of the
     //! auto-registration helper. The copy drifted: it kept replacing
     //! inserts (so it discarded operator ACLs, H2) and never gained the
     //! reply-channel origin binding (so aggregator reply channels stayed
     //! world-subscribable, H3) — both long after those were fixed for
     //! `serve_rpc`.
     //!
-    //! Both callers now route through `register_rpc_service_channels`.
-    //! These pin the two properties ON THE SHARED HELPER, so a future
-    //! divergence fails here rather than in only one subsystem's tests.
+    //! The implementation now lives on `ChannelConfigRegistry` in the
+    //! `net` crate and has its own tests there. What these add is the
+    //! `Mesh` end of it: that a `MeshBuilder`-built mesh hands its node
+    //! the same registry the policy lands in, so a serve through this
+    //! mesh is governed by the entries below. Testing that needs a
+    //! `Mesh`, which is why they stay here.
 
     use super::*;
     use net::adapter::net::identity::EntityKeypair;
@@ -1619,6 +1651,11 @@ mod rpc_service_channel_registration_tests {
             .unwrap()
     }
 
+    /// The registry the mesh installed on its node at build time.
+    fn registry(mesh: &Mesh) -> &ChannelConfigRegistry {
+        &mesh.channel_configs
+    }
+
     /// An operator ACL registered first must survive auto-registration.
     #[tokio::test]
     async fn shared_registration_preserves_an_operator_acl() {
@@ -1630,7 +1667,9 @@ mod rpc_service_channel_registration_tests {
                 .with_token_roots(vec![root.entity_id().clone()]),
         );
 
-        mesh.register_rpc_service_channels("agg.svc");
+        registry(&mesh)
+            .install_rpc_service_defaults("agg.svc")
+            .unwrap();
 
         let cfg = mesh
             .channel_configs
@@ -1649,7 +1688,9 @@ mod rpc_service_channel_registration_tests {
     #[tokio::test]
     async fn shared_registration_binds_the_reply_prefix_to_the_caller_origin() {
         let mesh = mesh().await;
-        mesh.register_rpc_service_channels("agg.svc2");
+        registry(&mesh)
+            .install_rpc_service_defaults("agg.svc2")
+            .unwrap();
 
         let resolved = mesh
             .channel_configs
@@ -1672,7 +1713,9 @@ mod rpc_service_channel_registration_tests {
     #[tokio::test]
     async fn shared_registration_still_installs_defaults() {
         let mesh = mesh().await;
-        mesh.register_rpc_service_channels("agg.svc3");
+        registry(&mesh)
+            .install_rpc_service_defaults("agg.svc3")
+            .unwrap();
 
         assert!(mesh
             .channel_configs

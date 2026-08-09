@@ -972,7 +972,7 @@ impl MeshOsDaemonHandle {
         caps: Option<crate::capabilities::CapabilitySetJs>,
     ) -> Result<()> {
         let cap_set = match caps {
-            Some(c) => crate::capabilities::capability_set_from_js(c),
+            Some(c) => crate::capabilities::capability_set_from_js(c)?,
             None => CapabilitySet::default(),
         };
         let guard = self.inner.lock().await;

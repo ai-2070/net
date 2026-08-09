@@ -231,12 +231,25 @@ Construct, ingest, read, shut down — in each binding's own idiom. The call
 shapes match; the ergonomics don't, and pretending otherwise is how people get
 stuck.
 
+**Each snippet below configures a delivering transport, and that is not
+incidental.** The default (memory) selects the Noop adapter, which counts
+batches and discards them — its `poll_shard` always returns empty. Ingestion
+succeeds and the read step then yields nothing, so a copy of these loops on a
+default node **waits forever** rather than failing. Memory is for construction,
+ingestion, batching, backpressure, counters and lifecycle; reach for Redis,
+JetStream or a mesh pair as soon as something has to come back out.
+
 **Rust** — the core crate, with every knob reachable:
 
 ```rust
-use net::{ConsumeRequest, Event, EventBus, EventBusConfig};
+use net::{
+    AdapterConfig, ConsumeRequest, Event, EventBus, EventBusConfig, RedisAdapterConfig,
+};
 
-let bus = EventBus::new(EventBusConfig::default()).await?;
+let mut config = EventBusConfig::default();
+config.adapter = AdapterConfig::Redis(RedisAdapterConfig::new("redis://127.0.0.1:6379"));
+
+let bus = EventBus::new(config).await?;
 bus.ingest(Event::from_str(r#"{"sensor": "lidar"}"#)?)?;
 bus.flush().await?;
 
@@ -250,7 +263,10 @@ explicit because Node finalizers are not deterministic:
 ```typescript
 import { NetNode } from "@net-mesh/sdk";
 
-const node = await NetNode.create({ shards: 4 });
+const node = await NetNode.create({
+  shards: 4,
+  transport: { type: "redis", url: "redis://127.0.0.1:6379" },
+});
 node.emit({ sensor: "lidar" });
 await node.flush();
 
@@ -266,7 +282,7 @@ forget:
 ```python
 from net_sdk import NetNode
 
-with NetNode(shards=4) as node:
+with NetNode(shards=4, redis_url="redis://127.0.0.1:6379") as node:
     node.emit({"sensor": "lidar"})
 
     for event in node.subscribe(limit=100, timeout=5.0):

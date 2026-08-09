@@ -33,7 +33,13 @@ export { NetNode } from './node';
 export { EventStream, TypedEventStream } from './stream';
 
 // Typed channels.
-export { TypedChannel } from './channel';
+export {
+  TypedChannel,
+  ChannelNameError,
+  validateChannelName,
+  MAX_CHANNEL_NAME_LEN,
+  CHANNEL_TAG_KEY,
+} from './channel';
 
 // Mesh + streams.
 export {
@@ -109,6 +115,7 @@ export {
   TokenError,
   channelHash,
   delegateToken,
+  verifySignature,
 } from './identity';
 export type { TokenScope, TokenErrorKind, IssueTokenOptions } from './identity';
 

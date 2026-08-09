@@ -35,7 +35,11 @@ Identity tells you who an entity is. Permission tokens tell you what an entity i
 
 Scopes are bitfields. The four primary scopes are `PUBLISH`, `SUBSCRIBE`, `ADMIN` (create or delete channels, manage other tokens), and `DELEGATE` (re-issue this token to another entity, with a non-zero delegation depth). They compose with bitwise operations: a single token can grant publish-and-subscribe, or publish-and-delegate-but-not-subscribe.
 
-Tokens are time-bound — every token has a `not_before` and `not_after` — and revocable through a nonce field that pairs with a revocation list. Revocation is checked at session and subscription time, not per-packet. The per-packet path uses the bloom-filter cache; if an authorization is revoked, the cache miss on the next subscription attempt is what catches it.
+Tokens are time-bound — every token has a `not_before` and `not_after`. There is also a fifth scope, `WILDCARD`, which authorizes the token's actions on every channel regardless of its `channel_hash`; it must be granted explicitly and is not part of `ALL`.
+
+**Revocation is by issuer generation, not a nonce list.** Every token carries an `issuer_generation`, and `RevocationRegistry` holds a monotonic floor per issuer: raising the floor invalidates every token minted below it, in one operation, with nothing to enumerate or distribute. The `nonce` field distinguishes token instances for replay separation — it is not the revocation selector. Revocation is checked at session and subscription time, not per-packet; the per-packet path uses the bloom-filter cache, and a revoked authorization is caught by the cache miss on the next subscription attempt.
+
+That granularity is the trade-off to know: the floor is per *issuer*, so raising it to revoke one credential also invalidates every sibling minted at or below that generation. Issue from a narrow, per-purpose identity when you need to revoke independently.
 
 A token with the `DELEGATE` scope and non-zero delegation depth can be re-issued by its holder to another entity. The new token's scope is restricted to the intersection of the parent's scope, the depth is decremented, and the new token is signed by the delegating holder rather than the original issuer. This is how you build hierarchical access without a central authority: an administrator issues a broad delegating token to a department, the department issues narrower tokens to teams, and so on, with revocation cascading down through the chain.
 

@@ -149,17 +149,23 @@ pub fn install_fold_query_service(
 
 /// Internal: install the standard RPC channel policy for `service`.
 ///
-/// Delegates to [`Mesh::register_rpc_service_channels`] rather than
-/// carrying its own copy. It previously did carry one — mirroring
+/// Installs nothing, on purpose — core does it.
+///
+/// This function once carried its own copy of the policy, mirroring
 /// `serve_rpc`'s pattern by hand because the SDK's registry accessor is
-/// `cortex`-gated while this module is not — and the copy drifted: it
-/// kept using replacing inserts (so it discarded operator ACLs, H2) and
+/// `cortex`-gated while this module is not. The copy drifted: it kept
+/// using replacing inserts (so it discarded operator ACLs, H2) and
 /// never gained the reply-channel origin binding (so aggregator reply
 /// channels stayed world-subscribable, H3), both long after those were
-/// fixed for `serve_rpc`. The shared helper is gated only on `net`, so
-/// there is no longer a reason to duplicate it.
-fn auto_register_rpc_channels(mesh: &Mesh, service: &str) {
-    mesh.register_rpc_service_channels(service);
+/// fixed for `serve_rpc`. The implementation now lives on
+/// [`ChannelConfigRegistry::install_rpc_service_defaults`], and core's
+/// serve seams call it, so there is nothing left for this hop to do.
+fn auto_register_rpc_channels(_mesh: &Mesh, _service: &str) {
+    // Deliberately empty. `install_query_service` reaches
+    // `MeshNode::serve_rpc`, and core installs the policy from that
+    // seam now — so pre-registering here would be a second owner of a
+    // requirement that already has one. That duplication is what let
+    // this copy drift in the first place.
 }
 
 #[cfg(test)]
@@ -205,7 +211,17 @@ mod aggregator_channel_registration_tests {
         let mesh = mesh().await;
 
         for service in [REGISTRY_SERVICE, FOLD_QUERY_SERVICE] {
-            auto_register_rpc_channels(&mesh, service);
+            // Install through the registry primitive, which is what the
+            // core serve seams now call. `auto_register_rpc_channels`
+            // is deliberately empty — pre-registering here would make
+            // the SDK a second owner of a requirement core already
+            // enforces. What this test is really for is the aggregator
+            // SERVICE NAMES: they are the longest in the tree, and a
+            // name that cannot form a valid reply channel installs
+            // nothing at all.
+            registry(&mesh)
+                .install_rpc_service_defaults(service)
+                .unwrap_or_else(|e| panic!("{service}: must install: {e}"));
 
             let caller = format!("{service}.replies.00112233445566aa");
             let reg = registry(&mesh);

@@ -101,8 +101,10 @@ backpressure.
 ```python
 from net_sdk import NetNode
 
-# Context manager handles shutdown/drain for you.
-with NetNode(shards=4) as node:
+# Context manager handles shutdown/drain for you. `redis_url` because the
+# default (memory) transport selects the Noop adapter: it counts batches and
+# discards them, so `subscribe` would return nothing here.
+with NetNode(shards=4, redis_url="redis://127.0.0.1:6379") as node:
     node.emit({"sensor": "lidar", "range_m": 12.5})
     node.emit_raw('{"sensor": "radar", "range_m": 45.0}')
     node.emit_batch([{"a": 1}, {"a": 2}, {"a": 3}])
@@ -119,9 +121,11 @@ that anyone processed it. Under backpressure it drops, and
 `stats().events_dropped` is how you find out. That distinction is the whole
 philosophy: [Submitted Is Not Completed](https://ai2070.net/docs/guides/submitted-is-not-completed).
 
-Transports are constructor arguments — `NetNode(shards=4)` is memory;
-`NetNode(shards=4, redis_url="redis://localhost:6379")` and `jetstream_url=…`
-use those backends with the same `emit` / `subscribe` code.
+Transports are constructor arguments — `redis_url=`, `jetstream_url=`, or
+`mesh_*`, with the same `emit` / `subscribe` code. The default, memory, is the
+one that **does not deliver**: it counts events and discards them, so it suits
+ingestion, batching, backpressure, counters and lifecycle, and a `subscribe`
+loop on it waits forever rather than erroring.
 
 ## Claude Code Skill
 
@@ -181,7 +185,7 @@ with. Wheels ship everything; this only bites on source builds via
 | Mesh streams — direct peer-to-peer, windowed | [Mesh streams](https://ai2070.net/docs/guides/mesh-streams) |
 | Capabilities — announce and discover | [Discover and invoke](https://ai2070.net/docs/guides/discover-and-invoke) |
 | nRPC — typed request/response, streaming, cancellation | [Typed RPC](https://ai2070.net/docs/guides/nrpc) |
-| Channels — hierarchical pub/sub with capability auth | [Channels](https://ai2070.net/docs/concepts/channels) |
+| Distributed mesh channels — roster fan-out with capability auth | [Channels](https://ai2070.net/docs/concepts/channels) |
 | RedEX / CortEX / NetDB — logs, folds, queries | [Durable logs](https://ai2070.net/docs/guides/durable-logs), [Folds](https://ai2070.net/docs/guides/cortex-folds), [NetDB](https://ai2070.net/docs/guides/netdb-queries) |
 | MeshDB — federated queries | [MeshDB](https://ai2070.net/docs/guides/netdb-queries#federated-queries-meshdb) |
 | Dataforts — blobs, greedy cache, data gravity | [Blob storage](https://ai2070.net/docs/guides/dataforts) |

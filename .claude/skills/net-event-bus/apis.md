@@ -34,22 +34,28 @@ API-surface counts the companions depend on:
 If a count moves, the SDK has churned underneath this doc — re-verify from
 source. **The SDK source is ground truth; this skill is a shadow copy of it.**
 
-## The four surfaces (do not skip)
+## The five surfaces (do not skip)
 
 Choosing the wrong one is the most expensive mistake available here, and it is
-made before any code is written.
+made before any code is written. Note that the first two are *both* called
+"channels" and are not the same mechanism — `concepts.md` § Channel opens with
+the split.
 
 | Surface | What it is | Available in |
 |---|---|---|
-| **Named channels** (`node.channel("name")` → publish/subscribe) | Topic-based pub/sub. Channel name is embedded in the payload as `_channel` and used as a subscribe filter. Subscriber roster held by the publisher. | TypeScript, Python |
+| **Tagged EventBus topics** (`node.channel("name")` → publish/subscribe) | A label over local ingestion: the name is written into the payload as `_channel` and used as an exact subscribe filter. **No roster, no registration, no authorization, no cross-process delivery of its own.** | TypeScript, Python |
+| **Distributed mesh channels** (`registerChannel` → `subscribeChannel` → `publishChannel`) | Real pub/sub. The publisher registers a config, subscribers join a roster via an acked membership request, publish is a per-peer unicast returning a `PublishReport`. Cap filters and `require_token` gate joins. | Rust, TypeScript, Go, C; Python `core-only` (on `net.NetMesh`, not `net_sdk.MeshNode`) |
 | **Raw typed firehose** (`node.emit(struct)` → `node.subscribe()`) | One stream of typed events. Consumers receive everything and discriminate on the receive side. | Rust, TypeScript, Python |
 | **Raw poll** (`bus.IngestRaw` → `bus.Poll(cursor)`) | Push JSON in, poll JSON out with a cursor. No async, no channels. | Go, C |
 | **nRPC** (`TypedMeshRpc.serve` + `TypedMeshRpc.call`) | Typed call → typed reply, with deadlines, retries, hedging and response streaming. **A different surface from this file** — see `nrpc.md`. | all five |
 
-Two decisions follow directly:
+Three decisions follow directly:
 
-- **Wants topic-based fan-out, in Rust / Go / C?** There is no built-in
-  named-channel API. Filter on the consumer.
+- **Wants two processes to exchange events by topic name?** That is the
+  distributed mesh channel, in every language. `node.channel()` will not do it
+  — it is a filter over one node's own bus.
+- **Wants topic-based fan-out inside one node, in Rust / Go / C?** There is no
+  tagged-topic API. Filter on the consumer.
 - **Wants request/response — a call that returns a value?** Stop here and read
   `nrpc.md`. The bus surface has no return-value mechanism, and building one out
   of two channels is a well-worn way to reinvent nRPC badly.

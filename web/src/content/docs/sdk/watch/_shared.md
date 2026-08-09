@@ -1,7 +1,7 @@
 ---
 title: Watch
 description: Invoking gets you one result. Watching gets you the ongoing facts — the events the work emits as it happens.
-capability: Channels — pub/sub with capability auth
+capability: Distributed mesh channels — register / subscribe / publish
 boundary: /docs/sdk/c/memory-and-threading
 boundaryLabel: C — polling and the cursor trap
 ---

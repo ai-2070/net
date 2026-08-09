@@ -27,6 +27,7 @@ on:
       - ".github/scripts/lib/checker.sh"
       - ".github/scripts/check-docs.sh"
       - ".github/scripts/check-skill-refs.py"
+      - ".github/scripts/check-token-wire-size.py"
       # The surfaces the docs describe. Same roots as skills.yml, for the same
       # reason: the types the docs name live under `net/src` and the bindings,
       # not only in the SDK.
@@ -47,6 +48,7 @@ on:
       - ".github/scripts/lib/checker.sh"
       - ".github/scripts/check-docs.sh"
       - ".github/scripts/check-skill-refs.py"
+      - ".github/scripts/check-token-wire-size.py"
       - "go/**"
       - "net/crates/net/src/**"
       - "net/crates/net/sdk/**"

@@ -22,30 +22,53 @@ A node is identified by an **ed25519 keypair**. The public key is the node ID. T
 
 **Practical implication:** when you instantiate a node in your application, you are joining the mesh, not connecting to it. There is no server on the other end. Two processes that both create a `NetNode` on the same machine are already two nodes; if they share a transport (memory, mesh, Redis, JetStream), they can already communicate.
 
-## Channel
+## Channel — two surfaces share the word
+
+Net calls two independently implemented things a "channel". They share a name grammar and nothing else. Reading a claim about one as evidence about the other is the most expensive mistake on this page.
+
+| | **Tagged EventBus topic** | **Distributed mesh channel** |
+|---|---|---|
+| API | TS/Python `node.channel("name")` → `publish` / `subscribe` | `mesh.register_channel` / `subscribe_channel` / `publish_channel` |
+| What publish does | writes one local EventBus event with `_channel: "name"` added | per-peer unicast to a subscriber roster |
+| What subscribe does | installs an exact payload filter `_channel == "name"` on a local poll loop | sends a membership request to the publisher and waits for an `Ack` |
+| Where the state lives | your own node's ring buffer | the **publisher's** roster |
+| Creation | implicit — no registration, ever | the publisher must `register_channel` first (or a prefix ACL must cover the name) |
+| Authorization | none | cap filters, `require_token` + `token_roots`, origin binding |
+| Crosses the network | only if the node's transport carries the events | yes, that is the point |
+| Return value | `boolean` (TS) / `Receipt` (Python) | per-peer `PublishReport` |
+| Available in | TypeScript, Python | Rust, TypeScript, Python (low-level `NetMesh`), Go, C |
+
+The tagged topic is a **convenience label over generic ingestion**. It is genuinely useful — one node, many logical streams, no discrimination code on the consumer — and it is not distributed pub/sub. It has no roster, sends no membership message, and consults no ACL. Two processes do not talk to each other through `node.channel()` unless the node's transport was already carrying every event between them.
+
+Everything below in this section is about **distributed mesh channels** unless it says otherwise.
 
 **A channel is a name, not a thing.** This is the single most important concept to internalize.
 
 In Kafka, a topic is a thing — a partitioned log living on a broker cluster, with retention policy, replication factor, and a leader per partition. In NATS, a subject is also a thing — the broker holds the subscription registry and routes messages.
 
-In Net, a channel is just a *name to match on*. There is no broker holding a subscription registry. The publisher holds the subscriber roster directly. A subscriber asks the publisher (or any reachable node) to be added to the roster for channel name X. When the publisher emits, it does N per-peer unicasts to every roster member. On the **mesh** transport those unicasts ride already-encrypted sessions end-to-end; on **memory** there is no wire; on **Redis / JetStream** the payload sits in plaintext at the broker and transport security is whatever you configured for that system (TLS, etc.). See the "Encryption" section below for the full picture.
+In Net, a channel is just a *name to match on*. There is no broker holding a subscription registry. The publisher holds the subscriber roster directly. A subscriber asks the publisher to be added to the roster for channel name X. When the publisher emits, it does N per-peer unicasts to every roster member. On the **mesh** transport those unicasts ride already-encrypted sessions end-to-end; on **memory** there is no wire; on **Redis / JetStream** the payload sits in plaintext at the broker and transport security is whatever you configured for that system (TLS, etc.). See the "Encryption" section below for the full picture.
 
 Consequences:
 - **Publish-without-subscribers is a no-op.** The roster is empty, the fan-out loop runs zero times. No buffer fills up at a broker, because there is no broker.
-- **Channel creation is implicit.** No "create topic" API call. A channel exists as soon as someone publishes or subscribes to a name. There is no central registry to update.
 - **Channels cost nothing when idle.** A channel with zero subscribers consumes zero resources mesh-wide. There's no metadata to maintain.
 - **Channels with thousands of subscribers work.** They just fan out more packets. The cost is linear in subscriber count, paid by the publisher node.
+- **Creation is a publisher-side act, not an implicit one.** "No central registry" is not "no registration": `register_channel` installs the config the publisher validates joins against, and a subscribe for a name with no exact entry and no covering prefix is rejected. What is missing compared to Kafka is the *cluster-wide* coordination step, not the local one. (The tagged-topic surface is the one where creation really is implicit — there is nothing to create.)
 
 ### Naming rules (validated at construction, so get them right)
 
 `ChannelName::new` validates; there is no `From<&str>` escape hatch. Names are hierarchical paths:
 
-- **Max 255 bytes** (`MAX_NAME_LEN`).
-- Valid characters: alphanumeric plus `-`, `_`, `.`, `/`.
+- **Max 255 bytes** (`MAX_NAME_LEN`) — bytes, not characters.
+- Valid characters: **lowercase** ASCII `a-z`, digits `0-9`, and `-`, `_`, `.`, `/`. Nothing else — no spaces, no `:`, `*`, `+`, `#`, no non-ASCII.
+- **Uppercase is rejected outright.** Not "case-sensitive" — `Sensors/Temp` is not a different channel from `sensors/temp`, it is an error. Lowercase-only eliminates the split-namespace footgun where `prod.deploy` is locked down by ACL and `Prod.deploy` silently is not.
 - Must not be empty, must not start or end with `/`, must not contain `//`.
-- **Matched case-sensitively.** `Sensors/Temp` and `sensors/temp` are different channels — this is the #1 "why is my subscriber silent" cause after transport mismatch.
+- **`.` and `..` are rejected as whole path segments** (`a/../b`, `./x`, a bare `..`). Channel names double as on-disk directory segments under the `redex-disk` feature, so `..` would escape the persistence root.
 
-Prefix matching is first-class: a subscriber to `sensors/lidar` receives `sensors/lidar/front` and `sensors/lidar/rear` alike (subject to capabilities).
+The ergonomic TS/Python `node.channel(name)` wrappers apply the **same** grammar in the `TypedChannel` constructor (`validateChannelName` / `validate_channel_name`, throwing `ChannelNameError`). They previously did not, so a name the mesh rejects was accepted locally and diverged only later.
+
+**There is no wildcard subscription.** Subscribing to `sensors/lidar` does *not* deliver `sensors/lidar/front`. Rosters are keyed by exact `ChannelId` (`channel/roster.rs`), and the tagged-topic filter is an exact `_channel ==` match. `ChannelName::is_prefix_of` exists in the source but has no production call site. To consume a family of channels, subscribe to each name.
+
+What *is* prefix-matched is **ACL resolution on the publisher side**. `Mesh::register_channel_prefix(prefix, config)` makes any channel name starting with `prefix` — with no exact entry — resolve to `config`, longest prefix winning. That is how nRPC covers every `<service>.replies.<caller_origin>` without pre-registering each one. It decides *whether a join is allowed*, never *what a subscriber receives*. Token gates on a prefix entry evaluate against the concrete requested channel, so a token minted for `<prefix><a>` does not authorize `<prefix><b>`. Rust-only — see `bindings/coverage.md`.
 
 **Two hashes, and conflating them is a security bug.** A channel name derives *both*:
 
@@ -54,26 +77,45 @@ Prefix matching is first-class: a subscriber to `sensors/lidar` receives `sensor
 
 Wire collisions are benign because they only cost filter precision. ACL, config, and storage decisions key on the canonical u64. (This split exists because the canonical key *used* to be a u32 truncation, which let ~2^32 of grinding produce a token issued for one channel that passed the token-cache fast path for an unrelated victim channel.) If you're writing a relay or reading a capture: the header's 16-bit `channel_hash` tells you where a packet is probably going, never what it's allowed to do.
 
-The named-channel API exists in TS and Python (`node.channel("name")`). The other SDKs do not have it, and they don't all replace it the same way:
+**Distributed mesh channels exist in all five language surfaces.** Register, subscribe, and publish are on the mesh handle, not the bus node:
+
+- **Rust** — `Mesh::register_channel` / `subscribe_channel` / `publish_channel` (`sdk/src/mesh.rs`).
+- **TypeScript** — `MeshNode.registerChannel` / `subscribeChannel` / `publishChannel` (`sdk-ts/src/mesh.ts`).
+- **Python** — on the low-level `net.NetMesh` / `AsyncNetMesh` binding. The ergonomic `net_sdk.MeshNode` does **not** wrap them, so this is `core-only` for Python.
+- **Go** — `MeshNode.RegisterChannel` / `SubscribeChannel` / `Publish` (`go/mesh.go`).
+- **C** — `net_mesh_register_channel` / `net_mesh_subscribe_channel` / `net_mesh_publish`.
+
+The **tagged-topic** wrapper (`node.channel("name")`) is the one that exists only in TS and Python. Where it is absent, the substitute is not another channel API — it is discrimination on the consumer:
 
 - **Rust** has a typed firehose: `node.emit(&MyType)` and `node.subscribe_typed::<T>()`. Consumers receive every event of that type and filter on payload content.
-- **Go and C** have neither named channels nor a typed firehose. They use raw JSON ingest + cursor-based polling: `bus.IngestRaw(json)` / `bus.Poll(limit, cursor)` (Go) and `net_ingest_raw` / `net_poll_ex` (C). Consumers parse the JSON in their own loop.
+- **Go and C** use raw JSON ingest + cursor-based polling: `bus.IngestRaw(json)` / `bus.Poll(limit, cursor)` (Go) and `net_ingest_raw` / `net_poll_ex` (C). Consumers parse the JSON in their own loop.
 
-(See `apis.md` for the per-SDK code.)
+(See `apis.md` for the per-SDK code and `bindings/coverage.md` for the authoritative matrix.)
 
 ## Subscriber
 
-A subscriber is a node that has joined a channel's roster. Subscriptions are **hot, not cold** — a subscriber receives events emitted *after* it subscribed, plus whatever is still in the publisher's local ring buffer at the moment it joined. There is no "replay from the beginning of time" semantic.
+Subscriptions are **hot, not cold** on both surfaces: you receive what is emitted *after* you subscribe. There is no "replay from the beginning of time" semantic anywhere. If the user wants durable replay from a specific offset, they need a persistence layer (RedEX, Redis adapter, or JetStream adapter). That is a deliberate, separate decision — not a default.
 
-If the user wants durable replay from a specific offset, they need a persistence layer (RedEX, Redis adapter, or JetStream adapter). That is a deliberate, separate decision — not a default.
+Beyond that the two surfaces differ, and the difference decides whether "did I miss anything?" has an answer:
 
-If a subscriber goes silent (overload, crash, network partition), the publisher's failure detector evicts it from the roster. No in-band error message. The subscriber's neighbors observe the silence and the mesh routes around it.
+**Distributed mesh channel.** A subscriber sends a membership request to the publisher and blocks until an `Ack` arrives; the publisher can reject it (`Unauthorized`, `UnknownChannel`, `RateLimited`, `TooManyChannels`). Joining the roster is **not** a replay — a successful subscribe does not hand you what is sitting in the publisher's ring buffer. You get the fan-out from the next publish onward, and nothing before it. If a subscriber goes silent (overload, crash, network partition), the publisher's failure detector evicts it from the roster. No in-band error message. The subscriber's neighbors observe the silence and the mesh routes around it.
+
+**Tagged EventBus topic.** There is no membership step and nothing to reject; `subscribe()` is a local poll loop with a filter, so it starts wherever your own node's cursor starts. Nobody else knows you subscribed, and nothing can evict you.
 
 ## Publisher
 
-A publisher is a node that holds a roster and emits to it. Publisher and subscriber are not separate types — they are roles a `NetNode` plays per channel. The same node can publish on `sensors/temp` and subscribe to `commands/actuator` simultaneously.
+A publisher is a node that holds a roster and emits to it — on the distributed surface. Publisher and subscriber are not separate types; they are roles a node plays per channel. The same node can publish on `sensors/temp` and subscribe to `commands/actuator` simultaneously. On the tagged-topic surface there is no publisher role at all: `channel.publish` is ingestion into your own bus with a label attached, and no roster exists on either side.
 
-When a publisher emits, the call returns a `Receipt` (or null/error under backpressure). The receipt confirms the event was accepted into the local ring buffer for fan-out — it does **not** confirm delivery to all subscribers. Net does not guarantee delivery; it guarantees fast attempts.
+What a publish call hands back depends on which surface you are on, and the two are not interchangeable:
+
+| Surface | Single publish | Batch publish |
+|---|---|---|
+| Tagged EventBus topic — TS `channel.publish` | `boolean` accepted | `number` accepted |
+| Tagged EventBus topic — Python `channel.publish` | `Receipt`; raises on failure | `int` accepted |
+| Bus ingestion — `node.emit` / `emit_raw` | `Receipt`; throws/raises on failure | `number` accepted |
+| Distributed mesh channel — `mesh.publish_channel` | per-peer `PublishReport` | `PublishReport` (Rust `publish_many` only) |
+
+In every case the return value confirms the event was accepted **locally** — into the ring buffer, or handed to the per-peer fan-out. It does **not** confirm delivery. Net does not guarantee delivery; it guarantees fast attempts. Even a `PublishReport` reports what was sent, not what arrived.
 
 ## Backpressure: silence, not a signal
 
@@ -86,7 +128,7 @@ In Net, backpressure is **immediate and unilateral**. A node that can't keep up 
 Silence propagates through the proximity graph. Neighbors observe the missed heartbeat within a heartbeat interval, mark the node as degraded, open the circuit breaker, and **route new traffic to other capable nodes**. The sender does not slow down. The mesh has other nodes.
 
 **Practical implication for the SDK user:**
-- `emit` / `publish` may silently lose data under backpressure. Check return values: TS returns `null`, batch APIs return ingested counts, Rust returns `Result`.
+- `emit` / `publish` may silently lose data under backpressure. Check return values, and note they differ per surface (see the Publisher table above): TS `emit` throws, TS `channel.publish` returns `false`, Python raises, batch APIs return ingested counts to compare against the input length, Rust returns `Result`. Under the default `drop_oldest` nothing reports at all — the producer always succeeds and the counter never moves.
 - "Lossy by default" is the design. If the user needs reliability, they need either `Reliability::Reliable` per-stream (mesh transport), an explicit persistence layer, or end-to-end acks at the application level.
 - Don't add timeouts and retries against the bus. Backpressure handling is the bus's job.
 
@@ -104,7 +146,7 @@ A node's transport is what physically moves bytes between nodes. In TS, Python, 
 
 | Transport | When to use | Notes |
 |---|---|---|
-| **Memory** (default) | Single process, multiple components, tests | No network, no encryption, no persistence. Pure in-process ring buffer. Fastest. |
+| **Memory** (default) | Construction, ingestion, batching, backpressure, counters, lifecycle | **Does not deliver.** It selects the Noop adapter, which counts batches and discards them (`adapter/noop.rs`); `poll_shard` always returns empty. Publish succeeds, `subscribe()` yields nothing, forever — a round-trip **hangs** rather than failing. No network, no encryption, no persistence. |
 | **Mesh** (UDP, peer-to-peer) | Production multi-host deployments | Encrypted (Noise + ChaCha20-Poly1305), no broker, NAT traversal opt-in, automatic rerouting. The "real" Net. |
 | **Redis** | When you already run Redis and need cross-process pub/sub with optional persistence | Net publishes to Redis Streams; subscribers read from them. You get Redis's durability semantics. |
 | **JetStream** (NATS) | When you already run NATS JetStream and want its durability/retention | Same idea as Redis adapter, different backend. |
@@ -112,6 +154,8 @@ A node's transport is what physically moves bytes between nodes. In TS, Python, 
 Selection happens via constructor parameters — see `apis.md`. **A node can have only one transport at a time** (it's set at construction). To bridge transports, run two nodes in the same process.
 
 In TS, Python, and Rust, application code does not know which transport it got. Code written for the memory transport runs unmodified on mesh transport. This is the "location-transparent consumption" property — the call signature for `publish` is identical whether the subscriber is in the same process or five hops away on a different continent. (Go and C are an exception: their poll-based surface and current binding shape can require explicit changes when switching transports — `NewMeshNode` for mesh, etc.)
+
+**Transparent does not mean equivalent.** Memory is the one entry in that table that never hands an event to a consumer, so "runs unmodified" is a statement about the *code*, not the *behaviour*: the same snippet that round-trips on Redis blocks indefinitely on memory. Write round-trip examples and delivery tests against a loopback mesh pair, Redis, or JetStream. `testing.md` has the split by what you are asserting.
 
 ## Encryption (for mesh transport)
 
@@ -132,7 +176,9 @@ Out of scope for most event-bus integrations, but you should know the words:
 - **Capabilities:** a node announces what it can do — hardware (CPU, GPU, RAM), loaded models, installed tools, operator tags (`region:us`, `env:prod`). The mesh routes based on capabilities, not just node IDs. Relevant if the user wants a channel to land on "any node with a GPU" rather than a specific node.
 - **Subnets:** application-derived boundaries from capability tags. A `SubnetLocal` channel only delivers to peers whose tags map to the same subnet. Used for "dev nodes can't see prod data" — a one-line policy, not a firewall rule.
 - **Scoped discovery (`scope:*` tags):** a separate, query-side mechanism for narrowing *who finds whom*. A provider tags itself `scope:tenant:oem-123`, `scope:region:eu-west`, or `scope:subnet-local`; consumers call `find_nodes_scoped(filter, scope)` to get only the matching pool. Wire format and forwarders are unchanged — strictly a discovery filter, not a routing gate. Useful for per-tenant GPU pools and regional rendezvous selection without standing up separate subnets.
-- **Permission tokens (root-anchored token chains):** a channel registered with `token_roots` enforces auth. A presented credential is a `TokenChain` — honored only if it **roots** at one of the channel's `token_roots`, **binds** at its leaf to the subscribing peer's `EntityId`, and **authorizes** the action (`SUBSCRIBE` / `PUBLISH`) at every link. The chain travels the wire on subscribe (`subscribe_channel_with_chain`, surfaced as `SubscribeOptions.token` on the SDK) and the publisher re-checks expiry + revocation while the subscription lives. A **delegated** publisher (granted via `owner → org → this_node`) must install its full chain locally with `MeshNode::set_publish_chain(channel, chain)` at startup, or its publishes fail the root-anchor check; **direct-issued** publishers (the common case) need no change. Revocation is immediate (a root dropped from `token_roots` revokes inline). A capability announcement's wire `node_id` is bound to the verified signer, so a forged `node_id` is rejected with `WireError::NodeIdMismatch`.
+- **Permission tokens (root-anchored token chains):** a channel registered with `token_roots` enforces auth. A presented credential is a `TokenChain` — honored only if it **roots** at one of the channel's `token_roots`, **binds** at its leaf to the subscribing peer's `EntityId`, and **authorizes** the action (`SUBSCRIBE` / `PUBLISH`) at every link. The chain travels the wire on subscribe (`MeshNode::subscribe_channel_with_chain`) and the publisher re-checks expiry + revocation while the subscription lives. A **delegated** publisher (granted via `owner → org → this_node`) must install its full chain locally with `MeshNode::set_publish_chain(channel, chain)` at startup, or its publishes fail the root-anchor check; **direct-issued** publishers (the common case) need no change.
+
+  **Both delegated paths are core-only and unreachable from any SDK or binding.** Every published surface — Rust `SubscribeOptions.token`, Python, Node, Go, C — carries exactly **one** `PermissionToken`, not a chain. So an owner → delegator → subscriber chain cannot subscribe, and a delegated publisher cannot install its chain, from anything a caller can import. If you are designing a delegated channel workflow today: mint a token issued directly to the subscriber by a root the channel trusts, or drive the core `MeshNode` from Rust. See `bindings/coverage.md`. Revocation is immediate (a root dropped from `token_roots` revokes inline). A capability announcement's wire `node_id` is bound to the verified signer, so a forged `node_id` is rejected with `WireError::NodeIdMismatch`.
 
 If the user is just publishing and subscribing on a single trusted mesh, you don't need any of this. If they ask "how do I keep dev events out of prod?" or "can I require auth for this channel?" — point at `README.md` § Capabilities, Subnets, and Security surface.
 

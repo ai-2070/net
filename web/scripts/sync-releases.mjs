@@ -36,11 +36,19 @@ const DEST = join(WEB, "src", "content", "docs", "releases");
 const GH = "https://github.com/ai-2070/net/blob/master";
 
 // Authored alongside the release notes but not published: the checklist, the
-// beta notes, and a stray v0.8 draft superseded by the real v0.8 notes.
+// beta notes, a stray v0.8 draft superseded by the real v0.8 notes, and the
+// pending-breaking staging file.
+//
+// `PENDING_v0.35_BREAKING.md` collects breaking entries as they land, before
+// there is a note to put them in — `RELEASE_STEPS.md` picks the codename at
+// step 2 and drafts the note at step 4, and the entries are folded in there
+// and the file deleted. Publishing it would put a half-assembled changelog on
+// the site under a version that has not shipped.
 const NOT_PUBLISHED = new Set([
   "BETA_NOTES.md",
   "RELEASE_STEPS.md",
   "RELEASE_v0.8_NOTES.md",
+  "PENDING_v0.35_BREAKING.md",
 ]);
 
 // Paths the notes reference that moved, or that were always one directory

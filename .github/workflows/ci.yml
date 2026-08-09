@@ -1346,6 +1346,16 @@ jobs:
         with:
           node-version: "24"
 
+      # `sdk-ts` resolves `@net-mesh/core` through a `file:` devDependency,
+      # which carries no version — so a peerDependency range that excludes
+      # the core it ships with is invisible to every other step in this job.
+      # It surfaces only at `npm install` on a user's machine. Non-strict
+      # here: a floor aimed at an unreleased version is fine as long as the
+      # CHANGELOG says so. `release-npm-sdk.yml` runs the strict form.
+      - name: Guard — SDK peer range admits the in-tree core
+        working-directory: ${{ github.workspace }}
+        run: python3 .github/scripts/check-npm-peer-range.py
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -1430,6 +1440,14 @@ jobs:
         uses: actions/setup-python@v7
         with:
           python-version: "3.12"
+
+      # This job's wheel enables features the *release* wheel did not,
+      # so everything below could pass against a surface users cannot
+      # install. `org` and `deck` shipped that way. Compare the two
+      # feature sets before trusting any of it.
+      - name: Guard — release wheel carries what this job tests
+        working-directory: ${{ github.workspace }}
+        run: python3 .github/scripts/check-python-wheel-features.py
 
       # Match `net/crates/net/rust-toolchain.toml` directly so the
       # pinned 1.96.0 toolchain is installed up-front rather than
@@ -1641,6 +1659,20 @@ jobs:
           CARGO_PROFILE_RELEASE_DEBUG: "1"
           RUSTFLAGS: "-Cforce-frame-pointers=yes"
         run: cargo build --release -p net-ffi --features net-ffi/test-helpers
+
+      # The public nRPC header must describe the library being built.
+      #
+      # `net_rpc.h` shipped at ABI 0x0002 against a 0x0004
+      # implementation, declaring both cancellation functions without
+      # the leading `MeshRpcHandle*` that 0x0004 added — so a consumer
+      # compiled against it passed whatever was in the first argument
+      # register as a mesh pointer. The only guard was
+      # `net_rpc_check_abi_version`, which compared `runtime >=
+      # expected` and therefore passed the stale header. Text-only, so
+      # it runs before the build finishes mattering.
+      - name: Guard — nRPC header matches the implementation ABI
+        if: ${{ !cancelled() }}
+        run: python3 "$GITHUB_WORKSPACE/.github/scripts/check-rpc-abi-parity.py"
 
       # The invariant this hang cost a lot to find: the Go binary loads exactly
       # one copy of `net::ffi`.

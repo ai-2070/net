@@ -47,9 +47,12 @@ npm install @net-mesh/sdk @net-mesh/core
 native binding it dispatches into. Prebuilt `.node` artifacts ship with every
 feature enabled.
 
-Upgrade both together. The wrapper is a thin typed layer over the binding, so
-a version skew surfaces as a missing method at the call site rather than at
-install time. [CHANGELOG.md](CHANGELOG.md) records what each release asks a
+Upgrade both together, and install them together. The wrapper is a thin typed
+layer over the binding, so a version skew surfaces as a missing method at the
+call site rather than at install time — which is why `@net-mesh/sdk` also
+declares a `@net-mesh/core` peer floor. If npm reports an unmet peer
+dependency, do not `--force` past it: the SDK is calling a binding method your
+core does not have. [CHANGELOG.md](CHANGELOG.md) records what each release asks a
 caller to change — read it before upgrading, especially if you filter on
 `minVramGb` / `minMemoryGb`.
 
@@ -60,8 +63,15 @@ caller to change — read it before upgrading, especially if you filter on
 ```typescript
 import { MeshNode, serveTool } from '@net-mesh/sdk';
 
-const psk = new Uint8Array(32).fill(0x42);   // both peers share the same PSK
+// `psk` is a 64-character hex string, not bytes — it is hex-decoded at
+// the native boundary. A `Uint8Array` here does not type-check and
+// does not satisfy the runtime constructor.
+const psk = '42'.repeat(32);                 // both peers share the same PSK
 const node = await MeshNode.create({ bindAddr: '127.0.0.1:0', psk });
+
+// Port 0 means the OS chooses; `localAddr()` is how the peer learns
+// which port to connect to.
+console.log(node.localAddr());
 
 const handle = serveTool(node, {
   name: 'web_search',
@@ -121,13 +131,26 @@ console.log(`${stats.eventsIngested} ingested, ${stats.eventsDropped} dropped`);
 await node.shutdown();   // explicit — Node finalizers are non-deterministic
 ```
 
-Consume what you emit:
+Consume what you emit — **on a transport that stores**. The default is memory,
+which selects the Noop adapter: it counts batches and discards them, so
+`subscribe()` on the node above would block forever with nothing to yield.
 
 ```typescript
+const node = await NetNode.create({
+  shards: 4,
+  transport: { type: 'redis', url: 'redis://127.0.0.1:6379' },
+});
+
+node.emit({ sensor: 'lidar', range_m: 12.5 });
+
 for await (const event of node.subscribe({ limit: 100 })) {
   console.log('event', event);
 }
 ```
+
+Memory is the right choice for ingestion, batching, backpressure, counters and
+lifecycle — everything above this snippet. Use redis, jetstream or mesh the
+moment a consumer has to receive something.
 
 `emit` returns once the event is **accepted into the local ring buffer** — not
 that anyone processed it. Under backpressure it drops, and
@@ -204,7 +227,7 @@ napi build --platform --release --features "cortex netdb redex-disk meshdb mesho
 | Mesh streams — direct peer-to-peer, windowed | [Mesh streams](https://ai2070.net/docs/guides/mesh-streams) |
 | Capabilities — announce and discover | [Discover and invoke](https://ai2070.net/docs/guides/discover-and-invoke) |
 | nRPC — typed request/response, streaming, cancellation | [Typed RPC](https://ai2070.net/docs/guides/nrpc) |
-| Channels — hierarchical pub/sub with capability auth | [Channels](https://ai2070.net/docs/concepts/channels) |
+| Distributed mesh channels — roster fan-out with capability auth | [Channels](https://ai2070.net/docs/concepts/channels) |
 | RedEX / CortEX / NetDB — logs, folds, queries | [Durable logs](https://ai2070.net/docs/guides/durable-logs), [Folds](https://ai2070.net/docs/guides/cortex-folds), [NetDB](https://ai2070.net/docs/guides/netdb-queries) |
 | MeshDB — federated queries | [MeshDB](https://ai2070.net/docs/guides/netdb-queries#federated-queries-meshdb) |
 | Dataforts — blobs, greedy cache, data gravity | [Blob storage](https://ai2070.net/docs/guides/dataforts) |

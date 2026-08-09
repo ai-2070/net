@@ -402,6 +402,19 @@ int      net_mesh_open_stream(net_meshnode_t* handle,
                               net_mesh_stream_t** out_stream);
 void     net_mesh_stream_free(net_mesh_stream_t* handle);
 
+/* Close the underlying core stream, then free the handle.
+ *
+ * `net_mesh_stream_free` above only drops the FFI handle; core stream
+ * state survives until node shutdown. Use this to release it eagerly,
+ * to enforce a close/reopen epoch, or to reopen the same stream id
+ * under a new configuration — without it the original "first open
+ * wins" config stays in force for the life of the node.
+ *
+ * Returns 0 on success or a negative NET_ERR_* code. Null your handle
+ * afterwards; calling it or net_mesh_stream_free twice on the same
+ * pointer is undefined. */
+int      net_mesh_close_stream(net_mesh_stream_t* handle);
+
 /* Send a batch of payloads on an open stream.
  *
  * `payloads` is a pointer to an array of `count` byte-pointers;
@@ -453,17 +466,26 @@ int      net_mesh_recv_shard(net_meshnode_t* handle,
  *     "visibility": "global" | "subnet-local" | "parent-visible" | "exported",
  *     "reliable":      false,
  *     "require_token": false,
+ *     "token_roots":   ["<64 hex chars>", ...],
  *     "priority":      0,
  *     "max_rate_pps":  1000,
  *     "publish_caps":   { ... CapabilityFilter ... },   // Stage G-4
  *     "subscribe_caps": { ... CapabilityFilter ... } }  // Stage G-4
+ *
+ * `token_roots` are hex-encoded 32-byte entity ids whose signature may
+ * root a presented token chain. Required whenever `require_token` is
+ * true: core rejects every authorization when token enforcement is on
+ * and no roots are installed, so `require_token` alone does not give
+ * you a token-gated channel — it gives you a permanently closed one.
  */
 int      net_mesh_register_channel(net_meshnode_t* handle, const char* config_json);
 int      net_mesh_subscribe_channel(net_meshnode_t* handle,
                                     uint64_t publisher_node_id,
                                     const char* channel);
 
-/* Subscribe with a serialized `PermissionToken` (161 bytes) attached.
+/* Subscribe with a serialized `PermissionToken` (169 bytes) attached.
+ * A full `TokenChain` is a different shape — `1 + count * 169` bytes —
+ * and is not accepted here.
  * Required when the publisher set `require_token=true`, or when the
  * subscriber's announced caps don't satisfy `subscribe_caps`. Parses
  * the token client-side — malformed bytes return
@@ -518,6 +540,64 @@ void     net_identity_free(net_identity_t* handle);
  * buffer — treat the bytes as secret material. */
 int      net_identity_to_seed(net_identity_t* handle, uint8_t* out);
 
+/* --- Issuer generation + durable issuer state -------------------------
+ *
+ * A token carries the credential epoch of the identity that signed it,
+ * and a verifier rejects it once its revocation floor for that issuer
+ * exceeds the epoch. That is only usable if an issuer can restart still
+ * knowing which epoch it is on, and the 32-byte seed above cannot carry
+ * one: `net_identity_from_seed` comes back at generation zero, which
+ * for an issuer that has already published floor N means it can mint
+ * nothing a verifier will accept.
+ *
+ * Persisted state layout (identical in every binding):
+ *
+ *     offset  size  field
+ *          0     1  version (currently 1)
+ *          1    32  ed25519 seed
+ *         33     4  issuer generation, uint32 little-endian
+ */
+
+#define NET_IDENTITY_STATE_SIZE 37
+
+/* Returns the size this build writes. Compare against
+ * NET_IDENTITY_STATE_SIZE at startup if you want a stale header to
+ * fail loudly rather than under-allocate a buffer. */
+size_t   net_identity_state_size(void);
+
+/* This issuer's current credential epoch. Returns 0 for a NULL or
+ * shutting-down handle — indistinguishable from a genuine zero, which
+ * is the epoch that claims the least. */
+uint32_t net_identity_generation(net_identity_t* handle);
+
+/* The same key at a later generation, as a NEW handle. The input is
+ * unchanged; free both. `next` equal to the current generation is
+ * accepted and idempotent at every generation, UINT32_MAX included.
+ * Returns NET_ERR_IDENTITY when `next` is lower. There is no
+ * generation above UINT32_MAX to name, so an issuer there can
+ * re-apply but not advance; past that, rotate the identity key.
+ *
+ * Rotation order: build the generation-N handle, persist
+ * net_identity_to_state atomically and durably, distribute verifier
+ * floor N, then issue. Publishing floor N before the state is durable
+ * leaves a crashed issuer announcing a floor it cannot satisfy.
+ *
+ * The token cache is NOT shared with the source handle — two
+ * independently-freeable handles must not share one. */
+int      net_identity_at_generation(net_identity_t* handle, uint32_t next,
+                                    net_identity_t** out_handle);
+
+/* Writes NET_IDENTITY_STATE_SIZE bytes into `out`. Secret material:
+ * contains the signing seed. Encrypt at rest and write atomically. */
+int      net_identity_to_state(net_identity_t* handle, uint8_t* out);
+
+/* Restores key AND generation. Returns NET_ERR_IDENTITY on a wrong
+ * length or an unrecognized version rather than parsing what it can —
+ * a partial parse of credential state is how an issuer silently comes
+ * back on the wrong epoch. */
+int      net_identity_from_state(const uint8_t* state, size_t state_len,
+                                 net_identity_t** out_handle);
+
 /* Writes the 32-byte entity id into `out[32]`. */
 int      net_identity_entity_id(net_identity_t* handle, uint8_t* out);
 
@@ -525,6 +605,23 @@ uint64_t net_identity_node_id(net_identity_t* handle);
 uint64_t net_identity_origin_hash(net_identity_t* handle);
 
 /* Signs `msg[len]`; writes a 64-byte ed25519 signature into `out_sig[64]`. */
+/* Verify a detached ed25519 signature against a 32-byte entity id.
+ *
+ * The verifying half of net_identity_sign. Writes 1 to *out_valid when
+ * the signature is valid for this exact (entity_id, msg) pair and 0
+ * when it is not; returns 0 on success, or a negative code only for a
+ * malformed argument. So a 0 return with *out_valid == 0 means "did
+ * not verify", never "called wrong".
+ *
+ * Strict verification — the malleable (R, S + L) signature variant is
+ * rejected, so one logical message cannot appear under two encodings.
+ *
+ * `signature_len` must be exactly 64 and `entity_id_len` exactly 32. */
+int      net_verify_signature(const uint8_t* entity_id, size_t entity_id_len,
+                              const uint8_t* msg, size_t msg_len,
+                              const uint8_t* signature, size_t signature_len,
+                              int* out_valid);
+
 int      net_identity_sign(net_identity_t* handle,
                            const uint8_t* msg, size_t len,
                            uint8_t* out_sig);

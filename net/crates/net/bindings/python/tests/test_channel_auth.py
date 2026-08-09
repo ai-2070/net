@@ -128,7 +128,7 @@ def test_publish_open_channel_no_caps_enforced() -> None:
 def test_subscribe_channel_rejects_malformed_token_bytes() -> None:
     m = NetMesh(_port(7), PSK)
     try:
-        # 16 bytes is far too short for a 161-byte PermissionToken —
+        # 16 bytes is far too short for a 169-byte PermissionToken —
         # `from_bytes` must reject with `TokenError(invalid_format)`
         # *before* any membership request is dispatched, so there's
         # no network timeout to wait through.
