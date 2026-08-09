@@ -217,6 +217,44 @@ impl ControlPlaneStats {
 /// caller does NOT replay) rather than spin forever (#4 follow-up).
 const COMMITTED_FLUSH_STALL_BUDGET: Duration = Duration::from_secs(30);
 
+/// Bound on ONE datagram send (OLB-2B.3c step-2 HOLD item 2).
+///
+/// `NetSocket::send_to` pends while the socket is unwritable, and a socket that
+/// never becomes writable turns a send into an indefinite await with no error
+/// to report. That is survivable on a background task and is NOT survivable on
+/// a path an exported FFI entry point reaches synchronously: the caller has no
+/// cancellation, so the hang becomes the process's. The deadline converts it
+/// into a typed refusal the caller can surface.
+///
+/// Generous relative to any healthy send — a local datagram completes in
+/// microseconds — and short enough that a wedged socket is reported rather than
+/// waited on.
+const DATAGRAM_SEND_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Whole-operation bound on acquiring the announce lock (HOLD-2 backstop).
+///
+/// An EXPORTED, synchronous entry point must not block unboundedly on an
+/// internal lock. `announce_capabilities` is reached that way through the C ABI,
+/// and a caller on the far side of `extern "C"` has no cancellation: whatever
+/// this waits for, it waits for on the caller's thread, forever.
+///
+/// A `tokio::time::timeout` around the future cannot supply this bound. A
+/// blocking `Mutex::lock()` is not an await point, so the timer never gets to
+/// run on the thread that is stuck inside it — the deadline has to be on the
+/// ACQUIRE itself.
+///
+/// See §18.0g of the 2B.3b design note for the failure this was traced to: a
+/// wakeup lost between two statically-linked copies of this crate in one
+/// process, where the mutex is demonstrably free and the waiter is never
+/// unparked. The bound is what keeps the boundary usable; it is NOT a fix for
+/// that packaging defect, and it protects only this one lock.
+const ANNOUNCE_LOCK_DEADLINE: Duration = Duration::from_secs(30);
+
+/// How often the bounded acquire retries the fast path. Short enough that a lost
+/// wakeup costs a caller milliseconds rather than the whole deadline, long enough
+/// that an ordinary contended acquire still parks rather than spins.
+const ANNOUNCE_LOCK_POLL: Duration = Duration::from_millis(50);
+
 /// Back off, then report whether the committed-prefix flush retry may
 /// continue. Returns `Err(StreamError::Transport)` once `deadline` has
 /// passed — a receiver that has granted no credit by then is treated as
@@ -900,12 +938,26 @@ impl Drop for TrainSlot {
 ///
 /// This guard moves the rollback into `Drop`, which runs
 /// synchronously whenever the spawned future is dropped. The
-/// successful-send arm calls `commit()` to consume the guard
-/// without invoking `Drop` (`std::mem::forget`); cancellation,
-/// panic, or any non-success path lets the guard drop naturally,
-/// and `Drop` reverts all three registrations.
+/// successful-send arm calls `commit()`, which DISARMS the guard and
+/// then lets it drop like any other value; cancellation, panic, or any
+/// non-success path leaves it armed, and `Drop` reverts all three
+/// registrations.
+///
+/// The disarm flag replaces an earlier `ManuallyDrop`/`ptr::read`
+/// shape that skipped `Drop` outright and had to name every
+/// `Arc`-typed field by hand so it could be read back out and dropped.
+/// That list is exactly the kind that goes stale: three routing
+/// handles were later added to the guard and not added to it, so every
+/// successful routed registration leaked three strong references. A
+/// flag owns no field list, so a field added tomorrow is dropped
+/// correctly by construction.
 struct PeerRegistrationGuard {
     peer_node_id: u64,
+    /// `true` from construction until `commit()`. `Drop` rolls back
+    /// only while armed — that, and nothing about which fields the
+    /// struct happens to hold, is what distinguishes the successful
+    /// path from every other one.
+    armed: bool,
     /// Session-id of the registered peer; the rollback uses this to
     /// drop the `session_id_to_node` reverse-index entry alongside
     /// the other peer-keyed maps (PERF_AUDIT §2.4).
@@ -924,43 +976,41 @@ struct PeerRegistrationGuard {
     /// The control-path transition handle, so the rollback is one
     /// serialized peer transition like every other publisher/remover.
     peer_transitions: PeerTransitions,
+    /// OLB-2B.3c step 2: a rollback REMOVES a session, which moves the
+    /// session/direct-state projection exactly as installing one does. The
+    /// handles ride the guard because the rollback runs from `Drop`, where
+    /// there is no `&MeshNode` to reach them through.
+    session_routing: Arc<NodeSessionRouting>,
+    routing_registry: Arc<super::behavior::org_routing_registry::NodeOrgRoutingRegistry>,
+    peer_entity_ids: Arc<DashMap<u64, EntityId>>,
 }
 
 impl PeerRegistrationGuard {
-    /// Mark the registration as durable. Drops `self` *without*
-    /// running the rollback — the post-handshake send completed
-    /// successfully, so the registrations should stay in place.
-    fn commit(self) {
-        // `mem::forget` skips `Drop`. The Arc fields would
-        // normally decrement on drop, but since we want them
-        // alive (they're shared with the rest of the bus), we
-        // need to drop them manually before forgetting the
-        // wrapper. SAFETY: reading the Arc fields out of the
-        // struct via `ptr::read` and forgetting the rest is the
-        // standard cancel-Drop pattern.
-        let me = std::mem::ManuallyDrop::new(self);
-        #[expect(
-            clippy::multiple_unsafe_ops_per_block,
-            reason = "the ptr::read calls form a single semantic op (consume ManuallyDrop fields together so they drop normally)"
-        )]
-        // SAFETY: `me` is `ManuallyDrop`, so its fields won't be
-        // dropped automatically. We read them out and let them
-        // drop normally, which decrements the Arc strong counts
-        // — exactly what would happen on a non-guarded path. EVERY
-        // Arc field must appear here; one left out leaks a strong
-        // reference on every committed registration.
-        unsafe {
-            let _peers = std::ptr::read(&me.peers);
-            let _peer_addrs = std::ptr::read(&me.peer_addrs);
-            let _session_id_to_node = std::ptr::read(&me.session_id_to_node);
-            let _router = std::ptr::read(&me.router);
-            let _peer_transitions = std::ptr::read(&me.peer_transitions);
-        }
+    /// Mark the registration as durable. Disarms the rollback — the
+    /// post-handshake send completed successfully, so the
+    /// registrations should stay in place — and then drops `self`
+    /// ordinarily, releasing every guard-owned reference exactly as an
+    /// unguarded path would have.
+    ///
+    /// No `mem::forget`, no `ManuallyDrop`, no `unsafe`: `Drop` still
+    /// runs, it just finds the guard disarmed and returns. That is what
+    /// makes the release of the fields total rather than enumerated.
+    fn commit(mut self) {
+        self.armed = false;
+        // `self` drops here. Every field — including any added later —
+        // is released by the ordinary drop glue.
     }
 }
 
 impl Drop for PeerRegistrationGuard {
     fn drop(&mut self) {
+        // Committed: the registration is durable and there is nothing to
+        // undo. Returning here is the whole of the successful path's
+        // special-casing; the fields below are untouched and drop
+        // normally after this returns.
+        if !self.armed {
+            return;
+        }
         // Roll back as ONE peer transition, so the removals cannot
         // interleave with a concurrent install's publications.
         let peer_node_id = self.peer_node_id;
@@ -971,52 +1021,68 @@ impl Drop for PeerRegistrationGuard {
         let peer_addrs = &self.peer_addrs;
         let session_id_to_node = &self.session_id_to_node;
         let router = &self.router;
-        self.peer_transitions.with(peer_node_id, || {
-            // Undo only OUR registration — and only while it is still
-            // ours.
-            //
-            // The peer entry is matched on the exact SESSION we
-            // registered, not on its address: a concurrent retry can
-            // legitimately install a different session at the same
-            // address (a re-handshake to the same relay). When that
-            // match FAILS, a replacement owns this peer, and every
-            // sidecar below now describes the replacement rather than
-            // us. Running the sidecar removals anyway was the defect:
-            // both were keyed on the shared address, so a stale
-            // rollback stripped a live session's address mapping and
-            // route while leaving the live session itself in place —
-            // reachable in `peers`, unreachable in fact.
-            //
-            // The rollback owns the whole transition or none of it.
-            if peers
-                .remove_if(&peer_node_id, |_, pi| {
-                    pi.session.session_id() == registered_session_id
-                })
-                .is_none()
-            {
-                return;
-            }
-            peer_addrs.remove_if(&peer_node_id, |_, addr| *addr == registered_next_hop);
-            // PERF_AUDIT §2.4: drop the reverse-index entry only when
-            // it still points at our registered node_id. A concurrent
-            // retry that installed a fresh session under the same
-            // peer_node_id would have replaced it; we must not undo
-            // that successful registration.
-            session_id_to_node.remove_if(&registered_session_id, |_, n| *n == peer_node_id);
-            // Remove exactly the candidate this registration installed,
-            // named by the TOKEN its install produced. A routed
-            // registration writes the ORDINARY slot, so the rollback
-            // must not scan both provenances — an earlier shape used
-            // the both-slot address helper and let a cancelled routed
-            // handshake erase a pre-existing PROTECTED candidate at the
-            // same address. Address alone is not enough either: a
-            // replacement registration through the same relay writes an
-            // identical `(dest, next_hop)` pair, which an address-keyed
-            // removal cannot tell from ours.
-            router
-                .routing_table()
-                .remove_ordinary_route_if_token_is(peer_node_id, registered_route_token);
-        });
+        // HOLD-2 item 1: the removal and the republication it causes are ONE
+        // serialized transition, taken in the frozen order `session gate ->
+        // peer-transition guard -> peer shard`. A rollback that did NOT own the
+        // registration removes nothing inside the closure and publishes
+        // nothing.
+        commit_peer_transition(
+            &self.session_routing,
+            &self.routing_registry,
+            &self.peers,
+            &self.peer_entity_ids,
+            || {
+                let mut removed = false;
+                self.peer_transitions.with(peer_node_id, || {
+                    // Undo only OUR registration — and only while it is still
+                    // ours.
+                    //
+                    // The peer entry is matched on the exact SESSION we
+                    // registered, not on its address: a concurrent retry can
+                    // legitimately install a different session at the same
+                    // address (a re-handshake to the same relay). When that
+                    // match FAILS, a replacement owns this peer, and every
+                    // sidecar below now describes the replacement rather than
+                    // us. Running the sidecar removals anyway was the defect:
+                    // both were keyed on the shared address, so a stale
+                    // rollback stripped a live session's address mapping and
+                    // route while leaving the live session itself in place —
+                    // reachable in `peers`, unreachable in fact.
+                    //
+                    // The rollback owns the whole transition or none of it.
+                    if peers
+                        .remove_if(&peer_node_id, |_, pi| {
+                            pi.session.session_id() == registered_session_id
+                        })
+                        .is_none()
+                    {
+                        return;
+                    }
+                    peer_addrs.remove_if(&peer_node_id, |_, addr| *addr == registered_next_hop);
+                    // PERF_AUDIT §2.4: drop the reverse-index entry only when
+                    // it still points at our registered node_id. A concurrent
+                    // retry that installed a fresh session under the same
+                    // peer_node_id would have replaced it; we must not undo
+                    // that successful registration.
+                    session_id_to_node.remove_if(&registered_session_id, |_, n| *n == peer_node_id);
+                    // Remove exactly the candidate this registration installed,
+                    // named by the TOKEN its install produced. A routed
+                    // registration writes the ORDINARY slot, so the rollback
+                    // must not scan both provenances — an earlier shape used
+                    // the both-slot address helper and let a cancelled routed
+                    // handshake erase a pre-existing PROTECTED candidate at the
+                    // same address. Address alone is not enough either: a
+                    // replacement registration through the same relay writes an
+                    // identical `(dest, next_hop)` pair, which an address-keyed
+                    // removal cannot tell from ours.
+                    router
+                        .routing_table()
+                        .remove_ordinary_route_if_token_is(peer_node_id, registered_route_token);
+                    removed = true;
+                });
+                ((), removed)
+            },
+        );
     }
 }
 
@@ -1282,6 +1348,14 @@ struct DispatchCtx {
     /// review-pass-3 §10: per-outcome private-discovery intake counters. See the
     /// matching `MeshNode` field.
     scoped_ingest_counters: Arc<super::behavior::org_scoped_store::ScopedIngestCounters>,
+    /// OLB-2B.3c step 2: the node's session/direct-state projection and the
+    /// routing registry it publishes to. Carried here because the TOFU
+    /// entity-id pin — which is what makes a node id resolve to a provider —
+    /// happens on the dispatch path, and a pin that moved the projection
+    /// without republishing it would leave every pool annotating that provider
+    /// cold forever.
+    session_routing: Arc<NodeSessionRouting>,
+    routing_registry: Arc<super::behavior::org_routing_registry::NodeOrgRoutingRegistry>,
     /// OA3-5 §3.2: the bounded relay dedup gate for opaque scoped-announcement
     /// propagation. See the matching field doc on `MeshNode`.
     scoped_relay_gate: Arc<super::behavior::org_scoped_relay::ScopedAnnRelayGate>,
@@ -6272,7 +6346,399 @@ fn advance_fenced_generation(counter: &std::sync::atomic::AtomicU64, what: &'sta
 /// a mutation's state-lock section but preceded its publication still reads the
 /// post-mutation revision, and the pin then blocks until that publication is
 /// ordered — so the wake the discarded attempt relies on is already queued.
+/// One coherent, IMMUTABLE observation of the node's session/direct-state,
+/// published as a whole (OLB-2B.3c step 2; design §3).
+///
+/// The generation lives INSIDE the value rather than beside it, which is what
+/// makes "these rows were observed at this generation" unfalsifiable: there is
+/// no second place for the two to be sampled from and disagree.
+///
+/// Keyed by the PROVIDER entity, because that is the identity discovery
+/// produces. The `NodeId → EntityId` mapping is mutable and is consulted only
+/// while this value is being built, never at lookup time — a lookup that
+/// re-resolved it would attach a session to a provider on the strength of
+/// whatever the map happens to say at that instant, which is exactly the
+/// identity confusion design §3 forbids.
+#[derive(Debug, Default)]
+struct SessionProjection {
+    /// The generation this whole observation was published under.
+    generation: u64,
+    /// Entities with EXACTLY ONE unambiguously resolved live session.
+    ///
+    /// An entity absent here is `Cold`, and absence deliberately conflates
+    /// three cases the projection refuses to distinguish by guessing: no live
+    /// session, a `(node_id, entity)` pair that moved while it was being read,
+    /// and an entity that resolves to more than one live session. In the last
+    /// case there is no answer to "which session would a call use", and
+    /// picking one would be a routing decision made by a map iteration order.
+    rows: std::collections::BTreeMap<
+        EntityId,
+        super::behavior::org_routing_registry::DirectEligibility,
+    >,
+}
+
+impl super::behavior::org_routing_registry::SessionEligibility for SessionProjection {
+    fn eligibility(
+        &self,
+        provider: &EntityId,
+    ) -> super::behavior::org_routing_registry::DirectEligibility {
+        self.rows
+            .get(provider)
+            .copied()
+            .unwrap_or(super::behavior::org_routing_registry::DirectEligibility::Cold)
+    }
+}
+
+/// The node's session/direct-state projection, and the one generation that
+/// orders it (OLB-2B.3c step 2).
+///
+/// # Why the projection is PUBLISHED rather than sampled on demand
+///
+/// A pool's annotations must all come from one coherent view. Building them by
+/// reading `peers` and `peer_entity_ids` at annotation time would sample two
+/// independently-mutable maps once per provider, so one pool could carry rows
+/// from several different states of the world — the mixed observation design
+/// §3 refuses. Publishing an immutable value makes the actor's capture a single
+/// `ArcSwap::load_full`, which cannot straddle anything.
+///
+/// # Lock order
+///
+/// ```text
+/// peer-transition shard  ->  session publication gate  ->  registry lock
+/// ```
+///
+/// Acyclic, and disjoint from the frozen `source commit pin → registry lock`:
+/// routing never takes a peer-transition shard or this gate, and the actor's
+/// capture takes no lock at all. The registry invalidation that follows a
+/// republication runs with the gate RELEASED, on the same discipline the
+/// consumer-Grant edge already carries (design §2A.2, item 10) — taking the
+/// registry lock beneath a publication gate is the inversion that discipline
+/// exists to prevent.
+struct NodeSessionRouting {
+    /// The currently published observation.
+    published: arc_swap::ArcSwap<SessionProjection>,
+    /// The monotone, checked, terminal generation ordering it. Shared with the
+    /// registry, which compares it lock-free beneath its own lock.
+    currentness: Arc<super::behavior::org_routing_registry::SessionCurrentness>,
+    /// Serializes republication, so two transitions cannot interleave a build
+    /// with a store and publish a projection older than the generation naming
+    /// it. Held ONLY across the rebuild and the two stores.
+    gate: parking_lot::Mutex<()>,
+    /// Republications that produced a new generation. Observable so a witness
+    /// can prove a NON-transition published nothing.
+    publications: AtomicU64,
+    /// Test-only observation of the sample→revalidate window inside the build.
+    build_observer: SessionBuildObserver,
+    /// Test-only, one-shot: fires immediately BEFORE a transition takes
+    /// [`Self::gate`], and therefore before it takes any lock at all.
+    ///
+    /// This exists because "the replacement is blocked" and "the replacement
+    /// has not started yet" are the same observation from outside, and only the
+    /// first is the property. A witness that arms this and waits for it knows
+    /// the contending thread is AT the production gate; anything it asserts
+    /// afterwards is about contention rather than about scheduling luck.
+    ///
+    /// It paces the real path — `commit_peer_transition` is the only caller —
+    /// so it cannot drift from the transition it is supposed to be observing.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    transition_attempt_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+impl NodeSessionRouting {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            published: arc_swap::ArcSwap::from_pointee(SessionProjection::default()),
+            currentness: super::behavior::org_routing_registry::SessionCurrentness::new(),
+            gate: parking_lot::Mutex::new(()),
+            publications: AtomicU64::new(0),
+            build_observer: SessionBuildObserver::default(),
+            #[cfg(test)]
+            transition_attempt_hook: parking_lot::Mutex::new(None),
+        })
+    }
+
+    /// One-shot, TAKEN like the build observations: a witness arms exactly one
+    /// transition attempt and every attempt after it runs unobserved.
+    #[inline]
+    fn observe_transition_attempt(&self) {
+        #[cfg(test)]
+        {
+            let hook = self.transition_attempt_hook.lock().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+    }
+
+    /// Test-only: arm [`Self::observe_transition_attempt`].
+    ///
+    /// Arm it from INSIDE a window that already owns the gate. Armed from
+    /// outside one, the next transition to come along consumes it — which may
+    /// be any transition, not the one under test.
+    #[cfg(test)]
+    pub(crate) fn observe_transition_attempt_for_test(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.transition_attempt_hook.lock() = Some(hook);
+    }
+
+    /// Capture the current observation for one actor quantum. Lock-free.
+    fn observe(&self) -> super::behavior::org_routing_registry::SessionObservation {
+        let published = self.published.load_full();
+        // The generation comes from the VALUE, not from a second read of the
+        // counter: a counter read here could observe a newer generation than
+        // the projection it is about to stamp, which is the over-stating
+        // direction — an annotation looking newer than it is survives the very
+        // movement meant to clear it.
+        //
+        // The counter is read only to decide LIVENESS, and it is read twice on
+        // purpose. That is not redundancy that can be simplified away: the two
+        // reads can disagree, and the only way they can is exhaustion landing
+        // between them — in which case the second one drops the observation.
+        // Both orders of the check fail closed, and this one fails closed
+        // sooner.
+        let generation = self
+            .currentness
+            .generation()
+            .map(|_| published.generation)
+            // A spent space can witness nothing.
+            .filter(|_| !self.is_exhausted());
+        super::behavior::org_routing_registry::SessionObservation::new(
+            generation,
+            published,
+            self.currentness.clone(),
+        )
+    }
+
+    fn is_exhausted(&self) -> bool {
+        self.currentness.generation().is_none()
+    }
+
+    /// Rebuild and publish the projection, returning the generation it was
+    /// published under — or `None` when the generation space is spent.
+    ///
+    /// Reserve, build, store, commit. The reservation happens first so an
+    /// exhausted space publishes NOTHING rather than a projection under a
+    /// frozen or aliased generation; the commit happens last so the counter
+    /// never names a projection that is not yet visible.
+    ///
+    /// # Why the gate is the CALLER's
+    ///
+    /// The guard is passed in rather than taken here, and that is the whole
+    /// commit protocol (HOLD-2 item 1). Taking it here would serialize
+    /// republications against each other and nothing else: the authoritative
+    /// `peers` mutation would still be free to land between this build's
+    /// revalidation and its store, and the projection published under the fresh
+    /// generation would name a session that `peers` no longer holds. Ordering
+    /// the mutation's *notification* behind the gate is not enough, because a
+    /// notification is not the mutation. So the mutation runs under this same
+    /// guard — see [`commit_peer_transition`] — and the only way to reach this
+    /// function is to hold it.
+    fn republish_locked(
+        &self,
+        _gate: &parking_lot::MutexGuard<'_, ()>,
+        peers: &DashMap<u64, PeerInfo>,
+        peer_entity_ids: &DashMap<u64, EntityId>,
+    ) -> Option<u64> {
+        if self.is_exhausted() {
+            return None;
+        }
+        let Some(generation) = self.currentness.reserve() else {
+            // Irreversible, and loud. Refusing to move is not an option in this
+            // direction: a node that can no longer record that its session view
+            // changed must stop publishing pools rather than keep publishing
+            // under a generation that can no longer distinguish views.
+            self.currentness.exhaust();
+            tracing::error!(
+                "org routing: session generation space exhausted; routing pools \
+                 are fenced rather than reusing a session identity"
+            );
+            return None;
+        };
+        let rows = build_session_rows(peers, peer_entity_ids, &self.build_observer);
+        // Test-only, at the ONE instant the commit protocol is about: every
+        // incarnation has been revalidated and NOTHING has been stored yet. A
+        // witness scheduled here drives the exact interleaving that a
+        // re-read-only repair cannot close — see
+        // `a_peer_replaced_after_revalidation_cannot_publish_its_old_session`.
+        self.build_observer.observe_revalidated();
+        self.published
+            .store(Arc::new(SessionProjection { generation, rows }));
+        self.currentness.commit(generation);
+        self.publications.fetch_add(1, Ordering::AcqRel);
+        Some(generation)
+    }
+
+    #[cfg(test)]
+    fn publications(&self) -> u64 {
+        self.publications.load(Ordering::Acquire)
+    }
+
+    /// Test-only: arm the one-shot sample→revalidate interleaving. The hook
+    /// receives the `node_id` whose peer was just sampled.
+    #[cfg(test)]
+    fn observe_build_for_test(&self, hook: Arc<dyn Fn(u64) + Send + Sync>) {
+        *self.build_observer.hook.lock() = Some(hook);
+    }
+
+    /// Test-only: arm the one-shot revalidated→published interleaving. Fires
+    /// after every row's incarnation has been revalidated and before the
+    /// projection is stored.
+    #[cfg(test)]
+    fn observe_revalidated_for_test(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.build_observer.revalidated.lock() = Some(hook);
+    }
+}
+
+/// Test-only observation point INSIDE the projection build: fires once, after a
+/// peer's session has been sampled and before that sample is revalidated.
+///
+/// A production build has no field here, so `observe` compiles to nothing. It
+/// exists because the sample→revalidate window is invisible to every
+/// final-state assertion: the interleaving that matters is a peer replacement
+/// landing exactly inside it, and only a reader scheduled there can drive one.
+#[derive(Default)]
+struct SessionBuildObserver {
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    hook: parking_lot::Mutex<Option<Arc<dyn Fn(u64) + Send + Sync>>>,
+    /// The second window: everything revalidated, nothing published yet.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    revalidated: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+impl SessionBuildObserver {
+    /// One-shot: the hook is TAKEN, so a witness arms exactly one interleaving
+    /// and the rebuild that follows it runs clean.
+    #[inline]
+    fn observe_sampled(&self, _node_id: u64) {
+        #[cfg(test)]
+        {
+            let hook = self.hook.lock().take();
+            if let Some(hook) = hook {
+                hook(_node_id);
+            }
+        }
+    }
+
+    /// One-shot, same discipline: the revalidated→published window.
+    #[inline]
+    fn observe_revalidated(&self) {
+        #[cfg(test)]
+        {
+            let hook = self.revalidated.lock().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+    }
+}
+
+/// Join the peer table with the TOFU-pinned entity map, coherently.
+///
+/// Three refusals, and each one is a case where an answer would have to be
+/// guessed:
+///
+/// - the mapped node has no live session — nothing to annotate;
+/// - the peer record does not agree that it is that node — a torn read;
+/// - the `(node_id, entity)` pair changed while it was being read, or the
+///   entity resolves to a second live node. Both leave "which session" without
+///   a determinate answer.
+///
+/// Every refusal produces ABSENCE, which reads back as
+/// [`DirectEligibility::Cold`]. That is the conservative direction: a provider
+/// wrongly called cold loses a preference, a provider wrongly called direct
+/// would have a session attached to it that it does not own.
+fn build_session_rows(
+    peers: &DashMap<u64, PeerInfo>,
+    peer_entity_ids: &DashMap<u64, EntityId>,
+    observer: &SessionBuildObserver,
+) -> std::collections::BTreeMap<EntityId, super::behavior::org_routing_registry::DirectEligibility>
+{
+    use super::behavior::org_routing_registry::DirectEligibility;
+    let mut rows: std::collections::BTreeMap<EntityId, DirectEligibility> =
+        std::collections::BTreeMap::new();
+    let mut ambiguous: std::collections::BTreeSet<EntityId> = std::collections::BTreeSet::new();
+    // Snapshot the pairs FIRST, so no `peer_entity_ids` iteration guard is
+    // alive while the loop below looks that same map up again. `DashMap`'s
+    // shard locks are not recursive-read-safe — a writer queued between the
+    // two acquisitions wedges both — and the second lookup here is exactly the
+    // stability re-check, so the recursive shape would be on the hot side of
+    // every peer transition. This is the same idiom, and the same reason, as
+    // `sweep_expired_subscribers`.
+    let pinned: Vec<(u64, EntityId)> = peer_entity_ids
+        .iter()
+        .map(|entry| (*entry.key(), entry.value().clone()))
+        .collect();
+    for (node_id, entity) in pinned {
+        // SAMPLE the peer: its exact session incarnation and its transport.
+        let Some((session_id, direct)) = peers.get(&node_id).and_then(|peer| {
+            // The peer record does not agree it is this node. Refuse rather
+            // than trusting the key over the record.
+            (peer.node_id == node_id).then(|| (peer.session.session_id(), peer.is_direct()))
+        }) else {
+            continue;
+        };
+        observer.observe_sampled(node_id);
+        // STABILITY, both halves. The sample above is two mutable maps read
+        // without a lock spanning them, so BOTH bases have to be revalidated
+        // before the row can be published, and a row whose basis moved is
+        // dropped rather than repaired.
+        //
+        // The identity half was always here. The INCARNATION half was not, and
+        // its absence was a real hole: a concurrent peer replacement installs
+        // `S1` after this build sampled `S0`, leaves the `NodeId → EntityId`
+        // mapping untouched — so the identity check passes — and the build then
+        // publishes a fresh generation naming a session that is already gone.
+        // A 2B.3d consumer would preselect it, which is exactly the "never
+        // attach a session to a provider on the strength of a mutable read"
+        // rule this join exists to keep.
+        //
+        // Re-reading the peer closes the sampled-then-replaced case
+        // deterministically. A replacement landing AFTER this check is ordered
+        // behind us differently: it takes the session publication gate this
+        // build already holds, so its own republication is strictly later and
+        // supersedes whatever we publish — the same argument the facts plane
+        // makes for its commit pin.
+        let identity_current = peer_entity_ids
+            .get(&node_id)
+            .is_some_and(|live| *live.value() == entity);
+        let incarnation_current = peers.get(&node_id).is_some_and(|peer| {
+            peer.node_id == node_id
+                && peer.session.session_id() == session_id
+                && peer.is_direct() == direct
+        });
+        if !identity_current || !incarnation_current {
+            ambiguous.insert(entity);
+            continue;
+        }
+        let eligibility = if direct {
+            DirectEligibility::Direct {
+                node_id,
+                session_id,
+            }
+        } else {
+            DirectEligibility::Relayed {
+                node_id,
+                session_id,
+            }
+        };
+        if rows.insert(entity.clone(), eligibility).is_some() {
+            // A second live session claims this entity. There is no answer to
+            // "which session would a call use", so there is no row.
+            ambiguous.insert(entity);
+        }
+    }
+    for entity in ambiguous {
+        rows.remove(&entity);
+    }
+    rows
+}
+
 struct ScopedSlotSource {
+    /// The node's published session/direct-state projection (OLB-2B.3c step
+    /// 2). Observed once per actor quantum, lock-free.
+    session_routing: Arc<NodeSessionRouting>,
     scoped_discovery:
         Arc<parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryState>>,
     publication: Arc<ScopedMutationPublication>,
@@ -6478,6 +6944,66 @@ struct ScopedSourceSnapshot {
     >,
 }
 
+/// One forwarding recipient, OWNED: everything a send needs, and no borrow of
+/// the peer map (HOLD-2 item 2).
+///
+/// The invariant this type exists to make mechanical: **no `DashMap` iterator or
+/// lookup guard may cross an `.await`.** A `RefMulti` held across
+/// `socket.send_to(..).await` wedges that shard for as long as the send pends —
+/// blocking peer replacement, eviction, and every other reader of the same
+/// shard — and the announcement path funnels through the same map, so a
+/// forwarding task that pends there can stop an exported FFI entry point from
+/// ever reaching its own send.
+struct PeerRecipient {
+    addr: SocketAddr,
+    session: Arc<NetSession>,
+}
+
+/// Snapshot every live peer as an OWNED [`PeerRecipient`] list.
+///
+/// THE forwarding primitive: one place iterates the peer map, the iteration
+/// completes before anything awaits, and every fan-out sends from the owned
+/// snapshot. `exclude` drops the ingress peer (never send back to whoever gave
+/// it to us) without the caller needing a second pass.
+///
+/// A snapshot is deliberately a point-in-time view: a peer evicted mid-fan-out
+/// is sent one datagram it will drop, which is the same best-effort semantics
+/// every forwarding path here already had — and strictly better than holding the
+/// map still to avoid it.
+fn snapshot_peers(peers: &DashMap<u64, PeerInfo>, exclude: Option<u64>) -> Vec<PeerRecipient> {
+    peers
+        .iter()
+        .filter(|entry| exclude != Some(entry.value().node_id))
+        .map(|entry| PeerRecipient {
+            addr: entry.value().addr(),
+            session: entry.value().session.clone(),
+        })
+        .collect()
+}
+
+/// Send ONE datagram under [`DATAGRAM_SEND_DEADLINE`].
+///
+/// Every send on a caller-facing path goes through here, so the bound is a
+/// property of the seam rather than a rule each call site re-earns.
+///
+/// **Callers must not hold a peer-map guard across this.** It awaits, and a
+/// `DashMap` shard guard held across an await wedges that shard for as long as
+/// the send pends — blocking peer replacement, eviction, and every other
+/// reader of the same shard. Clone what you need and release the guard first.
+async fn send_datagram(
+    socket: &NetSocket,
+    packet: &[u8],
+    addr: SocketAddr,
+) -> Result<(), AdapterError> {
+    match tokio::time::timeout(DATAGRAM_SEND_DEADLINE, socket.send_to(packet, addr)).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(AdapterError::Connection(format!("send failed: {e}"))),
+        Err(_) => Err(AdapterError::Connection(format!(
+            "send to {addr} exceeded the {DATAGRAM_SEND_DEADLINE:?} datagram deadline"
+        ))),
+    }
+}
+
 /// Publish an authority change and advance the routing epoch as ONE ordered unit
 /// (OLB-2B-E3c).
 ///
@@ -6558,6 +7084,169 @@ fn move_routing_authority<R>(
         AuthorityAdvance::AlreadyExhausted => {}
     }
     result
+}
+
+/// Run a peer-state mutation and the session republication it causes as ONE
+/// serialized transition (OLB-2B.3c step 2; HOLD-2 item 1).
+///
+/// The order is normative, and each step is where it is for a reason the
+/// consumer-Grant edge already paid for once (design §2A.2, item 10):
+///
+/// ```text
+/// take the session publication gate   \
+/// MUTATE the authoritative peer state  |  under the session publication gate
+/// republish the projection             |
+/// advance the generation              /
+/// RELEASE the gate
+/// retire the pools this movement supersedes   (takes the registry lock)
+/// mark actor work                             (inside the invalidation)
+/// ```
+///
+/// # Why the mutation is inside the gate
+///
+/// Because ordering the *notification* behind the gate is not ordering the
+/// mutation. The repair this replaces re-read each peer's exact incarnation
+/// before publishing, which closes `sample → replace → revalidate`; it does not
+/// close `revalidate → replace → publish`. In that schedule the replacement
+/// takes the separate peer-transition guard, mutates `peers`, releases it, and
+/// only then queues on this gate — so the build ahead of it stores a projection
+/// under a FRESH generation naming a session `peers` has already dropped, and a
+/// 2B.3d consumer reading in that window preselects a dead session. A second
+/// best-effort re-read cannot fix that; it only moves the window. The mutation
+/// and the publication have to be one unit, which is what this is.
+///
+/// `mutate` returns `(value, published)`. `published` is the call site's own
+/// answer to "did my mutation actually happen" — a lost compare-and-swap, a
+/// refused rotation, a declined eviction — and a mutation that did not happen
+/// publishes nothing and wakes nothing.
+///
+/// # Lock order
+///
+/// ```text
+/// session publication gate -> peer-transition guard -> peer shard
+/// ```
+///
+/// then the registry lock, with the gate RELEASED. Acyclic: the gate is now
+/// always the OUTERMOST of the three, so no path can hold a peer-transition
+/// guard or a peer shard and then queue on the gate. The registry stays outside
+/// it, because taking the registry lock beneath the gate would invert against
+/// the first future caller that republishes from under the registry.
+fn commit_peer_transition<T>(
+    session_routing: &NodeSessionRouting,
+    registry: &super::behavior::org_routing_registry::NodeOrgRoutingRegistry,
+    peers: &DashMap<u64, PeerInfo>,
+    peer_entity_ids: &DashMap<u64, EntityId>,
+    mutate: impl FnOnce() -> (T, bool),
+) -> T {
+    let (value, outcome) = {
+        // The pre-lock seam. Nothing is held here, so a witness that waits for
+        // it knows the next thing this thread does is queue on the gate.
+        session_routing.observe_transition_attempt();
+        let gate = session_routing.gate.lock();
+        let (value, published) = mutate();
+        // `None` = nothing was mutated. `Some(None)` = mutated, and the
+        // generation space is spent. The two are NOT the same wake.
+        let outcome: Option<Option<u64>> =
+            published.then(|| session_routing.republish_locked(&gate, peers, peer_entity_ids));
+        (value, outcome)
+    };
+    match outcome {
+        // The mutation did not happen. Nothing to supersede.
+        None => {}
+        // The generation space is spent. Retire every pool ONCE — they were
+        // computed under views nothing can witness any more, and leaving them
+        // published would keep a reader's validation comparing against a
+        // generation that no longer exists. `u64::MAX` is the reserved
+        // terminal marker and is never a live generation, so every published
+        // pool is strictly older than it.
+        //
+        // This cannot spin: the re-queued rebuilds install facts and publish
+        // no pool (a spent space projects nothing), so the next arm finds
+        // nothing owed and the actor parks.
+        Some(None) => {
+            registry.invalidate_session_older_than(u64::MAX);
+        }
+        Some(Some(live)) => {
+            registry.invalidate_session_older_than(live);
+        }
+    }
+    value
+}
+
+/// [`commit_peer_transition`] for a call site that has no mutation to
+/// serialize — a bare republication of the CURRENT peer state.
+///
+/// Test/fixture only, and gated rather than merely discouraged: a production
+/// caller reaching for this would be publishing a projection whose basis it
+/// mutated outside the gate, which is the exact defect the commit protocol
+/// exists to make unreachable.
+#[cfg(test)]
+fn republish_session_projection(
+    session_routing: &NodeSessionRouting,
+    registry: &super::behavior::org_routing_registry::NodeOrgRoutingRegistry,
+    peers: &DashMap<u64, PeerInfo>,
+    peer_entity_ids: &DashMap<u64, EntityId>,
+) {
+    commit_peer_transition(session_routing, registry, peers, peer_entity_ids, || {
+        ((), true)
+    });
+}
+
+/// Test-only: a routing registry with an idle source, for witnesses that need
+/// a [`PeerRegistrationGuard`] and nothing else from the routing plane.
+///
+/// The guard carries the routing handles because its rollback REMOVES a
+/// session; a witness about the rollback's peer-map bookkeeping still has to
+/// supply them, and supplying a detached registry keeps that witness about the
+/// thing it is about.
+#[cfg(test)]
+fn detached_routing_registry_for_test(
+) -> Arc<super::behavior::org_routing_registry::NodeOrgRoutingRegistry> {
+    use super::behavior::org_routing as routing;
+    use super::behavior::org_routing_registry as reg;
+
+    struct IdleSource;
+    struct IdleSnapshot;
+    struct IdlePin;
+
+    impl reg::SourceSnapshot for IdleSnapshot {
+        fn token(&self) -> reg::SourceToken {
+            reg::SourceToken::new(Vec::new())
+        }
+        fn providers(&self, _key: &reg::SlotKey) -> reg::ScopedSourceFacts {
+            reg::ScopedSourceFacts {
+                facts: reg::SourceFacts::Unserved,
+                authority: reg::ScopedDiscoveryAuthorityStamp::Owner,
+                authority_deadline: u64::MAX,
+                grant_fence: reg::GrantArtifactFence::Publication(0),
+            }
+        }
+    }
+    impl reg::SourceCommitPin for IdlePin {
+        fn epoch(&self) -> reg::SourceEpoch {
+            reg::SourceEpoch::default()
+        }
+        fn settle_if_current(
+            &self,
+            settle: &mut dyn FnMut() -> routing::ApplyOutcome,
+        ) -> Option<routing::ApplyOutcome> {
+            Some(settle())
+        }
+    }
+    impl reg::SlotSource for IdleSource {
+        fn snapshot(&self, _keys: &[reg::SlotKey]) -> Box<dyn reg::SourceSnapshot> {
+            Box::new(IdleSnapshot)
+        }
+        fn pin_if_current(
+            &self,
+            _keys: &[reg::SlotKey],
+            _expected: &reg::SourceToken,
+        ) -> Option<Box<dyn reg::SourceCommitPin + '_>> {
+            Some(Box::new(IdlePin))
+        }
+    }
+
+    reg::NodeOrgRoutingRegistry::new(Arc::new(IdleSource), Arc::default(), Arc::default())
 }
 
 /// Test-only RAII flag: set while a joiner waits on the routing-task slot.
@@ -7325,6 +8014,18 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
         }))
     }
 
+    /// ONE coherent observation of the node's session/direct-state, for the
+    /// whole quantum (OLB-2B.3c step 2).
+    ///
+    /// Lock-free and instantaneous: the projection is an immutable published
+    /// value, so this cannot straddle a transition the way a pair of live map
+    /// reads could. It deliberately takes NO gate — a capture that serialized
+    /// against peer transitions would put the routing actor on the peer
+    /// control path.
+    fn session_view(&self) -> super::behavior::org_routing_registry::SessionObservation {
+        self.session_routing.observe()
+    }
+
     fn liveness(&self) -> super::behavior::org_routing_registry::SourceLiveness {
         use super::behavior::org_routing_registry::SourceLiveness;
         // Two TERMINAL latches: the node-owned authority epoch and the scoped
@@ -7687,6 +8388,17 @@ pub struct MeshNode {
     /// actor incarnation; the actor's authority over it is claimed and revoked by
     /// the incarnation lifecycle, not by construction.
     routing_registry: Arc<super::behavior::org_routing_registry::NodeOrgRoutingRegistry>,
+    /// Test-only: fires inside `send_subprotocol_to_node` at the instant the
+    /// peer-map guard has been RELEASED and before the socket await. The only
+    /// place from which "no peer shard is retained across the send" is
+    /// observable — see the witness for why a black-hole address cannot show it.
+    #[cfg(test)]
+    send_guard_released_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// OLB-2B.3c step 2: the node's ONE session/direct-state projection and the
+    /// generation ordering it. Every session transition republishes through
+    /// this handle and then invalidates the pools the republication superseded;
+    /// the routing actor observes it lock-free, once per quantum.
+    session_routing: Arc<NodeSessionRouting>,
     /// OLB-2B-E3a: the registry-work wake — the second source in the actor's wait
     /// set, for the transitions private-discovery movement cannot signal (first
     /// demand, slot lifecycle).
@@ -9117,6 +9829,63 @@ impl MeshNode {
         let upgrade_cache: Arc<DashMap<u64, UpgradeCacheEntry>> = Arc::new(DashMap::new());
         #[cfg(feature = "nat-traversal")]
         let upgrade_cache_failure = upgrade_cache.clone();
+        // OLB-2B-E3c: the routing plane. Built here, before the node literal, so
+        // the registry binds to the very same scoped state, publication gate and
+        // revocation slot the ingest paths use — one source of truth, not a
+        // parallel copy. The SUPERVISOR is deliberately NOT built here: it owns the
+        // exclusive destructive drain, and its single production construction path
+        // is `spawn_org_routing_supervisor`, reached only from `start`.
+        let scoped_discovery = Arc::new(parking_lot::Mutex::new(
+            super::behavior::org_scoped_store::ScopedDiscoveryState::new(),
+        ));
+        let scoped_publication = Arc::new(ScopedMutationPublication::new());
+        let scoped_ingest_counters: Arc<super::behavior::org_scoped_store::ScopedIngestCounters> =
+            Arc::default();
+        let org_revocation: Arc<
+            ArcSwapOption<super::behavior::org_revocation::OrgRevocationStore>,
+        > = Arc::new(ArcSwapOption::empty());
+        let routing_work: Arc<super::behavior::org_routing::RegistryWork> = Arc::default();
+        let routing_registry_metrics: Arc<super::behavior::org_routing_registry::RegistryMetrics> =
+            Arc::default();
+        let routing_unserved_scope = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // Hoisted: the routing source shares this exact slot, because installed
+        // consumer Grants are AUTHORITY for the grant plane (OLB-2B.3c-pre) —
+        // and the exact WRITER gate with it, so the commit pin can exclude Grant
+        // movement for the life of an installation (review 2026-07-29 §1).
+        let consumer_grant_audiences = Arc::new(arc_swap::ArcSwap::from_pointee(
+            super::behavior::org_grant_registry::ConsumerGrantSnapshot::empty(),
+        ));
+        let consumer_grant_gate = Arc::new(ConsumerGrantGate::new());
+        let routing_authority = Arc::new(RoutingAuthority::new());
+        // OLB-2B.3c step 2: the node-owned session/direct-state projection.
+        // Built here, beside the discovery source, because the pool's session
+        // annotation and its discovery rows must be produced by ONE node — a
+        // second owner would be a second view of reachability, free to
+        // disagree with this one.
+        let session_routing = NodeSessionRouting::new();
+        let routing_registry = super::behavior::org_routing_registry::NodeOrgRoutingRegistry::new(
+            Arc::new(ScopedSlotSource {
+                session_routing: session_routing.clone(),
+                scoped_discovery: scoped_discovery.clone(),
+                publication: scoped_publication.clone(),
+                org_revocation: org_revocation.clone(),
+                consumer_grants: consumer_grant_audiences.clone(),
+                consumer_grant_gate: consumer_grant_gate.clone(),
+                authority: routing_authority.clone(),
+                #[cfg(test)]
+                settle_gap_hook: parking_lot::Mutex::new(None),
+                unserved_scope: routing_unserved_scope.clone(),
+            }),
+            routing_work.clone(),
+            routing_registry_metrics.clone(),
+        );
+        // The failure callback below evicts peers, which moves the
+        // session/direct-state projection, so it needs both routing handles
+        // (OLB-2B.3c step 2). That is why the whole routing plane is
+        // constructed above the detector rather than beside the node literal:
+        // a callback registered before its consumer exists cannot notify it.
+        let session_routing_failure = session_routing.clone();
+        let routing_registry_failure = routing_registry.clone();
         let failure_detector = FailureDetector::with_config(FailureDetectorConfig {
             timeout: config.session_timeout,
             miss_threshold: 3,
@@ -9265,7 +10034,23 @@ impl MeshNode {
             // Pull `entity_id` BEFORE removing it so we know which
             // origin_hash slot to demote / drop. A node disappearing
             // releases its claim on the wire hash.
-            let removed_entity_id = peer_entity_ids_failure.remove(&node_id).map(|(_, eid)| eid);
+            // OLB-2B.3c step 2, HOLD-2 item 1: this node id no longer resolves
+            // to a provider entity, so every pool annotating that provider
+            // through this session is superseded. The unbinding and the
+            // republication it causes are ONE serialized transition — a verdict
+            // for a node that never had a binding removes nothing and publishes
+            // nothing.
+            let removed_entity_id = commit_peer_transition(
+                &session_routing_failure,
+                &routing_registry_failure,
+                &peers_failure,
+                &peer_entity_ids_failure,
+                || {
+                    let removed = peer_entity_ids_failure.remove(&node_id).map(|(_, eid)| eid);
+                    let published = removed.is_some();
+                    (removed, published)
+                },
+            );
             if let Some(eid) = removed_entity_id {
                 // Same key the inbound announcement handler uses —
                 // the full 64-bit `EntityId::origin_hash()` since the
@@ -9426,50 +10211,6 @@ impl MeshNode {
         // registries, so the signal is echo-safe by construction.
         let local_caps_changed = Arc::new(tokio::sync::watch::channel(0u64).0);
 
-        // OLB-2B-E3c: the routing plane. Built here, before the node literal, so
-        // the registry binds to the very same scoped state, publication gate and
-        // revocation slot the ingest paths use — one source of truth, not a
-        // parallel copy. The SUPERVISOR is deliberately NOT built here: it owns the
-        // exclusive destructive drain, and its single production construction path
-        // is `spawn_org_routing_supervisor`, reached only from `start`.
-        let scoped_discovery = Arc::new(parking_lot::Mutex::new(
-            super::behavior::org_scoped_store::ScopedDiscoveryState::new(),
-        ));
-        let scoped_publication = Arc::new(ScopedMutationPublication::new());
-        let scoped_ingest_counters: Arc<super::behavior::org_scoped_store::ScopedIngestCounters> =
-            Arc::default();
-        let org_revocation: Arc<
-            ArcSwapOption<super::behavior::org_revocation::OrgRevocationStore>,
-        > = Arc::new(ArcSwapOption::empty());
-        let routing_work: Arc<super::behavior::org_routing::RegistryWork> = Arc::default();
-        let routing_registry_metrics: Arc<super::behavior::org_routing_registry::RegistryMetrics> =
-            Arc::default();
-        let routing_unserved_scope = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        // Hoisted: the routing source shares this exact slot, because installed
-        // consumer Grants are AUTHORITY for the grant plane (OLB-2B.3c-pre) —
-        // and the exact WRITER gate with it, so the commit pin can exclude Grant
-        // movement for the life of an installation (review 2026-07-29 §1).
-        let consumer_grant_audiences = Arc::new(arc_swap::ArcSwap::from_pointee(
-            super::behavior::org_grant_registry::ConsumerGrantSnapshot::empty(),
-        ));
-        let consumer_grant_gate = Arc::new(ConsumerGrantGate::new());
-        let routing_authority = Arc::new(RoutingAuthority::new());
-        let routing_registry = super::behavior::org_routing_registry::NodeOrgRoutingRegistry::new(
-            Arc::new(ScopedSlotSource {
-                scoped_discovery: scoped_discovery.clone(),
-                publication: scoped_publication.clone(),
-                org_revocation: org_revocation.clone(),
-                consumer_grants: consumer_grant_audiences.clone(),
-                consumer_grant_gate: consumer_grant_gate.clone(),
-                authority: routing_authority.clone(),
-                #[cfg(test)]
-                settle_gap_hook: parking_lot::Mutex::new(None),
-                unserved_scope: routing_unserved_scope.clone(),
-            }),
-            routing_work.clone(),
-            routing_registry_metrics.clone(),
-        );
-
         // Close the loop between the detector and the reroute policy.
         // The detector's callbacks hold the policy, so the policy is
         // built first and cannot take this as a constructor argument —
@@ -9534,6 +10275,9 @@ impl MeshNode {
             scoped_publication,
             scoped_ingest_counters,
             routing_registry,
+            #[cfg(test)]
+            send_guard_released_hook: parking_lot::Mutex::new(None),
+            session_routing,
             routing_work,
             routing_health: super::behavior::org_routing::new_routing_health(),
             routing_metrics: Arc::default(),
@@ -11368,7 +12112,16 @@ impl MeshNode {
     #[doc(hidden)]
     #[cfg(any(test, feature = "fixtures"))]
     pub fn test_pin_peer_entity(&self, node_id: u64, entity_id: EntityId) {
-        self.peer_entity_ids.entry(node_id).or_insert(entity_id);
+        // OLB-2B.3c step 2: a pin resolves a node id to a provider entity, so
+        // it changes which providers the projection can annotate. Serialized
+        // with its republication for the same reason the production pin sites
+        // are — a fixture that seeded a pin and got no projection, or got one
+        // that raced its own pin, would be modelling a node this code cannot
+        // produce.
+        self.commit_peer_transition(|| {
+            self.peer_entity_ids.entry(node_id).or_insert(entity_id);
+            ((), true)
+        });
     }
 
     /// Test/debug accessor for the live [`NetSession`] to a peer.
@@ -11731,20 +12484,32 @@ impl MeshNode {
         if ctx.subject_node != from_node {
             return Err(SubnetAuthError::WrongSubject);
         }
-        match self.peer_entity_ids.entry(from_node) {
-            dashmap::mapref::entry::Entry::Occupied(slot) => {
-                if slot.get() != &ctx.subject {
-                    tracing::warn!(
-                        from_node = format!("{from_node:#x}"),
-                        "subnet: admission refused — a different entity is already pinned to this routing id"
-                    );
-                    return Err(SubnetAuthError::IdentityPinConflict);
+        // OLB-2B.3c step 2, HOLD-2 item 1: the pin and the republication it
+        // causes are ONE serialized transition, so no build can publish a
+        // projection between its revalidation and its store while this pin
+        // lands. The Occupied arm published NOTHING — it either matched or
+        // refused — and so wakes nothing.
+        self.commit_peer_transition(|| {
+            let outcome = match self.peer_entity_ids.entry(from_node) {
+                dashmap::mapref::entry::Entry::Occupied(slot) => {
+                    if slot.get() != &ctx.subject {
+                        tracing::warn!(
+                            from_node = format!("{from_node:#x}"),
+                            "subnet: admission refused — a different entity is already pinned to this routing id"
+                        );
+                        Err(SubnetAuthError::IdentityPinConflict)
+                    } else {
+                        Ok(false)
+                    }
                 }
-            }
-            dashmap::mapref::entry::Entry::Vacant(slot) => {
-                slot.insert(ctx.subject.clone());
-            }
-        }
+                dashmap::mapref::entry::Entry::Vacant(slot) => {
+                    slot.insert(ctx.subject.clone());
+                    Ok(true)
+                }
+            };
+            let published = matches!(outcome, Ok(true));
+            (outcome, published)
+        })?;
 
         self.subnet_contexts.install(from_node, ctx.clone());
         Ok(ctx)
@@ -14558,11 +15323,57 @@ impl MeshNode {
     /// already received it, re-signs, and self-indexes to the same
     /// proof standard as the wire. A concurrent writer that already
     /// reconciled the cache to `desired` makes this a no-op.
+    /// Acquire the announce lock under [`ANNOUNCE_LOCK_DEADLINE`], retrying the
+    /// fast path every [`ANNOUNCE_LOCK_POLL`].
+    ///
+    /// `None` means the deadline expired. Every caller refuses rather than
+    /// waiting, because every caller is reachable from an exported synchronous
+    /// entry point — see the constant for why a `timeout` around the future
+    /// cannot supply this bound, and §18.0g for the lost wakeup it was traced
+    /// to.
+    fn lock_announce_mu(&self) -> Option<parking_lot::MutexGuard<'_, ()>> {
+        let acquired = self.lock_announce_mu_within(ANNOUNCE_LOCK_DEADLINE);
+        if acquired.is_none() {
+            tracing::error!(
+                "capability: the announce lock was not obtainable within \
+                 {ANNOUNCE_LOCK_DEADLINE:?}"
+            );
+        }
+        acquired
+    }
+
+    /// [`Self::lock_announce_mu`] with the bound supplied by the caller, so a
+    /// witness can drive the refusal without waiting out the production
+    /// deadline. Production has exactly one caller, and it passes the constant.
+    fn lock_announce_mu_within(&self, within: Duration) -> Option<parking_lot::MutexGuard<'_, ()>> {
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            // A TIMED park, retried: the retry is the point. It re-reads the
+            // mutex state on every iteration, so an acquire that would otherwise
+            // sleep forever on a wakeup that never arrives costs one poll
+            // interval instead.
+            if let Some(guard) = self
+                .announce_mu
+                .try_lock_for(ANNOUNCE_LOCK_POLL.min(within))
+            {
+                return Some(guard);
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+        }
+    }
+
     fn rebuild_cached_announcement(
         &self,
         desired: Option<super::behavior::org::OrgMembershipCert>,
     ) {
-        let _announce_guard = self.announce_mu.lock();
+        let Some(_announce_guard) = self.lock_announce_mu() else {
+            // The cache stays as it is: the next send re-derives the desired
+            // certificate and tries again. Refusing here costs one stale-cert
+            // rebuild; waiting here would cost the exported caller its thread.
+            return;
+        };
         let Some(cached) = self.local_emission.load_full() else {
             return;
         };
@@ -14806,8 +15617,19 @@ impl MeshNode {
         keys: SessionKeys,
         expected_prior_session_id: Option<u64>,
     ) -> PeerTransitionOutcome {
-        self.peer_transitions.with(peer_node_id, || {
-            self.install_peer_locked(peer_node_id, transport, keys, expected_prior_session_id)
+        // OLB-2B.3c step 2, HOLD-2 item 1: the peer swap and the republication
+        // it causes are ONE serialized transition. The session publication gate
+        // is taken FIRST and held across both, so no build can be sitting
+        // between its revalidation and its store while this install lands —
+        // which is the schedule a post-sample re-read cannot close. A LOST
+        // compare-and-swap leaves `owned` false, publishes nothing, and wakes
+        // nothing.
+        self.commit_peer_transition(|| {
+            let outcome = self.peer_transitions.with(peer_node_id, || {
+                self.install_peer_locked(peer_node_id, transport, keys, expected_prior_session_id)
+            });
+            let published = outcome.owned;
+            (outcome, published)
         })
     }
 
@@ -15593,6 +16415,22 @@ impl MeshNode {
         ]
     }
 
+    /// Routing-POOL counters (OLB-2B.3c step 2):
+    /// `[published, invalidated, refused_stale_session]`.
+    ///
+    /// Deliberately a SEPARATE crate-private surface rather than three more
+    /// slots on the public array above. Widening a `pub fn`'s return type is a
+    /// source-breaking change, and the second cell is dark until 2B.3d — the
+    /// slice that publishes a routing surface is the slice that may change one.
+    #[cfg(test)]
+    pub(crate) fn org_routing_pool_counts(&self) -> [u64; 3] {
+        [
+            self.routing_registry_metrics.pools_published(),
+            self.routing_registry_metrics.pools_invalidated(),
+            self.routing_registry_metrics.pools_refused_stale_session(),
+        ]
+    }
+
     /// Routing-actor loop iterations COMPLETED (OLB-2B.3b).
     ///
     /// The only externally-visible statement that no reconciliation pass is in
@@ -15852,6 +16690,92 @@ impl MeshNode {
             .load()
             .allows(facts.actor_incarnation)
             .then_some(facts)
+    }
+
+    /// The VALIDATED routing pool for `key`, with the facts it was derived
+    /// from (OLB-2B.3c step 2).
+    ///
+    /// Its registry-side twin, `DemandHandle::unsensed_pool_unvalidated`,
+    /// returns whatever is published; this is where a pool becomes usable. The
+    /// facts half runs every check [`Self::org_routing_base_facts`] runs — it
+    /// IS that call — and the pool half then adds the two the second cell
+    /// needs:
+    ///
+    /// - **the pool derives from EXACTLY these facts.** The two cells are read
+    ///   with two separate atomics, so the pairing is checked and never
+    ///   assumed. The publication order makes a mismatched pair unreachable,
+    ///   but a reader that relied on that would be trusting a producer's
+    ///   discipline for a property it can verify itself in one pointer
+    ///   comparison;
+    /// - **the pool was computed under the LIVE session view.** A pool from an
+    ///   older projection annotates providers with sessions that may be gone.
+    ///   Refusing it is cold, which is the same answer a caller gets before
+    ///   the first pool is ever published.
+    ///
+    /// `None` is the deterministic cold outcome for every one of those, and
+    /// none of them invalidates anything: the facts are still valid, and the
+    /// pool the actor is about to publish is already owed.
+    #[allow(dead_code)] // consumer: the family projection (OLB-2B.3d).
+    pub(crate) fn org_routing_unsensed_pool(
+        &self,
+        key: &super::behavior::org_routing_registry::SlotKey,
+    ) -> Option<Arc<super::behavior::org_routing_registry::ScopedUnsensedRoutePool>> {
+        let facts = self.org_routing_base_facts(key)?;
+        let pool = self.routing_registry.unsensed_pool_unvalidated(key)?;
+        if !pool.derives_from(&facts) {
+            return None;
+        }
+        let live = self.session_routing.currentness.generation()?;
+        (pool.session_generation() == live).then_some(pool)
+    }
+
+    /// Republish the session/direct-state projection with no mutation to
+    /// serialize — see [`republish_session_projection`] for why production
+    /// cannot reach this.
+    #[cfg(test)]
+    pub(crate) fn note_session_transition(&self) {
+        republish_session_projection(
+            &self.session_routing,
+            &self.routing_registry,
+            &self.peers,
+            &self.peer_entity_ids,
+        );
+    }
+
+    /// Run `mutate` and the republication it causes as ONE serialized
+    /// transition, from a `&self` call site. See [`commit_peer_transition`].
+    fn commit_peer_transition<T>(&self, mutate: impl FnOnce() -> (T, bool)) -> T {
+        commit_peer_transition(
+            &self.session_routing,
+            &self.routing_registry,
+            &self.peers,
+            &self.peer_entity_ids,
+            mutate,
+        )
+    }
+
+    /// Test-only: arm the one-shot "guard released, about to await" observation
+    /// inside [`Self::send_subprotocol_to_node`].
+    #[cfg(test)]
+    pub(crate) fn observe_send_guard_release_for_test(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.send_guard_released_hook.lock() = Some(hook);
+    }
+
+    /// Test-only: session republications that produced a new generation.
+    ///
+    /// The direct evidence for "a non-publishing transition wakes nothing" — a
+    /// witness that inferred it from a pool count could not tell a suppressed
+    /// republication from one that happened to change nothing.
+    #[cfg(test)]
+    pub(crate) fn org_routing_session_publications(&self) -> u64 {
+        self.session_routing.publications()
+    }
+
+    /// Test-only: the live session generation, or `None` once the space is
+    /// terminally spent.
+    #[cfg(test)]
+    pub(crate) fn org_routing_session_generation(&self) -> Option<u64> {
+        self.session_routing.currentness.generation()
     }
 
     /// Spawn the NAT classification loop. Waits until at least 2
@@ -16658,6 +17582,8 @@ impl MeshNode {
             scoped_discovery: self.scoped_discovery.clone(),
             scoped_publication: self.scoped_publication.clone(),
             scoped_ingest_counters: self.scoped_ingest_counters.clone(),
+            session_routing: self.session_routing.clone(),
+            routing_registry: self.routing_registry.clone(),
             scoped_relay_gate: self.scoped_relay_gate.clone(),
             consumer_grant_audiences: self.consumer_grant_audiences.clone(),
             #[cfg(feature = "redex")]
@@ -17095,8 +18021,11 @@ impl MeshNode {
                     // backward loop.
                     tokio::spawn(async move {
                         let next_hop = router.routing_table().lookup(origin_nid);
-                        for entry in peers.iter() {
-                            let addr = entry.value().addr();
+                        // Snapshot FIRST: the iteration completes before the
+                        // first await, so no peer shard is held across a send
+                        // (HOLD-2 item 2).
+                        for peer in snapshot_peers(&peers, None) {
+                            let addr = peer.addr;
                             if addr == source {
                                 continue; // never send back to sender
                             }
@@ -17106,7 +18035,7 @@ impl MeshNode {
                             if filter.contains(&addr) {
                                 continue;
                             }
-                            let _ = socket.send_to(&fwd_bytes, addr).await;
+                            let _ = send_datagram(&socket, &fwd_bytes, addr).await;
                         }
                     });
                 }
@@ -17795,145 +18724,163 @@ impl MeshNode {
         // outside any transition — so a concurrent install could
         // interleave with it, and the rollback guard below could not
         // name the exact route it was undoing.
-        let Some((registered_session_id, registered_route_token)) =
-            ctx.peer_transitions.with(peer_node_id, || {
-                let registered: Option<u64> = match ctx.peers.entry(peer_node_id) {
-                    dashmap::mapref::entry::Entry::Occupied(mut occ) => {
-                        match routed_rotation_outcome(
-                            occ.get(),
-                            &remote_static_pub,
-                            &initiator_ephemeral,
-                            ctx.session_timeout,
-                        ) {
-                            RoutedRotationOutcome::DropReplay => {
-                                tracing::warn!(
-                                    peer_node_id,
-                                    "routed handshake: dropping msg1 — live session already \
+        //
+        // HOLD-2 item 1: that transition and the republication it causes are
+        // serialized under the session publication gate, taken FIRST — so no
+        // projection build can be sitting between its revalidation and its
+        // store while this registration lands.
+        let Some((registered_session_id, registered_route_token)) = commit_peer_transition(
+            &ctx.session_routing,
+            &ctx.routing_registry,
+            &ctx.peers,
+            &ctx.peer_entity_ids,
+            || {
+                let committed = ctx.peer_transitions.with(peer_node_id, || {
+                    let registered: Option<u64> = match ctx.peers.entry(peer_node_id) {
+                        dashmap::mapref::entry::Entry::Occupied(mut occ) => {
+                            match routed_rotation_outcome(
+                                occ.get(),
+                                &remote_static_pub,
+                                &initiator_ephemeral,
+                                ctx.session_timeout,
+                            ) {
+                                RoutedRotationOutcome::DropReplay => {
+                                    tracing::warn!(
+                                        peer_node_id,
+                                        "routed handshake: dropping msg1 — live session already \
                                      established for this peer with matching remote_static_pub \
                                      AND identical initiator ephemeral (replay guard)"
-                                );
-                                None
-                            }
-                            RoutedRotationOutcome::RefuseFresh => {
-                                tracing::warn!(
-                                    peer_node_id,
-                                    "routed handshake: refusing key rotation — existing \
+                                    );
+                                    None
+                                }
+                                RoutedRotationOutcome::RefuseFresh => {
+                                    tracing::warn!(
+                                        peer_node_id,
+                                        "routed handshake: refusing key rotation — existing \
                                      session is still within session_timeout. New keys \
                                      can be installed once the live session has gone \
                                      silent for at least session_timeout (rotation gate)"
-                                );
-                                None
-                            }
-                            RoutedRotationOutcome::DeferBusy => {
-                                tracing::debug!(
-                                    peer_node_id,
-                                    "routed handshake: deferring key rotation — existing \
+                                    );
+                                    None
+                                }
+                                RoutedRotationOutcome::DeferBusy => {
+                                    tracing::debug!(
+                                        peer_node_id,
+                                        "routed handshake: deferring key rotation — existing \
                                      session is live and busy (open streams / unacked \
                                      in-flight data). Swapping now would drop that state; \
                                      the initiator retries once the session is quiescent \
                                      (direct-path upgrade C3 busy gate)"
-                                );
-                                None
-                            }
-                            RoutedRotationOutcome::AcceptRotation => {
-                                // PERF_AUDIT §2.4: the rotation displaces
-                                // the existing session — evict its reverse-
-                                // index entry, otherwise every accepted
-                                // rotation leaks one stale entry forever.
-                                let displaced_session_id = occ.get().session.session_id();
-                                ctx.session_id_to_node
-                                    .remove_if(&displaced_session_id, |_, n| *n == peer_node_id);
-                                let session = Arc::new(NetSession::new(
-                                    keys,
-                                    source,
-                                    ctx.packet_pool_size,
-                                    ctx.default_reliable,
-                                ));
-                                let session_id = session.session_id();
-                                occ.insert(PeerInfo {
-                                    node_id: peer_node_id,
-                                    // The msg1 arrived through `source`,
-                                    // which is the immediate upstream
-                                    // relay — not necessarily the remote
-                                    // endpoint. Routed is the honest
-                                    // claim; a Direct one here would
-                                    // assert an adjacency the handshake
-                                    // never established.
-                                    transport: PeerTransport::Routed {
-                                        relay_addr: source,
-                                        adjacent_relay_identity: ctx
-                                            .addr_to_node
-                                            .get(&source)
-                                            .map(|e| *e.value())
-                                            .filter(|nid| *nid != peer_node_id),
-                                    },
-                                    session,
-                                    remote_static_pub,
-                                    last_initiator_ephemeral: Some(initiator_ephemeral),
-                                });
-                                Some(session_id)
+                                    );
+                                    None
+                                }
+                                RoutedRotationOutcome::AcceptRotation => {
+                                    // PERF_AUDIT §2.4: the rotation displaces
+                                    // the existing session — evict its reverse-
+                                    // index entry, otherwise every accepted
+                                    // rotation leaks one stale entry forever.
+                                    let displaced_session_id = occ.get().session.session_id();
+                                    ctx.session_id_to_node
+                                        .remove_if(&displaced_session_id, |_, n| {
+                                            *n == peer_node_id
+                                        });
+                                    let session = Arc::new(NetSession::new(
+                                        keys,
+                                        source,
+                                        ctx.packet_pool_size,
+                                        ctx.default_reliable,
+                                    ));
+                                    let session_id = session.session_id();
+                                    occ.insert(PeerInfo {
+                                        node_id: peer_node_id,
+                                        // The msg1 arrived through `source`,
+                                        // which is the immediate upstream
+                                        // relay — not necessarily the remote
+                                        // endpoint. Routed is the honest
+                                        // claim; a Direct one here would
+                                        // assert an adjacency the handshake
+                                        // never established.
+                                        transport: PeerTransport::Routed {
+                                            relay_addr: source,
+                                            adjacent_relay_identity: ctx
+                                                .addr_to_node
+                                                .get(&source)
+                                                .map(|e| *e.value())
+                                                .filter(|nid| *nid != peer_node_id),
+                                        },
+                                        session,
+                                        remote_static_pub,
+                                        last_initiator_ephemeral: Some(initiator_ephemeral),
+                                    });
+                                    Some(session_id)
+                                }
                             }
                         }
-                    }
-                    dashmap::mapref::entry::Entry::Vacant(vac) => {
-                        let session = Arc::new(NetSession::new(
-                            keys,
-                            source,
-                            ctx.packet_pool_size,
-                            ctx.default_reliable,
-                        ));
-                        let session_id = session.session_id();
-                        vac.insert(PeerInfo {
-                            node_id: peer_node_id,
-                            transport: PeerTransport::Routed {
-                                relay_addr: source,
-                                adjacent_relay_identity: ctx
-                                    .addr_to_node
-                                    .get(&source)
-                                    .map(|e| *e.value())
-                                    .filter(|nid| *nid != peer_node_id),
-                            },
-                            session,
-                            remote_static_pub,
-                            last_initiator_ephemeral: Some(initiator_ephemeral),
-                        });
-                        Some(session_id)
-                    }
-                };
-                let registered_session_id = registered?;
-                ctx.peer_addrs.insert(peer_node_id, source);
-                // ORDINARY on purpose. `peer_node_id` is the remote
-                // end-to-end peer; `source` is the immediate upstream
-                // relay's address. For a routed handshake those are not
-                // the same node, so binding `next_hop_id =
-                // peer_node_id` here would assert a false adjacency: a
-                // route claiming the remote endpoint as its next-hop
-                // identity while pointing at an intermediate relay's
-                // address. Protected forwarding would then select the
-                // remote endpoint's session and seal a tag the adjacent
-                // relay cannot verify.
-                //
-                // Route-hop authority is selected from the exact
-                // authenticated ADJACENT peer. Until this path can
-                // supply that identity from the ingress session that
-                // actually carried the handshake, the route stays
-                // address-only and protected forwarding fails closed on
-                // it.
-                let route_token = ctx.router.add_route(peer_node_id, source);
-                ctx.session_id_to_node
-                    .insert(registered_session_id, peer_node_id);
-                // Fresh session incarnation (Vacant or accepted
-                // rotation) → the peer's withdrawal seq counter
-                // restarts, so purge its gate history, exactly as the
-                // direct `connect`/`accept` install paths do. Without
-                // this, a peer reconnecting through a relay
-                // (`connect_via`) has its reset-sequence withdrawals
-                // rejected as stale until the gate ages them out
-                // (cubic P2).
-                ctx.route_withdraw_gate.forget_sender(peer_node_id);
-                Some((registered_session_id, route_token))
-            })
-        else {
+                        dashmap::mapref::entry::Entry::Vacant(vac) => {
+                            let session = Arc::new(NetSession::new(
+                                keys,
+                                source,
+                                ctx.packet_pool_size,
+                                ctx.default_reliable,
+                            ));
+                            let session_id = session.session_id();
+                            vac.insert(PeerInfo {
+                                node_id: peer_node_id,
+                                transport: PeerTransport::Routed {
+                                    relay_addr: source,
+                                    adjacent_relay_identity: ctx
+                                        .addr_to_node
+                                        .get(&source)
+                                        .map(|e| *e.value())
+                                        .filter(|nid| *nid != peer_node_id),
+                                },
+                                session,
+                                remote_static_pub,
+                                last_initiator_ephemeral: Some(initiator_ephemeral),
+                            });
+                            Some(session_id)
+                        }
+                    };
+                    let registered_session_id = registered?;
+                    ctx.peer_addrs.insert(peer_node_id, source);
+                    // ORDINARY on purpose. `peer_node_id` is the remote
+                    // end-to-end peer; `source` is the immediate upstream
+                    // relay's address. For a routed handshake those are not
+                    // the same node, so binding `next_hop_id =
+                    // peer_node_id` here would assert a false adjacency: a
+                    // route claiming the remote endpoint as its next-hop
+                    // identity while pointing at an intermediate relay's
+                    // address. Protected forwarding would then select the
+                    // remote endpoint's session and seal a tag the adjacent
+                    // relay cannot verify.
+                    //
+                    // Route-hop authority is selected from the exact
+                    // authenticated ADJACENT peer. Until this path can
+                    // supply that identity from the ingress session that
+                    // actually carried the handshake, the route stays
+                    // address-only and protected forwarding fails closed on
+                    // it.
+                    let route_token = ctx.router.add_route(peer_node_id, source);
+                    ctx.session_id_to_node
+                        .insert(registered_session_id, peer_node_id);
+                    // Fresh session incarnation (Vacant or accepted
+                    // rotation) → the peer's withdrawal seq counter
+                    // restarts, so purge its gate history, exactly as the
+                    // direct `connect`/`accept` install paths do. Without
+                    // this, a peer reconnecting through a relay
+                    // (`connect_via`) has its reset-sequence withdrawals
+                    // rejected as stale until the gate ages them out
+                    // (cubic P2).
+                    ctx.route_withdraw_gate.forget_sender(peer_node_id);
+                    Some((registered_session_id, route_token))
+                });
+                // Every non-publishing outcome (replay drop, refused rotation,
+                // deferred busy rotation) is `None` here, and publishes
+                // nothing.
+                let published = committed.is_some();
+                (committed, published)
+            },
+        ) else {
             return;
         };
 
@@ -17949,9 +18896,9 @@ impl MeshNode {
         // `peer_node_id` already installed a newer (valid) route, we must
         // not overwrite it.
         //
-        // A Drop guard owns the rollback. The send marks the
-        // guard `completed` only on success; cancellation, panic,
-        // or any non-success drops the guard, which runs the
+        // A Drop guard owns the rollback. The send DISARMS the
+        // guard only on success; cancellation, panic, or any
+        // non-success drops it still armed, which runs the
         // rollback. Drop is invoked synchronously when the spawned
         // future is dropped (whether by cancellation or normal
         // completion), so the rollback is no longer dependent on
@@ -17965,6 +18912,9 @@ impl MeshNode {
         let payload = routed.freeze();
         let guard = PeerRegistrationGuard {
             peer_node_id,
+            // Armed from construction: until the send is known to have
+            // succeeded, every exit from here owes the rollback.
+            armed: true,
             registered_session_id,
             registered_next_hop: source,
             registered_route_token,
@@ -17973,13 +18923,17 @@ impl MeshNode {
             peer_addrs: ctx.peer_addrs.clone(),
             session_id_to_node: ctx.session_id_to_node.clone(),
             router: ctx.router.clone(),
+            session_routing: ctx.session_routing.clone(),
+            routing_registry: ctx.routing_registry.clone(),
+            peer_entity_ids: ctx.peer_entity_ids.clone(),
         };
         tokio::spawn(async move {
             match socket.send_to(&payload, next_hop).await {
                 Ok(_) => {
-                    // `commit` consumes the guard via `mem::forget`,
-                    // so the rollback Drop is skipped and the
-                    // registrations stay in place.
+                    // `commit` disarms the guard and drops it, so the
+                    // rollback is skipped, the registrations stay in
+                    // place, and the guard's own references are
+                    // released.
                     guard.commit();
                 }
                 Err(e) => {
@@ -19925,6 +20879,12 @@ impl MeshNode {
         // Eviction is a peer-state transition like any other and runs
         // through the same handle as the installers.
         let peer_transitions_evict = self.peer_transitions.clone();
+        // OLB-2B.3c step 2: an eviction moves the session/direct-state
+        // projection, so the sweep republishes it and retires the pools that
+        // movement supersedes.
+        let session_routing_evict = self.session_routing.clone();
+        let routing_registry_evict = self.routing_registry.clone();
+        let peer_entity_ids_evict = self.peer_entity_ids.clone();
         let route_withdraw_gate = self.route_withdraw_gate.clone();
         let failure_detector = self.failure_detector.clone();
         // SI-2a: sensing soft-state expiry rides this loop's tick —
@@ -20581,6 +21541,20 @@ impl MeshNode {
                             // delete parts of it — the same
                             // published-then-torn shape the install
                             // path takes the guard to prevent.
+                            // HOLD-2 item 1: the eviction and the republication
+                            // it causes are ONE serialized transition. Losing a
+                            // session moves the projection in the direction
+                            // that matters most — a pool still annotating this
+                            // provider DIRECT would preselect a session that no
+                            // longer exists — so a build must not be able to
+                            // publish between its revalidation and its store
+                            // while this removal lands.
+                            let evicted = commit_peer_transition(
+                                &session_routing_evict,
+                                &routing_registry_evict,
+                                &peers,
+                                &peer_entity_ids_evict,
+                                || {
                             let evicted = peer_transitions_evict.with(node_id, || {
                                 let evicted = peers.remove_if(&node_id, |_, info| {
                                     info.session.session_id() == observed_session_id
@@ -20623,6 +21597,12 @@ impl MeshNode {
                                 subnet_contexts_evict.forget_peer(node_id);
                                 true
                             });
+                                    // An eviction that declined (the
+                                    // exact-session guard) leaves `evicted`
+                                    // false and wakes nothing.
+                                    (evicted, evicted)
+                                },
+                            );
                             if evicted {
                                 tracing::info!(
                                     node_id = format!("{:#x}", node_id),
@@ -20694,17 +21674,23 @@ impl MeshNode {
     /// address, so a relayed peer is reachable without anyone having to
     /// claim the relay's address belongs to it.
     pub async fn send_to_peer_node(&self, node_id: u64, batch: &Batch) -> Result<(), AdapterError> {
-        let peer = self
-            .peers
-            .get(&node_id)
-            .ok_or_else(|| AdapterError::Connection("unknown peer".into()))?;
-        let peer_addr = peer.addr();
+        // Read, COPY, release — before the loop below awaits (HOLD item 2).
+        // This path is worse than the subprotocol one it shares the defect
+        // with: it awaits once per MTU-sized chunk, so a large batch held the
+        // peer shard across a whole sequence of sends.
+        let (peer_addr, session) = {
+            let peer = self
+                .peers
+                .get(&node_id)
+                .ok_or_else(|| AdapterError::Connection("unknown peer".into()))?;
+            (peer.addr(), peer.session.clone())
+        };
         // Partition filter: silently drop sends to blocked peers
         if self.partition_filter.contains(&peer_addr) {
             return Ok(());
         }
 
-        let session = &peer.session;
+        let session = &session;
         let stream_id = batch.shard_id as u64;
 
         let reliable = {
@@ -20733,10 +21719,7 @@ impl MeshNode {
                     PacketFlags::NONE
                 };
                 let packet = builder.build(stream_id, seq, &current_batch, flags);
-                self.socket
-                    .send_to(&packet, peer_addr)
-                    .await
-                    .map_err(|e| AdapterError::Connection(format!("send failed: {}", e)))?;
+                send_datagram(&self.socket, &packet, peer_addr).await?;
 
                 current_batch.clear();
                 current_size = 0;
@@ -20757,10 +21740,7 @@ impl MeshNode {
                 PacketFlags::NONE
             };
             let packet = builder.build(stream_id, seq, &current_batch, flags);
-            self.socket
-                .send_to(&packet, peer_addr)
-                .await
-                .map_err(|e| AdapterError::Connection(format!("send failed: {}", e)))?;
+            send_datagram(&self.socket, &packet, peer_addr).await?;
         }
 
         // builder is dropped here — auto-released back to the pool
@@ -25363,31 +26343,52 @@ impl MeshNode {
         //    the entity binding is deferred to the eventual direct
         //    announcement.
         if signature_verified && ann.hop_count == 0 {
-            if let Some(existing) = ctx.peer_entity_ids.get(&from_node) {
-                if *existing.value() != ann.entity_id {
-                    tracing::trace!(
-                        from_node = format!("{:#x}", from_node),
-                        "capability: entity_id rebind rejected (TOFU)"
-                    );
-                    return;
-                }
-            } else {
-                ctx.peer_entity_ids.insert(from_node, ann.entity_id.clone());
-                // Mirror the entity-id pin into the origin_hash
-                // reverse index. First-write-wins: an existing
-                // claimant keeps the slot; a different node_id
-                // grinding the same u64 (2^32 adversarial work,
-                // accidental 2^-32) is rejected. Post-
-                // `WIRE_ORIGIN_HASH_64BIT` the wire header carries
-                // the full `EntityId::origin_hash()` u64 so the
-                // reverse-index key matches the application-layer
-                // value verbatim — accidental collisions are
-                // effectively impossible.
-                let origin_hash = ann.entity_id.origin_hash();
-                let _ = ctx
-                    .origin_hash_to_node
-                    .entry(origin_hash)
-                    .or_insert(from_node);
+            // HOLD-2 item 1: the pin and the republication it causes are ONE
+            // serialized transition. `Err(())` is the rejected rebind, which
+            // returns without pinning; `Ok(false)` is a matching
+            // re-announcement. Both publish nothing.
+            let pinned = commit_peer_transition(
+                &ctx.session_routing,
+                &ctx.routing_registry,
+                &ctx.peers,
+                &ctx.peer_entity_ids,
+                || {
+                    let outcome: Result<bool, ()> =
+                        if let Some(existing) = ctx.peer_entity_ids.get(&from_node) {
+                            if *existing.value() != ann.entity_id {
+                                tracing::trace!(
+                                    from_node = format!("{:#x}", from_node),
+                                    "capability: entity_id rebind rejected (TOFU)"
+                                );
+                                Err(())
+                            } else {
+                                Ok(false)
+                            }
+                        } else {
+                            ctx.peer_entity_ids.insert(from_node, ann.entity_id.clone());
+                            // Mirror the entity-id pin into the origin_hash
+                            // reverse index. First-write-wins: an existing
+                            // claimant keeps the slot; a different node_id
+                            // grinding the same u64 (2^32 adversarial work,
+                            // accidental 2^-32) is rejected. Post-
+                            // `WIRE_ORIGIN_HASH_64BIT` the wire header carries
+                            // the full `EntityId::origin_hash()` u64 so the
+                            // reverse-index key matches the application-layer
+                            // value verbatim — accidental collisions are
+                            // effectively impossible.
+                            let origin_hash = ann.entity_id.origin_hash();
+                            let _ = ctx
+                                .origin_hash_to_node
+                                .entry(origin_hash)
+                                .or_insert(from_node);
+                            Ok(true)
+                        };
+                    let published = matches!(outcome, Ok(true));
+                    (outcome, published)
+                },
+            );
+            if pinned.is_err() {
+                return;
             }
         }
 
@@ -25645,12 +26646,11 @@ impl MeshNode {
         let partition_filter = ctx.partition_filter.clone();
 
         tokio::spawn(async move {
-            for entry in peers.iter() {
-                let peer = entry.value();
-                if peer.node_id == from_node {
-                    continue; // never send back to the ingress peer
-                }
-                if partition_filter.contains(&peer.addr()) {
+            // Snapshot FIRST (HOLD-2 item 2): this path used the borrowed
+            // session AFTER awaiting, so the shard stayed wedged for the whole
+            // fan-out rather than for one send.
+            for peer in snapshot_peers(&peers, Some(from_node)) {
+                if partition_filter.contains(&peer.addr) {
                     continue;
                 }
                 let session = &peer.session;
@@ -25669,7 +26669,7 @@ impl MeshNode {
                     PacketFlags::NONE,
                     SUBPROTOCOL_SCOPED_CAPABILITY_ANN,
                 );
-                let _ = socket.send_to(&packet, peer.addr()).await;
+                let _ = send_datagram(&socket, &packet, peer.addr).await;
                 drop(builder);
                 session.touch();
             }
@@ -25695,15 +26695,12 @@ impl MeshNode {
             // invariant.
             let next_hop_addr = router.routing_table().lookup(origin_node_id);
 
-            for entry in peers.iter() {
-                let peer = entry.value();
-                if peer.node_id == sender_node_id {
-                    continue; // never send back to whoever gave it to us
-                }
-                if Some(peer.addr()) == next_hop_addr {
+            // Snapshot FIRST (HOLD-2 item 2), same as the scoped path above.
+            for peer in snapshot_peers(&peers, Some(sender_node_id)) {
+                if Some(peer.addr) == next_hop_addr {
                     continue; // split horizon: that's our path to the origin
                 }
-                if partition_filter.contains(&peer.addr()) {
+                if partition_filter.contains(&peer.addr) {
                     continue;
                 }
 
@@ -25726,7 +26723,7 @@ impl MeshNode {
                     PacketFlags::NONE,
                     SUBPROTOCOL_CAPABILITY_ANN,
                 );
-                let _ = socket.send_to(&packet, peer.addr()).await;
+                let _ = send_datagram(&socket, &packet, peer.addr).await;
                 drop(builder);
                 session.touch();
             }
@@ -28028,6 +29025,15 @@ impl MeshNode {
             return Ok(());
         }
 
+        // Test-only, at the ONE instant that matters: the guard above is out of
+        // scope and the await below has not started.
+        #[cfg(test)]
+        {
+            let hook = self.send_guard_released_hook.lock().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         let stream_id = subprotocol_id as u64;
 
         let pool = session.thread_local_pool();
@@ -28042,10 +29048,7 @@ impl MeshNode {
         let packet =
             builder.build_subprotocol(stream_id, seq, &events, PacketFlags::NONE, subprotocol_id);
 
-        self.socket
-            .send_to(&packet, peer_addr)
-            .await
-            .map_err(|e| AdapterError::Connection(format!("send failed: {}", e)))?;
+        send_datagram(&self.socket, &packet, peer_addr).await?;
 
         drop(builder);
         session.touch();
@@ -28338,7 +29341,13 @@ impl MeshNode {
         // serialized at send time through the epoch-checked path);
         // `None` = the announce was rate-limit-deferred or coalesced.
         let to_broadcast = {
-            let _announce_guard = self.announce_mu.lock();
+            let Some(_announce_guard) = self.lock_announce_mu() else {
+                return Err(AdapterError::Connection(format!(
+                    "announce: the announce lock was not obtainable within \
+                     {ANNOUNCE_LOCK_DEADLINE:?}; refusing rather than blocking an \
+                     exported call indefinitely"
+                )));
+            };
             // Set a new baseline or re-read the current one — both
             // under `announce_mu` so a re-announce never clobbers a
             // concurrent explicit announce's newer baseline. The
@@ -35080,6 +36089,7 @@ mod heartbeat_aead_tests {
         {
             let _guard = PeerRegistrationGuard {
                 peer_node_id: peer_id,
+                armed: true,
                 peer_transitions: PeerTransitions::new(),
                 registered_route_token,
                 registered_session_id,
@@ -35088,6 +36098,9 @@ mod heartbeat_aead_tests {
                 peer_addrs: peer_addrs.clone(),
                 session_id_to_node: session_id_to_node.clone(),
                 router: router.clone(),
+                session_routing: NodeSessionRouting::new(),
+                routing_registry: detached_routing_registry_for_test(),
+                peer_entity_ids: Arc::new(DashMap::new()),
             };
         } // Drop runs here.
 
@@ -35109,6 +36122,26 @@ mod heartbeat_aead_tests {
         );
     }
 
+    /// `commit()` must preserve the REGISTRATIONS and release the
+    /// guard's own REFERENCES — both halves, in one witness.
+    ///
+    /// The second half is the one that was missing, and its absence was
+    /// a live defect: the pre-repair `commit()` skipped `Drop` with
+    /// `ManuallyDrop` and hand-read only the five fields the guard had
+    /// when that code was written. Three routing handles were added
+    /// afterwards and never added to the list, so every successful
+    /// routed registration leaked three strong references — invisible
+    /// to a witness that only checked the maps still had their entries.
+    ///
+    /// So this asserts strong counts directly, and it asserts them for
+    /// EVERY `Arc`-backed field rather than for the three that
+    /// happened to be leaking. A field added tomorrow is covered the
+    /// moment it is added to the construction below; the counts either
+    /// return to baseline or they do not.
+    ///
+    /// Dies to: reinstating any `commit()` that skips `Drop` while
+    /// enumerating fields, and to a `Drop` that leaks on the disarmed
+    /// path.
     #[tokio::test]
     async fn peer_registration_guard_is_no_op_on_drop_when_completed() {
         let peer_id = 0xCAFE_F00Du64;
@@ -35145,10 +36178,39 @@ mod heartbeat_aead_tests {
         peer_addrs.insert(peer_id, next_hop);
         router.add_route(peer_id, next_hop);
 
+        // Every Arc-backed field, held EXTERNALLY for the whole test —
+        // so the only thing a count can be measuring is the guard.
+        // `peer_transitions` is a newtype over its `Arc`, so it is
+        // counted through the field it wraps.
+        let session_routing = NodeSessionRouting::new();
+        let routing_registry = detached_routing_registry_for_test();
+        let peer_entity_ids: Arc<DashMap<u64, EntityId>> = Arc::new(DashMap::new());
+        let peer_transitions = PeerTransitions::new();
+
+        // BASELINE, taken with the guard not yet constructed. Read as
+        // absolute numbers rather than assumed to be 1: the registry
+        // and the router may legitimately be referenced elsewhere, and
+        // the invariant is "returns to where it started", not "returns
+        // to one".
+        let counts = |pt: &PeerTransitions| {
+            [
+                ("peers", Arc::strong_count(&peers)),
+                ("peer_addrs", Arc::strong_count(&peer_addrs)),
+                ("session_id_to_node", Arc::strong_count(&session_id_to_node)),
+                ("router", Arc::strong_count(&router)),
+                ("peer_transitions", Arc::strong_count(&pt.shards)),
+                ("session_routing", Arc::strong_count(&session_routing)),
+                ("routing_registry", Arc::strong_count(&routing_registry)),
+                ("peer_entity_ids", Arc::strong_count(&peer_entity_ids)),
+            ]
+        };
+        let baseline = counts(&peer_transitions);
+
         {
             let guard = PeerRegistrationGuard {
                 peer_node_id: peer_id,
-                peer_transitions: PeerTransitions::new(),
+                armed: true,
+                peer_transitions: peer_transitions.clone(),
                 registered_route_token: 0,
                 registered_session_id,
                 registered_next_hop: next_hop,
@@ -35156,12 +36218,46 @@ mod heartbeat_aead_tests {
                 peer_addrs: peer_addrs.clone(),
                 session_id_to_node: session_id_to_node.clone(),
                 router: router.clone(),
+                session_routing: session_routing.clone(),
+                routing_registry: routing_registry.clone(),
+                peer_entity_ids: peer_entity_ids.clone(),
             };
-            // Successful-send path consumes the guard without
-            // running Drop's rollback.
+
+            // The guard really is holding a reference to each — without
+            // this half, a field the guard never took would "return to
+            // baseline" vacuously.
+            let held = counts(&peer_transitions);
+            for (i, (name, n)) in held.iter().enumerate() {
+                assert_eq!(
+                    *n,
+                    baseline[i].1 + 1,
+                    "constructing the guard must take exactly one reference to \
+                     `{name}` (baseline {}, observed {n})",
+                    baseline[i].1
+                );
+            }
+
+            // Successful-send path: disarms the rollback, then drops
+            // ordinarily.
             guard.commit();
         }
 
+        // THE OWNERSHIP PROPERTY. Every count is back where it started,
+        // so `commit()` released everything it took.
+        let after = counts(&peer_transitions);
+        for (i, (name, n)) in after.iter().enumerate() {
+            assert_eq!(
+                *n, baseline[i].1,
+                "commit() leaked a strong reference to `{name}`: baseline {}, \
+                 after commit {n}. Every field of the guard must be released \
+                 on the successful path, not an enumerated subset of them",
+                baseline[i].1
+            );
+        }
+
+        // AND the registrations survive — the other half of commit's
+        // contract, which the ownership half must not be read as
+        // replacing.
         assert!(peers.contains_key(&peer_id));
         assert!(peer_addrs.contains_key(&peer_id));
         assert!(
@@ -35221,6 +36317,7 @@ mod heartbeat_aead_tests {
         {
             let _guard = PeerRegistrationGuard {
                 peer_node_id: peer_id,
+                armed: true,
                 peer_transitions: PeerTransitions::new(),
                 registered_route_token: 0,
                 registered_session_id: stale_session_id, // NOT the live session_id
@@ -35229,6 +36326,9 @@ mod heartbeat_aead_tests {
                 peer_addrs: peer_addrs.clone(),
                 session_id_to_node: session_id_to_node.clone(),
                 router: router.clone(),
+                session_routing: NodeSessionRouting::new(),
+                routing_registry: detached_routing_registry_for_test(),
+                peer_entity_ids: Arc::new(DashMap::new()),
             };
         }
 
@@ -35319,6 +36419,7 @@ mod heartbeat_aead_tests {
         {
             let _guard = PeerRegistrationGuard {
                 peer_node_id: peer_id,
+                armed: true,
                 peer_transitions: PeerTransitions::new(),
                 registered_route_token: stale_route_token,
                 registered_session_id: stale_session_id,
@@ -35329,6 +36430,9 @@ mod heartbeat_aead_tests {
                 peer_addrs: peer_addrs.clone(),
                 session_id_to_node: session_id_to_node.clone(),
                 router: router.clone(),
+                session_routing: NodeSessionRouting::new(),
+                routing_registry: detached_routing_registry_for_test(),
+                peer_entity_ids: Arc::new(DashMap::new()),
             };
         }
 
@@ -35405,6 +36509,7 @@ mod heartbeat_aead_tests {
         {
             let _guard = PeerRegistrationGuard {
                 peer_node_id: peer_id,
+                armed: true,
                 peer_transitions: PeerTransitions::new(),
                 registered_route_token,
                 registered_session_id,
@@ -35413,6 +36518,9 @@ mod heartbeat_aead_tests {
                 peer_addrs: peer_addrs.clone(),
                 session_id_to_node: session_id_to_node.clone(),
                 router: router.clone(),
+                session_routing: NodeSessionRouting::new(),
+                routing_registry: detached_routing_registry_for_test(),
+                peer_entity_ids: Arc::new(DashMap::new()),
             };
         }
 
@@ -38376,6 +39484,21 @@ mod oa34b2_query_currentness_tests {
         );
         let entity = node.entity_id().clone();
         let cert = OrgMembershipCert::try_issue(org, entity.clone(), 1, 3600).expect("cert");
+        // The directory is deliberately LEFT BEHIND when the test finishes, and
+        // that is not an oversight. It holds the authority's revocation
+        // `.lock` sidecar, and `OrgRevocationStore` keys its PROCESS-GLOBAL
+        // core registry by that sidecar's `(device, inode)` so two path
+        // aliases of one sidecar share one live view (AV-9). Deleting it frees
+        // the inode while this node's core is still registered; Linux recycles
+        // a freed inode immediately, so the NEXT store opened anywhere in this
+        // test binary can land on it, derive the same `BackingId`, and join
+        // THIS test's core — reading its floors, its poison bit and its
+        // generation, and writing to a path that no longer exists.
+        //
+        // The victims are whichever tests are scheduled next, so it surfaces
+        // as unrelated failures in varying combinations rather than as one
+        // deterministic break. Only the deletion at the START of the helper
+        // remains, and it can free nothing: the path is per-test.
         let dir = std::env::temp_dir().join(format!("net-oa34b2-qc-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let authority = NodeAuthority::adopt(&dir, cert, &entity, 0, None).expect("adopt");
@@ -38454,7 +39577,7 @@ mod oa34b2_query_currentness_tests {
         assert_eq!(g1.grant_id, g2.grant_id, "same grant id");
         assert_ne!(g1.signature, g2.signature, "distinct signed authority");
 
-        let (c, dir) = adopted_consumer(&org_a, "reexpose").await;
+        let (c, _dir) = adopted_consumer(&org_a, "reexpose").await;
         c.install_consumer_grant_audience(g1.clone(), copy_secret(&s1))
             .expect("install g1");
         c.ingest_scoped_announcement_for_test(&granted_envelope(
@@ -38485,8 +39608,6 @@ mod oa34b2_query_currentness_tests {
             vec![p_entity],
             "only the G2 record is visible under the replacement authority",
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// OLB-2A.3.3 end-to-end: a revocation floor raised through the INSTALLED
@@ -38520,7 +39641,7 @@ mod oa34b2_query_currentness_tests {
         let s = s.expect("secret");
         let grant_id = g.grant_id;
 
-        let (c, dir) = adopted_consumer(&org_a, "floorwake").await;
+        let (c, _dir) = adopted_consumer(&org_a, "floorwake").await;
         c.install_consumer_grant_audience(g.clone(), copy_secret(&s))
             .expect("install grant");
         c.ingest_scoped_announcement_for_test(&granted_envelope(&p, &org_b, &g, &s, "svc-a", exp));
@@ -38559,8 +39680,6 @@ mod oa34b2_query_currentness_tests {
             changes.has_changed().expect("watch alive"),
             "and published the change wake",
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

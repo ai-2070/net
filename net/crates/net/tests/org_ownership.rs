@@ -29,6 +29,22 @@ use net::adapter::net::behavior::org_authority::NodeAuthority;
 use net::adapter::net::behavior::org_revocation::{OrgRevocationStore, ProvisioningExpectation};
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
 
+// A scratch directory holding an authority's revocation `.lock` sidecar is
+// deliberately LEFT BEHIND when its test finishes.
+//
+// `OrgRevocationStore` keys its PROCESS-GLOBAL core registry by that sidecar's
+// `(device, inode)`, so two path aliases of one sidecar share one live view
+// (AV-9). Deleting the directory frees the inode while this test's core is
+// still registered; Linux recycles a freed inode immediately, so the next store
+// opened anywhere in this binary can land on it, derive the same `BackingId`,
+// and join THIS test's core — inheriting its floors, its poison bit and its
+// generation, and writing through a path that no longer exists
+// (`state lock: No such file or directory`).
+//
+// The victims are whichever tests are scheduled next, so it surfaces as
+// unrelated failures in varying combinations rather than as one deterministic
+// break. Start-of-test resets stay: they run before anything is registered.
+
 const TEST_BUFFER_SIZE: usize = 256 * 1024;
 const PSK: [u8; 32] = [0x42u8; 32];
 
@@ -174,8 +190,6 @@ async fn owner_cert_projects_across_the_wire_only_when_emitted() {
         .await,
         "B must project A's verified owner org after emission is enabled"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ---------------------------------------------------------------------------
@@ -224,9 +238,6 @@ async fn install_refuses_foreign_authority() {
         node.node_authority().expect("still owned").owner_org(),
         org().org_id()
     );
-
-    let _ = std::fs::remove_dir_all(&dir_a);
-    let _ = std::fs::remove_dir_all(&dir_b);
 }
 
 /// Review-8 §4: an installed revocation store never lowers — a
@@ -278,9 +289,6 @@ async fn store_replacement_never_lowers_the_live_view() {
         5,
         "live floor must remain 5"
     );
-
-    let _ = std::fs::remove_dir_all(&dir_hi);
-    let _ = std::fs::remove_dir_all(&dir_lo);
 }
 
 /// Review-9 red 1: installing a store whose floors ALREADY rose
@@ -345,8 +353,6 @@ async fn installing_pre_raised_store_reconciles_existing_projections() {
         "nrpc:oa1-echo",
         0xDEAD
     ));
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Review-9 red 2: a DETACHED (replaced) store's late raises must
@@ -419,9 +425,6 @@ async fn detached_store_cannot_mutate_the_node() {
         None,
         "the installed store retracts"
     );
-
-    let _ = std::fs::remove_dir_all(&dir_old);
-    let _ = std::fs::remove_dir_all(&dir_new);
 }
 
 /// Review-9: concurrent dominating replacements are serialized —
@@ -470,9 +473,6 @@ async fn concurrent_replacements_never_lower_the_installed_floor() {
         final_floor, 7,
         "final installed floor never drops (r6: {r6:?})"
     );
-
-    let _ = std::fs::remove_dir_all(&dir6);
-    let _ = std::fs::remove_dir_all(&dir7);
 }
 
 /// Review-9: `install_node_authority` re-verifies the authority
@@ -539,9 +539,6 @@ async fn floored_authority_fails_installation_and_emission_goes_dark() {
         None,
         "a self-floored node must stop emitting ownership"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
-    let _ = std::fs::remove_dir_all(&dir2);
 }
 
 /// Review-8 §9 end-to-end: raising a floor through the INSTALLED
@@ -598,8 +595,6 @@ async fn floor_raise_retracts_projection_without_reannouncement() {
         "nrpc:oa1-echo",
         0xDEAD
     ));
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Review-9 real-path witness: a certificate acceptable ONLY under
@@ -643,8 +638,6 @@ async fn ceremony_skew_carries_into_production_startup() {
         .await
         .expect("startup verifies under the persisted ceremony skew");
     assert!(node.node_authority().is_some());
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Review-8 §2 production-startup witnesses: the four configured
@@ -737,9 +730,6 @@ async fn production_startup_honors_configured_authority() {
         .is_err(),
         "emit_owner_cert without node_authority_dir must refuse"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
-    let _ = std::fs::remove_dir_all(&missing);
 }
 
 // ---------------------------------------------------------------------------
@@ -850,8 +840,6 @@ async fn readopt_refuses_a_missing_revocation_state() {
         !state_path.exists(),
         "the refused adopt wrote an empty state anyway — floors are gone",
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Positive control for the above: a first adopt on a clean directory still
@@ -867,8 +855,6 @@ async fn first_adopt_on_a_clean_directory_still_succeeds() {
         NodeAuthority::adopt(&dir, cert, node.entity_id(), 0, None).expect("first adopt");
     assert_eq!(authority.owner_org(), org().org_id());
     assert!(dir.join("revocation-state.json").exists());
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ---------------------------------------------------------------------------
@@ -974,8 +960,6 @@ async fn floors_gate_ingest_and_survive_restart_with_lower_valid_bundle() {
         None,
         "below-floor cert must stay dropped after the restart chain"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ---------------------------------------------------------------------------
@@ -1207,9 +1191,6 @@ async fn active_raise_and_replacement_serialize_on_the_publish_guard() {
         node.install_org_revocation_store(weaker).is_err(),
         "a raise that publishes first must refuse the weaker candidate"
     );
-
-    let _ = std::fs::remove_dir_all(&dir_a);
-    let _ = std::fs::remove_dir_all(&dir_b);
 }
 
 /// Review-9 addendum P1: `install_node_authority` pins the
@@ -1311,8 +1292,6 @@ async fn authority_install_pins_candidate_floors_across_verification() {
         None,
         "emission is dark for the post-publication floored certificate"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Review-9 addendum P1: one backing path is ONE security view. A
@@ -1394,8 +1373,6 @@ async fn poisoned_sibling_write_gates_the_installed_view_until_recovery() {
     // republished + successful parent fsync) and clears it.
     sibling.apply_bundle(&bundle9).expect("recovery apply");
     assert!(!installed.is_poisoned(), "recovery clears the shared bit");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Review-9 addendum P1 (cached announcements, send-time seam):
@@ -1449,8 +1426,6 @@ async fn cached_announcement_revalidates_at_the_send_boundary() {
         rebuilt.version > certified.version,
         "the cert-free replacement supersedes the certified form"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Review-9 addendum P1 (cached announcements, late-join path):
@@ -1503,8 +1478,6 @@ async fn late_join_push_after_self_floor_carries_no_owner_cert() {
         None,
         "the session-open push must not carry the floored certificate"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Review-9 addendum P1 (cached announcements, deferred-flush
@@ -1584,8 +1557,6 @@ async fn deferred_flush_after_self_floor_carries_no_owner_cert() {
         may_execute(b.capability_fold(), a_id, "nrpc:oa1-echo", 0xDEAD),
         "capabilities survive; only ownership is withdrawn"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Review-9 addendum P2 (observer theft): one store `Arc`
@@ -1646,8 +1617,6 @@ async fn one_store_installed_into_two_nodes_notifies_both() {
             "{name} must observe the retraction (registry, not a stolen slot)"
         );
     }
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ---------------------------------------------------------------------------
@@ -1718,9 +1687,6 @@ async fn opener_cannot_publish_during_store_replacement() {
         .org_revocation_store()
         .expect("installed")
         .shares_core_with(&b_marker(&dir_b)));
-
-    let _ = std::fs::remove_dir_all(&dir_a);
-    let _ = std::fs::remove_dir_all(&dir_b);
 }
 
 /// Helper: reopen B's path to compare cores (the installed store is
@@ -1789,9 +1755,6 @@ async fn opener_cannot_publish_during_authority_installation() {
         opener_blocked.load(std::sync::atomic::Ordering::Acquire),
         "a same-path opener published inside the authority install's pinned interval"
     );
-
-    let _ = std::fs::remove_dir_all(&dir_a);
-    let _ = std::fs::remove_dir_all(&dir_b);
 }
 
 /// Review-11 P1 (canonical dual-core locking): two nodes performing
@@ -1850,9 +1813,6 @@ async fn two_nodes_opposite_store_swaps_do_not_deadlock() {
         outcome.is_ok(),
         "opposite cross-core swaps deadlocked (canonical ordering failed)"
     );
-
-    let _ = std::fs::remove_dir_all(&dir_a);
-    let _ = std::fs::remove_dir_all(&dir_b);
 }
 
 // ---------------------------------------------------------------------------
@@ -1918,8 +1878,6 @@ async fn concurrent_floor_publish_during_send_retries_to_cert_free() {
         sent.verify().is_ok(),
         "the rebuilt announcement is re-signed"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// NC4 (Kyra Gate-1 audit) — the send seqlock PINS the exact
@@ -1980,8 +1938,6 @@ async fn send_seqlock_pins_authority_and_store_arcs() {
     // The undisturbed send still ships the certified form.
     let sent = CapabilityAnnouncement::from_bytes(&bytes).expect("decode");
     assert!(sent.owner_cert.is_some(), "undisturbed send ships the cert");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// NC3 (Kyra Gate-1 audit) — the send stamp reads the store generation
@@ -2081,8 +2037,6 @@ async fn send_seqlock_barrier_catches_a_paused_mid_swap_publish() {
         sent.verify().is_ok(),
         "the rebuilt announcement is re-signed"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Review-11 P1: certificate wall-clock expiry is honored on every
@@ -2143,8 +2097,6 @@ async fn expired_certificate_cache_reuse_is_cert_free_without_authority_event() 
         sent.version > certified.version,
         "the cert-free replacement supersedes the certified form"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ---------------------------------------------------------------------------
@@ -2196,8 +2148,6 @@ async fn dropping_a_node_unsubscribes_its_raise_callback() {
     store
         .apply_bundle(&OrgRevocationBundle::try_issue(&org(), &floors).expect("issue"))
         .expect("raise after node drop");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// R3-4: a raise subscription is owned EXTERNALLY through the
@@ -2239,8 +2189,6 @@ fn dropping_the_external_guard_unsubscribes_from_the_shared_core() {
     // core alive changes nothing.
     drop(a);
     assert_eq!(b.subscriber_count(), 0);
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// AV-10: a raise callback SNAPSHOTTED before node teardown (exactly as
@@ -2307,6 +2255,4 @@ async fn a_snapshotted_raise_callback_is_inert_after_node_teardown() {
         Some(org().org_id()),
         "a callback snapshotted before teardown must not retract the fold afterward",
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -3012,6 +3012,26 @@ mod tests {
     }
 
     /// Unique per-test scratch dir (house pattern — no tempfile dev-dep).
+    /// A scratch directory for one test's state file and `.lock` sidecar.
+    ///
+    /// **It deliberately does not delete itself.** The path is already unique
+    /// per test through `TEST_DIR_SEQ`, so cleanup would only reclaim disk —
+    /// and on unix it would do something far worse than save a few bytes.
+    ///
+    /// [`BackingId::FileId`] keys the PROCESS-GLOBAL core registry by the
+    /// sidecar's `(device, inode)`, so that two path aliases of one sidecar
+    /// share one live view (AV-9). Deleting a finished test's directory frees
+    /// that inode, Linux reuses a freed inode immediately, and the NEXT store
+    /// opened anywhere in this test binary can land on it — deriving the same
+    /// `BackingId` and having [`join_or_create_core`] join the finished test's
+    /// still-live core by design, floors, poison bit, generation and
+    /// exhaustion latch included.
+    ///
+    /// The victims are whichever tests happen to be scheduled next, so it
+    /// presents as unrelated witnesses failing in varying combinations rather
+    /// than as one deterministic break. It did exactly that to four
+    /// `org_routing_wiring_tests` witnesses on Linux CI, which share this test
+    /// binary; the fixture there carries the same note and the same fix.
     struct Scratch(PathBuf);
     impl Scratch {
         fn new() -> Self {
@@ -3025,11 +3045,6 @@ mod tests {
         }
         fn state_path(&self) -> PathBuf {
             self.0.join("revocation-state.json")
-        }
-    }
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 

@@ -47,6 +47,22 @@ use net::adapter::net::mesh_rpc::{
 };
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
 
+// A scratch directory holding an authority's revocation `.lock` sidecar is
+// deliberately LEFT BEHIND when its test finishes.
+//
+// `OrgRevocationStore` keys its PROCESS-GLOBAL core registry by that sidecar's
+// `(device, inode)`, so two path aliases of one sidecar share one live view
+// (AV-9). Deleting the directory frees the inode while this test's core is
+// still registered; Linux recycles a freed inode immediately, so the next store
+// opened anywhere in this binary can land on it, derive the same `BackingId`,
+// and join THIS test's core — inheriting its floors, its poison bit and its
+// generation, and writing through a path that no longer exists
+// (`state lock: No such file or directory`).
+//
+// The victims are whichever tests are scheduled next, so it surfaces as
+// unrelated failures in varying combinations rather than as one deterministic
+// break. Start-of-test resets stay: they run before anything is registered.
+
 const PSK: [u8; 32] = [0x42u8; 32];
 const TEST_BUFFER_SIZE: usize = 256 * 1024;
 /// The proof header the provider strips before the handler sees the request.
@@ -369,7 +385,7 @@ async fn live_two_node_owner_delegated_admit() {
     let caller = build_node_with(EntityKeypair::from_bytes(CALLER_SEED)).await;
     bring_up(&caller, &server).await;
 
-    let (org_b, dir) = install_authority(&server, "admit");
+    let (org_b, _dir) = install_authority(&server, "admit");
     let provider = server.entity_id().clone();
     let caller_entity = caller.entity_id().clone();
 
@@ -430,8 +446,6 @@ async fn live_two_node_owner_delegated_admit() {
         stripped.load(Ordering::SeqCst),
         "the raw net-org-admission proof header was stripped from the handler view",
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// LIVE deny over the real transport: a public call (no proof) to a PROTECTED
@@ -443,7 +457,7 @@ async fn live_two_node_missing_proof_denied() {
     let server = build_node_with(EntityKeypair::generate()).await;
     let caller = build_node_with(EntityKeypair::from_bytes([0x08u8; 32])).await;
     bring_up(&caller, &server).await;
-    let (_org_b, dir) = install_authority(&server, "deny");
+    let (_org_b, _dir) = install_authority(&server, "deny");
 
     let calls = Arc::new(AtomicUsize::new(0));
     let _serve = server
@@ -503,8 +517,6 @@ async fn live_two_node_missing_proof_denied() {
         ),
     }
     assert_handler_stays_dark(&calls, "the handler stayed dark for the denied call").await;
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// LIVE provider-state deny: the provider's revocation store is poisoned AFTER
@@ -523,7 +535,7 @@ async fn live_two_node_provider_store_poison_denies() {
     let server = build_node_with(EntityKeypair::generate()).await;
     let caller = build_node_with(EntityKeypair::from_bytes(CALLER_SEED)).await;
     bring_up(&caller, &server).await;
-    let (org_b, dir) = install_authority(&server, "poison");
+    let (org_b, _dir) = install_authority(&server, "poison");
     let provider = server.entity_id().clone();
 
     let calls = Arc::new(AtomicUsize::new(0));
@@ -574,8 +586,6 @@ async fn live_two_node_provider_store_poison_denies() {
         other => panic!("expected an AdmissionDenied ServerError, got {other:?}"),
     }
     assert_handler_stays_dark(&calls, "the handler stayed dark under the poisoned store").await;
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// LIVE provider-state deny: the captured `provider_policy` is the final live
@@ -588,7 +598,7 @@ async fn live_two_node_policy_veto_denies() {
     let server = build_node_with(EntityKeypair::generate()).await;
     let caller = build_node_with(EntityKeypair::from_bytes(CALLER_SEED)).await;
     bring_up(&caller, &server).await;
-    let (org_b, dir) = install_authority(&server, "veto");
+    let (org_b, _dir) = install_authority(&server, "veto");
     let provider = server.entity_id().clone();
 
     let calls = Arc::new(AtomicUsize::new(0));
@@ -636,8 +646,6 @@ async fn live_two_node_policy_veto_denies() {
         }
     }
     assert_handler_stays_dark(&calls, "the handler stayed dark under the policy veto").await;
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Records whether the handler's request headers carried the org-admission proof.
@@ -736,7 +744,7 @@ async fn live_two_node_protected_call_service_bypasses_legacy_gate() {
     let server = build_node_with(EntityKeypair::generate()).await;
     let caller = build_node_with(EntityKeypair::from_bytes(CALLER_SEED)).await;
     bring_up(&caller, &server).await;
-    let (org_b, dir) = install_authority(&server, "callservice");
+    let (org_b, _dir) = install_authority(&server, "callservice");
     let provider = server.entity_id().clone();
 
     let calls = Arc::new(AtomicUsize::new(0));
@@ -801,8 +809,6 @@ async fn live_two_node_protected_call_service_bypasses_legacy_gate() {
         1,
         "the protected call bypassed the legacy gate and reached the handler exactly once",
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ============================================================================
@@ -830,7 +836,7 @@ impl RpcHandler for TrivialHandler {
 #[tokio::test]
 async fn owner_scoped_residue_is_stripped_from_the_plaintext_announcement() {
     let server = build_node_with(EntityKeypair::from_bytes([0x51u8; 32])).await;
-    let (_org_b, dir) = install_authority(&server, "residue-strip");
+    let (_org_b, _dir) = install_authority(&server, "residue-strip");
 
     // Register "secret" OWNER-SCOPED (requires the installed authority). Hold the
     // handle so the registration is not torn down by Drop.
@@ -884,8 +890,6 @@ async fn owner_scoped_residue_is_stripped_from_the_plaintext_announcement() {
         settled.capabilities.has_tag("region:eu-west"),
         "the unrelated baseline tag must survive the strip",
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// OA3-4b1 Commit B2: an owner-scoped service is delivered ONLY inside the
@@ -902,7 +906,7 @@ async fn owner_scoped_service_ships_only_inside_the_encrypted_owner_envelope() {
     };
 
     let server = build_node_with(EntityKeypair::from_bytes([0x53u8; 32])).await;
-    let (_org_b, dir) = install_authority(&server, "scoped-delivery");
+    let (_org_b, _dir) = install_authority(&server, "scoped-delivery");
     // The owner envelope embeds the owner cert, so emission must be ENABLED for
     // any scoped envelope to ship (the same switch the public cert rides).
     server
@@ -968,8 +972,6 @@ async fn owner_scoped_service_ships_only_inside_the_encrypted_owner_envelope() {
         !descriptor.has_tag("nrpc:open"),
         "the encrypted descriptor carries only owner-scoped services, never public ones",
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// OA3-4b2 slice 2 — the granted-audience registration seam. `serve_rpc_granted`
@@ -995,7 +997,7 @@ async fn serve_rpc_granted_is_dispatchable_but_undiscoverable_without_a_grant() 
     );
 
     let server = build_node_with(EntityKeypair::from_bytes([0x63u8; 32])).await;
-    let (_org_b, dir) = install_authority(&server, "granted-seam");
+    let (_org_b, _dir) = install_authority(&server, "granted-seam");
     server
         .set_owner_cert_emission(true)
         .expect("enable owner-cert emission");
@@ -1046,8 +1048,6 @@ async fn serve_rpc_granted_is_dispatchable_but_undiscoverable_without_a_grant() 
         has_local_capability(server.capability_fold(), server.node_id(), "nrpc:cross"),
         "the granted service is locally dispatchable despite being undiscoverable",
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ---------------------------------------------------------------------------
@@ -1154,7 +1154,7 @@ async fn converge_scoped_count(p: &Arc<MeshNode>, n: usize) -> bool {
 /// granted service.
 #[tokio::test]
 async fn a_granted_service_ships_only_inside_an_encrypted_grant_envelope() {
-    let (p, _h, dir, entity, org_b) = granted_provider(0x70, "one", "cross").await;
+    let (p, _h, _dir, entity, org_b) = granted_provider(0x70, "one", "cross").await;
     let org_a = OrgKeypair::from_bytes([0x7Au8; 32]);
 
     let (grant, secret) = OrgCapabilityGrant::try_issue(
@@ -1193,8 +1193,6 @@ async fn a_granted_service_ships_only_inside_an_encrypted_grant_envelope() {
         .expect("grantee opens the granted envelope");
     assert!(descriptor.has_tag("nrpc:cross"));
     assert!(!descriptor.has_tag("nrpc:open"));
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// OA3-4b2 slice 3 — two overlapping grants (same capability) emit TWO
@@ -1202,7 +1200,7 @@ async fn a_granted_service_ships_only_inside_an_encrypted_grant_envelope() {
 /// ONLY its own envelope: K1 cannot open K2's, and vice versa.
 #[tokio::test]
 async fn overlapping_grants_emit_two_independently_decryptable_envelopes() {
-    let (p, _h, dir, entity, org_b) = granted_provider(0x71, "two", "cross").await;
+    let (p, _h, _dir, entity, org_b) = granted_provider(0x71, "two", "cross").await;
     let org_a = OrgKeypair::from_bytes([0x7Au8; 32]);
     let cap = CapabilityAuthorityId::for_tag("nrpc:cross");
 
@@ -1266,8 +1264,6 @@ async fn overlapping_grants_emit_two_independently_decryptable_envelopes() {
         e2.open_with(o1.discovery_key()).is_err(),
         "K1 cannot open E2",
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// OA3-4b2 slice 3 — a provider grant for a capability with NO locally-registered
@@ -1275,7 +1271,7 @@ async fn overlapping_grants_emit_two_independently_decryptable_envelopes() {
 /// installed grant).
 #[tokio::test]
 async fn an_unrelated_capability_grant_emits_no_granted_envelope() {
-    let (p, _h, dir, entity, org_b) = granted_provider(0x72, "none", "cross").await;
+    let (p, _h, _dir, entity, org_b) = granted_provider(0x72, "none", "cross").await;
     let org_a = OrgKeypair::from_bytes([0x7Au8; 32]);
 
     // §T6 — establish the MATCHING case first, so the zero below is a
@@ -1332,8 +1328,6 @@ async fn an_unrelated_capability_grant_emits_no_granted_envelope() {
         converge_scoped_count(&p, 0).await,
         "an unrelated-capability grant emits no granted envelope",
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// OA3-4b2 slice 3 — a granted envelope's expiry never outlives its grant:
@@ -1342,7 +1336,7 @@ async fn an_unrelated_capability_grant_emits_no_granted_envelope() {
 /// the (3600 s) cert.
 #[tokio::test]
 async fn a_granted_envelope_never_outlives_its_grant() {
-    let (p, _h, dir, entity, org_b) = granted_provider(0x73, "ttl", "cross").await;
+    let (p, _h, _dir, entity, org_b) = granted_provider(0x73, "ttl", "cross").await;
     let org_a = OrgKeypair::from_bytes([0x7Au8; 32]);
 
     let (grant, secret) = OrgCapabilityGrant::try_issue(
@@ -1375,8 +1369,6 @@ async fn a_granted_envelope_never_outlives_its_grant() {
         env.expires_at() <= unix_now() + 200,
         "the short grant TTL clamped the envelope expiry below the announce TTL",
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// OA3-4b2 slice 3 — removing a provider grant swaps the registry snapshot
@@ -1387,7 +1379,7 @@ async fn a_granted_envelope_never_outlives_its_grant() {
 /// the grant gone — zero envelopes.
 #[tokio::test]
 async fn removing_a_provider_grant_refuses_the_cached_granted_envelope() {
-    let (p, _h, dir, entity, org_b) = granted_provider(0x74, "remove", "cross").await;
+    let (p, _h, _dir, entity, org_b) = granted_provider(0x74, "remove", "cross").await;
     let org_a = OrgKeypair::from_bytes([0x7Au8; 32]);
 
     let (grant, secret) = OrgCapabilityGrant::try_issue(
@@ -1421,8 +1413,6 @@ async fn removing_a_provider_grant_refuses_the_cached_granted_envelope() {
         p.announcement_scoped_for_send_for_test().is_empty(),
         "the rebuilt emission carries no granted envelope",
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ---------------------------------------------------------------------------
@@ -1512,7 +1502,7 @@ async fn an_inbound_granted_announcement_is_verified_and_stored() {
     let env = granted_envelope_bytes(&provider, &org_b, &grant, &secret, "cross", now);
 
     // Consumer C: org A, with the B→A pair installed → opens + resolves P.
-    let (c, c_dir) = adopted_node(0x91, &org_a, "resolve").await;
+    let (c, _c_dir) = adopted_node(0x91, &org_a, "resolve").await;
     c.install_consumer_grant_audience(grant.clone(), copy_secret(&secret))
         .expect("install consumer grant");
     c.ingest_scoped_announcement_for_test(&env);
@@ -1525,7 +1515,7 @@ async fn an_inbound_granted_announcement_is_verified_and_stored() {
     // Node D: org A but NO consumer grant → stores nothing. Prove non-storage by
     // installing the grant AFTER the ingest: the record never landed, so the
     // query stays empty.
-    let (d, d_dir) = adopted_node(0x92, &org_a, "nostore").await;
+    let (d, _d_dir) = adopted_node(0x92, &org_a, "nostore").await;
     d.ingest_scoped_announcement_for_test(&env);
     d.install_consumer_grant_audience(grant.clone(), copy_secret(&secret))
         .expect("install after the drop");
@@ -1534,9 +1524,6 @@ async fn an_inbound_granted_announcement_is_verified_and_stored() {
             .is_empty(),
         "a node without the pair at ingest time stored nothing",
     );
-
-    let _ = std::fs::remove_dir_all(&c_dir);
-    let _ = std::fs::remove_dir_all(&d_dir);
 }
 
 /// OA3-4b2 slice 4 — the selector is an EXACT lookup by grant id: an envelope for
@@ -1555,7 +1542,7 @@ async fn the_ingest_selector_drops_a_grant_id_it_does_not_hold() {
     let env1 = granted_envelope_bytes(&provider, &org_b, &g1, &s1, "cross", now);
 
     // C holds only G2, then receives an envelope for G1 → dropped.
-    let (c, dir) = adopted_node(0x94, &org_a, "wrongid").await;
+    let (c, _dir) = adopted_node(0x94, &org_a, "wrongid").await;
     c.install_consumer_grant_audience(g2, s2)
         .expect("install g2");
     c.ingest_scoped_announcement_for_test(&env1);
@@ -1568,8 +1555,6 @@ async fn the_ingest_selector_drops_a_grant_id_it_does_not_hold() {
             .is_empty(),
         "an envelope whose grant id the node did not hold was dropped, not stored",
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// OA3-4b2 slice 4 — removing the consumer credential retracts the stored granted
@@ -1587,7 +1572,7 @@ async fn removing_the_consumer_credential_hides_the_stored_granted_record() {
     let grant_id = grant.grant_id;
     let env = granted_envelope_bytes(&provider, &org_b, &grant, &secret, "cross", now);
 
-    let (c, dir) = adopted_node(0x96, &org_a, "hide").await;
+    let (c, _dir) = adopted_node(0x96, &org_a, "hide").await;
     c.install_consumer_grant_audience(grant.clone(), copy_secret(&secret))
         .expect("install");
     c.ingest_scoped_announcement_for_test(&env);
@@ -1614,8 +1599,6 @@ async fn removing_the_consumer_credential_hides_the_stored_granted_record() {
         vec![p_entity],
         "the record was hidden, not evicted — re-installing re-exposes it",
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// OA3-4b2 slice 4 — a consumer credential replacement racing the verify→insert
@@ -1634,7 +1617,7 @@ async fn a_consumer_credential_replacement_racing_the_granted_insert_is_refused(
     let grant_id = grant.grant_id;
     let env = granted_envelope_bytes(&provider, &org_b, &grant, &secret, "cross", now);
 
-    let (c, dir) = adopted_node(0x98, &org_a, "race").await;
+    let (c, _dir) = adopted_node(0x98, &org_a, "race").await;
     c.install_consumer_grant_audience(grant.clone(), copy_secret(&secret))
         .expect("install target grant");
 
@@ -1674,8 +1657,6 @@ async fn a_consumer_credential_replacement_racing_the_granted_insert_is_refused(
         vec![p_entity],
         "a clean re-ingest against the settled snapshot resolves P",
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// OA3-4b1 B2 audience-rotation safety (Kyra): a same-org authority replacement
@@ -1840,9 +1821,6 @@ async fn a_same_org_audience_rotation_refuses_the_stale_scoped_envelope() {
         .is_err(),
         "E2 sealed under the new key must not open under the rotated-out K1",
     );
-
-    let _ = std::fs::remove_dir_all(&dir_a);
-    let _ = std::fs::remove_dir_all(&dir_b);
 }
 
 /// OA3-5a: a live inbound owner-scoped announcement is opened under this node's
@@ -1928,8 +1906,6 @@ async fn an_inbound_owner_scoped_announcement_is_verified_and_stored() {
             .any(|p| p == &exp_provider),
         "an expired envelope is refused at ingest",
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// OA3-5 (Kyra closure, publication race): an owner-scoped capability verified
@@ -2073,8 +2049,6 @@ async fn a_floor_publish_racing_the_scoped_insert_is_refused_then_recovers() {
             .any(|p| p == &raced_provider),
         "the identical envelope re-announced against the settled view lands cleanly",
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// OA3-5 §3.2 (Kyra APPROVED design) — opaque multi-hop propagation, LIVE:
@@ -2180,8 +2154,6 @@ async fn an_owner_scoped_announcement_floods_opaquely_through_a_relay_to_the_aud
         r.scoped_owner_providers_for_test(now).is_empty(),
         "the authority-less relay forwards but never decrypts or stores the envelope",
     );
-
-    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// OA3-4b2 slice 5 — a GRANTED (cross-org B→A) capability floods opaquely through
@@ -2202,6 +2174,13 @@ async fn a_granted_capability_floods_opaquely_through_a_relay_to_the_grantee() {
     let org_b = OrgKeypair::from_bytes([0x8Bu8; 32]); // provider org
     let org_a = OrgKeypair::from_bytes([0x8Au8; 32]); // grantee org (distinct)
     let base = std::env::temp_dir().join(format!("net-oa34b2-relay-{}", std::process::id()));
+    // START-of-test reset, on this test's OWN pid-scoped path. This is the half
+    // of the cleanup rule that stays: a previous run's residue under the same
+    // path would be adopted as live authority state, and nothing else in the
+    // process can be holding a core on a path that is about to be created.
+    // (What was removed everywhere is the END-of-test deletion, which frees a
+    // `.lock` sidecar inode while its process-global core is still live and lets
+    // the next store join a dead test's core.)
     let _ = std::fs::remove_dir_all(&base);
 
     // The single B→A grant: P holds it as a PROVIDER record (to emit), A holds it
@@ -2295,8 +2274,6 @@ async fn a_granted_capability_floods_opaquely_through_a_relay_to_the_grantee() {
             .unwrap_or(false),
         "the granted tag never appears in P's plaintext announcement",
     );
-
-    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// OA3 closure (Kyra #2): a send fired AFTER a visibility change must not ship an
@@ -2307,7 +2284,7 @@ async fn a_granted_capability_floods_opaquely_through_a_relay_to_the_grantee() {
 #[tokio::test]
 async fn a_send_after_a_visibility_change_refuses_the_stale_emission() {
     let server = build_node_with(EntityKeypair::from_bytes([0x52u8; 32])).await;
-    let (_org_b, dir) = install_authority(&server, "vis-race");
+    let (_org_b, _dir) = install_authority(&server, "vis-race");
 
     let _svc = server
         .serve_rpc("svc", Arc::new(TrivialHandler))
@@ -2337,8 +2314,6 @@ async fn a_send_after_a_visibility_change_refuses_the_stale_emission() {
         server.announcement_bytes_for_send_for_test().is_none(),
         "a send after a visibility change must not ship the stale emission",
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// OA3 closure item-2 race (Kyra re-review): a visibility change landing INSIDE
@@ -2348,7 +2323,7 @@ async fn a_send_after_a_visibility_change_refuses_the_stale_emission() {
 #[tokio::test]
 async fn a_visibility_change_during_serialization_refuses_the_stale_bytes() {
     let server = build_node_with(EntityKeypair::from_bytes([0x53u8; 32])).await;
-    let (_org_b, dir) = install_authority(&server, "vis-serialize-race");
+    let (_org_b, _dir) = install_authority(&server, "vis-serialize-race");
 
     let _svc = server
         .serve_rpc("svc", Arc::new(TrivialHandler))
@@ -2377,8 +2352,6 @@ async fn a_visibility_change_during_serialization_refuses_the_stale_bytes() {
             .is_none(),
         "a visibility change during serialization must refuse the stale bytes",
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Kyra OA3 review, Finding 2 witness — a REAL registry transition (not a
@@ -2397,7 +2370,7 @@ async fn a_visibility_change_during_serialization_refuses_the_stale_bytes() {
 #[tokio::test]
 async fn a_real_registry_transition_during_serialization_refuses_the_stale_bytes() {
     let server = build_node_with(EntityKeypair::from_bytes([0x54u8; 32])).await;
-    let (_org_b, dir) = install_authority(&server, "vis-real-transition");
+    let (_org_b, _dir) = install_authority(&server, "vis-real-transition");
 
     let public_handle = server
         .serve_rpc("svc", Arc::new(TrivialHandler))
@@ -2457,8 +2430,6 @@ async fn a_real_registry_transition_during_serialization_refuses_the_stale_bytes
         installed.lock().is_some(),
         "the probe must actually have performed the transition",
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// OA3-4b2 slice 1 — the LIVE `MeshNode` grant-audience install/remove surface.
@@ -2580,8 +2551,6 @@ async fn grant_audience_registries_install_and_remove_on_a_live_node() {
     assert_eq!(server.consumer_grant_audiences_len_for_test(), 1);
     assert!(server.remove_consumer_grant_audience(&c_grant_id));
     assert_eq!(server.consumer_grant_audiences_len_for_test(), 0);
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ============================================================================
@@ -2674,7 +2643,7 @@ async fn live_two_node_cross_org_granted_admit() {
     bring_up(&caller, &server).await;
 
     // Provider P₂ is owned by org B; the caller acts for a DISTINCT org A.
-    let (org_b, dir) = install_authority(&server, "xorg-admit");
+    let (org_b, _dir) = install_authority(&server, "xorg-admit");
     let org_a = OrgKeypair::from_bytes([0x7au8; 32]);
     assert_ne!(org_a.org_id(), org_b.org_id(), "A and B are distinct orgs");
     let provider = server.entity_id().clone();
@@ -2739,8 +2708,6 @@ async fn live_two_node_cross_org_granted_admit() {
         stripped.load(Ordering::SeqCst),
         "the raw net-org-admission proof header was stripped from the handler view",
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// OA-4 slice 2 (Tier 1, corrupted-provider-state) — missing-local-tag. A
@@ -2767,7 +2734,7 @@ async fn live_two_node_protected_missing_local_capability_denies() {
     let server = build_node_with(EntityKeypair::generate()).await;
     let caller = build_node_with(EntityKeypair::from_bytes(CALLER_SEED)).await;
     bring_up(&caller, &server).await;
-    let (org_b, dir) = install_authority(&server, "notag");
+    let (org_b, _dir) = install_authority(&server, "notag");
     let org_a = OrgKeypair::from_bytes([0x7au8; 32]);
     let provider = server.entity_id().clone();
 
@@ -2828,8 +2795,6 @@ async fn live_two_node_protected_missing_local_capability_denies() {
         "the handler stayed dark — the possession precheck denied before admission",
     )
     .await;
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// OA-4 slice 2 (Tier 1) — `AnyNodeOwnedBy(B)` reuse and boundary. A single B→A
@@ -2979,9 +2944,7 @@ async fn live_cross_org_any_node_owned_by_reuse_and_deny() {
     }
     assert_handler_stays_dark(&pc_calls, "the non-B provider's handler stayed dark").await;
 
-    for d in [dir2, dir2b, dirc] {
-        let _ = std::fs::remove_dir_all(&d);
-    }
+    for _d in [dir2, dir2b, dirc] {}
 }
 
 /// OA-4 slice 3 (Tier 1) — the representative live OwnerDelegated denial:
@@ -2995,7 +2958,7 @@ async fn live_two_node_owner_delegated_membership_only_denied() {
     let server = build_node_with(EntityKeypair::generate()).await;
     let caller = build_node_with(EntityKeypair::from_bytes(CALLER_SEED)).await;
     bring_up(&caller, &server).await;
-    let (org_b, dir) = install_authority(&server, "memonly");
+    let (org_b, _dir) = install_authority(&server, "memonly");
     let provider = server.entity_id().clone();
     let caller_entity = caller.entity_id().clone();
 
@@ -3051,8 +3014,6 @@ async fn live_two_node_owner_delegated_membership_only_denied() {
         other => panic!("expected AdmissionDenied, got {other:?}"),
     }
     assert_handler_stays_dark(&calls, "the handler stayed dark").await;
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// OA-4 slice 3 (Tier 1) — registering a PROTECTED capability leaves PUBLIC
@@ -3067,7 +3028,7 @@ async fn live_two_node_public_capability_unchanged_beside_protected() {
     let server = build_node_with(EntityKeypair::generate()).await;
     let caller = build_node_with(EntityKeypair::from_bytes(CALLER_SEED)).await;
     bring_up(&caller, &server).await;
-    let (_org_b, dir) = install_authority(&server, "pubunchanged");
+    let (_org_b, _dir) = install_authority(&server, "pubunchanged");
 
     let pub_calls = Arc::new(AtomicUsize::new(0));
     let saw_proof = Arc::new(AtomicBool::new(false));
@@ -3141,8 +3102,6 @@ async fn live_two_node_public_capability_unchanged_beside_protected() {
         other => panic!("expected AdmissionDenied, got {other:?}"),
     }
     assert_handler_stays_dark(&prot_calls, "the protected handler stayed dark").await;
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// OA-4 slice 3 (Tier 1) — the OA-1 restart chain through the LIVE admission
@@ -3274,8 +3233,6 @@ async fn live_two_node_owner_delegated_floor_survives_restart_denies() {
         1,
         "the at-floor call reached the handler",
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ============================================================================
@@ -3358,7 +3315,7 @@ async fn live_granted_audience_discovers_then_invokes() {
     let cap = CapabilityAuthorityId::for_tag("nrpc:svc");
 
     let calls = Arc::new(AtomicUsize::new(0));
-    let (p2, _serve, p_entity, p_dir) = granted_service_provider(
+    let (p2, _serve, p_entity, _p_dir) = granted_service_provider(
         0x61,
         "svc",
         Arc::new(DarkHandler {
@@ -3366,7 +3323,7 @@ async fn live_granted_audience_discovers_then_invokes() {
         }),
     )
     .await;
-    let (a, a_dir) = adopted_node(0x62, &org_a, "gdisc").await;
+    let (a, _a_dir) = adopted_node(0x62, &org_a, "gdisc").await;
     bring_up(&a, &p2).await;
 
     // DISCOVER|INVOKE grant B→A for exactly P₂.
@@ -3421,9 +3378,6 @@ async fn live_granted_audience_discovers_then_invokes() {
         1,
         "the exact P₂ handler ran once under the same grant",
     );
-
-    let _ = std::fs::remove_dir_all(&p_dir);
-    let _ = std::fs::remove_dir_all(&a_dir);
 }
 
 /// OA-4 slice 4 — DISCOVER-only resolves but cannot invoke (decrypt-without-
@@ -3437,7 +3391,7 @@ async fn live_granted_audience_discover_only_resolves_but_cannot_invoke() {
     let now = unix_now();
 
     let calls = Arc::new(AtomicUsize::new(0));
-    let (p2, _serve, p_entity, p_dir) = granted_service_provider(
+    let (p2, _serve, p_entity, _p_dir) = granted_service_provider(
         0x63,
         "svc",
         Arc::new(DarkHandler {
@@ -3445,7 +3399,7 @@ async fn live_granted_audience_discover_only_resolves_but_cannot_invoke() {
         }),
     )
     .await;
-    let (a, a_dir) = adopted_node(0x64, &org_a, "gdonly").await;
+    let (a, _a_dir) = adopted_node(0x64, &org_a, "gdonly").await;
     bring_up(&a, &p2).await;
 
     // A DISCOVER-only grant (no INVOKE) mints an audience secret.
@@ -3491,9 +3445,6 @@ async fn live_granted_audience_discover_only_resolves_but_cannot_invoke() {
         "the handler stayed dark — discovery did not confer invocation",
     )
     .await;
-
-    let _ = std::fs::remove_dir_all(&p_dir);
-    let _ = std::fs::remove_dir_all(&a_dir);
 }
 
 /// OA-4 slice 4 — a wrong dispatcher resolves but the invocation is denied. The
@@ -3509,7 +3460,7 @@ async fn live_granted_audience_wrong_dispatcher_resolves_but_invocation_denied()
     let cap = CapabilityAuthorityId::for_tag("nrpc:svc");
 
     let calls = Arc::new(AtomicUsize::new(0));
-    let (p2, _serve, p_entity, p_dir) = granted_service_provider(
+    let (p2, _serve, p_entity, _p_dir) = granted_service_provider(
         0x65,
         "svc",
         Arc::new(DarkHandler {
@@ -3517,7 +3468,7 @@ async fn live_granted_audience_wrong_dispatcher_resolves_but_invocation_denied()
         }),
     )
     .await;
-    let (a, a_dir) = adopted_node(0x66, &org_a, "gwrongdisp").await;
+    let (a, _a_dir) = adopted_node(0x66, &org_a, "gwrongdisp").await;
     bring_up(&a, &p2).await;
 
     let (grant, secret) = OrgCapabilityGrant::try_issue(
@@ -3578,9 +3529,6 @@ async fn live_granted_audience_wrong_dispatcher_resolves_but_invocation_denied()
         other => panic!("expected AdmissionDenied, got {other:?}"),
     }
     assert_handler_stays_dark(&calls, "the handler stayed dark").await;
-
-    let _ = std::fs::remove_dir_all(&p_dir);
-    let _ = std::fs::remove_dir_all(&a_dir);
 }
 
 /// OA-4 slice 4 — provider policy is final on the granted/cross-org path too. A
@@ -3617,7 +3565,7 @@ async fn live_granted_audience_provider_policy_final() {
         )
         .expect("granted serve with veto policy");
 
-    let (a, a_dir) = adopted_node(0x68, &org_a, "gveto").await;
+    let (a, _a_dir) = adopted_node(0x68, &org_a, "gveto").await;
     bring_up(&a, &p2).await;
 
     let (grant, secret) = OrgCapabilityGrant::try_issue(
@@ -3666,9 +3614,6 @@ async fn live_granted_audience_provider_policy_final() {
         other => panic!("expected AdmissionDenied, got {other:?}"),
     }
     assert_handler_stays_dark(&calls, "the handler stayed dark under the policy veto").await;
-
-    let _ = std::fs::remove_dir_all(&p_dir);
-    let _ = std::fs::remove_dir_all(&a_dir);
 }
 
 /// OA-4 slice 4 — INVOKE-only grants hold no audience material BY CONSTRUCTION.
@@ -3735,7 +3680,7 @@ async fn live_two_node_proof_for_another_identity_is_denied() {
     let caller = build_node_with(EntityKeypair::from_bytes(SESSION_SEED)).await;
     bring_up(&caller, &server).await;
 
-    let (org_b, dir) = install_authority(&server, "bindmismatch");
+    let (org_b, _dir) = install_authority(&server, "bindmismatch");
     let provider = server.entity_id().clone();
 
     let calls = Arc::new(AtomicUsize::new(0));
@@ -3807,8 +3752,6 @@ async fn live_two_node_proof_for_another_identity_is_denied() {
         1,
         "only the correctly-bound call reached the handler",
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The caller-side TTL ceiling is enforced LOCALLY, before anything leaves
@@ -3836,7 +3779,7 @@ async fn a_proof_ttl_outside_the_ceiling_fails_locally() {
     let caller = build_node_with(EntityKeypair::from_bytes(CALLER_SEED)).await;
     bring_up(&caller, &server).await;
 
-    let (org_b, dir) = install_authority(&server, "ttlceiling");
+    let (org_b, _dir) = install_authority(&server, "ttlceiling");
     let provider = server.entity_id().clone();
 
     let calls = Arc::new(AtomicUsize::new(0));
@@ -3920,6 +3863,4 @@ async fn a_proof_ttl_outside_the_ceiling_fails_locally() {
         .await
         .expect("a TTL at the ceiling admits");
     assert_eq!(calls.load(Ordering::SeqCst), 1, "only the valid TTL called");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }

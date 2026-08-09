@@ -21,6 +21,22 @@ use net::adapter::net::behavior::org_authority::NodeAuthority;
 use net::adapter::net::org_admission_gate::{capture_admission_stamp, verify_provider_authority};
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
 
+// A scratch directory holding an authority's revocation `.lock` sidecar is
+// deliberately LEFT BEHIND when its test finishes.
+//
+// `OrgRevocationStore` keys its PROCESS-GLOBAL core registry by that sidecar's
+// `(device, inode)`, so two path aliases of one sidecar share one live view
+// (AV-9). Deleting the directory frees the inode while this test's core is
+// still registered; Linux recycles a freed inode immediately, so the next store
+// opened anywhere in this binary can land on it, derive the same `BackingId`,
+// and join THIS test's core — inheriting its floors, its poison bit and its
+// generation, and writing through a path that no longer exists
+// (`state lock: No such file or directory`).
+//
+// The victims are whichever tests are scheduled next, so it surfaces as
+// unrelated failures in varying combinations rather than as one deterministic
+// break. Start-of-test resets stay: they run before anything is registered.
+
 const TEST_BUFFER_SIZE: usize = 256 * 1024;
 const PSK: [u8; 32] = [0x42u8; 32];
 
@@ -75,7 +91,7 @@ async fn adopt_and_install(node: &Arc<MeshNode>, tag: &str) -> PathBuf {
 #[tokio::test]
 async fn verify_provider_authority_returns_facts_for_a_healthy_provider() {
     let node = build_node().await;
-    let dir = adopt_and_install(&node, "healthy").await;
+    let _dir = adopt_and_install(&node, "healthy").await;
 
     let facts =
         verify_provider_authority(&node, &ClockSample::now()).expect("healthy provider admits");
@@ -91,8 +107,6 @@ async fn verify_provider_authority_returns_facts_for_a_healthy_provider() {
         facts.stamp.is_current(&capture_admission_stamp(&node)),
         "stamp stable when nothing changed",
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// KC4 (ABA) — ProviderFacts RETAINS the authority and store Arcs
@@ -103,7 +117,7 @@ async fn verify_provider_authority_returns_facts_for_a_healthy_provider() {
 #[tokio::test]
 async fn provider_facts_pins_the_authority_and_store_arcs() {
     let node = build_node().await;
-    let dir = adopt_and_install(&node, "aba-pin").await;
+    let _dir = adopt_and_install(&node, "aba-pin").await;
 
     let authority = node.node_authority().expect("authority");
     let store = node.org_revocation_store().expect("store");
@@ -131,8 +145,6 @@ async fn provider_facts_pins_the_authority_and_store_arcs() {
         store_before,
         "pin released on drop"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Witness 25 seed — an authority-dark node (never adopted) cannot
@@ -166,7 +178,7 @@ async fn stamp_reflects_authority_installation() {
     assert_eq!(before.authority_ptr, 0);
     assert_eq!(before.store_ptr, 0);
 
-    let dir = adopt_and_install(&node, "stamp").await;
+    let _dir = adopt_and_install(&node, "stamp").await;
 
     let after = capture_admission_stamp(&node);
     assert_ne!(after.authority_ptr, 0);
@@ -174,8 +186,6 @@ async fn stamp_reflects_authority_installation() {
     // A stamp captured before installation is NOT current against the
     // installed view — the authority changed.
     assert!(!before.is_current(&after));
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// KC10 negative — a provider whose OWN owner cert has fallen BELOW a
@@ -185,7 +195,7 @@ async fn stamp_reflects_authority_installation() {
 #[tokio::test]
 async fn provider_below_its_own_floor_cannot_admit() {
     let node = build_node().await;
-    let dir = adopt_and_install(&node, "below-floor").await;
+    let _dir = adopt_and_install(&node, "below-floor").await;
     // Healthy first.
     assert!(verify_provider_authority(&node, &ClockSample::now()).is_ok());
 
@@ -203,7 +213,6 @@ async fn provider_below_its_own_floor_cannot_admit() {
         Err(AdmissionDenied::ProviderAuthorityUnavailable),
         "a below-floor owner cert cannot admit",
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// KC10 negative — an EXPIRED provider owner cert cannot admit. The
@@ -258,7 +267,6 @@ async fn provider_with_expired_cert_cannot_admit() {
         Err(AdmissionDenied::ProviderAuthorityUnavailable),
         "an expired owner cert cannot admit",
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// KC10 negative — a POISONED installed store cannot admit: the
@@ -270,7 +278,7 @@ async fn provider_with_expired_cert_cannot_admit() {
 #[tokio::test]
 async fn provider_with_poisoned_store_cannot_admit() {
     let node = build_node().await;
-    let dir = adopt_and_install(&node, "poisoned").await;
+    let _dir = adopt_and_install(&node, "poisoned").await;
     assert!(verify_provider_authority(&node, &ClockSample::now()).is_ok());
 
     node.org_revocation_store()
@@ -284,7 +292,6 @@ async fn provider_with_poisoned_store_cannot_admit() {
     );
     // The live stamp also reflects the poison.
     assert!(capture_admission_stamp(&node).poisoned);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A floor raised through the installed store bumps the store
@@ -294,7 +301,7 @@ async fn provider_with_poisoned_store_cannot_admit() {
 #[tokio::test]
 async fn stamp_notices_a_floor_raise() {
     let node = build_node().await;
-    let dir = adopt_and_install(&node, "floor").await;
+    let _dir = adopt_and_install(&node, "floor").await;
 
     let facts = verify_provider_authority(&node, &ClockSample::now()).expect("healthy");
     let before = facts.stamp;
@@ -317,8 +324,6 @@ async fn stamp_notices_a_floor_raise() {
         after.store_generation > before.store_generation,
         "the store generation advanced",
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// AV-6 item 6: `verify_provider_authority` checks the provider's OWN
@@ -332,7 +337,7 @@ async fn stamp_notices_a_floor_raise() {
 #[tokio::test]
 async fn provider_self_verify_reads_the_supplied_clock_sample() {
     let node = build_node().await;
-    let dir = adopt_and_install(&node, "clock-thread").await;
+    let _dir = adopt_and_install(&node, "clock-thread").await;
 
     // The real clock admits (cert is fresh, valid ~3600s).
     assert!(verify_provider_authority(&node, &ClockSample::now()).is_ok());
@@ -360,6 +365,4 @@ async fn provider_self_verify_reads_the_supplied_clock_sample() {
         verify_provider_authority(&node, &far_past).map(|_| ()),
         Err(AdmissionDenied::ProviderAuthorityUnavailable),
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }

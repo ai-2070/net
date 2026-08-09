@@ -108,6 +108,22 @@ use net::adapter::net::{
 use net::error::AdapterError;
 use tokio::net::UdpSocket;
 
+// A scratch directory holding an authority's revocation `.lock` sidecar is
+// deliberately LEFT BEHIND when its test finishes.
+//
+// `OrgRevocationStore` keys its PROCESS-GLOBAL core registry by that sidecar's
+// `(device, inode)`, so two path aliases of one sidecar share one live view
+// (AV-9). Deleting the directory frees the inode while this test's core is
+// still registered; Linux recycles a freed inode immediately, so the next store
+// opened anywhere in this binary can land on it, derive the same `BackingId`,
+// and join THIS test's core — inheriting its floors, its poison bit and its
+// generation, and writing through a path that no longer exists
+// (`state lock: No such file or directory`).
+//
+// The victims are whichever tests are scheduled next, so it surfaces as
+// unrelated failures in varying combinations rather than as one deterministic
+// break. Start-of-test resets stay: they run before anything is registered.
+
 const PSK: [u8; 32] = [0x42u8; 32];
 const TEST_BUFFER_SIZE: usize = 256 * 1024;
 const DAY: u64 = 24 * 60 * 60;
@@ -263,7 +279,6 @@ async fn wait_until<F: Fn() -> bool>(limit: Duration, cond: F) -> bool {
 /// `NodeAuthority::adopt` would leave the path unowned across exactly
 /// the window where adoption creates the directory and then fails, or
 /// where installation panics — the cases the guard exists for.
-/// `fresh` also carries the startup `remove_dir_all`, which is
 /// crash-residue cleanup: paths are keyed by PID, and a PID reused
 /// after a process abort would otherwise adopt against a stale store.
 struct ScratchDir(std::path::PathBuf);
@@ -290,23 +305,12 @@ impl ScratchDir {
     }
 }
 
-impl Drop for ScratchDir {
-    fn drop(&mut self) {
-        // Not a panic — Drop runs during unwinding, where a second
-        // panic aborts and would eat the original assertion failure.
-        // Surfaced instead: this residue is exactly what a later run
-        // under a reused PID trips over in `fresh`.
-        match std::fs::remove_dir_all(&self.0) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => eprintln!(
-                "scratch store {} not removed on drop ({e}); \
-                 a later run reusing this PID will refuse it",
-                self.0.display()
-            ),
-        }
-    }
-}
+// NO cleanup `Drop`, deliberately — see the note at `ScratchDir`.
+//
+// Freeing this directory's revocation `.lock` inode while the core keyed
+// on it is still live lets the NEXT store in this binary alias it. The
+// residue a reused PID would trip over is handled by `fresh`'s
+// start-of-test reset, which runs before anything is registered.
 
 impl std::ops::Deref for ScratchDir {
     type Target = std::path::Path;

@@ -2774,11 +2774,25 @@ mod tests {
             &self.0
         }
     }
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+
+    // NO `Drop` that deletes this directory, deliberately. The path is already
+    // unique per test through `TEST_DIR_SEQ`, so cleanup would only reclaim
+    // disk — and on unix it would cost far more than it saves.
+    //
+    // An authority dir holds `REVOCATION_STATE_FILE` and its `.lock` sidecar,
+    // and `OrgRevocationStore` keys its PROCESS-GLOBAL core registry by that
+    // sidecar's `(device, inode)` so two path aliases of one sidecar share one
+    // live view (AV-9). Deleting a finished test's directory frees the inode,
+    // Linux reuses a freed inode immediately, and the next store opened
+    // anywhere in this test binary can land on it — deriving the same
+    // `BackingId` and joining the finished test's still-live core by design,
+    // floors, poison bit, generation and exhaustion latch included.
+    //
+    // The victims are whichever tests are scheduled next, so it presents as
+    // unrelated witnesses failing in varying combinations rather than as one
+    // deterministic break. It did exactly that to the `org_routing_wiring_tests`
+    // witnesses on Linux CI, which share this test binary; that fixture and
+    // `org_revocation`'s carry the same note and the same fix.
 
     /// Run `body` in an ISOLATED child process so process-global state it
     /// mutates — the `umask` and the current directory — cannot contaminate the
