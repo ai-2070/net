@@ -216,19 +216,23 @@ describe('live nRPC registration through the Node binding', () => {
     //
     // Draining is what you would write, and it is what this test did
     // first. It hangs — but only when a `callStreaming` has already
-    // completed earlier in the same process. Both response paths go
-    // through the same streaming-response bridge, and something in it
-    // survives the first call and stops the second call's terminal
-    // frame from reaching the client; the chunks still arrive, only
-    // the End does not. Registering a server-streaming handler is
-    // harmless, so it is the completed call that does it.
+    // completed earlier in the same process. The chunks still arrive;
+    // only the terminal frame does not.
     //
-    // That is a real defect and it is not this one — decision 1 is
-    // about registration reaching an entered runtime, which the
-    // chunks arriving already proves. Asserting EOF here would tie
-    // this witness to an unrelated bug; asserting the chunks holds
-    // the line without pretending the bug is absent. Filed for
-    // separate investigation.
+    // Narrowed since: registering a server-streaming handler is
+    // harmless, so it is the completed call. A completed
+    // `callClientStream` before a duplex call is also harmless, so it
+    // is specifically the server-streaming response path. And the
+    // substrate is not at fault — `a_completed_streaming_call_does_not
+    // _disturb_a_later_duplex` in `tests/integration_nrpc_duplex.rs`
+    // runs the same sequence against core, with one node pair and with
+    // two, and passes. That leaves this binding layer.
+    //
+    // Not fixed, and not this decision's subject: decision 1 is about
+    // registration reaching an entered runtime, which the chunks
+    // arriving already proves. Asserting EOF here would tie the
+    // witness to an unrelated defect; asserting the chunks holds the
+    // line without pretending the defect is absent.
     const got: string[] = []
     for (let i = 0; i < 2; i += 1) {
       const chunk = await call.next()
