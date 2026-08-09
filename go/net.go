@@ -429,6 +429,13 @@ type PollOptions struct {
 
 	// Filter is a JSON predicate object, e.g.
 	// `{"path":"kind","value":"lidar"}`. Empty means no filter.
+	//
+	// Embedded verbatim into the request, so it must be a
+	// well-formed JSON *object*. PollWith checks that before the cgo
+	// call: a malformed value would otherwise splice into the request
+	// body and come back as a generic InvalidJson naming nothing —
+	// and a bare scalar or array would reach a parser that only
+	// accepts an object.
 	Filter string
 
 	// Shards restricts the poll to specific shard ids. Nil means all
@@ -442,6 +449,9 @@ type PollOptions struct {
 var OrderingModes = []string{"none", "insertion_ts"}
 
 func (o *PollOptions) validate() error {
+	if err := o.validateFilter(); err != nil {
+		return err
+	}
 	if o.Ordering == "" {
 		return nil
 	}
@@ -454,6 +464,35 @@ func (o *PollOptions) validate() error {
 		"invalid ordering %q: use one of %v (values are case-sensitive)",
 		o.Ordering, OrderingModes,
 	)
+}
+
+// validateFilter rejects a Filter that is not a well-formed JSON
+// object.
+//
+// Filter is spliced into the request body verbatim — it has to be, so
+// the C parser receives a nested object rather than a string. That
+// makes it the one PollOptions field where a bad value corrupts the
+// whole request instead of just itself: `{"path":` produces malformed
+// JSON, and `"lidar"` or `[1,2]` produce well-formed JSON the parser
+// then refuses. Both come back as a bare InvalidJson that names
+// nothing, and Ordering already refuses its bad values here by name.
+func (o *PollOptions) validateFilter() error {
+	if o.Filter == "" {
+		return nil
+	}
+	var probe map[string]interface{}
+	if err := json.Unmarshal([]byte(o.Filter), &probe); err != nil {
+		return fmt.Errorf(
+			"invalid filter %q: must be a JSON object such as "+
+				`{"path":"kind","value":"lidar"}: %w`,
+			o.Filter, err,
+		)
+	}
+	if probe == nil {
+		// `null` unmarshals into a nil map without error.
+		return fmt.Errorf("invalid filter %q: must be a JSON object, not null", o.Filter)
+	}
+	return nil
 }
 
 // Poll retrieves events from the bus.

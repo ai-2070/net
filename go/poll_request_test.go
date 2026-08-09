@@ -121,3 +121,59 @@ func TestPollOptions_EmptyOrderingIsTheDefault(t *testing.T) {
 		t.Fatalf("unset ordering must be omitted, got %v", got)
 	}
 }
+
+// A malformed Filter must be refused by name, before the cgo call.
+//
+// Filter is spliced into the request body verbatim — it has to be, so
+// the C parser receives a nested object rather than a string. That
+// makes it the one PollOptions field where a bad value corrupts the
+// whole request rather than just itself: `{"path":` yields malformed
+// JSON, and `"lidar"` or `[1,2]` yield well-formed JSON the parser then
+// refuses. Both came back as a bare InvalidJson naming nothing, while
+// Ordering next to it already refused its bad values by name.
+func TestPollOptions_RejectsMalformedFilter(t *testing.T) {
+	for _, bad := range []string{
+		`{"path":`,                 // truncated — corrupts the request
+		`{"path":"kind",}`,         // trailing comma
+		`"lidar"`,                  // a scalar, not an object
+		`[{"path":"kind"}]`,        // an array, not an object
+		`42`,                       // a number
+		`null`,                     // unmarshals to a nil map, no error
+		`{"path":"kind"} trailing`, // junk after the object
+	} {
+		opts := PollOptions{Limit: 10, Filter: bad}
+		err := opts.validate()
+		if err == nil {
+			t.Fatalf("filter %q must be rejected", bad)
+		}
+		// The message has to name the field and the value — the point
+		// of checking here rather than letting C answer.
+		if !strings.Contains(err.Error(), "filter") {
+			t.Fatalf("error must name the filter, got %v", err)
+		}
+	}
+}
+
+func TestPollOptions_AcceptsWellFormedFilter(t *testing.T) {
+	for _, ok := range []string{
+		`{}`,
+		`{"path":"kind","value":"lidar"}`,
+		`{"and":[{"path":"a","value":1},{"path":"b","value":2}]}`,
+	} {
+		opts := PollOptions{Limit: 10, Filter: ok}
+		if err := opts.validate(); err != nil {
+			t.Fatalf("filter %q must be accepted, got %v", ok, err)
+		}
+	}
+
+	// And an accepted filter still lands in the request as a nested
+	// object, not a string.
+	got := decode(t, PollOptions{Limit: 10, Filter: `{"path":"kind","value":"lidar"}`})
+	filter, isObject := got["filter"].(map[string]any)
+	if !isObject {
+		t.Fatalf("filter must be embedded as an object, got %T", got["filter"])
+	}
+	if filter["path"] != "kind" {
+		t.Fatalf("filter contents must survive, got %v", filter)
+	}
+}

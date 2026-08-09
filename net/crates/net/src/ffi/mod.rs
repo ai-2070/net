@@ -1108,11 +1108,19 @@ fn parse_poll_request_json(json_str: &str) -> Result<ConsumeRequest, c_int> {
     let value: serde_json::Value =
         serde_json::from_str(json_str).map_err(|_| c_int::from(NetError::InvalidJson))?;
 
-    if let Some(obj) = value.as_object() {
-        for key in obj.keys() {
-            if !POLL_REQUEST_KEYS.contains(&key.as_str()) {
-                return Err(NetError::InvalidJson.into());
-            }
+    // A poll request is an object. `if let Some(obj)` skipped the whole
+    // unknown-key check for anything else, and every `value.get(...)`
+    // below returns `None` on a non-object — so `[]`, `"limit"` and
+    // `42` all parsed as a fully-default request and returned events
+    // the caller never asked for, with a success code. That is the same
+    // "accepted and ignored" failure the unknown-key check exists to
+    // stop, one level up.
+    let Some(obj) = value.as_object() else {
+        return Err(NetError::InvalidJson.into());
+    };
+    for key in obj.keys() {
+        if !POLL_REQUEST_KEYS.contains(&key.as_str()) {
+            return Err(NetError::InvalidJson.into());
         }
     }
 
@@ -2288,6 +2296,38 @@ mod tests {
                 "unknown key must be rejected: {bad}"
             );
         }
+    }
+
+    /// A request that is not an object at all is refused too.
+    ///
+    /// The unknown-key check ran under `if let Some(obj)`, and every
+    /// field read below it returns `None` on a non-object — so `[]`,
+    /// `"limit"` and `42` were each accepted as a fully-default request
+    /// and answered with events the caller never asked for, under a
+    /// success code. That is the same "accepted and ignored" shape the
+    /// unknown-key check exists to stop, one level up from it.
+    ///
+    /// An empty object is still a valid request: every key is optional.
+    #[test]
+    fn poll_request_requires_a_json_object() {
+        for bad in [
+            "[]",
+            r#"[{"limit":10}]"#,
+            r#""limit""#,
+            "42",
+            "true",
+            "null",
+        ] {
+            assert!(
+                parse_poll_request_json(bad).is_err(),
+                "a non-object request must be rejected, not read as \
+                 defaults: {bad}"
+            );
+        }
+
+        let req = parse_poll_request_json("{}").expect("an empty object is all-defaults");
+        assert_eq!(req.limit, 100);
+        assert_eq!(req.from_id, None);
     }
 
     /// Filter and shard selection were feature gaps rather than
