@@ -632,21 +632,16 @@ async fn duplex_window_grant_unblocks_blocked_send() {
 /// `call_duplex` — including across a different pair of nodes in the
 /// same process.
 ///
-/// This exists because that sequence DOES break through the Node
-/// binding: the duplex call receives its chunks and never its terminal
-/// frame, so a drain-to-EOF loop hangs
-/// (`bindings/node/test/mesh_rpc_live.test.ts` reads a bounded chunk
-/// count instead, with the reasoning at the assertion). Registering a
-/// server-streaming handler is harmless; it is the completed call that
-/// does it, and only server-streaming — client-streaming before duplex
-/// is fine.
+/// Written while chasing a terminal-frame stall that presented as
+/// exactly this sequence breaking through the Node binding. It was not
+/// the substrate — this passed then and passes now, with one pair and
+/// with two — which is what localised the defect to the napi layer,
+/// where the JS-side response sink was being released by garbage
+/// collection rather than when the handler finished.
 ///
-/// Both response paths run through the same streaming-response bridge,
-/// so the substrate was the first suspect. It is not: this passes, with
-/// one pair and with two, which puts the defect above core and leaves
-/// the napi layer holding it. Kept as the standing statement of that,
-/// so a future change that breaks the core sequence fails here rather
-/// than being mistaken for the binding defect.
+/// Kept because that is worth stating permanently: if a future change
+/// does break the core sequence, it fails here on its own terms rather
+/// than being mistaken for a binding problem.
 #[tokio::test]
 async fn a_completed_streaming_call_does_not_disturb_a_later_duplex() {
     use net::adapter::net::cortex::RpcStreamingHandler;

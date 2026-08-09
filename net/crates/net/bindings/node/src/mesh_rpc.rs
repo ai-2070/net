@@ -1425,10 +1425,24 @@ impl RpcStreamingHandler for NodeStreamingRpcHandler {
         ctx: RpcContext,
         sink: InnerRpcResponseSink,
     ) -> std::result::Result<(), RpcHandlerError> {
+        // Keep our own handle on the sink slot.
+        //
+        // Everything below hands `JsResponseSink` to JS, and JS is the
+        // only owner from then on. A `#[napi]` class is released by V8
+        // finalization, not by scope, so the inner
+        // `RpcResponseSink` — whose drop is what tells the substrate
+        // fold the response side is done — survived until a garbage
+        // collection happened to run. The handler returned in 0 ms and
+        // the caller saw the terminal frame seconds later, quantised to
+        // GC cycles: measured at 7.6 s, 7.7 s and 15.8 s on loopback,
+        // and unaffected by mesh traffic, because GC is not driven by
+        // the mesh. Retaining the slot lets us drop it ourselves the
+        // moment the handler's promise settles.
+        let sink_slot = Arc::new(Mutex::new(Some(sink)));
         let args = StreamingHandlerArgs {
             req: Buffer::from(ctx.payload.body.to_vec()),
             sink: JsResponseSink {
-                inner: Arc::new(Mutex::new(Some(sink))),
+                inner: sink_slot.clone(),
             },
         };
         let (tx, rx) = tokio::sync::oneshot::channel::<napi::Result<Promise<Buffer>>>();
@@ -1467,7 +1481,12 @@ impl RpcStreamingHandler for NodeStreamingRpcHandler {
                 )))
             }
         };
-        match tokio::time::timeout_at(deadline, promise).await {
+        let settled = tokio::time::timeout_at(deadline, promise).await;
+        // The handler is done with the sink the instant its promise
+        // settles, whichever way it settled. Drop it here rather than
+        // waiting for V8 to collect the JS-side wrapper.
+        drop(sink_slot.lock().take());
+        match settled {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(e)) => {
                 let msg: String = format!("{e}");
@@ -1592,6 +1611,20 @@ impl RpcDuplexHandler for NodeDuplexRpcHandler {
         requests: InnerRequestStream,
         responses: InnerRpcResponseSink,
     ) -> std::result::Result<(), RpcHandlerError> {
+        // Keep our own handle on the sink slot.
+        //
+        // Everything below hands `JsResponseSink` to JS, and JS is the
+        // only owner from then on. A `#[napi]` class is released by V8
+        // finalization, not by scope, so the inner
+        // `RpcResponseSink` — whose drop is what tells the substrate
+        // fold the response side is done — survived until a garbage
+        // collection happened to run. The handler returned in 0 ms and
+        // the caller saw the terminal frame seconds later, quantised to
+        // GC cycles: measured at 7.6 s, 7.7 s and 15.8 s on loopback,
+        // and unaffected by mesh traffic, because GC is not driven by
+        // the mesh. Retaining the slot lets us drop it ourselves the
+        // moment the handler's promise settles.
+        let sink_slot = Arc::new(Mutex::new(Some(responses)));
         let args = DuplexHandlerArgs {
             stream: JsRequestStream {
                 inner: Arc::new(tokio::sync::Mutex::new(Some(requests))),
@@ -1601,7 +1634,7 @@ impl RpcDuplexHandler for NodeDuplexRpcHandler {
                 headers: Arc::new(ctx.headers),
             },
             sink: JsResponseSink {
-                inner: Arc::new(Mutex::new(Some(responses))),
+                inner: sink_slot.clone(),
             },
         };
         let (tx, rx) = tokio::sync::oneshot::channel::<napi::Result<Promise<Buffer>>>();
@@ -1641,7 +1674,12 @@ impl RpcDuplexHandler for NodeDuplexRpcHandler {
                 )))
             }
         };
-        match tokio::time::timeout_at(deadline, promise).await {
+        let settled = tokio::time::timeout_at(deadline, promise).await;
+        // See the streaming handler: drop the sink as soon as the
+        // handler is done with it, so the fold's terminal frame does
+        // not wait on a garbage collection.
+        drop(sink_slot.lock().take());
+        match settled {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(e)) => {
                 let msg: String = format!("{e}");

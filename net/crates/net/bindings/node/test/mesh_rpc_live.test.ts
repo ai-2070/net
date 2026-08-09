@@ -34,26 +34,14 @@ type Rpc = any
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
-// Each case gets its own PSK, so it gets its own mesh.
-//
-// `MeshRpc.close()` now releases the node reference, so `shutdown()`
-// succeeds and nothing survives a case — but the isolation stays. It
-// costs nothing, and it keeps a failure in one case from showing up as
-// a hang in another, which is how the duplex defect below first
-// presented.
+// Each case gets its own PSK, so it gets its own mesh. It costs
+// nothing and keeps a failure in one case from surfacing as a hang in
+// another, which is how the terminal-frame defect first presented.
 let pskCounter = 0
 const nextPsk = () => (pskCounter += 1).toString(16).padStart(2, '0').repeat(32)
 
 const meshes: Mesh[] = []
 const rpcs: Rpc[] = []
-
-/// Set by a case that knowingly leaves a node reference behind.
-///
-/// `afterEach` asserts shutdown succeeds, because a shutdown that
-/// silently cannot run leaves live nodes behind — which is what made
-/// this suite order-dependent before `MeshRpc.close()` existed. One
-/// case opts out, and says why at the opt-out.
-let tolerateShutdownFailure = false
 
 async function node(psk: string): Promise<Mesh> {
   const mesh = await NetMesh.create({ bindAddr: '127.0.0.1:0', psk })
@@ -105,13 +93,7 @@ afterEach(async () => {
   // envelope holds an `Arc<MeshNode>` and `shutdown()` needs sole
   // ownership.
   rpcs.splice(0).forEach((rpc) => rpc.close())
-  const tolerate = tolerateShutdownFailure
-  tolerateShutdownFailure = false
-  await Promise.all(
-    meshes
-      .splice(0)
-      .map((m) => (tolerate ? m.shutdown().catch(() => {}) : m.shutdown())),
-  )
+  await Promise.all(meshes.splice(0).map((m) => m.shutdown()))
 })
 
 describe('live nRPC registration through the Node binding', () => {
@@ -211,53 +193,14 @@ describe('live nRPC registration through the Node binding', () => {
     await call.send(Buffer.from('two'))
     await call.finishSending()
 
-    // Read exactly as many chunks as were sent, rather than draining
-    // to EOF.
-    //
-    // Draining is what you would write, and it is what this test did
-    // first. It hangs — but only when a `callStreaming` has already
-    // completed earlier in the same process. The chunks still arrive;
-    // only the terminal frame does not.
-    //
-    // Narrowed since: registering a server-streaming handler is
-    // harmless, so it is the completed call. A completed
-    // `callClientStream` before a duplex call is also harmless, so it
-    // is specifically the server-streaming response path. And the
-    // substrate is not at fault — `a_completed_streaming_call_does_not
-    // _disturb_a_later_duplex` in `tests/integration_nrpc_duplex.rs`
-    // runs the same sequence against core, with one node pair and with
-    // two, and passes. That leaves this binding layer.
-    //
-    // Not fixed, and not this decision's subject: decision 1 is about
-    // registration reaching an entered runtime, which the chunks
-    // arriving already proves. Asserting EOF here would tie the
-    // witness to an unrelated defect; asserting the chunks holds the
-    // line without pretending the defect is absent.
     const got: string[] = []
-    for (let i = 0; i < 2; i += 1) {
-      const chunk = await call.next()
-      expect(chunk).not.toBeNull()
-      got.push(chunk.toString())
+    for (let c = await call.next(); c !== null; c = await call.next()) {
+      got.push(c.toString())
     }
     expect(got).toEqual(['re:one', 're:two'])
 
     await call.close()
     handle.close()
-
-    // Even so, this case cannot shut its nodes down.
-    //
-    // `MeshRpc.close()` releases the envelope's reference and the call
-    // above releases its own, but something on the server side of an
-    // un-drained duplex call still holds one — most likely the
-    // handler's `JsRequestStream` / `JsResponseSink`, which are
-    // arguments the caller never owns and so has no way to release.
-    // Every other case here shuts down cleanly, so the strict
-    // assertion stays on for them; this one opts out rather than
-    // pretending the reference is gone.
-    //
-    // It is downstream of the same un-drained call the note above is
-    // about. Both belong to the duplex-termination investigation.
-    tolerateShutdownFailure = true
   }, 30_000)
 
   it('all four shapes register on one MeshRpc', async () => {
