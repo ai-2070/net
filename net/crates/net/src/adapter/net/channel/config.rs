@@ -2792,7 +2792,11 @@ mod tests {
     #[test]
     fn rpc_service_defaults_never_expose_an_unbound_reply_window() {
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
-        use std::sync::{Arc as StdArc, Mutex as StdMutex};
+        // `parking_lot::Mutex`, per the crate's `disallowed_methods`
+        // lint — `std::sync::Mutex::lock` returns a poisoning `Result`
+        // this test has no meaningful way to handle.
+        use parking_lot::Mutex as StdMutex;
+        use std::sync::Arc as StdArc;
 
         // The observer has to watch registries that are actively being
         // populated. Watching one already-installed registry sees the
@@ -2814,7 +2818,7 @@ mod tests {
             std::thread::spawn(move || {
                 while !stop.load(AtomicOrdering::Relaxed) {
                     let reg = {
-                        let guard = current.lock().expect("registry slot");
+                        let guard = current.lock();
                         StdArc::clone(&guard)
                     };
                     // Read the REQUEST first, then the reply. Entries
@@ -2839,7 +2843,7 @@ mod tests {
         for _ in 0..20_000 {
             let fresh = StdArc::new(ChannelConfigRegistry::new());
             {
-                let mut guard = current.lock().expect("registry slot");
+                let mut guard = current.lock();
                 *guard = StdArc::clone(&fresh);
             }
             fresh.install_rpc_service_defaults("svc").expect("install");
