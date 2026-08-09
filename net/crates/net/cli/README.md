@@ -30,10 +30,12 @@ The crate is `net-cli` but the binary it installs is **`net-mesh`**. Prebuilt ta
 # Generate an operator identity (ed25519 seed + pubkey + fingerprint)
 net-mesh identity generate --out ~/.config/net-mesh/identity.toml
 
-# One-shot snapshot read (auto-formatted JSON for non-TTY, table for TTY)
-net-mesh snapshot get
+# One-shot snapshot of the supervisor this command starts. `--local` is
+# required: it cannot attach to a running deployment, so without the flag it
+# refuses rather than printing an empty snapshot that looks like a live read.
+net-mesh snapshot get --local
 # ...or just the peer / daemon counts and health rollup
-net-mesh snapshot status
+net-mesh snapshot status --local
 
 # Tail substrate logs as ndjson, follow mode, filtered to one daemon
 net-mesh log tail --daemon 0x000007 --follow --output ndjson
