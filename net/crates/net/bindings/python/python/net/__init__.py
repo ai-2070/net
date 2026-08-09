@@ -234,6 +234,7 @@ try:
         normalize_gpu_vendor,
         parse_token,
         token_is_expired,
+        verify_signature,
         verify_token,
     )
 except ImportError:
@@ -249,6 +250,7 @@ else:
             "normalize_gpu_vendor",
             "parse_token",
             "token_is_expired",
+            "verify_signature",
             "verify_token",
         ]
     )

@@ -4885,11 +4885,38 @@ mod tests {
         }
     }
 
-    /// An unknown modality must reject the whole announcement rather
-    /// than being dropped from it. Dropping produced a set the caller
-    /// believed declared `audio` and which silently did not, so a
-    /// scheduler matched on the difference and the operator had no
-    /// signal.
+    /// Call `net_verify_signature` the way C does, and read
+    /// `*out_valid`.
+    ///
+    /// The tests below went through `EntityId::verify_bytes` instead,
+    /// which is the layer *underneath* the export — so the null guards,
+    /// the 64-byte length check, the zero-length message branch and the
+    /// `out_valid` write were all unexercised. That is the same shape of
+    /// gap the export exists to close: the binding tests asserted the
+    /// signature's *length*, which passes for any 64 bytes.
+    fn abi_verify(entity_id: &[u8], msg: &[u8], sig: &[u8]) -> (c_int, c_int) {
+        let mut valid: c_int = -1;
+        let rc = unsafe {
+            net_verify_signature(
+                entity_id.as_ptr(),
+                entity_id.len(),
+                // A zero-length slice's `as_ptr` is a dangling non-null
+                // pointer; pass a real NULL so the empty-message branch
+                // is what C would actually hit.
+                if msg.is_empty() {
+                    std::ptr::null()
+                } else {
+                    msg.as_ptr()
+                },
+                msg.len(),
+                sig.as_ptr(),
+                sig.len(),
+                &mut valid,
+            )
+        };
+        (rc, valid)
+    }
+
     /// Sign then verify, through the C ABI, in one round trip.
     ///
     /// Every binding exposed `sign` and none exposed verification for
@@ -4902,25 +4929,29 @@ mod tests {
         use crate::adapter::net::identity::EntityKeypair;
 
         let keypair = EntityKeypair::generate();
-        let entity = keypair.entity_id();
+        let entity = keypair.entity_id().as_bytes().to_vec();
         let message = b"the exact bytes that were signed";
         let sig = keypair.sign(message).to_bytes();
 
-        assert!(
-            entity.verify_bytes(message, &sig).is_ok(),
+        assert_eq!(
+            abi_verify(&entity, message, &sig),
+            (0, 1),
             "a freshly produced signature must verify",
         );
 
-        // Wrong message.
-        assert!(
-            entity.verify_bytes(b"different bytes", &sig).is_err(),
+        // Wrong message. `rc == 0` with `valid == 0` is the contract:
+        // "did not verify", never "called wrong".
+        assert_eq!(
+            abi_verify(&entity, b"different bytes", &sig),
+            (0, 0),
             "a signature must not verify against another message",
         );
 
         // Wrong key.
         let other = EntityKeypair::generate();
-        assert!(
-            other.entity_id().verify_bytes(message, &sig).is_err(),
+        assert_eq!(
+            abi_verify(other.entity_id().as_bytes(), message, &sig),
+            (0, 0),
             "a signature must not verify under another entity",
         );
 
@@ -4928,20 +4959,123 @@ mod tests {
         // length-only assertions would have accepted.
         let mut bad = sig;
         bad[0] ^= 0xff;
-        assert!(entity.verify_bytes(message, &bad).is_err());
-        assert!(entity.verify_bytes(message, &[0u8; 64]).is_err());
+        assert_eq!(abi_verify(&entity, message, &bad), (0, 0));
+        assert_eq!(
+            abi_verify(&entity, message, &[0u8; 64]),
+            (0, 0),
+            "64 zero bytes is the signature a length check accepts",
+        );
     }
 
     /// An empty message is a legitimate thing to sign, and the ABI's
     /// null-pointer guard must not confuse "zero-length" with
     /// "missing".
+    ///
+    /// `msg == NULL` with `msg_len == 0` must succeed, because that is
+    /// what a C caller with no message has to pass.
     #[test]
     fn verify_signature_handles_an_empty_message() {
         use crate::adapter::net::identity::EntityKeypair;
 
         let keypair = EntityKeypair::generate();
+        let entity = keypair.entity_id().as_bytes().to_vec();
         let sig = keypair.sign(b"").to_bytes();
-        assert!(keypair.entity_id().verify_bytes(b"", &sig).is_ok());
+
+        assert_eq!(
+            abi_verify(&entity, b"", &sig),
+            (0, 1),
+            "a NULL message with length 0 is an empty message, not a \
+             missing argument",
+        );
+        // And it must not verify some other message's signature.
+        let other_sig = keypair.sign(b"not empty").to_bytes();
+        assert_eq!(abi_verify(&entity, b"", &other_sig), (0, 0));
+    }
+
+    /// Malformed arguments return a negative code and never claim a
+    /// verdict.
+    ///
+    /// The split matters: `0` with `*out_valid == 0` means the
+    /// signature did not verify, and a caller that cannot tell that
+    /// from "you passed a 63-byte signature" will treat a bug as a
+    /// failed check.
+    #[test]
+    fn verify_signature_rejects_malformed_arguments() {
+        use crate::adapter::net::identity::EntityKeypair;
+
+        let keypair = EntityKeypair::generate();
+        let entity = keypair.entity_id().as_bytes().to_vec();
+        let msg = b"payload";
+        let sig = keypair.sign(msg).to_bytes();
+
+        // Wrong entity-id length, both directions.
+        for bad_id_len in [0usize, 31, 33] {
+            let bad_id = vec![0u8; bad_id_len];
+            let (rc, _) = abi_verify(&bad_id, msg, &sig);
+            assert_eq!(
+                rc, NET_ERR_IDENTITY,
+                "a {bad_id_len}-byte entity id must be refused",
+            );
+        }
+
+        // Wrong signature length, both directions.
+        for bad_sig_len in [0usize, 63, 65] {
+            let bad_sig = vec![0u8; bad_sig_len];
+            let (rc, _) = abi_verify(&entity, msg, &bad_sig);
+            assert_eq!(
+                rc, NET_ERR_IDENTITY,
+                "a {bad_sig_len}-byte signature must be refused",
+            );
+        }
+
+        // NULL out_valid: nowhere to write the verdict, so the call
+        // cannot report anything and must say so.
+        let rc = unsafe {
+            net_verify_signature(
+                entity.as_ptr(),
+                entity.len(),
+                msg.as_ptr(),
+                msg.len(),
+                sig.as_ptr(),
+                sig.len(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, c_int::from(NetError::NullPointer));
+
+        // NULL signature, and a NULL message with a non-zero length —
+        // the latter is the case the `msg_len > 0` guard exists for.
+        let mut valid: c_int = -1;
+        let rc = unsafe {
+            net_verify_signature(
+                entity.as_ptr(),
+                entity.len(),
+                msg.as_ptr(),
+                msg.len(),
+                std::ptr::null(),
+                64,
+                &mut valid,
+            )
+        };
+        assert_eq!(rc, c_int::from(NetError::NullPointer));
+
+        let rc = unsafe {
+            net_verify_signature(
+                entity.as_ptr(),
+                entity.len(),
+                std::ptr::null(),
+                7,
+                sig.as_ptr(),
+                sig.len(),
+                &mut valid,
+            )
+        };
+        assert_eq!(
+            rc,
+            c_int::from(NetError::NullPointer),
+            "a NULL message with a non-zero length must not be \
+             dereferenced",
+        );
     }
 
     /// A wildcard grant must survive the C/Go boundary in both

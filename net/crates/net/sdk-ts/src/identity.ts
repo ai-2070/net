@@ -32,6 +32,7 @@ import {
   delegateToken as napiDelegateToken,
   parseToken as napiParseToken,
   tokenIsExpired as napiTokenIsExpired,
+  verifySignature as napiVerifySignature,
   verifyToken as napiVerifyToken,
 } from '@net-mesh/core';
 
@@ -376,6 +377,16 @@ export class Identity {
     return this.inner.sign(message);
   }
 
+  /**
+   * Verify a detached signature this identity produced.
+   *
+   * Convenience for `verifySignature(this.entityId, message, signature)`
+   * — see that function for the argument rules.
+   */
+  verify(message: Buffer, signature: Buffer): boolean {
+    return verifySignature(this.entityId, message, signature);
+  }
+
   /** Issue a scoped token to another entity. */
   issueToken(opts: IssueTokenOptions): Token {
     for (const s of opts.scope) {
@@ -435,6 +446,31 @@ export class Identity {
  */
 export function channelHash(channel: string): bigint {
   return runMapped(() => napiChannelHash(channel));
+}
+
+/**
+ * Verify a detached ed25519 signature against a 32-byte entity id.
+ *
+ * The verifying half of `Identity.sign`. This SDK exposed signing and
+ * no way to check the result, which is the gap the native
+ * `verifySignature` export closed for C, Go, Node and Python — the
+ * wrapper is the last surface to get it.
+ *
+ * Strict verification: the malleable `(R, S + L)` variant is rejected,
+ * so one logical message cannot appear under two byte encodings.
+ *
+ * Returns `true` when the signature is valid for this exact
+ * `(entityId, message)` pair and `false` when it is not. Throws
+ * `IdentityError` only on a malformed argument — a wrong-length entity
+ * id or signature — so `false` means "this did not verify", never
+ * "you called it wrong".
+ */
+export function verifySignature(
+  entityId: Buffer,
+  message: Buffer,
+  signature: Buffer,
+): boolean {
+  return runMapped(() => napiVerifySignature(entityId, message, signature));
 }
 
 /**

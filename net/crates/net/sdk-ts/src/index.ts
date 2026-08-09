@@ -115,6 +115,7 @@ export {
   TokenError,
   channelHash,
   delegateToken,
+  verifySignature,
 } from './identity';
 export type { TokenScope, TokenErrorKind, IssueTokenOptions } from './identity';
 

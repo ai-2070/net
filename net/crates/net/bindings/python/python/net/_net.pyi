@@ -1102,6 +1102,20 @@ def verify_token(token: bytes) -> bool:
     check time-bound validity — see :func:`token_is_expired`."""
     ...
 
+def verify_signature(entity_id: bytes, message: bytes, signature: bytes) -> bool:
+    """Verify a detached ed25519 signature against a 32-byte entity id.
+
+    The verifying half of :meth:`Identity.sign`. Strict verification:
+    the malleable ``(R, S + L)`` variant is rejected, so one logical
+    message cannot appear under two byte encodings.
+
+    ``True`` when the signature is valid for this exact
+    ``(entity_id, message)`` pair, ``False`` when it is not. Raises
+    :class:`IdentityError` only on a malformed argument — a
+    wrong-length entity id or signature — so ``False`` means "this did
+    not verify", never "you called it wrong"."""
+    ...
+
 def token_is_expired(token: bytes) -> bool:
     """``True`` if the token's ``not_after`` has passed (host
     wall-clock)."""
