@@ -1188,6 +1188,18 @@ mod mesh_bindings {
         /// at construction; `register_channel` inserts into this same
         /// Arc so the core's membership-ACL path sees every add.
         channel_configs: Arc<ChannelConfigRegistry>,
+        /// Which shard `poll` starts its sweep from, advanced once per
+        /// call.
+        ///
+        /// Starting at 0 every time and stopping at `limit` is the
+        /// shard-0 bug in a thinner disguise: a busy shard 0 that can
+        /// fill the limit alone means shards 1..n are never reached, so
+        /// a quiet stream on shard 3 stays invisible for as long as
+        /// shard 0 is saturated. Rotating bounds that wait at
+        /// `num_shards` calls.
+        ///
+        /// `Relaxed`: a fairness hint, not a synchronization point.
+        recv_cursor: Arc<std::sync::atomic::AtomicU16>,
     }
 
     /// Build the core `MatchCriteria` from flat Python kwargs (so callers
@@ -1512,6 +1524,7 @@ mod mesh_bindings {
                 #[cfg(feature = "org")]
                 subnet_exports: subnet_exports_map,
                 channel_configs,
+                recv_cursor: Arc::new(std::sync::atomic::AtomicU16::new(0)),
             })
         }
 
@@ -1874,14 +1887,27 @@ mod mesh_bindings {
         /// shards a caller silently saw only the stream ids congruent
         /// to 0 — three quarters of ordinary stream ids were
         /// unreadable through this binding.
+        ///
+        /// The sweep starts from a rotating shard, so no shard can be
+        /// starved by a busier one and events are not returned in
+        /// shard order.
         fn poll(&self, limit: usize) -> PyResult<Vec<StoredEvent>> {
             let node = self.get_node()?;
             let shards = node.num_shards().max(1);
+            // Rotate the starting shard so a saturated shard 0 cannot
+            // starve the rest — see `recv_cursor`. Events therefore
+            // arrive in no fixed shard order; use `poll_shard` with
+            // `shard_for_stream` when a specific stream is wanted.
+            let start = self
+                .recv_cursor
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                % shards;
             let mut events = Vec::new();
-            for shard in 0..shards {
+            for offset in 0..shards {
                 if events.len() >= limit {
                     break;
                 }
+                let shard = (start + offset) % shards;
                 let remaining = limit - events.len();
                 let result = self
                     .runtime

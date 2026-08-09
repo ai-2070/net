@@ -34,6 +34,7 @@
 //! ```
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU16, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -432,6 +433,7 @@ impl MeshBuilder {
         Ok(Mesh {
             node: Arc::new(node),
             channel_configs,
+            recv_cursor: Arc::new(AtomicU16::new(0)),
             identity: sdk_identity,
             #[cfg(feature = "tool")]
             tool_metadata_fetch: Arc::new(parking_lot::Mutex::new(None)),
@@ -459,6 +461,20 @@ pub struct Mesh {
     /// so `register_channel` / subscriber ACL checks operate on the
     /// same live data.
     channel_configs: Arc<ChannelConfigRegistry>,
+    /// Which shard [`Mesh::recv`] starts its sweep from, advanced once
+    /// per call.
+    ///
+    /// Without it, `recv` always starts at shard 0 and stops once it
+    /// has `limit` events — so a continuously-fed shard 0 means shards
+    /// 1..n are never reached. That is the same starvation as the
+    /// shard-0-only bug this replaced, just needing sustained load to
+    /// show up. Rotating the start makes every shard the head of the
+    /// sweep within `num_shards` calls.
+    ///
+    /// `Relaxed`: a fairness hint, not a synchronization point. Two
+    /// concurrent `recv`s racing to the same start offset costs one
+    /// round of fairness, nothing more.
+    recv_cursor: Arc<AtomicU16>,
     /// Held onto so the caller's `TokenCache` (and future capability
     /// announcement state) stays alive for the mesh's lifetime —
     /// `MeshNode` was already handed a clone of the keypair, so this
@@ -704,15 +720,30 @@ impl Mesh {
     /// doc comment already claimed all shards; the body now matches
     /// it.
     ///
+    /// **The sweep starts from a rotating shard**, advanced once per
+    /// call. Starting at 0 every time and stopping at `limit` is the
+    /// same starvation in a thinner disguise: a continuously-fed shard
+    /// 0 that can fill the limit alone means shards 1..n are never
+    /// reached, so a quiet stream on shard 3 stays invisible for as
+    /// long as shard 0 keeps up. Rotating bounds that wait at
+    /// `num_shards` calls.
+    ///
+    /// A consequence worth knowing: events are not returned in shard
+    /// order, and the shard a sweep starts from changes between calls.
     /// Use [`Self::recv_shard`] with [`Self::shard_for_stream`] when
     /// you want one specific stream and not a merge.
     pub async fn recv(&self, limit: usize) -> Result<Vec<StoredEvent>> {
         let shards = self.node.num_shards().max(1);
+        // `fetch_add` wraps at u16::MAX; `start` is reduced modulo
+        // `shards` at use, so a wrap costs at most one round of
+        // fairness — the same as the concurrent-caller race above.
+        let start = self.recv_cursor.fetch_add(1, AtomicOrdering::Relaxed) % shards;
         let mut out = Vec::new();
-        for shard in 0..shards {
+        for offset in 0..shards {
             if out.len() >= limit {
                 break;
             }
+            let shard = (start + offset) % shards;
             let remaining = limit - out.len();
             let result = self.node.poll_shard(shard, None, remaining).await?;
             out.extend(result.events);
@@ -1309,6 +1340,7 @@ impl Mesh {
         Self {
             node,
             channel_configs,
+            recv_cursor: Arc::new(AtomicU16::new(0)),
             identity,
             #[cfg(feature = "tool")]
             tool_metadata_fetch: Arc::new(parking_lot::Mutex::new(None)),
