@@ -4,6 +4,13 @@ Staging file, not a release note. `RELEASE_STEPS.md` picks the codename
 at step 2 and drafts the note at step 4; fold these entries in then and
 delete this file.
 
+Because it lives beside the real notes, it is listed in
+`NOT_PUBLISHED` in `web/scripts/sync-releases.mjs` — everything else in
+this directory is mirrored to the site, and a half-assembled changelog
+under a version that has not shipped should not be. **Remove that entry
+when you delete this file**, or `npm run check:releases` will keep
+excusing a name that no longer exists.
+
 Each entry is written to be pasted into the note's breaking-changes
 section as-is.
 
