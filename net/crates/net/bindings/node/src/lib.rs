@@ -1366,8 +1366,8 @@ mod mesh_bindings {
                 cfg = cfg.with_rate_limit(pps);
             }
             if let Some(filter) = self.publish_caps {
-                cfg = cfg
-                    .with_publish_caps(crate::capabilities::capability_filter_from_js(filter)?);
+                cfg =
+                    cfg.with_publish_caps(crate::capabilities::capability_filter_from_js(filter)?);
             }
             if let Some(filter) = self.subscribe_caps {
                 cfg = cfg

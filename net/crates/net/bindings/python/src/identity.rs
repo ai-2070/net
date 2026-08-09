@@ -14,7 +14,8 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use net::adapter::net::identity::{
-    EntityId, EntityKeypair, PermissionToken, TokenCache, TokenError as CoreTokenError, TokenScope,
+    EntityId, EntityKeypair, IdentityState, IdentityStateError, PermissionToken, TokenCache,
+    TokenError as CoreTokenError, TokenScope,
 };
 
 // =========================================================================
@@ -67,6 +68,20 @@ pub(crate) fn token_err(e: CoreTokenError) -> PyErr {
 
 pub(crate) fn identity_err(msg: impl Into<String>) -> PyErr {
     PyErr::new::<IdentityError, _>(format!("identity: {}", msg.into()))
+}
+
+/// Issuer-state failures get their own stable `kind` discriminators
+/// under the `identity:` prefix, matching the Node binding, so a
+/// caller can tell "you rotated backwards" from "that file is not
+/// identity state" without parsing prose.
+pub(crate) fn state_err(e: IdentityStateError) -> PyErr {
+    let kind = match e {
+        IdentityStateError::InvalidLength { .. } => "invalid_state_length",
+        IdentityStateError::UnsupportedVersion { .. } => "unsupported_state_version",
+        IdentityStateError::GenerationWentBackwards { .. } => "generation_went_backwards",
+        IdentityStateError::GenerationExhausted => "generation_exhausted",
+    };
+    identity_err(format!("{kind}: {e}"))
 }
 
 // =========================================================================
@@ -151,13 +166,24 @@ fn channel_to_hash(channel: &str) -> PyResult<net::adapter::net::ChannelHash> {
 pub struct Identity {
     pub(crate) keypair: Arc<EntityKeypair>,
     pub(crate) cache: Arc<TokenCache>,
+    /// This issuer's credential epoch, stamped onto every token
+    /// `issue_token` mints. Encoding is core's, shared with every
+    /// other binding — see `at_generation` for the rotation rules.
+    pub(crate) generation: u32,
 }
 
 impl Identity {
+    /// Key-only construction has no epoch to restore, so this starts
+    /// at zero. `from_state_bytes` is the path that carries one.
     fn wrap(kp: EntityKeypair) -> Self {
+        Self::wrap_at(kp, 0)
+    }
+
+    fn wrap_at(kp: EntityKeypair, generation: u32) -> Self {
         Self {
             keypair: Arc::new(kp),
             cache: Arc::new(TokenCache::new()),
+            generation,
         }
     }
 
@@ -169,7 +195,11 @@ impl Identity {
     /// already hold.
     #[cfg(feature = "compute")]
     pub(crate) fn to_sdk_identity(&self) -> net_sdk::Identity {
-        net_sdk::Identity::from_seed(*self.keypair.secret_bytes())
+        let id = net_sdk::Identity::from_seed(*self.keypair.secret_bytes());
+        // Carry the epoch across. Handing the SDK a generation-zero
+        // copy of a rotated issuer would have it mint below its own
+        // published floor. From zero, `at_generation` cannot fail.
+        id.at_generation(self.generation).unwrap_or(id)
     }
 }
 
@@ -229,7 +259,6 @@ impl Identity {
         self.keypair.sign(message).to_bytes().to_vec()
     }
 
-
     /// Issue a scoped permission token to `subject`.
     ///
     /// `scope` is a list of `'publish' | 'subscribe' | 'admin' |
@@ -250,8 +279,9 @@ impl Identity {
         // Route through `try_issue` so `ttl_seconds=0`
         // surfaces as `TokenError::ZeroTtl` rather than minting a
         // born-expired token.
-        let token = PermissionToken::try_issue(
+        let token = PermissionToken::try_issue_with_generation(
             &self.keypair,
+            self.generation,
             subject_id,
             scope_bits,
             channel_hash,
@@ -260,6 +290,70 @@ impl Identity {
         )
         .map_err(token_err)?;
         Ok(token.to_bytes())
+    }
+
+    /// This issuer's current credential epoch.
+    ///
+    /// Every token `issue_token` mints carries it, and a verifier
+    /// rejects that token once its revocation floor for this entity
+    /// exceeds it.
+    #[getter]
+    fn issuer_generation(&self) -> u32 {
+        self.generation
+    }
+
+    /// The same key at a later generation.
+    ///
+    /// Returns a **new** `Identity`; this one is unchanged. Rotation is
+    /// explicit at the call site rather than something that happens to
+    /// a caller mid-issuance.
+    ///
+    /// `next == issuer_generation` is accepted and idempotent, so
+    /// re-applying a persisted generation on restart is not an error.
+    /// Going backwards raises, and so does any rotation once the
+    /// generation reaches `2**32 - 1` — past that, rotate the key.
+    ///
+    /// Rotation order: build the generation-N identity, persist
+    /// `to_state_bytes()` atomically and durably, distribute verifier
+    /// floor N, then start issuing. Publishing floor N before the state
+    /// is durable leaves a crashed issuer announcing a floor it cannot
+    /// satisfy.
+    fn at_generation(&self, next: u32) -> PyResult<Self> {
+        let generation = IdentityState::check_rotation(self.generation, next).map_err(state_err)?;
+        Ok(Self {
+            keypair: self.keypair.clone(),
+            cache: self.cache.clone(),
+            generation,
+        })
+    }
+
+    /// Serialize the full issuer state — version, seed, generation.
+    ///
+    /// **Secret material**, exactly like `to_bytes`. Encrypt at rest
+    /// and write atomically; a torn write here is an issuer that cannot
+    /// come back.
+    fn to_state_bytes(&self) -> Vec<u8> {
+        IdentityState {
+            seed: *self.keypair.secret_bytes(),
+            generation: self.generation,
+        }
+        .to_bytes()
+        .to_vec()
+    }
+
+    /// Restore an issuer — key *and* generation — from
+    /// `to_state_bytes()`.
+    ///
+    /// The restart path for anything that rotates. `from_bytes` /
+    /// `from_seed` restore the key only and come back at generation
+    /// zero, which for a rotated issuer is below its own floor.
+    #[staticmethod]
+    fn from_state_bytes(bytes: &[u8]) -> PyResult<Self> {
+        let state = IdentityState::from_bytes(bytes).map_err(state_err)?;
+        Ok(Self::wrap_at(
+            EntityKeypair::from_bytes(state.seed),
+            state.generation,
+        ))
     }
 
     /// Install a token received from another issuer. Signature

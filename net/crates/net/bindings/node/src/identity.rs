@@ -21,7 +21,8 @@ use napi_derive::napi;
 use std::sync::Arc;
 
 use net::adapter::net::identity::{
-    EntityId, EntityKeypair, PermissionToken, TokenCache, TokenError, TokenScope,
+    EntityId, EntityKeypair, IdentityState, IdentityStateError, PermissionToken, TokenCache,
+    TokenError, TokenScope,
 };
 
 // =========================================================================
@@ -62,6 +63,20 @@ fn token_error_kind(e: &TokenError) -> &'static str {
 
 fn map_token_err(e: TokenError) -> Error {
     token_err(token_error_kind(&e))
+}
+
+/// Issuer-state failures get their own stable `kind` discriminators
+/// under the `identity:` prefix, so a caller can tell "you rotated
+/// backwards" from "that file is not identity state" without parsing
+/// prose. `Display` carries the numbers.
+fn map_state_err(e: IdentityStateError) -> Error {
+    let kind = match e {
+        IdentityStateError::InvalidLength { .. } => "invalid_state_length",
+        IdentityStateError::UnsupportedVersion { .. } => "unsupported_state_version",
+        IdentityStateError::GenerationWentBackwards { .. } => "generation_went_backwards",
+        IdentityStateError::GenerationExhausted => "generation_exhausted",
+    };
+    identity_err(format!("{kind}: {e}"))
 }
 
 /// Public helper for crate-internal callers (mesh subscribe path)
@@ -159,6 +174,10 @@ fn buffer_to_entity_id(buf: &Buffer) -> Result<EntityId> {
 pub struct Identity {
     keypair: Arc<EntityKeypair>,
     cache: Arc<TokenCache>,
+    /// This issuer's credential epoch, stamped onto every token
+    /// `issueToken` mints. See `atGeneration` for the rotation rules;
+    /// the encoding is core's, shared with every other binding.
+    generation: u32,
 }
 
 #[napi]
@@ -227,7 +246,6 @@ impl Identity {
         Buffer::from(sig.to_bytes().to_vec())
     }
 
-
     /// Issue a scoped permission token to `subject`. Returns the
     /// 169-byte serialized token as a Buffer; hand it to the
     /// subscriber who will then call `installToken(bytes)`.
@@ -252,8 +270,9 @@ impl Identity {
         // Error here) rather than minting a born-expired token
         // that every receiver rejects with no diagnostic to the
         // issuer.
-        let token = PermissionToken::try_issue(
+        let token = PermissionToken::try_issue_with_generation(
             &self.keypair,
+            self.generation,
             subject_id,
             scope_bits,
             channel_hash,
@@ -262,6 +281,82 @@ impl Identity {
         )
         .map_err(map_token_err)?;
         Ok(Buffer::from(token.to_bytes()))
+    }
+
+    /// This issuer's current credential epoch.
+    ///
+    /// Every token `issueToken` mints carries it, and a verifier
+    /// rejects that token once its revocation floor for this entity
+    /// exceeds it.
+    #[napi(getter)]
+    pub fn issuer_generation(&self) -> u32 {
+        self.generation
+    }
+
+    /// The same key at a later generation.
+    ///
+    /// Returns a **new** `Identity`; this one is unchanged. Rotation is
+    /// therefore explicit at the call site rather than something that
+    /// happens to a caller mid-issuance.
+    ///
+    /// `next === issuerGeneration` is accepted and idempotent, so
+    /// re-applying a persisted generation on restart is not an error.
+    /// Going backwards throws, and so does any rotation once the
+    /// generation reaches `2^32 - 1` — past that, rotate the key.
+    ///
+    /// ## Rotation order
+    ///
+    /// 1. build the generation-N identity here;
+    /// 2. persist `toStateBytes()` atomically and durably;
+    /// 3. distribute verifier floor N;
+    /// 4. start issuing from the returned identity.
+    ///
+    /// Never publish floor N before step 2 lands. A crash in between
+    /// leaves an issuer that has announced a floor it has no durable
+    /// state to satisfy — it can mint nothing a verifier accepts, and
+    /// only a key rotation gets it back.
+    #[napi]
+    pub fn at_generation(&self, next: u32) -> Result<Identity> {
+        let generation =
+            IdentityState::check_rotation(self.generation, next).map_err(map_state_err)?;
+        Ok(Self {
+            keypair: self.keypair.clone(),
+            cache: self.cache.clone(),
+            generation,
+        })
+    }
+
+    /// Serialize the full issuer state — version, seed, generation.
+    ///
+    /// **Secret material**, exactly like `toBytes`: these bytes contain
+    /// the ed25519 signing seed. Encrypt at rest and write atomically;
+    /// a torn write here is an issuer that cannot come back.
+    #[napi]
+    pub fn to_state_bytes(&self) -> Buffer {
+        Buffer::from(
+            IdentityState {
+                seed: *self.keypair.secret_bytes(),
+                generation: self.generation,
+            }
+            .to_bytes()
+            .to_vec(),
+        )
+    }
+
+    /// Restore an issuer — key *and* generation — from
+    /// `toStateBytes()`.
+    ///
+    /// This is the restart path for anything that rotates. `fromBytes`
+    /// / `fromSeed` restore the key only and come back at generation
+    /// zero, which for a rotated issuer means below its own published
+    /// floor.
+    #[napi(factory)]
+    pub fn from_state_bytes(bytes: Buffer) -> Result<Self> {
+        let state = IdentityState::from_bytes(bytes.as_ref()).map_err(map_state_err)?;
+        Ok(Self::wrap_at(
+            EntityKeypair::from_bytes(state.seed),
+            state.generation,
+        ))
     }
 
     /// Install a token this node received from another issuer. The
@@ -293,9 +388,16 @@ impl Identity {
     }
 
     fn wrap(kp: EntityKeypair) -> Self {
+        Self::wrap_at(kp, 0)
+    }
+
+    /// Key-only construction has no epoch to restore, so `wrap` starts
+    /// at zero. `fromStateBytes` is the path that carries one.
+    fn wrap_at(kp: EntityKeypair, generation: u32) -> Self {
         Self {
             keypair: Arc::new(kp),
             cache: Arc::new(TokenCache::new()),
+            generation,
         }
     }
 
@@ -310,7 +412,13 @@ impl Identity {
     /// the cache at spawn time.
     #[cfg(any(feature = "compute", feature = "delegation"))]
     pub(crate) fn to_sdk_identity(&self) -> net_sdk::Identity {
-        net_sdk::Identity::from_seed(*self.keypair.secret_bytes())
+        let id = net_sdk::Identity::from_seed(*self.keypair.secret_bytes());
+        // Carry the epoch across too. `from_seed` restores the key at
+        // generation zero, and handing the SDK a zero-generation copy
+        // of a rotated issuer would have it mint below its own floor.
+        // `at_generation` only fails going backwards or at the
+        // ceiling; from zero, neither applies.
+        id.at_generation(self.generation).unwrap_or(id)
     }
 
     /// Wrap a shared `EntityKeypair` Arc in a fresh `Identity` handle
@@ -322,6 +430,9 @@ impl Identity {
         Self {
             keypair,
             cache: Arc::new(TokenCache::new()),
+            // A freshly-derived child or device identity has no
+            // rotation history of its own.
+            generation: 0,
         }
     }
 

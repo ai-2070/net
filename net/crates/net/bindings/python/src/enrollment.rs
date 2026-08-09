@@ -50,6 +50,7 @@ fn to_py_identity(sdk: &SdkIdentity) -> Identity {
     Identity {
         keypair: sdk.keypair().clone(),
         cache: Arc::new(TokenCache::new()),
+        generation: sdk.issuer_generation(),
     }
 }
 

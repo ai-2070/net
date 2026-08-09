@@ -1,0 +1,106 @@
+// Durable issuer state through the Node binding (decision 4b).
+//
+// `issuerGeneration` rides on every token and drives revocation, but
+// the binding had no way to set it: `Identity` carried a keypair and a
+// cache and nothing else, so every token it minted was generation
+// zero. The field was visible on `parseToken` output and settable by
+// nobody.
+//
+// The state encoding is core's, shared byte-for-byte with the Rust,
+// Python and C surfaces — a file written by one has to be readable by
+// the others.
+
+import { describe, expect, it } from 'vitest'
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const binding: any = await import('../index')
+const { Identity, parseToken } = binding
+
+const CHANNEL = 'issuer/rotation'
+const STATE_SIZE = 37
+
+function issue(signer: any, subject: any): Buffer {
+  return signer.issueToken(subject.entityId, ['publish'], CHANNEL, 3600, 0)
+}
+
+describe('issuer generation', () => {
+  it('starts at zero and stamps every issued token', () => {
+    const id = Identity.generate()
+    const subject = Identity.generate()
+    expect(id.issuerGeneration).toBe(0)
+    expect(parseToken(issue(id, subject)).issuerGeneration).toBe(0)
+  })
+
+  it('rotates to a new identity, leaving the original alone', () => {
+    const id = Identity.generate()
+    const subject = Identity.generate()
+
+    const rotated = id.atGeneration(3)
+    expect(rotated.issuerGeneration).toBe(3)
+    expect(id.issuerGeneration).toBe(0)
+    expect(rotated.entityId).toEqual(id.entityId)
+
+    expect(parseToken(issue(rotated, subject)).issuerGeneration).toBe(3)
+    expect(parseToken(issue(id, subject)).issuerGeneration).toBe(0)
+  })
+
+  it('round-trips key and generation through state bytes', () => {
+    const id = Identity.generate().atGeneration(6)
+    const state = id.toStateBytes()
+    expect(state.length).toBe(STATE_SIZE)
+    // Layout is a cross-SDK contract, not an implementation detail.
+    expect(state[0]).toBe(1)
+    expect(state.subarray(33, 37)).toEqual(Buffer.from([6, 0, 0, 0]))
+
+    const restored = Identity.fromStateBytes(state)
+    expect(restored.issuerGeneration).toBe(6)
+    expect(restored.entityId).toEqual(id.entityId)
+
+    const subject = Identity.generate()
+    expect(parseToken(issue(restored, subject)).issuerGeneration).toBe(6)
+  })
+
+  it('key-only restoration comes back at generation zero', () => {
+    // The documented cost of `toBytes` / `fromBytes`. An issuer that
+    // rotated to 4 and published floor 4 comes back here unable to
+    // mint anything a verifier accepts.
+    const id = Identity.generate().atGeneration(4)
+    const seedOnly = Identity.fromBytes(id.toBytes())
+    expect(seedOnly.entityId).toEqual(id.entityId)
+    expect(seedOnly.issuerGeneration).toBe(0)
+  })
+
+  it('refuses to go backwards, and is idempotent at the same value', () => {
+    const id = Identity.generate().atGeneration(5)
+    expect(() => id.atGeneration(4)).toThrow(/generation_went_backwards/)
+    expect(id.atGeneration(5).issuerGeneration).toBe(5)
+    expect(id.atGeneration(6).issuerGeneration).toBe(6)
+  })
+
+  it('demands a key rotation at the ceiling', () => {
+    const ceiling = Identity.generate().atGeneration(0xffffffff)
+    expect(ceiling.issuerGeneration).toBe(0xffffffff)
+    expect(() => ceiling.atGeneration(0xffffffff)).toThrow(
+      /generation_exhausted/,
+    )
+  })
+
+  it('refuses malformed and future state rather than parsing part of it', () => {
+    const good = Identity.generate().atGeneration(2).toStateBytes()
+
+    expect(() => Identity.fromStateBytes(good.subarray(0, 36))).toThrow(
+      /invalid_state_length/,
+    )
+    // A bare seed is not identity state — accepting it would put the
+    // generation-zero trap back through the versioned door.
+    expect(() => Identity.fromStateBytes(Buffer.alloc(32))).toThrow(
+      /invalid_state_length/,
+    )
+
+    const future = Buffer.from(good)
+    future[0] = 2
+    expect(() => Identity.fromStateBytes(future)).toThrow(
+      /unsupported_state_version/,
+    )
+  })
+})

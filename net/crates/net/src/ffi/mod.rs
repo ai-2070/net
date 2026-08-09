@@ -207,6 +207,12 @@ pub mod blob_stubs;
 #[allow(missing_docs)]
 pub mod mesh;
 
+// Its own file rather than another block inside `mesh.rs`: these drive
+// the raw identity exports through real handle lifecycles, which is a
+// different shape from the parsing pins in that module's `tests`.
+#[cfg(all(test, feature = "net"))]
+mod identity_state_tests;
+
 /// C FFI for the transport surface (blob + directory transfer over the
 /// fairscheduler stream transport — Transport SDK plan T-C). Drives the
 /// node's transfer engine via the existing `MeshNodeHandle` +

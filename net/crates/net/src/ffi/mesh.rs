@@ -59,7 +59,8 @@ use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 
 use crate::adapter::net::identity::{
-    EntityId, PermissionToken, TokenCache, TokenError as CoreTokenError, TokenScope,
+    EntityId, IdentityState as InnerIdentityState, PermissionToken, TokenCache,
+    TokenError as CoreTokenError, TokenScope, IDENTITY_STATE_SIZE,
 };
 use crate::adapter::net::{
     ChannelConfig as InnerChannelConfig, ChannelConfigRegistry, ChannelHash, ChannelId,
@@ -2372,6 +2373,12 @@ pub unsafe extern "C" fn net_mesh_publish(
 pub struct IdentityHandle {
     keypair: ManuallyDrop<Arc<EntityKeypair>>,
     cache: ManuallyDrop<Arc<TokenCache>>,
+    /// This issuer's credential epoch, stamped onto every token
+    /// `net_identity_issue_token` mints. Plain `u32`, not shared:
+    /// `net_identity_at_generation` produces a *new* handle rather
+    /// than mutating this one, so a rotation cannot change what
+    /// another thread is in the middle of signing.
+    generation: u32,
     guard: HandleGuard,
 }
 
@@ -2534,6 +2541,8 @@ pub unsafe extern "C" fn net_identity_generate(out_handle: *mut *mut IdentityHan
     let handle = Box::new(IdentityHandle {
         keypair: ManuallyDrop::new(Arc::new(EntityKeypair::generate())),
         cache: ManuallyDrop::new(Arc::new(TokenCache::new())),
+        // A fresh key has no rotation history.
+        generation: 0,
         guard: HandleGuard::new(),
     });
     unsafe {
@@ -2562,6 +2571,11 @@ pub unsafe extern "C" fn net_identity_from_seed(
     let handle = Box::new(IdentityHandle {
         keypair: ManuallyDrop::new(Arc::new(EntityKeypair::from_bytes(arr))),
         cache: ManuallyDrop::new(Arc::new(TokenCache::new())),
+        // The seed carries no epoch. An issuer that has rotated and
+        // comes back through here mints at zero — below its own
+        // published floor. `net_identity_from_state` is the path that
+        // restores the issuer rather than just the key.
+        generation: 0,
         guard: HandleGuard::new(),
     });
     unsafe {
@@ -2592,6 +2606,146 @@ pub unsafe extern "C" fn net_identity_free(handle: *mut IdentityHandle) {
              leaking inner to avoid use-after-free"
         );
     }
+}
+
+/// Size of the buffer `net_identity_to_state` writes, in bytes.
+///
+/// The header carries this as `NET_IDENTITY_STATE_SIZE`; this export
+/// exists so a stale header is detectable rather than silently
+/// under-allocating a buffer the implementation then writes past. A C
+/// caller that wants the check can assert the two agree at startup.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_identity_state_size() -> usize {
+    IDENTITY_STATE_SIZE
+}
+
+/// This issuer's current credential epoch.
+///
+/// Every token `net_identity_issue_token` mints carries it, and a
+/// verifier rejects that token once its revocation floor for this
+/// entity exceeds it. Returns `0` for a NULL or shutting-down handle —
+/// indistinguishable from a genuine generation zero, which is the
+/// conservative reading (zero is the epoch that claims the least).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_identity_generation(handle: *mut IdentityHandle) -> u32 {
+    if handle.is_null() {
+        return 0;
+    }
+    let h = unsafe { &*handle };
+    let Some(_op) = h.guard.try_enter() else {
+        return 0;
+    };
+    h.generation
+}
+
+/// The same key at a later generation, as a **new** handle written to
+/// `*out_handle`. The input handle is unchanged; free both separately.
+///
+/// `next == net_identity_generation(handle)` is accepted and
+/// idempotent, so re-applying a persisted generation on restart is not
+/// an error. Going backwards returns `NET_ERR_IDENTITY`, and so does
+/// any rotation once the generation reaches `UINT32_MAX` — past that,
+/// rotate the identity key.
+///
+/// Rotation order: build the generation-N handle here, persist
+/// `net_identity_to_state` atomically and durably, distribute verifier
+/// floor N, then start issuing. Publishing floor N before the state is
+/// durable leaves a crashed issuer announcing a floor it cannot
+/// satisfy — it can mint nothing a verifier accepts, and only a key
+/// rotation recovers it.
+///
+/// The token cache is NOT shared with the source handle: the C ABI
+/// hands out owning pointers, and sharing an `Arc<TokenCache>` across
+/// two independently-freeable handles would make one `_free` observable
+/// through the other.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_identity_at_generation(
+    handle: *mut IdentityHandle,
+    next: u32,
+    out_handle: *mut *mut IdentityHandle,
+) -> c_int {
+    if handle.is_null() || out_handle.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let h = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let Ok(generation) = InnerIdentityState::check_rotation(h.generation, next) else {
+        return NET_ERR_IDENTITY;
+    };
+    let rotated = Box::new(IdentityHandle {
+        keypair: ManuallyDrop::new(Arc::clone(&h.keypair)),
+        cache: ManuallyDrop::new(Arc::new(TokenCache::new())),
+        generation,
+        guard: HandleGuard::new(),
+    });
+    unsafe {
+        *out_handle = Box::into_raw(rotated);
+    }
+    0
+}
+
+/// Write the versioned issuer state — version, seed, generation —
+/// into `out[NET_IDENTITY_STATE_SIZE]`.
+///
+/// **Secret material**: these bytes contain the ed25519 signing seed,
+/// exactly as `net_identity_to_seed` does. Encrypt at rest, and write
+/// atomically; a torn write here is an issuer that cannot come back.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_identity_to_state(handle: *mut IdentityHandle, out: *mut u8) -> c_int {
+    if handle.is_null() || out.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let h = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let bytes = InnerIdentityState {
+        seed: *h.keypair.secret_bytes(),
+        generation: h.generation,
+    }
+    .to_bytes();
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len());
+    }
+    0
+}
+
+/// Restore an issuer — key *and* generation — from
+/// `net_identity_to_state` output.
+///
+/// The restart path for anything that rotates. `net_identity_from_seed`
+/// restores the key only and comes back at generation zero, which for a
+/// rotated issuer is below its own floor. Returns `NET_ERR_IDENTITY`
+/// for a wrong length or a version this build does not understand —
+/// a partial parse of credential state is how an issuer silently comes
+/// back on the wrong epoch.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_identity_from_state(
+    state: *const u8,
+    state_len: usize,
+    out_handle: *mut *mut IdentityHandle,
+) -> c_int {
+    if state.is_null() || out_handle.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(state, state_len) };
+    let Ok(parsed) = InnerIdentityState::from_bytes(bytes) else {
+        return NET_ERR_IDENTITY;
+    };
+    let handle = Box::new(IdentityHandle {
+        keypair: ManuallyDrop::new(Arc::new(EntityKeypair::from_bytes(parsed.seed))),
+        cache: ManuallyDrop::new(Arc::new(TokenCache::new())),
+        generation: parsed.generation,
+        guard: HandleGuard::new(),
+    });
+    unsafe {
+        *out_handle = Box::into_raw(handle);
+    }
+    0
 }
 
 /// Write the 32-byte ed25519 seed into `out[32]`. Caller must pass
@@ -2801,8 +2955,9 @@ pub unsafe extern "C" fn net_identity_issue_token(
     // `TokenError::ReadOnly` → `NET_ERR_IDENTITY` instead of
     // panic-unwinding across this `extern "C"` frame into the
     // caller's binding.
-    let token = match PermissionToken::try_issue(
+    let token = match PermissionToken::try_issue_with_generation(
         &h.keypair,
+        h.generation,
         subject_id,
         scope,
         channel_hash,
