@@ -21,6 +21,7 @@ on:
       # The C snippet check compiles doc fences against the real public
       # headers, so a header change can break it without web/ being touched.
       - ".github/scripts/check-c-doc-snippets.py"
+      - ".github/scripts/check-install-version.py"
       - "net/crates/net/include/**"
   pull_request:
     paths:
@@ -37,6 +38,7 @@ on:
       # The C snippet check compiles doc fences against the real public
       # headers, so a header change can break it without web/ being touched.
       - ".github/scripts/check-c-doc-snippets.py"
+      - ".github/scripts/check-install-version.py"
       - "net/crates/net/include/**"
 
 jobs:
@@ -118,6 +120,18 @@ jobs:
       - name: Check the width checker still catches defects
         working-directory: .
         run: .github/scripts/check-doc-code-width.py --self-test
+
+      # The install pages hard-code "the current published release is X" and
+      # use it as a cross-layer pin instruction. It said 0.33 while every
+      # registry served 0.34 — a fact with an expiry date that nothing was
+      # watching. This derives the answer from the release notes in the tree.
+      - name: Check the install pages name the current release
+        working-directory: .
+        run: .github/scripts/check-install-version.py
+
+      - name: Check the version checker still catches defects
+        working-directory: .
+        run: .github/scripts/check-install-version.py --self-test
 
       # The C quickstart shipped calling `free(cursor)` while including only
       # net.h, <stdio.h> and <string.h>, so the advertised copy-and-run program
