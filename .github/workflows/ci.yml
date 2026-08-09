@@ -1356,6 +1356,22 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: python3 .github/scripts/check-npm-peer-range.py
 
+      # `@net-mesh/cli` and `@net-mesh/deck` ship nothing themselves — each is
+      # a launcher plus per-platform packages in optionalDependencies. npm
+      # SKIPS an optional dependency it cannot resolve without failing, so a
+      # missing platform package installs with exit 0, reports success, and
+      # only surfaces when someone runs the command and gets exit 127.
+      #
+      # Three lists have to agree for that not to happen: optionalDependencies,
+      # the triples the launcher resolves, and the release build matrix. This
+      # is the no-network half; the release workflows additionally verify each
+      # package is really on the registry before publishing the aggregate.
+      - name: Guard — npm aggregates name platform packages that get built
+        working-directory: ${{ github.workspace }}
+        run: |
+          python3 .github/scripts/check-npm-platform-packages.py
+          python3 .github/scripts/check-npm-platform-packages.py --self-test
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
