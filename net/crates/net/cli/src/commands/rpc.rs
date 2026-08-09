@@ -1,4 +1,4 @@
-//! `net rpc (call|stream|client-stream|duplex|discover|services)` —
+//! `net-mesh rpc (call|stream|client-stream|duplex|discover|services)` —
 //! typed-RPC client surface.
 //!
 //! **Phase 2 status: design stub.** The clap router intentionally
@@ -25,9 +25,9 @@
 //! 3. Lifecycle handling so the mesh classifier + traversal tasks
 //!    shut down cleanly on Ctrl-C.
 //!
-//! The same plumbing also unblocks `net cap announce`,
-//! `net peer (reflex|nat|reclassify-nat|set-reflex|clear-reflex)`,
-//! and `net port (probe-peer|try-map)` — those are all Mesh
+//! The same plumbing also unblocks `net-mesh cap announce`,
+//! `net-mesh peer (reflex|nat|reclassify-nat|set-reflex|clear-reflex)`,
+//! and `net-mesh port (probe-peer|try-map)` — those are all Mesh
 //! operations.
 //!
 //! Phase 2 ships admin commits + netdb mutations (no Mesh

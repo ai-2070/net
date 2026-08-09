@@ -2,7 +2,7 @@
 //! audience discovery keys, node identity seeds).
 //!
 //! These live at crate level rather than inside `commands::org` because the
-//! secret they protect crosses module boundaries: `net org keygen` serializes
+//! secret they protect crosses module boundaries: `net-mesh org keygen` serializes
 //! the org root seed in `commands::org` and hands it to
 //! `commands::identity::write_identity_atomically` to persist. A scrub
 //! ceremony that stops at the module edge is not a scrub ceremony — §10 was

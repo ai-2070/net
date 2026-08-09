@@ -1,7 +1,7 @@
-//! `net mcp serve` — expose the mesh's capabilities to a local MCP host as a
+//! `net-mesh mcp serve` — expose the mesh's capabilities to a local MCP host as a
 //! stdio MCP server (`MCP_BRIDGE_PLAN.md` Phase 2, demand side).
 //!
-//! The mirror of `net wrap`: where `wrap` publishes a local MCP server's tools
+//! The mirror of `net-mesh wrap`: where `wrap` publishes a local MCP server's tools
 //! onto the mesh, `serve` runs a stdio MCP **server** that a host (Claude
 //! Code, Cursor, …) spawns and speaks JSON-RPC to. It answers with the `net_*`
 //! meta-tools that search / describe / invoke capabilities discovered across
@@ -14,8 +14,8 @@
 //! strings back to the host in-band.
 //!
 //! Owner-scoped wrapped tools admit callers by `origin_hash`, which is derived
-//! from the operator *identity*, not the node — so running `net mcp serve`
-//! under the same identity as `net wrap` makes those tools invocable with no
+//! from the operator *identity*, not the node — so running `net-mesh mcp serve`
+//! under the same identity as `net-mesh wrap` makes those tools invocable with no
 //! explicit allow. A different identity would need the wrap side to `--allow`
 //! this shim's origin.
 
@@ -65,14 +65,14 @@ pub struct PinIdArgs {
     /// The capability id, as `provider/capability` (from a search result).
     pub cap_id: String,
 
-    /// Pin-store file. Defaults to the per-user store `net mcp serve` reads.
+    /// Pin-store file. Defaults to the per-user store `net-mesh mcp serve` reads.
     #[arg(long = "pin-store", value_name = "PATH")]
     pub pin_store: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
 pub struct PinListArgs {
-    /// Pin-store file. Defaults to the per-user store `net mcp serve` reads.
+    /// Pin-store file. Defaults to the per-user store `net-mesh mcp serve` reads.
     #[arg(long = "pin-store", value_name = "PATH")]
     pub pin_store: Option<PathBuf>,
 }
@@ -81,7 +81,7 @@ pub struct PinListArgs {
 pub struct ServeArgs {
     /// Operator identity file (`seed_hex = "..."`). Owner-scoped wrapped tools
     /// admit callers by origin, so run this under the same identity as your
-    /// `net wrap` side to invoke them without an explicit allow.
+    /// `net-mesh wrap` side to invoke them without an explicit allow.
     #[arg(long)]
     pub identity: Option<PathBuf>,
 
@@ -91,7 +91,7 @@ pub struct ServeArgs {
     #[arg(long = "allow-capability", value_name = "PROVIDER/CAP")]
     pub allow_capability: Vec<String>,
 
-    /// Pin-store file. Defaults to the per-user store the `net mcp pin` verbs
+    /// Pin-store file. Defaults to the per-user store the `net-mesh mcp pin` verbs
     /// write; an approved pin there admits its capability.
     #[arg(long = "pin-store", value_name = "PATH")]
     pub pin_store: Option<PathBuf>,
@@ -144,9 +144,9 @@ async fn run_serve(
         .or(profile.identity.as_deref())
         .ok_or_else(|| {
             invalid_args(
-                "net mcp serve needs an operator identity: pass --identity <PATH> or set \
+                "net-mesh mcp serve needs an operator identity: pass --identity <PATH> or set \
                  `identity = \"...\"` in your profile. Wrapped tools admit callers by origin, \
-                 so use the same identity as your `net wrap` side (or have it `--allow` this \
+                 so use the same identity as your `net-mesh wrap` side (or have it `--allow` this \
                  shim's origin).",
             )
         })?;
@@ -284,5 +284,5 @@ async fn pin_list(args: PinListArgs, output: Option<OutputFormat>) -> Result<(),
     Ok(())
 }
 
-// Identity loading and mesh attachment are shared with `net wrap` — see
+// Identity loading and mesh attachment are shared with `net-mesh wrap` — see
 // `context::load_operator_identity` and `context::build_attached_mesh`.

@@ -1,4 +1,4 @@
-//! `net wrap <name> [flags] -- <command...>` — wrap a local stdio MCP server
+//! `net-mesh wrap <name> [flags] -- <command...>` — wrap a local stdio MCP server
 //! as owner-only mesh capabilities (`MCP_BRIDGE_PLAN.md` Phase 1, supply side).
 //!
 //! Builds a mesh node under the operator's identity, joins the mesh via a
@@ -35,7 +35,7 @@ use crate::error::{generic, invalid_args, sdk, CliError};
 use crate::output::{emit_stream_row, OutputFormat};
 use crate::parsers::parse_u64_flexible;
 
-/// A `net wrap` output event, emitted through the `--output` pipeline like
+/// A `net-mesh wrap` output event, emitted through the `--output` pipeline like
 /// every other command (`json` / `ndjson` / `yaml` / `table` / `text`). Wrap
 /// is long-running, so it emits a stream: one `wrapped` event, then a
 /// `tools_changed` / `server_exited` event per lifecycle transition.
@@ -145,10 +145,10 @@ pub async fn run(
 ) -> Result<(), CliError> {
     let profile = resolve_profile(config_path, profile_name).await?;
 
-    // The mesh peer to join. `net wrap` must join a mesh to be reachable.
+    // The mesh peer to join. `net-mesh wrap` must join a mesh to be reachable.
     let remote = require_remote_attach(&profile, &args.remote, || {
         invalid_args(
-            "net wrap needs a mesh peer to join. Pass \
+            "net-mesh wrap needs a mesh peer to join. Pass \
              --node-addr/--node-pubkey/--node-id/--psk-hex (or set them in your \
              profile) pointing at a running mesh node.",
         )
@@ -161,7 +161,7 @@ pub async fn run(
         .or(profile.identity.as_deref())
         .ok_or_else(|| {
             invalid_args(
-                "net wrap needs an operator identity: pass --identity <PATH> or set \
+                "net-mesh wrap needs an operator identity: pass --identity <PATH> or set \
                  `identity = \"...\"` in your profile. Owner-only scoping keys on it, \
                  so an ephemeral key would admit nobody.",
             )
@@ -214,7 +214,7 @@ pub async fn run(
                 .with_audit(std::sync::Arc::new(|a: &DelegationAudit| {
                     // Diagnostics on stderr, off the structured stdout stream.
                     eprintln!(
-                        "net wrap: delegated invoke admitted — tool={} leaf={} root={}",
+                        "net-mesh wrap: delegated invoke admitted — tool={} leaf={} root={}",
                         a.tool,
                         hex::encode(a.leaf.as_bytes()),
                         hex::encode(a.root.as_bytes()),
@@ -232,7 +232,7 @@ pub async fn run(
         }
         config.delegation = Some(std::sync::Arc::new(gate));
         eprintln!(
-            "net wrap: delegation gate enabled (owner root {owner_root_hex}); \
+            "net-mesh wrap: delegation gate enabled (owner root {owner_root_hex}); \
              chain-rooted callers are verified + audited{}",
             rev_path
                 .map(|p| format!("; revocations honored from {}", p.display()))
@@ -328,7 +328,7 @@ pub async fn run(
     Ok(())
 }
 
-// Identity loading and mesh attachment are shared with `net mcp serve` — see
+// Identity loading and mesh attachment are shared with `net-mesh mcp serve` — see
 // `context::load_operator_identity` and `context::build_attached_mesh`.
 
 /// Parse `KEY=VALUE` env pairs.

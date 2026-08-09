@@ -1,4 +1,4 @@
-//! `net snapshot (get|status)` — one-shot reads of the live
+//! `net-mesh snapshot (get|status)` — one-shot reads of the live
 //! `MeshOsSnapshot` + the typed `StatusSummary`.
 //!
 //! - `snapshot get` — `client.status()` returns the freshest
@@ -86,7 +86,7 @@ pub async fn run(
 /// Serializable mirror of the substrate's `StatusSummary`.
 /// Fields match `bindings/python/src/deck.rs::status_summary_to_dict`
 /// — same shape every binding emits, so a script piping
-/// `net snapshot status --output json | jq` reads the same
+/// `net-mesh snapshot status --output json | jq` reads the same
 /// envelope as the Python / Node / Go consumers.
 #[derive(Serialize)]
 struct StatusSummaryMirror {

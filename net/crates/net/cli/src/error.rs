@@ -12,10 +12,10 @@
 //! Codes 10–19 are reserved per subcommand. Each subcommand picks
 //! a base from this table and offsets within:
 //!
-//! - `net daemon`  — 10 = factory-not-found
-//! - `net db`      — 11 = query-parse-failed
-//! - `net db`      — 12 = predicate-DSL-parse-failed
-//! - `net typegen` — 14 = breaking schema change (diff --exit-code)
+//! - `net-mesh daemon`  — 10 = factory-not-found
+//! - `net-mesh db`      — 11 = query-parse-failed
+//! - `net-mesh db`      — 12 = predicate-DSL-parse-failed
+//! - `net-mesh typegen` — 14 = breaking schema change (diff --exit-code)
 //!
 //! New subcommand-specific codes get a documented offset under
 //! the subcommand's module + a row in this table.
@@ -48,14 +48,14 @@ pub enum ExitCodeKind {
     ConnectionFailure = 6,
     Timeout = 7,
     ConfirmationRefused = 8,
-    /// `net daemon` — factory id not registered.
+    /// `net-mesh daemon` — factory id not registered.
     DaemonFactoryNotFound = 10,
-    /// `net db` — query JSON failed to parse.
+    /// `net-mesh db` — query JSON failed to parse.
     DbQueryParseFailed = 11,
-    /// `net db` — predicate DSL (`--where` / `--filter`) failed
+    /// `net-mesh db` — predicate DSL (`--where` / `--filter`) failed
     /// to parse.
     DbPredicateParseFailed = 12,
-    /// `net ice` — a supplied operator signature failed
+    /// `net-mesh ice` — a supplied operator signature failed
     /// cryptographic verification. Pre-fix this surfaced under
     /// `OperatorPolicyRejected` (5), conflating
     /// signature-verification failure with policy / quorum
@@ -64,7 +64,7 @@ pub enum ExitCodeKind {
     /// (operator's key + signature pair did not validate against
     /// the simulated envelope).
     IceSignatureInvalid = 13,
-    /// `net typegen diff --exit-code` — at least one BREAKING schema
+    /// `net-mesh typegen diff --exit-code` — at least one BREAKING schema
     /// change was detected between the two snapshots. Distinct from a
     /// generic failure (1) so CI gates can `case $?` on it specifically.
     TypegenBreakingChanges = 14,

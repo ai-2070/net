@@ -1,4 +1,4 @@
-//! `net version` — print the binary version + the embedded SDK
+//! `net-mesh version` — print the binary version + the embedded SDK
 //! version + git revision the binary was built against.
 //!
 //! Pure read-only: no SDK runtime is touched, no config is

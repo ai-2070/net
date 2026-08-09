@@ -1,4 +1,4 @@
-//! `net cap (show|query|nodes|announce)` — capability advertisement
+//! `net-mesh cap (show|query|nodes|announce)` — capability advertisement
 //! and discovery from the local snapshot, plus offline compose-and-sign
 //! for v0.4 capability-auth (see `docs/internal/plans/CAPABILITY_AUTH_PLAN.md`).
 //!

@@ -1,4 +1,4 @@
-//! `net netdb (tasks ls|memories ls|snapshot)` — Cortex-backed
+//! `net-mesh netdb (tasks ls|memories ls|snapshot)` — Cortex-backed
 //! local KV store reads.
 //!
 //! Phase 1 scope: `tasks ls`, `memories ls`, `snapshot --out`.
@@ -721,7 +721,7 @@ fn emit_mutation(
     // dropped on function exit and `NetDb` has no Drop impl, so
     // the persistent-dir handle outlived the function on Windows
     // (no fsync, no explicit close) until the inner adapters'
-    // Arcs final-dropped. A subsequent `net netdb <verb>` in the
+    // Arcs final-dropped. A subsequent `net-mesh netdb <verb>` in the
     // same process tree, or a future netdb-watcher holding the
     // same dir, could see stale data, and a crash during
     // shutdown could lose the last appended frame.
@@ -764,7 +764,7 @@ async fn run_tasks_ls(
         .ok_or_else(|| sdk("NetDB has no tasks adapter wired"))?;
     // Collect under the read guard and drop it before the
     // synchronous stdout write. Pre-fix the guard lived across
-    // `emit_value`, which means a concurrent `net netdb tasks
+    // `emit_value`, which means a concurrent `net-mesh netdb tasks
     // create` in the same process tree (and any future in-process
     // watcher) blocked on the writer lock while we drained
     // stdout; a piped `| jq` on a slow consumer stalled writers

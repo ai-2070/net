@@ -1,4 +1,4 @@
-//! `net log tail` and `net failures tail` — substrate log/failure
+//! `net-mesh log tail` and `net-mesh failures tail` — substrate log/failure
 //! streams.
 
 use std::path::PathBuf;

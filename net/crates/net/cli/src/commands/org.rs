@@ -1,4 +1,4 @@
-//! `net org (keygen|issue-cert|issue-floors|grant-dispatcher|
+//! `net-mesh org (keygen|issue-cert|issue-floors|grant-dispatcher|
 //! grant-capability)` — organization root authority authoring (OA-1
 //! belonging + OA-2 grant issuance, `ORG_CAPABILITY_AUTH_PLAN.md`).
 //!
@@ -18,7 +18,7 @@
 //!
 //! Certificates and bundles are NOT secrets (they're signed public
 //! statements) and are written as versioned JSON envelopes that
-//! `net node adopt` and config management consume.
+//! `net-mesh node adopt` and config management consume.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -101,7 +101,7 @@ pub struct KeygenArgs {
     /// Acknowledge that the org key's mode is not enforced on Windows and
     /// suppress the warning.
     ///
-    /// Same gate, same reasoning as `net org grant-capability --discover`:
+    /// Same gate, same reasoning as `net-mesh org grant-capability --discover`:
     /// deliberately SEPARATE from `--insecure-permissions` (§16), which
     /// relaxes a check on an INPUT rather than silencing the only signal that
     /// a freshly written OUTPUT secret may be readable by others.
@@ -111,7 +111,7 @@ pub struct KeygenArgs {
 
 #[derive(Args, Debug)]
 pub struct IssueCertArgs {
-    /// Path to the org root key file (from `net org keygen`).
+    /// Path to the org root key file (from `net-mesh org keygen`).
     #[arg(long = "org-key", value_name = "PATH")]
     pub org_key: PathBuf,
 
@@ -141,14 +141,14 @@ pub struct IssueCertArgs {
     pub force: bool,
 
     /// Allow permissive org-key file modes on Unix. See
-    /// `net identity show --insecure-permissions`.
+    /// `net-mesh identity show --insecure-permissions`.
     #[arg(long)]
     pub insecure_permissions: bool,
 }
 
 #[derive(Args, Debug)]
 pub struct IssueFloorsArgs {
-    /// Path to the org root key file (from `net org keygen`).
+    /// Path to the org root key file (from `net-mesh org keygen`).
     #[arg(long = "org-key", value_name = "PATH")]
     pub org_key: PathBuf,
 
@@ -1275,9 +1275,9 @@ pub(crate) async fn classify_seed_artifact(path: &Path) -> SeedArtifact {
 ///
 /// This generalizes the original §2 fix, which guarded only `issue-cert` /
 /// `issue-floors` and keyed on "is there ANY `seed_hex` here". That left the
-/// two verbs which themselves WRITE seed files — `net org keygen` and
-/// `net identity generate` — unguarded on their `--force` path, so
-/// `net identity generate --out "$KEY" --force` with `$KEY` drifted onto the
+/// two verbs which themselves WRITE seed files — `net-mesh org keygen` and
+/// `net-mesh identity generate` — unguarded on their `--force` path, so
+/// `net-mesh identity generate --out "$KEY" --force` with `$KEY` drifted onto the
 /// org key path replaced the org root with an operator identity and exited 0.
 /// Keying on the KIND rather than on mere presence closes that without
 /// refusing the legitimate same-kind replace each verb's `--force` exists for.

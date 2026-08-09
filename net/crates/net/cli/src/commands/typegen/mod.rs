@@ -1,4 +1,4 @@
-//! `net transfer`-style command family `net-mesh typegen
+//! `net-mesh transfer`-style command family `net-mesh typegen
 //! (generate|snapshot|diff)` — generate typed language bindings
 //! (TypeScript, Python) from discovered `ToolDescriptor`s
 //! (`TYPEGEN_CLI_PLAN.md`).
@@ -6,7 +6,7 @@
 //! Descriptors come from one of two sources:
 //!
 //! - **Live discovery** — remote-attach to a mesh node (same flags as the
-//!   `net aggregator` / `net transfer` verbs), let the capability fold
+//!   `net-mesh aggregator` / `net-mesh transfer` verbs), let the capability fold
 //!   populate, then `Mesh::list_tools`. Requires the attach flags.
 //! - **Snapshot** — read a [`TypegenSnapshot`] JSON file pinned by an
 //!   earlier `typegen snapshot`. Reproducible and offline; the path CI and
@@ -428,7 +428,7 @@ async fn fetch_live_source(
     let profile = resolve_profile(config_path, profile_name).await?;
     let remote = require_remote_attach(&profile, attach, || {
         invalid_args(
-            "net typegen live discovery needs a mesh target: pass --node-addr <IP:PORT> \
+            "net-mesh typegen live discovery needs a mesh target: pass --node-addr <IP:PORT> \
              --node-pubkey <HEX> --node-id <N> --psk-hex <HEX> (each defaultable in the \
              profile), or use --from-snapshot for offline generation.",
         )
