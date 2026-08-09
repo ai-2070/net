@@ -13,6 +13,7 @@
 package net
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -62,6 +63,47 @@ func TestIngestBatchChecked_FailsOnTheFirstBadElement(t *testing.T) {
 	if !strings.Contains(err.Error(), "index 0") {
 		t.Fatalf("want the first bad index, got %v", err)
 	}
+}
+
+// The unchecked path keeps its documented skip-and-continue contract.
+//
+// It briefly delegated to IngestBatchChecked and discarded the error,
+// so one bad element dropped the entire batch and returned 0 with
+// nothing to inspect — strictly worse than the skip it documents, and
+// a silent behaviour change for every existing caller. The two
+// functions answer different questions and must not share a body.
+//
+// Asserted on the marshal stage alone: a nil receiver panics inside
+// IngestRawBatch, so reaching cgo is itself the evidence that the
+// batch was not abandoned at index 2.
+func TestIngestBatch_SkipsUnserializableAndKeepsTheRest(t *testing.T) {
+	events := []interface{}{
+		map[string]string{"ok": "1"},
+		map[string]string{"ok": "2"},
+		unserializable{Ch: make(chan int)},
+		map[string]string{"ok": "4"},
+	}
+
+	marshalled := 0
+	for _, e := range events {
+		if _, err := json.Marshal(e); err == nil {
+			marshalled++
+		}
+	}
+	if marshalled != 3 {
+		t.Fatalf("test premise: want 3 serializable events, got %d", marshalled)
+	}
+
+	defer func() {
+		// A panic from the nil receiver means the marshal loop ran to
+		// completion and handed a non-empty slice to IngestRawBatch.
+		// An abort at index 2 would have returned before that.
+		if recover() == nil {
+			t.Fatal("expected IngestRawBatch to be reached on the nil receiver")
+		}
+	}()
+	var bs *Net
+	bs.IngestBatch(events)
 }
 
 func TestIngestBatchChecked_WrapsTheMarshalCause(t *testing.T) {

@@ -358,10 +358,30 @@ func (bs *Net) Ingest(event interface{}) error {
 
 // IngestBatch ingests multiple events by marshaling them to JSON.
 //
-// Returns the number of successfully ingested events.
+// Returns the number of successfully ingested events. A value whose
+// `json.Marshal` fails is skipped and the rest of the batch is still
+// ingested, so the count can be lower than `len(events)` for two
+// different reasons — a marshal failure or a ring-buffer drop — which
+// this signature cannot distinguish.
+//
+// Use IngestBatchChecked when that distinction matters. It is the
+// same work with the marshal failure reported instead of swallowed,
+// and it is the shape Rust, TypeScript and Python already have.
+//
+// This deliberately does NOT delegate to IngestBatchChecked. Doing so
+// made one unserializable element discard the whole batch and return
+// 0, silently — a strictly worse answer than the documented skip, and
+// invisible at a call site with no error to inspect.
 func (bs *Net) IngestBatch(events []interface{}) int {
-	n, _ := bs.IngestBatchChecked(events)
-	return n
+	jsons := make([]string, 0, len(events))
+	for _, e := range events {
+		data, err := json.Marshal(e)
+		if err != nil {
+			continue
+		}
+		jsons = append(jsons, string(data))
+	}
+	return bs.IngestRawBatch(jsons)
 }
 
 // IngestBatchChecked marshals and ingests a batch, reporting the first
