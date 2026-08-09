@@ -505,19 +505,36 @@ Recorded rather than assumed:
   are syntax-checked and written to mirror the Node suite
   assertion-for-assertion, and need CI before they count.
 
-## Adjacent defects found, not fixed
+## Adjacent defects found — both since fixed
 
-Both surfaced while writing the first live nRPC test. Neither is in
-scope for these decisions; both are recorded at the relevant assertions.
+Both surfaced while writing the first live nRPC test. Neither was in
+scope for these decisions; both are closed.
 
-1. **`MeshRpc` pins the node forever.** `MeshRpc.fromMesh()` clones the
-   node's `Arc<MeshNode>` and offers no way to release it, unlike
-   `CapabilityGateway`, which grew `close()` for exactly this.
-   `NetMesh.shutdown()` needs sole ownership, so it fails with
-   "outstanding references exist" until V8 finalizes the `MeshRpc` — on
-   no schedule the caller controls.
-2. **A completed `callStreaming` breaks the next `callDuplex`.** In the
-   same process, the duplex call's chunks arrive but its terminal frame
-   does not, so a drain-to-EOF loop hangs. Registering a
-   server-streaming handler is harmless; it is the completed call that
-   does it. Narrowed no further.
+1. **`MeshRpc` pinned the node forever** (`a650d69b4`).
+   `MeshRpc.fromMesh()` cloned the node's `Arc<MeshNode>` and offered
+   no way to release it, unlike `CapabilityGateway`, which grew
+   `close()` for exactly this. `NetMesh.shutdown()` needs sole
+   ownership, so it failed with "outstanding references exist" until
+   V8 finalized the envelope. `MeshRpc.close()` now releases it.
+
+2. **The streaming terminal frame waited on a garbage collection**
+   (`ce043d4e1`). Filed as "a completed `callStreaming` breaks the
+   next `callDuplex`", which was wrong in every particular. The Rust
+   side kept no reference to the `JsResponseSink` it handed the JS
+   handler, so the inner `RpcResponseSink` — whose drop tells the fold
+   the response side is finished — was owned solely by a `#[napi]`
+   class, released by V8 finalization rather than by scope. Measured
+   at 7660, 7679, 7684 and 15777 ms on loopback, quantised to
+   collection cycles and unmoved by mesh traffic.
+
+   It was not cross-call interference and not specific to
+   server-streaming: every shape had it, and only the first streaming
+   call in a process paid full price because later ones landed after a
+   collection had run. Chunk delivery was unaffected, so any test
+   reading a known number of chunks passed — only a drain to EOF saw
+   it, and then as a hang rather than as latency. Both handlers now
+   drop the sink the instant the handler's promise settles.
+
+   `bindings/node/test/mesh_rpc_terminal_latency.test.ts` asserts the
+   latency directly on all four shapes, so a regression reports a
+   number instead of hanging.
