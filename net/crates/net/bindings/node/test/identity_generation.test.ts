@@ -77,11 +77,31 @@ describe('issuer generation', () => {
     expect(id.atGeneration(6).issuerGeneration).toBe(6)
   })
 
-  it('demands a key rotation at the ceiling', () => {
+  it('is usable at the ceiling, including across a restart', () => {
+    // This used to assert that re-applying `0xffffffff` at the ceiling
+    // threw `generation_exhausted`, contradicting the idempotence the
+    // line above pins at generation 5 — and doing it to the one issuer
+    // that most needs it. `atGeneration` names a target, and at the
+    // ceiling the only nameable target is the ceiling itself: a
+    // re-apply, not a rotation. An issuer there could not restore its
+    // own persisted state, and had no other way back.
     const ceiling = Identity.generate().atGeneration(0xffffffff)
     expect(ceiling.issuerGeneration).toBe(0xffffffff)
-    expect(() => ceiling.atGeneration(0xffffffff)).toThrow(
-      /generation_exhausted/,
+
+    // Usable for issuance...
+    const subject = Identity.generate()
+    expect(parseToken(issue(ceiling, subject)).issuerGeneration).toBe(
+      0xffffffff,
+    )
+
+    // ...and for the restart path.
+    const restored = Identity.fromStateBytes(ceiling.toStateBytes())
+    expect(restored.issuerGeneration).toBe(0xffffffff)
+    expect(restored.atGeneration(0xffffffff).issuerGeneration).toBe(0xffffffff)
+
+    // Backwards is still backwards here.
+    expect(() => ceiling.atGeneration(0xfffffffe)).toThrow(
+      /generation_went_backwards/,
     )
   })
 

@@ -82,12 +82,33 @@ def test_generation_may_not_go_backwards() -> None:
     assert ident.at_generation(6).issuer_generation == 6
 
 
-def test_ceiling_demands_a_key_rotation() -> None:
+def test_ceiling_is_usable_including_across_a_restart() -> None:
+    """The ceiling is fully usable; only advancing past it is refused.
+
+    This used to assert that re-applying ``0xFFFFFFFF`` at the ceiling
+    raised ``generation_exhausted``, contradicting the idempotence the
+    test above pins at generation 5 — and doing it to the one issuer
+    that most needs it. ``at_generation`` names a target, and at the
+    ceiling the only nameable target is the ceiling itself: a re-apply,
+    not a rotation. An issuer there could not restore its own persisted
+    state, and had no other way back.
+    """
     ceiling = Identity.generate().at_generation(0xFFFFFFFF)
     assert ceiling.issuer_generation == 0xFFFFFFFF
+
+    # Usable for issuance...
+    subject = Identity.generate()
+    assert parse_token(_issue(ceiling, subject))["issuer_generation"] == 0xFFFFFFFF
+
+    # ...and for the restart path.
+    restored = Identity.from_state_bytes(ceiling.to_state_bytes())
+    assert restored.issuer_generation == 0xFFFFFFFF
+    assert restored.at_generation(0xFFFFFFFF).issuer_generation == 0xFFFFFFFF
+
+    # Backwards is still backwards here.
     with pytest.raises(IdentityError) as excinfo:
-        ceiling.at_generation(0xFFFFFFFF)
-    assert "generation_exhausted" in str(excinfo.value)
+        ceiling.at_generation(0xFFFFFFFE)
+    assert "generation_went_backwards" in str(excinfo.value)
 
 
 def test_malformed_and_future_state_is_refused() -> None:

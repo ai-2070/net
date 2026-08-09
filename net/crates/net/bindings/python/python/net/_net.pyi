@@ -1047,7 +1047,59 @@ class Identity:
         """Alias for :meth:`from_seed`."""
         ...
     def to_bytes(self) -> bytes:
-        """Serialize as the 32-byte seed. Treat as secret."""
+        """Serialize as the 32-byte seed. Treat as secret.
+
+        **Key-only.** The seed carries no issuer generation, so an
+        issuer that has rotated and comes back through
+        :meth:`from_seed` / :meth:`from_bytes` starts at generation 0 —
+        below its own published floor, unable to mint anything a
+        verifier accepts. Use :meth:`to_state_bytes` /
+        :meth:`from_state_bytes` for anything that rotates."""
+        ...
+    @property
+    def issuer_generation(self) -> int:
+        """This issuer's credential epoch, stamped on every token
+        :meth:`issue_token` mints.
+
+        A verifier rejects that token once its ``RevocationRegistry``
+        floor for this entity exceeds this value."""
+        ...
+    def at_generation(self, next: int) -> "Identity":
+        """The same key at a later generation, as a **new** Identity.
+
+        This one is unchanged, so rotation is explicit at the call site
+        rather than something that happens to a caller mid-issuance.
+
+        ``next == issuer_generation`` is accepted and idempotent at
+        every generation including ``2**32 - 1``, so re-applying a
+        persisted generation on restart is never an error. Going
+        backwards raises :class:`IdentityError`. There is no generation
+        above ``2**32 - 1`` to name, so an issuer there can re-apply but
+        not advance; past that, rotate the key.
+
+        Rotation order: build the generation-N identity, persist
+        :meth:`to_state_bytes` atomically and durably, distribute
+        verifier floor N, then issue. Publishing floor N before the
+        state is durable leaves a crashed issuer announcing a floor it
+        cannot satisfy."""
+        ...
+    def to_state_bytes(self) -> bytes:
+        """Serialize the full issuer state: version, seed, generation.
+
+        **Secret material**, exactly like :meth:`to_bytes` — these bytes
+        contain the ed25519 signing seed. Encrypt at rest and write
+        atomically; a torn write here is an issuer that cannot come
+        back."""
+        ...
+    @staticmethod
+    def from_state_bytes(data: bytes) -> "Identity":
+        """Restore an issuer — key *and* generation — from
+        :meth:`to_state_bytes`.
+
+        The restart path for anything that rotates. Raises
+        :class:`IdentityError` on a wrong length or a version this build
+        does not understand: a partial parse of credential state is how
+        an issuer silently comes back on the wrong epoch."""
         ...
     @property
     def entity_id(self) -> bytes:
