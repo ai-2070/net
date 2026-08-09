@@ -54,8 +54,9 @@ use net::adapter::net::channel::ChannelName;
 // Re-export of core identity primitives so users can import directly
 // from `net_sdk::identity::*` instead of reaching into the core crate.
 pub use net::adapter::net::identity::{
-    EntityError, EntityId, EntityKeypair, OriginStamp, PermissionToken, TokenCache, TokenError,
-    TokenScope, MAX_TOKEN_TTL_SECS, TOKEN_CLOCK_SKEW_SECS_RECOMMENDED,
+    EntityError, EntityId, EntityKeypair, IdentityState, IdentityStateError, OriginStamp,
+    PermissionToken, TokenCache, TokenError, TokenScope, IDENTITY_STATE_SIZE,
+    IDENTITY_STATE_VERSION, MAX_TOKEN_TTL_SECS, TOKEN_CLOCK_SKEW_SECS_RECOMMENDED,
 };
 
 /// Caller-owned identity bundle: one ed25519 keypair + one token
@@ -67,6 +68,17 @@ pub use net::adapter::net::identity::{
 pub struct Identity {
     keypair: Arc<EntityKeypair>,
     cache: Arc<TokenCache>,
+    /// This issuer's credential epoch. Stamped onto every token this
+    /// identity issues or delegates.
+    ///
+    /// Not behind an `Arc`, and deliberately not mutable: rotating
+    /// produces a *new* `Identity` for the same key
+    /// ([`Identity::at_generation`]). A stale clone can therefore still
+    /// mint at `N - 1` after a rotation to `N`. That is an availability
+    /// failure — verifiers past floor `N` reject those tokens — not an
+    /// authority bypass, and it is the cheaper mistake than having a
+    /// clone in another thread silently change what a caller is signing.
+    generation: u32,
 }
 
 impl Identity {
@@ -89,6 +101,15 @@ impl Identity {
     /// Serialize the identity as its 32-byte seed. Token cache entries
     /// are runtime-only and not serialized — reinstall any long-lived
     /// grants via [`Self::install_token`] after reloading.
+    ///
+    /// **Key-only restoration resets the issuer generation to zero and
+    /// is not sufficient to restore an issuer after generation
+    /// rotation.** The seed carries no epoch, so an issuer that has
+    /// rotated to generation `N` and comes back through this path
+    /// starts minting at `0` again — below its own published floor, so
+    /// every token it signs is rejected, and it cannot climb back
+    /// without knowing `N`. Use [`Self::to_state_bytes`] /
+    /// [`Self::from_state_bytes`] for anything that rotates.
     pub fn to_bytes(&self) -> [u8; 32] {
         *self.keypair.secret_bytes()
     }
@@ -96,6 +117,9 @@ impl Identity {
     /// Load a previously-serialized identity. Expects exactly 32
     /// bytes — the ed25519 seed — otherwise returns
     /// [`TokenError::InvalidFormat`].
+    ///
+    /// Same caveat as [`Self::to_bytes`]: this restores the key, not
+    /// the issuer. Generation comes back as zero.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, TokenError> {
         if bytes.len() != 32 {
             return Err(TokenError::InvalidFormat);
@@ -103,6 +127,81 @@ impl Identity {
         let mut seed = [0u8; 32];
         seed.copy_from_slice(bytes);
         Ok(Self::from_seed(seed))
+    }
+
+    /// This issuer's current credential epoch.
+    ///
+    /// Every token [`Self::issue_token`] and the delegation builders
+    /// produce carries this value, and a verifier rejects it once its
+    /// [`crate::revocation::RevocationRegistry`] floor for this entity
+    /// exceeds it.
+    pub fn issuer_generation(&self) -> u32 {
+        self.generation
+    }
+
+    /// The same key at a later generation.
+    ///
+    /// Returns a *new* `Identity`; this one is unchanged, and so is
+    /// every other clone of it. Rotation is therefore explicit at the
+    /// call site rather than something a background thread can do to a
+    /// caller mid-issuance.
+    ///
+    /// `next == issuer_generation()` is accepted and idempotent, so
+    /// re-applying a persisted generation on restart is not an error.
+    /// Going backwards is rejected — it would re-mint at an epoch the
+    /// issuer has already retired.
+    ///
+    /// # Rotation order
+    ///
+    /// 1. construct the generation-`N` identity here;
+    /// 2. persist [`Self::to_state_bytes`] atomically and durably;
+    /// 3. distribute verifier floor `N`;
+    /// 4. start issuing from the returned identity.
+    ///
+    /// Never publish floor `N` before step 2 completes. A crash between
+    /// them leaves an issuer that has announced a floor it has no
+    /// durable state to satisfy, and it cannot mint anything a verifier
+    /// will accept — permanent self-revocation, recoverable only by
+    /// rotating the key.
+    pub fn at_generation(&self, next: u32) -> Result<Self, IdentityStateError> {
+        let generation = IdentityState::check_rotation(self.generation, next)?;
+        Ok(Self {
+            keypair: self.keypair.clone(),
+            cache: self.cache.clone(),
+            generation,
+        })
+    }
+
+    /// Serialize the full issuer state: version, seed, generation.
+    ///
+    /// **Secret material** — these bytes contain the ed25519 signing
+    /// seed, exactly like [`Self::to_bytes`]. Encrypt at rest, and
+    /// write atomically (temp file + rename, or whatever your vault
+    /// offers): a torn write here is an issuer that cannot come back.
+    ///
+    /// The token cache is not included; it is runtime state, and its
+    /// entries are other issuers' grants rather than this issuer's.
+    pub fn to_state_bytes(&self) -> [u8; IDENTITY_STATE_SIZE] {
+        IdentityState {
+            seed: *self.keypair.secret_bytes(),
+            generation: self.generation,
+        }
+        .to_bytes()
+    }
+
+    /// Restore an issuer — key *and* generation — from
+    /// [`Self::to_state_bytes`].
+    ///
+    /// This is the restart path for anything that rotates. A restored
+    /// identity mints at the generation it was persisted with, so it
+    /// satisfies the floor it published before going down.
+    pub fn from_state_bytes(bytes: &[u8]) -> Result<Self, IdentityStateError> {
+        let state = IdentityState::from_bytes(bytes)?;
+        Ok(Self {
+            keypair: Arc::new(EntityKeypair::from_bytes(state.seed)),
+            cache: Arc::new(TokenCache::new()),
+            generation: state.generation,
+        })
     }
 
     /// Ed25519 public key. 32 bytes.
@@ -194,8 +293,9 @@ impl Identity {
         ttl: Duration,
         delegation_depth: u8,
     ) -> Result<PermissionToken, TokenError> {
-        PermissionToken::try_issue(
+        PermissionToken::try_issue_with_generation(
             &self.keypair,
+            self.generation,
             subject,
             scope,
             channel.hash(),
@@ -242,6 +342,9 @@ impl Identity {
         Self {
             keypair: Arc::new(kp),
             cache: Arc::new(TokenCache::new()),
+            // Key-only construction has no epoch to restore. See
+            // `to_bytes` for why that matters after a rotation.
+            generation: 0,
         }
     }
 }

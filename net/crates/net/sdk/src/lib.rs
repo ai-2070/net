@@ -173,6 +173,11 @@ pub mod mesh_a2a;
 pub mod gang;
 #[cfg(feature = "net")]
 pub mod identity;
+// Its own file rather than another block in `identity.rs`: these walk
+// a full rotation against a `RevocationRegistry` rather than unit-
+// testing one method, and the module is already long.
+#[cfg(test)]
+mod identity_generation_tests;
 #[cfg(feature = "net")]
 pub mod revocation;
 // Agent-to-agent (A2A) task handoff (Hermes V2 Phase 3) — the transport-
@@ -267,7 +272,9 @@ pub use crate::compute::{
 #[cfg(feature = "net")]
 pub use crate::capabilities::{CapabilityFilter, CapabilitySet};
 #[cfg(feature = "net")]
-pub use crate::identity::{Identity, PermissionToken, TokenError, TokenScope};
+pub use crate::identity::{
+    Identity, IdentityStateError, PermissionToken, TokenError, TokenScope, IDENTITY_STATE_SIZE,
+};
 // Delegated-identity convenience re-exports (Phase 3): the chain type, the
 // shared revocation registry, and the child-seed KDF.
 #[cfg(feature = "net")]
