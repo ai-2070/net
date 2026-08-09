@@ -18,6 +18,10 @@ on:
       - ".github/scripts/check-docs-tiers.py"
       - ".github/scripts/check-spine-symbols.py"
       - ".github/scripts/check-doc-code-width.py"
+      # The C snippet check compiles doc fences against the real public
+      # headers, so a header change can break it without web/ being touched.
+      - ".github/scripts/check-c-doc-snippets.py"
+      - "net/crates/net/include/**"
   pull_request:
     paths:
       - "web/**"
@@ -30,6 +34,10 @@ on:
       - ".github/scripts/check-docs-tiers.py"
       - ".github/scripts/check-spine-symbols.py"
       - ".github/scripts/check-doc-code-width.py"
+      # The C snippet check compiles doc fences against the real public
+      # headers, so a header change can break it without web/ being touched.
+      - ".github/scripts/check-c-doc-snippets.py"
+      - "net/crates/net/include/**"
 
 jobs:
   check:
@@ -110,6 +118,21 @@ jobs:
       - name: Check the width checker still catches defects
         working-directory: .
         run: .github/scripts/check-doc-code-width.py --self-test
+
+      # The C quickstart shipped calling `free(cursor)` while including only
+      # net.h, <stdio.h> and <string.h>, so the advertised copy-and-run program
+      # did not compile. Reading it cannot catch that, and the skill-example
+      # check only covers real .c files on disk — the doc-site fences had no
+      # floor at all. This compiles every complete C program the docs publish,
+      # against the real public headers, at the strictness a careful reader
+      # would use.
+      - name: Check every published C program compiles
+        working-directory: .
+        run: .github/scripts/check-c-doc-snippets.py
+
+      - name: Check the C snippet checker still catches defects
+        working-directory: .
+        run: .github/scripts/check-c-doc-snippets.py --self-test
 
       # No lint or format step, and both omissions are deliberate:
       #

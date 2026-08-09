@@ -9,7 +9,8 @@ Ingest events and poll them back, freeing what the ABI hands you.
 ```c
 #include "net.h"
 #include <stdio.h>
-#include <string.h>
+#include <stdlib.h>   /* malloc, free */
+#include <string.h>   /* strlen, memcpy */
 
 int main(void) {
     // net_init returns NULL on failure. Pass NULL for defaults.
@@ -35,7 +36,12 @@ int main(void) {
         // `out.next_id` is owned by `out`. To page forward you MUST copy it BEFORE
         // freeing — net_free_poll_result frees next_id too, so using it after the
         // free is a use-after-free.
-        char *cursor = out.next_id ? strdup(out.next_id) : NULL;
+        char *cursor = NULL;
+        if (out.next_id) {
+            size_t n = strlen(out.next_id) + 1;
+            cursor = malloc(n);
+            if (cursor) memcpy(cursor, out.next_id, n);
+        }
         net_free_poll_result(&out);          // frees events AND next_id
         // ... pass `cursor` to the next net_poll_ex, then eventually:
         free(cursor);
@@ -53,9 +59,14 @@ acceptance, not delivery (see
 Polling is cursor-paginated: `net_poll_ex(handle, limit, cursor, &out)` fills
 `out.events` / `out.count`, sets `out.next_id` (the next cursor) and `out.has_more`.
 A `NULL` cursor starts from the earliest buffered event; **copy `out.next_id`
-(e.g. with `strdup`) before calling `net_free_poll_result`**, then pass the copy as
-the `cursor` to page forward. There is no async subscribe — poll on an interval for
-a live loop. The full paging loop is in the C header's `README.md`.
+before calling `net_free_poll_result`**, then pass the copy as the `cursor` to page
+forward. `strdup` does the same job in one line, but it is POSIX rather than ISO C
+and disappears under `-std=c11`; the `malloc` + `memcpy` above compiles anywhere.
+There is no async subscribe — poll on an interval for a live loop. The full paging
+loop is in the C header's `README.md`.
+
+This program compiles clean under `-std=c11 -Wall -Wextra -Werror`, and CI checks
+that on every commit.
 
 ## The three memory rules
 

@@ -64,7 +64,8 @@ LD_LIBRARY_PATH=target/release ./app           # DYLD_LIBRARY_PATH on macOS
 ```c
 #include "net.h"
 #include <stdio.h>
-#include <string.h>
+#include <stdlib.h>   /* malloc, free */
+#include <string.h>   /* strlen, memcpy */
 
 int main(void) {
     net_handle_t node = net_init("{\"num_shards\": 4}");   // NULL on failure
@@ -80,8 +81,14 @@ int main(void) {
         for (size_t i = 0; i < out.count; i++) {
             printf("event: %.*s\n", (int)out.events[i].raw_len, out.events[i].raw);
         }
-        /* next_id is owned by `out` — copy it BEFORE freeing to page forward. */
-        char *cursor = out.next_id ? strdup(out.next_id) : NULL;
+        /* next_id is owned by `out` — copy it BEFORE freeing to page forward.
+         * `strdup` is POSIX, not ISO C, so it vanishes under `-std=c11`. */
+        char *cursor = NULL;
+        if (out.next_id) {
+            size_t n = strlen(out.next_id) + 1;
+            cursor = malloc(n);
+            if (cursor) memcpy(cursor, out.next_id, n);
+        }
         net_free_poll_result(&out);
         free(cursor);
     }

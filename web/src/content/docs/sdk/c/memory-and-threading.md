@@ -39,11 +39,20 @@ while (running) {
 
     /* Copy the cursor BEFORE freeing — net_free_poll_result frees next_id. */
     free(cursor);
-    cursor = result.next_id ? strdup(result.next_id) : NULL;
+    cursor = NULL;
+    if (result.next_id) {
+        size_t n = strlen(result.next_id) + 1;
+        cursor = malloc(n);
+        if (cursor) memcpy(cursor, result.next_id, n);
+    }
     net_free_poll_result(&result);
 }
 free(cursor);
 ```
+
+`malloc` and `free` come from `<stdlib.h>`, `strlen` and `memcpy` from
+`<string.h>`. `strdup` would collapse the copy to one line, but it is POSIX
+rather than ISO C and is not declared under `-std=c11`.
 
 A `NULL` cursor starts from the earliest buffered event. There is no async
 subscribe in the C ABI — the SDK does not manage threads, so a live consumer is
