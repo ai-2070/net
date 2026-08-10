@@ -48,6 +48,10 @@ net-mesh ice force-restart-daemon 0x000007 --name indexer --dry-run
 net-mesh ice force-restart-daemon 0x000007 --name indexer
 ```
 
+Upgrading? [CHANGELOG.md](CHANGELOG.md) records what an operator or a CI
+script has to do differently — 0.35 makes `--local` mandatory on both
+`snapshot` verbs, which will fail scripts that call them.
+
 ## Subcommand surface
 
 | Subcommand    | What it does                                                                    |
