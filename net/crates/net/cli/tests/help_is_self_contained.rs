@@ -23,6 +23,7 @@
 use assert_cmd::prelude::*;
 use std::collections::BTreeSet;
 use std::process::Command;
+use std::sync::OnceLock;
 
 const BIN: &str = "net-mesh";
 
@@ -94,8 +95,17 @@ fn help_for(path: &[String]) -> String {
 }
 
 /// Child subcommand names listed in a help page's `Commands:` block.
+///
+/// Only the FIRST column counts. clap wraps a long subcommand description
+/// onto continuation lines that are indented exactly like a real entry, so
+/// taking the first word of every indented line would treat a stray English
+/// word as a subcommand — and `help_for` would then panic on
+/// `net-mesh <that word> --help` with a message about the CLI rather than
+/// about this parser. clap indents names to a consistent column and indents
+/// continuations further, so require the name to start at the shallowest
+/// indent seen in the block.
 fn children_of(help: &str) -> Vec<String> {
-    let mut out = Vec::new();
+    let mut rows: Vec<(usize, String)> = Vec::new();
     let mut in_commands = false;
 
     for line in help.lines() {
@@ -103,47 +113,66 @@ fn children_of(help: &str) -> Vec<String> {
             in_commands = true;
             continue;
         }
-        if in_commands {
-            // The block ends at the first non-indented line.
-            if !line.starts_with(' ') {
-                break;
-            }
-            if let Some(name) = line.split_whitespace().next() {
-                // `help` recurses into itself forever and documents clap, not us.
-                if name != "help" {
-                    out.push(name.to_owned());
-                }
-            }
+        if !in_commands {
+            continue;
+        }
+        // The block ends at the first non-indented line (clap separates
+        // blocks with a blank line, which is not indented either).
+        if !line.starts_with(' ') {
+            break;
+        }
+        let indent = line.len() - line.trim_start().len();
+        if let Some(name) = line.split_whitespace().next() {
+            rows.push((indent, name.to_owned()));
         }
     }
-    out
+
+    let Some(name_column) = rows.iter().map(|(indent, _)| *indent).min() else {
+        return Vec::new();
+    };
+
+    rows.into_iter()
+        .filter(|(indent, _)| *indent == name_column)
+        // `help` recurses into itself forever and documents clap, not us.
+        .filter(|(_, name)| name != "help")
+        .map(|(_, name)| name)
+        .collect()
 }
 
 /// Every reachable `--help` page, keyed by its subcommand path.
-fn every_help_page() -> Vec<(String, String)> {
-    let mut pages = Vec::new();
-    let mut queue: Vec<Vec<String>> = vec![Vec::new()];
-    let mut seen: BTreeSet<Vec<String>> = BTreeSet::new();
+///
+/// Walked once per test binary, not once per test. The tree is ~35 pages and
+/// each page is a process spawn; the three tests below all need the same
+/// pages, so walking per-test tripled the cost for nothing. Integration tests
+/// share a process and run on separate threads, so this is a `OnceLock`
+/// rather than a plain `static`.
+fn every_help_page() -> &'static [(String, String)] {
+    static PAGES: OnceLock<Vec<(String, String)>> = OnceLock::new();
+    PAGES.get_or_init(|| {
+        let mut pages = Vec::new();
+        let mut queue: Vec<Vec<String>> = vec![Vec::new()];
+        let mut seen: BTreeSet<Vec<String>> = BTreeSet::new();
 
-    while let Some(path) = queue.pop() {
-        if !seen.insert(path.clone()) {
-            continue;
+        while let Some(path) = queue.pop() {
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            let help = help_for(&path);
+            for child in children_of(&help) {
+                let mut next = path.clone();
+                next.push(child);
+                queue.push(next);
+            }
+            let label = if path.is_empty() {
+                BIN.to_owned()
+            } else {
+                format!("{BIN} {}", path.join(" "))
+            };
+            pages.push((label, help));
         }
-        let help = help_for(&path);
-        for child in children_of(&help) {
-            let mut next = path.clone();
-            next.push(child);
-            queue.push(next);
-        }
-        let label = if path.is_empty() {
-            BIN.to_owned()
-        } else {
-            format!("{BIN} {}", path.join(" "))
-        };
-        pages.push((label, help));
-    }
 
-    pages
+        pages
+    })
 }
 
 #[test]
