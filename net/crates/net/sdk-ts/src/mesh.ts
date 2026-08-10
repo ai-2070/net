@@ -472,7 +472,12 @@ export class MeshNode {
    *
    * ```typescript
    * const node = await MeshNode.create({ bindAddr, psk });
-   * const handle = serveTool(node.rpc(), { name: 'web_search' }, handler);
+   * const rpc = node.rpc();          // hold it — see below
+   * const handle = serveTool(rpc, { name: 'web_search' }, handler);
+   *
+   * handle.close();
+   * rpc.raw.close();
+   * await node.shutdown();
    * ```
    *
    * It exists because there was no supported way to get one. The
@@ -824,7 +829,7 @@ export class MeshNode {
   async storeDir(
     adapter: Parameters<NapiNetMesh['storeDir']>[0],
     root: string,
-  ): Promise<ReturnType<NapiNetMesh['storeDir']> extends Promise<infer T> ? T : never> {
+  ): Promise<Awaited<ReturnType<NapiNetMesh['storeDir']>>> {
     return this.native.storeDir(adapter, root);
   }
 
@@ -833,7 +838,7 @@ export class MeshNode {
     sourceId: bigint,
     manifestRef: Parameters<NapiNetMesh['fetchDir']>[1],
     dest: string,
-  ): Promise<ReturnType<NapiNetMesh['fetchDir']> extends Promise<infer T> ? T : never> {
+  ): Promise<Awaited<ReturnType<NapiNetMesh['fetchDir']>>> {
     return this.native.fetchDir(sourceId, manifestRef, dest);
   }
 
