@@ -159,6 +159,164 @@ func (id *Identity) ToSeed() ([]byte, error) {
 	return out, nil
 }
 
+// ---------------------------------------------------------------------------
+// Issuer generation + durable issuer state
+//
+// A token carries the credential epoch of the identity that signed it, and a
+// verifier rejects it once its revocation floor for that issuer exceeds the
+// epoch. That is only usable if an issuer can restart still knowing which
+// epoch it is on, and the 32-byte seed cannot carry one: IdentityFromSeed
+// comes back at generation zero, which for an issuer that has already
+// published floor N means it can mint nothing a verifier will accept.
+//
+// Node and Python have had this since it landed; Go had the C declarations
+// and no way to reach them.
+// ---------------------------------------------------------------------------
+
+// IdentityStateSize is the number of bytes ToState writes, as reported by
+// the linked libnet rather than by this package's header.
+//
+// Size your own storage from this, not from a constant you copied. The two
+// agree in a matched build; if they ever disagree, the library is right and
+// the header is stale — which is exactly the case a hard-coded 37 would turn
+// into a buffer overrun rather than a mismatch you can see.
+func IdentityStateSize() int {
+	return int(C.net_identity_state_size())
+}
+
+// IssuerGeneration is this issuer's current credential epoch.
+//
+// Every token Issue mints carries it, and a verifier rejects that token once
+// its revocation floor for this entity exceeds it.
+//
+// Returns 0 for a closed identity, which is indistinguishable from a genuine
+// generation zero — the same shape as NodeID and OriginHash, and deliberate:
+// zero is the epoch that claims the least, so a caller that ignores the
+// distinction under-claims rather than over-claims.
+func (id *Identity) IssuerGeneration() uint32 {
+	id.mu.RLock()
+	defer id.mu.RUnlock()
+	if id.handle == nil {
+		return 0
+	}
+	return uint32(C.net_identity_generation(id.handle))
+}
+
+// AtGeneration returns the same key at a later generation, as a NEW Identity.
+//
+// The receiver is unchanged and both must be closed separately — rotation is
+// explicit at the call site rather than something that happens to a caller
+// mid-issuance. The returned identity has its own empty token cache; the C
+// ABI hands out owning pointers, so sharing one across two independently
+// freeable handles would make one Close observable through the other.
+//
+// `next` equal to IssuerGeneration is accepted and idempotent at every
+// generation including 1<<32 - 1, so re-applying a persisted generation on
+// restart is never an error. Going backwards returns ErrIdentity. There is no
+// generation above 1<<32 - 1 to name, so an issuer there can re-apply but not
+// advance; past that, rotate the identity key.
+//
+// Rotation order:
+//
+//  1. build the generation-N identity here;
+//  2. persist ToState atomically and durably;
+//  3. distribute verifier floor N;
+//  4. start issuing from the returned identity.
+//
+// Never publish floor N before step 2 lands. A crash in between leaves an
+// issuer that has announced a floor it has no durable state to satisfy — it
+// can mint nothing a verifier accepts, and only a key rotation gets it back.
+func (id *Identity) AtGeneration(next uint32) (*Identity, error) {
+	id.mu.RLock()
+	defer id.mu.RUnlock()
+	if id.handle == nil {
+		return nil, ErrShuttingDown
+	}
+
+	var handle *C.net_identity_t
+	code := C.net_identity_at_generation(id.handle, C.uint32_t(next), &handle)
+	if err := identityErrorFromCode(code); err != nil {
+		// The C ABI collapses every rotation rejection into
+		// NET_ERR_IDENTITY, whose sentinel reads "malformed input" — true
+		// of a bad seed, unhelpful here. Going backwards is the only way
+		// the rotation check fails, and this handle's generation is
+		// immutable (rotation mints a new handle), so the real reason can
+		// be named without another round trip or a TOCTOU window. Wraps
+		// ErrIdentity, so errors.Is keeps working.
+		if errors.Is(err, ErrIdentity) {
+			current := uint32(C.net_identity_generation(id.handle))
+			if next < current {
+				return nil, fmt.Errorf(
+					"identity: generation %d is below this issuer's current %d; "+
+						"rotation only moves forward, though re-applying %d is fine: %w",
+					next, current, current, ErrIdentity)
+			}
+		}
+		return nil, err
+	}
+
+	rotated := &Identity{handle: handle}
+	runtime.SetFinalizer(rotated, (*Identity).free)
+	return rotated, nil
+}
+
+// ToState serializes the full issuer state — version, seed, generation.
+//
+// Secret material, exactly like ToSeed: these bytes contain the ed25519
+// signing seed. Encrypt at rest and write atomically; a torn write here is an
+// issuer that cannot come back.
+//
+// The buffer is sized from the linked library, so a build that grows the
+// state format cannot overflow a buffer this package allocated.
+func (id *Identity) ToState() ([]byte, error) {
+	id.mu.RLock()
+	defer id.mu.RUnlock()
+	if id.handle == nil {
+		return nil, ErrShuttingDown
+	}
+	out := make([]byte, IdentityStateSize())
+	if len(out) == 0 {
+		return nil, fmt.Errorf("identity: libnet reports a zero-byte state size: %w", ErrIdentity)
+	}
+	code := C.net_identity_to_state(id.handle, (*C.uint8_t)(unsafe.Pointer(&out[0])))
+	if err := identityErrorFromCode(code); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// IdentityFromState restores an issuer — key AND generation — from ToState
+// output.
+//
+// This is the restart path for anything that rotates. IdentityFromSeed
+// restores the key only and comes back at generation zero, which for a
+// rotated issuer means below its own published floor.
+//
+// Returns ErrIdentity on a wrong length or a version this build does not
+// understand, rather than parsing what it can: a partial parse of credential
+// state is how an issuer silently comes back on the wrong epoch.
+func IdentityFromState(state []byte) (*Identity, error) {
+	// Guard before indexing — &state[0] panics on an empty slice, and the
+	// C side would have rejected the length anyway.
+	if len(state) == 0 {
+		return nil, fmt.Errorf("identity: state is empty, want %d bytes: %w",
+			IdentityStateSize(), ErrIdentity)
+	}
+
+	var handle *C.net_identity_t
+	code := C.net_identity_from_state(
+		(*C.uint8_t)(unsafe.Pointer(&state[0])),
+		C.size_t(len(state)),
+		&handle,
+	)
+	if err := identityErrorFromCode(code); err != nil {
+		return nil, err
+	}
+	id := &Identity{handle: handle}
+	runtime.SetFinalizer(id, (*Identity).free)
+	return id, nil
+}
+
 // EntityID returns the 32-byte ed25519 public key.
 func (id *Identity) EntityID() ([]byte, error) {
 	id.mu.RLock()
