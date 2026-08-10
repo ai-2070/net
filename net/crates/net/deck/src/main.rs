@@ -40,11 +40,11 @@ async fn main() -> color_eyre::Result<()> {
     // falls through having allocated nothing, so `process::exit` is safe here
     // and keeps `--help` as fast as it should be.
     {
-        use std::io::{IsTerminal, Write};
+        use std::io::Write;
 
         let startup = cli::parse(
             std::env::args_os().skip(1),
-            std::io::stdout().is_terminal(),
+            cli::Streams::probe(),
             std::env::var_os(cli::ALLOW_NON_TTY_ENV).is_some_and(|v| !v.is_empty()),
         );
 
