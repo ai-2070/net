@@ -21,12 +21,22 @@ import (
 )
 
 func main() {
+	// `log.Fatalf` calls os.Exit, which does NOT run deferred functions — so
+	// every failure path below would skip `bus.Shutdown()` and leak the
+	// native runtime. Keep main a thin wrapper whose only job is the exit
+	// code, and let `run` return errors so its defer always fires.
+	if err := run(); err != nil {
+		log.Fatalf("%v", err)
+	}
+}
+
+func run() error {
 	fmt.Printf("Net version: %s\n", net.Version())
 
 	// Create event bus with default configuration
 	bus, err := net.New(nil)
 	if err != nil {
-		log.Fatalf("Failed to create event bus: %v", err)
+		return fmt.Errorf("failed to create event bus: %w", err)
 	}
 	defer bus.Shutdown()
 
@@ -76,12 +86,12 @@ func main() {
 	const wantIngested = 7 // 3 raw + 1 struct + 3 batch
 	stats, err := bus.Stats()
 	if err != nil {
-		log.Fatalf("Failed to get stats: %v", err)
+		return fmt.Errorf("failed to get stats: %w", err)
 	}
 	fmt.Printf("Stats: ingested=%d, dropped=%d\n",
 		stats.EventsIngested, stats.EventsDropped)
 	if stats.EventsIngested != wantIngested {
-		log.Fatalf("the bus did not accept every event: ingested=%d, want %d",
+		return fmt.Errorf("the bus did not accept every event: ingested=%d, want %d",
 			stats.EventsIngested, wantIngested)
 	}
 
@@ -94,7 +104,7 @@ func main() {
 	// JetStream, or mesh adapter and this same loop starts returning events.
 	response, err := bus.Poll(100, "")
 	if err != nil {
-		log.Fatalf("Failed to poll: %v", err)
+		return fmt.Errorf("failed to poll: %w", err)
 	}
 
 	fmt.Printf("Polled %d events (has_more=%v)\n", response.Count, response.HasMore)
@@ -130,4 +140,5 @@ func main() {
 	// above gets mistaken for a working round trip.
 	fmt.Printf("Accepted %d events at the producer boundary. "+
 		"Nothing consumed them — that needs an adapter.\n", stats.EventsIngested)
+	return nil
 }
