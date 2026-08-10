@@ -39,15 +39,22 @@ _RELEASE_FILE = re.compile(r"^RELEASE_v(\d+)\.(\d+)")
 # in prose (`0.34.0`) but the minor is what must match.
 _VERSION = re.compile(r"(?<![\d.])(\d+)\.(\d+)(?:\.\d+)?(?![\d.])")
 
-# Versions on these pages describe THIS product's release. Other numbers that
-# legitimately appear (a Node major, a Python minor, a TypeScript version) are
-# excluded by the allowlist below rather than by guessing from context.
-_NOT_A_NET_VERSION = {
-    # (page stem, matched text) pairs that name something else entirely.
-    ("go", "1.26"),
-    ("go", "1.25"),
-    ("typescript", "24.0"),
-}
+# Net is pre-1.0 and every published artifact is `0.x`, so a leading `0` is
+# what separates this product's version from the other numbers that
+# legitimately appear on an install page — Go 1.26, Node 24, Python 3.10.
+#
+# There used to be a `(page stem, text)` allowlist here for exactly those.
+# Every entry had a non-zero major, so the `major != 0` test below already
+# excluded all of them: the allowlist never rejected a single match and could
+# not have. It read like a maintained list, which is worse than no list —
+# adding "Go 1.27" to it when the toolchain moved would have felt like doing
+# the work, while the test that actually matters is the one below.
+#
+# The consequence to know: a genuinely non-Net `0.x` on an install page (some
+# dependency at 0.9, say) WOULD be flagged. That is not a hypothetical worth
+# a mechanism yet — no install page has one — and when it happens the honest
+# fix is an inline marker on that line, not a table in this file that drifts
+# away from the pages it describes.
 
 
 def latest_released_minor() -> tuple[int, int]:
@@ -59,20 +66,29 @@ def latest_released_minor() -> tuple[int, int]:
             found.append((int(m.group(1)), int(m.group(2))))
     if not found:
         raise SystemExit(f"FAIL  no release notes found under {_RELEASES}")
-    return max(found)
+
+    newest = max(found)
+    if newest[0] != 0:
+        # Say this here rather than let it surface as "found no version
+        # references at all; the matcher is broken", which is what the
+        # `major != 0` filter in `net_versions_in` would produce and which
+        # sends the reader after the wrong thing.
+        raise SystemExit(
+            f"FAIL  newest release is v{newest[0]}.{newest[1]}, but this "
+            "checker distinguishes Net versions from Go/Node/Python versions "
+            "by their leading `0`.\n"
+            "      Post-1.0 that no longer works. Replace the `major != 0` "
+            "test in `net_versions_in` with an explicit marker on the lines "
+            "that name a Net version."
+        )
+    return newest
 
 
 def net_versions_in(path: Path) -> list[tuple[int, int, str]]:
     """Every product-version-looking number on an install page."""
-    stem = path.stem
     out: list[tuple[int, int, str]] = []
     for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         for m in _VERSION.finditer(line):
-            text = m.group(0)
-            if (stem, f"{m.group(1)}.{m.group(2)}") in _NOT_A_NET_VERSION:
-                continue
-            if (stem, text) in _NOT_A_NET_VERSION:
-                continue
             # Only 0.x numbers are Net releases; Node 24, Go 1.26 etc. are not.
             if m.group(1) != "0":
                 continue
@@ -122,9 +138,18 @@ def self_test() -> int:
     print("==> self-test")
     major, minor = latest_released_minor()
 
+    # The stale number has to be a real, differently-spelled version. Going
+    # DOWN a minor breaks at `x.0` — `0.0 - 1` renders as `0.-1`, which the
+    # version regex does not match at all, so the test would report "flagged 0
+    # stale versions" and blame the matcher for arithmetic. Going up is always
+    # well-formed, and "names a version newer than anything released" is the
+    # same defect pointed the other way: the install pages must name the
+    # NEWEST RELEASED minor, not merely a different one.
+    stale_minor = minor + 1
+
     sample = (
         f"The current published release is **{major}.{minor}**.\n"
-        f'net-mesh = "{major}.{minor - 1}"\n'  # stale — must be caught
+        f'net-mesh = "{major}.{stale_minor}"\n'  # wrong — must be caught
         "Requires Node 24 and Go 1.26.\n"  # not Net versions — must be ignored
     )
     import tempfile
