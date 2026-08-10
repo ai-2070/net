@@ -11,10 +11,10 @@ Dart, Swift, Kotlin, Haskell, Erlang, PHP.
 [Headers and linking](https://ai2070.net/docs/sdk/c/headers-and-linking) ·
 [Memory and threading](https://ai2070.net/docs/sdk/c/memory-and-threading)
 
-## Ten headers, five libraries
+## Eleven headers, one library
 
-This is not one header. The full map — which header resolves against which
-cdylib, and which surface each covers — is in
+This is not one header. It is eleven — and every one of them resolves against
+the same `libnet`. The full map, with the surface each header covers, is in
 [Headers and Linking](https://ai2070.net/docs/sdk/c/headers-and-linking).
 
 | Header | Guard | Surface | Library |
@@ -61,10 +61,19 @@ LD_LIBRARY_PATH=target/release ./app           # DYLD_LIBRARY_PATH on macOS
 
 ## Quickstart
 
+This program prints one line and exits 0, and the line says the poll was
+empty. `net_init` with no adapter configured selects the default memory
+adapter, which counts events and discards them — so ingest succeeds, poll
+succeeds, and `out.count` is 0. What the snippet teaches is the call shape,
+the return codes, and who owns which allocation; it is not evidence that an
+event travelled anywhere. Configure a Redis, JetStream, or mesh adapter
+before treating a non-empty poll as the success condition.
+
 ```c
 #include "net.h"
 #include <stdio.h>
-#include <string.h>
+#include <stdlib.h>   /* malloc, free */
+#include <string.h>   /* strlen, memcpy */
 
 int main(void) {
     net_handle_t node = net_init("{\"num_shards\": 4}");   // NULL on failure
@@ -77,11 +86,20 @@ int main(void) {
 
     net_poll_result_t out;
     if (net_poll_ex(node, 100, NULL, &out) == 0) {
+        if (out.count == 0) {
+            printf("polled 0 events: the default adapter discards them\n");
+        }
         for (size_t i = 0; i < out.count; i++) {
             printf("event: %.*s\n", (int)out.events[i].raw_len, out.events[i].raw);
         }
-        /* next_id is owned by `out` — copy it BEFORE freeing to page forward. */
-        char *cursor = out.next_id ? strdup(out.next_id) : NULL;
+        /* next_id is owned by `out` — copy it BEFORE freeing to page forward.
+         * `strdup` is POSIX, not ISO C, so it vanishes under `-std=c11`. */
+        char *cursor = NULL;
+        if (out.next_id) {
+            size_t n = strlen(out.next_id) + 1;
+            cursor = malloc(n);
+            if (cursor) memcpy(cursor, out.next_id, n);
+        }
         net_free_poll_result(&out);
         free(cursor);
     }

@@ -18,6 +18,11 @@ on:
       - ".github/scripts/check-docs-tiers.py"
       - ".github/scripts/check-spine-symbols.py"
       - ".github/scripts/check-doc-code-width.py"
+      # The C snippet check compiles doc fences against the real public
+      # headers, so a header change can break it without web/ being touched.
+      - ".github/scripts/check-c-doc-snippets.py"
+      - ".github/scripts/check-install-version.py"
+      - "net/crates/net/include/**"
   pull_request:
     paths:
       - "web/**"
@@ -30,6 +35,11 @@ on:
       - ".github/scripts/check-docs-tiers.py"
       - ".github/scripts/check-spine-symbols.py"
       - ".github/scripts/check-doc-code-width.py"
+      # The C snippet check compiles doc fences against the real public
+      # headers, so a header change can break it without web/ being touched.
+      - ".github/scripts/check-c-doc-snippets.py"
+      - ".github/scripts/check-install-version.py"
+      - "net/crates/net/include/**"
 
 jobs:
   check:
@@ -110,6 +120,39 @@ jobs:
       - name: Check the width checker still catches defects
         working-directory: .
         run: .github/scripts/check-doc-code-width.py --self-test
+
+      # The install pages hard-code "the current published release is X" and
+      # use it as a cross-layer pin instruction. It said 0.33 while every
+      # registry served 0.34 — a fact with an expiry date that nothing was
+      # watching. This derives the answer from the release notes in the tree.
+      - name: Check the install pages name the current release
+        working-directory: .
+        run: .github/scripts/check-install-version.py
+
+      - name: Check the version checker still catches defects
+        working-directory: .
+        run: .github/scripts/check-install-version.py --self-test
+
+      # The C quickstart shipped calling `free(cursor)` while including only
+      # net.h, <stdio.h> and <string.h>, so the advertised copy-and-run program
+      # did not compile. Reading it cannot catch that, and the skill-example
+      # check only covers real .c files on disk — the doc-site fences had no
+      # floor at all. This compiles every complete C program the docs publish,
+      # against the real public headers, at the strictness a careful reader
+      # would use.
+      #
+      # `--require-cc` because a runner without a C compiler is a broken
+      # runner, not a reason to pass. Skipping is the right default locally —
+      # editing markdown without a toolchain is reasonable — but in CI a
+      # silent skip is a green step that checked nothing, which is the same
+      # failure this gate exists to prevent one level up.
+      - name: Check every published C program compiles
+        working-directory: .
+        run: .github/scripts/check-c-doc-snippets.py --require-cc
+
+      - name: Check the C snippet checker still catches defects
+        working-directory: .
+        run: .github/scripts/check-c-doc-snippets.py --self-test --require-cc
 
       # No lint or format step, and both omissions are deliberate:
       #

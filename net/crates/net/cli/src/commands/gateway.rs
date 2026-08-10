@@ -1,4 +1,4 @@
-//! `net gateway (stats|exports|export)` — surface the local
+//! `net-mesh gateway (stats|exports|export)` — surface the local
 //! mesh node's `SubnetGateway` state.
 //!
 //! `stats` rolls up `local_subnet`, forwarded/dropped counters,
@@ -154,7 +154,7 @@ async fn run_export(
         let _ = parse_subnet(target)?;
     }
     Err(invalid_args(
-        "net gateway export is read-validation-only today: arguments parse but \
+        "net-mesh gateway export is read-validation-only today: arguments parse but \
          the substrate mutate path requires a write-capable mesh handle that the \
          CLI's read-only DeckClient doesn't own. Set the export rule via the \
          operator daemon's config or the substrate's `SubnetGateway::export_channel` \
@@ -199,7 +199,7 @@ pub(crate) fn parse_channel_hash(raw: &str) -> Result<u64, CliError> {
         if !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err(invalid_args(format!(
                 "channel `{raw}`: a hash literal must be EXACTLY lowercase `0x` \
-                 followed by 16 lowercase hex digits, as `net gateway exports` \
+                 followed by 16 lowercase hex digits, as `net-mesh gateway exports` \
                  renders it. Short, long, or uppercase forms are refused rather \
                  than widened or reinterpreted (a short value is indistinguishable \
                  from the collidable 16-bit wire hint). Prefer the channel name: \

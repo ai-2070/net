@@ -19,7 +19,13 @@ requires-python = ">=3.10"
 # may break APIs. `>=0.35.0` let pip resolve or retain this 0.34 wrapper
 # against a 0.35+ core anyway, and the failure only surfaced later, at
 # the first call into a changed or removed native method.
-dependencies = ["net-mesh>=0.35.0,<0.35.0"]
+#
+# The upper bound is the *next* minor, not this one: patch releases within
+# the minor are additive by the versioning policy, so they stay resolvable,
+# while `0.36` is excluded because a pre-1.0 minor may break the wrapper.
+# `tests/test_packaging_metadata.py` asserts this range is non-empty and
+# admits the sibling `bindings/python` version.
+dependencies = ["net-mesh>=0.35.0,<0.36.0"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -35,7 +41,9 @@ keywords = ["net", "mesh", "event-bus", "streaming", "ai", "llm", "inference"]
 
 [project.optional-dependencies]
 pydantic = ["pydantic>=2.0"]
-test = ["pytest>=9.0.0"]
+# `packaging` backs tests/test_packaging_metadata.py, which parses the
+# dependency specifiers in this file. It is not a runtime dependency.
+test = ["pytest>=9.0.0", "packaging>=24.0"]
 
 [project.urls]
 Homepage = "https://github.com/ai-2070/net"

@@ -62,7 +62,40 @@ cargo build --release -p net-ffi
 |---|---|
 | Linux | `target/release/libnet.so` |
 | macOS | `target/release/libnet.dylib` |
-| Windows | `target/release/net.dll` |
+| Windows | `target/release/net.dll` + `net.dll.lib` |
+
+#### Pointing a fetched module at that library
+
+The cgo directives in this package say
+`-L${SRCDIR}/../net/crates/net/target/release`, which is correct when you are
+building inside a checkout and wrong everywhere else. `SRCDIR` for a module
+fetched with `go get` is the module cache, so that path resolves to a sibling
+checkout that does not exist and the link fails:
+
+```text
+ld.exe: cannot find -lnet: No such file or directory
+```
+
+That is not a missing library — it is the right library in a place the fetched
+module cannot name. Override the search path with `CGO_LDFLAGS`:
+
+```bash
+export CGO_LDFLAGS="-L/abs/path/to/net/crates/net/target/release"
+go build ./...
+```
+
+Then make sure the *loader* can find it too, which is a separate step from
+linking:
+
+```bash
+export LD_LIBRARY_PATH=/abs/path/to/net/crates/net/target/release    # Linux
+export DYLD_LIBRARY_PATH=/abs/path/to/net/crates/net/target/release  # macOS
+set PATH=C:\abs\path\to\net\crates\net\target\release;%PATH%         :: Windows
+```
+
+Windows has no `LD_LIBRARY_PATH`; it searches the executable's directory and
+then `PATH`. Miss this and the binary exits 127 before `main` runs, usually
+with no stderr at all — the build looked completely successful.
 
 One library, deliberately. Every surface — mesh, nRPC, MeshDB, MeshOS, Deck,
 MCP, organization/subnet — is linked into it by `bindings/go/net-ffi`, and
@@ -148,6 +181,10 @@ if err := bus.Ingest(map[string]any{"sensor": "radar", "range_m": 45.0}); err !=
 }
 
 // Poll — cursor-paginated. "" starts from the earliest buffered event.
+//
+// With the default (memory) config this returns ZERO events: that adapter
+// counts and discards. The loop below is the shape you will use once a
+// Redis, JetStream, or mesh adapter is configured — it is not a round trip.
 resp, err := bus.Poll(100, "")
 for _, ev := range resp.Events {
     fmt.Println("event", string(ev))

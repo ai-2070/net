@@ -1,7 +1,9 @@
 // Package net — Deck operator client.
 //
-// The Deck surface is compiled into the `libnet_deck` cdylib (separate
-// from `libnet`). Build with `cargo build --release -p net-deck-ffi`.
+// The Deck surface is compiled into `libnet`, the one shared library
+// every surface resolves against. Build with `cargo build --release -p
+// net-ffi`; `bindings/go/deck-ffi` is an rlib linked into it and emits
+// nothing of its own, so there is no second `-l` to add.
 //
 // This file covers the operator-side admin + status surface (slice 1):
 // client lifecycle, all 9 AdminCommands verbs, one-shot status reads,

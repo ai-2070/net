@@ -1,4 +1,4 @@
-//! `net snapshot (get|status)` — one-shot reads of the live
+//! `net-mesh snapshot (get|status)` — one-shot reads of the live
 //! `MeshOsSnapshot` + the typed `StatusSummary`.
 //!
 //! - `snapshot get` — `client.status()` returns the freshest
@@ -10,6 +10,21 @@
 //!
 //! Both are sync substrate reads — no streams, no Ctrl-C
 //! cancellation needed.
+//!
+//! # Why these require `--local`
+//!
+//! The Deck client is built from a `MeshOsDaemonSdk` that
+//! [`CliContext::build`] starts *during this invocation*. There is no
+//! attach path: `build_with_remote` gives the context an `Arc<MeshNode>`
+//! for typed RPC clients, but `DeckClient::from_runtime` still reads the
+//! local runtime. So a snapshot read can only ever describe a supervisor
+//! this process just created, which is empty by construction.
+//!
+//! Without a flag, that produced the worst possible outcome: plausible
+//! snapshot JSON, exit 0, and the only warning on stderr about an
+//! ephemeral identity — so the reader concludes the cluster is healthy
+//! and idle rather than that nothing was inspected. `--local` makes the
+//! choice explicit; the default now says what is missing.
 
 use std::path::PathBuf;
 
@@ -18,7 +33,7 @@ use net_sdk::deck::{MeshOsSnapshot, StatusSummary};
 use serde::Serialize;
 
 use crate::context::{resolve_profile, CliContext};
-use crate::error::{generic, CliError};
+use crate::error::{generic, invalid_args, CliError};
 use crate::prelude::{emit_value, OutputFormat};
 
 #[derive(Subcommand, Debug)]
@@ -40,6 +55,15 @@ pub struct GetArgs {
     /// Substrate node id for the in-process supervisor.
     #[arg(long, default_value_t = crate::prelude::DEFAULT_SUPERVISOR_NODE)]
     pub node: u64,
+
+    /// Report the in-process supervisor this command starts, rather than a
+    /// running deployment.
+    ///
+    /// Required, because that is the only thing this command can read. The
+    /// result is a fresh, empty snapshot — useful for checking the output
+    /// shape or in tests, and not a picture of any cluster.
+    #[arg(long)]
+    pub local: bool,
 }
 
 #[derive(Args, Debug)]
@@ -49,6 +73,40 @@ pub struct StatusArgs {
 
     #[arg(long, default_value_t = crate::prelude::DEFAULT_SUPERVISOR_NODE)]
     pub node: u64,
+
+    /// Report the in-process supervisor this command starts, rather than a
+    /// running deployment. See `net-mesh snapshot get --help`.
+    #[arg(long)]
+    pub local: bool,
+}
+
+/// Refuse to present a freshly created runtime as a deployment read.
+///
+/// Returns exit code 2 (invalid args), because this is a usage problem: the
+/// operator asked a question this command cannot answer, and the honest
+/// answer is to say so rather than to serialize an empty struct.
+fn require_explicit_local(local: bool, verb: &str) -> Result<(), CliError> {
+    if local {
+        // Still say it, so a `--local` result piped into a report is not
+        // mistaken later for a cluster observation.
+        tracing::warn!(
+            "--local: reporting the in-process supervisor started by this \
+             command. It has no peers, daemons or replicas because it was \
+             created a moment ago; this is not a view of a running deployment."
+        );
+        return Ok(());
+    }
+
+    Err(invalid_args(format!(
+        "`snapshot {verb}` cannot read a running deployment. The Deck client \
+         is built from an in-process supervisor started by this command, so \
+         the only snapshot it can produce is of a runtime created moments \
+         ago — empty by construction, and indistinguishable from a healthy \
+         idle cluster. Pass --local to inspect that fresh runtime on purpose \
+         (output shape, smoke tests). To observe a real node, use a surface \
+         that attaches to one: `net-mesh aggregator`, `net-mesh peer`, or \
+         net-deck."
+    )))
 }
 
 pub async fn run(
@@ -59,6 +117,7 @@ pub async fn run(
 ) -> Result<(), CliError> {
     match cmd {
         SnapshotCommand::Get(args) => {
+            require_explicit_local(args.local, "get")?;
             let profile = resolve_profile(config_path, profile_name).await?;
             let ctx =
                 CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
@@ -67,6 +126,7 @@ pub async fn run(
                 .map_err(|e| generic(format!("write snapshot: {e}")))?;
         }
         SnapshotCommand::Status(args) => {
+            require_explicit_local(args.local, "status")?;
             let profile = resolve_profile(config_path, profile_name).await?;
             let ctx =
                 CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
@@ -86,7 +146,7 @@ pub async fn run(
 /// Serializable mirror of the substrate's `StatusSummary`.
 /// Fields match `bindings/python/src/deck.rs::status_summary_to_dict`
 /// — same shape every binding emits, so a script piping
-/// `net snapshot status --output json | jq` reads the same
+/// `net-mesh snapshot status --output json | jq` reads the same
 /// envelope as the Python / Node / Go consumers.
 #[derive(Serialize)]
 struct StatusSummaryMirror {

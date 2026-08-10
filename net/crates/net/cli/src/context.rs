@@ -11,7 +11,7 @@
 //! # Remote-attach
 //!
 //! Subcommands that need to call a remote daemon (today: every
-//! `net aggregator` write/query verb) build through
+//! `net-mesh aggregator` write/query verb) build through
 //! [`CliContext::build_with_remote`] and pass a
 //! [`RemoteAttach`]. The context boots a local ephemeral
 //! `MeshNode` on `127.0.0.1:0`, completes the Noise handshake
@@ -107,7 +107,7 @@ impl CliContext {
     /// Same as [`Self::mesh_node`] but returns a typed error when
     /// the context was built via [`Self::build`] instead of
     /// [`Self::build_with_remote`]. Subcommands that always
-    /// remote-attach (`net aggregator query`/`spawn`/`scale`/
+    /// remote-attach (`net-mesh aggregator query`/`spawn`/`scale`/
     /// `ls --remote`) call this rather than re-implementing the
     /// "should be unreachable" sdk-error per call site.
     #[allow(dead_code)]
@@ -175,8 +175,7 @@ impl CliContext {
                 return Err(invalid_args(format!(
                     "endpoint `{endpoint}` is not supported in this build; \
                      only `in-process` is available until the substrate \
-                     remote-attach surface lands (see NET_CLI_PLAN.md \
-                     Phase 5)"
+                     remote-attach surface lands"
                 )));
             }
         }
@@ -199,7 +198,7 @@ impl CliContext {
                 }
                 tracing::warn!(
                     "no operator identity configured; using an ephemeral \
-                     keypair. Run `net identity generate --out <PATH>` and \
+                     keypair. Run `net-mesh identity generate --out <PATH>` and \
                      point your profile at the result for stable operator id."
                 );
                 EntityKeypair::generate()
@@ -255,7 +254,7 @@ async fn build_remote_mesh(remote: RemoteAttach) -> Result<net_sdk::Mesh, CliErr
 /// Build a local mesh bound to `bind`, optionally under an operator
 /// `identity`, and join `remote` via the routed handshake. The single
 /// implementation behind the in-process attach ([`build_remote_mesh`],
-/// anonymous + loopback) and the `net wrap` / `net mcp serve` shims (which pass
+/// anonymous + loopback) and the `net-mesh wrap` / `net-mesh mcp serve` shims (which pass
 /// their operator identity and bind `0.0.0.0:0` so the served / consumed
 /// capabilities carry a stable, owner-scoped origin reachable by the peer).
 pub(crate) async fn build_attached_mesh(
@@ -376,8 +375,8 @@ pub(crate) async fn load_identity_keypair(path: &Path) -> Result<EntityKeypair, 
 /// shared by [`load_identity_keypair`] (→ `EntityKeypair`) and
 /// [`load_operator_identity`] (→ `Identity`) so the two never drift.
 pub(crate) async fn load_identity_seed(path: &Path) -> Result<[u8; 32], CliError> {
-    // §10 — the READ side of the identity seed, shared by `net wrap`,
-    // `net mcp serve` and `net cap`. Three separate copies of the private key
+    // §10 — the READ side of the identity seed, shared by `net-mesh wrap`,
+    // `net-mesh mcp serve` and `net-mesh cap`. Three separate copies of the private key
     // pass through here and all three used to drop un-zeroed: the whole file
     // text, the parsed `seed_hex`, and the decoded bytes. The write side was
     // hardened for §10; this side was not.
@@ -421,7 +420,7 @@ pub(crate) async fn load_identity_seed(path: &Path) -> Result<[u8; 32], CliError
 }
 
 /// Load an operator [`Identity`](net_sdk::identity::Identity) from an identity
-/// TOML file. Shared by `net wrap` and `net mcp serve`, which build a mesh
+/// TOML file. Shared by `net-mesh wrap` and `net-mesh mcp serve`, which build a mesh
 /// under this identity so served / consumed capabilities carry a stable,
 /// owner-scoped origin.
 pub(crate) async fn load_operator_identity(

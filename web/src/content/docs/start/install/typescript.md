@@ -5,7 +5,7 @@ npm install @net-mesh/core     # the native addon
 npm install @net-mesh/sdk      # the ergonomic SDK, if you want typed channels
 ```
 
-Both publish at **0.33**. `@net-mesh/core` is a native addon built with `napi-rs`;
+Both publish at **0.34**. `@net-mesh/core` is a native addon built with `napi-rs`;
 prebuilt binaries ship for Windows, macOS and Linux on x86-64 and aarch64,
 including musl. **Node 20 or newer.**
 

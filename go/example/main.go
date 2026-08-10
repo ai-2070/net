@@ -1,4 +1,14 @@
 // Example usage of the Net Go bindings.
+//
+// What this example proves, and what it deliberately does not: `net.New(nil)`
+// selects the default memory adapter, which COUNTS events and DISCARDS them.
+// So every ingest below succeeds and `Poll` returns zero events — by design,
+// not by failure. The observable success condition here is producer-side
+// acceptance (`Stats().EventsIngested`), which the example asserts.
+//
+// Configure a real adapter — Redis, JetStream, or a mesh peer — before
+// treating a non-empty `Poll` as the thing that worked. See
+// https://ai2070.net/docs/sdk/go/watch.
 package main
 
 import (
@@ -11,12 +21,22 @@ import (
 )
 
 func main() {
+	// `log.Fatalf` calls os.Exit, which does NOT run deferred functions — so
+	// every failure path below would skip `bus.Shutdown()` and leak the
+	// native runtime. Keep main a thin wrapper whose only job is the exit
+	// code, and let `run` return errors so its defer always fires.
+	if err := run(); err != nil {
+		log.Fatalf("%v", err)
+	}
+}
+
+func run() error {
 	fmt.Printf("Net version: %s\n", net.Version())
 
 	// Create event bus with default configuration
 	bus, err := net.New(nil)
 	if err != nil {
-		log.Fatalf("Failed to create event bus: %v", err)
+		return fmt.Errorf("failed to create event bus: %w", err)
 	}
 	defer bus.Shutdown()
 
@@ -59,22 +79,39 @@ func main() {
 	// Give workers time to process
 	time.Sleep(100 * time.Millisecond)
 
-	// Get statistics
+	// Statistics. This is the real success condition for this example: the
+	// producer boundary accepted every event. Assert it rather than printing
+	// it, so a regression that silently stops accepting fails the run instead
+	// of scrolling past.
+	const wantIngested = 7 // 3 raw + 1 struct + 3 batch
 	stats, err := bus.Stats()
 	if err != nil {
-		log.Printf("Failed to get stats: %v", err)
-	} else {
-		fmt.Printf("Stats: ingested=%d, dropped=%d\n",
-			stats.EventsIngested, stats.EventsDropped)
+		return fmt.Errorf("failed to get stats: %w", err)
+	}
+	fmt.Printf("Stats: ingested=%d, dropped=%d\n",
+		stats.EventsIngested, stats.EventsDropped)
+	if stats.EventsIngested != wantIngested {
+		return fmt.Errorf("the bus did not accept every event: ingested=%d, want %d",
+			stats.EventsIngested, wantIngested)
 	}
 
-	// Poll events
+	// Poll events.
+	//
+	// Expect ZERO here. The default memory adapter counts events and throws
+	// them away, so there is nothing to read back. That is the configured
+	// behavior, not a failure — but it is also why polling cannot be the
+	// success condition for this program. Point the bus at a Redis,
+	// JetStream, or mesh adapter and this same loop starts returning events.
 	response, err := bus.Poll(100, "")
 	if err != nil {
-		log.Fatalf("Failed to poll: %v", err)
+		return fmt.Errorf("failed to poll: %w", err)
 	}
 
 	fmt.Printf("Polled %d events (has_more=%v)\n", response.Count, response.HasMore)
+	if response.Count == 0 {
+		fmt.Println("  (none — the default memory adapter discards events; " +
+			"configure an adapter to read them back)")
+	}
 	for i, raw := range response.Events {
 		var event map[string]interface{}
 		if err := json.Unmarshal(raw, &event); err == nil {
@@ -97,5 +134,11 @@ func main() {
 		log.Printf("Failed to flush: %v", err)
 	}
 
-	fmt.Println("Done!")
+	// Deliberately not "Done!". This program proved that the bus accepted 7
+	// events; it did not prove that anything received them, and a closing
+	// line that reads like success for the whole loop is how the empty poll
+	// above gets mistaken for a working round trip.
+	fmt.Printf("Accepted %d events at the producer boundary. "+
+		"Nothing consumed them — that needs an adapter.\n", stats.EventsIngested)
+	return nil
 }

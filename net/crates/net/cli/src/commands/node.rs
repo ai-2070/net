@@ -1,4 +1,4 @@
-//! `net node adopt` — provision a node's organization ownership
+//! `net-mesh node adopt` — provision a node's organization ownership
 //! (OA-1, `ORG_CAPABILITY_AUTH_PLAN.md`).
 //!
 //! Adoption installs THREE separately versioned files in the
@@ -42,12 +42,12 @@ pub enum NodeCommand {
 #[derive(Args, Debug)]
 pub struct AdoptArgs {
     /// Path to the membership certificate JSON (from
-    /// `net org issue-cert`).
+    /// `net-mesh org issue-cert`).
     #[arg(long, value_name = "PATH")]
     pub cert: PathBuf,
 
     /// Path to this node's identity file (TOML, from
-    /// `net identity generate`); the certificate must name its
+    /// `net-mesh identity generate`); the certificate must name its
     /// public key. Mutually exclusive with `--entity`.
     #[arg(long, value_name = "PATH", conflicts_with = "entity")]
     pub identity: Option<PathBuf>,
@@ -64,7 +64,7 @@ pub struct AdoptArgs {
     pub authority_dir: Option<PathBuf>,
 
     /// Optional operator revocation bundle (from
-    /// `net org issue-floors`) to merge during adoption.
+    /// `net-mesh org issue-floors`) to merge during adoption.
     #[arg(long, value_name = "PATH")]
     pub floors: Option<PathBuf>,
 

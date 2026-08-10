@@ -1,4 +1,4 @@
-//! `net peer ls` — list peers known to the local snapshot.
+//! `net-mesh peer ls` — list peers known to the local snapshot.
 //!
 //! Phase 1 scope: read-only ls only. `peer reflex` / `peer nat` /
 //! `peer reclassify-nat` / `peer set-reflex` / `peer clear-reflex`

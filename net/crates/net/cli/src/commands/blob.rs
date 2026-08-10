@@ -1,8 +1,8 @@
-//! `net blob (put|get|ls|rm)` — dataforts blob CAS operator
+//! `net-mesh blob (put|get|ls|rm)` — dataforts blob CAS operator
 //! surface.
 //!
 //! **Phase 4 status: design stub.** The clap router intentionally
-//! does not yet expose `net blob` because the existing `net-blob`
+//! does not yet expose `net-mesh blob` because the existing `net-blob`
 //! binary already serves the full operator surface
 //! (`crates/net/src/bin/net-blob.rs`). Per
 //! `NET_CLI_PLAN.md:§"Locked decisions"` #10, this CLI is the

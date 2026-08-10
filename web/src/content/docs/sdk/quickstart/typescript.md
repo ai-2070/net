@@ -38,12 +38,23 @@ was still holding.
 ```typescript
 import { MeshNode } from '@net-mesh/sdk';
 
-const psk = new Uint8Array(32).fill(0x42);   // raw bytes, length 32
+const psk = '42'.repeat(32);   // 64 hex characters = 32 bytes
 const node = await MeshNode.create({ bindAddr: '127.0.0.1:0', psk });
 ```
 
-TypeScript takes the PSK as a 32-byte `Uint8Array`. A wrong length fails when the
-node is created, not when the first peer disagrees with you.
+TypeScript takes the PSK as a **64-character hex string**, the same
+representation Python uses — not the raw `Uint8Array` Rust takes. Passing bytes
+fails twice over, at compile time and again at the native boundary:
+
+```text
+error TS2322: Type 'Uint8Array<ArrayBuffer>' is not assignable to type 'string'.
+
+Error: Failed to convert JavaScript value `Object {...}` into rust type `String`
+  on MeshOptions.psk { code: 'StringExpected' }
+```
+
+A wrong length fails when the node is created, not when the first peer
+disagrees with you.
 
 ### The handshake
 
@@ -52,13 +63,24 @@ const HOST_ADDR = '127.0.0.1:9001';
 const host = await MeshNode.create({ bindAddr: HOST_ADDR, psk });
 const agent = await MeshNode.create({ bindAddr: '127.0.0.1:9000', psk });
 
-await host.accept(agent.nodeId());
+// Start the responder, then await it — do NOT await it on the line above.
+const accepted = host.accept(agent.nodeId());
 await agent.connect(HOST_ADDR, host.publicKey(), host.nodeId());
+await accepted;
+
 await host.start();
 await agent.start();
 ```
 
-Two things the shape of that snippet is telling you. **`start()` is async in
+**The missing `await` on that first line is the whole point.** `accept()`
+resolves only once an initiator has connected, so `await host.accept(...)`
+followed by `agent.connect(...)` never reaches the second line: the handshake
+needs both halves in flight at once. Calling `accept` without awaiting it
+starts the responder and hands you the promise to settle after `connect`,
+which is what `tokio::join!` does on the Rust page and what a second thread
+does on the Python one.
+
+Two more things the shape of that snippet is telling you. **`start()` is async in
 TypeScript** — forgetting the `await` gives you a node that is not started yet and
 no error saying so. And **there is no `localAddr()` accessor**: the address you
 bound is the address you pass, so bind to a port you chose rather than `:0` when a

@@ -1410,9 +1410,43 @@ jobs:
       # It surfaces only at `npm install` on a user's machine. Non-strict
       # here: a floor aimed at an unreleased version is fine as long as the
       # CHANGELOG says so. `release-npm-sdk.yml` runs the strict form.
+      # A `run:` step naming a script by path needs the executable bit in
+      # git's INDEX. The bit is not in the working tree, and a Windows
+      # checkout has core.filemode off — so `chmod +x` there is a no-op
+      # against the index and the script commits as 100644 with nothing
+      # locally to show for it. Every test passes on the author's machine
+      # and the step still cannot start:
+      #
+      #   .../check-ts-consumer.sh: Permission denied
+      #   Error: Process completed with exit code 126.
+      #
+      # Cheap, no network, and it runs early because a 126 wastes a whole job.
+      - name: Guard — workflow scripts invoked by path are executable
+        working-directory: ${{ github.workspace }}
+        run: |
+          python3 -m pip install --quiet pyyaml
+          python3 .github/scripts/check-script-permissions.py --require-yaml
+          python3 .github/scripts/check-script-permissions.py --self-test
+
       - name: Guard — SDK peer range admits the in-tree core
         working-directory: ${{ github.workspace }}
         run: python3 .github/scripts/check-npm-peer-range.py
+
+      # `@net-mesh/cli` and `@net-mesh/deck` ship nothing themselves — each is
+      # a launcher plus per-platform packages in optionalDependencies. npm
+      # SKIPS an optional dependency it cannot resolve without failing, so a
+      # missing platform package installs with exit 0, reports success, and
+      # only surfaces when someone runs the command and gets exit 127.
+      #
+      # Three lists have to agree for that not to happen: optionalDependencies,
+      # the triples the launcher resolves, and the release build matrix. This
+      # is the no-network half; the release workflows additionally verify each
+      # package is really on the registry before publishing the aggregate.
+      - name: Guard — npm aggregates name platform packages that get built
+        working-directory: ${{ github.workspace }}
+        run: |
+          python3 .github/scripts/check-npm-platform-packages.py
+          python3 .github/scripts/check-npm-platform-packages.py --self-test
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -1460,6 +1494,22 @@ jobs:
       # only as a `npm run build` failure on a developer workstation.
       - name: Type-check (tsc)
         run: npm run build
+
+      # The step above compiles the SDK's own sources with
+      # `skipLibCheck: true`, which is exactly the blind spot: a declaration
+      # file that names a type nothing declares type-checks fine as long as
+      # nobody reads it. A consumer who turns skipLibCheck off reads it, and
+      # the errors land in OUR shipped files where they cannot fix them:
+      #
+      #   @net-mesh/core/index.d.ts(507,48): error TS2304:
+      #       Cannot find name 'DaemonBridgeTsfns'.
+      #   @net-mesh/sdk/dist/meshdb.d.ts(67,10): error TS2305:
+      #       Module '"@net-mesh/core"' has no exported member 'InMemoryChainReader'.
+      #
+      # This runs the check a careful consumer runs — a trivial program
+      # against the built pair, dependency declarations checked.
+      - name: Type-check a trivial consumer against the shipped declarations
+        run: "$GITHUB_WORKSPACE/.github/scripts/check-ts-consumer.sh"
 
       # The skill's TypeScript hello-world, type-checked against this same
       # surface. It runs here because it needs the napi-generated `index.d.ts`
@@ -1665,6 +1715,23 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # The text half of "Assert the Go binding links exactly one net::ffi"
+      # below. That step guards the CODE — no sibling cdylib, no second `-l`
+      # in `go/*.go`. Nothing guarded the TEXT, and text is what a consumer
+      # follows: the sweep that consolidated the docs updated
+      # `net/crates/net/include/net.go.h` but not `go/net.h`, the copy cgo
+      # actually compiles, so the header a Go user has kept saying
+      # `Link with -lnet -lnet_compute` months after that library stopped
+      # being built. Two test files kept saying `cargo build -p net-<x>-ffi`,
+      # which is now an rlib and produces nothing to link.
+      #
+      # First, and before the toolchains: it is pure text, needs no network,
+      # and a failure here should not cost a cdylib build to discover.
+      - name: Guard — no doc tells anyone to build or link a per-surface library
+        run: |
+          python3 .github/scripts/check-one-library-docs.py
+          python3 .github/scripts/check-one-library-docs.py --self-test
+
       - name: Setup Go
         uses: actions/setup-go@v7.0.0
         with:
@@ -1835,6 +1902,71 @@ jobs:
         env:
           LD_LIBRARY_PATH: ${{ github.workspace }}/net/crates/net/target/release
         run: go test -v -tags abi_stability -run TestABIStabilityU64FFIRoundTrip ./...
+
+      # With CGO_ENABLED=0 — the default on a Go install with no C compiler
+      # on PATH — the toolchain drops every cgo file in this package and
+      # compiles it down to the few plain-Go type declarations that remain.
+      # The package still exists, so the caller gets type-checked against an
+      # almost-empty API and told `undefined: net.New` about their OWN file,
+      # with nothing anywhere naming cgo. `go/cgo_disabled.go` replaces that
+      # with a message that does. Assert the guard is still wired: the build
+      # must fail, the failure must name cgo, and the misleading diagnostic
+      # must be gone.
+      - name: Assert the cgo-disabled build explains itself
+        working-directory: go
+        run: |
+          set +e
+          out=$(CGO_ENABLED=0 go build ./... 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+
+          if [ "$rc" -eq 0 ]; then
+            echo "::error::CGO_ENABLED=0 build succeeded — the cgo_disabled.go guard is gone"
+            exit 1
+          fi
+          if ! printf '%s' "$out" | grep -q "requires_cgo"; then
+            echo "::error::the cgo-disabled build failed without naming cgo"
+            exit 1
+          fi
+          if printf '%s' "$out" | grep -q "undefined: net\."; then
+            echo "::error::the misleading 'undefined: net.New' diagnostic is back"
+            exit 1
+          fi
+
+      # `go/example` is the checked-in "run this and watch it work" program,
+      # and until now NOTHING in this workflow compiled it. So its manifest
+      # drifted: it still declared `go 1.21` long after `go/go.mod` moved to
+      # `go 1.26`, and since it consumes that module through a local
+      # `replace`, running it as supplied failed before reaching main:
+      #
+      #   $ go run .
+      #   go: module .. requires go >= 1.26 (running go 1.25.5)
+      #
+      # The directive comparison is the readable diagnostic; building and
+      # RUNNING it is what proves the example still works against the module
+      # it replaces. Running matters now that the example asserts its own
+      # success condition — the producer boundary accepted all 7 events —
+      # rather than printing `Done!` over an empty poll. Both are cheap: the
+      # library is already built by this job.
+      - name: Build and run the checked-in Go example
+        working-directory: go/example
+        env:
+          CGO_LDFLAGS: -L${{ github.workspace }}/net/crates/net/target/release
+          LD_LIBRARY_PATH: ${{ github.workspace }}/net/crates/net/target/release
+        run: |
+          sdk=$(awk '/^go /{print $2; exit}' ../go.mod)
+          ex=$(awk '/^go /{print $2; exit}' go.mod)
+          echo "go/go.mod declares go $sdk; go/example/go.mod declares go $ex"
+          # The example may declare a NEWER language version than the module
+          # it replaces, but never an older one — that combination cannot
+          # resolve at all. `sort -V` puts the lower version first.
+          if [ "$(printf '%s\n%s\n' "$sdk" "$ex" | sort -V | head -1)" != "$sdk" ]; then
+            echo "::error::go/example/go.mod declares go $ex but replaces a module requiring go $sdk"
+            echo "A local-replace example cannot consume a module with a higher go directive."
+            exit 1
+          fi
+          go run .
 
       # The Go and C skill examples, executed against the cdylibs built above.
       # This job is the only place they can run: cgo links against libnet, and

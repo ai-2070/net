@@ -73,14 +73,20 @@ const node = await MeshNode.create({ bindAddr: '127.0.0.1:0', psk });
 // which port to connect to.
 console.log(node.localAddr());
 
-const handle = serveTool(node, {
+// `serveTool` takes the RPC handle, not the node — `node.rpc()` bridges the
+// two. Hold the handle: each `rpc()` call makes a new one with its own
+// reference to the mesh, and an outstanding reference blocks `shutdown()`.
+const rpc = node.rpc();
+
+const handle = serveTool(rpc, {
   name: 'web_search',
   description: 'Search the web for relevant pages.',
   tags: ['web', 'research'],
 }, async (req: { query: string }) => {
   return { results: [`first hit for '${req.query}'`] };
 });
-// handle.close() when done — always close explicitly.
+// handle.close() when done — always close explicitly. Then `rpc.raw.close()`
+// before `node.shutdown()`.
 ```
 
 **Discover** — react to the mesh changing rather than polling it:
@@ -193,23 +199,28 @@ install options in [Claude Skills](https://ai2070.net/docs/start/claude-skills).
 npx -y opensrc@latest path ai-2070/net
 ```
 
-## Submodules and the Cargo features behind them
+## Surfaces and the Cargo features behind them
 
 Every wrapper dispatches into `@net-mesh/core`. **Published artifacts ship
 every feature enabled**, so this table matters only for source builds — a
 disabled feature's symbols are absent at runtime and the `import` resolves to
 `undefined`.
 
-| Cargo feature | Submodule | Surface |
-|---|---|---|
-| `net` | `@net-mesh/sdk/mesh` | `MeshNode`, `NetStream`, channel auth |
-| `cortex` | `@net-mesh/sdk/cortex` | `Redex`, `RedexFile`, `TasksAdapter`, `MemoriesAdapter`, `NetDb` |
-| `meshdb` | `@net-mesh/sdk/meshdb` | `MeshQuery`, `MeshQueryRunner`, `MeshQueryStream`, `QueryBuilder`, `InMemoryChainReader` |
-| `meshos` | `@net-mesh/sdk/meshos` | `MeshOsDaemonSdk`, `MeshOsDaemonHandle`, `DaemonHealth`, `CapabilityAdvert` |
-| `compute` | `@net-mesh/sdk/compute` | `DaemonRuntime`, `DaemonHandle`, `MigrationHandle` |
-| `groups` | `@net-mesh/sdk/groups` | `ReplicaGroup`, `ForkGroup`, `StandbyGroup` |
-| `deck` | `@net-mesh/sdk/deck` | `DeckClient`, `OperatorIdentity`, admin / snapshot / status streams |
-| `redis` | top-level | `RedisStreamDedup` |
+**Everything below imports from the package root**, `@net-mesh/sdk`. The only
+other entry point is `@net-mesh/sdk/tool`; the package's `exports` map defines
+those two and nothing else, so a per-feature subpath such as
+`@net-mesh/sdk/mesh` fails with `ERR_PACKAGE_PATH_NOT_EXPORTED`.
+
+| Cargo feature | Surface |
+|---|---|
+| `net` | `MeshNode`, `NetStream`, channel auth |
+| `cortex` | `Redex`, `RedexFile`, `TasksAdapter`, `MemoriesAdapter`, `NetDb` |
+| `meshdb` | `MeshQuery`, `MeshQueryRunner`, `MeshQueryStream`, `QueryBuilder`, `InMemoryChainReader` |
+| `meshos` | `MeshOsDaemonSdk`, `MeshOsDaemonHandle`, `DaemonHealth`, `CapabilityAdvert` |
+| `compute` | `DaemonRuntime`, `DaemonHandle`, `MigrationHandle` |
+| `groups` | `ReplicaGroup`, `ForkGroup`, `StandbyGroup` |
+| `deck` | `DeckClient`, `OperatorIdentity`, admin / snapshot / status streams |
+| `redis` | `RedisStreamDedup` |
 
 The bus surface — `NetNode`, `EventStream`, capabilities, identity, predicates
 — is always present. To slim a build:

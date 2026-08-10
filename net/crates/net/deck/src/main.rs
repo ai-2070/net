@@ -16,6 +16,7 @@
 
 mod app;
 mod bookmarks;
+mod cli;
 #[cfg(feature = "demo")]
 mod demo;
 mod lineage;
@@ -34,6 +35,36 @@ use app::App;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> color_eyre::Result<()> {
+    // Argument handling comes first, before the runtime, the panic hook, or
+    // anything that touches the terminal. Every branch below either exits or
+    // falls through having allocated nothing, so `process::exit` is safe here
+    // and keeps `--help` as fast as it should be.
+    {
+        use std::io::Write;
+
+        let startup = cli::parse(
+            std::env::args_os().skip(1),
+            cli::Streams::probe(),
+            std::env::var_os(cli::ALLOW_NON_TTY_ENV).is_some_and(|v| !v.is_empty()),
+        );
+
+        match startup {
+            cli::Startup::Run => {}
+            cli::Startup::PrintAndExit { text, code } => {
+                let mut out = std::io::stdout();
+                let _ = out.write_all(text.as_bytes());
+                let _ = out.flush();
+                std::process::exit(code);
+            }
+            cli::Startup::FailWith { text, code } => {
+                let mut err = std::io::stderr();
+                let _ = err.write_all(text.as_bytes());
+                let _ = err.flush();
+                std::process::exit(code);
+            }
+        }
+    }
+
     color_eyre::install()?;
 
     // Restore the terminal on panic. color_eyre installs a

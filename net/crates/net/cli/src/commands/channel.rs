@@ -1,4 +1,4 @@
-//! `net channel (visibility|ls)` — surface the local mesh's
+//! `net-mesh channel (visibility|ls)` — surface the local mesh's
 //! `ChannelConfigRegistry` to operators.
 //!
 //! `visibility <name>` — look up a single channel's

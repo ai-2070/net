@@ -186,11 +186,39 @@ class MeshNode:
         return self._native.local_addr
 
     def connect(self, peer_addr: str, peer_public_key: str, peer_node_id: int) -> None:
-        """Connect to a peer as initiator."""
+        """Connect to a peer as initiator.
+
+        BLOCKS until the handshake completes or times out. Pair it with a
+        concurrent :meth:`accept` on the responder — see that method for
+        why the two cannot run in sequence on one thread.
+        """
         self._native.connect(peer_addr, peer_public_key, peer_node_id)
 
     def accept(self, peer_node_id: int) -> str:
-        """Accept an incoming connection as responder. Returns the peer's wire address."""
+        """Accept an incoming connection as responder.
+
+        Returns the peer's wire address.
+
+        BLOCKS until the initiator connects. The handshake needs both
+        halves in flight at once, so calling ``accept`` and then
+        ``connect`` on the same thread cannot work: ``accept`` never
+        returns, the initiating call is never reached, and the failure
+        arrives as a handshake timeout that blames the network rather
+        than the ordering::
+
+            RuntimeError: accept: connection error: handshake timeout
+
+        Run the responder side concurrently::
+
+            import threading
+
+            t = threading.Thread(target=host.accept, args=(agent.node_id,))
+            t.start()
+            agent.connect(HOST_ADDR, host.public_key, host.node_id)
+            t.join()
+
+        A thread is enough — the call releases the GIL while it waits.
+        """
         return self._native.accept(peer_node_id)
 
     def start(self) -> None:

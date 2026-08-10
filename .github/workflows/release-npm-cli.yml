@@ -279,6 +279,19 @@ jobs:
             exit 1
           fi
 
+      # `needs: publish-platforms` says the matrix succeeded; it does not say
+      # the matrix still covers every triple this package depends on. If a leg
+      # were dropped or made non-fatal, the aggregate would publish naming a
+      # platform package that does not exist — and npm would then install it
+      # with exit 0 and report success, because an unresolvable optional
+      # dependency is skipped rather than failed. The absence would surface
+      # only as exit 127 on a user's first command.
+      #
+      # Ask the registry directly, immediately before publishing.
+      - name: Verify every platform package is published
+        working-directory: ${{ github.workspace }}
+        run: python3 .github/scripts/check-npm-platform-packages.py --registry
+
       - name: Publish to npm
         shell: bash
         run: |

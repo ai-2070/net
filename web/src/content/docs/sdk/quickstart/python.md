@@ -48,16 +48,36 @@ representations have to agree.
 
 ### The handshake
 
+Both halves have to be in flight at once. `accept` and `connect` each block
+until the handshake completes, so the responder goes on its own thread:
+
 ```python
+import threading
+
 HOST_ADDR = "127.0.0.1:9001"
 host = MeshNode(bind_addr=HOST_ADDR, psk="42" * 32)
 agent = MeshNode(bind_addr="127.0.0.1:9000", psk="42" * 32)
 
-host.accept(agent.node_id)
+responder = threading.Thread(target=host.accept, args=(agent.node_id,))
+responder.start()
 agent.connect(HOST_ADDR, host.public_key, host.node_id)
+responder.join()
+
 host.start()
 agent.start()
 ```
+
+**Calling them in sequence on one thread cannot work.** `host.accept(...)` waits
+for an initiator that the next line was going to be, so it never returns, and
+the failure arrives ~20 seconds later looking like a network problem:
+
+```text
+RuntimeError: accept: connection error: handshake timeout
+```
+
+A plain thread is enough; the call releases the GIL while it waits. This is the
+one place Python differs from Rust on this page, where `tokio::join!` does the
+same job.
 
 `node_id` and `public_key` are **properties, not methods** — no parentheses. It is
 a small thing that produces a confusing error, because `host.public_key` without

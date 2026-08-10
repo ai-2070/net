@@ -12,8 +12,9 @@ name = "net-mesh"
 path = "src/main.rs"
 
 [features]
-# `keychain` turns on the OS-keychain secret value store so `net forwarding
-# set-value` can persist a forwarded secret (it enables `net-mesh-mcp`'s own
+# `keychain` turns on the OS-keychain secret value store so `net-mesh
+# forwarding set-value` can persist a forwarded secret (it enables
+# `net-mesh-mcp`'s own
 # `keychain` feature). NOT a default: it pulls the `keyring` dependency and
 # needs a keychain-capable host, so the standard build stays lean. The
 # `set-value` subcommand is always present; without this feature it returns a

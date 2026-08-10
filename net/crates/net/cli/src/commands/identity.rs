@@ -1,4 +1,4 @@
-//! `net identity (generate|show|fingerprint)` — operator-identity
+//! `net-mesh identity (generate|show|fingerprint)` — operator-identity
 //! authoring + inspection.
 //!
 //! Identity files are TOML at `$XDG_CONFIG_HOME/net-mesh/identities/`
@@ -41,7 +41,7 @@ pub enum IdentityCommand {
     /// audit dashboards.
     Fingerprint(FingerprintArgs),
     /// Revoke a delegated identity (Phase 3): raise an issuer's revocation
-    /// floor in the machine-shared store so a running `net wrap --owner-root`
+    /// floor in the machine-shared store so a running `net-mesh wrap --owner-root`
     /// provider stops admitting its delegations — without a restart.
     Revoke(RevokeArgs),
 }
@@ -100,7 +100,7 @@ pub struct RevokeArgs {
     pub generation: u32,
 
     /// Revocation-store path (default: the per-user shared file a
-    /// `net wrap --owner-root` provider honors).
+    /// `net-mesh wrap --owner-root` provider honors).
     #[arg(long = "revocation-store", value_name = "PATH")]
     pub revocation_store: Option<PathBuf>,
 }
@@ -170,7 +170,7 @@ async fn run_generate(args: GenerateArgs, output: Option<OutputFormat>) -> Resul
         // block above is skipped entirely when forcing, this guard is the only
         // thing standing between a drifted `--out` and the org root key:
         //
-        //   net identity generate --out "$KEY" --force
+        //   net-mesh identity generate --out "$KEY" --force
         //
         // with `$KEY` pointing at an org key file used to replace the org root
         // with an operator identity and exit 0 — root unrecoverable, no floor
@@ -652,7 +652,7 @@ mod tests {
 
     /// §11 — a failed rename must not orphan the seed-bearing temp file.
     ///
-    /// The temp holds raw key material (an org root seed via `net org keygen`,
+    /// The temp holds raw key material (an org root seed via `net-mesh org keygen`,
     /// or a node identity seed). The previous cleanup was a detached
     /// `tokio::spawn`, and this is a one-shot CLI: the error propagates
     /// straight out of `dispatch` and the process exits, so that task was
@@ -817,7 +817,7 @@ mod tests {
 
     #[test]
     fn revoke_writes_the_floor_to_the_store() {
-        // `net identity revoke` writes a floor a running provider then honors.
+        // `net-mesh identity revoke` writes a floor a running provider then honors.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rev.json");
         let issuer = net_sdk::Identity::generate();

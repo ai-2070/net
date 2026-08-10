@@ -1,26 +1,29 @@
 /*
- * net_meshdb.h — C SDK header for libnet_meshdb (the MeshDB
- * query layer C ABI).
+ * net_meshdb.h — C SDK header for the MeshDB query layer C ABI.
  *
- * One header, one shared library. Mirrors the layout of `net.h` /
- * `net.go.h` / `net_rpc.h` next to it. Symbols live in the
- * `libnet_meshdb.{so,dylib,dll}` cdylib built from
- * `bindings/go/meshdb-ffi`. The Go binding's
- * `bindings/go/net/meshdb.go` cgo include block has been the
- * de-facto contract for non-Go consumers; this file is the
- * canonical drop-in for C / C++ / Zig / Swift / Java JNI / etc.
+ * One of eleven headers, all resolving against a single shared library.
+ * Mirrors the layout of `net.h` / `net.go.h` / `net_rpc.h` next to it.
+ * The Go binding's `go/meshdb.go` cgo include block has been the
+ * de-facto contract for non-Go consumers; this file is the canonical
+ * drop-in for C / C++ / Zig / Swift / Java JNI / etc.
+ *
+ * These symbols are compiled into `libnet`. `bindings/go/meshdb-ffi` is
+ * an rlib linked into it and emits no library of its own — there is no
+ * `libnet_meshdb` to build or link.
  *
  * # Build
  *
- *   cargo build --release -p net-meshdb-ffi
+ *   cargo build --release -p net-ffi
  *
- *   Linux:   target/release/libnet_meshdb.so
- *   macOS:   target/release/libnet_meshdb.dylib
- *   Windows: target/release/net_meshdb.dll
+ *   Linux:   target/release/libnet.so
+ *   macOS:   target/release/libnet.dylib
+ *   Windows: target/release/net.dll  (+ net.dll.lib import library)
  *
  * # Link
  *
- *   gcc -o app app.c -L target/release -lnet_meshdb -lpthread -ldl -lm
+ *   gcc -o app app.c -L target/release -lnet -lpthread -ldl -lm
+ *
+ * Link `-lnet` and nothing else; there is no second library to add.
  *
  * # Handle model
  *

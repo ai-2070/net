@@ -1,9 +1,12 @@
 // MCP bridge helper + consent/pin binding tests (`MCP_BRIDGE_SDK_PLAN.md`
 // P3).
 //
-// Build the cdylib first:
-//   cargo build --release -p net-mcp-ffi
+// Build the one shared library first:
+//   cargo build --release -p net-ffi
 // then run with the link path on LD_LIBRARY_PATH (see the go-tests CI job).
+// `bindings/go/mcp-ffi` is an rlib linked into `libnet` and emits nothing
+// of its own — one-library-docs: allow
+// so `-p net-mcp-ffi` produces no cdylib to link against.
 //
 // The helpers are the bridge's one Rust implementation — these tests pin
 // the classification parity vectors (same inputs -> same status in every

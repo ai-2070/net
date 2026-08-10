@@ -6,19 +6,20 @@
 // builds (plain `go build` / `go test`) never compile this file
 // or reference `net_compute_test_inject_synthetic_peer`; the
 // symbol itself is gated at the Rust layer behind the
-// `test-helpers` cargo feature on compute-ffi, so a
-// `libnet_compute.{dylib,so}` built without that feature does
-// not export it either. Running the group tests therefore
-// requires:
+// `test-helpers` cargo feature on compute-ffi — which is an rlib
+// linked into the one `libnet` cdylib, not a library of its own —
+// so a `libnet` built without that feature does not export it
+// either. Running the group tests therefore requires:
 //
-//   1. Build compute-ffi with `--features test-helpers` so the
-//      cdylib exports the symbol.
+//   1. Build with the feature on so the symbol reaches `libnet`:
+//      `cargo build --release -p net-ffi --features
+//      net-ffi/test-helpers` (what the go-tests CI job runs).
 //   2. Run `go test -tags test_helpers` so this file is compiled
 //      into the test binary and the extern reference resolves.
 //
-// A release-mode cdylib paired with a `-tags test_helpers`
-// test binary will fail to link, which is the point — the test
-// posture is explicit rather than implicit.
+// A `libnet` built without the feature, paired with a
+// `-tags test_helpers` test binary, will fail to link — which is
+// the point: the test posture is explicit rather than implicit.
 
 //go:build test_helpers
 

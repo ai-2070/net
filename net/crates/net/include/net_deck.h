@@ -1,16 +1,17 @@
 /*
- * net_deck.h — C SDK header for libnet_deck (the Deck operator-
- * side SDK C ABI).
+ * net_deck.h — C SDK header for the Deck operator-side SDK C ABI.
  *
- * One header, one shared library. Mirrors the layout of
- * `net_meshos.h` / `net_meshdb.h` next to it. Symbols live in the
- * `libnet_deck.{so,dylib,dll}` cdylib built from
- * `bindings/go/deck-ffi`. The Go binding's
- * `bindings/go/net/deck.go` cgo include block is the sister-
- * consumer contract; this file is the canonical drop-in for C /
- * C++ / Zig / Swift / Java JNI / etc.
+ * One of eleven headers, all resolving against a single shared
+ * library. Mirrors the layout of `net_meshos.h` / `net_meshdb.h`
+ * next to it. The Go binding's `go/deck.go` cgo include block is the
+ * sister-consumer contract; this file is the canonical drop-in for
+ * C / C++ / Zig / Swift / Java JNI / etc.
  *
- * Companion to `DECK_SDK_PLAN.md` Phase 7; consumes the cdylib
+ * These symbols are compiled into `libnet`. `bindings/go/deck-ffi`
+ * is an rlib linked into it and emits no library of its own — there
+ * is no `libnet_deck` to build or link.
+ *
+ * Companion to `DECK_SDK_PLAN.md` Phase 7; consumes the same library
  * shipped for Phase 6 (Go) without modification.
  *
  * # Scope (slice 3)
@@ -25,24 +26,27 @@
  * # Operator-only mode
  *
  * `net_deck_client_new` constructs a private MeshOS supervisor
- * runtime inside the cdylib. The caller supplies only the 32-byte
- * operator seed + supervisor config; the cdylib wraps the
+ * runtime inside the library. The caller supplies only the 32-byte
+ * operator seed + supervisor config; the library wraps the
  * substrate's runtime end-to-end. Composing against an
- * externally-managed `NetMeshOsSdk` handle (from
- * `libnet_meshos`) requires cross-cdylib symbol sharing and lands
- * in slice 2 when an operator workflow demands it.
+ * externally-managed `NetMeshOsSdk` handle (from `net_meshos.h`)
+ * lands in slice 2 when an operator workflow demands it. Note that
+ * the old blocker for that — cross-cdylib symbol sharing — is gone:
+ * both surfaces now live in the same library.
  *
  * # Build
  *
- *   cargo build --release -p net-deck-ffi
+ *   cargo build --release -p net-ffi
  *
- *   Linux:   target/release/libnet_deck.so
- *   macOS:   target/release/libnet_deck.dylib
- *   Windows: target/release/net_deck.dll
+ *   Linux:   target/release/libnet.so
+ *   macOS:   target/release/libnet.dylib
+ *   Windows: target/release/net.dll  (+ net.dll.lib import library)
  *
  * # Link
  *
- *   gcc -o app app.c -L target/release -lnet_deck -lpthread -ldl -lm
+ *   gcc -o app app.c -L target/release -lnet -lpthread -ldl -lm
+ *
+ * Link `-lnet` and nothing else; there is no second library to add.
  *
  * # Handle model
  *

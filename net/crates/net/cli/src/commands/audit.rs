@@ -1,4 +1,4 @@
-//! `net audit (recent|stream)` — read the admin-audit ring.
+//! `net-mesh audit (recent|stream)` — read the admin-audit ring.
 
 use std::path::PathBuf;
 

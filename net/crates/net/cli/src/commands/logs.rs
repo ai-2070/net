@@ -1,4 +1,4 @@
-//! `net log tail` and `net failures tail` — substrate log/failure
+//! `net-mesh log tail` and `net-mesh failures tail` — substrate log/failure
 //! streams.
 
 use std::path::PathBuf;
@@ -28,12 +28,20 @@ pub struct LogTailArgs {
     #[arg(long)]
     pub min_level: Option<String>,
 
-    /// Restrict to records originating from this daemon.
-    #[arg(long)]
+    /// Restrict to records originating from this daemon
+    /// (decimal or `0x`-prefixed hex).
+    //
+    // `parse_u64_flexible` per the house rule in `parsers.rs`: operators
+    // read daemon and node ids as hex out of snapshot output, and every
+    // other id flag takes them that way. This one took decimal only, so
+    // the README's own `--daemon 0x000007` was rejected with
+    // "invalid digit found in string".
+    #[arg(long, value_parser = crate::parsers::parse_u64_flexible)]
     pub daemon: Option<u64>,
 
-    /// Restrict to records originating from this node.
-    #[arg(long)]
+    /// Restrict to records originating from this node
+    /// (decimal or `0x`-prefixed hex).
+    #[arg(long, value_parser = crate::parsers::parse_u64_flexible)]
     pub node_filter: Option<u64>,
 
     /// Watermark — emit only records with seq > this value.

@@ -1,4 +1,4 @@
-//! `net db (run|latest|between|tail|filter|aggregate|plan)` —
+//! `net-mesh db (run|latest|between|tail|filter|aggregate|plan)` —
 //! MeshDB federated query plane.
 //!
 //! **Phase 1 status: surface stub.** The clap router intentionally

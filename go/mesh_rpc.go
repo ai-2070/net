@@ -1,5 +1,4 @@
-// Package net — nRPC consumer wrapper for the C ABI exported by
-// `libnet_rpc` (built from `net/crates/net/bindings/go/rpc-ffi`).
+// Package net — nRPC consumer wrapper for the nRPC C ABI.
 //
 // This is the published Go binding for the nRPC surface: build a
 // `*MeshNode` via `NewMeshNode(cfg)` from `mesh.go`, then call
@@ -8,11 +7,16 @@
 //
 // # Build prerequisites
 //
-//   - Build `libnet` as a cdylib (`cargo build --release -p net`).
-//   - Build `libnet_rpc` as a cdylib
-//     (`cargo build --release -p net-rpc-ffi`).
-//   - Both libraries end up in `net/crates/net/target/release`.
-//     The cgo prelude links against `-lnet_rpc -lnet`.
+//   - Build the one shared library: `cargo build --release -p net-ffi`.
+//     It lands in `net/crates/net/target/release`, and the cgo prelude
+//     links `-lnet` against it.
+//   - `bindings/go/rpc-ffi` is an rlib linked into that library. It emits
+//     nothing of its own — there is no `libnet_rpc` to build, and no
+//     second `-l` to add. Net used to ship one cdylib per surface, each
+//     embedding its own copy of the core; linking two put two copies of
+//     the core's statics in a process, including the registry
+//     `parking_lot` uses to track blocked threads, which made a lock
+//     releasable without waking its waiter.
 //
 // # Lifecycle pattern (mirrors `mesh.go`)
 //

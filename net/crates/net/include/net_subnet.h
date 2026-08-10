@@ -2,19 +2,19 @@
  * net_subnet.h — C SDK header for the subnet AUTHORITY surface
  * (SUBNET_AUTH_SDK_PLAN.md S4c / §6.4).
  *
- * These symbols ship in the SAME cdylib as net_org.h — libnet_org, built
- * from bindings/go/org-ffi. They are declared in a separate header only
- * because they are a separate concept; there is no libnet_subnet. The
- * plan's default (provisioning in the base libnet ABI) was defeated by a
- * concrete link analysis: the base libnet FFI lives inside the `net`
- * crate and cannot depend on `net-mesh-sdk`, while the subnet SDK
- * (`net_sdk::subnet`) does — and libnet_org already carries that
- * dependency. Hosting here reuses the org handler dispatcher, the
- * net_org_caller_t projection, and the Arc<MeshNode> ownership contract,
- * and adds no new cdylib.
+ * These symbols sit beside net_org.h's, in the org-ffi rlib that is
+ * linked into `libnet`. They are declared in a separate header only
+ * because they are a separate concept. Hosting them there reuses the org
+ * handler dispatcher, the net_org_caller_t projection, and the
+ * Arc<MeshNode> ownership contract: the base FFI inside the `net` crate
+ * cannot depend on `net-mesh-sdk`, while the subnet SDK
+ * (`net_sdk::subnet`) does, and the org surface already carries that
+ * dependency.
  *
- *   cargo build --release -p net-org-ffi
- *   gcc -o app app.c -L target/release -lnet_org -lnet -lpthread -ldl -lm
+ * Like every other header here, this one resolves out of one `libnet`:
+ *
+ *   cargo build --release -p net-ffi
+ *   gcc -o app app.c -L target/release -lnet -lpthread -ldl -lm
  *
  * # The subnet surface, in one paragraph
  *
@@ -29,7 +29,7 @@
  *
  * # Error model
  *
- * `int` returns share libnet_org's namespace. A subnet
+ * `int` returns share the org surface's namespace. A subnet
  * provisioning / configuration / serve failure returns
  * NET_ORG_ERR_SUBNET (-13) and writes the stable `subnet:<kind>` wire
  * string to `out_err` (free with net_org_free_cstring). It is a LOCAL,
@@ -108,7 +108,7 @@ extern "C" {
 
 /* NET_ORG_ERR_SUBNET (-13) — the subnet provisioning / configuration /
  * serve-registration failure code — is defined in net_org.h (it is an
- * org-namespace code returned by these libnet_org functions, and lives in
+ * org-namespace code returned by these subnet functions, and lives in
  * the same numeric-mirror contract as the other NET_ORG_ERR_* codes). It
  * carries the stable `subnet:<kind>` wire string on out_err and is NOT a
  * call domain. */

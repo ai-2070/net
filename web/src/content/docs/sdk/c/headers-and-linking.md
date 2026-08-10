@@ -1,12 +1,13 @@
 ---
 title: Headers and Linking
-description: The eleven headers, which shared library each one resolves against, and the net.h / net.go.h choice you have to make per translation unit.
+description: The eleven headers, the one shared library they all resolve against, and the net.h / net.go.h choice you have to make per translation unit.
 ---
 
 # C — Headers and Linking
 
-The C surface is not one header. It is eleven, spread across five shared
-libraries, and one of the pairings is mutually exclusive. This page is the map.
+The C surface is not one header. It is eleven — and they all resolve out of a
+single shared library, `libnet`. One of the header pairings is mutually
+exclusive. This page is the map.
 
 ## The one decision that bites
 
@@ -62,11 +63,16 @@ One command, one library, every header served.
 
 Output lands in `target/release/`:
 
-| Platform | Filename |
-|---|---|
-| Linux | `libnet.so` |
-| macOS | `libnet.dylib` |
-| Windows | `net.dll` |
+| Platform | Filename | Also produced |
+|---|---|---|
+| Linux | `libnet.so` | — |
+| macOS | `libnet.dylib` | — |
+| Windows | `net.dll` | `net.dll.lib` (import library), `net.pdb` |
+
+On Windows the DLL is not the thing you link against. `net.dll.lib` is the
+import library, and it is what the linker needs; `net.dll` is what the
+*loader* needs, later, at run time. Missing either produces a different
+failure, and they are covered separately below.
 
 ## Compiling against it
 
@@ -76,6 +82,27 @@ gcc -o app app.c -L target/release -lnet -lpthread -ldl -lm
 
 `-lnet` regardless of which headers you included. There is no second `-l` to
 add.
+
+On Windows, pick the form that matches your toolchain:
+
+```bat
+:: MSVC — link the import library by name
+cl /I include app.c target\release\net.dll.lib
+```
+
+```bash
+# MinGW / GCC — `-lnet` resolves against net.dll directly.
+gcc -o app.exe app.c -Iinclude -Ltarget/release -lnet
+```
+
+`-lpthread -ldl -lm` are not Windows libraries; leave them off. If your `ld`
+is old enough that `-lnet` does not find `net.dll`, generate a GNU import
+library once and link that instead:
+
+```bash
+gendef net.dll                              # writes net.def
+dlltool -d net.def -D net.dll -l libnet.dll.a
+```
 
 ## One library, on purpose
 
@@ -104,12 +131,43 @@ passes far more often than it fails.
 One library makes that unreachable. The per-surface libraries are no longer
 built.
 
-At run time the loader has to find the library:
+## Finding it at run time
+
+Linking is not the last step. The executable records the library by name, and
+the loader has to find it when the process starts:
 
 ```bash
 LD_LIBRARY_PATH=target/release ./app       # Linux
 DYLD_LIBRARY_PATH=target/release ./app     # macOS
 ```
+
+Windows has no equivalent variable — it searches the executable's own
+directory first, then `PATH`. So do one of these:
+
+```bat
+:: Either put the DLL beside the executable — what you ship
+copy target\release\net.dll .
+app.exe
+
+:: Or point PATH at the build output — what you do while developing
+set PATH=%CD%\target\release;%PATH%
+app.exe
+```
+
+Skip it and the program dies before `main`. The failure is quiet and easy to
+misread — under MSYS/MinGW it looks like this, and a plain `cmd.exe` shows a
+dialog or nothing at all:
+
+```text
+$ ./app.exe
+app.exe: error while loading shared libraries: net.dll: cannot open shared
+object file: No such file or directory
+[exit=127]
+```
+
+Nothing there says the link succeeded and only the loader failed, so it is
+worth recognizing: exit 127 naming `net.dll` means the DLL is not on the
+search path, not that anything is wrong with your build.
 
 ## Examples in the repo
 

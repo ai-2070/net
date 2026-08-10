@@ -38,7 +38,7 @@ pub struct Profile {
     pub endpoint: Option<String>,
 
     /// Path to the operator identity file (the TOML format
-    /// authored by `net identity generate`).
+    /// authored by `net-mesh identity generate`).
     #[serde(default)]
     pub identity: Option<PathBuf>,
 
@@ -52,7 +52,7 @@ pub struct Profile {
     #[serde(default)]
     pub default_timeout_ms: Option<u64>,
 
-    /// Advisory ICE signature threshold for `net ice` previews.
+    /// Advisory ICE signature threshold for `net-mesh ice` previews.
     /// The substrate-side `AdminVerifier` is the source of truth;
     /// this is only a UI hint for the confirm gate.
     #[serde(default)]

@@ -1,4 +1,4 @@
-//! `net subnet` — two deliberately distinct groups under one verb.
+//! `net-mesh subnet` — two deliberately distinct groups under one verb.
 //!
 //! **Topology inspection** (`show|ls|tree`): operator-facing views of
 //! the local mesh node's hierarchical subnet state, routed through

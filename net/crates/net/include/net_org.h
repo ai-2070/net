@@ -1,12 +1,15 @@
 /*
- * net_org.h — C SDK header for libnet_org (the organization
- * capability-auth C ABI).
+ * net_org.h — C SDK header for the organization capability-auth C ABI.
  *
- * One header, one shared library. Mirrors the layout of `net_rpc.h`
- * next to it. Symbols live in the `libnet_org.{so,dylib,dll}` cdylib
- * built from `bindings/go/org-ffi`. The Go binding's `go/org.go` cgo
- * include block is the de-facto contract for non-Go consumers; this
- * file is the canonical drop-in for C / C++ / Zig / Swift / Java JNI.
+ * One of eleven headers, all resolving against a single shared library.
+ * Mirrors the layout of `net_rpc.h` next to it. The Go binding's
+ * `go/org.go` cgo include block is the de-facto contract for non-Go
+ * consumers; this file is the canonical drop-in for C / C++ / Zig /
+ * Swift / Java JNI.
+ *
+ * These symbols are compiled into `libnet`. `bindings/go/org-ffi` is an
+ * rlib linked into it and emits no library of its own — there is no
+ * `libnet_org` to build or link.
  *
  * This is the organization verb facade — the same two verbs (call,
  * serve), five concepts, and four error domains the Rust, Node, and
@@ -15,16 +18,23 @@
  *
  * # Build
  *
- *   cargo build --release -p net-org-ffi
+ *   cargo build --release -p net-ffi
  *
- *   Linux:   target/release/libnet_org.so
- *   macOS:   target/release/libnet_org.dylib
- *   Windows: target/release/net_org.dll
+ *   Linux:   target/release/libnet.so
+ *   macOS:   target/release/libnet.dylib
+ *   Windows: target/release/net.dll  (+ net.dll.lib import library)
  *
- * The cdylib wraps `Arc<MeshNode>` handles minted by the base
- * `libnet` (via `net_mesh_arc_clone`), so link both:
+ * This surface wraps `Arc<MeshNode>` handles minted elsewhere in the same
+ * library (via `net_mesh_arc_clone`). Both live in `libnet`, so there is
+ * one `-l`:
  *
- *   gcc -o app app.c -L target/release -lnet_org -lnet -lpthread -ldl -lm
+ *   gcc -o app app.c -L target/release -lnet -lpthread -ldl -lm
+ *
+ * Do not add a second `-l`. One cdylib per surface is what the
+ * consolidation removed: each embedded its own copy of the core, so
+ * linking two put two copies of the core's statics in one process —
+ * including the registry `parking_lot` uses to track blocked threads,
+ * which made a lock releasable without waking its waiter.
  *
  * # ABI versioning
  *
@@ -116,10 +126,11 @@ int net_org_check_abi_version(uint32_t expected);
 /* ======================================================================
  * Error codes.
  *
- * libnet_org uses its own small negative namespace starting at -1
- * (the standalone-cdylib house convention that net_rpc.h / net_deck.h
- * / net_meshos.h follow), NOT the base surface's shared net_error_t
- * enum. Kept in sync with the Rust `pub const NET_ORG_*` in
+ * The org surface uses its own small negative namespace starting at -1
+ * (the per-surface house convention that net_rpc.h / net_deck.h /
+ * net_meshos.h follow — it predates the one-library consolidation and
+ * outlived it), NOT the base surface's shared net_error_t enum. Kept in
+ * sync with the Rust `pub const NET_ORG_*` in
  * bindings/go/org-ffi/src/lib.rs.
  * ==================================================================== */
 

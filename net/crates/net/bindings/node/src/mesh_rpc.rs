@@ -2069,7 +2069,19 @@ impl MeshRpc {
     ///     }
     ///   });
     ///   ```
-    #[napi(js_name = "serveDuplex")]
+    // `ts_args_type` because `DuplexHandlerArgs` has hand-written napi impls
+    // rather than being a `#[napi(object)]`, so napi-rs emitted its
+    // `TypeName` into index.d.ts with no declaration behind it:
+    //
+    //   index.d.ts(2060,47): error TS2304: Cannot find name 'DuplexHandlerArgs'.
+    //
+    // The tuple below is what `ToNapiValue` actually builds — a JS array
+    // `[stream, sink]` — so this also documents the destructuring the doc
+    // example above shows, instead of an opaque name.
+    #[napi(
+        js_name = "serveDuplex",
+        ts_args_type = "service: string, handler: (args: [JsRequestStream, JsResponseSink]) => Promise<Buffer>"
+    )]
     pub fn serve_duplex(
         &self,
         service: String,
@@ -2112,7 +2124,16 @@ impl MeshRpc {
     /// Wired underneath `serveToolStreaming` in the TS layer so AI
     /// tools can emit progress / delta / result envelopes
     /// incrementally.
-    #[napi(js_name = "serveStreaming")]
+    // Same as `serveDuplex` above: `StreamingHandlerArgs` has hand-written
+    // napi impls, so index.d.ts named a type it never declared —
+    //
+    //   index.d.ts(2084,50): error TS2304: Cannot find name 'StreamingHandlerArgs'.
+    //
+    // — and the tuple is the `[req, sink]` array `ToNapiValue` builds.
+    #[napi(
+        js_name = "serveStreaming",
+        ts_args_type = "service: string, handler: (args: [Buffer, JsResponseSink]) => Promise<Buffer>"
+    )]
     pub fn serve_streaming(
         &self,
         service: String,

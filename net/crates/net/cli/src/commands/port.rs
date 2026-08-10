@@ -1,4 +1,4 @@
-//! `net port (gateway|probe-peer|try-map)` — port-mapping +
+//! `net-mesh port (gateway|probe-peer|try-map)` — port-mapping +
 //! reachability helpers.
 //!
 //! **Phase 2 status: design stub.** Same SDK gap as
@@ -8,7 +8,7 @@
 //! Lands when the `MeshContext` plumbing arrives.
 //!
 //! Notes:
-//! - `net port gateway` is the simplest variant — it just calls
+//! - `net-mesh port gateway` is the simplest variant — it just calls
 //!   `default_ipv4_gateway()` + `local_ipv4_for_gateway()` and
 //!   doesn't need a Mesh. We could ship that one ahead of the
 //!   others by linking through `net_sdk::traversal` re-exports.

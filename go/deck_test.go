@@ -1,11 +1,14 @@
 // Deck client tests.
 //
-// These tests exercise the surface defined in `deck.go`. The cdylib
-// must be built before running:
+// These tests exercise the surface defined in `deck.go`. The one shared
+// library must be built before running:
 //
-//	cargo build --release -p net-deck-ffi
+//	cargo build --release -p net-ffi
 //
-// without the cdylib, `go test -run TestDeck` fails the cgo link step.
+// `bindings/go/deck-ffi` is an rlib linked into that library and emits
+// nothing of its own — one-library-docs: allow
+// so `-p net-deck-ffi` produces no cdylib to link against. Without
+// `libnet`, `go test -run TestDeck` fails the cgo link step.
 //
 // The tests use a fixed seed so the operator id is reproducible. The
 // supervisor runtime starts up empty; admin verbs that target a node

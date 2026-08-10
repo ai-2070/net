@@ -46,12 +46,18 @@ use crate::output::OutputFormat;
     bin_name = "net-mesh",
     version,
     about = "Unified command-line interface for the Net mesh.",
+    // Help is the only documentation an installed binary carries, so it has
+    // to stand on its own. This used to end with "See NET_CLI_PLAN.md for the
+    // full surface" — a repository file that ships in no package, so the one
+    // pointer offered to a user who had just run `pip install net-mesh-cli`
+    // named something they could not open.
     long_about = "net-mesh is the operational counterpart to net-deck — \
                   a non-interactive command-line tool that wraps \
                   the Rust SDK for one-shot operator commands, CI \
                   scripting, daemon authoring, and ad-hoc cluster \
-                  inspection. See NET_CLI_PLAN.md for the full \
-                  surface."
+                  inspection.\n\n\
+                  Run `net-mesh help <command>` for any subcommand, or see \
+                  https://ai2070.net/docs/reference/cli for the full surface."
 )]
 struct Cli {
     /// Profile file path. Defaults to `$XDG_CONFIG_HOME/net-mesh/config.toml`.
@@ -80,15 +86,22 @@ struct Cli {
     #[arg(long, short = 'v', global = true, action = clap::ArgAction::Count)]
     verbose: u8,
 
-    /// Disable ANSI colour in table / text output. Also honours `$NO_COLOR`
-    /// (see [`no_color_from_env`]).
+    /// Disable ANSI colour in table / text output.
     ///
-    /// Deliberately NOT `env = "NO_COLOR"`. On a `bool` field clap parses the
-    /// VARIABLE'S VALUE as a bool literal, so the near-universal `NO_COLOR=1`
-    /// spelling made EVERY subcommand exit 2 with
-    /// `error: invalid value '1' for '--no-color'` before the CLI did any work
-    /// at all — `net org keygen`, `net identity generate`, all of them. The
-    /// env var is resolved by hand in `main` instead, to the actual convention.
+    /// Setting `NO_COLOR` in the environment to any non-empty value does the
+    /// same thing, per the <https://no-color.org> convention.
+    //
+    // Everything below this line is a plain comment, not a doc comment, and
+    // that is the point: clap renders doc comments as long help, so this
+    // maintenance history used to print to operators running `--help`. It
+    // belongs in the source, not in the shipped binary's user interface.
+    //
+    // Deliberately NOT `env = "NO_COLOR"`. On a `bool` field clap parses the
+    // VARIABLE'S VALUE as a bool literal, so the near-universal `NO_COLOR=1`
+    // spelling made EVERY subcommand exit 2 with
+    // `error: invalid value '1' for '--no-color'` before the CLI did any work
+    // at all. The env var is resolved by hand in `main` instead (see
+    // `no_color_from_env`), to the actual convention.
     #[arg(long, global = true)]
     no_color: bool,
 
@@ -178,10 +191,10 @@ enum Command {
     Completion(commands::completion::CompletionArgs),
     /// Emit the troff(1) man page on stdout.
     Man,
-    // `net db` (MeshDB federated query plane) ships once the SDK
+    // `net-mesh db` (MeshDB federated query plane) ships once the SDK
     // exposes a `MeshOsRuntime::chain_reader()` accessor — see
     // `commands/db.rs` for the design stub and
-    // `NET_CLI_PLAN.md §8`. `net port (gateway|probe-peer|
+    // `NET_CLI_PLAN.md §8`. `net-mesh port (gateway|probe-peer|
     // try-map)` waits on the same mesh-adapter access.
 }
 

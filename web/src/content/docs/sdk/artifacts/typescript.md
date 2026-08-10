@@ -1,34 +1,29 @@
 ## Move it — TypeScript
 
-The transfer operations are methods on the **native** mesh handle. The
-`@net-mesh/sdk` `MeshNode` does not delegate them, so this is the same reach-through
-as the rest of the spine:
+The transfer operations are methods on the `MeshNode` itself — no cast, no
+reach-through:
 
 ```typescript
-const native = (node as unknown as {
-  _native: {
-    serveBlobTransfer(adapter: unknown): void;
-    fetchBlob(holderId: bigint, blobRef: unknown): Promise<Buffer>;
-    fetchBlobDiscovered(blobRef: unknown): Promise<Buffer>;
-    storeDir(adapter: unknown, root: string): Promise<unknown>;
-    fetchDir(sourceId: bigint, manifestRef: unknown, dest: string): Promise<unknown>;
-  };
-})._native;
+node.serveBlobTransfer(adapter);
+await node.fetchBlob(holderNodeId, blobRef);
+await node.fetchBlobDiscovered(blobRef);
+await node.storeDir(adapter, root);
+await node.fetchDir(sourceNodeId, manifestRef, dest);
 ```
 
-`@net-mesh/sdk`'s own transport module re-exports only the wire contract —
+`@net-mesh/sdk`'s transport module re-exports the wire contract —
 `TransferControl`, `TransferHeader`, and the stream-id helpers. The node-driven
-operations are not there.
+operations above are on the node.
 
 ### Install, then fetch
 
 ```typescript
-native.serveBlobTransfer(adapter);                       // once per node
+node.serveBlobTransfer(adapter);                       // once per node
 
-const bytes = await native.fetchBlob(holderNodeId, blobRef);
-const same  = await native.fetchBlobDiscovered(blobRef); // mesh finds a holder
+const bytes = await node.fetchBlob(holderNodeId, blobRef);
+const same  = await node.fetchBlobDiscovered(blobRef); // mesh finds a holder
 
-const stats = await native.fetchDir(sourceNodeId, manifestRef, '/tmp/dest');
+const stats = await node.fetchDir(sourceNodeId, manifestRef, '/tmp/dest');
 ```
 
 `holderNodeId` and `sourceNodeId` are `bigint`. `fetchBlob` resolves to a `Buffer`.
@@ -50,7 +45,7 @@ landed — the runtime may well have them while `tsc` does not. Check the versio
 ### Verify it worked
 
 ```typescript
-const bytes = await native.fetchBlobDiscovered(blobRef);
+const bytes = await node.fetchBlobDiscovered(blobRef);
 if (bytes.length === 0) throw new Error('fetched nothing');
 console.log(`fetched: ${bytes.length} bytes`);
 ```

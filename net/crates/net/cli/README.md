@@ -30,19 +30,27 @@ The crate is `net-cli` but the binary it installs is **`net-mesh`**. Prebuilt ta
 # Generate an operator identity (ed25519 seed + pubkey + fingerprint)
 net-mesh identity generate --out ~/.config/net-mesh/identity.toml
 
-# One-shot snapshot read (auto-formatted JSON for non-TTY, table for TTY)
-net-mesh snapshot show
+# One-shot snapshot of the supervisor this command starts. `--local` is
+# required: it cannot attach to a running deployment, so without the flag it
+# refuses rather than printing an empty snapshot that looks like a live read.
+net-mesh snapshot get --local
+# ...or just the peer / daemon counts and health rollup
+net-mesh snapshot status --local
 
 # Tail substrate logs as ndjson, follow mode, filtered to one daemon
 net-mesh log tail --daemon 0x000007 --follow --output ndjson
 
 # Signed admin commit — drain a node, propagated on the admin chain via RedEX
-net-mesh admin drain --node 0x1a2b --drain-for 10m
+net-mesh admin drain 0x1a2b --drain-for 10m
 
-# Break-glass ICE — simulate blast radius first, commit only after confirm
-net-mesh ice force-restart --daemon 0x000007 --simulate
-net-mesh ice force-restart --daemon 0x000007 --confirm
+# Break-glass ICE — print the blast radius first, commit only when it looks right
+net-mesh ice force-restart-daemon 0x000007 --name indexer --dry-run
+net-mesh ice force-restart-daemon 0x000007 --name indexer
 ```
+
+Upgrading? [CHANGELOG.md](CHANGELOG.md) records what an operator or a CI
+script has to do differently — 0.35 makes `--local` mandatory on both
+`snapshot` verbs, which will fail scripts that call them.
 
 ## Subcommand surface
 

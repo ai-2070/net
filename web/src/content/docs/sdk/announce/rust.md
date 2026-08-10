@@ -1,6 +1,23 @@
 ## Announce it — Rust
 
-The ergonomic path for a callable tool is the `#[tool]` attribute.
+The ergonomic path for a callable tool is the `#[tool]` attribute. It needs two
+things the Quickstart's install does not pull in:
+
+```bash
+cargo add net-mesh-sdk --features macros   # net_sdk::macros is opt-in
+cargo add schemars@1                       # for #[derive(JsonSchema)]
+```
+
+`macros` is off by default so consumers who never write a `#[tool]` do not pay
+the proc-macro build cost, and `schemars` has to be a direct dependency of
+*your* crate because your types derive `JsonSchema` themselves. Skip either and
+this page's example does not compile:
+
+```text
+error[E0432]: unresolved import `net_sdk::macros`
+note: ... the item is gated behind the `macros` feature
+error[E0432]: unresolved import `schemars`
+```
 
 ```rust
 use net_sdk::macros::tool;

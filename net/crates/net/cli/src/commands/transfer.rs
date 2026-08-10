@@ -1,4 +1,4 @@
-//! `net transfer (recv-blob|send-blob|recv-dir|send-dir|ls|status|cancel)`
+//! `net-mesh transfer (recv-blob|send-blob|recv-dir|send-dir|ls|status|cancel)`
 //! — operator surface over the `net_sdk::transport` blob / directory
 //! movement primitives (`TRANSFER_CLI_PLAN.md`).
 //!
@@ -6,7 +6,7 @@
 //!
 //! - `recv-blob` / `recv-dir` — **remote**. Stand up an ephemeral mesh,
 //!   handshake with the holder (the same routed-attach path the
-//!   `net aggregator` RPC verbs use), install the blob-transfer engine
+//!   `net-mesh aggregator` RPC verbs use), install the blob-transfer engine
 //!   locally (required even to *fetch* — `fetch_blob` registers a
 //!   pending transfer on the caller's engine), then pull the content
 //!   and reconstruct it on disk. `recv-blob` writes a single file via a
@@ -17,7 +17,7 @@
 //!   [`BlobRef`] a peer fetches by, and (with `--store <dir>`) stage the
 //!   bytes into an on-disk store a serving node can serve from. There is
 //!   no "push" — this is the publish-and-fetch model (`TRANSFER_CLI_PLAN`
-//!   "Out of scope: net transfer push"). Without `--store` the verb only
+//!   "Out of scope: net-mesh transfer push"). Without `--store` the verb only
 //!   prints the reference (a dry content-address computation).
 //! - `ls` / `status` / `cancel` — **remote**. Query a holder's transfer
 //!   engine over the `blob.transfers` RPC (remote-attach), reporting that
@@ -619,7 +619,7 @@ fn require_remote_attach(
 ) -> Result<RemoteAttach, CliError> {
     crate::context::require_remote_attach(profile, args, || {
         invalid_args(format!(
-            "net transfer {verb} needs a holder target: pass --node-addr <IP:PORT> \
+            "net-mesh transfer {verb} needs a holder target: pass --node-addr <IP:PORT> \
              --node-pubkey <HEX> --node-id <N> --psk-hex <HEX> (each can be defaulted \
              in the profile as `node_addr` / `node_pubkey` / `node_id` / `psk_hex`)."
         ))

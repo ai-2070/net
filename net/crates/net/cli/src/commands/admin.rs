@@ -1,4 +1,4 @@
-//! `net admin <verb>` — signed admin-chain commits.
+//! `net-mesh admin <verb>` — signed admin-chain commits.
 //!
 //! Wraps the SDK's `AdminCommands` (`DeckClient::admin()`). Every
 //! verb constructs the corresponding `AdminEvent`, publishes it

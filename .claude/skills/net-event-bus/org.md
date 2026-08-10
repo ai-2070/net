@@ -223,10 +223,10 @@ Its own header and its own cdylib next to `net_rpc.h`, with an **independently v
 if (net_org_check_abi_version(NET_ORG_ABI_VERSION) < 0) abort();
 ```
 
-Link both libraries — the org cdylib wraps `Arc<MeshNode>` handles minted by the base `libnet`:
+Link `-lnet` and nothing else. The org surface wraps `Arc<MeshNode>` handles minted elsewhere in the same library, and both live in `libnet`:
 
 ```sh
-cargo build --release -p net-org-ffi
+cargo build --release -p net-ffi
 gcc -o app app.c -L target/release -lnet -lpthread -ldl -lm
 ```
 

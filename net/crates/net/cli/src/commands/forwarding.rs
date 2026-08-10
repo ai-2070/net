@@ -1,4 +1,4 @@
-//! `net forwarding` — manage the caller-side credential/header forwarding
+//! `net-mesh forwarding` — manage the caller-side credential/header forwarding
 //! **policy** and audit it (`MCP_CREDENTIAL_FORWARDING_PLAN.md` Phase 1).
 //!
 //! This is the operator surface over [`net_mcp::forward::ForwardingStore`]: the
@@ -9,7 +9,7 @@
 //! until then a configured ref has a policy but no value, and forwarding stays
 //! off by default regardless.
 //!
-//! Mirrors `net mcp pin`: the store path resolves to a per-user default (or an
+//! Mirrors `net-mesh mcp pin`: the store path resolves to a per-user default (or an
 //! explicit `--store`), writes go through the store's cross-process locked
 //! `mutate`, and output flows through the `--output` pipeline — except the
 //! human `audit` view, which renders the store's own value-free table for
@@ -104,7 +104,7 @@ pub struct RmArgs {
 #[derive(Args, Debug)]
 pub struct SetValueArgs {
     /// The secret ref name to store the value under (should match a ref you
-    /// configured with `net forwarding allow`).
+    /// configured with `net-mesh forwarding allow`).
     pub ref_name: String,
 }
 
@@ -136,7 +136,7 @@ async fn set_value(args: SetValueArgs, output: Option<OutputFormat>) -> Result<(
 
     // Reject a mistyped ref name before reading the secret: the keychain account
     // is this name verbatim, but the policy side stores refs as lowercase slugs
-    // (`net forwarding allow`), so a value under a non-slug name can never be
+    // (`net-mesh forwarding allow`), so a value under a non-slug name can never be
     // resolved and would fail silently as `ValueMissing` at forward time.
     validate_ref_name(&args.ref_name).map_err(|e| invalid_args(e.to_string()))?;
 
@@ -191,7 +191,7 @@ async fn set_value(_args: SetValueArgs, _output: Option<OutputFormat>) -> Result
 
 /// Resolve the forwarding-store path: the explicit `--store`, else the per-user
 /// default (`<local data>/net-mesh/forwarding.json`) — the same location every
-/// `net forwarding` verb reads and writes.
+/// `net-mesh forwarding` verb reads and writes.
 fn resolve_store(override_: Option<&Path>) -> Result<PathBuf, CliError> {
     if let Some(p) = override_ {
         return Ok(p.to_path_buf());

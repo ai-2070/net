@@ -442,7 +442,23 @@ impl DaemonRuntime {
     /// — event dispatch + daemon construction land in sub-step 2.
     /// Second registration of the same `kind` returns
     /// `daemon: factory for kind '<kind>' is already registered`.
-    #[napi]
+    // `ts_args_type` because `DaemonBridgeTsfns` is a plain Rust struct with
+    // hand-written napi impls, not a `#[napi(object)]`. napi-rs emits its
+    // `TypeName` into index.d.ts but has no shape to declare, so the
+    // generated declaration referenced a name that does not exist anywhere:
+    //
+    //   index.d.ts(507,48): error TS2304: Cannot find name 'DaemonBridgeTsfns'.
+    //
+    // That fails any consumer type-checking dependency declarations. Spell
+    // the object `from_napi_value` below actually destructures — keep the two
+    // in step if a property is added there.
+    #[napi(ts_args_type = "kind: string, factory: () => {
+    process: (event: CausalEventJs) => Array<Buffer>
+    snapshot?: () => Buffer | undefined | null
+    restore?: (snapshot: Buffer) => unknown
+    requiredCapabilities?: CapabilitySetJs
+    optionalCapabilities?: CapabilitySetJs
+  }")]
     pub fn register_factory(
         &self,
         kind: String,

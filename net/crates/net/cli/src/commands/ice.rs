@@ -1,4 +1,4 @@
-//! `net ice <verb>` — break-glass ICE surface.
+//! `net-mesh ice <verb>` — break-glass ICE surface.
 //!
 //! Every verb runs the full simulate → preview → confirm →
 //! commit workflow per `NET_CLI_PLAN.md §3 ICE preview workflow`:
@@ -391,7 +391,7 @@ fn map_ice_error(msg: &str, kind: &'static str) -> CliError {
 fn prompt_for_yes() -> Result<bool, CliError> {
     // Write the prompt to stderr so the preview JSON on stdout
     // stays uncontaminated when an operator pipes the command
-    // (`net ice ... | jq`). The typed response still reads from
+    // (`net-mesh ice ... | jq`). The typed response still reads from
     // stdin.
     let mut stderr = io::stderr();
     write!(stderr, "Type YES to confirm ICE commit: ")

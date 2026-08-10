@@ -1,4 +1,4 @@
-//! `net aggregator (inspect|query|ls|spawn|scale)` — operator
+//! `net-mesh aggregator (inspect|query|ls|spawn|scale)` — operator
 //! surface for the substrate's `AggregatorDaemon` state and the
 //! `AggregatorRegistry` that holds live groups.
 //!
@@ -316,7 +316,7 @@ fn require_remote_attach(
 ) -> Result<RemoteAttach, CliError> {
     crate::context::require_remote_attach(profile, args, || {
         invalid_args(format!(
-            "net aggregator {verb} needs a remote daemon target: pass \
+            "net-mesh aggregator {verb} needs a remote daemon target: pass \
              --node-addr <IP:PORT> --node-pubkey <HEX> --node-id <N> \
              --psk-hex <HEX> (each can be defaulted in the profile as \
              `node_addr` / `node_pubkey` / `node_id` / `psk_hex`)."

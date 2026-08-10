@@ -702,7 +702,22 @@ export class DaemonRuntime {
       // The NAPI side stores a TSFN of the factory but doesn't
       // invoke it — the actual invocation happens on the TS side
       // at `spawn` time (see `spawn` below).
-      this.inner.registerFactory(kind, factory as unknown as () => unknown);
+      // The cast is deliberate and narrow. `DaemonFactory` may return a
+      // Promise, and the native `registerFactory` parameter describes the
+      // synchronous daemon object its `FromNapiValue` would destructure —
+      // but nothing here destructures it, because the native side only
+      // records the kind. The actual factory invocation happens on the TS
+      // side in `spawn` below.
+      //
+      // Casting to the parameter type rather than to `() => unknown` means a
+      // change to the native signature shows up here instead of being
+      // absorbed. Until the declaration was fixed that parameter named an
+      // undeclared type, so this call was checked against `any` and any
+      // shape at all would have passed.
+      this.inner.registerFactory(
+        kind,
+        factory as unknown as Parameters<NapiDaemonRuntime['registerFactory']>[1],
+      );
       this.factories.set(kind, factory);
     } catch (e) {
       toDaemonError(e);

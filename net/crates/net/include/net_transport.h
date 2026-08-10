@@ -3,22 +3,24 @@
  *   blob transfer + directory transfer over the fairscheduler stream
  *   transport (Transport SDK plan, T-C).
  *
- * One header, one shared library. These symbols are exported by the
- * same `libnet` cdylib/staticlib as the rest of the C ABI; this header
- * only declares the transport slice. The transfer engine moves
+ * One of eleven headers, all resolving against a single shared library.
+ * These symbols are exported by the same `libnet` cdylib as the rest of
+ * the C ABI; this header only declares the transport slice. The transfer
+ * engine moves
  * content-addressed bytes (and whole directory trees) between peers
  * over reliable, fair-scheduled streams — distinct from RedEX
  * replication (a push primitive) and nRPC (request/reply).
  *
  * # Build
- *   cargo build --release -p net-mesh \
- *     --features net,dataforts,netdb,redex-disk
- *   Artifacts (in target/release): libnet_mesh.so (Linux),
- *   libnet_mesh.dylib (macOS), net_mesh.dll (Windows).
+ *   cargo build --release -p net-ffi
+ *   Artifacts (in target/release): libnet.so (Linux),
+ *   libnet.dylib (macOS), net.dll + net.dll.lib (Windows).
  *
  * # Link
  *   gcc -o transport transport.c -L target/release \
- *     -lnet_mesh -lpthread -ldl -lm
+ *     -lnet -lpthread -ldl -lm
+ *
+ *   Link `-lnet` and nothing else; there is no second library to add.
  *
  * # Handle model
  *   Transfer is node-driven, so the fetch/dir functions take a
