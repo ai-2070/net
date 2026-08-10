@@ -1002,9 +1002,9 @@ int      net_predicate_redact_trace_metadata_keys(const char* trace_json,
 
 /* =========================================================================
  * Compute — MeshDaemon + migration. Stage 6 of
- * SDK_COMPUTE_SURFACE_PLAN.md. Symbols live in `libnet_compute`
- * (sibling shared library built from `bindings/go/compute-ffi`).
- * Link with `-lnet -lnet_compute`.
+ * SDK_COMPUTE_SURFACE_PLAN.md. Symbols are compiled into `libnet`;
+ * `bindings/go/compute-ffi` is an rlib linked into it and emits no
+ * library of its own. Link with `-lnet` and nothing else.
  * ========================================================================= */
 
 /* Opaque handles. Go wrappers own the pointer lifetime via

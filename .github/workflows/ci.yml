@@ -1657,6 +1657,23 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # The text half of "Assert the Go binding links exactly one net::ffi"
+      # below. That step guards the CODE — no sibling cdylib, no second `-l`
+      # in `go/*.go`. Nothing guarded the TEXT, and text is what a consumer
+      # follows: the sweep that consolidated the docs updated
+      # `net/crates/net/include/net.go.h` but not `go/net.h`, the copy cgo
+      # actually compiles, so the header a Go user has kept saying
+      # `Link with -lnet -lnet_compute` months after that library stopped
+      # being built. Two test files kept saying `cargo build -p net-<x>-ffi`,
+      # which is now an rlib and produces nothing to link.
+      #
+      # First, and before the toolchains: it is pure text, needs no network,
+      # and a failure here should not cost a cdylib build to discover.
+      - name: Guard — no doc tells anyone to build or link a per-surface library
+        run: |
+          python3 .github/scripts/check-one-library-docs.py
+          python3 .github/scripts/check-one-library-docs.py --self-test
+
       - name: Setup Go
         uses: actions/setup-go@v7.0.0
         with:
