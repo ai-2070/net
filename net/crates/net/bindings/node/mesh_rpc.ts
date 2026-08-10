@@ -223,6 +223,27 @@ export interface RawMeshRpc {
     handler: (args: [Buffer, RawResponseSink]) => Promise<Buffer>,
   ): ServeHandle
   findServiceNodes(service: string): bigint[]
+  /**
+   * Release this handle's reference to the mesh. Idempotent.
+   *
+   * `MeshRpc.fromMesh` clones the underlying `Arc<MeshNode>`, so an
+   * outstanding handle makes `shutdown()` fail with
+   * `GenericFailure: cannot shutdown: outstanding references exist`
+   * until V8 finalizes the class — which is on no schedule the caller
+   * controls. This is the way to release it on purpose.
+   *
+   * Serve handles are unaffected: they hold the registration, not this
+   * envelope. Close them with their own `close()`.
+   *
+   * Declared late. `#[napi] pub fn close` has been on the Rust
+   * `MeshRpc` since it was added for exactly this reason, but this
+   * hand-written interface never listed it, so `rpc.raw.close()` — the
+   * call the SDK's own `MeshNode.rpc()` documentation tells you to make
+   * before `shutdown()` — did not type-check.
+   */
+  close(): void
+  /** `true` once {@link RawMeshRpc.close} has been called. */
+  readonly isClosed: boolean
   /** Mint a fresh cancel token (`bigint`). */
   reserveCancelToken(): bigint
   /** Abort the in-flight call associated with `token`. Idempotent. */

@@ -76,10 +76,22 @@ cat > "$WORK/tsconfig.json" <<'JSON'
 }
 JSON
 
-# Deliberately boring: the point is not to exercise the API, it is to make
-# TypeScript read every declaration both packages ship.
+# Mostly boring: the point is to make TypeScript read every declaration both
+# packages ship. Nothing here runs — `noEmit` type-checks and stops — so it is
+# free to name APIs that would need a live mesh.
+#
+# The one deliberately un-boring part is `registerDaemon`. A hand-written
+# `ts_args_type` fixes TS2304 by spelling the object shape, which trades a
+# loud error for a silent one: a declaration that disagrees with the Rust
+# decoder type-checks fine until someone writes the object literal. It had
+# disagreed in both directions — `name` declared optional though the decoder
+# raises without it, and both capability fields missing entirely, so
+# TypeScript's excess-property check (TS2353) rejected them even though the
+# decoder reads them. `net-node`'s own tests pin the declaration against the
+# decoder; this pins that the result is usable from outside.
 cat > "$WORK/consumer.ts" <<'TS'
-import { NetNode, MeshNode } from '@net-mesh/sdk';
+import { NetNode, MeshNode, MeshOsDaemonSdk } from '@net-mesh/sdk';
+import type { MeshOsDaemon } from '@net-mesh/sdk';
 import { Net } from '@net-mesh/core';
 
 export async function main(): Promise<void> {
@@ -90,10 +102,30 @@ export async function main(): Promise<void> {
     bindAddr: '127.0.0.1:0',
     psk: '42'.repeat(32),
   });
+
+  // The tool surface takes the RPC handle, not the node.
+  const rpc = node.rpc();
+  rpc.raw.close();
+
   await node.shutdown();
 
   void Net;
+  void declaredDaemon;
 }
+
+// An object literal, so excess-property checking applies: every field named
+// here must appear in the declaration, or this fails to compile.
+const declaredDaemon: MeshOsDaemon = {
+  name: 'indexer',
+  process: () => [],
+  requiredCapabilities: ['gpu:h100'],
+  optionalCapabilities: () => ['zone:a'],
+};
+
+// The same literal against the RAW napi parameter type, which is where the
+// mismatch actually lived — `@net-mesh/sdk` casts on the way through, so a
+// broken declaration is invisible from the SDK alone.
+export type RawDaemonArg = Parameters<MeshOsDaemonSdk['registerDaemon']>[0];
 TS
 
 echo "==> type-checking a trivial consumer with skipLibCheck: false"
