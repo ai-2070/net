@@ -174,11 +174,28 @@ def main() -> int:
         action="store_true",
         help="check that the checker still catches the defect that shipped",
     )
+    parser.add_argument(
+        "--require-cc",
+        action="store_true",
+        help="fail instead of skipping when no C compiler is found (use in CI)",
+    )
     args = parser.parse_args()
 
     cc = args.cc or shutil.which("gcc") or shutil.which("cc") or shutil.which("clang")
     if cc is None:
-        print("SKIP  no C compiler on PATH")
+        # Skipping is right on a contributor's machine — not having a C
+        # toolchain is a reasonable state to edit markdown in. It is wrong in
+        # CI, where a missing compiler means this gate silently stopped
+        # checking anything while still reporting a green step. `--require-cc`
+        # is how CI says which of the two it is.
+        if args.require_cc:
+            print(
+                "FAIL  no C compiler on PATH, and --require-cc was passed.\n"
+                "      This gate compiles every published C program; without a\n"
+                "      compiler it verifies nothing and would report success."
+            )
+            return 1
+        print("SKIP  no C compiler on PATH (pass --require-cc to make this fatal)")
         return 0
 
     if args.self_test:

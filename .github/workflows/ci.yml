@@ -1367,7 +1367,7 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: |
           python3 -m pip install --quiet pyyaml
-          python3 .github/scripts/check-script-permissions.py
+          python3 .github/scripts/check-script-permissions.py --require-yaml
           python3 .github/scripts/check-script-permissions.py --self-test
 
       - name: Guard — SDK peer range admits the in-tree core

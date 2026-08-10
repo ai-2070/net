@@ -32,7 +32,18 @@ from pathlib import Path
 try:
     import yaml
 except ImportError:  # pragma: no cover - CI installs pyyaml
-    print("SKIP  pyyaml is not installed")
+    # Skipping is right on a contributor's machine; it is wrong in CI, where a
+    # missing dependency means this gate stopped reading any workflow while
+    # still reporting a green step. `--require-yaml` is how CI says which of
+    # the two it is.
+    if "--require-yaml" in sys.argv:
+        print(
+            "FAIL  pyyaml is not installed, and --require-yaml was passed.\n"
+            "      This gate parses every workflow's `run:` blocks; without\n"
+            "      pyyaml it checks nothing and would report success."
+        )
+        sys.exit(1)
+    print("SKIP  pyyaml is not installed (pass --require-yaml to make this fatal)")
     sys.exit(0)
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -177,6 +188,14 @@ def self_test() -> int:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--self-test", action="store_true")
+    # Consumed above, at the import, before argparse exists. Declared here so
+    # it appears in `--help` and is not rejected as an unknown flag once
+    # pyyaml IS installed and the early exit never runs.
+    parser.add_argument(
+        "--require-yaml",
+        action="store_true",
+        help="fail instead of skipping when pyyaml is missing (use in CI)",
+    )
     args = parser.parse_args()
     return self_test() if args.self_test else check()
 

@@ -140,13 +140,19 @@ jobs:
       # floor at all. This compiles every complete C program the docs publish,
       # against the real public headers, at the strictness a careful reader
       # would use.
+      #
+      # `--require-cc` because a runner without a C compiler is a broken
+      # runner, not a reason to pass. Skipping is the right default locally —
+      # editing markdown without a toolchain is reasonable — but in CI a
+      # silent skip is a green step that checked nothing, which is the same
+      # failure this gate exists to prevent one level up.
       - name: Check every published C program compiles
         working-directory: .
-        run: .github/scripts/check-c-doc-snippets.py
+        run: .github/scripts/check-c-doc-snippets.py --require-cc
 
       - name: Check the C snippet checker still catches defects
         working-directory: .
-        run: .github/scripts/check-c-doc-snippets.py --self-test
+        run: .github/scripts/check-c-doc-snippets.py --self-test --require-cc
 
       # No lint or format step, and both omissions are deliberate:
       #
