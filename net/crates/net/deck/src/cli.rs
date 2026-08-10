@@ -181,13 +181,25 @@ mod tests {
     use super::*;
 
     /// An interactive terminal: both streams are a TTY.
-    const TTY: Streams = Streams { stdin_is_tty: true, stdout_is_tty: true };
+    const TTY: Streams = Streams {
+        stdin_is_tty: true,
+        stdout_is_tty: true,
+    };
     /// `net-deck > file` — the interface draws into a pipe.
-    const STDOUT_PIPED: Streams = Streams { stdin_is_tty: true, stdout_is_tty: false };
+    const STDOUT_PIPED: Streams = Streams {
+        stdin_is_tty: true,
+        stdout_is_tty: false,
+    };
     /// `echo | net-deck` — a real terminal to draw on, no keyboard behind it.
-    const STDIN_PIPED: Streams = Streams { stdin_is_tty: false, stdout_is_tty: true };
+    const STDIN_PIPED: Streams = Streams {
+        stdin_is_tty: false,
+        stdout_is_tty: true,
+    };
     /// Fully detached: a cron job, a CI step, a container healthcheck.
-    const DETACHED: Streams = Streams { stdin_is_tty: false, stdout_is_tty: false };
+    const DETACHED: Streams = Streams {
+        stdin_is_tty: false,
+        stdout_is_tty: false,
+    };
 
     /// `--help` and `-h` must print usage and exit 0. They used to enter the
     /// TUI and run forever, which is how a `net-deck --help` in a CI step
