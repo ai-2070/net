@@ -1077,15 +1077,30 @@ impl MeshOsDaemonSdk {
     //   index.d.ts(1752,26): error TS2304: Cannot find name 'DaemonObjectTsfns'.
     //
     // Spell the object `from_napi_value` below destructures; keep the two in
-    // step if a property is added there.
+    // step if a property is added there. `daemon_object_ts_declaration_matches_
+    // from_napi_value` in the test module pins that pairing, because getting it
+    // subtly wrong is worse than the TS2304 it replaced: a declaration that
+    // disagrees with the decoder type-checks and then fails at registration.
+    //
+    // `name` is REQUIRED — `from_napi_value` reads it as `Option<String>` only
+    // so it can raise `invalid_daemon` itself, and `MeshOsDaemon` in
+    // `sdk-ts/src/meshos.ts` declares it required too.
+    //
+    // The two capability fields take the union `resolve_capabilities_napi`
+    // accepts: a `string[]` property, or a `() => string[]` callable resolved
+    // once on the JS main thread at registration. This is deliberately NOT the
+    // `CapabilitySetJs` POJO that `compute.rs::register_factory` takes — the
+    // two surfaces read different shapes.
     #[napi(ts_args_type = "daemon: {
-    name?: string
+    name: string
     process: (event: CausalEventJs) => Array<Buffer>
     snapshot?: () => Buffer | undefined | null
     restore?: (snapshot: Buffer) => unknown
     onControl?: (control: DaemonControlJs) => unknown
     health?: () => string | HealthObjJs
     saturation?: () => number
+    requiredCapabilities?: Array<string> | (() => Array<string>)
+    optionalCapabilities?: Array<string> | (() => Array<string>)
   }, identity: Identity")]
     pub async fn register_daemon(
         &self,
@@ -1153,5 +1168,176 @@ impl MeshOsDaemonSdk {
     pub(crate) async fn with_core<R>(&self, f: impl FnOnce(&CoreSdk) -> R) -> Option<R> {
         let guard = self.inner.lock().await;
         guard.as_ref().map(f)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The `registerDaemon` declaration must describe the object the
+    //! decoder actually reads.
+    //!
+    //! `DaemonObjectTsfns` has hand-written napi impls, so napi-rs emitted
+    //! its `TypeName` into `index.d.ts` with no declaration behind it and
+    //! every consumer who type-checks dependencies saw `TS2304: Cannot find
+    //! name 'DaemonObjectTsfns'`. The fix is a `ts_args_type` spelling the
+    //! shape by hand — which trades a loud error for a silent one, because a
+    //! hand-written declaration that disagrees with `from_napi_value`
+    //! type-checks and then fails at registration.
+    //!
+    //! Both halves of that disagreement had already landed: `name` was
+    //! declared optional while the decoder raises `invalid_daemon` without
+    //! it, and `requiredCapabilities` / `optionalCapabilities` were read by
+    //! the decoder but missing from the declaration, so an object literal
+    //! carrying them failed TS's excess-property check (TS2353).
+    //!
+    //! These read the source rather than the generated `index.d.ts`:
+    //! `index.d.ts` is a build artifact that a clean checkout does not have,
+    //! and the pairing being guarded is between two things in this file.
+
+    /// This file's own source. The declaration under test is an attribute
+    /// string, so there is nothing to introspect at runtime.
+    const SOURCE: &str = include_str!("meshos.rs");
+
+    /// The `impl FromNapiValue for DaemonObjectTsfns` body — bounded, so a
+    /// property read by some other decoder in this file cannot drift in.
+    fn decoder_body() -> &'static str {
+        let start = SOURCE
+            .find("impl napi::bindgen_prelude::FromNapiValue for DaemonObjectTsfns")
+            .expect("the DaemonObjectTsfns decoder moved or was renamed");
+        let rest = &SOURCE[start..];
+        // The impl ends at the first line that closes at column 0.
+        let end = rest
+            .find("\n}\n")
+            .expect("could not find the end of the decoder impl");
+        &rest[..end]
+    }
+
+    /// Property names the decoder reads off the daemon object.
+    fn properties_the_decoder_reads() -> Vec<String> {
+        let body = decoder_body();
+        let mut found = Vec::new();
+
+        // `get_named_property::<T>("x")` and `get_named_property("x")`, plus
+        // the capability fields, which route through a helper that takes the
+        // attribute name as an argument.
+        for marker in ["get_named_property", "resolve_capabilities_napi"] {
+            let mut from = 0;
+            while let Some(at) = body[from..].find(marker) {
+                let after = from + at + marker.len();
+                // First string literal on the remainder of the call.
+                let Some(open) = body[after..].find('"') else {
+                    break;
+                };
+                let lit_start = after + open + 1;
+                let Some(close) = body[lit_start..].find('"') else {
+                    break;
+                };
+                let name = &body[lit_start..lit_start + close];
+                // Only same-call literals: a quote further away than the end
+                // of the statement means this call used a variable instead.
+                if body[after..lit_start].contains(';') {
+                    from = after;
+                    continue;
+                }
+                if !found.iter().any(|f: &String| f == name) {
+                    found.push(name.to_owned());
+                }
+                from = lit_start + close;
+            }
+        }
+
+        assert!(
+            !found.is_empty(),
+            "parsed no property names out of the decoder — the matcher is \
+             broken, and a checker that finds nothing passes forever"
+        );
+        found
+    }
+
+    /// The `ts_args_type` string attached to `register_daemon`.
+    fn declared_args() -> &'static str {
+        let anchor = SOURCE
+            .find("pub async fn register_daemon")
+            .expect("register_daemon moved or was renamed");
+        let before = &SOURCE[..anchor];
+        let start = before
+            .rfind("#[napi(ts_args_type = \"")
+            .expect("register_daemon no longer carries a ts_args_type");
+        let open = start + "#[napi(ts_args_type = \"".len();
+        let close = SOURCE[open..]
+            .find("\")]")
+            .expect("unterminated ts_args_type on register_daemon");
+        &SOURCE[open..open + close]
+    }
+
+    #[test]
+    fn daemon_object_ts_declaration_matches_from_napi_value() {
+        let declared = declared_args();
+        let mut missing = Vec::new();
+
+        for property in properties_the_decoder_reads() {
+            // Property positions in a TS object type are `name:` / `name?:`.
+            let required = format!("{property}:");
+            let optional = format!("{property}?:");
+            if !declared.contains(&required) && !declared.contains(&optional) {
+                missing.push(property);
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "`from_napi_value` reads {missing:?}, which the registerDaemon \
+             declaration never mentions. TypeScript's excess-property check \
+             rejects an object literal carrying them (TS2353), so the field \
+             is unusable from `@net-mesh/core` even though the decoder \
+             supports it.\n\ndeclared:\n{declared}"
+        );
+    }
+
+    /// `name` is the one field whose optionality the decoder decides for
+    /// itself: it reads `Option<String>` and then raises. Declaring it
+    /// optional type-checks, and then registration fails with the
+    /// `invalid_daemon` error naming `name` as a required string property.
+    #[test]
+    fn name_is_declared_required_because_the_decoder_requires_it() {
+        let body = decoder_body();
+        let raises_without_name = body.contains("daemon `name` must be a string property");
+        assert!(
+            raises_without_name,
+            "the decoder no longer raises on a missing `name` — if it became \
+             genuinely optional, relax the declaration to `name?: string` and \
+             delete this test"
+        );
+
+        let declared = declared_args();
+        assert!(
+            declared.contains("name: string"),
+            "`name` is declared optional but the decoder rejects a daemon \
+             without it:\n{declared}"
+        );
+        assert!(
+            !declared.contains("name?:"),
+            "`name` is still declared optional:\n{declared}"
+        );
+    }
+
+    /// The two daemon-object surfaces read DIFFERENT capability shapes —
+    /// `compute.rs::register_factory` takes the `CapabilitySetJs` POJO,
+    /// `resolve_capabilities_napi` here takes `string[]` or a callable
+    /// returning one. Copying compute's spelling over would type-check and
+    /// then fail to decode, so pin the shape this decoder accepts.
+    #[test]
+    fn capability_fields_declare_the_shape_this_decoder_accepts() {
+        let declared = declared_args();
+        for field in ["requiredCapabilities", "optionalCapabilities"] {
+            let spelled = format!("{field}?: Array<string> | (() => Array<string>)");
+            assert!(
+                declared.contains(&spelled),
+                "{field} must be declared as `{spelled}` — \
+                 `resolve_capabilities_napi` reads a `string[]` property or a \
+                 `() => string[]` callable, NOT compute.rs's \
+                 `CapabilitySetJs`.\n\ndeclared:\n{declared}"
+            );
+        }
     }
 }
