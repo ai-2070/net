@@ -525,6 +525,64 @@ void     net_identity_free(net_identity_t* handle);
  * buffer — treat the bytes as secret material. */
 int      net_identity_to_seed(net_identity_t* handle, uint8_t* out);
 
+/* --- Issuer generation + durable issuer state -------------------------
+ *
+ * A token carries the credential epoch of the identity that signed it,
+ * and a verifier rejects it once its revocation floor for that issuer
+ * exceeds the epoch. That is only usable if an issuer can restart still
+ * knowing which epoch it is on, and the 32-byte seed above cannot carry
+ * one: `net_identity_from_seed` comes back at generation zero, which
+ * for an issuer that has already published floor N means it can mint
+ * nothing a verifier will accept.
+ *
+ * Persisted state layout (identical in every binding):
+ *
+ *     offset  size  field
+ *          0     1  version (currently 1)
+ *          1    32  ed25519 seed
+ *         33     4  issuer generation, uint32 little-endian
+ */
+
+#define NET_IDENTITY_STATE_SIZE 37
+
+/* Returns the size this build writes. Compare against
+ * NET_IDENTITY_STATE_SIZE at startup if you want a stale header to
+ * fail loudly rather than under-allocate a buffer. */
+size_t   net_identity_state_size(void);
+
+/* This issuer's current credential epoch. Returns 0 for a NULL or
+ * shutting-down handle — indistinguishable from a genuine zero, which
+ * is the epoch that claims the least. */
+uint32_t net_identity_generation(net_identity_t* handle);
+
+/* The same key at a later generation, as a NEW handle. The input is
+ * unchanged; free both. `next` equal to the current generation is
+ * accepted and idempotent at every generation, UINT32_MAX included.
+ * Returns NET_ERR_IDENTITY when `next` is lower. There is no
+ * generation above UINT32_MAX to name, so an issuer there can
+ * re-apply but not advance; past that, rotate the identity key.
+ *
+ * Rotation order: build the generation-N handle, persist
+ * net_identity_to_state atomically and durably, distribute verifier
+ * floor N, then issue. Publishing floor N before the state is durable
+ * leaves a crashed issuer announcing a floor it cannot satisfy.
+ *
+ * The token cache is NOT shared with the source handle — two
+ * independently-freeable handles must not share one. */
+int      net_identity_at_generation(net_identity_t* handle, uint32_t next,
+                                    net_identity_t** out_handle);
+
+/* Writes NET_IDENTITY_STATE_SIZE bytes into `out`. Secret material:
+ * contains the signing seed. Encrypt at rest and write atomically. */
+int      net_identity_to_state(net_identity_t* handle, uint8_t* out);
+
+/* Restores key AND generation. Returns NET_ERR_IDENTITY on a wrong
+ * length or an unrecognized version rather than parsing what it can —
+ * a partial parse of credential state is how an issuer silently comes
+ * back on the wrong epoch. */
+int      net_identity_from_state(const uint8_t* state, size_t state_len,
+                                 net_identity_t** out_handle);
+
 /* Writes the 32-byte entity id into `out[32]`. */
 int      net_identity_entity_id(net_identity_t* handle, uint8_t* out);
 
