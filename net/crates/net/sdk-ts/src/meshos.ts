@@ -336,12 +336,21 @@ export class MeshOsDaemonSdk {
     identity: Identity,
   ): Promise<MeshOsDaemonHandle> {
     return rethrowAsync(async () => {
-      // The napi `registerDaemon` accepts a plain object with the
-      // typed callable fields. Cast through `unknown` because the
-      // generated d.ts references an internal `DaemonObjectTsfns`
-      // type that isn't reified at the napi boundary.
+      // The napi `registerDaemon` accepts a plain object with the typed
+      // callable fields, which `ts_args_type` on the Rust side now spells
+      // out. Casting to that parameter type rather than to `never` is the
+      // point: `never` satisfies ANY parameter type, so while it was there
+      // the SDK could not have noticed the declaration drifting away from
+      // what `from_napi_value` decodes — and it had, in both directions
+      // (`name` declared optional though the decoder raises without it,
+      // the two capability fields missing entirely).
+      //
+      // A cast is still needed because `MeshOsDaemon` uses method syntax
+      // and richer domain types (`DaemonHealth`, `CapabilityAdvert`) that
+      // the generated declaration spells structurally. `compute.ts` does
+      // the same thing for the same reason.
       const handle = await this.raw.registerDaemon(
-        daemon as unknown as never,
+        daemon as unknown as Parameters<NapiSdk['registerDaemon']>[0],
         identity,
       );
       return new MeshOsDaemonHandle(handle);
