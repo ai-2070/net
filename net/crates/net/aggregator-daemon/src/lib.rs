@@ -51,8 +51,8 @@ use clap::Parser;
 use serde::Deserialize;
 
 use net::adapter::net::behavior::aggregator::{
-    snapshot_group, AggregatorConfig, AggregatorDaemon, AggregatorRegistry, RegistryRpcError,
-    SpawnFn,
+    snapshot_group, AggregatorConfig, AggregatorDaemon, AggregatorRegistry, RegistryAdminPolicy,
+    RegistryRpcError, SpawnFn,
 };
 use net::adapter::net::behavior::fold::capability::CapabilityFold;
 use net::adapter::net::behavior::fold::reservation::ReservationFold;
@@ -115,6 +115,36 @@ struct Config {
     /// boundary at the operator's config file.
     #[serde(default, rename = "template")]
     templates: Vec<TemplateConfig>,
+    /// Node ids allowed to drive the `aggregator.registry` RPC —
+    /// `List`, `Spawn`, `Scale`, `Unregister`.
+    ///
+    /// Empty (the default) refuses every remote request. The
+    /// template list above bounds *what* can be deployed; this
+    /// bounds *who* can deploy it, and before it existed the answer
+    /// was "anyone holding the PSK". That matters when the PSK admits
+    /// nodes that are not aggregation operators: such a peer could
+    /// stop summary groups, resize them, spawn more from configured
+    /// templates until the host ran out of resources, and read group
+    /// status. It could never forge the signed source announcements
+    /// the summaries are computed from.
+    ///
+    /// Accepts decimal or `0x`-prefixed hex, matching the CLI's
+    /// `--node-id`.
+    ///
+    /// ```toml
+    /// operators = ["0x1a2b3c4d5e6f7788"]
+    /// ```
+    ///
+    /// Set `operators_any_admitted_peer = true` instead if mesh
+    /// membership *is* operator membership in this deployment — a
+    /// real model, but one worth stating out loud.
+    #[serde(default)]
+    operators: Vec<String>,
+    /// Accept registry administration from any admitted mesh peer.
+    /// The pre-0.35 behaviour; mutually exclusive with a non-empty
+    /// `operators` list.
+    #[serde(default)]
+    operators_any_admitted_peer: bool,
 }
 
 /// Per-group config section spawned at startup. Carries the
@@ -158,6 +188,36 @@ struct TemplateConfig {
     summary_interval_ms: u64,
 }
 
+/// Resolve the config's operator settings into a
+/// [`RegistryAdminPolicy`].
+///
+/// Refuses a config that sets both `operators` and
+/// `operators_any_admitted_peer`: picking one silently would leave the
+/// operator believing the other applied, and in one direction that is
+/// a wide-open registry they thought they had locked down.
+fn resolve_admin_policy(config: &Config) -> Result<RegistryAdminPolicy, DaemonError> {
+    if config.operators_any_admitted_peer {
+        if !config.operators.is_empty() {
+            return Err(DaemonError::OperatorPolicyAmbiguous);
+        }
+        return Ok(RegistryAdminPolicy::AnyAdmittedPeer);
+    }
+    let mut ids = Vec::with_capacity(config.operators.len());
+    for (index, raw) in config.operators.iter().enumerate() {
+        let trimmed = raw.trim();
+        let parsed = match trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+            Some(hex) => u64::from_str_radix(hex, 16),
+            None => trimmed.parse::<u64>(),
+        };
+        ids.push(parsed.map_err(|e| DaemonError::OperatorIdInvalid {
+            index,
+            raw: raw.clone(),
+            error: e.to_string(),
+        })?);
+    }
+    Ok(RegistryAdminPolicy::operators(ids))
+}
+
 /// Daemon startup errors. Cover config parsing, MeshNode boot,
 /// and group registration in one typed surface so the binary's
 /// `main` exit code maps cleanly.
@@ -182,6 +242,17 @@ pub enum DaemonError {
     ConfigParse { path: PathBuf },
     #[error("psk_hex must decode to 32 bytes: {0}")]
     PskInvalid(String),
+    #[error("operators[{index}]: {raw:?} is not a node id ({error})")]
+    OperatorIdInvalid {
+        index: usize,
+        raw: String,
+        error: String,
+    },
+    #[error(
+        "config sets both `operators` and `operators_any_admitted_peer = true`; \
+         these contradict — remove one"
+    )]
+    OperatorPolicyAmbiguous,
     #[error("listen address {addr:?} is not a valid SocketAddr: {error}")]
     ListenAddrInvalid {
         addr: String,
@@ -320,6 +391,7 @@ pub async fn boot(cli: Cli) -> Result<BootedDaemon, DaemonError> {
             error: e,
         })?;
     let psk = decode_psk(&config.psk_hex)?;
+    let admin_policy = resolve_admin_policy(&config)?;
 
     // Boot the MeshNode, install the registry, expose the RPC
     // service. Order matters: `set_aggregator_registry`
@@ -342,7 +414,7 @@ pub async fn boot(cli: Cli) -> Result<BootedDaemon, DaemonError> {
     let spawner = make_spawner(config.templates.clone(), registry.clone(), mesh.clone());
     let scaler = make_scaler(config.templates.clone(), registry.clone(), mesh.clone());
     let serve = registry
-        .install_registry_service_with_handlers(&mesh, spawner, scaler)
+        .install_registry_service_with_handlers(&mesh, spawner, scaler, admin_policy)
         .map_err(|e| DaemonError::Serve(format!("{e:?}")))?;
 
     let bound_addr = mesh.local_addr();
@@ -992,6 +1064,81 @@ psk_hex = \"{SENTINEL}\" trailing
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn operators_default_to_closed() {
+        let cfg = parse_config_for_test("listen = \"127.0.0.1:0\"\npsk_hex = \"aa\"\n");
+        let policy = resolve_admin_policy(&cfg).expect("policy");
+        assert!(
+            !policy.permits(0xAAAA),
+            "a config that names no operators must refuse everyone — anything else \
+             hands registry administration to whoever holds the PSK"
+        );
+    }
+
+    #[test]
+    fn named_operators_are_the_only_ones_permitted() {
+        let cfg = parse_config_for_test(
+            "listen = \"127.0.0.1:0\"\npsk_hex = \"aa\"\noperators = [\"0x1234\", \"9\"]\n",
+        );
+        let policy = resolve_admin_policy(&cfg).expect("policy");
+        assert!(policy.permits(0x1234), "hex operator id not accepted");
+        assert!(policy.permits(9), "decimal operator id not accepted");
+        assert!(!policy.permits(0x9999), "an unnamed node was permitted");
+    }
+
+    #[test]
+    fn an_empty_operators_list_is_not_a_synonym_for_everyone() {
+        let cfg =
+            parse_config_for_test("listen = \"127.0.0.1:0\"\npsk_hex = \"aa\"\noperators = []\n");
+        let policy = resolve_admin_policy(&cfg).expect("policy");
+        assert!(
+            !policy.permits(0xAAAA),
+            "writing the key and leaving it empty must not widen access"
+        );
+    }
+
+    #[test]
+    fn the_open_policy_must_be_asked_for_by_name() {
+        let cfg = parse_config_for_test(
+            "listen = \"127.0.0.1:0\"\npsk_hex = \"aa\"\noperators_any_admitted_peer = true\n",
+        );
+        let policy = resolve_admin_policy(&cfg).expect("policy");
+        assert!(policy.permits(0xAAAA));
+    }
+
+    #[test]
+    fn contradictory_operator_config_is_refused_rather_than_guessed() {
+        let cfg = parse_config_for_test(
+            "listen = \"127.0.0.1:0\"\npsk_hex = \"aa\"\noperators = [\"1\"]\n\
+             operators_any_admitted_peer = true\n",
+        );
+        // Silently picking one would leave the operator believing the
+        // other applied — in one direction that is a wide-open
+        // registry they thought they had locked down.
+        assert!(matches!(
+            resolve_admin_policy(&cfg),
+            Err(DaemonError::OperatorPolicyAmbiguous)
+        ));
+    }
+
+    #[test]
+    fn a_malformed_operator_id_names_its_index() {
+        let cfg = parse_config_for_test(
+            "listen = \"127.0.0.1:0\"\npsk_hex = \"aa\"\noperators = [\"1\", \"nope\"]\n",
+        );
+        match resolve_admin_policy(&cfg) {
+            Err(DaemonError::OperatorIdInvalid { index, raw, .. }) => {
+                assert_eq!(index, 1);
+                assert_eq!(raw, "nope");
+            }
+            other => panic!("expected OperatorIdInvalid, got {other:?}"),
+        }
+    }
+
+    fn parse_config_for_test(text: &str) -> Config {
+        toml::from_str(text).expect("test config must parse")
     }
 
     #[test]

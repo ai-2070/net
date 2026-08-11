@@ -64,6 +64,9 @@ pub const NET_REGISTRY_ERR_SCALE_REJECTED: i32 = 9;
 /// Server doesn't accept dynamic scale (no scale handler
 /// installed).
 pub const NET_REGISTRY_ERR_SCALE_NOT_SUPPORTED: i32 = 10;
+/// Server refused: the caller is not an operator of the target
+/// daemon's aggregator registry. See `RegistryAdminPolicy`.
+pub const NET_REGISTRY_ERR_UNAUTHORIZED: i32 = 11;
 /// Caller-side error: a string argument wasn't valid UTF-8 or
 /// a pointer was null where one was required.
 pub const NET_REGISTRY_ERR_INVALID_ARGS: i32 = 99;
@@ -864,6 +867,11 @@ fn classify(err: &RegistryClientError) -> (i32, String) {
         RegistryClientError::Server(RegistryRpcError::ScaleNotSupported) => (
             NET_REGISTRY_ERR_SCALE_NOT_SUPPORTED,
             "daemon doesn't accept dynamic scale (no scaler installed)".to_string(),
+        ),
+        RegistryClientError::Server(RegistryRpcError::Unauthorized) => (
+            NET_REGISTRY_ERR_UNAUTHORIZED,
+            "caller is not an operator of the target daemon's aggregator registry"
+                .to_string(),
         ),
     }
 }

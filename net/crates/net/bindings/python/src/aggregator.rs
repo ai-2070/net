@@ -112,6 +112,10 @@ fn registry_err(py: Python<'_>, e: SdkRegistryClientError) -> PyErr {
                 "scale-not-supported",
                 "daemon doesn't accept dynamic scale".to_string(),
             ),
+            RegistryRpcError::Unauthorized => (
+                "unauthorized",
+                "caller is not an operator of the target daemon's registry".to_string(),
+            ),
         },
     };
     let message = format!("agg:{kind}: {detail}");

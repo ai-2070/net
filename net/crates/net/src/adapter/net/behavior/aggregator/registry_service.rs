@@ -36,6 +36,7 @@
 //! group's `source_subnet` + `fold_kinds` and rejects with
 //! `ScaleRejected("template mismatch")` if not.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -222,6 +223,98 @@ pub enum RegistryRpcError {
     /// installed). Mirror of [`Self::SpawnNotSupported`] for the
     /// scale path.
     ScaleNotSupported,
+    /// The calling session peer is not an operator of this
+    /// daemon's registry. See [`RegistryAdminPolicy`].
+    Unauthorized,
+}
+
+/// Who may administer this daemon's aggregator registry.
+///
+/// # What this actually protects
+///
+/// Aggregator groups are fold-summary reducers: they read
+/// `CapabilityFold` / `ReservationFold` and publish bucketed counts.
+/// The templates an operator configures carry a source subnet, fold
+/// kinds, a summary interval and a replica count — not binaries,
+/// commands or application callbacks. An unauthorized caller here
+/// therefore cannot forge signed capability announcements, mutate
+/// canonical fold entries, invent provider identities, or run
+/// arbitrary workloads: source announcements stay signed and are
+/// admitted into the folds before aggregation, and the aggregator only
+/// counts what was already accepted.
+///
+/// What it *can* do is stop summary groups, resize them, create more
+/// from configured templates, exhaust host resources by repeating
+/// that, and read group status — including `group_seed`. That is
+/// control-plane availability and summary suppression: real, and worth
+/// a gate, but not workload takeover.
+///
+/// # When it matters
+///
+/// Only when the PSK admits nodes that are not trusted aggregation
+/// operators. Where mesh membership *is* operator membership by
+/// design, this is a coarse boundary rather than a missing one — so
+/// severity is deployment-dependent. The default is nonetheless
+/// [`Closed`](Self::Closed): the wide-open behaviour should be asked
+/// for by name rather than obtained by omission.
+///
+/// The decision is made on
+/// [`RpcContext::session_peer`](crate::adapter::net::cortex::RpcContext::session_peer),
+/// the AEAD-authenticated caller; `caller_origin` is routing metadata
+/// the sender chooses and must not be authorized on.
+#[derive(Debug, Clone, Default)]
+pub enum RegistryAdminPolicy {
+    /// Refuse every remote request. The default: a daemon that has not
+    /// named its operators cannot tell one from anyone else holding
+    /// the PSK.
+    #[default]
+    Closed,
+    /// The named operator nodes. An empty set is equivalent to
+    /// [`Closed`](Self::Closed) — writing the config key but leaving
+    /// it empty must not widen access.
+    Operators(Arc<HashSet<u64>>),
+    /// Any peer that completed the mesh handshake — the pre-0.35
+    /// behaviour. Correct when the PSK is held exclusively by trusted
+    /// aggregation operators, which is a real deployment model.
+    AnyAdmittedPeer,
+}
+
+impl RegistryAdminPolicy {
+    /// Build an [`Operators`](Self::Operators) set from anything iterable.
+    pub fn operators<I: IntoIterator<Item = u64>>(nodes: I) -> Self {
+        Self::Operators(Arc::new(nodes.into_iter().collect()))
+    }
+
+    /// Whether `session_peer` may administer this registry.
+    pub fn permits(&self, session_peer: u64) -> bool {
+        match self {
+            Self::Closed => false,
+            Self::Operators(nodes) => nodes.contains(&session_peer),
+            Self::AnyAdmittedPeer => true,
+        }
+    }
+}
+
+/// Shared authorization preamble for both registry handlers. Returns
+/// the encoded refusal when the caller is not an operator.
+fn refuse_unless_operator(
+    policy: &RegistryAdminPolicy,
+    ctx: &RpcContext,
+    handler: &'static str,
+) -> Option<RpcResponsePayload> {
+    if policy.permits(ctx.session_peer) {
+        return None;
+    }
+    tracing::warn!(
+        session_peer = format!("{:#x}", ctx.session_peer),
+        caller_origin = format!("{:#x}", ctx.caller_origin),
+        handler,
+        policy = ?policy,
+        "refused an unauthorized aggregator.registry request",
+    );
+    Some(encode_response(&RegistryResponse::Error(
+        RegistryRpcError::Unauthorized,
+    )))
 }
 
 /// Async callback the [`RegistryHandler`] invokes when a
@@ -299,18 +392,41 @@ pub struct ScaleRequest {
 /// constructor.
 pub struct RegistryReadHandler {
     registry: Arc<AggregatorRegistry>,
+    policy: RegistryAdminPolicy,
 }
 
 impl RegistryReadHandler {
     /// Wrap a shared registry as a read-only handler.
+    ///
+    /// Refuses every remote request until operators are named via
+    /// [`Self::with_policy`]. Note what "read-only" means here: it
+    /// cannot *spawn*. It still answers `Unregister`, which stops a
+    /// group — so it needs the same gate as the spawn-capable variant,
+    /// and the name should not be read as "harmless".
     pub fn new(registry: Arc<AggregatorRegistry>) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            policy: RegistryAdminPolicy::default(),
+        }
+    }
+
+    /// Name the operator nodes allowed to administer this registry.
+    pub fn with_policy(mut self, policy: RegistryAdminPolicy) -> Self {
+        self.policy = policy;
+        self
     }
 }
 
 #[async_trait]
 impl RpcHandler for RegistryReadHandler {
     async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+        // Authorize before decoding: the body is attacker-controlled,
+        // and a reply that differed between a malformed and a
+        // well-formed body would be a free oracle for probing the wire
+        // format.
+        if let Some(refusal) = refuse_unless_operator(&self.policy, &ctx, "read") {
+            return Ok(refusal);
+        }
         let request: RegistryRequest = match postcard::from_bytes(&ctx.payload.body) {
             Ok(req) => req,
             Err(e) => {
@@ -338,6 +454,7 @@ pub struct RegistryHandler {
     registry: Arc<AggregatorRegistry>,
     spawner: Arc<SpawnFn>,
     scaler: Option<Arc<ScaleFn>>,
+    policy: RegistryAdminPolicy,
 }
 
 impl RegistryHandler {
@@ -350,7 +467,16 @@ impl RegistryHandler {
             registry,
             spawner: Arc::new(spawner),
             scaler: None,
+            policy: RegistryAdminPolicy::default(),
         }
+    }
+
+    /// Name the operator nodes allowed to administer this registry.
+    /// Without this the handler refuses every remote request — see
+    /// [`RegistryAdminPolicy`].
+    pub fn with_policy(mut self, policy: RegistryAdminPolicy) -> Self {
+        self.policy = policy;
+        self
     }
 
     /// Attach a [`ScaleFn`] so the handler answers `Scale`
@@ -366,6 +492,9 @@ impl RegistryHandler {
 #[async_trait]
 impl RpcHandler for RegistryHandler {
     async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+        if let Some(refusal) = refuse_unless_operator(&self.policy, &ctx, "full") {
+            return Ok(refusal);
+        }
         let request: RegistryRequest = match postcard::from_bytes(&ctx.payload.body) {
             Ok(req) => req,
             Err(e) => {
@@ -539,14 +668,19 @@ impl AggregatorRegistry {
     /// [`RegistryRpcError::SpawnNotSupported`]; use
     /// [`Self::install_registry_service_with_spawner`] to
     /// accept dynamic deployment.
+    /// `policy` names the operator nodes allowed to drive it; it is
+    /// a required argument rather than a defaulted one so that every
+    /// caller has to decide, instead of getting the wide-open
+    /// behaviour by not thinking about it.
     pub fn install_registry_service(
         self: &Arc<Self>,
         mesh: &Arc<crate::adapter::net::MeshNode>,
+        policy: RegistryAdminPolicy,
     ) -> Result<crate::adapter::net::mesh_rpc::ServeHandle, crate::adapter::net::mesh_rpc::ServeError>
     {
         mesh.serve_rpc(
             REGISTRY_SERVICE,
-            Arc::new(RegistryReadHandler::new(self.clone())),
+            Arc::new(RegistryReadHandler::new(self.clone()).with_policy(policy)),
         )
     }
 
@@ -561,11 +695,12 @@ impl AggregatorRegistry {
         self: &Arc<Self>,
         mesh: &Arc<crate::adapter::net::MeshNode>,
         spawner: SpawnFn,
+        policy: RegistryAdminPolicy,
     ) -> Result<crate::adapter::net::mesh_rpc::ServeHandle, crate::adapter::net::mesh_rpc::ServeError>
     {
         mesh.serve_rpc(
             REGISTRY_SERVICE,
-            Arc::new(RegistryHandler::new(self.clone(), spawner)),
+            Arc::new(RegistryHandler::new(self.clone(), spawner).with_policy(policy)),
         )
     }
 
@@ -578,11 +713,16 @@ impl AggregatorRegistry {
         mesh: &Arc<crate::adapter::net::MeshNode>,
         spawner: SpawnFn,
         scaler: ScaleFn,
+        policy: RegistryAdminPolicy,
     ) -> Result<crate::adapter::net::mesh_rpc::ServeHandle, crate::adapter::net::mesh_rpc::ServeError>
     {
         mesh.serve_rpc(
             REGISTRY_SERVICE,
-            Arc::new(RegistryHandler::new(self.clone(), spawner).with_scaler(scaler)),
+            Arc::new(
+                RegistryHandler::new(self.clone(), spawner)
+                    .with_scaler(scaler)
+                    .with_policy(policy),
+            ),
         )
     }
 }

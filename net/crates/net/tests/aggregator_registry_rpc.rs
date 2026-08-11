@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use net::adapter::net::behavior::aggregator::{
-    AggregatorConfig, AggregatorDaemon, AggregatorRegistry, RegistryClient,
+    AggregatorConfig, AggregatorDaemon, AggregatorRegistry, RegistryAdminPolicy, RegistryClient,
 };
 use net::adapter::net::behavior::fold::capability::CapabilityFold;
 use net::adapter::net::behavior::fold::FoldKind;
@@ -103,8 +103,14 @@ async fn build_registry_pair() -> (
         registry.register(*name, group).expect("register");
     }
 
+    // The querier is the operator here. Naming its node id keeps
+    // these round-trips as the positive control for the
+    // authorization gate rather than side-stepping it.
     let serve_handle = registry
-        .install_registry_service(&host)
+        .install_registry_service(
+            &host,
+            RegistryAdminPolicy::operators([querier.node_id()]),
+        )
         .expect("install_registry_service");
 
     (host, querier, registry, serve_handle, vec!["alpha", "beta"])
@@ -150,10 +156,73 @@ async fn list_against_empty_registry_returns_empty_groups() {
     handshake(&host, &querier).await;
     let registry = Arc::new(AggregatorRegistry::new());
     let _serve = registry
-        .install_registry_service(&host)
+        .install_registry_service(
+            &host,
+            RegistryAdminPolicy::operators([querier.node_id()]),
+        )
         .expect("install_registry_service");
 
     let client = RegistryClient::new(querier).with_deadline(Duration::from_secs(2));
     let groups = client.list(host.node_id()).await.expect("list");
     assert!(groups.is_empty());
+}
+
+/// SEC-01 / AUTH-04 RED, over the real wire.
+///
+/// A peer that completed the handshake but is not a named operator
+/// must be refused. Before this gate, mesh admission *was* the
+/// operator boundary: anyone holding the PSK could list groups (with
+/// their `group_seed`), stop them, resize them, and spawn more from
+/// configured templates.
+///
+/// Scope, per Kyra's 2026-08-11 correction: these are fold-summary
+/// reducers, so the impact is control-plane availability and summary
+/// suppression — not workload takeover, and not forgery of the signed
+/// announcements the summaries are computed from.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_non_operator_peer_is_refused_by_the_registry_service() {
+    let host = build_node().await;
+    let outsider = build_node().await;
+    handshake(&host, &outsider).await;
+
+    let registry = Arc::new(AggregatorRegistry::new());
+    // Someone else entirely is the operator; the outsider handshook
+    // successfully but was never named.
+    let _serve = registry
+        .install_registry_service(&host, RegistryAdminPolicy::operators([0xDEAD_BEEFu64]))
+        .expect("install_registry_service");
+
+    let client = RegistryClient::new(outsider).with_deadline(Duration::from_secs(2));
+    match client.list(host.node_id()).await {
+        Err(net::adapter::net::behavior::aggregator::RegistryClientError::Server(
+            net::adapter::net::behavior::aggregator::RegistryRpcError::Unauthorized,
+        )) => {}
+        Ok(groups) => panic!(
+            "an unnamed peer listed the registry ({} groups) — mesh admission is \
+             not the operator boundary",
+            groups.len()
+        ),
+        Err(other) => panic!("expected Unauthorized, got {other:?}"),
+    }
+}
+
+/// The `Closed` default must refuse even a peer that handshook
+/// successfully — a daemon that names no operators has no way to tell
+/// one from anyone else holding the PSK.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_default_policy_refuses_every_remote_caller() {
+    let host = build_node().await;
+    let querier = build_node().await;
+    handshake(&host, &querier).await;
+
+    let registry = Arc::new(AggregatorRegistry::new());
+    let _serve = registry
+        .install_registry_service(&host, RegistryAdminPolicy::default())
+        .expect("install_registry_service");
+
+    let client = RegistryClient::new(querier).with_deadline(Duration::from_secs(2));
+    assert!(
+        client.list(host.node_id()).await.is_err(),
+        "the default policy served a caller it had no way to identify"
+    );
 }

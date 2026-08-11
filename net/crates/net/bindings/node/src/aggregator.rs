@@ -51,6 +51,10 @@ fn registry_err(e: RegistryClientError) -> Error {
             RegistryRpcError::ScaleNotSupported => {
                 agg_err("scale-not-supported", "daemon doesn't accept dynamic scale")
             }
+            RegistryRpcError::Unauthorized => agg_err(
+                "unauthorized",
+                "caller is not an operator of the target daemon's registry",
+            ),
         },
     }
 }
