@@ -1,6 +1,6 @@
 import "server-only";
 import { readFileSync, readdirSync, statSync, existsSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import title from "title";
 import GithubSlugger from "github-slugger";
 import { DOCS_ORDER } from "@/docs.order";
@@ -519,8 +519,17 @@ export function boundaryPath(folder: DocFolder, page: AdaptivePage): string {
 
 const SHARED_BODY = "_shared.md";
 
+// `node:path`'s basename, not a hand-rolled `lastIndexOf("/")`. The paths this
+// is asked about come from `join()`, which emits the platform separator — so on
+// Windows every filePath is `…\start\install\_shared.md`, the slash search
+// returns -1, and this handed back the ENTIRE absolute path. Nothing matched
+// `_shared.md` or `<lens>.md`, so the adaptive shape was never detected: every
+// adaptive page silently decomposed into five ordinary sibling pages. The build
+// died in `assertNoCrossLanguageNeighbours` — a Rust reader's order contained
+// `start/install/go` — and `next dev` rendered the five-manuals nav the adaptive
+// mechanism exists to prevent. Linux CI never saw either.
 function baseName(filePath: string): string {
-  return filePath.slice(filePath.lastIndexOf("/") + 1);
+  return basename(filePath);
 }
 
 function sharedFm(shared: DocFile | undefined): DocFrontmatter | undefined {
@@ -1050,6 +1059,60 @@ export function getDocsVersion(): string {
  * exactly the defect this replaced — a Python reader finishing `sdk/python/errors`
  * was handed `sdk/go/quickstart`.
  */
+/** Build-time proof that every adaptive page on disk is detected as one.
+ *
+ * The adaptive shape is detected structurally — a `_shared.md` beside one file
+ * per lens — and the detection compares FILENAMES. When that comparison broke
+ * on Windows (`baseName` searched for `/` against paths `join()` had built with
+ * `\`), nothing announced it: `shared` was simply never found, and every
+ * adaptive page quietly decomposed into five ordinary sibling pages. The site
+ * kept building on Linux and served the five-manuals nav on Windows.
+ *
+ * The failure mode to guard is therefore silence, not a wrong answer, and the
+ * only witness that catches silence is one that counts. This walks the content
+ * tree on disk, and requires a directory holding a `_shared.md` to have become
+ * a folder marked `adaptive`. It is deliberately filesystem-first: asking the
+ * built tree what it found would agree with the tree's own mistake.
+ */
+export function assertEveryAdaptivePageDetected(): void {
+  const onDisk: string[] = [];
+  const walk = (absPath: string, slugChain: string[]): void => {
+    if (existsSync(join(absPath, SHARED_BODY))) onDisk.push(slugChain.join("/"));
+    for (const entry of readdirSync(absPath)) {
+      const entryPath = join(absPath, entry);
+      if (statSync(entryPath).isDirectory()) {
+        walk(entryPath, [...slugChain, normalizeSlug(entry)]);
+      }
+    }
+  };
+  walk(DOCS_ROOT, []);
+
+  const detected = new Set<string>();
+  const visit = (folder: DocFolder): void => {
+    if (folder.adaptive) detected.add(folder.slug.join("/"));
+    for (const child of folder.children) {
+      if (child.kind === "folder") visit(child);
+    }
+  };
+  for (const folder of getDocTree().folders) visit(folder);
+
+  const missed = onDisk.filter((slug) => !detected.has(slug));
+  if (missed.length > 0) {
+    throw new Error(
+      `${missed.length} director(ies) hold a \`${SHARED_BODY}\` but were not ` +
+        `detected as adaptive pages — each would decompose into one ordinary ` +
+        `page per lens:\n  ` +
+        missed.join("\n  "),
+    );
+  }
+  if (onDisk.length === 0) {
+    throw new Error(
+      `found no \`${SHARED_BODY}\` under ${DOCS_ROOT}; this check would pass ` +
+        `vacuously, so it is failing instead`,
+    );
+  }
+}
+
 export function assertNoCrossLanguageNeighbours(): void {
   const problems: string[] = [];
   for (const lang of LANGUAGES) {
