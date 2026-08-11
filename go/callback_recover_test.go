@@ -200,3 +200,72 @@ func TestEveryUserCallbackTrampolineContainsPanics(t *testing.T) {
 			len(trampolinesWithoutUserCode), exempt)
 	}
 }
+
+// TestMeshOsCallbackGuardRefusesAfterTeardown is the FFI-02 guard.
+//
+// The cgo.Handle behind a MeshOS daemon used to be deleted the moment
+// `net_meshos_handle_free` returned. Registry removal explicitly lets
+// in-flight host Arc clones continue, so a callback already admitted
+// on the Rust side could then call `cgo.Handle.Value()` on a deleted
+// handle — an invalid-handle panic at an uncontained cgo boundary.
+//
+// Callbacks now enter a guard, and the delete waits for them. This
+// drives the guard directly rather than racing a real daemon: the
+// deterministic two-barrier witness the audit asks for needs
+// test-only hooks on the Rust side, which do not exist yet (task
+// #31). What this pins is the protocol the fix depends on.
+func TestMeshOsCallbackGuardRefusesAfterTeardown(t *testing.T) {
+	deleted := 0
+	ctx := &meshosCallbackCtx{daemon: nil}
+	ctx.deleteGuard = newStreamHandleGuard(func() { deleted++ })
+
+	// A callback in flight must hold the delete off.
+	if !ctx.deleteGuard.enter() {
+		t.Fatal("a callback was refused before teardown began")
+	}
+	ctx.deleteGuard.requestFree()
+	if deleted != 0 {
+		t.Fatal("the cgo.Handle was deleted while a callback was in flight — " +
+			"this is the FFI-02 use-after-delete")
+	}
+
+	// A callback arriving after teardown began must be refused, not
+	// admitted into a window where the handle can vanish underneath it.
+	if ctx.deleteGuard.enter() {
+		t.Fatal("a callback was admitted after teardown began")
+	}
+
+	// The last one out performs the delete.
+	ctx.deleteGuard.leave()
+	if deleted != 1 {
+		t.Fatalf("delete ran %d times, want exactly 1 after the last callback left", deleted)
+	}
+
+	// Idempotent: a second teardown request must not double-delete.
+	ctx.deleteGuard.requestFree()
+	if deleted != 1 {
+		t.Fatalf("delete ran %d times after a repeated requestFree", deleted)
+	}
+}
+
+// The teardown steps must stay sequenced, not fused. Gating the native
+// free on callbacks would call back into Rust from inside a Rust->Go
+// callback; fusing the delete into the native free reintroduces
+// FFI-02. Pin the shape so neither happens by accident.
+func TestMeshOsFreeDoesNotDeleteTheHandleDirectly(t *testing.T) {
+	src, err := os.ReadFile("meshos.go")
+	if err != nil {
+		t.Fatalf("read meshos.go: %v", err)
+	}
+	body := string(src)
+	needle := "cgoHandle.Delete()"
+	// Exactly one: the callback guard's free closure. Any other call
+	// site is a delete that does not wait for in-flight callbacks.
+	if got := strings.Count(body, needle); got != 1 {
+		t.Fatalf(
+			"found %d %s call sites in meshos.go, want exactly 1 (the "+
+				"callback guard's free closure). A delete anywhere else does "+
+				"not wait for in-flight Rust->Go callbacks and reopens FFI-02.",
+			got, needle)
+	}
+}

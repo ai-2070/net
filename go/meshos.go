@@ -448,7 +448,9 @@ func (s *MeshOsDaemonSdk) RegisterDaemon(name string, seed []byte) (*MeshOsDaemo
 	if err := meshosStatusToError(status); err != nil {
 		return nil, err
 	}
-	h := newMeshOsDaemonHandle(raw, 0)
+	// No Go callbacks on this path (no vtable registered), so there is
+	// no cgo.Handle and nothing for the callback guard to protect.
+	h := newMeshOsDaemonHandle(raw, nil)
 	runtime.SetFinalizer(h, func(h *MeshOsDaemonHandle) { h.Free() })
 	return h, nil
 }
@@ -494,28 +496,39 @@ func (s *MeshOsDaemonSdk) Free() {
 // returns on an event or shutdown — nothing can wake it early — but it
 // no longer wedges Free.)
 type MeshOsDaemonHandle struct {
-	ptr          *C.NetMeshOsHandle
-	guard        *streamHandleGuard
-	daemonHandle cgo.Handle
-	freeOnce     sync.Once
-	controlOnce  sync.Once
-	controlChan  chan MeshOsDaemonControl
-	pumpStop     chan struct{}
-	pumpDone     chan struct{}
+	ptr         *C.NetMeshOsHandle
+	guard       *streamHandleGuard
+	freeOnce    sync.Once
+	controlOnce sync.Once
+	controlChan chan MeshOsDaemonControl
+	pumpStop    chan struct{}
+	pumpDone    chan struct{}
 }
 
 // newMeshOsDaemonHandle wires a registered native handle to a
 // streamHandleGuard whose free closure captures only the raw C pointer
-// and the cgo.Handle (never the owning struct), so the GC finalizer is
-// preserved. cgoHandle may be 0 (the no-Go-callbacks register path).
-func newMeshOsDaemonHandle(raw *C.NetMeshOsHandle, cgoHandle cgo.Handle) *MeshOsDaemonHandle {
+// and the callback context (never the owning struct), so the GC
+// finalizer is preserved. `callbackCtx` may be nil (the
+// no-Go-callbacks register path).
+//
+// FFI-02: the two teardown steps are sequenced, not fused. The native
+// free runs when no Go->Rust op is in flight, as before; the
+// cgo.Handle delete is then *requested* and runs when no Rust->Go
+// callback is in flight. Fusing them would delete the handle while an
+// admitted callback still held it — the original defect — and gating
+// the native free on callbacks instead would call back into Rust from
+// inside a Rust->Go callback, trading a race for a deadlock.
+func newMeshOsDaemonHandle(
+	raw *C.NetMeshOsHandle,
+	callbackCtx *meshosCallbackCtx,
+) *MeshOsDaemonHandle {
 	guard := newStreamHandleGuard(func() {
 		C.net_meshos_handle_free(raw)
-		if cgoHandle != 0 {
-			cgoHandle.Delete()
+		if callbackCtx != nil {
+			callbackCtx.deleteGuard.requestFree()
 		}
 	})
-	return &MeshOsDaemonHandle{ptr: raw, guard: guard, daemonHandle: cgoHandle}
+	return &MeshOsDaemonHandle{ptr: raw, guard: guard}
 }
 
 // withReadHandle runs fn against the native handle while registered as
@@ -718,7 +731,14 @@ func (s *MeshOsDaemonSdk) RegisterDaemonWithCallbacks(daemon MeshOsDaemon, seed 
 		return nil, fmt.Errorf("%w: daemon Name() returned empty string", ErrMeshOsInvalidArg)
 	}
 
-	cgoHandle := cgo.NewHandle(daemon)
+	// FFI-02: the cgo.Handle points at a context carrying the daemon
+	// plus the guard that keeps the handle alive across in-flight
+	// callbacks. See `meshosCallbackCtx`.
+	callbackCtx := &meshosCallbackCtx{daemon: daemon}
+	cgoHandle := cgo.NewHandle(callbackCtx)
+	callbackCtx.deleteGuard = newStreamHandleGuard(func() {
+		cgoHandle.Delete()
+	})
 	vt := C.topGoMeshOsBuildVtable()
 
 	var raw *C.NetMeshOsHandle
@@ -738,10 +758,13 @@ func (s *MeshOsDaemonSdk) RegisterDaemonWithCallbacks(daemon MeshOsDaemon, seed 
 		s.ptr, namePtr, nameLen, seedPtr, &vt, userCtx, &raw,
 	)
 	if err := meshosStatusToError(status); err != nil {
-		cgoHandle.Delete()
+		// Registration failed, so no callback can be in flight — but
+		// go through the guard anyway rather than deleting directly,
+		// so there is exactly one path that deletes this handle.
+		callbackCtx.deleteGuard.requestFree()
 		return nil, err
 	}
-	h := newMeshOsDaemonHandle(raw, cgoHandle)
+	h := newMeshOsDaemonHandle(raw, callbackCtx)
 	runtime.SetFinalizer(h, func(h *MeshOsDaemonHandle) { h.Free() })
 	return h, nil
 }
@@ -755,13 +778,62 @@ func (s *MeshOsDaemonSdk) RegisterDaemonWithCallbacks(daemon MeshOsDaemon, seed 
 // into the same process.
 // ---------------------------------------------------------------------------
 
-func meshosHandleFromCtx(userCtx unsafe.Pointer) MeshOsDaemon {
-	h := cgo.Handle(uintptr(userCtx))
-	v := h.Value()
-	if d, ok := v.(MeshOsDaemon); ok {
-		return d
+// meshosCallbackCtx is what the cgo.Handle actually points at.
+//
+// FFI-02. The handle used to wrap the user's `MeshOsDaemon` directly,
+// and the Go free closure deleted it as soon as
+// `net_meshos_handle_free` returned. But registry removal explicitly
+// lets in-flight host `Arc` clones continue — `DaemonRegistry::deliver`
+// clones the Arc and locks it *before* `guard_identity` admits the
+// callback — so a callback already admitted on the Rust side could
+// reach `cgo.Handle.Value()` after the delete. Go treats that as an
+// invalid-handle panic, at an uncontained cgo boundary.
+//
+// The existing `streamHandleGuard` could not help: it counts Go->Rust
+// handle operations, and a Rust->Go callback never entered it.
+//
+// So callbacks now enter a guard of their own, and the cgo.Handle is
+// deleted by whoever leaves last. A callback that arrives after
+// teardown begins is refused rather than admitted, and one that is
+// already inside keeps the handle alive until it returns.
+type meshosCallbackCtx struct {
+	daemon MeshOsDaemon
+	// Guards the cgo.Handle delete against in-flight callbacks. Its
+	// free closure performs the delete and nothing else — deliberately
+	// no cgo call, because it can run on a thread that is currently
+	// inside a Rust->Go callback and re-entering Rust from there is
+	// how a teardown fix becomes a deadlock.
+	deleteGuard *streamHandleGuard
+}
+
+// meshosCallbackEnter resolves the callback context and registers an
+// in-flight callback against it.
+//
+// Returns `(daemon, leave, true)` when the callback may proceed; the
+// caller MUST call `leave` exactly once. Returns `(nil, nil, false)`
+// when teardown has begun, in which case the trampoline returns its
+// documented default without touching the daemon.
+func meshosCallbackEnter(userCtx unsafe.Pointer) (MeshOsDaemon, func(), bool) {
+	if userCtx == nil {
+		return nil, nil, false
 	}
-	return nil
+	h := cgo.Handle(uintptr(userCtx))
+	// `Value()` on a deleted handle panics. That is the residual
+	// window documented on `meshosCallbackCtx`: the FFI-01 guard on
+	// every trampoline contains it, so it costs the callback rather
+	// than the process.
+	v := h.Value()
+	ctx, ok := v.(*meshosCallbackCtx)
+	if !ok {
+		return nil, nil, false
+	}
+	if !ctx.deleteGuard.enter() {
+		// Teardown has started. Refusing here is what makes the
+		// delete safe: no new callback can be between `Value()` and
+		// its work when the handle goes away.
+		return nil, nil, false
+	}
+	return ctx.daemon, ctx.deleteGuard.leave, true
 }
 
 //export topGoMeshOsProcessTrampoline
@@ -781,10 +853,11 @@ func topGoMeshOsProcessTrampoline(
 			code = C.int(1)
 		}
 	}()
-	d := meshosHandleFromCtx(userCtx)
-	if d == nil {
+	d, leave, ok := meshosCallbackEnter(userCtx)
+	if !ok {
 		return C.int(1)
 	}
+	defer leave()
 	// `goBytesChecked` rejects an oversized inbound payload length
 	// rather than truncating it via the 32-bit C.int cast.
 	payload, okLen := goBytesChecked(payloadPtr, payloadLen)
@@ -824,10 +897,11 @@ func topGoMeshOsSnapshotTrampoline(
 	defer func() {
 		recoverCallback("meshos.Snapshot", recover())
 	}()
-	d := meshosHandleFromCtx(userCtx)
-	if d == nil {
+	d, leave, ok := meshosCallbackEnter(userCtx)
+	if !ok {
 		return
 	}
+	defer leave()
 	payload, present := d.Snapshot()
 	if !present {
 		return
@@ -854,10 +928,11 @@ func topGoMeshOsRestoreTrampoline(
 			code = C.int(1)
 		}
 	}()
-	d := meshosHandleFromCtx(userCtx)
-	if d == nil {
+	d, leave, ok := meshosCallbackEnter(userCtx)
+	if !ok {
 		return C.int(1)
 	}
+	defer leave()
 	state, okLen := goBytesChecked(payloadPtr, payloadLen)
 	if !okLen {
 		return C.int(1)
@@ -880,10 +955,11 @@ func topGoMeshOsOnControlTrampoline(
 	defer func() {
 		recoverCallback("meshos.OnControl", recover())
 	}()
-	d := meshosHandleFromCtx(userCtx)
-	if d == nil {
+	d, leave, ok := meshosCallbackEnter(userCtx)
+	if !ok {
 		return
 	}
+	defer leave()
 	d.OnControl(MeshOsDaemonControl{
 		Kind:          DaemonControlKind(kind),
 		GracePeriodMs: uint64(gracePeriodMs),
@@ -902,10 +978,13 @@ func topGoMeshOsHealthTrampoline(userCtx unsafe.Pointer) (health C.int) {
 			health = C.int(C.NET_MESHOS_HEALTH_UNHEALTHY)
 		}
 	}()
-	d := meshosHandleFromCtx(userCtx)
-	if d == nil {
+	d, leave, ok := meshosCallbackEnter(userCtx)
+	if !ok {
+		// Torn down, not sick: a daemon that is going away should not
+		// be reported UNHEALTHY and trigger replacement machinery.
 		return C.int(C.NET_MESHOS_HEALTH_HEALTHY)
 	}
+	defer leave()
 	return C.int(d.Health())
 }
 
@@ -919,10 +998,11 @@ func topGoMeshOsSaturationTrampoline(userCtx unsafe.Pointer) (saturation C.float
 			saturation = C.float(0)
 		}
 	}()
-	d := meshosHandleFromCtx(userCtx)
-	if d == nil {
+	d, leave, ok := meshosCallbackEnter(userCtx)
+	if !ok {
 		return C.float(0)
 	}
+	defer leave()
 	v := d.Saturation()
 	if v < 0 {
 		v = 0
