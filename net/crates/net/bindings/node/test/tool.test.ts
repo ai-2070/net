@@ -831,6 +831,38 @@ describe('tool registry lifetime', () => {
     expect(rpc.closes(TOOL_METADATA_FETCH_SERVICE)).toBe(2)
   })
 
+  it('re-registering one tool id does not let the older handle close the service', () => {
+    const rpc = fakeToolRpc()
+    const first = serveTool(rpc.rpc, { name: 'echo' }, echo)
+    const second = serveTool(rpc.rpc, { name: 'echo' }, echo)
+
+    // `second` owns the `echo` slot now. If `first.close()` evicted it by
+    // key, the registry would read empty and take the shared metadata
+    // service down while `second` is still being served.
+    first.close()
+    expect(rpc.closes(TOOL_METADATA_FETCH_SERVICE)).toBe(0)
+    expect(rpc.askMetadata('echo').type).toBe('found')
+
+    second.close()
+    expect(rpc.closes(TOOL_METADATA_FETCH_SERVICE)).toBe(1)
+  })
+
+  it('a failed re-registration restores the descriptor it displaced', () => {
+    const rpc = fakeToolRpc()
+    const live = serveTool(rpc.rpc, { name: 'echo' }, echo)
+    rpc.failServeOf('echo')
+
+    expect(() => serveTool(rpc.rpc, { name: 'echo' }, echo)).toThrow()
+
+    // The live tool's descriptor must survive an attempt that never
+    // registered anything.
+    expect(rpc.askMetadata('echo').type).toBe('found')
+    expect(rpc.closes(TOOL_METADATA_FETCH_SERVICE)).toBe(0)
+
+    live.close()
+    expect(rpc.closes(TOOL_METADATA_FETCH_SERVICE)).toBe(1)
+  })
+
   it('a metadata install that failed is retried by the next serveTool', () => {
     const rpc = fakeToolRpc()
     // Models the recoverable case the install already swallows: someone

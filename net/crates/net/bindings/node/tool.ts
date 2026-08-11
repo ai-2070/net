@@ -244,11 +244,25 @@ export interface ToolServeHandle {
 }
 
 // Per-rpc descriptor registries — keyed by `TypedMeshRpc` so each
-// rpc has its own tool_id → descriptor map. The `tool.metadata.fetch`
-// handler is lazy-installed on the first serveTool() against a
-// given rpc (one handle per rpc, dropped only when the process
-// exits — same lifetime contract the Rust SDK's
-// `ensure_tool_metadata_fetch_installed` follows).
+// rpc has its own tool_id → descriptor map.
+//
+// The lifetime contract, in full:
+//
+//   - ONE `tool.metadata.fetch` service per rpc, lazy-installed on the
+//     first `serveTool` / `serveToolStreaming` against it and shared by
+//     every tool on that rpc thereafter;
+//   - it lives exactly as long as the registry is non-empty. Closing the
+//     LAST tool closes the metadata service and deletes this WeakMap
+//     entry; closing any earlier one does not;
+//   - a later registration installs a NEW metadata service, because a
+//     closed `ServeHandle` serves nothing;
+//   - unary and streaming tools share that one count and one lifetime.
+//
+// The bound is not tidiness. Each nRPC registration holds a mesh
+// reference, so a metadata service that outlives its last tool makes
+// `MeshNode.shutdown()` fail with `cannot shutdown: outstanding
+// references exist` for a consumer who closed every handle they were
+// handed — with nothing left in their hands to close.
 interface ToolRegistryEntry {
   registry: Map<string, ToolDescriptor>
   fetchHandle: ServeHandle | null
@@ -257,17 +271,20 @@ const _toolRegistries: WeakMap<TypedMeshRpc, ToolRegistryEntry> = new WeakMap()
 
 function _ensureFetchInstalled(rpc: TypedMeshRpc): ToolRegistryEntry {
   let entry = _toolRegistries.get(rpc)
-  if (entry) return entry
-  entry = { registry: new Map(), fetchHandle: null }
-  _toolRegistries.set(rpc, entry)
+  if (!entry) {
+    entry = { registry: new Map(), fetchHandle: null }
+    _toolRegistries.set(rpc, entry)
+  }
+  if (entry.fetchHandle) return entry
   // Register the fetch handler. The handler queries `entry.registry`
   // for the name; falls back to NotFound. Mirrors the Rust SDK's
   // `tool.metadata.fetch` handler shape.
+  const installed = entry
   try {
     entry.fetchHandle = rpc.serve<{ name: string }, ToolMetadataResponse>(
       TOOL_METADATA_FETCH_SERVICE,
       (req) => {
-        const d = entry!.registry.get(req.name)
+        const d = installed.registry.get(req.name)
         return d
           ? { type: 'found', descriptor: d }
           : { type: 'not_found', name: req.name }
@@ -275,12 +292,91 @@ function _ensureFetchInstalled(rpc: TypedMeshRpc): ToolRegistryEntry {
     )
   } catch {
     // If install fails (e.g. another caller already registered the
-    // service manually), leave fetchHandle null. Subsequent serveTool
-    // calls retry. Silent because the failure is recoverable +
-    // observable via `fetchToolMetadata` returning NoRoute / NotFound
-    // on the agent side.
+    // service manually), leave fetchHandle null and keep the registry:
+    // the tools themselves still register, and the retry on the next
+    // `serveTool` above picks the service up against the SAME registry
+    // once the conflict clears. Silent because the failure is
+    // recoverable + observable via `fetchToolMetadata` returning
+    // NoRoute / NotFound on the agent side.
   }
   return entry
+}
+
+/**
+ * Release the shared metadata service once the last tool on `rpc` is
+ * gone. No-op while any tool is still registered.
+ *
+ * Deleting the WeakMap entry is load-bearing, not housekeeping: the
+ * entry's `fetchHandle` is now closed, and a closed `ServeHandle` serves
+ * nothing. Keeping the entry would let a later `serveTool` "reuse" a
+ * dead registration and quietly serve a tool no peer could ever fetch
+ * metadata for.
+ */
+function _closeRegistryIfEmpty(
+  rpc: TypedMeshRpc,
+  entry: ToolRegistryEntry,
+): void {
+  if (entry.registry.size !== 0) return
+  entry.fetchHandle?.close()
+  entry.fetchHandle = null
+  // Only unmap the entry this cleanup actually owns. A later round may
+  // already have installed a fresh one; deleting THAT would strand its
+  // metadata service with no path back to it.
+  if (_toolRegistries.get(rpc) === entry) _toolRegistries.delete(rpc)
+}
+
+/**
+ * Insert `descriptor` and register `serve` under it as one unit.
+ *
+ * `serve` is whichever registration the caller wants (`rpc.serve` for
+ * unary, `rpc.serveStreaming` for streaming) — the ownership rules are
+ * identical for both, so they get one code path rather than two policies
+ * that drift.
+ *
+ * If `serve` throws, the descriptor insert is reversed (restoring any
+ * descriptor it displaced) and a metadata service installed only for
+ * this attempt is closed with it, so a failed registration leaves the
+ * rpc exactly as it found it. The error is rethrown, never swallowed.
+ */
+function _registerTool(
+  rpc: TypedMeshRpc,
+  descriptor: ToolDescriptor,
+  serve: () => ServeHandle,
+): ToolServeHandle {
+  const entry = _ensureFetchInstalled(rpc)
+  const displaced = entry.registry.get(descriptor.toolId)
+  entry.registry.set(descriptor.toolId, descriptor)
+
+  let inner: ServeHandle
+  try {
+    inner = serve()
+  } catch (err) {
+    if (displaced !== undefined) {
+      entry.registry.set(descriptor.toolId, displaced)
+    } else {
+      entry.registry.delete(descriptor.toolId)
+    }
+    _closeRegistryIfEmpty(rpc, entry)
+    throw err
+  }
+
+  let closed = false
+  return {
+    descriptor,
+    close() {
+      if (closed) return
+      closed = true
+      // Identity, not just the key: if a later `serveTool` reused this
+      // tool id, that registration owns the slot now and this close must
+      // not evict it — doing so would drop the registry to empty and
+      // close the metadata service out from under a live tool.
+      if (entry.registry.get(descriptor.toolId) === descriptor) {
+        entry.registry.delete(descriptor.toolId)
+      }
+      inner.close()
+      _closeRegistryIfEmpty(rpc, entry)
+    },
+  }
 }
 
 /**
@@ -305,9 +401,11 @@ function _ensureFetchInstalled(rpc: TypedMeshRpc): ToolRegistryEntry {
  * `CapabilitySetJs` you pass to `mesh.announceCapabilities(...)`.
  *
  * On `handle.close()`: removes the descriptor from the per-rpc
- * registry and unregisters the handler. The lazy `tool.metadata.fetch`
- * service stays installed for the lifetime of the rpc — harmless
- * when empty (returns NotFound for every request).
+ * registry and unregisters the handler. Closing the LAST tool on this
+ * rpc also closes the shared `tool.metadata.fetch` service, releasing
+ * the mesh reference its registration holds — which is what lets
+ * `MeshNode.shutdown()` succeed after `rpc.raw.close()`. A registration
+ * that throws is rolled back the same way.
  */
 export function serveTool<Req = unknown, Resp = unknown>(
   rpc: TypedMeshRpc,
@@ -315,19 +413,9 @@ export function serveTool<Req = unknown, Resp = unknown>(
   handler: ToolHandler<Req, Resp>,
 ): ToolServeHandle {
   const descriptor = descriptorFrom(options)
-  const entry = _ensureFetchInstalled(rpc)
-  entry.registry.set(descriptor.toolId, descriptor)
-  const inner: ServeHandle = rpc.serve<Req, Resp>(descriptor.toolId, handler)
-  let closed = false
-  return {
-    descriptor,
-    close() {
-      if (closed) return
-      closed = true
-      entry.registry.delete(descriptor.toolId)
-      inner.close()
-    },
-  }
+  return _registerTool(rpc, descriptor, () =>
+    rpc.serve<Req, Resp>(descriptor.toolId, handler),
+  )
 }
 
 /**
@@ -355,9 +443,11 @@ export type StreamingToolHandler<Req = unknown> = (
  * streaming service).
  *
  * Atomic register + lazy auto-install of `tool.metadata.fetch` —
- * same pattern as `serveTool` for unary handlers. Stamps
- * `streaming: true` on the descriptor so peers can discover the
- * streaming variant explicitly.
+ * same pattern as `serveTool` for unary handlers, and the same
+ * registry: streaming and unary tools share one metadata service and
+ * one lifetime, so the LAST of them to close is what releases it,
+ * whichever shape it is. Stamps `streaming: true` on the descriptor so
+ * peers can discover the streaming variant explicitly.
  */
 export function serveToolStreaming<Req = unknown>(
   rpc: TypedMeshRpc,
@@ -366,49 +456,39 @@ export function serveToolStreaming<Req = unknown>(
 ): ToolServeHandle {
   const baseDescriptor = descriptorFrom(options)
   const descriptor: ToolDescriptor = { ...baseDescriptor, streaming: true }
-  const entry = _ensureFetchInstalled(rpc)
-  entry.registry.set(descriptor.toolId, descriptor)
-  const inner: ServeHandle = rpc.serveStreaming<Req, ToolEvent>(
-    descriptor.toolId,
-    async (req, sink) => {
-      let sawTerminal = false
-      try {
-        for await (const event of handler(req)) {
-          sink.send(event)
-          if (isTerminalEvent(event)) sawTerminal = true
-        }
-        if (!sawTerminal) {
-          sink.send({
+  return _registerTool(rpc, descriptor, () =>
+    rpc.serveStreaming<Req, ToolEvent>(
+      descriptor.toolId,
+      async (req, sink) => {
+        let sawTerminal = false
+        try {
+          for await (const event of handler(req)) {
+            sink.send(event)
+            if (isTerminalEvent(event)) sawTerminal = true
+          }
+          if (!sawTerminal) {
+            sink.send({
+              type: 'error',
+              code: 'missing_terminal',
+              message:
+                'tool stream ended without a terminal result or error envelope',
+            })
+          }
+        } catch (err) {
+          // Convert handler exceptions into a terminal error envelope
+          // so the caller sees a typed error rather than relying on
+          // the client-side missing_terminal fallback.
+          const message = err instanceof Error ? err.message : String(err)
+          const errEvent: ToolEventError = {
             type: 'error',
-            code: 'missing_terminal',
-            message:
-              'tool stream ended without a terminal result or error envelope',
-          })
+            code: 'handler_error',
+            message,
+          }
+          sink.send(errEvent)
         }
-      } catch (err) {
-        // Convert handler exceptions into a terminal error envelope
-        // so the caller sees a typed error rather than relying on
-        // the client-side missing_terminal fallback.
-        const message = err instanceof Error ? err.message : String(err)
-        const errEvent: ToolEventError = {
-          type: 'error',
-          code: 'handler_error',
-          message,
-        }
-        sink.send(errEvent)
-      }
-    },
+      },
+    ),
   )
-  let closed = false
-  return {
-    descriptor,
-    close() {
-      if (closed) return
-      closed = true
-      entry.registry.delete(descriptor.toolId)
-      inner.close()
-    },
-  }
 }
 
 /**
