@@ -822,6 +822,17 @@ func meshosCallbackEnter(userCtx unsafe.Pointer) (MeshOsDaemon, func(), bool) {
 	// window documented on `meshosCallbackCtx`: the FFI-01 guard on
 	// every trampoline contains it, so it costs the callback rather
 	// than the process.
+	//
+	// Deliberately left open (reviewed 2026-08-11). Closing it means a
+	// Rust-driven destructor on `NetMeshOsDaemonVtable` so the delete
+	// runs from actual `CDaemonBridge` drop — a cross-language ABI
+	// change touching meshos-ffi, both headers, the Go copies and the
+	// header-parity tests. The residual costs one teardown-racing
+	// callback, happens only after logical unregister, restores no
+	// access, corrupts nothing, and is bounded by the lingering
+	// registry `Arc`'s lifetime. Not worth expanding the ABI for on
+	// its own; fold it into the next vtable revision, together with
+	// the two test barriers the deterministic witness needs.
 	v := h.Value()
 	ctx, ok := v.(*meshosCallbackCtx)
 	if !ok {
