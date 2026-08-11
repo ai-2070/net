@@ -58,7 +58,16 @@ jobs:
       run:
         working-directory: web
     steps:
+      # `fetch-depth: 0` for `check-install-version.py` below. It answers
+      # "what is the current release?" with the newest stable unified
+      # `vX.Y.Z` tag REACHABLE FROM HEAD, and the default shallow checkout
+      # brings neither the tags nor the history that decides reachability.
+      # The checker fails closed on a shallow clone rather than guessing, so
+      # dropping this turns the job red with a prerequisite error — noisy,
+      # but never a wrong "current release".
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-node@v7
         with:
@@ -149,7 +158,12 @@ jobs:
       # The install pages hard-code "the current published release is X" and
       # use it as a cross-layer pin instruction. It said 0.33 while every
       # registry served 0.34 — a fact with an expiry date that nothing was
-      # watching. This derives the answer from the release notes in the tree.
+      # watching. This derives the answer from the newest stable unified
+      # `vX.Y.Z` tag reachable from HEAD (hence `fetch-depth: 0` above).
+      #
+      # Release-note FILES were the previous answer and were not one: v0.35.0
+      # shipped without a `RELEASE_v0.35*.md`, so the old check went on
+      # certifying pages that named 0.34. A tag is created BY publishing.
       - name: Check the install pages name the current release
         working-directory: .
         run: .github/scripts/check-install-version.py
