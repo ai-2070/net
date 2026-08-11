@@ -314,7 +314,14 @@ pub enum RegistryRpcError {
 /// The decision is made on
 /// [`RpcContext::session_peer`](crate::adapter::net::cortex::RpcContext::session_peer),
 /// the AEAD-authenticated caller; `caller_origin` is routing metadata
-/// the sender chooses and must not be authorized on.
+/// the sender chooses and must not be authorized on.///
+/// What that authenticates is the **deliverer**, not an end-to-end
+/// origin: it is the peer whose session the frame decrypted under. A
+/// deployment that relays nRPC through an intermediary makes the relay
+/// the authenticated peer, so an allowlist authorizes the relay and
+/// everything it chooses to forward. See
+/// [`RpcContext::session_peer`](crate::adapter::net::cortex::RpcContext::session_peer)
+/// for the full statement.
 #[derive(Debug, Clone, Default)]
 pub enum RegistryAdminPolicy {
     /// Refuse every remote request. The default: a daemon that has not

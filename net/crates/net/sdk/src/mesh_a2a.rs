@@ -18,6 +18,15 @@
 //! AEAD-authenticated peer that submitted it, and status and cancel
 //! only ever see that peer's own tasks.
 //!
+//! "The peer that submitted it" means the peer whose session delivered
+//! the frame — the **deliverer**, not an end-to-end origin. Under a
+//! deployment that relays nRPC through an intermediary, the relay is
+//! the owner and everything it forwards shares that ownership. That is
+//! the documented limit of public nRPC attribution rather than a gap in
+//! this binding; end-to-end provenance needs a PROTECTED service or an
+//! application-level signature. See
+//! [`RpcContext::session_peer`](net::adapter::net::cortex::RpcContext::session_peer).
+//!
 //! A task id is a name, not a bearer capability. It is client-generated,
 //! it travels through logs, dashboards and polling loops as an ordinary
 //! identifier, and [`TaskRecord`] carries the complete prompt and

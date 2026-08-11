@@ -221,6 +221,33 @@ on an older build still interoperates.
 
 ---
 
+## What "authenticated peer" means everywhere above
+
+Items 1–3 and 8 authorize on the **AEAD-authenticated session peer** —
+the node whose session the frame decrypted under. A sender cannot
+choose what that says, which is what makes it usable where
+`caller_origin` is not (that field is routing metadata the sender
+picks, and this tree's own docs say not to authorize on it).
+
+Its limit, which applies to every gate in this document:
+
+> It authenticates the **deliverer**, not an end-to-end origin.
+
+If a deployment terminates and reissues nRPC through a relay, the relay
+becomes the authenticated peer. An operator allowlist then authorizes
+the relay and everything the relay chooses to forward; an A2A task
+submitted through one is owned by the relay, not by the agent behind
+it. That is the documented limit of public nRPC attribution rather than
+a gap in any of these repairs — end-to-end provenance needs a PROTECTED
+service (`RpcContext::org_admission`, a verified four-party identity)
+or an application-level signature over a transcript that binds the
+destination.
+
+Direct authenticated sessions — the ordinary case, and the one the
+acceptance tests exercise — carry the boundary you would expect.
+
+---
+
 ## The operator identity workflow
 
 Items 1–3 name **mesh node ids**. A node id is derived from an

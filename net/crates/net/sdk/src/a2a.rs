@@ -282,6 +282,10 @@ pub enum TaskOwner {
     /// Submitted by an authenticated mesh peer, identified by the
     /// AEAD-authenticated session peer that delivered the request —
     /// never by anything the request body claimed.
+    ///
+    /// The deliverer, not an end-to-end origin: under nRPC relaying
+    /// the relay owns everything it forwards. See the module docs on
+    /// [`crate::mesh_a2a`].
     Peer(u64),
 }
 

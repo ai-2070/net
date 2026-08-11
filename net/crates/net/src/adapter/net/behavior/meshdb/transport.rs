@@ -513,6 +513,12 @@ impl Stream for ResponseStreamGuard {
 ///
 /// `peer` is the AEAD-authenticated `from_node` the frame decrypted
 /// under, not anything the request body claims.
+///
+/// That authenticates the **deliverer**, not an end-to-end origin. A
+/// deployment that relays MeshDB frames through an intermediary makes
+/// the relay the authenticated peer, so an authorizer keyed on it
+/// grants the relay's access to everything the relay forwards. See
+/// [`RpcContext::session_peer`](crate::adapter::net::cortex::RpcContext::session_peer).
 pub trait ChainAuthorizer: Send + Sync {
     /// `true` if `peer` may read `chain_origin`.
     ///
