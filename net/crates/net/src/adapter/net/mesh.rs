@@ -18036,10 +18036,13 @@ impl MeshNode {
                 };
                 {
                     let fwd_bytes = fwd_pw.to_bytes();
-                    let socket = ctx.socket.clone();
-                    let peers = ctx.peers.clone();
-                    let filter = ctx.partition_filter.clone();
-                    let router = ctx.router.clone();
+                    // Borrowed, not cloned: the re-broadcast below runs
+                    // inline rather than in a spawned task, so nothing
+                    // needs to outlive this scope.
+                    let socket = &ctx.socket;
+                    let peers = &ctx.peers;
+                    let filter = &ctx.partition_filter;
+                    let router = &ctx.router;
                     // DV loop-avoidance rule 3: split horizon on
                     // re-broadcast. If we installed `(origin_nid,
                     // next_hop=X)` — i.e. we'd use X to reach the
@@ -18047,25 +18050,44 @@ impl MeshNode {
                     // link to X. Prevents X from learning "we can
                     // reach origin in N+1 hops" and installing a
                     // backward loop.
-                    tokio::spawn(async move {
-                        let next_hop = router.routing_table().lookup(origin_nid);
-                        // Snapshot FIRST: the iteration completes before the
-                        // first await, so no peer shard is held across a send
-                        // (HOLD-2 item 2).
-                        for peer in snapshot_peers(&peers, None) {
-                            let addr = peer.addr;
-                            if addr == source {
-                                continue; // never send back to sender
-                            }
-                            if Some(addr) == next_hop {
-                                continue; // split horizon: that's our path to origin
-                            }
-                            if filter.contains(&addr) {
-                                continue;
-                            }
-                            let _ = send_datagram(&socket, &fwd_bytes, addr).await;
+                    // SEC-02 / SEC-07. Re-broadcast synchronously with
+                    // load-shedding sends instead of spawning a task
+                    // per accepted pingwave.
+                    //
+                    // The spawn held `fwd_bytes` and a peer snapshot
+                    // alive for as long as every send took, and a
+                    // pingwave is admitted on nothing more than a
+                    // registered source address. Congested egress
+                    // therefore turned unauthenticated packet arrival
+                    // into accumulating tasks and retained buffers —
+                    // the same shape as the legacy relay path above,
+                    // and the reason the protected route-hop path
+                    // already sheds.
+                    //
+                    // Nothing here needs to await: the snapshot was
+                    // always taken before the first await (HOLD-2 item
+                    // 2), so no peer shard is held across a send, and
+                    // `try_send_to` never blocks. Dropping the spawn
+                    // also drops the four clones it required.
+                    let next_hop = router.routing_table().lookup(origin_nid);
+                    for peer in snapshot_peers(peers, None) {
+                        let addr = peer.addr;
+                        if addr == source {
+                            continue; // never send back to sender
                         }
-                    });
+                        if Some(addr) == next_hop {
+                            continue; // split horizon: that's our path to origin
+                        }
+                        if filter.contains(&addr) {
+                            continue;
+                        }
+                        // A full egress socket means that peer is
+                        // already behind; a pingwave is a periodic
+                        // liveness beacon, so the next one carries the
+                        // same information. Dropping one is strictly
+                        // better than queuing it.
+                        let _ = socket.try_send_to(&fwd_bytes, addr);
+                    }
                 }
                 return;
             }
@@ -18229,10 +18251,31 @@ impl MeshNode {
                             new_data.freeze()
                         }
                     };
-                    let socket = ctx.socket.clone();
-                    tokio::spawn(async move {
-                        let _ = socket.send_to(&forwarded, next_hop).await;
-                    });
+                    // SEC-07. This used to spawn a task per datagram
+                    // around `send_to(..).await`. Legacy relay ingress
+                    // is unauthenticated — the packet is forwarded
+                    // without decrypting the inner payload, on nothing
+                    // but a routing-table hit — so anyone who can reach
+                    // a legacy relay and name a routed destination
+                    // could turn packet arrival into spawned tasks,
+                    // each holding its datagram alive until the egress
+                    // socket drained. Under congestion that is
+                    // unbounded heap and scheduler pressure, driven by
+                    // a source that never authenticated.
+                    //
+                    // Shed instead, the same way the protected route-hop
+                    // path already does: a full egress socket means the
+                    // far side is behind, and queuing is precisely the
+                    // wrong response at the moment this node should be
+                    // dropping. Verbatim `send_to` semantics are not
+                    // lost — UDP was always allowed to drop this.
+                    if let Err(e) = ctx.socket.try_send_to(&forwarded, next_hop) {
+                        tracing::debug!(
+                            dest = format!("{:#x}", routing_header.dest_id),
+                            reason = %e,
+                            "legacy relay: dropping forward, egress socket not ready",
+                        );
+                    }
                 }
             }
             return;
@@ -42420,6 +42463,46 @@ mod protected_forward_allocation_pins {
         assert!(
             body.contains(&format!("try_send_to{}", "(")),
             "the relay egress must be the non-blocking send",
+        );
+    }
+
+    /// SEC-07 / SEC-02. The same load-shedding rule the protected relay
+    /// is pinned to above, extended to the two forwarding paths that
+    /// act on *unauthenticated* ingress.
+    ///
+    /// Legacy routed relay forwards without decrypting the inner
+    /// payload, on nothing but a routing-table hit; pingwave
+    /// re-broadcast is admitted on nothing but a registered source
+    /// address. Both used to spawn a task per datagram around an
+    /// awaited `send_to`, so congested egress converted packet arrival
+    /// from an unauthenticated source into accumulating tasks and
+    /// retained buffers. If either regresses, that is a
+    /// denial-of-service surface reachable by anyone who can reach the
+    /// node — a stronger case for the pin than the protected path,
+    /// where the peer at least authenticated.
+    #[test]
+    fn unauthenticated_forwarding_paths_shed_instead_of_spawning() {
+        let src = source_without_comments();
+        let body = method_body(&src, "dispatch_packet");
+
+        let spawn = format!("tokio::{}", "spawn");
+        let awaited_send = format!("send_datagram{}", "(");
+        assert!(
+            !body.contains(&spawn),
+            "dispatch_packet must not spawn a task per forwarded datagram: \
+             legacy relay and pingwave re-broadcast both act on unauthenticated \
+             ingress, so a spawn-per-packet turns downstream congestion into \
+             unbounded heap and scheduler pressure driven by a source that never \
+             authenticated. Use socket.try_send_to and drop when it is not ready.",
+        );
+        assert!(
+            !body.contains(&awaited_send),
+            "dispatch_packet must not await send_datagram on a forwarding path — \
+             it carries a send deadline, which is a bounded wait, not a drop",
+        );
+        assert!(
+            body.contains(&format!("try_send_to{}", "(")),
+            "the forwarding egress must be the non-blocking send",
         );
     }
 
