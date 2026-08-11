@@ -250,45 +250,54 @@ Authenticated caller A sends an overflow request claiming sender B, where only B
 
 Remove self-declared sender identity from the security decision. Bind admission to `ctx.caller_origin` and an authenticated session. Resolve or verify authoritative object size before reserving disk headroom; bind that size to the accepted replication state.
 
-## AUTH-04 — Aggregator registry administration remains ungated
+## AUTH-04 — Aggregator registry uses mesh admission as its only operator boundary
 
-**Severity:** High/Critical impact  
-**Status:** Reconfirmed SEC-01 from the cross-subsystem report
+**Severity:** Medium, deployment-dependent
+**Status:** Corrected and narrowed from SEC-01 in the cross-subsystem report
 
-The daemon installs full Spawn/Scale capability by default:
-
-```text
-net/crates/net/aggregator-daemon/src/lib.rs:312-334
-```
-
-Configuration contains no operator identity, token, or administrative allowlist:
+The daemon installs `List`, `Spawn`, `Unregister`, and `Scale` handlers without a separate operator identity, token, or administrative allowlist:
 
 ```text
 net/crates/net/aggregator-daemon/src/lib.rs:96-118
-```
-
-The handler ignores caller identity and executes `List`, `Spawn`, `Unregister`, and `Scale`:
-
-```text
+net/crates/net/aggregator-daemon/src/lib.rs:312-334
 net/crates/net/src/adapter/net/behavior/aggregator/registry_service.rs:57-103
 net/crates/net/src/adapter/net/behavior/aggregator/registry_service.rs:367-385
 net/crates/net/src/adapter/net/behavior/aggregator/registry_service.rs:396-470
 ```
 
-`List` additionally exposes `group_seed`:
+The controlled objects are not arbitrary application workloads. Templates contain only a source subnet, capability/reservation fold kinds, a summary interval, and a replica count. Spawn/Scale/Unregister therefore create, resize, or stop configured fold-summary workers. They do not mutate the signed source announcements, forge provider identities, or deploy arbitrary code.
+
+If every holder of the mesh PSK is intentionally a trusted aggregation operator, mesh admission is the administrative ACL and no authorization vulnerability is established. If ordinary workers/providers share that PSK, a non-operator can suppress aggregate visibility, resize summary replicas, or repeatedly spawn distinct configured groups for host-resource pressure. The retained defect is therefore a deployment-dependent control-plane availability/resource issue, not capability-signature compromise.
+
+### Separate witness-needed key-material disclosure
+
+`List` exposes `group_seed`:
 
 ```text
 net/crates/net/src/adapter/net/behavior/aggregator/registry_service.rs:128-157
 net/crates/net/src/adapter/net/behavior/aggregator/registry_service.rs:500-505
 ```
 
-That seed derives replica private keypairs:
+The seed derives replica entity keypairs:
 
 ```text
 net/crates/net/src/adapter/net/compute/replica_group.rs:40-81
 ```
 
-This expands SEC-01 beyond workload disruption to replica identity-key compromise. The repair must omit private seed material from ordinary status output even for otherwise authorized readers unless exact key-export authority exists.
+That is sensitive material, but this audit did not prove that those replica keys can forge accepted summary publications or exercise another security-bearing authority. `AggregatorDaemon::publish_summary` publishes the plain `SummaryAnnouncement` through the host `MeshNode`:
+
+```text
+net/crates/net/src/adapter/net/behavior/aggregator/daemon.rs:433-452
+```
+
+Do not call this provider-key or summary-signature compromise until an end-to-end witness establishes what possession of the derived replica identity authorizes. Independently of severity, ordinary status output should not return private seed material without exact key-export authority.
+
+### Required decisions and witnesses
+
+1. Declare whether mesh PSK membership intentionally implies aggregation-operator authority.
+2. If it does not, prove a non-operator can invoke Spawn/Scale/Unregister and measure summary-availability and bounded-template resource impact.
+3. Attempt repeated distinct-name Spawn requests and measure whether configured replica limits or host quotas bound total resource use.
+4. Derive a replica keypair from `group_seed` and prove or refute any security-bearing impersonation path before promoting the disclosure finding.
 
 ## AUTH-05 — Transfer inspection and cancellation remain ungated
 
@@ -355,7 +364,7 @@ Default task IDs are random, so an unrelated peer generally needs a leaked or ob
 |---|---|---|
 | Core/Cortex `serve_rpc*` | Public application data plane | Authenticated origin plus capability admission; protected modes apply organization admission. No novel framework bypass retained. |
 | Compute migration | Destructive administration and secret transfer | **AUTH-01 confirmed.** |
-| Aggregator registry | Status, resource allocation, mutating/destructive administration | **AUTH-04 / SEC-01 reconfirmed; seed disclosure added.** |
+| Aggregator registry | Fold-summary status and configured reducer lifecycle | **AUTH-04 corrected:** mesh admission is the only operator boundary. Medium/deployment-dependent if ordinary members are not trusted aggregation operators; no source-announcement compromise. Seed disclosure is separately witness-needed. |
 | MeshDB | Remote reads, joins, aggregates, task allocation | **AUTH-02 confirmed.** Per-peer cancellation keying itself is sound. |
 | Dataforts overflow | Resource allocation and replication | **AUTH-03 confirmed.** |
 | Dataforts transfers | Metadata and destructive cancellation | **AUTH-05 / SEC-03 reconfirmed.** |
@@ -375,10 +384,10 @@ No live services or network witnesses were launched. No repository files were ch
 ## Repair order and acceptance
 
 1. AUTH-01 migration orchestrator authorization and secret transfer.
-2. AUTH-04 aggregator administration and group-seed disclosure.
-3. AUTH-02 MeshDB authority propagation.
-4. AUTH-03 overflow authenticated identity and authoritative size.
-5. AUTH-05 transfer ownership/administration.
+2. AUTH-02 MeshDB authority propagation.
+3. AUTH-03 overflow authenticated identity and authoritative size.
+4. AUTH-05 transfer ownership/administration.
+5. AUTH-04 aggregation-operator trust decision, bounded resource witness, and separate replica-seed authority witness.
 6. Decide and witness A2A ownership semantics.
 
 Each repair needs an inverse witness against the audited behavior, the smallest production change, positive authorized controls, exact-head focused and integration tests with nonzero counts, clean Git state, `git diff --check`, and green required CI.
