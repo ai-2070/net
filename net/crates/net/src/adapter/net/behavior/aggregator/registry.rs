@@ -328,6 +328,28 @@ impl AggregatorRegistry {
     /// template + derives the appropriate keypair via
     /// `derive_replica_keypair(group_seed, index)`.
     ///
+    /// # Not security-bearing for aggregators
+    ///
+    /// These derived keypairs are replica *identities*, not signing
+    /// authority. An aggregator replica publishes its summaries
+    /// through the host `MeshNode`, and `SummaryAnnouncement` carries
+    /// no replica signature — nothing in the aggregator path
+    /// authenticates on this keypair. Aggregator replicas are also not
+    /// `DaemonHost`s in the compute `DaemonRegistry`, so the migration
+    /// identity-envelope path (which does consult daemon keypairs)
+    /// cannot select one.
+    ///
+    /// The seed itself is frequently not secret either: a dynamically
+    /// spawned group — and a static one that omits an explicit seed —
+    /// derives it from the group *name*, so anyone who knows the name
+    /// can reconstruct every replica key. Treat these identities as
+    /// deterministic labels.
+    ///
+    /// If cross-node aggregator replicas ever need real signing
+    /// identities, that needs a randomly generated seed persisted with
+    /// explicit ownership and rotation semantics — not this
+    /// derivation, and not a public salt over it.
+    ///
     /// Returns:
     /// - `NotFound` when no group is registered under `name`.
     /// - `ScaleFailed` when target_replica_count == 0, or when

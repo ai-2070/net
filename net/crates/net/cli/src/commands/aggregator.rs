@@ -484,8 +484,13 @@ struct LsView {
 #[derive(Serialize)]
 struct LsGroupRow {
     name: String,
-    /// 64-char hex rendering of `group_seed`.
-    group_seed: String,
+    /// 16-char hex correlation handle for the group's seed.
+    ///
+    /// **Not the seed.** This used to render the raw 32-byte
+    /// `group_seed`, which derives every replica keypair — status
+    /// output should not carry private key material. Use it to tell
+    /// whether two groups share a seed, not to reconstruct one.
+    group_seed_fingerprint: String,
     /// Per-replica rows in declaration order.
     replicas: Vec<LsReplicaRow>,
     /// Summary counter — how many replicas are healthy now.
@@ -500,14 +505,7 @@ impl From<&net_sdk::deck::AggregatorRegistryGroupSnapshot> for LsGroupRow {
         let healthy_count = replicas.iter().filter(|r| r.healthy).count() as u64;
         Self {
             name: g.name.clone(),
-            group_seed: g
-                .group_seed
-                .iter()
-                .fold(String::with_capacity(64), |mut acc, b| {
-                    use std::fmt::Write as _;
-                    let _ = write!(&mut acc, "{b:02x}");
-                    acc
-                }),
+            group_seed_fingerprint: g.group_seed_fingerprint.to_hex(),
             replica_count: g.replicas.len() as u64,
             healthy_count,
             replicas,
@@ -547,7 +545,8 @@ struct RemoteLsView {
 #[derive(Serialize)]
 struct RemoteLsGroupRow {
     name: String,
-    group_seed: String,
+    /// 16-char hex correlation handle. See [`LsGroupRow`].
+    group_seed_fingerprint: String,
     /// Subnet the aggregator summarizes, rendered as `"3.7"`
     /// (dotted decimal). Read from the wire reply.
     source_subnet: String,
@@ -566,7 +565,7 @@ impl From<&net_sdk::aggregator::RegistryGroupSummary> for RemoteLsGroupRow {
         let healthy_count = replicas.iter().filter(|r| r.healthy).count() as u64;
         Self {
             name: g.name.clone(),
-            group_seed: hex::encode(g.group_seed),
+            group_seed_fingerprint: g.group_seed_fingerprint.to_hex(),
             source_subnet: g.source_subnet.to_string(),
             fold_kinds: g.fold_kinds.iter().map(|k| format!("{k:#06x}")).collect(),
             healthy_count,
@@ -580,10 +579,14 @@ impl From<&net_sdk::aggregator::RegistryGroupSummary> for RemoteLsGroupRow {
 struct SpawnView {
     /// Echo of the group the daemon registered.
     name: String,
-    /// 64-char hex rendering of the daemon-side-derived group
-    /// seed (today: `blake3(name)` — the daemon owns the
-    /// derivation, the operator just sees the resulting bytes).
-    group_seed: String,
+    /// 16-char hex correlation handle for the group's seed.
+    ///
+    /// **Not the seed.** The daemon derives the seed itself (today
+    /// `blake3(label || name)` when none is configured), and the raw
+    /// bytes derive every replica keypair — so they do not belong in
+    /// status output even though a name-derived one is reconstructible
+    /// anyway. See [`LsGroupRow`].
+    group_seed_fingerprint: String,
     /// Subnet the aggregator summarizes — operator sanity-check
     /// that the resolved template matches expectations.
     source_subnet: String,
@@ -600,7 +603,7 @@ impl From<&net_sdk::aggregator::RegistryGroupSummary> for SpawnView {
     fn from(g: &net_sdk::aggregator::RegistryGroupSummary) -> Self {
         Self {
             name: g.name.clone(),
-            group_seed: hex::encode(g.group_seed),
+            group_seed_fingerprint: g.group_seed_fingerprint.to_hex(),
             source_subnet: g.source_subnet.to_string(),
             fold_kinds: g.fold_kinds.iter().map(|k| format!("{k:#06x}")).collect(),
             replica_count: g.replicas.len() as u64,

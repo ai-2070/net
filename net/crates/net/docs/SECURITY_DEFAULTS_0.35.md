@@ -52,8 +52,8 @@ the type's docs for why.
 
 ## 3. The aggregator registry refuses every remote request
 
-**Was:** any admitted peer could `List` (including `group_seed`),
-`Spawn`, `Scale` and `Unregister`.
+**Was:** any admitted peer could `List`, `Spawn`, `Scale` and
+`Unregister`.
 
 **Now:** `RegistryAdminPolicy::Closed`, and the daemon config takes:
 
@@ -75,6 +75,45 @@ availability, summary suppression, and resource exhaustion.
 Also new: `max_groups` (64) and `max_replica_count` (16) bound how much
 one caller can commit. `replica_count` is a `u8` and was validated only
 as non-zero, so a single request could ask for 255.
+
+## 3a. Aggregator status no longer emits `group_seed`
+
+`List` returned the raw 32-byte `group_seed`, which deterministically
+derives every replica keypair. It is replaced by a 16-hex-char
+`group_seed_fingerprint` — `BLAKE3("net-aggregator-seed-fingerprint-v1"
+|| 0x00 || seed)` truncated — which answers "are these two groups
+running the same seed?" without answering "what is it?".
+
+Field renames, by surface:
+
+| Surface | Was | Now |
+|---|---|---|
+| Rust (`RegistryGroupSummary`) | `group_seed: [u8; 32]` | `group_seed_fingerprint: SeedFingerprint` |
+| C FFI JSON | `group_seed_hex` (64 ch) | `group_seed_fingerprint_hex` (16 ch) |
+| Node | `groupSeedHex` | `groupSeedFingerprintHex` |
+| Python dict | `group_seed_hex` | `group_seed_fingerprint_hex` |
+| `net-mesh aggregator ls/status/spawn` | `group_seed` | `group_seed_fingerprint` |
+
+**This was not an exploitable disclosure**, and the change is hygiene
+rather than a fix. The derived replica keypairs authorize nothing in
+the aggregator path: replicas publish through the host `MeshNode`,
+`SummaryAnnouncement` carries no replica signature, and aggregator
+replicas are not `DaemonHost`s in the compute registry, so the
+migration identity-envelope path cannot select one. Moreover a
+dynamically spawned group — and a static one that omits an explicit
+seed — derives the seed from the group *name*, so those replica keys
+were already reconstructible by anyone who knew the name. `List` was
+not what made them recoverable.
+
+It is removed anyway because an explicitly configured seed *is* meant
+to be secret, and a status API should not carry private key material
+regardless of what it currently authorizes.
+
+If cross-node aggregator replicas ever need real signing identities,
+that needs a randomly generated seed persisted with explicit ownership
+and rotation semantics — not this derivation, and **not** a public
+deployment salt over it, which would only be another secret seed
+wearing a different name.
 
 ## 4. `MeshDbServer::new` requires an access policy
 

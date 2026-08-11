@@ -131,8 +131,21 @@ pub enum RegistryResponse {
 pub struct RegistryGroupSummary {
     /// Operator-chosen group name (the registry key).
     pub name: String,
-    /// 32-byte group seed.
-    pub group_seed: [u8; 32],
+    /// Correlation handle for the group's seed. **Not the seed.**
+    ///
+    /// This field used to carry the raw 32-byte `group_seed`, which
+    /// deterministically derives every replica's private keypair. Those
+    /// keypairs turn out to authorize nothing in the aggregator path
+    /// (see `AggregatorGroupEntry::group_seed`), and for a
+    /// name-derived seed they were already reconstructible by anyone
+    /// who knew the group name — so this was not an exploitable
+    /// disclosure. It was still private key material on a status API,
+    /// and an explicitly configured seed *is* meant to be secret.
+    ///
+    /// The fingerprint answers the question status output actually
+    /// needs — "are these two groups running the same seed?" — without
+    /// carrying the answer to "what is it?".
+    pub group_seed_fingerprint: SeedFingerprint,
     /// Subnet the aggregator summarizes. Sourced from the live
     /// replica's config; identical across replicas in a group.
     pub source_subnet: SubnetId,
@@ -142,6 +155,46 @@ pub struct RegistryGroupSummary {
     pub fold_kinds: Vec<u16>,
     /// Per-replica rows in declaration order.
     pub replicas: Vec<RegistryReplicaSummary>,
+}
+
+/// Non-secret 8-byte correlation handle for a group seed.
+///
+/// `BLAKE3(b"net-aggregator-seed-fingerprint-v1" || 0x00 || seed)`
+/// truncated to 8 bytes. Domain-separated so it can never collide with
+/// another use of the seed, and truncated because correlation is all
+/// it is for — a wider value would invite someone to treat it as an
+/// identifier with cryptographic weight.
+///
+/// Preimage resistance is what makes this safe to publish for an
+/// explicitly configured (secret) seed. For a name-derived seed the
+/// fingerprint is trivially recomputable from the group name, which is
+/// in the same reply — no loss, because that seed was never secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeedFingerprint(pub [u8; 8]);
+
+impl SeedFingerprint {
+    /// Fingerprint `seed`.
+    pub fn of(seed: &[u8; 32]) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"net-aggregator-seed-fingerprint-v1");
+        hasher.update(&[0u8]);
+        hasher.update(seed);
+        let full = *hasher.finalize().as_bytes();
+        let mut out = [0u8; 8];
+        out.copy_from_slice(&full[..8]);
+        Self(out)
+    }
+
+    /// Lowercase hex, for operator-facing output.
+    pub fn to_hex(self) -> String {
+        self.0.iter().map(|b| format!("{b:02x}")).collect()
+    }
+}
+
+impl std::fmt::Display for SeedFingerprint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.to_hex())
+    }
 }
 
 /// Per-replica row inside a [`RegistryGroupSummary`].
@@ -245,7 +298,7 @@ pub enum RegistryRpcError {
 ///
 /// What it *can* do is stop summary groups, resize them, create more
 /// from configured templates, exhaust host resources by repeating
-/// that, and read group status — including `group_seed`. That is
+/// that, and read group status. That is
 /// control-plane availability and summary suppression: real, and worth
 /// a gate, but not workload takeover.
 ///
@@ -628,7 +681,7 @@ pub async fn snapshot_group(entry: &Arc<super::AggregatorGroupEntry>) -> Registr
     };
     RegistryGroupSummary {
         name: entry.name.clone(),
-        group_seed: entry.group_seed,
+        group_seed_fingerprint: SeedFingerprint::of(&entry.group_seed),
         source_subnet,
         fold_kinds,
         replicas: rows,
@@ -1073,7 +1126,7 @@ mod tests {
 
         let group_summary = RegistryGroupSummary {
             name: "test".into(),
-            group_seed: [0xCDu8; 32],
+            group_seed_fingerprint: SeedFingerprint::of(&[0xCDu8; 32]),
             source_subnet: SubnetId::GLOBAL,
             fold_kinds: vec![0x0001],
             replicas: vec![RegistryReplicaSummary {
@@ -1102,5 +1155,92 @@ mod tests {
             let decoded: RegistryResponse = postcard::from_bytes(&bytes).expect("decode resp");
             assert_eq!(resp, decoded);
         }
+    }
+}
+
+#[cfg(test)]
+mod seed_fingerprint_tests {
+    use super::*;
+
+    /// Kyra's 2026-08-11 decision on #28: the seed comes out of status
+    /// output. It is not an exploitable disclosure today — the derived
+    /// replica keypairs authorize nothing in the aggregator path, and a
+    /// name-derived seed is reconstructible from the group name anyway
+    /// — but it is private key material on a status API, and an
+    /// explicitly configured seed is meant to be secret.
+    #[test]
+    fn the_fingerprint_does_not_carry_the_seed() {
+        let seed = [0xABu8; 32];
+        let fp = SeedFingerprint::of(&seed);
+
+        // The obvious regression: someone "restores" the old behaviour
+        // by making the fingerprint a truncation of the seed.
+        assert_ne!(
+            fp.0,
+            seed[..8],
+            "the fingerprint is a prefix of the seed — that is the seed, shortened"
+        );
+        let seed_hex: String = seed.iter().map(|b| format!("{b:02x}")).collect();
+        assert!(
+            !seed_hex.contains(&fp.to_hex()),
+            "the fingerprint appears inside the seed's own rendering"
+        );
+        assert_eq!(fp.to_hex().len(), 16);
+    }
+
+    /// Correlation is the whole job: same seed must fingerprint the
+    /// same, different seeds differently. A constant would satisfy the
+    /// secrecy test above and be useless.
+    #[test]
+    fn the_fingerprint_correlates() {
+        let a = SeedFingerprint::of(&[7u8; 32]);
+        let b = SeedFingerprint::of(&[7u8; 32]);
+        let c = SeedFingerprint::of(&[8u8; 32]);
+        assert_eq!(a, b, "same seed must fingerprint identically");
+        assert_ne!(a, c, "different seeds must fingerprint differently");
+
+        // Single-bit sensitivity — a fingerprint that ignored most of
+        // the seed would still pass the check above.
+        let mut near = [7u8; 32];
+        near[31] ^= 0x01;
+        assert_ne!(a, SeedFingerprint::of(&near));
+    }
+
+    /// The domain separator has to be in the hash, or this value
+    /// collides with any other BLAKE3-over-the-seed in the tree.
+    #[test]
+    fn the_fingerprint_is_domain_separated() {
+        let seed = [0x5Au8; 32];
+        let bare = {
+            let mut h = blake3::Hasher::new();
+            h.update(&seed);
+            *h.finalize().as_bytes()
+        };
+        assert_ne!(
+            SeedFingerprint::of(&seed).0,
+            bare[..8],
+            "the fingerprint is a plain BLAKE3 of the seed with no domain separation"
+        );
+    }
+
+    /// A group summary must not be able to carry the seed at all —
+    /// pinned structurally, since the whole point is that the field is
+    /// gone rather than merely unused.
+    #[test]
+    fn the_summary_type_has_no_seed_field() {
+        let src = include_str!("registry_service.rs");
+        let decl = src
+            .split("pub struct RegistryGroupSummary")
+            .nth(1)
+            .expect("RegistryGroupSummary must exist");
+        let body = decl.split('}').next().expect("struct body");
+        assert!(
+            !body.contains("group_seed:"),
+            "RegistryGroupSummary carries a raw group_seed again:\n{body}"
+        );
+        assert!(
+            body.contains("group_seed_fingerprint:"),
+            "the correlation handle went missing:\n{body}"
+        );
     }
 }
