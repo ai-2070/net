@@ -22,11 +22,12 @@ on:
       - "docs/data/examples.yaml"
       - ".github/scripts/run-skill-examples.sh"
       - ".github/scripts/skill_examples.py"
-      # `go-tests` runs the one-library text guard before its toolchains.
-      # Editing the checker itself has to re-run it, or a loosened pattern
-      # lands green. Its other roots (`.claude/skills/`,
-      # `web/src/content/docs/`) are covered by the copy in `web.yml`.
+      # `go-tests` runs the C-surface text guards before its toolchains.
+      # Editing a checker itself has to re-run it, or a loosened pattern
+      # lands green. Their other roots (`.claude/skills/`,
+      # `web/src/content/docs/`) are covered by the copies in `web.yml`.
       - ".github/scripts/check-one-library-docs.py"
+      - ".github/scripts/check-header-count.py"
 
 env:
   CARGO_TERM_COLOR: always
@@ -1753,12 +1754,20 @@ jobs:
       # being built. Two test files kept saying `cargo build -p net-<x>-ffi`,
       # which is now an rlib and produces nothing to link.
       #
+      # `check-header-count.py` rides along: the header count is the same
+      # claim about the same surface, drifts for the same reason — prose
+      # duplicated across the docs and skills trees, updated one copy at a
+      # time — and is derivable from `git ls-files` over the include
+      # directory rather than typed and trusted.
+      #
       # First, and before the toolchains: it is pure text, needs no network,
       # and a failure here should not cost a cdylib build to discover.
-      - name: Guard — no doc tells anyone to build or link a per-surface library
+      - name: Guard — the C surface is described as it ships
         run: |
           python3 .github/scripts/check-one-library-docs.py
           python3 .github/scripts/check-one-library-docs.py --self-test
+          python3 .github/scripts/check-header-count.py
+          python3 .github/scripts/check-header-count.py --self-test
 
       - name: Setup Go
         uses: actions/setup-go@v7.0.0

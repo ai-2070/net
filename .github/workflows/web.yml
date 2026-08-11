@@ -22,10 +22,11 @@ on:
       # headers, so a header change can break it without web/ being touched.
       - ".github/scripts/check-c-doc-snippets.py"
       - ".github/scripts/check-install-version.py"
-      # The one-library checker reads the skills tree and the docs tree.
-      # ci.yml's copy fires on `net/**` / `go/**` and cannot see either.
+      # The C-surface checkers read the skills tree and the docs tree.
+      # ci.yml's copies fire on `net/**` / `go/**` and cannot see either.
       - ".claude/skills/**"
       - ".github/scripts/check-one-library-docs.py"
+      - ".github/scripts/check-header-count.py"
       - "net/crates/net/include/**"
   pull_request:
     paths:
@@ -43,10 +44,11 @@ on:
       # headers, so a header change can break it without web/ being touched.
       - ".github/scripts/check-c-doc-snippets.py"
       - ".github/scripts/check-install-version.py"
-      # The one-library checker reads the skills tree and the docs tree.
-      # ci.yml's copy fires on `net/**` / `go/**` and cannot see either.
+      # The C-surface checkers read the skills tree and the docs tree.
+      # ci.yml's copies fire on `net/**` / `go/**` and cannot see either.
       - ".claude/skills/**"
       - ".github/scripts/check-one-library-docs.py"
+      - ".github/scripts/check-header-count.py"
       - "net/crates/net/include/**"
 
 jobs:
@@ -136,11 +138,18 @@ jobs:
       #
       # It is pure text against `git ls-files` — no toolchain, no network —
       # so the duplication costs seconds.
-      - name: Guard — no doc claims a library that is not built
+      #
+      # `check-header-count.py` is the other half and travels with it: the
+      # library count and the header count are the same claim about the same
+      # surface, drift for the same reason, and are both derivable. It reads
+      # the same four roots, so it needs the same two homes.
+      - name: Guard — the C surface is described as it ships
         working-directory: .
         run: |
           python3 .github/scripts/check-one-library-docs.py
           python3 .github/scripts/check-one-library-docs.py --self-test
+          python3 .github/scripts/check-header-count.py
+          python3 .github/scripts/check-header-count.py --self-test
 
       # Phase 1A made code blocks scroll rather than wrap, which was right and
       # has a cost nobody was watching: a line wider than the column silently
