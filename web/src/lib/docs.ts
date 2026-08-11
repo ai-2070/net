@@ -1059,6 +1059,27 @@ export function getDocsVersion(): string {
  * exactly the defect this replaced — a Python reader finishing `sdk/python/errors`
  * was handed `sdk/go/quickstart`.
  */
+export function assertNoCrossLanguageNeighbours(): void {
+  const problems: string[] = [];
+  for (const lang of LANGUAGES) {
+    for (const doc of getLinearDocs(lang)) {
+      const owner = slugLanguage(doc.slug);
+      if (owner !== null && owner !== lang) {
+        problems.push(
+          `reading as \`${lang}\`, the order contains \`/docs/${doc.slug.join("/")}\`, ` +
+            `which belongs to \`${owner}\``,
+        );
+      }
+    }
+  }
+  if (problems.length > 0) {
+    throw new Error(
+      `prev/next crosses a language boundary (${problems.length} case(s)):\n  ` +
+        problems.slice(0, 10).join("\n  "),
+    );
+  }
+}
+
 /** Build-time proof that every adaptive page on disk is detected as one.
  *
  * The adaptive shape is detected structurally — a `_shared.md` beside one file
@@ -1073,16 +1094,36 @@ export function getDocsVersion(): string {
  * tree on disk, and requires a directory holding a `_shared.md` to have become
  * a folder marked `adaptive`. It is deliberately filesystem-first: asking the
  * built tree what it found would agree with the tree's own mistake.
+ *
+ * Filesystem-first has one obligation in return, which is to walk the tree the
+ * same way `buildDocTree` does. It skips `DOCS_ORDER.hide`d slugs and does not
+ * descend into them, so a hidden directory is absent from the built tree by
+ * decision rather than by defect. A walk that ignored `hide` would report that
+ * absence as broken detection, and hiding a section — a config edit, in a file
+ * nowhere near this one — would fail the build with a message pointing at the
+ * one thing that was working.
  */
 export function assertEveryAdaptivePageDetected(): void {
+  if (!existsSync(DOCS_ROOT)) {
+    throw new Error(
+      `no content tree at ${DOCS_ROOT}; adaptive detection cannot be checked ` +
+        `against a tree that is not there. \`buildDocTree\` returns empty for ` +
+        `this case, so the site would build with no docs at all`,
+    );
+  }
+
   const onDisk: string[] = [];
   const walk = (absPath: string, slugChain: string[]): void => {
     if (existsSync(join(absPath, SHARED_BODY))) onDisk.push(slugChain.join("/"));
     for (const entry of readdirSync(absPath)) {
       const entryPath = join(absPath, entry);
-      if (statSync(entryPath).isDirectory()) {
-        walk(entryPath, [...slugChain, normalizeSlug(entry)]);
-      }
+      if (!statSync(entryPath).isDirectory()) continue;
+      const childSlug = [...slugChain, normalizeSlug(entry)];
+      // Same test, same place in the loop, as `buildFolder` — and like it,
+      // `continue` rather than recurse, because hiding cascades: a hidden
+      // section takes its adaptive pages with it.
+      if (isHidden(childSlug)) continue;
+      walk(entryPath, childSlug);
     }
   };
   walk(DOCS_ROOT, []);
@@ -1109,27 +1150,6 @@ export function assertEveryAdaptivePageDetected(): void {
     throw new Error(
       `found no \`${SHARED_BODY}\` under ${DOCS_ROOT}; this check would pass ` +
         `vacuously, so it is failing instead`,
-    );
-  }
-}
-
-export function assertNoCrossLanguageNeighbours(): void {
-  const problems: string[] = [];
-  for (const lang of LANGUAGES) {
-    for (const doc of getLinearDocs(lang)) {
-      const owner = slugLanguage(doc.slug);
-      if (owner !== null && owner !== lang) {
-        problems.push(
-          `reading as \`${lang}\`, the order contains \`/docs/${doc.slug.join("/")}\`, ` +
-            `which belongs to \`${owner}\``,
-        );
-      }
-    }
-  }
-  if (problems.length > 0) {
-    throw new Error(
-      `prev/next crosses a language boundary (${problems.length} case(s)):\n  ` +
-        problems.slice(0, 10).join("\n  "),
     );
   }
 }
