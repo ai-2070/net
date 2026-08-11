@@ -30,10 +30,10 @@ fn psk() -> [u8; 32] {
         .expect("32-byte psk")
 }
 
-/// Boot a holder serving the `blob.transfers` RPC. Returns the mesh and
-/// the RPC serve handle — both kept alive by the caller (dropping the
-/// handle would stop answering the RPC).
-async fn boot_holder() -> (Mesh, transport::ServeHandle) {
+/// Boot a holder serving the `blob.transfers` RPC under `policy`.
+/// Returns the mesh and the RPC serve handle — both kept alive by the
+/// caller (dropping the handle would stop answering the RPC).
+async fn boot_holder_with(policy: transport::TransferAdminPolicy) -> (Mesh, transport::ServeHandle) {
     let mesh = MeshBuilder::new("127.0.0.1:0", &psk())
         .expect("mesh builder")
         .build()
@@ -43,9 +43,23 @@ async fn boot_holder() -> (Mesh, transport::ServeHandle) {
     // daemon boot order) so the `blob.transfers.requests` channel
     // subscription is wired into the dispatch loop before it spins up.
     let adapter = Arc::new(MeshBlobAdapter::new("holder", Arc::new(Redex::new())));
-    let serve = transport::serve_blob_transfer_rpc(&mesh, adapter).expect("serve transfers rpc");
+    let serve = transport::serve_blob_transfer_rpc_with_policy(&mesh, adapter, policy)
+        .expect("serve transfers rpc");
     mesh.start();
     (mesh, serve)
+}
+
+/// Holder that answers anyone.
+///
+/// `attach()` below drives the CLI without `--identity`, so it comes up
+/// with a fresh ephemeral identity and an unpredictable node id — there
+/// is nothing stable for the holder to name in an operator allowlist.
+/// Proving the round-trip plumbing therefore needs the open policy.
+/// The refusal path is covered by
+/// `closed_policy_refuses_remote_administration` below, and the
+/// allowlist logic by the unit tests in `transfer_rpc.rs`.
+async fn boot_holder() -> (Mesh, transport::ServeHandle) {
+    boot_holder_with(transport::TransferAdminPolicy::AnyAdmittedPeer).await
 }
 
 fn cli_cmd(home_dir: &TempDir) -> AssertCommand {
@@ -130,6 +144,40 @@ async fn ls_status_cancel_round_trip_over_rpc() {
     assert_eq!(code, 0, "cancel failed: stderr={stderr}");
     let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("parse cancel");
     assert_eq!(parsed["cancelled"], false, "stdout={stdout}");
+}
+
+/// SEC-03 / AUTH-05 at the CLI boundary. A holder under the default
+/// policy answers a non-operator with a refusal, not with its transfer
+/// list — and the CLI surfaces that as a failure rather than printing
+/// an empty list, which would read as "this node is idle".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closed_policy_refuses_remote_administration() {
+    let (holder, _serve) = boot_holder_with(transport::TransferAdminPolicy::Closed).await;
+    let home = TempDir::new().expect("home");
+
+    for verb in [
+        vec!["ls".to_string()],
+        vec!["status".to_string(), "0x42".to_string()],
+        vec!["cancel".to_string(), "0x42".to_string()],
+    ] {
+        let label = verb.join(" ");
+        let mut args = verb;
+        args.extend(["--output".to_string(), "json".to_string()]);
+        args.extend(attach(&holder));
+        let (code, stdout, stderr) = run_transfer(&home, args).await;
+        assert_ne!(
+            code, 0,
+            "`transfer {label}` succeeded against a Closed holder — \
+             stdout={stdout} stderr={stderr}"
+        );
+        let combined = format!("{stdout}{stderr}");
+        assert!(
+            combined.contains("not authorized"),
+            "`transfer {label}` failed without saying why; an operator who \
+             forgot to name themselves needs to be able to tell this from a \
+             network fault. output={combined}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

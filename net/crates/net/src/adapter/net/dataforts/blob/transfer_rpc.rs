@@ -18,6 +18,7 @@
 //! so `ls` reflects fetches, not what the node serves. See
 //! [`BlobTransferEngine::list_pending`](crate::adapter::net::dataforts::blob::transfer::BlobTransferEngine::list_pending).
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -88,6 +89,81 @@ pub enum TransferRpcError {
     /// both together.)
     #[error("blob-transfer engine not installed on target")]
     EngineNotInstalled,
+    /// The calling session peer is not an operator of this node's
+    /// transfer engine. See [`TransferAdminPolicy`].
+    #[error("caller is not authorized to administer this node's transfers")]
+    Unauthorized,
+}
+
+/// Who may inspect and cancel this node's in-flight transfers.
+///
+/// # Why this exists
+///
+/// `blob.transfers` is described in this module's own docs as an
+/// "operator-introspection surface", but it was registered as an
+/// ordinary public nRPC service and the handler never looked at who
+/// was calling. Any admitted mesh peer could therefore:
+///
+/// - enumerate in-flight stream ids, holder identities, expected
+///   content hashes, transferred byte counts and sizes; and
+/// - `Cancel` an arbitrary stream id, which drops the pending entry
+///   and fails the *owner's* fetch.
+///
+/// Cancellation is the sharper end — repeatedly cancelling makes blob
+/// and directory retrieval fail on a node the caller does not own —
+/// but `List` is not obviously the safer half: it is a map of what
+/// this node is fetching and from whom.
+///
+/// # Read and write are not separately configurable
+///
+/// Deliberately. Splitting them would invite "reads are harmless, open
+/// those up", and the disclosure above is the reason that reading
+/// isn't harmless. An operator who genuinely wants public visibility
+/// can say so with [`AnyAdmittedPeer`](Self::AnyAdmittedPeer).
+///
+/// # What the decision is made on
+///
+/// [`RpcContext::session_peer`] — the AEAD-authenticated node that
+/// delivered the request. `caller_origin` is unusable here: it is
+/// routing metadata the sender chooses, and this crate's own docs say
+/// not to authorize on it. Note the limit `session_peer` carries: it
+/// is the last hop, so under nRPC relaying an allowlist authorizes the
+/// relay and whatever it forwards.
+#[derive(Debug, Clone, Default)]
+pub enum TransferAdminPolicy {
+    /// Refuse every remote request. The default: a node that has not
+    /// named its operators has no way to tell one from an attacker.
+    ///
+    /// The service still answers — with
+    /// [`TransferRpcError::Unauthorized`] — so a misconfigured
+    /// operator gets a diagnosable reply rather than a timeout.
+    #[default]
+    Closed,
+    /// Only the named nodes may list, inspect, or cancel.
+    ///
+    /// An empty set is equivalent to [`Closed`](Self::Closed); the
+    /// unconfigured case never widens access.
+    Operators(Arc<HashSet<u64>>),
+    /// Any peer that completed the mesh handshake, i.e. the pre-0.35
+    /// behaviour that this type exists to close. Defensible only where
+    /// mesh admission *is* the operator boundary.
+    AnyAdmittedPeer,
+}
+
+impl TransferAdminPolicy {
+    /// Build an [`Operators`](Self::Operators) set from anything iterable.
+    pub fn operators<I: IntoIterator<Item = u64>>(nodes: I) -> Self {
+        Self::Operators(Arc::new(nodes.into_iter().collect()))
+    }
+
+    /// Whether `session_peer` may administer this node's transfers.
+    pub fn permits(&self, session_peer: u64) -> bool {
+        match self {
+            Self::Closed => false,
+            Self::Operators(nodes) => nodes.contains(&session_peer),
+            Self::AnyAdmittedPeer => true,
+        }
+    }
 }
 
 /// Pure-function answer logic, broken out for direct unit testing without
@@ -113,18 +189,44 @@ pub(crate) fn answer(
 /// (which auto-registers the service's channels).
 pub struct TransferRpcHandler {
     engine: Arc<BlobTransferEngine>,
+    policy: TransferAdminPolicy,
 }
 
 impl TransferRpcHandler {
-    /// Build a handler over `engine`.
+    /// Build a handler over `engine` that refuses every remote
+    /// request — [`TransferAdminPolicy::Closed`].
+    ///
+    /// Use [`Self::with_policy`] to name the operator nodes that may
+    /// administer this node's transfers.
     pub fn new(engine: Arc<BlobTransferEngine>) -> Self {
-        Self { engine }
+        Self::with_policy(engine, TransferAdminPolicy::default())
+    }
+
+    /// Build a handler over `engine` with an explicit authority policy.
+    pub fn with_policy(engine: Arc<BlobTransferEngine>, policy: TransferAdminPolicy) -> Self {
+        Self { engine, policy }
     }
 }
 
 #[async_trait]
 impl RpcHandler for TransferRpcHandler {
     async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+        // Authorize before decoding. The body is attacker-controlled
+        // and decoding it for an unauthorized caller buys nothing but
+        // a wider surface; it would also let the refusal reply differ
+        // between a malformed and a well-formed body, which is a free
+        // oracle for probing the wire format.
+        if !self.policy.permits(ctx.session_peer) {
+            tracing::warn!(
+                session_peer = format!("{:#x}", ctx.session_peer),
+                caller_origin = format!("{:#x}", ctx.caller_origin),
+                policy = ?self.policy,
+                "refused an unauthorized blob.transfers request",
+            );
+            return Ok(encode_response(&TransferRpcResponse::Error(
+                TransferRpcError::Unauthorized,
+            )));
+        }
         let request: TransferRpcRequest = match postcard::from_bytes(&ctx.payload.body) {
             Ok(req) => req,
             Err(e) => {
@@ -382,10 +484,15 @@ mod tests {
         use crate::adapter::net::cortex::rpc::{RpcCancellationToken, RpcRequestPayload};
 
         let (_node, engine) = build_engine().await;
-        let handler = TransferRpcHandler::new(engine);
+        // Named operator: this test is about decode behaviour, not
+        // authority, so the caller has to get past the gate. The
+        // authority cases are covered below.
+        let handler =
+            TransferRpcHandler::with_policy(engine, TransferAdminPolicy::operators([OPERATOR]));
 
         let make_ctx = |body: Vec<u8>| RpcContext {
             caller_origin: 1,
+            session_peer: OPERATOR,
             call_id: 2,
             payload: RpcRequestPayload {
                 service: TRANSFER_SERVICE.to_string(),
@@ -419,6 +526,110 @@ mod tests {
             TransferRpcResponse::Error(TransferRpcError::DecodeFailed(_)) => {}
             other => panic!("expected Error(DecodeFailed), got {other:?}"),
         }
+    }
+
+    /// Node id used as the legitimate operator across the authority
+    /// tests below.
+    const OPERATOR: u64 = 0x0FE8;
+    /// An admitted mesh peer that is not an operator.
+    const OUTSIDER: u64 = 0xBAD5;
+
+    /// SEC-03 / AUTH-05 RED witness. An admitted peer that is not an
+    /// operator must learn nothing about this node's transfers and
+    /// must not be able to cancel one.
+    ///
+    /// The cancel leg is the one that matters most: pre-fix it
+    /// removed the pending entry and failed the *owner's* fetch, so a
+    /// peer with no relationship to the transfer could break blob and
+    /// directory retrieval on another node at will.
+    #[tokio::test]
+    async fn unauthorized_peer_can_neither_inspect_nor_cancel_transfers() {
+        use crate::adapter::net::cortex::rpc::{RpcCancellationToken, RpcRequestPayload};
+
+        let (_node, engine) = build_engine().await;
+        // One live transfer to disclose or destroy.
+        let sid = super::super::transfer_stream_id(99);
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        engine.register_pending(sid, 7, [0xABu8; 32], tx);
+        let handler = TransferRpcHandler::with_policy(
+            engine.clone(),
+            TransferAdminPolicy::operators([OPERATOR]),
+        );
+
+        let call = |req: TransferRpcRequest, peer: u64| {
+            let handler = &handler;
+            async move {
+                let ctx = RpcContext {
+                    caller_origin: 1,
+                    session_peer: peer,
+                    call_id: 2,
+                    payload: RpcRequestPayload {
+                        service: TRANSFER_SERVICE.to_string(),
+                        deadline_ns: 0,
+                        flags: 0,
+                        headers: Vec::new(),
+                        body: Bytes::from(postcard::to_allocvec(&req).expect("encode")),
+                    },
+                    cancellation: RpcCancellationToken::new(),
+                    trace_context: None,
+                    org_admission: None,
+                };
+                let resp = handler.call(ctx).await.expect("handler ok");
+                postcard::from_bytes::<TransferRpcResponse>(&resp.body).expect("decode resp")
+            }
+        };
+
+        for req in [
+            TransferRpcRequest::List,
+            TransferRpcRequest::Get { stream_id: sid },
+            TransferRpcRequest::Cancel { stream_id: sid },
+        ] {
+            let label = format!("{req:?}");
+            match call(req, OUTSIDER).await {
+                TransferRpcResponse::Error(TransferRpcError::Unauthorized) => {}
+                other => panic!("{label} from a non-operator was answered with {other:?}"),
+            }
+        }
+
+        // The transfer survived the refused Cancel. Asserting on the
+        // reply alone would miss a gate that refused *after* mutating.
+        match answer(&engine, &TransferRpcRequest::Get { stream_id: sid }) {
+            TransferRpcResponse::Transfer(Some(s)) => assert_eq!(s.holder, 7),
+            other => panic!("refused Cancel still dropped the pending transfer: {other:?}"),
+        }
+
+        // Positive control: the operator can still do all three, and
+        // the Cancel actually takes effect.
+        match call(TransferRpcRequest::List, OPERATOR).await {
+            TransferRpcResponse::Transfers(v) => assert_eq!(v.len(), 1),
+            other => panic!("operator List refused: {other:?}"),
+        }
+        match call(TransferRpcRequest::Cancel { stream_id: sid }, OPERATOR).await {
+            TransferRpcResponse::Cancelled { existed: true } => {}
+            other => panic!("operator Cancel refused: {other:?}"),
+        }
+        match answer(&engine, &TransferRpcRequest::Get { stream_id: sid }) {
+            TransferRpcResponse::Transfer(None) => {}
+            other => panic!("operator Cancel did not take effect: {other:?}"),
+        }
+    }
+
+    /// The policy's truth table. `Closed` is the default, and an empty
+    /// operator set must not read as "everyone".
+    #[test]
+    fn transfer_admin_policy_permits_only_what_it_names() {
+        assert!(!TransferAdminPolicy::Closed.permits(OPERATOR));
+        assert!(!TransferAdminPolicy::default().permits(OPERATOR));
+
+        let named = TransferAdminPolicy::operators([OPERATOR]);
+        assert!(named.permits(OPERATOR));
+        assert!(!named.permits(OUTSIDER));
+
+        // The unconfigured-list case: writing the config key but
+        // leaving it empty must not widen access.
+        assert!(!TransferAdminPolicy::operators([]).permits(OPERATOR));
+
+        assert!(TransferAdminPolicy::AnyAdmittedPeer.permits(OUTSIDER));
     }
 
     /// `TransferClientError` must preserve the failure category across the
