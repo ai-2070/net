@@ -1,0 +1,64 @@
+name: Install version
+
+# `check-install-version.py`, on the event that can actually invalidate it.
+#
+# The checker's source of truth is the newest stable unified `vX.Y.Z` tag
+# reachable from HEAD. That was a deliberate move away from release-note
+# FILES — v0.35.0 shipped without a `RELEASE_v0.35*.md`, so a file-based
+# checker went on certifying pages that named 0.34. It cost one thing,
+# though, and this workflow is that cost being paid back.
+#
+# A release note lived under `web/src/content/docs/releases/`, which is
+# inside `web.yml`'s `web/**` path filter: adding one RE-RAN the checker.
+# A tag is inside no path filter at all. `web.yml` still runs the checker
+# on every `web/**` change and that is worth keeping — it catches a PR
+# that types the wrong number. But it can no longer catch the case the
+# checker was written for: publish v0.36.0, change nothing under `web/`,
+# and the install pages keep telling readers to install 0.35 with every
+# job green.
+#
+# So this fires on the unified release tag itself. Note that NOTHING else
+# in `.github/workflows/` does — the release workflows are keyed to
+# `crates-v*`, `node-v*`, `python-v*`, `cli-v*` and friends, and the
+# unified `v*` tag is created by hand. It was, until this file, a tag no
+# CI job had ever looked at.
+#
+# The daily run is the backstop for the tag push being missed, retried,
+# or predating this workflow, and it turns "the docs are a minor stale"
+# from a fact nobody is watching into a job that is red every morning
+# until someone fixes it.
+on:
+  push:
+    tags:
+      # Stable unified releases only. GitHub filter patterns anchor at both
+      # ends, so `v0.36.0-rc.1` does not match — and would be ignored by the
+      # checker's own tag doctrine even if it did.
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  # 04:00 UTC, an hour after `nightly-fuzz.yml`, so the two are not
+  # competing for runners. Scheduled runs use the default branch, which is
+  # the branch the docs site deploys from.
+  schedule:
+    - cron: "0 4 * * *"
+  # For re-running after the docs PR that answers a red tag run.
+  workflow_dispatch:
+
+jobs:
+  install-version:
+    name: Install pages name the current release
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # `fetch-depth: 0`, for the same reason `web.yml` needs it: the
+      # checker decides tag REACHABILITY from HEAD, and a shallow clone
+      # brings neither the tags nor the history that orders them. It fails
+      # closed on one rather than guessing, so dropping this turns the job
+      # red with a prerequisite error — noisy, never a wrong answer.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Self-test the checker
+        run: .github/scripts/check-install-version.py --self-test
+
+      - name: Check the install pages name the current release
+        run: .github/scripts/check-install-version.py

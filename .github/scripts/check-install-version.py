@@ -44,6 +44,21 @@ The consequence to accept: a future release updates "current release"
 documentation only once the unified release tag exists. A candidate PR must
 not call an unpublished version current.
 
+WHERE THIS RUNS, AND WHY IN TWO PLACES.
+
+  * `web.yml`, on every `web/**` change — catches a PR that types the wrong
+    number into an install page.
+  * `install-version.yml`, on the unified `v*.*.*` tag push and daily —
+    catches the other direction, which is the one this checker exists for.
+
+The second is not redundancy. Moving the answer from a release-note FILE to a
+tag took the input out of every path filter in the repository: a release note
+lived under `web/src/content/docs/releases/` and so re-ran `web.yml` by
+existing, while a tag changes no file and matches no `paths:` entry. Without a
+tag-triggered run, publishing v0.36.0 and touching nothing under `web/` leaves
+the install pages saying 0.35 with every job green — the exact defect, reached
+by the exact route, that replacing the file-based check was supposed to close.
+
 Usage: check-install-version.py [--self-test]
 Exits 0 when every install page names the newest released minor.
 """
