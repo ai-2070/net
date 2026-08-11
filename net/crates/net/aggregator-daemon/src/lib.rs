@@ -145,6 +145,43 @@ struct Config {
     /// `operators` list.
     #[serde(default)]
     operators_any_admitted_peer: bool,
+    /// Maximum groups this daemon will host, counting those spawned
+    /// from `[[group]]` at startup and those deployed later over RPC.
+    ///
+    /// `Spawn` takes a caller-chosen `group_name`, so distinct names
+    /// never collide and nothing else bounds how many groups a caller
+    /// can create. Combined with `max_replica_count` below, this caps
+    /// the resources one caller can commit. Defaults to
+    /// [`DEFAULT_MAX_GROUPS`].
+    #[serde(default = "default_max_groups")]
+    max_groups: usize,
+    /// Maximum replicas in any one group, for both `Spawn` and
+    /// `Scale`.
+    ///
+    /// `replica_count` is a `u8` validated only as non-zero, so a
+    /// single request could ask for 255 replicas. Defaults to
+    /// [`DEFAULT_MAX_REPLICA_COUNT`]; raise it deliberately if a
+    /// deployment genuinely needs wider groups.
+    #[serde(default = "default_max_replica_count")]
+    max_replica_count: u8,
+}
+
+/// Default ceiling on hosted groups. Generous for the intended
+/// workload — a handful of fold summaries per daemon — while keeping
+/// an unattended daemon from being talked into unbounded growth.
+pub const DEFAULT_MAX_GROUPS: usize = 64;
+
+/// Default ceiling on replicas per group. Summary reducers are
+/// replicated for availability, not throughput, so single digits is
+/// the normal range; the wire type allows 255.
+pub const DEFAULT_MAX_REPLICA_COUNT: u8 = 16;
+
+fn default_max_groups() -> usize {
+    DEFAULT_MAX_GROUPS
+}
+
+fn default_max_replica_count() -> u8 {
+    DEFAULT_MAX_REPLICA_COUNT
 }
 
 /// Per-group config section spawned at startup. Carries the
@@ -411,8 +448,22 @@ pub async fn boot(cli: Cli) -> Result<BootedDaemon, DaemonError> {
     // registry, then install the registry service with both
     // handlers. Templates and the mesh handle are captured by
     // each closure for the daemon's lifetime.
-    let spawner = make_spawner(config.templates.clone(), registry.clone(), mesh.clone());
-    let scaler = make_scaler(config.templates.clone(), registry.clone(), mesh.clone());
+    let limits = SpawnLimits {
+        max_groups: config.max_groups,
+        max_replica_count: config.max_replica_count,
+    };
+    let spawner = make_spawner(
+        config.templates.clone(),
+        registry.clone(),
+        mesh.clone(),
+        limits,
+    );
+    let scaler = make_scaler(
+        config.templates.clone(),
+        registry.clone(),
+        mesh.clone(),
+        limits,
+    );
     let serve = registry
         .install_registry_service_with_handlers(&mesh, spawner, scaler, admin_policy)
         .map_err(|e| DaemonError::Serve(format!("{e:?}")))?;
@@ -726,10 +777,54 @@ fn resolve_template(
         .ok_or_else(|| RegistryRpcError::UnknownTemplate(name.to_string()))
 }
 
+/// Refuse a spawn/scale that would exceed the daemon's configured
+/// ceilings.
+///
+/// `group_name` is caller-chosen, so distinct names never collide and
+/// nothing else bounds how many groups one caller can create;
+/// `replica_count` is a `u8` validated only as non-zero, so one
+/// request could ask for 255. Neither is a privilege-escalation
+/// vector — the templates bound *what* runs — but together they are a
+/// straightforward way to exhaust a host, which is the surviving
+/// concrete impact of the registry being reachable at all.
+///
+/// `current_groups` is `None` for a scale (which does not add a
+/// group).
+fn check_spawn_limits(
+    limits: SpawnLimits,
+    replica_count: u8,
+    current_groups: Option<usize>,
+) -> Result<(), RegistryRpcError> {
+    if replica_count > limits.max_replica_count {
+        return Err(RegistryRpcError::SpawnRejected(format!(
+            "replica_count {replica_count} exceeds this daemon's max_replica_count              ({}); raise it in the daemon config if that is intended",
+            limits.max_replica_count
+        )));
+    }
+    if let Some(current) = current_groups {
+        if current >= limits.max_groups {
+            return Err(RegistryRpcError::SpawnRejected(format!(
+                "daemon already hosts {current} groups, at its max_groups limit ({});                  unregister one or raise the limit in the daemon config",
+                limits.max_groups
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The two spawn/scale ceilings, copied out of the config so the
+/// spawn and scale closures can each own one.
+#[derive(Debug, Clone, Copy)]
+struct SpawnLimits {
+    max_groups: usize,
+    max_replica_count: u8,
+}
+
 fn make_spawner(
     templates: Vec<TemplateConfig>,
     registry: Arc<AggregatorRegistry>,
     mesh: Arc<MeshNode>,
+    limits: SpawnLimits,
 ) -> SpawnFn {
     let by_name = build_template_index(templates);
     Box::new(move |req| {
@@ -737,6 +832,7 @@ fn make_spawner(
         let mesh = mesh.clone();
         let by_name = by_name.clone();
         Box::pin(async move {
+            check_spawn_limits(limits, req.replica_count, Some(registry.entries().len()))?;
             let template = resolve_template(&by_name, &req.template_name)?;
             let spec = AggregatorSpec::from_template(
                 &template,
@@ -769,6 +865,7 @@ fn make_scaler(
     templates: Vec<TemplateConfig>,
     registry: Arc<AggregatorRegistry>,
     mesh: Arc<MeshNode>,
+    limits: SpawnLimits,
 ) -> net::adapter::net::behavior::aggregator::ScaleFn {
     let by_name = build_template_index(templates);
     Box::new(move |req| {
@@ -776,6 +873,14 @@ fn make_scaler(
         let mesh = mesh.clone();
         let by_name = by_name.clone();
         Box::pin(async move {
+            // Scale adds no group, so only the per-group ceiling
+            // applies — but it applies here too, or Spawn(16) followed
+            // by Scale(255) would walk straight around it.
+            check_spawn_limits(limits, req.target_replica_count, None)
+                .map_err(|e| match e {
+                    RegistryRpcError::SpawnRejected(m) => RegistryRpcError::ScaleRejected(m),
+                    other => other,
+                })?;
             let template = resolve_template(&by_name, &req.template_name)?;
             // Build the spec from the template + supplied group
             // name. `replica_count` here is the *target* — used
@@ -1280,5 +1385,78 @@ psk_hex = \"{SENTINEL}\" trailing
             }
             other => panic!("expected AggregatorConfig, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod spawn_limit_tests {
+    use super::*;
+
+    fn limits() -> SpawnLimits {
+        SpawnLimits {
+            max_groups: 2,
+            max_replica_count: 4,
+        }
+    }
+
+    /// Kyra's 2026-08-11 note: repeated `Spawn` with distinct group
+    /// names, each asking for up to 255 replicas, is the surviving
+    /// concrete impact of the registry being reachable. `group_name`
+    /// is caller-chosen so names never collide, and `replica_count` is
+    /// a `u8` validated only as non-zero.
+    ///
+    /// This is the deterministic form of that witness: it shows the
+    /// arithmetic the caps refuse, without booting 255 replicas.
+    #[test]
+    fn spawn_is_refused_past_the_group_and_replica_ceilings() {
+        // The 255-replica single request.
+        let err = check_spawn_limits(limits(), 255, Some(0))
+            .expect_err("255 replicas in one request must be refused");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("max_replica_count"),
+            "the refusal should name the limit an operator can raise: {msg}"
+        );
+
+        // The repeated-distinct-name growth.
+        assert!(
+            check_spawn_limits(limits(), 1, Some(2)).is_err(),
+            "a daemon at its group ceiling accepted another group"
+        );
+
+        // Within both ceilings, spawn proceeds.
+        check_spawn_limits(limits(), 4, Some(1)).expect("a request inside both limits");
+        check_spawn_limits(limits(), 1, Some(0)).expect("the first group");
+    }
+
+    /// Scale must carry the per-group ceiling too. Without it,
+    /// `Spawn(4)` then `Scale(255)` walks straight around the spawn
+    /// check — the limit would bound the front door and leave the
+    /// window open.
+    #[test]
+    fn scale_cannot_exceed_the_replica_ceiling_the_spawn_enforced() {
+        assert!(
+            check_spawn_limits(limits(), 255, None).is_err(),
+            "scale to 255 replicas was permitted past max_replica_count"
+        );
+        // No group is added by a scale, so the group ceiling must not
+        // fire — a daemon sitting at max_groups can still resize what
+        // it already hosts.
+        check_spawn_limits(limits(), 4, None).expect("resize at the group ceiling");
+    }
+
+    /// The defaults have to be finite and sane; a config that omits
+    /// them must not read as "unlimited".
+    #[test]
+    fn omitted_limits_default_to_finite_ceilings() {
+        let cfg: Config = toml::from_str("listen = \"127.0.0.1:0\"\npsk_hex = \"aa\"\n")
+            .expect("config parses");
+        assert_eq!(cfg.max_groups, DEFAULT_MAX_GROUPS);
+        assert_eq!(cfg.max_replica_count, DEFAULT_MAX_REPLICA_COUNT);
+        assert!(cfg.max_groups > 0 && cfg.max_replica_count > 0);
+        assert!(
+            cfg.max_replica_count < u8::MAX,
+            "the default must be below the wire maximum, or it bounds nothing"
+        );
     }
 }
