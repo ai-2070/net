@@ -94,6 +94,6 @@ func main() {
 ```
 
 Expect one line, `accepted: ingested=1`, and a clean exit. This is the example CI
-builds and runs against the real shared libraries on every commit.
+builds and runs against the real shared library on every commit.
 
 Next: [the Go SDK spine](/docs/sdk/go/quickstart).

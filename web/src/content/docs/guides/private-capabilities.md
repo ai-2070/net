@@ -183,7 +183,7 @@ Access is the string `"same_org"` or `"granted"`, and the handler receives `call
 
 **Go** — `NewOrgCredentials` / `NewOrgClient` / `OrgCall[Req, Resp]` / `ServeOrg[Req, Resp]`, with `InstallOrgAuthority` and `InstallProviderGrantAudience` for provisioning. The generic call and serve verbs are free functions rather than methods, because Go forbids type parameters on methods.
 
-**C** — `net_org.h` over the `libnet_org` cdylib, with its own ABI stamp versioned independently of `net_rpc`'s. Call `net_org_check_abi_version(NET_ORG_ABI_VERSION)` at init and refuse to load on a negative return. Link both libraries; the org cdylib wraps node handles minted by the base `libnet`. The four call domains map to distinct negative return codes, so C callers branch without parsing anything.
+**C** — `net_org.h`, with its own ABI stamp versioned independently of `net_rpc`'s. Call `net_org_check_abi_version(NET_ORG_ABI_VERSION)` at init and refuse to load on a negative return. The org surface and the node handles it wraps are both in `libnet`, so there is one `-l` and it is `-lnet`. The four call domains map to distinct negative return codes, so C callers branch without parsing anything.
 
 In every one of these, binding **consumes** the credential set — on success and on failure. Build a fresh one to bind again.
 

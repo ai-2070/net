@@ -1,6 +1,6 @@
 ---
 title: C ABI
-description: "Embed Net through generated C headers and shared libraries with explicit memory ownership, polling, and return codes."
+description: "Embed Net through generated C headers and one shared library with explicit memory ownership, polling, and return codes."
 ---
 
 # C ABI
@@ -11,25 +11,26 @@ threads, polling, and return codes explicitly.
 
 ```bash
 cargo build --release --features ffi,net
-# link against the required shared libraries and include their headers
+# include the headers your program uses, then link -lnet
 ```
 
 ## Surface
 
-The ABI is split across eleven headers and five shared libraries. Together they cover
-the event bus, mesh transport, capability announce/discover, channels, nRPC,
-RedEX/CortEX storage, blob and directory transfer, federated queries, daemon
-operations, and the Deck operator surface.
+The ABI is split across eleven headers, all compiled into one library, `libnet`
+(shared or static). Together they cover the event bus, mesh transport, capability
+announce/discover, channels, nRPC, RedEX/CortEX storage, blob and directory
+transfer, federated queries, daemon operations, and the Deck operator surface.
 
-Use only the headers and libraries required by your application. The language SDKs
-manage lifetimes, errors, and asynchronous iteration for you; prefer one of them
-unless you need the C boundary.
+Include only the headers your application needs; there is one library to link
+either way. The language SDKs manage lifetimes, errors, and asynchronous
+iteration for you; prefer one of them unless you need the C boundary.
 
 ## Pages
 
 1. [Quickstart](/docs/sdk/c/quickstart) — ingest and poll with the memory rules.
-2. [Headers and linking](/docs/sdk/c/headers-and-linking) — libraries, generated
-   headers, and the `net.h` / `net.go.h` choice per translation unit.
+2. [Headers and linking](/docs/sdk/c/headers-and-linking) — the one library,
+   the generated headers, and the `net.h` / `net.go.h` choice per translation
+   unit.
 3. [Memory and threading](/docs/sdk/c/memory-and-threading) — ownership, polling
    cursors, and thread-safety guarantees.
 4. [Errors](/docs/sdk/c/errors) — return codes and the `NET_ERR_*` table.

@@ -22,6 +22,12 @@ on:
       - "docs/data/examples.yaml"
       - ".github/scripts/run-skill-examples.sh"
       - ".github/scripts/skill_examples.py"
+      # `go-tests` runs the C-surface text guards before its toolchains.
+      # Editing a checker itself has to re-run it, or a loosened pattern
+      # lands green. Their other roots (`.claude/skills/`,
+      # `web/src/content/docs/`) are covered by the copies in `web.yml`.
+      - ".github/scripts/check-one-library-docs.py"
+      - ".github/scripts/check-header-count.py"
 
 env:
   CARGO_TERM_COLOR: always
@@ -1377,17 +1383,40 @@ jobs:
         working-directory: net/crates/net/bindings/node
         run: npx napi build --platform --no-default-features --features net,nat-traversal,cortex,compute,groups,meshos,deck,meshdb,aggregator,tool,consent,mcp,publish,payments,payments-http,delegation,a2a,org,test-helpers
 
-      # Compile the sibling .ts shims (meshdb.ts, mesh_rpc.ts, errors.ts)
-      # into .js so `require('../meshdb')` in the test suite resolves.
-      # `napi build` only produces the native `.node` artifact; the
-      # AsyncIterable shim that augments MeshQueryStream is plain TS
-      # that needs its own tsc pass.
+      # Compile the sibling .ts shims (meshdb.ts, mesh_rpc.ts, errors.ts,
+      # tool.ts, …) into the CJS `.js` + `.d.ts` pair consumers
+      # `require()`. `napi build` only produces the native `.node`
+      # artifact; the AsyncIterable shim that augments MeshQueryStream is
+      # plain TS that needs its own tsc pass.
+      #
+      # This is a BUILD step, not a test prerequisite. It used to be both:
+      # vitest resolved `../tool` to the compiled `tool.js` before the
+      # `tool.ts` beside it, so the suite tested whatever this step last
+      # emitted. `vitest.config.ts` now prefers `.ts`, so the tests read
+      # the sources and a stale artifact can no longer pass for a fresh
+      # one. Keep the step — it still has to compile, and `noEmitOnError`
+      # means a type error here is a red job.
       - name: Build TypeScript shims
         working-directory: net/crates/net/bindings/node
         run: npm run build:ts
 
       - name: Run tests
         run: npm test
+
+      # The tool-serving cleanup journey needs a real mesh: the property
+      # under test is that closing every handle the SDK hands you releases
+      # the node's last reference, and a fake `ServeHandle` cannot fail to
+      # do that. Reuses the binding built above — a second `napi build`
+      # solely for one file would double this job's cost for nothing.
+      #
+      # Named explicitly rather than flipping RUN_INTEGRATION_TESTS on for
+      # the whole `npm test` run: the other integration-gated suites want
+      # a two-node handshake and their own budget, and folding them in
+      # here would change what this step means when it goes red.
+      - name: Run live tool-lifecycle witness
+        env:
+          RUN_INTEGRATION_TESTS: "1"
+        run: npm test -- --run test/tool_lifecycle_live.test.ts
 
   sdk-ts-tests:
     name: TypeScript SDK tests (vitest + tsc)
@@ -1725,12 +1754,20 @@ jobs:
       # being built. Two test files kept saying `cargo build -p net-<x>-ffi`,
       # which is now an rlib and produces nothing to link.
       #
+      # `check-header-count.py` rides along: the header count is the same
+      # claim about the same surface, drifts for the same reason — prose
+      # duplicated across the docs and skills trees, updated one copy at a
+      # time — and is derivable from `git ls-files` over the include
+      # directory rather than typed and trusted.
+      #
       # First, and before the toolchains: it is pure text, needs no network,
       # and a failure here should not cost a cdylib build to discover.
-      - name: Guard — no doc tells anyone to build or link a per-surface library
+      - name: Guard — the C surface is described as it ships
         run: |
           python3 .github/scripts/check-one-library-docs.py
           python3 .github/scripts/check-one-library-docs.py --self-test
+          python3 .github/scripts/check-header-count.py
+          python3 .github/scripts/check-header-count.py --self-test
 
       - name: Setup Go
         uses: actions/setup-go@v7.0.0

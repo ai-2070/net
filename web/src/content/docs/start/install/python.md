@@ -5,7 +5,7 @@ pip install net-mesh          # the native binding
 pip install net-mesh-sdk      # the ergonomic SDK, if you want typed channels
 ```
 
-Both publish at **0.34**. The distribution is named `net-mesh` but **the import
+Both publish at **0.35**. The distribution is named `net-mesh` but **the import
 stays `net`** — symmetry with the Rust crate, and so existing code keeps working.
 The SDK installs as `net-mesh-sdk` and imports as `net_sdk`. **Python 3.10 or
 newer.**

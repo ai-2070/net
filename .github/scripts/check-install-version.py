@@ -12,11 +12,52 @@ hard-coded "current" version is a fact with an expiry date, and nothing was
 watching it, so it silently became instructions to install a superseded
 release and then pin the rest of the stack to match it.
 
-This derives the answer from the release notes in the tree (the newest
-`RELEASE_v<major>.<minor>*.md`) and requires the install pages to agree. It
-deliberately does NOT read the workspace Cargo version: that is the *next*
-candidate — 0.35.0 while 0.34 is the newest release — and telling readers to
-install an unpublished version is the same defect pointed the other way.
+THE SOURCE OF TRUTH IS THE UNIFIED RELEASE TAG.
+
+    Candidate manifests may lead publication; install pages name only the
+    newest stable unified `vX.Y.Z` tag reachable from the deployed docs
+    commit.
+
+Everything else that looked like an answer is wrong in a different direction:
+
+  * Release-note FILES were the previous answer, and they are a record of
+    intent, not of publication. v0.35.0 shipped — tagged, published to
+    crates.io, npm and PyPI — with no `RELEASE_v0.35*.md` in the tree, so this
+    checker went on certifying pages that named 0.34 as correct. A missing
+    release note is a release-process gap; it must not also silently pin the
+    documentation a minor behind.
+  * The workspace `Cargo.toml` version is the NEXT candidate — 0.35.0 while
+    0.34 was the newest release — so telling readers to install it is the same
+    defect pointed the other way.
+  * Registries are the real evidence and are deliberately not consulted.
+    Ordinary CI does not get to depend on network calls to crates.io, npm and
+    PyPI; a flaky registry must not fail a docs PR.
+
+The tag is the one artifact that is created BY publishing and is local to the
+checkout. Reachability from `HEAD` is what makes it an answer for THIS commit:
+a tag on a branch nobody merged describes a release these docs do not
+document. `cli-v*` and `deck-v*` are separately-versioned binaries, and
+`-rc` / `-beta` tags are not shipped releases — none of them are unified
+releases and all are ignored.
+
+The consequence to accept: a future release updates "current release"
+documentation only once the unified release tag exists. A candidate PR must
+not call an unpublished version current.
+
+WHERE THIS RUNS, AND WHY IN TWO PLACES.
+
+  * `web.yml`, on every `web/**` change — catches a PR that types the wrong
+    number into an install page.
+  * `install-version.yml`, on the unified `v*.*.*` tag push and daily —
+    catches the other direction, which is the one this checker exists for.
+
+The second is not redundancy. Moving the answer from a release-note FILE to a
+tag took the input out of every path filter in the repository: a release note
+lived under `web/src/content/docs/releases/` and so re-ran `web.yml` by
+existing, while a tag changes no file and matches no `paths:` entry. Without a
+tag-triggered run, publishing v0.36.0 and touching nothing under `web/` leaves
+the install pages saying 0.35 with every job green — the exact defect, reached
+by the exact route, that replacing the file-based check was supposed to close.
 
 Usage: check-install-version.py [--self-test]
 Exits 0 when every install page names the newest released minor.
@@ -26,14 +67,17 @@ from __future__ import annotations
 
 import argparse
 import re
+import subprocess
 import sys
+from collections.abc import Container, Iterable
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[2]
-_RELEASES = _ROOT / "web" / "src" / "content" / "docs" / "releases"
 _INSTALL = _ROOT / "web" / "src" / "content" / "docs" / "start" / "install"
 
-_RELEASE_FILE = re.compile(r"^RELEASE_v(\d+)\.(\d+)")
+# A unified release tag and nothing else. Anchored at both ends, so
+# `cli-v0.35.0` fails at the front and `v0.35.0-rc.1` at the back.
+_UNIFIED_TAG = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
 
 # Any `0.NN` that is not part of a longer number. Patch suffixes are allowed
 # in prose (`0.34.0`) but the minor is what must match.
@@ -57,17 +101,94 @@ _VERSION = re.compile(r"(?<![\d.])(\d+)\.(\d+)(?:\.\d+)?(?![\d.])")
 # away from the pages it describes.
 
 
-def latest_released_minor() -> tuple[int, int]:
-    """The newest (major, minor) with release notes in the tree."""
-    found: list[tuple[int, int]] = []
-    for path in _RELEASES.glob("RELEASE_v*.md"):
-        m = _RELEASE_FILE.match(path.name)
-        if m:
-            found.append((int(m.group(1)), int(m.group(2))))
-    if not found:
-        raise SystemExit(f"FAIL  no release notes found under {_RELEASES}")
+def parse_unified_tag(tag: str) -> tuple[int, int, int] | None:
+    """`(major, minor, patch)` for a unified release tag, else `None`.
 
-    newest = max(found)
+    Pure: no Git, no filesystem. Everything the doctrine excludes — the
+    per-binary `cli-` / `deck-` prefixes, prerelease suffixes, two-component
+    tags, anything not matching at all — comes back `None` here rather than
+    being filtered somewhere downstream where the reason is easy to lose.
+    """
+    m = _UNIFIED_TAG.match(tag.strip())
+    if not m:
+        return None
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+
+
+def newest_unified(
+    tags: Iterable[str], reachable: Container[str]
+) -> tuple[int, int, int] | None:
+    """The highest unified release among `tags` that is also `reachable`.
+
+    Split out from the Git call so the selection rules are testable without a
+    repository: the ordering, the exclusions, and — the one that is easy to
+    get wrong — that an unreachable tag is not a release for THIS checkout,
+    however new it is.
+    """
+    best: tuple[int, int, int] | None = None
+    for tag in tags:
+        version = parse_unified_tag(tag)
+        if version is None:
+            continue
+        if tag not in reachable:
+            continue
+        if best is None or version > best:
+            best = version
+    return best
+
+
+def _git(*args: str) -> str:
+    return subprocess.run(
+        ["git", *args],
+        capture_output=True,
+        text=True,
+        cwd=_ROOT,
+        check=True,
+    ).stdout
+
+
+def latest_released_version() -> tuple[int, int, int]:
+    """The newest stable unified release tag reachable from `HEAD`.
+
+    Fails closed. Every way this can come back empty is a prerequisite the
+    caller can fix, and each says which one — a checkout with no tags is a
+    CI configuration problem, not evidence that nothing has been released.
+    """
+    if _git("rev-parse", "--is-shallow-repository").strip() == "true":
+        raise SystemExit(
+            "FAIL  this is a shallow checkout, so tag reachability cannot be "
+            "decided.\n"
+            "      The install pages name the newest unified release tag "
+            "reachable from HEAD;\n"
+            "      a shallow clone can neither see the tags nor the history "
+            "that orders them.\n"
+            "      Check out with `fetch-depth: 0` (actions/checkout) or "
+            "`git fetch --tags --unshallow`."
+        )
+
+    all_tags = _git("tag", "--list").splitlines()
+    if not all_tags:
+        raise SystemExit(
+            "FAIL  no tags in this checkout.\n"
+            "      The newest unified `vX.Y.Z` tag reachable from HEAD is the "
+            "source of truth for\n"
+            "      the install pages. Fetch tags (`fetch-depth: 0`) rather "
+            "than assuming a version."
+        )
+
+    reachable = set(_git("tag", "--list", "--merged", "HEAD").splitlines())
+    newest = newest_unified(all_tags, reachable)
+    if newest is None:
+        raise SystemExit(
+            "FAIL  no stable unified `vX.Y.Z` tag is reachable from HEAD.\n"
+            f"      {len(all_tags)} tag(s) are present, but none that "
+            "qualifies: `cli-v*` / `deck-v*`\n"
+            "      version separate binaries, and `-rc` / `-beta` tags are "
+            "not shipped releases.\n"
+            "      If a release really has shipped, its tag is not merged "
+            "into this branch yet."
+        )
+
     if newest[0] != 0:
         # Say this here rather than let it surface as "found no version
         # references at all; the matcher is broken", which is what the
@@ -97,8 +218,8 @@ def net_versions_in(path: Path) -> list[tuple[int, int, str]]:
 
 
 def check() -> int:
-    major, minor = latest_released_minor()
-    print(f"==> newest release notes: v{major}.{minor}")
+    major, minor, patch = latest_released_version()
+    print(f"==> newest reachable unified release tag: v{major}.{minor}.{patch}")
 
     pages = sorted(_INSTALL.glob("*.md"))
     if not pages:
@@ -133,10 +254,82 @@ def check() -> int:
     return 0
 
 
+def _self_test_tag_parser() -> list[str]:
+    """The doctrine, as assertions. Returns a list of failures."""
+    failures: list[str] = []
+
+    def expect(got: object, want: object, what: str) -> None:
+        if got != want:
+            failures.append(f"FAIL  {what}: got {got!r}, expected {want!r}")
+
+    expect(parse_unified_tag("v0.35.0"), (0, 35, 0), "a unified tag is accepted")
+    # Everything the doctrine excludes, one reason at a time.
+    for rejected, why in [
+        ("v0.35.0-rc.1", "a release candidate is not a shipped release"),
+        ("v0.35.0-beta.2", "a beta is not a shipped release"),
+        ("cli-v0.35.0", "the CLI is versioned separately"),
+        ("deck-v0.35.0", "Deck is versioned separately"),
+        ("v0.35", "a two-component tag is not a release tag"),
+        ("0.35.0", "a tag without the `v` prefix is not one of ours"),
+        ("vX.Y.Z", "malformed"),
+        ("", "empty"),
+    ]:
+        expect(parse_unified_tag(rejected), None, f"`{rejected}` ignored — {why}")
+
+    # Ordering is numeric, not lexicographic: `v0.35.10` must outrank
+    # `v0.35.9`, which string comparison gets backwards.
+    expect(
+        newest_unified(["v0.35.0", "v0.35.1"], {"v0.35.0", "v0.35.1"}),
+        (0, 35, 1),
+        "a later patch outranks an earlier one",
+    )
+    expect(
+        newest_unified(["v0.35.9", "v0.35.10"], {"v0.35.9", "v0.35.10"}),
+        (0, 35, 10),
+        "patch ordering is numeric, not lexicographic",
+    )
+
+    # The whole selection at once, including the case that has no local
+    # spelling difference at all: `v0.36.0` is a perfectly well-formed
+    # unified tag and is still not a release for THIS checkout, because it is
+    # not reachable from HEAD. Nothing about the string says so.
+    tags = [
+        "v0.34.0",
+        "v0.35.0",
+        "v0.35.1",
+        "v0.35.2-rc.1",
+        "cli-v0.36.0",
+        "deck-v0.36.0",
+        "v0.36.0",
+        "not-a-tag",
+    ]
+    reachable = {"v0.34.0", "v0.35.0", "v0.35.1", "v0.35.2-rc.1", "cli-v0.36.0"}
+    expect(
+        newest_unified(tags, reachable),
+        (0, 35, 1),
+        "an unreachable tag is not shipped for this checkout",
+    )
+    expect(
+        newest_unified(["v0.36.0"], set()),
+        None,
+        "nothing reachable means no answer, not a guess",
+    )
+    return failures
+
+
 def self_test() -> int:
-    """The matcher must catch a stale number and ignore a non-Net one."""
+    """The tag parser must obey the doctrine, and the page matcher must
+    catch a stale number while ignoring a non-Net one."""
     print("==> self-test")
-    major, minor = latest_released_minor()
+
+    failures = _self_test_tag_parser()
+    if failures:
+        print("\n".join(failures))
+        return 1
+    print("  ok    unified tags parsed; rc/beta, cli-, deck- and malformed ignored")
+    print("  ok    newest wins numerically; an unreachable tag is not shipped")
+
+    major, minor, _patch = latest_released_version()
 
     # The stale number has to be a real, differently-spelled version. Going
     # DOWN a minor breaks at `x.0` — `0.0 - 1` renders as `0.-1`, which the

@@ -392,9 +392,9 @@ for {
 
 Pure-Go resilience helpers (`RetryPolicy` + `CallWithRetry`, `HedgePolicy` + `CallWithHedge`, `CircuitBreaker`) live in `net/crates/net/bindings/go/net/resilience.go` — the reference tree, **not** the shipped module, so `go get github.com/ai-2070/net/go` does not bring them. Vendor that file or write your own. ABI version drift is detected via `net.ABIVersion()` vs `net.ExpectedABIVersion`, currently `0x0004`.
 
-### C — a separate header and a separate library
+### C — a separate header, the same library
 
-nRPC is **not** in `net.h`, and that is a header-layout fact rather than a gap: the C SDK is ten headers over six cdylibs. nRPC lives in its own pair.
+nRPC is **not** in `net.h`, and that is a header-layout fact rather than a gap: the C SDK is eleven headers over one shared library, `libnet`. nRPC has its own header; it does not have its own library, and the paragraph below is what to link.
 
 Include `net/crates/net/include/net_rpc.h` and link `-lnet`, built with `cargo build --release -p net-ffi`. One library carries every surface — never add a second `-l`, which puts two copies of Net's internals in one process and can leave a lock released with its waiter still asleep. The header is the canonical drop-in for C, C++, Zig, Swift, JNI and anything else with a C ABI — it is not Go-specific, though the Go binding is its most-exercised consumer. It carries the full surface: `net_rpc_call` and the service/header/streaming/cancellable variants, `net_rpc_serve_streaming`, `net_rpc_find_service_nodes`, plus `net_rpc_abi_version()` / `net_rpc_check_abi_version()` for the version handshake.
 

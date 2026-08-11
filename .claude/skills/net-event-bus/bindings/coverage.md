@@ -25,7 +25,7 @@ meant to be vendored or copied into your own module. It covers surfaces the
 shipped module does not. Nothing below describes it; if a cell says `not
 exposed`, check there before concluding the work has not been done.
 
-### C is eleven headers over six libraries, not one SDK
+### C is eleven headers over one library, not one SDK
 
 A `supported` C cell tells you a symbol exists. It does not tell you that you can
 reach it from the translation unit you are already in.

@@ -82,9 +82,22 @@ does on the Python one.
 
 Two more things the shape of that snippet is telling you. **`start()` is async in
 TypeScript** — forgetting the `await` gives you a node that is not started yet and
-no error saying so. And **there is no `localAddr()` accessor**: the address you
-bound is the address you pass, so bind to a port you chose rather than `:0` when a
-second node has to reach you.
+no error saying so. And **`localAddr()` is how a `:0` bind becomes connectable**:
+port `0` asks the OS to pick a free port, and the port it picked is knowable only
+by asking the node back.
+
+Replace the first two lines of the snippet above with these three, and leave the
+rest of it alone:
+
+```typescript
+const host = await MeshNode.create({ bindAddr: '127.0.0.1:0', psk });
+const agent = await MeshNode.create({ bindAddr: '127.0.0.1:0', psk });
+const HOST_ADDR = host.localAddr();   // e.g. '127.0.0.1:54417'
+```
+
+Hard-coding the port, as the snippet above does, is fine when you chose the
+number and both sides already agree on it. `:0` plus `localAddr()` is what you
+want when you did not — in tests, and anywhere a fixed port would collide.
 
 Node ids are 64-bit, so they come back as `bigint` rather than `number`. That
 matters the moment you use one as an object key or compare it with `===` against a

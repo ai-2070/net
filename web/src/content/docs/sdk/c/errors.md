@@ -58,9 +58,9 @@ The `int` returns from `net.h` are drawn from this set:
 | `NET_ERR_SHUTTING_DOWN` | -8 | Handle is shutting down |
 | `NET_ERR_UNKNOWN` | -99 | Unclassified failure |
 
-The separate libraries add their own ranges — `NET_ERR_REDEX` and friends in
+The other headers add their own ranges — `NET_ERR_REDEX` and friends in
 `net_cortex.h`, the MeshDB codes in `net_meshdb.h`. Each header declares the
-codes for its own surface.
+codes for its own surface; they all resolve out of the same `libnet`.
 
 ## Beyond the bus
 

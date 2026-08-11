@@ -8,6 +8,7 @@ import {
   composeRendition,
   extractToc,
   getPrevNextByLanguage,
+  assertEveryAdaptivePageDetected,
   assertNoCrossLanguageNeighbours,
   navChildren,
   renditionPath,
@@ -39,9 +40,15 @@ export const dynamicParams = false;
 export const revalidate = false;
 
 export function generateStaticParams(): Array<{ slug: string[] }> {
-  // Runs once per build, and throws rather than warns. See the function's
-  // comment: this is the acceptance test for language-aware prev/next, placed
-  // where it cannot be skipped or forgotten.
+  // Both run once per build, and throw rather than warn. See each function's
+  // comment: these are the acceptance tests for language-aware prev/next and
+  // for adaptive-page detection, placed where they cannot be skipped.
+  //
+  // Detection first. When it breaks, EVERY adaptive page decomposes into five
+  // ordinary siblings, and the cross-language check then reports a dozen
+  // boundary crossings that are all one root cause — which reads as a content
+  // problem and sends the reader into the order config.
+  assertEveryAdaptivePageDetected();
   assertNoCrossLanguageNeighbours();
   return getAllSlugs().map((slug) => ({ slug }));
 }

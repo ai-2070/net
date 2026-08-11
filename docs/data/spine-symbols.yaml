@@ -29,7 +29,13 @@
 pages:
   quickstart:
     rust: [Net, MeshBuilder, Backpressure, shutdown, local_addr, public_key, node_id]
-    typescript: [NetNode, MeshNode, emitRaw, emitBatch, nodeId, publicKey]
+    # `localAddr` is here for the same reason `local_addr` is on the Rust row:
+    # the quickstart now tells readers it is how a `:0` bind becomes
+    # connectable. The page used to say the accessor did not exist while the
+    # binding had had it all along, so the inverse matters — if it is ever
+    # dropped from the SDK or the page, this row fails rather than the claim
+    # quietly going stale again.
+    typescript: [NetNode, MeshNode, emitRaw, emitBatch, nodeId, publicKey, localAddr]
     python: [NetNode, MeshNode, emit_raw, emit_batch, node_id, public_key]
     go: [NewMeshNode, MeshConfig, PskHex, IngestRaw, NodeID, PublicKey]
 
