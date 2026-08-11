@@ -459,6 +459,24 @@ fn mode_of(_meta: &std::fs::Metadata) -> u32 {
 ///   tree is in place — so a replace also drops files from a previous
 ///   version that aren't in the new manifest (no stale-file accumulation).
 ///
+/// # Permissions (Unix)
+///
+/// The temp tree is created `0o700`, so an in-progress reconstruction is
+/// never readable by another local user — the destination's parent is
+/// frequently traversable, and the temp tree lives there. Regular files
+/// are created carrying the manifest's sanitized mode rather than the
+/// umask default, so a file destined to be private is never briefly
+/// world-readable; for a multi-chunk file, whose handle stays open across
+/// every chunk fetch, that window used to last the whole transfer
+/// (LINUX-04).
+///
+/// **Behaviour change:** the `0o700` travels with the inode through the
+/// final rename, so **`dest` ends up owner-only** where it previously
+/// inherited the umask (typically `0o755`). A directory pulled from a
+/// remote peer defaults to private; widen it explicitly if another
+/// local user needs to read it. Special mode bits are stripped from
+/// remote file modes regardless — see [`sanitize_remote_file_mode`].
+///
 /// This is *replacement*-atomicity, **not** *observer*-atomicity: a
 /// process reading files inside `dest` during the swap may see the old
 /// tree one moment and a missing path the next — the rename invalidates
@@ -720,7 +738,9 @@ async fn alloc_temp_dir(dest: &Path) -> Result<PathBuf, DirError> {
         std::fs::create_dir_all(&parent)?;
         for _ in 0..8 {
             let work = parent.join(format!(".{base}.fetch_{:016x}", unique_suffix()));
-            match std::fs::create_dir(&work) {
+            // LINUX-04: private from the creation syscall, not chmodded
+            // private a moment later. See `create_dir_private`.
+            match create_dir_private(&work) {
                 Ok(()) => return Ok(work),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(DirError::Io(e)),
@@ -836,9 +856,15 @@ async fn fetch_blob_to_file(
     mode: u32,
 ) -> Result<u64, DirError> {
     let create_path = path.to_path_buf();
-    let mut file = tokio::task::spawn_blocking(move || std::fs::File::create(&create_path))
-        .await
-        .map_err(|e| DirError::Io(std::io::Error::other(e)))??;
+    // LINUX-04: request the final mode up front. This handle stays open
+    // across every chunk fetch, so `File::create`'s umask-derived 0644
+    // exposed a file destined for 0600 for the whole transfer — the
+    // longest-lived instance of that window, and the one a throttled
+    // transfer widens at will.
+    let mut file =
+        tokio::task::spawn_blocking(move || create_file_with_final_mode(&create_path, mode))
+            .await
+            .map_err(|e| DirError::Io(std::io::Error::other(e)))??;
     let mut written: u64 = 0;
     for chunk in chunks {
         let bytes = node.transfer_fetch_chunk(source, chunk.hash).await?;
@@ -1019,10 +1045,84 @@ fn check_link_target(
 }
 
 fn write_file(path: &Path, bytes: &[u8], mode: u32) -> Result<(), DirError> {
-    std::fs::write(path, bytes)?;
+    use std::io::Write as _;
+    let mut f = create_file_with_final_mode(path, mode)?;
+    f.write_all(bytes)?;
+    drop(f);
+    // Still needed: `OpenOptionsExt::mode` is masked by the process
+    // umask, so a file whose final mode is wider than umask allows
+    // (0o664 under umask 0o022) comes out narrower. The chmod widens it
+    // to its intended mode *after* the content is written. Narrower ->
+    // wider is safe; the reverse is the exposure this closes.
     apply_mode(path, mode)?;
     Ok(())
 }
+
+/// Create a file for a reconstructed manifest entry, requesting its
+/// **final** sanitized mode at creation time rather than letting the
+/// umask pick a wider one and narrowing later.
+///
+/// LINUX-04. `std::fs::write` creates at `0o666 & !umask` — 0644 on a
+/// typical host — and the intended mode was only applied afterwards. A
+/// file destined for `0o600` was therefore world-readable for the whole
+/// of its transfer. For a multi-chunk file the handle stays open across
+/// every chunk fetch, so the window is as long as the transfer: a
+/// throttled or large file widens it arbitrarily.
+///
+/// Since umask can only clear bits, requesting the final mode here means
+/// the file is never *broader* than it is meant to end up, at any point
+/// in its life.
+fn create_file_with_final_mode(path: &Path, mode: u32) -> Result<std::fs::File, DirError> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let sanitized = sanitize_remote_file_mode(mode);
+        // `0` means the manifest recorded no mode (a non-Unix
+        // publisher). Leave the default alone rather than inventing an
+        // intent the manifest never expressed — there is nothing to
+        // protect, and forcing owner-only here would silently change
+        // what a plain fetch produces.
+        if sanitized != 0 {
+            opts.mode(sanitized);
+        }
+    }
+    #[cfg(not(unix))]
+    ignore_mode_on_this_platform(mode);
+    Ok(opts.open(path)?)
+}
+
+/// Create a directory that no other local user can traverse.
+///
+/// LINUX-04. The `fetch_dir` temp tree is a *sibling* of the
+/// destination, so it lives in whatever directory the caller chose —
+/// frequently one another local user can traverse. Created with plain
+/// `create_dir` it inherited the umask, typically `0o755`, which made
+/// the entire in-progress reconstruction readable to anyone on the box
+/// for the duration of the fetch.
+///
+/// `0o700` on the temp root is the cheap, complete fix: everything
+/// under it is unreachable regardless of the modes the individual
+/// files and subdirectories carry.
+fn create_dir_private(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().mode(0o700).create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir(path)
+    }
+}
+
+/// Consume `mode` on platforms where it has no meaning, so the
+/// parameter stays part of the signature (and the intent stays legible)
+/// without tripping `unused_variables` on Windows.
+#[cfg(not(unix))]
+#[inline]
+fn ignore_mode_on_this_platform(_mode: u32) {}
 
 /// Unix mode bits above `0o777`: setuid (`0o4000`), setgid (`0o2000`)
 /// and the sticky bit (`0o1000`).
@@ -1216,6 +1316,114 @@ mod tests {
             "the ordinary permission bits should survive; got {:o}",
             mode
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// LINUX-04. The temp tree must be private in the creation
+    /// syscall, not chmodded private a moment later.
+    ///
+    /// It is a *sibling* of the destination, so it lives in whatever
+    /// directory the caller chose — often one another local user can
+    /// traverse. Created with plain `create_dir` it inherited the
+    /// umask (typically `0o755`), exposing the whole in-progress
+    /// reconstruction for the length of the fetch.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fetch_temp_tree_is_private_from_the_creation_syscall() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = std::env::temp_dir().join(format!("net-linux04-{}", std::process::id()));
+        std::fs::create_dir_all(&base).expect("base");
+        let dest = base.join("payload");
+
+        let work = alloc_temp_dir(&dest).await.expect("alloc temp dir");
+        let mode = std::fs::metadata(&work).expect("stat").permissions().mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "the in-progress fetch tree is group/other accessible: {:o}",
+            mode
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A file destined to be private must never exist in a broader
+    /// mode, including *while it is still being written* — the
+    /// multi-chunk path holds the handle open across every chunk
+    /// fetch, so a throttled transfer widens that window at will.
+    #[cfg(unix)]
+    #[test]
+    fn a_private_file_is_never_world_readable_mid_write() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("net-linux04-f-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("secret");
+
+        let mut f = create_file_with_final_mode(&path, 0o600).expect("create");
+
+        // Stat BEFORE writing or closing: this is the state another
+        // local user would find mid-transfer.
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "a 0600-destined file was group/other accessible while still open: {:o}",
+            mode
+        );
+
+        f.write_all(b"payload").expect("write");
+        drop(f);
+
+        // And a manifest mode wider than the umask still gets there in
+        // the end — umask can only clear bits at creation, so the
+        // trailing chmod has to widen it back.
+        let wide = dir.join("public");
+        write_file(&wide, b"x", 0o644).expect("write_file");
+        let mode = std::fs::metadata(&wide).expect("stat").permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o644,
+            "a 0644 manifest mode did not survive the umask-narrowed creation: {:o}",
+            mode
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Platform-independent: the two creation helpers must actually
+    /// produce a usable directory and a writable file everywhere, not
+    /// just on the platform whose modes they set.
+    #[test]
+    fn creation_helpers_work_on_every_platform() {
+        let dir = std::env::temp_dir().join(format!(
+            "net-linux04-x-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        create_dir_private(&dir).expect("create_dir_private");
+        assert!(dir.is_dir());
+
+        let path = dir.join("f");
+        {
+            use std::io::Write as _;
+            let mut f = create_file_with_final_mode(&path, 0o600).expect("create file");
+            f.write_all(b"hello").expect("write");
+        }
+        assert_eq!(std::fs::read(&path).expect("read"), b"hello");
+
+        // Truncating re-create: a retried fetch must not append to a
+        // partial file from the previous attempt.
+        {
+            use std::io::Write as _;
+            let mut f = create_file_with_final_mode(&path, 0o600).expect("recreate");
+            f.write_all(b"hi").expect("write");
+        }
+        assert_eq!(std::fs::read(&path).expect("read"), b"hi");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
