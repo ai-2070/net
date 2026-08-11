@@ -29,45 +29,57 @@ The authority lane found no surviving vulnerability after reviewing Noise and ro
 
 The combined review retained:
 
-- two high-severity findings;
-- three medium or medium-to-high findings;
+- one high-severity finding;
+- four medium, medium-to-high, or deployment-dependent findings;
 - one low-severity finding;
 - one medium-severity candidate requiring a load witness.
+
+The aggregator-registry item was initially overstated as a high-severity arbitrary-workload administration defect. Source re-review established that its templates instantiate only configured capability/reservation fold-summary workers. This packet corrects that item below.
 
 No confirmed memory-corruption, FFI use-after-free, malformed-parser panic, or deadlock vulnerability was established by the completed primary review lanes. The extended unsafe/FFI specialist run was still pending when this packet was frozen; any independent findings from that run must be recorded in a separate follow-on report rather than silently appended here.
 
 ---
 
-## SEC-01 — Any admitted mesh participant can administer the aggregator daemon
+## SEC-01 — Aggregator registry uses mesh admission as its only operator boundary
 
-**Severity:** High  
-**CWE:** CWE-862, Missing Authorization  
-**Confidence:** High  
-**Status:** Confirmed production path; inverse authorization witness required before repair
+**Severity:** Medium, deployment-dependent
+**CWE:** CWE-862 only when ordinary mesh members are outside the intended aggregation-operator trust set
+**Confidence:** High on mechanism; security classification depends on deployment intent
+**Status:** Corrected after source re-review; authority decision and bounded-impact witnesses required
 
-### Violated invariant
+### Corrected system boundary
 
-Mesh membership must not automatically grant operational control over daemon workloads. Administrative mutation requires an explicit authority decision separate from transport admission.
+The aggregator daemon is a specialized fold reducer, not an arbitrary workload host. Its built-in templates configure only:
 
-### Attacker prerequisite
+- a source subnet;
+- capability and/or reservation fold kinds;
+- a summary interval;
+- a replica count.
 
-Any node able to complete the mesh handshake, including a lower-trust or compromised participant possessing the mesh PSK and responder public key. No operator identity, ADMIN token, capability, or caller allowlist is required by the current handler.
+The workers read already-admitted `CapabilityFold` and `ReservationFold` state and publish bucketed `SummaryAnnouncement` rows such as `idle`, `busy`, `reserved`, and `faulty`:
 
-### Production path
+```text
+net/crates/net/src/adapter/net/behavior/aggregator/daemon.rs:366-411
+net/crates/net/src/adapter/net/behavior/aggregator/summarizer.rs:99-160
+```
 
-The aggregator daemon installs the full registry handler, including spawn, scale, and unregister behavior:
+Spawn, Scale, and Unregister create, resize, or stop only those operator-configured summary reducers. They do not mutate the signed source announcements, forge provider identities, or deploy arbitrary application code.
+
+### Actual control surface
+
+The daemon installs the registry handler, including Spawn, Scale, and Unregister:
 
 ```text
 net/crates/net/aggregator-daemon/src/lib.rs:326-334
 ```
 
-`RegistryHandler::call` decodes the request and invokes `answer` without evaluating authenticated caller identity, organization admission, an ADMIN capability, or a permission token:
+`RegistryHandler::call` does not evaluate caller identity or a separate operator token before invoking the configured operation:
 
 ```text
 net/crates/net/src/adapter/net/behavior/aggregator/registry_service.rs:366-385
 ```
 
-The mutating operations execute directly:
+The operations execute at:
 
 ```text
 Spawn:      net/crates/net/src/adapter/net/behavior/aggregator/registry_service.rs:405-428
@@ -75,50 +87,51 @@ Unregister: net/crates/net/src/adapter/net/behavior/aggregator/registry_service.
 Scale:      net/crates/net/src/adapter/net/behavior/aggregator/registry_service.rs:437-472
 ```
 
-The repository's aggregator design plan also records the missing authorization gate:
+### Security classification
 
-```text
-docs/internal/plans/SDK_AGGREGATOR_SUBNET_PLAN.md:559
-```
+If possession of the mesh PSK intentionally means trusted aggregation-operator membership, mesh admission is the administrative ACL and no missing-authorization vulnerability is established.
 
-### Impact
+If ordinary workers or providers share the PSK, a non-operator can:
 
-An admitted mesh participant can:
+- suppress aggregate visibility by stopping summary groups;
+- resize summary replicas;
+- repeatedly spawn distinct configured groups and create host-resource pressure;
+- inspect group status.
 
-- spawn arbitrary configured templates and consume resources;
-- scale workloads up or down;
-- stop arbitrary aggregator groups;
-- repeatedly disrupt aggregation availability.
+That is a deployment-dependent control-plane availability/resource issue. It does not compromise the authenticity of underlying capability or reservation announcements.
 
-The omission is server-side and shared by Rust, Node, Python, C, and Go clients. It is not binding-specific drift:
+### Existing evidence and required witnesses
 
-```text
-Node:   net/crates/net/bindings/node/src/aggregator.rs:183-222
-Python: net/crates/net/bindings/python/src/aggregator.rs:216-300
-C:      net/crates/net/src/ffi/aggregator.rs:25-29,151-172
-Go:     net/crates/net/go/aggregator.go:38-59
-```
-
-### Existing evidence
-
-The focused test below passed and proves that an RPC-shaped unregister request reaches group shutdown:
+The focused test below proves that an RPC-shaped Unregister reaches group shutdown:
 
 ```text
 adapter::net::behavior::aggregator::registry_service::tests::unregister_drives_group_shutdown_and_returns_existed_true
 ```
 
-That test does not prove authorization because the production handler has no authorization branch.
+Required next steps:
 
-### Required inverse witness
+1. Declare whether mesh admission intentionally confers aggregation-operator authority.
+2. If it does not, prove a lower-trust admitted member can invoke Spawn, Scale, and Unregister.
+3. Measure summary-availability impact and repeated distinct-name Spawn resource growth; do not assume unbounded impact without a quota witness.
+4. Preserve the invariant that signed source announcements and canonical folds remain untouched.
 
-1. Start the turnkey aggregator daemon with two admitted mesh participants: an operator and a lower-trust member.
-2. From the lower-trust member, invoke `List`, `Spawn`, `Scale`, and `Unregister` without an administrative grant.
-3. Prove that all mutating requests currently reach the handler and that at least one produces its live side effect.
-4. After repair, preserve only explicitly intended read access and prove every mutating request fails without the configured administrative authority.
+### Separate witness-needed seed disclosure
 
-### Minimal repair boundary
+`RegistryRequest::List` returns `group_seed`, which can derive replica entity keypairs:
 
-Require an ADMIN-scoped permission or signed entitlement on the aggregator registry service and enforce authenticated caller authority inside `RegistryHandler` before each mutating operation. Configure `List` independently if broad read access is intentional. The turnkey daemon must fail closed when no administrative ACL is configured.
+```text
+net/crates/net/src/adapter/net/behavior/aggregator/registry_service.rs:128-157
+net/crates/net/src/adapter/net/behavior/aggregator/registry_service.rs:500-505
+net/crates/net/src/adapter/net/compute/replica_group.rs:40-81
+```
+
+This is sensitive key material, but the audit did not prove that those replica identities can forge accepted summaries or exercise another security-bearing authority. Summary publication serializes a plain `SummaryAnnouncement` and calls the host `MeshNode::publish`:
+
+```text
+net/crates/net/src/adapter/net/behavior/aggregator/daemon.rs:433-452
+```
+
+Do not classify this as provider-key or summary-signature compromise until an end-to-end witness proves what possession of a derived replica key authorizes. Ordinary status output should nevertheless omit private seed material unless exact key-export authority is intended.
 
 ---
 
@@ -590,11 +603,11 @@ These ruled-out leads are not security acceptance for every authority feature co
 
 ## Repair and acceptance order
 
-1. **SEC-01:** aggregator administrative authorization.
-2. **SEC-02:** pingwave state caps, cleanup lifecycle, adjacent-session authentication/rate limiting, and bounded forwarding.
-3. **SEC-03:** transfer inspection and cancellation authorization.
-4. **SEC-04:** strip privileged mode bits from remote directory metadata.
-5. **SEC-05:** fail-closed credential-file permission and ACL enforcement.
+1. **SEC-02:** pingwave state caps, cleanup lifecycle, adjacent-session authentication/rate limiting, and bounded forwarding.
+2. **SEC-03:** transfer inspection and cancellation authorization.
+3. **SEC-04:** strip privileged mode bits from remote directory metadata.
+4. **SEC-05:** fail-closed credential-file permission and ACL enforcement.
+5. **SEC-01:** decide the aggregation-operator trust boundary, measure bounded-template resource impact, and separately witness the authority of leaked replica seeds.
 6. **SEC-07:** execute the congestion witness and repair if it survives.
 7. **SEC-06:** sanitize secret-bearing parser diagnostics.
 
