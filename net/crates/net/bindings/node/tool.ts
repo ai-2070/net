@@ -306,11 +306,19 @@ function _ensureFetchInstalled(rpc: TypedMeshRpc): ToolRegistryEntry {
  * Release the shared metadata service once the last tool on `rpc` is
  * gone. No-op while any tool is still registered.
  *
- * Deleting the WeakMap entry is load-bearing, not housekeeping: the
- * entry's `fetchHandle` is now closed, and a closed `ServeHandle` serves
- * nothing. Keeping the entry would let a later `serveTool` "reuse" a
- * dead registration and quietly serve a tool no peer could ever fetch
- * metadata for.
+ * Clearing `fetchHandle` is the load-bearing line. A closed `ServeHandle`
+ * serves nothing, and `_ensureFetchInstalled` early-returns on a truthy
+ * `fetchHandle` — so leaving the closed one in place makes the NEXT
+ * `serveTool` on this rpc skip installation and serve a tool whose
+ * metadata no peer can fetch. Not an error either side sees: the caller's
+ * `fetchToolMetadata` simply never answers.
+ *
+ * Deleting the WeakMap entry is housekeeping, and is described as such
+ * because a control says so — removing the delete alone leaves every
+ * witness green, while also removing the `fetchHandle = null` above hangs
+ * the live re-serve case out to its timeout. It still earns its line: an
+ * absent entry makes "no entry" mean "no tools" rather than "no tools, or
+ * an empty one", and drops the Map without waiting on the WeakMap.
  */
 function _closeRegistryIfEmpty(
   rpc: TypedMeshRpc,
@@ -319,9 +327,11 @@ function _closeRegistryIfEmpty(
   if (entry.registry.size !== 0) return
   entry.fetchHandle?.close()
   entry.fetchHandle = null
-  // Only unmap the entry this cleanup actually owns. A later round may
-  // already have installed a fresh one; deleting THAT would strand its
-  // metadata service with no path back to it.
+  // Only unmap the entry this cleanup actually owns. Defensive rather
+  // than reachable today: replacing an entry requires deleting it first,
+  // which requires it to have been empty, which requires every handle on
+  // it to have closed — and a handle closes once. Kept because the guard
+  // is one comparison and the alternative failure is silent.
   if (_toolRegistries.get(rpc) === entry) _toolRegistries.delete(rpc)
 }
 

@@ -86,18 +86,16 @@ no error saying so. And **`localAddr()` is how a `:0` bind becomes connectable**
 port `0` asks the OS to pick a free port, and the port it picked is knowable only
 by asking the node back.
 
+Replace the first two lines of the snippet above with these three, and leave the
+rest of it alone:
+
 ```typescript
 const host = await MeshNode.create({ bindAddr: '127.0.0.1:0', psk });
 const agent = await MeshNode.create({ bindAddr: '127.0.0.1:0', psk });
-
-const hostAddr = host.localAddr();   // e.g. '127.0.0.1:54417'
-
-const accepted = host.accept(agent.nodeId());
-await agent.connect(hostAddr, host.publicKey(), host.nodeId());
-await accepted;
+const HOST_ADDR = host.localAddr();   // e.g. '127.0.0.1:54417'
 ```
 
-Hard-coding the port, as the snippet above it does, is fine when you chose the
+Hard-coding the port, as the snippet above does, is fine when you chose the
 number and both sides already agree on it. `:0` plus `localAddr()` is what you
 want when you did not — in tests, and anywhere a fixed port would collide.
 

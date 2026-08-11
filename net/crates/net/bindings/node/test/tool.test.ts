@@ -848,6 +848,14 @@ describe('tool registry lifetime', () => {
     expect(rpc.closes(TOOL_METADATA_FETCH_SERVICE)).toBe(2)
   })
 
+  // Staged against the fake, and only reachable there: `MeshRpc.serve`
+  // goes to `MeshNode::serve_rpc(&service, …)`, which owns one
+  // registration per service name, so a live rpc is expected to refuse
+  // the second `serveTool` on a taken tool id rather than shadow it. The
+  // registry-side rule is pinned anyway, because the registry must not be
+  // the layer that decides: if that refusal ever softens, the identity
+  // check below is what keeps a stale handle from evicting the live
+  // descriptor and taking the shared metadata service down with it.
   it('re-registering one tool id does not let the older handle close the service', () => {
     const rpc = fakeToolRpc()
     const first = serveTool(rpc.rpc, { name: 'echo' }, echo)
