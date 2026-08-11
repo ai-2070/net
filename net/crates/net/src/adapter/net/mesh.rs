@@ -16941,6 +16941,19 @@ impl MeshNode {
         // (bounded retention of observation state), already shutdown-aware.
         let scoped = self.scoped_discovery.clone();
         let scoped_publication = self.scoped_publication.clone();
+        // SEC-02 — `ProximityGraph::cleanup` had no production caller.
+        // It evicts idle nodes and expired `(origin_id, seq)` dedup
+        // entries, both of which grow from attacker-chosen values in
+        // unauthenticated pingwaves; `sweep_stale_edges` already runs
+        // off the heartbeat tick, but nodes and the dedup cache were
+        // reclaimed only by tests. The admission caps added alongside
+        // this bound the growth; this is what gives the slots back, so
+        // a node that hits a cap recovers instead of staying wedged.
+        //
+        // Same home and rationale as the scoped-discovery sweep above:
+        // bounded retention of observation state, on a 60 s cadence,
+        // already shutdown-aware.
+        let proximity = self.proximity_graph.clone();
         let interval = self.config.capability_gc_interval;
         let dedup_retention =
             std::time::Duration::from_secs(2 * u64::from(CapabilityAnnouncement::DEFAULT_TTL_SECS));
@@ -16968,6 +16981,14 @@ impl MeshNode {
                             tracing::debug!(
                                 forgotten,
                                 "scoped discovery: swept fully-forgotten entries",
+                            );
+                        }
+                        let pruned = proximity.cleanup();
+                        if pruned.removed_nodes > 0 || pruned.removed_pingwaves > 0 {
+                            tracing::debug!(
+                                removed_nodes = pruned.removed_nodes,
+                                removed_pingwaves = pruned.removed_pingwaves,
+                                "proximity graph: swept idle nodes and dedup entries",
                             );
                         }
                     }
@@ -17997,6 +18018,13 @@ impl MeshNode {
                     .admit_pingwave_from(pw, from_graph_id, source);
                 let fwd_pw = match admission {
                     PingwaveAdmission::RejectedDuplicate => return,
+                    // SEC-02: the graph is at a cap, so this novel
+                    // pingwave grew no state. Installing a learned
+                    // route from it would put the origin in the
+                    // routing table anyway — the same unbounded,
+                    // attacker-chosen growth one map over — so the
+                    // refusal has to cover the route too.
+                    PingwaveAdmission::RejectedCapacity => return,
                     PingwaveAdmission::AcceptedNoForward => {
                         install_learned_route();
                         return;
