@@ -240,7 +240,15 @@ func unregisterDaemon(id uint64) {
 //export goComputeProcess
 func goComputeProcess(daemonID C.uint64_t, originHash C.uint64_t, sequence C.uint64_t,
 	payloadPtr *C.uint8_t, payloadLen C.size_t, outputs *C.net_compute_outputs_t,
-) C.int {
+) (code C.int) {
+	// First statement: the guard has to cover the handle lookup and
+	// the payload conversion too, not just `d.Process`. A peer-shaped
+	// payload reaches both.
+	defer func() {
+		if recoverCallback("compute.Process", recover()) {
+			code = -1
+		}
+	}()
 	d := lookupDaemon(uint64(daemonID))
 	if d == nil {
 		return -1
@@ -281,7 +289,32 @@ func goComputeProcess(daemonID C.uint64_t, originHash C.uint64_t, sequence C.uin
 }
 
 //export goComputeSnapshot
-func goComputeSnapshot(daemonID C.uint64_t, outPtr **C.uint8_t, outLen *C.size_t) C.int {
+func goComputeSnapshot(daemonID C.uint64_t, outPtr **C.uint8_t, outLen *C.size_t) (code C.int) {
+	// Guard first, then zero the outputs. The other order looks
+	// tempting — initialize before anything can panic — but it leaves
+	// the initialization itself unguarded, and a NULL `outPtr` from a
+	// misbehaving caller would panic there with nothing to catch it.
+	//
+	// The handler re-checks for nil because that same NULL `outPtr` is
+	// the most likely thing to have panicked; writing through it again
+	// inside the recover would panic a second time, mid-unwind, and
+	// take the process down by exactly the route this guard exists to
+	// close.
+	defer func() {
+		if recoverCallback("compute.Snapshot", recover()) {
+			if outPtr != nil {
+				*outPtr = nil
+			}
+			if outLen != nil {
+				*outLen = 0
+			}
+			code = -1
+		}
+	}()
+	// A recovered trampoline hands Rust a well-formed (empty) result
+	// rather than whatever the caller's stack happened to hold.
+	*outPtr = nil
+	*outLen = 0
 	d := lookupDaemon(uint64(daemonID))
 	if d == nil {
 		*outPtr = nil
@@ -321,7 +354,12 @@ func goComputeSnapshot(daemonID C.uint64_t, outPtr **C.uint8_t, outLen *C.size_t
 }
 
 //export goComputeRestore
-func goComputeRestore(daemonID C.uint64_t, statePtr *C.uint8_t, stateLen C.size_t) C.int {
+func goComputeRestore(daemonID C.uint64_t, statePtr *C.uint8_t, stateLen C.size_t) (code C.int) {
+	defer func() {
+		if recoverCallback("compute.Restore", recover()) {
+			code = -1
+		}
+	}()
 	d := lookupDaemon(uint64(daemonID))
 	if d == nil {
 		return -1

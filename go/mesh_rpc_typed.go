@@ -925,6 +925,17 @@ var (
 
 //export go_net_rpc_observer_trampoline
 func go_net_rpc_observer_trampoline(evt *C.RpcCallEventC) {
+	// An observer is a side-channel: it runs synchronously on the
+	// substrate dispatch thread and its result is not consumed. A
+	// panic therefore drops exactly one observation — the RPC it was
+	// observing has already completed and is unaffected. Before this
+	// guard it took the process down instead.
+	//
+	// Covers `rpcCallEventFromC` as well as the callback: that helper
+	// converts C pointers and lengths into Go strings and slices.
+	defer func() {
+		recoverCallback("rpc.Observer", recover())
+	}()
 	cb := currentObserver.Load()
 	if cb == nil || *cb == nil {
 		return

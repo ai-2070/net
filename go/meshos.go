@@ -772,7 +772,15 @@ func topGoMeshOsProcessTrampoline(
 	sequence C.uint64_t,
 	payloadPtr *C.uint8_t,
 	payloadLen C.size_t,
-) C.int {
+) (code C.int) {
+	// First statement: the guard must cover `meshosHandleFromCtx`
+	// (which panics on a deleted cgo.Handle) and the payload
+	// conversion, not only the call into user code.
+	defer func() {
+		if recoverCallback("meshos.Process", recover()) {
+			code = C.int(1)
+		}
+	}()
 	d := meshosHandleFromCtx(userCtx)
 	if d == nil {
 		return C.int(1)
@@ -811,6 +819,11 @@ func topGoMeshOsSnapshotTrampoline(
 	userCtx unsafe.Pointer,
 	emitCtx *C.NetMeshOsSnapshotEmitCtx,
 ) {
+	// No return value to set: a panic here means no emit call was
+	// made, which the Rust side already reads as "no snapshot".
+	defer func() {
+		recoverCallback("meshos.Snapshot", recover())
+	}()
 	d := meshosHandleFromCtx(userCtx)
 	if d == nil {
 		return
@@ -835,7 +848,12 @@ func topGoMeshOsRestoreTrampoline(
 	userCtx unsafe.Pointer,
 	payloadPtr *C.uint8_t,
 	payloadLen C.size_t,
-) C.int {
+) (code C.int) {
+	defer func() {
+		if recoverCallback("meshos.Restore", recover()) {
+			code = C.int(1)
+		}
+	}()
 	d := meshosHandleFromCtx(userCtx)
 	if d == nil {
 		return C.int(1)
@@ -857,6 +875,11 @@ func topGoMeshOsOnControlTrampoline(
 	gracePeriodMs C.uint64_t,
 	level C.float,
 ) {
+	// A control notification is fire-and-forget; a panicking handler
+	// loses that one notification and nothing else.
+	defer func() {
+		recoverCallback("meshos.OnControl", recover())
+	}()
 	d := meshosHandleFromCtx(userCtx)
 	if d == nil {
 		return
@@ -869,7 +892,16 @@ func topGoMeshOsOnControlTrampoline(
 }
 
 //export topGoMeshOsHealthTrampoline
-func topGoMeshOsHealthTrampoline(userCtx unsafe.Pointer) C.int {
+func topGoMeshOsHealthTrampoline(userCtx unsafe.Pointer) (health C.int) {
+	// A daemon whose health check panics is not healthy. Reporting
+	// HEALTHY here — the no-daemon default below — would hide a
+	// broken daemon from the very mechanism meant to surface it, so
+	// the panic maps to UNHEALTHY instead.
+	defer func() {
+		if recoverCallback("meshos.Health", recover()) {
+			health = C.int(C.NET_MESHOS_HEALTH_UNHEALTHY)
+		}
+	}()
 	d := meshosHandleFromCtx(userCtx)
 	if d == nil {
 		return C.int(C.NET_MESHOS_HEALTH_HEALTHY)
@@ -878,7 +910,15 @@ func topGoMeshOsHealthTrampoline(userCtx unsafe.Pointer) C.int {
 }
 
 //export topGoMeshOsSaturationTrampoline
-func topGoMeshOsSaturationTrampoline(userCtx unsafe.Pointer) C.float {
+func topGoMeshOsSaturationTrampoline(userCtx unsafe.Pointer) (saturation C.float) {
+	// Saturation drives placement. A panic reports 0 — the same
+	// value as "no daemon" — because claiming an unknown daemon is
+	// saturated would shed load it may well be able to take.
+	defer func() {
+		if recoverCallback("meshos.Saturation", recover()) {
+			saturation = C.float(0)
+		}
+	}()
 	d := meshosHandleFromCtx(userCtx)
 	if d == nil {
 		return C.float(0)
