@@ -106,8 +106,8 @@ provides `runner_cm(reader)` as a context manager; TypeScript provides
 `DisposableMeshQueryRunner` for the TC39 `using` protocol; Go requires
 `Free()` on the reader, query, runner and iterator.
 
-C consumers get the same surface through `net_meshdb.h` against the
-`libnet_meshdb` cdylib — see [Headers and Linking](/docs/sdk/c/headers-and-linking).
+C consumers get the same surface through `net_meshdb.h`, linked with `-lnet`
+like every other header — see [Headers and Linking](/docs/sdk/c/headers-and-linking).
 
 Errors surface as `MeshDbError`, with a parseable kind (`parseMeshDbErrorKind`
 in TypeScript).

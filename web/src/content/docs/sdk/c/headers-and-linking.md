@@ -53,7 +53,7 @@ of the table — it is the whole shipping model, and the reason is in
 handle model, and `#include`s it. The subnet-exported *caller* verb, `net_org_call_exported`, is declared
 in `net_org.h` because it takes the org client handle.
 
-## Building the libraries
+## Building the library
 
 ```bash
 cargo build --release -p net-ffi

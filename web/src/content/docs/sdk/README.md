@@ -16,7 +16,7 @@ Choose the language used by your application:
 | TypeScript | `@net-mesh/sdk`                        | Node.js with explicit async shutdown          | [TypeScript quickstart](/docs/sdk/typescript/quickstart) |
 | Python     | `net-mesh-sdk` / `net_sdk`             | Python async API over the native runtime      | [Python quickstart](/docs/sdk/python/quickstart)         |
 | Go         | `github.com/ai-2070/net/go`            | cgo binding with polling for bus events       | [Go quickstart](/docs/sdk/go/quickstart)                 |
-| C ABI      | generated headers and shared libraries | explicit ownership, polling, and return codes | [C quickstart](/docs/sdk/c/quickstart)                   |
+| C ABI      | generated headers over one `libnet`    | explicit ownership, polling, and return codes | [C quickstart](/docs/sdk/c/quickstart)                   |
 
 The language selector keeps the task sequence in one language where that surface
 exists:
