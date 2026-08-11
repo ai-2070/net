@@ -22,6 +22,10 @@ on:
       # headers, so a header change can break it without web/ being touched.
       - ".github/scripts/check-c-doc-snippets.py"
       - ".github/scripts/check-install-version.py"
+      # The one-library checker reads the skills tree and the docs tree.
+      # ci.yml's copy fires on `net/**` / `go/**` and cannot see either.
+      - ".claude/skills/**"
+      - ".github/scripts/check-one-library-docs.py"
       - "net/crates/net/include/**"
   pull_request:
     paths:
@@ -39,6 +43,10 @@ on:
       # headers, so a header change can break it without web/ being touched.
       - ".github/scripts/check-c-doc-snippets.py"
       - ".github/scripts/check-install-version.py"
+      # The one-library checker reads the skills tree and the docs tree.
+      # ci.yml's copy fires on `net/**` / `go/**` and cannot see either.
+      - ".claude/skills/**"
+      - ".github/scripts/check-one-library-docs.py"
       - "net/crates/net/include/**"
 
 jobs:
@@ -107,6 +115,23 @@ jobs:
       - name: Check the spine-symbol checker still catches defects
         working-directory: .
         run: .github/scripts/check-spine-symbols.py --self-test
+
+      # Also run in ci.yml's `go-tests`, and deliberately so. The checker
+      # scans four roots — `go/`, `net/crates/net/include/`, `.claude/skills/`
+      # and `web/src/content/docs/` — and no single workflow's path filter
+      # covers all four. ci.yml fires on `net/**` and `go/**`; this one fires
+      # on `web/**` and the skills tree. Without this copy, a docs page could
+      # reintroduce the exact sentence the checker exists to stop and nothing
+      # would go red: that is how "eleven headers and five shared libraries"
+      # survived a release on the C overview after the code side was clean.
+      #
+      # It is pure text against `git ls-files` — no toolchain, no network —
+      # so the duplication costs seconds.
+      - name: Guard — no doc claims a library that is not built
+        working-directory: .
+        run: |
+          python3 .github/scripts/check-one-library-docs.py
+          python3 .github/scripts/check-one-library-docs.py --self-test
 
       # Phase 1A made code blocks scroll rather than wrap, which was right and
       # has a cost nobody was watching: a line wider than the column silently

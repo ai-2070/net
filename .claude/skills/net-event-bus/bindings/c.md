@@ -3,10 +3,11 @@
 Read `../apis.md` first for the four surfaces and the cross-SDK rules. This page
 is only what is C-specific.
 
-## Headers and libraries — there is no single "C SDK"
+## Headers and the library — there is no single "C SDK"
 
-C is **ten headers over six shared libraries**, and picking the wrong pair is the
-first thing that goes wrong.
+C is **ten headers over one shared library**, `libnet` — as the last column
+below says on every row. Picking the wrong header is the first thing that goes
+wrong; picking the wrong library is not a mistake you can make.
 
 | Header | Guard | Surface | Link against |
 |---|---|---|---|

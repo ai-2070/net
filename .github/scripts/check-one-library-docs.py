@@ -17,11 +17,26 @@ actually has kept saying `Link with -lnet -lnet_compute`. Two test files and
 a published skill kept saying `cargo build -p net-<x>-ffi`, which is now an
 rlib and produces no library at all.
 
-Deliberately narrow. Only two forms are flagged, because only two are
+Deliberately narrow. Only three forms are flagged, because only three are
 unambiguously wrong wherever they appear:
 
-  1. a per-surface LINK FLAG   — `-lnet_rpc`, `-lnet_compute`
+  1. a per-surface LINK FLAG    — `-lnet_rpc`, `-lnet_compute`
   2. a per-surface BUILD TARGET — `cargo build ... -p net-rpc-ffi`
+  3. a COUNTED CLAIM of more than one shared library — "five shared libraries"
+
+The third was added after the code side had been clean for a release: the C
+overview still opened with "the ABI is split across eleven headers and five
+shared libraries", and the two flag/target patterns cannot see a sentence that
+names no flag and no target. A reader who believes that sentence goes looking
+for four libraries that do not exist, which is the same wasted afternoon the
+flag patterns were written to prevent — reached through prose instead.
+
+It requires a count AND an explicit library kind (`shared` / `static` /
+`dynamic` / `native`). Plain plural "libraries" is not enough: pages
+legitimately discuss other projects' libraries, and a checker that flagged
+those would report false positives and get switched off, which is how the real
+defect came back the first time. "One shared library" and any singular form
+pass, which is the sentence these pages should be saying.
 
 Everything else that mentions the old names is legitimate: `net_rpc.h` is a
 real header, `net_org_call` is a real symbol, `NET_ORG_ERR_*` are real
@@ -55,12 +70,29 @@ _SURFACES = "rpc|org|meshdb|meshos|deck|mcp|compute"
 
 _OPT_OUT = "one-library-docs: allow"
 
+# Counts greater than one, spelled either way. `one` / `a` / `1` are absent on
+# purpose: "one shared library" is the true sentence and must pass.
+_PLURAL_COUNT = (
+    r"two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
+    r"several|multiple|[2-9]|\d{2,}"
+)
+# `shared` and friends are required. Without one of them the phrase is just
+# "N libraries", which is a sentence about somebody else's dependencies as
+# often as it is about ours.
+_LIB_KIND = r"shared|static|dynamic|native"
+
 _PATTERNS = {
     # `-lnet_rpc`, `-lnet_mcp_ffi`. A space after `-l` is not valid here and
     # is not matched.
     "link-flag": re.compile(rf"-lnet_(?:{_SURFACES})(?:_ffi)?(?![\w])"),
     # `-p net-rpc-ffi`, as passed to cargo.
     "build-target": re.compile(rf"-p\s+net-(?:{_SURFACES})-ffi(?![\w-])"),
+    # "five shared libraries", "3 dynamic libraries". Singular "library" is
+    # matched too so a mistyped "two shared library" is not a hole.
+    "library-count": re.compile(
+        rf"\b(?:{_PLURAL_COUNT})\s+(?:{_LIB_KIND})\s+librar(?:y|ies)\b",
+        re.IGNORECASE,
+    ),
 }
 
 _ADVICE = {
@@ -71,6 +103,10 @@ _ADVICE = {
     "build-target": (
         "that crate is an rlib linked into `libnet`; building it produces "
         "nothing to link. Say `cargo build --release -p net-ffi`."
+    ),
+    "library-count": (
+        "there is one shared library, `libnet`. The headers are many; the "
+        "library is not. Say `one shared library`, or name `libnet`."
     ),
 }
 
@@ -137,7 +173,7 @@ def check() -> int:
             )
 
     if problems:
-        print(f"{len(problems)} instruction(s) naming a library that is not built:\n")
+        print(f"{len(problems)} claim(s) about a library that is not built:\n")
         print("\n".join(problems))
         print(
             f"\nIf a mention is a deliberate negation or history, put "
@@ -145,7 +181,10 @@ def check() -> int:
         )
         return 1
 
-    print(f"All {len(files)} consumer-facing files build and link one library.")
+    print(
+        f"All {len(files)} consumer-facing files: no per-surface build or link "
+        f"instruction, and no counted claim of more than one shared library."
+    )
     return 0
 
 
@@ -158,20 +197,39 @@ See `net_rpc.h` for the nRPC surface; call `net_org_call`.
 Symbols live in `libnet_rpc` historically; the header explains why.
 cargo build --release -p net-ffi
 gcc -o app app.c -L target/release -lnet -lpthread -ldl -lm
+The ABI is split across eleven headers and five shared libraries.
+Link the three shared libraries required by your application.
+Eleven headers, one shared library.
+Everything is compiled into libnet.
+Bundled with two libraries from upstream, plus the C runtime.
 """
 
 
 def self_test() -> int:
-    """The matcher must catch both forms, and nothing else."""
+    """The matcher must catch all three forms, and nothing else."""
     print("==> self-test")
     got = sorted((line, matched) for line, _kind, matched in scan(_SELF_TEST))
-    expected = sorted([(1, "-lnet_compute"), (2, "-p net-mcp-ffi")])
+    expected = sorted(
+        [
+            (1, "-lnet_compute"),
+            (2, "-p net-mcp-ffi"),
+            # The sentence the C overview actually shipped, and the same
+            # claim in imperative form. Line 11 proves the true sentence
+            # ("one shared library") is not collateral damage, line 12 that
+            # naming `libnet` is fine, and line 13 that a plural with no
+            # library KIND — somebody else's dependencies — is left alone.
+            (9, "five shared libraries"),
+            (10, "three shared libraries"),
+        ]
+    )
 
     if got != expected:
         print(f"FAIL  matched {got}, expected {expected}")
         return 1
 
     print("  ok    per-surface link flag and build target caught")
+    print("  ok    counted multi-shared-library prose caught, both word and count-first")
+    print("  ok    `one shared library`, `libnet`, and uncounted plurals pass")
     print("  ok    opt-out honoured; headers, symbols and `libnet_rpc` prose ignored")
     return 0
 
