@@ -3,6 +3,7 @@
 //! Dispatches inbound migration messages (subprotocol 0x0500) to the
 //! appropriate handler: orchestrator, source, or target.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -83,6 +84,99 @@ pub struct OutboundMigrationMessage {
     pub payload: Vec<u8>,
 }
 
+/// Which peers may drive a migration against daemons hosted on this
+/// node — the source-side authority gate for `TakeSnapshot`.
+///
+/// # Why this exists
+///
+/// `TakeSnapshot` is the one migration message with no prior state to
+/// authenticate against: every other inbound type is checked against a
+/// principal recorded earlier in the migration (see the `WrongPeer`
+/// gates on `SnapshotReady`, `CleanupComplete`, `ActivateTarget`).
+/// Being first, it *establishes* the orchestrator binding — so without
+/// a policy, whichever admitted peer sends it first becomes the trusted
+/// orchestrator for that daemon.
+///
+/// That is not a small privilege. Handling `TakeSnapshot` snapshots the
+/// named daemon and returns the chunks to the sender, and when identity
+/// transport is live the source seals the daemon's private Ed25519 seed
+/// to the `target_node` the *sender* chose. A peer that names itself as
+/// target therefore receives the daemon's signing key. `daemon_origin`
+/// is an operational identifier, not a secret, so knowing which daemon
+/// to name is not a meaningful barrier.
+///
+/// Mesh admission alone is the wrong boundary for that: completing the
+/// handshake proves PSK possession and nothing about operator intent.
+///
+/// # Default
+///
+/// [`LocalOnly`](Self::LocalOnly) — remote orchestration is refused
+/// until an operator names the nodes that may drive it. This is a
+/// deliberate fail-closed default and a **breaking change** for
+/// deployments that migrate daemons between nodes: the source must now
+/// name its orchestrators (or opt into
+/// [`AnyAdmittedPeer`](Self::AnyAdmittedPeer)) for a cross-node
+/// migration to be accepted.
+///
+/// # Scope
+///
+/// This is a deployment control, not a transferable migration
+/// authority. It answers "which nodes may orchestrate here" and cannot
+/// express delegation, expiry, or per-daemon scope. An issuer-signed
+/// migration entitlement — binding subject, source origin, target,
+/// permitted phases, validity and generation — remains the complete
+/// design; this closes the open door in the meantime.
+#[derive(Debug, Clone, Default)]
+pub enum MigrationOrchestratorPolicy {
+    /// Only this node may orchestrate. A `TakeSnapshot` from any
+    /// remote peer is refused before the daemon is snapshotted and
+    /// before any migration state is recorded.
+    ///
+    /// Locally-orchestrated migrations still work: the dispatcher's
+    /// loopback path delivers self-addressed messages with
+    /// `from_node == local_node_id`.
+    #[default]
+    LocalOnly,
+    /// This node plus an explicit set of operator-nominated node IDs.
+    ///
+    /// An empty set is equivalent to [`LocalOnly`](Self::LocalOnly) —
+    /// it is not a synonym for "allow all", which would invert the
+    /// meaning of an unpopulated config file.
+    Allowlist(Arc<HashSet<u64>>),
+    /// Any peer that completed the mesh handshake may orchestrate.
+    ///
+    /// This is the pre-0.35 behaviour and reopens the finding above.
+    /// Defensible only when mesh admission *is* the operator boundary
+    /// — a single-tenant mesh whose PSK is held exclusively by trusted
+    /// operators. If ordinary workloads or providers hold the PSK, do
+    /// not use this.
+    AnyAdmittedPeer,
+}
+
+impl MigrationOrchestratorPolicy {
+    /// Build an [`Allowlist`](Self::Allowlist) from anything iterable.
+    pub fn allowlist<I: IntoIterator<Item = u64>>(nodes: I) -> Self {
+        Self::Allowlist(Arc::new(nodes.into_iter().collect()))
+    }
+
+    /// Whether `from_node` may orchestrate a migration here, given
+    /// that this node is `local_node_id`.
+    ///
+    /// The local node is always permitted regardless of variant: a
+    /// policy that locked out the node's own orchestrator would break
+    /// local-source migration without closing any remote path.
+    pub fn permits(&self, from_node: u64, local_node_id: u64) -> bool {
+        if from_node == local_node_id {
+            return true;
+        }
+        match self {
+            Self::LocalOnly => false,
+            Self::Allowlist(nodes) => nodes.contains(&from_node),
+            Self::AnyAdmittedPeer => true,
+        }
+    }
+}
+
 /// Handles inbound migration subprotocol messages.
 ///
 /// Routes each message type to the orchestrator, source handler, or target
@@ -157,6 +251,12 @@ pub type EnvelopeUnsealFn = Arc<
 /// | `pre_cleanup`     | source   | source-side Unsubscribe teardown           |
 /// | `readiness`       | target   | gate inbound migrations on runtime state   |
 /// | `failure`         | source   | surface structured reason to SDK caller    |
+/// | `orchestrator_policy` | source | who may drive a migration against us   |
+///
+/// `orchestrator_policy` is not an `Option`: its `Default` is the
+/// fail-closed [`MigrationOrchestratorPolicy::LocalOnly`], so a test
+/// or caller that omits it gets the safe variant rather than an
+/// implicit "no policy configured, allow everything".
 #[derive(Default, Clone)]
 pub struct MigrationHandlerHooks {
     /// Identity-transport context. `None` = envelopes ignored
@@ -174,6 +274,9 @@ pub struct MigrationHandlerHooks {
     /// Source-side failure observer — surfaces structured reason
     /// codes to the SDK.
     pub failure: Option<FailureCallback>,
+    /// Source-side authority gate for inbound `TakeSnapshot`. See
+    /// [`MigrationOrchestratorPolicy`]; defaults to `LocalOnly`.
+    pub orchestrator_policy: MigrationOrchestratorPolicy,
 }
 
 /// Dispatcher for migration subprotocol (`0x0500`) messages.
@@ -227,6 +330,10 @@ pub struct MigrationSubprotocolHandler {
     /// processed (orchestrator aborted) but the SDK can't
     /// distinguish retriable (NotReady) from terminal.
     failure_callback: Option<FailureCallback>,
+    /// Source-side authority gate consulted before an inbound
+    /// `TakeSnapshot` is allowed to snapshot a local daemon. See
+    /// [`MigrationOrchestratorPolicy`].
+    orchestrator_policy: MigrationOrchestratorPolicy,
 }
 
 impl MigrationSubprotocolHandler {
@@ -273,7 +380,13 @@ impl MigrationSubprotocolHandler {
             pre_cleanup_callback: hooks.pre_cleanup,
             readiness_callback: hooks.readiness,
             failure_callback: hooks.failure,
+            orchestrator_policy: hooks.orchestrator_policy,
         }
+    }
+
+    /// The source-side authority gate this handler was built with.
+    pub fn orchestrator_policy(&self) -> &MigrationOrchestratorPolicy {
+        &self.orchestrator_policy
     }
 
     /// Handle an inbound migration message.
@@ -301,6 +414,56 @@ impl MigrationSubprotocolHandler {
                 daemon_origin,
                 target_node,
             } => {
+                // Authority gate. `TakeSnapshot` is the message that
+                // *establishes* the orchestrator binding, so unlike
+                // the `WrongPeer` gates below there is no recorded
+                // principal to check against — only policy. Without
+                // this, the first admitted peer to send it becomes
+                // the trusted orchestrator, and handling the message
+                // hands them the daemon's state plus (under identity
+                // transport) its private key sealed to a target they
+                // chose. See `MigrationOrchestratorPolicy`.
+                //
+                // Refuse BEFORE `start_snapshot`: that call runs the
+                // user's `MeshDaemon::snapshot()` and records source
+                // migration state, so an unauthorized sender must not
+                // reach it. Refusing later would still leak the
+                // snapshot side-effect and leave `AlreadyMigrating`
+                // wedged against the legitimate orchestrator — which
+                // is a denial-of-service in its own right.
+                if !self
+                    .orchestrator_policy
+                    .permits(from_node, self.local_node_id)
+                {
+                    tracing::warn!(
+                        from = format!("{:#x}", from_node),
+                        origin = format!("{:#x}", daemon_origin),
+                        target = format!("{:#x}", target_node),
+                        policy = ?self.orchestrator_policy,
+                        "refused TakeSnapshot from an unauthorized orchestrator",
+                    );
+                    // Answer rather than drop. A silent drop is
+                    // indistinguishable from a lost packet, so a
+                    // misconfigured-but-legitimate orchestrator would
+                    // retry until timeout with nothing to diagnose.
+                    // The reply says only that this node refused —
+                    // it does not disclose whether `daemon_origin`
+                    // is hosted here, so it is not a probe oracle.
+                    let reason =
+                        crate::adapter::net::compute::MigrationFailureReason::StateFailed(format!(
+                            "migration refused: node {from_node:#x} is not an authorized \
+                             orchestrator for this node"
+                        ));
+                    outbound.push(OutboundMigrationMessage {
+                        dest_node: from_node,
+                        payload: wire::encode(&MigrationMessage::MigrationFailed {
+                            daemon_origin,
+                            reason,
+                        })?,
+                    });
+                    return Ok(outbound);
+                }
+
                 // We are the source — take snapshot and reply.
                 // Record `from_node` as the orchestrator: it's the node
                 // that sent us TakeSnapshot, and replies (SnapshotReady,
@@ -1343,7 +1506,14 @@ mod tests {
         };
         let encoded = wire::encode(&msg).unwrap();
 
-        let outbound = handler.handle_message(&encoded, 0x3333).unwrap();
+        // Orchestrated locally. This test used to drive the message
+        // from a remote 0x3333 and assert a snapshot came back — i.e.
+        // it asserted the AUTH-01 behaviour, that an arbitrary peer
+        // can snapshot a local daemon. The dispatch mechanics it
+        // actually covers are unchanged; only the sender moved to one
+        // the default policy permits. `MigrationOrchestratorPolicy`'s
+        // own tests cover the remote-sender cases.
+        let outbound = handler.handle_message(&encoded, 0x1111).unwrap();
         assert!(!outbound.is_empty());
 
         // Should get SnapshotReady back
@@ -1600,6 +1770,12 @@ mod tests {
             0x1111,
             MigrationHandlerHooks {
                 identity: Some(ctx),
+                // This test is about seal failure, not authority, so
+                // the fictional orchestrator has to get past the
+                // `TakeSnapshot` gate to reach the seal at all.
+                orchestrator_policy: MigrationOrchestratorPolicy::allowlist([
+                    orchestrator_node_id
+                ]),
                 ..Default::default()
             },
         );
@@ -1985,5 +2161,260 @@ mod tests {
              StandbyGroup in the MigrationFailed arm. Add the rollback call \
              AND update this test."
         );
+    }
+
+    // ── AUTH-01: source-side orchestrator authority ──────────────
+    //
+    // `TakeSnapshot` is the message that establishes the orchestrator
+    // binding, so it cannot be checked against a recorded principal
+    // the way `SnapshotReady` / `CleanupComplete` / `ActivateTarget`
+    // are. Before this gate existed, the first admitted peer to send
+    // one became the trusted orchestrator for that daemon — and
+    // handling it returns the daemon's snapshot to the sender and,
+    // under identity transport, seals the daemon's private Ed25519
+    // seed to whatever `target_node` the sender named.
+
+    /// Build a source-side fixture: one registered stateful daemon
+    /// plus an identity context whose `peer_static_lookup` counts how
+    /// many times it is consulted.
+    ///
+    /// The counter is the sharp part. Asserting only "no
+    /// `SnapshotReady` came back" would still pass if the gate ran
+    /// after `maybe_seal_envelope` — the snapshot and the seal would
+    /// both have happened and merely not been sent. A lookup count of
+    /// zero proves the source never even picked a seal recipient, so
+    /// no key material was prepared for the caller.
+    fn authority_fixture(
+        local_node_id: u64,
+        policy: MigrationOrchestratorPolicy,
+    ) -> (
+        MigrationSubprotocolHandler,
+        Arc<MigrationSourceHandler>,
+        Arc<DaemonRegistry>,
+        u64,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use crate::adapter::net::state::snapshot::StateSnapshot;
+        use std::sync::atomic::AtomicUsize;
+        use x25519_dalek::{PublicKey as X25519Pub, StaticSecret as X25519Secret};
+
+        let mut seed = [0u8; 32];
+        getrandom::fill(&mut seed).unwrap();
+        let attacker_priv = X25519Secret::from(seed);
+        let attacker_pub = *X25519Pub::from(&attacker_priv).as_bytes();
+
+        let kp = EntityKeypair::generate();
+        let origin = kp.origin_hash();
+        let reg = Arc::new(DaemonRegistry::new());
+        reg.register(DaemonHost::new(
+            Box::new(TestDaemon { value: 42 }),
+            kp,
+            DaemonHostConfig::default(),
+        ))
+        .unwrap();
+
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let lookups_for_ctx = lookups.clone();
+        let ctx = MigrationIdentityContext {
+            unseal_snapshot: Arc::new(move |snap: &StateSnapshot| {
+                snap.open_identity_envelope(&attacker_priv)
+            }),
+            // Hands out a usable static for ANY node — the most
+            // permissive lookup possible, so a seal that gets this
+            // far always succeeds in picking a recipient.
+            peer_static_lookup: Arc::new(move |_nid| {
+                lookups_for_ctx.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(attacker_pub)
+            }),
+        };
+
+        let orch = Arc::new(MigrationOrchestrator::new(reg.clone(), local_node_id));
+        let source = Arc::new(MigrationSourceHandler::new(reg.clone()));
+        let target = Arc::new(MigrationTargetHandler::new(reg.clone()));
+        let handler = MigrationSubprotocolHandler::with_hooks(
+            orch,
+            source.clone(),
+            target,
+            local_node_id,
+            MigrationHandlerHooks {
+                identity: Some(ctx),
+                orchestrator_policy: policy,
+                ..Default::default()
+            },
+        );
+        (handler, source, reg, origin, lookups)
+    }
+
+    fn take_snapshot_bytes(daemon_origin: u64, target_node: u64) -> Vec<u8> {
+        wire::encode(&MigrationMessage::TakeSnapshot {
+            daemon_origin,
+            target_node,
+        })
+        .unwrap()
+    }
+
+    /// RED witness for AUTH-01. An admitted-but-unapproved peer names
+    /// itself as `target_node` and asks for a daemon's snapshot.
+    ///
+    /// Pre-fix this returned `SnapshotReady` chunks addressed to the
+    /// attacker, carrying the daemon's state and an identity envelope
+    /// sealed to the attacker's X25519 key. Post-fix the request is
+    /// refused before any of that happens.
+    #[test]
+    fn migration_take_snapshot_rejects_unapproved_orchestrator() {
+        let local: u64 = 0x1111;
+        let attacker: u64 = 0xBAD5;
+        let (handler, source, reg, origin, lookups) =
+            authority_fixture(local, MigrationOrchestratorPolicy::LocalOnly);
+
+        let outbound = handler
+            .handle_message(&take_snapshot_bytes(origin, attacker), attacker)
+            .expect("a refusal is an answer, not a dispatcher error");
+
+        // 1. Nothing carrying daemon state goes anywhere.
+        for frame in &outbound {
+            match wire::decode(&frame.payload).unwrap() {
+                MigrationMessage::SnapshotReady { .. } => panic!(
+                    "unapproved orchestrator {attacker:#x} received a SnapshotReady — \
+                     this is the AUTH-01 disclosure"
+                ),
+                MigrationMessage::MigrationFailed { .. } => {}
+                other => panic!("unexpected reply to a refused TakeSnapshot: {other:?}"),
+            }
+        }
+
+        // 2. Exactly one refusal, addressed to the caller.
+        assert_eq!(outbound.len(), 1, "expected a single MigrationFailed reply");
+        assert_eq!(outbound[0].dest_node, attacker);
+        match wire::decode(&outbound[0].payload).unwrap() {
+            MigrationMessage::MigrationFailed { reason, .. } => {
+                let msg = format!("{reason}");
+                assert!(
+                    msg.contains("not an authorized orchestrator"),
+                    "refusal should name the reason so a misconfigured operator can \
+                     diagnose it; got: {msg}"
+                );
+            }
+            other => panic!("expected MigrationFailed, got {other:?}"),
+        }
+
+        // 3. No seal recipient was ever looked up — no key material
+        //    was prepared for the caller.
+        assert_eq!(
+            lookups.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "peer_static_lookup ran during a refused TakeSnapshot, so the source got \
+             far enough to pick an identity-envelope recipient"
+        );
+
+        // 4. No migration state was recorded. A refusal that still
+        //    claimed the origin would let any peer wedge the daemon
+        //    against its legitimate orchestrator with AlreadyMigrating.
+        assert!(
+            source.phase(origin).is_none(),
+            "refused TakeSnapshot left source-side migration state behind"
+        );
+
+        // 5. The daemon is untouched and still hosted.
+        assert!(reg.contains(origin), "daemon must remain registered");
+
+        // 6. The legitimate orchestrator is not locked out afterwards.
+        let recovery = handler
+            .handle_message(&take_snapshot_bytes(origin, 0x2222), local)
+            .expect("local orchestrator must still be able to migrate");
+        assert!(
+            recovery.iter().any(|f| matches!(
+                wire::decode(&f.payload),
+                Ok(MigrationMessage::SnapshotReady { .. })
+            )),
+            "the attacker's refused attempt must not poison the real migration path"
+        );
+    }
+
+    /// Positive control: the operator-nominated orchestrator is
+    /// served. A gate that refused everyone would pass the RED test
+    /// above while breaking migration entirely.
+    #[test]
+    fn migration_take_snapshot_accepts_allowlisted_orchestrator() {
+        let control_plane: u64 = 0xC0FFEE;
+        let (handler, source, _reg, origin, lookups) = authority_fixture(
+            0x1111,
+            MigrationOrchestratorPolicy::allowlist([control_plane]),
+        );
+
+        let outbound = handler
+            .handle_message(&take_snapshot_bytes(origin, 0x2222), control_plane)
+            .expect("allowlisted orchestrator must be served");
+
+        assert!(
+            outbound.iter().any(|f| matches!(
+                wire::decode(&f.payload),
+                Ok(MigrationMessage::SnapshotReady { .. })
+            )),
+            "allowlisted orchestrator got no SnapshotReady"
+        );
+        assert!(
+            lookups.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "the accepted path should have consulted peer_static_lookup to seal"
+        );
+        assert!(
+            source.phase(origin).is_some(),
+            "accepted TakeSnapshot must record source-side migration state"
+        );
+    }
+
+    /// A locally-orchestrated migration still works under the
+    /// fail-closed default: the dispatcher's loopback path delivers
+    /// self-addressed messages with `from_node == local_node_id`.
+    #[test]
+    fn migration_take_snapshot_from_local_node_survives_local_only() {
+        let local: u64 = 0x1111;
+        let (handler, _source, _reg, origin, _lookups) =
+            authority_fixture(local, MigrationOrchestratorPolicy::LocalOnly);
+
+        let outbound = handler
+            .handle_message(&take_snapshot_bytes(origin, 0x2222), local)
+            .expect("local orchestration must survive the default policy");
+        assert!(
+            outbound.iter().any(|f| matches!(
+                wire::decode(&f.payload),
+                Ok(MigrationMessage::SnapshotReady { .. })
+            )),
+            "LocalOnly must not break a migration this node orchestrates itself"
+        );
+    }
+
+    /// The policy's own truth table, including the two cases most
+    /// likely to be got wrong by a later edit.
+    #[test]
+    fn orchestrator_policy_permits_only_what_it_names() {
+        let local: u64 = 0x1111;
+        let other: u64 = 0x2222;
+
+        let local_only = MigrationOrchestratorPolicy::LocalOnly;
+        assert!(local_only.permits(local, local));
+        assert!(!local_only.permits(other, local));
+
+        let allowed = MigrationOrchestratorPolicy::allowlist([other]);
+        assert!(allowed.permits(other, local));
+        assert!(allowed.permits(local, local), "local is always permitted");
+        assert!(!allowed.permits(0x3333, local));
+
+        // An empty allowlist is the unconfigured case. It must mean
+        // "nobody remote", not "everybody" — otherwise an operator
+        // who writes the config key but leaves the list empty gets
+        // the wide-open behaviour they were trying to close.
+        let empty = MigrationOrchestratorPolicy::allowlist([]);
+        assert!(!empty.permits(other, local));
+        assert!(empty.permits(local, local));
+
+        let any = MigrationOrchestratorPolicy::AnyAdmittedPeer;
+        assert!(any.permits(other, local));
+        assert!(any.permits(local, local));
+
+        // Default must be the fail-closed variant. If someone
+        // reorders the enum or moves `#[default]`, every deployment
+        // that never set a policy silently reopens AUTH-01.
+        assert!(!MigrationOrchestratorPolicy::default().permits(other, local));
     }
 }

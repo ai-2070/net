@@ -185,9 +185,9 @@ pub use stream::{
 };
 pub use subnet::{DropReason, ForwardDecision, SubnetGateway, SubnetId, SubnetPolicy, SubnetRule};
 pub use subprotocol::{
-    negotiate, MigrationSubprotocolHandler, NegotiatedSet, OutboundMigrationMessage,
-    SubprotocolDescriptor, SubprotocolManifest, SubprotocolRegistry, SubprotocolVersion,
-    SUBPROTOCOL_NEGOTIATION,
+    negotiate, MigrationHandlerHooks, MigrationOrchestratorPolicy, MigrationSubprotocolHandler,
+    NegotiatedSet, OutboundMigrationMessage, SubprotocolDescriptor, SubprotocolManifest,
+    SubprotocolRegistry, SubprotocolVersion, SUBPROTOCOL_NEGOTIATION,
 };
 pub use swarm::{
     Capabilities, CapabilityAd, EdgeInfo, GraphStats, LocalGraph, NodeInfo, Pingwave,

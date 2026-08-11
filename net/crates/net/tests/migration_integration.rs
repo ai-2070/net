@@ -391,7 +391,9 @@ fn test_start_migration_auto_no_targets() {
 #[test]
 fn test_subprotocol_handler_snapshot_ready_dispatch() {
     use net::adapter::net::compute::orchestrator::wire;
-    use net::adapter::net::subprotocol::MigrationSubprotocolHandler;
+    use net::adapter::net::subprotocol::{
+        MigrationHandlerHooks, MigrationOrchestratorPolicy, MigrationSubprotocolHandler,
+    };
 
     let reg = Arc::new(DaemonRegistry::new());
     let (_, origin) = register_counter_daemon(&reg, 25);
@@ -400,7 +402,22 @@ fn test_subprotocol_handler_snapshot_ready_dispatch() {
     let source = Arc::new(MigrationSourceHandler::new(reg.clone()));
     let target = Arc::new(MigrationTargetHandler::new(reg.clone()));
 
-    let handler = MigrationSubprotocolHandler::new(orch.clone(), source, target, 0x1111);
+    // Remote orchestrator at 0x3333, named explicitly. `TakeSnapshot`
+    // from an un-named peer is refused by the default policy — this
+    // test predates that gate and used to rely on the absence of one,
+    // which was AUTH-01. Naming the orchestrator keeps the test's
+    // actual subject (the dispatch chain) intact and doubles as the
+    // integration-level positive control for the allowlist.
+    let handler = MigrationSubprotocolHandler::with_hooks(
+        orch.clone(),
+        source,
+        target,
+        0x1111,
+        MigrationHandlerHooks {
+            orchestrator_policy: MigrationOrchestratorPolicy::allowlist([0x3333]),
+            ..Default::default()
+        },
+    );
 
     // Send TakeSnapshot → should get SnapshotReady back
     let take_msg = MigrationMessage::TakeSnapshot {

@@ -2689,8 +2689,9 @@ use net::adapter::net::compute::orchestrator::wire as migration_wire;
 use net::adapter::net::state::causal::CausalEvent;
 use net::adapter::net::{
     DaemonError, DaemonFactoryRegistry, DaemonHost, DaemonHostConfig, DaemonRegistry, MeshDaemon,
-    MigrationMessage, MigrationOrchestrator, MigrationPhase, MigrationSourceHandler,
-    MigrationSubprotocolHandler, MigrationTargetHandler, SUBPROTOCOL_MIGRATION,
+    MigrationHandlerHooks, MigrationMessage, MigrationOrchestrator, MigrationOrchestratorPolicy,
+    MigrationPhase, MigrationSourceHandler, MigrationSubprotocolHandler, MigrationTargetHandler,
+    SUBPROTOCOL_MIGRATION,
 };
 
 /// Simple stateful daemon for migration testing.
@@ -2768,11 +2769,18 @@ async fn test_migration_snapshot_over_wire() {
     let orchestrator_b = Arc::new(MigrationOrchestrator::new(registry_b.clone(), nid_b));
     let source_b = Arc::new(MigrationSourceHandler::new(registry_b.clone()));
     let target_b = Arc::new(MigrationTargetHandler::new(registry_b.clone()));
-    let handler_b = Arc::new(MigrationSubprotocolHandler::new(
+    // B is the source; A drives the migration. B must name A as an
+    // authorized orchestrator or the default `LocalOnly` policy
+    // refuses the inbound `TakeSnapshot` — see AUTH-01.
+    let handler_b = Arc::new(MigrationSubprotocolHandler::with_hooks(
         orchestrator_b,
         source_b.clone(),
         target_b,
         nid_b,
+        MigrationHandlerHooks {
+            orchestrator_policy: MigrationOrchestratorPolicy::allowlist([nid_a]),
+            ..Default::default()
+        },
     ));
 
     let node_a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
@@ -2903,11 +2911,17 @@ async fn test_migration_full_lifecycle_over_wire() {
 
     let orch_b = Arc::new(MigrationOrchestrator::new(registry_b.clone(), nid_b));
     let source_b = Arc::new(MigrationSourceHandler::new(registry_b.clone()));
-    let handler_b = Arc::new(MigrationSubprotocolHandler::new(
+    // B is the source; A orchestrates. Name A, or the default
+    // `LocalOnly` policy refuses A's `TakeSnapshot` — see AUTH-01.
+    let handler_b = Arc::new(MigrationSubprotocolHandler::with_hooks(
         orch_b,
         source_b.clone(),
         Arc::new(MigrationTargetHandler::new(registry_b.clone())),
         nid_b,
+        MigrationHandlerHooks {
+            orchestrator_policy: MigrationOrchestratorPolicy::allowlist([nid_a]),
+            ..Default::default()
+        },
     ));
 
     // C: target node — register a factory so the subprotocol handler can
