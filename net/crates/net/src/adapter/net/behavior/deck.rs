@@ -398,8 +398,7 @@ pub struct AggregatorRegistryGroupSnapshot {
     /// A local operator surface is still a status API, and status
     /// output should not carry private key material even where the
     /// reader is trusted.
-    pub group_seed_fingerprint:
-        crate::adapter::net::behavior::aggregator::SeedFingerprint,
+    pub group_seed_fingerprint: crate::adapter::net::behavior::aggregator::SeedFingerprint,
     /// Per-replica rows in declaration order.
     pub replicas: Vec<AggregatorReplicaRow>,
 }

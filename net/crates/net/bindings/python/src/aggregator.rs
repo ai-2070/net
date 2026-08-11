@@ -167,7 +167,10 @@ fn group_to_dict<'py>(py: Python<'py>, g: &RegistryGroupSummary) -> PyResult<Bou
     d.set_item("name", &g.name)?;
     // Not the seed: it derives every replica keypair and does not
     // belong in status output. See RegistryGroupSummary.
-    d.set_item("group_seed_fingerprint_hex", g.group_seed_fingerprint.to_hex())?;
+    d.set_item(
+        "group_seed_fingerprint_hex",
+        g.group_seed_fingerprint.to_hex(),
+    )?;
     let replicas = PyList::empty(py);
     for r in &g.replicas {
         replicas.append(replica_to_dict(py, r)?)?;

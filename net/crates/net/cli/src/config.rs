@@ -118,10 +118,7 @@ impl ConfigFile {
     /// necessarily runs before parsing and so cannot know that yet —
     /// and a profile that gains a PSK later should not silently lose
     /// the protection.
-    pub async fn load_with(
-        path: Option<&Path>,
-        allow_insecure: bool,
-    ) -> Result<Self, ConfigError> {
+    pub async fn load_with(path: Option<&Path>, allow_insecure: bool) -> Result<Self, ConfigError> {
         let path = match path {
             Some(p) => p.to_path_buf(),
             None => match default_path() {
@@ -271,7 +268,9 @@ mod tests {
         let path = dir.join("config.toml");
         std::fs::write(&path, "[default]\npsk_hex = \"abcd\"\n").expect("write config");
 
-        let cfg = ConfigFile::load(Some(&path)).await.expect("valid TOML loads");
+        let cfg = ConfigFile::load(Some(&path))
+            .await
+            .expect("valid TOML loads");
         assert_eq!(cfg.profile("default").psk_hex.as_deref(), Some("abcd"));
 
         let _ = std::fs::remove_dir_all(&dir);

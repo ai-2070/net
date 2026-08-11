@@ -107,10 +107,7 @@ async fn build_registry_pair() -> (
     // these round-trips as the positive control for the
     // authorization gate rather than side-stepping it.
     let serve_handle = registry
-        .install_registry_service(
-            &host,
-            RegistryAdminPolicy::operators([querier.node_id()]),
-        )
+        .install_registry_service(&host, RegistryAdminPolicy::operators([querier.node_id()]))
         .expect("install_registry_service");
 
     (host, querier, registry, serve_handle, vec!["alpha", "beta"])
@@ -156,10 +153,7 @@ async fn list_against_empty_registry_returns_empty_groups() {
     handshake(&host, &querier).await;
     let registry = Arc::new(AggregatorRegistry::new());
     let _serve = registry
-        .install_registry_service(
-            &host,
-            RegistryAdminPolicy::operators([querier.node_id()]),
-        )
+        .install_registry_service(&host, RegistryAdminPolicy::operators([querier.node_id()]))
         .expect("install_registry_service");
 
     let client = RegistryClient::new(querier).with_deadline(Duration::from_secs(2));

@@ -1292,11 +1292,8 @@ mod tests {
     fn write_file_does_not_create_a_setuid_file_from_a_hostile_manifest() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = std::env::temp_dir().join(format!(
-            "net-sec04-{}-{}",
-            std::process::id(),
-            line!()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("net-sec04-{}-{}", std::process::id(), line!()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join("payload");
 
@@ -1399,11 +1396,8 @@ mod tests {
     /// just on the platform whose modes they set.
     #[test]
     fn creation_helpers_work_on_every_platform() {
-        let dir = std::env::temp_dir().join(format!(
-            "net-linux04-x-{}-{}",
-            std::process::id(),
-            line!()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("net-linux04-x-{}-{}", std::process::id(), line!()));
         let _ = std::fs::remove_dir_all(&dir);
         create_dir_private(&dir).expect("create_dir_private");
         assert!(dir.is_dir());

@@ -252,7 +252,10 @@ fn resolve_admin_policy(config: &Config) -> Result<RegistryAdminPolicy, DaemonEr
     let mut ids = Vec::with_capacity(config.operators.len());
     for (index, raw) in config.operators.iter().enumerate() {
         let trimmed = raw.trim();
-        let parsed = match trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+        let parsed = match trimmed
+            .strip_prefix("0x")
+            .or_else(|| trimmed.strip_prefix("0X"))
+        {
             Some(hex) => u64::from_str_radix(hex, 16),
             None => trimmed.parse::<u64>(),
         };
@@ -900,11 +903,10 @@ fn make_scaler(
             // Scale adds no group, so only the per-group ceiling
             // applies — but it applies here too, or Spawn(16) followed
             // by Scale(255) would walk straight around it.
-            check_spawn_limits(limits, req.target_replica_count, None)
-                .map_err(|e| match e {
-                    RegistryRpcError::SpawnRejected(m) => RegistryRpcError::ScaleRejected(m),
-                    other => other,
-                })?;
+            check_spawn_limits(limits, req.target_replica_count, None).map_err(|e| match e {
+                RegistryRpcError::SpawnRejected(m) => RegistryRpcError::ScaleRejected(m),
+                other => other,
+            })?;
             let template = resolve_template(&by_name, &req.template_name)?;
             // Build the spec from the template + supplied group
             // name. `replica_count` here is the *target* — used
@@ -1112,9 +1114,11 @@ mod tests {
         let path = dir.join("aggregator.toml");
         std::fs::write(
             &path,
-            format!("listen = \"127.0.0.1:0\"
+            format!(
+                "listen = \"127.0.0.1:0\"
 psk_hex = \"{SENTINEL}\" trailing
-"),
+"
+            ),
         )
         .expect("write config");
 
@@ -1430,8 +1434,8 @@ mod spawn_limit_tests {
     /// them must not read as "unlimited".
     #[test]
     fn omitted_limits_default_to_finite_ceilings() {
-        let cfg: Config = toml::from_str("listen = \"127.0.0.1:0\"\npsk_hex = \"aa\"\n")
-            .expect("config parses");
+        let cfg: Config =
+            toml::from_str("listen = \"127.0.0.1:0\"\npsk_hex = \"aa\"\n").expect("config parses");
         assert_eq!(cfg.max_groups, DEFAULT_MAX_GROUPS);
         assert_eq!(cfg.max_replica_count, DEFAULT_MAX_REPLICA_COUNT);
         assert!(cfg.max_groups > 0 && cfg.max_replica_count > 0);
@@ -1482,9 +1486,7 @@ mod secret_file_gate_tests {
                 assert_eq!(e.kind(), "permissive_mode", "got {e}");
             }
             Err(other) => panic!("expected a permission refusal, got {other:?}"),
-            Ok(_) => panic!(
-                "the daemon booted from a world-readable config holding the mesh PSK"
-            ),
+            Ok(_) => panic!("the daemon booted from a world-readable config holding the mesh PSK"),
         }
 
         // The named override still boots it — the point is that an
@@ -1496,7 +1498,9 @@ mod secret_file_gate_tests {
             verbose: 0,
             insecure_permissions: true,
         };
-        let booted = boot(cli).await.expect("--insecure-permissions must still boot");
+        let booted = boot(cli)
+            .await
+            .expect("--insecure-permissions must still boot");
         booted.mesh.shutdown().await.ok();
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -1841,8 +1841,8 @@ mod tests {
     async fn overflow_admission_keys_on_the_authenticated_peer_not_the_claim() {
         use crate::adapter::net::behavior::fold::capability_bridge;
         use crate::adapter::net::identity::EntityKeypair;
-        use crate::adapter::net::{MeshNode, MeshNodeConfig};
         use crate::adapter::net::Redex;
+        use crate::adapter::net::{MeshNode, MeshNodeConfig};
 
         let honest: u64 = 0x0B0B;
         let attacker: u64 = 0xBAD5;

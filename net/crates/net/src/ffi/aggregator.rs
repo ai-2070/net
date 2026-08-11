@@ -870,8 +870,7 @@ fn classify(err: &RegistryClientError) -> (i32, String) {
         ),
         RegistryClientError::Server(RegistryRpcError::Unauthorized) => (
             NET_REGISTRY_ERR_UNAUTHORIZED,
-            "caller is not an operator of the target daemon's aggregator registry"
-                .to_string(),
+            "caller is not an operator of the target daemon's aggregator registry".to_string(),
         ),
     }
 }
@@ -964,8 +963,9 @@ mod tests {
     fn group_to_json_includes_every_documented_field() {
         let g = RegistryGroupSummary {
             name: "alpha".into(),
-            group_seed_fingerprint:
-                crate::adapter::net::behavior::aggregator::SeedFingerprint::of(&[0xABu8; 32]),
+            group_seed_fingerprint: crate::adapter::net::behavior::aggregator::SeedFingerprint::of(
+                &[0xABu8; 32],
+            ),
             source_subnet: crate::adapter::net::subnet::SubnetId::GLOBAL,
             fold_kinds: vec![0x0001],
             replicas: vec![
@@ -994,8 +994,8 @@ mod tests {
         );
         // The fingerprint is present, 16 hex chars, and is NOT a
         // prefix of the seed rendering.
-        let fp = crate::adapter::net::behavior::aggregator::SeedFingerprint::of(&[0xABu8; 32])
-            .to_hex();
+        let fp =
+            crate::adapter::net::behavior::aggregator::SeedFingerprint::of(&[0xABu8; 32]).to_hex();
         assert_eq!(fp.len(), 16);
         assert!(
             json.contains(&format!("\"group_seed_fingerprint_hex\":\"{fp}\"")),

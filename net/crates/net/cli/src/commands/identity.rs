@@ -399,8 +399,13 @@ struct IdentitySummary {
 /// operator would paste into an allowlist and then spend an afternoon
 /// wondering why their CLI is refused.
 fn node_id_hex_from_public_key(public_key_hex: &str) -> Option<String> {
-    let bytes = hex::decode(public_key_hex.trim().strip_prefix("0x").unwrap_or(public_key_hex))
-        .ok()?;
+    let bytes = hex::decode(
+        public_key_hex
+            .trim()
+            .strip_prefix("0x")
+            .unwrap_or(public_key_hex),
+    )
+    .ok()?;
     let arr: [u8; 32] = bytes.try_into().ok()?;
     Some(format!(
         "{:#018x}",

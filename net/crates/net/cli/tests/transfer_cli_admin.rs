@@ -33,7 +33,9 @@ fn psk() -> [u8; 32] {
 /// Boot a holder serving the `blob.transfers` RPC under `policy`.
 /// Returns the mesh and the RPC serve handle — both kept alive by the
 /// caller (dropping the handle would stop answering the RPC).
-async fn boot_holder_with(policy: transport::TransferAdminPolicy) -> (Mesh, transport::ServeHandle) {
+async fn boot_holder_with(
+    policy: transport::TransferAdminPolicy,
+) -> (Mesh, transport::ServeHandle) {
     let mesh = MeshBuilder::new("127.0.0.1:0", &psk())
         .expect("mesh builder")
         .build()
@@ -258,14 +260,13 @@ async fn a_named_operator_identity_is_admitted_by_a_node_id_allowlist() {
         serde_json::from_slice(&out.stdout).expect("identity show emits JSON");
     let node_id_hex = shown["node_id_hex"]
         .as_str()
-        .expect("identity show must publish node_id_hex — without it an operator \
-                 cannot populate an allowlist without reimplementing the derivation")
+        .expect(
+            "identity show must publish node_id_hex — without it an operator \
+                 cannot populate an allowlist without reimplementing the derivation",
+        )
         .to_string();
-    let node_id = u64::from_str_radix(
-        node_id_hex.trim_start_matches("0x"),
-        16,
-    )
-    .expect("node_id_hex parses as hex");
+    let node_id = u64::from_str_radix(node_id_hex.trim_start_matches("0x"), 16)
+        .expect("node_id_hex parses as hex");
 
     // 3. Holder names exactly that node, and nobody else.
     let (holder, _serve) =

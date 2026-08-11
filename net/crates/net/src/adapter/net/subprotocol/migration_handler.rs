@@ -1773,9 +1773,7 @@ mod tests {
                 // This test is about seal failure, not authority, so
                 // the fictional orchestrator has to get past the
                 // `TakeSnapshot` gate to reach the seal at all.
-                orchestrator_policy: MigrationOrchestratorPolicy::allowlist([
-                    orchestrator_node_id
-                ]),
+                orchestrator_policy: MigrationOrchestratorPolicy::allowlist([orchestrator_node_id]),
                 ..Default::default()
             },
         );
