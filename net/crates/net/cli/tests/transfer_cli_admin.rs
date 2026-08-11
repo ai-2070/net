@@ -52,12 +52,14 @@ async fn boot_holder_with(policy: transport::TransferAdminPolicy) -> (Mesh, tran
 /// Holder that answers anyone.
 ///
 /// `attach()` below drives the CLI without `--identity`, so it comes up
-/// with a fresh ephemeral identity and an unpredictable node id — there
-/// is nothing stable for the holder to name in an operator allowlist.
-/// Proving the round-trip plumbing therefore needs the open policy.
-/// The refusal path is covered by
-/// `closed_policy_refuses_remote_administration` below, and the
-/// allowlist logic by the unit tests in `transfer_rpc.rs`.
+/// anonymous with an unpredictable node id — nothing a holder could
+/// name in an allowlist. Proving the round-trip plumbing on its own
+/// therefore uses the open policy.
+///
+/// The allowlist path is not untested for it:
+/// `a_named_operator_identity_is_admitted_by_a_node_id_allowlist`
+/// drives the real operator workflow end to end, and
+/// `closed_policy_refuses_remote_administration` covers the refusal.
 async fn boot_holder() -> (Mesh, transport::ServeHandle) {
     boot_holder_with(transport::TransferAdminPolicy::AnyAdmittedPeer).await
 }
@@ -203,5 +205,98 @@ async fn status_rejects_non_numeric_id() {
     assert_eq!(
         code, 2,
         "expected InvalidArgs exit code for a bad transfer-id"
+    );
+}
+
+/// Task #30. The operator workflow the node-id allowlists depend on,
+/// end to end: generate an identity, read the `node_id` off
+/// `identity show`, name it on the holder, and attach with
+/// `--identity`.
+///
+/// Before this, `--identity` set the *operator* identity used for
+/// signing but the remote-attach mesh always came up anonymous, so the
+/// allowlists this release introduces were unsatisfiable from the CLI
+/// — the secure configuration existed and could not be reached by the
+/// tool operators use. This test fails if that regresses, which the
+/// `AnyAdmittedPeer` round-trip test above cannot detect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_named_operator_identity_is_admitted_by_a_node_id_allowlist() {
+    let home = TempDir::new().expect("home");
+    let id_path = home.path().join("operator.toml");
+
+    // 1. Generate an identity.
+    let mut cmd = cli_cmd(&home);
+    cmd.args([
+        "identity",
+        "generate",
+        "--out",
+        id_path.to_str().expect("utf-8 path"),
+    ]);
+    let out = cmd.output().expect("identity generate");
+    assert!(
+        out.status.success(),
+        "identity generate failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // 2. Read its mesh node id the way an operator would.
+    let mut cmd = cli_cmd(&home);
+    cmd.args([
+        "identity",
+        "show",
+        id_path.to_str().expect("utf-8 path"),
+        "--output",
+        "json",
+    ]);
+    let out = cmd.output().expect("identity show");
+    assert!(
+        out.status.success(),
+        "identity show failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let shown: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("identity show emits JSON");
+    let node_id_hex = shown["node_id_hex"]
+        .as_str()
+        .expect("identity show must publish node_id_hex — without it an operator \
+                 cannot populate an allowlist without reimplementing the derivation")
+        .to_string();
+    let node_id = u64::from_str_radix(
+        node_id_hex.trim_start_matches("0x"),
+        16,
+    )
+    .expect("node_id_hex parses as hex");
+
+    // 3. Holder names exactly that node, and nobody else.
+    let (holder, _serve) =
+        boot_holder_with(transport::TransferAdminPolicy::operators([node_id])).await;
+
+    // 4. Attaching WITH the identity is admitted.
+    let mut args = vec!["ls".to_string(), "--output".to_string(), "json".to_string()];
+    args.extend([
+        "--identity".to_string(),
+        id_path.to_str().expect("utf-8 path").to_string(),
+    ]);
+    args.extend(attach(&holder));
+    let (code, stdout, stderr) = run_transfer(&home, args).await;
+    assert_eq!(
+        code, 0,
+        "the named operator identity was refused by its own allowlist — \
+         the derived node_id and the attached mesh's node_id disagree. \
+         stdout={stdout} stderr={stderr}"
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("non-JSON stdout ({e}): {stdout}"));
+    assert_eq!(parsed["transfer_count"], 0);
+
+    // 5. Negative control: the same holder, no --identity. The CLI
+    //    comes up anonymous and must be refused — otherwise step 4
+    //    proves nothing about the identity being the reason.
+    let mut args = vec!["ls".to_string(), "--output".to_string(), "json".to_string()];
+    args.extend(attach(&holder));
+    let (code, stdout, stderr) = run_transfer(&home, args).await;
+    assert_ne!(
+        code, 0,
+        "an anonymous attach was admitted by a node-id allowlist. stdout={stdout} stderr={stderr}"
     );
 }

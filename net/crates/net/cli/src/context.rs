@@ -185,7 +185,11 @@ impl CliContext {
         // ceremony; writes pass `require_identity = true` so the
         // ephemeral branch becomes a typed error instead of a
         // silent warn-and-proceed.
-        let keypair = match identity_override.or(profile.identity.as_deref()) {
+        // Whether the operator NAMED an identity, as opposed to us
+        // minting one. Determines the mesh node id used for
+        // remote-attach below.
+        let configured_identity_path = identity_override.or(profile.identity.as_deref());
+        let keypair = match configured_identity_path {
             Some(path) => load_identity_keypair(path).await?,
             None => {
                 if require_identity {
@@ -219,8 +223,27 @@ impl CliContext {
         // receive loop. The Mesh owns the socket + dispatch loop;
         // `mesh_node()` hands out the `Arc<MeshNode>` view typed
         // clients consume.
+        // Remote-attach identity. When the operator named an
+        // identity, the attached mesh uses it, so this CLI presents a
+        // stable `node_id` that a daemon can name in an operator
+        // allowlist (`TransferAdminPolicy`, `RegistryAdminPolicy`,
+        // `MigrationOrchestratorPolicy`). Without this every
+        // invocation came up anonymous with an unpredictable id, and
+        // those allowlists were unsatisfiable from the CLI — the
+        // secure configuration existed but could not be reached by
+        // the tool operators actually use.
+        //
+        // Only when explicitly configured. An anonymous attach stays
+        // the default because two concurrent invocations sharing one
+        // node id would collide in the daemon's peer map, and an
+        // operator who has not asked for a stable identity should not
+        // acquire that failure mode by upgrading.
+        let attach_identity = match configured_identity_path {
+            Some(path) => Some(load_operator_identity(path).await?),
+            None => None,
+        };
         let mesh = match remote {
-            Some(remote) => Some(build_remote_mesh(remote).await?),
+            Some(remote) => Some(build_remote_mesh(remote, attach_identity).await?),
             None => None,
         };
 
@@ -246,9 +269,18 @@ impl CliContext {
 /// `handle_routed_handshake` Case 2 handles fresh msg1 from
 /// new initiators against a running dispatch loop. The relay
 /// hop is degenerate (relay == final dest == the daemon).
-async fn build_remote_mesh(remote: RemoteAttach) -> Result<net_sdk::Mesh, CliError> {
-    // In-process remote attach: loopback bind, ephemeral (anonymous) identity.
-    build_attached_mesh("127.0.0.1:0", None, &remote).await
+///
+/// `identity` is `Some` only when the operator named one. It becomes
+/// the attached mesh's ed25519 identity, and therefore its `node_id` —
+/// the value a daemon sees as the authenticated session peer and the
+/// one that goes in an operator allowlist. `None` keeps the historical
+/// anonymous attach.
+async fn build_remote_mesh(
+    remote: RemoteAttach,
+    identity: Option<net_sdk::identity::Identity>,
+) -> Result<net_sdk::Mesh, CliError> {
+    // Loopback bind; identity per the caller.
+    build_attached_mesh("127.0.0.1:0", identity, &remote).await
 }
 
 /// Build a local mesh bound to `bind`, optionally under an operator

@@ -184,7 +184,54 @@ no transfer with that id is pending — and **exit `0` in that case**: a
 no-op is not an error. Script against the `found` / `cancelled` field, not
 the exit code (a non-zero exit means the RPC itself failed — no route,
 timeout, or the engine isn't installed). The serving node must install the
-RPC (`transport::serve_blob_transfer_rpc`, or a daemon that does).
+RPC (`transport::serve_blob_transfer_rpc_with_policy`, or a daemon that
+does).
+
+### Authorization: naming your operators
+
+`blob.transfers` is an operator surface, not a public one. `ls` and
+`status` disclose in-flight stream ids, holder identities and expected
+content hashes; `cancel` fails the *owner's* fetch. Completing the mesh
+handshake proves PSK possession and nothing about operator intent, so
+the holder decides who may drive these verbs — and by default that is
+nobody:
+
+```rust
+serve_blob_transfer_rpc_with_policy(&mesh, adapter,
+    TransferAdminPolicy::operators([ops_node_id]))?;
+```
+
+`ops_node_id` is a mesh `node_id`, which is derived from an operator
+identity. The whole workflow:
+
+```sh
+# 1. Create an operator identity (0600, owner-only).
+net-mesh identity generate --out ~/.config/net-mesh/operator.toml
+
+# 2. Read the node id it derives.
+net-mesh identity show ~/.config/net-mesh/operator.toml --output json
+#   { ..., "node_id_hex": "0x1a2b3c4d5e6f7788", ... }
+
+# 3. Name that id on the holder (above, or `operators = [...]` in an
+#    aggregator daemon config).
+
+# 4. Attach WITH the identity. Without --identity the CLI comes up
+#    anonymous with a fresh node id every run, and an allowlist will
+#    refuse it.
+net-mesh transfer ls --identity ~/.config/net-mesh/operator.toml   --node-addr ... --node-pubkey ... --node-id ... --psk-hex ...
+```
+
+Two things worth knowing:
+
+- **`--identity` is what makes the id stable.** It is also what the CLI
+  signs admin commits with, so one file covers both.
+- **Two concurrent invocations sharing one identity share one
+  `node_id`**, and the daemon's peer map is keyed on it — the second
+  attach displaces the first. Give unattended automation its own
+  identity rather than reusing a human operator's.
+
+A refused call exits non-zero and says `not authorized`, so a
+misconfigured allowlist is distinguishable from a network fault.
 
 ---
 

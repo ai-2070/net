@@ -232,6 +232,8 @@ async fn run_generate(args: GenerateArgs, output: Option<OutputFormat>) -> Resul
         path: path.display().to_string(),
         operator_id_hex: file.operator_id_hex.clone(),
         public_key_hex: file.public_key_hex.clone(),
+        node_id_hex: node_id_hex_from_public_key(&file.public_key_hex)
+            .unwrap_or_else(|| "<unavailable: public_key_hex is not 32 bytes>".to_string()),
         created_at: file.created_at.clone(),
         note: file.note.clone(),
     };
@@ -250,6 +252,8 @@ async fn run_show(args: ShowArgs, output: Option<OutputFormat>) -> Result<(), Cl
         path: args.path.display().to_string(),
         operator_id_hex: file.operator_id_hex.clone(),
         public_key_hex: file.public_key_hex.clone(),
+        node_id_hex: node_id_hex_from_public_key(&file.public_key_hex)
+            .unwrap_or_else(|| "<unavailable: public_key_hex is not 32 bytes>".to_string()),
         created_at: file.created_at.clone(),
         note: file.note.clone(),
     };
@@ -367,9 +371,41 @@ struct IdentitySummary {
     path: String,
     operator_id_hex: String,
     public_key_hex: String,
+    /// The mesh `node_id` this identity produces, as `0x`-prefixed
+    /// hex.
+    ///
+    /// This is the value a daemon sees as the authenticated session
+    /// peer when the CLI attaches with `--identity`, and therefore the
+    /// value that goes in an operator allowlist — the aggregator
+    /// daemon's `operators = [...]`, `TransferAdminPolicy::operators`,
+    /// `MigrationOrchestratorPolicy::allowlist`.
+    ///
+    /// Derived, not stored: `blake2s(public_key, "net-node-id-v1")`
+    /// truncated to 8 bytes, little-endian. Printing it here means an
+    /// operator never has to reproduce that derivation by hand or
+    /// scrape it from a log line.
+    node_id_hex: String,
     created_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     note: Option<String>,
+}
+
+/// The mesh `node_id` an identity file's public key derives, rendered
+/// as `0x`-prefixed hex.
+///
+/// Returns `None` when `public_key_hex` is not 32 bytes of hex — a
+/// hand-edited or truncated file. The summary then omits the field
+/// rather than printing a plausible-looking wrong id, which an
+/// operator would paste into an allowlist and then spend an afternoon
+/// wondering why their CLI is refused.
+fn node_id_hex_from_public_key(public_key_hex: &str) -> Option<String> {
+    let bytes = hex::decode(public_key_hex.trim().strip_prefix("0x").unwrap_or(public_key_hex))
+        .ok()?;
+    let arr: [u8; 32] = bytes.try_into().ok()?;
+    Some(format!(
+        "{:#018x}",
+        net::adapter::net::identity::EntityId::from_bytes(arr).node_id()
+    ))
 }
 
 #[derive(Debug, Serialize)]
