@@ -1382,11 +1382,19 @@ jobs:
         working-directory: net/crates/net/bindings/node
         run: npx napi build --platform --no-default-features --features net,nat-traversal,cortex,compute,groups,meshos,deck,meshdb,aggregator,tool,consent,mcp,publish,payments,payments-http,delegation,a2a,org,test-helpers
 
-      # Compile the sibling .ts shims (meshdb.ts, mesh_rpc.ts, errors.ts)
-      # into .js so `require('../meshdb')` in the test suite resolves.
-      # `napi build` only produces the native `.node` artifact; the
-      # AsyncIterable shim that augments MeshQueryStream is plain TS
-      # that needs its own tsc pass.
+      # Compile the sibling .ts shims (meshdb.ts, mesh_rpc.ts, errors.ts,
+      # tool.ts, …) into the CJS `.js` + `.d.ts` pair consumers
+      # `require()`. `napi build` only produces the native `.node`
+      # artifact; the AsyncIterable shim that augments MeshQueryStream is
+      # plain TS that needs its own tsc pass.
+      #
+      # This is a BUILD step, not a test prerequisite. It used to be both:
+      # vitest resolved `../tool` to the compiled `tool.js` before the
+      # `tool.ts` beside it, so the suite tested whatever this step last
+      # emitted. `vitest.config.ts` now prefers `.ts`, so the tests read
+      # the sources and a stale artifact can no longer pass for a fresh
+      # one. Keep the step — it still has to compile, and `noEmitOnError`
+      # means a type error here is a red job.
       - name: Build TypeScript shims
         working-directory: net/crates/net/bindings/node
         run: npm run build:ts
