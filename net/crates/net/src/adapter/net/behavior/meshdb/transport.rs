@@ -501,6 +501,71 @@ impl Stream for ResponseStreamGuard {
     }
 }
 
+/// Decides whether an authenticated peer may read a given chain.
+///
+/// AUTH-02. `MESHDB_PLAN.md` specifies chain reads as gated by
+/// chain-level `subscribe_caps` and an `AuthGuard` evaluated against
+/// the requesting session — but the server API discarded the caller
+/// before the executor ran, so no embedder could implement that even
+/// if they wanted to. The authenticated peer was sitting right there
+/// in `dispatch_request`, keyed into the in-flight map, and simply
+/// never travelled any further.
+///
+/// `peer` is the AEAD-authenticated `from_node` the frame decrypted
+/// under, not anything the request body claims.
+pub trait ChainAuthorizer: Send + Sync {
+    /// `true` if `peer` may read `chain_origin`.
+    ///
+    /// Called once per distinct chain in the plan, **before** the
+    /// query runs or a task is allocated — a policy that ran per-row
+    /// would already have spent the resources the denial is meant to
+    /// withhold.
+    fn may_read(&self, peer: u64, chain_origin: u64) -> bool;
+}
+
+/// Who may read which chains through a [`MeshDbServer`].
+///
+/// There is no `Default`. Installing a MeshDB server exposes every
+/// chain its reader can resolve to every admitted mesh peer, so the
+/// embedder has to say which of these they mean; a default would let
+/// that decision be made by not making it.
+#[derive(Clone)]
+pub enum MeshDbAccessPolicy {
+    /// Any authenticated peer may read any chain the reader resolves.
+    ///
+    /// Correct when every chain served here is public to the mesh, or
+    /// when the reader itself is already scoped to public data. It is
+    /// not a placeholder for "we have not decided yet".
+    AllPeersMayReadEveryChain,
+    /// Consult an embedder-supplied authorizer per chain.
+    PerChain(Arc<dyn ChainAuthorizer>),
+}
+
+impl MeshDbAccessPolicy {
+    /// Build a [`PerChain`](Self::PerChain) policy from any
+    /// [`ChainAuthorizer`].
+    pub fn per_chain<A: ChainAuthorizer + 'static>(authorizer: A) -> Self {
+        Self::PerChain(Arc::new(authorizer))
+    }
+
+    /// Whether `peer` may read `chain_origin`.
+    pub fn permits(&self, peer: u64, chain_origin: u64) -> bool {
+        match self {
+            Self::AllPeersMayReadEveryChain => true,
+            Self::PerChain(a) => a.may_read(peer, chain_origin),
+        }
+    }
+}
+
+impl std::fmt::Debug for MeshDbAccessPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AllPeersMayReadEveryChain => f.write_str("AllPeersMayReadEveryChain"),
+            Self::PerChain(_) => f.write_str("PerChain(<authorizer>)"),
+        }
+    }
+}
+
 /// Server-side handler. Owns a `MeshQueryExecutor` (typically a
 /// `LocalMeshQueryExecutor` backed by RedEX) and produces a
 /// stream of [`MeshDbResponse`]s for every inbound
@@ -510,6 +575,8 @@ impl Stream for ResponseStreamGuard {
 /// continuation surface.
 pub struct MeshDbServer {
     executor: Arc<dyn MeshQueryExecutor>,
+    /// Per-chain read authority. See [`MeshDbAccessPolicy`].
+    policy: MeshDbAccessPolicy,
     /// In-flight server-side calls, keyed by (peer, call_id). A
     /// `Cancel { call_id }` from a peer flips the matching
     /// handle's cancel flag.
@@ -533,10 +600,16 @@ struct ServerCallHandle {
 
 impl MeshDbServer {
     /// Construct a server that drives `executor` for inbound
-    /// `Execute` requests.
-    pub fn new(executor: Arc<dyn MeshQueryExecutor>) -> Arc<Self> {
+    /// `Execute` requests, under `policy`.
+    ///
+    /// `policy` is a required argument. Installing this server makes
+    /// every chain the executor's reader can resolve reachable by
+    /// every admitted mesh peer, so the embedder states which chains
+    /// that is meant to be — see [`MeshDbAccessPolicy`].
+    pub fn new(executor: Arc<dyn MeshQueryExecutor>, policy: MeshDbAccessPolicy) -> Arc<Self> {
         Arc::new(Self {
             executor,
+            policy,
             inflight: Arc::new(RwLock::new(HashMap::new())),
             pending_cancels: Arc::new(RwLock::new(HashSet::new())),
         })
@@ -588,6 +661,43 @@ impl MeshDbServer {
                     });
                     return;
                 }
+                // AUTH-02. Authorize every chain the plan reads
+                // before the query runs or a task is allocated.
+                //
+                // `peer` is the AEAD-authenticated sender; the plan is
+                // whatever the caller sent, so the chains it touches
+                // have to be read off the tree rather than taken from
+                // the envelope. Denying after execution would already
+                // have done the read and spent the resources.
+                //
+                // The refusal names no chain: telling an unauthorized
+                // caller *which* origin was refused turns the denial
+                // into a chain-existence oracle.
+                let denied = plan
+                    .chain_origins()
+                    .into_iter()
+                    .find(|origin| !self.policy.permits(peer, *origin));
+                if let Some(origin) = denied {
+                    tracing::warn!(
+                        peer = format!("{peer:#x}"),
+                        chain = format!("{origin:#x}"),
+                        "meshdb: refused a query against a chain this peer may not read",
+                    );
+                    let sender_clone = sender.clone();
+                    tokio::spawn(async move {
+                        let _ = sender_clone
+                            .send_frame(
+                                peer,
+                                MeshDbFrame::Response(MeshDbResponse::Error {
+                                    call_id,
+                                    error: MeshError::Unauthorized,
+                                }),
+                            )
+                            .await;
+                    });
+                    return;
+                }
+
                 let cancel = Arc::new(Notify::new());
                 self.inflight.write().insert(
                     (peer, call_id),
@@ -839,7 +949,7 @@ impl MeshDbWireSender for MeshNodeMeshDbSender {
 /// inbound dispatch loop calls.
 ///
 /// Caller-only nodes leave `server` as `None`. Nodes that
-/// answer remote queries pass `Some(MeshDbServer::new(executor))`.
+/// answer remote queries pass `Some(MeshDbServer::new(executor, MeshDbAccessPolicy::AllPeersMayReadEveryChain))`.
 ///
 /// # Re-install semantics (not transparently idempotent)
 ///
@@ -1095,7 +1205,7 @@ mod tests {
         reader_b.append(0xCAFE, SeqNum(7), b"hello-wire".to_vec());
         let executor_b: Arc<dyn MeshQueryExecutor> =
             Arc::new(LocalMeshQueryExecutor::new(reader_b));
-        let server_b = MeshDbServer::new(executor_b);
+        let server_b = MeshDbServer::new(executor_b, MeshDbAccessPolicy::AllPeersMayReadEveryChain);
         let sender_b = Arc::new(SenderTo {
             wire: wire.clone(),
             local_node: node_b,
@@ -1282,7 +1392,7 @@ mod tests {
 
         let reader = Arc::new(InMemoryChainReader::default());
         let executor: Arc<dyn MeshQueryExecutor> = Arc::new(LocalMeshQueryExecutor::new(reader));
-        let server = MeshDbServer::new(executor);
+        let server = MeshDbServer::new(executor, MeshDbAccessPolicy::AllPeersMayReadEveryChain);
         let sender_b = Arc::new(SenderTo {
             wire: wire.clone(),
             local_node: node_b,
@@ -1424,7 +1534,7 @@ mod tests {
             executor: inner,
             calls: calls.clone(),
         });
-        let server = MeshDbServer::new(executor);
+        let server = MeshDbServer::new(executor, MeshDbAccessPolicy::AllPeersMayReadEveryChain);
 
         // Register a caller-side dispatcher on the OTHER end so
         // the server's outbound `MeshDbResponse::Error` has a
@@ -1525,7 +1635,7 @@ mod tests {
         reader_b.append(0xCAFE, SeqNum(7), b"real".to_vec());
         let executor_b: Arc<dyn MeshQueryExecutor> =
             Arc::new(LocalMeshQueryExecutor::new(reader_b));
-        let server_b = MeshDbServer::new(executor_b);
+        let server_b = MeshDbServer::new(executor_b, MeshDbAccessPolicy::AllPeersMayReadEveryChain);
         let sender_b = Arc::new(SenderTo {
             wire: wire.clone(),
             local_node: node_b,

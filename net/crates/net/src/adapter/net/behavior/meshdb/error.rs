@@ -158,6 +158,15 @@ pub enum MeshError {
     /// cancellations differently (they're not failures).
     #[error("query cancelled")]
     QueryCancelled,
+
+    /// The calling peer may not read one of the chains the plan
+    /// touches. See `MeshDbAccessPolicy`.
+    ///
+    /// Deliberately carries no origin: naming the refused chain would
+    /// turn every denial into a chain-existence oracle for a caller
+    /// who is not allowed to know.
+    #[error("caller is not authorized to read one of the chains in this query")]
+    Unauthorized,
 }
 
 /// Identifies which configured budget tripped a
