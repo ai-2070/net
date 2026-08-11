@@ -646,6 +646,7 @@ describe('tool registry lifetime', () => {
   function fakeToolRpc() {
     const served: ServedRecord[] = []
     let failOn: string | null = null
+    let failCloseOn: string | null = null
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     function register(service: string, handler: (req: any) => any) {
@@ -654,6 +655,12 @@ describe('tool registry lifetime', () => {
       served.push(record)
       return {
         close() {
+          // Throw BEFORE counting: a handle whose native instance is gone
+          // released nothing, so a test that reads `closes()` afterwards
+          // sees zero rather than a release that did not happen.
+          if (failCloseOn === service) {
+            throw new Error(`close rejected ${service}`)
+          }
           record.closeCount += 1
         },
         isClosed() {
@@ -691,6 +698,16 @@ describe('tool registry lifetime', () => {
       /** Make the next (and every later) `serve` of `service` throw. */
       failServeOf(service: string | null) {
         failOn = service
+      },
+      /**
+       * Make `close()` on every handle for `service` throw.
+       *
+       * Models a napi `ServeHandle` whose native instance V8 already
+       * finalized: the Rust `close` cannot fail, but calling any method
+       * on a finalized instance does.
+       */
+      failCloseOf(service: string | null) {
+        failCloseOn = service
       },
     }
   }
@@ -881,6 +898,68 @@ describe('tool registry lifetime', () => {
     alpha.close()
     expect(rpc.closes(TOOL_METADATA_FETCH_SERVICE)).toBe(0)
     beta.close()
+    expect(rpc.closes(TOOL_METADATA_FETCH_SERVICE)).toBe(1)
+  })
+
+  // The release runs in a `finally`, and these three are why. `close()`
+  // marks itself closed before it touches the inner handle, so if a
+  // throwing `inner.close()` also skipped the release there would be no
+  // second chance: the shared metadata service would outlive its last
+  // tool permanently, with nothing left in the caller's hands to close.
+  // That is the U-1 leak this whole registry exists to prevent, reached
+  // through the error path instead of the happy one.
+
+  it('a throwing inner close still releases the metadata service', () => {
+    const rpc = fakeToolRpc()
+    const handle = serveTool(rpc.rpc, { name: 'echo' }, echo)
+    rpc.failCloseOf('echo')
+
+    // The caller still sees the failure — the release is an obligation,
+    // not a reason to swallow the error.
+    expect(() => handle.close()).toThrow(/close rejected echo/)
+
+    // `echo`'s own handle released nothing (it counts before it would
+    // have incremented), and the shared service went down anyway.
+    expect(rpc.closes('echo')).toBe(0)
+    expect(rpc.closes(TOOL_METADATA_FETCH_SERVICE)).toBe(1)
+  })
+
+  it('a throwing inner close also unmaps the registry entry', () => {
+    const rpc = fakeToolRpc()
+    const handle = serveTool(rpc.rpc, { name: 'echo' }, echo)
+    rpc.failCloseOf('echo')
+    expect(() => handle.close()).toThrow()
+
+    // Releasing the service without unmapping the entry would leave a
+    // CLOSED `fetchHandle` behind for the next `serveTool` to "reuse",
+    // and it serves nothing. A second registration proves the entry went.
+    rpc.failCloseOf(null)
+    const next = serveTool(rpc.rpc, { name: 'next' }, echo)
+    expect(rpc.registrations(TOOL_METADATA_FETCH_SERVICE)).toBe(2)
+    expect(rpc.askMetadata('next').type).toBe('found')
+
+    next.close()
+    expect(rpc.closes(TOOL_METADATA_FETCH_SERVICE)).toBe(2)
+  })
+
+  it('a throwing inner close beside a live tool leaves the service up', () => {
+    const rpc = fakeToolRpc()
+    const keep = serveTool(rpc.rpc, { name: 'keep' }, echo)
+    const doomed = serveTool(rpc.rpc, { name: 'doomed' }, echo)
+    rpc.failCloseOf('doomed')
+
+    expect(() => doomed.close()).toThrow()
+
+    // The count, not the exception, decides. `keep` is still served, so
+    // the `finally` must find a non-empty registry and do nothing.
+    expect(rpc.closes(TOOL_METADATA_FETCH_SERVICE)).toBe(0)
+    expect(rpc.askMetadata('keep').type).toBe('found')
+    expect(rpc.askMetadata('doomed')).toEqual({
+      type: 'not_found',
+      name: 'doomed',
+    })
+
+    keep.close()
     expect(rpc.closes(TOOL_METADATA_FETCH_SERVICE)).toBe(1)
   })
 })

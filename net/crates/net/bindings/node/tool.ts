@@ -373,8 +373,20 @@ function _registerTool(
       if (entry.registry.get(descriptor.toolId) === descriptor) {
         entry.registry.delete(descriptor.toolId)
       }
-      inner.close()
-      _closeRegistryIfEmpty(rpc, entry)
+      // `finally`, because `closed` is already true: if `inner.close()`
+      // threw and took the release with it, no later call can retry, and
+      // the shared metadata service would outlive its last tool with
+      // nothing left in the caller's hands to close — the U-1 leak, made
+      // permanent. The napi `ServeHandle.close` is infallible in Rust,
+      // but any method call on a V8-finalized napi instance throws, which
+      // is the failure mode that handle's own doc comment warns about.
+      // Releasing the service is the obligation; `inner.close()`'s error
+      // is still the caller's to see, so it propagates.
+      try {
+        inner.close()
+      } finally {
+        _closeRegistryIfEmpty(rpc, entry)
+      }
     },
   }
 }
