@@ -91,6 +91,16 @@ pub struct Cli {
     /// debug, `-vvv` = trace.
     #[arg(long, short, action = clap::ArgAction::Count)]
     pub verbose: u8,
+    /// Read the config even when it is group/world-accessible or
+    /// owned by another user.
+    ///
+    /// The config holds `psk_hex`, the mesh-membership root secret, so
+    /// the daemon refuses such a file by default: another local user
+    /// who can read it can join the mesh. Use this only where the
+    /// deployment genuinely cannot satisfy owner-only permissions, and
+    /// understand that it means the PSK is exposed.
+    #[arg(long, default_value_t = false)]
+    pub insecure_permissions: bool,
 }
 
 /// Top-level TOML config shape.
@@ -265,6 +275,12 @@ pub enum DaemonError {
         path: PathBuf,
         error: std::io::Error,
     },
+    /// The config file was refused before being read: it is not a
+    /// regular file, is owned by another user, or is group/world
+    /// accessible. It holds the mesh PSK. Pass
+    /// `--insecure-permissions` to override.
+    #[error("{0}")]
+    ConfigPermissions(net::adapter::net::secret_file::SecretFileError),
     /// The config file is not valid TOML.
     ///
     /// SEC-06 / LINUX-03: deliberately carries no `toml::de::Error`.
@@ -401,20 +417,28 @@ pub struct BootedDaemon {
 /// embedders that need to drive their own shutdown.
 pub async fn boot(cli: Cli) -> Result<BootedDaemon, DaemonError> {
     // Parse config.
-    let raw =
-        tokio::fs::read_to_string(&cli.config)
-            .await
-            .map_err(|e| DaemonError::ConfigRead {
-                path: cli.config.clone(),
-                error: e,
-            })?;
-
-    // The config holds the mesh PSK; warn if it's readable by other
-    // local users (advisory — see `warn_if_config_world_readable`).
-    // Checked here, *before* parsing: a malformed config still exposed
-    // the PSK on disk, so the operator must hear about loose perms even
-    // when boot is about to fail on a `ConfigParse` error.
-    warn_if_config_world_readable(&cli.config).await;
+    //
+    // SEC-05 / LINUX-02: the permission check is the *opener*, not an
+    // advisory pass afterwards. This file holds `psk_hex` — the
+    // mesh-membership root secret — so a mode that lets another local
+    // user read it is not a warning-level event: that user can join
+    // the mesh, and from there reach every service admission gates on
+    // membership alone. The daemon used to warn and boot anyway.
+    //
+    // Validating the opened descriptor rather than the path also
+    // closes the swap-between-check-and-read window the previous
+    // `metadata(path)` + `read_to_string(path)` pair left open.
+    let config_path = cli.config.clone();
+    let insecure = cli.insecure_permissions;
+    let raw = tokio::task::spawn_blocking(move || {
+        net::adapter::net::secret_file::read_secret_file_to_string(&config_path, insecure)
+    })
+    .await
+    .map_err(|e| DaemonError::ConfigRead {
+        path: cli.config.clone(),
+        error: std::io::Error::other(e),
+    })?
+    .map_err(DaemonError::ConfigPermissions)?;
 
     let config: Config = toml::from_str(&raw).map_err(|_| DaemonError::ConfigParse {
         path: cli.config.clone(),
@@ -1016,60 +1040,16 @@ fn decode_psk(s: &str) -> Result<[u8; 32], DaemonError> {
     decode_hex_32(s).map_err(DaemonError::PskInvalid)
 }
 
-/// Warn (don't fail) if the daemon config is group- or
-/// world-readable. The config holds `psk_hex` — the mesh
-/// pre-shared key that gates every handshake — so a permissive
-/// mode is the same exposure `cli/identity.rs::check_strict_permissions`
-/// guards its seed against. The detection rule (mode `& 0o077`) is
-/// deliberately identical; the *policy* differs: the CLI fails closed
-/// because it created the seed at 0600, whereas the daemon config is
-/// operator-authored and may live under a deployment's own permission
-/// scheme, so we only warn. Kept as a separate local check rather than
-/// a shared cross-crate helper because the CLI reaches this crate only
-/// transitively (via `net-sdk`) and the shared kernel is two lines.
-#[cfg(unix)]
-async fn warn_if_config_world_readable(path: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let meta = match tokio::fs::metadata(path).await {
-        Ok(m) => m,
-        // Couldn't stat the file we just read — surface it (don't go
-        // silent) so a missing exposure check is at least observable.
-        Err(e) => {
-            tracing::debug!(
-                config = %path.display(),
-                error = %e,
-                "could not stat aggregator config to check permissions; \
-                 skipping the PSK-exposure check",
-            );
-            return;
-        }
-    };
-    let mode = meta.permissions().mode() & 0o777;
-    // Group/other readable (or writable) → the PSK is exposed.
-    if mode & 0o077 != 0 {
-        tracing::warn!(
-            config = %path.display(),
-            mode = format!("{mode:#o}"),
-            "aggregator config is group/world-accessible but holds the mesh \
-             PSK (psk_hex); tighten to 0600 so the pre-shared key isn't \
-             readable by other local users",
-        );
-    }
-}
-
-/// Non-Unix has no clean mode bits via `std::fs`, so the permission
-/// gate can't run — but stay loud about it rather than silent (parity
-/// with the CLI's Windows branch), since the PSK-bearing config is just
-/// as exposable under a permissive NTFS ACL.
-#[cfg(not(unix))]
-async fn warn_if_config_world_readable(path: &std::path::Path) {
-    tracing::warn!(
-        config = %path.display(),
-        "aggregator config permission check is a no-op on this platform; \
-         the file holds the mesh PSK (psk_hex) — restrict its ACL so it \
-         isn't readable by other local users",
-    );
-}
+// SEC-05 / LINUX-02: `warn_if_config_world_readable` lived here and
+// warned-then-booted on a group/world-accessible config. It is gone,
+// not relocated: `boot` now reads the config through
+// `secret_file::read_secret_file_to_string`, which refuses such a file
+// outright (and additionally checks owner and file type, on the opened
+// descriptor rather than the path). The old comment argued the daemon
+// should only warn because the config is operator-authored — but the
+// file holds the mesh PSK, and an operator who has not tightened it
+// has exposed mesh membership, which is not a warning-level outcome.
+// `--insecure-permissions` is the deliberate opt-out.
 
 fn decode_seed(s: &str) -> Result<[u8; 32], String> {
     decode_hex_32(s)
@@ -1143,6 +1123,7 @@ psk_hex = \"{SENTINEL}\" trailing
             listen: None,
             print_bootstrap: false,
             verbose: 0,
+            insecure_permissions: false,
         };
         // Not `expect_err`: `BootedDaemon` is not `Debug`, and it owns
         // a live MeshNode — deriving Debug on it to satisfy a test
@@ -1458,5 +1439,88 @@ mod spawn_limit_tests {
             cfg.max_replica_count < u8::MAX,
             "the default must be below the wire maximum, or it bounds nothing"
         );
+    }
+}
+
+#[cfg(test)]
+mod secret_file_gate_tests {
+    use super::*;
+
+    /// SEC-05 / LINUX-02 witness. A group/world-accessible config must
+    /// stop the daemon, not merely annoy it.
+    ///
+    /// The file holds `psk_hex` — the mesh-membership root secret — so
+    /// a mode another local user can read is not a warning-level
+    /// event: that user can join the mesh, and mesh membership is what
+    /// several services admit on. The daemon used to log a warning and
+    /// boot anyway.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_world_readable_config_stops_the_daemon() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("net-sec05-agg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("aggregator.toml");
+        std::fs::write(
+            &path,
+            "listen = \"127.0.0.1:0\"\npsk_hex = \"00112233445566778899aabbccddeeff\
+             00112233445566778899aabbccddeeff\"\n",
+        )
+        .expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        let cli = Cli {
+            config: path.clone(),
+            listen: None,
+            print_bootstrap: false,
+            verbose: 0,
+            insecure_permissions: false,
+        };
+        match boot(cli).await {
+            Err(DaemonError::ConfigPermissions(e)) => {
+                assert_eq!(e.kind(), "permissive_mode", "got {e}");
+            }
+            Err(other) => panic!("expected a permission refusal, got {other:?}"),
+            Ok(_) => panic!(
+                "the daemon booted from a world-readable config holding the mesh PSK"
+            ),
+        }
+
+        // The named override still boots it — the point is that an
+        // operator has to ask.
+        let cli = Cli {
+            config: path.clone(),
+            listen: None,
+            print_bootstrap: false,
+            verbose: 0,
+            insecure_permissions: true,
+        };
+        let booted = boot(cli).await.expect("--insecure-permissions must still boot");
+        booted.mesh.shutdown().await.ok();
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Platform-independent: a config the daemon itself could not open
+    /// is a typed refusal naming the path, not a panic or a silent
+    /// default.
+    #[tokio::test]
+    async fn a_missing_config_is_a_typed_error() {
+        let cli = Cli {
+            config: std::path::PathBuf::from("/nonexistent/net-sec05/aggregator.toml"),
+            listen: None,
+            print_bootstrap: false,
+            verbose: 0,
+            insecure_permissions: false,
+        };
+        // Not `{other:?}`: `BootedDaemon` is not Debug, and deriving
+        // it to satisfy a test would mean rendering a live MeshNode.
+        match boot(cli).await {
+            Err(DaemonError::ConfigPermissions(e)) => assert_eq!(e.kind(), "io"),
+            Err(DaemonError::ConfigRead { .. }) => {}
+            Err(other) => panic!("expected a typed read failure, got {other:?}"),
+            Ok(_) => panic!("booted from a nonexistent config"),
+        }
     }
 }

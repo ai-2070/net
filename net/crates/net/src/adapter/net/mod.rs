@@ -80,6 +80,7 @@ mod reroute;
 mod route;
 mod router;
 mod session;
+pub mod secret_file;
 pub mod state;
 mod stream;
 pub mod subnet;

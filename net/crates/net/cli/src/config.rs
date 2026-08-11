@@ -97,6 +97,31 @@ impl ConfigFile {
     /// Load from disk. Returns `Ok(default)` when the file is
     /// missing — the binary is usable without a config.
     pub async fn load(path: Option<&Path>) -> Result<Self, ConfigError> {
+        Self::load_with(path, false).await
+    }
+
+    /// [`Self::load`], with `allow_insecure` skipping the secret-file
+    /// permission gate.
+    ///
+    /// SEC-05 / LINUX-02: this file can hold `psk_hex`, the
+    /// mesh-membership root secret, and it had no permission check at
+    /// all — the CLI would read a world-readable profile and attach to
+    /// the mesh without a word. Another local user reading it gets the
+    /// PSK plus the bootstrap address, pubkey and node id sitting
+    /// beside it: everything needed to join.
+    ///
+    /// The gate validates the opened descriptor (regular file, owned
+    /// by this user, no group/other access), which also closes the
+    /// swap-between-check-and-read window a path-based check leaves.
+    ///
+    /// A profile with no `psk_hex` is not secret-bearing, but the gate
+    /// necessarily runs before parsing and so cannot know that yet —
+    /// and a profile that gains a PSK later should not silently lose
+    /// the protection.
+    pub async fn load_with(
+        path: Option<&Path>,
+        allow_insecure: bool,
+    ) -> Result<Self, ConfigError> {
         let path = match path {
             Some(p) => p.to_path_buf(),
             None => match default_path() {
@@ -104,28 +129,50 @@ impl ConfigFile {
                 None => return Ok(Self::default()),
             },
         };
-        match tokio::fs::read_to_string(&path).await {
-            // SEC-06 / LINUX-03. The `toml::de::Error` is deliberately
-            // dropped rather than carried: its `Display` embeds the
-            // offending source line, and this file holds `psk_hex` —
-            // the mesh-membership root secret. A malformed PSK line
-            // (operator typo, truncated write, templating failure)
-            // would otherwise be reproduced verbatim wherever this
-            // error is printed: stderr, shell scrollback, CI logs,
-            // journald. Those readers are a far wider set than the
-            // config file's.
-            //
-            // Same sanitized shape the org and subnet key loaders
-            // already use. The line/column is the cost; a profile is
-            // small enough to eyeball, and no diagnostic is worth
-            // leaking the mesh PSK.
-            Ok(s) => toml::from_str(&s).map_err(|_| ConfigError::Parse { path: path.clone() }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(ConfigError::Io {
-                path: path.clone(),
-                source: e,
-            }),
-        }
+        let gate_path = path.clone();
+        let gated = tokio::task::spawn_blocking(move || {
+            ::net::adapter::net::secret_file::read_secret_file_to_string(&gate_path, allow_insecure)
+        })
+        .await
+        .map_err(|e| ConfigError::Io {
+            path: path.clone(),
+            source: std::io::Error::other(e),
+        })?;
+        let text = match gated {
+            Ok(t) => t,
+            // A missing config is not an error — the binary is usable
+            // without one.
+            Err(::net::adapter::net::secret_file::SecretFileError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                return Ok(Self::default())
+            }
+            Err(::net::adapter::net::secret_file::SecretFileError::Io { source, .. }) => {
+                return Err(ConfigError::Io {
+                    path: path.clone(),
+                    source,
+                })
+            }
+            Err(e) => {
+                return Err(ConfigError::Permissions {
+                    path: path.clone(),
+                    source: e,
+                })
+            }
+        };
+        // SEC-06 / LINUX-03. The `toml::de::Error` is deliberately
+        // dropped rather than carried: its `Display` embeds the
+        // offending source line, and this file holds `psk_hex` — the
+        // mesh-membership root secret. A malformed PSK line (operator
+        // typo, truncated write, templating failure) would otherwise
+        // be reproduced verbatim wherever this error is printed:
+        // stderr, shell scrollback, CI logs, journald. Those readers
+        // are a far wider set than the config file's.
+        //
+        // Same sanitized shape the org and subnet key loaders already
+        // use. The line/column is the cost; a profile is small enough
+        // to eyeball, and no diagnostic is worth leaking the mesh PSK.
+        toml::from_str(&text).map_err(|_| ConfigError::Parse { path: path.clone() })
     }
 }
 
@@ -143,6 +190,16 @@ pub enum ConfigError {
         path: PathBuf,
         #[source]
         source: std::io::Error,
+    },
+
+    /// The profile file was refused before being read: it is not a
+    /// regular file, is owned by another user, or is group/world
+    /// accessible. It can hold the mesh PSK.
+    #[error("{source}")]
+    Permissions {
+        path: PathBuf,
+        #[source]
+        source: ::net::adapter::net::secret_file::SecretFileError,
     },
 
     /// The profile file is not valid TOML.

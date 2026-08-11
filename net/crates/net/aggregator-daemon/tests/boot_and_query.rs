@@ -76,6 +76,12 @@ async fn daemon_boots_two_groups_and_serves_registry_rpc() {
         r#"
             listen = "127.0.0.1:0"
             psk_hex = "{PSK_HEX}"
+            # The querier node is built after boot, so its node id is not
+            # knowable when this config is written. These tests exercise the
+            # registry mechanics, not the operator gate — that gate has its own
+            # coverage in tests/aggregator_registry_rpc.rs and the daemon unit
+            # tests. Open it explicitly rather than by omission.
+            operators_any_admitted_peer = true
 
             [[group]]
             name = "alpha"
@@ -98,6 +104,7 @@ async fn daemon_boots_two_groups_and_serves_registry_rpc() {
         listen: None,
         verbose: 0,
         print_bootstrap: false,
+        insecure_permissions: false,
     };
     let booted = boot(cli).await.expect("daemon boot");
     assert_eq!(booted.registry.len(), 2);
@@ -157,6 +164,12 @@ async fn daemon_rejects_unknown_fold_kind_at_boot() {
         r#"
             listen = "127.0.0.1:0"
             psk_hex = "{PSK_HEX}"
+            # The querier node is built after boot, so its node id is not
+            # knowable when this config is written. These tests exercise the
+            # registry mechanics, not the operator gate — that gate has its own
+            # coverage in tests/aggregator_registry_rpc.rs and the daemon unit
+            # tests. Open it explicitly rather than by omission.
+            operators_any_admitted_peer = true
 
             [[group]]
             name = "bad"
@@ -172,6 +185,7 @@ async fn daemon_rejects_unknown_fold_kind_at_boot() {
         listen: None,
         verbose: 0,
         print_bootstrap: false,
+        insecure_permissions: false,
     };
     match boot(cli).await {
         Err(net_aggregator_daemon::DaemonError::AggregatorConfig { name, error }) => {
@@ -192,6 +206,12 @@ async fn spawn_and_unregister_rpc_round_trip_against_running_daemon() {
         r#"
             listen = "127.0.0.1:0"
             psk_hex = "{PSK_HEX}"
+            # The querier node is built after boot, so its node id is not
+            # knowable when this config is written. These tests exercise the
+            # registry mechanics, not the operator gate — that gate has its own
+            # coverage in tests/aggregator_registry_rpc.rs and the daemon unit
+            # tests. Open it explicitly rather than by omission.
+            operators_any_admitted_peer = true
 
             [[template]]
             name = "primary"
@@ -206,6 +226,7 @@ async fn spawn_and_unregister_rpc_round_trip_against_running_daemon() {
         listen: None,
         verbose: 0,
         print_bootstrap: false,
+        insecure_permissions: false,
     };
     let booted = boot(cli).await.expect("daemon boot");
     assert_eq!(booted.registry.len(), 0);
@@ -262,6 +283,12 @@ async fn scale_grows_existing_group_via_wire() {
         r#"
             listen = "127.0.0.1:0"
             psk_hex = "{PSK_HEX}"
+            # The querier node is built after boot, so its node id is not
+            # knowable when this config is written. These tests exercise the
+            # registry mechanics, not the operator gate — that gate has its own
+            # coverage in tests/aggregator_registry_rpc.rs and the daemon unit
+            # tests. Open it explicitly rather than by omission.
+            operators_any_admitted_peer = true
 
             [[template]]
             name = "primary"
@@ -276,6 +303,7 @@ async fn scale_grows_existing_group_via_wire() {
         listen: None,
         verbose: 0,
         print_bootstrap: false,
+        insecure_permissions: false,
     };
     let booted = boot(cli).await.expect("daemon boot");
 
@@ -334,6 +362,12 @@ async fn scale_unknown_group_returns_typed_server_error() {
         r#"
             listen = "127.0.0.1:0"
             psk_hex = "{PSK_HEX}"
+            # The querier node is built after boot, so its node id is not
+            # knowable when this config is written. These tests exercise the
+            # registry mechanics, not the operator gate — that gate has its own
+            # coverage in tests/aggregator_registry_rpc.rs and the daemon unit
+            # tests. Open it explicitly rather than by omission.
+            operators_any_admitted_peer = true
 
             [[template]]
             name = "primary"
@@ -348,6 +382,7 @@ async fn scale_unknown_group_returns_typed_server_error() {
         listen: None,
         verbose: 0,
         print_bootstrap: false,
+        insecure_permissions: false,
     };
     let booted = boot(cli).await.expect("daemon boot");
 
@@ -383,6 +418,12 @@ async fn scale_template_mismatch_returns_typed_server_error() {
         r#"
             listen = "127.0.0.1:0"
             psk_hex = "{PSK_HEX}"
+            # The querier node is built after boot, so its node id is not
+            # knowable when this config is written. These tests exercise the
+            # registry mechanics, not the operator gate — that gate has its own
+            # coverage in tests/aggregator_registry_rpc.rs and the daemon unit
+            # tests. Open it explicitly rather than by omission.
+            operators_any_admitted_peer = true
 
             [[template]]
             name = "primary"
@@ -403,6 +444,7 @@ async fn scale_template_mismatch_returns_typed_server_error() {
         listen: None,
         verbose: 0,
         print_bootstrap: false,
+        insecure_permissions: false,
     };
     let booted = boot(cli).await.expect("daemon boot");
 
@@ -445,6 +487,12 @@ async fn spawn_unknown_template_returns_typed_server_error() {
         r#"
             listen = "127.0.0.1:0"
             psk_hex = "{PSK_HEX}"
+            # The querier node is built after boot, so its node id is not
+            # knowable when this config is written. These tests exercise the
+            # registry mechanics, not the operator gate — that gate has its own
+            # coverage in tests/aggregator_registry_rpc.rs and the daemon unit
+            # tests. Open it explicitly rather than by omission.
+            operators_any_admitted_peer = true
         "#
     );
     let cfg_file = write_temp_config(&toml).await;
@@ -453,6 +501,7 @@ async fn spawn_unknown_template_returns_typed_server_error() {
         listen: None,
         verbose: 0,
         print_bootstrap: false,
+        insecure_permissions: false,
     };
     let booted = boot(cli).await.expect("daemon boot");
 
@@ -485,6 +534,12 @@ async fn daemon_rejects_duplicate_group_names_at_boot() {
         r#"
             listen = "127.0.0.1:0"
             psk_hex = "{PSK_HEX}"
+            # The querier node is built after boot, so its node id is not
+            # knowable when this config is written. These tests exercise the
+            # registry mechanics, not the operator gate — that gate has its own
+            # coverage in tests/aggregator_registry_rpc.rs and the daemon unit
+            # tests. Open it explicitly rather than by omission.
+            operators_any_admitted_peer = true
 
             [[group]]
             name = "dup"
@@ -507,6 +562,7 @@ async fn daemon_rejects_duplicate_group_names_at_boot() {
         listen: None,
         verbose: 0,
         print_bootstrap: false,
+        insecure_permissions: false,
     };
     match boot(cli).await {
         Err(net_aggregator_daemon::DaemonError::Registry(msg)) => {

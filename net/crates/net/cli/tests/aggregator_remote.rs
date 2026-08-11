@@ -119,6 +119,7 @@ async fn boot_daemon(toml: &str) -> (BootedDaemon, NamedTempFile) {
         listen: None,
         verbose: 0,
         print_bootstrap: false,
+        insecure_permissions: false,
     };
     let booted = boot(cli).await.expect("daemon boot");
     booted.mesh.start();
@@ -131,6 +132,12 @@ async fn ls_remote_lists_configured_groups() {
         r#"
             listen = "127.0.0.1:0"
             psk_hex = "{PSK_HEX}"
+            # The querier node is built after boot, so its node id is not
+            # knowable when this config is written. These tests exercise the
+            # registry mechanics, not the operator gate — that gate has its own
+            # coverage in tests/aggregator_registry_rpc.rs and the daemon unit
+            # tests. Open it explicitly rather than by omission.
+            operators_any_admitted_peer = true
 
             [[group]]
             name = "alpha"
@@ -172,6 +179,12 @@ async fn spawn_against_template_adds_a_group() {
         r#"
             listen = "127.0.0.1:0"
             psk_hex = "{PSK_HEX}"
+            # The querier node is built after boot, so its node id is not
+            # knowable when this config is written. These tests exercise the
+            # registry mechanics, not the operator gate — that gate has its own
+            # coverage in tests/aggregator_registry_rpc.rs and the daemon unit
+            # tests. Open it explicitly rather than by omission.
+            operators_any_admitted_peer = true
 
             [[template]]
             name = "primary"
@@ -219,6 +232,12 @@ async fn scale_resizes_existing_group() {
         r#"
             listen = "127.0.0.1:0"
             psk_hex = "{PSK_HEX}"
+            # The querier node is built after boot, so its node id is not
+            # knowable when this config is written. These tests exercise the
+            # registry mechanics, not the operator gate — that gate has its own
+            # coverage in tests/aggregator_registry_rpc.rs and the daemon unit
+            # tests. Open it explicitly rather than by omission.
+            operators_any_admitted_peer = true
 
             [[template]]
             name = "primary"
@@ -270,6 +289,12 @@ async fn query_returns_summary_for_configured_group() {
         r#"
             listen = "127.0.0.1:0"
             psk_hex = "{PSK_HEX}"
+            # The querier node is built after boot, so its node id is not
+            # knowable when this config is written. These tests exercise the
+            # registry mechanics, not the operator gate — that gate has its own
+            # coverage in tests/aggregator_registry_rpc.rs and the daemon unit
+            # tests. Open it explicitly rather than by omission.
+            operators_any_admitted_peer = true
 
             [[group]]
             name = "alpha"
