@@ -12,10 +12,12 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  TOOL_METADATA_FETCH_SERVICE,
   ToolCallParseError,
   ToolDescriptor,
   ToolEvent,
   ToolListChange,
+  ToolMetadataResponse,
   addToolCapabilitiesToAnnounce,
   anthropic,
   callToolStreaming,
@@ -24,9 +26,11 @@ import {
   isTerminalEvent,
   mcp,
   openai,
+  serveTool,
   serveToolStreaming,
   watchTools,
 } from '../tool'
+import type { TypedMeshRpc } from '../mesh_rpc'
 import { NetMesh } from '../index'
 
 const RUN_INTEGRATION_TESTS = process.env.RUN_INTEGRATION_TESTS === '1'
@@ -602,6 +606,250 @@ describe('serveToolStreaming server-side terminal synthesis', () => {
     expect(last.type).toBe('error')
     expect(last.code).toBe('handler_error')
     expect(last.message).toContain('boom')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Tool registry lifetime (U-1).
+// ---------------------------------------------------------------------------
+//
+// `serveTool` lazy-installs one `tool.metadata.fetch` service per rpc and
+// shares it across every tool registered on that rpc. That registration is
+// not free: it holds a mesh reference, so a metadata service that outlives
+// its last tool is what makes `MeshNode.shutdown()` report `cannot shutdown:
+// outstanding references exist` after a consumer has closed every handle
+// they were given.
+//
+// The invariant these witnesses pin is a count, not an event: the metadata
+// service exists exactly while at least one tool is registered. Closing the
+// FIRST of two tools must not close it — that is the tempting wrong repair,
+// and it silently breaks descriptor lookups for the tool still being served.
+
+describe('tool registry lifetime', () => {
+  interface ServedRecord {
+    service: string
+    closeCount: number
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    handler: (req: any) => any
+  }
+
+  /**
+   * A `TypedMeshRpc` stand-in handing back a distinct, counting
+   * `ServeHandle` per registration.
+   *
+   * Records are appended and never replaced, so a metadata service that
+   * gets re-installed after the registry emptied shows up as a SECOND
+   * record rather than overwriting the first — which is how
+   * `registrations()` can tell "reused a closed handle" from "installed
+   * a fresh one".
+   */
+  function fakeToolRpc() {
+    const served: ServedRecord[] = []
+    let failOn: string | null = null
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    function register(service: string, handler: (req: any) => any) {
+      if (failOn === service) throw new Error(`serve rejected ${service}`)
+      const record: ServedRecord = { service, closeCount: 0, handler }
+      served.push(record)
+      return {
+        close() {
+          record.closeCount += 1
+        },
+        isClosed() {
+          return record.closeCount > 0
+        },
+      }
+    }
+
+    const rpc = {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      serve: (service: string, handler: (req: any) => any) =>
+        register(service, handler),
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      serveStreaming: (service: string, handler: (req: any) => any) =>
+        register(service, handler),
+    }
+
+    const recordsFor = (service: string) =>
+      served.filter((r) => r.service === service)
+
+    return {
+      rpc: rpc as unknown as TypedMeshRpc,
+      /** How many times `service` was registered over this rpc's life. */
+      registrations: (service: string) => recordsFor(service).length,
+      /** Total `close()` calls across every registration of `service`. */
+      closes: (service: string) =>
+        recordsFor(service).reduce((n, r) => n + r.closeCount, 0),
+      /** Ask the newest installed metadata handler what it knows. */
+      askMetadata(name: string): ToolMetadataResponse {
+        const records = recordsFor(TOOL_METADATA_FETCH_SERVICE)
+        const latest = records[records.length - 1]
+        if (!latest) throw new Error('no tool.metadata.fetch handler installed')
+        return latest.handler({ name }) as ToolMetadataResponse
+      },
+      /** Make the next (and every later) `serve` of `service` throw. */
+      failServeOf(service: string | null) {
+        failOn = service
+      },
+    }
+  }
+
+  const echo = async (req: unknown) => req
+  async function* oneResult(): AsyncGenerator<ToolEvent> {
+    yield { type: 'result', data: 'ok' }
+  }
+
+  it('closing the only tool closes the shared metadata service', () => {
+    const rpc = fakeToolRpc()
+    const handle = serveTool(rpc.rpc, { name: 'echo' }, echo)
+
+    expect(rpc.registrations(TOOL_METADATA_FETCH_SERVICE)).toBe(1)
+    expect(rpc.closes(TOOL_METADATA_FETCH_SERVICE)).toBe(0)
+
+    handle.close()
+
+    expect(rpc.closes('echo')).toBe(1)
+    expect(rpc.closes(TOOL_METADATA_FETCH_SERVICE)).toBe(1)
+  })
+
+  it('the metadata service survives the first of two closes, not the second', () => {
+    const rpc = fakeToolRpc()
+    const alpha = serveTool(rpc.rpc, { name: 'alpha' }, echo)
+    const beta = serveTool(rpc.rpc, { name: 'beta' }, echo)
+
+    // One metadata service, shared.
+    expect(rpc.registrations(TOOL_METADATA_FETCH_SERVICE)).toBe(1)
+
+    alpha.close()
+    expect(rpc.closes('alpha')).toBe(1)
+    // `beta` is still served, so its descriptor must still be fetchable.
+    expect(rpc.closes(TOOL_METADATA_FETCH_SERVICE)).toBe(0)
+    expect(rpc.askMetadata('beta').type).toBe('found')
+    expect(rpc.askMetadata('alpha')).toEqual({ type: 'not_found', name: 'alpha' })
+
+    beta.close()
+    expect(rpc.closes('beta')).toBe(1)
+    expect(rpc.closes(TOOL_METADATA_FETCH_SERVICE)).toBe(1)
+  })
+
+  it('repeated close() on every handle changes no count', () => {
+    const rpc = fakeToolRpc()
+    const alpha = serveTool(rpc.rpc, { name: 'alpha' }, echo)
+    const beta = serveTool(rpc.rpc, { name: 'beta' }, echo)
+    alpha.close()
+    beta.close()
+
+    alpha.close()
+    beta.close()
+    alpha.close()
+
+    expect(rpc.closes('alpha')).toBe(1)
+    expect(rpc.closes('beta')).toBe(1)
+    expect(rpc.closes(TOOL_METADATA_FETCH_SERVICE)).toBe(1)
+  })
+
+  it('unary and streaming tools share one metadata service and one count', () => {
+    const rpc = fakeToolRpc()
+    const unary = serveTool(rpc.rpc, { name: 'unary' }, echo)
+    const streaming = serveToolStreaming(rpc.rpc, { name: 'streamer' }, oneResult)
+
+    expect(rpc.registrations(TOOL_METADATA_FETCH_SERVICE)).toBe(1)
+
+    unary.close()
+    expect(rpc.closes(TOOL_METADATA_FETCH_SERVICE)).toBe(0)
+
+    streaming.close()
+    expect(rpc.closes(TOOL_METADATA_FETCH_SERVICE)).toBe(1)
+  })
+
+  it('closing the last streaming tool releases the metadata service', () => {
+    const rpc = fakeToolRpc()
+    const streaming = serveToolStreaming(rpc.rpc, { name: 'streamer' }, oneResult)
+    streaming.close()
+    expect(rpc.closes('streamer')).toBe(1)
+    expect(rpc.closes(TOOL_METADATA_FETCH_SERVICE)).toBe(1)
+  })
+
+  it('a failed unary registration leaves no descriptor and no live metadata service', () => {
+    const rpc = fakeToolRpc()
+    rpc.failServeOf('boom')
+
+    expect(() => serveTool(rpc.rpc, { name: 'boom' }, echo)).toThrow(
+      /serve rejected boom/,
+    )
+
+    // The metadata service was installed for the attempt — and released
+    // with it, because the attempt left no tool behind to justify it.
+    expect(rpc.registrations(TOOL_METADATA_FETCH_SERVICE)).toBe(1)
+    expect(rpc.closes(TOOL_METADATA_FETCH_SERVICE)).toBe(1)
+    // The handler still closes over the registry it was built against;
+    // rollback must have removed the descriptor from it.
+    expect(rpc.askMetadata('boom')).toEqual({ type: 'not_found', name: 'boom' })
+  })
+
+  it('a failed registration beside a live tool does not disturb it', () => {
+    const rpc = fakeToolRpc()
+    const keep = serveTool(rpc.rpc, { name: 'keep' }, echo)
+    rpc.failServeOf('boom')
+
+    expect(() => serveTool(rpc.rpc, { name: 'boom' }, echo)).toThrow()
+
+    expect(rpc.closes(TOOL_METADATA_FETCH_SERVICE)).toBe(0)
+    expect(rpc.askMetadata('keep').type).toBe('found')
+    expect(rpc.askMetadata('boom')).toEqual({ type: 'not_found', name: 'boom' })
+
+    keep.close()
+    expect(rpc.closes(TOOL_METADATA_FETCH_SERVICE)).toBe(1)
+  })
+
+  it('a failed streaming registration rolls back the same way', () => {
+    const rpc = fakeToolRpc()
+    rpc.failServeOf('boom')
+
+    expect(() =>
+      serveToolStreaming(rpc.rpc, { name: 'boom' }, oneResult),
+    ).toThrow(/serve rejected boom/)
+
+    expect(rpc.closes(TOOL_METADATA_FETCH_SERVICE)).toBe(1)
+    expect(rpc.askMetadata('boom')).toEqual({ type: 'not_found', name: 'boom' })
+  })
+
+  it('registering again after the last close installs a fresh metadata service', () => {
+    const rpc = fakeToolRpc()
+    serveTool(rpc.rpc, { name: 'first' }, echo).close()
+    expect(rpc.registrations(TOOL_METADATA_FETCH_SERVICE)).toBe(1)
+
+    const second = serveTool(rpc.rpc, { name: 'second' }, echo)
+
+    // A CLOSED handle cannot serve anything: the second round has to get
+    // its own registration, not the corpse of the first.
+    expect(rpc.registrations(TOOL_METADATA_FETCH_SERVICE)).toBe(2)
+    expect(rpc.askMetadata('second').type).toBe('found')
+
+    second.close()
+    expect(rpc.closes(TOOL_METADATA_FETCH_SERVICE)).toBe(2)
+  })
+
+  it('a metadata install that failed is retried by the next serveTool', () => {
+    const rpc = fakeToolRpc()
+    // Models the recoverable case the install already swallows: someone
+    // registered `tool.metadata.fetch` by hand first.
+    rpc.failServeOf(TOOL_METADATA_FETCH_SERVICE)
+    const alpha = serveTool(rpc.rpc, { name: 'alpha' }, echo)
+    expect(rpc.registrations(TOOL_METADATA_FETCH_SERVICE)).toBe(0)
+
+    rpc.failServeOf(null)
+    const beta = serveTool(rpc.rpc, { name: 'beta' }, echo)
+    expect(rpc.registrations(TOOL_METADATA_FETCH_SERVICE)).toBe(1)
+    // The retried handler sees BOTH tools — it reads the same registry.
+    expect(rpc.askMetadata('alpha').type).toBe('found')
+    expect(rpc.askMetadata('beta').type).toBe('found')
+
+    alpha.close()
+    expect(rpc.closes(TOOL_METADATA_FETCH_SERVICE)).toBe(0)
+    beta.close()
+    expect(rpc.closes(TOOL_METADATA_FETCH_SERVICE)).toBe(1)
   })
 })
 

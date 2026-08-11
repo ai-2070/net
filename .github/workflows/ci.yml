@@ -1389,6 +1389,21 @@ jobs:
       - name: Run tests
         run: npm test
 
+      # The tool-serving cleanup journey needs a real mesh: the property
+      # under test is that closing every handle the SDK hands you releases
+      # the node's last reference, and a fake `ServeHandle` cannot fail to
+      # do that. Reuses the binding built above — a second `napi build`
+      # solely for one file would double this job's cost for nothing.
+      #
+      # Named explicitly rather than flipping RUN_INTEGRATION_TESTS on for
+      # the whole `npm test` run: the other integration-gated suites want
+      # a two-node handshake and their own budget, and folding them in
+      # here would change what this step means when it goes red.
+      - name: Run live tool-lifecycle witness
+        env:
+          RUN_INTEGRATION_TESTS: "1"
+        run: npm test -- --run test/tool_lifecycle_live.test.ts
+
   sdk-ts-tests:
     name: TypeScript SDK tests (vitest + tsc)
     runs-on: ubuntu-latest
