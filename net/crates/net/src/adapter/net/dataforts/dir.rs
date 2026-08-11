@@ -1024,17 +1024,72 @@ fn write_file(path: &Path, bytes: &[u8], mode: u32) -> Result<(), DirError> {
     Ok(())
 }
 
-#[cfg(unix)]
+/// Unix mode bits above `0o777`: setuid (`0o4000`), setgid (`0o2000`)
+/// and the sticky bit (`0o1000`).
+const SPECIAL_MODE_BITS: u32 = 0o7000;
+
+/// Reduce a manifest-supplied file mode to the bits a remote peer is
+/// allowed to choose.
+///
+/// A directory manifest is attacker-controlled input: `DirEntry::File.mode`
+/// is whatever the publisher wrote, and it used to reach
+/// `Permissions::from_mode` unchanged. A manifest asking for `0o4755`
+/// therefore produced a setuid executable owned by whoever ran the
+/// fetch. Fetch as root — a system-level `net` service pulling a
+/// directory, say — and the result is a root-owned setuid binary
+/// sitting in a directory another local user can execute: a local
+/// privilege-escalation primitive handed over by a *download*.
+///
+/// Umask is no defence here, because the mode is applied by an
+/// explicit `chmod` after the file exists.
+///
+/// So: keep the ordinary permission bits, drop setuid/setgid/sticky
+/// unconditionally. Nothing about "fetch a directory from a peer"
+/// implies "and grant it elevated execution rights"; a workflow that
+/// genuinely needs special bits restored needs to say so explicitly
+/// through a path that isn't ordinary remote fetch.
+///
+/// `0` is preserved as `0` — it is the manifest's "no mode recorded"
+/// (a non-Unix publisher), and callers skip the `chmod` entirely.
+/// A mode of *only* special bits, `0o4000`, sanitizes to `0` and so
+/// leaves the file at the creating process's umask default, which is
+/// the safe reading of a nonsensical request.
+fn sanitize_remote_file_mode(mode: u32) -> u32 {
+    // Written as "keep the permission-ish bits, then remove the
+    // privileged ones" rather than the equivalent `& 0o777`, so the
+    // rule this enforces is legible at the point it is enforced.
+    (mode & 0o7777) & !SPECIAL_MODE_BITS
+}
+
+/// Apply a manifest-supplied mode to a reconstructed file.
+///
+/// The single choke point for remote modes: both the buffered
+/// ([`write_file`]) and streamed ([`fetch_blob_to_file`]) write paths
+/// land here, so sanitizing inside it — rather than at each caller —
+/// means a future third write path cannot forget.
+///
+/// Deliberately not split into two `#[cfg]` functions. The sanitizing
+/// step is platform-independent and stays on every build, so the rule
+/// is compiled and unit-tested on Windows CI too; only the `chmod`
+/// itself is Unix-gated.
 fn apply_mode(path: &Path, mode: u32) -> Result<(), DirError> {
-    if mode != 0 {
+    let mode = sanitize_remote_file_mode(mode);
+    if mode == 0 {
+        // No mode recorded, or a mode consisting only of bits we just
+        // dropped. Leave the file at the creating process's default.
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
     }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn apply_mode(_path: &Path, _mode: u32) -> Result<(), DirError> {
+    #[cfg(not(unix))]
+    {
+        // Windows has no mode to apply; NTFS ACLs are inherited from
+        // the destination directory.
+        let _ = path;
+    }
     Ok(())
 }
 
@@ -1072,6 +1127,98 @@ fn hex(hash: &[u8; 32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SEC-04 / LINUX-01. `DirEntry::File.mode` is whatever the
+    /// manifest publisher wrote, and it used to reach
+    /// `Permissions::from_mode` verbatim.
+    ///
+    /// Platform-independent by design: the masking is a pure
+    /// function precisely so the rule is pinned on every CI host,
+    /// not only the ones that can chmod. The companion test below
+    /// proves the rule is actually wired into the write path.
+    #[test]
+    fn remote_file_modes_never_carry_setuid_setgid_or_sticky() {
+        // The exploit shapes named in the finding.
+        assert_eq!(sanitize_remote_file_mode(0o4755), 0o755, "setuid stripped");
+        assert_eq!(sanitize_remote_file_mode(0o2755), 0o755, "setgid stripped");
+        assert_eq!(sanitize_remote_file_mode(0o1777), 0o777, "sticky stripped");
+        assert_eq!(sanitize_remote_file_mode(0o6755), 0o755, "setuid+setgid");
+        assert_eq!(sanitize_remote_file_mode(0o7777), 0o777, "all three");
+
+        // Ordinary modes survive untouched — a fix that also broke
+        // executables or private files would be traded for a
+        // different bug.
+        for ordinary in [0o755, 0o644, 0o600, 0o777, 0o400, 0o111] {
+            assert_eq!(
+                sanitize_remote_file_mode(ordinary),
+                ordinary,
+                "{ordinary:o} is an ordinary mode and must be preserved"
+            );
+        }
+
+        // `0` means "no mode recorded" (non-Unix publisher) and must
+        // stay 0 so callers skip the chmod rather than applying an
+        // empty permission set.
+        assert_eq!(sanitize_remote_file_mode(0), 0);
+
+        // Special bits alone degrade to "no mode", not to a chmod of
+        // the special bits with no permissions.
+        assert_eq!(sanitize_remote_file_mode(0o4000), 0);
+
+        // Nothing above the low 12 bits leaks through either — e.g. a
+        // publisher that sent a full `st_mode` with S_IFREG (0o100000)
+        // set rather than just the permission bits.
+        assert_eq!(sanitize_remote_file_mode(0o100_644), 0o644);
+        assert_eq!(sanitize_remote_file_mode(u32::MAX) & !0o777, 0);
+
+        // The property, stated once: no output ever has a special bit.
+        for mode in 0u32..0o10_000 {
+            assert_eq!(
+                sanitize_remote_file_mode(mode) & SPECIAL_MODE_BITS,
+                0,
+                "mode {mode:o} sanitized to something still privileged"
+            );
+        }
+    }
+
+    /// The rule above is only worth anything if the write path uses
+    /// it. Writes a file with a manifest mode of `0o4755` and reads
+    /// the resulting mode back off the filesystem.
+    ///
+    /// Unix-only: there is no `st_mode` to assert on elsewhere, and
+    /// `apply_mode` is a no-op on those platforms.
+    #[cfg(unix)]
+    #[test]
+    fn write_file_does_not_create_a_setuid_file_from_a_hostile_manifest() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "net-sec04-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("payload");
+
+        write_file(&path, b"#!/bin/sh\nid\n", 0o4755).expect("write");
+
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+        assert_eq!(
+            mode & SPECIAL_MODE_BITS,
+            0,
+            "extracted file kept privileged bits: {:o} — a root-owned fetch \
+             would have produced a setuid binary",
+            mode
+        );
+        assert_eq!(
+            mode & 0o777,
+            0o755,
+            "the ordinary permission bits should survive; got {:o}",
+            mode
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Review-bot P2 regression — the byte-permit clamp must run
     /// in the u64 domain BEFORE the u32 cast. `store_dir`
