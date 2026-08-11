@@ -256,9 +256,14 @@ func goComputeProcess(daemonID C.uint64_t, originHash C.uint64_t, sequence C.uin
 	// Copy the payload — the Rust side owns the underlying `Bytes`
 	// and may free it after this callback returns. Go slices
 	// backed by Rust memory are unsafe to retain.
-	var payload []byte
-	if payloadLen > 0 {
-		payload = C.GoBytes(unsafe.Pointer(payloadPtr), C.int(payloadLen))
+	// `goBytesChecked` refuses a length that would not survive the
+	// 32-bit `C.int` cast `C.GoBytes` takes, instead of silently
+	// truncating (or, once past MaxInt32, going negative). Same helper
+	// the meshos and RPC trampolines use — the compute path was the
+	// odd one out.
+	payload, okLen := goBytesChecked(payloadPtr, payloadLen)
+	if !okLen {
+		return -1
 	}
 	outs, err := d.Process(CausalEvent{
 		OriginHash: uint64(originHash),
@@ -370,9 +375,9 @@ func goComputeRestore(daemonID C.uint64_t, statePtr *C.uint8_t, stateLen C.size_
 		// Node / Python semantics: absent `restore` = ignore state.
 		return C.NET_COMPUTE_OK
 	}
-	var state []byte
-	if stateLen > 0 {
-		state = C.GoBytes(unsafe.Pointer(statePtr), C.int(stateLen))
+	state, okLen := goBytesChecked(statePtr, stateLen)
+	if !okLen {
+		return -1
 	}
 	if err := restorer.Restore(state); err != nil {
 		return -1

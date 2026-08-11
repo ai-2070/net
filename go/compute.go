@@ -526,7 +526,13 @@ func (rt *DaemonRuntime) Snapshot(originHash uint64) ([]byte, error) {
 	if C.net_compute_outputs_at(outputs, C.size_t(0), &ptr, &length) != C.NET_COMPUTE_OK {
 		return nil, &DaemonError{Message: "snapshot: failed to read bytes"}
 	}
-	return C.GoBytes(unsafe.Pointer(ptr), C.int(length)), nil
+	snapshot, okLen := goBytesChecked(ptr, length)
+	if !okLen {
+		return nil, &DaemonError{
+			Message: "snapshot: daemon state is too large to represent as a Go slice",
+		}
+	}
+	return snapshot, nil
 }
 
 // SpawnFromSnapshot creates a new daemon of `kind` seeded from a
@@ -663,7 +669,13 @@ func (rt *DaemonRuntime) Deliver(originHash uint64, event CausalEvent) ([][]byte
 		}
 		// Copy — outputs pointer lifetime is tied to the outputs
 		// vec which we're about to free.
-		out[i] = C.GoBytes(unsafe.Pointer(ptr), C.int(length))
+		copied, okLen := goBytesChecked(ptr, length)
+		if !okLen {
+			return nil, &DaemonError{
+				Message: "deliver: daemon output is too large to represent as a Go slice",
+			}
+		}
+		out[i] = copied
 	}
 	return out, nil
 }
