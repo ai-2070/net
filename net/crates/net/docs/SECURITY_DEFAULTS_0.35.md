@@ -1,6 +1,6 @@
 # Fail-closed defaults in 0.35
 
-0.35 closes a set of authorization and file-permission findings. Seven
+0.35 closes a set of authorization and file-permission findings. Eight
 defaults changed from permissive to fail-closed. **Each one can stop a
 working deployment on upgrade**, and each is deliberate: in every case
 the previous default granted something to anyone who completed the mesh
@@ -185,6 +185,40 @@ bits are preserved; the special bits are dropped unconditionally.
 No configuration. If you were relying on a fetched directory to carry
 setuid bits, that never worked safely.
 
+## 8. A2A tasks are bound to their submitter
+
+**Was:** `status` and `cancel` keyed on the caller-supplied task id
+alone, and the registry stored no submitter. Any in-root peer that
+learned an id could read the task's full brief — prompt and context
+refs — or cancel the work.
+
+**Now:** each task is bound at submission to the AEAD-authenticated
+peer that submitted it. Status and cancel only see that peer's own
+tasks; another submitter's task reads as *unknown* rather than
+forbidden, so a denial is not an existence oracle.
+
+Submission stays open to every in-root peer. That part was deliberate
+and is unchanged — same-root reachability means permission to submit
+work, not permission to inspect and cancel everyone else's.
+
+A task id is a name, not a bearer capability: it is client-generated
+and travels through logs, dashboards and polling loops as an ordinary
+identifier. Third-party observation, if it is ever wanted, needs an
+explicit delegated capability rather than a leaked id.
+
+**API change** for direct `TaskRegistry` users — `submit`, `status`,
+`record`, `cancel` and `forget` take a `TaskOwner` (`Local` for
+in-process use, `Peer(node_id)` from the wire), and `submit` returns
+`Result`: reusing an id for a *different* brief is now
+`SubmitRejection::IdReusedForDifferentBrief` rather than a silent
+hand-back of the earlier task. Identical re-submits stay idempotent
+(the nRPC retransmit case). Entries are keyed by `(owner, task_id)`,
+so two peers may use the same id without interfering — and no peer can
+squat obvious ids to deny another.
+
+The wire format is unchanged; this is entirely server-side, so a peer
+on an older build still interoperates.
+
 ---
 
 ## The operator identity workflow
@@ -224,6 +258,7 @@ like a failure and not a hang:
 | Aggregator registry | `RegistryRpcError::Unauthorized` (C: `NET_REGISTRY_ERR_UNAUTHORIZED`) |
 | MeshDB | `MeshError::Unauthorized` |
 | Secret files | typed error naming the path and a category |
+| A2A status / cancel | another submitter's task reads as unknown |
 
 The MeshDB and transfer refusals deliberately do not name the chain or
 resource that was refused: doing so would turn a denial into an

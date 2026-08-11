@@ -81,8 +81,7 @@ pub use net::adapter::net::behavior::aggregator::{
     snapshot_group, AggregatorConfig, AggregatorDaemon, AggregatorError, AggregatorGroupEntry,
     AggregatorPublishError, AggregatorRegistry, AggregatorRegistryError, CapabilityFoldSummarizer,
     EntrySnapshot, RegistryAdminPolicy, RegistryHandler, RegistryReadHandler,
-    ReservationFoldSummarizer, Summarizer,
-    SummaryAnnouncement,
+    ReservationFoldSummarizer, Summarizer, SummaryAnnouncement,
 };
 
 // ─── Lifecycle primitives ───
