@@ -435,6 +435,8 @@ func init() {
 	// `net_compute_*_fn` signatures (with `const uint8_t*` /
 	// `const char*` parameters) and thunk into the `//export`ed Go
 	// functions which cgo emits with non-const pointer parameters.
+	// The deallocator must be registered first — see callback_free.go.
+	registerCallbackFree()
 	code := C.net_compute_set_dispatcher(
 		C.net_compute_process_fn(C.bridgeProcess),
 		C.net_compute_snapshot_fn(C.bridgeSnapshot),

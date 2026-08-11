@@ -34,8 +34,10 @@
 //! `handler_id: u64` (the Go side's lookup key for its handler
 //! registry) plus `(req_ptr, req_len)`. The Go side returns
 //! `(out_resp_ptr, out_resp_len)` heap-allocated via `C.malloc`;
-//! the Rust side copies into a `Bytes` and frees the Go buffer
-//! via `libc::free`.
+//! the Rust side copies into a `Bytes` and releases the Go buffer
+//! through the Go-registered deallocator — never `libc::free`, which
+//! on Windows would free on a different CRT heap. See
+//! [`free_callback_buffer`].
 
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
@@ -478,7 +480,8 @@ fn format_rpc_error(err: &InnerRpcError) -> String {
 /// and returns `0`. On failure, sets `*out_err` to a heap-
 /// allocated UTF-8 message and returns non-zero. Rust copies the
 /// response bytes into a `Bytes`, then releases the Go-allocated
-/// buffer via `libc::free`.
+/// buffer through the Go-registered deallocator — see
+/// [`free_callback_buffer`].
 pub type RpcHandlerFn = unsafe extern "C" fn(
     handler_id: u64,
     req_ptr: *const u8,
@@ -493,15 +496,107 @@ pub type RpcHandlerFn = unsafe extern "C" fn(
 /// silently ignored (first registration wins — `OnceLock`).
 static DISPATCHER: OnceLock<RpcHandlerFn> = OnceLock::new();
 
+
+/// Releases a buffer the Go callback layer allocated.
+///
+/// Implemented in the Go module's own C translation unit
+/// (`go/compute_dispatch_bridge.c`), so the `free` runs in the CRT that
+/// ran the `malloc`.
+pub type CallbackFreeFn = unsafe extern "C" fn(*mut std::ffi::c_void);
+
+/// The Go-registered deallocator. First-call-wins.
+static CALLBACK_FREE: std::sync::OnceLock<CallbackFreeFn> = std::sync::OnceLock::new();
+
+/// Release a pointer the Go callback layer allocated.
+///
+/// **Never `libc::free`.** Go allocates these with `C.malloc` /
+/// `C.CString`, which resolve to the CRT linked into the CGO
+/// application module; `libc::free` here resolves to `net.dll`'s. On
+/// Linux both land on the same glibc heap and the mismatch is
+/// invisible, which is why this survived so long. On Windows each
+/// module carries its own heap, so it is a wrong-heap free — Application
+/// Verifier reported `StopCode 0x6` on a 26-byte block that was exactly
+/// a Go handler response, with `ucrtbase!free_base` under
+/// `net!net_org_serve`. Real corruption, and deterministic process
+/// termination.
+///
+/// With no deallocator registered the buffer is **leaked**, loudly and
+/// once: leaking bounded bytes beats corrupting a heap. On Windows that
+/// branch is unreachable, because dispatcher registration refuses
+/// without one.
+fn free_callback_buffer(ptr: *mut std::ffi::c_void) {
+    if ptr.is_null() {
+        return;
+    }
+    match CALLBACK_FREE.get() {
+        Some(f) => unsafe { f(ptr) },
+        None => {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "net-rpc-ffi: no callback deallocator registered (net_rpc_set_callback_free was \
+                     never called); leaking Go callback buffers rather than \
+                     freeing them on the wrong heap. Update the Go wrapper."
+                );
+            }
+        }
+    }
+}
+
+/// Register the deallocator for Go-allocated callback buffers.
+///
+/// Must be called **before** any dispatcher registration; on Windows
+/// that ordering is enforced, because releasing a Go buffer from this
+/// DLL's CRT corrupts the heap.
+///
+/// Idempotent — first call wins. Returns `0` on success, `-1` for a
+/// null pointer.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_set_callback_free(free_fn: Option<CallbackFreeFn>) -> c_int {
+    match free_fn {
+        Some(f) => {
+            let _ = CALLBACK_FREE.set(f);
+            0
+        }
+        None => -1,
+    }
+}
+
+/// Whether a callback deallocator has been registered.
+///
+/// Dispatcher registration consults this on Windows and refuses without
+/// one: a Go wrapper built before `net_rpc_set_callback_free` existed would otherwise
+/// pair with this DLL and reintroduce the wrong-heap free at the first
+/// callback — a crash at an arbitrary later moment instead of a refusal
+/// at startup.
+fn callback_free_registered() -> bool {
+    CALLBACK_FREE.get().is_some()
+}
+
+/// The message a refused dispatcher registration prints.
+fn warn_missing_callback_free(what: &str) {
+    eprintln!(
+        "net-rpc-ffi: refusing to register {what} before net_rpc_set_callback_free. On Windows this \
+         DLL cannot free a buffer the Go module allocated — the CRT heaps \
+         differ. Update the Go wrapper to match this library."
+    );
+}
+
 /// Register the process-wide handler dispatcher. Idempotent —
 /// only the first call takes effect; later calls return without
 /// changing the dispatcher.
 ///
 /// The Go binding calls this once during package init.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_rpc_set_handler_dispatcher(dispatcher: RpcHandlerFn) {
-    ffi_guard!((), {
+pub extern "C" fn net_rpc_set_handler_dispatcher(dispatcher: RpcHandlerFn) -> c_int {
+    ffi_guard!(-1, {
+        if cfg!(windows) && !callback_free_registered() {
+            warn_missing_callback_free("the unary handler dispatcher");
+            return -1;
+        }
         let _ = DISPATCHER.set(dispatcher);
+        0
     })
 }
 
@@ -558,7 +653,7 @@ impl RpcHandler for GoRpcHandler {
                     // oversized `resp_len` would be UB. Free the
                     // Go-allocated buffer and surface a clean error.
                     if resp_len > isize::MAX as usize {
-                        unsafe { libc::free(resp_ptr as *mut libc::c_void) };
+                        free_callback_buffer(resp_ptr as *mut std::ffi::c_void);
                         return Err("Go handler response length exceeds isize::MAX".to_string());
                     }
                     // Copy the Go-allocated response bytes into a
@@ -566,7 +661,7 @@ impl RpcHandler for GoRpcHandler {
                     // from the Go-malloc'd buffer.
                     let bytes = unsafe { std::slice::from_raw_parts(resp_ptr, resp_len).to_vec() };
                     // Release the Go-allocated buffer.
-                    unsafe { libc::free(resp_ptr as *mut libc::c_void) };
+                    free_callback_buffer(resp_ptr as *mut std::ffi::c_void);
                     Ok(bytes)
                 } else {
                     // Go reported an error; pull the message out
@@ -577,7 +672,7 @@ impl RpcHandler for GoRpcHandler {
                         let s = unsafe { std::ffi::CStr::from_ptr(err_ptr) }
                             .to_string_lossy()
                             .into_owned();
-                        unsafe { libc::free(err_ptr as *mut libc::c_void) };
+                        free_callback_buffer(err_ptr as *mut std::ffi::c_void);
                         s
                     };
                     Err(msg)
@@ -2819,8 +2914,9 @@ pub extern "C" fn net_rpc_call_streaming_with_headers_cancellable(
 /// drains the request stream via [`net_rpc_request_stream_next`]
 /// and returns one terminal response body (or an error). The
 /// terminal body is heap-allocated by the Go side (typically via
-/// `C.malloc`); Rust copies into a `Bytes` and `libc::free`s the
-/// Go buffer — same convention as the unary `RpcHandlerFn`.
+/// `C.malloc`); Rust copies into a `Bytes` and releases the Go
+/// buffer through the registered deallocator — same convention as the
+/// unary `RpcHandlerFn`.
 pub type RpcClientStreamingHandlerFn = unsafe extern "C" fn(
     handler_id: u64,
     request_stream: *mut RpcRequestStreamHandleC,
@@ -2859,18 +2955,28 @@ static DUPLEX_DISPATCHER: OnceLock<RpcDuplexHandlerFn> = OnceLock::new();
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_set_client_streaming_handler_dispatcher(
     dispatcher: RpcClientStreamingHandlerFn,
-) {
-    ffi_guard!((), {
+) -> c_int {
+    ffi_guard!(-1, {
+        if cfg!(windows) && !callback_free_registered() {
+            warn_missing_callback_free("the client-streaming handler dispatcher");
+            return -1;
+        }
         let _ = CLIENT_STREAMING_DISPATCHER.set(dispatcher);
+        0
     })
 }
 
 /// Register the process-wide duplex handler dispatcher.
 /// Idempotent — first registration wins.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_rpc_set_duplex_handler_dispatcher(dispatcher: RpcDuplexHandlerFn) {
-    ffi_guard!((), {
+pub extern "C" fn net_rpc_set_duplex_handler_dispatcher(dispatcher: RpcDuplexHandlerFn) -> c_int {
+    ffi_guard!(-1, {
+        if cfg!(windows) && !callback_free_registered() {
+            warn_missing_callback_free("the duplex handler dispatcher");
+            return -1;
+        }
         let _ = DUPLEX_DISPATCHER.set(dispatcher);
+        0
     })
 }
 
@@ -3069,7 +3175,7 @@ impl RpcClientStreamingHandler for GoClientStreamingRpcHandler {
                     // `isize::MAX` guard before `from_raw_parts`, same
                     // as the unary handler bridge.
                     if resp_len > isize::MAX as usize {
-                        unsafe { libc::free(resp_ptr as *mut libc::c_void) };
+                        free_callback_buffer(resp_ptr as *mut std::ffi::c_void);
                         return Err(
                             "Go client-streaming handler response length exceeds isize::MAX"
                                 .to_string(),
@@ -3077,7 +3183,7 @@ impl RpcClientStreamingHandler for GoClientStreamingRpcHandler {
                     }
                     let bytes =
                         unsafe { std::slice::from_raw_parts(resp_ptr, resp_len).to_vec() };
-                    unsafe { libc::free(resp_ptr as *mut libc::c_void) };
+                    free_callback_buffer(resp_ptr as *mut std::ffi::c_void);
                     Ok(bytes)
                 } else {
                     let msg = if err_ptr.is_null() {
@@ -3086,7 +3192,7 @@ impl RpcClientStreamingHandler for GoClientStreamingRpcHandler {
                         let s = unsafe { std::ffi::CStr::from_ptr(err_ptr) }
                             .to_string_lossy()
                             .into_owned();
-                        unsafe { libc::free(err_ptr as *mut libc::c_void) };
+                        free_callback_buffer(err_ptr as *mut std::ffi::c_void);
                         s
                     };
                     Err(msg)
@@ -3183,7 +3289,7 @@ impl RpcDuplexHandler for GoDuplexRpcHandler {
                         let s = unsafe { std::ffi::CStr::from_ptr(err_ptr) }
                             .to_string_lossy()
                             .into_owned();
-                        unsafe { libc::free(err_ptr as *mut libc::c_void) };
+                        free_callback_buffer(err_ptr as *mut std::ffi::c_void);
                         s
                     };
                     Err(msg)
@@ -3290,9 +3396,14 @@ static STREAMING_DISPATCHER: OnceLock<RpcStreamingHandlerFn> = OnceLock::new();
 /// Register the process-wide streaming handler dispatcher.
 /// Idempotent — first registration wins.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_rpc_set_streaming_handler_dispatcher(dispatcher: RpcStreamingHandlerFn) {
-    ffi_guard!((), {
+pub extern "C" fn net_rpc_set_streaming_handler_dispatcher(dispatcher: RpcStreamingHandlerFn) -> c_int {
+    ffi_guard!(-1, {
+        if cfg!(windows) && !callback_free_registered() {
+            warn_missing_callback_free("the server-streaming handler dispatcher");
+            return -1;
+        }
         let _ = STREAMING_DISPATCHER.set(dispatcher);
+        0
     })
 }
 
@@ -3354,7 +3465,7 @@ impl ::net::adapter::net::cortex::RpcStreamingHandler for GoStreamingRpcHandler 
                         let s = unsafe { std::ffi::CStr::from_ptr(err_ptr) }
                             .to_string_lossy()
                             .into_owned();
-                        unsafe { libc::free(err_ptr as *mut libc::c_void) };
+                        free_callback_buffer(err_ptr as *mut std::ffi::c_void);
                         s
                     };
                     Err(msg)

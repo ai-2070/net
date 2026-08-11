@@ -51,7 +51,8 @@ use net::ffi::mesh::{
 use net_org::{
     net_org_bind, net_org_call_exported, net_org_client_free, net_org_credentials_new,
     net_org_free_cstring, net_org_reserve_handler_id, net_org_response_free,
-    net_org_serve_handle_close, net_org_serve_handle_free, net_org_set_handler_dispatcher,
+    net_org_serve_handle_close, net_org_serve_handle_free, net_org_set_callback_free,
+    net_org_set_handler_dispatcher,
     net_subnet_declare_boundaries, net_subnet_install_gateway_credentials,
     net_subnet_serve_exported, NetOrgCaller, NetOrgClient, NetOrgCredentials, NetOrgServeHandle,
     NetSubnetPath, NET_ORG_OK,
@@ -115,7 +116,8 @@ unsafe extern "C" fn dispatcher(
     entry.attribution_ok = ok;
     drop(guard);
 
-    // A Go/C handler returns a malloc'd buffer the Rust side copies and frees.
+    // A Go/C handler returns a malloc'd buffer the Rust side copies, then
+    // releases through the deallocator registered below.
     let body = br#"{"n":2,"servedBy":"c-abi-s4"}"#;
     // SAFETY: `libc::malloc` of a nonzero size; the serve path frees it.
     let buf = unsafe { libc::malloc(body.len()) } as *mut u8;
@@ -380,7 +382,30 @@ fn live_subnet_exported_call_through_the_c_abi() {
         assert_eq!(unsafe { net_mesh_start(h) }, 0, "net_mesh_start");
     }
 
-    net_org_set_handler_dispatcher(dispatcher);
+    // Register the deallocator before the dispatcher — the library
+    // refuses the dispatcher without one on Windows, because it cannot
+    // know which allocator produced a callback's buffer.
+    //
+    // This test stands in for the Go module, and it allocates with
+    // `libc::malloc` from *this* test binary. Its matching release is
+    // this binary's `libc::free`, which is exactly the point: the
+    // allocator supplies the deallocator, so nobody has to assume the
+    // two modules share a heap.
+    unsafe extern "C" fn dispatcher_free(p: *mut std::ffi::c_void) {
+        // SAFETY: only ever called with a pointer this file's
+        // `libc::malloc` produced, or NULL.
+        unsafe { libc::free(p) };
+    }
+    assert_eq!(
+        net_org_set_callback_free(Some(dispatcher_free)),
+        0,
+        "the deallocator must be accepted"
+    );
+    assert_eq!(
+        net_org_set_handler_dispatcher(dispatcher),
+        0,
+        "the dispatcher must be accepted once a deallocator is registered"
+    );
 
     // ---- (2) an unknown export is refused LOCALLY ----
     let service = cstr(&m.exported_service);

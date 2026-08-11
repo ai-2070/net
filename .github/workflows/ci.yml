@@ -1732,6 +1732,14 @@ jobs:
           python3 .github/scripts/check-one-library-docs.py
           python3 .github/scripts/check-one-library-docs.py --self-test
 
+      # Also pure text, also before the toolchains. A `libc::free` on a
+      # Go-allocated callback buffer is a wrong-heap free on Windows —
+      # confirmed heap corruption, not a style question — and it costs a
+      # full cdylib + cgo build to discover any other way.
+      - name: Guard — Go callback buffers are freed by their allocator
+        run: |
+          python3 .github/scripts/check-callback-buffer-ownership.py
+
       - name: Setup Go
         uses: actions/setup-go@v7.0.0
         with:

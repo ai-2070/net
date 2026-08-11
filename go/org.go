@@ -111,7 +111,7 @@ extern int net_org_call_exported(
 extern uint64_t net_org_reserve_cancel_token(NetOrgClient* client);
 extern int      net_org_cancel_call(NetOrgClient* client, uint64_t cancel_token);
 
-extern void     net_org_set_handler_dispatcher(NetOrgHandlerFn dispatcher);
+extern int      net_org_set_handler_dispatcher(NetOrgHandlerFn dispatcher);
 extern uint64_t net_org_reserve_handler_id(void);
 extern int      net_org_serve(void* mesh_arc,
                               const char* service_ptr, size_t service_len,
@@ -782,9 +782,17 @@ var (
 
 func registerOrgDispatcher() {
 	orgDispatcherOnce.Do(func() {
-		C.net_org_set_handler_dispatcher(
+		// The deallocator must be registered first — see
+		// callback_free.go.
+		registerCallbackFree()
+		if code := C.net_org_set_handler_dispatcher(
 			(C.NetOrgHandlerFn)(C.go_net_org_handler_trampoline),
-		)
+		); code != 0 {
+			panic(fmt.Sprintf(
+				"net: libnet refused the org handler dispatcher (code %d); this "+
+					"Go wrapper and libnet disagree about callback-buffer "+
+					"ownership", int(code)))
+		}
 	})
 }
 
