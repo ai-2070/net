@@ -168,8 +168,18 @@ pub enum DaemonError {
         path: PathBuf,
         error: std::io::Error,
     },
-    #[error("parse config: {0}")]
-    ConfigParse(toml::de::Error),
+    /// The config file is not valid TOML.
+    ///
+    /// SEC-06 / LINUX-03: deliberately carries no `toml::de::Error`.
+    /// That type's `Display` embeds the offending source line, and
+    /// this config holds `psk_hex` — the mesh-membership root secret.
+    /// `main` logs this error, so a malformed PSK line would land in
+    /// journald or a container log stream, read by a far wider set of
+    /// people than the config file itself.
+    ///
+    /// The path is retained; the parser's line/column is the cost.
+    #[error("config {path:?} is not valid TOML (kind: parse_error)")]
+    ConfigParse { path: PathBuf },
     #[error("psk_hex must decode to 32 bytes: {0}")]
     PskInvalid(String),
     #[error("listen address {addr:?} is not a valid SocketAddr: {error}")]
@@ -298,7 +308,9 @@ pub async fn boot(cli: Cli) -> Result<BootedDaemon, DaemonError> {
     // when boot is about to fail on a `ConfigParse` error.
     warn_if_config_world_readable(&cli.config).await;
 
-    let config: Config = toml::from_str(&raw).map_err(DaemonError::ConfigParse)?;
+    let config: Config = toml::from_str(&raw).map_err(|_| DaemonError::ConfigParse {
+        path: cli.config.clone(),
+    })?;
 
     // CLI listen override.
     let listen = cli.listen.unwrap_or(config.listen.clone());
@@ -925,6 +937,62 @@ mod tests {
     // (which has its own tests under
     // `adapter::net::subnet::id::tests`). No daemon-local
     // duplicates here.
+
+    /// SEC-06 / LINUX-03 witness. A malformed `psk_hex` line must not
+    /// reach the daemon log.
+    ///
+    /// `main` logs this error, so on a systemd host it lands in
+    /// journald and on a container host in the log stream — read by a
+    /// far wider set of people than the `0600` config file is. The
+    /// `toml::de::Error` this used to carry embeds the offending
+    /// source line, which is the mesh-membership root secret.
+    #[tokio::test]
+    async fn a_malformed_psk_line_is_not_reproduced_in_the_boot_error() {
+        const SENTINEL: &str = "PSK_SENTINEL_0123456789abcdef";
+
+        let dir = std::env::temp_dir().join(format!("net-sec06-agg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("aggregator.toml");
+        std::fs::write(
+            &path,
+            format!("listen = \"127.0.0.1:0\"
+psk_hex = \"{SENTINEL}\" trailing
+"),
+        )
+        .expect("write config");
+
+        let cli = Cli {
+            config: path.clone(),
+            listen: None,
+            print_bootstrap: false,
+            verbose: 0,
+        };
+        // Not `expect_err`: `BootedDaemon` is not `Debug`, and it owns
+        // a live MeshNode — deriving Debug on it to satisfy a test
+        // would be the tail wagging the dog.
+        let err = match boot(cli).await {
+            Err(e) => e,
+            Ok(_) => panic!("malformed TOML must fail boot"),
+        };
+
+        // Display and Debug both: `main` may render either, and `{:?}`
+        // on a `#[source]`-carrying error walks the whole chain.
+        let rendered = format!("{err} | {err:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the mesh PSK was reproduced in the boot error: {rendered}"
+        );
+        assert!(
+            rendered.contains("parse_error"),
+            "the sanitized error dropped its category: {rendered}"
+        );
+        assert!(
+            rendered.contains("aggregator.toml"),
+            "the sanitized error dropped the path, leaving nothing to act on: {rendered}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn decode_psk_accepts_64_char_hex() {

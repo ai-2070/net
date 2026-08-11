@@ -397,19 +397,45 @@ pub(crate) async fn read_identity_file(
     if !insecure_permissions {
         check_strict_permissions(path).await?;
     }
-    let text = tokio::fs::read_to_string(path).await.map_err(|e| {
+    let mut text = tokio::fs::read_to_string(path).await.map_err(|e| {
         generic(format!(
             "failed to read identity file {}: {e}",
             path.display()
         ))
     })?;
-    let parsed: IdentityFile = toml::from_str(&text).map_err(|e| {
+    let outcome = parse_identity_file_text(&text, path);
+    // Scrub on EVERY exit, not just the success path — the buffer
+    // holds `seed_hex`. Mirrors `load_org_key` / `load_subnet_key`.
+    zeroize_string(&mut text);
+    outcome
+}
+
+/// Parse the (secret-bearing) identity file text. Split out so the
+/// caller can scrub the source buffer unconditionally on return.
+fn parse_identity_file_text(text: &str, path: &Path) -> Result<IdentityFile, CliError> {
+    // SEC-06 / LINUX-03. NEVER interpolate the `toml::de::Error`: its
+    // `Display` embeds the offending source line, which for this file
+    // is the secret `seed_hex`. A malformed seed — an operator typo, a
+    // truncated write, a templating failure — would otherwise be
+    // copied verbatim into stderr, and from there into shell scrollback,
+    // CI logs, or journald, whose readers are a much wider set than the
+    // `0600` file's.
+    //
+    // This is the same defect Kyra flagged as OA2-F P1 against the org
+    // key loader; `load_org_key_from_text` and `load_subnet_key_from_text`
+    // already carry the sanitized form. The identity loader was the one
+    // left interpolating.
+    //
+    // Report a stable category only. Losing the line number is the
+    // price: a parse failure in a file that is one `kind`, one
+    // `seed_hex` and a couple of scalars is not hard to find by eye,
+    // and no diagnostic is worth leaking the key it describes.
+    toml::from_str(text).map_err(|_| {
         invalid_args(format!(
-            "identity file {} failed to parse: {e}",
+            "identity file {} is not valid TOML (kind: parse_error)",
             path.display()
         ))
-    })?;
-    Ok(parsed)
+    })
 }
 
 /// Write `bytes` into the already-created `f` and fsync it, REMOVING `tmp` if
@@ -649,6 +675,56 @@ fn format_iso8601_utc(secs_since_epoch: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SEC-06 / LINUX-03 witness. A malformed `seed_hex` line must not
+    /// be reproduced in the error the CLI prints.
+    ///
+    /// This loader was the one still interpolating `toml::de::Error`
+    /// after the org and subnet loaders were sanitized for the same
+    /// defect (Kyra OA2-F P1). Its `Display` embeds the offending
+    /// source line — here, the private identity seed.
+    #[test]
+    fn a_malformed_seed_line_is_not_reproduced_in_the_parse_error() {
+        const SENTINEL: &str = "SEED_SENTINEL_0123456789abcdef";
+
+        let text = format!(
+            "operator_id_hex = \"aa\"\nseed_hex = \"{SENTINEL}\" trailing\n\
+             public_key_hex = \"bb\"\ncreated_at = \"now\"\n"
+        );
+        // Deliberately not `expect_err`: that needs `IdentityFile: Debug`,
+        // and deriving Debug on a struct holding `seed_hex` would open a
+        // fresh copy of the very leak this test exists to close.
+        let err = match parse_identity_file_text(&text, Path::new("/tmp/id.toml")) {
+            Err(e) => e,
+            Ok(_) => panic!("malformed TOML must fail to parse"),
+        };
+
+        let rendered = format!("{err} | {err:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the identity seed was reproduced in the parse error: {rendered}"
+        );
+        assert!(
+            rendered.contains("parse_error"),
+            "the sanitized error dropped its category: {rendered}"
+        );
+    }
+
+    /// A well-formed identity file still parses — a redaction that
+    /// broke parsing would satisfy the test above for the wrong reason.
+    #[test]
+    fn a_well_formed_identity_file_still_parses() {
+        let seed = "11".repeat(32);
+        let text = format!(
+            "operator_id_hex = \"aa\"\nseed_hex = \"{seed}\"\n\
+             public_key_hex = \"bb\"\ncreated_at = \"now\"\n"
+        );
+        let parsed = match parse_identity_file_text(&text, Path::new("/tmp/id.toml")) {
+            Ok(p) => p,
+            Err(e) => panic!("valid identity TOML must parse: {e}"),
+        };
+        assert_eq!(parsed.seed_hex, seed);
+    }
 
     /// §11 — a failed rename must not orphan the seed-bearing temp file.
     ///

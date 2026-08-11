@@ -105,10 +105,21 @@ impl ConfigFile {
             },
         };
         match tokio::fs::read_to_string(&path).await {
-            Ok(s) => toml::from_str(&s).map_err(|e| ConfigError::Parse {
-                path: path.clone(),
-                source: e,
-            }),
+            // SEC-06 / LINUX-03. The `toml::de::Error` is deliberately
+            // dropped rather than carried: its `Display` embeds the
+            // offending source line, and this file holds `psk_hex` —
+            // the mesh-membership root secret. A malformed PSK line
+            // (operator typo, truncated write, templating failure)
+            // would otherwise be reproduced verbatim wherever this
+            // error is printed: stderr, shell scrollback, CI logs,
+            // journald. Those readers are a far wider set than the
+            // config file's.
+            //
+            // Same sanitized shape the org and subnet key loaders
+            // already use. The line/column is the cost; a profile is
+            // small enough to eyeball, and no diagnostic is worth
+            // leaking the mesh PSK.
+            Ok(s) => toml::from_str(&s).map_err(|_| ConfigError::Parse { path: path.clone() }),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(ConfigError::Io {
                 path: path.clone(),
@@ -134,10 +145,78 @@ pub enum ConfigError {
         source: std::io::Error,
     },
 
-    #[error("config file at {path} failed to parse: {source}")]
-    Parse {
-        path: PathBuf,
-        #[source]
-        source: toml::de::Error,
-    },
+    /// The profile file is not valid TOML.
+    ///
+    /// Carries no `toml::de::Error` on purpose — see the call site in
+    /// [`ConfigFile::load`]. The parser's message embeds the offending
+    /// source line, and this file holds `psk_hex`, so the error is
+    /// reported as a category and a path only.
+    #[error("config file at {path} is not valid TOML (kind: parse_error)")]
+    Parse { path: PathBuf },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SEC-06 / LINUX-03 witness. A malformed `psk_hex` line must not
+    /// be reproduced in the error the CLI prints.
+    ///
+    /// `toml::de::Error`'s `Display` embeds the offending source line.
+    /// This file holds the mesh-membership root secret, and the error
+    /// is printed to stderr — which reaches shell scrollback, CI job
+    /// logs and journald, all read by more people than the config file
+    /// is.
+    #[tokio::test]
+    async fn a_malformed_psk_line_is_not_reproduced_in_the_parse_error() {
+        const SENTINEL: &str = "PSK_SENTINEL_0123456789abcdef";
+
+        let dir = std::env::temp_dir().join(format!("net-sec06-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("config.toml");
+        // Trailing garbage after a valid string: the parser reports
+        // the line, which carries the secret.
+        std::fs::write(
+            &path,
+            format!("listen = \"127.0.0.1:0\"\npsk_hex = \"{SENTINEL}\" trailing\n"),
+        )
+        .expect("write config");
+
+        let err = ConfigFile::load(Some(&path))
+            .await
+            .expect_err("malformed TOML must fail to parse");
+
+        // Both the Display and the Debug rendering — an operator may
+        // see either, and `{:?}` on a `#[source]`-carrying error walks
+        // the chain.
+        let rendered = format!("{err} | {err:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the PSK was reproduced in the parse error: {rendered}"
+        );
+        // Still useful: names the file so the operator knows where to
+        // look, and the category so they know what kind of failure it
+        // was.
+        assert!(
+            rendered.contains("config.toml") && rendered.contains("parse_error"),
+            "the sanitized error dropped the path or the category: {rendered}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A well-formed profile still loads — a redaction that broke
+    /// parsing would pass the test above for the wrong reason.
+    #[tokio::test]
+    async fn a_well_formed_profile_still_parses() {
+        let dir = std::env::temp_dir().join(format!("net-sec06-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[default]\npsk_hex = \"abcd\"\n").expect("write config");
+
+        let cfg = ConfigFile::load(Some(&path)).await.expect("valid TOML loads");
+        assert_eq!(cfg.profile("default").psk_hex.as_deref(), Some("abcd"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
