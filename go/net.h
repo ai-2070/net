@@ -1192,6 +1192,25 @@ typedef int (*net_compute_factory_fn)(
     size_t kind_len,
     uint64_t* out_daemon_id);
 
+/* Register the deallocator for buffers the handler callbacks allocate.
+ * MUST be called before any dispatcher registration.
+ *
+ * A handler returns its response (and error string) in memory it
+ * allocated. This library copies the bytes out and then has to release
+ * them — and on Windows it cannot, because each module carries its own
+ * CRT heap and freeing across that boundary corrupts it. Confirmed
+ * under Application Verifier: StopCode 0x6, "using wrong heap", on a
+ * block that was exactly a handler response.
+ *
+ * So the allocator supplies the release. Pass a function that frees
+ * with the same allocator your handlers use.
+ *
+ * Idempotent first-call-wins. Returns 0 on success, -1 for NULL. */
+typedef void (*net_compute_callback_free_fn)(void* ptr);
+
+int                     net_compute_set_callback_free(
+    net_compute_callback_free_fn free_fn);
+
 /* Install the Go dispatcher. Call once from Go's init; second call
  * is ignored (first registration wins). All five pointers must be
  * non-NULL. */

@@ -313,9 +313,32 @@ typedef int (*NetOrgHandlerFn)(
     const uint8_t* req_ptr, size_t req_len,
     uint8_t** out_resp_ptr, size_t* out_resp_len, char** out_err);
 
+/* Register the deallocator for buffers the handler callbacks allocate.
+ * MUST be called before any dispatcher registration.
+ *
+ * A handler returns its response (and error string) in memory it
+ * allocated. This library copies the bytes out and then has to release
+ * them — and on Windows it cannot, because each module carries its own
+ * CRT heap and freeing across that boundary corrupts it. Confirmed
+ * under Application Verifier: StopCode 0x6, "using wrong heap", on a
+ * block that was exactly a handler response.
+ *
+ * So the allocator supplies the release. Pass a function that frees
+ * with the same allocator your handlers use.
+ *
+ * Idempotent first-call-wins. Returns 0 on success, -1 for NULL. */
+typedef void (*NetOrgCallbackFreeFn)(void* ptr);
+
+int net_org_set_callback_free(NetOrgCallbackFreeFn free_fn);
+
 /* Register the process-wide dispatcher. First call wins; later calls are
- * no-ops. Call once at init before net_org_serve. */
-void net_org_set_handler_dispatcher(NetOrgHandlerFn dispatcher);
+ * no-ops. Call once at init before net_org_serve.
+ *
+ * Returns 0 on success. On Windows, returns NET_ORG_ERR_NULL if
+ * net_org_set_callback_free has not been called — without it this
+ * library cannot release a handler's response buffer safely, and
+ * refusing here beats corrupting a heap at the first call. */
+int net_org_set_handler_dispatcher(NetOrgHandlerFn dispatcher);
 
 /* Reserve a fresh handler id. Reserve the id, store the callable under it
  * in the language-side registry, THEN call net_org_serve — pre-registration

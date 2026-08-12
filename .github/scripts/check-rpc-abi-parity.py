@@ -63,6 +63,13 @@ def shape(text: str) -> str:
     t = " ".join(text.split())
     if not t or t in {"void", "()"}:
         return "void"
+    # `Option<SomeFnPtr>` is ABI-identical to a nullable function
+    # pointer — that is the null-pointer optimization, and it is how a
+    # Rust `extern "C"` signature accepts NULL without an unsafe cast.
+    # Unwrap it so it compares equal to the header's bare typedef.
+    m = re.fullmatch(r"Option\s*<\s*(.+?)\s*>", t)
+    if m:
+        t = m.group(1)
     is_ptr = "*" in t
     base = t.replace("*", " ")
     for noise in ("const", "mut", "unsafe", "extern"):
@@ -92,6 +99,10 @@ def shape(text: str) -> str:
         "NetRpcHeader": "net_rpc_header_t",
         "RpcHandlerFn": "net_rpc_handler_fn",
         "RpcStreamingHandlerFn": "net_rpc_streaming_handler_fn",
+        # The callback-buffer deallocator: `RpcCallbackFreeFn` in the
+        # header, `CallbackFreeFn` in the impl.
+        "RpcCallbackFreeFn": "net_rpc_callback_free_fn",
+        "CallbackFreeFn": "net_rpc_callback_free_fn",
         # `net_rpc_new` takes the node as an erased handle on the C
         # side by design — the header cannot name `Arc<MeshNode>`.
         "Arc<MeshNode>": "void",
