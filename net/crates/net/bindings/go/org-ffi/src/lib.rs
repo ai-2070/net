@@ -199,14 +199,29 @@ pub extern "C" fn net_org_abi_version() -> u32 {
     ffi_guard!(0, { NET_ORG_ABI_VERSION })
 }
 
-/// Returns `NET_ORG_OK` iff the loaded library is at least `expected`
-/// (forward-compatible: a newer lib satisfies an older header). A consumer
-/// pins the version its header was generated against at init and hard-fails on
-/// mismatch. Returns `NET_ORG_ERR_NULL` if the loaded lib is older.
+/// Returns `NET_ORG_OK` iff the loaded library's ABI is **exactly**
+/// `expected`. A consumer pins the version its header was generated against
+/// at init and hard-fails on mismatch.
+///
+/// # Why equality, not `>=`
+///
+/// This was `NET_ORG_ABI_VERSION >= expected`, described as
+/// "forward-compatible: a newer lib satisfies an older header". That is
+/// the same defect `net_rpc_check_abi_version` was fixed for, and it is
+/// wrong for the same reason: a stale header against a newer library is
+/// precisely the case a version check exists to catch, and `>=` waves it
+/// through. The nRPC instance shipped a header that had missed a leading
+/// `*mut MeshRpcHandle` on two functions; the guard passed, and consumers
+/// fed whatever was in the first argument register to the library as a
+/// pointer.
+///
+/// "Newer library satisfies older header" is only true when every ABI
+/// bump is additive, which nothing enforces — this crate's own
+/// dispatcher setters changed return type from `void` to `int` in 0.35.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_org_check_abi_version(expected: u32) -> c_int {
     ffi_guard!(NET_ORG_ERR_NULL, {
-        if NET_ORG_ABI_VERSION >= expected {
+        if NET_ORG_ABI_VERSION == expected {
             NET_ORG_OK
         } else {
             NET_ORG_ERR_NULL
@@ -2414,6 +2429,33 @@ mod tests {
 #[cfg(test)]
 mod callback_ownership_tests {
     use super::*;
+
+    /// `net_org_check_abi_version` must fail closed on inequality.
+    ///
+    /// It was `NET_ORG_ABI_VERSION >= expected`, the same shape that let
+    /// a stale nRPC header pass against a newer library. A version check
+    /// that accepts "older header, newer library" is blind to the exact
+    /// drift it exists to catch — and this crate proved the premise
+    /// wrong in 0.35, when the dispatcher setters went from returning
+    /// `void` to returning `int`.
+    #[test]
+    fn check_abi_version_requires_exact_equality() {
+        assert_eq!(
+            net_org_check_abi_version(NET_ORG_ABI_VERSION),
+            NET_ORG_OK,
+            "the current version must be accepted",
+        );
+        assert_eq!(
+            net_org_check_abi_version(NET_ORG_ABI_VERSION - 1),
+            NET_ORG_ERR_NULL,
+            "an older expectation must be refused, not treated as              forward-compatible",
+        );
+        assert_eq!(
+            net_org_check_abi_version(NET_ORG_ABI_VERSION + 1),
+            NET_ORG_ERR_NULL,
+            "a newer expectation must be refused",
+        );
+    }
 
     /// A dispatcher registration with no deallocator must be refused on
     /// Windows.

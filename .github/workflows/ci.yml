@@ -1803,9 +1803,11 @@ jobs:
       # `net_rpc_check_abi_version`, which compared `runtime >=
       # expected` and therefore passed the stale header. Text-only, so
       # it runs before the build finishes mattering.
-      - name: Guard — nRPC header matches the implementation ABI
+      - name: Guard — FFI C headers match their implementations
         if: ${{ !cancelled() }}
-        run: python3 "$GITHUB_WORKSPACE/.github/scripts/check-rpc-abi-parity.py"
+        run: |
+          python3 "$GITHUB_WORKSPACE/.github/scripts/check-rpc-abi-parity.py"
+          python3 "$GITHUB_WORKSPACE/.github/scripts/check-rpc-abi-parity.py" --self-test
 
       # The invariant this hang cost a lot to find: the Go binary loads exactly
       # one copy of `net::ffi`.
