@@ -8,7 +8,6 @@ down. Event delivery, migration, snapshot/restore land in sub-steps 2-5.
 
 from __future__ import annotations
 
-import itertools
 import threading
 import time
 
@@ -29,11 +28,15 @@ from net import (
 PSK = "42" * 32
 
 # Per-test unique ports so repeated runs don't collide on localhost.
-_port_counter = itertools.count(29_400)
-
-
 def _next_port() -> str:
-    return f"127.0.0.1:{next(_port_counter)}"
+    """A bind address the OS picks a port for.
+
+    Port ``0`` asks the kernel for a free ephemeral port. A fixed
+    counter only avoids collisions with the rest of *this* suite, and
+    CI hit ``EADDRINUSE`` on a port no test here claims. A caller that
+    has to dial the node reads ``local_addr`` back after construction.
+    """
+    return "127.0.0.1:0"
 
 
 def _mesh() -> NetMesh:
@@ -551,7 +554,9 @@ def _mesh_pair() -> tuple[NetMesh, NetMesh]:
     t.start()
     # Small beat so the accept-side is primed before connect fires.
     time.sleep(0.05)
-    a.connect(b_addr, b.public_key, b.node_id)
+    # `b_addr` is `127.0.0.1:0`; the port the kernel actually chose is
+    # only knowable after construction.
+    a.connect(b.local_addr, b.public_key, b.node_id)
     t.join(timeout=5)
     # `join(timeout=...)` silently returns when it times out —
     # detect via `is_alive()` so a hung handshake fails the test
