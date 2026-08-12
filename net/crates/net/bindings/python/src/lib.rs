@@ -3703,6 +3703,33 @@ mod mesh_bindings {
     }
 }
 
+/// Panic on purpose, to prove what panic strategy this built extension
+/// actually has.
+///
+/// `cargo build -v` shows what was *requested*. This shows what the
+/// loaded artifact *does*, which is the thing that matters and the
+/// thing we could not establish any other way:
+///
+/// * under an effective `panic = "abort"`, calling this terminates the
+///   process — no exception, no further line executes;
+/// * under `panic = "unwind"`, pyo3 converts it to `PanicException`,
+///   which Python can catch, and the process continues.
+///
+/// Always call it in a **child** process. Under abort it takes the
+/// interpreter with it, so a test harness that calls it in-process
+/// cannot report its own result.
+///
+/// Compiled only with the `panic-probe` feature, which is off by
+/// default and excluded from every published wheel — when the feature
+/// is absent this item does not exist, so there is no symbol to find
+/// and nothing to call. It lives on the private `net._net` module and
+/// is deliberately not re-exported from the public facade.
+#[cfg(feature = "panic-probe")]
+#[pyfunction]
+fn _panic_strategy_probe() {
+    panic!("net-python deliberate panic-strategy probe");
+}
+
 /// Net Python module.
 #[pymodule]
 fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -3715,6 +3742,11 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
     async_bridge::init().map_err(|e| {
         pyo3::exceptions::PyRuntimeError::new_err(format!("async bridge init: {e}"))
     })?;
+    // Same compile-time gate as the item itself: absent from the
+    // build graph without the feature, so a shipped wheel has no such
+    // attribute at all.
+    #[cfg(feature = "panic-probe")]
+    m.add_function(wrap_pyfunction!(_panic_strategy_probe, m)?)?;
     m.add_class::<Net>()?;
     m.add_class::<IngestResult>()?;
     m.add_class::<StoredEvent>()?;

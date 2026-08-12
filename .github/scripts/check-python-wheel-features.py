@@ -101,7 +101,128 @@ def main() -> int:
         )
         return 1
 
-    return check_profile(RELEASE_WF.read_text(encoding="utf-8"), ci_text)
+    rc = check_profile(RELEASE_WF.read_text(encoding="utf-8"), ci_text)
+    return rc or check_probe_absent(
+        table, defaults, RELEASE_WF.read_text(encoding="utf-8"), ci_text
+    )
+
+
+#: A deliberately panicking export, compiled only under this feature.
+#: It exists to prove what panic strategy a built extension has; it must
+#: never reach a wheel anyone installs.
+PROBE_FEATURE = "panic-probe"
+
+#: The one CI job allowed to enable it.
+PROBE_JOB = "panic-probe-witness"
+
+
+def ci_jobs(text: str) -> dict[str, str]:
+    """Split a workflow into `{job name: body}` by indentation.
+
+    Deliberately textual: this runs before any toolchain setup, and
+    depending on PyYAML for a check whose whole job is to not be
+    bypassed would make it skippable on a machine without it.
+    """
+    jobs: dict[str, str] = {}
+    current: str | None = None
+    lines: list[str] = []
+    in_jobs = False
+    for line in text.splitlines():
+        if line.startswith("jobs:"):
+            in_jobs = True
+            continue
+        if not in_jobs:
+            continue
+        if line and not line.startswith(" ") and not line.startswith("#"):
+            break  # a new top-level key ends the jobs block
+        m = re.match(r"^  ([A-Za-z0-9_-]+):\s*$", line)
+        if m:
+            if current:
+                jobs[current] = chr(10).join(lines)
+            current = m.group(1)
+            lines = []
+            continue
+        if current:
+            lines.append(line)
+    if current:
+        jobs[current] = chr(10).join(lines)
+    return jobs
+
+
+def check_probe_absent(
+    table: dict[str, list[str]],
+    defaults: set[str],
+    release_text: str,
+    ci_text: str,
+) -> int:
+    """The panic probe must be absent from everything that ships.
+
+    It is compile-time gated, so an absent feature means an absent
+    symbol — but only if nothing quietly enables it. A default feature,
+    a stray addition to `PY_RELEASE_FEATURES`, or one publish job out of
+    three drifting would put a function whose entire purpose is to
+    crash the interpreter into a published wheel.
+    """
+    problems: list[str] = []
+
+    if PROBE_FEATURE in defaults:
+        problems.append(
+            f"{CARGO}: `{PROBE_FEATURE}` is a default feature. It compiles a "
+            f"function that deliberately panics; default-on puts it in every wheel."
+        )
+    # A feature that transitively enables the probe is the same hazard.
+    for name, deps in table.items():
+        if name == PROBE_FEATURE:
+            continue
+        if PROBE_FEATURE in resolve({name}, table):
+            problems.append(
+                f"{CARGO}: feature `{name}` transitively enables "
+                f"`{PROBE_FEATURE}`; the probe must be reachable only by naming "
+                f"it explicitly."
+            )
+
+    m = RELEASE_RE.search(release_text)
+    if m and PROBE_FEATURE in {f.strip() for f in m.group(1).split(",")}:
+        problems.append(
+            f"{RELEASE_WF}: PY_RELEASE_FEATURES contains `{PROBE_FEATURE}` — that "
+            f"is the published wheel's feature set."
+        )
+    for build in re.findall(r"^\s*args:\s*(--\S+.*)$", release_text, re.M):
+        if PROBE_FEATURE in build:
+            problems.append(
+                f"{RELEASE_WF}: a wheel build enables `{PROBE_FEATURE}`: "
+                f"{build.strip()}"
+            )
+
+    # In CI the probe is allowed, but only inside the job that exists to
+    # run it. Any other build enabling it is testing something users
+    # cannot install.
+    #
+    # Scoped by job block rather than by line: the `--features` line that
+    # legitimately names the probe does not itself mention the job.
+    for job, body in ci_jobs(ci_text).items():
+        if PROBE_FEATURE not in body or job == PROBE_JOB:
+            continue
+        offending = [
+            ln.strip()
+            for ln in body.splitlines()
+            if PROBE_FEATURE in ln and not ln.lstrip().startswith("#")
+        ]
+        for ln in offending:
+            problems.append(
+                f"{CI_WF}: job `{job}` enables `{PROBE_FEATURE}`: {ln}"
+            )
+
+    if PROBE_JOB not in ci_jobs(ci_text):
+        problems.append(
+            f"{CI_WF}: no `{PROBE_JOB}` job. The probe feature exists to be "
+            f"exercised; without that job nothing proves the shipped extension's "
+            f"panic strategy, and this check is guarding an unused feature."
+        )
+
+    for p in problems:
+        print(p)
+    return 1 if problems else 0
 
 
 #: The Cargo profile the wheel must ship with. `release` sets
