@@ -76,3 +76,23 @@ int bridgeFactory(uint64_t runtime_id, const char* kind_ptr, size_t kind_len,
 void netGoFreeCallbackBuffer(void* p) {
     free(p);
 }
+
+// ---------------------------------------------------------------------------
+// MeshOS user_ctx destructor
+// ---------------------------------------------------------------------------
+//
+// FFI-02, final. Rust calls this from `CDaemonBridge`'s Drop — after
+// the registry slot is gone AND after every admitted callback has
+// returned, because a callback holds the bridge for its duration.
+//
+// That is the only moment at which deleting the cgo.Handle is provably
+// safe. The Go side cannot compute it: registry removal deliberately
+// lets in-flight host `Arc` clones continue, so "I asked for teardown"
+// and "no callback can still arrive" are different instants, with no
+// signal between them that Go can observe.
+//
+// A real symbol in this translation unit, like the trampolines above,
+// so `init()` can take its address.
+void bridgeMeshOsDestroyUserCtx(void* user_ctx) {
+    goMeshOsDestroyUserCtx(user_ctx);
+}

@@ -477,6 +477,25 @@ struct UserCtx(*mut std::ffi::c_void);
 unsafe impl Send for UserCtx {}
 unsafe impl Sync for UserCtx {}
 
+/// Releases a consumer's `user_ctx` once the substrate is finished
+/// with the daemon.
+///
+/// FFI-02. Registry removal deliberately lets in-flight host `Arc`
+/// clones continue — `DaemonRegistry::deliver` clones and locks the
+/// Arc *before* `guard_identity` admits the callback — so "unregistered"
+/// does not mean "no callback can still arrive". A consumer that frees
+/// its context when it asks for teardown therefore races a callback
+/// that was already admitted.
+///
+/// This callback removes the guesswork: it runs when the internal
+/// daemon bridge is dropped, which cannot happen while any clone of
+/// that bridge is alive, and therefore cannot happen while a callback
+/// is in flight. After it returns, no vtable callback will ever fire
+/// with that `user_ctx` again.
+///
+/// Registered through [`net_meshos_register_daemon_with_vtable_v2`].
+pub type MeshOsUserCtxDestroyFn = unsafe extern "C" fn(user_ctx: *mut std::ffi::c_void);
+
 /// `MeshDaemon` impl wrapping the consumer's vtable. Each trait
 /// method invokes the matching vtable callback; missing callbacks
 /// fall back to the substrate default.
@@ -484,6 +503,25 @@ struct CDaemonBridge {
     name: String,
     vtable: NetMeshOsDaemonVtable,
     user_ctx: UserCtx,
+    /// `None` for the v1 registration path, where the consumer owns
+    /// the context's lifetime and this library never touches it.
+    destroy: Option<MeshOsUserCtxDestroyFn>,
+}
+
+impl Drop for CDaemonBridge {
+    fn drop(&mut self) {
+        // Runs exactly once, when the last owner of this bridge goes
+        // away — which is after the registry slot is gone AND after
+        // every admitted callback has returned, because a callback
+        // holds the bridge for its duration.
+        if let Some(destroy) = self.destroy {
+            // SAFETY: `destroy` is a C function pointer the consumer
+            // supplied at registration and promised to keep valid for
+            // the daemon's lifetime; `user_ctx` is the pointer they
+            // registered alongside it. This is the only call.
+            unsafe { destroy(self.user_ctx.0) };
+        }
+    }
 }
 
 impl MeshDaemon for CDaemonBridge {
@@ -842,6 +880,53 @@ pub extern "C" fn net_meshos_register_daemon(
 /// bytes; `vtable_ptr` to a single `NetMeshOsDaemonVtable`. Each
 /// function pointer in the vtable (when non-NULL) must remain
 /// valid until the handle is freed.
+/// Register a daemon and let this library release `user_ctx` when it
+/// is finished with it.
+///
+/// Identical to [`net_meshos_register_daemon_with_vtable`] except for
+/// `destroy`, which is called exactly once — when the internal daemon
+/// bridge is dropped, after the registry slot is gone and after every
+/// admitted callback has returned. Until then the context stays alive.
+///
+/// This is the fix for FFI-02. A consumer that instead frees its
+/// context when it *requests* teardown races a callback that the
+/// registry already admitted from a lingering `Arc`; there is no
+/// observable moment at which the consumer can know it is safe. Only
+/// this library can know, and now it says so.
+///
+/// `destroy` may be NULL, which is exactly [`net_meshos_register_daemon_with_vtable`].
+///
+/// # Why a new symbol rather than a seventh vtable field
+///
+/// `NetMeshOsDaemonVtable` crosses as `*const`. Growing it would make
+/// this library read past the end of a struct that an older consumer
+/// allocated — a real out-of-bounds read, not a theoretical one. A
+/// separate entry point leaves that ABI untouched and makes the
+/// mismatch a link error instead: a consumer built against this header
+/// against an older library fails to resolve the symbol at load, which
+/// is the failure you want.
+///
+/// # Safety
+///
+/// As [`net_meshos_register_daemon_with_vtable`], plus: `destroy` (when
+/// non-NULL) must stay valid until it is called, and must tolerate
+/// being called from an arbitrary thread.
+#[no_mangle]
+pub extern "C" fn net_meshos_register_daemon_with_vtable_v2(
+    sdk: *mut NetMeshOsSdk,
+    name_ptr: *const c_char,
+    name_len: usize,
+    seed_ptr: *const u8,
+    vtable_ptr: *const NetMeshOsDaemonVtable,
+    user_ctx: *mut std::ffi::c_void,
+    destroy: Option<MeshOsUserCtxDestroyFn>,
+    out: *mut *mut NetMeshOsHandle,
+) -> c_int {
+    register_with_vtable_inner(
+        sdk, name_ptr, name_len, seed_ptr, vtable_ptr, user_ctx, destroy, out,
+    )
+}
+
 #[no_mangle]
 pub extern "C" fn net_meshos_register_daemon_with_vtable(
     sdk: *mut NetMeshOsSdk,
@@ -850,6 +935,25 @@ pub extern "C" fn net_meshos_register_daemon_with_vtable(
     seed_ptr: *const u8,
     vtable_ptr: *const NetMeshOsDaemonVtable,
     user_ctx: *mut std::ffi::c_void,
+    out: *mut *mut NetMeshOsHandle,
+) -> c_int {
+    // No destructor: the consumer owns `user_ctx` and this library
+    // never touches it. See the v2 docs for why that is hard to get
+    // right.
+    register_with_vtable_inner(
+        sdk, name_ptr, name_len, seed_ptr, vtable_ptr, user_ctx, None, out,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn register_with_vtable_inner(
+    sdk: *mut NetMeshOsSdk,
+    name_ptr: *const c_char,
+    name_len: usize,
+    seed_ptr: *const u8,
+    vtable_ptr: *const NetMeshOsDaemonVtable,
+    user_ctx: *mut std::ffi::c_void,
+    destroy: Option<MeshOsUserCtxDestroyFn>,
     out: *mut *mut NetMeshOsHandle,
 ) -> c_int {
     ffi_guard!(NET_MESHOS_ERR_CALL_FAILED, {
@@ -888,6 +992,7 @@ pub extern "C" fn net_meshos_register_daemon_with_vtable(
             name: name.clone(),
             vtable,
             user_ctx: UserCtx(user_ctx),
+            destroy,
         });
         let guard = sdk_ref.inner.lock();
         let sdk_inner = match guard.as_ref() {
@@ -1663,6 +1768,7 @@ mod tests {
             name: name.to_string(),
             vtable,
             user_ctx: UserCtx(user_ctx),
+            destroy: None,
         };
         let event = CausalEvent {
             link: net::adapter::net::state::causal::CausalLink {
@@ -1861,5 +1967,169 @@ mod tests {
         net_meshos_handle_free(handle);
         net_meshos_sdk_shutdown(sdk);
         net_meshos_sdk_free(sdk);
+    }
+}
+
+#[cfg(test)]
+mod user_ctx_destructor_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static DESTROY_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static LAST_DESTROYED: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn counting_destroy(ctx: *mut std::ffi::c_void) {
+        DESTROY_CALLS.fetch_add(1, Ordering::SeqCst);
+        LAST_DESTROYED.store(ctx as usize, Ordering::SeqCst);
+    }
+
+    unsafe extern "C" fn noop_process(
+        _: *mut std::ffi::c_void,
+        _: *mut NetMeshOsProcessEmitCtx,
+        _: u64,
+        _: u64,
+        _: *const u8,
+        _: usize,
+    ) -> c_int {
+        0
+    }
+
+    fn vtable() -> NetMeshOsDaemonVtable {
+        NetMeshOsDaemonVtable {
+            process: Some(noop_process),
+            snapshot: None,
+            restore: None,
+            on_control: None,
+            health: None,
+            saturation: None,
+        }
+    }
+
+    fn bridge(ctx: usize, destroy: Option<MeshOsUserCtxDestroyFn>) -> CDaemonBridge {
+        CDaemonBridge {
+            name: "destructor-test".to_string(),
+            vtable: vtable(),
+            user_ctx: UserCtx(ctx as *mut std::ffi::c_void),
+            destroy,
+        }
+    }
+
+    /// FFI-02. The destructor fires exactly once, with the registered
+    /// context, when the bridge is dropped.
+    ///
+    /// "Exactly once" is the property the whole design rests on: the
+    /// previous fix had the Go side deleting its handle on teardown
+    /// request, and the hazard was a *second* owner of that decision.
+    #[test]
+    fn the_destructor_runs_once_with_the_registered_context() {
+        DESTROY_CALLS.store(0, Ordering::SeqCst);
+        LAST_DESTROYED.store(0, Ordering::SeqCst);
+
+        {
+            let _b = bridge(0xDEAD_BEEF, Some(counting_destroy));
+            assert_eq!(
+                DESTROY_CALLS.load(Ordering::SeqCst),
+                0,
+                "the destructor must not fire while the bridge is alive"
+            );
+        }
+
+        assert_eq!(
+            DESTROY_CALLS.load(Ordering::SeqCst),
+            1,
+            "the destructor must fire exactly once on drop"
+        );
+        assert_eq!(
+            LAST_DESTROYED.load(Ordering::SeqCst),
+            0xDEAD_BEEF,
+            "the destructor must receive the context that was registered"
+        );
+    }
+
+    /// The v1 path promises this library never touches `user_ctx`.
+    /// A consumer on the old entry point manages its own lifetime, and
+    /// calling a destructor it never supplied would be a free of memory
+    /// we do not own.
+    #[test]
+    fn no_destructor_means_no_call() {
+        DESTROY_CALLS.store(0, Ordering::SeqCst);
+        drop(bridge(0x1234, None));
+        assert_eq!(
+            DESTROY_CALLS.load(Ordering::SeqCst),
+            0,
+            "the v1 registration path must never release the consumer's context"
+        );
+    }
+
+    /// A bridge held by a live reference must not be destroyed — this
+    /// is the in-flight-callback case in miniature. A callback holds
+    /// the bridge for its duration, so `Drop` cannot run underneath it.
+    #[test]
+    fn a_held_bridge_is_not_destroyed() {
+        DESTROY_CALLS.store(0, Ordering::SeqCst);
+        let held = std::sync::Arc::new(bridge(0xABCD, Some(counting_destroy)));
+        let second = std::sync::Arc::clone(&held);
+
+        drop(held);
+        assert_eq!(
+            DESTROY_CALLS.load(Ordering::SeqCst),
+            0,
+            "dropping one owner while another holds the bridge must not \
+             destroy the context — that is exactly the admitted-callback race"
+        );
+
+        drop(second);
+        assert_eq!(
+            DESTROY_CALLS.load(Ordering::SeqCst),
+            1,
+            "the last owner out must run the destructor"
+        );
+    }
+
+    /// Both registration paths exist and are distinct symbols, so a
+    /// consumer built against the newer header fails to *link* against
+    /// an older library rather than silently getting v1 semantics.
+    #[test]
+    fn both_registration_symbols_exist() {
+        let v1: unsafe extern "C" fn(
+            *mut NetMeshOsSdk,
+            *const c_char,
+            usize,
+            *const u8,
+            *const NetMeshOsDaemonVtable,
+            *mut std::ffi::c_void,
+            *mut *mut NetMeshOsHandle,
+        ) -> c_int = net_meshos_register_daemon_with_vtable;
+        let v2: unsafe extern "C" fn(
+            *mut NetMeshOsSdk,
+            *const c_char,
+            usize,
+            *const u8,
+            *const NetMeshOsDaemonVtable,
+            *mut std::ffi::c_void,
+            Option<MeshOsUserCtxDestroyFn>,
+            *mut *mut NetMeshOsHandle,
+        ) -> c_int = net_meshos_register_daemon_with_vtable_v2;
+        assert_ne!(
+            v1 as usize, v2 as usize,
+            "v1 and v2 must be distinct symbols"
+        );
+    }
+
+    /// The vtable's layout is unchanged by this feature.
+    ///
+    /// The destructor deliberately did NOT become a seventh field:
+    /// `NetMeshOsDaemonVtable` crosses as `*const`, so growing it would
+    /// make this library read past the end of a struct an older
+    /// consumer allocated. If someone later adds a field here, this
+    /// fails and they have to think about that.
+    #[test]
+    fn the_vtable_layout_did_not_change() {
+        assert_eq!(
+            std::mem::size_of::<NetMeshOsDaemonVtable>(),
+            6 * std::mem::size_of::<*const std::ffi::c_void>(),
+            "NetMeshOsDaemonVtable must stay six function pointers wide; \
+             growing it is an out-of-bounds read against older consumers"
+        );
     }
 }

@@ -110,6 +110,16 @@ SURFACES = (
         },
     ),
     Surface(
+        name="meshos",
+        header=Path("net/crates/net/include/net_meshos.h"),
+        impl=Path("net/crates/net/bindings/go/meshos-ffi/src/lib.rs"),
+        prefix="net_meshos_",
+        aliases={
+            "NetMeshOsUserCtxDestroyFn": "user_ctx_destroy_fn",
+            "MeshOsUserCtxDestroyFn": "user_ctx_destroy_fn",
+        },
+    ),
+    Surface(
         name="compute",
         header=Path("go/net.h"),
         impl=Path("net/crates/net/bindings/go/compute-ffi/src/lib.rs"),
@@ -248,6 +258,12 @@ def shape(text: str, aliases: dict[str, str] | None = None) -> str:
         # `MeshRpcHandle handle` / `handle: MeshRpcHandle`
         parts = [max(parts, key=lambda p: sum(c.isupper() for c in p) or 0)]
     base = parts[0].strip(":,")
+    # `std::ffi::c_void` and `c_void` are the same type; a Rust
+    # signature may write either. Keep the last path segment, unless
+    # the name carries generics (`Arc<MeshNode>`), where the qualifier
+    # is not a path separator worth splitting on.
+    if "::" in base and "<" not in base:
+        base = base.rsplit("::", 1)[-1]
     base = (aliases or {}).get(base, PRIMITIVES.get(base, base))
     return f"{'ptr' if is_ptr else 'val'}:{base}"
 

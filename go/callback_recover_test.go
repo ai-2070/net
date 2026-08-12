@@ -201,50 +201,57 @@ func TestEveryUserCallbackTrampolineContainsPanics(t *testing.T) {
 	}
 }
 
-// TestMeshOsCallbackGuardRefusesAfterTeardown is the FFI-02 guard.
+// TestMeshOsHandleIsDeletedOnlyByTheRustDestructor is the FFI-02 pin.
 //
-// The cgo.Handle behind a MeshOS daemon used to be deleted the moment
-// `net_meshos_handle_free` returned. Registry removal explicitly lets
-// in-flight host Arc clones continue, so a callback already admitted
-// on the Rust side could then call `cgo.Handle.Value()` on a deleted
-// handle — an invalid-handle panic at an uncontained cgo boundary.
+// The cgo.Handle behind a MeshOS daemon must be deleted from exactly
+// one place: `goMeshOsDestroyUserCtx`, which Rust calls from
+// `CDaemonBridge`'s Drop. That is the only instant at which the delete
+// is provably safe — registry removal lets in-flight host Arc clones
+// continue, so from Go, "teardown requested" and "no callback can
+// arrive" are different moments with no signal between them.
 //
-// Callbacks now enter a guard, and the delete waits for them. This
-// drives the guard directly rather than racing a real daemon: the
-// deterministic two-barrier witness the audit asks for needs
-// test-only hooks on the Rust side, which do not exist yet (task
-// #31). What this pins is the protocol the fix depends on.
-func TestMeshOsCallbackGuardRefusesAfterTeardown(t *testing.T) {
-	deleted := 0
-	ctx := &meshosCallbackCtx{daemon: nil}
-	ctx.deleteGuard = newStreamHandleGuard(func() { deleted++ })
-
-	// A callback in flight must hold the delete off.
-	if !ctx.deleteGuard.enter() {
-		t.Fatal("a callback was refused before teardown began")
+// Two earlier shapes were wrong in ways this catches. Deleting in the
+// handle's free closure raced an admitted callback (the original
+// defect). Deleting via a Go-side callback guard closed the common
+// interleavings but not the last one, and left two owners of the
+// decision.
+func TestMeshOsHandleIsDeletedOnlyByTheRustDestructor(t *testing.T) {
+	src, err := os.ReadFile("meshos.go")
+	if err != nil {
+		t.Fatalf("read meshos.go: %v", err)
 	}
-	ctx.deleteGuard.requestFree()
-	if deleted != 0 {
-		t.Fatal("the cgo.Handle was deleted while a callback was in flight — " +
-			"this is the FFI-02 use-after-delete")
-	}
+	body := string(src)
 
-	// A callback arriving after teardown began must be refused, not
-	// admitted into a window where the handle can vanish underneath it.
-	if ctx.deleteGuard.enter() {
-		t.Fatal("a callback was admitted after teardown began")
+	const del = "Delete()"
+	if got := strings.Count(body, del); got != 2 {
+		t.Fatalf(
+			"found %d %s call sites in meshos.go, want exactly 2: the Rust-driven "+
+				"destructor, and the registration-failure path where Rust never "+
+				"took ownership. Any other delete cannot know whether a callback "+
+				"is still in flight.",
+			got, del)
 	}
 
-	// The last one out performs the delete.
-	ctx.deleteGuard.leave()
-	if deleted != 1 {
-		t.Fatalf("delete ran %d times, want exactly 1 after the last callback left", deleted)
+	// The destructor must be the one Rust calls, not something Go
+	// schedules for itself.
+	if !strings.Contains(body, "//export goMeshOsDestroyUserCtx") {
+		t.Fatal("goMeshOsDestroyUserCtx is not exported to C; Rust cannot call it")
 	}
-
-	// Idempotent: a second teardown request must not double-delete.
-	ctx.deleteGuard.requestFree()
-	if deleted != 1 {
-		t.Fatalf("delete ran %d times after a repeated requestFree", deleted)
+	// Registration must go through v2, or Rust is never told about the
+	// destructor and the handle leaks instead.
+	if !strings.Contains(body, "net_meshos_register_daemon_with_vtable_v2") {
+		t.Fatal(
+			"MeshOS registration no longer uses the v2 entry point; without it " +
+				"Rust never receives the destructor and the cgo.Handle leaks")
+	}
+	// The handle's own free closure must not delete: that is the
+	// original defect's shape.
+	freeClosure := body[strings.Index(body, "func newMeshOsDaemonHandle"):]
+	freeClosure = freeClosure[:strings.Index(freeClosure, "\n}")]
+	if strings.Contains(freeClosure, del) {
+		t.Fatal(
+			"newMeshOsDaemonHandle's free closure deletes the cgo.Handle again — " +
+				"that is FFI-02, and it cannot know whether a callback is in flight")
 	}
 }
 
