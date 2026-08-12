@@ -32,10 +32,10 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
+use crate::runtime_guard::GuardedRuntime;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
-use tokio::runtime::Runtime;
 
 use net::adapter::net::behavior::deck::{
     AdminCommands as CoreAdminCommands, AuditQuery as CoreAuditQuery,
@@ -328,7 +328,7 @@ fn snapshot_to_json(py: Python<'_>, snap: &MeshOsSnapshot) -> PyResult<String> {
 #[pyclass(name = "SnapshotStream", module = "net._net")]
 pub struct PySnapshotStream {
     inner: Option<CoreSnapshotStream>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
 }
 
 #[pymethods]
@@ -368,7 +368,7 @@ impl PySnapshotStream {
 #[pyclass(name = "StatusSummaryStream", module = "net._net")]
 pub struct PyStatusSummaryStream {
     inner: Option<CoreStatusStream>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
 }
 
 #[pymethods]
@@ -413,7 +413,7 @@ pub struct PyAdminCommands {
     /// `Arc<CoreClient>` lets us produce an `AdminCommands<'a>`
     /// borrow on demand without holding it across the FFI.
     client: Arc<CoreClient>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
 }
 
 impl PyAdminCommands {
@@ -556,7 +556,7 @@ impl PyAdminCommands {
 #[pyclass(name = "DeckClient", module = "net._net")]
 pub struct PyDeckClient {
     client: Arc<CoreClient>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
     /// `Some` only when the client owns its private supervisor
     /// (constructed via the `__new__` constructor). The SDK stays
     /// alive for the client's lifetime; the `Drop` impl below
@@ -630,7 +630,7 @@ impl PyDeckClient {
         let sdk_cfg = crate::meshos::meshos_config_from_dict(py, meshos_config)?;
         let deck_cfg = config_from_dict(py, deck_config)?;
 
-        let runtime = Arc::new(
+        let runtime = Arc::new(GuardedRuntime::new(
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
@@ -641,7 +641,7 @@ impl PyDeckClient {
                         &format!("failed to build tokio runtime: {e}"),
                     )
                 })?,
-        );
+        ));
         let dispatcher = Arc::new(LoggingDispatcher::new());
         // Enter the runtime before `CoreSdk::start` so its internal
         // `tokio::spawn` lands on the runtime we own.
@@ -977,7 +977,7 @@ fn admin_audit_record_to_json(
 #[pyclass(name = "LogStream", module = "net._net")]
 pub struct PyLogStream {
     inner: Option<CoreLogStream>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
 }
 
 #[pymethods]
@@ -1012,7 +1012,7 @@ impl PyLogStream {
 #[pyclass(name = "FailureStream", module = "net._net")]
 pub struct PyFailureStream {
     inner: Option<CoreFailureStream>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
 }
 
 #[pymethods]
@@ -1066,7 +1066,7 @@ pub struct PyAuditQuery {
     between: Option<(u64, u64)>,
     force_only: bool,
     since: Option<u64>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
 }
 
 impl PyAuditQuery {
@@ -1146,7 +1146,7 @@ impl PyAuditQuery {
 #[pyclass(name = "AuditStream", module = "net._net")]
 pub struct PyAuditStream {
     inner: Option<CoreAuditStream>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
 }
 
 #[pymethods]
@@ -1350,7 +1350,7 @@ fn build_core_proposal<'a>(
 #[pyclass(name = "IceCommands", module = "net._net")]
 pub struct PyIceCommands {
     client: Arc<CoreClient>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
 }
 
 #[pymethods]
@@ -1453,7 +1453,7 @@ impl PyIceCommands {
 #[pyclass(name = "IceProposal", module = "net._net")]
 pub struct PyIceProposal {
     client: Arc<CoreClient>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
     action: Option<net::adapter::net::behavior::meshos::IceActionProposal>,
     issued_at_ms: u64,
 }
@@ -1461,7 +1461,7 @@ pub struct PyIceProposal {
 impl PyIceProposal {
     fn from_action(
         client: Arc<CoreClient>,
-        runtime: Arc<Runtime>,
+        runtime: Arc<GuardedRuntime>,
         action: net::adapter::net::behavior::meshos::IceActionProposal,
         issued_at_ms: u64,
     ) -> Self {
@@ -1542,7 +1542,7 @@ impl PyIceProposal {
 #[pyclass(name = "SimulatedIceProposal", module = "net._net")]
 pub struct PySimulatedIceProposal {
     client: Arc<CoreClient>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
     action: Option<net::adapter::net::behavior::meshos::IceActionProposal>,
     issued_at_ms: u64,
     blast: net::adapter::net::behavior::meshos::BlastRadius,
@@ -2049,7 +2049,7 @@ impl PyAsyncAdminCommands {
 #[pyclass(name = "AsyncDeckClient", module = "net._net")]
 pub struct PyAsyncDeckClient {
     client: Arc<CoreClient>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
     /// Owned SDK is held jointly with the sync sibling — only one
     /// shape should call `close()`. If the sync sibling is built
     /// first and the async wraps it, the sync's `Drop` drains the
@@ -2112,7 +2112,7 @@ impl PyAsyncDeckClient {
         let sdk_cfg = crate::meshos::meshos_config_from_dict(py, meshos_config)?;
         let deck_cfg = config_from_dict(py, deck_config)?;
 
-        let runtime = Arc::new(
+        let runtime = Arc::new(GuardedRuntime::new(
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
@@ -2123,7 +2123,7 @@ impl PyAsyncDeckClient {
                         &format!("failed to build tokio runtime: {e}"),
                     )
                 })?,
-        );
+        ));
         let dispatcher = Arc::new(LoggingDispatcher::new());
         let sdk = {
             let _enter = runtime.enter();
@@ -2262,7 +2262,7 @@ impl<'py> pyo3::IntoPyObject<'py> for AsyncChainCommitDeckWrap {
 #[pyclass(name = "AsyncIceCommands", module = "net._net")]
 pub struct PyAsyncIceCommands {
     client: Arc<CoreClient>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
 }
 
 #[pymethods]
@@ -2363,7 +2363,7 @@ impl PyAsyncIceCommands {
 #[pyclass(name = "AsyncIceProposal", module = "net._net")]
 pub struct PyAsyncIceProposal {
     client: Arc<CoreClient>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
     action: parking_lot::Mutex<Option<net::adapter::net::behavior::meshos::IceActionProposal>>,
     issued_at_ms: u64,
 }
@@ -2371,7 +2371,7 @@ pub struct PyAsyncIceProposal {
 impl PyAsyncIceProposal {
     fn from_action(
         client: Arc<CoreClient>,
-        runtime: Arc<Runtime>,
+        runtime: Arc<GuardedRuntime>,
         action: net::adapter::net::behavior::meshos::IceActionProposal,
         issued_at_ms: u64,
     ) -> Self {
@@ -2449,7 +2449,7 @@ impl PyAsyncIceProposal {
 pub struct PyAsyncSimulatedIceProposal {
     client: Arc<CoreClient>,
     #[allow(dead_code)]
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
     action: parking_lot::Mutex<Option<net::adapter::net::behavior::meshos::IceActionProposal>>,
     issued_at_ms: u64,
     blast: net::adapter::net::behavior::meshos::BlastRadius,

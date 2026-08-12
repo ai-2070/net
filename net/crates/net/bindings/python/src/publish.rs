@@ -15,9 +15,9 @@
 
 use std::sync::Arc;
 
+use crate::runtime_guard::GuardedRuntime;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use tokio::runtime::Runtime;
 
 use net::adapter::net::channel::ChannelConfigRegistry;
 use net::adapter::net::MeshNode;
@@ -118,7 +118,7 @@ pub(crate) fn mesh_over(node: Arc<MeshNode>) -> Mesh {
 pub(crate) fn mesh_publish_tools_configured(
     py: Python<'_>,
     node: Arc<MeshNode>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
     tools: Vec<(String, Option<String>, String)>,
     callback: Py<PyAny>,
     version: String,
@@ -192,7 +192,7 @@ pub(crate) fn mesh_publish_tools_configured(
 pub(crate) fn mesh_publish_tools(
     py: Python<'_>,
     node: Arc<MeshNode>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
     tools: Vec<(String, Option<String>, String)>,
     callback: Py<PyAny>,
     version: String,
@@ -224,13 +224,13 @@ pub(crate) fn mesh_publish_tools(
 )]
 pub struct PyLocalPublicationHandle {
     inner: Option<LocalPublicationHandle>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
 }
 
 impl PyLocalPublicationHandle {
     /// Wrap a fresh `LocalPublicationHandle` — for the paid publish path
     /// ([`crate::payment_provider`]), which reuses the same handle type.
-    pub(crate) fn wrap(inner: LocalPublicationHandle, runtime: Arc<Runtime>) -> Self {
+    pub(crate) fn wrap(inner: LocalPublicationHandle, runtime: Arc<GuardedRuntime>) -> Self {
         Self {
             inner: Some(inner),
             runtime,

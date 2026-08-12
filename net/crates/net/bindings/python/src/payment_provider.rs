@@ -242,13 +242,13 @@ const PRODUCTION_REGISTRY_VERSION: &str = "net-production-1";
 #[cfg(feature = "publish")]
 mod provider {
     use super::PRODUCTION_REGISTRY_VERSION;
+    use crate::runtime_guard::GuardedRuntime;
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Arc;
 
     use pyo3::exceptions::{PyRuntimeError, PyValueError};
     use pyo3::prelude::*;
-    use tokio::runtime::Runtime;
 
     use net::adapter::net::MeshNode;
     use net_mcp::serve::payment::PaymentAdmission;
@@ -355,7 +355,7 @@ mod provider {
     pub struct PyPaymentProvider {
         engine: Arc<PaymentEngine>,
         node: Arc<MeshNode>,
-        runtime: Arc<Runtime>,
+        runtime: Arc<GuardedRuntime>,
         provider_entity_id: Vec<u8>,
         /// The asset registry revision the engine issues quotes under, which
         /// follows from the settlement backend that was chosen.

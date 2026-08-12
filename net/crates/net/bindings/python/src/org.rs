@@ -28,6 +28,7 @@
 //! ingest authority installed and blocks a clean `NetMesh.shutdown()`. Teardown
 //! order: `org_client.close()` → `serve_handle.close()` → `mesh.shutdown()`.
 
+use crate::runtime_guard::GuardedRuntime;
 use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
@@ -187,7 +188,7 @@ pub struct PyOrgClient {
     /// share one audience lease and one node reference, a snapshot that wins
     /// keeps both alive to completion even if `close()` lands right after.
     inner: ArcSwapOption<net_sdk::org::OrgClient>,
-    runtime: Arc<tokio::runtime::Runtime>,
+    runtime: Arc<GuardedRuntime>,
 }
 
 #[pymethods]

@@ -15,12 +15,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::runtime_guard::GuardedRuntime;
 use parking_lot::RwLock;
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
-use tokio::runtime::Runtime;
 
 use net_sdk::aggregator::{
     FoldQueryClient as SdkFoldQueryClient, FoldQueryClientError as SdkFoldQueryClientError,
@@ -230,7 +230,7 @@ fn summaries_to_list<'py>(
 #[pyclass(name = "RegistryClient", module = "net._net")]
 pub struct PyRegistryClient {
     inner: Arc<RwLock<SdkRegistryClient>>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
 }
 
 #[pymethods]
@@ -326,7 +326,7 @@ impl PyRegistryClient {
 #[pyclass(name = "FoldQueryClient", module = "net._net")]
 pub struct PyFoldQueryClient {
     inner: Arc<RwLock<SdkFoldQueryClient>>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
 }
 
 #[pymethods]

@@ -16,9 +16,9 @@
 
 use std::sync::Arc;
 
+use crate::runtime_guard::GuardedRuntime;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use tokio::runtime::Runtime;
 
 use net::adapter::net::channel::ChannelConfigRegistry;
 use net::adapter::net::MeshNode;
@@ -82,7 +82,7 @@ fn mesh_over(node: Arc<MeshNode>) -> Mesh {
 /// Returns a handle that must be held to keep accepting tasks.
 pub(crate) fn mesh_serve_a2a(
     node: Arc<MeshNode>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
     callback: Py<PyAny>,
 ) -> PyResult<PyA2aServeHandle> {
     let mesh = mesh_over(node);
@@ -104,7 +104,7 @@ pub(crate) fn mesh_serve_a2a(
 pub(crate) fn mesh_submit_task(
     py: Python<'_>,
     node: Arc<MeshNode>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
     target_node_id: u64,
     prompt: String,
     context_refs: Vec<String>,
@@ -132,7 +132,7 @@ pub(crate) fn mesh_submit_task(
 pub(crate) fn mesh_task_status(
     py: Python<'_>,
     node: Arc<MeshNode>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
     target_node_id: u64,
     task_id: String,
 ) -> PyResult<Option<String>> {
@@ -155,7 +155,7 @@ pub(crate) fn mesh_task_status(
 pub(crate) fn mesh_cancel_task(
     py: Python<'_>,
     node: Arc<MeshNode>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
     target_node_id: u64,
     task_id: String,
 ) -> PyResult<bool> {

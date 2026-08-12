@@ -13,6 +13,7 @@
 
 #![cfg(feature = "payments-http")]
 
+use crate::runtime_guard::GuardedRuntime;
 use std::sync::Arc;
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -206,7 +207,7 @@ impl Drop for AbortOnDrop {
 /// reactor reqwest runs on).
 struct HttpClientState {
     flow: Arc<X402HttpFlow>,
-    runtime: Arc<tokio::runtime::Runtime>,
+    runtime: Arc<GuardedRuntime>,
 }
 
 impl HttpClientState {
@@ -228,7 +229,7 @@ impl HttpClientState {
         };
         Ok(Self {
             flow: Arc::new(flow),
-            runtime: Arc::new(runtime),
+            runtime: Arc::new(GuardedRuntime::new(runtime)),
         })
     }
 }

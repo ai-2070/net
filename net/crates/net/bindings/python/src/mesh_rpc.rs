@@ -48,12 +48,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex as TokioMutex;
 
+use crate::runtime_guard::GuardedRuntime;
 use bytes::Bytes;
 use futures::StreamExt;
 use pyo3::create_exception;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyTuple};
-use tokio::runtime::Runtime;
 
 use ::net::adapter::net::cortex::{
     RequestStream as InnerRequestStream, RpcCallEvent as InnerRpcCallEvent,
@@ -758,7 +758,7 @@ impl RpcHandler for PyAsyncRpcHandler {
 struct PyAsyncRpcClientStreamingHandler {
     callable: Py<PyAny>,
     timeout: Duration,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
 }
 
 #[async_trait::async_trait]
@@ -842,7 +842,7 @@ impl RpcClientStreamingHandler for PyAsyncRpcClientStreamingHandler {
 struct PyAsyncRpcDuplexHandler {
     callable: Py<PyAny>,
     timeout: Duration,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
 }
 
 #[async_trait::async_trait]
@@ -991,7 +991,7 @@ impl PyServeHandle {
 #[pyclass(name = "RpcStream", module = "_net")]
 pub struct PyRpcStream {
     inner: Arc<Mutex<Option<InnerRpcStream>>>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
 }
 
 #[pymethods]
@@ -1086,7 +1086,7 @@ impl PyRpcStream {
 #[pyclass(name = "ClientStreamCall", module = "_net")]
 pub struct PyClientStreamCall {
     inner: Arc<Mutex<Option<InnerClientStreamCallRaw>>>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
     call_id_cached: u64,
     flow_controlled_cached: bool,
     /// Lets ``close()`` interrupt a pending ``send()`` blocked on
@@ -1203,7 +1203,7 @@ impl PyClientStreamCall {
 #[pyclass(name = "DuplexCall", module = "_net")]
 pub struct PyDuplexCall {
     inner: Arc<Mutex<Option<InnerDuplexCallRaw>>>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
     call_id_cached: u64,
     flow_controlled_cached: bool,
     /// Same role as ``PyClientStreamCall::close_notify`` — lets
@@ -1378,7 +1378,7 @@ impl PyDuplexCall {
 #[pyclass(name = "DuplexSink", module = "_net")]
 pub struct PyDuplexSink {
     inner: Arc<Mutex<Option<InnerDuplexSink>>>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
     call_id_cached: u64,
     flow_controlled_cached: bool,
     /// Same role as ``PyClientStreamCall::close_notify``.
@@ -1468,7 +1468,7 @@ impl PyDuplexSink {
 #[pyclass(name = "DuplexStream", module = "_net")]
 pub struct PyDuplexStream {
     inner: Arc<Mutex<Option<InnerDuplexStream>>>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
     call_id_cached: u64,
 }
 
@@ -1582,7 +1582,7 @@ impl PyDuplexStream {
 #[pyclass(name = "RequestStreamRecv", module = "_net")]
 pub struct PyRequestStreamRecv {
     inner: Arc<Mutex<Option<InnerRequestStream>>>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
     caller_origin: u64,
     call_id: u64,
     deadline_ns: u64,
@@ -1693,7 +1693,7 @@ impl PyResponseSinkSend {
 struct PyRpcClientStreamingHandler {
     callable: Py<PyAny>,
     timeout: Duration,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
 }
 
 #[async_trait::async_trait]
@@ -1765,7 +1765,7 @@ impl RpcClientStreamingHandler for PyRpcClientStreamingHandler {
 struct PyRpcDuplexHandler {
     callable: Py<PyAny>,
     timeout: Duration,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
 }
 
 #[async_trait::async_trait]
@@ -2179,7 +2179,7 @@ pub struct PyRpcMetricsSnapshot {
 #[pyclass(name = "MeshRpc", module = "_net")]
 pub struct PyMeshRpc {
     node: Arc<MeshNode>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
 }
 
 #[pymethods]
@@ -2664,13 +2664,13 @@ impl PyMeshRpc {
 #[pyclass(name = "AsyncMeshRpc", module = "_net")]
 pub struct PyAsyncMeshRpc {
     node: Arc<MeshNode>,
-    /// The parent NetMesh's `Arc<Runtime>`. Streaming-serve handler
+    /// The parent NetMesh's `Arc<GuardedRuntime>`. Streaming-serve handler
     /// shims (`PyAsyncRpcClientStreamingHandler` etc.) pass it down
     /// to `PyRequestStreamRecv` so the sync `__next__` block_ons on
     /// the same runtime the substrate stream is bound to. Unary
     /// paths drive futures via the bridge runtime and don't read
     /// this field.
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
 }
 
 #[pymethods]

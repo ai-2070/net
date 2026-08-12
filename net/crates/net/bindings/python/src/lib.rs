@@ -10,6 +10,7 @@ mod blob;
 mod capability_aggregation;
 #[cfg(feature = "cortex")]
 mod cortex;
+mod runtime_guard;
 #[cfg(feature = "dataforts")]
 mod transport;
 // Identity / capabilities / subnets ride the `net` feature as a
@@ -111,6 +112,7 @@ mod redis_dedup;
 #[cfg(feature = "net")]
 mod subnets;
 
+use crate::runtime_guard::GuardedRuntime;
 use parking_lot::RwLock;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -335,7 +337,7 @@ fn generate_net_keypair() -> NetKeypair {
 #[pyclass]
 pub struct Net {
     bus: Arc<RwLock<Option<EventBus>>>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
 }
 
 #[pymethods]
@@ -666,7 +668,7 @@ impl Net {
 
         Ok(Net {
             bus: Arc::new(RwLock::new(Some(bus))),
-            runtime: Arc::new(runtime),
+            runtime: Arc::new(GuardedRuntime::new(runtime)),
         })
     }
 
@@ -1177,7 +1179,7 @@ mod mesh_bindings {
         /// any remaining clones held by a `DaemonRuntime` observe
         /// a shut-down node the next time they call into it.
         node: Option<Arc<MeshNode>>,
-        runtime: Arc<Runtime>,
+        runtime: Arc<GuardedRuntime>,
         /// The immutable named-export map resolved at construction
         /// (SSDK §3.3) — the checked map this binding retains beside its
         /// `Arc<MeshNode>`. Empty when no `subnet_exports` were
@@ -1455,9 +1457,10 @@ mod mesh_bindings {
                 Arc::new(construction.exports)
             };
 
-            let runtime = Arc::new(
-                Runtime::new().map_err(|e| PyRuntimeError::new_err(format!("runtime: {}", e)))?,
-            );
+            let runtime =
+                Arc::new(GuardedRuntime::new(Runtime::new().map_err(|e| {
+                    PyRuntimeError::new_err(format!("runtime: {}", e))
+                })?));
 
             // Derive the mesh's keypair from the caller-supplied
             // seed when present — lets a caller-side `Identity.
@@ -3168,7 +3171,7 @@ mod mesh_bindings {
         /// both use this for async method bridging so we don't
         /// spin up a second runtime per mesh.
         #[cfg(any(feature = "compute", feature = "cortex", feature = "aggregator"))]
-        pub(crate) fn runtime_arc(&self) -> Arc<Runtime> {
+        pub(crate) fn runtime_arc(&self) -> Arc<GuardedRuntime> {
             self.runtime.clone()
         }
     }

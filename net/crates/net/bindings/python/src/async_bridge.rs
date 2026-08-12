@@ -33,7 +33,7 @@ use pyo3::types::PyBytes;
 /// `future_into_py` call sites (the new `Async*` classes landing
 /// in waves T1+).
 ///
-/// Held by value (not `Arc<Runtime>`) because
+/// Held by value (not `Arc<GuardedRuntime>`) because
 /// `pyo3_async_runtimes::tokio::init_with_runtime` takes a
 /// `&Runtime` reference whose lifetime must outlive every
 /// awaitable the bridge ever returns — process-static is the
