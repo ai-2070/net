@@ -2486,7 +2486,9 @@ jobs:
         env:
           RUSTFLAGS: "-C link-arg=-Wl,--unresolved-symbols=ignore-all -C link-arg=-Wl,--allow-shlib-undefined"
           LD_PRELOAD: "/tmp/libnapi_stub.so"
-        run: cargo test --lib ${{ matrix.crate.features }}
+        run: |
+          cargo test --lib ${{ matrix.crate.features }}
+          cargo test --doc ${{ matrix.crate.features }}
 
       # The python entry needs no napi-style stub: the crate follows
       # pyo3's optional-extension-module pattern (see its Cargo.toml),
@@ -2503,10 +2505,21 @@ jobs:
             sudo apt-get install -y --no-install-recommends python3-dev
           }
 
+      # `--doc` as well as `--lib`. Doctests were never run for these
+      # crates, and rustdoc treats an INDENTED block in a doc comment as
+      # Rust — so a Python usage snippet compiles as Rust, fails, and
+      # nobody finds out. `net-python` had accumulated two that broke
+      # `cargo test` for anyone running it locally.
+      #
+      # It costs almost nothing: these crates' doc examples are fenced
+      # ```python / ```text, so rustdoc compiles none of them. The value
+      # is entirely in catching the next unfenced one.
       - name: Run tests
         if: matrix.crate.name != 'node'
         working-directory: ${{ matrix.crate.path }}
-        run: cargo test --lib ${{ matrix.crate.features }}
+        run: |
+          cargo test --lib ${{ matrix.crate.features }}
+          cargo test --doc ${{ matrix.crate.features }}
 
       # org-ffi is the one FFI crate with INTEGRATION targets — the S4 C
       # live cell, which drives the real C ABI end to end (net_mesh_new

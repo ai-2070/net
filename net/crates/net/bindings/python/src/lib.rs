@@ -2254,11 +2254,13 @@ mod mesh_bindings {
         /// Publish one payload to every subscriber of `channel`.
         /// Returns a `PublishReport` dict:
         ///
-        ///     {
-        ///       "attempted":  <int>,
-        ///       "delivered":  <int>,
-        ///       "errors":     [{"node_id": <int>, "message": <str>}, ...]
-        ///     }
+        /// ```text
+        /// {
+        ///   "attempted":  <int>,
+        ///   "delivered":  <int>,
+        ///   "errors":     [{"node_id": <int>, "message": <str>}, ...]
+        /// }
+        /// ```
         ///
         /// Args:
         ///     channel: Channel name.

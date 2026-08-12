@@ -1556,10 +1556,12 @@ impl PyTasksAdapter {
     ///
     /// Python usage:
     ///
-    ///     snap, it = adapter.snapshot_and_watch_tasks(status='pending')
-    ///     render(snap)
-    ///     for batch in it:
-    ///         render(batch)
+    /// ```python
+    /// snap, it = adapter.snapshot_and_watch_tasks(status='pending')
+    /// render(snap)
+    /// for batch in it:
+    ///     render(batch)
+    /// ```
     #[pyo3(signature = (
         *,
         status=None,
