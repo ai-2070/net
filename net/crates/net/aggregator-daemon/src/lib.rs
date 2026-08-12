@@ -1121,6 +1121,17 @@ psk_hex = \"{SENTINEL}\" trailing
             ),
         )
         .expect("write config");
+        // The SEC-05 gate runs before parsing, and `std::fs::write`
+        // leaves the umask default (typically 0o644) — which the gate
+        // correctly refuses, since this file holds `psk_hex`. This test
+        // is about the parse error's redaction, so give it a file the
+        // gate accepts. No-op off Unix, where the gate only warns.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("chmod 600");
+        }
 
         let cli = Cli {
             config: path.clone(),

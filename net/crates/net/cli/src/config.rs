@@ -213,6 +213,29 @@ pub enum ConfigError {
 mod tests {
     use super::*;
 
+    /// Make a freshly-written config owner-only.
+    ///
+    /// These tests exercise parse-error redaction, not permissions, but
+    /// `load` runs the SEC-05 secret-file gate first — the file holds
+    /// `psk_hex`, so a group-readable one is refused before parsing.
+    /// `std::fs::write` leaves the umask default (typically `0o644`),
+    /// which the gate correctly rejects.
+    ///
+    /// A no-op off Unix, matching the gate: `std::fs` exposes no usable
+    /// NTFS ACL view, so there the gate warns rather than enforcing.
+    /// That asymmetry is why this defect passed on Windows and failed
+    /// on CI.
+    fn make_owner_only(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .expect("chmod 600");
+        }
+        #[cfg(not(unix))]
+        let _ = path;
+    }
+
     /// SEC-06 / LINUX-03 witness. A malformed `psk_hex` line must not
     /// be reproduced in the error the CLI prints.
     ///
@@ -235,6 +258,7 @@ mod tests {
             format!("listen = \"127.0.0.1:0\"\npsk_hex = \"{SENTINEL}\" trailing\n"),
         )
         .expect("write config");
+        make_owner_only(&path);
 
         let err = ConfigFile::load(Some(&path))
             .await
@@ -267,6 +291,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join("config.toml");
         std::fs::write(&path, "[default]\npsk_hex = \"abcd\"\n").expect("write config");
+        make_owner_only(&path);
 
         let cfg = ConfigFile::load(Some(&path))
             .await
