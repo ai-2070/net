@@ -53,6 +53,17 @@ jobs:
         with:
           python-version: "3.11"
 
+      # `--profile python-release`, not `--release`: same optimisation
+      # settings, but `panic = "unwind"`. A Python extension is a guest in
+      # a process it does not own, and `abort` would take the host — a
+      # Jupyter kernel, a web worker — down with it on any internal Rust
+      # panic, with no traceback. See the profile's comment in the
+      # workspace Cargo.toml. The CLI, daemon and Node/Go/C artifacts stay
+      # on `release`/abort.
+      #
+      # Whatever this builds is what CI must test. Testing a `maturin
+      # develop` build instead tests a different panic strategy than the
+      # one that ships.
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
@@ -60,7 +71,7 @@ jobs:
           # `extension-module` (the cdylib must not link libpython) is
           # passed explicitly rather than trusting maturin to merge
           # `[tool.maturin] features` from pyproject.toml with CLI args.
-          args: --release --out dist --find-interpreter --features ${{ env.PY_RELEASE_FEATURES }}
+          args: --profile python-release --out dist --find-interpreter --features ${{ env.PY_RELEASE_FEATURES }}
           sccache: "true"
           # Use manylinux_2_28 (Rocky 8, gcc 11+) instead of the
           # default `auto` (which picks manylinux2014 with gcc 4.8).
@@ -103,7 +114,7 @@ jobs:
           # `extension-module` (the cdylib must not link libpython) is
           # passed explicitly rather than trusting maturin to merge
           # `[tool.maturin] features` from pyproject.toml with CLI args.
-          args: --release --out dist --find-interpreter --features ${{ env.PY_RELEASE_FEATURES }}
+          args: --profile python-release --out dist --find-interpreter --features ${{ env.PY_RELEASE_FEATURES }}
           sccache: "true"
           working-directory: net/crates/net/bindings/python
 
@@ -139,7 +150,7 @@ jobs:
           # `extension-module` (the cdylib must not link libpython) is
           # passed explicitly rather than trusting maturin to merge
           # `[tool.maturin] features` from pyproject.toml with CLI args.
-          args: --release --out dist --find-interpreter --features ${{ env.PY_RELEASE_FEATURES }}
+          args: --profile python-release --out dist --find-interpreter --features ${{ env.PY_RELEASE_FEATURES }}
           sccache: "true"
           working-directory: net/crates/net/bindings/python
 

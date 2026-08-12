@@ -100,7 +100,57 @@ def main() -> int:
             f"PY_RELEASE_FEATURES, or stop testing them."
         )
         return 1
-    return 0
+
+    return check_profile(RELEASE_WF.read_text(encoding="utf-8"), ci_text)
+
+
+#: The Cargo profile the wheel must ship with. `release` sets
+#: `panic = "abort"`, which for a Python extension means an internal
+#: Rust panic kills the host process — a Jupyter kernel, a web worker —
+#: with no traceback. `python-release` is `release` plus unwinding.
+WHEEL_PROFILE = "python-release"
+
+
+def check_profile(release_text: str, ci_text: str) -> int:
+    """The wheel ships one profile and CI must test that same one.
+
+    Features were not the only way these two drifted. The published
+    wheel was built `--release` (`panic = "abort"`) while CI tested a
+    `maturin develop` build (debug, unwind), so the two disagreed about
+    whether a panic is recoverable — and only the recoverable one was
+    ever run. A tokio runtime dropped in an async context passed 884
+    tests and aborted the process for anyone who installed the wheel.
+    """
+    problems: list[str] = []
+
+    builds = re.findall(r"^\s*args:\s*(--\S+.*)$", release_text, re.M)
+    wheel_builds = [b for b in builds if "--out dist" in b and "--features" in b]
+    if not wheel_builds:
+        problems.append(
+            f"{RELEASE_WF}: found no wheel build args — the publish jobs moved, "
+            f"and this check is now inspecting nothing"
+        )
+    for b in wheel_builds:
+        if f"--profile {WHEEL_PROFILE}" not in b:
+            problems.append(
+                f"{RELEASE_WF}: a wheel is built with `{b.strip()}` rather than "
+                f"`--profile {WHEEL_PROFILE}`. `--release` gives the extension "
+                f"`panic = \"abort\"`, so a Rust panic takes the host process down "
+                f"with no traceback."
+            )
+
+    # CI has to build and test that same profile somewhere, or the
+    # shipped configuration is untested no matter what the profile says.
+    if f"--profile {WHEEL_PROFILE}" not in ci_text:
+        problems.append(
+            f"{CI_WF}: nothing builds `--profile {WHEEL_PROFILE}`. The wheel that "
+            f"ships is then never exercised — a `maturin develop` build has a "
+            f"different panic strategy."
+        )
+
+    for p in problems:
+        print(p)
+    return 1 if problems else 0
 
 
 if __name__ == "__main__":

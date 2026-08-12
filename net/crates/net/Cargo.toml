@@ -675,6 +675,36 @@ codegen-units = 1
 panic = "abort"
 opt-level = 3
 
+# The profile the published Python wheel is built with.
+#
+# Identical to `release` except that it unwinds. A Python extension is
+# loaded into a host process it does not own — a Jupyter kernel, a web
+# worker, an orchestrator — and `panic = "abort"` means an internal Rust
+# panic kills that process, along with every other extension and task in
+# it, with no traceback. pyo3's boundary machinery is built around
+# unwindable panics; shipping with `abort` disables that recovery model
+# wholesale.
+#
+# This is deliberately NOT a change to `[profile.release]`. The CLI, the
+# daemon, and the Node/Go/C artifacts own their processes and keep
+# `abort`, where failing fast is the right call.
+#
+# Build the wheel with `--profile python-release`, and test the wheel
+# that was built that way — a `maturin develop` (debug, unwind) run does
+# not exercise the shipped configuration. That mismatch is what hid a
+# tokio runtime being dropped in an async context: harmless under test,
+# `__fastfail`/0xC0000409 in a user's process.
+#
+# What this does NOT do: make every panic a Python exception. It makes a
+# panic crossing a pyo3-invoked boundary containable, lets `catch_unwind`
+# work, and turns a panicking background tokio task into a `JoinError`
+# rather than an abort. A detached task that nobody joins still fails
+# silently — every task whose result matters needs its `JoinHandle`
+# observed and turned into a real error.
+[profile.python-release]
+inherits = "release"
+panic = "unwind"
+
 [profile.bench]
 lto = true
 codegen-units = 1

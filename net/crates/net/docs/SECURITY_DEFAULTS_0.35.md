@@ -1,7 +1,8 @@
 # Fail-closed defaults in 0.35
 
 0.35 closes a set of authorization and file-permission findings. Eight
-defaults changed from permissive to fail-closed. **Each one can stop a
+defaults changed from permissive to fail-closed, and the Python wheel's
+crash behaviour changed (§9). **Each one can stop a
 working deployment on upgrade**, and each is deliberate: in every case
 the previous default granted something to anyone who completed the mesh
 handshake, and completing the handshake proves PSK possession and
@@ -218,6 +219,45 @@ squat obvious ids to deny another.
 
 The wire format is unchanged; this is entirely server-side, so a peer
 on an older build still interoperates.
+
+## 9. The Python wheel unwinds instead of aborting
+
+Not a fail-closed change — the opposite, and it belongs here because it
+changes what a failure does to your process.
+
+**Was:** the published wheel was built `--release`, which sets
+`panic = "abort"`. An internal Rust panic called `abort()` and took the
+host process with it — no traceback, no chance to handle it. In a
+Jupyter kernel or a web worker that means everything else in the
+process dies too.
+
+Worse, it was untestable: CI installs the binding with `maturin
+develop`, which builds **debug** and therefore unwinds. The
+configuration under test and the configuration that shipped disagreed
+about whether a panic is recoverable, and only the recoverable one was
+ever exercised. A tokio runtime being dropped in an async context
+passed 884 tests and aborted for anyone who installed the wheel.
+
+**Now:** wheels are built with a dedicated `python-release` profile —
+identical to `release`, but `panic = "unwind"`. A panic crossing a
+pyo3-invoked boundary can be contained and surfaced as a Python
+exception rather than ending the process.
+
+The CLI, the daemon, and the Node, Go and C artifacts are unchanged and
+still abort. They own their processes; a Python extension is a guest in
+one.
+
+**What this does not do.** It is not a promise that every panic becomes
+a catchable exception. It makes `catch_unwind` work at the pyo3
+boundary and turns a panicking background tokio task into a `JoinError`
+instead of an abort — but a detached task nobody joins still fails
+silently. Any task whose result matters needs its `JoinHandle` observed
+and turned into a real error. This is a release-policy repair, not a
+substitute for not panicking.
+
+CI now builds a wheel with that exact profile, installs it into a clean
+virtualenv, and runs the suite against the installed artifact, so the
+shipped configuration is tested rather than approximated.
 
 ---
 
