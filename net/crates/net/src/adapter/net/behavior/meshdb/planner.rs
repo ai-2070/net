@@ -1719,6 +1719,65 @@ fn group_by_mode(group_by: &[Expr]) -> Result<Option<JoinKeyMode>, MeshError> {
 #[allow(dead_code)]
 const _PLANNER_USES_TAXONOMY_AXIS: TaxonomyAxis = TaxonomyAxis::Dataforts;
 
+impl ExecutionPlan {
+    /// Every chain origin this plan reads, deduplicated.
+    ///
+    /// AUTH-02. This is the set an authorization policy has to decide
+    /// on: MeshDB executes a caller-supplied plan, so "which chains
+    /// does this request touch" cannot be answered from the request
+    /// envelope — it has to be read off the plan tree.
+    pub fn chain_origins(&self) -> Vec<u64> {
+        let mut out = Vec::new();
+        self.root.collect_chain_origins(&mut out);
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+}
+
+impl OperatorNode {
+    /// Recursive half of [`ExecutionPlan::chain_origins`].
+    ///
+    /// The match is deliberately **exhaustive** — no wildcard arm.
+    /// `OperatorPlan` is `#[non_exhaustive]`, but that only binds
+    /// downstream crates, so within this crate a new variant fails to
+    /// compile here rather than being silently skipped. A wildcard
+    /// would turn "someone added a read operator" into an
+    /// authorization bypass that no test would notice.
+    fn collect_chain_origins(&self, out: &mut Vec<u64>) {
+        match &self.operator {
+            OperatorPlan::AtRead { origin, .. }
+            | OperatorPlan::BetweenRead { origin, .. }
+            | OperatorPlan::LatestRead { origin } => out.push(*origin),
+            OperatorPlan::LineageEmit {
+                origin, entries, ..
+            } => {
+                // Both the walk start AND every chain the walk
+                // reached: a lineage emit discloses the existence and
+                // tip of each entry, so each is a chain this request
+                // reads.
+                out.push(*origin);
+                out.extend(entries.iter().map(|e| e.origin));
+            }
+            OperatorPlan::Filter { input, .. }
+            | OperatorPlan::AggregateCount { input, .. }
+            | OperatorPlan::AggregateNumeric { input, .. }
+            | OperatorPlan::AggregateReduction { input, .. }
+            | OperatorPlan::AggregateDistinct { input, .. }
+            | OperatorPlan::Window { input, .. } => input.collect_chain_origins(out),
+            OperatorPlan::HashJoin { left, right, .. } => {
+                left.collect_chain_origins(out);
+                right.collect_chain_origins(out);
+            }
+            OperatorPlan::NotYetImplemented { input, .. } => {
+                if let Some(inner) = input {
+                    inner.collect_chain_origins(out);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3533,64 +3592,5 @@ mod tests {
         let bytes = postcard::to_allocvec(&plan).unwrap();
         let decoded: ExecutionPlan = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(decoded, plan);
-    }
-}
-
-impl ExecutionPlan {
-    /// Every chain origin this plan reads, deduplicated.
-    ///
-    /// AUTH-02. This is the set an authorization policy has to decide
-    /// on: MeshDB executes a caller-supplied plan, so "which chains
-    /// does this request touch" cannot be answered from the request
-    /// envelope — it has to be read off the plan tree.
-    pub fn chain_origins(&self) -> Vec<u64> {
-        let mut out = Vec::new();
-        self.root.collect_chain_origins(&mut out);
-        out.sort_unstable();
-        out.dedup();
-        out
-    }
-}
-
-impl OperatorNode {
-    /// Recursive half of [`ExecutionPlan::chain_origins`].
-    ///
-    /// The match is deliberately **exhaustive** — no wildcard arm.
-    /// `OperatorPlan` is `#[non_exhaustive]`, but that only binds
-    /// downstream crates, so within this crate a new variant fails to
-    /// compile here rather than being silently skipped. A wildcard
-    /// would turn "someone added a read operator" into an
-    /// authorization bypass that no test would notice.
-    fn collect_chain_origins(&self, out: &mut Vec<u64>) {
-        match &self.operator {
-            OperatorPlan::AtRead { origin, .. }
-            | OperatorPlan::BetweenRead { origin, .. }
-            | OperatorPlan::LatestRead { origin } => out.push(*origin),
-            OperatorPlan::LineageEmit {
-                origin, entries, ..
-            } => {
-                // Both the walk start AND every chain the walk
-                // reached: a lineage emit discloses the existence and
-                // tip of each entry, so each is a chain this request
-                // reads.
-                out.push(*origin);
-                out.extend(entries.iter().map(|e| e.origin));
-            }
-            OperatorPlan::Filter { input, .. }
-            | OperatorPlan::AggregateCount { input, .. }
-            | OperatorPlan::AggregateNumeric { input, .. }
-            | OperatorPlan::AggregateReduction { input, .. }
-            | OperatorPlan::AggregateDistinct { input, .. }
-            | OperatorPlan::Window { input, .. } => input.collect_chain_origins(out),
-            OperatorPlan::HashJoin { left, right, .. } => {
-                left.collect_chain_origins(out);
-                right.collect_chain_origins(out);
-            }
-            OperatorPlan::NotYetImplemented { input, .. } => {
-                if let Some(inner) = input {
-                    inner.collect_chain_origins(out);
-                }
-            }
-        }
     }
 }
