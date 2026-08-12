@@ -225,18 +225,26 @@ on an older build still interoperates.
 Not a fail-closed change — the opposite, and it belongs here because it
 changes what a failure does to your process.
 
-**Was:** the published wheel was built `--release`, which sets
-`panic = "abort"`. An internal Rust panic called `abort()` and took the
-host process with it — no traceback, no chance to handle it. In a
-Jupyter kernel or a web worker that means everything else in the
-process dies too.
+**Was:** the published wheel was built `--release`, which the
+workspace sets to `panic = "abort"`. Under an effective abort profile,
+an internal Rust panic calls `abort()` and takes the host process with
+it — no traceback, no chance to handle it. In a Jupyter kernel or a web
+worker, everything else in that process dies too.
 
-Worse, it was untestable: CI installs the binding with `maturin
-develop`, which builds **debug** and therefore unwinds. The
-configuration under test and the configuration that shipped disagreed
-about whether a panic is recoverable, and only the recoverable one was
-ever exercised. A tokio runtime being dropped in an async context
-passed 884 tests and aborted for anyone who installed the wheel.
+And it was untested: CI installs the binding with `maturin develop`,
+which builds **debug** and therefore unwinds. The configuration under
+test and the configuration that shipped disagreed about whether a panic
+is recoverable, and only the recoverable one was ever exercised. That
+is how a tokio runtime being dropped in an async context sat there
+while 884 tests passed.
+
+One caveat on the history, because an earlier version of this note
+overstated it. When that runtime-drop panic was actually observed on a
+`--release` wheel, the process *survived* — which an effective abort
+profile cannot do. So whether that artifact really used abort, and
+whether the panic relates to the separate `0xC0000409` termination that
+prompted the investigation, are both unestablished. The change below is
+made on the policy above, not on that chain of events.
 
 **Now:** wheels are built with a dedicated `python-release` profile —
 identical to `release`, but `panic = "unwind"`. A panic crossing a

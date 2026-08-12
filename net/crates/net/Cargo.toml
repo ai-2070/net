@@ -691,9 +691,15 @@ opt-level = 3
 #
 # Build the wheel with `--profile python-release`, and test the wheel
 # that was built that way — a `maturin develop` (debug, unwind) run does
-# not exercise the shipped configuration. That mismatch is what hid a
-# tokio runtime being dropped in an async context: harmless under test,
-# `__fastfail`/0xC0000409 in a user's process.
+# not exercise the shipped configuration, so panics that only matter in
+# the shipped one are invisible.
+#
+# That mismatch is the reason for the profile; do not read more into it.
+# A tokio runtime dropped in an async context was found here, but when
+# it was observed on a `--release` wheel the process survived — which an
+# effective abort profile cannot do. Whether the shipped extension
+# really used abort, and whether that panic caused the `0xC0000409`
+# termination that started the investigation, are both unestablished.
 #
 # What this does NOT do: make every panic a Python exception. It makes a
 # panic crossing a pyo3-invoked boundary containable, lets `catch_unwind`
@@ -704,6 +710,26 @@ opt-level = 3
 [profile.python-release]
 inherits = "release"
 panic = "unwind"
+
+# `python-release` with symbols, for diagnosing panics in the shipped
+# configuration.
+#
+# A release backtrace is useless here: every frame resolves to the
+# nearest exported symbol, so a stack of thirty frames prints
+# `net_validate_capabilities` thirty times. That was tried.
+#
+# Use this when a panic reproduces only against an installed wheel —
+# same optimisation and the same panic strategy as what ships, but with
+# full debug info and nothing stripped, so `RUST_BACKTRACE=full` names
+# real functions. It is not a published profile.
+#
+#   maturin build --profile python-diagnostic --out dist --features …
+#   pip install <wheel> into a clean venv
+#   RUST_BACKTRACE=full PYTHONFAULTHANDLER=1 pytest -s
+[profile.python-diagnostic]
+inherits = "python-release"
+debug = 2
+strip = "none"
 
 [profile.bench]
 lto = true

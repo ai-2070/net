@@ -115,11 +115,18 @@ def check_profile(release_text: str, ci_text: str) -> int:
     """The wheel ships one profile and CI must test that same one.
 
     Features were not the only way these two drifted. The published
-    wheel was built `--release` (`panic = "abort"`) while CI tested a
-    `maturin develop` build (debug, unwind), so the two disagreed about
-    whether a panic is recoverable — and only the recoverable one was
-    ever run. A tokio runtime dropped in an async context passed 884
-    tests and aborted the process for anyone who installed the wheel.
+    wheel was built `--release` while CI tested a `maturin develop`
+    build (debug, unwind), so the two disagreed about whether a panic is
+    recoverable — and only the recoverable one was ever run. A tokio
+    runtime dropped in an async context passed 884 tests that way, and
+    nobody saw it.
+
+    Stated as policy rather than history: a pyo3 extension under an
+    effective abort profile kills its host process on an internal panic.
+    The one panic actually observed on a `--release` wheel did *not*
+    abort, so what that artifact's strategy really was — and whether it
+    relates to the separate 0xC0000409 termination — is unestablished.
+    The gate stands on the mismatch itself, which is not in doubt.
     """
     problems: list[str] = []
 

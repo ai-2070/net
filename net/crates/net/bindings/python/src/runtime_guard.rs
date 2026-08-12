@@ -23,19 +23,33 @@
 //! timing, which is why it surfaced as a test suite that died in a
 //! different place each run.
 //!
-//! # Why it was invisible
+//! # Why it went unnoticed
 //!
-//! The workspace sets `panic = "abort"` for `[profile.release]`. CI
-//! tests the binding via `maturin develop`, which builds **debug**, so
-//! the panic unwinds, tokio's worker absorbs it, and 884 tests pass.
-//! The published wheel is built `--release`, where the same panic calls
-//! `abort()` — `__fastfail` on MSVC, exit code `0xC0000409` — and takes
-//! the host process with it. A Jupyter kernel or a web server would
-//! die with no traceback.
+//! CI installs the binding with `maturin develop`, which builds
+//! **debug**. There the panic unwinds, tokio's worker absorbs it, and
+//! 884 tests pass with the failure showing up only as a line on stderr
+//! that pytest captures. Nothing was watching for it.
 //!
-//! So the configuration under test and the configuration that ships
-//! disagreed about whether a panic is recoverable, and only the tested
-//! one was ever exercised.
+//! It is worth being careful about what this panic was observed to do,
+//! because an earlier account of it was wrong.
+//!
+//! *Policy:* a pyo3 extension built with an effective
+//! `panic = "abort"` terminates its host process on any internal Rust
+//! panic — `__fastfail` on MSVC — taking a Jupyter kernel or a web
+//! worker down with no traceback. That is why the wheel now ships the
+//! `python-release` profile, which unwinds.
+//!
+//! *Evidence:* this particular panic was seen on a `--release` wheel
+//! and the process **survived**, which an effective abort profile
+//! cannot do. So we do not know that the shipped extension actually
+//! used abort, and we have not established any link between this panic
+//! and the separate `0xC0000409` termination that first drew attention
+//! here. Both were real; the causal chain between them was assumed,
+//! not shown.
+//!
+//! What is established, and is reason enough for the guard: dropping a
+//! runtime inside an async context is a defect wherever it happens,
+//! and it aborts under any build that does abort.
 //!
 //! # The fix
 //!
