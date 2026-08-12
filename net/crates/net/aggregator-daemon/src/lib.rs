@@ -1502,7 +1502,11 @@ mod secret_file_gate_tests {
         // (the `ServeHandle`'s Drop un-installs the service, and the
         // node was never `start()`ed). Calling `shutdown()` here would
         // need the `Adapter` trait in scope for no gain.
-        drop(boot(cli).await.expect("--insecure-permissions must still boot"));
+        drop(
+            boot(cli)
+                .await
+                .expect("--insecure-permissions must still boot"),
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

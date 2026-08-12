@@ -35,9 +35,9 @@
 //! registry) plus `(req_ptr, req_len)`. The Go side returns
 //! `(out_resp_ptr, out_resp_len)` heap-allocated via `C.malloc`;
 //! the Rust side copies into a `Bytes` and releases the Go buffer
-//! through the Go-registered deallocator — never `libc::free`, which
-//! on Windows would free on a different CRT heap. See
-//! [`free_callback_buffer`].
+//! through the deallocator Go registered via
+//! [`net_rpc_set_callback_free`] — never `libc::free`, which on
+//! Windows would free on a different CRT heap.
 
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
@@ -480,8 +480,8 @@ fn format_rpc_error(err: &InnerRpcError) -> String {
 /// and returns `0`. On failure, sets `*out_err` to a heap-
 /// allocated UTF-8 message and returns non-zero. Rust copies the
 /// response bytes into a `Bytes`, then releases the Go-allocated
-/// buffer through the Go-registered deallocator — see
-/// [`free_callback_buffer`].
+/// buffer through the deallocator registered via
+/// [`net_rpc_set_callback_free`].
 pub type RpcHandlerFn = unsafe extern "C" fn(
     handler_id: u64,
     req_ptr: *const u8,
@@ -495,7 +495,6 @@ pub type RpcHandlerFn = unsafe extern "C" fn(
 /// [`net_rpc_set_handler_dispatcher`]; subsequent calls are
 /// silently ignored (first registration wins — `OnceLock`).
 static DISPATCHER: OnceLock<RpcHandlerFn> = OnceLock::new();
-
 
 /// Releases a buffer the Go callback layer allocated.
 ///
@@ -3396,7 +3395,9 @@ static STREAMING_DISPATCHER: OnceLock<RpcStreamingHandlerFn> = OnceLock::new();
 /// Register the process-wide streaming handler dispatcher.
 /// Idempotent — first registration wins.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_rpc_set_streaming_handler_dispatcher(dispatcher: RpcStreamingHandlerFn) -> c_int {
+pub extern "C" fn net_rpc_set_streaming_handler_dispatcher(
+    dispatcher: RpcStreamingHandlerFn,
+) -> c_int {
     ffi_guard!(-1, {
         if cfg!(windows) && !callback_free_registered() {
             warn_missing_callback_free("the server-streaming handler dispatcher");

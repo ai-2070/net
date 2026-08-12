@@ -52,10 +52,9 @@ use net_org::{
     net_org_bind, net_org_call_exported, net_org_client_free, net_org_credentials_new,
     net_org_free_cstring, net_org_reserve_handler_id, net_org_response_free,
     net_org_serve_handle_close, net_org_serve_handle_free, net_org_set_callback_free,
-    net_org_set_handler_dispatcher,
-    net_subnet_declare_boundaries, net_subnet_install_gateway_credentials,
-    net_subnet_serve_exported, NetOrgCaller, NetOrgClient, NetOrgCredentials, NetOrgServeHandle,
-    NetSubnetPath, NET_ORG_OK,
+    net_org_set_handler_dispatcher, net_subnet_declare_boundaries,
+    net_subnet_install_gateway_credentials, net_subnet_serve_exported, NetOrgCaller, NetOrgClient,
+    NetOrgCredentials, NetOrgServeHandle, NetSubnetPath, NET_ORG_OK,
 };
 
 // ---------------------------------------------------------------------------

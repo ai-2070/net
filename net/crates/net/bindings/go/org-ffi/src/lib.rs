@@ -59,8 +59,8 @@
 //! a non-empty response.
 //!
 //! Go therefore registers [`net_org_set_callback_free`] before any dispatcher,
-//! and every release of a callback-owned pointer goes through
-//! [`free_callback_buffer`].
+//! and every release of a callback-owned pointer goes through the
+//! deallocator it supplied.
 
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 

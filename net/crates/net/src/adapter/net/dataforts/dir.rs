@@ -474,8 +474,11 @@ fn mode_of(_meta: &std::fs::Metadata) -> u32 {
 /// final rename, so **`dest` ends up owner-only** where it previously
 /// inherited the umask (typically `0o755`). A directory pulled from a
 /// remote peer defaults to private; widen it explicitly if another
-/// local user needs to read it. Special mode bits are stripped from
-/// remote file modes regardless — see [`sanitize_remote_file_mode`].
+/// local user needs to read it. The setuid, setgid and sticky bits are
+/// stripped from every remote file mode regardless (SEC-04): the mode
+/// comes from the manifest publisher, so honouring `04755` here would
+/// let a hostile manifest plant a setuid binary owned by whoever ran
+/// the fetch.
 ///
 /// This is *replacement*-atomicity, **not** *observer*-atomicity: a
 /// process reading files inside `dest` during the swap may see the old

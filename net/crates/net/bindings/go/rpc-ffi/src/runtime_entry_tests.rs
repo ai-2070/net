@@ -109,7 +109,10 @@ fn rpc_handle() -> *mut MeshRpcHandle {
             "server-streaming",
             net_rpc_set_streaming_handler_dispatcher(unused_streaming),
         ),
-        ("duplex", net_rpc_set_duplex_handler_dispatcher(unused_duplex)),
+        (
+            "duplex",
+            net_rpc_set_duplex_handler_dispatcher(unused_duplex),
+        ),
     ] {
         assert_eq!(
             code, 0,

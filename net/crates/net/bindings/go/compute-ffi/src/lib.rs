@@ -688,7 +688,6 @@ struct DispatcherFns {
 
 static DISPATCHER: OnceLock<DispatcherFns> = OnceLock::new();
 
-
 /// Releases a buffer the Go callback layer allocated.
 ///
 /// Implemented in the Go module's own C translation unit
