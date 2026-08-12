@@ -13,7 +13,6 @@ which is operator setup — covered by the Rust live suite.
 
 from __future__ import annotations
 
-import itertools
 
 import pytest
 
@@ -26,11 +25,21 @@ if not hasattr(net, "OrgCredentials"):
 from net.org import parse_org_error  # noqa: E402
 
 PSK = "42" * 32
-_ports = itertools.count(35_100)
-
-
 def _addr() -> str:
-    return f"127.0.0.1:{next(_ports)}"
+    """A bind address the OS picks.
+
+    Port 0 asks the kernel for a free ephemeral port, so parallel jobs
+    and unrelated processes on the same runner cannot collide. A fixed
+    counter (this used to hand out 35100, 35101, ...) fails with
+    EADDRINUSE the moment anything else on the machine holds one of
+    those numbers, which is a flake nobody can reproduce locally.
+
+    No test in this module dials another mesh in it, so nothing here
+    needs a predictable port. A test that does need one can read
+    `mesh.local_addr` after construction — that is what the rest of the
+    suite does.
+    """
+    return "127.0.0.1:0"
 
 
 def _seed(b: int) -> bytes:
