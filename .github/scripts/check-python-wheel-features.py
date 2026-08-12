@@ -112,8 +112,56 @@ def main() -> int:
 #: never reach a wheel anyone installs.
 PROBE_FEATURE = "panic-probe"
 
-#: The one CI job allowed to enable it.
+#: The one job allowed to enable it, in its own workflow.
 PROBE_JOB = "panic-probe-witness"
+WITNESS_WF = Path(".github/workflows/panic-probe-witness.yml")
+
+#: What that job must actually do. Finding a job by name proves nothing
+#: — an empty job with the right name would satisfy it while the
+#: extension's panic strategy went unmeasured.
+REQUIRED_WITNESS_STEPS = {
+    "an abort-profile probe build": "maturin build --release",
+    "an unwind-profile probe build": "maturin build --profile python-release",
+    "the abort assertion": "--expect abort",
+    "the unwind assertion": "--expect unwind",
+    "the ordinary-wheel absence assertion": "_panic_strategy_probe",
+}
+
+
+def witness_problems() -> list[str]:
+    """The witness must exist and must do the five things it claims.
+
+    A green run has to mean the same thing next year as it does today.
+    """
+    if not WITNESS_WF.is_file():
+        return [
+            f"{WITNESS_WF}: missing. The `{PROBE_FEATURE}` feature exists to be "
+            f"exercised by this workflow; without it nothing measures the "
+            f"shipped extension's panic strategy and this check guards an "
+            f"unused feature."
+        ]
+    text = WITNESS_WF.read_text(encoding="utf-8")
+    out: list[str] = []
+    if PROBE_JOB not in text:
+        out.append(f"{WITNESS_WF}: no `{PROBE_JOB}` job")
+    for what, needle in REQUIRED_WITNESS_STEPS.items():
+        if needle not in text:
+            out.append(
+                f"{WITNESS_WF}: no {what} (looked for {needle!r}). The witness "
+                f"would pass while proving less than it claims."
+            )
+    # Triggers it declares must be triggers it can actually receive. The
+    # previous version of this job sat in `ci.yml` behind an `if:`
+    # naming `workflow_dispatch` and `schedule`, neither of which that
+    # workflow fires — two thirds of the condition was dead.
+    for event in ("workflow_dispatch", "schedule", "push"):
+        if event not in text:
+            out.append(
+                f"{WITNESS_WF}: does not declare `{event}`. Two expensive "
+                f"builds need a manual and a scheduled path, not only a "
+                f"push-triggered one."
+            )
+    return out
 
 
 def ci_jobs(text: str) -> dict[str, str]:
@@ -213,12 +261,7 @@ def check_probe_absent(
                 f"{CI_WF}: job `{job}` enables `{PROBE_FEATURE}`: {ln}"
             )
 
-    if PROBE_JOB not in ci_jobs(ci_text):
-        problems.append(
-            f"{CI_WF}: no `{PROBE_JOB}` job. The probe feature exists to be "
-            f"exercised; without that job nothing proves the shipped extension's "
-            f"panic strategy, and this check is guarding an unused feature."
-        )
+    problems.extend(witness_problems())
 
     for p in problems:
         print(p)
