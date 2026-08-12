@@ -1799,7 +1799,21 @@ mod tests {
         // Missing file → not enrolled yet.
         assert!(DeviceEnrollment::load(&path).unwrap().is_none());
         // Corrupt file → surfaced, not silently treated as unenrolled.
+        //
+        // Written by hand rather than through `save`, precisely because
+        // `save` would produce valid JSON. That also bypasses the
+        // `0o600` `save` sets, and `load` runs the SEC-05 secret-file
+        // gate first — this file holds `device_seed` — so on Unix a
+        // umask-default `0o644` is refused as `Permissions` before
+        // anything parses it. Restore the mode `save` would have used,
+        // so the assertion is about corruption and not about
+        // permissions.
         std::fs::write(&path, b"{ not valid json").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         assert!(matches!(
             DeviceEnrollment::load(&path),
             Err(DeviceEnrollmentError::Corrupt { .. })
