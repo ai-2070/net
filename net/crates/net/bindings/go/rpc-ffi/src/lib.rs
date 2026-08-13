@@ -520,9 +520,14 @@ static CALLBACK_FREE: std::sync::OnceLock<CallbackFreeFn> = std::sync::OnceLock:
 /// termination.
 ///
 /// With no deallocator registered the buffer is **leaked**, loudly and
-/// once: leaking bounded bytes beats corrupting a heap. On Windows that
-/// branch is unreachable, because dispatcher registration refuses
-/// without one.
+/// once: leaking beats corrupting a heap. That branch is unreachable in
+/// practice, because dispatcher registration refuses without a
+/// deallocator on every platform — see [`warn_missing_callback_free`].
+/// It exists so that a path which somehow reaches it fails safe rather
+/// than guessing.
+///
+/// Note what is leaked: one buffer *per callback*, for the life of the
+/// process. Not a bounded quantity.
 fn free_callback_buffer(ptr: *mut std::ffi::c_void) {
     if ptr.is_null() {
         return;
@@ -545,9 +550,8 @@ fn free_callback_buffer(ptr: *mut std::ffi::c_void) {
 
 /// Register the deallocator for Go-allocated callback buffers.
 ///
-/// Must be called **before** any dispatcher registration; on Windows
-/// that ordering is enforced, because releasing a Go buffer from this
-/// DLL's CRT corrupts the heap.
+/// Must be called **before** any dispatcher registration, and that
+/// ordering is enforced on every platform.
 ///
 /// Idempotent — first call wins. Returns `0` on success, `-1` for a
 /// null pointer.
@@ -564,21 +568,42 @@ pub extern "C" fn net_rpc_set_callback_free(free_fn: Option<CallbackFreeFn>) -> 
 
 /// Whether a callback deallocator has been registered.
 ///
-/// Dispatcher registration consults this on Windows and refuses without
-/// one: a Go wrapper built before `net_rpc_set_callback_free` existed would otherwise
-/// pair with this DLL and reintroduce the wrong-heap free at the first
-/// callback — a crash at an arbitrary later moment instead of a refusal
-/// at startup.
+/// Dispatcher registration consults this and refuses without one: a Go
+/// wrapper built before `net_rpc_set_callback_free` existed would
+/// otherwise pair with this DLL and produce a crash or a leak at an
+/// arbitrary later moment instead of a refusal at startup.
 fn callback_free_registered() -> bool {
     CALLBACK_FREE.get().is_some()
 }
 
 /// The message a refused dispatcher registration prints.
+///
+/// # Why this refuses everywhere, not just on Windows
+///
+/// The wrong-heap free is a Windows failure — each module carries its
+/// own CRT heap there, and Application Verifier caught the corruption
+/// directly. On Linux both sides are glibc's heap, which is why the
+/// original defect went unnoticed and why the first version of this
+/// gate was `cfg!(windows)`.
+///
+/// But the repair changed what a missing deallocator *means*. Rust no
+/// longer calls `libc::free` on these buffers at all, on any platform.
+/// So a mismatched pairing on Linux no longer performs an
+/// invisible-but-correct free — it leaks one buffer per callback,
+/// forever. That is a regression against the pre-repair behaviour, and
+/// a server that leaks per request is not a state worth booting into.
+///
+/// The invariant is platform-independent — the allocator that creates a
+/// buffer releases it — so the enforcement is too. A consumer that
+/// reaches this message is one build step from correct: register the
+/// deallocator first.
 fn warn_missing_callback_free(what: &str) {
     eprintln!(
-        "net-rpc-ffi: refusing to register {what} before net_rpc_set_callback_free. On Windows this \
-         DLL cannot free a buffer the Go module allocated — the CRT heaps \
-         differ. Update the Go wrapper to match this library."
+        "net-rpc-ffi: refusing to register {what} before net_rpc_set_callback_free. \
+         This library releases Go-allocated callback buffers only through that \
+         deallocator — on Windows because freeing them here corrupts a different \
+         CRT heap, and everywhere because it otherwise cannot free them at all and \
+         would leak one per callback. Update the Go wrapper to match this library."
     );
 }
 
@@ -590,7 +615,7 @@ fn warn_missing_callback_free(what: &str) {
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_set_handler_dispatcher(dispatcher: RpcHandlerFn) -> c_int {
     ffi_guard!(-1, {
-        if cfg!(windows) && !callback_free_registered() {
+        if !callback_free_registered() {
             warn_missing_callback_free("the unary handler dispatcher");
             return -1;
         }
@@ -2956,7 +2981,7 @@ pub extern "C" fn net_rpc_set_client_streaming_handler_dispatcher(
     dispatcher: RpcClientStreamingHandlerFn,
 ) -> c_int {
     ffi_guard!(-1, {
-        if cfg!(windows) && !callback_free_registered() {
+        if !callback_free_registered() {
             warn_missing_callback_free("the client-streaming handler dispatcher");
             return -1;
         }
@@ -2970,7 +2995,7 @@ pub extern "C" fn net_rpc_set_client_streaming_handler_dispatcher(
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_set_duplex_handler_dispatcher(dispatcher: RpcDuplexHandlerFn) -> c_int {
     ffi_guard!(-1, {
-        if cfg!(windows) && !callback_free_registered() {
+        if !callback_free_registered() {
             warn_missing_callback_free("the duplex handler dispatcher");
             return -1;
         }
@@ -3399,7 +3424,7 @@ pub extern "C" fn net_rpc_set_streaming_handler_dispatcher(
     dispatcher: RpcStreamingHandlerFn,
 ) -> c_int {
     ffi_guard!(-1, {
-        if cfg!(windows) && !callback_free_registered() {
+        if !callback_free_registered() {
             warn_missing_callback_free("the server-streaming handler dispatcher");
             return -1;
         }

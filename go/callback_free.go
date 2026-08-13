@@ -56,13 +56,19 @@ import (
 //
 // # Ordering
 //
-// The deallocator is registered before any dispatcher. On Windows the
-// Rust side enforces that: dispatcher registration fails if no
-// deallocator is present, so a Go wrapper built before this existed
-// refuses at startup instead of corrupting a heap at the first
-// callback. `registerCallbackFree` is therefore called from every
+// The deallocator is registered before any dispatcher, and the Rust
+// side enforces that on every platform: dispatcher registration fails
+// if no deallocator is present, so a Go wrapper built before this
+// existed refuses at startup instead of failing at the first callback.
+// `registerCallbackFree` is therefore called from every
 // dispatcher-registration path rather than relying on package `init`
 // ordering.
+//
+// The enforcement is not Windows-only even though the heap corruption
+// is. Rust no longer calls `libc::free` on these buffers anywhere, so
+// on Linux a missing deallocator does not produce an
+// invisible-but-correct free — it leaks one buffer per callback for the
+// life of the process.
 
 var callbackFreeOnce sync.Once
 
@@ -71,9 +77,9 @@ var callbackFreeOnce sync.Once
 //
 // Panics if a surface refuses. That is the right response: the
 // alternative is running with a dispatcher whose buffers cannot be
-// freed correctly, and on Windows the Rust side will refuse the
-// dispatcher anyway — failing here names the cause instead of
-// surfacing later as a mystery registration error.
+// freed correctly, and the Rust side will refuse that dispatcher
+// anyway — failing here names the cause instead of surfacing later as
+// a mystery registration error.
 func registerCallbackFree() {
 	callbackFreeOnce.Do(func() {
 		f := C.NetGoCallbackFreeFn(C.netGoFreeCallbackBuffer)
