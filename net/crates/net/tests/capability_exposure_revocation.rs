@@ -169,6 +169,20 @@ async fn retiring_a_public_service_supersedes_the_peer_view_inside_the_rate_wind
 /// The probe fires inside the send seqlock and advances the exposure epoch
 /// exactly as a concurrent revocation would, so the first attempt is refused.
 /// It is one-shot, so the corrective attempt proceeds against stable state.
+///
+/// Two things have to be true for that to be observable at all, and neither
+/// was guaranteed before — both concern the re-announce `serve_rpc` spawns:
+///
+/// 1. the probed announce must reach the seqlock rather than coalesce. Only
+///    `revocation_pending_on_the_wire` gets an announce past the 120 s window,
+///    the first sender to broadcast consumes it, and the spawned task could be
+///    that sender. This test re-arms it explicitly instead of racing;
+/// 2. the tag the final assertion watches must be one only the corrective send
+///    can carry. The spawned task republishes the CURRENT baseline, so it will
+///    happily ship a tag this test set moments earlier — which made the
+///    assertion pass on a build where no corrective send occurred at all.
+///    Waiting for that task to finish first, and watching a tag introduced
+///    afterwards, closes it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_security_refused_send_drives_its_own_corrective_send() {
     let server = build_node().await;
@@ -192,6 +206,46 @@ async fn a_security_refused_send_drives_its_own_corrective_send() {
         .serve_rpc("corrective-svc", Arc::new(TrivialHandler))
         .expect("serve");
 
+    // `serve_rpc` SPAWNS a re-announce (see `serve_rpc_reannounce_baseline`),
+    // and it competes with the probed announce below for the one thing that
+    // gets either past a 120 s window: `revocation_pending_on_the_wire` — an
+    // exposure generation ahead of the last BROADCAST one, which is
+    // security-priority and bypasses coalescing outright.
+    //
+    // Whichever announce runs first consumes it, because a successful send
+    // records the generation it shipped. The other then finds nothing pending,
+    // takes the in-window arm, and on a bare-start node returns `Coalesced`
+    // before the send seqlock is ever entered. When the loser was the probed
+    // announce the probe never fired and this test failed on the assertion
+    // below — a ~1% flake that reached CI.
+    //
+    // Let the spawned re-announce finish first. It is security-priority, so it
+    // broadcasts; observing its arrival at the client is how this test knows the
+    // task is behind it rather than pending. It has to be behind us for a second
+    // reason as well: it republishes the CURRENT baseline (that is the
+    // `serve_rpc_reannounce_baseline` contract), so a copy still pending here
+    // would pick up the witness baseline set below and ship it — carrying the
+    // very tag the final assertion attributes to the corrective send.
+    let registered = CapabilityFilter::new().require_tag("nrpc:corrective-svc");
+    assert!(
+        wait_until(
+            || client
+                .find_nodes_by_filter(&registered)
+                .contains(&server_id),
+            Duration::from_secs(10),
+        )
+        .await,
+        "the serve_rpc re-announce never reached the client; without that this test \
+         cannot know the spawned task is behind it",
+    );
+
+    // Then re-arm the condition instead of racing for it — the send above
+    // consumed it. One bump is exactly the state a real revocation leaves
+    // behind, and it is the state this witness is meant to start from, so the
+    // announce below is deterministically security-priority and always reaches
+    // the seqlock.
+    server.test_advance_visibility_generation();
+
     // One-shot: refuse the FIRST attempt from inside its send seqlock.
     let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let server_probe = server.clone();
@@ -202,8 +256,16 @@ async fn a_security_refused_send_drives_its_own_corrective_send() {
         }
     };
 
+    // Witness on a tag introduced by THIS announce, not on `nrpc:corrective-svc`.
+    // The spawned re-announce carries the service tag too, so asserting on it
+    // let this test pass on a build where the corrective send never happened —
+    // the spawned task had already delivered it. Verified: with a probe that
+    // refuses every attempt, so no corrective send can succeed, the old
+    // assertion still passed. A tag present in no other baseline can only reach
+    // the client through the corrective send.
+    const WITNESS_TAG: &str = "corrective-witness";
     server
-        .announce_with_send_probe_for_test(CapabilitySet::new(), &probe)
+        .announce_with_send_probe_for_test(CapabilitySet::new().add_tag(WITNESS_TAG), &probe)
         .await
         .expect("announce");
 
@@ -212,7 +274,7 @@ async fn a_security_refused_send_drives_its_own_corrective_send() {
         "the probe must actually have fired inside the send seqlock",
     );
 
-    let served = CapabilityFilter::new().require_tag("nrpc:corrective-svc");
+    let served = CapabilityFilter::new().require_tag(WITNESS_TAG);
     assert!(
         wait_until(
             || client.find_nodes_by_filter(&served).contains(&server_id),
@@ -220,7 +282,8 @@ async fn a_security_refused_send_drives_its_own_corrective_send() {
         )
         .await,
         "the refused send must have driven a corrective send of its own — nothing \
-         else exists on a bare-start node to carry the announcement",
+         else exists on a bare-start node to carry the announcement, and this tag \
+         appears in no other baseline",
     );
 }
 
