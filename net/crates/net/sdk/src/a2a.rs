@@ -464,13 +464,50 @@ impl TaskRegistry {
         }
     }
 
-    /// Every recorded task, newest-updated first.
-    pub fn list(&self) -> Vec<TaskRecord> {
+    /// Every recorded task with the owner that submitted it,
+    /// newest-updated first.
+    ///
+    /// **Local only.** No nRPC service exposes this — [`Mesh::serve_a2a`]
+    /// serves submit, status and cancel, all of which are owner-scoped.
+    /// A caller holding the registry is the process hosting it, and
+    /// giving the executor's own operator a full view is the point.
+    ///
+    /// The owner rides alongside rather than inside [`TaskRecord`]:
+    /// that type is the status reply's wire shape, spoken by the Node
+    /// and Python bindings and by peers on older builds, and a
+    /// cross-version break is not worth an operator convenience.
+    ///
+    /// Use [`Self::list_for`] for one submitter's tasks.
+    ///
+    /// [`Mesh::serve_a2a`]: crate::mesh::Mesh::serve_a2a
+    pub fn list(&self) -> Vec<(TaskOwner, TaskRecord)> {
+        let mut recs: Vec<(TaskOwner, TaskRecord)> = self
+            .inner
+            .lock()
+            .iter()
+            .map(|((owner, _id), e)| {
+                (
+                    *owner,
+                    TaskRecord {
+                        brief: e.brief.clone(),
+                        state: e.state.clone(),
+                        updated_at: e.updated_at,
+                    },
+                )
+            })
+            .collect();
+        recs.sort_by_key(|(_, r)| std::cmp::Reverse(r.updated_at));
+        recs
+    }
+
+    /// One owner's tasks, newest-updated first.
+    pub fn list_for(&self, owner: TaskOwner) -> Vec<TaskRecord> {
         let mut recs: Vec<TaskRecord> = self
             .inner
             .lock()
-            .values()
-            .map(|e| TaskRecord {
+            .iter()
+            .filter(|((o, _), _)| *o == owner)
+            .map(|(_, e)| TaskRecord {
                 brief: e.brief.clone(),
                 state: e.state.clone(),
                 updated_at: e.updated_at,
@@ -843,6 +880,76 @@ mod tests {
         let reg = TaskRegistry::new();
         assert!(!reg.cancel(TaskOwner::Local, "nope"));
         assert!(reg.status(TaskOwner::Local, "nope").is_none());
+    }
+
+    /// `list` was the one accessor left owner-blind after tasks became
+    /// owner-keyed: it flattened every submitter's records into an
+    /// undifferentiated `Vec<TaskRecord>`.
+    ///
+    /// Not a disclosure — nothing serves it remotely — but it made the
+    /// local operator view useless for the question the ownership work
+    /// exists to answer, and it silently merged two submitters' tasks
+    /// that happen to share an id, which is the collision
+    /// `(owner, task_id)` keying was introduced to prevent.
+    #[tokio::test]
+    async fn list_attributes_tasks_and_list_for_scopes_them() {
+        let reg = TaskRegistry::new();
+        let alice = TaskOwner::Peer(0xA11CE);
+        let bob = TaskOwner::Peer(0xB0B);
+        let exec = || {
+            Arc::new(MockExecutor {
+                result: "blob://r".to_string(),
+                saw_cancel: Arc::new(AtomicBool::new(false)),
+                wait_for_cancel: true,
+            })
+        };
+
+        // The same client-chosen id from two submitters — "task-1" is
+        // not a far-fetched collision — plus a second task for Alice.
+        let mut shared = TaskBrief::new("alice's work");
+        shared.task_id = "task-1".to_string();
+        reg.submit(alice, shared, exec()).expect("alice submit");
+
+        let mut collide = TaskBrief::new("bob's work");
+        collide.task_id = "task-1".to_string();
+        reg.submit(bob, collide, exec()).expect("bob submit");
+
+        let mut second = TaskBrief::new("alice's other work");
+        second.task_id = "task-2".to_string();
+        reg.submit(alice, second, exec()).expect("alice submit 2");
+
+        let all = reg.list();
+        assert_eq!(all.len(), 3, "all three tasks are recorded");
+
+        // Both `task-1`s survive, and each is attributable.
+        let task_1_owners: Vec<TaskOwner> = all
+            .iter()
+            .filter(|(_, r)| r.brief.task_id == "task-1")
+            .map(|(o, _)| *o)
+            .collect();
+        assert_eq!(task_1_owners.len(), 2, "one submitter's task-1 was lost");
+        assert!(task_1_owners.contains(&alice) && task_1_owners.contains(&bob));
+
+        // The brief that comes back with each owner is that owner's.
+        let alices_first = all
+            .iter()
+            .find(|(o, r)| *o == alice && r.brief.task_id == "task-1")
+            .expect("alice's task-1");
+        assert_eq!(alices_first.1.brief.prompt, "alice's work");
+
+        // `list_for` is the scoped view.
+        let hers = reg.list_for(alice);
+        assert_eq!(hers.len(), 2, "alice has two tasks");
+        assert!(
+            hers.iter().all(|r| r.brief.prompt.starts_with("alice's")),
+            "list_for leaked another submitter's task: {hers:?}"
+        );
+        assert_eq!(reg.list_for(bob).len(), 1);
+        assert!(reg.list_for(TaskOwner::Local).is_empty());
+
+        for (owner, rec) in all {
+            reg.cancel(owner, &rec.brief.task_id);
+        }
     }
 
     #[tokio::test]
