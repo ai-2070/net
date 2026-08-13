@@ -1482,6 +1482,16 @@ pub struct TraceContext {
 /// to authorize a caller must either run behind the PROTECTED-service
 /// admission gate (and read [`RpcContext::org_admission`]) or carry
 /// their own application-level signature.
+///
+/// # Construction
+///
+/// `#[non_exhaustive]`: handlers *receive* this type, they do not build
+/// it, and the 0.35 addition of [`session_peer`](Self::session_peer)
+/// showed what the alternative costs — a new field is a compile break
+/// for every downstream literal. Nothing outside this crate constructs
+/// one today, so the attribute takes nothing away and means the next
+/// field this gains is additive.
+#[non_exhaustive]
 pub struct RpcContext {
     /// Caller's `origin_hash`, copied verbatim from the inbound
     /// packet header ([`RpcInboundEvent::origin_hash`]).

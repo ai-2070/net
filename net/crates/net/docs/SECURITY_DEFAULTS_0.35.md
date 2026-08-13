@@ -283,6 +283,30 @@ shipped configuration is tested rather than approximated.
 
 ---
 
+## Source-compatibility breaks
+
+Not default changes — these break a *build*, not a deployment, and they
+fail at compile time where they are easy to find. Listed so the failure
+is expected rather than diagnosed.
+
+| Item | Break | Fix |
+| --- | --- | --- |
+| `RpcContext` | Gained `session_peer`, and is now `#[non_exhaustive]` | Stop constructing it literally; handlers receive it. It is the field every gate in this document authorizes on |
+| `MeshDbServer::new` | Second argument, `MeshDbAccessPolicy` | §4 |
+| `AggregatorRegistry::install_registry_service*` | Trailing `RegistryAdminPolicy` argument | §3 |
+| `serve_blob_transfer_rpc` | Unchanged signature, but now defaults to `Closed` | §2, or `serve_blob_transfer_rpc_with_policy` |
+| `TaskRegistry::submit` / `status` / `record` / `cancel` / `forget` | Leading `TaskOwner` argument; `submit` returns `Result` | §8 |
+| `TaskRegistry::list` | Returns `(TaskOwner, TaskRecord)` pairs | Use `list_for(owner)` for one submitter |
+| `RegistryGroupSummary` | `group_seed` → `group_seed_fingerprint` | §3a |
+
+`RpcContext` becoming `#[non_exhaustive]` is the one worth a note: it is
+a break in its own right, taken *because* adding `session_peer` was
+already one. Nothing outside the `net` crate constructs an `RpcContext`
+— handlers are handed one — so the attribute costs nothing now and
+makes the next field additive instead of another break.
+
+---
+
 ## What "authenticated peer" means everywhere above
 
 Items 1–3 and 8 authorize on the **AEAD-authenticated session peer** —
