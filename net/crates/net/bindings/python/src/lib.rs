@@ -410,7 +410,17 @@ impl Net {
         net_batched_io: Option<bool>,
         net_packet_pool_size: Option<usize>,
     ) -> PyResult<Self> {
-        let runtime = Runtime::new().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        // Guarded at construction, not at storage. Twenty fallible steps
+        // separate this line from the `Net` built below, and every one of
+        // them drops this runtime on its error path. Wrapping only at the
+        // struct — which is what the original #35 sweep did — leaves that
+        // whole window unguarded, so a caller who reaches any of those
+        // errors from a thread that is already inside a runtime (a pyo3
+        // handler dispatched onto a tokio worker) gets the panic the guard
+        // exists to prevent.
+        let runtime = Arc::new(GuardedRuntime::new(
+            Runtime::new().map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+        ));
 
         let mut builder = EventBusConfig::builder();
 
@@ -668,7 +678,7 @@ impl Net {
 
         Ok(Net {
             bus: Arc::new(RwLock::new(Some(bus))),
-            runtime: Arc::new(GuardedRuntime::new(runtime)),
+            runtime,
         })
     }
 

@@ -216,11 +216,18 @@ impl HttpClientState {
         config: PaymentConfig,
         destinations: DestinationPolicy,
     ) -> PyResult<Self> {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .map_err(|e| PyRuntimeError::new_err(format!("http client runtime: {e}")))?;
+        // Guarded at construction: `build_flow` below is fallible, and on
+        // its error path this runtime drops before it ever reaches the
+        // struct. Dropping the `EnterGuard` first leaves *this* runtime's
+        // context, but not an enclosing one — a caller already inside a
+        // runtime still hits the blocking-drop panic.
+        let runtime = Arc::new(GuardedRuntime::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .map_err(|e| PyRuntimeError::new_err(format!("http client runtime: {e}")))?,
+        ));
         // Build the flow inside the runtime context so reqwest's client finds
         // a reactor at construction.
         let flow = {
@@ -229,7 +236,7 @@ impl HttpClientState {
         };
         Ok(Self {
             flow: Arc::new(flow),
-            runtime: Arc::new(GuardedRuntime::new(runtime)),
+            runtime,
         })
     }
 }

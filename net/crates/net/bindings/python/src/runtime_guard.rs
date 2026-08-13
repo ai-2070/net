@@ -181,4 +181,108 @@ mod tests {
         let answer = guarded.block_on(async { 6 * 7 });
         assert_eq!(answer, 42);
     }
+
+    /// Files whose runtime construction is deliberately not wrapped,
+    /// with the reason. Keep this short and justified.
+    const UNWRAPPED_BY_DESIGN: &[(&str, &str)] = &[(
+        "async_bridge.rs",
+        "process-static `OnceLock<Runtime>`: never dropped, so it cannot \
+         reach the blocking-drop path. Held by value because \
+         `init_with_runtime` needs a `&Runtime` outliving every awaitable.",
+    )];
+
+    /// Every runtime the binding builds must be wrapped **where it is
+    /// built**, not where it is stored.
+    ///
+    /// The original sweep for this defect wrapped runtimes at their
+    /// struct fields, which looks equivalent and is not. Two sites
+    /// constructed a bare `Runtime` and only wrapped it several
+    /// fallible steps later — `Net::new` had twenty early exits in
+    /// that window, `PaymentHttpClient::new` one. On any of those error
+    /// paths the bare runtime dropped unguarded, and a caller already
+    /// inside a runtime got exactly the panic the guard exists to
+    /// prevent.
+    ///
+    /// Testing the two known sites would pin the two known sites. This
+    /// scans the crate so the next one fails here instead.
+    #[test]
+    fn every_runtime_is_guarded_at_its_construction_site() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut checked = 0usize;
+        let mut unguarded: Vec<String> = Vec::new();
+
+        let mut files: Vec<_> = std::fs::read_dir(&src)
+            .expect("read src/")
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+            .collect();
+        files.sort();
+
+        for path in files {
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            if name == "runtime_guard.rs" {
+                continue; // this file's own tests build runtimes on purpose
+            }
+            if UNWRAPPED_BY_DESIGN.iter().any(|(f, _)| *f == name) {
+                continue;
+            }
+            let body = std::fs::read_to_string(&path).expect("read source");
+            let lines: Vec<&str> = body.lines().collect();
+
+            for (i, line) in lines.iter().enumerate() {
+                // Prose that mentions `Runtime::new()` is not a
+                // construction. Without this the scan flags the comments
+                // explaining the guard, and — worse — inflates `checked`,
+                // so the vacuity floor below could be satisfied entirely
+                // by comments.
+                let code = line.trim_start();
+                if code.starts_with("//") {
+                    continue;
+                }
+                let builds = code.contains("Runtime::new()")
+                    || code.contains("runtime::Builder::new_multi_thread()")
+                    || code.contains("runtime::Builder::new_current_thread()");
+                if !builds {
+                    continue;
+                }
+                checked += 1;
+
+                // The wrap may sit on the construction line, or open a
+                // few lines above it for a multi-line builder chain.
+                // Anything further away is a window where a bare
+                // runtime is live across fallible code.
+                let lo = i.saturating_sub(3);
+                let hi = (i + 3).min(lines.len());
+                if !lines[lo..hi]
+                    .iter()
+                    .any(|l| l.contains("GuardedRuntime::new"))
+                {
+                    unguarded.push(format!("{name}:{}: {}", i + 1, line.trim()));
+                }
+            }
+        }
+
+        assert!(
+            unguarded.is_empty(),
+            "runtime(s) built without a GuardedRuntime at the construction \
+             site:\n  {}\n\nWrap at construction:\n\n    let rt = \
+             Arc::new(GuardedRuntime::new(Runtime::new()?));\n\nWrapping only \
+             where the runtime is finally stored leaves every fallible step \
+             in between dropping a bare runtime, which panics if the caller \
+             is inside a runtime. If a site genuinely cannot drop (a \
+             never-dropped static), add it to UNWRAPPED_BY_DESIGN with the \
+             reason.",
+            unguarded.join("\n  ")
+        );
+
+        // Guard the guard: a rename or a move would make the loop above
+        // find nothing and pass vacuously.
+        assert!(
+            checked >= 6,
+            "expected at least 6 runtime construction sites, found {checked} — \
+             did they move or get renamed? A vacuous pass here means this \
+             invariant is unenforced."
+        );
+    }
 }
