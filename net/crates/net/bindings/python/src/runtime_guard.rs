@@ -184,6 +184,10 @@ mod tests {
 
     /// Files whose runtime construction is deliberately not wrapped,
     /// with the reason. Keep this short and justified.
+    ///
+    /// Keyed by path relative to `src/`, forward-slashed — an exemption
+    /// should name one file, not every file that happens to share a
+    /// basename.
     const UNWRAPPED_BY_DESIGN: &[(&str, &str)] = &[(
         "async_bridge.rs",
         "process-static `OnceLock<Runtime>`: never dropped, so it cannot \
@@ -211,16 +215,38 @@ mod tests {
         let mut checked = 0usize;
         let mut unguarded: Vec<String> = Vec::new();
 
-        let mut files: Vec<_> = std::fs::read_dir(&src)
-            .expect("read src/")
-            .filter_map(Result::ok)
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "rs"))
-            .collect();
+        // Recursive. A flat `read_dir` covered only the top level, so a
+        // runtime built in any future submodule directory would escape
+        // the invariant silently — and the vacuity floor below would
+        // not notice, because the existing top-level sites keep it
+        // satisfied. `src/` has no subdirectories today; the point is
+        // that adding one does not quietly turn this pin off.
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        let mut dirs = vec![src.clone()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir)
+                .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+                .filter_map(Result::ok)
+            {
+                let path = entry.path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|x| x == "rs") {
+                    files.push(path);
+                }
+            }
+        }
         files.sort();
 
         for path in files {
-            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            // Relative to `src/`, forward-slashed, so an exemption
+            // names one file rather than every file with that
+            // basename anywhere in the tree.
+            let name = path
+                .strip_prefix(&src)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
             if name == "runtime_guard.rs" {
                 continue; // this file's own tests build runtimes on purpose
             }
