@@ -262,11 +262,57 @@ struct Entry {
     cancel: CancelToken,
 }
 
+/// Who submitted a task.
+///
+/// A task id is a **name, not a bearer capability**: it is
+/// client-generated, it travels through logs, dashboards and polling
+/// loops as an ordinary identifier, and [`TaskRecord`] carries the
+/// complete prompt and context refs. Learning one must not confer the
+/// right to read or cancel the work it names.
+///
+/// Registry entries are therefore keyed by `(owner, task_id)`, not by
+/// `task_id` alone. Keying rather than storing-and-checking also means
+/// two agents that independently pick the same id — `"task-1"` is not
+/// far-fetched for client-generated ids — never collide, so one peer
+/// cannot squat obvious ids to deny another.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TaskOwner {
+    /// Submitted in-process, with no mesh peer involved.
+    Local,
+    /// Submitted by an authenticated mesh peer, identified by the
+    /// AEAD-authenticated session peer that delivered the request —
+    /// never by anything the request body claimed.
+    ///
+    /// The deliverer, not an end-to-end origin: under nRPC relaying
+    /// the relay owns everything it forwards. See the module docs on
+    /// [`crate::mesh_a2a`].
+    Peer(u64),
+}
+
+/// Why [`TaskRegistry::submit`] refused a brief.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SubmitRejection {
+    /// This owner already has a *different* brief under this task id.
+    ///
+    /// Silently returning the existing task would be worse than
+    /// refusing: the submitter would poll a task that is not the one
+    /// they described and read someone else's — or their own earlier —
+    /// result as the answer to this request.
+    #[error(
+        "task id {task_id:?} already names a different brief for this submitter; \
+         re-submitting an id is idempotent only for an identical brief"
+    )]
+    IdReusedForDifferentBrief {
+        /// The contested id.
+        task_id: String,
+    },
+}
+
 /// The executor side's live task table: spawns [`TaskExecutor`]s, tracks their
 /// [`TaskState`], and routes cancellation. Cheap to clone (shared inner).
 #[derive(Clone, Default)]
 pub struct TaskRegistry {
-    inner: Arc<Mutex<HashMap<String, Entry>>>,
+    inner: Arc<Mutex<HashMap<(TaskOwner, String), Entry>>>,
 }
 
 impl TaskRegistry {
@@ -280,11 +326,19 @@ impl TaskRegistry {
     /// cancelled`, racing the executor against the cancel token so a cancel
     /// stops the work (a cooperative executor also watches the token).
     ///
-    /// Idempotent per task id: a re-submit of an id the registry already
-    /// knows (an nRPC retransmit of the accept) returns the id without
-    /// spawning a second executor — re-inserting would orphan the first
-    /// entry's cancel token (making the original run uncancellable) and race
-    /// two executors on the final state.
+    /// Idempotent per `(owner, task id)`: a re-submit of a brief this
+    /// owner already has (an nRPC retransmit of the accept) returns the
+    /// id without spawning a second executor — re-inserting would orphan
+    /// the first entry's cancel token (making the original run
+    /// uncancellable) and race two executors on the final state.
+    ///
+    /// Idempotency requires an **identical** brief. The same owner
+    /// reusing an id for different work is
+    /// [`SubmitRejection::IdReusedForDifferentBrief`], not a silent
+    /// hand-back of the earlier task.
+    ///
+    /// Two different owners may use the same task id without
+    /// interfering: entries are keyed by the pair.
     ///
     /// Also evicts terminal records older than [`TERMINAL_RECORD_TTL_SECS`]
     /// (see [`Self::evict_terminal`]) so a long-lived executor's table doesn't
@@ -292,8 +346,14 @@ impl TaskRegistry {
     ///
     /// Requires a tokio runtime context (the serve handler / a `#[tokio::test]`
     /// provides it).
-    pub fn submit(&self, brief: TaskBrief, executor: Arc<dyn TaskExecutor>) -> String {
+    pub fn submit(
+        &self,
+        owner: TaskOwner,
+        brief: TaskBrief,
+        executor: Arc<dyn TaskExecutor>,
+    ) -> Result<String, SubmitRejection> {
         let id = brief.task_id.clone();
+        let key = (owner, id.clone());
         let cancel = CancelToken::new();
         {
             let mut map = self.inner.lock();
@@ -302,11 +362,14 @@ impl TaskRegistry {
                 !e.state.is_terminal()
                     || now.saturating_sub(e.updated_at) <= TERMINAL_RECORD_TTL_SECS
             });
-            if map.contains_key(&id) {
-                return id;
+            if let Some(existing) = map.get(&key) {
+                if existing.brief == brief {
+                    return Ok(id);
+                }
+                return Err(SubmitRejection::IdReusedForDifferentBrief { task_id: id });
             }
             map.insert(
-                id.clone(),
+                key.clone(),
                 Entry {
                     brief: brief.clone(),
                     state: TaskState::Accepted,
@@ -317,7 +380,7 @@ impl TaskRegistry {
         }
 
         let inner = Arc::clone(&self.inner);
-        let id_run = id.clone();
+        let id_run = key.clone();
         tokio::spawn(async move {
             set_state(&inner, &id_run, TaskState::Running);
             // Panic containment: an executor panic unwinds this task and
@@ -357,30 +420,42 @@ impl TaskRegistry {
             };
             set_state(&inner, &id_run, final_state);
         });
-        id
+        Ok(id)
     }
 
-    /// The current state of `task_id`, if known.
-    pub fn status(&self, task_id: &str) -> Option<TaskState> {
-        self.inner.lock().get(task_id).map(|e| e.state.clone())
+    /// The current state of `owner`'s `task_id`, if known.
+    ///
+    /// A task belonging to a *different* owner reads as unknown. That is
+    /// deliberate: distinguishing "not yours" from "no such task" would
+    /// make this an existence oracle for a caller who is not entitled to
+    /// know the task exists.
+    pub fn status(&self, owner: TaskOwner, task_id: &str) -> Option<TaskState> {
+        self.inner
+            .lock()
+            .get(&(owner, task_id.to_string()))
+            .map(|e| e.state.clone())
     }
 
-    /// The full record of `task_id`, if known.
-    pub fn record(&self, task_id: &str) -> Option<TaskRecord> {
-        self.inner.lock().get(task_id).map(|e| TaskRecord {
-            brief: e.brief.clone(),
-            state: e.state.clone(),
-            updated_at: e.updated_at,
-        })
+    /// The full record of `owner`'s `task_id`, if known. Another owner's
+    /// task reads as unknown — see [`Self::status`].
+    pub fn record(&self, owner: TaskOwner, task_id: &str) -> Option<TaskRecord> {
+        self.inner
+            .lock()
+            .get(&(owner, task_id.to_string()))
+            .map(|e| TaskRecord {
+                brief: e.brief.clone(),
+                state: e.state.clone(),
+                updated_at: e.updated_at,
+            })
     }
 
-    /// Request cancellation of `task_id`. Returns `true` if it existed and was
-    /// still in flight (a terminal or unknown task returns `false`). Trips the
-    /// token; the spawned task transitions to `Cancelled` once the executor
-    /// stops.
-    pub fn cancel(&self, task_id: &str) -> bool {
+    /// Request cancellation of `owner`'s `task_id`. Returns `true` if it
+    /// existed and was still in flight (a terminal, unknown, or
+    /// differently-owned task returns `false`). Trips the token; the
+    /// spawned task transitions to `Cancelled` once the executor stops.
+    pub fn cancel(&self, owner: TaskOwner, task_id: &str) -> bool {
         let map = self.inner.lock();
-        match map.get(task_id) {
+        match map.get(&(owner, task_id.to_string())) {
             Some(e) if !e.state.is_terminal() => {
                 e.cancel.cancel();
                 true
@@ -389,13 +464,50 @@ impl TaskRegistry {
         }
     }
 
-    /// Every recorded task, newest-updated first.
-    pub fn list(&self) -> Vec<TaskRecord> {
+    /// Every recorded task with the owner that submitted it,
+    /// newest-updated first.
+    ///
+    /// **Local only.** No nRPC service exposes this — [`Mesh::serve_a2a`]
+    /// serves submit, status and cancel, all of which are owner-scoped.
+    /// A caller holding the registry is the process hosting it, and
+    /// giving the executor's own operator a full view is the point.
+    ///
+    /// The owner rides alongside rather than inside [`TaskRecord`]:
+    /// that type is the status reply's wire shape, spoken by the Node
+    /// and Python bindings and by peers on older builds, and a
+    /// cross-version break is not worth an operator convenience.
+    ///
+    /// Use [`Self::list_for`] for one submitter's tasks.
+    ///
+    /// [`Mesh::serve_a2a`]: crate::mesh::Mesh::serve_a2a
+    pub fn list(&self) -> Vec<(TaskOwner, TaskRecord)> {
+        let mut recs: Vec<(TaskOwner, TaskRecord)> = self
+            .inner
+            .lock()
+            .iter()
+            .map(|((owner, _id), e)| {
+                (
+                    *owner,
+                    TaskRecord {
+                        brief: e.brief.clone(),
+                        state: e.state.clone(),
+                        updated_at: e.updated_at,
+                    },
+                )
+            })
+            .collect();
+        recs.sort_by_key(|(_, r)| std::cmp::Reverse(r.updated_at));
+        recs
+    }
+
+    /// One owner's tasks, newest-updated first.
+    pub fn list_for(&self, owner: TaskOwner) -> Vec<TaskRecord> {
         let mut recs: Vec<TaskRecord> = self
             .inner
             .lock()
-            .values()
-            .map(|e| TaskRecord {
+            .iter()
+            .filter(|((o, _), _)| *o == owner)
+            .map(|(_, e)| TaskRecord {
                 brief: e.brief.clone(),
                 state: e.state.clone(),
                 updated_at: e.updated_at,
@@ -405,10 +517,13 @@ impl TaskRegistry {
         recs
     }
 
-    /// Drop a task's record (housekeeping once the requester has the result).
-    /// Returns whether a record existed.
-    pub fn forget(&self, task_id: &str) -> bool {
-        self.inner.lock().remove(task_id).is_some()
+    /// Drop `owner`'s record for `task_id` (housekeeping once the
+    /// requester has the result). Returns whether a record existed.
+    pub fn forget(&self, owner: TaskOwner, task_id: &str) -> bool {
+        self.inner
+            .lock()
+            .remove(&(owner, task_id.to_string()))
+            .is_some()
     }
 
     /// Evict terminal records whose last state change is more than `ttl_secs`
@@ -432,8 +547,8 @@ impl TaskRegistry {
 /// `Failed` — or `Cancelled` when the token was tripped (the requester asked
 /// to stop; the panic is incidental). The normal completion path disarms it.
 struct PanicGuard {
-    inner: Arc<Mutex<HashMap<String, Entry>>>,
-    id: String,
+    inner: Arc<Mutex<HashMap<(TaskOwner, String), Entry>>>,
+    id: (TaskOwner, String),
     cancel: CancelToken,
     armed: bool,
 }
@@ -455,7 +570,11 @@ impl Drop for PanicGuard {
 
 /// Set a task's state, never overwriting a terminal state (so a late `Running`
 /// can't clobber a `Cancelled` recorded by a racing cancel).
-fn set_state(inner: &Arc<Mutex<HashMap<String, Entry>>>, id: &str, state: TaskState) {
+fn set_state(
+    inner: &Arc<Mutex<HashMap<(TaskOwner, String), Entry>>>,
+    id: &(TaskOwner, String),
+    state: TaskState,
+) {
     let mut map = inner.lock();
     if let Some(e) = map.get_mut(id) {
         if !e.state.is_terminal() {
@@ -518,7 +637,7 @@ mod tests {
 
     async fn wait_terminal(reg: &TaskRegistry, id: &str) -> TaskState {
         for _ in 0..200 {
-            if let Some(s) = reg.status(id) {
+            if let Some(s) = reg.status(TaskOwner::Local, id) {
                 if s.is_terminal() {
                     return s;
                 }
@@ -532,14 +651,17 @@ mod tests {
     async fn a_task_runs_to_completion_with_a_result_ref() {
         let reg = TaskRegistry::new();
         let brief = TaskBrief::new("summarize the logs");
-        let id = reg.submit(
-            brief,
-            Arc::new(MockExecutor {
-                result: "blob://result-123".to_string(),
-                saw_cancel: Arc::new(AtomicBool::new(false)),
-                wait_for_cancel: false,
-            }),
-        );
+        let id = reg
+            .submit(
+                TaskOwner::Local,
+                brief,
+                Arc::new(MockExecutor {
+                    result: "blob://result-123".to_string(),
+                    saw_cancel: Arc::new(AtomicBool::new(false)),
+                    wait_for_cancel: false,
+                }),
+            )
+            .expect("a fresh brief is accepted");
         let state = wait_terminal(&reg, &id).await;
         assert_eq!(
             state,
@@ -553,17 +675,23 @@ mod tests {
     async fn cancel_stops_a_running_task() {
         let reg = TaskRegistry::new();
         let saw = Arc::new(AtomicBool::new(false));
-        let id = reg.submit(
-            TaskBrief::new("grind forever"),
-            Arc::new(MockExecutor {
-                result: String::new(),
-                saw_cancel: Arc::clone(&saw),
-                wait_for_cancel: true,
-            }),
-        );
+        let id = reg
+            .submit(
+                TaskOwner::Local,
+                TaskBrief::new("grind forever"),
+                Arc::new(MockExecutor {
+                    result: String::new(),
+                    saw_cancel: Arc::clone(&saw),
+                    wait_for_cancel: true,
+                }),
+            )
+            .expect("submit");
         // Let it reach Running, then cancel.
         tokio::time::sleep(Duration::from_millis(20)).await;
-        assert!(reg.cancel(&id), "an in-flight task cancels");
+        assert!(
+            reg.cancel(TaskOwner::Local, &id),
+            "an in-flight task cancels"
+        );
         let state = wait_terminal(&reg, &id).await;
         assert_eq!(state, TaskState::Cancelled);
         assert!(
@@ -571,7 +699,7 @@ mod tests {
             "the executor observed the cancel"
         );
         // Cancelling a terminal task is a no-op.
-        assert!(!reg.cancel(&id));
+        assert!(!reg.cancel(TaskOwner::Local, &id));
     }
 
     /// An executor that IGNORES the cancel token — it just sleeps. Records
@@ -607,15 +735,18 @@ mod tests {
         let reg = TaskRegistry::new();
         let dropped = Arc::new(AtomicBool::new(false));
         let completed = Arc::new(AtomicBool::new(false));
-        let id = reg.submit(
-            TaskBrief::new("ignore the token"),
-            Arc::new(StubbornExecutor {
-                dropped: Arc::clone(&dropped),
-                completed: Arc::clone(&completed),
-            }),
-        );
+        let id = reg
+            .submit(
+                TaskOwner::Local,
+                TaskBrief::new("ignore the token"),
+                Arc::new(StubbornExecutor {
+                    dropped: Arc::clone(&dropped),
+                    completed: Arc::clone(&completed),
+                }),
+            )
+            .expect("submit");
         tokio::time::sleep(Duration::from_millis(20)).await;
-        assert!(reg.cancel(&id));
+        assert!(reg.cancel(TaskOwner::Local, &id));
         // Terminal promptly — not after the executor's hour-long sleep.
         let state = wait_terminal(&reg, &id).await;
         assert_eq!(state, TaskState::Cancelled);
@@ -652,15 +783,19 @@ mod tests {
         let exec = Arc::new(CountingExecutor {
             runs: Arc::clone(&runs),
         });
-        let id = reg.submit(brief.clone(), exec.clone());
-        let id2 = reg.submit(brief, exec);
+        let id = reg
+            .submit(TaskOwner::Local, brief.clone(), exec.clone())
+            .expect("first submit");
+        let id2 = reg
+            .submit(TaskOwner::Local, brief, exec)
+            .expect("identical re-submit is idempotent");
         assert_eq!(id, id2, "the retransmit acks the same id");
 
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(runs.load(Ordering::SeqCst), 1, "exactly one executor ran");
 
         // The (single, original) run is still wired to the entry's token.
-        assert!(reg.cancel(&id));
+        assert!(reg.cancel(TaskOwner::Local, &id));
         let state = wait_terminal(&reg, &id).await;
         assert_eq!(state, TaskState::Cancelled);
         assert_eq!(runs.load(Ordering::SeqCst), 1);
@@ -669,35 +804,41 @@ mod tests {
     #[tokio::test]
     async fn terminal_records_evict_after_ttl_running_ones_never() {
         let reg = TaskRegistry::new();
-        let done = reg.submit(
-            TaskBrief::new("quick"),
-            Arc::new(MockExecutor {
-                result: "blob://r".to_string(),
-                saw_cancel: Arc::new(AtomicBool::new(false)),
-                wait_for_cancel: false,
-            }),
-        );
+        let done = reg
+            .submit(
+                TaskOwner::Local,
+                TaskBrief::new("quick"),
+                Arc::new(MockExecutor {
+                    result: "blob://r".to_string(),
+                    saw_cancel: Arc::new(AtomicBool::new(false)),
+                    wait_for_cancel: false,
+                }),
+            )
+            .expect("submit");
         wait_terminal(&reg, &done).await;
         // Within the TTL the record survives housekeeping.
         assert_eq!(reg.evict_terminal(TERMINAL_RECORD_TTL_SECS, now_secs()), 0);
-        assert!(reg.status(&done).is_some());
+        assert!(reg.status(TaskOwner::Local, &done).is_some());
 
-        let live = reg.submit(
-            TaskBrief::new("still running"),
-            Arc::new(MockExecutor {
-                result: String::new(),
-                saw_cancel: Arc::new(AtomicBool::new(false)),
-                wait_for_cancel: true,
-            }),
-        );
+        let live = reg
+            .submit(
+                TaskOwner::Local,
+                TaskBrief::new("still running"),
+                Arc::new(MockExecutor {
+                    result: String::new(),
+                    saw_cancel: Arc::new(AtomicBool::new(false)),
+                    wait_for_cancel: true,
+                }),
+            )
+            .expect("submit");
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         // Past the TTL the terminal record evicts; the in-flight one never.
         let future = now_secs() + TERMINAL_RECORD_TTL_SECS + 10;
         assert_eq!(reg.evict_terminal(TERMINAL_RECORD_TTL_SECS, future), 1);
-        assert!(reg.status(&done).is_none());
-        assert!(reg.status(&live).is_some());
-        reg.cancel(&live);
+        assert!(reg.status(TaskOwner::Local, &done).is_none());
+        assert!(reg.status(TaskOwner::Local, &live).is_some());
+        reg.cancel(TaskOwner::Local, &live);
     }
 
     /// An executor that panics mid-run.
@@ -715,7 +856,13 @@ mod tests {
         // An executor panic must not strand the task in `Running` — the guard
         // records `Failed` so pollers terminate and the entry can be forgotten.
         let reg = TaskRegistry::new();
-        let id = reg.submit(TaskBrief::new("kaboom"), Arc::new(PanickingExecutor));
+        let id = reg
+            .submit(
+                TaskOwner::Local,
+                TaskBrief::new("kaboom"),
+                Arc::new(PanickingExecutor),
+            )
+            .expect("submit");
         let state = wait_terminal(&reg, &id).await;
         assert_eq!(
             state,
@@ -724,15 +871,85 @@ mod tests {
             }
         );
         // Terminal: cancel is a no-op, the record can be forgotten.
-        assert!(!reg.cancel(&id));
-        assert!(reg.forget(&id));
+        assert!(!reg.cancel(TaskOwner::Local, &id));
+        assert!(reg.forget(TaskOwner::Local, &id));
     }
 
     #[tokio::test]
     async fn cancel_of_unknown_task_is_false() {
         let reg = TaskRegistry::new();
-        assert!(!reg.cancel("nope"));
-        assert!(reg.status("nope").is_none());
+        assert!(!reg.cancel(TaskOwner::Local, "nope"));
+        assert!(reg.status(TaskOwner::Local, "nope").is_none());
+    }
+
+    /// `list` was the one accessor left owner-blind after tasks became
+    /// owner-keyed: it flattened every submitter's records into an
+    /// undifferentiated `Vec<TaskRecord>`.
+    ///
+    /// Not a disclosure — nothing serves it remotely — but it made the
+    /// local operator view useless for the question the ownership work
+    /// exists to answer, and it silently merged two submitters' tasks
+    /// that happen to share an id, which is the collision
+    /// `(owner, task_id)` keying was introduced to prevent.
+    #[tokio::test]
+    async fn list_attributes_tasks_and_list_for_scopes_them() {
+        let reg = TaskRegistry::new();
+        let alice = TaskOwner::Peer(0xA11CE);
+        let bob = TaskOwner::Peer(0xB0B);
+        let exec = || {
+            Arc::new(MockExecutor {
+                result: "blob://r".to_string(),
+                saw_cancel: Arc::new(AtomicBool::new(false)),
+                wait_for_cancel: true,
+            })
+        };
+
+        // The same client-chosen id from two submitters — "task-1" is
+        // not a far-fetched collision — plus a second task for Alice.
+        let mut shared = TaskBrief::new("alice's work");
+        shared.task_id = "task-1".to_string();
+        reg.submit(alice, shared, exec()).expect("alice submit");
+
+        let mut collide = TaskBrief::new("bob's work");
+        collide.task_id = "task-1".to_string();
+        reg.submit(bob, collide, exec()).expect("bob submit");
+
+        let mut second = TaskBrief::new("alice's other work");
+        second.task_id = "task-2".to_string();
+        reg.submit(alice, second, exec()).expect("alice submit 2");
+
+        let all = reg.list();
+        assert_eq!(all.len(), 3, "all three tasks are recorded");
+
+        // Both `task-1`s survive, and each is attributable.
+        let task_1_owners: Vec<TaskOwner> = all
+            .iter()
+            .filter(|(_, r)| r.brief.task_id == "task-1")
+            .map(|(o, _)| *o)
+            .collect();
+        assert_eq!(task_1_owners.len(), 2, "one submitter's task-1 was lost");
+        assert!(task_1_owners.contains(&alice) && task_1_owners.contains(&bob));
+
+        // The brief that comes back with each owner is that owner's.
+        let alices_first = all
+            .iter()
+            .find(|(o, r)| *o == alice && r.brief.task_id == "task-1")
+            .expect("alice's task-1");
+        assert_eq!(alices_first.1.brief.prompt, "alice's work");
+
+        // `list_for` is the scoped view.
+        let hers = reg.list_for(alice);
+        assert_eq!(hers.len(), 2, "alice has two tasks");
+        assert!(
+            hers.iter().all(|r| r.brief.prompt.starts_with("alice's")),
+            "list_for leaked another submitter's task: {hers:?}"
+        );
+        assert_eq!(reg.list_for(bob).len(), 1);
+        assert!(reg.list_for(TaskOwner::Local).is_empty());
+
+        for (owner, rec) in all {
+            reg.cancel(owner, &rec.brief.task_id);
+        }
     }
 
     #[tokio::test]

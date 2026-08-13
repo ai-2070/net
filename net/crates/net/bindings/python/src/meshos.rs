@@ -26,11 +26,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::runtime_guard::GuardedRuntime;
 use bytes::Bytes;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyTuple};
-use tokio::runtime::Runtime;
 
 use net::adapter::net::behavior::capability::{CapabilityFilter, CapabilitySet};
 use net::adapter::net::behavior::meshos::logs::LogLevel as CoreLogLevel;
@@ -690,7 +690,7 @@ pub struct PyMeshOsDaemonHandle {
     /// by value — after a successful shutdown the pyclass holds
     /// `None` and every subsequent method raises `already_shutdown`.
     inner: Option<CoreHandle>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
     /// Cached identity so `daemon_id`/`daemon_name` work after
     /// shutdown (when `inner` is `None`).
     daemon_id: u64,
@@ -925,7 +925,7 @@ pub struct PyMeshOsDaemonSdk {
     /// After a successful shutdown the pyclass holds `None` and
     /// every subsequent method raises `already_shutdown`.
     inner: Option<CoreSdk>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
 }
 
 impl PyMeshOsDaemonSdk {
@@ -949,7 +949,7 @@ impl PyMeshOsDaemonSdk {
     /// supervisor runs on. Returns `None` when the SDK has been
     /// consumed by `shutdown()`.
     #[cfg(feature = "deck")]
-    pub(crate) fn runtime_clone(&self) -> Option<Arc<Runtime>> {
+    pub(crate) fn runtime_clone(&self) -> Option<Arc<GuardedRuntime>> {
         if self.inner.is_some() {
             Some(self.runtime.clone())
         } else {
@@ -984,7 +984,7 @@ impl PyMeshOsDaemonSdk {
         control_capacity: Option<usize>,
     ) -> PyResult<Self> {
         let cfg = meshos_config_from_dict(py, config)?;
-        let runtime = Arc::new(
+        let runtime = Arc::new(GuardedRuntime::new(
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
@@ -995,7 +995,7 @@ impl PyMeshOsDaemonSdk {
                         &format!("failed to build tokio runtime: {e}"),
                     )
                 })?,
-        );
+        ));
         let dispatcher = Arc::new(LoggingDispatcher::new());
         // `MeshOsDaemonSdk::start` registers a tokio task on the
         // current runtime context — enter the runtime before calling

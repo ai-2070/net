@@ -76,13 +76,25 @@ pub struct OverflowPush {
     /// Wire size of the chunk in bytes. Drives the receive-
     /// side disk-gate.
     pub size_bytes: u64,
-    /// Sender's canonical `node_id`. The receiver synthesizes
-    /// the sender's `CapabilitySet` from its local capability
-    /// fold keyed on this id; the admission check reads
-    /// `overflow_enabled` + scope tags from the synthesized
-    /// snapshot, not from the request body. Defends against a
-    /// sender forging its caps via the request — the only
-    /// authority is the verified fold state.
+    /// Sender's canonical `node_id`.
+    ///
+    /// **Not the authority.** The receiver keys its capability
+    /// lookup on the AEAD-authenticated session peer
+    /// ([`RpcContext::session_peer`](crate::adapter::net::cortex::RpcContext::session_peer)),
+    /// and refuses the push if this field disagrees with it.
+    ///
+    /// It used to be the authority, and that was AUTH-03: reading
+    /// caps from the fold rather than from the request body stops a
+    /// sender forging its *capabilities*, but it does nothing about a
+    /// sender forging *who it is*. Peer A could name peer B here and
+    /// inherit B's overflow opt-in, scope tags and audit attribution.
+    /// The old comment on this field claimed "the only authority is
+    /// the verified fold state", which was true and beside the point:
+    /// the fold entry it looked up was chosen by the attacker.
+    ///
+    /// Retained on the wire so a mismatch is a diagnosable rejection
+    /// rather than a silent behaviour change, and because dropping a
+    /// field is a wire break.
     pub sender_node_id: u64,
 }
 
@@ -339,20 +351,45 @@ impl OverflowPushHandler {
     /// state on each call, so an operator toggling
     /// `overflow_enabled` on the local node is observed by
     /// the next inbound push.
-    pub async fn handle(&self, request: OverflowPush) -> OverflowPushAck {
+    pub async fn handle(&self, request: OverflowPush, session_peer: u64) -> OverflowPushAck {
         use super::adapter::BlobAdapter;
         use super::admission::{should_accept_overflow_from, OverflowVerdict};
         use super::blob_ref::BlobRef;
 
-        // Synthesize sender caps from the capability fold.
-        // Absent → use the empty default (which has
-        // `overflow_enabled = false`); the admission gate
-        // will then return `SenderNotOverflowing`.
+        // AUTH-03. The capability lookup keys on the AEAD-authenticated
+        // session peer, never on `request.sender_node_id`.
+        //
+        // Reading caps from the fold instead of from the request body
+        // already stopped a sender forging its *capabilities* — but the
+        // fold entry being read was still chosen by the sender, so peer
+        // A could name peer B and inherit B's overflow opt-in, scope
+        // tags and attribution. Keying on the authenticated peer closes
+        // that without needing a new reject reason: an unauthorized A
+        // now fails gate (3) on its own caps and gets
+        // `SenderNotOverflowing`, which is exactly what happened —
+        // *this* sender has not opted into overflow.
+        //
+        // Absent from the fold → the empty default (which has
+        // `overflow_enabled = false`), so the same gate rejects.
         let sender_caps =
             super::super::super::behavior::fold::capability_bridge::synthesize_capability_set(
                 self.mesh.capability_fold(),
-                request.sender_node_id,
+                session_peer,
             );
+
+        // A disagreement is not itself fatal — the decision above
+        // already ignores the claim, and a peer allowed to push is
+        // allowed to push whatever it mislabels itself as. But it has
+        // no legitimate cause, so say so once rather than silently
+        // normalizing it.
+        if request.sender_node_id != session_peer {
+            tracing::warn!(
+                session_peer = format!("{:#x}", session_peer),
+                claimed_sender = format!("{:#x}", request.sender_node_id),
+                "overflow push: sender_node_id disagrees with the authenticated \
+                 session peer; admitting on the authenticated peer's capabilities",
+            );
+        }
 
         // Snapshot local caps fresh per request so a
         // concurrent `set_overflow_enabled(false)` is
@@ -391,7 +428,10 @@ impl OverflowPushHandler {
                         tracing::warn!(
                             error = %e,
                             hash = %hex,
-                            sender = request.sender_node_id,
+                            // Authenticated sender, not the claimed one:
+                            // an operator reading this needs to know who
+                            // actually sent it.
+                            sender = session_peer,
                             "overflow push: prefetch failed after admit",
                         );
                         OverflowPushAck::OpenChunkFailed
@@ -422,7 +462,7 @@ impl crate::adapter::net::cortex::RpcHandler for OverflowPushHandler {
         let request: OverflowPush = postcard::from_bytes(&ctx.payload.body)
             .map_err(|e| RpcHandlerError::Internal(format!("overflow push: decode failed: {e}")))?;
 
-        let ack = self.handle(request).await;
+        let ack = self.handle(request, ctx.session_peer).await;
 
         // Encode the ack into the response body. Encoding
         // failure is an internal bug (postcard for our typed
@@ -1783,6 +1823,123 @@ mod tests {
     // decode are total inverses for every typed variant so a sender +
     // receiver on different builds can't observe wire-format divergence.
     // ========================================================================
+
+    // ========================================================================
+    // AUTH-03 — admission keys on the authenticated peer
+    // ========================================================================
+
+    /// RED witness for AUTH-03. Peer B is overflow-enabled; peer A is
+    /// not. A sends an `OverflowPush` naming B as `sender_node_id`.
+    ///
+    /// Pre-fix the receiver synthesized *B's* capabilities from the
+    /// fold — because the request body chose which fold entry to read
+    /// — so A inherited B's opt-in and scope tags and the push was
+    /// admitted and attributed to B. Post-fix the lookup keys on the
+    /// AEAD-authenticated session peer, so A is judged as A.
+    #[cfg(feature = "cortex")]
+    #[tokio::test]
+    async fn overflow_admission_keys_on_the_authenticated_peer_not_the_claim() {
+        use crate::adapter::net::behavior::fold::capability_bridge;
+        use crate::adapter::net::identity::EntityKeypair;
+        use crate::adapter::net::Redex;
+        use crate::adapter::net::{MeshNode, MeshNodeConfig};
+
+        let honest: u64 = 0x0B0B;
+        let attacker: u64 = 0xBAD5;
+
+        let node = Arc::new(
+            MeshNode::new(
+                EntityKeypair::generate(),
+                MeshNodeConfig::new("127.0.0.1:0".parse().unwrap(), [0x17u8; 32]),
+            )
+            .await
+            .expect("node"),
+        );
+        // Local node participates and has headroom, so a rejection
+        // below is about the *sender*, not about us.
+        node.announce_capabilities(overflow_peer_caps(500))
+            .await
+            .expect("announce local caps");
+
+        // Only the honest peer is overflow-enabled in the fold. The
+        // attacker is absent entirely — the shape a peer that never
+        // opted in actually has.
+        capability_bridge::apply_legacy_announcement(
+            node.capability_fold(),
+            CapabilityAnnouncement::new(
+                honest,
+                EntityId::from_bytes([0x11u8; 32]),
+                1,
+                overflow_peer_caps(500),
+            ),
+            None,
+            0,
+        )
+        .expect("seed fold");
+
+        let adapter = Arc::new(super::super::mesh::MeshBlobAdapter::new(
+            "auth03",
+            Arc::new(Redex::new()),
+        ));
+        let handler = OverflowPushHandler::new(node.clone(), adapter);
+
+        let (hash, _hex) = hex64(0xAA);
+        let impersonating = OverflowPush {
+            blob_hash: hash,
+            size_bytes: 1024,
+            // The lie: A claims to be B.
+            sender_node_id: honest,
+        };
+
+        let ack = handler.handle(impersonating, attacker).await;
+        assert_eq!(
+            ack,
+            OverflowPushAck::Rejected(OverflowReject::SenderNotOverflowing),
+            "an unenrolled peer inherited an overflow-enabled peer's admission \
+             by naming it in sender_node_id — this is AUTH-03",
+        );
+
+        // Positive control: the honest peer, pushing as itself, is
+        // still admitted. A gate that rejected everyone would satisfy
+        // the assertion above while breaking overflow entirely.
+        let legitimate = OverflowPush {
+            blob_hash: hash,
+            size_bytes: 1024,
+            sender_node_id: honest,
+        };
+        let ack = handler.handle(legitimate, honest).await;
+        assert!(
+            !matches!(
+                ack,
+                OverflowPushAck::Rejected(OverflowReject::SenderNotOverflowing)
+            ),
+            "the enrolled peer was refused on its own identity: {ack:?}",
+        );
+    }
+
+    /// The size half of AUTH-03 was already closed before the audit
+    /// ran, in `should_accept_overflow_from`: `size_bytes` is
+    /// sender-controlled, so the disk gate floors its estimate at one
+    /// chunk. A sender claiming `size_bytes = 1` is still required to
+    /// have a whole chunk of headroom, and a chunk is the most it can
+    /// ship. This pins that floor so a later "optimization" that takes
+    /// the sender's number at face value has to argue with a test.
+    #[test]
+    fn disk_gate_ignores_an_understated_size() {
+        use super::super::admission::{should_accept_overflow_from, OverflowVerdict};
+
+        // Headroom of 0 GiB: honest sizes and understated ones alike
+        // must fail, because the floor is a whole chunk.
+        let local = overflow_peer_caps(0);
+        let sender = overflow_peer_caps(100);
+        for claimed in [0, 1, 1024, super::super::blob_ref::BLOB_CHUNK_SIZE_BYTES] {
+            assert_eq!(
+                should_accept_overflow_from(&local, &sender, claimed),
+                OverflowVerdict::Reject(OverflowReject::InsufficientDisk),
+                "claiming size_bytes={claimed} slipped past a disk gate with no headroom",
+            );
+        }
+    }
 
     #[test]
     fn overflow_push_request_round_trips_postcard() {

@@ -277,9 +277,32 @@ typedef int (*RpcHandlerFn)(
     size_t* out_resp_len,
     char** out_err);
 
+/* Register the deallocator for buffers the handler callbacks
+ * allocate. MUST be called before any dispatcher registration.
+ *
+ * A handler returns its response (and error string) in memory it
+ * allocated. This library copies the bytes out and then has to release
+ * them — and on Windows it cannot, because each module carries its own
+ * CRT heap and freeing across that boundary corrupts it. Confirmed
+ * under Application Verifier: StopCode 0x6, "using wrong heap", on a
+ * block that was exactly a handler response.
+ *
+ * So the allocator supplies the release. Pass a function that frees
+ * with the same allocator your handlers use.
+ *
+ * Idempotent first-call-wins. Returns 0 on success, -1 for NULL. */
+typedef void (*RpcCallbackFreeFn)(void* ptr);
+
+int net_rpc_set_callback_free(RpcCallbackFreeFn free_fn);
+
 /* Idempotent first-call-wins. The Go binding calls this once in
- * its package init; non-Go consumers do the same at startup. */
-void net_rpc_set_handler_dispatcher(RpcHandlerFn dispatcher);
+ * its package init; non-Go consumers do the same at startup.
+ *
+ * Returns 0 on success. On Windows, returns -1 if
+ * net_rpc_set_callback_free has not been called — see above; without
+ * it this library cannot release a handler's response buffer safely,
+ * and refusing here beats corrupting a heap at the first call. */
+int net_rpc_set_handler_dispatcher(RpcHandlerFn dispatcher);
 
 /* Reserve the next monotonic handler id without registering
  * anything. The consumer stores its callback in its registry
@@ -479,8 +502,9 @@ typedef int (*net_rpc_streaming_handler_fn)(
     char** out_err);
 
 /* Register the process-wide streaming handler dispatcher.
- * Idempotent — first call wins. */
-void net_rpc_set_streaming_handler_dispatcher(
+ * Idempotent — first call wins. Returns 0, or -1 on Windows if
+ * net_rpc_set_callback_free has not been called. */
+int net_rpc_set_streaming_handler_dispatcher(
     net_rpc_streaming_handler_fn dispatcher);
 
 /* Register a server-streaming handler for `service`. Same
@@ -889,9 +913,11 @@ typedef int (*RpcDuplexHandlerFn)(
     RpcResponseSinkHandleC* response_sink,
     char** out_err);
 
-void net_rpc_set_client_streaming_handler_dispatcher(
+/* Both idempotent, first call wins. Return 0, or -1 on Windows if
+ * net_rpc_set_callback_free has not been called. */
+int net_rpc_set_client_streaming_handler_dispatcher(
     RpcClientStreamingHandlerFn dispatcher);
-void net_rpc_set_duplex_handler_dispatcher(RpcDuplexHandlerFn dispatcher);
+int net_rpc_set_duplex_handler_dispatcher(RpcDuplexHandlerFn dispatcher);
 
 /* Pull the next request chunk inside a Go dispatcher callback.
  * Blocks the calling thread. Returns NET_RPC_OK with the chunk,

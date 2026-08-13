@@ -11,7 +11,6 @@ opportunistically.
 
 from __future__ import annotations
 
-import itertools
 import threading
 import time
 
@@ -21,26 +20,30 @@ import pytest
 # value the per-file helpers used.
 PSK = "42" * 32
 
-# Per-test unique ports so repeated runs don't collide on localhost.
-# Starting offset is deliberately above the per-file counters used
-# in test_compute.py (29_400) and test_async_interop.py (29_700) so
-# tests running side-by-side never pick the same port.
-_port_counter = itertools.count(30_000)
-
-
 @pytest.fixture
 def next_port() -> "function":  # type: ignore[name-defined]
-    """Yields a fresh ``127.0.0.1:N`` address per call.
+    """Yields a bind address the OS picks a port for.
 
     Use as::
 
         def test_thing(next_port):
             addr = next_port()
             ...
+
+    Port ``0`` asks the kernel for a free ephemeral port. This used to
+    hand out fixed numbers from ``itertools.count(30_000)``, with the
+    offset chosen to sit above the per-file counters in
+    ``test_compute.py`` and ``test_async_interop.py`` — which kept the
+    suite from colliding with *itself*, and did nothing about anything
+    else on the machine. CI hit exactly that: ``EADDRINUSE`` on a port
+    no test in this repository claims.
+
+    A caller that has to dial the resulting node reads ``local_addr``
+    back after construction; ``0`` is not a connect target.
     """
 
     def _allocator() -> str:
-        return f"127.0.0.1:{next(_port_counter)}"
+        return "127.0.0.1:0"
 
     return _allocator
 
@@ -101,7 +104,9 @@ def mesh_pair(next_port):
     t.start()
     # Small beat so the accept-side is primed before connect fires.
     time.sleep(0.05)
-    a.connect(b_addr, b.public_key, b.node_id)
+    # `b_addr` is `127.0.0.1:0`; the port the kernel actually chose is
+    # only knowable after construction.
+    a.connect(b.local_addr, b.public_key, b.node_id)
     t.join(timeout=5)
     if t.is_alive():
         raise RuntimeError(

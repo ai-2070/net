@@ -1482,6 +1482,16 @@ pub struct TraceContext {
 /// to authorize a caller must either run behind the PROTECTED-service
 /// admission gate (and read [`RpcContext::org_admission`]) or carry
 /// their own application-level signature.
+///
+/// # Construction
+///
+/// `#[non_exhaustive]`: handlers *receive* this type, they do not build
+/// it, and the 0.35 addition of [`session_peer`](Self::session_peer)
+/// showed what the alternative costs — a new field is a compile break
+/// for every downstream literal. Nothing outside this crate constructs
+/// one today, so the attribute takes nothing away and means the next
+/// field this gains is additive.
+#[non_exhaustive]
 pub struct RpcContext {
     /// Caller's `origin_hash`, copied verbatim from the inbound
     /// packet header ([`RpcInboundEvent::origin_hash`]).
@@ -1506,6 +1516,29 @@ pub struct RpcContext {
     /// an application-level signature over a transcript that binds
     /// the destination and carries its own freshness.
     pub caller_origin: u64,
+    /// The AEAD-authenticated session peer that delivered this
+    /// request — `RpcInboundEvent::from_node`.
+    ///
+    /// **This is the only authenticated subject a public handler
+    /// gets.** Unlike [`caller_origin`](Self::caller_origin), a peer
+    /// cannot choose what this says: the packet decrypted under that
+    /// session's keys, so it is the node that actually sent it.
+    ///
+    /// What it does **not** prove: that this node *originated* the
+    /// request. It is the last hop. If a deployment relays nRPC
+    /// through an intermediary, requests arrive bearing the relay's
+    /// node id, so an allowlist built on this field authorizes the
+    /// relay and everything the relay chooses to forward. Handlers
+    /// that need end-to-end provenance want a PROTECTED service and
+    /// [`org_admission`](Self::org_admission), or an application-level
+    /// signature over a transcript that binds the destination.
+    ///
+    /// Within those limits it is the same basis the RPC layer already
+    /// uses for its own security decisions: response routing and the
+    /// in-flight cancellation map are both keyed on `from_node`
+    /// precisely so a peer that copies another's `caller_origin`
+    /// cannot steer or cancel the victim's call.
+    pub session_peer: u64,
     /// Caller-generated correlation id. Same value on the matching
     /// CANCEL or RESPONSE.
     pub call_id: u64,
@@ -1906,6 +1939,7 @@ impl RpcServerFold {
                     let handler_started = std::time::Instant::now();
                     let ctx = RpcContext {
                         caller_origin,
+                        session_peer: from_node,
                         call_id,
                         payload,
                         cancellation,
@@ -2609,6 +2643,7 @@ impl RpcServerStreamingFold {
                     let handler_started = std::time::Instant::now();
                     let ctx = RpcContext {
                         caller_origin,
+                        session_peer: from_node,
                         call_id,
                         payload,
                         cancellation,

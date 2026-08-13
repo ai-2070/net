@@ -51,6 +51,10 @@ fn registry_err(e: RegistryClientError) -> Error {
             RegistryRpcError::ScaleNotSupported => {
                 agg_err("scale-not-supported", "daemon doesn't accept dynamic scale")
             }
+            RegistryRpcError::Unauthorized => agg_err(
+                "unauthorized",
+                "caller is not an operator of the target daemon's registry",
+            ),
         },
     }
 }
@@ -94,10 +98,11 @@ impl From<&RegistryReplicaSummary> for RegistryReplicaRowJs {
 #[napi(object)]
 pub struct RegistryGroupSummaryJs {
     pub name: String,
-    /// 64-char lowercase hex rendering of the 32-byte group
-    /// seed. JS BigInt is awkward at 32 bytes; hex matches what
-    /// every other binding emits.
-    pub group_seed_hex: String,
+    /// 16-char lowercase hex correlation handle for the group's
+    /// seed. **Not the seed** — that derives every replica keypair
+    /// and does not belong in status output. Hex matches what every
+    /// other binding emits.
+    pub group_seed_fingerprint_hex: String,
     pub replicas: Vec<RegistryReplicaRowJs>,
 }
 
@@ -105,7 +110,7 @@ impl From<&RegistryGroupSummary> for RegistryGroupSummaryJs {
     fn from(g: &RegistryGroupSummary) -> Self {
         Self {
             name: g.name.clone(),
-            group_seed_hex: hex::encode(g.group_seed),
+            group_seed_fingerprint_hex: g.group_seed_fingerprint.to_hex(),
             replicas: g.replicas.iter().map(Into::into).collect(),
         }
     }

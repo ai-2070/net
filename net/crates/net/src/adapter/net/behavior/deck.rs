@@ -393,8 +393,12 @@ pub struct AggregatorReplicaRow {
 pub struct AggregatorRegistryGroupSnapshot {
     /// Operator-chosen group name.
     pub name: String,
-    /// 32-byte group seed for deterministic identity.
-    pub group_seed: [u8; 32],
+    /// Correlation handle for the group's seed. **Not the seed** —
+    /// see [`RegistryGroupSummary::group_seed_fingerprint`](crate::adapter::net::behavior::aggregator::RegistryGroupSummary).
+    /// A local operator surface is still a status API, and status
+    /// output should not carry private key material even where the
+    /// reader is trusted.
+    pub group_seed_fingerprint: crate::adapter::net::behavior::aggregator::SeedFingerprint,
     /// Per-replica rows in declaration order.
     pub replicas: Vec<AggregatorReplicaRow>,
 }
@@ -962,7 +966,10 @@ impl DeckClient {
                 .collect();
             groups.push(AggregatorRegistryGroupSnapshot {
                 name: entry.name.clone(),
-                group_seed: entry.group_seed,
+                group_seed_fingerprint:
+                    crate::adapter::net::behavior::aggregator::SeedFingerprint::of(
+                        &entry.group_seed,
+                    ),
                 replicas: rows,
             });
         }

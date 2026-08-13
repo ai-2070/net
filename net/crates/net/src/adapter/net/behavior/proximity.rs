@@ -256,6 +256,17 @@ pub enum PingwaveAdmission {
     /// A new, non-expired pingwave: update local state, install/refresh
     /// the route, AND re-broadcast the returned (hop-advanced) pingwave.
     AcceptedAndForward(EnhancedPingwave),
+    /// The graph is at a configured cap (`max_nodes` /
+    /// `max_seen_pingwaves`), so this novel pingwave was refused
+    /// before it could grow attacker-influenced state. No route may be
+    /// installed and nothing is re-broadcast.
+    ///
+    /// Distinct from [`RejectedDuplicate`](Self::RejectedDuplicate) so
+    /// the two are distinguishable in metrics: duplicates are normal
+    /// mesh chatter, whereas a sustained stream of these means the
+    /// graph is saturated — either the mesh outgrew its configured
+    /// caps, or something is flooding it.
+    RejectedCapacity,
 }
 
 /// Proximity node info combining discovery and capability data
@@ -445,8 +456,34 @@ pub struct ProximityConfig {
     pub pingwave_interval: Duration,
     /// Whether to prefer low latency over hop count
     pub prefer_low_latency: bool,
-    /// Maximum nodes to track
+    /// Maximum nodes to track.
+    ///
+    /// A soft cap, enforced in [`ProximityGraph::admit_pingwave_from`]:
+    /// at or above it, a *novel* `origin_id` is not inserted, while
+    /// known nodes keep updating. Periodic
+    /// [`cleanup`](ProximityGraph::cleanup) reclaims slots as entries
+    /// idle out.
     pub max_nodes: usize,
+    /// Maximum `(origin_id, seq)` dedup entries to retain.
+    ///
+    /// Sized as 4× `max_nodes` by default, matching the ratio
+    /// [`MAX_SEEN_PINGWAVES`](crate::adapter::net::swarm::MAX_SEEN_PINGWAVES)
+    /// uses, so a multi-second pingwave burst per node fits before the
+    /// cap bites.
+    ///
+    /// A quarter of it is reserved for origins the graph already knows,
+    /// so a flood of novel origins cannot suppress the pingwaves of the
+    /// topology it is competing with — see
+    /// `ProximityGraph::unreserved_dedup_capacity`.
+    pub max_seen_pingwaves: usize,
+    /// Maximum directed edges to retain.
+    ///
+    /// Edges are the third attacker-influenced map: each accepted
+    /// pingwave from peer Z carrying origin Y inserts `(Z, Y)`, so a
+    /// flood of distinct origins grows this alongside `nodes`. Capped
+    /// at 4× `max_nodes` because a node legitimately has several
+    /// in-edges.
+    pub max_edges: usize,
     /// Whether to auto-update capability index
     pub auto_index_update: bool,
 }
@@ -460,6 +497,8 @@ impl Default for ProximityConfig {
             pingwave_interval: Duration::from_secs(5),
             prefer_low_latency: true,
             max_nodes: 10000,
+            max_seen_pingwaves: 40_000,
+            max_edges: 40_000,
             auto_index_update: true,
         }
     }
@@ -640,8 +679,39 @@ impl ProximityGraph {
     ) -> Option<EnhancedPingwave> {
         match self.admit_pingwave_from(pw, from_node, from_addr) {
             PingwaveAdmission::AcceptedAndForward(fwd) => Some(fwd),
-            PingwaveAdmission::RejectedDuplicate | PingwaveAdmission::AcceptedNoForward => None,
+            PingwaveAdmission::RejectedDuplicate
+            | PingwaveAdmission::RejectedCapacity
+            | PingwaveAdmission::AcceptedNoForward => None,
         }
+    }
+
+    /// How much of the dedup cache a *novel* origin may fill.
+    ///
+    /// The remainder — a quarter of
+    /// [`max_seen_pingwaves`](ProximityConfig::max_seen_pingwaves) — is
+    /// headroom that only origins already in the graph can reach.
+    ///
+    /// A dedup entry is a `(origin_id, seq)` pair, and a known peer's
+    /// next pingwave always carries a fresh `seq`, so without this a
+    /// flood of novel origins could fill the cache and every legitimate
+    /// pingwave would then be refused until the next
+    /// [`cleanup`](Self::cleanup) — with `dedup_timeout` at 10 s and the
+    /// sweep on a 60 s cadence, roughly a minute of suppressed
+    /// discovery, refillable at will for the cost of a few MB of UDP.
+    /// The known peers would then idle past `node_timeout` and be
+    /// evicted, so the flood would not merely fail to add topology: it
+    /// would destroy the topology already there.
+    ///
+    /// Reserving is enough because the reserve only has to absorb what
+    /// known peers produce between sweeps. It is not a second ceiling:
+    /// `max_seen_pingwaves` still binds every origin, known or not, so
+    /// the memory bound this cap exists for is unchanged.
+    fn unreserved_dedup_capacity(&self) -> usize {
+        let max = self.config.max_seen_pingwaves;
+        // `max - max/4`, never below 1 for a nonzero cap: a
+        // pathologically small configuration should still admit
+        // something rather than reserving the entire cache.
+        max.saturating_sub(max / 4).max(usize::from(max > 0))
     }
 
     /// Admit an inbound pingwave: dedup, then (only for a NEW pingwave)
@@ -677,10 +747,59 @@ impl ProximityGraph {
             self.stats.pingwaves_dropped.fetch_add(1, Ordering::Relaxed);
             return PingwaveAdmission::RejectedDuplicate;
         }
+
+        // SEC-02. `origin_id` and `seq` are attacker-chosen: the frame
+        // is a fixed 72-byte unsigned format admitted on nothing more
+        // than a registered source address, and `origin_id` is 256-bit,
+        // so accidental dedup collisions are negligible. Every novel
+        // tuple used to grow `seen_pingwaves`, `nodes` and `edges` for
+        // the process lifetime, and the only thing that reclaimed the
+        // first two — `cleanup()` — had no production caller at all.
+        // A peer could grow them at line rate until the node died of
+        // memory exhaustion.
+        //
+        // Same soft-cap policy the older `LocalGraph` already carries
+        // for this exact threat (see `MAX_GRAPH_NODES` /
+        // `MAX_SEEN_PINGWAVES` in `swarm.rs`): at the cap, novel keys
+        // are refused while known ones keep updating, so a flood
+        // cannot evict the legitimate topology it is competing with —
+        // it can only fail to add to it. Periodic cleanup reclaims
+        // slots as entries idle out.
+        //
+        // Refuse the whole pingwave rather than admitting it
+        // untracked: without a dedup entry we would re-admit and
+        // re-forward every copy of it, turning a memory cap into a
+        // rebroadcast amplifier.
+        //
+        // The cap is applied the same way the node cap below is: to
+        // origins the graph does not already know. A flat check here
+        // would have read on *every* pingwave, and a known peer's next
+        // one always carries a fresh `seq` — so a saturated cache would
+        // refuse the legitimate topology along with the flood, which is
+        // the opposite of the policy stated above. `reserved_dedup_slots`
+        // is the headroom that keeps that from happening; the absolute
+        // ceiling still binds everyone, so the memory bound is unchanged.
+        let seen = self.num_seen.load(Ordering::Relaxed);
+        let known_origin = self.nodes.contains_key(&pw.origin_id);
+        if seen >= self.config.max_seen_pingwaves
+            || (!known_origin && seen >= self.unreserved_dedup_capacity())
+        {
+            self.stats.pingwaves_dropped.fetch_add(1, Ordering::Relaxed);
+            return PingwaveAdmission::RejectedCapacity;
+        }
+
         // Key the dedup-count bump on the insert result (None == new key) so
         // it stays exact even under a concurrent insert of the same key.
         if self.seen_pingwaves.insert(key, Instant::now()).is_none() {
             self.num_seen.fetch_add(1, Ordering::Relaxed);
+        }
+
+        // Node cap. Checked after the dedup insert so a refused novel
+        // origin is still deduplicated — otherwise every retransmission
+        // of it would take the full admission path again.
+        if !known_origin && self.num_nodes.load(Ordering::Relaxed) >= self.config.max_nodes {
+            self.stats.pingwaves_dropped.fetch_add(1, Ordering::Relaxed);
+            return PingwaveAdmission::RejectedCapacity;
         }
 
         // Update or create node
@@ -787,6 +906,18 @@ impl ProximityGraph {
     /// the self → peer edge added at session setup); leave the
     /// existing latency alone in that case.
     fn insert_or_update_edge(&self, from: NodeId, to: NodeId, sample_us: u64) {
+        // SEC-02 soft cap. Novel edges are refused at the cap; existing
+        // ones keep taking latency samples, so a flood degrades
+        // discovery of new topology without disturbing what is already
+        // known. `sweep_stale_edges` (driven from the heartbeat tick)
+        // reclaims slots — unlike `nodes` and `seen_pingwaves`, edges
+        // always had a production sweep; what they lacked was a bound
+        // on growth between sweeps.
+        if !self.edges.contains_key(&(from, to))
+            && self.num_edges.load(Ordering::Relaxed) >= self.config.max_edges
+        {
+            return;
+        }
         let mut edge_inserted = false;
         self.edges
             .entry((from, to))
@@ -1492,6 +1623,266 @@ mod tests {
         node.health = HealthStatus::Degraded;
         let degraded_score = node.routing_score(true);
         assert!(degraded_score > score);
+    }
+
+    /// SEC-02 RED. A single registered sender floods novel
+    /// `(origin_id, seq)` tuples; every configured cap must hold.
+    ///
+    /// Pre-fix `max_nodes` was declared and never read, and neither
+    /// the dedup cache nor the edge map had a bound at all — so this
+    /// loop grew all three without limit, for the process lifetime,
+    /// on unauthenticated UDP admitted from a registered source
+    /// address.
+    #[test]
+    fn pingwave_flood_cannot_grow_the_graph_past_its_caps() {
+        let my_id = make_node_id(1);
+        let config = ProximityConfig {
+            max_nodes: 4,
+            max_seen_pingwaves: 16,
+            max_edges: 8,
+            // Long timeouts: this test is about admission refusing to
+            // grow, not about eviction reclaiming. A short timeout
+            // would let cleanup mask a missing cap.
+            node_timeout: Duration::from_secs(600),
+            dedup_timeout: Duration::from_secs(600),
+            ..Default::default()
+        };
+        let graph = ProximityGraph::new(my_id, config);
+        let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let sender = make_node_id(2);
+
+        // 500 distinct origins, each with a distinct seq — the attack
+        // shape: 256-bit random origins make accidental dedup
+        // negligible, so every frame is novel. `make_node_id` only
+        // varies one byte, so spread across two here to get 500
+        // genuinely distinct ids.
+        let wide_id = |n: u64| {
+            let mut id = [0u8; 32];
+            id[0] = (n & 0xff) as u8;
+            id[1] = ((n >> 8) & 0xff) as u8;
+            id[2] = 0xAA;
+            id
+        };
+        let mut accepted = 0usize;
+        let mut refused = 0usize;
+        for i in 0..500u64 {
+            let pw = EnhancedPingwave::new(wide_id(i), i, 3);
+            match graph.admit_pingwave_from(pw, sender, from) {
+                PingwaveAdmission::RejectedCapacity => refused += 1,
+                _ => accepted += 1,
+            }
+        }
+
+        let stats = graph.stats();
+        assert!(
+            stats.node_count <= 4,
+            "node_count {} exceeded max_nodes 4 — `max_nodes` is declared but not enforced",
+            stats.node_count
+        );
+        assert!(
+            stats.dedup_cache_size <= 16,
+            "seen_pingwaves {} exceeded max_seen_pingwaves 16",
+            stats.dedup_cache_size
+        );
+        assert!(
+            stats.edge_count <= 8,
+            "edges {} exceeded max_edges 8",
+            stats.edge_count
+        );
+        assert!(
+            refused > 0,
+            "a 500-origin flood against caps of 4/16/8 refused nothing"
+        );
+        assert!(
+            accepted > 0,
+            "the caps refused everything, including the frames that fit"
+        );
+    }
+
+    /// The caps must not cost liveness for peers already known: a
+    /// saturated graph still tracks the nodes it holds. A fix that
+    /// froze the graph entirely would satisfy the RED above while
+    /// breaking proximity routing under load.
+    ///
+    /// This one saturates the *node* cap; `max_seen_pingwaves` is left
+    /// deliberately slack so the assertion is about that cap alone. The
+    /// dedup cache has its own version of this property and its own
+    /// test below — it needed one, because the flat check it originally
+    /// carried failed it.
+    #[test]
+    fn a_saturated_graph_still_updates_the_nodes_it_already_knows() {
+        let my_id = make_node_id(1);
+        let config = ProximityConfig {
+            max_nodes: 2,
+            max_seen_pingwaves: 1_000,
+            node_timeout: Duration::from_secs(600),
+            dedup_timeout: Duration::from_secs(600),
+            ..Default::default()
+        };
+        let graph = ProximityGraph::new(my_id, config);
+        let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let sender = make_node_id(2);
+        let known = make_node_id(42);
+
+        // Learn `known`, then saturate with junk.
+        graph.admit_pingwave_from(EnhancedPingwave::new(known, 1, 3), sender, from);
+        for i in 0..100u64 {
+            let mut junk = [0u8; 32];
+            junk[0] = (i & 0xff) as u8;
+            junk[1] = 0xBB;
+            graph.admit_pingwave_from(EnhancedPingwave::new(junk, i, 3), sender, from);
+        }
+        assert!(graph.stats().node_count <= 2);
+
+        // The known peer's next pingwave must still be admitted and
+        // still refresh its entry — it is competing with the flood for
+        // slots it already occupies, and must not lose.
+        let admitted = graph.admit_pingwave_from(EnhancedPingwave::new(known, 2, 3), sender, from);
+        assert!(
+            !matches!(admitted, PingwaveAdmission::RejectedCapacity),
+            "a known peer was refused because attacker traffic filled the graph: {admitted:?}"
+        );
+        assert!(
+            graph.get_node(&known).is_some(),
+            "the known peer was evicted by the flood"
+        );
+    }
+
+    /// The same property for the *dedup* cache, which is where it was
+    /// actually missing.
+    ///
+    /// The `max_seen_pingwaves` check was a flat one taken ahead of
+    /// everything else, so a full cache refused every novel
+    /// `(origin_id, seq)` — and a known peer's next pingwave always
+    /// carries a fresh `seq`. Filling the cache therefore suppressed
+    /// the legitimate topology as well as the flood, until the next
+    /// `cleanup()`. With `dedup_timeout` at 10 s against a 60 s sweep
+    /// cadence that is most of a minute of dead discovery for a few MB
+    /// of UDP, repeatable after every sweep — and long enough for the
+    /// real peers to idle past `node_timeout` and be evicted, so the
+    /// flood destroys topology rather than merely failing to add any.
+    ///
+    /// `max_nodes` is left slack here for the mirror-image reason the
+    /// test above leaves `max_seen_pingwaves` slack.
+    #[test]
+    fn a_saturated_dedup_cache_still_admits_a_known_peers_next_pingwave() {
+        let my_id = make_node_id(1);
+        let config = ProximityConfig {
+            max_nodes: 1_000,
+            max_seen_pingwaves: 64,
+            max_edges: 1_000,
+            // Long timeouts: this is about admission reserving room,
+            // not about eviction reclaiming it. A short dedup_timeout
+            // would let expiry mask a missing reserve.
+            node_timeout: Duration::from_secs(600),
+            dedup_timeout: Duration::from_secs(600),
+            ..Default::default()
+        };
+        let graph = ProximityGraph::new(my_id, config);
+        let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let sender = make_node_id(2);
+        let known = make_node_id(42);
+
+        // The known peer is in the graph first — the shape of a mesh
+        // that was healthy before the flood arrived.
+        graph.admit_pingwave_from(EnhancedPingwave::new(known, 1, 3), sender, from);
+        assert!(graph.get_node(&known).is_some(), "setup: peer not learned");
+
+        // Flood novel origins until the cache stops taking them.
+        for i in 0..500u64 {
+            let mut junk = [0u8; 32];
+            junk[0] = (i & 0xff) as u8;
+            junk[1] = ((i >> 8) & 0xff) as u8;
+            junk[2] = 0xBB;
+            graph.admit_pingwave_from(EnhancedPingwave::new(junk, i, 3), sender, from);
+        }
+        let saturated = graph.stats().dedup_cache_size;
+        assert!(
+            saturated <= 64,
+            "dedup cache {saturated} exceeded max_seen_pingwaves 64"
+        );
+        assert!(
+            saturated >= 16,
+            "the flood barely filled the cache ({saturated}); this test needs a \
+             genuinely saturated one to prove anything"
+        );
+
+        // Every subsequent pingwave from the known peer is novel — a
+        // fresh seq each time — and every one must still be admitted.
+        for seq in 2..12u64 {
+            let admitted =
+                graph.admit_pingwave_from(EnhancedPingwave::new(known, seq, 3), sender, from);
+            assert!(
+                !matches!(admitted, PingwaveAdmission::RejectedCapacity),
+                "a known peer's pingwave (seq {seq}) was refused because a flood of \
+                 novel origins filled the dedup cache: {admitted:?}"
+            );
+        }
+        assert!(
+            graph.get_node(&known).is_some(),
+            "the known peer went missing while the cache was saturated"
+        );
+
+        // The reserve is headroom, not a second ceiling: the absolute
+        // cap still binds, including the peers it is reserved for.
+        assert!(
+            graph.stats().dedup_cache_size <= 64,
+            "the reserve let the dedup cache past max_seen_pingwaves — the memory \
+             bound the cap exists for is gone"
+        );
+
+        // And novel origins are still refused, or the reserve would
+        // just be a bigger cap.
+        let mut fresh = [0u8; 32];
+        fresh[0] = 0xEE;
+        fresh[1] = 0xCC;
+        assert!(
+            matches!(
+                graph.admit_pingwave_from(EnhancedPingwave::new(fresh, 1, 3), sender, from),
+                PingwaveAdmission::RejectedCapacity
+            ),
+            "a novel origin reached the reserved headroom"
+        );
+    }
+
+    /// The reserve's arithmetic, including the degenerate configs a
+    /// `max / 4` split gets wrong if written carelessly.
+    #[test]
+    fn the_dedup_reserve_leaves_room_for_both_sides() {
+        let graph_with = |max_seen: usize| {
+            ProximityGraph::new(
+                make_node_id(1),
+                ProximityConfig {
+                    max_seen_pingwaves: max_seen,
+                    ..Default::default()
+                },
+            )
+        };
+
+        // Ordinary sizing: a quarter held back, three quarters open.
+        assert_eq!(graph_with(40_000).unreserved_dedup_capacity(), 30_000);
+        assert_eq!(graph_with(64).unreserved_dedup_capacity(), 48);
+
+        // A cap of zero admits nothing, and must not underflow.
+        assert_eq!(graph_with(0).unreserved_dedup_capacity(), 0);
+
+        // Tiny caps must still admit a novel origin. `1 - 1/4 == 1`
+        // already, but 2 and 3 are where an unclamped `max * 3 / 4`
+        // would be fine and a `max - max/4` on a rounding-down
+        // division would not — pin the whole small range.
+        for max in 1..=8usize {
+            let unreserved = graph_with(max).unreserved_dedup_capacity();
+            assert!(
+                unreserved >= 1,
+                "max_seen_pingwaves {max} reserved the entire cache, so no novel \
+                 origin is ever admitted"
+            );
+            assert!(
+                unreserved <= max,
+                "max_seen_pingwaves {max} gave novel origins {unreserved} slots, \
+                 more than the cache holds"
+            );
+        }
     }
 
     #[test]

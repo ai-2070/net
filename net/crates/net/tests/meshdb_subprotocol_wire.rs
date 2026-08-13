@@ -24,7 +24,8 @@ use std::time::Duration;
 use net::adapter::net::behavior::meshdb::planner::{CostEstimate, ExecutionPlan, OperatorNode};
 use net::adapter::net::behavior::meshdb::{
     enable_meshdb_on_mesh, ChainReader, FederatedMeshQueryExecutor, LocalMeshQueryExecutor,
-    MeshDbServer, MeshQueryExecutor, OperatorPlan, SeqNum, MESHDB_SERVER_BATCH_ROWS,
+    MeshDbAccessPolicy, MeshDbServer, MeshQueryExecutor, OperatorPlan, SeqNum,
+    MESHDB_SERVER_BATCH_ROWS,
 };
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
 
@@ -140,7 +141,7 @@ async fn federated_latest_query_over_real_wire() {
     let reader = Arc::new(InMemoryChainReader::default());
     reader.append(0xCAFE_BABE, SeqNum(7), b"hello-wire".to_vec());
     let executor: Arc<dyn MeshQueryExecutor> = Arc::new(LocalMeshQueryExecutor::new(reader));
-    let server = MeshDbServer::new(executor);
+    let server = MeshDbServer::new(executor, MeshDbAccessPolicy::AllPeersMayReadEveryChain);
     let (_dispatcher_b, _transport_b) = enable_meshdb_on_mesh(&b, Some(server.clone()));
 
     // A is the caller. Install a caller-only dispatcher and grab
@@ -206,7 +207,7 @@ async fn federated_latest_query_over_wire_returns_empty_for_unknown_origin() {
 
     let reader = Arc::new(InMemoryChainReader::default()); // empty
     let executor: Arc<dyn MeshQueryExecutor> = Arc::new(LocalMeshQueryExecutor::new(reader));
-    let server = MeshDbServer::new(executor);
+    let server = MeshDbServer::new(executor, MeshDbAccessPolicy::AllPeersMayReadEveryChain);
     let (_d, _t) = enable_meshdb_on_mesh(&b, Some(server));
 
     let (_d, transport) = enable_meshdb_on_mesh(&a, None);
@@ -302,7 +303,7 @@ async fn federated_between_query_over_wire_streams_multiple_batches() {
         reader.append(0xFEED, SeqNum(seq), format!("row-{seq}").into_bytes());
     }
     let executor: Arc<dyn MeshQueryExecutor> = Arc::new(LocalMeshQueryExecutor::new(reader));
-    let server = MeshDbServer::new(executor);
+    let server = MeshDbServer::new(executor, MeshDbAccessPolicy::AllPeersMayReadEveryChain);
     let (_db, _tb) = enable_meshdb_on_mesh(&b, Some(server.clone()));
 
     let (_da, transport) = enable_meshdb_on_mesh(&a, None);
@@ -390,7 +391,7 @@ async fn federated_query_over_wire_propagates_executor_error() {
     handshake(&a, &b).await;
 
     let executor: Arc<dyn MeshQueryExecutor> = Arc::new(AlwaysErrorExecutor);
-    let server = MeshDbServer::new(executor);
+    let server = MeshDbServer::new(executor, MeshDbAccessPolicy::AllPeersMayReadEveryChain);
     let (_db, _tb) = enable_meshdb_on_mesh(&b, Some(server.clone()));
 
     let (_da, transport) = enable_meshdb_on_mesh(&a, None);
@@ -456,7 +457,7 @@ async fn federated_query_caller_cancels_via_handle_clears_both_sides() {
         reader.append(0xC0DE, SeqNum(seq), b"x".to_vec());
     }
     let executor: Arc<dyn MeshQueryExecutor> = Arc::new(LocalMeshQueryExecutor::new(reader));
-    let server = MeshDbServer::new(executor);
+    let server = MeshDbServer::new(executor, MeshDbAccessPolicy::AllPeersMayReadEveryChain);
     let (_db, _tb) = enable_meshdb_on_mesh(&b, Some(server.clone()));
 
     let (_da, transport) = enable_meshdb_on_mesh(&a, None);
@@ -511,5 +512,131 @@ async fn federated_query_caller_cancels_via_handle_clears_both_sides() {
         server.inflight_calls(),
         0,
         "server-side inflight must clear after caller cancels",
+    );
+}
+
+/// AUTH-02 RED, over the real wire — the witness the audit named
+/// (`unauthorized_peer_cannot_read_protected_chain`).
+///
+/// Peer C is denied one chain and allowed another. Before this change
+/// the server received `(peer, request)` and passed the plan straight
+/// to the executor, so the authenticated caller was discarded before
+/// any policy could see it — the per-chain ACL `MESHDB_PLAN.md`
+/// specifies was not merely unenforced, it was unimplementable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unauthorized_peer_cannot_read_protected_chain() {
+    const PROTECTED: u64 = 0xDEAD_0001;
+    const PUBLIC: u64 = 0xBEEF_0002;
+
+    /// Denies exactly one chain, to everyone.
+    struct DenyProtected;
+    impl net::adapter::net::behavior::meshdb::ChainAuthorizer for DenyProtected {
+        fn may_read(&self, _peer: u64, chain_origin: u64) -> bool {
+            chain_origin != PROTECTED
+        }
+    }
+
+    let a = build_node().await;
+    let b = build_node().await;
+    handshake(&a, &b).await;
+
+    let reader = Arc::new(InMemoryChainReader::default());
+    reader.append(PROTECTED, SeqNum(7), b"secret-rows".to_vec());
+    reader.append(PUBLIC, SeqNum(7), b"public-rows".to_vec());
+    let executor: Arc<dyn MeshQueryExecutor> = Arc::new(LocalMeshQueryExecutor::new(reader));
+    let server = MeshDbServer::new(executor, MeshDbAccessPolicy::per_chain(DenyProtected));
+    let (_dispatcher_b, _transport_b) = enable_meshdb_on_mesh(&b, Some(server.clone()));
+
+    let (_dispatcher_a, transport_a) = enable_meshdb_on_mesh(&a, None);
+    let fed_a = FederatedMeshQueryExecutor::new(transport_a);
+
+    // 1. The denied chain yields no rows.
+    let running = fed_a
+        .execute(atomic_plan(
+            OperatorPlan::LatestRead { origin: PROTECTED },
+            b.node_id(),
+        ))
+        .await
+        .expect("execute is accepted at the transport layer");
+    use futures::StreamExt;
+    let mut stream = running.rows;
+    let mut rows = Vec::new();
+    let mut saw_error = false;
+    let drain = async {
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(row) => rows.push(row),
+                Err(_) => saw_error = true,
+            }
+        }
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(5), drain).await;
+    assert!(
+        rows.is_empty(),
+        "an unauthorized peer read {} row(s) from a protected chain",
+        rows.len()
+    );
+    assert!(
+        saw_error,
+        "the refusal must reach the caller as an error, not as a silent empty \
+         result — an empty stream is indistinguishable from an empty chain"
+    );
+
+    // 2. Positive control: the allowed chain still reads. A policy
+    //    that denied everything would satisfy the assertion above
+    //    while breaking MeshDB.
+    let running = fed_a
+        .execute(atomic_plan(
+            OperatorPlan::LatestRead { origin: PUBLIC },
+            b.node_id(),
+        ))
+        .await
+        .expect("execute");
+    let mut stream = running.rows;
+    let mut rows = Vec::new();
+    let drain = async {
+        while let Some(item) = stream.next().await {
+            rows.push(item.expect("row"));
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), drain)
+        .await
+        .expect("drain the permitted chain");
+    assert_eq!(
+        rows.len(),
+        1,
+        "the permitted chain returned no rows; the gate is denying everything"
+    );
+    assert_eq!(rows[0].payload, b"public-rows".to_vec());
+}
+
+/// The authorization set is read off the plan tree, not the request
+/// envelope, so a protected chain buried inside a composite operator
+/// must still be caught. A collector that only looked at the root
+/// would let `Filter { input: LatestRead { protected } }` straight
+/// through.
+#[test]
+fn chain_origins_sees_through_composite_operators() {
+    let leaf = OperatorNode {
+        operator: OperatorPlan::LatestRead { origin: 0xAAAA },
+        target_nodes: vec![],
+        cost: CostEstimate::default(),
+    };
+    let filtered = ExecutionPlan {
+        root: OperatorNode {
+            operator: OperatorPlan::NotYetImplemented {
+                detail: "composite".to_string(),
+                input: Some(Box::new(leaf)),
+            },
+            target_nodes: vec![],
+            cost: CostEstimate::default(),
+        },
+        total_cost: CostEstimate::default(),
+    };
+    assert_eq!(
+        filtered.chain_origins(),
+        vec![0xAAAA],
+        "a chain read nested inside a composite operator was invisible to the \
+         authorization collector"
     );
 }

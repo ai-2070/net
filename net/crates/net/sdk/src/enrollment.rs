@@ -1161,18 +1161,50 @@ impl DeviceEnrollment {
 
     /// Load from `path`. A missing file is `Ok(None)` (not enrolled yet); a
     /// present-but-unparseable file is [`DeviceEnrollmentError::Corrupt`].
+    ///
+    /// The file is refused unless it is a regular file owned by the calling
+    /// user with no group/other access — see [`Self::load_allowing_insecure`].
     pub fn load(path: impl AsRef<Path>) -> Result<Option<Self>, DeviceEnrollmentError> {
+        Self::load_allowing_insecure(path, false)
+    }
+
+    /// [`Self::load`], with `allow_insecure` skipping the permission gate.
+    ///
+    /// SEC-05 / LINUX-02: this file holds `device_seed`, the device's private
+    /// ed25519 signing key, and the loader read it with no check at all — the
+    /// writer takes care to create it `0600`, but nothing verified that it
+    /// still was on the way back in. A local user who can read it holds the
+    /// device's identity; one who can *write* it can substitute their own and
+    /// have this device enroll as them, which is why the gate refuses a file
+    /// owned by someone else even when its mode is impeccable.
+    pub fn load_allowing_insecure(
+        path: impl AsRef<Path>,
+        allow_insecure: bool,
+    ) -> Result<Option<Self>, DeviceEnrollmentError> {
+        use std::io::Read as _;
         let path = path.as_ref();
-        let bytes = match std::fs::read(path) {
-            Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => {
-                return Err(DeviceEnrollmentError::Io {
-                    path: path.display().to_string(),
-                    reason: e.to_string(),
-                })
-            }
-        };
+        let mut file =
+            match ::net::adapter::net::secret_file::open_secret_file(path, allow_insecure) {
+                Ok(f) => f,
+                Err(::net::adapter::net::secret_file::SecretFileError::Io { source, .. })
+                    if source.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    return Ok(None)
+                }
+                Err(e) => {
+                    return Err(DeviceEnrollmentError::Io {
+                        path: path.display().to_string(),
+                        reason: e.to_string(),
+                    })
+                }
+            };
+        let mut bytes = Vec::new();
+        if let Err(e) = file.read_to_end(&mut bytes) {
+            return Err(DeviceEnrollmentError::Io {
+                path: path.display().to_string(),
+                reason: e.to_string(),
+            });
+        }
         let corrupt = |reason: String| DeviceEnrollmentError::Corrupt {
             path: path.display().to_string(),
             reason,
@@ -1767,7 +1799,21 @@ mod tests {
         // Missing file → not enrolled yet.
         assert!(DeviceEnrollment::load(&path).unwrap().is_none());
         // Corrupt file → surfaced, not silently treated as unenrolled.
+        //
+        // Written by hand rather than through `save`, precisely because
+        // `save` would produce valid JSON. That also bypasses the
+        // `0o600` `save` sets, and `load` runs the SEC-05 secret-file
+        // gate first — this file holds `device_seed` — so on Unix a
+        // umask-default `0o644` is refused as `Permissions` before
+        // anything parses it. Restore the mode `save` would have used,
+        // so the assertion is about corruption and not about
+        // permissions.
         std::fs::write(&path, b"{ not valid json").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         assert!(matches!(
             DeviceEnrollment::load(&path),
             Err(DeviceEnrollmentError::Corrupt { .. })

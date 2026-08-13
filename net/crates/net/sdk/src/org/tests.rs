@@ -649,7 +649,8 @@ async fn two_mesh_wrappers_over_one_node_share_the_audience_lease() {
     assert_eq!(
         node.consumer_grant_audiences_len_for_test(),
         1,
-        "dropping one wrapper's client must not withdraw a live client's ingest          authority — the refcount belongs to the node, not the wrapper"
+        "dropping one wrapper's client must not withdraw a live client's ingest \
+         authority — the refcount belongs to the node, not the wrapper"
     );
 
     drop(c2);

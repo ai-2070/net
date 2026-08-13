@@ -240,7 +240,15 @@ func unregisterDaemon(id uint64) {
 //export goComputeProcess
 func goComputeProcess(daemonID C.uint64_t, originHash C.uint64_t, sequence C.uint64_t,
 	payloadPtr *C.uint8_t, payloadLen C.size_t, outputs *C.net_compute_outputs_t,
-) C.int {
+) (code C.int) {
+	// First statement: the guard has to cover the handle lookup and
+	// the payload conversion too, not just `d.Process`. A peer-shaped
+	// payload reaches both.
+	defer func() {
+		if recoverCallback("compute.Process", recover()) {
+			code = -1
+		}
+	}()
 	d := lookupDaemon(uint64(daemonID))
 	if d == nil {
 		return -1
@@ -248,9 +256,14 @@ func goComputeProcess(daemonID C.uint64_t, originHash C.uint64_t, sequence C.uin
 	// Copy the payload — the Rust side owns the underlying `Bytes`
 	// and may free it after this callback returns. Go slices
 	// backed by Rust memory are unsafe to retain.
-	var payload []byte
-	if payloadLen > 0 {
-		payload = C.GoBytes(unsafe.Pointer(payloadPtr), C.int(payloadLen))
+	// `goBytesChecked` refuses a length that would not survive the
+	// 32-bit `C.int` cast `C.GoBytes` takes, instead of silently
+	// truncating (or, once past MaxInt32, going negative). Same helper
+	// the meshos and RPC trampolines use — the compute path was the
+	// odd one out.
+	payload, okLen := goBytesChecked(payloadPtr, payloadLen)
+	if !okLen {
+		return -1
 	}
 	outs, err := d.Process(CausalEvent{
 		OriginHash: uint64(originHash),
@@ -281,7 +294,32 @@ func goComputeProcess(daemonID C.uint64_t, originHash C.uint64_t, sequence C.uin
 }
 
 //export goComputeSnapshot
-func goComputeSnapshot(daemonID C.uint64_t, outPtr **C.uint8_t, outLen *C.size_t) C.int {
+func goComputeSnapshot(daemonID C.uint64_t, outPtr **C.uint8_t, outLen *C.size_t) (code C.int) {
+	// Guard first, then zero the outputs. The other order looks
+	// tempting — initialize before anything can panic — but it leaves
+	// the initialization itself unguarded, and a NULL `outPtr` from a
+	// misbehaving caller would panic there with nothing to catch it.
+	//
+	// The handler re-checks for nil because that same NULL `outPtr` is
+	// the most likely thing to have panicked; writing through it again
+	// inside the recover would panic a second time, mid-unwind, and
+	// take the process down by exactly the route this guard exists to
+	// close.
+	defer func() {
+		if recoverCallback("compute.Snapshot", recover()) {
+			if outPtr != nil {
+				*outPtr = nil
+			}
+			if outLen != nil {
+				*outLen = 0
+			}
+			code = -1
+		}
+	}()
+	// A recovered trampoline hands Rust a well-formed (empty) result
+	// rather than whatever the caller's stack happened to hold.
+	*outPtr = nil
+	*outLen = 0
 	d := lookupDaemon(uint64(daemonID))
 	if d == nil {
 		*outPtr = nil
@@ -321,7 +359,12 @@ func goComputeSnapshot(daemonID C.uint64_t, outPtr **C.uint8_t, outLen *C.size_t
 }
 
 //export goComputeRestore
-func goComputeRestore(daemonID C.uint64_t, statePtr *C.uint8_t, stateLen C.size_t) C.int {
+func goComputeRestore(daemonID C.uint64_t, statePtr *C.uint8_t, stateLen C.size_t) (code C.int) {
+	defer func() {
+		if recoverCallback("compute.Restore", recover()) {
+			code = -1
+		}
+	}()
 	d := lookupDaemon(uint64(daemonID))
 	if d == nil {
 		return -1
@@ -332,9 +375,9 @@ func goComputeRestore(daemonID C.uint64_t, statePtr *C.uint8_t, stateLen C.size_
 		// Node / Python semantics: absent `restore` = ignore state.
 		return C.NET_COMPUTE_OK
 	}
-	var state []byte
-	if stateLen > 0 {
-		state = C.GoBytes(unsafe.Pointer(statePtr), C.int(stateLen))
+	state, okLen := goBytesChecked(statePtr, stateLen)
+	if !okLen {
+		return -1
 	}
 	if err := restorer.Restore(state); err != nil {
 		return -1
@@ -392,6 +435,8 @@ func init() {
 	// `net_compute_*_fn` signatures (with `const uint8_t*` /
 	// `const char*` parameters) and thunk into the `//export`ed Go
 	// functions which cgo emits with non-const pointer parameters.
+	// The deallocator must be registered first — see callback_free.go.
+	registerCallbackFree()
 	code := C.net_compute_set_dispatcher(
 		C.net_compute_process_fn(C.bridgeProcess),
 		C.net_compute_snapshot_fn(C.bridgeSnapshot),

@@ -10,6 +10,33 @@
 //!   [`A2A_STATUS_SERVICE`] answers a task's [`TaskRecord`], and
 //!   [`A2A_CANCEL_SERVICE`] trips its cancel token. Its running dispatch loop
 //!   answers routed handshakes from any in-root peer — zero pairing ceremony.
+//!
+//! # Ownership
+//!
+//! **Submission is open to every in-root peer; inspection and
+//! cancellation are not.** Each task is bound at submission to the
+//! AEAD-authenticated peer that submitted it, and status and cancel
+//! only ever see that peer's own tasks.
+//!
+//! "The peer that submitted it" means the peer whose session delivered
+//! the frame — the **deliverer**, not an end-to-end origin. Under a
+//! deployment that relays nRPC through an intermediary, the relay is
+//! the owner and everything it forwards shares that ownership. That is
+//! the documented limit of public nRPC attribution rather than a gap in
+//! this binding; end-to-end provenance needs a PROTECTED service or an
+//! application-level signature. See
+//! [`RpcContext::session_peer`](net::adapter::net::cortex::RpcContext::session_peer).
+//!
+//! A task id is a name, not a bearer capability. It is client-generated,
+//! it travels through logs, dashboards and polling loops as an ordinary
+//! identifier, and [`TaskRecord`] carries the complete prompt and
+//! context refs — so learning an id must not confer the right to read
+//! the brief or stop the work. Same-root reachability means permission
+//! to *submit* work, not permission to inspect and cancel every other
+//! agent's.
+//!
+//! Third-party observation, if it is ever wanted, needs an explicit
+//! delegated capability rather than a leaked id.
 //! * **Requester** — [`Mesh::submit_task`] / [`Mesh::task_status`] /
 //!   [`Mesh::cancel_task`] `call` those services by the executor's node id. The
 //!   requester submits, keeps working, polls, and cancels — and the executor
@@ -23,9 +50,12 @@
 
 use std::sync::Arc;
 
-use crate::a2a::{TaskAck, TaskBrief, TaskExecutor, TaskRecord, TaskRegistry};
+use crate::a2a::{TaskAck, TaskBrief, TaskExecutor, TaskOwner, TaskRecord, TaskRegistry};
 use crate::mesh::Mesh;
-use crate::mesh_rpc::{CallOptionsTyped, Codec, ServeError, ServeHandle};
+use crate::mesh_rpc::{
+    CallOptionsTyped, RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus,
+    ServeError, ServeHandle,
+};
 
 /// The nRPC service an executor serves to accept a [`TaskBrief`] (submit).
 pub const A2A_TASK_SERVICE: &str = "net.a2a.task";
@@ -51,6 +81,116 @@ fn task_ref_bytes(task_id: &str) -> Vec<u8> {
     serde_json::to_vec(task_id).unwrap_or_default()
 }
 
+/// The owner a request is attributed to.
+///
+/// Always the AEAD-authenticated session peer that delivered the frame —
+/// never `caller_origin`, which is routing metadata the sender chooses,
+/// and never anything in the request body.
+fn owner_of(ctx: &RpcContext) -> TaskOwner {
+    TaskOwner::Peer(ctx.session_peer)
+}
+
+/// The requester side calls these services through `call_typed` with
+/// `Req = Resp = Vec<u8>`, so the transport JSON-encodes the payload
+/// bytes as an array of numbers. Moving the handlers onto the
+/// context-bearing `serve_rpc` path means unwrapping and re-wrapping
+/// that envelope here, where `serve_rpc_typed` used to do it.
+///
+/// Kept exactly as it was rather than switching to a raw body: the
+/// wire is spoken by the Node and Python bindings and by any peer on
+/// an older build, and ownership is a server-side property. A
+/// cross-version A2A break would be an odd thing to buy with an
+/// authorization fix.
+fn typed_body(raw: &[u8]) -> Vec<u8> {
+    serde_json::from_slice(raw).unwrap_or_default()
+}
+
+/// Wrap `body` in the same envelope, in an `Ok` response. A2A answers
+/// application outcomes in the body (`TaskAck { accepted: false }`,
+/// `null`, `false`) rather than through transport status, so the
+/// requester reads one shape.
+fn json_ok(body: Vec<u8>) -> RpcResponsePayload {
+    RpcResponsePayload {
+        status: RpcStatus::Ok,
+        headers: Vec::new(),
+        body: bytes::Bytes::from(serde_json::to_vec(&body).unwrap_or_default()),
+    }
+}
+
+/// `net.a2a.task` — accept a brief, attributed to the authenticated
+/// submitter.
+struct SubmitHandler {
+    registry: TaskRegistry,
+    executor: Arc<dyn TaskExecutor>,
+}
+
+#[async_trait::async_trait]
+impl RpcHandler for SubmitHandler {
+    async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+        // Never fails out of band: a malformed or refused brief answers a
+        // `TaskAck { accepted: false }` the requester reads.
+        let ack = match TaskBrief::decode(&typed_body(&ctx.payload.body)) {
+            Ok(brief) => {
+                match self
+                    .registry
+                    .submit(owner_of(&ctx), brief, Arc::clone(&self.executor))
+                {
+                    Ok(task_id) => TaskAck {
+                        task_id,
+                        accepted: true,
+                        reason: None,
+                    },
+                    Err(rejection) => TaskAck {
+                        task_id: String::new(),
+                        accepted: false,
+                        reason: Some(rejection.to_string()),
+                    },
+                }
+            }
+            Err(e) => TaskAck {
+                task_id: String::new(),
+                accepted: false,
+                reason: Some(e.to_string()),
+            },
+        };
+        Ok(json_ok(ack.encode()))
+    }
+}
+
+/// `net.a2a.status` — answer the caller's own task, or `null`.
+struct StatusHandler {
+    registry: TaskRegistry,
+}
+
+#[async_trait::async_trait]
+impl RpcHandler for StatusHandler {
+    async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+        let task_id: String =
+            serde_json::from_slice(&typed_body(&ctx.payload.body)).unwrap_or_default();
+        // Another submitter's task reads as unknown rather than
+        // forbidden — see `TaskRegistry::status`. `TaskRecord` carries
+        // the full prompt and context refs, so "not yours" and "no such
+        // task" must be indistinguishable.
+        let record: Option<TaskRecord> = self.registry.record(owner_of(&ctx), &task_id);
+        Ok(json_ok(serde_json::to_vec(&record).unwrap_or_default()))
+    }
+}
+
+/// `net.a2a.cancel` — cancel the caller's own task.
+struct CancelHandler {
+    registry: TaskRegistry,
+}
+
+#[async_trait::async_trait]
+impl RpcHandler for CancelHandler {
+    async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+        let task_id: String =
+            serde_json::from_slice(&typed_body(&ctx.payload.body)).unwrap_or_default();
+        let cancelled = self.registry.cancel(owner_of(&ctx), &task_id);
+        Ok(json_ok(serde_json::to_vec(&cancelled).unwrap_or_default()))
+    }
+}
+
 impl Mesh {
     /// **Executor side.** Serve the three A2A services backed by `registry` +
     /// `executor`: accept briefs (spawning the executor), answer status, and
@@ -65,56 +205,25 @@ impl Mesh {
         registry: TaskRegistry,
         executor: Arc<dyn TaskExecutor>,
     ) -> Result<Vec<ServeHandle>, ServeError> {
-        let submit = {
-            let registry = registry.clone();
-            self.serve_rpc_typed(A2A_TASK_SERVICE, Codec::Json, move |req: Vec<u8>| {
-                let registry = registry.clone();
-                let executor = Arc::clone(&executor);
-                async move {
-                    // Never fails out of band: a malformed brief answers a
-                    // `TaskAck { accepted: false }` the requester reads.
-                    let ack = match TaskBrief::decode(&req) {
-                        Ok(brief) => {
-                            let task_id = registry.submit(brief, executor);
-                            TaskAck {
-                                task_id,
-                                accepted: true,
-                                reason: None,
-                            }
-                        }
-                        Err(e) => TaskAck {
-                            task_id: String::new(),
-                            accepted: false,
-                            reason: Some(e.to_string()),
-                        },
-                    };
-                    Ok::<Vec<u8>, String>(ack.encode())
-                }
-            })?
-        };
-
-        let status = {
-            let registry = registry.clone();
-            self.serve_rpc_typed(A2A_STATUS_SERVICE, Codec::Json, move |req: Vec<u8>| {
-                let registry = registry.clone();
-                async move {
-                    let task_id: String = serde_json::from_slice(&req).unwrap_or_default();
-                    // `Option<TaskRecord>` → JSON (null when unknown).
-                    let record: Option<TaskRecord> = registry.record(&task_id);
-                    Ok::<Vec<u8>, String>(serde_json::to_vec(&record).unwrap_or_default())
-                }
-            })?
-        };
-
-        let cancel =
-            self.serve_rpc_typed(A2A_CANCEL_SERVICE, Codec::Json, move |req: Vec<u8>| {
-                let registry = registry.clone();
-                async move {
-                    let task_id: String = serde_json::from_slice(&req).unwrap_or_default();
-                    let cancelled = registry.cancel(&task_id);
-                    Ok::<Vec<u8>, String>(serde_json::to_vec(&cancelled).unwrap_or_default())
-                }
-            })?;
+        // The context-bearing `serve_rpc` path, not `serve_rpc_typed`:
+        // the typed helper hands the closure only the request bytes, so
+        // the authenticated submitter was structurally unavailable to
+        // these handlers. That is why status and cancel keyed on the
+        // task id alone.
+        let submit = self.serve_rpc(
+            A2A_TASK_SERVICE,
+            Arc::new(SubmitHandler {
+                registry: registry.clone(),
+                executor,
+            }),
+        )?;
+        let status = self.serve_rpc(
+            A2A_STATUS_SERVICE,
+            Arc::new(StatusHandler {
+                registry: registry.clone(),
+            }),
+        )?;
+        let cancel = self.serve_rpc(A2A_CANCEL_SERVICE, Arc::new(CancelHandler { registry }))?;
 
         Ok(vec![submit, status, cancel])
     }

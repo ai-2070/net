@@ -37,9 +37,25 @@ fn snapshot(args: &[&str], config: &std::path::Path) -> std::process::Output {
 }
 
 /// An empty config file — the "no configuration at all" case from the report.
+///
+/// Owner-only, because `--config` runs the SEC-05 secret-file gate before
+/// parsing and refuses a group- or world-readable config outright. That is
+/// the correct behavior; it is just not what these tests are about, and
+/// `std::fs::write` leaves the umask default (typically `0o644`).
+///
+/// Only one of the tests below reaches config loading at all — the rest
+/// refuse at argument validation first — so on Unix this defect showed up
+/// as a single failure. Windows has no mode bits and the gate only warns
+/// there, which is why it passed locally and failed on CI.
 fn empty_config() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("config.toml"), "").unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
     dir
 }
 

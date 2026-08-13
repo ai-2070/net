@@ -53,6 +53,7 @@
 use parking_lot::Mutex;
 use std::sync::Arc;
 
+use crate::runtime_guard::GuardedRuntime;
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
@@ -1332,9 +1333,9 @@ impl PyInMemoryChainReader {
 /// construct many runners; a single shared runtime suffices
 /// because the runner blocks the caller's thread anyway
 /// (sync-drain design).
-fn shared_runtime() -> Result<Arc<Runtime>, std::io::Error> {
+fn shared_runtime() -> Result<Arc<GuardedRuntime>, std::io::Error> {
     use std::sync::OnceLock;
-    static RT: OnceLock<Arc<Runtime>> = OnceLock::new();
+    static RT: OnceLock<Arc<GuardedRuntime>> = OnceLock::new();
     // Pre-fix this did `RT.get()` then `RT.set()` — two threads
     // simultaneously hitting the get-empty path both built a
     // fresh `Runtime`; the losing thread's runtime got dropped
@@ -1349,7 +1350,7 @@ fn shared_runtime() -> Result<Arc<Runtime>, std::io::Error> {
     // expensive; the `RT.set` below is idempotent — if another
     // thread already populated the slot, we drop our just-built
     // runtime and reuse theirs.
-    let candidate = Arc::new(Runtime::new()?);
+    let candidate = Arc::new(GuardedRuntime::new(Runtime::new()?));
     match RT.set(candidate.clone()) {
         Ok(()) => Ok(candidate),
         Err(_) => Ok(RT
@@ -1367,7 +1368,7 @@ fn shared_runtime() -> Result<Arc<Runtime>, std::io::Error> {
 /// the executor; awaitable `execute`.
 #[pyclass(name = "MeshQueryRunner", module = "net._net")]
 pub struct PyMeshQueryRunner {
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
     executor: Arc<LocalMeshQueryExecutor<InMemoryStore>>,
 }
 

@@ -459,6 +459,27 @@ fn mode_of(_meta: &std::fs::Metadata) -> u32 {
 ///   tree is in place — so a replace also drops files from a previous
 ///   version that aren't in the new manifest (no stale-file accumulation).
 ///
+/// # Permissions (Unix)
+///
+/// The temp tree is created `0o700`, so an in-progress reconstruction is
+/// never readable by another local user — the destination's parent is
+/// frequently traversable, and the temp tree lives there. Regular files
+/// are created carrying the manifest's sanitized mode rather than the
+/// umask default, so a file destined to be private is never briefly
+/// world-readable; for a multi-chunk file, whose handle stays open across
+/// every chunk fetch, that window used to last the whole transfer
+/// (LINUX-04).
+///
+/// **Behaviour change:** the `0o700` travels with the inode through the
+/// final rename, so **`dest` ends up owner-only** where it previously
+/// inherited the umask (typically `0o755`). A directory pulled from a
+/// remote peer defaults to private; widen it explicitly if another
+/// local user needs to read it. The setuid, setgid and sticky bits are
+/// stripped from every remote file mode regardless (SEC-04): the mode
+/// comes from the manifest publisher, so honouring `04755` here would
+/// let a hostile manifest plant a setuid binary owned by whoever ran
+/// the fetch.
+///
 /// This is *replacement*-atomicity, **not** *observer*-atomicity: a
 /// process reading files inside `dest` during the swap may see the old
 /// tree one moment and a missing path the next — the rename invalidates
@@ -720,7 +741,9 @@ async fn alloc_temp_dir(dest: &Path) -> Result<PathBuf, DirError> {
         std::fs::create_dir_all(&parent)?;
         for _ in 0..8 {
             let work = parent.join(format!(".{base}.fetch_{:016x}", unique_suffix()));
-            match std::fs::create_dir(&work) {
+            // LINUX-04: private from the creation syscall, not chmodded
+            // private a moment later. See `create_dir_private`.
+            match create_dir_private(&work) {
                 Ok(()) => return Ok(work),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(DirError::Io(e)),
@@ -836,9 +859,15 @@ async fn fetch_blob_to_file(
     mode: u32,
 ) -> Result<u64, DirError> {
     let create_path = path.to_path_buf();
-    let mut file = tokio::task::spawn_blocking(move || std::fs::File::create(&create_path))
-        .await
-        .map_err(|e| DirError::Io(std::io::Error::other(e)))??;
+    // LINUX-04: request the final mode up front. This handle stays open
+    // across every chunk fetch, so `File::create`'s umask-derived 0644
+    // exposed a file destined for 0600 for the whole transfer — the
+    // longest-lived instance of that window, and the one a throttled
+    // transfer widens at will.
+    let mut file =
+        tokio::task::spawn_blocking(move || create_file_with_final_mode(&create_path, mode))
+            .await
+            .map_err(|e| DirError::Io(std::io::Error::other(e)))??;
     let mut written: u64 = 0;
     for chunk in chunks {
         let bytes = node.transfer_fetch_chunk(source, chunk.hash).await?;
@@ -1019,22 +1048,151 @@ fn check_link_target(
 }
 
 fn write_file(path: &Path, bytes: &[u8], mode: u32) -> Result<(), DirError> {
-    std::fs::write(path, bytes)?;
+    use std::io::Write as _;
+    let mut f = create_file_with_final_mode(path, mode)?;
+    f.write_all(bytes)?;
+    drop(f);
+    // Still needed: `OpenOptionsExt::mode` is masked by the process
+    // umask, so a file whose final mode is wider than umask allows
+    // (0o664 under umask 0o022) comes out narrower. The chmod widens it
+    // to its intended mode *after* the content is written. Narrower ->
+    // wider is safe; the reverse is the exposure this closes.
     apply_mode(path, mode)?;
     Ok(())
 }
 
-#[cfg(unix)]
+/// Create a file for a reconstructed manifest entry, requesting its
+/// **final** sanitized mode at creation time rather than letting the
+/// umask pick a wider one and narrowing later.
+///
+/// LINUX-04. `std::fs::write` creates at `0o666 & !umask` — 0644 on a
+/// typical host — and the intended mode was only applied afterwards. A
+/// file destined for `0o600` was therefore world-readable for the whole
+/// of its transfer. For a multi-chunk file the handle stays open across
+/// every chunk fetch, so the window is as long as the transfer: a
+/// throttled or large file widens it arbitrarily.
+///
+/// Since umask can only clear bits, requesting the final mode here means
+/// the file is never *broader* than it is meant to end up, at any point
+/// in its life.
+fn create_file_with_final_mode(path: &Path, mode: u32) -> Result<std::fs::File, DirError> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let sanitized = sanitize_remote_file_mode(mode);
+        // `0` means the manifest recorded no mode (a non-Unix
+        // publisher). Leave the default alone rather than inventing an
+        // intent the manifest never expressed — there is nothing to
+        // protect, and forcing owner-only here would silently change
+        // what a plain fetch produces.
+        if sanitized != 0 {
+            opts.mode(sanitized);
+        }
+    }
+    #[cfg(not(unix))]
+    ignore_mode_on_this_platform(mode);
+    Ok(opts.open(path)?)
+}
+
+/// Create a directory that no other local user can traverse.
+///
+/// LINUX-04. The `fetch_dir` temp tree is a *sibling* of the
+/// destination, so it lives in whatever directory the caller chose —
+/// frequently one another local user can traverse. Created with plain
+/// `create_dir` it inherited the umask, typically `0o755`, which made
+/// the entire in-progress reconstruction readable to anyone on the box
+/// for the duration of the fetch.
+///
+/// `0o700` on the temp root is the cheap, complete fix: everything
+/// under it is unreachable regardless of the modes the individual
+/// files and subdirectories carry.
+fn create_dir_private(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().mode(0o700).create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir(path)
+    }
+}
+
+/// Consume `mode` on platforms where it has no meaning, so the
+/// parameter stays part of the signature (and the intent stays legible)
+/// without tripping `unused_variables` on Windows.
+#[cfg(not(unix))]
+#[inline]
+fn ignore_mode_on_this_platform(_mode: u32) {}
+
+/// Unix mode bits above `0o777`: setuid (`0o4000`), setgid (`0o2000`)
+/// and the sticky bit (`0o1000`).
+const SPECIAL_MODE_BITS: u32 = 0o7000;
+
+/// Reduce a manifest-supplied file mode to the bits a remote peer is
+/// allowed to choose.
+///
+/// A directory manifest is attacker-controlled input: `DirEntry::File.mode`
+/// is whatever the publisher wrote, and it used to reach
+/// `Permissions::from_mode` unchanged. A manifest asking for `0o4755`
+/// therefore produced a setuid executable owned by whoever ran the
+/// fetch. Fetch as root — a system-level `net` service pulling a
+/// directory, say — and the result is a root-owned setuid binary
+/// sitting in a directory another local user can execute: a local
+/// privilege-escalation primitive handed over by a *download*.
+///
+/// Umask is no defence here, because the mode is applied by an
+/// explicit `chmod` after the file exists.
+///
+/// So: keep the ordinary permission bits, drop setuid/setgid/sticky
+/// unconditionally. Nothing about "fetch a directory from a peer"
+/// implies "and grant it elevated execution rights"; a workflow that
+/// genuinely needs special bits restored needs to say so explicitly
+/// through a path that isn't ordinary remote fetch.
+///
+/// `0` is preserved as `0` — it is the manifest's "no mode recorded"
+/// (a non-Unix publisher), and callers skip the `chmod` entirely.
+/// A mode of *only* special bits, `0o4000`, sanitizes to `0` and so
+/// leaves the file at the creating process's umask default, which is
+/// the safe reading of a nonsensical request.
+fn sanitize_remote_file_mode(mode: u32) -> u32 {
+    // Written as "keep the permission-ish bits, then remove the
+    // privileged ones" rather than the equivalent `& 0o777`, so the
+    // rule this enforces is legible at the point it is enforced.
+    (mode & 0o7777) & !SPECIAL_MODE_BITS
+}
+
+/// Apply a manifest-supplied mode to a reconstructed file.
+///
+/// The single choke point for remote modes: both the buffered
+/// ([`write_file`]) and streamed ([`fetch_blob_to_file`]) write paths
+/// land here, so sanitizing inside it — rather than at each caller —
+/// means a future third write path cannot forget.
+///
+/// Deliberately not split into two `#[cfg]` functions. The sanitizing
+/// step is platform-independent and stays on every build, so the rule
+/// is compiled and unit-tested on Windows CI too; only the `chmod`
+/// itself is Unix-gated.
 fn apply_mode(path: &Path, mode: u32) -> Result<(), DirError> {
-    if mode != 0 {
+    let mode = sanitize_remote_file_mode(mode);
+    if mode == 0 {
+        // No mode recorded, or a mode consisting only of bits we just
+        // dropped. Leave the file at the creating process's default.
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
     }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn apply_mode(_path: &Path, _mode: u32) -> Result<(), DirError> {
+    #[cfg(not(unix))]
+    {
+        // Windows has no mode to apply; NTFS ACLs are inherited from
+        // the destination directory.
+        let _ = path;
+    }
     Ok(())
 }
 
@@ -1072,6 +1230,200 @@ fn hex(hash: &[u8; 32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SEC-04 / LINUX-01. `DirEntry::File.mode` is whatever the
+    /// manifest publisher wrote, and it used to reach
+    /// `Permissions::from_mode` verbatim.
+    ///
+    /// Platform-independent by design: the masking is a pure
+    /// function precisely so the rule is pinned on every CI host,
+    /// not only the ones that can chmod. The companion test below
+    /// proves the rule is actually wired into the write path.
+    #[test]
+    fn remote_file_modes_never_carry_setuid_setgid_or_sticky() {
+        // The exploit shapes named in the finding.
+        assert_eq!(sanitize_remote_file_mode(0o4755), 0o755, "setuid stripped");
+        assert_eq!(sanitize_remote_file_mode(0o2755), 0o755, "setgid stripped");
+        assert_eq!(sanitize_remote_file_mode(0o1777), 0o777, "sticky stripped");
+        assert_eq!(sanitize_remote_file_mode(0o6755), 0o755, "setuid+setgid");
+        assert_eq!(sanitize_remote_file_mode(0o7777), 0o777, "all three");
+
+        // Ordinary modes survive untouched — a fix that also broke
+        // executables or private files would be traded for a
+        // different bug.
+        for ordinary in [0o755, 0o644, 0o600, 0o777, 0o400, 0o111] {
+            assert_eq!(
+                sanitize_remote_file_mode(ordinary),
+                ordinary,
+                "{ordinary:o} is an ordinary mode and must be preserved"
+            );
+        }
+
+        // `0` means "no mode recorded" (non-Unix publisher) and must
+        // stay 0 so callers skip the chmod rather than applying an
+        // empty permission set.
+        assert_eq!(sanitize_remote_file_mode(0), 0);
+
+        // Special bits alone degrade to "no mode", not to a chmod of
+        // the special bits with no permissions.
+        assert_eq!(sanitize_remote_file_mode(0o4000), 0);
+
+        // Nothing above the low 12 bits leaks through either — e.g. a
+        // publisher that sent a full `st_mode` with S_IFREG (0o100000)
+        // set rather than just the permission bits.
+        assert_eq!(sanitize_remote_file_mode(0o100_644), 0o644);
+        assert_eq!(sanitize_remote_file_mode(u32::MAX) & !0o777, 0);
+
+        // The property, stated once: no output ever has a special bit.
+        for mode in 0u32..0o10_000 {
+            assert_eq!(
+                sanitize_remote_file_mode(mode) & SPECIAL_MODE_BITS,
+                0,
+                "mode {mode:o} sanitized to something still privileged"
+            );
+        }
+    }
+
+    /// The rule above is only worth anything if the write path uses
+    /// it. Writes a file with a manifest mode of `0o4755` and reads
+    /// the resulting mode back off the filesystem.
+    ///
+    /// Unix-only: there is no `st_mode` to assert on elsewhere, and
+    /// `apply_mode` is a no-op on those platforms.
+    #[cfg(unix)]
+    #[test]
+    fn write_file_does_not_create_a_setuid_file_from_a_hostile_manifest() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir =
+            std::env::temp_dir().join(format!("net-sec04-{}-{}", std::process::id(), line!()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("payload");
+
+        write_file(&path, b"#!/bin/sh\nid\n", 0o4755).expect("write");
+
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+        assert_eq!(
+            mode & SPECIAL_MODE_BITS,
+            0,
+            "extracted file kept privileged bits: {:o} — a root-owned fetch \
+             would have produced a setuid binary",
+            mode
+        );
+        assert_eq!(
+            mode & 0o777,
+            0o755,
+            "the ordinary permission bits should survive; got {:o}",
+            mode
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// LINUX-04. The temp tree must be private in the creation
+    /// syscall, not chmodded private a moment later.
+    ///
+    /// It is a *sibling* of the destination, so it lives in whatever
+    /// directory the caller chose — often one another local user can
+    /// traverse. Created with plain `create_dir` it inherited the
+    /// umask (typically `0o755`), exposing the whole in-progress
+    /// reconstruction for the length of the fetch.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fetch_temp_tree_is_private_from_the_creation_syscall() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = std::env::temp_dir().join(format!("net-linux04-{}", std::process::id()));
+        std::fs::create_dir_all(&base).expect("base");
+        let dest = base.join("payload");
+
+        let work = alloc_temp_dir(&dest).await.expect("alloc temp dir");
+        let mode = std::fs::metadata(&work).expect("stat").permissions().mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "the in-progress fetch tree is group/other accessible: {:o}",
+            mode
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A file destined to be private must never exist in a broader
+    /// mode, including *while it is still being written* — the
+    /// multi-chunk path holds the handle open across every chunk
+    /// fetch, so a throttled transfer widens that window at will.
+    #[cfg(unix)]
+    #[test]
+    fn a_private_file_is_never_world_readable_mid_write() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("net-linux04-f-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("secret");
+
+        let mut f = create_file_with_final_mode(&path, 0o600).expect("create");
+
+        // Stat BEFORE writing or closing: this is the state another
+        // local user would find mid-transfer.
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "a 0600-destined file was group/other accessible while still open: {:o}",
+            mode
+        );
+
+        f.write_all(b"payload").expect("write");
+        drop(f);
+
+        // And a manifest mode wider than the umask still gets there in
+        // the end — umask can only clear bits at creation, so the
+        // trailing chmod has to widen it back.
+        let wide = dir.join("public");
+        write_file(&wide, b"x", 0o644).expect("write_file");
+        let mode = std::fs::metadata(&wide).expect("stat").permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o644,
+            "a 0644 manifest mode did not survive the umask-narrowed creation: {:o}",
+            mode
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Platform-independent: the two creation helpers must actually
+    /// produce a usable directory and a writable file everywhere, not
+    /// just on the platform whose modes they set.
+    #[test]
+    fn creation_helpers_work_on_every_platform() {
+        let dir =
+            std::env::temp_dir().join(format!("net-linux04-x-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&dir);
+        create_dir_private(&dir).expect("create_dir_private");
+        assert!(dir.is_dir());
+
+        let path = dir.join("f");
+        {
+            use std::io::Write as _;
+            let mut f = create_file_with_final_mode(&path, 0o600).expect("create file");
+            f.write_all(b"hello").expect("write");
+        }
+        assert_eq!(std::fs::read(&path).expect("read"), b"hello");
+
+        // Truncating re-create: a retried fetch must not append to a
+        // partial file from the previous attempt.
+        {
+            use std::io::Write as _;
+            let mut f = create_file_with_final_mode(&path, 0o600).expect("recreate");
+            f.write_all(b"hi").expect("write");
+        }
+        assert_eq!(std::fs::read(&path).expect("read"), b"hi");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Review-bot P2 regression — the byte-permit clamp must run
     /// in the u64 domain BEFORE the u32 cast. `store_dir`

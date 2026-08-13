@@ -1702,6 +1702,79 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: .github/scripts/run-skill-examples.sh --lang python
 
+  python-wheel-acceptance:
+    name: Python wheel (shipped profile, installed from the wheel)
+    runs-on: ubuntu-latest
+    # A `python-release` build is `release` plus LTO and one codegen
+    # unit, so it is slow. That is the price of testing the artifact
+    # that ships rather than a proxy for it.
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: net/crates/net/bindings/python
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: python-wheel
+          workspaces: net/crates/net -> target
+
+      - name: Ensure libpython is linkable
+        run: |
+          dpkg -s python3-dev >/dev/null 2>&1 || {
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends python3-dev
+          }
+
+      - name: Install maturin
+        run: pip install --upgrade pip maturin
+
+      # The profile, features and command here MUST match
+      # `release-python.yml`. `check-python-wheel-features.py` enforces
+      # that mechanically; this comment is for the reader.
+      - name: Build the wheel exactly as the release workflow does
+        run: |
+          maturin build --profile python-release --out dist \
+            --features net,cortex,compute,groups,meshdb,meshos,deck,aggregator,tool,consent,mcp,delegation,publish,a2a,payments,payments-http,org,extension-module
+
+      # A *clean* environment, and install from the built wheel. An
+      # editable or `maturin develop` install would put a differently
+      # compiled extension on the path and prove nothing about the
+      # artifact.
+      - name: Install the built wheel into a clean virtualenv
+        run: |
+          python3 -m venv /tmp/wheelenv
+          /tmp/wheelenv/bin/pip install --upgrade pip pytest pytest-timeout pyyaml
+          wheel=$(ls dist/*.whl | head -1)
+          echo "installing $wheel"
+          /tmp/wheelenv/bin/pip install "$wheel"
+          # Fail loudly if the import resolves to a source directory
+          # rather than the installed extension.
+          cd /tmp && /tmp/wheelenv/bin/python -c "import net, sys; assert net.__file__, 'net resolved to a namespace package, not the wheel'; print('wheel import ok:', net.__file__)"
+
+      # The whole point. This is the configuration users get:
+      # `panic = "unwind"`, LTO, optimised. A panic that a debug build
+      # contains and a release build aborts on shows up here and
+      # nowhere else in CI — which is exactly how a tokio runtime being
+      # dropped in an async context stayed invisible while 884 tests
+      # passed against a `maturin develop` build.
+      - name: Run the full suite against the installed wheel
+        env:
+          PYTHONFAULTHANDLER: "1"
+          PYTHONUNBUFFERED: "1"
+        run: /tmp/wheelenv/bin/pytest -v -s --timeout=60 --timeout-method=thread
+
   sdk-py-tests:
     name: Python SDK tests (sdk-py, pytest)
     runs-on: ubuntu-latest
@@ -1769,6 +1842,14 @@ jobs:
           python3 .github/scripts/check-header-count.py
           python3 .github/scripts/check-header-count.py --self-test
 
+      # Also pure text, also before the toolchains. A `libc::free` on a
+      # Go-allocated callback buffer is a wrong-heap free on Windows —
+      # confirmed heap corruption, not a style question — and it costs a
+      # full cdylib + cgo build to discover any other way.
+      - name: Guard — Go callback buffers are freed by their allocator
+        run: |
+          python3 .github/scripts/check-callback-buffer-ownership.py
+
       - name: Setup Go
         uses: actions/setup-go@v7.0.0
         with:
@@ -1832,9 +1913,11 @@ jobs:
       # `net_rpc_check_abi_version`, which compared `runtime >=
       # expected` and therefore passed the stale header. Text-only, so
       # it runs before the build finishes mattering.
-      - name: Guard — nRPC header matches the implementation ABI
+      - name: Guard — FFI C headers match their implementations
         if: ${{ !cancelled() }}
-        run: python3 "$GITHUB_WORKSPACE/.github/scripts/check-rpc-abi-parity.py"
+        run: |
+          python3 "$GITHUB_WORKSPACE/.github/scripts/check-rpc-abi-parity.py"
+          python3 "$GITHUB_WORKSPACE/.github/scripts/check-rpc-abi-parity.py" --self-test
 
       # The invariant this hang cost a lot to find: the Go binary loads exactly
       # one copy of `net::ffi`.
@@ -2513,7 +2596,9 @@ jobs:
         env:
           RUSTFLAGS: "-C link-arg=-Wl,--unresolved-symbols=ignore-all -C link-arg=-Wl,--allow-shlib-undefined"
           LD_PRELOAD: "/tmp/libnapi_stub.so"
-        run: cargo test --lib ${{ matrix.crate.features }}
+        run: |
+          cargo test --lib ${{ matrix.crate.features }}
+          cargo test --doc ${{ matrix.crate.features }}
 
       # The python entry needs no napi-style stub: the crate follows
       # pyo3's optional-extension-module pattern (see its Cargo.toml),
@@ -2530,10 +2615,21 @@ jobs:
             sudo apt-get install -y --no-install-recommends python3-dev
           }
 
+      # `--doc` as well as `--lib`. Doctests were never run for these
+      # crates, and rustdoc treats an INDENTED block in a doc comment as
+      # Rust — so a Python usage snippet compiles as Rust, fails, and
+      # nobody finds out. `net-python` had accumulated two that broke
+      # `cargo test` for anyone running it locally.
+      #
+      # It costs almost nothing: these crates' doc examples are fenced
+      # ```python / ```text, so rustdoc compiles none of them. The value
+      # is entirely in catching the next unfenced one.
       - name: Run tests
         if: matrix.crate.name != 'node'
         working-directory: ${{ matrix.crate.path }}
-        run: cargo test --lib ${{ matrix.crate.features }}
+        run: |
+          cargo test --lib ${{ matrix.crate.features }}
+          cargo test --doc ${{ matrix.crate.features }}
 
       # org-ffi is the one FFI crate with INTEGRATION targets — the S4 C
       # live cell, which drives the real C ABI end to end (net_mesh_new

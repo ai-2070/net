@@ -14,7 +14,8 @@ use std::time::Duration;
 
 use net_sdk::aggregator::{
     snapshot_group, AggregatorConfig, AggregatorDaemon, AggregatorRegistry, BoundRegistryClient,
-    LifecycleGroup, RegistryClient, RegistryClientError, RegistryRpcError, SpawnFn,
+    LifecycleGroup, RegistryAdminPolicy, RegistryClient, RegistryClientError, RegistryRpcError,
+    SpawnFn,
 };
 use net_sdk::mesh::{Mesh, MeshBuilder};
 
@@ -107,7 +108,14 @@ async fn bound_registry_client_drives_list_spawn_unregister_against_remote_host(
     let registry: Arc<AggregatorRegistry> = Arc::new(AggregatorRegistry::new());
     let spawner = primary_template_spawner(registry.clone(), b.node_arc());
     let _serve = net_sdk::aggregator::install_aggregator_registry_service_with_spawner(
-        &b, &registry, spawner,
+        &b,
+        &registry,
+        spawner,
+        // A is the operator in these tests. Naming its node id
+        // exercises the real allowlist path rather than opening the
+        // registry, so these round-trips double as the positive
+        // control for the authorization gate.
+        RegistryAdminPolicy::operators([a.inner().node_id()]),
     )
     .expect("install registry service");
 
@@ -160,7 +168,14 @@ async fn bound_client_unknown_template_surfaces_typed_server_error() {
     let registry: Arc<AggregatorRegistry> = Arc::new(AggregatorRegistry::new());
     let spawner = primary_template_spawner(registry.clone(), b.node_arc());
     let _serve = net_sdk::aggregator::install_aggregator_registry_service_with_spawner(
-        &b, &registry, spawner,
+        &b,
+        &registry,
+        spawner,
+        // A is the operator in these tests. Naming its node id
+        // exercises the real allowlist path rather than opening the
+        // registry, so these round-trips double as the positive
+        // control for the authorization gate.
+        RegistryAdminPolicy::operators([a.inner().node_id()]),
     )
     .expect("install registry service");
     handshake(&a, &b, addr_b).await;
@@ -187,7 +202,14 @@ async fn unbound_registry_client_can_target_multiple_nodes() {
     let registry: Arc<AggregatorRegistry> = Arc::new(AggregatorRegistry::new());
     let spawner = primary_template_spawner(registry.clone(), b.node_arc());
     let _serve = net_sdk::aggregator::install_aggregator_registry_service_with_spawner(
-        &b, &registry, spawner,
+        &b,
+        &registry,
+        spawner,
+        // A is the operator in these tests. Naming its node id
+        // exercises the real allowlist path rather than opening the
+        // registry, so these round-trips double as the positive
+        // control for the authorization gate.
+        RegistryAdminPolicy::operators([a.inner().node_id()]),
     )
     .expect("install registry service");
     handshake(&a, &b, addr_b).await;

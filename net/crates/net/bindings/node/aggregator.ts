@@ -183,7 +183,7 @@ export interface RegistryReplicaRow {
 // Mirrors `RegistryGroupSummaryJs` in `src/aggregator.rs`.
 export interface RegistryGroupSummary {
   name: string
-  groupSeedHex: string
+  groupSeedFingerprintHex: string
   replicas: RegistryReplicaRow[]
 }
 

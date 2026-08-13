@@ -64,6 +64,9 @@ pub const NET_REGISTRY_ERR_SCALE_REJECTED: i32 = 9;
 /// Server doesn't accept dynamic scale (no scale handler
 /// installed).
 pub const NET_REGISTRY_ERR_SCALE_NOT_SUPPORTED: i32 = 10;
+/// Server refused: the caller is not an operator of the target
+/// daemon's aggregator registry. See `RegistryAdminPolicy`.
+pub const NET_REGISTRY_ERR_UNAUTHORIZED: i32 = 11;
 /// Caller-side error: a string argument wasn't valid UTF-8 or
 /// a pointer was null where one was required.
 pub const NET_REGISTRY_ERR_INVALID_ARGS: i32 = 99;
@@ -865,6 +868,10 @@ fn classify(err: &RegistryClientError) -> (i32, String) {
             NET_REGISTRY_ERR_SCALE_NOT_SUPPORTED,
             "daemon doesn't accept dynamic scale (no scaler installed)".to_string(),
         ),
+        RegistryClientError::Server(RegistryRpcError::Unauthorized) => (
+            NET_REGISTRY_ERR_UNAUTHORIZED,
+            "caller is not an operator of the target daemon's aggregator registry".to_string(),
+        ),
     }
 }
 
@@ -877,12 +884,19 @@ fn store_error_detail(h: &RegistryClientHandle, detail: String) {
 }
 
 /// Encode the wire-contract JSON for a slice of registry-group
-/// summaries via `serde_json`. The substrate type
-/// `RegistryGroupSummary` derives `Serialize` but its
-/// `group_seed: [u8; 32]` field serializes as an array of u8 —
-/// the wire contract calls for `group_seed_hex: "abab…"` (64
-/// lowercase hex chars). The proxy wire-types below handle the
-/// rename + hex encoding.
+/// summaries via `serde_json`. The substrate types serialize their
+/// byte arrays as arrays of u8; the proxy wire-types below render them
+/// as hex strings instead.
+///
+/// **Breaking:** `group_seed_hex` (64 chars, the raw seed) is replaced
+/// by `group_seed_fingerprint_hex` (16 chars). The seed
+/// deterministically derives every replica keypair, and a status API
+/// should not carry private key material — see
+/// `RegistryGroupSummary::group_seed_fingerprint`. Consumers using the
+/// old field to correlate groups should use the fingerprint;
+/// consumers using it to *derive replica keys* were relying on
+/// something that is not an authorization primitive and is often
+/// recomputable from the group name anyway.
 fn groups_to_json(groups: &[RegistryGroupSummary]) -> String {
     let wire: Vec<GroupWire<'_>> = groups.iter().map(GroupWire::from).collect();
     serde_json::to_string(&wire).unwrap_or_else(|_| "[]".to_string())
@@ -895,7 +909,7 @@ fn group_to_json(g: &RegistryGroupSummary) -> String {
 #[derive(serde::Serialize)]
 struct GroupWire<'a> {
     name: &'a str,
-    group_seed_hex: String,
+    group_seed_fingerprint_hex: String,
     replicas: Vec<ReplicaWire<'a>>,
 }
 
@@ -911,7 +925,7 @@ impl<'a> From<&'a RegistryGroupSummary> for GroupWire<'a> {
     fn from(g: &'a RegistryGroupSummary) -> Self {
         Self {
             name: g.name.as_str(),
-            group_seed_hex: hex::encode(g.group_seed),
+            group_seed_fingerprint_hex: g.group_seed_fingerprint.to_hex(),
             replicas: g
                 .replicas
                 .iter()
@@ -949,7 +963,9 @@ mod tests {
     fn group_to_json_includes_every_documented_field() {
         let g = RegistryGroupSummary {
             name: "alpha".into(),
-            group_seed: [0xABu8; 32],
+            group_seed_fingerprint: crate::adapter::net::behavior::aggregator::SeedFingerprint::of(
+                &[0xABu8; 32],
+            ),
             source_subnet: crate::adapter::net::subnet::SubnetId::GLOBAL,
             fold_kinds: vec![0x0001],
             replicas: vec![
@@ -969,9 +985,22 @@ mod tests {
         };
         let json = group_to_json(&g);
         assert!(json.contains("\"name\":\"alpha\""));
-        // Each byte 0xAB → "ab"; 32 of them = 64 hex chars
-        // alternating "ab".
-        assert!(json.contains("\"group_seed_hex\":\"abababababababababababababababababababababababababababababababab\""));
+        // The seed itself must never appear: 32 bytes of 0xAB would
+        // render as 64 alternating "ab" chars.
+        let raw_seed_hex = "ab".repeat(32);
+        assert!(
+            !json.contains(&raw_seed_hex),
+            "the raw group seed was rendered into the wire JSON: {json}"
+        );
+        // The fingerprint is present, 16 hex chars, and is NOT a
+        // prefix of the seed rendering.
+        let fp =
+            crate::adapter::net::behavior::aggregator::SeedFingerprint::of(&[0xABu8; 32]).to_hex();
+        assert_eq!(fp.len(), 16);
+        assert!(
+            json.contains(&format!("\"group_seed_fingerprint_hex\":\"{fp}\"")),
+            "missing group_seed_fingerprint_hex in {json}"
+        );
         assert!(json.contains("\"generation\":42"));
         assert!(json.contains("\"healthy\":true"));
         assert!(json.contains("\"diagnostic\":null"));

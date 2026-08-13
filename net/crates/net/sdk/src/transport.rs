@@ -70,7 +70,7 @@ pub use net::adapter::net::dataforts::blob::{
 // the server-side error variants for matching. [`serve_blob_transfer_rpc`]
 // (below) installs the matching handler.
 pub use net::adapter::net::dataforts::blob::{
-    BlobTransferClient, TransferClientError, TransferRpcError, TransferStatus,
+    BlobTransferClient, TransferAdminPolicy, TransferClientError, TransferRpcError, TransferStatus,
 };
 // Returned by [`serve_blob_transfer_rpc`]; the caller holds it to keep the
 // RPC registered (drop = stop answering).
@@ -197,9 +197,43 @@ pub fn serve_blob_transfer(mesh: &Mesh, adapter: Arc<MeshBlobAdapter>) {
 /// query and cancel this node's in-flight, requester-side transfers.
 /// Returns the [`ServeHandle`]; **hold it** for as long as the RPC should
 /// answer (dropping it stops the RPC; the engine itself stays installed).
+///
+/// Every remote request is refused —
+/// [`TransferAdminPolicy::Closed`] — because this overload has no way
+/// to tell an operator from any other admitted peer. Use
+/// [`serve_blob_transfer_rpc_with_policy`] to name them.
 pub fn serve_blob_transfer_rpc(
     mesh: &Mesh,
     adapter: Arc<MeshBlobAdapter>,
+) -> Result<ServeHandle, ServeError> {
+    serve_blob_transfer_rpc_with_policy(mesh, adapter, TransferAdminPolicy::default())
+}
+
+/// [`serve_blob_transfer_rpc`] with an explicit authority policy.
+///
+/// `blob.transfers` exposes in-flight stream ids, holder identities
+/// and expected content hashes, and its `Cancel` verb fails the
+/// *owner's* fetch — so it is an operator surface, not a public one,
+/// and mesh admission is not a sufficient boundary for it:
+///
+/// ```no_run
+/// # use std::sync::Arc;
+/// # use net_sdk::mesh::Mesh;
+/// # use net_sdk::transport::serve_blob_transfer_rpc_with_policy;
+/// # use net::adapter::net::dataforts::blob::{MeshBlobAdapter, TransferAdminPolicy};
+/// # fn f(mesh: &Mesh, adapter: Arc<MeshBlobAdapter>, ops_node: u64)
+/// # -> Result<(), Box<dyn std::error::Error>> {
+/// let _handle = serve_blob_transfer_rpc_with_policy(
+///     mesh,
+///     adapter,
+///     TransferAdminPolicy::operators([ops_node]),
+/// )?;
+/// # Ok(()) }
+/// ```
+pub fn serve_blob_transfer_rpc_with_policy(
+    mesh: &Mesh,
+    adapter: Arc<MeshBlobAdapter>,
+    policy: TransferAdminPolicy,
 ) -> Result<ServeHandle, ServeError> {
     // Install the engine (and hold its handle so the RPC reports on the
     // exact registry doing the fetches), then serve the handler through
@@ -211,9 +245,9 @@ pub fn serve_blob_transfer_rpc(
     let engine = mesh.node().serve_blob_transfer(adapter);
     mesh.serve_rpc(
         net::adapter::net::dataforts::blob::TRANSFER_SERVICE,
-        Arc::new(net::adapter::net::dataforts::blob::TransferRpcHandler::new(
-            engine,
-        )),
+        Arc::new(
+            net::adapter::net::dataforts::blob::TransferRpcHandler::with_policy(engine, policy),
+        ),
     )
 }
 

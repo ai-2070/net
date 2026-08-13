@@ -10,7 +10,34 @@ and output shape.
 
 ## Unreleased — targets 0.35.0
 
+> **Security defaults changed.** Seven defaults went fail-closed in this
+> release, several of which will stop a working remote-administration
+> setup on upgrade. See
+> [`docs/SECURITY_DEFAULTS_0.35.md`](../docs/SECURITY_DEFAULTS_0.35.md) —
+> in particular the operator-identity workflow, which is what the new
+> node-id allowlists key on.
+
 ### Breaking
+
+- **`--identity` now also fixes the CLI's mesh `node_id`.** Previously it
+  set only the operator identity used for signing; the attached mesh came
+  up anonymous with a fresh id every run. Remote-administration surfaces
+  now authorize on that id, so an allowlisted operator must pass
+  `--identity`.
+
+  Two consequences worth knowing:
+
+  - Without `--identity` the CLI stays anonymous, and any node-id
+    allowlist will refuse it. That is a non-zero exit saying
+    `not authorized`, not a hang.
+  - Two concurrent invocations sharing one identity now share a
+    `node_id`, and the daemon's peer map is keyed on it — the second
+    attach displaces the first. Give unattended automation its own
+    identity rather than reusing a human operator's.
+
+- **`net-mesh identity show` gained `node_id_hex`.** Additive to the JSON
+  shape, but scripts asserting on an exact key set will need updating. It
+  is the value that goes in an operator allowlist.
 
 - **`net-mesh snapshot get` and `net-mesh snapshot status` now require
   `--local`.** Without it they exit 2 with an explanation instead of printing

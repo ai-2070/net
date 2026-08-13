@@ -51,8 +51,8 @@ use clap::Parser;
 use serde::Deserialize;
 
 use net::adapter::net::behavior::aggregator::{
-    snapshot_group, AggregatorConfig, AggregatorDaemon, AggregatorRegistry, RegistryRpcError,
-    SpawnFn,
+    snapshot_group, AggregatorConfig, AggregatorDaemon, AggregatorRegistry, RegistryAdminPolicy,
+    RegistryRpcError, SpawnFn,
 };
 use net::adapter::net::behavior::fold::capability::CapabilityFold;
 use net::adapter::net::behavior::fold::reservation::ReservationFold;
@@ -91,6 +91,16 @@ pub struct Cli {
     /// debug, `-vvv` = trace.
     #[arg(long, short, action = clap::ArgAction::Count)]
     pub verbose: u8,
+    /// Read the config even when it is group/world-accessible or
+    /// owned by another user.
+    ///
+    /// The config holds `psk_hex`, the mesh-membership root secret, so
+    /// the daemon refuses such a file by default: another local user
+    /// who can read it can join the mesh. Use this only where the
+    /// deployment genuinely cannot satisfy owner-only permissions, and
+    /// understand that it means the PSK is exposed.
+    #[arg(long, default_value_t = false)]
+    pub insecure_permissions: bool,
 }
 
 /// Top-level TOML config shape.
@@ -115,6 +125,73 @@ struct Config {
     /// boundary at the operator's config file.
     #[serde(default, rename = "template")]
     templates: Vec<TemplateConfig>,
+    /// Node ids allowed to drive the `aggregator.registry` RPC —
+    /// `List`, `Spawn`, `Scale`, `Unregister`.
+    ///
+    /// Empty (the default) refuses every remote request. The
+    /// template list above bounds *what* can be deployed; this
+    /// bounds *who* can deploy it, and before it existed the answer
+    /// was "anyone holding the PSK". That matters when the PSK admits
+    /// nodes that are not aggregation operators: such a peer could
+    /// stop summary groups, resize them, spawn more from configured
+    /// templates until the host ran out of resources, and read group
+    /// status. It could never forge the signed source announcements
+    /// the summaries are computed from.
+    ///
+    /// Accepts decimal or `0x`-prefixed hex, matching the CLI's
+    /// `--node-id`.
+    ///
+    /// ```toml
+    /// operators = ["0x1a2b3c4d5e6f7788"]
+    /// ```
+    ///
+    /// Set `operators_any_admitted_peer = true` instead if mesh
+    /// membership *is* operator membership in this deployment — a
+    /// real model, but one worth stating out loud.
+    #[serde(default)]
+    operators: Vec<String>,
+    /// Accept registry administration from any admitted mesh peer.
+    /// The pre-0.35 behaviour; mutually exclusive with a non-empty
+    /// `operators` list.
+    #[serde(default)]
+    operators_any_admitted_peer: bool,
+    /// Maximum groups this daemon will host, counting those spawned
+    /// from `[[group]]` at startup and those deployed later over RPC.
+    ///
+    /// `Spawn` takes a caller-chosen `group_name`, so distinct names
+    /// never collide and nothing else bounds how many groups a caller
+    /// can create. Combined with `max_replica_count` below, this caps
+    /// the resources one caller can commit. Defaults to
+    /// [`DEFAULT_MAX_GROUPS`].
+    #[serde(default = "default_max_groups")]
+    max_groups: usize,
+    /// Maximum replicas in any one group, for both `Spawn` and
+    /// `Scale`.
+    ///
+    /// `replica_count` is a `u8` validated only as non-zero, so a
+    /// single request could ask for 255 replicas. Defaults to
+    /// [`DEFAULT_MAX_REPLICA_COUNT`]; raise it deliberately if a
+    /// deployment genuinely needs wider groups.
+    #[serde(default = "default_max_replica_count")]
+    max_replica_count: u8,
+}
+
+/// Default ceiling on hosted groups. Generous for the intended
+/// workload — a handful of fold summaries per daemon — while keeping
+/// an unattended daemon from being talked into unbounded growth.
+pub const DEFAULT_MAX_GROUPS: usize = 64;
+
+/// Default ceiling on replicas per group. Summary reducers are
+/// replicated for availability, not throughput, so single digits is
+/// the normal range; the wire type allows 255.
+pub const DEFAULT_MAX_REPLICA_COUNT: u8 = 16;
+
+fn default_max_groups() -> usize {
+    DEFAULT_MAX_GROUPS
+}
+
+fn default_max_replica_count() -> u8 {
+    DEFAULT_MAX_REPLICA_COUNT
 }
 
 /// Per-group config section spawned at startup. Carries the
@@ -158,6 +235,39 @@ struct TemplateConfig {
     summary_interval_ms: u64,
 }
 
+/// Resolve the config's operator settings into a
+/// [`RegistryAdminPolicy`].
+///
+/// Refuses a config that sets both `operators` and
+/// `operators_any_admitted_peer`: picking one silently would leave the
+/// operator believing the other applied, and in one direction that is
+/// a wide-open registry they thought they had locked down.
+fn resolve_admin_policy(config: &Config) -> Result<RegistryAdminPolicy, DaemonError> {
+    if config.operators_any_admitted_peer {
+        if !config.operators.is_empty() {
+            return Err(DaemonError::OperatorPolicyAmbiguous);
+        }
+        return Ok(RegistryAdminPolicy::AnyAdmittedPeer);
+    }
+    let mut ids = Vec::with_capacity(config.operators.len());
+    for (index, raw) in config.operators.iter().enumerate() {
+        let trimmed = raw.trim();
+        let parsed = match trimmed
+            .strip_prefix("0x")
+            .or_else(|| trimmed.strip_prefix("0X"))
+        {
+            Some(hex) => u64::from_str_radix(hex, 16),
+            None => trimmed.parse::<u64>(),
+        };
+        ids.push(parsed.map_err(|e| DaemonError::OperatorIdInvalid {
+            index,
+            raw: raw.clone(),
+            error: e.to_string(),
+        })?);
+    }
+    Ok(RegistryAdminPolicy::operators(ids))
+}
+
 /// Daemon startup errors. Cover config parsing, MeshNode boot,
 /// and group registration in one typed surface so the binary's
 /// `main` exit code maps cleanly.
@@ -168,10 +278,37 @@ pub enum DaemonError {
         path: PathBuf,
         error: std::io::Error,
     },
-    #[error("parse config: {0}")]
-    ConfigParse(toml::de::Error),
+    /// The config file was refused before being read: it is not a
+    /// regular file, is owned by another user, or is group/world
+    /// accessible. It holds the mesh PSK. Pass
+    /// `--insecure-permissions` to override.
+    #[error("{0}")]
+    ConfigPermissions(net::adapter::net::secret_file::SecretFileError),
+    /// The config file is not valid TOML.
+    ///
+    /// SEC-06 / LINUX-03: deliberately carries no `toml::de::Error`.
+    /// That type's `Display` embeds the offending source line, and
+    /// this config holds `psk_hex` — the mesh-membership root secret.
+    /// `main` logs this error, so a malformed PSK line would land in
+    /// journald or a container log stream, read by a far wider set of
+    /// people than the config file itself.
+    ///
+    /// The path is retained; the parser's line/column is the cost.
+    #[error("config {path:?} is not valid TOML (kind: parse_error)")]
+    ConfigParse { path: PathBuf },
     #[error("psk_hex must decode to 32 bytes: {0}")]
     PskInvalid(String),
+    #[error("operators[{index}]: {raw:?} is not a node id ({error})")]
+    OperatorIdInvalid {
+        index: usize,
+        raw: String,
+        error: String,
+    },
+    #[error(
+        "config sets both `operators` and `operators_any_admitted_peer = true`; \
+         these contradict — remove one"
+    )]
+    OperatorPolicyAmbiguous,
     #[error("listen address {addr:?} is not a valid SocketAddr: {error}")]
     ListenAddrInvalid {
         addr: String,
@@ -283,22 +420,32 @@ pub struct BootedDaemon {
 /// embedders that need to drive their own shutdown.
 pub async fn boot(cli: Cli) -> Result<BootedDaemon, DaemonError> {
     // Parse config.
-    let raw =
-        tokio::fs::read_to_string(&cli.config)
-            .await
-            .map_err(|e| DaemonError::ConfigRead {
-                path: cli.config.clone(),
-                error: e,
-            })?;
+    //
+    // SEC-05 / LINUX-02: the permission check is the *opener*, not an
+    // advisory pass afterwards. This file holds `psk_hex` — the
+    // mesh-membership root secret — so a mode that lets another local
+    // user read it is not a warning-level event: that user can join
+    // the mesh, and from there reach every service admission gates on
+    // membership alone. The daemon used to warn and boot anyway.
+    //
+    // Validating the opened descriptor rather than the path also
+    // closes the swap-between-check-and-read window the previous
+    // `metadata(path)` + `read_to_string(path)` pair left open.
+    let config_path = cli.config.clone();
+    let insecure = cli.insecure_permissions;
+    let raw = tokio::task::spawn_blocking(move || {
+        net::adapter::net::secret_file::read_secret_file_to_string(&config_path, insecure)
+    })
+    .await
+    .map_err(|e| DaemonError::ConfigRead {
+        path: cli.config.clone(),
+        error: std::io::Error::other(e),
+    })?
+    .map_err(DaemonError::ConfigPermissions)?;
 
-    // The config holds the mesh PSK; warn if it's readable by other
-    // local users (advisory — see `warn_if_config_world_readable`).
-    // Checked here, *before* parsing: a malformed config still exposed
-    // the PSK on disk, so the operator must hear about loose perms even
-    // when boot is about to fail on a `ConfigParse` error.
-    warn_if_config_world_readable(&cli.config).await;
-
-    let config: Config = toml::from_str(&raw).map_err(DaemonError::ConfigParse)?;
+    let config: Config = toml::from_str(&raw).map_err(|_| DaemonError::ConfigParse {
+        path: cli.config.clone(),
+    })?;
 
     // CLI listen override.
     let listen = cli.listen.unwrap_or(config.listen.clone());
@@ -308,6 +455,7 @@ pub async fn boot(cli: Cli) -> Result<BootedDaemon, DaemonError> {
             error: e,
         })?;
     let psk = decode_psk(&config.psk_hex)?;
+    let admin_policy = resolve_admin_policy(&config)?;
 
     // Boot the MeshNode, install the registry, expose the RPC
     // service. Order matters: `set_aggregator_registry`
@@ -327,10 +475,24 @@ pub async fn boot(cli: Cli) -> Result<BootedDaemon, DaemonError> {
     // registry, then install the registry service with both
     // handlers. Templates and the mesh handle are captured by
     // each closure for the daemon's lifetime.
-    let spawner = make_spawner(config.templates.clone(), registry.clone(), mesh.clone());
-    let scaler = make_scaler(config.templates.clone(), registry.clone(), mesh.clone());
+    let limits = SpawnLimits {
+        max_groups: config.max_groups,
+        max_replica_count: config.max_replica_count,
+    };
+    let spawner = make_spawner(
+        config.templates.clone(),
+        registry.clone(),
+        mesh.clone(),
+        limits,
+    );
+    let scaler = make_scaler(
+        config.templates.clone(),
+        registry.clone(),
+        mesh.clone(),
+        limits,
+    );
     let serve = registry
-        .install_registry_service_with_handlers(&mesh, spawner, scaler)
+        .install_registry_service_with_handlers(&mesh, spawner, scaler, admin_policy)
         .map_err(|e| DaemonError::Serve(format!("{e:?}")))?;
 
     let bound_addr = mesh.local_addr();
@@ -642,10 +804,56 @@ fn resolve_template(
         .ok_or_else(|| RegistryRpcError::UnknownTemplate(name.to_string()))
 }
 
+/// Refuse a spawn/scale that would exceed the daemon's configured
+/// ceilings.
+///
+/// `group_name` is caller-chosen, so distinct names never collide and
+/// nothing else bounds how many groups one caller can create;
+/// `replica_count` is a `u8` validated only as non-zero, so one
+/// request could ask for 255. Neither is a privilege-escalation
+/// vector — the templates bound *what* runs — but together they are a
+/// straightforward way to exhaust a host, which is the surviving
+/// concrete impact of the registry being reachable at all.
+///
+/// `current_groups` is `None` for a scale (which does not add a
+/// group).
+fn check_spawn_limits(
+    limits: SpawnLimits,
+    replica_count: u8,
+    current_groups: Option<usize>,
+) -> Result<(), RegistryRpcError> {
+    if replica_count > limits.max_replica_count {
+        return Err(RegistryRpcError::SpawnRejected(format!(
+            "replica_count {replica_count} exceeds this daemon's max_replica_count \
+             ({}); raise it in the daemon config if that is intended",
+            limits.max_replica_count
+        )));
+    }
+    if let Some(current) = current_groups {
+        if current >= limits.max_groups {
+            return Err(RegistryRpcError::SpawnRejected(format!(
+                "daemon already hosts {current} groups, at its max_groups limit \
+                 ({}); unregister one or raise the limit in the daemon config",
+                limits.max_groups
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The two spawn/scale ceilings, copied out of the config so the
+/// spawn and scale closures can each own one.
+#[derive(Debug, Clone, Copy)]
+struct SpawnLimits {
+    max_groups: usize,
+    max_replica_count: u8,
+}
+
 fn make_spawner(
     templates: Vec<TemplateConfig>,
     registry: Arc<AggregatorRegistry>,
     mesh: Arc<MeshNode>,
+    limits: SpawnLimits,
 ) -> SpawnFn {
     let by_name = build_template_index(templates);
     Box::new(move |req| {
@@ -653,6 +861,7 @@ fn make_spawner(
         let mesh = mesh.clone();
         let by_name = by_name.clone();
         Box::pin(async move {
+            check_spawn_limits(limits, req.replica_count, Some(registry.entries().len()))?;
             let template = resolve_template(&by_name, &req.template_name)?;
             let spec = AggregatorSpec::from_template(
                 &template,
@@ -685,6 +894,7 @@ fn make_scaler(
     templates: Vec<TemplateConfig>,
     registry: Arc<AggregatorRegistry>,
     mesh: Arc<MeshNode>,
+    limits: SpawnLimits,
 ) -> net::adapter::net::behavior::aggregator::ScaleFn {
     let by_name = build_template_index(templates);
     Box::new(move |req| {
@@ -692,6 +902,13 @@ fn make_scaler(
         let mesh = mesh.clone();
         let by_name = by_name.clone();
         Box::pin(async move {
+            // Scale adds no group, so only the per-group ceiling
+            // applies — but it applies here too, or Spawn(16) followed
+            // by Scale(255) would walk straight around it.
+            check_spawn_limits(limits, req.target_replica_count, None).map_err(|e| match e {
+                RegistryRpcError::SpawnRejected(m) => RegistryRpcError::ScaleRejected(m),
+                other => other,
+            })?;
             let template = resolve_template(&by_name, &req.template_name)?;
             // Build the spec from the template + supplied group
             // name. `replica_count` here is the *target* — used
@@ -827,60 +1044,16 @@ fn decode_psk(s: &str) -> Result<[u8; 32], DaemonError> {
     decode_hex_32(s).map_err(DaemonError::PskInvalid)
 }
 
-/// Warn (don't fail) if the daemon config is group- or
-/// world-readable. The config holds `psk_hex` — the mesh
-/// pre-shared key that gates every handshake — so a permissive
-/// mode is the same exposure `cli/identity.rs::check_strict_permissions`
-/// guards its seed against. The detection rule (mode `& 0o077`) is
-/// deliberately identical; the *policy* differs: the CLI fails closed
-/// because it created the seed at 0600, whereas the daemon config is
-/// operator-authored and may live under a deployment's own permission
-/// scheme, so we only warn. Kept as a separate local check rather than
-/// a shared cross-crate helper because the CLI reaches this crate only
-/// transitively (via `net-sdk`) and the shared kernel is two lines.
-#[cfg(unix)]
-async fn warn_if_config_world_readable(path: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let meta = match tokio::fs::metadata(path).await {
-        Ok(m) => m,
-        // Couldn't stat the file we just read — surface it (don't go
-        // silent) so a missing exposure check is at least observable.
-        Err(e) => {
-            tracing::debug!(
-                config = %path.display(),
-                error = %e,
-                "could not stat aggregator config to check permissions; \
-                 skipping the PSK-exposure check",
-            );
-            return;
-        }
-    };
-    let mode = meta.permissions().mode() & 0o777;
-    // Group/other readable (or writable) → the PSK is exposed.
-    if mode & 0o077 != 0 {
-        tracing::warn!(
-            config = %path.display(),
-            mode = format!("{mode:#o}"),
-            "aggregator config is group/world-accessible but holds the mesh \
-             PSK (psk_hex); tighten to 0600 so the pre-shared key isn't \
-             readable by other local users",
-        );
-    }
-}
-
-/// Non-Unix has no clean mode bits via `std::fs`, so the permission
-/// gate can't run — but stay loud about it rather than silent (parity
-/// with the CLI's Windows branch), since the PSK-bearing config is just
-/// as exposable under a permissive NTFS ACL.
-#[cfg(not(unix))]
-async fn warn_if_config_world_readable(path: &std::path::Path) {
-    tracing::warn!(
-        config = %path.display(),
-        "aggregator config permission check is a no-op on this platform; \
-         the file holds the mesh PSK (psk_hex) — restrict its ACL so it \
-         isn't readable by other local users",
-    );
-}
+// SEC-05 / LINUX-02: `warn_if_config_world_readable` lived here and
+// warned-then-booted on a group/world-accessible config. It is gone,
+// not relocated: `boot` now reads the config through
+// `secret_file::read_secret_file_to_string`, which refuses such a file
+// outright (and additionally checks owner and file type, on the opened
+// descriptor rather than the path). The old comment argued the daemon
+// should only warn because the config is operator-authored — but the
+// file holds the mesh PSK, and an operator who has not tightened it
+// has exposed mesh membership, which is not a warning-level outcome.
+// `--insecure-permissions` is the deliberate opt-out.
 
 fn decode_seed(s: &str) -> Result<[u8; 32], String> {
     decode_hex_32(s)
@@ -925,6 +1098,151 @@ mod tests {
     // (which has its own tests under
     // `adapter::net::subnet::id::tests`). No daemon-local
     // duplicates here.
+
+    /// SEC-06 / LINUX-03 witness. A malformed `psk_hex` line must not
+    /// reach the daemon log.
+    ///
+    /// `main` logs this error, so on a systemd host it lands in
+    /// journald and on a container host in the log stream — read by a
+    /// far wider set of people than the `0600` config file is. The
+    /// `toml::de::Error` this used to carry embeds the offending
+    /// source line, which is the mesh-membership root secret.
+    #[tokio::test]
+    async fn a_malformed_psk_line_is_not_reproduced_in_the_boot_error() {
+        const SENTINEL: &str = "PSK_SENTINEL_0123456789abcdef";
+
+        let dir = std::env::temp_dir().join(format!("net-sec06-agg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("aggregator.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "listen = \"127.0.0.1:0\"
+psk_hex = \"{SENTINEL}\" trailing
+"
+            ),
+        )
+        .expect("write config");
+        // The SEC-05 gate runs before parsing, and `std::fs::write`
+        // leaves the umask default (typically 0o644) — which the gate
+        // correctly refuses, since this file holds `psk_hex`. This test
+        // is about the parse error's redaction, so give it a file the
+        // gate accepts. No-op off Unix, where the gate only warns.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("chmod 600");
+        }
+
+        let cli = Cli {
+            config: path.clone(),
+            listen: None,
+            print_bootstrap: false,
+            verbose: 0,
+            insecure_permissions: false,
+        };
+        // Not `expect_err`: `BootedDaemon` is not `Debug`, and it owns
+        // a live MeshNode — deriving Debug on it to satisfy a test
+        // would be the tail wagging the dog.
+        let err = match boot(cli).await {
+            Err(e) => e,
+            Ok(_) => panic!("malformed TOML must fail boot"),
+        };
+
+        // Display and Debug both: `main` may render either, and `{:?}`
+        // on a `#[source]`-carrying error walks the whole chain.
+        let rendered = format!("{err} | {err:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the mesh PSK was reproduced in the boot error: {rendered}"
+        );
+        assert!(
+            rendered.contains("parse_error"),
+            "the sanitized error dropped its category: {rendered}"
+        );
+        assert!(
+            rendered.contains("aggregator.toml"),
+            "the sanitized error dropped the path, leaving nothing to act on: {rendered}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn operators_default_to_closed() {
+        let cfg = parse_config_for_test("listen = \"127.0.0.1:0\"\npsk_hex = \"aa\"\n");
+        let policy = resolve_admin_policy(&cfg).expect("policy");
+        assert!(
+            !policy.permits(0xAAAA),
+            "a config that names no operators must refuse everyone — anything else \
+             hands registry administration to whoever holds the PSK"
+        );
+    }
+
+    #[test]
+    fn named_operators_are_the_only_ones_permitted() {
+        let cfg = parse_config_for_test(
+            "listen = \"127.0.0.1:0\"\npsk_hex = \"aa\"\noperators = [\"0x1234\", \"9\"]\n",
+        );
+        let policy = resolve_admin_policy(&cfg).expect("policy");
+        assert!(policy.permits(0x1234), "hex operator id not accepted");
+        assert!(policy.permits(9), "decimal operator id not accepted");
+        assert!(!policy.permits(0x9999), "an unnamed node was permitted");
+    }
+
+    #[test]
+    fn an_empty_operators_list_is_not_a_synonym_for_everyone() {
+        let cfg =
+            parse_config_for_test("listen = \"127.0.0.1:0\"\npsk_hex = \"aa\"\noperators = []\n");
+        let policy = resolve_admin_policy(&cfg).expect("policy");
+        assert!(
+            !policy.permits(0xAAAA),
+            "writing the key and leaving it empty must not widen access"
+        );
+    }
+
+    #[test]
+    fn the_open_policy_must_be_asked_for_by_name() {
+        let cfg = parse_config_for_test(
+            "listen = \"127.0.0.1:0\"\npsk_hex = \"aa\"\noperators_any_admitted_peer = true\n",
+        );
+        let policy = resolve_admin_policy(&cfg).expect("policy");
+        assert!(policy.permits(0xAAAA));
+    }
+
+    #[test]
+    fn contradictory_operator_config_is_refused_rather_than_guessed() {
+        let cfg = parse_config_for_test(
+            "listen = \"127.0.0.1:0\"\npsk_hex = \"aa\"\noperators = [\"1\"]\n\
+             operators_any_admitted_peer = true\n",
+        );
+        // Silently picking one would leave the operator believing the
+        // other applied — in one direction that is a wide-open
+        // registry they thought they had locked down.
+        assert!(matches!(
+            resolve_admin_policy(&cfg),
+            Err(DaemonError::OperatorPolicyAmbiguous)
+        ));
+    }
+
+    #[test]
+    fn a_malformed_operator_id_names_its_index() {
+        let cfg = parse_config_for_test(
+            "listen = \"127.0.0.1:0\"\npsk_hex = \"aa\"\noperators = [\"1\", \"nope\"]\n",
+        );
+        match resolve_admin_policy(&cfg) {
+            Err(DaemonError::OperatorIdInvalid { index, raw, .. }) => {
+                assert_eq!(index, 1);
+                assert_eq!(raw, "nope");
+            }
+            other => panic!("expected OperatorIdInvalid, got {other:?}"),
+        }
+    }
+
+    fn parse_config_for_test(text: &str) -> Config {
+        toml::from_str(text).expect("test config must parse")
+    }
 
     #[test]
     fn decode_psk_accepts_64_char_hex() {
@@ -1064,6 +1382,167 @@ mod tests {
                 assert!(error.contains("fold_kinds"), "msg was: {error}");
             }
             other => panic!("expected AggregatorConfig, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod spawn_limit_tests {
+    use super::*;
+
+    fn limits() -> SpawnLimits {
+        SpawnLimits {
+            max_groups: 2,
+            max_replica_count: 4,
+        }
+    }
+
+    /// Kyra's 2026-08-11 note: repeated `Spawn` with distinct group
+    /// names, each asking for up to 255 replicas, is the surviving
+    /// concrete impact of the registry being reachable. `group_name`
+    /// is caller-chosen so names never collide, and `replica_count` is
+    /// a `u8` validated only as non-zero.
+    ///
+    /// This is the deterministic form of that witness: it shows the
+    /// arithmetic the caps refuse, without booting 255 replicas.
+    #[test]
+    fn spawn_is_refused_past_the_group_and_replica_ceilings() {
+        // The 255-replica single request.
+        let err = check_spawn_limits(limits(), 255, Some(0))
+            .expect_err("255 replicas in one request must be refused");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("max_replica_count"),
+            "the refusal should name the limit an operator can raise: {msg}"
+        );
+
+        // The repeated-distinct-name growth.
+        assert!(
+            check_spawn_limits(limits(), 1, Some(2)).is_err(),
+            "a daemon at its group ceiling accepted another group"
+        );
+
+        // Within both ceilings, spawn proceeds.
+        check_spawn_limits(limits(), 4, Some(1)).expect("a request inside both limits");
+        check_spawn_limits(limits(), 1, Some(0)).expect("the first group");
+    }
+
+    /// Scale must carry the per-group ceiling too. Without it,
+    /// `Spawn(4)` then `Scale(255)` walks straight around the spawn
+    /// check — the limit would bound the front door and leave the
+    /// window open.
+    #[test]
+    fn scale_cannot_exceed_the_replica_ceiling_the_spawn_enforced() {
+        assert!(
+            check_spawn_limits(limits(), 255, None).is_err(),
+            "scale to 255 replicas was permitted past max_replica_count"
+        );
+        // No group is added by a scale, so the group ceiling must not
+        // fire — a daemon sitting at max_groups can still resize what
+        // it already hosts.
+        check_spawn_limits(limits(), 4, None).expect("resize at the group ceiling");
+    }
+
+    /// The defaults have to be finite and sane; a config that omits
+    /// them must not read as "unlimited".
+    #[test]
+    fn omitted_limits_default_to_finite_ceilings() {
+        let cfg: Config =
+            toml::from_str("listen = \"127.0.0.1:0\"\npsk_hex = \"aa\"\n").expect("config parses");
+        assert_eq!(cfg.max_groups, DEFAULT_MAX_GROUPS);
+        assert_eq!(cfg.max_replica_count, DEFAULT_MAX_REPLICA_COUNT);
+        assert!(cfg.max_groups > 0 && cfg.max_replica_count > 0);
+        assert!(
+            cfg.max_replica_count < u8::MAX,
+            "the default must be below the wire maximum, or it bounds nothing"
+        );
+    }
+}
+
+#[cfg(test)]
+mod secret_file_gate_tests {
+    use super::*;
+
+    /// SEC-05 / LINUX-02 witness. A group/world-accessible config must
+    /// stop the daemon, not merely annoy it.
+    ///
+    /// The file holds `psk_hex` — the mesh-membership root secret — so
+    /// a mode another local user can read is not a warning-level
+    /// event: that user can join the mesh, and mesh membership is what
+    /// several services admit on. The daemon used to log a warning and
+    /// boot anyway.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_world_readable_config_stops_the_daemon() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("net-sec05-agg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("aggregator.toml");
+        std::fs::write(
+            &path,
+            "listen = \"127.0.0.1:0\"\npsk_hex = \"00112233445566778899aabbccddeeff\
+             00112233445566778899aabbccddeeff\"\n",
+        )
+        .expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        let cli = Cli {
+            config: path.clone(),
+            listen: None,
+            print_bootstrap: false,
+            verbose: 0,
+            insecure_permissions: false,
+        };
+        match boot(cli).await {
+            Err(DaemonError::ConfigPermissions(e)) => {
+                assert_eq!(e.kind(), "permissive_mode", "got {e}");
+            }
+            Err(other) => panic!("expected a permission refusal, got {other:?}"),
+            Ok(_) => panic!("the daemon booted from a world-readable config holding the mesh PSK"),
+        }
+
+        // The named override still boots it — the point is that an
+        // operator has to ask.
+        let cli = Cli {
+            config: path.clone(),
+            listen: None,
+            print_bootstrap: false,
+            verbose: 0,
+            insecure_permissions: true,
+        };
+        // Booting is the whole assertion; dropping tears the node down
+        // (the `ServeHandle`'s Drop un-installs the service, and the
+        // node was never `start()`ed). Calling `shutdown()` here would
+        // need the `Adapter` trait in scope for no gain.
+        drop(
+            boot(cli)
+                .await
+                .expect("--insecure-permissions must still boot"),
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Platform-independent: a config the daemon itself could not open
+    /// is a typed refusal naming the path, not a panic or a silent
+    /// default.
+    #[tokio::test]
+    async fn a_missing_config_is_a_typed_error() {
+        let cli = Cli {
+            config: std::path::PathBuf::from("/nonexistent/net-sec05/aggregator.toml"),
+            listen: None,
+            print_bootstrap: false,
+            verbose: 0,
+            insecure_permissions: false,
+        };
+        // Not `{other:?}`: `BootedDaemon` is not Debug, and deriving
+        // it to satisfy a test would mean rendering a live MeshNode.
+        match boot(cli).await {
+            Err(DaemonError::ConfigPermissions(e)) => assert_eq!(e.kind(), "io"),
+            Err(DaemonError::ConfigRead { .. }) => {}
+            Err(other) => panic!("expected a typed read failure, got {other:?}"),
+            Ok(_) => panic!("booted from a nonexistent config"),
         }
     }
 }

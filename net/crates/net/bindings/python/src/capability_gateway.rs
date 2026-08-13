@@ -38,10 +38,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::runtime_guard::GuardedRuntime;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use serde_json::{json, Value};
-use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 
 use net_mcp::serve::{
@@ -501,7 +501,7 @@ struct GatewayState {
     /// was configured with — carried so a reconstructed engine matches.
     spend_profile: String,
     /// The mesh's own runtime — where the node's socket + timers live.
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
 }
 
 /// Payment kwargs, collected before the cfg boundary so both gateway

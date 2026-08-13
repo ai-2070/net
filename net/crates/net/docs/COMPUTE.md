@@ -94,6 +94,32 @@ Events arriving during migration are buffered and replayed after restore. This e
 
 `MigrationOrchestrator` coordinates the full 6-phase lifecycle from a controller node (which may be the source, target, or a third party). It tracks in-flight migrations, manages phase transitions, and produces outbound messages for the source and target handlers.
 
+#### Who may orchestrate
+
+`TakeSnapshot` is the message that *establishes* the orchestrator binding for a daemon. Every later message is checked against a principal recorded earlier in the migration (`SnapshotReady`, `CleanupComplete` and `ActivateTarget` all reject a sender that isn't the recorded one), but the first message has nothing to check against — so the source decides by policy.
+
+Handling `TakeSnapshot` is a privileged operation: the source snapshots the named daemon, returns the chunks to the sender, and — when identity transport is enabled — seals the daemon's private Ed25519 seed to whatever `target_node` the *sender* named. Mesh admission is not a sufficient boundary for that, so `MigrationOrchestratorPolicy` gates it:
+
+| Variant | Accepts `TakeSnapshot` from |
+|---|---|
+| `LocalOnly` (default) | this node only |
+| `Allowlist(nodes)` | this node plus the named nodes |
+| `AnyAdmittedPeer` | any peer that completed the handshake |
+
+The default is fail-closed, so a **cross-node migration requires the source to name its orchestrator**:
+
+```rust
+runtime.set_migration_orchestrator_policy(
+    MigrationOrchestratorPolicy::allowlist([control_plane_node]),
+)?;
+```
+
+Call it before `DaemonRuntime::start()`; the policy is captured when the subprotocol handler is installed, and setting it later returns an error rather than silently not applying. A refused request gets a `MigrationFailed` reply naming the reason, so a misconfigured orchestrator fails loudly instead of timing out.
+
+An empty allowlist means "no remote orchestrators", not "all" — the unconfigured case never widens access. `AnyAdmittedPeer` restores the pre-0.35 behaviour and is defensible only where the PSK is held exclusively by trusted operators.
+
+This is a deployment control, not a transferable authority: it cannot express delegation, expiry, or per-daemon scope. An issuer-signed migration entitlement binding subject, source origin, target, permitted phases and validity remains the complete design.
+
 ```
                   ┌─────────────────────────┐
                   │  MigrationOrchestrator   │
@@ -191,7 +217,7 @@ With all six phases wired over the subprotocol, a daemon's *worldline* — its c
 
 - **Host crash before `SnapshotReady`.** If the source dies before it produces a snapshot the orchestrator can forward, there is no state to migrate. `ReplicaGroup` / `StandbyGroup` are the answer for workloads that cannot tolerate this — they keep a warm copy running.
 - **Keypair transport.** The target's `DaemonFactoryRegistry` must already carry the daemon's `EntityKeypair` — today that's an out-of-band provisioning step, intentionally out of scope for this subprotocol. Treating the private key as sensitive, and moving it from source to target securely at migration time, is a separate security problem.
-- **Byzantine orchestrators.** A malicious orchestrator could instruct targets to drop the daemon (`MigrationFailed`) or redirect to an attacker-controlled node. Orchestrator trust is a deployment concern, not a protocol guarantee.
+- **Byzantine orchestrators.** A malicious orchestrator could instruct targets to drop the daemon (`MigrationFailed`) or redirect to an attacker-controlled node. Orchestrator trust is a deployment concern, not a protocol guarantee. What *is* enforced is which nodes may become the orchestrator in the first place: see "Who may orchestrate" below.
 
 **How this composes with the group types:**
 

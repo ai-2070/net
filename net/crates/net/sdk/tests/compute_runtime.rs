@@ -15,6 +15,7 @@ use bytes::Bytes;
 
 use net::adapter::net::compute::DaemonError as CoreDaemonError;
 use net::adapter::net::state::causal::{CausalEvent, CausalLink};
+use net::adapter::net::MigrationOrchestratorPolicy;
 use net_sdk::capabilities::CapabilityFilter;
 use net_sdk::compute::{DaemonError, DaemonHostConfig, DaemonRuntime, MeshDaemon};
 use net_sdk::mesh::MeshBuilder;
@@ -120,6 +121,40 @@ async fn start_is_idempotent() {
     rt.start().await.expect("first start");
     rt.start().await.expect("second start is a no-op");
     assert!(rt.is_ready());
+}
+
+/// AUTH-01. The orchestrator policy is baked into the subprotocol
+/// handler at `start()`, so setting it afterwards cannot take effect.
+/// It must say so rather than returning `Ok` and quietly leaving the
+/// runtime on the previous policy — an operator who believes they
+/// restricted migration and did not is worse off than one who sees an
+/// error and moves the call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_orchestrator_policy_refuses_to_be_set_after_start() {
+    let rt = runtime().await;
+
+    rt.set_migration_orchestrator_policy(MigrationOrchestratorPolicy::allowlist([0xC0FFEEu64]))
+        .expect("policy is settable while Registering");
+
+    rt.start().await.expect("start");
+
+    let err = rt
+        .set_migration_orchestrator_policy(MigrationOrchestratorPolicy::AnyAdmittedPeer)
+        .expect_err("setting the policy on a started runtime must not silently no-op");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("before start()"),
+        "the error should tell the caller what to do instead; got: {msg}"
+    );
+
+    rt.shutdown().await.expect("shutdown");
+    let err = rt
+        .set_migration_orchestrator_policy(MigrationOrchestratorPolicy::LocalOnly)
+        .expect_err("a torn-down runtime accepts no configuration");
+    assert!(
+        matches!(err, DaemonError::ShuttingDown),
+        "expected ShuttingDown, got {err:?}",
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

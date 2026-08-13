@@ -81,7 +81,7 @@ typedef int (*RpcHandlerFn)(
 
 // Imported FFI surface from `net-rpc-ffi`.
 extern uint32_t net_rpc_abi_version(void);
-extern void net_rpc_set_handler_dispatcher(RpcHandlerFn dispatcher);
+extern int  net_rpc_set_handler_dispatcher(RpcHandlerFn dispatcher);
 extern void net_rpc_free_cstring(char* s);
 extern void net_rpc_response_free(uint8_t* ptr, size_t len);
 extern void net_rpc_find_service_nodes_free(uint64_t* ptr, size_t len);
@@ -290,10 +290,10 @@ typedef int (*RpcDuplexHandlerFn)(
     RpcResponseSinkHandleC* response_sink,
     char** out_err
 );
-extern void net_rpc_set_client_streaming_handler_dispatcher(
+extern int  net_rpc_set_client_streaming_handler_dispatcher(
     RpcClientStreamingHandlerFn dispatcher
 );
-extern void net_rpc_set_duplex_handler_dispatcher(
+extern int  net_rpc_set_duplex_handler_dispatcher(
     RpcDuplexHandlerFn dispatcher
 );
 
@@ -305,7 +305,7 @@ typedef int (*RpcStreamingHandlerFn)(
     const uint8_t* req_ptr, size_t req_len,
     RpcResponseSinkHandleC* response_sink,
     char** out_err);
-extern void net_rpc_set_streaming_handler_dispatcher(
+extern int  net_rpc_set_streaming_handler_dispatcher(
     RpcStreamingHandlerFn dispatcher);
 extern ServeHandleC* net_rpc_serve_streaming(
     MeshRpcHandle* handle,
@@ -444,9 +444,17 @@ var (
 // the Rust side).
 func registerDispatcher() {
 	dispatcherOnce.Do(func() {
-		C.net_rpc_set_handler_dispatcher(
+		// The deallocator must be registered first — see
+		// callback_free.go.
+		registerCallbackFree()
+		if code := C.net_rpc_set_handler_dispatcher(
 			(C.RpcHandlerFn)(C.go_net_rpc_handler_trampoline),
-		)
+		); code != 0 {
+			panic(fmt.Sprintf(
+				"net: libnet refused the unary RPC handler dispatcher (code %d); "+
+					"this Go wrapper and libnet disagree about callback-buffer "+
+					"ownership", int(code)))
+		}
 	})
 }
 
@@ -2174,17 +2182,33 @@ var (
 
 func registerClientStreamingDispatcher() {
 	clientStreamingDispatcherOnce.Do(func() {
-		C.net_rpc_set_client_streaming_handler_dispatcher(
+		// The deallocator must be registered first — see
+		// callback_free.go.
+		registerCallbackFree()
+		if code := C.net_rpc_set_client_streaming_handler_dispatcher(
 			(C.RpcClientStreamingHandlerFn)(C.go_net_rpc_client_streaming_trampoline),
-		)
+		); code != 0 {
+			panic(fmt.Sprintf(
+				"net: libnet refused the client-streaming handler dispatcher (code %d); this Go "+
+					"wrapper and libnet disagree about callback-buffer "+
+					"ownership", int(code)))
+		}
 	})
 }
 
 func registerDuplexDispatcher() {
 	duplexDispatcherOnce.Do(func() {
-		C.net_rpc_set_duplex_handler_dispatcher(
+		// The deallocator must be registered first — see
+		// callback_free.go.
+		registerCallbackFree()
+		if code := C.net_rpc_set_duplex_handler_dispatcher(
 			(C.RpcDuplexHandlerFn)(C.go_net_rpc_duplex_trampoline),
-		)
+		); code != 0 {
+			panic(fmt.Sprintf(
+				"net: libnet refused the duplex handler dispatcher (code %d); this Go "+
+					"wrapper and libnet disagree about callback-buffer "+
+					"ownership", int(code)))
+		}
 	})
 }
 
@@ -2286,9 +2310,17 @@ func safeCallDuplexHandler(h DuplexHandler, s *RequestStreamRecv, sk *ResponseSi
 
 func registerStreamingDispatcher() {
 	streamingDispatcherOnce.Do(func() {
-		C.net_rpc_set_streaming_handler_dispatcher(
+		// The deallocator must be registered first — see
+		// callback_free.go.
+		registerCallbackFree()
+		if code := C.net_rpc_set_streaming_handler_dispatcher(
 			(C.RpcStreamingHandlerFn)(C.go_net_rpc_streaming_trampoline),
-		)
+		); code != 0 {
+			panic(fmt.Sprintf(
+				"net: libnet refused the server-streaming handler dispatcher (code %d); this Go "+
+					"wrapper and libnet disagree about callback-buffer "+
+					"ownership", int(code)))
+		}
 	})
 }
 

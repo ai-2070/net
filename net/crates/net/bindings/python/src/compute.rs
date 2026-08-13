@@ -30,6 +30,7 @@ use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 
+use crate::runtime_guard::GuardedRuntime;
 use net::adapter::net::behavior::capability::{CapabilityFilter, CapabilitySet};
 use net::adapter::net::compute::{DaemonError as CoreDaemonError, DaemonHostConfig, MeshDaemon};
 use net::adapter::net::state::causal::{CausalEvent, CausalLink};
@@ -40,7 +41,6 @@ use net_sdk::compute::{
     StateSnapshot,
 };
 use net_sdk::mesh::Mesh as SdkMesh;
-use tokio::runtime::Runtime;
 
 // =========================================================================
 // Error prefix — stable string convention
@@ -321,7 +321,7 @@ impl PyDaemonHandle {
 #[pyclass(name = "DaemonRuntime", module = "net._net")]
 pub struct PyDaemonRuntime {
     inner: Arc<SdkDaemonRuntime>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
     /// Registered factory callables, keyed by `kind`. Values are
     /// `Py<PyAny>` holding the user's Python factory callable.
     /// The DashMap is the single source of truth; the SDK side
@@ -792,11 +792,11 @@ pub struct PyMigrationHandle {
     source_node: u64,
     target_node: u64,
     inner: SdkMigrationHandle,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
 }
 
 impl PyMigrationHandle {
-    fn from_sdk(handle: SdkMigrationHandle, runtime: Arc<Runtime>) -> Self {
+    fn from_sdk(handle: SdkMigrationHandle, runtime: Arc<GuardedRuntime>) -> Self {
         Self {
             origin_hash: handle.origin_hash,
             source_node: handle.source_node,

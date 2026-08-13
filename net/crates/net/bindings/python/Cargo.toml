@@ -66,6 +66,25 @@ default = [
 # unit-test binary resolves the C-API symbols at link time and runs
 # standalone — no unresolved-symbol linker flags, no LD_PRELOAD.
 extension-module = ["pyo3/extension-module"]
+# A deliberately panicking export, used to prove what panic strategy a
+# BUILT extension actually has.
+#
+# The question it answers cannot be answered from Cargo logs: `cargo
+# build -v` shows what was requested, not what the loaded `.pyd`/`.so`
+# does. Invoking this in a child process settles it — abort kills the
+# child, unwind lets pyo3 raise `PanicException` and the child prints a
+# sentinel and exits 0.
+#
+# Off by default and never in the published feature set. When the
+# feature is absent the item is not compiled, so there is no symbol and
+# no callable in a shipped wheel — `check-python-wheel-features.py`
+# enforces that against both workflows, and the probe job asserts an
+# ordinary wheel has no such attribute.
+#
+# Deliberately NOT used to investigate the intermittent runtime-drop
+# panic: that panic's ownership and containment path are exactly what
+# is unknown, so it cannot serve as its own probe.
+panic-probe = []
 # Pulls in `net-sdk` at its `redis` sub-feature for the
 # `RedisStreamDedup` consumer helper. The dedup helper is a thin
 # PyO3 wrapper around the canonical Rust implementation.

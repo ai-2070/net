@@ -12,7 +12,6 @@ helper (CI's `maturin develop` flags already include it).
 
 from __future__ import annotations
 
-import itertools
 import json
 
 import pytest
@@ -26,11 +25,15 @@ except ImportError as err:
 
 PSK = "42" * 32
 
-_port_counter = itertools.count(31_500)
-
-
 def _next_port() -> str:
-    return f"127.0.0.1:{next(_port_counter)}"
+    """A bind address the OS picks a port for.
+
+    Port ``0`` asks the kernel for a free ephemeral port. A fixed
+    counter only avoids collisions with the rest of *this* suite, and
+    CI hit ``EADDRINUSE`` on a port no test here claims. A caller that
+    has to dial the node reads ``local_addr`` back after construction.
+    """
+    return "127.0.0.1:0"
 
 
 def _primed_mesh() -> NetMesh:

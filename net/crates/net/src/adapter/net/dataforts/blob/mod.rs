@@ -133,8 +133,9 @@ pub use transfer::{
     SUBPROTOCOL_BLOB_TRANSFER,
 };
 pub use transfer_rpc::{
-    BlobTransferClient, TransferClientError, TransferRpcError, TransferRpcHandler,
-    TransferRpcRequest, TransferRpcResponse, DEFAULT_TRANSFER_DEADLINE, TRANSFER_SERVICE,
+    BlobTransferClient, TransferAdminPolicy, TransferClientError, TransferRpcError,
+    TransferRpcHandler, TransferRpcRequest, TransferRpcResponse, DEFAULT_TRANSFER_DEADLINE,
+    TRANSFER_SERVICE,
 };
 
 #[cfg(test)]

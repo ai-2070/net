@@ -18,6 +18,7 @@ use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::runtime_guard::GuardedRuntime;
 use async_trait::async_trait;
 use pyo3::exceptions::PyKeyError;
 use pyo3::prelude::*;
@@ -548,14 +549,14 @@ pub fn blob_adapter_ids() -> Vec<String> {
     global_blob_adapter_registry().ids()
 }
 
-fn shared_runtime() -> PyResult<Arc<Runtime>> {
+fn shared_runtime() -> PyResult<Arc<GuardedRuntime>> {
     use std::sync::OnceLock;
-    static RT: OnceLock<Arc<Runtime>> = OnceLock::new();
+    static RT: OnceLock<Arc<GuardedRuntime>> = OnceLock::new();
     if let Some(rt) = RT.get() {
         return Ok(rt.clone());
     }
     let rt = Runtime::new()
-        .map(Arc::new)
+        .map(|rt| Arc::new(GuardedRuntime::new(rt)))
         .map_err(|e| CortexError::new_err(format!("tokio runtime build: {}", e)))?;
     Ok(RT.get_or_init(|| rt).clone())
 }

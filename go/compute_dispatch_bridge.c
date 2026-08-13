@@ -9,6 +9,8 @@
 // sidesteps that while still giving us externally-linkable symbols
 // the `init()` function can take the address of.
 
+#include <stdlib.h>
+
 #include "net.h"
 #include "_cgo_export.h"
 
@@ -41,4 +43,56 @@ void bridgeFree(uint64_t daemon_id) {
 int bridgeFactory(uint64_t runtime_id, const char* kind_ptr, size_t kind_len,
                   uint64_t* out_daemon_id) {
     return goComputeFactory(runtime_id, (char*)kind_ptr, kind_len, out_daemon_id);
+}
+
+// ---------------------------------------------------------------------------
+// Callback-buffer deallocator
+// ---------------------------------------------------------------------------
+//
+// Every Go callback that returns bytes to Rust allocates them with
+// `C.malloc`, which resolves to the CRT linked into *this* module —
+// the CGO application. Rust then copied the bytes and released them
+// with `libc::free` from `net.dll`.
+//
+// On Linux both resolve to the same glibc heap and the mismatch is
+// invisible. On Windows each module carries its own CRT heap, so that
+// is a wrong-heap free. Application Verifier caught it directly:
+//
+//     StopCode 0x6 — Corrupted heap pointer or using wrong heap
+//     block 0x1a (26 bytes), the exact size of a Go handler response
+//     ucrtbase!free_base <- net!net_org_serve
+//
+// It is a real heap corruption, and it terminated the process
+// deterministically whenever an affected handler returned a non-empty
+// response.
+//
+// This function is the fix: Rust calls back into it instead of
+// `libc::free`, so the `free` executes in the same CRT that ran the
+// `malloc`. It lives in this translation unit rather than a Go-file
+// preamble for the same reason the trampolines above do — the address
+// has to be takeable, which needs a real externally-linkable symbol.
+//
+// NULL is accepted and ignored, matching `free`.
+void netGoFreeCallbackBuffer(void* p) {
+    free(p);
+}
+
+// ---------------------------------------------------------------------------
+// MeshOS user_ctx destructor
+// ---------------------------------------------------------------------------
+//
+// FFI-02, final. Rust calls this from `CDaemonBridge`'s Drop — after
+// the registry slot is gone AND after every admitted callback has
+// returned, because a callback holds the bridge for its duration.
+//
+// That is the only moment at which deleting the cgo.Handle is provably
+// safe. The Go side cannot compute it: registry removal deliberately
+// lets in-flight host `Arc` clones continue, so "I asked for teardown"
+// and "no callback can still arrive" are different instants, with no
+// signal between them that Go can observe.
+//
+// A real symbol in this translation unit, like the trampolines above,
+// so `init()` can take its address.
+void bridgeMeshOsDestroyUserCtx(void* user_ctx) {
+    goMeshOsDestroyUserCtx(user_ctx);
 }

@@ -1,0 +1,118 @@
+# Prove what panic strategy the built Python extension actually has.
+#
+# Separate from `ci.yml` because it is expensive — two full LTO builds —
+# and because it needs triggers `ci.yml` does not declare. It previously
+# lived there behind an `if:` naming `workflow_dispatch` and `schedule`,
+# neither of which that workflow fires, so two thirds of the condition
+# were dead and the remaining arm ran it on every qualifying push.
+#
+# The paths below are every file that can change the answer or bypass
+# the check: the profile definitions, the binding's manifest and the
+# probe itself, the checker, the anti-shipping gate, the release
+# workflow that decides what ships, and this file.
+name: Panic strategy witness
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly, so a drift nobody pushed — a toolchain or pyo3 change —
+    # still gets caught before a release.
+    - cron: "17 4 * * 1"
+  push:
+    paths:
+      - "net/crates/net/Cargo.toml"
+      - "net/crates/net/bindings/python/Cargo.toml"
+      - "net/crates/net/bindings/python/src/lib.rs"
+      - ".github/scripts/check-panic-strategy.py"
+      - ".github/scripts/check-python-wheel-features.py"
+      - ".github/workflows/release-python.yml"
+      - ".github/workflows/panic-probe-witness.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  panic-probe-witness:
+    name: Python extension panic strategy (abort vs unwind witness)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: panic-probe
+          workspaces: net/crates/net -> target
+
+      - name: Ensure libpython is linkable
+        run: |
+          dpkg -s python3-dev >/dev/null 2>&1 || {
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends python3-dev
+          }
+
+      - name: Install maturin
+        run: pip install --upgrade pip maturin
+
+      # Panic strategy is a property of the profile and the crate graph,
+      # not of the product surface, so these carry the smallest feature
+      # set that still imports `_net`. The real release feature
+      # composition is proven by `python-wheel-acceptance` in ci.yml;
+      # duplicating it here would double a long build to learn nothing.
+      - name: Build the abort control wheel
+        working-directory: net/crates/net/bindings/python
+        run: |
+          maturin build --release --out /tmp/probe-abort \
+            --no-default-features \
+            --features net,cortex,extension-module,panic-probe
+
+      - name: Build the unwind control wheel
+        working-directory: net/crates/net/bindings/python
+        run: |
+          maturin build --profile python-release --out /tmp/probe-unwind \
+            --no-default-features \
+            --features net,cortex,extension-module,panic-probe
+
+      # `--release` sets `panic = "abort"`. If this passes, the profile
+      # reaches the loaded extension and an abort-built wheel really does
+      # take its host process down — the premise the python-release
+      # decision rests on.
+      - name: Witness — a --release wheel aborts on an internal panic
+        run: |
+          python3 .github/scripts/check-panic-strategy.py \
+            --wheel "$(ls /tmp/probe-abort/*.whl | head -1)" --expect abort
+
+      # And the profile we ship does the opposite: pyo3 raises
+      # PanicException, the child catches it, the host survives.
+      - name: Witness — a python-release wheel unwinds and is catchable
+        run: |
+          python3 .github/scripts/check-panic-strategy.py \
+            --wheel "$(ls /tmp/probe-unwind/*.whl | head -1)" --expect unwind
+
+      # The probe must not exist in anything anyone installs. The feature
+      # is compile-time, so an ordinary wheel should have no such
+      # attribute at all — not a hidden one, an absent one.
+      - name: Guard — an ordinary wheel carries no probe
+        working-directory: net/crates/net/bindings/python
+        run: |
+          maturin build --profile python-release --out /tmp/probe-none \
+            --no-default-features --features net,cortex,extension-module
+          python3 -m venv /tmp/noprobe
+          /tmp/noprobe/bin/pip install --quiet "$(ls /tmp/probe-none/*.whl | head -1)"
+          cd /tmp && /tmp/noprobe/bin/python -c "
+          import net._net as native
+          assert not hasattr(native, '_panic_strategy_probe'), (
+              'a wheel built without the panic-probe feature still exposes the '
+              'probe — the compile-time gate is not doing its job')
+          print('ok: no probe in an ordinary wheel')
+          "

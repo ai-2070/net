@@ -36,6 +36,7 @@
 //! group's `source_subnet` + `fold_kinds` and rejects with
 //! `ScaleRejected("template mismatch")` if not.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -130,8 +131,21 @@ pub enum RegistryResponse {
 pub struct RegistryGroupSummary {
     /// Operator-chosen group name (the registry key).
     pub name: String,
-    /// 32-byte group seed.
-    pub group_seed: [u8; 32],
+    /// Correlation handle for the group's seed. **Not the seed.**
+    ///
+    /// This field used to carry the raw 32-byte `group_seed`, which
+    /// deterministically derives every replica's private keypair. Those
+    /// keypairs turn out to authorize nothing in the aggregator path
+    /// (see `AggregatorGroupEntry::group_seed`), and for a
+    /// name-derived seed they were already reconstructible by anyone
+    /// who knew the group name — so this was not an exploitable
+    /// disclosure. It was still private key material on a status API,
+    /// and an explicitly configured seed *is* meant to be secret.
+    ///
+    /// The fingerprint answers the question status output actually
+    /// needs — "are these two groups running the same seed?" — without
+    /// carrying the answer to "what is it?".
+    pub group_seed_fingerprint: SeedFingerprint,
     /// Subnet the aggregator summarizes. Sourced from the live
     /// replica's config; identical across replicas in a group.
     pub source_subnet: SubnetId,
@@ -141,6 +155,46 @@ pub struct RegistryGroupSummary {
     pub fold_kinds: Vec<u16>,
     /// Per-replica rows in declaration order.
     pub replicas: Vec<RegistryReplicaSummary>,
+}
+
+/// Non-secret 8-byte correlation handle for a group seed.
+///
+/// `BLAKE3(b"net-aggregator-seed-fingerprint-v1" || 0x00 || seed)`
+/// truncated to 8 bytes. Domain-separated so it can never collide with
+/// another use of the seed, and truncated because correlation is all
+/// it is for — a wider value would invite someone to treat it as an
+/// identifier with cryptographic weight.
+///
+/// Preimage resistance is what makes this safe to publish for an
+/// explicitly configured (secret) seed. For a name-derived seed the
+/// fingerprint is trivially recomputable from the group name, which is
+/// in the same reply — no loss, because that seed was never secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeedFingerprint(pub [u8; 8]);
+
+impl SeedFingerprint {
+    /// Fingerprint `seed`.
+    pub fn of(seed: &[u8; 32]) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"net-aggregator-seed-fingerprint-v1");
+        hasher.update(&[0u8]);
+        hasher.update(seed);
+        let full = *hasher.finalize().as_bytes();
+        let mut out = [0u8; 8];
+        out.copy_from_slice(&full[..8]);
+        Self(out)
+    }
+
+    /// Lowercase hex, for operator-facing output.
+    pub fn to_hex(self) -> String {
+        self.0.iter().map(|b| format!("{b:02x}")).collect()
+    }
+}
+
+impl std::fmt::Display for SeedFingerprint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.to_hex())
+    }
 }
 
 /// Per-replica row inside a [`RegistryGroupSummary`].
@@ -222,6 +276,106 @@ pub enum RegistryRpcError {
     /// installed). Mirror of [`Self::SpawnNotSupported`] for the
     /// scale path.
     ScaleNotSupported,
+    /// The calling session peer is not an operator of this
+    /// daemon's registry. See [`RegistryAdminPolicy`].
+    Unauthorized,
+}
+
+/// Who may administer this daemon's aggregator registry.
+///
+/// # What this actually protects
+///
+/// Aggregator groups are fold-summary reducers: they read
+/// `CapabilityFold` / `ReservationFold` and publish bucketed counts.
+/// The templates an operator configures carry a source subnet, fold
+/// kinds, a summary interval and a replica count — not binaries,
+/// commands or application callbacks. An unauthorized caller here
+/// therefore cannot forge signed capability announcements, mutate
+/// canonical fold entries, invent provider identities, or run
+/// arbitrary workloads: source announcements stay signed and are
+/// admitted into the folds before aggregation, and the aggregator only
+/// counts what was already accepted.
+///
+/// What it *can* do is stop summary groups, resize them, create more
+/// from configured templates, exhaust host resources by repeating
+/// that, and read group status. That is
+/// control-plane availability and summary suppression: real, and worth
+/// a gate, but not workload takeover.
+///
+/// # When it matters
+///
+/// Only when the PSK admits nodes that are not trusted aggregation
+/// operators. Where mesh membership *is* operator membership by
+/// design, this is a coarse boundary rather than a missing one — so
+/// severity is deployment-dependent. The default is nonetheless
+/// [`Closed`](Self::Closed): the wide-open behaviour should be asked
+/// for by name rather than obtained by omission.
+///
+/// The decision is made on
+/// [`RpcContext::session_peer`](crate::adapter::net::cortex::RpcContext::session_peer),
+/// the AEAD-authenticated caller; `caller_origin` is routing metadata
+/// the sender chooses and must not be authorized on.
+///
+/// What that authenticates is the **deliverer**, not an end-to-end
+/// origin: it is the peer whose session the frame decrypted under. A
+/// deployment that relays nRPC through an intermediary makes the relay
+/// the authenticated peer, so an allowlist authorizes the relay and
+/// everything it chooses to forward. See
+/// [`RpcContext::session_peer`](crate::adapter::net::cortex::RpcContext::session_peer)
+/// for the full statement.
+#[derive(Debug, Clone, Default)]
+pub enum RegistryAdminPolicy {
+    /// Refuse every remote request. The default: a daemon that has not
+    /// named its operators cannot tell one from anyone else holding
+    /// the PSK.
+    #[default]
+    Closed,
+    /// The named operator nodes. An empty set is equivalent to
+    /// [`Closed`](Self::Closed) — writing the config key but leaving
+    /// it empty must not widen access.
+    Operators(Arc<HashSet<u64>>),
+    /// Any peer that completed the mesh handshake — the pre-0.35
+    /// behaviour. Correct when the PSK is held exclusively by trusted
+    /// aggregation operators, which is a real deployment model.
+    AnyAdmittedPeer,
+}
+
+impl RegistryAdminPolicy {
+    /// Build an [`Operators`](Self::Operators) set from anything iterable.
+    pub fn operators<I: IntoIterator<Item = u64>>(nodes: I) -> Self {
+        Self::Operators(Arc::new(nodes.into_iter().collect()))
+    }
+
+    /// Whether `session_peer` may administer this registry.
+    pub fn permits(&self, session_peer: u64) -> bool {
+        match self {
+            Self::Closed => false,
+            Self::Operators(nodes) => nodes.contains(&session_peer),
+            Self::AnyAdmittedPeer => true,
+        }
+    }
+}
+
+/// Shared authorization preamble for both registry handlers. Returns
+/// the encoded refusal when the caller is not an operator.
+fn refuse_unless_operator(
+    policy: &RegistryAdminPolicy,
+    ctx: &RpcContext,
+    handler: &'static str,
+) -> Option<RpcResponsePayload> {
+    if policy.permits(ctx.session_peer) {
+        return None;
+    }
+    tracing::warn!(
+        session_peer = format!("{:#x}", ctx.session_peer),
+        caller_origin = format!("{:#x}", ctx.caller_origin),
+        handler,
+        policy = ?policy,
+        "refused an unauthorized aggregator.registry request",
+    );
+    Some(encode_response(&RegistryResponse::Error(
+        RegistryRpcError::Unauthorized,
+    )))
 }
 
 /// Async callback the [`RegistryHandler`] invokes when a
@@ -299,18 +453,41 @@ pub struct ScaleRequest {
 /// constructor.
 pub struct RegistryReadHandler {
     registry: Arc<AggregatorRegistry>,
+    policy: RegistryAdminPolicy,
 }
 
 impl RegistryReadHandler {
     /// Wrap a shared registry as a read-only handler.
+    ///
+    /// Refuses every remote request until operators are named via
+    /// [`Self::with_policy`]. Note what "read-only" means here: it
+    /// cannot *spawn*. It still answers `Unregister`, which stops a
+    /// group — so it needs the same gate as the spawn-capable variant,
+    /// and the name should not be read as "harmless".
     pub fn new(registry: Arc<AggregatorRegistry>) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            policy: RegistryAdminPolicy::default(),
+        }
+    }
+
+    /// Name the operator nodes allowed to administer this registry.
+    pub fn with_policy(mut self, policy: RegistryAdminPolicy) -> Self {
+        self.policy = policy;
+        self
     }
 }
 
 #[async_trait]
 impl RpcHandler for RegistryReadHandler {
     async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+        // Authorize before decoding: the body is attacker-controlled,
+        // and a reply that differed between a malformed and a
+        // well-formed body would be a free oracle for probing the wire
+        // format.
+        if let Some(refusal) = refuse_unless_operator(&self.policy, &ctx, "read") {
+            return Ok(refusal);
+        }
         let request: RegistryRequest = match postcard::from_bytes(&ctx.payload.body) {
             Ok(req) => req,
             Err(e) => {
@@ -338,6 +515,7 @@ pub struct RegistryHandler {
     registry: Arc<AggregatorRegistry>,
     spawner: Arc<SpawnFn>,
     scaler: Option<Arc<ScaleFn>>,
+    policy: RegistryAdminPolicy,
 }
 
 impl RegistryHandler {
@@ -350,7 +528,16 @@ impl RegistryHandler {
             registry,
             spawner: Arc::new(spawner),
             scaler: None,
+            policy: RegistryAdminPolicy::default(),
         }
+    }
+
+    /// Name the operator nodes allowed to administer this registry.
+    /// Without this the handler refuses every remote request — see
+    /// [`RegistryAdminPolicy`].
+    pub fn with_policy(mut self, policy: RegistryAdminPolicy) -> Self {
+        self.policy = policy;
+        self
     }
 
     /// Attach a [`ScaleFn`] so the handler answers `Scale`
@@ -366,6 +553,9 @@ impl RegistryHandler {
 #[async_trait]
 impl RpcHandler for RegistryHandler {
     async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+        if let Some(refusal) = refuse_unless_operator(&self.policy, &ctx, "full") {
+            return Ok(refusal);
+        }
         let request: RegistryRequest = match postcard::from_bytes(&ctx.payload.body) {
             Ok(req) => req,
             Err(e) => {
@@ -499,7 +689,7 @@ pub async fn snapshot_group(entry: &Arc<super::AggregatorGroupEntry>) -> Registr
     };
     RegistryGroupSummary {
         name: entry.name.clone(),
-        group_seed: entry.group_seed,
+        group_seed_fingerprint: SeedFingerprint::of(&entry.group_seed),
         source_subnet,
         fold_kinds,
         replicas: rows,
@@ -539,14 +729,19 @@ impl AggregatorRegistry {
     /// [`RegistryRpcError::SpawnNotSupported`]; use
     /// [`Self::install_registry_service_with_spawner`] to
     /// accept dynamic deployment.
+    /// `policy` names the operator nodes allowed to drive it; it is
+    /// a required argument rather than a defaulted one so that every
+    /// caller has to decide, instead of getting the wide-open
+    /// behaviour by not thinking about it.
     pub fn install_registry_service(
         self: &Arc<Self>,
         mesh: &Arc<crate::adapter::net::MeshNode>,
+        policy: RegistryAdminPolicy,
     ) -> Result<crate::adapter::net::mesh_rpc::ServeHandle, crate::adapter::net::mesh_rpc::ServeError>
     {
         mesh.serve_rpc(
             REGISTRY_SERVICE,
-            Arc::new(RegistryReadHandler::new(self.clone())),
+            Arc::new(RegistryReadHandler::new(self.clone()).with_policy(policy)),
         )
     }
 
@@ -561,11 +756,12 @@ impl AggregatorRegistry {
         self: &Arc<Self>,
         mesh: &Arc<crate::adapter::net::MeshNode>,
         spawner: SpawnFn,
+        policy: RegistryAdminPolicy,
     ) -> Result<crate::adapter::net::mesh_rpc::ServeHandle, crate::adapter::net::mesh_rpc::ServeError>
     {
         mesh.serve_rpc(
             REGISTRY_SERVICE,
-            Arc::new(RegistryHandler::new(self.clone(), spawner)),
+            Arc::new(RegistryHandler::new(self.clone(), spawner).with_policy(policy)),
         )
     }
 
@@ -578,11 +774,16 @@ impl AggregatorRegistry {
         mesh: &Arc<crate::adapter::net::MeshNode>,
         spawner: SpawnFn,
         scaler: ScaleFn,
+        policy: RegistryAdminPolicy,
     ) -> Result<crate::adapter::net::mesh_rpc::ServeHandle, crate::adapter::net::mesh_rpc::ServeError>
     {
         mesh.serve_rpc(
             REGISTRY_SERVICE,
-            Arc::new(RegistryHandler::new(self.clone(), spawner).with_scaler(scaler)),
+            Arc::new(
+                RegistryHandler::new(self.clone(), spawner)
+                    .with_scaler(scaler)
+                    .with_policy(policy),
+            ),
         )
     }
 }
@@ -933,7 +1134,7 @@ mod tests {
 
         let group_summary = RegistryGroupSummary {
             name: "test".into(),
-            group_seed: [0xCDu8; 32],
+            group_seed_fingerprint: SeedFingerprint::of(&[0xCDu8; 32]),
             source_subnet: SubnetId::GLOBAL,
             fold_kinds: vec![0x0001],
             replicas: vec![RegistryReplicaSummary {
@@ -962,5 +1163,92 @@ mod tests {
             let decoded: RegistryResponse = postcard::from_bytes(&bytes).expect("decode resp");
             assert_eq!(resp, decoded);
         }
+    }
+}
+
+#[cfg(test)]
+mod seed_fingerprint_tests {
+    use super::*;
+
+    /// Kyra's 2026-08-11 decision on #28: the seed comes out of status
+    /// output. It is not an exploitable disclosure today — the derived
+    /// replica keypairs authorize nothing in the aggregator path, and a
+    /// name-derived seed is reconstructible from the group name anyway
+    /// — but it is private key material on a status API, and an
+    /// explicitly configured seed is meant to be secret.
+    #[test]
+    fn the_fingerprint_does_not_carry_the_seed() {
+        let seed = [0xABu8; 32];
+        let fp = SeedFingerprint::of(&seed);
+
+        // The obvious regression: someone "restores" the old behaviour
+        // by making the fingerprint a truncation of the seed.
+        assert_ne!(
+            fp.0,
+            seed[..8],
+            "the fingerprint is a prefix of the seed — that is the seed, shortened"
+        );
+        let seed_hex: String = seed.iter().map(|b| format!("{b:02x}")).collect();
+        assert!(
+            !seed_hex.contains(&fp.to_hex()),
+            "the fingerprint appears inside the seed's own rendering"
+        );
+        assert_eq!(fp.to_hex().len(), 16);
+    }
+
+    /// Correlation is the whole job: same seed must fingerprint the
+    /// same, different seeds differently. A constant would satisfy the
+    /// secrecy test above and be useless.
+    #[test]
+    fn the_fingerprint_correlates() {
+        let a = SeedFingerprint::of(&[7u8; 32]);
+        let b = SeedFingerprint::of(&[7u8; 32]);
+        let c = SeedFingerprint::of(&[8u8; 32]);
+        assert_eq!(a, b, "same seed must fingerprint identically");
+        assert_ne!(a, c, "different seeds must fingerprint differently");
+
+        // Single-bit sensitivity — a fingerprint that ignored most of
+        // the seed would still pass the check above.
+        let mut near = [7u8; 32];
+        near[31] ^= 0x01;
+        assert_ne!(a, SeedFingerprint::of(&near));
+    }
+
+    /// The domain separator has to be in the hash, or this value
+    /// collides with any other BLAKE3-over-the-seed in the tree.
+    #[test]
+    fn the_fingerprint_is_domain_separated() {
+        let seed = [0x5Au8; 32];
+        let bare = {
+            let mut h = blake3::Hasher::new();
+            h.update(&seed);
+            *h.finalize().as_bytes()
+        };
+        assert_ne!(
+            SeedFingerprint::of(&seed).0,
+            bare[..8],
+            "the fingerprint is a plain BLAKE3 of the seed with no domain separation"
+        );
+    }
+
+    /// A group summary must not be able to carry the seed at all —
+    /// pinned structurally, since the whole point is that the field is
+    /// gone rather than merely unused.
+    #[test]
+    fn the_summary_type_has_no_seed_field() {
+        let src = include_str!("registry_service.rs");
+        let decl = src
+            .split("pub struct RegistryGroupSummary")
+            .nth(1)
+            .expect("RegistryGroupSummary must exist");
+        let body = decl.split('}').next().expect("struct body");
+        assert!(
+            !body.contains("group_seed:"),
+            "RegistryGroupSummary carries a raw group_seed again:\n{body}"
+        );
+        assert!(
+            body.contains("group_seed_fingerprint:"),
+            "the correlation handle went missing:\n{body}"
+        );
     }
 }

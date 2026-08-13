@@ -8,6 +8,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use crate::runtime_guard::GuardedRuntime;
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use pyo3::exceptions::{PyRuntimeError, PyStopIteration, PyValueError};
@@ -78,9 +79,9 @@ pyo3::create_exception!(
 /// each with its own worker thread pool — wasteful at memory and CPU.
 /// A single multi-threaded runtime drives every handle; construction
 /// is lazy so Python tests that never touch cortex pay nothing.
-fn make_runtime() -> PyResult<Arc<Runtime>> {
+fn make_runtime() -> PyResult<Arc<GuardedRuntime>> {
     use std::sync::OnceLock;
-    static RT: OnceLock<Arc<Runtime>> = OnceLock::new();
+    static RT: OnceLock<Arc<GuardedRuntime>> = OnceLock::new();
     // Can't use `get_or_init` with a fallible init, so do the check
     // manually. Runtime::new() returns an io::Error that's normally
     // surfaced to the caller on first-touch; if it fails once it'll
@@ -91,7 +92,7 @@ fn make_runtime() -> PyResult<Arc<Runtime>> {
         return Ok(existing.clone());
     }
     let rt = Runtime::new()
-        .map(Arc::new)
+        .map(|rt| Arc::new(GuardedRuntime::new(rt)))
         .map_err(|e| PyRuntimeError::new_err(format!("failed to create tokio runtime: {}", e)))?;
     // If another thread raced and populated the slot, reuse theirs.
     Ok(RT.get_or_init(|| rt).clone())
@@ -841,7 +842,7 @@ impl PyRedexEvent {
 #[pyclass(name = "RedexFile")]
 pub struct PyRedexFile {
     inner: Arc<InnerRedexFile>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
 }
 
 #[pymethods]
@@ -938,7 +939,7 @@ struct RedexTailIterInner {
 #[pyclass(name = "RedexTailIter")]
 pub struct PyRedexTailIter {
     inner: Arc<RedexTailIterInner>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
 }
 
 #[pymethods]
@@ -1269,7 +1270,7 @@ impl PyTask {
 #[derive(Clone)]
 pub struct PyTasksAdapter {
     inner: Arc<InnerTasksAdapter>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
 }
 
 #[pymethods]
@@ -1555,10 +1556,12 @@ impl PyTasksAdapter {
     ///
     /// Python usage:
     ///
-    ///     snap, it = adapter.snapshot_and_watch_tasks(status='pending')
-    ///     render(snap)
-    ///     for batch in it:
-    ///         render(batch)
+    /// ```python
+    /// snap, it = adapter.snapshot_and_watch_tasks(status='pending')
+    /// render(snap)
+    /// for batch in it:
+    ///     render(batch)
+    /// ```
     #[pyo3(signature = (
         *,
         status=None,
@@ -1647,7 +1650,7 @@ fn build_task_watcher(
 
 fn new_task_watch_iter(
     stream: BoxStream<'static, Vec<InnerTask>>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
 ) -> PyTaskWatchIter {
     PyTaskWatchIter {
         inner: Arc::new(TaskWatchIterInner {
@@ -1674,7 +1677,7 @@ struct TaskWatchIterInner {
 #[pyclass(name = "TaskWatchIter")]
 pub struct PyTaskWatchIter {
     inner: Arc<TaskWatchIterInner>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
 }
 
 #[pymethods]
@@ -1811,7 +1814,7 @@ impl PyMemory {
 #[derive(Clone)]
 pub struct PyMemoriesAdapter {
     inner: Arc<InnerMemoriesAdapter>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
 }
 
 #[pymethods]
@@ -2222,7 +2225,7 @@ fn build_memory_watcher(
 
 fn new_memory_watch_iter(
     stream: BoxStream<'static, Vec<std::sync::Arc<InnerMemory>>>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
 ) -> PyMemoryWatchIter {
     PyMemoryWatchIter {
         inner: Arc::new(MemoryWatchIterInner {
@@ -2247,7 +2250,7 @@ struct MemoryWatchIterInner {
 #[pyclass(name = "MemoryWatchIter")]
 pub struct PyMemoryWatchIter {
     inner: Arc<MemoryWatchIterInner>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
 }
 
 #[pymethods]
@@ -3561,7 +3564,7 @@ fn parse_wf_status(s: &str) -> PyResult<InnerWfTaskStatus> {
 #[derive(Clone)]
 pub struct PyWorkflowAdapter {
     inner: Arc<InnerWorkflowAdapter>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
 }
 
 #[pymethods]

@@ -323,8 +323,11 @@ void net_meshos_snapshot_emit(
  *                     keypair's origin hash).
  *   vtable_ptr      — vtable; `process` field is required.
  *   user_ctx        — opaque pointer passed verbatim to every
- *                     callback. Consumer owns the lifetime —
- *                     must outlive the handle.
+ *                     callback. Consumer owns the lifetime and must
+ *                     keep it valid until every callback has stopped,
+ *                     which is later than "I freed the handle" — see
+ *                     `net_meshos_register_daemon_with_vtable_v2` for
+ *                     a version that tells you when.
  *   out             — receives the registered handle.
  *
  * Returns NET_MESHOS_OK on success. Caller MUST free the handle
@@ -337,6 +340,51 @@ int net_meshos_register_daemon_with_vtable(
     const uint8_t* seed_ptr,
     const NetMeshOsDaemonVtable* vtable_ptr,
     void* user_ctx,
+    NetMeshOsHandle** out
+);
+
+/* Releases a `user_ctx` once this library is finished with the daemon.
+ *
+ * Called exactly once, from an arbitrary thread, after the daemon's
+ * registry slot is gone AND after every callback that was already
+ * admitted has returned. Once it returns, no vtable callback will ever
+ * fire with that `user_ctx` again. */
+typedef void (*NetMeshOsUserCtxDestroyFn)(void* user_ctx);
+
+/* Register a daemon and let this library release `user_ctx`.
+ *
+ * Identical to `net_meshos_register_daemon_with_vtable` except for
+ * `destroy`, which may be NULL (making the two identical).
+ *
+ * # Why you probably want this
+ *
+ * Unregistering a daemon does not mean no callback can still arrive:
+ * the registry deliberately lets in-flight references continue, so a
+ * callback admitted a moment earlier may still be running — or may not
+ * have started. A consumer that frees its context when it *asks* for
+ * teardown is racing that callback, and there is no signal it can
+ * observe to know it has won. Only this library knows, and `destroy`
+ * is it saying so.
+ *
+ * The Go binding uses this to decide when a `cgo.Handle` may be
+ * deleted; a C consumer with a heap-allocated context has the same
+ * problem.
+ *
+ * # Why a new function rather than a seventh vtable field
+ *
+ * `NetMeshOsDaemonVtable` crosses as a pointer. Growing it would make
+ * this library read past the end of a struct an older consumer
+ * allocated. A separate symbol leaves that ABI alone and turns a
+ * version mismatch into a link error at load — which is where you want
+ * to find out. */
+int net_meshos_register_daemon_with_vtable_v2(
+    NetMeshOsSdk* sdk,
+    const char* name_ptr,
+    size_t name_len,
+    const uint8_t* seed_ptr,
+    const NetMeshOsDaemonVtable* vtable_ptr,
+    void* user_ctx,
+    NetMeshOsUserCtxDestroyFn destroy,
     NetMeshOsHandle** out
 );
 

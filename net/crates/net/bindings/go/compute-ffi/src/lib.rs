@@ -688,6 +688,114 @@ struct DispatcherFns {
 
 static DISPATCHER: OnceLock<DispatcherFns> = OnceLock::new();
 
+/// Releases a buffer the Go callback layer allocated.
+///
+/// Implemented in the Go module's own C translation unit
+/// (`go/compute_dispatch_bridge.c`), so the `free` runs in the CRT that
+/// ran the `malloc`.
+pub type CallbackFreeFn = unsafe extern "C" fn(*mut std::ffi::c_void);
+
+/// The Go-registered deallocator. First-call-wins.
+static CALLBACK_FREE: std::sync::OnceLock<CallbackFreeFn> = std::sync::OnceLock::new();
+
+/// Release a pointer the Go callback layer allocated.
+///
+/// **Never `libc::free`.** Go allocates these with `C.malloc` /
+/// `C.CString`, which resolve to the CRT linked into the CGO
+/// application module; `libc::free` here resolves to `net.dll`'s. On
+/// Linux both land on the same glibc heap and the mismatch is
+/// invisible, which is why this survived so long. On Windows each
+/// module carries its own heap, so it is a wrong-heap free — Application
+/// Verifier reported `StopCode 0x6` on a 26-byte block that was exactly
+/// a Go handler response, with `ucrtbase!free_base` under
+/// `net!net_org_serve`. Real corruption, and deterministic process
+/// termination.
+///
+/// With no deallocator registered the buffer is **leaked**, loudly and
+/// once: leaking beats corrupting a heap. That branch is unreachable in
+/// practice, because dispatcher registration refuses without a
+/// deallocator on every platform — see [`warn_missing_callback_free`].
+/// It exists so a path that somehow reaches it fails safe rather than
+/// guessing.
+///
+/// Note what is leaked: one buffer *per callback*, for the life of the
+/// process. Not a bounded quantity.
+fn free_callback_buffer(ptr: *mut std::ffi::c_void) {
+    if ptr.is_null() {
+        return;
+    }
+    match CALLBACK_FREE.get() {
+        Some(f) => unsafe { f(ptr) },
+        None => {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "net-compute-ffi: no callback deallocator registered \
+                     (net_compute_set_callback_free was never called); leaking Go \
+                     callback buffers rather than freeing them on the wrong heap. \
+                     Update the Go wrapper."
+                );
+            }
+        }
+    }
+}
+
+/// Register the deallocator for Go-allocated callback buffers.
+///
+/// Must be called **before** any dispatcher registration, and that
+/// ordering is enforced on every platform.
+///
+/// Idempotent — first call wins. Returns `0` on success, `-1` for a
+/// null pointer.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_compute_set_callback_free(free_fn: Option<CallbackFreeFn>) -> c_int {
+    match free_fn {
+        Some(f) => {
+            let _ = CALLBACK_FREE.set(f);
+            0
+        }
+        None => -1,
+    }
+}
+
+/// Whether a callback deallocator has been registered.
+///
+/// Dispatcher registration consults this and refuses without one: a Go
+/// wrapper built before `net_compute_set_callback_free` existed would
+/// otherwise pair with this DLL and produce a crash or a leak at an
+/// arbitrary later moment instead of a refusal at startup.
+fn callback_free_registered() -> bool {
+    CALLBACK_FREE.get().is_some()
+}
+
+/// The message a refused dispatcher registration prints.
+///
+/// # Why this refuses everywhere, not just on Windows
+///
+/// The wrong-heap free is a Windows failure — each module carries its
+/// own CRT heap there. On Linux both sides are glibc's heap, which is
+/// why the original defect went unnoticed and why the first version of
+/// this gate was `cfg!(windows)`.
+///
+/// The repair changed what a missing deallocator means. Rust no longer
+/// calls `libc::free` on these buffers on any platform, so a mismatched
+/// pairing on Linux no longer performs an invisible-but-correct free —
+/// it leaks one buffer per callback, forever. That is a regression
+/// against the pre-repair behaviour, and a process that leaks per call
+/// is not a state worth booting into. The invariant is
+/// platform-independent, so the enforcement is too.
+fn warn_missing_callback_free(what: &str) {
+    eprintln!(
+        "net-compute-ffi: refusing to register {what} before \
+         net_compute_set_callback_free. This library releases Go-allocated \
+         callback buffers only through that deallocator — on Windows because \
+         freeing them here corrupts a different CRT heap, and everywhere because \
+         it otherwise cannot free them at all and would leak one per callback. \
+         Update the Go wrapper to match this library."
+    );
+}
+
 /// Register the Go-side dispatcher trampolines. MUST be called
 /// exactly once before any `net_compute_spawn` or
 /// `net_compute_deliver`. A second call is ignored (the first
@@ -708,6 +816,10 @@ pub extern "C" fn net_compute_set_dispatcher(
     factory: Option<FactoryFn>,
 ) -> c_int {
     ffi_guard!(NET_COMPUTE_ERR_NULL, {
+        if !callback_free_registered() {
+            warn_missing_callback_free("the compute dispatcher set");
+            return NET_COMPUTE_ERR_NULL;
+        }
         let Some(process) = process else {
             return NET_COMPUTE_ERR_NULL;
         };
@@ -752,7 +864,8 @@ pub extern "C" fn net_compute_set_dispatcher(
 // params. NULL out-pointer / zero len means "no caps declared
 // for this side"; either side may be omitted independently.
 // Buffers MUST be allocated via `C.malloc` / `libc::malloc` so
-// Rust can release them via `libc::free` after parsing.
+// Rust releases them through the Go-registered deallocator after
+// parsing — never `libc::free`; see `free_callback_buffer`.
 //
 // Idempotent: the dispatcher is invoked once per bridge
 // construction, parsed once into a `CapabilitySet`, stored on
@@ -777,7 +890,8 @@ pub extern "C" fn net_compute_set_dispatcher(
 ///     the optional cap set.
 ///
 /// Allocation contract: the consumer allocates via `C.malloc` /
-/// `libc::malloc`; Rust calls `libc::free` after parsing. Returning
+/// `libc::malloc`; Rust releases it through the registered
+/// deallocator after parsing. Returning
 /// stack-allocated or static buffers is undefined behavior.
 ///
 /// Return code: `0` on success, non-zero is logged and treated as
@@ -808,6 +922,10 @@ static DAEMON_CAPS_DISPATCHER: OnceLock<DaemonCapsFn> = OnceLock::new();
 /// Passing NULL returns `NET_COMPUTE_ERR_NULL`.
 #[no_mangle]
 pub extern "C" fn net_compute_set_daemon_caps_dispatcher(f: Option<DaemonCapsFn>) -> c_int {
+    if !callback_free_registered() {
+        warn_missing_callback_free("the daemon-capabilities dispatcher");
+        return NET_COMPUTE_ERR_NULL;
+    }
     ffi_guard!(NET_COMPUTE_ERR_NULL, {
         let Some(f) = f else {
             return NET_COMPUTE_ERR_NULL;
@@ -861,10 +979,10 @@ fn fetch_daemon_caps(
         // Free both sides defensively before returning the empty
         // fallback.
         if !req_ptr.is_null() {
-            unsafe { libc::free(req_ptr as *mut std::ffi::c_void) };
+            free_callback_buffer(req_ptr as *mut std::ffi::c_void);
         }
         if !opt_ptr.is_null() {
-            unsafe { libc::free(opt_ptr as *mut std::ffi::c_void) };
+            free_callback_buffer(opt_ptr as *mut std::ffi::c_void);
         }
         eprintln!(
             "net-compute-ffi: daemon-caps dispatcher returned {code} for daemon_id {daemon_id:#x}; using empty caps"
@@ -883,9 +1001,9 @@ fn fetch_daemon_caps(
             // owes us a free. Releasing here closes the leak that
             // the previous combined `is_null() || len == 0` guard
             // produced — the early return above only fires when
-            // there's nothing to free. Same `libc::free` path the
+            // there's nothing to free. Same deallocator path the
             // success branch below takes.
-            unsafe { libc::free(ptr as *mut std::ffi::c_void) };
+            free_callback_buffer(ptr as *mut std::ffi::c_void);
             return CapabilitySet::default();
         }
         // `slice::from_raw_parts` requires `len <= isize::MAX`; a
@@ -893,12 +1011,12 @@ fn fetch_daemon_caps(
         // Free the buffer (caller still owes us the free) and fall
         // back to empty, mirroring the core ffi guard discipline.
         if len > isize::MAX as usize {
-            unsafe { libc::free(ptr as *mut std::ffi::c_void) };
+            free_callback_buffer(ptr as *mut std::ffi::c_void);
             return CapabilitySet::default();
         }
         // SAFETY: the consumer's contract says `ptr` points at
         // `len` bytes of UTF-8 JSON it allocated via
-        // `C.malloc` / `libc::malloc`. We free via `libc::free`
+        // `C.malloc` / `libc::malloc`. We release via the deallocator
         // after parsing.
         let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
         let parsed = match std::str::from_utf8(bytes)
@@ -914,7 +1032,7 @@ fn fetch_daemon_caps(
             }
         };
         // Free the consumer's malloc'd buffer.
-        unsafe { libc::free(ptr as *mut std::ffi::c_void) };
+        free_callback_buffer(ptr as *mut std::ffi::c_void);
         parsed
     };
 
@@ -987,7 +1105,8 @@ pub extern "C" fn net_compute_outputs_push(
 ///
 /// Pairs with Go-side `C.malloc`-equivalent allocations. Go
 /// snapshot trampolines must allocate via `C.malloc` and hand us
-/// the pointer; we free via `libc::free`. NULL is a no-op.
+/// the pointer; we release it through the registered deallocator.
+/// NULL is a no-op.
 #[no_mangle]
 pub extern "C" fn net_compute_snapshot_bytes_free(ptr: *mut u8, _len: usize) {
     ffi_guard!((), {
@@ -998,15 +1117,16 @@ pub extern "C" fn net_compute_snapshot_bytes_free(ptr: *mut u8, _len: usize) {
         // guard on the inbound paths (`GoBridge::snapshot` and
         // `parse_side`); this outbound free helper — declared in
         // `net.go.h` and callable directly by Go — kept the old
-        // shape. `libc::free` reads its metadata from the malloc
+        // shape. The deallocator reads its metadata from the malloc
         // header so the `len` parameter is informational only.
         if ptr.is_null() {
             return;
         }
-        // The Go side allocated via `C.malloc`; `libc::free` matches.
-        unsafe {
-            libc::free(ptr as *mut std::ffi::c_void);
-        }
+        // The Go side allocated via `C.malloc`; the Go-registered
+        // deallocator is the matching release. No `unsafe` block: the
+        // helper is safe to call, and the pointer's provenance is the
+        // caller's contract, documented above.
+        free_callback_buffer(ptr as *mut std::ffi::c_void);
     })
 }
 
@@ -1123,21 +1243,21 @@ impl MeshDaemon for GoBridge {
             return None;
         }
         if len == 0 {
-            unsafe { libc::free(ptr as *mut std::ffi::c_void) };
+            free_callback_buffer(ptr as *mut std::ffi::c_void);
             return None;
         }
         // `slice::from_raw_parts` requires `len <= isize::MAX`; a Go
         // snapshot trampoline returning a bogus oversized length would
         // be UB. Free and treat as None, mirroring the core ffi guard.
         if len > isize::MAX as usize {
-            unsafe { libc::free(ptr as *mut std::ffi::c_void) };
+            free_callback_buffer(ptr as *mut std::ffi::c_void);
             return None;
         }
         // Copy the Go-allocated buffer into a Rust `Bytes` and
         // free the original so Go's malloc pool stays tidy.
         let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
         let out = Bytes::copy_from_slice(slice);
-        unsafe { libc::free(ptr as *mut std::ffi::c_void) };
+        free_callback_buffer(ptr as *mut std::ffi::c_void);
         Some(out)
     }
 

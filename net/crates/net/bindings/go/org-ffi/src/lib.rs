@@ -38,8 +38,29 @@
 //! async SDK. Go registers one process-wide handler dispatcher
 //! (`net_org_set_handler_dispatcher`, first-call-wins); the Rust serve path
 //! invokes it with a `handler_id`, the verified `NetOrgCaller`, and the request
-//! bytes, receiving a Go-`malloc`'d response the Rust side copies and frees via
-//! `libc::free` — the same contract the sibling crates use.
+//! bytes, receiving a Go-`malloc`'d response the Rust side copies and then
+//! releases **through the Go-registered deallocator** — never `libc::free`.
+//!
+//! # Callback-buffer ownership
+//!
+//! The allocator that creates a callback-owned buffer must release it.
+//!
+//! Go allocates handler responses and error strings with `C.malloc` /
+//! `C.CString`, which resolve to the CRT linked into the CGO application
+//! module. Rust used to release them with `libc::free` from `net.dll`. On
+//! Linux both land on the same glibc heap and nothing is visible; on Windows
+//! each module carries its own CRT heap, so it is a wrong-heap free.
+//!
+//! Application Verifier caught it directly at
+//! `291280b85`: `StopCode 0x6` (corrupted heap pointer or using wrong heap)
+//! on a 26-byte block — exactly a Go handler's `{"n":2,"servedBy":"go-s4"}` —
+//! with `ucrtbase!free_base` under `net!net_org_serve`. Real heap corruption,
+//! and deterministic process termination whenever an affected handler returned
+//! a non-empty response.
+//!
+//! Go therefore registers [`net_org_set_callback_free`] before any dispatcher,
+//! and every release of a callback-owned pointer goes through the
+//! deallocator it supplied.
 
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
@@ -178,14 +199,29 @@ pub extern "C" fn net_org_abi_version() -> u32 {
     ffi_guard!(0, { NET_ORG_ABI_VERSION })
 }
 
-/// Returns `NET_ORG_OK` iff the loaded library is at least `expected`
-/// (forward-compatible: a newer lib satisfies an older header). A consumer
-/// pins the version its header was generated against at init and hard-fails on
-/// mismatch. Returns `NET_ORG_ERR_NULL` if the loaded lib is older.
+/// Returns `NET_ORG_OK` iff the loaded library's ABI is **exactly**
+/// `expected`. A consumer pins the version its header was generated against
+/// at init and hard-fails on mismatch.
+///
+/// # Why equality, not `>=`
+///
+/// This was `NET_ORG_ABI_VERSION >= expected`, described as
+/// "forward-compatible: a newer lib satisfies an older header". That is
+/// the same defect `net_rpc_check_abi_version` was fixed for, and it is
+/// wrong for the same reason: a stale header against a newer library is
+/// precisely the case a version check exists to catch, and `>=` waves it
+/// through. The nRPC instance shipped a header that had missed a leading
+/// `*mut MeshRpcHandle` on two functions; the guard passed, and consumers
+/// fed whatever was in the first argument register to the library as a
+/// pointer.
+///
+/// "Newer library satisfies older header" is only true when every ABI
+/// bump is additive, which nothing enforces — this crate's own
+/// dispatcher setters changed return type from `void` to `int` in 0.35.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_org_check_abi_version(expected: u32) -> c_int {
     ffi_guard!(NET_ORG_ERR_NULL, {
-        if NET_ORG_ABI_VERSION >= expected {
+        if NET_ORG_ABI_VERSION == expected {
             NET_ORG_OK
         } else {
             NET_ORG_ERR_NULL
@@ -394,6 +430,49 @@ pub type OrgHandlerFn = unsafe extern "C" fn(
 /// `net_rpc_set_handler_dispatcher`).
 static ORG_DISPATCHER: OnceLock<OrgHandlerFn> = OnceLock::new();
 
+/// Releases a buffer the Go callback layer allocated.
+///
+/// Implemented in the Go module's own C translation unit
+/// (`go/compute_dispatch_bridge.c`), so the `free` runs in the CRT that
+/// ran the `malloc`.
+pub type CallbackFreeFn = unsafe extern "C" fn(*mut std::ffi::c_void);
+
+/// The Go-registered deallocator. First-call-wins.
+static ORG_CALLBACK_FREE: OnceLock<CallbackFreeFn> = OnceLock::new();
+
+/// Release a pointer the Go callback layer allocated.
+///
+/// Never `libc::free`: that is the cross-CRT wrong-heap free this
+/// module exists to avoid. If no deallocator is registered the buffer
+/// is **leaked**, loudly and once — leaking is strictly better than
+/// corrupting a heap. The branch is unreachable in practice because
+/// [`net_org_set_handler_dispatcher`] refuses to register without a
+/// deallocator, on every platform; it exists so that a path which
+/// somehow reaches it fails safe rather than guessing.
+///
+/// Note what is leaked: one buffer *per handler response*, for the life
+/// of the process. Not a bounded quantity.
+fn free_callback_buffer(ptr: *mut std::ffi::c_void) {
+    if ptr.is_null() {
+        return;
+    }
+    match ORG_CALLBACK_FREE.get() {
+        Some(f) => unsafe { f(ptr) },
+        None => {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "net-org-ffi: no callback deallocator registered \
+                     (net_org_set_callback_free was never called); leaking Go \
+                     callback buffers rather than freeing them on the wrong heap. \
+                     Update the Go wrapper."
+                );
+            }
+        }
+    }
+}
+
 /// Monotonic handler-id counter. Starts at 1 so `0` is the "unreserved"
 /// sentinel. IDs are never reused; an unused reservation is harmless.
 static NEXT_ORG_HANDLER_ID: AtomicU64 = AtomicU64::new(1);
@@ -428,12 +507,58 @@ fn org_handler_error_from_msg(msg: String) -> OrgHandlerError {
     OrgHandlerError::Internal(msg)
 }
 
+/// Register the deallocator for Go-allocated callback buffers.
+///
+/// Must be called **before** [`net_org_set_handler_dispatcher`], and
+/// that ordering is enforced on every platform.
+///
+/// Idempotent — first call wins. Returns [`NET_ORG_OK`], or
+/// [`NET_ORG_ERR_NULL`] for a null pointer.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_org_set_callback_free(free_fn: Option<CallbackFreeFn>) -> c_int {
+    ffi_guard!(NET_ORG_ERR_NULL, {
+        match free_fn {
+            Some(f) => {
+                let _ = ORG_CALLBACK_FREE.set(f);
+                NET_ORG_OK
+            }
+            None => NET_ORG_ERR_NULL,
+        }
+    })
+}
+
 /// Register the process-wide org handler dispatcher. Idempotent — only the
 /// first call takes effect.
+///
+/// **Fails closed** when no deallocator has been registered. A Go
+/// wrapper built before [`net_org_set_callback_free`] existed would
+/// otherwise pair with this DLL and fail at the first handler response
+/// — on Windows by reintroducing the wrong-heap free, elsewhere by
+/// leaking the buffer, in both cases at an arbitrary later moment
+/// instead of at startup. Returns [`NET_ORG_OK`] on success.
+///
+/// The refusal is not Windows-only even though the corruption is. Rust
+/// no longer calls `libc::free` on these buffers anywhere, so a
+/// mismatched pairing on Linux no longer performs an
+/// invisible-but-correct free — it leaks one buffer per response,
+/// forever, which is a regression against the pre-repair behaviour and
+/// not a state worth booting into.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_org_set_handler_dispatcher(dispatcher: OrgHandlerFn) {
-    ffi_guard!((), {
+pub extern "C" fn net_org_set_handler_dispatcher(dispatcher: OrgHandlerFn) -> c_int {
+    ffi_guard!(NET_ORG_ERR_NULL, {
+        if ORG_CALLBACK_FREE.get().is_none() {
+            eprintln!(
+                "net-org-ffi: refusing to register a handler dispatcher before \
+                 net_org_set_callback_free. This library releases Go-allocated \
+                 buffers only through that deallocator — on Windows because \
+                 freeing them here corrupts a different CRT heap, and everywhere \
+                 because it otherwise cannot free them at all and would leak one \
+                 per handler response. Update the Go wrapper to match this library."
+            );
+            return NET_ORG_ERR_NULL;
+        }
         let _ = ORG_DISPATCHER.set(dispatcher);
+        NET_ORG_OK
     })
 }
 
@@ -486,14 +611,14 @@ async fn org_dispatch(
                     return Ok(Vec::new());
                 }
                 if resp_len > isize::MAX as usize {
-                    unsafe { libc::free(resp_ptr as *mut libc::c_void) };
+                    free_callback_buffer(resp_ptr as *mut std::ffi::c_void);
                     return Err("Go org handler response length exceeds isize::MAX".to_string());
                 }
-                // Copy the Go-`malloc`'d bytes into a Rust-owned Vec, then free
-                // the Go buffer (Go allocates via C.malloc; we release via the
-                // matching free).
+                // Copy the Go-`malloc`'d bytes into a Rust-owned Vec, then
+                // release the Go buffer through the deallocator Go
+                // registered — the allocator that made it.
                 let bytes = unsafe { std::slice::from_raw_parts(resp_ptr, resp_len).to_vec() };
-                unsafe { libc::free(resp_ptr as *mut libc::c_void) };
+                free_callback_buffer(resp_ptr as *mut std::ffi::c_void);
                 Ok(bytes)
             } else {
                 let msg = if err_ptr.is_null() {
@@ -502,7 +627,7 @@ async fn org_dispatch(
                     let s = unsafe { std::ffi::CStr::from_ptr(err_ptr) }
                         .to_string_lossy()
                         .into_owned();
-                    unsafe { libc::free(err_ptr as *mut libc::c_void) };
+                    free_callback_buffer(err_ptr as *mut std::ffi::c_void);
                     s
                 };
                 Err(msg)
@@ -2187,7 +2312,21 @@ mod tests {
         ) -> c_int {
             NET_ORG_OK
         }
-        net_org_set_handler_dispatcher(noop);
+        // The deallocator has to be registered first — dispatcher
+        // registration refuses without one on Windows, because this DLL
+        // cannot free a buffer the Go module allocated. `noop` returns
+        // no buffer, so a no-op deallocator is honest here.
+        unsafe extern "C" fn noop_free(_: *mut std::ffi::c_void) {}
+        assert_eq!(
+            net_org_set_callback_free(Some(noop_free)),
+            NET_ORG_OK,
+            "the deallocator must be accepted"
+        );
+        assert_eq!(
+            net_org_set_handler_dispatcher(noop),
+            NET_ORG_OK,
+            "the dispatcher must be accepted once a deallocator is registered"
+        );
 
         let service = b"fleet.telemetry";
         let call = |name: &[u8]| -> (c_int, String) {
@@ -2297,5 +2436,114 @@ mod tests {
             "NetSubnetPath is the 5-byte POD the layout test pins",
         );
         assert!(max_slice_elems::<NetSubnetPath>() < max_slice_elems::<u8>());
+    }
+}
+
+#[cfg(test)]
+mod callback_ownership_tests {
+    use super::*;
+
+    /// `net_org_check_abi_version` must fail closed on inequality.
+    ///
+    /// It was `NET_ORG_ABI_VERSION >= expected`, the same shape that let
+    /// a stale nRPC header pass against a newer library. A version check
+    /// that accepts "older header, newer library" is blind to the exact
+    /// drift it exists to catch — and this crate proved the premise
+    /// wrong in 0.35, when the dispatcher setters went from returning
+    /// `void` to returning `int`.
+    #[test]
+    fn check_abi_version_requires_exact_equality() {
+        assert_eq!(
+            net_org_check_abi_version(NET_ORG_ABI_VERSION),
+            NET_ORG_OK,
+            "the current version must be accepted",
+        );
+        assert_eq!(
+            net_org_check_abi_version(NET_ORG_ABI_VERSION - 1),
+            NET_ORG_ERR_NULL,
+            "an older expectation must be refused, not treated as forward-compatible",
+        );
+        assert_eq!(
+            net_org_check_abi_version(NET_ORG_ABI_VERSION + 1),
+            NET_ORG_ERR_NULL,
+            "a newer expectation must be refused",
+        );
+    }
+
+    /// A dispatcher registration with no deallocator must be refused —
+    /// on every platform, not only Windows.
+    ///
+    /// This is the mixed-version case: a Go wrapper built before
+    /// `net_org_set_callback_free` existed, loaded against this DLL.
+    /// Accepting it fails at the first handler response either way —
+    /// on Windows by restoring the wrong-heap free, elsewhere by
+    /// leaking the buffer, since Rust no longer calls `libc::free` on
+    /// these at all. Refusing at registration turns an arbitrary later
+    /// failure into a startup error that names the mismatch.
+    ///
+    /// The gate used to be `cfg!(windows)`, on the reasoning that
+    /// Linux shares one heap and the mismatch is invisible there. True
+    /// before the repair; after it, the Linux outcome is an unbounded
+    /// leak — one buffer per response — which is worse than the
+    /// behaviour being replaced.
+    ///
+    /// Checks the predicate rather than calling the entry point: the
+    /// dispatcher statics are `OnceLock`s, so a test that actually
+    /// registered one would poison every other test in the binary.
+    #[test]
+    fn a_missing_deallocator_is_refused_everywhere() {
+        // Deliberately does NOT assert the OnceLock is empty. Another
+        // test in this binary registers a deallocator, and cargo runs
+        // them in parallel, so that assertion was a coin flip on test
+        // ordering. What matters is that the predicate is not
+        // platform-conditional.
+        let refuses_when_missing = |registered: bool| !registered;
+        assert!(
+            refuses_when_missing(false),
+            "a dispatcher registration without a deallocator must be refused"
+        );
+        assert!(
+            !refuses_when_missing(true),
+            "a registered deallocator must let the dispatcher through"
+        );
+
+        // The gate in the entry point must be exactly that, with no
+        // platform condition tacked on.
+        let src = include_str!("lib.rs");
+        let gate = src
+            .split("pub extern \"C\" fn net_org_set_handler_dispatcher")
+            .nth(1)
+            .expect("the entry point must exist");
+        let body = gate.split("ORG_DISPATCHER.set").next().expect("gate body");
+        assert!(
+            body.contains("ORG_CALLBACK_FREE.get().is_none()"),
+            "the dispatcher no longer checks for a deallocator at all:\n{body}"
+        );
+        assert!(
+            !body.contains("cfg!(windows)"),
+            "the deallocator gate is Windows-conditional again. Off Windows a \
+             missing deallocator no longer means an invisible-but-correct free \
+             — Rust does not free these buffers at all — it means leaking one \
+             per handler response:\n{body}"
+        );
+    }
+
+    /// Freeing through the helper with no deallocator registered must
+    /// leak rather than fall back to `libc::free`.
+    ///
+    /// A fallback would be the whole defect again, reached by a path
+    /// that looks like caution. Leaking bounded bytes is the correct
+    /// trade against corrupting a heap.
+    #[test]
+    fn an_unregistered_free_leaks_rather_than_guessing() {
+        // A real allocation, so a wrong fallback would actually corrupt
+        // something under a heap verifier rather than silently pass.
+        let boxed = Box::into_raw(Box::new([0u8; 26]));
+        free_callback_buffer(boxed as *mut std::ffi::c_void);
+        // Still ours: reclaim it so the test itself does not leak.
+        drop(unsafe { Box::from_raw(boxed) });
+
+        // NULL is a no-op, matching `free`.
+        free_callback_buffer(std::ptr::null_mut());
     }
 }

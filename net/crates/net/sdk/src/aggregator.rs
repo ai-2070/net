@@ -80,8 +80,8 @@ pub use net::adapter::net::behavior::aggregator::{
 pub use net::adapter::net::behavior::aggregator::{
     snapshot_group, AggregatorConfig, AggregatorDaemon, AggregatorError, AggregatorGroupEntry,
     AggregatorPublishError, AggregatorRegistry, AggregatorRegistryError, CapabilityFoldSummarizer,
-    EntrySnapshot, RegistryHandler, RegistryReadHandler, ReservationFoldSummarizer, Summarizer,
-    SummaryAnnouncement,
+    EntrySnapshot, RegistryAdminPolicy, RegistryHandler, RegistryReadHandler,
+    ReservationFoldSummarizer, Summarizer, SummaryAnnouncement,
 };
 
 // ─── Lifecycle primitives ───
@@ -117,9 +117,10 @@ use crate::mesh::Mesh;
 pub fn install_aggregator_registry_service(
     mesh: &Mesh,
     registry: &Arc<AggregatorRegistry>,
+    policy: RegistryAdminPolicy,
 ) -> Result<ServeHandle, ServeError> {
     auto_register_rpc_channels(mesh, REGISTRY_SERVICE);
-    registry.install_registry_service(&mesh.node_arc())
+    registry.install_registry_service(&mesh.node_arc(), policy)
 }
 
 /// Same as [`install_aggregator_registry_service`] but with a
@@ -128,9 +129,10 @@ pub fn install_aggregator_registry_service_with_spawner(
     mesh: &Mesh,
     registry: &Arc<AggregatorRegistry>,
     spawner: SpawnFn,
+    policy: RegistryAdminPolicy,
 ) -> Result<ServeHandle, ServeError> {
     auto_register_rpc_channels(mesh, REGISTRY_SERVICE);
-    registry.install_registry_service_with_spawner(&mesh.node_arc(), spawner)
+    registry.install_registry_service_with_spawner(&mesh.node_arc(), spawner, policy)
 }
 
 /// Install the `fold.query` RPC service on a [`Mesh`],

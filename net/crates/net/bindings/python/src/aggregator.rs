@@ -15,12 +15,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::runtime_guard::GuardedRuntime;
 use parking_lot::RwLock;
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
-use tokio::runtime::Runtime;
 
 use net_sdk::aggregator::{
     FoldQueryClient as SdkFoldQueryClient, FoldQueryClientError as SdkFoldQueryClientError,
@@ -112,6 +112,10 @@ fn registry_err(py: Python<'_>, e: SdkRegistryClientError) -> PyErr {
                 "scale-not-supported",
                 "daemon doesn't accept dynamic scale".to_string(),
             ),
+            RegistryRpcError::Unauthorized => (
+                "unauthorized",
+                "caller is not an operator of the target daemon's registry".to_string(),
+            ),
         },
     };
     let message = format!("agg:{kind}: {detail}");
@@ -161,8 +165,12 @@ fn replica_to_dict<'py>(
 fn group_to_dict<'py>(py: Python<'py>, g: &RegistryGroupSummary) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
     d.set_item("name", &g.name)?;
-    let seed_hex = hex::encode(g.group_seed);
-    d.set_item("group_seed_hex", seed_hex)?;
+    // Not the seed: it derives every replica keypair and does not
+    // belong in status output. See RegistryGroupSummary.
+    d.set_item(
+        "group_seed_fingerprint_hex",
+        g.group_seed_fingerprint.to_hex(),
+    )?;
     let replicas = PyList::empty(py);
     for r in &g.replicas {
         replicas.append(replica_to_dict(py, r)?)?;
@@ -222,7 +230,7 @@ fn summaries_to_list<'py>(
 #[pyclass(name = "RegistryClient", module = "net._net")]
 pub struct PyRegistryClient {
     inner: Arc<RwLock<SdkRegistryClient>>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
 }
 
 #[pymethods]
@@ -318,7 +326,7 @@ impl PyRegistryClient {
 #[pyclass(name = "FoldQueryClient", module = "net._net")]
 pub struct PyFoldQueryClient {
     inner: Arc<RwLock<SdkFoldQueryClient>>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
 }
 
 #[pymethods]

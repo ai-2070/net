@@ -89,10 +89,36 @@ fn node_runtime() -> &'static Runtime {
 /// A live `MeshRpcHandle` over a node bound to an ephemeral port,
 /// with every shape's dispatcher installed.
 fn rpc_handle() -> *mut MeshRpcHandle {
-    net_rpc_set_handler_dispatcher(unused_unary);
-    net_rpc_set_client_streaming_handler_dispatcher(unused_client_streaming);
-    net_rpc_set_streaming_handler_dispatcher(unused_streaming);
-    net_rpc_set_duplex_handler_dispatcher(unused_duplex);
+    // The deallocator comes first: dispatcher registration refuses
+    // without one on Windows, because the library cannot know which
+    // allocator produced a callback's buffer. These `unused_*`
+    // dispatchers never return one, so a no-op release is honest.
+    unsafe extern "C" fn unused_free(_: *mut std::ffi::c_void) {}
+    assert_eq!(
+        net_rpc_set_callback_free(Some(unused_free)),
+        0,
+        "the deallocator must be accepted"
+    );
+    for (what, code) in [
+        ("unary", net_rpc_set_handler_dispatcher(unused_unary)),
+        (
+            "client-streaming",
+            net_rpc_set_client_streaming_handler_dispatcher(unused_client_streaming),
+        ),
+        (
+            "server-streaming",
+            net_rpc_set_streaming_handler_dispatcher(unused_streaming),
+        ),
+        (
+            "duplex",
+            net_rpc_set_duplex_handler_dispatcher(unused_duplex),
+        ),
+    ] {
+        assert_eq!(
+            code, 0,
+            "the {what} dispatcher must be accepted once a deallocator is registered"
+        );
+    }
     let node = node_runtime().block_on(async {
         MeshNode::new(
             EntityKeypair::generate(),

@@ -10,6 +10,7 @@ mod blob;
 mod capability_aggregation;
 #[cfg(feature = "cortex")]
 mod cortex;
+mod runtime_guard;
 #[cfg(feature = "dataforts")]
 mod transport;
 // Identity / capabilities / subnets ride the `net` feature as a
@@ -111,6 +112,7 @@ mod redis_dedup;
 #[cfg(feature = "net")]
 mod subnets;
 
+use crate::runtime_guard::GuardedRuntime;
 use parking_lot::RwLock;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -335,7 +337,7 @@ fn generate_net_keypair() -> NetKeypair {
 #[pyclass]
 pub struct Net {
     bus: Arc<RwLock<Option<EventBus>>>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<GuardedRuntime>,
 }
 
 #[pymethods]
@@ -408,7 +410,17 @@ impl Net {
         net_batched_io: Option<bool>,
         net_packet_pool_size: Option<usize>,
     ) -> PyResult<Self> {
-        let runtime = Runtime::new().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        // Guarded at construction, not at storage. Twenty fallible steps
+        // separate this line from the `Net` built below, and every one of
+        // them drops this runtime on its error path. Wrapping only at the
+        // struct — which is what the original #35 sweep did — leaves that
+        // whole window unguarded, so a caller who reaches any of those
+        // errors from a thread that is already inside a runtime (a pyo3
+        // handler dispatched onto a tokio worker) gets the panic the guard
+        // exists to prevent.
+        let runtime = Arc::new(GuardedRuntime::new(
+            Runtime::new().map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+        ));
 
         let mut builder = EventBusConfig::builder();
 
@@ -666,7 +678,7 @@ impl Net {
 
         Ok(Net {
             bus: Arc::new(RwLock::new(Some(bus))),
-            runtime: Arc::new(runtime),
+            runtime,
         })
     }
 
@@ -1177,7 +1189,7 @@ mod mesh_bindings {
         /// any remaining clones held by a `DaemonRuntime` observe
         /// a shut-down node the next time they call into it.
         node: Option<Arc<MeshNode>>,
-        runtime: Arc<Runtime>,
+        runtime: Arc<GuardedRuntime>,
         /// The immutable named-export map resolved at construction
         /// (SSDK §3.3) — the checked map this binding retains beside its
         /// `Arc<MeshNode>`. Empty when no `subnet_exports` were
@@ -1455,9 +1467,10 @@ mod mesh_bindings {
                 Arc::new(construction.exports)
             };
 
-            let runtime = Arc::new(
-                Runtime::new().map_err(|e| PyRuntimeError::new_err(format!("runtime: {}", e)))?,
-            );
+            let runtime =
+                Arc::new(GuardedRuntime::new(Runtime::new().map_err(|e| {
+                    PyRuntimeError::new_err(format!("runtime: {}", e))
+                })?));
 
             // Derive the mesh's keypair from the caller-supplied
             // seed when present — lets a caller-side `Identity.
@@ -2251,11 +2264,13 @@ mod mesh_bindings {
         /// Publish one payload to every subscriber of `channel`.
         /// Returns a `PublishReport` dict:
         ///
-        ///     {
-        ///       "attempted":  <int>,
-        ///       "delivered":  <int>,
-        ///       "errors":     [{"node_id": <int>, "message": <str>}, ...]
-        ///     }
+        /// ```text
+        /// {
+        ///   "attempted":  <int>,
+        ///   "delivered":  <int>,
+        ///   "errors":     [{"node_id": <int>, "message": <str>}, ...]
+        /// }
+        /// ```
         ///
         /// Args:
         ///     channel: Channel name.
@@ -3168,7 +3183,7 @@ mod mesh_bindings {
         /// both use this for async method bridging so we don't
         /// spin up a second runtime per mesh.
         #[cfg(any(feature = "compute", feature = "cortex", feature = "aggregator"))]
-        pub(crate) fn runtime_arc(&self) -> Arc<Runtime> {
+        pub(crate) fn runtime_arc(&self) -> Arc<GuardedRuntime> {
             self.runtime.clone()
         }
     }
@@ -3698,6 +3713,33 @@ mod mesh_bindings {
     }
 }
 
+/// Panic on purpose, to prove what panic strategy this built extension
+/// actually has.
+///
+/// `cargo build -v` shows what was *requested*. This shows what the
+/// loaded artifact *does*, which is the thing that matters and the
+/// thing we could not establish any other way:
+///
+/// * under an effective `panic = "abort"`, calling this terminates the
+///   process — no exception, no further line executes;
+/// * under `panic = "unwind"`, pyo3 converts it to `PanicException`,
+///   which Python can catch, and the process continues.
+///
+/// Always call it in a **child** process. Under abort it takes the
+/// interpreter with it, so a test harness that calls it in-process
+/// cannot report its own result.
+///
+/// Compiled only with the `panic-probe` feature, which is off by
+/// default and excluded from every published wheel — when the feature
+/// is absent this item does not exist, so there is no symbol to find
+/// and nothing to call. It lives on the private `net._net` module and
+/// is deliberately not re-exported from the public facade.
+#[cfg(feature = "panic-probe")]
+#[pyfunction]
+fn _panic_strategy_probe() {
+    panic!("net-python deliberate panic-strategy probe");
+}
+
 /// Net Python module.
 #[pymodule]
 fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -3710,6 +3752,11 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
     async_bridge::init().map_err(|e| {
         pyo3::exceptions::PyRuntimeError::new_err(format!("async bridge init: {e}"))
     })?;
+    // Same compile-time gate as the item itself: absent from the
+    // build graph without the feature, so a shipped wheel has no such
+    // attribute at all.
+    #[cfg(feature = "panic-probe")]
+    m.add_function(wrap_pyfunction!(_panic_strategy_probe, m)?)?;
     m.add_class::<Net>()?;
     m.add_class::<IngestResult>()?;
     m.add_class::<StoredEvent>()?;

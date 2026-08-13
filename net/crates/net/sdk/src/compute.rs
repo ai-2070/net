@@ -70,8 +70,8 @@ use ::net::adapter::net::compute::{
 };
 use ::net::adapter::net::identity::EntityId;
 use ::net::adapter::net::subprotocol::{
-    FailureCallback, MigrationHandlerHooks, MigrationSubprotocolHandler, PostRestoreCallback,
-    PreCleanupCallback, ReadinessCallback,
+    FailureCallback, MigrationHandlerHooks, MigrationOrchestratorPolicy,
+    MigrationSubprotocolHandler, PostRestoreCallback, PreCleanupCallback, ReadinessCallback,
 };
 
 use crate::identity::Identity;
@@ -245,6 +245,11 @@ struct Inner {
     /// `Drop`/`unregister`.
     #[cfg_attr(not(feature = "groups"), allow(dead_code))]
     observer_id_counter: std::sync::atomic::AtomicU64,
+    /// Source-side migration authority, baked into the subprotocol
+    /// handler at `start()`. Defaults to the fail-closed
+    /// `LocalOnly`; see
+    /// [`DaemonRuntime::set_migration_orchestrator_policy`].
+    orchestrator_policy: Mutex<MigrationOrchestratorPolicy>,
 }
 
 /// A post-delivery observer closure registered against an
@@ -338,7 +343,50 @@ impl DaemonRuntime {
                 start_stall_ms: std::sync::atomic::AtomicU32::new(0),
                 observers: Mutex::new(HashMap::new()),
                 observer_id_counter: std::sync::atomic::AtomicU64::new(1),
+                orchestrator_policy: Mutex::new(MigrationOrchestratorPolicy::default()),
             }),
+        }
+    }
+
+    /// Name the nodes allowed to drive a migration against daemons
+    /// hosted by this runtime.
+    ///
+    /// Defaults to [`MigrationOrchestratorPolicy::LocalOnly`], which
+    /// refuses every remote `TakeSnapshot`. A cross-node migration
+    /// therefore requires the **source** to name its orchestrator:
+    ///
+    /// ```no_run
+    /// # use net_sdk::compute::DaemonRuntime;
+    /// # use net::adapter::net::subprotocol::MigrationOrchestratorPolicy;
+    /// # fn f(runtime: &DaemonRuntime, control_plane_node: u64) -> Result<(), Box<dyn std::error::Error>> {
+    /// runtime.set_migration_orchestrator_policy(
+    ///     MigrationOrchestratorPolicy::allowlist([control_plane_node]),
+    /// )?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// Must be called before [`Self::start`]: the policy is baked into
+    /// the subprotocol handler when the handler is installed. Calling
+    /// it afterwards returns [`DaemonError::ShuttingDown`] on a
+    /// torn-down runtime and a `ProcessFailed` core error on a
+    /// started one, rather than silently doing nothing — a security
+    /// control that quietly fails to apply is worse than one that
+    /// refuses.
+    pub fn set_migration_orchestrator_policy(
+        &self,
+        policy: MigrationOrchestratorPolicy,
+    ) -> Result<(), DaemonError> {
+        match self.state() {
+            State::Registering => {
+                *self.inner.orchestrator_policy.lock() = policy;
+                Ok(())
+            }
+            State::Ready => Err(DaemonError::Core(CoreDaemonError::ProcessFailed(
+                "migration orchestrator policy must be set before start(); the running \
+                 handler already captured the previous policy"
+                    .into(),
+            ))),
+            State::ShuttingDown => Err(DaemonError::ShuttingDown),
         }
     }
 
@@ -600,6 +648,7 @@ impl DaemonRuntime {
                 pre_cleanup: Some(pre_cleanup),
                 readiness: Some(readiness),
                 failure: Some(failure),
+                orchestrator_policy: self.inner.orchestrator_policy.lock().clone(),
             },
         )
     }
