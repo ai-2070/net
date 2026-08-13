@@ -153,10 +153,24 @@ chmod 600 /etc/net/aggregator.toml
 chown "$(id -u)" /etc/net/aggregator.toml
 ```
 
-Escape hatch: `--insecure-permissions` on the daemon,
-`ConfigFile::load_with` / `DeviceEnrollment::load_allowing_insecure`
-in-process. These skip the ownership and mode checks; they never skip
-the regular-file check, which is about not blocking forever on a FIFO.
+Escape hatches, by surface:
+
+| Surface | Override |
+| --- | --- |
+| `net-aggregator-daemon` config | `--insecure-permissions` |
+| `net-mesh` profile | `--insecure-config-permissions`, or `NET_MESH_INSECURE_CONFIG_PERMISSIONS=1` |
+| Embedded profile load | `ConfigFile::load_with(path, true)` |
+| Device enrollment | `DeviceEnrollment::load_allowing_insecure` |
+
+The CLI flag is spelled differently from the per-command
+`--insecure-permissions` on `identity` / `org` / `subnet` / `node` on
+purpose: those downgrade the gate on the *key file* that command names,
+this one on the profile. Lowering the guard on the mesh PSK should not
+be something you do by reaching for a flag you meant to point at an
+identity file.
+
+These skip the ownership and mode checks; they never skip the
+regular-file check, which is about not blocking forever on a FIFO.
 
 **Windows is unchanged and still a gap**: `std::fs` exposes no usable
 NTFS ACL view, so the gate warns rather than enforcing. Restrict the

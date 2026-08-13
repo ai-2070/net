@@ -73,6 +73,27 @@ struct Cli {
     )]
     profile: String,
 
+    /// Read the profile even when it is group/world-accessible or
+    /// owned by another user.
+    ///
+    /// The profile can hold `psk_hex`, the mesh-membership root secret,
+    /// so a file another local user can read is refused by default:
+    /// that user can join the mesh. Use this only where the deployment
+    /// genuinely cannot satisfy owner-only permissions.
+    ///
+    /// Distinct from the per-command `--insecure-permissions`, which
+    /// downgrades the gate on the identity, org or subnet key file that
+    /// command names. This one is about the profile.
+    //
+    // A separate flag rather than making the per-command one global:
+    // clap propagates a `global = true` arg into every subcommand, and
+    // `identity`, `org`, `subnet` and `node` already define
+    // `--insecure-permissions` themselves, so reusing the name is a
+    // duplicate-argument panic. Sharing it would also be wrong on the
+    // merits — see `config::set_insecure_permissions`.
+    #[arg(long, global = true, env = "NET_MESH_INSECURE_CONFIG_PERMISSIONS")]
+    insecure_config_permissions: bool,
+
     /// Output format. Auto-detects `table`/`text` for TTY stdout
     /// and `json`/`ndjson` for non-TTY when omitted.
     #[arg(long, global = true, value_enum)]
@@ -239,6 +260,10 @@ fn no_color_from_env() -> bool {
 async fn main() -> ExitCode {
     let mut cli = Cli::parse();
     cli.no_color |= no_color_from_env();
+    // Before dispatch, and therefore before any subcommand resolves a
+    // profile. `ConfigFile::load` reads it from there rather than
+    // taking it as an argument — see `config::set_insecure_permissions`.
+    config::set_insecure_permissions(cli.insecure_config_permissions);
     install_tracing(cli.verbose, cli.quiet);
 
     match dispatch(cli).await {

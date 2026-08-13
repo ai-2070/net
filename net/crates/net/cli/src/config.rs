@@ -12,8 +12,39 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
+
+/// Set by `main` from `--insecure-config-permissions` before any
+/// subcommand runs. See [`set_insecure_permissions`].
+static INSECURE_PERMISSIONS: AtomicBool = AtomicBool::new(false);
+
+/// Allow [`ConfigFile::load`] to read a profile that is
+/// group/world-accessible or owned by another user.
+///
+/// A process-wide switch rather than an argument threaded through
+/// [`ConfigFile::load`] because the profile is resolved from
+/// ~35 call sites across the subcommands, all of which take the config
+/// path from the same global argv. Adding a parameter to each would put
+/// the decision in 35 places when it is made in one — and a security
+/// control is worse, not better, for being restatable per call site.
+/// `main` sets it once, before dispatch; nothing else writes it.
+///
+/// The name is deliberately distinct from the per-command
+/// `--insecure-permissions` (which downgrades the gate on the *key
+/// file* that command names). These are different files with different
+/// consequences, and an operator should not be able to lower the guard
+/// on the mesh PSK by reaching for a flag they meant to point at an
+/// identity file.
+pub fn set_insecure_permissions(allow: bool) {
+    INSECURE_PERMISSIONS.store(allow, Ordering::Relaxed);
+}
+
+/// Whether the profile permission gate has been waived process-wide.
+pub fn insecure_permissions() -> bool {
+    INSECURE_PERMISSIONS.load(Ordering::Relaxed)
+}
 
 /// Top-level config file shape. The `default` table is the
 /// implicit profile when `--profile` is omitted; `profiles.*`
@@ -96,8 +127,13 @@ impl ConfigFile {
 
     /// Load from disk. Returns `Ok(default)` when the file is
     /// missing — the binary is usable without a config.
+    ///
+    /// Honours the process-wide override set by
+    /// [`set_insecure_permissions`], i.e. the CLI's
+    /// `--insecure-config-permissions`. Embedders that want to decide
+    /// per call should use [`Self::load_with`] instead.
     pub async fn load(path: Option<&Path>) -> Result<Self, ConfigError> {
-        Self::load_with(path, false).await
+        Self::load_with(path, insecure_permissions()).await
     }
 
     /// [`Self::load`], with `allow_insecure` skipping the secret-file
@@ -234,6 +270,58 @@ mod tests {
         }
         #[cfg(not(unix))]
         let _ = path;
+    }
+
+    /// The SEC-05 gate has to be reachable from the tool operators
+    /// actually run.
+    ///
+    /// `load_with(.., true)` existed but had no caller passing `true`,
+    /// so the CLI's only documented escape hatch was an in-process Rust
+    /// API. The aggregator daemon got `--insecure-permissions`; the CLI
+    /// got nothing, and every pre-existing `0644` profile — the umask
+    /// default, and the CLI never writes this file itself — became an
+    /// unoverridable hard failure on upgrade.
+    ///
+    /// Unix-only: off Unix the gate warns rather than enforcing, so
+    /// there is no refusal to override.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_world_readable_profile_is_refused_but_the_override_admits_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("net-sec05-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[default]\npsk_hex = \"abcd\"\n").expect("write config");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod 644");
+
+        match ConfigFile::load(Some(&path)).await {
+            Err(ConfigError::Permissions { source, .. }) => {
+                assert_eq!(source.kind(), "permissive_mode", "got {source}");
+            }
+            Err(other) => panic!("expected a permission refusal, got {other:?}"),
+            Ok(_) => panic!("a world-readable profile holding a PSK was read"),
+        }
+
+        // The flag `main` sets from `--insecure-config-permissions`.
+        // Restored below; leaking it would only *relax* the gate for
+        // the other tests in this binary, all of which write owner-only
+        // files and would pass either way — but a test that leaves
+        // process state behind is a test that makes the next failure
+        // harder to read.
+        let previously = insecure_permissions();
+        set_insecure_permissions(true);
+        let loaded = ConfigFile::load(Some(&path)).await;
+        set_insecure_permissions(previously);
+
+        let cfg = loaded.expect("--insecure-config-permissions must admit the file");
+        assert_eq!(
+            cfg.profile("default").psk_hex.as_deref(),
+            Some("abcd"),
+            "the override admitted the file but did not actually parse it"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// SEC-06 / LINUX-03 witness. A malformed `psk_hex` line must not
