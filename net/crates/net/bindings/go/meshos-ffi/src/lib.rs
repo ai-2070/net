@@ -880,6 +880,24 @@ pub extern "C" fn net_meshos_register_daemon(
 /// bytes; `vtable_ptr` to a single `NetMeshOsDaemonVtable`. Each
 /// function pointer in the vtable (when non-NULL) must remain
 /// valid until the handle is freed.
+#[no_mangle]
+pub extern "C" fn net_meshos_register_daemon_with_vtable(
+    sdk: *mut NetMeshOsSdk,
+    name_ptr: *const c_char,
+    name_len: usize,
+    seed_ptr: *const u8,
+    vtable_ptr: *const NetMeshOsDaemonVtable,
+    user_ctx: *mut std::ffi::c_void,
+    out: *mut *mut NetMeshOsHandle,
+) -> c_int {
+    // No destructor: the consumer owns `user_ctx` and this library
+    // never touches it. See the v2 docs for why that is hard to get
+    // right.
+    register_with_vtable_inner(
+        sdk, name_ptr, name_len, seed_ptr, vtable_ptr, user_ctx, None, out,
+    )
+}
+
 /// Register a daemon and let this library release `user_ctx` when it
 /// is finished with it.
 ///
@@ -903,8 +921,8 @@ pub extern "C" fn net_meshos_register_daemon(
 /// allocated — a real out-of-bounds read, not a theoretical one. A
 /// separate entry point leaves that ABI untouched and makes the
 /// mismatch a link error instead: a consumer built against this header
-/// against an older library fails to resolve the symbol at load, which
-/// is the failure you want.
+/// but loaded against an older library fails to resolve the symbol,
+/// which is the failure you want.
 ///
 /// # Safety
 ///
@@ -924,24 +942,6 @@ pub extern "C" fn net_meshos_register_daemon_with_vtable_v2(
 ) -> c_int {
     register_with_vtable_inner(
         sdk, name_ptr, name_len, seed_ptr, vtable_ptr, user_ctx, destroy, out,
-    )
-}
-
-#[no_mangle]
-pub extern "C" fn net_meshos_register_daemon_with_vtable(
-    sdk: *mut NetMeshOsSdk,
-    name_ptr: *const c_char,
-    name_len: usize,
-    seed_ptr: *const u8,
-    vtable_ptr: *const NetMeshOsDaemonVtable,
-    user_ctx: *mut std::ffi::c_void,
-    out: *mut *mut NetMeshOsHandle,
-) -> c_int {
-    // No destructor: the consumer owns `user_ctx` and this library
-    // never touches it. See the v2 docs for why that is hard to get
-    // right.
-    register_with_vtable_inner(
-        sdk, name_ptr, name_len, seed_ptr, vtable_ptr, user_ctx, None, out,
     )
 }
 
@@ -1975,12 +1975,28 @@ mod user_ctx_destructor_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    static DESTROY_CALLS: AtomicUsize = AtomicUsize::new(0);
-    static LAST_DESTROYED: AtomicUsize = AtomicUsize::new(0);
-
+    /// The `user_ctx` these tests register IS the counter the
+    /// destructor bumps.
+    ///
+    /// Previously two `static` counters that every test reset to zero
+    /// and then asserted exact values against — which cargo runs in
+    /// parallel threads of one process, so the tests raced each other
+    /// and `a_held_bridge_is_not_destroyed` failed intermittently
+    /// (roughly one run in three) on a reset it did not perform.
+    ///
+    /// Per-test counters remove the shared state, and the indirection
+    /// is not a workaround but a stronger assertion: the destructor can
+    /// only reach a given test's counter by having been handed that
+    /// test's exact `user_ctx`, so "was it called" and "with the right
+    /// context" become the same observation.
+    ///
+    /// # Safety
+    ///
+    /// `ctx` must be a pointer to an `AtomicUsize` that outlives the
+    /// bridge — every caller below keeps one on the test's own stack.
     unsafe extern "C" fn counting_destroy(ctx: *mut std::ffi::c_void) {
-        DESTROY_CALLS.fetch_add(1, Ordering::SeqCst);
-        LAST_DESTROYED.store(ctx as usize, Ordering::SeqCst);
+        let counter = unsafe { &*(ctx as *const AtomicUsize) };
+        counter.fetch_add(1, Ordering::SeqCst);
     }
 
     unsafe extern "C" fn noop_process(
@@ -2005,11 +2021,12 @@ mod user_ctx_destructor_tests {
         }
     }
 
-    fn bridge(ctx: usize, destroy: Option<MeshOsUserCtxDestroyFn>) -> CDaemonBridge {
+    /// Build a bridge whose `user_ctx` is `counter`.
+    fn bridge(counter: &AtomicUsize, destroy: Option<MeshOsUserCtxDestroyFn>) -> CDaemonBridge {
         CDaemonBridge {
             name: "destructor-test".to_string(),
             vtable: vtable(),
-            user_ctx: UserCtx(ctx as *mut std::ffi::c_void),
+            user_ctx: UserCtx(counter as *const AtomicUsize as *mut std::ffi::c_void),
             destroy,
         }
     }
@@ -2020,29 +2037,27 @@ mod user_ctx_destructor_tests {
     /// "Exactly once" is the property the whole design rests on: the
     /// previous fix had the Go side deleting its handle on teardown
     /// request, and the hazard was a *second* owner of that decision.
+    ///
+    /// The context check is implicit and all the stronger for it — the
+    /// counter can only have moved if the destructor was handed this
+    /// test's own `user_ctx`.
     #[test]
     fn the_destructor_runs_once_with_the_registered_context() {
-        DESTROY_CALLS.store(0, Ordering::SeqCst);
-        LAST_DESTROYED.store(0, Ordering::SeqCst);
+        let calls = AtomicUsize::new(0);
 
         {
-            let _b = bridge(0xDEAD_BEEF, Some(counting_destroy));
+            let _b = bridge(&calls, Some(counting_destroy));
             assert_eq!(
-                DESTROY_CALLS.load(Ordering::SeqCst),
+                calls.load(Ordering::SeqCst),
                 0,
                 "the destructor must not fire while the bridge is alive"
             );
         }
 
         assert_eq!(
-            DESTROY_CALLS.load(Ordering::SeqCst),
+            calls.load(Ordering::SeqCst),
             1,
-            "the destructor must fire exactly once on drop"
-        );
-        assert_eq!(
-            LAST_DESTROYED.load(Ordering::SeqCst),
-            0xDEAD_BEEF,
-            "the destructor must receive the context that was registered"
+            "the destructor must fire exactly once on drop, with the registered context"
         );
     }
 
@@ -2052,10 +2067,10 @@ mod user_ctx_destructor_tests {
     /// we do not own.
     #[test]
     fn no_destructor_means_no_call() {
-        DESTROY_CALLS.store(0, Ordering::SeqCst);
-        drop(bridge(0x1234, None));
+        let calls = AtomicUsize::new(0);
+        drop(bridge(&calls, None));
         assert_eq!(
-            DESTROY_CALLS.load(Ordering::SeqCst),
+            calls.load(Ordering::SeqCst),
             0,
             "the v1 registration path must never release the consumer's context"
         );
@@ -2066,13 +2081,13 @@ mod user_ctx_destructor_tests {
     /// the bridge for its duration, so `Drop` cannot run underneath it.
     #[test]
     fn a_held_bridge_is_not_destroyed() {
-        DESTROY_CALLS.store(0, Ordering::SeqCst);
-        let held = std::sync::Arc::new(bridge(0xABCD, Some(counting_destroy)));
+        let calls = AtomicUsize::new(0);
+        let held = std::sync::Arc::new(bridge(&calls, Some(counting_destroy)));
         let second = std::sync::Arc::clone(&held);
 
         drop(held);
         assert_eq!(
-            DESTROY_CALLS.load(Ordering::SeqCst),
+            calls.load(Ordering::SeqCst),
             0,
             "dropping one owner while another holds the bridge must not \
              destroy the context — that is exactly the admitted-callback race"
@@ -2080,7 +2095,7 @@ mod user_ctx_destructor_tests {
 
         drop(second);
         assert_eq!(
-            DESTROY_CALLS.load(Ordering::SeqCst),
+            calls.load(Ordering::SeqCst),
             1,
             "the last owner out must run the destructor"
         );
