@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 // in this module now goes through `stage_beside` + `publish_staged` /
 // `publish_staged_replace`.
 use crate::commands::identity::{
-    check_strict_permissions, enforce_strict_permissions, now_iso8601, parse_entity_hex,
+    enforce_strict_permissions, now_iso8601, parse_entity_hex, read_secret_key_file,
 };
 use crate::error::{generic, invalid_args, CliError};
 use crate::prelude::{emit_value, OutputFormat};
@@ -840,16 +840,8 @@ fn refuse_force(force: bool) -> Result<(), CliError> {
 /// Load + parse an org key file, honoring the ssh-style permission
 /// gate (the seed is root-of-trust material for the whole org).
 async fn load_org_key(path: &Path, insecure_permissions: bool) -> Result<OrgKeypair, CliError> {
-    if !insecure_permissions {
-        check_strict_permissions(path).await?;
-    }
     // The file text carries the raw seed. Scrub it on EVERY exit.
-    let mut text = tokio::fs::read_to_string(path).await.map_err(|e| {
-        generic(format!(
-            "failed to read org key file {}: {e}",
-            path.display()
-        ))
-    })?;
+    let mut text = read_secret_key_file(path, "org key file", insecure_permissions).await?;
     let outcome = load_org_key_from_text(&text, path);
     zeroize_string(&mut text);
     outcome

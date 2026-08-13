@@ -268,7 +268,7 @@ struct TreeRow {
 // race-free stage-beside/no-clobber pipeline as the org verbs.
 
 use crate::commands::identity::{
-    check_strict_permissions, enforce_strict_permissions, now_iso8601, parse_entity_hex,
+    enforce_strict_permissions, now_iso8601, parse_entity_hex, read_secret_key_file,
 };
 use crate::commands::org::{
     publish_staged, publish_staged_replace, refuse_aliased_paths, refuse_existing,
@@ -1115,15 +1115,7 @@ async fn load_subnet_key(
     path: &Path,
     insecure_permissions: bool,
 ) -> Result<EntityKeypair, CliError> {
-    if !insecure_permissions {
-        check_strict_permissions(path).await?;
-    }
-    let mut text = tokio::fs::read_to_string(path).await.map_err(|e| {
-        generic(format!(
-            "failed to read subnet key file {}: {e}",
-            path.display()
-        ))
-    })?;
+    let mut text = read_secret_key_file(path, "subnet key file", insecure_permissions).await?;
     let outcome = load_subnet_key_from_text(&text, path);
     zeroize_string(&mut text);
     outcome

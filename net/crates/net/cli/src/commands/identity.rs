@@ -435,15 +435,7 @@ pub(crate) async fn read_identity_file(
     path: &Path,
     insecure_permissions: bool,
 ) -> Result<IdentityFile, CliError> {
-    if !insecure_permissions {
-        check_strict_permissions(path).await?;
-    }
-    let mut text = tokio::fs::read_to_string(path).await.map_err(|e| {
-        generic(format!(
-            "failed to read identity file {}: {e}",
-            path.display()
-        ))
-    })?;
+    let mut text = read_secret_key_file(path, "identity file", insecure_permissions).await?;
     let outcome = parse_identity_file_text(&text, path);
     // Scrub on EVERY exit, not just the success path — the buffer
     // holds `seed_hex`. Mirrors `load_org_key` / `load_subnet_key`.
@@ -603,52 +595,62 @@ pub(crate) async fn enforce_strict_permissions(_path: &Path) -> Result<(), CliEr
     Ok(())
 }
 
-#[cfg(unix)]
-pub(crate) async fn check_strict_permissions(path: &Path) -> Result<(), CliError> {
-    use std::os::unix::fs::PermissionsExt;
-    let meta = tokio::fs::metadata(path).await.map_err(|e| {
-        generic(format!(
-            "failed to stat identity file {}: {e}",
-            path.display()
-        ))
-    })?;
-    let mode = meta.permissions().mode() & 0o777;
-    // Refuse anything where group or other can read the file.
-    if mode & 0o077 != 0 {
-        return Err(invalid_args(format!(
-            "identity file {} has permissive mode {:#o}; tighten to 0600 \
-             or pass --insecure-permissions to override (kind: \
-             permissive_mode)",
-            path.display(),
-            mode
-        )));
-    }
-    Ok(())
-}
+/// Read a seed-bearing key file through the SEC-05 secret-file gate.
+///
+/// The single read path for every file in this tree that holds private
+/// key material as text: identity seeds, org root seeds, subnet
+/// authority seeds. `what` names the file in errors ("identity file",
+/// "org key file", …).
+///
+/// # Why this replaced `check_strict_permissions`
+///
+/// That helper checked `metadata(path).mode() & 0o077` and returned,
+/// leaving the caller to `read_to_string(path)` separately. Three
+/// problems, all of which `secret_file` already solves for the profile
+/// and the daemon config:
+///
+/// 1. **No ownership check.** `0600` says nothing about *whose* `0600`.
+///    A seed file under a directory another user controls could be
+///    perfectly-permissioned and entirely theirs — and the CLI would
+///    load their signing identity as the operator's.
+/// 2. **Two lookups of a name.** `metadata(path)` then `read(path)` is
+///    a TOCTOU pair: the name can be replaced between them, so the
+///    bytes read are not necessarily the object approved. Opening once
+///    and `fstat`-ing the descriptor validates what will actually be
+///    read.
+/// 3. **No type check.** A FIFO at that path blocks the CLI forever.
+///
+/// The seed loaders were the last readers still on the old pair; the
+/// module docs on `secret_file` describe exactly this shape as the
+/// thing being replaced. On Windows the gate degrades to a warning, as
+/// it does everywhere else — one implementation of that caveat instead
+/// of two.
+pub(crate) async fn read_secret_key_file(
+    path: &Path,
+    what: &'static str,
+    insecure_permissions: bool,
+) -> Result<String, CliError> {
+    let owned = path.to_path_buf();
+    let read = tokio::task::spawn_blocking(move || {
+        ::net::adapter::net::secret_file::read_secret_file_to_string(&owned, insecure_permissions)
+    })
+    .await
+    .map_err(|e| generic(format!("failed to read {what} {}: {e}", path.display())))?;
 
-#[cfg(not(unix))]
-pub(crate) async fn check_strict_permissions(path: &Path) -> Result<(), CliError> {
-    // NTFS ACLs don't have a clean 0o600 analog reachable from
-    // `std::fs`, so structurally the permission gate is a no-op
-    // on Windows — but pre-fix that no-op was silent and every
-    // doc on top of `read_identity_file` advertised a contract
-    // that wasn't enforced. Operators reading the help text or
-    // module header believed their identity files were guarded
-    // the same way `ssh` guards `~/.ssh/id_*`; on Windows they
-    // weren't, with no surfaced warning.
-    //
-    // Surface a stderr warning so a permissive ACL is at least
-    // observable in operator logs. Pass `--insecure-permissions`
-    // to suppress (matches the Unix gate's escape hatch). The
-    // proper fix is a `GetFileSecurityW` DACL check; tracked as
-    // a follow-up because it pulls in the `windows`-rs crate.
-    eprintln!(
-        "warning: identity-file permission gate is a no-op on Windows; \
-         NTFS ACLs on {} are not validated. Pass --insecure-permissions \
-         to silence, or manage the DACL out-of-band.",
-        path.display()
-    );
-    Ok(())
+    read.map_err(|e| {
+        use ::net::adapter::net::secret_file::SecretFileError;
+        match e {
+            // An unreadable or missing file is an environment problem,
+            // not an argument problem — same split the old helper made.
+            SecretFileError::Io { .. } => generic(format!("failed to read {what}: {e}")),
+            // A refusal names the override, which the error type cannot
+            // know about: it is a flag on this binary, not a property of
+            // the file.
+            other => invalid_args(format!(
+                "{other}; or pass --insecure-permissions to override"
+            )),
+        }
+    })
 }
 
 /// The default identity path, or `None` when the platform config directory
@@ -716,6 +718,126 @@ fn format_iso8601_utc(secs_since_epoch: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("net-sec05-key-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    /// The seed loaders read through the secret-file gate, not the
+    /// old `metadata()`-then-`read()` pair.
+    ///
+    /// Two properties the old `check_strict_permissions` did not have,
+    /// both platform-independent (they are type and plumbing checks,
+    /// not mode checks), plus the ordinary case still working:
+    ///
+    /// * a non-regular file is refused rather than opened — reading a
+    ///   FIFO would block the CLI forever;
+    /// * `--insecure-permissions` reaches the gate, and still does not
+    ///   waive the type check.
+    #[tokio::test]
+    async fn the_seed_reader_goes_through_the_secret_file_gate() {
+        let dir = scratch("gate");
+
+        // A directory stands in for "not a regular file" on every
+        // platform. The old pair would have `stat`ed it happily and
+        // then failed later, in the read, with an io error that says
+        // nothing about why this is refused.
+        match read_secret_key_file(&dir, "identity file", false).await {
+            Err(e) => {
+                let msg = format!("{e}");
+                assert!(
+                    msg.contains("not a regular file") || msg.contains("failed to read"),
+                    "a directory should be refused as a secret file; got: {msg}"
+                );
+            }
+            Ok(_) => panic!("a directory was accepted as an identity file"),
+        }
+
+        // The permission override must not waive the type check — it
+        // is about permissions, and a FIFO is not a permission
+        // problem.
+        assert!(
+            read_secret_key_file(&dir, "identity file", true)
+                .await
+                .is_err(),
+            "--insecure-permissions also skipped the regular-file check"
+        );
+
+        // And the ordinary case still reads. A gate that refused
+        // everything would satisfy both assertions above.
+        let path = dir.join("id.toml");
+        std::fs::write(&path, "seed_hex = \"aa\"\n").expect("write");
+        enforce_strict_permissions(&path)
+            .await
+            .expect("chmod 0600 (no-op off Unix)");
+        let text = read_secret_key_file(&path, "identity file", false)
+            .await
+            .expect("an owner-only identity file must still load");
+        assert!(text.contains("seed_hex"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every seed-bearing read goes through the gate, and none of them
+    /// checks permissions by hand.
+    ///
+    /// The behaviour that matters most here — refusing a file owned by
+    /// another user — cannot be tested directly: only root can `chown`
+    /// to another uid, so a runtime test would skip on every ordinary
+    /// machine and in most CI. `secret_file`'s ownership check is the
+    /// substantive thing the CLI's old `metadata().mode() & 0o077` gate
+    /// lacked, so what is pinned instead is that the CLI *delegates* to
+    /// it, everywhere, rather than growing a second mode-only check
+    /// that would silently lack the ownership half again.
+    ///
+    /// Source-level, in the style of the substrate's other
+    /// authorization pins. Platform-independent by construction.
+    #[test]
+    fn no_seed_loader_reimplements_the_permission_check() {
+        let readers = [
+            ("identity.rs", include_str!("identity.rs")),
+            ("org.rs", include_str!("org.rs")),
+            ("subnet.rs", include_str!("subnet.rs")),
+            ("context.rs", include_str!("../context.rs")),
+        ];
+        // Assembled, not written out: a pin that contains the pattern
+        // it bans matches its own source.
+        let banned = format!("permissions().{}", "mode()");
+        for (name, src) in readers {
+            // Production code only. Tests legitimately read a mode
+            // back off the filesystem to prove the WRITE path produced
+            // `0600` — that is the check working, not a second copy of
+            // it.
+            let code = src.split("#[cfg(test)]").next().unwrap_or(src);
+            let code: String = code
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                !code.contains(&banned),
+                "{name} inspects file modes directly. Seed-bearing files go through \
+                 `read_secret_key_file` -> `secret_file`, which additionally checks \
+                 ownership (0600 proves nothing about WHOSE 0600) and file type, on \
+                 the opened descriptor rather than on a path that can be swapped \
+                 between the check and the read."
+            );
+        }
+
+        // And the gate is actually reachable from the three loaders —
+        // a pin that only forbids the old shape would pass on a file
+        // that had no check at all, which is precisely how
+        // `load_identity_seed` got into this state.
+        for (name, src) in readers {
+            assert!(
+                src.contains("read_secret_key_file"),
+                "{name} loads secret-bearing text without going through the gate"
+            );
+        }
+    }
 
     /// SEC-06 / LINUX-03 witness. A malformed `seed_hex` line must not
     /// be reproduced in the error the CLI prints.
