@@ -824,14 +824,16 @@ fn check_spawn_limits(
 ) -> Result<(), RegistryRpcError> {
     if replica_count > limits.max_replica_count {
         return Err(RegistryRpcError::SpawnRejected(format!(
-            "replica_count {replica_count} exceeds this daemon's max_replica_count              ({}); raise it in the daemon config if that is intended",
+            "replica_count {replica_count} exceeds this daemon's max_replica_count \
+             ({}); raise it in the daemon config if that is intended",
             limits.max_replica_count
         )));
     }
     if let Some(current) = current_groups {
         if current >= limits.max_groups {
             return Err(RegistryRpcError::SpawnRejected(format!(
-                "daemon already hosts {current} groups, at its max_groups limit ({});                  unregister one or raise the limit in the daemon config",
+                "daemon already hosts {current} groups, at its max_groups limit \
+                 ({}); unregister one or raise the limit in the daemon config",
                 limits.max_groups
             )));
         }

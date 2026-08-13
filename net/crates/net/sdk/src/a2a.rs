@@ -299,7 +299,8 @@ pub enum SubmitRejection {
     /// they described and read someone else's — or their own earlier —
     /// result as the answer to this request.
     #[error(
-        "task id {task_id:?} already names a different brief for this submitter;          re-submitting an id is idempotent only for an identical brief"
+        "task id {task_id:?} already names a different brief for this submitter; \
+         re-submitting an id is idempotent only for an identical brief"
     )]
     IdReusedForDifferentBrief {
         /// The contested id.

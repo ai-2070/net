@@ -2448,7 +2448,7 @@ mod callback_ownership_tests {
         assert_eq!(
             net_org_check_abi_version(NET_ORG_ABI_VERSION - 1),
             NET_ORG_ERR_NULL,
-            "an older expectation must be refused, not treated as              forward-compatible",
+            "an older expectation must be refused, not treated as forward-compatible",
         );
         assert_eq!(
             net_org_check_abi_version(NET_ORG_ABI_VERSION + 1),

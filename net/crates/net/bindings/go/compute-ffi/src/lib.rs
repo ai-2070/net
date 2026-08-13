@@ -726,7 +726,10 @@ fn free_callback_buffer(ptr: *mut std::ffi::c_void) {
                 std::sync::atomic::AtomicBool::new(false);
             if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 eprintln!(
-                    "net-compute-ffi: no callback deallocator registered (net_compute_set_callback_free was                      never called); leaking Go callback buffers rather than                      freeing them on the wrong heap. Update the Go wrapper."
+                    "net-compute-ffi: no callback deallocator registered \
+                     (net_compute_set_callback_free was never called); leaking Go \
+                     callback buffers rather than freeing them on the wrong heap. \
+                     Update the Go wrapper."
                 );
             }
         }
@@ -766,7 +769,10 @@ fn callback_free_registered() -> bool {
 /// The message a refused dispatcher registration prints.
 fn warn_missing_callback_free(what: &str) {
     eprintln!(
-        "net-compute-ffi: refusing to register {what} before net_compute_set_callback_free. On Windows          this DLL cannot free a buffer the Go module allocated — the CRT heaps          differ. Update the Go wrapper to match this library."
+        "net-compute-ffi: refusing to register {what} before \
+         net_compute_set_callback_free. On Windows this DLL cannot free a buffer \
+         the Go module allocated — the CRT heaps differ. Update the Go wrapper to \
+         match this library."
     );
 }
 
