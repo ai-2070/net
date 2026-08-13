@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 # `net_sdk` (the package directory under `src/` is unchanged) so
 # user code keeps `import net_sdk` working.
 name = "net-mesh-sdk"
-version = "0.35.0"
+version = "0.36.0"
 description = "Ergonomic Python SDK for the Net mesh network"
 license = "MIT OR Apache-2.0"
 license-files = ["LICENSE-APACHE", "LICENSE-MIT"]
@@ -16,7 +16,7 @@ requires-python = ">=3.10"
 # wrapper over the native `net-mesh` module, and
 # `web/src/content/docs/reference/versioning.md` says the two must
 # match, that mixing versions is unsupported, and that pre-1.0 minors
-# may break APIs. `>=0.35.0` let pip resolve or retain this 0.34 wrapper
+# may break APIs. `>=0.36.0` let pip resolve or retain this 0.34 wrapper
 # against a 0.35+ core anyway, and the failure only surfaced later, at
 # the first call into a changed or removed native method.
 #
@@ -25,7 +25,7 @@ requires-python = ">=3.10"
 # while `0.36` is excluded because a pre-1.0 minor may break the wrapper.
 # `tests/test_packaging_metadata.py` asserts this range is non-empty and
 # admits the sibling `bindings/python` version.
-dependencies = ["net-mesh>=0.35.0,<0.36.0"]
+dependencies = ["net-mesh>=0.36.0,<0.36.0"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",

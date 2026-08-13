@@ -1,6 +1,6 @@
 [package]
 name = "net-ffi"
-version = "0.35.0"
+version = "0.36.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "The single cdylib carrying every C-ABI surface Net exposes"
@@ -53,7 +53,7 @@ test-helpers = ["net-compute-ffi/test-helpers"]
 # package is sufficient — cargo would unify them anyway when the siblings are
 # built together, but relying on that made the feature set a property of the
 # build command rather than of the manifest.
-net = { package = "net-mesh", version = "0.35.0", path = "../../..", features = [
+net = { package = "net-mesh", version = "0.36.0", path = "../../..", features = [
     "net",
     "netdb",
     "redex-disk",
@@ -68,10 +68,10 @@ net = { package = "net-mesh", version = "0.35.0", path = "../../..", features = 
 # The seven C-ABI surfaces, linked as rlibs. Their `#[no_mangle]` entry points
 # are re-exported from this cdylib; `src/lib.rs` carries the `extern crate`
 # lines that keep the linker from dropping them as unreferenced.
-net-compute-ffi = { version = "0.35.0", path = "../compute-ffi" }
-net-deck-ffi = { version = "0.35.0", path = "../deck-ffi" }
-net-mcp-ffi = { version = "0.35.0", path = "../mcp-ffi" }
-net-meshdb-ffi = { version = "0.35.0", path = "../meshdb-ffi" }
-net-meshos-ffi = { version = "0.35.0", path = "../meshos-ffi" }
-net-org-ffi = { version = "0.35.0", path = "../org-ffi" }
-net-rpc-ffi = { version = "0.35.0", path = "../rpc-ffi" }
+net-compute-ffi = { version = "0.36.0", path = "../compute-ffi" }
+net-deck-ffi = { version = "0.36.0", path = "../deck-ffi" }
+net-mcp-ffi = { version = "0.36.0", path = "../mcp-ffi" }
+net-meshdb-ffi = { version = "0.36.0", path = "../meshdb-ffi" }
+net-meshos-ffi = { version = "0.36.0", path = "../meshos-ffi" }
+net-org-ffi = { version = "0.36.0", path = "../org-ffi" }
+net-rpc-ffi = { version = "0.36.0", path = "../rpc-ffi" }
