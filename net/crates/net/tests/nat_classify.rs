@@ -46,18 +46,21 @@ const PSK: [u8; 32] = [0x42u8; 32];
 /// tests.
 fn test_config() -> MeshNodeConfig {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    // Handshake budget is deliberately on the generous end of the
-    // repo's idiom (3 attempts × 3 s, vs the 3 × 2 s some suites use).
-    // The coverage workflow runs these under `-C instrument-coverage`,
-    // which slows every basic block several-fold; the spawned `accept`
-    // task can then miss a tighter 2 s window and trip the
-    // `connect().expect(...)` in the three-node helpers. The wider
-    // window costs nothing on the happy path — a successful handshake
-    // returns immediately.
+    // Handshake budget matches the repo's highest-headroom idiom
+    // (4 attempts × 4 s, as `connect_direct` uses), not the 3 × 2 s
+    // baseline. The coverage workflow runs these under
+    // `-C instrument-coverage`, which slows every basic block
+    // several-fold, and the four tests in this file share the runner
+    // with the rest of the suite; the spawned `accept` task then
+    // misses a tighter window and trips the `connect().expect(...)`
+    // in the three-node helpers. 3 × 3 s was still short enough to
+    // flake in CI, and the whole budget is only ever paid by a
+    // handshake that is already failing — a successful one returns
+    // on attempt 1.
     let mut cfg = MeshNodeConfig::new(addr, PSK)
         .with_heartbeat_interval(Duration::from_millis(200))
         .with_session_timeout(Duration::from_secs(5))
-        .with_handshake(3, Duration::from_secs(3));
+        .with_handshake(4, Duration::from_secs(4));
     cfg.socket_buffers = SocketBufferConfig {
         send_buffer_size: TEST_BUFFER_SIZE,
         recv_buffer_size: TEST_BUFFER_SIZE,
