@@ -16,16 +16,18 @@ requires-python = ">=3.10"
 # wrapper over the native `net-mesh` module, and
 # `web/src/content/docs/reference/versioning.md` says the two must
 # match, that mixing versions is unsupported, and that pre-1.0 minors
-# may break APIs. `>=0.36.0` let pip resolve or retain this 0.34 wrapper
-# against a 0.35+ core anyway, and the failure only surfaced later, at
-# the first call into a changed or removed native method.
+# may break APIs. A bare `>=` lower bound let pip resolve or retain an
+# older wrapper against a newer core anyway, and the failure only surfaced
+# later, at the first call into a changed or removed native method.
 #
 # The upper bound is the *next* minor, not this one: patch releases within
 # the minor are additive by the versioning policy, so they stay resolvable,
-# while `0.36` is excluded because a pre-1.0 minor may break the wrapper.
-# `tests/test_packaging_metadata.py` asserts this range is non-empty and
-# admits the sibling `bindings/python` version.
-dependencies = ["net-mesh>=0.36.0,<0.36.0"]
+# while `0.37` is excluded because a pre-1.0 minor may break the wrapper.
+# A release bump must move *both* bounds; rewriting only the release version
+# here collapses the range to the empty set and makes the package
+# uninstallable. `tests/test_packaging_metadata.py` asserts this range is
+# non-empty and admits the sibling `bindings/python` version.
+dependencies = ["net-mesh>=0.36.0,<0.37.0"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
