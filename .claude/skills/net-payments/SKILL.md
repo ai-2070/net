@@ -4,8 +4,8 @@ description: "Use this skill when the user is integrating the Net Payments SDK (
 allowed-tools: ["Read", "Grep", "Glob", "Bash", "Edit", "Write"]
 metadata:
   skill-version: 1.10.0
-  last-updated: 2026-08-09
-  net-version: 0.35.0
+  last-updated: 2026-08-13
+  net-version: 0.36.0
   x402-spec: "v2 @ 087922a5eecc06ea773636b75df205814ba295b5 (2026-05-29)"
 ---
 

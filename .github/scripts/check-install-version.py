@@ -21,12 +21,12 @@ THE SOURCE OF TRUTH IS THE UNIFIED RELEASE TAG.
 Everything else that looked like an answer is wrong in a different direction:
 
   * Release-note FILES were the previous answer, and they are a record of
-    intent, not of publication. v0.35.0 shipped — tagged, published to
-    crates.io, npm and PyPI — with no `RELEASE_v0.35*.md` in the tree, so this
+    intent, not of publication. v0.36.0 shipped — tagged, published to
+    crates.io, npm and PyPI — with no `RELEASE_v0.36*.md` in the tree, so this
     checker went on certifying pages that named 0.34 as correct. A missing
     release note is a release-process gap; it must not also silently pin the
     documentation a minor behind.
-  * The workspace `Cargo.toml` version is the NEXT candidate — 0.35.0 while
+  * The workspace `Cargo.toml` version is the NEXT candidate — 0.36.0 while
     0.34 was the newest release — so telling readers to install it is the same
     defect pointed the other way.
   * Registries are the real evidence and are deliberately not consulted.
@@ -56,7 +56,7 @@ tag took the input out of every path filter in the repository: a release note
 lived under `web/src/content/docs/releases/` and so re-ran `web.yml` by
 existing, while a tag changes no file and matches no `paths:` entry. Without a
 tag-triggered run, publishing v0.36.0 and touching nothing under `web/` leaves
-the install pages saying 0.35 with every job green — the exact defect, reached
+the install pages saying 0.36 with every job green — the exact defect, reached
 by the exact route, that replacing the file-based check was supposed to close.
 
 Usage: check-install-version.py [--self-test]
@@ -76,7 +76,7 @@ _ROOT = Path(__file__).resolve().parents[2]
 _INSTALL = _ROOT / "web" / "src" / "content" / "docs" / "start" / "install"
 
 # A unified release tag and nothing else. Anchored at both ends, so
-# `cli-v0.35.0` fails at the front and `v0.35.0-rc.1` at the back.
+# `cli-v0.36.0` fails at the front and `v0.36.0-rc.1` at the back.
 _UNIFIED_TAG = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
 
 # Any `0.NN` that is not part of a longer number. Patch suffixes are allowed
@@ -262,30 +262,30 @@ def _self_test_tag_parser() -> list[str]:
         if got != want:
             failures.append(f"FAIL  {what}: got {got!r}, expected {want!r}")
 
-    expect(parse_unified_tag("v0.35.0"), (0, 35, 0), "a unified tag is accepted")
+    expect(parse_unified_tag("v0.36.0"), (0, 36, 0), "a unified tag is accepted")
     # Everything the doctrine excludes, one reason at a time.
     for rejected, why in [
-        ("v0.35.0-rc.1", "a release candidate is not a shipped release"),
-        ("v0.35.0-beta.2", "a beta is not a shipped release"),
-        ("cli-v0.35.0", "the CLI is versioned separately"),
-        ("deck-v0.35.0", "Deck is versioned separately"),
-        ("v0.35", "a two-component tag is not a release tag"),
-        ("0.35.0", "a tag without the `v` prefix is not one of ours"),
+        ("v0.36.0-rc.1", "a release candidate is not a shipped release"),
+        ("v0.36.0-beta.2", "a beta is not a shipped release"),
+        ("cli-v0.36.0", "the CLI is versioned separately"),
+        ("deck-v0.36.0", "Deck is versioned separately"),
+        ("v0.36", "a two-component tag is not a release tag"),
+        ("0.36.0", "a tag without the `v` prefix is not one of ours"),
         ("vX.Y.Z", "malformed"),
         ("", "empty"),
     ]:
         expect(parse_unified_tag(rejected), None, f"`{rejected}` ignored — {why}")
 
-    # Ordering is numeric, not lexicographic: `v0.35.10` must outrank
-    # `v0.35.9`, which string comparison gets backwards.
+    # Ordering is numeric, not lexicographic: `v0.36.10` must outrank
+    # `v0.36.9`, which string comparison gets backwards.
     expect(
-        newest_unified(["v0.35.0", "v0.35.1"], {"v0.35.0", "v0.35.1"}),
-        (0, 35, 1),
+        newest_unified(["v0.36.0", "v0.36.1"], {"v0.36.0", "v0.36.1"}),
+        (0, 36, 1),
         "a later patch outranks an earlier one",
     )
     expect(
-        newest_unified(["v0.35.9", "v0.35.10"], {"v0.35.9", "v0.35.10"}),
-        (0, 35, 10),
+        newest_unified(["v0.36.9", "v0.36.10"], {"v0.36.9", "v0.36.10"}),
+        (0, 36, 10),
         "patch ordering is numeric, not lexicographic",
     )
 
@@ -295,18 +295,18 @@ def _self_test_tag_parser() -> list[str]:
     # not reachable from HEAD. Nothing about the string says so.
     tags = [
         "v0.34.0",
-        "v0.35.0",
-        "v0.35.1",
-        "v0.35.2-rc.1",
+        "v0.36.0",
+        "v0.36.1",
+        "v0.36.2-rc.1",
         "cli-v0.36.0",
         "deck-v0.36.0",
         "v0.36.0",
         "not-a-tag",
     ]
-    reachable = {"v0.34.0", "v0.35.0", "v0.35.1", "v0.35.2-rc.1", "cli-v0.36.0"}
+    reachable = {"v0.34.0", "v0.36.0", "v0.36.1", "v0.36.2-rc.1", "cli-v0.36.0"}
     expect(
         newest_unified(tags, reachable),
-        (0, 35, 1),
+        (0, 36, 1),
         "an unreachable tag is not shipped for this checkout",
     )
     expect(
