@@ -4586,9 +4586,29 @@ mod tests {
     /// Review-9: an adoption racing a concurrent floor raise never
     /// returns success with an already-revoked certificate — the
     /// final verification and the membership write happen under the
-    /// revocation-state lock, so the raise either lands before
-    /// (candidate refused) or after (normal revocation of an
-    /// installed cert, retracted at runtime), never in between.
+    /// revocation-state lock, so the raise can never interleave
+    /// between the two.
+    ///
+    /// The lock closes the verify→publish window, not the whole
+    /// ceremony: step 9 drops the state lock before step 10 reopens
+    /// through the startup loader, so a raise has THREE places to
+    /// land, and all three are fail-closed:
+    ///
+    ///   1. before the locked verify — refused, nothing published;
+    ///   2. after the membership write but before the step-10
+    ///      reopen — the reopen self-verifies against the raised
+    ///      floors and refuses, so `adopt` reports failure with the
+    ///      membership already on disk (no rollback: step 10 cannot
+    ///      distinguish the cert IT wrote from one a previous
+    ///      successful adoption left, and deleting the latter on a
+    ///      transient error would destroy a valid authority);
+    ///   3. after the reopen — `adopt` succeeds and the installed
+    ///      cert is revoked at the next startup, the ordinary
+    ///      revoked-cert-at-startup contract.
+    ///
+    /// Cases 2 and 3 differ only in who observes the refusal, so the
+    /// invariant asserted across every interleave is the one that
+    /// matters: the node can never START with the floored cert.
     #[test]
     fn adopt_racing_floor_raise_never_installs_revoked_cert() {
         let scratch = Scratch::new();
@@ -4613,35 +4633,56 @@ mod tests {
         started_rx.recv().expect("raiser started");
 
         // The gen-3 adoption races the raise. Whichever interleave
-        // the scheduler picks, success with generation 3 installed
-        // is unreachable: either the candidate/locked verification
-        // sees floor 5 (refusal), or — if adoption fully completed
-        // before the raise — the final open below fails.
+        // the scheduler picks, a USABLE generation-3 authority is
+        // unreachable: the verification either refuses the
+        // candidate, or the raise lands on an installed cert that
+        // startup then refuses.
         let adoption =
             NodeAuthority::adopt(scratch.dir(), cert_for(&kp, 3), kp.entity_id(), 0, None);
         raiser.join().expect("raiser join");
 
-        match adoption {
-            Err(e) => {
-                assert!(
-                    matches!(e, OrgAuthorityError::CertBelowFloor { .. }),
-                    "refusal must be the floor, got {e}"
-                );
-                assert!(
-                    !scratch.dir().join(OWNER_MEMBERSHIP_FILE).exists(),
-                    "a refused adoption must not publish membership"
-                );
-            }
-            Ok(authority) => {
-                // The adoption completed before the raise reached
-                // the lock. The installed authority must then fail
-                // startup verification against the raised floors —
-                // exactly the revoked-cert-at-startup contract.
-                assert_eq!(authority.config.owner_cert.generation, 3);
-                let err = NodeAuthority::open(scratch.dir(), kp.entity_id())
-                    .expect_err("post-raise startup refuses the floored cert");
-                assert!(matches!(err, OrgAuthorityError::CertBelowFloor { .. }));
-            }
+        match &adoption {
+            // Cases 1 and 2: refusal is always the floor, never some
+            // other error standing in for it.
+            Err(e) => assert!(
+                matches!(e, OrgAuthorityError::CertBelowFloor { .. }),
+                "refusal must be the floor, got {e}"
+            ),
+            // Case 3: adoption beat the raise outright, so what it
+            // hands back is the candidate — not a partial or some
+            // other writer's authority.
+            Ok(authority) => assert_eq!(authority.config.owner_cert.generation, 3),
+        }
+
+        // The invariant every interleave shares. Either the ceremony
+        // never published (case 1: startup has no membership to
+        // load) or it did and the raised floor retires it (cases 2
+        // and 3) — and in NO case does a node come up owning a
+        // certificate the org has already revoked.
+        let err = NodeAuthority::open(scratch.dir(), kp.entity_id())
+            .expect_err("startup must never accept the floored cert");
+        let published = scratch.dir().join(OWNER_MEMBERSHIP_FILE).exists();
+        match (&err, published) {
+            (OrgAuthorityError::CertBelowFloor { .. }, true) => {}
+            (OrgAuthorityError::MissingFile { .. }, false) => {}
+            _ => panic!(
+                "startup refusal must match what the ceremony published \
+                 (published={published}), got {err}"
+            ),
+        }
+
+        // A refusal reported to the operator must not have left a
+        // usable authority behind: if the ceremony published before
+        // being overtaken (case 2), the cert on disk is the floored
+        // candidate, not something that would load.
+        if adoption.is_err() && published {
+            let bytes = std::fs::read(scratch.dir().join(OWNER_MEMBERSHIP_FILE)).expect("read");
+            let config: NodeAuthorityConfig =
+                serde_json::from_slice(&bytes).expect("published membership parses");
+            assert_eq!(
+                config.owner_cert.generation, 3,
+                "the published membership must be this ceremony's candidate"
+            );
         }
     }
 
