@@ -117,11 +117,11 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // env-injected because the deck ships from the same
     // workspace and tracks the same release cadence.
     let version = concat!("v", env!("CARGO_PKG_VERSION"));
-    let codename = "DOUBLEBACK";
+    // let codename = "DOUBLEBACK";
     let right = Line::from(vec![
-        Span::styled("CODENAME: ", theme::chrome()),
-        Span::styled(codename, theme::text()),
-        Span::styled("   ", theme::chrome()),
+        // Span::styled("CODENAME: ", theme::chrome()),
+        // Span::styled(codename, theme::text()),
+        // Span::styled("   ", theme::chrome()),
         Span::styled(format!("{version}   "), theme::chrome()),
         Span::styled("?", theme::green_hi()),
         Span::styled(" help", theme::dim()),
