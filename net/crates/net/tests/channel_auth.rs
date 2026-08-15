@@ -49,8 +49,11 @@ struct Node {
 }
 
 async fn build_node() -> Node {
+    build_node_with_config(test_config()).await
+}
+
+async fn build_node_with_config(cfg: MeshNodeConfig) -> Node {
     let keypair = EntityKeypair::generate();
-    let cfg = test_config();
     let mut node = MeshNode::new(keypair.clone(), cfg)
         .await
         .expect("MeshNode::new");
@@ -99,8 +102,17 @@ where
 /// publisher's peer_entity_ids has the subscriber's EntityId before
 /// any subscribe attempt.
 async fn setup_pair(a_caps: CapabilitySet, b_caps: CapabilitySet) -> (Node, Node) {
-    let a = build_node().await;
-    let b = build_node().await;
+    setup_pair_with_configs(test_config(), test_config(), a_caps, b_caps).await
+}
+
+async fn setup_pair_with_configs(
+    a_cfg: MeshNodeConfig,
+    b_cfg: MeshNodeConfig,
+    a_caps: CapabilitySet,
+    b_caps: CapabilitySet,
+) -> (Node, Node) {
+    let a = build_node_with_config(a_cfg).await;
+    let b = build_node_with_config(b_cfg).await;
     handshake_no_start(&a.mesh, &b.mesh).await;
     a.mesh.start();
     b.mesh.start();
@@ -374,6 +386,88 @@ async fn unauth_channel_accepts_everyone() {
         .expect("open-channel publish");
     assert_eq!(report.attempted, 1);
     assert_eq!(report.delivered, 1);
+}
+
+/// A subscribe whose first transmission never reaches the publisher
+/// must still land, via the retransmits `membership_max_attempts`
+/// allows inside the one `membership_ack_timeout` budget.
+///
+/// The membership subprotocol is fire-and-forget UDP —
+/// `send_subprotocol_to_node` hands a frame to `send_datagram` with no
+/// NACKs and no retransmit window. So a single dropped datagram in
+/// either direction used to cost the caller the entire ack timeout and
+/// surface as a hard `Connection` error, on the one control plane whose
+/// callers all just retry anyway. That is what made
+/// `subscribe_accepted_with_valid_token` flake under `llvm-cov` on CI:
+/// 16 concurrent tests on a small runner starved the receive task, the
+/// kernel buffer filled, and one loopback packet went missing.
+///
+/// The partition filter stands in for the loss. It drops in BOTH
+/// directions at the node that holds it, so blocking B at A discards
+/// the `Subscribe` itself rather than only its `Ack` — a strictly
+/// harder case than the CI flake, and the one a single-shot request
+/// cannot survive at all.
+#[tokio::test]
+async fn subscribe_survives_a_dropped_membership_datagram() {
+    // Three attempts across a 3 s budget → roughly one per second.
+    let mut b_cfg = test_config();
+    b_cfg.membership_ack_timeout = Duration::from_secs(3);
+    b_cfg.membership_max_attempts = 3;
+
+    let (a, b) = setup_pair_with_configs(
+        test_config(),
+        b_cfg,
+        CapabilitySet::new(),
+        CapabilitySet::new(),
+    )
+    .await;
+
+    let name = ChannelName::new("lab/lossy").unwrap();
+    a.registry
+        .insert(ChannelConfig::new(ChannelId::new(name.clone())));
+
+    // Black-hole B at A, so B's first attempt is dropped outright.
+    let b_addr = b.mesh.local_addr();
+    a.mesh.block_peer(b_addr);
+
+    let a_id = a.mesh.node_id();
+    let subscribe = tokio::spawn({
+        let b_mesh = b.mesh.clone();
+        let name = name.clone();
+        async move { b_mesh.subscribe_channel(a_id, name).await }
+    });
+
+    // Heal after the first attempt's slice has certainly elapsed but
+    // well inside `session_timeout`, so the peer is never declared
+    // failed — this is packet loss, not a partition.
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    a.mesh.unblock_peer(&b_addr);
+
+    subscribe
+        .await
+        .expect("subscribe task panicked")
+        .expect("a retransmit must carry the subscribe once the loss clears");
+
+    // The subscribe really took effect — a retransmit that merely
+    // returned Ok without rostering the peer would be worse than the
+    // timeout it replaced.
+    let publisher = ChannelPublisher::new(
+        name,
+        PublishConfig {
+            reliability: Reliability::FireAndForget,
+            on_failure: OnFailure::BestEffort,
+            max_inflight: 16,
+        },
+    );
+    let report = a
+        .mesh
+        .publish(&publisher, Bytes::from_static(b"after-loss"))
+        .await
+        .expect("publish after a recovered subscribe");
+    assert_eq!(
+        report.delivered, 1,
+        "the recovered subscribe must leave the peer actually rostered"
+    );
 }
 
 /// M1 (2026-07-31 audit): a token-gated **prefix** channel must work
