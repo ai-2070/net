@@ -8,12 +8,12 @@ cargo add net-mesh-sdk      # the ergonomic SDK, if you want typed channels
 `net-mesh` re-exports as `net`, so user code keeps `use net::…` short. The SDK
 imports as `net_sdk`.
 
-Pinning explicitly, and note the version — **0.35 is the published release**:
+Pinning explicitly, and note the version — **0.36 is the published release**:
 
 ```toml
 [dependencies]
-net-mesh = "0.35"
-net-mesh-sdk = "0.35"
+net-mesh = "0.36"
+net-mesh-sdk = "0.36"
 ```
 
 ### Feature flags
@@ -53,7 +53,7 @@ A minimal build — in-memory bus only, no mesh, no persistence:
 
 ```toml
 [dependencies]
-net-mesh = { version = "0.35", default-features = false }
+net-mesh = { version = "0.36", default-features = false }
 ```
 
 ### What is peculiar about Rust here
