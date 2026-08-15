@@ -26,7 +26,7 @@ concluding the feature is missing.
 ## Versions move together
 
 Every package publishes at the same version from the same commit. The current
-published release is **0.35**. Pin the same version across layers — a core at one
+published release is **0.36**. Pin the same version across layers — a core at one
 version and an SDK at another is a combination nobody built or tested.
 
 ## What an install gives you
