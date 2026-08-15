@@ -1558,6 +1558,17 @@ struct DispatchCtx {
     channel_configs: Option<Arc<ChannelConfigRegistry>>,
     /// In-flight Subscribe/Unsubscribe requests awaiting an Ack, keyed by nonce.
     pending_membership_acks: Arc<DashMap<u64, (u64, oneshot::Sender<MembershipAck>)>>,
+    /// Recently-*rejected* membership requests keyed by `(from_node,
+    /// nonce)`, so a retransmit is re-acked from the recorded reason
+    /// without charging the peer's auth-failure budget twice. Accepted
+    /// requests are deliberately absent — see [`MembershipRejection`].
+    membership_dedupe: Arc<DashMap<(u64, u64), MembershipRejection>>,
+    /// How long a [`MembershipRejection`] stays replayable. Sized at
+    /// `2 ×` the sender's `membership_ack_timeout` — every retransmit
+    /// of a request happens inside that one budget, so double it is
+    /// ample slack for scheduling and clock jitter, and short enough
+    /// that a peer that goes away leaves nothing worth evicting.
+    membership_dedupe_ttl: Duration,
     /// In-flight reflex probes keyed by the responder's `node_id`.
     /// Populated by `MeshNode::probe_reflex`; the dispatch branch
     /// for `SUBPROTOCOL_REFLEX` completes the oneshot with the
@@ -1888,6 +1899,25 @@ pub struct MeshNodeConfig {
     /// Timeout for `subscribe_channel` / `unsubscribe_channel` to wait
     /// for an `Ack` before returning `AdapterError::Timeout`.
     pub membership_ack_timeout: Duration,
+    /// How many times a `Subscribe` / `Unsubscribe` is put on the wire
+    /// before the request gives up, **counting the first transmission**.
+    ///
+    /// The membership subprotocol rides `send_subprotocol_to_node`,
+    /// which is fire-and-forget UDP — no NACKs, no retransmit window,
+    /// none of the `Reliability::Reliable` machinery. So a single
+    /// dropped datagram in either direction (request or `Ack`) used to
+    /// cost the caller the whole `membership_ack_timeout` and surface
+    /// as a hard `Connection` error, on a control plane where the
+    /// natural caller response is to retry anyway.
+    ///
+    /// Attempts share the `membership_ack_timeout` budget rather than
+    /// each getting their own, so the total wall time a caller can
+    /// block is unchanged. All attempts reuse one nonce; the receiver
+    /// dedupes on it (see `membership_dedupe`), so a retransmit is
+    /// re-acked from the cached verdict instead of being re-authorized.
+    ///
+    /// `1` restores the pre-fix single-shot behavior.
+    pub membership_max_attempts: u32,
     /// Drop inbound `CapabilityAnnouncement` packets whose signature
     /// is missing. Defaults to `true` because the cap data feeds
     /// channel-auth (`can_publish` / `can_subscribe` cap filters)
@@ -2329,6 +2359,7 @@ impl MeshNodeConfig {
             max_streams: 4096,
             max_channels_per_peer: 1024,
             membership_ack_timeout: Duration::from_secs(5),
+            membership_max_attempts: 3,
             require_signed_capabilities: true,
             capability_gc_interval: Duration::from_secs(60),
             admission_replay: super::behavior::org_admission_replay::AdmissionReplayConfig::default(
@@ -2501,6 +2532,14 @@ impl MeshNodeConfig {
     /// [`Self::enable_stream_ack_ranges`].
     pub fn with_stream_ack_ranges(mut self, enable: bool) -> Self {
         self.enable_stream_ack_ranges = enable;
+        self
+    }
+
+    /// Set how many times a membership request is transmitted before
+    /// giving up, counting the first send. See
+    /// [`Self::membership_max_attempts`]. Clamped to at least 1.
+    pub fn with_membership_max_attempts(mut self, attempts: u32) -> Self {
+        self.membership_max_attempts = attempts.max(1);
         self
     }
 
@@ -3524,6 +3563,51 @@ struct AuthFailureState {
     /// subscribe short-circuits with `RateLimited`.
     throttled_until: Option<std::time::Instant>,
 }
+
+/// A *rejected* membership request, remembered just long enough to
+/// answer the retransmits of the request that produced it.
+///
+/// `membership_max_attempts` puts the same `Subscribe` on the wire more
+/// than once when an `Ack` doesn't come back, so the publisher can see
+/// several copies of one request. Re-deciding an **accepted** copy is
+/// harmless and is what we do: every write on that path is idempotent
+/// (`allow_channel`, `roster.add_with_mode`, `clear_auth_failures`), and
+/// re-running `authorize_subscribe` is in fact what re-inserts the
+/// verified chain into `subscriber_chains` — replaying a cached accept
+/// instead would skip that, and a replay landing after an eviction
+/// would leave the peer rostered with no retained chain for the sweep
+/// to check.
+///
+/// The **reject** path is the one that must not repeat:
+/// `record_auth_failure` is a counter against
+/// `max_auth_failures_per_window`. Without this cache a peer whose
+/// `Ack` got dropped would burn 2–3 slots of its budget for a single
+/// rejected subscribe, so packet loss alone could throttle a peer that
+/// never spammed anything.
+///
+/// Caching only rejections keeps the counter honest — one charge per
+/// *distinct* request — without weakening it: a peer that reuses one
+/// nonce is charged once and stays rejected, and a peer that spams
+/// fresh nonces is charged for every one of them.
+#[derive(Debug, Clone, Copy)]
+struct MembershipRejection {
+    /// Echoed back on a replayed `Ack` so a retransmit gets the same
+    /// answer the lost `Ack` carried.
+    reason: Option<AckReason>,
+    /// When the rejection was recorded, for TTL pruning.
+    at: std::time::Instant,
+}
+
+/// Hard cap on remembered membership rejections.
+///
+/// The TTL alone bounds nothing useful: a peer spamming fresh nonces
+/// fills the map as fast as it can send, which is the same
+/// memory-growth vector the rejected-subscribe path was already
+/// hardened against. At the cap the cache stops accepting new entries,
+/// so membership degrades to the pre-dedupe behavior — every
+/// retransmit charged, which under exactly that kind of spam is the
+/// behavior you want anyway — rather than growing without bound.
+const MEMBERSHIP_DEDUPE_MAX: usize = 4096;
 
 /// Evict subscribers whose tokens have expired. Walks the roster by
 /// peer and, for every `require_token` channel they hold, runs the
@@ -8652,6 +8736,10 @@ pub struct MeshNode {
     channel_configs: Option<Arc<ChannelConfigRegistry>>,
     /// In-flight Subscribe/Unsubscribe requests keyed by nonce.
     pending_membership_acks: Arc<DashMap<u64, (u64, oneshot::Sender<MembershipAck>)>>,
+    /// Recently-rejected membership requests keyed by `(from_node,
+    /// nonce)`. Shared with `DispatchCtx` via `Arc` clone; see the
+    /// field of the same name there and [`MembershipRejection`].
+    membership_dedupe: Arc<DashMap<(u64, u64), MembershipRejection>>,
     /// In-flight reflex probes keyed by the responder's `node_id`.
     /// Shared with `DispatchCtx` via `Arc` clone so the dispatcher
     /// can complete oneshots without routing back through
@@ -10374,6 +10462,7 @@ impl MeshNode {
             roster,
             channel_configs: None,
             pending_membership_acks: Arc::new(DashMap::new()),
+            membership_dedupe: Arc::new(DashMap::new()),
             #[cfg(feature = "nat-traversal")]
             pending_reflex_probes: Arc::new(DashMap::new()),
             #[cfg(feature = "nat-traversal")]
@@ -17667,6 +17756,8 @@ impl MeshNode {
             roster: self.roster.clone(),
             channel_configs: self.channel_configs.clone(),
             pending_membership_acks: self.pending_membership_acks.clone(),
+            membership_dedupe: self.membership_dedupe.clone(),
+            membership_dedupe_ttl: self.config.membership_ack_timeout * 2,
             #[cfg(feature = "nat-traversal")]
             pending_reflex_probes: self.pending_reflex_probes.clone(),
             #[cfg(feature = "nat-traversal")]
@@ -23165,43 +23256,87 @@ impl MeshNode {
         };
         let bytes = membership::encode(&msg);
 
-        let (tx, rx) = oneshot::channel::<MembershipAck>();
+        let (tx, mut rx) = oneshot::channel::<MembershipAck>();
         // Bind to publisher_node_id — the node we're sending the
         // Subscribe/Unsubscribe to is the only legitimate Ack source.
         self.pending_membership_acks
             .insert(nonce, (publisher_node_id, tx));
 
-        // Scoped send; if it fails, drop the pending entry so memory
-        // doesn't accumulate.
-        // Node-keyed: the membership request is addressed to a peer we
-        // already identified. Round-tripping that id through an address
-        // could not reach a peer we hold only a routed session with —
-        // its address belongs to the relay.
-        if let Err(e) = self
-            .send_subprotocol_to_node(publisher_node_id, SUBPROTOCOL_CHANNEL_MEMBERSHIP, &bytes)
-            .await
-        {
-            self.pending_membership_acks.remove(&nonce);
-            return Err(MembershipFailure::Transport(e));
+        // This subprotocol is fire-and-forget UDP (`send_subprotocol_to_node`
+        // builds a frame and hands it straight to `send_datagram` — no NACKs,
+        // no retransmit window). One dropped datagram in either direction
+        // therefore used to cost the caller the entire ack timeout and come
+        // back as a hard error, on the control plane whose callers all just
+        // retry. So put the request on the wire up to
+        // `membership_max_attempts` times, splitting the ONE
+        // `membership_ack_timeout` budget across the attempts rather than
+        // giving each its own: the documented "blocks until the Ack arrives or
+        // `membership_ack_timeout` elapses" contract is unchanged, and the
+        // caller just gets more than one shot inside it.
+        //
+        // Every attempt reuses `nonce`, which is what makes the retransmit
+        // safe: the publisher's dedupe keys on `(from_node, nonce)` and
+        // re-acks a rejection from its recorded verdict instead of charging
+        // the peer's auth-failure budget again, while an accepted request
+        // re-runs an idempotent path. A fresh nonce per attempt would look
+        // like N distinct requests and defeat both.
+        let attempts = self.config.membership_max_attempts.max(1);
+        let per_attempt = self.config.membership_ack_timeout / attempts;
+
+        let mut ack = None;
+        for attempt in 0..attempts {
+            // Scoped send; if it fails, drop the pending entry so memory
+            // doesn't accumulate.
+            // Node-keyed: the membership request is addressed to a peer we
+            // already identified. Round-tripping that id through an address
+            // could not reach a peer we hold only a routed session with —
+            // its address belongs to the relay.
+            if let Err(e) = self
+                .send_subprotocol_to_node(publisher_node_id, SUBPROTOCOL_CHANNEL_MEMBERSHIP, &bytes)
+                .await
+            {
+                self.pending_membership_acks.remove(&nonce);
+                return Err(MembershipFailure::Transport(e));
+            }
+
+            // `&mut rx` so a slice that expires leaves the receiver intact
+            // for the next attempt — taking `rx` by value would drop the
+            // channel and orphan the `Ack` still in flight from an earlier
+            // transmission, turning a merely-slow publisher into a failure.
+            match tokio::time::timeout(per_attempt, &mut rx).await {
+                Ok(Ok(a)) => {
+                    ack = Some(a);
+                    break;
+                }
+                Ok(Err(_)) => {
+                    self.pending_membership_acks.remove(&nonce);
+                    return Err(MembershipFailure::Transport(AdapterError::Connection(
+                        "membership ack channel closed".into(),
+                    )));
+                }
+                Err(_) => {
+                    if attempt + 1 < attempts {
+                        tracing::debug!(
+                            nonce,
+                            publisher = publisher_node_id,
+                            channel = %channel,
+                            attempt = attempt + 1,
+                            attempts,
+                            "membership ack not received; retransmitting"
+                        );
+                    }
+                }
+            }
         }
 
-        let ack = match tokio::time::timeout(self.config.membership_ack_timeout, rx).await {
-            Ok(Ok(ack)) => ack,
-            Ok(Err(_)) => {
-                self.pending_membership_acks.remove(&nonce);
-                return Err(MembershipFailure::Transport(AdapterError::Connection(
-                    "membership ack channel closed".into(),
-                )));
-            }
-            Err(_) => {
-                self.pending_membership_acks.remove(&nonce);
-                return Err(MembershipFailure::Transport(AdapterError::Connection(
-                    format!(
-                        "membership ack timeout ({:?}) for channel {}",
-                        self.config.membership_ack_timeout, channel
-                    ),
-                )));
-            }
+        let Some(ack) = ack else {
+            self.pending_membership_acks.remove(&nonce);
+            return Err(MembershipFailure::Transport(AdapterError::Connection(
+                format!(
+                    "membership ack timeout ({:?}, {} attempts) for channel {}",
+                    self.config.membership_ack_timeout, attempts, channel
+                ),
+            )));
         };
 
         if !ack.accepted {
@@ -23230,13 +23365,22 @@ impl MeshNode {
                 token,
                 queue_group,
             } => {
-                let (accepted, reason) = Self::authorize_subscribe(
-                    &channel,
-                    from_node,
-                    token.as_deref(),
-                    queue_group.as_deref(),
-                    ctx,
-                );
+                // A retransmit of a request we already refused answers
+                // from the recorded verdict: same `Ack`, no second
+                // charge against the peer's auth-failure budget. An
+                // accepted request is deliberately NOT cached and is
+                // re-decided in full — see [`MembershipRejection`].
+                let replayed = Self::recorded_membership_rejection(from_node, nonce, ctx);
+                let (accepted, reason) = match replayed {
+                    Some(hit) => (false, hit.reason),
+                    None => Self::authorize_subscribe(
+                        &channel,
+                        from_node,
+                        token.as_deref(),
+                        queue_group.as_deref(),
+                        ctx,
+                    ),
+                };
                 if accepted {
                     // Populate the AuthGuard fast path so publish
                     // fan-out can admit this subscriber in <10 ns
@@ -23258,17 +23402,24 @@ impl MeshNode {
                     };
                     ctx.roster.add_with_mode(id, from_node, mode);
                     Self::clear_auth_failures(from_node, ctx);
-                } else if !matches!(
-                    reason,
-                    Some(AckReason::TooManyChannels) | Some(AckReason::RateLimited)
-                ) {
-                    // Count auth-rule rejections toward the
-                    // failure budget. Resource limits
-                    // (TooManyChannels) and throttle short-
-                    // circuits (RateLimited) don't — the former
-                    // is orthogonal, the latter is the *result*
-                    // of past failures and would double-count.
-                    Self::record_auth_failure(from_node, ctx);
+                } else if replayed.is_none() {
+                    // First time we've refused THIS request. A
+                    // retransmit of it skips this arm entirely, so one
+                    // rejected subscribe costs one slot of the budget
+                    // no matter how many copies packet loss produces.
+                    Self::record_membership_rejection(from_node, nonce, reason, ctx);
+                    if !matches!(
+                        reason,
+                        Some(AckReason::TooManyChannels) | Some(AckReason::RateLimited)
+                    ) {
+                        // Count auth-rule rejections toward the
+                        // failure budget. Resource limits
+                        // (TooManyChannels) and throttle short-
+                        // circuits (RateLimited) don't — the former
+                        // is orthogonal, the latter is the *result*
+                        // of past failures and would double-count.
+                        Self::record_auth_failure(from_node, ctx);
+                    }
                 }
                 Self::send_membership_ack(from_node, nonce, accepted, reason, ctx);
             }
@@ -28114,6 +28265,58 @@ impl MeshNode {
                 None => false,
             },
         }
+    }
+
+    /// The rejection already recorded for `(from_node, nonce)`, if this
+    /// exact request was decided recently enough to still be replayable.
+    ///
+    /// A hit means "this is a retransmit of a request we already
+    /// refused" — re-ack it, but don't charge the peer's auth-failure
+    /// budget a second time. See [`MembershipRejection`].
+    fn recorded_membership_rejection(
+        from_node: u64,
+        nonce: u64,
+        ctx: &DispatchCtx,
+    ) -> Option<MembershipRejection> {
+        let hit = *ctx.membership_dedupe.get(&(from_node, nonce))?;
+        if hit.at.elapsed() >= ctx.membership_dedupe_ttl {
+            // Aged out between the sender's last retransmit and now.
+            // Drop it here so the map self-prunes on lookup as well as
+            // on insert.
+            ctx.membership_dedupe.remove(&(from_node, nonce));
+            return None;
+        }
+        Some(hit)
+    }
+
+    /// Remember that `(from_node, nonce)` was rejected, so the request's
+    /// retransmits get the same `Ack` without a second
+    /// `record_auth_failure`.
+    ///
+    /// Prunes expired entries when the map reaches
+    /// [`MEMBERSHIP_DEDUPE_MAX`]; if the prune doesn't get it back under
+    /// the cap the insert is skipped, which costs only the dedupe (the
+    /// rejection itself already happened) and never unbounded memory.
+    fn record_membership_rejection(
+        from_node: u64,
+        nonce: u64,
+        reason: Option<AckReason>,
+        ctx: &DispatchCtx,
+    ) {
+        if ctx.membership_dedupe.len() >= MEMBERSHIP_DEDUPE_MAX {
+            let ttl = ctx.membership_dedupe_ttl;
+            ctx.membership_dedupe.retain(|_, v| v.at.elapsed() < ttl);
+            if ctx.membership_dedupe.len() >= MEMBERSHIP_DEDUPE_MAX {
+                return;
+            }
+        }
+        ctx.membership_dedupe.insert(
+            (from_node, nonce),
+            MembershipRejection {
+                reason,
+                at: std::time::Instant::now(),
+            },
+        );
     }
 
     /// Send an `Ack` on the membership subprotocol back to `to_node`.
@@ -41968,6 +42171,9 @@ mod subnet_visible_unknown_tests {
 #[cfg(test)]
 mod membership_failure_tests {
     use super::*;
+    use crate::adapter::net::ChannelConfig;
+
+    const PSK: [u8; 32] = [0x5Au8; 32];
 
     /// Only the origin-binding `Unauthorized` warrants a corrective
     /// re-announce.
@@ -42001,6 +42207,141 @@ mod membership_failure_tests {
             !MembershipFailure::Transport(AdapterError::Connection("peer gone".into()))
                 .warrants_reannounce(),
             "a peer that is simply gone must not drive re-announces"
+        );
+    }
+
+    /// Build a node whose `deny/*` channel requires a `gpu` tag, so a
+    /// subscribe from a peer that announced nothing is rejected
+    /// `Unauthorized` without any signature work.
+    async fn node_with_gated_channel() -> (MeshNode, ChannelName) {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut node = MeshNode::new(EntityKeypair::generate(), MeshNodeConfig::new(addr, PSK))
+            .await
+            .expect("MeshNode::new");
+        let registry = Arc::new(ChannelConfigRegistry::new());
+        let channel = ChannelName::new("deny/gated").unwrap();
+        registry.insert(
+            ChannelConfig::new(ChannelId::new(channel.clone())).with_subscribe_caps(
+                super::super::behavior::capability::CapabilityFilter::new().require_tag("gpu"),
+            ),
+        );
+        node.set_channel_configs(registry);
+        (node, channel)
+    }
+
+    fn subscribe_bytes(channel: &ChannelName, nonce: u64) -> Vec<u8> {
+        membership::encode(&MembershipMsg::Subscribe {
+            channel: channel.clone(),
+            nonce,
+            token: None,
+            queue_group: None,
+        })
+    }
+
+    fn failures_for(ctx: &DispatchCtx, node: u64) -> u16 {
+        ctx.auth_failures.get(&node).map_or(0, |e| e.failures)
+    }
+
+    /// A retransmitted `Subscribe` costs its sender exactly ONE slot of
+    /// `max_auth_failures_per_window`, no matter how many copies arrive.
+    ///
+    /// `membership_max_attempts` puts the same request on the wire more
+    /// than once when the `Ack` is lost, and the reject path's
+    /// `record_auth_failure` is a counter. Charging per *copy* rather
+    /// than per *request* would let packet loss alone throttle a peer
+    /// that never spammed anything — the peer would spend its whole
+    /// budget on a handful of honest subscribes.
+    #[tokio::test]
+    async fn retransmitted_subscribe_is_charged_to_the_auth_budget_once() {
+        const PEER: u64 = 0xBEEF;
+
+        let (node, channel) = node_with_gated_channel().await;
+        let ctx = node.dispatch_ctx();
+        let payload = subscribe_bytes(&channel, 0x1234_5678);
+
+        MeshNode::handle_membership_message(&payload, PEER, &ctx);
+        assert_eq!(
+            failures_for(&ctx, PEER),
+            1,
+            "the first rejection must charge the budget"
+        );
+
+        // Two retransmits of the SAME request — same nonce.
+        MeshNode::handle_membership_message(&payload, PEER, &ctx);
+        MeshNode::handle_membership_message(&payload, PEER, &ctx);
+        assert_eq!(
+            failures_for(&ctx, PEER),
+            1,
+            "retransmits of one request must not each charge the budget"
+        );
+
+        // A genuinely new request (fresh nonce) still charges — the
+        // dedupe must not become a way to subscribe-spam for free.
+        MeshNode::handle_membership_message(&subscribe_bytes(&channel, 0x9999), PEER, &ctx);
+        assert_eq!(
+            failures_for(&ctx, PEER),
+            2,
+            "a distinct request must be charged even from a peer with a cached rejection"
+        );
+    }
+
+    /// Accepted subscribes are deliberately NOT cached: a retransmit
+    /// re-runs `authorize_subscribe` in full.
+    ///
+    /// That re-run is what re-inserts the verified chain into
+    /// `subscriber_chains`. Replaying a cached accept instead would skip
+    /// it, and a replay landing after an eviction would leave the peer
+    /// rostered with nothing for the sweep to re-verify — subscribed on
+    /// paper, unbacked in fact.
+    #[tokio::test]
+    async fn accepted_subscribe_is_reprocessed_not_replayed() {
+        const PEER: u64 = 0xFEED;
+
+        // No registry at all ⇒ the ACL is bypassed and the subscribe is
+        // accepted.
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let node = MeshNode::new(EntityKeypair::generate(), MeshNodeConfig::new(addr, PSK))
+            .await
+            .expect("MeshNode::new");
+        let ctx = node.dispatch_ctx();
+        let channel = ChannelName::new("open/plain").unwrap();
+        let id = ChannelId::new(channel.clone());
+        let payload = subscribe_bytes(&channel, 0xAAAA);
+
+        MeshNode::handle_membership_message(&payload, PEER, &ctx);
+        assert!(ctx.roster.is_subscribed(PEER, &id), "first subscribe lands");
+
+        // The eviction a replayed accept would fail to repair.
+        ctx.roster.remove(&id, PEER);
+        MeshNode::handle_membership_message(&payload, PEER, &ctx);
+        assert!(
+            ctx.roster.is_subscribed(PEER, &id),
+            "a retransmitted accept must re-run the accept path, not replay a cached verdict"
+        );
+        assert!(
+            ctx.membership_dedupe.is_empty(),
+            "accepted requests must not occupy the rejection cache"
+        );
+    }
+
+    /// The rejection cache is bounded. A peer spamming fresh nonces is
+    /// the same memory-growth vector the rejected-subscribe path was
+    /// already hardened against, and a TTL alone doesn't bound it —
+    /// entries arrive as fast as the peer can send.
+    #[tokio::test]
+    async fn membership_rejection_cache_is_bounded() {
+        const PEER: u64 = 0x5EED;
+
+        let (node, _channel) = node_with_gated_channel().await;
+        let ctx = node.dispatch_ctx();
+
+        for nonce in 0..(MEMBERSHIP_DEDUPE_MAX as u64 * 2) {
+            MeshNode::record_membership_rejection(PEER, nonce, Some(AckReason::Unauthorized), &ctx);
+        }
+        assert!(
+            ctx.membership_dedupe.len() <= MEMBERSHIP_DEDUPE_MAX,
+            "rejection cache grew past its cap: {}",
+            ctx.membership_dedupe.len()
         );
     }
 
