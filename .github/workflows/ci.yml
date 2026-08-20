@@ -1593,7 +1593,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.97.1"
+          toolchain: "1.98.0"
           components: clippy, rustfmt, llvm-tools-preview
 
       - uses: Swatinem/rust-cache@v2
@@ -1723,7 +1723,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.97.1"
+          toolchain: "1.98.0"
 
       - uses: Swatinem/rust-cache@v2
         with:
