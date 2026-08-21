@@ -1,0 +1,19 @@
+net/crates/net/tests/subnet_auth_e2e.rs
+  s_40089823396c99::t_1107bbb52e0f04 190-209
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "c8deb6ef3f2c313df31e03bc01a3973fefc8efb4",
+  "prompts": {},
+  "sessions": {
+    "s_40089823396c99": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9026ab7a-c341-40e2-8428-e61bed141534",
+        "model": "claude-opus-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
