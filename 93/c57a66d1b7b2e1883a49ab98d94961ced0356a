@@ -1,0 +1,66 @@
+net/crates/net/docs/misc/CODE_REVIEW_2026_06_21_NAT_TRAVERSAL.md
+  s_d15043c27a0f20::t_f7d06708844fa7 373-374,376-379
+  s_d15043c27a0f20::t_ce43cfcfbc348c 49
+  s_d15043c27a0f20::t_b295df0f1b43b7 277-303
+net/crates/net/src/adapter/net/traversal/mod.rs
+  s_d15043c27a0f20::t_a16398374aaf0f 356-382
+net/crates/net/docs/plans/NAT_TRAVERSAL_V2_PLAN.md
+  s_d15043c27a0f20::t_c7ae86fd6df38b 303-304
+net/crates/net/src/adapter/net/traversal/config.rs
+  s_d15043c27a0f20::t_4ab4e0af8bd85e 58-91,102-105
+  s_d15043c27a0f20::t_da6b5ebdbb7b17 124-127
+net/crates/net/src/adapter/net/traversal/rendezvous.rs
+  s_d15043c27a0f20::t_a3f9c0259d0cb0 551-558
+  s_d15043c27a0f20::t_e469462df6833f 88-104
+  s_d15043c27a0f20::t_5aad3dec8465ce 36-37
+  s_d15043c27a0f20::t_73194306f22199 496-504
+  s_d15043c27a0f20::t_cbcb36606a52db 279-337
+  s_d15043c27a0f20::t_ea091ebebec9ec 381-399,409-412,418-419,425
+  s_d15043c27a0f20::t_db083657a6592a 713-772
+  s_d15043c27a0f20::t_821a2733c96f00 162,176-178
+  s_d15043c27a0f20::t_46731a1ff69547 179
+net/crates/net/tests/rendezvous_introduce_validation.rs
+  s_d15043c27a0f20::t_a1e49c577d68f4 395-410,412,415,426,430-441,443-444,447,449
+  s_d15043c27a0f20::t_4564c25591a970 370-394,411,413-414,416-425,427-429,442,445-446,448,450-451
+net/crates/net/tests/rendezvous_coordinator.rs
+  s_d15043c27a0f20::t_8b6697272ff798 391,400-404,406
+  s_d15043c27a0f20::t_14e487f4d38e3a 521-580
+  s_d15043c27a0f20::t_a2a7a7b8c982b4 225-229,231
+  s_d15043c27a0f20::t_488388f9facebb 249-255,257-258,260-261
+  s_d15043c27a0f20::t_8a87da5a8c2b5d 293-298,301,308
+  s_d15043c27a0f20::t_e295180b1a6a4c 368,376-381,384-385
+  s_d15043c27a0f20::t_c84bcb8d7b8511 436,449-451,453,456,458-459
+net/crates/net/src/adapter/net/mesh.rs
+  s_d15043c27a0f20::t_52389acb011aee 6658-6686
+  s_d15043c27a0f20::t_73c9c557c2eb5c 586-708
+  s_d15043c27a0f20::t_68571a2a896602 1085-1086,1088
+  s_d15043c27a0f20::t_821a500d044386 6577-6582,6604-6610,6612-6613
+  s_d15043c27a0f20::t_c49bf547238414 9867-9869,9878,9880
+  s_d15043c27a0f20::t_b0a83c1b7deec2 9953-9965,9971-9986,9988,9992-10007,10009-10025
+  s_d15043c27a0f20::t_0facefbf1cc51a 4928
+  s_d15043c27a0f20::t_9b1dbb94b51aed 10051-10056,10062
+  s_d15043c27a0f20::t_f1f71e1fc71186 10146-10150
+  s_d15043c27a0f20::t_8bc57ea96beefc 2760-2763,2765
+  s_d15043c27a0f20::t_cf2adc1e661cef 14843-14850
+  s_d15043c27a0f20::t_9b4af7851df698 3611
+  s_d15043c27a0f20::t_5cd742a217eb6c 9705-9771,9787,9789,9803-9805,9821,9823
+  s_d15043c27a0f20::t_41ddd2e7828f47 14897-14900
+  s_d15043c27a0f20::t_709bbde9de2555 14777-14781,14783-14784
+  s_d15043c27a0f20::t_0c4f98083878ca 567-568
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "93c57a66d1b7b2e1883a49ab98d94961ced0356a",
+  "prompts": {},
+  "sessions": {
+    "s_d15043c27a0f20": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "47de36b5-a0ab-46ec-8280-668f1f28ce92",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

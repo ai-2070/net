@@ -1,0 +1,25 @@
+net/crates/net/bindings/node/src/capability_gateway.rs
+  s_8145011de91f43::t_7425eec21428bf 692
+  s_8145011de91f43::t_9ecc232bc3b3ac 609
+  s_8145011de91f43::t_f099fc930e7405 681
+  s_8145011de91f43::t_5878640fc2ffcd 622
+  s_8145011de91f43::t_82805b33023355 701
+.claude/skills/net-payments/bindings.md
+  s_8145011de91f43::t_b9c9d5b0c5d02a 210-211
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "04ee794b777cb74dd0d3c2eb0e6411e747b11137",
+  "prompts": {},
+  "sessions": {
+    "s_8145011de91f43": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "96805a67-4a02-4942-ad40-e539bfe24a47",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

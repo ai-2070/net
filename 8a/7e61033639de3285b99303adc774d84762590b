@@ -1,0 +1,21 @@
+net/crates/net/docs/plans/ISLAND_CLAIM_BENCHMARK_PLAN.md
+  s_c28bdf38c0df3a::t_c12c0e1d402dc0 352-440
+  s_c28bdf38c0df3a::t_dd762ac8f6a82f 3-12
+  s_c28bdf38c0df3a::t_93145a8e7ded55 139-142
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "8a7e61033639de3285b99303adc774d84762590b",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

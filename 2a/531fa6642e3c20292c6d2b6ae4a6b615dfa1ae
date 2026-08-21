@@ -1,0 +1,20 @@
+web/src/docs.order.ts
+  s_194734e88f5f20::t_c1318a70c3dac5 297
+  s_194734e88f5f20::t_200ff422a36098 139
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "2a531fa6642e3c20292c6d2b6ae4a6b615dfa1ae",
+  "prompts": {},
+  "sessions": {
+    "s_194734e88f5f20": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b105284e-cf63-4195-a44b-3da9b5a80a29",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

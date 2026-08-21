@@ -1,0 +1,23 @@
+net/crates/net/docs/plans/NAT_TRAVERSAL_V2_PLAN.md
+  s_d15043c27a0f20::t_7ce3a3cd069a11 196,200-202,204,208-210,216-223
+  s_d15043c27a0f20::t_6669eb90b5aefd 328
+  s_d15043c27a0f20::t_df9f5b82764fd3 333
+  s_d15043c27a0f20::t_dfb83a5aec27a5 316-317
+  s_d15043c27a0f20::t_011fd74fe51eaf 224
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "c4c421a70cc13e69815cf44ff7125c27697ac14b",
+  "prompts": {},
+  "sessions": {
+    "s_d15043c27a0f20": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "47de36b5-a0ab-46ec-8280-668f1f28ce92",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

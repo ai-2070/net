@@ -1,0 +1,21 @@
+net/crates/net/Cargo.lock
+  s_b9010668dcf322::t_2c5b695f2b03fb 956,958,965,967
+net/crates/net/fuzz/Cargo.lock
+  s_b9010668dcf322::t_46c234280169b1 335,337,344,346
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "2b831dde50e9dc1c9ddac0948372f673037ce826",
+  "prompts": {},
+  "sessions": {
+    "s_b9010668dcf322": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "962c7dfd-7fbc-4808-bdef-6222d8f5d096",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

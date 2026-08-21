@@ -1,0 +1,22 @@
+net/crates/net/sdk/src/tool_payment.rs
+  s_8145011de91f43::t_67a1eb1ff15ae8 403,412-413
+  s_8145011de91f43::t_4b3e1bcccc703e 394-402,404-411
+net/crates/net/tests/cross_lang_payments/README.md
+  s_8145011de91f43::t_d546ab7269804f 65-76
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "6acb939865419080c740a0d7c5d58809635f2e01",
+  "prompts": {},
+  "sessions": {
+    "s_8145011de91f43": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "96805a67-4a02-4942-ad40-e539bfe24a47",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

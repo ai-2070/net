@@ -1,0 +1,19 @@
+net/crates/net/docs/plans/PAYMENTS_BENCHMARKS_PLAN.md
+  s_49cc2ab0880501::t_43c9cbf7770a21 3-21,26-32,34,36-46,48-59,65-100,104-135,139-159,161,163,165-168,170-174,176-178,180,182-185,187-189,191-276,280-294,298-324,330-340
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "12ee5b1c13739f39ca016e2dace82da0b2ee68fc",
+  "prompts": {},
+  "sessions": {
+    "s_49cc2ab0880501": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1bc5d9ed-b590-4842-a9b4-43f10e352741",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

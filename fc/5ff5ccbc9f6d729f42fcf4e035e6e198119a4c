@@ -1,0 +1,27 @@
+net/crates/net/tests/org_ownership.rs
+  s_9298fd786cc20e::t_e8001f0310b689 1845-1848,1850,1859-1860,1868-1877,1879
+net/crates/net/src/adapter/net/mesh.rs
+  s_9298fd786cc20e::t_26fbcfae561f07 7237-7248
+  s_9298fd786cc20e::t_7a0c05fb1b65b3 7345
+  s_9298fd786cc20e::t_c79812096f92ab 7259-7260,7431-7434
+  s_9298fd786cc20e::t_1af0fb8bbddc45 7356-7360
+  s_9298fd786cc20e::t_c813e2a8ad91b0 7414-7422
+  s_9298fd786cc20e::t_7ac6b8b43f1d42 7375
+  s_9298fd786cc20e::t_e352b80b9c1c89 7261
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "fc5ff5ccbc9f6d729f42fcf4e035e6e198119a4c",
+  "prompts": {},
+  "sessions": {
+    "s_9298fd786cc20e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b66914e-9464-4925-9eaf-43ca3fe549a1",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

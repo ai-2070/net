@@ -1,0 +1,20 @@
+net/crates/net/tests/rendezvous_introduce_validation.rs
+  s_c28bdf38c0df3a::t_0178ce2c5463b2 355-356
+  s_c28bdf38c0df3a::t_7c9ea0636ef458 321-336,338,343-344,351-354,358-359,362-363
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "413233a0d63304b77daa71fc7de1654017d6e969",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

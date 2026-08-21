@@ -1,0 +1,21 @@
+.github/workflows/ci.yml
+  s_9154b2b350271d::t_17e57ab4679110 155
+  s_9154b2b350271d::t_467c9b11406699 165
+  s_9154b2b350271d::t_b53dde82987fb3 248-251,258-261
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "0fce5c13829165b38a1aafdbe083bb6693077b27",
+  "prompts": {},
+  "sessions": {
+    "s_9154b2b350271d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d98fa485-64dd-4080-821b-7d096bd891cb",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

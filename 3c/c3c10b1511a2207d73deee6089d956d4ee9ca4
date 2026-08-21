@@ -1,0 +1,21 @@
+net/crates/net/payments/src/flow/mod.rs
+  s_ac213343b6b34b::t_7a39e86157788b 52-57,72-79
+net/crates/net/payments/tests/native_tool_gate.rs
+  s_ac213343b6b34b::t_f5529467cbac7c 106-152
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3cc3c10b1511a2207d73deee6089d956d4ee9ca4",
+  "prompts": {},
+  "sessions": {
+    "s_ac213343b6b34b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8d7c0951-4b90-460d-a264-8a57a5f7927a",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

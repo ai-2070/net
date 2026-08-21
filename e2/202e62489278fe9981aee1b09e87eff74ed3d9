@@ -1,0 +1,33 @@
+.claude/skills/net-event-bus/examples/README.md
+  s_4e844c75f3aded::t_fa70e3c4228060 74
+.github/scripts/check-skill-examples.sh
+  s_4e844c75f3aded::t_541e9e47c9f7c7 4,40
+.github/scripts/run-skill-examples.sh
+  s_4e844c75f3aded::t_0b2a325ebdedf3 13,51
+.github/scripts/skill_examples.py
+  s_4e844c75f3aded::t_b4ff015a49842a 2,24,30-34,36-43,56,91-130,275-350,356,361-363,366
+.github/workflows/ci.yml
+  s_4e844c75f3aded::t_9b8cae56154b51 22
+.github/workflows/skills.yml
+  s_4e844c75f3aded::t_83728b4e6cf393 56,103
+docs/data/README.md
+  s_4e844c75f3aded::t_d4ccb163abdb37 20
+docs/data/examples.yaml
+  s_4e844c75f3aded::t_63bb177d1ee1c5 1-89
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "e2202e62489278fe9981aee1b09e87eff74ed3d9",
+  "prompts": {},
+  "sessions": {
+    "s_4e844c75f3aded": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a15fe99c-1910-4f73-ae09-8a2ba5b4ff55",
+        "model": "unknown"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

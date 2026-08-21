@@ -1,0 +1,22 @@
+net/crates/net/src/adapter/net/org_admission_gate.rs
+  s_9298fd786cc20e::t_eb5e79c3d6482c 66
+  s_9298fd786cc20e::t_68508c355f606b 472-490,495-506,511-515
+  s_9298fd786cc20e::t_64c50e137d223c 491-494,507-510
+  s_9298fd786cc20e::t_49769a035af05e 59-65
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "a0ca4820534e31578046bc9b6f21c794e89268bc",
+  "prompts": {},
+  "sessions": {
+    "s_9298fd786cc20e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b66914e-9464-4925-9eaf-43ca3fe549a1",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

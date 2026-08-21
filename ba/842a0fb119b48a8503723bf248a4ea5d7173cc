@@ -1,0 +1,25 @@
+net/crates/net/tests/nrpc_registration_order.rs
+  s_9298fd786cc20e::t_2c01840b42de14 1-24,27,33-172
+  s_9298fd786cc20e::t_7d5c4c811bf3fa 28-32
+  s_9298fd786cc20e::t_04ef7adea53ded 25-26
+net/crates/net/src/adapter/net/mesh_rpc.rs
+  s_9298fd786cc20e::t_a2b104384e3b06 2948-2949
+  s_9298fd786cc20e::t_bb8d6806316b08 2945-2947,2950
+  s_9298fd786cc20e::t_98bd8efaaed860 2677-2686
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "ba842a0fb119b48a8503723bf248a4ea5d7173cc",
+  "prompts": {},
+  "sessions": {
+    "s_9298fd786cc20e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b66914e-9464-4925-9eaf-43ca3fe549a1",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

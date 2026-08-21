@@ -1,0 +1,24 @@
+net/crates/net/docs/plans/ORG_CAPABILITY_AUTH_PLAN.md
+  s_9298fd786cc20e::t_c13201904bde77 13-37
+  s_9298fd786cc20e::t_937f2bd515b044 234
+  s_9298fd786cc20e::t_226e5f6a24f2f1 230-233,235-239
+net/crates/net/docs/plans/OA2E_INTEGRATION_DESIGN.md
+  s_9298fd786cc20e::t_70f3eadcb56b31 1,3-8,13-54
+  s_9298fd786cc20e::t_abaf924fdf994f 473-476,480,482-485,487-491,495-506,508-509,511-514
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "c5e018b33291dd00848c278d772fde3b04ff4110",
+  "prompts": {},
+  "sessions": {
+    "s_9298fd786cc20e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b66914e-9464-4925-9eaf-43ca3fe549a1",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

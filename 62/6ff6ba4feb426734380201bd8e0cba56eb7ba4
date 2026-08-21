@@ -1,0 +1,49 @@
+net/crates/net/adapters/mcp/src/serve/shim.rs
+  s_2ce1bbf7d954a5::t_1cd0b5bfef5319 794-795
+  s_2ce1bbf7d954a5::t_8bb0cbd223cba6 1721-1729,1731-1742,1744-1745
+  s_2ce1bbf7d954a5::t_ea032c937ddaf7 677,684-695
+  s_2ce1bbf7d954a5::t_2cfb32c3093e07 1730,1743
+  s_2ce1bbf7d954a5::t_866b9022f8777a 461-462
+  s_2ce1bbf7d954a5::t_616f089a1e97c3 696-697
+net/crates/net/payments/src/flow/mod.rs
+  s_2ce1bbf7d954a5::t_e7a8e5b1c7d2a9 251-263
+net/crates/net/bindings/python/src/mesh_rpc.rs
+  s_2ce1bbf7d954a5::t_8bb0cbd223cba6 173-175,3660-3662
+net/crates/net/bindings/python/src/capability_gateway.rs
+  s_2ce1bbf7d954a5::t_8bb0cbd223cba6 885-909
+  s_2ce1bbf7d954a5::t_3f7532e4863604 121
+  s_2ce1bbf7d954a5::t_27039db6f9cb09 194-213
+net/crates/net/payments/tests/mcp_gate_composition.rs
+  s_2ce1bbf7d954a5::t_1cd0b5bfef5319 76-77,91-94,303
+net/crates/net/adapters/mcp/src/serve/mesh_gateway.rs
+  s_2ce1bbf7d954a5::t_1cd0b5bfef5319 802,823-824,828-829
+  s_2ce1bbf7d954a5::t_8bb0cbd223cba6 895-946
+  s_2ce1bbf7d954a5::t_fa9aeda7917787 418-422,427-433
+  s_2ce1bbf7d954a5::t_c1ad5ee3d9c31f 448-465
+  s_2ce1bbf7d954a5::t_9ed83a4e294711 675,840,849,854
+  s_2ce1bbf7d954a5::t_9fc9fa0f0bbdea 389-392
+net/crates/net/adapters/mcp/tests/serve_end_to_end.rs
+  s_2ce1bbf7d954a5::t_1cd0b5bfef5319 223
+net/crates/net/adapters/mcp/src/serve/gated.rs
+  s_2ce1bbf7d954a5::t_1cd0b5bfef5319 144,178,261,403
+  s_2ce1bbf7d954a5::t_8bb0cbd223cba6 460-462
+net/crates/net/adapters/mcp/src/serve/backend.rs
+  s_2ce1bbf7d954a5::t_3455fe68ebc226 90-100
+  s_2ce1bbf7d954a5::t_ed20536b2c01dc 112-123
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "626ff6ba4feb426734380201bd8e0cba56eb7ba4",
+  "prompts": {},
+  "sessions": {
+    "s_2ce1bbf7d954a5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "18fdae31-20fa-4349-91d0-7ace7316145f",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

@@ -1,0 +1,33 @@
+net/crates/net/bindings/python/src/capability_gateway.rs
+  s_2ce1bbf7d954a5::t_43db1467e4b8bf 544-549,556-557
+  s_2ce1bbf7d954a5::t_d9a7a0a602df84 319-323,328-330,336-340,345-347,401-405,410-414,1586-1587
+  s_2ce1bbf7d954a5::t_845f96b26cc06b 835-881
+  s_2ce1bbf7d954a5::t_2b924375aa7251 1002-1054
+  s_2ce1bbf7d954a5::t_78778b50ff5015 1513-1585,1588-1594
+  s_2ce1bbf7d954a5::t_4c390a52fb6456 285-318,324-327,331-335,341-344,348-400,406-409,415-432
+  s_2ce1bbf7d954a5::t_4093dc3c1a7f94 450-458
+net/crates/net/docs/plans/PAYMENTS_LANGUAGE_SDKS_PLAN.md
+  s_2ce1bbf7d954a5::t_fca94c20eff948 71-72
+  s_2ce1bbf7d954a5::t_c4138f4c388720 45
+net/crates/net/bindings/python/python/net/_net.pyi
+  s_2ce1bbf7d954a5::t_a94e577de7d7c7 3254-3269
+  s_2ce1bbf7d954a5::t_533a75c6b1cca1 3165-3198
+net/crates/net/bindings/python/tests/test_capability_gateway.py
+  s_2ce1bbf7d954a5::t_8958e96380b8bb 234-316
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "34bda34509b63e13b5617aa4b39f31ff009b20f7",
+  "prompts": {},
+  "sessions": {
+    "s_2ce1bbf7d954a5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "18fdae31-20fa-4349-91d0-7ace7316145f",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

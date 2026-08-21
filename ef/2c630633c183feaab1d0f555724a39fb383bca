@@ -1,0 +1,20 @@
+net/crates/net/benches/island_claim_match.rs
+  s_c28bdf38c0df3a::t_5a5d6180b0c8b8 329-333
+  s_c28bdf38c0df3a::t_e7930941498e8d 12-24
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "ef2c630633c183feaab1d0f555724a39fb383bca",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

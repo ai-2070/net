@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/mesh.rs
+  s_c28bdf38c0df3a::t_dba7f0e3bf1677 10130
+  s_c28bdf38c0df3a::t_ecb9f05d25c76b 10073-10090,10100-10105,10107-10114,10118-10120,10122-10129,10131-10150,10152-10157,10159-10162,10165-10169
+net/crates/net/tests/sensing_leader_delivery.rs
+  s_c28bdf38c0df3a::t_03c029147d3376 348-462
+  s_c28bdf38c0df3a::t_f8536d5f4c3b24 347
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.13",
+  "base_commit_sha": "26f87296ad9eb8ad0aa34dc54cd550de7b428291",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

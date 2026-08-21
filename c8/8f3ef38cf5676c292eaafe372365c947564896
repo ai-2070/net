@@ -1,0 +1,21 @@
+net/crates/net/payments/src/engine/mod.rs
+  s_ac213343b6b34b::t_44fb7accb96888 1130-1159
+net/crates/net/payments/tests/checker_verification.rs
+  s_ac213343b6b34b::t_4b5f6188365bc9 516-608
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c88f3ef38cf5676c292eaafe372365c947564896",
+  "prompts": {},
+  "sessions": {
+    "s_ac213343b6b34b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8d7c0951-4b90-460d-a264-8a57a5f7927a",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

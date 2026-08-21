@@ -1,0 +1,26 @@
+net/crates/net/payments/benches/mesh_paid_invoke.rs
+  s_49cc2ab0880501::t_28e1ba79bed884 40
+  s_49cc2ab0880501::t_02b03273d3feb2 180-186
+  s_49cc2ab0880501::t_3a904be2bf97c9 1-5,7,9-18,20-39,41-106,108-179,187-200,209,211,214-217,220-228
+  s_49cc2ab0880501::t_79b20f52e2431d 201-208,210,212-213,218-219
+net/crates/net/docs/performance/payments-paid-vs-unpaid.md
+  s_49cc2ab0880501::t_d51ec913d84894 1-72
+net/crates/net/docs/plans/PAYMENTS_BENCHMARKS_PLAN.md
+  s_49cc2ab0880501::t_89bca52c8f36e0 384-392
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "c9d393e88d7c42e911755063a9a7e8cb74866fc0",
+  "prompts": {},
+  "sessions": {
+    "s_49cc2ab0880501": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1bc5d9ed-b590-4842-a9b4-43f10e352741",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

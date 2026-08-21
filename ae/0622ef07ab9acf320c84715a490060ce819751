@@ -1,0 +1,39 @@
+net/crates/net/src/adapter/net/mesh_rpc.rs
+  s_9298fd786cc20e::t_efe7d618fa5344 426-454,474,496-497
+  s_9298fd786cc20e::t_cf38d5c926d644 2355-2362
+  s_9298fd786cc20e::t_37e738187d6d47 2619-2625
+  s_9298fd786cc20e::t_4a304d29baa67d 2771,2781-2789
+  s_9298fd786cc20e::t_0258e88db17bd0 4407-4475
+  s_9298fd786cc20e::t_61c3c274f5d970 2561-2562
+  s_9298fd786cc20e::t_6736f1cf63f0ab 455-463,467-473,475-492
+  s_9298fd786cc20e::t_1213164fbff9ca 2286-2292
+  s_9298fd786cc20e::t_ad5cc99397da84 3042,3052-3060
+  s_9298fd786cc20e::t_cde644a0963224 464-466
+  s_9298fd786cc20e::t_dddf59be45ccd9 493-495
+net/crates/net/tests/nrpc_response_routing.rs
+  s_9298fd786cc20e::t_9bc8a2981b13ea 64-66
+  s_9298fd786cc20e::t_ee0f3d5eeee29d 178-181
+  s_9298fd786cc20e::t_2c96c00d359396 116-118,120
+  s_9298fd786cc20e::t_4be7e65c2026f1 1-2,4-11,13-20
+  s_9298fd786cc20e::t_03c98920456f20 124-130
+  s_9298fd786cc20e::t_af4f015c05d173 26
+  s_9298fd786cc20e::t_c5f1d87a0a2fb3 3,12,21-25,27-63,67-115,119,121-123,131-163,168-177,183-208
+  s_9298fd786cc20e::t_4d04882dff6431 164-167
+  s_9298fd786cc20e::t_6bf4740418372b 182
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "ae0622ef07ab9acf320c84715a490060ce819751",
+  "prompts": {},
+  "sessions": {
+    "s_9298fd786cc20e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b66914e-9464-4925-9eaf-43ca3fe549a1",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

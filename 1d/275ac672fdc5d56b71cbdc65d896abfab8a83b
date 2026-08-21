@@ -1,0 +1,33 @@
+net/crates/net/bindings/python/src/publish.rs
+  s_ecf38b21f410fb::t_4e89c50c8e5d9e 147-153,157
+  s_ecf38b21f410fb::t_b61bd28a999dd9 100-104,114
+net/crates/net/bindings/python/tests/test_publish.py
+  s_ecf38b21f410fb::t_26e9b0baab1ff4 122-150
+  s_ecf38b21f410fb::t_85484125e31849 91-92,94
+  s_ecf38b21f410fb::t_c756463181e245 119-121
+  s_ecf38b21f410fb::t_d8dc5867dfec70 112-118
+net/crates/net/bindings/python/src/lib.rs
+  s_ecf38b21f410fb::t_4388593fb39653 1549-1556,1558,1566,1576
+net/crates/net/integrations/hermes/tests/test_federate.py
+  s_ecf38b21f410fb::t_734686c82d9634 196-198
+net/crates/net/integrations/hermes/provider.py
+  s_ecf38b21f410fb::t_54dfae36646077 83-87
+net/crates/net/bindings/python/python/net/_net.pyi
+  s_ecf38b21f410fb::t_3dc1ca7f36d7d1 716,727-731
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "1d275ac672fdc5d56b71cbdc65d896abfab8a83b",
+  "prompts": {},
+  "sessions": {
+    "s_ecf38b21f410fb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3ac0e26d-f44d-4303-a31a-325922571411",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

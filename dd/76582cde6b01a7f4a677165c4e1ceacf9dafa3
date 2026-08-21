@@ -1,0 +1,22 @@
+net/crates/net/bindings/python/tests/test_readme_feature_names.py
+  s_d15043c27a0f20::t_c15bde13838748 1-44,49-65
+  s_d15043c27a0f20::t_2b38800a840b66 45-48
+net/crates/net/bindings/python/README.md
+  s_d15043c27a0f20::t_61e780163000e3 1216-1218,1222,1226,1229-1230,1232-1233
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "dd76582cde6b01a7f4a677165c4e1ceacf9dafa3",
+  "prompts": {},
+  "sessions": {
+    "s_d15043c27a0f20": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "47de36b5-a0ab-46ec-8280-668f1f28ce92",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

@@ -1,0 +1,25 @@
+net/crates/net/payments/tests/lifecycle_modes.rs
+  s_2ce1bbf7d954a5::t_606f90bf4a4811 816-954
+net/crates/net/payments/src/engine/mod.rs
+  s_2ce1bbf7d954a5::t_59dbdf9c2c1aa1 277-282
+  s_2ce1bbf7d954a5::t_0e640576f4141b 406,417,439-454,460
+  s_2ce1bbf7d954a5::t_a3880d9f3ee9f7 306,317-321
+  s_2ce1bbf7d954a5::t_c6c632d23a17b6 205-211
+  s_2ce1bbf7d954a5::t_d6c138831f8393 322-324
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d90db63c21496075252f0866d8c5ff75daf9a28c",
+  "prompts": {},
+  "sessions": {
+    "s_2ce1bbf7d954a5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "18fdae31-20fa-4349-91d0-7ace7316145f",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

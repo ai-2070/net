@@ -1,0 +1,19 @@
+.github/workflows/skills.yml
+  s_a85d4c545303aa::t_fdd0800e53ea99 225-242
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.18",
+  "base_commit_sha": "8b4fde1b0ceed01afda74c1abc8471d2667b318f",
+  "prompts": {},
+  "sessions": {
+    "s_a85d4c545303aa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "36284d49-c490-4d4d-bc20-5d2a1a6841ad",
+        "model": "claude-opus-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

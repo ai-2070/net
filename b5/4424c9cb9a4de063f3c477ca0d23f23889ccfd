@@ -1,0 +1,25 @@
+net/crates/net/docs/plans/OA2E_INTEGRATION_DESIGN.md
+  s_9298fd786cc20e::t_6efb06625b8727 432-452,456-459,463,468-470
+  s_9298fd786cc20e::t_2463830315432f 79,88-118
+  s_9298fd786cc20e::t_86b6585bac2e29 150,152-155,157,159-160
+  s_9298fd786cc20e::t_9acf62f8d0461e 418-419
+  s_9298fd786cc20e::t_5ae87b162c0f61 4-5,7-8,10-17
+  s_9298fd786cc20e::t_6432b1922e43ac 22-26
+  s_9298fd786cc20e::t_eabaa3fbf335cc 384-390
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "b54424c9cb9a4de063f3c477ca0d23f23889ccfd",
+  "prompts": {},
+  "sessions": {
+    "s_9298fd786cc20e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b66914e-9464-4925-9eaf-43ca3fe549a1",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

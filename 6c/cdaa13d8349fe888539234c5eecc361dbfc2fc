@@ -1,0 +1,21 @@
+net/crates/net/src/adapter/net/behavior/sensing/continuity.rs
+  s_c28bdf38c0df3a::t_bf3a72fb763909 262-268
+  s_c28bdf38c0df3a::t_0c335e9c6c65ce 622-677
+  s_c28bdf38c0df3a::t_80dddd5a76cf1d 621
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "6ccdaa13d8349fe888539234c5eecc361dbfc2fc",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

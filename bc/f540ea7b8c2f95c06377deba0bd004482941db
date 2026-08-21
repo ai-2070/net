@@ -1,0 +1,53 @@
+net/crates/net/bindings/python/src/payment_http.rs
+  s_2ce1bbf7d954a5::t_857b032eada75f 189,391-392
+  s_2ce1bbf7d954a5::t_e918c85a56c22e 1-188,190-390,393-399
+.github/workflows/ci.yml
+  s_2ce1bbf7d954a5::t_0097dc60646750 726-729
+net/crates/net/docs/plans/PAYMENTS_LANGUAGE_SDKS_PLAN.md
+  s_2ce1bbf7d954a5::t_d738731babcc09 46
+  s_2ce1bbf7d954a5::t_344fe16df2f9f5 73
+net/crates/net/bindings/python/src/lib.rs
+  s_2ce1bbf7d954a5::t_846f31a6aafe5c 43-48
+  s_2ce1bbf7d954a5::t_a45107ad7a0977 3370-3374
+net/crates/net/bindings/python/python/net/__init__.py
+  s_2ce1bbf7d954a5::t_9a8ea045845716 832-843
+net/crates/net/bindings/python/Cargo.toml
+  s_2ce1bbf7d954a5::t_f5b8d438aea3cf 166-175
+  s_2ce1bbf7d954a5::t_c217c14e1f0825 231-234
+  s_2ce1bbf7d954a5::t_8d38b29fa83c82 158-165
+net/crates/net/bindings/python/src/capability_gateway.rs
+  s_2ce1bbf7d954a5::t_c37b103bbd91c9 473-475,477-480
+  s_2ce1bbf7d954a5::t_346f497cd77a41 92-96
+  s_928ee85c6ffc0a::t_c86a2509f47009 633
+  s_928ee85c6ffc0a::t_8a2ad7b982b7a1 487,491
+net/crates/net/bindings/python/tests/test_payment_http.py
+  s_2ce1bbf7d954a5::t_ce4e0c36c3e93d 1-104
+net/crates/net/Cargo.lock
+  s_2ce1bbf7d954a5::t_194bdad742822e 2970
+net/crates/net/bindings/python/python/net/_net.pyi
+  s_2ce1bbf7d954a5::t_8b619a397707ca 3271-3344
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "bcf540ea7b8c2f95c06377deba0bd004482941db",
+  "prompts": {},
+  "sessions": {
+    "s_2ce1bbf7d954a5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "18fdae31-20fa-4349-91d0-7ace7316145f",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    },
+    "s_928ee85c6ffc0a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e047eae9-2217-4dd5-bd25-c49d438c1220",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

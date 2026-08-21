@@ -1,0 +1,33 @@
+net/crates/net/benches/bench_island_claim/mod.rs
+  s_c28bdf38c0df3a::t_14da4ad320b618 407
+  s_c28bdf38c0df3a::t_a5f298a2f6fb18 389
+  s_c28bdf38c0df3a::t_8c0cc8a193eff3 45-47
+  s_c28bdf38c0df3a::t_be4688531ac9e1 1-35,37-39,41-44,48-325,329-338,341-388,390-395,397-405,408-409,411-429,431-466,472-547,550-627
+  s_c28bdf38c0df3a::t_0782984bc02635 406
+  s_c28bdf38c0df3a::t_eacf013c4ddbba 410
+  s_c28bdf38c0df3a::t_db75bcb1d544b6 430
+  s_c28bdf38c0df3a::t_58a695a8907802 36,40
+  s_c28bdf38c0df3a::t_f92bf6c172b839 396
+  s_c28bdf38c0df3a::t_dfd803b7e565dd 326-328,339-340,467-471,548-549
+net/crates/net/benches/island_claim_harness.rs
+  s_c28bdf38c0df3a::t_5e387032edd4dd 1-81,87-93,98-103,108-125,131-144,150-277,282-287,291-302,308-318
+  s_c28bdf38c0df3a::t_dfd803b7e565dd 82-86,94-97,104-107,126-130,145-149,278-281,288-290,303-307
+net/crates/net/Cargo.toml
+  s_c28bdf38c0df3a::t_a2df2e7a2d5915 464-470
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "9dec8b5a8cddc2445668afa44b63f2fbe85f7e0b",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

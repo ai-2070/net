@@ -1,0 +1,32 @@
+web/src/content/docs/tutorials/event-sourced-service.md
+  s_4e844c75f3aded::t_794785094d7140 13
+web/src/content/docs/tutorials/fleet-telemetry.md
+  s_4e844c75f3aded::t_794785094d7140 13
+web/src/content/docs/reference/replication-config.md
+  s_4e844c75f3aded::t_794785094d7140 140
+web/src/components/DocsContent.tsx
+  s_4e844c75f3aded::t_24049e09a339b0 9
+  s_4e844c75f3aded::t_552ff99a53091c 393-447,552-564
+web/src/content/docs/concepts/architecture.md
+  s_4e844c75f3aded::t_794785094d7140 9
+web/src/content/docs/concepts/storage-stack.md
+  s_4e844c75f3aded::t_794785094d7140 11
+web/src/content/docs/tutorials/distributed-daemon.md
+  s_4e844c75f3aded::t_794785094d7140 13
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.18",
+  "base_commit_sha": "5efe576a02b886ba4aa3688b5504024f61bd51f1",
+  "prompts": {},
+  "sessions": {
+    "s_4e844c75f3aded": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a15fe99c-1910-4f73-ae09-8a2ba5b4ff55",
+        "model": "claude-opus-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

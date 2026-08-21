@@ -1,0 +1,24 @@
+net/crates/net/sdk/src/operator.rs
+  s_ecf38b21f410fb::t_b88cba88d570cc 64-71
+  s_ecf38b21f410fb::t_65e98865bda824 490
+  s_ecf38b21f410fb::t_5c2576b376b41a 626-655
+  s_ecf38b21f410fb::t_054b36d6951486 301-305,312-314
+  s_ecf38b21f410fb::t_509431fbedb9ca 487-489
+  s_ecf38b21f410fb::t_2df22d3bf688af 486
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "5220b22229add04db6e6344ab6f9167521a0018a",
+  "prompts": {},
+  "sessions": {
+    "s_ecf38b21f410fb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3ac0e26d-f44d-4303-a31a-325922571411",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

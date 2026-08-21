@@ -1,0 +1,26 @@
+.claude/skills/net-payments/failure-schematic.md
+  s_2ce1bbf7d954a5::t_63b63ba2c96260 141-148
+  s_2ce1bbf7d954a5::t_c90a4ff6a308e4 101-108
+.claude/skills/net-payments/signer.md
+  s_2ce1bbf7d954a5::t_019b6c85fd6bd5 40-42
+.claude/skills/net-payments/bindings.md
+  s_2ce1bbf7d954a5::t_b52a72b226068d 122,125-136
+.claude/skills/net-payments/testing.md
+  s_2ce1bbf7d954a5::t_57b6fefb519122 54-69
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "86f2f0d3a864d8e724438722fa3d0690aeba100d",
+  "prompts": {},
+  "sessions": {
+    "s_2ce1bbf7d954a5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "18fdae31-20fa-4349-91d0-7ace7316145f",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

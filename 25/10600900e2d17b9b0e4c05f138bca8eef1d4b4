@@ -1,0 +1,32 @@
+net/crates/net/benches/island_claim_divergence.rs
+  s_c28bdf38c0df3a::t_b7967deae94a9b 152,172,175,178-201,203,209
+  s_c28bdf38c0df3a::t_ba176a3ebf663d 267
+  s_c28bdf38c0df3a::t_86dd7dec41ff0c 103
+  s_c28bdf38c0df3a::t_8e2e302d44bd55 111-115,250-253,442-444,464,550-552,576
+  s_c28bdf38c0df3a::t_da1f015bc72cb5 1-52,61-63,65-102,104-110,116-151,153-171,173-174,176-177,202,204-208,210-249,254-266,268-272,274-359,366-441,445-463,465-549,553-575,577-593,597-670
+  s_c28bdf38c0df3a::t_646060a28b5618 360-365
+  s_c28bdf38c0df3a::t_a404938e2eebac 53-60,64
+  s_c28bdf38c0df3a::t_6653f3d7beda86 594-596
+  s_c28bdf38c0df3a::t_ad980fc68cc9fc 273
+net/crates/net/Cargo.toml
+  s_c28bdf38c0df3a::t_0dad49fb31454b 484-490
+net/crates/net/benches/island_claim_boundaries.rs
+  s_c28bdf38c0df3a::t_1773dd84eaf08b 135
+  s_c28bdf38c0df3a::t_ce44de2354d503 53
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "2510600900e2d17b9b0e4c05f138bca8eef1d4b4",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

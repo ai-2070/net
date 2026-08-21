@@ -1,0 +1,27 @@
+net/crates/net/docs/performance/payments-spend-contention.md
+  s_49cc2ab0880501::t_44e3a0b3179963 1-90
+net/crates/net/docs/plans/PAYMENTS_BENCHMARKS_PLAN.md
+  s_49cc2ab0880501::t_a3270955d58c9b 385-394
+net/crates/net/payments/benches/spend_contention.rs
+  s_49cc2ab0880501::t_91ca215f8cc164 594
+  s_49cc2ab0880501::t_acf2c4162353e4 611-615,627,646-648,651-654,656,658,661,664-668
+  s_49cc2ab0880501::t_12eda22d259e18 1-3,5-13,15-231,234-237,239-593,595-610,616-626,628-645,649-650,655,657,659-660,662-663,669
+net/crates/net/docs/performance/payments-duplicate-storms.md
+  s_49cc2ab0880501::t_ab1f7f8349c958 55-60
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "1be26e6a744f828f6770875cf40cea17fe1fc29b",
+  "prompts": {},
+  "sessions": {
+    "s_49cc2ab0880501": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1bc5d9ed-b590-4842-a9b4-43f10e352741",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

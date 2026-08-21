@@ -1,0 +1,85 @@
+web/src/content/docs/guides/continuity-and-migration.md
+  s_c97615a3f036e9::t_272a7832eaec4e 12,14,16-19,23
+  s_c97615a3f036e9::t_bf0a6cd6707bad 106-108,110,112-116
+  s_c97615a3f036e9::t_f7f1984b1e9010 172-177,181
+  s_c97615a3f036e9::t_e3c193187bdbcc 83-94
+  s_c97615a3f036e9::t_863c6326787406 125,130-132,134-135,138
+  s_c97615a3f036e9::t_44c593ec8ed3a7 28,31-36
+  s_c97615a3f036e9::t_a3a1dc9c388679 58-69
+web/src/content/docs/guides/cortex-folds.md
+  s_c97615a3f036e9::t_7ead2c5d9adca0 163
+  s_c97615a3f036e9::t_5e494574db179d 183-184
+  s_c97615a3f036e9::t_e0420116118bf3 152-156,159
+  s_c97615a3f036e9::t_26686f9a4629c0 132-133,137-139,143
+  s_c97615a3f036e9::t_5369fcd0ba8d05 47-49,53-55,57-58
+  s_c97615a3f036e9::t_c1871cd4ec0283 12,23-29
+web/src/content/docs/guides/netdb-queries.md
+  s_c97615a3f036e9::t_7249800625f684 35-37,48-51
+  s_c97615a3f036e9::t_a5c13d50119644 100,103,106-113
+  s_c97615a3f036e9::t_f71d43fb9702fa 81,85
+  s_c97615a3f036e9::t_32761e65ffbb18 10,12,19,28
+  s_c97615a3f036e9::t_3e28a0ea757716 63-64
+web/src/content/docs/guides/dataforts.md
+  s_c97615a3f036e9::t_00e03c1f961fbc 131
+  s_c97615a3f036e9::t_b1f3256a203be2 138-141,145-148,152-155
+  s_c97615a3f036e9::t_d805743601c679 12-28,31,33
+  s_c97615a3f036e9::t_05d2080a27ed0c 114,117-120,123
+  s_c97615a3f036e9::t_9b468212dbb438 60-65,75
+  s_c97615a3f036e9::t_78ceab9a0b25b5 86-87,89-90,93-95
+web/src/content/docs/guides/daemons-and-placement.md
+  s_c97615a3f036e9::t_a4e4407a3e295c 61,64-71,74
+  s_c97615a3f036e9::t_7314c70c399d3f 179-189,195,197,200-210,212-215,218
+  s_c97615a3f036e9::t_95b9e21da837d5 25,39
+  s_c97615a3f036e9::t_53a9c7ae2b8f7c 90,93-110,112-117,119,122
+  s_c97615a3f036e9::t_10e965e9b7bc8b 129-134,136,138-152,156-158,161-162,166-167,170
+  s_c97615a3f036e9::t_1cab1881eb6e0c 267-270,272-276
+  s_c97615a3f036e9::t_d5be7c6d23247b 288-290,292-298
+  s_c97615a3f036e9::t_0b23d06907bcc1 244-257
+  s_c97615a3f036e9::t_3cb101914bf62f 316-317,320-322,326-328,332-333
+web/src/content/docs/concepts/channels.md
+  s_c97615a3f036e9::t_fde50f4e5d0f56 33-41
+web/src/content/docs/guides/nrpc.md
+  s_c97615a3f036e9::t_9cf90181195025 9,12,14,19,26,30,33-44,47,50-58,61-63,69,72-93,102-108,110,115,120-127,130-132,141,145,148-164,167,171,174-179,184-196,201,204,208-209,216,219-229,231-236,239,241,243,247,250-276,279,283,286-294,297,299,301-302,306-309,312,317,319,323,328,331,334,337-347,349-355,357,360-362,364,371,374,376-380
+web/src/content/docs/concepts/subnets.md
+  s_c97615a3f036e9::t_7e561b918f77b9 22
+web/src/content/docs/guides/event-bus.md
+  s_c97615a3f036e9::t_327adeefc0d8a5 12,14-24,27-34
+  s_c97615a3f036e9::t_5cfb8067c2bea7 42,44,46
+  s_c97615a3f036e9::t_5a1092f2a4f7a4 103
+  s_c97615a3f036e9::t_750813a093ec9a 159,162-173,176
+  s_c97615a3f036e9::t_fe20db4c2009cb 76,79,82-83,87-91,94,96
+web/src/content/docs/guides/discover-and-invoke.md
+  s_c97615a3f036e9::t_e9d543a08249f9 45,47,56,67-70
+web/src/content/docs/tutorials/fleet-telemetry.md
+  s_c97615a3f036e9::t_25e0d1a229823f 47
+  s_c97615a3f036e9::t_47d83e9bc3cafe 49-60
+  s_c97615a3f036e9::t_f17046e2394217 70-94
+  s_c97615a3f036e9::t_19ee5a4eff4e72 48
+web/src/content/docs/guides/recover-failed-workflow.md
+  s_c97615a3f036e9::t_5d8ef676b896d9 46,49,52
+  s_c97615a3f036e9::t_435b652ddbe127 83
+  s_c97615a3f036e9::t_27fe856811eb8a 20-21,28-31
+web/src/content/docs/guides/durable-logs.md
+  s_c97615a3f036e9::t_fc0c407c0f8552 79,83,86
+  s_c97615a3f036e9::t_b451e28385f661 126
+  s_c97615a3f036e9::t_46d8640386da94 101-102
+  s_c97615a3f036e9::t_cff5d15e33029e 11,20
+  s_c97615a3f036e9::t_3c1216d7898a74 32,35,37,40
+  s_c97615a3f036e9::t_3e8d2899d4cb23 50,52,56-58,63-65,69,72
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "bbbab279d8cc577057b239c5e5cd449c69fd4e34",
+  "prompts": {},
+  "sessions": {
+    "s_c97615a3f036e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3b0eda2e-904f-4682-a859-71d75357e55f",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

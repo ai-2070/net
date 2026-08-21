@@ -1,0 +1,32 @@
+net/crates/net/bindings/node/test/capability_gateway.test.ts
+  s_2ce1bbf7d954a5::t_c7a8ae74f95238 175-249
+net/crates/net/bindings/node/src/payment_signer.rs
+  s_2ce1bbf7d954a5::t_981489e5f311dd 92-94,106,122
+  s_2ce1bbf7d954a5::t_468b9b849af7c9 27-28,107-117,123-133
+  s_2ce1bbf7d954a5::t_4e11e4a3e71571 1-26,29-91,95-105,118-121,134
+net/crates/net/bindings/node/src/capability_gateway.rs
+  s_2ce1bbf7d954a5::t_14a2ba7af52eeb 278,283-291,296-309,312-314,318,321-325,333,340-342
+  s_2ce1bbf7d954a5::t_71b5edd83223f3 30
+  s_2ce1bbf7d954a5::t_468b9b849af7c9 279-282,292-295
+  s_2ce1bbf7d954a5::t_b0f9db1bf5135e 465,472-477,494-525,532
+net/crates/net/docs/plans/PAYMENTS_PY_TS_SDK_GAP_PLAN.md
+  s_2ce1bbf7d954a5::t_95f6b4a4e663d2 229-242
+net/crates/net/bindings/node/src/lib.rs
+  s_2ce1bbf7d954a5::t_f00378aa67acca 63-66
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "7cc07b07ab9b8aa76d55a5e829e43070d3ef1aec",
+  "prompts": {},
+  "sessions": {
+    "s_2ce1bbf7d954a5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "18fdae31-20fa-4349-91d0-7ace7316145f",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

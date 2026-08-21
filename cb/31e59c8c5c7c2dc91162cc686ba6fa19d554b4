@@ -1,0 +1,20 @@
+net/crates/net/src/adapter/net/behavior/sensing/rendezvous.rs
+  s_55e949a455a65a::t_748844b834c906 864-904
+  s_55e949a455a65a::t_113c11c179c3a7 2303-2365
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "cb31e59c8c5c7c2dc91162cc686ba6fa19d554b4",
+  "prompts": {},
+  "sessions": {
+    "s_55e949a455a65a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d43bc436-0ca9-4951-8c4a-7484aacbc488",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

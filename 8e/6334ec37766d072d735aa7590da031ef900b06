@@ -1,0 +1,55 @@
+net/crates/net/src/adapter/net/behavior/gang/mod.rs
+  s_c28bdf38c0df3a::t_114d640b2fe1e1 184-204,206
+net/crates/net/src/adapter/net/behavior/sensing/mod.rs
+  s_c28bdf38c0df3a::t_965c6bfbea211f 69-70
+net/crates/net/src/adapter/net/mesh.rs
+  s_c28bdf38c0df3a::t_5e3a09de190b86 3057-3061
+  s_c28bdf38c0df3a::t_08eff43538c52e 11355-11364
+  s_c28bdf38c0df3a::t_6d43cb0eef07a9 12523-12528
+  s_c28bdf38c0df3a::t_bf8a5d9f7df665 5940,14025-14070,14072-14162
+  s_c28bdf38c0df3a::t_7e712e0def3533 4997-5004
+  s_c28bdf38c0df3a::t_b94373a15e9463 14548-14551,14561
+  s_c28bdf38c0df3a::t_b8729f0dee2425 3174-3193
+  s_c28bdf38c0df3a::t_92f604a7a9fd14 5881-5882
+  s_c28bdf38c0df3a::t_185eb1e6f6e481 3062,3075
+  s_c28bdf38c0df3a::t_6ca6e44aea5bce 4769-4770
+  s_c28bdf38c0df3a::t_7490325e7e6a9a 5916-5919,5924-5938
+  s_c28bdf38c0df3a::t_37cf6589b60633 5871-5880,5883
+  s_c28bdf38c0df3a::t_965c6bfbea211f 14071,14552-14560
+  s_c28bdf38c0df3a::t_c1a5467383f898 4897-4902
+  s_c28bdf38c0df3a::t_5b3c104b617b2b 4771,4773,4809,4819-4825
+  s_c28bdf38c0df3a::t_922f9ac5bd1e6c 5939,5941
+net/crates/net/src/adapter/net/behavior/sensing/table.rs
+  s_c28bdf38c0df3a::t_2234f754238657 400-415
+net/crates/net/tests/sensing_leader_delivery.rs
+  s_c28bdf38c0df3a::t_0c4ddb8668c2af 1082
+  s_c28bdf38c0df3a::t_e317c0ac17acef 1062-1066,1068-1081
+  s_c28bdf38c0df3a::t_620e9b99c8a605 1002-1006
+  s_c28bdf38c0df3a::t_f6e04cdd072e3c 985-1001,1007-1061,1067,1083-1109
+net/crates/net/src/adapter/net/behavior/sensing/rendezvous.rs
+  s_c28bdf38c0df3a::t_312d06c4effd81 674-752,757-761,763-796
+  s_c28bdf38c0df3a::t_741f3ce95fa269 238-254
+  s_c28bdf38c0df3a::t_965c6bfbea211f 753-756,762
+  s_c28bdf38c0df3a::t_114d640b2fe1e1 845-856
+net/crates/net/tests/sensing_scheduler_bridge.rs
+  s_c28bdf38c0df3a::t_ff7fb7fdd103b2 297-331,335-373
+  s_c28bdf38c0df3a::t_965c6bfbea211f 83,332-334
+  s_c28bdf38c0df3a::t_b0fddb809557e0 23,70-73,76,173,178
+  s_c28bdf38c0df3a::t_865ad031a87bd6 422
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.13",
+  "base_commit_sha": "8e6334ec37766d072d735aa7590da031ef900b06",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

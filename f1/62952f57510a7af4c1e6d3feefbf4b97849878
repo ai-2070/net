@@ -1,0 +1,20 @@
+net/crates/net/docs/misc/CODE_REVIEW_2026_07_08_PAYMENTS_FAILURE_SCHEMATIC.md
+  s_9f662bf3f2895f::t_e19b28ff69aa1c 15,17-25
+  s_9f662bf3f2895f::t_83cf4b501d4de8 121-127,129
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f162952f57510a7af4c1e6d3feefbf4b97849878",
+  "prompts": {},
+  "sessions": {
+    "s_9f662bf3f2895f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "451f4855-6551-4904-9cc0-f53e5fd0f95d",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

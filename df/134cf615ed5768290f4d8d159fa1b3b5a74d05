@@ -1,0 +1,21 @@
+net/crates/net/src/adapter/net/redex/file.rs
+  s_d15043c27a0f20::t_22373acb442758 2936-2948,2958-2962,2966-2973,2975-2976
+net/crates/net/src/timestamp.rs
+  s_d15043c27a0f20::t_ab1b0b2039b6fc 384-405
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "df134cf615ed5768290f4d8d159fa1b3b5a74d05",
+  "prompts": {},
+  "sessions": {
+    "s_d15043c27a0f20": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "47de36b5-a0ab-46ec-8280-668f1f28ce92",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

@@ -1,0 +1,27 @@
+web/src/content/docs/worldview/zenoh-vs-net.md
+  s_4e844c75f3aded::t_65360e2dacd695 91-154
+web/src/content/docs/worldview/nats-vs-net.md
+  s_4e844c75f3aded::t_07d391fc730d2e 101-134
+docs/data/tiers.yaml
+  s_4e844c75f3aded::t_4aa562e25ef8fe 24,31
+web/src/content/docs/worldview/how-net-compares.md
+  s_4e844c75f3aded::t_683f9bf6707a46 1-117
+web/src/docs.order.ts
+  s_4e844c75f3aded::t_4aa562e25ef8fe 87
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.18",
+  "base_commit_sha": "44eb4ea0476aeefa4c935928b63fa6023298f0ec",
+  "prompts": {},
+  "sessions": {
+    "s_4e844c75f3aded": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a15fe99c-1910-4f73-ae09-8a2ba5b4ff55",
+        "model": "claude-opus-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

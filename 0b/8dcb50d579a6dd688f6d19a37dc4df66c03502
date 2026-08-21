@@ -1,0 +1,21 @@
+net/crates/net/tests/org_ownership.rs
+  s_9298fd786cc20e::t_c036a2f2ef7fd3 1504
+net/crates/net/src/adapter/net/behavior/org_grant.rs
+  s_9298fd786cc20e::t_8d12d52cd5ac77 1520-1524
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "0b8dcb50d579a6dd688f6d19a37dc4df66c03502",
+  "prompts": {},
+  "sessions": {
+    "s_9298fd786cc20e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b66914e-9464-4925-9eaf-43ca3fe549a1",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

@@ -1,0 +1,28 @@
+.github/workflows/release-python.yml
+  s_03bb83ad7963e7::t_8a32b5b63c3be0 44-47,87-90,123-126
+.github/workflows/ci.yml
+  s_03bb83ad7963e7::t_90ef0e7941cbd5 1339
+  s_03bb83ad7963e7::t_78c6c18be4c34a 707-710,712
+  s_03bb83ad7963e7::t_ba4e0c877386bc 1330-1337,1340-1343,1346
+net/crates/net/bindings/python/pyproject.toml
+  s_03bb83ad7963e7::t_037293b34c2869 41-47
+net/crates/net/bindings/python/Cargo.toml
+  s_03bb83ad7963e7::t_00fb14776c977c 175-177
+  s_03bb83ad7963e7::t_54a19bd9f9a876 50-60
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ab7315cb7b8bad7f8a5de4ec57ea3b3403f68cf0",
+  "prompts": {},
+  "sessions": {
+    "s_03bb83ad7963e7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "75c50af5-cd15-4a8f-b08c-8e2335723558",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

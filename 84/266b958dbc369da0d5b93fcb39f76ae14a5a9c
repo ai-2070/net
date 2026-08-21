@@ -1,0 +1,28 @@
+net/crates/net/docs/plans/PAYMENTS_DOCS_PLAN.md
+  s_8145011de91f43::t_db1dbd67840165 356-367,374-376
+  s_8145011de91f43::t_3c3f840b5836b7 74-75
+  s_8145011de91f43::t_3d00864298a275 173
+  s_8145011de91f43::t_97e51b14f5668a 194-199
+  s_8145011de91f43::t_39b723ae85d108 47-52
+  s_8145011de91f43::t_b0869c079177d5 3-9
+  s_8145011de91f43::t_6a15765a7b7fae 166-168
+  s_8145011de91f43::t_35e45715263824 102-129
+  s_8145011de91f43::t_bb857cdcf15a10 234-243,248-254,260-261,265-266,269-271
+  s_8145011de91f43::t_abf257c0f7e6f4 282-284
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "84266b958dbc369da0d5b93fcb39f76ae14a5a9c",
+  "prompts": {},
+  "sessions": {
+    "s_8145011de91f43": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "96805a67-4a02-4942-ad40-e539bfe24a47",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

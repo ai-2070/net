@@ -1,0 +1,23 @@
+go/header_parity_test.go
+  s_d15043c27a0f20::t_5d60b0465d6759 1-125
+go/net.h
+  s_d15043c27a0f20::t_a30c9d6a73cd39 939-956
+  s_d15043c27a0f20::t_4ee2046e9625e6 42-43
+  s_d15043c27a0f20::t_9f6d13b32ab429 957
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "90025b30c4b27d67938fa020413ff97f8a22a180",
+  "prompts": {},
+  "sessions": {
+    "s_d15043c27a0f20": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "47de36b5-a0ab-46ec-8280-668f1f28ce92",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

@@ -1,0 +1,23 @@
+net/crates/net/integrations/hermes/federate.py
+  s_ecf38b21f410fb::t_ec1d4cbe9ffd98 218
+  s_ecf38b21f410fb::t_7c7b0ea7a71403 228-242,246
+  s_ecf38b21f410fb::t_1c53f5e48ea23e 295-309,315-316
+net/crates/net/integrations/hermes/tests/test_federate.py
+  s_ecf38b21f410fb::t_684aa2983b9b62 131-165
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "0d10bcacf6be8737669b82ff3a41655f88ab620b",
+  "prompts": {},
+  "sessions": {
+    "s_ecf38b21f410fb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3ac0e26d-f44d-4303-a31a-325922571411",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

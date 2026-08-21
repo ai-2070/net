@@ -1,0 +1,21 @@
+net/crates/net/docs/plans/PAYMENTS_P1_NETWORK_LADDER.md
+  s_2ce1bbf7d954a5::t_f65fae61c5437e 152-155
+net/crates/net/docs/plans/PAYMENTS_XRPL_ENABLEMENT_PLAN.md
+  s_2ce1bbf7d954a5::t_7ad967ed8d7e9f 1-96
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "fa933e0c174ac3ec6da1d6e12a41f91b9b2d5d19",
+  "prompts": {},
+  "sessions": {
+    "s_2ce1bbf7d954a5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "18fdae31-20fa-4349-91d0-7ace7316145f",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

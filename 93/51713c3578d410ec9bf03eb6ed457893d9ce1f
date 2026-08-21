@@ -1,0 +1,23 @@
+net/crates/net/bindings/node/src/lib.rs
+  s_2ce1bbf7d954a5::t_c1b14a870acfa3 1515-1524
+net/crates/net/bindings/node/test/payment_conformance.test.ts
+  s_2ce1bbf7d954a5::t_ef5d71a73b7180 1-165
+net/crates/net/docs/plans/PAYMENTS_PY_TS_SDK_GAP_PLAN.md
+  s_2ce1bbf7d954a5::t_ca2d89c4236bc8 317-332,334-335
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "9351713c3578d410ec9bf03eb6ed457893d9ce1f",
+  "prompts": {},
+  "sessions": {
+    "s_2ce1bbf7d954a5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "18fdae31-20fa-4349-91d0-7ace7316145f",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

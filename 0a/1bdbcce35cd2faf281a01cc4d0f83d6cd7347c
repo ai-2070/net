@@ -1,0 +1,24 @@
+net/crates/net/tests/common/mod.rs
+  s_6e3ba98fcf8a1a::t_e2e85c0406a942 160-175
+net/crates/net/tests/event_pingwave.rs
+  s_6e3ba98fcf8a1a::t_b4c82b23ce072c 14-16,21,25,32-33,42-45,50,53-55,57,62-64
+net/crates/net/tests/route_withdraw.rs
+  s_6e3ba98fcf8a1a::t_c03a0a7ad2a124 149-151
+  s_6e3ba98fcf8a1a::t_c93a5f709b02a2 19-21,26,31,36-37,48-51,53,58-61,67-69
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "0a1bdbcce35cd2faf281a01cc4d0f83d6cd7347c",
+  "prompts": {},
+  "sessions": {
+    "s_6e3ba98fcf8a1a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "06d6941e-b88a-429a-8af7-b32d33e82522",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

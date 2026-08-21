@@ -1,0 +1,19 @@
+net/crates/net/docs/plans/NODE_DELEGATION_A2A_SDK_PLAN.md
+  s_8145011de91f43::t_8c1af1ad1362c5 1-179
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3d4641f99cc5d5f41c64815b7d6b98545a7629e7",
+  "prompts": {},
+  "sessions": {
+    "s_8145011de91f43": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "96805a67-4a02-4942-ad40-e539bfe24a47",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

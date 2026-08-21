@@ -1,0 +1,35 @@
+net/crates/net/tests/reflex_override.rs
+  s_c28bdf38c0df3a::t_16881e025e5637 561-564
+net/crates/net/src/adapter/net/mesh.rs
+  s_c28bdf38c0df3a::t_602d108b4200d0 6983
+  s_c28bdf38c0df3a::t_3610d7c18d7b74 884-885
+  s_c28bdf38c0df3a::t_97b574bb638a08 3809-3813
+  s_c28bdf38c0df3a::t_199477d828ba3b 3323
+  s_c28bdf38c0df3a::t_192d73f548a03d 7155-7157,7159
+  s_c28bdf38c0df3a::t_1730e02cce5702 8640-8650
+  s_c28bdf38c0df3a::t_eb2f4748d51a34 55
+  s_c28bdf38c0df3a::t_c4c79e30bbf344 3932-3934
+  s_c28bdf38c0df3a::t_7140aa1abf9cf8 2700-2704
+  s_c28bdf38c0df3a::t_2e139acfa13bad 4567
+net/crates/net/src/adapter/net/behavior/broadcast.rs
+  s_c28bdf38c0df3a::t_2b6d39dcd57fac 68-90,92-126,131-170
+  s_c28bdf38c0df3a::t_0c9977d89258bb 91
+  s_c28bdf38c0df3a::t_766c77cca174ed 35-38
+  s_c28bdf38c0df3a::t_9cf0749b82fdd0 171
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "0039737203d27a1c136f1cc4dde3a531ffd939cb",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

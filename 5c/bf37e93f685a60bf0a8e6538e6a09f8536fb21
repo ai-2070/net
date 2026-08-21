@@ -1,0 +1,19 @@
+net/crates/net/docs/plans/PAYMENTS_STORAGE_DISPOSITION.md
+  s_49cc2ab0880501::t_126faa857e5a13 1-318
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "5cbf37e93f685a60bf0a8e6538e6a09f8536fb21",
+  "prompts": {},
+  "sessions": {
+    "s_49cc2ab0880501": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1bc5d9ed-b590-4842-a9b4-43f10e352741",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

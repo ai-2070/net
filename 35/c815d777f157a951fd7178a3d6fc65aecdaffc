@@ -1,0 +1,43 @@
+net/crates/net/payments/tests/checker_verification.rs
+  s_2ce1bbf7d954a5::t_50c75fa6d58eba 17-19
+  s_2ce1bbf7d954a5::t_83427946940c06 291-316
+net/crates/net/sdk/src/tool_payment.rs
+  s_2ce1bbf7d954a5::t_cb06d85d751402 57-62
+  s_2ce1bbf7d954a5::t_84c7c8632295a1 20-27
+  s_2ce1bbf7d954a5::t_def167e5605a54 90-371,373-422
+  s_2ce1bbf7d954a5::t_6c76d3fadce1b1 372
+  s_2ce1bbf7d954a5::t_7b72201c2e393d 42
+net/crates/net/payments/tests/lifecycle_modes.rs
+  s_2ce1bbf7d954a5::t_8ec7caea22c240 20
+  s_2ce1bbf7d954a5::t_35d436296e2503 1128-1130
+  s_2ce1bbf7d954a5::t_2ee13f3e322c82 1151,1157-1218
+  s_2ce1bbf7d954a5::t_76ccd2a5d8d7fd 1316-1318
+  s_2ce1bbf7d954a5::t_0bdb70c70a03df 1105-1106,1108-1110,1219
+  s_2ce1bbf7d954a5::t_51b8c0b1da7a1a 1095-1099,1107
+  s_2ce1bbf7d954a5::t_cfaf80ba232b9a 1246
+  s_2ce1bbf7d954a5::t_b1929aaf64b537 1220-1221
+net/crates/net/payments/src/engine/mod.rs
+  s_2ce1bbf7d954a5::t_afa38b65b18df3 172-177,182-183
+  s_2ce1bbf7d954a5::t_e228983f2260ad 154-171,178-181,184-209,216-218
+  s_2ce1bbf7d954a5::t_cf94d2db7b4445 1484,1490,1499,1505,1511-1513,1517-1525,1527,1539-1542,1547
+net/crates/net/payments/src/flow/mod.rs
+  s_2ce1bbf7d954a5::t_82ed719054b9a2 71-74
+net/crates/net/payments/src/core/versioning.rs
+  s_2ce1bbf7d954a5::t_0057289c2d226c 30-36
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "35c815d777f157a951fd7178a3d6fc65aecdaffc",
+  "prompts": {},
+  "sessions": {
+    "s_2ce1bbf7d954a5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "18fdae31-20fa-4349-91d0-7ace7316145f",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

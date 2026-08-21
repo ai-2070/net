@@ -1,0 +1,47 @@
+net/crates/net/tests/integration_nrpc_streaming.rs
+  s_2ce1bbf7d954a5::t_ab80fed96f853b 491-493
+net/crates/net/sdk/tests/mesh_rpc_bidi_typed.rs
+  s_2ce1bbf7d954a5::t_ab80fed96f853b 152-154
+net/crates/net/bindings/go/rpc-ffi/src/lib.rs
+  s_2ce1bbf7d954a5::t_0204233af19063 439,4033
+net/crates/net/src/adapter/net/mesh_rpc.rs
+  s_2ce1bbf7d954a5::t_1a976b49ae0d16 972
+  s_2ce1bbf7d954a5::t_3506ef8ca2fd75 1320-1324
+  s_2ce1bbf7d954a5::t_b67c8ef9f4bf7a 3660-3664
+  s_2ce1bbf7d954a5::t_f3e89e460a466c 249-255
+  s_2ce1bbf7d954a5::t_738c3ae360b66e 631-635
+net/crates/net/adapters/mcp/src/serve/mesh_gateway.rs
+  s_2ce1bbf7d954a5::t_0204233af19063 738,757,771
+  s_2ce1bbf7d954a5::t_ab80fed96f853b 388-390,646-648
+net/crates/net/bindings/python/src/mesh_rpc.rs
+  s_2ce1bbf7d954a5::t_0204233af19063 173,3658,3691,3737
+net/crates/net/tests/integration_nrpc_predicate_header.rs
+  s_2ce1bbf7d954a5::t_ab80fed96f853b 307-309
+net/crates/net/docs/plans/PAYMENTS_FAILURE_SCHEMATIC_PLAN.md
+  s_2ce1bbf7d954a5::t_99ca255d48c07e 128-130,132-134
+net/crates/net/sdk/tests/mesh_rpc_retry.rs
+  s_2ce1bbf7d954a5::t_0204233af19063 355,360,365,371,376,381,386
+net/crates/net/bindings/node/src/mesh_rpc.rs
+  s_2ce1bbf7d954a5::t_0204233af19063 88,2115,2146
+net/crates/net/tests/integration_nrpc_mesh.rs
+  s_2ce1bbf7d954a5::t_ab80fed96f853b 222-224,625-727
+  s_2ce1bbf7d954a5::t_f5ba0f0d15b898 728
+net/crates/net/tests/integration_nrpc_client_streaming.rs
+  s_2ce1bbf7d954a5::t_ab80fed96f853b 348-350
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4bd9e6417054b99540267b01b6c85e9331e2ef58",
+  "prompts": {},
+  "sessions": {
+    "s_2ce1bbf7d954a5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "18fdae31-20fa-4349-91d0-7ace7316145f",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

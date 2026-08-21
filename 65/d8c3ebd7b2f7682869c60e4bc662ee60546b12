@@ -1,0 +1,24 @@
+net/crates/net/benches/bench_mesh_pair/mod.rs
+  s_c28bdf38c0df3a::t_802d8e5e120f65 188-197,202,204-205,207-220
+  s_c28bdf38c0df3a::t_82f116d73b0458 198-201,203,206
+net/crates/net/benches/capability_propagation.rs
+  s_c28bdf38c0df3a::t_55b4af946af760 81-86,194-196,215-218
+  s_c28bdf38c0df3a::t_5644acc4e7aed1 125
+  s_c28bdf38c0df3a::t_9c3068550581ab 8-24,31,35-36,40,45-47,51-80,87-90,93-95,97-99,101-124,126-193,197-214,220,222,234-275
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "65d8c3ebd7b2f7682869c60e4bc662ee60546b12",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

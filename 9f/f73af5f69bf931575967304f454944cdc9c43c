@@ -1,0 +1,19 @@
+net/crates/net/src/adapter/net/subnet/provision.rs
+  s_12f4e33e3df602::t_e56c184c41f2f7 367
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "9ff73af5f69bf931575967304f454944cdc9c43c",
+  "prompts": {},
+  "sessions": {
+    "s_12f4e33e3df602": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7511de7f-06ee-435d-954d-dfdcdf2c77a9",
+        "model": "claude-opus-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

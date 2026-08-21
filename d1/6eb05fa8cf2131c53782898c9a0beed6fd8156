@@ -1,0 +1,127 @@
+net/crates/net/cli/tests/org_adopt.rs
+  s_9298fd786cc20e::t_39656ac121273e 210-316
+net/crates/net/tests/sensing_scheduler_bridge.rs
+  s_9298fd786cc20e::t_e4e1fdf8d4aa46 118
+net/crates/net/src/adapter/net/behavior/fold/capability.rs
+  s_9298fd786cc20e::t_854b1634bcbce8 129-138,148,154-168
+  s_9298fd786cc20e::t_e4e1fdf8d4aa46 1007,1220,1309,1981
+net/crates/net/src/adapter/net/behavior/gang/mod.rs
+  s_9298fd786cc20e::t_e4e1fdf8d4aa46 262
+net/crates/net/src/adapter/net/behavior/org_revocation.rs
+  s_9298fd786cc20e::t_37dc31e641ca3e 55
+  s_9298fd786cc20e::t_22c087e080f1a9 479
+  s_9298fd786cc20e::t_eafea286949bf2 902
+  s_9298fd786cc20e::t_b1409a52bd3f5e 246-248,255-272
+  s_9298fd786cc20e::t_1475991ea0e1c2 867
+  s_9298fd786cc20e::t_d7e4dbe96707f8 273-283
+  s_9298fd786cc20e::t_49e2ed4d236bc4 468-478,480-484,486-501,503-512,515-520,532-582,585-590,593-616
+  s_9298fd786cc20e::t_a2292c1d05ab6d 629-646,649,651-697,701,705-712,714,720-729,731-747,749-756,761-762,769-772,777-794
+  s_9298fd786cc20e::t_2d50f8ce66a2ef 329-339,348-359,362-363,365-367,369-377,384-385,388-396,415-416
+  s_9298fd786cc20e::t_6b17833e62317c 317-322
+  s_9298fd786cc20e::t_6c158ad087bac8 448-449
+  s_9298fd786cc20e::t_2d56757c85d52a 617,1033-1034,1036-1153
+  s_9298fd786cc20e::t_39f2d7571d5226 151-166
+  s_9298fd786cc20e::t_9cc5f0175bc872 306-316
+  s_9298fd786cc20e::t_22ee3a0d3fc898 45-51
+  s_9298fd786cc20e::t_a831ab0172589c 795
+net/crates/net/src/adapter/net/behavior/org.rs
+  s_9298fd786cc20e::t_33fe297abf9643 329-332
+  s_9298fd786cc20e::t_b37ff852d09a01 1108-1143,1145-1153
+  s_9298fd786cc20e::t_ea27305d879cdb 536-542,544-546
+  s_9298fd786cc20e::t_408a70d1c817d2 62
+  s_9298fd786cc20e::t_22c087e080f1a9 333-335,1144
+  s_9298fd786cc20e::t_5ccff5d79191ff 508-514,521-524
+  s_9298fd786cc20e::t_2ef7eb8e02e765 286-300
+net/crates/net/tests/aggregator_fold_query.rs
+  s_9298fd786cc20e::t_e4e1fdf8d4aa46 108
+net/crates/net/src/adapter/net/behavior/fold/capability_bridge.rs
+  s_9298fd786cc20e::t_bd139c1c13a923 826,834
+  s_9298fd786cc20e::t_c64e9b04d97538 340-343,357,362-398
+  s_9298fd786cc20e::t_4be236cf47bf68 896
+  s_9298fd786cc20e::t_e4e1fdf8d4aa46 1176,1289,1332,1831,1972,2084
+  s_9298fd786cc20e::t_0c89270d831eaa 2254-2318,2320-2340,2342-2345
+  s_9298fd786cc20e::t_22c087e080f1a9 2319,2341
+  s_9298fd786cc20e::t_801b2baf772ba1 2231,2236-2240,2245-2249
+  s_9298fd786cc20e::t_2088704aafb6c9 34-35
+  s_9298fd786cc20e::t_e8ed4bcc61f68b 251-256,262,264,266-275,278,281,286-290,292-293,296,299,301-309
+  s_9298fd786cc20e::t_9472b5ce4c7a25 399-400
+net/crates/net/src/adapter/net/behavior/org_authority.rs
+  s_9298fd786cc20e::t_bb9a6049e378e5 582-586,600-602,608
+  s_9298fd786cc20e::t_e5e9dc60970d32 387-400
+  s_9298fd786cc20e::t_4f7ae2d1114bc5 660-692
+  s_9298fd786cc20e::t_22c087e080f1a9 770-772,799-800,849-850,868-875,891-892,908-909,924-925,940-941,954-956,983-984,1124-1125,1154-1155
+  s_9298fd786cc20e::t_bd9f2ae272fbd5 333-337
+  s_9298fd786cc20e::t_60ea4ca8f2fc74 401-405
+  s_9298fd786cc20e::t_fef77242e60c18 499,502-503,505
+  s_9298fd786cc20e::t_f51a1196b44f63 42-45
+  s_9298fd786cc20e::t_9e8fdfb1c652dc 97-102,106
+  s_9298fd786cc20e::t_475a50e2df13cb 435-455,457-463,465-468,475,481-484,495-498,500-501,504,506,508-538,540-558,564,572-575
+  s_9298fd786cc20e::t_ede0fa60f65996 817,829,856,917,974
+  s_9298fd786cc20e::t_66485940b07612 559-562
+  s_9298fd786cc20e::t_f096889379a59d 1016-1123,1126-1153,1156-1206
+  s_9298fd786cc20e::t_af433f66dae75c 312-332
+net/crates/net/src/adapter/net/behavior/aggregator/summarizer.rs
+  s_9298fd786cc20e::t_e4e1fdf8d4aa46 270
+net/crates/net/src/adapter/net/behavior/gang/schedule.rs
+  s_9298fd786cc20e::t_e4e1fdf8d4aa46 243
+net/crates/net/src/adapter/net/mesh.rs
+  s_9298fd786cc20e::t_7db9aec7ba8a91 4775-4787,4789-4802
+  s_9298fd786cc20e::t_54e28e3b9affa3 5331,5504-5519
+  s_9298fd786cc20e::t_06ad9257935577 6649-6654,6658-6682,6686-6695,6697,6707-6748,6750-6757,6767,6770-6774,6776-6790
+  s_9298fd786cc20e::t_327b6ba3a57c48 15232-15240,15242,15247,15252-15253
+  s_9298fd786cc20e::t_e07f07fbe02eca 17180-17183
+  s_9298fd786cc20e::t_4d15e07e37f17a 17188-17191,17196,17201-17202
+  s_9298fd786cc20e::t_74fbbbcba7700f 5369-5370
+  s_9298fd786cc20e::t_0ae08f07d2617e 19511-19516,19521,19526-19527
+  s_9298fd786cc20e::t_5d1a854b62f862 1805-1806
+  s_9298fd786cc20e::t_22c087e080f1a9 4788,6683-6685,6749,6775
+  s_9298fd786cc20e::t_b0d04708e67c9c 4096-4112
+  s_9298fd786cc20e::t_806af83ce30cca 1992-2008
+  s_9298fd786cc20e::t_7a5e9158dd4e51 17480-17483,17488,17495
+  s_9298fd786cc20e::t_e4e1fdf8d4aa46 22689
+  s_9298fd786cc20e::t_8cb7ec36475697 17464-17467
+  s_9298fd786cc20e::t_dc85e3755208aa 1618-1639
+net/crates/net/sdk/src/org.rs
+  s_9298fd786cc20e::t_522d2e6871f3b0 35-39
+net/crates/net/src/adapter/net/behavior/aggregator/query_service.rs
+  s_9298fd786cc20e::t_e4e1fdf8d4aa46 291
+net/crates/net/src/adapter/net/behavior/aggregator/daemon.rs
+  s_9298fd786cc20e::t_e4e1fdf8d4aa46 659
+net/crates/net/cli/src/commands/node.rs
+  s_9298fd786cc20e::t_457665fc6d25f5 91-102
+  s_9298fd786cc20e::t_e63517cfa43c1b 72-74
+  s_9298fd786cc20e::t_d7a6003164b4a1 139-145,166,171-192,200,216
+net/crates/net/tests/gang_claim_node.rs
+  s_9298fd786cc20e::t_e4e1fdf8d4aa46 78
+net/crates/net/src/adapter/net/behavior/sensing/snapshot.rs
+  s_9298fd786cc20e::t_e4e1fdf8d4aa46 500
+net/crates/net/src/adapter/net/behavior/fold/mod.rs
+  s_9298fd786cc20e::t_958869780ba668 654-668
+net/crates/net/src/adapter/net/behavior/fold/capability_aggregation.rs
+  s_9298fd786cc20e::t_e4e1fdf8d4aa46 905
+net/crates/net/src/adapter/net/cortex/workflow/step.rs
+  s_9298fd786cc20e::t_e4e1fdf8d4aa46 515
+net/crates/net/tests/org_ownership.rs
+  s_9298fd786cc20e::t_f9279877c48eb3 462
+  s_9298fd786cc20e::t_d10d8e69395678 503
+  s_9298fd786cc20e::t_ede0fa60f65996 114
+  s_9298fd786cc20e::t_b388cee225d32d 135-142,157-182,185-190,193-222,225,228-257,261-321,324-331,335-401
+  s_9298fd786cc20e::t_22c087e080f1a9 183-184,191-192,223-224,226-227,258-260,322-323,332-334,509-510
+  s_9298fd786cc20e::t_57c49f93326071 402
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "d16eb05fa8cf2131c53782898c9a0beed6fd8156",
+  "prompts": {},
+  "sessions": {
+    "s_9298fd786cc20e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b66914e-9464-4925-9eaf-43ca3fe549a1",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

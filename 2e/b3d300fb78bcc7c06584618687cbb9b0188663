@@ -1,0 +1,21 @@
+net/crates/net/src/adapter/net/behavior/broadcast.rs
+  s_6e3ba98fcf8a1a::t_7a74f25387fc5e 167,210,212-213,217-247
+  s_6e3ba98fcf8a1a::t_26e335385d9406 88-100,104,106-108,117,119-123,127-130,136,141-166
+  s_6e3ba98fcf8a1a::t_13fb10e316ebb5 168
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "2eb3d300fb78bcc7c06584618687cbb9b0188663",
+  "prompts": {},
+  "sessions": {
+    "s_6e3ba98fcf8a1a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "06d6941e-b88a-429a-8af7-b32d33e82522",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

@@ -1,0 +1,29 @@
+net/crates/net/tests/sensing_rendezvous.rs
+  s_c28bdf38c0df3a::t_05b9c59f5c174d 205-208,210-213,216-218,220
+  s_c28bdf38c0df3a::t_1da4e3a9923bba 1-83,93,96-97,103-149,152-165,169-184,189-204,214-215,219,221-227
+  s_c28bdf38c0df3a::t_dd6c7e1d7f221e 151
+  s_c28bdf38c0df3a::t_901060bee25b45 209
+  s_c28bdf38c0df3a::t_b16e7e12c0a616 84-92,94-95,98
+  s_c28bdf38c0df3a::t_b6b1a036436864 99-102,185-188
+  s_c28bdf38c0df3a::t_dd08f6b9cf7dfc 150,166-168
+net/crates/net/src/adapter/net/behavior/proximity.rs
+  s_c28bdf38c0df3a::t_6eb0b5135ac503 696-707
+net/crates/net/docs/plans/SENSING_INTEREST_COALESCING_PLAN.md
+  s_c28bdf38c0df3a::t_2465da71108a95 864-872
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "7a6e45a1ee80377a2428c736db4e50e200f8b919",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

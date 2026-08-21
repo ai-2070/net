@@ -1,0 +1,24 @@
+net/crates/net/tests/reflex_override.rs
+  s_6e3ba98fcf8a1a::t_c823643cd8901e 566-644
+net/crates/net/src/adapter/net/mesh.rs
+  s_6e3ba98fcf8a1a::t_894a2faa4dfc8c 11398-11402,11421,11428-11436,11439
+  s_6e3ba98fcf8a1a::t_31ff3ea0d6ad90 3518
+  s_6e3ba98fcf8a1a::t_1228bfc11d5125 2065-2071
+  s_6e3ba98fcf8a1a::t_190bd2a85ad625 11351-11356,11364-11365
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "e1e3760ef0e4324ffe0d33594285c91fea72f4cb",
+  "prompts": {},
+  "sessions": {
+    "s_6e3ba98fcf8a1a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "06d6941e-b88a-429a-8af7-b32d33e82522",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

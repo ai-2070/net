@@ -1,0 +1,19 @@
+net/crates/net/payments/src/flow/mod.rs
+  s_9f662bf3f2895f::t_0a4b18b7b7b15c 97-105
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "cd2e54b35c39f219c0798577077c818658cd8823",
+  "prompts": {},
+  "sessions": {
+    "s_9f662bf3f2895f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "451f4855-6551-4904-9cc0-f53e5fd0f95d",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

@@ -1,0 +1,24 @@
+net/crates/net/benches/capability_burst.rs
+  s_c28bdf38c0df3a::t_6f25138507c7f6 1-119,122-124,128-188,191-226
+  s_c28bdf38c0df3a::t_8ef79786c2ed41 120-121,125-127,189-190
+net/crates/net/Cargo.toml
+  s_c28bdf38c0df3a::t_cafa46b8910860 458-463
+net/crates/net/benches/bench_mesh_pair/mod.rs
+  s_c28bdf38c0df3a::t_9cdf70e90a436e 389-394
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "04409e3b24aa48678a31d476a785e83f0c5c83dc",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

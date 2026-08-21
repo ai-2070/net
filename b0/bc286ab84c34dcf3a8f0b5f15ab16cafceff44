@@ -1,0 +1,105 @@
+web/src/content/docs/sdk/errors/rust.md
+  s_a85d4c545303aa::t_6afecb0c256c6f 1-121
+web/src/content/docs/sdk/invoke/_shared.md
+  s_a85d4c545303aa::t_ffddbe3621c743 38-41
+  s_a85d4c545303aa::t_b53a4a37b10cd6 1-3,5-37,42-67
+  s_a85d4c545303aa::t_a0dc976c6545f5 4
+web/src/content/docs/sdk/invoke/go.md
+  s_a85d4c545303aa::t_22ba91943407a4 1-80,82-84,94-112
+  s_a85d4c545303aa::t_b162af66aa8e42 81,85-93
+web/src/content/docs/sdk/announce/rust.md
+  s_a85d4c545303aa::t_de5fae6f2f0ba3 1-86
+web/src/content/docs/sdk/errors/_shared.md
+  s_a85d4c545303aa::t_64b8f580d8ffd2 1-93
+web/src/content/docs/sdk/errors/typescript.md
+  s_a85d4c545303aa::t_788040bd65833e 1-126
+web/src/content/docs/sdk/invoke/python.md
+  s_a85d4c545303aa::t_2f651bea9b75fa 50,56-57,61-67
+  s_a85d4c545303aa::t_5ed885b41e55e9 1-49,51-55,58-60,68-81
+web/src/content/docs/sdk/discover/rust.md
+  s_a85d4c545303aa::t_ffc03abba010c9 1-74
+web/src/content/docs/sdk/quickstart/typescript.md
+  s_a85d4c545303aa::t_53b657ace4ab53 26-29
+  s_a85d4c545303aa::t_f675ba5260254f 50-51,55-57,60-65,67-68
+  s_a85d4c545303aa::t_001ffb5dd62687 1-25,30-49,52-54,58-59,66,69-81
+web/src/content/docs/sdk/discover/go.md
+  s_a85d4c545303aa::t_4497476594234b 1-97
+web/src/content/docs/sdk/quickstart/_shared.md
+  s_a85d4c545303aa::t_f3fcc396ba1456 25
+  s_a85d4c545303aa::t_9e6feea32e0df5 74-81
+  s_a85d4c545303aa::t_a0dc976c6545f5 4
+  s_a85d4c545303aa::t_568b7e31261ec0 1-3,5-24,26-73
+web/src/content/docs/sdk/invoke/typescript.md
+  s_a85d4c545303aa::t_bc81414f7c7d5b 1-84
+web/src/content/docs/sdk/watch/typescript.md
+  s_a85d4c545303aa::t_d32c663b1c944d 1-50
+web/src/content/docs/sdk/watch/go.md
+  s_a85d4c545303aa::t_445e0d4968b7b1 1-75
+web/src/content/docs/sdk/artifacts/go.md
+  s_a85d4c545303aa::t_8079ac94a737de 1-78
+web/src/content/docs/sdk/quickstart/rust.md
+  s_a85d4c545303aa::t_4cabb3121f467b 1-91
+web/src/content/docs/sdk/watch/python.md
+  s_a85d4c545303aa::t_b770378f4b00aa 1-52
+web/src/content/docs/sdk/announce/_shared.md
+  s_a85d4c545303aa::t_3cb0e837096fce 1-3,5-85
+  s_a85d4c545303aa::t_a0dc976c6545f5 4
+web/src/content/docs/sdk/quickstart/go.md
+  s_a85d4c545303aa::t_4e8b3bd3aba91f 1-115
+web/src/content/docs/sdk/artifacts/typescript.md
+  s_a85d4c545303aa::t_91f20b127b9159 1-58
+web/src/content/docs/sdk/artifacts/python.md
+  s_a85d4c545303aa::t_110614dc3fc9ca 1-60
+web/src/content/docs/sdk/announce/go.md
+  s_a85d4c545303aa::t_c1047803d18bb7 1-116
+web/src/content/docs/sdk/watch/_shared.md
+  s_a85d4c545303aa::t_5c72b0a03723fc 1-3,5-59
+  s_a85d4c545303aa::t_a0dc976c6545f5 4
+web/src/content/docs/sdk/errors/python.md
+  s_a85d4c545303aa::t_0b22c3fcc714e4 1-130
+web/src/content/docs/sdk/announce/typescript.md
+  s_a85d4c545303aa::t_b12b90445b31ef 1-26,33-71,74,76,80-82,88-89
+  s_a85d4c545303aa::t_69508977c90496 72-73,75,77-79,83-87
+  s_a85d4c545303aa::t_15891085aa5889 27-32
+web/src/content/docs/sdk/watch/rust.md
+  s_a85d4c545303aa::t_0387f1b382a7d5 1-52
+docs/data/tiers.yaml
+  s_a85d4c545303aa::t_6ff93397a70a08 24,141-154
+web/src/content/docs/sdk/invoke/rust.md
+  s_a85d4c545303aa::t_14d9610770b678 1-79
+web/src/content/docs/sdk/errors/go.md
+  s_a85d4c545303aa::t_f5b12e8496c027 1-131
+web/src/content/docs/sdk/discover/typescript.md
+  s_a85d4c545303aa::t_07826fefaa935e 1-74
+web/src/content/docs/sdk/artifacts/_shared.md
+  s_a85d4c545303aa::t_b12f6ad2510a79 1-3,5-67
+  s_a85d4c545303aa::t_a0dc976c6545f5 4
+web/src/content/docs/sdk/artifacts/rust.md
+  s_a85d4c545303aa::t_dccefbc2f501a5 51
+  s_a85d4c545303aa::t_bede17262629a5 1-50,52-59
+web/src/content/docs/sdk/discover/_shared.md
+  s_a85d4c545303aa::t_40635df84692db 1-3,5-73
+  s_a85d4c545303aa::t_a0dc976c6545f5 4
+web/src/content/docs/sdk/quickstart/python.md
+  s_a85d4c545303aa::t_d11d72004312c6 1-82
+web/src/content/docs/sdk/discover/python.md
+  s_a85d4c545303aa::t_7a82d95ac1ec6e 1-73
+web/src/content/docs/sdk/announce/python.md
+  s_a85d4c545303aa::t_fe2fe239de527d 1-90
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.18",
+  "base_commit_sha": "b0bc286ab84c34dcf3a8f0b5f15ab16cafceff44",
+  "prompts": {},
+  "sessions": {
+    "s_a85d4c545303aa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "36284d49-c490-4d4d-bc20-5d2a1a6841ad",
+        "model": "claude-opus-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

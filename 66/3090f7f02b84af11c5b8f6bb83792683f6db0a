@@ -1,0 +1,31 @@
+net/crates/net/bindings/node/test/payment_conformance.test.ts
+  s_2ce1bbf7d954a5::t_abf04d564c0e56 160-163,167
+  s_2ce1bbf7d954a5::t_9c6463ea07bca3 131-138
+  s_2ce1bbf7d954a5::t_e199a823297d14 31,33
+  s_2ce1bbf7d954a5::t_61888325f2e5fb 159,164
+  s_2ce1bbf7d954a5::t_b7df2ac6e1116b 125-130
+  s_2ce1bbf7d954a5::t_ef625b67e6942c 91
+net/crates/net/bindings/node/test/publish.test.ts
+  s_2ce1bbf7d954a5::t_ef13ed2dd1012b 38-42
+net/crates/net/bindings/node/test/capability_gateway.test.ts
+  s_2ce1bbf7d954a5::t_ba56f365496e2a 30-35
+net/crates/net/bindings/node/test/payment_provider.test.ts
+  s_2ce1bbf7d954a5::t_04042d1da8fc9a 58-62
+  s_2ce1bbf7d954a5::t_83cce1c26cd7ca 150-152,154
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "663090f7f02b84af11c5b8f6bb83792683f6db0a",
+  "prompts": {},
+  "sessions": {
+    "s_2ce1bbf7d954a5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "18fdae31-20fa-4349-91d0-7ace7316145f",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

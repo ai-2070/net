@@ -1,0 +1,20 @@
+net/crates/net/tests/natsim.rs
+  s_d15043c27a0f20::t_5a721f1a96ff55 234-242,245
+  s_d15043c27a0f20::t_2c4313325db464 27-48,53-57,59-60
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "09634cd1851bb8e5a7eb6320fae130c87dc89e3c",
+  "prompts": {},
+  "sessions": {
+    "s_d15043c27a0f20": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "47de36b5-a0ab-46ec-8280-668f1f28ce92",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

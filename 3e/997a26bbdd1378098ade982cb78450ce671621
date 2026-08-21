@@ -1,0 +1,33 @@
+net/crates/net/docs/plans/PAYMENTS_BENCHMARKS_PLAN.md
+  s_49cc2ab0880501::t_cba394c44fdb67 367-376
+net/crates/net/payments/benches/bench_common/mod.rs
+  s_49cc2ab0880501::t_d040dd95e250bd 43
+  s_49cc2ab0880501::t_97cd356c3ff7ba 296-301,306,312-317
+  s_49cc2ab0880501::t_c15c23e78adb2d 227-229,231-237,246,318
+  s_49cc2ab0880501::t_ed56f3bfedd75f 319
+.github/workflows/ci.yml
+  s_49cc2ab0880501::t_8f2da263722363 552
+net/crates/net/payments/benches/admission_matrix.rs
+  s_49cc2ab0880501::t_6056cf50a4d19e 1-225,230-231,235,237-415
+  s_49cc2ab0880501::t_48210bf00177d1 226-229,232-234,236
+net/crates/net/payments/Cargo.toml
+  s_49cc2ab0880501::t_02d58f0e792860 172-178
+net/crates/net/docs/performance/payments-admission-matrix.md
+  s_49cc2ab0880501::t_df5c6bdc07852b 1-97
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "3e997a26bbdd1378098ade982cb78450ce671621",
+  "prompts": {},
+  "sessions": {
+    "s_49cc2ab0880501": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1bc5d9ed-b590-4842-a9b4-43f10e352741",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

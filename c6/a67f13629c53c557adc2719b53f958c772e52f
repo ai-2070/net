@@ -1,0 +1,26 @@
+docs/data/tiers.yaml
+  s_4e844c75f3aded::t_5893818c31143f 10-13,24,136-137,184
+  s_4e844c75f3aded::t_c91c100f240d98 210
+web/src/content/docs/concepts/channels.md
+  s_4e844c75f3aded::t_2cfe9fec258e3d 42-61
+web/src/docs.order.ts
+  s_4e844c75f3aded::t_5893818c31143f 216-228
+web/src/content/docs/concepts/agent-identity.md
+  s_4e844c75f3aded::t_5c457e221760d5 56-62
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.18",
+  "base_commit_sha": "c6a67f13629c53c557adc2719b53f958c772e52f",
+  "prompts": {},
+  "sessions": {
+    "s_4e844c75f3aded": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a15fe99c-1910-4f73-ae09-8a2ba5b4ff55",
+        "model": "claude-opus-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

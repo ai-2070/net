@@ -1,0 +1,27 @@
+net/crates/net/payments/src/x402/schemes/exact_xrpl.rs
+  s_2ce1bbf7d954a5::t_f24a31f2562bdf 1-269
+net/crates/net/payments/src/x402/schemes/mod.rs
+  s_2ce1bbf7d954a5::t_db1c2cc122ae46 51
+net/crates/net/docs/plans/PAYMENTS_XRPL_ENABLEMENT_PLAN.md
+  s_2ce1bbf7d954a5::t_5bed6343d89eeb 31
+  s_2ce1bbf7d954a5::t_f6dc96f51ef740 64,67,69-73,75-77,79
+  s_2ce1bbf7d954a5::t_d171c311d311b6 15-25
+  s_2ce1bbf7d954a5::t_5d39df36bd4904 29
+  s_2ce1bbf7d954a5::t_744904de78b84f 46
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "14eba5ee529e642f1f3aeaeadf58b0da21de193f",
+  "prompts": {},
+  "sessions": {
+    "s_2ce1bbf7d954a5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "18fdae31-20fa-4349-91d0-7ace7316145f",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

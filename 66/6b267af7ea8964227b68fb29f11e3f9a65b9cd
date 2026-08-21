@@ -1,0 +1,35 @@
+net/crates/net/src/adapter/net/behavior/diff.rs
+  s_5e9fb7d8a3c6fc::t_531ea3cd2361fb 717
+  s_5e9fb7d8a3c6fc::t_ac5ca8e93eea9a 667
+  s_5e9fb7d8a3c6fc::t_0643273b382efa 608
+  s_5e9fb7d8a3c6fc::t_9aa2cfd5d91e55 743
+net/crates/net/payments/src/policy/spend.rs
+  s_5e9fb7d8a3c6fc::t_6f99ee3a956d37 392
+net/crates/net/rust-toolchain.toml
+  s_5e9fb7d8a3c6fc::t_1f6f7298986839 2
+net/crates/net/src/adapter/net/behavior/deck.rs
+  s_5e9fb7d8a3c6fc::t_7040753a20f6d8 439
+  s_5e9fb7d8a3c6fc::t_969d67a3028c65 448
+net/crates/net/src/adapter/net/behavior/meshdb/planner.rs
+  s_5e9fb7d8a3c6fc::t_1b9af011c1ff85 939
+net/crates/net/src/ffi/mod.rs
+  s_5e9fb7d8a3c6fc::t_c018259e3cd140 571-572,575-581,584
+net/crates/net/src/adapter/net/mesh.rs
+  s_5e9fb7d8a3c6fc::t_c5b1009fd5ff7f 11074
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "666b267af7ea8964227b68fb29f11e3f9a65b9cd",
+  "prompts": {},
+  "sessions": {
+    "s_5e9fb7d8a3c6fc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ca796d94-78a4-42b1-8d07-43580584ff60",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

@@ -1,0 +1,42 @@
+net/crates/net/src/adapter/net/behavior/sensing/mod.rs
+  s_c28bdf38c0df3a::t_feb38edff3c8f3 87-90
+net/crates/net/src/adapter/net/mesh.rs
+  s_c28bdf38c0df3a::t_8e2a60c76ee4b9 4183-4202,4208
+  s_c28bdf38c0df3a::t_61fd4244178336 9008-9012,9020-9022,9024-9025,9027-9030
+  s_c28bdf38c0df3a::t_38149cc2d1d092 10959-10969
+  s_c28bdf38c0df3a::t_b3258f411f6043 3013-3023,3031-3034
+  s_c28bdf38c0df3a::t_5ba9998d398073 4501-4509
+  s_c28bdf38c0df3a::t_47ec8316a9df89 11131-11144
+  s_c28bdf38c0df3a::t_092b1bbfbfadc0 11262-11264,11275-11277,11279-11282
+  s_c28bdf38c0df3a::t_c04a69f91dbde7 11315,11326-11339,11361-11363,11368
+  s_c28bdf38c0df3a::t_14a424b2679724 11498-11513
+  s_c28bdf38c0df3a::t_bb6ca5c0cdb747 2839-2848
+  s_c28bdf38c0df3a::t_6106015c7abbb6 6033-6034,6042-6049
+  s_c28bdf38c0df3a::t_9096d49b80a3cf 4555-4564,4568-4574,4588-4593
+  s_c28bdf38c0df3a::t_608239587070a2 6097,6100-6101,6105,6107-6111,6114-6117,6119,6136-6145
+  s_c28bdf38c0df3a::t_cf4de20914f8cb 4637-4644
+  s_c28bdf38c0df3a::t_0932a297438b40 6050
+net/crates/net/tests/sensing_origin_emitter.rs
+  s_c28bdf38c0df3a::t_5857444add61cb 37-42
+  s_c28bdf38c0df3a::t_dfc97275d084c3 477-603
+  s_c28bdf38c0df3a::t_eae12d1e6aa8dd 604-606
+net/crates/net/src/adapter/net/behavior/sensing/emitter.rs
+  s_c28bdf38c0df3a::t_a4824c18462be6 2-6,25-54,71-81,89-104,107,110,113,122-130,142-182,187-188,199-202,217-285,296-297,300-301,306-309,314-318,320-324,330,340-346,350-359,365-366,370-376,386,394,402-406,411,413,422-424,427-429,433-453,475,495-496,498-502,504,515-526,528,534-537,594,616,633-650,664-666,675-713,728,772,783,798,801-803,822-824,835,841,852-853,857,860-861,863,865-907,909-922,927,930,932,934-938,940-944,946-947,949-965,967,969-970,973,975,979-981
+  s_c28bdf38c0df3a::t_b1c701cba3bcd9 966,968,971-972,974,976-978,982
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "c2eb12bcb68331078f6399019e92c0b093050874",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

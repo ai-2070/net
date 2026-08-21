@@ -1,0 +1,22 @@
+net/crates/net/payments/tests/svm_checker.rs
+  s_a797c9974a8f7a::t_45f77b57a92102 364-406
+net/crates/net/payments/src/checker/svm.rs
+  s_a797c9974a8f7a::t_af619983752409 221-228,234-236,239-245,253-254
+  s_a797c9974a8f7a::t_aabffeac5baa3e 369-371,378-380
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a01fb7142e428fb60945b33262c89482d129a856",
+  "prompts": {},
+  "sessions": {
+    "s_a797c9974a8f7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0c9069b3-7f10-427a-9e70-65573d5f98b9",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

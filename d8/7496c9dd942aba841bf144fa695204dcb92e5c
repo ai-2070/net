@@ -1,0 +1,26 @@
+net/crates/net/src/adapter/net/behavior/sensing/emitter.rs
+  s_c28bdf38c0df3a::t_ddeb5b30759191 418
+  s_c28bdf38c0df3a::t_71b5dc7948ba9d 168
+  s_c28bdf38c0df3a::t_c670e63663fccd 1-167,169-395
+  s_c28bdf38c0df3a::t_0c9c4c8589b882 396-417,419-645
+  s_c28bdf38c0df3a::t_21ce60c2b242a8 646-669
+net/crates/net/src/adapter/net/behavior/sensing/mod.rs
+  s_c28bdf38c0df3a::t_b6be8376cd53b2 44-46
+  s_c28bdf38c0df3a::t_61bea5d69cb013 87-88
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "d87496c9dd942aba841bf144fa695204dcb92e5c",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

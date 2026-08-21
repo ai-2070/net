@@ -1,0 +1,42 @@
+web/src/docs.order.ts
+  s_8145011de91f43::t_d45cdb91bd6a28 83-93
+  s_8145011de91f43::t_ecdab6dca808df 179,191-200
+  s_8145011de91f43::t_06b96a13530548 25
+  s_8145011de91f43::t_65ae4e18b19891 201
+web/src/content/docs/payments/non-custodial-signing.md
+  s_8145011de91f43::t_ea84ce39b9bff1 1-46
+web/src/content/docs/payments/x402-and-net.md
+  s_8145011de91f43::t_f6def9c49865df 1-58
+web/src/content/docs/payments/spend-policy-and-approvals.md
+  s_8145011de91f43::t_a9f7af7c91be58 1-57
+web/src/content/docs/payments/verification-tiers.md
+  s_8145011de91f43::t_a893ea58cd77e7 1-50
+web/src/content/docs/payments/what-net-payments-is.md
+  s_8145011de91f43::t_571f1dd1675dbf 1-67
+web/src/content/docs/payments/the-lifecycle.md
+  s_8145011de91f43::t_5c03a132b1529c 1-50
+web/src/content/docs/payments/failure-schematic.md
+  s_8145011de91f43::t_f51d6828d3b26b 1-53
+web/src/content/docs/payments/README.md
+  s_8145011de91f43::t_1f2dc95e3d901b 1-51
+web/src/content/docs/payments/networks.md
+  s_8145011de91f43::t_5bba91861764e8 1-46
+web/src/content/docs/payments/billing.md
+  s_8145011de91f43::t_0976a86bd2ee17 1-43
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d6bdba06f93aeeb835f599433238c2aa37d2fa47",
+  "prompts": {},
+  "sessions": {
+    "s_8145011de91f43": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "96805a67-4a02-4942-ad40-e539bfe24a47",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

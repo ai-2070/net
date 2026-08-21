@@ -1,0 +1,19 @@
+web/src/lib/repo-info.ts
+  s_485727b9531cf3::t_97772f45903099 101,122,139
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c6874457d1664dbaf5a32e62b5964ed414fad073",
+  "prompts": {},
+  "sessions": {
+    "s_485727b9531cf3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fa6ca479-5653-4381-b8dc-c0f6cf90ed7a",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

@@ -1,0 +1,23 @@
+net/crates/net/benches/sensing_signature.rs
+  s_c28bdf38c0df3a::t_216b84451e6751 1-252
+net/crates/net/Cargo.toml
+  s_c28bdf38c0df3a::t_8aebc74d9f804a 432-439
+net/crates/net/docs/plans/SENSING_INTEREST_COALESCING_PLAN.md
+  s_c28bdf38c0df3a::t_cf912ee72c02ea 949-968
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "3018e65209c086a1c53b65dbd8c8d0f6816ae28b",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

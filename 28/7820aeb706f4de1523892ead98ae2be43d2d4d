@@ -1,0 +1,24 @@
+net/crates/net/tests/org_admission_gate.rs
+  s_9298fd786cc20e::t_ec9cd774b106fd 122-131
+  s_9298fd786cc20e::t_0021212dd93599 96-121,132-135
+net/crates/net/src/adapter/net/org_admission_gate.rs
+  s_9298fd786cc20e::t_7da66b0d50f635 227,230,233-236
+  s_9298fd786cc20e::t_8b451eeb5af604 168-177
+  s_9298fd786cc20e::t_59e09bc247104f 19,21
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "287820aeb706f4de1523892ead98ae2be43d2d4d",
+  "prompts": {},
+  "sessions": {
+    "s_9298fd786cc20e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b66914e-9464-4925-9eaf-43ca3fe549a1",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

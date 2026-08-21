@@ -1,0 +1,34 @@
+net/crates/net/src/adapter/net/mesh.rs
+  s_9298fd786cc20e::t_c2347f1f2c299d 613-632
+  s_9298fd786cc20e::t_488eab6cc74e9d 17733-17738,17743
+  s_9298fd786cc20e::t_278c3b343f1097 20507-20514
+  s_9298fd786cc20e::t_82c61ebbdbc851 17662,17668
+  s_9298fd786cc20e::t_65cfd000462813 17586-17593,17602-17634,17641
+  s_9298fd786cc20e::t_ec3b3049730c0d 17637
+net/crates/net/src/adapter/net/mesh_rpc.rs
+  s_9298fd786cc20e::t_7817faa7291c37 2153
+  s_9298fd786cc20e::t_0e44f0864ef5ca 2727,2910,3218
+  s_9298fd786cc20e::t_dff25bd5840171 649-652,661
+  s_9298fd786cc20e::t_c8f1981904eea1 2074-2092,2109,2117-2138,2140-2152,2154-2169,2171-2175,2177-2180
+  s_9298fd786cc20e::t_1f70414f079eb0 5027-5036,5038-5094,5096-5153,5161-5162,5173
+  s_9298fd786cc20e::t_730baa45f43696 5037
+  s_9298fd786cc20e::t_7146549a6d3b00 53
+  s_9298fd786cc20e::t_13affb92da620a 2604
+  s_9298fd786cc20e::t_a7465e32733a18 2093-2100
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "747da4baebe67bb450d40034b56dbc448ad8f05b",
+  "prompts": {},
+  "sessions": {
+    "s_9298fd786cc20e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b66914e-9464-4925-9eaf-43ca3fe549a1",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

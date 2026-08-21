@@ -1,0 +1,24 @@
+net/crates/net/payments/src/billing/mod.rs
+  s_2ce1bbf7d954a5::t_f04dd48db7e4e3 190,195-203,206-207,210,213,233
+net/crates/net/payments/src/core/billing_event.rs
+  s_2ce1bbf7d954a5::t_034caeabb48bd1 93-112
+  s_2ce1bbf7d954a5::t_9cd60ad45c4d3c 137-149,152-153,156,159,173,176-177,180-181,188,199-225
+  s_2ce1bbf7d954a5::t_2be5fc57c50b3c 18
+  s_2ce1bbf7d954a5::t_78c45269045e3d 226
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "6420156ae7a07990c7cd124e0c8d86eb2b2cde51",
+  "prompts": {},
+  "sessions": {
+    "s_2ce1bbf7d954a5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "18fdae31-20fa-4349-91d0-7ace7316145f",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

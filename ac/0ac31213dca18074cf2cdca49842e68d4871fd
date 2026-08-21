@@ -1,0 +1,34 @@
+net/crates/net/docs/plans/SENSING_INTEREST_COALESCING_PLAN.md
+  s_c28bdf38c0df3a::t_451d1a2cc16432 181-182,188-201
+  s_c28bdf38c0df3a::t_6c21ca524925a0 697-719
+  s_c28bdf38c0df3a::t_08afda7e470659 813,819-823
+  s_c28bdf38c0df3a::t_81f08e497e4235 343-350
+  s_c28bdf38c0df3a::t_d6660716643c53 726-739
+  s_c28bdf38c0df3a::t_c8ff1335aea2ff 496-508,514,521-522
+  s_c28bdf38c0df3a::t_3e6524d5aaf4bc 775,778-782
+  s_c28bdf38c0df3a::t_ee7e2ddc7dca64 395-399
+  s_c28bdf38c0df3a::t_25a7f823414093 36-46
+  s_c28bdf38c0df3a::t_eba6d0bdfbacd9 67-69
+  s_c28bdf38c0df3a::t_435d9091e46132 401-420
+  s_c28bdf38c0df3a::t_103b749173815a 446-477,480-490
+  s_c28bdf38c0df3a::t_f417ecf6365d5e 247-270
+  s_c28bdf38c0df3a::t_62a534aa1a30a8 802-806
+  s_c28bdf38c0df3a::t_51a75cb7037c64 3-5
+  s_c28bdf38c0df3a::t_aa667eae83922f 400
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "ac0ac31213dca18074cf2cdca49842e68d4871fd",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

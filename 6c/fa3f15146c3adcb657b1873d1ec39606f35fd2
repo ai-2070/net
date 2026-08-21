@@ -1,0 +1,54 @@
+net/crates/net/payments/tests/native_tool_gate.rs
+  s_2ce1bbf7d954a5::t_f8624e74fd4424 155,157-159,162-190
+  s_2ce1bbf7d954a5::t_9889b2122975da 84-87,92-97,99-100,106-109,116-117
+net/crates/net/adapters/mcp/tests/publish_tools_end_to_end.rs
+  s_2ce1bbf7d954a5::t_b40414e201d0e8 557
+net/crates/net/sdk/src/tool_payment.rs
+  s_2ce1bbf7d954a5::t_14ed6328cee712 72-76,82,90
+  s_2ce1bbf7d954a5::t_0cd33a8a1fd264 292-357,363-365
+net/crates/net/payments/tests/mcp_gate_composition.rs
+  s_2ce1bbf7d954a5::t_c8929d28870741 91
+net/crates/net/docs/plans/PAYMENTS_FAILURE_SCHEMATIC_PLAN.md
+  s_2ce1bbf7d954a5::t_bb3b28b3210902 138-145
+net/crates/net/sdk/src/tool.rs
+  s_2ce1bbf7d954a5::t_76bb0093344df6 1216-1217,1236-1238
+  s_2ce1bbf7d954a5::t_a68b4acc683075 1218-1231
+  s_2ce1bbf7d954a5::t_087474c1233555 1169-1187
+net/crates/net/payments/src/flow/mod.rs
+  s_2ce1bbf7d954a5::t_f19d5b6725edd7 47-224,227-229,244,251,256-258,260
+  s_2ce1bbf7d954a5::t_fab04c1e7dcc57 1009-1098
+net/crates/net/payments/src/flow/mcp_gate.rs
+  s_2ce1bbf7d954a5::t_0dd6d47c52be8f 78
+net/crates/net/sdk/tests/tool_serve_paid.rs
+  s_2ce1bbf7d954a5::t_dbb89db0cd6420 26,28-31
+  s_2ce1bbf7d954a5::t_8a9532f380d752 225-226,230-237,240-241,251-255
+  s_2ce1bbf7d954a5::t_bcfb3a9193bc03 288-292
+  s_2ce1bbf7d954a5::t_8d813bbc007545 68,73-100
+  s_2ce1bbf7d954a5::t_09e8775123f74f 135-137,139-144,147-148,155,169-191,197
+  s_2ce1bbf7d954a5::t_6ce410fad883c0 138
+net/crates/net/adapters/mcp/tests/wrap_end_to_end.rs
+  s_2ce1bbf7d954a5::t_244e4db3b2d0be 356
+net/crates/net/adapters/mcp/src/serve/payment.rs
+  s_2ce1bbf7d954a5::t_2480678b797ba2 108-114,120
+net/crates/net/adapters/mcp/src/wrap/invoke.rs
+  s_2ce1bbf7d954a5::t_8c2c69b400aa48 380-383,385-388,390,395-403,408-410
+  s_2ce1bbf7d954a5::t_7fbe5e65f067d4 79-97
+net/crates/net/payments/src/flow/mesh.rs
+  s_2ce1bbf7d954a5::t_a135d54b5c83a2 251
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "6cfa3f15146c3adcb657b1873d1ec39606f35fd2",
+  "prompts": {},
+  "sessions": {
+    "s_2ce1bbf7d954a5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "18fdae31-20fa-4349-91d0-7ace7316145f",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

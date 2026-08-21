@@ -1,0 +1,45 @@
+net/crates/net/payments/benches/admission_matrix.rs
+  s_49cc2ab0880501::t_045af72a21338a 61-64,120-127,134-141,171-174,208-211,224-227,239-249,283-294,305-308,366-369,383-386,400-403
+net/crates/net/payments/benches/duplicate_storm.rs
+  s_49cc2ab0880501::t_045af72a21338a 214-218,235-242,298-302,313-320
+net/crates/net/docs/performance/payments-external-rail-telemetry.md
+  s_49cc2ab0880501::t_ec1910f6529c48 1-147
+net/crates/net/payments/benches/mock_lifecycle.rs
+  s_49cc2ab0880501::t_045af72a21338a 122-129,136-142,145-149,164-170,186-189,202-208,211-215,220-223,228-231,235-238,240-244,306-325,346-359,369-375,377-381
+  s_49cc2ab0880501::t_c933757cc08d96 278
+net/crates/net/payments/benches/redeem_matrix.rs
+  s_49cc2ab0880501::t_9da7282ecd268a 17-22
+  s_49cc2ab0880501::t_045af72a21338a 136-142,152-158,175-182,186-200,218-221
+net/crates/net/payments/tests/read_only_writes_audit.rs
+  s_49cc2ab0880501::t_045af72a21338a 97-100,112-122,126-132,136-139,142-146,177-183,189-195,199-205,221-226,242,265,298-306,343-346
+net/crates/net/docs/plans/PAYMENTS_BENCHMARKS_PLAN.md
+  s_49cc2ab0880501::t_4dc8c8b838a087 411-418
+  s_49cc2ab0880501::t_6246c566dcf0e8 442-476
+net/crates/net/payments/benches/mesh_paid_invoke.rs
+  s_49cc2ab0880501::t_045af72a21338a 74-83,109-111,123-124,132-134,173-180,220-228,242-244,248-255,261-268
+net/crates/net/payments/benches/admission.rs
+  s_49cc2ab0880501::t_045af72a21338a 56-61
+net/crates/net/payments/src/policy/spend.rs
+  s_49cc2ab0880501::t_045af72a21338a 311-328
+net/crates/net/payments/benches/spend_contention.rs
+  s_49cc2ab0880501::t_045af72a21338a 44-46,100-106,155-158,170-173,222-226,293-301,351-354,358,366-374,505-511,519-527,587-591
+  s_49cc2ab0880501::t_e1cf98a9fda2f6 192
+net/crates/net/payments/tests/redeem_denial_no_write.rs
+  s_49cc2ab0880501::t_045af72a21338a 50-56
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "4044f4f4ca4ca6a66ebabfaac9c07fbd10a45e47",
+  "prompts": {},
+  "sessions": {
+    "s_49cc2ab0880501": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1bc5d9ed-b590-4842-a9b4-43f10e352741",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

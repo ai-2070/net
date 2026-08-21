@@ -1,0 +1,36 @@
+net/crates/net/docs/misc/CODE_REVIEW_2026_07_06_HERMES_PLAN_2.md
+  s_ecf38b21f410fb::t_92e2525056b122 76-81
+  s_ecf38b21f410fb::t_1b598569b5f171 318-322
+  s_ecf38b21f410fb::t_e3d1450c90f470 351-354
+  s_ecf38b21f410fb::t_ebd29622df8cc3 336-339
+  s_ecf38b21f410fb::t_bbd68e483cbb17 103-108
+  s_ecf38b21f410fb::t_e73da0d1a9e8c9 300-304
+  s_ecf38b21f410fb::t_69bfee6f85fec0 266-269
+  s_ecf38b21f410fb::t_14b9deb98db3b2 26-36
+  s_ecf38b21f410fb::t_15d93d08ea77ae 372-374,380-381,386-389,394,399-401,406-407,412-413,419-420,425,427-431,442-443
+  s_ecf38b21f410fb::t_12607ce11356ed 160-165
+  s_ecf38b21f410fb::t_d49a5ea678fdf4 281-286
+  s_ecf38b21f410fb::t_5cac5ef9a29c3d 127-132
+  s_ecf38b21f410fb::t_e1b57aeea71051 211-213
+  s_ecf38b21f410fb::t_1438f6ca670ada 228-231
+  s_ecf38b21f410fb::t_d15428342151c5 186-190
+  s_ecf38b21f410fb::t_e4c0a12c5522be 247-251
+  s_ecf38b21f410fb::t_76a767cc5c1cf6 42-45
+  s_ecf38b21f410fb::t_47a2423394f151 461-468
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "fb867f416789d24330fe453ac9c6d4f57817a91a",
+  "prompts": {},
+  "sessions": {
+    "s_ecf38b21f410fb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3ac0e26d-f44d-4303-a31a-325922571411",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

@@ -1,0 +1,29 @@
+go/payments_golden_vectors_test.go
+  s_8145011de91f43::t_58b091d87d40d4 313-325,327-331,343-347,362
+net/crates/net/tests/cross_lang_payments/payment_vectors.json
+  s_8145011de91f43::t_4d0c099d2ab580 264,341-350
+net/crates/net/payments/examples/gen_payments_fixtures.rs
+  s_8145011de91f43::t_5a1513233e7d2f 329-349
+  s_8145011de91f43::t_6d75665441a6b0 510-524
+  s_8145011de91f43::t_59741c30bd9d02 429
+net/crates/net/bindings/node/test/payments_golden_vectors.test.ts
+  s_8145011de91f43::t_35732d7be8a725 82-83,87-98,102,110-111
+net/crates/net/bindings/python/tests/test_payments_golden_vectors.py
+  s_8145011de91f43::t_906dbc0eb2abb1 125-126,133-140,142-146,151-152,158-160
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e38139a6fffd9b4163e8de42f2f3713ea12e081c",
+  "prompts": {},
+  "sessions": {
+    "s_8145011de91f43": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "96805a67-4a02-4942-ad40-e539bfe24a47",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

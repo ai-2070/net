@@ -1,0 +1,23 @@
+.claude/skills/net-payments/bindings.md
+  s_8145011de91f43::t_8a95a344b3f4ac 155,157,159,162-165
+  s_8145011de91f43::t_c9342422170989 218,220-221
+  s_8145011de91f43::t_c0e0779cd53280 166
+.claude/skills/net-payments/gotchas.md
+  s_8145011de91f43::t_97ed01b89fd3cd 100-104
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e7183ca59270ac36d37481112958105a74683240",
+  "prompts": {},
+  "sessions": {
+    "s_8145011de91f43": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "96805a67-4a02-4942-ad40-e539bfe24a47",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

@@ -1,0 +1,22 @@
+net/crates/net/docs/plans/PAYMENTS_FAILURE_SCHEMATIC_PLAN.md
+  s_2ce1bbf7d954a5::t_6a33bfba6887fa 9,12
+  s_2ce1bbf7d954a5::t_0a4c5d2c98dc92 70-71
+  s_2ce1bbf7d954a5::t_2dc0ea20e1b8f7 103-116
+  s_2ce1bbf7d954a5::t_c48d04034b53c0 55
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "665180db81f28b5f94ddbeac8116c2cea20fb201",
+  "prompts": {},
+  "sessions": {
+    "s_2ce1bbf7d954a5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "18fdae31-20fa-4349-91d0-7ace7316145f",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

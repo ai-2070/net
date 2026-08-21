@@ -1,0 +1,19 @@
+net/crates/net/docs/plans/PAYMENTS_P2_GAP_PLAN.md
+  s_ac213343b6b34b::t_2410517aba1c6d 30
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "86e263a8318129c165b5857825a49ea4a6c703b7",
+  "prompts": {},
+  "sessions": {
+    "s_ac213343b6b34b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8d7c0951-4b90-460d-a264-8a57a5f7927a",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

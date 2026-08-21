@@ -1,0 +1,45 @@
+net/crates/net/src/adapter/net/mesh.rs
+  s_c28bdf38c0df3a::t_55b2027350e508 4708-4712,4714-4735,4744-4795
+  s_c28bdf38c0df3a::t_74c68e43a5fc9f 3328
+  s_c28bdf38c0df3a::t_ac4acb74d31560 4736-4743
+  s_c28bdf38c0df3a::t_0bd596bee942ed 3090-3122
+  s_c28bdf38c0df3a::t_d4c8722f9fce1c 12262,12265,12269-12279,12294-12295
+  s_c28bdf38c0df3a::t_63a387fcc20b7b 12266-12268,12281-12293,13407
+  s_c28bdf38c0df3a::t_80b16b9300e5fc 13341,13354,13360,13362,13365,13383-13406
+  s_c28bdf38c0df3a::t_4c77fdcac18619 4971,4978,4980
+  s_c28bdf38c0df3a::t_112328e65606a1 3169-3199
+  s_c28bdf38c0df3a::t_a6287bd48c329e 4713
+  s_c28bdf38c0df3a::t_912c7e330e49ee 3200-3327,3329-3384
+  s_c28bdf38c0df3a::t_da24094ba18034 4624-4688
+net/crates/net/src/adapter/net/behavior/sensing/delivery.rs
+  s_c28bdf38c0df3a::t_3effbbe4bd518f 445-451
+  s_c28bdf38c0df3a::t_8a845a9aca9dcb 43
+  s_c28bdf38c0df3a::t_10acc61ae9664a 404-419
+net/crates/net/src/adapter/net/behavior/sensing/rendezvous.rs
+  s_c28bdf38c0df3a::t_72b23a98f96672 596-622,624-638
+  s_c28bdf38c0df3a::t_74c68e43a5fc9f 623
+net/crates/net/tests/sensing_failure_plane.rs
+  s_c28bdf38c0df3a::t_036559a90f369d 39-43,83,86,102,106,212,216-217,290,294-295,368,371,500,506-508
+  s_c28bdf38c0df3a::t_c6d917eadaeee9 1-38,44-82,84-85,87-101,103-105,114-176,181,184,194-211,213-215,225-282,358-367,369-370,372-482,488-492
+  s_c28bdf38c0df3a::t_62729f206329bb 349
+  s_c28bdf38c0df3a::t_74c68e43a5fc9f 107-113,218-224,296-302,483-487
+  s_c28bdf38c0df3a::t_6a4af7e4579112 177-180,182-183,185-193
+  s_c28bdf38c0df3a::t_a9a5705223c750 493-499,501-505,509-578
+  s_c28bdf38c0df3a::t_36487a933b90a4 283-289,291-293,303-348,350-357
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.13",
+  "base_commit_sha": "1e5f7981f6dc3b546f617be34f9dfd3446ccd62e",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

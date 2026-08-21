@@ -1,0 +1,24 @@
+net/crates/net/src/adapter/net/dataforts/blob/dispatch.rs
+  s_d15043c27a0f20::t_2d00611186e24e 240-252,258-262
+  s_d15043c27a0f20::t_0095a6f0026d37 710-762
+net/crates/net/bindings/python/tests/test_async_per_module.py
+  s_d15043c27a0f20::t_b931b57d7b0f4a 170-171,173,183-209
+  s_d15043c27a0f20::t_c4ddcc941b91e3 210-212
+  s_d15043c27a0f20::t_f601b0dbbd2696 213
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "3980d4ad372bb3520e658eb513a15a322cd7eb94",
+  "prompts": {},
+  "sessions": {
+    "s_d15043c27a0f20": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "47de36b5-a0ab-46ec-8280-668f1f28ce92",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

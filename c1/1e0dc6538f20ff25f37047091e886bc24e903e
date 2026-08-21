@@ -1,0 +1,26 @@
+net/crates/net/docs/plans/SENSING_INTEREST_COALESCING_PLAN.md
+  s_c28bdf38c0df3a::t_8237483d55ec82 20-26
+  s_c28bdf38c0df3a::t_44ed37e37983b1 1556-1576
+net/crates/net/src/adapter/net/mesh.rs
+  s_c28bdf38c0df3a::t_9f4b1878022103 5099,5101-5103,10147-10149,12821-12824,13149
+  s_c28bdf38c0df3a::t_d7d89d32bf1107 3153-3154
+  s_c28bdf38c0df3a::t_63e05f7a439167 1130
+  s_c28bdf38c0df3a::t_b80a5d7cb2f631 3136-3152,3155
+  s_c28bdf38c0df3a::t_e7609e94569c17 3884-3892
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.13",
+  "base_commit_sha": "c11e0dc6538f20ff25f37047091e886bc24e903e",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

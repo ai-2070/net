@@ -1,0 +1,32 @@
+net/crates/net/tests/integration_nrpc_loopback.rs
+  s_9298fd786cc20e::t_29bb16f40bb2e1 54,61
+  s_9298fd786cc20e::t_d5fa41ed0a8660 41-44
+net/crates/net/tests/integration_nrpc_cross_lang.rs
+  s_9298fd786cc20e::t_29bb16f40bb2e1 115,120
+  s_9298fd786cc20e::t_d5fa41ed0a8660 34-36
+net/crates/net/tests/nrpc_route_discriminator.rs
+  s_9298fd786cc20e::t_ac0faf392ec22a 26-28
+  s_9298fd786cc20e::t_2347b252d68d40 106,108
+net/crates/net/tests/integration_nrpc_cross_lang_streaming.rs
+  s_9298fd786cc20e::t_d5fa41ed0a8660 59,65
+  s_9298fd786cc20e::t_29bb16f40bb2e1 183,188
+net/crates/net/src/adapter/net/cortex/rpc.rs
+  s_9298fd786cc20e::t_7bdad6d610c064 4664-4667,5196-5199,5442-5445,5571-5574,5668-5671,5791-5794,5839-5842,5903-5906,6268-6271,6317-6320
+  s_9298fd786cc20e::t_ebf81bde6a51aa 4679
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "059978fc6afd0adc234590078bb96072983f30bb",
+  "prompts": {},
+  "sessions": {
+    "s_9298fd786cc20e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b66914e-9464-4925-9eaf-43ca3fe549a1",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

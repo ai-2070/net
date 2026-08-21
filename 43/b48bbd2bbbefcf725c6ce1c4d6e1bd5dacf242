@@ -1,0 +1,22 @@
+net/crates/net/integrations/hermes/node.py
+  s_ecf38b21f410fb::t_84c32d769c6a91 432-444
+net/crates/net/integrations/hermes/tests/test_mesh_admin.py
+  s_ecf38b21f410fb::t_7804b4a5c1cca8 151-167
+  s_ecf38b21f410fb::t_84d2f2c1462cca 150
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "43b48bbd2bbbefcf725c6ce1c4d6e1bd5dacf242",
+  "prompts": {},
+  "sessions": {
+    "s_ecf38b21f410fb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3ac0e26d-f44d-4303-a31a-325922571411",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

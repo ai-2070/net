@@ -1,0 +1,28 @@
+net/crates/net/payments/tests/svm_checker.rs
+  s_a797c9974a8f7a::t_1dc266f5479f55 42-54,56
+  s_a797c9974a8f7a::t_82d5dae5ac8d31 15-17
+net/crates/net/payments/tests/rpc_fixture/mod.rs
+  s_a797c9974a8f7a::t_3ab8d7f5ed24cf 1-90
+net/crates/net/payments/tests/eip155_checker.rs
+  s_a797c9974a8f7a::t_e18dd5e77280c4 13-15
+  s_a797c9974a8f7a::t_cc9270d1e4e409 36-46,48
+net/crates/net/payments/tests/xrpl_checker.rs
+  s_a797c9974a8f7a::t_1c0eaf971d6f0a 38-52,54
+  s_a797c9974a8f7a::t_1bcd72df20e9ac 17-19
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ce1a079388293b9e7e17a916c434d4282e163e46",
+  "prompts": {},
+  "sessions": {
+    "s_a797c9974a8f7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0c9069b3-7f10-427a-9e70-65573d5f98b9",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

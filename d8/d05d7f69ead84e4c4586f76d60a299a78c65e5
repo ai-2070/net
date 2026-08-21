@@ -1,0 +1,23 @@
+net/crates/net/tests/nrpc_route_discriminator.rs
+  s_9298fd786cc20e::t_10f423b369876b 36-37
+  s_9298fd786cc20e::t_97ac34e9391eec 224-230,234,236,238-239
+  s_9298fd786cc20e::t_b93a6094dfbb16 11-18,20-24
+net/crates/net/tests/nrpc_inbound_dispatcher.rs
+  s_9298fd786cc20e::t_2c43145d07c9e1 347-353,355-362,364
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "d8d05d7f69ead84e4c4586f76d60a299a78c65e5",
+  "prompts": {},
+  "sessions": {
+    "s_9298fd786cc20e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b66914e-9464-4925-9eaf-43ca3fe549a1",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

@@ -1,0 +1,22 @@
+net/crates/net/src/adapter/net/mesh.rs
+  s_20457e56f05db2::t_dbe30b03bb42cc 12606-12616,12623-12624
+net/crates/net/src/adapter/net/behavior/proximity.rs
+  s_20457e56f05db2::t_d3eed98744c696 948-968
+  s_20457e56f05db2::t_14c914b63707c2 1724-1777
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "4f144573efc3b4392558aa43a3b727c40774b34a",
+  "prompts": {},
+  "sessions": {
+    "s_20457e56f05db2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "304d82b1-ccb6-4126-8be7-640b4a26ff5b",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

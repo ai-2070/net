@@ -1,0 +1,19 @@
+web/src/content/docs/worldview/right-and-wrong-use-cases.md
+  s_4e844c75f3aded::t_bd3c7f72605264 55
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.19",
+  "base_commit_sha": "311e5b008a2cca392d8d3fbd1b322d0a0e1874a3",
+  "prompts": {},
+  "sessions": {
+    "s_4e844c75f3aded": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a15fe99c-1910-4f73-ae09-8a2ba5b4ff55",
+        "model": "unknown"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

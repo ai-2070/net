@@ -1,0 +1,22 @@
+net/crates/net/src/adapter/net/behavior/sensing/identity.rs
+  s_55e949a455a65a::t_3dd7b03912e3d6 663-683
+  s_55e949a455a65a::t_0142745d4e0b14 1072-1116
+  s_55e949a455a65a::t_79b9348ced9edc 568-576
+  s_55e949a455a65a::t_a92812515f360c 1071
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "0dc22dc882feba6eff8639f0bc58aecdae2752f2",
+  "prompts": {},
+  "sessions": {
+    "s_55e949a455a65a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d43bc436-0ca9-4951-8c4a-7484aacbc488",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

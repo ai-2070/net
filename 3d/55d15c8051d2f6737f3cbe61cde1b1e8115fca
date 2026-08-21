@@ -1,0 +1,37 @@
+net/crates/net/benches/bench_island_claim/mod.rs
+  s_c28bdf38c0df3a::t_99d922155c0388 649-652
+  s_c28bdf38c0df3a::t_d0316d9cd2c460 674-675
+net/crates/net/benches/island_claim_divergence.rs
+  s_c28bdf38c0df3a::t_b13a2b725c3bd1 613
+  s_c28bdf38c0df3a::t_be7a0bda7f3a95 787
+  s_c28bdf38c0df3a::t_f5dd59960d08e0 799
+  s_c28bdf38c0df3a::t_4ff3a0b7d0b150 309-310,313-315,317,320-321,329-331,334-352,354
+  s_c28bdf38c0df3a::t_cab81ee4f8bbe1 242-245,253
+  s_c28bdf38c0df3a::t_7178c334c56315 43,45
+  s_c28bdf38c0df3a::t_1f16d257379abe 670-691,697-699
+  s_c28bdf38c0df3a::t_55414d5cce55b6 162,766,768-779,784-786,788-798,800-805,807
+  s_c28bdf38c0df3a::t_dffbfb10228ed4 382-384,387-391,398-414
+  s_c28bdf38c0df3a::t_33219aaffe6cb4 74,76-77
+  s_c28bdf38c0df3a::t_d5ee93ecda5423 311-312,692-696,780-783
+  s_c28bdf38c0df3a::t_868110a59f1537 375
+  s_c28bdf38c0df3a::t_278350c9a77a9b 427-428,430-432,438,447-457,460-461,479-480,490,492-501,504,512,525,527-528,535-537,545,548-561,563-571,576,578-587
+  s_c28bdf38c0df3a::t_b344fa038cab87 129-130,132-134,136,140-161
+  s_c28bdf38c0df3a::t_aa1d0f77f8252d 316
+  s_c28bdf38c0df3a::t_6a29f859bf2776 163
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "3d55d15c8051d2f6737f3cbe61cde1b1e8115fca",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

@@ -1,0 +1,27 @@
+net/crates/net/benches/island_claim_boundaries.rs
+  s_c28bdf38c0df3a::t_72c133618491e5 240-249
+  s_c28bdf38c0df3a::t_5a8c04c3a5711f 95,107,114-115,120-121,125-127
+  s_c28bdf38c0df3a::t_9447f908471d4a 182-189,508-511,523-525
+  s_c28bdf38c0df3a::t_61e1746225a15f 252,258,261,264
+  s_c28bdf38c0df3a::t_86fd7c6e9658d1 70
+  s_c28bdf38c0df3a::t_44b487d2909b54 250,466-507,512-522,526-527
+  s_c28bdf38c0df3a::t_c9600d1ebcd98d 13-16
+  s_c28bdf38c0df3a::t_bf5b8aeadc4a79 161-168,172,192-194,201,204-205,225-239
+  s_c28bdf38c0df3a::t_1853904f1d4418 251
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "99baabbb33b17971d30e0584cb644ff6bca3abd9",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

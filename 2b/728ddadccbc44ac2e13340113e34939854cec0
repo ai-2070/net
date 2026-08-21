@@ -1,0 +1,19 @@
+net/crates/net/tests/natsim/run_scenario.sh
+  s_6f4d4a41711b2b::t_ca1f9d47b3d9be 81-95
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "2b728ddadccbc44ac2e13340113e34939854cec0",
+  "prompts": {},
+  "sessions": {
+    "s_6f4d4a41711b2b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2a40a731-f07a-4efa-9058-fa494f0474b7",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

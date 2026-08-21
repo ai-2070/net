@@ -1,0 +1,26 @@
+web/src/content/docs/start/install/typescript.md
+  s_48ef8e138f3b5e::t_cb7e0bbb0fd79f 8
+web/src/content/docs/start/install/python.md
+  s_48ef8e138f3b5e::t_5975882a798c5e 8
+web/src/content/docs/start/install/_shared.md
+  s_48ef8e138f3b5e::t_80d24b944cc4a9 29
+web/src/content/docs/start/install/rust.md
+  s_48ef8e138f3b5e::t_e4376e28efb41f 11,15-16
+  s_48ef8e138f3b5e::t_e960ada97a895c 56
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "1bb84b60f4504652bd7c0b8e55dbffcd7713bf36",
+  "prompts": {},
+  "sessions": {
+    "s_48ef8e138f3b5e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "279a4472-85a1-439a-85a9-44d27ab7ef2e",
+        "model": "claude-opus-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

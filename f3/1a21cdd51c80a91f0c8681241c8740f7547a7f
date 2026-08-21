@@ -1,0 +1,26 @@
+net/crates/net/src/adapter/net/mesh.rs
+  s_c28bdf38c0df3a::t_a5239c5c9ae9a4 1117-1123,3526-3527
+  s_c28bdf38c0df3a::t_9085a78954db78 7601-7614
+  s_c28bdf38c0df3a::t_f1fc2404f68f3f 4619-4643,11376
+  s_c28bdf38c0df3a::t_0067885d24898e 3515-3525
+  s_c28bdf38c0df3a::t_ea1f8fcb93fc27 7615,11225-11375
+  s_c28bdf38c0df3a::t_d745b8f4bd28f2 1124,2836-2844,3528-3529,4224-4227,4644-4646,6200-6201,7616-7618,11377-11379
+net/crates/net/src/adapter/net/behavior/sensing/wire.rs
+  s_c28bdf38c0df3a::t_9f610c4ddbb8b1 19-25
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "f31a21cdd51c80a91f0c8681241c8740f7547a7f",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

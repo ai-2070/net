@@ -1,0 +1,87 @@
+.claude/skills/net-event-bus/testing.md
+  s_c97615a3f036e9::t_864b869bf364cb 153
+.claude/skills/net-payments/facilitator.md
+  s_c97615a3f036e9::t_fcd93956d706c2 150-151,155-157
+  s_c97615a3f036e9::t_0fd014e85103d9 136,140
+.claude/skills/net-payments/gotchas.md
+  s_c97615a3f036e9::t_75b610a988c654 79-84
+.claude/skills/net-event-bus/redex.md
+  s_c97615a3f036e9::t_c11e69342bfdd5 75
+.claude/skills/net-payments/failure-schematic.md
+  s_c97615a3f036e9::t_8481af66402d89 107-109
+  s_c97615a3f036e9::t_997881db4ea3d5 104-106,110-120
+.claude/skills/net-event-bus/cortex.md
+  s_c97615a3f036e9::t_26de1132ed2d95 68-71
+  s_c97615a3f036e9::t_5463d1ba534240 104
+  s_c97615a3f036e9::t_0647d0ae68dee8 111-114
+  s_c97615a3f036e9::t_5a066afec64f81 50-55
+  s_c97615a3f036e9::t_d20761ed750cdd 31
+.claude/skills/net-event-bus/mesh.md
+  s_c97615a3f036e9::t_d7c3790dc251db 69
+  s_c97615a3f036e9::t_15bcfae937864d 68
+  s_c97615a3f036e9::t_e70dd9c70d7698 266
+  s_c97615a3f036e9::t_668ff4a21a5e49 303
+  s_c97615a3f036e9::t_331b0e0ac81330 198-201,208-210,213-226,228,230
+  s_c97615a3f036e9::t_ec2b05a8307a9a 304
+  s_c97615a3f036e9::t_1f8e525d1b3afc 65-67
+.claude/skills/net-event-bus/dataforts.md
+  s_c97615a3f036e9::t_7ec9a880080852 301
+  s_c97615a3f036e9::t_0c98ad08817142 350
+  s_c97615a3f036e9::t_2e250e11535106 199
+  s_c97615a3f036e9::t_31ff9812a32bfb 207
+  s_c97615a3f036e9::t_62b8bda7bcbca5 357
+  s_c97615a3f036e9::t_761ea28a5f0726 339-341
+  s_c97615a3f036e9::t_c89c36dc8105c9 333-335
+  s_c97615a3f036e9::t_5b0ee3292fd6e6 184,186-190,192
+  s_c97615a3f036e9::t_b9961dfda48133 327-329
+  s_c97615a3f036e9::t_320feb44ea6b61 39-40
+  s_c97615a3f036e9::t_8c7abc3fc20ca6 34
+  s_c97615a3f036e9::t_13b374006be885 309-310,314
+  s_c97615a3f036e9::t_e5ac2b3a6d69a0 320-321,323
+.claude/skills/net-event-bus/cli.md
+  s_c97615a3f036e9::t_e9d706785c1554 29
+  s_c97615a3f036e9::t_f9c99de70d0dee 96-108
+.claude/skills/net-payments/networks.md
+  s_c97615a3f036e9::t_eca4408fef36dc 75-76
+  s_c97615a3f036e9::t_d1b94aea4ad835 31
+  s_c97615a3f036e9::t_54a829faa422d7 82
+  s_c97615a3f036e9::t_7f09c34cbeed21 65
+.claude/skills/net-payments/SKILL.md
+  s_c97615a3f036e9::t_faef9a232fcf30 6-7
+.claude/skills/net-payments/spend-policy.md
+  s_c97615a3f036e9::t_1dc205f14ed3a6 25-33
+.claude/skills/net-payments/bindings.md
+  s_c97615a3f036e9::t_b6ef942dc33ca5 54
+.claude/skills/net-payments/signer.md
+  s_c97615a3f036e9::t_6f9b55c0f20618 222-223
+.claude/skills/net-event-bus/SKILL.md
+  s_c97615a3f036e9::t_dad9213eeff8ff 6-7
+  s_c97615a3f036e9::t_14db4a5dea680d 39
+.claude/skills/net-event-bus/observability.md
+  s_c97615a3f036e9::t_7a61c748cd8d1c 116-118,124,126-131,140,142
+  s_c97615a3f036e9::t_1abe555b7657f6 152
+.claude/skills/net-event-bus/error-codes.md
+  s_c97615a3f036e9::t_6ed1819b66a5b1 71-72,75-81
+  s_c97615a3f036e9::t_1eadfeee04375c 56,59
+  s_c97615a3f036e9::t_9fc348852439f6 103,107-109,111
+  s_c97615a3f036e9::t_de04f6eee65ee2 86
+  s_c97615a3f036e9::t_5d6c97ea607cd6 3
+.claude/skills/net-event-bus/filter-dsl.md
+  s_c97615a3f036e9::t_60e2c92b9ef259 71
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "33be3ace194a2f23426d286aff734bb7905af89f",
+  "prompts": {},
+  "sessions": {
+    "s_c97615a3f036e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3b0eda2e-904f-4682-a859-71d75357e55f",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

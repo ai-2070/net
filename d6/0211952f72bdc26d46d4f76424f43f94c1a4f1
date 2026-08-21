@@ -1,0 +1,19 @@
+net/crates/net/docs/plans/PAYMENTS_DOCS_PLAN.md
+  s_8145011de91f43::t_a73e6277b7791f 1-319
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d60211952f72bdc26d46d4f76424f43f94c1a4f1",
+  "prompts": {},
+  "sessions": {
+    "s_8145011de91f43": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "96805a67-4a02-4942-ad40-e539bfe24a47",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

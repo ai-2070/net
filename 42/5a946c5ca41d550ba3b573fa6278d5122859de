@@ -1,0 +1,24 @@
+net/crates/net/bindings/python/src/async_bridge.rs
+  s_ecf38b21f410fb::t_d39015361c674d 225-236
+net/crates/net/bindings/python/tests/test_a2a.py
+  s_ecf38b21f410fb::t_977fbfea048ad7 125-167
+net/crates/net/bindings/python/src/a2a.rs
+  s_ecf38b21f410fb::t_b17929eb6bbcb0 52-58,60
+  s_ecf38b21f410fb::t_1eb04ba6647e7a 69
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "425a946c5ca41d550ba3b573fa6278d5122859de",
+  "prompts": {},
+  "sessions": {
+    "s_ecf38b21f410fb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3ac0e26d-f44d-4303-a31a-325922571411",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

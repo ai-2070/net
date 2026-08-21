@@ -1,0 +1,24 @@
+.claude/skills/net-event-bus/mesh.md
+  s_2ce1bbf7d954a5::t_ce64dbc06d4c26 67
+  s_2ce1bbf7d954a5::t_95c246907b3ab0 70
+  s_2ce1bbf7d954a5::t_4e2f174390b622 131
+  s_2ce1bbf7d954a5::t_db5029c5d8a2d8 129
+.claude/skills/net-event-bus/SKILL.md
+  s_2ce1bbf7d954a5::t_68d874815bceef 6-7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "fa8659df3799d6264235704727e0c0f816959ff6",
+  "prompts": {},
+  "sessions": {
+    "s_2ce1bbf7d954a5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "18fdae31-20fa-4349-91d0-7ace7316145f",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

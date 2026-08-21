@@ -1,0 +1,22 @@
+net/crates/net/sdk/src/tool_payment.rs
+  s_9f662bf3f2895f::t_017ed7032b9f4c 191-204,206-209
+  s_9f662bf3f2895f::t_84d4af0057fab8 497-511
+net/crates/net/payments/src/flow/mod.rs
+  s_9f662bf3f2895f::t_62f11d42a63dfe 1147-1192
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e709dca49b39e1fec1acdf86405eeca1b91e776f",
+  "prompts": {},
+  "sessions": {
+    "s_9f662bf3f2895f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "451f4855-6551-4904-9cc0-f53e5fd0f95d",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

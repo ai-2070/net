@@ -1,0 +1,40 @@
+.github/workflows/ci.yml
+  s_2ce1bbf7d954a5::t_d862802aa020a0 1011
+  s_2ce1bbf7d954a5::t_c8fb75c47bf647 559
+  s_2ce1bbf7d954a5::t_faf6c6f11f08be 1142
+net/crates/net/bindings/node/Cargo.toml
+  s_2ce1bbf7d954a5::t_00b16b97b8828b 155-163
+  s_2ce1bbf7d954a5::t_7f5196554bd124 47
+net/crates/net/bindings/node/src/publish.rs
+  s_2ce1bbf7d954a5::t_23cf6a8533f1af 1-142,144-191,197-486
+  s_2ce1bbf7d954a5::t_426b7db6553263 143
+  s_2ce1bbf7d954a5::t_f8699e0a3cb778 192-196
+net/crates/net/bindings/node/test/publish.test.ts
+  s_2ce1bbf7d954a5::t_2466cc419f68f3 31
+  s_2ce1bbf7d954a5::t_105ce64ad102a4 1-30,32-123
+net/crates/net/bindings/node/src/lib.rs
+  s_2ce1bbf7d954a5::t_33dd7cad575488 72-76
+  s_2ce1bbf7d954a5::t_7fb83b23cb577f 1134-1147
+  s_2ce1bbf7d954a5::t_a28acea89b26ac 1478-1483,1485-1487
+  s_2ce1bbf7d954a5::t_b267418552c790 2073-2074
+  s_2ce1bbf7d954a5::t_9e1735b4b9ba87 2188-2233
+  s_2ce1bbf7d954a5::t_03994b105297a0 20
+net/crates/net/docs/plans/PAYMENTS_PY_TS_SDK_GAP_PLAN.md
+  s_2ce1bbf7d954a5::t_23c3a616960a5a 267,269,273-290
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "9422f92de70a5ebb87eac867cbc1b39baec3dfaa",
+  "prompts": {},
+  "sessions": {
+    "s_2ce1bbf7d954a5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "18fdae31-20fa-4349-91d0-7ace7316145f",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

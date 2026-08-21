@@ -1,0 +1,31 @@
+net/crates/net/src/adapter/net/behavior/sensing/scope.rs
+  s_c28bdf38c0df3a::t_52b5244fd0ba89 127
+  s_c28bdf38c0df3a::t_1db54218695ba2 1-126,128-184
+net/crates/net/src/adapter/net/behavior/sensing/negotiation.rs
+  s_c28bdf38c0df3a::t_f0353bedf25842 1-99
+net/crates/net/src/adapter/net/behavior/sensing/evaluator.rs
+  s_c28bdf38c0df3a::t_50814b35593063 180-182,186-188
+net/crates/net/tests/sensing_fallback.rs
+  s_c28bdf38c0df3a::t_8a3997367bc582 90
+  s_c28bdf38c0df3a::t_b21cbafcc69f76 1-89,91-140,143-145,148-159,168-200
+  s_c28bdf38c0df3a::t_52b5244fd0ba89 141-142,146-147,160-167
+net/crates/net/src/adapter/net/behavior/sensing/mod.rs
+  s_c28bdf38c0df3a::t_ef6566598ca994 35-36,39-40
+  s_c28bdf38c0df3a::t_4231fcc11790b3 41
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "a5ab6af4da3b05f8fad9a207100948855b4f422d",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

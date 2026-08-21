@@ -1,0 +1,29 @@
+net/crates/net/bindings/python/tests/test_capability_gateway.py
+  s_8145011de91f43::t_d53f5e21f02f73 106-117
+net/crates/net/bindings/node/src/capability_gateway.rs
+  s_8145011de91f43::t_18a3722d6ba30e 815-833
+  s_8145011de91f43::t_70aba48549ac37 674-676,678
+  s_8145011de91f43::t_8dc79d41266ff2 73-93
+net/crates/net/bindings/node/test/capability_gateway.test.ts
+  s_8145011de91f43::t_d62c8a7e3a48bf 115,118-125,131
+net/crates/net/bindings/python/src/capability_gateway.rs
+  s_8145011de91f43::t_c22b0fd4f2620d 1131-1133,1135
+  s_8145011de91f43::t_887323a6e8253f 136-156
+  s_8145011de91f43::t_0f6614d52d7017 963-965,967
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "dcb881b6a927184fb05883b9c3c9af330cf0e78b",
+  "prompts": {},
+  "sessions": {
+    "s_8145011de91f43": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "96805a67-4a02-4942-ad40-e539bfe24a47",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

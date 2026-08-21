@@ -1,0 +1,21 @@
+net/crates/net/bindings/node/test/deck.test.ts
+  s_412b111b5c6fa1::t_96c4441b9ca0b0 332
+net/crates/net/bindings/node/test/cross_lang_compat.test.ts
+  s_412b111b5c6fa1::t_43fd05c89b5c9b 127-144
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "101402f1e2fb8c50f311ae020c0a2c2d8cec7af3",
+  "prompts": {},
+  "sessions": {
+    "s_412b111b5c6fa1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4c005a75-18a6-40ff-881f-c6206bc1e6bd",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

@@ -1,0 +1,19 @@
+net/crates/net/docs/releases/RELEASE_v0.31_HOLD_THE_LINE.md
+  s_9d49878d0ea1eb::t_36f852034e78d5 3,5,7,9-12,14,18,20-34,36,38,40-43,45-49,53,55-60,63,65-66,68,70,72-76,78-80,86,88,90,94-103,105-118,124,126,130-132,134,136-138,144-153,159,161-166,172-175,182-187,191
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c3720439ea1aacafd06f0b01f42f1e2c272ee2ea",
+  "prompts": {},
+  "sessions": {
+    "s_9d49878d0ea1eb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b1f3d6a0-f11e-4e01-a538-365ef9408008",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

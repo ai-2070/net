@@ -1,0 +1,26 @@
+net/crates/net/sdk/src/tool_payment.rs
+  s_8145011de91f43::t_cdfc61c6412989 427-428
+  s_8145011de91f43::t_487e5a731c57c9 394-412,414-415,420,423-426,429-433
+net/crates/net/docs/misc/CODE_REVIEW_2026_07_09_PAYMENTS_SDKS.md
+  s_8145011de91f43::t_d346346b49d502 70
+  s_8145011de91f43::t_2685feda926bde 109-117
+  s_8145011de91f43::t_f897cc816deab1 374-392
+net/crates/net/tests/cross_lang_payments/README.md
+  s_8145011de91f43::t_05e5ea03a518ec 69-81
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "413bd5487194f3371cdba3b40171d8ecc435d947",
+  "prompts": {},
+  "sessions": {
+    "s_8145011de91f43": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "96805a67-4a02-4942-ad40-e539bfe24a47",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

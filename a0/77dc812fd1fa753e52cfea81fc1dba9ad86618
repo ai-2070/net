@@ -1,0 +1,28 @@
+net/crates/net/payments/src/policy/spend.rs
+  s_49cc2ab0880501::t_d36d9b728601ae 37
+  s_49cc2ab0880501::t_026d3a332453d5 282-291,293-294,297,309-328,331-368,370-371,373,375-376,379-388,392-408,411-424,427-431,433
+net/crates/net/payments/src/engine/mod.rs
+  s_49cc2ab0880501::t_abd3e8f44e6cad 508-533,535-556,558,560-563,565-570
+net/crates/net/docs/performance/payments-admission-matrix.md
+  s_49cc2ab0880501::t_2af07b80905eeb 80-87
+net/crates/net/payments/tests/read_only_writes_audit.rs
+  s_49cc2ab0880501::t_9b0ae72ae8af06 1-302
+net/crates/net/docs/performance/payments-redeem-write-amplification.md
+  s_49cc2ab0880501::t_1520e28012dadf 104-124
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "a077dc812fd1fa753e52cfea81fc1dba9ad86618",
+  "prompts": {},
+  "sessions": {
+    "s_49cc2ab0880501": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1bc5d9ed-b590-4842-a9b4-43f10e352741",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

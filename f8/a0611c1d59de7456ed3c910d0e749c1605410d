@@ -1,0 +1,19 @@
+net/crates/net/bindings/node/src/lib.rs
+  s_20457e56f05db2::t_e6a248c15bb7e5 2119-2132,2135-2141,2146-2163,2165-2168
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "f8a0611c1d59de7456ed3c910d0e749c1605410d",
+  "prompts": {},
+  "sessions": {
+    "s_20457e56f05db2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "304d82b1-ccb6-4126-8be7-640b4a26ff5b",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

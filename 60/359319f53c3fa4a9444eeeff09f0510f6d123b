@@ -1,0 +1,19 @@
+net/crates/net/docs/misc/CODE_REVIEW_2026_07_11_REALTIME_ROUTING_DISCOVERY.md
+  s_6e3ba98fcf8a1a::t_36fc40a374218b 1-486
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "60359319f53c3fa4a9444eeeff09f0510f6d123b",
+  "prompts": {},
+  "sessions": {
+    "s_6e3ba98fcf8a1a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "06d6941e-b88a-429a-8af7-b32d33e82522",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

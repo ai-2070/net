@@ -1,0 +1,31 @@
+net/crates/net/src/adapter/net/behavior/org_revocation.rs
+  s_9298fd786cc20e::t_ff7eabb0484eaa 2740
+  s_9298fd786cc20e::t_8d193c5928ea2b 936,989
+  s_9298fd786cc20e::t_963cb7652825f1 1165
+  s_9298fd786cc20e::t_8454fc1fdbcc29 2526-2528
+  s_9298fd786cc20e::t_e5e48226bfd427 2468-2525,2529-2542
+  s_9298fd786cc20e::t_23c0590ab2f33c 2320,2324
+  s_9298fd786cc20e::t_f3d4d724d0030d 878-888
+  s_9298fd786cc20e::t_c6a4b0dec4b765 604
+  s_9298fd786cc20e::t_fc10083e5612c1 2999
+  s_9298fd786cc20e::t_a29dd200fd5350 525-537,553-559,561-565,571-578,587-601
+net/crates/net/tests/org_ownership.rs
+  s_9298fd786cc20e::t_3cca52c7ac3ece 1943-1954,1956-1957,1964,1968,1971,1975,1978-1981
+  s_9298fd786cc20e::t_b0cef4a5b94e7b 1982
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "fda5e2ed027393350fb1617f955b76a6329ee776",
+  "prompts": {},
+  "sessions": {
+    "s_9298fd786cc20e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b66914e-9464-4925-9eaf-43ca3fe549a1",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

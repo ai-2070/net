@@ -1,0 +1,20 @@
+net/crates/net/docs/misc/CODE_REVIEW_2026_07_08_PAYMENTS_GAP_2.md
+  s_ac213343b6b34b::t_674b2a3e98dad4 31
+  s_ac213343b6b34b::t_5a8f3700c92d0d 32
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d2a7b07815b276d0fbce8f370f71e63291205de7",
+  "prompts": {},
+  "sessions": {
+    "s_ac213343b6b34b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8d7c0951-4b90-460d-a264-8a57a5f7927a",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
