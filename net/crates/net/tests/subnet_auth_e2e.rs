@@ -187,7 +187,26 @@ fn base_config() -> MeshNodeConfig {
     let mut cfg = MeshNodeConfig::new(addr, PSK)
         .with_heartbeat_interval(Duration::from_millis(200))
         .with_session_timeout(Duration::from_secs(5))
-        .with_handshake(3, Duration::from_secs(2))
+        // A deliberately generous PER-ATTEMPT handshake window, because
+        // the retry count cannot substitute for it. Every direct
+        // handshake retry mints a FRESH Noise handshake, so a responder
+        // that consumed an earlier `msg1` answers a state the initiator
+        // has already discarded; that `read_message` failure burns the
+        // next attempt, and the responder — one-shot by API — has
+        // already returned Ok and stopped listening. The pair can never
+        // re-sync, so only the FIRST attempt's timeout decides, and
+        // missing it fails `connect` with
+        // `Connection("handshake timeout")` while the peer's `accept()`
+        // reports success.
+        //
+        // The window is the whole defence, and localhost never loses
+        // the datagram — it is buffered until the responder task is
+        // scheduled. On a loaded runner (this binary alone stands up 22
+        // four-worker runtimes, and CI runs it beside a dozen other
+        // mesh binaries) that scheduling delay can outlast 2s. Nothing
+        // in this file expects a handshake to fail, so the larger
+        // budget is only ever paid by a stall it rescues.
+        .with_handshake(3, Duration::from_secs(5))
         .with_capability_gc_interval(Duration::from_millis(250));
     cfg.socket_buffers = SocketBufferConfig {
         send_buffer_size: TEST_BUFFER_SIZE,
