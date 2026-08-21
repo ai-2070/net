@@ -265,7 +265,16 @@ fn engine_unavailable_denial(tool_id: &str, quote_id: &str) -> net_sdk::tool_pay
 /// spans, not intra-doc links: each gate module is behind its own feature
 /// while this fn compiles under `any(mesh, mcp-gate)`, so a link to the
 /// other module would dangle when docs build with only one feature on.)
+//
+// `result_large_err`: the `Err` type is not ours to shrink here. A
+// `GateDenial` (message + schematic) is the refusal type of the SDK's
+// public `ToolPaymentGate` and the MCP adapter's `PaymentAdmission`,
+// and both of this function's callers are thin impls of those traits —
+// boxing the denial here would only be unboxed one frame up. The path
+// is a cold refusal, taken once per rejected invocation, never on the
+// admit path.
 #[cfg(any(feature = "mesh", feature = "mcp-gate"))]
+#[allow(clippy::result_large_err)]
 pub(crate) async fn redeem_via_engine(
     engine: &PaymentEngine,
     tool_id: &str,
