@@ -107,6 +107,10 @@ struct ToolRefusal {
 /// per-caller reply subscription propagates — the round-trip idiom). A
 /// server refusal is a deterministic answer: it is returned, never
 /// retried.
+// `ToolRefusal` carries a `FailureSchematic` by value — that IS the
+// assertion surface of these tests, and boxing it here would buy a
+// test helper nothing.
+#[allow(clippy::result_large_err)]
 async fn invoke_tool(
     caller: &Mesh,
     provider_id: u64,

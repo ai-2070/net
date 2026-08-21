@@ -146,6 +146,10 @@ struct ServerRefusal {
 /// cross-node call can lose its reply before the per-caller reply
 /// subscription propagates — the round-trip suite's idiom). A server
 /// refusal is terminal (never retried) and returns both renderings.
+// `ServerRefusal` carries a `FailureSchematic` by value — that IS the
+// assertion surface of these tests, and boxing it here would buy a
+// test helper nothing.
+#[allow(clippy::result_large_err)]
 async fn call_with_headers(
     caller: &Mesh,
     target: u64,

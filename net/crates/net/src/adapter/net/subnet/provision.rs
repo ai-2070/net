@@ -364,7 +364,7 @@ pub mod dto {
             return Err(SubnetProvisionError::InvalidIdHex);
         }
         let mut out = [0u8; 32];
-        for (i, chunk) in bytes.chunks_exact(2).enumerate() {
+        for (i, chunk) in bytes.as_chunks::<2>().0.iter().enumerate() {
             let hi = hex_val(chunk[0]).ok_or(SubnetProvisionError::InvalidIdHex)?;
             let lo = hex_val(chunk[1]).ok_or(SubnetProvisionError::InvalidIdHex)?;
             out[i] = (hi << 4) | lo;
