@@ -430,6 +430,10 @@ name = "subnet_auth_e2e"
 required-features = ["net", "cortex", "fixtures"]
 
 [[test]]
+name = "handshake_retry_resync"
+required-features = ["net"]
+
+[[test]]
 name = "subnet_gateway_local_auth"
 required-features = ["net"]
 

@@ -658,6 +658,7 @@ jobs:
           --test channel_auth_hardening
           --test channel_auth_origin_binding
           --test connect_post_start
+          --test handshake_retry_resync
           --test failure_detector_matrix
           --test parallel_bind_stress
           --test peer_death_evicts_peer_map

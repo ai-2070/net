@@ -592,37 +592,38 @@ impl NetAdapter {
         // which is still long but not unbounded.
         const HANDSHAKE_RETRY_SLEEP_CAP_MS: u64 = 5_000;
 
-        loop {
-            attempt += 1;
-            match self.try_handshake(socket).await {
-                Ok(result) => return Ok(result),
-                Err(e) if attempt < max_attempts => {
-                    tracing::warn!(
-                        attempt = attempt,
-                        max = max_attempts,
-                        error = %e,
-                        "handshake failed, retrying"
-                    );
-                    let backoff_ms =
-                        (100u64.saturating_mul(attempt as u64)).min(HANDSHAKE_RETRY_SLEEP_CAP_MS);
-                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-    }
+        // Backoff shared by both roles, so the two retry loops below
+        // cannot drift apart.
+        let backoff = |attempt: usize, e: &AdapterError| {
+            tracing::warn!(
+                attempt = attempt,
+                max = max_attempts,
+                error = %e,
+                "handshake failed, retrying"
+            );
+            let backoff_ms =
+                (100u64.saturating_mul(attempt as u64)).min(HANDSHAKE_RETRY_SLEEP_CAP_MS);
+            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms))
+        };
 
-    /// Single handshake attempt.
-    /// Returns session keys and the actual peer address.
-    async fn try_handshake(
-        &self,
-        socket: &Socket,
-    ) -> Result<(SessionKeys, std::net::SocketAddr), AdapterError> {
-        let timeout = self.config.handshake_timeout;
-        let socket_arc = socket.socket_arc();
-
+        // The two roles retry differently, which is why they no longer
+        // share one attempt function.
+        //
+        // The INITIATOR builds `msg1` and its Noise state ONCE, out here
+        // above the loop, so a retry RETRANSMITS the same `msg1`.
+        // Minting a fresh handshake per attempt cannot re-sync a pair
+        // that fell out of step: the responder answers whichever `msg1`
+        // it read first, and an initiator that has since discarded that
+        // state fails `read_message` on the reply and spends the rest of
+        // its budget re-asking a question nobody is still listening for.
+        // Reusing one state leaves every copy of `msg1` answerable by
+        // the state we still hold. `build_handshake` stamps no counter
+        // or nonce, so the retransmitted bytes are byte-identical.
+        //
+        // The RESPONDER has no state to carry across attempts — each
+        // attempt answers whichever `msg1` it reads — so it rebuilds
+        // per attempt by construction.
         if self.config.is_initiator() {
-            // Initiator flow
             let peer_pubkey = self
                 .config
                 .peer_static_pubkey
@@ -632,7 +633,6 @@ impl NetAdapter {
             let mut handshake = NoiseHandshake::initiator(&self.config.psk, peer_pubkey)
                 .map_err(|e| AdapterError::Fatal(format!("handshake init failed: {}", e)))?;
 
-            // Send first message
             let msg1 = handshake
                 .write_message(&[])
                 .map_err(|e| AdapterError::Connection(format!("write_message failed: {}", e)))?;
@@ -640,140 +640,201 @@ impl NetAdapter {
             let mut builder = PacketBuilder::new(&[0u8; 32], 0);
             let packet = builder.build_handshake(&msg1);
 
-            socket
-                .send_to(&packet, self.config.peer_addr)
-                .await
-                .map_err(|e| AdapterError::Connection(format!("send failed: {}", e)))?;
-
-            // Receive response, discarding datagrams that are not handshake
-            // packets from the expected peer. This prevents stray traffic on
-            // the shared socket from consuming the handshake slot.
-            let (parsed, _source) = tokio::time::timeout(timeout, async {
-                // Stack buffer reused across loop iterations.
-                // `MAX_PACKET_SIZE` is 8192 bytes — small enough to
-                // live on the async stack without spilling, and the
-                // reuse drops the per-iteration `BytesMut::with_capacity`
-                // alloc on the stray-traffic path. Pre-fix every
-                // discarded datagram (an off-peer packet, an invalid
-                // handshake) allocated a fresh 8 KiB and freed it at
-                // loop end — under stray UDP traffic on the same
-                // bind port this churned the allocator. Only the
-                // success path now allocates (a `Bytes::copy_from_slice`
-                // sized to the actual payload, since `ParsedPacket`
-                // owns its `Bytes`).
-                let mut recv_buf = [0u8; protocol::MAX_PACKET_SIZE];
-                loop {
-                    let (n, source) = socket_arc
-                        .recv_from(&mut recv_buf)
-                        .await
-                        .map_err(|e| AdapterError::Connection(format!("recv failed: {}", e)))?;
-
-                    // Only accept packets from the peer we initiated with
-                    if source != self.config.peer_addr {
-                        continue;
+            loop {
+                attempt += 1;
+                match self
+                    .try_handshake_initiator(socket, &packet, &mut handshake)
+                    .await
+                {
+                    Ok(()) => {
+                        let keys = handshake.into_session_keys().map_err(|e| {
+                            AdapterError::Fatal(format!("key extraction failed: {}", e))
+                        })?;
+                        return Ok((keys, self.config.peer_addr));
                     }
-
-                    let data = bytes::Bytes::copy_from_slice(&recv_buf[..n]);
-
-                    if let Some(p) = ParsedPacket::parse(data, source) {
-                        if p.header.flags.is_handshake() {
-                            return Ok::<_, AdapterError>((p, source));
-                        }
-                    }
-                    // Not a valid handshake packet from our peer — keep waiting
+                    Err(e) if attempt < max_attempts => backoff(attempt, &e).await,
+                    Err(e) => return Err(e),
                 }
-            })
-            .await
-            .map_err(|_| AdapterError::Connection("handshake timeout".into()))??;
-
-            // Process response
-            handshake
-                .read_message(&parsed.payload)
-                .map_err(|e| AdapterError::Connection(format!("read_message failed: {}", e)))?;
-
-            // Extract session keys
-            let keys = handshake
-                .into_session_keys()
-                .map_err(|e| AdapterError::Fatal(format!("key extraction failed: {}", e)))?;
-            Ok((keys, self.config.peer_addr))
-        } else {
-            // Responder flow
-            let keypair = self
-                .config
-                .static_keypair
-                .as_ref()
-                .ok_or_else(|| AdapterError::Fatal("missing static keypair".into()))?;
-
-            // Wait for an initiator handshake message, discarding any
-            // non-handshake datagrams that arrive on the shared
-            // socket. Per-source pacing throttles flooders so the
-            // legitimate initiator's msg1 can land — without it,
-            // an attacker could blast handshake-flagged datagrams
-            // and monopolize this recv loop.
-            let (parsed, source) = tokio::time::timeout(timeout, async {
-                loop {
-                    let mut recv_buf = bytes::BytesMut::with_capacity(protocol::MAX_PACKET_SIZE);
-                    recv_buf.resize(protocol::MAX_PACKET_SIZE, 0);
-
-                    let (n, source) = socket_arc
-                        .recv_from(&mut recv_buf)
-                        .await
-                        .map_err(|e| AdapterError::Connection(format!("recv failed: {}", e)))?;
-
-                    recv_buf.truncate(n);
-                    let data = recv_buf.freeze();
-
-                    if let Some(p) = ParsedPacket::parse(data, source) {
-                        if p.header.flags.is_handshake() {
-                            // Per-source pacing: drop packets from
-                            // sources that exceed the budget.
-                            let allowed = self.handshake_pacer.lock().check_and_record(source);
-                            if !allowed {
-                                tracing::debug!(
-                                    %source,
-                                    "handshake responder: dropping packet from \
-                                     rate-limited source"
-                                );
-                                continue;
-                            }
-                            return Ok::<_, AdapterError>((p, source));
-                        }
-                    }
-                    // Not a valid handshake packet — keep waiting
-                }
-            })
-            .await
-            .map_err(|_| AdapterError::Connection("handshake timeout".into()))??;
-
-            let mut handshake = NoiseHandshake::responder(&self.config.psk, keypair)
-                .map_err(|e| AdapterError::Fatal(format!("handshake init failed: {}", e)))?;
-
-            // Process initiator message
-            handshake
-                .read_message(&parsed.payload)
-                .map_err(|e| AdapterError::Connection(format!("read_message failed: {}", e)))?;
-
-            // Send response
-            let msg2 = handshake
-                .write_message(&[])
-                .map_err(|e| AdapterError::Connection(format!("write_message failed: {}", e)))?;
-
-            let mut builder = PacketBuilder::new(&[0u8; 32], 0);
-            let packet = builder.build_handshake(&msg2);
-
-            // Reply to the actual source address (not the configured peer_addr),
-            // so the handshake completes even behind NAT or when the config is stale.
-            socket
-                .send_to(&packet, source)
-                .await
-                .map_err(|e| AdapterError::Connection(format!("send failed: {}", e)))?;
-
-            // Extract session keys and use the actual source address as peer
-            let keys = handshake
-                .into_session_keys()
-                .map_err(|e| AdapterError::Fatal(format!("key extraction failed: {}", e)))?;
-            Ok((keys, source))
+            }
         }
+
+        loop {
+            attempt += 1;
+            match self.try_handshake_responder(socket).await {
+                Ok(result) => return Ok(result),
+                Err(e) if attempt < max_attempts => backoff(attempt, &e).await,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// ONE initiator attempt: (re)transmit `packet` and drive
+    /// `handshake` to completion from the peer's reply.
+    ///
+    /// `packet` and `handshake` belong to [`Self::perform_handshake`]
+    /// and are reused across attempts — see its comment for why.
+    async fn try_handshake_initiator(
+        &self,
+        socket: &Socket,
+        packet: &Bytes,
+        handshake: &mut NoiseHandshake,
+    ) -> Result<(), AdapterError> {
+        let timeout = self.config.handshake_timeout;
+        let socket_arc = socket.socket_arc();
+
+        socket
+            .send_to(packet, self.config.peer_addr)
+            .await
+            .map_err(|e| AdapterError::Connection(format!("send failed: {}", e)))?;
+
+        // Receive response, discarding datagrams that are not handshake
+        // packets from the expected peer. This prevents stray traffic on
+        // the shared socket from consuming the handshake slot.
+        tokio::time::timeout(timeout, async {
+            // Stack buffer reused across loop iterations.
+            // `MAX_PACKET_SIZE` is 8192 bytes — small enough to
+            // live on the async stack without spilling, and the
+            // reuse drops the per-iteration `BytesMut::with_capacity`
+            // alloc on the stray-traffic path. Pre-fix every
+            // discarded datagram (an off-peer packet, an invalid
+            // handshake) allocated a fresh 8 KiB and freed it at
+            // loop end — under stray UDP traffic on the same
+            // bind port this churned the allocator. Only the
+            // success path now allocates (a `Bytes::copy_from_slice`
+            // sized to the actual payload, since `ParsedPacket`
+            // owns its `Bytes`).
+            let mut recv_buf = [0u8; protocol::MAX_PACKET_SIZE];
+            loop {
+                let (n, source) = socket_arc
+                    .recv_from(&mut recv_buf)
+                    .await
+                    .map_err(|e| AdapterError::Connection(format!("recv failed: {}", e)))?;
+
+                // Only accept packets from the peer we initiated with
+                if source != self.config.peer_addr {
+                    continue;
+                }
+
+                let data = bytes::Bytes::copy_from_slice(&recv_buf[..n]);
+
+                let Some(p) = ParsedPacket::parse(data, source) else {
+                    continue;
+                };
+                if !p.header.flags.is_handshake() {
+                    // Not a valid handshake packet from our peer — keep waiting
+                    continue;
+                }
+
+                // A handshake-flagged datagram that does not advance
+                // the state is discarded, NOT fatal: keep waiting for
+                // the real `msg2` until the window closes. Snow
+                // checkpoints the symmetric state and restores it
+                // when `read_message` fails, leaving
+                // `pattern_position` untouched, so a rejected reply
+                // costs nothing — whereas failing the attempt on one
+                // would hand an off-path sender a single garbage
+                // datagram as a denial primitive.
+                match handshake.read_message(&p.payload) {
+                    Ok(_) => return Ok::<(), AdapterError>(()),
+                    Err(e) => {
+                        tracing::debug!(
+                            %source,
+                            error = %e,
+                            "discarding a handshake reply that does not advance our state"
+                        );
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|_| AdapterError::Connection("handshake timeout".into()))?
+    }
+
+    /// ONE responder attempt: read an initiator's `msg1`, answer it,
+    /// and return the session keys with the source address it came
+    /// from.
+    async fn try_handshake_responder(
+        &self,
+        socket: &Socket,
+    ) -> Result<(SessionKeys, std::net::SocketAddr), AdapterError> {
+        let timeout = self.config.handshake_timeout;
+        let socket_arc = socket.socket_arc();
+
+        let keypair = self
+            .config
+            .static_keypair
+            .as_ref()
+            .ok_or_else(|| AdapterError::Fatal("missing static keypair".into()))?;
+
+        // Wait for an initiator handshake message, discarding any
+        // non-handshake datagrams that arrive on the shared
+        // socket. Per-source pacing throttles flooders so the
+        // legitimate initiator's msg1 can land — without it,
+        // an attacker could blast handshake-flagged datagrams
+        // and monopolize this recv loop.
+        let (parsed, source) = tokio::time::timeout(timeout, async {
+            loop {
+                let mut recv_buf = bytes::BytesMut::with_capacity(protocol::MAX_PACKET_SIZE);
+                recv_buf.resize(protocol::MAX_PACKET_SIZE, 0);
+
+                let (n, source) = socket_arc
+                    .recv_from(&mut recv_buf)
+                    .await
+                    .map_err(|e| AdapterError::Connection(format!("recv failed: {}", e)))?;
+
+                recv_buf.truncate(n);
+                let data = recv_buf.freeze();
+
+                if let Some(p) = ParsedPacket::parse(data, source) {
+                    if p.header.flags.is_handshake() {
+                        // Per-source pacing: drop packets from
+                        // sources that exceed the budget.
+                        let allowed = self.handshake_pacer.lock().check_and_record(source);
+                        if !allowed {
+                            tracing::debug!(
+                                %source,
+                                "handshake responder: dropping packet from \
+                                 rate-limited source"
+                            );
+                            continue;
+                        }
+                        return Ok::<_, AdapterError>((p, source));
+                    }
+                }
+                // Not a valid handshake packet — keep waiting
+            }
+        })
+        .await
+        .map_err(|_| AdapterError::Connection("handshake timeout".into()))??;
+
+        let mut handshake = NoiseHandshake::responder(&self.config.psk, keypair)
+            .map_err(|e| AdapterError::Fatal(format!("handshake init failed: {}", e)))?;
+
+        // Process initiator message
+        handshake
+            .read_message(&parsed.payload)
+            .map_err(|e| AdapterError::Connection(format!("read_message failed: {}", e)))?;
+
+        // Send response
+        let msg2 = handshake
+            .write_message(&[])
+            .map_err(|e| AdapterError::Connection(format!("write_message failed: {}", e)))?;
+
+        let mut builder = PacketBuilder::new(&[0u8; 32], 0);
+        let packet = builder.build_handshake(&msg2);
+
+        // Reply to the actual source address (not the configured peer_addr),
+        // so the handshake completes even behind NAT or when the config is stale.
+        socket
+            .send_to(&packet, source)
+            .await
+            .map_err(|e| AdapterError::Connection(format!("send failed: {}", e)))?;
+
+        // Extract session keys and use the actual source address as peer
+        let keys = handshake
+            .into_session_keys()
+            .map_err(|e| AdapterError::Fatal(format!("key extraction failed: {}", e)))?;
+        Ok((keys, source))
     }
 
     /// Process a single received packet: parse, decrypt, and queue events.

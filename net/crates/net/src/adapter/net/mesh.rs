@@ -33117,12 +33117,20 @@ impl MeshNode {
         dest_pubkey: &[u8; 32],
         dest_node_id: u64,
     ) -> Result<u64, AdapterError> {
-        // Retry the msg1-send + msg2-await `handshake_retries` times
-        // (mirrors `handshake_initiator` for the direct path). Routed
-        // handshakes ride a UDP relay path that can drop msg1 or msg2
-        // independently; a single packet loss should not surface as a
-        // typed error to the operator. Per-attempt cleanup happens
+        // Retry the msg1-send + msg2-await `handshake_retries` times.
+        // Routed handshakes ride a UDP relay path that can drop msg1 or
+        // msg2 independently; a single packet loss should not surface as
+        // a typed error to the operator. Per-attempt cleanup happens
         // inside `try_connect_via_once`, so each retry starts fresh.
+        //
+        // Minting a fresh handshake per attempt is safe HERE, unlike on
+        // the direct path (see `handshake_initiator`, which retransmits
+        // one `msg1` instead). The routed responder is the destination's
+        // dispatch loop via `handle_routed_handshake` Case 2 — always
+        // listening, and it answers each `msg1` on its own terms — so a
+        // later attempt still gets a reply. The direct responder is
+        // `accept()`, which stops listening after its first success, so
+        // there a fresh `msg1` asks a question nobody will answer.
         let mut attempt = 0;
         let keys = loop {
             attempt += 1;
@@ -33700,37 +33708,38 @@ impl MeshNode {
 
     // ── Handshake helpers ───────────────────────────────────────────────
 
+    /// Drive a direct initiator handshake to completion, retrying a
+    /// transient failure up to `handshake_retries` times.
+    ///
+    /// `msg1` and its Noise state are built ONCE and reused: a retry
+    /// RETRANSMITS the same `msg1` instead of minting a fresh
+    /// handshake. That distinction is what makes `handshake_retries` a
+    /// budget rather than a formality.
+    ///
+    /// Minting a fresh handshake per attempt desynchronises the pair
+    /// beyond repair. The only direct responder is [`Self::accept`],
+    /// which is ONE-SHOT — it returns after its first success and stops
+    /// listening, and the dispatch loop drops unsolicited direct
+    /// handshakes rather than answering them. So a responder that was
+    /// merely slow to be scheduled consumes the FIRST `msg1` and
+    /// answers that one. A fresh-per-attempt initiator has by then
+    /// discarded the state that `msg2` belongs to: it fails
+    /// `read_message`, burns the remainder of its budget re-sending
+    /// `msg1` copies nobody is listening for, and reports
+    /// `Connection("handshake timeout")` while the peer's `accept()`
+    /// reports success. Reusing one state leaves every copy of `msg1`
+    /// answerable by the state we still hold.
+    ///
+    /// Retransmitting identical bytes adds no replay exposure: with a
+    /// one-shot sole responder, N copies still yield at most one
+    /// session, and a captured `msg1` was always replayable by anyone
+    /// on path.
     async fn handshake_initiator(
         &self,
         peer_addr: SocketAddr,
         peer_pubkey: &[u8; 32],
         peer_node_id: u64,
     ) -> Result<SessionKeys, AdapterError> {
-        let mut attempt = 0;
-        loop {
-            attempt += 1;
-            match self
-                .try_handshake_initiator(peer_addr, peer_pubkey, peer_node_id)
-                .await
-            {
-                Ok(keys) => return Ok(keys),
-                Err(e) if attempt < self.config.handshake_retries => {
-                    tracing::warn!(attempt, error = %e, "mesh handshake failed, retrying");
-                    tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-    }
-
-    async fn try_handshake_initiator(
-        &self,
-        peer_addr: SocketAddr,
-        peer_pubkey: &[u8; 32],
-        peer_node_id: u64,
-    ) -> Result<SessionKeys, AdapterError> {
-        let timeout = self.config.handshake_timeout;
-
         // Prologue uses the 32-bit `routing_id` projection of the node
         // ids — the same projection routed handshakes use, so the two
         // paths share one prologue convention. Direct handshakes don't
@@ -33745,8 +33754,44 @@ impl MeshNode {
             .write_message(&[])
             .map_err(|e| AdapterError::Connection(format!("write_message failed: {}", e)))?;
 
+        // Deterministic in `msg1` — `build_handshake` stamps no counter
+        // or nonce — so the retransmitted bytes are byte-identical.
         let mut builder = PacketBuilder::new(&[0u8; 32], 0);
         let packet = builder.build_handshake(&msg1);
+
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match self
+                .try_handshake_initiator(peer_addr, &packet, &mut handshake)
+                .await
+            {
+                Ok(()) => {
+                    return handshake
+                        .into_session_keys()
+                        .map_err(|e| AdapterError::Fatal(format!("key extraction failed: {}", e)))
+                }
+                Err(e) if attempt < self.config.handshake_retries => {
+                    tracing::warn!(attempt, error = %e, "mesh handshake failed, retransmitting");
+                    tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// ONE attempt: (re)transmit `packet` and drive `handshake` to
+    /// completion from the peer's reply.
+    ///
+    /// `packet` and `handshake` belong to [`Self::handshake_initiator`]
+    /// and are reused across attempts — see its doc for why.
+    async fn try_handshake_initiator(
+        &self,
+        peer_addr: SocketAddr,
+        packet: &Bytes,
+        handshake: &mut NoiseHandshake,
+    ) -> Result<(), AdapterError> {
+        let timeout = self.config.handshake_timeout;
 
         // Polling `socket_arc.recv_from` directly would race
         // `spawn_receive_loop`'s consumer post-`start()` (tokio
@@ -33761,7 +33806,7 @@ impl MeshNode {
         //     branch forwards the parsed payload bytes through.
         // Concurrent direct connects on the same node also work
         // — each registers under its own peer_addr.
-        let payload_bytes = if self.started.load(Ordering::Acquire) {
+        if self.started.load(Ordering::Acquire) {
             let (tx, rx) = oneshot::channel::<Bytes>();
             // Register BEFORE sending msg1 so we can't miss a
             // fast responder that replies before we'd otherwise
@@ -33769,12 +33814,12 @@ impl MeshNode {
             // entry for the same `peer_addr` — last writer wins.
             self.pending_direct_initiators.insert(peer_addr, tx);
 
-            if let Err(e) = self.socket.send_to(&packet, peer_addr).await {
+            if let Err(e) = self.socket.send_to(packet, peer_addr).await {
                 self.pending_direct_initiators.remove(&peer_addr);
                 return Err(AdapterError::Connection(format!("send failed: {}", e)));
             }
 
-            match tokio::time::timeout(timeout, rx).await {
+            let payload_bytes = match tokio::time::timeout(timeout, rx).await {
                 Ok(Ok(payload)) => payload,
                 Ok(Err(_)) => {
                     // Sender dropped — the dispatcher removed our
@@ -33789,18 +33834,23 @@ impl MeshNode {
                     self.pending_direct_initiators.remove(&peer_addr);
                     return Err(AdapterError::Connection("handshake timeout".into()));
                 }
-            }
+            };
+
+            handshake
+                .read_message(&payload_bytes)
+                .map_err(|e| AdapterError::Connection(format!("read_message failed: {}", e)))?;
+            Ok(())
         } else {
             // Pre-start fallback: dispatcher is not running, so
             // there's nothing to forward through the registry.
             // Poll the socket directly — no race exists yet.
             let socket_arc = self.socket.socket_arc();
             self.socket
-                .send_to(&packet, peer_addr)
+                .send_to(packet, peer_addr)
                 .await
                 .map_err(|e| AdapterError::Connection(format!("send failed: {}", e)))?;
 
-            let parsed = tokio::time::timeout(timeout, async {
+            tokio::time::timeout(timeout, async {
                 loop {
                     let mut recv_buf = bytes::BytesMut::with_capacity(protocol::MAX_PACKET_SIZE);
                     recv_buf.resize(protocol::MAX_PACKET_SIZE, 0);
@@ -33817,25 +33867,38 @@ impl MeshNode {
                     recv_buf.truncate(n);
                     let data = recv_buf.freeze();
 
-                    if let Some(p) = ParsedPacket::parse(data, source) {
-                        if p.header.flags.is_handshake() {
-                            return Ok::<_, AdapterError>(p);
+                    let Some(p) = ParsedPacket::parse(data, source) else {
+                        continue;
+                    };
+                    if !p.header.flags.is_handshake() {
+                        continue;
+                    }
+
+                    // A handshake-flagged datagram that does not
+                    // advance the state is discarded, NOT fatal: keep
+                    // waiting for the real `msg2` until the window
+                    // closes. Snow checkpoints the symmetric state and
+                    // restores it when `read_message` fails, and leaves
+                    // `pattern_position` untouched, so a rejected reply
+                    // costs nothing — whereas failing the attempt on
+                    // one would hand an off-path sender a single
+                    // garbage datagram as a denial primitive.
+                    match handshake.read_message(&p.payload) {
+                        Ok(_) => return Ok::<(), AdapterError>(()),
+                        Err(e) => {
+                            tracing::debug!(
+                                %source,
+                                error = %e,
+                                "discarding a direct handshake reply that does not \
+                                 advance our state"
+                            );
                         }
                     }
                 }
             })
             .await
-            .map_err(|_| AdapterError::Connection("handshake timeout".into()))??;
-            parsed.payload
-        };
-
-        handshake
-            .read_message(&payload_bytes)
-            .map_err(|e| AdapterError::Connection(format!("read_message failed: {}", e)))?;
-
-        handshake
-            .into_session_keys()
-            .map_err(|e| AdapterError::Fatal(format!("key extraction failed: {}", e)))
+            .map_err(|_| AdapterError::Connection("handshake timeout".into()))?
+        }
     }
 
     async fn handshake_responder(
