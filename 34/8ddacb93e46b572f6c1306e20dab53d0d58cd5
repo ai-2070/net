@@ -1,0 +1,25 @@
+net/crates/net/tests/dataforts_blob_e2e.rs
+  s_1c2619b306ff4a::t_5cc2a494ae17d3 73-90,94-130
+  s_1c2619b306ff4a::t_f11c0d7dbe5527 1024-1027
+  s_1c2619b306ff4a::t_69c273d25410c3 56-60
+  s_1c2619b306ff4a::t_d3c92edc3adef0 957-961
+  s_1c2619b306ff4a::t_a418d3237937cc 131-132
+net/crates/net/tests/integration_nrpc_protected.rs
+  s_1c2619b306ff4a::t_0ff3ac37091497 73-82,86
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "348ddacb93e46b572f6c1306e20dab53d0d58cd5",
+  "prompts": {},
+  "sessions": {
+    "s_1c2619b306ff4a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "cfd83cc7-8d52-41cc-a24f-3fd93e60a22f",
+        "model": "claude-opus-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
