@@ -70,10 +70,20 @@ const ORG_ADMISSION_HEADER: &str = "net-org-admission";
 
 fn test_config() -> MeshNodeConfig {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    // Handshake budget matches the repo's highest-headroom idiom
+    // (4 attempts × 4 s, as `connect_direct` and `nat_classify` use),
+    // not the 3 × 2 s baseline. The coverage workflow runs this file
+    // under `-C instrument-coverage`, which slows every basic block
+    // several-fold, and its 41 tests share the runner with the rest of
+    // the suite; the spawned `accept` task then misses a tighter window
+    // and trips the `connect().expect(...)` in `handshake_pair` /
+    // `connect_no_start`. The whole budget is only ever paid by a
+    // handshake that is already failing — a successful one returns on
+    // attempt 1, so the happy path is unchanged.
     let mut cfg = MeshNodeConfig::new(addr, PSK)
         .with_heartbeat_interval(Duration::from_millis(200))
         .with_session_timeout(Duration::from_secs(5))
-        .with_handshake(3, Duration::from_secs(2))
+        .with_handshake(4, Duration::from_secs(4))
         .with_capability_gc_interval(Duration::from_millis(250));
     cfg.socket_buffers = SocketBufferConfig {
         send_buffer_size: TEST_BUFFER_SIZE,
