@@ -53,7 +53,11 @@ fn test_config() -> MeshNodeConfig {
     let mut cfg = MeshNodeConfig::new(addr, PSK)
         .with_heartbeat_interval(Duration::from_millis(200))
         .with_session_timeout(Duration::from_secs(5))
-        .with_handshake(3, Duration::from_secs(2))
+        // 4 × 4 s, the repo's highest-headroom idiom, rather than the
+        // 3 × 2 s baseline — same coverage-runner starvation the
+        // `nat_classify` budget documents. Only ever paid by a
+        // handshake that is already failing.
+        .with_handshake(4, Duration::from_secs(4))
         .with_capability_gc_interval(Duration::from_millis(250))
         // The production default is 10s — too long for an e2e
         // that re-announces caps multiple times within a single
@@ -66,7 +70,64 @@ fn test_config() -> MeshNodeConfig {
         send_buffer_size: TEST_BUFFER_SIZE,
         recv_buffer_size: TEST_BUFFER_SIZE,
     };
+    // The overflow-push tests call `send_overflow_push`, whose first
+    // act is `ensure_reply_subscription` — a membership Subscribe that
+    // must be acked before the RPC can go out. `membership_max_attempts`
+    // retransmits SHARE this budget rather than each getting their own,
+    // so the 5 s default gives each of the 3 attempts only ~1.67 s. Under
+    // `-C instrument-coverage` that is short enough for all three to miss
+    // a starved peer, and the caller then fails with
+    //
+    //     no route to target …: reply-channel subscribe rejected …
+    //     (connection error: membership ack timeout (5s, 3 attempts))
+    //
+    // which is terminal: `warrants_reannounce()` is true only for
+    // `Rejected(Unauthorized)`, so a TIMEOUT skips both the retry loop
+    // and the corrective re-announce that would otherwise self-heal a
+    // missing pin. Widen the budget to 15 s (~5 s per retransmit) so the
+    // control plane survives the same starvation the handshake budget
+    // above already accounts for. Costs nothing when the ack arrives.
+    cfg.membership_ack_timeout = Duration::from_secs(15);
     cfg
+}
+
+/// Block until B has ingested A's signed capability announcement.
+///
+/// `send_overflow_push` needs two independent things from that one
+/// announcement, and polling only the first is what made the overflow
+/// tests race:
+///
+///   * B's capability index must carry A's `dataforts.blob.overflow`
+///     tag — B's admission gate reads `sender_caps` from there;
+///   * B must have PINNED A's `EntityId` — the reply channel is named
+///     after A's announced origin, and B authorizes the subscribe
+///     against the TOFU pin installed from that same signature-verified
+///     announcement. Without the pin the subscribe is rejected
+///     `Unauthorized`.
+///
+/// Asserting rather than breaking out silently: the previous 500 ms
+/// poll fell through on timeout and let the test proceed into a doomed
+/// RPC, so a slow runner surfaced as an opaque `no route to target`
+/// deep inside the blob stack instead of naming the unmet precondition.
+async fn await_announcement_ingested(node_a: &Arc<MeshNode>, node_b: &Arc<MeshNode>) {
+    let a_id = node_a.node_id();
+    let b_id = node_b.node_id();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut tags = false;
+    let mut pins = false;
+    while tokio::time::Instant::now() < deadline {
+        tags = BlobCapability::from_capability_set(&node_b.test_capability_fold_get(a_id))
+            .overflow_enabled;
+        pins = node_b.peer_entity_id(a_id).is_some() && node_a.peer_entity_id(b_id).is_some();
+        if tags && pins {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!(
+        "A's announcement never landed on B within 10s \
+         (overflow tag in B's index: {tags}, entity pins both ways: {pins})"
+    );
 }
 
 async fn build_node() -> Arc<MeshNode> {
@@ -893,20 +954,11 @@ async fn overflow_push_nudge_round_trips_through_mesh_rpc() {
         .await
         .expect("B announce");
 
-    // Wait for gossip to settle so A's caps land in B's
-    // capability index (B's admission needs to see A's
-    // `dataforts.blob.overflow` tag). The
-    // `with_min_announce_interval(10ms)` in `test_config`
-    // makes this fast; 500ms is generous.
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
-    while tokio::time::Instant::now() < deadline {
-        let caps = node_b.test_capability_fold_get(a_id);
-        let blob = BlobCapability::from_capability_set(&caps);
-        if blob.overflow_enabled {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    // Wait for gossip to settle so A's announcement lands on B —
+    // both the `dataforts.blob.overflow` tag B's admission reads
+    // and the entity pin B authorizes the reply-channel subscribe
+    // against.
+    await_announcement_ingested(&node_a, &node_b).await;
 
     // Fire the nudge. A 1 KiB blob — well under B's
     // advertised disk-free.
@@ -969,18 +1021,10 @@ async fn overflow_push_rejected_when_receiver_not_participating() {
         .await
         .expect("B announce");
 
-    // Wait for A's caps to propagate to B (admission reads
-    // sender_caps from B's index).
-    let a_id = node_a.node_id();
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
-    while tokio::time::Instant::now() < deadline {
-        let caps = node_b.test_capability_fold_get(a_id);
-        let blob = BlobCapability::from_capability_set(&caps);
-        if blob.overflow_enabled {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    // Wait for A's announcement to propagate to B (admission reads
+    // sender_caps from B's index; the reply-channel subscribe needs
+    // the entity pin from the same announcement).
+    await_announcement_ingested(&node_a, &node_b).await;
 
     let hash: [u8; 32] = blake3::hash(b"overflow-rejected-test").into();
     let ack = node_a
