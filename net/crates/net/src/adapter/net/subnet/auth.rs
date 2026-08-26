@@ -30,7 +30,7 @@
 //! mirrors the org credential family (`behavior/org.rs`).
 
 use blake2::{
-    digest::{consts::U32, Mac},
+    digest::{consts::U32, KeyInit, Mac},
     Blake2sMac,
 };
 use dashmap::DashMap;
@@ -1095,7 +1095,7 @@ impl SubnetCredentialSet {
         reason = "Blake2sMac::new_from_slice rejects only keys longer than 32 bytes; the domain label is a short compile-time constant"
     )]
     pub fn credential_set_hash(&self) -> [u8; 32] {
-        let mut mac = <Blake2sMac<U32> as Mac>::new_from_slice(SUBNET_CREDSET_HASH_DOMAIN)
+        let mut mac = <Blake2sMac<U32> as KeyInit>::new_from_slice(SUBNET_CREDSET_HASH_DOMAIN)
             .expect("BLAKE2s accepts variable-length keys");
         Mac::update(&mut mac, &self.to_bytes());
         let mut out = [0u8; 32];

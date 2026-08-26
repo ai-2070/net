@@ -1004,19 +1004,19 @@ impl std::fmt::Debug for PacketCipher {
 )]
 fn derive_key(ikm: &[u8], info: &[u8], out: &mut [u8; 32]) {
     use blake2::{
-        digest::{consts::U32, Mac},
+        digest::{consts::U32, KeyInit, Mac},
         Blake2sMac,
     };
 
     // Extract: PRK = BLAKE2s-MAC(key=ikm, data="net-kdf-v1")
-    let mut extractor = <Blake2sMac<U32> as Mac>::new_from_slice(ikm)
+    let mut extractor = <Blake2sMac<U32> as KeyInit>::new_from_slice(ikm)
         .expect("BLAKE2s accepts variable-length keys");
     Mac::update(&mut extractor, b"net-kdf-v1");
     let prk = extractor.finalize().into_bytes();
 
     // Expand: OKM = BLAKE2s-MAC(key=PRK, data=info)
     let mut expander =
-        <Blake2sMac<U32> as Mac>::new_from_slice(&prk).expect("BLAKE2s accepts 32-byte key");
+        <Blake2sMac<U32> as KeyInit>::new_from_slice(&prk).expect("BLAKE2s accepts 32-byte key");
     Mac::update(&mut expander, info);
     let okm = expander.finalize().into_bytes();
 

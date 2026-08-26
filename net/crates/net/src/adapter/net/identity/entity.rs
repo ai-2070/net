@@ -5,7 +5,7 @@
 //! The u64 node IDs used in swarm/routing are derived from the public key.
 
 use blake2::{
-    digest::{consts::U32, Mac},
+    digest::{consts::U32, KeyInit, Mac},
     Blake2sMac,
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
@@ -99,7 +99,7 @@ impl EntityId {
         reason = "Blake2sMac::new_from_slice rejects only keys longer than 32 bytes; domain labels are short compile-time-constant slices"
     )]
     fn blake2s_hash(&self, label: &[u8]) -> [u8; 32] {
-        let mut mac = <Blake2sMac<U32> as Mac>::new_from_slice(label)
+        let mut mac = <Blake2sMac<U32> as KeyInit>::new_from_slice(label)
             .expect("BLAKE2s accepts variable-length keys");
         Mac::update(&mut mac, &self.0);
         let result = mac.finalize().into_bytes();

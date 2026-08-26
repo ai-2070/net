@@ -31,7 +31,7 @@
 //! `ReplicationCoordinator` itself land in Phases C / D / E.
 
 use blake2::{
-    digest::{generic_array::typenum::U32, FixedOutput, KeyInit, Mac},
+    digest::{consts::U32, FixedOutput, KeyInit, Mac},
     Blake2sMac,
 };
 use bytes::{Buf, BufMut};
