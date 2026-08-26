@@ -291,7 +291,13 @@ crossbeam-queue = { version = "0.3", optional = true }
 socket2 = { version = "0.6", features = ["all"], optional = true }
 hex = { version = "0.4", optional = true }
 libc = { version = "0.2", optional = true }
-blake2 = { version = "0.10", optional = true }
+# BLAKE2s-MAC — the KDF/derivation primitive behind EntityId::node_id,
+# the identity envelope, route-hop MACs and the subnet cred-set hash.
+# 0.11 rides digest 0.11: `digest::generic_array` is gone (use
+# `digest::consts`) and `new_from_slice` lives on `KeyInit`, not `Mac`.
+# `snow` 0.10 still pins ^0.10, so two blake2 copies coexist in the
+# lock — a compile-time-only duplicate, both are pure Rust.
+blake2 = { version = "0.11", optional = true }
 # BLAKE3 — content-addressed hash for the Dataforts blob surface
 # (Phase 3). Locked by `DATAFORTS_PLAN.md` as the only blob hash
 # algorithm; a 1-byte version field reserved in the encoded form

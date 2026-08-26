@@ -65,7 +65,7 @@ pub struct ReplicaGroupConfig {
 )]
 pub fn derive_replica_keypair(group_seed: &[u8; 32], index: u8) -> EntityKeypair {
     use blake2::{
-        digest::{consts::U32, Mac},
+        digest::{consts::U32, KeyInit, Mac},
         Blake2sMac,
     };
 
@@ -73,7 +73,7 @@ pub fn derive_replica_keypair(group_seed: &[u8; 32], index: u8) -> EntityKeypair
     input[..32].copy_from_slice(group_seed);
     input[32] = index;
 
-    let mut mac = <Blake2sMac<U32> as Mac>::new_from_slice(b"net-replica-v1")
+    let mut mac = <Blake2sMac<U32> as KeyInit>::new_from_slice(b"net-replica-v1")
         .expect("BLAKE2s accepts variable-length keys");
     Mac::update(&mut mac, &input);
     let secret: [u8; 32] = mac.finalize().into_bytes().into();

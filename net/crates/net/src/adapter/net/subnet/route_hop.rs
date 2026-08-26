@@ -33,7 +33,7 @@
 //! forwarding.
 
 use blake2::{
-    digest::{consts::U32, Mac},
+    digest::{consts::U32, KeyInit, Mac},
     Blake2sMac,
 };
 
@@ -154,7 +154,7 @@ pub fn compute_tag(
     routing_header_bytes: &[u8],
     inner: &[u8],
 ) -> [u8; ROUTE_HOP_TAG_SIZE] {
-    let mut mac = <Blake2sMac<U32> as Mac>::new_from_slice(key)
+    let mut mac = <Blake2sMac<U32> as KeyInit>::new_from_slice(key)
         .expect("BLAKE2s accepts variable-length keys up to 32 bytes");
     Mac::update(&mut mac, ROUTE_HOP_MAC_DOMAIN);
     Mac::update(&mut mac, &hop_session_id.to_le_bytes());

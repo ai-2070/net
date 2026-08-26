@@ -65,6 +65,8 @@ use blake2::{
 };
 use bytes::{Buf, BufMut};
 use chacha20poly1305::{
+    // `KeyInit` is `crypto_common::KeyInit`, re-exported by both the AEAD and
+    // the `blake2::digest` stacks; the single import keys `Blake2sMac` too.
     aead::{Aead, KeyInit, Payload},
     XChaCha20Poly1305,
 };
@@ -520,7 +522,7 @@ fn attestation_transcript(
     reason = "Blake2sMac::new_from_slice rejects only keys longer than 32 bytes; label slices are always short labels"
 )]
 fn derive_key(shared: &[u8; 32], label: &[u8]) -> [u8; 32] {
-    let mut mac = <Blake2sMac<U32> as Mac>::new_from_slice(label)
+    let mut mac = <Blake2sMac<U32> as KeyInit>::new_from_slice(label)
         .expect("BLAKE2s accepts variable-length keys");
     Mac::update(&mut mac, shared);
     let result = mac.finalize().into_bytes();
@@ -555,7 +557,7 @@ fn volatile_zero(buf: &mut [u8]) {
     reason = "Blake2sMac::new_from_slice rejects only keys longer than 32 bytes; KDF_DOMAIN_NONCE is a short compile-time-constant label"
 )]
 fn derive_nonce(eph_pk: &[u8; 32], target_pk: &[u8; 32]) -> [u8; 24] {
-    let mut mac = <Blake2sMac<U32> as Mac>::new_from_slice(KDF_DOMAIN_NONCE)
+    let mut mac = <Blake2sMac<U32> as KeyInit>::new_from_slice(KDF_DOMAIN_NONCE)
         .expect("BLAKE2s accepts variable-length keys");
     Mac::update(&mut mac, eph_pk);
     Mac::update(&mut mac, target_pk);
