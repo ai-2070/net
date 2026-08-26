@@ -62,7 +62,7 @@ bytes = "1"
 # `chacha20poly1305` 0.11 and `getrandom` 0.4 pull a newer major than core's
 # (0.10 / 0.2–0.3), which Cargo coexists — a deliberate trade of a second
 # locked copy for staying current, not an oversight.
-blake2 = "0.10"
+blake2 = "0.11"
 chacha20poly1305 = "0.11"
 getrandom = "0.4"
 x25519-dalek = { version = "3", features = ["static_secrets", "zeroize"] }
