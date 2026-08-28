@@ -93,3 +93,6 @@ net/crates/net/docs/BRAINSTORMING.md
 # ["src"]`), so it was purely a misleading second copy that a future
 # packaging change could have promoted to the real one.
 net/crates/net/sdk-py/build/
+
+# Notes
+notes/*.md
