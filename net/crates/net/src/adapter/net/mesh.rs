@@ -7432,6 +7432,12 @@ type PublishPhaseHook = Arc<dyn Fn(u64) + Send + Sync>;
 type GrantMovementHook =
     Arc<dyn Fn(&super::behavior::org_routing_registry::GrantScopeMovement) + Send + Sync>;
 
+/// Test-only observer of one grant query inside the cold capture's store section
+/// (OLB-2B.3d-pre, independent review F1). Receives that query's row count, so a
+/// witness cannot mistake an empty grant list for an executed query.
+#[cfg(test)]
+type ColdGrantQueryHook = Arc<dyn Fn(usize) + Send + Sync>;
+
 impl RoutingAuthority {
     fn new() -> Self {
         Self {
@@ -8551,7 +8557,7 @@ pub struct MeshNode {
     /// Not `take()`n: the loop may run several times per capture and the witness
     /// needs every iteration.
     #[cfg(test)]
-    cold_capture_in_grant_query_hook: parking_lot::Mutex<Option<Arc<dyn Fn(usize) + Send + Sync>>>,
+    cold_capture_in_grant_query_hook: parking_lot::Mutex<Option<ColdGrantQueryHook>>,
     /// Test-only: the identity of the cold capture's CURRENT store section, or 0
     /// when no capture holds one.
     ///

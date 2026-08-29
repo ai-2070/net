@@ -8345,6 +8345,22 @@ async fn a_peer_replaced_after_revalidation_cannot_publish_its_old_session() {
 // where real envelopes can be ingested; these four assert the properties only
 // the node's private state can show.
 
+/// What a cold-capture observation point records: the production section
+/// identity, how many sections have been opened, and whether a rival `try_lock`
+/// FAILED there (i.e. the store lock was held).
+type SectionObservation = (u64, u64, bool);
+
+/// One observation taken INSIDE the grant loop: [`SectionObservation`] plus that
+/// query's row count, which is what stops an empty grant list from passing as an
+/// executed query.
+type GrantQueryObservation = (u64, u64, bool, usize);
+
+/// The single pre-loop observation, filled by the plane-gap hook.
+type SectionObservationSlot = Arc<parking_lot::Mutex<Option<SectionObservation>>>;
+
+/// Every in-query observation, in loop order.
+type GrantQueryObservationLog = Arc<parking_lot::Mutex<Vec<GrantQueryObservation>>>;
+
 /// (C1) ONE ACQUISITION spans the owner plane and a real, non-empty grant query.
 ///
 /// **Independent review F1: two earlier versions of this witness were weaker than
@@ -8381,11 +8397,8 @@ async fn one_cold_capture_acquisition_spans_the_owner_and_grant_queries() {
     let (grant_id, _handle) = fx.install(grant, secret);
     fx.ingest_granted(&envelope_secret, tag);
 
-    // (identity, acquisitions, rival try_lock failed) at each observation point.
-    let pre_loop: Arc<parking_lot::Mutex<Option<(u64, u64, bool)>>> =
-        Arc::new(parking_lot::Mutex::new(None));
-    let in_query: Arc<parking_lot::Mutex<Vec<(u64, u64, bool, usize)>>> =
-        Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let pre_loop: SectionObservationSlot = Arc::new(parking_lot::Mutex::new(None));
+    let in_query: GrantQueryObservationLog = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let (_, acquisitions_before) = fx.node.cold_section_observation();
     {
         let node = fx.node.clone();
