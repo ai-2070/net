@@ -54,6 +54,7 @@ pub mod org_admission;
 pub mod org_admission_replay;
 pub mod org_authority;
 pub mod org_call;
+pub mod org_cold_plan;
 pub mod org_grant;
 pub mod org_grant_registry;
 pub mod org_revocation;

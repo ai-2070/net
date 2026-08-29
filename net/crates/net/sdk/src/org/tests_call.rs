@@ -6,6 +6,8 @@
 //! intent construction — everything `call` does before the network. The live
 //! two-node traversal of `verify_org_admission` is S3.
 
+use std::sync::Arc;
+
 use net::adapter::net::behavior::capability::{CapabilityAnnouncement, CapabilitySet};
 use net::adapter::net::behavior::org_scoped_ann::ScopedCapabilityAnnouncement;
 use net::adapter::net::identity::EntityKeypair;
@@ -737,4 +739,243 @@ async fn candidate_order_is_global_across_the_owner_and_grant_planes() {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+// ---------------------------------------------------------------------------
+// OLB-2B.3d-pre — the coherent cold plan
+//
+// The capture's structural properties (one store section, the epoch re-check,
+// the two fail-closed refusals) are witnessed on the node in
+// `org_routing_wiring_tests`. These four are the ones that need REAL rows and a
+// REAL bound client: that the capture serves exactly what the live plane seams
+// serve, that each component of the captured authority identity is actually
+// compared, and that a moved authority mints nothing.
+// ---------------------------------------------------------------------------
+
+/// The capture is a COHERENCE change, not a discovery change: for the same
+/// capability and the same held grant it serves exactly the rows the live
+/// per-plane seams serve.
+///
+/// This is the drift guard for having two entry shapes over one store. A capture
+/// that skipped the revocation floors, or applied a weaker grant-row predicate,
+/// would be MORE permissive than the seam it replaced — and every candidate
+/// count in the suite would still look right.
+#[tokio::test]
+async fn the_cold_capture_serves_exactly_what_the_live_plane_seams_serve() {
+    let a = org_a();
+    let b = org_b();
+    let (mesh, identity, dir) = mesh_with_authority("cold-capture-planes", Some(&a)).await;
+    let own = EntityKeypair::generate();
+    let foreign = EntityKeypair::generate();
+    let tag = "nrpc:customer.read";
+    let capability = cap(tag);
+
+    inject_owner_envelope(&mesh, &a, &own, &[tag]);
+    let (grant, secret) = discover_grant(&b, a.org_id(), capability, 3600);
+    let grant_id = grant.grant_id;
+    let secret_copy = copy_secret(&secret);
+    // Bind FIRST: a granted envelope is only admissible while the consumer
+    // audience is installed, which is what the bind's lease does.
+    let client = bind(&mesh, &a, &identity, vec![(grant.clone(), Some(secret))]);
+    inject_granted_envelope(&mesh, &b, &foreign, &grant, &secret_copy, tag);
+
+    let capture = client.capture_private(&capability).expect("capture");
+    let owner_live: Vec<_> = mesh
+        .node()
+        .owner_private_capability_providers(&capability)
+        .into_iter()
+        .map(|p| p.provider)
+        .collect();
+    let granted_live: Vec<_> = mesh
+        .node()
+        .granted_capability_providers(&grant_id)
+        .into_iter()
+        .map(|p| p.provider)
+        .collect();
+    assert_eq!(owner_live.len(), 1, "precondition: one owner-plane row");
+    assert_eq!(granted_live.len(), 1, "precondition: one grant-plane row");
+    assert_eq!(
+        capture
+            .owner_providers()
+            .iter()
+            .map(|p| p.provider.clone())
+            .collect::<Vec<_>>(),
+        owner_live,
+        "the capture's owner plane must be exactly the live seam's"
+    );
+    assert_eq!(
+        capture
+            .granted_providers(&grant_id)
+            .iter()
+            .map(|p| p.provider.clone())
+            .collect::<Vec<_>>(),
+        granted_live,
+        "the capture's grant plane must be exactly the live seam's — same store \
+         query, same floors, same installed-grant predicate"
+    );
+    assert!(
+        capture.granted_providers(&[0x77u8; 32]).is_empty(),
+        "a grant the capture was not asked about contributes nothing"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A raised revocation floor moves the captured authority identity, so the plan
+/// refuses to mint under it.
+///
+/// The floor generation moves INSIDE the revocation store and advances no
+/// routing epoch by itself, so a comparison that only checked the epoch would
+/// confirm a stamp taken before the org revoked. Carries the adjacent control:
+/// before the raise the same stamp compares CURRENT, so the assertion below is
+/// about the floor and not about a stamp that never matches.
+#[tokio::test]
+async fn a_captured_stamp_notices_a_raised_revocation_floor() {
+    let a = org_a();
+    let (mesh, identity, dir) = mesh_with_authority("cold-floor", Some(&a)).await;
+    let provider = EntityKeypair::generate();
+    let tag = "nrpc:internal.reindex";
+    inject_owner_envelope(&mesh, &a, &provider, &[tag]);
+    let client = bind(&mesh, &a, &identity, vec![]);
+    let capability = cap(tag);
+
+    let capture = client.capture_private(&capability).expect("capture");
+    assert!(
+        mesh.node().org_cold_authority_is_current(capture.stamp()),
+        "control: an untouched authority view compares CURRENT"
+    );
+
+    let mut floors = std::collections::BTreeMap::new();
+    floors.insert(provider.entity_id().clone(), 2u32);
+    let bundle = OrgRevocationBundle::try_issue(&a, &floors).expect("floors");
+    mesh.node()
+        .node_authority()
+        .expect("authority")
+        .revocation
+        .apply_bundle(&bundle)
+        .expect("the org raises a floor");
+
+    assert!(
+        !mesh.node().org_cold_authority_is_current(capture.stamp()),
+        "a raised floor must supersede the captured authority identity"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A same-id consumer-grant replacement moves the captured authority identity.
+///
+/// Comparing `grant_id` alone would pass a remove-then-reinstall and a different
+/// signed grant reusing the id, which is exactly how a withdrawn discovery
+/// authority keeps serving. With the adjacent control: the untouched
+/// installation compares CURRENT.
+#[tokio::test]
+async fn a_captured_stamp_notices_a_consumer_grant_replacement() {
+    let a = org_a();
+    let b = org_b();
+    let (mesh, identity, dir) = mesh_with_authority("cold-grant-move", Some(&a)).await;
+    let foreign = EntityKeypair::generate();
+    let tag = "nrpc:customer.read";
+    let capability = cap(tag);
+    let (grant, secret) = discover_grant(&b, a.org_id(), capability, 3600);
+    let grant_id = grant.grant_id;
+    let secret_copy = copy_secret(&secret);
+    let reinstall_secret = copy_secret(&secret);
+    let client = bind(&mesh, &a, &identity, vec![(grant.clone(), Some(secret))]);
+    inject_granted_envelope(&mesh, &b, &foreign, &grant, &secret_copy, tag);
+
+    let capture = client.capture_private(&capability).expect("capture");
+    assert_eq!(
+        capture.granted_providers(&grant_id).len(),
+        1,
+        "precondition: the grant plane carries the provider"
+    );
+    assert!(
+        mesh.node().org_cold_authority_is_current(capture.stamp()),
+        "control: the untouched installation compares CURRENT"
+    );
+
+    // Remove and reinstall the SAME signed grant: a new installation of the same
+    // authority, which is the weakest movement the comparison must still see.
+    assert!(
+        mesh.node().remove_consumer_grant_audience(&grant_id),
+        "precondition: the grant was installed"
+    );
+    mesh.node()
+        .install_consumer_grant_audience(grant, reinstall_secret)
+        .expect("reinstall the same grant");
+
+    assert!(
+        !mesh.node().org_cold_authority_is_current(capture.stamp()),
+        "a reinstallation is a DIFFERENT installation, so the captured identity \
+         is superseded"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A derivation whose authority moved before the mint produces NO proof intent.
+///
+/// The security property of the final coherent comparison, driven through the
+/// exact code `plan` runs: capture, move the node's authority, derive. The
+/// control derives over an unmoved capture and mints the canonical intent, so
+/// "never mints" cannot satisfy this witness.
+#[tokio::test]
+async fn a_plan_attempt_under_a_moved_authority_mints_nothing() {
+    use super::call::PlanAttempt;
+    let a = org_a();
+    let (mesh, identity, dir) = mesh_with_authority("cold-superseded", Some(&a)).await;
+    let provider = EntityKeypair::generate();
+    let tag = "nrpc:internal.reindex";
+    inject_owner_envelope(&mesh, &a, &provider, &[tag]);
+    // Protected RPC is direct-session-only, so the control has to be reachable
+    // or selection refuses before the comparison this witness is about.
+    mesh.node()
+        .test_pin_peer_entity(provider.entity_id().node_id(), provider.entity_id().clone());
+    let client = bind(&mesh, &a, &identity, vec![]);
+    let capability = cap(tag);
+
+    let control = client.capture_private(&capability).expect("capture");
+    match client
+        .plan_attempt(&capability, &control)
+        .expect("the control derivation succeeds")
+    {
+        PlanAttempt::Minted(intent) => assert_eq!(
+            intent.capability, capability,
+            "control: an unmoved capture mints exactly one intent for the \
+             capability asked about"
+        ),
+        PlanAttempt::Superseded { .. } => {
+            panic!("control: an unmoved capture must not report itself superseded")
+        }
+    }
+
+    let capture = client.capture_private(&capability).expect("capture");
+    // A same-org renewal is accepted and advances the routing epoch, so the
+    // captured identity is genuinely superseded — no test seam involved.
+    let entity = identity.entity_id().clone();
+    let cert = OrgMembershipCert::try_issue(&a, entity.clone(), 1, 3600).expect("cert");
+    let next_dir = dir.join("successor");
+    let _ = std::fs::remove_dir_all(&next_dir);
+    let successor =
+        NodeAuthority::adopt(&next_dir, cert, &entity, 0, None).expect("adopt successor");
+    mesh.node()
+        .install_node_authority(Arc::new(successor))
+        .expect("same-org renewal is accepted");
+    assert!(
+        !mesh.node().org_cold_authority_is_current(capture.stamp()),
+        "precondition: the renewal superseded the captured identity"
+    );
+
+    match client
+        .plan_attempt(&capability, &capture)
+        .expect("a superseded derivation is not an error")
+    {
+        PlanAttempt::Superseded { considered } => assert_eq!(
+            considered, 1,
+            "the superseded arm still reports the candidates it examined, so the \
+             eventual refusal carries a real number"
+        ),
+        PlanAttempt::Minted(_) => {
+            panic!("a proof intent was minted under an authority identity that had moved")
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

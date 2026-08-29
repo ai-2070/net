@@ -8522,6 +8522,22 @@ pub struct MeshNode {
     /// not be able to occupy undetected (review-pass-3 §6).
     #[cfg(test)]
     routing_sample_gap_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Test-only: fires inside the cold plan's capture, between the owner plane
+    /// and the grant planes, with the scoped-store lock HELD — the window a
+    /// store mutation must not be able to occupy (OLB-2B.3d-pre).
+    #[cfg(test)]
+    cold_capture_plane_gap_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Test-only: fires inside the cold plan's capture between the authority/view
+    /// reads and the scoped-store section, holding NO lock — the window an
+    /// authority installation must not be able to occupy undetected
+    /// (OLB-2B.3d-pre).
+    ///
+    /// A separate hook from the one above because the two windows have opposite
+    /// lock states, and an install cannot complete under the store lock: the
+    /// install path itself commits floor reconciliation through the scoped store,
+    /// so it waits for the capture's section rather than racing inside it.
+    #[cfg(test)]
+    cold_capture_authority_gap_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Actor observation points, threaded into the supervisor. See `ActorHooks`
     /// for why this is `any(test, fixtures)` rather than fixtures alone.
     #[cfg(any(test, feature = "fixtures"))]
@@ -10380,6 +10396,10 @@ impl MeshNode {
             routing_spawn_pause_hook: parking_lot::Mutex::new(None),
             #[cfg(test)]
             routing_sample_gap_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            cold_capture_plane_gap_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            cold_capture_authority_gap_hook: parking_lot::Mutex::new(None),
             #[cfg(any(test, feature = "fixtures"))]
             routing_hooks: Arc::default(),
             scoped_relay_gate: Arc::new(
@@ -15267,8 +15287,8 @@ impl MeshNode {
         grant_id: &[u8; 32],
         now_secs: u64,
     ) -> Vec<super::behavior::org_scoped_ingest::VerifiedScopedCapability> {
+        use super::behavior::org_cold_plan::OrgColdGrantAuthority;
         use super::behavior::org_revocation::OrgRevocationState;
-        use super::behavior::org_scoped_ingest::CapabilityAudienceScope;
         // Query-time consumer currentness: no installed consumer grant for this id
         // ⇒ nothing is discoverable under it, even if a record is still stored.
         let consumer = self.consumer_grant_audiences.load();
@@ -15276,23 +15296,18 @@ impl MeshNode {
             return Vec::new();
         };
         // Pin the EXACT installed grant authority — signature binds the whole
-        // canonical grant; the handle is defense in depth.
-        let current_signature = record.grant().signature;
-        let current_handle = *record.audience_handle();
+        // canonical grant; the handle is defense in depth. The pin and its row
+        // predicate are ONE shared implementation with the cold plan's capture
+        // (OLB-2B.3d-pre): two copies of a currentness predicate is how one path
+        // silently becomes weaker than the other it mirrors.
+        let pinned = OrgColdGrantAuthority::of(record);
         let store = self.org_revocation.load_full();
         let empty_floors = OrgRevocationState::empty();
         let floors_snapshot = store.as_ref().map(|s| s.snapshot());
         let floors: &OrgRevocationState = floors_snapshot.as_deref().unwrap_or(&empty_floors);
         self.scoped_discovery
             .lock()
-            .find_capabilities_for_grant(grant_id, now_secs, floors, |c| {
-                c.grant_signature() == Some(&current_signature)
-                    && matches!(
-                        c.scope(),
-                        CapabilityAudienceScope::Grant { audience_handle, .. }
-                            if audience_handle == &current_handle
-                    )
-            })
+            .find_capabilities_for_grant(grant_id, now_secs, floors, |c| pinned.admits(c))
             .into_iter()
             .cloned()
             .collect()
@@ -15308,6 +15323,261 @@ impl MeshNode {
             .iter()
             .map(|c| c.provider().clone())
             .collect()
+    }
+
+    /// OLB-2B.3d-pre: ONE coherent observation of this node's private-discovery
+    /// authority and the rows that authority makes visible — the cold plan's
+    /// captured inputs
+    /// (`docs/internal/plans/OLB_2B3B_WARMED_CALL_BOUNDARY_DESIGN.md` §10).
+    ///
+    /// `capability` selects the owner plane's rows; `discover_grant_ids` names
+    /// the consumer grants whose scopes to query, IN THE CALLER'S ORDER, so the
+    /// facade walks its own held grants in its own order rather than one this
+    /// seam invents.
+    ///
+    /// This is the same data the per-plane seams
+    /// ([`Self::owner_private_capability_providers`],
+    /// [`Self::granted_capability_providers`]) return, through the SAME store
+    /// queries and the SAME row predicates — the difference is entirely
+    /// coherence. Those seams sample the wall clock, the revocation view, the
+    /// consumer-grant registry and the store lock once EACH, so a plan built
+    /// from one owner call plus N granted calls mixed 3 + N clocks, 1 + N floor
+    /// snapshots, N registry loads and 1 + N critical sections. A floor raise or
+    /// a grant removal landing between two of those left the plan holding
+    /// pre-transition authority on one plane and post-transition authority on
+    /// another. Here every plane is filtered against one snapshot, at one
+    /// instant, under one lock acquisition.
+    ///
+    /// The epoch RE-CHECK is `Self::sample_routing_authority`'s seqlock, applied
+    /// to a wider read: the write side advances the routing epoch BEFORE
+    /// publishing a store or an authority (OLB-2C put both halves inside one
+    /// epoch advance), so reading the view first and re-checking the epoch after
+    /// is the conservative direction, and any interleaving that could mix two
+    /// stores also moves the epoch. Bounded, not looped — see
+    /// [`OrgColdRefusal::IncoherentAuthority`].
+    ///
+    /// The consumer-grant registry is NOT covered by that epoch, and this seam
+    /// does not pretend otherwise: its coherence is structural (one load feeds
+    /// every grant plane), and movement AFTER the capture is what the stamp
+    /// exists to catch at [`Self::org_cold_authority_is_current`].
+    ///
+    /// Discovery is NOT authority: a returned provider still admits the caller
+    /// only on a valid per-call organization proof.
+    ///
+    /// [`OrgColdRefusal::IncoherentAuthority`]: super::behavior::org_cold_plan::OrgColdRefusal::IncoherentAuthority
+    pub fn org_cold_discovery(
+        &self,
+        capability: &super::behavior::org_grant::CapabilityAuthorityId,
+        discover_grant_ids: &[[u8; 32]],
+    ) -> Result<
+        super::behavior::org_cold_plan::OrgColdDiscovery,
+        super::behavior::org_cold_plan::OrgColdRefusal,
+    > {
+        self.capture_cold(Some(capability), discover_grant_ids).map(
+            |(authority, owner, granted)| {
+                super::behavior::org_cold_plan::OrgColdDiscovery::new(authority, owner, granted)
+            },
+        )
+    }
+
+    /// OLB-2B.3d-pre: the AUTHORITY half of a capture — one instant and one
+    /// authority identity, with no private-plane query.
+    ///
+    /// The exported (public-plane) call path needs exactly this: its candidates
+    /// come from the plaintext fold, so querying the private planes to obtain a
+    /// coherent clock would be work it has no use for. Everything else about it
+    /// is identical, including the refusals and the stamp the final comparison
+    /// re-checks.
+    pub fn org_cold_authority(
+        &self,
+    ) -> Result<
+        super::behavior::org_cold_plan::OrgColdAuthority,
+        super::behavior::org_cold_plan::OrgColdRefusal,
+    > {
+        self.capture_cold(None, &[])
+            .map(|(authority, _, _)| authority)
+    }
+
+    /// The one capture implementation. With no capability and no grant ids it
+    /// does not take the scoped-store lock at all — the authority-only shape.
+    #[allow(clippy::type_complexity)]
+    fn capture_cold(
+        &self,
+        capability: Option<&super::behavior::org_grant::CapabilityAuthorityId>,
+        discover_grant_ids: &[[u8; 32]],
+    ) -> Result<
+        (
+            super::behavior::org_cold_plan::OrgColdAuthority,
+            Vec<super::behavior::org_scoped_store::PrivateCapabilityProvider>,
+            Vec<(
+                [u8; 32],
+                Arc<[super::behavior::org_scoped_store::PrivateCapabilityProvider]>,
+            )>,
+        ),
+        super::behavior::org_cold_plan::OrgColdRefusal,
+    > {
+        use super::behavior::org_cold_plan::{
+            OrgColdAuthority, OrgColdAuthorityStamp, OrgColdGrantAuthority, OrgColdRefusal,
+        };
+        use super::behavior::org_revocation::OrgRevocationState;
+        use super::behavior::org_scoped_store::PrivateCapabilityProvider;
+        // Matches `sample_routing_authority`: authority movement is node-mediated
+        // and rare, so a handful of attempts either observes one identity or the
+        // node is churning and a cold plan is the honest answer.
+        const ATTEMPTS: usize = 4;
+        for _ in 0..ATTEMPTS {
+            let Some(authority) = self.node_authority() else {
+                return Err(OrgColdRefusal::NoNodeAuthority);
+            };
+            // A spent epoch space can no longer distinguish authority views, so
+            // it can no longer witness currentness — fail closed rather than
+            // capture under an identity that cannot be compared.
+            if self.routing_authority.is_exhausted() {
+                return Err(OrgColdRefusal::IncoherentAuthority);
+            }
+            let before = self.routing_authority.epoch();
+            let now_secs = super::behavior::org::current_timestamp();
+            let (poisoned, floor_generation, store) =
+                ScopedSlotSource::revocation_view_of(&self.org_revocation);
+            let empty_floors = OrgRevocationState::empty();
+            let floors_snapshot = store.as_ref().map(|s| s.snapshot());
+            let floors: &OrgRevocationState = floors_snapshot.as_deref().unwrap_or(&empty_floors);
+            // ONE registry view for every grant plane.
+            let installed = self.consumer_grant_audiences.load();
+            let mut grant_authority: Vec<([u8; 32], Option<OrgColdGrantAuthority>)> =
+                Vec::with_capacity(discover_grant_ids.len());
+            for grant_id in discover_grant_ids {
+                grant_authority.push((
+                    *grant_id,
+                    installed
+                        .get(grant_id)
+                        .map(|record| OrgColdGrantAuthority::of(record)),
+                ));
+            }
+            // Test-only: the window an authority installation must not be able
+            // to occupy undetected. Fired holding NO lock, because the install
+            // path commits floor reconciliation through the scoped store and so
+            // cannot complete under the section below.
+            #[cfg(test)]
+            {
+                let hook = self.cold_capture_authority_gap_hook.lock().take();
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }
+            // ONE critical section over the store: owner scope and every grant
+            // scope, so no store mutation can land BETWEEN two planes of one
+            // plan. Nothing inside awaits or takes another node lock.
+            //
+            // An authority or store installation takes this same lock for its
+            // floor reconciliation, so it WAITS for one capture rather than
+            // interleaving with it. Bounded: the section performs two indexed
+            // lookups per plane, no I/O, and takes no other lock, so there is no
+            // ordering cycle — the capture holds this lock and nothing else.
+            let mut owner: Vec<PrivateCapabilityProvider> = Vec::new();
+            let mut granted: Vec<([u8; 32], Arc<[PrivateCapabilityProvider]>)> =
+                Vec::with_capacity(grant_authority.len());
+            if capability.is_some() || !grant_authority.is_empty() {
+                let store_guard = self.scoped_discovery.lock();
+                if let Some(capability) = capability {
+                    owner = store_guard
+                        .find_owner_private_providers(Some(capability), now_secs, floors)
+                        .into_iter()
+                        .map(|(candidate, _)| candidate)
+                        .collect();
+                }
+                // Test-only: the exact window a store mutation must not be able
+                // to occupy — fired BETWEEN the owner plane and the grant planes,
+                // with the lock held.
+                #[cfg(test)]
+                {
+                    let hook = self.cold_capture_plane_gap_hook.lock().take();
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                }
+                for (grant_id, pinned) in &grant_authority {
+                    let rows: Arc<[PrivateCapabilityProvider]> = match pinned {
+                        // Not installed ⇒ nothing is discoverable under it, even
+                        // if records are still stored. Exactly the live seam's
+                        // rule.
+                        None => Arc::from(Vec::new()),
+                        Some(pinned) => store_guard
+                            .find_capabilities_for_grant(grant_id, now_secs, floors, |c| {
+                                pinned.admits(c)
+                            })
+                            .iter()
+                            .map(|c| PrivateCapabilityProvider::from_verified(c))
+                            .collect(),
+                    };
+                    granted.push((*grant_id, rows));
+                }
+            }
+            if self.routing_authority.epoch() != before {
+                continue;
+            }
+            return Ok((
+                OrgColdAuthority::new(
+                    now_secs,
+                    OrgColdAuthorityStamp::new(
+                        authority.owner_org(),
+                        before,
+                        poisoned,
+                        floor_generation,
+                        grant_authority,
+                    ),
+                ),
+                owner,
+                granted,
+            ));
+        }
+        Err(OrgColdRefusal::IncoherentAuthority)
+    }
+
+    /// OLB-2B.3d-pre: whether the authority a cold plan was derived under is
+    /// STILL the installed one — the plan's final coherent comparison, run
+    /// before the proof intent exists.
+    ///
+    /// Compared as a whole, and compared rather than re-read as a predicate: the
+    /// question is not "is authority usable now" but "is it the SAME authority
+    /// the rows, the grant matching and the selection were derived under". A
+    /// mismatch means the derivation is superseded, so the plan discards it and
+    /// re-derives from a fresh capture; nothing has been sent, so this is not a
+    /// retry of anything.
+    ///
+    /// Movement after this returns `true` is the ordinary linearization race and
+    /// is accepted (design §11): the provider's admission is the final authority
+    /// on every call, and no local comparison can close a window that ends at a
+    /// remote evaluation.
+    pub fn org_cold_authority_is_current(
+        &self,
+        stamp: &super::behavior::org_cold_plan::OrgColdAuthorityStamp,
+    ) -> bool {
+        use super::behavior::org_cold_plan::OrgColdGrantAuthority;
+        let Some(authority) = self.node_authority() else {
+            return false;
+        };
+        if authority.owner_org() != stamp.authority_org() || self.routing_authority.is_exhausted() {
+            return false;
+        }
+        let Some((epoch, poisoned, floor_generation)) = self.sample_routing_authority() else {
+            // The sample could not be taken coherently, so we cannot assert the
+            // stamp still holds. Fail closed — the caller re-derives.
+            return false;
+        };
+        if epoch != stamp.epoch()
+            || poisoned != stamp.poisoned()
+            || floor_generation != stamp.floor_generation()
+        {
+            return false;
+        }
+        let installed = self.consumer_grant_audiences.load();
+        stamp.grants().iter().all(|(grant_id, pinned)| {
+            let live = installed
+                .get(grant_id)
+                .map(|r| OrgColdGrantAuthority::of(r));
+            live.as_ref() == pinned.as_ref()
+        })
     }
 
     /// The private-discovery QUERY-VISIBLE change generation over EITHER partition,

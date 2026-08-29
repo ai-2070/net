@@ -8299,3 +8299,200 @@ async fn a_peer_replaced_after_revalidation_cannot_publish_its_old_session() {
         "the live projection names the LIVE incarnation"
     );
 }
+
+// ---- OLB-2B.3d-pre: the coherent cold-plan capture -------------------------
+//
+// The capture is the cold plan's first step, and its whole value is coherence:
+// one instant, one revocation view, one consumer-grant view, one store critical
+// section, one authority identity. Every witness below drives the PRODUCTION
+// seam (`MeshNode::org_cold_discovery` / `org_cold_authority`) on a real node —
+// the per-row content is witnessed against the live plane seams in the SDK,
+// where real envelopes can be ingested; these four assert the properties only
+// the node's private state can show.
+
+/// (C1) ONE store critical section spans every plane of a capture.
+///
+/// The contention form, not a counter: the hook fires with the scoped-store lock
+/// HELD, between the owner plane and the grant planes, and proves a rival
+/// `try_lock` FAILS there. Per-plane lock acquisitions — the shape this replaces,
+/// where a store mutation can land between two planes of one plan — would let
+/// that `try_lock` succeed.
+///
+/// Carries its own negative control: the same `try_lock` succeeds once the
+/// capture has returned, so the positive half cannot be satisfied by a lock that
+/// is simply never available.
+#[tokio::test]
+async fn a_cold_capture_holds_one_store_section_across_every_plane() {
+    let node = node().await;
+    let org = crate::adapter::net::behavior::org::OrgKeypair::from_bytes([0xc1u8; 32]);
+    node.install_node_authority(adopt_authority(&node, &org, "cold-section"))
+        .expect("install authority");
+
+    let observed = Arc::new(AtomicBool::new(false));
+    let contended = Arc::new(AtomicBool::new(false));
+    {
+        let scoped = node.scoped_discovery.clone();
+        let observed = observed.clone();
+        let contended = contended.clone();
+        *node.cold_capture_plane_gap_hook.lock() = Some(Arc::new(move || {
+            observed.store(true, Ordering::Release);
+            contended.store(scoped.try_lock().is_none(), Ordering::Release);
+        }));
+    }
+
+    let capture = node
+        .org_cold_discovery(&CapabilityAuthorityId::for_tag("nrpc:cold.section"), &[])
+        .expect("an adopted node captures");
+    assert!(
+        observed.load(Ordering::Acquire),
+        "the between-planes window was never entered, so this witness asserted \
+         nothing"
+    );
+    assert!(
+        contended.load(Ordering::Acquire),
+        "a store mutation could occupy the gap between two planes of ONE capture"
+    );
+    assert!(
+        node.scoped_discovery.try_lock().is_some(),
+        "control: the store lock is free once the capture returns, so the \
+         positive half above is about the capture and not about an unavailable \
+         lock"
+    );
+    assert!(
+        capture.owner_providers().is_empty(),
+        "no envelope was ingested, so the owner plane is empty — the capture's \
+         CONTENT is witnessed in the SDK against the live seams"
+    );
+}
+
+/// (C2) An authority installation that lands INSIDE a capture is never captured
+/// across.
+///
+/// The seqlock the read seam already uses, applied to a wider read: the capture
+/// re-checks the routing epoch after reading the view, so an install occupying
+/// the window is detected and that attempt is discarded. Dropping the re-check
+/// would return a stamp naming the PRE-install epoch — an identity the final
+/// comparison would then confirm against a view the successor has replaced.
+///
+/// The install runs on another thread and is JOINED inside the window, so the
+/// interleaving is deterministic rather than raced. It fires in the lock-free
+/// window on purpose: the install commits floor reconciliation through the
+/// scoped store, so it cannot complete inside the capture's store section at
+/// all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_authority_install_inside_a_cold_capture_is_never_captured_across() {
+    let node = node().await;
+    let org = crate::adapter::net::behavior::org::OrgKeypair::from_bytes([0xc2u8; 32]);
+    node.install_node_authority(adopt_authority(&node, &org, "cold-straddle-a"))
+        .expect("install authority");
+    let before = node.routing_authority.epoch();
+
+    // Fires ONCE (the hook is taken), so the retry runs cleanly.
+    let successor = adopt_authority(&node, &org, "cold-straddle-b");
+    let installed = Arc::new(AtomicBool::new(false));
+    {
+        let node2 = node.clone();
+        let installed = installed.clone();
+        *node.cold_capture_authority_gap_hook.lock() = Some(Arc::new(move || {
+            let node3 = node2.clone();
+            let successor = successor.clone();
+            let handle = std::thread::spawn(move || {
+                node3
+                    .install_node_authority(successor)
+                    .expect("same-org renewal is accepted");
+            });
+            handle.join().expect("installer thread");
+            installed.store(true, Ordering::Release);
+        }));
+    }
+
+    let capture = node
+        .org_cold_discovery(&CapabilityAuthorityId::for_tag("nrpc:cold.straddle"), &[])
+        .expect("the retry captures coherently");
+    assert!(
+        installed.load(Ordering::Acquire),
+        "the window was never entered, so this witness asserted nothing"
+    );
+    let after = node.routing_authority.epoch();
+    assert_ne!(
+        after, before,
+        "precondition: the install inside the window moved the routing epoch"
+    );
+    assert_eq!(
+        capture.stamp().epoch(),
+        after,
+        "the capture must carry the epoch it actually completed under, never the \
+         one it started under"
+    );
+    assert!(
+        node.org_cold_authority_is_current(capture.stamp()),
+        "and the returned stamp compares CURRENT immediately afterwards"
+    );
+}
+
+/// (C3) A node with no installed authority refuses the capture, with the
+/// adjacent control that adopting one admits it.
+///
+/// Fail-closed: without authority there is no private-discovery authority to
+/// plan under, and reporting an empty provider set would misattribute a local
+/// configuration failure to the network.
+#[tokio::test]
+async fn an_unadopted_node_refuses_the_cold_capture() {
+    use crate::adapter::net::behavior::org_cold_plan::OrgColdRefusal;
+    let node = node().await;
+    let capability = CapabilityAuthorityId::for_tag("nrpc:cold.unadopted");
+    assert_eq!(
+        node.org_cold_discovery(&capability, &[]).err(),
+        Some(OrgColdRefusal::NoNodeAuthority),
+        "an un-adopted node cannot capture private-discovery authority"
+    );
+    assert_eq!(
+        node.org_cold_authority().err(),
+        Some(OrgColdRefusal::NoNodeAuthority),
+        "and neither can the authority-only shape the exported path uses"
+    );
+}
+
+/// (C4) A spent authority-epoch space refuses the capture rather than capturing
+/// under an identity that can no longer be compared.
+///
+/// At saturation every later authority receives the same identity, so a stamp
+/// taken there would compare EQUAL across an unrelated replacement — exactly the
+/// aliasing the routing plane already fences.
+#[tokio::test]
+async fn a_spent_authority_epoch_refuses_the_cold_capture() {
+    use crate::adapter::net::behavior::org_cold_plan::OrgColdRefusal;
+    let node = node().await;
+    let org = crate::adapter::net::behavior::org::OrgKeypair::from_bytes([0xc4u8; 32]);
+    node.install_node_authority(adopt_authority(&node, &org, "cold-spent"))
+        .expect("install authority");
+    let capability = CapabilityAuthorityId::for_tag("nrpc:cold.spent");
+    assert!(
+        node.org_cold_discovery(&capability, &[]).is_ok(),
+        "precondition: the capture works before the epoch space is spent"
+    );
+
+    node.routing_authority
+        .epoch
+        .store(u64::MAX, Ordering::Release);
+    {
+        let _gate = node.routing_authority.lock_gate();
+        assert_eq!(
+            node.routing_authority.advance(),
+            AuthorityAdvance::NewlyExhausted,
+            "precondition: the epoch space is now terminal"
+        );
+    }
+
+    assert_eq!(
+        node.org_cold_discovery(&capability, &[]).err(),
+        Some(OrgColdRefusal::IncoherentAuthority),
+        "a spent epoch space cannot witness currentness, so the capture fails \
+         closed"
+    );
+    assert_eq!(
+        node.org_cold_authority().err(),
+        Some(OrgColdRefusal::IncoherentAuthority),
+        "and so does the authority-only shape"
+    );
+}
