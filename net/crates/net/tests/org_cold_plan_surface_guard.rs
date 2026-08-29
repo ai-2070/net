@@ -30,7 +30,11 @@ fn crate_root() -> PathBuf {
 }
 
 fn read(path: &Path) -> String {
-    std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    // Normalized to LF: this repo is checked out with CRLF on Windows, and every
+    // structural assertion below anchors on line shapes.
+    std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+        .replace("\r\n", "\n")
 }
 
 /// The line that declares `item`, plus the attribute lines immediately above it.
@@ -198,6 +202,114 @@ fn the_bridge_declares_itself_unstable() {
         assert!(
             src.to_lowercase().contains(&phrase.to_lowercase()),
             "the bridge module must state plainly that it is {phrase}"
+        );
+    }
+}
+
+/// The body of `MeshNode::capture_cold`, from its signature to the line that
+/// closes it at the same indentation.
+fn capture_cold_body(src: &str) -> String {
+    let start = src
+        .find("    fn capture_cold(")
+        .expect("MeshNode::capture_cold not found — this guard is anchored on it");
+    let rest = &src[start..];
+    let end = rest
+        .find("\n    }\n")
+        .expect("capture_cold's closing brace not found");
+    rest[..end].to_string()
+}
+
+/// F1 (independent review): the cold capture takes the scoped store EXACTLY ONCE,
+/// through the instrumented acquisition, with BOTH plane queries inside it.
+///
+/// The runtime witness
+/// `one_cold_capture_acquisition_spans_the_owner_and_grant_queries` compares the
+/// section identity across the owner plane and a real grant query, which kills a
+/// split that reacquires through `lock_cold_section`. This is the other half: a
+/// split that BYPASSES the helper with a bare `scoped_discovery.lock()` would
+/// stamp no new identity, so only a structural check can see it.
+///
+/// Non-vacuous by construction: the function must be found, and both production
+/// plane queries must appear inside the section, or the assertions below cannot
+/// pass.
+#[test]
+fn the_cold_capture_holds_exactly_one_store_acquisition() {
+    let body = capture_cold_body(&read(&crate_root().join("src/adapter/net/mesh.rs")));
+    let instrumented = body.matches("self.lock_cold_section()").count();
+    assert_eq!(
+        instrumented, 1,
+        "capture_cold must open EXACTLY ONE store section, through \
+         lock_cold_section; found {instrumented}"
+    );
+    let bare = body.matches("scoped_discovery.lock()").count();
+    assert_eq!(
+        bare, 0,
+        "capture_cold must not take the scoped store outside lock_cold_section: \
+         a bare acquisition stamps no section identity, so the runtime witness \
+         could not see the split ({bare} found)"
+    );
+    // The anchors that make the two assertions above mean something.
+    for query in [
+        "find_owner_private_providers(",
+        "find_capabilities_for_grant(",
+    ] {
+        assert!(
+            body.contains(query),
+            "capture_cold must contain the production `{query}` call inside its \
+             single section, or this guard is vacuous"
+        );
+    }
+    let section = body
+        .find("self.lock_cold_section()")
+        .expect("checked above");
+    for query in [
+        "find_owner_private_providers(",
+        "find_capabilities_for_grant(",
+    ] {
+        let at = body.find(query).expect("checked above");
+        assert!(
+            at > section,
+            "`{query}` must run AFTER the section is opened, inside it"
+        );
+    }
+}
+
+/// F2 (independent review): the proof intent is constructed only AFTER the final
+/// currentness comparison, on both cold-plan paths.
+///
+/// The runtime evidence is the thread-local intent counter (see
+/// `a_superseded_private_attempt_constructs_no_intent`). This is the structural
+/// leg: in each attempt, the `intent_for` call must appear after the
+/// `org_cold_authority_is_current` call. It exists because the first repair
+/// satisfied every behavioural assertion while minting BEFORE the comparison —
+/// the sequence was wrong, not the outcome.
+#[test]
+fn both_cold_plan_attempts_mint_after_the_comparison() {
+    let src = read(&crate_root().join("sdk/src/org/call.rs"));
+    for attempt in ["fn plan_attempt(", "fn plan_exported_attempt("] {
+        let start = src
+            .find(attempt)
+            .unwrap_or_else(|| panic!("{attempt} not found — this guard is anchored on it"));
+        let rest = &src[start..];
+        let end = rest
+            .find("\n    }\n")
+            .unwrap_or_else(|| panic!("{attempt} closing brace not found"));
+        let body = &rest[..end];
+        let compare = body
+            .find("org_cold_authority_is_current")
+            .unwrap_or_else(|| panic!("{attempt} does not compare currentness at all"));
+        let mint = body
+            .find("self.intent_for(")
+            .unwrap_or_else(|| panic!("{attempt} never constructs the intent"));
+        assert!(
+            mint > compare,
+            "{attempt} constructs the proof intent BEFORE the final currentness \
+             comparison; §10's sequence is select -> compare -> mint"
+        );
+        assert!(
+            body.contains("select_candidate("),
+            "{attempt} must select through the shared rule, or the ordering above \
+             is about the wrong code"
         );
     }
 }

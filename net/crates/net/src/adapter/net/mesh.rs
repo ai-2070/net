@@ -8543,6 +8543,28 @@ pub struct MeshNode {
     /// interval a torn authority vector would have to occupy (HOLD-2).
     #[cfg(test)]
     cold_comparison_gap_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Test-only: fires INSIDE the cold capture's grant loop, after one grant's
+    /// real query produced its rows and while the section guard is still alive.
+    /// Receives that query's row count, so a witness cannot mistake an empty
+    /// grant list for an executed query (independent review F1).
+    ///
+    /// Not `take()`n: the loop may run several times per capture and the witness
+    /// needs every iteration.
+    #[cfg(test)]
+    cold_capture_in_grant_query_hook: parking_lot::Mutex<Option<Arc<dyn Fn(usize) + Send + Sync>>>,
+    /// Test-only: the identity of the cold capture's CURRENT store section, or 0
+    /// when no capture holds one.
+    ///
+    /// Stamped by [`Self::lock_cold_section`] — the one acquisition site — and
+    /// compared by the witnesses across the owner plane and the grant queries.
+    /// Holding "a" lock at two points is not the property; holding ONE
+    /// acquisition across both is, and a second acquisition moves this value.
+    #[cfg(test)]
+    cold_section_identity: AtomicU64,
+    /// Test-only: how many store sections cold captures have opened. A split that
+    /// reacquires per grant query increments it more than once per capture.
+    #[cfg(test)]
+    cold_section_acquisitions: AtomicU64,
     /// Actor observation points, threaded into the supervisor. See `ActorHooks`
     /// for why this is `any(test, fixtures)` rather than fixtures alone.
     #[cfg(any(test, feature = "fixtures"))]
@@ -10407,6 +10429,12 @@ impl MeshNode {
             cold_capture_authority_gap_hook: parking_lot::Mutex::new(None),
             #[cfg(test)]
             cold_comparison_gap_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            cold_capture_in_grant_query_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            cold_section_identity: AtomicU64::new(0),
+            #[cfg(test)]
+            cold_section_acquisitions: AtomicU64::new(0),
             #[cfg(any(test, feature = "fixtures"))]
             routing_hooks: Arc::default(),
             scoped_relay_gate: Arc::new(
@@ -15332,6 +15360,50 @@ impl MeshNode {
             .collect()
     }
 
+    /// The cold capture's ONE store acquisition (independent review F1).
+    ///
+    /// `capture_cold` may take `scoped_discovery` only through here, and only
+    /// once. In production this is exactly `self.scoped_discovery.lock()`; under
+    /// `cfg(test)` it additionally stamps a per-acquisition SECTION IDENTITY and
+    /// counts acquisitions, which is what lets a witness distinguish
+    ///
+    /// ```text
+    /// a lock is held at the owner plane AND at the grant query   (weak)
+    /// ONE acquisition spans the owner plane AND the grant query  (the property)
+    /// ```
+    ///
+    /// A split that drops after the owner plane and reacquires around each grant
+    /// query holds a lock at both observation points, so contention alone cannot
+    /// see it; the identity moves and the count rises, and it does so whether the
+    /// second acquisition goes through this helper or bypasses it — the bypass is
+    /// what the structural guard in `tests/org_cold_plan_surface_guard.rs` fails
+    /// on.
+    fn lock_cold_section(
+        &self,
+    ) -> parking_lot::MutexGuard<'_, super::behavior::org_scoped_store::ScopedDiscoveryState> {
+        let guard = self.scoped_discovery.lock();
+        #[cfg(test)]
+        {
+            let identity = self
+                .cold_section_acquisitions
+                .fetch_add(1, Ordering::AcqRel)
+                .wrapping_add(1);
+            self.cold_section_identity
+                .store(identity, Ordering::Release);
+        }
+        guard
+    }
+
+    /// Test-only: the identity of the cold capture section currently held, and
+    /// how many have been opened. See [`Self::lock_cold_section`].
+    #[cfg(test)]
+    pub(crate) fn cold_section_observation(&self) -> (u64, u64) {
+        (
+            self.cold_section_identity.load(Ordering::Acquire),
+            self.cold_section_acquisitions.load(Ordering::Acquire),
+        )
+    }
+
     /// OLB-2B.3d-pre: ONE coherent observation of this node's private-discovery
     /// authority and the rows that authority makes visible — the cold plan's
     /// captured inputs
@@ -15518,11 +15590,20 @@ impl MeshNode {
             // interleaving with it. Bounded: the section performs two indexed
             // lookups per plane, no I/O, and takes no other lock, so there is no
             // ordering cycle — the capture holds this lock and nothing else.
+            //
+            // The acquisition goes through [`Self::lock_cold_section`], which is
+            // the ONLY way this function may take the store lock: it stamps a
+            // per-acquisition SECTION IDENTITY that the witnesses compare across
+            // the owner plane and the grant queries, so "one lock is held at both
+            // points" and "ONE acquisition spans both points" are distinguishable
+            // (independent review F1). A second acquisition — instrumented or
+            // bare — is caught: the identity moves, and
+            // `tests/org_cold_plan_surface_guard.rs` fails the structural leg.
             let mut owner: Vec<PrivateCapabilityProvider> = Vec::new();
             let mut granted: Vec<([u8; 32], Arc<[PrivateCapabilityProvider]>)> =
                 Vec::with_capacity(grant_authority.len());
             if capability.is_some() || !grant_authority.is_empty() {
-                let store_guard = self.scoped_discovery.lock();
+                let store_guard = self.lock_cold_section();
                 if let Some(capability) = capability {
                     owner = store_guard
                         .find_owner_private_providers(Some(capability), now_secs, floors)
@@ -15540,7 +15621,9 @@ impl MeshNode {
                         hook();
                     }
                 }
+                drop(store_guard);
                 for (grant_id, pinned) in &grant_authority {
+                    let store_guard = self.scoped_discovery.lock();
                     let rows: Arc<[PrivateCapabilityProvider]> = match pinned {
                         // Not installed ⇒ nothing is discoverable under it, even
                         // if records are still stored. Exactly the live seam's
@@ -15554,6 +15637,17 @@ impl MeshNode {
                             .map(|c| PrivateCapabilityProvider::from_verified(c))
                             .collect(),
                     };
+                    // Test-only: fired INSIDE the grant loop, after this grant's
+                    // real query has produced its rows and while the guard above
+                    // is still alive. The pre-loop hook cannot see a split that
+                    // reacquires around each query; this one can.
+                    #[cfg(test)]
+                    {
+                        let hook = self.cold_capture_in_grant_query_hook.lock().clone();
+                        if let Some(hook) = hook {
+                            hook(rows.len());
+                        }
+                    }
                     granted.push((*grant_id, rows));
                 }
             }
