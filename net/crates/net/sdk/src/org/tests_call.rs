@@ -820,16 +820,20 @@ async fn the_cold_capture_serves_exactly_what_the_live_plane_seams_serve() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A raised revocation floor moves the captured authority identity, so the plan
-/// refuses to mint under it.
+/// A real revocation floor raise supersedes the capture it preceded, so the plan
+/// will not mint under it.
 ///
-/// The floor generation moves INSIDE the revocation store and advances no
-/// routing epoch by itself, so a comparison that only checked the epoch would
-/// confirm a stamp taken before the org revoked. Carries the adjacent control:
-/// before the raise the same stamp compares CURRENT, so the assertion below is
-/// about the floor and not about a stamp that never matches.
+/// End-to-end and honest about its coupling: on this path the raise advances the
+/// routing epoch as well as the floor generation, so this witness proves the
+/// TRANSITION is caught, not which component caught it. The floor generation is
+/// witnessed on its own by
+/// `org_routing_wiring_tests::a_captured_stamp_compares_the_revocation_floor_generation`,
+/// which is where the epoch can be held equal.
+///
+/// Carries the adjacent control: before the raise the same stamp compares
+/// CURRENT, so this cannot be satisfied by a stamp that never matches.
 #[tokio::test]
-async fn a_captured_stamp_notices_a_raised_revocation_floor() {
+async fn a_raised_revocation_floor_supersedes_the_capture_it_preceded() {
     let a = org_a();
     let (mesh, identity, dir) = mesh_with_authority("cold-floor", Some(&a)).await;
     let provider = EntityKeypair::generate();
@@ -856,7 +860,7 @@ async fn a_captured_stamp_notices_a_raised_revocation_floor() {
 
     assert!(
         !mesh.node().org_cold_authority_is_current(capture.stamp()),
-        "a raised floor must supersede the captured authority identity"
+        "a raised floor must supersede the authority identity captured before it"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

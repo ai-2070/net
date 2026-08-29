@@ -181,6 +181,25 @@ impl OrgColdAuthorityStamp {
         self.floor_generation
     }
 
+    /// The same stamp with a DIFFERENT floor generation — the isolation seam for
+    /// the floor component of the final comparison.
+    ///
+    /// A real floor raise advances the routing epoch too (the raise notifies the
+    /// subscriber that advances it), so an end-to-end raise cannot show that the
+    /// floor generation is compared ON ITS OWN. It has to be, because a floor
+    /// publication is authoritative inside the revocation store BEFORE that
+    /// subscriber runs — the same window `SlotBaseFacts` keeps its own
+    /// `floor_generation` for. Mirrors the read seam's witness technique
+    /// (`facts_built_against_superseded_floors_read_cold`), which fabricates the
+    /// generation rather than racing the subscriber.
+    #[cfg(test)]
+    pub(crate) fn with_floor_generation_for_test(&self, floor_generation: u64) -> Self {
+        Self {
+            floor_generation,
+            ..self.clone()
+        }
+    }
+
     /// The pinned installation of each requested grant scope, in the order the
     /// caller asked for them. `None` means the grant was not installed, which is
     /// itself part of the identity: an install landing afterwards moves the

@@ -8496,3 +8496,36 @@ async fn a_spent_authority_epoch_refuses_the_cold_capture() {
         "and so does the authority-only shape"
     );
 }
+
+/// (C5) The captured revocation FLOOR generation is compared on its own.
+///
+/// A real floor raise also advances the routing epoch, so an end-to-end raise
+/// proves only that SOMETHING moved. The floor generation has to be compared
+/// independently: a floor publication is authoritative inside the revocation
+/// store before the subscriber that advances the epoch runs, which is the window
+/// the routing read seam keeps its own `floor_generation` for. Isolated the same
+/// way that seam's witness isolates it — by naming the generation rather than
+/// racing the subscriber.
+#[tokio::test]
+async fn a_captured_stamp_compares_the_revocation_floor_generation() {
+    let node = node().await;
+    let org = crate::adapter::net::behavior::org::OrgKeypair::from_bytes([0xc5u8; 32]);
+    node.install_node_authority(adopt_authority(&node, &org, "cold-floors"))
+        .expect("install authority");
+    let capture = node
+        .org_cold_discovery(&CapabilityAuthorityId::for_tag("nrpc:cold.floors"), &[])
+        .expect("capture");
+
+    assert!(
+        node.org_cold_authority_is_current(capture.stamp()),
+        "control: the captured stamp compares CURRENT against its own view"
+    );
+    let superseded = capture
+        .stamp()
+        .with_floor_generation_for_test(capture.stamp().floor_generation().wrapping_sub(1));
+    assert!(
+        !node.org_cold_authority_is_current(&superseded),
+        "a stamp naming a DIFFERENT floor generation must not compare current, \
+         even with the epoch and the poison bit unchanged"
+    );
+}
