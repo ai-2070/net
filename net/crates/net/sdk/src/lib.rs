@@ -193,6 +193,14 @@ pub mod a2a;
 pub mod subnet;
 #[cfg(feature = "net")]
 pub mod subnets;
+// Capability sensing — the provider lifecycle (`provide`, the
+// ownership-safe registration handle, state-edge notification) plus
+// the exact-provider readiness projection over a caller-supplied
+// authorized population. See
+// CAPABILITY_SENSING_SDK_INTEGRATION_PLAN.md §4.2/§4.4. Rides `net`:
+// every operation is node state on a live `MeshNode`.
+#[cfg(feature = "net")]
+pub mod sensing;
 
 // Aggregator + lifecycle surfaces. Aggregator-daemon clients
 // (`RegistryClient`, `FoldQueryClient`) + the daemon-author
@@ -309,6 +317,17 @@ pub use crate::a2a::{
 };
 #[cfg(feature = "net")]
 pub use crate::subnets::{SubnetId, SubnetPolicy};
+// Capability-sensing provider convenience re-exports (S1): the trait an
+// integration implements, its result model, the registration handle,
+// and the loud refusal. Everything else — the interest vocabulary, the
+// incarnation derivation, the exact-provider projection — stays behind
+// `net_sdk::sensing::` so the crate root does not grow a second sensing
+// surface.
+#[cfg(feature = "net")]
+pub use crate::sensing::{
+    EvaluationRequest, ReadinessEvaluation, ReadinessEvaluator, ReadinessRegistration,
+    SensingClient, SensingError,
+};
 
 impl NetBuilder {
     /// Build and start the node.

@@ -318,8 +318,10 @@ async fn build_fixture() -> Fixture {
             ready: a_ready.clone(),
             start_ms: a_start_ms.clone(),
         }),
-    );
-    r.register_readiness_evaluator(CapabilityId::new(CAP), Arc::new(SlowReady));
+    )
+    .expect("evaluator registers");
+    r.register_readiness_evaluator(CapabilityId::new(CAP), Arc::new(SlowReady))
+        .expect("evaluator registers");
 
     connect(&a, &r).await;
     connect(&a, &o).await;

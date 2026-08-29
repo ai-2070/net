@@ -93,6 +93,53 @@ Being an origin (signing readiness for yourself) needs BOTH
 `enable_sensing_coalescing = true` AND a persisted `sensing_incarnation`.
 Being a relay/leader/consumer needs only the master switch.
 
+## Provider lifecycle
+
+A provider serves readiness for a capability by installing one
+`ReadinessEvaluator`. The trait is deliberately the whole contract: one
+cheap, non-blocking, synchronous `evaluate` call. It runs on the
+emission path (at the aggregated cadence plus on state edges) but
+always OUTSIDE the emitter lock, so an evaluator may safely call back
+into `MeshNode`. Expensive state acquisition stays **outside** the
+evaluator — publish into an atomic or an `ArcSwap` snapshot the
+evaluator merely reads.
+
+Registration is ownership-bearing (`ReadinessEvaluators`,
+`behavior/sensing/evaluator.rs`):
+
+| Operation | Meaning |
+|-----------|---------|
+| `MeshNode::register_readiness_evaluator` | vacancy-required install; mints an `EvaluatorRegistrationId`, or refuses with `EvaluatorOccupied` |
+| `MeshNode::replace_readiness_evaluator` | explicit supersession; mints a fresh id, so the superseded id is immediately non-current |
+| `MeshNode::unregister_readiness_evaluator` | removes only if the supplied id is still the installed one; `true` at most once per registration |
+| `MeshNode::notify_sensing_state_changed` | the state edge — pull every live stream on that capability forward, min-gapped at the floor. Returns whether anything moved |
+
+Three rules follow, and they are what the ids exist for:
+
+- **No silent theft.** A second integration cannot take a served
+  capability by accident; it is refused and the incumbent keeps
+  evaluating. Supersession has to be spelled out.
+- **A superseded holder is inert.** Once replaced, an old holder's
+  removal changes nothing — it can never evict its replacement.
+- **Close/drop are idempotent.** The removal is reported once, so an
+  explicit close followed by a drop is safe.
+
+A capability with no evaluator is not silence: interests targeting this
+node for it stream `ProviderUnknown { TemporarilyUnevaluable }`, which
+projects `Unknown`. "Targeted but cannot answer" beats both a false
+`Ready` and a global `NotReady`.
+
+The state edge is a **wake, never a value**. A woken beat carries
+whatever the evaluator reads at beat time, so publish the new state
+*before* announcing the edge — an edge announced first simply re-signs
+the old answer.
+
+The Rust SDK wraps all of this in `net_sdk::sensing`:
+`mesh.sensing()?.provide(capability, evaluator)` returns a
+`ReadinessRegistration` that owns its registration and releases it on
+`close()` or drop, with the fail-closed origin gate reported as a typed
+`SensingError::IncarnationRequired` rather than a silently dark node.
+
 ## Observability
 
 Read a snapshot through `MeshNode::sensing_counters()` (an

@@ -127,7 +127,8 @@ pub use table::{
 
 pub use evaluator::{
     check_cadence, project_evaluation, validate_interest_constraints, CadenceRefusal,
-    EvaluationRequest, ReadinessEvaluation, ReadinessEvaluator, SensingCounters, StatusReason,
+    EvaluationRequest, EvaluatorOccupied, EvaluatorRegistrationId, ReadinessEvaluation,
+    ReadinessEvaluator, ReadinessEvaluators, SensingCounters, StatusReason,
     DEFAULT_ATTESTATION_CADENCE_FLOOR,
 };
 
