@@ -249,7 +249,7 @@ jobs:
           a_peer_snapshot_retains_no_shard_and_drops_the_ingress_peer
           a_peer_replaced_after_revalidation_cannot_publish_its_old_session
           the_announce_lock_is_acquired_under_a_bound_and_refuses_past_it
-          a_cold_capture_holds_one_store_section_across_every_plane
+          one_cold_capture_acquisition_spans_the_owner_and_grant_queries
           an_authority_install_during_a_cold_capture_waits_for_it
           an_unadopted_node_refuses_the_cold_capture
           a_spent_authority_epoch_refuses_the_cold_capture
