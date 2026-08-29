@@ -44,6 +44,13 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 #
 # A genuine flake here is itself a defect worth seeing, so failing loudly on
 # the first attempt is the correct behavior, not a nuisance.
+#
+# `sensing_provider` (net-mesh-sdk) rides the same rule for the same reason.
+# Its provider-lifecycle witnesses are ownership races and state-edge timing
+# proofs: an in-flight evaluation released after a close or a replacement, a
+# superseded handle poking its successor's schedule, an edge that must arrive
+# far inside a deliberately long cadence. Every one of those fails only on the
+# interleaving that exposes the defect, which is exactly what retries hide.
 [[profile.default.overrides]]
-filter = 'binary(integration_nrpc_protected) + binary(org_ownership) + binary(capability_exposure_revocation) + binary(org_admission_gate) + binary(org_admission_wire) + binary(nrpc_call_hijack) + binary(nrpc_response_routing) + binary(nrpc_service_equality) + binary(nrpc_route_discriminator) + binary(nrpc_streaming_gate) + binary(nrpc_registration_order)'
+filter = 'binary(integration_nrpc_protected) + binary(org_ownership) + binary(capability_exposure_revocation) + binary(org_admission_gate) + binary(org_admission_wire) + binary(nrpc_call_hijack) + binary(nrpc_response_routing) + binary(nrpc_service_equality) + binary(nrpc_route_discriminator) + binary(nrpc_streaming_gate) + binary(nrpc_registration_order) + binary(sensing_provider)'
 retries = 0

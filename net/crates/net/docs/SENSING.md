@@ -99,30 +99,87 @@ A provider serves readiness for a capability by installing one
 `ReadinessEvaluator`. The trait is deliberately the whole contract: one
 cheap, non-blocking, synchronous `evaluate` call. It runs on the
 emission path (at the aggregated cadence plus on state edges) but
-always OUTSIDE the emitter lock, so an evaluator may safely call back
+always OUTSIDE every sensing lock, so an evaluator may safely call back
 into `MeshNode`. Expensive state acquisition stays **outside** the
 evaluator — publish into an atomic or an `ArcSwap` snapshot the
 evaluator merely reads.
 
-Registration is ownership-bearing (`ReadinessEvaluators`,
-`behavior/sensing/evaluator.rs`):
+Registration is ownership-bearing. The registry
+(`behavior/sensing/evaluator.rs`) is crate-internal; the supported
+surface is the node's lifecycle seams plus one opaque id and its
+refusal:
 
 | Operation | Meaning |
 |-----------|---------|
-| `MeshNode::register_readiness_evaluator` | vacancy-required install; mints an `EvaluatorRegistrationId`, or refuses with `EvaluatorOccupied` |
-| `MeshNode::replace_readiness_evaluator` | explicit supersession; mints a fresh id, so the superseded id is immediately non-current |
+| `MeshNode::register_readiness_evaluator` | vacancy-required install; issues an `EvaluatorRegistrationId`, or refuses with `EvaluatorInstallRefusal::Occupied` |
+| `MeshNode::replace_readiness_evaluator` | explicit supersession; issues a fresh id, so the superseded id is non-current the instant it returns |
 | `MeshNode::unregister_readiness_evaluator` | removes only if the supplied id is still the installed one; `true` at most once per registration |
-| `MeshNode::notify_sensing_state_changed` | the state edge — pull every live stream on that capability forward, min-gapped at the floor. Returns whether anything moved |
+| `MeshNode::notify_sensing_state_changed` | the capability-scoped state edge for low-level callers that own their node outright |
+| `MeshNode::notify_sensing_state_changed_owned` | the ownership-aware state edge (`#[doc(hidden)]`, workspace-internal): pokes only while the supplied id is still installed |
 
-Three rules follow, and they are what the ids exist for:
+Four rules follow, and they are what the ids exist for:
 
 - **No silent theft.** A second integration cannot take a served
   capability by accident; it is refused and the incumbent keeps
   evaluating. Supersession has to be spelled out.
-- **A superseded holder is inert.** Once replaced, an old holder's
-  removal changes nothing — it can never evict its replacement.
+- **A superseded holder is inert on every edge.** Once replaced or
+  closed, an old holder's removal changes nothing, its state-edge
+  notification moves nothing, and a readiness result it was already
+  computing can no longer be published.
 - **Close/drop are idempotent.** The removal is reported once, so an
   explicit close followed by a drop is safe.
+- **Identity exhaustion is terminal, not wrapping.** Ids are issued at
+  most once each; the allocator saturates at a reserved sentinel rather
+  than reusing a value a long-closed handle still holds. Past that
+  point every install — vacancy-required and replacing alike — is
+  refused with `EvaluatorInstallRefusal::IdentityExhausted`, incumbents
+  keep serving, and removal keeps working.
+
+### The publication fence
+
+`evaluate` is arbitrary user code and may take arbitrarily long, so a
+close or a replacement can land while a result is still being computed.
+Publishing that result afterwards would let a retired integration's
+verdict become the latest observation.
+
+The registry therefore owns a commit mutex that is the linearization
+point for ownership transfer. Install, replace, and remove hold it for
+their whole operation; the emitter holds it across the currentness test
+**and** the publication. So:
+
+```text
+snapshot (id, evaluator)      ← no lock
+run evaluate                  ← no lock; may block, may re-enter MeshNode
+begin_commit(cap, id)         ┐ one critical section:
+  sign                        │ the currentness decision and
+  insert into latest          │ the publication cannot be split
+  feed the consumer cell      ┘
+release, then fan out to peers ← no lock held for network I/O
+```
+
+If the capability's installed registration is no longer the one the
+evaluation ran under, the section does not open and the beat is dropped
+— the emitter re-arms and the successor's own beat publishes the
+truthful answer. The test is total in both directions: an "unevaluable"
+beat produced with no evaluator installed is likewise dropped if an
+evaluator has appeared since, because publishing "cannot answer" about a
+capability that now can is a false negative.
+
+**Lock order.** `commit_mu` is strictly outermost among the sensing
+locks. It may be held while taking
+`sensing_local_projection_mu` → `sensing_interest_table` →
+`sensing_observations` (the frozen order), or `sensing_emitter`; nothing
+acquires it while holding any of those. No user evaluator, no `.await`,
+and no network I/O runs inside it.
+
+**Scope, stated honestly.** The fence covers the LOCAL commit points —
+the wire cache and the consumer cell. Peer fan-out happens after the
+section releases, because holding a registry lock across network I/O
+would let a slow send block every registration on the node. A frame
+already handed to the socket is not recalled, which is the same
+soft-state honesty §4.3 of the SDK integration plan applies to the
+lease's wire leg: the plan explicitly declines to linearize installation
+ownership across the wire.
 
 A capability with no evaluator is not silence: interests targeting this
 node for it stream `ProviderUnknown { TemporarilyUnevaluable }`, which
@@ -132,13 +189,46 @@ projects `Unknown`. "Targeted but cannot answer" beats both a false
 The state edge is a **wake, never a value**. A woken beat carries
 whatever the evaluator reads at beat time, so publish the new state
 *before* announcing the edge — an edge announced first simply re-signs
-the old answer.
+the old answer. That obligation is the caller's; nothing in the node can
+enforce it.
 
-The Rust SDK wraps all of this in `net_sdk::sensing`:
+### Rust SDK
+
+`net_sdk::sensing` wraps the provider lifecycle and nothing else:
 `mesh.sensing()?.provide(capability, evaluator)` returns a
 `ReadinessRegistration` that owns its registration and releases it on
-`close()` or drop, with the fail-closed origin gate reported as a typed
-`SensingError::IncarnationRequired` rather than a silently dark node.
+`close()` or drop. `changed()` routes through the ownership-aware seam,
+so a superseded-but-still-open handle cannot move its successor's
+schedule.
+
+Every prerequisite is a typed refusal rather than a silently dark node:
+`SensingError::Disabled` (plane off), `DurableIdentityRequired` (a
+generated ephemeral keypair cannot sign orderable readiness across a
+restart), `IncarnationRequired` (the fail-closed origin gate),
+`AlreadyProviding`, and `RegistrationIdentityExhausted`. Absence of the
+sensing plane at BUILD time is a compile error at the call site, not a
+runtime no-op: the module rides `feature = "net"`.
+
+**Not in the SDK yet.** There is no query, watch, snapshot, or readiness
+projection surface. Exact-provider acquisition and projection are
+deferred to S4 for a concrete reason: the core still refuses every
+organization-audience exact-provider lease
+(`SensingRegistrationError::OrgAudienceUnsupported`), because the
+lease's wire leg emits legacy frames only, which an
+organization-authoritative provider refuses. Until
+organization-authenticated registration intake and organization-audience
+exact leases are authorized, nothing in the SDK could create the
+observations a projection would read.
+
+The plan's §4.5 node-authority refusal guards *owner-scoped* sensing,
+and the provider surface exposes none: registering an evaluator names
+only a local capability id, carries no audience, and confers no
+authority. Whether a consumer's interest may reach this provider is
+decided on the registration path by `validate_subscriber_scope` and —
+for organization audiences — `verify_org_sensing_registration`, both of
+which run before any table row exists. The evaluator is consulted only
+after an admitted row produces a beat. When exact-provider acquisition
+lands, that surface carries the authority refusal.
 
 ## Observability
 

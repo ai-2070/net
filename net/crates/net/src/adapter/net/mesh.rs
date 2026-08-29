@@ -11599,7 +11599,7 @@ impl MeshNode {
         &self,
         capability_id: sensing::CapabilityId,
         evaluator: Arc<dyn sensing::ReadinessEvaluator + Send + Sync>,
-    ) -> Result<sensing::EvaluatorRegistrationId, sensing::EvaluatorOccupied> {
+    ) -> Result<sensing::EvaluatorRegistrationId, sensing::EvaluatorInstallRefusal> {
         self.sensing_evaluators
             .install_vacant(capability_id, evaluator)
     }
@@ -11607,16 +11607,20 @@ impl MeshNode {
     /// SI-3 / S0 item 7: install an evaluator, EXPLICITLY superseding
     /// whatever served the capability before. The caller is stating
     /// that it owns the capability's readiness; the superseded
-    /// registration's id becomes non-current immediately, so that
-    /// holder's later close or drop removes nothing.
+    /// registration's id becomes non-current the instant this returns,
+    /// so that holder's later close or drop removes nothing, its
+    /// state-edge notifications are inert, and an evaluation already in
+    /// flight under it can no longer publish.
     ///
     /// Prefer [`Self::register_readiness_evaluator`] unless
-    /// supersession is the intent.
+    /// supersession is the intent. Refuses only with
+    /// [`sensing::EvaluatorInstallRefusal::IdentityExhausted`], on
+    /// which the incumbent is left serving.
     pub fn replace_readiness_evaluator(
         &self,
         capability_id: sensing::CapabilityId,
         evaluator: Arc<dyn sensing::ReadinessEvaluator + Send + Sync>,
-    ) -> sensing::EvaluatorRegistrationId {
+    ) -> Result<sensing::EvaluatorRegistrationId, sensing::EvaluatorInstallRefusal> {
         self.sensing_evaluators
             .install_replacing(capability_id, evaluator)
     }
@@ -11631,6 +11635,9 @@ impl MeshNode {
     /// most once per registration. A superseded holder gets `false`
     /// and changes nothing, which is what makes an SDK handle's
     /// close/drop pair idempotent and a stale handle's drop inert.
+    ///
+    /// Once this returns `true`, a result the removed evaluator was
+    /// already computing can no longer become the latest observation.
     pub fn unregister_readiness_evaluator(
         &self,
         capability_id: &sensing::CapabilityId,
@@ -11644,15 +11651,57 @@ impl MeshNode {
     /// edges immediate with min-gap"): local state affecting
     /// `capability_id` changed — pull every live stream on that
     /// capability forward to now, min-gapped at the cadence floor,
-    /// and wake the emitter loop.
+    /// and wake the emitter loop. A no-op while the origin role is
+    /// dark or no stream targets the capability.
     ///
-    /// Returns whether any live stream actually moved. `false` while
-    /// the origin role is dark or no stream targets the capability —
-    /// the notification is a WAKE, never evidence about readiness:
-    /// the value a woken beat carries is whatever the evaluator reads
-    /// at beat time, so the application must publish its state
-    /// BEFORE calling this.
-    pub fn notify_sensing_state_changed(&self, capability_id: &sensing::CapabilityId) -> bool {
+    /// The notification is a WAKE, never evidence about readiness: the
+    /// value a woken beat carries is whatever the evaluator reads at
+    /// beat time, so the application must publish its state BEFORE
+    /// calling this.
+    ///
+    /// This is the CAPABILITY-scoped seam for low-level callers that
+    /// own their node outright. A caller holding a registration id
+    /// should use the ownership-aware seam
+    /// ([`Self::notify_sensing_state_changed_owned`]) so a superseded
+    /// registration cannot move its successor's schedule.
+    pub fn notify_sensing_state_changed(&self, capability_id: &sensing::CapabilityId) {
+        self.poke_sensing_capability(capability_id);
+    }
+
+    /// S0 item 7: the OWNERSHIP-AWARE state-edge seam — poke the
+    /// capability's live streams only while `registration_id` is still
+    /// the installed registration.
+    ///
+    /// Returns whether any live stream actually moved; `false` both
+    /// when nothing was watching and when this registration has been
+    /// superseded or removed. The currentness test and the poke are one
+    /// critical section, so there is no check-then-poke window: once a
+    /// replacement or close has returned, the old registration can
+    /// never alter the successor's schedule.
+    ///
+    /// Unstable, workspace-internal SDK bridge: this exists so
+    /// `net_sdk::sensing::ReadinessRegistration::changed` can be
+    /// ownership-safe. Not part of the supported `net` surface.
+    #[doc(hidden)]
+    pub fn notify_sensing_state_changed_owned(
+        &self,
+        capability_id: &sensing::CapabilityId,
+        registration_id: sensing::EvaluatorRegistrationId,
+    ) -> bool {
+        self.sensing_evaluators
+            .poke_if_current(capability_id, registration_id, || {
+                self.poke_sensing_capability(capability_id)
+            })
+    }
+
+    /// Pull every live stream on `capability_id` forward and wake the
+    /// emitter loop. Returns whether anything moved.
+    ///
+    /// Lock order: takes `sensing_emitter` only, and is called either
+    /// with no sensing lock held (the capability-scoped seam) or under
+    /// the evaluator registry's commit mutex (the ownership-aware
+    /// seam) — `commit_mu` → `sensing_emitter`, never the reverse.
+    fn poke_sensing_capability(&self, capability_id: &sensing::CapabilityId) -> bool {
         let moved = {
             let mut slot = self.sensing_emitter.lock();
             match slot.as_mut() {
@@ -11685,13 +11734,48 @@ impl MeshNode {
         self.config.enable_sensing_coalescing
     }
 
-    /// How many capabilities on this node currently have a readiness
-    /// evaluator installed (tests + observability).
+    /// Whether the caller supplied this node's durable identity
+    /// ([`MeshNodeConfig::configured_identity`]).
     ///
-    /// A refused registration must leave this unchanged — that is what
+    /// An origin signs its attestations with the node's entity key, so
+    /// a generated ephemeral identity makes both the consumer's TOFU
+    /// pin and the persisted incarnation meaningless across a restart.
+    /// The SDK refuses provider registration on that basis.
+    pub fn sensing_identity_is_durable(&self) -> bool {
+        self.config.configured_identity
+    }
+
+    /// How many capabilities on this node currently have a readiness
+    /// evaluator installed.
+    ///
+    /// Test/observability seam only — deliberately NOT part of the
+    /// supported surface, so the registry's storage choice stays free.
+    /// A refused registration must leave this unchanged; that is what
     /// "the refusal is total" means.
+    #[cfg(any(test, feature = "fixtures"))]
     pub fn sensing_evaluator_count(&self) -> usize {
         self.sensing_evaluators.len()
+    }
+
+    /// Whether this node's readiness-registration identity space is
+    /// exhausted — terminal and fail-closed for new installs.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn sensing_evaluator_identities_exhausted(&self) -> bool {
+        self.sensing_evaluators.identities_exhausted()
+    }
+
+    /// Force the registration-id allocator's resting value, so a test
+    /// can reach the terminal exhausted state without 2^64 real
+    /// registrations.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn set_sensing_evaluator_next_id_for_test(&self, next: u64) {
+        self.sensing_evaluators.set_next_id_for_test(next);
+    }
+
+    /// The largest registration id the allocator will ever issue.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn sensing_max_registration_id_for_test() -> u64 {
+        sensing::ReadinessEvaluators::max_issuable_id_for_test()
     }
 
     /// SI-3: live emission streams on this origin (tests +
@@ -18046,64 +18130,106 @@ impl MeshNode {
                             }
                         })
                         .collect();
-                    // Phase 2 (NO emitter lock): run the user
-                    // evaluator, then seal — `into_unsigned` is
-                    // pure. `ReadinessEvaluators::evaluator` clones
-                    // the `Arc` out of the slot so the shard guard
-                    // drops before the user code runs.
-                    let evaluation = evaluators
-                        .evaluator(&beat.key().capability_id)
-                        .map(|evaluator| evaluator.evaluate(&beat.request()));
+                    // Phase 2a (NO lock): snapshot the OWNING
+                    // registration together with its evaluator.
+                    // `installed` clones the `Arc` out of the slot so
+                    // the shard guard drops before user code runs, and
+                    // the id rides along so phase 2c can prove the
+                    // result belongs to a registration that is still
+                    // current. `None` = "targeted but cannot answer".
+                    let installed = evaluators.installed(&branch.interest.capability_id);
+                    let evaluated_under = installed.as_ref().map(|(id, _)| *id);
+                    // Phase 2b (NO lock): run the user evaluator. It may
+                    // block for as long as it likes and may re-enter
+                    // `MeshNode` — no sensing lock is held here.
+                    let evaluation =
+                        installed.map(|(_, evaluator)| evaluator.evaluate(&beat.request()));
                     let unsigned = beat.into_unsigned(evaluation);
-                    let Ok(signed) = sensing::sign_attestation(&identity, unsigned) else {
-                        continue;
-                    };
-                    // SI-7: one signed origin beat produced — fanned
-                    // to every downstream below, never multiplied by
-                    // watcher count (the coalescing economic claim).
-                    counters
-                        .attestations_emitted
-                        .fetch_add(1, Ordering::Relaxed);
-                    // SI-4 review P1: the self-provider Local watch
-                    // consumes the signed beat through the SAME
-                    // attestation + continuity semantics as any
-                    // consumer — the origin's own live stream is
-                    // continuity-bearing by definition. The wire
-                    // cache insert also serves the leader fan-out
-                    // below, which resolves its identical signed
-                    // bytes from `latest` on (incarnation, seq).
-                    if local_interval.is_some() || leader_row {
-                        observations
-                            .lock()
-                            .latest
-                            .insert(branch.clone(), signed.clone());
-                    }
-                    if local_interval.is_some() {
-                        // review-pass-3 §14b: the aggregate read and the cell
-                        // apply are ONE projection transaction. The
-                        // `local_interval` above was derived before the signature
-                        // — long enough for a lease tighten to commit in between,
-                        // which would re-anchor the shared cell to the stale
-                        // LOOSER cadence until the next beat or tick. Re-derived
-                        // under the mutex, so the value applied is the one that
-                        // was live when it was applied, matching the field's own
-                        // "changes OR applies" contract.
-                        let _projection = projection_mu.lock();
-                        let interval = { table.lock().local_consumer_interval(&branch, now) };
-                        if let Some(interval) = interval {
-                            let moved = {
-                                let mut observations = observations.lock();
-                                observations.feed_consumer_cell(
-                                    &branch, &signed, true, interval, factor, now,
-                                )
-                            };
-                            if moved {
-                                overlay.send_modify(|generation| {
-                                    *generation = generation.wrapping_add(1);
-                                });
+                    // Phase 2c: the COMMIT SECTION (S0 item 7). Sealing,
+                    // signing, and publication all happen while the
+                    // evaluator registry's commit mutex is held, and the
+                    // section is entered ONLY if the capability's
+                    // installed registration still equals the one the
+                    // evaluation ran under. Because install / replace /
+                    // remove hold the same mutex for their whole
+                    // operation, a result computed under a registration
+                    // that has since been closed or replaced can never
+                    // become the latest observation — and this is a
+                    // fence, not a check-then-publish: the currentness
+                    // decision and the publication are one critical
+                    // section.
+                    //
+                    // Deliberately scoped to LOCAL commit points
+                    // (`latest` + the consumer cell). Network fan-out
+                    // stays outside: no I/O under a registry lock, and
+                    // the wire is soft state the plan explicitly refuses
+                    // to linearize (§4.3).
+                    let signed = {
+                        let Some(_commit) = evaluators
+                            .begin_commit(&branch.interest.capability_id, evaluated_under)
+                        else {
+                            // Ownership moved while the evaluator ran.
+                            // Drop the beat: the successor's own beat or
+                            // state edge publishes the truthful answer,
+                            // and the consumer meanwhile holds or
+                            // expires to Unknown.
+                            continue;
+                        };
+                        let Ok(signed) = sensing::sign_attestation(&identity, unsigned) else {
+                            continue;
+                        };
+                        // SI-7: one signed origin beat produced — fanned
+                        // to every downstream below, never multiplied by
+                        // watcher count (the coalescing economic claim).
+                        counters
+                            .attestations_emitted
+                            .fetch_add(1, Ordering::Relaxed);
+                        // SI-4 review P1: the self-provider Local watch
+                        // consumes the signed beat through the SAME
+                        // attestation + continuity semantics as any
+                        // consumer — the origin's own live stream is
+                        // continuity-bearing by definition. The wire
+                        // cache insert also serves the leader fan-out
+                        // below, which resolves its identical signed
+                        // bytes from `latest` on (incarnation, seq).
+                        if local_interval.is_some() || leader_row {
+                            observations
+                                .lock()
+                                .latest
+                                .insert(branch.clone(), signed.clone());
+                        }
+                        if local_interval.is_some() {
+                            // review-pass-3 §14b: the aggregate read and the cell
+                            // apply are ONE projection transaction. The
+                            // `local_interval` above was derived before the signature
+                            // — long enough for a lease tighten to commit in between,
+                            // which would re-anchor the shared cell to the stale
+                            // LOOSER cadence until the next beat or tick. Re-derived
+                            // under the mutex, so the value applied is the one that
+                            // was live when it was applied, matching the field's own
+                            // "changes OR applies" contract.
+                            //
+                            // Lock order (frozen): commit_mu →
+                            // sensing_local_projection_mu →
+                            // sensing_interest_table → sensing_observations.
+                            let _projection = projection_mu.lock();
+                            let interval = { table.lock().local_consumer_interval(&branch, now) };
+                            if let Some(interval) = interval {
+                                let moved = {
+                                    let mut observations = observations.lock();
+                                    observations.feed_consumer_cell(
+                                        &branch, &signed, true, interval, factor, now,
+                                    )
+                                };
+                                if moved {
+                                    overlay.send_modify(|generation| {
+                                        *generation = generation.wrapping_add(1);
+                                    });
+                                }
                             }
                         }
-                    }
+                        signed
+                    };
                     // SI-4 re-review P0: locally signed beats
                     // dispatch three-way like any delivery — the
                     // Leader row hands the beat to the leader

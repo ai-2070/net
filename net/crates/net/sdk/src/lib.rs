@@ -317,12 +317,13 @@ pub use crate::a2a::{
 };
 #[cfg(feature = "net")]
 pub use crate::subnets::{SubnetId, SubnetPolicy};
-// Capability-sensing provider convenience re-exports (S1): the trait an
+// Capability-sensing PROVIDER convenience re-exports (S1): the trait an
 // integration implements, its result model, the registration handle,
-// and the loud refusal. Everything else — the interest vocabulary, the
-// incarnation derivation, the exact-provider projection — stays behind
+// and the loud refusal. The incarnation derivation stays behind
 // `net_sdk::sensing::` so the crate root does not grow a second sensing
-// surface.
+// surface. There is no query, watch, or projection surface in this
+// slice — see the module docs for why exact-provider projection is
+// deferred to S4.
 #[cfg(feature = "net")]
 pub use crate::sensing::{
     EvaluationRequest, ReadinessEvaluation, ReadinessEvaluator, ReadinessRegistration,

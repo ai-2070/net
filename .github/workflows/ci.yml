@@ -1242,6 +1242,12 @@ jobs:
       #   - tool_macro              — `#[tool]` proc-macro
       #     expansion + serve-helper round-trip. Gated on
       #     `feature = "macros" + "cortex"`.
+      #   - sensing_provider        — S1 capability-sensing provider
+      #     lifecycle: registration ownership, the publication fence
+      #     (an in-flight evaluation released after a close or a
+      #     replacement), state-edge notification, and terminal
+      #     registration-identity exhaustion. Gated on
+      #     `feature = "net"`.
       #
       # nextest rather than `cargo test`: the SDK has 35 separate integration
       # test binaries and `cargo test` runs them ONE AT A TIME, so the suite
@@ -1251,7 +1257,13 @@ jobs:
       # hang guard (a stalled test becomes a named failure instead of eating
       # the 20-minute budget) and the `retries = 0` override that keeps the
       # security-race binaries from being retried into green.
-      - name: Run Rust SDK tests (includes mesh_stream_backpressure, mesh_rpc_bidi_typed, tool_*)
+      #
+      # `sensing_provider` is in that zero-retry override, and
+      # `net_sdk::sensing::tests::the_provider_witness_binary_is_excluded_from_retries`
+      # reads `.config/nextest.toml` and fails if it ever drops out — the
+      # override is a filter expression, so it would otherwise stop matching
+      # silently.
+      - name: Run Rust SDK tests (includes mesh_stream_backpressure, mesh_rpc_bidi_typed, tool_*, sensing_provider)
         run: cargo nextest run --no-fail-fast --no-tests=fail --features "net cortex dataforts testing compute nat-traversal port-mapping aggregator tool macros"
 
       # SDK doctests — `///` examples in `sdk/src/`. nextest does NOT run

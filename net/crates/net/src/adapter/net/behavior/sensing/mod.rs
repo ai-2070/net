@@ -125,11 +125,15 @@ pub use table::{
     DownstreamEntry, DownstreamId, InterestTable, RefusalPartition, RegisterOutcome, UpstreamAction,
 };
 
+// S0 item 7: only the opaque cross-crate id and its refusal are public.
+// The registry itself, its storage, its mutation methods, and the
+// publication fence are crate-internal — the supported surface is the
+// `MeshNode` lifecycle seams, not a second registry API.
+pub(crate) use evaluator::ReadinessEvaluators;
 pub use evaluator::{
     check_cadence, project_evaluation, validate_interest_constraints, CadenceRefusal,
-    EvaluationRequest, EvaluatorOccupied, EvaluatorRegistrationId, ReadinessEvaluation,
-    ReadinessEvaluator, ReadinessEvaluators, SensingCounters, StatusReason,
-    DEFAULT_ATTESTATION_CADENCE_FLOOR,
+    EvaluationRequest, EvaluatorInstallRefusal, EvaluatorRegistrationId, ReadinessEvaluation,
+    ReadinessEvaluator, SensingCounters, StatusReason, DEFAULT_ATTESTATION_CADENCE_FLOOR,
 };
 
 pub use continuity::{

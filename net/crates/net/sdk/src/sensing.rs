@@ -62,36 +62,58 @@
 //!
 //! # Ownership
 //!
-//! [`ReadinessRegistration`] owns exactly the registration that minted
-//! it. Two integrations cannot silently fight over one capability:
-//! [`SensingClient::provide`] refuses an occupied capability, and
-//! supersession is spelled out with
-//! [`SensingClient::provide_replacing`]. A superseded handle's `close`
-//! or drop removes nothing, so a replacement is never evicted by the
-//! registration it replaced.
+//! [`ReadinessRegistration`] owns exactly the registration that issued
+//! it, and that ownership is enforced on all three edges:
 //!
-//! # What this module deliberately does not contain
+//! - two integrations cannot silently fight over one capability —
+//!   [`SensingClient::provide`] refuses an occupied capability and
+//!   supersession must be spelled out with
+//!   [`SensingClient::provide_replacing`];
+//! - a superseded or closed handle's `close`, drop, and
+//!   [`ReadinessRegistration::changed`] are all inert, so it can never
+//!   evict or disturb its successor;
+//! - a readiness result already being computed when a close or
+//!   replacement lands cannot become the latest observation.
 //!
-//! There is no generic query surface, no provider-free watch, no leader
-//! resolution, and no rendezvous: those are later slices. Nothing here
-//! exposes leader ids, audience commitments, wire digests, frames,
-//! private discovery records, or retry/admission policy.
+//! The last two are not best-effort checks: the node tests ownership
+//! and performs the effect inside one critical section shared with
+//! registration, replacement, and removal.
+//!
+//! # Scope of this slice
+//!
+//! **Provider lifecycle only.** There is deliberately no query surface,
+//! no watch, no snapshot, and no readiness projection here.
+//!
+//! Exact-provider acquisition and projection are deferred to S4, and
+//! the reason is concrete rather than a matter of sequencing: the core
+//! still refuses every organization-audience exact-provider lease
+//! (`SensingRegistrationError::OrgAudienceUnsupported`) because the
+//! lease's wire leg emits legacy frames only, which an
+//! organization-authoritative provider refuses. Until
+//! organization-authenticated registration intake and
+//! organization-audience exact leases are authorized, nothing in this
+//! SDK could create the observations a projection would read, so
+//! shipping a projection would ship a surface that can only ever answer
+//! `Unknown` for the population it was built for.
+//!
+//! Nothing here exposes leader ids, audience commitments, interest
+//! specs, provider selectors, wire digests, frames, private discovery
+//! records, or retry/admission policy — and no operation here is
+//! owner-scoped, so none of them is needed.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use net::adapter::net::behavior::sensing;
 use net::adapter::net::MeshNode;
 
 use crate::mesh::Mesh;
 
-/// The provider-side evaluator contract and its value types. A
-/// capability integration implements [`ReadinessEvaluator`] and nothing
-/// else.
-pub use sensing::{
-    CapabilityId, EvaluationRequest, ReadinessEvaluation, ReadinessEvaluator, StatusReason,
-};
+/// The provider-side evaluator contract. A capability integration
+/// implements [`ReadinessEvaluator`] and needs nothing else: the
+/// request's constraint and latency values are read through their own
+/// methods, so the interest vocabulary stays out of this surface.
+pub use sensing::{CapabilityId, EvaluationRequest, ReadinessEvaluation, ReadinessEvaluator};
 
 /// The persisted provider boot epoch and its derivation. An origin
 /// signs its attestation sequence under this counter, so it MUST come
@@ -103,14 +125,6 @@ pub use sensing::{
 /// to [`MeshBuilder::sensing_incarnation`](crate::mesh::MeshBuilder::sensing_incarnation).
 pub use sensing::{
     next_incarnation, Incarnation, IncarnationError, IncarnationPersistence, PersistenceFault,
-};
-
-/// The canonical interest vocabulary an exact-provider projection is
-/// asked about. These are the existing frozen semantics — the SDK adds
-/// no parallel ontology and no query DSL.
-pub use sensing::{
-    CanonicalConstraints, ConstraintError, ConsumerLatencyBudget, DisclosureClass, InterestSpec,
-    ProjectedReadiness, ProviderSelector, ResultMode, WorkLatencyEnvelope,
 };
 
 /// A loud refusal from the sensing surface.
@@ -152,21 +166,32 @@ pub enum SensingError {
         capability: String,
     },
 
-    /// The exact-provider projection was handed a provider-free
-    /// selector. Provider-free sensing is leader-routed and is not part
-    /// of this surface; an exact projection needs an exactly addressed
-    /// interest.
+    /// This node has no caller-supplied durable identity, so it cannot
+    /// be a provider: an origin signs its attestations with the node's
+    /// entity key, and a generated ephemeral key makes both the
+    /// consumer's trust-on-first-use pin and the persisted incarnation
+    /// meaningless across a restart.
     #[error(
-        "the exact-provider projection needs an exactly addressed interest — \
-         ProviderSelector::{selector} is provider-free"
+        "provider readiness needs a durable node identity — \
+         build the mesh with MeshBuilder::identity(..) instead of the \
+         generated ephemeral keypair"
     )]
-    ProviderFreeSelector {
-        /// The offending selector's variant name.
-        selector: &'static str,
-    },
+    DurableIdentityRequired,
+
+    /// This node can no longer issue a non-aliasing registration
+    /// identity, so no further registration of any kind can be
+    /// installed. Terminal and fail-closed: existing registrations keep
+    /// serving and can still be closed, but nothing new installs,
+    /// because reusing an identity would let a long-closed handle
+    /// remove a live registration.
+    #[error(
+        "this node's readiness-registration identity space is exhausted — \
+         no further provider registration can be installed on it"
+    )]
+    RegistrationIdentityExhausted,
 }
 
-/// The sensing surface bound to one live node.
+/// The provider-side sensing surface bound to one live node.
 ///
 /// Obtained from [`Mesh::sensing`]. Cheap to clone — it holds the same
 /// `Arc<MeshNode>` the mesh does, and all registration state lives on
@@ -186,22 +211,54 @@ impl std::fmt::Debug for SensingClient {
 }
 
 impl Mesh {
-    /// The capability-sensing surface for this mesh.
+    /// The provider-side capability-sensing surface for this mesh.
     ///
-    /// Refuses loudly with [`SensingError::Disabled`] when the plane is
-    /// off. Being a provider additionally needs a persisted
-    /// incarnation, which [`SensingClient::provide`] checks — a node
-    /// may legitimately hold a client without being an origin.
+    /// Every prerequisite this slice's surface actually has is checked
+    /// here or at [`SensingClient::provide`], and every failure is a
+    /// typed refusal rather than a silently dark plane:
+    ///
+    /// - [`SensingError::Disabled`] — the sensing plane is off (it ships
+    ///   dark; turn it on with
+    ///   [`MeshBuilder::enable_sensing`](crate::mesh::MeshBuilder::enable_sensing));
+    /// - [`SensingError::DurableIdentityRequired`] — the node runs on a
+    ///   generated ephemeral keypair, which no provider can sign
+    ///   orderable readiness under;
+    /// - [`SensingError::IncarnationRequired`] — checked at `provide`,
+    ///   because it is specifically the origin role that needs the
+    ///   persisted epoch.
+    ///
+    /// Absence of the sensing plane at BUILD time is not a runtime
+    /// refusal at all: this whole module rides `feature = "net"`, so a
+    /// build without it fails to compile at the call site rather than
+    /// no-opping.
+    ///
+    /// # Why no node-authority refusal
+    ///
+    /// The plan's §4.5 authority refusal guards *owner-scoped* sensing.
+    /// This slice exposes none: registering an evaluator names only a
+    /// local capability id, carries no audience, and confers no
+    /// authority. Whether a given consumer's interest may reach this
+    /// provider at all is decided on the registration path, by
+    /// `validate_subscriber_scope` and — for organization audiences —
+    /// `verify_org_sensing_registration`, both of which run before any
+    /// table row exists and neither of which consults this registry.
+    /// The evaluator is read only after an admitted row produces a beat.
+    /// When exact-provider acquisition arrives (S4), it is that surface
+    /// that must carry the authority refusal.
     pub fn sensing(&self) -> Result<SensingClient, SensingError> {
         SensingClient::bind_node(self.node().clone())
     }
 }
 
 impl SensingClient {
-    /// Bind the sensing surface to a node handle.
+    /// Bind the provider surface to a node handle, checking the
+    /// prerequisites that hold for every operation on it.
     fn bind_node(node: Arc<MeshNode>) -> Result<Self, SensingError> {
         if !node.sensing_enabled() {
             return Err(SensingError::Disabled);
+        }
+        if !node.sensing_identity_is_durable() {
+            return Err(SensingError::DurableIdentityRequired);
         }
         Ok(Self { node })
     }
@@ -222,6 +279,10 @@ impl SensingClient {
     /// - [`SensingError::AlreadyProviding`] when the capability is
     ///   already served. The incumbent is untouched — this call never
     ///   steals a live registration.
+    /// - [`SensingError::RegistrationIdentityExhausted`] when the node
+    ///   can no longer issue a non-aliasing registration identity.
+    ///
+    /// Every refusal is total: nothing is installed.
     pub fn provide(
         &self,
         capability: impl Into<CapabilityId>,
@@ -232,9 +293,7 @@ impl SensingClient {
         let registration_id = self
             .node
             .register_readiness_evaluator(capability_id.clone(), evaluator)
-            .map_err(|_| SensingError::AlreadyProviding {
-                capability: capability_id.as_str().to_string(),
-            })?;
+            .map_err(|refusal| install_refusal(refusal, &capability_id))?;
         Ok(ReadinessRegistration::new(
             self.node.clone(),
             capability_id,
@@ -252,7 +311,11 @@ impl SensingClient {
     /// the registration this call installed.
     ///
     /// Same [`SensingError::IncarnationRequired`] refusal as
-    /// [`Self::provide`].
+    /// [`Self::provide`], and the same
+    /// [`SensingError::RegistrationIdentityExhausted`] terminal refusal
+    /// — on which the incumbent is left serving, because superseding a
+    /// live registration with an un-ownable one would be strictly worse
+    /// than refusing.
     pub fn provide_replacing(
         &self,
         capability: impl Into<CapabilityId>,
@@ -262,85 +325,13 @@ impl SensingClient {
         self.require_origin()?;
         let registration_id = self
             .node
-            .replace_readiness_evaluator(capability_id.clone(), evaluator);
+            .replace_readiness_evaluator(capability_id.clone(), evaluator)
+            .map_err(|refusal| install_refusal(refusal, &capability_id))?;
         Ok(ReadinessRegistration::new(
             self.node.clone(),
             capability_id,
             registration_id,
         ))
-    }
-
-    /// The exact-provider readiness projection over a
-    /// caller-supplied, ALREADY AUTHORIZED provider population.
-    ///
-    /// The population is a **hard upper bound**: this is a projection,
-    /// not a discovery producer. Sensing can only classify providers
-    /// the caller already authorized — it never adds one, and a
-    /// retained observation for a provider outside the supplied
-    /// population is excluded rather than reported. Duplicates in
-    /// `authorized_population` collapse to one projection.
-    ///
-    /// Providers with no usable observation project
-    /// [`ProjectedReadiness::Unknown`] — never `Ready`, and never a
-    /// global `NotReady`. An exact `NotReady` prunes that interest's
-    /// candidate only; it says nothing about the provider's other
-    /// interests and never suspends its capability membership.
-    ///
-    /// Ordering and viability come from the existing core semantics
-    /// (the same classification the aggregate projects), so a caller
-    /// and the schedulers can never disagree about one branch.
-    ///
-    /// Refuses with [`SensingError::ProviderFreeSelector`] if `spec`
-    /// is not exactly addressed.
-    pub fn exact_provider_readiness(
-        &self,
-        spec: &InterestSpec,
-        budget: &ConsumerLatencyBudget,
-        authorized_population: &[u64],
-    ) -> Result<ExactProviderReadiness, SensingError> {
-        if spec.providers.is_provider_free() {
-            return Err(SensingError::ProviderFreeSelector {
-                selector: provider_free_selector_name(&spec.providers),
-            });
-        }
-        // The clamp is applied ONCE, here, and every downstream read is
-        // asked only about members of it — so no core read can widen it.
-        let mut population: Vec<u64> = authorized_population.to_vec();
-        population.sort_unstable();
-        population.dedup();
-
-        let candidates = self.node.sensed_candidates(spec, budget, Some(&population));
-        let overlay = self
-            .node
-            .sensing_readiness_overlay(spec, budget, Some(&population));
-
-        let interest = spec.key();
-        let providers = population
-            .iter()
-            .map(|provider| {
-                let observation = overlay
-                    .candidates
-                    .iter()
-                    .find(|((observed, _), _)| observed == provider)
-                    .map(|(key, observation)| (key.1, observation));
-                SensedProvider {
-                    provider: *provider,
-                    readiness: self
-                        .node
-                        .sensing_projected(&sensing::ProviderInterestKey::new(
-                            interest.clone(),
-                            *provider,
-                        )),
-                    estimated_start: observation.and_then(|(_, obs)| obs.estimated_start),
-                    capability_generation: observation.map(|(generation, _)| generation),
-                }
-            })
-            .collect();
-
-        Ok(ExactProviderReadiness {
-            providers,
-            candidates,
-        })
     }
 
     /// The fail-closed origin gate: sensing is on, but signing
@@ -356,97 +347,22 @@ impl SensingClient {
     }
 }
 
-/// The variant name of a provider-free selector, for the refusal
-/// message. Exact selectors never reach this.
-fn provider_free_selector_name(selector: &ProviderSelector) -> &'static str {
-    match selector {
-        ProviderSelector::AnyAuthorized => "AnyAuthorized",
-        ProviderSelector::Group(_) => "Group",
-        ProviderSelector::Tags(_) => "Tags",
-        ProviderSelector::Node(_) | ProviderSelector::Nodes(_) => "Node",
-    }
-}
-
-/// One provider's exact-interest readiness projection.
+/// Map a core install refusal onto the SDK's typed refusal.
 ///
-/// Carries only verified projection facts. There is deliberately no
-/// freshness timestamp and no capacity field: readiness is advisory and
-/// reserves nothing.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct SensedProvider {
-    /// The provider's node id.
-    pub provider: u64,
-    /// `Ready | Unknown | NotReady` for this exact interest.
-    pub readiness: ProjectedReadiness,
-    /// The provider's own time-to-start estimate, when it signed one.
-    pub estimated_start: Option<Duration>,
-    /// The capability generation the observation was made under.
-    /// `None` when there is no observation yet.
-    pub capability_generation: Option<u64>,
-}
-
-/// The exact-provider readiness projection for one interest over one
-/// authorized population.
-///
-/// Every list is a subset of the population the caller supplied.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct ExactProviderReadiness {
-    providers: Vec<SensedProvider>,
-    candidates: net::adapter::net::behavior::scheduler_bridge::SensedCandidates,
-}
-
-impl ExactProviderReadiness {
-    /// Every authorized provider's projection, ordered by node id.
-    pub fn providers(&self) -> &[SensedProvider] {
-        &self.providers
-    }
-
-    /// One provider's projection. `Unknown` for a provider outside the
-    /// authorized population — absence of authorization is never
-    /// evidence of unreadiness.
-    pub fn readiness(&self, provider: u64) -> ProjectedReadiness {
-        self.providers
-            .iter()
-            .find(|sensed| sensed.provider == provider)
-            .map_or(ProjectedReadiness::Unknown, |sensed| sensed.readiness)
-    }
-
-    /// Providers locally viable for this interest — `Ready` within the
-    /// supplied budget, ranked best-first by the existing core
-    /// economics.
-    pub fn viable(&self) -> &[u64] {
-        &self.candidates.viable
-    }
-
-    /// Providers with no viability verdict: `Unknown`, or `Ready`
-    /// outside the budget. Retained, never pruned — a route change can
-    /// make one viable.
-    pub fn potential(&self) -> &[u64] {
-        &self.candidates.potential
-    }
-
-    /// Providers sensed explicitly `NotReady` for THIS interest.
-    /// Pruned from this interest's selection only.
-    pub fn non_viable(&self) -> &[u64] {
-        &self.candidates.non_viable
-    }
-
-    /// The provider a call for this interest should target: the
-    /// best-ranked viable candidate. `None` when nothing is currently
-    /// viable — the caller falls back to its own deterministic choice
-    /// over [`Self::potential`], never to a failure.
-    pub fn best_provider(&self) -> Option<u64> {
-        self.candidates.selected_provider()
-    }
-
-    /// How many authorized providers this projection covers.
-    pub fn len(&self) -> usize {
-        self.providers.len()
-    }
-
-    /// Whether the authorized population was empty.
-    pub fn is_empty(&self) -> bool {
-        self.providers.is_empty()
+/// The capability name comes from the caller's own argument, never from
+/// the incumbent's registration — the core refusal deliberately carries
+/// no id, so a loser learns nothing it could use to evict a winner.
+fn install_refusal(
+    refusal: sensing::EvaluatorInstallRefusal,
+    capability_id: &CapabilityId,
+) -> SensingError {
+    match refusal {
+        sensing::EvaluatorInstallRefusal::Occupied => SensingError::AlreadyProviding {
+            capability: capability_id.as_str().to_string(),
+        },
+        sensing::EvaluatorInstallRefusal::IdentityExhausted => {
+            SensingError::RegistrationIdentityExhausted
+        }
     }
 }
 
@@ -496,15 +412,25 @@ impl ReadinessRegistration {
     /// evaluator reads at beat time, so an edge announced before the
     /// state is visible simply re-signs the old answer.
     ///
-    /// Returns whether any live observation path actually moved:
-    /// `false` when nothing is watching this capability, or once this
-    /// registration is closed. Inert after `close`, so a stale handle
-    /// cannot disturb its replacement's schedule.
+    /// Returns whether any live observation path actually moved.
+    /// `false` when nothing is watching this capability, and `false`
+    /// whenever this handle no longer owns the capability's readiness —
+    /// after its own `close`, and after a
+    /// [`SensingClient::provide_replacing`] superseded it even if this
+    /// handle is still open.
+    ///
+    /// Ownership is decided on the NODE, inside the same critical
+    /// section as registration, replacement, and removal — not by the
+    /// local `closed` flag, which cannot see a supersession it was never
+    /// told about. So there is no check-then-poke window: once a
+    /// replacement or close has returned, this handle can never move the
+    /// successor's schedule.
     pub fn changed(&self) -> bool {
         if self.closed.load(Ordering::Acquire) {
             return false;
         }
-        self.node.notify_sensing_state_changed(&self.capability_id)
+        self.node
+            .notify_sensing_state_changed_owned(&self.capability_id, self.registration_id)
     }
 
     /// Stop serving readiness for this capability.
@@ -514,13 +440,17 @@ impl ReadinessRegistration {
     /// drop, or a handle that was already superseded. Live watchers
     /// fall back to `Unknown` at their next beat; nothing fails.
     ///
-    /// Idempotence is *structural*, not enforced here: the core removal
-    /// is conditional on this handle's registration id, and an id is
-    /// never reused, so a second attempt could only ever find someone
-    /// else's row and refuse. The local flag earns its place for two
-    /// other reasons — it keeps the repeat path (drop always follows an
-    /// explicit close) off the node's map entirely, and it is the same
-    /// bit [`Self::changed`] reads to go inert.
+    /// Once this returns, a readiness result the removed evaluator was
+    /// already computing can no longer become the latest observation:
+    /// the node's removal and the emitter's publication share one
+    /// critical section.
+    ///
+    /// Idempotence is *structural*, not enforced by the local flag: the
+    /// core removal is conditional on this handle's registration id, and
+    /// an id is never issued twice, so a second attempt could only ever
+    /// find someone else's row and refuse. The flag earns its place by
+    /// keeping the repeat path (drop always follows an explicit close)
+    /// off the node entirely.
     pub fn close(&self) -> bool {
         if self
             .closed
@@ -563,13 +493,12 @@ mod tests {
         fn require<T: Send + Sync>() {}
         require::<ReadinessRegistration>();
         require::<SensingClient>();
-        require::<ExactProviderReadiness>();
-        require::<SensedProvider>();
         require::<SensingError>();
     }
 
     /// Refusals must be readable without a debugger — each carries the
-    /// action the caller has to take.
+    /// action the caller has to take, or says plainly that the state is
+    /// terminal.
     #[test]
     fn every_refusal_names_the_remedy() {
         assert!(SensingError::Disabled
@@ -578,27 +507,38 @@ mod tests {
         assert!(SensingError::IncarnationRequired
             .to_string()
             .contains("next_incarnation"));
+        assert!(SensingError::DurableIdentityRequired
+            .to_string()
+            .contains("MeshBuilder::identity"));
         assert!(SensingError::AlreadyProviding {
             capability: "gpu.infer".into(),
         }
         .to_string()
         .contains("gpu.infer"));
-        assert!(SensingError::ProviderFreeSelector {
-            selector: "AnyAuthorized",
-        }
-        .to_string()
-        .contains("AnyAuthorized"));
+        assert!(SensingError::RegistrationIdentityExhausted
+            .to_string()
+            .contains("exhausted"));
     }
 
+    /// The core refusal maps onto exactly one SDK refusal each, and the
+    /// capability name in the message comes from the CALLER's argument —
+    /// never from the incumbent, which would leak ownership information
+    /// to the loser.
     #[test]
-    fn provider_free_selectors_are_named_exactly() {
+    fn core_install_refusals_map_onto_distinct_sdk_refusals() {
+        let capability = CapabilityId::new("gpu.infer");
         assert_eq!(
-            provider_free_selector_name(&ProviderSelector::AnyAuthorized),
-            "AnyAuthorized",
+            install_refusal(sensing::EvaluatorInstallRefusal::Occupied, &capability),
+            SensingError::AlreadyProviding {
+                capability: "gpu.infer".to_string(),
+            },
         );
         assert_eq!(
-            provider_free_selector_name(&ProviderSelector::Tags(Vec::new())),
-            "Tags",
+            install_refusal(
+                sensing::EvaluatorInstallRefusal::IdentityExhausted,
+                &capability
+            ),
+            SensingError::RegistrationIdentityExhausted,
         );
     }
 
@@ -615,5 +555,86 @@ mod tests {
 
         let odd: CapabilityId = " Mixed.Case ".to_string().into();
         assert_eq!(odd.as_str(), " Mixed.Case ");
+    }
+
+    /// This module's public surface is provider lifecycle ONLY. The
+    /// projection vocabulary the earlier candidate exposed — interest
+    /// specs, audience-bearing types, provider selectors, result modes,
+    /// budgets, projected readiness — must stay out, and no readiness
+    /// projection may reappear here without a separate authorization.
+    ///
+    /// Non-vacuous by construction: it reads this module's own source,
+    /// so a re-export or a projection method fails it.
+    #[test]
+    fn the_public_surface_of_this_module_is_provider_lifecycle_only() {
+        let source = include_str!("sensing.rs");
+        // Only the re-export statements and item declarations, so prose
+        // and doc links that legitimately NAME a deferred concept do not
+        // trip the guard.
+        let declarations: String = source
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("pub use ") || line.starts_with("pub fn "))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for forbidden in [
+            "InterestSpec",
+            "AudienceScopeCommitment",
+            "ProviderSelector",
+            "ResultMode",
+            "DisclosureClass",
+            "ConsumerLatencyBudget",
+            "ProjectedReadiness",
+            "CanonicalConstraints",
+            "WorkLatencyEnvelope",
+            "SensedProvider",
+            "ExactProviderReadiness",
+            "exact_provider_readiness",
+        ] {
+            assert!(
+                !declarations.contains(forbidden),
+                "`{forbidden}` is back in the SDK sensing surface — exact-provider \
+                 acquisition and projection are deferred to S4, after \
+                 organization-audience exact leases are authorized",
+            );
+        }
+
+        // ...and the provider contract IS present, so the guard cannot
+        // pass by the module having been emptied.
+        for required in [
+            "ReadinessEvaluator",
+            "EvaluationRequest",
+            "ReadinessEvaluation",
+            "CapabilityId",
+            "Incarnation",
+        ] {
+            assert!(
+                declarations.contains(required),
+                "the provider contract item `{required}` is missing from the surface",
+            );
+        }
+    }
+
+    /// The ownership and state-edge witnesses in
+    /// `sdk/tests/sensing_provider.rs` are race and timing proofs: a
+    /// retry can only turn a real defect green. The nextest profile
+    /// grants two retries by default, so that binary MUST be in the
+    /// zero-retry override.
+    ///
+    /// Guards the config rather than trusting it, because the override is
+    /// a filter expression that fails silently when it stops matching.
+    #[test]
+    fn the_provider_witness_binary_is_excluded_from_retries() {
+        let config = include_str!("../../.config/nextest.toml");
+        let override_block = config
+            .split("[[profile.default.overrides]]")
+            .find(|block| block.contains("retries = 0"))
+            .expect("a zero-retry override block must exist");
+        assert!(
+            override_block.contains("binary(sensing_provider)"),
+            "sdk/tests/sensing_provider.rs must be in the zero-retry override — \
+             its ownership and state-edge witnesses must not be retried into green",
+        );
     }
 }
