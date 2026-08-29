@@ -241,7 +241,11 @@ Two independent reviews HELD that candidate on six blockers (capture atomicity
 against the writer's pre-publication window, whole-vector currentness across
 routing and grant authority, superseded negative derivations, a witness that
 executed no grant plane, an unauthorized public bridge surface, and one stale doc
-link); the additive repair is landed and likewise unsigned.
+link); the additive repair is landed and likewise unsigned. A second specification
+review then ACCEPTED that repair's concurrency/authority half and HELD two
+further blockers — one-acquisition evidence for the capture's store section, and
+a proof intent constructed before the final currentness comparison; both are
+repaired additively and remain unsigned.
 
 **Head tokens (corrected 2026-07-28).** The sign-off initially named `351f93480`
 as `SAFE_LIVE_HEAD`; that was withdrawn on review, since the token is reserved by
