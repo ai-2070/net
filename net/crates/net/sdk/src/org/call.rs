@@ -931,12 +931,15 @@ impl OrgClient {
 /// on the substrate's frozen value.
 const DEFAULT_PROOF_TTL_SECS: u64 = net::adapter::net::behavior::org_call::MAX_ORG_PROOF_TTL_SECS;
 
-/// Test-only: proof intents constructed on THIS thread.
-///
-/// Thread-local rather than global: the witnesses run their attempts inline on
-/// the test's own thread, so a per-thread count is exact and cannot be raced by
-/// a sibling test. It exists to make "no intent is constructed under a superseded
-/// capture" observable instead of merely stated (independent review F2).
+// Test-only: proof intents constructed on THIS thread.
+//
+// Plain comments, not `///`: rustdoc cannot document a macro invocation, so a
+// doc comment here is `unused_doc_comments` under `-D warnings`.
+//
+// Thread-local rather than global: the witnesses run their attempts inline on
+// the test's own thread, so a per-thread count is exact and cannot be raced by
+// a sibling test. It exists to make "no intent is constructed under a superseded
+// capture" observable instead of merely stated (independent review F2).
 #[cfg(test)]
 thread_local! {
     static INTENTS_CONSTRUCTED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
