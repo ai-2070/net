@@ -172,7 +172,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           set -o pipefail
-          MIN=86
+          MIN=91
           out=$(cargo test --lib --features "$UNIT_FEATURES" \
                   org_routing_wiring_tests 2>&1 | tee /dev/stderr)
           n=$(printf '%s\n' "$out" \
@@ -248,7 +248,12 @@ jobs:
           a_projection_and_its_generation_are_never_observed_torn
           a_peer_snapshot_retains_no_shard_and_drops_the_ingress_peer
           a_peer_replaced_after_revalidation_cannot_publish_its_old_session
-          the_announce_lock_is_acquired_under_a_bound_and_refuses_past_it"
+          the_announce_lock_is_acquired_under_a_bound_and_refuses_past_it
+          a_cold_capture_holds_one_store_section_across_every_plane
+          an_authority_install_inside_a_cold_capture_is_never_captured_across
+          an_unadopted_node_refuses_the_cold_capture
+          a_spent_authority_epoch_refuses_the_cold_capture
+          a_captured_stamp_compares_the_revocation_floor_generation"
           for required in $REQUIRED; do
             if ! printf "%s" "$out" | grep -q "$required"; then
               echo "::error::required routing witness missing: $required"

@@ -226,6 +226,18 @@ OLB-2C authority-publication half — are SIGNED by Kyra (2026-07-27) at
 [`OLB_2B_CONSUMER_ENTRY_DESIGN.md`](OLB_2B_CONSUMER_ENTRY_DESIGN.md) for the
 frozen boundary it must preserve.
 
+Within OLB-2B.3: `2B.3c-pre` is SIGNED at `2aa6431ed`, `2B.3b` at `5524bbc25`,
+and `2B.3a` at `fd05a89ba`. `2B.3c` step 1 was accepted and its lineage merged;
+step 2 is landed on master (`04a21d0b4`) and NOT SIGNED. **`2B.3d-pre` step 1 —
+the coherent current-authority cold plan — is IMPLEMENTED at a candidate and NOT
+SIGNED**, entered on the user's explicit direction while step 2 is unsigned; its
+record is
+[`OLB_2B3B_WARMED_CALL_BOUNDARY_DESIGN.md`](OLB_2B3B_WARMED_CALL_BOUNDARY_DESIGN.md)
+§19. It changes no wire format, no public error vocabulary and no call surface:
+the cold path now derives from ONE captured observation of private-discovery
+authority and refuses to mint a proof under an identity that moved.
+`OrgCapabilityRegistration` remains dark and LS-1..LS-6 remain unbuilt.
+
 **Head tokens (corrected 2026-07-28).** The sign-off initially named `351f93480`
 as `SAFE_LIVE_HEAD`; that was withdrawn on review, since the token is reserved by
 this plan (below) and twice by

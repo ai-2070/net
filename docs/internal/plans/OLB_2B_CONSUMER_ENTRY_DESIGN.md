@@ -332,7 +332,7 @@ Application and bounds:
 |---|---|
 | **2B-entry** | §5 boundary: drain ownership + lease + supervisor + fencing + minimal registry + bounded application. |
 | **2B.2** | Coherent `OrgAuthorityEpoch` publication + mandatory per-call comparison before proof/send. **Publication half LANDED as OLB-2C** (see below); the per-call comparison waits on 2B.3's warmed route set, which is the thing there would be to compare. |
-| **2B.3** | `ArcSwap`-published generation-stamped `OrgRouteSet` + publish-if-current + warmed-call consumption. **2B.3a SIGNED** at `fd05a89ba` (the publication cell only — explicitly NOT a claim that `SlotBaseFacts` is the route set). Re-sliced into **2B.3c-pre / 2B.3b / 2B.3c / 2B.3d-pre / 2B.3d**; revision-5 design under review at [`OLB_2B3B_WARMED_CALL_BOUNDARY_DESIGN.md`](OLB_2B3B_WARMED_CALL_BOUNDARY_DESIGN.md). Implementation NOT authorized. |
+| **2B.3** | `ArcSwap`-published generation-stamped `OrgRouteSet` + publish-if-current + warmed-call consumption. **2B.3a SIGNED** at `fd05a89ba`; **2B.3c-pre SIGNED** at `2aa6431ed`; **2B.3b SIGNED** at `5524bbc25`; **2B.3c** step 1 accepted, step 2 landed and unsigned; **2B.3d-pre step 1 implemented at a candidate, unsigned** — see [`OLB_2B3B_WARMED_CALL_BOUNDARY_DESIGN.md`](OLB_2B3B_WARMED_CALL_BOUNDARY_DESIGN.md) §19. Design at revision 6 in that document. |
 | **2B.4** | Exact-provider lease acquire/release on route-slot lifecycle + node-global ttl/2 refresh owner (first holder arms, last disarms). |
 | **2B.5** | `sensed_candidates` join + §8 classification + granted-candidates-Unknown, inside the actor, never on the request path. |
 
