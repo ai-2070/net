@@ -77,9 +77,11 @@ impl OrgClient {
     /// one. Uses the installed authority's skew tolerance, so it agrees with
     /// the provider's own window arithmetic.
     pub fn check_current(&self) -> Result<(), OrgCredentialError> {
-        // `is_valid_with_skew` samples the canonical wall clock the credential
-        // family uses; taking our own `SystemTime` here would be a second clock
-        // that could disagree with the one the windows were minted against.
+        // `current_timestamp` is the canonical wall clock the credential family
+        // uses; taking our own `SystemTime` here would be a second clock that
+        // could disagree with the one the windows were minted against. A call
+        // arriving through `plan` uses its capture's instant instead — see
+        // [`Self::check_current_at`].
         self.membership
             .is_valid_with_skew(self.skew_secs)
             .map_err(|source| OrgCredentialError::NotCurrentlyValid {
@@ -88,6 +90,31 @@ impl OrgClient {
             })?;
         self.dispatcher
             .is_valid_with_skew(self.skew_secs)
+            .map_err(|source| OrgCredentialError::NotCurrentlyValid {
+                credential: "dispatcher grant".to_string(),
+                source,
+            })?;
+        Ok(())
+    }
+
+    /// [`Self::check_current`] at the cold plan's CAPTURED instant
+    /// (OLB-2B.3d-pre).
+    ///
+    /// Every call goes through here rather than through the sampling twin: two
+    /// independent clock samples let a plan pass the membership window at one
+    /// instant and the dispatcher window at another, so a credential set that
+    /// was never simultaneously valid could authorize a call. One captured
+    /// instant makes that unrepresentable, and it is the SAME instant the grant
+    /// windows, the discovery filters and the expiry checks use.
+    pub(crate) fn check_current_at(&self, now_secs: u64) -> Result<(), OrgCredentialError> {
+        self.membership
+            .is_valid_at_with_skew(now_secs, self.skew_secs)
+            .map_err(|source| OrgCredentialError::NotCurrentlyValid {
+                credential: "membership".to_string(),
+                source,
+            })?;
+        self.dispatcher
+            .is_valid_at_with_skew(now_secs, self.skew_secs)
             .map_err(|source| OrgCredentialError::NotCurrentlyValid {
                 credential: "dispatcher grant".to_string(),
                 source,
