@@ -1,22 +1,35 @@
 //! Rust SDK integration witnesses for the S1 provider slice
 //! (`docs/internal/plans/CAPABILITY_SENSING_SDK_INTEGRATION_PLAN.md`
-//! §4.4/§4.2, §6 witnesses 14–17).
+//! §4.4, §4.5, §6 witnesses 14–16).
 //!
 //! Exercises `sdk/src/sensing.rs` against real `Mesh`es: the loud
-//! refusals, ownership-safe `provide` / `close` / drop, state-edge
-//! notification through the live observation path, and the
-//! exact-provider projection's population clamp.
+//! configuration refusals, ownership-safe `provide` / `close` / drop,
+//! state-edge notification through the live observation path, the
+//! publication fence that stops a superseded evaluation from becoming
+//! the latest observation, and the terminal registration-identity
+//! exhaustion state.
+//!
+//! There are deliberately NO projection witnesses: this slice ships no
+//! projection. See the module docs for why exact-provider acquisition
+//! and projection are deferred to S4.
 //!
 //! Every critical case here is an INVERSE witness — it fails against a
 //! specific wrong implementation, named in the test's doc comment.
 //!
-//! The state-edge and retained-observation tests use the SELF-PROVIDER
-//! path: one node registers an exact-provider interest in itself, so it
-//! is both origin and consumer. That keeps the whole attestation +
-//! continuity pipeline live (`MeshNode` feeds its own emitter with no
-//! wire hop) while staying deterministic — no second node, no delivery
-//! scheduling, no fleet-root configuration the SDK deliberately does
-//! not expose.
+//! Most tests use the SELF-PROVIDER path: one node registers an
+//! exact-provider interest in itself, so it is both origin and
+//! consumer. That keeps the whole attestation + continuity pipeline live
+//! (`MeshNode` feeds its own emitter with no wire hop) while staying
+//! deterministic — no second node, no delivery scheduling, and no
+//! fleet-root configuration the SDK deliberately does not expose.
+//!
+//! The fence witnesses need the emitter to sit inside user code while
+//! the test moves ownership, so they run on a multi-thread runtime: the
+//! blocking evaluator parks a worker thread by design.
+//!
+//! This binary is in the `retries = 0` override in
+//! `net/crates/net/.config/nextest.toml`. These are race and timing
+//! proofs; a retry could only turn a real defect green.
 
 #![cfg(feature = "net")]
 
@@ -25,13 +38,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use net::adapter::net::behavior::sensing::{
-    CanonicalConstraints, DisclosureClass, InterestSpec, ProviderInterestKey, ProviderSelector,
-    ResultMode, WorkLatencyEnvelope,
+    CanonicalConstraints, DisclosureClass, InterestSpec, ProjectedReadiness, ProviderInterestKey,
+    ProviderSelector, ResultMode, SensingCounters, WorkLatencyEnvelope,
 };
+use net_sdk::identity::Identity;
 use net_sdk::mesh::{Mesh, MeshBuilder};
 use net_sdk::sensing::{
-    CapabilityId, ConsumerLatencyBudget, EvaluationRequest, Incarnation, ProjectedReadiness,
-    ReadinessEvaluation, ReadinessEvaluator, SensingError,
+    CapabilityId, EvaluationRequest, Incarnation, ReadinessEvaluation, ReadinessEvaluator,
+    SensingError,
 };
 
 const PSK: [u8; 32] = [0x5cu8; 32];
@@ -55,6 +69,10 @@ const OTHER_CAPABILITY: &str = "print.document";
 const D: Duration = Duration::from_secs(20);
 const TTL: Duration = Duration::from_secs(30);
 const POLL: Duration = Duration::from_secs(5);
+/// How long a "this must NOT happen" assertion waits before concluding
+/// the thing genuinely did not happen. Only ever used after a positive
+/// signal proves the code under test already reached the decision point.
+const SETTLE: Duration = Duration::from_millis(600);
 
 /// Reports whatever its backing flag currently says, and counts calls
 /// so a test can prove the evaluator was re-run rather than a cached
@@ -99,10 +117,71 @@ impl ReadinessEvaluator for AlwaysNotReady {
     }
 }
 
-async fn mesh_with(enable_sensing: bool, incarnation: Option<Incarnation>) -> Mesh {
+/// Parks inside `evaluate` until released, so a test can hold a
+/// readiness evaluation IN FLIGHT while it moves ownership out from
+/// under it.
+///
+/// Spins rather than blocking on a channel so it works on any runtime
+/// flavor; the tests that use it request extra worker threads because
+/// this deliberately occupies one.
+struct BlockingEvaluator {
+    entered: Arc<AtomicBool>,
+    release: Arc<AtomicBool>,
+    returned: Arc<AtomicBool>,
+}
+
+struct BlockingHandles {
+    entered: Arc<AtomicBool>,
+    release: Arc<AtomicBool>,
+    returned: Arc<AtomicBool>,
+}
+
+impl BlockingEvaluator {
+    fn new() -> (BlockingHandles, Arc<Self>) {
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let returned = Arc::new(AtomicBool::new(false));
+        (
+            BlockingHandles {
+                entered: entered.clone(),
+                release: release.clone(),
+                returned: returned.clone(),
+            },
+            Arc::new(Self {
+                entered,
+                release,
+                returned,
+            }),
+        )
+    }
+}
+
+impl ReadinessEvaluator for BlockingEvaluator {
+    fn evaluate(&self, _request: &EvaluationRequest<'_>) -> ReadinessEvaluation {
+        self.entered.store(true, Ordering::Release);
+        while !self.release.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        self.returned.store(true, Ordering::Release);
+        // Ready is the dangerous verdict: if the fence leaks, a stale
+        // Ready is what would wrongly become the latest observation.
+        ReadinessEvaluation::Ready {
+            estimated_start: Some(Duration::from_millis(1)),
+        }
+    }
+}
+
+async fn mesh_with(
+    enable_sensing: bool,
+    durable_identity: bool,
+    incarnation: Option<Incarnation>,
+) -> Mesh {
     let mut builder = MeshBuilder::new("127.0.0.1:0", &PSK).expect("bind addr");
     if enable_sensing {
         builder = builder.enable_sensing();
+    }
+    if durable_identity {
+        builder = builder.identity(Identity::generate());
     }
     if let Some(incarnation) = incarnation {
         builder = builder.sensing_incarnation(incarnation);
@@ -110,15 +189,18 @@ async fn mesh_with(enable_sensing: bool, incarnation: Option<Incarnation>) -> Me
     builder.build().await.expect("build mesh")
 }
 
-/// A sensing-enabled ORIGIN: the plane is on and a persisted epoch was
-/// supplied, so this node can sign readiness for itself.
+/// A sensing-enabled ORIGIN: the plane is on, the identity is durable,
+/// and a persisted epoch was supplied, so this node can sign readiness
+/// for itself.
 async fn origin_mesh() -> Mesh {
-    mesh_with(true, Some(Incarnation::new(1))).await
+    mesh_with(true, true, Some(Incarnation::new(1))).await
 }
 
 /// An exactly addressed interest in `provider`, scoped to this node's
-/// own audience.
-fn exact_spec(mesh: &Mesh, capability: &str, provider: u64) -> InterestSpec {
+/// own audience. Built from core types on purpose: driving the
+/// observation path is a TEST concern, and the SDK deliberately exposes
+/// no interest vocabulary.
+fn self_interest(mesh: &Mesh, capability: &str, provider: u64) -> InterestSpec {
     InterestSpec {
         capability_id: CapabilityId::new(capability),
         constraints: CanonicalConstraints::from_entries([("model", "llama-70b")])
@@ -129,12 +211,6 @@ fn exact_spec(mesh: &Mesh, capability: &str, provider: u64) -> InterestSpec {
         disclosure_class: DisclosureClass::Owner,
         audience: mesh.inner().sensing_local_root(),
     }
-}
-
-/// A budget that admits everything — the tests here are about
-/// readiness, not about route economics.
-fn budget() -> ConsumerLatencyBudget {
-    ConsumerLatencyBudget::default()
 }
 
 async fn poll_until<F: FnMut() -> bool>(limit: Duration, mut check: F) -> bool {
@@ -155,7 +231,7 @@ async fn poll_until<F: FnMut() -> bool>(limit: Duration, mut check: F) -> bool {
 /// Returns the branch key the projection is read under.
 async fn watch_self(mesh: &Mesh, capability: &str) -> ProviderInterestKey {
     let own_id = mesh.inner().node_id();
-    let spec = exact_spec(mesh, capability, own_id);
+    let spec = self_interest(mesh, capability, own_id);
     mesh.inner().start();
     mesh.inner()
         .register_sensing_interest(&spec, own_id, D, TTL)
@@ -163,8 +239,12 @@ async fn watch_self(mesh: &Mesh, capability: &str) -> ProviderInterestKey {
     ProviderInterestKey::new(spec.key(), own_id)
 }
 
+fn attestations_emitted(mesh: &Mesh) -> u64 {
+    SensingCounters::get(&mesh.inner().sensing_counters().attestations_emitted)
+}
+
 // ---------------------------------------------------------------------
-// Loud refusals (§6 witness 14)
+// Loud configuration refusals (§4.5, §6 witness 14)
 // ---------------------------------------------------------------------
 
 /// **Inverse witness: a missing incarnation silently accepted.**
@@ -174,14 +254,16 @@ async fn watch_self(mesh: &Mesh, capability: &str) -> ProviderInterestKey {
 /// believing it is publishing readiness on a node that can never sign.
 #[tokio::test]
 async fn provide_without_a_persisted_incarnation_fails_loudly() {
-    let mesh = mesh_with(true, None).await;
+    let mesh = mesh_with(true, true, None).await;
     assert!(
         !mesh.inner().sensing_origin_active(),
         "no incarnation must leave the origin role dark",
     );
 
     let (_ready, _evaluations, evaluator) = FlagEvaluator::pair();
-    let client = mesh.sensing().expect("sensing enabled");
+    let client = mesh
+        .sensing()
+        .expect("sensing enabled with a durable identity");
     assert_eq!(
         client
             .provide(CapabilityId::new(CAPABILITY), evaluator)
@@ -202,7 +284,7 @@ async fn provide_without_a_persisted_incarnation_fails_loudly() {
 /// way around the fail-closed origin gate.
 #[tokio::test]
 async fn provide_replacing_without_an_incarnation_fails_loudly_too() {
-    let mesh = mesh_with(true, None).await;
+    let mesh = mesh_with(true, true, None).await;
     let client = mesh.sensing().expect("sensing enabled");
     assert_eq!(
         client
@@ -210,13 +292,35 @@ async fn provide_replacing_without_an_incarnation_fails_loudly_too() {
             .err(),
         Some(SensingError::IncarnationRequired),
     );
+    assert_eq!(mesh.inner().sensing_evaluator_count(), 0);
 }
 
 /// The plane ships dark: no `SensingClient` at all until it is enabled.
 #[tokio::test]
 async fn the_sensing_surface_is_refused_while_the_plane_is_disabled() {
-    let mesh = mesh_with(false, Some(Incarnation::new(1))).await;
+    let mesh = mesh_with(false, true, Some(Incarnation::new(1))).await;
     assert_eq!(mesh.sensing().err(), Some(SensingError::Disabled));
+}
+
+/// **Inverse witness: an ephemeral-identity node accepted as a
+/// provider.**
+///
+/// A provider signs its attestations with the node's entity key. On a
+/// generated keypair every restart changes that key, so the consumer's
+/// trust-on-first-use pin breaks and the persisted incarnation — whose
+/// entire purpose is making restarts orderable — is meaningless. Refused
+/// at `sensing()`, before any registration can exist.
+#[tokio::test]
+async fn the_sensing_surface_is_refused_without_a_durable_node_identity() {
+    let mesh = mesh_with(true, false, Some(Incarnation::new(1))).await;
+    assert!(
+        mesh.inner().sensing_origin_active(),
+        "the plane and epoch are configured — identity is the only thing missing",
+    );
+    assert_eq!(
+        mesh.sensing().err(),
+        Some(SensingError::DurableIdentityRequired),
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -243,6 +347,7 @@ async fn a_second_provide_for_one_capability_is_refused_and_the_incumbent_surviv
             capability: CAPABILITY.to_string(),
         }),
     );
+    assert_eq!(mesh.inner().sensing_evaluator_count(), 1);
 
     // The incumbent — not the rejected rival — is what a beat runs.
     let branch = watch_self(&mesh, CAPABILITY).await;
@@ -282,9 +387,14 @@ async fn dropping_a_superseded_handle_cannot_remove_its_replacement() {
     // drop is likewise inert.
     assert!(
         !old.close(),
-        "a superseded handle must not report a removal",
+        "a superseded handle must not report a removal"
     );
     drop(old);
+    assert_eq!(
+        mesh.inner().sensing_evaluator_count(),
+        1,
+        "the replacement must still be installed",
+    );
 
     // The replacement is still the one that answers beats: NotReady
     // (marker 99), and the superseded evaluator never runs again.
@@ -348,7 +458,149 @@ async fn close_removes_exactly_this_registration_and_is_idempotent() {
 }
 
 // ---------------------------------------------------------------------
-// State-edge notification (§6 witness 15)
+// The publication fence (H1)
+// ---------------------------------------------------------------------
+
+/// **Inverse witness: an in-flight evaluation publishing after its
+/// registration was REPLACED.**
+///
+/// The evaluator is held inside `evaluate` with a `Ready` verdict
+/// pending. While it is parked there, the replacement completes. When
+/// the old evaluation is released, its `Ready` must not become the
+/// latest observation — exactly one attestation may ever be published
+/// for this branch, and it must be the successor's `NotReady`.
+///
+/// Fails against: signing and applying without revalidating ownership;
+/// revalidating by capability rather than by registration id; testing
+/// currentness and then publishing outside the section.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_evaluation_in_flight_cannot_publish_after_its_replacement_completes() {
+    let mesh = origin_mesh().await;
+    let client = mesh.sensing().expect("sensing enabled");
+    let (blocking, evaluator) = BlockingEvaluator::new();
+
+    let old = client
+        .provide(CapabilityId::new(CAPABILITY), evaluator)
+        .expect("provide");
+    let branch = watch_self(&mesh, CAPABILITY).await;
+
+    // The emitter is now parked inside the user evaluator.
+    assert!(
+        poll_until(POLL, || blocking.entered.load(Ordering::Acquire)).await,
+        "the evaluator never ran, so nothing is in flight to fence",
+    );
+    assert_eq!(
+        attestations_emitted(&mesh),
+        0,
+        "nothing may be published while the evaluation is still in flight",
+    );
+
+    // Ownership moves while that evaluation is parked. This must not
+    // block on the evaluator: the registry's commit section is entered
+    // only AFTER user code returns.
+    let new = client
+        .provide_replacing(CapabilityId::new(CAPABILITY), Arc::new(AlwaysNotReady))
+        .expect("replacement completes while the old evaluation is in flight");
+    assert!(!old.close(), "the superseded handle owns nothing");
+
+    // Release the stale evaluation and let it try to commit.
+    blocking.release.store(true, Ordering::Release);
+    assert!(
+        poll_until(POLL, || blocking.returned.load(Ordering::Acquire)).await,
+        "the parked evaluation never returned",
+    );
+    tokio::time::sleep(SETTLE).await;
+
+    assert_eq!(
+        attestations_emitted(&mesh),
+        0,
+        "the superseded evaluation published anyway — the fence leaked",
+    );
+    assert!(
+        mesh.inner().sensing_latest_attestation(&branch).is_none(),
+        "a stale Ready reached the wire cache",
+    );
+    assert_eq!(
+        mesh.inner().sensing_projected(&branch),
+        ProjectedReadiness::Unknown,
+        "a stale Ready reached the local projection",
+    );
+
+    // The successor still works, and its beat is the FIRST publication.
+    assert!(new.changed(), "the successor owns the schedule");
+    assert!(
+        poll_until(POLL, || mesh.inner().sensing_projected(&branch)
+            == ProjectedReadiness::NotReady)
+        .await,
+        "the successor never published",
+    );
+    assert_eq!(
+        attestations_emitted(&mesh),
+        1,
+        "exactly one attestation — the successor's — may ever have been published",
+    );
+
+    assert!(new.close());
+}
+
+/// **Inverse witness: an in-flight evaluation publishing after its
+/// registration was CLOSED.**
+///
+/// Same fence, the other ownership edge. After `close` returns, the
+/// parked `Ready` must never become the latest observation and no
+/// attestation may be published at all.
+///
+/// Fails against: the same three wrong implementations as the
+/// replacement witness.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_evaluation_in_flight_cannot_publish_after_its_close_completes() {
+    let mesh = origin_mesh().await;
+    let client = mesh.sensing().expect("sensing enabled");
+    let (blocking, evaluator) = BlockingEvaluator::new();
+
+    let registration = client
+        .provide(CapabilityId::new(CAPABILITY), evaluator)
+        .expect("provide");
+    let branch = watch_self(&mesh, CAPABILITY).await;
+
+    assert!(
+        poll_until(POLL, || blocking.entered.load(Ordering::Acquire)).await,
+        "the evaluator never ran, so nothing is in flight to fence",
+    );
+
+    // Close while the evaluation is parked. This must complete without
+    // waiting on user code.
+    assert!(
+        registration.close(),
+        "close must succeed while an evaluation is in flight",
+    );
+    assert_eq!(mesh.inner().sensing_evaluator_count(), 0);
+
+    blocking.release.store(true, Ordering::Release);
+    assert!(
+        poll_until(POLL, || blocking.returned.load(Ordering::Acquire)).await,
+        "the parked evaluation never returned",
+    );
+    tokio::time::sleep(SETTLE).await;
+
+    assert_eq!(
+        attestations_emitted(&mesh),
+        0,
+        "a closed registration's evaluation published anyway — the fence leaked",
+    );
+    assert!(
+        mesh.inner().sensing_latest_attestation(&branch).is_none(),
+        "a closed registration's Ready reached the wire cache",
+    );
+    assert_eq!(
+        mesh.inner().sensing_projected(&branch),
+        ProjectedReadiness::Unknown,
+        "a closed registration's Ready reached the local projection",
+    );
+}
+
+// ---------------------------------------------------------------------
+// State-edge notification (H2, §6 witness 15)
 // ---------------------------------------------------------------------
 
 /// **Inverse witness: a `changed` notification that does not reach the
@@ -389,7 +641,7 @@ async fn a_state_edge_notification_advances_the_exact_observation_path() {
     // Publish the new state. The next scheduled beat is ~10 s out, so
     // nothing may change until the edge is announced.
     ready.store(false, Ordering::Relaxed);
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    tokio::time::sleep(SETTLE).await;
     assert_eq!(
         mesh.inner().sensing_projected(&branch),
         ProjectedReadiness::Ready,
@@ -428,8 +680,8 @@ async fn a_state_edge_notification_advances_the_exact_observation_path() {
 /// false" is trivially satisfiable whenever the node happens to have
 /// nothing to move. The stale handle is asked FIRST and its successor
 /// SECOND, and the witness demands `successor moved && !stale moved` in
-/// one iteration. A `changed()` that ignored the closed flag would poke
-/// the node from the stale handle, consume the movement, and leave the
+/// one iteration. A `changed()` that ignored ownership would poke the
+/// node from the stale handle, consume the movement, and leave the
 /// successor with nothing — so the conjunction can never hold.
 ///
 /// Fails against: `changed()` that pokes nothing; `changed()` that
@@ -475,263 +727,133 @@ async fn changed_is_false_when_nothing_is_watching_and_inert_once_closed() {
     assert!(successor.close());
 }
 
-// ---------------------------------------------------------------------
-// Exact-provider projection (§6 witnesses 6, 13, 17)
-// ---------------------------------------------------------------------
-
-/// **Inverse witness: a provider outside the supplied population
-/// admitted.**
+/// **Inverse witness: a SUPERSEDED-BUT-OPEN handle poking its
+/// successor's schedule.**
 ///
-/// The node holds a real retained observation for ITSELF, yet a
-/// projection over a population that excludes it must not report it —
-/// not as Ready, not as potential, not at all. An implementation that
-/// enumerated observations and then filtered (or forgot to) would leak
-/// the self observation here.
+/// The previous witness closes the stale handle first, so a `changed()`
+/// gated only on the local `closed` bit would still pass it. Here the
+/// old handle is never closed — it is simply no longer the owner. A
+/// `changed()` that consults only its own flag cannot tell, and would
+/// poke.
+///
+/// Fails against: `changed()` gated on a handle-local `closed` bit
+/// rather than on node-side ownership.
 #[tokio::test]
-async fn the_authorized_population_is_a_hard_upper_bound() {
+async fn a_superseded_but_open_handle_cannot_move_its_successors_schedule() {
     let mesh = origin_mesh().await;
     let client = mesh.sensing().expect("sensing enabled");
     let (_ready, _evaluations, evaluator) = FlagEvaluator::pair();
-    let registration = client
+
+    let superseded = client
         .provide(CapabilityId::new(CAPABILITY), evaluator)
         .expect("provide");
-
-    let own_id = mesh.inner().node_id();
-    let branch = watch_self(&mesh, CAPABILITY).await;
+    let _branch = watch_self(&mesh, CAPABILITY).await;
     assert!(
-        poll_until(POLL, || mesh.inner().sensing_projected(&branch)
-            == ProjectedReadiness::Ready)
+        poll_until(POLL, || superseded.changed()).await,
+        "the original owner must be able to move the schedule",
+    );
+
+    // Supersede it, WITHOUT closing the old handle.
+    let successor = client
+        .provide_replacing(CapabilityId::new(CAPABILITY), Arc::new(AlwaysNotReady))
+        .expect("explicit replacement");
+
+    assert!(
+        poll_until(POLL, || {
+            let superseded_moved = superseded.changed();
+            let successor_moved = successor.changed();
+            successor_moved && !superseded_moved
+        })
         .await,
-        "the self observation never established",
+        "a superseded-but-open handle moved a schedule it no longer owns",
     );
 
-    let spec = exact_spec(&mesh, CAPABILITY, own_id);
-    let stranger = own_id.wrapping_add(1);
+    // And it stays inert — this is not a one-shot transition.
+    assert!(!superseded.changed());
+    assert!(!superseded.changed());
 
-    // Population excludes the observed provider entirely.
-    let clamped = client
-        .exact_provider_readiness(&spec, &budget(), &[stranger])
-        .expect("exact projection");
-    assert_eq!(clamped.len(), 1);
-    assert_eq!(clamped.providers()[0].provider, stranger);
-    assert!(
-        !clamped.viable().contains(&own_id)
-            && !clamped.potential().contains(&own_id)
-            && !clamped.non_viable().contains(&own_id),
-        "a retained observation outside the population escaped the clamp",
-    );
-    assert_eq!(clamped.readiness(own_id), ProjectedReadiness::Unknown);
-
-    // Including it surfaces the same observation — the clamp filters,
-    // it does not suppress.
-    let admitted = client
-        .exact_provider_readiness(&spec, &budget(), &[own_id, stranger])
-        .expect("exact projection");
-    assert_eq!(admitted.readiness(own_id), ProjectedReadiness::Ready);
-    assert_eq!(admitted.viable(), &[own_id]);
-    assert_eq!(admitted.best_provider(), Some(own_id));
-
-    assert!(registration.close());
+    assert!(successor.close());
+    // The superseded handle's own drop is still inert.
+    drop(superseded);
+    assert_eq!(mesh.inner().sensing_evaluator_count(), 0);
 }
 
-/// **Inverse witness: an unsupported / evaluator-free provider marked
-/// Ready or NotReady.**
+// ---------------------------------------------------------------------
+// Registration-identity exhaustion (H3)
+// ---------------------------------------------------------------------
+
+/// **Inverse witness: id exhaustion wrapping and aliasing stale
+/// tokens.**
 ///
-/// A provider with no observation — the "targeted but cannot answer"
-/// and "not yet observed" cases — projects `Unknown` and stays
-/// `potential`. Neither a `Ready` claim nor a global `NotReady` is
-/// honest here: absence of evidence never prunes.
+/// The last issuable identity still installs; past it, every install is
+/// refused with a typed terminal error, the incumbent keeps serving, and
+/// removal still works. A wrapping allocator would keep returning `Ok`
+/// here and would eventually reissue an id a closed handle still holds.
 #[tokio::test]
-async fn providers_without_an_observation_project_unknown_and_stay_potential() {
+async fn provide_is_terminally_refused_once_registration_identities_are_exhausted() {
     let mesh = origin_mesh().await;
     let client = mesh.sensing().expect("sensing enabled");
-    let own_id = mesh.inner().node_id();
 
-    // No evaluator installed for this capability at all, and no watch.
-    let spec = exact_spec(&mesh, OTHER_CAPABILITY, own_id);
-    let population = [own_id, own_id.wrapping_add(1), own_id.wrapping_add(2)];
-
-    let projection = client
-        .exact_provider_readiness(&spec, &budget(), &population)
-        .expect("exact projection");
-
-    assert_eq!(projection.len(), 3);
-    for sensed in projection.providers() {
-        assert_eq!(
-            sensed.readiness,
-            ProjectedReadiness::Unknown,
-            "provider {} must be Unknown, not Ready or NotReady",
-            sensed.provider,
-        );
-        assert_eq!(sensed.estimated_start, None);
-        assert_eq!(sensed.capability_generation, None);
-    }
-    assert!(projection.viable().is_empty(), "nothing may be viable");
-    assert!(
-        projection.non_viable().is_empty(),
-        "an unobserved provider must never be pruned as NotReady",
+    // One below the boundary: the last identity is still issuable.
+    mesh.inner().set_sensing_evaluator_next_id_for_test(
+        net::adapter::net::MeshNode::sensing_max_registration_id_for_test(),
     );
-    assert_eq!(projection.potential().len(), 3);
-    assert_eq!(
-        projection.best_provider(),
-        None,
-        "no viable provider means no selection, not an arbitrary one",
-    );
-}
+    assert!(!mesh.inner().sensing_evaluator_identities_exhausted());
 
-/// **Inverse witness: an exact NotReady pruning more than its own
-/// interest.**
-///
-/// The provider answers NotReady for the watched interest. That
-/// interest's candidate is pruned; a DIFFERENT interest on the same
-/// provider is untouched and stays Unknown/potential.
-#[tokio::test]
-async fn an_exact_not_ready_prunes_only_that_interest() {
-    let mesh = origin_mesh().await;
-    let client = mesh.sensing().expect("sensing enabled");
-    let (ready, _evaluations, evaluator) = FlagEvaluator::pair();
-    ready.store(false, Ordering::Relaxed);
-    let registration = client
-        .provide(CapabilityId::new(CAPABILITY), evaluator)
-        .expect("provide");
+    let last = client
+        .provide(CapabilityId::new(CAPABILITY), Arc::new(AlwaysNotReady))
+        .expect("the last issuable identity installs");
+    assert!(mesh.inner().sensing_evaluator_identities_exhausted());
 
-    let own_id = mesh.inner().node_id();
-    let branch = watch_self(&mesh, CAPABILITY).await;
-    assert!(
-        poll_until(POLL, || mesh.inner().sensing_projected(&branch)
-            == ProjectedReadiness::NotReady)
-        .await,
-        "the NotReady observation never arrived",
-    );
-
-    let watched = exact_spec(&mesh, CAPABILITY, own_id);
-    let pruned = client
-        .exact_provider_readiness(&watched, &budget(), &[own_id])
-        .expect("exact projection");
-    assert_eq!(pruned.readiness(own_id), ProjectedReadiness::NotReady);
-    assert_eq!(pruned.non_viable(), &[own_id]);
-    assert!(pruned.viable().is_empty());
-    assert_eq!(pruned.best_provider(), None);
-
-    // A different capability on the SAME provider is unaffected.
-    let unrelated = exact_spec(&mesh, OTHER_CAPABILITY, own_id);
-    let untouched = client
-        .exact_provider_readiness(&unrelated, &budget(), &[own_id])
-        .expect("exact projection");
-    assert_eq!(untouched.readiness(own_id), ProjectedReadiness::Unknown);
-    assert_eq!(untouched.potential(), &[own_id]);
-    assert!(
-        untouched.non_viable().is_empty(),
-        "one interest's NotReady must not prune another interest",
-    );
-
-    assert!(registration.close());
-}
-
-/// Duplicates in the supplied population collapse to one projection —
-/// a caller's sloppy candidate list cannot inflate the classification
-/// lists or double-count a provider.
-#[tokio::test]
-async fn duplicate_providers_in_the_population_collapse_to_one_projection() {
-    let mesh = origin_mesh().await;
-    let client = mesh.sensing().expect("sensing enabled");
-    let own_id = mesh.inner().node_id();
-    let spec = exact_spec(&mesh, CAPABILITY, own_id);
-
-    let projection = client
-        .exact_provider_readiness(&spec, &budget(), &[own_id, own_id, own_id])
-        .expect("exact projection");
-
-    assert_eq!(projection.len(), 1);
-    assert_eq!(projection.potential(), &[own_id]);
-    assert!(projection.viable().is_empty());
-    assert!(projection.non_viable().is_empty());
-}
-
-/// An empty authorized population projects nothing — even while the
-/// node holds a live, established observation it could have reported.
-/// Sensing cannot invent a candidate, and "no authorized providers" is
-/// the strongest form of the clamp.
-///
-/// Fails against: a projection that enumerates observations and forgets
-/// the population.
-#[tokio::test]
-async fn an_empty_population_projects_no_providers() {
-    let mesh = origin_mesh().await;
-    let client = mesh.sensing().expect("sensing enabled");
-    let (_ready, _evaluations, evaluator) = FlagEvaluator::pair();
-    let registration = client
-        .provide(CapabilityId::new(CAPABILITY), evaluator)
-        .expect("provide");
-
-    let own_id = mesh.inner().node_id();
-    let branch = watch_self(&mesh, CAPABILITY).await;
-    assert!(
-        poll_until(POLL, || mesh.inner().sensing_projected(&branch)
-            == ProjectedReadiness::Ready)
-        .await,
-        "the observation the clamp must suppress never established",
-    );
-
-    let spec = exact_spec(&mesh, CAPABILITY, own_id);
-    let projection = client
-        .exact_provider_readiness(&spec, &budget(), &[])
-        .expect("exact projection");
-
-    assert!(projection.is_empty());
-    assert_eq!(projection.len(), 0);
-    assert!(projection.viable().is_empty());
-    assert!(projection.potential().is_empty());
-    assert!(projection.non_viable().is_empty());
-    assert_eq!(projection.best_provider(), None);
-    assert_eq!(projection.readiness(own_id), ProjectedReadiness::Unknown);
-
-    assert!(registration.close());
-}
-
-/// The exact seam refuses a provider-free selector rather than
-/// quietly becoming the leader-routed path this slice does not
-/// implement.
-#[tokio::test]
-async fn a_provider_free_selector_is_refused_by_the_exact_seam() {
-    let mesh = origin_mesh().await;
-    let client = mesh.sensing().expect("sensing enabled");
-    let own_id = mesh.inner().node_id();
-
-    let mut spec = exact_spec(&mesh, CAPABILITY, own_id);
-    spec.providers = ProviderSelector::AnyAuthorized;
+    // Terminal for a fresh capability...
     assert_eq!(
         client
-            .exact_provider_readiness(&spec, &budget(), &[own_id])
+            .provide(
+                CapabilityId::new(OTHER_CAPABILITY),
+                Arc::new(AlwaysNotReady)
+            )
             .err(),
-        Some(SensingError::ProviderFreeSelector {
-            selector: "AnyAuthorized",
-        }),
+        Some(SensingError::RegistrationIdentityExhausted),
     );
-
-    spec.providers = ProviderSelector::Tags(Vec::new());
+    // ...and for supersession, which leaves the incumbent serving.
     assert_eq!(
         client
-            .exact_provider_readiness(&spec, &budget(), &[own_id])
+            .provide_replacing(CapabilityId::new(CAPABILITY), Arc::new(AlwaysNotReady))
             .err(),
-        Some(SensingError::ProviderFreeSelector { selector: "Tags" }),
+        Some(SensingError::RegistrationIdentityExhausted),
+    );
+    assert_eq!(
+        mesh.inner().sensing_evaluator_count(),
+        1,
+        "no new registration was published, and the incumbent survived",
     );
 
-    // The exact form is admitted.
-    spec.providers = ProviderSelector::Node(own_id);
-    assert!(client
-        .exact_provider_readiness(&spec, &budget(), &[own_id])
-        .is_ok());
+    // Removal remains available — a node that cannot install must still
+    // be able to stop serving.
+    assert!(last.close());
+    assert_eq!(mesh.inner().sensing_evaluator_count(), 0);
+    // But the vacated slot still cannot be refilled: the state is
+    // terminal, not merely a capacity hint.
+    assert_eq!(
+        client
+            .provide(CapabilityId::new(CAPABILITY), Arc::new(AlwaysNotReady))
+            .err(),
+        Some(SensingError::RegistrationIdentityExhausted),
+    );
 }
 
 // ---------------------------------------------------------------------
 // Shared-node ownership
 // ---------------------------------------------------------------------
 
-/// Registration state lives on the NODE, not on the SDK wrapper: two
-/// `Mesh` wrappers over one `MeshNode` see one registry, so the second
-/// wrapper's `provide` is refused rather than silently stealing the
-/// first wrapper's capability.
+/// Registration state lives on the NODE, not on the SDK wrapper.
+///
+/// Uses a genuine SECOND `Mesh` over the same `Arc<MeshNode>` via
+/// `Mesh::from_node_arc` — the public constructor that made the
+/// audience-lease regression possible — so the two wrappers really are
+/// distinct SDK objects. The second wrapper's `provide` must be refused
+/// rather than silently stealing the first wrapper's capability, and the
+/// first wrapper's handle must remain the owner.
 #[tokio::test]
 async fn two_mesh_wrappers_over_one_node_share_one_registration() {
     let mesh = origin_mesh().await;
@@ -743,8 +865,13 @@ async fn two_mesh_wrappers_over_one_node_share_one_registration() {
         .provide(CapabilityId::new(CAPABILITY), evaluator)
         .expect("first provide");
 
-    // A second client over the same node.
-    let second_client = mesh.sensing().expect("sensing enabled");
+    // A genuinely separate SDK wrapper over the same node.
+    let second_wrapper = Mesh::from_node_arc(
+        mesh.node_arc(),
+        Arc::new(net::adapter::net::ChannelConfigRegistry::new()),
+        None,
+    );
+    let second_client = second_wrapper.sensing().expect("sensing enabled");
     assert_eq!(
         second_client
             .provide(CapabilityId::new(CAPABILITY), Arc::new(AlwaysNotReady))
@@ -753,9 +880,11 @@ async fn two_mesh_wrappers_over_one_node_share_one_registration() {
             capability: CAPABILITY.to_string(),
         }),
     );
+    assert_eq!(mesh.inner().sensing_evaluator_count(), 1);
 
     assert!(first.close(), "the owning handle still owns the row");
-    assert!(second_client
+    let via_second = second_client
         .provide(CapabilityId::new(CAPABILITY), Arc::new(AlwaysNotReady))
-        .is_ok());
+        .expect("the vacated capability admits the second wrapper");
+    assert!(via_second.close());
 }

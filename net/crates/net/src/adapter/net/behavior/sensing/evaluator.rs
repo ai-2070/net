@@ -21,14 +21,25 @@
 //!   increments the protocol-invalid/security counter even though it
 //!   projects publicly as `ProviderUnknown { InvalidConstraints }`.
 //!
-//! [`ReadinessEvaluators`] is the node's registry of those
-//! implementations (CAPABILITY_SENSING_SDK_INTEGRATION_PLAN.md S0
-//! item 7, §4.4). Installing one mints an opaque
-//! [`EvaluatorRegistrationId`] and removal is conditional on that id
-//! still being installed, so an old provider handle can never evict
-//! the replacement that superseded it, and a vacancy-required
-//! install refuses ([`EvaluatorOccupied`]) rather than silently
-//! stealing a live registration.
+//! `ReadinessEvaluators` is the node's **crate-internal** registry of
+//! those implementations (CAPABILITY_SENSING_SDK_INTEGRATION_PLAN.md
+//! S0 item 7, §4.4). It is deliberately not public API: the storage
+//! choice, the mutation methods, and the inspection methods are all
+//! internal, and the only things that cross the crate boundary are the
+//! opaque [`EvaluatorRegistrationId`], the
+//! [`EvaluatorInstallRefusal`] it can refuse with, and the `MeshNode`
+//! lifecycle seams built on them.
+//!
+//! Ownership has three parts, and all three are enforced by one mutex
+//! rather than by check-then-act:
+//!
+//! - an install issues a fresh, never-reused id, and a vacancy-required
+//!   install refuses rather than silently stealing a live registration;
+//! - removal is conditional on that id, so a superseded handle can
+//!   never evict its replacement;
+//! - **publication** of an evaluated result is conditional on the same
+//!   id, so a result computed under a registration that has since been
+//!   closed or replaced cannot become the latest observation.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -328,31 +339,65 @@ pub fn validate_interest_constraints(
 /// A node-local provider-readiness registration identity (plan
 /// §4.4: "return an opaque registration token/generation").
 ///
-/// Minted monotonically per node by [`ReadinessEvaluators`], exactly
-/// like the interest lease's `LeaseToken` — the node-global mint is
-/// what makes a stale id inert: an id is never reused, so an id that
-/// is no longer the installed one can only be a superseded
-/// registration. Node-local and never on the wire.
+/// Minted by the node's registry under a **checked, non-reusing**
+/// allocator: an id is issued at most once for the lifetime of the
+/// node, so an id that is no longer the installed one can only be a
+/// superseded registration and can never alias a later one. Node-local
+/// and never on the wire.
+///
+/// Public only because the SDK's provider handle must hold one across
+/// the crate boundary; it is opaque by construction — no constructor,
+/// no accessor, no ordering.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct EvaluatorRegistrationId(u64);
 
-/// A vacancy-required install found the capability already served by
-/// a live registration (plan §4.4: "never silently steal it").
+/// The largest id the allocator will ever issue.
 ///
-/// Deliberately carries NOTHING: exposing the incumbent's
-/// registration id would hand the loser a token it could use to
-/// unregister the winner, which is the ownership hole this type
-/// exists to close.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct EvaluatorOccupied;
+/// `u64::MAX` is reserved as the terminal *exhausted* sentinel and is
+/// never handed out, so a stale id can never equal the allocator's
+/// resting value.
+const MAX_REGISTRATION_ID: u64 = u64::MAX - 1;
 
-impl std::fmt::Display for EvaluatorOccupied {
+/// Why an evaluator install was refused (plan §4.4: "reject or
+/// explicitly replace an existing evaluator; never silently steal
+/// it").
+///
+/// Deliberately carries NO id: handing the loser the incumbent's
+/// registration id would give it a token it could use to unregister
+/// the winner, which is the ownership hole this type exists to close.
+///
+/// Deliberately NOT `#[non_exhaustive]`. The only cross-crate consumer
+/// is the workspace's own SDK, versioned in lockstep, and a wildcard arm
+/// there could only report a new refusal under a wrong name. Exhaustive
+/// means adding a variant is a compile error at the one place that has
+/// to decide how to report it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EvaluatorInstallRefusal {
+    /// A live registration already serves this capability. Only
+    /// [`ReadinessEvaluators::install_vacant`] can produce this.
+    Occupied,
+    /// The node's registration-identity space is exhausted. No further
+    /// install of any kind can publish, because a fresh non-aliasing id
+    /// can no longer be issued and reusing one would let a stale handle
+    /// remove a live registration. Terminal: incumbents keep serving
+    /// and removal keeps working, but nothing new installs.
+    IdentityExhausted,
+}
+
+impl std::fmt::Display for EvaluatorInstallRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("a readiness evaluator is already registered for this capability")
+        match self {
+            Self::Occupied => {
+                f.write_str("a readiness evaluator is already registered for this capability")
+            }
+            Self::IdentityExhausted => {
+                f.write_str("the node's readiness-registration identity space is exhausted")
+            }
+        }
     }
 }
 
-impl std::error::Error for EvaluatorOccupied {}
+impl std::error::Error for EvaluatorInstallRefusal {}
 
 /// One capability's installed evaluator plus the registration
 /// identity that owns it.
@@ -361,68 +406,104 @@ struct EvaluatorSlot {
     evaluator: Arc<dyn ReadinessEvaluator + Send + Sync>,
 }
 
-/// The node's provider-readiness evaluator registry (plan §4.4).
+/// A held publication section (plan §4.4 ownership).
 ///
-/// One evaluator per capability id, as before — the addition is
-/// **ownership**. Every install mints a fresh
-/// [`EvaluatorRegistrationId`] and removal is conditional on that id
-/// still being the installed one, so a handle whose registration was
-/// already replaced cannot evict its replacement. Read on the
-/// emission path, so the map stays a `DashMap` and
-/// [`Self::evaluator`] clones the `Arc` out before the shard guard
-/// drops — the user evaluator must never run under a map guard.
+/// Existence of this value proves the registry's commit mutex is held
+/// AND that, at the moment it was taken, the capability's installed
+/// registration matched the one the caller evaluated under. Because
+/// install/replace/remove take the same mutex for their whole
+/// operation, a publication guarded by this token cannot land after a
+/// close or replacement has *returned*.
+///
+/// The guard deliberately exposes nothing: it is a fence, not a handle.
+pub(crate) struct EvaluationCommit<'a> {
+    _guard: parking_lot::MutexGuard<'a, ()>,
+}
+
+/// The node's provider-readiness evaluator registry (plan §4.4, S0
+/// item 7).
+///
+/// One evaluator per capability id — the addition over a plain map is
+/// **ownership**. Every install issues a fresh
+/// [`EvaluatorRegistrationId`], removal is conditional on that id still
+/// being the installed one, and publication of an evaluated result is
+/// conditional on the same id through [`Self::begin_commit`].
+///
+/// # Concurrency contract
+///
+/// `commit_mu` is the linearization point for ownership transfer. Every
+/// mutation ([`Self::install_vacant`], [`Self::install_replacing`],
+/// [`Self::remove_if_current`]) holds it across its whole operation,
+/// and every publication holds it across the currentness test AND the
+/// publication itself. So there is no check-then-act window: the
+/// decision and the effect are one critical section.
+///
+/// **Lock order.** `commit_mu` is strictly OUTERMOST among the sensing
+/// locks. It may be held while taking
+/// `sensing_local_projection_mu` → `sensing_interest_table` →
+/// `sensing_observations` (the frozen order) or `sensing_emitter`;
+/// nothing ever acquires it while holding any of those. No user
+/// evaluator, no `.await`, and no network I/O may run inside it —
+/// [`Self::installed`] exists precisely so the user evaluator runs
+/// before the section is entered.
 ///
 /// Readiness is not reservation, admission, or execution authority:
 /// this registry answers only "who evaluates capability Y on this
 /// node".
 #[derive(Default)]
-pub struct ReadinessEvaluators {
+pub(crate) struct ReadinessEvaluators {
     slots: DashMap<CapabilityId, EvaluatorSlot>,
+    /// Next id to issue, or `u64::MAX` once exhausted. Never wraps.
     next_id: AtomicU64,
+    commit_mu: parking_lot::Mutex<()>,
 }
 
 impl ReadinessEvaluators {
-    /// Mint the next node-local registration id. Monotonic and never
-    /// reused; `u64` exhaustion is not a reachable operational
-    /// condition (one mint per provider registration).
-    fn mint(&self) -> EvaluatorRegistrationId {
-        EvaluatorRegistrationId(self.next_id.fetch_add(1, Ordering::Relaxed))
+    /// Issue the next id, or `None` once the space is exhausted.
+    ///
+    /// Checked and non-reusing: the counter saturates at the reserved
+    /// `u64::MAX` sentinel instead of wrapping, so no id is ever issued
+    /// twice and a stale id can never alias a live one. A `fetch_update`
+    /// rather than `fetch_add` because the terminal state must be
+    /// reached exactly once and never stepped past.
+    fn mint(&self) -> Option<EvaluatorRegistrationId> {
+        self.next_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                if current > MAX_REGISTRATION_ID {
+                    None
+                } else {
+                    Some(current + 1)
+                }
+            })
+            .ok()
+            .map(EvaluatorRegistrationId)
+    }
+
+    /// Whether the identity space is exhausted (tests + observability).
+    #[cfg(any(test, feature = "fixtures"))]
+    pub(crate) fn identities_exhausted(&self) -> bool {
+        self.next_id.load(Ordering::Relaxed) > MAX_REGISTRATION_ID
     }
 
     /// Install an evaluator ONLY if the capability is currently
-    /// unserved. Atomic against a concurrent rival: the vacancy check
-    /// and the insert happen under one shard write guard, so two
-    /// racing installers cannot both observe a vacancy.
+    /// unserved.
     ///
-    /// A refusal is total — no id is minted and the incumbent is
-    /// untouched.
-    pub fn install_vacant(
+    /// A refusal is total: no id is issued and the incumbent is
+    /// untouched. Serialized against publication and removal by
+    /// `commit_mu`, so a registration that returns has fully taken
+    /// ownership before any later publication can test currentness.
+    pub(crate) fn install_vacant(
         &self,
         capability_id: CapabilityId,
         evaluator: Arc<dyn ReadinessEvaluator + Send + Sync>,
-    ) -> Result<EvaluatorRegistrationId, EvaluatorOccupied> {
-        match self.slots.entry(capability_id) {
-            dashmap::mapref::entry::Entry::Occupied(_) => Err(EvaluatorOccupied),
-            dashmap::mapref::entry::Entry::Vacant(vacant) => {
-                let registration_id = self.mint();
-                vacant.insert(EvaluatorSlot {
-                    registration_id,
-                    evaluator,
-                });
-                Ok(registration_id)
-            }
+    ) -> Result<EvaluatorRegistrationId, EvaluatorInstallRefusal> {
+        let _commit = self.commit_mu.lock();
+        if self.slots.contains_key(&capability_id) {
+            return Err(EvaluatorInstallRefusal::Occupied);
         }
-    }
-
-    /// Install an evaluator, EXPLICITLY superseding any incumbent.
-    /// The returned id is fresh, so the superseded registration's id
-    /// is immediately non-current and its later removal is inert.
-    pub fn install_replacing(
-        &self,
-        capability_id: CapabilityId,
-        evaluator: Arc<dyn ReadinessEvaluator + Send + Sync>,
-    ) -> EvaluatorRegistrationId {
-        let registration_id = self.mint();
+        let registration_id = self
+            .mint()
+            .ok_or(EvaluatorInstallRefusal::IdentityExhausted)?;
         self.slots.insert(
             capability_id,
             EvaluatorSlot {
@@ -430,19 +511,52 @@ impl ReadinessEvaluators {
                 evaluator,
             },
         );
-        registration_id
+        Ok(registration_id)
+    }
+
+    /// Install an evaluator, EXPLICITLY superseding any incumbent.
+    ///
+    /// The new id is fresh, so the superseded registration's id is
+    /// non-current the instant this returns: its later removal is inert
+    /// and an evaluation already in flight under it can no longer
+    /// publish.
+    ///
+    /// Fallible only through
+    /// [`EvaluatorInstallRefusal::IdentityExhausted`] — on which the
+    /// incumbent keeps serving, because superseding it with an
+    /// un-ownable registration would be strictly worse than refusing.
+    pub(crate) fn install_replacing(
+        &self,
+        capability_id: CapabilityId,
+        evaluator: Arc<dyn ReadinessEvaluator + Send + Sync>,
+    ) -> Result<EvaluatorRegistrationId, EvaluatorInstallRefusal> {
+        let _commit = self.commit_mu.lock();
+        let registration_id = self
+            .mint()
+            .ok_or(EvaluatorInstallRefusal::IdentityExhausted)?;
+        self.slots.insert(
+            capability_id,
+            EvaluatorSlot {
+                registration_id,
+                evaluator,
+            },
+        );
+        Ok(registration_id)
     }
 
     /// Remove the capability's evaluator ONLY if `registration_id` is
-    /// still the installed one. Returns whether this call performed
-    /// the removal — so it is `true` at most once per registration,
-    /// which makes an idempotent `close`/`drop` pair safe and a stale
-    /// handle's drop a pure no-op.
-    pub fn remove_if_current(
+    /// still the installed one.
+    ///
+    /// Returns whether THIS call performed the removal — `true` at most
+    /// once per registration, so a stale handle's drop is a pure no-op.
+    /// Remains available after identity exhaustion: a node that can no
+    /// longer install must still be able to stop serving.
+    pub(crate) fn remove_if_current(
         &self,
         capability_id: &CapabilityId,
         registration_id: EvaluatorRegistrationId,
     ) -> bool {
+        let _commit = self.commit_mu.lock();
         self.slots
             .remove_if(capability_id, |_, slot| {
                 slot.registration_id == registration_id
@@ -450,25 +564,103 @@ impl ReadinessEvaluators {
             .is_some()
     }
 
-    /// The evaluator currently serving `capability_id`, cloned out of
-    /// the map so the caller runs it with no guard held. `None` means
-    /// "targeted but cannot answer" — the caller projects
+    /// The capability's installed registration and its evaluator.
+    ///
+    /// The `Arc` is cloned out so the shard guard drops before the
+    /// caller runs user code, and the id rides along so the caller can
+    /// prove at publication time that it evaluated under the
+    /// registration that is still current.
+    ///
+    /// `None` means "targeted but cannot answer" — the caller projects
     /// `ProviderUnknown { TemporarilyUnevaluable }`, never Ready and
     /// never NotReady.
-    pub fn evaluator(
+    pub(crate) fn installed(
         &self,
         capability_id: &CapabilityId,
-    ) -> Option<Arc<dyn ReadinessEvaluator + Send + Sync>> {
+    ) -> Option<(
+        EvaluatorRegistrationId,
+        Arc<dyn ReadinessEvaluator + Send + Sync>,
+    )> {
         self.slots
             .get(capability_id)
-            .map(|slot| slot.evaluator.clone())
+            .map(|slot| (slot.registration_id, slot.evaluator.clone()))
+    }
+
+    /// Enter the publication section, but only if the capability's
+    /// installed registration is EXACTLY the one the caller evaluated
+    /// under.
+    ///
+    /// `evaluated_under` is `None` for a beat produced with no evaluator
+    /// installed, so the test is total in both directions: a result
+    /// computed under a since-superseded registration is refused, and so
+    /// is an "unevaluable" beat for a capability that has since gained
+    /// an evaluator (publishing "cannot answer" about a capability that
+    /// now can is a false negative — dropping the beat leaves the
+    /// consumer's continuity to hold or expire to Unknown, which is the
+    /// conservative answer, and the emitter re-arms).
+    ///
+    /// The returned guard MUST be held for the whole publication. Do not
+    /// test currentness, drop the guard, and then publish: that is the
+    /// check-then-publish race this method exists to remove.
+    pub(crate) fn begin_commit(
+        &self,
+        capability_id: &CapabilityId,
+        evaluated_under: Option<EvaluatorRegistrationId>,
+    ) -> Option<EvaluationCommit<'_>> {
+        let guard = self.commit_mu.lock();
+        let current = self
+            .slots
+            .get(capability_id)
+            .map(|slot| slot.registration_id);
+        (current == evaluated_under).then_some(EvaluationCommit { _guard: guard })
+    }
+
+    /// Run `poke` while holding the publication section, but only if
+    /// `registration_id` is still the installed registration.
+    ///
+    /// This is the state-edge seam: the currentness test and the poke are
+    /// one critical section, so a superseded handle can never move the
+    /// schedule its successor owns, and there is no window between the
+    /// test and the effect.
+    pub(crate) fn poke_if_current<R: Default>(
+        &self,
+        capability_id: &CapabilityId,
+        registration_id: EvaluatorRegistrationId,
+        poke: impl FnOnce() -> R,
+    ) -> R {
+        let _commit = self.commit_mu.lock();
+        let current = self
+            .slots
+            .get(capability_id)
+            .is_some_and(|slot| slot.registration_id == registration_id);
+        if current {
+            poke()
+        } else {
+            R::default()
+        }
+    }
+
+    /// Installed evaluator count (tests + observability).
+    #[cfg(any(test, feature = "fixtures"))]
+    pub(crate) fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Whether no capability on this node has an evaluator.
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.slots.is_empty()
     }
 
     /// Whether `registration_id` is the capability's installed
-    /// registration (tests + observability; never a decision input —
-    /// a check-then-remove would race, so removal is
-    /// [`Self::remove_if_current`]).
-    pub fn is_current(
+    /// registration.
+    ///
+    /// Tests and observability ONLY — never a decision input, because a
+    /// check-then-act on this value is exactly the race
+    /// [`Self::begin_commit`] and [`Self::poke_if_current`] exist to
+    /// prevent.
+    #[cfg(test)]
+    pub(crate) fn is_current(
         &self,
         capability_id: &CapabilityId,
         registration_id: EvaluatorRegistrationId,
@@ -478,14 +670,18 @@ impl ReadinessEvaluators {
             .is_some_and(|slot| slot.registration_id == registration_id)
     }
 
-    /// Installed evaluator count (observability).
-    pub fn len(&self) -> usize {
-        self.slots.len()
+    /// Force the allocator's resting value, to reach the terminal
+    /// exhausted state without 2^64 real registrations.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub(crate) fn set_next_id_for_test(&self, next: u64) {
+        self.next_id.store(next, Ordering::Relaxed);
     }
 
-    /// Whether no capability on this node has an evaluator.
-    pub fn is_empty(&self) -> bool {
-        self.slots.is_empty()
+    /// The largest issuable id — so a test can name the boundary
+    /// without duplicating the constant.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub(crate) const fn max_issuable_id_for_test() -> u64 {
+        MAX_REGISTRATION_ID
     }
 }
 
@@ -661,7 +857,8 @@ mod tests {
             constraints: &constraints,
             work_latency: &work_latency,
         };
-        match evaluators.evaluator(capability)?.evaluate(&request) {
+        let (_, evaluator) = evaluators.installed(capability)?;
+        match evaluator.evaluate(&request) {
             ReadinessEvaluation::NotReady { reason } => Some(reason),
             other => panic!("marker evaluator answered {other:?}"),
         }
@@ -679,8 +876,9 @@ mod tests {
         let second = evaluators
             .install_vacant(b.clone(), Arc::new(MarkerEvaluator { marker: 2 }))
             .expect("vacant install");
-        let third =
-            evaluators.install_replacing(a.clone(), Arc::new(MarkerEvaluator { marker: 3 }));
+        let third = evaluators
+            .install_replacing(a.clone(), Arc::new(MarkerEvaluator { marker: 3 }))
+            .expect("replacement install");
 
         assert_ne!(first, second);
         assert_ne!(first, third);
@@ -701,7 +899,8 @@ mod tests {
             .install_vacant(capability.clone(), Arc::new(MarkerEvaluator { marker: 7 }))
             .expect("vacant install");
         let new = evaluators
-            .install_replacing(capability.clone(), Arc::new(MarkerEvaluator { marker: 9 }));
+            .install_replacing(capability.clone(), Arc::new(MarkerEvaluator { marker: 9 }))
+            .expect("replacement install");
 
         assert!(!evaluators.is_current(&capability, old));
         assert!(evaluators.is_current(&capability, new));
@@ -750,7 +949,7 @@ mod tests {
 
         assert_eq!(
             evaluators.install_vacant(capability.clone(), Arc::new(MarkerEvaluator { marker: 12 })),
-            Err(EvaluatorOccupied),
+            Err(EvaluatorInstallRefusal::Occupied),
         );
         assert!(evaluators.is_current(&capability, incumbent));
         assert_eq!(marker(&evaluators, &capability), Some(11));
@@ -778,13 +977,345 @@ mod tests {
             .install_vacant(served.clone(), Arc::new(MarkerEvaluator { marker: 5 }))
             .expect("vacant install");
 
-        assert!(evaluators.evaluator(&unserved).is_none());
+        assert!(evaluators.installed(&unserved).is_none());
         assert!(!evaluators.is_current(&unserved, id));
         assert!(!evaluators.remove_if_current(&unserved, id));
         assert_eq!(
             marker(&evaluators, &served),
             Some(5),
             "a removal aimed at another capability must not touch this one",
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // The publication fence (H1)
+    // ---------------------------------------------------------------
+
+    /// The fence's whole contract in one place: a commit section opens
+    /// only when the capability's installed registration is EXACTLY the
+    /// one the caller evaluated under.
+    ///
+    /// Fails against: publishing without revalidating ownership;
+    /// revalidating against the capability alone rather than the id.
+    #[test]
+    fn a_commit_section_opens_only_for_the_registration_that_was_evaluated() {
+        let evaluators = ReadinessEvaluators::default();
+        let capability = CapabilityId::new("gpu.infer");
+        let first = evaluators
+            .install_vacant(capability.clone(), Arc::new(MarkerEvaluator { marker: 1 }))
+            .expect("vacant install");
+
+        // The current registration may publish.
+        assert!(evaluators.begin_commit(&capability, Some(first)).is_some());
+
+        // Replacement makes the old id non-current, so its in-flight
+        // result can no longer commit — while the successor's can.
+        let second = evaluators
+            .install_replacing(capability.clone(), Arc::new(MarkerEvaluator { marker: 2 }))
+            .expect("replacement install");
+        assert!(
+            evaluators.begin_commit(&capability, Some(first)).is_none(),
+            "a superseded registration must not open a commit section",
+        );
+        assert!(evaluators.begin_commit(&capability, Some(second)).is_some());
+
+        // Close makes it non-current too.
+        assert!(evaluators.remove_if_current(&capability, second));
+        assert!(
+            evaluators.begin_commit(&capability, Some(second)).is_none(),
+            "a closed registration must not open a commit section",
+        );
+    }
+
+    /// The test is total in the other direction as well: a beat produced
+    /// with NO evaluator installed must not publish "cannot answer"
+    /// about a capability that has since gained one.
+    #[test]
+    fn an_unevaluable_beat_cannot_commit_once_an_evaluator_appears() {
+        let evaluators = ReadinessEvaluators::default();
+        let capability = CapabilityId::new("gpu.infer");
+
+        // Nothing installed: the unevaluable beat may publish.
+        assert!(evaluators.begin_commit(&capability, None).is_some());
+
+        let id = evaluators
+            .install_vacant(capability.clone(), Arc::new(MarkerEvaluator { marker: 3 }))
+            .expect("vacant install");
+        assert!(
+            evaluators.begin_commit(&capability, None).is_none(),
+            "a stale 'cannot answer' must not outrank a live evaluator",
+        );
+
+        // And once it closes again, it may.
+        assert!(evaluators.remove_if_current(&capability, id));
+        assert!(evaluators.begin_commit(&capability, None).is_some());
+    }
+
+    /// The state-edge seam is id-conditional and does not run the poke
+    /// at all for a superseded registration — the currentness test and
+    /// the effect are one section, so there is no check-then-poke gap.
+    ///
+    /// Fails against: poking by capability alone; checking the id and
+    /// then poking outside the section.
+    #[test]
+    fn poke_if_current_runs_only_for_the_installed_registration() {
+        let evaluators = ReadinessEvaluators::default();
+        let capability = CapabilityId::new("gpu.infer");
+        let old = evaluators
+            .install_vacant(capability.clone(), Arc::new(MarkerEvaluator { marker: 1 }))
+            .expect("vacant install");
+
+        let pokes = AtomicU64::new(0);
+        let poke = || {
+            pokes.fetch_add(1, Ordering::Relaxed);
+            true
+        };
+
+        assert!(evaluators.poke_if_current(&capability, old, poke));
+        assert_eq!(pokes.load(Ordering::Relaxed), 1);
+
+        let new = evaluators
+            .install_replacing(capability.clone(), Arc::new(MarkerEvaluator { marker: 2 }))
+            .expect("replacement install");
+        assert!(
+            !evaluators.poke_if_current(&capability, old, poke),
+            "a superseded registration must not move its successor's schedule",
+        );
+        assert_eq!(
+            pokes.load(Ordering::Relaxed),
+            1,
+            "the poke must not even run for a superseded registration",
+        );
+
+        assert!(evaluators.poke_if_current(&capability, new, poke));
+        assert_eq!(pokes.load(Ordering::Relaxed), 2);
+
+        // After close, the successor's own id is inert too.
+        assert!(evaluators.remove_if_current(&capability, new));
+        assert!(!evaluators.poke_if_current(&capability, new, poke));
+        assert_eq!(pokes.load(Ordering::Relaxed), 2);
+    }
+
+    // ---------------------------------------------------------------
+    // Registration-identity exhaustion (H3)
+    // ---------------------------------------------------------------
+
+    /// The last issuable id still installs; one more is terminal.
+    ///
+    /// Fails against: a wrapping `fetch_add` (which would keep issuing
+    /// ids forever, aliasing old ones) and against a saturating
+    /// allocator that reuses `u64::MAX`.
+    #[test]
+    fn the_final_issuable_id_installs_and_the_next_vacancy_is_terminal() {
+        let evaluators = ReadinessEvaluators::default();
+        let a = CapabilityId::new("gpu.infer");
+        let b = CapabilityId::new("print.document");
+        evaluators.set_next_id_for_test(ReadinessEvaluators::max_issuable_id_for_test());
+        assert!(!evaluators.identities_exhausted());
+
+        let last = evaluators
+            .install_vacant(a.clone(), Arc::new(MarkerEvaluator { marker: 1 }))
+            .expect("the last issuable id installs");
+        assert!(evaluators.identities_exhausted());
+
+        assert_eq!(
+            evaluators.install_vacant(b.clone(), Arc::new(MarkerEvaluator { marker: 2 })),
+            Err(EvaluatorInstallRefusal::IdentityExhausted),
+        );
+        assert_eq!(evaluators.len(), 1, "no new registration was published");
+        assert_eq!(marker(&evaluators, &a), Some(1));
+        assert!(evaluators.installed(&b).is_none());
+
+        // Terminal: repeated attempts stay refused and never step past
+        // the sentinel into reuse.
+        assert_eq!(
+            evaluators.install_vacant(b.clone(), Arc::new(MarkerEvaluator { marker: 3 })),
+            Err(EvaluatorInstallRefusal::IdentityExhausted),
+        );
+
+        // Removal remains available — a node that cannot install must
+        // still be able to stop serving.
+        assert!(evaluators.remove_if_current(&a, last));
+        assert!(evaluators.is_empty());
+        // ...but the vacated slot still cannot be refilled.
+        assert_eq!(
+            evaluators.install_vacant(a.clone(), Arc::new(MarkerEvaluator { marker: 4 })),
+            Err(EvaluatorInstallRefusal::IdentityExhausted),
+        );
+    }
+
+    /// Exhaustion refuses REPLACEMENT too, and leaves the incumbent
+    /// serving: superseding a live registration with an un-ownable one
+    /// would be strictly worse than refusing.
+    #[test]
+    fn exhaustion_refuses_replacement_and_leaves_the_incumbent_serving() {
+        let evaluators = ReadinessEvaluators::default();
+        let capability = CapabilityId::new("gpu.infer");
+        let incumbent = evaluators
+            .install_vacant(capability.clone(), Arc::new(MarkerEvaluator { marker: 1 }))
+            .expect("vacant install");
+        evaluators.set_next_id_for_test(u64::MAX);
+        assert!(evaluators.identities_exhausted());
+
+        assert_eq!(
+            evaluators
+                .install_replacing(capability.clone(), Arc::new(MarkerEvaluator { marker: 2 })),
+            Err(EvaluatorInstallRefusal::IdentityExhausted),
+        );
+        assert!(evaluators.is_current(&capability, incumbent));
+        assert_eq!(marker(&evaluators, &capability), Some(1));
+        assert!(
+            evaluators
+                .begin_commit(&capability, Some(incumbent))
+                .is_some(),
+            "the incumbent must keep publishing after exhaustion",
+        );
+    }
+
+    /// The non-aliasing property the whole ownership scheme rests on: a
+    /// stale id can never equal a later one, so the allocator must never
+    /// hand out the same value twice and must never rest on an issued
+    /// value.
+    ///
+    /// Fails against: `fetch_add` wrapping past `u64::MAX` (after which
+    /// id 0 is reissued and the very first handle could remove a live
+    /// registration).
+    #[test]
+    fn a_stale_id_can_never_alias_a_later_registration() {
+        let evaluators = ReadinessEvaluators::default();
+        let capability = CapabilityId::new("gpu.infer");
+
+        // The first id ever issued, held by a long-closed handle.
+        let ancient = evaluators
+            .install_vacant(capability.clone(), Arc::new(MarkerEvaluator { marker: 1 }))
+            .expect("vacant install");
+        assert!(evaluators.remove_if_current(&capability, ancient));
+
+        // Drive the allocator to its terminal value and install once
+        // more at the boundary.
+        evaluators.set_next_id_for_test(ReadinessEvaluators::max_issuable_id_for_test());
+        let newest = evaluators
+            .install_vacant(capability.clone(), Arc::new(MarkerEvaluator { marker: 2 }))
+            .expect("boundary install");
+        assert_ne!(ancient, newest);
+
+        // The ancient handle is inert against the newest registration.
+        assert!(!evaluators.remove_if_current(&capability, ancient));
+        assert!(evaluators
+            .begin_commit(&capability, Some(ancient))
+            .is_none());
+        assert!(!evaluators.poke_if_current(&capability, ancient, || true));
+        assert_eq!(marker(&evaluators, &capability), Some(2));
+    }
+
+    // ---------------------------------------------------------------
+    // Public-surface guard (H4)
+    // ---------------------------------------------------------------
+
+    /// The supported cross-crate surface of this module is exactly the
+    /// opaque registration id and its install refusal — plus the
+    /// pre-existing frozen evaluator contract. The registry, its
+    /// storage, its mutation methods, and the publication fence must
+    /// stay crate-internal so none of them becomes API and the storage
+    /// choice stays free.
+    ///
+    /// Non-vacuous by construction: it reads this module's own source
+    /// and the re-export list, so a new public ITEM or a widened
+    /// re-export fails it rather than silently expanding the surface.
+    /// Scoped to items rather than struct fields — a new field on an
+    /// allowlisted type is a change to that type's own frozen SI-0
+    /// contract, guarded by the wire/golden fixtures, not by this.
+    #[test]
+    fn the_public_surface_of_this_module_is_exactly_the_allowlist() {
+        const ALLOWED: &[&str] = &[
+            // Pre-existing frozen contract (SI-0).
+            "pub const DEFAULT_ATTESTATION_CADENCE_FLOOR",
+            "pub struct EvaluationRequest",
+            "pub enum ReadinessEvaluation",
+            "pub enum StatusReason",
+            "pub const fn project_evaluation",
+            "pub trait ReadinessEvaluator",
+            "pub struct CadenceRefusal",
+            "pub const fn as_status",
+            "pub const fn check_cadence",
+            "pub struct SensingCounters",
+            "pub fn get",
+            "pub fn validate_interest_constraints",
+            // S0 item 7: the ONLY new cross-crate items.
+            "pub struct EvaluatorRegistrationId",
+            "pub enum EvaluatorInstallRefusal",
+        ];
+
+        /// Item-declaration keywords that can follow `pub`. Anything
+        /// else after `pub ` is a struct field.
+        const ITEM_KEYWORDS: &[&str] = &[
+            "struct",
+            "enum",
+            "trait",
+            "fn",
+            "const",
+            "type",
+            "mod",
+            "use",
+            "static",
+            "unsafe",
+            "async",
+            "extern",
+            "union",
+            "macro_rules!",
+        ];
+
+        let source = include_str!("evaluator.rs");
+        let declared: Vec<String> = source
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("pub ") && !line.starts_with("pub(crate)"))
+            .filter(|line| {
+                line.split_whitespace()
+                    .nth(1)
+                    .is_some_and(|second| ITEM_KEYWORDS.contains(&second))
+            })
+            .map(|line| {
+                // Keep the declaration head only: everything up to the
+                // name, so signatures and field lists do not matter.
+                line.split(|c: char| c == '(' || c == '<' || c == ':' || c == '{' || c == ';')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string()
+            })
+            .filter(|head| !head.is_empty())
+            .collect();
+
+        for head in &declared {
+            assert!(
+                ALLOWED.contains(&head.as_str()),
+                "undeclared public item `{head}` in the sensing evaluator module — \
+                 either make it crate-internal or add it to the reviewed allowlist",
+            );
+        }
+        for allowed in ALLOWED {
+            assert!(
+                declared.iter().any(|head| head == allowed),
+                "allowlisted public item `{allowed}` disappeared — update the allowlist \
+                 in the same commit so surface loss is deliberate",
+            );
+        }
+
+        // The registry itself must not be re-exported publicly.
+        let re_exports = include_str!("mod.rs");
+        let evaluator_block = re_exports
+            .split("pub use evaluator::{")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("the evaluator re-export block must exist");
+        assert!(
+            !evaluator_block.contains("ReadinessEvaluators"),
+            "the evaluator registry must not be publicly re-exported",
+        );
+        assert!(
+            re_exports.contains("pub(crate) use evaluator::ReadinessEvaluators;"),
+            "the registry must stay a crate-internal re-export",
         );
     }
 }
