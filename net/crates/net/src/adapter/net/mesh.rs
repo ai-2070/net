@@ -9108,8 +9108,12 @@ pub struct MeshNode {
     /// [`MeshNode::register_readiness_evaluator`]; a targeted
     /// interest with no registered evaluator streams
     /// `ProviderUnknown { TemporarilyUnevaluable }`.
-    sensing_evaluators:
-        Arc<DashMap<sensing::CapabilityId, Arc<dyn sensing::ReadinessEvaluator + Send + Sync>>>,
+    ///
+    /// S0 item 7: the registry is ownership-bearing — each install
+    /// mints a [`sensing::EvaluatorRegistrationId`] and removal is
+    /// conditional on it, so a superseded provider handle cannot
+    /// evict its replacement.
+    sensing_evaluators: Arc<sensing::ReadinessEvaluators>,
     /// SI-3c: §4.6 strictly-newer admission over what each origin
     /// SIGNED — the [`sensing::IncarnationSeqGate`] (SI-1c) getting
     /// its first live consumer. Keys on the transcript digest, so
@@ -10513,7 +10517,7 @@ impl MeshNode {
             sensing_fold_coalescer: Arc::new(DashMap::new()),
             sensing_emitter,
             sensing_emitter_notify: Arc::new(tokio::sync::Notify::new()),
-            sensing_evaluators: Arc::new(DashMap::new()),
+            sensing_evaluators: Arc::new(sensing::ReadinessEvaluators::default()),
             sensing_observer_gate: Arc::new(parking_lot::Mutex::new(
                 sensing::IncarnationSeqGate::new(),
             )),
@@ -11569,16 +11573,24 @@ impl MeshNode {
         Ok(())
     }
 
-    /// SI-3: install (or replace) the [`sensing::ReadinessEvaluator`]
-    /// for one capability id (plan §4.4 — one narrow trait per
-    /// integration). Implementations should be cheap and
-    /// non-blocking (they run on the emission path), but they are
-    /// invoked OUTSIDE the emitter lock (closure item 5) — an
-    /// evaluator may safely call back into `MeshNode`, including
-    /// [`Self::notify_sensing_state_changed`]. Interests targeting
-    /// this node for a capability WITHOUT an evaluator stream
-    /// `ProviderUnknown { TemporarilyUnevaluable }` — an explicit
-    /// "targeted but cannot answer" beats silence.
+    /// SI-3: install the [`sensing::ReadinessEvaluator`] for one
+    /// capability id (plan §4.4 — one narrow trait per integration).
+    /// Implementations should be cheap and non-blocking (they run on
+    /// the emission path), but they are invoked OUTSIDE the emitter
+    /// lock (closure item 5) — an evaluator may safely call back into
+    /// `MeshNode`, including [`Self::notify_sensing_state_changed`].
+    /// Interests targeting this node for a capability WITHOUT an
+    /// evaluator stream `ProviderUnknown { TemporarilyUnevaluable }`
+    /// — an explicit "targeted but cannot answer" beats silence.
+    ///
+    /// S0 item 7: this is the VACANCY-REQUIRED install. A capability
+    /// already served by a live registration is refused with
+    /// [`sensing::EvaluatorOccupied`] — the incumbent keeps serving
+    /// and no id is minted, so one integration can never silently
+    /// steal another's slot. Explicit supersession is
+    /// [`Self::replace_readiness_evaluator`]. Hold the returned
+    /// [`sensing::EvaluatorRegistrationId`]: it is the only thing
+    /// that can remove this registration.
     ///
     /// Registration is independent of the origin role being active:
     /// evaluators may be installed before `start()` or while the
@@ -11587,24 +11599,60 @@ impl MeshNode {
         &self,
         capability_id: sensing::CapabilityId,
         evaluator: Arc<dyn sensing::ReadinessEvaluator + Send + Sync>,
-    ) {
-        self.sensing_evaluators.insert(capability_id, evaluator);
+    ) -> Result<sensing::EvaluatorRegistrationId, sensing::EvaluatorOccupied> {
+        self.sensing_evaluators
+            .install_vacant(capability_id, evaluator)
     }
 
-    /// SI-3: remove a capability's evaluator. Live streams for it
-    /// fall back to `ProviderUnknown { TemporarilyUnevaluable }` at
-    /// their next beat. Returns whether one was installed.
-    pub fn unregister_readiness_evaluator(&self, capability_id: &sensing::CapabilityId) -> bool {
-        self.sensing_evaluators.remove(capability_id).is_some()
+    /// SI-3 / S0 item 7: install an evaluator, EXPLICITLY superseding
+    /// whatever served the capability before. The caller is stating
+    /// that it owns the capability's readiness; the superseded
+    /// registration's id becomes non-current immediately, so that
+    /// holder's later close or drop removes nothing.
+    ///
+    /// Prefer [`Self::register_readiness_evaluator`] unless
+    /// supersession is the intent.
+    pub fn replace_readiness_evaluator(
+        &self,
+        capability_id: sensing::CapabilityId,
+        evaluator: Arc<dyn sensing::ReadinessEvaluator + Send + Sync>,
+    ) -> sensing::EvaluatorRegistrationId {
+        self.sensing_evaluators
+            .install_replacing(capability_id, evaluator)
+    }
+
+    /// SI-3 / S0 item 7: remove a capability's evaluator, but ONLY if
+    /// `registration_id` is still the installed registration. Live
+    /// streams for a removed evaluator fall back to
+    /// `ProviderUnknown { TemporarilyUnevaluable }` at their next
+    /// beat.
+    ///
+    /// Returns whether THIS call performed the removal — `true` at
+    /// most once per registration. A superseded holder gets `false`
+    /// and changes nothing, which is what makes an SDK handle's
+    /// close/drop pair idempotent and a stale handle's drop inert.
+    pub fn unregister_readiness_evaluator(
+        &self,
+        capability_id: &sensing::CapabilityId,
+        registration_id: sensing::EvaluatorRegistrationId,
+    ) -> bool {
+        self.sensing_evaluators
+            .remove_if_current(capability_id, registration_id)
     }
 
     /// SI-3: the integration's status-edge hook (plan §4.4 "status
     /// edges immediate with min-gap"): local state affecting
     /// `capability_id` changed — pull every live stream on that
     /// capability forward to now, min-gapped at the cadence floor,
-    /// and wake the emitter loop. A no-op while the origin role is
-    /// dark or no stream targets the capability.
-    pub fn notify_sensing_state_changed(&self, capability_id: &sensing::CapabilityId) {
+    /// and wake the emitter loop.
+    ///
+    /// Returns whether any live stream actually moved. `false` while
+    /// the origin role is dark or no stream targets the capability —
+    /// the notification is a WAKE, never evidence about readiness:
+    /// the value a woken beat carries is whatever the evaluator reads
+    /// at beat time, so the application must publish its state
+    /// BEFORE calling this.
+    pub fn notify_sensing_state_changed(&self, capability_id: &sensing::CapabilityId) -> bool {
         let moved = {
             let mut slot = self.sensing_emitter.lock();
             match slot.as_mut() {
@@ -11615,6 +11663,7 @@ impl MeshNode {
         if moved {
             self.sensing_emitter_notify.notify_one();
         }
+        moved
     }
 
     /// SI-3: whether the origin role is active — the plane is
@@ -11622,6 +11671,27 @@ impl MeshNode {
     /// otherwise; see [`MeshNodeConfig::sensing_incarnation`]).
     pub fn sensing_origin_active(&self) -> bool {
         self.sensing_emitter.lock().is_some()
+    }
+
+    /// Whether the capability-sensing plane is enabled at all
+    /// ([`MeshNodeConfig::enable_sensing_coalescing`]).
+    ///
+    /// Distinct from [`Self::sensing_origin_active`], which
+    /// additionally requires a persisted incarnation: a caller that
+    /// must refuse "sensing is off" separately from "this node cannot
+    /// sign readiness for itself" needs both bits, and the emitter
+    /// slot alone conflates them.
+    pub fn sensing_enabled(&self) -> bool {
+        self.config.enable_sensing_coalescing
+    }
+
+    /// How many capabilities on this node currently have a readiness
+    /// evaluator installed (tests + observability).
+    ///
+    /// A refused registration must leave this unchanged — that is what
+    /// "the refusal is total" means.
+    pub fn sensing_evaluator_count(&self) -> usize {
+        self.sensing_evaluators.len()
     }
 
     /// SI-3: live emission streams on this origin (tests +
@@ -17978,12 +18048,11 @@ impl MeshNode {
                         .collect();
                     // Phase 2 (NO emitter lock): run the user
                     // evaluator, then seal — `into_unsigned` is
-                    // pure. Clone the Arc out of the map entry
-                    // before evaluating so the shard guard drops
-                    // first.
+                    // pure. `ReadinessEvaluators::evaluator` clones
+                    // the `Arc` out of the slot so the shard guard
+                    // drops before the user code runs.
                     let evaluation = evaluators
-                        .get(&beat.key().capability_id)
-                        .map(|entry| entry.value().clone())
+                        .evaluator(&beat.key().capability_id)
                         .map(|evaluator| evaluator.evaluate(&beat.request()));
                     let unsigned = beat.into_unsigned(evaluation);
                     let Ok(signed) = sensing::sign_attestation(&identity, unsigned) else {

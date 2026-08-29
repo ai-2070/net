@@ -121,6 +121,8 @@ pub struct MeshBuilder {
     subnet_attachment: Option<crate::subnet::TopologySubnetId>,
     subnet_control_channel: Option<net::adapter::net::ChannelName>,
     subnet_exports: Vec<crate::subnet::NamedSubnetExport>,
+    enable_sensing: bool,
+    sensing_incarnation: Option<net::adapter::net::behavior::sensing::Incarnation>,
     #[cfg(feature = "nat-traversal")]
     reflex_override: Option<SocketAddr>,
     #[cfg(feature = "port-mapping")]
@@ -148,6 +150,8 @@ impl MeshBuilder {
             subnet_attachment: None,
             subnet_control_channel: None,
             subnet_exports: Vec::new(),
+            enable_sensing: false,
+            sensing_incarnation: None,
             #[cfg(feature = "nat-traversal")]
             reflex_override: None,
             #[cfg(feature = "port-mapping")]
@@ -264,6 +268,39 @@ impl MeshBuilder {
             subnet,
             topology_epoch,
         });
+        self
+    }
+
+    /// Turn on the capability-sensing plane
+    /// (`docs/internal/plans/CAPABILITY_SENSING_SDK_INTEGRATION_PLAN.md`
+    /// §4.5). Off by default — sensing ships dark, and
+    /// [`Mesh::sensing`] refuses loudly until this is called.
+    ///
+    /// This alone makes the node a sensing consumer/relay. SERVING
+    /// readiness additionally needs
+    /// [`sensing_incarnation`](Self::sensing_incarnation).
+    pub fn enable_sensing(mut self) -> Self {
+        self.enable_sensing = true;
+        self
+    }
+
+    /// Supply this node's persisted sensing
+    /// [`Incarnation`](crate::sensing::Incarnation) — the provider boot
+    /// epoch its signed readiness sequence is ordered under.
+    ///
+    /// Required to SERVE readiness, and fail-closed without it:
+    /// [`SensingClient::provide`](crate::sensing::SensingClient::provide)
+    /// refuses rather than installing an evaluator on a node that can
+    /// never sign. Derive the value with
+    /// [`next_incarnation`](crate::sensing::next_incarnation) over real
+    /// durable storage BEFORE building the mesh; a per-boot random
+    /// value cannot be ordered and would be poisoned as equivocation
+    /// after a restart.
+    pub fn sensing_incarnation(
+        mut self,
+        incarnation: net::adapter::net::behavior::sensing::Incarnation,
+    ) -> Self {
+        self.sensing_incarnation = Some(incarnation);
         self
     }
 
@@ -392,6 +429,17 @@ impl MeshBuilder {
         // just one layer down.
         for export in self.subnet_exports {
             config = config.with_subnet_export(export);
+        }
+        // Sensing (§4.5). The incarnation is passed through
+        // independently of the master switch: core keeps the origin
+        // role fail-closed on the pair, and `Mesh::sensing()` /
+        // `SensingClient::provide` report the missing half by name
+        // rather than leaving the plane silently dark.
+        if self.enable_sensing {
+            config = config.with_sensing_coalescing(true);
+        }
+        if let Some(incarnation) = self.sensing_incarnation {
+            config = config.with_sensing_incarnation(incarnation);
         }
         #[cfg(feature = "nat-traversal")]
         if let Some(external) = self.reflex_override {

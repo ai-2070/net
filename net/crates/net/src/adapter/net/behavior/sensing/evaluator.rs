@@ -20,9 +20,21 @@
 //!   protocol input**, not merely an unevaluable predicate: it
 //!   increments the protocol-invalid/security counter even though it
 //!   projects publicly as `ProviderUnknown { InvalidConstraints }`.
+//!
+//! [`ReadinessEvaluators`] is the node's registry of those
+//! implementations (CAPABILITY_SENSING_SDK_INTEGRATION_PLAN.md S0
+//! item 7, §4.4). Installing one mints an opaque
+//! [`EvaluatorRegistrationId`] and removal is conditional on that id
+//! still being installed, so an old provider handle can never evict
+//! the replacement that superseded it, and a vacancy-required
+//! install refuses ([`EvaluatorOccupied`]) rather than silently
+//! stealing a live registration.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
+
+use dashmap::DashMap;
 
 use super::continuity::AttestedStatus;
 use super::identity::{
@@ -313,6 +325,170 @@ pub fn validate_interest_constraints(
     }
 }
 
+/// A node-local provider-readiness registration identity (plan
+/// §4.4: "return an opaque registration token/generation").
+///
+/// Minted monotonically per node by [`ReadinessEvaluators`], exactly
+/// like the interest lease's `LeaseToken` — the node-global mint is
+/// what makes a stale id inert: an id is never reused, so an id that
+/// is no longer the installed one can only be a superseded
+/// registration. Node-local and never on the wire.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct EvaluatorRegistrationId(u64);
+
+/// A vacancy-required install found the capability already served by
+/// a live registration (plan §4.4: "never silently steal it").
+///
+/// Deliberately carries NOTHING: exposing the incumbent's
+/// registration id would hand the loser a token it could use to
+/// unregister the winner, which is the ownership hole this type
+/// exists to close.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct EvaluatorOccupied;
+
+impl std::fmt::Display for EvaluatorOccupied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a readiness evaluator is already registered for this capability")
+    }
+}
+
+impl std::error::Error for EvaluatorOccupied {}
+
+/// One capability's installed evaluator plus the registration
+/// identity that owns it.
+struct EvaluatorSlot {
+    registration_id: EvaluatorRegistrationId,
+    evaluator: Arc<dyn ReadinessEvaluator + Send + Sync>,
+}
+
+/// The node's provider-readiness evaluator registry (plan §4.4).
+///
+/// One evaluator per capability id, as before — the addition is
+/// **ownership**. Every install mints a fresh
+/// [`EvaluatorRegistrationId`] and removal is conditional on that id
+/// still being the installed one, so a handle whose registration was
+/// already replaced cannot evict its replacement. Read on the
+/// emission path, so the map stays a `DashMap` and
+/// [`Self::evaluator`] clones the `Arc` out before the shard guard
+/// drops — the user evaluator must never run under a map guard.
+///
+/// Readiness is not reservation, admission, or execution authority:
+/// this registry answers only "who evaluates capability Y on this
+/// node".
+#[derive(Default)]
+pub struct ReadinessEvaluators {
+    slots: DashMap<CapabilityId, EvaluatorSlot>,
+    next_id: AtomicU64,
+}
+
+impl ReadinessEvaluators {
+    /// Mint the next node-local registration id. Monotonic and never
+    /// reused; `u64` exhaustion is not a reachable operational
+    /// condition (one mint per provider registration).
+    fn mint(&self) -> EvaluatorRegistrationId {
+        EvaluatorRegistrationId(self.next_id.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Install an evaluator ONLY if the capability is currently
+    /// unserved. Atomic against a concurrent rival: the vacancy check
+    /// and the insert happen under one shard write guard, so two
+    /// racing installers cannot both observe a vacancy.
+    ///
+    /// A refusal is total — no id is minted and the incumbent is
+    /// untouched.
+    pub fn install_vacant(
+        &self,
+        capability_id: CapabilityId,
+        evaluator: Arc<dyn ReadinessEvaluator + Send + Sync>,
+    ) -> Result<EvaluatorRegistrationId, EvaluatorOccupied> {
+        match self.slots.entry(capability_id) {
+            dashmap::mapref::entry::Entry::Occupied(_) => Err(EvaluatorOccupied),
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                let registration_id = self.mint();
+                vacant.insert(EvaluatorSlot {
+                    registration_id,
+                    evaluator,
+                });
+                Ok(registration_id)
+            }
+        }
+    }
+
+    /// Install an evaluator, EXPLICITLY superseding any incumbent.
+    /// The returned id is fresh, so the superseded registration's id
+    /// is immediately non-current and its later removal is inert.
+    pub fn install_replacing(
+        &self,
+        capability_id: CapabilityId,
+        evaluator: Arc<dyn ReadinessEvaluator + Send + Sync>,
+    ) -> EvaluatorRegistrationId {
+        let registration_id = self.mint();
+        self.slots.insert(
+            capability_id,
+            EvaluatorSlot {
+                registration_id,
+                evaluator,
+            },
+        );
+        registration_id
+    }
+
+    /// Remove the capability's evaluator ONLY if `registration_id` is
+    /// still the installed one. Returns whether this call performed
+    /// the removal — so it is `true` at most once per registration,
+    /// which makes an idempotent `close`/`drop` pair safe and a stale
+    /// handle's drop a pure no-op.
+    pub fn remove_if_current(
+        &self,
+        capability_id: &CapabilityId,
+        registration_id: EvaluatorRegistrationId,
+    ) -> bool {
+        self.slots
+            .remove_if(capability_id, |_, slot| {
+                slot.registration_id == registration_id
+            })
+            .is_some()
+    }
+
+    /// The evaluator currently serving `capability_id`, cloned out of
+    /// the map so the caller runs it with no guard held. `None` means
+    /// "targeted but cannot answer" — the caller projects
+    /// `ProviderUnknown { TemporarilyUnevaluable }`, never Ready and
+    /// never NotReady.
+    pub fn evaluator(
+        &self,
+        capability_id: &CapabilityId,
+    ) -> Option<Arc<dyn ReadinessEvaluator + Send + Sync>> {
+        self.slots
+            .get(capability_id)
+            .map(|slot| slot.evaluator.clone())
+    }
+
+    /// Whether `registration_id` is the capability's installed
+    /// registration (tests + observability; never a decision input —
+    /// a check-then-remove would race, so removal is
+    /// [`Self::remove_if_current`]).
+    pub fn is_current(
+        &self,
+        capability_id: &CapabilityId,
+        registration_id: EvaluatorRegistrationId,
+    ) -> bool {
+        self.slots
+            .get(capability_id)
+            .is_some_and(|slot| slot.registration_id == registration_id)
+    }
+
+    /// Installed evaluator count (observability).
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Whether no capability on this node has an evaluator.
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -460,5 +636,155 @@ mod tests {
         assert!(validate_interest_constraints(&bytes[..3], &right, &counters).is_err());
         assert_eq!(SensingCounters::get(&counters.invalid_constraints), 2);
         assert_eq!(SensingCounters::get(&counters.protocol_invalid), 1);
+    }
+
+    /// A marker evaluator whose verdict identifies WHICH instance is
+    /// installed, so a replacement is distinguishable from an
+    /// incumbent through the public read seam alone.
+    struct MarkerEvaluator {
+        marker: u16,
+    }
+
+    impl ReadinessEvaluator for MarkerEvaluator {
+        fn evaluate(&self, _request: &EvaluationRequest<'_>) -> ReadinessEvaluation {
+            ReadinessEvaluation::NotReady {
+                reason: self.marker,
+            }
+        }
+    }
+
+    fn marker(evaluators: &ReadinessEvaluators, capability: &CapabilityId) -> Option<u16> {
+        let constraints = CanonicalConstraints::from_entries([("max_load", "1")]).unwrap();
+        let work_latency = WorkLatencyEnvelope::start_within(Duration::from_secs(1));
+        let request = EvaluationRequest {
+            capability_id: capability,
+            constraints: &constraints,
+            work_latency: &work_latency,
+        };
+        match evaluators.evaluator(capability)?.evaluate(&request) {
+            ReadinessEvaluation::NotReady { reason } => Some(reason),
+            other => panic!("marker evaluator answered {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_install_mints_a_distinct_registration_id() {
+        let evaluators = ReadinessEvaluators::default();
+        let a = CapabilityId::new("gpu.infer");
+        let b = CapabilityId::new("print.document");
+
+        let first = evaluators
+            .install_vacant(a.clone(), Arc::new(MarkerEvaluator { marker: 1 }))
+            .expect("vacant install");
+        let second = evaluators
+            .install_vacant(b.clone(), Arc::new(MarkerEvaluator { marker: 2 }))
+            .expect("vacant install");
+        let third =
+            evaluators.install_replacing(a.clone(), Arc::new(MarkerEvaluator { marker: 3 }));
+
+        assert_ne!(first, second);
+        assert_ne!(first, third);
+        assert_ne!(second, third);
+        assert_eq!(evaluators.len(), 2);
+    }
+
+    /// The inverse witness for an UNCONDITIONAL unregister: a
+    /// superseded registration's id must remove nothing. An
+    /// implementation that removed by capability id alone would drop
+    /// the replacement here.
+    #[test]
+    fn a_superseded_registration_id_cannot_remove_its_replacement() {
+        let evaluators = ReadinessEvaluators::default();
+        let capability = CapabilityId::new("gpu.infer");
+
+        let old = evaluators
+            .install_vacant(capability.clone(), Arc::new(MarkerEvaluator { marker: 7 }))
+            .expect("vacant install");
+        let new = evaluators
+            .install_replacing(capability.clone(), Arc::new(MarkerEvaluator { marker: 9 }));
+
+        assert!(!evaluators.is_current(&capability, old));
+        assert!(evaluators.is_current(&capability, new));
+
+        // The stale handle's drop.
+        assert!(!evaluators.remove_if_current(&capability, old));
+        assert_eq!(
+            marker(&evaluators, &capability),
+            Some(9),
+            "the replacement must survive the superseded handle's removal",
+        );
+        assert_eq!(evaluators.len(), 1);
+
+        // The current handle's close removes exactly its own row.
+        assert!(evaluators.remove_if_current(&capability, new));
+        assert!(evaluators.is_empty());
+        assert_eq!(marker(&evaluators, &capability), None);
+    }
+
+    /// The removal seam is `true` at most once per registration, so an
+    /// explicit close followed by a drop is safe and a repeat is inert.
+    #[test]
+    fn remove_if_current_reports_the_removal_exactly_once() {
+        let evaluators = ReadinessEvaluators::default();
+        let capability = CapabilityId::new("gpu.infer");
+        let id = evaluators
+            .install_vacant(capability.clone(), Arc::new(MarkerEvaluator { marker: 4 }))
+            .expect("vacant install");
+
+        assert!(evaluators.remove_if_current(&capability, id));
+        assert!(!evaluators.remove_if_current(&capability, id));
+        assert!(!evaluators.remove_if_current(&capability, id));
+        assert!(evaluators.is_empty());
+    }
+
+    /// The inverse witness for SILENT OWNERSHIP THEFT: a
+    /// vacancy-required install must refuse totally — the incumbent
+    /// keeps serving and its id stays current.
+    #[test]
+    fn a_vacancy_required_install_refuses_without_disturbing_the_incumbent() {
+        let evaluators = ReadinessEvaluators::default();
+        let capability = CapabilityId::new("gpu.infer");
+        let incumbent = evaluators
+            .install_vacant(capability.clone(), Arc::new(MarkerEvaluator { marker: 11 }))
+            .expect("vacant install");
+
+        assert_eq!(
+            evaluators.install_vacant(capability.clone(), Arc::new(MarkerEvaluator { marker: 12 })),
+            Err(EvaluatorOccupied),
+        );
+        assert!(evaluators.is_current(&capability, incumbent));
+        assert_eq!(marker(&evaluators, &capability), Some(11));
+        assert_eq!(evaluators.len(), 1);
+
+        // Only after the incumbent closes does the slot admit a new
+        // registration.
+        assert!(evaluators.remove_if_current(&capability, incumbent));
+        let successor = evaluators
+            .install_vacant(capability.clone(), Arc::new(MarkerEvaluator { marker: 12 }))
+            .expect("vacated install");
+        assert_ne!(successor, incumbent);
+        assert_eq!(marker(&evaluators, &capability), Some(12));
+    }
+
+    /// An unserved capability yields no evaluator — the caller's
+    /// "targeted but cannot answer" input, which projects Unknown, not
+    /// Ready and not NotReady.
+    #[test]
+    fn an_unserved_capability_has_no_evaluator_and_no_current_registration() {
+        let evaluators = ReadinessEvaluators::default();
+        let served = CapabilityId::new("gpu.infer");
+        let unserved = CapabilityId::new("print.document");
+        let id = evaluators
+            .install_vacant(served.clone(), Arc::new(MarkerEvaluator { marker: 5 }))
+            .expect("vacant install");
+
+        assert!(evaluators.evaluator(&unserved).is_none());
+        assert!(!evaluators.is_current(&unserved, id));
+        assert!(!evaluators.remove_if_current(&unserved, id));
+        assert_eq!(
+            marker(&evaluators, &served),
+            Some(5),
+            "a removal aimed at another capability must not touch this one",
+        );
     }
 }
