@@ -15621,9 +15621,7 @@ impl MeshNode {
                         hook();
                     }
                 }
-                drop(store_guard);
                 for (grant_id, pinned) in &grant_authority {
-                    let store_guard = self.scoped_discovery.lock();
                     let rows: Arc<[PrivateCapabilityProvider]> = match pinned {
                         // Not installed ⇒ nothing is discoverable under it, even
                         // if records are still stored. Exactly the live seam's
