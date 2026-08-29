@@ -438,17 +438,21 @@ impl OrgClient {
         capability: &CapabilityAuthorityId,
         capture: &OrgColdDiscovery,
     ) -> Result<PlanAttempt, OrgSdkError> {
-        // Derive into a VALUE — never `?` — so the comparison below decides
-        // whether this derivation may speak at all.
+        // Derive and select into an INERT value — never `?`, and never a proof.
+        // The selected candidate is the whole outcome of the derivation; the
+        // intent does not exist yet, because §10 puts the comparison BETWEEN
+        // selection and the mint and F2 found this path minting before it.
         let (candidates, considered) = self.derive_captured(capability, capture);
-        let derived = candidates.and_then(|candidates| {
-            self.select_candidate(capability, &candidates, considered)
-                .map(|candidate| self.intent_for(candidate))
-        });
+        let selected: Result<AuthorizedOrgCandidate, OrgSdkError> =
+            candidates.and_then(|candidates| {
+                self.select_candidate(capability, &candidates, considered)
+                    .cloned()
+            });
         if !self.node.org_cold_authority_is_current(capture.authority()) {
             return Ok(PlanAttempt::Superseded { considered });
         }
-        derived.map(|intent| PlanAttempt::Minted(Box::new(intent)))
+        // Current: NOW the proof intent may exist.
+        selected.map(|candidate| PlanAttempt::Minted(Box::new(self.intent_for(&candidate))))
     }
 
     /// [`Self::plan`] over the public exported plane — the same selection rule,
@@ -499,14 +503,15 @@ impl OrgClient {
         authority: &OrgColdAuthority,
     ) -> Result<PlanAttempt, OrgSdkError> {
         let (candidates, considered) = self.derive_exported(capability, service, authority);
-        let derived = candidates.and_then(|candidates| {
-            self.select_candidate(capability, &candidates, considered)
-                .map(|candidate| self.intent_for(candidate))
-        });
+        let selected: Result<AuthorizedOrgCandidate, OrgSdkError> =
+            candidates.and_then(|candidates| {
+                self.select_candidate(capability, &candidates, considered)
+                    .cloned()
+            });
         if !self.node.org_cold_authority_is_current(authority) {
             return Ok(PlanAttempt::Superseded { considered });
         }
-        derived.map(|intent| PlanAttempt::Minted(Box::new(intent)))
+        selected.map(|candidate| PlanAttempt::Minted(Box::new(self.intent_for(&candidate))))
     }
 
     /// The shared selection rule (OA2-E0.3): org-protected RPC is
@@ -771,9 +776,16 @@ impl OrgClient {
 
     /// Assemble the canonical nine-field proof intent for a chosen candidate.
     /// Pure construction — the authority decision already happened in
-    /// [`Self::plan_attempt`], and its result is released only after the final
-    /// currentness comparison there.
+    /// [`Self::plan_attempt`], which calls this ONLY after its final currentness
+    /// comparison holds.
+    ///
+    /// That ordering is witnessed rather than asserted: under `cfg(test)` every
+    /// construction bumps a thread-local counter, and the compare-before-mint
+    /// witnesses prove a superseded attempt leaves it untouched (independent
+    /// review F2).
     pub(crate) fn intent_for(&self, candidate: &AuthorizedOrgCandidate) -> OrgProofIntent {
+        #[cfg(test)]
+        INTENTS_CONSTRUCTED.with(|count| count.set(count.get() + 1));
         OrgProofIntent {
             caller: self.caller.clone(),
             membership: self.membership.clone(),
@@ -918,6 +930,23 @@ impl OrgClient {
 /// captured proof is worthless, and there is no per-call knowledge that improves
 /// on the substrate's frozen value.
 const DEFAULT_PROOF_TTL_SECS: u64 = net::adapter::net::behavior::org_call::MAX_ORG_PROOF_TTL_SECS;
+
+/// Test-only: proof intents constructed on THIS thread.
+///
+/// Thread-local rather than global: the witnesses run their attempts inline on
+/// the test's own thread, so a per-thread count is exact and cannot be raced by
+/// a sibling test. It exists to make "no intent is constructed under a superseded
+/// capture" observable instead of merely stated (independent review F2).
+#[cfg(test)]
+thread_local! {
+    static INTENTS_CONSTRUCTED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: the current thread's proof-intent construction count.
+#[cfg(test)]
+pub(crate) fn intents_constructed_on_this_thread() -> u64 {
+    INTENTS_CONSTRUCTED.with(std::cell::Cell::get)
+}
 
 /// How many times the cold plan re-derives from a fresh capture when the
 /// authority it derived under moved before the intent was minted

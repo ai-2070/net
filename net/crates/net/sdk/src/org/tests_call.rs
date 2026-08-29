@@ -1204,3 +1204,116 @@ async fn cold_capture_refusals_map_onto_the_existing_vocabulary() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// F2 (independent review, 2026-08-29) — the proof intent is constructed only
+// AFTER the final currentness comparison, on both paths.
+//
+// The first repair satisfied every behavioural assertion while minting BEFORE
+// the comparison: `Superseded` was returned, no intent escaped, and no test
+// could tell. These witnesses close that by counting CONSTRUCTIONS, so the
+// sequence itself is observable.
+// ---------------------------------------------------------------------------
+
+/// A superseded PRIVATE attempt constructs no proof intent at all, and the
+/// positive control constructs exactly one.
+///
+/// Dies to moving `intent_for` back before the comparison: the superseded arm
+/// would then construct an intent it throws away, and the count would rise.
+#[tokio::test]
+async fn a_superseded_private_attempt_constructs_no_intent() {
+    let a = org_a();
+    let (mesh, identity, dir) = mesh_with_authority("cold-mint-order", Some(&a)).await;
+    let provider = EntityKeypair::generate();
+    let tag = "nrpc:internal.reindex";
+    inject_owner_envelope(&mesh, &a, &provider, &[tag]);
+    mesh.node()
+        .test_pin_peer_entity(provider.entity_id().node_id(), provider.entity_id().clone());
+    let client = bind(&mesh, &a, &identity, vec![]);
+    let capability = cap(tag);
+
+    // Positive control FIRST, so a zero delta below cannot come from a plan that
+    // never selects anything.
+    let current = client.capture_private(&capability).expect("capture");
+    let before = super::call::intents_constructed_on_this_thread();
+    match client
+        .plan_attempt(&capability, &current)
+        .expect("the control derivation succeeds")
+    {
+        super::call::PlanAttempt::Minted(intent) => {
+            assert_eq!(
+                intent.capability, capability,
+                "control: the canonical intent"
+            )
+        }
+        super::call::PlanAttempt::Superseded { .. } => {
+            panic!("control: an unmoved capture must mint")
+        }
+    }
+    assert_eq!(
+        super::call::intents_constructed_on_this_thread() - before,
+        1,
+        "control: a current attempt constructs EXACTLY one intent"
+    );
+
+    let stale = client.capture_private(&capability).expect("capture");
+    renew_authority(&mesh, &a, &identity, &dir);
+    let before = super::call::intents_constructed_on_this_thread();
+    match client
+        .plan_attempt(&capability, &stale)
+        .expect("a superseded derivation is not an error")
+    {
+        super::call::PlanAttempt::Superseded { considered } => assert_eq!(considered, 1),
+        super::call::PlanAttempt::Minted(_) => panic!("a superseded capture must not mint"),
+    }
+    assert_eq!(
+        super::call::intents_constructed_on_this_thread(),
+        before,
+        "a superseded attempt must construct NO proof intent — not even one it \
+         discards: §10 puts the comparison BETWEEN selection and the mint"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The exported attempt has the same sequence: select, compare, then mint.
+///
+/// Its derivation refuses on an empty public plane, so this witness pairs the
+/// superseded arm with a construction count rather than with a minted intent —
+/// and asserts the count stays at zero in BOTH the refusing-current and the
+/// superseded cases, because neither may construct a proof.
+#[tokio::test]
+async fn a_superseded_exported_attempt_constructs_no_intent() {
+    let a = org_a();
+    let (mesh, identity, dir) = mesh_with_authority("cold-mint-order-exported", Some(&a)).await;
+    let client = bind(&mesh, &a, &identity, vec![]);
+    let capability = cap("nrpc:public.svc");
+    let authority = mesh.node().org_cold_authority().expect("authority capture");
+
+    let before = super::call::intents_constructed_on_this_thread();
+    assert!(
+        client
+            .plan_exported_attempt(&capability, "public.svc", &authority)
+            .is_err(),
+        "control: the empty public plane refuses while the capture is current"
+    );
+    assert_eq!(
+        super::call::intents_constructed_on_this_thread(),
+        before,
+        "a refusal constructs no intent"
+    );
+
+    renew_authority(&mesh, &a, &identity, &dir);
+    match client
+        .plan_exported_attempt(&capability, "public.svc", &authority)
+        .expect("a superseded derivation is not an error")
+    {
+        super::call::PlanAttempt::Superseded { considered } => assert_eq!(considered, 0),
+        super::call::PlanAttempt::Minted(_) => panic!("nothing was mintable"),
+    }
+    assert_eq!(
+        super::call::intents_constructed_on_this_thread(),
+        before,
+        "and neither does a superseded exported attempt"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

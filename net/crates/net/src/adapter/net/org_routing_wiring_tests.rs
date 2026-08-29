@@ -8345,25 +8345,34 @@ async fn a_peer_replaced_after_revalidation_cannot_publish_its_old_session() {
 // where real envelopes can be ingested; these four assert the properties only
 // the node's private state can show.
 
-/// (C1) ONE store critical section spans every plane of a capture — with a REAL
-/// grant plane executing inside it.
+/// (C1) ONE ACQUISITION spans the owner plane and a real, non-empty grant query.
 ///
-/// **HOLD-4 (independent review, 2026-08-29): the first version of this witness
-/// requested zero grant planes**, so the production grant loop ran zero
-/// iterations and the assertion was about a lock held at one source location
-/// rather than about the owner→grant boundary. This version installs a real
-/// consumer DISCOVER grant, ingests a matching granted record through the real
-/// verified ingest path, asks for that grant id, and asserts the granted plane
-/// actually produced its row — so a mutation that splits the section around a
-/// NON-EMPTY grant loop is caught.
+/// **Independent review F1: two earlier versions of this witness were weaker than
+/// their name.** The first requested no grant planes at all, so the production
+/// grant loop ran zero iterations. The second executed a real grant query but
+/// observed the lock only immediately BEFORE the loop — so a split that dropped
+/// the guard after the owner plane and reacquired around each grant query held a
+/// lock at every observation point and survived.
 ///
-/// The contention form, not a counter: the hook fires with the scoped-store lock
-/// HELD, between the owner plane and the grant planes, and proves a rival
-/// `try_lock` FAILS there. Carries its own negative control: the same `try_lock`
-/// succeeds once the capture has returned, so the positive half cannot be
-/// satisfied by a lock that is simply never available.
+/// The property is not "a lock is held twice", it is "ONE acquisition spans
+/// both", so this witness compares the production SECTION IDENTITY stamped by
+/// `MeshNode::lock_cold_section` at the two production-coupled points:
+///
+/// ```text
+/// pre-loop hook      lock held (rival try_lock fails) + identity I, count N
+/// in-query hook      fired INSIDE the grant loop, after that grant's real query
+///                    produced its rows: lock still held + identity STILL I
+/// after the capture  the lock is free again; exactly ONE section was opened
+/// ```
+///
+/// The in-query hook receives the row count, so an empty grant list cannot be
+/// mistaken for an executed query, and the witness additionally asserts the row
+/// reached the returned capture. `tests/org_cold_plan_surface_guard.rs` carries
+/// the structural leg: `capture_cold` acquires the store only through
+/// `lock_cold_section`, exactly once, with both plane queries inside it — which
+/// is what catches a split that bypasses the instrumented acquisition.
 #[tokio::test]
-async fn a_cold_capture_holds_one_store_section_across_every_plane() {
+async fn one_cold_capture_acquisition_spans_the_owner_and_grant_queries() {
     let fx = grant_fixture("cold-section").await;
     let tag = "nrpc:cold.section";
     let capability = CapabilityAuthorityId::for_tag(tag);
@@ -8372,15 +8381,30 @@ async fn a_cold_capture_holds_one_store_section_across_every_plane() {
     let (grant_id, _handle) = fx.install(grant, secret);
     fx.ingest_granted(&envelope_secret, tag);
 
-    let observed = Arc::new(AtomicBool::new(false));
-    let contended = Arc::new(AtomicBool::new(false));
+    // (identity, acquisitions, rival try_lock failed) at each observation point.
+    let pre_loop: Arc<parking_lot::Mutex<Option<(u64, u64, bool)>>> =
+        Arc::new(parking_lot::Mutex::new(None));
+    let in_query: Arc<parking_lot::Mutex<Vec<(u64, u64, bool, usize)>>> =
+        Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let (_, acquisitions_before) = fx.node.cold_section_observation();
     {
+        let node = fx.node.clone();
         let scoped = fx.node.scoped_discovery.clone();
-        let observed = observed.clone();
-        let contended = contended.clone();
+        let pre_loop = pre_loop.clone();
         *fx.node.cold_capture_plane_gap_hook.lock() = Some(Arc::new(move || {
-            observed.store(true, Ordering::Release);
-            contended.store(scoped.try_lock().is_none(), Ordering::Release);
+            let (identity, acquisitions) = node.cold_section_observation();
+            *pre_loop.lock() = Some((identity, acquisitions, scoped.try_lock().is_none()));
+        }));
+    }
+    {
+        let node = fx.node.clone();
+        let scoped = fx.node.scoped_discovery.clone();
+        let in_query = in_query.clone();
+        *fx.node.cold_capture_in_grant_query_hook.lock() = Some(Arc::new(move |rows| {
+            let (identity, acquisitions) = node.cold_section_observation();
+            in_query
+                .lock()
+                .push((identity, acquisitions, scoped.try_lock().is_none(), rows));
         }));
     }
 
@@ -8388,27 +8412,59 @@ async fn a_cold_capture_holds_one_store_section_across_every_plane() {
         .node
         .org_cold_discovery(&capability, &[grant_id])
         .expect("an adopted node captures");
-    assert!(
-        observed.load(Ordering::Acquire),
-        "the between-planes window was never entered, so this witness asserted \
-         nothing"
+
+    let (pre_identity, pre_acquisitions, pre_contended) = pre_loop
+        .lock()
+        .take()
+        .expect("the between-planes window was never entered, so this witness asserted nothing");
+    let queries = in_query.lock().clone();
+    assert_eq!(
+        queries.len(),
+        1,
+        "exactly one grant query must have executed inside the section — an empty \
+         grant list would make this witness vacuous (F1)"
+    );
+    let (query_identity, query_acquisitions, query_contended, rows) = queries[0];
+    assert_eq!(
+        rows, 1,
+        "the grant query must have produced the ingested row, so the observation \
+         below is about a REAL non-empty query"
     );
     assert_eq!(
         capture.granted_providers(&grant_id).len(),
         1,
-        "the GRANT plane must actually have executed inside the section — a \
-         witness that requests no grant planes proves nothing about the \
-         owner->grant boundary (HOLD-4)"
+        "and that row reached the capture"
     );
     assert!(
-        contended.load(Ordering::Acquire),
-        "a store mutation could occupy the gap between two planes of ONE capture"
+        pre_contended,
+        "the store lock must be held at the owner->grant boundary"
+    );
+    assert!(
+        query_contended,
+        "and still held INSIDE the grant query — the point the pre-loop \
+         observation alone cannot see"
+    );
+    assert_ne!(pre_identity, 0, "a section identity must have been stamped");
+    assert_eq!(
+        pre_identity, query_identity,
+        "the SAME acquisition must span the owner plane and the grant query; a \
+         drop-and-reacquire holds a lock at both points but moves this identity"
+    );
+    assert_eq!(
+        (pre_acquisitions, query_acquisitions),
+        (acquisitions_before + 1, acquisitions_before + 1),
+        "exactly ONE store section may be opened per capture"
+    );
+    let (_, acquisitions_after) = fx.node.cold_section_observation();
+    assert_eq!(
+        acquisitions_after,
+        acquisitions_before + 1,
+        "and none afterwards"
     );
     assert!(
         fx.node.scoped_discovery.try_lock().is_some(),
         "control: the store lock is free once the capture returns, so the \
-         positive half above is about the capture and not about an unavailable \
-         lock"
+         contention above is about the capture and not about an unavailable lock"
     );
 }
 
