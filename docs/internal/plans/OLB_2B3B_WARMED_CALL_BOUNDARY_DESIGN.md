@@ -2899,8 +2899,10 @@ otherwise be satisfied by a strictly worse implementation:
 
 ## 19. 2B.3d-pre step 1 — the candidate record
 
-**Status: candidate `bd0589d1b` was HELD by two independent reviews; the repair
-is IMPLEMENTED at `436fb8c1a` and is NOT SIGNED.** Entered on the user's explicit
+**Status: candidate `bd0589d1b` was HELD by two independent reviews; a second
+specification review HELD the repair on two further blockers. Both rounds are
+repaired additively — `436fb8c1a`, then `f52116d0b` + `5d02b9156` — and NOTHING
+here is SIGNED.** Entered on the user's explicit
 direction (2026-08-29) while 2B.3c step 2 remains unsigned; this section records
 the authorization, the content, the two HOLDs and the additive repair (§19.6),
 and claims no signature. Independent review owns the boundary.
@@ -2910,7 +2912,7 @@ real defects — a capture that could stamp a predecessor view with the successo
 epoch, a final comparison that was not linearizable across routing and grant
 authority, negative derivations that escaped a superseded view, and an
 every-plane witness that executed no grant plane — plus an unauthorized public
-surface. §19.6 is the record.
+surface. §19.6 is the record of the first round, §19.7 of the second.
 
 ### 19.1 What it changes, mechanism first
 
@@ -2980,14 +2982,14 @@ overclaimed:
 
 | Witness | Where | Dies to |
 |---|---|---|
-| `a_cold_capture_holds_one_store_section_across_every_plane` | wiring | one lock acquisition per plane. **The first version of this witness requested ZERO grant planes and therefore proved nothing about the owner→grant boundary (HOLD-4); the claim above was false until the repair.** |
+| ~~`a_cold_capture_holds_one_store_section_across_every_plane`~~ | wiring | **RETIRED, twice insufficient.** Version 1 requested ZERO grant planes, so the production grant loop never ran (HOLD-4). Version 2 ran a real grant query but observed the lock only BEFORE the loop, so a split that reacquired around each query held a lock at every observation point and survived (F1). Replaced by `one_cold_capture_acquisition_spans_the_owner_and_grant_queries` — see §19.7. |
 | `an_authority_install_inside_a_cold_capture_is_never_captured_across` | wiring | dropping the epoch RE-CHECK. **Insufficient: it exercised an install COMPLETED after the capture's sample, never the writer's pre-publication window (HOLD-1). Replaced by `an_authority_install_during_a_cold_capture_waits_for_it` plus §19.6's window witness.** |
 | `an_unadopted_node_refuses_the_cold_capture` | wiring | reporting the no-authority arm as churn |
 | `a_spent_authority_epoch_refuses_the_cold_capture` | wiring | dropping the exhaustion check |
 | `a_captured_stamp_compares_the_revocation_floor_generation` | wiring | dropping `floor_generation` from the comparison |
 | `the_cold_capture_serves_exactly_what_the_live_plane_seams_serve` | sdk | not querying the grant planes |
 | `a_captured_stamp_notices_a_consumer_grant_replacement` | sdk | comparing `grant_id` only |
-| `a_plan_attempt_under_a_moved_authority_mints_nothing` | sdk | removing the final comparison |
+| `a_plan_attempt_under_a_moved_authority_mints_nothing` | sdk | removing the final comparison. **Necessary but not sufficient: it proves no intent ESCAPES a superseded view, not that none is CONSTRUCTED. Both attempts did construct one before the comparison until F2 (§19.7).** |
 
 Every mutation was applied to production code, run, and reverted; each killed
 exactly the witness above and no other. Three carry adjacent controls that a
@@ -3031,7 +3033,8 @@ window. Both witnesses are kept, and labelled for what each proves.
 
 ### 19.5 Three consequences worth naming
 
-**The capture holds the AUTHORITY GATE and the scoped-store lock** (§19.6, H1),
+**The capture holds the AUTHORITY GATE and the scoped-store lock** (§19.6, H1;
+the store acquisition goes through `lock_cold_section`, §19.7),
 in the writer's own order. So an authority or store installation now waits for
 one capture rather than interleaving with it — at the gate, and again at the
 store lock its floor reconciliation needs. Bounded by construction: the
@@ -3102,6 +3105,89 @@ accepts that linearization, and remote admission is final); no witness covers a
 peer-session change after reachability annotation; and the exported plane has no
 live public-provider movement witness — its superseded gating is witnessed on an
 empty plane.
+
+### 19.7 The specification review's two blockers, and their repair
+
+A second independent review ACCEPTED H1/H2/H3 and found two remaining blockers.
+Repaired at `f52116d0b`, with one corrective commit `5d02b9156` (below).
+
+**F1 — the every-plane evidence did not prove one ACQUISITION.** The repaired
+witness ran a real installed+ingested grant row, but its only lock observation
+was immediately BEFORE the grant loop. A split that dropped the guard after the
+owner plane and reacquired around each grant query therefore held a lock at
+every observation point, returned the right row, and released after the capture —
+it survived. Contention cannot express the property; identity can:
+
+```text
+capture_cold  ->  self.lock_cold_section()      the ONLY acquisition allowed here
+                  cfg(test): stamps a per-acquisition SECTION IDENTITY + counter
+
+pre-loop hook     rival try_lock fails; identity I; count N
+in-query hook     fired INSIDE the grant loop, AFTER that grant's real query
+                  produced its rows: rival try_lock fails; identity STILL I
+after capture     lock free; exactly ONE section opened for the capture
+```
+
+The in-query hook carries the query's row count, so an empty grant list cannot
+masquerade as an executed query, and the witness also asserts the row reached the
+returned capture.
+
+**Two legs, and neither is claimed to do the other's work.** A split that
+reacquires THROUGH the helper moves the identity and the count — the runtime
+witness dies. A split that BYPASSES the helper with a bare
+`scoped_discovery.lock()` stamps no identity, so the runtime witness passes; that
+case is caught by the structural leg,
+`org_cold_plan_surface_guard::the_cold_capture_holds_exactly_one_store_acquisition`,
+which asserts `capture_cold` contains exactly one `lock_cold_section()` call,
+zero bare acquisitions, and both production plane queries inside the section. The
+guard is non-vacuous by construction: it must find the function and both query
+calls, or its assertions cannot pass. It is CI-pinned in the no-features step
+beside `doc_link_guard`.
+
+**F2 — both attempts constructed the proof intent BEFORE the comparison.** No
+intent escaped, every behavioural assertion held, and the sequence was still
+wrong: §10 puts the comparison between selection and the mint, and the bridge and
+plan docs said so while the code minted first. Each attempt now derives and
+selects into an inert `AuthorizedOrgCandidate` result, runs the whole-vector
+comparison, and only then calls `intent_for`. A `cfg(test)` thread-local counter
+in `intent_for` makes the sequence observable rather than asserted.
+
+**What the F2 evidence proves, exactly:**
+
+- `a_superseded_private_attempt_constructs_no_intent` — positive control first (a
+  current capture constructs EXACTLY one), then a superseded capture constructs
+  ZERO. This is the load-bearing runtime witness.
+- `a_superseded_exported_attempt_constructs_no_intent` — the exported superseded
+  arm and the exported current-refusal arm both construct zero. **It does NOT
+  witness the exported ordering**: its derivation refuses on an empty public
+  plane, so `intent_for` is unreachable either way, and it PASSES under the
+  pre-repair exported shape. The exported ordering is held by the structural leg
+  `both_cold_plan_attempts_mint_after_the_comparison`; a real exported mint is
+  exercised live by
+  `sdk::org::tests_live::live_call_exported_reaches_a_subnet_exported_service`. A
+  unit-level exported mint would need an owned public projection, which requires
+  a core-internal fold helper the SDK test crate cannot reach — stated rather
+  than papered over.
+
+**F-round mutation ledger.** Applied to production, run, reverted.
+
+| Mutation | Runtime witness | Structural guard |
+|---|---|---|
+| drop after the owner plane, reacquire per grant query THROUGH the helper | **FAIL** (`identity … left: 1 right: 2`) | **FAIL** (two acquisitions) |
+| same split with a BARE `scoped_discovery.lock()` | passes — a bare acquisition stamps no identity, by construction | **FAIL** (bare acquisition present) |
+| query the grant plane with the section RELEASED | **FAIL** (`still held INSIDE the grant query`) | passes (one acquisition, none bare) |
+| private attempt mints inside the derivation (pre-repair shape) | **FAIL** (`right: 1` — the superseded arm constructed one) | **FAIL** (mint precedes compare) |
+| exported attempt mints inside the derivation | passes — the derivation refuses first (see above) | **FAIL** (mint precedes compare) |
+
+**One process failure, recorded rather than hidden.** While running the F1
+ledger I reverted `mesh.rs` with `git checkout` before the F1 production change
+was committed, lost it, and reapplied it with anchored replacements. The anchors
+matched the mutated text, so one probe — a `drop` plus a bare per-grant
+acquisition, i.e. exactly the F1 defect — was reapplied and COMMITTED in
+`f52116d0b`. The structural leg in that same commit rejects it; `5d02b9156`
+restores the single acquisition, and both legs are green. The lesson is the
+mechanical one: commit before mutating, and re-run the guard after any
+reapplication.
 
 ## Open questions
 
