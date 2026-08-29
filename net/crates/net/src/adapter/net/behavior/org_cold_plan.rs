@@ -19,7 +19,7 @@
 //!
 //! What the capture proves, exactly:
 //!
-//! - **one instant.** [`OrgColdDiscovery::now_secs`] is the only clock the plan
+//! - **one instant.** `OrgColdDiscovery::now_secs` is the only clock the plan
 //!   sees. Before this, a plan sampled the wall clock once per credential and
 //!   once per discovery plane, so it could be assembled from credentials that
 //!   were never simultaneously valid.
@@ -33,7 +33,7 @@
 //! - **one scoped-store critical section.** The owner scope and every grant
 //!   scope are queried under a single lock acquisition, so a store mutation
 //!   cannot land between two planes of one plan.
-//! - **one authority identity.** [`OrgColdAuthorityStamp`] names the exact
+//! - **one authority identity.** `OrgColdAuthorityStamp` names the exact
 //!   authority the capture was taken under, and the plan compares it again
 //!   before the proof exists.
 //!

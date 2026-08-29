@@ -237,6 +237,11 @@ record is
 the cold path now derives from ONE captured observation of private-discovery
 authority and refuses to mint a proof under an identity that moved.
 `OrgCapabilityRegistration` remains dark and LS-1..LS-6 remain unbuilt.
+Two independent reviews HELD that candidate on six blockers (capture atomicity
+against the writer's pre-publication window, whole-vector currentness across
+routing and grant authority, superseded negative derivations, a witness that
+executed no grant plane, an unauthorized public bridge surface, and one stale doc
+link); the additive repair is landed and likewise unsigned.
 
 **Head tokens (corrected 2026-07-28).** The sign-off initially named `351f93480`
 as `SAFE_LIVE_HEAD`; that was withdrawn on review, since the token is reserved by
