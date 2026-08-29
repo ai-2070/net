@@ -422,33 +422,57 @@ async fn a_state_edge_notification_advances_the_exact_observation_path() {
 }
 
 /// A notification for a capability nothing is watching moves nothing,
-/// and a closed handle's notification is inert — so a stale handle
-/// cannot disturb its replacement's emission schedule.
+/// and a closed handle's notification is inert.
+///
+/// The inertness half is DIFFERENTIAL, because "closed handle returns
+/// false" is trivially satisfiable whenever the node happens to have
+/// nothing to move. The stale handle is asked FIRST and its successor
+/// SECOND, and the witness demands `successor moved && !stale moved` in
+/// one iteration. A `changed()` that ignored the closed flag would poke
+/// the node from the stale handle, consume the movement, and leave the
+/// successor with nothing — so the conjunction can never hold.
+///
+/// Fails against: `changed()` that pokes nothing; `changed()` that
+/// ignores `close`.
 #[tokio::test]
 async fn changed_is_false_when_nothing_is_watching_and_inert_once_closed() {
     let mesh = origin_mesh().await;
     let client = mesh.sensing().expect("sensing enabled");
     let (_ready, _evaluations, evaluator) = FlagEvaluator::pair();
 
-    let registration = client
+    let stale = client
         .provide(CapabilityId::new(CAPABILITY), evaluator)
         .expect("provide");
     assert!(
-        !registration.changed(),
+        !stale.changed(),
         "no live stream targets this capability yet",
     );
 
     let _branch = watch_self(&mesh, CAPABILITY).await;
     assert!(
-        poll_until(POLL, || registration.changed()).await,
+        poll_until(POLL, || stale.changed()).await,
         "a live stream must eventually be movable",
     );
 
-    assert!(registration.close());
+    // Retire the handle and hand the capability to a successor. The
+    // observation path is untouched by either operation — it belongs to
+    // the interest, not to the evaluator registration.
+    assert!(stale.close());
+    let successor = client
+        .provide(CapabilityId::new(CAPABILITY), Arc::new(AlwaysNotReady))
+        .expect("successor provide");
+
     assert!(
-        !registration.changed(),
-        "a closed registration must not touch the node",
+        poll_until(POLL, || {
+            let stale_moved = stale.changed();
+            let successor_moved = successor.changed();
+            successor_moved && !stale_moved
+        })
+        .await,
+        "the stale handle must never move a schedule its successor owns",
     );
+
+    assert!(successor.close());
 }
 
 // ---------------------------------------------------------------------
@@ -624,14 +648,32 @@ async fn duplicate_providers_in_the_population_collapse_to_one_projection() {
     assert!(projection.non_viable().is_empty());
 }
 
-/// An empty authorized population projects nothing. Sensing cannot
-/// invent a candidate.
+/// An empty authorized population projects nothing — even while the
+/// node holds a live, established observation it could have reported.
+/// Sensing cannot invent a candidate, and "no authorized providers" is
+/// the strongest form of the clamp.
+///
+/// Fails against: a projection that enumerates observations and forgets
+/// the population.
 #[tokio::test]
 async fn an_empty_population_projects_no_providers() {
     let mesh = origin_mesh().await;
     let client = mesh.sensing().expect("sensing enabled");
-    let spec = exact_spec(&mesh, CAPABILITY, mesh.inner().node_id());
+    let (_ready, _evaluations, evaluator) = FlagEvaluator::pair();
+    let registration = client
+        .provide(CapabilityId::new(CAPABILITY), evaluator)
+        .expect("provide");
 
+    let own_id = mesh.inner().node_id();
+    let branch = watch_self(&mesh, CAPABILITY).await;
+    assert!(
+        poll_until(POLL, || mesh.inner().sensing_projected(&branch)
+            == ProjectedReadiness::Ready)
+        .await,
+        "the observation the clamp must suppress never established",
+    );
+
+    let spec = exact_spec(&mesh, CAPABILITY, own_id);
     let projection = client
         .exact_provider_readiness(&spec, &budget(), &[])
         .expect("exact projection");
@@ -642,6 +684,9 @@ async fn an_empty_population_projects_no_providers() {
     assert!(projection.potential().is_empty());
     assert!(projection.non_viable().is_empty());
     assert_eq!(projection.best_provider(), None);
+    assert_eq!(projection.readiness(own_id), ProjectedReadiness::Unknown);
+
+    assert!(registration.close());
 }
 
 /// The exact seam refuses a provider-free selector rather than

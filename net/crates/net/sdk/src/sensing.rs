@@ -513,6 +513,14 @@ impl ReadinessRegistration {
     /// at most once, and `false` for a repeat close, a close after
     /// drop, or a handle that was already superseded. Live watchers
     /// fall back to `Unknown` at their next beat; nothing fails.
+    ///
+    /// Idempotence is *structural*, not enforced here: the core removal
+    /// is conditional on this handle's registration id, and an id is
+    /// never reused, so a second attempt could only ever find someone
+    /// else's row and refuse. The local flag earns its place for two
+    /// other reasons — it keeps the repeat path (drop always follows an
+    /// explicit close) off the node's map entirely, and it is the same
+    /// bit [`Self::changed`] reads to go inert.
     pub fn close(&self) -> bool {
         if self
             .closed
@@ -592,5 +600,20 @@ mod tests {
             provider_free_selector_name(&ProviderSelector::Tags(Vec::new())),
             "Tags",
         );
+    }
+
+    /// `provide` takes `impl Into<CapabilityId>` so a caller may write
+    /// the name inline. That conversion must be the IDENTITY on the
+    /// name — a `From` that trimmed, lowercased, or otherwise
+    /// normalized would silently address a different capability than
+    /// the one the caller wrote.
+    #[test]
+    fn a_capability_name_converts_verbatim() {
+        let written: CapabilityId = "gpu.infer".into();
+        assert_eq!(written, CapabilityId::new("gpu.infer"));
+        assert_eq!(written.as_str(), "gpu.infer");
+
+        let odd: CapabilityId = " Mixed.Case ".to_string().into();
+        assert_eq!(odd.as_str(), " Mixed.Case ");
     }
 }
