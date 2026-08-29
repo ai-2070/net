@@ -46,6 +46,23 @@
 //!   a later announcement simply is not in this plan — exactly as before.
 //! - **it says nothing about direct reachability.** Session state is not
 //!   authority; the plan annotates it after authorization, as it always has.
+//!
+//! # Not application API
+//!
+//! **This is an unstable workspace-internal OLB implementation bridge.** It is
+//! `pub` for exactly one reason: the coherent capture is produced by `MeshNode`
+//! in this crate and consumed by the cold plan in the separate `net-mesh-sdk`
+//! crate, so the three types the SDK names have to cross the crate boundary.
+//! Every item here is `#[doc(hidden)]`, appears in no generated public
+//! documentation, is re-exported by no SDK surface, carries NO stability
+//! guarantee, and is not covered by semver. Applications use the two-verb facade
+//! (`mesh.org(credentials)?` / `org.call(..)`), whose API and error vocabulary
+//! this slice leaves unchanged. `tests/org_cold_plan_surface_guard.rs` enforces
+//! all of that.
+//!
+//! Nothing beyond what the SDK actually needs is exported: the authority stamp
+//! and the per-grant installation identity are crate-internal, because the SDK
+//! never inspects them — it passes the capture back to the node's comparison.
 
 use std::sync::Arc;
 
@@ -60,6 +77,7 @@ use crate::adapter::net::behavior::org_scoped_store::PrivateCapabilityProvider;
 ///
 /// Both arms are LOCAL refusals: nothing was sent, no proof was minted, and no
 /// provider was contacted. Neither is a statement about any provider.
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrgColdRefusal {
     /// No node authority is installed, so this node holds no private-discovery
@@ -84,17 +102,17 @@ pub enum OrgColdRefusal {
 /// equivalent comparison — so the cold plan is never weaker about grant
 /// authority than the warmed plane it is the fallback for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct OrgColdGrantAuthority {
+pub(crate) struct OrgColdGrantAuthority {
     /// The grant this scope was authorized by.
-    pub grant_id: [u8; 32],
+    pub(crate) grant_id: [u8; 32],
     /// The node-local installation identity (non-aliasing and monotone), which
     /// distinguishes two installations of the same signed grant.
-    pub install_seq: u64,
+    pub(crate) install_seq: u64,
     /// The signature over the whole canonical grant.
-    pub grant_signature: [u8; 64],
+    pub(crate) grant_signature: [u8; 64],
     /// The installed audience handle, mirroring the live query's own
     /// defense-in-depth check.
-    pub audience_handle: [u8; 32],
+    pub(crate) audience_handle: [u8; 32],
 }
 
 impl OrgColdGrantAuthority {
@@ -133,7 +151,7 @@ impl OrgColdGrantAuthority {
 /// here, because the rows it changes are captured values that were already
 /// filtered per row.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OrgColdAuthorityStamp {
+pub(crate) struct OrgColdAuthorityStamp {
     authority_org: OrgId,
     epoch: u64,
     poisoned: bool,
@@ -161,23 +179,23 @@ impl OrgColdAuthorityStamp {
     }
 
     /// The organization that owns this node, as observed.
-    pub fn authority_org(&self) -> OrgId {
+    pub(crate) fn authority_org(&self) -> OrgId {
         self.authority_org
     }
 
     /// The routing authority epoch the observation was taken under.
-    pub fn epoch(&self) -> u64 {
+    pub(crate) fn epoch(&self) -> u64 {
         self.epoch
     }
 
     /// The revocation view's poison bit, sampled coherently with the generation
     /// that qualifies it.
-    pub fn poisoned(&self) -> bool {
+    pub(crate) fn poisoned(&self) -> bool {
         self.poisoned
     }
 
     /// The revocation floor generation every plane was filtered against.
-    pub fn floor_generation(&self) -> u64 {
+    pub(crate) fn floor_generation(&self) -> u64 {
         self.floor_generation
     }
 
@@ -204,7 +222,7 @@ impl OrgColdAuthorityStamp {
     /// caller asked for them. `None` means the grant was not installed, which is
     /// itself part of the identity: an install landing afterwards moves the
     /// stamp.
-    pub fn grants(&self) -> &[([u8; 32], Option<OrgColdGrantAuthority>)] {
+    pub(crate) fn grants(&self) -> &[([u8; 32], Option<OrgColdGrantAuthority>)] {
         &self.grants
     }
 }
@@ -216,6 +234,7 @@ impl OrgColdAuthorityStamp {
 /// this and no private rows — one clock, one authority identity, one final
 /// comparison — and querying the private planes to obtain a clock would be work
 /// that path has no use for.
+#[doc(hidden)]
 #[derive(Debug, Clone)]
 pub struct OrgColdAuthority {
     now_secs: u64,
@@ -236,13 +255,32 @@ impl OrgColdAuthority {
     }
 
     /// The authority identity the observation was taken under.
-    pub fn stamp(&self) -> &OrgColdAuthorityStamp {
+    pub(crate) fn stamp(&self) -> &OrgColdAuthorityStamp {
         &self.stamp
     }
 
     /// The organization that owns this node, as observed at capture time.
     pub fn authority_org(&self) -> OrgId {
         self.stamp.authority_org()
+    }
+
+    /// The same capture with a DIFFERENT captured floor generation — the
+    /// isolation seam for the floor component of the final comparison.
+    ///
+    /// A real floor raise advances the routing epoch too (the raise notifies the
+    /// subscriber that advances it), so an end-to-end raise cannot show that the
+    /// floor generation is compared ON ITS OWN. It has to be, because a floor
+    /// publication is authoritative inside the revocation store BEFORE that
+    /// subscriber runs — the same window `SlotBaseFacts` keeps its own
+    /// `floor_generation` for. Mirrors the read seam's witness technique
+    /// (`facts_built_against_superseded_floors_read_cold`), which fabricates the
+    /// generation rather than racing the subscriber.
+    #[cfg(test)]
+    pub(crate) fn with_floor_generation_for_test(&self, floor_generation: u64) -> Self {
+        Self {
+            now_secs: self.now_secs,
+            stamp: self.stamp.with_floor_generation_for_test(floor_generation),
+        }
     }
 }
 
@@ -252,6 +290,7 @@ impl OrgColdAuthority {
 /// Immutable by construction — there is no mutating accessor and no interior
 /// mutability — so a plan derived from it cannot observe two states of the
 /// world. Produced only by `MeshNode::org_cold_discovery`.
+#[doc(hidden)]
 #[derive(Debug, Clone)]
 pub struct OrgColdDiscovery {
     authority: OrgColdAuthority,
@@ -283,11 +322,6 @@ impl OrgColdDiscovery {
     /// window and expiry filter in the plan uses exactly this value.
     pub fn now_secs(&self) -> u64 {
         self.authority.now_secs()
-    }
-
-    /// The authority identity the observation was taken under.
-    pub fn stamp(&self) -> &OrgColdAuthorityStamp {
-        self.authority.stamp()
     }
 
     /// The organization that owns this node, as observed at capture time.

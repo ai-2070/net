@@ -844,7 +844,8 @@ async fn a_raised_revocation_floor_supersedes_the_capture_it_preceded() {
 
     let capture = client.capture_private(&capability).expect("capture");
     assert!(
-        mesh.node().org_cold_authority_is_current(capture.stamp()),
+        mesh.node()
+            .org_cold_authority_is_current(capture.authority()),
         "control: an untouched authority view compares CURRENT"
     );
 
@@ -859,7 +860,9 @@ async fn a_raised_revocation_floor_supersedes_the_capture_it_preceded() {
         .expect("the org raises a floor");
 
     assert!(
-        !mesh.node().org_cold_authority_is_current(capture.stamp()),
+        !mesh
+            .node()
+            .org_cold_authority_is_current(capture.authority()),
         "a raised floor must supersede the authority identity captured before it"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -893,7 +896,8 @@ async fn a_captured_stamp_notices_a_consumer_grant_replacement() {
         "precondition: the grant plane carries the provider"
     );
     assert!(
-        mesh.node().org_cold_authority_is_current(capture.stamp()),
+        mesh.node()
+            .org_cold_authority_is_current(capture.authority()),
         "control: the untouched installation compares CURRENT"
     );
 
@@ -908,7 +912,9 @@ async fn a_captured_stamp_notices_a_consumer_grant_replacement() {
         .expect("reinstall the same grant");
 
     assert!(
-        !mesh.node().org_cold_authority_is_current(capture.stamp()),
+        !mesh
+            .node()
+            .org_cold_authority_is_current(capture.authority()),
         "a reinstallation is a DIFFERENT installation, so the captured identity \
          is superseded"
     );
@@ -964,7 +970,9 @@ async fn a_plan_attempt_under_a_moved_authority_mints_nothing() {
         .install_node_authority(Arc::new(successor))
         .expect("same-org renewal is accepted");
     assert!(
-        !mesh.node().org_cold_authority_is_current(capture.stamp()),
+        !mesh
+            .node()
+            .org_cold_authority_is_current(capture.authority()),
         "precondition: the renewal superseded the captured identity"
     );
 
@@ -980,6 +988,219 @@ async fn a_plan_attempt_under_a_moved_authority_mints_nothing() {
         PlanAttempt::Minted(_) => {
             panic!("a proof intent was minted under an authority identity that had moved")
         }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// HOLD-3 (independent review, 2026-08-29) — a superseded view speaks about
+// nothing, including its own refusals.
+// ---------------------------------------------------------------------------
+
+/// Move the node's authority within its own org: a renewal is accepted and
+/// advances the routing epoch, so every capture taken before it is superseded.
+fn renew_authority(mesh: &Mesh, org: &OrgKeypair, identity: &Identity, dir: &std::path::Path) {
+    let entity = identity.entity_id().clone();
+    let cert = OrgMembershipCert::try_issue(org, entity.clone(), 1, 3600).expect("cert");
+    let next = dir.join("successor");
+    let _ = std::fs::remove_dir_all(&next);
+    let authority = NodeAuthority::adopt(&next, cert, &entity, 0, None).expect("adopt successor");
+    mesh.node()
+        .install_node_authority(Arc::new(authority))
+        .expect("same-org renewal is accepted");
+}
+
+/// A `NoAuthorizedProvider` derived under a superseded capture never escapes.
+///
+/// Movement causes this class: a removed consumer grant or a raised floor empties
+/// a plane, so "nothing authorized" is exactly what a stale view reports. Dies to
+/// applying `?` to the derivation before the comparison — the stale refusal then
+/// escapes with authority and outside the bounded budget.
+#[tokio::test]
+async fn a_superseded_no_provider_derivation_does_not_escape() {
+    let a = org_a();
+    let (mesh, identity, dir) = mesh_with_authority("cold-superseded-none", Some(&a)).await;
+    let client = bind(&mesh, &a, &identity, vec![]);
+    let capability = cap("nrpc:internal.reindex");
+
+    let capture = client.capture_private(&capability).expect("capture");
+    // Control: still current, so the exact refusal is preserved verbatim.
+    match client.plan_attempt(&capability, &capture) {
+        Err(OrgSdkError::Discovery(OrgDiscoveryError::NoAuthorizedProvider {
+            considered, ..
+        })) => assert_eq!(considered, 0, "control: nothing discovered, nothing hidden"),
+        other => panic!("control: expected NoAuthorizedProvider, got {other:?}"),
+    }
+
+    renew_authority(&mesh, &a, &identity, &dir);
+    match client
+        .plan_attempt(&capability, &capture)
+        .expect("a superseded derivation is not an error")
+    {
+        super::call::PlanAttempt::Superseded { considered } => assert_eq!(considered, 0),
+        super::call::PlanAttempt::Minted(_) => panic!("nothing was mintable"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An `AmbiguousCapabilityGrant` derived under a superseded capture never
+/// escapes either — the authority-bearing class movement can CREATE, by
+/// installing a second overlapping grant.
+#[tokio::test]
+async fn a_superseded_ambiguity_derivation_does_not_escape() {
+    let (a, b) = (org_a(), org_b());
+    let (mesh, identity, dir) = mesh_with_authority("cold-superseded-ambig", Some(&a)).await;
+    let provider = EntityKeypair::generate();
+    let tag = "nrpc:customer.read";
+    let capability = cap(tag);
+    let (g1, s1) = discover_grant(&b, a.org_id(), capability, 3600);
+    let (g2, s2) = discover_grant(&b, a.org_id(), capability, 3600);
+    let s1_copy = copy_secret(&s1);
+    let client = bind(
+        &mesh,
+        &a,
+        &identity,
+        vec![(g1.clone(), Some(s1)), (g2.clone(), Some(s2))],
+    );
+    inject_granted_envelope(&mesh, &b, &provider, &g1, &s1_copy, tag);
+
+    let capture = client.capture_private(&capability).expect("capture");
+    match client.plan_attempt(&capability, &capture) {
+        Err(OrgSdkError::Credentials(OrgCredentialError::AmbiguousCapabilityGrant {
+            grant_ids,
+            ..
+        })) => assert_eq!(
+            grant_ids.len(),
+            2,
+            "control: the exact ambiguity is reported"
+        ),
+        other => panic!("control: expected AmbiguousCapabilityGrant, got {other:?}"),
+    }
+
+    renew_authority(&mesh, &a, &identity, &dir);
+    match client
+        .plan_attempt(&capability, &capture)
+        .expect("a superseded derivation is not an error")
+    {
+        super::call::PlanAttempt::Superseded { considered } => assert_eq!(
+            considered, 1,
+            "the superseded arm reports the candidates it examined"
+        ),
+        super::call::PlanAttempt::Minted(_) => panic!("an ambiguous plan is never mintable"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The exported path gates its negative outcomes the same way.
+#[tokio::test]
+async fn a_superseded_exported_derivation_does_not_escape() {
+    let a = org_a();
+    let (mesh, identity, dir) = mesh_with_authority("cold-superseded-exported", Some(&a)).await;
+    let client = bind(&mesh, &a, &identity, vec![]);
+    let capability = cap("nrpc:public.svc");
+    let authority = mesh.node().org_cold_authority().expect("authority capture");
+
+    match client.plan_exported_attempt(&capability, "public.svc", &authority) {
+        Err(OrgSdkError::Discovery(OrgDiscoveryError::NoAuthorizedProvider {
+            considered, ..
+        })) => assert_eq!(considered, 0, "control: the public plane is empty"),
+        other => panic!("control: expected NoAuthorizedProvider, got {other:?}"),
+    }
+
+    renew_authority(&mesh, &a, &identity, &dir);
+    match client
+        .plan_exported_attempt(&capability, "public.svc", &authority)
+        .expect("a superseded derivation is not an error")
+    {
+        super::call::PlanAttempt::Superseded { considered } => assert_eq!(considered, 0),
+        super::call::PlanAttempt::Minted(_) => panic!("nothing was mintable"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Three superseded attempts exhaust the bounded budget and refuse LOCALLY with
+/// the capability asked about and the count the last derivation examined.
+///
+/// Drives the production loop with a capture that is already superseded, so the
+/// budget is observable without racing authority movement three times. Dies to an
+/// unbounded loop (the witness would hang) and to a budget that reports a
+/// different capability or count.
+#[tokio::test]
+async fn three_superseded_attempts_refuse_locally_with_the_last_count() {
+    let a = org_a();
+    let (mesh, identity, dir) = mesh_with_authority("cold-exhaustion", Some(&a)).await;
+    let provider = EntityKeypair::generate();
+    let tag = "nrpc:internal.reindex";
+    inject_owner_envelope(&mesh, &a, &provider, &[tag]);
+    mesh.node()
+        .test_pin_peer_entity(provider.entity_id().node_id(), provider.entity_id().clone());
+    let client = bind(&mesh, &a, &identity, vec![]);
+    let capability = cap(tag);
+
+    let stale = client.capture_private(&capability).expect("capture");
+    renew_authority(&mesh, &a, &identity, &dir);
+    assert!(
+        !mesh.node().org_cold_authority_is_current(stale.authority()),
+        "precondition: every attempt below derives under a superseded capture"
+    );
+
+    let attempts = std::cell::Cell::new(0usize);
+    let err = client
+        .plan_over(&capability, || {
+            attempts.set(attempts.get() + 1);
+            Ok(stale.clone())
+        })
+        .expect_err("a superseded plan never mints");
+    assert_eq!(
+        attempts.get(),
+        3,
+        "the re-derivation budget is bounded at 3"
+    );
+    match err {
+        OrgSdkError::Discovery(OrgDiscoveryError::NoAuthorizedProvider {
+            capability: reported,
+            considered,
+        }) => {
+            assert_eq!(
+                reported,
+                super::error::hex_capability(&capability),
+                "the refusal names the capability the caller asked about"
+            );
+            assert_eq!(
+                considered, 1,
+                "and carries the count the last derivation examined"
+            );
+        }
+        other => panic!("expected a local NoAuthorizedProvider, got {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Both capture refusals map onto the EXISTING local vocabulary through the
+/// production loop — no new error kind, and no silent widening.
+#[tokio::test]
+async fn cold_capture_refusals_map_onto_the_existing_vocabulary() {
+    use net::adapter::net::behavior::org_cold_plan::OrgColdRefusal;
+    let a = org_a();
+    let (mesh, identity, dir) = mesh_with_authority("cold-refusal-map", Some(&a)).await;
+    let client = bind(&mesh, &a, &identity, vec![]);
+    let capability = cap("nrpc:internal.reindex");
+
+    match client.plan_over(&capability, || Err(OrgColdRefusal::NoNodeAuthority)) {
+        Err(OrgSdkError::Credentials(OrgCredentialError::NodeAuthorityRequired)) => {}
+        other => panic!("expected NodeAuthorityRequired, got {other:?}"),
+    }
+    match client.plan_over(&capability, || Err(OrgColdRefusal::IncoherentAuthority)) {
+        Err(OrgSdkError::Discovery(OrgDiscoveryError::NoAuthorizedProvider {
+            considered, ..
+        })) => assert_eq!(considered, 0, "nothing was coherently discovered"),
+        other => panic!("expected NoAuthorizedProvider, got {other:?}"),
+    }
+    match client.plan_exported_over(&capability, "public.svc", || {
+        Err(OrgColdRefusal::NoNodeAuthority)
+    }) {
+        Err(OrgSdkError::Credentials(OrgCredentialError::NodeAuthorityRequired)) => {}
+        other => panic!("expected NodeAuthorityRequired on the exported path, got {other:?}"),
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

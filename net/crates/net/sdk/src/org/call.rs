@@ -379,19 +379,34 @@ impl OrgClient {
     /// falls through to a send under a superseded capture.
     pub(crate) fn plan(&self, service: &str) -> Result<OrgProofIntent, OrgSdkError> {
         let capability = CapabilityAuthorityId::for_tag(&nrpc_tag(service));
+        self.plan_over(&capability, || self.capture_private(&capability))
+    }
+
+    /// [`Self::plan`]'s bounded loop over an injectable capture.
+    ///
+    /// `pub(crate)` with the capture as a parameter because the loop's own
+    /// properties — that exhaustion refuses locally with the last considered
+    /// count, that the budget is bounded, and that each refusal class maps to the
+    /// existing vocabulary — are otherwise only reachable by racing authority
+    /// movement against three consecutive derivations.
+    pub(crate) fn plan_over(
+        &self,
+        capability: &CapabilityAuthorityId,
+        mut capture: impl FnMut() -> Result<OrgColdDiscovery, OrgColdRefusal>,
+    ) -> Result<OrgProofIntent, OrgSdkError> {
         let mut considered = 0usize;
         for _ in 0..COLD_PLAN_ATTEMPTS {
-            let capture = match self.capture_private(&capability) {
+            let capture = match capture() {
                 Ok(capture) => capture,
-                Err(refusal) => return Err(cold_refusal_error(&capability, refusal, considered)),
+                Err(refusal) => return Err(cold_refusal_error(capability, refusal, considered)),
             };
-            match self.plan_attempt(&capability, &capture)? {
+            match self.plan_attempt(capability, &capture)? {
                 PlanAttempt::Minted(intent) => return Ok(*intent),
                 PlanAttempt::Superseded { considered: seen } => considered = seen,
             }
         }
         Err(OrgDiscoveryError::NoAuthorizedProvider {
-            capability: hex_capability(&capability),
+            capability: hex_capability(capability),
             considered,
         }
         .into())
@@ -399,32 +414,46 @@ impl OrgClient {
 
     /// ONE derivation over ONE capture: candidates, selection, the final
     /// coherent authority comparison, and — only if that comparison holds — the
-    /// proof intent.
+    /// derivation's result.
     ///
-    /// The comparison sits between selection and the mint deliberately (design
-    /// §10): the rows, the grant matching and the chosen provider all rest on the
-    /// captured authority, so a moved authority invalidates the whole derivation
-    /// rather than just its last step. A superseded attempt mints NOTHING and
-    /// carries only the count it examined, so the caller's refusal stays honest.
+    /// The comparison sits between selection and the RELEASE of the result
+    /// deliberately (design §10): the rows, the grant matching and the chosen
+    /// provider all rest on the captured authority, so a moved authority
+    /// invalidates the whole derivation rather than just its last step.
     ///
-    /// `pub(crate)` because the superseded arm is otherwise unobservable: the
-    /// only way to witness "no proof under a moved authority" deterministically
-    /// is to move the authority between a capture and this call.
+    /// **HOLD-3 (independent review, 2026-08-29): that includes the NEGATIVE
+    /// outcomes.** The derivation is computed into a value FIRST, and the
+    /// comparison gates it: `?` on candidate derivation or selection would have
+    /// let a stale `NoAuthorizedProvider`, `ProviderNotDirect`,
+    /// `AmbiguousCapabilityGrant` or credential refusal escape from a view the
+    /// node had already superseded — a wrong exact refusal, reported with
+    /// authority, and outside the bounded re-derivation budget. Movement can
+    /// CAUSE all four: a removed consumer grant empties a plane, a raised floor
+    /// retracts the only direct provider, and an installed grant can make two
+    /// grants match at once.
+    ///
+    /// When the capture is still current the exact error is preserved verbatim.
     pub(crate) fn plan_attempt(
         &self,
         capability: &CapabilityAuthorityId,
         capture: &OrgColdDiscovery,
     ) -> Result<PlanAttempt, OrgSdkError> {
-        let (candidates, considered) = self.authorized_captured_candidates(capability, capture)?;
-        let candidate = self.select_candidate(capability, &candidates, considered)?;
-        if !self.node.org_cold_authority_is_current(capture.stamp()) {
+        // Derive into a VALUE — never `?` — so the comparison below decides
+        // whether this derivation may speak at all.
+        let (candidates, considered) = self.derive_captured(capability, capture);
+        let derived = candidates.and_then(|candidates| {
+            self.select_candidate(capability, &candidates, considered)
+                .map(|candidate| self.intent_for(candidate))
+        });
+        if !self.node.org_cold_authority_is_current(capture.authority()) {
             return Ok(PlanAttempt::Superseded { considered });
         }
-        Ok(PlanAttempt::Minted(Box::new(self.intent_for(candidate))))
+        derived.map(|intent| PlanAttempt::Minted(Box::new(intent)))
     }
 
     /// [`Self::plan`] over the public exported plane — the same selection rule,
-    /// the same captured instant and the same final comparison applied to
+    /// the same captured instant, the same final comparison, and the same
+    /// negative-outcome gating applied to
     /// [`Self::authorized_exported_candidates`].
     ///
     /// The capture is the AUTHORITY half only: exported candidates come from the
@@ -432,26 +461,52 @@ impl OrgClient {
     /// authority coherence is identical.
     pub(crate) fn plan_exported(&self, service: &str) -> Result<OrgProofIntent, OrgSdkError> {
         let capability = CapabilityAuthorityId::for_tag(&nrpc_tag(service));
+        self.plan_exported_over(&capability, service, || self.node.org_cold_authority())
+    }
+
+    /// [`Self::plan_exported`]'s bounded loop over an injectable capture — the
+    /// exported twin of [`Self::plan_over`], for the same reason.
+    pub(crate) fn plan_exported_over(
+        &self,
+        capability: &CapabilityAuthorityId,
+        service: &str,
+        mut capture: impl FnMut() -> Result<OrgColdAuthority, OrgColdRefusal>,
+    ) -> Result<OrgProofIntent, OrgSdkError> {
         let mut considered = 0usize;
         for _ in 0..COLD_PLAN_ATTEMPTS {
-            let authority = match self.node.org_cold_authority() {
+            let authority = match capture() {
                 Ok(authority) => authority,
-                Err(refusal) => return Err(cold_refusal_error(&capability, refusal, considered)),
+                Err(refusal) => return Err(cold_refusal_error(capability, refusal, considered)),
             };
-            let (candidates, seen) =
-                self.authorized_exported_candidates(&capability, service, &authority)?;
-            considered = seen;
-            let candidate = self.select_candidate(&capability, &candidates, considered)?;
-            if !self.node.org_cold_authority_is_current(authority.stamp()) {
-                continue;
+            match self.plan_exported_attempt(capability, service, &authority)? {
+                PlanAttempt::Minted(intent) => return Ok(*intent),
+                PlanAttempt::Superseded { considered: seen } => considered = seen,
             }
-            return Ok(self.intent_for(candidate));
         }
         Err(OrgDiscoveryError::NoAuthorizedProvider {
-            capability: hex_capability(&capability),
+            capability: hex_capability(capability),
             considered,
         }
         .into())
+    }
+
+    /// ONE exported derivation over ONE authority capture — the exported twin of
+    /// [`Self::plan_attempt`], including its negative-outcome gating (HOLD-3).
+    pub(crate) fn plan_exported_attempt(
+        &self,
+        capability: &CapabilityAuthorityId,
+        service: &str,
+        authority: &OrgColdAuthority,
+    ) -> Result<PlanAttempt, OrgSdkError> {
+        let (candidates, considered) = self.derive_exported(capability, service, authority);
+        let derived = candidates.and_then(|candidates| {
+            self.select_candidate(capability, &candidates, considered)
+                .map(|candidate| self.intent_for(candidate))
+        });
+        if !self.node.org_cold_authority_is_current(authority) {
+            return Ok(PlanAttempt::Superseded { considered });
+        }
+        derived.map(|intent| PlanAttempt::Minted(Box::new(intent)))
     }
 
     /// The shared selection rule (OA2-E0.3): org-protected RPC is
@@ -538,14 +593,33 @@ impl OrgClient {
 
     /// The candidate derivation over an already-captured observation — the
     /// PURE half: no clock sample, no store query, no authority read.
+    #[cfg(all(test, feature = "cortex"))]
     fn authorized_captured_candidates(
         &self,
         capability: &CapabilityAuthorityId,
         capture: &OrgColdDiscovery,
     ) -> Result<(Vec<AuthorizedOrgCandidate>, usize), OrgSdkError> {
+        let (candidates, considered) = self.derive_captured(capability, capture);
+        candidates.map(|candidates| (candidates, considered))
+    }
+
+    /// [`Self::authorized_captured_candidates`] as a VALUE plus the count
+    /// discovery examined — the shape [`Self::plan_attempt`] needs.
+    ///
+    /// The count rides beside the result rather than inside the `Ok` arm because
+    /// it is a property of DISCOVERY, which succeeded even when authorization
+    /// then refused: an ambiguity examined its candidate. A credential or
+    /// authority refusal precedes discovery and therefore examined none (HOLD-3).
+    fn derive_captured(
+        &self,
+        capability: &CapabilityAuthorityId,
+        capture: &OrgColdDiscovery,
+    ) -> (Result<Vec<AuthorizedOrgCandidate>, OrgSdkError>, usize) {
         // Stage 3 of the validity contract: the credentials backing EVERY call,
         // at the captured instant.
-        self.check_current_at(capture.now_secs())?;
+        if let Err(refusal) = self.check_current_at(capture.now_secs()) {
+            return (Err(refusal.into()), 0);
+        }
         // Per-call authority currentness. Bind proved this relation once; a call
         // is where it must still hold, and a plan against another org's authority
         // would search private state this credential set cannot own.
@@ -556,25 +630,31 @@ impl OrgClient {
         // claims the end-to-end transition; the capture-level refusals are
         // witnessed directly.
         if capture.authority_org() != self.acting_org {
-            return Err(OrgCredentialError::NodeAuthorityOrgMismatch {
-                authority_org: capture.authority_org(),
-                membership_org: self.acting_org,
-            }
-            .into());
+            return (
+                Err(OrgCredentialError::NodeAuthorityOrgMismatch {
+                    authority_org: capture.authority_org(),
+                    membership_org: self.acting_org,
+                }
+                .into()),
+                0,
+            );
         }
         if !self.dispatcher.covers_capability(capability) {
-            return Err(OrgCredentialError::DispatcherScopeExcludesCapability {
-                capability: hex_capability(capability),
-            }
-            .into());
+            return (
+                Err(OrgCredentialError::DispatcherScopeExcludesCapability {
+                    capability: hex_capability(capability),
+                }
+                .into()),
+                0,
+            );
         }
 
         let discovered = self.discover_private_captured(capability, capture);
         let considered = discovered.len();
-        Ok((
-            self.authorize_discovered(capability, discovered, capture.now_secs())?,
+        (
+            self.authorize_discovered(capability, discovered, capture.now_secs()),
             considered,
-        ))
+        )
     }
 
     /// The exported-plane counterpart of the private derivation
@@ -584,34 +664,44 @@ impl OrgClient {
     /// code, deliberately not forked.
     ///
     /// Derives over an already-captured authority observation, so the exported
-    /// path shares the private path's one instant and one authority identity.
-    fn authorized_exported_candidates(
+    /// path shares the private path's one instant and one authority identity —
+    /// and, like [`Self::derive_captured`], yields a VALUE plus the count so the
+    /// final comparison can gate a refusal (HOLD-3).
+    fn derive_exported(
         &self,
         capability: &CapabilityAuthorityId,
         service: &str,
         authority: &OrgColdAuthority,
-    ) -> Result<(Vec<AuthorizedOrgCandidate>, usize), OrgSdkError> {
-        self.check_current_at(authority.now_secs())?;
+    ) -> (Result<Vec<AuthorizedOrgCandidate>, OrgSdkError>, usize) {
+        if let Err(refusal) = self.check_current_at(authority.now_secs()) {
+            return (Err(refusal.into()), 0);
+        }
         if authority.authority_org() != self.acting_org {
-            return Err(OrgCredentialError::NodeAuthorityOrgMismatch {
-                authority_org: authority.authority_org(),
-                membership_org: self.acting_org,
-            }
-            .into());
+            return (
+                Err(OrgCredentialError::NodeAuthorityOrgMismatch {
+                    authority_org: authority.authority_org(),
+                    membership_org: self.acting_org,
+                }
+                .into()),
+                0,
+            );
         }
         if !self.dispatcher.covers_capability(capability) {
-            return Err(OrgCredentialError::DispatcherScopeExcludesCapability {
-                capability: hex_capability(capability),
-            }
-            .into());
+            return (
+                Err(OrgCredentialError::DispatcherScopeExcludesCapability {
+                    capability: hex_capability(capability),
+                }
+                .into()),
+                0,
+            );
         }
 
         let discovered = self.discover_public_owned(service);
         let considered = discovered.len();
-        Ok((
-            self.authorize_discovered(capability, discovered, authority.now_secs())?,
+        (
+            self.authorize_discovered(capability, discovered, authority.now_secs()),
             considered,
-        ))
+        )
     }
 
     /// Phases 1–3 of the authority pipeline, shared verbatim by the
@@ -681,7 +771,8 @@ impl OrgClient {
 
     /// Assemble the canonical nine-field proof intent for a chosen candidate.
     /// Pure construction — the authority decision already happened in
-    /// [`authorized_candidates`].
+    /// [`Self::plan_attempt`], and its result is released only after the final
+    /// currentness comparison there.
     pub(crate) fn intent_for(&self, candidate: &AuthorizedOrgCandidate) -> OrgProofIntent {
         OrgProofIntent {
             caller: self.caller.clone(),

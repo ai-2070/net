@@ -8538,6 +8538,11 @@ pub struct MeshNode {
     /// so it waits for the capture's section rather than racing inside it.
     #[cfg(test)]
     cold_capture_authority_gap_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Test-only: fires inside the cold plan's FINAL comparison, after the
+    /// routing sample and before the closing consumer-grant snapshot — the exact
+    /// interval a torn authority vector would have to occupy (HOLD-2).
+    #[cfg(test)]
+    cold_comparison_gap_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Actor observation points, threaded into the supervisor. See `ActorHooks`
     /// for why this is `any(test, fixtures)` rather than fixtures alone.
     #[cfg(any(test, feature = "fixtures"))]
@@ -10400,6 +10405,8 @@ impl MeshNode {
             cold_capture_plane_gap_hook: parking_lot::Mutex::new(None),
             #[cfg(test)]
             cold_capture_authority_gap_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            cold_comparison_gap_hook: parking_lot::Mutex::new(None),
             #[cfg(any(test, feature = "fixtures"))]
             routing_hooks: Arc::default(),
             scoped_relay_gate: Arc::new(
@@ -15364,7 +15371,14 @@ impl MeshNode {
     /// Discovery is NOT authority: a returned provider still admits the caller
     /// only on a valid per-call organization proof.
     ///
+    /// **Unstable workspace-internal bridge (OLB-2B.3d-pre), not application
+    /// API.** It exists only because the coherent capture must cross from
+    /// `net-mesh` into the separate `net-mesh-sdk` crate; it is `#[doc(hidden)]`,
+    /// carries no stability guarantee, and is not covered by semver. Applications
+    /// use `org.call`.
+    ///
     /// [`OrgColdRefusal::IncoherentAuthority`]: super::behavior::org_cold_plan::OrgColdRefusal::IncoherentAuthority
+    #[doc(hidden)]
     pub fn org_cold_discovery(
         &self,
         capability: &super::behavior::org_grant::CapabilityAuthorityId,
@@ -15388,6 +15402,10 @@ impl MeshNode {
     /// coherent clock would be work it has no use for. Everything else about it
     /// is identical, including the refusals and the stamp the final comparison
     /// re-checks.
+    ///
+    /// **Unstable workspace-internal bridge (OLB-2B.3d-pre), not application
+    /// API** — see [`Self::org_cold_discovery`].
+    #[doc(hidden)]
     pub fn org_cold_authority(
         &self,
     ) -> Result<
@@ -15426,23 +15444,51 @@ impl MeshNode {
         // node is churning and a cold plan is the honest answer.
         const ATTEMPTS: usize = 4;
         for _ in 0..ATTEMPTS {
-            let Some(authority) = self.node_authority() else {
-                return Err(OrgColdRefusal::NoNodeAuthority);
-            };
+            // HOLD-1 (independent review, 2026-08-29). The whole observation runs
+            // under the AUTHORITY GATE, and the epoch is sampled BEFORE the views
+            // it qualifies.
+            //
+            // Ordering alone cannot close this. `move_routing_authority`
+            // deliberately advances the epoch and THEN publishes the successor
+            // authority and store, under the gate, so there is a real interval in
+            // which the epoch already names the successor while the installed
+            // authority, revocation store and discovery rows are still the
+            // predecessor's. A gate-free reader that samples the epoch anywhere
+            // in that interval — before or after loading the views — re-checks it
+            // to the same value and stamps a PREDECESSOR view with the SUCCESSOR
+            // epoch. Pointer identity would not fix it either: this crate
+            // deliberately rejects it as ABA-vulnerable and uses the monotone
+            // epoch as authority identity, so the repair is to make the epoch
+            // sample trustworthy rather than to add a subordinate field beside it.
+            //
+            // Taking the gate makes that interval UNOBSERVABLE. The lock order is
+            // the writer's own — authority gate, then the scoped store, which the
+            // publication's floor reconciliation also takes in that order — so
+            // the capture adds no new ordering and no cycle. Nothing inside
+            // awaits, and no network send happens under this gate.
+            let _authority_gate = self.routing_authority.lock_gate();
+            let before = self.routing_authority.epoch();
             // A spent epoch space can no longer distinguish authority views, so
             // it can no longer witness currentness — fail closed rather than
             // capture under an identity that cannot be compared.
             if self.routing_authority.is_exhausted() {
                 return Err(OrgColdRefusal::IncoherentAuthority);
             }
-            let before = self.routing_authority.epoch();
+            let Some(authority) = self.node_authority() else {
+                return Err(OrgColdRefusal::NoNodeAuthority);
+            };
             let now_secs = super::behavior::org::current_timestamp();
             let (poisoned, floor_generation, store) =
                 ScopedSlotSource::revocation_view_of(&self.org_revocation);
             let empty_floors = OrgRevocationState::empty();
             let floors_snapshot = store.as_ref().map(|s| s.snapshot());
             let floors: &OrgRevocationState = floors_snapshot.as_deref().unwrap_or(&empty_floors);
-            // ONE registry view for every grant plane.
+            // ONE registry view for every grant plane. Registry movement is NOT
+            // covered by the gate above — a grant install/remove/replacement
+            // between this load and the queries below is either conservative
+            // (an absent pin yields no rows) or carries a new non-aliasing
+            // installation identity, and the final comparison refuses on the
+            // exact pinned identity in both directions.
             let installed = self.consumer_grant_audiences.load();
             let mut grant_authority: Vec<([u8; 32], Option<OrgColdGrantAuthority>)> =
                 Vec::with_capacity(discover_grant_ids.len());
@@ -15454,10 +15500,8 @@ impl MeshNode {
                         .map(|record| OrgColdGrantAuthority::of(record)),
                 ));
             }
-            // Test-only: the window an authority installation must not be able
-            // to occupy undetected. Fired holding NO lock, because the install
-            // path commits floor reconciliation through the scoped store and so
-            // cannot complete under the section below.
+            // Test-only: fired with the authority gate HELD and the store lock
+            // NOT yet taken.
             #[cfg(test)]
             {
                 let hook = self.cold_capture_authority_gap_hook.lock().take();
@@ -15513,6 +15557,10 @@ impl MeshNode {
                     granted.push((*grant_id, rows));
                 }
             }
+            // The seqlock's closing half. Under the gate this cannot move, so it
+            // is a structural assertion rather than a race check — kept because
+            // it is the one line that would fail loudly if a future change moved
+            // any of the reads above out from under the gate.
             if self.routing_authority.epoch() != before {
                 continue;
             }
@@ -15545,37 +15593,106 @@ impl MeshNode {
     /// re-derives from a fresh capture; nothing has been sent, so this is not a
     /// retry of anything.
     ///
+    /// **HOLD-2 (independent review, 2026-08-29): the vector is compared
+    /// LINEARIZABLY, not component by component.** Routing authority and the
+    /// consumer-grant registry publish under DIFFERENT gates, so sampling one
+    /// and then the other admits a torn equality that was never jointly true:
+    /// a requested grant can be installed while routing still matches, routing
+    /// can then be replaced, and the grant removed again, leaving every
+    /// component individually equal to the capture at the instant it was read
+    /// and no instant at which they were all equal together.
+    ///
+    /// The shape below closes it with the registry's own publication identity —
+    /// the primitive the grant plane already maintains for exactly this purpose —
+    /// rather than a new lock:
+    ///
+    /// ```text
+    /// grant snapshot A     -> every requested installation equals the stamp
+    /// routing sample       -> seqlock'd epoch + poison + floors, inside A..B
+    /// grant snapshot B     -> equals the stamp AGAIN
+    /// A.revision == B.revision  -> no grant publication straddled the sample
+    /// ```
+    ///
+    /// A publication between A and B does not mean the vector is stale — it may
+    /// be unrelated churn — so that case RE-ESTABLISHES the interval, bounded,
+    /// and fails closed on exhaustion. Grant identity mismatch in either
+    /// snapshot is genuine movement and refuses immediately.
+    ///
+    /// No lock is taken here: the capture holds the authority gate, but this runs
+    /// immediately before `intent_for` and the send, and holding an authority
+    /// lock across a network send is forbidden.
+    ///
     /// Movement after this returns `true` is the ordinary linearization race and
     /// is accepted (design §11): the provider's admission is the final authority
     /// on every call, and no local comparison can close a window that ends at a
     /// remote evaluation.
+    #[doc(hidden)]
     pub fn org_cold_authority_is_current(
         &self,
+        authority: &super::behavior::org_cold_plan::OrgColdAuthority,
+    ) -> bool {
+        let stamp = authority.stamp();
+        // Matches `sample_routing_authority`: unrelated grant churn during the
+        // sample is rare and node-mediated, so a handful of attempts either
+        // observes one interval or the honest answer is "not current".
+        const ATTEMPTS: usize = 4;
+        for _ in 0..ATTEMPTS {
+            let a = self.consumer_grant_audiences.load();
+            if !self.cold_grants_match(&a, stamp) {
+                return false;
+            }
+            let Some(installed_authority) = self.node_authority() else {
+                return false;
+            };
+            if installed_authority.owner_org() != stamp.authority_org()
+                || self.routing_authority.is_exhausted()
+            {
+                return false;
+            }
+            let Some((epoch, poisoned, floor_generation)) = self.sample_routing_authority() else {
+                // The sample could not be taken coherently, so we cannot assert
+                // the stamp still holds. Fail closed — the caller re-derives.
+                return false;
+            };
+            if epoch != stamp.epoch()
+                || poisoned != stamp.poisoned()
+                || floor_generation != stamp.floor_generation()
+            {
+                return false;
+            }
+            // Test-only: the exact interval a torn vector would have to occupy —
+            // after the routing sample, before the closing grant snapshot.
+            #[cfg(test)]
+            {
+                let hook = self.cold_comparison_gap_hook.lock().take();
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }
+            let b = self.consumer_grant_audiences.load();
+            if !self.cold_grants_match(&b, stamp) {
+                return false;
+            }
+            if a.revision() == b.revision() {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Every requested grant installation in `snapshot` equals the capture's pin,
+    /// absence included — an install landing after the capture is movement just
+    /// as a removal is.
+    fn cold_grants_match(
+        &self,
+        snapshot: &super::behavior::org_grant_registry::ConsumerGrantSnapshot,
         stamp: &super::behavior::org_cold_plan::OrgColdAuthorityStamp,
     ) -> bool {
         use super::behavior::org_cold_plan::OrgColdGrantAuthority;
-        let Some(authority) = self.node_authority() else {
-            return false;
-        };
-        if authority.owner_org() != stamp.authority_org() || self.routing_authority.is_exhausted() {
-            return false;
-        }
-        let Some((epoch, poisoned, floor_generation)) = self.sample_routing_authority() else {
-            // The sample could not be taken coherently, so we cannot assert the
-            // stamp still holds. Fail closed — the caller re-derives.
-            return false;
-        };
-        if epoch != stamp.epoch()
-            || poisoned != stamp.poisoned()
-            || floor_generation != stamp.floor_generation()
-        {
-            return false;
-        }
-        let installed = self.consumer_grant_audiences.load();
         stamp.grants().iter().all(|(grant_id, pinned)| {
-            let live = installed
+            let live = snapshot
                 .get(grant_id)
-                .map(|r| OrgColdGrantAuthority::of(r));
+                .map(|record| OrgColdGrantAuthority::of(record));
             live.as_ref() == pinned.as_ref()
         })
     }
