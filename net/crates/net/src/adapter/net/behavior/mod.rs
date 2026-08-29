@@ -54,6 +54,9 @@ pub mod org_admission;
 pub mod org_admission_replay;
 pub mod org_authority;
 pub mod org_call;
+/// Unstable workspace-internal OLB implementation bridge — see the module docs.
+/// Hidden from generated documentation; not application API, not semver-covered.
+#[doc(hidden)]
 pub mod org_cold_plan;
 pub mod org_grant;
 pub mod org_grant_registry;
