@@ -7,6 +7,28 @@
 # [build]
 # rustflags = ["-C", "target-cpu=native"]
 
+# sccache (optional, opt-in per developer)
+#
+# `build.rustc-wrapper` is DELIBERATELY not set here. Cargo invokes the wrapper
+# immediately — before any compilation, for its own `rustc -vV` probe — so a
+# committed `rustc-wrapper = "sccache"` is a hard build failure for every
+# contributor who has not installed the binary:
+#
+#   error: could not execute process `sccache rustc -vV` (never executed)
+#
+# Opt in from your own shell instead (see "Faster local builds" in
+# CONTRIBUTING.md):
+#
+#   cargo install sccache
+#   export RUSTC_WRAPPER=sccache
+#   export CARGO_INCREMENTAL=0
+#
+# `CARGO_INCREMENTAL=0` is mandatory, not incidental: sccache does not cache
+# incremental compiler invocations, and the dev profile turns incremental on by
+# default — so without it the workspace crates you actually care about silently
+# bypass the cache. This is the same pairing the sccache CI jobs use
+# (`.github/workflows/ci.yml`).
+
 # Environment-specific overrides
 [target.'cfg(target_os = "linux")']
 # Linux-specific optimizations (e.g., for io_uring support in future)

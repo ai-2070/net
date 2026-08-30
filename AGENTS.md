@@ -53,6 +53,8 @@ cargo clippy --all-features --all-targets -- \
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 ```
 
+That checklist compiles the workspace several times over with different feature sets, which is the workload [sccache](https://github.com/mozilla/sccache) is for — `export RUSTC_WRAPPER=sccache` **and** `export CARGO_INCREMENTAL=0` together (sccache does not cache incremental invocations, so setting only the first silently bypasses the cache). Opt-in per developer, from the shell only: a committed `rustc-wrapper` in `.cargo/config.toml` hard-fails the build for anyone without the binary. Full trade-offs in CONTRIBUTING.md.
+
 CI also lints workspace members individually (`net-payments`, `sdk`, the ffi crates, `bindings/node`, `bindings/python`) with their own feature lists — run `cargo clippy -p <crate>` / `cargo doc -p <crate> --no-deps` for any member you touched, with the feature list from ci.yml. Doc comments on **public** items may not intra-doc-link private items (`rustdoc::private_intra_doc_links` is denied).
 
 ### The feature-flag trap (critical)

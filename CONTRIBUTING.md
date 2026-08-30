@@ -64,6 +64,42 @@ cargo test --lib
 
 Go bindings live in `go/` (`go test ./...`), the web docs in `web/`.
 
+### Faster local builds (optional: sccache)
+
+The pre-push checklist rebuilds the workspace several times over — three clippy
+runs with different feature sets, a rustdoc pass, then the tests — and a
+RED/GREEN mutation loop across detached worktrees pays for a cold target dir
+every time. [sccache](https://github.com/mozilla/sccache) caches the compiler
+objects themselves, so those repeats hit cache instead of rustc. It is entirely
+optional and per-developer:
+
+```bash
+cargo install sccache
+
+export RUSTC_WRAPPER=sccache
+export CARGO_INCREMENTAL=0
+
+sccache --show-stats   # hit/miss counters; `sccache --zero-stats` to reset
+```
+
+Two things worth knowing before you turn it on:
+
+- **`CARGO_INCREMENTAL=0` is mandatory, not optional.** sccache does not cache
+  incremental compiler invocations, and the dev profile enables them by
+  default — leave incremental on and the workspace crates you actually care
+  about silently bypass the cache. CI pairs the two for the same reason (see
+  the sccache jobs in `.github/workflows/ci.yml`).
+- **It is a real trade, not a free win.** Turning incremental off makes the
+  narrow edit-one-file-rebuild-one-crate loop *slower*. sccache wins where this
+  repo actually spends its time: switching between feature sets, switching
+  branches, and fresh worktrees — all of which throw incremental state away
+  anyway.
+
+Deliberately NOT wired into `net/crates/net/.cargo/config.toml`: cargo invokes
+the wrapper before it compiles anything, so a committed `rustc-wrapper` setting
+is a hard build failure (`could not execute process 'sccache rustc -vV'`) for
+anyone without the binary installed. Keep it in your shell.
+
 ### Focused runs, and why they should use nextest
 
 Use `cargo nextest run` rather than `cargo test` whenever you are running one
