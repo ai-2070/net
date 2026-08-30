@@ -851,9 +851,12 @@ is on the **observation plane only**: it takes no scoped-store query, performs
 no grant or provider scan, emits no registration, and does not move the
 final-validation → `MeshNode::call` boundary asserted above. **Ordering is the
 one exception, and it is deliberate:** a sensed call performs a **linear stable
-bucket permutation** over the `<= 32` already-authorized candidates — three
-buckets concatenated, `O(C * S)` with `S <= 32` sensed rows over `C` complete
-candidates, **no comparator over `C`, no `sort_by`, no P2C** (that design's D7.2).
+bucket permutation** over the **complete** authorized candidate list — three
+buckets concatenated, `O(C * S)` where `S <= 32` is the **sensed observation-row**
+count and `C` is the complete authorized candidate count, **which is NOT bounded
+by 32** (excess SameOrg providers survive as unsensed `Unknown` fallback and every
+`Granted` candidate is in the list). Two passes, so at most `2 * S` comparisons per
+candidate. **No comparator over `C`, no `sort_by`, no P2C** (that design's D7.2).
 The existing global sort is untouched and remains the tie-break of record; **no
 comparison sort is added over the complete candidate list**. Sorts *inside* the
 bounded sensing projection helper already exist and are unchanged

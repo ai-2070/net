@@ -450,6 +450,12 @@ This plan does not add:
 Every language inherits the same behavior from Rust `OrgClient::call`.
 An OLB PR touching `bindings/` or `go/` may contain the one new error
 kind's classification and nothing else (the OSDK-L review rule).
+**Not applicable to the organization exact-sensing lane (§2A):** that lane
+introduces **no new error kind**, so it touches **no binding and no language
+surface at all**. An OA-1..OA-6 PR that modifies `bindings/`, `go/`,
+`sdk-ts/` or `sdk-py/` is out of scope by construction — see
+[`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md)
+§15 and its D7.2/W-47 fallback rule.
 
 ---
 
@@ -466,19 +472,26 @@ A sensed `org.call` performs exactly these seven steps, in this order:
 1. **existing** authorized candidates in the **existing global deterministic
    order**, with owner-first `push_unique` dedup — unchanged;
 2. **one bounded per-call snapshot** of at most **32** already-authorized SameOrg
-   observation rows, inside a single `sensing_observations` critical section
-   (design D6.4);
+   **observation rows** (`S <= 32` — this is the only population the 32 cap binds),
+   inside a single `sensing_observations` critical section (design D6.4);
 3. **release the observation lock** — before anything below it;
 4. **off-lock** route estimate + request-relative budget classification
    (design D6.5 Phases 2-3);
-5. a **linear stable bucket permutation** over the `<= 32` candidates — three
-   buckets concatenated, `<= 1024` integer compares, no comparator, no `sort_by`
-   (design D7.2);
+5. a **linear stable bucket permutation** over the **complete** authorized
+   candidate list — three buckets concatenated, `O(C * S)` where `C` is the
+   complete candidate count and is **NOT bounded by 32** (excess SameOrg survives
+   as unsensed `Unknown`, and `Granted` candidates are in the list); two passes, so
+   at most `2 * S` comparisons per candidate. No comparator over `C`, no `sort_by`
+   (design D7.2). **The bounded projection sorts inside
+   `scheduler_bridge/readiness.rs:82`/`:84`/`:85`, each over `S <= 32` entries,
+   already exist and remain permitted** (design D7.2a);
 6. **existing** final currentness comparison, proof mint, one invocation,
    provider-side admission — all unchanged;
 7. **unsensed and cold behavior is unchanged**, including `ProviderNotDirect`.
 
-**Therefore, for the sensed path, this plan does NOT specify:**
+**Therefore, for the sensed path, this plan does NOT specify the following
+thirteen things.** The count is the number of substantive rows in the table below;
+if a row is added or removed, this number changes with it.
 
 | Not used | Where the historical text lives |
 |---|---|
@@ -633,7 +646,8 @@ OrgClient::call(service)
 
 authorized candidate set (SameOrg subset)
 → one exact-provider, org-authenticated sensing lease per authorized
-  same-org provider (retained in OrgRoutingState, §7)
+  same-org provider (route slots retained in OrgRoutingState, §7; the sensing
+  LEASE ownership is the separate OrgSensingFamily graph — §2A)
 → ONE bounded per-call snapshot of that population's observation rows
   (<= 32; the lock is released before any other work) — §2A
 → classify each candidate OFF the lock:
@@ -1483,11 +1497,15 @@ Per-call complexity (**SENSED**, organization-audience exact sensing — §2A):
 ```text
 coherent authority-epoch compare  O(1)   mandatory, unchanged
 per-call temporal recheck         O(1)   clock math, unchanged
-ONE observation snapshot          O(N)   N = |authorized SameOrg| <= 32,
+ONE observation snapshot          O(S)   S = |sensed SameOrg rows| <= 32,
                                          one bounded critical section
-route estimate + budget classify  O(N)   OFF the lock
-linear stable bucket permutation  O(N^2) <= 1024 integer compares at N <= 32,
-                                         no comparison sort (design D7.2)
+projection (readiness.rs:82/84/85) O(S log S)  three EXISTING bounded sorts,
+                                         unchanged and permitted (D7.2a)
+route estimate + budget classify  O(S)   OFF the lock
+linear stable bucket permutation  O(C*S) C = complete authorized candidates,
+                                         NOT bounded by 32; two passes, so
+                                         <= 2*S compares per candidate; no
+                                         comparison sort over C (design D7.2)
 proof construction                O(1)   unchanged
 exact dispatch                    O(1), excluding network
 ```
@@ -1942,6 +1960,14 @@ signature — restated, not extended.)
 ---
 
 ## 12. SDK and language surface
+
+> **SUPERSEDED FOR ORGANIZATION EXACT SENSING — NOT AN IMPLEMENTATION CONTRACT
+> for that lane.** Everything below that depends on the new `NoViableProvider`
+> kind — the generated `org:discovery:no_viable_provider` wire vocabulary, the X1
+> fixture regeneration and the four binding classifiers — is **out of scope** for
+> the exact SameOrg sensing path, which introduces **no new error and no binding
+> change** (§2A; governing design D7.2/W-47 and its §15). Retained for the
+> separately reviewed lane that would introduce such an error.
 
 ### Rust
 
@@ -2401,11 +2427,15 @@ The plan is complete when all are true:
       EXCEPT ordering: no scoped-store query, no candidate
       revalidation, no interest reconciliation, no registration
       emission, no registration wait. **Ordering differs by design** —
-      a sensed call performs exactly ONE stable class-ordering pass
-      over the `<= 32` already-authorized candidates (design D7.2
-      step 3), leaving `call.rs:758`'s global sort intact as the
-      tie-break of record. That pass is a stable permutation, not a
-      re-sort and not a second sort. *(Reconciled 2026-08-30; see
+      a sensed call performs a **linear stable bucket permutation**
+      over the **COMPLETE** authorized candidate list, whose count `C`
+      is **NOT bounded by 32**; the 32 cap binds only the `S` sensed
+      observation rows. Cost is `O(C * S)` over two passes, at most
+      `2 * S` compares per candidate, with **no comparison sort over
+      `C`** — while the three bounded projection sorts in
+      `scheduler_bridge/readiness.rs:82`/`:84`/`:85` already exist and
+      remain permitted. `call.rs:758`'s global sort is untouched and
+      remains the tie-break of record. *(Reconciled 2026-08-30; see
       [`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md)
       D6.4 for the mechanism and D6.8 for the divergence record.)*
 - [ ] Route sets are immutable, change-driven, single-flight rebuilt,
