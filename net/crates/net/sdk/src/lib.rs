@@ -193,12 +193,13 @@ pub mod a2a;
 pub mod subnet;
 #[cfg(feature = "net")]
 pub mod subnets;
-// Capability sensing — the provider lifecycle (`provide`, the
-// ownership-safe registration handle, state-edge notification) plus
-// the exact-provider readiness projection over a caller-supplied
-// authorized population. See
-// CAPABILITY_SENSING_SDK_INTEGRATION_PLAN.md §4.2/§4.4. Rides `net`:
-// every operation is node state on a live `MeshNode`.
+// Capability sensing — the PROVIDER lifecycle only: `provide`, the
+// ownership-safe registration handle, and state-edge notification. See
+// CAPABILITY_SENSING_SDK_INTEGRATION_PLAN.md §4.4/§4.5. There is no
+// query, watch, snapshot, or readiness projection in this slice; the
+// module docs record why exact-provider acquisition and projection are
+// deferred to S4. Rides `net`: every operation is node state on a live
+// `MeshNode`.
 #[cfg(feature = "net")]
 pub mod sensing;
 
