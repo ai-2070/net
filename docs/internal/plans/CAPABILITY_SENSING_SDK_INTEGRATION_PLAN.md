@@ -12,6 +12,34 @@
 
 **Revision (2026-07-22, applies Kyra's OLB review ruling):** (1) organization sensing registration is authenticated by membership-cert-carrying registration variants — a narrow additive extension at registration intake; the earlier "no sensing-wire work" claim is withdrawn (§1.4, S0). (2) The node-global interest lease key has two shapes — `ProviderFree { audience, interest_digest }` and `ExactProvider { audience, interest_digest, provider }` — and each entry aggregates cadence with token-indexed intervals, not a bare refcount (§4.3, S0). (3) Organization-private consumers use exact-provider leases derived from private authorized discovery, never provider-free rendezvous (§3.1, §3.6). (4) Pruning follows fresh-evidence viability, not raw `NotReady` status (§2 rule 3). **Re-review (same day):** the registration wire choice is pinned — the organization variants are APPENDED to `SensingInterestFrame` under the existing 0x0C02 subprotocol, never a new subprotocol (S0); and S4's sequencing gates on the org-required S0/S1 subset, not S0–S3 (S4).
 
+**Status correction (2026-08-30, read at `f9f423e7bfd5b3d90491600af27624a153f5f5bc`).**
+S1 shipped **provider-lifecycle only**. `net/crates/net/sdk/src/sensing.rs` delivers
+`SensingClient`, `provide` / `provide_replacing`, and `ReadinessRegistration`, and a
+`--lib` guard test (`sdk/src/sensing.rs:588`) fails if any consumer name returns.
+Items 1–5 of the S1 work list below — query validation/canonical conversion,
+owner-authority candidate/leader resolution, watch registration over the
+node-global lease, exact snapshot projection, and missed-wakeup-safe `changed()` —
+are **NOT delivered**, and neither are the `SensingQuery` / `SensingWatch` /
+`SensingSnapshot` / `SensedProvider` types §4 lists. An exact-provider projection
+seam landed in `a58293e58` and was **removed** in `52e1d8bb2` for a concrete
+reason, not for sequencing: `MeshNode::acquire_sensing_interest_lease`
+(`mesh.rs:11197`) refuses every organization-derived audience with
+`SensingRegistrationError::OrgAudienceUnsupported` (`mesh.rs:6161`, raised at
+`:11220-11227`), because the lease wire leg emits legacy
+`SensingInterestFrame::provider_registration` unconditionally
+(`mesh.rs:11154`) — the variant an org-authoritative receiver refuses
+(`mesh.rs:24888-24905`). Nothing in the SDK could therefore create the
+observations a projection would read.
+
+That authority boundary now has a dedicated design under review:
+[`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md)
+— **DESIGN FOR REVIEW, no implementation or arm lighting authorized.** It also
+records a second blocker this plan never named: `register_sensing_interest_as`
+routes local registrations through the legacy `validate_subscriber_scope`
+(`mesh.rs:10950`), which an organization audience can never pass. S4 below, and
+§3.6's "may internally consume sensing", remain gated on that design's review and
+on its OA-6 arm-lighting slice.
+
 ---
 
 ## 1. Repository audit and current state
