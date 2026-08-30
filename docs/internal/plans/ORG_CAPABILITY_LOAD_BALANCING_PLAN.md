@@ -67,7 +67,9 @@ arm-lighting slice. The Rust SDK's sensing surface is provider-lifecycle only at
 this head; the exact-provider projection seam that briefly existed (`a58293e58`)
 was removed in `52e1d8bb2` for this same reason.
 
-These closures complete the practical Option-A OLB-0 substrate. **OLB-1
+These closures complete the practical Option-A OLB-0 substrate **for the inbound
+relay leg and the node-global lease/refcount/cadence primitive only** — see the
+OLB-0 exit correction above; the consumer leg remains unsatisfied. **OLB-1
 candidate factoring is SIGNED** at `OLB1_SIGNED_HEAD = 4dccb7767`
 (behavior-preserving `AuthorizedOrgCandidate` factoring in `call.rs`, with direct
 reachability sampled in sorted order to preserve the pre-factoring selection).
@@ -1568,25 +1570,41 @@ Potential
 NonViable
 ```
 
-A provider can sign `Ready` and still project `NonViable` when its
-signed start estimate plus the current consumer-local route estimate
-exceeds a hard budget. Selection consumes the projection layer;
-`OrgClient` carries no new public type for either — whatever thin
-internal enum it holds is a private projection of the generic types,
-never exported.
+A provider can sign `Ready` and still fail to project `Viable` when its signed
+start estimate plus the current consumer-local route estimate exceeds the
+consumer's budget — in which case it projects **`Potential`**, not `NonViable`.
+Selection consumes the projection layer; `OrgClient` carries no new public type
+for either — whatever thin internal enum it holds is a private projection of the
+generic types, never exported.
 
-### The pruning rule (locked)
+### The pruning rule (locked; corrected 2026-08-30)
 
 ```text
 Unknown never prunes.
 
-NonViable may prune only when derived from fresh exact evidence:
-- a fresh exact provider NotReady; or
-- a fresh exact Ready whose signed start estimate plus the current
-  consumer-local route estimate exceeds a hard budget.
+NonViable may prune only when derived from fresh exact evidence, and the ONLY
+input that yields NonViable is:
+- a fresh exact provider NotReady.
+
+A fresh exact Ready whose signed start estimate plus the current consumer-local
+route estimate exceeds the budget is POTENTIAL, never NonViable, and is never
+pruned — a route change could still make it viable.
 
 Stale evidence becomes Potential/Unknown, never NonViable.
 ```
+
+**Why the correction.** `classify_branch`
+(`src/adapter/net/behavior/sensing/controller.rs:311-325`) maps
+`ProjectedReadiness::Ready` outside the budget through its `_ =>` arm to
+`BranchViability::Potential`; only `ProjectedReadiness::NotReady` becomes
+`NonViable` (`:322`). The `Potential` variant's own doc says "never prune on it"
+(`:301-303`), `SensedCandidates.potential` retains it
+(`behavior/scheduler_bridge/readiness.rs:46-50`), and an existing test pins it
+(`:126`, asserted `:134`). The earlier wording specified the inverse of the frozen
+primitive; see
+[`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md)
+§0 item 7 and D6.5. §10's `non_viable` count field is unaffected as a *name*; what
+changes is which observations can populate it.
 
 ### Freshness rules
 
@@ -1714,10 +1732,15 @@ OrgDiscoveryError::NoViableProvider {
 }
 ```
 
-The count field is `non_viable`, not `not_ready`: a fresh `Ready` that
-misses the consumer's end-to-end budget is non-viable without the
-provider ever declaring NotReady, and the error must not misreport it
-as a provider declaration.
+The count field is `non_viable`, not `not_ready`, because the name describes the
+projection layer rather than a provider declaration. *(Corrected 2026-08-30: the
+original rationale here — "a fresh `Ready` that misses the consumer's end-to-end
+budget is non-viable without the provider ever declaring NotReady" — is the
+inverse of the frozen primitive. Over-budget `Ready` is `Potential`, never
+`NonViable`, so it never enters this count; see the corrected pruning rule in §8
+and `controller.rs:311-325`. The name still stands: `NonViable` is a
+consumer-side projection verdict, and a future budget-aware verdict would land
+here without renaming the field.)*
 
 Wire vocabulary (via the existing `wire_kind()` / `to_wire()` emitters,
 `error.rs:454` / `:188`):
@@ -1905,6 +1928,17 @@ at intake; relay self-membership enforced; tighten/relax/no-op/race/
 stale-token cadence transitions; and the producer-path witness — an
 org-private provider produces attestations under an exact-provider
 lease while remaining absent from the provider-free population.
+
+**This last witness is NOT satisfied at
+`f9f423e7bfd5b3d90491600af27624a153f5f5bc` / `063e90acf`** — no org-audience
+exact-provider lease can be acquired at all
+(`SensingRegistrationError::OrgAudienceUnsupported`, `mesh.rs:6161`, raised at
+`:11220-11227`), and the local registration core additionally fails the legacy
+`validate_subscriber_scope` (`mesh.rs:10950`). It is restated here as an
+OBLIGATION, not as a discharged exit fact; see the OLB-0 exit correction at the
+top of this file and
+[`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md).
+*(Corrected 2026-08-30.)*
 
 ### OLB-1 — factor organization candidates from selection
 
