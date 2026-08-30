@@ -301,7 +301,7 @@ never load-bearing for any decision.
 | Counter | Fires when |
 |---------|-----------|
 | `invalid_constraints` | any constraint parse/validate rejection |
-| `protocol_invalid` | the security-relevant subset: digest mismatch, or a wire scope claim the session does not back |
+| `protocol_invalid` | the security-relevant subset: digest mismatch, a wire scope claim the session does not back, or an organization provider registration whose interest selector does not name the frame's own `target` |
 | `cadence_refusals` | a requested interval below the cadence floor was refused |
 | `scope_refusals` | a §4.10 scope-validation refusal (any kind) |
 | `broad_selector_refusals` | an `Each`-mode selector matched more providers than `each_mode_max_providers` (the §4.7 amplification guard) |
