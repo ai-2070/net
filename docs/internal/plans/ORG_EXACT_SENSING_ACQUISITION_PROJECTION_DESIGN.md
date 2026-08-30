@@ -1,13 +1,15 @@
 # Organization-Audience Exact-Provider Sensing — Acquisition and Projection Design
 
 **Status: DESIGN FOR REVIEW — no implementation or arm lighting authorized.**
-**Revision 6 (2026-08-30), the evidence reconciliation of revision 5
-(`ee8c9826d17d17aecb9d7976fb083a35a932d3bb`).** Revision 6 closes five
-evidence/scope contradictions (E1–E5 in §0.2). **Authority and lifecycle review
-are ACCEPT and are not reopened by this revision** — no D1–D5, D7.1, D7.3–D7.5,
-D8 or D9 decision changes. Revision 5 closed six narrow residuals (M1–M6, §0.1);
-revision 4 closed seven (F1–F7, §0) and withdrew revision 3's published-artifact
-currentness model in favour of a per-call coherent snapshot.
+**Revision 7 (2026-08-30), the normalization and deletion repair of revision 6
+(`eb1bb896a65fb720ee938bd3de35626680ae406e`).** Revision 7 closes six
+normalization defects (N1–N6 in §0.3) by **deleting duplicate contracts**, not by
+adding prose: §10 is now the single gate roster, the ordering mechanism is frozen
+as a linear bucket permutation, and the superseded OLB architecture is labelled or
+corrected at every active site. **Authority and lifecycle review are ACCEPT and
+are not reopened** — no D1–D5, D7.1, D7.3–D7.5, D8 or D9 decision changes.
+Revision 6 closed five evidence/scope contradictions (E1–E5, §0.2); revision 5
+closed six residuals (M1–M6, §0.1); revision 4 closed seven (F1–F7, §0).
 
 Nothing in this document authorizes code. It does not authorize LS-1..LS-6,
 provider-free sensing, the `OrgCapabilityRegistration` dispatch arm, a generic
@@ -109,6 +111,25 @@ both recorded authority and lifecycle as ACCEPT.
 leg, intake, lifecycle, the ownership/clone/drop graph), D7.1/D7.3–D7.5, D8
 (mixed-version), D9 (lock order). No decision in those sections is altered here;
 §0.1's M1–M3 closures stand unchanged.
+
+### 0.3 What revision 6 got wrong (N1–N6)
+
+Three reviews of `eb1bb896a` returned HOLD, again on evidence and scope only. The
+instruction was to **delete** obsolete duplicate contracts rather than layer more
+prose, and that is what revision 7 does.
+
+| N | Revision-6 state | Repair (deletion-first) |
+|---|---|---|
+| **N1** | Three competing definitions of the same gates: §10.1 said T1/T2 "stay on `cargo test`", §10.2's rows said one shared step with zero-retry `n/a`, §10.3's blocks said two nextest steps, and OA-1 still carried a `cargo test --lib` block with the elided comment `# the same >= assertions and REQUIRED name loop as ci.yml:171-265`. T10 had no block. §10.4 delegated T5–T7/T9/T11 to OA sections. | **Deleted**: the `cargo test` claim, the conflicting metadata, OA-1's block and its elided comment, and §10.4's duplicate roster. §10.3 now holds **eleven** blocks including T10's, §10.2 is metadata only, §10.4 is a one-paragraph uniqueness rule, and every OA slice references target IDs. There is **no `cargo test` target in this design.** |
+| **N2** | The `MANIFEST` literal carried a comment header (a ninth line), and the negative witness was one module-level build accepting `E0432\|E0433\|E0425\|E0599`. Per-item probes were an unimplemented "alternative". | **Deleted** the header line and the alternation. Replaced with **eight `trybuild` compile-fail cases**, one per entry, each with a committed byte-exact `.stderr`, plus the runner, the probe manifest with `trybuild` as a probe-crate-only dev-dependency, and T10 leg 3 `diff`ing `tests/ui/` against `MANIFEST`. |
+| **N3** | One "OA-6 deletes the gate" claim survived at the D5.4 containment bullet; W-16 lived in `A/mesh.rs` yet called a bridge identifier, which W-21 forbids; and `OA5_BASE_HEAD`/`OA5_HEAD` were angle-bracket SHA placeholders. | **Deleted** all three. W-16 **moves from T2 to T4** (T2's floor 34→33, T4's MIN 4→5), where `fixtures` is on and naming the bridge is legal. The placeholders are replaced by a landing-time evidence file with a `^[0-9a-f]{40}$` schema and a complete guard. |
+| **N4** | Seven OLB sites still specified the superseded sensed architecture: P2C in the per-call contract, the §5.1 flow's P2C selector, the §7 `OrgRouteSet`/hot-path block, the §7 complexity table, §9's Ordering section, §13's stack item 7, and the bottom-line release contract. | Added **OLB §2A**, the single active seven-step contract that governs; bannered the two historical blocks `SUPERSEDED — NOT AN IMPLEMENTATION CONTRACT`; corrected the flow, the complexity table, the stack item, the two pinned claims, OLB-3's heading, and the bottom line. |
+| **N5** | D7.2 said "stable-sort by `(class_rank, ranked_index)`" while D6.8 and the warmed companion called the same operation "not a re-sort and not a second sort" — a contradiction, not a specification. | **Deleted** every `stable-sort`/`class_rank`/"not a re-sort" phrase. Frozen as a **linear stable bucket permutation**: three buckets, one `[bool; 32]`, `O(N²)` at `N <= 32` (`<= 1024` integer compares), no comparator, no `sort_by`, no P2C. Pinned output and three inverse mutations added to W-43. |
+| **N6** | — | Verification below and in §14. |
+
+**Not reopened:** D1–D5, D7.1, D7.3–D7.5, D8, D9. §0.1's M1–M3 and §0.2's E2/E3
+closures stand; N3 refines E3's placement by relocating W-16, which changes no
+authority or lifecycle decision.
 
 ---
 
@@ -1228,7 +1249,7 @@ This is recorded as a divergence, not hidden:
 |---|---|---|
 | scoped-store query | none | none — unchanged |
 | registration emission | none | none — unchanged |
-| sort of the authorized candidate list | none (precomputed route set) | **ONE stable class-ordering pass over `<= 32` already-authorized candidates** (D7.2 step 3). `call.rs:758`'s global sort is unchanged and remains the tie-break of record; the added pass is a stable permutation, not a re-sort, and it is not a second sort. |
+| sort of the authorized candidate list | none (precomputed route set) | **still none — no comparison sort is added.** `call.rs:758`'s global sort is unchanged and remains the tie-break of record. What is added is a **linear stable bucket permutation** over `<= 32` already-ordered candidates: `<= 1024` integer compares, three `Vec<usize>` buffers, one fixed `[bool; 32]`, no comparator and no `sort_by` (D7.2). |
 | **observation-map read** | **none** | **one bounded section, `<= 32` entries, `O(population)`** |
 | authority recheck | per call, unchanged | per call, unchanged |
 
@@ -1261,26 +1282,91 @@ Because sensing is SameOrg-only, a naive reorder could leave a `Granted` or
 `Unknown` candidate ahead of a viable `SameOrg` one. The algorithm is therefore a
 **stable class-ordered permutation of the complete globally sorted list**:
 
+**It is a linear stable bucket permutation, and there is no second sort.**
+`call.rs:758`'s global sort stays exactly as it is and remains the tie-break of
+record. What this design adds is a bucketed *permutation* of that already-ordered
+list — no comparison sort, no `sort_by`, no `sort_unstable`, no comparator:
+
 ```text
-1. keep call.rs:758's global sort — unchanged, it is the tie-break of record
-2. assign each candidate a class_rank:
-       0  SameOrg and in delta.viable          (ranked by (cost, provider))
-       1  SameOrg and in delta.potential       (original relative order)
-       1  Granted                              (original relative order — same rank)
-       2  SameOrg and in delta.non_viable      (original relative order)
-3. stable-sort by (class_rank, ranked_index) — ONE stable pass, no second sort
+INPUT   cands: &[Candidate]          // already globally sorted (call.rs:758),
+                                     // already owner-first deduped (push_unique)
+        ranked: &[u64]               // delta.viable provider ids, in (cost, provider)
+                                     // order, produced off-lock by D6.5 Phase 3
+        N = cands.len() <= 32        // the population cap, D4.3
+
+STEP 1  three output buffers, each with capacity N:
+            viable, potential, non_viable : Vec<usize>   // candidate indices
+        one bounded seen-flag vector:
+            emitted : [bool; 32]     // fixed size, no allocation, no hashing
+
+STEP 2  emit the `viable` bucket in SENSED RANK ORDER.
+        for r in ranked:                                  // <= 32 iterations
+            for (i, c) in cands.iter().enumerate():        // <= 32 iterations
+                if !emitted[i] && c.mode == SameOrg && c.provider == r:
+                    viable.push(i); emitted[i] = true; break
+
+STEP 3  ONE pass over cands in ORIGINAL order for everything else.
+        for (i, c) in cands.iter().enumerate():            // <= 32 iterations
+            if emitted[i] { continue }
+            if c.mode == SameOrg && pruned.contains(c.provider) { non_viable.push(i) }
+            else                                            { potential.push(i) }
+        // `Granted` always lands in `potential`: never sensed, never pruned.
+
+STEP 4  concatenate: viable ++ potential ++ non_viable
 ```
+
+**Chosen implementation and its cost, stated exactly.** Step 2 is a linear scan
+per ranked provider — a **fixed vector with linear lookup**, no map, no hashing.
+With the D4.3 cap of `N <= 32` that is at most `32 x 32 = 1024` `u64` equality
+comparisons, bounded and allocation-free; steps 3 and 4 are `O(N)`. A bounded map
+would make step 2 `O(N)`, and is **rejected** for this size: 1024 integer compares
+on a `<= 32`-element slice is cheaper than constructing a map, and a fixed vector
+matches the repo's bounded-state idiom (`S/lease.rs:233`/`:254`,
+`B/org_routing_registry.rs:1863`/`:1870`). Total: `O(N^2)` with `N <= 32`.
+
+**Stability, exactly.** `potential` and `non_viable` preserve the input's relative
+order because step 3 visits `cands` in index order and appends. `viable` is
+ordered by sensed rank, which is the whole point of sensing. Concatenation cannot
+reorder a bucket. No element is emitted twice: `emitted[i]` is set on emission and
+checked before both pushes.
 
 - Owner-plane candidates are never *demoted below* `Granted` by sensing; a
   `Granted` candidate is never *sensed* and never *pruned*.
-- Class 1 deliberately holds both `SameOrg`-`Potential` and `Granted`, so
-  `Granted` keeps its globally sorted position relative to unsensed peers.
-- `push_unique` runs **before** classification, so a provider on both planes is
-  already exactly one `Mode::SameOrg` candidate and sensing cannot resurrect the
-  grant row.
+- The `potential` bucket deliberately holds both `SameOrg`-`Potential` **and**
+  `Granted`, so `Granted` keeps its globally sorted position relative to unsensed
+  peers.
+- `push_unique` runs **before** bucketing, so a provider on both planes is already
+  exactly one `Mode::SameOrg` candidate and sensing cannot resurrect the grant row.
 - `direct` still decides afterwards; `considered`, `ProviderNotDirect`,
   `NoAuthorizedProvider` and `AmbiguousCapabilityGrant` are unchanged.
-- An all-pruned list falls back to the input order and yields no new error.
+- An all-pruned list falls back to the input order and yields no new error: with
+  `ranked` empty, step 2 emits nothing and step 3 preserves the input order.
+
+**Pinned output for an interleaved mixed list.** This is the exact expected value
+W-43 asserts, not an illustration:
+
+```text
+cands  = [ A:SameOrg, B:Granted, C:SameOrg, D:Granted, E:SameOrg ]   (global order)
+ranked = [ E, C ]                       // sensed viable, in (cost, provider) order
+pruned = { A }                          // fresh exact NotReady
+
+step 2  viable     = [E, C]             // sensed rank order, NOT global order
+step 3  potential  = [B, D]             // B and D are Granted -> potential, input order
+        non_viable = [A]                // SameOrg and pruned
+step 4  OUTPUT     = [E, C, B, D, A]
+```
+
+Note what this pins: `E` precedes `C` because sensing ranked it first, `B`
+precedes `D` because the input did, and `A` is last without being removed.
+
+**Inverse mutations for W-43, all three materially forbidden:**
+
+1. replace steps 2-4 with a `sort_by` over a `(class_rank, index)` key — a
+   comparison sort is forbidden; the witness must fail;
+2. reuse the OLB §9 P2C sampler to pick from `viable` — P2C is not the sensed
+   selector (D7.3); the witness must fail because `[E, C]` order is not preserved;
+3. emit `viable` in global order rather than sensed rank order — yields
+   `[C, E, B, D, A]` and must fail.
 
 ### D7.3 Reconciliation with the accepted OLB cold plan
 
@@ -1656,14 +1742,17 @@ checks the correspondence mechanically.
    therefore does **both**: the flag on each command (a new convention, stated as
    such) **and** the `nextest.toml` membership, because the SDK guard test at
    `SDK/sensing.rs:689` reads that file.
-3. **The existing counted-gate extractor cannot parse nextest.** All three
-   counted `--lib` steps (`ci.yml:171-265`, `:281-314`, `:341-458`) run
-   `cargo test --lib` and extract with
+3. **The existing counted-gate extractor parses libtest, so this design does not
+   reuse it.** All three counted `--lib` steps (`ci.yml:171-265`, `:281-314`,
+   `:341-458`) run `cargo test --lib` and extract with
    `grep -oE 'test result: ok\. [0-9]+ passed'` (`:179`, `:289`, `:352`) — the
-   **libtest** summary. A nextest-run counted gate would find `$n` empty and exit
-   1. So: the two `--lib` gates stay on `cargo test` with numeric MINs; the seven
-   new **integration** binaries use nextest with a per-name proof (10.3) instead
-   of a count parser.
+   **libtest** summary, which nextest never emits. **Every target in this design
+   is therefore nextest, including the two `--lib` targets**, and every count
+   obligation is discharged by a per-name loop instead of an output parser. The
+   nextest `--lib` precedent is `ci.yml:2894-2897`, the repo's existing nextest
+   `--lib` gate, which deliberately replaces a numeric floor with
+   `--no-tests=fail` plus an `-E` filterset. **There is no `cargo test` step
+   anywhere in this design.**
 4. **The integration pin guard auto-scrapes ci.yml.** `ci.yml:510-575` derives
    its pinned set with `grep -oE -- '--test [a-z0-9_]+'` after dropping `#`-comment
    lines and lines containing `echo ` (`:549-552`). Adding a `net/crates/net/tests/*.rs`
@@ -1703,22 +1792,23 @@ checks the correspondence mechanically.
 ### 10.2 The table
 
 Seven new binaries, two extended `--lib` modules, one extended integration
-binary, one expected-failure build probe. `MIN` equals the required-name-list
-length except where an existing baseline is added, and that is shown as
-`baseline + added`.
+binary, one expected-failure build guard. **This table is metadata only: the ONE
+command definition for every target is its §10.3 block, and nothing else in this
+document defines a command.** `MIN` is the FINAL value; where an existing baseline
+is added it is shown as `baseline + added = floor`.
 
-| # | Target | Package | Exact file | Slice | Rows | MIN | Zero-retry | Exact CI step label |
+| # | Target | Package | Exact file | Slice | Rows | Final MIN | Zero-retry | Exact CI step label |
 |---|---|---|---|---|---|---|---|---|
-| T1 | `org_gate::tests` (`--lib`) | `net-mesh` | `S/org_gate.rs` | OA-1, OA-2 | W-1..W-6, W-17 | `42+6=48` (OA-1) → `42+7=49` (OA-2) | n/a (`cargo test --lib`) | `Sensing org-authority witnesses` |
-| T2 | `sensing_authority_witness_tests` (`--lib`) | `net-mesh` | `A/mesh.rs` | OA-1, OA-2 | W-7, W-8, W-13..W-16 | `28+2=30` (OA-1) → `28+6=34` (OA-2) | n/a (`cargo test --lib`) | `Sensing org-authority witnesses` (same step) |
+| T1 | `org_gate::tests` (`--lib`, nextest) | `net-mesh` | `S/org_gate.rs` | OA-1, OA-2 | W-1..W-6, W-17 | 7 added; floor `42+7=49` | yes | `Sensing org-authority witnesses — org_gate` |
+| T2 | `sensing_authority_witness_tests` (`--lib`, nextest) | `net-mesh` | `A/mesh.rs` | OA-1, OA-2 | W-7, W-8, W-13..W-15 | 5 added; floor `28+5=33` | yes | `Sensing org-authority witnesses — authority module` |
 | T3 | `sensing_org_exact_intake` | `net-mesh` | `net/crates/net/tests/sensing_org_exact_intake.rs` | OA-2 | W-9..W-12 | **4** | yes | `Sensing org exact intake witnesses` |
-| T4 | `sensing_org_exact_guards` | `net-mesh` | `net/crates/net/tests/sensing_org_exact_guards.rs` | OA-2, OA-5 | W-18..W-20 (OA-2), W-21 (OA-5) | **3** → **4** | yes | `Sensing org exact structural guards` |
+| T4 | `sensing_org_exact_guards` | `net-mesh` | `net/crates/net/tests/sensing_org_exact_guards.rs` | OA-2, OA-5 | W-16, W-18..W-20 (OA-2), W-21 (OA-5) | **5** | yes | `Sensing org exact structural guards` |
 | T5 | `sensing_org_exact_lease` | `net-mesh` | `net/crates/net/tests/sensing_org_exact_lease.rs` | OA-3 | W-22..W-29 | **8** | yes | `Sensing org exact lease witnesses` |
 | T6 | `sensing_org_exact_refresh` | `net-mesh` | `net/crates/net/tests/sensing_org_exact_refresh.rs` | OA-3 | W-30..W-35 | **6** | yes | `Sensing org exact refresh witnesses` |
 | T7 | `sensing_org_exact_projection` | `net-mesh` | `net/crates/net/tests/sensing_org_exact_projection.rs` | OA-4 | W-36..W-41 | **6** | yes | `Sensing org exact projection witnesses` |
 | T8 | `sensing_org_three_node` (extended) | `net-mesh` | `net/crates/net/tests/sensing_org_three_node.rs` | OA-5 | W-42 | `1+1=2` | yes (already pinned `ci.yml:885`) | `Sensing org three-node witnesses` |
 | T9 | `org_exact_sensing_seam` | `net-mesh-sdk` | `net/crates/net/sdk/tests/org_exact_sensing_seam.rs` | OA-5 | W-43..W-51 | **9** | yes | `SDK org exact sensing seam witnesses` |
-| T10 | fixtures-off probe (expected-failure build, **not** a test binary) | standalone | `net/crates/net/guards/fixtures_off_probe/` | OA-5 | W-52 | n/a | n/a | ``Guard — the OA-5 seam does not compile without `fixtures` `` |
+| T10 | fixtures-off probe (**trybuild**, not a nextest binary) | standalone `net-mesh-fixtures-off-probe` | `net/crates/net/guards/fixtures_off_probe/` | OA-5 | W-52 | **8** compile-fail cases + 1 positive build | n/a (own crate, own lockfile) | ``Guard — the OA-5 seam does not compile without `fixtures` `` |
 | T11 | `org_exact_sensing` | `net-mesh-sdk` | `net/crates/net/sdk/tests/org_exact_sensing.rs` | OA-6 | W-53, W-54 | **2** | yes | `SDK org exact sensing production witnesses` |
 
 Row totals: T1 7, T2 6, T3 4, T4 4, T5 8, T6 6, T7 6, T8 1, T9 9, T10 1, T11 2 →
@@ -1798,20 +1888,24 @@ port-mapping tool batched-ingress cli regex`.
           fi
 ```
 
-#### T2 — `sensing_authority_witness_tests` (`--lib`, core) — nextest, MIN 30 → **34**
+#### T2 — `sensing_authority_witness_tests` (`--lib`, core) — nextest, floor **33**
+
+W-16 is **not** here: it must call `probe_reverse_lock_order`, and W-21 forbids
+any bridge identifier in `A/mesh.rs`. It lives in **T4** instead, which already
+owns the lock-inventory witnesses and runs with `fixtures` on, so it may name the
+bridge legally.
 
 ```yaml
       - name: Sensing org-authority witnesses — authority module
         if: ${{ !cancelled() }}
         run: |
           set -o pipefail
-          # OA-1 adds W-7, W-8; OA-2 adds W-13..W-16. Baseline in the module is 28.
+          # OA-1 adds W-7, W-8; OA-2 adds W-13..W-15. Baseline in the module is 28.
           REQUIRED="the_org_lease_leg_registers_under_proven_root_not_the_local_root
           the_legacy_lease_leg_is_unchanged_byte_for_byte
           floor_raise_between_local_planning_and_the_org_register_creates_no_row
           authority_swap_between_local_planning_and_the_org_register_creates_no_row
-          the_table_guard_is_still_held_across_the_org_install_currentness_capture
-          a_sanctioned_observation_acquisition_under_org_install_reports_reverse_order"
+          the_table_guard_is_still_held_across_the_org_install_currentness_capture"
           cargo nextest run --no-fail-fast --no-tests=fail --retries 0 \
             --lib --features "$UNIT_FEATURES" \
             -E 'test(/^adapter::net::mesh::sensing_authority_witness_tests::/)'
@@ -1823,8 +1917,8 @@ port-mapping tool batched-ingress cli regex`.
           n=$(cargo nextest list --lib --features "$UNIT_FEATURES" \
                 -E 'test(/^adapter::net::mesh::sensing_authority_witness_tests::/)' \
                 2>/dev/null | grep -cE '^[[:space:]]{4}[^[:space:]]')
-          if [ "${n:-0}" -lt 34 ]; then
-            echo "::error::expected >= 34 authority witnesses, listed ${n:-0}."
+          if [ "${n:-0}" -lt 33 ]; then
+            echo "::error::expected >= 33 authority witnesses, listed ${n:-0}."
             exit 1
           fi
 ```
@@ -1836,12 +1930,11 @@ port-mapping tool batched-ingress cli regex`.
 > (`grep -oE 'test result: ok\. [0-9]+ passed'`, `ci.yml:179`/`:289`/`:352`) parses
 > **libtest** output, which nextest never emits (10.1 fact 3). The count above
 > therefore parses `cargo nextest list`'s human output, counting four-space-indented
-> test-name lines. **That line shape MUST be confirmed against nextest under the
-> pinned 1.98.0 toolchain before OA-1 lands** — a mismatch yields `n=0` and a loud
-> failure, never a silent pass. If it cannot be confirmed, the recorded fallback is
-> to keep steps 1 and 2 (which fully discharge the *added* names) and enforce the
-> baseline with the existing libtest extractor in a separate `cargo test --lib`
-> step, accepting the two-runner cost. **Not** to drop the floor.
+> test-name lines. **That line shape is an OA-1 STOP GATE: confirm it against
+> nextest under the pinned 1.98.0 toolchain before OA-1 lands.** A mismatch yields
+> `n=0` and a loud failure, never a silent pass. If it cannot be confirmed, **stop
+> and take the baseline-floor mechanism to review** — do not drop the floor, and do
+> not reintroduce a `cargo test` step: this design has no `cargo test` target.
 
 #### T3 — `sensing_org_exact_intake` (core) — nextest, **MIN=4**
 
@@ -1863,19 +1956,23 @@ port-mapping tool batched-ingress cli regex`.
           done
 ```
 
-#### T4 — `sensing_org_exact_guards` (core) — nextest, **MIN=3 (OA-2) → 4 (OA-5)**
+#### T4 — `sensing_org_exact_guards` (core) — nextest, final **MIN=5**
 
-The OA-2 block carries three names. **OA-5 edits this same step**, appending
-`every_bridge_declaration_in_the_module_is_hidden_gated_and_worded` to `REQUIRED`,
-making the final MIN **4**:
+This binary owns **both** halves of the lock-direction proof: the structural
+inventory (W-18..W-20) and the runtime reverse-direction witness (**W-16**, moved
+here from T2 because it calls `probe_reverse_lock_order` and W-21 forbids bridge
+identifiers in `A/mesh.rs`). It runs with `fixtures` on, so the fixtures-gated
+`pub` bridge is nameable from it. OA-2 lands four names; OA-5 appends the fifth in
+the SAME step, giving the final MIN of 5:
 
 ```yaml
       - name: Sensing org exact structural guards
         if: ${{ !cancelled() }}
         run: |
           set -o pipefail
-          # OA-2 lands the first three. OA-5 appends the fourth in the SAME step.
-          REQUIRED="every_org_install_acquisition_goes_through_the_sanctioned_funnel
+          # OA-2 lands the first four. OA-5 appends the fifth in the SAME step.
+          REQUIRED="a_sanctioned_observation_acquisition_under_org_install_reports_reverse_order
+          every_org_install_acquisition_goes_through_the_sanctioned_funnel
           every_relevant_sensing_lock_acquisition_is_in_the_sanctioned_inventory
           the_zero_retry_override_names_every_org_exact_sensing_binary
           every_bridge_declaration_in_the_module_is_hidden_gated_and_worded"
@@ -2008,14 +2105,43 @@ because a 14-binary grouped command cannot prove a per-binary floor.
           done
 ```
 
-#### T10 — the fixtures-off probe — **NOT a nextest binary**
+#### T10 — the fixtures-off probe — **NON-NEXTEST (trybuild)**
 
-**Non-nextest, explicitly.** T10 is a two-invocation `cargo build` guard, not a
-test target: it has no test functions, no `--test` flag and no `MIN`. Its complete
-command and exact success condition are in D10.3 part (b); the success condition
-is *both* legs passing — the negative build failing with a pinned absent-symbol
-diagnostic code, **and** the positive build succeeding under
-`--features fixtures`. Either leg alone is vacuous.
+**Explicitly non-nextest.** T10 is a standalone crate driven by `trybuild`: eight
+per-entry compile-fail cases plus one positive whole-set build. It has no nextest
+invocation, no `--test <binary>` flag and no `-E` filterset. Its artifacts are
+frozen in D10.3 part (b); **this is its one and only command definition**.
+
+`REPO_ROOT` is derived rather than assumed, so the block is copy-pasteable into a
+job with **any** default working directory — including `net/crates/net`, which is
+the default in every job that runs the other ten blocks:
+
+```yaml
+      - name: Guard — the OA-5 seam does not compile without `fixtures`
+        if: ${{ !cancelled() }}
+        run: |
+          set -o pipefail
+          REPO_ROOT="$(git rev-parse --show-toplevel)"
+          cd "$REPO_ROOT/net/crates/net/guards/fixtures_off_probe"
+          # 1. NEGATIVE — eight per-entry compile-fail cases. trybuild compiles
+          #    each tests/ui/<entry>.rs WITHOUT the probe's `fixtures` feature and
+          #    compares the rendered diagnostic to the committed .stderr byte for
+          #    byte. Any case that COMPILES, or whose diagnostic drifts, fails.
+          cargo test --test compile_fail
+          # 2. POSITIVE — the same crate WITH fixtures forwarded must build, so a
+          #    probe broken for an unrelated reason cannot pass leg 1 vacuously.
+          cargo build --features fixtures
+          # 3. The eight case files must equal MANIFEST exactly — no case may be
+          #    deleted to make leg 1 pass, and no MANIFEST entry may go uncovered.
+          ls tests/ui/*.rs | sed 's|tests/ui/||; s|\.rs$||' | sort > /tmp/ui.txt
+          sort MANIFEST > /tmp/manifest.txt
+          diff -u /tmp/manifest.txt /tmp/ui.txt || {
+            echo "::error::tests/ui/ does not match MANIFEST exactly"; exit 1; }
+```
+
+The success condition is **all three legs**. Leg 1 alone could pass with zero
+cases; leg 2 alone proves nothing about absence; leg 3 is what binds the case set
+to the manifest.
 
 #### T11 — `org_exact_sensing` (SDK, production) — nextest, **MIN=2**
 
@@ -2061,61 +2187,19 @@ what makes this a production-path witness.
   authority unit tests` `:2894`) and collides with none. T1 and T2 are two
   separate labels because they are two separate commands.
 
-### 10.4 The complete required-name roster
+### 10.4 Uniqueness rule
 
-Every function name below is stated once here, once in its owning slice, and once
-in the §11 matrix row that owns it. §14 checks that correspondence mechanically.
-All names are `snake_case`, unique tree-wide, and at most 79 characters — the
-de-facto maximum already in the repo
+**One definition each.** Every target's command, features, flags, `REQUIRED` list
+and label are defined exactly once — in its §10.3 block. §10.2 is metadata only.
+Every other mention of a target anywhere in this document, including every OA
+slice, is a **reference by ID** (`T1`…`T11`) and MUST NOT restate a command, a
+feature string, a name list or a MIN. A second definition is a defect, not a
+convenience.
+
+All function names are `snake_case`, unique across all blocks, and at most 79
+characters — the de-facto maximum already in the repo
 (`test_regression_dual_model_alternating_ingests_do_not_produce_duplicate_app_seq`,
 `tests/integration_netdb.rs:323`).
-
-**T1 — `org_gate::tests` (`--lib`), `S/org_gate.rs`, baseline 42.**
-OA-1 adds W-1..W-6 (six names, listed in OA-1). OA-2 adds one:
-
-| Row | Function name |
-|---|---|
-| W-17 | `the_rejection_surface_inventory_matches_the_match_the_tests_and_the_docs` |
-
-**T2 — `sensing_authority_witness_tests` (`--lib`), `A/mesh.rs`, baseline 28.**
-OA-1 adds W-7, W-8 (listed in OA-1). OA-2 adds four. **These names deliberately
-say `local_planning` and `org_register`**, because the module already contains the
-INBOUND equivalents — `floor_raise_between_gate_and_register_creates_no_row`
-(`A/mesh.rs:41371`) and
-`authority_swap_between_gate_and_register_creates_no_row` (`:41411`) — and W-13/W-14
-cover the new **local-origin egress** path, not those:
-
-| Row | Function name |
-|---|---|
-| W-13 | `floor_raise_between_local_planning_and_the_org_register_creates_no_row` |
-| W-14 | `authority_swap_between_local_planning_and_the_org_register_creates_no_row` |
-| W-15 | `the_table_guard_is_still_held_across_the_org_install_currentness_capture` |
-| W-16 | `a_sanctioned_observation_acquisition_under_org_install_reports_reverse_order` |
-
-**T3 — `sensing_org_exact_intake`, MIN=4** (OA-2). Names as in the command above.
-
-**T4 — `sensing_org_exact_guards`, MIN=3 (OA-2) → 4 (OA-5).**
-
-| Row | Function name | Slice |
-|---|---|---|
-| W-18 | `every_org_install_acquisition_goes_through_the_sanctioned_funnel` | OA-2 |
-| W-19 | `every_relevant_sensing_lock_acquisition_is_in_the_sanctioned_inventory` | OA-2 |
-| W-20 | `the_zero_retry_override_names_every_org_exact_sensing_binary` | OA-2 |
-| W-21 | `every_bridge_declaration_in_the_module_is_hidden_gated_and_worded` | OA-5 |
-
-**T5, T6, T7 — names listed in OA-3 and OA-4** (8, 6 and 6 respectively).
-
-**T8 — `sensing_org_three_node`, baseline 1**
-(`relay_reauthors_org_provider_under_its_own_membership`, `:159`), OA-5 adds one:
-
-| Row | Function name |
-|---|---|
-| W-42 | `a_floored_peer_with_sensing_off_drops_the_org_frame_and_stays_unknown` |
-
-**T9, T11 — names listed in OA-5 and OA-6** (9 and 2 respectively).
-
-**T10** is a build probe, not a test binary: it has no function names, and its
-proof is the expected-failure/self-test command pair in D10.3 part (b).
 
 ---
 
@@ -2240,8 +2324,8 @@ pub mod org_exact_sensing_bridge;
   module cannot become a vector for unrelated production exposure. This is
   explicitly unsupported test plumbing, exactly like the accepted S1 fixture
   bridges (`S/evaluator.rs:1900-1907`), and it creates **no production call
-  edge**: OA-5 adds no caller, and OA-6 deletes the gate rather than adding one
-  beside it.
+  edge**: OA-5 adds no caller, and **OA-6 never lights this bridge** — the
+  fixtures gate stays on it permanently (D10.3 part (d)).
 - It runs as a test in **T4** (`sensing_org_exact_guards`), with its own
   independent command per §10.3.
 
@@ -2330,108 +2414,196 @@ literal from `S/evaluator.rs:1884`. `MANIFEST` (the file beside the probe's
 | 7 | `probe_set_demand_contention_hook` | installs the W-35 acknowledgement hook on `demand_mu`: `fn(&Arc<MeshNode>, Option<Arc<dyn Fn() + Send + Sync>>)` | core fixture (T6) | `let _ = bridge::probe_set_demand_contention_hook as usize;` |
 | 8 | `probe_family_binding_state` | observes Active/Inert plus retained-demand count for W-49/W-50/W-51: `fn(&OrgClient) -> (bool, usize)` | SDK seam (T9) | `let _ = bridge::probe_family_binding_state as usize;` |
 
-**Negative expected diagnostic, per entry.** Without `fixtures` the `pub mod`
-declaration is itself `cfg`-ed out, so the **module** disappears before any item
-does. The `use` at the top of `src/main.rs` therefore fails first with **`E0432`**
-(unresolved import `net::adapter::net::org_exact_sensing_bridge`), and that one
-diagnostic covers all eight entries — which is why the guard also asserts
-`MANIFEST` equals the module's declaration set (W-21), so per-entry coverage is
-proved *structurally* rather than by eight separate compiler errors.
+**Negative evidence is per entry, and there is no accepted diagnostic class.**
+Eight `trybuild` compile-fail cases, one per MANIFEST entry, each with a committed
+`.stderr` compared **byte for byte**. A case that compiles fails the guard; a case
+whose diagnostic drifts fails the guard. No `E0432|E0433|…` alternation is
+accepted anywhere, and there is no unimplemented alternative path.
 
-**Per-item diagnostics are available if review prefers them**, at the cost of
-eight tiny crates: replace `src/main.rs`'s single `use` with eight modules each
-naming one item by fully qualified path
-(`net::adapter::net::org_exact_sensing_bridge::probe_…`). Each then fails with
-**`E0433`** (failed to resolve). Recorded as the alternative; **not** the default,
-because the module-level gate makes the eight failures identical in cause and the
-`MANIFEST` equality check already binds the set.
+`trybuild` is **ABSENT** from this repository (10.1 fact 8), so T10 adds it — as a
+dev-dependency of the **probe crate only**. The probe carries its own
+`[workspace]` table and its own lockfile, so this introduces no dependency into
+the `net-mesh` workspace graph and cannot affect any shipped artifact.
 
-#### The probe source, complete
+#### The probe crate, complete
+
+```text
+net/crates/net/guards/fixtures_off_probe/
+  Cargo.toml
+  MANIFEST                              # the eight lines above, nothing else
+  src/main.rs                           # positive: names all eight
+  tests/compile_fail.rs                 # the trybuild runner
+  tests/ui/probe_acquire_org_exact_interest.rs      + .stderr
+  tests/ui/probe_reconcile_population.rs            + .stderr
+  tests/ui/probe_refresh_once.rs                    + .stderr
+  tests/ui/probe_sensed_branch_snapshot.rs          + .stderr
+  tests/ui/probe_sensed_provider_order.rs           + .stderr
+  tests/ui/probe_reverse_lock_order.rs              + .stderr
+  tests/ui/probe_set_demand_contention_hook.rs      + .stderr
+  tests/ui/probe_family_binding_state.rs            + .stderr
+```
+
+`Cargo.toml` — complete. Package names/versions are `net-mesh` `0.36.0`
+(`net/crates/net/Cargo.toml:26-27`) with lib name `net` (`:65,:70`), so the
+`package =` rename idiom (`sdk/Cargo.toml:25`) is required for `use net::…` to
+compile. Depth from `guards/fixtures_off_probe/` to the core crate is `../..`:
+
+```toml
+[package]
+name = "net-mesh-fixtures-off-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Its OWN workspace root. The root workspace at ../../Cargo.toml neither includes
+# nor excludes it, and the root feature graph can never turn `fixtures` on here.
+[workspace]
+
+[features]
+# The positive leg. Forwards to the CORE crate's gate explicitly, because nothing
+# forwards it implicitly (10.1 fact 7).
+fixtures = ["net/fixtures"]
+
+[dependencies]
+net = { package = "net-mesh", version = "0.36.0", path = "../..", default-features = false, features = ["net"] }
+
+[dev-dependencies]
+# Present ONLY in this crate. `trybuild` is absent from the net-mesh workspace and
+# stays absent from it.
+trybuild = "1"
+
+[[bin]]
+name = "fixtures_off_probe"
+path = "src/main.rs"
+```
+
+`tests/compile_fail.rs` — complete runner. The `MANIFEST` cross-check lives in
+T10 leg 3 (a shell `diff`) rather than here, so a missing case file fails even if
+`trybuild`'s glob silently matches fewer files:
 
 ```rust
-// net/crates/net/guards/fixtures_off_probe/src/main.rs — COMPLETE FILE.
-// One reference per MANIFEST entry; MANIFEST is asserted equal to the bridge
-// module's declaration set by W-21, so this list cannot silently shrink.
-use net::adapter::net::org_exact_sensing_bridge as bridge;
-
-fn main() {
-    // Coercing each fn item to `usize` names it without calling it, so the probe
-    // needs no runtime, no mesh, and no arguments — it is a pure name-resolution
-    // check. All eight must resolve under `fixtures` and vanish without it.
-    let _ = bridge::probe_acquire_org_exact_interest as usize;
-    let _ = bridge::probe_reconcile_population as usize;
-    let _ = bridge::probe_refresh_once as usize;
-    let _ = bridge::probe_sensed_branch_snapshot as usize;
-    let _ = bridge::probe_sensed_provider_order as usize;
-    let _ = bridge::probe_reverse_lock_order as usize;
-    let _ = bridge::probe_set_demand_contention_hook as usize;
-    let _ = bridge::probe_family_binding_state as usize;
+// Eight per-entry cases. The crate is built WITHOUT its `fixtures` feature here,
+// so `net` carries no `fixtures` either and the bridge module does not exist.
+#[test]
+fn the_oa5_bridge_is_absent_without_fixtures() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/ui/*.rs");
 }
 ```
 
-```text
-// net/crates/net/guards/fixtures_off_probe/MANIFEST — COMPLETE FILE.
-probe_acquire_org_exact_interest
-probe_reconcile_population
-probe_refresh_once
-probe_sensed_branch_snapshot
-probe_sensed_provider_order
-probe_reverse_lock_order
-probe_set_demand_contention_hook
-probe_family_binding_state
+#### The eight negative cases
+
+Every case file is three lines and differs only in the item it names. Shown in
+full for entry 1; the other seven are byte-identical apart from the final path
+segment, which is the entry's name from `MANIFEST`:
+
+```rust
+// tests/ui/probe_acquire_org_exact_interest.rs — COMPLETE FILE.
+fn main() {
+    let _ = net::adapter::net::org_exact_sensing_bridge::probe_acquire_org_exact_interest as usize;
+}
 ```
 
-Expected diagnostics, and how they are normalized:
+| # | Case file (`tests/ui/…`) | The item reference it must fail on |
+|---|---|---|
+| 1 | `probe_acquire_org_exact_interest.rs` | `net::adapter::net::org_exact_sensing_bridge::probe_acquire_org_exact_interest` |
+| 2 | `probe_reconcile_population.rs` | `net::adapter::net::org_exact_sensing_bridge::probe_reconcile_population` |
+| 3 | `probe_refresh_once.rs` | `net::adapter::net::org_exact_sensing_bridge::probe_refresh_once` |
+| 4 | `probe_sensed_branch_snapshot.rs` | `net::adapter::net::org_exact_sensing_bridge::probe_sensed_branch_snapshot` |
+| 5 | `probe_sensed_provider_order.rs` | `net::adapter::net::org_exact_sensing_bridge::probe_sensed_provider_order` |
+| 6 | `probe_reverse_lock_order.rs` | `net::adapter::net::org_exact_sensing_bridge::probe_reverse_lock_order` |
+| 7 | `probe_set_demand_contention_hook.rs` | `net::adapter::net::org_exact_sensing_bridge::probe_set_demand_contention_hook` |
+| 8 | `probe_family_binding_state.rs` | `net::adapter::net::org_exact_sensing_bridge::probe_family_binding_state` |
 
-- **Without `fixtures`:** the `pub mod` declaration itself is `cfg`-ed out, so the
-  `use` fails first with **`E0432`** (unresolved import), and any surviving item
-  reference fails with **`E0433`** (failed to resolve) or **`E0425`**
-  (cannot find value). The CI step greps for
-  `E0432|E0433|E0425|E0599` on the captured stderr, so the build must fail *for
-  the absent-symbol reason* rather than for any other breakage. Normalization is
-  deliberately by **error code, not message text**, because rustc prose is not
-  stable across toolchains; the toolchain itself is pinned to 1.98.0
-  (`net/crates/net/rust-toolchain.toml`), so the code set is stable in practice.
-- **With `--features fixtures`:** the build must **succeed**. That is the
-  self-test half; without it a probe broken for an unrelated reason would pass
-  the negative check vacuously.
+Each case uses a **fully qualified path** rather than a `use` alias, deliberately:
+the failing span then contains that entry's own name, so its `.stderr` is unique
+to it and cannot be satisfied by another entry's diagnostic.
+
+#### Expected-diagnostic policy — exact, and honest about what it proves
+
+- Each `.stderr` is **generated once at landing** with
+  `TRYBUILD=overwrite cargo test --test compile_fail`, reviewed, and **committed**.
+  Thereafter the runner compares byte for byte; drift fails.
+- **No error-code alternation is accepted.** The committed file is the contract.
+- Diagnostics are rustc-version-dependent, which is safe here because the
+  toolchain is pinned to **1.98.0** (`net/crates/net/rust-toolchain.toml`). A
+  toolchain bump regenerates the eight files in the same commit as the bump — the
+  same discipline the repo already applies to generated fixtures.
+- **What a case proves, stated precisely:** that *this exact item reference* does
+  not compile without `fixtures`. Because the module-level `#[cfg]` removes the
+  module, the eight failures share a cause (the module segment does not resolve)
+  while each `.stderr` pins a different item reference. **Per-item existence** —
+  that all eight exist and none was quietly dropped — is proved by the other two
+  legs: the positive build in T10 leg 2 names all eight and must compile, and
+  T10 leg 3 `diff`s `tests/ui/` against `MANIFEST`. The three legs together are
+  the witness; none is sufficient alone.
+
+#### The positive leg
+
+`src/main.rs` (given complete above) names all eight items. T10 leg 2 builds the
+crate with `--features fixtures`, which forwards `net/fixtures` and makes the
+module and all eight items exist. If that build fails, the probe is broken and
+leg 1 cannot be trusted — which is exactly why leg 2 exists.
+
+**CI target:** the single step in T10's §10.3 block. `integration-guard` is not
+involved: the probe is not a `net/crates/net/tests/*.rs` file and `ci.yml:554`
+never sees it.
+
+**(c) The OA-5 range evidence file — schema now, hashes at landing.**
+
+**No SHA literal and no angle-bracket value appears in this design.** The range is
+carried by a file that OA-5 *generates* at landing and commits alongside its diff:
+
+```text
+net/crates/net/guards/oa5_range_evidence.json
+```
+
+Schema — two required fields, each a full 40-hex commit id matching
+`^[0-9a-f]{40}$`, no other keys permitted:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `oa5_base_head` | string, `^[0-9a-f]{40}$` | the exact accepted OA-4 head the OA-5 diff is measured from |
+| `oa5_head` | string, `^[0-9a-f]{40}$` | the exact OA-5 candidate head under review |
+
+The guard, complete. It is a shell step, not a script to be written later, and it
+fails closed on a missing file, a malformed field, a non-ancestor base, or a
+touched production file:
 
 ```yaml
-      - name: Guard — the OA-5 seam does not compile without `fixtures`
+      - name: Guard — the OA-5 range touches no production call path
         if: ${{ !cancelled() }}
         run: |
           set -o pipefail
-          P=net/crates/net/guards/fixtures_off_probe/Cargo.toml
-          # 1. NEGATIVE: without `fixtures` the symbols are absent → build MUST fail.
-          if cargo build --manifest-path "$P" 2>/tmp/off.txt; then
-            echo "::error::the OA-5 seam compiled WITHOUT fixtures — the dark boundary is gone"
-            exit 1
-          fi
-          # Diagnostic handling: the failure must be "symbol absent", not any other
-          # breakage (a typo, a missing dep, a syntax error would also "fail").
-          grep -qE 'E0432|E0433|E0425|E0599' /tmp/off.txt || {
-            echo "::error::probe failed for the wrong reason:"; cat /tmp/off.txt; exit 1; }
-          # 2. SELF-TEST: with `fixtures` it MUST compile, or the probe is vacuous.
-          cargo build --manifest-path "$P" --features fixtures
+          REPO_ROOT="$(git rev-parse --show-toplevel)"
+          EV="$REPO_ROOT/net/crates/net/guards/oa5_range_evidence.json"
+          test -f "$EV" || { echo "::error::OA-5 range evidence file is absent"; exit 1; }
+          BASE=$(jq -r '.oa5_base_head' "$EV")
+          HEAD_=$(jq -r '.oa5_head' "$EV")
+          for v in "$BASE" "$HEAD_"; do
+            printf '%s' "$v" | grep -qE '^[0-9a-f]{40}$' || {
+              echo "::error::not a 40-hex commit id: $v"; exit 1; }
+          done
+          # The base must really be an ancestor of the candidate.
+          git merge-base --is-ancestor "$BASE" "$HEAD_" || {
+            echo "::error::oa5_base_head is not an ancestor of oa5_head"; exit 1; }
+          # The allowlist: OA-5 must not touch either production SDK call path.
+          FORBIDDEN='net/crates/net/sdk/src/org/call.rs
+          net/crates/net/sdk/src/org/client.rs'
+          CHANGED=$(git diff --name-only "$BASE".."$HEAD_")
+          for f in $FORBIDDEN; do
+            if printf '%s\n' "$CHANGED" | grep -qx "$f"; then
+              echo "::error::OA-5 range modifies production path $f — that is OA-6"
+              exit 1
+            fi
+          done
 ```
 
-The negative/self-test pair is the `<script>` + `--self-test` convention the
-`.github/scripts/*` guards already use. **W-52 is this step**, and it is real
-compile evidence rather than a source string.
-
-**(c) The exact OA-5 commit range, filled before acceptance.**
-
-```text
-OA5_BASE_HEAD = <the exact accepted OA-4 head SHA>       # placeholder AT DESIGN TIME ONLY
-OA5_HEAD      = <the exact OA-5 candidate head SHA>      # placeholder AT DESIGN TIME ONLY
-```
-
-A script asserts `git diff --name-only $OA5_BASE_HEAD..$OA5_HEAD` matches the
-OA-5 file allowlist and **rejects any change to `SDK/org/call.rs` or
-`SDK/org/client.rs`**. **These two placeholders MUST be replaced with exact SHAs
-before OA-5 can be accepted; a vague or unset range is itself a review
-failure and OA-5 cannot land with them unfilled.** OA-6 requires its own
-exact-head review on the same rule.
+**Acceptance rule.** OA-5 cannot be accepted until this file exists and contains
+two real hashes; the guard above is what proves it. Field *descriptions* live
+here; field *values* are produced at landing and never written into this design.
+OA-6 supplies its own evidence file under the same schema and its own exact-head
+review.
 
 **(d) OA-6 retires the probe, and does NOT re-gate the bridge.** The
 fixtures-only module stays fixtures-only **forever**: OA-6 deletes the
@@ -2478,33 +2650,11 @@ lock.
 
 **Rows:** W-1..W-6 (T1), W-7..W-8 (T2).
 
-**Exact CI edit — one counted step, on `cargo test` (10.1 fact 3):**
-
-```yaml
-      - name: Sensing org-authority witnesses
-        if: ${{ !cancelled() }}
-        run: |
-          set -o pipefail
-          GATE_MIN=48      # 42 existing + 6 added (W-1..W-6)
-          LEASE_MIN=30     # 28 existing + 2 added (W-7, W-8)
-          count() {
-            printf '%s\n' "$1" | grep -oE 'test result: ok\. [0-9]+ passed' \
-              | grep -oE '[0-9]+' | head -1
-          }
-          gate=$(cargo test --lib --features "$UNIT_FEATURES" \
-                   behavior::sensing::org_gate:: 2>&1 | tee /dev/stderr)
-          lease=$(cargo test --lib --features "$UNIT_FEATURES" \
-                   mesh::sensing_authority_witness_tests 2>&1 | tee /dev/stderr)
-          # the same >= assertions and REQUIRED name loop as ci.yml:171-265
-          REQUIRED="local_org_admission_derives_the_audience_and_refuses_any_other
-          local_org_admission_refuses_a_selector_that_does_not_name_the_target
-          local_org_planner_emits_the_org_variant_never_the_legacy_one
-          local_org_planner_refuses_a_legacy_authority_with_no_frame
-          local_org_planner_refuses_a_membership_for_another_org
-          an_emitted_local_org_frame_passes_the_intake_gate_unmodified
-          the_org_lease_leg_registers_under_proven_root_not_the_local_root
-          the_legacy_lease_leg_is_unchanged_byte_for_byte"
-```
+**Gates:** execute the complete **T1** and **T2** blocks from §10.3, unchanged.
+OA-1 lands six of T1's seven names (W-1..W-6) and two of T2's five (W-7, W-8);
+both blocks are already written to their final form, so OA-1 adds no command of
+its own and restates nothing. Interim floors during OA-1 are `42+6=48` (T1) and
+`28+2=30` (T2); the blocks' final floors of 49 and 33 are reached at OA-2.
 
 **Stop condition:** if the shared-core factoring cannot keep the legacy path
 byte-identical, stop.
@@ -2560,11 +2710,9 @@ a_sanctioned_observation_acquisition_under_org_install_reports_reverse_order
 ```
 
 **Exact CI edits:**
-- add the step `Sensing org exact intake witnesses` (T3) and the step
-  `Sensing org exact structural guards` (T4), each exactly per §10.3 with
-  `--features "cortex tool fixtures"`, `--no-tests=fail --retries 0`, and its
-  own `REQUIRED` loop over the names in §10.4;
-- extend the OA-1 counted step: `GATE_MIN=48` → **49**, `LEASE_MIN=30` → **34**;
+- add the **T3** and **T4** blocks from §10.3, verbatim;
+- T1 and T2 reach their final floors here (49 and 33) — the blocks in §10.3 are
+  already written to those values, so no command changes;
 - extend the Windows filter (`ci.yml:2897`) to
   `-E 'test(/^adapter::net::behavior::org/) + test(/^adapter::net::org_admission_gate/) + test(/^adapter::net::behavior::sensing::org_gate/) + test(/^adapter::net::mesh::sensing_authority_witness_tests/)'`;
 - append `binary(sensing_org_exact_intake) + binary(sensing_org_exact_guards)`
@@ -2598,30 +2746,11 @@ release; acquire-before-release churn with the population narrowed first; one
 refresh record per installed key; subsecond absolute arming with earlier-deadline
 wake; extract-then-drop off `demand_mu`; **`Drop` on the inner only**.
 
-T5 `sensing_org_exact_lease` — **MIN=8**, rows W-22..W-29:
-```text
-the_allocator_issues_at_most_max_lease_token_and_never_u64_max
-the_acquire_after_the_last_issuable_token_is_refused_fail_closed
-at_exhaustion_incumbents_keep_tokens_cadence_and_streams
-a_stale_ticket_cannot_release_a_live_successor_for_the_same_key
-installation_id_is_the_first_token_and_survives_that_holders_release
-final_release_then_same_key_reacquire_yields_a_fresh_installation_id
-the_refresh_read_returns_the_stored_spec_and_the_installed_cadence
-a_reentrant_destructor_on_an_extracted_demand_cannot_deadlock
-```
+**Gates:** execute the complete **T5** and **T6** blocks from §10.3 (rows
+W-22..W-29 and W-30..W-35). Their names, features, flags and MINs are defined
+there and are not restated here.
 
-T6 `sensing_org_exact_refresh` — **MIN=6**, rows W-30..W-35:
-```text
-n_half_ttl_refreshes_leave_the_holder_count_exactly_unchanged
-the_last_holders_release_disarms_the_refresh_record
-an_earlier_deadline_inserted_while_the_worker_is_parked_wakes_it
-a_subsecond_half_ttl_arms_to_the_absolute_deadline_not_a_whole_second_delta
-own_membership_revocation_stops_refresh_emission_with_no_legacy_downgrade
-a_contender_on_demand_mu_fails_try_lock_and_the_acknowledgement_hook_fires
-```
-
-**Exact CI edits:** the T5 and T6 steps per §10.3, features
-`"cortex tool fixtures"`; append
+**Exact CI edits:** add the **T5** and **T6** blocks from §10.3; append
 `binary(sensing_org_exact_lease) + binary(sensing_org_exact_refresh)` to
 `.config/nextest.toml:55` (plus `binary(sensing_lease) + binary(sensing_lease_wire)
 + binary(sensing_org_three_node)`); extend the `SDK/sensing.rs:689` guard.
@@ -2650,19 +2779,11 @@ stamp**; no freshness in the public output.
 **Explicitly NOT in this slice:** repairing `sensing_readiness_overlay`'s torn
 read (§12.4), and adding a removal path to `CapabilityIndex` (§12.8).
 
-T7 `sensing_org_exact_projection` — **MIN=6**, rows W-36..W-41:
-```text
-counts_ranking_and_rows_agree_under_concurrent_status_and_route_change
-unknown_never_prunes_and_an_over_budget_ready_stays_potential
-expiry_without_a_new_beat_maps_unknown_and_an_expired_not_ready_never_prunes
-a_provider_removed_before_the_snapshot_resolves_unknown_from_current_state
-a_provider_removed_after_the_snapshot_is_advisory_and_cannot_authorize
-no_sensing_lock_is_held_during_route_budget_or_sort_work
-```
+**Gates:** execute the complete **T7** block from §10.3 (rows W-36..W-41).
 
-**Exact CI edits:** the T7 step per §10.3, features `"cortex tool fixtures"`;
-append `binary(sensing_org_exact_projection)` to `.config/nextest.toml:55`;
-extend the `SDK/sensing.rs:689` guard.
+**Exact CI edits:** add the **T7** block from §10.3; append
+`binary(sensing_org_exact_projection)` to `.config/nextest.toml:55`; extend the
+`SDK/sensing.rs:689` guard.
 
 **Stop conditions:** if a coherent single-section read requires holding
 `sensing_observations` across the proximity plane, stop. If `projected_at` cannot
@@ -2731,35 +2852,20 @@ instead of a raw `send_subprotocol`.
 1. **Module-boundary source guard** (D10.3 part (a)) — W-21, in T4. Not a five-name list.
 2. **Fixtures-off negative compile witness** (D10.3 part (b)) — W-52, in T10, with the
    diagnostic-code check and the `--features fixtures` self-test.
-3. **Exact commit range** (D10.3 part (c)) — `OA5_BASE_HEAD`/`OA5_HEAD` filled with real
-   SHAs before acceptance; the allowlist rejects `SDK/org/call.rs` and
+3. **Range evidence** (D10.3 part (c)) — OA-5 generates
+   `guards/oa5_range_evidence.json` with two real 40-hex ids; the guard validates
+   the schema, the ancestry, and an allowlist that rejects `SDK/org/call.rs` and
    `SDK/org/client.rs`.
 4. **Exact-head diff review** by the independent reviewer, not by a grep.
 
-T9 `org_exact_sensing_seam` — **MIN=9**, rows W-43..W-51:
-```text
-same_org_and_granted_mixed_list_orders_viable_same_org_first
-an_all_granted_list_is_returned_unchanged_and_is_never_sensed
-a_provider_on_both_planes_yields_one_same_org_candidate
-direct_still_decides_after_reordering_and_considered_is_unchanged
-an_all_pruned_list_falls_back_to_the_input_order_with_no_new_error
-the_fixtures_only_seam_composition_proof_end_to_end
-an_inert_family_binding_never_fails_bind_node
-an_intermediate_wrapper_clone_drop_retires_nothing
-the_last_wrapper_clone_drop_retires_every_demand_and_deregisters
-```
+**Gates:** execute the complete **T9** block from §10.3 (rows W-43..W-51), the
+**T8** block (row W-42), the **T10** block (row W-52), and T4's fifth name (W-21).
 
 **Exact CI edits:**
-- the step `SDK org exact sensing seam witnesses` (T9) per §10.3, with
-  `-p net-mesh-sdk`, an explicit `--test org_exact_sensing_seam`, and
-  `--features "net cortex dataforts testing compute nat-traversal port-mapping aggregator tool macros fixtures"`
-  — an explicit `--test` is what converts whole-crate auto-discovery into a
+- add the **T9**, **T8** and **T10** blocks from §10.3, verbatim. T9's explicit
+  `--test` is what converts the SDK job's whole-crate auto-discovery into a
   per-binary anti-vacuity gate (10.1 fact 6);
-- the step `Sensing org three-node witnesses` (T8) per §10.3 with
-  `--features "cortex tool fixtures"`, `MIN=2`, and both names in its `REQUIRED`
-  list;
-- the step ``Guard — the OA-5 seam does not compile without `fixtures` `` (T10),
-  exactly as written in D10.3 part (b);
+- append T4's fifth `REQUIRED` name (W-21) — the block in §10.3 already lists it;
 - an **SDK file-name guard** mirroring `integration-guard`'s shape for
   `sdk/tests/*.rs`, because `sdk/tests/` is outside its jurisdiction (10.1 fact
   5) — `ci.yml:554` runs `ls tests/*.rs` under `working-directory:
@@ -2785,18 +2891,11 @@ re-gating of a fixtures-only item**, **delete** OA-5 dark-boundary
 parts 1-3 and the `guards/fixtures_off_probe/` directory and its CI step, new
 `sdk/tests/org_exact_sensing.rs` (T11, `#![cfg(feature = "net")]`).
 
-T11 `org_exact_sensing` — **MIN=2**, rows W-53, W-54:
-```text
-sensed_selection_through_production_plan_attempt_end_to_end
-an_inert_binding_uses_deterministic_unsensed_planning
-```
-
-**Exact CI edit:** the step `SDK org exact sensing production witnesses` (T11)
-per §10.3, with `-p net-mesh-sdk`, an explicit `--test org_exact_sensing`, and
-`--features "net cortex dataforts testing compute nat-traversal port-mapping aggregator tool macros"`
-— **without** `fixtures`, which is what makes it a production-path witness.
-Append `binary(org_exact_sensing)` to `.config/nextest.toml:55`. Delete the T10
-probe step and the `guards/fixtures_off_probe/` directory in the same commit.
+**Gates:** execute the complete **T11** block from §10.3 (rows W-53, W-54). Its
+feature string deliberately omits `fixtures`, which is what makes it a
+production-path witness. Append `binary(org_exact_sensing)` to
+`.config/nextest.toml:55`. **Delete** the T10 crate
+(`guards/fixtures_off_probe/`) and its block in the same commit.
 
 Requires, and does not itself discharge:
 1. an **independent** exact-head review (not the author of OA-1..OA-5);
@@ -2861,9 +2960,9 @@ mechanically in §14.**
 | W-38 | **time advancing past a cell's continuity deadline with NO new beat and NO worker publication forces Unknown, and an expired `NotReady` never prunes** | OA-4 | T7 | omit `projected_at`'s `now >= deadline` pre-check |
 | W-39 | **a provider removed or replaced BEFORE the snapshot resolves `Unknown` from current map state** — no artifact comparison exists | OA-4 | T7 | read a cached row instead of the current map |
 | W-40 | **a provider removed AFTER the snapshot is bounded advisory staleness: it can mis-rank, and it can NEVER authorize or enter `OrgProofIntent`** | OA-4 | T7 | let the sensed order bypass `org_cold_authority_is_current` |
-| W-41 | **no sensing lock is held during proximity sampling, budget classification, sorting, or the mint** | OA-4 | T7 | sample proximity inside the observation section |
+| W-41 | **no sensing lock is held during proximity sampling, budget classification, the bucket permutation, or the mint** | OA-4 | T7 | sample proximity inside the observation section |
 | W-42 | a ≥ 0.32.0 peer with the sensing plane off drops the org frame, leaves Unknown, and emits nothing legacy — driven through the local-origin lease path with a `NodeAuthority` installed on A | OA-5 | T8 | emit a legacy registration on no-attestation |
-| W-43 | `[SameOrg A, Granted B, SameOrg C]` with `C` viable orders `[C, A, B]` | OA-5 | T9 | reorder only a contiguous SameOrg region |
+| W-43 | **the pinned bucket permutation output**: `[A:SameOrg, B:Granted, C:SameOrg, D:Granted, E:SameOrg]` with `ranked=[E,C]` and `pruned={A}` yields exactly `[E, C, B, D, A]` (D7.2) | OA-5 | T9 | replace the permutation with a `sort_by` comparison sort; or reuse the OLB §9 P2C sampler; or emit `viable` in global rather than sensed rank order |
 | W-44 | an all-`Granted` list is returned unchanged and is never sensed or pruned | OA-5 | T9 | pass Granted providers to the sensed order |
 | W-45 | a provider on both authority planes yields one `Mode::SameOrg` candidate and sensing cannot resurrect the grant row | OA-5 | T9 | bypass `push_unique` for sensed candidates |
 | W-46 | `direct` still decides after reordering; `considered`, `ProviderNotDirect` and `NoAuthorizedProvider` are unchanged | OA-5 | T9 | filter on `direct`; recompute `considered` post-authorization |
@@ -2978,9 +3077,11 @@ reconciliation.
 1. Its §11 warmed-path claim is scoped identically. The accepted boundary is
    unchanged for every path it already covers; D6.8 records the one added read on
    the sensed path, with OA-0's stop condition if review rejects it.
-2. **New in revision 6:** §11's scope note asserted the sensed path "adds no sort
-   of the authorized list". That was **false** — D7.2 performs one stable
-   class-ordering pass — and is corrected in place. Every other clause of §11 is
+2. §11's scope note asserted the sensed path "adds no sort of the authorized
+   list". That was **false** and was corrected in revision 6.
+3. **New in revision 7:** the correction is restated in the frozen vocabulary — a
+   **linear stable bucket permutation**, no comparator, no `sort_by`, no P2C, and
+   **no comparison sort added on any path**. Every other clause of §11 is
    unchanged on both paths, including the final-validation → `MeshNode::call`
    boundary.
 
@@ -2990,12 +3091,12 @@ superseded, each in place and each pointing at the design section that governs:
 
 | OLB location | What it said | Disposition |
 |---|---|---|
-| `:201-202` (pinned hot-path claim 7) | "no … sort" unqualified | scoped to the UNSENSED track; a sensed call adds one stable class-ordering pass (D7.2) |
+| `:201-202` (pinned hot-path claim 7) | "no … sort" unqualified | scoped to the UNSENSED track; a sensed call adds a linear bucket permutation, not a sort (D7.2) |
 | `:213` (pinned claim 9) | "per-request sorting of Ready candidates is prohibited" | scoped to the UNSENSED warmed-pool track; a stable permutation of an already-sorted authorized list is not a per-request re-sort |
 | `:2001` (OLB-2 bullet) | `ArcSwap`-published `OrgRouteSet` projection | scoped: it is the ROUTE/authority artifact, **not** the readiness source; exact sensing publishes no sensing facts |
 | `:2021` (OLB-2 bullet) | join observations via `sensed_candidates` "inside the node routing actor, never on the request path" | **superseded** for exact sensing, with the five replacement properties stated inline (per-call snapshot ≤ 32 rows; lock released before route/budget/ordering/mint/IO; stable class ordering; `Granted` never sensed; unsensed/cold unchanged) |
 | `:2127` (§9 P2C exit witness) | "no sort (instrumented witness)" | scoped to the unsensed P2C track; the exact-sensing path does not use P2C and carries its own witnesses (W-36..W-41, W-43..W-47) |
-| `:2245` + two exit-gate rows | sensed row claimed "no sort of the authorized list"; `OrgClient` internals list omitted the snapshot/ordering | corrected; two new exact-sensing exit-gate rows added (one bounded section + lock-release order; the stable class-ordering pass) |
+| `:2245` + two exit-gate rows | sensed row claimed "no sort of the authorized list"; `OrgClient` internals list omitted the snapshot/ordering | corrected; two new exact-sensing exit-gate rows added (one bounded section + lock-release order; the bucket permutation) |
 
 A warmed observation pool may be revisited later as a **separate** optimization;
 it cannot contradict this boundary.
@@ -3047,28 +3148,40 @@ document before commit.
 | more than one bridge module path or declaration site | **eliminated**; one file, one declaration, and W-21 forbids the identifier in `A/mesh.rs` |
 | OA-6 "removing the module gate" / re-gating a fixtures item into the production inventory | **eliminated**; D10.3 part (d) freezes the rule and gives the `S/evaluator.rs:1878`-vs-`:1882` reason |
 | an `ArcSwap`-published sensing artifact, or a routing-actor observation join, asserted of this slice | **eliminated**; OLB `:2001` scoped and `:2021` superseded |
-| a "no sort" / "no per-call sort" / P2C claim asserted of the sensed path | **eliminated in all three places** — D6.8's table, OLB `:2245`, warmed design §11 — because D7.2 performs one stable class-ordering pass |
+| a "no sort" / "no per-call sort" / P2C claim asserted of the sensed path | **eliminated**; and in revision 7 restated as the frozen linear bucket permutation, so the sensed path adds no comparison sort either |
 | a MIN recorded at a non-final value | **eliminated**; T4 shows 3 → **4** and T8 shows **2** below |
+
+**Revision-7 classes swept (N1–N6):**
+
+| Class | Result |
+|---|---|
+| more than one command definition for any target | **eliminated**; exactly one `#### Tn` block each, T1–T11, and §10.4 states the rule |
+| a `cargo test` target anywhere in this design | **eliminated**. The six remaining `cargo test` strings are, exhaustively: two descriptions of *existing* CI steps (§10.1 facts 3 and 8), T10's `cargo test --test compile_fail` runner in its block, the one-time `TRYBUILD=overwrite cargo test --test compile_fail` landing procedure that generates the eight `.stderr` files, and two §0/§14 correction records. **No target in T1–T11 runs `cargo test`.** |
+| an elided command comment ("the same … as ci.yml:171-265") | **eliminated** with OA-1's block |
+| a target whose command lives in an OA slice | **eliminated**; every OA slice says "execute the complete Tn block from §10.3" |
+| a `MANIFEST` literal with anything but the eight names | **eliminated**; the header line is now prose outside the fence |
+| a diagnostic alternation, or an unimplemented per-item alternative | **eliminated**; eight committed byte-exact `.stderr` files, no alternation |
+| "OA-6 deletes/removes the fixtures gate" | **eliminated**; the last instance was the D5.4 containment bullet |
+| a bridge identifier in `A/mesh.rs` | **eliminated**; W-16 moved T2 → T4 |
+| a literal or angle-bracket future SHA | **eliminated**; schema + guard only |
+| P2C / `ArcSwap` readiness / routing-actor join / no-per-call-sort / zero-observation-scan asserted of the SENSED path in OLB | **eliminated**; OLB §2A governs, two blocks bannered `SUPERSEDED — NOT AN IMPLEMENTATION CONTRACT`, seven sites corrected |
+| `stable-sort`, `class_rank`, or "not a re-sort" | **eliminated**; the frozen term is *linear stable bucket permutation* |
 
 **Mechanical correspondence, regenerated from this document (not asserted):**
 
 | Check | Result |
 |---|---|
 | §11 matrix rows contiguous W-1..W-54, no gaps, no duplicates | **54 rows**, first 1, last 54, 0 dupes, 0 missing |
-| every §11 row's target ∈ {T1..T11}; per-target counts equal §10.2 | T1 7 · T2 6 · T3 4 · T4 4 · T5 8 · T6 6 · T7 6 · T8 1 · T9 9 · T10 1 · T11 2 = **54** |
-| **every executable target has a standalone block** | T1, T2, T3, T4, T5, T6, T7, T8, T9, T11 — **10 blocks**; T10 is labelled non-nextest with its own command and success condition |
-| **every block contains both fail flags** | `--no-tests=fail` and `--retries 0` present in every `cargo nextest run` line of all 10 blocks |
-| **MIN equals the FINAL required-name count** | T1 7 added (floor 49) · T2 6 added (floor 34) · T3 **4** · T4 **4** (final, incl. OA-5's fourth) · T5 **8** · T6 **6** · T7 **6** · T8 **2** (final, incl. the pre-existing test) · T9 **9** · T11 **2** |
-| every `REQUIRED` name appears exactly once per target, and each target's set is disjoint from every other's | verified — **54** names total across the 10 nextest blocks, no name in two blocks, none over 79 chars |
-| every matrix executable row maps to exactly one target `REQUIRED` list | verified via the §10.2 Rows column and the block contents |
-| **the two places where name count and row count differ, and why** | **T8** has 2 `REQUIRED` names but 1 matrix row: the second name is the **pre-existing** test `relay_reauthors_org_provider_under_its_own_membership` (`tests/sensing_org_three_node.rs:159`), which predates this design and owns no W-row — it is in `REQUIRED` so MIN=2 cannot be satisfied by the new test alone. **T10** has 1 matrix row (W-52) and 0 names, because it is a build guard, not a test binary. Every other target's name count equals its row count. |
-| every function name is `snake_case` and ≤ 79 chars (the repo's de-facto maximum) | longest 76 chars, none over |
-| one bridge module path only | `src/adapter/net/org_exact_sensing_bridge.rs`, declared from `src/adapter/net/mod.rs` |
+| one `#### Tn` command-definition block per target | **11/11** — T1..T11, exactly one each |
+| every nextest block carries both fail flags | `--no-tests=fail` **and** `--retries 0` on **20/20** `cargo nextest run` lines across the 10 nextest blocks |
+| T10 is labelled non-nextest and carries its own complete command | yes — three legs (trybuild negative, positive build, `MANIFEST` ↔ `tests/ui/` diff), with `REPO_ROOT` derived via `git rev-parse --show-toplevel` so it is working-directory independent |
+| MIN equals the FINAL required-name count | T1 **7** (floor 49) · T2 **5** (floor 33) · T3 **4** · T4 **5** · T5 **8** · T6 **6** · T7 **6** · T8 **2** · T9 **9** · T11 **2** |
+| per-target §11 row counts equal §10.2 | T1 7 · T2 5 · T3 4 · T4 5 · T5 8 · T6 6 · T7 6 · T8 1 · T9 9 · T10 1 · T11 2 = **54** |
+| names unique across all blocks, ≤ 79 chars | 54 names, 0 cross-block duplicates, longest 76 |
+| the two places where name count and row count differ | **T8**: 2 names / 1 row — the second name is the pre-existing `relay_reauthors_org_provider_under_its_own_membership` (`tests/sensing_org_three_node.rs:159`), included so MIN=2 cannot be met by the new test alone. **T10**: 1 row / 0 names — a build guard, not a test binary. |
+| one bridge module path | `src/adapter/net/org_exact_sensing_bridge.rs`, declared `pub` from `src/adapter/net/mod.rs`; zero bridge identifiers in `A/mesh.rs` |
+| the `MANIFEST` literal | exactly **8** lines |
 | every `D<n>.<m>` and `§<n>` cross-reference resolves | verified |
-
-Note: §10.4's roster tables also begin rows with `| W-n |`, so a naive scan sees
-ten row ids twice. The contiguity/count check above is scoped to the §11 matrix
-shape (`| W-n | … | Tn |`) and is exact.
 
 **Findings beyond the three reviews.** Four, each verified from source:
 1. **The packet's "exactly 12" is 13 occurrences / 12 assertions** (§1.9a).
