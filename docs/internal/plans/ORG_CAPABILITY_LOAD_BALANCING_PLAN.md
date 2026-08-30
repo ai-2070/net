@@ -1617,12 +1617,31 @@ client's audience. It was rehomed to `MeshNode` as `OrgAudienceLeases`
 (`mesh.rs:8437` / `:8486`) and an SDK RAII `AudienceLeaseGuard`
 (`sdk/src/org/lease.rs:27`).
 
-The sensing-interest lease copies that ownership template:
+The sensing-interest lease copies that ownership template — the refcount is
+node-global, and holders hold RAII guards only:
 
 ```text
 sensing-interest refcount → MeshNode
-SensingWatch / OrgRoutingState → RAII guards only
+exact organization-sensing RAII demand, lease tickets,
+guards and clone-family lifecycle
+                            → OrgSensingFamily / OrgSensingFamilyInner
+                               (Drop on the inner only; last wrapper
+                                clone retires the demand)
 ```
+
+**`OrgRoutingState` does not retain exact-sensing guards.** It holds only
+RAII route-slot handles and selector nonce state; the exact organization-sensing
+demand, tickets, guards, refresh records, clone-family lifecycle and last-drop
+retirement are owned by `OrgSensingFamily` / `OrgSensingFamilyInner`. Governing:
+[`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md)
+D5.1/D5.2; see also the §5 precedence row, the scoped OLB-2B bullet in §13, and
+the §14 exit-gate row.
+
+The generic `SensingWatch` consumer surface holds RAII guards under this same
+node-global refcount template, but it is **not** part of the exact
+organization-sensing lane and carries no ownership in it: that surface is left
+dark and unauthorized by the exact design (its §15 non-goals), so nothing above
+is asserted of it and nothing about it governs this lane.
 
 Two owners acquiring the same interest must produce:
 
