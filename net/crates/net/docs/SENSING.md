@@ -301,7 +301,7 @@ never load-bearing for any decision.
 | Counter | Fires when |
 |---------|-----------|
 | `invalid_constraints` | any constraint parse/validate rejection |
-| `protocol_invalid` | the security-relevant subset: digest mismatch, a wire scope claim the session does not back, or an organization provider registration whose interest selector does not name the frame's own `target` |
+| `protocol_invalid` | the security-relevant subset. Complete list of production increments: an unknown sensing subprotocol / stream id; a frame from a peer already inside its auth-failure throttle; a strict interest-frame or attestation decode failure; a constraint-digest or interest-digest mismatch; a wire scope claim the session does not back; a LEGACY registration declaring an organization-derived audience while this node holds organization authority; malformed organization-registration interval / soft-state-TTL bounds; an organization frame that is not an org registration variant, whose leader-leg routed origin does not match `from_node`, or whose interest selector does not name the frame's own `target`; a rendezvous / leader wire-intake authority mismatch; an attestation signature-verification failure; an out-of-bounds promised cadence on an interval-unsupported refusal; and attestation equivocation |
 | `cadence_refusals` | a requested interval below the cadence floor was refused |
 | `scope_refusals` | a §4.10 scope-validation refusal (any kind) |
 | `broad_selector_refusals` | an `Each`-mode selector matched more providers than `each_mode_max_providers` (the §4.7 amplification guard) |

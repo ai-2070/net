@@ -25348,14 +25348,29 @@ impl MeshNode {
     }
 
     /// OLB org-auth (piece 4, exact-provider): the organization sensing
-    /// registration authority gate. Captures a coherent authority snapshot under
-    /// `org_install`, runs `verify_org_sensing_registration` against the PINNED
-    /// view at a single `now_secs`, and returns the narrow admitted wrapper
-    /// TOGETHER WITH the pinned snapshot — the caller performs the final
-    /// stamp-currency recheck immediately before its table mutation, so no
-    /// preparatory work intervenes between the recheck and the mutation. Any gate
-    /// failure (no authority/store, poison, cert/scope rejection) returns `None`;
-    /// nothing is emitted and the observation stays `Unknown`/`Potential`.
+    /// registration authority gate, in the order it actually runs.
+    ///
+    /// 1. cheap STRUCTURAL bounds on `requested_sample_interval` /
+    ///    `soft_state_ttl` — resource limits, not authority evidence;
+    /// 2. the AUTHORITY-FREE shape phase, `validate_org_frame_shape`: frame-kind
+    ///    discrimination, semantic spec reconstruction + interest-digest
+    ///    cross-check, and the exact `spec.providers ==
+    ///    ProviderSelector::Node(target)` relation on the provider leg. No
+    ///    authority, no store, no lock — so a frame whose own bytes are
+    ///    internally inconsistent is refused as protocol-invalid input WITHOUT
+    ///    this node taking an `org_install` snapshot, and its malformation is
+    ///    never reported as a local `org_authority_unavailable` problem;
+    /// 3. only then a coherent authority snapshot under `org_install`;
+    /// 4. `verify_org_admission` against that PINNED view at a single
+    ///    `now_secs`, consuming the shape from step 2 so nothing is
+    ///    reconstructed twice.
+    ///
+    /// Returns the narrow admitted wrapper TOGETHER WITH the pinned snapshot —
+    /// the caller performs the final stamp-currency recheck immediately before
+    /// its table mutation, so no preparatory work intervenes between the recheck
+    /// and the mutation. Any failure (malformed bounds, malformed shape, no
+    /// authority/store, poison, cert/scope rejection) returns `None`; nothing is
+    /// emitted and the observation stays `Unknown`/`Potential`.
     fn admit_org_registration(
         ctx: &DispatchCtx,
         frame: &sensing::SensingInterestFrame,
