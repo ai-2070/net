@@ -113,16 +113,19 @@ use, and it is the only part of this lifecycle covered by the usual
 compatibility expectations.
 
 Everything below it is **internal plumbing**. The registry itself
-(`behavior/sensing/evaluator.rs`) is crate-private. The `MeshNode`
-methods and the two value types the SDK needs are technically `pub`
-only because `net-mesh-sdk` is a separate crate, so each of them is
-`#[doc(hidden)]` and carries the sentence *"Unstable,
-workspace-internal SDK bridge; not supported core API."* A `--lib`
-guard test requires both markers on every one of them.
+(`behavior/sensing/evaluator.rs`) is crate-private; what remains `pub`
+is only what a separate crate — the SDK, or the workspace's own test
+suites — cannot otherwise reach. Every one of those items is
+`#[doc(hidden)]` and says in words that it is not supported API.
 
-With that framing, the internal bridges are:
+There are two such inventories, and a `--lib` guard test walks both,
+requiring the marker attribute and the exact wording on each entry.
 
-| Bridge (`#[doc(hidden)]`, unstable) | Meaning |
+**Production bridges** — `pub` in every build, so any dependent can
+reach them. Each carries `#[doc(hidden)]` and the sentence *"Unstable,
+workspace-internal SDK bridge; not supported core API."*
+
+| Production bridge | Meaning |
 |---|---|
 | `MeshNode::register_readiness_evaluator` | vacancy-required install; issues an `EvaluatorRegistrationId`, or refuses with `EvaluatorInstallRefusal::Occupied` |
 | `MeshNode::replace_readiness_evaluator` | explicit supersession; issues a fresh id, so the superseded id is non-current the instant it returns |
@@ -130,6 +133,26 @@ With that framing, the internal bridges are:
 | `MeshNode::notify_sensing_state_changed_owned` | the ownership-aware state edge: pokes only while the supplied id is still installed |
 | `MeshNode::sensing_enabled` / `sensing_identity_is_durable` | the two prerequisite bits `Mesh::sensing` refuses by name |
 | `EvaluatorRegistrationId` / `EvaluatorInstallRefusal` | the opaque id the SDK handle holds, and the refusal it maps |
+
+**Fixtures-only bridges** — gated on `cfg(test)` or the `fixtures`
+feature, but still `pub` whenever a *dependency* enables that feature,
+which means they appear in all-features builds and in rustdoc. So they
+are hidden too, and carry a distinct sentence: *"Unstable fixtures-only
+test bridge; not supported core API."* The guard additionally requires
+the cfg gate to still be present, so one cannot quietly become
+unconditionally public.
+
+| Fixtures-only bridge | Purpose |
+|---|---|
+| `MeshNode::sensing_evaluator_count` | how many capabilities have an evaluator installed — lets a witness assert a refusal was total |
+| `MeshNode::sensing_evaluator_identities_exhausted` | whether the registration-identity space has reached its terminal state |
+| `MeshNode::set_sensing_evaluator_next_id_for_test` | force the allocator's resting value, to reach the boundary without 2^64 registrations; deliberately bypasses monotonicity |
+| `MeshNode::sensing_max_registration_id_for_test` | the largest issuable id, so a witness names the boundary without duplicating the constant |
+| `MeshNode::set_sensing_commit_pause_hook_for_test` | park the emitter at the END of the publication section, to prove the section is retained across signing and publication |
+| `MeshNode::set_sensing_ownership_contention_hook_for_test` | acknowledge that an ownership transition found the commit mutex HELD, so contention is proved rather than inferred from a timeout |
+
+Neither inventory is supported API. The only supported provider surface
+remains `net_sdk::sensing`.
 
 One method in this area is **not** a bridge:
 `MeshNode::notify_sensing_state_changed` is the pre-existing

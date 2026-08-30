@@ -1842,14 +1842,30 @@ mod tests {
     }
 
     /// Every core item that is public ONLY because `net-mesh-sdk` is a
-    /// separate crate must be `#[doc(hidden)]` AND carry the unstable
-    /// workspace-internal wording. Reachability is unavoidable; being
-    /// mistaken for supported API is not.
+    /// separate crate, or ONLY so the workspace's own suites can reach
+    /// it, must be `#[doc(hidden)]` AND carry the wording that says so.
+    /// Reachability is unavoidable; being mistaken for supported API is
+    /// not.
+    ///
+    /// Two inventories, with DISTINCT required sentences:
+    ///
+    /// - **production bridges** — public in every build, reachable by
+    ///   any dependent, carrying the workspace-internal SDK wording;
+    /// - **fixtures-only bridges** — gated on `cfg(test)` or the
+    ///   `fixtures` feature, but still `pub` whenever a dependency
+    ///   enables that feature, so they show up in all-features builds
+    ///   and rustdoc. They carry the fixtures-only wording, and the
+    ///   guard also requires the cfg gate to still be there.
+    ///
+    /// Because the two sentences differ, annotating the production list
+    /// cannot satisfy the fixtures list; and the fixtures inventory
+    /// carries a reviewed count, so dropping a method from it fails
+    /// rather than silently narrowing the guard.
     ///
     /// Non-vacuous by construction: it reads the real source of both
-    /// modules, locates each bridge's declaration, walks back over its
-    /// contiguous doc/attribute block, and requires BOTH markers. Losing
-    /// either one fails it.
+    /// modules, locates each declaration, walks back over its contiguous
+    /// doc/attribute block, and requires every marker. Losing any one
+    /// fails it.
     ///
     /// `MeshNode::sensing_origin_active` is deliberately absent: it
     /// predates this slice and is read by the crate's own integration
@@ -1857,9 +1873,15 @@ mod tests {
     /// for the SDK.
     #[test]
     fn the_sdk_bridges_are_hidden_and_marked_unstable() {
-        /// The exact sentence every bridge must carry, so the guard
-        /// cannot be satisfied by vague prose.
+        /// The exact sentence every production bridge must carry, so the
+        /// guard cannot be satisfied by vague prose.
         const UNSTABLE: &str = "Unstable, workspace-internal SDK bridge; not supported core API.";
+        /// The exact sentence every fixtures-only bridge must carry.
+        /// Deliberately different from `UNSTABLE`, so the two inventories
+        /// cannot satisfy each other.
+        const FIXTURES_ONLY: &str = "Unstable fixtures-only test bridge; not supported core API.";
+        /// The cfg gate a fixtures-only bridge must keep.
+        const FIXTURES_CFG: &str = "#[cfg(any(test, feature = \"fixtures\"))]";
 
         let mesh = include_str!("../../mesh.rs");
         let evaluator = include_str!("evaluator.rs");
@@ -1873,6 +1895,22 @@ mod tests {
             (evaluator, "pub struct EvaluatorRegistrationId("),
             (evaluator, "pub enum EvaluatorInstallRefusal {"),
         ];
+        // The reviewed fixtures-only inventory. The count is part of the
+        // contract: removing an entry to make this guard pass fails it.
+        let fixture_bridges: &[&str] = &[
+            "pub fn sensing_evaluator_count(",
+            "pub fn sensing_evaluator_identities_exhausted(",
+            "pub fn set_sensing_evaluator_next_id_for_test(",
+            "pub fn sensing_max_registration_id_for_test(",
+            "pub fn set_sensing_commit_pause_hook_for_test(",
+            "pub fn set_sensing_ownership_contention_hook_for_test(",
+        ];
+        assert_eq!(
+            fixture_bridges.len(),
+            6,
+            "the fixtures-only inventory must list all six bridges; dropping one \
+             would hide it from this guard instead of annotating it",
+        );
 
         /// The contiguous doc/attribute block immediately above a
         /// declaration. The split leaves the declaration's own
@@ -1909,6 +1947,30 @@ mod tests {
                 block.contains(UNSTABLE),
                 "bridge `{declaration}` is missing the exact wording {UNSTABLE:?} — \
                  a reader must be told it is not supported core API",
+            );
+        }
+
+        for declaration in fixture_bridges {
+            let block = attribute_block(mesh, declaration).unwrap_or_else(|| {
+                panic!(
+                    "fixtures-only bridge `{declaration}` not found — if it was \
+                     renamed, rename it here in the same commit",
+                )
+            });
+            assert!(
+                block.contains("#[doc(hidden)]"),
+                "fixtures-only bridge `{declaration}` is missing #[doc(hidden)] — a \
+                 dependency enabling `fixtures` would surface it as core API",
+            );
+            assert!(
+                block.contains(FIXTURES_ONLY),
+                "fixtures-only bridge `{declaration}` is missing the exact wording \
+                 {FIXTURES_ONLY:?}",
+            );
+            assert!(
+                block.contains(FIXTURES_CFG),
+                "fixtures-only bridge `{declaration}` lost its {FIXTURES_CFG} gate — \
+                 it would become unconditionally public",
             );
         }
 
