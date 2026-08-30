@@ -233,7 +233,12 @@ opaque authority-epoch comparison:
 11. `OrgClient`'s internals are pinned to four operations — maintain
     candidates, maintain leases, project route sets (the route/authority
     artifact — **never a sensed readiness artifact**, see §2A), select — never a
-    mini scheduler (§2, §7);
+    mini scheduler (§2, §7). *(Scoped 2026-08-30: "maintain leases" here is the
+    ROUTE-slot plane. For the exact organization-sensing lane the sensing
+    lease/demand plane is a separate graph — `OrgSensingFamily` /
+    `OrgSensingFamilyInner` — and is not an `OrgRoutingState` operation; see
+    [`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md) D5.1/D5.2, §2A, the
+    precedence row in §5, and the scoped OLB-2B bullet in §13.)*;
 12. the release sequence is decoupled from the broader sensing roadmap
     (§13 scope note).
 
@@ -261,8 +266,16 @@ findings and four bounded corrections, all applied in this revision:
    at registration intake only (sensing plan S0; §5.1b). The
    attestation transcript, continuity, and epoch semantics are
    unchanged.
-3. **The lazy watch has a durable owner** — a bounded, clone-shared
-   `OrgRoutingState` retains the interest guards across calls (§7).
+3. **The lazy watch has a durable owner for its ROUTE guards** — a bounded,
+   clone-shared `OrgRoutingState` retains the **route-slot** guards across calls
+   (§7). **SUPERSEDED — NOT AN IMPLEMENTATION CONTRACT for organization exact
+   sensing (2026-08-30).** In that lane `OrgRoutingState` does **not** retain or
+   maintain exact-sensing lease handles across calls; exact-sensing demand,
+   tickets/guards, refresh records, clone-family lifecycle and last-drop
+   retirement belong to `OrgSensingFamily` / `OrgSensingFamilyInner`, with `Drop`
+   on the inner only. Governing: [`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md)
+   D5.1/D5.2; see also the §5 precedence row, the scoped OLB-2B bullet in §13 and
+   the §14 exit-gate row.
 4. **The node-global lease aggregates cadence** with token-indexed
    intervals, not a bare refcount, and its key supports both
    provider-free and exact-provider shapes (§7; sensing plan §4.3).
@@ -959,10 +972,22 @@ later calls for C
 → reuse warmed observations
 ```
 
-### The durable owner: `OrgRoutingState`
+### The durable owner of ROUTE guards: `OrgRoutingState`
 
-A guard that lives only inside one call would drop at call end,
-deregister, and leave every call cold. The guards need a clone-shared
+> **SUPERSEDED — NOT AN IMPLEMENTATION CONTRACT for organization exact sensing
+> (2026-08-30).** Everything in this section describes the pre-OA **route/authority**
+> plane. It is retained for that plane and for the historical record. It is **not**
+> the ownership contract for exact-sensing leases: `OrgRoutingState` does not retain
+> or maintain exact-sensing lease handles across calls, and no MUST/owner statement
+> below applies to them. The governing ownership contract is
+> [`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md) D5.1/D5.2 —
+> `OrgSensingFamily` / `OrgSensingFamilyInner` owns exact-sensing demand,
+> tickets/guards, refresh records, clone-family lifecycle and last-drop retirement,
+> with `Drop` on the inner only. See also the §5 precedence row, the scoped OLB-2B
+> bullet in §13, and the §14 exit-gate row.
+
+A route guard that lives only inside one call would drop at call end,
+deregister, and leave every call cold. Those route guards need a clone-shared
 owner with client lifetime:
 
 ```rust
@@ -1008,22 +1033,33 @@ Semantics:
 ```text
 all OrgClient clones            → share one family handle set
 independent client families     → share node base facts + scheduler
-first call to service C         → acquire node route-slot + exact lease handles
+first call to service C         → acquire node route-slot handles
 later call to C                 → read the slot's immutable route set
-authorized provider set changes → node actor acquires/releases lease delta
 input change                    → node actor rebuilds/publishes; calls only read
-last family clone drops/closes  → release that family's slot/lease references
+last family clone drops/closes  → release that family's slot references
 last node-slot consumer drops   → retire shared slot; node actor remains bounded
 ```
 
+**The lease rows are deliberately absent above.** The pre-OA sketch had this block
+acquire "exact lease handles" on first call, take a lease delta on provider-set
+change, and release "slot/lease references" on last clone drop. For organization
+exact sensing that is **superseded and is not an implementation contract**:
+`OrgRoutingState` neither retains nor maintains exact-sensing lease handles across
+calls. Those transitions live on the sensing plane instead —
+`OrgSensingFamily` / `OrgSensingFamilyInner` owns the demand, the tickets/guards,
+the refresh records, the clone-family lifecycle and last-drop retirement, with
+`Drop` on the inner only, so the LAST wrapper clone retires the demand. Governing:
+[`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md) D5.1/D5.2; see also the
+§5 precedence row, the scoped OLB-2B bullet in §13, and the §14 exit-gate row.
+
 The actual registration refcount and routing scheduler remain node-global.
-`OrgRoutingState` owns only RAII/route-slot handles and selector nonce state. The
+`OrgRoutingState` owns only RAII/route-slot handles and selector nonce state. Its
 internal machinery is exactly four operations and stays that way (2B.3b
 implements the first; the other three are 2B.3c/2B.3d):
 
 ```text
 maintain candidate set
-maintain exact sensing leases
+maintain route-slot lease handles      (ROUTE plane; NOT exact-sensing leases)
 project immutable route set
 select one provider
 ```
@@ -1986,9 +2022,12 @@ No new common verb:
 org.call("customer.read", &request).await?;
 ```
 
-The sensed-routing machinery (`OrgRoutingState`, the exact-provider
-leases, the selector) is internal to `OrgClient`. Provider readiness
-remains part of the generic sensing SDK, not `serve_org`.
+The sensed-routing machinery is internal to `OrgClient`: the route plane
+(`OrgRoutingState`, route-slot handles, the selector) and — as a **separate**
+graph, not an `OrgRoutingState` responsibility — the exact-provider sensing lease
+plane (`OrgSensingFamily` / `OrgSensingFamilyInner`, which owns the demand,
+tickets, refresh records and last-drop retirement; design D5.1/D5.2). Provider
+readiness remains part of the generic sensing SDK, not `serve_org`.
 
 ### Node, Python, Go, C
 
@@ -2024,7 +2063,8 @@ not wait for it. The minimal org-specific sequence is:
 1. authenticated same-org sensing registration   (sensing S0 subset)
 2. node-global exact-interest leases             (sensing S0 subset)
 3. provider evaluator lifecycle                  (sensing S0/S1 subset)
-4. clone-shared bounded OrgRoutingState handles  (OLB-2)
+4. clone-shared bounded OrgRoutingState ROUTE-slot
+   handles (never exact-sensing lease handles)     (OLB-2)
 5. node-shared bounded base facts/scheduler       (OLB-2)
 6. immutable route sets + authority epoch         (OLB-2)
 7. O(1) P2C selection (UNSENSED only; a sensed
