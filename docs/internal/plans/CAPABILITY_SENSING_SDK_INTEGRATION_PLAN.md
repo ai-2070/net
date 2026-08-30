@@ -94,7 +94,7 @@ The user hypothesis is confirmed for production decision paths:
 | Proximity/routing/failure detector | **Input producer and invalidation source**, not a final consumer. Supplies path estimate/reachability and wakes recomputation. |
 | nRPC `call_service` | **Not integrated.** Uses capability discovery, health filtering, authorization filtering, and `RoutingPolicy`, but not sensing. |
 | Ordinary compute `Scheduler` | **Not integrated.** Places daemons, migration targets, and group members from static capability state and placement filters. |
-| SDK | **Not integrated.** No sensing module or lifecycle; even sensed gang methods are not wrapped. |
+| SDK | **Provider lifecycle integrated (accepted S1); consumer side not integrated.** `net/crates/net/sdk/src/sensing.rs` ships `SensingClient` (`:220`), `Mesh::sensing` (`:267`), `provide` / `provide_replacing` (`:305` / `:338`), and the RAII `ReadinessRegistration` (`:399`, `Drop` `:486-489`). There is still no query, watch, snapshot, or projection surface, and sensed gang methods are still not wrapped. *(Corrected 2026-08-30: the original row's blanket "No sensing module or lifecycle" is false after S1.)* |
 | Organization SDK | **Not integrated.** Its thin facade performs verified private discovery and deterministic exact-provider selection. |
 | Tools/A2A/Hermes/OpenClaw integrations | **No direct integration.** Their capability calls flow through nRPC/tool paths. |
 | Dataforts/CAS/MeshDB | **No integration required.** Their target decisions are possession, coverage, and data-locality questions, not provider-readiness interests. |
@@ -115,7 +115,12 @@ Normal callers currently must understand too much:
 - evaluator installation and state-edge notification;
 - explicit and drop-time deregistration.
 
-There is no SDK-level ownership or cleanup contract for either consumer watches or provider evaluators.
+There is no SDK-level ownership or cleanup contract for **consumer watches**. For
+**provider evaluators** there now is one, delivered by accepted S1:
+`ReadinessRegistration` (`sdk/src/sensing.rs:399`) owns its registration id and
+releases it on `close()` / `Drop` (`:473-489`), removal is conditional on that
+exact id, and the ownership-aware state edge routes through
+`notify_sensing_state_changed_owned`. *(Corrected 2026-08-30.)*
 
 ### 1.4 Authority prerequisite
 
@@ -179,7 +184,7 @@ Locked rules:
 
 1. Sensing is advisory and request-relative.
 2. `Unknown` is retained as potential capacity; absence of evidence never prunes.
-3. Pruning follows viability derived from fresh exact evidence, never absence: `Unknown` never prunes; a candidate may be pruned/deprioritized only as `NonViable` — from a fresh exact provider `NotReady`, or from a fresh exact `Ready` whose signed start estimate plus the current consumer-local route estimate exceeds a hard budget. Stale evidence degrades to `Potential`/`Unknown`, never `NonViable`.
+3. Pruning follows viability derived from fresh exact evidence, never absence: `Unknown` never prunes; a candidate may be pruned/deprioritized only as `NonViable`, and the ONLY input that yields `NonViable` is a **fresh exact provider `NotReady`**. Stale evidence degrades to `Potential`/`Unknown`, never `NonViable`. **A fresh exact `Ready` whose signed start estimate plus the current consumer-local route estimate exceeds the consumer budget is `Potential`, not `NonViable`, and is never pruned** — `classify_branch` maps it through its `_ =>` arm (`src/adapter/net/behavior/sensing/controller.rs:311-325`, variant doc `:301-303`), and `scheduler_bridge/readiness.rs` retains it (`:46-50`) with a test pinning it (`:126`, asserted `:134`). *(Corrected 2026-08-30: the original clause specified the inverse of the frozen primitive. See [`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md) §0 item 7 and D6.5.)*
 4. A result for one interest never mutates capability-fold membership or affects another interest.
 5. The candidate population comes from verified discovery/authority. Sensing never expands visibility.
 6. Selection names one exact provider.
