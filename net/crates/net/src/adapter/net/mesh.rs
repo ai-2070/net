@@ -25402,6 +25402,40 @@ impl MeshNode {
             );
             return None;
         }
+        // AUTHORITY-FREE SHAPE PHASE, before any `org_install` work.
+        //
+        // Steps 1, 2 and 2a of the gate — frame-kind discrimination, semantic
+        // spec reconstruction + interest-digest cross-check, and the exact
+        // `spec.providers == ProviderSelector::Node(target)` relation — are pure
+        // functions of bytes the frame already carries. Running them here, ahead
+        // of `capture_sensing_authority_snapshot`, means a frame whose own bytes
+        // are internally inconsistent is refused as protocol-invalid input
+        // WITHOUT this node taking the three `org_install` acquisitions, touching
+        // the revocation store, or reporting `org_authority_unavailable` — which
+        // would have mislabelled the sender's malformation as a local
+        // authority problem on an unadopted or poisoned node.
+        //
+        // This is not a duplicate check: `validate_org_frame_shape` is the ONE
+        // definition, its products are threaded into the authority phase below,
+        // and `OrgFrameShape` has private fields and no public constructor, so
+        // the authority phase cannot be entered without it. The ordering is
+        // therefore structural, not conventional.
+        let shape = match sensing::validate_org_frame_shape(frame, &ctx.sensing_counters) {
+            Ok(shape) => shape,
+            Err(rejection) => {
+                sensing::count_org_rejection(&rejection, &ctx.sensing_counters);
+                // A malformed frame spends the peer's rolling auth-failure
+                // budget exactly like a refused authority claim: it is cheap for
+                // us but it is still an attacker-controlled flood vector.
+                Self::record_auth_failure(from_node, ctx);
+                tracing::trace!(
+                    from_node = format!("{:#x}", from_node),
+                    ?rejection,
+                    "sensing: org registration refused on frame shape before any authority work"
+                );
+                return None;
+            }
+        };
         let snapshot = match sensing::capture_sensing_authority_snapshot(
             &ctx.org_install,
             &ctx.node_authority,
@@ -25429,8 +25463,11 @@ impl MeshNode {
                 return None;
             }
         };
-        let validated = match sensing::verify_org_sensing_registration(
-            frame,
+        // AUTHORITY PHASE (steps 3-8), against the pinned snapshot. Consumes the
+        // shape validated above, so nothing is reconstructed twice and the two
+        // phases cannot drift.
+        let validated = match sensing::verify_org_admission(
+            &shape,
             from_node,
             sender_entity,
             Some(snapshot.authority_view()),
@@ -41952,6 +41989,80 @@ mod sensing_authority_witness_tests {
             err.to_string().contains("fleet root"),
             "startup failure must name the fleet-root collision, got: {err}"
         );
+    }
+
+    /// PRODUCTION PATH ORDERING (review item 1). On a node with NO authority
+    /// installed, a malformed org provider registration — selector naming a
+    /// provider other than the frame's own `target` — is refused as
+    /// protocol-invalid input through the REAL dispatch entry point, and this
+    /// node takes NO authority snapshot and produces no row.
+    ///
+    /// Deterministic, with its own discrimination built in: the control below
+    /// runs FIRST and proves `org_authority_unavailable` is reachable on this
+    /// exact unadopted node, so the counter staying still in the malformed case
+    /// is positive evidence that the shape phase refused before any
+    /// `org_install` work — not a vacuous "counter happened to be zero".
+    #[tokio::test]
+    async fn a_malformed_selector_is_refused_before_any_authority_snapshot() {
+        // UNADOPTED: `capture_sensing_authority_snapshot` cannot succeed here.
+        let node = build_node().await;
+        let sender = EntityKeypair::generate().entity_id().clone();
+        pin_sender(&node, &sender);
+        let target = node.node_id().wrapping_add(1);
+        let ctx = node.dispatch_ctx();
+
+        // ---- CONTROL: a WELL-FORMED frame does reach the snapshot and does
+        // report the authority as unavailable.
+        let coherent = sensing::SensingInterestFrame::org_provider_registration(
+            &org_spec(target, org_commitment()),
+            target,
+            D,
+            ORG_TTL,
+            member_cert(&sender, 1),
+        );
+        let bytes = sensing::encode_interest_frame(&coherent).expect("encode");
+        MeshNode::handle_sensing_interest_frame(&bytes, FROM_NODE, &ctx);
+        assert_eq!(
+            sensing::SensingCounters::get(&node.sensing_counters.org_authority_unavailable),
+            1,
+            "control: on an unadopted node a well-formed org frame MUST report \
+             authority-unavailable — otherwise the absence check below is vacuous"
+        );
+        assert!(node.sensing_table_is_empty(), "control installs no row");
+        let protocol_baseline =
+            sensing::SensingCounters::get(&node.sensing_counters.protocol_invalid);
+        let authority_baseline =
+            sensing::SensingCounters::get(&node.sensing_counters.org_authority_unavailable);
+
+        // ---- WITNESS: the same frame, selector pointing at a different
+        // provider than the leg's target. The interest digest is still
+        // self-consistent (the constructor derives it from this very spec), so
+        // this is not a digest-mismatch refusal — it is the selector relation.
+        let mut spec = org_spec(target, org_commitment());
+        spec.providers = sensing::ProviderSelector::Node(target.wrapping_add(1));
+        let malformed = sensing::SensingInterestFrame::org_provider_registration(
+            &spec,
+            target,
+            D,
+            ORG_TTL,
+            member_cert(&sender, 1),
+        );
+        let bytes = sensing::encode_interest_frame(&malformed).expect("encode");
+        MeshNode::handle_sensing_interest_frame(&bytes, FROM_NODE, &ctx);
+
+        assert_eq!(
+            sensing::SensingCounters::get(&node.sensing_counters.protocol_invalid),
+            protocol_baseline + 1,
+            "the selector/target malformation is counted as protocol-invalid input"
+        );
+        assert_eq!(
+            sensing::SensingCounters::get(&node.sensing_counters.org_authority_unavailable),
+            authority_baseline,
+            "and NO authority snapshot was attempted: the authority-free shape \
+             phase refused before any org_install work, so the sender's \
+             malformation is never mislabelled as a local authority problem"
+        );
+        assert!(node.sensing_table_is_empty(), "no row, no effect");
     }
 }
 

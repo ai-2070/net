@@ -457,66 +457,126 @@ jobs:
           done
           echo "OLB-2B.3b: $rn registry (min $REG_MIN) + $sn state (min $STATE_MIN) passed; all named witnesses present"
 
-      # OA-1/OA-2 (organization exact-provider sensing): the org-sensing
-      # AUTHORITY GATE witnesses (`behavior::sensing::org_gate::tests`). The
-      # gate is the single admission transaction that turns an
-      # attacker-controlled 0x0C02 org registration frame into a validated
-      # object, so every refusal arm is a security property.
+      # SELECTOR ↔ TARGET ORG INTAKE (organization exact-provider sensing, the
+      # intake slice only). The org-sensing authority gate is the single
+      # admission transaction that turns an attacker-controlled 0x0C02 org
+      # registration frame into a validated object, so every refusal arm is a
+      # security property. This step gates two things:
       #
-      # Gated on the same count+name pattern as the routing witnesses above,
-      # and for the same reasons:
-      #   * `cargo test --lib` has NO retry mechanism at all, so no race or
-      #     ordering witness here can ever be retried into green. (Retries
-      #     exist only under nextest via `.config/nextest.toml`.)
-      #   * MIN catches a module that silently compiles to zero tests; the
-      #     empty-`$n` check makes that loud rather than a vacuous pass.
-      #   * MIN alone cannot say WHICH witness vanished, so the names that
-      #     carry a security property outright are pinned individually.
+      #   * `behavior::sensing::org_gate::tests` — the gate's own witnesses,
+      #     including the selector ↔ target relation and the authority-free
+      #     shape phase;
+      #   * `mesh::sensing_authority_witness_tests` — the PRODUCTION dispatch
+      #     ordering witness, which proves a malformed selector is refused
+      #     before any `org_install` snapshot and installs no row.
+      #
+      # This step does NOT gate organization lease egress; that path is not
+      # implemented yet and nothing here should be read as claiming it.
+      #
+      # WHY THIS SHAPE. An earlier revision parsed the first
+      # `test result: ok. N passed` it could find and checked required names
+      # with a substring `grep -q`. Both were spoofable: a test NAME or a panic
+      # message containing the summary text could supply the count, and
+      # `<required>_extra` satisfied a substring match for `<required>`. The
+      # replacement is structurally exact on three independent axes:
+      #
+      #   1. INVENTORY comes from `-- --list`, which EXECUTES NOTHING, so no
+      #      test output exists to inject a summary line at all. Each line is
+      #      exactly `<fully::qualified::name>: test` and is matched anchored at
+      #      both ends with a name charset (`[a-z0-9_]`) that cannot contain
+      #      `: test`. A stray diagnostic cannot match `^…$`.
+      #   2. EXISTENCE of each required witness is an anchored full-path match
+      #      against that same inventory, so `<name>_extra` is a different
+      #      string and fails.
+      #   3. EXECUTION is one `-- --exact <fully::qualified::name>` run per
+      #      witness, asserting BOTH `running 1 test` and a
+      #      `1 passed; 0 failed` summary — cardinality and verdict pinned
+      #      separately. `--exact` does not match `<name>_extra` either.
+      #
+      # `cargo test` has NO retry mechanism at all, so no ordering or race
+      # witness here can be retried into green (retries exist only under nextest
+      # via `.config/nextest.toml`). This job deliberately stays on `cargo test`
+      # — see the note at the top of the job.
       #
       # NOTE: `#[cfg(test)]`, NOT `feature = "fixtures"` — `$UNIT_FEATURES`
-      # deliberately excludes `fixtures`, so a fixtures gate would compile this
-      # module to a silent 0-test no-op here.
+      # deliberately excludes `fixtures`, so a fixtures gate would compile these
+      # modules to a silent 0-test no-op here.
       #
-      # MIN accounting: 42 pre-existing + 6 added by this slice = 48. The next
-      # organization-sensing slice RAISES this floor and APPENDS its names in
-      # the same commit that adds the witnesses — never separately, or the gate
-      # goes red on a name that does not exist yet.
-      - name: Sensing org-authority gate witnesses
+      # FLOOR accounting: org_gate 42 pre-existing + 7 added = 49;
+      # sensing_authority_witness_tests 28 pre-existing + 1 added = 29. A later
+      # slice RAISES a floor and APPENDS its names in the same commit that adds
+      # the witnesses — never separately, or the gate goes red on a name that
+      # does not exist yet.
+      - name: Selector-target org intake witnesses
         if: ${{ !cancelled() }}
         run: |
           set -o pipefail
-          MIN=48
-          out=$(cargo test --lib --features "$UNIT_FEATURES" \
-                  behavior::sensing::org_gate::tests:: 2>&1 | tee /dev/stderr)
-          n=$(printf '%s\n' "$out" \
-                | grep -oE 'test result: ok\. [0-9]+ passed' \
-                | grep -oE '[0-9]+' | head -1)
-          if [ -z "$n" ] || [ "$n" -lt "$MIN" ]; then
-            echo "::error::expected >= $MIN org_gate witnesses, ran ${n:-0}."
-            echo "The module is the #[cfg(test)] mod tests in"
+          GATE=adapter::net::behavior::sensing::org_gate::tests
+          MESH=adapter::net::mesh::sensing_authority_witness_tests
+          GATE_MIN=49
+          MESH_MIN=29
+
+          # (1) structural inventory — nothing executes, so nothing can inject.
+          list=$(cargo test --lib --features "$UNIT_FEATURES" -- --list)
+          gate_n=$(printf '%s\n' "$list" | grep -cE "^${GATE}::[a-z0-9_]+: test\$")
+          mesh_n=$(printf '%s\n' "$list" | grep -cE "^${MESH}::[a-z0-9_]+: test\$")
+          echo "inventory: $gate_n in org_gate::tests (min $GATE_MIN), $mesh_n in sensing_authority_witness_tests (min $MESH_MIN)"
+          if [ "${gate_n:-0}" -lt "$GATE_MIN" ]; then
+            echo "::error::expected >= $GATE_MIN witnesses in $GATE, listed ${gate_n:-0}."
+            echo "Module: the #[cfg(test)] mod tests in"
             echo "src/adapter/net/behavior/sensing/org_gate.rs. If witnesses were"
-            echo "intentionally removed, lower MIN in this step in the same commit"
-            echo "— do not let the gate pass vacuously."
+            echo "intentionally removed, lower GATE_MIN in this step in the same"
+            echo "commit — do not let the gate pass vacuously."
             exit 1
           fi
-          # The selector<->target intake invariant (design D2.6): a provider
-          # registration whose interest selector does not name the frame's own
-          # target must be refused BEFORE any authority work and before any
-          # effect, counted as protocol-invalid input, and the coherent shape
-          # must still round-trip from our own planner.
-          REQUIRED="local_org_admission_refuses_a_selector_that_does_not_name_the_target
+          if [ "${mesh_n:-0}" -lt "$MESH_MIN" ]; then
+            echo "::error::expected >= $MESH_MIN witnesses in $MESH, listed ${mesh_n:-0}."
+            echo "Module: mod sensing_authority_witness_tests in"
+            echo "src/adapter/net/mesh.rs. Same rule as above."
+            exit 1
+          fi
+
+          # (2)+(3) anchored existence + exact single-test execution, per name.
+          # The gate's own witnesses:
+          GATE_REQUIRED="local_org_admission_refuses_a_selector_that_does_not_name_the_target
           every_non_exact_selector_shape_is_refused_at_intake
           the_selector_target_refusal_bumps_protocol_invalid_and_creates_no_row
           the_selector_target_check_precedes_every_other_authority_refusal
           an_exact_selector_naming_the_target_is_admitted_unchanged
-          an_emitted_local_org_frame_passes_the_intake_gate_unmodified"
-          for required in $REQUIRED; do
-            if ! printf "%s" "$out" | grep -q "$required"; then
-              echo "::error::required org_gate witness missing: $required"
+          an_emitted_local_org_frame_passes_the_intake_gate_unmodified
+          the_shape_phase_refuses_a_malformed_selector_with_no_authority_input"
+          # The production dispatch-ordering witness:
+          MESH_REQUIRED="a_malformed_selector_is_refused_before_any_authority_snapshot"
+
+          check_one() {
+            fqn="$1"
+            hits=$(printf '%s\n' "$list" | grep -cE "^${fqn}: test\$")
+            if [ "$hits" != "1" ]; then
+              echo "::error::required witness not found exactly once by anchored full path: $fqn (matched $hits)"
               exit 1
             fi
-          done
-          echo "org-authority gate witnesses: $n passed (min $MIN); all named security witnesses present"
+            out=$(cargo test --lib --features "$UNIT_FEATURES" -- --exact "$fqn" 2>&1)
+            if ! printf '%s\n' "$out" | grep -qE '^running 1 test$'; then
+              echo "::error::$fqn did not run as exactly one test"
+              printf '%s\n' "$out"
+              exit 1
+            fi
+            if ! printf '%s\n' "$out" | grep -qE '^test result: ok\. 1 passed; 0 failed;'; then
+              echo "::error::$fqn did not pass as exactly one test"
+              printf '%s\n' "$out"
+              exit 1
+            fi
+            echo "  exact: $fqn"
+          }
+
+          for required in $GATE_REQUIRED; do check_one "${GATE}::${required}"; done
+          for required in $MESH_REQUIRED; do check_one "${MESH}::${required}"; done
+
+          # Whole-module runs, so a witness cannot be green in isolation while
+          # broken beside its siblings.
+          cargo test --lib --features "$UNIT_FEATURES" "${GATE}::"
+          cargo test --lib --features "$UNIT_FEATURES" "${MESH}::"
+          echo "selector-target org intake: inventory + anchored existence + exact per-witness runs all green"
 
       # Doctests live in `///` comment blocks across `src/` and `sdk/src/`.
       # `cargo test --lib` does not execute them — they need a separate

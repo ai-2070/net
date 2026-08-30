@@ -27,10 +27,26 @@
 //!
 //! Between steps 2 and 3, on the provider-addressed leg only, the interest
 //! selector must name EXACTLY the frame's own `target`
-//! (`spec.providers == ProviderSelector::Node(target)`, design D2.6). It is a
-//! pure comparison of two values the frame already carries, so it needs no
-//! authority and no lock, and it runs before every check below and therefore
-//! before any effect.
+//! (`spec.providers == ProviderSelector::Node(target)`, design D2.6).
+//!
+//! # Two phases, and why the boundary is where it is
+//!
+//! Steps 1, 2 and that selector check need no authority, no revocation store
+//! and no lock — they are pure functions of bytes the frame already carries.
+//! They live in `validate_org_frame_shape`, which yields an
+//! `OrgFrameShape`. Steps 3–8 need the installed authority and the pinned
+//! revocation snapshot, and live in `verify_org_admission`, which can only
+//! be called WITH an `OrgFrameShape`.
+//!
+//! [`verify_org_sensing_registration`] is the single-call composition of both
+//! and is unchanged for callers that already hold an authority snapshot. The
+//! dispatch layer instead calls the two halves in order, so a frame whose own
+//! bytes are internally inconsistent is refused as protocol-invalid input
+//! WITHOUT that node taking an `org_install` snapshot — which would otherwise
+//! report the sender's malformation as a local `org_authority_unavailable`
+//! problem on an unadopted or poisoned node. `OrgFrameShape` has private
+//! fields and no public constructor, so that ordering is structural rather
+//! than a convention a future edit could quietly invert.
 //!
 //! Step 9 (the authority/store stability recheck immediately before mutation)
 //! and step 10 (the mutation itself) are the dispatch layer's job — the gate
@@ -291,44 +307,57 @@ pub fn verify_org_sensing_registration(
     now_secs: u64,
     counters: &SensingCounters,
 ) -> Result<ValidatedOrgSensingRegistration, OrgSensingRejection> {
-    let result = verify_org_sensing_registration_inner(
-        frame,
-        from_node,
-        sender_entity,
-        node_authority,
-        revocation,
-        now_secs,
-        counters,
-    );
+    let result = validate_org_frame_shape(frame, counters).and_then(|shape| {
+        verify_org_admission_with_shape(
+            &shape,
+            from_node,
+            sender_entity,
+            node_authority,
+            revocation,
+            now_secs,
+        )
+    });
     if let Err(rejection) = &result {
-        // One counter per reason; `Semantic` already counted upstream.
-        let counter = match rejection {
-            OrgSensingRejection::CertInvalid(_) => Some(&counters.org_cert_invalid),
-            OrgSensingRejection::BelowFloor => Some(&counters.org_below_floor),
-            OrgSensingRejection::ForeignOrg => Some(&counters.org_foreign_org),
-            OrgSensingRejection::SenderMemberMismatch => Some(&counters.org_sender_member_mismatch),
-            OrgSensingRejection::AudienceMismatch => Some(&counters.org_audience_mismatch),
-            OrgSensingRejection::MissingAuthority => Some(&counters.org_authority_unavailable),
-            // Routed-origin / frame-shape violations are protocol-invalid
-            // input. A selector that does not name the frame's own target is
-            // the same class: the sender's own bytes are internally
-            // inconsistent, so it is a protocol violation, not merely an
-            // authorization refusal (design D2.6).
-            OrgSensingRejection::ConsumerBindingMismatch
-            | OrgSensingRejection::NotOrgRegistration
-            | OrgSensingRejection::SelectorTargetMismatch => Some(&counters.protocol_invalid),
-            OrgSensingRejection::Semantic(_) => None,
-        };
-        if let Some(counter) = counter {
-            counter.fetch_add(1, Ordering::Relaxed);
-        }
+        count_org_rejection(rejection, counters);
     }
     result
 }
 
-#[allow(clippy::too_many_arguments)]
-fn verify_org_sensing_registration_inner(
-    frame: &SensingInterestFrame,
+/// The ONE counter mapping for an org-gate refusal. Both the full verifier and
+/// the dispatch-layer shape pre-gate route through this, so a refusal can never
+/// be counted in two different classes depending on which entry point saw it.
+pub(crate) fn count_org_rejection(rejection: &OrgSensingRejection, counters: &SensingCounters) {
+    // One counter per reason; `Semantic` already counted upstream by
+    // `validated_spec`.
+    let counter = match rejection {
+        OrgSensingRejection::CertInvalid(_) => Some(&counters.org_cert_invalid),
+        OrgSensingRejection::BelowFloor => Some(&counters.org_below_floor),
+        OrgSensingRejection::ForeignOrg => Some(&counters.org_foreign_org),
+        OrgSensingRejection::SenderMemberMismatch => Some(&counters.org_sender_member_mismatch),
+        OrgSensingRejection::AudienceMismatch => Some(&counters.org_audience_mismatch),
+        OrgSensingRejection::MissingAuthority => Some(&counters.org_authority_unavailable),
+        // Routed-origin / frame-shape violations are protocol-invalid
+        // input. A selector that does not name the frame's own target is
+        // the same class: the sender's own bytes are internally
+        // inconsistent, so it is a protocol violation, not merely an
+        // authorization refusal (design D2.6).
+        OrgSensingRejection::ConsumerBindingMismatch
+        | OrgSensingRejection::NotOrgRegistration
+        | OrgSensingRejection::SelectorTargetMismatch => Some(&counters.protocol_invalid),
+        OrgSensingRejection::Semantic(_) => None,
+    };
+    if let Some(counter) = counter {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The AUTHORITY phase (steps 3–8) with counter dispatch, for a caller that has
+/// already validated the frame shape. This is the dispatch layer's entry point:
+/// it pairs with [`validate_org_frame_shape`] to give the same total validation
+/// as [`verify_org_sensing_registration`], in two explicitly ordered halves, so
+/// the authority-free refusals can be taken before any `org_install` work.
+pub(crate) fn verify_org_admission(
+    shape: &OrgFrameShape<'_>,
     from_node: u64,
     sender_entity: &EntityId,
     node_authority: Option<OrgAuthorityView>,
@@ -336,6 +365,58 @@ fn verify_org_sensing_registration_inner(
     now_secs: u64,
     counters: &SensingCounters,
 ) -> Result<ValidatedOrgSensingRegistration, OrgSensingRejection> {
+    let result = verify_org_admission_with_shape(
+        shape,
+        from_node,
+        sender_entity,
+        node_authority,
+        revocation,
+        now_secs,
+    );
+    if let Err(rejection) = &result {
+        count_org_rejection(rejection, counters);
+    }
+    result
+}
+
+/// The AUTHORITY-FREE prefix of the org gate, and an unforgeable proof that it
+/// ran: frame-kind discrimination (step 1), semantic spec reconstruction +
+/// interest-digest cross-check (step 2), and the selector ↔ target exactness
+/// check (step 2a).
+///
+/// None of those three needs an installed authority, a revocation store, or any
+/// lock — they are pure functions of bytes the frame already carries. Holding
+/// them in their own phase is what lets the dispatch layer reject a malformed
+/// frame BEFORE it pays for an `org_install` snapshot, and what makes that
+/// ordering structural rather than a convention: [`OrgFrameShape`] has private
+/// fields and no public constructor, so the authority phase literally cannot be
+/// entered without one.
+///
+/// The fields are the products the authority phase needs, so nothing is
+/// recomputed and the two phases cannot drift apart.
+pub(crate) struct OrgFrameShape<'a> {
+    spec: InterestSpec,
+    leg: Leg,
+    membership: &'a OrgMembershipCert,
+}
+
+impl OrgFrameShape<'_> {
+    /// The provider-addressed target, when this is the provider leg.
+    #[cfg(test)]
+    fn provider_target(&self) -> Option<u64> {
+        match self.leg {
+            Leg::Provider { target, .. } => Some(target),
+            Leg::Capability { .. } => None,
+        }
+    }
+}
+
+/// Steps 1, 2 and 2a. Authority-free, lock-free, and the mandatory entry point
+/// to the gate — see [`OrgFrameShape`].
+pub(crate) fn validate_org_frame_shape<'a>(
+    frame: &'a SensingInterestFrame,
+    counters: &SensingCounters,
+) -> Result<OrgFrameShape<'a>, OrgSensingRejection> {
     // Step 1: the frame must be an organization registration variant, and we
     // extract the leg parameters + the membership certificate exactly once.
     let (membership, leg) = match frame {
@@ -398,13 +479,37 @@ fn verify_org_sensing_registration_inner(
         }
     }
 
+    Ok(OrgFrameShape {
+        spec,
+        leg,
+        membership,
+    })
+}
+
+/// Steps 3–8: everything that needs the installed authority and the pinned
+/// revocation snapshot. Reachable only with an [`OrgFrameShape`], so steps 1, 2
+/// and 2a have provably already passed.
+fn verify_org_admission_with_shape(
+    shape: &OrgFrameShape<'_>,
+    from_node: u64,
+    sender_entity: &EntityId,
+    node_authority: Option<OrgAuthorityView>,
+    revocation: &OrgRevocationState,
+    now_secs: u64,
+) -> Result<ValidatedOrgSensingRegistration, OrgSensingRejection> {
+    let OrgFrameShape {
+        spec,
+        leg,
+        membership,
+    } = shape;
+
     // Step 3: the authenticated hop is the certificate's member. The
     // certificate binds an EntityId; it does NOT replace the routed-origin
     // cross-check, which the leader leg still enforces (consumer == from_node).
     if *sender_entity != membership.member {
         return Err(OrgSensingRejection::SenderMemberMismatch);
     }
-    if let Leg::Capability { consumer, .. } = &leg {
+    if let Leg::Capability { consumer, .. } = leg {
         if *consumer != from_node {
             return Err(OrgSensingRejection::ConsumerBindingMismatch);
         }
@@ -442,7 +547,8 @@ fn verify_org_sensing_registration_inner(
     // Steps 9 (stability recheck) and 10 (mutation) are the dispatch layer's.
     let subscriber = membership.member.clone();
     let org_id = membership.org_id;
-    Ok(ValidatedOrgSensingRegistration(match leg {
+    let spec = spec.clone();
+    Ok(ValidatedOrgSensingRegistration(match *leg {
         Leg::Capability {
             consumer,
             requested_sample_interval,
@@ -472,7 +578,9 @@ fn verify_org_sensing_registration_inner(
     }))
 }
 
-/// The leg-specific parameters extracted from the frame once (step 1).
+/// The leg-specific parameters extracted from the frame once (step 1). `Copy`
+/// because [`OrgFrameShape`] hands it to the authority phase by reference.
+#[derive(Clone, Copy)]
 enum Leg {
     Capability {
         consumer: u64,
@@ -2459,5 +2567,50 @@ mod tests {
             }
             _ => panic!("expected a provider registration"),
         }
+    }
+
+    /// The phase split is real, not cosmetic: `validate_org_frame_shape` takes
+    /// NO authority view, NO revocation state and NO `now_secs`, so the
+    /// selector/target refusal is structurally incapable of consulting — or
+    /// waiting on — any authority. This is the unit-level twin of the
+    /// production-path witness in `mesh::sensing_authority_witness_tests`.
+    #[test]
+    fn the_shape_phase_refuses_a_malformed_selector_with_no_authority_input() {
+        let counters = SensingCounters::default();
+        let malformed = provider_frame_with(
+            ProviderSelector::Node(0x77),
+            0x88,
+            org_commit(),
+            cert_gen(5),
+        );
+        assert_eq!(
+            validate_org_frame_shape(&malformed, &counters).err(),
+            Some(OrgSensingRejection::SelectorTargetMismatch),
+            "the authority-free phase refuses the malformation on its own"
+        );
+        // The coherent shape passes the phase and carries its products forward.
+        let coherent = provider_frame_with(
+            ProviderSelector::Node(0x77),
+            0x77,
+            org_commit(),
+            cert_gen(5),
+        );
+        let shape = validate_org_frame_shape(&coherent, &counters).expect("shape accepted");
+        assert_eq!(shape.provider_target(), Some(0x77));
+        // And the two phases compose to exactly the public verifier's verdict.
+        assert_eq!(
+            verify_org_admission(
+                &shape,
+                FROM_NODE,
+                &member(),
+                Some(authority()),
+                &empty_floors(),
+                now_secs(),
+                &counters,
+            )
+            .is_ok(),
+            run(&coherent, &member(), Some(authority()), &empty_floors()).is_ok(),
+            "shape + admission agrees with the single-call verifier"
+        );
     }
 }
