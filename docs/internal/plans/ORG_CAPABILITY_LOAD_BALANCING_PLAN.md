@@ -1618,7 +1618,7 @@ Stale evidence becomes Potential/Unknown, never NonViable.
 (comment `:125`, asserted `:134`). The earlier wording specified the inverse of the frozen
 primitive; see
 [`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md)
-§0 item 7 and D6.5. §10's `non_viable` count field is unaffected as a *name*; what
+§2.1 item 5 and D6.7. §10's `non_viable` count field is unaffected as a *name*; what
 changes is which observations can populate it.
 
 ### Freshness rules
@@ -2030,13 +2030,19 @@ Exit witnesses:
   previously required the inverse of the frozen primitive. Only a fresh exact
   `NotReady` yields `NonViable` — see the corrected §8 pruning rule and
   [`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md)
-  D6.6.)*
+  D6.7.)*
 - stale NotReady becomes Unknown/Potential — never NonViable;
 - foreign/granted candidate exposes no readiness;
 - a second call reuses the warmed route set (no cold re-registration);
-- **a warmed call issues no scoped-store query, no observation-map
-  scan, no sort, and no registration emission** (instrumented
-  witness);
+- **an UNSENSED warmed call issues no scoped-store query, no
+  observation-map scan, no sort, and no registration emission**
+  (instrumented witness). *(Scoped 2026-08-30: a SENSED org call adds
+  exactly one bounded `sensing_observations` critical section reading at
+  most 32 rows — see
+  [`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md)
+  D6.4 and the divergence record in D6.8. The scoped-store, sort and
+  emission clauses remain true on BOTH paths; only the observation-read
+  clause is path-dependent.)*
 - 1,024 indexed rows + one affected capability: rebuild visits only that bucket
   and performs ZERO descriptor decodes after ingest; a family's full 64 retained
   route demands and many independent clients do not multiply store scans or
