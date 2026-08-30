@@ -373,8 +373,9 @@ const MAX_REGISTRATION_ID: u64 = u64::MAX - 1;
 /// to decide how to report it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EvaluatorInstallRefusal {
-    /// A live registration already serves this capability. Only
-    /// [`ReadinessEvaluators::install_vacant`] can produce this.
+    /// A live registration already serves this capability. Only a
+    /// vacancy-required install can produce this — see
+    /// `MeshNode::register_readiness_evaluator`.
     Occupied,
     /// The node's registration-identity space is exhausted. No further
     /// install of any kind can publish, because a fresh non-aliasing id
@@ -687,6 +688,8 @@ impl ReadinessEvaluators {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicBool;
+
     use super::*;
 
     /// A minimal integration: readiness is driven by a "load"
@@ -1055,8 +1058,9 @@ mod tests {
     /// at all for a superseded registration — the currentness test and
     /// the effect are one section, so there is no check-then-poke gap.
     ///
-    /// Fails against: poking by capability alone; checking the id and
-    /// then poking outside the section.
+    /// Fails against: poking by capability alone. (The check-then-poke
+    /// RACE needs a concurrent rival and is witnessed separately, by
+    /// `a_rival_install_cannot_complete_while_a_poke_holds_the_section`.)
     #[test]
     fn poke_if_current_runs_only_for_the_installed_registration() {
         let evaluators = ReadinessEvaluators::default();
@@ -1094,6 +1098,141 @@ mod tests {
         assert!(evaluators.remove_if_current(&capability, new));
         assert!(!evaluators.poke_if_current(&capability, new, poke));
         assert_eq!(pokes.load(Ordering::Relaxed), 2);
+    }
+
+    /// How long a mutual-exclusion witness holds its section. The
+    /// contended operation it races against is a single map insert —
+    /// microseconds — so this is many orders of magnitude of slack, and
+    /// the assertion is about a happens-before the mutex guarantees.
+    const HOLD: Duration = Duration::from_millis(50);
+
+    /// **The check-then-publish witness.** A rival install must not be
+    /// able to complete while a publication holds its commit section.
+    ///
+    /// This is what distinguishes a real fence from "test currentness,
+    /// drop the guard, then publish": under check-then-publish the rival
+    /// takes only the map's own shard lock and finishes immediately, so
+    /// a result computed under the old registration would land after the
+    /// replacement had already returned.
+    ///
+    /// Fails against: `begin_commit` that returns no guard, or a guard
+    /// that does not exclude install/replace/remove.
+    #[test]
+    fn a_rival_install_cannot_complete_while_a_publication_holds_the_section() {
+        let evaluators = Arc::new(ReadinessEvaluators::default());
+        let capability = CapabilityId::new("gpu.infer");
+        let id = evaluators
+            .install_vacant(capability.clone(), Arc::new(MarkerEvaluator { marker: 1 }))
+            .expect("vacant install");
+
+        let rival_running = Arc::new(AtomicBool::new(false));
+        let rival_done = Arc::new(AtomicBool::new(false));
+
+        let commit = evaluators
+            .begin_commit(&capability, Some(id))
+            .expect("the installed registration opens a section");
+
+        let rival = {
+            let evaluators = Arc::clone(&evaluators);
+            let capability = capability.clone();
+            let rival_running = Arc::clone(&rival_running);
+            let rival_done = Arc::clone(&rival_done);
+            std::thread::spawn(move || {
+                rival_running.store(true, Ordering::Release);
+                evaluators
+                    .install_replacing(capability, Arc::new(MarkerEvaluator { marker: 2 }))
+                    .expect("replacement install");
+                rival_done.store(true, Ordering::Release);
+            })
+        };
+
+        while !rival_running.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        std::thread::sleep(HOLD);
+        assert!(
+            !rival_done.load(Ordering::Acquire),
+            "a rival install completed while a publication held the commit section — \
+             the section is not mutually exclusive with ownership transfer",
+        );
+        // The publication's own view is still the one it was admitted
+        // under, for the whole section.
+        assert_eq!(marker(&evaluators, &capability), Some(1));
+
+        drop(commit);
+        rival.join().expect("rival thread");
+        assert!(rival_done.load(Ordering::Acquire));
+        assert_eq!(marker(&evaluators, &capability), Some(2));
+        assert!(
+            evaluators.begin_commit(&capability, Some(id)).is_none(),
+            "the old registration is non-current once the rival completed",
+        );
+    }
+
+    /// **The check-then-poke witness.** Same property on the state-edge
+    /// seam: a rival install must not complete while a poke is running.
+    ///
+    /// Under check-then-poke (test the id under the lock, release, then
+    /// poke) the rival finishes first and the poke lands on a schedule
+    /// the caller no longer owns.
+    ///
+    /// Fails against: `poke_if_current` that releases the section before
+    /// running the poke.
+    #[test]
+    fn a_rival_install_cannot_complete_while_a_poke_holds_the_section() {
+        let evaluators = Arc::new(ReadinessEvaluators::default());
+        let capability = CapabilityId::new("gpu.infer");
+        let id = evaluators
+            .install_vacant(capability.clone(), Arc::new(MarkerEvaluator { marker: 1 }))
+            .expect("vacant install");
+
+        let rival_running = Arc::new(AtomicBool::new(false));
+        let rival_done = Arc::new(AtomicBool::new(false));
+        let poked = Arc::new(AtomicU64::new(0));
+
+        let rival = {
+            let evaluators = Arc::clone(&evaluators);
+            let capability = capability.clone();
+            let rival_running = Arc::clone(&rival_running);
+            let rival_done = Arc::clone(&rival_done);
+            let start = Arc::new(AtomicBool::new(false));
+            let start_for_poke = Arc::clone(&start);
+            let handle = std::thread::spawn(move || {
+                while !start.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+                rival_running.store(true, Ordering::Release);
+                evaluators
+                    .install_replacing(capability, Arc::new(MarkerEvaluator { marker: 2 }))
+                    .expect("replacement install");
+                rival_done.store(true, Ordering::Release);
+            });
+            (handle, start_for_poke)
+        };
+        let (rival_handle, rival_start) = rival;
+
+        let ran = evaluators.poke_if_current(&capability, id, || {
+            poked.fetch_add(1, Ordering::Relaxed);
+            rival_start.store(true, Ordering::Release);
+            while !rival_running.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            std::thread::sleep(HOLD);
+            assert!(
+                !rival_done.load(Ordering::Acquire),
+                "a rival install completed while a poke held the commit section — \
+                 the currentness test and the poke are not one critical section",
+            );
+            true
+        });
+
+        assert!(ran, "the installed registration's poke must run");
+        assert_eq!(poked.load(Ordering::Relaxed), 1);
+        rival_handle.join().expect("rival thread");
+
+        // Ownership has transferred, and the old id is now inert.
+        assert!(!evaluators.poke_if_current(&capability, id, || true));
+        assert_eq!(poked.load(Ordering::Relaxed), 1);
     }
 
     // ---------------------------------------------------------------
@@ -1172,40 +1311,72 @@ mod tests {
         );
     }
 
-    /// The non-aliasing property the whole ownership scheme rests on: a
-    /// stale id can never equal a later one, so the allocator must never
-    /// hand out the same value twice and must never rest on an issued
-    /// value.
+    /// The non-aliasing property the whole ownership scheme rests on:
+    /// every id the allocator ever issues is distinct, and at the
+    /// boundary it STOPS rather than continuing into reuse.
     ///
-    /// Fails against: `fetch_add` wrapping past `u64::MAX` (after which
-    /// id 0 is reissued and the very first handle could remove a live
-    /// registration).
+    /// The stopping half is what makes non-aliasing true — an allocator
+    /// that kept issuing would eventually hand a live registration the
+    /// value a long-closed handle still holds. So the witness walks the
+    /// last two issuable ids, checks every id ever issued is unique, and
+    /// then requires a refusal.
+    ///
+    /// Fails against: `fetch_add`, which returns `Ok` here instead of
+    /// stopping and later reissues id 0.
     #[test]
-    fn a_stale_id_can_never_alias_a_later_registration() {
+    fn every_issued_id_is_distinct_and_the_allocator_stops_at_the_boundary() {
         let evaluators = ReadinessEvaluators::default();
         let capability = CapabilityId::new("gpu.infer");
+        let other = CapabilityId::new("print.document");
+        let mut issued = Vec::new();
 
         // The first id ever issued, held by a long-closed handle.
         let ancient = evaluators
             .install_vacant(capability.clone(), Arc::new(MarkerEvaluator { marker: 1 }))
             .expect("vacant install");
+        issued.push(ancient);
         assert!(evaluators.remove_if_current(&capability, ancient));
 
-        // Drive the allocator to its terminal value and install once
-        // more at the boundary.
-        evaluators.set_next_id_for_test(ReadinessEvaluators::max_issuable_id_for_test());
-        let newest = evaluators
+        // Two ids left before the boundary. Both must issue, and both
+        // must differ from each other and from the ancient one.
+        evaluators.set_next_id_for_test(ReadinessEvaluators::max_issuable_id_for_test() - 1);
+        let penultimate = evaluators
             .install_vacant(capability.clone(), Arc::new(MarkerEvaluator { marker: 2 }))
-            .expect("boundary install");
-        assert_ne!(ancient, newest);
+            .expect("penultimate id issues");
+        issued.push(penultimate);
+        assert!(evaluators.remove_if_current(&capability, penultimate));
+        let last = evaluators
+            .install_vacant(capability.clone(), Arc::new(MarkerEvaluator { marker: 3 }))
+            .expect("last issuable id issues");
+        issued.push(last);
 
-        // The ancient handle is inert against the newest registration.
+        let mut unique = issued.clone();
+        unique.sort_by_key(|id| format!("{id:?}"));
+        unique.dedup_by_key(|id| format!("{id:?}"));
+        assert_eq!(
+            unique.len(),
+            issued.len(),
+            "the allocator issued the same id twice: {issued:?}",
+        );
+
+        // ...and now it stops. A wrapping allocator would keep going and
+        // eventually reissue `ancient`.
+        assert!(evaluators.identities_exhausted());
+        assert_eq!(
+            evaluators.install_vacant(other.clone(), Arc::new(MarkerEvaluator { marker: 4 })),
+            Err(EvaluatorInstallRefusal::IdentityExhausted),
+            "the allocator continued past its last issuable id",
+        );
+        assert!(evaluators.installed(&other).is_none());
+
+        // The ancient handle is inert on every edge against the live
+        // registration.
         assert!(!evaluators.remove_if_current(&capability, ancient));
         assert!(evaluators
             .begin_commit(&capability, Some(ancient))
             .is_none());
         assert!(!evaluators.poke_if_current(&capability, ancient, || true));
-        assert_eq!(marker(&evaluators, &capability), Some(2));
+        assert_eq!(marker(&evaluators, &capability), Some(3));
     }
 
     // ---------------------------------------------------------------
@@ -1278,7 +1449,7 @@ mod tests {
             .map(|line| {
                 // Keep the declaration head only: everything up to the
                 // name, so signatures and field lists do not matter.
-                line.split(|c: char| c == '(' || c == '<' || c == ':' || c == '{' || c == ';')
+                line.split(['(', '<', ':', '{', ';'])
                     .next()
                     .unwrap_or("")
                     .trim()
