@@ -202,10 +202,13 @@ opaque authority-epoch comparison:
    `OrgRouteSet`** — no rediscovery, candidate scan, observation scan, sort,
    interest reconciliation, or registration wait (§7). *(Scoped 2026-08-30: the
    sort clause is likewise the UNSENSED track; a sensed call adds one stable
-   class-ordering pass, D7.2.)* *(Scoped 2026-08-30:
+   bucket permutation — not a re-sort and not a second sort, D7.2.)*
+   *(Scoped 2026-08-30:
    the observation-scan clause is the UNSENSED/cold path. A sensed OA-6 call
-   adds exactly one bounded `sensing_observations` section over the already
-   authorized SameOrg population — `<= 32` lookups, never a full or unbounded
+   adds exactly one bounded `sensing_observations` section over the SENSED
+   SameOrg observation rows — `S <= 32` lookups, the only population that cap
+   binds; the complete authorized candidate count `C` is NOT capped and its
+   excess stays unsensed `Unknown`/`Potential` — never a full or unbounded
    scan, never a second aggregate/detail scan — with all route and budget work
    off that lock; every other clause here holds on both paths. See §14 and
    [`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md)
@@ -216,9 +219,11 @@ opaque authority-epoch comparison:
    seven-step contract in §2A instead: it does **not** use P2C;
 9. per-request sorting of Ready candidates is prohibited; the fallback
    vector is sorted once at rebuild (§9). *(Scoped 2026-08-30: this is the
-   UNSENSED warmed-pool track. A sensed organization-audience call performs one
-   stable class-ordering pass over `<= 32` already-authorized candidates — see
-   §14 and the design's D7.2. The prohibition on re-sorting a Ready pool per
+   UNSENSED warmed-pool track. A sensed organization-audience call performs a
+   linear stable bucket permutation of the **complete** already-authorized
+   candidate list, whose count `C` is **NOT bounded by 32** — only the sensed
+   observation-row subset `S` is `<= 32` — in at most `S + 1` traversals of that
+   list; see §14 and the design's D7.2. The prohibition on re-sorting a Ready pool per
    request stands; a stable permutation of an already-sorted authorized list is
    not that.)*;
 10. exact-provider fan-out is hard-bounded (32 sensed providers per
@@ -480,8 +485,10 @@ A sensed `org.call` performs exactly these seven steps, in this order:
 5. a **linear stable bucket permutation** over the **complete** authorized
    candidate list — three buckets concatenated, `O(C * S)` where `C` is the
    complete candidate count and is **NOT bounded by 32** (excess SameOrg survives
-   as unsensed `Unknown`, and `Granted` candidates are in the list); two passes, so
-   at most `2 * S` comparisons per candidate. No comparator over `C`, no `sort_by`
+   as unsensed `Unknown`, and `Granted` candidates are in the list). At most
+   `S + 1` traversals of the complete list — step 2 traverses it once per sensed
+   `ranked` entry, step 3 once — and at most `2 * S` equality comparisons per
+   candidate. No comparator over `C`, no `sort_by`
    (design D7.2). **The bounded projection sorts inside
    `scheduler_bridge/readiness.rs:82`/`:84`/`:85`, each over `S <= 32` entries,
    already exist and remain permitted** (design D7.2a);
@@ -1503,7 +1510,9 @@ projection (readiness.rs:82/84/85) O(S log S)  three EXISTING bounded sorts,
                                          unchanged and permitted (D7.2a)
 route estimate + budget classify  O(S)   OFF the lock
 linear stable bucket permutation  O(C*S) C = complete authorized candidates,
-                                         NOT bounded by 32; two passes, so
+                                         NOT bounded by 32; <= S+1 traversals
+                                         of the complete list (step 2 once per
+                                         ranked entry, step 3 once), so
                                          <= 2*S compares per candidate; no
                                          comparison sort over C (design D7.2)
 proof construction                O(1)   unchanged
@@ -2203,7 +2212,8 @@ Exit witnesses:
   observation-map scan, no sort, and no registration emission**
   (instrumented witness). *(Scoped 2026-08-30: a SENSED org call adds
   exactly one bounded `sensing_observations` critical section over the
-  already authorized SameOrg population, reading at most 32 rows, with
+  SENSED SameOrg observation rows, reading at most 32 such rows — the cap
+  binds those rows, never the complete authorized candidate count — with
   no full/global/unbounded scan and no second aggregate/detail scan —
   see
   [`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md)
@@ -2402,7 +2412,15 @@ The plan is complete when all are true:
       sensing authority.
 - [ ] Lazy watches are retained in a bounded, clone-shared
       `OrgRoutingState`; a second call is warm; the last client drop
-      releases every guard.
+      releases every guard. *(Scoped 2026-08-30: this is the ROUTE plane.
+      For organization exact sensing, sensing demand, lease tickets,
+      refresh records and the family lifecycle are owned by the separate
+      `OrgSensingFamily`/`OrgSensingFamilyInner` graph — NOT by
+      `OrgRoutingState`, which holds only RAII route-slot handles and
+      selector nonce state. `Drop` lives on the inner, so the LAST wrapper
+      clone retires the demand; see
+      [`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md)
+      D5.1/D5.2 and §2A.)*
 - [ ] Cadence relaxes when the strictest watcher drops; a stale lease
       ticket cannot remove a successor holder from the node-global
       registry (local invariant).
@@ -2417,9 +2435,12 @@ The plan is complete when all are true:
       reconciliation, no registration wait. Cold behavior is likewise
       unchanged.
 - [ ] A **sensed** org.call (OA-6 only) adds exactly ONE bounded
-      `sensing_observations` critical section over the ALREADY
-      AUTHORIZED SameOrg candidate population (`|population| <= 32`,
-      `O(population)` map lookups), followed by route estimation,
+      `sensing_observations` critical section over the SENSED SameOrg
+      observation rows (`S <= 32` rows, `O(S)` map lookups — the cap
+      binds this row subset, never the complete authorized candidate
+      population `C`, and excess authorized SameOrg candidates beyond
+      the cap remain unsensed `Unknown`/`Potential` fallback), followed
+      by route estimation,
       budget classification and ranking performed entirely OFF that
       lock. It performs **no full, global or unbounded scan** and **no
       second aggregate/detail scan** — one section, one pass. Every
@@ -2430,7 +2451,9 @@ The plan is complete when all are true:
       a sensed call performs a **linear stable bucket permutation**
       over the **COMPLETE** authorized candidate list, whose count `C`
       is **NOT bounded by 32**; the 32 cap binds only the `S` sensed
-      observation rows. Cost is `O(C * S)` over two passes, at most
+      observation rows. Cost is `O(C * S)` over at most `S + 1`
+      traversals of the complete list (step 2 traverses it once per
+      sensed `ranked` entry, step 3 once), at most
       `2 * S` compares per candidate, with **no comparison sort over
       `C`** — while the three bounded projection sorts in
       `scheduler_bridge/readiness.rs:82`/`:84`/`:85` already exist and
@@ -2493,7 +2516,16 @@ The plan is complete when all are true:
       (`org_sensing_fallback_total`).
 - [ ] No-viable is distinct from no-authority, local-only, counts
       `non_viable`, and is pinned in the regenerated X1 fixture across
-      all four binding suites.
+      all four binding suites. **SUPERSEDED FOR ORGANIZATION EXACT
+      SENSING (2026-08-30) — not asserted of that lane.** The exact
+      contract there introduces **no new error kind at all**: when every
+      sensed candidate is pruned, the call falls back to the original
+      authorized order and proceeds, so there is no no-viable result to
+      classify, no X1 fixture to regenerate and **no language-binding
+      change in any of the four suites**. See
+      [`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md)
+      §OA-6 and D7.3. This row remains live for the unsensed OLB-4
+      balancing release only.
 - [ ] The P2C sampler contract (seed + nonce) is pinned, reproducible
       under a fixed seed, and non-stampeding — on the **unsensed
       warmed-pool** track. *(Scoped 2026-08-30: the organization-audience
@@ -2502,8 +2534,10 @@ The plan is complete when all are true:
       gate is not asserted of that path, and that path's ordering is not
       asserted of this gate.)*
 - [ ] (exact sensing) A sensed OA-6 call performs exactly ONE bounded
-      `sensing_observations` critical section over the already
-      authorized SameOrg population (`<= 32` rows), and releases that
+      `sensing_observations` critical section over the SENSED SameOrg
+      observation rows (`S <= 32`; the complete authorized candidate
+      count `C` is NOT capped, and the excess stays unsensed
+      `Unknown`/`Potential`), and releases that
       lock **before** route estimation, request-relative budget
       classification, the stable class-ordering pass, proof mint, and
       any `.await`/I/O. No `ArcSwap`-published sensing artifact and no
