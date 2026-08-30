@@ -211,17 +211,22 @@ pub struct SensingCounters {
     // ── Refusals by kind (SI-0) ──
     /// Every constraint rejection (any [`ConstraintError`]).
     pub invalid_constraints: AtomicU64,
-    /// The security-relevant subset: protocol-invalid input —
-    /// constraint digest mismatches (plan §4.4), wire scope claims the
-    /// session does not back (plan §4.10), a LEGACY registration whose
-    /// declared audience is an organization-derived commitment while this
-    /// node holds organization authority (the C1 authority-aware
-    /// classification — an honest legacy sender never claims the org
-    /// audience, so the combination is a protocol violation, not merely an
-    /// authorization refusal), and an organization provider registration
-    /// whose interest selector does not name the frame's own `target`
-    /// (`OrgSensingRejection::SelectorTargetMismatch`, design D2.6 — the
-    /// sender's own bytes are internally inconsistent).
+    /// The security-relevant subset: protocol-invalid input. The PRINCIPAL
+    /// cases — not the complete set; `net/crates/net/docs/SENSING.md`
+    /// "Refusals by kind" carries the full production inventory:
+    ///
+    /// - constraint-digest and interest-digest mismatches (plan §4.4);
+    /// - wire scope claims the session does not back (plan §4.10);
+    /// - malformed organization-registration interval / soft-state-TTL bounds;
+    /// - a LEGACY registration whose declared audience is an
+    ///   organization-derived commitment while this node holds organization
+    ///   authority (the C1 authority-aware classification — an honest legacy
+    ///   sender never claims the org audience, so the combination is a protocol
+    ///   violation, not merely an authorization refusal);
+    /// - an organization provider registration whose interest selector does not
+    ///   name the frame's own `target`
+    ///   (`OrgSensingRejection::SelectorTargetMismatch`, design D2.6 — the
+    ///   sender's own bytes are internally inconsistent).
     pub protocol_invalid: AtomicU64,
     /// Structured cadence refusals issued.
     pub cadence_refusals: AtomicU64,
