@@ -839,6 +839,20 @@ operation, no alternative-provider selection.** Authority movement after the
 final comparison is the ordinary linearization race and is accepted; **holding an
 authority lock across a network send is forbidden.**
 
+**Scope of "no scan" (added 2026-08-30).** Every clause above holds unchanged
+for this design's own path and for every witness it owns. One sibling design
+adds a read this section did not contemplate: an **organization-audience
+exact-provider SENSED** call inserts one bounded `sensing_observations`
+critical section, reading at most 32 rows, between candidate derivation and
+selection — see
+[`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md)
+D6.4, with the divergence stated and stop-gated in its D6.8/§12.10. That read
+is on the **observation plane only**: it takes no scoped-store query, performs
+no grant or provider scan, adds no sort of the authorized list, emits no
+registration, and does not move the final-validation → `MeshNode::call`
+boundary asserted above. An unsensed or cold call is byte-for-byte as
+described here.
+
 ## 12. Witnesses
 
 Both zero-lock forms — instrumented end-to-end counters *and* a real contention
