@@ -848,10 +848,13 @@ selection — see
 [`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md)
 D6.4, with the divergence stated and stop-gated in its D6.8/§12.10. That read
 is on the **observation plane only**: it takes no scoped-store query, performs
-no grant or provider scan, adds no sort of the authorized list, emits no
-registration, and does not move the final-validation → `MeshNode::call`
-boundary asserted above. An unsensed or cold call is byte-for-byte as
-described here.
+no grant or provider scan, emits no registration, and does not move the
+final-validation → `MeshNode::call` boundary asserted above. **Ordering is the
+one exception, and it is deliberate:** a sensed call performs exactly ONE stable
+class-ordering pass over the `<= 32` already-authorized candidates (that design's
+D7.2 step 3), leaving the existing global sort intact as the tie-break of record;
+that pass is a stable permutation, not a re-sort and not a second sort. An
+unsensed or cold call is byte-for-byte as described here.
 
 ## 12. Witnesses
 
