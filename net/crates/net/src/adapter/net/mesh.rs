@@ -11585,9 +11585,9 @@ impl MeshNode {
     ///
     /// S0 item 7: this is the VACANCY-REQUIRED install. A capability
     /// already served by a live registration is refused with
-    /// [`sensing::EvaluatorOccupied`] — the incumbent keeps serving
-    /// and no id is minted, so one integration can never silently
-    /// steal another's slot. Explicit supersession is
+    /// [`sensing::EvaluatorInstallRefusal::Occupied`] — the incumbent
+    /// keeps serving and no id is issued, so one integration can never
+    /// silently steal another's slot. Explicit supersession is
     /// [`Self::replace_readiness_evaluator`]. Hold the returned
     /// [`sensing::EvaluatorRegistrationId`]: it is the only thing
     /// that can remove this registration.

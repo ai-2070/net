@@ -568,15 +568,22 @@ mod tests {
     #[test]
     fn the_public_surface_of_this_module_is_provider_lifecycle_only() {
         let source = include_str!("sensing.rs");
-        // Only the re-export statements and item declarations, so prose
-        // and doc links that legitimately NAME a deferred concept do not
-        // trip the guard.
-        let declarations: String = source
-            .lines()
-            .map(str::trim)
-            .filter(|line| line.starts_with("pub use ") || line.starts_with("pub fn "))
-            .collect::<Vec<_>>()
-            .join("\n");
+        // WHOLE `pub use` statements (they span lines) plus public fn
+        // signatures — so prose and doc links that legitimately NAME a
+        // deferred concept do not trip the guard, and a name hidden on a
+        // re-export's continuation line cannot slip past it either.
+        let mut declarations = String::new();
+        for after in source.split("pub use ").skip(1) {
+            let statement = after.split(';').next().unwrap_or("");
+            declarations.push_str(statement);
+            declarations.push('\n');
+        }
+        for line in source.lines().map(str::trim) {
+            if line.starts_with("pub fn ") {
+                declarations.push_str(line);
+                declarations.push('\n');
+            }
+        }
 
         for forbidden in [
             "InterestSpec",
