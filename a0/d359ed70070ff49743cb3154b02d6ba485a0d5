@@ -1,0 +1,23 @@
+CONTRIBUTING.md
+  s_f3e3c0544a3b29::t_590046dec022fc 67-102
+AGENTS.md
+  s_f3e3c0544a3b29::t_5a57af6839f785 56-57
+net/crates/net/.cargo/config.toml
+  s_f3e3c0544a3b29::t_e4c647cfabd091 10-31
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "a0d359ed70070ff49743cb3154b02d6ba485a0d5",
+  "prompts": {},
+  "sessions": {
+    "s_f3e3c0544a3b29": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5bd32f7e-6815-4bb6-87cb-96b03572522a",
+        "model": "claude-opus-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
