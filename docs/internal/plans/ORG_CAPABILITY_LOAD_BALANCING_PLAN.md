@@ -486,17 +486,20 @@ The substrate under `src/adapter/net/behavior/sensing/` provides:
   attestations project to `Unknown`, never `NotReady`
   (`continuity.rs:93-101`);
 - consumer-local route economics: `BranchView { estimated_start,
-  route_estimate }` (`controller.rs:248-257`), joined by
-  `classify_branch` (`controller.rs:294-308`) under
-  `ConsumerLatencyBudget::admits` (`identity.rs:307-315`);
+  route_estimate }` (`controller.rs:265-274`), joined by
+  `classify_branch` (`controller.rs:311-325`) under
+  `ConsumerLatencyBudget::admits` (`identity.rs:323-330`; the struct is
+  `identity.rs:311-315`);
 - the two projection layers: provider evidence
   `ProjectedReadiness::{Ready, NotReady, Unknown}`
   (`continuity.rs:80-89`) and the budget-relative
   `BranchViability::{Viable(cost), Potential, NonViable}`
-  (`controller.rs:279-290`);
+  (`controller.rs:296-307`; the `Potential` doc that forbids pruning on it
+  is `:301-303`);
 - sensed candidate ordering: `SensedCandidates { viable, potential,
-  non_viable }` with `viable` ranked by `route + start`
-  (`scheduler_bridge/readiness.rs:41-63`);
+  non_viable }` (`scheduler_bridge/readiness.rs:41-53`) with `viable`
+  ranked by `route + start` inside `project_sensed_candidates`
+  (`readiness.rs:69-87`, the sort at `:82-83`);
 - unified change notifications:
   `subscribe_sensing_overlay_changes` (`mesh.rs:7310`);
 - a projection-stage population clamp: `MeshNode::sensed_candidates(spec,
@@ -707,7 +710,17 @@ sensing emits only organization variants; intake validates membership
 before creating table state; legacy entity/fleet-root variants cannot
 enter an organization-derived audience; and mixed-version refusal
 degrades to Unknown and deterministic routing, never an invocation
-failure. The 0x0C03 attestation transcript, continuity, and epoch
+failure — **subject to an absolute path-member floor.** The
+degradation depends on the dispatch-loop unknown-subprotocol catch-all,
+which landed in `5362486afca2681e7c3b2ca9d096bd70dc3c6130` and first
+shipped in `crates-v0.32.0` / v0.32.0. Below that release there is no
+catch-all and a 0x0C02 frame is parsed as application events, so
+**pre-0.32.0 consumers, relays and providers are EXCLUDED from this
+path rather than degrading cleanly**; providers/relays-first ordering is
+necessary but not sufficient on its own; and there is no legacy fallback
+for an org-derived audience at any version. *(Corrected 2026-08-30; see
+[`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md)
+D8.3.)* The 0x0C03 attestation transcript, continuity, and epoch
 semantics are unchanged. The candidate population comes from
 the verified owner-private store; the sensing counterparties are
 verified members of that same organization.
@@ -793,7 +806,7 @@ DISCOVER⇔binding precedent, a SENSE right needs its own
 issue-and-decode structural rule decided at its review.
 
 Audience isolation is structural: the `AudienceScopeCommitment` is bound
-into the interest digest (`identity.rs:763-779`), so the same semantic
+into the interest digest (`identity.rs:779-795`, the audience at `:793`), so the same semantic
 interest under different authority audiences can never coalesce and
 never shares private observations.
 
@@ -1482,9 +1495,11 @@ exact-provider registrations §5.1a mints are per-provider node state
 and must be acquired, counted, and released per provider. The interest
 digest already binds every identity dimension — capability, canonical
 constraints, work-latency envelope, provider selector, result mode,
-disclosure class, and the audience commitment (`identity.rs:763-779`).
+disclosure class, and the audience commitment (`identity.rs:779-795`; the
+selector at `:788-790`, the audience at `:793`).
 Two consumer-local dimensions deliberately do not fork the lease,
-because they are not interest identity (`identity.rs:863-878`): the
+because they are not interest identity (`InterestRegistration`,
+`identity.rs:877-878` doc / `:880` struct / `:887` field): the
 end-to-end `ConsumerLatencyBudget` (a per-watch projection input) and
 `requested_sample_interval` (aggregated below).
 
@@ -1562,7 +1577,7 @@ Ready { estimated_start } | Unknown | NotReady
 
 **Consumer-relative projection** (evidence joined with this consumer's
 route estimate under its budget — `BranchViability` via
-`classify_branch`, `controller.rs:294-308`):
+`classify_branch`, `controller.rs:311-325`):
 
 ```text
 Viable(cost = route_estimate + estimated_start)
@@ -1599,8 +1614,8 @@ Stale evidence becomes Potential/Unknown, never NonViable.
 `BranchViability::Potential`; only `ProjectedReadiness::NotReady` becomes
 `NonViable` (`:322`). The `Potential` variant's own doc says "never prune on it"
 (`:301-303`), `SensedCandidates.potential` retains it
-(`behavior/scheduler_bridge/readiness.rs:46-50`), and an existing test pins it
-(`:126`, asserted `:134`). The earlier wording specified the inverse of the frozen
+(`behavior/scheduler_bridge/readiness.rs:46-48`), and an existing test pins it
+(comment `:125`, asserted `:134`). The earlier wording specified the inverse of the frozen
 primitive; see
 [`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md)
 §0 item 7 and D6.5. §10's `non_viable` count field is unaffected as a *name*; what
@@ -2006,7 +2021,16 @@ Exit witnesses:
 - Viable beats Potential;
 - Potential remains eligible;
 - fresh exact NotReady prunes;
-- fresh Ready that exceeds the hard E2E budget prunes as NonViable;
+- fresh Ready that exceeds the hard E2E budget is **Potential and is NOT
+  pruned** — `classify_branch` maps it through its `_ =>` arm
+  (`src/adapter/net/behavior/sensing/controller.rs:311-325`, arm `:323`;
+  variant doc `:301-303`), and `SensedCandidates.potential` retains it
+  (`behavior/scheduler_bridge/readiness.rs:46-48`) with a test pinning it
+  (comment `:125`, asserted `:134`). *(Corrected 2026-08-30: this line
+  previously required the inverse of the frozen primitive. Only a fresh exact
+  `NotReady` yields `NonViable` — see the corrected §8 pruning rule and
+  [`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md)
+  D6.6.)*
 - stale NotReady becomes Unknown/Potential — never NonViable;
 - foreign/granted candidate exposes no readiness;
 - a second call reuses the warmed route set (no cold re-registration);
@@ -2204,7 +2228,18 @@ The plan is complete when all are true:
 - [ ] The registration wire is the pinned appended 0x0C02 organization
       variants; legacy variants never enter an organization-derived
       audience; mixed-version refusal degrades to Unknown and
-      deterministic routing, never an invocation failure.
+      deterministic routing, never an invocation failure — **and every
+      consumer, relay and provider on the exact-org-sensing path is at or
+      past the absolute minimum floor: commit
+      `5362486afca2681e7c3b2ca9d096bd70dc3c6130`, first contained release
+      `crates-v0.32.0` / v0.32.0.** Pre-floor peers are EXCLUDED from the
+      path, not described as refusing cleanly or degrading to Unknown: below
+      that commit there is no unknown-subprotocol catch-all, so a 0x0C02
+      frame is parsed as application events. Providers/relays-first is
+      necessary but NOT sufficient by itself, and there is no legacy
+      fallback at any version. *(Corrected 2026-08-30; see
+      [`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md)
+      D8.3.)*
 - [ ] The per-call temporal recheck of membership/dispatcher/grant
       remains on the hot path — the route cache is never an authority
       cache.
@@ -2217,8 +2252,10 @@ The plan is complete when all are true:
       configuration.
 - [ ] Viable is preferred over Potential; Potential remains eligible.
 - [ ] Unknown never prunes; NonViable prunes only from fresh exact
-      evidence (NotReady, or Ready exceeding the hard E2E budget);
-      stale evidence never becomes NonViable.
+      evidence, and the ONLY such input is a fresh exact NotReady. A fresh
+      Ready exceeding the hard E2E budget is Potential and is never pruned
+      (`controller.rs:311-325`, arm `:323`), and stale evidence never becomes
+      NonViable. *(Corrected 2026-08-30.)*
 - [ ] Cold/unavailable sensing preserves the current call path
       byte-for-byte, including `ProviderNotDirect`.
 - [ ] Sensing capacity fallback is observable
