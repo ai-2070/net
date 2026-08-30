@@ -25,6 +25,13 @@
 //! 8. the interest audience == the canonical organization sensing commitment
 //!    for `cert.org_id`.
 //!
+//! Between steps 2 and 3, on the provider-addressed leg only, the interest
+//! selector must name EXACTLY the frame's own `target`
+//! (`spec.providers == ProviderSelector::Node(target)`, design D2.6). It is a
+//! pure comparison of two values the frame already carries, so it needs no
+//! authority and no lock, and it runs before every check below and therefore
+//! before any effect.
+//!
 //! Step 9 (the authority/store stability recheck immediately before mutation)
 //! and step 10 (the mutation itself) are the dispatch layer's job — the gate
 //! is validated against a pinned revocation snapshot the caller captured, and
@@ -39,7 +46,7 @@ use super::super::org::{OrgError, OrgId, OrgMembershipCert};
 use super::super::org_authority::{NodeAuthority, OrgAuthorityError};
 use super::super::org_revocation::{BarrieredGeneration, OrgRevocationState, OrgRevocationStore};
 use super::frames::{FrameSpecError, SensingInterestFrame};
-use super::identity::{AudienceScopeCommitment, InterestSpec};
+use super::identity::{AudienceScopeCommitment, InterestSpec, ProviderSelector};
 use super::SensingCounters;
 use crate::adapter::net::identity::EntityId;
 use arc_swap::ArcSwapOption;
@@ -245,6 +252,19 @@ pub enum OrgSensingRejection {
     BelowFloor,
     /// The interest audience is not the canonical commitment for the org.
     AudienceMismatch,
+    /// The provider-addressed leg's interest selector does not name EXACTLY
+    /// the frame's `target`: `spec.providers != ProviderSelector::Node(target)`
+    /// (design D2.6). An exact-provider interest is one interest per provider,
+    /// so `AnyAuthorized`, a `Group`, a `Tags` match, and even a one-element
+    /// `Nodes([target])` are all incoherent here — `Nodes` is canonically
+    /// sorted and deduplicated, so accepting it would split one semantic
+    /// interest across two digests.
+    ///
+    /// Appended after the eight original variants. `OrgSensingRejection` is
+    /// public and not `#[non_exhaustive]`, so this is a deliberate semver
+    /// break for any downstream exhaustive matcher; in-tree the cost is the
+    /// single wildcard-free match in this file.
+    SelectorTargetMismatch,
 }
 
 /// Steps 1–8 of the org-sensing authority gate against a PINNED revocation
@@ -289,9 +309,14 @@ pub fn verify_org_sensing_registration(
             OrgSensingRejection::SenderMemberMismatch => Some(&counters.org_sender_member_mismatch),
             OrgSensingRejection::AudienceMismatch => Some(&counters.org_audience_mismatch),
             OrgSensingRejection::MissingAuthority => Some(&counters.org_authority_unavailable),
-            // Routed-origin / frame-shape violations are protocol-invalid input.
+            // Routed-origin / frame-shape violations are protocol-invalid
+            // input. A selector that does not name the frame's own target is
+            // the same class: the sender's own bytes are internally
+            // inconsistent, so it is a protocol violation, not merely an
+            // authorization refusal (design D2.6).
             OrgSensingRejection::ConsumerBindingMismatch
-            | OrgSensingRejection::NotOrgRegistration => Some(&counters.protocol_invalid),
+            | OrgSensingRejection::NotOrgRegistration
+            | OrgSensingRejection::SelectorTargetMismatch => Some(&counters.protocol_invalid),
             OrgSensingRejection::Semantic(_) => None,
         };
         if let Some(counter) = counter {
@@ -351,6 +376,27 @@ fn verify_org_sensing_registration_inner(
     let spec = frame
         .validated_spec(counters)
         .map_err(OrgSensingRejection::Semantic)?;
+
+    // Step 2a (design D2.6): on the provider-addressed leg the interest
+    // selector must name EXACTLY the frame's own `target`. This runs
+    // immediately after semantic reconstruction — before the membership,
+    // authority, signature, floor and audience work below, and therefore
+    // before ANY table mutation, evaluator feed, relay planning, cache
+    // publication or onward byte. It is a pure comparison of two values the
+    // frame already carries, so it needs no authority and no lock.
+    //
+    // `Node(target)` is the only coherent shape: an exact-provider interest is
+    // one interest per provider, and `ProviderSelector` is part of the interest
+    // digest, so a broader selector would either corrupt the merge-miss
+    // denominator (`AnyAuthorized` makes `is_provider_free()` true) or split one
+    // semantic interest across two digests (`Nodes` is canonically sorted and
+    // deduplicated). The capability leg carries a `consumer`, not a `target`,
+    // and is checked by the routed-origin binding in step 3 instead.
+    if let Leg::Provider { target, .. } = &leg {
+        if spec.providers != ProviderSelector::Node(*target) {
+            return Err(OrgSensingRejection::SelectorTargetMismatch);
+        }
+    }
 
     // Step 3: the authenticated hop is the certificate's member. The
     // certificate binds an EntityId; it does NOT replace the routed-origin
@@ -2165,5 +2211,253 @@ mod tests {
             canonical_org_sensing_commitment(&org_kp().org_id()),
             "org authority preserved"
         );
+    }
+
+    // ---- D2.6: the selector <-> target intake invariant -----------------
+    //
+    // The provider-addressed leg carries BOTH a `target` and, inside the
+    // digest-bound spec, a `providers` selector. Before this slice the gate
+    // never compared them, so a frame naming provider A while selecting
+    // provider B was admitted and produced a real registration. These
+    // witnesses pin the comparison, its position in the locked order, its
+    // counter class, and the fact that the coherent shape still passes.
+
+    /// Build a provider frame whose selector and target are chosen
+    /// independently, so an incoherent pair can be constructed on purpose.
+    fn provider_frame_with(
+        selector: ProviderSelector,
+        target: u64,
+        audience: AudienceScopeCommitment,
+        cert: OrgMembershipCert,
+    ) -> SensingInterestFrame {
+        let mut spec = spec_with(audience);
+        spec.providers = selector;
+        SensingInterestFrame::org_provider_registration(&spec, target, D, TTL, cert)
+    }
+
+    /// The local-origin admission refuses a selector that names a provider
+    /// other than the leg's own target. Inverse mutation: drop the
+    /// `spec.providers == Node(target)` comparison — the frame is admitted and
+    /// a registration for a provider nobody selected is produced.
+    #[test]
+    fn local_org_admission_refuses_a_selector_that_does_not_name_the_target() {
+        let frame = provider_frame_with(
+            ProviderSelector::Node(0x77),
+            0x88,
+            org_commit(),
+            cert_gen(5),
+        );
+        assert_eq!(
+            run(&frame, &member(), Some(authority()), &empty_floors()),
+            Err(OrgSensingRejection::SelectorTargetMismatch),
+            "selector names 0x77 while the leg targets 0x88"
+        );
+        // The mirror image is refused too: the selector must not merely
+        // *contain* the target's neighbourhood, it must BE `Node(target)`.
+        let swapped = provider_frame_with(
+            ProviderSelector::Node(0x88),
+            0x77,
+            org_commit(),
+            cert_gen(5),
+        );
+        assert_eq!(
+            run(&swapped, &member(), Some(authority()), &empty_floors()),
+            Err(OrgSensingRejection::SelectorTargetMismatch)
+        );
+    }
+
+    /// Only `Node(target)` is exact. Every other selector shape is refused —
+    /// including a one-element `Nodes([target])`, which "contains" the target
+    /// but hashes to a different interest digest, and the three provider-free
+    /// shapes, which would make `is_provider_free()` true on a leg that
+    /// carries an explicit destination.
+    #[test]
+    fn every_non_exact_selector_shape_is_refused_at_intake() {
+        const TARGET: u64 = 0x77;
+        let shapes = [
+            ("AnyAuthorized", ProviderSelector::AnyAuthorized),
+            ("Nodes([target])", ProviderSelector::Nodes(vec![TARGET])),
+            (
+                "Nodes([target, other])",
+                ProviderSelector::Nodes(vec![TARGET, 0x88]),
+            ),
+            (
+                "Group",
+                ProviderSelector::Group(super::super::identity::GroupRef::from_bytes([0x5Au8; 32])),
+            ),
+            (
+                "Tags",
+                ProviderSelector::Tags(vec![super::super::identity::TagMatch {
+                    key: "rack".to_string(),
+                    value: "a1".to_string(),
+                }]),
+            ),
+        ];
+        for (label, selector) in shapes {
+            let frame = provider_frame_with(selector, TARGET, org_commit(), cert_gen(5));
+            assert_eq!(
+                run(&frame, &member(), Some(authority()), &empty_floors()),
+                Err(OrgSensingRejection::SelectorTargetMismatch),
+                "{label} is not an exact provider selector"
+            );
+        }
+    }
+
+    /// The refusal is protocol-invalid input — the sender's own bytes are
+    /// internally inconsistent — and it yields no validated registration, so
+    /// nothing downstream can mutate a table from it.
+    #[test]
+    fn the_selector_target_refusal_bumps_protocol_invalid_and_creates_no_row() {
+        let counters = SensingCounters::default();
+        let frame = provider_frame_with(
+            ProviderSelector::AnyAuthorized,
+            0x77,
+            org_commit(),
+            cert_gen(5),
+        );
+        let before = SensingCounters::get(&counters.protocol_invalid);
+        let outcome = verify_org_sensing_registration(
+            &frame,
+            FROM_NODE,
+            &member(),
+            Some(authority()),
+            &empty_floors(),
+            now_secs(),
+            &counters,
+        );
+        assert_eq!(outcome, Err(OrgSensingRejection::SelectorTargetMismatch));
+        assert_eq!(
+            SensingCounters::get(&counters.protocol_invalid),
+            before + 1,
+            "a selector/target mismatch is counted as protocol-invalid input"
+        );
+        // No other refusal class is touched — this is not an authority failure.
+        assert_eq!(SensingCounters::get(&counters.org_audience_mismatch), 0);
+        assert_eq!(SensingCounters::get(&counters.org_foreign_org), 0);
+        assert_eq!(SensingCounters::get(&counters.org_cert_invalid), 0);
+        assert_eq!(SensingCounters::get(&counters.org_authority_unavailable), 0);
+    }
+
+    /// Position in the locked order: the comparison is a pure function of two
+    /// values the frame already carries, so it must run BEFORE any authority,
+    /// signature, floor or audience work — and therefore before any effect. A
+    /// frame that is simultaneously selector-incoherent and unauthorized is
+    /// refused for the selector, proving nothing authority-shaped ran first.
+    #[test]
+    fn the_selector_target_check_precedes_every_other_authority_refusal() {
+        // (a) no authority installed at all: without step 2a this is
+        //     `MissingAuthority`.
+        let frame = provider_frame_with(
+            ProviderSelector::Node(0x77),
+            0x88,
+            org_commit(),
+            cert_gen(5),
+        );
+        assert_eq!(
+            run(&frame, &member(), None, &empty_floors()),
+            Err(OrgSensingRejection::SelectorTargetMismatch),
+            "step 2a precedes the installed-authority requirement"
+        );
+        // (b) a foreign organization's certificate: without step 2a this is
+        //     `ForeignOrg`.
+        let foreign_kp = OrgKeypair::from_bytes([0x77u8; 32]);
+        let foreign_cert =
+            OrgMembershipCert::try_issue(&foreign_kp, member(), 1, ORG_CERT_TTL_SECS_RECOMMENDED)
+                .expect("issue foreign cert");
+        let foreign = provider_frame_with(
+            ProviderSelector::Node(0x77),
+            0x88,
+            canonical_org_sensing_commitment(&foreign_kp.org_id()),
+            foreign_cert,
+        );
+        assert_eq!(
+            run(&foreign, &member(), Some(authority()), &empty_floors()),
+            Err(OrgSensingRejection::SelectorTargetMismatch),
+            "step 2a precedes the owner-org comparison"
+        );
+        // (c) a floored certificate: without step 2a this is `BelowFloor`.
+        let floors = floors_at(org_kp().org_id(), member(), 9);
+        assert_eq!(
+            run(&frame, &member(), Some(authority()), &floors),
+            Err(OrgSensingRejection::SelectorTargetMismatch),
+            "step 2a precedes the revocation floor"
+        );
+        // Control: with the selector coherent, each of those refusals is the
+        // one that actually fires — step 2a adds no false positives.
+        let ok = provider_frame_with(
+            ProviderSelector::Node(0x77),
+            0x77,
+            org_commit(),
+            cert_gen(5),
+        );
+        assert_eq!(
+            run(&ok, &member(), None, &empty_floors()),
+            Err(OrgSensingRejection::MissingAuthority)
+        );
+        assert_eq!(
+            run(&ok, &member(), Some(authority()), &floors),
+            Err(OrgSensingRejection::BelowFloor)
+        );
+    }
+
+    /// The coherent shape is still admitted, and the spec survives the gate
+    /// unchanged — step 2a is a refusal, never a rewrite.
+    #[test]
+    fn an_exact_selector_naming_the_target_is_admitted_unchanged() {
+        const TARGET: u64 = 0x5EED;
+        let frame = provider_frame_with(
+            ProviderSelector::Node(TARGET),
+            TARGET,
+            org_commit(),
+            cert_gen(5),
+        );
+        let validated =
+            run(&frame, &member(), Some(authority()), &empty_floors()).expect("admitted");
+        match &validated.0 {
+            ValidatedInner::Provider { spec, target, .. } => {
+                assert_eq!(*target, TARGET);
+                assert!(
+                    matches!(spec.providers, ProviderSelector::Node(n) if n == TARGET),
+                    "the selector reaches the admitted object verbatim"
+                );
+            }
+            _ => panic!("expected a provider registration"),
+        }
+    }
+
+    /// Round trip: a frame the org planner itself emits is admitted by the
+    /// gate with no modification, and specifically satisfies the new step 2a.
+    /// This is the coupling guard — the producer and the checker agree on the
+    /// exact shape, so tightening intake cannot orphan our own egress.
+    #[test]
+    fn an_emitted_local_org_frame_passes_the_intake_gate_unmodified() {
+        const TARGET: u64 = 0x77;
+        let seed = org_admitted(EntityId::from_bytes([0xCCu8; 32]));
+        let admitted = seed.provider_continuation(TARGET, D, TTL);
+        let (relay_entity, relay_authority, store) = adopt_relay("gate-round-trip", 1);
+        let membership = capture_relay(
+            Some(relay_authority),
+            Some(store),
+            &relay_entity,
+            org_kp().org_id(),
+            now_secs(),
+        )
+        .expect("relay membership");
+        let frame = plan_provider_continuation(&admitted, |_| Some(membership))
+            .expect("org continuation frame");
+        // The emitted frame is fed to the gate byte-for-byte as planned.
+        let validated = run(&frame, &relay_entity, Some(authority()), &empty_floors())
+            .expect("the planner's own frame must be admitted by the gate");
+        match &validated.0 {
+            ValidatedInner::Provider { spec, target, .. } => {
+                assert_eq!(*target, TARGET);
+                assert_eq!(
+                    spec,
+                    admitted.spec(),
+                    "the admitted spec equals the planned spec"
+                );
+            }
+            _ => panic!("expected a provider registration"),
+        }
     }
 }
