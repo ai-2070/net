@@ -200,7 +200,9 @@ opaque authority-epoch comparison:
 
 7. the hot path is an `ArcSwap` load of a **change-driven immutable
    `OrgRouteSet`** — no rediscovery, candidate scan, observation scan, sort,
-   interest reconciliation, or registration wait (§7). *(Scoped 2026-08-30:
+   interest reconciliation, or registration wait (§7). *(Scoped 2026-08-30: the
+   sort clause is likewise the UNSENSED track; a sensed call adds one stable
+   class-ordering pass, D7.2.)* *(Scoped 2026-08-30:
    the observation-scan clause is the UNSENSED/cold path. A sensed OA-6 call
    adds exactly one bounded `sensing_observations` section over the already
    authorized SameOrg population — `<= 32` lookups, never a full or unbounded
@@ -211,7 +213,12 @@ opaque authority-epoch comparison:
 8. the per-call contract is route-set load, authority-epoch comparison,
    temporal window recheck, P2C sample, proof, dispatch — all O(1) (§7);
 9. per-request sorting of Ready candidates is prohibited; the fallback
-   vector is sorted once at rebuild (§9);
+   vector is sorted once at rebuild (§9). *(Scoped 2026-08-30: this is the
+   UNSENSED warmed-pool track. A sensed organization-audience call performs one
+   stable class-ordering pass over `<= 32` already-authorized candidates — see
+   §14 and the design's D7.2. The prohibition on re-sorting a Ready pool per
+   request stands; a stable permutation of an already-sorted authorized list is
+   not that.)*;
 10. exact-provider fan-out is hard-bounded (32 sensed providers per
     capability, 64 retained authority-scoped route demands per
     `OrgRoutingState` clone family) with deterministic truncation and
@@ -2000,7 +2007,11 @@ For same-org candidates:
   degradation at either cap;
 - add generation-stamped, `ArcSwap`-published `OrgRouteSet` projection. Calls
   only read. Independent client families reuse the node's same capability
-  discovery/sensing/route base facts; final caller/grant narrowing remains local;
+  discovery/route base facts; final caller/grant narrowing remains local.
+  *(Scoped 2026-08-30: this route-set projection is the ROUTE/authority artifact.
+  It is **not** the readiness source for organization-audience exact sensing —
+  that design publishes no sensing facts at all and reads observations per call.
+  See the reconciliation bullet below.)*;
 - add coherent `OrgAuthorityEpoch` publication and mandatory per-call comparison.
   On mismatch, never use the route set; run the current-authority slow plan or
   fail locally before proof/send;
@@ -2016,9 +2027,30 @@ For same-org candidates:
   lease. The node routing actor rebuilds immutable route sets; the lease refresh
   actor keeps wire registrations alive. Never give each client family a refresh
   loop;
-- join observations via `sensed_candidates` with the authorized
-  population as `resolved_population` (projection-stage clamp) —
-  inside the node routing actor, never on the request path;
+- **superseded for exact sensing (2026-08-30).** This bullet specified joining
+  observations via `sensed_candidates` with the authorized population as
+  `resolved_population` **inside the node routing actor, never on the request
+  path**. The authorized exact-sensing design does **not** work that way and this
+  clause does not describe it:
+    - there is **no** `ArcSwap`-published sensing-facts artifact and **no**
+      routing-actor observation join for this slice — both were withdrawn as
+      unimplementable;
+    - a **sensed** OA-6 call performs **exactly one bounded per-call snapshot**
+      of at most 32 already-authorized SameOrg observation rows, on the request
+      path, under one `sensing_observations` section;
+    - the observation lock is **released before** route estimation,
+      request-relative budget classification, the stable class-ordering pass,
+      proof mint, and any `.await`/I/O;
+    - the mixed SameOrg/`Granted` list then receives the defined **stable
+      class-ordering pass**; `Granted` candidates are never sensed and never
+      pruned;
+    - ordinary **unsensed and cold** behavior is unchanged, and the warmed
+      route-set pool above remains valid for it.
+  A warmed observation pool may be revisited later as a **separate** optimization,
+  but it cannot contradict this boundary. See
+  [`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md)
+  D6.4 (the snapshot), D6.5 (phase order), D7.2 (the ordering pass) and D6.8
+  (the divergence record);
 - classify per §8 (evidence layer + projection layer);
 - make granted candidates Unknown/Potential unconditionally;
 - pin the tag↔CapabilityId mapping for `nrpc:<service>`.
@@ -2122,9 +2154,14 @@ Exit witnesses:
 
 - one candidate; two candidates; more than two candidates;
 - the two sampled indices are distinct;
-- the warmed selection performs exactly two candidate cost loads and
-  one cost comparison — plus an EntityId comparison only on an exact
-  tie — and no sort (instrumented witness);
+- the warmed **unsensed** selection performs exactly two candidate cost loads
+  and one cost comparison — plus an EntityId comparison only on an exact
+  tie — and no sort (instrumented witness). *(Scoped 2026-08-30: the P2C sampler
+  and its no-sort witness belong to this unsensed warmed-pool track. The
+  organization-audience exact-sensing path does **not** use P2C: it performs the
+  per-call snapshot of D6.4 followed by the stable class-ordering pass of D7.2,
+  and its own witnesses are W-36..W-41 and W-43..W-47. Neither claim is asserted
+  of the other path.)*;
 - lower cost wins the sampled comparison;
 - ties resolve by EntityId;
 - fixed seed + nonce reproduce the selection exactly;
@@ -2241,10 +2278,15 @@ The plan is complete when all are true:
       budget classification and ranking performed entirely OFF that
       lock. It performs **no full, global or unbounded scan** and **no
       second aggregate/detail scan** — one section, one pass. Every
-      other clause of the row above still holds on the sensed path:
-      no scoped-store query, no candidate revalidation, no sort of the
-      authorized list, no interest reconciliation, no registration
-      emission, no registration wait. *(Reconciled 2026-08-30; see
+      other clause of the row above still holds on the sensed path
+      EXCEPT ordering: no scoped-store query, no candidate
+      revalidation, no interest reconciliation, no registration
+      emission, no registration wait. **Ordering differs by design** —
+      a sensed call performs exactly ONE stable class-ordering pass
+      over the `<= 32` already-authorized candidates (design D7.2
+      step 3), leaving `call.rs:758`'s global sort intact as the
+      tie-break of record. That pass is a stable permutation, not a
+      re-sort and not a second sort. *(Reconciled 2026-08-30; see
       [`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md)
       D6.4 for the mechanism and D6.8 for the divergence record.)*
 - [ ] Route sets are immutable, change-driven, single-flight rebuilt,
@@ -2276,7 +2318,9 @@ The plan is complete when all are true:
       deterministic truncation observable via
       `org_sensing_truncated_total`.
 - [ ] `OrgClient`'s internals are exactly: maintain candidates,
-      maintain leases, project route sets, select — no retry queues,
+      maintain leases, project route sets, select — and, on the sensed
+      path only, one per-call observation snapshot plus one stable
+      class-ordering pass (design D6.4/D7.2) — no retry queues,
       weights, EWMA, breakers, sticky sessions, probing, or policy
       configuration.
 - [ ] Viable is preferred over Potential; Potential remains eligible.
@@ -2293,7 +2337,23 @@ The plan is complete when all are true:
       `non_viable`, and is pinned in the regenerated X1 fixture across
       all four binding suites.
 - [ ] The P2C sampler contract (seed + nonce) is pinned, reproducible
-      under a fixed seed, and non-stampeding.
+      under a fixed seed, and non-stampeding — on the **unsensed
+      warmed-pool** track. *(Scoped 2026-08-30: the organization-audience
+      exact-sensing path does not use P2C; it uses the per-call snapshot
+      of design D6.4 plus the stable class-ordering pass of D7.2. This
+      gate is not asserted of that path, and that path's ordering is not
+      asserted of this gate.)*
+- [ ] (exact sensing) A sensed OA-6 call performs exactly ONE bounded
+      `sensing_observations` critical section over the already
+      authorized SameOrg population (`<= 32` rows), and releases that
+      lock **before** route estimation, request-relative budget
+      classification, the stable class-ordering pass, proof mint, and
+      any `.await`/I/O. No `ArcSwap`-published sensing artifact and no
+      routing-actor observation join exist for this slice.
+- [ ] (exact sensing) The mixed SameOrg/`Granted` list receives the
+      defined stable class-ordering pass; `Granted` candidates are
+      never sensed and never pruned; the existing global sort remains
+      the tie-break of record.
 - [ ] Selection produces one exact provider.
 - [ ] Invocation still constructs canonical `OrgProofIntent`
       (nine fields unchanged).
