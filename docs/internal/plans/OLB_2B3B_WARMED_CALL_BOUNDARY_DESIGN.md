@@ -855,8 +855,9 @@ bucket permutation** over the **complete** authorized candidate list — three
 buckets concatenated, `O(C * S)` where `S <= 32` is the **sensed observation-row**
 count and `C` is the complete authorized candidate count, **which is NOT bounded
 by 32** (excess SameOrg providers survive as unsensed `Unknown` fallback and every
-`Granted` candidate is in the list). Two passes, so at most `2 * S` comparisons per
-candidate. **No comparator over `C`, no `sort_by`, no P2C** (that design's D7.2).
+`Granted` candidate is in the list). At most `S + 1` traversals of the complete
+list — step 2 traverses it once per sensed `ranked` entry, step 3 once — and at
+most `2 * S` equality comparisons per candidate. **No comparator over `C`, no `sort_by`, no P2C** (that design's D7.2).
 The existing global sort is untouched and remains the tie-break of record; **no
 comparison sort is added over the complete candidate list**. Sorts *inside* the
 bounded sensing projection helper already exist and are unchanged
