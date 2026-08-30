@@ -345,9 +345,11 @@ pub fn validate_interest_constraints(
 /// superseded registration and can never alias a later one. Node-local
 /// and never on the wire.
 ///
-/// Public only because the SDK's provider handle must hold one across
-/// the crate boundary; it is opaque by construction — no constructor,
-/// no accessor, no ordering.
+/// Unstable, workspace-internal SDK bridge; not supported core API.
+/// Public only because `net-mesh-sdk` is a separate crate and its
+/// provider handle must hold one across the crate boundary. Opaque by
+/// construction — no constructor, no accessor, no ordering.
+#[doc(hidden)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct EvaluatorRegistrationId(u64);
 
@@ -371,6 +373,11 @@ const MAX_REGISTRATION_ID: u64 = u64::MAX - 1;
 /// there could only report a new refusal under a wrong name. Exhaustive
 /// means adding a variant is a compile error at the one place that has
 /// to decide how to report it.
+///
+/// Unstable, workspace-internal SDK bridge; not supported core API.
+/// Public only because `net-mesh-sdk` is a separate crate — the
+/// supported refusals are `net_sdk::sensing::SensingError` variants.
+#[doc(hidden)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EvaluatorInstallRefusal {
     /// A live registration already serves this capability. Only a
@@ -457,9 +464,47 @@ pub(crate) struct ReadinessEvaluators {
     /// Next id to issue, or `u64::MAX` once exhausted. Never wraps.
     next_id: AtomicU64,
     commit_mu: parking_lot::Mutex<()>,
+    /// Fixtures-only contention observer, mirroring the node's
+    /// `sensing_projection_contention_hook`: invoked by an ownership
+    /// transition when its `try_lock` on `commit_mu` observes the mutex
+    /// HELD, before falling back to the blocking `lock()`.
+    ///
+    /// The concurrency witnesses wait on this signal, so "the rival
+    /// reached the real ownership-mutex boundary and found it held" is
+    /// proved by actual observed contention rather than by a
+    /// scheduler-dependent timeout. Absent from production builds.
+    #[cfg(any(test, feature = "fixtures"))]
+    contention_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl ReadinessEvaluators {
+    /// Enter the ownership section, acknowledging observed contention.
+    ///
+    /// Try-then-block so the fixtures-only observer fires ONLY after a
+    /// `try_lock` actually found the mutex held — never on the
+    /// uncontended fast path. Production is a plain `lock()`.
+    fn acquire_commit(&self) -> parking_lot::MutexGuard<'_, ()> {
+        match self.commit_mu.try_lock() {
+            Some(guard) => guard,
+            None => {
+                #[cfg(any(test, feature = "fixtures"))]
+                {
+                    let hook = self.contention_hook.lock().clone();
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                }
+                self.commit_mu.lock()
+            }
+        }
+    }
+
+    /// Install (or clear) the fixtures-only contention observer.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub(crate) fn set_contention_hook_for_test(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self.contention_hook.lock() = hook;
+    }
+
     /// Issue the next id, or `None` once the space is exhausted.
     ///
     /// Checked and non-reusing: the counter saturates at the reserved
@@ -498,21 +543,34 @@ impl ReadinessEvaluators {
         capability_id: CapabilityId,
         evaluator: Arc<dyn ReadinessEvaluator + Send + Sync>,
     ) -> Result<EvaluatorRegistrationId, EvaluatorInstallRefusal> {
-        let _commit = self.commit_mu.lock();
-        if self.slots.contains_key(&capability_id) {
-            return Err(EvaluatorInstallRefusal::Occupied);
-        }
-        let registration_id = self
-            .mint()
-            .ok_or(EvaluatorInstallRefusal::IdentityExhausted)?;
-        self.slots.insert(
-            capability_id,
-            EvaluatorSlot {
-                registration_id,
-                evaluator,
-            },
-        );
-        Ok(registration_id)
+        // Nothing should be displaced on a vacancy-required install, but
+        // the value is carried out of the section anyway: if that
+        // invariant ever broke, dropping a user evaluator under the
+        // ownership mutex could deadlock (see `install_replacing`).
+        let mut displaced: Option<EvaluatorSlot> = None;
+        let outcome = {
+            let _commit = self.acquire_commit();
+            if self.slots.contains_key(&capability_id) {
+                Err(EvaluatorInstallRefusal::Occupied)
+            } else {
+                match self.mint() {
+                    None => Err(EvaluatorInstallRefusal::IdentityExhausted),
+                    Some(registration_id) => {
+                        displaced = self.slots.insert(
+                            capability_id,
+                            EvaluatorSlot {
+                                registration_id,
+                                evaluator,
+                            },
+                        );
+                        Ok(registration_id)
+                    }
+                }
+            }
+        };
+        // Section released. Any user `Drop` may run now.
+        drop(displaced);
+        outcome
     }
 
     /// Install an evaluator, EXPLICITLY superseding any incumbent.
@@ -526,23 +584,40 @@ impl ReadinessEvaluators {
     /// [`EvaluatorInstallRefusal::IdentityExhausted`] — on which the
     /// incumbent keeps serving, because superseding it with an
     /// un-ownable registration would be strictly worse than refusing.
+    ///
+    /// **The displaced evaluator is dropped OUTSIDE the section.** The
+    /// map mutation is fully serialized under `commit_mu`, but the
+    /// superseded slot is moved out as a value and only released after
+    /// the guard is. Its `Drop` is arbitrary user code — it may
+    /// legitimately call back into provide/replace/close — and
+    /// `commit_mu` is not reentrant, so dropping it under the guard
+    /// would deadlock the node.
     pub(crate) fn install_replacing(
         &self,
         capability_id: CapabilityId,
         evaluator: Arc<dyn ReadinessEvaluator + Send + Sync>,
     ) -> Result<EvaluatorRegistrationId, EvaluatorInstallRefusal> {
-        let _commit = self.commit_mu.lock();
-        let registration_id = self
-            .mint()
-            .ok_or(EvaluatorInstallRefusal::IdentityExhausted)?;
-        self.slots.insert(
-            capability_id,
-            EvaluatorSlot {
-                registration_id,
-                evaluator,
-            },
-        );
-        Ok(registration_id)
+        let mut displaced: Option<EvaluatorSlot> = None;
+        let outcome = {
+            let _commit = self.acquire_commit();
+            match self.mint() {
+                None => Err(EvaluatorInstallRefusal::IdentityExhausted),
+                Some(registration_id) => {
+                    displaced = self.slots.insert(
+                        capability_id,
+                        EvaluatorSlot {
+                            registration_id,
+                            evaluator,
+                        },
+                    );
+                    Ok(registration_id)
+                }
+            }
+        };
+        // Section released — the superseded evaluator's `Drop` runs here,
+        // where it may re-enter the lifecycle freely.
+        drop(displaced);
+        outcome
     }
 
     /// Remove the capability's evaluator ONLY if `registration_id` is
@@ -552,17 +627,26 @@ impl ReadinessEvaluators {
     /// once per registration, so a stale handle's drop is a pure no-op.
     /// Remains available after identity exhaustion: a node that can no
     /// longer install must still be able to stop serving.
+    ///
+    /// **The removed evaluator is dropped OUTSIDE the section**, for the
+    /// same reason as [`Self::install_replacing`]: a user `Drop` that
+    /// re-enters the lifecycle must not meet a held, non-reentrant
+    /// mutex.
     pub(crate) fn remove_if_current(
         &self,
         capability_id: &CapabilityId,
         registration_id: EvaluatorRegistrationId,
     ) -> bool {
-        let _commit = self.commit_mu.lock();
-        self.slots
-            .remove_if(capability_id, |_, slot| {
+        let removed = {
+            let _commit = self.acquire_commit();
+            self.slots.remove_if(capability_id, |_, slot| {
                 slot.registration_id == registration_id
             })
-            .is_some()
+        };
+        let performed_removal = removed.is_some();
+        // Section released — the removed evaluator's `Drop` runs here.
+        drop(removed);
+        performed_removal
     }
 
     /// The capability's installed registration and its evaluator.
@@ -608,7 +692,7 @@ impl ReadinessEvaluators {
         capability_id: &CapabilityId,
         evaluated_under: Option<EvaluatorRegistrationId>,
     ) -> Option<EvaluationCommit<'_>> {
-        let guard = self.commit_mu.lock();
+        let guard = self.acquire_commit();
         let current = self
             .slots
             .get(capability_id)
@@ -629,7 +713,7 @@ impl ReadinessEvaluators {
         registration_id: EvaluatorRegistrationId,
         poke: impl FnOnce() -> R,
     ) -> R {
-        let _commit = self.commit_mu.lock();
+        let _commit = self.acquire_commit();
         let current = self
             .slots
             .get(capability_id)
@@ -1100,20 +1184,35 @@ mod tests {
         assert_eq!(pokes.load(Ordering::Relaxed), 2);
     }
 
-    /// How long a mutual-exclusion witness holds its section. The
-    /// contended operation it races against is a single map insert —
-    /// microseconds — so this is many orders of magnitude of slack, and
-    /// the assertion is about a happens-before the mutex guarantees.
-    const HOLD: Duration = Duration::from_millis(50);
+    /// Bounded wait for an acknowledgement flag. Never unbounded: a
+    /// missing acknowledgement is a named FAILURE, not a hang.
+    fn await_ack(flag: &AtomicBool, label: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !flag.load(Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{label} was never acknowledged within 10s",
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    /// Supplementary non-completion window, used ONLY after the
+    /// acquisition boundary has already been acknowledged. The
+    /// load-bearing proof is the acknowledgement; this only adds "and it
+    /// still had not completed".
+    const SETTLE: Duration = Duration::from_millis(50);
 
     /// **The check-then-publish witness.** A rival install must not be
     /// able to complete while a publication holds its commit section.
     ///
-    /// This is what distinguishes a real fence from "test currentness,
-    /// drop the guard, then publish": under check-then-publish the rival
-    /// takes only the map's own shard lock and finishes immediately, so
-    /// a result computed under the old registration would land after the
-    /// replacement had already returned.
+    /// The proof is an EXACT acknowledgement, not a timeout: the
+    /// registry's contention observer fires only when a transition's
+    /// `try_lock` on the ownership mutex actually finds it HELD. So the
+    /// witness knows the rival reached the real mutex boundary and was
+    /// blocked there. Under check-then-publish the rival's `try_lock`
+    /// would SUCCEED, the observer would never fire, and the test fails
+    /// on the acknowledgement rather than on scheduling luck.
     ///
     /// Fails against: `begin_commit` that returns no guard, or a guard
     /// that does not exclude install/replace/remove.
@@ -1125,8 +1224,12 @@ mod tests {
             .install_vacant(capability.clone(), Arc::new(MarkerEvaluator { marker: 1 }))
             .expect("vacant install");
 
-        let rival_running = Arc::new(AtomicBool::new(false));
+        let contended = Arc::new(AtomicBool::new(false));
         let rival_done = Arc::new(AtomicBool::new(false));
+        evaluators.set_contention_hook_for_test(Some({
+            let contended = Arc::clone(&contended);
+            Arc::new(move || contended.store(true, Ordering::Release))
+        }));
 
         let commit = evaluators
             .begin_commit(&capability, Some(id))
@@ -1135,10 +1238,8 @@ mod tests {
         let rival = {
             let evaluators = Arc::clone(&evaluators);
             let capability = capability.clone();
-            let rival_running = Arc::clone(&rival_running);
             let rival_done = Arc::clone(&rival_done);
             std::thread::spawn(move || {
-                rival_running.store(true, Ordering::Release);
                 evaluators
                     .install_replacing(capability, Arc::new(MarkerEvaluator { marker: 2 }))
                     .expect("replacement install");
@@ -1146,17 +1247,19 @@ mod tests {
             })
         };
 
-        while !rival_running.load(Ordering::Acquire) {
-            std::thread::yield_now();
-        }
-        std::thread::sleep(HOLD);
+        // (1) the rival reached the REAL ownership-mutex boundary and
+        // found it held.
+        await_ack(
+            &contended,
+            "the rival's arrival at the held ownership mutex",
+        );
+        // (2) supplementary: it still has not completed.
+        std::thread::sleep(SETTLE);
         assert!(
             !rival_done.load(Ordering::Acquire),
-            "a rival install completed while a publication held the commit section — \
-             the section is not mutually exclusive with ownership transfer",
+            "a rival install completed while a publication held the commit section",
         );
-        // The publication's own view is still the one it was admitted
-        // under, for the whole section.
+        // (3) the publication's view is unchanged for the whole section.
         assert_eq!(marker(&evaluators, &capability), Some(1));
 
         drop(commit);
@@ -1167,14 +1270,17 @@ mod tests {
             evaluators.begin_commit(&capability, Some(id)).is_none(),
             "the old registration is non-current once the rival completed",
         );
+        evaluators.set_contention_hook_for_test(None);
     }
 
     /// **The check-then-poke witness.** Same property on the state-edge
-    /// seam: a rival install must not complete while a poke is running.
+    /// seam, with the same exact acknowledgement: a rival install must
+    /// not complete while a poke is running, and must be observed
+    /// blocked at the real mutex boundary.
     ///
     /// Under check-then-poke (test the id under the lock, release, then
-    /// poke) the rival finishes first and the poke lands on a schedule
-    /// the caller no longer owns.
+    /// poke) the rival's `try_lock` succeeds, so the contention observer
+    /// never fires and the poke's own assertion fails.
     ///
     /// Fails against: `poke_if_current` that releases the section before
     /// running the poke.
@@ -1186,38 +1292,39 @@ mod tests {
             .install_vacant(capability.clone(), Arc::new(MarkerEvaluator { marker: 1 }))
             .expect("vacant install");
 
-        let rival_running = Arc::new(AtomicBool::new(false));
+        let contended = Arc::new(AtomicBool::new(false));
         let rival_done = Arc::new(AtomicBool::new(false));
         let poked = Arc::new(AtomicU64::new(0));
+        let rival_start = Arc::new(AtomicBool::new(false));
+        evaluators.set_contention_hook_for_test(Some({
+            let contended = Arc::clone(&contended);
+            Arc::new(move || contended.store(true, Ordering::Release))
+        }));
 
         let rival = {
             let evaluators = Arc::clone(&evaluators);
             let capability = capability.clone();
-            let rival_running = Arc::clone(&rival_running);
             let rival_done = Arc::clone(&rival_done);
-            let start = Arc::new(AtomicBool::new(false));
-            let start_for_poke = Arc::clone(&start);
-            let handle = std::thread::spawn(move || {
-                while !start.load(Ordering::Acquire) {
-                    std::thread::yield_now();
-                }
-                rival_running.store(true, Ordering::Release);
+            let rival_start = Arc::clone(&rival_start);
+            std::thread::spawn(move || {
+                await_ack(&rival_start, "the poke's request to start the rival");
                 evaluators
                     .install_replacing(capability, Arc::new(MarkerEvaluator { marker: 2 }))
                     .expect("replacement install");
                 rival_done.store(true, Ordering::Release);
-            });
-            (handle, start_for_poke)
+            })
         };
-        let (rival_handle, rival_start) = rival;
 
         let ran = evaluators.poke_if_current(&capability, id, || {
             poked.fetch_add(1, Ordering::Relaxed);
             rival_start.store(true, Ordering::Release);
-            while !rival_running.load(Ordering::Acquire) {
-                std::thread::yield_now();
-            }
-            std::thread::sleep(HOLD);
+            // The rival must be observed BLOCKED at the real mutex, which
+            // can only happen if this poke is running inside the section.
+            await_ack(
+                &contended,
+                "the rival's arrival at the held ownership mutex during a poke",
+            );
+            std::thread::sleep(SETTLE);
             assert!(
                 !rival_done.load(Ordering::Acquire),
                 "a rival install completed while a poke held the commit section — \
@@ -1228,11 +1335,241 @@ mod tests {
 
         assert!(ran, "the installed registration's poke must run");
         assert_eq!(poked.load(Ordering::Relaxed), 1);
-        rival_handle.join().expect("rival thread");
+        rival.join().expect("rival thread");
 
         // Ownership has transferred, and the old id is now inert.
         assert!(!evaluators.poke_if_current(&capability, id, || true));
         assert_eq!(poked.load(Ordering::Relaxed), 1);
+        evaluators.set_contention_hook_for_test(None);
+    }
+
+    // ---------------------------------------------------------------
+    // User destructors never run under the ownership mutex (H7)
+    // ---------------------------------------------------------------
+
+    /// An evaluator whose DESTRUCTOR re-enters the real lifecycle.
+    ///
+    /// This is legitimate user code: an integration may perfectly well
+    /// tear down a sibling capability's registration when its own
+    /// evaluator is dropped. `commit_mu` is not reentrant, so if a
+    /// displaced or removed slot were dropped while the ownership
+    /// section were held, this destructor would deadlock the node.
+    struct ReentrantOnDrop {
+        registry: Arc<ReadinessEvaluators>,
+        /// Sibling capability this destructor installs into, proving the
+        /// re-entry really reached the lifecycle rather than bailing out.
+        sibling: CapabilityId,
+        /// Set once the destructor has completed its re-entrant call.
+        completed: Arc<AtomicBool>,
+    }
+
+    impl ReadinessEvaluator for ReentrantOnDrop {
+        fn evaluate(&self, _request: &EvaluationRequest<'_>) -> ReadinessEvaluation {
+            ReadinessEvaluation::NotReady { reason: 1 }
+        }
+    }
+
+    impl Drop for ReentrantOnDrop {
+        fn drop(&mut self) {
+            // Re-enter the ownership path. If the caller still held
+            // `commit_mu`, this blocks forever.
+            let _ = self.registry.install_replacing(
+                self.sibling.clone(),
+                Arc::new(MarkerEvaluator { marker: 77 }),
+            );
+            self.completed.store(true, Ordering::Release);
+        }
+    }
+
+    /// Bounded completion for the reentrancy witnesses.
+    ///
+    /// Deliberately not an unbounded hang: the operation runs on its own
+    /// thread and the witness fails with a named assertion if it has not
+    /// finished, so a deadlock is a test FAILURE rather than a job that
+    /// eats its timeout.
+    fn run_bounded(label: &str, body: impl FnOnce() + Send + 'static) {
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            body();
+            // A send failure means the receiver already gave up; the
+            // assertion below is what reports it.
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .is_ok(),
+            "{label} did not return within 10s — a user destructor almost \
+             certainly deadlocked on the ownership mutex",
+        );
+        handle.join().expect("worker thread");
+    }
+
+    /// **Inverse witness: dropping the displaced slot under
+    /// `commit_mu`.**
+    ///
+    /// A replacement displaces an evaluator whose destructor re-enters
+    /// `install_replacing`. The replacement must RETURN, the destructor
+    /// must complete its re-entrant call, and the resulting ownership
+    /// state must be exactly as specified.
+    #[test]
+    fn a_replacement_does_not_drop_the_displaced_evaluator_under_the_section() {
+        let registry = Arc::new(ReadinessEvaluators::default());
+        let capability = CapabilityId::new("gpu.infer");
+        let sibling = CapabilityId::new("print.document");
+        let completed = Arc::new(AtomicBool::new(false));
+
+        let displaced_id = registry
+            .install_vacant(
+                capability.clone(),
+                Arc::new(ReentrantOnDrop {
+                    registry: Arc::clone(&registry),
+                    sibling: sibling.clone(),
+                    completed: Arc::clone(&completed),
+                }),
+            )
+            .expect("vacant install");
+
+        let successor_id = {
+            let registry = Arc::clone(&registry);
+            let capability = capability.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            run_bounded(
+                "install_replacing over a reentrant-drop evaluator",
+                move || {
+                    let id = registry
+                        .install_replacing(capability, Arc::new(MarkerEvaluator { marker: 9 }))
+                        .expect("replacement install");
+                    let _ = tx.send(id);
+                },
+            );
+            rx.recv().expect("replacement id")
+        };
+
+        assert!(
+            completed.load(Ordering::Acquire),
+            "the displaced evaluator's destructor never ran its re-entrant call",
+        );
+
+        // Ownership state, stated explicitly.
+        assert!(registry.is_current(&capability, successor_id));
+        assert!(!registry.is_current(&capability, displaced_id));
+        assert_eq!(marker(&registry, &capability), Some(9));
+        // The destructor's own re-entrant install really landed.
+        assert_eq!(marker(&registry, &sibling), Some(77));
+        assert_eq!(registry.len(), 2);
+        // And the section is usable again afterwards.
+        assert!(registry
+            .begin_commit(&capability, Some(successor_id))
+            .is_some());
+    }
+
+    /// **Inverse witness: dropping the removed slot under `commit_mu`.**
+    ///
+    /// The same property on the removal edge: `remove_if_current` must
+    /// return, the destructor must complete, and the capability must end
+    /// up unserved.
+    #[test]
+    fn a_removal_does_not_drop_the_removed_evaluator_under_the_section() {
+        let registry = Arc::new(ReadinessEvaluators::default());
+        let capability = CapabilityId::new("gpu.infer");
+        let sibling = CapabilityId::new("print.document");
+        let completed = Arc::new(AtomicBool::new(false));
+
+        let id = registry
+            .install_vacant(
+                capability.clone(),
+                Arc::new(ReentrantOnDrop {
+                    registry: Arc::clone(&registry),
+                    sibling: sibling.clone(),
+                    completed: Arc::clone(&completed),
+                }),
+            )
+            .expect("vacant install");
+
+        let removed = {
+            let registry = Arc::clone(&registry);
+            let capability = capability.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            run_bounded(
+                "remove_if_current over a reentrant-drop evaluator",
+                move || {
+                    let removed = registry.remove_if_current(&capability, id);
+                    let _ = tx.send(removed);
+                },
+            );
+            rx.recv().expect("removal outcome")
+        };
+
+        assert!(removed, "the live registration must be removed");
+        assert!(
+            completed.load(Ordering::Acquire),
+            "the removed evaluator's destructor never ran its re-entrant call",
+        );
+
+        // Ownership state, stated explicitly: the capability is unserved,
+        // the stale id is inert, and the destructor's sibling install
+        // landed.
+        assert!(registry.installed(&capability).is_none());
+        assert!(!registry.remove_if_current(&capability, id));
+        assert_eq!(marker(&registry, &sibling), Some(77));
+        assert_eq!(registry.len(), 1);
+        // A fresh registration can take the vacated capability.
+        let successor = registry
+            .install_vacant(capability.clone(), Arc::new(MarkerEvaluator { marker: 3 }))
+            .expect("vacated install");
+        assert_ne!(successor, id);
+    }
+
+    /// The same guarantee for the LAST reference held by the emitter.
+    ///
+    /// `installed()` hands out an `Arc` clone; if a close then removes
+    /// the registry's copy, the emitter's clone is the final one and its
+    /// `Drop` runs wherever the emitter drops it — which must be outside
+    /// any section. Here the registry's own drop order is checked: the
+    /// clone outlives `remove_if_current`, so the destructor runs at the
+    /// end of this test, not inside the removal.
+    #[test]
+    fn a_removal_leaves_a_live_arc_clone_to_drop_outside_the_section() {
+        let registry = Arc::new(ReadinessEvaluators::default());
+        let capability = CapabilityId::new("gpu.infer");
+        let sibling = CapabilityId::new("print.document");
+        let completed = Arc::new(AtomicBool::new(false));
+
+        let id = registry
+            .install_vacant(
+                capability.clone(),
+                Arc::new(ReentrantOnDrop {
+                    registry: Arc::clone(&registry),
+                    sibling: sibling.clone(),
+                    completed: Arc::clone(&completed),
+                }),
+            )
+            .expect("vacant install");
+        // The emitter's snapshot: a live clone across the removal.
+        let (snapshot_id, snapshot) = registry.installed(&capability).expect("installed");
+        assert_eq!(snapshot_id, id);
+
+        run_bounded("remove_if_current with a live Arc clone outstanding", {
+            let registry = Arc::clone(&registry);
+            let capability = capability.clone();
+            move || {
+                assert!(registry.remove_if_current(&capability, id));
+            }
+        });
+        assert!(
+            !completed.load(Ordering::Acquire),
+            "the destructor must NOT have run yet — the emitter's clone is still live",
+        );
+
+        // Releasing the last clone runs the destructor here, with no
+        // section held, and its re-entrant install succeeds.
+        drop(snapshot);
+        assert!(
+            completed.load(Ordering::Acquire),
+            "releasing the final clone must run the destructor",
+        );
+        assert_eq!(marker(&registry, &sibling), Some(77));
     }
 
     // ---------------------------------------------------------------
@@ -1383,12 +1720,16 @@ mod tests {
     // Public-surface guard (H4)
     // ---------------------------------------------------------------
 
-    /// The supported cross-crate surface of this module is exactly the
-    /// opaque registration id and its install refusal — plus the
-    /// pre-existing frozen evaluator contract. The registry, its
-    /// storage, its mutation methods, and the publication fence must
-    /// stay crate-internal so none of them becomes API and the storage
-    /// choice stays free.
+    /// The public surface of this module is the pre-existing frozen
+    /// evaluator contract PLUS exactly two hidden, workspace-internal
+    /// SDK bridges. The registry, its storage, its mutation methods, and
+    /// the publication fence must stay crate-internal so none of them
+    /// becomes API and the storage choice stays free.
+    ///
+    /// The two bridge items are allowlisted as *reachable*, not as
+    /// *supported*: `the_sdk_bridges_are_hidden_and_marked_unstable`
+    /// separately requires each of them to carry `#[doc(hidden)]` and
+    /// the unstable workspace-internal wording.
     ///
     /// Non-vacuous by construction: it reads this module's own source
     /// and the re-export list, so a new public ITEM or a widened
@@ -1412,7 +1753,10 @@ mod tests {
             "pub struct SensingCounters",
             "pub fn get",
             "pub fn validate_interest_constraints",
-            // S0 item 7: the ONLY new cross-crate items.
+            // S0 item 7: reachable across the crate boundary, but NOT
+            // supported API — each must be `#[doc(hidden)]` and marked
+            // unstable/workspace-internal (guarded separately by
+            // `the_sdk_bridges_are_hidden_and_marked_unstable`).
             "pub struct EvaluatorRegistrationId",
             "pub enum EvaluatorInstallRefusal",
         ];
@@ -1488,5 +1832,93 @@ mod tests {
             re_exports.contains("pub(crate) use evaluator::ReadinessEvaluators;"),
             "the registry must stay a crate-internal re-export",
         );
+    }
+
+    /// Every core item that is public ONLY because `net-mesh-sdk` is a
+    /// separate crate must be `#[doc(hidden)]` AND carry the unstable
+    /// workspace-internal wording. Reachability is unavoidable; being
+    /// mistaken for supported API is not.
+    ///
+    /// Non-vacuous by construction: it reads the real source of both
+    /// modules, locates each bridge's declaration, walks back over its
+    /// contiguous doc/attribute block, and requires BOTH markers. Losing
+    /// either one fails it.
+    ///
+    /// `MeshNode::sensing_origin_active` is deliberately absent: it
+    /// predates this slice and is read by the crate's own integration
+    /// suites as a plain observability query, so it is not public solely
+    /// for the SDK.
+    #[test]
+    fn the_sdk_bridges_are_hidden_and_marked_unstable() {
+        /// The exact sentence every bridge must carry, so the guard
+        /// cannot be satisfied by vague prose.
+        const UNSTABLE: &str = "Unstable, workspace-internal SDK bridge; not supported core API.";
+
+        let mesh = include_str!("../../mesh.rs");
+        let evaluator = include_str!("evaluator.rs");
+        let bridges: &[(&str, &str)] = &[
+            (mesh, "pub fn register_readiness_evaluator("),
+            (mesh, "pub fn replace_readiness_evaluator("),
+            (mesh, "pub fn unregister_readiness_evaluator("),
+            (mesh, "pub fn notify_sensing_state_changed_owned("),
+            (mesh, "pub fn sensing_enabled("),
+            (mesh, "pub fn sensing_identity_is_durable("),
+            (evaluator, "pub struct EvaluatorRegistrationId("),
+            (evaluator, "pub enum EvaluatorInstallRefusal {"),
+        ];
+
+        /// The contiguous doc/attribute block immediately above a
+        /// declaration. The split leaves the declaration's own
+        /// indentation as a trailing fragment, so skip empties before
+        /// collecting.
+        fn attribute_block(source: &str, declaration: &str) -> Option<String> {
+            let before = source.split(declaration).next()?;
+            if before.len() == source.len() {
+                return None;
+            }
+            let block: Vec<&str> = before
+                .lines()
+                .rev()
+                .map(str::trim)
+                .skip_while(|line| line.is_empty())
+                .take_while(|line| line.starts_with("///") || line.starts_with("#["))
+                .collect();
+            Some(block.join("\n"))
+        }
+
+        for (source, declaration) in bridges {
+            let block = attribute_block(source, declaration).unwrap_or_else(|| {
+                panic!(
+                    "bridge declaration `{declaration}` not found — if it was renamed, \
+                     rename it here in the same commit",
+                )
+            });
+            assert!(
+                block.contains("#[doc(hidden)]"),
+                "bridge `{declaration}` is missing #[doc(hidden)] — it would appear \
+                 as supported core API in rustdoc",
+            );
+            assert!(
+                block.contains(UNSTABLE),
+                "bridge `{declaration}` is missing the exact wording {UNSTABLE:?} — \
+                 a reader must be told it is not supported core API",
+            );
+        }
+
+        // ...and the guard must not pass by the marker being everywhere:
+        // the frozen evaluator-contract types are NOT bridges.
+        for supported in [
+            "pub struct EvaluationRequest {",
+            "pub enum ReadinessEvaluation {",
+            "pub trait ReadinessEvaluator {",
+        ] {
+            let block = attribute_block(evaluator, supported)
+                .unwrap_or_else(|| panic!("`{supported}` not found"));
+            assert!(
+                !block.contains("#[doc(hidden)]"),
+                "`{supported}` is part of the SUPPORTED evaluator contract and must \
+                 not be hidden merely because the SDK re-exports it",
+            );
+        }
     }
 }

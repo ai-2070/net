@@ -1,12 +1,12 @@
-//! Capability sensing — the **provider** side, plus the exact-provider
-//! readiness projection.
+//! Capability sensing — the **provider** side.
 //!
 //! `docs/internal/plans/CAPABILITY_SENSING_SDK_INTEGRATION_PLAN.md` §4.4
-//! (provider lifecycle) and §4.2 (snapshot). Sensing answers one
+//! (provider lifecycle) and §4.5 (configuration). Sensing answers one
 //! question — "can this provider currently satisfy capability Y under
 //! characteristics C and latency envelope L?" — and the answer is
 //! **advisory**: a provider signs what it evaluates about itself and
 //! each consumer judges viability against its own latency budget.
+//! Provider admission remains final regardless of what readiness said.
 //!
 //! # What readiness is not
 //!
@@ -96,10 +96,22 @@
 //! shipping a projection would ship a surface that can only ever answer
 //! `Unknown` for the population it was built for.
 //!
-//! Nothing here exposes leader ids, audience commitments, interest
-//! specs, provider selectors, wire digests, frames, private discovery
-//! records, or retry/admission policy — and no operation here is
-//! owner-scoped, so none of them is needed.
+//! # What this surface does and does not name
+//!
+//! This module re-exports NO interest, audience, or projection
+//! vocabulary: no `InterestSpec`, no audience commitment, no provider
+//! selector, no result mode, no disclosure class, no consumer latency
+//! budget, no projected readiness. It names no leader ids, wire digests,
+//! frames, private discovery records, or retry/admission policy, and no
+//! operation here is owner-scoped, so none of them is needed.
+//!
+//! It does NOT follow that those core types are unreachable. This is a
+//! thin SDK over `net`, and [`EvaluationRequest`] necessarily carries
+//! the evaluator's inputs — a `CapabilityId`, the canonical constraints,
+//! and the work-latency envelope — as part of the already-frozen
+//! evaluator contract. Their types are therefore nameable transitively
+//! through `net`. What this slice declines to do is *re-export* them as
+//! SDK surface or build a query/projection API on top of them.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -110,9 +122,16 @@ use net::adapter::net::MeshNode;
 use crate::mesh::Mesh;
 
 /// The provider-side evaluator contract. A capability integration
-/// implements [`ReadinessEvaluator`] and needs nothing else: the
-/// request's constraint and latency values are read through their own
-/// methods, so the interest vocabulary stays out of this surface.
+/// implements [`ReadinessEvaluator`] and needs nothing else from this
+/// module.
+///
+/// [`EvaluationRequest`] carries the evaluator's inputs as PUBLIC
+/// FIELDS — `capability_id`, `constraints`, and `work_latency` — so an
+/// implementation reads them directly. Their types belong to `net`'s
+/// frozen evaluator contract and are deliberately not re-exported here;
+/// an evaluator that only reads values (`request.constraints.get(..)`)
+/// never needs to name them, and one that does can reach them through
+/// `net` without this module growing an interest vocabulary.
 pub use sensing::{CapabilityId, EvaluationRequest, ReadinessEvaluation, ReadinessEvaluator};
 
 /// The persisted provider boot epoch and its derivation. An origin

@@ -600,6 +600,158 @@ async fn an_evaluation_in_flight_cannot_publish_after_its_close_completes() {
 }
 
 // ---------------------------------------------------------------------
+// Production guard retention (H8)
+// ---------------------------------------------------------------------
+
+/// **The production commit-section retention witness.**
+///
+/// The two tests above prove that a transition which COMPLETES before
+/// `begin_commit` causes the beat to be dropped. This one proves the
+/// converse and stronger property: once the real emitter has entered the
+/// section, the section is genuinely RETAINED across signing and the
+/// local `latest` + consumer-cell publication, so an ownership
+/// transition cannot complete in the middle of a publication.
+///
+/// It is production-coupled: the emitter is parked by a hook placed at
+/// the real call site, inside the section, after a successful
+/// currentness test and after `sign_attestation`, immediately before the
+/// local publication. And the rival's blocking is acknowledged EXACTLY,
+/// by the registry's contention observer, which fires only when a
+/// transition's `try_lock` on the ownership mutex finds it held.
+///
+/// Proves, in order:
+///   1. the old registration entered the production commit section;
+///   2. a replacement reached the real ownership-mutex boundary and
+///      found it held;
+///   3. while parked, that replacement cannot complete;
+///   4. the old result's local publication completes under the section;
+///   5. after release, the replacement completes;
+///   6. subsequent old results cannot publish;
+///   7. the final owner and projection are the successor's.
+///
+/// Fails if `_commit` is dropped immediately after `begin_commit`,
+/// before `sign_attestation`, or before the local publication: in every
+/// one of those the rival's `try_lock` succeeds, the contention observer
+/// never fires, and step 2 fails by named assertion rather than by
+/// timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_production_commit_section_is_held_across_signing_and_publication() {
+    let mesh = origin_mesh().await;
+    let client = mesh.sensing().expect("sensing enabled");
+    let (ready, _evaluations, evaluator) = FlagEvaluator::pair();
+    ready.store(true, Ordering::Relaxed);
+
+    let old = client
+        .provide(CapabilityId::new(CAPABILITY), evaluator)
+        .expect("provide");
+
+    // Park the emitter INSIDE the section, immediately before the local
+    // publication.
+    let in_section = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    mesh.inner().set_sensing_commit_pause_hook_for_test(Some({
+        let in_section = in_section.clone();
+        let release = release.clone();
+        Arc::new(move || {
+            in_section.store(true, Ordering::Release);
+            while !release.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+        })
+    }));
+    // Acknowledge the rival's arrival at the real ownership mutex.
+    let contended = Arc::new(AtomicBool::new(false));
+    mesh.inner()
+        .set_sensing_ownership_contention_hook_for_test(Some({
+            let contended = contended.clone();
+            Arc::new(move || contended.store(true, Ordering::Release))
+        }));
+
+    let branch = watch_self(&mesh, CAPABILITY).await;
+
+    // (1) production entered the commit section.
+    assert!(
+        poll_until(POLL, || in_section.load(Ordering::Acquire)).await,
+        "the emitter never entered the production commit section",
+    );
+    assert!(
+        mesh.inner().sensing_latest_attestation(&branch).is_none(),
+        "nothing may be published before the section's publication runs",
+    );
+
+    // A replacement races the held section, on a blocking thread so it
+    // may park on the mutex without starving the runtime.
+    let replaced = {
+        let client = client.clone();
+        tokio::task::spawn_blocking(move || {
+            client.provide_replacing(CapabilityId::new(CAPABILITY), Arc::new(AlwaysNotReady))
+        })
+    };
+
+    // (2) it reached the real mutex boundary and found it HELD.
+    assert!(
+        poll_until(POLL, || contended.load(Ordering::Acquire)).await,
+        "the replacement never blocked on the ownership mutex — the section \
+         was not held across signing and publication",
+    );
+    // (3) and cannot complete while it is held.
+    tokio::time::sleep(SETTLE).await;
+    assert!(
+        !replaced.is_finished(),
+        "the replacement completed while the publication held the section",
+    );
+
+    // Release the section and let publication finish.
+    release.store(true, Ordering::Release);
+
+    // (5) the replacement now completes.
+    let successor = replaced
+        .await
+        .expect("replacement task")
+        .expect("replacement installs once the section releases");
+
+    // (4) the OLD result's local publication completed under the
+    // section: exactly one attestation, and it is the old Ready.
+    assert!(
+        poll_until(POLL, || mesh.inner().sensing_projected(&branch)
+            == ProjectedReadiness::Ready)
+        .await,
+        "the old result's local publication did not complete under the section",
+    );
+    assert!(
+        mesh.inner().sensing_latest_attestation(&branch).is_some(),
+        "the old result never reached the wire cache",
+    );
+    assert_eq!(
+        attestations_emitted(&mesh),
+        1,
+        "exactly one publication — the old registration's — may have happened",
+    );
+
+    // (6) subsequent old results cannot publish: the old handle owns
+    // nothing now, on any edge.
+    mesh.inner().set_sensing_commit_pause_hook_for_test(None);
+    assert!(!old.changed(), "the superseded handle owns no schedule");
+    assert!(!old.close(), "the superseded handle removes nothing");
+
+    // (7) the final owner is the successor, and its beat is the second
+    // and only other publication.
+    assert!(successor.changed(), "the successor owns the schedule");
+    assert!(
+        poll_until(POLL, || mesh.inner().sensing_projected(&branch)
+            == ProjectedReadiness::NotReady)
+        .await,
+        "the successor never published",
+    );
+    assert_eq!(attestations_emitted(&mesh), 2);
+    assert_eq!(mesh.inner().sensing_evaluator_count(), 1);
+
+    mesh.inner()
+        .set_sensing_ownership_contention_hook_for_test(None);
+    assert!(successor.close());
+}
+
+// ---------------------------------------------------------------------
 // State-edge notification (H2, §6 witness 15)
 // ---------------------------------------------------------------------
 

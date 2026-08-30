@@ -104,18 +104,40 @@ into `MeshNode`. Expensive state acquisition stays **outside** the
 evaluator — publish into an atomic or an `ArcSwap` snapshot the
 evaluator merely reads.
 
-Registration is ownership-bearing. The registry
-(`behavior/sensing/evaluator.rs`) is crate-internal; the supported
-surface is the node's lifecycle seams plus one opaque id and its
-refusal:
+### Supported surface vs. internal plumbing
 
-| Operation | Meaning |
-|-----------|---------|
+The **supported** provider surface is the Rust SDK's
+`net_sdk::sensing`: `mesh.sensing()?.provide(..)` and the
+`ReadinessRegistration` it returns. That is what applications should
+use, and it is the only part of this lifecycle covered by the usual
+compatibility expectations.
+
+Everything below it is **internal plumbing**. The registry itself
+(`behavior/sensing/evaluator.rs`) is crate-private. The `MeshNode`
+methods and the two value types the SDK needs are technically `pub`
+only because `net-mesh-sdk` is a separate crate, so each of them is
+`#[doc(hidden)]` and carries the sentence *"Unstable,
+workspace-internal SDK bridge; not supported core API."* A `--lib`
+guard test requires both markers on every one of them.
+
+With that framing, the internal bridges are:
+
+| Bridge (`#[doc(hidden)]`, unstable) | Meaning |
+|---|---|
 | `MeshNode::register_readiness_evaluator` | vacancy-required install; issues an `EvaluatorRegistrationId`, or refuses with `EvaluatorInstallRefusal::Occupied` |
 | `MeshNode::replace_readiness_evaluator` | explicit supersession; issues a fresh id, so the superseded id is non-current the instant it returns |
 | `MeshNode::unregister_readiness_evaluator` | removes only if the supplied id is still the installed one; `true` at most once per registration |
-| `MeshNode::notify_sensing_state_changed` | the capability-scoped state edge for low-level callers that own their node outright |
-| `MeshNode::notify_sensing_state_changed_owned` | the ownership-aware state edge (`#[doc(hidden)]`, workspace-internal): pokes only while the supplied id is still installed |
+| `MeshNode::notify_sensing_state_changed_owned` | the ownership-aware state edge: pokes only while the supplied id is still installed |
+| `MeshNode::sensing_enabled` / `sensing_identity_is_durable` | the two prerequisite bits `Mesh::sensing` refuses by name |
+| `EvaluatorRegistrationId` / `EvaluatorInstallRefusal` | the opaque id the SDK handle holds, and the refusal it maps |
+
+One method in this area is **not** a bridge:
+`MeshNode::notify_sensing_state_changed` is the pre-existing
+capability-scoped state edge for low-level callers that own their node
+outright, and it keeps its original `-> ()` signature and semantics.
+`MeshNode::sensing_origin_active` likewise predates this slice and is
+read by the crate's own integration suites as a plain observability
+query.
 
 Four rules follow, and they are what the ids exist for:
 
@@ -134,6 +156,12 @@ Four rules follow, and they are what the ids exist for:
   point every install — vacancy-required and replacing alike — is
   refused with `EvaluatorInstallRefusal::IdentityExhausted`, incumbents
   keep serving, and removal keeps working.
+- **No user code runs under the ownership mutex — including
+  destructors.** `Drop` on an evaluator is user code just like
+  `evaluate`, and it may legitimately re-enter provide/replace/close.
+  The mutex is not reentrant, so a displaced or removed slot is moved
+  out as a value, the section is released, and only then is the slot
+  dropped. The map mutation itself stays fully serialized.
 
 ### The publication fence
 
@@ -169,8 +197,11 @@ capability that now can is a false negative.
 locks. It may be held while taking
 `sensing_local_projection_mu` → `sensing_interest_table` →
 `sensing_observations` (the frozen order), or `sensing_emitter`; nothing
-acquires it while holding any of those. No user evaluator, no `.await`,
-and no network I/O runs inside it.
+acquires it while holding any of those. No user evaluator, no user
+`Drop`, no `.await`, and no network I/O runs inside it — the displaced
+and removed slots that carry the final `Arc<dyn ReadinessEvaluator>` are
+released after the section, and the emitter's own clone is released
+before it enters the section.
 
 **Scope, stated honestly.** The fence covers the LOCAL commit points —
 the wire cache and the consumer cell. Peer fan-out happens after the

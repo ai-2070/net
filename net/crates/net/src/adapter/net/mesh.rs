@@ -9114,6 +9114,17 @@ pub struct MeshNode {
     /// conditional on it, so a superseded provider handle cannot
     /// evict its replacement.
     sensing_evaluators: Arc<sensing::ReadinessEvaluators>,
+    /// Fixtures-only publication-section observer: invoked by the origin
+    /// emitter INSIDE the evaluator registry's ownership section, after
+    /// a successful currentness test and after signing, immediately
+    /// before the local `latest` + consumer-cell publication.
+    ///
+    /// The guard-retention witness parks the emitter here and then
+    /// proves a rival replace/remove cannot complete — which is only
+    /// true if the section is genuinely still held through signing and
+    /// publication. Absent from production builds.
+    #[cfg(any(test, feature = "fixtures"))]
+    sensing_commit_pause_hook: Arc<parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>,
     /// SI-3c: §4.6 strictly-newer admission over what each origin
     /// SIGNED — the [`sensing::IncarnationSeqGate`] (SI-1c) getting
     /// its first live consumer. Keys on the transcript digest, so
@@ -10518,6 +10529,8 @@ impl MeshNode {
             sensing_emitter,
             sensing_emitter_notify: Arc::new(tokio::sync::Notify::new()),
             sensing_evaluators: Arc::new(sensing::ReadinessEvaluators::default()),
+            #[cfg(any(test, feature = "fixtures"))]
+            sensing_commit_pause_hook: Arc::new(parking_lot::Mutex::new(None)),
             sensing_observer_gate: Arc::new(parking_lot::Mutex::new(
                 sensing::IncarnationSeqGate::new(),
             )),
@@ -11595,6 +11608,12 @@ impl MeshNode {
     /// Registration is independent of the origin role being active:
     /// evaluators may be installed before `start()` or while the
     /// plane is dark; they take effect whenever emission runs.
+    ///
+    /// Unstable, workspace-internal SDK bridge; not supported core API.
+    /// Public only because `net-mesh-sdk` is a separate crate — the
+    /// supported provider surface is
+    /// `net_sdk::sensing::SensingClient::provide`.
+    #[doc(hidden)]
     pub fn register_readiness_evaluator(
         &self,
         capability_id: sensing::CapabilityId,
@@ -11616,6 +11635,12 @@ impl MeshNode {
     /// supersession is the intent. Refuses only with
     /// [`sensing::EvaluatorInstallRefusal::IdentityExhausted`], on
     /// which the incumbent is left serving.
+    ///
+    /// Unstable, workspace-internal SDK bridge; not supported core API.
+    /// Public only because `net-mesh-sdk` is a separate crate — the
+    /// supported supersession surface is
+    /// `net_sdk::sensing::SensingClient::provide_replacing`.
+    #[doc(hidden)]
     pub fn replace_readiness_evaluator(
         &self,
         capability_id: sensing::CapabilityId,
@@ -11638,6 +11663,12 @@ impl MeshNode {
     ///
     /// Once this returns `true`, a result the removed evaluator was
     /// already computing can no longer become the latest observation.
+    ///
+    /// Unstable, workspace-internal SDK bridge; not supported core API.
+    /// Public only because `net-mesh-sdk` is a separate crate — the
+    /// supported removal surface is
+    /// `net_sdk::sensing::ReadinessRegistration::close` and its `Drop`.
+    #[doc(hidden)]
     pub fn unregister_readiness_evaluator(
         &self,
         capability_id: &sensing::CapabilityId,
@@ -11679,9 +11710,10 @@ impl MeshNode {
     /// replacement or close has returned, the old registration can
     /// never alter the successor's schedule.
     ///
-    /// Unstable, workspace-internal SDK bridge: this exists so
-    /// `net_sdk::sensing::ReadinessRegistration::changed` can be
-    /// ownership-safe. Not part of the supported `net` surface.
+    /// Unstable, workspace-internal SDK bridge; not supported core API.
+    /// Public only because `net-mesh-sdk` is a separate crate — it
+    /// exists so `net_sdk::sensing::ReadinessRegistration::changed` can
+    /// be ownership-safe.
     #[doc(hidden)]
     pub fn notify_sensing_state_changed_owned(
         &self,
@@ -11718,6 +11750,12 @@ impl MeshNode {
     /// SI-3: whether the origin role is active — the plane is
     /// enabled AND a persisted incarnation was supplied (fail-closed
     /// otherwise; see [`MeshNodeConfig::sensing_incarnation`]).
+    ///
+    /// Deliberately NOT marked a workspace-internal bridge: it predates
+    /// this slice and is read by the crate's own integration suites
+    /// (`tests/sensing_origin_emitter.rs`) as a plain observability
+    /// query, so it is not public solely for the SDK's prerequisite
+    /// checks.
     pub fn sensing_origin_active(&self) -> bool {
         self.sensing_emitter.lock().is_some()
     }
@@ -11730,6 +11768,12 @@ impl MeshNode {
     /// must refuse "sensing is off" separately from "this node cannot
     /// sign readiness for itself" needs both bits, and the emitter
     /// slot alone conflates them.
+    ///
+    /// Unstable, workspace-internal SDK bridge; not supported core API.
+    /// Public only because `net-mesh-sdk` is a separate crate — it
+    /// exists so `Mesh::sensing` can refuse
+    /// `net_sdk::sensing::SensingError::Disabled` by name.
+    #[doc(hidden)]
     pub fn sensing_enabled(&self) -> bool {
         self.config.enable_sensing_coalescing
     }
@@ -11741,6 +11785,13 @@ impl MeshNode {
     /// a generated ephemeral identity makes both the consumer's TOFU
     /// pin and the persisted incarnation meaningless across a restart.
     /// The SDK refuses provider registration on that basis.
+    ///
+    /// Unstable, workspace-internal SDK bridge; not supported core API.
+    /// Public only because `net-mesh-sdk` is a separate crate — it
+    /// exists so `Mesh::sensing` can refuse
+    /// `net_sdk::sensing::SensingError::DurableIdentityRequired` by
+    /// name.
+    #[doc(hidden)]
     pub fn sensing_identity_is_durable(&self) -> bool {
         self.config.configured_identity
     }
@@ -11776,6 +11827,37 @@ impl MeshNode {
     #[cfg(any(test, feature = "fixtures"))]
     pub fn sensing_max_registration_id_for_test() -> u64 {
         sensing::ReadinessEvaluators::max_issuable_id_for_test()
+    }
+
+    /// Install (or clear) the fixtures-only PUBLICATION-SECTION pause.
+    ///
+    /// The emitter invokes it inside the evaluator registry's ownership
+    /// section, after a successful currentness test and after signing,
+    /// immediately before the local `latest` + consumer-cell
+    /// publication. Parking there lets a witness prove the section is
+    /// genuinely retained across signing and publication.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn set_sensing_commit_pause_hook_for_test(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        *self.sensing_commit_pause_hook.lock() = hook;
+    }
+
+    /// Install (or clear) the fixtures-only ownership-mutex CONTENTION
+    /// observer.
+    ///
+    /// Fires when an ownership transition's `try_lock` on the registry's
+    /// commit mutex observes it HELD, before falling back to a blocking
+    /// acquire — so a witness can prove "the rival reached the real
+    /// mutex boundary and found it held" by acknowledgement rather than
+    /// by a scheduler-dependent timeout.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn set_sensing_ownership_contention_hook_for_test(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        self.sensing_evaluators.set_contention_hook_for_test(hook);
     }
 
     /// SI-3: live emission streams on this origin (tests +
@@ -18026,6 +18108,8 @@ impl MeshNode {
         let emitter = self.sensing_emitter.clone();
         let notify = self.sensing_emitter_notify.clone();
         let evaluators = self.sensing_evaluators.clone();
+        #[cfg(any(test, feature = "fixtures"))]
+        let commit_pause = self.sensing_commit_pause_hook.clone();
         let table = self.sensing_interest_table.clone();
         #[cfg(feature = "redex")]
         let sensing_leader = self.sensing_leader.clone();
@@ -18178,6 +18262,21 @@ impl MeshNode {
                         let Ok(signed) = sensing::sign_attestation(&identity, unsigned) else {
                             continue;
                         };
+                        // Fixtures-only guard-retention seam: we are
+                        // INSIDE the ownership section, past a successful
+                        // currentness test and past signing, and the
+                        // local publication below has not run yet. The
+                        // witness parks here and proves a rival
+                        // replace/remove cannot complete — which holds
+                        // only if `_commit` is still alive across all of
+                        // signing and publication.
+                        #[cfg(any(test, feature = "fixtures"))]
+                        {
+                            let pause = commit_pause.lock().clone();
+                            if let Some(pause) = pause {
+                                pause();
+                            }
+                        }
                         // SI-7: one signed origin beat produced — fanned
                         // to every downstream below, never multiplied by
                         // watcher count (the coalescing economic claim).
