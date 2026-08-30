@@ -11807,18 +11807,27 @@ impl MeshNode {
     /// How many capabilities on this node currently have a readiness
     /// evaluator installed.
     ///
-    /// Test/observability seam only — deliberately NOT part of the
-    /// supported surface, so the registry's storage choice stays free.
     /// A refused registration must leave this unchanged; that is what
     /// "the refusal is total" means.
+    ///
+    /// Unstable fixtures-only test bridge; not supported core API.
+    /// Reachable only under `cfg(test)` or the `fixtures` feature, and
+    /// public solely so the workspace's own suites can observe registry
+    /// state across the crate boundary. It exists to keep the
+    /// registry's storage choice free, not to describe it.
     #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
     pub fn sensing_evaluator_count(&self) -> usize {
         self.sensing_evaluators.len()
     }
 
     /// Whether this node's readiness-registration identity space is
     /// exhausted — terminal and fail-closed for new installs.
+    ///
+    /// Unstable fixtures-only test bridge; not supported core API.
+    /// Reachable only under `cfg(test)` or the `fixtures` feature.
     #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
     pub fn sensing_evaluator_identities_exhausted(&self) -> bool {
         self.sensing_evaluators.identities_exhausted()
     }
@@ -11826,13 +11835,24 @@ impl MeshNode {
     /// Force the registration-id allocator's resting value, so a test
     /// can reach the terminal exhausted state without 2^64 real
     /// registrations.
+    ///
+    /// Unstable fixtures-only test bridge; not supported core API.
+    /// Reachable only under `cfg(test)` or the `fixtures` feature. It
+    /// deliberately bypasses the allocator's monotonicity, so it is a
+    /// witness tool and nothing else.
     #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
     pub fn set_sensing_evaluator_next_id_for_test(&self, next: u64) {
         self.sensing_evaluators.set_next_id_for_test(next);
     }
 
     /// The largest registration id the allocator will ever issue.
+    ///
+    /// Unstable fixtures-only test bridge; not supported core API.
+    /// Reachable only under `cfg(test)` or the `fixtures` feature, so a
+    /// witness can name the boundary without duplicating the constant.
     #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
     pub fn sensing_max_registration_id_for_test() -> u64 {
         sensing::ReadinessEvaluators::max_issuable_id_for_test()
     }
@@ -11840,11 +11860,16 @@ impl MeshNode {
     /// Install (or clear) the fixtures-only PUBLICATION-SECTION pause.
     ///
     /// The emitter invokes it inside the evaluator registry's ownership
-    /// section, after a successful currentness test and after signing,
-    /// immediately before the local `latest` + consumer-cell
+    /// section, at the END of that section — past the currentness test,
+    /// past signing, and past the local `latest` + consumer-cell
     /// publication. Parking there lets a witness prove the section is
-    /// genuinely retained across signing and publication.
+    /// genuinely retained across all of it.
+    ///
+    /// Unstable fixtures-only test bridge; not supported core API.
+    /// Reachable only under `cfg(test)` or the `fixtures` feature; the
+    /// hook itself is absent from production builds.
     #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
     pub fn set_sensing_commit_pause_hook_for_test(
         &self,
         hook: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -11860,7 +11885,12 @@ impl MeshNode {
     /// acquire — so a witness can prove "the rival reached the real
     /// mutex boundary and found it held" by acknowledgement rather than
     /// by a scheduler-dependent timeout.
+    ///
+    /// Unstable fixtures-only test bridge; not supported core API.
+    /// Reachable only under `cfg(test)` or the `fixtures` feature; the
+    /// observer itself is absent from production builds.
     #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
     pub fn set_sensing_ownership_contention_hook_for_test(
         &self,
         hook: Option<Arc<dyn Fn() + Send + Sync>>,
