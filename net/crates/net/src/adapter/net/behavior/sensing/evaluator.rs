@@ -632,6 +632,13 @@ impl ReadinessEvaluators {
     /// same reason as [`Self::install_replacing`]: a user `Drop` that
     /// re-enters the lifecycle must not meet a held, non-reentrant
     /// mutex.
+    ///
+    /// Written explicitly rather than relying on temporary-drop order.
+    /// This previously read `remove_if(..).is_some()` as the function's
+    /// TAIL expression, which happens to drop the removed value *after*
+    /// the guard — so it was safe, but only by a rule that binding the
+    /// result to a local silently reverses. The explicit form states the
+    /// requirement instead of depending on it.
     pub(crate) fn remove_if_current(
         &self,
         capability_id: &CapabilityId,

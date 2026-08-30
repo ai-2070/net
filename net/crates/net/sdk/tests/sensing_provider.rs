@@ -647,6 +647,12 @@ async fn the_production_commit_section_is_held_across_signing_and_publication() 
 
     // Park the emitter INSIDE the section, immediately before the local
     // publication.
+    //
+    // The park is BOUNDED. On the passing path the test releases it in
+    // milliseconds; the deadline exists only so that a failing run (the
+    // guard was dropped early, so the assertions below fire) cannot
+    // leave a worker thread spinning and turn a named assertion failure
+    // into a runtime-shutdown timeout.
     let in_section = Arc::new(AtomicBool::new(false));
     let release = Arc::new(AtomicBool::new(false));
     mesh.inner().set_sensing_commit_pause_hook_for_test(Some({
@@ -654,7 +660,8 @@ async fn the_production_commit_section_is_held_across_signing_and_publication() 
         let release = release.clone();
         Arc::new(move || {
             in_section.store(true, Ordering::Release);
-            while !release.load(Ordering::Acquire) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while !release.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
                 std::thread::yield_now();
             }
         })
@@ -669,14 +676,28 @@ async fn the_production_commit_section_is_held_across_signing_and_publication() 
 
     let branch = watch_self(&mesh, CAPABILITY).await;
 
-    // (1) production entered the commit section.
+    // (1) production entered the commit section — the seam sits at the
+    // END of it, so reaching it also means (4) the whole local
+    // publication already ran.
     assert!(
         poll_until(POLL, || in_section.load(Ordering::Acquire)).await,
         "the emitter never entered the production commit section",
     );
+    // (4) the old result's local publication completed while the section
+    // is STILL held — both commit points, observed from outside.
     assert!(
-        mesh.inner().sensing_latest_attestation(&branch).is_none(),
-        "nothing may be published before the section's publication runs",
+        mesh.inner().sensing_latest_attestation(&branch).is_some(),
+        "the wire cache was not written before the section's end",
+    );
+    assert_eq!(
+        mesh.inner().sensing_projected(&branch),
+        ProjectedReadiness::Ready,
+        "the consumer cell was not fed before the section's end",
+    );
+    assert_eq!(
+        attestations_emitted(&mesh),
+        1,
+        "exactly one publication — the old registration's — has happened",
     );
 
     // A replacement races the held section, on a blocking thread so it
@@ -710,17 +731,11 @@ async fn the_production_commit_section_is_held_across_signing_and_publication() 
         .expect("replacement task")
         .expect("replacement installs once the section releases");
 
-    // (4) the OLD result's local publication completed under the
-    // section: exactly one attestation, and it is the old Ready.
-    assert!(
-        poll_until(POLL, || mesh.inner().sensing_projected(&branch)
-            == ProjectedReadiness::Ready)
-        .await,
-        "the old result's local publication did not complete under the section",
-    );
-    assert!(
-        mesh.inner().sensing_latest_attestation(&branch).is_some(),
-        "the old result never reached the wire cache",
+    // The publication observed in-section above is still the only one,
+    // and it survived the release unchanged.
+    assert_eq!(
+        mesh.inner().sensing_projected(&branch),
+        ProjectedReadiness::Ready,
     );
     assert_eq!(
         attestations_emitted(&mesh),

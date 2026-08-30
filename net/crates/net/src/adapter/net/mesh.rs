@@ -8253,6 +8253,14 @@ fn exact_expiry_wait(deadline_secs: u64, wall_now: Duration) -> Duration {
     Duration::from_secs(deadline_secs).saturating_sub(wall_now)
 }
 
+/// A fixtures-only observer hook, shared with the origin-emitter task.
+///
+/// Cheap to clone (the outer `Arc`) so the emitter loop can capture it,
+/// and swappable at runtime (the `Mutex<Option<..>>`) so a witness can
+/// install and clear it. Absent from production builds.
+#[cfg(any(test, feature = "fixtures"))]
+type SensingObserverHook = Arc<parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>;
+
 /// Multi-peer mesh node.
 ///
 /// Composes `NetSession` (per-peer encryption), `NetRouter` (forwarding),
@@ -9124,7 +9132,7 @@ pub struct MeshNode {
     /// true if the section is genuinely still held through signing and
     /// publication. Absent from production builds.
     #[cfg(any(test, feature = "fixtures"))]
-    sensing_commit_pause_hook: Arc<parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>,
+    sensing_commit_pause_hook: SensingObserverHook,
     /// SI-3c: §4.6 strictly-newer admission over what each origin
     /// SIGNED — the [`sensing::IncarnationSeqGate`] (SI-1c) getting
     /// its first live consumer. Keys on the transcript digest, so
@@ -18262,21 +18270,6 @@ impl MeshNode {
                         let Ok(signed) = sensing::sign_attestation(&identity, unsigned) else {
                             continue;
                         };
-                        // Fixtures-only guard-retention seam: we are
-                        // INSIDE the ownership section, past a successful
-                        // currentness test and past signing, and the
-                        // local publication below has not run yet. The
-                        // witness parks here and proves a rival
-                        // replace/remove cannot complete — which holds
-                        // only if `_commit` is still alive across all of
-                        // signing and publication.
-                        #[cfg(any(test, feature = "fixtures"))]
-                        {
-                            let pause = commit_pause.lock().clone();
-                            if let Some(pause) = pause {
-                                pause();
-                            }
-                        }
                         // SI-7: one signed origin beat produced — fanned
                         // to every downstream below, never multiplied by
                         // watcher count (the coalescing economic claim).
@@ -18325,6 +18318,24 @@ impl MeshNode {
                                         *generation = generation.wrapping_add(1);
                                     });
                                 }
+                            }
+                        }
+                        // Fixtures-only guard-retention seam, at the END
+                        // of the section: the currentness test, the
+                        // signature, and the whole local publication
+                        // (`latest` + the consumer cell) are all behind
+                        // us, and `_commit` must still be alive. The
+                        // witness parks here and proves a rival
+                        // replace/remove cannot complete — so releasing
+                        // the guard at ANY earlier point (right after
+                        // `begin_commit`, before signing, or before
+                        // publication) makes the rival's `try_lock`
+                        // succeed and fails the witness.
+                        #[cfg(any(test, feature = "fixtures"))]
+                        {
+                            let pause = commit_pause.lock().clone();
+                            if let Some(pause) = pause {
+                                pause();
                             }
                         }
                         signed

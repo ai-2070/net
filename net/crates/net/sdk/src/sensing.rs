@@ -640,6 +640,41 @@ mod tests {
                 "the provider contract item `{required}` is missing from the surface",
             );
         }
+
+        // ...and the DOCS must not claim a projection the module does
+        // not have. The surface checks above only read declarations, so
+        // a stale heading would otherwise survive.
+        let module_doc: String = source
+            .lines()
+            .take_while(|line| line.starts_with("//!") || line.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !module_doc.contains("plus the exact-provider"),
+            "the module heading still advertises the exact-provider projection, \
+             which this slice does not ship",
+        );
+        assert!(
+            module_doc.contains("deferred to S4"),
+            "the module docs must state that exact-provider acquisition and \
+             projection are deferred, and why",
+        );
+
+        // The crate root must not advertise it either.
+        let root = include_str!("lib.rs");
+        let sensing_comment = root
+            .split("pub mod sensing;")
+            .next()
+            .and_then(|before| before.rsplit("// Capability sensing").next())
+            .expect("the sensing module comment must exist");
+        assert!(
+            sensing_comment.contains("PROVIDER lifecycle only"),
+            "lib.rs must describe the sensing module as provider-lifecycle only",
+        );
+        assert!(
+            !sensing_comment.contains("readiness projection over"),
+            "lib.rs still advertises the removed readiness projection",
+        );
     }
 
     /// The ownership and state-edge witnesses in
