@@ -34,6 +34,39 @@ pre-leader race closure is signed at
 lifecycle entry condition is signed at
 **`LEADER_ENTRY_CONDITION_HEAD = f2c82e467`**.
 
+**OLB-0 exit correction (2026-08-30, read at
+`f9f423e7bfd5b3d90491600af27624a153f5f5bc`).** "These closures complete the
+practical Option-A OLB-0 substrate" is true for the INBOUND relay leg and for the
+node-global lease/refcount/cadence primitive, and false for the CONSUMER leg this
+plan actually needs. `MeshNode::acquire_sensing_interest_lease` (`mesh.rs:11197`)
+refuses every organization-derived audience with
+`SensingRegistrationError::OrgAudienceUnsupported` (`mesh.rs:6161`, raised at
+`:11220-11227`), added deliberately by `e0fb6b8e5` on review-pass-3 §4 rather than
+laundering a legacy frame onto the wire. Two consequences for the gates below:
+
+- OLB-0's exit witness "an org-private provider produces attestations under an
+  exact-provider lease while remaining absent from the provider-free population"
+  is **NOT satisfied** — no org-audience exact lease can be acquired at all.
+- §5.1a's sketch (`routing_state.acquire_exact_interest(..)` then
+  `node.sensed_candidates(..)`) and every OLB-2 bullet that acquires a lease per
+  authorized same-org provider are therefore **not reachable** at this head.
+
+A second blocker, not previously recorded here: `register_sensing_interest_as`
+routes local registrations through the legacy `validate_subscriber_scope`
+(`mesh.rs:10950`), which requires `interest_audience == session_root ==
+local_root` — an organization commitment can never satisfy it, since
+`install_node_authority_inner` refuses exactly that collision
+(`mesh.rs:13866-13880`).
+
+Both are designed in
+[`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md)
+— **DESIGN FOR REVIEW; no implementation or arm lighting authorized**, and
+`SAFE_ORG_EXACT_SENSING_HEAD` is deliberately **not established**. OLB-2's
+same-org sensing join stays blocked on that design's review and its OA-6
+arm-lighting slice. The Rust SDK's sensing surface is provider-lifecycle only at
+this head; the exact-provider projection seam that briefly existed (`a58293e58`)
+was removed in `52e1d8bb2` for this same reason.
+
 These closures complete the practical Option-A OLB-0 substrate. **OLB-1
 candidate factoring is SIGNED** at `OLB1_SIGNED_HEAD = 4dccb7767`
 (behavior-preserving `AuthorizedOrgCandidate` factoring in `call.rs`, with direct
@@ -320,6 +353,9 @@ implemented two-verb facade this composes beneath),
 [`CAPABILITY_SENSING_SDK_INTEGRATION_PLAN.md`](CAPABILITY_SENSING_SDK_INTEGRATION_PLAN.md)
 (the sensing SDK lifecycle this consumes — its S0/S1 are OLB-0's
 prerequisite, including the org-authenticated registration seam),
+[`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md)
+(the missing organization-audience exact-provider acquisition/projection
+boundary — DESIGN FOR REVIEW; OLB-2's same-org sensing join is blocked on it),
 [`ORG_SENSING_LEADER_SUBSTRATE_PLAN.md`](ORG_SENSING_LEADER_SUBSTRATE_PLAN.md)
 (the parallel provider-free owner-private leader design — shares only the
 indexed private-discovery/source substrate and does not gate OLB-1..OLB-5),
@@ -626,6 +662,15 @@ for candidate in candidates.same_org() {
 
 let sensed = node.sensed_candidates(&spec, &budget, Some(&candidate_node_ids));
 ```
+
+**Not reachable at `f9f423e7b` (see the OLB-0 exit correction above).** The
+acquisition in that sketch is refused before anything is minted:
+`acquire_sensing_interest_lease` returns
+`SensingRegistrationError::OrgAudienceUnsupported` for an organization-derived
+audience, and the local registration core additionally fails the legacy
+`validate_subscriber_scope`. The acquisition/projection boundary that makes this
+sketch real is designed, for review only, in
+[`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md).
 
 This preserves the confidentiality ordering structurally — private
 authority determines providers; sensing observes exactly those — and

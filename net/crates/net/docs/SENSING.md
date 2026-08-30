@@ -274,6 +274,11 @@ organization-authenticated registration intake and organization-audience
 exact leases are authorized, nothing in the SDK could create the
 observations a projection would read.
 
+That boundary now has a dedicated internal design under review —
+`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md` in the repository's
+`docs/internal/plans/`. It is a design only: nothing about the refusal above
+has changed, and no implementation or arm lighting is authorized.
+
 The plan's §4.5 node-authority refusal guards *owner-scoped* sensing,
 and the provider surface exposes none: registering an evaluator names
 only a local capability id, carries no audience, and confers no
