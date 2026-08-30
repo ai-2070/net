@@ -2488,7 +2488,8 @@ consumer target**. D10.3's four parts are lettered **(a)**-**(d)** below and are
 referenced elsewhere as "D10.3 part (a)" and so on.
 
 **(a) The module-boundary guard, not a five-name list.** The guard must be
-bypass-proof against a differently named sixth bridge, so the rule is
+bypass-proof against an eighth, differently named bridge added beyond the
+seven-entry OA bridge manifest, so the rule is
 **semantic, by module boundary**, following
 `org_cold_plan_surface_guard.rs`'s exact-inventory shape (10.1 fact 9):
 
@@ -3421,7 +3422,7 @@ mechanically in §14.**
 | W-18 | **every `org_install` acquisition goes through the sanctioned funnel** — a direct `.lock()` at any of the 6 sites fails | OA-2 | T4 | restore one direct `org_install.lock()` |
 | W-19 | **every relevant sensing-lock acquisition is in the sanctioned inventory**, with exact per-lock counts (45/44/14/2/2/6 at base + this design's additions) — including a **raw `sensing_observations.lock()` inserted under an authority capture**, which bypasses W-16's consult and is caught here | OA-2 | T4 | add a second acquisition path outside the inventory; or insert a raw `.lock()` inside a capture |
 | W-20 | the zero-retry override names every org-exact-sensing binary, and the `SDK/sensing.rs:689` guard asserts all **eleven** names (the ten appended in D10.2 plus the pre-existing `sensing_provider`) | OA-2 | T4 | drop a `binary(..)` from `.config/nextest.toml:55` |
-| W-21 | **the dark-boundary inventory is by MODULE BOUNDARY, over a module an external crate can actually name**: `org_exact_sensing_bridge` is declared `pub` at `src/adapter/net/mod.rs` (never inside the private `mod mesh;` at `:53`), every declaration in that file carries the exact cfg + `#[doc(hidden)]` + the `S/evaluator.rs:1882` sentence in `///` rustdoc, the declaration set equals the probe `MANIFEST`, it is the only `pub` item OA-5 adds under `src/`, and no bridge identifier appears in `A/mesh.rs` | OA-5 | T4 | add a sixth, differently named bridge; declare one outside the file; make the module `pub(crate)`; or nest it inside `mesh.rs` |
+| W-21 | **the dark-boundary inventory is by MODULE BOUNDARY, over a module an external crate can actually name**: `org_exact_sensing_bridge` is declared `pub` at `src/adapter/net/mod.rs` (never inside the private `mod mesh;` at `:53`), every declaration in that file carries the exact cfg + `#[doc(hidden)]` + the `S/evaluator.rs:1882` sentence in `///` rustdoc, the declaration set equals the probe `MANIFEST`, it is the only `pub` item OA-5 adds under `src/`, and no bridge identifier appears in `A/mesh.rs` | OA-5 | T4 | add an eighth, differently named bridge beyond the seven-entry OA bridge manifest; declare one outside the file; make the module `pub(crate)`; or nest it inside `mesh.rs` |
 | W-22 | the allocator issues at most `MAX_LEASE_TOKEN` and never `u64::MAX` | OA-3 | T5 | restore `fetch_add` |
 | W-23 | the acquire after the last issuable token is refused, typed and fail-closed | OA-3 | T5 | wrap instead of refusing |
 | W-24 | at exhaustion incumbents keep tokens, cadence and streams; existing tickets still release, including the terminal `Deregister` | OA-3 | T5 | tear down incumbents on exhaustion |
@@ -3657,7 +3658,7 @@ document before commit.
 | Class | Result |
 |---|---|
 | a core-crate declaration naming an SDK type | **eliminated**; `probe_family_binding_state(&OrgClient)` deleted, bridge = **7** declarations |
-| an OA-5 reference to `SDK/org/call.rs`, `SDK/org/client.rs`, `OrgClient`, `bind_node`, or `org_sensed_candidate_permutation` | **eliminated**; OA-5 drives the core bridge only, and says so explicitly |
+| an OA-5 **assignment** against `SDK/org/call.rs`, `SDK/org/client.rs`, `OrgClient`, `bind_node`, or `org_sensed_candidate_permutation` | OA-5 contains no implementation assignment, file-scope assignment, witness assignment, or required edit for these SDK surfaces; W-49..W-51 and W-55 are assigned exclusively to OA-6/T11. Explanatory exclusions legitimately name these identifiers, so no claim is made about raw occurrences |
 | W-49, W-50, W-51 or W-55 assigned to OA-5 / T9 / T4 | **eliminated**; all four are OA-6 / T11 |
 | a count invented to preserve the old eight | **eliminated**; seven everywhere — MANIFEST, positive probe, `tests/ui` listing, negative cases, `.stderr` table, W-52, T10 |
 | T4 stated as 6 anywhere | **eliminated**; T4 = 5 in the table, the block, the audit and the sweep |
