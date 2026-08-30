@@ -200,7 +200,14 @@ opaque authority-epoch comparison:
 
 7. the hot path is an `ArcSwap` load of a **change-driven immutable
    `OrgRouteSet`** — no rediscovery, candidate scan, observation scan, sort,
-   interest reconciliation, or registration wait (§7);
+   interest reconciliation, or registration wait (§7). *(Scoped 2026-08-30:
+   the observation-scan clause is the UNSENSED/cold path. A sensed OA-6 call
+   adds exactly one bounded `sensing_observations` section over the already
+   authorized SameOrg population — `<= 32` lookups, never a full or unbounded
+   scan, never a second aggregate/detail scan — with all route and budget work
+   off that lock; every other clause here holds on both paths. See §14 and
+   [`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md)
+   D6.4/D6.8.)*;
 8. the per-call contract is route-set load, authority-epoch comparison,
    temporal window recheck, P2C sample, proof, dispatch — all O(1) (§7);
 9. per-request sorting of Ready candidates is prohibited; the fallback
@@ -2037,8 +2044,10 @@ Exit witnesses:
 - **an UNSENSED warmed call issues no scoped-store query, no
   observation-map scan, no sort, and no registration emission**
   (instrumented witness). *(Scoped 2026-08-30: a SENSED org call adds
-  exactly one bounded `sensing_observations` critical section reading at
-  most 32 rows — see
+  exactly one bounded `sensing_observations` critical section over the
+  already authorized SameOrg population, reading at most 32 rows, with
+  no full/global/unbounded scan and no second aggregate/detail scan —
+  see
   [`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md)
   D6.4 and the divergence record in D6.8. The scoped-store, sort and
   emission clauses remain true on BOTH paths; only the observation-read
@@ -2220,10 +2229,24 @@ The plan is complete when all are true:
       ttl/2 refresh; the observation is `Unknown`/`Potential` until
       repair and no `org.call` fails; a last-holder close disarms the
       refresh owner (no ghost demand).
-- [ ] The warmed org.call path is: ArcSwap route-set load → two-index
-      P2C → proof → send — no rediscovery, no candidate revalidation
-      scan, no observation scan, no sorting, no interest
-      reconciliation, no registration wait.
+- [ ] The warmed **unsensed** org.call path is: ArcSwap route-set load →
+      two-index P2C → proof → send — no rediscovery, no candidate
+      revalidation scan, no observation scan, no sorting, no interest
+      reconciliation, no registration wait. Cold behavior is likewise
+      unchanged.
+- [ ] A **sensed** org.call (OA-6 only) adds exactly ONE bounded
+      `sensing_observations` critical section over the ALREADY
+      AUTHORIZED SameOrg candidate population (`|population| <= 32`,
+      `O(population)` map lookups), followed by route estimation,
+      budget classification and ranking performed entirely OFF that
+      lock. It performs **no full, global or unbounded scan** and **no
+      second aggregate/detail scan** — one section, one pass. Every
+      other clause of the row above still holds on the sensed path:
+      no scoped-store query, no candidate revalidation, no sort of the
+      authorized list, no interest reconciliation, no registration
+      emission, no registration wait. *(Reconciled 2026-08-30; see
+      [`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md)
+      D6.4 for the mechanism and D6.8 for the divergence record.)*
 - [ ] Route sets are immutable, change-driven, single-flight rebuilt,
       and published **publish-if-current** over the full
       source-generation vector — a stale computation never publishes;
