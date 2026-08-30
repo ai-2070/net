@@ -210,8 +210,10 @@ opaque authority-epoch comparison:
    off that lock; every other clause here holds on both paths. See §14 and
    [`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md)
    D6.4/D6.8.)*;
-8. the per-call contract is route-set load, authority-epoch comparison,
-   temporal window recheck, P2C sample, proof, dispatch — all O(1) (§7);
+8. the per-call contract for an **UNSENSED** call is route-set load,
+   authority-epoch comparison, temporal window recheck, P2C sample, proof,
+   dispatch — all O(1) (§7). A **sensed** organization-audience call follows the
+   seven-step contract in §2A instead: it does **not** use P2C;
 9. per-request sorting of Ready candidates is prohibited; the fallback
    vector is sorted once at rebuild (§9). *(Scoped 2026-08-30: this is the
    UNSENSED warmed-pool track. A sensed organization-audience call performs one
@@ -262,7 +264,8 @@ findings and four bounded corrections, all applied in this revision:
    — `Unknown` never prunes; `NonViable` prunes only from fresh exact
    evidence; the error field is `non_viable`, not `not_ready` (§8, §10).
 6. **The P2C sampler contract is pinned** (seed + nonce; reproducible,
-   non-stampeding) (§9).
+   non-stampeding) (§9) — for **UNSENSED** selection. A sensed
+   organization-audience call does not use P2C; see §2A.
 
 **Current execution point:** architecture and Option-A OLB-0 are signed; OLB-1
 candidate factoring is signed at `4dccb7767`. The bounded stop-and-review that
@@ -449,6 +452,47 @@ kind's classification and nothing else (the OSDK-L review rule).
 
 ---
 
+## 2A. The ACTIVE organization exact-sensing contract
+
+**This section governs. Where any other section of this plan disagrees about how a
+SENSED organization-audience call works, this section wins and that text is
+historical.** The governing design is
+[`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md);
+this is its summary, not a second definition.
+
+A sensed `org.call` performs exactly these seven steps, in this order:
+
+1. **existing** authorized candidates in the **existing global deterministic
+   order**, with owner-first `push_unique` dedup — unchanged;
+2. **one bounded per-call snapshot** of at most **32** already-authorized SameOrg
+   observation rows, inside a single `sensing_observations` critical section
+   (design D6.4);
+3. **release the observation lock** — before anything below it;
+4. **off-lock** route estimate + request-relative budget classification
+   (design D6.5 Phases 2-3);
+5. a **linear stable bucket permutation** over the `<= 32` candidates — three
+   buckets concatenated, `<= 1024` integer compares, no comparator, no `sort_by`
+   (design D7.2);
+6. **existing** final currentness comparison, proof mint, one invocation,
+   provider-side admission — all unchanged;
+7. **unsensed and cold behavior is unchanged**, including `ProviderNotDirect`.
+
+**Therefore, for the sensed path, this plan does NOT specify:**
+
+| Not used | Where the historical text lives |
+|---|---|
+| an `ArcSwap`-published readiness artifact or `OrgRouteSet` as the **sensing** source | §7 (bannered). The route set remains the ROUTE/authority artifact for unsensed calls. |
+| a routing-actor observation join, or "never on the request path" | §5.1/§13 OLB-2 bullet (superseded in place) |
+| P2C for sensed selection | §9 (bannered), §13 item 7, §7 complexity table |
+| "no per-call ordering work" / "no per-call sort" | §1 pin 9, §9 — scoped to unsensed |
+| "zero observation scans" on a sensed call | §1 pin 7, §14 — scoped to unsensed |
+| a cached sensing generation as the release readiness architecture | §7 `RouteSourceGeneration.sensing` remains a ROUTE-rebuild input, never the per-call readiness source |
+
+A warmed observation pool may be revisited later as a **separate** optimization.
+It cannot contradict steps 1-7.
+
+---
+
 ## 3. Current baseline (grounded)
 
 ### 3.1 The org call path
@@ -582,14 +626,14 @@ OrgClient::call(service)
 authorized candidate set (SameOrg subset)
 → one exact-provider, org-authenticated sensing lease per authorized
   same-org provider (retained in OrgRoutingState, §7)
-→ join resulting observations against the same authorized population
-  (resolved_population clamp as projection-stage defense in depth)
-→ classify each candidate:
+→ ONE bounded per-call snapshot of that population's observation rows
+  (<= 32; the lock is released before any other work) — §2A
+→ classify each candidate OFF the lock:
      evidence    Ready(estimated_start) | Unknown | NotReady
      projection  Viable(cost) | Potential | NonViable
 
-Viable + Potential
-→ shared sensed-provider selector (pinned P2C contract, §9)
+Viable + Potential + NonViable
+→ linear stable bucket permutation (design D7.2) — NOT P2C, NOT a sort
 → exact EntityId
 
 selected provider + selected authority relation
@@ -972,6 +1016,13 @@ organization call still proceeds
 Never an unbounded per-client or node-wide service/watch cache.
 
 ### The hot path: a change-driven immutable route set
+
+> **SUPERSEDED — NOT AN IMPLEMENTATION CONTRACT.**
+> The block below is the historical OLB-2/OLB-3 warmed-pool proposal for sensed
+> selection. It does **not** describe organization-audience exact sensing, which
+> is governed by
+> [`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md)
+> — see §2A below for the seven-step active contract. Retained for provenance only.
 
 The warmed request path is:
 
@@ -1408,7 +1459,7 @@ authority/private discovery; it never uses stale cached candidates. A revocation
 linearized after the epoch check races the call in the normal way; one
 linearized before it cannot pass with an old route set.
 
-Per-call complexity (ordinary warmed):
+Per-call complexity (ordinary **UNSENSED** warmed):
 
 ```text
 route-set load                    O(1)
@@ -1416,6 +1467,20 @@ coherent authority-epoch compare  O(1)   mandatory
 per-call temporal recheck         O(1)   clock math
 P2C sampling                      O(1)
 proof construction                O(1)
+exact dispatch                    O(1), excluding network
+```
+
+Per-call complexity (**SENSED**, organization-audience exact sensing — §2A):
+
+```text
+coherent authority-epoch compare  O(1)   mandatory, unchanged
+per-call temporal recheck         O(1)   clock math, unchanged
+ONE observation snapshot          O(N)   N = |authorized SameOrg| <= 32,
+                                         one bounded critical section
+route estimate + budget classify  O(N)   OFF the lock
+linear stable bucket permutation  O(N^2) <= 1024 integer compares at N <= 32,
+                                         no comparison sort (design D7.2)
+proof construction                O(1)   unchanged
 exact dispatch                    O(1), excluding network
 ```
 
@@ -1676,6 +1741,13 @@ Potential/Unknown         → retained as potential capacity
 
 ### Ordering
 
+> **SUPERSEDED — NOT AN IMPLEMENTATION CONTRACT.**
+> The block below is the historical OLB-2/OLB-3 warmed-pool proposal for sensed
+> selection. It does **not** describe organization-audience exact sensing, which
+> is governed by
+> [`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md)
+> — see §2A below for the seven-step active contract. Retained for provenance only.
+
 1. Viable candidates
 2. Potential candidates
 
@@ -1898,7 +1970,8 @@ not wait for it. The minimal org-specific sequence is:
 4. clone-shared bounded OrgRoutingState handles  (OLB-2)
 5. node-shared bounded base facts/scheduler       (OLB-2)
 6. immutable route sets + authority epoch         (OLB-2)
-7. O(1) P2C selection                             (OLB-3)
+7. O(1) P2C selection (UNSENSED only; a sensed
+   call uses the §2A bucket permutation)         (OLB-3)
 8. live three-node witness                        (OLB-5)
 ```
 
@@ -2138,7 +2211,14 @@ Exit witnesses:
 - a provider present in sensing but absent from authorized discovery
   never appears.
 
-### OLB-3 — shared sensed selector
+### OLB-3 — shared UNSENSED selector
+
+> **SUPERSEDED for organization exact sensing — NOT AN IMPLEMENTATION CONTRACT
+> for that path.** A sensed organization-audience call uses the linear stable
+> bucket permutation of §2A step 5 and
+> [`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md)
+> D7.2 — **not** P2C. The block below remains the contract for unsensed warmed
+> selection only.
 
 Apply the pinned P2C contract (§9) over the `Viable` cost:
 
@@ -2372,14 +2452,20 @@ The bounded first release is:
 ```text
 OrgClient private discovery
 → owner-private verified providers
-→ current SameOrg authority match
+→ current SameOrg authority match          (existing global deterministic order,
+                                            owner-first push_unique dedup)
 → exact-provider org-authenticated sensing leases
-→ fresh Viable / Potential / NonViable projection
-→ Viable P2C
-→ Potential deterministic fallback
+→ ONE bounded per-call snapshot of <= 32 authorized SameOrg observation rows
+→ release the observation lock
+→ OFF-LOCK route estimate + request-relative budget classification
+    fresh Viable / Potential / NonViable
+→ linear stable bucket permutation           (design D7.2 — NOT P2C, NOT a sort)
+→ existing final currentness comparison
 → one exact OrgProofIntent call
 → provider-local OrgAdmission
 ```
+
+Unsensed and cold calls are unchanged and still take the P2C path of §9.
 
 Granted calls remain:
 
