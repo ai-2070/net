@@ -226,7 +226,8 @@ opaque authority-epoch comparison:
     `OrgRoutingState` clone family) with deterministic truncation and
     `org_sensing_truncated_total` (§7);
 11. `OrgClient`'s internals are pinned to four operations — maintain
-    candidates, maintain leases, project route sets, select — never a
+    candidates, maintain leases, project route sets (the route/authority
+    artifact — **never a sensed readiness artifact**, see §2A), select — never a
     mini scheduler (§2, §7);
 12. the release sequence is decoupled from the broader sensing roadmap
     (§13 scope note).
@@ -487,6 +488,13 @@ A sensed `org.call` performs exactly these seven steps, in this order:
 | "no per-call ordering work" / "no per-call sort" | §1 pin 9, §9 — scoped to unsensed |
 | "zero observation scans" on a sensed call | §1 pin 7, §14 — scoped to unsensed |
 | a cached sensing generation as the release readiness architecture | §7 `RouteSourceGeneration.sensing` remains a ROUTE-rebuild input, never the per-call readiness source |
+| a sensed `OrgRouteSet` / "project sensed route sets" | §1 pin, §14 exit row — scoped to the route/authority plane; there is no sensed readiness artifact |
+| `NoViableProvider`, a new wire kind, X1 fixture regeneration, or binding-classifier updates | §10 and OLB-4 (bannered). **An all-pruned exact list falls back to the original authorized order with NO new error** (design D7.2, W-47), and the design's §15 authorizes no bindings and no wire vocabulary. |
+| P2C on a **cold** or `Inert` call | §13 (corrected). Cold and `Inert` take the existing deterministic unsensed plan; P2C is warmed-unsensed-only. |
+| "two comparisons on each call" | §13 bottom line (corrected) — that is the warmed-unsensed contract. A sensed call is one bounded section plus an `O(C * S)` permutation. |
+| a "64 capabilities" demand bound | §14 (corrected) — the bound is **64 authority-scoped demands per clone family** (`org_routing_registry.rs:52`). |
+| family deadlines arming a reconciler timer | §14 (scoped) — family `OrgRouteSet` deadlines arm NOTHING; the exact-sensing refresh owner is the node-global lease due-set (design D4.6). |
+| exact-sensing lease OWNERSHIP in `OrgRoutingState` | §7 (scoped) — ownership is the separate `OrgSensingFamily`/`OrgSensingFamilyInner` graph (design D5.1/D5.2); `OrgRoutingState` and `org_routing_registry.rs` are not modified. |
 
 A warmed observation pool may be revisited later as a **separate** optimization.
 It cannot contradict steps 1-7.
@@ -1817,6 +1825,20 @@ No public policy knob is needed in v1.
 
 ## 10. No-viable-provider result
 
+> **SUPERSEDED FOR ORGANIZATION EXACT SENSING — NOT AN IMPLEMENTATION CONTRACT
+> for that path.** The governing design
+> ([`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md)
+> D7.2, W-47) freezes the opposite behaviour: **an all-pruned exact-sensing list
+> falls back to the ORIGINAL authorized order and introduces NO new error.** With
+> `ranked` empty the bucket permutation emits the input order unchanged, so a
+> call is still made and `NoViableProvider` is never produced. Consequently, for
+> the exact SameOrg sensing lane this section's `NoViableProvider` variant, its
+> wire kind, its X1 fixture regeneration, its four binding-classifier updates and
+> its `net_org.h` vocabulary edit are **all out of scope** — that design's §15
+> authorizes **no language bindings and no wire vocabulary at all**. The section
+> below remains the proposal for a future, separately reviewed budget-aware
+> refusal on some other lane; nothing in the exact-sensing slices depends on it.
+
 If every authorized candidate is NonViable on fresh exact evidence, the
 SDK must not pretend there was no authority and must not issue a call
 known to miss its readiness budget.
@@ -2091,7 +2113,12 @@ For same-org candidates:
 - on first retained route slot per service, acquire one exact-provider lease per
   authorized same-org provider (enqueued, never awaited); on
   provider-set change, acquire new / release removed; on last client
-  drop, release all;
+  drop, release all. *(Scoped 2026-08-30: the **ownership** of those
+  exact-provider leases is NOT `OrgRoutingState`. Design D5.1/D5.2 freezes a
+  separate `OrgSensingFamily` / `OrgSensingFamilyInner` graph with its own
+  `demand_mu`, `Drop` on the inner only, and a two-state `OrgSensingBinding` on
+  `OrgClient`. `OrgRoutingState` and `org_routing_registry.rs` are explicitly NOT
+  modified by that design; only the existing `new_family` mint is reused.)*;
 - add the **node-global sensing-interest ttl/2 refresh owner** — the
   convergence backstop for a reordered stale deregister (§7). This is
   owned by the node-global lease lifecycle, not an SDK family: one refresh owner
@@ -2253,6 +2280,15 @@ Exit witnesses:
 
 ### OLB-4 — exact invocation and error closure
 
+> **SUPERSEDED FOR ORGANIZATION EXACT SENSING (see §10's banner).** The exact
+> design introduces **no new error, no wire kind, no fixture regeneration and no
+> binding change**: an all-pruned list falls back to the original authorized order
+> (D7.2, W-47). The `NoViableProvider` work below belongs to a future separately
+> reviewed lane. The invariants in the list that are NOT about the new error —
+> admission stays remote, sensing never changes an `OrgProofIntent` field, one
+> call means one call id and one signature, no second attempt after timeout or
+> denial — **remain active and are preserved by the exact design** (its D9.4).
+
 Add `NoViableProvider` (with the `non_viable` count field), regenerate
 the X1 fixture, update the four binding classifiers plus the
 `net_org.h` vocabulary comment, and prove:
@@ -2284,8 +2320,11 @@ Witness:
 6. B changes to NotReady (`notify_sensing_state_changed`);
 7. next `org.call` invokes A;
 8. A's provider-local admission still verifies the proof;
-9. removing/revoking A leaves no viable provider →
-   `NoViableProvider`, nothing sent;
+9. removing/revoking A leaves no viable provider → **on the exact-sensing lane
+   the call still goes out in the original authorized order and no new error is
+   produced** (design D7.2/W-47). *(Corrected 2026-08-30: this item previously
+   required `NoViableProvider` and nothing sent, which the governing design
+   contradicts — see §10's banner.)*;
 10. no plaintext capability announcement leaks the service, and the
     provider-free sensing population never contains it.
 
@@ -2373,7 +2412,13 @@ The plan is complete when all are true:
       and published **publish-if-current** over the full
       source-generation vector — a stale computation never publishes;
       staleness on read enqueues a rebuild, never performs one inline.
-- [ ] Authority validity deadlines arm a reconciler timer; expiry
+- [ ] Authority validity deadlines arm a reconciler timer — **on the route/authority
+      plane only.** *(Scoped 2026-08-30: family `OrgRouteSet` deadlines arm
+      NOTHING, per
+      [`OLB_2B3B_WARMED_CALL_BOUNDARY_DESIGN.md`](OLB_2B3B_WARMED_CALL_BOUNDARY_DESIGN.md)
+      §"Family `OrgRouteSet` deadlines — these arm NOTHING", and the exact-sensing
+      refresh owner is the node-global lease due-set of design D4.6, not a family
+      timer.)* expiry
       rebuilds and reselects without waiting for an external event;
       no expired credential enters `OrgProofIntent`.
 - [ ] The registration wire is the pinned appended 0x0C02 organization
@@ -2394,13 +2439,16 @@ The plan is complete when all are true:
 - [ ] The per-call temporal recheck of membership/dispatcher/grant
       remains on the hot path — the route cache is never an authority
       cache.
-- [ ] Sensed fan-out is bounded (32 providers / 64 capabilities) with
+- [ ] Sensed fan-out is bounded (32 sensed providers per capability /
+      **64 authority-scoped demands per clone family**, `MAX_HANDLES_PER_FAMILY`
+      at `org_routing_registry.rs:52`) with
       deterministic truncation observable via
       `org_sensing_truncated_total`.
 - [ ] `OrgClient`'s internals are exactly: maintain candidates,
-      maintain leases, project route sets, select — and, on the sensed
-      path only, one per-call observation snapshot plus one stable
-      class-ordering pass (design D6.4/D7.2) — no retry queues,
+      maintain leases, project route sets (route/authority plane), select —
+      and, on the sensed path only, one per-call observation snapshot plus
+      one linear bucket permutation (design D6.4/D7.2) — **no sensed
+      `OrgRouteSet` and no published sensing artifact** — no retry queues,
       weights, EWMA, breakers, sticky sessions, probing, or policy
       configuration.
 - [ ] Viable is preferred over Potential; Potential remains eligible.
@@ -2465,7 +2513,11 @@ OrgClient private discovery
 → provider-local OrgAdmission
 ```
 
-Unsensed and cold calls are unchanged and still take the P2C path of §9.
+Unsensed **warmed** calls are unchanged and still take the P2C path of §9.
+**Cold and `Inert` calls take neither**: they use the existing deterministic
+unsensed plan — sorted authorized order, first direct candidate — exactly as
+today, which is also the Granted path shown immediately below. P2C is
+warmed-unsensed-only and describes no part of the exact-sensing lane.
 
 Granted calls remain:
 
@@ -2496,12 +2548,18 @@ another framework: one authenticated organization sensing registration
 seam, exact-provider leases for private providers, one bounded
 clone-shared routing state, and one internal selector.
 
-The performance contract, in one line:
+The performance contract, in one line — **for the unsensed warmed pool**:
 
 ```text
 complexity on state changes
-→ two comparisons on each call
+→ two comparisons on each warmed UNSENSED call
 ```
+
+For a **sensed** exact-sensing call the contract is §2A's, not this one: one
+bounded observation section over `S <= 32` rows, then off-lock classification and
+an `O(C * S)` bucket permutation over the `C` complete authorized candidates
+(design D7.2). *(Corrected 2026-08-30: the unqualified "two comparisons on each
+call" was false for the sensed lane.)*
 
 never:
 

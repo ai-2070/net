@@ -852,10 +852,14 @@ no grant or provider scan, emits no registration, and does not move the
 final-validation → `MeshNode::call` boundary asserted above. **Ordering is the
 one exception, and it is deliberate:** a sensed call performs a **linear stable
 bucket permutation** over the `<= 32` already-authorized candidates — three
-buckets concatenated, at most 1024 integer compares at that bound, **no
-comparator, no `sort_by`, no P2C** (that design's D7.2). The existing global sort
-is untouched and remains the tie-break of record; **no comparison sort is added on
-any path**. An unsensed or cold call is byte-for-byte as described here.
+buckets concatenated, `O(C * S)` with `S <= 32` sensed rows over `C` complete
+candidates, **no comparator over `C`, no `sort_by`, no P2C** (that design's D7.2).
+The existing global sort is untouched and remains the tie-break of record; **no
+comparison sort is added over the complete candidate list**. Sorts *inside* the
+bounded sensing projection helper already exist and are unchanged
+(`scheduler_bridge/readiness.rs:82`, `:84`, `:85`, each over `<= 32` entries) —
+that design's D7.2a inventories them. An unsensed or cold call is byte-for-byte as
+described here.
 
 ## 12. Witnesses
 
