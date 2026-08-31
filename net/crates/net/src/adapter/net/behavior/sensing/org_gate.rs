@@ -474,7 +474,7 @@ pub(crate) fn validate_org_frame_shape<'a>(
     // deduplicated). The capability leg carries a `consumer`, not a `target`,
     // and is checked by the routed-origin binding in step 3 instead.
     if let Leg::Provider { target, .. } = &leg {
-        if spec.providers != ProviderSelector::Node(*target) {
+        if !selector_names_target(&spec, *target) {
             return Err(OrgSensingRejection::SelectorTargetMismatch);
         }
     }
@@ -576,6 +576,105 @@ fn verify_org_admission_with_shape(
             gate_proof: GateProof(()),
         },
     }))
+}
+
+/// The ONE selector <-> target exactness rule (design D2.6), shared by the
+/// inbound intake gate and the local-origin egress planner so the two can never
+/// disagree about what "exact provider" means.
+///
+/// `Node(target)` is the only coherent shape: an exact-provider interest is one
+/// interest per provider, and `ProviderSelector` is part of the interest digest,
+/// so a broader selector would either corrupt the merge-miss denominator
+/// (`AnyAuthorized` makes `is_provider_free()` true) or split one semantic
+/// interest across two digests (`Nodes` is canonically sorted and deduplicated).
+pub(crate) fn selector_names_target(spec: &InterestSpec, target: u64) -> bool {
+    spec.providers == ProviderSelector::Node(target)
+}
+
+/// Why a LOCAL-ORIGIN organization egress was refused. Every variant is a hard
+/// refusal: nothing is minted, installed or emitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LocalOrgEgressRefusal {
+    /// The spec's audience is not the canonical sensing commitment of the
+    /// organization the captured membership proves. The audience is DERIVED
+    /// from installed authority; a caller cannot name one.
+    AudienceNotDerived,
+    /// The interest selector does not name the lease's own target
+    /// (design D2.6) — the same rule the inbound gate enforces.
+    SelectorTargetMismatch,
+}
+
+/// A validated local-origin organization egress plan, and an unforgeable proof
+/// that a LIVE local membership was captured for it.
+///
+/// Constructible only from a [`LiveOrgRelayMembership`], which is itself
+/// constructible only inside this module by
+/// [`capture_live_org_relay_membership`] — so a caller cannot inject an
+/// audience commitment, an owner root, a certificate, or an organization id,
+/// and cannot fabricate this token to reach the egress planner.
+///
+/// The certificate is cloned OUT of the live token deliberately: the token is
+/// deliberately not `Clone`, and the frame needs an owned certificate. Cloning
+/// the cert copies signed bytes only — it confers no authority and does not
+/// extend the token's lifetime.
+pub(crate) struct LocalOrgEgress {
+    proven_root: AudienceScopeCommitment,
+    membership: OrgMembershipCert,
+}
+
+impl LocalOrgEgress {
+    /// Derive the egress plan from a live local membership capture. The proven
+    /// root is `canonical_org_sensing_commitment(org)` — the SAME derivation
+    /// the admitted-wrapper uses, never a caller value and never
+    /// `validate_subscriber_scope`'s legacy entity root.
+    pub(crate) fn from_live_membership(membership: &LiveOrgRelayMembership) -> Self {
+        Self {
+            proven_root: canonical_org_sensing_commitment(&membership.org_id()),
+            membership: membership.owner_cert().clone(),
+        }
+    }
+
+    /// The organization-derived root the interest table row registers under.
+    pub(crate) fn proven_root(&self) -> AudienceScopeCommitment {
+        self.proven_root
+    }
+}
+
+/// Plan the LOCAL-ORIGIN organization provider registration frame.
+///
+/// There is deliberately **no `Legacy` arm**: this function is reachable only
+/// with a [`LocalOrgEgress`], which only a live organization membership capture
+/// can produce, so a legacy authority cannot reach it and it can emit nothing
+/// but [`SensingInterestFrame::OrgProviderRegistration`]. That is the structural
+/// counterpart to `plan_provider_continuation`'s exhaustive authority match on
+/// the inbound relay path — and unlike that planner, this one has no legacy
+/// frame to fall back to even in principle.
+///
+/// Both refusals are checked BEFORE the frame is built, so a refused plan emits
+/// nothing.
+pub(crate) fn plan_local_org_provider_registration(
+    egress: &LocalOrgEgress,
+    spec: &InterestSpec,
+    target: u64,
+    requested_sample_interval: Duration,
+    soft_state_ttl: Duration,
+) -> Result<SensingInterestFrame, LocalOrgEgressRefusal> {
+    // The audience must be the one DERIVED from the captured membership's
+    // organization. This is the local mirror of intake step 8, and it is what
+    // makes "no caller-supplied audience" checkable rather than merely intended.
+    if spec.audience != egress.proven_root {
+        return Err(LocalOrgEgressRefusal::AudienceNotDerived);
+    }
+    if !selector_names_target(spec, target) {
+        return Err(LocalOrgEgressRefusal::SelectorTargetMismatch);
+    }
+    Ok(SensingInterestFrame::org_provider_registration(
+        spec,
+        target,
+        requested_sample_interval,
+        soft_state_ttl,
+        egress.membership.clone(),
+    ))
 }
 
 /// The leg-specific parameters extracted from the frame once (step 1). `Copy`
@@ -2612,5 +2711,145 @@ mod tests {
             run(&coherent, &member(), Some(authority()), &empty_floors()).is_ok(),
             "shape + admission agrees with the single-call verifier"
         );
+    }
+
+    // ---- LOCAL-ORIGIN ORG EGRESS PLANNER ---------------------------------
+
+    /// Build a live local membership capture for a freshly adopted relay, and
+    /// derive the egress plan from it. This is the ONLY way to obtain a
+    /// `LocalOrgEgress` — the plan cannot be constructed from caller-supplied
+    /// audience/root/certificate material.
+    fn local_egress(tag: &str) -> (EntityId, LocalOrgEgress) {
+        let (relay_entity, authority, store) = adopt_relay(tag, 1);
+        let membership = capture_relay(
+            Some(authority),
+            Some(store),
+            &relay_entity,
+            org_kp().org_id(),
+            now_secs(),
+        )
+        .expect("relay membership");
+        let plan = LocalOrgEgress::from_live_membership(&membership);
+        (relay_entity, plan)
+    }
+
+    /// The planner emits ONLY the org variant, carrying THIS node's own live
+    /// membership certificate. There is no `Legacy` arm to reach: a
+    /// `LocalOrgEgress` can only come from an organization membership capture,
+    /// so a legacy authority cannot produce a frame here even in principle.
+    #[test]
+    fn the_local_org_planner_emits_only_the_org_variant_with_its_own_membership() {
+        const TARGET: u64 = 0x77;
+        let (relay_entity, plan) = local_egress("local-egress-emit");
+        let spec = spec_with(plan.proven_root());
+        let frame = plan_local_org_provider_registration(&plan, &spec, TARGET, D, TTL)
+            .expect("a coherent own-org plan emits a frame");
+        match frame {
+            SensingInterestFrame::OrgProviderRegistration {
+                target,
+                subscriber_membership,
+                audience_scope,
+                ..
+            } => {
+                assert_eq!(target, TARGET);
+                assert_eq!(
+                    subscriber_membership.member, relay_entity,
+                    "the frame carries THIS node's own live membership"
+                );
+                assert_eq!(
+                    audience_scope,
+                    canonical_org_sensing_commitment(&org_kp().org_id()),
+                    "the audience is derived from installed authority"
+                );
+            }
+            other => panic!("expected OrgProviderRegistration, got {other:?}"),
+        }
+    }
+
+    /// The audience is DERIVED, not accepted: a caller-chosen audience that is
+    /// not the captured organization's canonical commitment is refused before
+    /// any frame is built.
+    #[test]
+    fn the_local_org_planner_refuses_an_audience_it_did_not_derive() {
+        let (_, plan) = local_egress("local-egress-audience");
+        // A legacy entity root, and a foreign organization's commitment.
+        for audience in [
+            AudienceScopeCommitment::owner_root(&member()),
+            canonical_org_sensing_commitment(&OrgKeypair::from_bytes([0x99u8; 32]).org_id()),
+        ] {
+            let spec = spec_with(audience);
+            assert_eq!(
+                plan_local_org_provider_registration(&plan, &spec, 0x77, D, TTL).err(),
+                Some(LocalOrgEgressRefusal::AudienceNotDerived),
+                "only the derived audience may be spoken for"
+            );
+        }
+    }
+
+    /// The planner enforces the SAME exactness rule as the inbound gate, via
+    /// the one shared predicate.
+    #[test]
+    fn the_local_org_planner_refuses_a_selector_that_does_not_name_the_target() {
+        let (_, plan) = local_egress("local-egress-selector");
+        let mut spec = spec_with(plan.proven_root());
+        for selector in [
+            ProviderSelector::Node(0x88),
+            ProviderSelector::AnyAuthorized,
+            ProviderSelector::Nodes(vec![0x77]),
+        ] {
+            spec.providers = selector;
+            assert_eq!(
+                plan_local_org_provider_registration(&plan, &spec, 0x77, D, TTL).err(),
+                Some(LocalOrgEgressRefusal::SelectorTargetMismatch)
+            );
+        }
+        // And the one shared predicate is the same rule the gate uses.
+        let coherent = spec_with(plan.proven_root());
+        assert!(selector_names_target(&coherent, 0x77));
+        assert!(!selector_names_target(&coherent, 0x88));
+    }
+
+    /// A membership captured for ANOTHER organization cannot be obtained at all:
+    /// the capture itself refuses, so no egress plan exists to speak for it.
+    #[test]
+    fn a_membership_for_another_org_yields_no_local_egress_plan() {
+        let (relay_entity, authority, store) = adopt_relay("local-egress-foreign", 1);
+        let outcome = capture_relay(
+            Some(authority),
+            Some(store),
+            &relay_entity,
+            foreign_org(),
+            now_secs(),
+        );
+        // `LiveOrgRelayMembership` is deliberately not `Debug` (it is an
+        // authority proof, not a printable value), so match rather than unwrap.
+        match outcome {
+            Err(RelayMembershipUnavailable::ForeignOrg) => {}
+            Err(other) => panic!("expected ForeignOrg, got {other:?}"),
+            Ok(_) => panic!("a capture for a foreign org must be refused"),
+        }
+    }
+
+    /// The emitted local frame passes the REAL intake gate unchanged — the
+    /// producer and the checker agree byte for byte, including the new
+    /// selector/target step.
+    #[test]
+    fn an_emitted_local_org_lease_frame_passes_the_real_intake_gate() {
+        const TARGET: u64 = 0x77;
+        let (relay_entity, plan) = local_egress("local-egress-roundtrip");
+        let spec = spec_with(plan.proven_root());
+        let frame = plan_local_org_provider_registration(&plan, &spec, TARGET, D, TTL)
+            .expect("frame planned");
+        let validated = run(&frame, &relay_entity, Some(authority()), &empty_floors())
+            .expect("the planner's own frame must be admitted by the intake gate");
+        match &validated.0 {
+            ValidatedInner::Provider {
+                target, spec: got, ..
+            } => {
+                assert_eq!(*target, TARGET);
+                assert_eq!(got, &spec, "the admitted spec equals the planned spec");
+            }
+            _ => panic!("expected a provider registration"),
+        }
     }
 }

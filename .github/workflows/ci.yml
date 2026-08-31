@@ -467,11 +467,16 @@ jobs:
       #     including the selector ↔ target relation and the authority-free
       #     shape phase;
       #   * `mesh::sensing_authority_witness_tests` — the PRODUCTION dispatch
-      #     ordering witness, which proves a malformed selector is refused
-      #     before any `org_install` snapshot and installs no row.
+      #     ordering witness, plus the LOCAL-ORIGIN organization lease-egress
+      #     witnesses: an own-org exact lease registers under the
+      #     organization-derived proven root (never `sensing_local_root`), the
+      #     exactness rule holds on egress, a foreign audience never enters the
+      #     org path, a node without authority cannot produce an org lease, and
+      #     the legacy lease path is unchanged.
       #
-      # This step does NOT gate organization lease egress; that path is not
-      # implemented yet and nothing here should be read as claiming it.
+      # This step gates local-origin org lease EGRESS. It does NOT gate
+      # projection, ranking, refresh workers, `OrgClient` wiring or any
+      # production arm lighting — none of that exists yet.
       #
       # WHY THIS SHAPE. An earlier revision parsed the first
       # `test result: ok. N passed` it could find and checked required names
@@ -513,19 +518,20 @@ jobs:
       # deliberately excludes `fixtures`, so a fixtures gate would compile these
       # modules to a silent 0-test no-op here.
       #
-      # FLOOR accounting: org_gate 42 pre-existing + 7 added = 49;
-      # sensing_authority_witness_tests 28 pre-existing + 1 added = 29. A later
-      # slice RAISES a floor and APPENDS its names in the same commit that adds
-      # the witnesses — never separately, or the gate goes red on a name that
-      # does not exist yet.
+      # FLOOR accounting: org_gate 42 baseline + 7 (selector-target intake) + 5
+      # (local-origin org egress planner) = 54; sensing_authority_witness_tests
+      # 28 baseline + 1 (dispatch ordering) + 6 (local org lease egress) = 35. A
+      # later slice RAISES a floor and APPENDS its names in the same commit that
+      # adds the witnesses — never separately, or the gate goes red on a name
+      # that does not exist yet.
       - name: Selector-target org intake witnesses
         if: ${{ !cancelled() }}
         run: |
           set -uo pipefail
           GATE=adapter::net::behavior::sensing::org_gate::tests
           MESH=adapter::net::mesh::sensing_authority_witness_tests
-          GATE_MIN=49
-          MESH_MIN=29
+          GATE_MIN=54
+          MESH_MIN=35
 
           die() { echo "::error::$1"; shift; [ "$#" -gt 0 ] && printf '%s\n' "$@"; exit 1; }
 
@@ -589,9 +595,20 @@ jobs:
           the_selector_target_check_precedes_every_other_authority_refusal
           an_exact_selector_naming_the_target_is_admitted_unchanged
           an_emitted_local_org_frame_passes_the_intake_gate_unmodified
-          the_shape_phase_refuses_a_malformed_selector_with_no_authority_input"
-          # The production dispatch-ordering witness:
-          MESH_REQUIRED="a_malformed_selector_is_refused_before_any_authority_snapshot"
+          the_shape_phase_refuses_a_malformed_selector_with_no_authority_input
+          the_local_org_planner_emits_only_the_org_variant_with_its_own_membership
+          the_local_org_planner_refuses_an_audience_it_did_not_derive
+          the_local_org_planner_refuses_a_selector_that_does_not_name_the_target
+          a_membership_for_another_org_yields_no_local_egress_plan
+          an_emitted_local_org_lease_frame_passes_the_real_intake_gate"
+          # The production dispatch-ordering + LOCAL LEASE EGRESS witnesses:
+          MESH_REQUIRED="a_malformed_selector_is_refused_before_any_authority_snapshot
+          an_own_org_exact_lease_registers_under_the_org_proven_root
+          an_own_org_lease_refuses_a_selector_that_does_not_name_the_target
+          a_foreign_org_audience_never_enters_the_local_org_egress
+          a_node_without_org_authority_cannot_produce_an_org_lease
+          a_legacy_audience_lease_still_registers_under_the_local_root
+          an_org_audience_sensing_lease_is_never_laundered_into_a_legacy_frame"
 
           check_one() {
             fqn="$1"
