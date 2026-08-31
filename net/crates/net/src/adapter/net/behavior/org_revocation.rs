@@ -3011,12 +3011,27 @@ mod tests {
         assert_eq!(poison_path_key(&indirect), expected, "memo is stable");
     }
 
-    /// Unique per-test scratch dir (house pattern — no tempfile dev-dep).
-    /// A scratch directory for one test's state file and `.lock` sidecar.
+    /// A per-PROCESS salt for scratch paths, sampled once. `process::id()`
+    /// alone is NOT unique over time — see
+    /// `super::org_authority::tests::a_scratch_dir_is_never_inherited_from_an_existing_directory`
+    /// for the full reasoning; the same hazard applies verbatim here.
+    static SCRATCH_SALT: std::sync::LazyLock<u128> = std::sync::LazyLock::new(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    });
+
+    /// A scratch directory for one test's state file and `.lock` sidecar
+    /// (house pattern — no tempfile dev-dep).
     ///
-    /// **It deliberately does not delete itself.** The path is already unique
-    /// per test through `TEST_DIR_SEQ`, so cleanup would only reclaim disk —
-    /// and on unix it would do something far worse than save a few bytes.
+    /// **It deliberately does not delete itself.** Cleanup would only reclaim
+    /// disk — and on unix it would do something far worse than save a few bytes.
+    ///
+    /// The path is unique per test through `TEST_DIR_SEQ` *within one process*,
+    /// and across processes through `SCRATCH_SALT` plus the `create_dir` claim.
+    /// `TEST_DIR_SEQ` alone is NOT enough: because nothing is ever deleted,
+    /// `pid-seq` collides with an earlier run whenever the OS recycles the PID.
     ///
     /// [`BackingId::FileId`] keys the PROCESS-GLOBAL core registry by the
     /// sidecar's `(device, inode)`, so that two path aliases of one sidecar
@@ -3035,13 +3050,23 @@ mod tests {
     struct Scratch(PathBuf);
     impl Scratch {
         fn new() -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "net-org-revocation-{}-{}",
-                std::process::id(),
-                TEST_DIR_SEQ.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::create_dir_all(&dir).expect("create scratch dir");
-            Self(dir)
+            for _ in 0..64 {
+                let dir = std::env::temp_dir().join(format!(
+                    "net-org-revocation-{}-{:x}-{}",
+                    std::process::id(),
+                    *SCRATCH_SALT,
+                    TEST_DIR_SEQ.fetch_add(1, Ordering::Relaxed)
+                ));
+                // `create_dir` — never `create_dir_all`: it fails with
+                // `AlreadyExists`, so a residual collision with an earlier run
+                // is refused instead of adopting that run's revocation state.
+                match std::fs::create_dir(&dir) {
+                    Ok(()) => return Self(dir),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => panic!("create scratch dir {}: {e}", dir.display()),
+                }
+            }
+            panic!("could not claim a unique scratch dir after 64 attempts");
         }
         fn state_path(&self) -> PathBuf {
             self.0.join("revocation-state.json")

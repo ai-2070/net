@@ -2759,25 +2759,116 @@ mod tests {
 
     static TEST_DIR_SEQ: AtomicUsize = AtomicUsize::new(0);
 
+    /// A per-PROCESS salt for scratch paths, sampled once.
+    ///
+    /// `process::id()` alone is NOT unique over time — see the regression test
+    /// below for why that matters here.
+    static SCRATCH_SALT: std::sync::LazyLock<u128> = std::sync::LazyLock::new(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    });
+
+    fn scratch_salt() -> u128 {
+        *SCRATCH_SALT
+    }
+
+    /// Take EXCLUSIVE ownership of `dir`, or refuse.
+    ///
+    /// `create_dir` — never `create_dir_all`: it fails with `AlreadyExists` on
+    /// an existing directory, so a residual path collision is refused instead
+    /// of silently adopting whatever the previous owner left behind.
+    fn claim_scratch(dir: &Path) -> Option<PathBuf> {
+        if let Some(parent) = dir.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match std::fs::create_dir(dir) {
+            Ok(()) => Some(dir.to_path_buf()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => None,
+            Err(e) => panic!("create scratch dir {}: {e}", dir.display()),
+        }
+    }
+
     struct Scratch(PathBuf);
     impl Scratch {
         fn new() -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "net-org-authority-{}-{}",
-                std::process::id(),
-                TEST_DIR_SEQ.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::create_dir_all(&dir).expect("create scratch dir");
-            Self(dir)
+            for _ in 0..64 {
+                let dir = std::env::temp_dir().join(format!(
+                    "net-org-authority-{}-{:x}-{}",
+                    std::process::id(),
+                    scratch_salt(),
+                    TEST_DIR_SEQ.fetch_add(1, Ordering::Relaxed)
+                ));
+                if let Some(dir) = claim_scratch(&dir) {
+                    return Self(dir);
+                }
+            }
+            panic!("could not claim a unique scratch dir after 64 attempts");
         }
         fn dir(&self) -> &Path {
             &self.0
         }
     }
 
-    // NO `Drop` that deletes this directory, deliberately. The path is already
-    // unique per test through `TEST_DIR_SEQ`, so cleanup would only reclaim
-    // disk — and on unix it would cost far more than it saves.
+    /// PID-REUSE REGRESSION. `claim_scratch` must REFUSE a directory that
+    /// already exists rather than adopt it.
+    ///
+    /// `process::id()` is not unique over time: nextest runs one short-lived
+    /// process per test (thousands per run), Windows recycles PIDs
+    /// aggressively, every fresh process restarts `TEST_DIR_SEQ` at 0, and
+    /// these directories are deliberately never deleted (see the note above).
+    /// So `pid-seq` alone reproduces an EARLIER RUN's path, and the old
+    /// `create_dir_all` handed that run's directory back with its
+    /// `owner-audience.key` and revocation state still inside — which is
+    /// exactly how "a refused adoption left owner-audience.key" and
+    /// wrong-variant `OrgAuthorityError` assertions failed in varying
+    /// combinations across unrelated witnesses.
+    #[test]
+    fn a_scratch_dir_is_never_inherited_from_an_existing_directory() {
+        let base = std::env::temp_dir().join(format!(
+            "net-org-authority-claimtest-{}-{:x}",
+            std::process::id(),
+            scratch_salt()
+        ));
+        let squatted = base.join("squatted");
+        std::fs::create_dir_all(&squatted).expect("pre-create the colliding dir");
+        std::fs::write(squatted.join("owner-audience.key"), b"stale").expect("populate it");
+        assert!(
+            claim_scratch(&squatted).is_none(),
+            "an EXISTING directory must be refused, never adopted — adopting it \
+             inherits the previous run's authority artifacts"
+        );
+        // A never-seen sibling is claimed, and comes back empty.
+        let fresh = base.join("fresh");
+        assert!(
+            claim_scratch(&fresh).is_some(),
+            "a new path must be claimed"
+        );
+        assert_eq!(
+            std::fs::read_dir(&fresh).expect("read fresh").count(),
+            0,
+            "a freshly claimed scratch dir is empty"
+        );
+        // And the real constructor yields an empty directory.
+        let scratch = Scratch::new();
+        assert_eq!(
+            std::fs::read_dir(scratch.dir())
+                .expect("read scratch")
+                .count(),
+            0,
+            "Scratch::new must never hand back a populated directory"
+        );
+    }
+
+    // NO `Drop` that deletes this directory, deliberately. Cleanup would only
+    // reclaim disk — and on unix it would cost far more than it saves.
+    //
+    // The path is unique per test through `TEST_DIR_SEQ` *within one process*,
+    // and across processes through `SCRATCH_SALT` plus the `create_dir` claim.
+    // `TEST_DIR_SEQ` alone is NOT enough: because nothing is ever deleted,
+    // `pid-seq` collides with an earlier run whenever the OS recycles the PID.
+    // See `a_scratch_dir_is_never_inherited_from_an_existing_directory`.
     //
     // An authority dir holds `REVOCATION_STATE_FILE` and its `.lock` sidecar,
     // and `OrgRevocationStore` keys its PROCESS-GLOBAL core registry by that
