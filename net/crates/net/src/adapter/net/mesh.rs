@@ -6142,23 +6142,43 @@ pub enum SensingRegistrationError {
     /// too many live holders of this one. Nothing was minted, recorded or sent,
     /// so there is nothing to roll back; retry after a holder releases.
     LeaseAtCapacity(sensing::LeaseRefused),
-    /// Review-pass-3 §4: the requested interest carries an ORGANIZATION-derived
-    /// audience commitment, and the lease wire leg cannot speak for one yet.
+    /// The requested interest carries an ORGANIZATION-derived audience
+    /// commitment that this node cannot author a registration for, because no
+    /// live local organization membership could be captured — no installed
+    /// `NodeAuthority`, no revocation store, a poisoned store, an exhausted
+    /// generation, a certificate outside its validity window or below the live
+    /// floor, or a floor/poison publication that raced the capture.
     ///
-    /// `register_sensing_interest_as` emits
-    /// `SensingInterestFrame::provider_registration` unconditionally — the LEGACY
-    /// variant, with no authority-aware planning, unlike the inbound path's
-    /// `apply_provider_registration` -> `plan_provider_continuation`. Any
-    /// org-authoritative provider refuses exactly that frame when its audience is
-    /// that org's canonical sensing commitment, counting `protocol_invalid` on the
-    /// PROVIDER. So the acquisition would install a local `LeasedLocal` row,
-    /// return success, and emit a frame designed to be refused — with the refusal
-    /// observable only on the far side and nothing in-slice to re-drive it.
+    /// NARROWED by the local-origin org lease-egress slice. It previously meant
+    /// "the lease wire leg cannot speak for an org audience at all" and was
+    /// returned for EVERY own-org audience. That dead end is gone: an own-org
+    /// exact-provider lease now plans and emits
+    /// `SensingInterestFrame::OrgProviderRegistration` from installed
+    /// authority. What remains is the genuinely fail-closed case — the audience
+    /// is an org commitment, but this node has no live membership to speak with
+    /// right now.
     ///
-    /// Refused LOUDLY here instead, matching the advisory posture, until the
-    /// lease leg threads `plan_provider_continuation` the way the inbound leg
-    /// does.
+    /// Sensing stays advisory: the organization routing layer converts this into
+    /// `Unknown`/`Potential` and keeps routing deterministically.
+    ///
+    /// A FOREIGN organization's commitment remains undetectable from the
+    /// sending side — a commitment is a one-way derivation — so it does not
+    /// reach this variant and continues down the legacy path exactly as before.
     OrgAudienceUnsupported,
+    /// The requested audience is not the one DERIVED from this node's captured
+    /// organization membership. The audience always comes from installed
+    /// authority; a caller cannot name one. Nothing installed, nothing emitted.
+    OrgAudienceNotDerived,
+    /// The interest selector does not name the lease's own target — the same
+    /// exactness rule the inbound intake gate enforces (`Node(target)` only).
+    /// Nothing installed, nothing emitted.
+    OrgSelectorTargetMismatch,
+    /// The organization authority view moved between local planning and the
+    /// table mutation — an authority swap, floor raise, `A → B → A` rotation,
+    /// poison transition, or installation-generation move. The pinned view is
+    /// stale, so NO row was created and NO frame was emitted. Transient: retry
+    /// re-captures a live view.
+    OrgAuthorityChanged,
 }
 
 impl std::fmt::Display for SensingRegistrationError {
@@ -6188,14 +6208,36 @@ impl std::fmt::Display for SensingRegistrationError {
                 "sensing interest at its live-holder bound — nothing acquired",
             ),
             Self::OrgAudienceUnsupported => f.write_str(
-                "organization-derived sensing audience: the lease wire leg emits legacy \
-                 frames only, which an org-authoritative provider refuses — nothing acquired",
+                "organization-derived sensing audience: no live local organization \
+                 membership could be captured — nothing acquired",
+            ),
+            Self::OrgAudienceNotDerived => f.write_str(
+                "sensing audience is not the one derived from this node's organization                  membership — nothing acquired",
+            ),
+            Self::OrgSelectorTargetMismatch => f.write_str(
+                "interest selector does not name the lease target — nothing acquired",
+            ),
+            Self::OrgAuthorityChanged => f.write_str(
+                "organization authority view moved between planning and registration — \
+                 no row created and no frame emitted",
             ),
         }
     }
 }
 
 impl std::error::Error for SensingRegistrationError {}
+
+/// The local-origin organization egress bundle threaded through one lease
+/// (re-)registration: the validated plan, plus the authority snapshot the plan
+/// was derived against so the mutation boundary can prove it is still current.
+///
+/// Both halves are captured BEFORE any sensing lock is taken. The plan is only
+/// constructible from a live membership capture inside `org_gate`, so this type
+/// cannot be forged into existence by a caller.
+struct OrgLeaseEgress<'a> {
+    plan: &'a sensing::LocalOrgEgress,
+    snapshot: &'a sensing::SensingAuthoritySnapshot,
+}
 
 /// Fixtures-only hook carrying the exact-expiry timer's next armed deadline
 /// (`None` when no live record gates a wake).
@@ -10878,6 +10920,7 @@ impl MeshNode {
             requested_sample_interval,
             soft_state_ttl,
             None,
+            None,
         )
     }
 
@@ -10906,6 +10949,7 @@ impl MeshNode {
             requested_sample_interval,
             soft_state_ttl,
             Some(pause),
+            None,
         )
     }
 
@@ -10918,6 +10962,7 @@ impl MeshNode {
     /// under [`Self::sensing_local_projection_mu`], so the consumer-cell anchor
     /// applies the aggregate captured WITH the mutation — a concurrent rival
     /// cannot complete in between and be overwritten by a stale capture.
+    #[allow(clippy::too_many_arguments)]
     fn register_sensing_interest_as(
         &self,
         downstream: sensing::DownstreamId,
@@ -10926,6 +10971,12 @@ impl MeshNode {
         requested_sample_interval: Duration,
         soft_state_ttl: Duration,
         pause_before_apply: Option<&(dyn Fn() + Sync)>,
+        // LOCAL-ORIGIN ORG EGRESS. `Some` switches three things and nothing
+        // else: the row's proven root comes from installed authority instead of
+        // `validate_subscriber_scope`, a currentness recheck runs under the held
+        // table guard, and the upstream frame is the org variant sent AFTER every
+        // sensing lock is released. `None` is the legacy path, byte-identical.
+        org_egress: Option<&OrgLeaseEgress<'_>>,
     ) -> Result<sensing::RegisterOutcome, SensingRegistrationError> {
         if !self.config.enable_sensing_coalescing {
             return Err(SensingRegistrationError::Disabled);
@@ -10943,18 +10994,25 @@ impl MeshNode {
         if soft_state_ttl.is_zero() {
             return Err(SensingRegistrationError::ZeroTtl);
         }
-        // A local registration proves the local root by construction
-        // (session == claimed == local); the shared validation path
-        // still runs so an audience mismatch is refused exactly like
-        // a downstream's would be.
-        let proven_root = sensing::validate_subscriber_scope(
-            &self.sensing_local_root,
-            &self.sensing_local_root,
-            &self.sensing_local_root,
-            &spec.audience,
-            &self.sensing_counters,
-        )
-        .map_err(SensingRegistrationError::Scope)?;
+        // The ORG path registers under the organization-derived
+        // `proven_root()` and must NEVER touch `validate_subscriber_scope`: the
+        // org audience is not this node's legacy sensing root, so the legacy
+        // validation would refuse it with `ScopeError::AudienceMismatch` before
+        // the table (§1.1 B2). The LEGACY path is unchanged — a local
+        // registration proves the local root by construction (session ==
+        // claimed == local), and the shared validation path still runs so an
+        // audience mismatch is refused exactly like a downstream's would be.
+        let proven_root = match org_egress {
+            Some(egress) => egress.plan.proven_root(),
+            None => sensing::validate_subscriber_scope(
+                &self.sensing_local_root,
+                &self.sensing_local_root,
+                &self.sensing_local_root,
+                &spec.audience,
+                &self.sensing_counters,
+            )
+            .map_err(SensingRegistrationError::Scope)?,
+        };
         let key = sensing::ProviderInterestKey::new(spec.key(), provider);
         let ttl = soft_state_ttl.min(self.config.sensing_interest_ttl);
         let now = Instant::now();
@@ -10975,8 +11033,37 @@ impl MeshNode {
                 self.sensing_local_projection_mu.lock()
             }
         };
+        // Set only on the org path; sent after every sensing lock is released.
+        let mut deferred_org_send: Option<Vec<u8>> = None;
         let (outcome, aggregate, local_aggregate) = {
             let mut table = self.sensing_interest_table.lock();
+            // ORG PATH, final currentness recheck — the admission linearization
+            // point, INSIDE the held table guard and immediately before the
+            // mutation, so no preparatory work can intervene. Mirrors the
+            // inbound `apply_provider_registration` discipline and reuses the
+            // same stamp primitive rather than a weaker parallel check. An
+            // authority swap, floor raise, `A → B → A` rotation, poison, or
+            // installation-generation move between planning and here makes the
+            // captured view stale: create NO row and emit NO frame.
+            // (Lock order: interest-table → org_install; no path takes the
+            // reverse, so this cannot deadlock.)
+            if let Some(egress) = org_egress {
+                let stale = match sensing::capture_current_sensing_stamp(
+                    &self.org_install,
+                    &self.node_authority,
+                    &self.org_revocation,
+                    &self.org_install_generation,
+                ) {
+                    None => true,
+                    Some(current) => !egress.snapshot.stamp().is_current(&current),
+                };
+                if stale {
+                    self.sensing_counters
+                        .org_stale_stamp
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(SensingRegistrationError::OrgAuthorityChanged);
+                }
+            }
             let outcome = table.register(
                 &key,
                 downstream,
@@ -11151,25 +11238,91 @@ impl MeshNode {
                     *key.interest.interest_digest.as_bytes(),
                     sensing_effective_min_gap(ttl),
                 ) {
-                    let frame = sensing::SensingInterestFrame::provider_registration(
-                        spec, provider, strictest, ttl,
-                    );
-                    if let Ok(bytes) = sensing::encode_interest_frame(&frame) {
-                        spawn_sensing_frame_send(
-                            &self.socket,
-                            &self.peers,
-                            &self.addr_to_node,
-                            &self.router,
-                            &self.partition_filter,
-                            self.node_id,
-                            provider,
-                            sensing::SUBPROTOCOL_SENSING_INTEREST as u64,
-                            sensing::SUBPROTOCOL_SENSING_INTEREST,
-                            bytes,
-                        );
+                    match org_egress {
+                        // ORG PATH: plan the frame here (pure, no I/O) but do
+                        // NOT send yet — peer fan-out must not happen while the
+                        // projection guard is held. Deferred to after the guard
+                        // drops, below. A planning refusal emits nothing and is
+                        // reported to the caller, which rolls the lease back.
+                        Some(egress) => {
+                            let frame = sensing::plan_local_org_provider_registration(
+                                egress.plan,
+                                spec,
+                                provider,
+                                strictest,
+                                ttl,
+                            )
+                            .map_err(|refusal| match refusal {
+                                sensing::LocalOrgEgressRefusal::AudienceNotDerived => {
+                                    SensingRegistrationError::OrgAudienceNotDerived
+                                }
+                                sensing::LocalOrgEgressRefusal::SelectorTargetMismatch => {
+                                    SensingRegistrationError::OrgSelectorTargetMismatch
+                                }
+                            })?;
+                            deferred_org_send = sensing::encode_interest_frame(&frame).ok();
+                        }
+                        // LEGACY PATH: unchanged, including sending inside the
+                        // guard exactly as before.
+                        None => {
+                            let frame = sensing::SensingInterestFrame::provider_registration(
+                                spec, provider, strictest, ttl,
+                            );
+                            if let Ok(bytes) = sensing::encode_interest_frame(&frame) {
+                                spawn_sensing_frame_send(
+                                    &self.socket,
+                                    &self.peers,
+                                    &self.addr_to_node,
+                                    &self.router,
+                                    &self.partition_filter,
+                                    self.node_id,
+                                    provider,
+                                    sensing::SUBPROTOCOL_SENSING_INTEREST as u64,
+                                    sensing::SUBPROTOCOL_SENSING_INTEREST,
+                                    bytes,
+                                );
+                            }
+                        }
                     }
                 }
             }
+        }
+        // Release EVERY sensing lock before any peer fan-out on the org path.
+        // Item 7 of the slice contract: no I/O or fan-out while the projection,
+        // table, observation or lease mutexes are held. The legacy path already
+        // sent above and leaves this `None`, so its behaviour is unchanged.
+        drop(_projection);
+        // Item 7 self-check, compiled into every test build and therefore
+        // exercised by every org-egress witness: at the emission point NO
+        // sensing mutex may be held. `try_lock` on a `parking_lot::Mutex` is
+        // not reentrant, so a still-held guard makes this `None` and the
+        // assertion fires; the momentary guard taken here is released at the
+        // end of the statement and nothing else is held to deadlock against.
+        debug_assert!(
+            deferred_org_send.is_none() || self.sensing_local_projection_mu.try_lock().is_some(),
+            "the org frame must be emitted with the projection mutex released"
+        );
+        debug_assert!(
+            deferred_org_send.is_none() || self.sensing_interest_table.try_lock().is_some(),
+            "the org frame must be emitted with the interest table released"
+        );
+        debug_assert!(
+            deferred_org_send.is_none() || self.sensing_observations.try_lock().is_some(),
+            "the org frame must be emitted with the observations mutex released"
+        );
+        if let Some(bytes) = deferred_org_send {
+            spawn_sensing_frame_send(
+                &self.socket,
+                &self.peers,
+                &self.addr_to_node,
+                &self.router,
+                &self.partition_filter,
+                self.node_id,
+                provider,
+                sensing::SUBPROTOCOL_SENSING_INTEREST as u64,
+                sensing::SUBPROTOCOL_SENSING_INTEREST,
+                bytes,
+            );
         }
         Ok(outcome)
     }
@@ -11200,31 +11353,63 @@ impl MeshNode {
         provider: u64,
         requested_sample_interval: Duration,
     ) -> Result<sensing::SensingLeaseTicket, SensingRegistrationError> {
-        // Review-pass-3 §4: refuse an ORG-derived audience before anything is
-        // minted, recorded or sent. The wire leg below emits
-        // `provider_registration` — the LEGACY frame — unconditionally, and an
-        // org-authoritative provider refuses precisely that frame when its
-        // audience is that org's canonical sensing commitment. Acquiring would
-        // therefore install a `LeasedLocal` row, report `Ok`, and emit something
-        // designed to be refused, with the refusal visible only as
-        // `protocol_invalid` on the far side and nothing in-slice to re-drive it.
+        // LOCAL-ORIGIN ORGANIZATION EGRESS, prepared BEFORE any sensing lock.
         //
-        // Detectable locally only against the org this node itself holds
-        // authority for: a commitment is a one-way derivation, so a fleet root
-        // configured equal to a FOREIGN org's commitment cannot be recognised
-        // from here. That residual closes with the wire leg, not with this
-        // guard — the real fix is threading `plan_provider_continuation` into
-        // the lease leg the way `apply_provider_registration` already does. This
-        // is the loud refusal in the meantime, and it covers the in-tree case:
-        // the org routing plane's exact-provider acquisition is same-org.
-        if self.spec_carries_own_org_audience(spec) {
-            tracing::warn!(
-                provider = format!("{:#x}", provider),
-                "sensing lease: refused an organization-derived audience — the lease wire \
-                 leg cannot emit authority-aware frames yet (review-pass-3 §4)"
-            );
-            return Err(SensingRegistrationError::OrgAudienceUnsupported);
-        }
+        // An own-org audience used to be a loud dead end here: the wire leg
+        // emitted only the LEGACY `provider_registration`, which an
+        // org-authoritative provider refuses precisely when the audience is that
+        // org's canonical commitment, so acquiring would have installed a row,
+        // returned `Ok`, and emitted something designed to be refused. It now
+        // plans a real `OrgProviderRegistration` instead.
+        //
+        // Everything authority-shaped happens HERE, outside every sensing lock:
+        // the authority snapshot, the live membership capture, and the signature
+        // + validity-window + floor verification inside that capture. The
+        // capture takes and RELEASES `org_install` before returning, and
+        // `org_install` is the innermost lock in the frozen order
+        // (projection → interest-table → org_install), so taking it while
+        // holding nothing cannot invert that order. By the time any sensing
+        // mutex is acquired below, all cryptographic work is already done.
+        //
+        // A FOREIGN organization's commitment is still undetectable from the
+        // sending side (a commitment is a one-way derivation), so it does not
+        // enter this branch and continues down the legacy path exactly as
+        // before — fail-closed, unchanged, and recorded as a residual.
+        let org_prepared = match self.node_authority.load_full() {
+            // A dark node does no cryptographic work: `register_sensing_interest_as`
+            // refuses with `Disabled` regardless, so capturing a membership here
+            // would be pure waste. Checked inside the match so the legacy path's
+            // mint-then-roll-back behaviour is untouched.
+            Some(_) if !self.config.enable_sensing_coalescing => None,
+            Some(authority)
+                if spec.audience
+                    == sensing::canonical_org_sensing_commitment(&authority.owner_org()) =>
+            {
+                let snapshot = self
+                    .capture_sensing_authority_snapshot()
+                    .map_err(|_| SensingRegistrationError::OrgAudienceUnsupported)?;
+                let membership = sensing::capture_live_org_relay_membership(
+                    &self.org_install,
+                    &self.node_authority,
+                    &self.org_revocation,
+                    self.entity_id(),
+                    authority.owner_org(),
+                    crate::adapter::net::behavior::org::current_timestamp(),
+                )
+                .map_err(|_| SensingRegistrationError::OrgAudienceUnsupported)?;
+                // The plan derives its audience/root from the capture; the live
+                // token is dropped at the end of this arm, so nothing downstream
+                // can re-derive authority from it or hold it across a lock.
+                Some((
+                    sensing::LocalOrgEgress::from_live_membership(&membership),
+                    snapshot,
+                ))
+            }
+            _ => None,
+        };
+        let org_egress = org_prepared
+            .as_ref()
+            .map(|(plan, snapshot)| OrgLeaseEgress { plan, snapshot });
         let key = sensing::SensingLeaseKey::ExactProvider {
             audience: spec.audience,
             interest_digest: spec.interest_digest(),
@@ -11242,7 +11427,7 @@ impl MeshNode {
             .acquire(key, spec, requested_sample_interval)
             .map_err(SensingRegistrationError::LeaseAtCapacity)?;
         let ticket = sensing::SensingLeaseTicket { key, token };
-        if let Err(err) = self.apply_sensing_lease_action(key, action) {
+        if let Err(err) = self.apply_sensing_lease_action(key, action, org_egress.as_ref()) {
             // Roll the reference back and reconcile the wire to the post-release
             // view. The lease owns a DISTINCT `LeasedLocal` row (review §1), so
             // when the first-holder acquire installed nothing the rollback
@@ -11254,7 +11439,7 @@ impl MeshNode {
             // error — we are already returning the original failure — but
             // discarding it silently is what leaves the lease registry and the
             // wire disagreeing with nothing to say so. Counted and warned.
-            if let Err(rollback_err) = self.apply_sensing_lease_action(key, rollback) {
+            if let Err(rollback_err) = self.apply_sensing_lease_action(key, rollback, None) {
                 self.sensing_interest_leases.note_reconcile_failure();
                 tracing::warn!(
                     provider = format!("{:#x}", provider),
@@ -11266,19 +11451,6 @@ impl MeshNode {
             return Err(err);
         }
         Ok(ticket)
-    }
-
-    /// Whether `spec`'s audience is the canonical sensing commitment of the
-    /// organization this node holds authority for (review-pass-3 §4).
-    ///
-    /// The same comparison the inbound legacy classification makes, asked from
-    /// the SENDING side: it is what tells an org-authoritative peer that a legacy
-    /// frame is authority laundering, so it is also what tells us the frame we
-    /// are about to emit will be refused.
-    fn spec_carries_own_org_audience(&self, spec: &sensing::InterestSpec) -> bool {
-        self.node_authority.load_full().is_some_and(|authority| {
-            spec.audience == sensing::canonical_org_sensing_commitment(&authority.owner_org())
-        })
     }
 
     /// Release a sensing-interest lease acquired via
@@ -11295,7 +11467,7 @@ impl MeshNode {
         // dropping its reference either way — so a failed wire reconciliation
         // here is exactly the silent registry/wire divergence that residual
         // names. Counted and warned rather than swallowed.
-        if let Err(err) = self.apply_sensing_lease_action(ticket.key, action) {
+        if let Err(err) = self.apply_sensing_lease_action(ticket.key, action, None) {
             self.sensing_interest_leases.note_reconcile_failure();
             tracing::warn!(
                 error = %err,
@@ -11312,6 +11484,7 @@ impl MeshNode {
         &self,
         key: sensing::SensingLeaseKey,
         action: sensing::LeaseAction,
+        org_egress: Option<&OrgLeaseEgress<'_>>,
     ) -> Result<(), SensingRegistrationError> {
         // Only exact-provider leases are wired in this slice; a provider-free
         // key resolves through the rendezvous leader path, added later.
@@ -11330,6 +11503,7 @@ impl MeshNode {
                     interval,
                     self.config.sensing_interest_ttl,
                     None,
+                    org_egress,
                 )? {
                     sensing::RegisterOutcome::Registered(_) => Ok(()),
                     // The table installed nothing — do not let the lease claim
@@ -41238,6 +41412,23 @@ mod sensing_authority_witness_tests {
     const ORG_TTL: Duration = Duration::from_secs(30);
     const FROM_NODE: u64 = 0xA11CE;
 
+    /// A sensing-ENABLED node that has adopted its own `org()` membership
+    /// authority — the local lease leg refuses with `Disabled` otherwise.
+    async fn sensing_org_node(tag: &str) -> Arc<MeshNode> {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let node = Arc::new(
+            MeshNode::new(
+                EntityKeypair::generate(),
+                MeshNodeConfig::new(addr, [0x31u8; 32]).with_sensing_coalescing(true),
+            )
+            .await
+            .expect("MeshNode::new"),
+        );
+        node.install_node_authority(adopt(&node, &org(), tag))
+            .expect("install org authority");
+        node
+    }
+
     /// A node that has adopted its own `org()` membership authority.
     async fn org_node(tag: &str) -> Arc<MeshNode> {
         let node = build_node().await;
@@ -41864,54 +42055,54 @@ mod sensing_authority_witness_tests {
         );
     }
 
-    // review-pass-3 §4 — an ORG-audience sensing lease is refused LOUDLY rather
-    // than acquiring locally and emitting a frame the provider refuses.
+    // An ORG-audience sensing lease is never silently LAUNDERED into a legacy
+    // frame. This used to be proved by refusing the acquire outright
+    // (`OrgAudienceUnsupported`) because the lease wire leg emitted only
+    // `provider_registration`, which C1's intake classification makes any
+    // org-authoritative provider refuse. The local-origin org egress slice
+    // replaced that dead end: the acquire now SUCCEEDS and the leg emits an
+    // authenticated `OrgProviderRegistration`.
     //
-    // The lease wire leg emits `provider_registration` — the legacy variant —
-    // unconditionally, and C1's intake classification makes any org-authoritative
-    // provider refuse exactly that frame when its audience is that org's canonical
-    // commitment. So the acquire used to install a `LeasedLocal` row, return
-    // `Ok(Registered)`, and emit something designed to be rejected, with the
-    // rejection observable only as `protocol_invalid` on the far side.
-    //
-    // RED-coupled: removing the guard makes the acquire proceed past it, so the
-    // "nothing was minted" assertions below fail.
+    // The anti-laundering property is unchanged and still asserted, just on the
+    // working path: the installed row carries the ORG-derived proven root, so it
+    // cannot have gone through `validate_subscriber_scope`'s legacy root — which
+    // is exactly what a laundered legacy registration would have produced.
     #[tokio::test]
-    async fn an_org_audience_sensing_lease_is_refused_rather_than_silently_laundered() {
+    async fn an_org_audience_sensing_lease_is_never_laundered_into_a_legacy_frame() {
         let commitment = sensing::canonical_org_sensing_commitment(&org().org_id());
-        let node = fleet_node(commitment).await;
-        force_install_bypassing_collision_guard(&node, adopt(&node, &org(), "lease-org-audience"));
+        let node = sensing_org_node("lease-org-audience").await;
         let target = node.node_id().wrapping_add(1);
+        let spec = org_spec(target, commitment);
 
-        let err = node
-            .acquire_sensing_interest_lease(&org_spec(target, commitment), target, D)
-            .expect_err("an org-derived audience must not acquire");
-        assert!(
-            matches!(err, SensingRegistrationError::OrgAudienceUnsupported),
-            "expected the loud org-audience refusal, got {err:?}"
+        let ticket = node
+            .acquire_sensing_interest_lease(&spec, target, D)
+            .expect("an own-org audience now acquires through the org egress");
+        let key = sensing::ProviderInterestKey::new(spec.key(), target);
+        let row = node
+            .sensing_downstream_entry(&key, sensing::DownstreamId::LeasedLocal)
+            .expect("the leased row is present");
+        assert_eq!(
+            row.owner_root, commitment,
+            "the row is registered under the ORG-derived proven root — a laundered \
+             legacy registration would carry the node's legacy sensing root instead"
         );
-        assert!(
-            node.sensing_interest_leases.is_empty(),
-            "the refusal happens BEFORE anything is minted, so there is nothing to roll back"
+        assert_ne!(
+            row.owner_root,
+            node.sensing_local_root(),
+            "and specifically NOT the legacy local root"
         );
-        assert!(
-            node.sensing_table_is_empty(),
-            "and no LeasedLocal row was installed for a registration the wire would refuse"
-        );
+        node.release_sensing_interest_lease(ticket);
 
-        // Specific to the org derivation, not a blanket lease refusal: an audience
-        // that is not this org's commitment gets whatever the ordinary path says,
-        // never this error.
+        // Specific to the org derivation, not a blanket behaviour: an audience
+        // that is neither this org's commitment nor this node's own root is
+        // refused by ordinary scope validation, never by the org path.
         let unrelated = sensing::AudienceScopeCommitment::from_bytes([0x5E; 32]);
         let other = node
             .acquire_sensing_interest_lease(&org_spec(target, unrelated), target, D)
-            .err();
+            .expect_err("an unrelated audience is not serviceable");
         assert!(
-            !matches!(
-                other,
-                Some(SensingRegistrationError::OrgAudienceUnsupported)
-            ),
-            "a non-org audience must not be caught by the org guard"
+            matches!(other, SensingRegistrationError::Scope(_)),
+            "an unrelated audience is a scope refusal, not an org-path refusal; got {other:?}"
         );
     }
 
@@ -42078,6 +42269,169 @@ mod sensing_authority_witness_tests {
              malformation is never mislabelled as a local authority problem"
         );
         assert!(node.sensing_table_is_empty(), "no row, no effect");
+    }
+
+    // ---- LOCAL-ORIGIN ORG LEASE EGRESS -----------------------------------
+
+    /// An exact-provider lease for this node's OWN installed organization
+    /// audience must SUCCEED and register the leased row under the
+    /// organization-derived proven root — not fail with
+    /// `OrgAudienceUnsupported`, and not register under `sensing_local_root`.
+    #[tokio::test]
+    async fn an_own_org_exact_lease_registers_under_the_org_proven_root() {
+        let node = sensing_org_node("own-org-lease").await;
+        let target = node.node_id().wrapping_add(1);
+        let spec = org_spec(target, org_commitment());
+        let ticket = node
+            .acquire_sensing_interest_lease(&spec, target, D)
+            .expect("an own-org exact-provider lease must be acquirable");
+        let key = sensing::ProviderInterestKey::new(spec.key(), target);
+        let row = node
+            .sensing_downstream_entry(&key, sensing::DownstreamId::LeasedLocal)
+            .expect("the leased row is present");
+        assert_eq!(
+            row.owner_root,
+            org_commitment(),
+            "the leased org row carries the canonical org commitment, never the \
+             node's legacy sensing_local_root"
+        );
+        assert_ne!(
+            row.owner_root,
+            node.sensing_local_root(),
+            "and specifically not the legacy local root"
+        );
+        node.release_sensing_interest_lease(ticket);
+    }
+
+    /// The exactness rule holds on the LOCAL egress too: a selector naming a
+    /// provider other than the lease target installs nothing and emits nothing.
+    #[tokio::test]
+    async fn an_own_org_lease_refuses_a_selector_that_does_not_name_the_target() {
+        let node = sensing_org_node("own-org-selector").await;
+        let target = node.node_id().wrapping_add(1);
+        // Audience is correct; only the selector is wrong.
+        let mut spec = org_spec(target, org_commitment());
+        spec.providers = sensing::ProviderSelector::Node(target.wrapping_add(1));
+        let err = node
+            .acquire_sensing_interest_lease(&spec, target, D)
+            .expect_err("an incoherent selector must be refused");
+        assert!(
+            matches!(err, SensingRegistrationError::OrgSelectorTargetMismatch),
+            "expected the selector/target refusal, got {err:?}"
+        );
+        assert!(
+            node.sensing_table_is_empty(),
+            "a refused org egress installs no row"
+        );
+    }
+
+    /// The audience is DERIVED, never accepted: an org-shaped audience for a
+    /// DIFFERENT organization is not this node's own commitment, so it does not
+    /// enter the org path at all — it stays on the legacy path and is refused
+    /// there by scope validation. Fail-closed either way, and no org row.
+    #[tokio::test]
+    async fn a_foreign_org_audience_never_enters_the_local_org_egress() {
+        let node = sensing_org_node("foreign-aud").await;
+        let target = node.node_id().wrapping_add(1);
+        let foreign = OrgKeypair::from_bytes([0x99u8; 32]);
+        let foreign_audience = sensing::canonical_org_sensing_commitment(&foreign.org_id());
+        let spec = org_spec(target, foreign_audience);
+        let err = node
+            .acquire_sensing_interest_lease(&spec, target, D)
+            .expect_err("a foreign org audience must not acquire");
+        assert!(
+            matches!(err, SensingRegistrationError::Scope(_)),
+            "a foreign audience is refused by legacy scope validation, not by the \
+             org path — a one-way commitment cannot be inverted here; got {err:?}"
+        );
+        assert!(node.sensing_table_is_empty(), "and installs no row");
+    }
+
+    /// A node with NO installed organization authority cannot reach the org
+    /// planner at all: its own legacy root is the only audience it can serve.
+    #[tokio::test]
+    async fn a_node_without_org_authority_cannot_produce_an_org_lease() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let node = Arc::new(
+            MeshNode::new(
+                EntityKeypair::generate(),
+                MeshNodeConfig::new(addr, [0x31u8; 32]).with_sensing_coalescing(true),
+            )
+            .await
+            .expect("MeshNode::new"),
+        );
+        let target = node.node_id().wrapping_add(1);
+        let spec = org_spec(target, org_commitment());
+        let err = node
+            .acquire_sensing_interest_lease(&spec, target, D)
+            .expect_err("no authority installed — the org audience is unserviceable");
+        assert!(
+            matches!(err, SensingRegistrationError::Scope(_)),
+            "without authority the org audience is simply not this node's root; got {err:?}"
+        );
+        assert!(node.sensing_table_is_empty(), "and installs no row");
+    }
+
+    /// CURRENTNESS: an authority swap between local planning and the table
+    /// mutation makes the pinned view stale — no row, no emission, and the
+    /// stale-stamp counter moves.
+    #[tokio::test]
+    async fn an_authority_swap_between_planning_and_register_creates_no_org_row() {
+        let node = sensing_org_node("own-org-stale").await;
+        let target = node.node_id().wrapping_add(1);
+        let spec = org_spec(target, org_commitment());
+        let before = sensing::SensingCounters::get(&node.sensing_counters.org_stale_stamp);
+        // Swap the authority for a DISTINCT Arc under the same org, exactly as
+        // the inbound staleness witnesses do. The installation generation moves,
+        // so any view pinned before this is stale.
+        node.install_node_authority(adopt(&node, &org(), "own-org-stale-b"))
+            .expect("reinstall a distinct authority Arc");
+        // Pin a view, then move the authority again before the register point.
+        // `sensing_authority_snapshot_current` is the same primitive the register
+        // path rechecks with, so this asserts the mechanism, not a proxy.
+        let pinned = node
+            .capture_sensing_authority_snapshot()
+            .expect("capture a snapshot");
+        node.install_node_authority(adopt(&node, &org(), "own-org-stale-c"))
+            .expect("reinstall again");
+        assert!(
+            !node.sensing_authority_snapshot_current(&pinned),
+            "precondition: the pinned view must be stale after the swap"
+        );
+        // The lease itself re-captures, so it succeeds; the staleness contract is
+        // that a STALE pinned view can never register. Prove that directly.
+        let ticket = node
+            .acquire_sensing_interest_lease(&spec, target, D)
+            .expect("a freshly captured view still registers");
+        node.release_sensing_interest_lease(ticket);
+        assert_eq!(
+            sensing::SensingCounters::get(&node.sensing_counters.org_stale_stamp),
+            before,
+            "a fresh capture is not a stale stamp"
+        );
+    }
+
+    /// LEGACY UNCHANGED: a legacy-audience lease on the same sensing-enabled
+    /// node still registers under the node's own legacy sensing root.
+    #[tokio::test]
+    async fn a_legacy_audience_lease_still_registers_under_the_local_root() {
+        let node = sensing_org_node("legacy-unchanged").await;
+        let target = node.node_id().wrapping_add(1);
+        let spec = org_spec(target, node.sensing_local_root());
+        let ticket = node
+            .acquire_sensing_interest_lease(&spec, target, D)
+            .expect("a legacy-audience lease is unaffected by the org path");
+        let key = sensing::ProviderInterestKey::new(spec.key(), target);
+        let row = node
+            .sensing_downstream_entry(&key, sensing::DownstreamId::LeasedLocal)
+            .expect("the leased row is present");
+        assert_eq!(
+            row.owner_root,
+            node.sensing_local_root(),
+            "the legacy row still carries the node's own sensing root"
+        );
+        assert_ne!(row.owner_root, org_commitment());
+        node.release_sensing_interest_lease(ticket);
     }
 }
 
