@@ -106,6 +106,13 @@ impl OrgClient {
     /// was never simultaneously valid could authorize a call. One captured
     /// instant makes that unrepresentable, and it is the SAME instant the grant
     /// windows, the discovery filters and the expiry checks use.
+    // Its only consumers are the call verb's two currentness checks in
+    // `org/call.rs`, and that module is `#[cfg(feature = "cortex")]`
+    // (`org.rs`). `net-aggregator-daemon` is the one workspace build that
+    // takes this SDK without `cortex`, and `ffi-clippy` lints it at
+    // `-D warnings`, so there the method is genuinely dead. Same shape as
+    // the `node` field above and `hex_capability` in `org/error.rs`.
+    #[cfg_attr(not(feature = "cortex"), allow(dead_code))]
     pub(crate) fn check_current_at(&self, now_secs: u64) -> Result<(), OrgCredentialError> {
         self.membership
             .is_valid_at_with_skew(now_secs, self.skew_secs)
