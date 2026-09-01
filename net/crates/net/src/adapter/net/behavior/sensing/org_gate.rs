@@ -638,6 +638,20 @@ impl LocalOrgEgress {
     pub(crate) fn proven_root(&self) -> AudienceScopeCommitment {
         self.proven_root
     }
+
+    /// Carry this plan out of the guarded transaction so Phase 2 can author the
+    /// frame with every sensing guard released.
+    ///
+    /// This copies already-signed bytes plus a derived commitment. It confers no
+    /// authority, cannot be built from caller material, and does NOT make the
+    /// plan replayable across transitions: every transition runs its own fresh
+    /// capture, so current authority, membership and floor stay final.
+    pub(crate) fn clone_for_phase_two(&self) -> Self {
+        Self {
+            proven_root: self.proven_root,
+            membership: self.membership.clone(),
+        }
+    }
 }
 
 /// Plan the LOCAL-ORIGIN organization provider registration frame.
