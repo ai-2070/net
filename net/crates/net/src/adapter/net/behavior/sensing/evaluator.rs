@@ -261,6 +261,11 @@ pub struct SensingCounters {
     pub org_stale_stamp: AtomicU64,
     /// The installed revocation store is poisoned — all org intake fails dark.
     pub org_store_poisoned: AtomicU64,
+    /// A surviving-holder organization lease release was REFUSED at the final
+    /// currentness fence: nothing was released, the pre-transition registry and
+    /// table state stand, and no frame was emitted. Distinct from
+    /// `reconcile_failures`, which counts a divergence that already happened.
+    pub org_release_refused: AtomicU64,
 
     // ── Coalescing + delivery lifecycle (SI-7) ──
     /// Consumer capability-registrations admitted at THIS node's

@@ -51,6 +51,12 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 # superseded handle poking its successor's schedule, an edge that must arrive
 # far inside a deliberately long cadence. Every one of those fails only on the
 # interleaving that exposes the defect, which is exactly what retries hide.
+#
+# `sensing_org_lease_wire` joins for the same reason: its witnesses park one
+# organization transition mid-flight and prove a later one cannot overtake it,
+# and prove a refused transition puts nothing on the wire. Both are properties
+# of one specific interleaving, so a retry could only ever convert a real
+# ordering defect into a green run.
 [[profile.default.overrides]]
-filter = 'binary(integration_nrpc_protected) + binary(org_ownership) + binary(capability_exposure_revocation) + binary(org_admission_gate) + binary(org_admission_wire) + binary(nrpc_call_hijack) + binary(nrpc_response_routing) + binary(nrpc_service_equality) + binary(nrpc_route_discriminator) + binary(nrpc_streaming_gate) + binary(nrpc_registration_order) + binary(sensing_provider)'
+filter = 'binary(integration_nrpc_protected) + binary(org_ownership) + binary(capability_exposure_revocation) + binary(org_admission_gate) + binary(org_admission_wire) + binary(nrpc_call_hijack) + binary(nrpc_response_routing) + binary(nrpc_service_equality) + binary(nrpc_route_discriminator) + binary(nrpc_streaming_gate) + binary(nrpc_registration_order) + binary(sensing_provider) + binary(sensing_org_lease_wire)'
 retries = 0
