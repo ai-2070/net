@@ -531,7 +531,7 @@ jobs:
           GATE=adapter::net::behavior::sensing::org_gate::tests
           MESH=adapter::net::mesh::sensing_authority_witness_tests
           GATE_MIN=54
-          MESH_MIN=35
+          MESH_MIN=39
 
           die() { echo "::error::$1"; shift; [ "$#" -gt 0 ] && printf '%s\n' "$@"; exit 1; }
 
@@ -608,7 +608,12 @@ jobs:
           a_foreign_org_audience_never_enters_the_local_org_egress
           a_node_without_org_authority_cannot_produce_an_org_lease
           a_legacy_audience_lease_still_registers_under_the_local_root
-          an_org_audience_sensing_lease_is_never_laundered_into_a_legacy_frame"
+          an_org_audience_sensing_lease_is_never_laundered_into_a_legacy_frame
+          releasing_the_strictest_org_holder_reauthors_at_the_relaxed_cadence
+          the_off_lock_phase_assertion_fires_inside_the_guarded_phase
+          an_authority_swap_inside_the_capture_window_creates_no_org_row
+          a_floor_raise_inside_the_capture_window_creates_no_org_row
+          a_self_provider_org_lease_requires_selector_exactness"
 
           check_one() {
             fqn="$1"
@@ -1068,6 +1073,7 @@ jobs:
           --test sensing_org_three_node
           --test sensing_lease
           --test sensing_lease_wire
+          --test sensing_org_lease_wire
           --test sensing_failure_plane
           --test sensing_fallback
           --test sensing_origin_emitter

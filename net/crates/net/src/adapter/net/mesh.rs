@@ -6165,20 +6165,6 @@ pub enum SensingRegistrationError {
     /// sending side — a commitment is a one-way derivation — so it does not
     /// reach this variant and continues down the legacy path exactly as before.
     OrgAudienceUnsupported,
-    /// The requested audience is not the one DERIVED from this node's captured
-    /// organization membership. The audience always comes from installed
-    /// authority; a caller cannot name one. Nothing installed, nothing emitted.
-    OrgAudienceNotDerived,
-    /// The interest selector does not name the lease's own target — the same
-    /// exactness rule the inbound intake gate enforces (`Node(target)` only).
-    /// Nothing installed, nothing emitted.
-    OrgSelectorTargetMismatch,
-    /// The organization authority view moved between local planning and the
-    /// table mutation — an authority swap, floor raise, `A → B → A` rotation,
-    /// poison transition, or installation-generation move. The pinned view is
-    /// stale, so NO row was created and NO frame was emitted. Transient: retry
-    /// re-captures a live view.
-    OrgAuthorityChanged,
 }
 
 impl std::fmt::Display for SensingRegistrationError {
@@ -6208,18 +6194,8 @@ impl std::fmt::Display for SensingRegistrationError {
                 "sensing interest at its live-holder bound — nothing acquired",
             ),
             Self::OrgAudienceUnsupported => f.write_str(
-                "organization-derived sensing audience: no live local organization \
-                 membership could be captured — nothing acquired",
-            ),
-            Self::OrgAudienceNotDerived => f.write_str(
-                "sensing audience is not the one derived from this node's organization                  membership — nothing acquired",
-            ),
-            Self::OrgSelectorTargetMismatch => f.write_str(
-                "interest selector does not name the lease target — nothing acquired",
-            ),
-            Self::OrgAuthorityChanged => f.write_str(
-                "organization authority view moved between planning and registration — \
-                 no row created and no frame emitted",
+                "organization-derived sensing audience: this node could not author a \
+                 registration for it — nothing acquired, nothing emitted",
             ),
         }
     }
@@ -6238,6 +6214,65 @@ struct OrgLeaseEgress<'a> {
     plan: &'a sensing::LocalOrgEgress,
     snapshot: &'a sensing::SensingAuthoritySnapshot,
 }
+
+/// Everything Phase 2 needs to author and emit ONE organization frame, captured
+/// out of the guarded transaction so planning, certificate cloning, encoding,
+/// route/session work, sequence allocation, task spawn and peer fan-out all run
+/// with every sensing guard released.
+struct PendingOrgSend {
+    spec: sensing::InterestSpec,
+    provider: u64,
+    strictest: Duration,
+    ttl: Duration,
+    plan: sensing::LocalOrgEgress,
+}
+
+// Test-only phase instrumentation: how many sensing guards THIS THREAD is
+// currently holding inside a sensing transaction.
+//
+// This replaces an earlier `debug_assert!(mutex.try_lock().is_some())` probe,
+// which was wrong twice over: `try_lock` tests global AVAILABILITY, not this
+// thread's ownership, so it both raced a legitimate concurrent acquirer and
+// would have passed while this thread still held the guard on a reentrant
+// mutex. A thread-local depth is exact and cannot race: only this thread
+// mutates it.
+#[cfg(any(test, feature = "fixtures"))]
+thread_local! {
+    static SENSING_GUARD_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// RAII depth marker for the sensing transaction, test builds only.
+#[cfg(any(test, feature = "fixtures"))]
+struct SensingPhaseMark;
+
+#[cfg(any(test, feature = "fixtures"))]
+impl SensingPhaseMark {
+    fn enter() -> Self {
+        SENSING_GUARD_DEPTH.with(|d| d.set(d.get() + 1));
+        Self
+    }
+}
+
+#[cfg(any(test, feature = "fixtures"))]
+impl Drop for SensingPhaseMark {
+    fn drop(&mut self) {
+        SENSING_GUARD_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+/// Assert THIS THREAD holds no sensing guard. Deterministic: the counter is
+/// thread-local, so no other thread can perturb it.
+#[cfg(any(test, feature = "fixtures"))]
+fn assert_off_sensing_locks(what: &str) {
+    let depth = SENSING_GUARD_DEPTH.with(|d| d.get());
+    assert_eq!(
+        depth, 0,
+        "{what} must run with every sensing guard released (this thread holds {depth})"
+    );
+}
+
+#[cfg(not(any(test, feature = "fixtures")))]
+fn assert_off_sensing_locks(_what: &str) {}
 
 /// Fixtures-only hook carrying the exact-expiry timer's next armed deadline
 /// (`None` when no live record gates a wake).
@@ -8685,6 +8720,14 @@ pub struct MeshNode {
     /// installation generation would close it at the wire, but that is a
     /// deferred sensing-wire change (§4.3).
     sensing_lease_apply_mu: parking_lot::Mutex<()>,
+    /// Serializes ORGANIZATION frame authoring + emission only (Phase 2).
+    ///
+    /// The smallest dedicated mechanism for send ordering on the org lane: it is
+    /// taken with every sensing mutation guard already released, so no sensing
+    /// lock is ever held across planning, encoding, route/session work, sequence
+    /// allocation, task spawn or peer fan-out — while two transitions for the
+    /// same interest still cannot invert on the wire.
+    org_egress_send_mu: parking_lot::Mutex<()>,
     /// Review L1 linearization: the LOCAL-projection transaction mutex. Every
     /// operation that changes OR applies the node-local consumer projection
     /// (the `Local`/`LeasedLocal` rows' derived
@@ -10522,6 +10565,7 @@ impl MeshNode {
             ),
             sensing_interest_leases: sensing::SensingInterestLeases::default(),
             sensing_lease_apply_mu: parking_lot::Mutex::new(()),
+            org_egress_send_mu: parking_lot::Mutex::new(()),
             sensing_local_projection_mu,
             #[cfg(feature = "fixtures")]
             sensing_projection_contention_hook: parking_lot::Mutex::new(None),
@@ -10922,6 +10966,7 @@ impl MeshNode {
             None,
             None,
         )
+        .map(|(outcome, _)| outcome)
     }
 
     /// Fixtures-only witness seam (review L1 linearization): run a direct
@@ -10951,6 +10996,7 @@ impl MeshNode {
             Some(pause),
             None,
         )
+        .map(|(outcome, _)| outcome)
     }
 
     /// The shared node-local registration core, parameterized by the owning
@@ -10977,7 +11023,7 @@ impl MeshNode {
         // table guard, and the upstream frame is the org variant sent AFTER every
         // sensing lock is released. `None` is the legacy path, byte-identical.
         org_egress: Option<&OrgLeaseEgress<'_>>,
-    ) -> Result<sensing::RegisterOutcome, SensingRegistrationError> {
+    ) -> Result<(sensing::RegisterOutcome, Option<PendingOrgSend>), SensingRegistrationError> {
         if !self.config.enable_sensing_coalescing {
             return Err(SensingRegistrationError::Disabled);
         }
@@ -11033,8 +11079,11 @@ impl MeshNode {
                 self.sensing_local_projection_mu.lock()
             }
         };
-        // Set only on the org path; sent after every sensing lock is released.
-        let mut deferred_org_send: Option<Vec<u8>> = None;
+        // Test-only: THIS THREAD is now inside the guarded sensing transaction.
+        #[cfg(any(test, feature = "fixtures"))]
+        let _phase = SensingPhaseMark::enter();
+        // Set only on the org path; authored and sent in Phase 2.
+        let mut pending_org: Option<PendingOrgSend> = None;
         let (outcome, aggregate, local_aggregate) = {
             let mut table = self.sensing_interest_table.lock();
             // ORG PATH, final currentness recheck — the admission linearization
@@ -11061,7 +11110,7 @@ impl MeshNode {
                     self.sensing_counters
                         .org_stale_stamp
                         .fetch_add(1, Ordering::Relaxed);
-                    return Err(SensingRegistrationError::OrgAuthorityChanged);
+                    return Err(SensingRegistrationError::OrgAudienceUnsupported);
                 }
             }
             let outcome = table.register(
@@ -11185,9 +11234,12 @@ impl MeshNode {
                             &key,
                             now,
                         );
-                        return Ok(sensing::RegisterOutcome::RefusedByCachedFloor {
-                            minimum_supported: refusal.minimum_supported,
-                        });
+                        return Ok((
+                            sensing::RegisterOutcome::RefusedByCachedFloor {
+                                minimum_supported: refusal.minimum_supported,
+                            },
+                            None,
+                        ));
                     }
                 }
             }
@@ -11239,28 +11291,19 @@ impl MeshNode {
                     sensing_effective_min_gap(ttl),
                 ) {
                     match org_egress {
-                        // ORG PATH: plan the frame here (pure, no I/O) but do
-                        // NOT send yet — peer fan-out must not happen while the
-                        // projection guard is held. Deferred to after the guard
-                        // drops, below. A planning refusal emits nothing and is
-                        // reported to the caller, which rolls the lease back.
+                        // ORG PATH: capture the parameters ONLY. No planning, no
+                        // certificate clone, no encoding, no route/session work
+                        // and no fan-out happen here — all of that is Phase 2,
+                        // performed by the caller after the lease-apply guard is
+                        // also released.
                         Some(egress) => {
-                            let frame = sensing::plan_local_org_provider_registration(
-                                egress.plan,
-                                spec,
+                            pending_org = Some(PendingOrgSend {
+                                spec: spec.clone(),
                                 provider,
                                 strictest,
                                 ttl,
-                            )
-                            .map_err(|refusal| match refusal {
-                                sensing::LocalOrgEgressRefusal::AudienceNotDerived => {
-                                    SensingRegistrationError::OrgAudienceNotDerived
-                                }
-                                sensing::LocalOrgEgressRefusal::SelectorTargetMismatch => {
-                                    SensingRegistrationError::OrgSelectorTargetMismatch
-                                }
-                            })?;
-                            deferred_org_send = sensing::encode_interest_frame(&frame).ok();
+                                plan: egress.plan.clone_for_phase_two(),
+                            });
                         }
                         // LEGACY PATH: unchanged, including sending inside the
                         // guard exactly as before.
@@ -11287,30 +11330,49 @@ impl MeshNode {
                 }
             }
         }
-        // Release EVERY sensing lock before any peer fan-out on the org path.
-        // Item 7 of the slice contract: no I/O or fan-out while the projection,
-        // table, observation or lease mutexes are held. The legacy path already
-        // sent above and leaves this `None`, so its behaviour is unchanged.
+        // Release the projection guard and LEAVE the guarded phase. The org
+        // frame is authored by the caller in Phase 2, after the lease-apply
+        // guard is released too. The legacy path already sent above and leaves
+        // `pending_org` as `None`, so its behaviour is unchanged.
         drop(_projection);
-        // Item 7 self-check, compiled into every test build and therefore
-        // exercised by every org-egress witness: at the emission point NO
-        // sensing mutex may be held. `try_lock` on a `parking_lot::Mutex` is
-        // not reentrant, so a still-held guard makes this `None` and the
-        // assertion fires; the momentary guard taken here is released at the
-        // end of the statement and nothing else is held to deadlock against.
-        debug_assert!(
-            deferred_org_send.is_none() || self.sensing_local_projection_mu.try_lock().is_some(),
-            "the org frame must be emitted with the projection mutex released"
-        );
-        debug_assert!(
-            deferred_org_send.is_none() || self.sensing_interest_table.try_lock().is_some(),
-            "the org frame must be emitted with the interest table released"
-        );
-        debug_assert!(
-            deferred_org_send.is_none() || self.sensing_observations.try_lock().is_some(),
-            "the org frame must be emitted with the observations mutex released"
-        );
-        if let Some(bytes) = deferred_org_send {
+        #[cfg(any(test, feature = "fixtures"))]
+        drop(_phase);
+        Ok((outcome, pending_org))
+    }
+
+    /// PHASE 2 — author and emit ONE organization frame with every sensing
+    /// guard released: plan (which clones the certificate), encode, then hand
+    /// the bytes to the ordinary send path for route/session work, sequence
+    /// allocation and task spawn.
+    ///
+    /// Send order for the org lane is serialized by its own dedicated mutex
+    /// rather than by retaining the broad lease-apply guard across fan-out, so
+    /// two transitions for the same interest cannot invert on the wire while no
+    /// sensing mutation lock is held during I/O.
+    fn emit_pending_org_send(&self, pending: Option<PendingOrgSend>) {
+        let Some(pending) = pending else {
+            return;
+        };
+        assert_off_sensing_locks("organization frame authoring and emission");
+        let _order = self.org_egress_send_mu.lock();
+        let Ok(frame) = sensing::plan_local_org_provider_registration(
+            &pending.plan,
+            &pending.spec,
+            pending.provider,
+            pending.strictest,
+            pending.ttl,
+        ) else {
+            // Unreachable through the production branch: the audience and the
+            // selector were both proven in Phase 0 before anything was minted.
+            // Fail closed and loudly rather than emitting anything.
+            tracing::error!(
+                provider = format!("{:#x}", pending.provider),
+                "sensing lease: organization frame planning refused in phase 2 — \
+                 nothing emitted"
+            );
+            return;
+        };
+        if let Ok(bytes) = sensing::encode_interest_frame(&frame) {
             spawn_sensing_frame_send(
                 &self.socket,
                 &self.peers,
@@ -11318,13 +11380,12 @@ impl MeshNode {
                 &self.router,
                 &self.partition_filter,
                 self.node_id,
-                provider,
+                pending.provider,
                 sensing::SUBPROTOCOL_SENSING_INTEREST as u64,
                 sensing::SUBPROTOCOL_SENSING_INTEREST,
                 bytes,
             );
         }
-        Ok(outcome)
     }
 
     /// OLB-0 §4.3: acquire a node-global lease on an EXACT-provider
@@ -11353,60 +11414,28 @@ impl MeshNode {
         provider: u64,
         requested_sample_interval: Duration,
     ) -> Result<sensing::SensingLeaseTicket, SensingRegistrationError> {
-        // LOCAL-ORIGIN ORGANIZATION EGRESS, prepared BEFORE any sensing lock.
-        //
-        // An own-org audience used to be a loud dead end here: the wire leg
-        // emitted only the LEGACY `provider_registration`, which an
-        // org-authoritative provider refuses precisely when the audience is that
-        // org's canonical commitment, so acquiring would have installed a row,
-        // returned `Ok`, and emitted something designed to be refused. It now
-        // plans a real `OrgProviderRegistration` instead.
-        //
-        // Everything authority-shaped happens HERE, outside every sensing lock:
-        // the authority snapshot, the live membership capture, and the signature
-        // + validity-window + floor verification inside that capture. The
-        // capture takes and RELEASES `org_install` before returning, and
-        // `org_install` is the innermost lock in the frozen order
-        // (projection → interest-table → org_install), so taking it while
-        // holding nothing cannot invert that order. By the time any sensing
-        // mutex is acquired below, all cryptographic work is already done.
-        //
-        // A FOREIGN organization's commitment is still undetectable from the
-        // sending side (a commitment is a one-way derivation), so it does not
-        // enter this branch and continues down the legacy path exactly as
-        // before — fail-closed, unchanged, and recorded as a residual.
-        let org_prepared = match self.node_authority.load_full() {
-            // A dark node does no cryptographic work: `register_sensing_interest_as`
-            // refuses with `Disabled` regardless, so capturing a membership here
-            // would be pure waste. Checked inside the match so the legacy path's
-            // mint-then-roll-back behaviour is untouched.
-            Some(_) if !self.config.enable_sensing_coalescing => None,
-            Some(authority)
-                if spec.audience
-                    == sensing::canonical_org_sensing_commitment(&authority.owner_org()) =>
-            {
-                let snapshot = self
-                    .capture_sensing_authority_snapshot()
-                    .map_err(|_| SensingRegistrationError::OrgAudienceUnsupported)?;
-                let membership = sensing::capture_live_org_relay_membership(
-                    &self.org_install,
-                    &self.node_authority,
-                    &self.org_revocation,
-                    self.entity_id(),
-                    authority.owner_org(),
-                    crate::adapter::net::behavior::org::current_timestamp(),
-                )
-                .map_err(|_| SensingRegistrationError::OrgAudienceUnsupported)?;
-                // The plan derives its audience/root from the capture; the live
-                // token is dropped at the end of this arm, so nothing downstream
-                // can re-derive authority from it or hold it across a lock.
-                Some((
-                    sensing::LocalOrgEgress::from_live_membership(&membership),
-                    snapshot,
-                ))
-            }
-            _ => None,
-        };
+        self.acquire_sensing_interest_lease_seamed(spec, provider, requested_sample_interval, None)
+    }
+
+    /// [`Self::acquire_sensing_interest_lease`] with a test-only seam that runs
+    /// `pause_after_capture` in the REAL window between Phase 0's authority /
+    /// membership capture and the guarded table + currentness transaction.
+    ///
+    /// That window is exactly where a production authority swap or floor raise
+    /// must invalidate the pinned view, so the witnesses drive it here rather
+    /// than staling a snapshot the production path never sees.
+    fn acquire_sensing_interest_lease_seamed(
+        &self,
+        spec: &sensing::InterestSpec,
+        provider: u64,
+        requested_sample_interval: Duration,
+        pause_after_capture: Option<&(dyn Fn() + Sync)>,
+    ) -> Result<sensing::SensingLeaseTicket, SensingRegistrationError> {
+        // PHASE 0 — off every sensing lock. See `prepare_org_egress`.
+        let org_prepared = self.prepare_org_egress(&spec.audience, spec, provider)?;
+        if let Some(pause) = pause_after_capture {
+            pause();
+        }
         let org_egress = org_prepared
             .as_ref()
             .map(|(plan, snapshot)| OrgLeaseEgress { plan, snapshot });
@@ -11427,30 +11456,111 @@ impl MeshNode {
             .acquire(key, spec, requested_sample_interval)
             .map_err(SensingRegistrationError::LeaseAtCapacity)?;
         let ticket = sensing::SensingLeaseTicket { key, token };
-        if let Err(err) = self.apply_sensing_lease_action(key, action, org_egress.as_ref()) {
-            // Roll the reference back and reconcile the wire to the post-release
-            // view. The lease owns a DISTINCT `LeasedLocal` row (review §1), so
-            // when the first-holder acquire installed nothing the rollback
-            // Deregister targets an absent lease row and is a true no-op — it can
-            // no longer tear down a `Local` row a direct registration installed
-            // for the same key.
-            let rollback = self.sensing_interest_leases.release(ticket);
-            // 2026-07-23 §6 residual: the rollback cannot propagate its own
-            // error — we are already returning the original failure — but
-            // discarding it silently is what leaves the lease registry and the
-            // wire disagreeing with nothing to say so. Counted and warned.
-            if let Err(rollback_err) = self.apply_sensing_lease_action(key, rollback, None) {
-                self.sensing_interest_leases.note_reconcile_failure();
-                tracing::warn!(
-                    provider = format!("{:#x}", provider),
-                    error = %rollback_err,
-                    "sensing lease: rollback could not reconcile the wire; the lease \
-                     registry and the wire may disagree until the next mutation"
-                );
+        let pending = match self.apply_sensing_lease_action(key, action, org_egress.as_ref()) {
+            Ok(pending) => pending,
+            Err(err) => {
+                // Roll the reference back and reconcile the wire to the post-release
+                // view. The lease owns a DISTINCT `LeasedLocal` row (review §1), so
+                // when the first-holder acquire installed nothing the rollback
+                // Deregister targets an absent lease row and is a true no-op — it can
+                // no longer tear down a `Local` row a direct registration installed
+                // for the same key.
+                let rollback = self.sensing_interest_leases.release(ticket);
+                // 2026-07-23 §6 residual: the rollback cannot propagate its own
+                // error — we are already returning the original failure — but
+                // discarding it silently is what leaves the lease registry and the
+                // wire disagreeing with nothing to say so. Counted and warned.
+                match self.apply_sensing_lease_action(key, rollback, None) {
+                    Ok(rollback_pending) => {
+                        drop(_apply);
+                        self.emit_pending_org_send(rollback_pending);
+                    }
+                    Err(rollback_err) => {
+                        self.sensing_interest_leases.note_reconcile_failure();
+                        tracing::warn!(
+                            provider = format!("{:#x}", provider),
+                            error = %rollback_err,
+                            "sensing lease: rollback could not reconcile the wire; the lease \
+                             registry and the wire may disagree until the next mutation"
+                        );
+                    }
+                }
+                return Err(err);
             }
-            return Err(err);
-        }
+        };
+        // PHASE 2 — every sensing guard, including the lease-apply guard, is
+        // released before the org frame is authored or sent.
+        drop(_apply);
+        self.emit_pending_org_send(pending);
         Ok(ticket)
+    }
+
+    /// PHASE 0 — the authority-aware preparation for ONE organization lease
+    /// transition, run with NO sensing lock held.
+    ///
+    /// Returns `None` when `audience` is not this node's own organization
+    /// commitment, in which case the caller takes the unchanged legacy path.
+    ///
+    /// Order matters and is asserted by witnesses:
+    ///
+    /// 1. exactness FIRST — `spec.providers == Node(provider)` (the one shared
+    ///    rule, `sensing::selector_names_target`). Refused here, before a lease
+    ///    reference is minted, a row is touched or an emitter is fed, so BOTH
+    ///    the self-provider and remote-provider branches are covered;
+    /// 2. then the authority snapshot and the live membership capture, which is
+    ///    where every signature / validity-window / floor check happens. The
+    ///    capture takes and releases `org_install` while nothing else is held,
+    ///    and `org_install` is innermost in the frozen order, so this cannot
+    ///    invert it.
+    ///
+    /// Nothing is stored for later replay: the plan is re-derived from a fresh
+    /// capture on EVERY transition, so current authority, membership and floor
+    /// remain final at each re-authoring.
+    fn prepare_org_egress(
+        &self,
+        audience: &sensing::AudienceScopeCommitment,
+        spec: &sensing::InterestSpec,
+        provider: u64,
+    ) -> Result<
+        Option<(sensing::LocalOrgEgress, sensing::SensingAuthoritySnapshot)>,
+        SensingRegistrationError,
+    > {
+        // A dark node does no cryptographic work; the register path refuses with
+        // `Disabled` regardless.
+        if !self.config.enable_sensing_coalescing {
+            return Ok(None);
+        }
+        let Some(authority) = self.node_authority.load_full() else {
+            return Ok(None);
+        };
+        if *audience != sensing::canonical_org_sensing_commitment(&authority.owner_org()) {
+            // Not our organization's commitment. A FOREIGN organization's
+            // commitment is undetectable from the sending side (a commitment is
+            // a one-way derivation), so it takes the legacy path exactly as
+            // before — fail-closed there, and a recorded residual.
+            return Ok(None);
+        }
+        // (1) Exactness before ANY mutation, for every provider branch.
+        if !sensing::selector_names_target(spec, provider) {
+            return Err(SensingRegistrationError::OrgAudienceUnsupported);
+        }
+        // (2) All cryptographic work, off every sensing lock.
+        let snapshot = self
+            .capture_sensing_authority_snapshot()
+            .map_err(|_| SensingRegistrationError::OrgAudienceUnsupported)?;
+        let membership = sensing::capture_live_org_relay_membership(
+            &self.org_install,
+            &self.node_authority,
+            &self.org_revocation,
+            self.entity_id(),
+            authority.owner_org(),
+            crate::adapter::net::behavior::org::current_timestamp(),
+        )
+        .map_err(|_| SensingRegistrationError::OrgAudienceUnsupported)?;
+        Ok(Some((
+            sensing::LocalOrgEgress::from_live_membership(&membership),
+            snapshot,
+        )))
     }
 
     /// Release a sensing-interest lease acquired via
@@ -11461,20 +11571,111 @@ impl MeshNode {
     /// release deregisters, a strictest-holder release relaxes the cadence
     /// to the surviving minimum, and an already-released ticket is a no-op.
     pub fn release_sensing_interest_lease(&self, ticket: sensing::SensingLeaseTicket) {
-        let _apply = self.sensing_lease_apply_mu.lock();
-        let action = self.sensing_interest_leases.release(ticket);
-        // 2026-07-23 §6 residual: release has no error channel — the holder is
-        // dropping its reference either way — so a failed wire reconciliation
-        // here is exactly the silent registry/wire divergence that residual
-        // names. Counted and warned rather than swallowed.
-        if let Err(err) = self.apply_sensing_lease_action(ticket.key, action, None) {
-            self.sensing_interest_leases.note_reconcile_failure();
-            tracing::warn!(
-                error = %err,
-                "sensing lease: release could not reconcile the wire; the lease registry \
-                 and the wire may disagree until the next mutation"
-            );
+        // PHASE 0, off every lock — a release that leaves other holders
+        // RE-AUTHORS the registration at the relaxed cadence, so it needs the
+        // same live authority proof a first acquisition does. The audience and
+        // provider come from the ticket's own key, so this is decided before any
+        // lock is taken and without a stored, replayable membership proof.
+        let (audience, provider) = match ticket.key {
+            sensing::SensingLeaseKey::ExactProvider {
+                audience, provider, ..
+            } => (audience, provider),
+            // Provider-free keys resolve through the leader path, not wired here.
+            sensing::SensingLeaseKey::ProviderFree { .. } => {
+                let _apply = self.sensing_lease_apply_mu.lock();
+                let action = self.sensing_interest_leases.release(ticket);
+                let _ = self.apply_sensing_lease_action(ticket.key, action, None);
+                return;
+            }
+        };
+        // The spec is not known until the action is read, so exactness cannot be
+        // re-proved here; it was proved at acquisition and the registry replays
+        // the stored spec verbatim. Passing the spec-independent audience is
+        // enough to decide the PLANE, which is what this preparation selects.
+        let org_prepared = match self.prepare_org_egress_for_release(&audience) {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                // Fail-closed and coherent: the registry has not been touched
+                // yet, so nothing diverges. The holder still drops its
+                // reference below; the wire simply keeps the stricter cadence
+                // until the next successful transition, which is the safe
+                // direction (over-sampling, never under-sampling).
+                self.sensing_interest_leases.note_reconcile_failure();
+                tracing::warn!(
+                    provider = format!("{:#x}", provider),
+                    error = %err,
+                    "sensing lease: release could not prove local organization authority; \
+                     the wire keeps the stricter cadence until the next transition"
+                );
+                let _apply = self.sensing_lease_apply_mu.lock();
+                let _ = self.sensing_interest_leases.release(ticket);
+                return;
+            }
+        };
+        let org_egress = org_prepared
+            .as_ref()
+            .map(|(plan, snapshot)| OrgLeaseEgress { plan, snapshot });
+        let pending = {
+            let _apply = self.sensing_lease_apply_mu.lock();
+            let action = self.sensing_interest_leases.release(ticket);
+            // 2026-07-23 §6 residual: release has no error channel — the holder
+            // is dropping its reference either way — so a failed wire
+            // reconciliation here is exactly the silent registry/wire divergence
+            // that residual names. Counted and warned rather than swallowed.
+            match self.apply_sensing_lease_action(ticket.key, action, org_egress.as_ref()) {
+                Ok(pending) => pending,
+                Err(err) => {
+                    self.sensing_interest_leases.note_reconcile_failure();
+                    tracing::warn!(
+                        error = %err,
+                        "sensing lease: release could not reconcile the wire; the lease \
+                         registry and the wire may disagree until the next mutation"
+                    );
+                    None
+                }
+            }
+        };
+        // PHASE 2 — authored and emitted with every sensing guard released.
+        self.emit_pending_org_send(pending);
+    }
+
+    /// [`Self::prepare_org_egress`] for a release, where the interest spec is
+    /// not available until the registry hands back the action. Decides the plane
+    /// from the audience alone and performs the same fresh capture; the
+    /// exactness rule was proved at acquisition and the registry replays the
+    /// stored spec verbatim, so there is nothing new to re-prove about it here.
+    fn prepare_org_egress_for_release(
+        &self,
+        audience: &sensing::AudienceScopeCommitment,
+    ) -> Result<
+        Option<(sensing::LocalOrgEgress, sensing::SensingAuthoritySnapshot)>,
+        SensingRegistrationError,
+    > {
+        if !self.config.enable_sensing_coalescing {
+            return Ok(None);
         }
+        let Some(authority) = self.node_authority.load_full() else {
+            return Ok(None);
+        };
+        if *audience != sensing::canonical_org_sensing_commitment(&authority.owner_org()) {
+            return Ok(None);
+        }
+        let snapshot = self
+            .capture_sensing_authority_snapshot()
+            .map_err(|_| SensingRegistrationError::OrgAudienceUnsupported)?;
+        let membership = sensing::capture_live_org_relay_membership(
+            &self.org_install,
+            &self.node_authority,
+            &self.org_revocation,
+            self.entity_id(),
+            authority.owner_org(),
+            crate::adapter::net::behavior::org::current_timestamp(),
+        )
+        .map_err(|_| SensingRegistrationError::OrgAudienceUnsupported)?;
+        Ok(Some((
+            sensing::LocalOrgEgress::from_live_membership(&membership),
+            snapshot,
+        )))
     }
 
     /// Execute the wire transition a lease mutation calls for. Called only
@@ -11485,11 +11686,11 @@ impl MeshNode {
         key: sensing::SensingLeaseKey,
         action: sensing::LeaseAction,
         org_egress: Option<&OrgLeaseEgress<'_>>,
-    ) -> Result<(), SensingRegistrationError> {
+    ) -> Result<Option<PendingOrgSend>, SensingRegistrationError> {
         // Only exact-provider leases are wired in this slice; a provider-free
         // key resolves through the rendezvous leader path, added later.
         let sensing::SensingLeaseKey::ExactProvider { provider, .. } = key else {
-            return Ok(());
+            return Ok(None);
         };
         match action {
             sensing::LeaseAction::Register { spec, interval }
@@ -11505,13 +11706,13 @@ impl MeshNode {
                     None,
                     org_egress,
                 )? {
-                    sensing::RegisterOutcome::Registered(_) => Ok(()),
+                    (sensing::RegisterOutcome::Registered(_), pending) => Ok(pending),
                     // The table installed nothing — do not let the lease claim
                     // an installation. The caller rolls the reference back.
-                    sensing::RegisterOutcome::OverCap => {
+                    (sensing::RegisterOutcome::OverCap, _) => {
                         Err(SensingRegistrationError::OverCapacity)
                     }
-                    sensing::RegisterOutcome::RefusedByCachedFloor { minimum_supported } => {
+                    (sensing::RegisterOutcome::RefusedByCachedFloor { minimum_supported }, _) => {
                         Err(SensingRegistrationError::RefusedByFloor { minimum_supported })
                     }
                 }
@@ -11522,9 +11723,9 @@ impl MeshNode {
                     &spec,
                     provider,
                 );
-                Ok(())
+                Ok(None)
             }
-            sensing::LeaseAction::Unchanged => Ok(()),
+            sensing::LeaseAction::Unchanged => Ok(None),
         }
     }
 
@@ -42316,7 +42517,7 @@ mod sensing_authority_witness_tests {
             .acquire_sensing_interest_lease(&spec, target, D)
             .expect_err("an incoherent selector must be refused");
         assert!(
-            matches!(err, SensingRegistrationError::OrgSelectorTargetMismatch),
+            matches!(err, SensingRegistrationError::OrgAudienceUnsupported),
             "expected the selector/target refusal, got {err:?}"
         );
         assert!(
@@ -42372,43 +42573,224 @@ mod sensing_authority_witness_tests {
         assert!(node.sensing_table_is_empty(), "and installs no row");
     }
 
-    /// CURRENTNESS: an authority swap between local planning and the table
-    /// mutation makes the pinned view stale — no row, no emission, and the
-    /// stale-stamp counter moves.
+    /// CURRENTNESS, driven through the REAL production window.
+    ///
+    /// The previous version of this witness staled a SEPARATE snapshot and then
+    /// called the public API, which captured a fresh view and succeeded — it
+    /// never entered the production capture-to-mutation window and would have
+    /// stayed green with the final currentness check deleted. This drives the
+    /// actual window via the Phase-0 seam: the pause runs after the real
+    /// authority/membership capture and before the guarded table transaction.
+    ///
+    /// (a) an authority installation/swap inside that window.
     #[tokio::test]
-    async fn an_authority_swap_between_planning_and_register_creates_no_org_row() {
-        let node = sensing_org_node("own-org-stale").await;
+    async fn an_authority_swap_inside_the_capture_window_creates_no_org_row() {
+        let node = sensing_org_node("stale-swap").await;
         let target = node.node_id().wrapping_add(1);
         let spec = org_spec(target, org_commitment());
         let before = sensing::SensingCounters::get(&node.sensing_counters.org_stale_stamp);
-        // Swap the authority for a DISTINCT Arc under the same org, exactly as
-        // the inbound staleness witnesses do. The installation generation moves,
-        // so any view pinned before this is stale.
-        node.install_node_authority(adopt(&node, &org(), "own-org-stale-b"))
-            .expect("reinstall a distinct authority Arc");
-        // Pin a view, then move the authority again before the register point.
-        // `sensing_authority_snapshot_current` is the same primitive the register
-        // path rechecks with, so this asserts the mechanism, not a proxy.
-        let pinned = node
-            .capture_sensing_authority_snapshot()
-            .expect("capture a snapshot");
-        node.install_node_authority(adopt(&node, &org(), "own-org-stale-c"))
-            .expect("reinstall again");
+        let swap_node = node.clone();
+        let swapped = std::sync::atomic::AtomicBool::new(false);
+        let pause = move || {
+            // Fire once: the pause sits on the acquire path and a rollback
+            // reconcile must not re-enter it.
+            if swapped.swap(true, Ordering::Relaxed) {
+                return;
+            }
+            swap_node
+                .install_node_authority(adopt(&swap_node, &org(), "stale-swap-b"))
+                .expect("install a DISTINCT authority Arc inside the window");
+        };
+        let err = node
+            .acquire_sensing_interest_lease_seamed(&spec, target, D, Some(&pause))
+            .expect_err("a view staled inside the production window must not register");
         assert!(
-            !node.sensing_authority_snapshot_current(&pinned),
-            "precondition: the pinned view must be stale after the swap"
+            matches!(err, SensingRegistrationError::OrgAudienceUnsupported),
+            "expected the fail-closed org disposition, got {err:?}"
         );
-        // The lease itself re-captures, so it succeeds; the staleness contract is
-        // that a STALE pinned view can never register. Prove that directly.
-        let ticket = node
-            .acquire_sensing_interest_lease(&spec, target, D)
-            .expect("a freshly captured view still registers");
-        node.release_sensing_interest_lease(ticket);
         assert_eq!(
             sensing::SensingCounters::get(&node.sensing_counters.org_stale_stamp),
-            before,
-            "a fresh capture is not a stale stamp"
+            before + 1,
+            "the stale-stamp counter moves exactly once"
         );
+        assert!(node.sensing_table_is_empty(), "no row");
+        assert!(
+            node.sensing_interest_leases.is_empty(),
+            "and no lease entry survives the rollback"
+        );
+    }
+
+    /// (b) a revocation-floor raise inside the same window.
+    #[tokio::test]
+    async fn a_floor_raise_inside_the_capture_window_creates_no_org_row() {
+        let node = sensing_org_node("stale-floor").await;
+        let target = node.node_id().wrapping_add(1);
+        let spec = org_spec(target, org_commitment());
+        let before = sensing::SensingCounters::get(&node.sensing_counters.org_stale_stamp);
+        let floor_node = node.clone();
+        let raised = std::sync::atomic::AtomicBool::new(false);
+        let pause = move || {
+            if raised.swap(true, Ordering::Relaxed) {
+                return;
+            }
+            // A live floor raise for this node's own (org, member) pair moves the
+            // store generation, which is part of the pinned stamp.
+            // The same live floor-raise mechanism the existing staleness
+            // witnesses use: apply a signed bundle to the INSTALLED store, which
+            // moves its publication generation and therefore the pinned stamp.
+            let mut floors = std::collections::BTreeMap::new();
+            floors.insert(
+                crate::adapter::net::identity::EntityId::from_bytes([0x77u8; 32]),
+                5u32,
+            );
+            let bundle =
+                crate::adapter::net::behavior::org::OrgRevocationBundle::try_issue(&org(), &floors)
+                    .expect("bundle");
+            floor_node
+                .org_revocation_store()
+                .expect("store")
+                .apply_bundle(&bundle)
+                .expect("apply the floor raise inside the window");
+        };
+        let err = node
+            .acquire_sensing_interest_lease_seamed(&spec, target, D, Some(&pause))
+            .expect_err("a floor raised inside the production window must not register");
+        assert!(
+            matches!(err, SensingRegistrationError::OrgAudienceUnsupported),
+            "expected the fail-closed org disposition, got {err:?}"
+        );
+        assert_eq!(
+            sensing::SensingCounters::get(&node.sensing_counters.org_stale_stamp),
+            before + 1,
+            "the stale-stamp counter moves exactly once"
+        );
+        assert!(node.sensing_table_is_empty(), "no row");
+        assert!(
+            node.sensing_interest_leases.is_empty(),
+            "and no lease entry"
+        );
+    }
+
+    /// SELF-PROVIDER inverse (defect 2): a lease whose provider is THIS node
+    /// must still prove selector exactness. Every non-exact shape installs no
+    /// lease entry, no row, no emitter registration and emits no frame — the
+    /// refusal happens in Phase 0, before anything is minted.
+    #[tokio::test]
+    async fn a_self_provider_org_lease_requires_selector_exactness() {
+        let node = sensing_org_node("self-exactness").await;
+        let me = node.node_id();
+        for selector in [
+            sensing::ProviderSelector::Node(me.wrapping_add(1)),
+            sensing::ProviderSelector::AnyAuthorized,
+            sensing::ProviderSelector::Nodes(vec![me]),
+        ] {
+            let mut spec = org_spec(me, org_commitment());
+            spec.providers = selector.clone();
+            let err = node
+                .acquire_sensing_interest_lease(&spec, me, D)
+                .expect_err("a non-exact selector must be refused on the SELF branch too");
+            assert!(
+                matches!(err, SensingRegistrationError::OrgAudienceUnsupported),
+                "expected the fail-closed org disposition for {selector:?}, got {err:?}"
+            );
+            assert!(
+                node.sensing_interest_leases.is_empty(),
+                "no lease entry for {selector:?}"
+            );
+            assert!(node.sensing_table_is_empty(), "no row for {selector:?}");
+        }
+        // The exact shape on the SELF branch still works.
+        let spec = org_spec(me, org_commitment());
+        let ticket = node
+            .acquire_sensing_interest_lease(&spec, me, D)
+            .expect("the exact self-provider shape is admitted");
+        node.release_sensing_interest_lease(ticket);
+    }
+
+    /// TWO HOLDERS (defect 1): releasing the STRICTEST holder while another
+    /// survives must RE-AUTHOR the organization registration at the relaxed
+    /// cadence — the old code sent that `Reregister` down the legacy path, where
+    /// the org audience fails scope validation, so the registry relaxed while
+    /// the table row and the wire kept the strict cadence.
+    #[tokio::test]
+    async fn releasing_the_strictest_org_holder_reauthors_at_the_relaxed_cadence() {
+        let node = sensing_org_node("two-holder").await;
+        let target = node.node_id().wrapping_add(1);
+        let spec = org_spec(target, org_commitment());
+        let key = sensing::ProviderInterestKey::new(spec.key(), target);
+        let loose = Duration::from_millis(400);
+        let strict = Duration::from_millis(50);
+
+        let loose_ticket = node
+            .acquire_sensing_interest_lease(&spec, target, loose)
+            .expect("first (loose) holder acquires");
+        let strict_ticket = node
+            .acquire_sensing_interest_lease(&spec, target, strict)
+            .expect("second (strict) holder acquires");
+        let row = node
+            .sensing_downstream_entry(&key, sensing::DownstreamId::LeasedLocal)
+            .expect("the leased row is present");
+        assert_eq!(
+            row.owner_root,
+            org_commitment(),
+            "the org row is under the org-derived root at the strict cadence"
+        );
+        assert_eq!(
+            row.requested_sample_interval, strict,
+            "the row carries the strictest holder's cadence"
+        );
+
+        // Release the STRICTEST holder; the loose one survives.
+        node.release_sensing_interest_lease(strict_ticket);
+        let relaxed = node
+            .sensing_downstream_entry(&key, sensing::DownstreamId::LeasedLocal)
+            .expect("the row survives the strictest release");
+        assert_eq!(
+            relaxed.requested_sample_interval, loose,
+            "the TABLE ROW relaxed to the surviving holder's cadence — this is what \
+             the legacy-path Reregister silently failed to do for an org audience"
+        );
+        assert_eq!(
+            relaxed.owner_root,
+            org_commitment(),
+            "and it is STILL under the org-derived root, so the re-authoring went \
+             through the org planner and not a legacy downgrade"
+        );
+
+        // Final release deregisters.
+        node.release_sensing_interest_lease(loose_ticket);
+        assert!(
+            node.sensing_downstream_entry(&key, sensing::DownstreamId::LeasedLocal)
+                .is_none(),
+            "the last release deregisters the leased row"
+        );
+        assert!(
+            node.sensing_interest_leases.is_empty(),
+            "and the registry is empty"
+        );
+    }
+
+    /// PHASE INSTRUMENTATION is not vacuous (defect 3): `assert_off_sensing_locks`
+    /// fires when THIS THREAD is inside the guarded phase. This is the inverse
+    /// witness for the off-lock boundary — if planning/encoding/send were moved
+    /// back under a sensing guard, every org lease test would fail here.
+    ///
+    /// Unlike the `try_lock` probe it replaces, this is deterministic: the depth
+    /// is thread-local, so no other thread can make it pass or fail by chance.
+    #[test]
+    fn the_off_lock_phase_assertion_fires_inside_the_guarded_phase() {
+        // Outside any transaction: silent.
+        assert_off_sensing_locks("control");
+        let caught = std::panic::catch_unwind(|| {
+            let _phase = SensingPhaseMark::enter();
+            assert_off_sensing_locks("organization frame authoring and emission");
+        });
+        assert!(
+            caught.is_err(),
+            "the phase assertion MUST fire while this thread is inside the guarded phase"
+        );
+        // The mark is RAII, so the depth unwound with the panic.
+        assert_off_sensing_locks("after unwind");
     }
 
     /// LEGACY UNCHANGED: a legacy-audience lease on the same sensing-enabled
