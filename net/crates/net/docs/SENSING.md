@@ -263,21 +263,33 @@ restart), `IncarnationRequired` (the fail-closed origin gate),
 sensing plane at BUILD time is a compile error at the call site, not a
 runtime no-op: the module rides `feature = "net"`.
 
-**Not in the SDK yet.** There is no query, watch, snapshot, or readiness
-projection surface. Exact-provider acquisition and projection are
-deferred to S4 for a concrete reason: the core still refuses every
-organization-audience exact-provider lease
-(`SensingRegistrationError::OrgAudienceUnsupported`), because the
-lease's wire leg emits legacy frames only, which an
-organization-authoritative provider refuses. Until
-organization-authenticated registration intake and organization-audience
-exact leases are authorized, nothing in the SDK could create the
-observations a projection would read.
+**Not in the SDK.** There is no query, watch, snapshot, or readiness
+projection surface here, and none of the core's exact-provider
+acquisition is re-exported.
 
-That boundary now has a dedicated internal design under review —
-`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md` in the repository's
-`docs/internal/plans/`. It is a design only: nothing about the refusal above
-has changed, and no implementation or arm lighting is authorized.
+The core boundary has moved. A local-origin OWN-ORGANIZATION
+exact-provider lease is implemented and dark: it plans and emits
+`SensingInterestFrame::OrgProviderRegistration` from installed
+authority, registers its local row under the organization-derived proven
+root, and reaches an organization-authoritative peer through that peer's
+ordinary registration intake.
+`SensingRegistrationError::OrgAudienceUnsupported` survives with a
+NARROWED meaning — the audience is an organization commitment but this
+node has no live membership to speak with right now, or the captured
+authority view went stale before the mutation. A FOREIGN organization's
+commitment is still undetectable from the sending side (a commitment is
+a one-way derivation), so it takes the legacy path unchanged. The
+internal design is
+`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md` under the
+repository's `docs/internal/plans/`.
+
+What is still genuinely absent: no query, watch, or snapshot surface, no
+readiness projection, no ranking, and no `ttl/2` refresh owner for a
+lease — an organization lease is a single registration with no
+re-authoring cadence. There are also no public `OrgClient` sensing
+controls or wiring, no provider-free/leader sensing, no `Granted` or
+cross-organization sensing, and no language bindings. Acquisition is not
+a projection, so the SDK surface stays provider-lifecycle only.
 
 The plan's §4.5 node-authority refusal guards *owner-scoped* sensing,
 and the provider surface exposes none: registering an evaluator names
@@ -286,8 +298,9 @@ authority. Whether a consumer's interest may reach this provider is
 decided on the registration path by `validate_subscriber_scope` and —
 for organization audiences — `verify_org_sensing_registration`, both of
 which run before any table row exists. The evaluator is consulted only
-after an admitted row produces a beat. When exact-provider acquisition
-lands, that surface carries the authority refusal.
+after an admitted row produces a beat. The authority refusal for
+exact-provider acquisition lives on that acquisition path, in the core,
+not in the provider registry.
 
 ## Observability
 

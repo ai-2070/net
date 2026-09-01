@@ -74,6 +74,7 @@ pub mod table;
 pub mod wire;
 
 pub use frames::{FrameSpecError, SensingInterestFrame, ValidatedProviderRegistration};
+pub(crate) use lease::LeasePlane;
 pub use lease::{
     LeaseAction, LeaseRefused, LeaseToken, SensingInterestLeases, SensingLeaseKey,
     SensingLeaseTicket,
@@ -87,9 +88,9 @@ pub(crate) use org_gate::{
     capture_current_sensing_stamp, capture_live_org_relay_membership,
     capture_sensing_authority_snapshot, count_org_rejection, plan_local_org_provider_registration,
     plan_provider_continuation, selector_names_target, validate_org_frame_shape,
-    verify_org_admission, AdmittedSensingRegistration, LiveOrgRelayMembership, LocalOrgEgress,
-    RegistrationAuthority, RegistrationLeg, RelayMembershipUnavailable, SensingAuthoritySnapshot,
-    SensingAuthorityUnavailable,
+    verify_org_admission, with_fenced_current_authority, AdmittedSensingRegistration,
+    LiveOrgRelayMembership, LocalOrgEgress, RegistrationAuthority, RegistrationLeg,
+    RelayMembershipUnavailable, SensingAuthoritySnapshot, SensingAuthorityUnavailable,
 };
 #[cfg(feature = "redex")]
 pub use rendezvous::{

@@ -84,17 +84,32 @@
 //! **Provider lifecycle only.** There is deliberately no query surface,
 //! no watch, no snapshot, and no readiness projection here.
 //!
-//! Exact-provider acquisition and projection are deferred to S4, and
-//! the reason is concrete rather than a matter of sequencing: the core
-//! still refuses every organization-audience exact-provider lease
-//! (`SensingRegistrationError::OrgAudienceUnsupported`) because the
-//! lease's wire leg emits legacy frames only, which an
-//! organization-authoritative provider refuses. Until
-//! organization-authenticated registration intake and
-//! organization-audience exact leases are authorized, nothing in this
-//! SDK could create the observations a projection would read, so
-//! shipping a projection would ship a surface that can only ever answer
-//! `Unknown` for the population it was built for.
+//! That scope no longer rests on a core dead end. The core now
+//! implements a dark local-origin exact-provider path: an
+//! OWN-ORGANIZATION exact-provider lease plans and emits
+//! `SensingInterestFrame::OrgProviderRegistration` from installed
+//! authority, registers its local row under the organization-derived
+//! proven root, and reaches an organization-authoritative peer through
+//! that peer's ordinary registration intake.
+//! `SensingRegistrationError::OrgAudienceUnsupported` survives with a
+//! NARROWED meaning — the audience is an organization commitment but
+//! this node has no live membership to speak with right now, or the
+//! captured authority view went stale before the mutation. A FOREIGN
+//! organization's commitment is still undetectable from the sending
+//! side (a commitment is a one-way derivation), so it takes the legacy
+//! path unchanged.
+//!
+//! What is still genuinely absent is everything a projection would
+//! stand on: no query, watch, or snapshot surface, no readiness
+//! projection, no ranking, and no `ttl/2` refresh owner for a lease —
+//! an organization lease is a single registration with no re-authoring
+//! cadence. There are also no public `OrgClient` sensing controls or
+//! wiring, no provider-free/leader sensing, no `Granted` or
+//! cross-organization sensing, and no language bindings. Acquisition
+//! existing in the core is therefore not a projection: shipping one
+//! here would ship a query surface with no refresh, no ranking, and no
+//! observation model beneath it, so this module stays provider
+//! lifecycle only.
 //!
 //! # What this surface does and does not name
 //!
@@ -262,8 +277,12 @@ impl Mesh {
     /// `verify_org_sensing_registration`, both of which run before any
     /// table row exists and neither of which consults this registry.
     /// The evaluator is read only after an admitted row produces a beat.
-    /// When exact-provider acquisition arrives (S4), it is that surface
-    /// that must carry the authority refusal.
+    /// Exact-provider acquisition is no longer hypothetical: the core
+    /// authors an own-organization exact-provider lease from installed
+    /// authority and refuses it with `OrgAudienceUnsupported` when no
+    /// live membership can be captured. That refusal lives on the
+    /// acquisition path, not in this provider registry, and none of it
+    /// is exposed through this SDK surface.
     pub fn sensing(&self) -> Result<SensingClient, SensingError> {
         SensingClient::bind_node(self.node().clone())
     }
@@ -581,9 +600,15 @@ mod tests {
     /// specs, audience-bearing types, provider selectors, result modes,
     /// budgets, projected readiness — must stay out, and no readiness
     /// projection may reappear here without a separate authorization.
+    /// The core having grown a dark own-organization exact-provider
+    /// acquisition path does not relax that: acquisition is not a
+    /// projection, and this SDK still exposes neither.
     ///
     /// Non-vacuous by construction: it reads this module's own source,
-    /// so a re-export or a projection method fails it.
+    /// so a re-export or a projection method fails it, and it pins the
+    /// scope statement plus the accurate account of what is absent, so
+    /// deleting either — or reviving the retired "deferred to S4"
+    /// story — fails it too.
     #[test]
     fn the_public_surface_of_this_module_is_provider_lifecycle_only() {
         let source = include_str!("sensing.rs");
@@ -620,9 +645,10 @@ mod tests {
         ] {
             assert!(
                 !declarations.contains(forbidden),
-                "`{forbidden}` is back in the SDK sensing surface — exact-provider \
-                 acquisition and projection are deferred to S4, after \
-                 organization-audience exact leases are authorized",
+                "`{forbidden}` is back in the SDK sensing surface — the SDK \
+                 sensing surface is provider lifecycle only, and no query, \
+                 watch, snapshot, or readiness-projection vocabulary may \
+                 reappear here without a separate authorization",
             );
         }
 
@@ -655,9 +681,30 @@ mod tests {
              which this slice does not ship",
         );
         assert!(
-            module_doc.contains("deferred to S4"),
-            "the module docs must state that exact-provider acquisition and \
-             projection are deferred, and why",
+            module_doc.contains("**Provider lifecycle only.**"),
+            "the module docs must keep the scope statement — this surface is \
+             provider lifecycle only",
+        );
+        assert!(
+            module_doc.contains("no readiness projection"),
+            "the module docs must keep saying that no query, watch, snapshot, \
+             or readiness projection exists here",
+        );
+        assert!(
+            module_doc.contains("no `ttl/2` refresh owner"),
+            "the module docs must keep naming what is still absent beneath a \
+             projection — no ranking and no lease refresh cadence",
+        );
+        assert!(
+            !module_doc.contains("deferred to S4"),
+            "the module docs still say exact-provider acquisition is deferred: \
+             the core now authors an own-organization exact-provider lease, so \
+             only the projection surface above it is absent",
+        );
+        assert!(
+            module_doc.contains("OrgProviderRegistration"),
+            "the module docs must record the implemented dark own-organization \
+             exact-provider path instead of denying it",
         );
 
         // The crate root must not advertise it either.
@@ -674,6 +721,11 @@ mod tests {
         assert!(
             !sensing_comment.contains("readiness projection over"),
             "lib.rs still advertises the removed readiness projection",
+        );
+        assert!(
+            !sensing_comment.contains("deferred to S4"),
+            "lib.rs still says exact-provider acquisition is deferred to S4 — \
+             the core implements it; the SDK just does not expose it",
         );
     }
 

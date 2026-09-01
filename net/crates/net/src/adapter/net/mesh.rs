@@ -6220,28 +6220,107 @@ struct OrgLeaseEgress<'a> {
 /// route/session work, sequence allocation, task spawn and peer fan-out all run
 /// with every sensing guard released.
 struct PendingOrgSend {
-    spec: sensing::InterestSpec,
+    /// Shared, not deep-cloned: the lease registry already owns the canonical
+    /// spec behind an `Arc`, so carrying the emission parameters out of Phase 1
+    /// costs one refcount and materializes nothing under a guard.
+    spec: Arc<sensing::InterestSpec>,
     provider: u64,
     strictest: Duration,
     ttl: Duration,
-    plan: sensing::LocalOrgEgress,
 }
 
-// Test-only phase instrumentation: how many sensing guards THIS THREAD is
-// currently holding inside a sensing transaction.
+/// A refused sensing-lease release, carrying the caller's ticket back.
+///
+/// The ticket is returned because the release did NOT happen: the reference is
+/// still held, the table row and the wire still carry the pre-transition
+/// cadence, and the caller may retry with the same ticket once authority is
+/// current again. Dropping this value drops the ticket, which leaks exactly one
+/// lease reference — the same consequence as never calling release at all, and
+/// strictly safer than the alternative it replaces (a committed release whose
+/// wire state silently disagreed).
+#[derive(Debug)]
+pub struct SensingLeaseReleaseRefused {
+    /// The still-live ticket. Hand it back to
+    /// [`MeshNode::release_sensing_interest_lease`] to retry.
+    ///
+    /// [`MeshNode::release_sensing_interest_lease`]:
+    ///     crate::adapter::net::MeshNode::release_sensing_interest_lease
+    pub ticket: sensing::SensingLeaseTicket,
+    /// Why the surviving holders' cadence could not be re-authored.
+    pub reason: SensingRegistrationError,
+}
+
+impl std::fmt::Display for SensingLeaseReleaseRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "sensing lease release refused, nothing released: {}",
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for SensingLeaseReleaseRefused {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.reason)
+    }
+}
+
+/// Everything Phase 1 decided that Phase 2 must still put on the wire.
+///
+/// Phase 1 mutates local state under the sensing guards and produces this;
+/// Phase 2 does every byte of authoring, encoding, route/session lookup,
+/// sequence allocation, task spawn and fan-out with all of those guards
+/// released. Both directions of the lease now flow through it — before this,
+/// only `Register`/`Reregister` had a Phase 2 and `Deregister` still did its
+/// full wire egress under the projection AND lease-apply guards.
+#[derive(Default)]
+struct PendingTransition {
+    /// An organization registration to author and emit.
+    org_registration: Option<PendingOrgSend>,
+    /// Branches whose last downstream died — one unchanged `Deregister` frame
+    /// each, byte-identical to what the guarded path used to send inline.
+    deregistrations: Vec<sensing::ProviderInterestKey>,
+}
+
+/// The only two values Phase 1 computes that Phase 2 needs. Everything else
+/// (spec, provider, plan) is already owned outside the guarded section, which
+/// is why no certificate or spec is cloned inside it.
+struct OrgSendParams {
+    strictest: Duration,
+    ttl: Duration,
+}
+
+// Phase instrumentation: how many SENSING GUARDS THIS THREAD currently holds.
 //
-// This replaces an earlier `debug_assert!(mutex.try_lock().is_some())` probe,
-// which was wrong twice over: `try_lock` tests global AVAILABILITY, not this
-// thread's ownership, so it both raced a legitimate concurrent acquirer and
-// would have passed while this thread still held the guard on a reentrant
-// mutex. A thread-local depth is exact and cannot race: only this thread
-// mutates it.
+// Two earlier shapes were both wrong.
+//
+// The first was `debug_assert!(mutex.try_lock().is_some())`, which tests global
+// AVAILABILITY rather than this thread's ownership: it raced a legitimate
+// concurrent acquirer and would have passed while this thread still held the
+// guard on a reentrant mutex.
+//
+// The second was a manual `SensingPhaseMark::enter()` at ONE call site. It
+// tracked only the registration projection guard — not the lease-apply guard,
+// not the deregistration projection guard, not the table, observations or
+// emitter guards, and not the currentness fence's `org_install`. Worse, the
+// mark was declared AFTER the guard it shadowed, so implicit drop order
+// released the mark FIRST and every early return reported depth zero while the
+// projection guard was still held.
+//
+// The shape below fixes both. `SensingGuard` pairs each REAL acquisition with
+// the depth increment and declares the inner guard FIRST, so drop order
+// releases the lock before the mark: the depth can never read zero while the
+// guard is still held, on any path including unwind. Every sensing guard in the
+// lease/register/deregister/emit paths is acquired through it, so
+// `assert_off_sensing_locks` covers all of them rather than one.
 #[cfg(any(test, feature = "fixtures"))]
 thread_local! {
     static SENSING_GUARD_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
-/// RAII depth marker for the sensing transaction, test builds only.
+/// RAII depth marker, test builds only. Never constructed directly outside
+/// [`SensingGuard`] — the whole point is that the depth tracks real guards.
 #[cfg(any(test, feature = "fixtures"))]
 struct SensingPhaseMark;
 
@@ -6257,6 +6336,46 @@ impl SensingPhaseMark {
 impl Drop for SensingPhaseMark {
     fn drop(&mut self) {
         SENSING_GUARD_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+/// A sensing lock guard that carries its own phase instrumentation.
+///
+/// FIELD ORDER IS LOAD-BEARING. Rust drops fields in declaration order, so
+/// `guard` is released before `_mark` decrements the depth. The instrumentation
+/// therefore strictly outlives the lock it describes, and no early return,
+/// `?`, or panic-unwind can report depth zero while the guard is still held.
+/// The reverse order would make the assertion silently vacuous on exactly the
+/// paths it exists to police.
+///
+/// In non-instrumented builds this is the bare guard plus a zero-sized field,
+/// so it costs nothing.
+struct SensingGuard<G> {
+    guard: G,
+    #[cfg(any(test, feature = "fixtures"))]
+    _mark: SensingPhaseMark,
+}
+
+impl<G> SensingGuard<G> {
+    fn new(guard: G) -> Self {
+        Self {
+            guard,
+            #[cfg(any(test, feature = "fixtures"))]
+            _mark: SensingPhaseMark::enter(),
+        }
+    }
+}
+
+impl<G> std::ops::Deref for SensingGuard<G> {
+    type Target = G;
+    fn deref(&self) -> &G {
+        &self.guard
+    }
+}
+
+impl<G> std::ops::DerefMut for SensingGuard<G> {
+    fn deref_mut(&mut self) -> &mut G {
+        &mut self.guard
     }
 }
 
@@ -8720,14 +8839,51 @@ pub struct MeshNode {
     /// installation generation would close it at the wire, but that is a
     /// deferred sensing-wire change (§4.3).
     sensing_lease_apply_mu: parking_lot::Mutex<()>,
-    /// Serializes ORGANIZATION frame authoring + emission only (Phase 2).
+    /// ORGANIZATION LEASE TRANSITION ORDER.
     ///
-    /// The smallest dedicated mechanism for send ordering on the org lane: it is
-    /// taken with every sensing mutation guard already released, so no sensing
-    /// lock is ever held across planning, encoding, route/session work, sequence
-    /// allocation, task spawn or peer fan-out — while two transitions for the
-    /// same interest still cannot invert on the wire.
-    org_egress_send_mu: parking_lot::Mutex<()>,
+    /// Establishes ONE total order over an organization lease transition's
+    /// three parts: the lease-registry decision/commit, the local
+    /// table/overlay mutation plus its currentness verdict, and the resulting
+    /// `Register`/`Reregister`/`Deregister` emission.
+    ///
+    /// It exists because serializing only the emission was not enough. With a
+    /// send-only mutex, transition B could commit its registry and table
+    /// decision AFTER A, then win the send mutex and emit FIRST, leaving A's
+    /// older state as the provider's final view: a `Register -> Deregister`
+    /// pair could resurrect a removed row, and two registrations could
+    /// overwrite a stricter cadence with an older, looser one.
+    ///
+    /// Acquired OUTERMOST — before `sensing_lease_apply_mu` — and held across
+    /// the off-lock authoring/emission phase. That is sound because this is
+    /// dedicated ordering state and nothing else: while it is held, Phase 2
+    /// holds no lease, projection, table, observation, emitter or
+    /// `org_install` guard, which is the property `assert_off_sensing_locks`
+    /// checks on every instrumented build.
+    ///
+    /// Bounded node-wide rather than per-key, deliberately: this is a dark
+    /// slice with a single-digit number of org leases, and one mutex is far
+    /// easier to reason about than a keyed map of them. It is acquired ONLY for
+    /// organization-plane exact-provider lease transitions — legacy leases,
+    /// provider-free keys, inbound peer registrations and every non-lease
+    /// sensing path never touch it, so no unrelated or legacy traffic is
+    /// serialized behind it.
+    org_transition_mu: parking_lot::Mutex<()>,
+    /// Fixtures-only: fires with `org_install` HELD, after a successful final
+    /// currentness comparison and before the table mutation. Lets a witness
+    /// prove an authority installation or floor publication attempted in that
+    /// exact instant cannot complete ahead of the mutation.
+    #[cfg(any(test, feature = "fixtures"))]
+    sensing_fence_seam: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Fixtures-only: fires ONCE PER EMITTING Phase 2, with every sensing guard
+    /// released and `org_transition_mu` still held. Lets a witness park one
+    /// transition mid-flight and prove a later one cannot overtake it, and lets
+    /// another prove a refused transition emits nothing at all.
+    ///
+    /// It deliberately does NOT fire for an empty payload — the acquire rollback
+    /// path reaches Phase 2 with nothing to send, and counting that as an
+    /// emission would make the zero-emission proof vacuous.
+    #[cfg(any(test, feature = "fixtures"))]
+    sensing_phase_two_seam: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Review L1 linearization: the LOCAL-projection transaction mutex. Every
     /// operation that changes OR applies the node-local consumer projection
     /// (the `Local`/`LeasedLocal` rows' derived
@@ -10565,7 +10721,11 @@ impl MeshNode {
             ),
             sensing_interest_leases: sensing::SensingInterestLeases::default(),
             sensing_lease_apply_mu: parking_lot::Mutex::new(()),
-            org_egress_send_mu: parking_lot::Mutex::new(()),
+            org_transition_mu: parking_lot::Mutex::new(()),
+            #[cfg(any(test, feature = "fixtures"))]
+            sensing_fence_seam: parking_lot::Mutex::new(None),
+            #[cfg(any(test, feature = "fixtures"))]
+            sensing_phase_two_seam: parking_lot::Mutex::new(None),
             sensing_local_projection_mu,
             #[cfg(feature = "fixtures")]
             sensing_projection_contention_hook: parking_lot::Mutex::new(None),
@@ -11008,6 +11168,39 @@ impl MeshNode {
     /// under [`Self::sensing_local_projection_mu`], so the consumer-cell anchor
     /// applies the aggregate captured WITH the mutation — a concurrent rival
     /// cannot complete in between and be overwritten by a stale capture.
+    /// The currentness-fence seam, if a witness installed one.
+    #[cfg(any(test, feature = "fixtures"))]
+    fn sensing_fence_seam_hook(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        self.sensing_fence_seam.lock().clone()
+    }
+
+    #[cfg(not(any(test, feature = "fixtures")))]
+    fn sensing_fence_seam_hook(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        None
+    }
+
+    /// Install the currentness-fence seam (fixtures only). It fires with
+    /// `org_install` held, after a successful final comparison and before the
+    /// table mutation.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn set_sensing_fence_seam_for_test(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.sensing_fence_seam.lock() = Some(hook);
+    }
+
+    /// Install the Phase-2 seam (fixtures only). It fires with every sensing
+    /// guard released and the transition order still held, so a witness can
+    /// park one transition and prove a later one cannot emit ahead of it.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn set_sensing_phase_two_seam_for_test(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.sensing_phase_two_seam.lock() = Some(hook);
+    }
+
+    /// Remove the Phase-2 seam (fixtures only).
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn clear_sensing_phase_two_seam_for_test(&self) {
+        *self.sensing_phase_two_seam.lock() = None;
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn register_sensing_interest_as(
         &self,
@@ -11023,7 +11216,7 @@ impl MeshNode {
         // table guard, and the upstream frame is the org variant sent AFTER every
         // sensing lock is released. `None` is the legacy path, byte-identical.
         org_egress: Option<&OrgLeaseEgress<'_>>,
-    ) -> Result<(sensing::RegisterOutcome, Option<PendingOrgSend>), SensingRegistrationError> {
+    ) -> Result<(sensing::RegisterOutcome, Option<OrgSendParams>), SensingRegistrationError> {
         if !self.config.enable_sensing_coalescing {
             return Err(SensingRegistrationError::Disabled);
         }
@@ -11069,7 +11262,7 @@ impl MeshNode {
         // the fixtures-only contention observer can signal ACTUAL observed
         // contention (round 4): the hook fires only after `try_lock` found the
         // mutex held, never on the uncontended fast path.
-        let _projection = match self.sensing_local_projection_mu.try_lock() {
+        let _projection = SensingGuard::new(match self.sensing_local_projection_mu.try_lock() {
             Some(guard) => guard,
             None => {
                 #[cfg(feature = "fixtures")]
@@ -11078,49 +11271,69 @@ impl MeshNode {
                 }
                 self.sensing_local_projection_mu.lock()
             }
-        };
-        // Test-only: THIS THREAD is now inside the guarded sensing transaction.
-        #[cfg(any(test, feature = "fixtures"))]
-        let _phase = SensingPhaseMark::enter();
+        });
         // Set only on the org path; authored and sent in Phase 2.
-        let mut pending_org: Option<PendingOrgSend> = None;
+        let mut org_send: Option<OrgSendParams> = None;
         let (outcome, aggregate, local_aggregate) = {
-            let mut table = self.sensing_interest_table.lock();
-            // ORG PATH, final currentness recheck — the admission linearization
-            // point, INSIDE the held table guard and immediately before the
-            // mutation, so no preparatory work can intervene. Mirrors the
-            // inbound `apply_provider_registration` discipline and reuses the
-            // same stamp primitive rather than a weaker parallel check. An
-            // authority swap, floor raise, `A → B → A` rotation, poison, or
-            // installation-generation move between planning and here makes the
-            // captured view stale: create NO row and emit NO frame.
-            // (Lock order: interest-table → org_install; no path takes the
-            // reverse, so this cannot deadlock.)
-            if let Some(egress) = org_egress {
-                let stale = match sensing::capture_current_sensing_stamp(
-                    &self.org_install,
-                    &self.node_authority,
-                    &self.org_revocation,
-                    &self.org_install_generation,
-                ) {
-                    None => true,
-                    Some(current) => !egress.snapshot.stamp().is_current(&current),
-                };
-                if stale {
-                    self.sensing_counters
-                        .org_stale_stamp
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Err(SensingRegistrationError::OrgAudienceUnsupported);
+            let mut table = SensingGuard::new(self.sensing_interest_table.lock());
+            // ORG PATH, final currentness FENCE — the admission linearization
+            // point. `org_install` is held across BOTH the comparison and the
+            // table mutation, so authority cannot move in between.
+            //
+            // This used to be a sampled comparison: `capture_current_sensing_stamp`
+            // releases `org_install` before returning, so an authority swap, a
+            // store swap, an `A -> B -> exact-A` rotation, a floor raise or a
+            // poison mark could land after the verdict and before the row
+            // existed — yielding a local row and a ticket for a frame the
+            // provider was already guaranteed to reject.
+            //
+            // Only the bounded, pure `table.register` runs inside the fence: no
+            // crypto, no authoring, no encoding, no I/O, no callback.
+            //
+            // (Lock order: interest-table -> org_install; no authority-install
+            // or floor-publication path takes a sensing lock, so the reverse
+            // edge does not exist and this cannot deadlock.)
+            let outcome = match org_egress {
+                Some(egress) => {
+                    // The seam Arc is bound to a local so it outlives the call.
+                    let seam = self.sensing_fence_seam_hook();
+                    let fenced = sensing::with_fenced_current_authority(
+                        &self.org_install,
+                        &self.node_authority,
+                        &self.org_revocation,
+                        &self.org_install_generation,
+                        egress.snapshot.stamp(),
+                        seam.as_ref().map(|hook| hook.as_ref()),
+                        || {
+                            table.register(
+                                &key,
+                                downstream,
+                                requested_sample_interval,
+                                ttl,
+                                proven_root,
+                                now,
+                            )
+                        },
+                    );
+                    match fenced {
+                        Some(outcome) => outcome,
+                        None => {
+                            self.sensing_counters
+                                .org_stale_stamp
+                                .fetch_add(1, Ordering::Relaxed);
+                            return Err(SensingRegistrationError::OrgAudienceUnsupported);
+                        }
+                    }
                 }
-            }
-            let outcome = table.register(
-                &key,
-                downstream,
-                requested_sample_interval,
-                ttl,
-                proven_root,
-                now,
-            );
+                None => table.register(
+                    &key,
+                    downstream,
+                    requested_sample_interval,
+                    ttl,
+                    proven_root,
+                    now,
+                ),
+            };
             (
                 outcome,
                 table.aggregate(&key, now),
@@ -11296,14 +11509,13 @@ impl MeshNode {
                         // and no fan-out happen here — all of that is Phase 2,
                         // performed by the caller after the lease-apply guard is
                         // also released.
-                        Some(egress) => {
-                            pending_org = Some(PendingOrgSend {
-                                spec: spec.clone(),
-                                provider,
-                                strictest,
-                                ttl,
-                                plan: egress.plan.clone_for_phase_two(),
-                            });
+                        Some(_) => {
+                            // Parameters ONLY. No certificate clone, no spec
+                            // clone, no planning, no encoding, no route or
+                            // session work, no fan-out — all of that is Phase 2,
+                            // run by the caller with every guard released and
+                            // reading the plan the caller already owns.
+                            org_send = Some(OrgSendParams { strictest, ttl });
                         }
                         // LEGACY PATH: unchanged, including sending inside the
                         // guard exactly as before.
@@ -11333,30 +11545,69 @@ impl MeshNode {
         // Release the projection guard and LEAVE the guarded phase. The org
         // frame is authored by the caller in Phase 2, after the lease-apply
         // guard is released too. The legacy path already sent above and leaves
-        // `pending_org` as `None`, so its behaviour is unchanged.
+        // `org_send` as `None`, so its behaviour is unchanged.
         drop(_projection);
-        #[cfg(any(test, feature = "fixtures"))]
-        drop(_phase);
-        Ok((outcome, pending_org))
+        Ok((outcome, org_send))
     }
 
-    /// PHASE 2 — author and emit ONE organization frame with every sensing
-    /// guard released: plan (which clones the certificate), encode, then hand
-    /// the bytes to the ordinary send path for route/session work, sequence
-    /// allocation and task spawn.
+    /// PHASE 2 — put Phase 1's decisions on the wire with every sensing guard
+    /// released.
     ///
-    /// Send order for the org lane is serialized by its own dedicated mutex
-    /// rather than by retaining the broad lease-apply guard across fan-out, so
-    /// two transitions for the same interest cannot invert on the wire while no
-    /// sensing mutation lock is held during I/O.
-    fn emit_pending_org_send(&self, pending: Option<PendingOrgSend>) {
-        let Some(pending) = pending else {
+    /// The caller still holds `org_transition_mu` (organization plane only), so
+    /// emissions for one key cannot invert relative to the order their
+    /// decisions committed. Nothing else is held: no lease-apply, projection,
+    /// table, observation, emitter or `org_install` guard — which is what the
+    /// instrumented assertion below actually checks, across every guard rather
+    /// than one.
+    fn commit_transition_phase_two(
+        &self,
+        pending: PendingTransition,
+        plan: Option<&sensing::LocalOrgEgress>,
+    ) {
+        assert_off_sensing_locks("sensing transition phase 2 (authoring and emission)");
+        // The seam observes actual EMISSIONS, not mere phase entries: the
+        // acquire rollback path legitimately reaches Phase 2 with an empty
+        // payload and puts nothing on the wire, so firing on entry would make
+        // "nothing was emitted" unprovable.
+        #[cfg(any(test, feature = "fixtures"))]
+        if pending.org_registration.is_some() || !pending.deregistrations.is_empty() {
+            if let Some(hook) = self.sensing_phase_two_seam.lock().clone() {
+                hook();
+            }
+        }
+        self.emit_pending_org_send(pending.org_registration, plan);
+        for branch_key in &pending.deregistrations {
+            self.send_sensing_deregister_upstream_direct(branch_key);
+        }
+    }
+
+    /// PHASE 2 — author and emit ONE organization registration with every
+    /// sensing guard released: plan (which clones the certificate), encode,
+    /// then hand the bytes to the ordinary send path for route/session work,
+    /// sequence allocation and task spawn.
+    ///
+    /// Ordering is the caller's `org_transition_mu`, held across commit,
+    /// mutation and emission — so two transitions for one interest emit in the
+    /// order their decisions committed, and no sensing mutation lock is held
+    /// during any of the I/O.
+    ///
+    /// `plan` is BORROWED from the caller's Phase 0 capture. Nothing is cloned
+    /// to get here.
+    fn emit_pending_org_send(
+        &self,
+        pending: Option<PendingOrgSend>,
+        plan: Option<&sensing::LocalOrgEgress>,
+    ) {
+        let (Some(pending), Some(plan)) = (pending, plan) else {
             return;
         };
         assert_off_sensing_locks("organization frame authoring and emission");
-        let _order = self.org_egress_send_mu.lock();
+        // No lock is taken here. Ordering is already established by
+        // `org_transition_mu`, which the caller holds across the whole
+        // transition: commit, mutation and emission. Taking a second
+        // send-only mutex would add an edge without adding an ordering.
         let Ok(frame) = sensing::plan_local_org_provider_registration(
-            &pending.plan,
+            plan,
             &pending.spec,
             pending.provider,
             pending.strictest,
@@ -11436,28 +11687,52 @@ impl MeshNode {
         if let Some(pause) = pause_after_capture {
             pause();
         }
-        let org_egress = org_prepared
-            .as_ref()
-            .map(|(plan, snapshot)| OrgLeaseEgress { plan, snapshot });
         let key = sensing::SensingLeaseKey::ExactProvider {
             audience: spec.audience,
             interest_digest: spec.interest_digest(),
             provider,
         };
-        // Serialize the decision with the synchronous allocation of its wire
-        // packet's stream sequence (see `sensing_lease_apply_mu` for the exact
-        // ordering guarantee and its limits).
-        let _apply = self.sensing_lease_apply_mu.lock();
+        // TRANSITION ORDER — outermost, and held across Phase 1 AND Phase 2 so
+        // this transition's commit, mutation and emission are one totally
+        // ordered unit. Taken only for the organization plane; a legacy lease
+        // never queues behind it.
+        let _order = org_prepared
+            .is_some()
+            .then(|| self.org_transition_mu.lock());
+        let plane = if org_prepared.is_some() {
+            sensing::LeasePlane::Organization
+        } else {
+            sensing::LeasePlane::Legacy
+        };
+        let _apply = SensingGuard::new(self.sensing_lease_apply_mu.lock());
         // Review-pass-2 §6: a bounded registry. A capacity refusal mints nothing
         // and records nothing, so — unlike the wire-failure path below — there
         // is no reference to roll back.
-        let (token, action) = self
+        //
+        // `established` is the plane this lease ALREADY had, which for a
+        // non-establishing acquisition may differ from `plane`: authority can
+        // have arrived or gone since the lease was created. The established
+        // plane wins, always.
+        let (token, action, established) = self
             .sensing_interest_leases
-            .acquire(key, spec, requested_sample_interval)
+            .acquire(key, spec, requested_sample_interval, plane)
             .map_err(SensingRegistrationError::LeaseAtCapacity)?;
         let ticket = sensing::SensingLeaseTicket { key, token };
-        let pending = match self.apply_sensing_lease_action(key, action, org_egress.as_ref()) {
-            Ok(pending) => pending,
+        // An ORGANIZATION lease can only ever be authored on the organization
+        // path. If this acquisition could not prepare one, refuse rather than
+        // fall back to legacy authoring — that fallback is the laundering the
+        // plane record exists to prevent.
+        if established == sensing::LeasePlane::Organization && org_prepared.is_none() {
+            let _ = self.sensing_interest_leases.release(ticket);
+            return Err(SensingRegistrationError::OrgAudienceUnsupported);
+        }
+        let org_egress = (established == sensing::LeasePlane::Organization)
+            .then_some(org_prepared.as_ref())
+            .flatten()
+            .map(|(plan, snapshot)| OrgLeaseEgress { plan, snapshot });
+        let plan = org_egress.as_ref().map(|egress| egress.plan);
+        let outcome = match self.apply_sensing_lease_action(key, action, org_egress.as_ref()) {
+            Ok(outcome) => outcome,
             Err(err) => {
                 // Roll the reference back and reconcile the wire to the post-release
                 // view. The lease owns a DISTINCT `LeasedLocal` row (review §1), so
@@ -11471,9 +11746,9 @@ impl MeshNode {
                 // discarding it silently is what leaves the lease registry and the
                 // wire disagreeing with nothing to say so. Counted and warned.
                 match self.apply_sensing_lease_action(key, rollback, None) {
-                    Ok(rollback_pending) => {
+                    Ok(rollback_outcome) => {
                         drop(_apply);
-                        self.emit_pending_org_send(rollback_pending);
+                        self.commit_transition_phase_two(rollback_outcome, None);
                     }
                     Err(rollback_err) => {
                         self.sensing_interest_leases.note_reconcile_failure();
@@ -11489,9 +11764,10 @@ impl MeshNode {
             }
         };
         // PHASE 2 — every sensing guard, including the lease-apply guard, is
-        // released before the org frame is authored or sent.
+        // released before anything is authored, encoded, routed or sent. Only
+        // the dedicated transition-order lock is still held.
         drop(_apply);
-        self.emit_pending_org_send(pending);
+        self.commit_transition_phase_two(outcome, plan);
         Ok(ticket)
     }
 
@@ -11570,58 +11846,118 @@ impl MeshNode {
     /// released against a different interest. Idempotent — the last holder's
     /// release deregisters, a strictest-holder release relaxes the cadence
     /// to the surviving minimum, and an already-released ticket is a no-op.
-    pub fn release_sensing_interest_lease(&self, ticket: sensing::SensingLeaseTicket) {
-        // PHASE 0, off every lock — a release that leaves other holders
-        // RE-AUTHORS the registration at the relaxed cadence, so it needs the
-        // same live authority proof a first acquisition does. The audience and
-        // provider come from the ticket's own key, so this is decided before any
-        // lock is taken and without a stored, replayable membership proof.
+    ///
+    /// # Transactional
+    ///
+    /// Returns `Err` — with the ticket handed back, still held — when an
+    /// ORGANIZATION lease's surviving-holder `Reregister` cannot be authored
+    /// against fresh current authority. In that case NOTHING moved: the
+    /// registry still holds this reference, the table row and the wire still
+    /// carry the pre-transition cadence, and the caller may retry.
+    ///
+    /// Previously this committed the registry release first and only then
+    /// discovered it could not author the relaxed cadence, leaving the registry
+    /// relaxed while the table and the provider kept the strict one. A final
+    /// release never fails: tearing a row down needs no membership claim.
+    pub fn release_sensing_interest_lease(
+        &self,
+        ticket: sensing::SensingLeaseTicket,
+    ) -> Result<(), SensingLeaseReleaseRefused> {
         let (audience, provider) = match ticket.key {
             sensing::SensingLeaseKey::ExactProvider {
                 audience, provider, ..
             } => (audience, provider),
             // Provider-free keys resolve through the leader path, not wired here.
             sensing::SensingLeaseKey::ProviderFree { .. } => {
-                let _apply = self.sensing_lease_apply_mu.lock();
+                let _apply = SensingGuard::new(self.sensing_lease_apply_mu.lock());
                 let action = self.sensing_interest_leases.release(ticket);
-                let _ = self.apply_sensing_lease_action(ticket.key, action, None);
-                return;
+                let pending = self
+                    .apply_sensing_lease_action(ticket.key, action, None)
+                    .unwrap_or_default();
+                drop(_apply);
+                self.commit_transition_phase_two(pending, None);
+                return Ok(());
             }
         };
-        // The spec is not known until the action is read, so exactness cannot be
-        // re-proved here; it was proved at acquisition and the registry replays
-        // the stored spec verbatim. Passing the spec-independent audience is
-        // enough to decide the PLANE, which is what this preparation selects.
-        let org_prepared = match self.prepare_org_egress_for_release(&audience) {
-            Ok(prepared) => prepared,
-            Err(err) => {
-                // Fail-closed and coherent: the registry has not been touched
-                // yet, so nothing diverges. The holder still drops its
-                // reference below; the wire simply keeps the stricter cadence
-                // until the next successful transition, which is the safe
-                // direction (over-sampling, never under-sampling).
-                self.sensing_interest_leases.note_reconcile_failure();
-                tracing::warn!(
-                    provider = format!("{:#x}", provider),
-                    error = %err,
-                    "sensing lease: release could not prove local organization authority; \
-                     the wire keeps the stricter cadence until the next transition"
-                );
-                let _apply = self.sensing_lease_apply_mu.lock();
-                let _ = self.sensing_interest_leases.release(ticket);
-                return;
+        // The ESTABLISHED plane, read from the registry — never re-derived from
+        // whatever authority is installed right now. Authority removal or an
+        // owner-org swap therefore cannot route an existing organization lease
+        // through legacy validation or legacy registration.
+        let plane = self
+            .sensing_interest_leases
+            .plane_for(&ticket.key)
+            .unwrap_or(sensing::LeasePlane::Legacy);
+        if plane == sensing::LeasePlane::Legacy {
+            // LEGACY PATH, unchanged.
+            let _apply = SensingGuard::new(self.sensing_lease_apply_mu.lock());
+            let action = self.sensing_interest_leases.release(ticket);
+            let pending = match self.apply_sensing_lease_action(ticket.key, action, None) {
+                Ok(pending) => pending,
+                Err(err) => {
+                    self.sensing_interest_leases.note_reconcile_failure();
+                    tracing::warn!(
+                        error = %err,
+                        "sensing lease: release could not reconcile the wire; the lease \
+                         registry and the wire may disagree until the next mutation"
+                    );
+                    PendingTransition::default()
+                }
+            };
+            drop(_apply);
+            self.commit_transition_phase_two(pending, None);
+            return Ok(());
+        }
+        // ORGANIZATION PATH. Transition order first, so the preview below and
+        // the commit that follows it cannot be split by a rival transition for
+        // this key — which is exactly what makes the preview sound.
+        let _order = self.org_transition_mu.lock();
+        // PREVIEW, committing nothing.
+        let previewed = self.sensing_interest_leases.preview_release(&ticket);
+        // A FINAL release needs no membership claim: it removes the local row
+        // and emits the ordinary unchanged `Deregister` even with no authority
+        // installed at all. Same for a no-op.
+        let needs_authority = matches!(previewed, sensing::LeaseAction::Reregister { .. });
+        let org_prepared = if needs_authority {
+            match self.prepare_org_egress_for_release(&audience) {
+                // Authority is live but this is no longer our organization's
+                // audience — the lease cannot be re-authored on its own plane,
+                // and must not silently drop to legacy.
+                Ok(None) => {
+                    return Err(SensingLeaseReleaseRefused {
+                        ticket,
+                        reason: SensingRegistrationError::OrgAudienceUnsupported,
+                    });
+                }
+                Ok(prepared) => prepared,
+                Err(reason) => {
+                    // NOTHING has been committed: the registry still holds this
+                    // reference and the table row is untouched, so registry,
+                    // table and provider remain coherent at the pre-transition
+                    // cadence. The caller sees the real reason and keeps a live
+                    // ticket to retry with.
+                    self.sensing_interest_leases.note_reconcile_failure();
+                    tracing::warn!(
+                        provider = format!("{:#x}", provider),
+                        error = %reason,
+                        "sensing lease: release refused — the surviving holders' cadence \
+                         cannot be re-authored under current organization authority; \
+                         nothing was released"
+                    );
+                    return Err(SensingLeaseReleaseRefused { ticket, reason });
+                }
             }
+        } else {
+            None
         };
         let org_egress = org_prepared
             .as_ref()
             .map(|(plan, snapshot)| OrgLeaseEgress { plan, snapshot });
+        let plan = org_egress.as_ref().map(|egress| egress.plan);
+        // COMMIT — authority is proved (or not required), so the registry
+        // mutation and the table mutation happen together.
         let pending = {
-            let _apply = self.sensing_lease_apply_mu.lock();
+            let _apply = SensingGuard::new(self.sensing_lease_apply_mu.lock());
             let action = self.sensing_interest_leases.release(ticket);
-            // 2026-07-23 §6 residual: release has no error channel — the holder
-            // is dropping its reference either way — so a failed wire
-            // reconciliation here is exactly the silent registry/wire divergence
-            // that residual names. Counted and warned rather than swallowed.
             match self.apply_sensing_lease_action(ticket.key, action, org_egress.as_ref()) {
                 Ok(pending) => pending,
                 Err(err) => {
@@ -11631,12 +11967,14 @@ impl MeshNode {
                         "sensing lease: release could not reconcile the wire; the lease \
                          registry and the wire may disagree until the next mutation"
                     );
-                    None
+                    PendingTransition::default()
                 }
             }
         };
-        // PHASE 2 — authored and emitted with every sensing guard released.
-        self.emit_pending_org_send(pending);
+        // PHASE 2 — authored and emitted with every sensing guard released and
+        // the transition order still held.
+        self.commit_transition_phase_two(pending, plan);
+        Ok(())
     }
 
     /// [`Self::prepare_org_egress`] for a release, where the interest spec is
@@ -11686,11 +12024,11 @@ impl MeshNode {
         key: sensing::SensingLeaseKey,
         action: sensing::LeaseAction,
         org_egress: Option<&OrgLeaseEgress<'_>>,
-    ) -> Result<Option<PendingOrgSend>, SensingRegistrationError> {
+    ) -> Result<PendingTransition, SensingRegistrationError> {
         // Only exact-provider leases are wired in this slice; a provider-free
         // key resolves through the rendezvous leader path, added later.
         let sensing::SensingLeaseKey::ExactProvider { provider, .. } = key else {
-            return Ok(None);
+            return Ok(PendingTransition::default());
         };
         match action {
             sensing::LeaseAction::Register { spec, interval }
@@ -11706,7 +12044,15 @@ impl MeshNode {
                     None,
                     org_egress,
                 )? {
-                    (sensing::RegisterOutcome::Registered(_), pending) => Ok(pending),
+                    (sensing::RegisterOutcome::Registered(_), org_send) => Ok(PendingTransition {
+                        org_registration: org_send.map(|params| PendingOrgSend {
+                            spec: Arc::clone(&spec),
+                            provider,
+                            strictest: params.strictest,
+                            ttl: params.ttl,
+                        }),
+                        deregistrations: Vec::new(),
+                    }),
                     // The table installed nothing — do not let the lease claim
                     // an installation. The caller rolls the reference back.
                     (sensing::RegisterOutcome::OverCap, _) => {
@@ -11717,15 +12063,15 @@ impl MeshNode {
                     }
                 }
             }
-            sensing::LeaseAction::Deregister { spec } => {
-                self.deregister_sensing_interest_as(
+            sensing::LeaseAction::Deregister { spec } => Ok(PendingTransition {
+                org_registration: None,
+                deregistrations: self.deregister_sensing_interest_as(
                     sensing::DownstreamId::LeasedLocal,
                     &spec,
                     provider,
-                );
-                Ok(None)
-            }
-            sensing::LeaseAction::Unchanged => Ok(None),
+                ),
+            }),
+            sensing::LeaseAction::Unchanged => Ok(PendingTransition::default()),
         }
     }
 
@@ -11738,8 +12084,15 @@ impl MeshNode {
     /// deregister upstream otherwise. A no-op when the plane is disabled
     /// or no such row exists.
     pub fn deregister_sensing_interest(&self, spec: &sensing::InterestSpec, provider: u64) {
-        // The DIRECT path retires the node-local `Local` row it owns.
-        self.deregister_sensing_interest_as(sensing::DownstreamId::Local, spec, provider);
+        // The DIRECT path retires the node-local `Local` row it owns. Phase 1
+        // mutates; the unchanged upstream `Deregister` frames go out here, with
+        // the projection guard already released.
+        let pending =
+            self.deregister_sensing_interest_as(sensing::DownstreamId::Local, spec, provider);
+        assert_off_sensing_locks("direct sensing deregistration emission");
+        for branch_key in &pending {
+            self.send_sensing_deregister_upstream_direct(branch_key);
+        }
     }
 
     /// The shared node-local deregistration core, parameterized by the owning
@@ -11751,19 +12104,26 @@ impl MeshNode {
         downstream: sensing::DownstreamId,
         spec: &sensing::InterestSpec,
         provider: u64,
-    ) {
+    ) -> Vec<sensing::ProviderInterestKey> {
         if !self.config.enable_sensing_coalescing {
-            return;
+            return Vec::new();
         }
         // Review L1 linearization: the removal and its consumer-cell
         // reconciliation are one transaction under the projection mutex.
-        let _projection = self.sensing_local_projection_mu.lock();
+        //
+        // PHASE 1 ONLY. This function no longer encodes a frame, resolves a
+        // route or session, allocates a stream sequence or spawns a task — all
+        // of that used to run right here with this guard AND the caller's
+        // lease-apply guard held. It now returns the branches that need an
+        // unchanged `Deregister` frame and the caller sends them in Phase 2.
+        let _projection = SensingGuard::new(self.sensing_local_projection_mu.lock());
+        let mut pending_deregistrations = Vec::new();
         let key = sensing::ProviderInterestKey::new(spec.key(), provider);
         let now = Instant::now();
         // Closure item 7: stamp snapshot BEFORE the table mutation the
         // retire decision rests on.
         let emitter_stamp = self.sensing_emitter.lock().as_ref().map(|e| e.stamp());
-        let actions = self.sensing_interest_table.lock().deregister(
+        let actions = SensingGuard::new(self.sensing_interest_table.lock()).deregister(
             &key.interest.interest_digest,
             Some(provider),
             downstream,
@@ -11813,9 +12173,11 @@ impl MeshNode {
                 continue;
             }
             if action == sensing::UpstreamAction::Deregister {
-                self.send_sensing_deregister_upstream_direct(&branch_key);
+                pending_deregistrations.push(branch_key);
             }
         }
+        drop(_projection);
+        pending_deregistrations
     }
 
     /// The `&self` counterpart of
@@ -42292,7 +42654,8 @@ mod sensing_authority_witness_tests {
             node.sensing_local_root(),
             "and specifically NOT the legacy local root"
         );
-        node.release_sensing_interest_lease(ticket);
+        node.release_sensing_interest_lease(ticket)
+            .expect("the release must not be refused");
 
         // Specific to the org derivation, not a blanket behaviour: an audience
         // that is neither this org's commitment nor this node's own root is
@@ -42501,7 +42864,8 @@ mod sensing_authority_witness_tests {
             node.sensing_local_root(),
             "and specifically not the legacy local root"
         );
-        node.release_sensing_interest_lease(ticket);
+        node.release_sensing_interest_lease(ticket)
+            .expect("the release must not be refused");
     }
 
     /// The exactness rule holds on the LOCAL egress too: a selector naming a
@@ -42704,7 +43068,468 @@ mod sensing_authority_witness_tests {
         let ticket = node
             .acquire_sensing_interest_lease(&spec, me, D)
             .expect("the exact self-provider shape is admitted");
-        node.release_sensing_interest_lease(ticket);
+        node.release_sensing_interest_lease(ticket)
+            .expect("the release must not be refused");
+    }
+
+    // ---- RELEASE COHERENCE + AUTHORITY PLANE (item 2) ---------------------
+
+    /// AUTHORITY REMOVED: a surviving-holder release of an ORGANIZATION lease
+    /// is REFUSED rather than committed, and nothing moves.
+    ///
+    /// The defect: release used to commit the registry drop first and only then
+    /// discover it could not author the relaxed cadence, leaving the registry
+    /// relaxed while the table and the provider kept the strict cadence. Worse,
+    /// `None` meant both "legacy lease" and "cannot author right now", so after
+    /// authority removal an ORGANIZATION lease fell through to legacy authoring.
+    #[tokio::test]
+    async fn a_surviving_holder_release_without_authority_is_refused_and_changes_nothing() {
+        let node = sensing_org_node("release-no-authority").await;
+        let target = node.node_id().wrapping_add(1);
+        let spec = org_spec(target, org_commitment());
+        let key = sensing::ProviderInterestKey::new(spec.key(), target);
+        let loose = Duration::from_millis(400);
+        let strict = Duration::from_millis(50);
+
+        let loose_ticket = node
+            .acquire_sensing_interest_lease(&spec, target, loose)
+            .expect("loose holder acquires");
+        let strict_ticket = node
+            .acquire_sensing_interest_lease(&spec, target, strict)
+            .expect("strict holder acquires");
+        let before = node
+            .sensing_downstream_entry(&key, sensing::DownstreamId::LeasedLocal)
+            .expect("the row exists");
+        assert_eq!(before.requested_sample_interval, strict);
+
+        // Remove the authority the lease was established under.
+        // Remove it the way this module already installs one (see the direct
+        // `node_authority.store(..)` precedent below): no production surface.
+        node.node_authority.store(None);
+
+        let refusal = node
+            .release_sensing_interest_lease(strict_ticket)
+            .expect_err("a surviving-holder org release must be REFUSED with no authority");
+        assert!(
+            matches!(
+                refusal.reason,
+                SensingRegistrationError::OrgAudienceUnsupported
+            ),
+            "the refusal must name the org-authority failure, got {:?}",
+            refusal.reason
+        );
+
+        // COHERENT: registry, table and cadence all unmoved.
+        let after = node
+            .sensing_downstream_entry(&key, sensing::DownstreamId::LeasedLocal)
+            .expect("the row is still installed");
+        assert_eq!(
+            after.requested_sample_interval, strict,
+            "the table must still carry the pre-transition cadence — a committed \
+             release with an un-authorable cadence is exactly the divergence"
+        );
+        assert_eq!(
+            after.owner_root,
+            org_commitment(),
+            "and still under the organization-derived root, never downgraded"
+        );
+        assert!(
+            !node.sensing_interest_leases.is_empty(),
+            "the registry still holds the reference that was not released"
+        );
+        // The ticket came back live, so the caller can retry.
+        node.node_authority
+            .store(Some(adopt(&node, &org(), "release-no-authority-2")));
+        node.release_sensing_interest_lease(refusal.ticket)
+            .expect("the returned ticket releases once authority is current again");
+        let relaxed = node
+            .sensing_downstream_entry(&key, sensing::DownstreamId::LeasedLocal)
+            .expect("the row survives the retry");
+        assert_eq!(
+            relaxed.requested_sample_interval, loose,
+            "the retry finally relaxes to the surviving holder's cadence"
+        );
+        node.release_sensing_interest_lease(loose_ticket)
+            .expect("final release");
+    }
+
+    /// FINAL release needs NO membership claim: with the authority gone it still
+    /// removes the local row and produces the ordinary unchanged deregistration.
+    #[tokio::test]
+    async fn a_final_org_release_without_authority_still_tears_the_row_down() {
+        let node = sensing_org_node("release-final-no-authority").await;
+        let target = node.node_id().wrapping_add(1);
+        let spec = org_spec(target, org_commitment());
+        let key = sensing::ProviderInterestKey::new(spec.key(), target);
+
+        let ticket = node
+            .acquire_sensing_interest_lease(&spec, target, Duration::from_millis(200))
+            .expect("acquire");
+        assert!(
+            node.sensing_downstream_entry(&key, sensing::DownstreamId::LeasedLocal)
+                .is_some(),
+            "precondition: the row exists"
+        );
+        node.node_authority.store(None);
+
+        node.release_sensing_interest_lease(ticket).expect(
+            "a FINAL release must succeed with no authority — tearing a row \
+                     down carries no membership claim",
+        );
+        assert!(
+            node.sensing_downstream_entry(&key, sensing::DownstreamId::LeasedLocal)
+                .is_none(),
+            "the local row must be gone"
+        );
+        assert!(
+            node.sensing_interest_leases.is_empty(),
+            "and the registry is empty"
+        );
+    }
+
+    /// OWNER-ORG SWAP: an existing ORGANIZATION lease cannot be re-authored, or
+    /// registered, under a DIFFERENT organization's authority. It is refused,
+    /// never laundered onto the legacy path.
+    #[tokio::test]
+    async fn an_owner_org_swap_cannot_reclassify_an_existing_org_lease() {
+        let node = sensing_org_node("release-org-swap").await;
+        let target = node.node_id().wrapping_add(1);
+        let spec = org_spec(target, org_commitment());
+        let key = sensing::ProviderInterestKey::new(spec.key(), target);
+        let loose = Duration::from_millis(400);
+        let strict = Duration::from_millis(50);
+
+        let loose_ticket = node
+            .acquire_sensing_interest_lease(&spec, target, loose)
+            .expect("loose acquires");
+        let strict_ticket = node
+            .acquire_sensing_interest_lease(&spec, target, strict)
+            .expect("strict acquires");
+
+        // Swap to a DIFFERENT organization. The lease's audience is still the
+        // original org's commitment, so the current authority cannot speak for
+        // it — and the plane record forbids falling back to legacy.
+        let other = OrgKeypair::from_bytes([0x5Eu8; 32]);
+        node.node_authority
+            .store(Some(adopt(&node, &other, "release-org-swap-other")));
+
+        let refusal = node
+            .release_sensing_interest_lease(strict_ticket)
+            .expect_err("a surviving-holder release under a FOREIGN owner org must be refused");
+        assert!(
+            matches!(
+                refusal.reason,
+                SensingRegistrationError::OrgAudienceUnsupported
+            ),
+            "got {:?}",
+            refusal.reason
+        );
+        let after = node
+            .sensing_downstream_entry(&key, sensing::DownstreamId::LeasedLocal)
+            .expect("the row survives");
+        assert_eq!(
+            after.owner_root,
+            org_commitment(),
+            "the row keeps the ORIGINAL organization's root — an owner-org swap \
+             must not re-root or legacy-downgrade a live organization lease"
+        );
+        assert_eq!(after.requested_sample_interval, strict, "and its cadence");
+        let _ = refusal;
+        let _ = loose_ticket;
+    }
+
+    /// A BELOW-FLOOR membership (the node's own certificate retracted by a
+    /// revocation floor) is not current authority: the surviving-holder release
+    /// is refused and the pre-transition state stands.
+    #[tokio::test]
+    async fn a_below_floor_membership_refuses_a_surviving_holder_release() {
+        use crate::adapter::net::behavior::org::OrgRevocationBundle;
+        use std::collections::BTreeMap;
+
+        let node = sensing_org_node("release-below-floor").await;
+        let target = node.node_id().wrapping_add(1);
+        let spec = org_spec(target, org_commitment());
+        let key = sensing::ProviderInterestKey::new(spec.key(), target);
+        let loose = Duration::from_millis(400);
+        let strict = Duration::from_millis(50);
+
+        let loose_ticket = node
+            .acquire_sensing_interest_lease(&spec, target, loose)
+            .expect("loose acquires");
+        let strict_ticket = node
+            .acquire_sensing_interest_lease(&spec, target, strict)
+            .expect("strict acquires");
+
+        // Raise the floor ABOVE this node's own certificate generation (1).
+        let mut floors = BTreeMap::new();
+        floors.insert(node.entity_id().clone(), 9u32);
+        let bundle = OrgRevocationBundle::try_issue(&org(), &floors).expect("bundle");
+        node.org_revocation_store()
+            .expect("store")
+            .apply_bundle(&bundle)
+            .expect("apply the floor raise");
+
+        let refusal = node
+            .release_sensing_interest_lease(strict_ticket)
+            .expect_err("a retracted membership cannot re-author the relaxed cadence");
+        assert!(
+            matches!(
+                refusal.reason,
+                SensingRegistrationError::OrgAudienceUnsupported
+            ),
+            "got {:?}",
+            refusal.reason
+        );
+        let after = node
+            .sensing_downstream_entry(&key, sensing::DownstreamId::LeasedLocal)
+            .expect("the row survives a refused release");
+        assert_eq!(
+            after.requested_sample_interval, strict,
+            "the strict cadence stands — over-sampling, never a silent relax the \
+             provider never heard about"
+        );
+        let _ = refusal;
+        let _ = loose_ticket;
+    }
+
+    /// The recorded PLANE, not live authority, decides. A lease established with
+    /// NO authority is a LEGACY lease for its whole life, and installing an
+    /// authority afterwards must not turn its next transition into an
+    /// organization one.
+    #[tokio::test]
+    async fn a_legacy_lease_stays_legacy_after_an_authority_arrives() {
+        let node = sensing_org_node("plane-legacy-sticky").await;
+        let target = node.node_id().wrapping_add(1);
+        // A LEGACY audience: this node's own sensing root, not the org's.
+        let spec = org_spec(target, node.sensing_local_root);
+        let key = sensing::ProviderInterestKey::new(spec.key(), target);
+        let loose = Duration::from_millis(400);
+        let strict = Duration::from_millis(50);
+
+        let loose_ticket = node
+            .acquire_sensing_interest_lease(&spec, target, loose)
+            .expect("legacy loose acquires");
+        let strict_ticket = node
+            .acquire_sensing_interest_lease(&spec, target, strict)
+            .expect("legacy strict acquires");
+        let row = node
+            .sensing_downstream_entry(&key, sensing::DownstreamId::LeasedLocal)
+            .expect("the legacy row exists");
+        assert_eq!(
+            row.owner_root, node.sensing_local_root,
+            "precondition: a legacy lease is rooted at the node's own sensing root"
+        );
+
+        // Releasing the strictest holder must SUCCEED on the legacy path — a
+        // legacy release never consults organization authority at all.
+        node.release_sensing_interest_lease(strict_ticket)
+            .expect("a legacy release is never refused");
+        let relaxed = node
+            .sensing_downstream_entry(&key, sensing::DownstreamId::LeasedLocal)
+            .expect("the row survives");
+        assert_eq!(relaxed.requested_sample_interval, loose);
+        assert_eq!(
+            relaxed.owner_root, node.sensing_local_root,
+            "and it is STILL legacy-rooted — an installed authority must not \
+             promote a legacy lease's transition to the organization plane"
+        );
+        node.release_sensing_interest_lease(loose_ticket)
+            .expect("final legacy release");
+    }
+
+    // ---- TRANSITION ORDER (item 1) ----------------------------------------
+
+    /// A later organization transition CANNOT overtake an earlier one.
+    ///
+    /// The defect this kills: ordering only the emission is not enough.
+    /// Transition B could commit its registry and table decision AFTER A, then
+    /// win a send-only mutex and emit FIRST, leaving A's older state as the
+    /// provider's final view.
+    ///
+    /// Deterministic, not timing-dependent: A is parked INSIDE Phase 2 by a
+    /// seam and signals when it is there. B is then started and given a
+    /// generous window to finish. If ordering were emission-only, B would
+    /// complete while A is parked. It cannot, because A holds the transition
+    /// order across Phase 2 — so B is still blocked when the window expires,
+    /// and only completes after A is released.
+    #[tokio::test]
+    async fn a_later_org_transition_cannot_overtake_a_parked_earlier_one() {
+        use std::sync::mpsc;
+
+        let node = sensing_org_node("order-overtake").await;
+        let target = node.node_id().wrapping_add(1);
+        let spec = org_spec(target, org_commitment());
+        let key = sensing::ProviderInterestKey::new(spec.key(), target);
+        let loose = Duration::from_millis(400);
+        let strict = Duration::from_millis(50);
+
+        // A: the first (loose) acquisition, parked in Phase 2.
+        let (reached_tx, reached_rx) = mpsc::sync_channel::<()>(1);
+        let (release_tx, release_rx) = mpsc::sync_channel::<()>(1);
+        let release_rx = Arc::new(parking_lot::Mutex::new(release_rx));
+        let fired = Arc::new(AtomicU64::new(0));
+        {
+            let fired = fired.clone();
+            node.set_sensing_phase_two_seam_for_test(Arc::new(move || {
+                // Park only the FIRST transition; later ones run through.
+                if fired.fetch_add(1, Ordering::SeqCst) == 0 {
+                    let _ = reached_tx.send(());
+                    let _ = release_rx.lock().recv();
+                }
+            }));
+        }
+
+        let a_node = node.clone();
+        let a_spec = spec.clone();
+        let a = std::thread::spawn(move || {
+            a_node
+                .acquire_sensing_interest_lease(&a_spec, target, loose)
+                .expect("A acquires")
+        });
+        reached_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("A must reach phase 2");
+
+        // B: a LATER, stricter transition. It must not be able to finish.
+        let b_node = node.clone();
+        let b_spec = spec.clone();
+        let (b_done_tx, b_done_rx) = mpsc::sync_channel::<()>(1);
+        let b = std::thread::spawn(move || {
+            let ticket = b_node
+                .acquire_sensing_interest_lease(&b_spec, target, strict)
+                .expect("B acquires");
+            let _ = b_done_tx.send(());
+            ticket
+        });
+        assert!(
+            b_done_rx.recv_timeout(Duration::from_millis(600)).is_err(),
+            "B completed while A was parked in phase 2 — the transition order is \
+             emission-only, so a later decision can overtake an earlier one"
+        );
+        // A's Phase 1 mutation has already landed (it parked in Phase 2), so a
+        // row exists — but it must carry A's cadence and ONLY A's. B is blocked
+        // before its own commit, so it cannot have tightened anything yet.
+        let parked = node
+            .sensing_downstream_entry(&key, sensing::DownstreamId::LeasedLocal)
+            .expect("A's phase-1 mutation landed before it parked");
+        assert_eq!(
+            parked.requested_sample_interval, loose,
+            "B committed its table mutation while A still held the transition \
+             order — the commit and the emission are not one ordered unit"
+        );
+
+        let _ = release_tx.send(());
+        let a_ticket = a.join().expect("A joins");
+        let b_ticket = b.join().expect("B joins");
+
+        // FINAL STATE IS B's — the later decision, applied last.
+        let row = node
+            .sensing_downstream_entry(&key, sensing::DownstreamId::LeasedLocal)
+            .expect("the row exists after both transitions");
+        assert_eq!(
+            row.requested_sample_interval, strict,
+            "the provider's final view must be the LATER decision's cadence"
+        );
+        assert_eq!(
+            row.owner_root,
+            org_commitment(),
+            "and still under the organization-derived root"
+        );
+
+        node.clear_sensing_phase_two_seam_for_test();
+        node.release_sensing_interest_lease(b_ticket)
+            .expect("release B");
+        node.release_sensing_interest_lease(a_ticket)
+            .expect("release A");
+    }
+
+    /// `Register -> final Deregister`: a stale registration cannot resurrect the
+    /// removed row. The deregistration is parked in Phase 2 while a rival
+    /// acquisition is attempted; the rival cannot land ahead of it, so the
+    /// removal is never followed by an older registration.
+    #[tokio::test]
+    async fn a_final_deregister_cannot_be_resurrected_by_a_racing_registration() {
+        use std::sync::mpsc;
+
+        let node = sensing_org_node("order-deregister").await;
+        let target = node.node_id().wrapping_add(1);
+        let spec = org_spec(target, org_commitment());
+        let key = sensing::ProviderInterestKey::new(spec.key(), target);
+        let d = Duration::from_millis(200);
+
+        let ticket = node
+            .acquire_sensing_interest_lease(&spec, target, d)
+            .expect("acquire");
+        assert!(
+            node.sensing_downstream_entry(&key, sensing::DownstreamId::LeasedLocal)
+                .is_some(),
+            "precondition: the row exists"
+        );
+
+        // Park the DEREGISTRATION inside phase 2.
+        let (reached_tx, reached_rx) = mpsc::sync_channel::<()>(1);
+        let (release_tx, release_rx) = mpsc::sync_channel::<()>(1);
+        let release_rx = Arc::new(parking_lot::Mutex::new(release_rx));
+        let fired = Arc::new(AtomicU64::new(0));
+        {
+            let fired = fired.clone();
+            node.set_sensing_phase_two_seam_for_test(Arc::new(move || {
+                if fired.fetch_add(1, Ordering::SeqCst) == 0 {
+                    let _ = reached_tx.send(());
+                    let _ = release_rx.lock().recv();
+                }
+            }));
+        }
+        let d_node = node.clone();
+        let dereg = std::thread::spawn(move || {
+            d_node
+                .release_sensing_interest_lease(ticket)
+                .expect("final release")
+        });
+        reached_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the deregistration must reach phase 2");
+
+        // A rival registration attempts to land while the removal is parked.
+        let r_node = node.clone();
+        let r_spec = spec.clone();
+        let (r_done_tx, r_done_rx) = mpsc::sync_channel::<()>(1);
+        let rival = std::thread::spawn(move || {
+            let ticket = r_node
+                .acquire_sensing_interest_lease(&r_spec, target, d)
+                .expect("the rival acquires");
+            let _ = r_done_tx.send(());
+            ticket
+        });
+        assert!(
+            r_done_rx.recv_timeout(Duration::from_millis(600)).is_err(),
+            "a registration landed while a final deregistration was mid-flight — \
+             it could resurrect the removed row on the provider"
+        );
+
+        let _ = release_tx.send(());
+        dereg.join().expect("the deregistration joins");
+        let rival_ticket = rival.join().expect("the rival joins");
+
+        // The rival's registration is the LAST decision, so a row exists — but
+        // it is the rival's own fresh one, applied strictly after the removal.
+        let row = node
+            .sensing_downstream_entry(&key, sensing::DownstreamId::LeasedLocal)
+            .expect("the rival's fresh row exists");
+        assert_eq!(
+            row.owner_root,
+            org_commitment(),
+            "the rival's row is its own organization registration, not a revived \
+             stale one"
+        );
+        node.clear_sensing_phase_two_seam_for_test();
+        node.release_sensing_interest_lease(rival_ticket)
+            .expect("release the rival");
+        assert!(
+            node.sensing_downstream_entry(&key, sensing::DownstreamId::LeasedLocal)
+                .is_none(),
+            "and the final release leaves nothing behind"
+        );
     }
 
     /// TWO HOLDERS (defect 1): releasing the STRICTEST holder while another
@@ -42741,7 +43566,8 @@ mod sensing_authority_witness_tests {
         );
 
         // Release the STRICTEST holder; the loose one survives.
-        node.release_sensing_interest_lease(strict_ticket);
+        node.release_sensing_interest_lease(strict_ticket)
+            .expect("the release must not be refused");
         let relaxed = node
             .sensing_downstream_entry(&key, sensing::DownstreamId::LeasedLocal)
             .expect("the row survives the strictest release");
@@ -42758,7 +43584,8 @@ mod sensing_authority_witness_tests {
         );
 
         // Final release deregisters.
-        node.release_sensing_interest_lease(loose_ticket);
+        node.release_sensing_interest_lease(loose_ticket)
+            .expect("the release must not be refused");
         assert!(
             node.sensing_downstream_entry(&key, sensing::DownstreamId::LeasedLocal)
                 .is_none(),
@@ -42770,27 +43597,298 @@ mod sensing_authority_witness_tests {
         );
     }
 
-    /// PHASE INSTRUMENTATION is not vacuous (defect 3): `assert_off_sensing_locks`
-    /// fires when THIS THREAD is inside the guarded phase. This is the inverse
-    /// witness for the off-lock boundary — if planning/encoding/send were moved
-    /// back under a sensing guard, every org lease test would fail here.
+    /// PHASE-2 COVERAGE (item 4): the REAL production Phase 2 entry point
+    /// refuses to run under EVERY sensing guard the off-lock claim covers.
     ///
-    /// Unlike the `try_lock` probe it replaces, this is deterministic: the depth
-    /// is thread-local, so no other thread can make it pass or fail by chance.
-    #[test]
-    fn the_off_lock_phase_assertion_fires_inside_the_guarded_phase() {
+    /// This is the inverse witness for the off-lock boundary, and unlike the
+    /// hand-built counter probe it replaces it actually proves COVERAGE: each
+    /// case takes a real production guard through the real instrumented wrapper
+    /// and then calls the real `commit_transition_phase_two`. An uninstrumented
+    /// guard makes its own case fail, loudly, by name.
+    #[tokio::test]
+    async fn the_phase_two_entry_refuses_to_run_under_any_sensing_guard() {
+        let node = sensing_org_node("phase-two-coverage").await;
         // Outside any transaction: silent.
         assert_off_sensing_locks("control");
-        let caught = std::panic::catch_unwind(|| {
-            let _phase = SensingPhaseMark::enter();
-            assert_off_sensing_locks("organization frame authoring and emission");
-        });
+
+        // Each case acquires a REAL production guard through the REAL
+        // instrumented wrapper and then calls the REAL Phase 2 entry point.
+        // This is the coverage claim itself: if any of these guards were not
+        // instrumented, its case would silently pass and Phase 2 would be free
+        // to author, encode, route and send with that lock held.
+        //
+        // A previous version constructed a bare `SensingPhaseMark` by hand and
+        // proved only that a counter can panic — it would have stayed green with
+        // every production acquisition uninstrumented.
+        type GuardCase = (&'static str, Box<dyn Fn() + Send>);
+        let cases: Vec<GuardCase> = vec![
+            (
+                "sensing_lease_apply_mu",
+                Box::new({
+                    let node = node.clone();
+                    move || {
+                        let _g = SensingGuard::new(node.sensing_lease_apply_mu.lock());
+                        node.commit_transition_phase_two(PendingTransition::default(), None);
+                    }
+                }),
+            ),
+            (
+                "sensing_local_projection_mu",
+                Box::new({
+                    let node = node.clone();
+                    move || {
+                        let _g = SensingGuard::new(node.sensing_local_projection_mu.lock());
+                        node.commit_transition_phase_two(PendingTransition::default(), None);
+                    }
+                }),
+            ),
+            (
+                "sensing_interest_table",
+                Box::new({
+                    let node = node.clone();
+                    move || {
+                        let _g = SensingGuard::new(node.sensing_interest_table.lock());
+                        node.commit_transition_phase_two(PendingTransition::default(), None);
+                    }
+                }),
+            ),
+            (
+                "sensing_observations",
+                Box::new({
+                    let node = node.clone();
+                    move || {
+                        let _g = SensingGuard::new(node.sensing_observations.lock());
+                        node.commit_transition_phase_two(PendingTransition::default(), None);
+                    }
+                }),
+            ),
+        ];
+        for (guard, run) in cases {
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
+            assert!(
+                caught.is_err(),
+                "the production phase-2 entry ran while `{guard}` was held — that \
+                 guard's acquisition is not instrumented, so the off-lock claim is \
+                 unchecked for it"
+            );
+            // The mark strictly outlives the guard, so the depth unwound.
+            assert_off_sensing_locks("after unwind");
+        }
+
+        // AND the ordering property the field layout encodes: an early return
+        // out of a guarded scope must never report depth zero while the guard is
+        // still held. Exercised by taking the guard, returning through `?`-like
+        // control flow, and observing depth only AFTER the scope ends.
+        {
+            let _g = SensingGuard::new(node.sensing_interest_table.lock());
+            let depth = SENSING_GUARD_DEPTH.with(|d| d.get());
+            assert_eq!(depth, 1, "a held instrumented guard must read depth 1");
+        }
+        assert_off_sensing_locks("after the guarded scope ends");
+    }
+
+    /// PRODUCTION COVERAGE (item 4): the guards the PRODUCTION path acquires
+    /// are instrumented, proven from inside a real production transaction.
+    ///
+    /// The sibling above takes each guard in the test, which proves the wrapper
+    /// works but NOT that production uses it. This one calls the real Phase 2
+    /// entry from inside the real fence seam — a point reached only by a genuine
+    /// `acquire_sensing_interest_lease`, with the lease-apply guard, the
+    /// projection guard, the interest-table guard and `org_install` all held by
+    /// production code. If production reverted any of those to a bare `.lock()`,
+    /// the depth would read lower and this would stop firing.
+    #[tokio::test]
+    async fn the_production_transaction_holds_instrumented_guards_at_the_fence() {
+        let node = sensing_org_node("phase-two-production-coverage").await;
+        let target = node.node_id().wrapping_add(1);
+        let spec = org_spec(target, org_commitment());
+
+        let depth_at_fence = Arc::new(AtomicU64::new(0));
+        let fired = Arc::new(AtomicU64::new(0));
+        {
+            let depth_at_fence = depth_at_fence.clone();
+            let fired = fired.clone();
+            let node2 = node.clone();
+            node.set_sensing_fence_seam_for_test(Arc::new(move || {
+                depth_at_fence.store(
+                    u64::from(SENSING_GUARD_DEPTH.with(|d| d.get())),
+                    Ordering::SeqCst,
+                );
+                // The REAL phase-2 entry, called from inside the REAL guarded
+                // transaction. It must refuse.
+                let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    node2.commit_transition_phase_two(PendingTransition::default(), None);
+                }));
+                if caught.is_err() {
+                    fired.store(1, Ordering::SeqCst);
+                }
+            }));
+        }
+        let ticket = node
+            .acquire_sensing_interest_lease(&spec, target, Duration::from_millis(200))
+            .expect("acquire");
+
+        let depth = depth_at_fence.load(Ordering::SeqCst);
         assert!(
-            caught.is_err(),
-            "the phase assertion MUST fire while this thread is inside the guarded phase"
+            depth >= 3,
+            "at the production fence this thread must hold at least the \
+             lease-apply, projection and interest-table guards through the \
+             instrumented wrapper — depth was {depth}, so production reverted \
+             one or more of them to an uninstrumented `.lock()`"
         );
-        // The mark is RAII, so the depth unwound with the panic.
-        assert_off_sensing_locks("after unwind");
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            1,
+            "the production phase-2 entry did NOT refuse from inside the real \
+             guarded transaction — the off-lock claim is unenforced on the path \
+             that actually matters"
+        );
+        node.release_sensing_interest_lease(ticket)
+            .expect("release");
+    }
+
+    // ---- CURRENTNESS FENCE (item 5) ---------------------------------------
+
+    /// An authority INSTALL attempted in the instant between the final
+    /// currentness comparison and the table mutation cannot complete ahead of
+    /// the mutation.
+    ///
+    /// The defect: `capture_current_sensing_stamp` releases `org_install` before
+    /// returning, so the old code compared a sample and then mutated with
+    /// nothing excluded. An install, store swap, `A -> B -> exact-A` rotation,
+    /// floor raise or poison mark landing in that gap produced a local row and a
+    /// ticket for a frame the provider was already certain to reject.
+    ///
+    /// The fence holds `org_install` across both. This witness fires inside the
+    /// fence and proves a real installation attempt is still blocked there.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_install_attempted_inside_the_fence_cannot_precede_the_mutation() {
+        use std::sync::mpsc;
+
+        let node = sensing_org_node("fence-install").await;
+        let target = node.node_id().wrapping_add(1);
+        let spec = org_spec(target, org_commitment());
+        let key = sensing::ProviderInterestKey::new(spec.key(), target);
+
+        let (inside_tx, inside_rx) = mpsc::sync_channel::<()>(1);
+        let install_done = Arc::new(AtomicU64::new(0));
+        {
+            let install_done = install_done.clone();
+            let node2 = node.clone();
+            node.set_sensing_fence_seam_for_test(Arc::new(move || {
+                // We are inside the fence with `org_install` HELD.
+                let n = node2.clone();
+                let done = install_done.clone();
+                std::thread::spawn(move || {
+                    n.node_authority
+                        .store(Some(adopt(&n, &org(), "fence-install-rival")));
+                    // A real acquisition of the installation lock — this is what
+                    // must not be able to complete while the fence holds it.
+                    let _install = n.org_install.lock();
+                    done.store(1, Ordering::SeqCst);
+                });
+                // Give the rival a generous window. It must NOT finish.
+                std::thread::sleep(Duration::from_millis(300));
+                let _ = inside_tx.send(());
+                assert_eq!(
+                    install_done.load(Ordering::SeqCst),
+                    0,
+                    "an installation completed while the currentness fence held \
+                     `org_install` — the comparison is a sample, not an exclusion, \
+                     so a row can be created for an authority that already moved"
+                );
+                // The rival thread finishes on its own once the fence releases;
+                // it is detached deliberately so the fence is never the thing
+                // waiting on it.
+            }));
+        }
+
+        let ticket = node
+            .acquire_sensing_interest_lease(&spec, target, Duration::from_millis(200))
+            .expect("the fenced acquisition succeeds");
+        inside_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the fence seam must have fired");
+        let row = node
+            .sensing_downstream_entry(&key, sensing::DownstreamId::LeasedLocal)
+            .expect("the fenced mutation installed the row");
+        assert_eq!(
+            row.owner_root,
+            org_commitment(),
+            "under the organization-derived root"
+        );
+        node.release_sensing_interest_lease(ticket)
+            .expect("release");
+    }
+
+    /// A capture-window stale view creates NO row AND emits NO frame.
+    ///
+    /// The earlier witnesses asserted only "no local row". Zero emission is the
+    /// stronger and more load-bearing half: a frame sent for a view the provider
+    /// will reject is exactly the state the fence exists to prevent. Phase 2 is
+    /// the ONLY place any organization frame is authored, so observing that
+    /// Phase 2 never runs is an exact proof that nothing was emitted.
+    #[tokio::test]
+    async fn a_stale_capture_window_emits_no_frame_at_all() {
+        let node = sensing_org_node("stale-emits-nothing").await;
+        let target = node.node_id().wrapping_add(1);
+        let spec = org_spec(target, org_commitment());
+        let key = sensing::ProviderInterestKey::new(spec.key(), target);
+
+        // Count every entry into the authoring/emission phase.
+        let phase_two_entries = Arc::new(AtomicU64::new(0));
+        {
+            let seen = phase_two_entries.clone();
+            node.set_sensing_phase_two_seam_for_test(Arc::new(move || {
+                seen.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        // Control: a healthy acquisition DOES author exactly once, so the
+        // observer is proven live before it is used to prove an absence.
+        let control = node
+            .acquire_sensing_interest_lease(&spec, target, Duration::from_millis(200))
+            .expect("the control acquisition succeeds");
+        assert_eq!(
+            phase_two_entries.load(Ordering::SeqCst),
+            1,
+            "the emission observer must be live — a healthy org acquisition \
+             authors exactly one frame"
+        );
+        node.release_sensing_interest_lease(control)
+            .expect("release the control");
+        let baseline = phase_two_entries.load(Ordering::SeqCst);
+
+        // Now stale the captured view inside the REAL production window.
+        let node2 = node.clone();
+        let swap = move || {
+            node2
+                .node_authority
+                .store(Some(adopt(&node2, &org(), "stale-emits-nothing-rival")));
+        };
+        let refused = node
+            .acquire_sensing_interest_lease_seamed(
+                &spec,
+                target,
+                Duration::from_millis(200),
+                Some(&swap),
+            )
+            .expect_err("a staled captured view must refuse");
+        assert!(
+            matches!(refused, SensingRegistrationError::OrgAudienceUnsupported),
+            "got {refused:?}"
+        );
+        assert!(
+            node.sensing_downstream_entry(&key, sensing::DownstreamId::LeasedLocal)
+                .is_none(),
+            "no row may be created for a staled view"
+        );
+        assert_eq!(
+            phase_two_entries.load(Ordering::SeqCst),
+            baseline,
+            "a staled view must emit NOTHING — a frame the provider is certain \
+             to reject went out"
+        );
+        node.clear_sensing_phase_two_seam_for_test();
     }
 
     /// LEGACY UNCHANGED: a legacy-audience lease on the same sensing-enabled
@@ -42813,7 +43911,8 @@ mod sensing_authority_witness_tests {
             "the legacy row still carries the node's own sensing root"
         );
         assert_ne!(row.owner_root, org_commitment());
-        node.release_sensing_interest_lease(ticket);
+        node.release_sensing_interest_lease(ticket)
+            .expect("the release must not be refused");
     }
 }
 

@@ -518,12 +518,26 @@ jobs:
       # deliberately excludes `fixtures`, so a fixtures gate would compile these
       # modules to a silent 0-test no-op here.
       #
-      # FLOOR accounting: org_gate 42 baseline + 7 (selector-target intake) + 5
-      # (local-origin org egress planner) = 54; sensing_authority_witness_tests
-      # 28 baseline + 1 (dispatch ordering) + 6 (local org lease egress) = 35. A
-      # later slice RAISES a floor and APPENDS its names in the same commit that
-      # adds the witnesses — never separately, or the gate goes red on a name
-      # that does not exist yet.
+      # FLOOR accounting (verified against `cargo test --lib --features
+      # "$UNIT_FEATURES" -- --list`, NOT by hand):
+      #   org_gate                        = 54
+      #     42 baseline + 7 (selector-target intake) + 5 (local-origin planner)
+      #   sensing_authority_witness_tests = 49
+      #     28 baseline + 1 (dispatch ordering) + 6 (local org lease egress)
+      #     + 4 (lease-egress hold repair) + 10 (transition order, release
+      #     coherence, phase-2 coverage, currentness fence)
+      # The mesh line previously read 35 while MESH_MIN read 39 — the arithmetic
+      # drifted from the pin. Re-derive both from `--list` when you change them.
+      #
+      # REQUIRED holds 34 names (12 gate + 22 mesh); a prior commit message said
+      # 21, which was a `tail`-truncated count of the gate's own output, not the
+      # roster size. Count with the loops below, not by eye.
+      #
+      # A later slice RAISES a floor and APPENDS its names in the same commit
+      # that adds the witnesses — never separately, or the gate goes red on a
+      # name that does not exist yet. Likewise, RETIRING a witness removes its
+      # name here in the same commit, or the anchored existence check fails on a
+      # name that no longer exists.
       - name: Selector-target org intake witnesses
         if: ${{ !cancelled() }}
         run: |
@@ -531,7 +545,7 @@ jobs:
           GATE=adapter::net::behavior::sensing::org_gate::tests
           MESH=adapter::net::mesh::sensing_authority_witness_tests
           GATE_MIN=54
-          MESH_MIN=39
+          MESH_MIN=49
 
           die() { echo "::error::$1"; shift; [ "$#" -gt 0 ] && printf '%s\n' "$@"; exit 1; }
 
@@ -610,10 +624,20 @@ jobs:
           a_legacy_audience_lease_still_registers_under_the_local_root
           an_org_audience_sensing_lease_is_never_laundered_into_a_legacy_frame
           releasing_the_strictest_org_holder_reauthors_at_the_relaxed_cadence
-          the_off_lock_phase_assertion_fires_inside_the_guarded_phase
           an_authority_swap_inside_the_capture_window_creates_no_org_row
           a_floor_raise_inside_the_capture_window_creates_no_org_row
-          a_self_provider_org_lease_requires_selector_exactness"
+          a_self_provider_org_lease_requires_selector_exactness
+          a_later_org_transition_cannot_overtake_a_parked_earlier_one
+          a_final_deregister_cannot_be_resurrected_by_a_racing_registration
+          a_surviving_holder_release_without_authority_is_refused_and_changes_nothing
+          a_final_org_release_without_authority_still_tears_the_row_down
+          an_owner_org_swap_cannot_reclassify_an_existing_org_lease
+          a_below_floor_membership_refuses_a_surviving_holder_release
+          a_legacy_lease_stays_legacy_after_an_authority_arrives
+          the_phase_two_entry_refuses_to_run_under_any_sensing_guard
+          the_production_transaction_holds_instrumented_guards_at_the_fence
+          an_install_attempted_inside_the_fence_cannot_precede_the_mutation
+          a_stale_capture_window_emits_no_frame_at_all"
 
           check_one() {
             fqn="$1"

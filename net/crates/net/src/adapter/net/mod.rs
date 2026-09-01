@@ -137,8 +137,9 @@ pub use identity::{
 #[cfg(feature = "nat-traversal")]
 pub use mesh::UpgradeAttemptGuard;
 pub use mesh::{
-    ControlPlaneStats, MeshNode, MeshNodeConfig, PartitionFilter, SensingReadinessOverlay,
-    SensingRegistrationError, UnregisteredChannelPolicy, ACK_RANGES_CAPABILITY_TAG,
+    ControlPlaneStats, MeshNode, MeshNodeConfig, PartitionFilter, SensingLeaseReleaseRefused,
+    SensingReadinessOverlay, SensingRegistrationError, UnregisteredChannelPolicy,
+    ACK_RANGES_CAPABILITY_TAG,
 };
 #[cfg(feature = "netdb")]
 pub use netdb::{MemoriesFilter, NetDb, NetDbBuilder, NetDbError, NetDbSnapshot, TasksFilter};

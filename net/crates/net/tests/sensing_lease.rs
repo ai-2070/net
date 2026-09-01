@@ -89,14 +89,16 @@ async fn equivalent_acquires_share_one_registration_and_last_release_deregisters
         "the equivalent second acquire is still one registration"
     );
 
-    node.release_sensing_interest_lease(t1);
+    node.release_sensing_interest_lease(t1)
+        .expect("the release must not be refused");
     assert!(
         node.sensing_downstreams(&key)
             .contains(&DownstreamId::LeasedLocal),
         "a surviving holder keeps the registration live"
     );
 
-    node.release_sensing_interest_lease(t2);
+    node.release_sensing_interest_lease(t2)
+        .expect("the release must not be refused");
     assert!(
         node.sensing_downstreams(&key).is_empty(),
         "the last release deregisters the interest"
@@ -135,8 +137,10 @@ async fn a_stricter_acquire_keeps_one_local_registration() {
         "the tightened 50 ms cadence is actually installed on the row"
     );
 
-    node.release_sensing_interest_lease(strict);
-    node.release_sensing_interest_lease(loose);
+    node.release_sensing_interest_lease(strict)
+        .expect("the release must not be refused");
+    node.release_sensing_interest_lease(loose)
+        .expect("the release must not be refused");
     assert!(
         node.sensing_table_is_empty(),
         "both holders gone — interest deregistered"
@@ -162,7 +166,8 @@ async fn releasing_one_ticket_leaves_another_key_untouched() {
         .acquire_sensing_interest_lease(&spec_b, OTHER_PROVIDER, D)
         .expect("acquire B");
 
-    node.release_sensing_interest_lease(ta);
+    node.release_sensing_interest_lease(ta)
+        .expect("the release must not be refused");
     assert!(node.sensing_downstreams(&key_a).is_empty(), "A torn down");
     assert!(
         node.sensing_downstreams(&key_b)
@@ -209,7 +214,8 @@ async fn overcap_rolls_back_and_does_not_wedge_the_lease() {
     );
 
     // Free capacity, then the same interest registers cleanly (recovery).
-    node.release_sensing_interest_lease(ta);
+    node.release_sensing_interest_lease(ta)
+        .expect("the release must not be refused");
     let _tb = node
         .acquire_sensing_interest_lease(&spec_b, OTHER_PROVIDER, D)
         .expect("recovers once capacity frees");
@@ -278,10 +284,12 @@ async fn double_release_is_idempotent() {
     let ticket = node
         .acquire_sensing_interest_lease(&spec, PROVIDER, D)
         .expect("acquire");
-    node.release_sensing_interest_lease(ticket);
+    node.release_sensing_interest_lease(ticket)
+        .expect("the release must not be refused");
     assert!(node.sensing_downstreams(&key).is_empty());
     // Second release of the same ticket does nothing and must not panic.
-    node.release_sensing_interest_lease(ticket);
+    node.release_sensing_interest_lease(ticket)
+        .expect("the release must not be refused");
     assert!(node.sensing_table_is_empty());
 }
 
@@ -370,7 +378,8 @@ async fn stale_ticket_release_cannot_remove_a_live_successor() {
     let t1 = node
         .acquire_sensing_interest_lease(&spec, PROVIDER, D)
         .expect("acquire t1");
-    node.release_sensing_interest_lease(t1);
+    node.release_sensing_interest_lease(t1)
+        .expect("the release must not be refused");
     assert!(node.sensing_table_is_empty(), "t1 released — no rows");
 
     // A NEW holder for the same key mints a fresh, monotonic token.
@@ -384,7 +393,8 @@ async fn stale_ticket_release_cannot_remove_a_live_successor() {
     );
 
     // The STALE t1 release must be a pure no-op — it cannot tear down t2.
-    node.release_sensing_interest_lease(t1);
+    node.release_sensing_interest_lease(t1)
+        .expect("the release must not be refused");
     assert!(
         node.sensing_downstreams(&key)
             .contains(&DownstreamId::LeasedLocal),
@@ -396,7 +406,8 @@ async fn stale_ticket_release_cannot_remove_a_live_successor() {
     );
 
     // The successor's OWN release is what finally deregisters.
-    node.release_sensing_interest_lease(t2);
+    node.release_sensing_interest_lease(t2)
+        .expect("the release must not be refused");
     assert!(
         node.sensing_table_is_empty(),
         "t2 release deregisters — no rows remain"
@@ -444,7 +455,8 @@ async fn refused_non_first_holder_tighten_relaxes_back_to_survivor() {
     );
 
     // The loose holder still cleanly tears down.
-    node.release_sensing_interest_lease(loose);
+    node.release_sensing_interest_lease(loose)
+        .expect("the release must not be refused");
     assert!(node.sensing_table_is_empty(), "final release deregisters");
 }
 
@@ -483,7 +495,8 @@ async fn local_and_leased_share_one_aggregate_consumer_cadence() {
 
     // Releasing the lease leaves the direct row and relaxes the shared cell to
     // 100 ms — and, because the direct row survives, sends no upstream Deregister.
-    node.release_sensing_interest_lease(lease);
+    node.release_sensing_interest_lease(lease)
+        .expect("the release must not be refused");
     assert_eq!(
         node.sensing_downstreams(&key),
         vec![DownstreamId::Local],
@@ -528,7 +541,8 @@ async fn shared_consumer_cadence_is_order_independent() {
         "the shared cadence is min(50, 100), not the last-registered 100 ms"
     );
 
-    node.release_sensing_interest_lease(lease);
+    node.release_sensing_interest_lease(lease)
+        .expect("the release must not be refused");
     node.deregister_sensing_interest(&spec, PROVIDER);
     assert!(node.sensing_table_is_empty());
 }
