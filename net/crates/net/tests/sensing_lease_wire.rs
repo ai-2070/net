@@ -137,13 +137,15 @@ async fn lease_tighten_and_relax_reach_the_provider() {
     // The strictest holder releases (spaced past the min-gap) → the provider
     // relaxes back to the surviving loose cadence.
     tokio::time::sleep(PAST_MIN_GAP).await;
-    a.release_sensing_interest_lease(strict);
+    a.release_sensing_interest_lease(strict)
+        .expect("the release must not be refused");
     assert!(
         poll_until(POLL, || peer_interval(&b, &key, a_id) == Some(D)).await,
         "provider never relaxed back to {D:?}"
     );
 
-    a.release_sensing_interest_lease(loose);
+    a.release_sensing_interest_lease(loose)
+        .expect("the release must not be refused");
     a.shutdown().await.expect("shutdown A");
     b.shutdown().await.expect("shutdown B");
 }
@@ -178,7 +180,8 @@ async fn last_release_deregisters_the_provider_row() {
         "provider never gained the row"
     );
 
-    a.release_sensing_interest_lease(ticket);
+    a.release_sensing_interest_lease(ticket)
+        .expect("the release must not be refused");
     assert!(
         poll_until(POLL, || peer_interval(&b, &key, a_id).is_none()).await,
         "provider row was not deregistered promptly (would only expire by sweep)"

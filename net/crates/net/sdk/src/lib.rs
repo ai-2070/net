@@ -196,10 +196,11 @@ pub mod subnets;
 // Capability sensing — the PROVIDER lifecycle only: `provide`, the
 // ownership-safe registration handle, and state-edge notification. See
 // CAPABILITY_SENSING_SDK_INTEGRATION_PLAN.md §4.4/§4.5. There is no
-// query, watch, snapshot, or readiness projection in this slice; the
-// module docs record why exact-provider acquisition and projection are
-// deferred to S4. Rides `net`: every operation is node state on a live
-// `MeshNode`.
+// query, watch, snapshot, or readiness projection in this slice. The
+// core does now author a dark own-organization exact-provider lease,
+// but acquisition is not a projection — the module docs record what is
+// implemented there and what is still absent above it. Rides `net`:
+// every operation is node state on a live `MeshNode`.
 #[cfg(feature = "net")]
 pub mod sensing;
 
@@ -322,9 +323,9 @@ pub use crate::subnets::{SubnetId, SubnetPolicy};
 // integration implements, its result model, the registration handle,
 // and the loud refusal. The incarnation derivation stays behind
 // `net_sdk::sensing::` so the crate root does not grow a second sensing
-// surface. There is no query, watch, or projection surface in this
-// slice — see the module docs for why exact-provider projection is
-// deferred to S4.
+// surface. There is no query, watch, or projection surface here — the
+// core's own-organization exact-provider acquisition is not re-exported
+// and grows no SDK vocabulary; see the module docs.
 #[cfg(feature = "net")]
 pub use crate::sensing::{
     EvaluationRequest, ReadinessEvaluation, ReadinessEvaluator, ReadinessRegistration,

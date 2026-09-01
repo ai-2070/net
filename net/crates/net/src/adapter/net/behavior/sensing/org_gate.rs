@@ -638,20 +638,6 @@ impl LocalOrgEgress {
     pub(crate) fn proven_root(&self) -> AudienceScopeCommitment {
         self.proven_root
     }
-
-    /// Carry this plan out of the guarded transaction so Phase 2 can author the
-    /// frame with every sensing guard released.
-    ///
-    /// This copies already-signed bytes plus a derived commitment. It confers no
-    /// authority, cannot be built from caller material, and does NOT make the
-    /// plan replayable across transitions: every transition runs its own fresh
-    /// capture, so current authority, membership and floor stay final.
-    pub(crate) fn clone_for_phase_two(&self) -> Self {
-        Self {
-            proven_root: self.proven_root,
-            membership: self.membership.clone(),
-        }
-    }
 }
 
 /// Plan the LOCAL-ORIGIN organization provider registration frame.
@@ -1073,6 +1059,72 @@ pub(crate) fn capture_current_sensing_stamp(
         installation_generation: org_install_generation.load(Ordering::Acquire),
         poisoned: store.is_poisoned(),
     })
+}
+
+/// Run `mutate` if and only if `expected` is still the current authority stamp,
+/// with `org_install` HELD across both the comparison and the mutation.
+///
+/// This closes a real window. [`capture_current_sensing_stamp`] releases
+/// `org_install` before it returns, so a caller that compared its result and
+/// then mutated a table was SAMPLING authority, not excluding it: an authority
+/// swap, a store swap, an `A -> B -> exact-A` rotation, a floor raise
+/// (`apply_bundle` -> `StoreCore::publish`) or a poison mark could all land in
+/// between and the row would be created anyway — a local row and a ticket for a
+/// frame the provider is now guaranteed to reject.
+///
+/// The shape mirrors [`capture_live_org_relay_membership_seamed`], which
+/// already performs its currency recheck under the same lock rather than
+/// afterwards.
+///
+/// # What may run inside
+///
+/// `mutate` MUST be a bounded, pure state mutation — the interest-table
+/// register/deregister call and nothing else. No cryptography, no frame
+/// authoring, no encoding, no I/O, no callbacks, no channel sends, no lock
+/// acquisition that is not already ordered below `org_install`. The authority
+/// installation path holds this same lock across Ed25519 verification and a
+/// fold sweep, so anything slow here directly stalls installs.
+///
+/// # Lock order
+///
+/// `sensing_interest_table` -> `org_install`, matching the two existing
+/// comparison sites. No authority-installation or floor-publication path
+/// acquires any sensing lock, so the reverse edge does not exist and this
+/// cannot deadlock.
+///
+/// `fence_seam` fires after a SUCCESSFUL comparison and before `mutate`, with
+/// `org_install` held. It exists so a witness can prove an authority
+/// installation or floor publication attempted in that instant cannot complete
+/// ahead of the mutation.
+pub(crate) fn with_fenced_current_authority<R>(
+    org_install: &Mutex<()>,
+    node_authority: &ArcSwapOption<NodeAuthority>,
+    org_revocation: &ArcSwapOption<OrgRevocationStore>,
+    org_install_generation: &AtomicU64,
+    expected: &SensingAuthorityStamp,
+    fence_seam: Option<&(dyn Fn() + Send + Sync)>,
+    mutate: impl FnOnce() -> R,
+) -> Option<R> {
+    let _install = org_install.lock();
+    let authority = node_authority.load_full()?;
+    let store = org_revocation.load_full()?;
+    let current = SensingAuthorityStamp {
+        authority_ptr: Arc::as_ptr(&authority) as *const () as usize,
+        store_ptr: Arc::as_ptr(&store) as *const () as usize,
+        store_generation: store.barriered_generation().ok(),
+        installation_generation: org_install_generation.load(Ordering::Acquire),
+        poisoned: store.is_poisoned(),
+    };
+    if !expected.is_current(&current) {
+        return None;
+    }
+    if let Some(seam) = fence_seam {
+        seam();
+    }
+    // STILL HOLDING `org_install`: no install, swap, rotation, floor
+    // publication or poison mark can be observed between the verdict above and
+    // the mutation below.
+    Some(mutate())
 }
 
 /// A pinned, live proof of THIS node's own organization membership, captured so

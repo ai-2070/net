@@ -107,7 +107,7 @@ struct LeaseMetrics {
     reconcile_failures: AtomicU64,
 }
 
-/// Opaque per-holder token. [`SensingInterestLeases::acquire`] returns one;
+/// Opaque per-holder token. `SensingInterestLeases::acquire` returns one;
 /// [`SensingInterestLeases::release`] consumes it via the ticket. Node-local;
 /// never on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -181,6 +181,33 @@ pub struct SensingLeaseTicket {
     pub(crate) token: LeaseToken,
 }
 
+/// Which authority plane a lease was FIRST established under.
+///
+/// Recorded once, at the establishing acquisition, and never recomputed. Every
+/// later transition for that key reads it back rather than re-deriving it from
+/// whatever authority happens to be installed at the time.
+///
+/// This is the fix for a real defect: the plane used to be inferred by
+/// comparing the audience against the currently-installed authority's owner
+/// organization, so removing the authority — or swapping the owner org — made
+/// an existing ORGANIZATION lease look like a LEGACY one, and its next
+/// transition would be authored and validated as legacy. That is authority
+/// laundering in the release direction.
+///
+/// It is minimal internal metadata: two states, crate-private, derived at
+/// establishment from the node's own installed authority. It is NOT a stored
+/// membership certificate and NOT a replayable proof — every organization
+/// transition still performs its own fresh capture. It only answers "which
+/// plane does this lease belong to", which cannot change for the lease's
+/// lifetime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LeasePlane {
+    /// Established without organization authority — legacy entity-root frames.
+    Legacy,
+    /// Established under this node's own installed organization authority.
+    Organization,
+}
+
 /// One key's shared registration state.
 struct LeaseEntry {
     /// The canonical spec every holder of this key registered under (they share
@@ -191,6 +218,9 @@ struct LeaseEntry {
     /// The interval currently installed on the wire — the minimum of
     /// `registrations` at the last wire-changing action.
     installed_interval: Duration,
+    /// The authority plane this lease was established under. Immutable for the
+    /// entry's lifetime.
+    plane: LeasePlane,
 }
 
 /// Reference-counted, cadence-aggregating sensing-interest leases for one node.
@@ -220,12 +250,18 @@ impl SensingInterestLeases {
     /// cadence does not move even for a would-be-stricter holder, and no live
     /// interest is evicted to make room. The caller therefore has nothing to
     /// roll back.
-    pub fn acquire(
+    /// `plane` is the authority plane the CALLER established this transition
+    /// under. It is stored on the establishing (vacant) acquisition and ignored
+    /// afterwards: an existing lease keeps the plane it was created with, so a
+    /// later authority change cannot reclassify it. The plane actually in force
+    /// is always the one returned here.
+    pub(crate) fn acquire(
         &self,
         key: SensingLeaseKey,
         spec: &InterestSpec,
         interval: Duration,
-    ) -> Result<(LeaseToken, LeaseAction), LeaseRefused> {
+        plane: LeasePlane,
+    ) -> Result<(LeaseToken, LeaseAction, LeasePlane), LeaseRefused> {
         let mut entries = self.entries.lock();
         // Checked BEFORE `entry()` and before the token mint, so a refused
         // acquisition is indistinguishable from never having been attempted —
@@ -246,8 +282,9 @@ impl SensingInterestLeases {
                     spec: Arc::clone(&spec),
                     registrations,
                     installed_interval: interval,
+                    plane,
                 });
-                Ok((token, LeaseAction::Register { spec, interval }))
+                Ok((token, LeaseAction::Register { spec, interval }, plane))
             }
             Entry::Occupied(mut o) => {
                 let entry = o.get_mut();
@@ -259,6 +296,8 @@ impl SensingInterestLeases {
                 }
                 let token = self.mint_token();
                 entry.registrations.insert(token, interval);
+                // The ESTABLISHED plane, not the caller's current view of it.
+                let plane = entry.plane;
                 // `installed_interval` is maintained as the exact minimum of all
                 // live registrations, so the new minimum is just this holder's
                 // interval against it.
@@ -271,9 +310,10 @@ impl SensingInterestLeases {
                             spec: Arc::clone(&entry.spec),
                             interval: new_min,
                         },
+                        plane,
                     ))
                 } else {
-                    Ok((token, LeaseAction::Unchanged))
+                    Ok((token, LeaseAction::Unchanged, plane))
                 }
             }
         }
@@ -303,6 +343,57 @@ impl SensingInterestLeases {
                 .refused_interest_at_capacity
                 .load(Ordering::Acquire),
         )
+    }
+
+    /// The authority plane a live lease was ESTABLISHED under, if the key is
+    /// still held. Reads recorded metadata; derives nothing from current
+    /// authority.
+    pub(crate) fn plane_for(&self, key: &SensingLeaseKey) -> Option<LeasePlane> {
+        self.entries.lock().get(key).map(|entry| entry.plane)
+    }
+
+    /// What [`release`](Self::release) WOULD return, without mutating anything.
+    ///
+    /// This exists because an organization release is transactional: a
+    /// surviving-holder `Reregister` must be authored against fresh current
+    /// authority, and if it cannot be, the release must not have happened at
+    /// all. Committing first and discovering the failure afterwards is exactly
+    /// the divergence this preview prevents — the registry would hold a relaxed
+    /// aggregate while the table and the wire kept the strict cadence.
+    ///
+    /// The preview is only sound if no rival transition for the key can
+    /// interleave between it and the commit. The caller guarantees that by
+    /// holding the organization transition lock across both (see
+    /// `MeshNode::org_transition_mu`).
+    pub(crate) fn preview_release(&self, ticket: &SensingLeaseTicket) -> LeaseAction {
+        let entries = self.entries.lock();
+        let Some(entry) = entries.get(&ticket.key) else {
+            return LeaseAction::Unchanged;
+        };
+        if !entry.registrations.contains_key(&ticket.token) {
+            return LeaseAction::Unchanged;
+        }
+        if entry.registrations.len() == 1 {
+            return LeaseAction::Deregister {
+                spec: Arc::clone(&entry.spec),
+            };
+        }
+        let new_min = strictest_sample_interval(
+            entry
+                .registrations
+                .iter()
+                .filter(|(token, _)| **token != ticket.token)
+                .map(|(_, interval)| *interval),
+        )
+        .unwrap_or(entry.installed_interval);
+        if new_min > entry.installed_interval {
+            LeaseAction::Reregister {
+                spec: Arc::clone(&entry.spec),
+                interval: new_min,
+            }
+        } else {
+            LeaseAction::Unchanged
+        }
     }
 
     /// Release a reference held under `ticket`.
@@ -419,7 +510,9 @@ mod tests {
         let mut held = Vec::new();
         for provider in 0..MAX_LEASED_INTERESTS as u64 {
             let key = key_for(&s, provider);
-            let (token, action) = leases.acquire(key, &s, ms(100)).expect("within capacity");
+            let (token, action, _) = leases
+                .acquire(key, &s, ms(100), LeasePlane::Legacy)
+                .expect("within capacity");
             assert!(matches!(action, LeaseAction::Register { .. }));
             held.push(ticket(key, token));
         }
@@ -427,7 +520,7 @@ mod tests {
 
         let overflow = key_for(&s, MAX_LEASED_INTERESTS as u64);
         assert_eq!(
-            leases.acquire(overflow, &s, ms(100)),
+            leases.acquire(overflow, &s, ms(100), LeasePlane::Legacy),
             Err(LeaseRefused::NodeAtCapacity)
         );
         assert_eq!(
@@ -445,8 +538,8 @@ mod tests {
         // An EXISTING key still acquires at node capacity: only a new key spends
         // the node budget.
         let existing = held[0].key;
-        let (_t, action) = leases
-            .acquire(existing, &s, ms(500))
+        let (_t, action, _) = leases
+            .acquire(existing, &s, ms(500), LeasePlane::Legacy)
             .expect("an existing interest is not node-bounded");
         assert_eq!(action, LeaseAction::Unchanged);
 
@@ -455,7 +548,9 @@ mod tests {
             leases.release(held.pop().expect("held")),
             LeaseAction::Deregister { .. }
         ));
-        assert!(leases.acquire(overflow, &s, ms(100)).is_ok());
+        assert!(leases
+            .acquire(overflow, &s, ms(100), LeasePlane::Legacy)
+            .is_ok());
     }
 
     /// The 65th HOLDER of one interest is refused, and — the load-bearing half —
@@ -467,7 +562,9 @@ mod tests {
         let s = spec("gpu.infer");
         let key = key_for(&s, 7);
         for _ in 0..MAX_HOLDERS_PER_INTEREST {
-            leases.acquire(key, &s, ms(100)).expect("within capacity");
+            leases
+                .acquire(key, &s, ms(100), LeasePlane::Legacy)
+                .expect("within capacity");
         }
         assert_eq!(
             leases.entry_for_test(&key),
@@ -475,7 +572,7 @@ mod tests {
         );
 
         assert_eq!(
-            leases.acquire(key, &s, ms(10)),
+            leases.acquire(key, &s, ms(10), LeasePlane::Legacy),
             Err(LeaseRefused::InterestAtCapacity)
         );
         assert_eq!(
@@ -496,7 +593,9 @@ mod tests {
         let leases = SensingInterestLeases::default();
         let s = spec("gpu.infer");
         let key = key_for(&s, 7);
-        let (_t, action) = leases.acquire(key, &s, ms(100)).expect("within capacity");
+        let (_t, action, _) = leases
+            .acquire(key, &s, ms(100), LeasePlane::Legacy)
+            .expect("within capacity");
         match action {
             LeaseAction::Register { spec, interval } => {
                 assert_eq!(*spec, s);
@@ -512,8 +611,12 @@ mod tests {
         let leases = SensingInterestLeases::default();
         let s = spec("gpu.infer");
         let key = key_for(&s, 7);
-        leases.acquire(key, &s, ms(100)).expect("within capacity");
-        let (_t, action) = leases.acquire(key, &s, ms(500)).expect("within capacity");
+        leases
+            .acquire(key, &s, ms(100), LeasePlane::Legacy)
+            .expect("within capacity");
+        let (_t, action, _) = leases
+            .acquire(key, &s, ms(500), LeasePlane::Legacy)
+            .expect("within capacity");
         assert_eq!(action, LeaseAction::Unchanged);
         assert_eq!(leases.entry_for_test(&key), Some((2, ms(100))));
     }
@@ -523,8 +626,12 @@ mod tests {
         let leases = SensingInterestLeases::default();
         let s = spec("gpu.infer");
         let key = key_for(&s, 7);
-        leases.acquire(key, &s, ms(500)).expect("within capacity");
-        let (_t, action) = leases.acquire(key, &s, ms(100)).expect("within capacity");
+        leases
+            .acquire(key, &s, ms(500), LeasePlane::Legacy)
+            .expect("within capacity");
+        let (_t, action, _) = leases
+            .acquire(key, &s, ms(100), LeasePlane::Legacy)
+            .expect("within capacity");
         match action {
             LeaseAction::Reregister { spec, interval } => {
                 assert_eq!(*spec, s);
@@ -539,8 +646,12 @@ mod tests {
         let leases = SensingInterestLeases::default();
         let s = spec("gpu.infer");
         let key = key_for(&s, 7);
-        let (strict, _) = leases.acquire(key, &s, ms(100)).expect("within capacity");
-        let (loose, _) = leases.acquire(key, &s, ms(500)).expect("within capacity");
+        let (strict, _, _) = leases
+            .acquire(key, &s, ms(100), LeasePlane::Legacy)
+            .expect("within capacity");
+        let (loose, _, _) = leases
+            .acquire(key, &s, ms(500), LeasePlane::Legacy)
+            .expect("within capacity");
         let _ = strict;
         let action = leases.release(ticket(key, loose));
         assert_eq!(action, LeaseAction::Unchanged);
@@ -552,8 +663,12 @@ mod tests {
         let leases = SensingInterestLeases::default();
         let s = spec("gpu.infer");
         let key = key_for(&s, 7);
-        let (strict, _) = leases.acquire(key, &s, ms(100)).expect("within capacity");
-        leases.acquire(key, &s, ms(500)).expect("within capacity");
+        let (strict, _, _) = leases
+            .acquire(key, &s, ms(100), LeasePlane::Legacy)
+            .expect("within capacity");
+        leases
+            .acquire(key, &s, ms(500), LeasePlane::Legacy)
+            .expect("within capacity");
         match leases.release(ticket(key, strict)) {
             LeaseAction::Reregister { spec, interval } => {
                 assert_eq!(*spec, s);
@@ -569,7 +684,9 @@ mod tests {
         let leases = SensingInterestLeases::default();
         let s = spec("gpu.infer");
         let key = key_for(&s, 7);
-        let (only, _) = leases.acquire(key, &s, ms(100)).expect("within capacity");
+        let (only, _, _) = leases
+            .acquire(key, &s, ms(100), LeasePlane::Legacy)
+            .expect("within capacity");
         match leases.release(ticket(key, only)) {
             LeaseAction::Deregister { spec } => assert_eq!(*spec, s),
             other => panic!("expected Deregister, got {other:?}"),
@@ -582,8 +699,12 @@ mod tests {
         let leases = SensingInterestLeases::default();
         let s = spec("gpu.infer");
         let key = key_for(&s, 7);
-        let (a, first) = leases.acquire(key, &s, ms(100)).expect("within capacity");
-        let (b, second) = leases.acquire(key, &s, ms(100)).expect("within capacity");
+        let (a, first, _) = leases
+            .acquire(key, &s, ms(100), LeasePlane::Legacy)
+            .expect("within capacity");
+        let (b, second, _) = leases
+            .acquire(key, &s, ms(100), LeasePlane::Legacy)
+            .expect("within capacity");
         assert!(matches!(first, LeaseAction::Register { .. }));
         assert_eq!(second, LeaseAction::Unchanged);
         assert_eq!(leases.release(ticket(key, a)), LeaseAction::Unchanged);
@@ -604,9 +725,13 @@ mod tests {
             interest_digest: s.interest_digest(),
             provider: 9,
         };
-        let (k1_tok, _) = leases.acquire(key, &s, ms(100)).expect("within capacity");
+        let (k1_tok, _, _) = leases
+            .acquire(key, &s, ms(100), LeasePlane::Legacy)
+            .expect("within capacity");
         // A real token, but issued for a DIFFERENT key — unknown to key's entry.
-        let (k2_tok, _) = leases.acquire(k2, &s, ms(100)).expect("within capacity");
+        let (k2_tok, _, _) = leases
+            .acquire(k2, &s, ms(100), LeasePlane::Legacy)
+            .expect("within capacity");
         assert_eq!(leases.release(ticket(key, k2_tok)), LeaseAction::Unchanged);
         assert_eq!(leases.entry_for_test(&key), Some((1, ms(100))));
         // Double release of key's token: first deregisters, second is a noop.
@@ -627,8 +752,12 @@ mod tests {
             interest_digest: s.interest_digest(),
             provider: 8,
         };
-        leases.acquire(k1, &s, ms(100)).expect("within capacity");
-        leases.acquire(k2, &s, ms(100)).expect("within capacity");
+        leases
+            .acquire(k1, &s, ms(100), LeasePlane::Legacy)
+            .expect("within capacity");
+        leases
+            .acquire(k2, &s, ms(100), LeasePlane::Legacy)
+            .expect("within capacity");
         assert_eq!(leases.len(), 2);
         assert_eq!(leases.entry_for_test(&k1), Some((1, ms(100))));
         assert_eq!(leases.entry_for_test(&k2), Some((1, ms(100))));
