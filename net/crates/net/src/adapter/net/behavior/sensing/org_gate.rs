@@ -1062,7 +1062,8 @@ pub(crate) fn capture_current_sensing_stamp(
 }
 
 /// Run `mutate` if and only if `expected` is still the current authority stamp,
-/// with `org_install` HELD across both the comparison and the mutation.
+/// with `org_install` AND the store's publication pin HELD across both the
+/// comparison and the mutation.
 ///
 /// This closes a real window. [`capture_current_sensing_stamp`] releases
 /// `org_install` before it returns, so a caller that compared its result and
@@ -1072,30 +1073,67 @@ pub(crate) fn capture_current_sensing_stamp(
 /// between and the row would be created anyway — a local row and a ticket for a
 /// frame the provider is now guaranteed to reject.
 ///
-/// The shape mirrors [`capture_live_org_relay_membership_seamed`], which
-/// already performs its currency recheck under the same lock rather than
-/// afterwards.
+/// # Two exclusions, because one lock is not enough
+///
+/// `org_install` excludes authority INSTALLATION only. It does not order floor
+/// publication or poison: `apply_bundle` publishes through the store's own
+/// `live.write()`, and every poison transition takes the store's `poison_gate`;
+/// neither path touches `org_install`. So
+/// [`OrgRevocationStore::barriered_generation`] and
+/// [`OrgRevocationStore::is_poisoned`] are SAMPLES, not exclusions —
+/// `barriered_generation` takes `live.read()` into a local and drops it before
+/// returning, and `is_poisoned` only touches the process-wide poison registry.
+/// Comparing two such samples and then mutating left floor publication and
+/// poison free to land in between, which is exactly the interleaving this fence
+/// claims to exclude.
+///
+/// [`OrgRevocationStore::pin_publication`] is the missing half: it holds
+/// `poison_gate` and then `live.read()`, so while it lives no publication can
+/// complete (`StoreCore::publish` needs `live.write()`) and no poison
+/// transition can land. The stamp is therefore built from the PIN's own
+/// accessors — `pin.generation()` / `pin.poisoned()` — so the compared values
+/// are the pinned ones rather than two independent reads a transition can slip
+/// between.
+///
+/// # Lock order
+///
+/// `sensing_interest_table` -> `org_install` -> `poison_gate` -> `live`.
+///
+/// The first edge matches the two existing comparison sites. The second is new
+/// and acyclic: no publication, poison or reload path acquires `org_install`
+/// while holding `poison_gate` or `live`, and no authority-installation or
+/// floor-publication path acquires any sensing lock, so neither reverse edge
+/// exists. `poison_gate -> live` is the store's own FROZEN order, and
+/// `pin_publication` takes it in that direction.
 ///
 /// # What may run inside
 ///
 /// `mutate` MUST be a bounded, pure state mutation — the interest-table
 /// register/deregister call and nothing else. No cryptography, no frame
 /// authoring, no encoding, no I/O, no callbacks, no channel sends, no lock
-/// acquisition that is not already ordered below `org_install`. The authority
-/// installation path holds this same lock across Ed25519 verification and a
-/// fold sweep, so anything slow here directly stalls installs.
+/// acquisition that is not already ordered below `org_install`. The bar is
+/// strictly harder than it was: the pin transitively blocks `apply_bundle`,
+/// which holds an interprocess file lock, so anything slow here stalls every
+/// opener of the same store path — not just local installs.
 ///
-/// # Lock order
+/// # Where the seam fires, and why not under the pin
 ///
-/// `sensing_interest_table` -> `org_install`, matching the two existing
-/// comparison sites. No authority-installation or floor-publication path
-/// acquires any sensing lock, so the reverse edge does not exist and this
-/// cannot deadlock.
+/// `fence_seam` fires with `org_install` HELD and BEFORE the pin is taken,
+/// deliberately outside the pinned window. The seam is `dyn Fn()`, so the type
+/// cannot stop a witness from blocking inside it — and the in-crate
+/// installation witness does exactly that, sleeping to prove a rival install
+/// cannot complete. Sleeping under the pin would stall every same-path opener,
+/// which is precisely the discipline this slice exists to enforce. Firing it
+/// before the pin keeps that witness sound (its claim is about INSTALLATION,
+/// which `org_install` alone excludes and which is held across the seam) while
+/// leaving the pinned window with NO user-supplied code in it at all: pin,
+/// stamp, compare, mutate, release.
 ///
-/// `fence_seam` fires after a SUCCESSFUL comparison and before `mutate`, with
-/// `org_install` held. It exists so a witness can prove an authority
-/// installation or floor publication attempted in that instant cannot complete
-/// ahead of the mutation.
+/// A transition that lands during the seam is not lost — it lands before the
+/// pin, so the comparison below is what catches it and the mutation never runs.
+/// What the pin adds is the case the seam can no longer reach: a transition
+/// attempted after the verdict, which now cannot complete until `mutate` has
+/// returned.
 pub(crate) fn with_fenced_current_authority<R>(
     org_install: &Mutex<()>,
     node_authority: &ArcSwapOption<NodeAuthority>,
@@ -1108,22 +1146,26 @@ pub(crate) fn with_fenced_current_authority<R>(
     let _install = org_install.lock();
     let authority = node_authority.load_full()?;
     let store = org_revocation.load_full()?;
+    // Outside the pin, deliberately — see "Where the seam fires" above.
+    if let Some(seam) = fence_seam {
+        seam();
+    }
+    // From here to the end of the function nothing user-supplied runs, and
+    // publication + poison are HELD STILL rather than merely observed.
+    let pin = store.pin_publication();
     let current = SensingAuthorityStamp {
         authority_ptr: Arc::as_ptr(&authority) as *const () as usize,
         store_ptr: Arc::as_ptr(&store) as *const () as usize,
-        store_generation: store.barriered_generation().ok(),
+        store_generation: pin.generation().ok(),
         installation_generation: org_install_generation.load(Ordering::Acquire),
-        poisoned: store.is_poisoned(),
+        poisoned: pin.poisoned(),
     };
     if !expected.is_current(&current) {
         return None;
     }
-    if let Some(seam) = fence_seam {
-        seam();
-    }
-    // STILL HOLDING `org_install`: no install, swap, rotation, floor
-    // publication or poison mark can be observed between the verdict above and
-    // the mutation below.
+    // STILL HOLDING `org_install` AND the publication pin: no install, swap,
+    // rotation, floor publication or poison mark can land between the verdict
+    // above and the mutation below.
     Some(mutate())
 }
 
@@ -1218,13 +1260,18 @@ pub(crate) enum RelayMembershipUnavailable {
     /// This node's own certificate generation is below the current revocation
     /// floor for its `(org, member)` — its membership has been revoked.
     BelowFloor,
-    /// A revocation published — moving the store's floor generation — between
-    /// the coherent floor snapshot the verdict was computed against and the final
-    /// currency recheck, so the verdict is stale. Refused advisorily rather than
-    /// returning a membership (or a floor verdict) proven against a floor view
-    /// that is no longer live; the soft-state refresh retries naturally. (A store
-    /// that POISONS mid-capture is caught first as `Poisoned` — poison does not
-    /// move the generation, so the final live poison check is what catches it.)
+    /// The security view moved between the coherent floor snapshot the verdict
+    /// was computed against and the final currency recheck, so the verdict is
+    /// stale. Three shapes reach it: a revocation published (moving the store's
+    /// floor generation), and — because the cryptography runs with
+    /// `org_install` RELEASED — an authority or store swap, or an
+    /// `A -> B -> exact-Arc-A` rotation that reuses the original address and is
+    /// caught only by the installation generation. Refused advisorily rather
+    /// than returning a membership (or a floor verdict) proven against a view
+    /// that is no longer live; the soft-state refresh retries naturally. (A
+    /// store that POISONS mid-capture is caught first as `Poisoned` — poison
+    /// does not move the generation, so the live poison check in the recheck is
+    /// what catches it.)
     ViewChanged,
 }
 
@@ -1232,19 +1279,41 @@ pub(crate) enum RelayMembershipUnavailable {
 /// re-authoring an org sensing registration whose (already-validated)
 /// organization is `expected_org`, at an explicit `now_secs`.
 ///
-/// `org_install` is held throughout so the authority and store IDENTITY cannot
-/// be replaced mid-gate (the same lock the piece-1 captures use). It does NOT,
-/// however, gate floor publication: a concurrent `apply_bundle` raises the floor
-/// through the store's OWN publication path, so a coherent floor snapshot alone
-/// is not a currency proof. The gate therefore captures the floor snapshot
-/// paired with its publication generation, runs the membership self-verify with
-/// no store publish guard held across the signature check, and makes the END of
-/// the gate the explicit linearization point: it crosses the store publication
-/// barrier and re-checks poison, and gates BOTH the success and the
-/// snapshot-dependent failure result behind that currency check. A floor raise
-/// or poison that publishes between the snapshot and the recheck yields an
-/// advisory `ViewChanged` — never a membership (or a specific floor verdict)
-/// computed against a floor view that is no longer live.
+/// # Three phases, and why the cryptography is in the middle one
+///
+/// `org_install` is the authority INSTALLATION lock. The installation path
+/// holds it across Ed25519 verification and a fold sweep, so every other holder
+/// must be bounded — a gate that runs its own signature check and a deep
+/// certificate clone under it directly stalls installs and every sibling that
+/// takes it. This gate therefore does NOT hold it across its cryptography:
+///
+/// - **A — under `org_install`.** Load the authority + store `Arc`s (retained,
+///   which pins them against allocator address reuse), refuse a poisoned store,
+///   refuse a foreign org, take the coherent `snapshot_with_generation()`, and
+///   stamp the view: both `Arc` pointers, the installation generation, and the
+///   store's publication generation. Nothing here is unbounded.
+/// - **B — lock RELEASED.** `self_verify_at` and the owner-certificate clone.
+/// - **C — under `org_install` again.** Re-establish currency over the whole
+///   stamp before anything is returned.
+///
+/// The pointers and the installation generation are load-bearing, not
+/// decoration. Once phase A releases the lock, an authority or store swap — and
+/// in particular an `A -> B -> exact-Arc-A` rotation, which reuses the original
+/// address — is invisible to the store's publication generation alone. The
+/// stamp is exactly [`SensingAuthorityStamp`], field for field, because the
+/// comparison it needs is exactly the sibling fence's.
+///
+/// # Why the linearization point is the END
+///
+/// `org_install` does NOT gate floor publication: a concurrent `apply_bundle`
+/// raises the floor through the store's OWN publication path, so a coherent
+/// floor snapshot alone is not a currency proof. Phase C is the explicit
+/// linearization point — it crosses the store publication barrier, re-checks
+/// poison, and gates BOTH the success and the snapshot-dependent failure result
+/// behind that check. A floor raise, a poison mark or an authority rotation
+/// that lands between the snapshot and the recheck yields an advisory
+/// `ViewChanged` — never a membership (or a specific floor verdict) computed
+/// against a view that is no longer live.
 ///
 /// The relay's membership bar is IDENTICAL to the startup ownership bar
 /// (`NodeAuthorityConfig::self_verify_at`) — binding, signature, window at
@@ -1260,6 +1329,7 @@ pub(crate) fn capture_live_org_relay_membership(
     org_install: &Mutex<()>,
     node_authority: &ArcSwapOption<NodeAuthority>,
     org_revocation: &ArcSwapOption<OrgRevocationStore>,
+    org_install_generation: &AtomicU64,
     local_entity: &EntityId,
     expected_org: OrgId,
     now_secs: u64,
@@ -1268,6 +1338,7 @@ pub(crate) fn capture_live_org_relay_membership(
         org_install,
         node_authority,
         org_revocation,
+        org_install_generation,
         local_entity,
         expected_org,
         now_secs,
@@ -1276,69 +1347,101 @@ pub(crate) fn capture_live_org_relay_membership(
 }
 
 /// [`capture_live_org_relay_membership`] with a test seam invoked exactly once
-/// AFTER the coherent floor snapshot and BEFORE the final currency recheck. In
-/// production the seam is `|| {}` (inlined away); the in-crate race witnesses
-/// pass a pause closure to publish a floor raise / poison the store while the
-/// gate is parked between the snapshot and the recheck.
+/// AFTER phase A has released `org_install` and BEFORE the off-lock
+/// cryptography of phase B — i.e. at the head of the window phase C exists to
+/// close. In production the seam is `|| {}` (inlined away); the in-crate race
+/// witnesses pass a closure that publishes a floor raise, poisons the store or
+/// swaps the authority while the gate is parked there.
+#[allow(clippy::too_many_arguments)]
 fn capture_live_org_relay_membership_seamed(
     org_install: &Mutex<()>,
     node_authority: &ArcSwapOption<NodeAuthority>,
     org_revocation: &ArcSwapOption<OrgRevocationStore>,
+    org_install_generation: &AtomicU64,
     local_entity: &EntityId,
     expected_org: OrgId,
     now_secs: u64,
     after_floor_snapshot: impl FnOnce(),
 ) -> Result<LiveOrgRelayMembership, RelayMembershipUnavailable> {
-    let _install = org_install.lock();
-    let authority = node_authority
-        .load_full()
-        .ok_or(RelayMembershipUnavailable::NoAuthority)?;
-    let store = org_revocation
-        .load_full()
-        .ok_or(RelayMembershipUnavailable::NoStore)?;
-    if store.is_poisoned() {
-        return Err(RelayMembershipUnavailable::Poisoned);
-    }
-    // A relay only re-authors within its OWN organization. Checked before the
-    // floor snapshot — so ForeignOrg ordering is preserved — and doubling as the
-    // late-bound guard against an authority rotation to a different org between
-    // the incoming validation and this capture.
-    if authority.owner_org() != expected_org {
-        return Err(RelayMembershipUnavailable::ForeignOrg);
-    }
+    // ---- Phase A: bounded capture, under `org_install` ----------------
+    let (authority, store, floors, captured) = {
+        let _install = org_install.lock();
+        let authority = node_authority
+            .load_full()
+            .ok_or(RelayMembershipUnavailable::NoAuthority)?;
+        let store = org_revocation
+            .load_full()
+            .ok_or(RelayMembershipUnavailable::NoStore)?;
+        if store.is_poisoned() {
+            return Err(RelayMembershipUnavailable::Poisoned);
+        }
+        // A relay only re-authors within its OWN organization. Checked before
+        // the floor snapshot — so ForeignOrg ordering is preserved — and
+        // doubling as the late-bound guard against an authority rotation to a
+        // different org between the incoming validation and this capture.
+        if authority.owner_org() != expected_org {
+            return Err(RelayMembershipUnavailable::ForeignOrg);
+        }
+        let (floors, captured_generation) = store
+            .snapshot_with_generation()
+            .map_err(|_| RelayMembershipUnavailable::GenerationExhausted)?;
+        let captured = SensingAuthorityStamp {
+            authority_ptr: Arc::as_ptr(&authority) as *const () as usize,
+            store_ptr: Arc::as_ptr(&store) as *const () as usize,
+            store_generation: Some(captured_generation),
+            installation_generation: org_install_generation.load(Ordering::Acquire),
+            poisoned: false,
+        };
+        (authority, store, floors, captured)
+    };
 
-    // Capture a coherent floor snapshot paired with its publication generation,
-    // then run the membership self-verify WITHOUT holding any store publish guard
-    // across the signature check.
-    let (floors, captured_generation) = store
-        .snapshot_with_generation()
-        .map_err(|_| RelayMembershipUnavailable::GenerationExhausted)?;
     after_floor_snapshot();
+
+    // ---- Phase B: cryptography, `org_install` RELEASED ----------------
+    // The retained `authority`/`store` Arcs keep these objects alive and their
+    // addresses un-reusable for the whole window, which is what makes the
+    // pointer comparison in phase C meaningful rather than a coincidence.
     let verification = authority
         .config
         .self_verify_at(local_entity, &floors, now_secs);
+    let owner_cert = authority.config.owner_cert.clone();
 
-    // The END of the gate is the explicit linearization point. Cross the store
-    // publication barrier and re-check poison, then gate BOTH the success and the
-    // (snapshot-dependent) verification verdict behind currency: a floor raise or
-    // poison that published between the snapshot and here makes the verdict
-    // stale, so refuse with an advisory `ViewChanged` rather than returning a
-    // membership — or a specific floor verdict — proven against a floor view that
-    // is no longer live. An early `?` on `verification` would bypass this, so the
-    // Result is held, not propagated, until currency is established.
-    let current_generation = store
+    // ---- Phase C: bounded recheck, under `org_install` ----------------
+    // An early `?` on `verification` would bypass this, so the Result is held,
+    // not propagated, until currency is established over the WHOLE stamp: both
+    // pointers, the installation generation, the publication generation, and
+    // poison.
+    let _install = org_install.lock();
+    // Absence is a view CHANGE, not a fresh `NoAuthority`: something was
+    // installed at capture and is not installed now.
+    let authority_now = node_authority
+        .load_full()
+        .ok_or(RelayMembershipUnavailable::ViewChanged)?;
+    let store_now = org_revocation
+        .load_full()
+        .ok_or(RelayMembershipUnavailable::ViewChanged)?;
+    // Refusal ordering preserved exactly: exhaustion, then poison, then the
+    // staleness verdict, then the (snapshot-dependent) verification verdict.
+    let current_generation = store_now
         .barriered_generation()
         .map_err(|_| RelayMembershipUnavailable::GenerationExhausted)?;
-    if store.is_poisoned() {
+    if store_now.is_poisoned() {
         return Err(RelayMembershipUnavailable::Poisoned);
     }
-    if current_generation != captured_generation {
+    let current = SensingAuthorityStamp {
+        authority_ptr: Arc::as_ptr(&authority_now) as *const () as usize,
+        store_ptr: Arc::as_ptr(&store_now) as *const () as usize,
+        store_generation: Some(current_generation),
+        installation_generation: org_install_generation.load(Ordering::Acquire),
+        poisoned: false,
+    };
+    if !captured.is_current(&current) {
         return Err(RelayMembershipUnavailable::ViewChanged);
     }
     verification.map_err(map_self_verify_error)?;
 
     Ok(LiveOrgRelayMembership {
-        owner_cert: authority.config.owner_cert.clone(),
+        owner_cert,
         org_id: authority.owner_org(),
         _authority: authority,
         _store: store,
@@ -1980,7 +2083,16 @@ mod tests {
         let na = ArcSwapOption::from(authority);
         let rev = ArcSwapOption::from(store);
         let lock = Mutex::new(());
-        capture_live_org_relay_membership(&lock, &na, &rev, local_entity, expected_org, now)
+        let install_gen = AtomicU64::new(0);
+        capture_live_org_relay_membership(
+            &lock,
+            &na,
+            &rev,
+            &install_gen,
+            local_entity,
+            expected_org,
+            now,
+        )
     }
 
     #[test]
@@ -2200,6 +2312,7 @@ mod tests {
         let na = ArcSwapOption::from(Some(authority));
         let rev = ArcSwapOption::from(Some(store.clone()));
         let lock = Mutex::new(());
+        let install_gen = AtomicU64::new(0);
         let paused = Barrier::new(2);
         let release = Barrier::new(2);
 
@@ -2209,6 +2322,7 @@ mod tests {
                     &lock,
                     &na,
                     &rev,
+                    &install_gen,
                     &entity,
                     org_kp().org_id(),
                     now_secs(),
@@ -2245,6 +2359,7 @@ mod tests {
         let na = ArcSwapOption::from(Some(authority));
         let rev = ArcSwapOption::from(Some(store.clone()));
         let lock = Mutex::new(());
+        let install_gen = AtomicU64::new(0);
         let paused = Barrier::new(2);
         let release = Barrier::new(2);
 
@@ -2254,6 +2369,7 @@ mod tests {
                     &lock,
                     &na,
                     &rev,
+                    &install_gen,
                     &entity,
                     org_kp().org_id(),
                     now_secs(),
@@ -2268,6 +2384,334 @@ mod tests {
             release.wait();
             let result = gate.join().expect("gate thread");
             assert_eq!(result.err(), Some(RelayMembershipUnavailable::Poisoned));
+        });
+    }
+
+    // ---- repair B: the crypto window is OFF `org_install` --------------
+
+    /// Structural proof of repair B: the Ed25519 self-verify and the deep
+    /// owner-certificate clone do NOT run under the authority INSTALLATION
+    /// lock. The seam fires at the head of that window, and `org_install` is
+    /// free there.
+    ///
+    /// RED coupling: under the previous single-phase shape the lock was held
+    /// from the first `load_full` straight through the clone, so this
+    /// `try_lock` — on the very thread that holds it — returned `None`.
+    #[test]
+    fn the_relay_crypto_window_runs_with_org_install_released() {
+        let (entity, authority, store) = adopt_relay("crypto-offlock", 1);
+        let na = ArcSwapOption::from(Some(authority));
+        let rev = ArcSwapOption::from(Some(store));
+        let lock = Mutex::new(());
+        let install_gen = AtomicU64::new(0);
+        let free_in_window = AtomicU64::new(0);
+        let result = capture_live_org_relay_membership_seamed(
+            &lock,
+            &na,
+            &rev,
+            &install_gen,
+            &entity,
+            org_kp().org_id(),
+            now_secs(),
+            || {
+                if lock.try_lock().is_some() {
+                    free_in_window.store(1, Ordering::SeqCst);
+                }
+            },
+        );
+        assert_eq!(
+            result.err(),
+            None,
+            "the three-phase capture still admits a live relay membership"
+        );
+        assert_eq!(
+            free_in_window.load(Ordering::SeqCst),
+            1,
+            "`org_install` was still held at the head of the cryptography \
+             window — the Ed25519 self-verify and the deep certificate clone \
+             are running under the authority installation lock"
+        );
+    }
+
+    /// An authority SWAP during the off-lock cryptography window is caught by
+    /// the phase-C recheck and refused as `ViewChanged`.
+    ///
+    /// RED coupling: delete the phase-C stamp comparison and this returns
+    /// `Ok` — a membership vouched under an authority that has already been
+    /// replaced. The store, its generation and its poison state never move
+    /// here, so nothing but the pointer/installation-generation recheck can
+    /// catch it.
+    #[test]
+    fn an_authority_swap_during_the_relay_crypto_window_is_view_changed() {
+        let (entity, authority, store) = adopt_relay("swap-window", 1);
+        let (_rival_entity, rival, _rival_store) = adopt_relay("swap-window-rival", 1);
+        let na = ArcSwapOption::from(Some(authority));
+        let rev = ArcSwapOption::from(Some(store));
+        let lock = Mutex::new(());
+        let install_gen = AtomicU64::new(7);
+        let result = capture_live_org_relay_membership_seamed(
+            &lock,
+            &na,
+            &rev,
+            &install_gen,
+            &entity,
+            org_kp().org_id(),
+            now_secs(),
+            || {
+                // Exactly what a real installation does: publish the new
+                // authority and advance the installation generation.
+                na.store(Some(rival.clone()));
+                install_gen.fetch_add(1, Ordering::Release);
+            },
+        );
+        assert_eq!(result.err(), Some(RelayMembershipUnavailable::ViewChanged));
+    }
+
+    /// An `A -> B -> exact-Arc-A` rotation during the off-lock cryptography
+    /// window is caught ONLY by the installation generation: the authority
+    /// pointer is back to its original value, the store never moved, the
+    /// publication generation never moved, and nothing poisoned.
+    ///
+    /// RED coupling: drop `installation_generation` from the phase-C stamp (or
+    /// drop phase C entirely) and this returns `Ok`.
+    #[test]
+    fn an_a_b_a_rotation_during_the_relay_crypto_window_is_view_changed() {
+        let (entity, authority, store) = adopt_relay("aba-window", 1);
+        let (_rival_entity, rival, _rival_store) = adopt_relay("aba-window-rival", 1);
+        let na = ArcSwapOption::from(Some(authority.clone()));
+        let rev = ArcSwapOption::from(Some(store));
+        let lock = Mutex::new(());
+        let install_gen = AtomicU64::new(7);
+        let result = capture_live_org_relay_membership_seamed(
+            &lock,
+            &na,
+            &rev,
+            &install_gen,
+            &entity,
+            org_kp().org_id(),
+            now_secs(),
+            || {
+                na.store(Some(rival.clone()));
+                install_gen.fetch_add(1, Ordering::Release);
+                na.store(Some(authority.clone()));
+                install_gen.fetch_add(1, Ordering::Release);
+            },
+        );
+        assert_eq!(
+            result.err(),
+            Some(RelayMembershipUnavailable::ViewChanged),
+            "the authority Arc is byte-for-byte the captured one again, so only \
+             the installation generation can witness the rotation"
+        );
+    }
+
+    // ---- repair A: the currentness fence holds the publication PIN -----
+    //
+    // `with_fenced_current_authority` used to build its verdict from
+    // `barriered_generation()` + `is_poisoned()`. Both are SAMPLES: the first
+    // takes `live.read()` into a local and drops it before returning, and the
+    // second only touches the process-wide poison registry. Neither excludes
+    // anything, so a floor publication or a poison transition could land
+    // between the verdict and the mutation while the comment above the
+    // mutation claimed it could not. The fence now holds
+    // `OrgRevocationStore::pin_publication()` across both, and its stamp is
+    // built from that pin's accessors.
+
+    fn fence_stamp(
+        lock: &Mutex<()>,
+        na: &ArcSwapOption<NodeAuthority>,
+        rev: &ArcSwapOption<OrgRevocationStore>,
+        install_gen: &AtomicU64,
+    ) -> SensingAuthorityStamp {
+        capture_current_sensing_stamp(lock, na, rev, install_gen).expect("current stamp")
+    }
+
+    /// The fence really PINS the store rather than sampling it.
+    ///
+    /// This thread holds `pin_publication()` for the first half. A sampling
+    /// fence sails straight through that — `barriered_generation` only wants a
+    /// second `live.read()`, which coexists with ours, and `is_poisoned` wants
+    /// no store lock at all — so it compares and mutates immediately. A
+    /// pinning fence must block on `poison_gate`, which we hold, until we let
+    /// go.
+    ///
+    /// RED coupling: revert the fence to `store.barriered_generation().ok()` +
+    /// `store.is_poisoned()` and the `recv_timeout` below succeeds.
+    #[test]
+    fn the_fence_pins_the_store_rather_than_sampling_it() {
+        use std::sync::mpsc;
+
+        let (_entity, authority, store) = adopt_relay("fence-pin", 1);
+        let na = ArcSwapOption::from(Some(authority));
+        let rev = ArcSwapOption::from(Some(store.clone()));
+        let lock = Mutex::new(());
+        let install_gen = AtomicU64::new(0);
+        let expected = fence_stamp(&lock, &na, &rev, &install_gen);
+
+        // `SyncSender` (not `Sender`) because the seam must be `Sync`.
+        let (at_seam_tx, at_seam_rx) = mpsc::sync_channel::<()>(1);
+        let (mutated_tx, mutated_rx) = mpsc::sync_channel::<()>(1);
+        let seam = move || {
+            at_seam_tx.send(()).expect("seam signal");
+        };
+
+        // Publication AND poison are immobile for as long as this lives.
+        let held = store.pin_publication();
+
+        std::thread::scope(|s| {
+            let fence = s.spawn(|| {
+                with_fenced_current_authority(
+                    &lock,
+                    &na,
+                    &rev,
+                    &install_gen,
+                    &expected,
+                    Some(&seam),
+                    || {
+                        mutated_tx.send(()).expect("mutation signal");
+                    },
+                )
+            });
+            at_seam_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the fence must reach its seam — that needs only `org_install`");
+            assert!(
+                mutated_rx.recv_timeout(Duration::from_millis(500)).is_err(),
+                "the fenced mutation ran while this thread held the store's \
+                 publication pin — the fence is SAMPLING the store, so a floor \
+                 publication or a poison transition can still land between its \
+                 verdict and its mutation"
+            );
+            drop(held);
+            let out = fence.join().expect("fence thread");
+            assert!(
+                out.is_some(),
+                "once the pin is released the fence completes normally"
+            );
+            assert!(
+                mutated_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+                "and the mutation runs exactly once, after the pin was free"
+            );
+        });
+    }
+
+    /// A poison mark landing while the fence witness is parked never reaches
+    /// the mutation.
+    ///
+    /// The seam fires with `org_install` held and BEFORE the pin, so the
+    /// transition lands ahead of the verdict and the verdict — built from
+    /// `pin.poisoned()` — refuses.
+    ///
+    /// RED coupling: the pre-repair shape sampled `is_poisoned()`, compared,
+    /// and only THEN fired the seam, so this poison landed strictly between the
+    /// verdict and the mutation: the fence returned `Some(())` and the row was
+    /// created against a poisoned store.
+    #[test]
+    fn a_poison_landing_in_the_fence_window_never_reaches_the_mutation() {
+        use std::sync::Barrier;
+
+        let (_entity, authority, store) = adopt_relay("fence-poison", 1);
+        let na = ArcSwapOption::from(Some(authority));
+        let rev = ArcSwapOption::from(Some(store.clone()));
+        let lock = Mutex::new(());
+        let install_gen = AtomicU64::new(0);
+        let expected = fence_stamp(&lock, &na, &rev, &install_gen);
+        let paused = Barrier::new(2);
+        let release = Barrier::new(2);
+        let mutations = AtomicU64::new(0);
+        let seam = || {
+            paused.wait();
+            release.wait();
+        };
+
+        std::thread::scope(|s| {
+            let fence = s.spawn(|| {
+                with_fenced_current_authority(
+                    &lock,
+                    &na,
+                    &rev,
+                    &install_gen,
+                    &expected,
+                    Some(&seam),
+                    || {
+                        mutations.fetch_add(1, Ordering::SeqCst);
+                    },
+                )
+            });
+            paused.wait();
+            store.mark_poisoned_for_test();
+            release.wait();
+            let out = fence.join().expect("fence thread");
+            assert!(
+                out.is_none(),
+                "the fence admitted a mutation against a store that poisoned \
+                 inside its own window"
+            );
+            assert_eq!(
+                mutations.load(Ordering::SeqCst),
+                0,
+                "the bounded mutation ran even though the pinned verdict saw \
+                 poison — the fence is comparing samples, not pinned values"
+            );
+        });
+    }
+
+    /// The floor-publication companion: a real signed `apply_bundle` landing
+    /// while the fence witness is parked never reaches the mutation.
+    ///
+    /// RED coupling: identical to the poison cell — the pre-repair fence
+    /// sampled `barriered_generation()`, compared, fired the seam, and then
+    /// mutated, so the raise landed between the verdict and the row.
+    #[test]
+    fn a_floor_publication_landing_in_the_fence_window_never_reaches_the_mutation() {
+        use std::sync::Barrier;
+
+        let (entity, authority, store) = adopt_relay("fence-publish", 1);
+        let na = ArcSwapOption::from(Some(authority));
+        let rev = ArcSwapOption::from(Some(store.clone()));
+        let lock = Mutex::new(());
+        let install_gen = AtomicU64::new(0);
+        let expected = fence_stamp(&lock, &na, &rev, &install_gen);
+        let paused = Barrier::new(2);
+        let release = Barrier::new(2);
+        let mutations = AtomicU64::new(0);
+        let seam = || {
+            paused.wait();
+            release.wait();
+        };
+
+        std::thread::scope(|s| {
+            let fence = s.spawn(|| {
+                with_fenced_current_authority(
+                    &lock,
+                    &na,
+                    &rev,
+                    &install_gen,
+                    &expected,
+                    Some(&seam),
+                    || {
+                        mutations.fetch_add(1, Ordering::SeqCst);
+                    },
+                )
+            });
+            paused.wait();
+            let mut floors = BTreeMap::new();
+            floors.insert(entity.clone(), 2u32);
+            let bundle = OrgRevocationBundle::try_issue(&org_kp(), &floors).expect("bundle");
+            store.apply_bundle(&bundle).expect("apply floor raise");
+            release.wait();
+            let out = fence.join().expect("fence thread");
+            assert!(
+                out.is_none(),
+                "the fence admitted a mutation against a floor view that was \
+                 republished inside its own window"
+            );
+            assert_eq!(
+                mutations.load(Ordering::SeqCst),
+                0,
+                "the bounded mutation ran against a raised floor — the fence is \
+                 comparing samples, not pinned values"
+            );
         });
     }
 

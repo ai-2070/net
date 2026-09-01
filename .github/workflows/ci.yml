@@ -520,12 +520,16 @@ jobs:
       #
       # FLOOR accounting (verified against `cargo test --lib --features
       # "$UNIT_FEATURES" -- --list`, NOT by hand):
-      #   org_gate                        = 54
+      #   org_gate                        = 60
       #     42 baseline + 7 (selector-target intake) + 5 (local-origin planner)
-      #   sensing_authority_witness_tests = 49
+      #     + 6 (publication-pinned fence, off-lock relay crypto window)
+      #   sensing_authority_witness_tests = 52
       #     28 baseline + 1 (dispatch ordering) + 6 (local org lease egress)
       #     + 4 (lease-egress hold repair) + 10 (transition order, release
       #     coherence, phase-2 coverage, currentness fence)
+      #     + 3 (release-through-fence, rollback plane, provenance ordering)
+      #     net of 2 retired: the two manual-wrapper guard witnesses replaced by
+      #     production-observed ones
       # The mesh line previously read 35 while MESH_MIN read 39 — the arithmetic
       # drifted from the pin. Re-derive both from `--list` when you change them.
       #
@@ -544,8 +548,8 @@ jobs:
           set -uo pipefail
           GATE=adapter::net::behavior::sensing::org_gate::tests
           MESH=adapter::net::mesh::sensing_authority_witness_tests
-          GATE_MIN=54
-          MESH_MIN=49
+          GATE_MIN=60
+          MESH_MIN=52
 
           die() { echo "::error::$1"; shift; [ "$#" -gt 0 ] && printf '%s\n' "$@"; exit 1; }
 
@@ -614,7 +618,13 @@ jobs:
           the_local_org_planner_refuses_an_audience_it_did_not_derive
           the_local_org_planner_refuses_a_selector_that_does_not_name_the_target
           a_membership_for_another_org_yields_no_local_egress_plan
-          an_emitted_local_org_lease_frame_passes_the_real_intake_gate"
+          an_emitted_local_org_lease_frame_passes_the_real_intake_gate
+          the_fence_pins_the_store_rather_than_sampling_it
+          a_floor_publication_landing_in_the_fence_window_never_reaches_the_mutation
+          a_poison_landing_in_the_fence_window_never_reaches_the_mutation
+          the_relay_crypto_window_runs_with_org_install_released
+          an_authority_swap_during_the_relay_crypto_window_is_view_changed
+          an_a_b_a_rotation_during_the_relay_crypto_window_is_view_changed"
           # The production dispatch-ordering + LOCAL LEASE EGRESS witnesses:
           MESH_REQUIRED="a_malformed_selector_is_refused_before_any_authority_snapshot
           an_own_org_exact_lease_registers_under_the_org_proven_root
@@ -634,8 +644,11 @@ jobs:
           an_owner_org_swap_cannot_reclassify_an_existing_org_lease
           a_below_floor_membership_refuses_a_surviving_holder_release
           a_legacy_lease_stays_legacy_after_an_authority_arrives
-          the_phase_two_entry_refuses_to_run_under_any_sensing_guard
-          the_production_transaction_holds_instrumented_guards_at_the_fence
+          the_production_transaction_identifies_each_guard_it_holds
+          a_final_release_reaches_phase_two_holding_nothing
+          a_floor_raise_between_preparation_and_the_fence_refuses_the_release
+          a_failed_self_provider_acquisition_rolls_back_on_the_org_plane
+          an_authority_loss_duplicate_cannot_strand_a_final_release
           an_install_attempted_inside_the_fence_cannot_precede_the_mutation
           a_stale_capture_window_emits_no_frame_at_all"
 
