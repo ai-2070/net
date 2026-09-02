@@ -56,6 +56,17 @@
 //!    teardown applied last — the stale resurrection the pre-repair egress
 //!    permitted — and, with nothing following it, a final teardown must still
 //!    leave NO row at all.
+//! 7. [`the_production_send_boundary_is_strictly_serial_in_enqueue_order`] — the
+//!    TRANSPORT BOUNDARY itself. Tests 5 and 6 prove the datagrams enter the
+//!    ordered egress and that the provider's final row is the later decision's;
+//!    neither can fail for a mutant that keeps the queue and then races the
+//!    dequeued sends. This one observes each production `send_to` and requires
+//!    the consumer to complete send *i* before starting send *i+1*.
+//! 8. [`the_ordered_egress_is_bounded_and_keeps_the_latest_decision`] — the
+//!    egress is BOUNDED under a consumer that provably cannot run, overflow is
+//!    counted, and the LATEST committed decision still reaches the provider.
+//! 9. [`the_egress_consumer_does_not_survive_node_shutdown`] — the egress is
+//!    node-OWNED: `shutdown` closes and joins its single consumer.
 //!
 //! Topology is two nodes, one organization, no chaos injection, single send per
 //! transition with a soft-state refresh loop for UDP best-effort. Every test
@@ -66,7 +77,10 @@
 //! Tests 5 and 6 additionally contend two decisions for ONE interest against
 //! each other, and are deliberately SINGLE-threaded (`#[tokio::test]`, one
 //! worker): see [`unpark_and_measure_queue`] for why exactly one worker is
-//! load-bearing there.
+//! load-bearing there. Test 8 is single-threaded for the same reason — blocking
+//! the only worker is what makes "the consumer cannot run" a fact. Test 7 is
+//! the opposite: it needs SEVERAL workers, or a racing consumer's rival sends
+//! could not run either and the discrimination would be vacuous.
 //!
 //! Run:
 //!
@@ -75,9 +89,10 @@
 //! ```
 //!
 //! `--features net` ALONE DOES NOT WORK, and the previously documented command
-//! was therefore wrong even for the four tests that predate this note: tests 4,
-//! 5 and 6 drive `MeshNode::set_sensing_phase_two_seam_for_test`, and tests 5
-//! and 6 also drive `MeshNode::org_egress_depth_for_test`. Both are
+//! was therefore wrong even for the four tests that predate this note: tests 4-6
+//! drive `MeshNode::set_sensing_phase_two_seam_for_test`, and tests 5-9 drive
+//! `MeshNode::org_egress_state_for_test` /
+//! `MeshNode::set_org_egress_send_observer_for_test`. All are
 //! `#[cfg(any(test, feature = "fixtures"))]`, and an integration test is a
 //! separate crate, so `test` is not set on `net` — only `fixtures` exposes them.
 
@@ -103,7 +118,8 @@ use net::adapter::net::behavior::sensing::{
 };
 use net::adapter::net::identity::EntityId;
 use net::adapter::net::{
-    EntityKeypair, MeshNode, MeshNodeConfig, SensingRegistrationError, SocketBufferConfig,
+    EntityKeypair, MeshNode, MeshNodeConfig, OrgEgressSendPhase, SensingRegistrationError,
+    SocketBufferConfig,
 };
 use net::adapter::Adapter;
 
@@ -256,6 +272,22 @@ fn org_spec(target: u64) -> InterestSpec {
         result_mode: ResultMode::Any,
         disclosure_class: DisclosureClass::Owner,
         audience: canonical_org_sensing_commitment(&org().org_id()),
+    }
+}
+
+/// [`org_spec`] with a DISTINCT interest identity per `index`.
+///
+/// The upstream min-gap damper is keyed by `(provider, interest_digest)`, so a
+/// witness that needs N real emissions in quick succession needs N distinct
+/// interests; re-registering one interest would be damped to a single frame.
+fn distinct_org_spec(target: u64, index: usize) -> InterestSpec {
+    InterestSpec {
+        constraints: CanonicalConstraints::from_entries([
+            ("model", "llama-70b"),
+            ("shard", &index.to_string()),
+        ])
+        .unwrap(),
+        ..org_spec(target)
     }
 }
 
@@ -775,7 +807,7 @@ fn arm_phase_two_park(a: &Arc<MeshNode>) -> Phase2Park {
 fn unpark_and_measure_queue(a: &Arc<MeshNode>, park: &Phase2Park) -> u64 {
     park.unpark.store(true, Ordering::SeqCst);
     std::thread::sleep(HANDOFF);
-    a.org_egress_depth_for_test()
+    a.org_egress_state_for_test().depth
 }
 
 /// TEST 5 — CADENCE ORDERING under real contention, observed from the PROVIDER.
@@ -861,6 +893,12 @@ async fn the_later_org_cadence_decision_is_what_the_provider_finally_holds() {
     let _ = refresher.await;
     tokio::time::sleep(PAST_MIN_GAP).await;
 
+    // The SEND-BOUNDARY trace for the contending pair. The queue-depth
+    // assertions below prove the datagrams entered the ordered egress; this
+    // proves the consumer then sent them one at a time, in enqueue order — the
+    // discrimination a depth assertion structurally cannot make.
+    let trace = arm_send_trace(&a);
+
     // DECISION A: tighten to MID, and stop it between commit and transport.
     let park = arm_phase_two_park(&a);
     let first = {
@@ -873,7 +911,7 @@ async fn the_later_org_cadence_decision_is_what_the_provider_finally_holds() {
     })
     .await;
     assert_eq!(
-        a.org_egress_depth_for_test(),
+        a.org_egress_state_for_test().depth,
         0,
         "the park must sit BEFORE the parked decision's transport effect — that is \
          the entire premise of this witness. A non-zero depth here means the \
@@ -925,10 +963,15 @@ async fn the_later_org_cadence_decision_is_what_the_provider_finally_holds() {
         .expect("the later tightening must acquire");
     a.clear_sensing_phase_two_seam_for_test();
     assert!(
-        poll_until(POLL, || a.org_egress_depth_for_test() == 0).await,
+        poll_until(POLL, || a.org_egress_state_for_test().depth == 0).await,
         "the ordered egress never drained — its single sequential consumer is what \
          turns enqueue order into socket order, and it is not running"
     );
+    // THE MECHANISM, at the transport boundary: the two contending datagrams
+    // were handed to the socket one at a time, in the order their decisions
+    // committed. This is what fails for a mutant that keeps the ordered queue
+    // and races the dequeued sends.
+    assert_strictly_serial(&trace, 2);
 
     assert!(
         poll_until(POLL, || peer_row(&b, &key, a_id).map(|(d, _)| d)
@@ -1066,7 +1109,7 @@ async fn a_parked_org_teardown_cannot_be_overtaken_by_its_own_reacquisition() {
     })
     .await;
     assert_eq!(
-        a.org_egress_depth_for_test(),
+        a.org_egress_state_for_test().depth,
         0,
         "the park must sit BEFORE the teardown's transport effect: the `Deregister` \
          may not have been handed to the transport yet, or the re-acquisition below \
@@ -1116,7 +1159,7 @@ async fn a_parked_org_teardown_cannot_be_overtaken_by_its_own_reacquisition() {
         .expect("the re-acquisition must acquire");
     a.clear_sensing_phase_two_seam_for_test();
     assert!(
-        poll_until(POLL, || a.org_egress_depth_for_test() == 0).await,
+        poll_until(POLL, || a.org_egress_state_for_test().depth == 0).await,
         "the ordered egress never drained — its single sequential consumer is what \
          turns enqueue order into socket order, and it is not running"
     );
@@ -1182,5 +1225,374 @@ async fn a_parked_org_teardown_cannot_be_overtaken_by_its_own_reacquisition() {
     );
 
     a.shutdown().await.expect("shutdown A");
+    b.shutdown().await.expect("shutdown B");
+}
+
+// ---- THE TRANSPORT BOUNDARY (tests 7-9) ------------------------------------
+
+/// A recorded trace of the PRODUCTION organization send boundary.
+///
+/// Each entry is one `(enqueue sequence, phase)` observation, taken from inside
+/// the consumer immediately before and immediately after its own `send_to`. The
+/// trace is what discriminates a genuinely sequential consumer from a mutant
+/// that keeps the ordered queue and then races the dequeued sends: the queue is
+/// touched identically by both, the trace is not.
+type SendTrace = Arc<parking_lot::Mutex<Vec<(u64, OrgEgressSendPhase)>>>;
+
+fn arm_send_trace(a: &Arc<MeshNode>) -> SendTrace {
+    let trace: SendTrace = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let sink = trace.clone();
+    a.set_org_egress_send_observer_for_test(Arc::new(move |seq, phase| {
+        sink.lock().push((seq, phase));
+    }));
+    trace
+}
+
+/// [`arm_send_trace`] that also PARKS inside the FIRST datagram's send bracket.
+///
+/// This is what makes the racing-consumer mutant fail DETERMINISTICALLY rather
+/// than probabilistically. The observer blocks for `park` between datagram 0's
+/// `Started` and its `Completed`, and then records how many observations exist
+/// at that moment:
+///
+/// * a genuinely SEQUENTIAL consumer is the only writer of the trace and it is
+///   blocked, so exactly ONE observation can exist — its own `Started`;
+/// * a consumer that dequeues and then `tokio::spawn`s the sends has other
+///   tasks free to run on the other workers, so their observations land during
+///   the park and the count exceeds one.
+///
+/// Requires more than one runtime worker, or the rival sends could not run even
+/// under the mutant and the discrimination would be vacuous.
+fn arm_parked_send_trace(
+    a: &Arc<MeshNode>,
+    park: Duration,
+) -> (SendTrace, Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::AtomicUsize;
+
+    let trace: SendTrace = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let during_park = Arc::new(AtomicUsize::new(0));
+    let sink = trace.clone();
+    let counted = during_park.clone();
+    let armed = Arc::new(AtomicBool::new(true));
+    a.set_org_egress_send_observer_for_test(Arc::new(move |seq, phase| {
+        sink.lock().push((seq, phase));
+        if phase != OrgEgressSendPhase::Started || !armed.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        std::thread::sleep(park);
+        let observed = sink.lock().len();
+        counted.store(observed, Ordering::SeqCst);
+    }));
+    (trace, during_park)
+}
+
+/// Assert a recorded trace is STRICTLY SERIAL in enqueue order.
+///
+/// The contract has exactly one legal shape: for every datagram, `Started` is
+/// immediately followed by that same datagram's `Completed`, and sequences are
+/// non-decreasing. Both semantic inverses fail here and nowhere else:
+///
+/// * PARALLELISED sends — two `Started` in a row, i.e. a second `send_to` began
+///   before the first returned;
+/// * REORDERED sends — a lower sequence starting after a higher one.
+fn assert_strictly_serial(trace: &SendTrace, at_least: usize) {
+    let observed = trace.lock().clone();
+    assert!(
+        observed.len() >= at_least * 2,
+        "expected at least {at_least} bracketed sends at the production send \
+         boundary, saw {} observations: {observed:?}. An EMPTY trace means the \
+         datagrams never went through the ordered consumer at all — the racing \
+         per-datagram `tokio::spawn` this repair replaced",
+        observed.len()
+    );
+    let mut previous_seq: Option<u64> = None;
+    let mut index = 0;
+    while index < observed.len() {
+        let (seq, phase) = observed[index];
+        assert_eq!(
+            phase,
+            OrgEgressSendPhase::Started,
+            "observation {index} of the send trace is {phase:?} for datagram \
+             {seq} where a `Started` was due. Two `Started`s in a row means the \
+             consumer began a second socket send before the first returned — the \
+             ordered queue was kept and the SENDS were parallelised, which is \
+             exactly the mutant a queue-depth assertion cannot see. Trace: \
+             {observed:?}"
+        );
+        let Some(&(completed_seq, completed_phase)) = observed.get(index + 1) else {
+            panic!(
+                "datagram {seq} started at the send boundary and never completed; \
+                 the trace ends mid-send: {observed:?}"
+            );
+        };
+        assert_eq!(
+            (completed_seq, completed_phase),
+            (seq, OrgEgressSendPhase::Completed),
+            "datagram {seq}'s `Started` is followed by {completed_phase:?} for \
+             datagram {completed_seq}, not by its own completion — the consumer \
+             interleaved two socket sends. Trace: {observed:?}"
+        );
+        if let Some(previous) = previous_seq {
+            assert!(
+                seq > previous,
+                "datagram {seq} was sent AFTER datagram {previous}, so the \
+                 consumer dequeued out of enqueue order. Enqueue order is \
+                 decision order (producers enqueue under `org_transition_mu`), so \
+                 this is a peer-observable inversion of two committed decisions. \
+                 Trace: {observed:?}"
+            );
+        }
+        previous_seq = Some(seq);
+        index += 2;
+    }
+}
+
+/// TEST 7 — the SEND BOUNDARY is strictly serial and in enqueue order.
+///
+/// Tests 5 and 6 prove the datagrams enter the ordered egress and that the
+/// provider's final row is the later decision's. Neither can fail for a mutant
+/// that keeps the queue and then fans the dequeued datagrams into concurrent
+/// `tokio::spawn`ed sends: the queue depth is identical, and on loopback the
+/// arrival order does not actually invert (measured, 20/20 — see test 5).
+///
+/// This witness observes the production `send_to` itself. Several distinct
+/// interests are registered back to back so the consumer has a real run of
+/// datagrams to order, and the recorded trace must be
+/// `Started(0) Completed(0) Started(1) Completed(1) ...`. A parallelising or
+/// reordering consumer cannot produce that, and an egress bypass produces an
+/// empty trace.
+///
+/// MECHANISM PROOF, not a UDP outcome: it states what this node's socket calls
+/// did, in order. What the peer finally holds is asserted by tests 5 and 6, and
+/// a network reordering in flight remains outside any send-side mechanism.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_production_send_boundary_is_strictly_serial_in_enqueue_order() {
+    let OrgPair { a, b, .. } = org_pair("send-order").await;
+    let b_id = b.node_id();
+    // PARKED inside the first send's bracket: see `arm_parked_send_trace` for
+    // why the park is what makes the racing-consumer mutant deterministic.
+    let (trace, during_park) = arm_parked_send_trace(&a, HANDOFF);
+
+    // DISTINCT interests, so the upstream min-gap damper admits every one of
+    // them: it is keyed by `(provider, interest_digest)`, so the same interest
+    // registered twice inside 100 ms would emit only once.
+    const SENDS: usize = 6;
+    let mut tickets = Vec::with_capacity(SENDS);
+    for index in 0..SENDS {
+        let spec = distinct_org_spec(b_id, index);
+        tickets.push(
+            a.acquire_sensing_interest_lease(&spec, b_id, D)
+                .expect("each distinct own-org interest must acquire"),
+        );
+    }
+    assert!(
+        poll_until(POLL, || a.org_egress_state_for_test().sent >= SENDS as u64).await,
+        "the ordered consumer never handed all {SENDS} datagrams to the socket; \
+         saw {:?}",
+        a.org_egress_state_for_test()
+    );
+    assert_eq!(
+        during_park.load(Ordering::SeqCst),
+        1,
+        "while datagram 0 was parked INSIDE its own send bracket, {} send-boundary \
+         observations existed. A sequential consumer is the trace's only writer \
+         and it was blocked, so exactly one — its own `Started` — is possible. \
+         More means other sends were in flight concurrently: the ordered queue \
+         was kept and the SOCKET SENDS were parallelised, which is precisely the \
+         mutant a queue-depth assertion cannot see. Trace: {:?}",
+        during_park.load(Ordering::SeqCst),
+        trace.lock().clone()
+    );
+    assert_strictly_serial(&trace, SENDS);
+    assert_eq!(
+        a.org_egress_state_for_test().dropped_oldest,
+        0,
+        "nothing may be evicted well below the bound"
+    );
+
+    for ticket in tickets {
+        a.release_sensing_interest_lease(ticket)
+            .expect("the release must not be refused");
+    }
+    a.shutdown().await.expect("shutdown A");
+    b.shutdown().await.expect("shutdown B");
+}
+
+/// TEST 8 — the ordered egress is BOUNDED under a consumer that cannot run, and
+/// the LATEST committed decision survives the overflow.
+///
+/// The pre-repair egress was an UNBOUNDED channel. A bounded lease registry does
+/// not bound transition RATE, so one stalled `send_to` let the queue grow
+/// without limit. Producers cannot be blocked instead — the lease API is
+/// synchronous and enqueues under `org_transition_mu`, so blocking would stall
+/// every organization transition on the socket.
+///
+/// The bound therefore evicts the OLDEST pending datagram, which is the only
+/// eviction policy that keeps the property the egress exists for: the newest
+/// datagram is never the casualty. This drives a burst strictly larger than the
+/// bound with the runtime's only worker deliberately BLOCKED — so the consumer
+/// provably cannot retire anything — and then asserts:
+///
+/// 1. depth never exceeds the bound;
+/// 2. the overflow was counted as an eviction, not silently absorbed;
+/// 3. the LAST interest of the burst still reaches the provider.
+///
+/// Single-threaded (`#[tokio::test]`, one worker) is load-bearing: the burst
+/// runs on a blocking thread and is fully synchronous, while the consumer is a
+/// runtime TASK, so blocking the one worker is what makes "the consumer cannot
+/// run" a fact rather than a hope.
+#[tokio::test]
+async fn the_ordered_egress_is_bounded_and_keeps_the_latest_decision() {
+    use std::sync::mpsc;
+
+    let OrgPair { a, b, .. } = org_pair("bounded").await;
+    let a_id = a.node_id();
+    let b_id = b.node_id();
+
+    // WARM-UP, on this task: the egress is created lazily and its consumer is
+    // `tokio::spawn`ed, so it must first come into existence inside the runtime.
+    // Drain it, then take the send baseline.
+    let warm_spec = org_spec(b_id);
+    let warm = a
+        .acquire_sensing_interest_lease(&warm_spec, b_id, D)
+        .expect("the warm-up own-org holder must acquire");
+    assert!(
+        poll_until(POLL, || {
+            let state = a.org_egress_state_for_test();
+            state.started && state.depth == 0 && state.sent >= 1
+        })
+        .await,
+        "the egress never came up and drained: {:?}",
+        a.org_egress_state_for_test()
+    );
+    let sent_before = a.org_egress_state_for_test().sent;
+
+    // Strictly more than the production bound, so eviction MUST happen. The
+    // bound is not exported; the burst is sized against it by construction and
+    // the accounting assertion below states the relationship it needs.
+    const BURST: usize = 140;
+    let last_spec = distinct_org_spec(b_id, BURST - 1);
+    let last_key = ProviderInterestKey::new(last_spec.key(), b_id);
+
+    let (done_tx, done_rx) = mpsc::sync_channel::<Vec<_>>(1);
+    let burst = {
+        let a = a.clone();
+        // `spawn_blocking`, not a bare `std::thread`: the whole acquisition path
+        // is synchronous but it still needs the runtime CONTEXT, exactly as the
+        // pre-existing legacy `spawn_sensing_frame_send` does on this same chain.
+        tokio::task::spawn_blocking(move || {
+            let mut tickets = Vec::with_capacity(BURST);
+            for index in 0..BURST {
+                let spec = distinct_org_spec(b_id, index);
+                if let Ok(ticket) = a.acquire_sensing_interest_lease(&spec, b_id, D) {
+                    tickets.push(ticket);
+                }
+            }
+            let _ = done_tx.send(tickets);
+        })
+    };
+    // BLOCK the single runtime worker until the burst is done. `recv` on a std
+    // channel blocks this thread exactly like the `std::thread::sleep` the
+    // ordering witnesses use, so the consumer TASK cannot be polled while the
+    // blocking-pool thread above runs.
+    let tickets = done_rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the synchronous burst must complete without the runtime worker");
+    let state = a.org_egress_state_for_test();
+
+    assert_eq!(
+        state.sent, sent_before,
+        "the consumer retired datagrams while the only runtime worker was \
+         blocked, so this run does not observe a stalled egress at all: {state:?}"
+    );
+    assert!(
+        state.depth <= 128,
+        "the ordered egress grew to {} pending datagrams. It is supposed to be \
+         BOUNDED: an unbounded queue behind one stalled `send_to` is unbounded \
+         memory growth driven by transition rate, which the bounded lease \
+         registry does not limit. State: {state:?}",
+        state.depth
+    );
+    assert!(
+        state.dropped_oldest > 0,
+        "a burst of {BURST} datagrams past the bound evicted NOTHING ({state:?}). \
+         Either the queue is not bounded, or the overflow was absorbed without \
+         being counted — and an uncounted drop is exactly the silent loss the \
+         eviction counter exists to expose"
+    );
+    assert_eq!(
+        state.depth + state.dropped_oldest,
+        BURST as u64,
+        "every enqueued datagram must be accounted for as pending or evicted: \
+         {state:?}"
+    );
+
+    // THE SEMANTIC PROPERTY: the newest decision is never the casualty. The
+    // burst's LAST interest was enqueued last, so it must still be in the queue
+    // and must still reach the provider.
+    assert!(
+        poll_until(POLL, || peer_row(&b, &last_key, a_id).is_some()).await,
+        "the LAST decision of an overflowing burst never reached the provider. \
+         Overflow must evict the OLDEST pending datagram: dropping the newest \
+         would make the peer's final row an older decision, which is the entire \
+         defect the ordered egress exists to fix"
+    );
+
+    burst.await.expect("the burst joins");
+    for ticket in tickets {
+        let _ = a.release_sensing_interest_lease(ticket);
+    }
+    let _ = a.release_sensing_interest_lease(warm);
+    a.shutdown().await.expect("shutdown A");
+    b.shutdown().await.expect("shutdown B");
+}
+
+/// TEST 9 — the egress consumer does NOT survive node shutdown.
+///
+/// The pre-repair egress discarded its `JoinHandle` and `MeshNode::shutdown` did
+/// not close, drain or join it: the consumer task simply outlived the node,
+/// holding an `Arc<NetSocket>` and its queue.
+///
+/// The contract asserted here is the one the node actually implements: shutdown
+/// CLOSES the queue and JOINS the consumer within a bounded grace window, so
+/// after `shutdown().await` the task has exited. It is bounded on purpose — a
+/// stalled socket must not stall shutdown — and the timeout path aborts.
+#[tokio::test]
+async fn the_egress_consumer_does_not_survive_node_shutdown() {
+    let OrgPair { a, b, .. } = org_pair("shutdown").await;
+    let b_id = b.node_id();
+    let spec = org_spec(b_id);
+
+    let ticket = a
+        .acquire_sensing_interest_lease(&spec, b_id, D)
+        .expect("the own-org holder must acquire");
+    let before = a.org_egress_state_for_test();
+    assert!(
+        before.started,
+        "the egress must exist before shutdown, or this witness is vacuous: \
+         {before:?}"
+    );
+    assert!(
+        !before.consumer_finished,
+        "the consumer must still be alive before shutdown: {before:?}"
+    );
+
+    a.release_sensing_interest_lease(ticket)
+        .expect("the release must not be refused");
+    a.shutdown().await.expect("shutdown A");
+
+    let after = a.org_egress_state_for_test();
+    assert!(
+        after.consumer_finished,
+        "the ordered egress' consumer task OUTLIVED the node. `shutdown` must \
+         close the queue and join the consumer; a discarded `JoinHandle` leaves a \
+         task holding the socket and its queue after the node is gone. State: \
+         {after:?}"
+    );
+    assert_eq!(
+        after.depth, 0,
+        "and shutdown must leave nothing queued behind it: {after:?}"
+    );
+
     b.shutdown().await.expect("shutdown B");
 }

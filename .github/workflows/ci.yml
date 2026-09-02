@@ -523,19 +523,23 @@ jobs:
       #   org_gate                        = 60
       #     42 baseline + 7 (selector-target intake) + 5 (local-origin planner)
       #     + 6 (publication-pinned fence, off-lock relay crypto window)
-      #   sensing_authority_witness_tests = 52
+      #   sensing_authority_witness_tests = 54
       #     28 baseline + 1 (dispatch ordering) + 6 (local org lease egress)
       #     + 4 (lease-egress hold repair) + 10 (transition order, release
       #     coherence, phase-2 coverage, currentness fence)
       #     + 3 (release-through-fence, rollback plane, provenance ordering)
-      #     net of 2 retired: the two manual-wrapper guard witnesses replaced by
-      #     production-observed ones
+      #     + 3 (acquisition transaction: partitioned-tightening restoration,
+      #     the partition-to-restoration authority race, the refused
+      #     remote-provider inverse)
+      #     net of 3 retired: the two manual-wrapper guard witnesses replaced by
+      #     production-observed ones, and the cached-floor "rollback plane"
+      #     witness replaced by the two destructive-partition witnesses above
       # The mesh line previously read 35 while MESH_MIN read 39 — the arithmetic
       # drifted from the pin. Re-derive both from `--list` when you change them.
       #
-      # REQUIRED holds 34 names (12 gate + 22 mesh); a prior commit message said
-      # 21, which was a `tail`-truncated count of the gate's own output, not the
-      # roster size. Count with the loops below, not by eye.
+      # REQUIRED holds 45 names (18 gate + 27 mesh). Count with the loops below,
+      # not by eye: a prior comment claimed 34, which was neither the roster size
+      # nor any derived figure.
       #
       # A later slice RAISES a floor and APPENDS its names in the same commit
       # that adds the witnesses — never separately, or the gate goes red on a
@@ -549,7 +553,7 @@ jobs:
           GATE=adapter::net::behavior::sensing::org_gate::tests
           MESH=adapter::net::mesh::sensing_authority_witness_tests
           GATE_MIN=60
-          MESH_MIN=52
+          MESH_MIN=54
 
           die() { echo "::error::$1"; shift; [ "$#" -gt 0 ] && printf '%s\n' "$@"; exit 1; }
 
@@ -647,7 +651,9 @@ jobs:
           the_production_transaction_identifies_each_guard_it_holds
           a_final_release_reaches_phase_two_holding_nothing
           a_floor_raise_between_preparation_and_the_fence_refuses_the_release
-          a_failed_self_provider_acquisition_rolls_back_on_the_org_plane
+          a_partitioned_tightening_restores_the_row_and_never_moves_the_registry
+          an_authority_change_during_a_refused_tightening_leaves_one_state
+          a_refused_remote_acquisition_moves_nothing_and_emits_nothing
           an_authority_loss_duplicate_cannot_strand_a_final_release
           an_install_attempted_inside_the_fence_cannot_precede_the_mutation
           a_stale_capture_window_emits_no_frame_at_all"
