@@ -36,19 +36,18 @@ const DEST = join(WEB, "src", "content", "docs", "releases");
 const GH = "https://github.com/ai-2070/net/blob/master";
 
 // Authored alongside the release notes but not published: the checklist, the
-// beta notes, a stray v0.8 draft superseded by the real v0.8 notes, and the
-// pending-breaking staging file.
+// beta notes, and a stray v0.8 draft superseded by the real v0.8 notes.
 //
-// `PENDING_v0.35_BREAKING.md` collects breaking entries as they land, before
-// there is a note to put them in — `RELEASE_STEPS.md` picks the codename at
-// step 2 and drafts the note at step 4, and the entries are folded in there
-// and the file deleted. Publishing it would put a half-assembled changelog on
-// the site under a version that has not shipped.
+// A `PENDING_vX_BREAKING.md` staging file belongs in this set for as long as
+// one exists — it collects breaking entries as they land, before there is a
+// note to put them in, and `RELEASE_STEPS.md` folds them into the note at
+// step 4 and deletes the file. Publishing one would put a half-assembled
+// changelog on the site under a version that has not shipped. There is no
+// such file right now: v0.35's entries are in the v0.35 note.
 const NOT_PUBLISHED = new Set([
   "BETA_NOTES.md",
   "RELEASE_STEPS.md",
   "RELEASE_v0.8_NOTES.md",
-  "PENDING_v0.35_BREAKING.md",
 ]);
 
 // Paths the notes reference that moved, or that were always one directory
@@ -115,6 +114,8 @@ const TITLES = {
   "RELEASE_v0.32_SUMMER_MADNESS.md": "v0.32.0 — Summer Madness",
   "RELEASE_v0.33_CIRCUS_MAXIMUS.md": "v0.33.0 — Circus Maximus",
   "RELEASE_v0.34_HOTEL_CALIFORNIA.md": "v0.34.0 — Hotel California",
+  "RELEASE_v0.35_DOUBLEBACK.md": "v0.35.0 — Doubleback",
+  "RELEASE_v0.36_PARANOID.md": "v0.36.0 — Paranoid",
   "RELEASE_v0.8_KILLING_MOON.md": "v0.8 — Killing Moon",
   "RELEASE_v0.9_FIRST_BLOOD.md": "v0.9 — First Blood",
 };
