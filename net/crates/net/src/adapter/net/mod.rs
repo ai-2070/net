@@ -141,6 +141,11 @@ pub use mesh::{
     SensingReadinessOverlay, SensingRegistrationError, UnregisteredChannelPolicy,
     ACK_RANGES_CAPABILITY_TAG,
 };
+/// Exported only so the fixtures-gated ordered-egress accessors have nameable
+/// types in integration tests; each is `#[doc(hidden)]` at its definition and
+/// none of them exposes authority material or any control over the egress.
+#[cfg(any(test, feature = "fixtures"))]
+pub use mesh::{OrgEgressSendObserver, OrgEgressSendPhase, OrgEgressState};
 #[cfg(feature = "netdb")]
 pub use netdb::{MemoriesFilter, NetDb, NetDbBuilder, NetDbError, NetDbSnapshot, TasksFilter};
 // `SharedPacketPool` is intentionally not re-exported — see

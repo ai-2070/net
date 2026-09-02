@@ -89,7 +89,13 @@ pub enum LeaseRefused {
     InterestAtCapacity,
 }
 
-/// Refusal counters for [`SensingInterestLeases`].
+/// Transactional counters for [`SensingInterestLeases`].
+///
+/// Crate-private on purpose: these describe how this registry's own
+/// transactions resolved, not a sensing-plane observability contract, so they
+/// stay off the public [`SensingCounters`] surface.
+///
+/// [`SensingCounters`]: super::evaluator::SensingCounters
 #[derive(Default)]
 struct LeaseMetrics {
     refused_node_at_capacity: AtomicU64,
@@ -105,11 +111,21 @@ struct LeaseMetrics {
     /// exists that does not (or vice versa) until something else reconciles it.
     /// Counted so the divergence is observable instead of silent.
     reconcile_failures: AtomicU64,
+    /// Surviving-holder ORGANIZATION releases refused at the final currentness
+    /// fence: nothing was released, the pre-transition registry and table state
+    /// stand, and no frame was emitted. Distinct from `reconcile_failures`,
+    /// which counts a divergence that already happened.
+    release_refused: AtomicU64,
+    /// Lease installations INVALIDATED: a tightening acquisition's refusal
+    /// partition moved the shared row, and current organization authority then
+    /// refused to restore the surviving holders' aggregate. The entry is dropped
+    /// rather than left claiming an installed row that no longer exists.
+    installations_invalidated: AtomicU64,
 }
 
-/// Opaque per-holder token. `SensingInterestLeases::acquire` returns one;
-/// [`SensingInterestLeases::release`] consumes it via the ticket. Node-local;
-/// never on the wire.
+/// Opaque per-holder token. The registry's crate-private acquisition commit
+/// returns one; [`SensingInterestLeases::release`] consumes it via the ticket.
+/// Node-local; never on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LeaseToken(u64);
 
@@ -162,6 +178,85 @@ pub enum LeaseAction {
         /// The canonical interest spec to deregister.
         spec: Arc<InterestSpec>,
     },
+}
+
+/// Which shape an acquisition takes, decided by
+/// [`SensingInterestLeases::preview_acquire`] before anything is mutated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcquireTransition {
+    /// First holder for this key — register the previewed spec.
+    Establish,
+    /// The aggregate TIGHTENS. `restore_to` is the aggregate installed right
+    /// now, i.e. the surviving holders' cadence.
+    ///
+    /// A tightening is the ONLY acquisition that can leave the interest table
+    /// moved when it fails: it overwrites the row shared by every holder of the
+    /// key, so a self-provider emitter refusal partitions that row against THIS
+    /// holder's interval and can remove it even though the survivors' interval
+    /// would have been admitted. `restore_to` is what the transaction then owes
+    /// the table back.
+    Tighten { restore_to: Duration },
+    /// Refcount only — no wire op, and nothing that can fail.
+    Unchanged,
+}
+
+/// A previewed acquisition: everything
+/// [`SensingInterestLeases::commit_acquire`] will do, computed without mutating
+/// anything.
+pub(crate) struct PreviewedAcquire {
+    key: SensingLeaseKey,
+    /// This holder's requested interval.
+    interval: Duration,
+    /// The plane to RECORD if this acquisition establishes the entry.
+    establishing_plane: LeasePlane,
+    /// The plane IN FORCE: the established one when the key already exists.
+    plane: LeasePlane,
+    /// The authoritative spec — the STORED one for an existing key, or the
+    /// caller's promoted to an `Arc` for a new one.
+    spec: Arc<InterestSpec>,
+    transition: AcquireTransition,
+}
+
+impl PreviewedAcquire {
+    /// The authority plane in force for this lease. For an existing key this is
+    /// the RECORDED plane, which the caller must honour instead of whatever
+    /// authority happens to be installed right now.
+    pub(crate) fn plane(&self) -> LeasePlane {
+        self.plane
+    }
+
+    /// The wire transition to apply BEFORE the registry commits. Clones an
+    /// `Arc`, nothing else.
+    pub(crate) fn action(&self) -> LeaseAction {
+        match self.transition {
+            AcquireTransition::Establish => LeaseAction::Register {
+                spec: Arc::clone(&self.spec),
+                interval: self.interval,
+            },
+            AcquireTransition::Tighten { .. } => LeaseAction::Reregister {
+                spec: Arc::clone(&self.spec),
+                interval: self.interval,
+            },
+            AcquireTransition::Unchanged => LeaseAction::Unchanged,
+        }
+    }
+
+    /// The transition that puts the interest table back to the aggregate the
+    /// registry still holds, for a tightening whose application failed AFTER
+    /// moving rows.
+    ///
+    /// `None` when there is nothing to restore to: an establishing acquisition
+    /// had no earlier aggregate (the partition removed only the row it had just
+    /// created), and `Unchanged` never applies a transition at all.
+    pub(crate) fn restoration(&self) -> Option<LeaseAction> {
+        match self.transition {
+            AcquireTransition::Tighten { restore_to } => Some(LeaseAction::Reregister {
+                spec: Arc::clone(&self.spec),
+                interval: restore_to,
+            }),
+            AcquireTransition::Establish | AcquireTransition::Unchanged => None,
+        }
+    }
 }
 
 /// A held sensing-interest lease reference (OLB-0). Returned by
@@ -236,87 +331,157 @@ impl SensingInterestLeases {
         LeaseToken(self.next_token.fetch_add(1, Ordering::Relaxed))
     }
 
-    /// Acquire a reference to the interest `key` (registered under `spec`) at
-    /// the requested `interval`.
+    /// PREVIEW one acquisition of the interest `key` at the requested
+    /// `interval`, deciding everything and mutating NOTHING.
     ///
-    /// The returned [`LeaseAction`] tells the node what wire transition to
-    /// perform and carries the authoritative spec; the returned [`LeaseToken`]
-    /// is packaged into a [`SensingLeaseTicket`] and handed back to
-    /// [`release`](Self::release) exactly once. `spec` is stored on the first
-    /// acquisition and reused for every later action for this key.
+    /// The acquisition transaction commits the REGISTRY LAST: the caller applies
+    /// the table/emitter transition first and only a successful application
+    /// reaches [`commit_acquire`](Self::commit_acquire). A refused acquisition
+    /// therefore never inserts a reference, so there is no registry rollback at
+    /// all — which is what removed the old
+    /// insert / refuse / roll-back / restore-through-a-second-fence path, whose
+    /// two commits could be split by an authority publication and leave a
+    /// surviving holder claiming a row that had been removed.
+    ///
+    /// Sound because `sensing_lease_apply_mu` is held across the preview AND the
+    /// commit, and every registry mutation on this node runs under it — the same
+    /// argument [`preview_release`](Self::preview_release) rests on.
     ///
     /// Refuses fail-closed at either bound (review-pass-2 §6). A refusal is
     /// TOTAL: no token is minted, no registration is recorded, the installed
     /// cadence does not move even for a would-be-stricter holder, and no live
-    /// interest is evicted to make room. The caller therefore has nothing to
-    /// roll back.
-    /// `plane` is the authority plane the CALLER established this transition
-    /// under. It is stored on the establishing (vacant) acquisition and ignored
-    /// afterwards: an existing lease keeps the plane it was created with, so a
-    /// later authority change cannot reclassify it. The plane actually in force
-    /// is always the one returned here.
-    pub(crate) fn acquire(
+    /// interest is evicted to make room.
+    ///
+    /// `plane` is the authority plane the CALLER can establish this lease under.
+    /// It is recorded only on the establishing (vacant) acquisition; an existing
+    /// lease keeps the plane it was created with, so a later authority change
+    /// cannot reclassify it. [`PreviewedAcquire::plane`] is always the plane
+    /// actually in force.
+    pub(crate) fn preview_acquire(
+        &self,
+        key: SensingLeaseKey,
+        spec: &InterestSpec,
+        interval: Duration,
+        plane: LeasePlane,
+    ) -> Result<PreviewedAcquire, LeaseRefused> {
+        let entries = self.entries.lock();
+        let Some(entry) = entries.get(&key) else {
+            // Only a NEW key spends the node budget.
+            if entries.len() >= MAX_LEASED_INTERESTS {
+                self.metrics
+                    .refused_node_at_capacity
+                    .fetch_add(1, Ordering::AcqRel);
+                return Err(LeaseRefused::NodeAtCapacity);
+            }
+            return Ok(PreviewedAcquire {
+                key,
+                interval,
+                establishing_plane: plane,
+                plane,
+                // Promoted to an `Arc` HERE and stored verbatim by the commit,
+                // so the spec is cloned exactly once across both halves.
+                spec: Arc::new(spec.clone()),
+                transition: AcquireTransition::Establish,
+            });
+        };
+        if entry.registrations.len() >= MAX_HOLDERS_PER_INTEREST {
+            self.metrics
+                .refused_interest_at_capacity
+                .fetch_add(1, Ordering::AcqRel);
+            return Err(LeaseRefused::InterestAtCapacity);
+        }
+        // `installed_interval` is maintained as the exact minimum of all live
+        // registrations, so the new minimum is just this holder's interval
+        // against it.
+        let transition = if interval < entry.installed_interval {
+            AcquireTransition::Tighten {
+                restore_to: entry.installed_interval,
+            }
+        } else {
+            AcquireTransition::Unchanged
+        };
+        Ok(PreviewedAcquire {
+            key,
+            interval,
+            establishing_plane: plane,
+            // The ESTABLISHED plane, not the caller's current view of it.
+            plane: entry.plane,
+            // The registry — not the caller — is the source of the wire identity
+            // for an existing key. Refcount bump only.
+            spec: Arc::clone(&entry.spec),
+            transition,
+        })
+    }
+
+    /// COMMIT a previewed acquisition, recording the holder.
+    ///
+    /// Infallible by construction: the preview proved both bounds under the same
+    /// `sensing_lease_apply_mu` the caller still holds, so nothing here can
+    /// refuse and the caller can never be handed a ticket for a reference that
+    /// was not recorded.
+    pub(crate) fn commit_acquire(&self, previewed: PreviewedAcquire) -> LeaseToken {
+        let PreviewedAcquire {
+            key,
+            interval,
+            establishing_plane,
+            plane,
+            spec,
+            transition,
+        } = previewed;
+        let mut entries = self.entries.lock();
+        let token = self.mint_token();
+        match entries.entry(key) {
+            Entry::Vacant(v) => {
+                debug_assert_eq!(
+                    transition,
+                    AcquireTransition::Establish,
+                    "a vacant key must have previewed as establishing — the apply \
+                     guard is held across the preview and this commit"
+                );
+                let mut registrations = HashMap::new();
+                registrations.insert(token, interval);
+                v.insert(LeaseEntry {
+                    spec,
+                    registrations,
+                    installed_interval: interval,
+                    plane: establishing_plane,
+                });
+            }
+            Entry::Occupied(mut o) => {
+                let entry = o.get_mut();
+                debug_assert_ne!(
+                    transition,
+                    AcquireTransition::Establish,
+                    "an occupied key must not have previewed as establishing"
+                );
+                debug_assert_eq!(
+                    entry.plane, plane,
+                    "the established plane cannot change under the apply guard"
+                );
+                entry.registrations.insert(token, interval);
+                entry.installed_interval = interval.min(entry.installed_interval);
+            }
+        }
+        token
+    }
+
+    /// One-shot preview + commit.
+    ///
+    /// TESTS ONLY. Production must apply the table/emitter transition BETWEEN
+    /// the two halves — that ordering is the whole point of splitting them, so
+    /// collapsing it back is exactly the defect this shape removed.
+    #[cfg(test)]
+    fn acquire(
         &self,
         key: SensingLeaseKey,
         spec: &InterestSpec,
         interval: Duration,
         plane: LeasePlane,
     ) -> Result<(LeaseToken, LeaseAction, LeasePlane), LeaseRefused> {
-        let mut entries = self.entries.lock();
-        // Checked BEFORE `entry()` and before the token mint, so a refused
-        // acquisition is indistinguishable from never having been attempted —
-        // and only a NEW key spends node budget.
-        if !entries.contains_key(&key) && entries.len() >= MAX_LEASED_INTERESTS {
-            self.metrics
-                .refused_node_at_capacity
-                .fetch_add(1, Ordering::AcqRel);
-            return Err(LeaseRefused::NodeAtCapacity);
-        }
-        match entries.entry(key) {
-            Entry::Vacant(v) => {
-                let token = self.mint_token();
-                let spec = Arc::new(spec.clone());
-                let mut registrations = HashMap::new();
-                registrations.insert(token, interval);
-                v.insert(LeaseEntry {
-                    spec: Arc::clone(&spec),
-                    registrations,
-                    installed_interval: interval,
-                    plane,
-                });
-                Ok((token, LeaseAction::Register { spec, interval }, plane))
-            }
-            Entry::Occupied(mut o) => {
-                let entry = o.get_mut();
-                if entry.registrations.len() >= MAX_HOLDERS_PER_INTEREST {
-                    self.metrics
-                        .refused_interest_at_capacity
-                        .fetch_add(1, Ordering::AcqRel);
-                    return Err(LeaseRefused::InterestAtCapacity);
-                }
-                let token = self.mint_token();
-                entry.registrations.insert(token, interval);
-                // The ESTABLISHED plane, not the caller's current view of it.
-                let plane = entry.plane;
-                // `installed_interval` is maintained as the exact minimum of all
-                // live registrations, so the new minimum is just this holder's
-                // interval against it.
-                let new_min = interval.min(entry.installed_interval);
-                if new_min < entry.installed_interval {
-                    entry.installed_interval = new_min;
-                    Ok((
-                        token,
-                        LeaseAction::Reregister {
-                            spec: Arc::clone(&entry.spec),
-                            interval: new_min,
-                        },
-                        plane,
-                    ))
-                } else {
-                    Ok((token, LeaseAction::Unchanged, plane))
-                }
-            }
-        }
+        let previewed = self.preview_acquire(key, spec, interval, plane)?;
+        let action = previewed.action();
+        let plane = previewed.plane();
+        Ok((self.commit_acquire(previewed), action, plane))
     }
 
     /// Record a wire reconciliation that failed after the registry committed —
@@ -331,6 +496,56 @@ impl SensingInterestLeases {
     /// Nonzero means the lease registry and the wire may disagree.
     pub fn reconcile_failures(&self) -> u64 {
         self.metrics.reconcile_failures.load(Ordering::Acquire)
+    }
+
+    /// Record an ORGANIZATION release refused at the final currentness fence.
+    /// Nothing moved: this is the "refused" counterpart to
+    /// [`note_reconcile_failure`](Self::note_reconcile_failure), which means a
+    /// divergence already happened.
+    pub(crate) fn note_release_refused(&self) {
+        self.metrics.release_refused.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// How many surviving-holder organization releases were refused with nothing
+    /// released and nothing emitted. Read only by the in-crate witnesses.
+    #[cfg(test)]
+    pub(crate) fn release_refusals(&self) -> u64 {
+        self.metrics.release_refused.load(Ordering::Acquire)
+    }
+
+    /// Drop a lease entry ENTIRELY because its installation cannot exist under
+    /// current authority, returning the number of holders dropped.
+    ///
+    /// Exactly one transition reaches here: a TIGHTENING acquisition whose
+    /// self-provider refusal partition moved the shared row, and whose
+    /// restoration to the surviving holders' aggregate was then refused by
+    /// current organization authority. Retaining the entry would leave those
+    /// holders claiming an installed row that no longer exists; removing it
+    /// states the truth — the lease is no longer installed — and makes each
+    /// surviving ticket's release the no-op it already is, since an organization
+    /// lease with no current authority cannot be re-authored either.
+    pub(crate) fn invalidate_installation(&self, key: &SensingLeaseKey) -> usize {
+        let dropped = self
+            .entries
+            .lock()
+            .remove(key)
+            .map_or(0, |entry| entry.registrations.len());
+        if dropped > 0 {
+            self.metrics
+                .installations_invalidated
+                .fetch_add(1, Ordering::AcqRel);
+        }
+        dropped
+    }
+
+    /// How many lease installations were invalidated by
+    /// [`invalidate_installation`](Self::invalidate_installation). Read only by
+    /// the in-crate witnesses.
+    #[cfg(test)]
+    pub(crate) fn installations_invalidated(&self) -> u64 {
+        self.metrics
+            .installations_invalidated
+            .load(Ordering::Acquire)
     }
 
     /// Refusal counters: `(node at capacity, interest at capacity)`.
