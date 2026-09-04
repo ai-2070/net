@@ -1,0 +1,20 @@
+docs/internal/plans/BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md
+  s_d514fa1efbfb65::t_73bb55058842eb 209
+  s_d514fa1efbfb65::t_c2351ce65ed27f 1-208,210-699
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "ffd32435e3c9c5a395e1971408ec236aa5a7a697",
+  "prompts": {},
+  "sessions": {
+    "s_d514fa1efbfb65": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7cef3112-1a53-4aa3-b1ed-a68e13bf6b54",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
