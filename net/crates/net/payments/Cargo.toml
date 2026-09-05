@@ -65,7 +65,7 @@ sha2 = "0.11"
 # Cross-process advisory lock + per-user path resolution for the
 # payment policy store — the exact `sdk/src/pins.rs` regime.
 fs2 = "0.4"
-dirs = "6"
+dirs = "7"
 tokio = { version = "1", features = ["rt", "time", "sync", "fs"] }
 async-trait = "0.1"
 # Workspace lock discipline (clippy disallowed-methods bans
