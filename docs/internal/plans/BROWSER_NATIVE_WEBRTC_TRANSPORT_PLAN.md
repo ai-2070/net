@@ -232,6 +232,17 @@ napi binding (Node ≥ 20). `web/` is a Next.js site. Every `wasm-bindgen` /
   path.
 - **Dropping Noise in favour of DTLS.** See §4.
 - **Mobile native (iOS / Android) clients.** Native nodes with UDP.
+- **Anchorless ("serverless-only") deployments.** Serverless runtimes
+  (Cloudflare Workers, Vercel / Netlify functions, Deno Deploy, Lambda)
+  expose no listening UDP socket and cannot hold an ICE agent, a DTLS
+  session or a routed relay session alive between invocations, so none of
+  them can host bootstrap, STUN, announcement flooding or the relay
+  fallback. A browser cannot cover for that either — a tab has no raw UDP,
+  so it can neither answer STUN nor serve a bootstrap URL. v1 therefore
+  requires at least one always-on native anchor. The intended product
+  answer is a **packaged anchor** (Stage 7): one small container or VM with
+  one UDP port, off the data path, serving many browsers. A third-party
+  STUN escape hatch is *not* offered in v1 (see §6, "Serverless").
 - **Browser-side persistence beyond identity.** RedEX / Dataforts on
   IndexedDB is a separate plan.
 - **A collaborative-text CRDT.** Net carries and persists updates; the CRDT
@@ -476,6 +487,17 @@ candidates on anchors are the candidate future mechanism (str0m support to
 be verified in Stage 0) and are listed under deferred work, not promised.
 "100 % of sessions established" is a Stage 6 exit criterion **only over
 pairs whose anchors are reachable**.
+
+**Serverless is not UDP-blocked; it is anchorless.** Hosting the page on a
+static host or edge CDN says nothing about the browser's network path — a
+tab on an ordinary connection has UDP regardless of where it loaded from.
+What serverless hosting removes is any place to *run the anchor*. That is a
+deployment constraint, not a connectivity class, and it is handled by the
+packaged anchor (Stage 7), not by this section's fallback logic. The
+tempting shortcut — a serverless HTTPS signalling relay plus a public
+third-party STUN server — would reintroduce the external dependency the
+goals exclude and would still leave no relay fallback and no announcement
+flooding, so it is not offered.
 
 ### 7. The browser node is a leaf profile: a `net-wire` crate plus a `net-leaf` crate
 
@@ -742,6 +764,11 @@ the new optional fields).
 
 - Node / Python / Go anchor-role parity for `RtcConfig` + `RtcStats`.
 - `sdk-ts` / `@net-mesh/browser` shared generated types.
+- **Packaged anchor.** A single-binary / container distribution of a
+  `webrtc`-enabled node preconfigured as an anchor (`serve_bootstrap`,
+  `serve_stun`, a pinned `rtc_addr`, invite minting), so that "deploy a
+  browser-native Net app" means static assets plus one small always-on
+  process. This is the answer to serverless-only hosting (§Non-goals).
 - ICE-TCP passive candidates on anchors (if S0b confirms str0m support).
 - DTLS-exporter shortcut (if S0c demands it).
 - Browser-side RedEX on IndexedDB (separate plan).
@@ -889,3 +916,4 @@ applied in this revision:
 | 7 | Key-storage guarantee overstated; multi-tab undefined | §8: same-origin boundary stated; leader-elected single node per origin |
 | — | Spikes before the wide refactor; wire split is a crate split; conformance vs deployment denominators; per-pair witness; compatibility guarantee precision; allow mechanical test edits | Stage 0; §7 / Stage 2; Goals + Stage 6; §10; Goals; Stage 1 |
 | — | Name the announcement route-learning path; `reflex_addr` carries a `SocketAddr` on the wire | §Context, §7; wire-address inventory |
+| — | 2026-09-05, product owner: serverless-only hosting is anchorless, not UDP-blocked | §Non-goals, §6 "Serverless", Stage 7 packaged anchor |
