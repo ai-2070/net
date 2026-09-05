@@ -242,7 +242,9 @@ napi binding (Node ≥ 20). `web/` is a Next.js site. Every `wasm-bindgen` /
   requires at least one always-on native anchor. The intended product
   answer is a **packaged anchor** (Stage 7): one small container or VM with
   one UDP port, off the data path, serving many browsers. A third-party
-  STUN escape hatch is *not* offered in v1 (see §6, "Serverless").
+  STUN escape hatch is *not* offered in v1 (see §6, "Serverless"). The
+  serverless substitute for each anchor function is sketched under
+  §Follow-on.
 - **Browser-side persistence beyond identity.** RedEX / Dataforts on
   IndexedDB is a separate plan.
 - **A collaborative-text CRDT.** Net carries and persists updates; the CRDT
@@ -726,6 +728,14 @@ the new optional fields).
 
 - Leaf crate and TypeScript wrapper; identity storage and leader election
   (§8); dispatcher; channels; nRPC client; fold announce; capability query.
+- **`ControlPlane` trait from day one.** Everything the leaf needs from an
+  anchor that is *not* a Net packet on the data path — bootstrap
+  offer/answer, candidate trickle, announcement publish/subscribe,
+  signalling dialog transport for peers it has no session with yet — goes
+  behind one trait. `AnchorControlPlane` (DataChannel to a native anchor,
+  §5) is the only v1 implementation. The trait exists so the serverless
+  follow-on (§Follow-on) is a second implementation, not a refactor; it
+  must not leak `PeerAddr::Rtc` or any anchor-specific type.
 - `cross_lang_wire` replay inside the wasm test runner.
 - Playwright CI: Chromium + Firefox against a native anchor — handshake,
   reliable round-trip, fire-and-forget loss under injected DataChannel loss,
@@ -737,6 +747,9 @@ the new optional fields).
 
 - All scenarios green on Chromium and Firefox; Safari best-effort, recorded.
 - Bundle and wasm sizes recorded; wasm ≤ 1.5 MB gzipped target.
+- A mock `ControlPlane` (in-memory, no anchor) drives the leaf through
+  handshake and one direct browser ↔ browser session in the wasm test
+  runner, proving the trait boundary is complete.
 
 ## Stage 6 — Browser ↔ browser direct, NAT conformance, telemetry, demo
 
@@ -878,6 +891,60 @@ No new dependency reaches the default build.
   Stage 5 gives it a transport.
 - Native ↔ native WebRTC.
 
+## Follow-on: serverless control plane (not in this plan)
+
+Recorded here so the v1 design keeps the door open; scoped and staged in a
+separate plan once Stage 6 lands.
+
+**What "serverless support" means.** Hosting a browser-native Net app with
+no always-on native anchor — static assets plus a serverless runtime
+(Cloudflare Workers / Durable Objects, Deno Deploy, Vercel or Netlify
+functions, Lambda). §Non-goals explains why v1 cannot: those runtimes cannot
+bind a listening UDP socket or hold ICE / DTLS / relay state alive. The
+follow-on replaces each anchor *function* with a serverless-compatible
+substitute. The data path is untouched: sessions still ride direct
+DataChannels, Noise end to end, the same wire.
+
+| Anchor function | Serverless substitute | Marginal effort after v1 |
+|---|---|---|
+| Bootstrap + ongoing signalling (§5 Layer 0, Layer 3) | One durable object per room holding a WebSocket to each tab; SDP and candidates are opaque payloads | small–medium |
+| Discovery / announcement flooding (§7) | The same object stores signed announcements; tabs subscribe. Announcements are self-authenticating (entity signature), so the store is dumb and the leaf verifies on receipt | small–medium |
+| STUN (§6) | A third-party STUN server, configured as `iceServers`. Serverless cannot answer UDP. **Policy relaxation, one config line** | trivial |
+| Relay fallback for ICE failures (§6) | Net packets over the room object's WebSocket, Noise-opaque to it; or a managed TURN. The only place a Net packet touches a WebSocket, and only for the failure case | medium |
+| Enrollment / admission (§5 Layer 0) | `net-wire` compiled to wasm inside the worker runs the enrollment handler; the delegation root lives in the platform secret store | medium–large |
+
+**Why it is additive.** `net-wire` already targets wasm, so it runs inside
+Workers as well as browsers. Signed announcements need no trusted store.
+`PeerAddr` gains a `Ws` variant used only by the leaf's control plane and
+the relay fallback. The invite / enrollment flow is unchanged. The framing
+"anchors are how browsers *find* each other" holds exactly — only the
+finder moves.
+
+**What it costs, honestly.**
+
+- The "no third-party infrastructure" goal is relaxed for STUN. Product
+  decision, not engineering.
+- The relay fallback is a deliberate exception to the "no WebSocket data
+  path" non-goal, confined to pairs ICE cannot connect. It stays
+  Noise-opaque, so the security model survives.
+- Running enrollment in a worker moves the delegation root into a platform
+  secret. Custody decision.
+- Platform limits need measuring before commitment: idle-WebSocket
+  hibernation, per-object fan-out ceilings, egress pricing on the relay
+  path, CPU budget per invocation for Noise handshakes.
+
+**Tiers and rough sizing (after Stage 6):**
+
+| Tier | Scope | Estimate |
+|---|---|---|
+| A | Serverless signalling + discovery + third-party STUN; ICE failures simply fail | ~2 weeks |
+| B | A + WebSocket relay fallback through the room object | ~2 weeks more |
+| C | B + in-worker enrollment and admission | ~2–4 weeks more |
+
+**The one v1 design hook that makes this true:** the leaf's `ControlPlane`
+trait (Stage 5). With it, every tier above is a second implementation of an
+existing boundary; without it, Tier A alone is a leaf refactor.
+
 ## Related plans
 
 - [`NAT_TRAVERSAL_PLAN.md`](NAT_TRAVERSAL_PLAN.md) /
@@ -917,3 +984,4 @@ applied in this revision:
 | — | Spikes before the wide refactor; wire split is a crate split; conformance vs deployment denominators; per-pair witness; compatibility guarantee precision; allow mechanical test edits | Stage 0; §7 / Stage 2; Goals + Stage 6; §10; Goals; Stage 1 |
 | — | Name the announcement route-learning path; `reflex_addr` carries a `SocketAddr` on the wire | §Context, §7; wire-address inventory |
 | — | 2026-09-05, product owner: serverless-only hosting is anchorless, not UDP-blocked | §Non-goals, §6 "Serverless", Stage 7 packaged anchor |
+| — | 2026-09-05, product owner: document the serverless follow-on and keep v1 open to it | §Follow-on; `ControlPlane` trait + mock-driven exit criterion in Stage 5 |
