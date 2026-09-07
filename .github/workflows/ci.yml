@@ -709,6 +709,71 @@ jobs:
           fi
           echo "selector-target org intake: self-test + inventory + anchored existence + exact per-witness runs + whole-module runs all green"
 
+      # The retained organization exact-provider DEMAND and REFRESH witnesses
+      # (`src/adapter/net/behavior/org_sensing_demand.rs`). Same discipline as
+      # the step above and for the same reason: these are `#[cfg(test)]` units,
+      # so a bare `cargo test --lib -- <filter>` that matched nothing would exit
+      # 0 and the coverage loss would be silent.
+      #
+      # The roster is DERIVED from `--list`, not asserted against a hand count:
+      # the floor is "every listed witness must run and pass, and there must be
+      # at least the ones this slice named". No future floor is inherited.
+      - name: Organization sensing demand + refresh witnesses
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          DEMAND=adapter::net::behavior::org_sensing_demand::tests
+
+          die() { echo "::error::$1"; shift; [ "$#" -gt 0 ] && printf '%s\n' "$@"; exit 1; }
+
+          # `--list` EXECUTES NOTHING, so there is no test output to inject a
+          # summary line into. Fail closed on cargo's own status.
+          if ! list=$(cargo test --lib --features "$UNIT_FEATURES" -- --list 2>&1); then
+            die "cargo test -- --list failed" "$list"
+          fi
+          listed=$(printf '%s\n' "$list" | grep -E "^${DEMAND}::[a-z0-9_]+: test\$" \
+                     | sed "s|^${DEMAND}::||; s|: test\$||" | sort -u)
+          n=$(printf '%s\n' "$listed" | grep -c . || true)
+          echo "inventory: $n witness(es) in $DEMAND"
+
+          # The invariants this slice is accountable for. Each must be present
+          # exactly once; the module may grow beyond them freely.
+          REQUIRED="only_the_last_family_owner_retires_retained_demand
+          reconciliation_preserves_the_surviving_holders_installation
+          a_refused_provider_does_not_cost_the_others_their_demand
+          a_retention_without_live_authority_retains_nothing
+          the_family_capability_bound_refuses_and_evicts_nothing
+          a_refresh_renews_without_acquiring_a_holder
+          a_refresh_never_resurrects_retired_or_superseded_demand
+          authority_replacement_refuses_a_refresh_without_downgrading
+          the_single_worker_refreshes_retained_demand_and_shutdown_closes_it"
+          required_n=$(printf '%s\n' $REQUIRED | grep -c .)
+          if [ "$n" -lt "$required_n" ]; then
+            die "expected at least $required_n witnesses in $DEMAND, listed $n" \
+                "Module: the #[cfg(test)] mod tests in" \
+                "src/adapter/net/behavior/org_sensing_demand.rs." \
+                "If witnesses were intentionally removed, remove their names here in the" \
+                "same commit — do not let the gate pass vacuously."
+          fi
+          for required in $REQUIRED; do
+            hits=$(printf '%s\n' "$listed" | grep -cE "^${required}\$" || true)
+            if [ "$hits" != "1" ]; then
+              die "required demand/refresh witness not found exactly once: $required (matched $hits)"
+            fi
+          done
+
+          # WHOLE-MODULE run, fail closed on status, and every LISTED witness
+          # must have passed — the count comes from the inventory above, so an
+          # added witness is covered without editing this step.
+          out=$(cargo test --lib --features "$UNIT_FEATURES" "${DEMAND}::" 2>&1)
+          st=$?
+          printf '%s\n' "$out"
+          [ "$st" -eq 0 ] || die "whole-module run failed for $DEMAND (cargo exit $st)"
+          if ! printf '%s\n' "$out" | grep -qE "^test result: ok\. $n passed; 0 failed;"; then
+            die "the whole-module run did not pass exactly the $n inventoried witnesses"
+          fi
+          echo "organization sensing demand + refresh: $n witness(es) listed, $required_n pinned by name, all green"
+
       # Doctests live in `///` comment blocks across `src/` and `sdk/src/`.
       # `cargo test --lib` does not execute them — they need a separate
       # `cargo test --doc` invocation. Same broad feature set so doc

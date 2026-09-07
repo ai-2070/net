@@ -6825,6 +6825,191 @@ struct OrgEgressCell {
     terminal: bool,
 }
 
+/// How many live installations one node will keep armed for refresh.
+///
+/// DERIVED, not a second bound: an armed record exists only for a live lease
+/// entry, and the registry already refuses past
+/// [`sensing::MAX_LEASED_INTERESTS`]. The explicit refusal here is the
+/// fail-closed backstop for that invariant rather than a new policy — it evicts
+/// nothing and counts the refusal.
+const MAX_SENSING_REFRESH_ARMED: usize = sensing::MAX_LEASED_INTERESTS;
+
+/// How many providers of ONE capability this node will sense at once.
+///
+/// The bound on the SENSED subset, not on the authorized candidate list: a
+/// capability may legitimately have more authorized providers than this, and
+/// the excess simply is not sensed (it stays advisory `Unknown` wherever
+/// readiness is consulted). Truncation is counted, never silent.
+pub(crate) const MAX_ORG_SENSING_POPULATION: usize = 32;
+
+/// Counters for the organization exact-provider demand and refresh lifecycle.
+///
+/// Deliberately separate from [`sensing::SensingCounters`]: those describe the
+/// sensing PLANE's intake and evaluation, these describe this node's own
+/// retained demand and its renewal, and mixing them would make neither
+/// legible.
+#[derive(Default)]
+pub(crate) struct OrgSensingDemandCounters {
+    /// Providers whose exact-provider demand was newly retained.
+    retained: AtomicU64,
+    /// Retained providers released by reconciliation or retirement.
+    released: AtomicU64,
+    /// Retentions refused because a bound was reached. Nothing was evicted.
+    refused_at_capacity: AtomicU64,
+    /// Retentions refused because this node could not derive live organization
+    /// authority for the audience.
+    refused_no_authority: AtomicU64,
+    /// Authorized populations truncated at the sensing cap.
+    truncated: AtomicU64,
+    /// Refreshes that renewed a live installation on its own plane.
+    refresh_renewed: AtomicU64,
+    /// Refreshes that found no installation at all — the demand was retired
+    /// between arming and firing.
+    refresh_absent: AtomicU64,
+    /// Refreshes that found a DIFFERENT installation under the same key. A
+    /// retired installation is never resurrected.
+    refresh_superseded: AtomicU64,
+    /// Refreshes that could not re-author on the organization plane right now
+    /// (authority replaced, revoked or poisoned). No legacy downgrade.
+    refresh_authority_refused: AtomicU64,
+    /// Refreshes whose table/emitter application refused.
+    refresh_refused: AtomicU64,
+}
+
+impl OrgSensingDemandCounters {
+    /// One provider's exact-provider demand was newly retained.
+    pub(crate) fn note_retained(&self) {
+        self.retained.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One retained provider's demand was released.
+    pub(crate) fn note_released(&self) {
+        self.released.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A retention was refused at a bound; nothing was evicted.
+    pub(crate) fn note_at_capacity(&self) {
+        self.refused_at_capacity.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A retention could not be authored under live organization authority.
+    pub(crate) fn note_no_authority(&self) {
+        self.refused_no_authority.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The observable organization sensing demand/refresh state.
+#[cfg(any(test, feature = "fixtures"))]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OrgSensingDemandState {
+    /// Providers newly retained.
+    pub retained: u64,
+    /// Retained providers released.
+    pub released: u64,
+    /// Retentions refused at a bound.
+    pub refused_at_capacity: u64,
+    /// Retentions refused for want of live organization authority.
+    pub refused_no_authority: u64,
+    /// Authorized populations truncated at the sensing cap.
+    pub truncated: u64,
+    /// Refreshes that renewed a live installation.
+    pub refresh_renewed: u64,
+    /// Refreshes that found no installation.
+    pub refresh_absent: u64,
+    /// Refreshes that found a different installation for the key.
+    pub refresh_superseded: u64,
+    /// Refreshes refused by current organization authority.
+    pub refresh_authority_refused: u64,
+    /// Refreshes whose application refused.
+    pub refresh_refused: u64,
+    /// Installations currently armed for refresh.
+    pub armed: u64,
+    /// Whether the refresh worker exists.
+    pub worker_started: bool,
+    /// Whether the refresh schedule has reached its terminal state.
+    pub terminal: bool,
+}
+
+/// One armed refresh record.
+///
+/// Keyed by the lease key, identified by the INSTALLATION it was armed for. The
+/// installation id is what makes a fired refresh unable to renew a successor:
+/// a final release plus a same-key re-acquisition produces a fresh id, so the
+/// stale record's effect refuses instead of resurrecting retired demand.
+struct ArmedRefresh {
+    deadline: Instant,
+    seq: u64,
+    installation_id: sensing::LeaseToken,
+    period: Duration,
+}
+
+/// THE node-owned refresh schedule: one due-set, one worker, no timer per
+/// lease.
+///
+/// Deadlines are absolute [`Instant`]s, so a sub-second period arms exactly
+/// rather than rounding to a whole second, and an EARLIER deadline inserted
+/// while the worker is parked re-arms it (the worker parks on
+/// `sleep_until(earliest)` raced against the wake).
+struct SensingRefreshState {
+    /// Deadline-ordered index. `(deadline, seq)` is total, so two records with
+    /// the same instant keep a stable order and neither is lost.
+    due: std::collections::BTreeMap<(Instant, u64), sensing::SensingLeaseKey>,
+    /// The armed record per key — at most one, so re-arming replaces rather
+    /// than accumulates.
+    armed: HashMap<sensing::SensingLeaseKey, ArmedRefresh>,
+    next_seq: u64,
+    /// The single worker, retained so teardown can join it.
+    worker: Option<tokio::task::JoinHandle<()>>,
+    /// Set by node teardown. Nothing is armed and no worker is spawned after
+    /// this, and the worker exits.
+    terminal: bool,
+}
+
+impl SensingRefreshState {
+    fn insert(&mut self, key: sensing::SensingLeaseKey, record: ArmedRefresh) {
+        if let Some(previous) = self.armed.insert(key, record) {
+            self.due.remove(&(previous.deadline, previous.seq));
+        }
+        let armed = &self.armed[&key];
+        self.due.insert((armed.deadline, armed.seq), key);
+    }
+
+    fn remove(&mut self, key: &sensing::SensingLeaseKey) -> Option<ArmedRefresh> {
+        let previous = self.armed.remove(key)?;
+        self.due.remove(&(previous.deadline, previous.seq));
+        Some(previous)
+    }
+
+    /// The earliest armed deadline, if any.
+    fn earliest(&self) -> Option<(Instant, u64, sensing::SensingLeaseKey)> {
+        self.due
+            .iter()
+            .next()
+            .map(|((deadline, seq), key)| (*deadline, *seq, *key))
+    }
+}
+
+/// What one refresh of a live installation resolved to.
+///
+/// Only the first three variants keep the cadence armed. `Absent` and
+/// `Superseded` deliberately retire the record: the demand is gone or has been
+/// replaced, and re-arming either would be resurrecting retired demand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SensingRefreshOutcome {
+    /// The installation was renewed on its own plane.
+    Renewed,
+    /// The organization plane could not be re-authored right now (authority
+    /// replaced, revoked or poisoned). No legacy downgrade.
+    AuthorityUnavailable,
+    /// The table/emitter application refused; pre-refresh state stands.
+    Refused,
+    /// No installation exists for the key any more.
+    Absent,
+    /// A live installation exists for the key, but a DIFFERENT one.
+    Superseded,
+}
+
 /// LEGACY sensing frame send — unchanged. Builds synchronously, then spawns one
 /// task per datagram. Two spawned sends race, so this does NOT order what the
 /// peer observes; legacy soft-state refresh is what repairs a stale final state
@@ -9961,6 +10146,15 @@ pub struct MeshNode {
     /// Fixtures-only ASYNC lifecycle gate, cloned into the egress at spawn.
     #[cfg(any(test, feature = "fixtures"))]
     org_egress_lifecycle_gate: OrgEgressLifecycleGateSlot,
+    /// THE node-owned exact-provider refresh schedule: one bounded due-set and
+    /// one lazily spawned worker, never a timer per lease or per family.
+    sensing_refresh: parking_lot::Mutex<SensingRefreshState>,
+    /// Wakes the refresh worker when an EARLIER deadline is armed while it is
+    /// parked, and when the schedule closes. `Notify::notify_one` stores a
+    /// permit with no waiter registered, so an arm cannot be lost.
+    sensing_refresh_wake: Arc<tokio::sync::Notify>,
+    /// Organization exact-provider demand and refresh counters.
+    org_sensing_demand_counters: Arc<OrgSensingDemandCounters>,
     /// In-crate witness seam: fires after a release's authority preparation has
     /// succeeded and BEFORE the final currentness application.
     ///
@@ -11850,6 +12044,15 @@ impl MeshNode {
             org_egress_lifecycle_seam: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(any(test, feature = "fixtures"))]
             org_egress_lifecycle_gate: Arc::new(parking_lot::Mutex::new(None)),
+            sensing_refresh: parking_lot::Mutex::new(SensingRefreshState {
+                due: std::collections::BTreeMap::new(),
+                armed: HashMap::new(),
+                next_seq: 0,
+                worker: None,
+                terminal: false,
+            }),
+            sensing_refresh_wake: Arc::new(tokio::sync::Notify::new()),
+            org_sensing_demand_counters: Arc::new(OrgSensingDemandCounters::default()),
             #[cfg(test)]
             sensing_release_pre_apply_seam: parking_lot::Mutex::new(None),
             #[cfg(test)]
@@ -13640,6 +13843,480 @@ impl MeshNode {
         // the transition order still held.
         self.commit_transition_phase_two(pending, plan);
         Ok(())
+    }
+
+    /// RENEW one live exact-provider installation. Mints nothing, records no
+    /// holder, and can never resurrect retired demand.
+    ///
+    /// Refresh is a distinct operation, not an acquisition:
+    /// [`Self::acquire_sensing_interest_lease`] always reserves an identity and
+    /// records a holder, so renewing through it would add a holder every period
+    /// until `MAX_HOLDERS_PER_INTEREST` refused — and long before that the
+    /// final release would stop deregistering, because holders would remain.
+    /// So this reads the registry`s refresh view, checks the INSTALLATION identity
+    /// it was armed for, and re-applies the registry's own stored spec at the
+    /// registry's own installed cadence.
+    ///
+    /// # Ordering and authority
+    ///
+    /// Phase 0 (off every sensing lock) reads the view and, on the organization
+    /// plane, performs a FRESH authority capture — the same
+    /// [`Self::prepare_org_egress`] the acquisition uses, so a replaced,
+    /// revoked or poisoned authority refuses here rather than re-emitting under
+    /// a stale certificate, and there is no legacy downgrade. The identity is
+    /// then RE-CHECKED under `sensing_lease_apply_mu`, because a final release
+    /// can land in the capture window; that recheck is what makes a fired
+    /// refresh unable to renew a successor installation.
+    pub(crate) fn refresh_sensing_interest_lease(
+        &self,
+        key: &sensing::SensingLeaseKey,
+        installation_id: sensing::LeaseToken,
+    ) -> SensingRefreshOutcome {
+        let (audience, provider) = match key {
+            sensing::SensingLeaseKey::ExactProvider {
+                audience, provider, ..
+            } => (*audience, *provider),
+            // Provider-free demand is not lit; it has no refresh owner here.
+            sensing::SensingLeaseKey::ProviderFree { .. } => {
+                return SensingRefreshOutcome::Absent;
+            }
+        };
+        // PHASE 0 — off every sensing lock.
+        let Some(view) = self.sensing_interest_leases.refresh_view(key) else {
+            self.org_sensing_demand_counters
+                .refresh_absent
+                .fetch_add(1, Ordering::Relaxed);
+            return SensingRefreshOutcome::Absent;
+        };
+        if view.installation_id() != installation_id {
+            self.org_sensing_demand_counters
+                .refresh_superseded
+                .fetch_add(1, Ordering::Relaxed);
+            return SensingRefreshOutcome::Superseded;
+        }
+        let holders_before = view.holders();
+        let org_prepared = match view.plane() {
+            sensing::LeasePlane::Legacy => None,
+            sensing::LeasePlane::Organization => {
+                match self.prepare_org_egress(&audience, view.spec(), provider) {
+                    Ok(Some(prepared)) => Some(prepared),
+                    // `Ok(None)` is "this is not our organization's audience any
+                    // more"; `Err` is any other authority unavailability. Both
+                    // stop the renewal on its own plane rather than downgrading.
+                    Ok(None) | Err(_) => {
+                        self.org_sensing_demand_counters
+                            .refresh_authority_refused
+                            .fetch_add(1, Ordering::Relaxed);
+                        return SensingRefreshOutcome::AuthorityUnavailable;
+                    }
+                }
+            }
+        };
+        let ordered = org_prepared.is_some();
+        let _order = ordered.then(|| self.org_transition_mu.lock());
+        let _apply = SensingGuard::new(
+            self.sensing_lease_apply_mu.lock(),
+            SensingGuardKind::LeaseApply,
+        );
+        // THE IDENTITY RECHECK, under the apply guard: a final release could
+        // have retired this installation while the capture above ran.
+        let Some(current) = self.sensing_interest_leases.refresh_view(key) else {
+            drop(_apply);
+            self.org_sensing_demand_counters
+                .refresh_absent
+                .fetch_add(1, Ordering::Relaxed);
+            return SensingRefreshOutcome::Absent;
+        };
+        if current.installation_id() != installation_id {
+            drop(_apply);
+            self.org_sensing_demand_counters
+                .refresh_superseded
+                .fetch_add(1, Ordering::Relaxed);
+            return SensingRefreshOutcome::Superseded;
+        }
+        // The registry's OWN spec and cadence — never a caller's copy.
+        let action = sensing::LeaseAction::Reregister {
+            spec: Arc::clone(current.spec()),
+            interval: current.installed_interval(),
+        };
+        let org_egress = org_prepared
+            .as_ref()
+            .map(|(plan, snapshot)| OrgLeaseEgress { plan, snapshot });
+        let plan = org_egress.as_ref().map(|egress| egress.plan);
+        let applied = self.apply_sensing_lease_action(*key, action, org_egress.as_ref(), ordered);
+        let pending = match applied.verdict {
+            Ok(pending) => pending,
+            Err(error) => {
+                drop(_apply);
+                self.org_sensing_demand_counters
+                    .refresh_refused
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    provider = format!("{:#x}", provider),
+                    %error,
+                    "sensing refresh: renewal refused; the installation keeps its \
+                     pre-refresh state"
+                );
+                return SensingRefreshOutcome::Refused;
+            }
+        };
+        // The registry is untouched by a refresh — that is the whole point.
+        debug_assert_eq!(
+            self.sensing_interest_leases
+                .refresh_view(key)
+                .map(|view| view.holders()),
+            Some(holders_before),
+            "a refresh changed the holder count; it must renew, never acquire"
+        );
+        drop(_apply);
+        self.commit_transition_phase_two(pending, plan);
+        self.org_sensing_demand_counters
+            .refresh_renewed
+            .fetch_add(1, Ordering::Relaxed);
+        SensingRefreshOutcome::Renewed
+    }
+
+    /// ARM (or re-arm) `key`'s installation for refresh at `now + period`.
+    ///
+    /// Takes the node by `Arc` deliberately: the worker holds a `Weak` back to
+    /// it, so the schedule can never keep the node alive, and no
+    /// `self_weak`-style start-time wiring is required for the demand path to
+    /// work. Returns `false` when the schedule is terminal or at its bound —
+    /// nothing is evicted either way.
+    pub(crate) fn arm_sensing_refresh(
+        node: &Arc<MeshNode>,
+        key: sensing::SensingLeaseKey,
+        installation_id: sensing::LeaseToken,
+        period: Duration,
+    ) -> bool {
+        let mut schedule = node.sensing_refresh.lock();
+        if schedule.terminal {
+            return false;
+        }
+        // The bound is checked BEFORE the mutation and only for a key that is
+        // not already armed: re-arming a live installation spends no budget.
+        if !schedule.armed.contains_key(&key) && schedule.armed.len() >= MAX_SENSING_REFRESH_ARMED {
+            node.org_sensing_demand_counters
+                .refused_at_capacity
+                .fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        let seq = schedule.next_seq;
+        schedule.next_seq = schedule.next_seq.wrapping_add(1);
+        let deadline = Instant::now() + period;
+        let earliest_before = schedule.earliest().map(|(deadline, _, _)| deadline);
+        schedule.insert(
+            key,
+            ArmedRefresh {
+                deadline,
+                seq,
+                installation_id,
+                period,
+            },
+        );
+        if schedule.worker.is_none() {
+            let weak = Arc::downgrade(node);
+            let wake = node.sensing_refresh_wake.clone();
+            schedule.worker = Some(tokio::spawn(Self::run_sensing_refresh(weak, wake)));
+        }
+        let rearm = earliest_before.is_none_or(|previous| deadline < previous);
+        drop(schedule);
+        if rearm {
+            // An EARLIER deadline than the one the worker is parked on. Waking
+            // it is what turns "one worker, absolute deadlines" into correct
+            // deadline precision instead of a missed period.
+            node.sensing_refresh_wake.notify_one();
+        }
+        true
+    }
+
+    /// DISARM `key`. Idempotent, and the only way an armed record leaves the
+    /// schedule other than firing or terminal closure.
+    pub(crate) fn disarm_sensing_refresh(&self, key: &sensing::SensingLeaseKey) {
+        self.sensing_refresh.lock().remove(key);
+    }
+
+    /// THE single refresh worker. One task for the whole node.
+    ///
+    /// Parks on the EARLIEST absolute deadline raced against the wake, so an
+    /// earlier arm shortens the park instead of being missed, and a sub-second
+    /// period is honoured exactly rather than rounded to a whole second.
+    ///
+    /// The schedule guard is converted to a decision and RELEASED before any
+    /// await: a `parking_lot` guard held across a yield point would both make
+    /// this future non-`Send` and block every arm for the length of a park.
+    async fn run_sensing_refresh(node: std::sync::Weak<MeshNode>, wake: Arc<tokio::sync::Notify>) {
+        /// What the schedule says to do next. Computed under the guard,
+        /// executed after it.
+        enum Step {
+            /// This installation is due; its record has been taken out.
+            Fire(sensing::SensingLeaseKey, ArmedRefresh),
+            /// Park until this absolute deadline, or until an earlier arm.
+            Park(Instant),
+            /// Nothing armed; park until something is.
+            Idle,
+            /// Terminal.
+            Stop,
+        }
+        loop {
+            let Some(live) = node.upgrade() else { return };
+            let step = {
+                let mut schedule = live.sensing_refresh.lock();
+                if schedule.terminal {
+                    Step::Stop
+                } else {
+                    match schedule.earliest() {
+                        None => Step::Idle,
+                        Some((deadline, _, key)) if deadline <= Instant::now() => {
+                            // Take the record OUT before the guard is released:
+                            // the effect runs off it, and a successful renewal
+                            // re-arms below.
+                            match schedule.remove(&key) {
+                                Some(record) => Step::Fire(key, record),
+                                None => Step::Idle,
+                            }
+                        }
+                        Some((deadline, _, _)) => Step::Park(deadline),
+                    }
+                }
+            };
+            match step {
+                Step::Stop => return,
+                Step::Park(deadline) => {
+                    // Drop the node handle across the park: an idle or parked
+                    // worker must never be what keeps the node alive.
+                    drop(live);
+                    let sleep = tokio::time::sleep_until(deadline.into());
+                    tokio::pin!(sleep);
+                    tokio::select! {
+                        _ = &mut sleep => {}
+                        _ = wake.notified() => {}
+                    }
+                }
+                Step::Idle => {
+                    drop(live);
+                    wake.notified().await;
+                }
+                Step::Fire(key, record) => {
+                    // OFF the schedule lock: the effect takes sensing locks and
+                    // may emit.
+                    let outcome = live.refresh_sensing_interest_lease(&key, record.installation_id);
+                    if matches!(
+                        outcome,
+                        SensingRefreshOutcome::Renewed
+                            | SensingRefreshOutcome::Refused
+                            | SensingRefreshOutcome::AuthorityUnavailable
+                    ) {
+                        // A live installation for this identity still exists, so
+                        // keep the cadence — an authority outage must not
+                        // permanently stop refresh once authority returns.
+                        // `Absent`/`Superseded` deliberately do NOT re-arm: the
+                        // demand is retired or replaced, and re-arming either
+                        // would be exactly the resurrection this refuses.
+                        MeshNode::arm_sensing_refresh(
+                            &live,
+                            key,
+                            record.installation_id,
+                            record.period,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Enter the schedule's TERMINAL state and join its worker within the same
+    /// bounded grace the ordered egress uses.
+    ///
+    /// After this returns nothing can be armed and no worker exists, so no
+    /// refresh can emit for a node that is gone.
+    async fn close_sensing_refresh(&self) {
+        let worker = {
+            let mut schedule = self.sensing_refresh.lock();
+            schedule.terminal = true;
+            schedule.due.clear();
+            schedule.armed.clear();
+            schedule.worker.take()
+        };
+        self.sensing_refresh_wake.notify_waiters();
+        self.sensing_refresh_wake.notify_one();
+        if let Some(mut worker) = worker {
+            if tokio::time::timeout(ORG_EGRESS_DRAIN_GRACE, &mut worker)
+                .await
+                .is_err()
+            {
+                worker.abort();
+                // Settlement, not just cancellation.
+                let _ = (&mut worker).await;
+            }
+        }
+    }
+
+    /// Close and abort the refresh worker WITHOUT awaiting — the destructor
+    /// path, explicitly best-effort exactly like the egress'.
+    fn close_sensing_refresh_detached(&self) {
+        let worker = {
+            let mut schedule = self.sensing_refresh.lock();
+            schedule.terminal = true;
+            schedule.due.clear();
+            schedule.armed.clear();
+            schedule.worker.take()
+        };
+        self.sensing_refresh_wake.notify_waiters();
+        if let Some(worker) = worker {
+            worker.abort();
+        }
+    }
+
+    /// The AUTHORIZED sensing population for one owner-scoped capability: the
+    /// node ids of providers this node has verified private discovery for.
+    ///
+    /// Authority comes from the verified owner-private discovery plane
+    /// ([`Self::owner_private_capability_providers`]) — every candidate was
+    /// admitted by `verify_scoped_ingest` and is filtered here for expiry and
+    /// revocation-floor currentness. Nothing about the population is caller
+    /// supplied, and GRANTED-audience providers are deliberately excluded: a
+    /// cross-org grant confers invocation authority, never membership in this
+    /// node's own organization sensing audience.
+    ///
+    /// An entity is projected to a node id through the TOFU pin map, so a
+    /// provider that has never been pinned on a session simply is not in the
+    /// population — discovery is not reachability. Bounded by
+    /// [`MAX_ORG_SENSING_POPULATION`]; truncation is counted, not silent.
+    ///
+    /// Discovery is NOT authority: a member of this population still admits a
+    /// caller only on a valid per-call organization proof.
+    pub(crate) fn org_sensing_authorized_population(
+        &self,
+        capability: &super::behavior::org_grant::CapabilityAuthorityId,
+    ) -> Vec<u64> {
+        let authorized: std::collections::BTreeSet<EntityId> = self
+            .owner_private_capability_providers(capability)
+            .into_iter()
+            .map(|candidate| candidate.provider)
+            .collect();
+        if authorized.is_empty() {
+            return Vec::new();
+        }
+        // Snapshot the pin pairs FIRST so no `peer_entity_ids` iteration guard
+        // is held while the population is assembled (the idiom the session-row
+        // builders already use).
+        let pinned: Vec<(u64, EntityId)> = self
+            .peer_entity_ids
+            .iter()
+            .map(|entry| (*entry.key(), entry.value().clone()))
+            .collect();
+        let mut population: Vec<u64> = pinned
+            .into_iter()
+            .filter(|(_, entity)| authorized.contains(entity))
+            .map(|(node, _)| node)
+            .collect();
+        // A locally served owner-scoped capability makes THIS node a legitimate
+        // exact provider; the self-provider sensing path already exists.
+        if authorized.contains(self.entity_id()) {
+            population.push(self.node_id);
+        }
+        population.sort_unstable();
+        population.dedup();
+        if population.len() > MAX_ORG_SENSING_POPULATION {
+            population.truncate(MAX_ORG_SENSING_POPULATION);
+            self.org_sensing_demand_counters
+                .truncated
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        population
+    }
+
+    /// The INSTALLATION identity currently live for `key`, if any — what a
+    /// refresh must be armed against.
+    pub(crate) fn sensing_refresh_installation(
+        &self,
+        key: &sensing::SensingLeaseKey,
+    ) -> Option<sensing::LeaseToken> {
+        self.sensing_interest_leases
+            .refresh_view(key)
+            .map(|view| view.installation_id())
+    }
+
+    /// The refresh period: half this node's soft-state horizon, so a renewal
+    /// lands before the provider's row can expire even if one is missed.
+    ///
+    /// Kept as a `Duration` and armed as an ABSOLUTE deadline, so a sub-second
+    /// horizon arms at sub-second precision instead of rounding to a whole
+    /// second.
+    pub(crate) fn sensing_refresh_period(&self) -> Duration {
+        self.config.sensing_interest_ttl / 2
+    }
+
+    /// This node's soft-state horizon for sensing rows — the ceiling the
+    /// retained-demand cadence is clamped to, so the fixed internal interval
+    /// can never exceed the ttl the acquisition path would refuse it against.
+    pub(crate) fn sensing_interest_ttl(&self) -> Duration {
+        self.config.sensing_interest_ttl
+    }
+
+    /// Whether a previously-captured sensing authority STAMP is still the live
+    /// view. The stamp-only sibling of
+    /// [`Self::sensing_authority_snapshot_current`], for a retained demand that
+    /// kept the epoch rather than the whole pinned snapshot.
+    pub(crate) fn sensing_authority_stamp_is_current(
+        &self,
+        stamp: &sensing::SensingAuthorityStamp,
+    ) -> bool {
+        sensing::capture_current_sensing_stamp(
+            &self.org_install,
+            &self.node_authority,
+            &self.org_revocation,
+            &self.org_install_generation,
+        )
+        .is_some_and(|current| stamp.is_current(&current))
+    }
+
+    /// The node's sensing lease registry (fixtures/tests only) — the retained
+    /// demand witnesses read holder counts and installation identity through
+    /// it rather than being handed them by the demand container.
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn sensing_interest_leases_for_test(&self) -> &sensing::SensingInterestLeases {
+        &self.sensing_interest_leases
+    }
+
+    /// Remove this node's installed organization authority (fixtures/tests
+    /// only), so a witness can drive the authority-loss fence without a real
+    /// revocation ceremony.
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn clear_node_authority_for_test(&self) {
+        self.node_authority.store(None);
+    }
+
+    /// Demand/refresh counters, shared with the family container.
+    pub(crate) fn org_sensing_demand_counters(&self) -> &Arc<OrgSensingDemandCounters> {
+        &self.org_sensing_demand_counters
+    }
+
+    /// The organization sensing demand/refresh counters and schedule state, for
+    /// witnesses and diagnostics. Read-only.
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn org_sensing_demand_state_for_test(&self) -> OrgSensingDemandState {
+        let counters = &self.org_sensing_demand_counters;
+        let schedule = self.sensing_refresh.lock();
+        OrgSensingDemandState {
+            retained: counters.retained.load(Ordering::Relaxed),
+            released: counters.released.load(Ordering::Relaxed),
+            refused_at_capacity: counters.refused_at_capacity.load(Ordering::Relaxed),
+            refused_no_authority: counters.refused_no_authority.load(Ordering::Relaxed),
+            truncated: counters.truncated.load(Ordering::Relaxed),
+            refresh_renewed: counters.refresh_renewed.load(Ordering::Relaxed),
+            refresh_absent: counters.refresh_absent.load(Ordering::Relaxed),
+            refresh_superseded: counters.refresh_superseded.load(Ordering::Relaxed),
+            refresh_authority_refused: counters.refresh_authority_refused.load(Ordering::Relaxed),
+            refresh_refused: counters.refresh_refused.load(Ordering::Relaxed),
+            armed: schedule.armed.len() as u64,
+            worker_started: schedule.worker.is_some(),
+            terminal: schedule.terminal,
+        }
     }
 
     /// [`Self::prepare_org_egress`] for a release, where the interest spec is
@@ -16469,7 +17146,6 @@ impl MeshNode {
     /// authority view under the `org_install` publication lock — the org
     /// registration gate validates against it and rechecks its stamp before
     /// mutation ([`Self::sensing_authority_snapshot_current`]).
-    #[allow(dead_code)]
     pub(crate) fn capture_sensing_authority_snapshot(
         &self,
     ) -> Result<sensing::SensingAuthoritySnapshot, sensing::SensingAuthorityUnavailable> {
@@ -19752,12 +20428,11 @@ impl MeshNode {
 
     /// Mint a routing clone family over this node's registry.
     ///
-    /// The consumer that will hold demand handles is the WARMED-CALL path, which
-    /// is deliberately outside the OLB-2B entry boundary (Kyra) — so this seam has
-    /// no in-crate production caller yet, and that is the reviewed scope decision
-    /// rather than a missing consumer. The allow is scoped to exactly these two
-    /// methods; it is NOT a module-wide or per-slice allowance.
-    #[allow(dead_code)]
+    /// The in-crate consumer is now
+    /// [`OrgSensingFamily::mint`](super::behavior::org_sensing_demand::OrgSensingFamily::mint):
+    /// retained exact-provider sensing demand holds one family for the lifetime
+    /// of a binding, so the registry's family bound accounts for it. The
+    /// warmed-call demand-handle consumer is still outside this boundary.
     pub(crate) fn org_routing_family(
         &self,
     ) -> Result<
@@ -38084,6 +38759,13 @@ impl Adapter for MeshNode {
         // successor node can mint.
         self.join_org_routing_supervisor().await;
 
+        // The refresh schedule is closed and JOINED BEFORE the egress: a
+        // refresh in flight would otherwise enqueue a datagram behind a
+        // consumer this call is about to retire, and an armed record would
+        // keep firing against a node that is shutting down. Nothing can be
+        // armed and no worker exists once this returns.
+        self.close_sensing_refresh().await;
+
         // The ordered organization egress is node-owned: enter the TERMINAL
         // lifecycle state (so no later transition can create a first consumer
         // behind this call), then close it so its single consumer drains and
@@ -38174,6 +38856,11 @@ impl Drop for MeshNode {
         if let Some(handle) = self.routing_task.lock().take() {
             handle.abort();
         }
+        // The refresh worker holds only a `Weak` to this node, so it cannot
+        // keep it alive — but it can still be parked on a deadline. Close the
+        // schedule and abort it, best-effort, exactly like the egress below.
+        self.close_sensing_refresh_detached();
+
         // Same best-effort treatment for the ordered organization egress: a
         // destructor cannot await, and silently dropping the handle would merely
         // DETACH the consumer, leaving it sending over a node that is gone. It
