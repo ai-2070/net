@@ -77,9 +77,21 @@ const MAX_LEASED_INTERESTS: usize = 256;
 /// acquisition mints its own token.
 const MAX_HOLDERS_PER_INTEREST: usize = 64;
 
+/// The reserved end of the holder-token identity space.
+///
+/// [`LeaseToken`] identity is TERMINAL (D4.8): a token names one acquisition
+/// for the life of the process and is never reused. The allocator is therefore
+/// a checked counter with `u64::MAX` reserved as an exhaustion SENTINEL rather
+/// than a value — `next_token == LEASE_TOKEN_SPACE_END` means "no identity
+/// left", so the space cannot wrap and a stale ticket can never name a
+/// same-key successor.
+const LEASE_TOKEN_SPACE_END: u64 = u64::MAX;
+
 /// Why a lease acquisition was refused. Deterministic and state-free: a refused
-/// acquisition mints no token and mutates nothing, so the caller sees exactly
-/// the pre-call registry.
+/// acquisition mutates no registry state, so the caller sees exactly the
+/// pre-call registry. A capacity refusal also reserves no identity; an
+/// [`IdentityExhausted`](LeaseRefused::IdentityExhausted) refusal is by
+/// definition the state where no identity is left to reserve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeaseRefused {
     /// The node already leases `MAX_LEASED_INTERESTS` distinct interests. A
@@ -87,6 +99,14 @@ pub enum LeaseRefused {
     NodeAtCapacity,
     /// This interest already has `MAX_HOLDERS_PER_INTEREST` live holders.
     InterestAtCapacity,
+    /// The terminal holder-token identity space is exhausted, so no further
+    /// acquisition can be given a NEVER-REUSED identity.
+    ///
+    /// Terminal and node-global: every later acquisition on this node refuses
+    /// too. Incumbent holders keep their registrations, their aggregate cadence
+    /// and their rows, and their tickets still perform a terminal
+    /// deregistration — this refuses to MINT, it does not retract.
+    IdentityExhausted,
 }
 
 /// Transactional counters for [`SensingInterestLeases`].
@@ -121,11 +141,17 @@ struct LeaseMetrics {
     /// refused to restore the surviving holders' aggregate. The entry is dropped
     /// rather than left claiming an installed row that no longer exists.
     installations_invalidated: AtomicU64,
+    /// Acquisitions refused because the terminal token identity space was
+    /// exhausted. Nothing was reserved and nothing moved.
+    refused_identity_exhausted: AtomicU64,
 }
 
-/// Opaque per-holder token. The registry's crate-private acquisition commit
-/// returns one; [`SensingInterestLeases::release`] consumes it via the ticket.
-/// Node-local; never on the wire.
+/// Opaque per-holder token, TERMINAL for the life of the process: the
+/// allocator hands each acquisition a distinct value and never reuses or wraps
+/// one — the top of the space is a reserved exhaustion sentinel rather than a
+/// value. Reserved by the acquisition PREVIEW and recorded by its commit;
+/// [`SensingInterestLeases::release`] consumes it via the ticket. Node-local;
+/// never on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LeaseToken(u64);
 
@@ -202,7 +228,14 @@ enum AcquireTransition {
 
 /// A previewed acquisition: everything
 /// [`SensingInterestLeases::commit_acquire`] will do, computed without mutating
-/// anything.
+/// any registry state.
+///
+/// It DOES carry a reserved terminal identity ([`LeaseToken`]). Reserving in
+/// the preview is what makes identity exhaustion detectable BEFORE any
+/// interest-table or emitter mutation: a transaction that cannot be named must
+/// refuse without having touched the wire. The reservation is monotone, so a
+/// preview whose application then fails burns that one value and no other
+/// holder is affected.
 pub(crate) struct PreviewedAcquire {
     key: SensingLeaseKey,
     /// This holder's requested interval.
@@ -215,6 +248,9 @@ pub(crate) struct PreviewedAcquire {
     /// caller's promoted to an `Arc` for a new one.
     spec: Arc<InterestSpec>,
     transition: AcquireTransition,
+    /// The terminal identity reserved for this acquisition, recorded verbatim
+    /// by the commit. Never re-derived, so commit cannot mint a second value.
+    token: LeaseToken,
 }
 
 impl PreviewedAcquire {
@@ -261,13 +297,19 @@ impl PreviewedAcquire {
 
 /// A held sensing-interest lease reference (OLB-0). Returned by
 /// [`MeshNode::acquire_sensing_interest_lease`]; hand it back to
-/// [`MeshNode::release_sensing_interest_lease`] exactly once (an SDK RAII
-/// guard does that on drop). Opaque outside the crate, and self-describing —
-/// release needs nothing else, so the wire identity can never diverge from a
-/// caller's re-supplied arguments.
+/// [`MeshNode::try_release_sensing_interest_lease`] — or to the
+/// unit-returning [`MeshNode::release_sensing_interest_lease`] — exactly once
+/// (an SDK RAII guard does that on drop). Opaque outside the crate, and
+/// self-describing — release needs nothing else, so the wire identity can never
+/// diverge from a caller's re-supplied arguments.
+///
+/// `Copy`, deliberately: a REFUSED organization release hands the still-live
+/// ticket back, and a caller that retained its own copy may retry with either.
 ///
 /// [`MeshNode::acquire_sensing_interest_lease`]:
 ///     crate::adapter::net::MeshNode::acquire_sensing_interest_lease
+/// [`MeshNode::try_release_sensing_interest_lease`]:
+///     crate::adapter::net::MeshNode::try_release_sensing_interest_lease
 /// [`MeshNode::release_sensing_interest_lease`]:
 ///     crate::adapter::net::MeshNode::release_sensing_interest_lease
 #[derive(Debug, Clone, Copy)]
@@ -322,13 +364,46 @@ struct LeaseEntry {
 #[derive(Default)]
 pub struct SensingInterestLeases {
     entries: Mutex<HashMap<SensingLeaseKey, LeaseEntry>>,
+    /// The next unreserved holder identity. Advanced by CHECKED terminal
+    /// allocation ([`SensingInterestLeases::reserve_token`]) — never
+    /// `fetch_add`, which wraps `u64::MAX` back to `0` and would let a stale
+    /// ticket release a same-key successor.
     next_token: AtomicU64,
     metrics: LeaseMetrics,
 }
 
 impl SensingInterestLeases {
-    fn mint_token(&self) -> LeaseToken {
-        LeaseToken(self.next_token.fetch_add(1, Ordering::Relaxed))
+    /// Reserve the next TERMINAL holder identity, or refuse.
+    ///
+    /// Checked, not `fetch_add`: `LEASE_TOKEN_SPACE_END` is a reserved
+    /// sentinel, never a handed-out value, so the counter saturates there
+    /// instead of wrapping to `0`. Once saturated the state is terminal —
+    /// every later reservation refuses with
+    /// [`LeaseRefused::IdentityExhausted`], and no value is ever issued twice.
+    ///
+    /// `compare_exchange_weak` rather than `fetch_update` so the exhaustion
+    /// verdict is re-read from the CAS's own observed value on every retry: two
+    /// racing reservations at the last legal slot must produce exactly one
+    /// token and one refusal.
+    fn reserve_token(&self) -> Result<LeaseToken, LeaseRefused> {
+        let mut current = self.next_token.load(Ordering::Acquire);
+        loop {
+            if current == LEASE_TOKEN_SPACE_END {
+                self.metrics
+                    .refused_identity_exhausted
+                    .fetch_add(1, Ordering::AcqRel);
+                return Err(LeaseRefused::IdentityExhausted);
+            }
+            match self.next_token.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(LeaseToken(current)),
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     /// PREVIEW one acquisition of the interest `key` at the requested
@@ -347,10 +422,13 @@ impl SensingInterestLeases {
     /// commit, and every registry mutation on this node runs under it — the same
     /// argument [`preview_release`](Self::preview_release) rests on.
     ///
-    /// Refuses fail-closed at either bound (review-pass-2 §6). A refusal is
-    /// TOTAL: no token is minted, no registration is recorded, the installed
-    /// cadence does not move even for a would-be-stricter holder, and no live
-    /// interest is evicted to make room.
+    /// Refuses fail-closed at either bound (review-pass-2 §6) and at identity
+    /// exhaustion (D4.8). A CAPACITY refusal is TOTAL: no identity is reserved,
+    /// no registration is recorded, the installed cadence does not move even
+    /// for a would-be-stricter holder, and no live interest is evicted to make
+    /// room. Identity is reserved only AFTER both bounds admit, and reserving
+    /// it here — rather than in the commit — is what makes exhaustion refuse
+    /// before the caller has touched the interest table or the emitter.
     ///
     /// `plane` is the authority plane the CALLER can establish this lease under.
     /// It is recorded only on the establishing (vacant) acquisition; an existing
@@ -373,6 +451,7 @@ impl SensingInterestLeases {
                     .fetch_add(1, Ordering::AcqRel);
                 return Err(LeaseRefused::NodeAtCapacity);
             }
+            let token = self.reserve_token()?;
             return Ok(PreviewedAcquire {
                 key,
                 interval,
@@ -382,6 +461,7 @@ impl SensingInterestLeases {
                 // so the spec is cloned exactly once across both halves.
                 spec: Arc::new(spec.clone()),
                 transition: AcquireTransition::Establish,
+                token,
             });
         };
         if entry.registrations.len() >= MAX_HOLDERS_PER_INTEREST {
@@ -400,6 +480,7 @@ impl SensingInterestLeases {
         } else {
             AcquireTransition::Unchanged
         };
+        let token = self.reserve_token()?;
         Ok(PreviewedAcquire {
             key,
             interval,
@@ -410,15 +491,17 @@ impl SensingInterestLeases {
             // for an existing key. Refcount bump only.
             spec: Arc::clone(&entry.spec),
             transition,
+            token,
         })
     }
 
-    /// COMMIT a previewed acquisition, recording the holder.
+    /// COMMIT a previewed acquisition, recording the holder under the identity
+    /// the preview reserved.
     ///
-    /// Infallible by construction: the preview proved both bounds under the same
-    /// `sensing_lease_apply_mu` the caller still holds, so nothing here can
-    /// refuse and the caller can never be handed a ticket for a reference that
-    /// was not recorded.
+    /// Infallible by construction: the preview proved both bounds AND reserved
+    /// a terminal identity under the same `sensing_lease_apply_mu` the caller
+    /// still holds, so nothing here can refuse and the caller can never be
+    /// handed a ticket for a reference that was not recorded.
     pub(crate) fn commit_acquire(&self, previewed: PreviewedAcquire) -> LeaseToken {
         let PreviewedAcquire {
             key,
@@ -427,9 +510,9 @@ impl SensingInterestLeases {
             plane,
             spec,
             transition,
+            token,
         } = previewed;
         let mut entries = self.entries.lock();
-        let token = self.mint_token();
         match entries.entry(key) {
             Entry::Vacant(v) => {
                 debug_assert_eq!(
@@ -465,13 +548,37 @@ impl SensingInterestLeases {
         token
     }
 
-    /// One-shot preview + commit.
+    /// Acquire one reference to `key` on the LEGACY plane.
+    ///
+    /// The pre-existing single-call acquisition surface, preserved verbatim in
+    /// arguments and return shape. It is the crate-internal transactional
+    /// preview + commit pair applied back to back, so it inherits both
+    /// cardinality bounds and terminal identity refusal — including
+    /// `Err(`[`LeaseRefused::IdentityExhausted`]`)`.
+    ///
+    /// PRODUCTION organization transitions must NOT use this: the node has to
+    /// apply the table/emitter transition BETWEEN the two halves, and the
+    /// authority plane in force is read from recorded provenance rather than
+    /// assumed. This collapses both, which is exactly why it is legacy-plane
+    /// only.
+    pub fn acquire(
+        &self,
+        key: SensingLeaseKey,
+        spec: &InterestSpec,
+        interval: Duration,
+    ) -> Result<(LeaseToken, LeaseAction), LeaseRefused> {
+        let previewed = self.preview_acquire(key, spec, interval, LeasePlane::Legacy)?;
+        let action = previewed.action();
+        Ok((self.commit_acquire(previewed), action))
+    }
+
+    /// One-shot preview + commit on an explicit plane.
     ///
     /// TESTS ONLY. Production must apply the table/emitter transition BETWEEN
     /// the two halves — that ordering is the whole point of splitting them, so
     /// collapsing it back is exactly the defect this shape removed.
     #[cfg(test)]
-    fn acquire(
+    fn acquire_on_plane(
         &self,
         key: SensingLeaseKey,
         spec: &InterestSpec,
@@ -558,6 +665,40 @@ impl SensingInterestLeases {
                 .refused_interest_at_capacity
                 .load(Ordering::Acquire),
         )
+    }
+
+    /// How many acquisitions were refused because the terminal token identity
+    /// space was exhausted.
+    ///
+    /// A separate accessor rather than a third element on
+    /// [`refusals`](Self::refusals): that tuple is a pre-existing surface, and
+    /// widening it would break every caller that destructures it.
+    pub fn identity_refusals(&self) -> u64 {
+        self.metrics
+            .refused_identity_exhausted
+            .load(Ordering::Acquire)
+    }
+
+    /// Test-only allocator seam: place the terminal identity allocator at
+    /// `next`, so the space boundary is reachable without issuing `2^64`
+    /// tokens.
+    ///
+    /// `next == LEASE_TOKEN_SPACE_END` is the exhausted state; `next ==
+    /// LEASE_TOKEN_SPACE_END - 1` leaves exactly one legal token. Writes the
+    /// live counter directly, so what the witnesses drive is the PRODUCTION
+    /// allocator and not a parallel one.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn seed_token_space_for_test(&self, next: u64) {
+        self.next_token.store(next, Ordering::Release);
+    }
+
+    /// The reserved sentinel that marks the identity space exhausted, so a
+    /// witness can name the boundary instead of hard-coding `u64::MAX`.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn token_space_end() -> u64 {
+        LEASE_TOKEN_SPACE_END
     }
 
     /// The authority plane a live lease was ESTABLISHED under, if the key is
@@ -726,7 +867,7 @@ mod tests {
         for provider in 0..MAX_LEASED_INTERESTS as u64 {
             let key = key_for(&s, provider);
             let (token, action, _) = leases
-                .acquire(key, &s, ms(100), LeasePlane::Legacy)
+                .acquire_on_plane(key, &s, ms(100), LeasePlane::Legacy)
                 .expect("within capacity");
             assert!(matches!(action, LeaseAction::Register { .. }));
             held.push(ticket(key, token));
@@ -735,7 +876,7 @@ mod tests {
 
         let overflow = key_for(&s, MAX_LEASED_INTERESTS as u64);
         assert_eq!(
-            leases.acquire(overflow, &s, ms(100), LeasePlane::Legacy),
+            leases.acquire_on_plane(overflow, &s, ms(100), LeasePlane::Legacy),
             Err(LeaseRefused::NodeAtCapacity)
         );
         assert_eq!(
@@ -754,7 +895,7 @@ mod tests {
         // the node budget.
         let existing = held[0].key;
         let (_t, action, _) = leases
-            .acquire(existing, &s, ms(500), LeasePlane::Legacy)
+            .acquire_on_plane(existing, &s, ms(500), LeasePlane::Legacy)
             .expect("an existing interest is not node-bounded");
         assert_eq!(action, LeaseAction::Unchanged);
 
@@ -764,7 +905,7 @@ mod tests {
             LeaseAction::Deregister { .. }
         ));
         assert!(leases
-            .acquire(overflow, &s, ms(100), LeasePlane::Legacy)
+            .acquire_on_plane(overflow, &s, ms(100), LeasePlane::Legacy)
             .is_ok());
     }
 
@@ -778,7 +919,7 @@ mod tests {
         let key = key_for(&s, 7);
         for _ in 0..MAX_HOLDERS_PER_INTEREST {
             leases
-                .acquire(key, &s, ms(100), LeasePlane::Legacy)
+                .acquire_on_plane(key, &s, ms(100), LeasePlane::Legacy)
                 .expect("within capacity");
         }
         assert_eq!(
@@ -787,7 +928,7 @@ mod tests {
         );
 
         assert_eq!(
-            leases.acquire(key, &s, ms(10), LeasePlane::Legacy),
+            leases.acquire_on_plane(key, &s, ms(10), LeasePlane::Legacy),
             Err(LeaseRefused::InterestAtCapacity)
         );
         assert_eq!(
@@ -809,7 +950,7 @@ mod tests {
         let s = spec("gpu.infer");
         let key = key_for(&s, 7);
         let (_t, action, _) = leases
-            .acquire(key, &s, ms(100), LeasePlane::Legacy)
+            .acquire_on_plane(key, &s, ms(100), LeasePlane::Legacy)
             .expect("within capacity");
         match action {
             LeaseAction::Register { spec, interval } => {
@@ -827,10 +968,10 @@ mod tests {
         let s = spec("gpu.infer");
         let key = key_for(&s, 7);
         leases
-            .acquire(key, &s, ms(100), LeasePlane::Legacy)
+            .acquire_on_plane(key, &s, ms(100), LeasePlane::Legacy)
             .expect("within capacity");
         let (_t, action, _) = leases
-            .acquire(key, &s, ms(500), LeasePlane::Legacy)
+            .acquire_on_plane(key, &s, ms(500), LeasePlane::Legacy)
             .expect("within capacity");
         assert_eq!(action, LeaseAction::Unchanged);
         assert_eq!(leases.entry_for_test(&key), Some((2, ms(100))));
@@ -842,10 +983,10 @@ mod tests {
         let s = spec("gpu.infer");
         let key = key_for(&s, 7);
         leases
-            .acquire(key, &s, ms(500), LeasePlane::Legacy)
+            .acquire_on_plane(key, &s, ms(500), LeasePlane::Legacy)
             .expect("within capacity");
         let (_t, action, _) = leases
-            .acquire(key, &s, ms(100), LeasePlane::Legacy)
+            .acquire_on_plane(key, &s, ms(100), LeasePlane::Legacy)
             .expect("within capacity");
         match action {
             LeaseAction::Reregister { spec, interval } => {
@@ -862,10 +1003,10 @@ mod tests {
         let s = spec("gpu.infer");
         let key = key_for(&s, 7);
         let (strict, _, _) = leases
-            .acquire(key, &s, ms(100), LeasePlane::Legacy)
+            .acquire_on_plane(key, &s, ms(100), LeasePlane::Legacy)
             .expect("within capacity");
         let (loose, _, _) = leases
-            .acquire(key, &s, ms(500), LeasePlane::Legacy)
+            .acquire_on_plane(key, &s, ms(500), LeasePlane::Legacy)
             .expect("within capacity");
         let _ = strict;
         let action = leases.release(ticket(key, loose));
@@ -879,10 +1020,10 @@ mod tests {
         let s = spec("gpu.infer");
         let key = key_for(&s, 7);
         let (strict, _, _) = leases
-            .acquire(key, &s, ms(100), LeasePlane::Legacy)
+            .acquire_on_plane(key, &s, ms(100), LeasePlane::Legacy)
             .expect("within capacity");
         leases
-            .acquire(key, &s, ms(500), LeasePlane::Legacy)
+            .acquire_on_plane(key, &s, ms(500), LeasePlane::Legacy)
             .expect("within capacity");
         match leases.release(ticket(key, strict)) {
             LeaseAction::Reregister { spec, interval } => {
@@ -900,7 +1041,7 @@ mod tests {
         let s = spec("gpu.infer");
         let key = key_for(&s, 7);
         let (only, _, _) = leases
-            .acquire(key, &s, ms(100), LeasePlane::Legacy)
+            .acquire_on_plane(key, &s, ms(100), LeasePlane::Legacy)
             .expect("within capacity");
         match leases.release(ticket(key, only)) {
             LeaseAction::Deregister { spec } => assert_eq!(*spec, s),
@@ -915,10 +1056,10 @@ mod tests {
         let s = spec("gpu.infer");
         let key = key_for(&s, 7);
         let (a, first, _) = leases
-            .acquire(key, &s, ms(100), LeasePlane::Legacy)
+            .acquire_on_plane(key, &s, ms(100), LeasePlane::Legacy)
             .expect("within capacity");
         let (b, second, _) = leases
-            .acquire(key, &s, ms(100), LeasePlane::Legacy)
+            .acquire_on_plane(key, &s, ms(100), LeasePlane::Legacy)
             .expect("within capacity");
         assert!(matches!(first, LeaseAction::Register { .. }));
         assert_eq!(second, LeaseAction::Unchanged);
@@ -941,11 +1082,11 @@ mod tests {
             provider: 9,
         };
         let (k1_tok, _, _) = leases
-            .acquire(key, &s, ms(100), LeasePlane::Legacy)
+            .acquire_on_plane(key, &s, ms(100), LeasePlane::Legacy)
             .expect("within capacity");
         // A real token, but issued for a DIFFERENT key — unknown to key's entry.
         let (k2_tok, _, _) = leases
-            .acquire(k2, &s, ms(100), LeasePlane::Legacy)
+            .acquire_on_plane(k2, &s, ms(100), LeasePlane::Legacy)
             .expect("within capacity");
         assert_eq!(leases.release(ticket(key, k2_tok)), LeaseAction::Unchanged);
         assert_eq!(leases.entry_for_test(&key), Some((1, ms(100))));
@@ -968,13 +1109,221 @@ mod tests {
             provider: 8,
         };
         leases
-            .acquire(k1, &s, ms(100), LeasePlane::Legacy)
+            .acquire_on_plane(k1, &s, ms(100), LeasePlane::Legacy)
             .expect("within capacity");
         leases
-            .acquire(k2, &s, ms(100), LeasePlane::Legacy)
+            .acquire_on_plane(k2, &s, ms(100), LeasePlane::Legacy)
             .expect("within capacity");
         assert_eq!(leases.len(), 2);
         assert_eq!(leases.entry_for_test(&k1), Some((1, ms(100))));
         assert_eq!(leases.entry_for_test(&k2), Some((1, ms(100))));
+    }
+
+    // ---- D4.8: TERMINAL, non-aliasing holder identity ------------------
+    //
+    // The allocator used to be `AtomicU64::fetch_add`, which wraps `u64::MAX`
+    // to `0`. Release authority is `(key, token)` equality, so a wrap hands a
+    // NEW holder an identity a long-lived stale ticket already names — and that
+    // stale ticket then tears down a successor's row. These drive the
+    // PRODUCTION allocator through its test seam; none of them loops through
+    // `2^64` values.
+
+    /// The LAST legal identity is issued, and every acquisition after it
+    /// refuses — terminally, and without disturbing the incumbent.
+    #[test]
+    fn the_last_legal_token_is_issued_and_every_later_acquisition_refuses() {
+        let leases = SensingInterestLeases::default();
+        let s = spec("gpu.infer");
+        let incumbent_key = key_for(&s, 1);
+        let (incumbent, _, _) = leases
+            .acquire_on_plane(incumbent_key, &s, ms(100), LeasePlane::Legacy)
+            .expect("the incumbent acquires before the space is narrowed");
+
+        // Exactly ONE identity left.
+        leases.seed_token_space_for_test(SensingInterestLeases::token_space_end() - 1);
+        let last_key = key_for(&s, 2);
+        let (last, _, _) = leases
+            .acquire_on_plane(last_key, &s, ms(100), LeasePlane::Legacy)
+            .expect("the last legal identity must still be issued");
+
+        // And now the space is terminal — for a NEW key and for an EXISTING one
+        // alike, because both need an identity.
+        for (label, key) in [("a new key", key_for(&s, 3)), ("an existing key", last_key)] {
+            assert_eq!(
+                leases.acquire_on_plane(key, &s, ms(10), LeasePlane::Legacy),
+                Err(LeaseRefused::IdentityExhausted),
+                "{label} was admitted past the end of the identity space"
+            );
+        }
+        assert_eq!(
+            leases.identity_refusals(),
+            2,
+            "both exhaustion refusals must be counted"
+        );
+        assert_eq!(
+            leases.refusals(),
+            (0, 0),
+            "exhaustion is not a capacity refusal"
+        );
+
+        // INCUMBENTS SURVIVE: registrations, cadence and holder count are
+        // exactly what they were, and the refused acquisitions joined nothing.
+        assert_eq!(
+            leases.entry_for_test(&incumbent_key),
+            Some((1, ms(100))),
+            "an exhausted allocator must not disturb a live holder"
+        );
+        assert_eq!(
+            leases.entry_for_test(&last_key),
+            Some((1, ms(100))),
+            "the refused stricter acquisition neither joined nor tightened"
+        );
+        assert_eq!(leases.len(), 2, "and created no third interest");
+
+        // TERMINAL DEREGISTRATION still works for both existing tickets: this
+        // refuses to MINT, it does not retract.
+        assert!(matches!(
+            leases.release(ticket(last_key, last)),
+            LeaseAction::Deregister { .. }
+        ));
+        assert!(matches!(
+            leases.release(ticket(incumbent_key, incumbent)),
+            LeaseAction::Deregister { .. }
+        ));
+        assert!(leases.is_empty(), "both leases tore down cleanly");
+
+        // Still terminal after the releases — freeing entries frees capacity,
+        // never identity.
+        assert_eq!(
+            leases.acquire_on_plane(key_for(&s, 4), &s, ms(100), LeasePlane::Legacy),
+            Err(LeaseRefused::IdentityExhausted)
+        );
+    }
+
+    /// The wrap this replaces, named directly: with the allocator parked one
+    /// short of the end, a stale ticket for a released holder can never be
+    /// re-minted for a SUCCESSOR of the same key.
+    ///
+    /// RED coupling: restore `fetch_add` and the successor below is handed
+    /// token `0` — the exact value `stale` already carries — so the stale
+    /// release deregisters the successor's row.
+    #[test]
+    fn a_wrapped_allocator_cannot_hand_a_successor_a_stale_tickets_identity() {
+        let leases = SensingInterestLeases::default();
+        let s = spec("gpu.infer");
+        let key = key_for(&s, 7);
+
+        // A long-lived ticket minted at the BOTTOM of the space, then released.
+        let (stale, _, _) = leases
+            .acquire_on_plane(key, &s, ms(100), LeasePlane::Legacy)
+            .expect("the first holder acquires");
+        assert!(matches!(
+            leases.release(ticket(key, stale)),
+            LeaseAction::Deregister { .. }
+        ));
+
+        // Park the allocator at the last legal identity and mint the successor.
+        leases.seed_token_space_for_test(SensingInterestLeases::token_space_end() - 1);
+        let (successor, _, _) = leases
+            .acquire_on_plane(key, &s, ms(100), LeasePlane::Legacy)
+            .expect("the successor acquires under the last legal identity");
+        assert_ne!(
+            successor, stale,
+            "the allocator reissued an identity a stale ticket still names"
+        );
+
+        // The stale ticket is a pure no-op against the successor's entry.
+        assert_eq!(leases.release(ticket(key, stale)), LeaseAction::Unchanged);
+        assert_eq!(
+            leases.entry_for_test(&key),
+            Some((1, ms(100))),
+            "the stale release tore down the successor's registration"
+        );
+        assert!(matches!(
+            leases.release(ticket(key, successor)),
+            LeaseAction::Deregister { .. }
+        ));
+    }
+
+    /// Two racing reservations at the LAST legal identity produce exactly one
+    /// token and one refusal — the checked allocator's CAS, not a
+    /// read-then-write that could hand the same value to both.
+    #[test]
+    fn racing_reservations_at_the_boundary_issue_exactly_one_identity() {
+        let leases = SensingInterestLeases::default();
+        let s = spec("gpu.infer");
+        leases.seed_token_space_for_test(SensingInterestLeases::token_space_end() - 1);
+
+        let start = std::sync::Barrier::new(4);
+        let outcomes: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..4u64)
+                .map(|provider| {
+                    let leases = &leases;
+                    let s = &s;
+                    let start = &start;
+                    scope.spawn(move || {
+                        start.wait();
+                        leases
+                            .acquire_on_plane(key_for(s, provider), s, ms(100), LeasePlane::Legacy)
+                            .map(|(token, _, _)| token)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("reservation thread"))
+                .collect()
+        });
+
+        assert_eq!(
+            outcomes.iter().filter(|outcome| outcome.is_ok()).count(),
+            1,
+            "exactly one racer may take the last identity; got {outcomes:?}"
+        );
+        for outcome in &outcomes {
+            if let Err(refusal) = outcome {
+                assert_eq!(*refusal, LeaseRefused::IdentityExhausted);
+            }
+        }
+        assert_eq!(leases.len(), 1, "and exactly one lease was established");
+    }
+
+    /// The restored compatibility surface: three arguments, the original
+    /// two-element return, legacy-plane behaviour, and terminal identity
+    /// refusal integrated.
+    #[test]
+    fn the_compatibility_acquire_keeps_its_shape_and_refuses_at_exhaustion() {
+        let leases = SensingInterestLeases::default();
+        let s = spec("gpu.infer");
+        let key = key_for(&s, 7);
+
+        let (first, action) = leases.acquire(key, &s, ms(100)).expect("first acquires");
+        match action {
+            LeaseAction::Register { spec, interval } => {
+                assert_eq!(*spec, s);
+                assert_eq!(interval, ms(100));
+            }
+            other => panic!("expected Register, got {other:?}"),
+        }
+        assert_eq!(
+            leases.plane_for(&key),
+            Some(LeasePlane::Legacy),
+            "the compatibility surface establishes on the LEGACY plane"
+        );
+        let (_second, action) = leases.acquire(key, &s, ms(50)).expect("second acquires");
+        assert!(matches!(action, LeaseAction::Reregister { .. }));
+
+        leases.seed_token_space_for_test(SensingInterestLeases::token_space_end());
+        assert_eq!(
+            leases.acquire(key, &s, ms(100)),
+            Err(LeaseRefused::IdentityExhausted),
+            "the compatibility surface must inherit terminal identity refusal"
+        );
+        assert_eq!(
+            leases.entry_for_test(&key),
+            Some((2, ms(50))),
+            "and must not have disturbed the live holders"
+        );
+        let _ = first;
     }
 }

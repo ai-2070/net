@@ -523,7 +523,7 @@ jobs:
       #   org_gate                        = 60
       #     42 baseline + 7 (selector-target intake) + 5 (local-origin planner)
       #     + 6 (publication-pinned fence, off-lock relay crypto window)
-      #   sensing_authority_witness_tests = 54
+      #   sensing_authority_witness_tests = 61
       #     28 baseline + 1 (dispatch ordering) + 6 (local org lease egress)
       #     + 4 (lease-egress hold repair) + 10 (transition order, release
       #     coherence, phase-2 coverage, currentness fence)
@@ -531,13 +531,15 @@ jobs:
       #     + 3 (acquisition transaction: partitioned-tightening restoration,
       #     the partition-to-restoration authority race, the refused
       #     remote-provider inverse)
+      #     + 7 (exact-head HOLD repair: 3 inbound-admission fence, 3 bounded
+      #     egress + terminal lifecycle, 1 terminal lease identity)
       #     net of 3 retired: the two manual-wrapper guard witnesses replaced by
       #     production-observed ones, and the cached-floor "rollback plane"
       #     witness replaced by the two destructive-partition witnesses above
       # The mesh line previously read 35 while MESH_MIN read 39 — the arithmetic
       # drifted from the pin. Re-derive both from `--list` when you change them.
       #
-      # REQUIRED holds 45 names (18 gate + 27 mesh). Count with the loops below,
+      # REQUIRED holds 52 names (18 gate + 34 mesh). Count with the loops below,
       # not by eye: a prior comment claimed 34, which was neither the roster size
       # nor any derived figure.
       #
@@ -553,7 +555,7 @@ jobs:
           GATE=adapter::net::behavior::sensing::org_gate::tests
           MESH=adapter::net::mesh::sensing_authority_witness_tests
           GATE_MIN=60
-          MESH_MIN=54
+          MESH_MIN=61
 
           die() { echo "::error::$1"; shift; [ "$#" -gt 0 ] && printf '%s\n' "$@"; exit 1; }
 
@@ -656,7 +658,14 @@ jobs:
           a_refused_remote_acquisition_moves_nothing_and_emits_nothing
           an_authority_loss_duplicate_cannot_strand_a_final_release
           an_install_attempted_inside_the_fence_cannot_precede_the_mutation
-          a_stale_capture_window_emits_no_frame_at_all"
+          a_stale_capture_window_emits_no_frame_at_all
+          an_inbound_org_row_mutation_cannot_interleave_with_a_publication
+          a_floor_publication_winning_the_inbound_fence_creates_no_row
+          a_poison_winning_the_inbound_fence_creates_no_row
+          a_stuck_org_send_retires_at_the_deadline_and_the_next_advances
+          a_shutdown_egress_can_be_neither_created_nor_enqueued
+          an_enqueue_after_close_is_refused_and_strands_no_queue
+          an_exhausted_lease_identity_space_moves_no_row_and_keeps_incumbents"
 
           check_one() {
             fqn="$1"
@@ -1116,7 +1125,6 @@ jobs:
           --test sensing_org_three_node
           --test sensing_lease
           --test sensing_lease_wire
-          --test sensing_org_lease_wire
           --test sensing_failure_plane
           --test sensing_fallback
           --test sensing_origin_emitter
@@ -1127,6 +1135,66 @@ jobs:
           --test sensing_resolver
           --test sensing_scheduler_bridge
           --test sensing_routed_origin
+
+      # === Sensing — organization lease WIRE (independent) =================
+      # `sensing_org_lease_wire` gets its OWN invocation rather than riding the
+      # group above. `--no-tests=fail` is RUN-WIDE, not per-binary: with fifteen
+      # `--test` targets in one command, this binary compiling to zero tests
+      # (its `#![cfg]` unsatisfied, or every witness renamed away) is invisible
+      # as long as any sibling still runs something. Alone, that same flag is
+      # exact — zero tests here is a failed step.
+      #
+      # `--retries 0` deliberately: `.config/nextest.toml` grants retries to
+      # absorb loopback-UDP transport-saturation flake, but these nine witnesses
+      # are ORDERING and EXCLUSION proofs whose signal is intermittent by
+      # construction — a "flake" here is the defect. Same feature set as the
+      # group, so no extra crate compile: these witnesses drive
+      # `fixtures`-gated seams (`org_egress_state_for_test`,
+      # `set_org_egress_send_observer_for_test`,
+      # `set_sensing_phase_two_seam_for_test`) and an integration test is a
+      # separate crate, so `test` is not set on `net` — only `fixtures` exposes
+      # them, and without it this binary is exactly the 0-test no-op above.
+      #
+      # All NINE witnesses in the file are the boundary; every one is pinned by
+      # name, and the count is pinned too, so neither a rename nor a silent
+      # deletion can pass.
+      - name: Sensing — organization lease wire
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          die() { echo "::error::$1"; shift; [ "$#" -gt 0 ] && printf '%s\n' "$@"; exit 1; }
+
+          if ! out=$(cargo nextest run --no-fail-fast --no-tests=fail --retries 0 \
+                       --features "cortex tool fixtures" \
+                       --test sensing_org_lease_wire 2>&1 | tee /dev/stderr); then
+            die "sensing_org_lease_wire failed"
+          fi
+
+          REQUIRED="an_org_lease_reaches_the_provider_through_real_intake
+          releasing_the_strictest_org_holder_relaxes_the_provider_row
+          releasing_the_last_org_holder_deregisters_the_provider_row
+          a_stale_org_capture_refuses_and_puts_nothing_on_the_wire
+          the_later_org_cadence_decision_is_what_the_provider_finally_holds
+          a_parked_org_teardown_cannot_be_overtaken_by_its_own_reacquisition
+          the_production_send_boundary_is_strictly_serial_in_enqueue_order
+          the_ordered_egress_is_bounded_and_keeps_the_latest_decision
+          the_egress_consumer_does_not_survive_node_shutdown"
+          n=0
+          for required in $REQUIRED; do
+            # nextest prints `<crate>::<binary> <test>`; `cargo test` would use
+            # `::`. Accept either separator so the pin does not depend on the
+            # runner's formatting.
+            if ! printf '%s\n' "$out" | grep -qE "sensing_org_lease_wire[ :]+${required}\$"; then
+              die "required organization lease wire witness missing: $required"
+            fi
+            n=$((n + 1))
+          done
+          if [ "$n" != "9" ]; then
+            die "expected 9 required organization lease wire witnesses, pinned $n" \
+                "If a witness was intentionally retired, remove its name here in the" \
+                "same commit and correct this count — do not let the gate pass vacuously."
+          fi
+          echo "organization lease wire: 9 pinned witnesses ran under a zero-retry, single-binary invocation"
 
       # === NetDB ==========================================================
       - name: NetDB

@@ -322,7 +322,7 @@ fn spawn_refresher(
         loop {
             tokio::time::sleep(PAST_MIN_GAP).await;
             if let Ok(t) = a.acquire_sensing_interest_lease(&spec, provider, interval) {
-                a.release_sensing_interest_lease(t)
+                a.try_release_sensing_interest_lease(t)
                     .expect("the release must not be refused");
             }
         }
@@ -396,9 +396,9 @@ async fn an_org_lease_reaches_the_provider_through_real_intake() {
     );
 
     refresher.abort();
-    a.release_sensing_interest_lease(strict)
+    a.try_release_sensing_interest_lease(strict)
         .expect("the release must not be refused");
-    a.release_sensing_interest_lease(loose)
+    a.try_release_sensing_interest_lease(loose)
         .expect("the release must not be refused");
     a.shutdown().await.expect("shutdown A");
     b.shutdown().await.expect("shutdown B");
@@ -410,7 +410,7 @@ async fn an_org_lease_reaches_the_provider_through_real_intake() {
 /// The surviving-holder release is the only lease transition that must AUTHOR a
 /// brand-new organization registration under FRESHLY captured authority — it is
 /// not a teardown, and it is the one release that
-/// `release_sensing_interest_lease` can refuse. The in-crate witness proves the
+/// `try_release_sensing_interest_lease` can refuse. The in-crate witness proves the
 /// planner produces the relaxed org variant; this proves the bytes leave the
 /// socket, survive B's org authority gate, and move B's own row.
 ///
@@ -456,7 +456,7 @@ async fn releasing_the_strictest_org_holder_relaxes_the_provider_row() {
     refresher.abort();
     tokio::time::sleep(PAST_MIN_GAP).await;
 
-    a.release_sensing_interest_lease(strict)
+    a.try_release_sensing_interest_lease(strict)
         .expect("the surviving-holder release must not be refused — A's authority is live");
 
     assert!(
@@ -487,7 +487,7 @@ async fn releasing_the_strictest_org_holder_relaxes_the_provider_row() {
          audience, which B counts here before installing nothing"
     );
 
-    a.release_sensing_interest_lease(loose)
+    a.try_release_sensing_interest_lease(loose)
         .expect("the release must not be refused");
     a.shutdown().await.expect("shutdown A");
     b.shutdown().await.expect("shutdown B");
@@ -536,7 +536,7 @@ async fn releasing_the_last_org_holder_deregisters_the_provider_row() {
          the removal below would prove nothing about the Deregister frame"
     );
 
-    a.release_sensing_interest_lease(only)
+    a.try_release_sensing_interest_lease(only)
         .expect("a FINAL organization release can never be refused");
 
     assert!(
@@ -741,9 +741,9 @@ async fn a_stale_org_capture_refuses_and_puts_nothing_on_the_wire() {
          here"
     );
 
-    a.release_sensing_interest_lease(parked_ticket)
+    a.try_release_sensing_interest_lease(parked_ticket)
         .expect("the release must not be refused");
-    a.release_sensing_interest_lease(loose)
+    a.try_release_sensing_interest_lease(loose)
         .expect("the release must not be refused");
     a.shutdown().await.expect("shutdown A");
     b.shutdown().await.expect("shutdown B");
@@ -1015,11 +1015,11 @@ async fn the_later_org_cadence_decision_is_what_the_provider_finally_holds() {
          throwing bytes away"
     );
 
-    a.release_sensing_interest_lease(strict_ticket)
+    a.try_release_sensing_interest_lease(strict_ticket)
         .expect("the release must not be refused");
-    a.release_sensing_interest_lease(mid_ticket)
+    a.try_release_sensing_interest_lease(mid_ticket)
         .expect("the release must not be refused");
-    a.release_sensing_interest_lease(loose)
+    a.try_release_sensing_interest_lease(loose)
         .expect("the release must not be refused");
     a.shutdown().await.expect("shutdown A");
     b.shutdown().await.expect("shutdown B");
@@ -1102,7 +1102,7 @@ async fn a_parked_org_teardown_cannot_be_overtaken_by_its_own_reacquisition() {
     let park = arm_phase_two_park(&a);
     let teardown = {
         let a = a.clone();
-        tokio::task::spawn_blocking(move || a.release_sensing_interest_lease(only))
+        tokio::task::spawn_blocking(move || a.try_release_sensing_interest_lease(only))
     };
     await_condition(POLL, "the final teardown parked in Phase 2", || {
         park.entered.load(Ordering::SeqCst)
@@ -1212,7 +1212,7 @@ async fn a_parked_org_teardown_cannot_be_overtaken_by_its_own_reacquisition() {
     // AND THE OTHER HALF: with NOTHING following it, a final teardown really
     // does leave the provider with no row. Without this, the assertions above
     // would be satisfied by a `Deregister` that never removes anything.
-    a.release_sensing_interest_lease(fresh_ticket)
+    a.try_release_sensing_interest_lease(fresh_ticket)
         .expect("a FINAL organization release can never be refused");
     assert!(
         poll_until(POLL, || b
@@ -1411,7 +1411,7 @@ async fn the_production_send_boundary_is_strictly_serial_in_enqueue_order() {
     );
 
     for ticket in tickets {
-        a.release_sensing_interest_lease(ticket)
+        a.try_release_sensing_interest_lease(ticket)
             .expect("the release must not be refused");
     }
     a.shutdown().await.expect("shutdown A");
@@ -1540,9 +1540,9 @@ async fn the_ordered_egress_is_bounded_and_keeps_the_latest_decision() {
 
     burst.await.expect("the burst joins");
     for ticket in tickets {
-        let _ = a.release_sensing_interest_lease(ticket);
+        let _ = a.try_release_sensing_interest_lease(ticket);
     }
-    let _ = a.release_sensing_interest_lease(warm);
+    let _ = a.try_release_sensing_interest_lease(warm);
     a.shutdown().await.expect("shutdown A");
     b.shutdown().await.expect("shutdown B");
 }
@@ -1577,7 +1577,7 @@ async fn the_egress_consumer_does_not_survive_node_shutdown() {
         "the consumer must still be alive before shutdown: {before:?}"
     );
 
-    a.release_sensing_interest_lease(ticket)
+    a.try_release_sensing_interest_lease(ticket)
         .expect("the release must not be refused");
     a.shutdown().await.expect("shutdown A");
 
