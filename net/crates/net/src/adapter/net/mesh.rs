@@ -29,6 +29,7 @@
 //! ```
 
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
@@ -1338,6 +1339,11 @@ struct DispatchCtx {
     /// authority rotation in the sensing authority stamp. Same `Arc` as the
     /// matching `MeshNode` field.
     org_install_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// In-crate witness seam for the INBOUND organization admission fence,
+    /// sharing the node's slot (see `MeshNode::sensing_fence_seam`). Fires with
+    /// `org_install` held, before the store publication pin is taken.
+    #[cfg(test)]
+    sensing_fence_seam: SensingSeamSlot,
     /// OA3-5: the private-discovery store verified scoped announcements land in.
     /// See the matching field doc on `MeshNode`.
     scoped_discovery:
@@ -1778,6 +1784,21 @@ struct DispatchCtx {
     auth_failure_window: Duration,
     /// How long a peer stays throttled after tripping the threshold.
     auth_throttle_duration: Duration,
+}
+
+impl DispatchCtx {
+    /// The inbound-admission currentness-fence seam, if a witness installed
+    /// one. Mirrors `MeshNode::sensing_fence_seam_hook`, so the production
+    /// dispatch fence takes the same shape as the local-lease fence.
+    #[cfg(test)]
+    fn sensing_fence_seam_hook(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        self.sensing_fence_seam.lock().clone()
+    }
+
+    #[cfg(not(test))]
+    fn sensing_fence_seam_hook(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        None
+    }
 }
 
 /// Capacity of the per-worker protected-forwarding buffer.
@@ -6064,16 +6085,22 @@ fn build_sensing_frame_datagram(
 /// such a rule cannot be scoped to the organization plane today because both
 /// planes share subprotocol `0x0C02` and the same stream id.
 struct OrderedSensingEgress {
-    /// Pending datagrams, newest at the back. A leaf `parking_lot` mutex held
-    /// only for one `push_back`/`pop_front`: no await, no I/O, no user code, and
-    /// no sensing lock is taken under it.
-    queue: Arc<parking_lot::Mutex<VecDeque<PendingDatagram>>>,
+    /// Pending datagrams AND the queue's own closure flag, under ONE leaf
+    /// `parking_lot` mutex held only for a single `push_back`/`pop_front`: no
+    /// await, no I/O, no user code, and no sensing lock is taken under it.
+    ///
+    /// The flag lives INSIDE the queue deliberately. It used to be a separate
+    /// `AtomicBool` read before the queue lock, which admitted two real
+    /// interleavings: an enqueue could observe `closed == false`, then push
+    /// after the consumer had observed closed-and-empty and exited (a stranded
+    /// nonzero queue with no consumer), and a close could land between an
+    /// enqueue's check and its push. Acceptance and closure now mutate the same
+    /// state under the same lock, so "closed" and "empty" are one observation.
+    queue: Arc<parking_lot::Mutex<EgressQueue>>,
     /// Wakes the consumer after an enqueue or a close. `Notify::notify_one`
     /// stores a permit when no waiter is registered, so the drain-then-park loop
     /// below cannot lose a wakeup.
     wake: Arc<tokio::sync::Notify>,
-    /// Set by [`Self::close`]; the consumer drains what is queued and exits.
-    closed: Arc<AtomicBool>,
     /// The next enqueue sequence. Node-local, never on the wire, and present
     /// ONLY in instrumented builds: its sole purpose is letting a witness name
     /// WHICH datagram the consumer sent when. A production build allocates no
@@ -6083,6 +6110,13 @@ struct OrderedSensingEgress {
     counters: Arc<OrgEgressCounters>,
     /// The single consumer, retained so shutdown can join it.
     consumer: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+/// The ordered egress' queue: pending datagrams plus the closure flag they are
+/// accepted or refused against. One lock covers both.
+struct EgressQueue {
+    pending: VecDeque<PendingDatagram>,
+    closed: bool,
 }
 
 /// One queued organization datagram.
@@ -6100,6 +6134,13 @@ struct OrgEgressCounters {
     depth: AtomicU64,
     dropped_oldest: AtomicU64,
     sent: AtomicU64,
+    /// Datagrams whose bounded send timed out or errored. NEVER also counted as
+    /// `sent`: a datagram the socket did not take is not a datagram that left.
+    send_failed: AtomicU64,
+    /// Enqueues refused because the queue was already closed — the honest
+    /// count of decisions made after terminal closure, rather than a silent
+    /// return.
+    refused_closed: AtomicU64,
     consumer_finished: AtomicBool,
 }
 
@@ -6115,6 +6156,13 @@ const MAX_PENDING_ORG_EGRESS: usize = 128;
 /// How long `shutdown` lets the consumer drain before aborting it. A stalled
 /// socket must not stall node shutdown.
 const ORG_EGRESS_DRAIN_GRACE: Duration = Duration::from_secs(1);
+
+/// Shared slot for one in-crate witness seam: a nullary hook installed on the
+/// node and observed from wherever the production path fires it (the dispatch
+/// context shares the node's slot, so an inbound fence witness can install on
+/// one and fire on the other).
+#[cfg(test)]
+type SensingSeamSlot = Arc<parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>;
 
 /// Which side of one production `send_to` an observation names.
 #[cfg(any(test, feature = "fixtures"))]
@@ -6137,6 +6185,27 @@ pub type OrgEgressSendObserver = Arc<dyn Fn(u64, OrgEgressSendPhase) + Send + Sy
 #[cfg(any(test, feature = "fixtures"))]
 type OrgEgressObserverSlot = Arc<parking_lot::Mutex<Option<OrgEgressSendObserver>>>;
 
+/// Instrumented-only override of the egress' per-datagram send policy.
+///
+/// The consumer bounds every send through the SAME
+/// [`bound_datagram_send`] wrapper production uses; this only substitutes the
+/// deadline and, for named enqueue sequences, a send future that never
+/// resolves — which is what an unwritable socket is. Without it a witness for
+/// "a stuck send retires at the deadline" would have to wedge a real UDP socket
+/// and then wait out [`DATAGRAM_SEND_DEADLINE`].
+#[cfg(any(test, feature = "fixtures"))]
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct OrgEgressSendPolicy {
+    /// The deadline each send is retired at.
+    pub deadline: Duration,
+    /// Enqueue sequences whose send must never resolve on its own.
+    pub stall: Arc<dyn Fn(u64) -> bool + Send + Sync>,
+}
+
+#[cfg(any(test, feature = "fixtures"))]
+type OrgEgressSendPolicySlot = Arc<parking_lot::Mutex<Option<OrgEgressSendPolicy>>>;
+
 /// The ordered organization egress' observable state.
 #[cfg(any(test, feature = "fixtures"))]
 #[doc(hidden)]
@@ -6151,8 +6220,15 @@ pub struct OrgEgressState {
     pub dropped_oldest: u64,
     /// Datagrams the consumer has handed to the socket.
     pub sent: u64,
+    /// Datagrams retired at the send deadline or failed by the socket.
+    pub send_failed: u64,
+    /// Enqueues refused because the queue was already closed.
+    pub refused_closed: u64,
     /// Whether the single consumer task has exited.
     pub consumer_finished: bool,
+    /// Whether the node's egress lifecycle has reached its terminal state, so
+    /// neither creation nor enqueue is possible any more.
+    pub terminal: bool,
 }
 
 impl OrderedSensingEgress {
@@ -6160,26 +6236,27 @@ impl OrderedSensingEgress {
     fn spawn(
         socket: Arc<NetSocket>,
         #[cfg(any(test, feature = "fixtures"))] observer: OrgEgressObserverSlot,
+        #[cfg(any(test, feature = "fixtures"))] policy: OrgEgressSendPolicySlot,
     ) -> Self {
-        let queue = Arc::new(parking_lot::Mutex::new(VecDeque::with_capacity(
-            MAX_PENDING_ORG_EGRESS,
-        )));
+        let queue = Arc::new(parking_lot::Mutex::new(EgressQueue {
+            pending: VecDeque::with_capacity(MAX_PENDING_ORG_EGRESS),
+            closed: false,
+        }));
         let wake = Arc::new(tokio::sync::Notify::new());
-        let closed = Arc::new(AtomicBool::new(false));
         let counters = Arc::new(OrgEgressCounters::default());
         let consumer = tokio::spawn(Self::consume(
             socket,
             queue.clone(),
             wake.clone(),
-            closed.clone(),
             counters.clone(),
             #[cfg(any(test, feature = "fixtures"))]
             observer,
+            #[cfg(any(test, feature = "fixtures"))]
+            policy,
         ));
         Self {
             queue,
             wake,
-            closed,
             #[cfg(any(test, feature = "fixtures"))]
             next_seq: AtomicU64::new(0),
             counters,
@@ -6187,22 +6264,29 @@ impl OrderedSensingEgress {
         }
     }
 
-    /// THE single consumer. Strictly sequential: each `send_to` completes before
+    /// THE single consumer. Strictly sequential: each send completes before
     /// the next begins, so the socket sees enqueue order. Parallelising this
     /// loop — or dequeuing a batch and fanning it into concurrent sends — would
     /// reintroduce exactly the race the type exists to remove, which is why the
     /// observer below brackets each individual send.
+    ///
+    /// Every send is BOUNDED. It used to `await` a raw `NetSocket::send_to`
+    /// forever and discard the result, so one unwritable socket wedged the
+    /// single consumer permanently and every later organization transition
+    /// queued behind it until the bound evicted it. A timeout or error is now
+    /// recorded and the loop advances — no retries, no acknowledgements, no
+    /// receiver ordering, and never counted as sent.
     async fn consume(
         socket: Arc<NetSocket>,
-        queue: Arc<parking_lot::Mutex<VecDeque<PendingDatagram>>>,
+        queue: Arc<parking_lot::Mutex<EgressQueue>>,
         wake: Arc<tokio::sync::Notify>,
-        closed: Arc<AtomicBool>,
         counters: Arc<OrgEgressCounters>,
         #[cfg(any(test, feature = "fixtures"))] observer: OrgEgressObserverSlot,
+        #[cfg(any(test, feature = "fixtures"))] policy: OrgEgressSendPolicySlot,
     ) {
         loop {
             loop {
-                let Some(next) = queue.lock().pop_front() else {
+                let Some(next) = queue.lock().pending.pop_front() else {
                     break;
                 };
                 #[cfg(any(test, feature = "fixtures"))]
@@ -6211,18 +6295,64 @@ impl OrderedSensingEgress {
                 if let Some(hook) = hook.as_ref() {
                     hook(next.seq, OrgEgressSendPhase::Started);
                 }
-                let _ = socket.send_to(&next.packet, next.addr).await;
+                #[cfg(any(test, feature = "fixtures"))]
+                let outcome = {
+                    let policy = policy.lock().clone();
+                    let deadline = policy
+                        .as_ref()
+                        .map_or(DATAGRAM_SEND_DEADLINE, |policy| policy.deadline);
+                    let stalled = policy
+                        .as_ref()
+                        .is_some_and(|policy| (policy.stall)(next.seq));
+                    if stalled {
+                        // An unwritable socket, exactly: the send never
+                        // resolves. The SAME wrapper production uses is what
+                        // must retire it.
+                        bound_datagram_send(std::future::pending(), next.addr, deadline).await
+                    } else {
+                        bound_datagram_send(
+                            socket.send_to(&next.packet, next.addr),
+                            next.addr,
+                            deadline,
+                        )
+                        .await
+                    }
+                };
+                #[cfg(not(any(test, feature = "fixtures")))]
+                let outcome = bound_datagram_send(
+                    socket.send_to(&next.packet, next.addr),
+                    next.addr,
+                    DATAGRAM_SEND_DEADLINE,
+                )
+                .await;
                 #[cfg(any(test, feature = "fixtures"))]
                 if let Some(hook) = hook.as_ref() {
                     hook(next.seq, OrgEgressSendPhase::Completed);
                 }
                 counters.depth.fetch_sub(1, Ordering::Relaxed);
-                counters.sent.fetch_add(1, Ordering::Relaxed);
+                match outcome {
+                    Ok(()) => {
+                        counters.sent.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(err) => {
+                        counters.send_failed.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(
+                            addr = %next.addr,
+                            error = %err,
+                            "ordered organization egress: datagram retired without being \
+                             sent; the transition's frame is dropped exactly as a lost UDP \
+                             datagram is"
+                        );
+                    }
+                }
             }
-            // Closed AND drained is the only exit. A producer's `notify_one`
-            // stores a permit when no waiter is registered, so an enqueue
-            // landing between the emptiness check and the park is not lost.
-            if closed.load(Ordering::Acquire) && queue.lock().is_empty() {
+            // Closed AND drained is the only exit, and both are read under the
+            // SAME lock an enqueue would have to take to add work — so a
+            // producer cannot slip a datagram past this verdict. A rival's
+            // `notify_one` stores a permit when no waiter is registered, so an
+            // enqueue landing between the drain above and the park below is not
+            // lost.
+            if queue.lock().is_closed_and_drained() {
                 break;
             }
             wake.notified().await;
@@ -6230,47 +6360,78 @@ impl OrderedSensingEgress {
         counters.consumer_finished.store(true, Ordering::Release);
     }
 
-    /// Enqueue one already-built datagram. Synchronous and NON-BLOCKING, so it
-    /// is safe to call while `org_transition_mu` is held: a stalled socket
-    /// evicts the oldest pending datagram rather than stalling the caller.
-    fn enqueue(&self, packet: Bytes, addr: SocketAddr) {
-        if self.closed.load(Ordering::Acquire) {
-            // The node is shutting down; there is nothing left to order.
-            return;
-        }
+    /// Enqueue one already-built datagram, reporting whether it was ACCEPTED.
+    ///
+    /// Synchronous and NON-BLOCKING, so it is safe to call while
+    /// `org_transition_mu` is held: a stalled socket evicts the oldest pending
+    /// datagram rather than stalling the caller. A closed queue refuses; the
+    /// closure test and the push happen under one lock acquisition, so an
+    /// accepted datagram is always one a live consumer will still observe.
+    fn enqueue(&self, packet: Bytes, addr: SocketAddr) -> bool {
         #[cfg(any(test, feature = "fixtures"))]
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
-        let evicted = {
+        /// What one enqueue attempt resolved to under the queue lock.
+        enum Accepted {
+            /// The queue was already closed — nothing was pushed.
+            Refused,
+            /// Pushed, and the bound evicted the OLDEST pending datagram.
+            Evicted,
+            /// Pushed within the bound.
+            Queued,
+        }
+        let accepted = {
             let mut queue = self.queue.lock();
-            queue.push_back(PendingDatagram {
-                #[cfg(any(test, feature = "fixtures"))]
-                seq,
-                packet,
-                addr,
-            });
-            if queue.len() > MAX_PENDING_ORG_EGRESS {
-                queue.pop_front().is_some()
+            if queue.closed {
+                Accepted::Refused
             } else {
-                false
+                queue.pending.push_back(PendingDatagram {
+                    #[cfg(any(test, feature = "fixtures"))]
+                    seq,
+                    packet,
+                    addr,
+                });
+                if queue.pending.len() > MAX_PENDING_ORG_EGRESS {
+                    queue.pending.pop_front();
+                    Accepted::Evicted
+                } else {
+                    Accepted::Queued
+                }
             }
         };
-        if evicted {
-            self.counters.dropped_oldest.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.counters.depth.fetch_add(1, Ordering::Relaxed);
+        match accepted {
+            Accepted::Refused => {
+                self.counters.refused_closed.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+            Accepted::Evicted => {
+                self.counters.dropped_oldest.fetch_add(1, Ordering::Relaxed);
+                self.wake.notify_one();
+                true
+            }
+            Accepted::Queued => {
+                self.counters.depth.fetch_add(1, Ordering::Relaxed);
+                self.wake.notify_one();
+                true
+            }
         }
-        self.wake.notify_one();
     }
 
     /// Stop accepting datagrams and wake the consumer so it drains and exits.
+    /// Closure is written under the queue lock, so it is ordered against every
+    /// enqueue acceptance rather than merely visible to one.
     fn close(&self) {
-        self.closed.store(true, Ordering::Release);
+        self.queue.lock().closed = true;
         self.wake.notify_one();
     }
 
     /// Close, then JOIN the consumer within [`ORG_EGRESS_DRAIN_GRACE`]. Aborts
     /// on expiry: a stalled socket must not stall node shutdown, and an
     /// undelivered datagram is dropped exactly as a lost UDP datagram is.
+    ///
+    /// An abort is FOLLOWED BY an await of the aborted handle, so the task has
+    /// genuinely settled when this returns. Aborting and returning immediately
+    /// only requests cancellation — the task can still be running its final
+    /// poll, which is the "joined teardown" claim being false.
     async fn close_and_join(&self) {
         self.close();
         let handle = self.consumer.lock().take();
@@ -6285,6 +6446,9 @@ impl OrderedSensingEgress {
                     "ordered organization egress did not drain within the shutdown grace \
                      window; the remaining datagrams are dropped"
                 );
+                // Settlement, not just cancellation. `JoinError::Cancelled` is
+                // the expected result here.
+                let _ = handle.await;
             }
         }
     }
@@ -6306,9 +6470,37 @@ impl OrderedSensingEgress {
             depth: self.counters.depth.load(Ordering::Relaxed),
             dropped_oldest: self.counters.dropped_oldest.load(Ordering::Relaxed),
             sent: self.counters.sent.load(Ordering::Relaxed),
+            send_failed: self.counters.send_failed.load(Ordering::Relaxed),
+            refused_closed: self.counters.refused_closed.load(Ordering::Relaxed),
             consumer_finished: self.counters.consumer_finished.load(Ordering::Acquire),
+            terminal: false,
         }
     }
+}
+
+impl EgressQueue {
+    /// Whether the consumer may exit: closed AND nothing left to hand to the
+    /// socket. Both fields under the caller's single lock acquisition.
+    fn is_closed_and_drained(&self) -> bool {
+        self.closed && self.pending.is_empty()
+    }
+}
+
+/// The node's ordered-egress lifecycle: one coherent state that lazy creation
+/// AND shutdown both linearize through.
+///
+/// A `OnceLock` could not express this. Creation was `get_or_init`, shutdown was
+/// a one-time `get()`, and the two did not order against each other: a first
+/// consumer could be created AFTER `shutdown` had already returned, leaving a
+/// task and a queue outliving the node it belongs to. Once `terminal` is set —
+/// under this mutex — creation is impossible and the retained handle is kept
+/// only so post-shutdown observation is real.
+struct OrgEgressCell {
+    /// The egress, once created. Retained across terminal closure so its
+    /// counters remain readable after shutdown.
+    egress: Option<Arc<OrderedSensingEgress>>,
+    /// Set by the node's terminal teardown. No egress is created after this.
+    terminal: bool,
 }
 
 /// LEGACY sensing frame send — unchanged. Builds synchronously, then spawns one
@@ -6528,6 +6720,10 @@ impl std::fmt::Display for SensingRegistrationError {
             Self::LeaseAtCapacity(sensing::LeaseRefused::InterestAtCapacity) => f.write_str(
                 "sensing interest at its live-holder bound — nothing acquired",
             ),
+            Self::LeaseAtCapacity(sensing::LeaseRefused::IdentityExhausted) => f.write_str(
+                "sensing lease holder-identity space exhausted — nothing acquired; \
+                 incumbent leases are unaffected",
+            ),
             Self::OrgAudienceUnsupported => f.write_str(
                 "organization-derived sensing audience: this node could not author a \
                  registration for it — nothing acquired, nothing emitted",
@@ -6615,10 +6811,10 @@ impl<T> SensingApply<T> {
 #[derive(Debug)]
 pub struct SensingLeaseReleaseRefused {
     /// The still-live ticket. Hand it back to
-    /// [`MeshNode::release_sensing_interest_lease`] to retry.
+    /// [`MeshNode::try_release_sensing_interest_lease`] to retry.
     ///
-    /// [`MeshNode::release_sensing_interest_lease`]:
-    ///     crate::adapter::net::MeshNode::release_sensing_interest_lease
+    /// [`MeshNode::try_release_sensing_interest_lease`]:
+    ///     crate::adapter::net::MeshNode::try_release_sensing_interest_lease
     pub ticket: sensing::SensingLeaseTicket,
     /// Why the surviving holders' cadence could not be re-authored.
     pub reason: SensingRegistrationError,
@@ -6699,7 +6895,7 @@ struct OrgSendParams {
 // `sensing_local_projection_mu`, `sensing_interest_table`,
 // `sensing_observations` and `sensing_emitter` that lies ON THE LEASE
 // TRANSITION PATH goes through it — that is `acquire_sensing_interest_lease` /
-// `release_sensing_interest_lease` -> `apply_sensing_lease_action` ->
+// `try_release_sensing_interest_lease` -> `apply_sensing_lease_action` ->
 // `register_sensing_interest_as` / `deregister_sensing_interest_as` -> Phase 2.
 // The same mutexes are acquired in ~110 other places in this file (maintenance
 // tick, inbound dispatch, attestation, leader reconciliation, emitter loop,
@@ -7771,6 +7967,31 @@ fn snapshot_peers(peers: &DashMap<u64, PeerInfo>, exclude: Option<u64>) -> Vec<P
         .collect()
 }
 
+/// Bound one ALREADY-ISSUED datagram send future by `deadline`.
+///
+/// The single place the datagram-send bound is expressed. Taking the future
+/// rather than the socket is what lets both the caller-facing
+/// [`send_datagram`] seam and the ordered organization egress share the exact
+/// same retirement policy — and lets an instrumented witness substitute a send
+/// that never resolves without duplicating the deadline wrapper it is meant to
+/// exercise.
+async fn bound_datagram_send<F>(
+    send: F,
+    addr: SocketAddr,
+    deadline: Duration,
+) -> Result<(), AdapterError>
+where
+    F: Future<Output = std::io::Result<usize>>,
+{
+    match tokio::time::timeout(deadline, send).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(AdapterError::Connection(format!("send failed: {e}"))),
+        Err(_) => Err(AdapterError::Connection(format!(
+            "send to {addr} exceeded the {deadline:?} datagram deadline"
+        ))),
+    }
+}
+
 /// Send ONE datagram under [`DATAGRAM_SEND_DEADLINE`].
 ///
 /// Every send on a caller-facing path goes through here, so the bound is a
@@ -7785,13 +8006,7 @@ async fn send_datagram(
     packet: &[u8],
     addr: SocketAddr,
 ) -> Result<(), AdapterError> {
-    match tokio::time::timeout(DATAGRAM_SEND_DEADLINE, socket.send_to(packet, addr)).await {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(e)) => Err(AdapterError::Connection(format!("send failed: {e}"))),
-        Err(_) => Err(AdapterError::Connection(format!(
-            "send to {addr} exceeded the {DATAGRAM_SEND_DEADLINE:?} datagram deadline"
-        ))),
-    }
+    bound_datagram_send(socket.send_to(packet, addr), addr, DATAGRAM_SEND_DEADLINE).await
 }
 
 /// Publish an authority change and advance the routing epoch as ONE ordered unit
@@ -9396,15 +9611,25 @@ pub struct MeshNode {
     /// sensing path never touch it, so no unrelated or legacy traffic is
     /// serialized behind it.
     org_transition_mu: parking_lot::Mutex<()>,
-    /// The single-consumer ordered egress for the ORGANIZATION lane. Created
-    /// lazily on first use because `MeshNode::new` may run outside a tokio
-    /// runtime, while every org transition necessarily runs inside one.
-    org_egress: std::sync::OnceLock<OrderedSensingEgress>,
+    /// The single-consumer ordered egress for the ORGANIZATION lane, and its
+    /// lifecycle. Created lazily on first use because `MeshNode::new` may run
+    /// outside a tokio runtime, while every org transition necessarily runs
+    /// inside one.
+    ///
+    /// A mutex-guarded [`OrgEgressCell`] rather than a `OnceLock`: lazy
+    /// creation and terminal shutdown must LINEARIZE against each other, and
+    /// `get_or_init` + a one-time `get()` do not. See the cell's own doc for
+    /// the interleavings that admitted.
+    org_egress: parking_lot::Mutex<OrgEgressCell>,
     /// Fixtures-only observer of the PRODUCTION organization send boundary.
     /// Shared with the consumer at spawn, so a witness may install it before or
     /// after the lazily created egress exists.
     #[cfg(any(test, feature = "fixtures"))]
     org_egress_send_observer: OrgEgressObserverSlot,
+    /// Fixtures-only override of the egress' per-datagram send policy. Shared
+    /// with the consumer at spawn, exactly like the observer slot.
+    #[cfg(any(test, feature = "fixtures"))]
+    org_egress_send_policy: OrgEgressSendPolicySlot,
     /// In-crate witness seam: fires after a release's authority preparation has
     /// succeeded and BEFORE the final currentness application.
     ///
@@ -9427,8 +9652,13 @@ pub struct MeshNode {
     /// final currentness comparison and before the table mutation. Lets a
     /// witness prove an authority installation or floor publication attempted in
     /// that exact instant cannot complete ahead of the mutation.
+    ///
+    /// Behind an `Arc` so the DISPATCH context shares the same slot: the
+    /// inbound organization admission runs the same fence and needs the same
+    /// window, and a witness must be able to install the seam on the node and
+    /// have it fire on the dispatch path.
     #[cfg(test)]
-    sensing_fence_seam: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    sensing_fence_seam: SensingSeamSlot,
     /// Fixtures-only: fires ONCE PER EMITTING Phase 2, with every sensing guard
     /// released and `org_transition_mu` still held. Lets a witness park one
     /// transition mid-flight and prove a later one cannot overtake it, and lets
@@ -11277,9 +11507,14 @@ impl MeshNode {
             sensing_interest_leases: sensing::SensingInterestLeases::default(),
             sensing_lease_apply_mu: parking_lot::Mutex::new(()),
             org_transition_mu: parking_lot::Mutex::new(()),
-            org_egress: std::sync::OnceLock::new(),
+            org_egress: parking_lot::Mutex::new(OrgEgressCell {
+                egress: None,
+                terminal: false,
+            }),
             #[cfg(any(test, feature = "fixtures"))]
             org_egress_send_observer: Arc::new(parking_lot::Mutex::new(None)),
+            #[cfg(any(test, feature = "fixtures"))]
+            org_egress_send_policy: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(test)]
             sensing_release_pre_apply_seam: parking_lot::Mutex::new(None),
             #[cfg(test)]
@@ -11287,7 +11522,7 @@ impl MeshNode {
             #[cfg(test)]
             sensing_acquire_pre_restore_seam: parking_lot::Mutex::new(None),
             #[cfg(test)]
-            sensing_fence_seam: parking_lot::Mutex::new(None),
+            sensing_fence_seam: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(any(test, feature = "fixtures"))]
             sensing_phase_two_seam: parking_lot::Mutex::new(None),
             sensing_local_projection_mu,
@@ -11743,20 +11978,50 @@ impl MeshNode {
         *self.sensing_fence_seam.lock() = Some(hook);
     }
 
-    /// The ordered organization egress, created on first use.
+    /// The ordered organization egress, created on first use — or `None` once
+    /// the node's egress lifecycle is TERMINAL.
     ///
     /// Lazy because `MeshNode::new` may run outside a tokio runtime while every
     /// organization transition necessarily runs inside one — the same
     /// requirement the pre-existing legacy `spawn_sensing_frame_send` already
     /// carries on this call chain.
-    fn org_egress(&self) -> &OrderedSensingEgress {
-        self.org_egress.get_or_init(|| {
-            OrderedSensingEgress::spawn(
-                self.socket.clone(),
-                #[cfg(any(test, feature = "fixtures"))]
-                self.org_egress_send_observer.clone(),
-            )
-        })
+    ///
+    /// Creation happens UNDER the lifecycle mutex, so it linearizes with
+    /// [`Self::take_org_egress_for_terminal_close`]: a first consumer can no
+    /// longer be spawned after shutdown has already closed and joined, which is
+    /// how a task and a queue used to outlive the node. The returned `Arc` is a
+    /// clone rather than a borrow so the mutex is never held across the
+    /// enqueue.
+    fn org_egress(&self) -> Option<Arc<OrderedSensingEgress>> {
+        let mut cell = self.org_egress.lock();
+        if cell.terminal {
+            return None;
+        }
+        if let Some(egress) = &cell.egress {
+            return Some(Arc::clone(egress));
+        }
+        let egress = Arc::new(OrderedSensingEgress::spawn(
+            self.socket.clone(),
+            #[cfg(any(test, feature = "fixtures"))]
+            self.org_egress_send_observer.clone(),
+            #[cfg(any(test, feature = "fixtures"))]
+            self.org_egress_send_policy.clone(),
+        ));
+        cell.egress = Some(Arc::clone(&egress));
+        Some(egress)
+    }
+
+    /// Enter the TERMINAL egress state and hand back the live egress, if any.
+    ///
+    /// Marking terminal under the lifecycle mutex is what makes shutdown final:
+    /// from the moment this returns, [`Self::org_egress`] creates nothing, so
+    /// the caller's close/join covers every consumer that will ever exist. The
+    /// handle stays in the cell so post-shutdown observation reads the real
+    /// counters of the task that actually ran.
+    fn take_org_egress_for_terminal_close(&self) -> Option<Arc<OrderedSensingEgress>> {
+        let mut cell = self.org_egress.lock();
+        cell.terminal = true;
+        cell.egress.as_ref().map(Arc::clone)
     }
 
     /// The ordered organization egress' observable state.
@@ -11767,10 +12032,27 @@ impl MeshNode {
     #[cfg(any(test, feature = "fixtures"))]
     #[doc(hidden)]
     pub fn org_egress_state_for_test(&self) -> OrgEgressState {
-        self.org_egress
-            .get()
+        let cell = self.org_egress.lock();
+        let mut state = cell
+            .egress
+            .as_deref()
             .map(OrderedSensingEgress::state)
-            .unwrap_or_default()
+            .unwrap_or_default();
+        state.terminal = cell.terminal;
+        state
+    }
+
+    /// Override the egress' per-datagram send policy: the deadline, and which
+    /// enqueue sequences must never resolve.
+    ///
+    /// Install BEFORE the egress is first used. The consumer reads the shared
+    /// slot per datagram, so a later install still takes effect, but the
+    /// deadline a stalled send is retired at is whatever the slot holds when
+    /// that send begins.
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn set_org_egress_send_policy_for_test(&self, policy: OrgEgressSendPolicy) {
+        *self.org_egress_send_policy.lock() = Some(policy);
     }
 
     /// Observe every organization datagram at the PRODUCTION send boundary —
@@ -12337,7 +12619,7 @@ impl MeshNode {
                 sensing::SUBPROTOCOL_SENSING_INTEREST,
                 bytes,
             ) {
-                self.org_egress().enqueue(packet, addr);
+                self.enqueue_org_datagram(packet, addr);
             }
         }
     }
@@ -12364,7 +12646,35 @@ impl MeshNode {
                 sensing::SUBPROTOCOL_SENSING_INTEREST,
                 bytes,
             ) {
-                self.org_egress().enqueue(packet, addr);
+                self.enqueue_org_datagram(packet, addr);
+            }
+        }
+    }
+
+    /// Hand one built organization datagram to the ordered egress.
+    ///
+    /// The single place the node reaches the egress from. `None` means the
+    /// lifecycle is already terminal — the node is shutting down and there is
+    /// nothing left to order — and a refused enqueue means the queue closed;
+    /// both are counted rather than silently swallowed, and neither is a
+    /// delivery claim.
+    fn enqueue_org_datagram(&self, packet: Bytes, addr: SocketAddr) {
+        match self.org_egress() {
+            Some(egress) => {
+                if !egress.enqueue(packet, addr) {
+                    tracing::debug!(
+                        addr = %addr,
+                        "ordered organization egress closed; the transition's frame is \
+                         not sent"
+                    );
+                }
+            }
+            None => {
+                tracing::debug!(
+                    addr = %addr,
+                    "ordered organization egress is terminal; the transition's frame is \
+                     not sent"
+                );
             }
         }
     }
@@ -12706,8 +13016,46 @@ impl MeshNode {
         )))
     }
 
+    /// Release a sensing-interest lease, PRESERVING the pre-existing
+    /// unit-returning surface.
+    ///
+    /// Identical work to
+    /// [`try_release_sensing_interest_lease`](Self::try_release_sensing_interest_lease)
+    /// — same transaction, same ordering, same refusal — it simply has no
+    /// channel to report a refusal on.
+    ///
+    /// # When that matters, and when it cannot
+    ///
+    /// A LEGACY-plane release is unconditional: tearing a row down or relaxing
+    /// a legacy cadence carries no membership claim, so this return type is
+    /// exact for it — and every caller that predates the organization plane
+    /// holds a legacy lease by construction, because the organization plane did
+    /// not exist.
+    ///
+    /// An ORGANIZATION lease's surviving-holder `Reregister` CAN be refused. A
+    /// refusal here is not weakened — nothing is released, the registry, the
+    /// table row and the wire all stand at the pre-transition cadence, and the
+    /// `SensingLeaseTicket` the caller still holds (it is `Copy`) remains live —
+    /// but this method cannot tell the caller. It is counted
+    /// (`SensingInterestLeases::release_refusals`) and logged at ERROR. Any
+    /// caller on the organization plane MUST use
+    /// [`try_release_sensing_interest_lease`](Self::try_release_sensing_interest_lease),
+    /// which hands the live ticket back with the reason.
+    pub fn release_sensing_interest_lease(&self, ticket: sensing::SensingLeaseTicket) {
+        if let Err(refused) = self.try_release_sensing_interest_lease(ticket) {
+            tracing::error!(
+                reason = %refused.reason,
+                "sensing lease: release REFUSED and nothing was released, but this \
+                 unit-returning surface cannot report it — the lease is still held at \
+                 its pre-transition cadence. Use `try_release_sensing_interest_lease` \
+                 on the organization plane"
+            );
+        }
+    }
+
     /// Release a sensing-interest lease acquired via
-    /// [`acquire_sensing_interest_lease`](Self::acquire_sensing_interest_lease).
+    /// [`acquire_sensing_interest_lease`](Self::acquire_sensing_interest_lease),
+    /// reporting a transactional refusal.
     /// Ticket-owned: all wire identity comes from the registry's stored
     /// state, never from re-supplied arguments, so a ticket can never be
     /// released against a different interest. Idempotent — the last holder's
@@ -12726,7 +13074,12 @@ impl MeshNode {
     /// discovered it could not author the relaxed cadence, leaving the registry
     /// relaxed while the table and the provider kept the strict one. A final
     /// release never fails: tearing a row down needs no membership claim.
-    pub fn release_sensing_interest_lease(
+    ///
+    /// This is the operation the organization ownership path and every SDK
+    /// internal use; [`release_sensing_interest_lease`](Self::release_sensing_interest_lease)
+    /// is the pre-existing unit-returning surface kept for source
+    /// compatibility.
+    pub fn try_release_sensing_interest_lease(
         &self,
         ticket: sensing::SensingLeaseTicket,
     ) -> Result<(), SensingLeaseReleaseRefused> {
@@ -20245,6 +20598,8 @@ impl MeshNode {
             sensing_emitter_notify: self.sensing_emitter_notify.clone(),
             org_install: self.org_install.clone(),
             org_install_generation: self.org_install_generation.clone(),
+            #[cfg(test)]
+            sensing_fence_seam: self.sensing_fence_seam.clone(),
             signing_identity: self.identity.clone(),
             capability_version: self.capability_version.clone(),
             sensing_observer_gate: self.sensing_observer_gate.clone(),
@@ -27258,8 +27613,8 @@ impl MeshNode {
         let key = sensing::ProviderInterestKey::new(spec.key(), target);
         // Acquire the interest-table guard FIRST, then bind the admitted authority
         // to its currentness evidence and — for an org admission — perform the FINAL
-        // currency recheck, all under the SAME held guard, and register without ever
-        // releasing it (Kyra amended-verdict closures 4 + 5).
+        // currency comparison and the row mutation INSIDE ONE PUBLICATION FENCE
+        // (Kyra amended-verdict closures 4 + 5, and the exact-head HOLD repair).
         //
         // Closure 5 (exhaustive authority↔evidence binding): the `Option` shape
         // alone would silently accept `Org`+`None` (skipping the recheck) or
@@ -27267,34 +27622,66 @@ impl MeshNode {
         // so only the two coherent pairings mutate; the rest fail closed with no
         // row.
         //
-        // Closure 4 (no post-check window): the recheck ran BEFORE `.lock()`
-        // previously, so table-lock contention could stall between a passing check
-        // and the register while a floor/rotation/poison landed. Holding the guard
-        // across the recheck AND the register closes that window — the successful
-        // check is the admission linearization point and the mutation follows it
-        // atomically. (Lock order: interest-table → org_install; no path takes the
-        // reverse, so this cannot deadlock.)
+        // Closure 4, and why the table lock is not enough: this used to call
+        // `capture_current_sensing_stamp`, which RELEASES `org_install` before it
+        // returns, and then mutate. Holding the interest-table guard across both
+        // excludes rival sensing transitions, but it excludes NOTHING on the
+        // authority side — no authority installation, store swap, `A -> B ->
+        // exact-A` rotation, floor publication (`apply_bundle` -> `StoreCore::
+        // publish`) or poison mark takes a sensing lock. So the comparison was a
+        // SAMPLE and any of those could linearize between the verdict and the row,
+        // producing a local row and an upstream continuation for a view the
+        // provider is already certain to reject.
+        //
+        // `with_fenced_current_authority` is the same centralized primitive the
+        // LOCAL lease leg uses: it holds `org_install` AND
+        // `OrgRevocationStore::pin_publication()` across the comparison and the
+        // bounded mutation, and builds its stamp from the pin's own accessors. Only
+        // `table.register` runs inside: no crypto, no authoring, no encoding, no
+        // I/O, no callback, no unrelated lock.
+        //
+        // (Lock order: interest-table → org_install → poison_gate → live. No
+        // publication, poison or installation path acquires a sensing lock, so no
+        // reverse edge exists and this cannot deadlock.)
         let outcome = {
             let mut table = ctx.sensing_interest_table.lock();
+            let register = |table: &mut sensing::InterestTable| {
+                table.register(
+                    &key,
+                    sensing::DownstreamId::Peer(from_node),
+                    requested_sample_interval,
+                    ttl,
+                    admitted.proven_root(),
+                    now,
+                )
+            };
             match (admitted.authority(), org_authority) {
-                (sensing::RegistrationAuthority::Legacy { .. }, None) => {}
+                (sensing::RegistrationAuthority::Legacy { .. }, None) => register(&mut table),
                 (sensing::RegistrationAuthority::Org { .. }, Some(snapshot)) => {
-                    let stale = match sensing::capture_current_sensing_stamp(
+                    // The seam Arc is bound to a local so it outlives the call.
+                    let seam = ctx.sensing_fence_seam_hook();
+                    let fenced = sensing::with_fenced_current_authority(
                         &ctx.org_install,
                         &ctx.node_authority,
                         &ctx.org_revocation,
                         &ctx.org_install_generation,
-                    ) {
-                        None => true,
-                        Some(current) => !snapshot.stamp().is_current(&current),
-                    };
-                    if stale {
-                        // Review §4: the pinned view went stale between the gate
-                        // and the mutation boundary — count it, then create no row.
-                        ctx.sensing_counters
-                            .org_stale_stamp
-                            .fetch_add(1, Ordering::Relaxed);
-                        return;
+                        snapshot.stamp(),
+                        seam.as_ref().map(|hook| hook.as_ref()),
+                        || register(&mut table),
+                    );
+                    match fenced {
+                        Some(outcome) => outcome,
+                        None => {
+                            // Review §4: the pinned view went stale at the
+                            // admission linearization point — count it, then
+                            // create no row. The fence refuses BEFORE
+                            // `table.register`, so the table is exactly as it
+                            // was.
+                            ctx.sensing_counters
+                                .org_stale_stamp
+                                .fetch_add(1, Ordering::Relaxed);
+                            return;
+                        }
                     }
                 }
                 // Incoherent authority/evidence pairing — a caller bug; never mutate.
@@ -27308,14 +27695,6 @@ impl MeshNode {
                     return;
                 }
             }
-            table.register(
-                &key,
-                sensing::DownstreamId::Peer(from_node),
-                requested_sample_interval,
-                ttl,
-                admitted.proven_root(),
-                now,
-            )
         };
         match outcome {
             sensing::RegisterOutcome::Registered(action) => {
@@ -37308,11 +37687,13 @@ impl Adapter for MeshNode {
         // successor node can mint.
         self.join_org_routing_supervisor().await;
 
-        // The ordered organization egress is node-owned: close it so its single
-        // consumer drains and exits, and JOIN it, so no task and no queue
-        // outlives this call. Bounded internally — a stalled socket is aborted
-        // rather than allowed to stall shutdown.
-        if let Some(egress) = self.org_egress.get() {
+        // The ordered organization egress is node-owned: enter the TERMINAL
+        // lifecycle state (so no later transition can create a first consumer
+        // behind this call), then close it so its single consumer drains and
+        // exits, and JOIN it, so no task and no queue outlives this call.
+        // Bounded internally — a stalled socket is aborted, and the aborted
+        // handle is awaited, rather than allowed to stall shutdown.
+        if let Some(egress) = self.take_org_egress_for_terminal_close() {
             egress.close_and_join().await;
         }
 
@@ -37398,8 +37779,11 @@ impl Drop for MeshNode {
         }
         // Same best-effort treatment for the ordered organization egress: a
         // destructor cannot await, and silently dropping the handle would merely
-        // DETACH the consumer, leaving it sending over a node that is gone.
-        if let Some(egress) = self.org_egress.get() {
+        // DETACH the consumer, leaving it sending over a node that is gone. It
+        // goes through the SAME terminal lifecycle transition as `shutdown`, so
+        // a destructor that races a last transition cannot leave a freshly
+        // created consumer behind.
+        if let Some(egress) = self.take_org_egress_for_terminal_close() {
             egress.close_and_abort();
         }
         // Review-11 P2: unsubscribe this node's raise callback from
@@ -43618,7 +44002,7 @@ mod sensing_authority_witness_tests {
             node.sensing_local_root(),
             "and specifically NOT the legacy local root"
         );
-        node.release_sensing_interest_lease(ticket)
+        node.try_release_sensing_interest_lease(ticket)
             .expect("the release must not be refused");
 
         // Specific to the org derivation, not a blanket behaviour: an audience
@@ -43828,7 +44212,7 @@ mod sensing_authority_witness_tests {
             node.sensing_local_root(),
             "and specifically not the legacy local root"
         );
-        node.release_sensing_interest_lease(ticket)
+        node.try_release_sensing_interest_lease(ticket)
             .expect("the release must not be refused");
     }
 
@@ -44032,7 +44416,7 @@ mod sensing_authority_witness_tests {
         let ticket = node
             .acquire_sensing_interest_lease(&spec, me, D)
             .expect("the exact self-provider shape is admitted");
-        node.release_sensing_interest_lease(ticket)
+        node.try_release_sensing_interest_lease(ticket)
             .expect("the release must not be refused");
     }
 
@@ -44072,7 +44456,7 @@ mod sensing_authority_witness_tests {
         node.node_authority.store(None);
 
         let refusal = node
-            .release_sensing_interest_lease(strict_ticket)
+            .try_release_sensing_interest_lease(strict_ticket)
             .expect_err("a surviving-holder org release must be REFUSED with no authority");
         assert!(
             matches!(
@@ -44104,7 +44488,7 @@ mod sensing_authority_witness_tests {
         // The ticket came back live, so the caller can retry.
         node.node_authority
             .store(Some(adopt(&node, &org(), "release-no-authority-2")));
-        node.release_sensing_interest_lease(refusal.ticket)
+        node.try_release_sensing_interest_lease(refusal.ticket)
             .expect("the returned ticket releases once authority is current again");
         let relaxed = node
             .sensing_downstream_entry(&key, sensing::DownstreamId::LeasedLocal)
@@ -44113,7 +44497,7 @@ mod sensing_authority_witness_tests {
             relaxed.requested_sample_interval, loose,
             "the retry finally relaxes to the surviving holder's cadence"
         );
-        node.release_sensing_interest_lease(loose_ticket)
+        node.try_release_sensing_interest_lease(loose_ticket)
             .expect("final release");
     }
 
@@ -44136,7 +44520,7 @@ mod sensing_authority_witness_tests {
         );
         node.node_authority.store(None);
 
-        node.release_sensing_interest_lease(ticket).expect(
+        node.try_release_sensing_interest_lease(ticket).expect(
             "a FINAL release must succeed with no authority — tearing a row \
                      down carries no membership claim",
         );
@@ -44178,7 +44562,7 @@ mod sensing_authority_witness_tests {
             .store(Some(adopt(&node, &other, "release-org-swap-other")));
 
         let refusal = node
-            .release_sensing_interest_lease(strict_ticket)
+            .try_release_sensing_interest_lease(strict_ticket)
             .expect_err("a surviving-holder release under a FOREIGN owner org must be refused");
         assert!(
             matches!(
@@ -44234,7 +44618,7 @@ mod sensing_authority_witness_tests {
             .expect("apply the floor raise");
 
         let refusal = node
-            .release_sensing_interest_lease(strict_ticket)
+            .try_release_sensing_interest_lease(strict_ticket)
             .expect_err("a retracted membership cannot re-author the relaxed cadence");
         assert!(
             matches!(
@@ -44286,7 +44670,7 @@ mod sensing_authority_witness_tests {
 
         // Releasing the strictest holder must SUCCEED on the legacy path — a
         // legacy release never consults organization authority at all.
-        node.release_sensing_interest_lease(strict_ticket)
+        node.try_release_sensing_interest_lease(strict_ticket)
             .expect("a legacy release is never refused");
         let relaxed = node
             .sensing_downstream_entry(&key, sensing::DownstreamId::LeasedLocal)
@@ -44297,7 +44681,7 @@ mod sensing_authority_witness_tests {
             "and it is STILL legacy-rooted — an installed authority must not \
              promote a legacy lease's transition to the organization plane"
         );
-        node.release_sensing_interest_lease(loose_ticket)
+        node.try_release_sensing_interest_lease(loose_ticket)
             .expect("final legacy release");
     }
 
@@ -44401,9 +44785,9 @@ mod sensing_authority_witness_tests {
         );
 
         node.clear_sensing_phase_two_seam_for_test();
-        node.release_sensing_interest_lease(b_ticket)
+        node.try_release_sensing_interest_lease(b_ticket)
             .expect("release B");
-        node.release_sensing_interest_lease(a_ticket)
+        node.try_release_sensing_interest_lease(a_ticket)
             .expect("release A");
     }
 
@@ -44447,7 +44831,7 @@ mod sensing_authority_witness_tests {
         let d_node = node.clone();
         let dereg = std::thread::spawn(move || {
             d_node
-                .release_sensing_interest_lease(ticket)
+                .try_release_sensing_interest_lease(ticket)
                 .expect("final release")
         });
         reached_rx
@@ -44487,7 +44871,7 @@ mod sensing_authority_witness_tests {
              stale one"
         );
         node.clear_sensing_phase_two_seam_for_test();
-        node.release_sensing_interest_lease(rival_ticket)
+        node.try_release_sensing_interest_lease(rival_ticket)
             .expect("release the rival");
         assert!(
             node.sensing_downstream_entry(&key, sensing::DownstreamId::LeasedLocal)
@@ -44530,7 +44914,7 @@ mod sensing_authority_witness_tests {
         );
 
         // Release the STRICTEST holder; the loose one survives.
-        node.release_sensing_interest_lease(strict_ticket)
+        node.try_release_sensing_interest_lease(strict_ticket)
             .expect("the release must not be refused");
         let relaxed = node
             .sensing_downstream_entry(&key, sensing::DownstreamId::LeasedLocal)
@@ -44548,7 +44932,7 @@ mod sensing_authority_witness_tests {
         );
 
         // Final release deregisters.
-        node.release_sensing_interest_lease(loose_ticket)
+        node.try_release_sensing_interest_lease(loose_ticket)
             .expect("the release must not be refused");
         assert!(
             node.sensing_downstream_entry(&key, sensing::DownstreamId::LeasedLocal)
@@ -44629,7 +45013,7 @@ mod sensing_authority_witness_tests {
         }
 
         let refusal = node
-            .release_sensing_interest_lease(strict_ticket)
+            .try_release_sensing_interest_lease(strict_ticket)
             .expect_err("a view staled between preparation and the fence must refuse");
         assert!(
             matches!(
@@ -44677,14 +45061,14 @@ mod sensing_authority_witness_tests {
 
         // The ticket came back live: retry succeeds now the window is closed.
         node.clear_sensing_release_pre_apply_seam_for_test();
-        node.release_sensing_interest_lease(refusal.ticket)
+        node.try_release_sensing_interest_lease(refusal.ticket)
             .expect("the returned ticket releases once the view is current again");
         let relaxed = node
             .sensing_downstream_entry(&key, sensing::DownstreamId::LeasedLocal)
             .expect("the row survives the retry");
         assert_eq!(relaxed.requested_sample_interval, loose);
         node.clear_sensing_phase_two_seam_for_test();
-        node.release_sensing_interest_lease(loose_ticket)
+        node.try_release_sensing_interest_lease(loose_ticket)
             .expect("final release");
     }
 
@@ -44834,7 +45218,7 @@ mod sensing_authority_witness_tests {
         );
 
         node.clear_sensing_acquire_pre_restore_seam_for_test();
-        node.release_sensing_interest_lease(loose_ticket)
+        node.try_release_sensing_interest_lease(loose_ticket)
             .expect("the surviving ticket releases");
     }
 
@@ -44970,7 +45354,7 @@ mod sensing_authority_witness_tests {
         // installation left to tear down.
         node.clear_sensing_acquire_pre_restore_seam_for_test();
         node.clear_sensing_phase_two_seam_for_test();
-        node.release_sensing_interest_lease(loose_ticket)
+        node.try_release_sensing_interest_lease(loose_ticket)
             .expect("releasing an invalidated lease is a no-op, not a failure");
     }
 
@@ -45061,7 +45445,7 @@ mod sensing_authority_witness_tests {
 
         node.clear_sensing_cached_floor_for_test(&spec, target);
         node.clear_sensing_phase_two_seam_for_test();
-        node.release_sensing_interest_lease(loose_ticket)
+        node.try_release_sensing_interest_lease(loose_ticket)
             .expect("the surviving ticket releases");
     }
 
@@ -45154,7 +45538,7 @@ mod sensing_authority_witness_tests {
         let rel_node = node.clone();
         let (rel_done_tx, rel_done_rx) = mpsc::sync_channel::<()>(1);
         let rel = std::thread::spawn(move || {
-            let outcome = rel_node.release_sensing_interest_lease(ticket);
+            let outcome = rel_node.try_release_sensing_interest_lease(ticket);
             let _ = rel_done_tx.send(());
             outcome
         });
@@ -45264,7 +45648,7 @@ mod sensing_authority_witness_tests {
         );
 
         node.clear_sensing_phase_two_seam_for_test();
-        node.release_sensing_interest_lease(ticket)
+        node.try_release_sensing_interest_lease(ticket)
             .expect("release");
     }
 
@@ -45289,7 +45673,7 @@ mod sensing_authority_witness_tests {
                 *held.lock() = Some(SensingGuards::held());
             }));
         }
-        node.release_sensing_interest_lease(ticket)
+        node.try_release_sensing_interest_lease(ticket)
             .expect("final release");
         let observed = held
             .lock()
@@ -45306,7 +45690,7 @@ mod sensing_authority_witness_tests {
 
     // ---- CURRENTNESS FENCE (item 5) ---------------------------------------
 
-    /// An authority INSTALL attempted in the instant between the final
+    /// A REAL authority installation attempted in the instant between the final
     /// currentness comparison and the table mutation cannot complete ahead of
     /// the mutation.
     ///
@@ -45316,47 +45700,117 @@ mod sensing_authority_witness_tests {
     /// floor raise or poison mark landing in that gap produced a local row and a
     /// ticket for a frame the provider was already certain to reject.
     ///
-    /// The fence holds `org_install` across both. This witness fires inside the
-    /// fence and proves a real installation attempt is still blocked there.
+    /// # What makes this non-vacuous
+    ///
+    /// The rival runs the PRODUCTION installer
+    /// ([`MeshNode::install_node_authority`]) — not a bare
+    /// `node_authority.store(..)`, which publishes without taking the
+    /// installation lock at all and therefore proves nothing about the fence.
+    ///
+    /// And it ACKNOWLEDGES AT THE LOCK: it `try_lock`s `org_install` and
+    /// reports that the attempt FAILED before it commits to the blocking
+    /// installer. An acknowledgement that fires regardless of contention only
+    /// proves the rival was scheduled; one that required the try to fail proves
+    /// the exclusion was actually met. There is no `sleep` anywhere here — the
+    /// seam holds `org_install` for exactly as long as it takes the rival to
+    /// report, so the negative assertion cannot pass because a scheduler was
+    /// slow.
+    ///
+    /// # The ordering, observed from both sides
+    ///
+    /// * inside the fence, with the rival provably blocked: publication is
+    ///   STILL the old authority and the old installation generation;
+    /// * from the rival, the instant its installation returns: the fenced row
+    ///   ALREADY exists — so the mutation completed first and only then did the
+    ///   installer publish and join.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_install_attempted_inside_the_fence_cannot_precede_the_mutation() {
         use std::sync::mpsc;
+
+        /// What the rival installer observed, in order.
+        struct RivalReport {
+            /// The `org_install` `try_lock` at the moment the fence held it.
+            lock_attempt_failed: bool,
+            /// Whether the fenced row existed the instant the real installation
+            /// returned.
+            row_present_when_published: bool,
+            /// The installation generation after the real installer published.
+            generation_after: u64,
+        }
 
         let node = sensing_org_node("fence-install").await;
         let target = node.node_id().wrapping_add(1);
         let spec = org_spec(target, org_commitment());
         let key = sensing::ProviderInterestKey::new(spec.key(), target);
 
+        let authority_before = node.node_authority.load_full().expect("adopted authority");
+        let generation_before = node.org_install_generation.load(Ordering::Acquire);
+        let rival_authority = adopt(&node, &org(), "fence-install-rival");
+
+        // `go`: the fence has `org_install` held and wants the rival to try it.
+        // `blocked`: the rival's try FAILED, so the exclusion is proven met.
+        let (go_tx, go_rx) = mpsc::sync_channel::<()>(1);
+        let (blocked_tx, blocked_rx) = mpsc::sync_channel::<bool>(1);
+        let rival = {
+            let node = node.clone();
+            let key = key.clone();
+            std::thread::spawn(move || {
+                go_rx.recv().expect("the fence must release the rival");
+                // THE ACKNOWLEDGEMENT, at the actual lock the installer needs.
+                let lock_attempt_failed = node.org_install.try_lock().is_none();
+                let _ = blocked_tx.send(lock_attempt_failed);
+                // THE REAL PRODUCTION INSTALLER. Blocks on `org_install` until
+                // the fence has finished its mutation and released it.
+                node.install_node_authority(rival_authority)
+                    .expect("a same-org replacement installs");
+                RivalReport {
+                    lock_attempt_failed,
+                    row_present_when_published: node
+                        .sensing_downstream_entry(&key, sensing::DownstreamId::LeasedLocal)
+                        .is_some(),
+                    generation_after: node.org_install_generation.load(Ordering::Acquire),
+                }
+            })
+        };
+
         let (inside_tx, inside_rx) = mpsc::sync_channel::<()>(1);
-        let install_done = Arc::new(AtomicU64::new(0));
         {
-            let install_done = install_done.clone();
-            let node2 = node.clone();
+            let observer = node.clone();
+            let authority_before = Arc::clone(&authority_before);
+            // The seam is `dyn Fn() + Send + Sync`, and `mpsc::Receiver` is
+            // `Send` but not `Sync` — guard it, exactly like the sibling
+            // parked-transition witnesses do.
+            let blocked_rx = Arc::new(parking_lot::Mutex::new(blocked_rx));
             node.set_sensing_fence_seam_for_test(Arc::new(move || {
                 // We are inside the fence with `org_install` HELD.
-                let n = node2.clone();
-                let done = install_done.clone();
-                std::thread::spawn(move || {
-                    n.node_authority
-                        .store(Some(adopt(&n, &org(), "fence-install-rival")));
-                    // A real acquisition of the installation lock — this is what
-                    // must not be able to complete while the fence holds it.
-                    let _install = n.org_install.lock();
-                    done.store(1, Ordering::SeqCst);
-                });
-                // Give the rival a generous window. It must NOT finish.
-                std::thread::sleep(Duration::from_millis(300));
-                let _ = inside_tx.send(());
-                assert_eq!(
-                    install_done.load(Ordering::SeqCst),
-                    0,
-                    "an installation completed while the currentness fence held \
-                     `org_install` — the comparison is a sample, not an exclusion, \
-                     so a row can be created for an authority that already moved"
+                let _ = go_tx.send(());
+                let failed = blocked_rx
+                    .lock()
+                    .recv()
+                    .expect("the rival must report its lock attempt");
+                assert!(
+                    failed,
+                    "the installation lock was FREE inside the currentness fence — \
+                         the comparison is a sample, not an exclusion, so a row can be \
+                         created for an authority that already moved"
                 );
-                // The rival thread finishes on its own once the fence releases;
-                // it is detached deliberately so the fence is never the thing
-                // waiting on it.
+                // The rival is blocked at the lock, so publication cannot
+                // have moved: same authority object, same generation.
+                let published = observer
+                    .node_authority
+                    .load_full()
+                    .expect("still installed");
+                assert!(
+                    Arc::ptr_eq(&published, &authority_before),
+                    "a rival installation published while the fence held \
+                         `org_install`"
+                );
+                assert_eq!(
+                    observer.org_install_generation.load(Ordering::Acquire),
+                    generation_before,
+                    "the installation generation advanced inside the fence window"
+                );
+                let _ = inside_tx.send(());
             }));
         }
 
@@ -45374,7 +45828,21 @@ mod sensing_authority_witness_tests {
             org_commitment(),
             "under the organization-derived root"
         );
-        node.release_sensing_interest_lease(ticket)
+
+        let report = rival.join().expect("the rival installer joins");
+        assert!(report.lock_attempt_failed);
+        assert!(
+            report.row_present_when_published,
+            "the rival installation published BEFORE the fenced row existed — the \
+             mutation must complete first and the installer only then publish"
+        );
+        assert!(
+            report.generation_after > generation_before,
+            "the real installer never published at all, so nothing was excluded: \
+             generation stayed at {generation_before}"
+        );
+
+        node.try_release_sensing_interest_lease(ticket)
             .expect("release");
     }
 
@@ -45411,7 +45879,7 @@ mod sensing_authority_witness_tests {
             "the emission observer must be live — a healthy org acquisition \
              authors exactly one frame"
         );
-        node.release_sensing_interest_lease(control)
+        node.try_release_sensing_interest_lease(control)
             .expect("release the control");
         let baseline = phase_two_entries.load(Ordering::SeqCst);
 
@@ -45468,8 +45936,433 @@ mod sensing_authority_witness_tests {
             "the legacy row still carries the node's own sensing root"
         );
         assert_ne!(row.owner_root, org_commitment());
-        node.release_sensing_interest_lease(ticket)
+        node.try_release_sensing_interest_lease(ticket)
             .expect("the release must not be refused");
+    }
+
+    // ---- INBOUND ADMISSION FENCE ------------------------------------------
+    //
+    // `apply_provider_registration` held the interest-table guard, sampled
+    // currentness with `capture_current_sensing_stamp` (which RELEASES
+    // `org_install` before returning), and then called `table.register`. The
+    // table guard excludes rival sensing transitions and NOTHING on the
+    // authority side, so a floor publication, a poison mark or an authority
+    // swap could linearize between the verdict and the row. These three drive
+    // the PRODUCTION inbound path.
+
+    /// The inbound row mutation happens INSIDE the store's publication pin.
+    ///
+    /// This thread holds `OrgRevocationStore::pin_publication()` for the first
+    /// half. A sampling comparison sails straight through that — it wants only
+    /// a second `live.read()`, which coexists with ours — so the row appears
+    /// immediately. A fenced one must block on `poison_gate`, which the pin
+    /// holds, until we let go.
+    ///
+    /// The seam ack is what makes the negative assertion sound: it fires with
+    /// `org_install` already held and immediately BEFORE the pin is taken, so
+    /// the only thing left between it and a row is the pin acquisition.
+    ///
+    /// Because the mutation is inside the pin, no floor publication
+    /// (`apply_bundle` -> `StoreCore::publish` needs `live.write()`) and no
+    /// poison transition (needs `poison_gate`) can linearize between the final
+    /// comparison and the row.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_inbound_org_row_mutation_cannot_interleave_with_a_publication() {
+        use std::sync::mpsc;
+
+        let node = org_node("inbound-pin").await;
+        let sender = EntityKeypair::generate().entity_id().clone();
+        pin_sender(&node, &sender);
+        let target = node.node_id().wrapping_add(1);
+        let key =
+            sensing::ProviderInterestKey::new(org_spec(target, org_commitment()).key(), target);
+        let store = node.org_revocation_store().expect("installed store");
+
+        let (at_seam_tx, at_seam_rx) = mpsc::sync_channel::<()>(1);
+        node.set_sensing_fence_seam_for_test(Arc::new(move || {
+            let _ = at_seam_tx.send(());
+        }));
+
+        let ctx = node.dispatch_ctx();
+        let now = Instant::now();
+        let now_secs = current_timestamp();
+        let (admitted, snapshot) = MeshNode::admit_org_registration(
+            &ctx,
+            &org_provider_frame(target, org_commitment(), member_cert(&sender, 1)),
+            FROM_NODE,
+            &sender,
+            now_secs,
+        )
+        .expect("a valid org provider registration is admitted");
+
+        // Publication AND poison are immobile for as long as this lives.
+        let held = store.pin_publication();
+
+        let (done_tx, done_rx) = mpsc::sync_channel::<()>(1);
+        let apply = {
+            let ctx = ctx.clone();
+            // The completion path spawns tasks, so the worker needs the
+            // runtime context this test's `#[tokio::test]` created.
+            let runtime = tokio::runtime::Handle::current();
+            std::thread::spawn(move || {
+                let _entered = runtime.enter();
+                MeshNode::apply_provider_registration(
+                    &ctx,
+                    &admitted,
+                    Some(&snapshot),
+                    FROM_NODE,
+                    now,
+                    now_secs,
+                );
+                let _ = done_tx.send(());
+            })
+        };
+
+        at_seam_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the inbound fence must reach its seam — that needs only `org_install`");
+        // The blocked worker is holding the interest-table guard, so the row
+        // is NOT read here: reading it would queue behind that guard and this
+        // witness would deadlock rather than fail. Non-completion is the
+        // property — `table.register` runs inside the fence, so a fence that
+        // has not returned has created nothing.
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(500)).is_err(),
+            "the inbound admission completed while this thread held the store's \
+             publication pin — the currentness comparison is SAMPLING the store, so a \
+             floor publication or a poison transition can still land between the \
+             verdict and the row"
+        );
+
+        drop(held);
+        apply.join().expect("the inbound admission joins");
+        assert!(
+            node.sensing_downstream_entry(&key, sensing::DownstreamId::Peer(FROM_NODE))
+                .is_some(),
+            "once the pin is free the fenced mutation completes normally"
+        );
+    }
+
+    /// A real signed floor publication that WINS the fence window — it lands
+    /// while the seam holds `org_install`, before the pin — makes the inbound
+    /// registration refuse with no row.
+    #[tokio::test]
+    async fn a_floor_publication_winning_the_inbound_fence_creates_no_row() {
+        let node = org_node("inbound-floor").await;
+        let sender = EntityKeypair::generate().entity_id().clone();
+        pin_sender(&node, &sender);
+        let target = node.node_id().wrapping_add(1);
+        let key =
+            sensing::ProviderInterestKey::new(org_spec(target, org_commitment()).key(), target);
+        let store = node.org_revocation_store().expect("installed store");
+        let before = node
+            .sensing_counters
+            .org_stale_stamp
+            .load(Ordering::Relaxed);
+
+        let ctx = node.dispatch_ctx();
+        let now = Instant::now();
+        let now_secs = current_timestamp();
+        let (admitted, snapshot) = MeshNode::admit_org_registration(
+            &ctx,
+            &org_provider_frame(target, org_commitment(), member_cert(&sender, 1)),
+            FROM_NODE,
+            &sender,
+            now_secs,
+        )
+        .expect("admitted");
+
+        // The raise runs SYNCHRONOUSLY inside the seam, so it is complete
+        // before the pin is taken and before the final comparison — no
+        // scheduling inference.
+        let unrelated = EntityKeypair::generate().entity_id().clone();
+        node.set_sensing_fence_seam_for_test(Arc::new(move || {
+            let mut floors = BTreeMap::new();
+            floors.insert(unrelated.clone(), 7u32);
+            let bundle = OrgRevocationBundle::try_issue(&org(), &floors).expect("bundle");
+            store.apply_bundle(&bundle).expect("apply the floor raise");
+        }));
+
+        MeshNode::apply_provider_registration(
+            &ctx,
+            &admitted,
+            Some(&snapshot),
+            FROM_NODE,
+            now,
+            now_secs,
+        );
+        assert!(
+            node.sensing_downstream_entry(&key, sensing::DownstreamId::Peer(FROM_NODE))
+                .is_none(),
+            "a floor publication that won the fence window must create NO row"
+        );
+        assert_eq!(
+            node.sensing_counters
+                .org_stale_stamp
+                .load(Ordering::Relaxed),
+            before + 1,
+            "and the refusal must be counted as a stale stamp"
+        );
+    }
+
+    /// The poison companion: a poison mark that wins the inbound fence window
+    /// refuses with no row.
+    #[tokio::test]
+    async fn a_poison_winning_the_inbound_fence_creates_no_row() {
+        let node = org_node("inbound-poison").await;
+        let sender = EntityKeypair::generate().entity_id().clone();
+        pin_sender(&node, &sender);
+        let target = node.node_id().wrapping_add(1);
+        let key =
+            sensing::ProviderInterestKey::new(org_spec(target, org_commitment()).key(), target);
+        let store = node.org_revocation_store().expect("installed store");
+        let before = node
+            .sensing_counters
+            .org_stale_stamp
+            .load(Ordering::Relaxed);
+
+        let ctx = node.dispatch_ctx();
+        let now = Instant::now();
+        let now_secs = current_timestamp();
+        let (admitted, snapshot) = MeshNode::admit_org_registration(
+            &ctx,
+            &org_provider_frame(target, org_commitment(), member_cert(&sender, 1)),
+            FROM_NODE,
+            &sender,
+            now_secs,
+        )
+        .expect("admitted");
+
+        node.set_sensing_fence_seam_for_test(Arc::new(move || {
+            store.mark_poisoned_for_test();
+        }));
+
+        MeshNode::apply_provider_registration(
+            &ctx,
+            &admitted,
+            Some(&snapshot),
+            FROM_NODE,
+            now,
+            now_secs,
+        );
+        assert!(
+            node.sensing_downstream_entry(&key, sensing::DownstreamId::Peer(FROM_NODE))
+                .is_none(),
+            "a poison mark that won the fence window must create NO row"
+        );
+        assert_eq!(
+            node.sensing_counters
+                .org_stale_stamp
+                .load(Ordering::Relaxed),
+            before + 1,
+            "and the refusal must be counted as a stale stamp"
+        );
+    }
+
+    // ---- BOUNDED ORDERED EGRESS -------------------------------------------
+
+    /// One unwritable socket cannot wedge the ordered egress forever: the
+    /// stuck send is RETIRED at the deadline, is NOT counted as sent, and the
+    /// next queued datagram advances.
+    ///
+    /// The pre-repair consumer awaited a raw `NetSocket::send_to` with no bound
+    /// and discarded the result, so the first unwritable peer parked the single
+    /// sequential consumer permanently and every later organization transition
+    /// queued behind it until the bound evicted it.
+    ///
+    /// The stall is injected through the production send policy: the SAME
+    /// `bound_datagram_send` wrapper retires it, only the deadline and the
+    /// awaited future are substituted, so a witness needs neither a wedged UDP
+    /// socket nor a five-second wait.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stuck_org_send_retires_at_the_deadline_and_the_next_advances() {
+        let node = sensing_org_node("egress-stuck").await;
+        node.set_org_egress_send_policy_for_test(OrgEgressSendPolicy {
+            deadline: Duration::from_millis(120),
+            // ONLY the first datagram stalls, so the second one advancing is
+            // the property rather than an accident of the policy.
+            stall: Arc::new(|seq| seq == 0),
+        });
+        let egress = node
+            .org_egress()
+            .expect("a fresh node's egress is creatable");
+        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+
+        assert!(egress.enqueue(Bytes::from_static(b"stuck"), addr));
+        assert!(egress.enqueue(Bytes::from_static(b"next"), addr));
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let state = node.org_egress_state_for_test();
+            if state.send_failed >= 1 && state.sent >= 1 {
+                assert_eq!(
+                    state.send_failed, 1,
+                    "exactly the stalled datagram was retired"
+                );
+                assert_eq!(
+                    state.sent, 1,
+                    "a datagram the socket never took must NOT be counted as sent"
+                );
+                assert_eq!(state.depth, 0, "and the queue drained");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the stuck send never retired and the later datagram never advanced: \
+                 {state:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // And shutdown stays bounded with the policy still armed.
+        let started = Instant::now();
+        node.shutdown().await.expect("shutdown");
+        assert!(
+            started.elapsed() < ORG_EGRESS_DRAIN_GRACE * 5,
+            "shutdown took {:?} — the drain grace is not bounding it",
+            started.elapsed()
+        );
+        assert!(
+            node.org_egress_state_for_test().consumer_finished,
+            "the consumer must have settled"
+        );
+    }
+
+    /// Shutdown is TERMINAL for both creation and enqueue.
+    ///
+    /// The pre-repair lifecycle was a `OnceLock`: creation was `get_or_init`,
+    /// shutdown a one-time `get()`, and the two did not order against each
+    /// other — so a first consumer could be created after `shutdown` had
+    /// returned, leaving a task and a queue outliving the node.
+    #[tokio::test]
+    async fn a_shutdown_egress_can_be_neither_created_nor_enqueued() {
+        let node = sensing_org_node("egress-terminal").await;
+        // Never used before shutdown: this is exactly the "first creation after
+        // shutdown returned" case.
+        assert!(
+            !node.org_egress_state_for_test().started,
+            "precondition: no egress exists yet"
+        );
+        node.shutdown().await.expect("shutdown");
+
+        assert!(
+            node.org_egress().is_none(),
+            "a first consumer was created AFTER shutdown returned — it and its queue \
+             now outlive the node"
+        );
+        let state = node.org_egress_state_for_test();
+        assert!(state.terminal, "the lifecycle must be terminal");
+        assert!(
+            !state.started,
+            "and nothing may have been spawned by the attempt"
+        );
+    }
+
+    /// An enqueue that races the consumer's closed-and-empty exit is REFUSED
+    /// rather than stranded.
+    ///
+    /// Closure and acceptance are decided under the same queue lock, so the
+    /// post-close enqueue cannot land behind a consumer that has already
+    /// exited. Observed on the real egress, after a real close.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_enqueue_after_close_is_refused_and_strands_no_queue() {
+        let node = sensing_org_node("egress-close-race").await;
+        let egress = node.org_egress().expect("creatable");
+        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+
+        // Close and JOIN, so the consumer has provably observed closed+empty
+        // and exited before the racing enqueue is attempted.
+        egress.close_and_join().await;
+        assert!(
+            node.org_egress_state_for_test().consumer_finished,
+            "precondition: the consumer has exited"
+        );
+
+        assert!(
+            !egress.enqueue(Bytes::from_static(b"late"), addr),
+            "a closed queue accepted a datagram no consumer will ever observe"
+        );
+        let state = node.org_egress_state_for_test();
+        assert_eq!(state.depth, 0, "a stranded nonzero queue with no consumer");
+        assert_eq!(state.refused_closed, 1, "and the refusal must be counted");
+    }
+
+    // ---- TERMINAL LEASE IDENTITY, AT THE NODE -----------------------------
+
+    /// An exhausted holder-identity space refuses the acquisition BEFORE any
+    /// interest-table or emitter mutation, and leaves the incumbent lease — its
+    /// registry entry, its cadence and its row — exactly as it was.
+    ///
+    /// Identity is reserved by the registry PREVIEW, which runs before
+    /// `apply_sensing_lease_action`; reserving it in the commit instead would
+    /// mean the table had already moved by the time exhaustion was noticed.
+    #[tokio::test]
+    async fn an_exhausted_lease_identity_space_moves_no_row_and_keeps_incumbents() {
+        let node = sensing_org_node("lease-identity").await;
+        let target = node.node_id().wrapping_add(1);
+        let spec = org_spec(target, org_commitment());
+        let key = sensing::ProviderInterestKey::new(spec.key(), target);
+
+        let incumbent = node
+            .acquire_sensing_interest_lease(&spec, target, Duration::from_millis(200))
+            .expect("the incumbent acquires");
+        let row_before = node
+            .sensing_downstream_entry(&key, sensing::DownstreamId::LeasedLocal)
+            .expect("the incumbent's row exists");
+
+        // Exhaust the space, then attempt a STRICTER acquisition — the one
+        // shape that would move the shared row if it got as far as the table.
+        node.sensing_interest_leases
+            .seed_token_space_for_test(sensing::SensingInterestLeases::token_space_end());
+        let phase_two = Arc::new(AtomicU64::new(0));
+        {
+            let seen = phase_two.clone();
+            node.set_sensing_phase_two_seam_for_test(Arc::new(move || {
+                seen.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        let refused = node
+            .acquire_sensing_interest_lease(&spec, target, Duration::from_millis(10))
+            .expect_err("an exhausted identity space must refuse");
+        assert!(
+            matches!(
+                refused,
+                SensingRegistrationError::LeaseAtCapacity(sensing::LeaseRefused::IdentityExhausted)
+            ),
+            "got {refused:?}"
+        );
+        assert_eq!(
+            phase_two.load(Ordering::SeqCst),
+            0,
+            "a refusal that cannot be named must emit nothing at all"
+        );
+        let row_after = node
+            .sensing_downstream_entry(&key, sensing::DownstreamId::LeasedLocal)
+            .expect("the incumbent's row must survive");
+        assert_eq!(
+            row_after.requested_sample_interval, row_before.requested_sample_interval,
+            "the refused stricter acquisition moved the incumbent's cadence"
+        );
+        let lease_key = sensing::SensingLeaseKey::ExactProvider {
+            audience: spec.audience,
+            interest_digest: spec.interest_digest(),
+            provider: target,
+        };
+        assert_eq!(
+            node.sensing_interest_leases.entry_for_test(&lease_key),
+            Some((1, Duration::from_millis(200))),
+            "and the registry still holds exactly the incumbent"
+        );
+
+        // The incumbent's own ticket still performs a terminal deregistration.
+        node.clear_sensing_phase_two_seam_for_test();
+        node.try_release_sensing_interest_lease(incumbent)
+            .expect("a terminal deregistration needs no new identity");
+        assert!(
+            node.sensing_downstream_entry(&key, sensing::DownstreamId::LeasedLocal)
+                .is_none(),
+            "the incumbent tore its row down"
+        );
     }
 }
 
