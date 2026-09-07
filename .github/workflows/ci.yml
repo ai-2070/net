@@ -523,7 +523,7 @@ jobs:
       #   org_gate                        = 60
       #     42 baseline + 7 (selector-target intake) + 5 (local-origin planner)
       #     + 6 (publication-pinned fence, off-lock relay crypto window)
-      #   sensing_authority_witness_tests = 66
+      #   sensing_authority_witness_tests = 67
       #     28 baseline + 1 (dispatch ordering) + 6 (local org lease egress)
       #     + 4 (lease-egress hold repair) + 10 (transition order, release
       #     coherence, phase-2 coverage, currentness fence)
@@ -536,13 +536,16 @@ jobs:
       #     + 5 (exact-head RE-REVIEW repair: grace-expiry settlement, concurrent
       #     teardown, cancelled teardown, the parked-creation/shutdown race, the
       #     parked-enqueue/close race)
+      #     + 1 (exact-head THIRD-review repair: post-abort cancellation
+      #     recovered and retired exactly once, split off the drain-cancellation
+      #     leg it used to share)
       #     net of 3 retired: the two manual-wrapper guard witnesses replaced by
       #     production-observed ones, and the cached-floor "rollback plane"
       #     witness replaced by the two destructive-partition witnesses above
       # The mesh line previously read 35 while MESH_MIN read 39 — the arithmetic
       # drifted from the pin. Re-derive both from `--list` when you change them.
       #
-      # REQUIRED holds 57 names (18 gate + 39 mesh). Count with the loops below,
+      # REQUIRED holds 58 names (18 gate + 40 mesh). Count with the loops below,
       # not by eye: a prior comment claimed 34, which was neither the roster size
       # nor any derived figure.
       #
@@ -558,7 +561,7 @@ jobs:
           GATE=adapter::net::behavior::sensing::org_gate::tests
           MESH=adapter::net::mesh::sensing_authority_witness_tests
           GATE_MIN=60
-          MESH_MIN=66
+          MESH_MIN=67
 
           die() { echo "::error::$1"; shift; [ "$#" -gt 0 ] && printf '%s\n' "$@"; exit 1; }
 
@@ -673,7 +676,8 @@ jobs:
           concurrent_teardowns_both_observe_settlement
           a_cancelled_teardown_leaves_the_consumer_recoverable
           a_creation_parked_under_the_cell_cannot_be_overtaken_by_shutdown
-          an_enqueue_holding_the_queue_lock_blocks_close"
+          an_enqueue_holding_the_queue_lock_blocks_close
+          a_post_abort_cancellation_is_recovered_and_retired_exactly_once"
 
           check_one() {
             fqn="$1"
@@ -1199,60 +1203,100 @@ jobs:
 
           # Inventory records for ONE test name. `cargo nextest list` prints
           # `<crate>::<binary> <test>`, one per line, and executes nothing.
+          # ANCHORED at line start, so a `note:`/`test stdout:` line quoting a
+          # record cannot be counted as one.
           inventory_count() {   # $1=inventory  $2=test name
             printf '%s\n' "$1" | strip_ansi \
-              | grep -cE "::${BIN} ${2}\$" || true
+              | grep -cE "^[A-Za-z0-9_-]+::${BIN} ${2}\$" || true
           }
           inventory_total() {   # $1=inventory
             printf '%s\n' "$1" | strip_ansi \
-              | grep -cE "::${BIN} [A-Za-z0-9_]+\$" || true
+              | grep -cE "^[A-Za-z0-9_-]+::${BIN} [A-Za-z0-9_]+\$" || true
           }
-          # The last nextest summary line, ANSI-free.
-          summary_line() {      # $1=output
+          # Nextest's own final Summary RECORD, ANSI-free and anchored.
+          #
+          # `^\s*Summary \[..\]` plus end-of-line is what keeps a diagnostic
+          # substring out: a test that prints "1 test run: 1 passed, 0 skipped"
+          # on its own stdout, or a `note:`-prefixed paraphrase, matches
+          # nothing. `tail -1` then takes nextest's record, which always follows
+          # all test output.
+          #
+          # The `passed` count may carry runner annotations — nextest 0.9.143
+          # emits `9 passed (1 slow)` and can add `(1 slow, 1 leaky)` — and
+          # failure runs insert `N failed` before `skipped`. Both are accepted
+          # by the grammar and then judged on the extracted NUMBERS, which is
+          # why a `1 failed` run still fails the `passed == run` check below.
+          summary_record() {    # $1=output
             printf '%s\n' "$1" | strip_ansi \
-              | grep -oE '[0-9]+ tests? run: [0-9]+ passed, [0-9]+ skipped' \
+              | grep -E '^[[:space:]]*Summary \[[^]]*\] [0-9]+ tests? run: [0-9]+ passed[^:]*, [0-9]+ skipped$' \
               | tail -1
           }
-          # WHOLE-BINARY acceptance: status first, then every inventoried test
-          # ran and passed and nothing was skipped.
-          accept_whole_run() {  # $1=status  $2=output  $3=expected count
+          summary_field() {     # $1=record  $2=run|passed|skipped
+            case "$2" in
+              run)     printf '%s' "$1" | sed -E 's/.*\] ([0-9]+) tests? run:.*/\1/' ;;
+              passed)  printf '%s' "$1" | sed -E 's/.*run: ([0-9]+) passed.*/\1/' ;;
+              skipped) printf '%s' "$1" | sed -E 's/.*[ ,]([0-9]+) skipped$/\1/' ;;
+            esac
+          }
+          # WHOLE-BINARY acceptance: command status first (authoritative), then
+          # the run must cover EXACTLY the inventory, pass all of it, and skip
+          # nothing.
+          accept_whole_run() {  # $1=status  $2=output  $3=inventory count
             [ "$1" -eq 0 ] || return 1
-            line=$(summary_line "$2")
-            [ -n "$line" ] || return 1
-            passed=$(printf '%s' "$line" | sed -E 's/.*run: ([0-9]+) passed.*/\1/')
-            skipped=$(printf '%s' "$line" | sed -E 's/.*, ([0-9]+) skipped.*/\1/')
+            rec=$(summary_record "$2")
+            [ -n "$rec" ] || return 1
+            run=$(summary_field "$rec" run)
+            passed=$(summary_field "$rec" passed)
+            skipped=$(summary_field "$rec" skipped)
             [ "$skipped" -eq 0 ] || return 1
-            [ "$passed" -ge "$3" ] || return 1
+            [ "$run" -eq "$3" ] || return 1
+            [ "$passed" -eq "$run" ] || return 1
             return 0
           }
-          # EXACT-FILTER acceptance: status first, then exactly one test ran and
+          # EXACT-FILTER acceptance: status first, then EXACTLY one test ran and
           # passed. `skipped` is the filtered-out remainder here and is ignored;
           # an `#[ignore]`d target yields `0 tests run` and is rejected, as is a
           # filter that matched more than one record.
           accept_exact_run() {  # $1=status  $2=output
             [ "$1" -eq 0 ] || return 1
-            printf '%s\n' "$2" | strip_ansi \
-              | grep -qE '1 test run: 1 passed,' || return 1
+            rec=$(summary_record "$2")
+            [ -n "$rec" ] || return 1
+            [ "$(summary_field "$rec" run)" -eq 1 ] || return 1
+            [ "$(summary_field "$rec" passed)" -eq 1 ] || return 1
             return 0
           }
 
           # ---- ADVERSARIAL SELF-TESTS, before anything is trusted ---------
+          # Fixtures use the grammar observed from nextest 0.9.143 itself. They
+          # are PARSER evidence only — the real runs below are the test
+          # evidence.
           esc=$(printf '\033')
           coloured_exact=$(printf '        PASS [   0.5s] (1/1) %s[32mnet-mesh::%s%s[0m %s[1man_org_lease_reaches_the_provider_through_real_intake%s[0m\n     Summary [   0.5s] 1 test run: 1 passed, 8 skipped\n' "$esc" "$BIN" "$esc" "$esc" "$esc")
+          coloured_slow_exact=$(printf '     %s[33mSummary%s[0m [   0.5s] 1 test run: 1 passed (1 slow), 8 skipped\n' "$esc" "$esc")
           plain_exact=$(printf '     Summary [   0.5s] 1 test run: 1 passed, 8 skipped\n')
+          slow_exact=$(printf '     Summary [  61.0s] 1 test run: 1 passed (1 slow), 8 skipped\n')
           ignored_exact=$(printf '     Summary [   0.0s] 0 tests run: 0 passed, 9 skipped\n')
           two_exact=$(printf '     Summary [   0.5s] 2 tests run: 2 passed, 7 skipped\n')
           whole_ok=$(printf '     Summary [   2.6s] 9 tests run: 9 passed, 0 skipped\n')
+          whole_slow=$(printf '     Summary [  61.0s] 9 tests run: 9 passed (1 slow, 1 leaky), 0 skipped\n')
           whole_skipped=$(printf '     Summary [   2.6s] 9 tests run: 8 passed, 1 skipped\n')
+          whole_failed=$(printf '     Summary [   2.6s] 9 tests run: 8 passed, 1 failed, 0 skipped\n')
+          diag_only=$(printf 'test stdout: 1 test run: 1 passed, 0 skipped\nnote: fake Summary [   0.1s] 1 test run: 1 passed, 0 skipped\n')
+          diag_then_real=$(printf 'test stdout: 9 tests run: 9 passed, 0 skipped\n     Summary [   0.5s] 1 test run: 1 passed, 8 skipped\n')
 
-          # (a) THE REGRESSION: ANSI-decorated success must be ACCEPTED.
+          # (a) THE REGRESSION: ANSI-decorated success must be ACCEPTED, with
+          #     and without a slow annotation.
           accept_exact_run 0 "$coloured_exact" \
             || die "self-test FAILED: an ANSI-decorated passing record was rejected — this is exactly the run-34149650635 failure mode"
-          [ "$(inventory_count "$coloured_exact" an_org_lease_reaches_the_provider_through_real_intake)" = 1 ] \
-            || die "self-test FAILED: the inventory matcher cannot see through ANSI escapes"
-          # (b) POSITIVE CONTROLS.
+          accept_exact_run 0 "$coloured_slow_exact" \
+            || die "self-test FAILED: an ANSI-decorated SLOW passing record was rejected"
+          [ "$(inventory_count "$coloured_exact" an_org_lease_reaches_the_provider_through_real_intake)" = 0 ] \
+            || die "self-test FAILED: a run transcript was counted as an inventory record"
+          # (b) POSITIVE CONTROLS, including nextest's slow annotations.
           accept_exact_run 0 "$plain_exact" || die "self-test FAILED: a valid exact run was rejected"
+          accept_exact_run 0 "$slow_exact" || die "self-test FAILED: a valid SLOW exact run was rejected"
           accept_whole_run 0 "$whole_ok" 9 || die "self-test FAILED: a valid whole-binary run was rejected"
+          accept_whole_run 0 "$whole_slow" 9 || die "self-test FAILED: a valid SLOW/leaky whole-binary run was rejected"
           # (c) NONZERO STATUS carrying success-looking text must be REJECTED.
           if accept_exact_run 1 "$plain_exact"; then
             die "self-test FAILED: a nonzero exact run with spoofed success text was accepted"
@@ -1268,20 +1312,47 @@ jobs:
           if accept_exact_run 0 "$two_exact"; then
             die "self-test FAILED: a duplicate/over-broad exact filter was accepted"
           fi
-          # (f) A whole run that SKIPPED anything must be REJECTED.
+          # (f) A whole run that SKIPPED or FAILED anything must be REJECTED,
+          #     and so must one whose total disagrees with the inventory.
           if accept_whole_run 0 "$whole_skipped" 9; then
             die "self-test FAILED: a whole-binary run with a skipped test was accepted"
           fi
-          # (g) Inventory cardinality: duplicates and absences both rejected.
+          if accept_whole_run 0 "$whole_failed" 9; then
+            die "self-test FAILED: a whole-binary run with a failed test was accepted"
+          fi
+          if accept_whole_run 0 "$whole_ok" 10; then
+            die "self-test FAILED: a whole-binary run covering fewer tests than the inventory was accepted"
+          fi
+          # (g) MISLEADING DIAGNOSTICS cannot stand in for nextest's record, and
+          #     cannot inflate the count when a real record follows.
+          if accept_exact_run 0 "$diag_only"; then
+            die "self-test FAILED: an unanchored diagnostic line satisfied the exact-run predicate"
+          fi
+          accept_exact_run 0 "$diag_then_real" \
+            || die "self-test FAILED: the real Summary record was not used when preceded by test output"
+          if accept_whole_run 0 "$diag_then_real" 9; then
+            die "self-test FAILED: a diagnostic line inflated the whole-run count over the real record"
+          fi
+          # (h) Inventory cardinality: duplicates, absences and quoted records.
           dupe=$(printf 'net-mesh::%s dup_name\nnet-mesh::%s dup_name\n' "$BIN" "$BIN")
           [ "$(inventory_count "$dupe" dup_name)" = 2 ] \
             || die "self-test FAILED: duplicate inventory records were not both counted"
           [ "$(inventory_count "$dupe" absent_name)" = 0 ] \
             || die "self-test FAILED: an absent inventory record was counted"
-          echo "self-test: ANSI-tolerant matching, fail-closed-on-status, ignored/duplicate/skipped rejection and inventory cardinality all behave"
+          quoted=$(printf 'note: net-mesh::%s quoted_name\n' "$BIN")
+          [ "$(inventory_count "$quoted" quoted_name)" = 0 ] \
+            || die "self-test FAILED: a quoted (non-anchored) inventory line was counted"
+          echo "self-test: ANSI/slow tolerance, fail-closed-on-status, ignored/duplicate/skipped/failed/count-mismatch rejection, anchored-record and inventory cardinality all behave"
 
           # ---- (1) NON-EXECUTING INVENTORY --------------------------------
-          if ! inv=$(cargo nextest list --color never --features "$FEATURES" --test "$BIN" 2>&1); then
+          # The `--test` targets below are spelled LITERALLY, not through
+          # `$BIN`: the "Integration test pin guard" job scrapes real `--test
+          # <name>` flags out of this workflow to prove every `tests/*.rs` runs
+          # somewhere, and a shell variable is invisible to it. Run
+          # 34158104154 failed exactly there — this step passed while the guard
+          # reported the binary unpinned. `$BIN` stays for the match patterns.
+          if ! inv=$(cargo nextest list --color never --features "$FEATURES" \
+                       --test sensing_org_lease_wire 2>&1); then
             die "cargo nextest list failed for $BIN" "$inv"
           fi
           REQUIRED="an_org_lease_reaches_the_provider_through_real_intake
@@ -1315,7 +1386,7 @@ jobs:
           # Every inventoried test must run and pass with nothing skipped, so
           # the nine are green TOGETHER and not merely in isolation.
           out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail --retries 0 \
-                  --features "$FEATURES" --test "$BIN" 2>&1)
+                  --features "$FEATURES" --test sensing_org_lease_wire 2>&1)
           st=$?
           printf '%s\n' "$out"
           if ! accept_whole_run "$st" "$out" "$total"; then
@@ -1328,7 +1399,8 @@ jobs:
           # `#[ignore]`d witness a failure rather than a silent skip.
           for required in $REQUIRED; do
             out=$(cargo nextest run --color never --no-tests=fail --retries 0 \
-                    --features "$FEATURES" --test "$BIN" -E "test(=$required)" 2>&1)
+                    --features "$FEATURES" --test sensing_org_lease_wire \
+                    -E "test(=$required)" 2>&1)
             st=$?
             if ! accept_exact_run "$st" "$out"; then
               die "$required did not run and pass as exactly one test (nextest exit $st)" "$out"

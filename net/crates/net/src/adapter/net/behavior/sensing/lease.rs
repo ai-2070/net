@@ -1497,9 +1497,16 @@ mod tests {
     /// registry agree, and the forbidden pair (`Unchanged` + `Deregister`) is
     /// unreachable.
     ///
-    /// The registry mutex is held by this thread while both rivals are started,
-    /// so both are provably parked on the exact synchronization under test
-    /// rather than merely scheduled.
+    /// This thread holds the registry mutex while both rivals run, so NEITHER
+    /// can complete until it is released — that much is an exclusion, and the
+    /// non-completion assertion below rests on it. The `ready` signals are sent
+    /// BEFORE each rival enters its method, so they prove the threads started,
+    /// NOT that either has already reached the mutex. The load-bearing claim is
+    /// therefore the outcome: whichever order the mutex is granted in, the two
+    /// returned actions and the registry must agree, and the forbidden
+    /// `Unchanged` + `Deregister` pair must be unreachable. The deterministic
+    /// RED coupling for the composed shape is the sibling
+    /// single-critical-section witness above, which needs no schedule at all.
     #[test]
     fn a_public_acquire_cannot_interleave_with_a_final_release() {
         use std::sync::mpsc;
@@ -1537,7 +1544,8 @@ mod tests {
             })
         };
 
-        // Both rivals have entered.
+        // Both rival threads have STARTED (this is a start signal, not an
+        // arrival-at-the-mutex acknowledgement — see the note above).
         for _ in 0..2 {
             ready_rx
                 .recv_timeout(Duration::from_secs(5))
