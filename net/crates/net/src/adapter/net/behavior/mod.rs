@@ -68,6 +68,11 @@ pub mod org_scoped_ann;
 pub mod org_scoped_ingest;
 pub mod org_scoped_relay;
 pub mod org_scoped_store;
+/// Retained organization exact-provider sensing demand and its refresh
+/// lifecycle — an internal ownership substrate, not application API and not
+/// semver-covered.
+#[doc(hidden)]
+pub mod org_sensing_demand;
 pub mod placement;
 pub mod placement_registry;
 pub mod predicate;

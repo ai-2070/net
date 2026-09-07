@@ -283,13 +283,27 @@ internal design is
 `ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md` under the
 repository's `docs/internal/plans/`.
 
+Retained demand and refresh now exist in the core, still dark. An
+internal clone-shared family retains exact-provider demand over the
+AUTHORIZED provider population of one owner-scoped capability — the
+audience derived from installed organization authority and the
+population from verified owner-private discovery, neither ever
+caller-supplied. It reconciles as that population changes (surviving
+holders keep their installation identity), and one node-owned worker
+renews every retained installation at `ttl/2` on an absolute deadline —
+one task for the whole node, never a timer per lease. A refresh mints no
+holder and is identity-checked, so a retired or re-established
+installation is never resurrected, and a replaced or revoked authority
+makes it refuse rather than downgrade. Demand retires when the last
+family owner releases, on reconciliation, and on node shutdown.
+
 What is still genuinely absent: no query, watch, or snapshot surface, no
-readiness projection, no ranking, and no `ttl/2` refresh owner for a
-lease — an organization lease is a single registration with no
-re-authoring cadence. There are also no public `OrgClient` sensing
-controls or wiring, no provider-free/leader sensing, no `Granted` or
-cross-organization sensing, and no language bindings. Acquisition is not
-a projection, so the SDK surface stays provider-lifecycle only.
+readiness projection and no ranking. There are also no public
+`OrgClient` sensing controls or wiring — the retained-demand substrate
+is not connected to call planning — no provider-free/leader sensing, no
+`Granted` or cross-organization sensing, and no language bindings.
+Acquisition is not a projection, so the SDK surface stays
+provider-lifecycle only.
 
 The plan's §4.5 node-authority refusal guards *owner-scoped* sensing,
 and the provider surface exposes none: registering an evaluator names

@@ -67,7 +67,7 @@ use super::identity::{
 ///
 /// Sized with `MAX_NODE_SLOTS`: both answer "how many distinct interest
 /// identities may this node retain node-global state for" (review-pass-2 §6).
-const MAX_LEASED_INTERESTS: usize = 256;
+pub(crate) const MAX_LEASED_INTERESTS: usize = 256;
 
 /// Max live holders of ONE interest key.
 ///
@@ -345,6 +345,49 @@ pub(crate) enum LeasePlane {
     Organization,
 }
 
+/// The immutable read one REFRESH of a live installation renews from.
+///
+/// Produced by [`SensingInterestLeases::refresh_view`]; mints nothing, inserts
+/// nothing, removes nothing. Everything in it is the registry's own recorded
+/// state, so a refresh can never re-register under a caller's stale copy of the
+/// spec or the cadence.
+pub(crate) struct RefreshView {
+    spec: Arc<InterestSpec>,
+    installed_interval: Duration,
+    plane: LeasePlane,
+    installation_id: LeaseToken,
+    holders: usize,
+}
+
+impl RefreshView {
+    /// The canonical STORED interest spec.
+    pub(crate) fn spec(&self) -> &Arc<InterestSpec> {
+        &self.spec
+    }
+
+    /// The cadence currently INSTALLED on the wire (the holders' minimum).
+    pub(crate) fn installed_interval(&self) -> Duration {
+        self.installed_interval
+    }
+
+    /// The authority plane the installation was ESTABLISHED under. A refresh
+    /// must re-author on this plane or not at all — never downgrade.
+    pub(crate) fn plane(&self) -> LeasePlane {
+        self.plane
+    }
+
+    /// This installation's identity. A refresh armed for a different one is
+    /// refreshing something that no longer exists.
+    pub(crate) fn installation_id(&self) -> LeaseToken {
+        self.installation_id
+    }
+
+    /// Live holder count. A refresh never changes it — that is the property.
+    pub(crate) fn holders(&self) -> usize {
+        self.holders
+    }
+}
+
 /// One key's shared registration state.
 struct LeaseEntry {
     /// The canonical spec every holder of this key registered under (they share
@@ -358,6 +401,16 @@ struct LeaseEntry {
     /// The authority plane this lease was established under. Immutable for the
     /// entry's lifetime.
     plane: LeasePlane,
+    /// THIS INSTALLATION's identity: the FIRST token issued for the key, stored
+    /// once and never rewritten while the entry lives.
+    ///
+    /// It survives that first holder's release while others remain, and a final
+    /// release followed by a same-key re-acquisition yields a FRESH one —
+    /// because the entry is removed and re-established, and the allocator is
+    /// terminal and non-aliasing ([`LEASE_TOKEN_SPACE_END`]). That is exactly
+    /// what lets a refresh prove it is renewing the installation it was armed
+    /// for rather than resurrecting a retired one.
+    installation_id: LeaseToken,
 }
 
 /// Reference-counted, cadence-aggregating sensing-interest leases for one node.
@@ -572,6 +625,9 @@ impl SensingInterestLeases {
                     registrations,
                     installed_interval: interval,
                     plane: establishing_plane,
+                    // The FIRST token issued for this key IS the installation
+                    // identity. Never rewritten while the entry lives.
+                    installation_id: token,
                 });
             }
             Entry::Occupied(mut o) => {
@@ -817,6 +873,30 @@ impl SensingInterestLeases {
     #[cfg(any(test, feature = "fixtures"))]
     pub fn token_space_end() -> u64 {
         LEASE_TOKEN_SPACE_END
+    }
+
+    /// What a REFRESH of one live installation must renew — read from the
+    /// registry, mutating nothing.
+    ///
+    /// Refresh deliberately does NOT go through
+    /// [`acquire`](SensingInterestLeases::acquire): that always reserves an
+    /// identity and records a holder, so refreshing through it would add a
+    /// holder every period, reach `MAX_HOLDERS_PER_INTEREST` and then refuse —
+    /// and worse, the final release would stop deregistering, because holders
+    /// would remain. So this is a distinct, non-mutating, identity-checked read
+    /// and the caller performs the wire effect from it.
+    pub(crate) fn refresh_view(&self, key: &SensingLeaseKey) -> Option<RefreshView> {
+        let entries = self.lock_entries();
+        let entry = entries.get(key)?;
+        Some(RefreshView {
+            // The canonical STORED spec and the INSTALLED cadence — never a
+            // caller-supplied copy of either.
+            spec: Arc::clone(&entry.spec),
+            installed_interval: entry.installed_interval,
+            plane: entry.plane,
+            installation_id: entry.installation_id,
+            holders: entry.registrations.len(),
+        })
     }
 
     /// The authority plane a live lease was ESTABLISHED under, if the key is
