@@ -361,6 +361,15 @@ struct LeaseEntry {
 }
 
 /// Reference-counted, cadence-aggregating sensing-interest leases for one node.
+///
+/// `entries` is THE registry synchronization: every read, every decision and
+/// every mutation — acquisitions and releases alike — passes through one
+/// crate-internal `lock_entries` helper. The one-shot public
+/// [`acquire`](SensingInterestLeases::acquire) holds it across decision AND
+/// application, so it is atomic against a concurrent final release; the node's
+/// split preview/commit transaction relies instead on `sensing_lease_apply_mu`
+/// being held across both halves, which is what lets the interest-table
+/// application sit between them.
 #[derive(Default)]
 pub struct SensingInterestLeases {
     entries: Mutex<HashMap<SensingLeaseKey, LeaseEntry>>,
@@ -370,6 +379,14 @@ pub struct SensingInterestLeases {
     /// ticket release a same-key successor.
     next_token: AtomicU64,
     metrics: LeaseMetrics,
+    /// Instrumented-only: how many times the registry mutex has been taken.
+    ///
+    /// The atomicity seam. "Decides and applies in ONE critical section" has no
+    /// outcome signature on an uncontended run — a composed two-lock operation
+    /// returns exactly the same tuple — so the witness counts the acquisitions
+    /// the operation actually performs.
+    #[cfg(any(test, feature = "fixtures"))]
+    entry_lock_acquisitions: AtomicU64,
 }
 
 impl SensingInterestLeases {
@@ -406,28 +423,57 @@ impl SensingInterestLeases {
         }
     }
 
-    /// PREVIEW one acquisition of the interest `key` at the requested
-    /// `interval`, deciding everything and mutating NOTHING.
+    /// Take the registry's ONE mutex, counting the acquisition in instrumented
+    /// builds.
     ///
-    /// The acquisition transaction commits the REGISTRY LAST: the caller applies
-    /// the table/emitter transition first and only a successful application
-    /// reaches [`commit_acquire`](Self::commit_acquire). A refused acquisition
-    /// therefore never inserts a reference, so there is no registry rollback at
-    /// all — which is what removed the old
-    /// insert / refuse / roll-back / restore-through-a-second-fence path, whose
-    /// two commits could be split by an authority publication and leave a
-    /// surviving holder claiming a row that had been removed.
+    /// The count is the witness seam for atomicity: "this operation is a single
+    /// registry critical section" is otherwise unobservable, and a composed
+    /// two-lock operation is indistinguishable from an atomic one by outcome
+    /// alone on an uncontended run.
+    fn lock_entries(&self) -> parking_lot::MutexGuard<'_, HashMap<SensingLeaseKey, LeaseEntry>> {
+        #[cfg(any(test, feature = "fixtures"))]
+        self.entry_lock_acquisitions.fetch_add(1, Ordering::AcqRel);
+        self.entries.lock()
+    }
+
+    /// How many times the registry mutex has been taken since construction.
     ///
-    /// Sound because `sensing_lease_apply_mu` is held across the preview AND the
-    /// commit, and every registry mutation on this node runs under it — the same
-    /// argument [`preview_release`](Self::preview_release) rests on.
+    /// Instrumented builds only; the atomicity witnesses read the DELTA across
+    /// one operation.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn entry_lock_acquisitions_for_test(&self) -> u64 {
+        self.entry_lock_acquisitions.load(Ordering::Acquire)
+    }
+
+    /// Whether `token` is a live holder of `key`, read from the registry
+    /// itself.
+    ///
+    /// Instrumented builds only. The contention witnesses need "the registry
+    /// and the returned action agree", which a holder COUNT cannot express.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn holds_token_for_test(&self, key: &SensingLeaseKey, token: LeaseToken) -> bool {
+        self.lock_entries()
+            .get(key)
+            .is_some_and(|entry| entry.registrations.contains_key(&token))
+    }
+
+    /// DECIDE one acquisition against an ALREADY-HELD registry view, mutating
+    /// no entry.
+    ///
+    /// Split out from [`preview_acquire`](Self::preview_acquire) so the
+    /// one-shot public surface can decide AND apply inside a single critical
+    /// section while the node's split transaction keeps its two halves (the
+    /// interest-table application legitimately runs between them, under
+    /// `sensing_lease_apply_mu`).
     ///
     /// Refuses fail-closed at either bound (review-pass-2 §6) and at identity
     /// exhaustion (D4.8). A CAPACITY refusal is TOTAL: no identity is reserved,
     /// no registration is recorded, the installed cadence does not move even
     /// for a would-be-stricter holder, and no live interest is evicted to make
     /// room. Identity is reserved only AFTER both bounds admit, and reserving
-    /// it here — rather than in the commit — is what makes exhaustion refuse
+    /// it here — rather than at application — is what makes exhaustion refuse
     /// before the caller has touched the interest table or the emitter.
     ///
     /// `plane` is the authority plane the CALLER can establish this lease under.
@@ -435,14 +481,14 @@ impl SensingInterestLeases {
     /// lease keeps the plane it was created with, so a later authority change
     /// cannot reclassify it. [`PreviewedAcquire::plane`] is always the plane
     /// actually in force.
-    pub(crate) fn preview_acquire(
+    fn decide_acquire(
         &self,
+        entries: &HashMap<SensingLeaseKey, LeaseEntry>,
         key: SensingLeaseKey,
         spec: &InterestSpec,
         interval: Duration,
         plane: LeasePlane,
     ) -> Result<PreviewedAcquire, LeaseRefused> {
-        let entries = self.entries.lock();
         let Some(entry) = entries.get(&key) else {
             // Only a NEW key spends the node budget.
             if entries.len() >= MAX_LEASED_INTERESTS {
@@ -457,8 +503,9 @@ impl SensingInterestLeases {
                 interval,
                 establishing_plane: plane,
                 plane,
-                // Promoted to an `Arc` HERE and stored verbatim by the commit,
-                // so the spec is cloned exactly once across both halves.
+                // Promoted to an `Arc` HERE and stored verbatim by the
+                // application, so the spec is cloned exactly once across both
+                // halves.
                 spec: Arc::new(spec.clone()),
                 transition: AcquireTransition::Establish,
                 token,
@@ -495,14 +542,11 @@ impl SensingInterestLeases {
         })
     }
 
-    /// COMMIT a previewed acquisition, recording the holder under the identity
-    /// the preview reserved.
-    ///
-    /// Infallible by construction: the preview proved both bounds AND reserved
-    /// a terminal identity under the same `sensing_lease_apply_mu` the caller
-    /// still holds, so nothing here can refuse and the caller can never be
-    /// handed a ticket for a reference that was not recorded.
-    pub(crate) fn commit_acquire(&self, previewed: PreviewedAcquire) -> LeaseToken {
+    /// APPLY a decided acquisition to an ALREADY-HELD registry view.
+    fn apply_acquire(
+        entries: &mut HashMap<SensingLeaseKey, LeaseEntry>,
+        previewed: PreviewedAcquire,
+    ) -> LeaseToken {
         let PreviewedAcquire {
             key,
             interval,
@@ -512,14 +556,14 @@ impl SensingInterestLeases {
             transition,
             token,
         } = previewed;
-        let mut entries = self.entries.lock();
         match entries.entry(key) {
             Entry::Vacant(v) => {
                 debug_assert_eq!(
                     transition,
                     AcquireTransition::Establish,
-                    "a vacant key must have previewed as establishing — the apply \
-                     guard is held across the preview and this commit"
+                    "a vacant key must have decided as establishing — the decision \
+                     and this application are either one registry critical section \
+                     or bracketed by the node's apply guard"
                 );
                 let mut registrations = HashMap::new();
                 registrations.insert(token, interval);
@@ -535,7 +579,7 @@ impl SensingInterestLeases {
                 debug_assert_ne!(
                     transition,
                     AcquireTransition::Establish,
-                    "an occupied key must not have previewed as establishing"
+                    "an occupied key must not have decided as establishing"
                 );
                 debug_assert_eq!(
                     entry.plane, plane,
@@ -548,35 +592,112 @@ impl SensingInterestLeases {
         token
     }
 
-    /// Acquire one reference to `key` on the LEGACY plane.
+    /// PREVIEW one acquisition of the interest `key` at the requested
+    /// `interval`, deciding everything and mutating NOTHING.
+    ///
+    /// The acquisition transaction commits the REGISTRY LAST: the caller applies
+    /// the table/emitter transition first and only a successful application
+    /// reaches [`commit_acquire`](Self::commit_acquire). A refused acquisition
+    /// therefore never inserts a reference, so there is no registry rollback at
+    /// all — which is what removed the old
+    /// insert / refuse / roll-back / restore-through-a-second-fence path, whose
+    /// two commits could be split by an authority publication and leave a
+    /// surviving holder claiming a row that had been removed.
+    ///
+    /// Sound ONLY because `sensing_lease_apply_mu` is held across the preview
+    /// AND the commit, and every registry mutation the NODE performs runs under
+    /// it — the same argument [`preview_release`](Self::preview_release) rests
+    /// on. A caller that cannot hold that guard must use the atomic one-shot
+    /// [`acquire`](Self::acquire) instead.
+    pub(crate) fn preview_acquire(
+        &self,
+        key: SensingLeaseKey,
+        spec: &InterestSpec,
+        interval: Duration,
+        plane: LeasePlane,
+    ) -> Result<PreviewedAcquire, LeaseRefused> {
+        let entries = self.lock_entries();
+        self.decide_acquire(&entries, key, spec, interval, plane)
+    }
+
+    /// COMMIT a previewed acquisition, recording the holder under the identity
+    /// the preview reserved.
+    ///
+    /// Infallible by construction: the preview proved both bounds AND reserved
+    /// a terminal identity under the same `sensing_lease_apply_mu` the caller
+    /// still holds, so nothing here can refuse and the caller can never be
+    /// handed a ticket for a reference that was not recorded.
+    pub(crate) fn commit_acquire(&self, previewed: PreviewedAcquire) -> LeaseToken {
+        let mut entries = self.lock_entries();
+        Self::apply_acquire(&mut entries, previewed)
+    }
+
+    /// Acquire one reference to `key` on the LEGACY plane, ATOMICALLY.
     ///
     /// The pre-existing single-call acquisition surface, preserved verbatim in
-    /// arguments and return shape. It is the crate-internal transactional
-    /// preview + commit pair applied back to back, so it inherits both
-    /// cardinality bounds and terminal identity refusal — including
+    /// arguments and return shape, and inheriting both cardinality bounds and
+    /// terminal identity refusal — including
     /// `Err(`[`LeaseRefused::IdentityExhausted`]`)`.
+    ///
+    /// # One critical section, not two
+    ///
+    /// This decides AND applies under a SINGLE hold of the registry's own
+    /// mutex — the same mutex [`release`](Self::release) takes. Composing the
+    /// crate-internal preview and commit instead would lock twice, and a
+    /// direct public caller holds no outer node guard to bridge the gap. The
+    /// gap was reachable: with `K` held by a sole holder `t0`, a looser
+    /// acquisition could decide `Unchanged` and unlock, `t0`'s final release
+    /// could then remove `K` and return `Deregister`, and the acquisition
+    /// would insert into a now-vacant `K` while still reporting `Unchanged` —
+    /// a recorded holder with no installed registration (and a
+    /// `debug_assert` failure in a debug build). The same gap let two
+    /// last-slot decisions both pass a cardinality bound, and two
+    /// same-key establishes both decide `Establish`.
+    ///
+    /// # Why the node still uses the split form
     ///
     /// PRODUCTION organization transitions must NOT use this: the node has to
     /// apply the table/emitter transition BETWEEN the two halves, and the
     /// authority plane in force is read from recorded provenance rather than
-    /// assumed. This collapses both, which is exactly why it is legacy-plane
-    /// only.
+    /// assumed. Those callers hold `sensing_lease_apply_mu` across both halves,
+    /// which is the equivalent exclusion at a wider scope. This collapses
+    /// both, which is exactly why it is legacy-plane only.
     pub fn acquire(
         &self,
         key: SensingLeaseKey,
         spec: &InterestSpec,
         interval: Duration,
     ) -> Result<(LeaseToken, LeaseAction), LeaseRefused> {
-        let previewed = self.preview_acquire(key, spec, interval, LeasePlane::Legacy)?;
-        let action = previewed.action();
-        Ok((self.commit_acquire(previewed), action))
+        let (token, action, _) = self.acquire_atomic(key, spec, interval, LeasePlane::Legacy)?;
+        Ok((token, action))
     }
 
-    /// One-shot preview + commit on an explicit plane.
+    /// One-shot ATOMIC acquisition on an explicit plane — the shared body of
+    /// [`acquire`](Self::acquire).
     ///
-    /// TESTS ONLY. Production must apply the table/emitter transition BETWEEN
-    /// the two halves — that ordering is the whole point of splitting them, so
-    /// collapsing it back is exactly the defect this shape removed.
+    /// The registry mutex is taken exactly once and held across the decision
+    /// AND its application, so no rival acquisition or release can interleave.
+    fn acquire_atomic(
+        &self,
+        key: SensingLeaseKey,
+        spec: &InterestSpec,
+        interval: Duration,
+        plane: LeasePlane,
+    ) -> Result<(LeaseToken, LeaseAction, LeasePlane), LeaseRefused> {
+        let mut entries = self.lock_entries();
+        let previewed = self.decide_acquire(&entries, key, spec, interval, plane)?;
+        let action = previewed.action();
+        let in_force = previewed.plane();
+        Ok((
+            Self::apply_acquire(&mut entries, previewed),
+            action,
+            in_force,
+        ))
+    }
+
+    /// [`acquire_atomic`](Self::acquire_atomic) with the plane in force also
+    /// returned. TESTS ONLY: production must apply the table/emitter transition
+    /// BETWEEN the two halves, which is the whole point of splitting them.
     #[cfg(test)]
     fn acquire_on_plane(
         &self,
@@ -585,10 +706,7 @@ impl SensingInterestLeases {
         interval: Duration,
         plane: LeasePlane,
     ) -> Result<(LeaseToken, LeaseAction, LeasePlane), LeaseRefused> {
-        let previewed = self.preview_acquire(key, spec, interval, plane)?;
-        let action = previewed.action();
-        let plane = previewed.plane();
-        Ok((self.commit_acquire(previewed), action, plane))
+        self.acquire_atomic(key, spec, interval, plane)
     }
 
     /// Record a wire reconciliation that failed after the registry committed —
@@ -705,7 +823,7 @@ impl SensingInterestLeases {
     /// still held. Reads recorded metadata; derives nothing from current
     /// authority.
     pub(crate) fn plane_for(&self, key: &SensingLeaseKey) -> Option<LeasePlane> {
-        self.entries.lock().get(key).map(|entry| entry.plane)
+        self.lock_entries().get(key).map(|entry| entry.plane)
     }
 
     /// What [`release`](Self::release) WOULD return, without mutating anything.
@@ -722,7 +840,7 @@ impl SensingInterestLeases {
     /// holding the organization transition lock across both (see
     /// `MeshNode::org_transition_mu`).
     pub(crate) fn preview_release(&self, ticket: &SensingLeaseTicket) -> LeaseAction {
-        let entries = self.entries.lock();
+        let entries = self.lock_entries();
         let Some(entry) = entries.get(&ticket.key) else {
             return LeaseAction::Unchanged;
         };
@@ -759,7 +877,7 @@ impl SensingInterestLeases {
     /// All application identity comes from the stored entry, never from the
     /// caller.
     pub fn release(&self, ticket: SensingLeaseTicket) -> LeaseAction {
-        let mut entries = self.entries.lock();
+        let mut entries = self.lock_entries();
         let Entry::Occupied(mut o) = entries.entry(ticket.key) else {
             return LeaseAction::Unchanged;
         };
@@ -794,7 +912,7 @@ impl SensingInterestLeases {
     #[doc(hidden)]
     #[cfg(any(test, feature = "fixtures"))]
     pub fn len(&self) -> usize {
-        self.entries.lock().len()
+        self.lock_entries().len()
     }
 
     /// Whether no interest is referenced.
@@ -1325,5 +1443,287 @@ mod tests {
             "and must not have disturbed the live holders"
         );
         let _ = first;
+    }
+
+    // ---- PUBLIC ACQUIRE ATOMICITY --------------------------------------
+    //
+    // The public one-shot used to COMPOSE `preview_acquire` + `commit_acquire`.
+    // Each locks the registry separately, and a direct public caller holds no
+    // outer node guard bridging them. With `K` held by a sole holder `t0`: a
+    // looser acquisition decides `Unchanged` and unlocks; `t0`'s final release
+    // removes `K` and returns `Deregister`; the acquisition then inserts into a
+    // vacant `K` while still reporting `Unchanged` — a recorded holder with no
+    // installed registration (and a `debug_assert` failure in a debug build).
+    // The same gap let two last-slot decisions both pass a cardinality bound
+    // and two same-key decisions both establish.
+
+    /// One public acquisition is ONE registry critical section — the direct,
+    /// deterministic signature the composed form cannot have.
+    ///
+    /// RED coupling: restore
+    /// `acquire = preview_acquire(..)? + commit_acquire(..)` and the delta
+    /// below is 2.
+    #[test]
+    fn the_public_acquire_is_one_registry_critical_section() {
+        let leases = SensingInterestLeases::default();
+        let s = spec("gpu.infer");
+        let key = key_for(&s, 7);
+
+        for label in ["establishing", "joining"] {
+            let before = leases.entry_lock_acquisitions_for_test();
+            leases.acquire(key, &s, ms(100)).expect("acquire");
+            assert_eq!(
+                leases.entry_lock_acquisitions_for_test() - before,
+                1,
+                "the {label} public acquisition took the registry mutex more than \
+                 once, so a rival release can land between its decision and its \
+                 application"
+            );
+        }
+        // The release side is the operation it must be atomic AGAINST, and it is
+        // one section too — so a single mutex really is the whole ordering.
+        let (token, _) = leases.acquire(key, &s, ms(100)).expect("acquire");
+        let before = leases.entry_lock_acquisitions_for_test();
+        leases.release(ticket(key, token));
+        assert_eq!(
+            leases.entry_lock_acquisitions_for_test() - before,
+            1,
+            "release is not a single registry critical section"
+        );
+    }
+
+    /// A public acquisition and a concurrent FINAL release of the only other
+    /// holder cannot interleave: whichever wins, the returned actions and the
+    /// registry agree, and the forbidden pair (`Unchanged` + `Deregister`) is
+    /// unreachable.
+    ///
+    /// The registry mutex is held by this thread while both rivals are started,
+    /// so both are provably parked on the exact synchronization under test
+    /// rather than merely scheduled.
+    #[test]
+    fn a_public_acquire_cannot_interleave_with_a_final_release() {
+        use std::sync::mpsc;
+
+        let leases = Arc::new(SensingInterestLeases::default());
+        let s = spec("gpu.infer");
+        let key = key_for(&s, 7);
+        let (t0, _) = leases.acquire(key, &s, ms(100)).expect("the sole holder");
+
+        let (ready_tx, ready_rx) = mpsc::channel::<&'static str>();
+        let (done_tx, done_rx) = mpsc::channel::<&'static str>();
+
+        // HELD: neither rival can make progress while this lives.
+        let held = leases.entries.lock();
+
+        let acquirer = {
+            let leases = Arc::clone(&leases);
+            let s = s.clone();
+            let ready = ready_tx.clone();
+            let done = done_tx.clone();
+            std::thread::spawn(move || {
+                let _ = ready.send("acquire");
+                let out = leases.acquire(key, &s, ms(500));
+                let _ = done.send("acquire");
+                out
+            })
+        };
+        let releaser = {
+            let leases = Arc::clone(&leases);
+            std::thread::spawn(move || {
+                let _ = ready_tx.send("release");
+                let out = leases.release(ticket(key, t0));
+                let _ = done_tx.send("release");
+                out
+            })
+        };
+
+        // Both rivals have entered.
+        for _ in 0..2 {
+            ready_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("both rivals must start");
+        }
+        // And neither can finish: the registry mutex is the whole ordering.
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "a registry operation completed while this thread held the registry \
+             mutex — acquisition or release is not synchronized by it"
+        );
+
+        drop(held);
+        let acquired = acquirer.join().expect("the acquirer joins");
+        let released = releaser.join().expect("the releaser joins");
+
+        let (a_token, a_action) = acquired.expect("the acquisition is within bounds");
+        // EXACTLY the two coherent serializations, nothing else.
+        let coherent = match (&a_action, &released) {
+            // The acquisition won: it joined a live entry, and the final release
+            // then relaxed the cadence to the survivor's.
+            (LeaseAction::Unchanged, LeaseAction::Reregister { interval, .. }) => {
+                *interval == ms(500)
+            }
+            // The release won: the entry was gone, so the acquisition
+            // RE-ESTABLISHED it and said so.
+            (LeaseAction::Register { interval, .. }, LeaseAction::Deregister { .. }) => {
+                *interval == ms(500)
+            }
+            _ => false,
+        };
+        assert!(
+            coherent,
+            "incoherent serialization: acquire returned {a_action:?} and the final \
+             release returned {released:?}. `Unchanged` + `Deregister` is the \
+             split-transaction defect — a recorded holder with no installed \
+             registration"
+        );
+        assert!(
+            leases.holds_token_for_test(&key, a_token),
+            "the registry must hold the token the acquisition handed out"
+        );
+        assert_eq!(
+            leases.entry_for_test(&key),
+            Some((1, ms(500))),
+            "and exactly one holder at exactly its cadence"
+        );
+    }
+
+    /// Concurrent establishes of the SAME fresh key produce exactly ONE
+    /// `Register`; every other racer joins. Two `Establish` decisions would
+    /// trip the occupied-entry `debug_assert` and report two installations for
+    /// one row.
+    #[test]
+    fn concurrent_same_key_acquisitions_establish_exactly_once() {
+        const RACERS: usize = 8;
+
+        let leases = Arc::new(SensingInterestLeases::default());
+        let s = spec("gpu.infer");
+        let key = key_for(&s, 7);
+        let start = Arc::new(std::sync::Barrier::new(RACERS));
+
+        let outcomes: Vec<_> = (0..RACERS)
+            .map(|_| {
+                let leases = Arc::clone(&leases);
+                let s = s.clone();
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    leases.acquire(key, &s, ms(100))
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().expect("racer joins"))
+            .collect();
+
+        let mut registers = 0;
+        for outcome in &outcomes {
+            let (token, action) = outcome.as_ref().expect("all racers are within bounds");
+            if matches!(action, LeaseAction::Register { .. }) {
+                registers += 1;
+            }
+            assert!(
+                leases.holds_token_for_test(&key, *token),
+                "a racer was handed a token the registry does not hold"
+            );
+        }
+        assert_eq!(
+            registers, 1,
+            "exactly one racer may establish the shared registration; got \
+             {registers} out of {RACERS}"
+        );
+        assert_eq!(leases.entry_for_test(&key), Some((RACERS, ms(100))));
+        assert_eq!(leases.len(), 1);
+    }
+
+    /// Concurrent acquisitions of DISTINCT new keys competing for the LAST node
+    /// slot cannot both pass the bound.
+    #[test]
+    fn concurrent_last_node_slot_acquisitions_cannot_exceed_the_bound() {
+        const RACERS: usize = 6;
+
+        let leases = Arc::new(SensingInterestLeases::default());
+        let s = spec("gpu.infer");
+        for provider in 0..(MAX_LEASED_INTERESTS as u64 - 1) {
+            leases
+                .acquire(key_for(&s, provider), &s, ms(100))
+                .expect("filling below the bound");
+        }
+        assert_eq!(leases.len(), MAX_LEASED_INTERESTS - 1);
+
+        let start = Arc::new(std::sync::Barrier::new(RACERS));
+        let outcomes: Vec<_> = (0..RACERS as u64)
+            .map(|offset| {
+                let leases = Arc::clone(&leases);
+                let s = s.clone();
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    leases.acquire(
+                        key_for(&s, MAX_LEASED_INTERESTS as u64 + offset),
+                        &s,
+                        ms(100),
+                    )
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().expect("racer joins"))
+            .collect();
+
+        assert_eq!(
+            outcomes.iter().filter(|outcome| outcome.is_ok()).count(),
+            1,
+            "exactly one racer may take the last node slot; got {outcomes:?}"
+        );
+        for outcome in &outcomes {
+            if let Err(refusal) = outcome {
+                assert_eq!(*refusal, LeaseRefused::NodeAtCapacity);
+            }
+        }
+        assert_eq!(
+            leases.len(),
+            MAX_LEASED_INTERESTS,
+            "the node bound was exceeded"
+        );
+    }
+
+    /// The same race at the per-interest HOLDER bound.
+    #[test]
+    fn concurrent_last_holder_acquisitions_cannot_exceed_the_bound() {
+        const RACERS: usize = 6;
+
+        let leases = Arc::new(SensingInterestLeases::default());
+        let s = spec("gpu.infer");
+        let key = key_for(&s, 7);
+        for _ in 0..(MAX_HOLDERS_PER_INTEREST - 1) {
+            leases.acquire(key, &s, ms(100)).expect("filling below");
+        }
+
+        let start = Arc::new(std::sync::Barrier::new(RACERS));
+        let outcomes: Vec<_> = (0..RACERS)
+            .map(|_| {
+                let leases = Arc::clone(&leases);
+                let s = s.clone();
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    leases.acquire(key, &s, ms(100))
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().expect("racer joins"))
+            .collect();
+
+        assert_eq!(
+            outcomes.iter().filter(|outcome| outcome.is_ok()).count(),
+            1,
+            "exactly one racer may take the last holder slot; got {outcomes:?}"
+        );
+        assert_eq!(
+            leases.entry_for_test(&key),
+            Some((MAX_HOLDERS_PER_INTEREST, ms(100))),
+            "the per-interest holder bound was exceeded"
+        );
     }
 }
