@@ -6125,6 +6125,10 @@ struct OrderedSensingEgress {
     /// boundaries. See [`OrgEgressLifecyclePoint`].
     #[cfg(any(test, feature = "fixtures"))]
     lifecycle_seam: OrgEgressLifecycleSeamSlot,
+    /// Fixtures-only ASYNC park at one boundary, so a witness can cancel a
+    /// shutdown future exactly where cancellation is possible.
+    #[cfg(any(test, feature = "fixtures"))]
+    lifecycle_gate: OrgEgressLifecycleGateSlot,
 }
 
 /// Teardown state: who owns the consumer handle. Settlement itself is the
@@ -6241,14 +6245,21 @@ pub struct OrgEgressSendPolicy {
 #[cfg(any(test, feature = "fixtures"))]
 type OrgEgressSendPolicySlot = Arc<parking_lot::Mutex<Option<OrgEgressSendPolicy>>>;
 
-/// One PRODUCTION lifecycle boundary of the ordered egress, each fired with the
-/// exact lock the property depends on already held.
+/// One PRODUCTION lifecycle boundary of the ordered egress.
 ///
-/// A witness that only attempts creation AFTER shutdown has returned, or an
-/// enqueue AFTER close-and-join has returned, never reaches the contested
-/// interleaving at all — the outcome is the same whether the boundaries are
-/// synchronized or not. These points let a witness PARK inside the boundary and
-/// prove the rival cannot pass it.
+/// Two kinds, and the distinction is the whole point:
+///
+/// * `*Under*` points fire with the lock the property depends on ALREADY HELD.
+///   A witness parks there to hold the boundary open.
+/// * `*Contended` points fire ONLY when a `try_lock` OBSERVED that lock held,
+///   immediately before blocking on it. That is the acknowledgement a rival
+///   has actually ARRIVED at the contested acquisition. An ack that fires
+///   regardless of contention proves only that the rival was scheduled, and a
+///   "it did not finish within N ms" assertion sequenced after such an ack can
+///   pass vacuously — the rival may simply not have got there yet.
+///
+/// The try-then-block shape is instrumented-build only; production takes the
+/// plain lock, so no ordering or fairness property changes.
 #[cfg(any(test, feature = "fixtures"))]
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6256,12 +6267,24 @@ pub enum OrgEgressLifecyclePoint {
     /// Inside `MeshNode::org_egress`, holding the lifecycle cell, after the
     /// terminal test and BEFORE the consumer is spawned.
     CreatingUnderCell,
+    /// Inside `MeshNode::take_org_egress_for_terminal_close`, having observed
+    /// the lifecycle cell HELD by someone else.
+    TerminalCloseContended,
     /// Inside `enqueue`, holding the queue lock and BEFORE the closure test.
     EnqueueUnderQueueLock,
     /// Inside `close`, holding the queue lock and BEFORE closure is written.
     ClosingUnderQueueLock,
+    /// Inside `close`, having observed the queue lock HELD by someone else.
+    CloseContended,
     /// Inside `close_and_join`, holding teardown ownership and BEFORE the join.
     TeardownOwned,
+    /// Inside `close_and_join`, having observed teardown ownership HELD by
+    /// another in-flight attempt.
+    TeardownContended,
+    /// Inside `close_and_join`, AFTER the grace expiry requested the abort and
+    /// BEFORE the join that settles it — the window a cancellation must be
+    /// recoverable from.
+    TeardownAborted,
 }
 
 /// Observer of the production egress lifecycle boundaries.
@@ -6273,6 +6296,30 @@ pub type OrgEgressLifecycleObserver = Arc<dyn Fn(OrgEgressLifecyclePoint) + Send
 /// can install it before the lazily created egress exists.
 #[cfg(any(test, feature = "fixtures"))]
 type OrgEgressLifecycleSeamSlot = Arc<parking_lot::Mutex<Option<OrgEgressLifecycleObserver>>>;
+
+/// An ASYNC park at one lifecycle boundary.
+///
+/// The synchronous observer above cannot help a witness that needs to CANCEL
+/// the parked future: a hook that blocks its worker thread makes the enclosing
+/// future undroppable, so `select!`/`abort()` cannot take effect. This gate
+/// parks on an `.await` instead, which is a real yield point — the only place a
+/// shutdown future can actually be cancelled.
+#[cfg(any(test, feature = "fixtures"))]
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct OrgEgressLifecycleGate {
+    /// The boundary to park at. Other boundaries pass straight through.
+    pub point: OrgEgressLifecyclePoint,
+    /// Production adds a permit the moment it reaches the boundary. Permits
+    /// accumulate, so the acknowledgement cannot be missed.
+    pub entered: Arc<tokio::sync::Semaphore>,
+    /// Production awaits this. `Notify::notify_one` stores a permit when no
+    /// waiter is registered, so a release issued before the park is not lost.
+    pub release: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(any(test, feature = "fixtures"))]
+type OrgEgressLifecycleGateSlot = Arc<parking_lot::Mutex<Option<OrgEgressLifecycleGate>>>;
 
 /// The ordered organization egress' observable state.
 #[cfg(any(test, feature = "fixtures"))]
@@ -6313,6 +6360,7 @@ impl OrderedSensingEgress {
         #[cfg(any(test, feature = "fixtures"))] observer: OrgEgressObserverSlot,
         #[cfg(any(test, feature = "fixtures"))] policy: OrgEgressSendPolicySlot,
         #[cfg(any(test, feature = "fixtures"))] lifecycle: OrgEgressLifecycleSeamSlot,
+        #[cfg(any(test, feature = "fixtures"))] gate: OrgEgressLifecycleGateSlot,
     ) -> Self {
         let queue = Arc::new(parking_lot::Mutex::new(EgressQueue {
             pending: VecDeque::with_capacity(MAX_PENDING_ORG_EGRESS),
@@ -6342,6 +6390,8 @@ impl OrderedSensingEgress {
             }),
             #[cfg(any(test, feature = "fixtures"))]
             lifecycle_seam: lifecycle,
+            #[cfg(any(test, feature = "fixtures"))]
+            lifecycle_gate: gate,
         }
     }
 
@@ -6352,6 +6402,23 @@ impl OrderedSensingEgress {
         let hook = self.lifecycle_seam.lock().clone();
         if let Some(hook) = hook {
             hook(point);
+        }
+    }
+
+    /// PARK on an await at `point`, if a witness installed a gate for it.
+    ///
+    /// The acknowledgement is issued BEFORE the park (permits accumulate on the
+    /// semaphore, so it cannot be missed), and the park itself is a genuine
+    /// yield point — which is what lets a witness cancel the enclosing future
+    /// exactly here.
+    #[cfg(any(test, feature = "fixtures"))]
+    async fn park_lifecycle(&self, point: OrgEgressLifecyclePoint) {
+        let gate = self.lifecycle_gate.lock().clone();
+        if let Some(gate) = gate {
+            if gate.point == point {
+                gate.entered.add_permits(1);
+                gate.release.notified().await;
+            }
         }
     }
 
@@ -6523,8 +6590,21 @@ impl OrderedSensingEgress {
     /// Stop accepting datagrams and wake the consumer so it drains and exits.
     /// Closure is written under the queue lock, so it is ordered against every
     /// enqueue acceptance rather than merely visible to one.
+    ///
+    /// Instrumented builds take the queue lock try-then-block so a witness can
+    /// be told the moment this call OBSERVED the lock held by a rival enqueue.
+    /// Production takes the plain lock.
     fn close(&self) {
         {
+            #[cfg(any(test, feature = "fixtures"))]
+            let mut queue = match self.queue.try_lock() {
+                Some(queue) => queue,
+                None => {
+                    self.fire_lifecycle(OrgEgressLifecyclePoint::CloseContended);
+                    self.queue.lock()
+                }
+            };
+            #[cfg(not(any(test, feature = "fixtures")))]
             let mut queue = self.queue.lock();
             #[cfg(any(test, feature = "fixtures"))]
             self.fire_lifecycle(OrgEgressLifecyclePoint::ClosingUnderQueueLock);
@@ -6584,6 +6664,18 @@ impl OrderedSensingEgress {
     /// grace plus a post-abort join, so a queued caller waits at most that.
     async fn close_and_join(&self) {
         self.close();
+        // Instrumented builds take teardown ownership try-then-block, so a
+        // witness is told the moment THIS call observed another attempt already
+        // owning it. Production awaits the plain lock.
+        #[cfg(any(test, feature = "fixtures"))]
+        let mut teardown = match self.teardown.try_lock() {
+            Ok(teardown) => teardown,
+            Err(_) => {
+                self.fire_lifecycle(OrgEgressLifecyclePoint::TeardownContended);
+                self.teardown.lock().await
+            }
+        };
+        #[cfg(not(any(test, feature = "fixtures")))]
         let mut teardown = self.teardown.lock().await;
         if self.counters.settled.load(Ordering::Acquire) {
             // Another explicit shutdown already settled this egress. Observing
@@ -6604,6 +6696,14 @@ impl OrderedSensingEgress {
                     "ordered organization egress did not drain within the shutdown grace \
                      window; the remaining datagrams are dropped"
                 );
+                #[cfg(any(test, feature = "fixtures"))]
+                self.fire_lifecycle(OrgEgressLifecyclePoint::TeardownAborted);
+                // The abort is requested but NOT yet settled. This is the exact
+                // window a cancellation has to be recoverable from, and the
+                // only place in it a future can actually be cancelled.
+                #[cfg(any(test, feature = "fixtures"))]
+                self.park_lifecycle(OrgEgressLifecyclePoint::TeardownAborted)
+                    .await;
                 // Settlement, not just cancellation. `JoinError::Cancelled` is
                 // the expected result here.
                 let _ = (&mut *handle).await;
@@ -9858,6 +9958,9 @@ pub struct MeshNode {
     /// creation boundary is the node's, and cloned into the egress at spawn.
     #[cfg(any(test, feature = "fixtures"))]
     org_egress_lifecycle_seam: OrgEgressLifecycleSeamSlot,
+    /// Fixtures-only ASYNC lifecycle gate, cloned into the egress at spawn.
+    #[cfg(any(test, feature = "fixtures"))]
+    org_egress_lifecycle_gate: OrgEgressLifecycleGateSlot,
     /// In-crate witness seam: fires after a release's authority preparation has
     /// succeeded and BEFORE the final currentness application.
     ///
@@ -11745,6 +11848,8 @@ impl MeshNode {
             org_egress_send_policy: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(any(test, feature = "fixtures"))]
             org_egress_lifecycle_seam: Arc::new(parking_lot::Mutex::new(None)),
+            #[cfg(any(test, feature = "fixtures"))]
+            org_egress_lifecycle_gate: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(test)]
             sensing_release_pre_apply_seam: parking_lot::Mutex::new(None),
             #[cfg(test)]
@@ -12247,6 +12352,8 @@ impl MeshNode {
             self.org_egress_send_policy.clone(),
             #[cfg(any(test, feature = "fixtures"))]
             self.org_egress_lifecycle_seam.clone(),
+            #[cfg(any(test, feature = "fixtures"))]
+            self.org_egress_lifecycle_gate.clone(),
         ));
         cell.egress = Some(Arc::clone(&egress));
         Some(egress)
@@ -12259,7 +12366,23 @@ impl MeshNode {
     /// the caller's close/join covers every consumer that will ever exist. The
     /// handle stays in the cell so post-shutdown observation reads the real
     /// counters of the task that actually ran.
+    ///
+    /// Instrumented builds take the cell try-then-block, so a witness parked
+    /// inside a concurrent CREATION is told the moment this call observed the
+    /// cell held. Production takes the plain lock.
     fn take_org_egress_for_terminal_close(&self) -> Option<Arc<OrderedSensingEgress>> {
+        #[cfg(any(test, feature = "fixtures"))]
+        let mut cell = match self.org_egress.try_lock() {
+            Some(cell) => cell,
+            None => {
+                let hook = self.org_egress_lifecycle_seam.lock().clone();
+                if let Some(hook) = hook {
+                    hook(OrgEgressLifecyclePoint::TerminalCloseContended);
+                }
+                self.org_egress.lock()
+            }
+        };
+        #[cfg(not(any(test, feature = "fixtures")))]
         let mut cell = self.org_egress.lock();
         cell.terminal = true;
         cell.egress.as_ref().map(Arc::clone)
@@ -12310,6 +12433,23 @@ impl MeshNode {
     #[doc(hidden)]
     pub fn clear_org_egress_lifecycle_seam_for_test(&self) {
         *self.org_egress_lifecycle_seam.lock() = None;
+    }
+
+    /// Install the ASYNC lifecycle gate. Production parks on an `.await` at the
+    /// named boundary after acknowledging arrival, so a witness can cancel the
+    /// parked future exactly there.
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn set_org_egress_lifecycle_gate_for_test(&self, gate: OrgEgressLifecycleGate) {
+        *self.org_egress_lifecycle_gate.lock() = Some(gate);
+    }
+
+    /// Remove the async lifecycle gate. Any future already parked must be
+    /// released separately — clearing the slot does not wake it.
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn clear_org_egress_lifecycle_gate_for_test(&self) {
+        *self.org_egress_lifecycle_gate.lock() = None;
     }
 
     /// Observe every organization datagram at the PRODUCTION send boundary —
@@ -46643,51 +46783,116 @@ mod sensing_authority_witness_tests {
     }
 
     /// Two CONCURRENT explicit teardowns both observe the same settled
-    /// outcome — neither returns while the other is still draining a live
-    /// consumer.
+    /// outcome, with the OVERLAP FORCED rather than hoped for.
+    ///
+    /// The first attempt is parked at `TeardownOwned` — teardown ownership
+    /// held, consumer not settled. The second is then established at the shared
+    /// boundary by its own `TeardownContended` acknowledgement, which fires
+    /// only because its `try_lock` OBSERVED ownership held. While both are
+    /// there, neither call has returned and settlement is unpublished. Only
+    /// then is the first released.
     ///
     /// The pre-repair shape moved the sole `JoinHandle` into a caller-local, so
-    /// the second caller found `None` and returned immediately. An empty handle
-    /// slot is not proof of settlement, and each caller's state is captured the
-    /// instant its own call returns — which is exactly where the old shape lied.
+    /// the second caller found `None` and returned immediately — while the
+    /// first was still draining a live consumer. Each caller's state is
+    /// captured the instant its own call returns, which is exactly where that
+    /// shape lied.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_teardowns_both_observe_settlement() {
+        use std::sync::mpsc;
+
         let node = sensing_org_node("egress-concurrent-teardown").await;
         node.set_org_egress_send_policy_for_test(OrgEgressSendPolicy {
             deadline: Duration::from_secs(600),
             stall: Arc::new(|_| true),
         });
+
         let owned = Arc::new(AtomicU64::new(0));
+        let (at_owned_tx, at_owned_rx) = mpsc::sync_channel::<()>(1);
+        let (release_tx, release_rx) = mpsc::sync_channel::<()>(1);
+        let release_rx = Arc::new(parking_lot::Mutex::new(release_rx));
+        let (contended_tx, contended_rx) = mpsc::sync_channel::<()>(1);
         {
             let owned = owned.clone();
-            node.set_org_egress_lifecycle_seam_for_test(Arc::new(move |point| {
-                if point == OrgEgressLifecyclePoint::TeardownOwned {
-                    owned.fetch_add(1, Ordering::SeqCst);
+            node.set_org_egress_lifecycle_seam_for_test(Arc::new(move |point| match point {
+                OrgEgressLifecyclePoint::TeardownOwned => {
+                    if owned.fetch_add(1, Ordering::SeqCst) == 0 {
+                        let _ = at_owned_tx.send(());
+                        let _ = release_rx.lock().recv();
+                    }
                 }
+                OrgEgressLifecyclePoint::TeardownContended => {
+                    let _ = contended_tx.try_send(());
+                }
+                _ => {}
             }));
         }
+
         let egress = node.org_egress().expect("creatable");
         let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
         assert!(egress.enqueue(Bytes::from_static(b"stalled"), addr));
 
-        let observations: Vec<OrgEgressState> = {
-            let mut tasks = Vec::new();
-            for _ in 0..2 {
-                let egress = Arc::clone(&egress);
-                tasks.push(tokio::spawn(async move {
-                    egress.close_and_join().await;
-                    // Captured the INSTANT this call returned.
-                    egress.state()
-                }));
-            }
-            let mut out = Vec::new();
-            for task in tasks {
-                out.push(task.await.expect("teardown task joins"));
-            }
-            out
+        // FIRST attempt: parks holding teardown ownership.
+        let (first_done_tx, first_done_rx) = mpsc::sync_channel::<OrgEgressState>(1);
+        let first = {
+            let egress = Arc::clone(&egress);
+            tokio::spawn(async move {
+                egress.close_and_join().await;
+                let state = egress.state();
+                let _ = first_done_tx.send(state);
+                state
+            })
         };
+        at_owned_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the first teardown must park holding ownership");
+        assert!(
+            !egress.state().settled,
+            "precondition: the parked attempt has not settled anything"
+        );
 
-        for state in &observations {
+        // SECOND attempt: established at the shared boundary by its OWN
+        // contention acknowledgement.
+        let (second_done_tx, second_done_rx) = mpsc::sync_channel::<OrgEgressState>(1);
+        let second = {
+            let egress = Arc::clone(&egress);
+            tokio::spawn(async move {
+                egress.close_and_join().await;
+                let state = egress.state();
+                let _ = second_done_tx.send(state);
+                state
+            })
+        };
+        contended_rx.recv_timeout(Duration::from_secs(5)).expect(
+            "the second teardown must reach the shared teardown boundary and observe \
+                 it held — without that acknowledgement this witness proves nothing about \
+                 overlap",
+        );
+
+        // BOTH are at the boundary and NEITHER has returned.
+        assert!(
+            first_done_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "the parked first attempt returned while still parked"
+        );
+        assert!(
+            second_done_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "the second teardown returned while the first still owned an unsettled \
+             consumer — an empty handle slot is not proof of settlement"
+        );
+        assert!(
+            !egress.state().settled,
+            "settlement was published while both attempts were still at the boundary"
+        );
+
+        let _ = release_tx.send(());
+        let first_state = first.await.expect("the first teardown joins");
+        let second_state = second.await.expect("the second teardown joins");
+
+        for state in [&first_state, &second_state] {
             assert!(
                 state.settled,
                 "a concurrent teardown returned before settlement was published: \
@@ -46707,22 +46912,20 @@ mod sensing_authority_witness_tests {
              of the second observing the published outcome"
         );
         assert_eq!(
-            observations[0].dropped_forced, 1,
+            first_state.dropped_forced, 1,
             "the stalled in-flight datagram must be retired exactly once"
         );
         node.clear_org_egress_lifecycle_seam_for_test();
     }
 
-    /// A CANCELLED teardown leaves the consumer handle recoverable, and the
-    /// next teardown settles it.
+    /// A teardown CANCELLED WHILE DRAINING leaves the consumer handle
+    /// recoverable, and the next teardown settles it.
     ///
-    /// The invariant asserted is ownership, not a schedule: the handle leaves
-    /// the teardown slot ONLY once settlement is published. So this covers
-    /// cancellation while draining AND cancellation after the abort was
-    /// requested but before the join completed — whichever the cancellation
-    /// budget happens to hit, the same invariant must hold and the follow-up
-    /// must still settle. The pre-repair shape took the handle out first, so a
-    /// cancelled attempt detached the consumer permanently.
+    /// The cancellation lands well inside the drain grace, so the abort has
+    /// definitely NOT been requested yet — that half is the sibling witness
+    /// below. The pre-repair shape took the handle out of the shared slot
+    /// first, so a cancelled attempt detached the consumer permanently and no
+    /// later shutdown could join or abort it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_cancelled_teardown_leaves_the_consumer_recoverable() {
         let node = sensing_org_node("egress-cancelled-teardown").await;
@@ -46734,7 +46937,8 @@ mod sensing_authority_witness_tests {
         let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
         assert!(egress.enqueue(Bytes::from_static(b"stalled"), addr));
 
-        // (a) CANCELLED WHILE DRAINING: well inside the grace window.
+        // CANCELLED WHILE DRAINING: well inside the grace window, so the
+        // attempt was demonstrably still awaiting the drain timeout.
         assert!(
             tokio::time::timeout(
                 ORG_EGRESS_DRAIN_GRACE / 5,
@@ -46750,28 +46954,18 @@ mod sensing_authority_witness_tests {
             "a cancelled teardown must not publish settlement: {state:?}"
         );
         assert_eq!(
+            state.dropped_forced, 0,
+            "and must not have retired anything yet: {state:?}"
+        );
+        assert_eq!(
             egress.teardown_handle_owned(),
             Some(true),
             "the cancelled teardown DETACHED the consumer handle — no later \
              shutdown can join or abort it"
         );
 
-        // (b) CANCELLED AGAIN, at a budget that may land either side of the
-        // abort request. The invariant is the same either way.
-        let _ = tokio::time::timeout(
-            ORG_EGRESS_DRAIN_GRACE + Duration::from_millis(2),
-            Box::pin(egress.close_and_join()),
-        )
-        .await;
-        let owned = egress.teardown_handle_owned();
-        let settled = egress.state().settled;
-        assert!(
-            owned == Some(true) || settled,
-            "the handle left the teardown slot without settlement being published \
-             (owned = {owned:?}, settled = {settled})"
-        );
-
-        // (c) The follow-up settles regardless of where the cancellations landed.
+        // The successor recovers, settles, and retires the outstanding work
+        // EXACTLY once.
         egress.close_and_join().await;
         let state = egress.state();
         assert!(
@@ -46791,6 +46985,116 @@ mod sensing_authority_witness_tests {
         );
     }
 
+    /// A teardown cancelled AFTER the abort was requested but BEFORE the join
+    /// settled is recovered by its successor, which joins and retires exactly
+    /// once.
+    ///
+    /// This window is not reachable by picking a cancellation deadline: the
+    /// abort and the join that follows it are microseconds apart, so a
+    /// timeout-based attempt lands on either side by luck and its assertion has
+    /// to degrade to "retained ownership OR already settled" — which is not
+    /// branch-specific evidence at all.
+    ///
+    /// Instead production ACKNOWLEDGES the window and parks there on an
+    /// `.await` ([`OrgEgressLifecyclePoint::TeardownAborted`]). An `.await` is
+    /// the only place a shutdown future can actually be cancelled, so the
+    /// cancellation is forced to land exactly inside it — proven by the
+    /// acknowledgement, not inferred from elapsed time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_post_abort_cancellation_is_recovered_and_retired_exactly_once() {
+        let node = sensing_org_node("egress-post-abort-cancel").await;
+        node.set_org_egress_send_policy_for_test(OrgEgressSendPolicy {
+            deadline: Duration::from_secs(600),
+            stall: Arc::new(|_| true),
+        });
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        node.set_org_egress_lifecycle_gate_for_test(OrgEgressLifecycleGate {
+            point: OrgEgressLifecyclePoint::TeardownAborted,
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+
+        let egress = node.org_egress().expect("creatable");
+        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        assert!(egress.enqueue(Bytes::from_static(b"stalled"), addr));
+
+        let attempt = {
+            let egress = Arc::clone(&egress);
+            tokio::spawn(async move { egress.close_and_join().await })
+        };
+        // THE ACKNOWLEDGEMENT: the abort has been requested and the join has
+        // not run. Bounded so a broken seam fails rather than hangs.
+        tokio::time::timeout(ORG_EGRESS_DRAIN_GRACE * 5, entered.acquire())
+            .await
+            .expect("the teardown must reach the post-abort window")
+            .expect("the acknowledgement semaphore stays open")
+            .forget();
+        let state = egress.state();
+        assert!(
+            !state.settled,
+            "settlement was published before the join: {state:?}"
+        );
+        assert_eq!(
+            state.dropped_forced, 0,
+            "and nothing was retired before the join: {state:?}"
+        );
+
+        // CANCEL, exactly here. The future is parked on the gate's `.await`, so
+        // cancellation is real rather than deferred to some later yield.
+        attempt.abort();
+        assert!(
+            attempt
+                .await
+                .expect_err("the attempt must be cancelled")
+                .is_cancelled(),
+            "the parked teardown was not actually cancelled"
+        );
+        // Nothing is parked on the gate any more, so the successor must not be
+        // held by it.
+        node.clear_org_egress_lifecycle_gate_for_test();
+
+        assert_eq!(
+            egress.teardown_handle_owned(),
+            Some(true),
+            "a cancellation between the abort request and the join DETACHED the \
+             consumer handle — the abort was requested and nobody can join it"
+        );
+        let state = egress.state();
+        assert!(
+            !state.settled,
+            "a cancelled teardown must not publish settlement: {state:?}"
+        );
+        assert_eq!(
+            state.dropped_forced, 0,
+            "nor retire outstanding work: {state:?}"
+        );
+
+        // THE SUCCESSOR recovers the already-aborted handle, joins it, and
+        // retires the outstanding datagram exactly once.
+        egress.close_and_join().await;
+        let state = egress.state();
+        assert!(state.settled, "{state:?}");
+        assert!(state.consumer_finished, "{state:?}");
+        assert_eq!(state.depth, 0, "{state:?}");
+        assert_eq!(
+            state.dropped_forced, 1,
+            "the successor must retire the outstanding datagram exactly once: \
+             {state:?}"
+        );
+        assert_eq!(
+            state.sent + state.send_failed,
+            0,
+            "force-dropped work must never be counted as sent or failed: {state:?}"
+        );
+        assert_eq!(egress.teardown_handle_owned(), Some(false));
+        // Nothing left parked: release is a no-op, and a further teardown is a
+        // settled observation.
+        release.notify_waiters();
+        egress.close_and_join().await;
+        assert!(egress.state().settled);
+    }
+
     /// A first creation PARKED inside the lifecycle cell cannot be overtaken by
     /// a concurrent shutdown, and the consumer it creates is still closed and
     /// joined by that shutdown.
@@ -46799,6 +47103,12 @@ mod sensing_authority_witness_tests {
     /// under the pre-repair `OnceLock` the terminal read and the lazy
     /// `get_or_init` did not order, so shutdown could complete while a creation
     /// was in flight and the fresh consumer outlived the node.
+    ///
+    /// The rival's ARRIVAL is acknowledged by production
+    /// ([`OrgEgressLifecyclePoint::TerminalCloseContended`], which fires only
+    /// when the terminal transition's own `try_lock` observed the cell held).
+    /// Without that, "shutdown did not finish within 400 ms" is equally
+    /// consistent with shutdown never having reached the cell at all.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_creation_parked_under_the_cell_cannot_be_overtaken_by_shutdown() {
         use std::sync::mpsc;
@@ -46807,15 +47117,19 @@ mod sensing_authority_witness_tests {
         let (parked_tx, parked_rx) = mpsc::sync_channel::<()>(1);
         let (unpark_tx, unpark_rx) = mpsc::sync_channel::<()>(1);
         let unpark_rx = Arc::new(parking_lot::Mutex::new(unpark_rx));
+        let (contended_tx, contended_rx) = mpsc::sync_channel::<()>(1);
         let armed = Arc::new(AtomicBool::new(true));
-        node.set_org_egress_lifecycle_seam_for_test(Arc::new(move |point| {
-            if point != OrgEgressLifecyclePoint::CreatingUnderCell
-                || !armed.swap(false, Ordering::SeqCst)
-            {
-                return;
+        node.set_org_egress_lifecycle_seam_for_test(Arc::new(move |point| match point {
+            OrgEgressLifecyclePoint::CreatingUnderCell => {
+                if armed.swap(false, Ordering::SeqCst) {
+                    let _ = parked_tx.send(());
+                    let _ = unpark_rx.lock().recv();
+                }
             }
-            let _ = parked_tx.send(());
-            let _ = unpark_rx.lock().recv();
+            OrgEgressLifecyclePoint::TerminalCloseContended => {
+                let _ = contended_tx.try_send(());
+            }
+            _ => {}
         }));
 
         let creating = {
@@ -46834,9 +47148,14 @@ mod sensing_authority_witness_tests {
                 let _ = shutdown_done_tx.send(());
             })
         };
+        // THE RIVAL HAS ARRIVED at the contested acquisition and found it held.
+        contended_rx.recv_timeout(Duration::from_secs(10)).expect(
+            "shutdown never reached the lifecycle cell, so the schedule this witness \
+             claims was never established",
+        );
         assert!(
             shutdown_done_rx
-                .recv_timeout(Duration::from_millis(400))
+                .recv_timeout(Duration::from_millis(200))
                 .is_err(),
             "shutdown completed its terminal transition while a creation held the \
              lifecycle cell — the consumer it is about to spawn will outlive the node"
@@ -46869,7 +47188,8 @@ mod sensing_authority_witness_tests {
     ///
     /// Attempting the enqueue after `close_and_join` has returned cannot
     /// distinguish a shared lock from two independent flags; parking inside the
-    /// window does.
+    /// window does — but only once the rival is PROVEN to have arrived, which
+    /// is what [`OrgEgressLifecyclePoint::CloseContended`] acknowledges.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_enqueue_holding_the_queue_lock_blocks_close() {
         use std::sync::mpsc;
@@ -46881,15 +47201,19 @@ mod sensing_authority_witness_tests {
         let (parked_tx, parked_rx) = mpsc::sync_channel::<()>(1);
         let (unpark_tx, unpark_rx) = mpsc::sync_channel::<()>(1);
         let unpark_rx = Arc::new(parking_lot::Mutex::new(unpark_rx));
+        let (contended_tx, contended_rx) = mpsc::sync_channel::<()>(1);
         let armed = Arc::new(AtomicBool::new(true));
-        node.set_org_egress_lifecycle_seam_for_test(Arc::new(move |point| {
-            if point != OrgEgressLifecyclePoint::EnqueueUnderQueueLock
-                || !armed.swap(false, Ordering::SeqCst)
-            {
-                return;
+        node.set_org_egress_lifecycle_seam_for_test(Arc::new(move |point| match point {
+            OrgEgressLifecyclePoint::EnqueueUnderQueueLock => {
+                if armed.swap(false, Ordering::SeqCst) {
+                    let _ = parked_tx.send(());
+                    let _ = unpark_rx.lock().recv();
+                }
             }
-            let _ = parked_tx.send(());
-            let _ = unpark_rx.lock().recv();
+            OrgEgressLifecyclePoint::CloseContended => {
+                let _ = contended_tx.try_send(());
+            }
+            _ => {}
         }));
 
         let enqueuing = {
@@ -46908,8 +47232,13 @@ mod sensing_authority_witness_tests {
                 let _ = closed_tx.send(());
             })
         };
+        // THE RIVAL HAS ARRIVED at the queue lock and found it held.
+        contended_rx.recv_timeout(Duration::from_secs(10)).expect(
+            "close never reached the queue lock, so the schedule this witness claims \
+             was never established",
+        );
         assert!(
-            closed_rx.recv_timeout(Duration::from_millis(400)).is_err(),
+            closed_rx.recv_timeout(Duration::from_millis(200)).is_err(),
             "close wrote closure while an enqueue held the queue lock — acceptance \
              and closure are not decided under the same synchronization"
         );
