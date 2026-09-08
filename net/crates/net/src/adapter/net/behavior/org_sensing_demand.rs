@@ -2667,11 +2667,17 @@ mod tests {
     /// is left to age past three quarters of its horizon before the family
     /// joins, so an arm grounded in join time would schedule the first renewal
     /// after the existing soft state had already expired.
+    ///
+    /// The assertions are on the ARMED DEADLINE, not on when a renewal is
+    /// observed. The decision under test is a scheduling one, and an observed
+    /// renewal instant also carries the join's own cost, the probe's 5 ms poll
+    /// granularity and the runner's sleep overshoot - on a loaded CI runner
+    /// those alone pushed a correct schedule past a 200 ms horizon.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn adopting_an_aged_installation_renews_before_it_expires() {
-        // 200 ms horizon: period 100 ms, damper gap 100 ms, expiry at 200 ms
-        // after the public registration.
-        let node = demand_node("adopt-aged", Duration::from_millis(200)).await;
+        // 2 s horizon: period 1 s, expiry 2 s after the public registration.
+        let ttl = Duration::from_secs(2);
+        let node = demand_node("adopt-aged", ttl).await;
         let family = OrgSensingFamily::mint(&node).expect("mint");
         let provider = node.node_id().wrapping_add(1);
         let key = lease_key_for(&node, provider);
@@ -2683,17 +2689,43 @@ mod tests {
         let established_at = Instant::now();
         assert!(node.sensing_refresh_arm_for_test(&key).is_none());
 
-        // AGE it: 150 ms of a 200 ms horizon is already gone when the family
-        // joins, and a join-time arm would land at 250 ms.
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        // AGE it: 1.5 s of a 2 s horizon is already gone when the family
+        // joins, and a join-time arm would land a full period later, at 2.5 s.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
         let demand = family.reconcile(TAG, &[provider]).expect("retain");
+        let armed = node.sensing_refresh_arm_for_test(&key);
+        let seen = Instant::now();
         let state = node.org_sensing_demand_state_for_test();
         assert_eq!(
             state.refresh_adopted, 1,
             "a coalescing join onto an aged row must be adopted: {state:?}"
         );
 
-        // The renewal has to land before the row's own expiry.
+        match armed {
+            Some((deadline, _)) => {
+                assert!(
+                    deadline <= seen,
+                    "an adopted arm must be grounded in the row's unknown freshness, \
+                     not in join time: its deadline is {:?} out, and a join-time arm \
+                     would be a full period out",
+                    deadline.saturating_duration_since(seen)
+                );
+                assert!(
+                    deadline < established_at + ttl,
+                    "the renewal must be scheduled before the existing soft state \
+                     expires: {:?} into a {ttl:?} horizon",
+                    deadline.duration_since(established_at)
+                );
+            }
+            // The due-now arm was already taken by the worker, which is the
+            // same conclusion reached one step later.
+            None => assert!(
+                state.refresh_renewed >= 1,
+                "an adopted row must be armed or already renewed: {state:?}"
+            ),
+        }
+
+        // And the renewal really lands, on that schedule.
         until(
             &node,
             Duration::from_secs(5),
@@ -2701,14 +2733,6 @@ mod tests {
             || node.org_sensing_demand_state_for_test().refresh_renewed >= 1,
         )
         .await;
-        let renewed_at = Instant::now();
-        assert!(
-            renewed_at.duration_since(established_at) < node.sensing_interest_ttl(),
-            "the adoption renewed only after the existing soft state had expired: \
-             {:?} into a {:?} horizon",
-            renewed_at.duration_since(established_at),
-            node.sensing_interest_ttl()
-        );
         assert!(row_present(&node, provider));
 
         let _ = node.try_release_sensing_interest_lease(public);
