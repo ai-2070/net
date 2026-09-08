@@ -16083,6 +16083,14 @@ impl MeshNode {
                     .into(),
             ));
         }
+        // Note on duration: a peer whose PSK or static key does not
+        // match cannot be told apart from another pairing's stale
+        // `msg1`, so this spends the full
+        // `handshake_retries × handshake_timeout` budget rather than
+        // failing on the first bad datagram — and holds
+        // `accept_in_flight` (so `start()` refuses) for that whole
+        // time. See `try_handshake_responder`'s doc for why that is
+        // the right trade and what to tune.
         let (keys, peer_addr) = self.handshake_responder(peer_node_id).await?;
 
         // The responder side of a handshake is the SAME lifecycle
@@ -34145,6 +34153,32 @@ impl MeshNode {
     /// floor in exactly that case. Per-datagram logging stays at
     /// `debug` on purpose: at `warn` a junk sprayer would own the
     /// operator's log.
+    ///
+    /// # What draining costs, and why that is the right trade
+    ///
+    /// A mismatched pair no longer fails fast. Pre-drain, `accept()`
+    /// returned `read_message failed` the instant the wrong `msg1`
+    /// arrived; now it spends the whole
+    /// `handshake_retries × handshake_timeout` budget, because there
+    /// is nothing at this layer that distinguishes "wrong key" from
+    /// "another pairing's stale retransmit" — and failing on the
+    /// latter is the bug this exists to fix.
+    ///
+    /// That is symmetry restored, not cost added: the INITIATOR always
+    /// spent its full budget on a mismatch, so the old fast responder
+    /// failure did not shorten anything end to end. It only made one
+    /// side report a useful error and the other a bare timeout.
+    ///
+    /// The operational consequence is real and worth knowing. The
+    /// budget is wall-clock (~15 s at the defaults), `start()` refuses
+    /// while an `accept()` is in flight (see [`Self::start`]), and
+    /// topology setup usually accepts peers in sequence — so N
+    /// misconfigured peers delay a node's startup by N budgets. Tune
+    /// `handshake_retries` / `handshake_timeout` if that matters. The
+    /// signal for it is the error text naming the decrypt failure,
+    /// plus a climbing
+    /// [`Self::responder_handshakes_drained`]; the cure is fixing the
+    /// key, not widening the budget.
     ///
     /// `last_decrypt_reject` and `last_paced_source` are owned by
     /// [`Self::handshake_responder`] and carry across every attempt of
