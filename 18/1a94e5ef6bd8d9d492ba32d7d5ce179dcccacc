@@ -1,0 +1,22 @@
+net/crates/net/tests/handshake_retry_resync.rs
+  s_bfb52d5ec11803::t_1462bbb2c0eefe 410-450
+net/crates/net/src/adapter/net/mesh.rs
+  s_bfb52d5ec11803::t_6c8ebded1fc62b 33979-33988,33992-33999,34057-34060,34064-34065,34133-34137,34148,34165-34182
+  s_bfb52d5ec11803::t_b719134a819231 34049-34055
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "181a94e5ef6bd8d9d492ba32d7d5ce179dcccacc",
+  "prompts": {},
+  "sessions": {
+    "s_bfb52d5ec11803": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5180a5ef-838b-45f7-8776-0e6bc31fafca",
+        "model": "claude-opus-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
