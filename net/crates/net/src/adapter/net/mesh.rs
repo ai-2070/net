@@ -7040,6 +7040,22 @@ pub(crate) enum SensingArmProvenance {
     Adopted,
 }
 
+/// What an admission into the refused-release ledger resolved to.
+///
+/// `Discharged` is NOT a loss: the ticket's holder is already gone (an
+/// invalidation killed it), so there is nothing left to own. That distinction
+/// is why admission can be closed against invalidation without ever dropping
+/// live ownership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefusedReleaseOutcome {
+    /// The ledger owns the ticket and will retry its release.
+    Retained,
+    /// The ticket's holder no longer exists; nothing to own.
+    Discharged,
+    /// The node is terminal — its whole registry goes away with it.
+    Terminal,
+}
+
 /// Whether a refused release is entering the retention set for the FIRST time
 /// or being put back by the retry loop that extracted it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10432,6 +10448,18 @@ pub struct MeshNode {
     /// exactly that window.
     #[cfg(test)]
     sensing_population_seam: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// In-crate witness seam: fires inside a convergence's carry loop, right
+    /// after ONE holder's ownership has been observed and before it is used.
+    /// A witness invalidates the installation in that window; the observation
+    /// must stay coherent instead of being contradicted by a second read.
+    #[cfg(test)]
+    sensing_carry_validated_seam: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// In-crate witness seam: fires inside `acquire_provider`, immediately
+    /// BEFORE the acquisition call — exactly where a pre-acquisition key
+    /// sample would sit. A witness establishes the row publicly there, so a
+    /// caller that inferred freshness from before/after samples is detectable.
+    #[cfg(test)]
+    sensing_pre_acquire_seam: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// In-crate witness seam: fires inside an acquisition immediately after the
     /// registry PREVIEW and before the plane-coherence refusals — with nothing
     /// yet mutated. Lets a witness prove the transition order was taken from
@@ -12333,6 +12361,10 @@ impl MeshNode {
             #[cfg(test)]
             sensing_population_seam: parking_lot::Mutex::new(None),
             #[cfg(test)]
+            sensing_carry_validated_seam: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            sensing_pre_acquire_seam: parking_lot::Mutex::new(None),
+            #[cfg(test)]
             sensing_acquire_previewed_seam: parking_lot::Mutex::new(None),
             #[cfg(test)]
             sensing_acquire_pre_restore_seam: parking_lot::Mutex::new(None),
@@ -12992,6 +13024,51 @@ impl MeshNode {
     pub(crate) fn fire_sensing_population_seam(&self) {
         #[cfg(test)]
         if let Some(hook) = self.sensing_population_seam.lock().clone() {
+            hook();
+        }
+    }
+
+    /// Install the carry-validated seam. It fires inside a convergence's carry
+    /// loop, right after one holder's ownership was observed.
+    #[cfg(test)]
+    pub(crate) fn set_sensing_carry_validated_seam_for_test(
+        &self,
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) {
+        *self.sensing_carry_validated_seam.lock() = Some(hook);
+    }
+
+    /// Remove the carry-validated seam.
+    #[cfg(test)]
+    pub(crate) fn clear_sensing_carry_validated_seam_for_test(&self) {
+        *self.sensing_carry_validated_seam.lock() = None;
+    }
+
+    /// Fire the carry-validated seam, if one is installed.
+    pub(crate) fn fire_sensing_carry_validated_seam(&self) {
+        #[cfg(test)]
+        if let Some(hook) = self.sensing_carry_validated_seam.lock().clone() {
+            hook();
+        }
+    }
+
+    /// Install the pre-acquire seam. It fires immediately before a retained
+    /// provider's acquisition call.
+    #[cfg(test)]
+    pub(crate) fn set_sensing_pre_acquire_seam_for_test(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.sensing_pre_acquire_seam.lock() = Some(hook);
+    }
+
+    /// Remove the pre-acquire seam.
+    #[cfg(test)]
+    pub(crate) fn clear_sensing_pre_acquire_seam_for_test(&self) {
+        *self.sensing_pre_acquire_seam.lock() = None;
+    }
+
+    /// Fire the pre-acquire seam, if one is installed.
+    pub(crate) fn fire_sensing_pre_acquire_seam(&self) {
+        #[cfg(test)]
+        if let Some(hook) = self.sensing_pre_acquire_seam.lock().clone() {
             hook();
         }
     }
@@ -14529,16 +14606,15 @@ impl MeshNode {
     /// Ownership therefore moves to the node's refresh worker, which retries on
     /// its own cadence.
     ///
-    /// Returns `false` ONLY for a terminal node. There is deliberately no
-    /// capacity rejection of live ownership: see
+    /// There is deliberately no capacity rejection of live ownership: see
     /// [`Self::retain_refused_release`].
     pub(crate) fn park_refused_release(
         node: &Arc<MeshNode>,
         ticket: sensing::SensingLeaseTicket,
         installation_id: sensing::LeaseToken,
         provider: u64,
-    ) -> bool {
-        let retained = Self::retain_refused_release(
+    ) -> RefusedReleaseOutcome {
+        let outcome = Self::retain_refused_release(
             node,
             RefusedRelease {
                 ticket,
@@ -14548,44 +14624,68 @@ impl MeshNode {
             RefusedReleaseAdmission::Fresh,
         );
         let counters = &node.org_sensing_demand_counters;
-        if retained {
-            counters
-                .refused_release_parked
-                .fetch_add(1, Ordering::Relaxed);
-        } else {
-            counters
-                .refused_release_unowned
-                .fetch_add(1, Ordering::Relaxed);
+        match outcome {
+            RefusedReleaseOutcome::Retained => {
+                counters
+                    .refused_release_parked
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            RefusedReleaseOutcome::Discharged => {
+                counters
+                    .refused_release_reclaimed
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            RefusedReleaseOutcome::Terminal => {
+                counters
+                    .refused_release_unowned
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
-        retained
+        outcome
     }
 
     /// Put one refused release into the retention set.
     ///
     /// # The set is an ownership LEDGER, not a budget
     ///
-    /// Every entry names one distinct live `(key, token)` holder, and the
-    /// registry admits at most `MAX_LEASED_INTERESTS *
-    /// MAX_HOLDERS_PER_INTEREST` of those in total, so the ledger's size is
-    /// bounded by the registry itself rather than by a policy. Entries stop
-    /// being live only by invalidation, and
-    /// [`Self::discharge_refused_releases_for_key`] discharges them at that
-    /// exact transition.
+    /// Two facts make its size the registry's business rather than a policy's:
     ///
-    /// So there is NO capacity rejection here. A rejection would have to be
+    /// * an entry is only ever ADMITTED while its ticket is a live holder, and
+    ///   that is checked under the SAME schedule lock the append happens in;
+    /// * an entry only ever stops being live by invalidation, and
+    ///   [`Self::discharge_refused_releases_for_key`] runs under that same lock
+    ///   at the invalidating transition.
+    ///
+    /// So an in-flight admission cannot slip past a discharge: either the
+    /// discharge reached the lock first and this admission's own read finds the
+    /// ticket dead, or the admission holds the lock and the discharge — which
+    /// needs it — sees the appended entry. A separate "sample fullness, then
+    /// lock and append" pair could not say that: an invalidation between the
+    /// sample and the append left a stale entry the discharge had already
+    /// looked for and not found, so pending state could scale with caller
+    /// concurrency instead of with registry capacity. Every entry live at
+    /// insert plus discharge-at-invalidation is what actually bounds it by
+    /// `MAX_LEASED_INTERESTS * MAX_HOLDERS_PER_INTEREST`.
+    ///
+    /// There is NO capacity rejection here. A rejection would have to be
     /// justified against the state it was decided on, and a check-then-lock
     /// pair cannot do that: two admissions can both observe `N - 1`, one
     /// appends, and the other's second look sees `N` and abandons a live
-    /// ticket whose sole release capability it was holding — with reclaimable
-    /// entries sitting in the set it never re-examined. Over-ceiling admission
-    /// is counted loudly (`refused_release_overflow`) and a reclamation pass
-    /// runs first, but losing ownership is never the outcome. `Reinstated`
-    /// (the worker putting back what it extracted) is likewise unconditional.
+    /// ticket whose sole release capability it was holding. Over-ceiling
+    /// admission is counted loudly (`refused_release_overflow`) and a
+    /// reclamation pass runs first, but losing ownership is never the outcome.
+    ///
+    /// `Reinstated` — the worker putting back what it extracted — takes the
+    /// same liveness check and no capacity check. Its ticket was in flight
+    /// outside the ledger while the retry ran, so a discharge in that window
+    /// could not see it; the check is what keeps that from re-admitting a dead
+    /// ticket. Nothing live is ever dropped by it: a `Discharged` outcome means
+    /// the holder is already gone.
     fn retain_refused_release(
         node: &Arc<MeshNode>,
         entry: RefusedRelease,
         admission: RefusedReleaseAdmission,
-    ) -> bool {
+    ) -> RefusedReleaseOutcome {
         if admission == RefusedReleaseAdmission::Fresh {
             // Best-effort tidy of anything the invalidation hook could not
             // reach, so the ceiling is measured against live ownership. The
@@ -14598,7 +14698,21 @@ impl MeshNode {
         let retry_at = Instant::now() + node.sensing_refresh_period();
         let mut schedule = node.sensing_refresh.lock();
         if schedule.terminal {
-            return false;
+            return RefusedReleaseOutcome::Terminal;
+        }
+        // THE ADMISSION BOUNDARY. Read under the schedule lock deliberately:
+        // this is the ordering that makes an admission and an invalidation's
+        // discharge mutually exclusive. `apply -> schedule -> entries` is the
+        // sanctioned direction; nothing takes the schedule lock while holding
+        // the registry's.
+        if !node.holds_sensing_lease_token(&entry.ticket) {
+            drop(schedule);
+            tracing::debug!(
+                provider = format!("{:#x}", entry.provider),
+                "org sensing demand: refused release needs no owner; its holder is \
+                 already gone"
+            );
+            return RefusedReleaseOutcome::Discharged;
         }
         let over_ceiling = schedule.refused.len() >= node.refused_release_cap();
         let wake_before = schedule.next_wake();
@@ -14627,7 +14741,7 @@ impl MeshNode {
         if rearm {
             node.sensing_refresh_wake.notify_one();
         }
-        true
+        RefusedReleaseOutcome::Retained
     }
 
     /// DISCHARGE every retained release for `key`, at the transition that made
@@ -14831,25 +14945,36 @@ impl MeshNode {
                 }
                 Step::Retry(pending) => {
                     for entry in pending {
+                        let provider = entry.provider;
                         if live
                             .try_release_sensing_interest_lease(entry.ticket)
                             .is_err()
                         {
-                            // Still refused. Keep OWNING it and try again on the
-                            // next cadence. The reinstatement is capacity-exempt
-                            // deliberately: this ticket was already ours, and
-                            // refusing to put it back is the same lost-ownership
-                            // defect the retention exists to prevent. Only a
-                            // TERMINAL node declines, and its whole registry
-                            // goes away with it.
-                            if !MeshNode::retain_refused_release(
+                            // Still refused. Keep OWNING it and try again on
+                            // the next cadence: this ticket was already ours,
+                            // and refusing to put it back is the same
+                            // lost-ownership defect the retention exists to
+                            // prevent. Capacity is not consulted; the only
+                            // outcomes are "retained", "its holder is already
+                            // gone" (an invalidation reached it while the retry
+                            // held it OUTSIDE the ledger, so there is nothing
+                            // to own), and "terminal".
+                            match MeshNode::retain_refused_release(
                                 &live,
                                 entry,
                                 RefusedReleaseAdmission::Reinstated,
                             ) {
-                                live.org_sensing_demand_counters
-                                    .refused_release_unowned
-                                    .fetch_add(1, Ordering::Relaxed);
+                                RefusedReleaseOutcome::Retained => {}
+                                RefusedReleaseOutcome::Discharged => {
+                                    live.org_sensing_demand_counters
+                                        .refused_release_reclaimed
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                                RefusedReleaseOutcome::Terminal => {
+                                    live.org_sensing_demand_counters
+                                        .refused_release_unowned
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
                             }
                             // Published LAST, deliberately: an observer that
                             // sees this count has already seen the entry put
@@ -14869,7 +14994,7 @@ impl MeshNode {
                             .refused_release_retried
                             .fetch_add(1, Ordering::Relaxed);
                         tracing::debug!(
-                            provider = format!("{:#x}", entry.provider),
+                            provider = format!("{:#x}", provider),
                             "org sensing demand: refused retirement release recovered"
                         );
                     }
@@ -14981,16 +15106,25 @@ impl MeshNode {
         population
     }
 
-    /// Whether `ticket` is STILL a live holder of its key.
+    /// The INSTALLATION `ticket` is a live holder of, or `None` when it holds
+    /// nothing — ONE registry observation of both facts.
     ///
-    /// Actual ownership, straight out of the registry. This is what a
-    /// convergence validates carried tickets against: installation identity
-    /// answers a different question ("is the row I remember still the live
-    /// one"), and a pair whose two halves came from separate reads can be
-    /// self-consistent while describing a holder that never existed.
-    pub(crate) fn holds_sensing_lease_token(&self, ticket: &sensing::SensingLeaseTicket) -> bool {
+    /// This is what a convergence validates carried tickets against. Asking
+    /// "is it a holder" and "which installation is live" as two reads is two
+    /// observations at two instants, and an independent invalidation between
+    /// them makes them disagree about a ticket that was valid when committed —
+    /// which is a property of the observation, not of the ticket.
+    pub(crate) fn sensing_lease_holder_installation(
+        &self,
+        ticket: &sensing::SensingLeaseTicket,
+    ) -> Option<sensing::LeaseToken> {
         self.sensing_interest_leases
-            .holds_token(&ticket.key, ticket.token)
+            .holder_installation(&ticket.key, ticket.token)
+    }
+
+    /// Whether `ticket` is STILL a live holder of its key.
+    pub(crate) fn holds_sensing_lease_token(&self, ticket: &sensing::SensingLeaseTicket) -> bool {
+        self.sensing_lease_holder_installation(ticket).is_some()
     }
 
     /// The INSTALLATION identity currently live for `key`, if any — what a

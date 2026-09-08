@@ -523,29 +523,38 @@ impl SensingInterestLeases {
         self.entry_lock_acquisitions.load(Ordering::Acquire)
     }
 
-    /// Whether `token` is a live holder of `key`, read from the registry
-    /// itself.
+    /// The INSTALLATION `token` is a live holder of, or `None` when it holds
+    /// nothing under `key` — both answers from ONE registry read.
     ///
-    /// This is ACTUAL OWNERSHIP, not a resemblance of it. Installation
-    /// identity answers "is the row I remember still the live one", which is a
-    /// different question: a ticket and an installation sampled by two
-    /// separate reads can name different incarnations of the same key, and
-    /// then the pair never described a holder at all. Membership cannot be
-    /// wrong that way — a token is in an entry's registrations exactly while
-    /// its holder exists.
-    pub(crate) fn holds_token(&self, key: &SensingLeaseKey, token: LeaseToken) -> bool {
-        self.lock_entries()
-            .get(key)
-            .is_some_and(|entry| entry.registrations.contains_key(&token))
+    /// This is ACTUAL OWNERSHIP, not a resemblance of it, and it is
+    /// deliberately one observation. Installation identity alone answers a
+    /// different question ("is the row I remember still the live one"), and
+    /// asking the two separately produces a pair of observations at two
+    /// instants: a legitimate invalidation in between makes them disagree
+    /// about a ticket that was perfectly valid when it was committed. One read
+    /// cannot disagree with itself.
+    pub(crate) fn holder_installation(
+        &self,
+        key: &SensingLeaseKey,
+        token: LeaseToken,
+    ) -> Option<LeaseToken> {
+        let entries = self.lock_entries();
+        let entry = entries.get(key)?;
+        entry
+            .registrations
+            .contains_key(&token)
+            .then_some(entry.installation_id)
     }
 
-    /// [`Self::holds_token`], for the contention witnesses that need "the
-    /// registry and the returned action agree" — which a holder COUNT cannot
-    /// express.
+    /// Whether `token` is a live holder of `key` — for the contention
+    /// witnesses that need "the registry and the returned action agree", which
+    /// a holder COUNT cannot express. Production reads the coherent
+    /// [`Self::holder_installation`] instead, because it needs both answers
+    /// from one observation.
     #[doc(hidden)]
     #[cfg(any(test, feature = "fixtures"))]
     pub fn holds_token_for_test(&self, key: &SensingLeaseKey, token: LeaseToken) -> bool {
-        self.holds_token(key, token)
+        self.holder_installation(key, token).is_some()
     }
 
     /// DECIDE one acquisition against an ALREADY-HELD registry view, mutating

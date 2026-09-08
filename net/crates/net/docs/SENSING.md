@@ -342,22 +342,39 @@ installation — a surviving holder keeps its row and its renewal.
 A release the transaction refuses leaves a holder that is still live and
 still this node's, so the ticket is retained on the node and retried on
 the worker's cadence instead of being dropped. That retention is an
-ownership LEDGER, not a budget: every entry names one distinct live
-`(key, token)` holder, so its size is bounded by the registry's own
-holder capacity, entries are discharged at the invalidation that kills
-them, and admission never rejects — a retry that fails puts its ticket
-back unconditionally, and going over the derived ceiling is counted
-loudly rather than paid for by abandoning a live holder. A capacity
-rejection would have to be justified against the state it was decided
-on, and a check-then-lock pair cannot do that.
+ownership LEDGER, not a budget, and two facts are what actually bound
+it by the registry's own live-holder capacity:
+
+* an entry is only ADMITTED while its ticket is a live holder, and that
+  is checked under the SAME lock the append happens in;
+* an entry only stops being live by invalidation, and the invalidating
+  transition discharges it under that same lock.
+
+So an in-flight admission cannot slip past a discharge: either the
+discharge reached the lock first and the admission finds its ticket dead
+(nothing to own — not a loss), or the admission holds the lock and the
+discharge sees the appended entry. Without that, an invalidation between
+a fullness sample and the append left a stale entry the discharge had
+already looked for, and pending state could scale with caller
+concurrency rather than with registry capacity. Admission still never
+rejects: a retry that fails puts its ticket back unconditionally, and
+going over the derived ceiling is counted loudly rather than paid for by
+abandoning a live holder — a capacity rejection would have to be
+justified against the state it was decided on, and a check-then-lock
+pair cannot do that.
 
 Ownership is also VALIDATED, not assumed. Production invalidates whole
 installations (a refused tightening whose surviving-holder restoration
 current authority will not author), which kills every holder of that
 key. A convergence therefore re-checks each carried ticket against
-ACTUAL HOLDER MEMBERSHIP — is this exact token still a registration of
-this exact key — and re-acquires when it is not, rather than reporting a
-provider as retained with nothing behind it.
+ACTUAL HOLDER MEMBERSHIP and the installation that holder belongs to,
+from ONE registry read, and re-acquires when they do not match what was
+committed. One read matters: asking the two questions separately is two
+observations at two instants, and an independent invalidation between
+them makes them disagree about a ticket that was valid when it was
+committed. A carry that was valid when observed and invalidated
+immediately afterwards is legitimate movement — the next convergence
+rejects the dead ticket and re-acquires.
 
 **Terminal lifecycle.** Node shutdown closes and joins the refresh
 schedule and drops any retained refused releases with it. It does NOT
