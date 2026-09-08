@@ -80,6 +80,8 @@ pages:
   releases/RELEASE_v0.32_SUMMER_MADNESS: universal
   releases/RELEASE_v0.33_CIRCUS_MAXIMUS: universal
   releases/RELEASE_v0.34_HOTEL_CALIFORNIA: universal
+  releases/RELEASE_v0.35_DOUBLEBACK: universal
+  releases/RELEASE_v0.36_PARANOID: universal
   releases/RELEASE_v0.8_KILLING_MOON: universal
   releases/RELEASE_v0.9_FIRST_BLOOD: universal
   start: universal
