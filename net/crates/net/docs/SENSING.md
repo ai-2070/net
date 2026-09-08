@@ -357,11 +357,13 @@ discharge sees the appended entry. Without that, an invalidation between
 a fullness sample and the append left a stale entry the discharge had
 already looked for, and pending state could scale with caller
 concurrency rather than with registry capacity. Admission still never
-rejects: a retry that fails puts its ticket back unconditionally, and
-going over the derived ceiling is counted loudly rather than paid for by
-abandoning a live holder — a capacity rejection would have to be
-justified against the state it was decided on, and a check-then-lock
-pair cannot do that.
+rejects a live holder: a retry that fails puts its ticket back
+whenever that ticket is still live — never for capacity — and going
+over the derived ceiling is counted loudly rather than paid for by
+abandoning a live holder, while a ticket whose installation is already
+invalidated is discharged instead of re-appended. A capacity rejection
+would have to be justified against the state it was decided on, and a
+check-then-lock pair cannot do that.
 
 Ownership is also VALIDATED, not assumed. Production invalidates whole
 installations (a refused tightening whose surviving-holder restoration
