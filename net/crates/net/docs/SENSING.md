@@ -422,15 +422,27 @@ the last one retires everything. Planning applies the projection
 between candidate derivation and selection: it permutes an
 already-authorized list, cannot add, remove or authorize a candidate,
 mints nothing, and runs strictly before the final currentness
-comparison that still gates the proof. Acquisition happens at most
-once per capability per binding, on the first call that needs an
-order, and warmed calls reuse it; a moved sensing authority triggers
-one re-convergence, never a retry loop. Every degradation — inert
-binding, refused acquisition, empty population, `Unknown`, expired or
-over-budget evidence, an all-pruned order — lands on the same outcome:
-the deterministic unsensed order, with no new error. Only one input is
-request-relative: the latency budget, derived from that call's own
-deadline.
+comparison that still gates the proof.
+
+**Reconciliation is driven by the call's own candidate list.** The
+authority stamp covers security-authority publication — not discovery
+rows, not pins, not holder liveness — so demand keyed on it alone
+would freeze ordinary churn. Each call therefore compares its own
+pinned same-organization candidates against what that capability's
+demand was last converged FOR. Unchanged: nothing is re-acquired.
+Changed — a newly discovered provider, a departed one, a pin that came
+or went: one convergence, which keeps every still-authorized holder's
+existing ticket. A convergence that could not take a holder it wanted
+(a per-provider refusal is skipped, never fatal) is retried on a floor,
+so a transient refusal recovers without turning every later call into
+acquisition traffic. A moved sensing authority is one more trigger, not
+a retry loop.
+
+Every degradation — inert binding, refused acquisition, empty
+population, `Unknown`, expired or over-budget evidence, an all-pruned
+order — lands on the same outcome: the deterministic unsensed order,
+with no new error. Only one input is request-relative: the latency
+budget, derived from that call's own deadline.
 
 What is still genuinely absent: no query, watch or snapshot surface,
 and no continuous ranking. There is no provider-free/leader sensing, no

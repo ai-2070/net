@@ -924,8 +924,17 @@ jobs:
             | grep -oE -- '--test [a-z0-9_]+' \
             | sed 's/--test //' | sort -u > /tmp/pinned.txt
           printf '%s\n' "$UNPINNED_OK" | awk '{print $1}' | grep -v '^$' | sort -u > /tmp/allowed.txt
-          ls tests/*.rs | sed 's|tests/||; s|\.rs$||' | sort -u > /tmp/present.txt
-          missing=$(comm -23 /tmp/present.txt <(sort -u /tmp/pinned.txt /tmp/allowed.txt))
+          # The inventory is PER CRATE, because `--test <name>` is resolved
+          # against the crate a step runs in. The root crate's `tests/` are the
+          # ones that must be pinned (the `integration-*` jobs pin explicitly);
+          # the SDK's `tests/` are auto-discovered by `rust-sdk-tests`, so they
+          # are NOT required to appear here — but a pin that names one is still
+          # a REAL target, and attributing it to the root crate is what made
+          # this guard fail on an SDK test that exists and runs.
+          ls tests/*.rs | sed 's|tests/||; s|\.rs$||' | sort -u > /tmp/present_root.txt
+          ls sdk/tests/*.rs | sed 's|sdk/tests/||; s|\.rs$||' | sort -u > /tmp/present_sdk.txt
+          sort -u /tmp/present_root.txt /tmp/present_sdk.txt > /tmp/present_any.txt
+          missing=$(comm -23 /tmp/present_root.txt <(sort -u /tmp/pinned.txt /tmp/allowed.txt))
           if [ -n "$missing" ]; then
             echo "::error::Integration test(s) present in tests/ but pinned to no CI step:"
             printf '  %s\n' $missing
@@ -935,15 +944,17 @@ jobs:
             echo "satisfy it compiles to a silent 0-test binary), or to UNPINNED_OK."
             exit 1
           fi
-          # The reverse drift: a --test flag naming a file that no longer exists
-          # fails the run with a confusing cargo error, so name it here instead.
-          stale=$(comm -13 /tmp/present.txt /tmp/pinned.txt)
+          # The reverse drift: a --test flag naming a file that exists in NO
+          # crate fails the run with a confusing cargo error, so name it here
+          # instead. Checked against both crates' inventories, since both are
+          # pinned somewhere in this workflow.
+          stale=$(comm -13 /tmp/present_any.txt /tmp/pinned.txt)
           if [ -n "$stale" ]; then
-            echo "::error::CI pins --test target(s) with no matching tests/*.rs:"
+            echo "::error::CI pins --test target(s) that exist in no crate's tests/:"
             printf '  %s\n' $stale
             exit 1
           fi
-          echo "OK: $(wc -l < /tmp/present.txt) test files, all accounted for."
+          echo "OK: $(wc -l < /tmp/present_root.txt) root + $(wc -l < /tmp/present_sdk.txt) sdk test files, all accounted for."
 
   # --- Family A: bare bus/FFI + net mesh -------------------------------
   integration-net-core:
@@ -2087,8 +2098,13 @@ jobs:
       # reads `.config/nextest.toml` and fails if it ever drops out — the
       # override is a filter expression, so it would otherwise stop matching
       # silently.
-      - name: Run Rust SDK tests (includes mesh_stream_backpressure, mesh_rpc_bidi_typed, tool_*, sensing_provider)
-        run: cargo nextest run --no-fail-fast --no-tests=fail --features "net cortex dataforts testing compute nat-traversal port-mapping aggregator tool macros"
+      #   - org_exact_sensing       — OA-6 production organization
+      #     exact-sensing call edge (14 tests). Needs the SDK's own
+      #     `fixtures` feature, which is what gates `OrgClient`'s
+      #     test-only sensing observation accessors; without it the
+      #     binary does not compile, which is loud rather than silent.
+      - name: Run Rust SDK tests (includes mesh_stream_backpressure, mesh_rpc_bidi_typed, tool_*, sensing_provider, org_exact_sensing)
+        run: cargo nextest run --no-fail-fast --no-tests=fail --features "net cortex dataforts testing compute nat-traversal port-mapping aggregator tool macros fixtures"
 
       # === OA-6: the PRODUCTION organization exact-sensing call edge =======
       #
@@ -2110,14 +2126,21 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           set -uo pipefail
-          FEATURES="net cortex dataforts testing compute nat-traversal port-mapping aggregator tool macros"
+          FEATURES="net cortex dataforts testing compute nat-traversal port-mapping aggregator tool macros fixtures"
           REQUIRED="
             the_production_call_lands_on_the_sensed_provider
             the_production_call_follows_the_sensed_rank_between_viable_providers
-            a_consumer_without_sensing_plans_the_deterministic_order
+            a_deadline_below_every_estimate_falls_back_to_the_deterministic_order
+            a_provider_discovered_after_the_first_call_enters_the_population
+            a_departed_provider_leaves_the_warmed_population
+            a_capacity_refused_holder_is_recovered_by_a_later_call
+            live_evidence_stops_vouching_at_a_later_instant
+            withdrawn_readiness_reads_unknown_and_plans_deterministically
             an_all_not_ready_population_still_calls_in_the_deterministic_order
-            expired_evidence_falls_back_and_manufactures_no_error
             the_binding_owns_the_acquisition_and_the_last_owner_retires_it
+            a_refused_mint_binds_inert_and_never_remints
+            a_pinned_but_dead_sensed_provider_is_selected_and_fails_at_transport
+            a_consumer_without_sensing_plans_the_deterministic_order
             the_sdk_sensed_adapter_adds_no_ordering_structure
           "
           out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
@@ -2133,8 +2156,8 @@ jobs:
               || { printf '%s\n' "$single"; echo "::error::$required did not run and pass as exactly one test"; exit 1; }
             pinned=$((pinned + 1))
           done
-          [ "$listed" -ge 7 ] \
-            || { echo "::error::expected at least 7 production witnesses, saw $listed"; exit 1; }
+          [ "$listed" -ge 14 ] \
+            || { echo "::error::expected at least 14 production witnesses, saw $listed"; exit 1; }
           echo "organization exact production call edge: $listed listed, $pinned pinned by name, all green"
 
       # The DARK-BOUNDARY fact for the production path: the SDK library builds
@@ -2142,6 +2165,20 @@ jobs:
       # dev-dependencies, and the SDK's own `[dependencies]` entry for net-mesh
       # enables no features - so if the sensed call path ever reached a
       # fixtures-gated seam, this step is what fails.
+      # The in-crate half of the OA-6 evidence: the sensed step inside the
+      # authority window, the Granted-mode mapping and selection under an
+      # actual reordering, and the reconciliation trigger's decision table.
+      # Named because a `--lib` run would otherwise absorb a rename silently.
+      - name: Sensing — organization exact planning unit witnesses (OA-6)
+        if: ${{ !cancelled() }}
+        run: >
+          cargo nextest run --no-fail-fast --no-tests=fail --retries 0
+          --features "net cortex fixtures" --lib
+          -E 'test(=org::tests_call::authority_movement_inside_sensed_planning_is_still_fenced)
+            + test(=org::tests_call::the_sensed_adapter_never_ranks_a_granted_candidate)
+            + test(=org::tests_call::selection_and_its_errors_follow_the_reordered_list)
+            + test(=org::tests_call::the_reconciliation_trigger_fires_on_change_and_floors_a_retry)'
+
       - name: Sensing — the production call path needs no fixtures seam (OA-6)
         if: ${{ !cancelled() }}
         run: cargo check --lib --features "net cortex"
@@ -2157,7 +2194,7 @@ jobs:
       # those two would have compiled to nothing and gone silently unverified.
       - name: Run Rust SDK doctests
         if: ${{ !cancelled() }}
-        run: cargo test --doc --features "net cortex dataforts testing compute nat-traversal port-mapping aggregator tool macros"
+        run: cargo test --doc --features "net cortex dataforts testing compute nat-traversal port-mapping aggregator tool macros fixtures"
 
       # net-payments — x402 envelope model unit tests plus
       # `payments_golden_vectors`, the Rust source-of-truth verifier for

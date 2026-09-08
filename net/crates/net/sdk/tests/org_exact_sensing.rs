@@ -7,28 +7,36 @@
 //! witnesses observe is the one `plan_attempt` actually computed on the call
 //! path, and the invocation is the one `MeshNode::call` actually admitted.
 //!
-//! What each witness holds:
+//! What these witnesses hold:
 //!
-//! * **the binding owns the acquisition** — one mint per bind, shared by every
-//!   clone; an intermediate clone's drop retires nothing, the last one retires
-//!   everything, and two binds are independent;
-//! * **the real call consumes the sensed order** — with two authorized, pinned,
-//!   discovered providers whose evaluators disagree, the protected invocation
-//!   lands on the SENSED-preferred one even though deterministic selection
-//!   would have taken the other;
-//! * **unavailable evidence changes nothing but the order** — a consumer whose
-//!   sensing plane is off still calls, deterministically, with zero sensing
-//!   state;
-//! * **the SDK adapter adds no ordering structure** — a source guard over the
-//!   adapter's own body.
+//! * **the real call consumes the sensed order** — both the viable/pruned
+//!   split and the RANK inside the viable set decide which provider the
+//!   protected invocation reaches;
+//! * **the order is request-relative** — the same fixture reverses its choice
+//!   under a deadline that puts the sensed provider over budget;
+//! * **churn reconciles** — a provider discovered, or departed, after the
+//!   first call enters or leaves the warmed population, and a holder a
+//!   transient capacity refusal could not take is recovered later;
+//! * **evidence ages** — a projection asked at a later instant stops vouching,
+//!   proved by ASKING rather than sleeping, and withdrawal reads `Unknown`
+//!   rather than not-ready;
+//! * **the binding owns the acquisition** — one mint per bind shared by every
+//!   clone, an intermediate drop retires nothing, the last retires everything,
+//!   a refused mint binds INERT and never re-mints;
+//! * **every degradation is the deterministic order** — never an error;
+//! * **the SDK adapter adds no ordering structure** — a source guard.
 //!
 //! Note on features: this crate's dev-dependency on `net-mesh` enables
 //! `fixtures`, so nothing here may be read as a fixtures-OFF build proof. The
 //! production path's own independence from that feature is a BUILD fact, shown
 //! by `cargo check -p net-mesh-sdk --lib` (no dev-dependencies, `fixtures`
-//! off), not by this file. Every seam used below is `pub` without a fixtures
-//! gate.
-#![cfg(all(feature = "net", feature = "cortex"))]
+//! off), not by this file.
+//!
+//! The binding's ownership and reconciliation are observed through
+//! `OrgClient`'s `#[doc(hidden)]`, test/fixtures-only DATA accessors — hence
+//! this file's `fixtures` gate. They hand out no family handle, so this file
+//! can never hold an owner of the acquisition it is asserting about.
+#![cfg(all(feature = "net", feature = "cortex", feature = "fixtures"))]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -36,8 +44,9 @@ use std::time::{Duration, Instant};
 
 use net::adapter::net::behavior::capability::CapabilitySet;
 use net::adapter::net::behavior::sensing::{
-    CapabilityId, ConsumerLatencyBudget, EvaluationRequest, Incarnation, ReadinessEvaluation,
-    ReadinessEvaluator,
+    CanonicalConstraints, CapabilityId, ConsumerLatencyBudget, DisclosureClass, EvaluationRequest,
+    Incarnation, InterestSpec, ProviderSelector, ReadinessEvaluation, ReadinessEvaluator,
+    ResultMode, SensingLeaseTicket, WorkLatencyEnvelope,
 };
 use net::adapter::net::{ChannelConfigRegistry, MeshNode, MeshNodeConfig};
 use net_sdk::identity::Identity;
@@ -116,10 +125,23 @@ async fn mesh_in_org(
     sensing: bool,
     audience: Option<&OwnerAudienceCredential>,
 ) -> Member {
+    mesh_in_org_with(tag, owner, sensing, audience, Duration::from_secs(10)).await
+}
+
+/// [`mesh_in_org`] with an explicit session timeout — the departure witness
+/// needs a peer that really leaves when its process stops, and the timeout is
+/// the supported mechanism for that.
+async fn mesh_in_org_with(
+    tag: &str,
+    owner: &OrgKeypair,
+    sensing: bool,
+    audience: Option<&OwnerAudienceCredential>,
+    session_timeout: Duration,
+) -> Member {
     let identity = Identity::generate();
     let mut cfg = MeshNodeConfig::new("127.0.0.1:0".parse().expect("addr"), [0x51u8; 32])
         .with_heartbeat_interval(Duration::from_millis(100))
-        .with_session_timeout(Duration::from_secs(10));
+        .with_session_timeout(session_timeout);
     cfg.min_announce_interval = Duration::from_millis(50);
     cfg.configured_identity = true;
     if sensing {
@@ -247,10 +269,6 @@ fn serve(member: &Member, name: &'static str, calls: Arc<AtomicUsize>) -> ServeH
 }
 
 /// Serve REAL readiness for the capability, through the shipped provider verb.
-fn provide(member: &Member, ready: bool) -> ReadinessRegistration {
-    provide_at(member, ready, Duration::from_millis(1))
-}
-
 /// [`provide`] with an explicit time-to-start estimate.
 fn provide_at(member: &Member, ready: bool, start: Duration) -> ReadinessRegistration {
     member
@@ -322,638 +340,1030 @@ fn by_entity_order<'a>(a: &'a Member, b: &'a Member) -> (&'a Member, &'a Member)
     }
 }
 
+/// Fill this node's sensing-interest lease capacity, so every subsequent
+/// exact-provider acquisition is refused at the real capacity boundary.
+///
+/// Uses only the shipped node verbs, and the interests are this node's OWN
+/// owner-rooted ones for provider ids nothing else uses — so the refusal the
+/// acquisition path meets is the production `NodeAtCapacity` refusal, not a
+/// substituted error.
+fn fill_sensing_capacity(node: &Arc<MeshNode>) -> Vec<SensingLeaseTicket> {
+    let audience = node.sensing_local_root();
+    let mut tickets = Vec::new();
+    for provider in 1..=512u64 {
+        let target = u64::MAX - provider;
+        let spec = InterestSpec {
+            capability_id: CapabilityId::new("capacity.filler"),
+            constraints: CanonicalConstraints::default(),
+            work_latency: WorkLatencyEnvelope::start_within(Duration::from_secs(2)),
+            providers: ProviderSelector::Node(target),
+            result_mode: ResultMode::Any,
+            disclosure_class: DisclosureClass::Owner,
+            audience,
+        };
+        match node.acquire_sensing_interest_lease(&spec, target, Duration::from_secs(2)) {
+            Ok(ticket) => tickets.push(ticket),
+            // Capacity reached: that is the point.
+            Err(_) => break,
+        }
+    }
+    assert!(
+        !tickets.is_empty(),
+        "precondition: the filler leases must actually install"
+    );
+    tickets
+}
+
+/// Release the capacity fillers.
+fn release_sensing_capacity(node: &Arc<MeshNode>, tickets: Vec<SensingLeaseTicket>) {
+    for ticket in tickets {
+        let _ = node.try_release_sensing_interest_lease(ticket);
+    }
+}
+
+/// This capability's retained population, holders and demand identity.
+fn demand_state(client: &OrgClient) -> Option<(Vec<u64>, Vec<u64>, usize)> {
+    client
+        .sensing_demand_state(&capability())
+        .map(|(mut population, mut retained, identity)| {
+            population.sort_unstable();
+            retained.sort_unstable();
+            (population, retained, identity)
+        })
+}
+
+/// Poll `probe` until it holds, or fail with `what`.
+async fn until(what: &str, deadline: Duration, mut probe: impl FnMut() -> bool) {
+    let end = Instant::now() + deadline;
+    loop {
+        if probe() {
+            return;
+        }
+        assert!(Instant::now() < end, "{what}");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 // ---------------------------------------------------------------------------
-// W-53 — the real production call consumes the sensed order
+// One shared cell: N same-organization providers of one capability
 // ---------------------------------------------------------------------------
 
-/// Two authorized, pinned, discovered providers of ONE capability, with real
-/// evaluators that disagree: the provider deterministic selection takes —
-/// lowest provider entity id, first direct — answers NotReady, the other
-/// answers Ready.
-///
-/// The protected invocation must land on the SENSED provider. Nothing is
-/// substituted: the order is the one the production call path computed, the
-/// proof was minted for the provider that order chose, and the reply names the
-/// handler that actually ran.
+/// A stood-up cell: the consumer's bound client, and providers ORDERED the way
+/// deterministic selection orders them (ascending provider entity id), so
+/// `providers[0]` is always the one the unsensed path would take.
+struct Cell {
+    consumer: Member,
+    providers: Vec<Member>,
+    client: OrgClient,
+    calls: Vec<Arc<AtomicUsize>>,
+    names: Vec<&'static str>,
+    _serves: Vec<ServeHandle>,
+    ready: Vec<ReadinessRegistration>,
+}
+
+const NAMES: [&str; 3] = ["first", "second", "third"];
+
+impl Cell {
+    /// Stand up `readiness.len()` providers, all serving the protected
+    /// capability. `readiness[i]` applies to the provider at DETERMINISTIC
+    /// index `i` — index 0 being the one selection takes without sensing.
+    ///
+    /// `sensing` is the consumer's plane; `bind_later` leaves the client
+    /// unbound until the caller binds it (used by the inert witness).
+    async fn stand_up(tag: &str, sensing: bool, readiness: &[(bool, Duration)]) -> Self {
+        Self::stand_up_with(tag, sensing, readiness, Duration::from_secs(10)).await
+    }
+
+    /// [`Self::stand_up`] with an explicit consumer session timeout.
+    async fn stand_up_with(
+        tag: &str,
+        sensing: bool,
+        readiness: &[(bool, Duration)],
+        session_timeout: Duration,
+    ) -> Self {
+        let owner = org();
+        let mut members: Vec<Member> = Vec::new();
+        let mut audience: Option<OwnerAudienceCredential> = None;
+        for index in 0..readiness.len() {
+            let member =
+                mesh_in_org(&format!("{tag}-p{index}"), &owner, true, audience.as_ref()).await;
+            if audience.is_none() {
+                audience = Some(shared_audience(&member));
+            }
+            members.push(member);
+        }
+        let consumer = mesh_in_org_with(
+            &format!("{tag}-c"),
+            &owner,
+            sensing,
+            audience.as_ref(),
+            session_timeout,
+        )
+        .await;
+        let refs: Vec<&Member> = members.iter().collect();
+        bring_up(&consumer, &refs).await;
+
+        // Deterministic order: ascending provider entity id.
+        members.sort_by(|a, b| {
+            a.node
+                .entity_id()
+                .as_bytes()
+                .cmp(b.node.entity_id().as_bytes())
+        });
+
+        let mut calls = Vec::new();
+        let mut serves = Vec::new();
+        let mut ready = Vec::new();
+        let mut names = Vec::new();
+        for (index, member) in members.iter().enumerate() {
+            let counter = Arc::new(AtomicUsize::new(0));
+            let name = NAMES[index];
+            serves.push(serve(member, name, counter.clone()));
+            let (is_ready, start) = readiness[index];
+            ready.push(provide_at(member, is_ready, start));
+            calls.push(counter);
+            names.push(name);
+        }
+
+        let client = bind(&consumer);
+        let refs: Vec<&Member> = members.iter().collect();
+        converge_population(&consumer, &refs, members.len()).await;
+        Self {
+            consumer,
+            providers: members,
+            client,
+            calls,
+            names,
+            _serves: serves,
+            ready,
+        }
+    }
+
+    fn id(&self, index: usize) -> u64 {
+        self.providers[index].node.node_id()
+    }
+
+    fn served(&self, index: usize) -> usize {
+        self.calls[index].load(Ordering::SeqCst)
+    }
+
+    /// One protected call, returning the name of the handler that ran.
+    async fn call(&self) -> String {
+        let reply: Pong = self
+            .client
+            .call(SERVICE, &Ping { n: 1 })
+            .await
+            .expect("the protected call is admitted");
+        reply.served_by
+    }
+
+    /// One protected call under an explicit deadline, through the shipped
+    /// execution-control seam.
+    async fn call_with_deadline(&self, deadline_ms: u64) -> String {
+        let body = serde_json::to_vec(&Ping { n: 1 }).expect("encode");
+        let reply = self
+            .client
+            .call_bytes_deadline(SERVICE, bytes::Bytes::from(body), deadline_ms, 0)
+            .await
+            .expect("the deadline-bounded protected call is admitted");
+        let pong: Pong = serde_json::from_slice(&reply).expect("decode");
+        pong.served_by
+    }
+
+    /// Wait until the projection ranks exactly `viable` and prunes exactly
+    /// `pruned`, both as provider node ids.
+    async fn await_projection(&self, viable: &[u64], pruned: &[u64]) {
+        let client = &self.client;
+        let (viable, pruned) = (viable.to_vec(), pruned.to_vec());
+        until(
+            "the real signed evidence never reached that shape",
+            SETTLE,
+            || {
+                let Some(projection) = client.sensing_projection(
+                    &capability(),
+                    Instant::now(),
+                    &ConsumerLatencyBudget::default(),
+                ) else {
+                    return false;
+                };
+                projection.viable() == viable.as_slice()
+                    && projection.non_viable() == pruned.as_slice()
+            },
+        )
+        .await;
+    }
+
+    /// Drive real production calls until `probe` holds. Only a call may
+    /// reconcile, so the loop's body IS the mechanism under test.
+    async fn call_until(&self, what: &str, deadline: Duration, mut probe: impl FnMut() -> bool) {
+        let end = Instant::now() + deadline;
+        loop {
+            let _ = self.call().await;
+            if probe() {
+                return;
+            }
+            assert!(Instant::now() < end, "{what}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    fn cleanup(&self) {
+        let _ = std::fs::remove_dir_all(&self.consumer.dir);
+        for provider in &self.providers {
+            let _ = std::fs::remove_dir_all(&provider.dir);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The real production call consumes the sensed order
+// ---------------------------------------------------------------------------
+
+/// Two authorized, pinned, discovered providers whose real evaluators
+/// disagree: the one deterministic selection takes answers NotReady, the other
+/// answers Ready. The protected invocation must reach the SENSED one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_production_call_lands_on_the_sensed_provider() {
-    let owner = org();
-    let p1 = mesh_in_org("sensed-p1", &owner, true, None).await;
-    let audience = shared_audience(&p1);
-    let p2 = mesh_in_org("sensed-p2", &owner, true, Some(&audience)).await;
-    let consumer = mesh_in_org("sensed-c", &owner, true, Some(&audience)).await;
-    bring_up(&consumer, &[&p1, &p2]).await;
+    let cell = Cell::stand_up(
+        "sensed",
+        true,
+        &[
+            (false, Duration::from_millis(1)),
+            (true, Duration::from_millis(1)),
+        ],
+    )
+    .await;
 
-    let (low, high) = by_entity_order(&p1, &p2);
-    let (low_id, high_id) = (low.node.node_id(), high.node.node_id());
-    let low_calls = Arc::new(AtomicUsize::new(0));
-    let high_calls = Arc::new(AtomicUsize::new(0));
-    let _low_serve = serve(low, "unsensed-choice", low_calls.clone());
-    let _high_serve = serve(high, "sensed-choice", high_calls.clone());
-    let _low_ready = provide(low, false);
-    let _high_ready = provide(high, true);
+    // The first call arms the acquisition; its own order is whatever evidence
+    // existed at that instant.
+    let _armed = cell.call().await;
+    cell.await_projection(&[cell.id(1)], &[cell.id(0)]).await;
 
-    let client = bind(&consumer);
-    assert!(
-        client.sensing_binding().is_active(),
-        "precondition: the bind minted an acquisition family"
-    );
-    converge_population(&consumer, &[&p1, &p2], 2).await;
-
-    // The FIRST call is what ARMS the acquisition: it retains demand for this
-    // capability, which registers one exact-provider interest per provider.
-    // Whatever evidence existed at that instant is whatever it was - the
-    // witness is the warmed call further down.
-    let _armed: Pong = client
-        .call(SERVICE, &Ping { n: 1 })
-        .await
-        .expect("the first protected call is admitted");
-
-    let family = client.sensing_binding().family().expect("Active").clone();
-    let demand = {
-        let deadline = Instant::now() + SETTLE;
-        loop {
-            if let Some(demand) = family.demand(&capability()) {
-                if demand.population().len() == 2 {
-                    break demand;
-                }
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the call path never retained demand over both providers"
-            );
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    };
-
-    // Wait for the REAL signed evidence to separate them: the Ready provider
-    // viable, the NotReady one pruned. Observation, never injection.
-    {
-        let deadline = Instant::now() + SETTLE;
-        loop {
-            let projection =
-                demand.project_sensed_order(Instant::now(), &ConsumerLatencyBudget::default());
-            if projection.viable() == [high_id] && projection.non_viable() == [low_id] {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "signed readiness never separated the two providers: {projection:?}"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    }
-
-    // THE WITNESS: one warmed call, counted at both handlers.
-    let low_before = low_calls.load(Ordering::SeqCst);
-    let high_before = high_calls.load(Ordering::SeqCst);
-    let reply: Pong = client
-        .call(SERVICE, &Ping { n: 2 })
-        .await
-        .expect("the warmed protected call is admitted");
-
+    let before = (cell.served(0), cell.served(1));
     assert_eq!(
-        reply,
-        Pong {
-            served_by: "sensed-choice".to_string()
-        },
+        cell.call().await,
+        cell.names[1],
         "the call must reach the SENSED provider, not the deterministic first one"
     );
+    assert_eq!(cell.served(1) - before.1, 1);
     assert_eq!(
-        high_calls.load(Ordering::SeqCst) - high_before,
-        1,
-        "the sensed provider's handler ran exactly once"
-    );
-    assert_eq!(
-        low_calls.load(Ordering::SeqCst) - low_before,
+        cell.served(0) - before.0,
         0,
-        "and the provider deterministic selection would have taken never ran"
+        "the provider deterministic selection would have taken never ran"
     );
 
-    // Sensing REORDERS an authorized list; it does not shrink one. Both
-    // providers are still authorized, discovered and pinned.
-    let mut both = vec![low_id, high_id];
+    // Sensing REORDERS an authorized list; it does not shrink one.
+    let mut both = vec![cell.id(0), cell.id(1)];
     both.sort_unstable();
     assert_eq!(
-        population(&consumer),
+        population(&cell.consumer),
         both,
-        "sensing removed no authorization: a deprioritized candidate stays eligible"
+        "a deprioritized provider stays authorized"
     );
-
-    drop(client);
-    drop(demand);
-    drop(family);
-    for member in [&p1, &p2, &consumer] {
-        let _ = std::fs::remove_dir_all(&member.dir);
-    }
+    cell.cleanup();
 }
 
-// ---------------------------------------------------------------------------
-// W-54 — unavailable evidence preserves deterministic unsensed planning
-// ---------------------------------------------------------------------------
-
-/// A consumer whose sensing plane is OFF — the shipped default — calls the same
-/// two providers. No evidence can exist, so the call takes the deterministic
-/// order it always did: lowest provider entity id with a live direct session.
-///
-/// This is the production shape of the failure ladder's floor: no order, no
-/// error, no sensing state, no new refusal, and no per-call retry of the
-/// refused acquisition.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_consumer_without_sensing_plans_the_deterministic_order() {
-    let owner = org();
-    let p1 = mesh_in_org("dark-p1", &owner, true, None).await;
-    let audience = shared_audience(&p1);
-    let p2 = mesh_in_org("dark-p2", &owner, true, Some(&audience)).await;
-    // SENSING OFF on the consumer.
-    let consumer = mesh_in_org("dark-c", &owner, false, Some(&audience)).await;
-    bring_up(&consumer, &[&p1, &p2]).await;
-    assert!(
-        !consumer.node.sensing_enabled(),
-        "precondition: this consumer's sensing plane is off"
-    );
-
-    let (low, high) = by_entity_order(&p1, &p2);
-    let low_calls = Arc::new(AtomicUsize::new(0));
-    let high_calls = Arc::new(AtomicUsize::new(0));
-    let _low_serve = serve(low, "deterministic-choice", low_calls.clone());
-    let _high_serve = serve(high, "other", high_calls.clone());
-    // Both providers really answer readiness, and the one a SENSED order would
-    // prefer is the high-id one - so evidence leaking into this consumer's
-    // planning would be caught below rather than hidden.
-    let _low_ready = provide(low, false);
-    let _high_ready = provide(high, true);
-
-    let client = bind(&consumer);
-    converge_population(&consumer, &[&p1, &p2], 2).await;
-    let family = client.sensing_binding().family().expect("Active").clone();
-
-    let mut first_demand = None;
-    for _ in 0..3 {
-        let reply: Pong = client
-            .call(SERVICE, &Ping { n: 7 })
-            .await
-            .expect("the protected call is admitted without sensing");
-        // The acquisition is attempted ONCE and then reused, even though it
-        // acquired nothing: a dark plane must not turn every call into a fresh
-        // convergence attempt.
-        let demand = family.demand(&capability()).expect("the demand exists");
-        match &first_demand {
-            None => first_demand = Some(demand),
-            Some(previous) => assert!(
-                Arc::ptr_eq(previous, &demand),
-                "no per-call re-acquisition: the same demand is reused"
-            ),
-        }
-        assert_eq!(
-            reply,
-            Pong {
-                served_by: "deterministic-choice".to_string()
-            },
-            "with no evidence the order is the deterministic one - lowest \
-             provider id, first direct"
-        );
-    }
-    assert_eq!(high_calls.load(Ordering::SeqCst), 0);
-    assert_eq!(low_calls.load(Ordering::SeqCst), 3);
-
-    assert!(
-        consumer.node.sensing_table_is_empty(),
-        "a dark consumer registers no interest at all"
-    );
-    // The family still minted - the mint does not consult the plane - and the
-    // convergence it attempted acquired NOTHING, because every per-provider
-    // acquisition is refused by the dark plane. So the projection is empty and
-    // the order it could contribute is the identity.
-    let demand = first_demand.expect("a demand was recorded");
-    assert!(
-        demand.retained_providers().is_empty(),
-        "a dark plane acquires no interest, so there is no evidence to order by"
-    );
-    let projection = demand.project_sensed_order(Instant::now(), &ConsumerLatencyBudget::default());
-    assert!(
-        projection.viable().is_empty() && projection.non_viable().is_empty(),
-        "and nothing is ranked or pruned: {projection:?}"
-    );
-
-    drop(demand);
-    drop(family);
-    drop(client);
-    for member in [&p1, &p2, &consumer] {
-        let _ = std::fs::remove_dir_all(&member.dir);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// The sensed RANK order, not merely the sensed/pruned split
-// ---------------------------------------------------------------------------
-
-/// Two providers, BOTH viable, differing only in the estimate they themselves
-/// report. The one the sensing plane ranks first is not the one deterministic
-/// selection would take, so the call must follow the RANK — not just the
-/// viable/pruned partition, and not the candidate list's own order.
-///
-/// This is the discriminating half of "the production call consumes the sensed
-/// order": with nothing pruned, an implementation that treated the ranked list
-/// as an unordered set would still pass the pruning witness and fail here.
+/// Both providers viable, differing only in the estimate they report. The call
+/// follows the RANK — so treating the ranked list as an unordered set fails
+/// here even though the pruning witness above would still pass.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_production_call_follows_the_sensed_rank_between_viable_providers() {
-    let owner = org();
-    let p1 = mesh_in_org("rank-p1", &owner, true, None).await;
-    let audience = shared_audience(&p1);
-    let p2 = mesh_in_org("rank-p2", &owner, true, Some(&audience)).await;
-    let consumer = mesh_in_org("rank-c", &owner, true, Some(&audience)).await;
-    bring_up(&consumer, &[&p1, &p2]).await;
+    let cell = Cell::stand_up(
+        "rank",
+        true,
+        &[
+            (true, Duration::from_millis(400)),
+            (true, Duration::from_millis(1)),
+        ],
+    )
+    .await;
+    let _armed = cell.call().await;
+    cell.await_projection(&[cell.id(1), cell.id(0)], &[]).await;
 
-    let (low, high) = by_entity_order(&p1, &p2);
-    let (low_id, high_id) = (low.node.node_id(), high.node.node_id());
-    let low_calls = Arc::new(AtomicUsize::new(0));
-    let high_calls = Arc::new(AtomicUsize::new(0));
-    let _low_serve = serve(low, "slow-but-first", low_calls.clone());
-    let _high_serve = serve(high, "fast-but-last", high_calls.clone());
-    // BOTH Ready, so nothing is pruned; the deterministic-first provider is
-    // the SLOW one, so only rank order can move the call.
-    let _low_ready = provide_at(low, true, Duration::from_millis(400));
-    let _high_ready = provide_at(high, true, Duration::from_millis(1));
-
-    let client = bind(&consumer);
-    converge_population(&consumer, &[&p1, &p2], 2).await;
-    let _armed: Pong = client
-        .call(SERVICE, &Ping { n: 1 })
-        .await
-        .expect("admitted");
-    let family = client.sensing_binding().family().expect("Active").clone();
-    let demand = {
-        let deadline = Instant::now() + SETTLE;
-        loop {
-            if let Some(demand) = family.demand(&capability()) {
-                let projection =
-                    demand.project_sensed_order(Instant::now(), &ConsumerLatencyBudget::default());
-                // Both viable, the FAST one ranked first, nothing pruned.
-                if projection.viable() == [high_id, low_id] && projection.non_viable().is_empty() {
-                    break demand;
-                }
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the two Ready providers never ranked by their own estimates"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    };
-
-    let low_before = low_calls.load(Ordering::SeqCst);
-    let high_before = high_calls.load(Ordering::SeqCst);
-    let reply: Pong = client
-        .call(SERVICE, &Ping { n: 2 })
-        .await
-        .expect("the warmed protected call is admitted");
+    let before = (cell.served(0), cell.served(1));
     assert_eq!(
-        reply,
-        Pong {
-            served_by: "fast-but-last".to_string()
-        },
+        cell.call().await,
+        cell.names[1],
         "the call must follow the sensed RANK, not the candidate list's order"
     );
-    assert_eq!(high_calls.load(Ordering::SeqCst) - high_before, 1);
-    assert_eq!(
-        low_calls.load(Ordering::SeqCst) - low_before,
-        0,
-        "the slower viable provider is deprioritized, not called"
-    );
-
-    drop(demand);
-    drop(family);
-    drop(client);
-    for member in [&p1, &p2, &consumer] {
-        let _ = std::fs::remove_dir_all(&member.dir);
-    }
+    assert_eq!(cell.served(1) - before.1, 1);
+    assert_eq!(cell.served(0) - before.0, 0);
+    cell.cleanup();
 }
 
 // ---------------------------------------------------------------------------
-// The fallback contract, at the production call edge
+// The order is REQUEST-RELATIVE: one deadline, one different answer
 // ---------------------------------------------------------------------------
 
-/// EVERY provider answers a fresh explicit NotReady. The accepted contract is
-/// that this DEPRIORITIZES and nothing more: an all-pruned order falls back to
-/// the caller's own deterministic order, no candidate is eliminated, and no new
-/// error is manufactured. The call is admitted and served.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_all_not_ready_population_still_calls_in_the_deterministic_order() {
-    let owner = org();
-    let p1 = mesh_in_org("pruned-p1", &owner, true, None).await;
-    let audience = shared_audience(&p1);
-    let p2 = mesh_in_org("pruned-p2", &owner, true, Some(&audience)).await;
-    let consumer = mesh_in_org("pruned-c", &owner, true, Some(&audience)).await;
-    bring_up(&consumer, &[&p1, &p2]).await;
-
-    let (low, high) = by_entity_order(&p1, &p2);
-    let (low_id, high_id) = (low.node.node_id(), high.node.node_id());
-    let low_calls = Arc::new(AtomicUsize::new(0));
-    let high_calls = Arc::new(AtomicUsize::new(0));
-    let _low_serve = serve(low, "low", low_calls.clone());
-    let _high_serve = serve(high, "high", high_calls.clone());
-    let _low_ready = provide(low, false);
-    let _high_ready = provide(high, false);
-
-    let client = bind(&consumer);
-    converge_population(&consumer, &[&p1, &p2], 2).await;
-    let _armed: Pong = client
-        .call(SERVICE, &Ping { n: 1 })
-        .await
-        .expect("admitted");
-    let family = client.sensing_binding().family().expect("Active").clone();
-    let demand = {
-        let deadline = Instant::now() + SETTLE;
-        loop {
-            if let Some(demand) = family.demand(&capability()) {
-                let projection =
-                    demand.project_sensed_order(Instant::now(), &ConsumerLatencyBudget::default());
-                let mut pruned = projection.non_viable().to_vec();
-                pruned.sort_unstable();
-                let mut both = vec![low_id, high_id];
-                both.sort_unstable();
-                if projection.viable().is_empty() && pruned == both {
-                    break demand;
-                }
-            }
-            assert!(
-                Instant::now() < deadline,
-                "both providers should have answered a fresh explicit NotReady"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    };
-
-    let before = low_calls.load(Ordering::SeqCst);
-    let reply: Pong = client
-        .call(SERVICE, &Ping { n: 2 })
-        .await
-        .expect("an all-pruned order is not an error: the call is still admitted");
-    assert_eq!(
-        reply,
-        Pong {
-            served_by: "low".to_string()
-        },
-        "all-pruned falls back to the caller's own deterministic order"
-    );
-    assert_eq!(low_calls.load(Ordering::SeqCst) - before, 1);
-    assert_eq!(
-        population(&consumer).len(),
-        2,
-        "and a pruned provider is deprioritized, never de-authorized"
-    );
-
-    drop(demand);
-    drop(family);
-    drop(client);
-    for member in [&p1, &p2, &consumer] {
-        let _ = std::fs::remove_dir_all(&member.dir);
-    }
-}
-
-/// Evidence that has EXPIRED cannot eliminate authorization or invent an error.
+/// The same fixture, three calls, one difference: a deadline.
 ///
-/// Both providers serve readiness, the consumer senses them, and then both
-/// registrations are withdrawn: their beats stop and the observations age out.
-/// The order that remains ranks and prunes nobody, so planning falls back to
-/// the deterministic order and the call is still admitted.
+/// With no deadline the budget is unbounded and the sensed rank decides. With
+/// a deadline below what EVERY provider reports as its own time-to-start,
+/// nothing is viable — each is DEMOTED to potential, never pruned and never an
+/// error — so the deterministic order returns. A third call without a deadline
+/// gets the sensed rank back, so the budget is per REQUEST rather than sticky.
+///
+/// Ignoring `deadline_ms` in the planning input would leave all three calls
+/// identical, which is exactly what this discriminates.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn expired_evidence_falls_back_and_manufactures_no_error() {
-    let owner = org();
-    let p1 = mesh_in_org("expire-p1", &owner, true, None).await;
-    let audience = shared_audience(&p1);
-    let p2 = mesh_in_org("expire-p2", &owner, true, Some(&audience)).await;
-    let consumer = mesh_in_org("expire-c", &owner, true, Some(&audience)).await;
-    bring_up(&consumer, &[&p1, &p2]).await;
+async fn a_deadline_below_every_estimate_falls_back_to_the_deterministic_order() {
+    let cell = Cell::stand_up(
+        "budget",
+        true,
+        &[
+            (true, Duration::from_millis(400)),
+            (true, Duration::from_millis(300)),
+        ],
+    )
+    .await;
+    let _armed = cell.call().await;
+    // Unbounded: both viable, the cheaper one leading.
+    cell.await_projection(&[cell.id(1), cell.id(0)], &[]).await;
 
-    let (low, high) = by_entity_order(&p1, &p2);
-    let high_id = high.node.node_id();
-    let low_calls = Arc::new(AtomicUsize::new(0));
-    let high_calls = Arc::new(AtomicUsize::new(0));
-    let _low_serve = serve(low, "low", low_calls.clone());
-    let _high_serve = serve(high, "high", high_calls.clone());
-    let low_ready = provide(low, false);
-    let high_ready = provide(high, true);
-
-    let client = bind(&consumer);
-    converge_population(&consumer, &[&p1, &p2], 2).await;
-    let _armed: Pong = client
-        .call(SERVICE, &Ping { n: 1 })
-        .await
-        .expect("admitted");
-    let family = client.sensing_binding().family().expect("Active").clone();
-    let demand = {
-        let deadline = Instant::now() + SETTLE;
-        loop {
-            if let Some(demand) = family.demand(&capability()) {
-                if demand
-                    .project_sensed_order(Instant::now(), &ConsumerLatencyBudget::default())
-                    .viable()
-                    == [high_id]
-                {
-                    break demand;
-                }
-            }
-            assert!(
-                Instant::now() < deadline,
-                "precondition: live evidence never established"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+    // The same evidence under a 150 ms budget: nothing viable, nothing pruned.
+    let bounded = ConsumerLatencyBudget {
+        end_to_end_within: Some(Duration::from_millis(150)),
     };
-
-    // WITHDRAW readiness on both providers: no evaluator, so no further beats.
-    assert!(low_ready.close(), "the low provider withdraws readiness");
-    assert!(high_ready.close(), "the high provider withdraws readiness");
-
-    // Age out. The consumer's cells expire to Unknown, which ranks and prunes
-    // nobody - it is not a NotReady verdict.
-    {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            let projection =
-                demand.project_sensed_order(Instant::now(), &ConsumerLatencyBudget::default());
-            if projection.viable().is_empty() && projection.non_viable().is_empty() {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "withdrawn readiness must age out to Unknown: {projection:?}"
-            );
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    }
-
-    let before = low_calls.load(Ordering::SeqCst);
-    let high_before = high_calls.load(Ordering::SeqCst);
-    let reply: Pong = client
-        .call(SERVICE, &Ping { n: 2 })
-        .await
-        .expect("expired evidence is not an error: the call is still admitted");
-    assert_eq!(
-        reply,
-        Pong {
-            served_by: "low".to_string()
-        },
-        "with no live evidence the deterministic order returns"
-    );
-    assert_eq!(low_calls.load(Ordering::SeqCst) - before, 1);
-    assert_eq!(
-        population(&consumer).len(),
-        2,
-        "and both providers are still authorized"
-    );
-    assert_eq!(
-        high_calls.load(Ordering::SeqCst) - high_before,
-        0,
-        "and the provider whose Ready evidence expired is no longer preferred"
-    );
-
-    drop(demand);
-    drop(family);
-    drop(client);
-    for member in [&p1, &p2, &consumer] {
-        let _ = std::fs::remove_dir_all(&member.dir);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// W-49 / W-50 / W-51 — the binding owns the acquisition
-// ---------------------------------------------------------------------------
-
-/// One mint per bind, shared by every clone. An intermediate clone's drop
-/// retires nothing; the last owner's drop retires everything, down to the
-/// interest rows on the node. Two binds are independent.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_binding_owns_the_acquisition_and_the_last_owner_retires_it() {
-    let owner = org();
-    let p1 = mesh_in_org("own-p1", &owner, true, None).await;
-    let audience = shared_audience(&p1);
-    let p2 = mesh_in_org("own-p2", &owner, true, Some(&audience)).await;
-    let consumer = mesh_in_org("own-c", &owner, true, Some(&audience)).await;
-    bring_up(&consumer, &[&p1, &p2]).await;
-
-    let calls = Arc::new(AtomicUsize::new(0));
-    let _s1 = serve(&p1, "p1", calls.clone());
-    let _s2 = serve(&p2, "p2", calls.clone());
-    let _r1 = provide(&p1, true);
-    let _r2 = provide(&p2, true);
-
-    let client = bind(&consumer);
-    // W-49: the mint happened at BIND, once, and produced one family.
-    let family = client.sensing_binding().family().expect("Active").clone();
-    assert_eq!(
-        family.owners(),
-        2,
-        "the client and this witness's handle are the only owners"
+    let projection = cell
+        .client
+        .sensing_projection(&capability(), Instant::now(), &bounded)
+        .expect("demand");
+    assert!(
+        projection.viable().is_empty(),
+        "every provider is over this budget: {projection:?}"
     );
     assert!(
-        family.capabilities().is_empty(),
+        projection.non_viable().is_empty(),
+        "and each is DEMOTED, never pruned: {projection:?}"
+    );
+
+    // 1. No deadline: the sensed rank wins.
+    let before = (cell.served(0), cell.served(1));
+    assert_eq!(cell.call().await, cell.names[1]);
+    assert_eq!(cell.served(1) - before.1, 1);
+
+    // 2. A deadline below every estimate: the deterministic order returns,
+    //    through the shipped execution-control seam, with no invented error.
+    let before = (cell.served(0), cell.served(1));
+    assert_eq!(
+        cell.call_with_deadline(150).await,
+        cell.names[0],
+        "the call's own deadline is the budget: an over-budget order falls back"
+    );
+    assert_eq!(cell.served(0) - before.0, 1);
+    assert_eq!(cell.served(1) - before.1, 0);
+
+    // 3. No deadline again, same client: the sensed rank returns.
+    let before = (cell.served(0), cell.served(1));
+    assert_eq!(cell.call().await, cell.names[1]);
+    assert_eq!(cell.served(1) - before.1, 1);
+    assert_eq!(
+        population(&cell.consumer).len(),
+        2,
+        "and a budget de-authorizes nobody"
+    );
+    cell.cleanup();
+}
+
+// ---------------------------------------------------------------------------
+// Churn: additions, departures, and a refused holder recovering
+// ---------------------------------------------------------------------------
+
+/// A provider discovered AFTER the first call must enter the warmed
+/// population, under an unchanged security authority.
+///
+/// This is the reviewer's reproduction, as a witness: the authority stamp does
+/// not cover discovery rows or pins, so reuse keyed on it alone froze the
+/// population at whatever the first call saw.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_provider_discovered_after_the_first_call_enters_the_population() {
+    let cell = Cell::stand_up(
+        "grow",
+        true,
+        &[
+            (false, Duration::from_millis(1)),
+            (false, Duration::from_millis(1)),
+        ],
+    )
+    .await;
+    let _armed = cell.call().await;
+    let (population, retained, first_identity) = demand_state(&cell.client).expect("demand");
+    let mut two = vec![cell.id(0), cell.id(1)];
+    two.sort_unstable();
+    assert_eq!(population, two, "precondition: two providers retained");
+    assert_eq!(retained, two);
+
+    // A THIRD provider joins the same organization, connects, is discovered,
+    // and answers readiness. No authority moves.
+    let audience = shared_audience(&cell.providers[0]);
+    let third = mesh_in_org("grow-p2", &org(), true, Some(&audience)).await;
+    bring_up(&cell.consumer, &[&third]).await;
+    let third_calls = Arc::new(AtomicUsize::new(0));
+    let _third_serve = serve(&third, "third", third_calls.clone());
+    let _third_ready = provide_at(&third, true, Duration::from_micros(1));
+    let refs: Vec<&Member> = cell
+        .providers
+        .iter()
+        .chain(std::iter::once(&third))
+        .collect();
+    converge_population(&cell.consumer, &refs, 3).await;
+
+    // Warmed calls must incorporate it. Nothing else changed.
+    let mut three = two.clone();
+    three.push(third.node.node_id());
+    three.sort_unstable();
+    let expected = three.clone();
+    cell.call_until(
+        "warmed production calls never incorporated the newly discovered provider",
+        SETTLE,
+        || {
+            demand_state(&cell.client)
+                .map(|(population, retained, _)| population == expected && retained == expected)
+                .unwrap_or(false)
+        },
+    )
+    .await;
+    let (_, _, identity) = demand_state(&cell.client).expect("demand");
+    assert_ne!(
+        identity, first_identity,
+        "the reconciled demand is a new retained snapshot, not the frozen one"
+    );
+
+    // And the third provider is now ORDERABLE: it is the only one answering
+    // Ready, so it is the only viable candidate and the call follows it.
+    let third_id = third.node.node_id();
+    let mut pruned = vec![cell.id(0), cell.id(1)];
+    pruned.sort_unstable();
+    cell.await_projection(&[third_id], &pruned).await;
+    let before = third_calls.load(Ordering::SeqCst);
+    assert_eq!(cell.call().await, "third");
+    assert_eq!(third_calls.load(Ordering::SeqCst) - before, 1);
+
+    let _ = std::fs::remove_dir_all(&third.dir);
+    cell.cleanup();
+}
+
+/// A provider that DEPARTS must leave the warmed population, including when
+/// its departure leaves too few candidates for an order to matter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_departed_provider_leaves_the_warmed_population() {
+    let cell = Cell::stand_up_with(
+        "shrink",
+        true,
+        &[
+            (true, Duration::from_millis(1)),
+            (true, Duration::from_millis(1)),
+        ],
+        // A short session timeout, so a stopped provider really leaves this
+        // consumer's pin set rather than lingering for the default window.
+        Duration::from_secs(2),
+    )
+    .await;
+    let _armed = cell.call().await;
+    let (retained_population, _, _) = demand_state(&cell.client).expect("demand");
+    assert_eq!(
+        retained_population.len(),
+        2,
+        "precondition: two providers retained"
+    );
+
+    // The second provider goes away: its session and its pin go with it, so
+    // the consumer's own authorized population drops to one.
+    net::adapter::Adapter::shutdown(cell.providers[1].node.as_ref())
+        .await
+        .expect("stop the departing provider");
+    let survivor = cell.id(0);
+    until(
+        "the departed provider never left the authorized population",
+        Duration::from_secs(30),
+        || population(&cell.consumer) == vec![survivor],
+    )
+    .await;
+
+    // Warmed calls must narrow the retained demand to the survivor - the
+    // one-candidate case must NOT skip reconciliation.
+    cell.call_until(
+        "warmed production calls never released the departed provider's demand",
+        SETTLE,
+        || {
+            demand_state(&cell.client)
+                .map(|(population, retained, _)| {
+                    population == vec![survivor] && retained == vec![survivor]
+                })
+                .unwrap_or(false)
+        },
+    )
+    .await;
+    cell.cleanup();
+}
+
+/// A holder the acquisition could not take - the node's interest capacity was
+/// full - is RECOVERED by a later call once capacity frees, without any
+/// authority movement and without a per-call re-acquisition in between.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_capacity_refused_holder_is_recovered_by_a_later_call() {
+    let cell = Cell::stand_up(
+        "recover",
+        true,
+        &[
+            (true, Duration::from_millis(1)),
+            (true, Duration::from_millis(1)),
+        ],
+    )
+    .await;
+
+    // Fill the consumer's interest capacity BEFORE the first call, so every
+    // per-provider acquisition meets the real capacity refusal.
+    let fillers = fill_sensing_capacity(&cell.consumer.node);
+    let _armed = cell.call().await;
+    let (population, retained, _) = demand_state(&cell.client).expect("demand");
+    assert_eq!(population.len(), 2, "the population is still derived");
+    assert!(
+        retained.is_empty(),
+        "but no holder could be acquired at capacity: {retained:?}"
+    );
+
+    // While capacity is still full, repeated calls must not hammer the
+    // exhausted allocator: the retry is floored.
+    let (_, _, identity) = demand_state(&cell.client).expect("demand");
+    for _ in 0..3 {
+        let _ = cell.call().await;
+    }
+    let (_, retained_again, identity_again) = demand_state(&cell.client).expect("demand");
+    assert!(retained_again.is_empty());
+    assert_eq!(
+        identity, identity_again,
+        "an incomplete convergence must not be retried on every call"
+    );
+
+    // Capacity frees. A later call - past the retry floor - recovers the
+    // holders, with no authority movement anywhere.
+    release_sensing_capacity(&cell.consumer.node, fillers);
+    let mut two = vec![cell.id(0), cell.id(1)];
+    two.sort_unstable();
+    let expected = two.clone();
+    cell.call_until(
+        "a later call never recovered the refused holders",
+        Duration::from_secs(30),
+        || {
+            demand_state(&cell.client)
+                .map(|(_, retained, _)| retained == expected)
+                .unwrap_or(false)
+        },
+    )
+    .await;
+    cell.cleanup();
+}
+
+// ---------------------------------------------------------------------------
+// Aging, and withdrawal
+// ---------------------------------------------------------------------------
+
+/// LIVE evidence stops vouching at a later instant.
+///
+/// Freshness is request-relative, so this is proved POSITIVELY by asking the
+/// same retained demand for a projection at an instant past the continuity
+/// window - no sleeping, no withdrawal, and no replacement `Unknown`
+/// observation that could mask a broken window. The provider is still Ready
+/// and still beating throughout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_evidence_stops_vouching_at_a_later_instant() {
+    let cell = Cell::stand_up(
+        "aging",
+        true,
+        &[
+            (false, Duration::from_millis(1)),
+            (true, Duration::from_millis(1)),
+        ],
+    )
+    .await;
+    let _armed = cell.call().await;
+    cell.await_projection(&[cell.id(1)], &[cell.id(0)]).await;
+
+    // The SAME demand, the SAME live evidence, one later instant.
+    let aged = Instant::now() + Duration::from_secs(600);
+    let projection = cell
+        .client
+        .sensing_projection(&capability(), aged, &ConsumerLatencyBudget::default())
+        .expect("demand");
+    assert!(
+        projection.viable().is_empty(),
+        "a Ready attestation must stop vouching once its window has elapsed: {projection:?}"
+    );
+    assert!(
+        projection.non_viable().is_empty(),
+        "and an aged-out row is Unknown, not not-ready: {projection:?}"
+    );
+
+    // Asking at NOW still ranks it, so the aged answer is about the instant
+    // rather than about the evidence having gone away.
+    let now = cell
+        .client
+        .sensing_projection(
+            &capability(),
+            Instant::now(),
+            &ConsumerLatencyBudget::default(),
+        )
+        .expect("demand");
+    assert_eq!(
+        now.viable(),
+        [cell.id(1)],
+        "the live projection is unchanged: {now:?}"
+    );
+    cell.cleanup();
+}
+
+/// WITHDRAWING readiness reads `Unknown`, not not-ready, and planning falls
+/// back to the deterministic order.
+///
+/// This is what withdrawal actually produces: the provider keeps beating and
+/// the beats carry no evaluation, which the consumer projects as `Unknown`. It
+/// is therefore evidence about withdrawal semantics and about the fallback -
+/// NOT about elapsed continuity, which the aging witness above proves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn withdrawn_readiness_reads_unknown_and_plans_deterministically() {
+    let mut cell = Cell::stand_up(
+        "withdraw",
+        true,
+        &[
+            (false, Duration::from_millis(1)),
+            (true, Duration::from_millis(1)),
+        ],
+    )
+    .await;
+    let _armed = cell.call().await;
+    cell.await_projection(&[cell.id(1)], &[cell.id(0)]).await;
+
+    // Withdraw on both providers.
+    for registration in cell.ready.drain(..) {
+        assert!(registration.close(), "readiness is withdrawn");
+    }
+    cell.await_projection(&[], &[]).await;
+
+    let before = (cell.served(0), cell.served(1));
+    assert_eq!(
+        cell.call().await,
+        cell.names[0],
+        "with no verdict for anyone the deterministic order returns"
+    );
+    assert_eq!(cell.served(0) - before.0, 1);
+    assert_eq!(cell.served(1) - before.1, 0);
+    assert_eq!(
+        population(&cell.consumer).len(),
+        2,
+        "and withdrawal de-authorizes nobody"
+    );
+    cell.cleanup();
+}
+
+/// Every provider answers a fresh explicit NotReady: an all-pruned order falls
+/// back to the caller's own deterministic order, eliminates no candidate, and
+/// invents no error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_all_not_ready_population_still_calls_in_the_deterministic_order() {
+    let cell = Cell::stand_up(
+        "pruned",
+        true,
+        &[
+            (false, Duration::from_millis(1)),
+            (false, Duration::from_millis(1)),
+        ],
+    )
+    .await;
+    let _armed = cell.call().await;
+    let mut both = vec![cell.id(0), cell.id(1)];
+    both.sort_unstable();
+    cell.await_projection(&[], &both).await;
+
+    let before = cell.served(0);
+    assert_eq!(
+        cell.call().await,
+        cell.names[0],
+        "all-pruned falls back to the deterministic order"
+    );
+    assert_eq!(cell.served(0) - before, 1);
+    assert_eq!(population(&cell.consumer).len(), 2);
+    cell.cleanup();
+}
+
+// ---------------------------------------------------------------------------
+// The binding owns the acquisition
+// ---------------------------------------------------------------------------
+
+/// One mint per bind, shared by every clone: an intermediate clone's drop
+/// retires nothing, the last owner's drop retires everything down to the
+/// node's interest rows, and two binds are independent.
+///
+/// This witness deliberately holds NO family handle — the observation
+/// accessors return data — so the client clones really are the only owners.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_binding_owns_the_acquisition_and_the_last_owner_retires_it() {
+    let cell = Cell::stand_up(
+        "own",
+        true,
+        &[
+            (true, Duration::from_millis(1)),
+            (true, Duration::from_millis(1)),
+        ],
+    )
+    .await;
+    assert!(cell.client.sensing_is_active(), "the bind minted a family");
+    assert_eq!(
+        cell.client.sensing_owners(),
+        Some(1),
+        "the client is the only owner of its acquisition"
+    );
+    assert!(
+        cell.client.sensing_capabilities().is_empty(),
         "and nothing is retained before a call needs it"
     );
 
-    converge_population(&consumer, &[&p1, &p2], 2).await;
-    let _reply: Pong = client
-        .call(SERVICE, &Ping { n: 1 })
-        .await
-        .expect("admitted");
-    assert_eq!(
-        family.capabilities(),
-        vec![capability()],
-        "the call path retained demand for exactly the capability it planned"
-    );
-    assert_eq!(
-        family
-            .demand(&capability())
-            .expect("demand")
-            .retained_providers()
-            .len(),
-        2,
-        "one exact interest per provider"
-    );
+    let _armed = cell.call().await;
+    assert_eq!(cell.client.sensing_capabilities(), vec![capability()]);
+    let (population, retained, _) = demand_state(&cell.client).expect("demand");
+    assert_eq!(population.len(), 2, "one exact interest per provider");
+    assert_eq!(retained.len(), 2);
     assert!(
-        !consumer.node.sensing_table_is_empty(),
-        "and the interest is real: the node holds the rows"
+        !cell.consumer.node.sensing_table_is_empty(),
+        "the interest is real: the node holds the rows"
     );
 
-    // W-49: a clone SHARES the acquisition - it never mints a second one.
-    let clone = client.clone();
+    // A clone SHARES the acquisition; it never mints a second one.
+    let clone = cell.client.clone();
+    assert_eq!(cell.client.sensing_owners(), Some(2));
+    assert_eq!(clone.sensing_capabilities(), vec![capability()]);
+    let (_, _, identity) = demand_state(&cell.client).expect("demand");
+    let (_, _, clone_identity) = demand_state(&clone).expect("demand");
     assert_eq!(
-        family.owners(),
-        3,
-        "the clone shares the family body rather than minting its own"
+        identity, clone_identity,
+        "both clones read the SAME retained demand"
     );
-    let clone_family = clone.sensing_binding().family().expect("Active").clone();
-    assert!(
-        Arc::ptr_eq(clone_family.node(), family.node()),
-        "and it is bound to the same node"
-    );
-    assert_eq!(clone_family.capabilities(), vec![capability()]);
-    drop(clone_family);
 
-    // W-50: an intermediate clone's drop retires NOTHING.
+    // An intermediate clone's drop retires nothing.
     drop(clone);
+    assert_eq!(cell.client.sensing_owners(), Some(1));
     assert!(
-        family.demand(&capability()).is_some(),
-        "an intermediate clone's release must not retire a surviving client's demand"
+        demand_state(&cell.client).is_some(),
+        "a clone's release must not retire a surviving client's demand"
     );
-    assert!(
-        !consumer.node.sensing_table_is_empty(),
-        "and the rows must still be installed"
-    );
-    let _reply: Pong = client
-        .call(SERVICE, &Ping { n: 2 })
-        .await
-        .expect("the surviving client still calls");
+    assert!(!cell.consumer.node.sensing_table_is_empty());
+    let _still = cell.call().await;
 
-    // Independent binds are independent: a second bind mints its OWN family.
-    let other = bind(&consumer);
-    let other_family = other.sensing_binding().family().expect("Active").clone();
-    assert!(
-        other_family.capabilities().is_empty(),
-        "a separate bind starts with its own empty acquisition"
-    );
-    assert_eq!(
-        family.capabilities(),
-        vec![capability()],
-        "and the first bind's demand is untouched by it"
-    );
-    assert_eq!(
-        other_family.owners(),
-        2,
-        "the two binds do not share one body"
-    );
-    drop(other_family);
+    // A separate bind mints its OWN acquisition.
+    let other = bind(&cell.consumer);
+    assert!(other.sensing_capabilities().is_empty());
+    assert_eq!(other.sensing_owners(), Some(1));
+    assert_eq!(cell.client.sensing_capabilities(), vec![capability()]);
     drop(other);
 
-    // W-51: the LAST owner's drop retires everything.
+    // The LAST owner's drop retires everything.
+    let Cell {
+        consumer,
+        providers,
+        client,
+        ..
+    } = cell;
     drop(client);
+    let node = Arc::clone(&consumer.node);
+    until(
+        "the last owner's release must retire every retained interest",
+        SETTLE,
+        move || node.sensing_table_is_empty(),
+    )
+    .await;
+
+    let _ = std::fs::remove_dir_all(&consumer.dir);
+    for provider in &providers {
+        let _ = std::fs::remove_dir_all(&provider.dir);
+    }
+}
+
+/// A bind whose family mint is REFUSED at the real boundary binds anyway,
+/// INERT: it calls deterministically, its clones share the inert state, and it
+/// never re-mints on the call path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_mint_binds_inert_and_never_remints() {
+    let owner = org();
+    let p0 = mesh_in_org("inert-p0", &owner, true, None).await;
+    let audience = shared_audience(&p0);
+    let p1 = mesh_in_org("inert-p1", &owner, true, Some(&audience)).await;
+    let consumer = mesh_in_org("inert-c", &owner, true, Some(&audience)).await;
+    bring_up(&consumer, &[&p0, &p1]).await;
+
+    let (low, high) = by_entity_order(&p0, &p1);
+    let low_calls = Arc::new(AtomicUsize::new(0));
+    let high_calls = Arc::new(AtomicUsize::new(0));
+    let _low_serve = serve(low, "first", low_calls.clone());
+    let _high_serve = serve(high, "second", high_calls.clone());
+    // The high-id provider is the one a SENSED order would prefer, so an
+    // accidentally-active binding would be caught by the assertions below.
+    let _low_ready = provide_at(low, false, Duration::from_millis(1));
+    let _high_ready = provide_at(high, true, Duration::from_millis(1));
+
+    // Drive the family identity space to its terminal state, so the mint is
+    // refused through the production allocator rather than a substitute.
+    consumer.node.exhaust_org_routing_families_for_test();
+    let refusals_before = consumer.node.org_routing_family_refusals_for_test();
+
+    let client = bind(&consumer);
+    assert!(
+        !client.sensing_is_active(),
+        "a refused mint must bind INERT rather than failing the bind"
+    );
+    assert_eq!(client.sensing_owners(), None);
+    assert!(client.sensing_capabilities().is_empty());
+    let clone = client.clone();
+    assert!(
+        !clone.sensing_is_active(),
+        "a clone shares the inert state; it cannot become active on its own"
+    );
     assert_eq!(
-        family.owners(),
+        consumer.node.org_routing_family_refusals_for_test() - refusals_before,
         1,
-        "this witness now holds the only reference"
+        "exactly ONE mint was attempted: at bind"
+    );
+
+    converge_population(&consumer, &[&p0, &p1], 2).await;
+    for _ in 0..3 {
+        let reply: Pong = client
+            .call(SERVICE, &Ping { n: 1 })
+            .await
+            .expect("an inert binding still calls");
+        assert_eq!(
+            reply.served_by, "first",
+            "and it plans the deterministic order"
+        );
+    }
+    let reply: Pong = clone
+        .call(SERVICE, &Ping { n: 1 })
+        .await
+        .expect("the clone calls too");
+    assert_eq!(reply.served_by, "first");
+    assert_eq!(high_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(low_calls.load(Ordering::SeqCst), 4);
+    assert_eq!(
+        consumer.node.org_routing_family_refusals_for_test() - refusals_before,
+        1,
+        "no call-path re-mint: four admitted calls, still one attempt"
     );
     assert!(
-        family.demand(&capability()).is_some(),
-        "which is exactly why nothing has been retired yet"
+        consumer.node.sensing_table_is_empty(),
+        "an inert binding installs no interest"
     );
-    drop(family);
-    let deadline = Instant::now() + SETTLE;
-    loop {
-        if consumer.node.sensing_table_is_empty() {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the last owner's release must retire every retained interest"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    assert!(client.sensing_capabilities().is_empty());
 
-    for member in [&p1, &p2, &consumer] {
+    for member in [&p0, &p1, &consumer] {
         let _ = std::fs::remove_dir_all(&member.dir);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Direct-session attribution: what `direct` actually means today
+// ---------------------------------------------------------------------------
+
+/// `direct` is an IDENTITY PIN, not a live session — a predicate that predates
+/// this slice (`peer_entity_id` reads the pin map, and peer eviction removes
+/// session state without removing the pin). This witness ESTABLISHES the
+/// resulting behaviour rather than asserting a wish: a sensed order that
+/// prefers a provider whose process is gone, while its evidence is still
+/// fresh, selects that provider, and the call fails at TRANSPORT with no
+/// silent fallback to the live one.
+///
+/// Nothing is manufactured: the pin was established by a real handshake and
+/// the session died because the provider really stopped. The behaviour is
+/// inherited, it is the same for the unsensed order (which also selects the
+/// first PINNED candidate), and correcting it would require a live-session
+/// predicate in transport, which this slice is not authorized to add. Recorded
+/// here so the attribution is explicit instead of implied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pinned_but_dead_sensed_provider_is_selected_and_fails_at_transport() {
+    let cell = Cell::stand_up(
+        "dead",
+        true,
+        &[
+            (false, Duration::from_millis(1)),
+            (true, Duration::from_millis(1)),
+        ],
+    )
+    .await;
+    let _armed = cell.call().await;
+    cell.await_projection(&[cell.id(1)], &[cell.id(0)]).await;
+
+    // The sensed leader's process goes away. Its pin remains, and its last
+    // Ready attestation is still inside its window.
+    net::adapter::Adapter::shutdown(cell.providers[1].node.as_ref())
+        .await
+        .expect("stop the sensed provider");
+    assert!(
+        cell.consumer.node.peer_entity_id(cell.id(1)).is_some(),
+        "the identity pin outlives the session - this is the inherited predicate"
+    );
+
+    let before = (cell.served(0), cell.served(1));
+    // Bounded observation: a send to a dead peer has nothing to answer it, so
+    // the deadline is how this witness stays a witness instead of a hang. The
+    // budget it implies (1.5 s) is far above every estimate here, so it does
+    // not change the order under test.
+    let body = serde_json::to_vec(&Ping { n: 1 }).expect("encode");
+    let outcome = cell
+        .client
+        .call_bytes_deadline(SERVICE, bytes::Bytes::from(body), 1500, 0)
+        .await
+        .and_then(|reply| {
+            serde_json::from_slice::<Pong>(&reply).map_err(|e| {
+                net_sdk::org::OrgSdkError::Rpc(net_sdk::mesh_rpc::RpcError::Codec {
+                    direction: net_sdk::mesh_rpc::CodecDirection::Decode,
+                    message: format!("{e}"),
+                })
+            })
+        });
+    match outcome {
+        Err(net_sdk::org::OrgSdkError::Rpc(_)) => {
+            // Established behaviour: selection followed the pin, the send had
+            // nowhere to go, and the SDK does not retry or re-select.
+            assert_eq!(
+                cell.served(0) - before.0,
+                0,
+                "and no silent fallback to the live provider happened"
+            );
+        }
+        Ok(reply) => {
+            // If the transport did complete, it must have been the SELECTED
+            // provider - never a silent substitution.
+            assert_eq!(
+                reply.served_by, cell.names[1],
+                "a reply may only come from the selected provider"
+            );
+        }
+        Err(other) => panic!("unexpected local refusal: {other:?}"),
+    }
+    assert_eq!(
+        cell.served(1) - before.1,
+        0,
+        "the stopped provider served nothing"
+    );
+    cell.cleanup();
+}
+
+// ---------------------------------------------------------------------------
+// Unavailable evidence: the deterministic floor
+// ---------------------------------------------------------------------------
+
+/// A consumer whose sensing plane is OFF - the shipped default - calls
+/// deterministically, holds no interest rows, and does not re-converge per
+/// call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_consumer_without_sensing_plans_the_deterministic_order() {
+    let cell = Cell::stand_up(
+        "dark",
+        false,
+        &[
+            (false, Duration::from_millis(1)),
+            (true, Duration::from_millis(1)),
+        ],
+    )
+    .await;
+    assert!(
+        !cell.consumer.node.sensing_enabled(),
+        "precondition: this consumer's sensing plane is off"
+    );
+
+    let mut identity = None;
+    for _ in 0..3 {
+        assert_eq!(
+            cell.call().await,
+            cell.names[0],
+            "with no evidence the order is the deterministic one"
+        );
+        let (_, retained, current) = demand_state(&cell.client).expect("demand");
+        assert!(
+            retained.is_empty(),
+            "a dark plane acquires no holder, so there is nothing to order by"
+        );
+        match identity {
+            None => identity = Some(current),
+            Some(previous) => assert_eq!(
+                previous, current,
+                "no per-call re-acquisition: the same demand is reused"
+            ),
+        }
+    }
+    assert_eq!(cell.served(1), 0);
+    assert_eq!(cell.served(0), 3);
+    assert!(
+        cell.consumer.node.sensing_table_is_empty(),
+        "a dark consumer registers no interest at all"
+    );
+    let projection = cell
+        .client
+        .sensing_projection(
+            &capability(),
+            Instant::now(),
+            &ConsumerLatencyBudget::default(),
+        )
+        .expect("demand");
+    assert!(projection.viable().is_empty() && projection.non_viable().is_empty());
+    cell.cleanup();
 }
 
 // ---------------------------------------------------------------------------

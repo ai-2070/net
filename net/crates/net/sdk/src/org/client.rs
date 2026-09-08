@@ -7,8 +7,11 @@
 //! S0 lands the binding relation and the lease. The call verb (`org.call`)
 //! lands in S1.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use net::adapter::net::behavior::org_grant::CapabilityAuthorityId;
 use net::adapter::net::behavior::org_sensing_demand::OrgSensingFamily;
 use net::adapter::net::identity::EntityKeypair;
 use net::adapter::net::MeshNode;
@@ -27,51 +30,126 @@ use crate::mesh::Mesh;
 /// unsensed order and calls exactly as it always did. So `bind_node` MAPS the
 /// mint result instead of propagating it, and gains no error variant.
 ///
-/// `Active` holds one `Arc`-shared family body. Cloning the binding bumps that
-/// `Arc`, so every clone of an [`OrgClient`] shares one acquisition: an
-/// intermediate clone's drop retires nothing, and the last one retires
-/// everything (the family body's own `Drop`). `Inert` owns nothing, so its drop
-/// is a no-op and there is no per-call re-mint to hammer an exhausted space —
-/// recovery is a new bind.
+/// `Active` holds one `Arc`-shared family body plus this binding's own
+/// reconciliation schedule. Cloning the binding shares both, so every clone of
+/// an [`OrgClient`] shares one acquisition: an intermediate clone's drop
+/// retires nothing, and the last one retires everything (the family body's own
+/// `Drop`). `Inert` owns nothing, so its drop is a no-op and there is no
+/// per-call re-mint to hammer an exhausted space — recovery is a new bind.
 ///
-/// `#[doc(hidden)]`: unstable, semver-uncovered plumbing that exists so a
-/// witness can observe which state a bind reached. Applications use
-/// `org.call`.
-#[doc(hidden)]
+/// `pub(crate)`: this type is not part of any public signature. What a witness
+/// can observe about it is a small set of `#[doc(hidden)]`, test/fixtures-only
+/// DATA accessors on [`OrgClient`] — never the cloneable family handle itself.
 #[derive(Clone)]
-pub enum OrgSensingBinding {
-    /// The mint succeeded; this client shares one acquisition family.
-    Active(OrgSensingFamily),
+pub(crate) enum OrgSensingBinding {
+    /// The mint succeeded; this client shares one acquisition.
+    Active(OrgSensingAcquisition),
     /// The mint was refused. Deterministic unsensed planning, no sensing work.
     Inert,
 }
 
 impl OrgSensingBinding {
-    /// The family, when this binding is active.
-    #[doc(hidden)]
-    pub fn family(&self) -> Option<&OrgSensingFamily> {
+    /// The acquisition, when this binding is active.
+    pub(crate) fn acquisition(&self) -> Option<&OrgSensingAcquisition> {
         match self {
-            Self::Active(family) => Some(family),
+            Self::Active(acquisition) => Some(acquisition),
             Self::Inert => None,
         }
     }
+}
 
-    /// Whether this binding senses at all.
-    #[doc(hidden)]
-    pub fn is_active(&self) -> bool {
-        matches!(self, Self::Active(_))
+/// One binding's acquisition: the shared family, and the shared record of what
+/// each capability's demand was last converged FOR.
+#[derive(Clone)]
+pub(crate) struct OrgSensingAcquisition {
+    family: OrgSensingFamily,
+    schedule: Arc<ConvergenceSchedule>,
+}
+
+/// What each capability's demand was last converged for.
+///
+/// This is what keeps reconciliation bounded in both directions. An unchanged
+/// authorized population must not be re-acquired on every call; a changed one
+/// — a newly discovered provider, a departed one, a holder a transient refusal
+/// could not take — must not stay frozen until the process restarts. The
+/// record is per capability, tiny, and shared by every clone of a binding, so
+/// two clones cannot each converge the same change.
+#[derive(Default)]
+pub(crate) struct ConvergenceSchedule {
+    records: parking_lot::Mutex<BTreeMap<CapabilityAuthorityId, ConvergedFor>>,
+}
+
+/// One capability's last convergence attempt.
+struct ConvergedFor {
+    /// The expected population it was driven by: the call's own pinned
+    /// same-organization candidates. Compared by value, so a discovery or pin
+    /// change is the trigger rather than a clock.
+    expected: Vec<u64>,
+    /// Whether every provider the demand ended up authorizing also ended up
+    /// with a live holder. A per-provider acquisition refusal is skipped
+    /// rather than fatal, so an incomplete convergence is normal — and must be
+    /// retryable without turning every later call into a re-acquisition.
+    complete: bool,
+    /// When that attempt ran, so an incomplete one is retried on a floor.
+    attempted: Instant,
+}
+
+impl ConvergenceSchedule {
+    /// Whether `expected` demands a convergence now.
+    ///
+    /// `retry_floor` bounds the ONLY time-driven case: an incomplete
+    /// convergence, where a provider refused at acquisition would otherwise
+    /// stay missing forever under an unchanged population.
+    pub(crate) fn needs_convergence(
+        &self,
+        capability: &CapabilityAuthorityId,
+        expected: &[u64],
+        now: Instant,
+        retry_floor: Duration,
+    ) -> bool {
+        match self.records.lock().get(capability) {
+            None => true,
+            Some(record) => {
+                record.expected != expected
+                    || (!record.complete
+                        && now.saturating_duration_since(record.attempted) >= retry_floor)
+            }
+        }
+    }
+
+    /// Record the outcome of a convergence attempt.
+    pub(crate) fn converged(
+        &self,
+        capability: CapabilityAuthorityId,
+        expected: Vec<u64>,
+        complete: bool,
+        now: Instant,
+    ) {
+        self.records.lock().insert(
+            capability,
+            ConvergedFor {
+                expected,
+                complete,
+                attempted: now,
+            },
+        );
     }
 }
 
-impl std::fmt::Debug for OrgSensingBinding {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Active(family) => f
-                .debug_struct("OrgSensingBinding::Active")
-                .field("owners", &family.owners())
-                .finish(),
-            Self::Inert => f.write_str("OrgSensingBinding::Inert"),
+impl OrgSensingAcquisition {
+    pub(crate) fn new(family: OrgSensingFamily) -> Self {
+        Self {
+            family,
+            schedule: Arc::new(ConvergenceSchedule::default()),
         }
+    }
+
+    pub(crate) fn family(&self) -> &OrgSensingFamily {
+        &self.family
+    }
+
+    pub(crate) fn schedule(&self) -> &ConvergenceSchedule {
+        &self.schedule
     }
 }
 
@@ -118,14 +196,77 @@ impl OrgClient {
         &self.grants
     }
 
-    /// This client's sensing binding — `Active` with a shared acquisition
-    /// family, or `Inert`.
+    /// Whether this client's sensing binding is active.
     ///
-    /// `#[doc(hidden)]`: the observation seam for the binding's ownership
-    /// semantics, not application API.
+    /// # The test/fixtures observation seam
+    ///
+    /// This and the four accessors below are the WHOLE observable surface of
+    /// the sensing binding, they are `#[doc(hidden)]` and gated to
+    /// test/`fixtures` builds, and they return plain DATA — never the
+    /// cloneable family handle, which would hand a caller ownership of this
+    /// binding's acquisition. They exist because the binding's contract is
+    /// about ownership and reconciliation, and neither is observable from a
+    /// reply body. Nothing in production reads them.
+    #[cfg(any(test, feature = "fixtures"))]
     #[doc(hidden)]
-    pub fn sensing_binding(&self) -> &OrgSensingBinding {
-        &self._sensing
+    pub fn sensing_is_active(&self) -> bool {
+        self._sensing.acquisition().is_some()
+    }
+
+    /// How many owners share this binding's acquisition, or `None` if inert.
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn sensing_owners(&self) -> Option<usize> {
+        self._sensing
+            .acquisition()
+            .map(|acquisition| acquisition.family().owners())
+    }
+
+    /// The capabilities this binding currently retains demand for.
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn sensing_capabilities(&self) -> Vec<CapabilityAuthorityId> {
+        self._sensing
+            .acquisition()
+            .map(|acquisition| acquisition.family().capabilities())
+            .unwrap_or_default()
+    }
+
+    /// One capability's retained demand as plain data:
+    /// `(population, retained_holders, demand_identity)`.
+    ///
+    /// The identity is the retained `Arc`'s address, which is how a witness
+    /// distinguishes "the same demand was reused" from "an identical one was
+    /// re-acquired". It is an opaque number, not a handle.
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn sensing_demand_state(
+        &self,
+        capability: &CapabilityAuthorityId,
+    ) -> Option<(Vec<u64>, Vec<u64>, usize)> {
+        let demand = self._sensing.acquisition()?.family().demand(capability)?;
+        let identity = std::sync::Arc::as_ptr(&demand) as usize;
+        Some((
+            demand.population().to_vec(),
+            demand.retained_providers(),
+            identity,
+        ))
+    }
+
+    /// One capability's readiness projection at a caller-supplied instant.
+    ///
+    /// The instant is the point: freshness is request-relative, so a witness
+    /// proves aging by ASKING at a later instant rather than by sleeping.
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn sensing_projection(
+        &self,
+        capability: &CapabilityAuthorityId,
+        at: Instant,
+        budget: &net::adapter::net::behavior::sensing::ConsumerLatencyBudget,
+    ) -> Option<net::adapter::net::behavior::org_sensing_demand::OrgSensedProjection> {
+        let demand = self._sensing.acquisition()?.family().demand(capability)?;
+        Some(demand.project_sensed_order(at, budget))
     }
 
     /// The membership certificate this client calls under.
@@ -304,7 +445,7 @@ impl OrgClient {
         // type of this function is unchanged. Recorded once, here - never per
         // call - because the mint does not happen again on this client.
         let _sensing = match OrgSensingFamily::mint(&node) {
-            Ok(family) => OrgSensingBinding::Active(family),
+            Ok(family) => OrgSensingBinding::Active(OrgSensingAcquisition::new(family)),
             Err(refusal) => {
                 // `eprintln!` because this crate takes no logging dependency
                 // (the `compute` verbs do the same for their one operator
