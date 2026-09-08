@@ -211,7 +211,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use crossbeam_queue::SegQueue;
 use dashmap::DashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::Notify;
@@ -445,24 +445,72 @@ mod routing {
 /// Shared inbound queue type
 type InboundQueues = Arc<DashMap<u16, SegQueue<StoredEvent>>>;
 
-/// Per-source rate limiter for the handshake responder loop.
+/// Rate limiter for the handshake responder loop.
 ///
 /// The responder used to accept whichever source emitted msg1
-/// first, with no per-source pacing — an attacker who knows the PSK
+/// first, with no pacing — an attacker who knows the PSK
 /// (PSKs are typically multi-tenant) could race the legitimate
 /// initiator's msg1; even without the PSK an attacker could flood
 /// handshake-flagged datagrams to monopolize the recv loop.
 ///
-/// `HandshakePacer` keeps a rolling count of recent attempts per
-/// source and rejects sources that exceed the budget within the
-/// window. Expired entries are garbage-collected on a periodic
-/// schedule rather than on every check, so a sustained flood from
-/// many distinct sources doesn't pay an O(n) sweep per packet.
+/// # Why a per-source budget is not enough on its own
+///
+/// A UDP source address is trivially spoofable, so "this source is
+/// over budget" is not evidence that this source is hostile. Dropping
+/// on the per-source budget alone hands an off-path attacker a precise
+/// denial primitive: learn the initiator's address (it is in the clear
+/// on every datagram), send `max_per_window` junk handshakes carrying
+/// it, and every real `msg1` from that address is dropped BEFORE Noise
+/// for the rest of the window. The victim's `accept()` then spends its
+/// whole budget and reports a bare timeout, because a paced drop never
+/// even looks at the payload. The same shape occurs with no attacker
+/// at all: a responder draining an initiator's own stale retransmits
+/// spends that initiator's budget on its way to reading its live
+/// `msg1`.
+///
+/// So an over-budget source is throttled, not banned — it draws from a
+/// small shared reserve. Under a targeted spoof the reserve is idle and
+/// the real `msg1` still gets its Noise read; under a genuine flood the
+/// reserve is what bounds how much crypto the flood can buy.
+///
+/// # The three ceilings
+///
+/// A datagram is admitted only if the aggregate ceiling has room AND
+/// either its source is within its own budget or the over-budget
+/// reserve has room:
+///
+/// - `max_per_window` — per source. Sized for a legitimate initiator.
+/// - `over_budget_reserve` — shared, for sources past that budget.
+///   Bounds a single-source flood without making an exhausted
+///   per-source budget fatal.
+/// - `aggregate_per_window` — shared, over everything. Bounds a flood
+///   that fans out across many spoofed addresses, where every datagram
+///   looks like a fresh in-budget source.
+///
+/// Residual, stated plainly: an attacker who both saturates the
+/// aggregate ceiling and spoofs the victim's address can still keep the
+/// victim's handshake out. Nothing short of a return-routability
+/// challenge (a DTLS/QUIC-style retry cookie) closes that, and unlike
+/// the per-source-only design it costs the attacker sustained line rate
+/// rather than five datagrams.
+///
+/// Expired entries are garbage-collected on a periodic schedule rather
+/// than on every check, so a sustained flood from many distinct sources
+/// doesn't pay an O(n) sweep per packet.
 pub(crate) struct HandshakePacer {
     /// Per-source `(count_in_window, window_start)`.
     entries: std::collections::HashMap<std::net::SocketAddr, (u32, std::time::Instant)>,
     /// Maximum attempts per source within `window`.
     max_per_window: u32,
+    /// Maximum admissions per `window` across all sources that have
+    /// already spent their per-source budget.
+    over_budget_reserve: u32,
+    /// Maximum admissions per `window` across all sources, in budget
+    /// or not.
+    aggregate_per_window: u32,
+    /// `(over_budget_admitted, total_admitted, window_start)` for the
+    /// two shared ceilings.
+    shared: (u32, u32, std::time::Instant),
     /// Window length.
     window: std::time::Duration,
     /// Last time we ran the GC pass.
@@ -471,25 +519,96 @@ pub(crate) struct HandshakePacer {
     /// before the periodic deadline. Keeps memory bounded against
     /// an attacker fanning across many spoofed source addresses.
     gc_size_threshold: usize,
+    /// How many GC sweeps have run. Only read by the test that pins
+    /// the sweep to being amortized rather than per-packet.
+    sweeps: u64,
 }
 
 impl HandshakePacer {
-    pub(crate) fn new(max_per_window: u32, window: std::time::Duration) -> Self {
+    /// Datagrams one source may buy Noise work with per
+    /// [`Self::DEFAULT_WINDOW`].
+    ///
+    /// Plenty for any legitimate initiator, which is RTT-limited and
+    /// sends at most `handshake_retries` retransmits spread across
+    /// its per-attempt windows; tight enough to throttle a flooder on
+    /// consumer-grade hardware. Defined once here so the responder
+    /// loops that pace to it, and the tests that witness them, cannot
+    /// drift from each other.
+    pub(crate) const DEFAULT_BURST: u32 = 5;
+
+    /// Admissions per [`Self::DEFAULT_WINDOW`] shared by every source
+    /// that has already spent [`Self::DEFAULT_BURST`].
+    ///
+    /// Well above what one initiator's retransmits plus its own stale
+    /// copies can need, so a spoofed or self-inflicted per-source
+    /// exhaustion does not keep a real `msg1` from being read; far
+    /// below what a flood wants.
+    pub(crate) const DEFAULT_OVER_BUDGET_RESERVE: u32 = 32;
+
+    /// Admissions per [`Self::DEFAULT_WINDOW`] across all sources.
+    ///
+    /// The only ceiling a fan-out flood cannot walk around by using a
+    /// fresh spoofed address per datagram. Sized to stay clear of a
+    /// large mesh's legitimate fan-in — a node bringing up hundreds of
+    /// peers sees a handful of `msg1` per second, not hundreds — while
+    /// still capping the responder's Noise work at a few milliseconds
+    /// of CPU per second.
+    pub(crate) const DEFAULT_AGGREGATE_BURST: u32 = 256;
+
+    /// Window for [`Self::DEFAULT_BURST`].
+    pub(crate) const DEFAULT_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// A pacer carrying the shipped budget — see [`Self::DEFAULT_BURST`].
+    pub(crate) fn with_defaults() -> Self {
+        Self::new(
+            Self::DEFAULT_BURST,
+            Self::DEFAULT_OVER_BUDGET_RESERVE,
+            Self::DEFAULT_AGGREGATE_BURST,
+            Self::DEFAULT_WINDOW,
+        )
+    }
+
+    pub(crate) fn new(
+        max_per_window: u32,
+        over_budget_reserve: u32,
+        aggregate_per_window: u32,
+        window: std::time::Duration,
+    ) -> Self {
         Self {
             entries: std::collections::HashMap::new(),
             max_per_window,
+            over_budget_reserve,
+            aggregate_per_window,
+            shared: (0, 0, std::time::Instant::now()),
             window,
             last_gc: std::time::Instant::now(),
             // 4096 entries × ~40 bytes each ≈ 160 KiB — comfortable
             // ceiling that still triggers GC well before any
             // realistic memory issue.
             gc_size_threshold: 4096,
+            sweeps: 0,
         }
     }
 
-    /// Record an attempt from `source`. Returns `true` if the source
-    /// is within budget (caller may proceed); `false` if it has
-    /// exceeded the rate limit (caller must drop the packet).
+    /// Override the entry-count GC trigger. Test-only: the shipped
+    /// threshold is sized for memory, not for a test to reach.
+    #[cfg(test)]
+    pub(crate) fn with_gc_size_threshold(mut self, threshold: usize) -> Self {
+        self.gc_size_threshold = threshold;
+        self
+    }
+
+    /// GC sweeps run so far.
+    #[cfg(test)]
+    pub(crate) fn sweeps(&self) -> u64 {
+        self.sweeps
+    }
+
+    /// Record an attempt from `source`. Returns `true` if the caller
+    /// may proceed to Noise; `false` if the packet must be dropped.
+    ///
+    /// See the type doc for why an over-budget source is throttled
+    /// against a shared reserve rather than dropped outright.
     pub(crate) fn check_and_record(&mut self, source: std::net::SocketAddr) -> bool {
         let now = std::time::Instant::now();
         // Amortized GC: only run the O(n) `retain` sweep when one
@@ -506,7 +625,30 @@ impl HandshakePacer {
             let cutoff = self.window.saturating_mul(2);
             self.entries
                 .retain(|_, (_, start)| now.duration_since(*start) < cutoff);
+            // A size-triggered sweep during a live fan-out flood
+            // reclaims nothing: every entry is younger than the
+            // cutoff, so `len()` stays at the threshold and the size
+            // branch fires again on the very next datagram — a full
+            // scan per packet for as long as the flood lasts, i.e.
+            // precisely when the responder needs to be cheap, and now
+            // reachable from every node's `accept()`. Drop the table
+            // instead of rescanning it. Forgetting the flood's history
+            // refills each tracked source's budget, but `entries` is
+            // not what bounds a fan-out flood — the aggregate ceiling
+            // is, and it is untouched by this — so the only thing lost
+            // is per-source resolution the flood had already defeated
+            // by using a fresh address per datagram.
+            if self.entries.len() >= self.gc_size_threshold {
+                self.entries.clear();
+            }
             self.last_gc = now;
+            self.sweeps = self.sweeps.saturating_add(1);
+        }
+
+        // Roll the shared window before consulting either ceiling, so
+        // the per-source and shared budgets refill on the same clock.
+        if now.duration_since(self.shared.2) > self.window {
+            self.shared = (0, 0, now);
         }
 
         let entry = self.entries.entry(source).or_insert((0, now));
@@ -516,7 +658,74 @@ impl HandshakePacer {
             entry.1 = now;
         }
         entry.0 = entry.0.saturating_add(1);
-        entry.0 <= self.max_per_window
+        let in_source_budget = entry.0 <= self.max_per_window;
+
+        // The aggregate ceiling binds first and binds everyone: it is
+        // the only one a flood cannot walk around by spoofing a fresh
+        // source address per datagram.
+        if self.shared.1 >= self.aggregate_per_window {
+            return false;
+        }
+
+        // An over-budget source is throttled, not banned — a spoofable
+        // address means an exhausted budget is not proof of hostility.
+        // It draws from the shared reserve instead.
+        if !in_source_budget {
+            if self.shared.0 >= self.over_budget_reserve {
+                return false;
+            }
+            self.shared.0 = self.shared.0.saturating_add(1);
+        }
+
+        self.shared.1 = self.shared.1.saturating_add(1);
+        true
+    }
+}
+
+/// Live counters for the handshake responder's drain path.
+///
+/// Cloneable handles, not a snapshot: the handshake runs inside
+/// [`NetAdapter::init`], which takes `&mut self`, so anything that wants
+/// to observe the drain has usually handed the adapter to the task
+/// driving it and needs a view that outlives that move. Obtain one from
+/// [`NetAdapter::responder_handshake_counters`] before starting.
+///
+/// The mesh transport exposes the same two numbers as
+/// `MeshNode::responder_handshakes_drained` /
+/// `responder_handshakes_paced`.
+#[derive(Clone, Debug, Default)]
+pub struct ResponderHandshakeCounters {
+    drained: Arc<AtomicU64>,
+    paced: Arc<AtomicU64>,
+}
+
+impl ResponderHandshakeCounters {
+    /// Handshake datagrams the responder read and discarded because
+    /// they did not decrypt under this pairing — another pairing's
+    /// retransmitted `msg1`, junk from a sprayer, or a genuine key
+    /// mismatch.
+    ///
+    /// Nonzero is normal on a busy socket: an initiator retransmits by
+    /// design, and a responder answers only the first copy it reads.
+    pub fn drained(&self) -> u64 {
+        self.drained.load(Ordering::Relaxed)
+    }
+
+    /// Handshake datagrams dropped before any Noise work because the
+    /// pacer refused them.
+    ///
+    /// Nonzero means something is emitting handshakes faster than any
+    /// legitimate initiator does — the signature of a flood.
+    pub fn paced(&self) -> u64 {
+        self.paced.load(Ordering::Relaxed)
+    }
+
+    fn record_drained(&self) {
+        self.drained.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_paced(&self) {
+        self.paced.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -545,6 +754,11 @@ pub struct NetAdapter {
     /// datagrams to monopolize the recv path or race a legitimate
     /// initiator's msg1.
     handshake_pacer: parking_lot::Mutex<HandshakePacer>,
+    /// What the responder's drain path threw away, and what the pacer
+    /// refused. Surfaced by
+    /// [`Self::responder_handshake_counters`] so the drain is
+    /// observable rather than inferred from a missing failure.
+    responder_handshakes: ResponderHandshakeCounters,
 }
 
 impl NetAdapter {
@@ -564,14 +778,18 @@ impl NetAdapter {
             shutdown: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(Notify::new()),
             initialized: AtomicBool::new(false),
-            // 5 attempts per second per source, plenty for any
-            // legitimate initiator (RTT-limited) and tight enough
-            // to throttle a flooder on consumer-grade hardware.
-            handshake_pacer: parking_lot::Mutex::new(HandshakePacer::new(
-                5,
-                std::time::Duration::from_secs(1),
-            )),
+            handshake_pacer: parking_lot::Mutex::new(HandshakePacer::with_defaults()),
+            responder_handshakes: ResponderHandshakeCounters::default(),
         })
+    }
+
+    /// Live handles to the responder's drain counters — see
+    /// [`ResponderHandshakeCounters`].
+    ///
+    /// Take one before handing the adapter to the task that will call
+    /// [`Self::init`]; the handles keep working after the move.
+    pub fn responder_handshake_counters(&self) -> ResponderHandshakeCounters {
+        self.responder_handshakes.clone()
     }
 
     /// Perform Noise handshake with peer.
@@ -620,9 +838,11 @@ impl NetAdapter {
         // the state we still hold. `build_handshake` stamps no counter
         // or nonce, so the retransmitted bytes are byte-identical.
         //
-        // The RESPONDER has no state to carry across attempts — each
-        // attempt answers whichever `msg1` it reads — so it rebuilds
-        // per attempt by construction.
+        // The RESPONDER has no Noise state to carry across attempts —
+        // each attempt answers whichever `msg1` it reads — so it
+        // rebuilds per attempt by construction. It does carry its
+        // rejection diagnosis, which would otherwise die with the
+        // attempt that observed it.
         if self.config.is_initiator() {
             let peer_pubkey = self
                 .config
@@ -658,9 +878,18 @@ impl NetAdapter {
             }
         }
 
+        // Rejection state for the whole responder sequence, not for
+        // one attempt: a mismatched initiator can fall silent while
+        // this side still has attempts left, and every later attempt
+        // then times out with nothing to report.
+        let mut last_decrypt_reject: Option<String> = None;
+        let mut last_paced_source: Option<std::net::SocketAddr> = None;
         loop {
             attempt += 1;
-            match self.try_handshake_responder(socket).await {
+            match self
+                .try_handshake_responder(socket, &mut last_decrypt_reject, &mut last_paced_source)
+                .await
+            {
                 Ok(result) => return Ok(result),
                 Err(e) if attempt < max_attempts => backoff(attempt, &e).await,
                 Err(e) => return Err(e),
@@ -753,9 +982,33 @@ impl NetAdapter {
     /// ONE responder attempt: read an initiator's `msg1`, answer it,
     /// and return the session keys with the source address it came
     /// from.
+    ///
+    /// # Why a foreign `msg1` is skipped, not failed
+    ///
+    /// [`Self::try_handshake_initiator`] retransmits byte-identical
+    /// copies of `msg1` when no reply arrives in time, and a responder
+    /// that was merely slow to be scheduled answers the FIRST copy —
+    /// the rest stay queued on the socket unread. They surface on a
+    /// later attempt, or an off-path sender simply sprays
+    /// handshake-flagged junk.
+    ///
+    /// Ending the attempt on one of those was a self-inflicted denial
+    /// of service: N such datagrams burned N of the few
+    /// `handshake_retries` in milliseconds, and the responder was gone
+    /// while the real initiator was still retransmitting into it. So a
+    /// datagram that does not decrypt costs one loop iteration, not one
+    /// attempt, and only a genuine absence of `msg1` ends the attempt.
+    /// The pacer is what keeps "delay" from becoming "starve".
+    ///
+    /// This mirrors `MeshNode::try_handshake_responder`; see its doc
+    /// for the fuller argument, including why one `NoiseHandshake` is
+    /// reused across rejected reads and why the diagnosis has to
+    /// outlive the attempt that produced it.
     async fn try_handshake_responder(
         &self,
         socket: &Socket,
+        last_decrypt_reject: &mut Option<String>,
+        last_paced_source: &mut Option<std::net::SocketAddr>,
     ) -> Result<(SessionKeys, std::net::SocketAddr), AdapterError> {
         let timeout = self.config.handshake_timeout;
         let socket_arc = socket.socket_arc();
@@ -766,54 +1019,91 @@ impl NetAdapter {
             .as_ref()
             .ok_or_else(|| AdapterError::Fatal("missing static keypair".into()))?;
 
-        // Wait for an initiator handshake message, discarding any
-        // non-handshake datagrams that arrive on the shared
-        // socket. Per-source pacing throttles flooders so the
-        // legitimate initiator's msg1 can land — without it,
-        // an attacker could blast handshake-flagged datagrams
-        // and monopolize this recv loop.
-        let (parsed, source) = tokio::time::timeout(timeout, async {
-            loop {
-                let mut recv_buf = bytes::BytesMut::with_capacity(protocol::MAX_PACKET_SIZE);
-                recv_buf.resize(protocol::MAX_PACKET_SIZE, 0);
+        // ONE responder for the whole wait: snow restores the symmetric
+        // state when `read_message` fails and does not advance
+        // `pattern_position`, so a rejected datagram cannot corrupt it.
+        let mut handshake = NoiseHandshake::responder(&self.config.psk, keypair)
+            .map_err(|e| AdapterError::Fatal(format!("handshake init failed: {}", e)))?;
 
+        // One receive buffer for the whole wait: the loop now runs for
+        // the full deadline under any handshake stream, so allocating
+        // and zeroing `MAX_PACKET_SIZE` per iteration would be per junk
+        // datagram — and it happens before the pacer, so the pacer does
+        // not bound it.
+        let mut recv_buf = vec![0u8; protocol::MAX_PACKET_SIZE];
+
+        // Wait for an initiator handshake message, discarding any
+        // non-handshake datagrams that arrive on the shared socket.
+        // Pacing throttles flooders so the legitimate initiator's msg1
+        // can land — without it, an attacker could blast
+        // handshake-flagged datagrams and monopolize this recv loop.
+        let waited = tokio::time::timeout(timeout, async {
+            loop {
                 let (n, source) = socket_arc
                     .recv_from(&mut recv_buf)
                     .await
                     .map_err(|e| AdapterError::Connection(format!("recv failed: {}", e)))?;
 
-                recv_buf.truncate(n);
-                let data = recv_buf.freeze();
+                let data = Bytes::copy_from_slice(&recv_buf[..n]);
 
-                if let Some(p) = ParsedPacket::parse(data, source) {
-                    if p.header.flags.is_handshake() {
-                        // Per-source pacing: drop packets from
-                        // sources that exceed the budget.
-                        let allowed = self.handshake_pacer.lock().check_and_record(source);
-                        if !allowed {
-                            tracing::debug!(
-                                %source,
-                                "handshake responder: dropping packet from \
-                                 rate-limited source"
-                            );
-                            continue;
-                        }
-                        return Ok::<_, AdapterError>((p, source));
-                    }
+                let Some(p) = ParsedPacket::parse(data, source) else {
+                    continue;
+                };
+                if !p.header.flags.is_handshake() {
+                    continue;
                 }
-                // Not a valid handshake packet — keep waiting
+
+                // Pace BEFORE the Noise read, so a rejected source
+                // cannot buy a Diffie-Hellman.
+                if !self.handshake_pacer.lock().check_and_record(source) {
+                    self.responder_handshakes.record_paced();
+                    *last_paced_source = Some(source);
+                    tracing::debug!(
+                        %source,
+                        "handshake responder: dropping packet from \
+                         rate-limited source"
+                    );
+                    continue;
+                }
+
+                if let Err(e) = handshake.read_message(&p.payload) {
+                    self.responder_handshakes.record_drained();
+                    *last_decrypt_reject = Some(format!("{source}: {e}"));
+                    tracing::debug!(
+                        %source,
+                        error = %e,
+                        "skipping handshake datagram that is not this pairing's msg1"
+                    );
+                    continue;
+                }
+
+                return Ok::<_, AdapterError>(source);
             }
         })
-        .await
-        .map_err(|_| AdapterError::Connection("handshake timeout".into()))??;
+        .await;
 
-        let mut handshake = NoiseHandshake::responder(&self.config.psk, keypair)
-            .map_err(|e| AdapterError::Fatal(format!("handshake init failed: {}", e)))?;
-
-        // Process initiator message
-        handshake
-            .read_message(&parsed.payload)
-            .map_err(|e| AdapterError::Connection(format!("read_message failed: {}", e)))?;
+        let source = match waited {
+            Ok(inner) => inner?,
+            // A decrypt failure outranks a paced drop: it is the one
+            // that names a misconfiguration.
+            Err(_) => {
+                return Err(AdapterError::Connection(
+                    match (last_decrypt_reject.as_deref(), *last_paced_source) {
+                        (Some(reject), _) => format!(
+                            "handshake timeout (last handshake datagram from {reject} \
+                             did not decrypt — wrong PSK, wrong peer key, or \
+                             another pairing's msg1)"
+                        ),
+                        (None, Some(paced)) => format!(
+                            "handshake timeout (across this handshake sequence every \
+                             handshake datagram the responder saw was dropped before \
+                             Noise by its pacing budget, most recently one from {paced})"
+                        ),
+                        (None, None) => "handshake timeout".into(),
+                    },
+                ))
+            }
+        };
 
         // Send response
         let msg2 = handshake
@@ -2126,33 +2416,38 @@ mod tests {
         );
     }
 
-    /// Regression: the handshake responder must rate-limit per
-    /// source so a flooder can't monopolize the recv loop.
-    /// `HandshakePacer` is the building block: it tracks
-    /// `(count, window_start)` per source and rejects after
-    /// `max_per_window` attempts within `window`.
+    /// Regression: the handshake responder must rate-limit a flooder
+    /// so it can't monopolize the recv loop. `HandshakePacer` is the
+    /// building block: per source it tracks `(count, window_start)`
+    /// and pushes anything past `max_per_window` onto a shared
+    /// reserve, which is itself bounded.
     #[test]
     fn handshake_pacer_rejects_floods_per_source() {
         use std::time::Duration;
-        let mut pacer = HandshakePacer::new(3, Duration::from_millis(50));
+        // Per-source 3, reserve 2, aggregate high enough not to bind.
+        let mut pacer = HandshakePacer::new(3, 2, 100, Duration::from_millis(50));
 
         let attacker: std::net::SocketAddr = "10.0.0.1:9000".parse().unwrap();
         let legit: std::net::SocketAddr = "10.0.0.2:9000".parse().unwrap();
 
-        // Attacker fires 3 attempts — all allowed (within budget).
-        for _ in 0..3 {
+        // 3 within the per-source budget, then 2 more off the shared
+        // reserve — a spoofable address means an exhausted budget is
+        // not proof of hostility, so the source is throttled rather
+        // than banned outright.
+        for _ in 0..5 {
             assert!(pacer.check_and_record(attacker));
         }
-        // Fourth and beyond — rejected.
+        // Reserve spent: everything beyond is dropped before Noise.
         for _ in 0..10 {
             assert!(
                 !pacer.check_and_record(attacker),
-                "attacker exceeding budget must be dropped"
+                "attacker past budget AND reserve must be dropped"
             );
         }
 
         // The legitimate initiator (different source) is unaffected
-        // by the attacker's burst — the budget is per-source.
+        // by the attacker's burst — it is still within its own budget,
+        // and the budget is per-source.
         assert!(
             pacer.check_and_record(legit),
             "legitimate source must still get through despite attacker flood"
@@ -2163,6 +2458,104 @@ mod tests {
         assert!(
             pacer.check_and_record(attacker),
             "attacker budget must refill after window"
+        );
+    }
+
+    /// A UDP source address is spoofable, so burning a source's
+    /// per-source budget must not be enough to keep that source out.
+    ///
+    /// Without the shared reserve this is a precise off-path denial
+    /// primitive: the initiator's address is in the clear on the wire,
+    /// `max_per_window` junk datagrams carrying it exhaust its budget,
+    /// and every real `msg1` from it is then dropped BEFORE
+    /// `read_message` for the rest of the window — so the victim's
+    /// `accept()` burns its whole budget and reports a bare timeout,
+    /// having never looked at a payload. The same shape occurs with no
+    /// attacker at all when the responder drains an initiator's own
+    /// stale retransmits on its way to that initiator's live `msg1`.
+    #[test]
+    fn handshake_pacer_reserve_survives_a_spoofed_per_source_exhaustion() {
+        use std::time::Duration;
+        let mut pacer = HandshakePacer::new(3, 8, 100, Duration::from_secs(60));
+
+        let victim: std::net::SocketAddr = "10.0.0.7:9000".parse().unwrap();
+
+        // Spoofer spends the victim's whole per-source budget.
+        for _ in 0..3 {
+            assert!(pacer.check_and_record(victim));
+        }
+
+        // The victim's real msg1 — and several retransmits — must
+        // still reach Noise, off the reserve.
+        for i in 0..8 {
+            assert!(
+                pacer.check_and_record(victim),
+                "a spoofed budget exhaustion must not ban the source (retransmit {i})"
+            );
+        }
+    }
+
+    /// The size-triggered GC must stay amortized. A sweep that
+    /// reclaims nothing leaves `entries` at the threshold, so without
+    /// a second step the very next datagram sweeps again — an O(n)
+    /// scan per packet for the whole flood, on a path every node's
+    /// `accept()` now reaches.
+    #[test]
+    fn handshake_pacer_gc_stays_amortized_under_a_fan_out_flood() {
+        use std::time::Duration;
+        let threshold = 64;
+        // A window long enough that the periodic trigger cannot fire:
+        // whatever sweeps happen are size-triggered, which is the
+        // path under test.
+        let mut pacer = HandshakePacer::new(5, 8, u32::MAX, Duration::from_secs(600))
+            .with_gc_size_threshold(threshold);
+
+        let datagrams = threshold * 8;
+        for i in 0..datagrams {
+            // A distinct source per datagram, all fresh — nothing is
+            // ever old enough for `retain` to reclaim.
+            let source: std::net::SocketAddr =
+                format!("10.2.{}.{}:9000", (i >> 8) & 0xff, i & 0xff)
+                    .parse()
+                    .unwrap();
+            pacer.check_and_record(source);
+        }
+
+        // One sweep per threshold-worth of entries is the amortized
+        // shape; one per datagram is the bug.
+        let sweeps = pacer.sweeps();
+        assert!(
+            sweeps <= (datagrams / threshold) as u64 + 1,
+            "GC must stay amortized, ran {sweeps} sweeps over {datagrams} datagrams",
+        );
+    }
+
+    /// The per-source budget alone cannot bound a flood that fans out
+    /// across spoofed addresses: every datagram then looks like a
+    /// fresh, in-budget source and buys a full Noise read. The
+    /// aggregate ceiling is the one that binds.
+    #[test]
+    fn handshake_pacer_caps_a_fan_out_flood_in_aggregate() {
+        use std::time::Duration;
+        let aggregate = 32;
+        let mut pacer = HandshakePacer::new(5, 8, aggregate, Duration::from_secs(60));
+
+        let mut admitted = 0;
+        for i in 0..4096u32 {
+            // A distinct source per datagram — each is in budget.
+            let source: std::net::SocketAddr =
+                format!("10.1.{}.{}:9000", (i >> 8) & 0xff, i & 0xff)
+                    .parse()
+                    .unwrap();
+            if pacer.check_and_record(source) {
+                admitted += 1;
+            }
+        }
+
+        assert_eq!(
+            admitted, aggregate,
+            "a fan-out flood must be capped by the aggregate ceiling, not by \
+             the per-source budget it walks around"
         );
     }
 }

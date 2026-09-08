@@ -555,6 +555,148 @@ use crate::event::{Batch, StoredEvent};
 /// Inbound event queues (same type as NetAdapter uses).
 type InboundQueues = Arc<DashMap<u16, SegQueue<StoredEvent>>>;
 
+/// Where a direct-handshake initiator waits for its `msg2` while some
+/// OTHER consumer of the node's shared socket is the one that actually
+/// reads it — the dispatch loop post-`start()`, or a sibling
+/// `accept()`/`connect()` pre-`start()`.
+///
+/// Not a `oneshot`, for the same reason the drain loops exist: a
+/// handshake-flagged datagram that turns out not to advance the
+/// initiator's state must not consume the registration, or a single
+/// spoofed packet ends the attempt.
+///
+/// Bounded, because forwarding from an unauthenticated source must not
+/// grow a queue — and **newest-wins** when it overflows. Candidates are
+/// indistinguishable until `read_message` has been tried on them, so
+/// the inbox cannot pick out the real `msg2`; but under a burst of
+/// stale or spoofed handshakes carrying the peer's address, the real
+/// reply is the LATER arrival. A queue that refuses on overflow drops
+/// exactly that one and the handshake times out, so this evicts the
+/// oldest candidate instead.
+struct DirectHandshakeInbox {
+    /// Queued candidates and the retirement flag under ONE lock.
+    ///
+    /// They cannot be separate: retirement has to preempt whatever is
+    /// already queued, not queue behind it. See [`Self::close`].
+    state: parking_lot::Mutex<DirectHandshakeInboxState>,
+    /// Wakes the waiter on deposit or close.
+    signal: Notify,
+}
+
+/// Interior of a [`DirectHandshakeInbox`].
+struct DirectHandshakeInboxState {
+    /// Candidate payloads, oldest first. Never longer than
+    /// [`DIRECT_HANDSHAKE_INBOX_DEPTH`].
+    queue: std::collections::VecDeque<Bytes>,
+    /// Set when a later `connect()` to the same address displaces this
+    /// registration, so the loser fails fast instead of waiting out its
+    /// deadline for datagrams that will now be delivered elsewhere.
+    closed: bool,
+}
+
+/// Depth of a [`DirectHandshakeInbox`]. A handshake expects exactly one
+/// useful reply; the slack is only there so a burst of junk from the
+/// peer's address cannot get between the initiator and the real `msg2`.
+const DIRECT_HANDSHAKE_INBOX_DEPTH: usize = 8;
+
+impl DirectHandshakeInbox {
+    fn new() -> Self {
+        Self {
+            state: parking_lot::Mutex::new(DirectHandshakeInboxState {
+                queue: std::collections::VecDeque::with_capacity(DIRECT_HANDSHAKE_INBOX_DEPTH),
+                closed: false,
+            }),
+            signal: Notify::new(),
+        }
+    }
+
+    /// Queue a candidate, evicting the oldest if the ring is full.
+    /// Returns `false` if this inbox has been retired, in which case
+    /// the caller still owns the datagram.
+    fn deposit(&self, payload: Bytes) -> bool {
+        {
+            let mut state = self.state.lock();
+            if state.closed {
+                return false;
+            }
+            if state.queue.len() >= DIRECT_HANDSHAKE_INBOX_DEPTH {
+                state.queue.pop_front();
+            }
+            state.queue.push_back(payload);
+        }
+        self.signal.notify_one();
+        true
+    }
+
+    /// Retire this inbox and discard what it is holding. A waiter on it
+    /// wakes and gets `None`.
+    ///
+    /// Discarding matters. Retirement means a later `connect()` to the
+    /// same address has taken the registration over, so the queued
+    /// candidates are now that connection's business — and one of them
+    /// may be a `msg2` the displaced handshake can still complete on.
+    /// Leaving them readable would let the loser finish and install a
+    /// session against the same peer, racing the install the winner is
+    /// about to perform.
+    fn close(&self) {
+        {
+            let mut state = self.state.lock();
+            state.closed = true;
+            state.queue.clear();
+        }
+        self.signal.notify_one();
+    }
+
+    /// Next candidate, waiting for one. `None` once retired.
+    async fn next(&self) -> Option<Bytes> {
+        loop {
+            // Retirement and dequeue under one lock, so a `close` can
+            // never be overtaken by a candidate queued before it. The
+            // block also keeps the `parking_lot` guard from straddling
+            // the await below — on edition 2021 an `if let` would hold
+            // it for the whole block.
+            let taken = {
+                let mut state = self.state.lock();
+                if state.closed {
+                    return None;
+                }
+                state.queue.pop_front()
+            };
+            if taken.is_some() {
+                return taken;
+            }
+            // `notify_one` stores a permit when there is no waiter, so
+            // a deposit landing between the check above and this await
+            // is not lost.
+            self.signal.notified().await;
+        }
+    }
+}
+
+/// Direct-handshake initiators indexed by the peer address whose
+/// datagrams they are waiting for.
+type DirectHandshakeRegistry = DashMap<SocketAddr, Arc<DirectHandshakeInbox>>;
+
+/// Hand a handshake payload read off the shared socket to the direct
+/// initiator waiting on `source`, if there is one. Returns whether the
+/// payload was claimed, so the caller knows not to also discard it.
+///
+/// Every consumer of the shared socket must go through this before
+/// dropping a handshake datagram it cannot use. A UDP datagram goes to
+/// exactly one waiter, so a consumer that discards someone else's
+/// `msg2` does not merely fail to help — it destroys the reply, and
+/// every retransmit of it too.
+fn forward_to_direct_initiator(
+    registry: &DirectHandshakeRegistry,
+    source: SocketAddr,
+    payload: Bytes,
+) -> bool {
+    let Some(entry) = registry.get(&source) else {
+        return false;
+    };
+    entry.deposit(payload)
+}
+
 /// One slot in [`MeshNode::fold_generations`]: a monotonic
 /// counter plus the wall-clock micros at which it was last
 /// bumped. The background GC loop evicts slots whose
@@ -1400,20 +1542,21 @@ struct DispatchCtx {
     /// matching routed msg2 arrives.
     pending_handshakes: Arc<DashMap<u64, PendingHandshake>>,
     /// In-flight DIRECT initiator handshakes, keyed by the peer's
-    /// socket address. The initiator registers a oneshot here
-    /// BEFORE sending msg1; the dispatch loop's direct-handshake
-    /// branch looks up the source, forwards the parsed payload
-    /// bytes through the oneshot, and removes the entry.
+    /// socket address. The initiator registers a
+    /// [`DirectHandshakeInbox`] here BEFORE sending msg1 and removes
+    /// it when the attempt ends; every consumer of the shared socket
+    /// runs [`forward_to_direct_initiator`] before dropping a
+    /// handshake datagram it cannot use.
     ///
-    /// Polling `socket_arc.recv_from` directly from
-    /// `try_handshake_initiator` would race the dispatch receive
-    /// loop spawned by `start()` — tokio dispatches each datagram
-    /// to exactly one waiter, so the handshake response could be
-    /// swallowed by either side. If no entry matches the source
-    /// (e.g., the
-    /// responder side or pre-start invocations), the dispatcher
-    /// falls through to its drop-direct-handshake behaviour.
-    pending_direct_initiators: Arc<DashMap<SocketAddr, oneshot::Sender<Bytes>>>,
+    /// Registration is NOT only for the post-`start()` path. Tokio
+    /// dispatches each datagram to exactly one waiter, so pre-`start()`
+    /// a sibling `accept()` or `connect()` polling the same socket can
+    /// win the race for this initiator's `msg2` — and a consumer that
+    /// discards it destroys the reply, and every retransmit of it.
+    /// If no entry matches the source (the responder side, or an
+    /// unsolicited handshake), the datagram falls through to the
+    /// caller's own drop behaviour.
+    pending_direct_initiators: Arc<DirectHandshakeRegistry>,
     /// Our Noise static keypair — needed to construct responder state
     /// when a routed msg1 arrives for us.
     static_keypair: StaticKeypair,
@@ -8709,10 +8852,40 @@ pub struct MeshNode {
     pending_handshakes: Arc<DashMap<u64, PendingHandshake>>,
     /// In-flight direct-handshake initiators, keyed by the peer's
     /// `SocketAddr`. Populated by `try_handshake_initiator` BEFORE
-    /// sending msg1; consumed by the dispatch loop when a matching
-    /// direct handshake response arrives. See the matching field
-    /// on `DispatchCtx` for context.
-    pending_direct_initiators: Arc<DashMap<SocketAddr, oneshot::Sender<Bytes>>>,
+    /// sending msg1, on BOTH sides of the `start()` boundary; fed by
+    /// whichever consumer of the shared socket reads the reply — the
+    /// dispatch loop, a sibling `connect()`, or the `accept()`
+    /// responder's drain. See the matching field on `DispatchCtx` for
+    /// context.
+    pending_direct_initiators: Arc<DirectHandshakeRegistry>,
+    /// Handshake datagrams the direct responder read and threw away
+    /// because they did not decrypt under the pairing being accepted
+    /// — another pairing's retransmitted `msg1`, junk, a key
+    /// mismatch. Surfaced by
+    /// [`MeshNode::responder_handshakes_drained`] so the drain is
+    /// observable rather than inferred from a missing failure.
+    responder_handshakes_drained: AtomicU64,
+    /// Handshake datagrams the direct responder dropped BEFORE any
+    /// Noise work because their source had exhausted the per-source
+    /// pacing budget. Surfaced by
+    /// [`MeshNode::responder_handshakes_paced`].
+    ///
+    /// Both counters are plain atomics, not `Arc`s: unlike
+    /// `pending_direct_initiators` (cloned into `DispatchCtx`) they
+    /// are only ever reached through `&self`, and the node already
+    /// lives behind an `Arc`.
+    responder_handshakes_paced: AtomicU64,
+    /// Rate limiter shared by every `accept()` on this node, matching
+    /// `NetAdapter`'s process-lifetime pacer.
+    ///
+    /// Node-scoped rather than per-`accept()` on purpose: a
+    /// per-`accept()` pacer hands a flooder a clean budget on the
+    /// node's very next `accept()`, so the throttle never accumulates
+    /// evidence across the accept sequence a node performs at
+    /// topology setup — and its aggregate ceiling, which is the only
+    /// bound on a flood that fans out across spoofed addresses, would
+    /// reset with it.
+    handshake_pacer: parking_lot::Mutex<super::HandshakePacer>,
     /// Proximity graph — topology awareness from pingwave propagation
     proximity_graph: Arc<ProximityGraph>,
     /// Per-peer serialization of the whole install transition —
@@ -10253,8 +10426,7 @@ impl MeshNode {
         });
 
         let pending_handshakes: Arc<DashMap<u64, PendingHandshake>> = Arc::new(DashMap::new());
-        let pending_direct_initiators: Arc<DashMap<SocketAddr, oneshot::Sender<Bytes>>> =
-            Arc::new(DashMap::new());
+        let pending_direct_initiators: Arc<DirectHandshakeRegistry> = Arc::new(DashMap::new());
 
         // Hoist the subnet knobs before `config` is moved into the
         // struct literal; the publish + subscribe paths read these
@@ -10431,6 +10603,9 @@ impl MeshNode {
             emission_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             pending_handshakes,
             pending_direct_initiators,
+            responder_handshakes_drained: AtomicU64::new(0),
+            responder_handshakes_paced: AtomicU64::new(0),
+            handshake_pacer: parking_lot::Mutex::new(super::HandshakePacer::with_defaults()),
             proximity_graph,
             peer_transitions: PeerTransitions::new(),
             reroute_policy,
@@ -15570,6 +15745,34 @@ impl MeshNode {
         &self.reroute_policy
     }
 
+    /// Handshake datagrams [`Self::accept`]'s responder read and
+    /// discarded because they did not decrypt under the pairing it
+    /// was accepting — another pairing's retransmitted `msg1`, junk
+    /// from a sprayer, or a genuine key mismatch.
+    ///
+    /// Nonzero is normal on a busy node: the initiator retransmits by
+    /// design and `accept()` is one-shot, so late copies land on the
+    /// next accept.
+    pub fn responder_handshakes_drained(&self) -> u64 {
+        self.responder_handshakes_drained.load(Ordering::Relaxed)
+    }
+
+    /// Handshake datagrams [`Self::accept`]'s responder dropped
+    /// before doing any Noise work, because the source had spent both
+    /// its own budget ([`Self::RESPONDER_HANDSHAKE_BURST`] per
+    /// [`Self::RESPONDER_HANDSHAKE_PACE_WINDOW`]) and the shared
+    /// reserve that keeps an exhausted per-source budget from being a
+    /// ban — or because the node-wide aggregate ceiling was spent.
+    ///
+    /// Counted per node, not per `accept()`, so the number accumulates
+    /// across a topology-setup sequence.
+    ///
+    /// Nonzero means something is emitting handshakes faster than any
+    /// legitimate initiator does — the signature of a flood.
+    pub fn responder_handshakes_paced(&self) -> u64 {
+        self.responder_handshakes_paced.load(Ordering::Relaxed)
+    }
+
     /// Number of connected peers.
     pub fn peer_count(&self) -> usize {
         self.peers.len()
@@ -15979,6 +16182,14 @@ impl MeshNode {
                     .into(),
             ));
         }
+        // Note on duration: a peer whose PSK or static key does not
+        // match cannot be told apart from another pairing's stale
+        // `msg1`, so this spends the full
+        // `handshake_retries × handshake_timeout` budget rather than
+        // failing on the first bad datagram — and holds
+        // `accept_in_flight` (so `start()` refuses) for that whole
+        // time. See `try_handshake_responder`'s doc for why that is
+        // the right trade and what to tune.
         let (keys, peer_addr) = self.handshake_responder(peer_node_id).await?;
 
         // The responder side of a handshake is the SAME lifecycle
@@ -18396,9 +18607,7 @@ impl MeshNode {
             // loop — tokio routes a UDP datagram to exactly one
             // waiter — and the response could be swallowed by
             // either consumer.
-            if let Some((_, tx)) = ctx.pending_direct_initiators.remove(&source) {
-                let _ = tx.send(parsed.payload);
-            }
+            forward_to_direct_initiator(&ctx.pending_direct_initiators, source, parsed.payload);
             return;
         }
 
@@ -33793,86 +34002,140 @@ impl MeshNode {
     ) -> Result<(), AdapterError> {
         let timeout = self.config.handshake_timeout;
 
-        // Polling `socket_arc.recv_from` directly would race
-        // `spawn_receive_loop`'s consumer post-`start()` (tokio
-        // dispatches a UDP datagram to exactly one waiter), so:
-        //   - Pre-`start()`: use `recv_from`; the dispatcher isn't
-        //     running, so there's no race. This preserves the
-        //     existing init-time ordering where `connect()` is
-        //     called before `start()`.
-        //   - Post-`start()`: register an oneshot in
-        //     `pending_direct_initiators`, then send msg1, then
-        //     await the oneshot. The dispatcher's direct-handshake
-        //     branch forwards the parsed payload bytes through.
-        // Concurrent direct connects on the same node also work
+        // Tokio dispatches a UDP datagram to exactly one waiter, so
+        // whoever else is reading this socket can take our `msg2`.
+        // Both branches below therefore register an inbox in
+        // `pending_direct_initiators` under our `peer_addr` before
+        // sending msg1, and every other consumer forwards what it
+        // cannot use. They differ only in who else is reading:
+        //   - Post-`start()`: the dispatch loop owns the socket, so
+        //     wait on the inbox alone.
+        //   - Pre-`start()`: no dispatcher, so read the socket
+        //     ourselves AND watch the inbox, because a sibling
+        //     `accept()` or `connect()` on this node polls the same
+        //     socket. This preserves the init-time ordering where
+        //     `connect()` is called before `start()`.
+        // Concurrent direct connects on the same node work either way
         // — each registers under its own peer_addr.
         if self.started.load(Ordering::Acquire) {
-            let (tx, rx) = oneshot::channel::<Bytes>();
             // Register BEFORE sending msg1 so we can't miss a
             // fast responder that replies before we'd otherwise
             // be ready to receive. `insert` replaces any prior
-            // entry for the same `peer_addr` — last writer wins.
-            self.pending_direct_initiators.insert(peer_addr, tx);
+            // entry for the same `peer_addr` — last writer wins, and
+            // the loser is told so it fails fast rather than waiting
+            // out a deadline for datagrams now delivered elsewhere.
+            let inbox = Arc::new(DirectHandshakeInbox::new());
+            if let Some(displaced) = self
+                .pending_direct_initiators
+                .insert(peer_addr, inbox.clone())
+            {
+                displaced.close();
+            }
 
             if let Err(e) = self.socket.send_to(packet, peer_addr).await {
-                self.pending_direct_initiators.remove(&peer_addr);
+                self.deregister_direct_initiator(peer_addr, &inbox);
                 return Err(AdapterError::Connection(format!("send failed: {}", e)));
             }
 
-            let payload_bytes = match tokio::time::timeout(timeout, rx).await {
-                Ok(Ok(payload)) => payload,
-                Ok(Err(_)) => {
-                    // Sender dropped — the dispatcher removed our
-                    // entry without forwarding. Should not happen
-                    // unless start() shut down; treat as timeout.
-                    self.pending_direct_initiators.remove(&peer_addr);
-                    return Err(AdapterError::Connection("handshake channel dropped".into()));
-                }
-                Err(_) => {
-                    // Timeout — the responder never replied or its
-                    // reply arrived for a different source. Clean up.
-                    self.pending_direct_initiators.remove(&peer_addr);
-                    return Err(AdapterError::Connection("handshake timeout".into()));
-                }
-            };
-
-            handshake
-                .read_message(&payload_bytes)
-                .map_err(|e| AdapterError::Connection(format!("read_message failed: {}", e)))?;
-            Ok(())
-        } else {
-            // Pre-start fallback: dispatcher is not running, so
-            // there's nothing to forward through the registry.
-            // Poll the socket directly — no race exists yet.
-            let socket_arc = self.socket.socket_arc();
-            self.socket
-                .send_to(packet, peer_addr)
-                .await
-                .map_err(|e| AdapterError::Connection(format!("send failed: {}", e)))?;
-
-            tokio::time::timeout(timeout, async {
+            let outcome = tokio::time::timeout(timeout, async {
                 loop {
-                    let mut recv_buf = bytes::BytesMut::with_capacity(protocol::MAX_PACKET_SIZE);
-                    recv_buf.resize(protocol::MAX_PACKET_SIZE, 0);
-
-                    let (n, source) = socket_arc
-                        .recv_from(&mut recv_buf)
-                        .await
-                        .map_err(|e| AdapterError::Connection(format!("recv failed: {}", e)))?;
-
-                    if source != peer_addr {
-                        continue;
-                    }
-
-                    recv_buf.truncate(n);
-                    let data = recv_buf.freeze();
-
-                    let Some(p) = ParsedPacket::parse(data, source) else {
-                        continue;
+                    let Some(payload) = inbox.next().await else {
+                        // Retired: a concurrent `connect()` to the same
+                        // address took over the registration.
+                        return Err(AdapterError::Connection(
+                            "handshake registration displaced".into(),
+                        ));
                     };
-                    if !p.header.flags.is_handshake() {
-                        continue;
+                    // Same rule as the pre-start loop below: a
+                    // forwarded datagram that does not advance our
+                    // state is discarded, NOT fatal. A `oneshot` here
+                    // made one spoofed handshake from the peer's
+                    // address enough to end the attempt.
+                    match handshake.read_message(&payload) {
+                        Ok(_) => return Ok(()),
+                        Err(e) => tracing::debug!(
+                            %peer_addr,
+                            error = %e,
+                            "discarding a direct handshake reply that does not \
+                             advance our state"
+                        ),
                     }
+                }
+            })
+            .await;
+
+            self.deregister_direct_initiator(peer_addr, &inbox);
+            match outcome {
+                Ok(inner) => inner,
+                // The responder never replied, or its reply arrived
+                // for a different source.
+                Err(_) => Err(AdapterError::Connection("handshake timeout".into())),
+            }
+        } else {
+            // Pre-`start()` the dispatcher is not running, so this
+            // loop reads the socket itself. It is NOT the only reader:
+            // a sibling `accept()` or `connect()` on the same node
+            // polls the same socket, and tokio hands each datagram to
+            // exactly one waiter. So register an inbox as well —
+            // whichever consumer wins the race forwards what it cannot
+            // use to whoever can, instead of destroying it.
+            let inbox = Arc::new(DirectHandshakeInbox::new());
+            if let Some(displaced) = self
+                .pending_direct_initiators
+                .insert(peer_addr, inbox.clone())
+            {
+                displaced.close();
+            }
+
+            let socket_arc = self.socket.socket_arc();
+            if let Err(e) = self.socket.send_to(packet, peer_addr).await {
+                self.deregister_direct_initiator(peer_addr, &inbox);
+                return Err(AdapterError::Connection(format!("send failed: {}", e)));
+            }
+
+            let outcome = tokio::time::timeout(timeout, async {
+                // One buffer for the whole wait — see the matching
+                // note in `try_handshake_responder`.
+                let mut recv_buf = vec![0u8; protocol::MAX_PACKET_SIZE];
+                loop {
+                    // Both arms are cancel-safe, so losing the race
+                    // costs nothing.
+                    let payload = tokio::select! {
+                        forwarded = inbox.next() => match forwarded {
+                            Some(payload) => payload,
+                            None => {
+                                return Err(AdapterError::Connection(
+                                    "handshake registration displaced".into(),
+                                ))
+                            }
+                        },
+                        read = socket_arc.recv_from(&mut recv_buf) => {
+                            let (n, source) = read.map_err(|e| {
+                                AdapterError::Connection(format!("recv failed: {}", e))
+                            })?;
+                            let data = Bytes::copy_from_slice(&recv_buf[..n]);
+
+                            let Some(p) = ParsedPacket::parse(data, source) else {
+                                continue;
+                            };
+                            if !p.header.flags.is_handshake() {
+                                continue;
+                            }
+                            if source != peer_addr {
+                                // Someone else's handshake reply. Hand
+                                // it over rather than drop it: this is
+                                // the only copy, and so is every
+                                // retransmit we would swallow next.
+                                forward_to_direct_initiator(
+                                    &self.pending_direct_initiators,
+                                    source,
+                                    p.payload,
+                                );
+                                continue;
+                            }
+                            p.payload
+                        }
+                    };
 
                     // A handshake-flagged datagram that does not
                     // advance the state is discarded, NOT fatal: keep
@@ -33883,11 +34146,11 @@ impl MeshNode {
                     // costs nothing — whereas failing the attempt on
                     // one would hand an off-path sender a single
                     // garbage datagram as a denial primitive.
-                    match handshake.read_message(&p.payload) {
+                    match handshake.read_message(&payload) {
                         Ok(_) => return Ok::<(), AdapterError>(()),
                         Err(e) => {
                             tracing::debug!(
-                                %source,
+                                %peer_addr,
                                 error = %e,
                                 "discarding a direct handshake reply that does not \
                                  advance our state"
@@ -33896,19 +34159,67 @@ impl MeshNode {
                     }
                 }
             })
-            .await
-            .map_err(|_| AdapterError::Connection("handshake timeout".into()))?
+            .await;
+
+            self.deregister_direct_initiator(peer_addr, &inbox);
+            match outcome {
+                Ok(inner) => inner,
+                Err(_) => Err(AdapterError::Connection("handshake timeout".into())),
+            }
         }
     }
+
+    /// Remove OUR direct-handshake registration, and only ours.
+    ///
+    /// A later `connect()` to the same address replaces the entry —
+    /// last writer wins — so an unconditional `remove` here would take
+    /// that live registration down with us and strand it.
+    fn deregister_direct_initiator(
+        &self,
+        peer_addr: SocketAddr,
+        inbox: &Arc<DirectHandshakeInbox>,
+    ) {
+        self.pending_direct_initiators
+            .remove_if(&peer_addr, |_, registered| Arc::ptr_eq(registered, inbox));
+    }
+
+    /// Handshake datagrams one source may buy Noise work with per
+    /// [`Self::RESPONDER_HANDSHAKE_PACE_WINDOW`] before it starts
+    /// drawing on the shared over-budget reserve — past which
+    /// [`Self::responder_handshakes_paced`] starts counting.
+    ///
+    /// Re-exported from the pacer rather than restated, so this,
+    /// `NetAdapter`'s responder, and the tests that witness them all
+    /// read one definition.
+    pub const RESPONDER_HANDSHAKE_BURST: u32 = super::HandshakePacer::DEFAULT_BURST;
+    /// Window for [`Self::RESPONDER_HANDSHAKE_BURST`].
+    pub const RESPONDER_HANDSHAKE_PACE_WINDOW: Duration = super::HandshakePacer::DEFAULT_WINDOW;
 
     async fn handshake_responder(
         &self,
         peer_node_id: u64,
     ) -> Result<(SessionKeys, SocketAddr), AdapterError> {
+        // Rejection state for the WHOLE accept, not for one attempt.
+        // The case that matters is a genuine key mismatch whose `msg1`
+        // lands during an early attempt: the initiator's budget is not
+        // the responder's, so its retransmits can stop while the
+        // responder still has attempts left. Per-attempt state throws
+        // the diagnosis away, and the final attempt — which saw
+        // nothing at all on the wire — reports a bare
+        // `handshake timeout` for what is really a misconfiguration.
+        let mut last_decrypt_reject: Option<String> = None;
+        let mut last_paced_source: Option<SocketAddr> = None;
         let mut attempt = 0;
         loop {
             attempt += 1;
-            match self.try_handshake_responder(peer_node_id).await {
+            match self
+                .try_handshake_responder(
+                    peer_node_id,
+                    &mut last_decrypt_reject,
+                    &mut last_paced_source,
+                )
+                .await
+            {
                 Ok(result) => return Ok(result),
                 Err(e) if attempt < self.config.handshake_retries => {
                     tracing::warn!(attempt, error = %e, "mesh accept failed, retrying");
@@ -33919,40 +34230,112 @@ impl MeshNode {
         }
     }
 
+    /// ONE attempt: wait for the initiator's `msg1`, answer it with
+    /// `msg2`, and return the derived session keys.
+    ///
+    /// # Why a foreign `msg1` is skipped, not failed
+    ///
+    /// [`Self::handshake_initiator`] retransmits byte-identical copies
+    /// of `msg1` when no reply arrives in time, and a responder that
+    /// was merely slow to be scheduled answers the FIRST copy — the
+    /// remaining copies stay queued on its socket unread, because
+    /// `accept()` is one-shot and returns after that first success.
+    /// The node's NEXT `accept()` reads them. They carry the previous
+    /// pairing's prologue, so `read_message` rejects them.
+    ///
+    /// Counting that as an attempt failure was a self-inflicted denial
+    /// of service: N stale copies burned N of the few
+    /// `handshake_retries` in ~N×100 ms, `accept()` returned `Err`
+    /// while the real initiator was still retransmitting into a node
+    /// with no responder left, and the initiator reported
+    /// `Connection("handshake timeout")` only after its whole budget
+    /// elapsed — seen in CI as a `traversal_observability`
+    /// topology-setup flake on a loaded (llvm-cov) runner. Draining
+    /// non-matching handshake datagrams inside the deadline instead
+    /// means only a genuine absence of `msg1` ends the attempt. It
+    /// also removes a cheap off-path DoS: a sprayer of junk handshake
+    /// packets can now delay an `accept()`, not kill it — and the
+    /// node's pacer caps how much Noise work the traffic can buy per
+    /// second, in aggregate as well as per source, so "delay" cannot
+    /// become "starve".
+    ///
+    /// # Diagnosing a genuine key mismatch
+    ///
+    /// A stale foreign `msg1` and a real initiator with the wrong PSK
+    /// or peer key are indistinguishable here — both are handshake
+    /// bytes that don't decrypt — so draining necessarily costs the
+    /// old fail-fast `read_message failed` error. The cause is not
+    /// lost: the last rejection is carried into the timeout error, so
+    /// a misconfigured pair reports
+    /// `handshake timeout (last handshake datagram from … did not
+    /// decrypt: …)` instead of a bare timeout, and the retry loop
+    /// logs it at `warn` on every attempt. That state is owned by
+    /// [`Self::handshake_responder`] and spans the whole `accept()`:
+    /// the initiator's budget is not the responder's, so a mismatched
+    /// peer can fall silent while the responder still has attempts
+    /// left, and per-attempt state would drop the diagnosis on the
+    /// floor in exactly that case. Per-datagram logging stays at
+    /// `debug` on purpose: at `warn` a junk sprayer would own the
+    /// operator's log.
+    ///
+    /// # What draining costs, and why that is the right trade
+    ///
+    /// A mismatched pair no longer fails fast. Pre-drain, `accept()`
+    /// returned `read_message failed` the instant the wrong `msg1`
+    /// arrived; now it spends the whole
+    /// `handshake_retries × handshake_timeout` budget, because there
+    /// is nothing at this layer that distinguishes "wrong key" from
+    /// "another pairing's stale retransmit" — and failing on the
+    /// latter is the bug this exists to fix.
+    ///
+    /// That is symmetry restored, not cost added: the INITIATOR always
+    /// spent its full budget on a mismatch, so the old fast responder
+    /// failure did not shorten anything end to end. It only made one
+    /// side report a useful error and the other a bare timeout.
+    ///
+    /// The operational consequence is real and worth knowing. The
+    /// budget is wall-clock (~15 s at the defaults), `start()` refuses
+    /// while an `accept()` is in flight (see [`Self::start`]), and
+    /// topology setup usually accepts peers in sequence — so N
+    /// misconfigured peers delay a node's startup by N budgets. Tune
+    /// `handshake_retries` / `handshake_timeout` if that matters. The
+    /// signal for it is the error text naming the decrypt failure,
+    /// plus a climbing
+    /// [`Self::responder_handshakes_drained`]; the cure is fixing the
+    /// key, not widening the budget.
+    ///
+    /// `last_decrypt_reject` and `last_paced_source` are owned by
+    /// [`Self::handshake_responder`] and carry across every attempt of
+    /// one `accept()` — see the comment there.
     async fn try_handshake_responder(
         &self,
         peer_node_id: u64,
+        last_decrypt_reject: &mut Option<String>,
+        last_paced_source: &mut Option<SocketAddr>,
     ) -> Result<(SessionKeys, SocketAddr), AdapterError> {
         let timeout = self.config.handshake_timeout;
         let socket_arc = self.socket.socket_arc();
 
-        // Wait for initiator's handshake
-        let (parsed, source) = tokio::time::timeout(timeout, async {
-            loop {
-                let mut recv_buf = bytes::BytesMut::with_capacity(protocol::MAX_PACKET_SIZE);
-                recv_buf.resize(protocol::MAX_PACKET_SIZE, 0);
-
-                let (n, source) = socket_arc
-                    .recv_from(&mut recv_buf)
-                    .await
-                    .map_err(|e| AdapterError::Connection(format!("recv failed: {}", e)))?;
-
-                recv_buf.truncate(n);
-                let data = recv_buf.freeze();
-
-                if let Some(p) = ParsedPacket::parse(data, source) {
-                    if p.header.flags.is_handshake() {
-                        return Ok::<_, AdapterError>((p, source));
-                    }
-                }
-            }
-        })
-        .await
-        .map_err(|_| AdapterError::Connection("handshake timeout".into()))??;
-
         // Direct responder: mirror the initiator's `routing_id`-based
         // prologue so direct and routed share one convention.
         let prologue = handshake_prologue(routing_id(peer_node_id), routing_id(self.node_id));
+
+        // ONE responder for the whole wait, exactly as the initiator
+        // loop above reuses one `NoiseHandshake` across rejected
+        // replies. Snow checkpoints the symmetric state before
+        // `read_message` and restores it on failure, and leaves
+        // `pattern_position` and `my_turn` untouched, so a rejected
+        // datagram cannot advance or corrupt the state; the remote
+        // ephemeral a failed read scratches into place is overwritten
+        // by the next read's `e` token before anything reads it.
+        // Rebuilding per candidate would additionally re-parse
+        // `NOISE_PATTERN` and re-derive the static public key on every
+        // junk datagram.
+        //
+        // This does NOT make the pacer redundant: the Diffie-Hellman
+        // is inside `read_message`, so every admitted candidate still
+        // costs one, reused state or not. The pacer is what bounds how
+        // many of those a flood can buy.
         let mut handshake = NoiseHandshake::responder_with_prologue(
             &self.config.psk,
             &self.static_keypair,
@@ -33960,9 +34343,112 @@ impl MeshNode {
         )
         .map_err(|e| AdapterError::Fatal(format!("handshake init failed: {}", e)))?;
 
-        handshake
-            .read_message(&parsed.payload)
-            .map_err(|e| AdapterError::Connection(format!("read_message failed: {}", e)))?;
+        // One receive buffer for the whole wait, not one per datagram.
+        // The loop now runs for the full deadline under any handshake
+        // stream (that is the point of draining), so a per-iteration
+        // `BytesMut::with_capacity(MAX_PACKET_SIZE)` + `resize(.., 0)`
+        // would allocate AND zero 8 KiB per junk datagram — work that
+        // happens before the pacer and so is not bounded by it. Copy
+        // out only the `n` bytes that actually arrived instead; a
+        // `msg1` is ~64 of them.
+        let mut recv_buf = vec![0u8; protocol::MAX_PACKET_SIZE];
+
+        // Wait for the initiator's handshake. `read_message` runs
+        // INSIDE the wait (see the doc above): a datagram that isn't
+        // this pairing's `msg1` costs one loop iteration, not one
+        // attempt.
+        let waited = tokio::time::timeout(timeout, async {
+            loop {
+                let (n, source) = socket_arc
+                    .recv_from(&mut recv_buf)
+                    .await
+                    .map_err(|e| AdapterError::Connection(format!("recv failed: {}", e)))?;
+
+                let data = Bytes::copy_from_slice(&recv_buf[..n]);
+
+                let Some(p) = ParsedPacket::parse(data, source) else {
+                    continue;
+                };
+                if !p.header.flags.is_handshake() {
+                    continue;
+                }
+
+                // Someone else's `msg2` can land here: pre-`start()`
+                // a sibling `connect()` polls this same socket, and
+                // tokio gives each datagram to exactly one waiter.
+                // Hand it over before treating it as ours. Draining it
+                // instead would not merely fail to help — it destroys
+                // that reply and, since this loop no longer backs off
+                // between datagrams, every retransmit of it too,
+                // leaving the sibling to time out against a peer that
+                // answered every single time.
+                if forward_to_direct_initiator(
+                    &self.pending_direct_initiators,
+                    source,
+                    p.payload.clone(),
+                ) {
+                    continue;
+                }
+
+                // Pace BEFORE the Noise read: the point is to bound
+                // the responder's cryptographic work, and a rejected
+                // source must not buy a Diffie-Hellman.
+                if !self.handshake_pacer.lock().check_and_record(source) {
+                    self.responder_handshakes_paced
+                        .fetch_add(1, Ordering::Relaxed);
+                    // A paced drop is a diagnosis too: an accept that
+                    // only ever saw paced datagrams timed out without
+                    // once looking at a payload, and no bare
+                    // "handshake timeout" would tell an operator that.
+                    *last_paced_source = Some(source);
+                    tracing::debug!(
+                        %source,
+                        "handshake responder: dropping packet from rate-limited source"
+                    );
+                    continue;
+                }
+
+                if let Err(e) = handshake.read_message(&p.payload) {
+                    self.responder_handshakes_drained
+                        .fetch_add(1, Ordering::Relaxed);
+                    *last_decrypt_reject = Some(format!("{source}: {e}"));
+                    tracing::debug!(
+                        %source,
+                        error = %e,
+                        "skipping handshake datagram that is not this pairing's msg1"
+                    );
+                    continue;
+                }
+
+                return Ok::<_, AdapterError>(source);
+            }
+        })
+        .await;
+
+        let source = match waited {
+            Ok(inner) => inner?,
+            Err(_) => {
+                // A decrypt failure outranks a paced drop: it is the
+                // one that names a misconfiguration.
+                return Err(AdapterError::Connection(
+                    match (last_decrypt_reject.as_deref(), *last_paced_source) {
+                        (Some(reject), _) => format!(
+                            "handshake timeout (last handshake datagram from {reject} \
+                             did not decrypt under this pairing's prologue — wrong PSK, \
+                             wrong peer key, or another pairing's msg1)"
+                        ),
+                        (None, Some(paced)) => format!(
+                            "handshake timeout (across this accept every handshake \
+                             datagram the responder saw was dropped before Noise by its \
+                             pacing budget, most recently one from {paced} — under \
+                             handshake traffic this heavy the peer's msg1 may never \
+                             have been read)"
+                        ),
+                        (None, None) => "handshake timeout".into(),
+                    },
+                ));
+            }
+        };
 
         let msg2 = handshake
             .write_message(&[])
@@ -39045,6 +39531,105 @@ mod committed_flush_stall_tests {
             Err(e) => panic!("under deadline must continue (Ok), got {e}"),
         }
         assert_eq!(delay, Duration::from_millis(10), "backoff must double");
+    }
+}
+
+#[cfg(test)]
+mod direct_handshake_inbox_tests {
+    use super::{DirectHandshakeInbox, DIRECT_HANDSHAKE_INBOX_DEPTH};
+    use bytes::Bytes;
+
+    fn candidate(tag: u8) -> Bytes {
+        Bytes::from(vec![tag; 4])
+    }
+
+    /// The inbox overflows towards the OLDEST candidate, not the newest.
+    ///
+    /// Candidates are indistinguishable until `read_message` has been
+    /// tried on them, so the inbox cannot pick out the real `msg2` —
+    /// but under a burst of stale or spoofed handshakes carrying the
+    /// peer's address, the real reply is the LATER arrival. A queue
+    /// that refuses on overflow drops exactly that one, and the
+    /// initiator times out having never seen the reply its peer sent.
+    #[tokio::test]
+    async fn a_full_inbox_evicts_the_oldest_candidate_not_the_newest() {
+        let inbox = DirectHandshakeInbox::new();
+
+        // A burst that fills the ring, then the real reply behind it.
+        for i in 0..DIRECT_HANDSHAKE_INBOX_DEPTH {
+            assert!(inbox.deposit(candidate(i as u8)));
+        }
+        let reply = candidate(0xff);
+        assert!(inbox.deposit(reply.clone()));
+
+        let mut seen = Vec::new();
+        for _ in 0..DIRECT_HANDSHAKE_INBOX_DEPTH {
+            seen.push(inbox.next().await.expect("inbox is not retired"));
+        }
+
+        assert!(
+            seen.contains(&reply),
+            "the newest candidate must survive a preceding burst",
+        );
+        assert!(
+            !seen.contains(&candidate(0)),
+            "the oldest candidate is the one that must be evicted",
+        );
+    }
+
+    /// A retired registration must not swallow datagrams: a later
+    /// `connect()` to the same address has taken over, and anything
+    /// deposited here would never be read.
+    #[tokio::test]
+    async fn a_retired_inbox_refuses_deposits_and_wakes_its_waiter() {
+        let inbox = DirectHandshakeInbox::new();
+        inbox.close();
+
+        assert!(
+            !inbox.deposit(candidate(1)),
+            "a retired inbox must leave the datagram with its caller",
+        );
+        assert!(
+            inbox.next().await.is_none(),
+            "a waiter on a retired inbox must fail fast, not wait out its deadline",
+        );
+    }
+
+    /// Retirement must preempt what is already queued, not trail it.
+    ///
+    /// A displaced registration that can still hand out candidates can
+    /// still complete its handshake — off datagrams that now belong to
+    /// the `connect()` which replaced it — and then install a session
+    /// against the same peer, racing the winner's install. Whether the
+    /// leftovers happen to contain a usable `msg2` is not something
+    /// this layer can see, so the only safe answer is to drop them.
+    #[tokio::test]
+    async fn retirement_discards_candidates_queued_before_it() {
+        let inbox = DirectHandshakeInbox::new();
+        assert!(inbox.deposit(candidate(1)));
+        assert!(inbox.deposit(candidate(2)));
+
+        inbox.close();
+
+        assert!(
+            inbox.next().await.is_none(),
+            "a displaced registration must not keep serving the candidates \
+             it was holding when it lost",
+        );
+    }
+
+    /// Deposits made before the waiter arrives are still delivered.
+    #[tokio::test]
+    async fn a_deposit_that_precedes_the_waiter_is_not_lost() {
+        let inbox = std::sync::Arc::new(DirectHandshakeInbox::new());
+        assert!(inbox.deposit(candidate(7)));
+
+        let waiter = inbox.clone();
+        let got = tokio::spawn(async move { waiter.next().await })
+            .await
+            .expect("waiter task panicked");
+
+        assert_eq!(got, Some(candidate(7)));
     }
 }
 
