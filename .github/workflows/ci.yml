@@ -2136,7 +2136,10 @@ jobs:
             a_capacity_refused_holder_is_recovered_by_a_later_call
             a_holder_that_dies_after_convergence_is_reacquired
             unknown_services_strand_no_sensing_capacity
-            overlapping_clones_converge_one_change_coherently
+            contending_clones_produce_exactly_one_convergence
+            within_attempt_narrowing_is_not_certified_as_agreement
+            within_attempt_widening_is_not_certified_as_agreement
+            a_capped_population_agrees_with_a_wider_expectation
             live_evidence_stops_vouching_at_a_later_instant
             withdrawn_readiness_reads_unknown_and_plans_deterministically
             an_all_not_ready_population_still_calls_in_the_deterministic_order
@@ -2159,8 +2162,8 @@ jobs:
               || { printf '%s\n' "$single"; echo "::error::$required did not run and pass as exactly one test"; exit 1; }
             pinned=$((pinned + 1))
           done
-          [ "$listed" -ge 17 ] \
-            || { echo "::error::expected at least 17 production witnesses, saw $listed"; exit 1; }
+          [ "$listed" -ge 20 ] \
+            || { echo "::error::expected at least 20 production witnesses, saw $listed"; exit 1; }
           echo "organization exact production call edge: $listed listed, $pinned pinned by name, all green"
 
       # The DARK-BOUNDARY fact for the production path: the SDK library builds
@@ -2174,13 +2177,32 @@ jobs:
       # Named because a `--lib` run would otherwise absorb a rename silently.
       - name: Sensing — organization exact planning unit witnesses (OA-6)
         if: ${{ !cancelled() }}
-        run: >
-          cargo nextest run --no-fail-fast --no-tests=fail --retries 0
-          --features "net cortex fixtures" --lib
-          -E 'test(=org::tests_call::authority_movement_inside_sensed_planning_is_still_fenced)
-            + test(=org::tests_call::the_sensed_adapter_never_ranks_or_prunes_a_granted_candidate)
-            + test(=org::tests_call::selection_and_its_errors_follow_the_reordered_list)
-            + test(=org::tests_call::the_reconciliation_trigger_certifies_the_installed_demand)'
+        run: |
+          set -uo pipefail
+          # Pinned INDIVIDUALLY: a union filterset is green as long as SOMETHING
+          # in it ran, so it cannot establish that each name executed.
+          for required in \
+            authority_movement_inside_sensed_planning_is_still_fenced \
+            the_sensed_adapter_never_ranks_or_prunes_a_granted_candidate \
+            selection_and_its_errors_follow_the_reordered_list \
+            the_reconciliation_trigger_certifies_the_installed_demand
+          do
+            out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                    --retries 0 --features "net cortex fixtures" --lib \
+                    -E "test(=org::tests_call::$required)" 2>&1) \
+              || { printf '%s\n' "$out"; echo "::error::$required did not run and pass"; exit 1; }
+            printf '%s\n' "$out" | grep -qE '1 test run: 1 passed' \
+              || { printf '%s\n' "$out"; echo "::error::$required did not run as exactly one test"; exit 1; }
+          done
+          echo "organization exact planning units: 4 pinned by name, each executed"
+
+      # The SDK's `fixtures` feature must mean the same thing STANDALONE as it
+      # does inside a workspace dev build: it forwards core's own `fixtures`
+      # seam, and a dev-dependency used to hide the missing forwarding. This is
+      # the configuration the Go FFI jobs build, and the one that broke.
+      - name: Sensing — the fixtures observers build standalone (OA-6)
+        if: ${{ !cancelled() }}
+        run: cargo check --lib --features "net cortex fixtures"
 
       - name: Sensing — the production call path needs no fixtures seam (OA-6)
         if: ${{ !cancelled() }}

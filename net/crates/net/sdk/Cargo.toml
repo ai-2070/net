@@ -168,7 +168,16 @@ cortex = ["net/netdb", "net/redex-disk"]
 # default so the generators are NOT compiled into a release binding library;
 # the `gen_org_*` examples enable it, and the crate's own tests reach the
 # module through `cfg(test)`.
-fixtures = ["net"]
+#
+# It also FORWARDS core's own `fixtures` seam (`net/fixtures`). The SDK's
+# test-only sensing observers read core test-only accessors — a retained
+# demand's holder tickets, for instance — and a feature that gated the SDK
+# half without enabling the core half compiled only inside a workspace dev
+# build, where a dev-dependency turned core fixtures on by accident. The
+# forwarding is what makes `--features fixtures` mean the same thing standalone
+# as it does under `cargo test`. Production darkness is unchanged: neither
+# feature is on by default, and nothing here is re-exported.
+fixtures = ["net", "net/fixtures"]
 # Compute surface — `MeshDaemon` trait + `DaemonRuntime` for local
 # spawn / snapshot / stop. Requires `net` because daemons have a
 # mesh identity (ed25519 keypair + origin_hash) that rides on the

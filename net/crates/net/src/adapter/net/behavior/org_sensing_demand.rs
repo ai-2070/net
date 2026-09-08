@@ -107,6 +107,14 @@ use super::scheduler_bridge::project_sensed_candidates;
 use super::sensing;
 use crate::adapter::net::mesh::{assert_off_sensing_locks, MeshNode, MAX_ORG_SENSING_POPULATION};
 
+/// The most providers ONE capability's demand is ever retained over.
+///
+/// Re-exported here, and not merely a private truncation, because a caller
+/// that reasons about whether a published population AGREES with the
+/// population it asked for cannot tell a legitimate cap from a disagreement
+/// without knowing the bound. Convergence truncates to this.
+pub const MAX_SENSED_POPULATION: usize = MAX_ORG_SENSING_POPULATION;
+
 /// How many distinct capabilities ONE family will retain demand for.
 ///
 /// Derived from the routing family's own handle bound rather than invented:

@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "cortex")]
 use net::adapter::net::behavior::org_grant::CapabilityAuthorityId;
 #[cfg(feature = "cortex")]
-use net::adapter::net::behavior::org_sensing_demand::OrgSensingFamily;
+use net::adapter::net::behavior::org_sensing_demand::{OrgSensingFamily, MAX_SENSED_POPULATION};
 use net::adapter::net::identity::EntityKeypair;
 use net::adapter::net::MeshNode;
 
@@ -93,26 +93,51 @@ pub(crate) struct ConvergenceSchedule {
     /// cannot both decide to converge one change. Held only across synchronous
     /// work.
     reconcile: parking_lot::Mutex<()>,
+    /// Instrumented builds only. `arrivals` counts callers that reached the
+    /// section's door (so a witness can prove overlap ACTUALLY contended
+    /// rather than merely being spawned), `convergences` counts attempts that
+    /// got past the decision, and `in_section` fires once inside the section
+    /// so a witness can hold it open while the others arrive.
+    #[cfg(any(test, feature = "fixtures"))]
+    arrivals: std::sync::atomic::AtomicU64,
+    #[cfg(any(test, feature = "fixtures"))]
+    convergences: std::sync::atomic::AtomicU64,
+    #[cfg(any(test, feature = "fixtures"))]
+    in_section: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
-/// The record: what was certified, about which demand, and when.
+/// One capability's last convergence attempt.
 #[cfg(feature = "cortex")]
 struct ConvergedFor {
-    /// The expectation the convergence was driven by — this call's own pinned
+    /// The expectation the attempt was driven by — this call's own pinned
     /// same-organization candidates. Compared by value, so a discovery or pin
     /// change is the trigger rather than a clock.
     expected: Vec<u64>,
-    /// The identity of the demand this record describes. A demand replaced or
-    /// retired since then invalidates the record outright.
-    demand: usize,
-    /// The population core actually published for that demand.
-    certified: Vec<u64>,
-    /// Whether the certified demand covers the whole expectation AND holds a
-    /// holder for every member of its own population. Anything less is
-    /// retryable on a floor.
-    complete: bool,
-    /// When the attempt ran, so an incomplete one is retried on a floor.
+    /// What the attempt produced.
+    outcome: Outcome,
+    /// When it ran, so a paced case is retried on a floor rather than per
+    /// call.
     attempted: Instant,
+}
+
+/// What a convergence attempt produced.
+#[cfg(feature = "cortex")]
+enum Outcome {
+    /// Core published a demand. `agreed` says whether that demand AGREES with
+    /// the expectation it was asked for and holds a holder for every member of
+    /// its own population; anything less is retried on the floor.
+    Certified {
+        /// The identity of the demand this record describes: a demand replaced
+        /// or retired since then invalidates the record outright.
+        demand: usize,
+        /// The population core actually published for it.
+        population: Vec<u64>,
+        agreed: bool,
+    },
+    /// Core refused. Nothing is certified, and the ATTEMPT is what paces the
+    /// next one — including when no demand is installed at all, which is
+    /// exactly the shape a `FamilyAtCapacity` refusal leaves behind.
+    Refused,
 }
 
 /// The most capabilities one binding keeps convergence records for.
@@ -129,9 +154,20 @@ impl ConvergenceSchedule {
     /// Whether `expected` demands a convergence now, given `installed` — the
     /// demand currently in force for that capability.
     ///
-    /// `retry_floor` bounds the only time-driven case: an incomplete
-    /// certification, which must be retryable without turning every later call
-    /// into an acquisition.
+    /// Two independent things are paced here, and neither may invalidate the
+    /// other by construction:
+    ///
+    /// * a REFUSED attempt paces the next attempt, whether or not a demand is
+    ///   installed. A capability that keeps meeting `FamilyAtCapacity` must not
+    ///   retry on every call;
+    /// * a CERTIFIED demand is reusable only while it still describes what is
+    ///   installed and it AGREED with the expectation. A demand that disagrees
+    ///   — narrower or wider than the expectation — is retried on the floor
+    ///   until the two sides agree. Repetition is not agreement: an identical
+    ///   mismatch seen twice is still a mismatch.
+    ///
+    /// The demand's own state — a moved sensing authority, a dead holder —
+    /// overrides both, because no record can see it.
     pub(crate) fn needs_convergence(
         &self,
         capability: &CapabilityAuthorityId,
@@ -142,35 +178,55 @@ impl ConvergenceSchedule {
         now: Instant,
         retry_floor: Duration,
     ) -> bool {
-        let Some(installed) = installed else {
-            return true; // No demand at all: nothing to reuse.
-        };
-        // The demand's OWN state comes first: neither a moved sensing
-        // authority nor a dead holder is visible in any record.
-        if !installed.authority_is_current() || !installed.holders_are_live() {
-            return true;
+        if let Some(installed) = installed {
+            if !installed.authority_is_current() || !installed.holders_are_live() {
+                return true;
+            }
         }
-        match self.records.lock().get(capability) {
-            None => true,
-            Some(record) => {
-                record.demand != Arc::as_ptr(installed) as usize
-                    || record.expected != expected
-                    || record.certified != population_of(installed)
-                    || (!record.complete
-                        && now.saturating_duration_since(record.attempted) >= retry_floor)
+        let records = self.records.lock();
+        let Some(record) = records.get(capability) else {
+            return true; // Never attempted for this capability.
+        };
+        if record.expected != expected {
+            return true; // Different inputs: decide again, with no floor.
+        }
+        let floored = now.saturating_duration_since(record.attempted) < retry_floor;
+        match &record.outcome {
+            Outcome::Refused => !floored,
+            Outcome::Certified {
+                demand,
+                population,
+                agreed,
+            } => {
+                let Some(installed) = installed else {
+                    // The demand this record certified is gone.
+                    return true;
+                };
+                if *demand != Arc::as_ptr(installed) as usize
+                    || *population != population_of(installed)
+                {
+                    return true;
+                }
+                !*agreed && !floored
             }
         }
     }
 
     /// Certify `demand` for `capability` under `expected`.
     ///
-    /// COMPLETE means two things at once: core published a population that
-    /// covers the whole expectation, and every member of that population has a
-    /// live holder. A population narrower than the expectation — a discovery
-    /// row that expired between this call's capture and core's own query — is
-    /// therefore recorded as incomplete and retried, unless a retry already
-    /// produced exactly the same population, which is a fixed point rather
-    /// than a loop.
+    /// AGREED means two things at once: every member of the published
+    /// population has a live holder, and that population is the one this
+    /// expectation asked for. Agreement is exact set equality, with ONE
+    /// explicit exception: convergence truncates a population to
+    /// [`MAX_SENSED_POPULATION`], so a published population at that bound and
+    /// contained in the expectation is the cap rather than a disagreement.
+    ///
+    /// Nothing else counts as agreement. In particular a mismatch is NOT
+    /// settled by being seen twice: a discovery row that expired between this
+    /// call's capture and core's own query yields a narrower population, and a
+    /// row that appeared in that window yields a wider one — and in both cases
+    /// the only thing that resolves it is a later attempt whose two sides
+    /// agree.
     pub(crate) fn certify(
         &self,
         capability: CapabilityAuthorityId,
@@ -178,35 +234,32 @@ impl ConvergenceSchedule {
         demand: &Arc<net::adapter::net::behavior::org_sensing_demand::OrgSensingCapabilityDemand>,
         now: Instant,
     ) {
-        let certified = population_of(demand);
+        let population = population_of(demand);
         let mut retained = demand.retained_providers();
         retained.sort_unstable();
         retained.dedup();
-        let holders_complete = retained == certified;
-        let covers_expectation = expected
-            .iter()
-            .all(|id| certified.binary_search(id).is_ok());
-        let settled = {
-            let records = self.records.lock();
-            records.get(&capability).is_some_and(|previous| {
-                previous.expected == expected && previous.certified == certified
-            })
-        };
-        let complete = holders_complete && (covers_expectation || settled);
+        let holders_complete = retained == population;
+        let capped = population.len() >= MAX_SENSED_POPULATION
+            && population
+                .iter()
+                .all(|id| expected.binary_search(id).is_ok());
+        let agreed = holders_complete && (population == expected || capped);
         self.insert(
             capability,
             ConvergedFor {
                 expected,
-                demand: Arc::as_ptr(demand) as usize,
-                certified,
-                complete,
+                outcome: Outcome::Certified {
+                    demand: Arc::as_ptr(demand) as usize,
+                    population,
+                    agreed,
+                },
                 attempted: now,
             },
         );
     }
 
-    /// Record a REFUSED convergence: nothing new is certified, and the attempt
-    /// is floored so a persistent refusal is not retried per call.
+    /// Record a REFUSED convergence: nothing is certified, and the attempt
+    /// paces the next one.
     pub(crate) fn record_refusal(
         &self,
         capability: CapabilityAuthorityId,
@@ -217,14 +270,57 @@ impl ConvergenceSchedule {
             capability,
             ConvergedFor {
                 expected,
-                // No demand is certified by a refusal, and `0` is not a live
-                // `Arc` address, so any installed demand invalidates it.
-                demand: 0,
-                certified: Vec::new(),
-                complete: false,
+                outcome: Outcome::Refused,
                 attempted: now,
             },
         );
+    }
+
+    /// Instrumented: one caller reached the reconciliation section's door.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub(crate) fn note_arrival(&self) {
+        self.arrivals
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(not(any(test, feature = "fixtures")))]
+    pub(crate) fn note_arrival(&self) {}
+
+    /// Instrumented: one caller got past the decision and is converging.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub(crate) fn note_convergence(&self) {
+        self.convergences
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(not(any(test, feature = "fixtures")))]
+    pub(crate) fn note_convergence(&self) {}
+
+    /// Instrumented: fire the in-section hook, if one is installed.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub(crate) fn fire_in_section(&self) {
+        let hook = self.in_section.lock().clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(not(any(test, feature = "fixtures")))]
+    pub(crate) fn fire_in_section(&self) {}
+
+    /// Counters for a witness: `(arrivals, convergences)`.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub(crate) fn instrumentation(&self) -> (u64, u64) {
+        (
+            self.arrivals.load(std::sync::atomic::Ordering::SeqCst),
+            self.convergences.load(std::sync::atomic::Ordering::SeqCst),
+        )
+    }
+
+    /// Install the in-section hook.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub(crate) fn set_in_section_hook(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self.in_section.lock() = hook;
     }
 
     /// Forget `capability`'s record — used when its demand is retired, so
@@ -312,6 +408,10 @@ pub struct OrgClient {
     pub(crate) skew_secs: u64,
     /// Dropped with the last clone; releases the consumer-audience references.
     pub(crate) _lease: Arc<AudienceLeaseGuard>,
+    /// Instrumented builds only: the provider the last planned call selected,
+    /// shared by every clone exactly like the lease.
+    #[cfg(all(feature = "cortex", any(test, feature = "fixtures")))]
+    pub(crate) selected: Arc<parking_lot::Mutex<Option<net::adapter::net::identity::EntityId>>>,
     /// This client's sensing acquisition, minted once at bind. Shared by every
     /// clone exactly like `_lease`; the last clone's drop retires the demand.
     #[cfg(feature = "cortex")]
@@ -430,6 +530,44 @@ impl OrgClient {
             }
         }
         Some(released)
+    }
+
+    /// `(arrivals, convergences)` at this binding's reconciliation section.
+    ///
+    /// Arrivals are counted at the door, before the lock, so a witness can
+    /// establish that concurrent callers actually CONTENDED; convergences
+    /// count the attempts that got past the decision. One change under real
+    /// contention must produce many arrivals and exactly one convergence.
+    #[cfg(all(feature = "cortex", any(test, feature = "fixtures")))]
+    #[doc(hidden)]
+    pub fn sensing_section_counters(&self) -> Option<(u64, u64)> {
+        self._sensing
+            .acquisition()
+            .map(|acquisition| acquisition.schedule().instrumentation())
+    }
+
+    /// Install a hook that fires INSIDE this binding's reconciliation section,
+    /// after the lock and before the decision's convergence.
+    ///
+    /// It is how a witness holds the section open while other callers arrive,
+    /// which is the only way to observe contention rather than infer it.
+    #[cfg(all(feature = "cortex", any(test, feature = "fixtures")))]
+    #[doc(hidden)]
+    pub fn set_sensing_section_hook_for_test(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        if let Some(acquisition) = self._sensing.acquisition() {
+            acquisition.schedule().set_in_section_hook(hook);
+        }
+    }
+
+    /// The provider the LAST planned call selected, if any.
+    ///
+    /// Recorded by the call path in instrumented builds so a witness can
+    /// observe the actual selection — including when the send then fails and
+    /// no reply names anyone.
+    #[cfg(all(feature = "cortex", any(test, feature = "fixtures")))]
+    #[doc(hidden)]
+    pub fn last_selected_provider(&self) -> Option<net::adapter::net::identity::EntityId> {
+        self.selected.lock().clone()
     }
 
     /// One capability's readiness projection at a caller-supplied instant.
@@ -649,6 +787,8 @@ impl OrgClient {
             acting_org,
             skew_secs: authority.config.verification_skew_secs,
             _lease: Arc::new(AudienceLeaseGuard::new(node.clone(), grant_ids)),
+            #[cfg(all(feature = "cortex", any(test, feature = "fixtures")))]
+            selected: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(feature = "cortex")]
             _sensing,
             node,

@@ -520,6 +520,17 @@ impl Cell {
         reply.served_by
     }
 
+    /// One protected call whose REPLY is not the point: fixtures that discover
+    /// synthetic, unreachable providers can legitimately have a call planned
+    /// for one of them and fail at transport. The planning - and the
+    /// reconciliation it drives - is what these witnesses assert.
+    async fn try_call(&self) -> Result<String, net_sdk::org::OrgSdkError> {
+        self.client
+            .call::<Ping, Pong>(SERVICE, &Ping { n: 1 })
+            .await
+            .map(|reply| reply.served_by)
+    }
+
     /// One protected call under an explicit deadline, through the shipped
     /// execution-control seam.
     async fn call_with_deadline(&self, deadline_ms: u64) -> String {
@@ -561,7 +572,7 @@ impl Cell {
     async fn call_until(&self, what: &str, deadline: Duration, mut probe: impl FnMut() -> bool) {
         let end = Instant::now() + deadline;
         loop {
-            let _ = self.call().await;
+            let _ = self.try_call().await;
             if probe() {
                 return;
             }
@@ -1066,10 +1077,17 @@ async fn a_holder_that_dies_after_convergence_is_reacquired() {
     cell.cleanup();
 }
 
-/// Two clones of one binding, calling concurrently, converge one change ONCE
-/// and agree about what is installed.
+/// Concurrent clones that ACTUALLY contend for the reconciliation section
+/// produce exactly ONE convergence.
+///
+/// Spawning is not overlap, and final row cardinality is not convergence
+/// multiplicity — core serializes its own ticket transaction, so several
+/// redundant convergences would still leave one demand and two rows behind.
+/// This witness therefore holds the section open from INSIDE while the other
+/// callers arrive at its door, counts the arrivals, and then counts how many
+/// callers got past the decision.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn overlapping_clones_converge_one_change_coherently() {
+async fn contending_clones_produce_exactly_one_convergence() {
     let cell = Cell::stand_up(
         "clones",
         true,
@@ -1079,37 +1097,73 @@ async fn overlapping_clones_converge_one_change_coherently() {
         ],
     )
     .await;
+    const CALLERS: u64 = 4;
 
-    // Eight concurrent first calls across four clones: nothing has converged
-    // yet, so every one of them would decide to converge without a section
-    // around the decision.
-    let clones: Vec<OrgClient> = (0..4).map(|_| cell.client.clone()).collect();
+    // The first caller into the section parks there until every other caller
+    // has arrived at the door. Arrivals are counted BEFORE the lock, so this
+    // is observed contention, not a sleep.
+    let parked = Arc::new(AtomicUsize::new(0));
+    {
+        let client = cell.client.clone();
+        let parked = parked.clone();
+        cell.client
+            .set_sensing_section_hook_for_test(Some(Arc::new(move || {
+                if parked.fetch_add(1, Ordering::SeqCst) > 0 {
+                    return; // Only the first holder parks.
+                }
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    let (arrivals, _) = client
+                        .sensing_section_counters()
+                        .expect("an active binding");
+                    if arrivals >= CALLERS {
+                        return;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "the other callers never reached the section door"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            })));
+    }
+
+    let clones: Vec<OrgClient> = (0..CALLERS).map(|_| cell.client.clone()).collect();
     let mut tasks = Vec::new();
     for clone in &clones {
-        for _ in 0..2 {
-            let clone = clone.clone();
-            tasks.push(tokio::spawn(async move {
-                clone
-                    .call::<Ping, Pong>(SERVICE, &Ping { n: 1 })
-                    .await
-                    .map(|reply| reply.served_by)
-            }));
-        }
+        let clone = clone.clone();
+        tasks.push(tokio::spawn(async move {
+            clone
+                .call::<Ping, Pong>(SERVICE, &Ping { n: 1 })
+                .await
+                .map(|reply| reply.served_by)
+        }));
     }
     for task in tasks {
         task.await.expect("join").expect("admitted");
     }
+    cell.client.set_sensing_section_hook_for_test(None);
 
+    let (arrivals, convergences) = cell
+        .client
+        .sensing_section_counters()
+        .expect("an active binding");
+    assert!(
+        arrivals >= CALLERS,
+        "precondition: the callers really contended for the section, saw {arrivals}"
+    );
+    assert_eq!(
+        convergences, 1,
+        "one change, one convergence: {arrivals} contending callers must not each converge"
+    );
+
+    // ...and the shared state they all read is the same one.
     let mut two = vec![cell.id(0), cell.id(1)];
     two.sort_unstable();
     let (population, retained, identity) = demand_state(&cell.client).expect("demand");
-    assert_eq!(population, two, "one coherent population");
-    assert_eq!(retained, two, "with one holder each - no duplicate tickets");
-    assert_eq!(
-        cell.client.sensing_records(),
-        Some(1),
-        "one record, for one capability"
-    );
+    assert_eq!(population, two);
+    assert_eq!(retained, two, "one holder each - no duplicate tickets");
+    assert_eq!(cell.client.sensing_records(), Some(1));
     for clone in &clones {
         let (clone_population, clone_retained, clone_identity) =
             demand_state(clone).expect("demand");
@@ -1117,14 +1171,294 @@ async fn overlapping_clones_converge_one_change_coherently() {
         assert_eq!(clone_retained, retained);
         assert_eq!(
             clone_identity, identity,
-            "every clone reads the SAME installed demand"
+            "every clone reads the SAME demand"
         );
     }
-    // The node itself holds exactly the interests that demand describes.
     assert_eq!(
         cell.consumer.node.sensing_interest_count(),
         2,
-        "no duplicate interest rows from the concurrent convergences"
+        "no duplicate interest rows"
+    );
+    cell.cleanup();
+}
+
+// ---------------------------------------------------------------------------
+// WITHIN-ATTEMPT discovery movement: the two directions, executed
+// ---------------------------------------------------------------------------
+
+/// Inject a real owner-scoped announcement for `provider` into `consumer`,
+/// expiring at `expires_at`, and pin the provider's entity.
+///
+/// Both halves go through the shipped verified paths: the envelope is built by
+/// the canonical builder and admitted by the real ingest, and the pin is the
+/// same TOFU entry a handshake writes.
+fn discover_synthetic(
+    consumer: &Member,
+    owner: &OrgKeypair,
+    provider: &net::adapter::net::identity::EntityKeypair,
+    expires_at: u64,
+) {
+    let authority = consumer.node.node_authority().expect("authority");
+    let cert = OrgMembershipCert::try_issue(owner, provider.entity_id().clone(), 1, 3600)
+        .expect("membership");
+    let descriptor = CapabilitySet::new().add_tag(TAG).to_bytes_compact();
+    let envelope =
+        net::adapter::net::behavior::org_scoped_ann::ScopedCapabilityAnnouncement::build_owner(
+            provider,
+            owner.org_id(),
+            cert,
+            authority.audience.audience_handle,
+            authority.audience.discovery_key(),
+            1,
+            expires_at,
+            &descriptor,
+        )
+        .expect("owner envelope");
+    consumer
+        .node
+        .ingest_scoped_announcement_for_test(&envelope.to_bytes());
+    consumer
+        .node
+        .test_pin_peer_entity(provider.entity_id().node_id(), provider.entity_id().clone());
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs()
+}
+
+/// A provider that DISAPPEARS between the caller's capture and core's own
+/// query — the narrowing direction — must not be certified as agreement, and
+/// the next attempt must converge to what discovery now says.
+///
+/// The disappearance is real: the synthetic provider's announcement expires,
+/// and the section hook holds the attempt open across that expiry, so core's
+/// population is genuinely narrower than the expectation the caller derived.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn within_attempt_narrowing_is_not_certified_as_agreement() {
+    let cell = Cell::stand_up(
+        "narrow",
+        true,
+        &[
+            (true, Duration::from_millis(1)),
+            (true, Duration::from_millis(1)),
+        ],
+    )
+    .await;
+    // A third, synthetic provider whose discovery row expires in two seconds.
+    let ephemeral = net::adapter::net::identity::EntityKeypair::generate();
+    discover_synthetic(&cell.consumer, &org(), &ephemeral, unix_now() + 2);
+    let ephemeral_id = ephemeral.entity_id().node_id();
+    until(
+        "the ephemeral provider was never discovered",
+        SETTLE,
+        || population(&cell.consumer).contains(&ephemeral_id),
+    )
+    .await;
+
+    // Hold the attempt open across the expiry: the caller's expectation
+    // already includes the ephemeral provider, and core's query will not.
+    let fired = Arc::new(AtomicUsize::new(0));
+    {
+        let fired = fired.clone();
+        cell.client
+            .set_sensing_section_hook_for_test(Some(Arc::new(move || {
+                if fired.fetch_add(1, Ordering::SeqCst) == 0 {
+                    std::thread::sleep(Duration::from_millis(2500));
+                }
+            })));
+    }
+    let _armed = cell.try_call().await;
+    cell.client.set_sensing_section_hook_for_test(None);
+    assert_eq!(
+        fired.load(Ordering::SeqCst),
+        1,
+        "the section hook must have held one attempt open"
+    );
+
+    let (population_now, _, _) = demand_state(&cell.client).expect("demand");
+    assert!(
+        !population_now.contains(&ephemeral_id),
+        "core published the NARROWER population: {population_now:?}"
+    );
+
+    // That mismatch must not be settled. A later call agrees with what
+    // discovery now says - the two real providers - and nothing is stuck.
+    let mut two = vec![cell.id(0), cell.id(1)];
+    two.sort_unstable();
+    let expected = two.clone();
+    cell.call_until(
+        "the narrowed attempt was certified and never reconverged",
+        Duration::from_secs(30),
+        || {
+            demand_state(&cell.client)
+                .map(|(population, retained, _)| population == expected && retained == expected)
+                .unwrap_or(false)
+        },
+    )
+    .await;
+    // And it SETTLES: once the two sides agree, calls stop reconverging.
+    let (_, _, identity) = demand_state(&cell.client).expect("demand");
+    for _ in 0..3 {
+        let _ = cell.try_call().await;
+    }
+    let (_, _, identity_again) = demand_state(&cell.client).expect("demand");
+    assert_eq!(
+        identity, identity_again,
+        "an agreed population is not re-acquired on every call"
+    );
+    cell.cleanup();
+}
+
+/// A provider that APPEARS between the caller's capture and core's own query —
+/// the widening direction — must not be certified as agreement either, because
+/// the caller never observed it and would otherwise never retire it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn within_attempt_widening_is_not_certified_as_agreement() {
+    let cell = Cell::stand_up(
+        "widen",
+        true,
+        &[
+            (true, Duration::from_millis(1)),
+            (true, Duration::from_millis(1)),
+        ],
+    )
+    .await;
+
+    // Inside the attempt, a third provider becomes discovered AND pinned - so
+    // core's query sees a population the caller's expectation did not.
+    let latecomer = net::adapter::net::identity::EntityKeypair::generate();
+    let latecomer_id = latecomer.entity_id().node_id();
+    let fired = Arc::new(AtomicUsize::new(0));
+    {
+        let fired = fired.clone();
+        let consumer_node = Arc::clone(&cell.consumer.node);
+        let owner = org();
+        let latecomer = latecomer.clone();
+        cell.client
+            .set_sensing_section_hook_for_test(Some(Arc::new(move || {
+                if fired.fetch_add(1, Ordering::SeqCst) > 0 {
+                    return;
+                }
+                let authority = consumer_node.node_authority().expect("authority");
+                let cert =
+                    OrgMembershipCert::try_issue(&owner, latecomer.entity_id().clone(), 1, 3600)
+                        .expect("membership");
+                let descriptor = CapabilitySet::new().add_tag(TAG).to_bytes_compact();
+                let envelope = net::adapter::net::behavior::org_scoped_ann::ScopedCapabilityAnnouncement::build_owner(
+                    &latecomer,
+                    owner.org_id(),
+                    cert,
+                    authority.audience.audience_handle,
+                    authority.audience.discovery_key(),
+                    1,
+                    unix_now() + 3600,
+                    &descriptor,
+                )
+                .expect("owner envelope");
+                consumer_node.ingest_scoped_announcement_for_test(&envelope.to_bytes());
+                consumer_node.test_pin_peer_entity(
+                    latecomer.entity_id().node_id(),
+                    latecomer.entity_id().clone(),
+                );
+            })));
+    }
+    let _armed = cell.try_call().await;
+    cell.client.set_sensing_section_hook_for_test(None);
+    assert_eq!(fired.load(Ordering::SeqCst), 1, "the hook must have fired");
+
+    let (population_now, _, _) = demand_state(&cell.client).expect("demand");
+    assert!(
+        population_now.contains(&latecomer_id),
+        "core published the WIDER population: {population_now:?}"
+    );
+
+    // A later call, whose expectation now includes the latecomer, must AGREE
+    // rather than inherit an unexamined wider demand - and it must settle.
+    let mut three = vec![cell.id(0), cell.id(1), latecomer_id];
+    three.sort_unstable();
+    let expected = three.clone();
+    cell.call_until(
+        "the widened attempt never reached agreement",
+        Duration::from_secs(30),
+        || {
+            demand_state(&cell.client)
+                .map(|(population, _, _)| population == expected)
+                .unwrap_or(false)
+        },
+    )
+    .await;
+    let (_, _, identity) = demand_state(&cell.client).expect("demand");
+    for _ in 0..3 {
+        let _ = cell.try_call().await;
+    }
+    let (_, _, identity_again) = demand_state(&cell.client).expect("demand");
+    assert_eq!(
+        identity, identity_again,
+        "and once the two sides agree, nothing re-acquires per call"
+    );
+    cell.cleanup();
+}
+
+/// A population TRUNCATED to the sensed cap agrees with the wider expectation
+/// that asked for it — so a consumer with more authorized providers than the
+/// cap settles instead of re-acquiring on every floored retry.
+///
+/// The cap is the one explicit exception to exact agreement, and it is
+/// explicit precisely because "narrower than asked for" is otherwise the
+/// signal that discovery moved under the attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_capped_population_agrees_with_a_wider_expectation() {
+    use net::adapter::net::behavior::org_sensing_demand::MAX_SENSED_POPULATION;
+
+    let cell = Cell::stand_up(
+        "capped",
+        true,
+        &[
+            (true, Duration::from_millis(1)),
+            (true, Duration::from_millis(1)),
+        ],
+    )
+    .await;
+
+    // Enough authorized, pinned, discovered providers to exceed the cap.
+    let crowd: Vec<net::adapter::net::identity::EntityKeypair> = (0..MAX_SENSED_POPULATION + 8)
+        .map(|_| net::adapter::net::identity::EntityKeypair::generate())
+        .collect();
+    for member in &crowd {
+        discover_synthetic(&cell.consumer, &org(), member, unix_now() + 3600);
+    }
+    until("the crowd was never discovered", SETTLE, || {
+        population(&cell.consumer).len() > MAX_SENSED_POPULATION
+    })
+    .await;
+
+    let _armed = cell.try_call().await;
+    let (population, retained, identity) = demand_state(&cell.client).expect("demand");
+    assert_eq!(
+        population.len(),
+        MAX_SENSED_POPULATION,
+        "core truncated the population to its own bound"
+    );
+    assert_eq!(
+        retained, population,
+        "with a holder for every capped member"
+    );
+
+    // It SETTLES: repeated calls, and calls past the retry floor, reuse the
+    // same demand rather than re-converging against an expectation the cap can
+    // never cover.
+    for _ in 0..3 {
+        let _ = cell.try_call().await;
+    }
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    let _ = cell.try_call().await;
+    let (_, _, identity_again) = demand_state(&cell.client).expect("demand");
+    assert_eq!(
+        identity, identity_again,
+        "a capped population is agreement, not a mismatch to retry forever"
     );
     cell.cleanup();
 }
@@ -1515,35 +1849,63 @@ async fn a_pinned_but_locally_dead_session_is_still_the_sensed_selection() {
         .client
         .call_bytes_deadline(SERVICE, bytes::Bytes::from(body), 1500, 0)
         .await;
+
+    // ATTRIBUTION, first: which provider did planning actually select, and was
+    // the local state still what this witness set up when it did?
+    let selected = cell
+        .client
+        .last_selected_provider()
+        .expect("the call planned a provider");
+    assert_eq!(
+        selected,
+        *cell.providers[1].node.entity_id(),
+        "selection followed the identity PIN to the provider whose local \
+         session is dead - not the live alternative"
+    );
+    assert!(
+        !cell
+            .consumer
+            .node
+            .peer_session_for_test(cell.id(1))
+            .expect("the session object survives")
+            .is_active(),
+        "and that session was still inactive across the call"
+    );
     assert_eq!(
         cell.served(0) - before.0,
         0,
         "there is no silent fallback: the live provider was never called"
     );
-    match outcome {
-        Ok(reply) => {
-            // The session was re-established underneath: the reply may then
-            // only come from the SELECTED provider, never a substitution.
-            let pong: Pong = serde_json::from_slice(&reply).expect("decode");
-            assert_eq!(
-                pong.served_by, cell.names[1],
-                "a reply may only come from the provider selection chose"
-            );
-            assert_eq!(cell.served(1) - before.1, 1);
-        }
-        Err(net_sdk::org::OrgSdkError::Rpc(_)) => {
-            // Or the send had nowhere to go, and the SDK reports transport
-            // rather than re-selecting.
-            assert_eq!(
-                cell.served(1) - before.1,
-                0,
-                "and nothing was served by anyone"
-            );
-        }
-        Err(other) => {
-            panic!("a dead local session must not become a LOCAL authority refusal: {other:?}")
-        }
-    }
+
+    // ...and then the specific result of having selected it. ESTABLISHED, not
+    // wished for: the RPC send path does not consult a session's `active`
+    // flag, so a locally deactivated session is not a barrier to the send.
+    // The call therefore succeeds AT THE SELECTED PROVIDER, and its handler is
+    // the one that runs.
+    let reply = outcome.expect(
+        "a locally deactivated session does not stop the send: if this ever \
+         fails, the established outcome has changed and the attribution below \
+         must be re-derived rather than relaxed",
+    );
+    let pong: Pong = serde_json::from_slice(&reply).expect("decode");
+    assert_eq!(
+        pong.served_by, cell.names[1],
+        "the reply comes from the provider selection chose - never a substitution"
+    );
+    assert_eq!(
+        cell.served(1) - before.1,
+        1,
+        "the selected provider's handler ran exactly once"
+    );
+
+    // WHAT THIS DOES AND DOES NOT ESTABLISH. `direct` is an identity pin, the
+    // pin outlives a session's active flag, and that flag is not a send-path
+    // predicate - so no wrong selection and no wrong error is demonstrated
+    // here: the call reached the provider selection named. The inherited
+    // predicate is therefore recorded, and no SDK correction is triggered by
+    // this reproduction. A liveness predicate would be transport policy, which
+    // this slice does not change, and the unsensed order selects by the same
+    // pin.
     cell.cleanup();
 }
 
