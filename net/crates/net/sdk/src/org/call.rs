@@ -201,6 +201,13 @@ impl OrgClient {
     ) -> Result<Bytes, OrgSdkError> {
         let intent = self.plan(service, deadline_ms)?;
         let provider = intent.provider.clone();
+        // Instrumented builds only: record WHICH provider planning selected,
+        // so a witness can attribute an outcome even when the send fails and
+        // no reply names anyone.
+        #[cfg(all(feature = "cortex", any(test, feature = "fixtures")))]
+        {
+            *self.selected.lock() = Some(provider.clone());
+        }
 
         let mut opts = CallOptions {
             org_proof_intent: Some(intent),
@@ -617,7 +624,12 @@ impl OrgClient {
         // ONE section: decide, converge, record. `retain` is synchronous and
         // takes core's own transaction lock inside; nothing here awaits.
         {
+            // Instrumented: this caller has ARRIVED at the section's door. It
+            // is counted before the lock, so a witness can tell contention
+            // from mere spawning.
+            acquisition.schedule().note_arrival();
             let _txn = acquisition.reconcile_lock();
+            acquisition.schedule().fire_in_section();
             let installed = family.demand(capability);
             if expected.is_empty() {
                 // Nothing to sense for this capability. An installed demand is
@@ -637,6 +649,7 @@ impl OrgClient {
                 now,
                 RECONCILE_RETRY_FLOOR,
             ) {
+                acquisition.schedule().note_convergence();
                 match family.retain(sensed.tag) {
                     Ok(demand) => {
                         acquisition

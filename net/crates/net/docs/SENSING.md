@@ -439,11 +439,21 @@ the authority stamp. Unchanged and fully certified: nothing is
 re-acquired. Anything else: one convergence, which keeps every
 still-authorized holder's existing ticket.
 
-Incomplete certifications — a population narrower than the
-expectation because a discovery row expired between the caller's
-capture and core's own query, or a holder a per-provider refusal could
-not take — are retried on a floor; a retry that produces the identical
-population is a fixed point rather than a loop. Ownership that dies
+A certified demand is reusable only while it AGREED with the
+expectation it was asked for: agreement is exact set equality, with one
+explicit exception — convergence truncates to the sensed population
+cap, so a population at that bound and contained in the expectation is
+the cap rather than a disagreement. Nothing else counts, and in
+particular repetition does not: a population narrower than the
+expectation (a discovery row that expired between the caller's capture
+and core's query) or wider than it (one that appeared in that window)
+stays retryable on the floor until the two sides agree, because an
+identical mismatch seen twice is still a mismatch.
+
+Failed attempts pace themselves separately, and neither pacing may
+cancel the other: a refused convergence — `FamilyAtCapacity`, say —
+paces the next attempt whether or not a demand is installed, while a
+changed expectation bypasses both floors immediately. Ownership that dies
 after a successful convergence is caught by the liveness question,
 which is the same one core's own convergence asks before carrying a
 ticket. Two bounds keep the state finite: a capability with an empty

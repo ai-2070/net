@@ -1625,12 +1625,13 @@ async fn selection_and_its_errors_follow_the_reordered_list() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The reconciliation trigger, as a decision table over a REAL demand.
+/// The reconciliation trigger, as a decision table over REAL demands.
 ///
-/// The record certifies the demand it was taken from, so this drives it with
-/// actual `OrgSensingCapabilityDemand` values: a record cannot outlive the
-/// demand's identity, cannot claim a narrower population settled the first
-/// time it sees it, and cannot grow without bound.
+/// Two things are paced independently here and neither may cancel the other:
+/// a certified demand is reusable only while it AGREES with the expectation it
+/// was asked for and still describes what is installed, and a REFUSED attempt
+/// paces the next attempt even when no demand is installed at all. Repetition
+/// is not agreement.
 #[tokio::test]
 async fn the_reconciliation_trigger_certifies_the_installed_demand() {
     use net::adapter::net::behavior::org_sensing_demand::OrgSensingFamily;
@@ -1644,70 +1645,111 @@ async fn the_reconciliation_trigger_certifies_the_installed_demand() {
     let floor = Duration::from_secs(2);
     let t0 = Instant::now();
 
-    // No demand at all: converge.
+    // No demand and no record: converge.
     assert!(schedule.needs_convergence(&capability, &[1, 2], None, t0, floor));
 
-    // A real demand, with nothing discovered - so its population is EMPTY and
-    // cannot cover an expectation of two providers.
+    // ---- a certified demand that DISAGREES ---------------------------------
+    // Nothing is discovered here, so core publishes an EMPTY population: the
+    // narrowing shape, where a row expired between the caller's capture and
+    // core's query.
     let demand = family.retain("nrpc:internal.reindex").expect("retain");
-    assert!(demand.population().is_empty(), "nothing is discovered here");
-    assert!(schedule.needs_convergence(&capability, &[1, 2], Some(&demand), t0, floor));
-
-    // Certifying it does NOT settle it: the published population is narrower
-    // than the expectation, which is exactly the interleaving where a
-    // discovery row expired between the caller's capture and core's query.
+    assert!(demand.population().is_empty());
     schedule.certify(capability, vec![1, 2], &demand, t0);
     assert!(
         !schedule.needs_convergence(&capability, &[1, 2], Some(&demand), t0, floor),
-        "but it is floored, not retried on the very next call"
+        "the disagreement is floored, not retried on the very next call"
     );
     assert!(
         schedule.needs_convergence(&capability, &[1, 2], Some(&demand), t0 + floor, floor),
         "and it IS retried once the floor has passed"
     );
 
-    // A retry that produces the identical population is a FIXED POINT, not a
-    // loop: certify the same pair again and it settles.
+    // REPETITION IS NOT AGREEMENT. Certifying the identical mismatch again
+    // must not settle it - that is the defect this replaced: a provider that
+    // came back would otherwise never be reacquired.
     schedule.certify(capability, vec![1, 2], &demand, t0 + floor);
     assert!(
-        !schedule.needs_convergence(
+        schedule.needs_convergence(
             &capability,
             &[1, 2],
             Some(&demand),
             t0 + Duration::from_secs(600),
             floor
         ),
-        "a fixed point is not re-run by the passage of time"
+        "a repeated identical mismatch stays retryable"
     );
 
-    // A CHANGED expectation converges immediately, with no floor.
-    assert!(schedule.needs_convergence(&capability, &[1, 2, 3], Some(&demand), t0, floor));
-    assert!(schedule.needs_convergence(&capability, &[1], Some(&demand), t0, floor));
-
-    // A REPLACED demand invalidates the record outright, even though the
-    // expectation is unchanged: the record certified a different installation.
-    let replaced = family.retain("nrpc:internal.reindex").expect("re-retain");
+    // ---- a certified demand that AGREES ------------------------------------
+    // The expectation that matches what core published settles, permanently.
+    schedule.certify(capability, Vec::new(), &demand, t0);
     assert!(
-        !std::sync::Arc::ptr_eq(&demand, &replaced),
-        "precondition: the convergence published a new demand"
+        !schedule.needs_convergence(
+            &capability,
+            &[],
+            Some(&demand),
+            t0 + Duration::from_secs(600),
+            floor
+        ),
+        "an agreed population is not re-run by the passage of time"
+    );
+
+    // (The CAP clause - a population truncated to `MAX_SENSED_POPULATION`
+    // counting as agreement with a wider expectation - needs 32 acquired
+    // HOLDERS, so it cannot be exercised on this sensing-disabled unit node.
+    // Its witness is `a_capped_population_agrees_with_a_wider_expectation`, on
+    // a real sensing-enabled consumer.)
+
+    // ---- a REPLACED demand invalidates the record --------------------------
+    let replaced = family.retain("nrpc:internal.reindex").expect("re-retain");
+    schedule.certify(capability, Vec::new(), &replaced, t0);
+    assert!(
+        !schedule.needs_convergence(&capability, &[], Some(&replaced), t0, floor),
+        "precondition: this record agrees about the replacement"
+    );
+    let third = family.retain("nrpc:internal.reindex").expect("re-retain");
+    assert!(
+        !std::sync::Arc::ptr_eq(&replaced, &third),
+        "precondition: a new demand was published"
     );
     assert!(
         schedule.needs_convergence(
             &capability,
-            &[1, 2],
-            Some(&replaced),
+            &[],
+            Some(&third),
             t0 + Duration::from_secs(600),
             floor
         ),
         "a record must never certify a demand it was not taken from"
     );
 
-    // A refusal certifies nothing.
-    schedule.certify(capability, vec![1, 2], &replaced, t0);
-    schedule.record_refusal(capability, vec![1, 2], t0);
-    assert!(schedule.needs_convergence(&capability, &[1, 2], Some(&replaced), t0, floor));
+    // ---- a REFUSAL paces itself, installed demand or not -------------------
+    let refused_capability = cap("nrpc:refused.capability");
+    schedule.record_refusal(refused_capability, vec![1, 2], t0);
+    assert!(
+        !schedule.needs_convergence(&refused_capability, &[1, 2], None, t0, floor),
+        "a refused attempt with NO demand installed must still be paced - this \
+         is the FamilyAtCapacity shape"
+    );
+    assert!(
+        !schedule.needs_convergence(
+            &refused_capability,
+            &[1, 2],
+            None,
+            t0 + Duration::from_millis(500),
+            floor
+        ),
+        "and stays paced within the floor"
+    );
+    assert!(
+        schedule.needs_convergence(&refused_capability, &[1, 2], None, t0 + floor, floor),
+        "then retries once"
+    );
+    assert!(
+        schedule.needs_convergence(&refused_capability, &[1, 2, 3], None, t0, floor),
+        "a CHANGED expectation bypasses the pacing entirely"
+    );
 
-    // And the record set is BOUNDED: many capability names cannot grow it.
+    // ---- and the record set is BOUNDED -------------------------------------
     for index in 0..200u32 {
         let other = cap(&format!("nrpc:svc.{index}"));
         schedule.record_refusal(other, vec![1], t0 + Duration::from_millis(index as u64));
@@ -1720,6 +1762,7 @@ async fn the_reconciliation_trigger_certifies_the_installed_demand() {
 
     drop(demand);
     drop(replaced);
+    drop(third);
     drop(family);
     let _ = std::fs::remove_dir_all(&dir);
 }
