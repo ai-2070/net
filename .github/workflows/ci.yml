@@ -751,6 +751,13 @@ jobs:
           # aged-installation adoption, executor fairness under a
           # continuously-due schedule, and a nonempty verified discovery
           # population.
+          #
+          # THIRD-review outcomes: the ticket/installation/freshness triple
+          # coming from one acquisition transaction, membership-based carry
+          # validation, adoption of an already-aged row, discharge of retained
+          # ownership at the invalidation that killed it, no capacity rejection
+          # of a live ticket, and in-window rederivation of a NONEMPTY
+          # population.
           REQUIRED="only_the_last_family_owner_retires_retained_demand
           a_nonfinal_family_retirement_keeps_the_shared_installation_refreshing
           a_refused_retirement_release_keeps_the_holder_and_recovers_it
@@ -775,7 +782,13 @@ jobs:
           the_single_worker_refreshes_every_retained_installation
           an_earlier_arm_shortens_a_live_park
           a_nanosecond_horizon_cannot_starve_the_runtime
-          a_cancelled_refresh_close_leaves_a_recoverable_worker"
+          a_cancelled_refresh_close_leaves_a_recoverable_worker
+          an_acquisition_reports_its_own_installation_and_freshness
+          a_carried_ticket_is_validated_by_membership_not_identity
+          adopting_an_aged_installation_renews_before_it_expires
+          an_invalidation_discharges_the_releases_it_killed
+          a_fresh_admission_at_the_ceiling_keeps_its_live_ticket
+          a_nonempty_population_is_rederived_when_the_view_moves_in_window"
           required_n=$(printf '%s\n' $REQUIRED | grep -c .)
           if [ "$n" -lt "$required_n" ]; then
             die "expected at least $required_n witnesses in $DEMAND, listed $n" \

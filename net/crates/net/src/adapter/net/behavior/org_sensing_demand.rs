@@ -104,7 +104,7 @@ use std::time::Duration;
 use super::org_grant::CapabilityAuthorityId;
 use super::org_routing_registry::RoutingFamily;
 use super::sensing;
-use crate::adapter::net::mesh::{MeshNode, SensingArmProvenance, MAX_ORG_SENSING_POPULATION};
+use crate::adapter::net::mesh::{MeshNode, MAX_ORG_SENSING_POPULATION};
 
 /// How many distinct capabilities ONE family will retain demand for.
 ///
@@ -195,6 +195,24 @@ impl OrgSensingCapabilityDemand {
     /// The organization-derived audience the demand was registered under.
     pub fn audience(&self) -> sensing::AudienceScopeCommitment {
         self.audience
+    }
+
+    /// The retained holders as `(provider, ticket, installation)` triples
+    /// (fixtures/tests only).
+    ///
+    /// A witness needs the EXACT ownership this demand holds — the token, not
+    /// a resemblance of it — to act on it directly: releasing a held ticket
+    /// out from under a demand is how "the installation still matches but the
+    /// token is no longer a holder" is reached at all.
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn retained_holders_for_test(
+        &self,
+    ) -> Vec<(u64, sensing::SensingLeaseTicket, sensing::LeaseToken)> {
+        self.retained
+            .iter()
+            .map(|held| (held.provider, held.ticket, held.installation_id))
+            .collect()
     }
 
     /// Whether the authority view this demand was derived against is STILL the
@@ -482,11 +500,13 @@ impl OrgSensingFamily {
         // retained with no registry installation behind it, forever: refresh
         // answers `Absent` and stops re-arming, and every later unchanged
         // convergence copied the same corpse.
-        //
-        // Ownership is therefore validated against the live installation
-        // identity. Equality is exact proof our holder survives: holders leave
-        // an entry only by releasing, and a re-established key carries a
-        // strictly newer identity.
+        // Ownership is therefore validated against ACTUAL HOLDER MEMBERSHIP:
+        // is this exact token still a registration of this exact key? That is
+        // the property, and an installation-identity comparison is only a
+        // proxy for it — one that agrees with itself even when the ticket and
+        // the installation it was recorded beside were never a valid pair.
+        // Since the two are now committed together, membership and identity
+        // cannot disagree, and the assertion below says so.
         let mut carried: Vec<RetainedProvider> = Vec::new();
         let mut departed: Vec<RetainedProvider> = Vec::new();
         let mut invalidated = 0u64;
@@ -498,14 +518,20 @@ impl OrgSensingFamily {
                     ticket: retained.ticket,
                     installation_id: retained.installation_id,
                 };
-                if node.sensing_refresh_installation(&moved.key) != Some(moved.installation_id) {
-                    // Nothing to carry and nothing to release: the entry this
-                    // ticket referenced is gone. A wanted provider falls through
-                    // to a FRESH acquisition below; an unwanted one simply
-                    // disappears.
+                if !node.holds_sensing_lease_token(&moved.ticket) {
+                    // Nothing to carry and nothing to release: this token is
+                    // not a holder of this key any more. A wanted provider
+                    // falls through to a FRESH acquisition below; an unwanted
+                    // one simply disappears.
                     invalidated += 1;
                     continue;
                 }
+                debug_assert_eq!(
+                    node.sensing_refresh_installation(&moved.key),
+                    Some(moved.installation_id),
+                    "a live holder's recorded installation must be the live one — the \
+                     ticket and the installation are committed as one pair"
+                );
                 if wanted.binary_search(&retained.provider).is_ok() {
                     carried.push(moved);
                 } else {
@@ -597,20 +623,21 @@ impl OrgSensingFamily {
         // an unclamped constant would make retained demand impossible on a node
         // configured with a shorter horizon.
         let interval = SENSING_SAMPLE_INTERVAL.min(node.sensing_interest_ttl());
-        let key = sensing::SensingLeaseKey::ExactProvider {
-            audience,
-            interest_digest: spec.interest_digest(),
-            provider,
-        };
-        // WHAT WAS THERE BEFORE US, read before the acquisition can change it.
-        // An acquisition that coalesces onto an existing installation
-        // re-registers nothing, so the row it joins can be arbitrarily old —
-        // typically because a PUBLIC holder established it first and the
-        // public API arms nothing. Arming such a row at `now + ttl/2` puts its
-        // first renewal after its own expiry, deterministically.
-        let prior = node.sensing_refresh_installation(&key);
-        let ticket = match node.acquire_sensing_interest_lease(&spec, provider, interval) {
-            Ok(ticket) => ticket,
+        // ONE FACT from inside the acquisition's own transaction: the ticket,
+        // the installation that holder actually joined, and whether this
+        // acquisition (re-)registered the wire row.
+        //
+        // Neither of the last two may be re-derived afterwards by a key read.
+        // A ticket paired with a separately sampled installation can name two
+        // different incarnations — invalidate the row and let a public holder
+        // re-establish it in the gap, and the pair describes a holder that
+        // never existed, while every later validation of it agrees with itself.
+        // Freshness inferred from a before/after pair of reads fails the same
+        // way: a rival establishing in the gap makes a COALESCING acquisition
+        // look establishing, and an arbitrarily old row is then armed a full
+        // period out and expires before its first renewal.
+        let acquired = match node.acquire_sensing_interest_lease_owned(&spec, provider, interval) {
+            Ok(acquired) => acquired,
             Err(error) => {
                 node.org_sensing_demand_counters().note_no_authority();
                 tracing::debug!(
@@ -621,41 +648,30 @@ impl OrgSensingFamily {
                 return None;
             }
         };
-        // The INSTALLATION this holder joined. A live holder implies a live
-        // entry, so this is `Some` by construction; the impossible branch hands
-        // the ticket straight back rather than asserting.
-        let Some(installation_id) = node.sensing_refresh_installation(&key) else {
-            let _ = node.try_release_sensing_interest_lease(ticket);
-            return None;
-        };
+        let key = acquired.ticket.key;
         node.org_sensing_demand_counters().note_retained();
         // ARM the refresh for THIS installation. `ttl/2` on the node's own
         // soft-state horizon, as an absolute deadline on the node's single
         // worker — no timer per lease and no whole-second rounding.
         //
-        // The provenance is what grounds the FIRST deadline: an installation we
-        // established is fresh, one we merely JOINED has unknown age and is
+        // The provenance grounds the FIRST deadline: a row this acquisition
+        // registered is fresh, a row it merely joined has unknown age and is
         // adopted by renewing at once unless somebody is already renewing it.
         // Arming an installation another holder already armed keeps the EARLIER
         // deadline either way: joining renews nothing, so it must never
         // postpone the renewal.
-        let provenance = if prior == Some(installation_id) {
-            SensingArmProvenance::Adopted
-        } else {
-            SensingArmProvenance::Established
-        };
         MeshNode::arm_sensing_refresh(
             node,
             key,
-            installation_id,
+            acquired.installation_id,
             node.sensing_refresh_period(),
-            provenance,
+            acquired.provenance,
         );
         Some(RetainedProvider {
             provider,
             key,
-            ticket,
-            installation_id,
+            ticket: acquired.ticket,
+            installation_id: acquired.installation_id,
         })
     }
 }
@@ -666,7 +682,8 @@ mod tests {
     use crate::adapter::net::behavior::org::{OrgKeypair, OrgMembershipCert};
     use crate::adapter::net::behavior::org_authority::NodeAuthority;
     use crate::adapter::net::mesh::{
-        SensingRefreshOutcome, SensingRegistrationError, MIN_SENSING_REFRESH_PERIOD,
+        SensingArmProvenance, SensingRefreshOutcome, SensingRegistrationError,
+        MIN_SENSING_REFRESH_PERIOD,
     };
     use crate::adapter::net::{EntityKeypair, MeshNodeConfig};
     use crate::adapter::Adapter;
@@ -2322,21 +2339,25 @@ mod tests {
             state.refresh_adopted, 1,
             "exactly the joined installation is adopted: {state:?}"
         );
+        // Wait for the SETTLED state, not for an effect counter. The worker
+        // takes the record out, increments `refresh_renewed`, and only then
+        // re-arms: an observer that treats the counter as a completion barrier
+        // can look between those two steps and find no record at all.
         until(
             &node,
             Duration::from_secs(5),
-            "the adoption renewed",
-            || node.org_sensing_demand_state_for_test().refresh_renewed >= 1,
+            "the adoption renewed and re-armed on a grounded cadence",
+            || {
+                node.sensing_refresh_arm_for_test(&adopted_key)
+                    .is_some_and(|(deadline, _)| {
+                        deadline > Instant::now() + Duration::from_secs(10)
+                    })
+            },
         )
         .await;
-
-        // The adopted key was renewed and is now on a grounded cadence.
-        let armed = node
-            .sensing_refresh_arm_for_test(&adopted_key)
-            .expect("re-armed after the adoption renewal");
         assert!(
-            armed.0 > Instant::now() + Duration::from_secs(10),
-            "and the cadence after the renewal is a full period: {armed:?}"
+            node.org_sensing_demand_state_for_test().refresh_renewed >= 1,
+            "and the renewal itself must have happened"
         );
         // The ESTABLISHED key is fresh by construction: a full period away, and
         // deliberately NOT renewed immediately.
@@ -2406,11 +2427,6 @@ mod tests {
     /// stamp movement over an empty query says nothing about provenance.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_verified_discovery_population_retains_and_follows_floor_movement() {
-        use crate::adapter::net::behavior::capability::CapabilitySet;
-        use crate::adapter::net::behavior::org::{current_timestamp, OrgRevocationBundle};
-        use crate::adapter::net::behavior::org_scoped_ann::ScopedCapabilityAnnouncement;
-        use std::collections::BTreeMap;
-
         let node = demand_node("discovery-population", Duration::from_secs(30)).await;
         let family = OrgSensingFamily::mint(&node).expect("mint");
         let capability = CapabilityAuthorityId::for_tag(TAG);
@@ -2426,24 +2442,7 @@ mod tests {
 
         // A REAL owner-scoped announcement from a same-organization provider,
         // through the production verified-ingest path.
-        let provider_kp = EntityKeypair::generate();
-        let provider_entity = provider_kp.entity_id().clone();
-        let authority = node.node_authority().expect("authority");
-        let cert = OrgMembershipCert::try_issue(&org(), provider_entity.clone(), 1, 3600)
-            .expect("provider cert");
-        let descriptor = CapabilitySet::new().add_tag(TAG).to_bytes_compact();
-        let envelope = ScopedCapabilityAnnouncement::build_owner(
-            &provider_kp,
-            org().org_id(),
-            cert,
-            authority.audience.audience_handle,
-            authority.audience.discovery_key(),
-            1,
-            current_timestamp() + 3600,
-            &descriptor,
-        )
-        .expect("owner envelope");
-        node.ingest_scoped_announcement_for_test(&envelope.to_bytes());
+        let provider_entity = announce_owner_provider(&node);
         assert_eq!(
             node.owner_private_capability_providers(&capability).len(),
             1,
@@ -2478,13 +2477,7 @@ mod tests {
         // generation its certificate carries. The record stops being current,
         // so the next production retention drops the provider — the same
         // qualifying view that admitted it is what retires it.
-        let mut floors = BTreeMap::new();
-        floors.insert(provider_entity.clone(), 5u32);
-        let bundle = OrgRevocationBundle::try_issue(&org(), &floors).expect("bundle");
-        node.org_revocation_store()
-            .expect("store")
-            .apply_bundle(&bundle)
-            .expect("the floor raise must publish");
+        raise_provider_floor(&node, &provider_entity);
         assert!(
             node.owner_private_capability_providers(&capability)
                 .is_empty(),
@@ -2510,6 +2503,453 @@ mod tests {
         drop(empty);
         drop(retained);
         drop(after);
+        drop(family);
+    }
+
+    // ---- ACQUISITION-GROUNDED FACTS -------------------------------------
+
+    /// The ticket, its installation and its freshness all come from ONE
+    /// acquisition transaction.
+    ///
+    /// Sampling the installation by key after the acquisition returned could
+    /// pair a ticket with a DIFFERENT incarnation — invalidate the row and let
+    /// a public holder re-establish it in the gap, and the pair describes a
+    /// holder that never existed while every later validation of it agrees
+    /// with itself. Inferring freshness from a before/after pair of key reads
+    /// fails the same way in the opposite direction: a rival establishing in
+    /// the gap makes a coalescing acquisition look establishing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_acquisition_reports_its_own_installation_and_freshness() {
+        let node = demand_node("acquired-fact", Duration::from_secs(30)).await;
+        let provider = node.node_id().wrapping_add(1);
+        let spec = spec_for(&node, provider);
+        let interval = SENSING_SAMPLE_INTERVAL.min(node.sensing_interest_ttl());
+
+        // ESTABLISHING: the row goes on the wire here and now, and the holder
+        // token IS the installation identity.
+        let first = node
+            .acquire_sensing_interest_lease_owned(&spec, provider, interval)
+            .expect("the establishing acquisition succeeds");
+        assert_eq!(
+            first.provenance,
+            SensingArmProvenance::Established,
+            "an acquisition that registered the row is fresh by construction"
+        );
+        assert!(
+            node.holds_sensing_lease_token(&first.ticket),
+            "the returned ticket must be a live holder of the key it names"
+        );
+        assert_eq!(
+            node.sensing_refresh_installation(&first.ticket.key),
+            Some(first.installation_id),
+            "and the installation it reports is the live one"
+        );
+
+        // COALESCING: the same cadence changes neither table nor wire, so the
+        // acquisition reports the EXISTING installation and unknown freshness.
+        let second = node
+            .acquire_sensing_interest_lease_owned(&spec, provider, interval)
+            .expect("the coalescing acquisition succeeds");
+        assert_eq!(
+            second.provenance,
+            SensingArmProvenance::Adopted,
+            "a coalescing acquisition renewed nothing, so its row's age is unknown"
+        );
+        assert_eq!(
+            second.installation_id, first.installation_id,
+            "it joined the existing installation"
+        );
+        assert_ne!(
+            second.ticket.token, second.installation_id,
+            "and its own holder token is NOT that installation — the pair has to \
+             come from the commit, not from two reads that happen to agree"
+        );
+        assert!(node.holds_sensing_lease_token(&second.ticket));
+
+        // TIGHTENING: re-registers the row, so it is fresh again.
+        let third = node
+            .acquire_sensing_interest_lease_owned(&spec, provider, interval / 2)
+            .expect("the tightening acquisition succeeds");
+        assert_eq!(
+            third.provenance,
+            SensingArmProvenance::Established,
+            "a tightening re-registered the row"
+        );
+
+        node.try_release_sensing_interest_lease(third.ticket)
+            .expect("release");
+        node.try_release_sensing_interest_lease(second.ticket)
+            .expect("release");
+        node.try_release_sensing_interest_lease(first.ticket)
+            .expect("release");
+    }
+
+    /// Carry validation is ACTUAL MEMBERSHIP, not installation resemblance.
+    ///
+    /// The discriminating case: the installation the demand recorded is still
+    /// the live one, but the demand's token is no longer one of its holders.
+    /// An identity comparison passes there and carries ownership that does not
+    /// exist; membership cannot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_carried_ticket_is_validated_by_membership_not_identity() {
+        let node = demand_node("membership", Duration::from_secs(30)).await;
+        let family = OrgSensingFamily::mint(&node).expect("mint");
+        let provider = node.node_id().wrapping_add(1);
+        let key = lease_key_for(&node, provider);
+
+        let first = family.reconcile(TAG, &[provider]).expect("retain");
+        let holders_before = first.retained_holders_for_test();
+        assert_eq!(holders_before.len(), 1);
+        let (_, ticket, installation) = holders_before[0];
+        assert!(node.holds_sensing_lease_token(&ticket));
+
+        // A public holder keeps the INSTALLATION alive at the same cadence.
+        let public = node
+            .acquire_sensing_interest_lease(
+                &spec_for(&node, provider),
+                provider,
+                SENSING_SAMPLE_INTERVAL.min(node.sensing_interest_ttl()),
+            )
+            .expect("the public holder joins");
+        // Now retire the demand's own holder out from under it. The
+        // installation survives; the demand's token does not.
+        node.try_release_sensing_interest_lease(ticket)
+            .expect("the demand's holder is released");
+        assert_eq!(
+            node.sensing_refresh_installation(&key),
+            Some(installation),
+            "precondition: the recorded installation is STILL the live one"
+        );
+        assert!(
+            !node.holds_sensing_lease_token(&ticket),
+            "precondition: but the recorded token is no longer a holder"
+        );
+
+        // The next convergence must re-acquire rather than carry it.
+        let second = family.reconcile(TAG, &[provider]).expect("re-converge");
+        let holders_after = second.retained_holders_for_test();
+        assert_eq!(holders_after.len(), 1);
+        assert_ne!(
+            holders_after[0].1.token, ticket.token,
+            "the convergence carried a ticket that owns nothing: the installation \
+             matched, so an identity check agreed with itself"
+        );
+        assert!(
+            node.holds_sensing_lease_token(&holders_after[0].1),
+            "and the replacement must be a real holder"
+        );
+        assert_eq!(
+            node.org_sensing_demand_state_for_test()
+                .ownership_invalidated,
+            1,
+            "the dropped ownership must be counted"
+        );
+        assert!(row_present(&node, provider));
+
+        let _ = node.try_release_sensing_interest_lease(public);
+        drop(first);
+        drop(second);
+        drop(family);
+    }
+
+    /// ADOPTING a row that is already older than a period renews it before its
+    /// own expiry.
+    ///
+    /// This is the aged case rather than the merely unarmed one: the public row
+    /// is left to age past three quarters of its horizon before the family
+    /// joins, so an arm grounded in join time would schedule the first renewal
+    /// after the existing soft state had already expired.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn adopting_an_aged_installation_renews_before_it_expires() {
+        // 200 ms horizon: period 100 ms, damper gap 100 ms, expiry at 200 ms
+        // after the public registration.
+        let node = demand_node("adopt-aged", Duration::from_millis(200)).await;
+        let family = OrgSensingFamily::mint(&node).expect("mint");
+        let provider = node.node_id().wrapping_add(1);
+        let key = lease_key_for(&node, provider);
+        let interval = SENSING_SAMPLE_INTERVAL.min(node.sensing_interest_ttl());
+
+        let public = node
+            .acquire_sensing_interest_lease(&spec_for(&node, provider), provider, interval)
+            .expect("the public holder establishes");
+        let established_at = Instant::now();
+        assert!(node.sensing_refresh_arm_for_test(&key).is_none());
+
+        // AGE it: 150 ms of a 200 ms horizon is already gone when the family
+        // joins, and a join-time arm would land at 250 ms.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let demand = family.reconcile(TAG, &[provider]).expect("retain");
+        let state = node.org_sensing_demand_state_for_test();
+        assert_eq!(
+            state.refresh_adopted, 1,
+            "a coalescing join onto an aged row must be adopted: {state:?}"
+        );
+
+        // The renewal has to land before the row's own expiry.
+        until(
+            &node,
+            Duration::from_secs(5),
+            "the aged row was renewed",
+            || node.org_sensing_demand_state_for_test().refresh_renewed >= 1,
+        )
+        .await;
+        let renewed_at = Instant::now();
+        assert!(
+            renewed_at.duration_since(established_at) < node.sensing_interest_ttl(),
+            "the adoption renewed only after the existing soft state had expired: \
+             {:?} into a {:?} horizon",
+            renewed_at.duration_since(established_at),
+            node.sensing_interest_ttl()
+        );
+        assert!(row_present(&node, provider));
+
+        let _ = node.try_release_sensing_interest_lease(public);
+        drop(demand);
+        drop(family);
+    }
+
+    /// An INVALIDATION discharges the retained releases it killed, at the
+    /// transition itself.
+    ///
+    /// That is what keeps the retention set a ledger of live ownership, so an
+    /// admission decision never has to prove liveness off-lock — and can never
+    /// reject a live ticket against a state it did not examine.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_invalidation_discharges_the_releases_it_killed() {
+        let node =
+            emitter_demand_node("discharge", Duration::from_secs(30), Duration::from_secs(1)).await;
+        let family = OrgSensingFamily::mint(&node).expect("mint");
+        let provider = node.node_id();
+        let demand = family.reconcile(TAG, &[provider]).expect("retain");
+        let slow = node
+            .acquire_sensing_interest_lease(
+                &spec_for(&node, provider),
+                provider,
+                Duration::from_secs(4),
+            )
+            .expect("the looser holder acquires");
+
+        node.clear_node_authority_for_test();
+        drop(demand);
+        family.retire(TAG);
+        assert_eq!(
+            node.org_sensing_demand_state_for_test()
+                .refused_release_outstanding,
+            1,
+            "precondition: the refused release is retained"
+        );
+
+        node.install_node_authority(adopt(&node, &org(), "discharge-again"))
+            .expect("reinstall org authority");
+        invalidate_installation(&node, provider);
+
+        let state = node.org_sensing_demand_state_for_test();
+        assert_eq!(
+            state.refused_release_outstanding, 0,
+            "the invalidation must discharge ownership it killed: {state:?}"
+        );
+        assert_eq!(state.refused_release_reclaimed, 1, "{state:?}");
+        let _ = node.try_release_sensing_interest_lease(slow);
+        drop(family);
+    }
+
+    /// A fresh admission at the ceiling KEEPS the ticket.
+    ///
+    /// The retention set is an ownership ledger, not a budget: its size is
+    /// bounded by the registry's own live-holder capacity. A capacity rejection
+    /// would have to be justified against the state it was decided on, and a
+    /// check-then-lock pair cannot do that — two admissions can both observe
+    /// `N - 1`, one appends, and the other abandons the sole release capability
+    /// of a live holder. So admission never rejects; going over the derived
+    /// ceiling is counted loudly instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fresh_admission_at_the_ceiling_keeps_its_live_ticket() {
+        let node = demand_node("ceiling", Duration::from_millis(2500)).await;
+        // ONE slot, so the ceiling decision is reachable with two real
+        // refusals instead of sixteen thousand.
+        node.set_refused_release_cap_for_test(1);
+        let (first_owner, second_owner) = (
+            OrgSensingFamily::mint(&node).expect("mint first"),
+            OrgSensingFamily::mint(&node).expect("mint second"),
+        );
+        let (first, second) = (
+            node.node_id().wrapping_add(1),
+            node.node_id().wrapping_add(2),
+        );
+        let (first_key, second_key) = (lease_key_for(&node, first), lease_key_for(&node, second));
+        let first_demand = first_owner.reconcile(TAG, &[first]).expect("retain first");
+        let second_demand = second_owner
+            .reconcile(TAG, &[second])
+            .expect("retain second");
+        // LOOSER independent holders, so both family releases must re-register
+        // a relaxed aggregate — the transaction current authority can refuse.
+        let slow_first = node
+            .acquire_sensing_interest_lease(
+                &spec_for(&node, first),
+                first,
+                Duration::from_millis(2500),
+            )
+            .expect("acquire");
+        let slow_second = node
+            .acquire_sensing_interest_lease(
+                &spec_for(&node, second),
+                second,
+                Duration::from_millis(2500),
+            )
+            .expect("acquire");
+
+        node.clear_node_authority_for_test();
+        drop(first_demand);
+        drop(second_demand);
+        first_owner.retire(TAG);
+        second_owner.retire(TAG);
+
+        let state = node.org_sensing_demand_state_for_test();
+        assert_eq!(
+            state.refused_release_unowned, 0,
+            "a live refused ticket was abandoned at the ceiling: {state:?}"
+        );
+        assert_eq!(
+            state.refused_release_outstanding, 2,
+            "both live holders must still have an owner: {state:?}"
+        );
+        assert_eq!(
+            state.refused_release_overflow, 1,
+            "and going over the derived ceiling must be loud, not silent: {state:?}"
+        );
+        assert_eq!(holders(&node, &first_key), Some(2), "neither release moved");
+        assert_eq!(holders(&node, &second_key), Some(2));
+
+        node.set_refused_release_cap_for_test(usize::MAX);
+        let _ = node.try_release_sensing_interest_lease(slow_first);
+        let _ = node.try_release_sensing_interest_lease(slow_second);
+        drop(first_owner);
+        drop(second_owner);
+    }
+
+    // ---- DISCOVERY PROVENANCE HELPERS -----------------------------------
+
+    /// Announce a REAL owner-scoped capability for a fresh same-organization
+    /// provider through the production verified-ingest path, and pin it onto a
+    /// node id exactly as a session would. Returns the provider's entity.
+    fn announce_owner_provider(node: &Arc<MeshNode>) -> crate::adapter::net::identity::EntityId {
+        use crate::adapter::net::behavior::capability::CapabilitySet;
+        use crate::adapter::net::behavior::org::current_timestamp;
+        use crate::adapter::net::behavior::org_scoped_ann::ScopedCapabilityAnnouncement;
+
+        let provider_kp = EntityKeypair::generate();
+        let provider_entity = provider_kp.entity_id().clone();
+        let authority = node.node_authority().expect("authority");
+        let cert = OrgMembershipCert::try_issue(&org(), provider_entity.clone(), 1, 3600)
+            .expect("provider cert");
+        let descriptor = CapabilitySet::new().add_tag(TAG).to_bytes_compact();
+        let envelope = ScopedCapabilityAnnouncement::build_owner(
+            &provider_kp,
+            org().org_id(),
+            cert,
+            authority.audience.audience_handle,
+            authority.audience.discovery_key(),
+            1,
+            current_timestamp() + 3600,
+            &descriptor,
+        )
+        .expect("owner envelope");
+        node.ingest_scoped_announcement_for_test(&envelope.to_bytes());
+        provider_entity
+    }
+
+    /// Raise `provider`'s revocation floor above the generation its
+    /// certificate carries, through the production store.
+    fn raise_provider_floor(
+        node: &Arc<MeshNode>,
+        provider: &crate::adapter::net::identity::EntityId,
+    ) {
+        use crate::adapter::net::behavior::org::OrgRevocationBundle;
+        use std::collections::BTreeMap;
+
+        let mut floors = BTreeMap::new();
+        floors.insert(provider.clone(), 5u32);
+        let bundle = OrgRevocationBundle::try_issue(&org(), &floors).expect("bundle");
+        node.org_revocation_store()
+            .expect("store")
+            .apply_bundle(&bundle)
+            .expect("the floor raise must publish");
+    }
+
+    /// A NONEMPTY population invalidated INSIDE the capture/query/currentness
+    /// window is re-derived, and the published population is the re-derived
+    /// one.
+    ///
+    /// The empty-population version of this witness cannot discriminate: an
+    /// implementation that queried once outside the retry loop while still
+    /// redoing capture and currentness each attempt would pass it, because
+    /// every attempt's population is `[]` either way. Here attempt one sees a
+    /// real provider and attempt two must not, so the returned population is
+    /// the discriminating observation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_nonempty_population_is_rederived_when_the_view_moves_in_window() {
+        let node = demand_node("in-window-rederive", Duration::from_secs(30)).await;
+        let family = OrgSensingFamily::mint(&node).expect("mint");
+        let capability = CapabilityAuthorityId::for_tag(TAG);
+
+        let provider_entity = announce_owner_provider(&node);
+        let provider_node = node.node_id().wrapping_add(7);
+        node.pin_peer_entity_for_test(provider_node, provider_entity.clone());
+        assert_eq!(
+            node.org_sensing_authorized_population(&capability),
+            vec![provider_node],
+            "precondition: a real verified provider is in the population"
+        );
+
+        // ONE-SHOT, inside the window between the population derivation and
+        // the captured view's currentness re-proof: retire the provider's
+        // record with a real floor raise. That both moves the qualifying view
+        // AND empties the population, so the two attempts see different
+        // populations.
+        let fired = Arc::new(AtomicU64::new(0));
+        {
+            let node = node.clone();
+            let fired = fired.clone();
+            let provider_entity = provider_entity.clone();
+            let seam = node.clone();
+            seam.set_sensing_population_seam_for_test(Arc::new(move || {
+                if fired.fetch_add(1, AtomicOrdering::SeqCst) > 0 {
+                    return;
+                }
+                raise_provider_floor(&node, &provider_entity);
+            }));
+        }
+
+        let retained = family
+            .retain(TAG)
+            .expect("retain must re-derive, not refuse");
+        node.clear_sensing_population_seam_for_test();
+        assert_eq!(
+            fired.load(AtomicOrdering::SeqCst),
+            2,
+            "the population must have been derived TWICE"
+        );
+        assert!(
+            retained.population().is_empty(),
+            "the PUBLISHED population is the first attempt's, cached across the \
+             re-derivation: {:?}",
+            retained.population()
+        );
+        assert!(
+            retained.retained_providers().is_empty(),
+            "and nothing may be retained for a provider the moved view retired"
+        );
+        assert!(
+            !row_present(&node, provider_node),
+            "so no row exists for it either"
+        );
+        assert!(
+            retained.authority_is_current(),
+            "the published stamp is the one that qualified the empty population"
+        );
+        assert_eq!(node.org_sensing_demand_state_for_test().retained, 0);
+
+        drop(retained);
         drop(family);
     }
 }
