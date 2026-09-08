@@ -1,0 +1,19 @@
+net/crates/net/tests/sensing_org_exact_projection.rs
+  s_bfb52d5ec11803::t_a58d497aa6cb86 54-57,498-501,543-545,623,767-919
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "b1627739d8cb9b620c92d9ffd16efe904f39caad",
+  "prompts": {},
+  "sessions": {
+    "s_bfb52d5ec11803": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5180a5ef-838b-45f7-8776-0e6bc31fafca",
+        "model": "unknown"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
