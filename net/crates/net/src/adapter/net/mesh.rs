@@ -8730,6 +8730,17 @@ pub struct MeshNode {
     /// are only ever reached through `&self`, and the node already
     /// lives behind an `Arc`.
     responder_handshakes_paced: AtomicU64,
+    /// Rate limiter shared by every `accept()` on this node, matching
+    /// `NetAdapter`'s process-lifetime pacer.
+    ///
+    /// Node-scoped rather than per-`accept()` on purpose: a
+    /// per-`accept()` pacer hands a flooder a clean budget on the
+    /// node's very next `accept()`, so the throttle never accumulates
+    /// evidence across the accept sequence a node performs at
+    /// topology setup — and its aggregate ceiling, which is the only
+    /// bound on a flood that fans out across spoofed addresses, would
+    /// reset with it.
+    handshake_pacer: parking_lot::Mutex<super::HandshakePacer>,
     /// Proximity graph — topology awareness from pingwave propagation
     proximity_graph: Arc<ProximityGraph>,
     /// Per-peer serialization of the whole install transition —
@@ -10450,6 +10461,7 @@ impl MeshNode {
             pending_direct_initiators,
             responder_handshakes_drained: AtomicU64::new(0),
             responder_handshakes_paced: AtomicU64::new(0),
+            handshake_pacer: parking_lot::Mutex::new(super::HandshakePacer::with_defaults()),
             proximity_graph,
             peer_transitions: PeerTransitions::new(),
             reroute_policy,
@@ -15602,8 +15614,14 @@ impl MeshNode {
     }
 
     /// Handshake datagrams [`Self::accept`]'s responder dropped
-    /// before doing any Noise work because their source had spent its
-    /// per-source budget (5 per second, per accept).
+    /// before doing any Noise work, because the source had spent both
+    /// its own budget ([`Self::RESPONDER_HANDSHAKE_BURST`] per
+    /// [`Self::RESPONDER_HANDSHAKE_PACE_WINDOW`]) and the shared
+    /// reserve that keeps an exhausted per-source budget from being a
+    /// ban — or because the node-wide aggregate ceiling was spent.
+    ///
+    /// Counted per node, not per `accept()`, so the number accumulates
+    /// across a topology-setup sequence.
     ///
     /// Nonzero means something is emitting handshakes faster than any
     /// legitimate initiator does — the signature of a flood.
@@ -33943,7 +33961,8 @@ impl MeshNode {
     }
 
     /// Handshake datagrams one source may buy Noise work with per
-    /// [`Self::RESPONDER_HANDSHAKE_PACE_WINDOW`] before
+    /// [`Self::RESPONDER_HANDSHAKE_PACE_WINDOW`] before it starts
+    /// drawing on the shared over-budget reserve — past which
     /// [`Self::responder_handshakes_paced`] starts counting.
     ///
     /// Re-exported from the pacer rather than restated, so this,
@@ -33957,15 +33976,10 @@ impl MeshNode {
         &self,
         peer_node_id: u64,
     ) -> Result<(SessionKeys, SocketAddr), AdapterError> {
-        // One pacer for the whole `accept()`, not one per attempt: a
-        // flooder that burns its budget during attempt 1 stays capped
-        // through the retries, and the state dies with this call so
-        // nothing carries over between accepts.
-        let mut pacer = super::HandshakePacer::with_defaults();
         let mut attempt = 0;
         loop {
             attempt += 1;
-            match self.try_handshake_responder(peer_node_id, &mut pacer).await {
+            match self.try_handshake_responder(peer_node_id).await {
                 Ok(result) => return Ok(result),
                 Err(e) if attempt < self.config.handshake_retries => {
                     tracing::warn!(attempt, error = %e, "mesh accept failed, retrying");
@@ -34000,9 +34014,10 @@ impl MeshNode {
     /// non-matching handshake datagrams inside the deadline instead
     /// means only a genuine absence of `msg1` ends the attempt. It
     /// also removes a cheap off-path DoS: a sprayer of junk handshake
-    /// packets can now delay an `accept()`, not kill it — and `pacer`
-    /// caps how much Noise work each source can buy per second, so
-    /// "delay" cannot become "starve".
+    /// packets can now delay an `accept()`, not kill it — and the
+    /// node's pacer caps how much Noise work the traffic can buy per
+    /// second, in aggregate as well as per source, so "delay" cannot
+    /// become "starve".
     ///
     /// # Diagnosing a genuine key mismatch
     ///
@@ -34020,7 +34035,6 @@ impl MeshNode {
     async fn try_handshake_responder(
         &self,
         peer_node_id: u64,
-        pacer: &mut super::HandshakePacer,
     ) -> Result<(SessionKeys, SocketAddr), AdapterError> {
         let timeout = self.config.handshake_timeout;
         let socket_arc = self.socket.socket_arc();
@@ -34065,10 +34079,10 @@ impl MeshNode {
                     continue;
                 }
 
-                // Pace BEFORE the Noise setup: the point is to bound
-                // per-source cryptographic work, and a rejected
-                // source must not buy an ephemeral keypair.
-                if !pacer.check_and_record(source) {
+                // Pace BEFORE the Noise read: the point is to bound
+                // the responder's cryptographic work, and a rejected
+                // source must not buy a Diffie-Hellman.
+                if !self.handshake_pacer.lock().check_and_record(source) {
                     self.responder_handshakes_paced
                         .fetch_add(1, Ordering::Relaxed);
                     tracing::debug!(

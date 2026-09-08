@@ -445,24 +445,72 @@ mod routing {
 /// Shared inbound queue type
 type InboundQueues = Arc<DashMap<u16, SegQueue<StoredEvent>>>;
 
-/// Per-source rate limiter for the handshake responder loop.
+/// Rate limiter for the handshake responder loop.
 ///
 /// The responder used to accept whichever source emitted msg1
-/// first, with no per-source pacing — an attacker who knows the PSK
+/// first, with no pacing — an attacker who knows the PSK
 /// (PSKs are typically multi-tenant) could race the legitimate
 /// initiator's msg1; even without the PSK an attacker could flood
 /// handshake-flagged datagrams to monopolize the recv loop.
 ///
-/// `HandshakePacer` keeps a rolling count of recent attempts per
-/// source and rejects sources that exceed the budget within the
-/// window. Expired entries are garbage-collected on a periodic
-/// schedule rather than on every check, so a sustained flood from
-/// many distinct sources doesn't pay an O(n) sweep per packet.
+/// # Why a per-source budget is not enough on its own
+///
+/// A UDP source address is trivially spoofable, so "this source is
+/// over budget" is not evidence that this source is hostile. Dropping
+/// on the per-source budget alone hands an off-path attacker a precise
+/// denial primitive: learn the initiator's address (it is in the clear
+/// on every datagram), send `max_per_window` junk handshakes carrying
+/// it, and every real `msg1` from that address is dropped BEFORE Noise
+/// for the rest of the window. The victim's `accept()` then spends its
+/// whole budget and reports a bare timeout, because a paced drop never
+/// even looks at the payload. The same shape occurs with no attacker
+/// at all: a responder draining an initiator's own stale retransmits
+/// spends that initiator's budget on its way to reading its live
+/// `msg1`.
+///
+/// So an over-budget source is throttled, not banned — it draws from a
+/// small shared reserve. Under a targeted spoof the reserve is idle and
+/// the real `msg1` still gets its Noise read; under a genuine flood the
+/// reserve is what bounds how much crypto the flood can buy.
+///
+/// # The three ceilings
+///
+/// A datagram is admitted only if the aggregate ceiling has room AND
+/// either its source is within its own budget or the over-budget
+/// reserve has room:
+///
+/// - `max_per_window` — per source. Sized for a legitimate initiator.
+/// - `over_budget_reserve` — shared, for sources past that budget.
+///   Bounds a single-source flood without making an exhausted
+///   per-source budget fatal.
+/// - `aggregate_per_window` — shared, over everything. Bounds a flood
+///   that fans out across many spoofed addresses, where every datagram
+///   looks like a fresh in-budget source.
+///
+/// Residual, stated plainly: an attacker who both saturates the
+/// aggregate ceiling and spoofs the victim's address can still keep the
+/// victim's handshake out. Nothing short of a return-routability
+/// challenge (a DTLS/QUIC-style retry cookie) closes that, and unlike
+/// the per-source-only design it costs the attacker sustained line rate
+/// rather than five datagrams.
+///
+/// Expired entries are garbage-collected on a periodic schedule rather
+/// than on every check, so a sustained flood from many distinct sources
+/// doesn't pay an O(n) sweep per packet.
 pub(crate) struct HandshakePacer {
     /// Per-source `(count_in_window, window_start)`.
     entries: std::collections::HashMap<std::net::SocketAddr, (u32, std::time::Instant)>,
     /// Maximum attempts per source within `window`.
     max_per_window: u32,
+    /// Maximum admissions per `window` across all sources that have
+    /// already spent their per-source budget.
+    over_budget_reserve: u32,
+    /// Maximum admissions per `window` across all sources, in budget
+    /// or not.
+    aggregate_per_window: u32,
+    /// `(over_budget_admitted, total_admitted, window_start)` for the
+    /// two shared ceilings.
+    shared: (u32, u32, std::time::Instant),
     /// Window length.
     window: std::time::Duration,
     /// Last time we ran the GC pass.
@@ -485,18 +533,50 @@ impl HandshakePacer {
     /// drift from each other.
     pub(crate) const DEFAULT_BURST: u32 = 5;
 
+    /// Admissions per [`Self::DEFAULT_WINDOW`] shared by every source
+    /// that has already spent [`Self::DEFAULT_BURST`].
+    ///
+    /// Well above what one initiator's retransmits plus its own stale
+    /// copies can need, so a spoofed or self-inflicted per-source
+    /// exhaustion does not keep a real `msg1` from being read; far
+    /// below what a flood wants.
+    pub(crate) const DEFAULT_OVER_BUDGET_RESERVE: u32 = 32;
+
+    /// Admissions per [`Self::DEFAULT_WINDOW`] across all sources.
+    ///
+    /// The only ceiling a fan-out flood cannot walk around by using a
+    /// fresh spoofed address per datagram. Sized to stay clear of a
+    /// large mesh's legitimate fan-in — a node bringing up hundreds of
+    /// peers sees a handful of `msg1` per second, not hundreds — while
+    /// still capping the responder's Noise work at a few milliseconds
+    /// of CPU per second.
+    pub(crate) const DEFAULT_AGGREGATE_BURST: u32 = 256;
+
     /// Window for [`Self::DEFAULT_BURST`].
     pub(crate) const DEFAULT_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
 
     /// A pacer carrying the shipped budget — see [`Self::DEFAULT_BURST`].
     pub(crate) fn with_defaults() -> Self {
-        Self::new(Self::DEFAULT_BURST, Self::DEFAULT_WINDOW)
+        Self::new(
+            Self::DEFAULT_BURST,
+            Self::DEFAULT_OVER_BUDGET_RESERVE,
+            Self::DEFAULT_AGGREGATE_BURST,
+            Self::DEFAULT_WINDOW,
+        )
     }
 
-    pub(crate) fn new(max_per_window: u32, window: std::time::Duration) -> Self {
+    pub(crate) fn new(
+        max_per_window: u32,
+        over_budget_reserve: u32,
+        aggregate_per_window: u32,
+        window: std::time::Duration,
+    ) -> Self {
         Self {
             entries: std::collections::HashMap::new(),
             max_per_window,
+            over_budget_reserve,
+            aggregate_per_window,
+            shared: (0, 0, std::time::Instant::now()),
             window,
             last_gc: std::time::Instant::now(),
             // 4096 entries × ~40 bytes each ≈ 160 KiB — comfortable
@@ -506,9 +586,11 @@ impl HandshakePacer {
         }
     }
 
-    /// Record an attempt from `source`. Returns `true` if the source
-    /// is within budget (caller may proceed); `false` if it has
-    /// exceeded the rate limit (caller must drop the packet).
+    /// Record an attempt from `source`. Returns `true` if the caller
+    /// may proceed to Noise; `false` if the packet must be dropped.
+    ///
+    /// See the type doc for why an over-budget source is throttled
+    /// against a shared reserve rather than dropped outright.
     pub(crate) fn check_and_record(&mut self, source: std::net::SocketAddr) -> bool {
         let now = std::time::Instant::now();
         // Amortized GC: only run the O(n) `retain` sweep when one
@@ -528,6 +610,12 @@ impl HandshakePacer {
             self.last_gc = now;
         }
 
+        // Roll the shared window before consulting either ceiling, so
+        // the per-source and shared budgets refill on the same clock.
+        if now.duration_since(self.shared.2) > self.window {
+            self.shared = (0, 0, now);
+        }
+
         let entry = self.entries.entry(source).or_insert((0, now));
         if now.duration_since(entry.1) > self.window {
             // Window expired; reset the counter.
@@ -535,7 +623,27 @@ impl HandshakePacer {
             entry.1 = now;
         }
         entry.0 = entry.0.saturating_add(1);
-        entry.0 <= self.max_per_window
+        let in_source_budget = entry.0 <= self.max_per_window;
+
+        // The aggregate ceiling binds first and binds everyone: it is
+        // the only one a flood cannot walk around by spoofing a fresh
+        // source address per datagram.
+        if self.shared.1 >= self.aggregate_per_window {
+            return false;
+        }
+
+        // An over-budget source is throttled, not banned — a spoofable
+        // address means an exhausted budget is not proof of hostility.
+        // It draws from the shared reserve instead.
+        if !in_source_budget {
+            if self.shared.0 >= self.over_budget_reserve {
+                return false;
+            }
+            self.shared.0 = self.shared.0.saturating_add(1);
+        }
+
+        self.shared.1 = self.shared.1.saturating_add(1);
+        true
     }
 }
 
@@ -2139,33 +2247,38 @@ mod tests {
         );
     }
 
-    /// Regression: the handshake responder must rate-limit per
-    /// source so a flooder can't monopolize the recv loop.
-    /// `HandshakePacer` is the building block: it tracks
-    /// `(count, window_start)` per source and rejects after
-    /// `max_per_window` attempts within `window`.
+    /// Regression: the handshake responder must rate-limit a flooder
+    /// so it can't monopolize the recv loop. `HandshakePacer` is the
+    /// building block: per source it tracks `(count, window_start)`
+    /// and pushes anything past `max_per_window` onto a shared
+    /// reserve, which is itself bounded.
     #[test]
     fn handshake_pacer_rejects_floods_per_source() {
         use std::time::Duration;
-        let mut pacer = HandshakePacer::new(3, Duration::from_millis(50));
+        // Per-source 3, reserve 2, aggregate high enough not to bind.
+        let mut pacer = HandshakePacer::new(3, 2, 100, Duration::from_millis(50));
 
         let attacker: std::net::SocketAddr = "10.0.0.1:9000".parse().unwrap();
         let legit: std::net::SocketAddr = "10.0.0.2:9000".parse().unwrap();
 
-        // Attacker fires 3 attempts — all allowed (within budget).
-        for _ in 0..3 {
+        // 3 within the per-source budget, then 2 more off the shared
+        // reserve — a spoofable address means an exhausted budget is
+        // not proof of hostility, so the source is throttled rather
+        // than banned outright.
+        for _ in 0..5 {
             assert!(pacer.check_and_record(attacker));
         }
-        // Fourth and beyond — rejected.
+        // Reserve spent: everything beyond is dropped before Noise.
         for _ in 0..10 {
             assert!(
                 !pacer.check_and_record(attacker),
-                "attacker exceeding budget must be dropped"
+                "attacker past budget AND reserve must be dropped"
             );
         }
 
         // The legitimate initiator (different source) is unaffected
-        // by the attacker's burst — the budget is per-source.
+        // by the attacker's burst — it is still within its own budget,
+        // and the budget is per-source.
         assert!(
             pacer.check_and_record(legit),
             "legitimate source must still get through despite attacker flood"
@@ -2176,6 +2289,68 @@ mod tests {
         assert!(
             pacer.check_and_record(attacker),
             "attacker budget must refill after window"
+        );
+    }
+
+    /// A UDP source address is spoofable, so burning a source's
+    /// per-source budget must not be enough to keep that source out.
+    ///
+    /// Without the shared reserve this is a precise off-path denial
+    /// primitive: the initiator's address is in the clear on the wire,
+    /// `max_per_window` junk datagrams carrying it exhaust its budget,
+    /// and every real `msg1` from it is then dropped BEFORE
+    /// `read_message` for the rest of the window — so the victim's
+    /// `accept()` burns its whole budget and reports a bare timeout,
+    /// having never looked at a payload. The same shape occurs with no
+    /// attacker at all when the responder drains an initiator's own
+    /// stale retransmits on its way to that initiator's live `msg1`.
+    #[test]
+    fn handshake_pacer_reserve_survives_a_spoofed_per_source_exhaustion() {
+        use std::time::Duration;
+        let mut pacer = HandshakePacer::new(3, 8, 100, Duration::from_secs(60));
+
+        let victim: std::net::SocketAddr = "10.0.0.7:9000".parse().unwrap();
+
+        // Spoofer spends the victim's whole per-source budget.
+        for _ in 0..3 {
+            assert!(pacer.check_and_record(victim));
+        }
+
+        // The victim's real msg1 — and several retransmits — must
+        // still reach Noise, off the reserve.
+        for i in 0..8 {
+            assert!(
+                pacer.check_and_record(victim),
+                "a spoofed budget exhaustion must not ban the source (retransmit {i})"
+            );
+        }
+    }
+
+    /// The per-source budget alone cannot bound a flood that fans out
+    /// across spoofed addresses: every datagram then looks like a
+    /// fresh, in-budget source and buys a full Noise read. The
+    /// aggregate ceiling is the one that binds.
+    #[test]
+    fn handshake_pacer_caps_a_fan_out_flood_in_aggregate() {
+        use std::time::Duration;
+        let aggregate = 32;
+        let mut pacer = HandshakePacer::new(5, 8, aggregate, Duration::from_secs(60));
+
+        let mut admitted = 0;
+        for i in 0..4096u32 {
+            // A distinct source per datagram — each is in budget.
+            let source: std::net::SocketAddr =
+                format!("10.1.{}.{}:9000", (i >> 8) & 0xff, i & 0xff)
+                    .parse()
+                    .unwrap();
+            if pacer.check_and_record(source) {
+                admitted += 1;
+            }
+        }
+
+        assert_eq!(
+            admitted, aggregate,
+            "a fan-out flood must be capped by the aggregate ceiling, not by              the per-source budget it walks around"
         );
     }
 }
