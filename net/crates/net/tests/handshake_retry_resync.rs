@@ -219,10 +219,11 @@ async fn an_absent_responder_still_fails_inside_the_budget() {
     );
 }
 
-/// Mirrors `MeshNode::RESPONDER_HANDSHAKE_BURST` — the per-source
-/// handshake budget the responder paces to. Private in the crate, so
-/// the tests pin it here: if it moves, these witnesses say so.
-const RESPONDER_BURST: usize = 5;
+/// The per-source handshake budget the responder paces to, read from
+/// the responder itself rather than mirrored: a mirrored copy makes a
+/// budget change surface as an off-by-N counter mismatch in an
+/// unrelated-looking assertion instead of a compile error.
+const RESPONDER_BURST: usize = MeshNode::RESPONDER_HANDSHAKE_BURST as usize;
 
 /// Build a well-formed handshake packet whose body cannot decrypt —
 /// exactly what another pairing's `msg1` looks like to this

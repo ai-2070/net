@@ -33943,15 +33943,15 @@ impl MeshNode {
     }
 
     /// Handshake datagrams one source may buy Noise work with per
-    /// [`Self::RESPONDER_HANDSHAKE_PACE_WINDOW`] during a single
-    /// `accept()`. A legitimate initiator sends at most
-    /// `handshake_retries` retransmits spread across its per-attempt
-    /// windows, so this is pure headroom for it; a flooder is capped
-    /// at five ephemeral keypairs per second. Same shape as
-    /// `NetAdapter`'s responder pacing.
-    const RESPONDER_HANDSHAKE_BURST: u32 = 5;
+    /// [`Self::RESPONDER_HANDSHAKE_PACE_WINDOW`] before
+    /// [`Self::responder_handshakes_paced`] starts counting.
+    ///
+    /// Re-exported from the pacer rather than restated, so this,
+    /// `NetAdapter`'s responder, and the tests that witness them all
+    /// read one definition.
+    pub const RESPONDER_HANDSHAKE_BURST: u32 = super::HandshakePacer::DEFAULT_BURST;
     /// Window for [`Self::RESPONDER_HANDSHAKE_BURST`].
-    const RESPONDER_HANDSHAKE_PACE_WINDOW: Duration = Duration::from_secs(1);
+    pub const RESPONDER_HANDSHAKE_PACE_WINDOW: Duration = super::HandshakePacer::DEFAULT_WINDOW;
 
     async fn handshake_responder(
         &self,
@@ -33960,16 +33960,8 @@ impl MeshNode {
         // One pacer for the whole `accept()`, not one per attempt: a
         // flooder that burns its budget during attempt 1 stays capped
         // through the retries, and the state dies with this call so
-        // nothing carries over between accepts. Budget mirrors
-        // `NetAdapter`'s responder — 5 per second per source is far
-        // above any legitimate initiator (`handshake_retries`
-        // retransmits spread over `handshake_timeout` windows) and
-        // low enough that a flooder pays for at most 5 Noise setups
-        // per second per source.
-        let mut pacer = super::HandshakePacer::new(
-            Self::RESPONDER_HANDSHAKE_BURST,
-            Self::RESPONDER_HANDSHAKE_PACE_WINDOW,
-        );
+        // nothing carries over between accepts.
+        let mut pacer = super::HandshakePacer::with_defaults();
         let mut attempt = 0;
         loop {
             attempt += 1;

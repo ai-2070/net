@@ -474,6 +474,25 @@ pub(crate) struct HandshakePacer {
 }
 
 impl HandshakePacer {
+    /// Datagrams one source may buy Noise work with per
+    /// [`Self::DEFAULT_WINDOW`].
+    ///
+    /// Plenty for any legitimate initiator, which is RTT-limited and
+    /// sends at most `handshake_retries` retransmits spread across
+    /// its per-attempt windows; tight enough to throttle a flooder on
+    /// consumer-grade hardware. Defined once here so the responder
+    /// loops that pace to it, and the tests that witness them, cannot
+    /// drift from each other.
+    pub(crate) const DEFAULT_BURST: u32 = 5;
+
+    /// Window for [`Self::DEFAULT_BURST`].
+    pub(crate) const DEFAULT_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// A pacer carrying the shipped budget — see [`Self::DEFAULT_BURST`].
+    pub(crate) fn with_defaults() -> Self {
+        Self::new(Self::DEFAULT_BURST, Self::DEFAULT_WINDOW)
+    }
+
     pub(crate) fn new(max_per_window: u32, window: std::time::Duration) -> Self {
         Self {
             entries: std::collections::HashMap::new(),
@@ -564,13 +583,7 @@ impl NetAdapter {
             shutdown: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(Notify::new()),
             initialized: AtomicBool::new(false),
-            // 5 attempts per second per source, plenty for any
-            // legitimate initiator (RTT-limited) and tight enough
-            // to throttle a flooder on consumer-grade hardware.
-            handshake_pacer: parking_lot::Mutex::new(HandshakePacer::new(
-                5,
-                std::time::Duration::from_secs(1),
-            )),
+            handshake_pacer: parking_lot::Mutex::new(HandshakePacer::with_defaults()),
         })
     }
 
