@@ -37,6 +37,17 @@
 //!   datagrams that don't decrypt under this pairing's prologue —
 //!   stale `msg1` copies left by an earlier pairing's retransmits —
 //!   cost the responder loop iterations, never attempts.
+//! - **Draining is bounded, and does not starve the initiator.** A
+//!   one-source flood is paced, every datagram is accounted for, and
+//!   the legitimate initiator still connects.
+//! - **Draining does not swallow someone else's reply.** A
+//!   pre-`start()` `accept()` shares the node's socket with a
+//!   concurrent `connect()`; the reply it cannot use is handed over,
+//!   not discarded.
+//! - **Draining does not swallow the diagnosis.** A wrong-PSK peer is
+//!   drained like any other non-decrypting datagram, but the error
+//!   names the decrypt failure — including when the rejection was
+//!   observed several attempts before the one that finally times out.
 
 #![cfg(feature = "net")]
 
