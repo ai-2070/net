@@ -433,7 +433,7 @@ async fn a_concurrent_accept_does_not_swallow_a_connects_reply() {
 
     // Nobody will ever send this node's msg1, so the hub's responder
     // stays in its drain loop for the accept's entire budget.
-    let absent_peer = 0x0dead_beefu64;
+    let absent_peer = 0x0000_dead_beef_u64;
 
     let hub_id = hub.node_id();
     let responder = peer.clone();
