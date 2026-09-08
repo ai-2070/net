@@ -673,8 +673,18 @@ async fn sensing_is_advisory_and_neither_plane_lets_it_authorize() {
     let provider_id = provider.node_id();
 
     let budget = ConsumerLatencyBudget::default();
-    let captured = seam.demand.project_sensed_order(Instant::now(), &budget);
+    let captured_at = Instant::now();
+    let captured = seam.demand.project_sensed_order(captured_at, &budget);
     assert_eq!(captured.viable(), &[provider_id], "precondition: viable");
+    // An INDEPENDENT copy of what the capture said, taken now. Comparing the
+    // capture against a later FRESH projection would be wrong: a fresh
+    // projection is evaluated at a fresh instant and is required to age.
+    let recorded = (
+        captured.rows().to_vec(),
+        captured.viable().to_vec(),
+        captured.potential().to_vec(),
+        captured.non_viable().to_vec(),
+    );
 
     let calls = Arc::new(AtomicU64::new(0));
     let _serve = provider
@@ -737,12 +747,19 @@ async fn sensing_is_advisory_and_neither_plane_lets_it_authorize() {
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    // The capture is unchanged: it describes the instant it was taken.
+    // THE CAPTURE ITSELF is unchanged: provider churn cannot reach into a value
+    // that was already taken. This is deliberately NOT a comparison against a
+    // later fresh projection - a fresh projection is evaluated at a fresh
+    // instant and is REQUIRED to age out (proved positively below).
     assert_eq!(
-        captured,
-        seam.demand.project_sensed_order(Instant::now(), &budget),
-        "provider churn after a capture does not rewrite it, and the capture \
-         confers nothing"
+        (
+            captured.rows().to_vec(),
+            captured.viable().to_vec(),
+            captured.potential().to_vec(),
+            captured.non_viable().to_vec()
+        ),
+        recorded,
+        "a capture is a value, not a handle on live state"
     );
 
     // ---- LOCAL fencing -------------------------------------------------
@@ -760,10 +777,46 @@ async fn sensing_is_advisory_and_neither_plane_lets_it_authorize() {
         "and the invocation plane refuses to capture an authority at all, so no \
          intent can be minted from an advisory order"
     );
+    // The capture STILL says what it said - losing local authority does not
+    // rewrite a value either.
     assert_eq!(
-        seam.demand.project_sensed_order(Instant::now(), &budget),
-        captured,
+        captured.viable().to_vec(),
+        recorded.1,
         "the advisory capture is still just data, with or without authority"
+    );
+
+    // ---- AND AGING IS CORRECT, not something this witness papers over ----
+    // A FRESH projection is evaluated at the instant it is given, so evidence
+    // that has outlived its window must read Unknown. Proved by asking for a
+    // far-future instant rather than by waiting: no sleep, no TTL tuning, no
+    // retry. A witness that instead demanded a fresh projection keep matching
+    // an old capture would fail the moment real expiry arrived - which is
+    // exactly the bug this replaces.
+    let aged = seam
+        .demand
+        .project_sensed_order(captured_at + SENSING_TTL * 4, &budget);
+    assert_eq!(
+        aged.rows().len(),
+        captured.rows().len(),
+        "the population is an immutable input, so aging changes verdicts, not \
+         membership: {aged:?}"
+    );
+    assert!(
+        aged.rows()
+            .iter()
+            .all(|row| row.readiness == ProjectedReadiness::Unknown),
+        "evidence past its window reads Unknown at the instant it is evaluated \
+         against: {aged:?}"
+    );
+    assert!(
+        aged.viable().is_empty() && aged.non_viable().is_empty(),
+        "and aged-out evidence neither ranks nor prunes: {aged:?}"
+    );
+    assert_eq!(
+        aged.potential(),
+        &[provider_id],
+        "it is held as potential - absence of fresh evidence is not evidence of \
+         absence: {aged:?}"
     );
 
     drop(_serve);
