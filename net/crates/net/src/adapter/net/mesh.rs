@@ -574,15 +574,24 @@ type InboundQueues = Arc<DashMap<u16, SegQueue<StoredEvent>>>;
 /// exactly that one and the handshake times out, so this evicts the
 /// oldest candidate instead.
 struct DirectHandshakeInbox {
+    /// Queued candidates and the retirement flag under ONE lock.
+    ///
+    /// They cannot be separate: retirement has to preempt whatever is
+    /// already queued, not queue behind it. See [`Self::close`].
+    state: parking_lot::Mutex<DirectHandshakeInboxState>,
+    /// Wakes the waiter on deposit or close.
+    signal: Notify,
+}
+
+/// Interior of a [`DirectHandshakeInbox`].
+struct DirectHandshakeInboxState {
     /// Candidate payloads, oldest first. Never longer than
     /// [`DIRECT_HANDSHAKE_INBOX_DEPTH`].
-    queue: parking_lot::Mutex<std::collections::VecDeque<Bytes>>,
+    queue: std::collections::VecDeque<Bytes>,
     /// Set when a later `connect()` to the same address displaces this
     /// registration, so the loser fails fast instead of waiting out its
     /// deadline for datagrams that will now be delivered elsewhere.
-    closed: AtomicBool,
-    /// Wakes the waiter on deposit or close.
-    signal: Notify,
+    closed: bool,
 }
 
 /// Depth of a [`DirectHandshakeInbox`]. A handshake expects exactly one
@@ -593,10 +602,10 @@ const DIRECT_HANDSHAKE_INBOX_DEPTH: usize = 8;
 impl DirectHandshakeInbox {
     fn new() -> Self {
         Self {
-            queue: parking_lot::Mutex::new(std::collections::VecDeque::with_capacity(
-                DIRECT_HANDSHAKE_INBOX_DEPTH,
-            )),
-            closed: AtomicBool::new(false),
+            state: parking_lot::Mutex::new(DirectHandshakeInboxState {
+                queue: std::collections::VecDeque::with_capacity(DIRECT_HANDSHAKE_INBOX_DEPTH),
+                closed: false,
+            }),
             signal: Notify::new(),
         }
     }
@@ -605,41 +614,59 @@ impl DirectHandshakeInbox {
     /// Returns `false` if this inbox has been retired, in which case
     /// the caller still owns the datagram.
     fn deposit(&self, payload: Bytes) -> bool {
-        if self.closed.load(Ordering::Acquire) {
-            return false;
-        }
         {
-            let mut queue = self.queue.lock();
-            if queue.len() >= DIRECT_HANDSHAKE_INBOX_DEPTH {
-                queue.pop_front();
+            let mut state = self.state.lock();
+            if state.closed {
+                return false;
             }
-            queue.push_back(payload);
+            if state.queue.len() >= DIRECT_HANDSHAKE_INBOX_DEPTH {
+                state.queue.pop_front();
+            }
+            state.queue.push_back(payload);
         }
         self.signal.notify_one();
         true
     }
 
-    /// Retire this inbox. A waiter on it wakes and gets `None`.
+    /// Retire this inbox and discard what it is holding. A waiter on it
+    /// wakes and gets `None`.
+    ///
+    /// Discarding matters. Retirement means a later `connect()` to the
+    /// same address has taken the registration over, so the queued
+    /// candidates are now that connection's business — and one of them
+    /// may be a `msg2` the displaced handshake can still complete on.
+    /// Leaving them readable would let the loser finish and install a
+    /// session against the same peer, racing the install the winner is
+    /// about to perform.
     fn close(&self) {
-        self.closed.store(true, Ordering::Release);
+        {
+            let mut state = self.state.lock();
+            state.closed = true;
+            state.queue.clear();
+        }
         self.signal.notify_one();
     }
 
-    /// Next candidate, waiting for one. `None` once retired and drained.
+    /// Next candidate, waiting for one. `None` once retired.
     async fn next(&self) -> Option<Bytes> {
         loop {
-            // Scoped so the `parking_lot` guard cannot straddle the
-            // await below — on edition 2021 an `if let` would hold it
-            // for the whole block.
-            let queued = { self.queue.lock().pop_front() };
-            if queued.is_some() {
-                return queued;
-            }
-            if self.closed.load(Ordering::Acquire) {
-                return None;
+            // Retirement and dequeue under one lock, so a `close` can
+            // never be overtaken by a candidate queued before it. The
+            // block also keeps the `parking_lot` guard from straddling
+            // the await below — on edition 2021 an `if let` would hold
+            // it for the whole block.
+            let taken = {
+                let mut state = self.state.lock();
+                if state.closed {
+                    return None;
+                }
+                state.queue.pop_front()
+            };
+            if taken.is_some() {
+                return taken;
             }
             // `notify_one` stores a permit when there is no waiter, so
-            // a deposit landing between the checks above and this await
+            // a deposit landing between the check above and this await
             // is not lost.
             self.signal.notified().await;
         }
@@ -39565,6 +39592,29 @@ mod direct_handshake_inbox_tests {
         assert!(
             inbox.next().await.is_none(),
             "a waiter on a retired inbox must fail fast, not wait out its deadline",
+        );
+    }
+
+    /// Retirement must preempt what is already queued, not trail it.
+    ///
+    /// A displaced registration that can still hand out candidates can
+    /// still complete its handshake — off datagrams that now belong to
+    /// the `connect()` which replaced it — and then install a session
+    /// against the same peer, racing the winner's install. Whether the
+    /// leftovers happen to contain a usable `msg2` is not something
+    /// this layer can see, so the only safe answer is to drop them.
+    #[tokio::test]
+    async fn retirement_discards_candidates_queued_before_it() {
+        let inbox = DirectHandshakeInbox::new();
+        assert!(inbox.deposit(candidate(1)));
+        assert!(inbox.deposit(candidate(2)));
+
+        inbox.close();
+
+        assert!(
+            inbox.next().await.is_none(),
+            "a displaced registration must not keep serving the candidates \
+             it was holding when it lost",
         );
     }
 
