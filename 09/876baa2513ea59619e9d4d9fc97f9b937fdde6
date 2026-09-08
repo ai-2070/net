@@ -1,0 +1,32 @@
+net/crates/net/tests/handshake_retry_resync.rs
+  s_bfb52d5ec11803::t_4b950d324871c1 425-428,442-443
+  s_bfb52d5ec11803::t_388c1493627f86 444-450
+  s_bfb52d5ec11803::t_dd97880e4fcbe8 410-424,429-441,451-454,456-464
+  s_bfb52d5ec11803::t_95ae4eb75b32fc 455
+net/crates/net/src/adapter/net/mesh.rs
+  s_bfb52d5ec11803::t_4bcce7ddff17d3 8755-8759,33898-33911
+  s_bfb52d5ec11803::t_bebbf11485934e 33914-33915,33927-33944,33947-33948,33950-33951,33953-33959
+  s_bfb52d5ec11803::t_2883a3c2804a40 33945-33946,34218-34226
+  s_bfb52d5ec11803::t_41139901c06d7c 1445-1458
+  s_bfb52d5ec11803::t_4b950d324871c1 34227-34233
+  s_bfb52d5ec11803::t_9564be580cebdc 576-599,18503
+  s_bfb52d5ec11803::t_6be9d0bee94a5f 33961-33971,33973-33976,33978-33981,33983-33998,34000-34019,34031,34035,34044-34050
+  s_bfb52d5ec11803::t_1a8416b01f5bd4 558-575,1459,8760,10329
+  s_bfb52d5ec11803::t_d3f25c213bf8a4 34234
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "09876baa2513ea59619e9d4d9fc97f9b937fdde6",
+  "prompts": {},
+  "sessions": {
+    "s_bfb52d5ec11803": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5180a5ef-838b-45f7-8776-0e6bc31fafca",
+        "model": "claude-opus-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
