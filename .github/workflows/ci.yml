@@ -2090,6 +2090,62 @@ jobs:
       - name: Run Rust SDK tests (includes mesh_stream_backpressure, mesh_rpc_bidi_typed, tool_*, sensing_provider)
         run: cargo nextest run --no-fail-fast --no-tests=fail --features "net cortex dataforts testing compute nat-traversal port-mapping aggregator tool macros"
 
+      # === OA-6: the PRODUCTION organization exact-sensing call edge =======
+      #
+      # The step above already ran this binary by auto-discovery. This one
+      # exists so the roster cannot shrink silently: it names each witness and
+      # requires each to RUN and PASS on its own, with retries off (the
+      # `.config/nextest.toml` override covers this binary for the same
+      # reason - a retry could turn a lost readiness observation into green).
+      #
+      # `--no-tests=fail` is load-bearing twice over: `-E 'test(=name)'` exits
+      # 0 when it matches nothing, so a renamed or deleted witness would be
+      # indistinguishable from a pass.
+      #
+      # Feature note: this crate's dev-dependency on net-mesh enables
+      # `fixtures`, so this step is NOT a fixtures-off proof. The production
+      # path's independence from that feature is the separate lib-only build
+      # below, which compiles no dev-dependencies.
+      - name: Sensing — organization exact production call edge (OA-6)
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          FEATURES="net cortex dataforts testing compute nat-traversal port-mapping aggregator tool macros"
+          REQUIRED="
+            the_production_call_lands_on_the_sensed_provider
+            the_production_call_follows_the_sensed_rank_between_viable_providers
+            a_consumer_without_sensing_plans_the_deterministic_order
+            an_all_not_ready_population_still_calls_in_the_deterministic_order
+            expired_evidence_falls_back_and_manufactures_no_error
+            the_binding_owns_the_acquisition_and_the_last_owner_retires_it
+            the_sdk_sensed_adapter_adds_no_ordering_structure
+          "
+          out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                  --retries 0 --features "$FEATURES" --test org_exact_sensing 2>&1) \
+            || { printf '%s\n' "$out"; echo "::error::the OA-6 production witnesses did not pass"; exit 1; }
+          printf '%s\n' "$out" | tail -3
+          listed=$(printf '%s\n' "$out" | grep -cE '^ +(PASS|FAIL)')
+          pinned=0
+          for required in $REQUIRED; do
+            single=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                       --retries 0 --features "$FEATURES" --test org_exact_sensing \
+                       -E "test(=$required)" 2>&1) \
+              || { printf '%s\n' "$single"; echo "::error::$required did not run and pass as exactly one test"; exit 1; }
+            pinned=$((pinned + 1))
+          done
+          [ "$listed" -ge 7 ] \
+            || { echo "::error::expected at least 7 production witnesses, saw $listed"; exit 1; }
+          echo "organization exact production call edge: $listed listed, $pinned pinned by name, all green"
+
+      # The DARK-BOUNDARY fact for the production path: the SDK library builds
+      # with net-mesh's `fixtures` feature OFF. `--lib` compiles no
+      # dev-dependencies, and the SDK's own `[dependencies]` entry for net-mesh
+      # enables no features - so if the sensed call path ever reached a
+      # fixtures-gated seam, this step is what fails.
+      - name: Sensing — the production call path needs no fixtures seam (OA-6)
+        if: ${{ !cancelled() }}
+        run: cargo check --lib --features "net cortex"
+
       # SDK doctests — `///` examples in `sdk/src/`. nextest does NOT run
       # doctests, so this `cargo test --doc` step is load-bearing, not a
       # duplicate of the step above.

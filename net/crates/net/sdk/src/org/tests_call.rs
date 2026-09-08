@@ -309,7 +309,7 @@ async fn a_discover_only_grant_resolves_but_cannot_invoke() {
     );
 
     let err = client
-        .plan("customer.read")
+        .plan("customer.read", 0)
         .expect_err("no invoke authority");
     assert!(
         matches!(
@@ -501,7 +501,7 @@ async fn selection_prefers_a_direct_provider_over_an_earlier_indirect_one() {
 
     // plan selects the direct provider even though it sorts later.
     let intent = client
-        .plan("internal.reindex")
+        .plan("internal.reindex", 0)
         .expect("a directly reachable provider exists");
     assert_eq!(
         &intent.provider,
@@ -522,7 +522,7 @@ async fn an_authorized_but_unreachable_provider_is_reported_as_not_direct() {
     inject_owner_envelope(&mesh, &a, &provider, &["nrpc:internal.reindex"]);
 
     let client = bind(&mesh, &a, &identity, vec![]);
-    let err = client.plan("internal.reindex").expect_err("unreachable");
+    let err = client.plan("internal.reindex", 0).expect_err("unreachable");
     assert!(
         matches!(
             err,
@@ -540,7 +540,7 @@ async fn nothing_discovered_reports_zero_considered() {
     let client = bind(&mesh, &a, &identity, vec![]);
 
     let err = client
-        .plan("internal.reindex")
+        .plan("internal.reindex", 0)
         .expect_err("nothing to call");
     assert!(
         matches!(
@@ -572,7 +572,9 @@ async fn a_dispatcher_scope_that_excludes_the_capability_refuses_locally() {
         .org(OrgCredentials::new(cert, dg, vec![], vec![]).expect("assembles"))
         .expect("binds");
 
-    let err = client.plan("internal.reindex").expect_err("out of scope");
+    let err = client
+        .plan("internal.reindex", 0)
+        .expect_err("out of scope");
     assert!(
         matches!(
             err,
@@ -607,7 +609,7 @@ async fn an_expired_membership_refuses_at_call_time() {
     client
         .check_current()
         .expect_err("but the credentials are not current");
-    let err = client.plan("internal.reindex").expect_err("expired");
+    let err = client.plan("internal.reindex", 0).expect_err("expired");
     assert!(
         matches!(
             err,
@@ -944,7 +946,7 @@ async fn a_plan_attempt_under_a_moved_authority_mints_nothing() {
 
     let control = client.capture_private(&capability).expect("capture");
     match client
-        .plan_attempt(&capability, &control)
+        .plan_attempt(&capability, &control, &unsensed())
         .expect("the control derivation succeeds")
     {
         PlanAttempt::Minted(intent) => assert_eq!(
@@ -977,7 +979,7 @@ async fn a_plan_attempt_under_a_moved_authority_mints_nothing() {
     );
 
     match client
-        .plan_attempt(&capability, &capture)
+        .plan_attempt(&capability, &capture, &unsensed())
         .expect("a superseded derivation is not an error")
     {
         PlanAttempt::Superseded { considered } => assert_eq!(
@@ -999,6 +1001,13 @@ async fn a_plan_attempt_under_a_moved_authority_mints_nothing() {
 
 /// Move the node's authority within its own org: a renewal is accepted and
 /// advances the routing epoch, so every capture taken before it is superseded.
+/// A planning input with no request-relative budget: these unit witnesses are
+/// about authority and candidate derivation, not about sensed ORDER, so they
+/// pass the same neutral selection every `call_bytes` does.
+fn unsensed() -> super::call::SensedSelection<'static> {
+    super::call::SensedSelection::new("net.unit.test", 0)
+}
+
 fn renew_authority(mesh: &Mesh, org: &OrgKeypair, identity: &Identity, dir: &std::path::Path) {
     let entity = identity.entity_id().clone();
     let cert = OrgMembershipCert::try_issue(org, entity.clone(), 1, 3600).expect("cert");
@@ -1025,7 +1034,7 @@ async fn a_superseded_no_provider_derivation_does_not_escape() {
 
     let capture = client.capture_private(&capability).expect("capture");
     // Control: still current, so the exact refusal is preserved verbatim.
-    match client.plan_attempt(&capability, &capture) {
+    match client.plan_attempt(&capability, &capture, &unsensed()) {
         Err(OrgSdkError::Discovery(OrgDiscoveryError::NoAuthorizedProvider {
             considered, ..
         })) => assert_eq!(considered, 0, "control: nothing discovered, nothing hidden"),
@@ -1034,7 +1043,7 @@ async fn a_superseded_no_provider_derivation_does_not_escape() {
 
     renew_authority(&mesh, &a, &identity, &dir);
     match client
-        .plan_attempt(&capability, &capture)
+        .plan_attempt(&capability, &capture, &unsensed())
         .expect("a superseded derivation is not an error")
     {
         super::call::PlanAttempt::Superseded { considered } => assert_eq!(considered, 0),
@@ -1065,7 +1074,7 @@ async fn a_superseded_ambiguity_derivation_does_not_escape() {
     inject_granted_envelope(&mesh, &b, &provider, &g1, &s1_copy, tag);
 
     let capture = client.capture_private(&capability).expect("capture");
-    match client.plan_attempt(&capability, &capture) {
+    match client.plan_attempt(&capability, &capture, &unsensed()) {
         Err(OrgSdkError::Credentials(OrgCredentialError::AmbiguousCapabilityGrant {
             grant_ids,
             ..
@@ -1079,7 +1088,7 @@ async fn a_superseded_ambiguity_derivation_does_not_escape() {
 
     renew_authority(&mesh, &a, &identity, &dir);
     match client
-        .plan_attempt(&capability, &capture)
+        .plan_attempt(&capability, &capture, &unsensed())
         .expect("a superseded derivation is not an error")
     {
         super::call::PlanAttempt::Superseded { considered } => assert_eq!(
@@ -1146,7 +1155,7 @@ async fn three_superseded_attempts_refuse_locally_with_the_last_count() {
 
     let attempts = std::cell::Cell::new(0usize);
     let err = client
-        .plan_over(&capability, || {
+        .plan_over(&capability, &unsensed(), || {
             attempts.set(attempts.get() + 1);
             Ok(stale.clone())
         })
@@ -1186,11 +1195,15 @@ async fn cold_capture_refusals_map_onto_the_existing_vocabulary() {
     let client = bind(&mesh, &a, &identity, vec![]);
     let capability = cap("nrpc:internal.reindex");
 
-    match client.plan_over(&capability, || Err(OrgColdRefusal::NoNodeAuthority)) {
+    match client.plan_over(&capability, &unsensed(), || {
+        Err(OrgColdRefusal::NoNodeAuthority)
+    }) {
         Err(OrgSdkError::Credentials(OrgCredentialError::NodeAuthorityRequired)) => {}
         other => panic!("expected NodeAuthorityRequired, got {other:?}"),
     }
-    match client.plan_over(&capability, || Err(OrgColdRefusal::IncoherentAuthority)) {
+    match client.plan_over(&capability, &unsensed(), || {
+        Err(OrgColdRefusal::IncoherentAuthority)
+    }) {
         Err(OrgSdkError::Discovery(OrgDiscoveryError::NoAuthorizedProvider {
             considered, ..
         })) => assert_eq!(considered, 0, "nothing was coherently discovered"),
@@ -1237,7 +1250,7 @@ async fn a_superseded_private_attempt_constructs_no_intent() {
     let current = client.capture_private(&capability).expect("capture");
     let before = super::call::intents_constructed_on_this_thread();
     match client
-        .plan_attempt(&capability, &current)
+        .plan_attempt(&capability, &current, &unsensed())
         .expect("the control derivation succeeds")
     {
         super::call::PlanAttempt::Minted(intent) => {
@@ -1260,7 +1273,7 @@ async fn a_superseded_private_attempt_constructs_no_intent() {
     renew_authority(&mesh, &a, &identity, &dir);
     let before = super::call::intents_constructed_on_this_thread();
     match client
-        .plan_attempt(&capability, &stale)
+        .plan_attempt(&capability, &stale, &unsensed())
         .expect("a superseded derivation is not an error")
     {
         super::call::PlanAttempt::Superseded { considered } => assert_eq!(considered, 1),

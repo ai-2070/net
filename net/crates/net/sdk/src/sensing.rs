@@ -99,17 +99,22 @@
 //! side (a commitment is a one-way derivation), so it takes the legacy
 //! path unchanged.
 //!
-//! What is still genuinely absent is everything a projection would
-//! stand on: no query, watch, or snapshot surface, no readiness
-//! projection, no ranking, and no `ttl/2` refresh owner for a lease —
-//! an organization lease is a single registration with no re-authoring
-//! cadence. There are also no public `OrgClient` sensing controls or
-//! wiring, no provider-free/leader sensing, no `Granted` or
-//! cross-organization sensing, and no language bindings. Acquisition
-//! existing in the core is therefore not a projection: shipping one
-//! here would ship a query surface with no refresh, no ranking, and no
-//! observation model beneath it, so this module stays provider
-//! lifecycle only.
+//! What is still genuinely absent HERE is everything a projection
+//! surface would stand on: no query, watch, or snapshot verb on this
+//! module, no readiness projection, no ranking, and
+//! no `ttl/2` refresh owner for a lease — an organization lease is a
+//! single registration with no re-authoring cadence. Also no
+//! provider-free/leader sensing, no `Granted` or cross-organization
+//! sensing, and no language bindings.
+//!
+//! The CONSUMER side is wired, and it is deliberately not wired here.
+//! [`crate::org::OrgClient`] binds one acquisition family per bind and
+//! applies the resulting order inside its own call planning; the whole
+//! surface is that ordering effect plus the `#[doc(hidden)]`
+//! observation seam its witnesses use. So this module stays provider
+//! lifecycle only: it ships no interest, projection or ranking verb,
+//! because a consumer does not ask for one — the call path consults the
+//! projection on its behalf.
 //!
 //! # What this surface does and does not name
 //!
