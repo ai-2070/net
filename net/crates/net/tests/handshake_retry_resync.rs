@@ -234,11 +234,14 @@ fn foreign_handshake_packet() -> Vec<u8> {
     packet
 }
 
-/// Spray `count` foreign handshakes at `target` from one source and
-/// return once they are all queued on its socket. `send_to`
-/// completing means the datagram is already in the receiver's queue,
-/// so everything sprayed here is ordered ahead of whatever the test
-/// sends afterwards.
+/// Spray `count` foreign handshakes at `target` from one source.
+///
+/// `send_to` returning means the datagram reached the kernel, NOT that
+/// it is already in another socket's receive queue — loopback delivery
+/// is not synchronous everywhere (notably Windows). So this makes no
+/// ordering promise; pair it with [`await_classified`], which waits on
+/// the responder's own counters, whenever a test needs the spray to be
+/// provably ahead of a later `msg1`.
 async fn spray_foreign_handshakes(target: &Arc<MeshNode>, count: usize) {
     let sprayer = tokio::net::UdpSocket::bind("127.0.0.1:0")
         .await
@@ -249,6 +252,29 @@ async fn spray_foreign_handshakes(target: &Arc<MeshNode>, count: usize) {
             .send_to(&packet, target.local_addr())
             .await
             .expect("spray a foreign handshake");
+    }
+}
+
+/// Block until `node`'s responder has classified at least `count`
+/// handshake datagrams — drained (read, did not decrypt) or paced
+/// (dropped before Noise).
+///
+/// This is the synchronisation point that lets the tests below assert
+/// exact counts: it turns "sprayed, therefore surely already queued"
+/// into "the responder says it has seen them", which is the same claim
+/// the assertions rest on and is actually observable.
+async fn await_classified(node: &Arc<MeshNode>, count: usize) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let seen = node.responder_handshakes_drained() + node.responder_handshakes_paced();
+        if seen >= count as u64 {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the responder classified only {seen} of the {count} sprayed handshakes",
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
 
@@ -283,11 +309,23 @@ async fn foreign_handshakes_do_not_consume_the_responder_budget() {
         sprayed <= RESPONDER_BURST,
         "the drain path, not the pacer, must be what handles these",
     );
-    spray_foreign_handshakes(&b, sprayed).await;
 
-    connect_with_late_accept(&a, &b, Duration::ZERO)
-        .await
-        .expect("queued foreign handshakes must be drained, not counted");
+    // Order the spray ahead of the initiator's `msg1` by construction
+    // rather than by hoping UDP does it: start the responder, spray,
+    // and wait on ITS counters before the initiator sends anything.
+    let responder = b.clone();
+    let initiator_id = a.node_id();
+    let accept = tokio::spawn(async move { responder.accept(initiator_id).await });
+
+    spray_foreign_handshakes(&b, sprayed).await;
+    await_classified(&b, sprayed).await;
+
+    let connect = a.connect(b.local_addr(), b.public_key(), b.node_id()).await;
+    let accepted = accept.await.expect("accept task panicked");
+    assert!(
+        connect.is_ok() && accepted.is_ok(),
+        "queued foreign handshakes must be drained, not counted:          connect={connect:?} accept={accepted:?}",
+    );
 
     assert_eq!(
         b.responder_handshakes_drained(),
@@ -303,35 +341,64 @@ async fn foreign_handshakes_do_not_consume_the_responder_budget() {
     assert_session_is_real(&a, &b).await;
 }
 
-/// Draining is bounded work: a source that keeps spraying pays for at
-/// most `RESPONDER_BURST` Noise setups per window, and the legitimate
+/// Draining is bounded work: a source that keeps spraying has most of
+/// its datagrams dropped before any Noise work, and the legitimate
 /// initiator still connects.
 ///
 /// Without pacing, "skip and keep waiting" would hand an off-path
-/// sprayer a full ephemeral-keypair generation per datagram for the
-/// whole deadline — trading the old kill-the-accept bug for a
-/// starve-the-accept one.
+/// sprayer a full Noise read per datagram for the whole deadline —
+/// trading the old kill-the-accept bug for a starve-the-accept one.
+///
+/// The assertions are deliberately *invariants*, not an exact
+/// drained/paced split. The split depends on how many wall-clock
+/// pacing windows elapse while the responder is draining, and a
+/// descheduled task on a loaded (llvm-cov) runner rolls the window
+/// mid-loop: the budget refills, more datagrams are admitted, and an
+/// `assert_eq!` on the split fails with no defect behind it —
+/// reintroducing exactly the kind of flake this file exists to remove.
+/// The pacer's arithmetic is pinned deterministically by
+/// `handshake_pacer_rejects_floods_per_source` in the unit suite; what
+/// belongs here is the behaviour: every datagram is accounted for,
+/// pacing engaged, and the initiator got through anyway.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_one_source_handshake_flood_is_paced_and_does_not_starve_the_initiator() {
     let a = build_node([0x99; 32]).await;
     let b = build_node([0xaa; 32]).await;
 
-    let flood = RESPONDER_BURST * 4;
+    // Several times the per-window budget, so `paced > 0` survives
+    // even if the responder stalls long enough to roll the window a
+    // few times mid-drain.
+    let flood = RESPONDER_BURST * 12;
+
+    let responder = b.clone();
+    let initiator_id = a.node_id();
+    let accept = tokio::spawn(async move { responder.accept(initiator_id).await });
+
     spray_foreign_handshakes(&b, flood).await;
+    await_classified(&b, flood).await;
 
-    connect_with_late_accept(&a, &b, Duration::ZERO)
-        .await
-        .expect("a paced flood must not stop a legitimate initiator");
-
+    // Snapshot before the initiator adds traffic of its own.
+    let drained = b.responder_handshakes_drained();
+    let paced = b.responder_handshakes_paced();
     assert_eq!(
-        b.responder_handshakes_drained(),
-        RESPONDER_BURST as u64,
-        "only the in-budget prefix may buy Noise work",
+        drained + paced,
+        flood as u64,
+        "every sprayed datagram must be accounted for as drained or paced",
     );
-    assert_eq!(
-        b.responder_handshakes_paced(),
-        (flood - RESPONDER_BURST) as u64,
-        "every over-budget datagram must be dropped before Noise setup",
+    assert!(
+        paced > 0,
+        "a flood this far over budget must have been paced ({drained} drained,          {paced} paced of {flood})",
+    );
+    assert!(
+        drained > 0,
+        "pacing must not be so eager that nothing reaches Noise at all",
+    );
+
+    let connect = a.connect(b.local_addr(), b.public_key(), b.node_id()).await;
+    let accepted = accept.await.expect("accept task panicked");
+    assert!(
+        connect.is_ok() && accepted.is_ok(),
+        "a paced flood must not stop a legitimate initiator:          connect={connect:?} accept={accepted:?}",
     );
 
     assert_session_is_real(&a, &b).await;
