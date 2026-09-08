@@ -324,7 +324,8 @@ async fn foreign_handshakes_do_not_consume_the_responder_budget() {
     let accepted = accept.await.expect("accept task panicked");
     assert!(
         connect.is_ok() && accepted.is_ok(),
-        "queued foreign handshakes must be drained, not counted:          connect={connect:?} accept={accepted:?}",
+        "queued foreign handshakes must be drained, not counted: \
+         connect={connect:?} accept={accepted:?}",
     );
 
     assert_eq!(
@@ -387,7 +388,8 @@ async fn a_one_source_handshake_flood_is_paced_and_does_not_starve_the_initiator
     );
     assert!(
         paced > 0,
-        "a flood this far over budget must have been paced ({drained} drained,          {paced} paced of {flood})",
+        "a flood this far over budget must have been paced ({drained} drained, \
+         {paced} paced of {flood})",
     );
     assert!(
         drained > 0,
@@ -398,7 +400,8 @@ async fn a_one_source_handshake_flood_is_paced_and_does_not_starve_the_initiator
     let accepted = accept.await.expect("accept task panicked");
     assert!(
         connect.is_ok() && accepted.is_ok(),
-        "a paced flood must not stop a legitimate initiator:          connect={connect:?} accept={accepted:?}",
+        "a paced flood must not stop a legitimate initiator: \
+         connect={connect:?} accept={accepted:?}",
     );
 
     assert_session_is_real(&a, &b).await;

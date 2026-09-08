@@ -2420,7 +2420,8 @@ mod tests {
 
         assert_eq!(
             admitted, aggregate,
-            "a fan-out flood must be capped by the aggregate ceiling, not by              the per-source budget it walks around"
+            "a fan-out flood must be capped by the aggregate ceiling, not by \
+             the per-source budget it walks around"
         );
     }
 }
