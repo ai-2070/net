@@ -2750,20 +2750,34 @@ mod tests {
         // The renewal really lands on that schedule, and its re-arm is a
         // DISTINCT, later record - the successor a post-hoc sample would have
         // mistaken for this decision.
-        until(
-            &node,
-            Duration::from_secs(5),
-            "the aged row was renewed",
-            || node.org_sensing_demand_state_for_test().refresh_renewed >= 1,
-        )
-        .await;
+        //
+        // Wait for the successor's own PUBLICATION, not for the renewal's
+        // effect counter: that counter is incremented inside the refresh,
+        // before the worker returns and arms the next period, so the interval
+        // between them is a real one in which no successor record exists yet.
+        let successor = {
+            let decisions = Arc::clone(&decisions);
+            let published = move || {
+                decisions
+                    .lock()
+                    .iter()
+                    .find(|decision| decision.seq > first.seq)
+                    .copied()
+            };
+            until(
+                &node,
+                Duration::from_secs(5),
+                "the aged row was renewed and re-armed",
+                || published().is_some(),
+            )
+            .await;
+            published().expect("the successor decision, just observed")
+        };
+        assert!(
+            node.org_sensing_demand_state_for_test().refresh_renewed >= 1,
+            "a successor arm implies the renewal it follows was counted first"
+        );
         assert!(row_present(&node, provider));
-        let all = decisions.lock().clone();
-        let successor = all
-            .iter()
-            .find(|decision| decision.seq > first.seq)
-            .copied()
-            .expect("the renewal must re-arm the row");
         assert_eq!(
             successor.provenance,
             SensingArmProvenance::Established,
@@ -2823,40 +2837,53 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1500)).await;
         let demand = family.reconcile(TAG, &[provider]).expect("retain");
 
-        // WAIT for the worker to finish: renewed AND re-armed. This is the
-        // interleaving an observer that was descheduled after the join sees.
-        until(
-            &node,
-            Duration::from_secs(5),
-            "the worker renewed and re-armed",
-            || {
-                node.org_sensing_demand_state_for_test().refresh_renewed >= 1
-                    && node.sensing_refresh_arm_for_test(&key).is_some()
-            },
-        )
-        .await;
+        // WAIT for the successor decision to be PUBLISHED. This is the
+        // interleaving an observer descheduled after the join sees, and the
+        // record itself is the barrier - the renewal's effect counter moves
+        // before the successor arm exists, and a mutable re-read of `armed`
+        // could name an even later tick.
+        let (first, successor) = {
+            let decisions = Arc::clone(&decisions);
+            let pair = move || {
+                let all = decisions.lock();
+                let first = *all.first()?;
+                let successor = all.iter().find(|next| next.seq > first.seq).copied()?;
+                Some((first, successor))
+            };
+            until(
+                &node,
+                Duration::from_secs(5),
+                "the worker renewed and re-armed",
+                || pair().is_some(),
+            )
+            .await;
+            pair().expect("the pair, just observed")
+        };
 
-        let sampled = node
-            .sensing_refresh_arm_for_test(&key)
-            .expect("the settled re-arm");
-        let seen = Instant::now();
-        let first = *decisions.lock().first().expect("the join must arm");
-
-        // The sample is the SUCCESSOR, not the adoption: a later record, a
-        // future deadline, and outside the joined row's own horizon. Asserting
-        // "due now" or "inside the original ttl" on it rejects real progress.
+        // The successor is what ANY later sample of the schedule names: a
+        // strictly later record, whose deadline was already in the future when
+        // it was taken and lies past the joined row's own horizon. Asserting
+        // "due now" or "inside the original ttl" on it rejects real progress,
+        // which is exactly why the decision under test is captured instead.
         assert!(
-            sampled.1 > first.seq,
-            "precondition: the sample must be a later record than the decision \
-             ({} vs {})",
-            sampled.1,
-            first.seq
+            successor.deadline > successor.armed_at && successor.deadline >= established_at + ttl,
+            "precondition: the successor's deadline is legitimately ahead and \
+             past the horizon: {:?} ahead of its own arm, {:?} after the \
+             public establishment of a {ttl:?} row",
+            successor
+                .deadline
+                .saturating_duration_since(successor.armed_at),
+            successor.deadline.saturating_duration_since(established_at)
         );
+        let sampled_seq = node
+            .sensing_refresh_arm_for_test(&key)
+            .expect("the row stays armed")
+            .1;
         assert!(
-            sampled.0 > seen && sampled.0 >= established_at + ttl,
-            "precondition: the successor's deadline is legitimately in the \
-             future and past the joined row's horizon: {:?} ahead",
-            sampled.0.saturating_duration_since(seen)
+            sampled_seq > first.seq,
+            "precondition: a post-hoc sample never names the adoption record \
+             again - seq {sampled_seq} against the decision's {}",
+            first.seq
         );
 
         // And the DECISION is still exactly one due-now adoption.
