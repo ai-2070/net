@@ -33919,6 +33919,31 @@ impl MeshNode {
         }
     }
 
+    /// ONE attempt: wait for the initiator's `msg1`, answer it with
+    /// `msg2`, and return the derived session keys.
+    ///
+    /// # Why a foreign `msg1` is skipped, not failed
+    ///
+    /// [`Self::handshake_initiator`] retransmits byte-identical copies
+    /// of `msg1` when no reply arrives in time, and a responder that
+    /// was merely slow to be scheduled answers the FIRST copy — the
+    /// remaining copies stay queued on its socket unread, because
+    /// `accept()` is one-shot and returns after that first success.
+    /// The node's NEXT `accept()` reads them. They carry the previous
+    /// pairing's prologue, so `read_message` rejects them.
+    ///
+    /// Counting that as an attempt failure was a self-inflicted denial
+    /// of service: N stale copies burned N of the few
+    /// `handshake_retries` in ~N×100 ms, `accept()` returned `Err`
+    /// while the real initiator was still retransmitting into a node
+    /// with no responder left, and the initiator reported
+    /// `Connection("handshake timeout")` only after its whole budget
+    /// elapsed — seen in CI as a `traversal_observability`
+    /// topology-setup flake on a loaded (llvm-cov) runner. Draining
+    /// non-matching handshake datagrams inside the deadline instead
+    /// means only a genuine absence of `msg1` ends the attempt. It
+    /// also removes a cheap off-path DoS: a sprayer of junk handshake
+    /// packets can now delay an `accept()`, not kill it.
     async fn try_handshake_responder(
         &self,
         peer_node_id: u64,
@@ -33926,8 +33951,16 @@ impl MeshNode {
         let timeout = self.config.handshake_timeout;
         let socket_arc = self.socket.socket_arc();
 
-        // Wait for initiator's handshake
-        let (parsed, source) = tokio::time::timeout(timeout, async {
+        // Direct responder: mirror the initiator's `routing_id`-based
+        // prologue so direct and routed share one convention.
+        let prologue = handshake_prologue(routing_id(peer_node_id), routing_id(self.node_id));
+
+        // Wait for the initiator's handshake. `read_message` runs
+        // INSIDE the wait (see the doc above): a datagram that isn't
+        // this pairing's `msg1` costs one loop iteration, not one
+        // attempt. Noise state is consumed by a failed read, so each
+        // candidate gets a fresh responder.
+        let (mut handshake, source) = tokio::time::timeout(timeout, async {
             loop {
                 let mut recv_buf = bytes::BytesMut::with_capacity(protocol::MAX_PACKET_SIZE);
                 recv_buf.resize(protocol::MAX_PACKET_SIZE, 0);
@@ -33940,29 +33973,34 @@ impl MeshNode {
                 recv_buf.truncate(n);
                 let data = recv_buf.freeze();
 
-                if let Some(p) = ParsedPacket::parse(data, source) {
-                    if p.header.flags.is_handshake() {
-                        return Ok::<_, AdapterError>((p, source));
-                    }
+                let Some(p) = ParsedPacket::parse(data, source) else {
+                    continue;
+                };
+                if !p.header.flags.is_handshake() {
+                    continue;
                 }
+
+                let mut handshake = NoiseHandshake::responder_with_prologue(
+                    &self.config.psk,
+                    &self.static_keypair,
+                    &prologue,
+                )
+                .map_err(|e| AdapterError::Fatal(format!("handshake init failed: {}", e)))?;
+
+                if let Err(e) = handshake.read_message(&p.payload) {
+                    tracing::debug!(
+                        %source,
+                        error = %e,
+                        "skipping handshake datagram that is not this pairing's msg1"
+                    );
+                    continue;
+                }
+
+                return Ok::<_, AdapterError>((handshake, source));
             }
         })
         .await
         .map_err(|_| AdapterError::Connection("handshake timeout".into()))??;
-
-        // Direct responder: mirror the initiator's `routing_id`-based
-        // prologue so direct and routed share one convention.
-        let prologue = handshake_prologue(routing_id(peer_node_id), routing_id(self.node_id));
-        let mut handshake = NoiseHandshake::responder_with_prologue(
-            &self.config.psk,
-            &self.static_keypair,
-            &prologue,
-        )
-        .map_err(|e| AdapterError::Fatal(format!("handshake init failed: {}", e)))?;
-
-        handshake
-            .read_message(&parsed.payload)
-            .map_err(|e| AdapterError::Connection(format!("read_message failed: {}", e)))?;
 
         let msg2 = handshake
             .write_message(&[])

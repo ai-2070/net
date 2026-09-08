@@ -33,6 +33,10 @@
 //! - **An absent responder still fails.** The widened tolerance is not
 //!   a way to hang: with no responder at all, `connect` returns
 //!   `handshake timeout` inside the configured budget.
+//! - **Foreign handshakes are drained, not charged.** Handshake
+//!   datagrams that don't decrypt under this pairing's prologue —
+//!   stale `msg1` copies left by an earlier pairing's retransmits —
+//!   cost the responder loop iterations, never attempts.
 
 #![cfg(feature = "net")]
 
@@ -41,7 +45,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use net::adapter::net::behavior::capability::CapabilitySet;
-use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
+use net::adapter::net::{
+    EntityKeypair, MeshNode, MeshNodeConfig, NetHeader, SocketBufferConfig,
+};
 
 const PSK: [u8; 32] = [0x42u8; 32];
 const TEST_BUFFER_SIZE: usize = 256 * 1024;
@@ -205,4 +211,51 @@ async fn an_absent_responder_still_fails_inside_the_budget() {
         elapsed < budget * 3,
         "the failure must land inside the configured budget, took {elapsed:?} (budget {budget:?})",
     );
+}
+
+/// Handshake datagrams that belong to a DIFFERENT pairing must not
+/// consume the responder's attempt budget.
+///
+/// This is the other half of the retransmit design. Because the
+/// initiator retransmits identical `msg1` copies and `accept()` is
+/// one-shot, a slow responder answers copy 1 and leaves the rest
+/// parked on its socket; the node's next `accept()` reads them and
+/// they cannot decrypt under the new pairing's prologue. Charging
+/// each one an attempt let a handful of stale copies exhaust
+/// `handshake_retries` in milliseconds — `accept()` returned `Err`
+/// while the real initiator was still retransmitting into a node
+/// with no responder, and the initiator reported `handshake timeout`
+/// after its full budget. Observed in CI as a topology-setup flake.
+///
+/// Sprayed junk stands in for the stale copies: it is a well-formed
+/// handshake packet that fails Noise, which is exactly what a foreign
+/// `msg1` is from this responder's point of view — and one datagram
+/// more than `RETRIES`, so a budget-consuming responder cannot
+/// survive it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn foreign_handshakes_do_not_consume_the_responder_budget() {
+    let a = build_node([0x77; 32]).await;
+    let b = build_node([0x88; 32]).await;
+
+    // `send_to` completing means the datagram is queued on B's
+    // socket, so every junk copy is ordered ahead of A's msg1.
+    let sprayer = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind sprayer");
+    // Same shape as a real msg1 packet — handshake header plus a
+    // NKpsk0-sized body — with a body that cannot decrypt.
+    let mut junk = NetHeader::handshake(48).to_bytes().to_vec();
+    junk.extend_from_slice(&[0x5a; 48]);
+    for _ in 0..=RETRIES {
+        sprayer
+            .send_to(&junk, b.local_addr())
+            .await
+            .expect("spray a foreign handshake");
+    }
+
+    connect_with_late_accept(&a, &b, Duration::ZERO)
+        .await
+        .expect("queued foreign handshakes must be drained, not counted");
+
+    assert_session_is_real(&a, &b).await;
 }
