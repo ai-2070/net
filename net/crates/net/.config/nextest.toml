@@ -63,6 +63,13 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 # sensing guard is held during the proximity/budget/order phases. A retry there
 # would hide exactly the coherence or lock-order defect those witnesses exist
 # to catch.
+#
+# `sensing_org_exact_seam` and `sensing_org_three_node` join too: the first
+# composes real discovery, real organization sensing transport, real signed
+# observations and one protected invocation, and the second proves a dark peer
+# installs nothing and buys no legacy downgrade. Both are ordering/exclusion
+# proofs over real loopback UDP, where a retry can only convert a dropped
+# registration or a lost observation into a green run.
 [[profile.default.overrides]]
-filter = 'binary(integration_nrpc_protected) + binary(org_ownership) + binary(capability_exposure_revocation) + binary(org_admission_gate) + binary(org_admission_wire) + binary(nrpc_call_hijack) + binary(nrpc_response_routing) + binary(nrpc_service_equality) + binary(nrpc_route_discriminator) + binary(nrpc_streaming_gate) + binary(nrpc_registration_order) + binary(sensing_provider) + binary(sensing_org_lease_wire) + binary(sensing_org_exact_projection)'
+filter = 'binary(integration_nrpc_protected) + binary(org_ownership) + binary(capability_exposure_revocation) + binary(org_admission_gate) + binary(org_admission_wire) + binary(nrpc_call_hijack) + binary(nrpc_response_routing) + binary(nrpc_service_equality) + binary(nrpc_route_discriminator) + binary(nrpc_streaming_gate) + binary(nrpc_registration_order) + binary(sensing_provider) + binary(sensing_org_lease_wire) + binary(sensing_org_exact_projection) + binary(sensing_org_exact_seam) + binary(sensing_org_three_node)'
 retries = 0
