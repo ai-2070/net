@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+use net::adapter::net::behavior::org_sensing_demand::OrgSensingFamily;
 use net::adapter::net::identity::EntityKeypair;
 use net::adapter::net::MeshNode;
 
@@ -17,6 +18,62 @@ use super::error::{hex32, OrgCredentialError, OrgSdkError};
 use super::lease::AudienceLeaseGuard;
 use super::types::{OrgCapabilityGrant, OrgDispatcherGrant, OrgId, OrgMembershipCert};
 use crate::mesh::Mesh;
+
+/// This client's organization-sensing acquisition, decided ONCE at bind.
+///
+/// Two-state by construction. The family mint is fallible — the routing
+/// registry's family identity space is bounded and terminal — and a binding
+/// that cannot sense is INERT, not broken: it plans in the deterministic
+/// unsensed order and calls exactly as it always did. So `bind_node` MAPS the
+/// mint result instead of propagating it, and gains no error variant.
+///
+/// `Active` holds one `Arc`-shared family body. Cloning the binding bumps that
+/// `Arc`, so every clone of an [`OrgClient`] shares one acquisition: an
+/// intermediate clone's drop retires nothing, and the last one retires
+/// everything (the family body's own `Drop`). `Inert` owns nothing, so its drop
+/// is a no-op and there is no per-call re-mint to hammer an exhausted space —
+/// recovery is a new bind.
+///
+/// `#[doc(hidden)]`: unstable, semver-uncovered plumbing that exists so a
+/// witness can observe which state a bind reached. Applications use
+/// `org.call`.
+#[doc(hidden)]
+#[derive(Clone)]
+pub enum OrgSensingBinding {
+    /// The mint succeeded; this client shares one acquisition family.
+    Active(OrgSensingFamily),
+    /// The mint was refused. Deterministic unsensed planning, no sensing work.
+    Inert,
+}
+
+impl OrgSensingBinding {
+    /// The family, when this binding is active.
+    #[doc(hidden)]
+    pub fn family(&self) -> Option<&OrgSensingFamily> {
+        match self {
+            Self::Active(family) => Some(family),
+            Self::Inert => None,
+        }
+    }
+
+    /// Whether this binding senses at all.
+    #[doc(hidden)]
+    pub fn is_active(&self) -> bool {
+        matches!(self, Self::Active(_))
+    }
+}
+
+impl std::fmt::Debug for OrgSensingBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Active(family) => f
+                .debug_struct("OrgSensingBinding::Active")
+                .field("owners", &family.owners())
+                .finish(),
+            Self::Inert => f.write_str("OrgSensingBinding::Inert"),
+        }
+    }
+}
 
 /// A credential set bound to a live mesh — the caller half of the org facade.
 ///
@@ -40,6 +97,9 @@ pub struct OrgClient {
     pub(crate) skew_secs: u64,
     /// Dropped with the last clone; releases the consumer-audience references.
     pub(crate) _lease: Arc<AudienceLeaseGuard>,
+    /// This client's sensing acquisition, minted once at bind. Shared by every
+    /// clone exactly like `_lease`; the last clone's drop retires the demand.
+    pub(crate) _sensing: OrgSensingBinding,
 }
 
 impl OrgClient {
@@ -56,6 +116,16 @@ impl OrgClient {
     /// The held cross-org capability grants.
     pub fn grants(&self) -> &[OrgCapabilityGrant] {
         &self.grants
+    }
+
+    /// This client's sensing binding — `Active` with a shared acquisition
+    /// family, or `Inert`.
+    ///
+    /// `#[doc(hidden)]`: the observation seam for the binding's ownership
+    /// semantics, not application API.
+    #[doc(hidden)]
+    pub fn sensing_binding(&self) -> &OrgSensingBinding {
+        &self._sensing
     }
 
     /// The membership certificate this client calls under.
@@ -229,6 +299,27 @@ impl OrgClient {
                 source,
             })?;
 
+        // SENSING ACQUISITION, once per bind. Mapped, never propagated: a
+        // refused mint is an inert binding, not a failed bind, and the error
+        // type of this function is unchanged. Recorded once, here - never per
+        // call - because the mint does not happen again on this client.
+        let _sensing = match OrgSensingFamily::mint(&node) {
+            Ok(family) => OrgSensingBinding::Active(family),
+            Err(refusal) => {
+                // `eprintln!` because this crate takes no logging dependency
+                // (the `compute` verbs do the same for their one operator
+                // warning). Once per BIND, never per call: the mint does not
+                // happen again on this client, so there is nothing to rate
+                // limit. It names the typed refusal so an operator can tell
+                // "no authority" from "family space exhausted".
+                eprintln!(
+                    "WARN: org sensing family unavailable ({refusal:?}); \
+                     this binding plans unsensed"
+                );
+                OrgSensingBinding::Inert
+            }
+        };
+
         Ok(OrgClient {
             caller: node.entity_keypair_arc(),
             membership,
@@ -237,6 +328,7 @@ impl OrgClient {
             acting_org,
             skew_secs: authority.config.verification_skew_secs,
             _lease: Arc::new(AudienceLeaseGuard::new(node.clone(), grant_ids)),
+            _sensing,
             node,
         })
     }

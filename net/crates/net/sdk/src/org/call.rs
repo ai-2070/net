@@ -52,6 +52,8 @@ use net::adapter::net::behavior::org_cold_plan::{
     OrgColdAuthority, OrgColdDiscovery, OrgColdRefusal,
 };
 use net::adapter::net::behavior::org_scoped_store::PrivateCapabilityProvider;
+use net::adapter::net::behavior::org_sensing_demand::org_sensed_bucket_permutation;
+use net::adapter::net::behavior::sensing::ConsumerLatencyBudget;
 use net::adapter::net::identity::EntityId;
 use net::adapter::net::mesh_rpc::{CallOptions, RpcError};
 
@@ -197,7 +199,7 @@ impl OrgClient {
         deadline_ms: u64,
         cancel_token: u64,
     ) -> Result<Bytes, OrgSdkError> {
-        let intent = self.plan(service)?;
+        let intent = self.plan(service, deadline_ms)?;
         let provider = intent.provider.clone();
 
         let mut opts = CallOptions {
@@ -377,9 +379,15 @@ impl OrgClient {
     /// considered count: the plan examined that many candidates and could not
     /// establish an authorized provider under one coherent authority. It never
     /// falls through to a send under a superseded capture.
-    pub(crate) fn plan(&self, service: &str) -> Result<OrgProofIntent, OrgSdkError> {
-        let capability = CapabilityAuthorityId::for_tag(&nrpc_tag(service));
-        self.plan_over(&capability, || self.capture_private(&capability))
+    pub(crate) fn plan(
+        &self,
+        service: &str,
+        deadline_ms: u64,
+    ) -> Result<OrgProofIntent, OrgSdkError> {
+        let tag = nrpc_tag(service);
+        let capability = CapabilityAuthorityId::for_tag(&tag);
+        let sensed = SensedSelection::new(&tag, deadline_ms);
+        self.plan_over(&capability, &sensed, || self.capture_private(&capability))
     }
 
     /// [`Self::plan`]'s bounded loop over an injectable capture.
@@ -392,6 +400,7 @@ impl OrgClient {
     pub(crate) fn plan_over(
         &self,
         capability: &CapabilityAuthorityId,
+        sensed: &SensedSelection<'_>,
         mut capture: impl FnMut() -> Result<OrgColdDiscovery, OrgColdRefusal>,
     ) -> Result<OrgProofIntent, OrgSdkError> {
         let mut considered = 0usize;
@@ -400,7 +409,7 @@ impl OrgClient {
                 Ok(capture) => capture,
                 Err(refusal) => return Err(cold_refusal_error(capability, refusal, considered)),
             };
-            match self.plan_attempt(capability, &capture)? {
+            match self.plan_attempt(capability, &capture, sensed)? {
                 PlanAttempt::Minted(intent) => return Ok(*intent),
                 PlanAttempt::Superseded { considered: seen } => considered = seen,
             }
@@ -437,6 +446,7 @@ impl OrgClient {
         &self,
         capability: &CapabilityAuthorityId,
         capture: &OrgColdDiscovery,
+        sensed: &SensedSelection<'_>,
     ) -> Result<PlanAttempt, OrgSdkError> {
         // Derive and select into an INERT value — never `?`, and never a proof.
         // The selected candidate is the whole outcome of the derivation; the
@@ -444,7 +454,13 @@ impl OrgClient {
         // selection and the mint and F2 found this path minting before it.
         let (candidates, considered) = self.derive_captured(capability, capture);
         let selected: Result<AuthorizedOrgCandidate, OrgSdkError> =
-            candidates.and_then(|candidates| {
+            candidates.and_then(|mut candidates| {
+                // ADVISORY sensed ORDER, between derivation and selection.
+                // It permutes an already-authorized list: it cannot add,
+                // remove or authorize a candidate, it mints nothing, and it
+                // runs strictly BEFORE the final currentness comparison below,
+                // which still gates the mint.
+                self.apply_sensed_order(capability, sensed, &mut candidates);
                 self.select_candidate(capability, &candidates, considered)
                     .cloned()
             });
@@ -512,6 +528,54 @@ impl OrgClient {
             return Ok(PlanAttempt::Superseded { considered });
         }
         selected.map(|candidate| PlanAttempt::Minted(Box::new(self.intent_for(&candidate))))
+    }
+
+    /// Permute an already-authorized candidate list into the SENSED order.
+    ///
+    /// Advisory, and bounded by that word in every direction: it never adds,
+    /// removes, filters or authorizes a candidate, it never mints, it produces
+    /// no error, and every input it uses is either the caller's own request
+    /// (the budget) or evidence this node already holds. Every failure mode -
+    /// an inert binding, a refused acquisition, a rotated sensing authority, an
+    /// empty population, no observations at all - lands on the SAME outcome:
+    /// the deterministic unsensed order the caller would have had anyway.
+    ///
+    /// Acquisition happens at most ONCE per capability per binding, on the
+    /// first call that needs it, and is then reused by every warmed call. A
+    /// rotated sensing authority triggers exactly one re-convergence, not a
+    /// retry loop: a second refusal simply plans unsensed.
+    fn apply_sensed_order(
+        &self,
+        capability: &CapabilityAuthorityId,
+        sensed: &SensedSelection<'_>,
+        candidates: &mut Vec<AuthorizedOrgCandidate>,
+    ) {
+        if candidates.len() < 2 {
+            // Nothing an order could change. Charge no sensing work for it.
+            return;
+        }
+        let Some(family) = self._sensing.family() else {
+            return; // Inert: the deterministic unsensed order, no work at all.
+        };
+        let demand = match family.demand(capability) {
+            // Warmed: reuse the retained demand, unless its sensing authority
+            // has moved - in which case re-converge once, or plan unsensed.
+            Some(demand) if demand.authority_is_current() => demand,
+            _ => match family.retain(sensed.tag) {
+                Ok(demand) => demand,
+                Err(_refusal) => return,
+            },
+        };
+        if demand.population().is_empty() {
+            return;
+        }
+        let projection = demand.project_sensed_order(Instant::now(), &sensed.budget);
+        let permutation = org_sensed_candidate_permutation(
+            candidates,
+            projection.viable(),
+            projection.non_viable(),
+        );
+        apply_permutation(candidates, permutation);
     }
 
     /// The shared selection rule (OA2-E0.3): org-protected RPC is
@@ -994,6 +1058,83 @@ fn nrpc_tag(service: &str) -> String {
 
 /// Keep one entry per provider — the same provider can surface on both planes
 /// (owner-private and under a grant) without becoming two candidates.
+/// The request-relative half of one planning attempt.
+///
+/// Exactly one input here is request-relative, by design (D7.5): the latency
+/// budget, derived from THIS call's deadline. Everything else about the sensed
+/// interest is fixed internal policy owned by core. The capability tag rides
+/// along because acquisition is keyed by it.
+///
+/// Neither field is an authorization input: they select no provider, no grant
+/// and no authority, and an empty budget is not an error.
+pub(crate) struct SensedSelection<'a> {
+    /// The nRPC capability tag this call plans over.
+    tag: &'a str,
+    /// This call's own end-to-end budget, or unbounded when the caller gave no
+    /// deadline.
+    budget: ConsumerLatencyBudget,
+}
+
+impl<'a> SensedSelection<'a> {
+    /// Derive the budget from the caller's deadline. `0` = the facade default,
+    /// which is an UNBOUNDED budget: no deadline means no viability bound, not
+    /// a zero one.
+    pub(crate) fn new(tag: &'a str, deadline_ms: u64) -> Self {
+        Self {
+            tag,
+            budget: ConsumerLatencyBudget {
+                end_to_end_within: (deadline_ms > 0).then(|| Duration::from_millis(deadline_ms)),
+            },
+        }
+    }
+}
+
+/// The SDK's whole share of the sensed ordering rule: project candidates onto
+/// the two plain-data slices core's rule takes, and apply it.
+///
+/// The rule itself lives once, in core
+/// ([`org_sensed_bucket_permutation`]) - a stable class permutation of the
+/// COMPLETE list. This adapter deliberately adds nothing to it: no comparison
+/// sort over the candidate list, no ordering structure, no second rule to
+/// diverge from the first. `Mode::Granted` maps to `false`, which is what
+/// keeps a granted candidate unsensed and unpruned.
+fn org_sensed_candidate_permutation(
+    cands: &[AuthorizedOrgCandidate],
+    ranked: &[u64],
+    pruned: &[u64],
+) -> Vec<usize> {
+    let mut providers: Vec<u64> = Vec::with_capacity(cands.len());
+    let mut same_org: Vec<bool> = Vec::with_capacity(cands.len());
+    for candidate in cands {
+        providers.push(candidate.provider.node_id());
+        same_org.push(matches!(candidate.mode, Mode::SameOrg));
+    }
+    org_sensed_bucket_permutation(&same_org, &providers, ranked, pruned)
+}
+
+/// Reorder `items` by `permutation`, losing nothing.
+///
+/// Written by MOVE, not by clone, and defensively total: any index the
+/// permutation failed to name is appended in its original relative order, so a
+/// malformed permutation can degrade the ORDER but can never drop an
+/// authorized candidate. A duplicate index takes the slot once and is then
+/// vacant, so no candidate is emitted twice either.
+fn apply_permutation<T>(items: &mut Vec<T>, permutation: Vec<usize>) {
+    let mut slots: Vec<Option<T>> = items.drain(..).map(Some).collect();
+    let mut ordered: Vec<T> = Vec::with_capacity(slots.len());
+    for index in permutation {
+        if let Some(item) = slots.get_mut(index).and_then(Option::take) {
+            ordered.push(item);
+        }
+    }
+    for slot in slots.iter_mut() {
+        if let Some(item) = slot.take() {
+            ordered.push(item);
+        }
+    }
+    *items = ordered;
+}
+
 fn push_unique(out: &mut Vec<Candidate>, candidate: Candidate) {
     if out.iter().any(|c| c.provider == candidate.provider) {
         return;

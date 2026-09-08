@@ -414,13 +414,30 @@ cross-organization one, survive as unsensed fallback. The result is
 advisory plain data: it holds no lease, mints no grant, reserves
 nothing, and cannot admit an invocation.
 
+**The call path consumes it.** The Rust SDK's `OrgClient` binds one
+acquisition family per bind: the mint is fallible, so a binding that
+cannot sense is INERT rather than broken, and every clone shares the
+same acquisition — an intermediate clone's release retires nothing,
+the last one retires everything. Planning applies the projection
+between candidate derivation and selection: it permutes an
+already-authorized list, cannot add, remove or authorize a candidate,
+mints nothing, and runs strictly before the final currentness
+comparison that still gates the proof. Acquisition happens at most
+once per capability per binding, on the first call that needs an
+order, and warmed calls reuse it; a moved sensing authority triggers
+one re-convergence, never a retry loop. Every degradation — inert
+binding, refused acquisition, empty population, `Unknown`, expired or
+over-budget evidence, an all-pruned order — lands on the same outcome:
+the deterministic unsensed order, with no new error. Only one input is
+request-relative: the latency budget, derived from that call's own
+deadline.
+
 What is still genuinely absent: no query, watch or snapshot surface,
-and no continuous ranking. There are also no public `OrgClient` sensing
-controls or wiring — neither the retained-demand substrate nor the
-projection is connected to call planning — no provider-free/leader
-sensing, no `Granted` or cross-organization sensing, and no language
-bindings. Acquisition is not a projection, so the SDK surface stays
-provider-lifecycle only.
+and no continuous ranking. There is no provider-free/leader sensing, no
+`Granted` or cross-organization sensing, no sensed ordering on the
+subnet-exported plane, and no language bindings — the consumer wiring
+is Rust-SDK-only. Acquisition is still not a projection, and the
+provider SDK surface stays provider-lifecycle only.
 
 The plan's §4.5 node-authority refusal guards *owner-scoped* sensing,
 and the provider surface exposes none: registering an evaluator names
