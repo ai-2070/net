@@ -50,12 +50,14 @@ use net::adapter::net::behavior::org::{OrgKeypair, OrgMembershipCert};
 use net::adapter::net::behavior::org_admission::OrgAdmission;
 use net::adapter::net::behavior::org_authority::NodeAuthority;
 use net::adapter::net::behavior::org_grant::{
-    CapabilityAuthorityId, DispatcherScope, OrgDispatcherGrant,
+    CapabilityAuthorityId, DispatcherScope, GrantRights, GrantTargetScope, OrgAudienceSecret,
+    OrgCapabilityGrant, OrgDispatcherGrant,
 };
 use net::adapter::net::behavior::org_scoped_ann::ScopedCapabilityAnnouncement;
 use net::adapter::net::behavior::org_sensing_demand::{
     OrgSensingCapabilityDemand, OrgSensingFamily,
 };
+use net::adapter::net::behavior::sensing;
 use net::adapter::net::behavior::sensing::{
     canonical_org_sensing_commitment, CapabilityId, ConsumerLatencyBudget, DownstreamId,
     EvaluationRequest, Incarnation, ProjectedReadiness, ProviderInterestKey, ReadinessEvaluation,
@@ -263,7 +265,35 @@ struct Seam {
     demand: Arc<OrgSensingCapabilityDemand>,
     family: OrgSensingFamily,
     branches: Vec<(u64, ProviderInterestKey)>,
+    /// How many invocation intents the composed preparation has CONSTRUCTED.
+    /// A fenced preparation must leave this untouched: "no intent" is the
+    /// property, and a counter is how a witness sees it rather than inferring
+    /// it from a refused call.
+    intents: Arc<AtomicU64>,
     _dirs: Vec<ScratchDir>,
+}
+
+/// Why a composed preparation refused, BEFORE any intent existed.
+#[derive(Debug, PartialEq, Eq)]
+enum PrepareRefused {
+    /// No local organization authority could be captured at all.
+    NoAuthority,
+    /// The captured authority moved between the capture and the mint
+    /// boundary - the local fence, distinct from any remote refusal.
+    Superseded,
+    /// The order named no same-organization candidate.
+    NoCandidate,
+    /// The chosen provider has no pinned entity, so nothing could bind a proof
+    /// to it. Annotated, never inferred from sensing.
+    NotDirect(u64),
+}
+
+/// One prepared invocation: the provider the ORDER chose and the intent minted
+/// for exactly that provider.
+#[derive(Debug)]
+struct Prepared {
+    provider: u64,
+    intent: OrgProofIntent,
 }
 
 /// Stand the whole thing up. `ready` says, per provider, whether its evaluator
@@ -369,6 +399,7 @@ async fn compose(tag: &str, ready: &[bool]) -> Seam {
         demand,
         family,
         branches,
+        intents: Arc::new(AtomicU64::new(0)),
         _dirs: dirs,
     }
 }
@@ -449,6 +480,97 @@ impl Seam {
         );
     }
 
+    /// The COMPOSED preparation: capture authority, let the real candidate
+    /// order choose the provider, and mint an intent for exactly that provider
+    /// - with the final currentness decision immediately before the mint.
+    ///
+    /// This orchestrates existing seams and invents no authority algorithm of
+    /// its own: `org_cold_authority` captures, `sensed_provider_order` orders
+    /// through the accepted core rule, `peer_entity_id` answers directness, and
+    /// `org_cold_authority_is_current` is the fence. What the fixture supplies
+    /// is the ORDER of those steps, which is the thing under test: nothing may
+    /// be minted after the fence says the view moved.
+    ///
+    /// `between` runs after the capture and before the fence, so a witness can
+    /// move the authority in exactly that window.
+    fn prepare_with(
+        &self,
+        complete: &[u64],
+        same_org: &[bool],
+        budget: &sensing::ConsumerLatencyBudget,
+        between: impl FnOnce(),
+    ) -> Result<Prepared, PrepareRefused> {
+        // 1. CAPTURE the authority this preparation will be judged against.
+        let authority = self
+            .consumer
+            .org_cold_authority()
+            .map_err(|_| PrepareRefused::NoAuthority)?;
+
+        // 2. The real candidate order chooses. Sensing only reorders what
+        //    authority already admitted.
+        let order = sensed_provider_order(&self.demand, Instant::now(), budget, complete, same_org);
+        let chosen = order.iter().copied().find(|provider| {
+            complete
+                .iter()
+                .position(|candidate| candidate == provider)
+                .is_some_and(|index| same_org[index])
+        });
+        let Some(provider_id) = chosen else {
+            return Err(PrepareRefused::NoCandidate);
+        };
+
+        // 3. Directness is annotated, never a sensing verdict.
+        if self.consumer.peer_entity_id(provider_id).is_none() {
+            return Err(PrepareRefused::NotDirect(provider_id));
+        }
+
+        between();
+
+        // 4. THE FENCE, immediately before the mint. Nothing below this line
+        //    may run against a view that has already moved.
+        if !self.consumer.org_cold_authority_is_current(&authority) {
+            return Err(PrepareRefused::Superseded);
+        }
+
+        // 5. Only now does an intent exist.
+        let provider = self
+            .providers
+            .iter()
+            .find(|provider| provider.node_id() == provider_id)
+            .unwrap_or_else(|| panic!("the order named an unknown provider {provider_id:#x}"));
+        self.intents.fetch_add(1, Ordering::SeqCst);
+        Ok(Prepared {
+            provider: provider_id,
+            intent: intent_for(EntityKeypair::from_bytes(self.consumer_seed), provider),
+        })
+    }
+
+    fn prepare(
+        &self,
+        complete: &[u64],
+        same_org: &[bool],
+        budget: &sensing::ConsumerLatencyBudget,
+    ) -> Result<Prepared, PrepareRefused> {
+        self.prepare_with(complete, same_org, budget, || {})
+    }
+
+    /// Invoke exactly what the preparation chose.
+    async fn invoke(&self, prepared: Prepared) -> Result<Bytes, RpcError> {
+        self.consumer
+            .call(
+                prepared.provider,
+                SERVICE,
+                Bytes::from_static(b"ping"),
+                CallOptions {
+                    org_proof_intent: Some(prepared.intent),
+                    deadline: Some(Instant::now() + Duration::from_secs(5)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map(|reply| reply.body)
+    }
+
     fn intent(&self, index: usize) -> OrgProofIntent {
         intent_for(
             EntityKeypair::from_bytes(self.consumer_seed),
@@ -467,106 +589,136 @@ impl Seam {
 }
 
 /// THE COMPOSITION: authorized discovery, exact org transport, signed
-/// observations, one coherent projection and order, one admitted protected
-/// invocation of the sensed-preferred provider.
+/// observations, one coherent projection, the candidate ORDER that follows from
+/// it, and one admitted protected invocation of exactly the provider that order
+/// chose.
+///
+/// The order is DISCRIMINATING: two real providers, and the one sensing ranks
+/// first is the one the caller's own list ranks LAST. A composition that
+/// computed an order and then invoked by its own criterion would call the other
+/// provider, and the other provider's handler is watched for exactly that.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn discovery_transport_observations_projection_and_admission_compose() {
-    let seam = compose("compose", &[true]).await;
+    let seam = compose("compose", &[true, true]).await;
     seam.settle(0, ProjectedReadiness::Ready).await;
-    let provider = &seam.providers[0];
-    let provider_id = provider.node_id();
+    seam.settle(1, ProjectedReadiness::Ready).await;
 
-    // PROJECTION - one capture, at one instant, over the authorized population.
-    let budget = ConsumerLatencyBudget::default();
-    let projection = seam.demand.project_sensed_order(Instant::now(), &budget);
-    assert_eq!(projection.rows().len(), 1, "{projection:?}");
-    assert_eq!(projection.viable(), &[provider_id], "{projection:?}");
-    assert_eq!(projection.preferred(), Some(provider_id));
-    assert!(
-        projection.rows()[0].estimated_start.is_some(),
-        "the provider's SIGNED start estimate must have arrived with the beat: \
-         {projection:?}"
-    );
-
-    // ORDER over the COMPLETE candidate list. The cross-organization candidate
-    // is never sensed, so it keeps its place behind the sensed-viable one.
-    let granted = provider_id.wrapping_add(0x5EED);
-    let mut complete = vec![provider_id, granted];
-    let mut same_org = vec![true, false];
-    if complete[0] > complete[1] {
-        complete.swap(0, 1);
-        same_org.swap(0, 1);
+    // The caller's own list is id-sorted; make sensing prefer the LAST of it.
+    let mut ids: Vec<u64> = seam.providers.iter().map(|p| p.node_id()).collect();
+    ids.sort_unstable();
+    let (behind, ahead) = (ids[0], ids[1]);
+    for provider in &seam.providers {
+        let start = if provider.node_id() == ahead {
+            Duration::from_millis(1)
+        } else {
+            Duration::from_millis(500)
+        };
+        provider
+            .replace_readiness_evaluator(
+                CapabilityId::new(TAG),
+                Arc::new(Evaluator { ready: true, start }),
+            )
+            .expect("evaluator replaces");
+        provider.notify_sensing_state_changed(&CapabilityId::new(TAG));
     }
-    let order = sensed_provider_order(&seam.demand, Instant::now(), &budget, &complete, &same_org);
-    assert_eq!(
-        order,
-        vec![provider_id, granted],
-        "the sensed-viable provider leads its own authorized list, and the \
-         unsensed cross-organization candidate follows without being pruned"
-    );
-
-    // INVOCATION of the sensed-preferred provider, over the protected path.
-    let calls = Arc::new(AtomicU64::new(0));
-    let admitted_caller = Arc::new(parking_lot::Mutex::new(None));
-    let header_stripped = Arc::new(AtomicBool::new(false));
-    let _serve = provider
-        .serve_rpc_protected(
-            SERVICE,
-            Arc::new(AdmitHandler {
-                calls: Arc::clone(&calls),
-                admitted_caller: Arc::clone(&admitted_caller),
-                header_stripped: Arc::clone(&header_stripped),
-            }),
-            OrgAdmission::OwnerDelegated,
-            Arc::new(|_| true),
-        )
-        .expect("serve the protected capability");
-
-    let preferred = projection
-        .preferred()
-        .expect("the sensed order named a provider");
-    assert_eq!(
-        preferred, provider_id,
-        "the call targets what sensing ranked"
-    );
-    let reply = seam
-        .consumer
-        .call(
-            preferred,
-            SERVICE,
-            Bytes::from_static(b"ping"),
-            CallOptions {
-                org_proof_intent: Some(seam.intent(0)),
-                deadline: Some(Instant::now() + Duration::from_secs(5)),
-                ..Default::default()
+    let budget = ConsumerLatencyBudget::default();
+    {
+        let demand = Arc::clone(&seam.demand);
+        await_condition(
+            SETTLE,
+            "sensed economics rank the higher-id provider first",
+            move || {
+                demand
+                    .project_sensed_order(Instant::now(), &budget)
+                    .viable()
+                    == [ahead, behind]
             },
         )
-        .await
-        .expect("the admitted call returns Ok");
+        .await;
+    }
 
-    assert_eq!(reply.body.as_ref(), b"pong");
+    // Both providers serve the SAME capability; only the chosen one may run.
+    let mut handlers = Vec::new();
+    let mut serves = Vec::new();
+    for provider in &seam.providers {
+        let calls = Arc::new(AtomicU64::new(0));
+        let admitted = Arc::new(parking_lot::Mutex::new(None));
+        let stripped = Arc::new(AtomicBool::new(false));
+        serves.push(
+            provider
+                .serve_rpc_protected(
+                    SERVICE,
+                    Arc::new(AdmitHandler {
+                        calls: Arc::clone(&calls),
+                        admitted_caller: Arc::clone(&admitted),
+                        header_stripped: Arc::clone(&stripped),
+                    }),
+                    OrgAdmission::OwnerDelegated,
+                    Arc::new(|_| true),
+                )
+                .expect("serve the protected capability"),
+        );
+        handlers.push((provider.node_id(), calls, admitted, stripped));
+    }
+
+    // THE COMPOSED PREPARATION: the order chooses, and the intent is minted for
+    // exactly what it chose.
+    let complete = ids.clone();
+    let same_org = vec![true, true];
+    let prepared = seam
+        .prepare(&complete, &same_org, &budget)
+        .expect("a current authority and a sensed candidate");
     assert_eq!(
-        calls.load(Ordering::SeqCst),
+        prepared.provider, ahead,
+        "the SENSED order chose, not the caller's own id order ({complete:?})"
+    );
+    assert_eq!(
+        seam.intents.load(Ordering::SeqCst),
         1,
-        "the handler ran exactly once"
+        "exactly one intent was minted, for the chosen provider"
     );
-    assert!(
-        admitted_caller.lock().is_some(),
-        "the handler must see ORGANIZATION ADMISSION attribution - the invocation \
-         was authorized by admission, not by sensing"
-    );
-    assert!(
-        header_stripped.load(Ordering::SeqCst),
-        "the raw admission proof header must be stripped from the handler view"
-    );
+
+    let body = seam
+        .invoke(prepared)
+        .await
+        .expect("the admitted call returns");
+    assert_eq!(body.as_ref(), b"pong");
+
+    for (provider_id, calls, admitted, stripped) in &handlers {
+        if *provider_id == ahead {
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "the sensed-first provider handled the call exactly once"
+            );
+            assert!(
+                admitted.lock().is_some(),
+                "and it saw ORGANIZATION ADMISSION attribution - authorization \
+                 came from admission, never from sensing"
+            );
+            assert!(
+                stripped.load(Ordering::SeqCst),
+                "the raw admission proof header must be stripped"
+            );
+        } else {
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "the provider the caller's own order would have picked stayed \
+                 dark - the invocation really followed the sensed order"
+            );
+        }
+    }
 
     // Sensing added nothing to authorization and nothing broke on the way.
+    let mut population = seam.demand.population().to_vec();
+    population.sort_unstable();
     assert_eq!(
         authorized_population(&seam.consumer, TAG),
-        seam.demand.population().to_vec(),
+        population,
         "the population is still exactly what discovery authorized"
     );
-    for node in [&seam.consumer, provider] {
+    for node in std::iter::once(&seam.consumer).chain(seam.providers.iter()) {
         assert_eq!(
             SensingCounters::get(&node.sensing_counters().protocol_invalid),
             0
@@ -576,6 +728,100 @@ async fn discovery_transport_observations_projection_and_admission_compose() {
             0
         );
     }
+
+    drop(serves);
+    seam.teardown().await;
+}
+
+/// A STALE local preparation mints no intent and sends nothing.
+///
+/// The authority moves in the window between the capture and the mint
+/// boundary - the one place the fence exists to cover. The preparation must
+/// refuse there, with the intent counter untouched, and the provider's handler
+/// must never see a call. This is the LOCAL fence; the remote refusal against a
+/// provider whose own authority is unusable is a separate, later boundary
+/// (`sensing_is_advisory_and_neither_plane_lets_it_authorize`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_local_preparation_mints_no_intent_and_sends_nothing() {
+    let seam = compose("stale", &[true]).await;
+    seam.settle(0, ProjectedReadiness::Ready).await;
+    let provider = &seam.providers[0];
+    let provider_id = provider.node_id();
+    let budget = ConsumerLatencyBudget::default();
+
+    let calls = Arc::new(AtomicU64::new(0));
+    let _serve = provider
+        .serve_rpc_protected(
+            SERVICE,
+            Arc::new(AdmitHandler {
+                calls: Arc::clone(&calls),
+                admitted_caller: Arc::new(parking_lot::Mutex::new(None)),
+                header_stripped: Arc::new(AtomicBool::new(false)),
+            }),
+            OrgAdmission::OwnerDelegated,
+            Arc::new(|_| true),
+        )
+        .expect("serve the protected capability");
+
+    // Baseline: the same preparation succeeds while the view is current, so the
+    // refusal below is the MOVEMENT, not a broken fixture.
+    let prepared = seam
+        .prepare(&[provider_id], &[true], &budget)
+        .expect("a current view prepares");
+    assert_eq!(prepared.provider, provider_id);
+    assert_eq!(seam.intents.load(Ordering::SeqCst), 1);
+    drop(prepared);
+
+    // Now move the authority INSIDE the preparation, after its capture.
+    let consumer = Arc::clone(&seam.consumer);
+    let refused = seam
+        .prepare_with(&[provider_id], &[true], &budget, move || {
+            let dir = ScratchDir::new("stale-rotation");
+            let cert = OrgMembershipCert::try_issue(&org(), consumer.entity_id().clone(), 1, 3600)
+                .expect("re-issue the membership cert");
+            let authority = NodeAuthority::adopt(&dir.0, cert, consumer.entity_id(), 0, None)
+                .expect("adopt a replacement authority");
+            consumer.clear_node_authority_for_test();
+            consumer
+                .install_node_authority(Arc::new(authority))
+                .expect("install the replacement");
+            // Leak the directory deliberately: see `ScratchDir`.
+            std::mem::forget(dir);
+        })
+        .expect_err("a moved authority must fence the preparation");
+    assert_eq!(
+        refused,
+        PrepareRefused::Superseded,
+        "the LOCAL fence refused - not a remote admission verdict"
+    );
+    assert_eq!(
+        seam.intents.load(Ordering::SeqCst),
+        1,
+        "the fenced preparation minted NO intent: the counter is still the one \
+         from the baseline"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "and nothing was sent - the handler never saw a call"
+    );
+
+    // With no authority at all, the preparation refuses even earlier.
+    seam.consumer.clear_node_authority_for_test();
+    assert_eq!(
+        seam.prepare(&[provider_id], &[true], &budget)
+            .expect_err("no authority, no preparation"),
+        PrepareRefused::NoAuthority
+    );
+    assert_eq!(
+        seam.intents.load(Ordering::SeqCst),
+        1,
+        "still no new intent"
+    );
+    assert!(
+        !seam.demand.authority_is_current(),
+        "and the retained demand knows its own view is gone"
+    );
 
     drop(_serve);
     seam.teardown().await;
@@ -820,6 +1066,224 @@ async fn sensing_is_advisory_and_neither_plane_lets_it_authorize() {
     );
 
     drop(_serve);
+    seam.teardown().await;
+}
+
+/// An ALL-PRUNED order falls back to the caller's own order, and prunes nobody.
+///
+/// Both real providers answer NOT READY, so nothing is viable. The order must
+/// then be exactly the caller's own list - a sensed verdict deprioritizes, it
+/// never removes - and the composed preparation still chooses, so a
+/// fully-pessimistic sensing plane cannot strand a request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_all_pruned_order_falls_back_to_the_callers_own_order() {
+    let seam = compose("pruned", &[false, false]).await;
+    seam.settle(0, ProjectedReadiness::NotReady).await;
+    seam.settle(1, ProjectedReadiness::NotReady).await;
+
+    let mut complete: Vec<u64> = seam.providers.iter().map(|p| p.node_id()).collect();
+    complete.sort_unstable();
+    let same_org = vec![true, true];
+    let budget = ConsumerLatencyBudget::default();
+
+    let projection = seam.demand.project_sensed_order(Instant::now(), &budget);
+    assert!(projection.viable().is_empty(), "{projection:?}");
+    assert_eq!(projection.non_viable().len(), 2, "{projection:?}");
+
+    let order = sensed_provider_order(&seam.demand, Instant::now(), &budget, &complete, &same_org);
+    assert_eq!(
+        order, complete,
+        "with nothing viable the order is the caller's own, and every candidate \
+         is still in it"
+    );
+    let prepared = seam
+        .prepare(&complete, &same_org, &budget)
+        .expect("an all-pruned sensing plane must not strand the request");
+    assert_eq!(
+        prepared.provider, complete[0],
+        "the caller's own first candidate is chosen"
+    );
+
+    seam.teardown().await;
+}
+
+/// A GRANTED-plane provider is never sensed, and a provider visible on BOTH
+/// discovery planes is sensed exactly once - through the owner plane.
+///
+/// Both announcements are real: a cross-organization DISCOVER grant is
+/// installed on the consumer, and the providers seal granted envelopes to that
+/// grant's audience, verified through the ordinary ingest path.
+///
+/// SCOPE, stated rather than smuggled: the owner-first CLASSIFICATION of a
+/// dual-plane provider (`push_unique` producing one `Mode::SameOrg` candidate)
+/// lives in the SDK's candidate builder, which this slice may not edit and
+/// cannot reach - the core crate has no candidate type and no dependency on the
+/// SDK. What IS core, and is witnessed here, is the sensing side of the same
+/// rule: the sensed population is derived from the owner plane alone, so a
+/// granted-only provider never enters it and a dual-plane provider enters it
+/// once, never twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_granted_only_provider_is_never_sensed_and_a_dual_plane_provider_is_sensed_once() {
+    let seam = compose("granted", &[true]).await;
+    seam.settle(0, ProjectedReadiness::Ready).await;
+    let owner_provider = seam.providers[0].node_id();
+
+    // A REAL cross-organization DISCOVER grant, installed on the consumer.
+    let other_org = OrgKeypair::from_bytes([0x77u8; 32]);
+    let capability = CapabilityAuthorityId::for_tag(TAG);
+    let (grant, secret) = OrgCapabilityGrant::try_issue(
+        &other_org,
+        org().org_id(),
+        capability,
+        GrantRights::DISCOVER,
+        GrantTargetScope::AnyNodeOwnedBy(other_org.org_id()),
+        3600,
+    )
+    .expect("issue the cross-organization DISCOVER grant");
+    let secret: OrgAudienceSecret = secret.expect("a DISCOVER grant carries audience material");
+    let grant_id = grant.grant_id;
+    let audience_handle = secret.audience_handle;
+    let discovery_key = *secret.discovery_key();
+    seam.consumer
+        .install_consumer_grant_audience(grant, secret)
+        .expect("install the consumer grant audience");
+
+    // Two granted envelopes: one for a provider only this plane knows, and one
+    // for the provider the OWNER plane already authorized.
+    let stranger = EntityKeypair::from_bytes([0x93u8; 32]);
+    let descriptor = CapabilitySet::new().add_tag(TAG).to_bytes_compact();
+    for keypair in [&stranger, seam.providers[0].entity_keypair()] {
+        let cert = OrgMembershipCert::try_issue(&other_org, keypair.entity_id().clone(), 1, 3600)
+            .expect("granted-plane membership cert");
+        let envelope = ScopedCapabilityAnnouncement::build_granted(
+            keypair,
+            other_org.org_id(),
+            cert,
+            grant_id,
+            audience_handle,
+            &discovery_key,
+            1,
+            now_secs() + 3600,
+            &descriptor,
+        )
+        .expect("granted envelope");
+        seam.consumer
+            .ingest_scoped_announcement_for_test(&envelope.to_bytes());
+    }
+
+    // Both really landed on the granted plane...
+    let granted: Vec<_> = seam
+        .consumer
+        .scoped_granted_providers_for_test(&grant_id, now_secs());
+    assert!(
+        granted.contains(stranger.entity_id()) && granted.contains(seam.providers[0].entity_id()),
+        "precondition: both granted announcements were verified and stored: \
+         {granted:?}"
+    );
+
+    // ...and neither changed what is SENSED.
+    assert_eq!(
+        authorized_population(&seam.consumer, TAG),
+        vec![owner_provider],
+        "the sensed population is owner-plane only: a granted-only provider is \
+         not in it, and the dual-plane provider is in it exactly ONCE"
+    );
+    let refreshed = seam.family.retain(TAG).expect("re-retain");
+    assert_eq!(refreshed.population().to_vec(), vec![owner_provider]);
+    assert_eq!(refreshed.retained_providers(), vec![owner_provider]);
+    let projection =
+        refreshed.project_sensed_order(Instant::now(), &ConsumerLatencyBudget::default());
+    assert_eq!(
+        projection.rows().len(),
+        1,
+        "one row, not two: {projection:?}"
+    );
+
+    // And in the ORDER, the granted candidate keeps its place and is never
+    // pruned - sensing has no verdict about it at all.
+    let granted_candidate = owner_provider.wrapping_add(0x9A17);
+    let mut paired = [(owner_provider, true), (granted_candidate, false)];
+    paired.sort_unstable();
+    let complete: Vec<u64> = paired.iter().map(|(id, _)| *id).collect();
+    let same_org: Vec<bool> = paired.iter().map(|(_, owned)| *owned).collect();
+    let order = sensed_provider_order(
+        &refreshed,
+        Instant::now(),
+        &ConsumerLatencyBudget::default(),
+        &complete,
+        &same_org,
+    );
+    assert_eq!(
+        order,
+        vec![owner_provider, granted_candidate],
+        "the sensed owner-plane provider leads; the granted candidate follows, \
+         unsensed and unpruned"
+    );
+
+    drop(refreshed);
+    seam.teardown().await;
+}
+
+/// An authorized provider with NO pinned entity is neither sensed nor callable.
+///
+/// Discovery authorizes it, so it is not an authority failure - but the sensed
+/// population is discovery INTERSECTED with this node's pins, and a proof
+/// cannot be bound to a peer whose entity is unknown. The composed preparation
+/// therefore refuses with the directness reason and mints nothing, which is the
+/// core-side shape of "annotated, never a sensing verdict".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unpinned_authorized_provider_is_neither_sensed_nor_callable() {
+    let seam = compose("unpinned", &[true]).await;
+    seam.settle(0, ProjectedReadiness::Ready).await;
+    let pinned = seam.providers[0].node_id();
+
+    // A real owner-scoped announcement for an entity this node has never met.
+    let stranger = EntityKeypair::from_bytes([0x94u8; 32]);
+    let authority = seam.consumer.node_authority().expect("authority");
+    let cert = OrgMembershipCert::try_issue(&org(), stranger.entity_id().clone(), 1, 3600)
+        .expect("stranger membership cert");
+    let descriptor = CapabilitySet::new().add_tag(TAG).to_bytes_compact();
+    let envelope = ScopedCapabilityAnnouncement::build_owner(
+        &stranger,
+        org().org_id(),
+        cert,
+        authority.audience.audience_handle,
+        authority.audience.discovery_key(),
+        1,
+        now_secs() + 3600,
+        &descriptor,
+    )
+    .expect("owner envelope");
+    seam.consumer
+        .ingest_scoped_announcement_for_test(&envelope.to_bytes());
+    assert!(
+        seam.consumer
+            .scoped_owner_providers_for_test(now_secs())
+            .contains(stranger.entity_id()),
+        "precondition: discovery really authorized the stranger"
+    );
+
+    // It is authorized, and still not sensed: there is no pin to sense it AT.
+    assert_eq!(
+        authorized_population(&seam.consumer, TAG),
+        vec![pinned],
+        "an unpinned authorized provider is not in the sensed population"
+    );
+
+    // And a caller that lists it anyway is refused at the directness boundary,
+    // before any intent exists.
+    let stranger_node = stranger.entity_id().node_id();
+    let before = seam.intents.load(Ordering::SeqCst);
+    let refused = seam
+        .prepare(&[stranger_node], &[true], &ConsumerLatencyBudget::default())
+        .expect_err("no pinned entity, no proof binding");
+    assert_eq!(refused, PrepareRefused::NotDirect(stranger_node));
+    assert_eq!(
+        seam.intents.load(Ordering::SeqCst),
+        before,
+        "and nothing was minted for it"
+    );
+
     seam.teardown().await;
 }
 

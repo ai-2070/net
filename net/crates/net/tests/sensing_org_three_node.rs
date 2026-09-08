@@ -285,7 +285,8 @@ async fn relay_reauthors_org_provider_under_its_own_membership() {
 }
 
 /// A compatible-floor peer with SENSING OFF drops the org frame and stays
-/// Unknown — with no legacy downgrade anywhere.
+/// Unknown — with no legacy downgrade anywhere, and with the intended wire leg
+/// ACKNOWLEDGED rather than assumed.
 ///
 /// This drives the LOCAL-ORIGIN lease path, not a hand-built frame: A holds a
 /// real organization authority, so `acquire_sensing_interest_lease` takes the
@@ -354,6 +355,42 @@ async fn a_floored_peer_with_sensing_off_drops_the_org_frame_and_stays_unknown()
     );
     assert!(!d.sensing_enabled(), "precondition: D does not");
 
+    // E: the POSITIVE CONTROL peer - same organization, same everything, except
+    // that it runs the sensing plane.
+    let e = Arc::new(
+        MeshNode::new(
+            EntityKeypair::generate(),
+            base_config().with_sensing_coalescing(true),
+        )
+        .await
+        .expect("MeshNode::new E"),
+    );
+    let _e_dir = adopt_and_install(&e, "dark-control").await;
+    connect_pair(&a, &e).await;
+    e.start();
+    e.announce_capabilities(net::adapter::net::behavior::capability::CapabilitySet::new())
+        .await
+        .expect("announce");
+    let e_id = e.node_id();
+    {
+        let (a2, e2) = (a.clone(), e.clone());
+        await_condition(Duration::from_secs(5), "E's pins established", move || {
+            a2.peer_entity_id(e_id).is_some() && e2.peer_entity_id(a_id).is_some()
+        })
+        .await;
+    }
+
+    // Acknowledge the node's OWN send boundary: one completed datagram per leg.
+    let sends = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    {
+        let sends = Arc::clone(&sends);
+        a.set_org_egress_send_observer_for_test(Arc::new(move |_seq, phase| {
+            if phase == net::adapter::net::OrgEgressSendPhase::Completed {
+                sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }));
+    }
+
     // THE PRODUCTION LOCAL-ORIGIN PATH: an organization lease toward D.
     let spec = org_spec(d_id, commitment);
     let key = ProviderInterestKey::new(spec.key(), d_id);
@@ -371,8 +408,53 @@ async fn a_floored_peer_with_sensing_off_drops_the_org_frame_and_stays_unknown()
          peer must not buy a legacy re-authoring"
     );
 
-    // Give the frame every chance to land, then prove nothing did.
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    // ARRIVAL EVIDENCE. An empty receiver proves nothing on its own: a frame
+    // that never left, or never arrived, looks identical. Two acknowledgements
+    // close that, neither of which makes UDP reliable:
+    //
+    // 1. the node's OWN ordered egress reports a completed send for every
+    //    datagram it emitted in this window - so the D-directed leg was
+    //    authored and handed to the socket, not skipped;
+    // 2. a SECOND peer, E, identical in every way except that it runs the
+    //    sensing plane, is leased in the same window from the same egress and
+    //    DOES install the row. The positive control is what makes D's silence
+    //    attributable to the dark plane rather than to loss: the same code
+    //    path, the same node, the same instant, one difference.
+    let e_spec = org_spec(e_id, commitment);
+    let e_key = ProviderInterestKey::new(e_spec.key(), e_id);
+    let e_ticket = a
+        .acquire_sensing_interest_lease(&e_spec, e_id, D)
+        .expect("the same lease path toward the sensing-enabled peer");
+    {
+        let e = e.clone();
+        let e_key = e_key.clone();
+        await_condition(
+            Duration::from_secs(5),
+            "the identical leg reaches a peer that RUNS the sensing plane",
+            move || {
+                e.sensing_downstream_entry(&e_key, DownstreamId::Peer(a_id))
+                    .is_some()
+            },
+        )
+        .await;
+    }
+    let e_row = e
+        .sensing_downstream_entry(&e_key, DownstreamId::Peer(a_id))
+        .expect("E's row for A");
+    assert_eq!(
+        e_row.owner_root, commitment,
+        "and it is organization-rooted, so the leg D dropped was a well-formed \
+         organization registration"
+    );
+    {
+        let sends = Arc::clone(&sends);
+        await_condition(
+            Duration::from_secs(5),
+            "the ordered egress completed a send for BOTH legs",
+            move || sends.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+        )
+        .await;
+    }
     assert!(
         d.sensing_table_is_empty(),
         "a dark peer must gain no sensing rows"
@@ -399,4 +481,5 @@ async fn a_floored_peer_with_sensing_off_drops_the_org_frame_and_stays_unknown()
     );
 
     let _ = a.try_release_sensing_interest_lease(ticket);
+    let _ = a.try_release_sensing_interest_lease(e_ticket);
 }
