@@ -1449,6 +1449,15 @@ struct DispatchCtx {
     /// work, exactly like an unknown subprotocol id (plan §5, "the
     /// plane ships dark").
     enable_sensing_coalescing: bool,
+    /// Fixtures-only: the DARK-PLANE receive acknowledgement. Fires on this
+    /// node's own 0x0C02 dispatch arm, for each event of a frame that the
+    /// disabled plane is about to drop, carrying the authenticated sender and
+    /// the undecoded payload. It is how a witness can tell "the registration
+    /// arrived and the dark plane dropped it" from "nothing arrived" - which an
+    /// empty table cannot distinguish. Production compiles no field, no branch
+    /// and no read: the plane still ships dark.
+    #[cfg(any(test, feature = "fixtures"))]
+    sensing_dark_drop_observer: SensingDarkDropSlot,
     /// SI-2a: local cap on accepted soft-state lifetimes. See the
     /// matching `MeshNodeConfig` field.
     sensing_interest_ttl: Duration,
@@ -6322,6 +6331,17 @@ pub type OrgEgressSendObserver = Arc<dyn Fn(u64, OrgEgressSendPhase) + Send + Sy
 #[cfg(any(test, feature = "fixtures"))]
 type OrgEgressObserverSlot = Arc<parking_lot::Mutex<Option<OrgEgressSendObserver>>>;
 
+/// Observer of this node's DARK-PLANE 0x0C02 drop: `(sender, payload)` for one
+/// event of a frame the disabled sensing plane refuses to process.
+#[cfg(any(test, feature = "fixtures"))]
+#[doc(hidden)]
+pub type SensingDarkDropObserver = Arc<dyn Fn(u64, &[u8]) + Send + Sync>;
+
+/// The shared slot, so a witness can install the acknowledgement on a running
+/// node without reaching into dispatch.
+#[cfg(any(test, feature = "fixtures"))]
+type SensingDarkDropSlot = Arc<parking_lot::Mutex<Option<SensingDarkDropObserver>>>;
+
 /// Instrumented-only override of the egress' per-datagram send policy.
 ///
 /// The consumer bounds every send through the SAME
@@ -10548,6 +10568,11 @@ pub struct MeshNode {
     /// `get_or_init` + a one-time `get()` do not. See the cell's own doc for
     /// the interleavings that admitted.
     org_egress: parking_lot::Mutex<OrgEgressCell>,
+    /// Fixtures-only acknowledgement of this node's own DARK-PLANE 0x0C02
+    /// drop. Shared with every `DispatchCtx` this node builds, so a witness may
+    /// install it on a running node.
+    #[cfg(any(test, feature = "fixtures"))]
+    sensing_dark_drop_observer: SensingDarkDropSlot,
     /// Fixtures-only observer of the PRODUCTION organization send boundary.
     /// Shared with the consumer at spawn, so a witness may install it before or
     /// after the lazily created egress exists.
@@ -12511,6 +12536,8 @@ impl MeshNode {
                 terminal: false,
             }),
             #[cfg(any(test, feature = "fixtures"))]
+            sensing_dark_drop_observer: Arc::new(parking_lot::Mutex::new(None)),
+            #[cfg(any(test, feature = "fixtures"))]
             org_egress_send_observer: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(any(test, feature = "fixtures"))]
             org_egress_send_policy: Arc::new(parking_lot::Mutex::new(None)),
@@ -13159,6 +13186,22 @@ impl MeshNode {
     #[doc(hidden)]
     pub fn set_org_egress_send_observer_for_test(&self, observer: OrgEgressSendObserver) {
         *self.org_egress_send_observer.lock() = Some(observer);
+    }
+
+    /// Acknowledge this node's own DARK-PLANE receive boundary.
+    ///
+    /// The hook fires on the 0x0C02 dispatch arm, once per event of a frame
+    /// that the DISABLED sensing plane is about to drop, carrying the
+    /// AEAD-authenticated sender and the raw payload. A dark node's empty
+    /// interest table is not evidence on its own - a datagram that was lost,
+    /// or aimed at a stopped node, leaves exactly the same table. This is the
+    /// receiver's own event, and it is the only thing that can tell those
+    /// apart. It acknowledges nothing on the wire: no reply, no retry, no
+    /// reliability, and the plane stays dark.
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn set_sensing_dark_drop_observer_for_test(&self, observer: SensingDarkDropObserver) {
+        *self.sensing_dark_drop_observer.lock() = Some(observer);
     }
 
     /// Install the release pre-apply seam. It fires after a release's authority
@@ -23100,6 +23143,8 @@ impl MeshNode {
             route_withdraw_gate: self.route_withdraw_gate.clone(),
             route_withdraw_cascades_inflight: self.route_withdraw_cascades_inflight.clone(),
             enable_sensing_coalescing: self.config.enable_sensing_coalescing,
+            #[cfg(any(test, feature = "fixtures"))]
+            sensing_dark_drop_observer: self.sensing_dark_drop_observer.clone(),
             sensing_interest_ttl: self.config.sensing_interest_ttl,
             sensing_interest_table: self.sensing_interest_table.clone(),
             sensing_counters: self.sensing_counters.clone(),
@@ -25096,6 +25141,16 @@ impl MeshNode {
         // iterating the frame is structurally safe.
         if parsed.header.subprotocol_id == sensing::SUBPROTOCOL_SENSING_INTEREST {
             if !ctx.enable_sensing_coalescing {
+                // Fixtures-only: acknowledge the drop to a local witness. The
+                // slot is read only in instrumented builds and only once the
+                // drop is already decided, so the dark path production
+                // compiles is unchanged - no decode, no counters, no reply.
+                #[cfg(any(test, feature = "fixtures"))]
+                if let Some(observe) = ctx.sensing_dark_drop_observer.lock().clone() {
+                    for payload in EventFrame::read_events(decrypted, parsed.header.event_count) {
+                        observe(from_node, &payload);
+                    }
+                }
                 return;
             }
             // NodeId-0 sentinel guard, as the REDEX/meshdb arms: a

@@ -283,9 +283,11 @@ enum PrepareRefused {
     Superseded,
     /// The order named no same-organization candidate.
     NoCandidate,
-    /// The chosen provider has no pinned entity, so nothing could bind a proof
-    /// to it. Annotated, never inferred from sensing.
-    NotDirect(u64),
+    /// The chosen provider has no PINNED ENTITY on this node, so nothing could
+    /// bind a proof to it. This is the narrow pin-binding check and nothing
+    /// wider: it is not the SDK's direct-session requirement, which lives with
+    /// the candidate builder and is not reachable from core.
+    Unpinned(u64),
 }
 
 /// One prepared invocation: the provider the ORDER chose and the intent minted
@@ -519,9 +521,11 @@ impl Seam {
             return Err(PrepareRefused::NoCandidate);
         };
 
-        // 3. Directness is annotated, never a sensing verdict.
+        // 3. PIN BINDING is annotated, never a sensing verdict. This is the
+        //    narrow core check - "is this peer's entity known here" - and not
+        //    the SDK's wider direct-session requirement.
         if self.consumer.peer_entity_id(provider_id).is_none() {
-            return Err(PrepareRefused::NotDirect(provider_id));
+            return Err(PrepareRefused::Unpinned(provider_id));
         }
 
         between();
@@ -1148,11 +1152,38 @@ async fn a_granted_only_provider_is_never_sensed_and_a_dual_plane_provider_is_se
         .install_consumer_grant_audience(grant, secret)
         .expect("install the consumer grant audience");
 
-    // Two granted envelopes: one for a provider only this plane knows, and one
-    // for the provider the OWNER plane already authorized.
-    let stranger = EntityKeypair::from_bytes([0x93u8; 32]);
+    // The granted-only provider is a REAL NODE, connected and PINNED, so its
+    // absence from the sensed population cannot be explained away by the pin
+    // intersection: it is eligible at every boundary except authorization.
+    let granted_node = node_with(EntityKeypair::generate(), None).await;
+    connect_pair(&seam.consumer, &granted_node).await;
+    granted_node.start();
+    granted_node
+        .announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("granted-plane node announce");
+    let granted_id = granted_node.node_id();
+    let consumer_id = seam.consumer.node_id();
+    {
+        let (consumer, peer) = (Arc::clone(&seam.consumer), Arc::clone(&granted_node));
+        await_condition(
+            SETTLE,
+            "the granted-only provider is pinned in both directions",
+            move || {
+                consumer.peer_entity_id(granted_id).is_some()
+                    && peer.peer_entity_id(consumer_id).is_some()
+            },
+        )
+        .await;
+    }
+
+    // Two granted envelopes: one for that pinned granted-only node, and one for
+    // the provider the OWNER plane already authorized.
     let descriptor = CapabilitySet::new().add_tag(TAG).to_bytes_compact();
-    for keypair in [&stranger, seam.providers[0].entity_keypair()] {
+    for keypair in [
+        granted_node.entity_keypair(),
+        seam.providers[0].entity_keypair(),
+    ] {
         let cert = OrgMembershipCert::try_issue(&other_org, keypair.entity_id().clone(), 1, 3600)
             .expect("granted-plane membership cert");
         let envelope = ScopedCapabilityAnnouncement::build_granted(
@@ -1171,22 +1202,33 @@ async fn a_granted_only_provider_is_never_sensed_and_a_dual_plane_provider_is_se
             .ingest_scoped_announcement_for_test(&envelope.to_bytes());
     }
 
-    // Both really landed on the granted plane...
+    // PRECONDITIONS, both halves of what would make an exclusion vacuous:
+    // the grant discovery really verified and stored both providers, AND the
+    // granted-only one is pinned - so if granted discovery were wrongly fed
+    // into the sensed population, it WOULD appear there.
     let granted: Vec<_> = seam
         .consumer
         .scoped_granted_providers_for_test(&grant_id, now_secs());
     assert!(
-        granted.contains(stranger.entity_id()) && granted.contains(seam.providers[0].entity_id()),
+        granted.contains(granted_node.entity_id())
+            && granted.contains(seam.providers[0].entity_id()),
         "precondition: both granted announcements were verified and stored: \
          {granted:?}"
     );
+    assert!(
+        seam.consumer.peer_entity_id(granted_id).is_some(),
+        "precondition: the granted-only provider is pinned, so the pin \
+         intersection cannot be what excludes it"
+    );
 
-    // ...and neither changed what is SENSED.
+    // ...and neither changed what is SENSED. No SENSE authority exists for
+    // this provider, and DISCOVER alone never manufactures one.
     assert_eq!(
         authorized_population(&seam.consumer, TAG),
         vec![owner_provider],
-        "the sensed population is owner-plane only: a granted-only provider is \
-         not in it, and the dual-plane provider is in it exactly ONCE"
+        "the sensed population is owner-plane only: a pinned, granted, \
+         verified provider is STILL not in it, and the dual-plane provider is \
+         in it exactly ONCE"
     );
     let refreshed = seam.family.retain(TAG).expect("re-retain");
     assert_eq!(refreshed.population().to_vec(), vec![owner_provider]);
@@ -1199,10 +1241,9 @@ async fn a_granted_only_provider_is_never_sensed_and_a_dual_plane_provider_is_se
         "one row, not two: {projection:?}"
     );
 
-    // And in the ORDER, the granted candidate keeps its place and is never
-    // pruned - sensing has no verdict about it at all.
-    let granted_candidate = owner_provider.wrapping_add(0x9A17);
-    let mut paired = [(owner_provider, true), (granted_candidate, false)];
+    // And in the ORDER, that same real granted candidate keeps its place and is
+    // never pruned - sensing has no verdict about it at all.
+    let mut paired = [(owner_provider, true), (granted_id, false)];
     paired.sort_unstable();
     let complete: Vec<u64> = paired.iter().map(|(id, _)| *id).collect();
     let same_org: Vec<bool> = paired.iter().map(|(_, owned)| *owned).collect();
@@ -1215,13 +1256,35 @@ async fn a_granted_only_provider_is_never_sensed_and_a_dual_plane_provider_is_se
     );
     assert_eq!(
         order,
-        vec![owner_provider, granted_candidate],
+        vec![owner_provider, granted_id],
         "the sensed owner-plane provider leads; the granted candidate follows, \
          unsensed and unpruned"
     );
 
+    // ALL-GRANTED CONTROL: the same two real providers, presented as granted
+    // candidates only. One of them is sensed Ready on the owner plane - and it
+    // still buys nothing, because no candidate is same-organization: the order
+    // is the caller's own, unchanged and complete.
+    let mut all_granted = vec![owner_provider, granted_id];
+    all_granted.sort_unstable();
+    let unchanged = sensed_provider_order(
+        &refreshed,
+        Instant::now(),
+        &ConsumerLatencyBudget::default(),
+        &all_granted,
+        &[false, false],
+    );
+    assert_eq!(
+        unchanged, all_granted,
+        "an all-Granted list is returned exactly as given: no promotion of the \
+         provider sensing happens to like, and no pruning"
+    );
+
     drop(refreshed);
     seam.teardown().await;
+    net::adapter::Adapter::shutdown(granted_node.as_ref())
+        .await
+        .expect("stop the granted-plane node");
 }
 
 /// An authorized provider with NO pinned entity is neither sensed nor callable.
@@ -1229,8 +1292,10 @@ async fn a_granted_only_provider_is_never_sensed_and_a_dual_plane_provider_is_se
 /// Discovery authorizes it, so it is not an authority failure - but the sensed
 /// population is discovery INTERSECTED with this node's pins, and a proof
 /// cannot be bound to a peer whose entity is unknown. The composed preparation
-/// therefore refuses with the directness reason and mints nothing, which is the
-/// core-side shape of "annotated, never a sensing verdict".
+/// therefore refuses at the PIN-BINDING check and mints nothing, which is the
+/// core-side shape of "annotated, never a sensing verdict". A missing pin is
+/// NOT the SDK's missing direct session: that requirement lives with the
+/// candidate builder, is not reachable from core, and is OA-6's to witness.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unpinned_authorized_provider_is_neither_sensed_nor_callable() {
     let seam = compose("unpinned", &[true]).await;
@@ -1277,7 +1342,7 @@ async fn an_unpinned_authorized_provider_is_neither_sensed_nor_callable() {
     let refused = seam
         .prepare(&[stranger_node], &[true], &ConsumerLatencyBudget::default())
         .expect_err("no pinned entity, no proof binding");
-    assert_eq!(refused, PrepareRefused::NotDirect(stranger_node));
+    assert_eq!(refused, PrepareRefused::Unpinned(stranger_node));
     assert_eq!(
         seam.intents.load(Ordering::SeqCst),
         before,
