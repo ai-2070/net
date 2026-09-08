@@ -1693,11 +1693,15 @@ async fn the_reconciliation_trigger_certifies_the_installed_demand() {
         "an agreed population is not re-run by the passage of time"
     );
 
-    // (The CAP clause - a population truncated to `MAX_SENSED_POPULATION`
-    // counting as agreement with a wider expectation - needs 32 acquired
-    // HOLDERS, so it cannot be exercised on this sensing-disabled unit node.
-    // Its witness is `a_capped_population_agrees_with_a_wider_expectation`, on
-    // a real sensing-enabled consumer.)
+    // (The CANONICAL-PREFIX clause - agreement is the expectation's leading
+    // `MAX_SENSED_POPULATION` members, which is what core's sort-then-truncate
+    // publishes - needs 32 acquired HOLDERS to reach the bound at all, so it
+    // cannot be exercised on this sensing-disabled unit node. Both of its
+    // sides have witnesses on a real sensing-enabled consumer: the legitimate
+    // cap in `a_capped_population_agrees_with_a_wider_expectation`, and the
+    // full-sized NON-prefix population - the case "cap-sized and contained"
+    // cannot see - in
+    // `a_missing_canonical_member_is_recovered_under_an_unchanged_expectation`.)
 
     // ---- a REPLACED demand invalidates the record --------------------------
     let replaced = family.retain("nrpc:internal.reindex").expect("re-retain");

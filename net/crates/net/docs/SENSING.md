@@ -439,16 +439,30 @@ the authority stamp. Unchanged and fully certified: nothing is
 re-acquired. Anything else: one convergence, which keeps every
 still-authorized holder's existing ticket.
 
+The expectation itself is bounded by PROVENANCE, not by owner
+organization: the sensed population is derived from owner-private
+discovery alone, so a provider discovered only under a held DISCOVER
+grant is outside it — including when that grant was issued by this
+organization to itself, which is valid and leaves the provider fully
+authorized to invoke. Asking for a provider core cannot publish makes
+agreement unreachable, and an unreachable expectation reconverges an
+unchanged population on every call past the floor.
+
 A certified demand is reusable only while it AGREED with the
-expectation it was asked for: agreement is exact set equality, with one
-explicit exception — convergence truncates to the sensed population
-cap, so a population at that bound and contained in the expectation is
-the cap rather than a disagreement. Nothing else counts, and in
-particular repetition does not: a population narrower than the
-expectation (a discovery row that expired between the caller's capture
-and core's query) or wider than it (one that appeared in that window)
-stays retryable on the floor until the two sides agree, because an
-identical mismatch seen twice is still a mismatch.
+expectation it was asked for. Agreement is the CANONICAL population for
+that expectation: core sorts, deduplicates and keeps the lowest
+`MAX_SENSED_POPULATION` node ids, so the population that agrees is
+exactly the expectation's leading prefix — the whole set below the
+bound, its lowest members above it. Size plus containment is not that
+rule: a full-sized population missing a member of the canonical prefix
+is a cap-sized subset, and treating it as the cap froze that member out
+permanently, even after it was rediscovered under an unchanged
+expectation. Nothing else counts either, and in particular repetition
+does not: a population narrower than the expectation (a discovery row
+that expired between the caller's capture and core's query) or wider
+than it (one that appeared in that window) stays retryable on the floor
+until the two sides agree, because an identical mismatch seen twice is
+still a mismatch.
 
 Failed attempts pace themselves separately, and neither pacing may
 cancel the other: a refused convergence — `FamilyAtCapacity`, say —

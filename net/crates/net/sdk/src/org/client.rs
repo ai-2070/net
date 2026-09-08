@@ -215,18 +215,36 @@ impl ConvergenceSchedule {
     /// Certify `demand` for `capability` under `expected`.
     ///
     /// AGREED means two things at once: every member of the published
-    /// population has a live holder, and that population is the one this
-    /// expectation asked for. Agreement is exact set equality, with ONE
-    /// explicit exception: convergence truncates a population to
-    /// [`MAX_SENSED_POPULATION`], so a published population at that bound and
-    /// contained in the expectation is the cap rather than a disagreement.
+    /// population has a live holder, and that population is the CANONICAL one
+    /// this expectation asks for.
+    ///
+    /// Canonical is core's own rule, not a size test. Core sorts the
+    /// authorized population, deduplicates it, and keeps the LOWEST
+    /// [`MAX_SENSED_POPULATION`] node ids
+    /// (`MeshNode::org_sensing_authorized_population`, and the same clamp
+    /// again inside the convergence). So the population that agrees with an
+    /// expectation is exactly that expectation's leading prefix - the whole
+    /// set when it fits under the bound, its lowest `MAX_SENSED_POPULATION`
+    /// members when it does not.
+    ///
+    /// Accepting "cap-sized AND contained" instead froze a real defect: a
+    /// provider that belongs in the canonical prefix but was missing from the
+    /// published population - because its discovery row expired between this
+    /// call's capture and core's query - yields a cap-sized subset, which
+    /// looked like the cap and settled forever, so the provider never came
+    /// back even after it was rediscovered under an UNCHANGED expectation.
     ///
     /// Nothing else counts as agreement. In particular a mismatch is NOT
     /// settled by being seen twice: a discovery row that expired between this
     /// call's capture and core's own query yields a narrower population, and a
-    /// row that appeared in that window yields a wider one — and in both cases
+    /// row that appeared in that window yields a wider one - and in both cases
     /// the only thing that resolves it is a later attempt whose two sides
     /// agree.
+    ///
+    /// `expected` is the caller's already-sorted, deduplicated expectation
+    /// (see `OrgClient::apply_sensed_order`); the prefix rule is meaningless
+    /// against an unordered list, so it is canonicalized here too rather than
+    /// trusted.
     pub(crate) fn certify(
         &self,
         capability: CapabilityAuthorityId,
@@ -234,16 +252,16 @@ impl ConvergenceSchedule {
         demand: &Arc<net::adapter::net::behavior::org_sensing_demand::OrgSensingCapabilityDemand>,
         now: Instant,
     ) {
+        let mut expected = expected;
+        expected.sort_unstable();
+        expected.dedup();
         let population = population_of(demand);
         let mut retained = demand.retained_providers();
         retained.sort_unstable();
         retained.dedup();
         let holders_complete = retained == population;
-        let capped = population.len() >= MAX_SENSED_POPULATION
-            && population
-                .iter()
-                .all(|id| expected.binary_search(id).is_ok());
-        let agreed = holders_complete && (population == expected || capped);
+        let ceiling = expected.len().min(MAX_SENSED_POPULATION);
+        let agreed = holders_complete && population.as_slice() == &expected[..ceiling];
         self.insert(
             capability,
             ConvergedFor {
