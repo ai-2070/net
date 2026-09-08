@@ -8719,12 +8719,17 @@ pub struct MeshNode {
     /// mismatch. Surfaced by
     /// [`MeshNode::responder_handshakes_drained`] so the drain is
     /// observable rather than inferred from a missing failure.
-    responder_handshakes_drained: Arc<AtomicU64>,
+    responder_handshakes_drained: AtomicU64,
     /// Handshake datagrams the direct responder dropped BEFORE any
     /// Noise work because their source had exhausted the per-source
     /// pacing budget. Surfaced by
     /// [`MeshNode::responder_handshakes_paced`].
-    responder_handshakes_paced: Arc<AtomicU64>,
+    ///
+    /// Both counters are plain atomics, not `Arc`s: unlike
+    /// `pending_direct_initiators` (cloned into `DispatchCtx`) they
+    /// are only ever reached through `&self`, and the node already
+    /// lives behind an `Arc`.
+    responder_handshakes_paced: AtomicU64,
     /// Proximity graph — topology awareness from pingwave propagation
     proximity_graph: Arc<ProximityGraph>,
     /// Per-peer serialization of the whole install transition —
@@ -10443,8 +10448,8 @@ impl MeshNode {
             emission_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             pending_handshakes,
             pending_direct_initiators,
-            responder_handshakes_drained: Arc::new(AtomicU64::new(0)),
-            responder_handshakes_paced: Arc::new(AtomicU64::new(0)),
+            responder_handshakes_drained: AtomicU64::new(0),
+            responder_handshakes_paced: AtomicU64::new(0),
             proximity_graph,
             peer_transitions: PeerTransitions::new(),
             reroute_policy,
