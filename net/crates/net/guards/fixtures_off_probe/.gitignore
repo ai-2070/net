@@ -1,0 +1,4 @@
+# Build artifacts of the standalone darkness probe. It has its OWN workspace
+# root, so the repository root ignore rules do not reach it.
+target/
+Cargo.lock
