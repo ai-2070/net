@@ -519,6 +519,9 @@ pub(crate) struct HandshakePacer {
     /// before the periodic deadline. Keeps memory bounded against
     /// an attacker fanning across many spoofed source addresses.
     gc_size_threshold: usize,
+    /// How many GC sweeps have run. Only read by the test that pins
+    /// the sweep to being amortized rather than per-packet.
+    sweeps: u64,
 }
 
 impl HandshakePacer {
@@ -583,7 +586,22 @@ impl HandshakePacer {
             // ceiling that still triggers GC well before any
             // realistic memory issue.
             gc_size_threshold: 4096,
+            sweeps: 0,
         }
+    }
+
+    /// Override the entry-count GC trigger. Test-only: the shipped
+    /// threshold is sized for memory, not for a test to reach.
+    #[cfg(test)]
+    pub(crate) fn with_gc_size_threshold(mut self, threshold: usize) -> Self {
+        self.gc_size_threshold = threshold;
+        self
+    }
+
+    /// GC sweeps run so far.
+    #[cfg(test)]
+    pub(crate) fn sweeps(&self) -> u64 {
+        self.sweeps
     }
 
     /// Record an attempt from `source`. Returns `true` if the caller
@@ -607,7 +625,24 @@ impl HandshakePacer {
             let cutoff = self.window.saturating_mul(2);
             self.entries
                 .retain(|_, (_, start)| now.duration_since(*start) < cutoff);
+            // A size-triggered sweep during a live fan-out flood
+            // reclaims nothing: every entry is younger than the
+            // cutoff, so `len()` stays at the threshold and the size
+            // branch fires again on the very next datagram — a full
+            // scan per packet for as long as the flood lasts, i.e.
+            // precisely when the responder needs to be cheap, and now
+            // reachable from every node's `accept()`. Drop the table
+            // instead of rescanning it. Forgetting the flood's history
+            // refills each tracked source's budget, but `entries` is
+            // not what bounds a fan-out flood — the aggregate ceiling
+            // is, and it is untouched by this — so the only thing lost
+            // is per-source resolution the flood had already defeated
+            // by using a fresh address per datagram.
+            if self.entries.len() >= self.gc_size_threshold {
+                self.entries.clear();
+            }
             self.last_gc = now;
+            self.sweeps = self.sweeps.saturating_add(1);
         }
 
         // Roll the shared window before consulting either ceiling, so
@@ -2324,6 +2359,41 @@ mod tests {
                 "a spoofed budget exhaustion must not ban the source (retransmit {i})"
             );
         }
+    }
+
+    /// The size-triggered GC must stay amortized. A sweep that
+    /// reclaims nothing leaves `entries` at the threshold, so without
+    /// a second step the very next datagram sweeps again — an O(n)
+    /// scan per packet for the whole flood, on a path every node's
+    /// `accept()` now reaches.
+    #[test]
+    fn handshake_pacer_gc_stays_amortized_under_a_fan_out_flood() {
+        use std::time::Duration;
+        let threshold = 64;
+        // A window long enough that the periodic trigger cannot fire:
+        // whatever sweeps happen are size-triggered, which is the
+        // path under test.
+        let mut pacer = HandshakePacer::new(5, 8, u32::MAX, Duration::from_secs(600))
+            .with_gc_size_threshold(threshold);
+
+        let datagrams = threshold * 8;
+        for i in 0..datagrams {
+            // A distinct source per datagram, all fresh — nothing is
+            // ever old enough for `retain` to reclaim.
+            let source: std::net::SocketAddr =
+                format!("10.2.{}.{}:9000", (i >> 8) & 0xff, i & 0xff)
+                    .parse()
+                    .unwrap();
+            pacer.check_and_record(source);
+        }
+
+        // One sweep per threshold-worth of entries is the amortized
+        // shape; one per datagram is the bug.
+        let sweeps = pacer.sweeps();
+        assert!(
+            sweeps <= (datagrams / threshold) as u64 + 1,
+            "GC must stay amortized, ran {sweeps} sweeps over {datagrams} datagrams",
+        );
     }
 
     /// The per-source budget alone cannot bound a flood that fans out
