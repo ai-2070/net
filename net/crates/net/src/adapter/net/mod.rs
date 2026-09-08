@@ -776,9 +776,11 @@ impl NetAdapter {
         // the state we still hold. `build_handshake` stamps no counter
         // or nonce, so the retransmitted bytes are byte-identical.
         //
-        // The RESPONDER has no state to carry across attempts — each
-        // attempt answers whichever `msg1` it reads — so it rebuilds
-        // per attempt by construction.
+        // The RESPONDER has no Noise state to carry across attempts —
+        // each attempt answers whichever `msg1` it reads — so it
+        // rebuilds per attempt by construction. It does carry its
+        // rejection diagnosis, which would otherwise die with the
+        // attempt that observed it.
         if self.config.is_initiator() {
             let peer_pubkey = self
                 .config
@@ -814,9 +816,18 @@ impl NetAdapter {
             }
         }
 
+        // Rejection state for the whole responder sequence, not for
+        // one attempt: a mismatched initiator can fall silent while
+        // this side still has attempts left, and every later attempt
+        // then times out with nothing to report.
+        let mut last_decrypt_reject: Option<String> = None;
+        let mut last_paced_source: Option<std::net::SocketAddr> = None;
         loop {
             attempt += 1;
-            match self.try_handshake_responder(socket).await {
+            match self
+                .try_handshake_responder(socket, &mut last_decrypt_reject, &mut last_paced_source)
+                .await
+            {
                 Ok(result) => return Ok(result),
                 Err(e) if attempt < max_attempts => backoff(attempt, &e).await,
                 Err(e) => return Err(e),
@@ -909,9 +920,33 @@ impl NetAdapter {
     /// ONE responder attempt: read an initiator's `msg1`, answer it,
     /// and return the session keys with the source address it came
     /// from.
+    ///
+    /// # Why a foreign `msg1` is skipped, not failed
+    ///
+    /// [`Self::try_handshake_initiator`] retransmits byte-identical
+    /// copies of `msg1` when no reply arrives in time, and a responder
+    /// that was merely slow to be scheduled answers the FIRST copy —
+    /// the rest stay queued on the socket unread. They surface on a
+    /// later attempt, or an off-path sender simply sprays
+    /// handshake-flagged junk.
+    ///
+    /// Ending the attempt on one of those was a self-inflicted denial
+    /// of service: N such datagrams burned N of the few
+    /// `handshake_retries` in milliseconds, and the responder was gone
+    /// while the real initiator was still retransmitting into it. So a
+    /// datagram that does not decrypt costs one loop iteration, not one
+    /// attempt, and only a genuine absence of `msg1` ends the attempt.
+    /// The pacer is what keeps "delay" from becoming "starve".
+    ///
+    /// This mirrors `MeshNode::try_handshake_responder`; see its doc
+    /// for the fuller argument, including why one `NoiseHandshake` is
+    /// reused across rejected reads and why the diagnosis has to
+    /// outlive the attempt that produced it.
     async fn try_handshake_responder(
         &self,
         socket: &Socket,
+        last_decrypt_reject: &mut Option<String>,
+        last_paced_source: &mut Option<std::net::SocketAddr>,
     ) -> Result<(SessionKeys, std::net::SocketAddr), AdapterError> {
         let timeout = self.config.handshake_timeout;
         let socket_arc = socket.socket_arc();
@@ -922,54 +957,89 @@ impl NetAdapter {
             .as_ref()
             .ok_or_else(|| AdapterError::Fatal("missing static keypair".into()))?;
 
-        // Wait for an initiator handshake message, discarding any
-        // non-handshake datagrams that arrive on the shared
-        // socket. Per-source pacing throttles flooders so the
-        // legitimate initiator's msg1 can land — without it,
-        // an attacker could blast handshake-flagged datagrams
-        // and monopolize this recv loop.
-        let (parsed, source) = tokio::time::timeout(timeout, async {
-            loop {
-                let mut recv_buf = bytes::BytesMut::with_capacity(protocol::MAX_PACKET_SIZE);
-                recv_buf.resize(protocol::MAX_PACKET_SIZE, 0);
+        // ONE responder for the whole wait: snow restores the symmetric
+        // state when `read_message` fails and does not advance
+        // `pattern_position`, so a rejected datagram cannot corrupt it.
+        let mut handshake = NoiseHandshake::responder(&self.config.psk, keypair)
+            .map_err(|e| AdapterError::Fatal(format!("handshake init failed: {}", e)))?;
 
+        // One receive buffer for the whole wait: the loop now runs for
+        // the full deadline under any handshake stream, so allocating
+        // and zeroing `MAX_PACKET_SIZE` per iteration would be per junk
+        // datagram — and it happens before the pacer, so the pacer does
+        // not bound it.
+        let mut recv_buf = vec![0u8; protocol::MAX_PACKET_SIZE];
+
+        // Wait for an initiator handshake message, discarding any
+        // non-handshake datagrams that arrive on the shared socket.
+        // Pacing throttles flooders so the legitimate initiator's msg1
+        // can land — without it, an attacker could blast
+        // handshake-flagged datagrams and monopolize this recv loop.
+        let waited = tokio::time::timeout(timeout, async {
+            loop {
                 let (n, source) = socket_arc
                     .recv_from(&mut recv_buf)
                     .await
                     .map_err(|e| AdapterError::Connection(format!("recv failed: {}", e)))?;
 
-                recv_buf.truncate(n);
-                let data = recv_buf.freeze();
+                let data = Bytes::copy_from_slice(&recv_buf[..n]);
 
-                if let Some(p) = ParsedPacket::parse(data, source) {
-                    if p.header.flags.is_handshake() {
-                        // Per-source pacing: drop packets from
-                        // sources that exceed the budget.
-                        let allowed = self.handshake_pacer.lock().check_and_record(source);
-                        if !allowed {
-                            tracing::debug!(
-                                %source,
-                                "handshake responder: dropping packet from \
-                                 rate-limited source"
-                            );
-                            continue;
-                        }
-                        return Ok::<_, AdapterError>((p, source));
-                    }
+                let Some(p) = ParsedPacket::parse(data, source) else {
+                    continue;
+                };
+                if !p.header.flags.is_handshake() {
+                    continue;
                 }
-                // Not a valid handshake packet — keep waiting
+
+                // Pace BEFORE the Noise read, so a rejected source
+                // cannot buy a Diffie-Hellman.
+                if !self.handshake_pacer.lock().check_and_record(source) {
+                    *last_paced_source = Some(source);
+                    tracing::debug!(
+                        %source,
+                        "handshake responder: dropping packet from \
+                         rate-limited source"
+                    );
+                    continue;
+                }
+
+                if let Err(e) = handshake.read_message(&p.payload) {
+                    *last_decrypt_reject = Some(format!("{source}: {e}"));
+                    tracing::debug!(
+                        %source,
+                        error = %e,
+                        "skipping handshake datagram that is not this pairing's msg1"
+                    );
+                    continue;
+                }
+
+                return Ok::<_, AdapterError>(source);
             }
         })
-        .await
-        .map_err(|_| AdapterError::Connection("handshake timeout".into()))??;
+        .await;
 
-        let mut handshake = NoiseHandshake::responder(&self.config.psk, keypair)
-            .map_err(|e| AdapterError::Fatal(format!("handshake init failed: {}", e)))?;
-
-        // Process initiator message
-        handshake
-            .read_message(&parsed.payload)
-            .map_err(|e| AdapterError::Connection(format!("read_message failed: {}", e)))?;
+        let source = match waited {
+            Ok(inner) => inner?,
+            // A decrypt failure outranks a paced drop: it is the one
+            // that names a misconfiguration.
+            Err(_) => {
+                return Err(AdapterError::Connection(
+                    match (last_decrypt_reject.as_deref(), *last_paced_source) {
+                        (Some(reject), _) => format!(
+                            "handshake timeout (last handshake datagram from {reject} \
+                             did not decrypt — wrong PSK, wrong peer key, or \
+                             another pairing's msg1)"
+                        ),
+                        (None, Some(paced)) => format!(
+                            "handshake timeout (every handshake datagram this attempt \
+                             saw was dropped before Noise by the responder's pacing \
+                             budget, most recently one from {paced})"
+                        ),
+                        (None, None) => "handshake timeout".into(),
+                    },
+                ))
+            }
+        };
 
         // Send response
         let msg2 = handshake

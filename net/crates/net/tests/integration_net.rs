@@ -109,6 +109,75 @@ async fn test_net_handshake() {
         .expect("initiator init failed");
 }
 
+/// One more foreign handshake than the responder has attempts, so a
+/// responder that charges an attempt per undecryptable datagram cannot
+/// survive them. `create_config_pair` pins `handshake_retries` to 3.
+const FOREIGN_HANDSHAKES: usize = 4;
+
+/// A well-formed handshake packet whose body cannot decrypt — what
+/// another pairing's `msg1`, or an off-path sprayer's junk, looks like
+/// to this responder.
+fn foreign_handshake_packet() -> Vec<u8> {
+    let mut packet = net::adapter::net::NetHeader::handshake(48)
+        .to_bytes()
+        .to_vec();
+    packet.extend_from_slice(&[0x5a; 48]);
+    packet
+}
+
+/// Handshake datagrams that belong to a different pairing must cost the
+/// responder loop iterations, never attempts.
+///
+/// The initiator retransmits byte-identical copies of `msg1` and a
+/// responder answers only the first, so leftovers routinely sit queued
+/// on the socket; an off-path sender can also just spray junk. Charging
+/// each one an attempt let a handful of them exhaust `handshake_retries`
+/// in milliseconds, leaving no responder for the real initiator, which
+/// then reported `handshake timeout` only after its whole budget.
+///
+/// `MeshNode` was fixed for this first; this is the same defect in
+/// `NetAdapter`, whose responder had the identical shape.
+#[tokio::test]
+async fn test_net_handshake_survives_queued_foreign_handshakes() {
+    let (port1, port2) = find_available_ports().await;
+    let (initiator_config, responder_config) = create_config_pair(port1, port2);
+    let responder_addr: SocketAddr = format!("127.0.0.1:{}", port2).parse().unwrap();
+
+    let responder_handle = tokio::spawn(async move {
+        let mut adapter = net::adapter::net::NetAdapter::new(responder_config).unwrap();
+        adapter.init().await
+    });
+
+    // Let the responder bind and reach its recv loop, then queue the
+    // foreign handshakes AHEAD of any real `msg1`.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let sprayer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let junk = foreign_handshake_packet();
+    for _ in 0..FOREIGN_HANDSHAKES {
+        sprayer.send_to(&junk, responder_addr).await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let initiator_handle = tokio::spawn(async move {
+        let mut adapter = net::adapter::net::NetAdapter::new(initiator_config).unwrap();
+        adapter.init().await
+    });
+
+    let (responder_result, initiator_result) = tokio::time::timeout(
+        Duration::from_secs(10),
+        futures::future::join(responder_handle, initiator_handle),
+    )
+    .await
+    .expect("handshake timed out");
+
+    responder_result
+        .expect("responder task panicked")
+        .expect("queued foreign handshakes must be drained, not charged as attempts");
+    initiator_result
+        .expect("initiator task panicked")
+        .expect("initiator init failed");
+}
+
 #[tokio::test]
 async fn test_net_send_receive_fire_and_forget() {
     let (port1, port2) = find_available_ports().await;
