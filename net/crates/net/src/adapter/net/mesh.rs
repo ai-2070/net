@@ -560,18 +560,95 @@ type InboundQueues = Arc<DashMap<u16, SegQueue<StoredEvent>>>;
 /// reads it — the dispatch loop post-`start()`, or a sibling
 /// `accept()`/`connect()` pre-`start()`.
 ///
-/// Bounded and multi-delivery rather than a `oneshot`: a
+/// Not a `oneshot`, for the same reason the drain loops exist: a
 /// handshake-flagged datagram that turns out not to advance the
 /// initiator's state must not consume the registration, or a single
-/// spoofed packet ends the attempt — the same denial primitive the
-/// initiator's own drain loop exists to remove. Bounded so that
-/// forwarding from an unauthenticated source cannot grow a queue.
-type DirectHandshakeInbox = tokio::sync::mpsc::Sender<Bytes>;
+/// spoofed packet ends the attempt.
+///
+/// Bounded, because forwarding from an unauthenticated source must not
+/// grow a queue — and **newest-wins** when it overflows. Candidates are
+/// indistinguishable until `read_message` has been tried on them, so
+/// the inbox cannot pick out the real `msg2`; but under a burst of
+/// stale or spoofed handshakes carrying the peer's address, the real
+/// reply is the LATER arrival. A queue that refuses on overflow drops
+/// exactly that one and the handshake times out, so this evicts the
+/// oldest candidate instead.
+struct DirectHandshakeInbox {
+    /// Candidate payloads, oldest first. Never longer than
+    /// [`DIRECT_HANDSHAKE_INBOX_DEPTH`].
+    queue: parking_lot::Mutex<std::collections::VecDeque<Bytes>>,
+    /// Set when a later `connect()` to the same address displaces this
+    /// registration, so the loser fails fast instead of waiting out its
+    /// deadline for datagrams that will now be delivered elsewhere.
+    closed: AtomicBool,
+    /// Wakes the waiter on deposit or close.
+    signal: Notify,
+}
 
 /// Depth of a [`DirectHandshakeInbox`]. A handshake expects exactly one
 /// useful reply; the slack is only there so a burst of junk from the
-/// peer's address doesn't push the real `msg2` out.
+/// peer's address cannot get between the initiator and the real `msg2`.
 const DIRECT_HANDSHAKE_INBOX_DEPTH: usize = 8;
+
+impl DirectHandshakeInbox {
+    fn new() -> Self {
+        Self {
+            queue: parking_lot::Mutex::new(std::collections::VecDeque::with_capacity(
+                DIRECT_HANDSHAKE_INBOX_DEPTH,
+            )),
+            closed: AtomicBool::new(false),
+            signal: Notify::new(),
+        }
+    }
+
+    /// Queue a candidate, evicting the oldest if the ring is full.
+    /// Returns `false` if this inbox has been retired, in which case
+    /// the caller still owns the datagram.
+    fn deposit(&self, payload: Bytes) -> bool {
+        if self.closed.load(Ordering::Acquire) {
+            return false;
+        }
+        {
+            let mut queue = self.queue.lock();
+            if queue.len() >= DIRECT_HANDSHAKE_INBOX_DEPTH {
+                queue.pop_front();
+            }
+            queue.push_back(payload);
+        }
+        self.signal.notify_one();
+        true
+    }
+
+    /// Retire this inbox. A waiter on it wakes and gets `None`.
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.signal.notify_one();
+    }
+
+    /// Next candidate, waiting for one. `None` once retired and drained.
+    async fn next(&self) -> Option<Bytes> {
+        loop {
+            // Scoped so the `parking_lot` guard cannot straddle the
+            // await below — on edition 2021 an `if let` would hold it
+            // for the whole block.
+            let queued = { self.queue.lock().pop_front() };
+            if queued.is_some() {
+                return queued;
+            }
+            if self.closed.load(Ordering::Acquire) {
+                return None;
+            }
+            // `notify_one` stores a permit when there is no waiter, so
+            // a deposit landing between the checks above and this await
+            // is not lost.
+            self.signal.notified().await;
+        }
+    }
+}
+
+/// Direct-handshake initiators indexed by the peer address whose
+/// datagrams they are waiting for.
+type DirectHandshakeRegistry = DashMap<SocketAddr, Arc<DirectHandshakeInbox>>;
 
 /// Hand a handshake payload read off the shared socket to the direct
 /// initiator waiting on `source`, if there is one. Returns whether the
@@ -583,18 +660,14 @@ const DIRECT_HANDSHAKE_INBOX_DEPTH: usize = 8;
 /// `msg2` does not merely fail to help — it destroys the reply, and
 /// every retransmit of it too.
 fn forward_to_direct_initiator(
-    registry: &DashMap<SocketAddr, DirectHandshakeInbox>,
+    registry: &DirectHandshakeRegistry,
     source: SocketAddr,
     payload: Bytes,
 ) -> bool {
     let Some(entry) = registry.get(&source) else {
         return false;
     };
-    // Full: the initiator is already holding more candidates than a
-    // handshake can need. Closed: it gave up and has not yet
-    // deregistered. Either way the datagram is spent, not ours.
-    let _ = entry.try_send(payload);
-    true
+    entry.deposit(payload)
 }
 
 /// One slot in [`MeshNode::fold_generations`]: a monotonic
@@ -1456,7 +1529,7 @@ struct DispatchCtx {
     /// If no entry matches the source (the responder side, or an
     /// unsolicited handshake), the datagram falls through to the
     /// caller's own drop behaviour.
-    pending_direct_initiators: Arc<DashMap<SocketAddr, DirectHandshakeInbox>>,
+    pending_direct_initiators: Arc<DirectHandshakeRegistry>,
     /// Our Noise static keypair — needed to construct responder state
     /// when a routed msg1 arrives for us.
     static_keypair: StaticKeypair,
@@ -8757,7 +8830,7 @@ pub struct MeshNode {
     /// dispatch loop, a sibling `connect()`, or the `accept()`
     /// responder's drain. See the matching field on `DispatchCtx` for
     /// context.
-    pending_direct_initiators: Arc<DashMap<SocketAddr, DirectHandshakeInbox>>,
+    pending_direct_initiators: Arc<DirectHandshakeRegistry>,
     /// Handshake datagrams the direct responder read and threw away
     /// because they did not decrypt under the pairing being accepted
     /// — another pairing's retransmitted `msg1`, junk, a key
@@ -10326,8 +10399,7 @@ impl MeshNode {
         });
 
         let pending_handshakes: Arc<DashMap<u64, PendingHandshake>> = Arc::new(DashMap::new());
-        let pending_direct_initiators: Arc<DashMap<SocketAddr, DirectHandshakeInbox>> =
-            Arc::new(DashMap::new());
+        let pending_direct_initiators: Arc<DirectHandshakeRegistry> = Arc::new(DashMap::new());
 
         // Hoist the subnet knobs before `config` is moved into the
         // struct literal; the publish + subscribe paths read these
@@ -33919,25 +33991,33 @@ impl MeshNode {
         // Concurrent direct connects on the same node work either way
         // — each registers under its own peer_addr.
         if self.started.load(Ordering::Acquire) {
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(DIRECT_HANDSHAKE_INBOX_DEPTH);
             // Register BEFORE sending msg1 so we can't miss a
             // fast responder that replies before we'd otherwise
             // be ready to receive. `insert` replaces any prior
-            // entry for the same `peer_addr` — last writer wins.
-            self.pending_direct_initiators.insert(peer_addr, tx);
+            // entry for the same `peer_addr` — last writer wins, and
+            // the loser is told so it fails fast rather than waiting
+            // out a deadline for datagrams now delivered elsewhere.
+            let inbox = Arc::new(DirectHandshakeInbox::new());
+            if let Some(displaced) = self
+                .pending_direct_initiators
+                .insert(peer_addr, inbox.clone())
+            {
+                displaced.close();
+            }
 
             if let Err(e) = self.socket.send_to(packet, peer_addr).await {
-                self.pending_direct_initiators.remove(&peer_addr);
+                self.deregister_direct_initiator(peer_addr, &inbox);
                 return Err(AdapterError::Connection(format!("send failed: {}", e)));
             }
 
             let outcome = tokio::time::timeout(timeout, async {
                 loop {
-                    let Some(payload) = rx.recv().await else {
-                        // Every sender is gone, which while our own
-                        // registration stands means a concurrent
-                        // `connect()` to the same address replaced it.
-                        return Err(AdapterError::Connection("handshake channel dropped".into()));
+                    let Some(payload) = inbox.next().await else {
+                        // Retired: a concurrent `connect()` to the same
+                        // address took over the registration.
+                        return Err(AdapterError::Connection(
+                            "handshake registration displaced".into(),
+                        ));
                     };
                     // Same rule as the pre-start loop below: a
                     // forwarded datagram that does not advance our
@@ -33957,7 +34037,7 @@ impl MeshNode {
             })
             .await;
 
-            self.pending_direct_initiators.remove(&peer_addr);
+            self.deregister_direct_initiator(peer_addr, &inbox);
             match outcome {
                 Ok(inner) => inner,
                 // The responder never replied, or its reply arrived
@@ -33972,12 +34052,17 @@ impl MeshNode {
             // exactly one waiter. So register an inbox as well —
             // whichever consumer wins the race forwards what it cannot
             // use to whoever can, instead of destroying it.
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(DIRECT_HANDSHAKE_INBOX_DEPTH);
-            self.pending_direct_initiators.insert(peer_addr, tx);
+            let inbox = Arc::new(DirectHandshakeInbox::new());
+            if let Some(displaced) = self
+                .pending_direct_initiators
+                .insert(peer_addr, inbox.clone())
+            {
+                displaced.close();
+            }
 
             let socket_arc = self.socket.socket_arc();
             if let Err(e) = self.socket.send_to(packet, peer_addr).await {
-                self.pending_direct_initiators.remove(&peer_addr);
+                self.deregister_direct_initiator(peer_addr, &inbox);
                 return Err(AdapterError::Connection(format!("send failed: {}", e)));
             }
 
@@ -33989,11 +34074,11 @@ impl MeshNode {
                     // Both arms are cancel-safe, so losing the race
                     // costs nothing.
                     let payload = tokio::select! {
-                        forwarded = rx.recv() => match forwarded {
+                        forwarded = inbox.next() => match forwarded {
                             Some(payload) => payload,
                             None => {
                                 return Err(AdapterError::Connection(
-                                    "handshake channel dropped".into(),
+                                    "handshake registration displaced".into(),
                                 ))
                             }
                         },
@@ -34049,12 +34134,26 @@ impl MeshNode {
             })
             .await;
 
-            self.pending_direct_initiators.remove(&peer_addr);
+            self.deregister_direct_initiator(peer_addr, &inbox);
             match outcome {
                 Ok(inner) => inner,
                 Err(_) => Err(AdapterError::Connection("handshake timeout".into())),
             }
         }
+    }
+
+    /// Remove OUR direct-handshake registration, and only ours.
+    ///
+    /// A later `connect()` to the same address replaces the entry —
+    /// last writer wins — so an unconditional `remove` here would take
+    /// that live registration down with us and strand it.
+    fn deregister_direct_initiator(
+        &self,
+        peer_addr: SocketAddr,
+        inbox: &Arc<DirectHandshakeInbox>,
+    ) {
+        self.pending_direct_initiators
+            .remove_if(&peer_addr, |_, registered| Arc::ptr_eq(registered, inbox));
     }
 
     /// Handshake datagrams one source may buy Noise work with per
@@ -39405,6 +39504,82 @@ mod committed_flush_stall_tests {
             Err(e) => panic!("under deadline must continue (Ok), got {e}"),
         }
         assert_eq!(delay, Duration::from_millis(10), "backoff must double");
+    }
+}
+
+#[cfg(test)]
+mod direct_handshake_inbox_tests {
+    use super::{DirectHandshakeInbox, DIRECT_HANDSHAKE_INBOX_DEPTH};
+    use bytes::Bytes;
+
+    fn candidate(tag: u8) -> Bytes {
+        Bytes::from(vec![tag; 4])
+    }
+
+    /// The inbox overflows towards the OLDEST candidate, not the newest.
+    ///
+    /// Candidates are indistinguishable until `read_message` has been
+    /// tried on them, so the inbox cannot pick out the real `msg2` —
+    /// but under a burst of stale or spoofed handshakes carrying the
+    /// peer's address, the real reply is the LATER arrival. A queue
+    /// that refuses on overflow drops exactly that one, and the
+    /// initiator times out having never seen the reply its peer sent.
+    #[tokio::test]
+    async fn a_full_inbox_evicts_the_oldest_candidate_not_the_newest() {
+        let inbox = DirectHandshakeInbox::new();
+
+        // A burst that fills the ring, then the real reply behind it.
+        for i in 0..DIRECT_HANDSHAKE_INBOX_DEPTH {
+            assert!(inbox.deposit(candidate(i as u8)));
+        }
+        let reply = candidate(0xff);
+        assert!(inbox.deposit(reply.clone()));
+
+        let mut seen = Vec::new();
+        for _ in 0..DIRECT_HANDSHAKE_INBOX_DEPTH {
+            seen.push(inbox.next().await.expect("inbox is not retired"));
+        }
+
+        assert!(
+            seen.contains(&reply),
+            "the newest candidate must survive a preceding burst",
+        );
+        assert!(
+            !seen.contains(&candidate(0)),
+            "the oldest candidate is the one that must be evicted",
+        );
+    }
+
+    /// A retired registration must not swallow datagrams: a later
+    /// `connect()` to the same address has taken over, and anything
+    /// deposited here would never be read.
+    #[tokio::test]
+    async fn a_retired_inbox_refuses_deposits_and_wakes_its_waiter() {
+        let inbox = DirectHandshakeInbox::new();
+        inbox.close();
+
+        assert!(
+            !inbox.deposit(candidate(1)),
+            "a retired inbox must leave the datagram with its caller",
+        );
+        assert!(
+            inbox.next().await.is_none(),
+            "a waiter on a retired inbox must fail fast, not wait out its deadline",
+        );
+    }
+
+    /// Deposits made before the waiter arrives are still delivered.
+    #[tokio::test]
+    async fn a_deposit_that_precedes_the_waiter_is_not_lost() {
+        let inbox = std::sync::Arc::new(DirectHandshakeInbox::new());
+        assert!(inbox.deposit(candidate(7)));
+
+        let waiter = inbox.clone();
+        let got = tokio::spawn(async move { waiter.next().await })
+            .await
+            .expect("waiter task panicked");
+
+        assert_eq!(got, Some(candidate(7)));
     }
 }
 
