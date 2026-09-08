@@ -57,6 +57,12 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 # and prove a refused transition puts nothing on the wire. Both are properties
 # of one specific interleaving, so a retry could only ever convert a real
 # ordering defect into a green run.
+#
+# `sensing_org_exact_projection` joins on the same rule: one witness drives a
+# concurrent readiness writer against repeated captures, and another proves no
+# sensing guard is held during the proximity/budget/order phases. A retry there
+# would hide exactly the coherence or lock-order defect those witnesses exist
+# to catch.
 [[profile.default.overrides]]
-filter = 'binary(integration_nrpc_protected) + binary(org_ownership) + binary(capability_exposure_revocation) + binary(org_admission_gate) + binary(org_admission_wire) + binary(nrpc_call_hijack) + binary(nrpc_response_routing) + binary(nrpc_service_equality) + binary(nrpc_route_discriminator) + binary(nrpc_streaming_gate) + binary(nrpc_registration_order) + binary(sensing_provider) + binary(sensing_org_lease_wire)'
+filter = 'binary(integration_nrpc_protected) + binary(org_ownership) + binary(capability_exposure_revocation) + binary(org_admission_gate) + binary(org_admission_wire) + binary(nrpc_call_hijack) + binary(nrpc_response_routing) + binary(nrpc_service_equality) + binary(nrpc_route_discriminator) + binary(nrpc_streaming_gate) + binary(nrpc_registration_order) + binary(sensing_provider) + binary(sensing_org_lease_wire) + binary(sensing_org_exact_projection)'
 retries = 0

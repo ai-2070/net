@@ -377,6 +377,37 @@ impl ObservationCell {
         }
     }
 
+    /// Projection at a CALLER-supplied instant, without mutating anything.
+    ///
+    /// Mirrors [`Self::expire_if_due`]'s bound without applying it, so a READ
+    /// path can evaluate freshness at one captured `now` — no `&mut`, no second
+    /// lock, and no worker tick required to turn expired evidence into
+    /// `Unknown`. The comparison is `now >= deadline`, the same boundary the
+    /// mutating driver uses, so the two cannot disagree about the exact instant
+    /// a cell stops vouching for anything.
+    ///
+    /// Deliberately NOT a `deadline()` getter: keeping `deadline` private keeps
+    /// the expiry rule in ONE place, next to `expire_if_due`, where a call site
+    /// cannot drift from it.
+    pub(crate) fn projected_at(&self, now: Instant) -> ProjectedReadiness {
+        if now >= self.deadline {
+            return ProjectedReadiness::Unknown;
+        }
+        self.projected()
+    }
+
+    /// The instant this cell stops vouching (fixtures/tests only).
+    ///
+    /// Exposed so a witness can assert the EXACT boundary — `deadline - 1ns`
+    /// still projects, `deadline` does not — instead of sleeping past a window
+    /// and hoping. Production reads freshness through
+    /// [`Self::projected_at`] alone.
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn deadline_for_test(&self) -> Instant {
+        self.deadline
+    }
+
     /// Current continuity state.
     pub const fn continuity(&self) -> Continuity {
         self.continuity

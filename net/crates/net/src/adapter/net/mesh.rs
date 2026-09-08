@@ -28,7 +28,7 @@
 //! └─────────────────────────────────────────────┘
 //! ```
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -7883,7 +7883,7 @@ impl<G> std::ops::DerefMut for SensingGuard<G> {
 /// Assert THIS THREAD holds no sensing guard. Deterministic: the counter is
 /// thread-local, so no other thread can perturb it.
 #[cfg(any(test, feature = "fixtures"))]
-fn assert_off_sensing_locks(what: &str) {
+pub(crate) fn assert_off_sensing_locks(what: &str) {
     let depth = SENSING_GUARD_DEPTH.with(|d| d.get());
     let held = SensingGuards::held();
     assert_eq!(
@@ -7894,7 +7894,7 @@ fn assert_off_sensing_locks(what: &str) {
 }
 
 #[cfg(not(any(test, feature = "fixtures")))]
-fn assert_off_sensing_locks(_what: &str) {}
+pub(crate) fn assert_off_sensing_locks(_what: &str) {}
 
 /// Fixtures-only hook carrying the exact-expiry timer's next armed deadline
 /// (`None` when no live record gates a wake).
@@ -10522,6 +10522,13 @@ pub struct MeshNode {
     /// would make the zero-emission proof vacuous.
     #[cfg(any(test, feature = "fixtures"))]
     sensing_phase_two_seam: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Fixtures seam: fires at each labelled point of the sensed projection
+    /// that must run OFF every sensing lock, carrying this thread's guard
+    /// depth and set. Lets a witness prove the off-lock claim positively.
+    #[cfg(any(test, feature = "fixtures"))]
+    #[allow(clippy::type_complexity)]
+    sensing_projection_offlock_observer:
+        parking_lot::Mutex<Option<Arc<dyn Fn(&'static str, usize, String) + Send + Sync>>>,
     /// Review L1 linearization: the LOCAL-projection transaction mutex. Every
     /// operation that changes OR applies the node-local consumer projection
     /// (the `Local`/`LeasedLocal` rows' derived
@@ -12404,6 +12411,8 @@ impl MeshNode {
             sensing_fence_seam: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(any(test, feature = "fixtures"))]
             sensing_phase_two_seam: parking_lot::Mutex::new(None),
+            #[cfg(any(test, feature = "fixtures"))]
+            sensing_projection_offlock_observer: parking_lot::Mutex::new(None),
             sensing_local_projection_mu,
             #[cfg(feature = "fixtures")]
             sensing_projection_contention_hook: parking_lot::Mutex::new(None),
@@ -16185,6 +16194,118 @@ impl MeshNode {
                 )
             })
             .collect()
+    }
+
+    /// ONE critical section over `sensing_observations`, for the retained
+    /// organization exact-provider demand of one capability (design D6.4).
+    ///
+    /// The caller captures `now` BEFORE calling and passes it in, so every
+    /// row's freshness is evaluated against the SAME instant, and the guard is
+    /// released before any proximity, budget or ordering work runs.
+    ///
+    /// Four structural properties, none of them a matter of caller discipline:
+    ///
+    /// 1. exactly `population.len()` rows, in `population` order. A member with
+    ///    no retained interest, or a retained interest with no cell, is
+    ///    `Unknown`;
+    /// 2. **only** `retained`'s keys are read, so an unrelated map entry can
+    ///    never contribute a provider, and there is no full map scan;
+    /// 3. a row removed or replaced before this call needs no detection: the map
+    ///    is read at its current state and an absent entry is `Unknown`;
+    /// 4. counts, ranking and rows are later folds of ONE immutable `Vec`, so
+    ///    they cannot disagree with each other.
+    pub(crate) fn org_sensed_branch_snapshot(
+        &self,
+        population: &[u64],
+        retained: &BTreeMap<u64, sensing::ProviderInterestKey>,
+        now: Instant,
+    ) -> Vec<(u64, sensing::ProjectedReadiness, Option<Duration>)> {
+        // The INSTRUMENTED guard, like every other sensing acquisition: the
+        // off-lock claim below is only measurable if this section registers
+        // itself, and a bare `.lock()` here would make the witness vacuous.
+        let observations = SensingGuard::new(
+            self.sensing_observations.lock(),
+            SensingGuardKind::Observations,
+        );
+        population
+            .iter()
+            .map(|&provider| {
+                let cell = retained
+                    .get(&provider)
+                    .and_then(|branch| observations.consumer_cells.get(branch));
+                match cell {
+                    None => (provider, sensing::ProjectedReadiness::Unknown, None),
+                    Some(cell) => (
+                        provider,
+                        cell.projected_at(now),
+                        cell.observation().and_then(|obs| obs.estimated_start),
+                    ),
+                }
+            })
+            .collect()
+    }
+
+    /// This consumer's current route estimate toward `provider`.
+    ///
+    /// Reads the proximity plane only — deliberately callable with every
+    /// sensing guard released, which is what lets the sensed projection do its
+    /// proximity pass off-lock.
+    pub(crate) fn sensing_route_estimate(&self, provider: u64) -> Duration {
+        sensing::proximity_route_estimate(&self.proximity_graph, provider)
+    }
+
+    /// Fixtures-only: report this thread's held sensing guards at one labelled
+    /// point of the sensed projection.
+    ///
+    /// The projection also carries [`assert_off_sensing_locks`], but an
+    /// assertion inside the code under test cannot tell a witness that it ever
+    /// ran. This seam does: a witness records the phases it observed AND their
+    /// guard sets, so "no lock was held" cannot pass vacuously.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub(crate) fn observe_sensing_projection_offlock(&self, phase: &'static str) {
+        let hook = self.sensing_projection_offlock_observer.lock().clone();
+        if let Some(hook) = hook {
+            let depth = SENSING_GUARD_DEPTH.with(|d| d.get());
+            hook(
+                phase,
+                depth as usize,
+                format!("{:?}", SensingGuards::held()),
+            );
+        }
+    }
+
+    /// The uninstrumented build has no observer: the phases stay off-lock by
+    /// construction, and there is nothing to report to.
+    #[cfg(not(any(test, feature = "fixtures")))]
+    pub(crate) fn observe_sensing_projection_offlock(&self, _phase: &'static str) {}
+
+    /// Install the sensed-projection off-lock observer (fixtures/tests only).
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn set_sensing_projection_offlock_observer_for_test(
+        &self,
+        hook: Arc<dyn Fn(&'static str, usize, String) + Send + Sync>,
+    ) {
+        *self.sensing_projection_offlock_observer.lock() = Some(hook);
+    }
+
+    /// Admit one beat into an EXISTING consumer cell and report the deadline it
+    /// armed (fixtures/tests only).
+    ///
+    /// `None` when the branch has no cell — a witness that expected retained
+    /// demand to have anchored one must see that, not silently create it.
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn sensing_admit_beat_for_test(
+        &self,
+        branch: &sensing::ProviderInterestKey,
+        beat: sensing::DeliveredBeat,
+        now: Instant,
+    ) -> Option<Instant> {
+        let mut observations = self.sensing_observations.lock();
+        let cell = observations.consumer_cells.get_mut(branch)?;
+        cell.on_admitted_beat(now, beat);
+        Some(cell.deadline_for_test())
     }
 
     /// SI-4b: the LOCAL result-mode aggregate for one interest

@@ -1530,6 +1530,73 @@ jobs:
           done
           echo "organization lease wire: self-test + non-executing inventory + whole-binary zero-retry run + $req_n exact per-witness runs all green"
 
+      # === Sensing — organization exact-provider PROJECTION (independent) ==
+      # OA-4's request-relative projection witnesses
+      # (`tests/sensing_org_exact_projection.rs`). Its own invocation for the
+      # same reason as the lease-wire step above: `--no-tests=fail` is RUN-wide,
+      # so this binary compiling to zero tests — its `#![cfg(all(feature =
+      # "net", feature = "fixtures"))]` unsatisfied, or every witness renamed
+      # away — would be invisible while a sibling target still ran something.
+      #
+      # `--retries 0` deliberately: one witness drives a concurrent readiness
+      # writer against repeated captures, and another proves that no sensing
+      # guard is held during the proximity/budget/order phases. Both are
+      # properties of a specific interleaving, so a retry could only convert a
+      # real coherence or lock-order defect into a green run.
+      #
+      # The roster is DERIVED from `cargo nextest list` (which executes
+      # nothing) and then re-run per name with an exact-equality filterset, so
+      # a renamed or `#[ignore]`d witness fails the step instead of vanishing.
+      - name: Sensing — organization exact projection
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          BIN=sensing_org_exact_projection
+          FEATURES="cortex tool fixtures"
+          REQUIRED="counts_ranking_and_rows_agree_under_concurrent_status_change
+          unknown_never_prunes_and_an_over_budget_ready_stays_potential
+          expiry_without_a_new_beat_maps_unknown_and_an_expired_not_ready_never_prunes
+          a_provider_removed_before_the_snapshot_resolves_unknown_from_current_state
+          a_provider_removed_after_the_snapshot_is_advisory_and_cannot_authorize
+          an_unrelated_interest_for_the_same_provider_never_contributes_readiness
+          no_sensing_lock_is_held_during_route_budget_or_sort_work
+          the_sensed_order_is_a_stable_class_permutation_of_the_complete_list
+          a_candidate_list_beyond_the_sensing_cap_keeps_every_unsensed_member
+          the_population_clamp_bounds_rows_but_never_drops_a_candidate"
+
+          die() { echo "::error::$1"; shift; [ "$#" -gt 0 ] && printf '%s\n' "$@"; exit 1; }
+          strip_ansi() { sed -E "s/$(printf '\033')\\[[0-9;:?]*[a-zA-Z]//g"; }
+
+          # Non-executing inventory: presence and cardinality come from the
+          # LIST, so there is no test output to decorate or inject into.
+          inventory=$(cargo nextest list --color never --features "$FEATURES" \
+                        --test sensing_org_exact_projection 2>&1) \
+            || die "cargo nextest list failed" "$inventory"
+          listed=$(printf '%s\n' "$inventory" | strip_ansi \
+                     | grep -cE "^[A-Za-z0-9_-]+::${BIN} [A-Za-z0-9_]+\$")
+          req_n=$(printf '%s\n' $REQUIRED | grep -c .)
+          [ "$listed" -ge "$req_n" ] \
+            || die "$BIN lists $listed test(s), fewer than the $req_n pinned by name" "$inventory"
+
+          for required in $REQUIRED; do
+            n=$(printf '%s\n' "$inventory" | strip_ansi \
+                  | grep -cE "^[A-Za-z0-9_-]+::${BIN} ${required}\$")
+            [ "$n" = 1 ] \
+              || die "$required is listed $n time(s) in $BIN, expected exactly 1" "$inventory"
+          done
+
+          # Whole binary, then each pinned name on its own with an exact filter.
+          cargo nextest run --color never --no-fail-fast --no-tests=fail --retries 0 \
+            --features "$FEATURES" --test sensing_org_exact_projection \
+            || die "$BIN did not pass as a whole"
+          for required in $REQUIRED; do
+            cargo nextest run --color never --no-tests=fail --retries 0 \
+              --features "$FEATURES" --test sensing_org_exact_projection -E "test(=$required)" \
+              || die "$required did not run and pass as exactly one test"
+            echo "  exact: $required"
+          done
+          echo "organization exact projection: $listed listed, $req_n pinned by name, all green"
+
       # === NetDB ==========================================================
       - name: NetDB
         if: ${{ !cancelled() }}

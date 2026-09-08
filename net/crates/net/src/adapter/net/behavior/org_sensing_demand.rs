@@ -99,12 +99,13 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::org_grant::CapabilityAuthorityId;
 use super::org_routing_registry::RoutingFamily;
+use super::scheduler_bridge::project_sensed_candidates;
 use super::sensing;
-use crate::adapter::net::mesh::{MeshNode, MAX_ORG_SENSING_POPULATION};
+use crate::adapter::net::mesh::{assert_off_sensing_locks, MeshNode, MAX_ORG_SENSING_POPULATION};
 
 /// How many distinct capabilities ONE family will retain demand for.
 ///
@@ -157,12 +158,158 @@ pub enum OrgSensingDemandRefused {
 struct RetainedProvider {
     provider: u64,
     key: sensing::SensingLeaseKey,
+    /// The OBSERVATION identity of this provider's branch. Recorded at
+    /// acquisition because the interest digest binds `Node(provider)`, so every
+    /// retained provider has its OWN digest: the branch key cannot be
+    /// re-derived from the capability alone, and re-deriving it per read would
+    /// rebuild a spec the acquisition already canonicalized.
+    branch: sensing::ProviderInterestKey,
     ticket: sensing::SensingLeaseTicket,
     /// The INSTALLATION this holder joined. Recorded because retirement has to
     /// settle the node's refresh schedule against the identity it actually
     /// released — a lease key is shared, so "my release" and "the row is gone"
     /// are different facts.
     installation_id: sensing::LeaseToken,
+}
+
+/// ONE population member's captured readiness row.
+///
+/// Deliberately carries no deadline, no observation timestamp and no continuity
+/// state: freshness was already applied at the captured instant, and exporting
+/// it would invite a second, later comparison against a first one's verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrgSensedRow {
+    /// The authorized provider this row describes.
+    pub provider: u64,
+    /// Its projection at the captured instant. `Unknown` covers missing,
+    /// removed, unretained and expired evidence alike.
+    pub readiness: sensing::ProjectedReadiness,
+    /// The provider-signed start estimate that backed the projection, if any.
+    pub estimated_start: Option<Duration>,
+}
+
+/// ONE request-relative sensed projection over one capability's authorized
+/// population (design D6.5). Plain, immutable, ADVISORY data.
+///
+/// `rows`, the three buckets and any count taken from them are folds of ONE
+/// captured `Vec`, so they cannot disagree. The buckets partition `rows`
+/// exactly: every provider appears in exactly one of them, and none is
+/// invented.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgSensedProjection {
+    rows: Vec<OrgSensedRow>,
+    viable: Vec<u64>,
+    potential: Vec<u64>,
+    non_viable: Vec<u64>,
+}
+
+impl OrgSensedProjection {
+    /// Exactly one row per authorized population member, in population order.
+    pub fn rows(&self) -> &[OrgSensedRow] {
+        &self.rows
+    }
+
+    /// Providers whose readiness is viable for THIS request's budget, in sensed
+    /// rank order — consumer-local route economics first, provider id as the
+    /// deterministic tie-break.
+    pub fn viable(&self) -> &[u64] {
+        &self.viable
+    }
+
+    /// Providers with no viability verdict: `Unknown` evidence, or a `Ready`
+    /// proof that does not fit this request's budget. NEVER pruned — a route
+    /// change or a fresh beat can make either viable, and absence of evidence
+    /// is not evidence of absence.
+    pub fn potential(&self) -> &[u64] {
+        &self.potential
+    }
+
+    /// Providers sensed explicitly NOT ready for this exact interest at the
+    /// captured instant. Non-viable for THIS request only: they are ordered
+    /// last, never removed, and nothing about discovery, membership or
+    /// admission changes.
+    pub fn non_viable(&self) -> &[u64] {
+        &self.non_viable
+    }
+
+    /// The provider a request should try first, or `None` when nothing is
+    /// currently viable — in which case the caller's own unsensed order stands.
+    pub fn preferred(&self) -> Option<u64> {
+        self.viable.first().copied()
+    }
+}
+
+/// The deterministic candidate ORDER a sensed projection implies, over plain
+/// data (design D7.2).
+///
+/// # Two populations, two different bounds
+///
+/// * `providers`/`same_org` describe the COMPLETE authorized candidate list
+///   `C`, already in the caller's own deterministic order. `C` is **not**
+///   bounded by the sensing population cap: SameOrg providers beyond it, and
+///   every cross-organization candidate, are in the list too;
+/// * `ranked` and `pruned` come from a sensed projection and are bounded by the
+///   sensed population `S <= MAX_ORG_SENSING_POPULATION`.
+///
+/// # What it does
+///
+/// A stable class-ordered PERMUTATION of the input list: sensed-viable
+/// candidates first in SENSED RANK ORDER, then everything with no verdict in
+/// input order, then the ones sensed not-ready in input order. It adds no
+/// comparison sort over the complete list, no map and no fixed-size array —
+/// membership is a linear scan of two slices bounded by `S`.
+///
+/// # What it cannot do
+///
+/// It returns indices only, so it can neither invent a candidate nor drop one:
+/// the result is always a permutation of `0..providers.len()`. A candidate that
+/// was never sensed keeps its place among the unverdicted ones; a not-ready one
+/// is ordered last rather than removed. Cross-organization candidates are never
+/// sensed and therefore never pruned.
+pub fn org_sensed_bucket_permutation(
+    same_org: &[bool],
+    providers: &[u64],
+    ranked: &[u64],
+    pruned: &[u64],
+) -> Vec<usize> {
+    debug_assert_eq!(
+        same_org.len(),
+        providers.len(),
+        "the two candidate slices are parallel views of one list"
+    );
+    let mut viable: Vec<usize> = Vec::with_capacity(ranked.len());
+    let mut potential: Vec<usize> = Vec::with_capacity(providers.len());
+    let mut non_viable: Vec<usize> = Vec::with_capacity(providers.len());
+
+    // Sensed rank order, which is the whole point of sensing: the sensed order
+    // drives the emission, not the input's own order.
+    for wanted in ranked {
+        if let Some(index) = providers
+            .iter()
+            .zip(same_org)
+            .position(|(provider, &owned)| owned && provider == wanted)
+        {
+            viable.push(index);
+        }
+    }
+
+    // ONE pass over the input in its ORIGINAL order for everything else.
+    // Membership in `ranked` IS the "already emitted" test, so no second
+    // bookkeeping structure can disagree with the first.
+    for (index, (&provider, &owned)) in providers.iter().zip(same_org).enumerate() {
+        if owned && ranked.contains(&provider) {
+            continue;
+        }
+        if owned && pruned.contains(&provider) {
+            non_viable.push(index);
+        } else {
+            potential.push(index);
+        }
+    }
+
+    viable.extend(potential);
+    viable.extend(non_viable);
+    viable
 }
 
 /// One capability's retained demand for ONE clone family.
@@ -221,6 +368,106 @@ impl OrgSensingCapabilityDemand {
     pub fn authority_is_current(&self) -> bool {
         self.node
             .sensing_authority_stamp_is_current(&self.authority_epoch)
+    }
+
+    /// The retained providers with their OBSERVATION identities
+    /// (fixtures/tests only).
+    ///
+    /// A witness needs the exact branch key the acquisition canonicalized: the
+    /// interest digest binds `Node(provider)` and the fixed internal sensing
+    /// policy, so rebuilding the spec outside this module would be a
+    /// resemblance of the key, not the key.
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn retained_branches_for_test(&self) -> Vec<(u64, sensing::ProviderInterestKey)> {
+        self.retained
+            .iter()
+            .map(|held| (held.provider, held.branch.clone()))
+            .collect()
+    }
+
+    /// ONE request-relative readiness projection over this demand's authorized
+    /// population, evaluated at ONE caller-captured instant (design D6.5).
+    ///
+    /// # The phases, and what runs where
+    ///
+    /// * **Phase 0** — off every sensing lock: the caller's `now` and `budget`,
+    ///   and this demand's immutable `population`. Nothing is derived from live
+    ///   state here, so the population a projection reports on can never be
+    ///   mutated underneath it;
+    /// * **Phase 1** — ONE `sensing_observations` critical section
+    ///   ([`MeshNode::org_sensed_branch_snapshot`]): exactly one row per
+    ///   population member, in population order, clamped to this demand's
+    ///   retained branch keys. Missing, removed, expired and unretained
+    ///   evidence all resolve `Unknown`, and no entry outside those keys is
+    ///   read — sensing cannot contribute a provider;
+    /// * **Phase 2** — off every sensing lock: ONE proximity pass;
+    /// * **Phase 3** — off every sensing lock, pure: request-relative
+    ///   classification and the sensed rank order.
+    ///
+    /// # What this is, and what it is NOT
+    ///
+    /// It is a coherent capture of THIS node's consumer cells at `now`. It is
+    /// not linearized against the proximity plane's own updates, and no
+    /// cross-plane or distributed linearizability is claimed. The result is
+    /// ADVISORY plain data: it carries no lease, mints no grant, reserves
+    /// nothing, and cannot admit an invocation. Provider churn after the
+    /// capture is not a defect of the capture — the value describes the instant
+    /// it was taken, and the next projection describes the next one.
+    pub fn project_sensed_order(
+        &self,
+        now: Instant,
+        budget: &sensing::ConsumerLatencyBudget,
+    ) -> OrgSensedProjection {
+        // PHASE 0 - immutable inputs, off every lock.
+        let population = Arc::clone(&self.population);
+        let retained: BTreeMap<u64, sensing::ProviderInterestKey> = self
+            .retained
+            .iter()
+            .map(|held| (held.provider, held.branch.clone()))
+            .collect();
+
+        // PHASE 1 - one critical section; nothing else happens inside it.
+        let rows = self
+            .node
+            .org_sensed_branch_snapshot(&population, &retained, now);
+
+        // PHASE 2 - the proximity pass, off every sensing lock. One estimate
+        // per row, in row order.
+        assert_off_sensing_locks("sensed projection proximity pass");
+        self.node.observe_sensing_projection_offlock("proximity");
+        let views: Vec<sensing::BranchView> = rows
+            .iter()
+            .map(
+                |&(provider, projection, estimated_start)| sensing::BranchView {
+                    provider,
+                    projection,
+                    estimated_start,
+                    route_estimate: self.node.sensing_route_estimate(provider),
+                },
+            )
+            .collect();
+
+        // PHASE 3 - pure, off every sensing lock. `project_sensed_candidates`
+        // is the same classifier the consumer aggregate uses, so a sensed order
+        // can never drift from the readiness it was derived from.
+        assert_off_sensing_locks("sensed projection classification and ordering");
+        self.node
+            .observe_sensing_projection_offlock("classification");
+        let delta = project_sensed_candidates(&views, budget);
+        OrgSensedProjection {
+            rows: rows
+                .into_iter()
+                .map(|(provider, readiness, estimated_start)| OrgSensedRow {
+                    provider,
+                    readiness,
+                    estimated_start,
+                })
+                .collect(),
+            viable: delta.viable,
+            potential: delta.potential,
+            non_viable: delta.non_viable,
+        }
     }
 
     /// RETIRE every retained provider. The lease key's LAST holder release is
@@ -522,6 +769,7 @@ impl OrgSensingFamily {
                 let moved = RetainedProvider {
                     provider: retained.provider,
                     key: retained.key,
+                    branch: retained.branch.clone(),
                     ticket: retained.ticket,
                     installation_id: retained.installation_id,
                 };
@@ -678,6 +926,12 @@ impl OrgSensingFamily {
         Some(RetainedProvider {
             provider,
             key,
+            // The observation identity of the interest this acquisition just
+            // registered, from the SAME canonical spec the digest came from.
+            branch: sensing::ProviderInterestKey::new(
+                sensing::CapabilityInterestKey::for_spec(&spec),
+                provider,
+            ),
             ticket: acquired.ticket,
             installation_id: acquired.installation_id,
         })
