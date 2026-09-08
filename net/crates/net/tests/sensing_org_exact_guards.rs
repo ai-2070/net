@@ -8,15 +8,32 @@
 //! * every `pub` item in the bridge file carries the fixtures gate, is hidden
 //!   from docs, and says in words that it is unsupported test plumbing;
 //! * the rule is by MODULE BOUNDARY, not a name list: the guard iterates the
-//!   bridge file's own declarations, so an eighth, differently named bridge is
-//!   covered the moment it is declared;
+//!   bridge file's own declarations, so a differently named additional bridge
+//!   in that file is covered the moment it is declared;
 //! * no bridge identifier appears in `mesh.rs`, so the module cannot quietly
 //!   become a re-export of private node state;
 //! * the external fixtures-off probe names exactly the bridge's declarations -
 //!   neither fewer (which would shrink the darkness claim) nor more (which
 //!   would not compile);
-//! * the bridge module is the ONLY declaration the slice adds under `src/`
-//!   that is `pub` without a fixtures gate on its module.
+//!
+//! # What these guards do NOT claim
+//!
+//! They are BOUNDED source checks, not a Rust front end, and saying so is part
+//! of the contract:
+//!
+//! * declaration enumeration recognises the `pub fn` / `pub struct` /
+//!   `pub enum` / `pub const` / `pub type` prefixes this file uses. A bridge
+//!   introduced through some other `pub` form - a re-export, a trait impl, a
+//!   macro expansion - would need the enumeration widened in the same commit;
+//! * probe coverage is name-substring based: it proves the probe MENTIONS each
+//!   declaration, and the fixtures-off compile then proves the module as a
+//!   whole is unreachable. That is module-level negative evidence, not a
+//!   per-symbol proof against a hypothetical partial exposure;
+//! * containment is checked against `mesh.rs` and the module declaration, not
+//!   against every file under `src/`.
+//!
+//! Exact-range diff review by a reviewer is what covers the remainder; these
+//! guards exist so a later edit cannot quietly undo what that review saw.
 //!
 //! Run: `cargo nextest run --features "cortex tool fixtures" --test
 //! sensing_org_exact_guards`

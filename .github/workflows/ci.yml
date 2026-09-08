@@ -1661,9 +1661,13 @@ jobs:
 
           run_binary sensing_org_exact_seam \
             discovery_transport_observations_projection_and_admission_compose \
+            a_stale_local_preparation_mints_no_intent_and_sends_nothing \
             an_unproven_call_to_the_sensed_provider_is_denied \
             sensing_is_advisory_and_neither_plane_lets_it_authorize \
-            real_sensed_evidence_orders_the_complete_candidate_list
+            real_sensed_evidence_orders_the_complete_candidate_list \
+            an_all_pruned_order_falls_back_to_the_callers_own_order \
+            a_granted_only_provider_is_never_sensed_and_a_dual_plane_provider_is_sensed_once \
+            an_unpinned_authorized_provider_is_neither_sensed_nor_callable
 
           run_binary sensing_org_exact_guards \
             every_bridge_declaration_is_gated_hidden_and_marked_unstable \
@@ -1695,16 +1699,22 @@ jobs:
           set -uo pipefail
           die() { echo "::error::$1"; shift; [ "$#" -gt 0 ] && printf '%s\n' "$@"; exit 1; }
 
-          negative=$(cargo check --message-format short 2>&1)
-          status=$?
-          [ "$status" -ne 0 ] \
-            || die "the fixtures-off probe COMPILED: the bridge is reachable in a \
-                    build without the feature" "$negative"
+          # The negative leg is EXPECTED to fail, and the runner's shell has
+          # errexit on: `set -uo pipefail` does not clear an inherited `-e`, so
+          # a bare assignment from a failing command would exit the step right
+          # here - before the diagnostic classification and before the positive
+          # control ever ran. Capturing it inside an `if` is what suppresses
+          # errexit for exactly this one command, and nothing else.
+          negative=""
+          if negative=$(cargo check --message-format short 2>&1); then
+            die "the fixtures-off probe COMPILED: the bridge is reachable in a \
+                 build without the feature" "$negative"
+          fi
           printf '%s\n' "$negative" \
             | grep -qE 'error\[E043[23]\].*org_exact_sensing_bridge' \
             || die "the fixtures-off probe failed for the WRONG reason: expected an \
                     E0432/E0433 resolution failure naming the bridge module" "$negative"
-          echo "negative leg: bridge unresolvable without \`fixtures\` (exit $status)"
+          echo "negative leg: bridge unresolvable without \`fixtures\`"
 
           cargo check --features fixtures \
             || die "the positive leg must compile, or the negative leg proves nothing"
