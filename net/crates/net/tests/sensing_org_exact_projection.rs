@@ -51,6 +51,10 @@ const TAG: &str = "nrpc:gpu.infer";
 
 /// Every off-lock observation the projection reported, in order.
 type OffLockLog = Arc<parking_lot::Mutex<Vec<SensingOffLockObservation>>>;
+
+/// What the observer itself could see about the lock it reports on:
+/// `(phase, mutex was free, this thread held it)`.
+type ObserverProbes = Arc<parking_lot::Mutex<Vec<(&'static str, bool, bool)>>>;
 const TTL: Duration = Duration::from_secs(30);
 
 /// A sensing-enabled, organization-authoritative node. No transport: every
@@ -491,8 +495,10 @@ async fn a_provider_removed_after_the_snapshot_is_advisory_and_cannot_authorize(
 ///
 /// * a lock taken for the duration of one route lookup, after a clean
 ///   phase label. Each lookup reports from its own callsite and carries
-///   `observations_available`, so an untracked raw `.lock()` held across it is
-///   visible even though the instrumented depth stays zero;
+///   `observations_held_here` - set by EVERY acquisition of the observation
+///   mutex, instrumented or not - so an untracked raw `.lock()` held across it
+///   is visible even though the instrumented guard depth stays zero. It is
+///   thread-local, so an unrelated legitimate holder cannot forge it;
 /// * a projection that stopped doing the work at all. The route observations
 ///   are counted against the captured rows, and the classification and ranking
 ///   points carry their own work counts, so zero work fails instead of passing
@@ -534,9 +540,9 @@ async fn no_sensing_lock_is_held_during_route_budget_or_sort_work() {
             observation.held
         );
         assert!(
-            observation.observations_available,
-            "{} ran while the observation mutex was UNAVAILABLE to its own \
-             thread - something is holding it across the work: {observation:?}",
+            !observation.observations_held_here,
+            "{} ran while THIS thread held the observation guard - the work is \
+             running under the lock it must have released: {observation:?}",
             observation.phase
         );
     }
@@ -614,7 +620,7 @@ async fn one_acquisition_captures_every_row_while_a_writer_is_excluded() {
             start_rx.recv().expect("released from inside the capture");
             // Taken while the capture holds the guard: this is the contention.
             probe_tx
-                .send(node.sensing_observations_available_for_test())
+                .send(node.sensing_observations_free_for_test())
                 .expect("report the probe");
             // Blocks until the section ends, then lands.
             node.sensing_admit_beat_for_test(
@@ -755,6 +761,159 @@ async fn an_unrelated_interest_for_the_same_provider_never_contributes_readiness
 
     drop(watched);
     drop(other);
+    drop(family);
+}
+
+/// The observer runs with NOTHING held: it can take the observation mutex
+/// itself.
+///
+/// This is a regression for a real defect in the first version of this
+/// instrumentation. Availability was probed inline in the callback's argument
+/// list, so on success the temporary guard lived until the end of the call
+/// statement: the diagnostic reported "off-lock, available" while the callback
+/// itself ran holding the observation lock. A callback that coordinated with
+/// another capture could then block it, or deadlock waiting for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_off_lock_observer_itself_holds_nothing() {
+    let node = projection_node("observer-free").await;
+    let family = OrgSensingFamily::mint(&node).expect("mint");
+    let provider = node.node_id().wrapping_add(1);
+    let demand = family.reconcile(TAG, &[provider]).expect("retain");
+    let keys = branches(&demand);
+    admit(&node, &keys[0].1, beat(AttestedStatus::Ready, 5, 1, true));
+
+    // The callback ACQUIRES the mutex it is being told about, and records
+    // whether it could - which a surviving probe guard makes impossible.
+    let acquired: ObserverProbes = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    {
+        let acquired = Arc::clone(&acquired);
+        let node = Arc::clone(&node);
+        node.clone()
+            .set_sensing_projection_offlock_observer_for_test(Arc::new(move |observation| {
+                let free = node.sensing_observations_free_for_test();
+                let held_here = MeshNode::sensing_observations_held_here_for_test();
+                acquired.lock().push((observation.phase, free, held_here));
+            }));
+    }
+
+    let projection = demand.project_sensed_order(Instant::now(), &ConsumerLatencyBudget::default());
+    assert_eq!(projection.viable(), &[provider], "the projection ran");
+
+    let seen = acquired.lock().clone();
+    assert!(
+        !seen.is_empty(),
+        "the observer must have been called, or this witness proves nothing"
+    );
+    for (phase, free, held_here) in seen {
+        assert!(
+            free,
+            "{phase}: the observer could not take the observation mutex, so \
+             the diagnostic is holding it across its own callback"
+        );
+        assert!(
+            !held_here,
+            "{phase}: the observer's own thread holds the observation guard"
+        );
+    }
+
+    drop(demand);
+    drop(family);
+}
+
+/// An UNRELATED thread owning the observation mutex must not make correct
+/// off-lock work look locked.
+///
+/// The naive probe - "is the mutex free?" - fails here through no fault of the
+/// projection: a legitimate concurrent capture, refresh or sweep owns it while
+/// the projecting thread correctly holds nothing. Ownership is thread-local, so
+/// that is how it is reported, and this witness is the control that keeps the
+/// observer from accusing correct concurrent work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unrelated_owner_does_not_make_off_lock_work_look_locked() {
+    let node = projection_node("other-owner").await;
+    let family = OrgSensingFamily::mint(&node).expect("mint");
+    let providers: Vec<u64> = (1..=3u64)
+        .map(|offset| node.node_id().wrapping_add(offset))
+        .collect();
+    let demand = family.reconcile(TAG, &providers).expect("retain");
+    for (_, branch) in branches(&demand) {
+        admit(&node, &branch, beat(AttestedStatus::Ready, 5, 1, true));
+    }
+
+    // A controlled foreign-owner interval: the holder takes the guard when the
+    // FIRST route lookup reports (the capture has already released) and keeps
+    // it until the projection has returned.
+    let (take_tx, take_rx) = std::sync::mpsc::channel::<()>();
+    let (taken_tx, taken_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = {
+        let node = Arc::clone(&node);
+        std::thread::spawn(move || {
+            take_rx.recv().expect("asked to take the guard");
+            let held = node.sensing_hold_observations_for_test();
+            taken_tx.send(()).expect("report ownership");
+            release_rx.recv().expect("asked to release");
+            drop(held);
+        })
+    };
+
+    let observed: OffLockLog = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    {
+        let observed = Arc::clone(&observed);
+        let take = parking_lot::Mutex::new(Some(take_tx));
+        let taken = parking_lot::Mutex::new(Some(taken_rx));
+        node.set_sensing_projection_offlock_observer_for_test(Arc::new(move |observation| {
+            if observation.phase == "route" {
+                if let Some(take) = take.lock().take() {
+                    take.send(()).expect("wake the holder");
+                    taken
+                        .lock()
+                        .take()
+                        .expect("paired")
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("the holder must take the guard");
+                }
+            }
+            observed.lock().push(observation);
+        }));
+    }
+
+    let projection = demand.project_sensed_order(Instant::now(), &ConsumerLatencyBudget::default());
+    // The foreign owner is STILL holding it here: the projection completed its
+    // off-lock work under real unrelated contention.
+    assert!(
+        !node.sensing_observations_free_for_test(),
+        "precondition: the unrelated owner must still hold the guard"
+    );
+    release_tx.send(()).expect("release the holder");
+    holder.join().expect("holder");
+
+    assert_eq!(
+        projection.viable().len(),
+        3,
+        "the projection completed normally: {projection:?}"
+    );
+    let seen = observed.lock().clone();
+    let routes = seen
+        .iter()
+        .filter(|observation| observation.phase == "route")
+        .count();
+    assert_eq!(routes, 3, "every route lookup still reported: {seen:?}");
+    for observation in &seen {
+        assert!(
+            !observation.observations_held_here,
+            "an unrelated owner must not be attributed to this thread: {observation:?}"
+        );
+        assert_eq!(observation.guard_depth, 0, "{observation:?}");
+    }
+    // And the control is not vacuous: at least one observation was taken while
+    // the mutex was genuinely owned by somebody else.
+    assert!(
+        seen.iter().any(|observation| observation.phase == "ranked"),
+        "the ranking boundary reported after the foreign owner took the guard: {seen:?}"
+    );
+
+    drop(demand);
     drop(family);
 }
 

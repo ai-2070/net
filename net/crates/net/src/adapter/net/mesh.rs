@@ -1534,7 +1534,7 @@ struct DispatchCtx {
     sensing_capability_interests: CapabilityInterestExpectations,
     /// SI-3c: the verified-observation seam (latest + refusals +
     /// provider epochs). See the matching field on `MeshNode`.
-    sensing_observations: Arc<parking_lot::Mutex<SensingObservations>>,
+    sensing_observations: Arc<ObservationMutex>,
     /// Review L1 linearization: the local-projection transaction mutex. Same
     /// `Arc` (and frozen lock order) as the matching `MeshNode` field.
     sensing_local_projection_mu: Arc<parking_lot::Mutex<()>>,
@@ -4968,7 +4968,7 @@ const SENSING_UPSTREAM_MIN_GAP: Duration = Duration::from_millis(100);
 /// re-derives `Local`/`LeasedLocal` ownership, so the two rows can never drift.
 fn reconcile_local_consumer_cell(
     table: &parking_lot::Mutex<sensing::InterestTable>,
-    observations: &parking_lot::Mutex<SensingObservations>,
+    observations: &ObservationMutex,
     overlay: &tokio::sync::watch::Sender<u64>,
     key: &sensing::ProviderInterestKey,
     now: Instant,
@@ -5003,7 +5003,7 @@ fn reconcile_local_consumer_cell(
 fn reconcile_materialized_consumer_cells(
     projection_mu: &parking_lot::Mutex<()>,
     table: &parking_lot::Mutex<sensing::InterestTable>,
-    observations: &parking_lot::Mutex<SensingObservations>,
+    observations: &ObservationMutex,
     overlay: &tokio::sync::watch::Sender<u64>,
     live_interests: &std::collections::HashSet<sensing::CapabilityInterestKey>,
     now: Instant,
@@ -5076,7 +5076,7 @@ fn dispatch_sensing_leader_deliveries(
     router: &Arc<NetRouter>,
     partition_filter: &PartitionFilter,
     local_node_id: u64,
-    observations: &Arc<parking_lot::Mutex<SensingObservations>>,
+    observations: &Arc<ObservationMutex>,
     overlay: &Arc<tokio::sync::watch::Sender<u64>>,
     factor: u32,
     deliveries: Vec<sensing::Delivery>,
@@ -5175,6 +5175,104 @@ struct SensingDeliverySlot {
     last_delivered: Option<(sensing::Incarnation, u64)>,
     next_due: Instant,
     pending: bool,
+}
+
+/// The observation store's mutex, wrapped so EVERY acquisition attributes
+/// ownership to the acquiring THREAD.
+///
+/// Why a wrapper rather than a `try_lock` probe: a failed `try_lock` proves
+/// only that SOME thread owns the mutex. A legitimate concurrent capture,
+/// refresh or sweep therefore made an "is this thread off-lock?" probe report
+/// false while the probing thread correctly held nothing — a false accusation.
+/// Ownership is thread-local by nature, so it is recorded that way, and an
+/// UNINSTRUMENTED `.lock()` is attributed exactly like an instrumented one:
+/// the marker rides the guard, not the call site.
+struct ObservationMutex {
+    inner: parking_lot::Mutex<SensingObservations>,
+}
+
+/// A held observation guard.
+///
+/// FIELD ORDER IS LOAD-BEARING, for the same reason as [`SensingGuard`]: the
+/// inner guard is released before the ownership marker is cleared, so no path
+/// can report "not owned here" while the lock is still held.
+struct ObservationGuard<'a> {
+    guard: parking_lot::MutexGuard<'a, SensingObservations>,
+    #[cfg(any(test, feature = "fixtures"))]
+    _owner: ObservationOwnerMark,
+}
+
+/// Per-thread observation-guard ownership depth (instrumented builds only).
+#[cfg(any(test, feature = "fixtures"))]
+struct ObservationOwnerMark;
+
+#[cfg(any(test, feature = "fixtures"))]
+thread_local! {
+    static OBSERVATIONS_OWNED_HERE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(any(test, feature = "fixtures"))]
+impl ObservationOwnerMark {
+    fn enter() -> Self {
+        OBSERVATIONS_OWNED_HERE.with(|owned| owned.set(owned.get() + 1));
+        Self
+    }
+}
+
+#[cfg(any(test, feature = "fixtures"))]
+impl Drop for ObservationOwnerMark {
+    fn drop(&mut self) {
+        OBSERVATIONS_OWNED_HERE.with(|owned| owned.set(owned.get().saturating_sub(1)));
+    }
+}
+
+impl ObservationMutex {
+    fn new(observations: SensingObservations) -> Self {
+        Self {
+            inner: parking_lot::Mutex::new(observations),
+        }
+    }
+
+    fn lock(&self) -> ObservationGuard<'_> {
+        let guard = self.inner.lock();
+        ObservationGuard {
+            guard,
+            #[cfg(any(test, feature = "fixtures"))]
+            _owner: ObservationOwnerMark::enter(),
+        }
+    }
+
+    /// Non-blocking acquisition. Used by the fixtures probe that asks whether
+    /// the mutex is currently free AT ALL — deliberately a different question
+    /// from [`Self::held_by_this_thread`].
+    #[cfg(any(test, feature = "fixtures"))]
+    fn try_lock(&self) -> Option<ObservationGuard<'_>> {
+        let guard = self.inner.try_lock()?;
+        Some(ObservationGuard {
+            guard,
+            _owner: ObservationOwnerMark::enter(),
+        })
+    }
+
+    /// Whether THIS thread currently holds this mutex. Sound under unrelated
+    /// contention: another thread's ownership cannot move this thread's count.
+    #[cfg(any(test, feature = "fixtures"))]
+    fn held_by_this_thread() -> bool {
+        OBSERVATIONS_OWNED_HERE.with(|owned| owned.get()) > 0
+    }
+}
+
+impl std::ops::Deref for ObservationGuard<'_> {
+    type Target = SensingObservations;
+    fn deref(&self) -> &SensingObservations {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for ObservationGuard<'_> {
+    fn deref_mut(&mut self) -> &mut SensingObservations {
+        &mut self.guard
+    }
 }
 
 /// SI-3c + closure items 3/6, grown by SI-4a into the relay
@@ -5523,7 +5621,7 @@ fn sensing_addr_is_live_direct(
 /// whatever route the failure plane promoted (ttl/2 anti-entropy).
 fn disrupt_sensing_provider(
     table: &parking_lot::Mutex<sensing::InterestTable>,
-    observations: &parking_lot::Mutex<SensingObservations>,
+    observations: &ObservationMutex,
     overlay: &tokio::sync::watch::Sender<u64>,
     provider: u64,
     reason: sensing::DisruptReason,
@@ -5567,7 +5665,7 @@ fn disrupt_sensing_provider(
 fn reclaim_dead_sensing_branch(
     projection_mu: &parking_lot::Mutex<()>,
     table: &parking_lot::Mutex<sensing::InterestTable>,
-    observations: &parking_lot::Mutex<SensingObservations>,
+    observations: &ObservationMutex,
     key: &sensing::ProviderInterestKey,
 ) {
     let _projection = projection_mu.lock();
@@ -5581,7 +5679,7 @@ fn reclaim_dead_sensing_branch(
 fn apply_sensing_removal_action(
     projection_mu: &parking_lot::Mutex<()>,
     table: &parking_lot::Mutex<sensing::InterestTable>,
-    observations: &parking_lot::Mutex<SensingObservations>,
+    observations: &ObservationMutex,
     emitter: &parking_lot::Mutex<Option<sensing::OriginEmitter>>,
     emitter_stamp: Option<u64>,
     socket: &Arc<NetSocket>,
@@ -5638,7 +5736,7 @@ fn apply_sensing_removal_action(
 fn remove_sensing_downstream(
     projection_mu: &parking_lot::Mutex<()>,
     table: &parking_lot::Mutex<sensing::InterestTable>,
-    observations: &parking_lot::Mutex<SensingObservations>,
+    observations: &ObservationMutex,
     emitter: &parking_lot::Mutex<Option<sensing::OriginEmitter>>,
     socket: &Arc<NetSocket>,
     peers: &Arc<DashMap<u64, PeerInfo>>,
@@ -5687,7 +5785,7 @@ fn remove_sensing_leader_consumer(
     projection_mu: &parking_lot::Mutex<()>,
     leader: &parking_lot::Mutex<Option<sensing::SensingLeader>>,
     table: &parking_lot::Mutex<sensing::InterestTable>,
-    observations: &parking_lot::Mutex<SensingObservations>,
+    observations: &ObservationMutex,
     emitter: &parking_lot::Mutex<Option<sensing::OriginEmitter>>,
     socket: &Arc<NetSocket>,
     peers: &Arc<DashMap<u64, PeerInfo>>,
@@ -7860,8 +7958,14 @@ pub struct SensingOffLockObservation {
     pub guard_depth: usize,
     /// Their names, for a failure message that says which one.
     pub held: String,
-    /// Whether `sensing_observations` could be taken right now.
-    pub observations_available: bool,
+    /// Whether THIS thread holds the observation guard at that point.
+    ///
+    /// Thread-local by construction, so an unrelated legitimate holder — a
+    /// concurrent capture, a refresh, the periodic sweep — cannot make it
+    /// true. It is set by EVERY acquisition of the observation mutex,
+    /// instrumented or not, which is what keeps a raw `.lock()` from hiding
+    /// behind a zero guard depth.
+    pub observations_held_here: bool,
     /// How much WORK this point covers: one route lookup, or the number of
     /// branch views a classification/ranking boundary is about to consume or
     /// has just produced. Zero means the projection reached the label without
@@ -11085,7 +11189,7 @@ pub struct MeshNode {
     /// delivery machinery (per-provider caches keyed on the full
     /// [`sensing::ProviderObservationKey`], packing, down-sampling,
     /// hop rule) subsumes the `latest` half.
-    sensing_observations: Arc<parking_lot::Mutex<SensingObservations>>,
+    sensing_observations: Arc<ObservationMutex>,
     /// Most recent `CapabilityAnnouncement` this node published,
     /// stamped with the org authority/floor epoch it was built
     /// under (review-9 addendum). Pushed to new peers right after
@@ -11854,8 +11958,8 @@ impl MeshNode {
                 _ => None,
             },
         ));
-        let sensing_observations: Arc<parking_lot::Mutex<SensingObservations>> =
-            Arc::new(parking_lot::Mutex::new(SensingObservations::default()));
+        let sensing_observations: Arc<ObservationMutex> =
+            Arc::new(ObservationMutex::new(SensingObservations::default()));
         let sensing_overlay_changed = Arc::new(tokio::sync::watch::channel(0u64).0);
         #[cfg(feature = "redex")]
         let sensing_leader: Arc<parking_lot::Mutex<Option<sensing::SensingLeader>>> =
@@ -16296,9 +16400,7 @@ impl MeshNode {
     /// The counter exists so a witness can distinguish "one section over the
     /// whole population" from "one section per row" — and, because only this
     /// helper moves it, from an untracked raw acquisition as well.
-    fn lock_sensing_observations(
-        &self,
-    ) -> SensingGuard<parking_lot::MutexGuard<'_, SensingObservations>> {
+    fn lock_sensing_observations(&self) -> SensingGuard<ObservationGuard<'_>> {
         #[cfg(any(test, feature = "fixtures"))]
         self.sensing_observation_acquisitions
             .fetch_add(1, Ordering::Relaxed);
@@ -16317,17 +16419,41 @@ impl MeshNode {
             .load(Ordering::Acquire)
     }
 
-    /// Whether the observation mutex is available to THIS thread right now
-    /// (fixtures/tests only).
+    /// Whether the observation mutex is FREE right now (fixtures/tests only).
     ///
-    /// `parking_lot` mutexes are not reentrant, so a `false` here means this
-    /// thread is holding it — whether it took it through the instrumented guard
-    /// or a raw `.lock()`. That is the one check a guard-depth counter cannot
-    /// make, which is why the off-lock observation carries it.
+    /// This answers "does anybody hold it", not "does this thread hold it" —
+    /// a failed `try_lock` names no owner. Use it for contention evidence (a
+    /// writer proving it was excluded from a capture), never for attributing
+    /// an off-lock violation: [`SensingOffLockObservation::observations_held_here`]
+    /// is the thread-local fact for that.
+    ///
+    /// The probe guard is released BEFORE returning, so a caller cannot end up
+    /// holding the lock it just asked about.
     #[cfg(any(test, feature = "fixtures"))]
     #[doc(hidden)]
-    pub fn sensing_observations_available_for_test(&self) -> bool {
-        self.sensing_observations.try_lock().is_some()
+    pub fn sensing_observations_free_for_test(&self) -> bool {
+        let probe = self.sensing_observations.try_lock();
+        let free = probe.is_some();
+        drop(probe);
+        free
+    }
+
+    /// Hold the observation guard until the returned value is dropped
+    /// (fixtures/tests only).
+    ///
+    /// Lets a witness establish a CONTROLLED unrelated-owner interval and
+    /// prove the off-lock observations do not accuse correct concurrent work.
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn sensing_hold_observations_for_test(&self) -> impl Sized + '_ {
+        self.sensing_observations.lock()
+    }
+
+    /// Whether THIS thread holds the observation guard (fixtures/tests only).
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn sensing_observations_held_here_for_test() -> bool {
+        ObservationMutex::held_by_this_thread()
     }
 
     /// Fire the mid-capture seam (fixtures/tests only).
@@ -16387,16 +16513,20 @@ impl MeshNode {
         let hook = self.sensing_projection_offlock_observer.lock().clone();
         if let Some(hook) = hook {
             let depth = SENSING_GUARD_DEPTH.with(|d| d.get());
-            hook(SensingOffLockObservation {
+            // No mutex is touched here, deliberately. An earlier revision
+            // probed `try_lock()` inline in this argument list: on success the
+            // temporary guard lived until the end of the call statement, so the
+            // callback itself ran holding the observation lock — a diagnostic
+            // that created the condition it reported on, and could block or
+            // deadlock a callback that coordinated with another capture.
+            let observation = SensingOffLockObservation {
                 phase,
                 guard_depth: depth as usize,
                 held: format!("{:?}", SensingGuards::held()),
-                // ACTUAL availability, not a bookkeeping count: an untracked
-                // raw acquisition held across this point makes this false while
-                // the depth stays zero.
-                observations_available: self.sensing_observations.try_lock().is_some(),
+                observations_held_here: ObservationMutex::held_by_this_thread(),
                 work_units,
-            });
+            };
+            hook(observation);
         }
     }
 
