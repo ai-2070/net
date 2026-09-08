@@ -690,7 +690,7 @@ mod tests {
     use crate::adapter::net::behavior::org::{OrgKeypair, OrgMembershipCert};
     use crate::adapter::net::behavior::org_authority::NodeAuthority;
     use crate::adapter::net::mesh::{
-        RefusedReleaseOutcome, SensingArmProvenance, SensingRefreshOutcome,
+        RefusedReleaseOutcome, SensingArmDecision, SensingArmProvenance, SensingRefreshOutcome,
         SensingRegistrationError, MIN_SENSING_REFRESH_PERIOD,
     };
     use crate::adapter::net::{EntityKeypair, MeshNodeConfig};
@@ -2668,11 +2668,20 @@ mod tests {
     /// joins, so an arm grounded in join time would schedule the first renewal
     /// after the existing soft state had already expired.
     ///
-    /// The assertions are on the ARMED DEADLINE, not on when a renewal is
-    /// observed. The decision under test is a scheduling one, and an observed
-    /// renewal instant also carries the join's own cost, the probe's 5 ms poll
-    /// granularity and the runner's sleep overshoot - on a loaded CI runner
-    /// those alone pushed a correct schedule past a 200 ms horizon.
+    /// The assertion is on the DECISION, captured by the arm seam under the
+    /// schedule guard that installed it. Neither of the two post-hoc
+    /// observations works, because neither identifies what it sampled:
+    ///
+    /// * an observed RENEWAL INSTANT also carries the join's own cost, the
+    ///   probe's poll granularity and the runner's sleep overshoot — on a
+    ///   loaded CI runner those alone pushed a correct schedule past a 200 ms
+    ///   horizon;
+    /// * a later read of `armed` can return the SUCCESSOR record. The worker
+    ///   legitimately dequeues the due-now adoption arm, renews, and re-arms
+    ///   `Established` a full period out; that deadline is neither due now nor
+    ///   inside the original horizon, and rejecting it rejects progress. `None`
+    ///   is equally ambiguous: the record is removed BEFORE the renewal is
+    ///   performed and counted, so absence does not mean renewed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn adopting_an_aged_installation_renews_before_it_expires() {
         // 2 s horizon: period 1 s, expiry 2 s after the public registration.
@@ -2680,52 +2689,67 @@ mod tests {
         let node = demand_node("adopt-aged", ttl).await;
         let family = OrgSensingFamily::mint(&node).expect("mint");
         let provider = node.node_id().wrapping_add(1);
-        let key = lease_key_for(&node, provider);
         let interval = SENSING_SAMPLE_INTERVAL.min(node.sensing_interest_ttl());
+        let period = node.sensing_refresh_period();
+
+        // Record every arm decision, in order, as the schedule took it.
+        let decisions: Arc<parking_lot::Mutex<Vec<SensingArmDecision>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        {
+            let decisions = Arc::clone(&decisions);
+            node.set_sensing_arm_seam_for_test(Arc::new(move |decision| {
+                decisions.lock().push(decision);
+            }));
+        }
 
         let public = node
             .acquire_sensing_interest_lease(&spec_for(&node, provider), provider, interval)
             .expect("the public holder establishes");
         let established_at = Instant::now();
-        assert!(node.sensing_refresh_arm_for_test(&key).is_none());
+        assert!(
+            decisions.lock().is_empty(),
+            "precondition: the public acquisition arms nothing"
+        );
 
-        // AGE it: 1.5 s of a 2 s horizon is already gone when the family
-        // joins, and a join-time arm would land a full period later, at 2.5 s.
+        // AGE it: 1.5 s of a 2 s horizon is already gone when the family joins.
         tokio::time::sleep(Duration::from_millis(1500)).await;
+        let joined_at = Instant::now();
         let demand = family.reconcile(TAG, &[provider]).expect("retain");
-        let armed = node.sensing_refresh_arm_for_test(&key);
-        let seen = Instant::now();
+        assert!(
+            joined_at + period >= established_at + ttl,
+            "precondition: the row must be aged enough that a full-period arm \
+             would miss its expiry - {:?} of a {ttl:?} horizon is gone and the \
+             period is {period:?}",
+            joined_at.duration_since(established_at)
+        );
+
+        // THE DECISION. The first record is the join's own arm, whatever the
+        // worker did next.
+        let first = *decisions
+            .lock()
+            .first()
+            .expect("the coalescing join must arm the row it joined");
+        assert_eq!(
+            first.provenance,
+            SensingArmProvenance::Adopted,
+            "a join that changed neither table nor wire is an adoption: {first:?}"
+        );
+        assert!(
+            first.deadline <= first.armed_at,
+            "an adopted arm is grounded in the row's unknown freshness, not in \
+             join time: this one is {:?} out, where a full-period arm would be \
+             {period:?} out and land after the row's own expiry",
+            first.deadline.saturating_duration_since(first.armed_at)
+        );
         let state = node.org_sensing_demand_state_for_test();
         assert_eq!(
             state.refresh_adopted, 1,
-            "a coalescing join onto an aged row must be adopted: {state:?}"
+            "and it must be counted exactly once: {state:?}"
         );
 
-        match armed {
-            Some((deadline, _)) => {
-                assert!(
-                    deadline <= seen,
-                    "an adopted arm must be grounded in the row's unknown freshness, \
-                     not in join time: its deadline is {:?} out, and a join-time arm \
-                     would be a full period out",
-                    deadline.saturating_duration_since(seen)
-                );
-                assert!(
-                    deadline < established_at + ttl,
-                    "the renewal must be scheduled before the existing soft state \
-                     expires: {:?} into a {ttl:?} horizon",
-                    deadline.duration_since(established_at)
-                );
-            }
-            // The due-now arm was already taken by the worker, which is the
-            // same conclusion reached one step later.
-            None => assert!(
-                state.refresh_renewed >= 1,
-                "an adopted row must be armed or already renewed: {state:?}"
-            ),
-        }
-
-        // And the renewal really lands, on that schedule.
+        // The renewal really lands on that schedule, and its re-arm is a
+        // DISTINCT, later record - the successor a post-hoc sample would have
+        // mistaken for this decision.
         until(
             &node,
             Duration::from_secs(5),
@@ -2734,7 +2758,118 @@ mod tests {
         )
         .await;
         assert!(row_present(&node, provider));
+        let all = decisions.lock().clone();
+        let successor = all
+            .iter()
+            .find(|decision| decision.seq > first.seq)
+            .copied()
+            .expect("the renewal must re-arm the row");
+        assert_eq!(
+            successor.provenance,
+            SensingArmProvenance::Established,
+            "a renewal re-registered the row, so its next period is grounded in \
+             the renewal: {successor:?}"
+        );
+        assert!(
+            successor.deadline > successor.armed_at,
+            "and it is a full period out, unlike the adoption: {successor:?}"
+        );
+        assert_eq!(
+            successor.installation_id, first.installation_id,
+            "the renewal renews the installation the join adopted - a successor \
+             naming another one would be a different row's cadence, not this \
+             decision's: {successor:?} vs {first:?}"
+        );
 
+        node.clear_sensing_arm_seam_for_test();
+        let _ = node.try_release_sensing_interest_lease(public);
+        drop(demand);
+        drop(family);
+    }
+
+    /// A COMPLETED renewal and re-arm is not the adoption decision.
+    ///
+    /// This drives the exact schedule that a post-hoc `armed` sample cannot
+    /// survive: the join installs the due-now adoption arm, the real worker
+    /// dequeues it, renews, and re-arms `Established` a full period out - all
+    /// before the observer reads. The record then names the SUCCESSOR, whose
+    /// deadline is legitimately in the future and outside the joined row's
+    /// original horizon.
+    ///
+    /// Production is untouched here; only the observation point differs. The
+    /// decision the schedule took is still exactly one due-now adoption.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_completed_rearm_is_not_the_adoption_decision() {
+        let ttl = Duration::from_secs(2);
+        let node = demand_node("adopt-rearm", ttl).await;
+        let family = OrgSensingFamily::mint(&node).expect("mint");
+        let provider = node.node_id().wrapping_add(1);
+        let key = lease_key_for(&node, provider);
+        let interval = SENSING_SAMPLE_INTERVAL.min(node.sensing_interest_ttl());
+
+        let decisions: Arc<parking_lot::Mutex<Vec<SensingArmDecision>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        {
+            let decisions = Arc::clone(&decisions);
+            node.set_sensing_arm_seam_for_test(Arc::new(move |decision| {
+                decisions.lock().push(decision);
+            }));
+        }
+
+        let public = node
+            .acquire_sensing_interest_lease(&spec_for(&node, provider), provider, interval)
+            .expect("the public holder establishes");
+        let established_at = Instant::now();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let demand = family.reconcile(TAG, &[provider]).expect("retain");
+
+        // WAIT for the worker to finish: renewed AND re-armed. This is the
+        // interleaving an observer that was descheduled after the join sees.
+        until(
+            &node,
+            Duration::from_secs(5),
+            "the worker renewed and re-armed",
+            || {
+                node.org_sensing_demand_state_for_test().refresh_renewed >= 1
+                    && node.sensing_refresh_arm_for_test(&key).is_some()
+            },
+        )
+        .await;
+
+        let sampled = node
+            .sensing_refresh_arm_for_test(&key)
+            .expect("the settled re-arm");
+        let seen = Instant::now();
+        let first = *decisions.lock().first().expect("the join must arm");
+
+        // The sample is the SUCCESSOR, not the adoption: a later record, a
+        // future deadline, and outside the joined row's own horizon. Asserting
+        // "due now" or "inside the original ttl" on it rejects real progress.
+        assert!(
+            sampled.1 > first.seq,
+            "precondition: the sample must be a later record than the decision \
+             ({} vs {})",
+            sampled.1,
+            first.seq
+        );
+        assert!(
+            sampled.0 > seen && sampled.0 >= established_at + ttl,
+            "precondition: the successor's deadline is legitimately in the \
+             future and past the joined row's horizon: {:?} ahead",
+            sampled.0.saturating_duration_since(seen)
+        );
+
+        // And the DECISION is still exactly one due-now adoption.
+        assert_eq!(first.provenance, SensingArmProvenance::Adopted, "{first:?}");
+        assert!(first.deadline <= first.armed_at, "{first:?}");
+        let state = node.org_sensing_demand_state_for_test();
+        assert_eq!(
+            state.refresh_adopted, 1,
+            "the completed renewal must not be counted as a second adoption: {state:?}"
+        );
+        assert!(row_present(&node, provider));
+
+        node.clear_sensing_arm_seam_for_test();
         let _ = node.try_release_sensing_interest_lease(public);
         drop(demand);
         drop(family);

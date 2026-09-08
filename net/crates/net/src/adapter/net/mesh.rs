@@ -7023,6 +7023,26 @@ pub(crate) struct AcquiredSensingLease {
     pub(crate) provenance: SensingArmProvenance,
 }
 
+/// ONE arm decision, as the schedule recorded it.
+///
+/// Reported by the in-crate arm seam under the schedule guard, so `deadline` is
+/// the deadline this decision chose and `seq` names this record rather than a
+/// successor's.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SensingArmDecision {
+    /// What this arm knew about the installation's freshness.
+    pub(crate) provenance: SensingArmProvenance,
+    /// The deadline it chose.
+    pub(crate) deadline: Instant,
+    /// The instant the decision was taken, read before the schedule guard.
+    pub(crate) armed_at: Instant,
+    /// The installation this record renews.
+    pub(crate) installation_id: sensing::LeaseToken,
+    /// The record's own sequence, minted per arm.
+    pub(crate) seq: u64,
+}
+
 /// What an arm KNOWS about the freshness of the installation it is arming.
 ///
 /// The first deadline has to be grounded in the row's actual freshness, not in
@@ -10442,6 +10462,16 @@ pub struct MeshNode {
     /// installation being refreshed.
     #[cfg(test)]
     sensing_refresh_pre_apply_seam: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// In-crate witness seam: fires for every arm decision, WHILE the schedule
+    /// guard that installed it is still held.
+    ///
+    /// Under that guard the record cannot have been dequeued, renewed or
+    /// re-armed yet, so a witness reads the decision it asked about rather than
+    /// whatever the worker left behind. Sampling `armed` after the fact cannot
+    /// tell an initial adoption arm from its own successor's re-arm.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    sensing_arm_seam: parking_lot::Mutex<Option<Arc<dyn Fn(SensingArmDecision) + Send + Sync>>>,
     /// In-crate witness seam: fires inside a retention, after the authorized
     /// population has been derived and BEFORE the captured authority view's
     /// currentness is re-proved. Lets a witness move the qualifying view in
@@ -12359,6 +12389,8 @@ impl MeshNode {
             #[cfg(test)]
             sensing_refresh_pre_apply_seam: parking_lot::Mutex::new(None),
             #[cfg(test)]
+            sensing_arm_seam: parking_lot::Mutex::new(None),
+            #[cfg(test)]
             sensing_population_seam: parking_lot::Mutex::new(None),
             #[cfg(test)]
             sensing_carry_validated_seam: parking_lot::Mutex::new(None),
@@ -12998,6 +13030,22 @@ impl MeshNode {
         hook: Arc<dyn Fn() + Send + Sync>,
     ) {
         *self.sensing_refresh_pre_apply_seam.lock() = Some(hook);
+    }
+
+    /// Install the ARM DECISION seam. It fires for every armed record while the
+    /// schedule guard that installed it is still held.
+    #[cfg(test)]
+    pub(crate) fn set_sensing_arm_seam_for_test(
+        &self,
+        hook: Arc<dyn Fn(SensingArmDecision) + Send + Sync>,
+    ) {
+        *self.sensing_arm_seam.lock() = Some(hook);
+    }
+
+    /// Remove the arm decision seam.
+    #[cfg(test)]
+    pub(crate) fn clear_sensing_arm_seam_for_test(&self) {
+        *self.sensing_arm_seam.lock() = None;
     }
 
     /// Remove the refresh pre-apply seam.
@@ -14551,6 +14599,18 @@ impl MeshNode {
             },
         );
         Self::ensure_sensing_refresh_worker(node, &mut schedule);
+        // Under the guard deliberately: the worker needs it to dequeue, so a
+        // witness observing here cannot be shown a successor's re-arm.
+        #[cfg(test)]
+        if let Some(hook) = node.sensing_arm_seam.lock().clone() {
+            hook(SensingArmDecision {
+                provenance,
+                deadline,
+                armed_at: now,
+                installation_id,
+                seq,
+            });
+        }
         let rearm = wake_before.is_none_or(|previous| deadline < previous);
         drop(schedule);
         if rearm {
