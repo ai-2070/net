@@ -34312,10 +34312,11 @@ impl MeshNode {
                              wrong peer key, or another pairing's msg1)"
                         ),
                         (None, Some(paced)) => format!(
-                            "handshake timeout (every handshake datagram this accept saw \
-                             was dropped before Noise by the responder's pacing budget, \
-                             most recently one from {paced} — under handshake traffic \
-                             this heavy the peer's msg1 may never have been read)"
+                            "handshake timeout (across this accept every handshake \
+                             datagram the responder saw was dropped before Noise by its \
+                             pacing budget, most recently one from {paced} — under \
+                             handshake traffic this heavy the peer's msg1 may never \
+                             have been read)"
                         ),
                         (None, None) => "handshake timeout".into(),
                     },

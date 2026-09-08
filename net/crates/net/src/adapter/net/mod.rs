@@ -1031,9 +1031,9 @@ impl NetAdapter {
                              another pairing's msg1)"
                         ),
                         (None, Some(paced)) => format!(
-                            "handshake timeout (every handshake datagram this attempt \
-                             saw was dropped before Noise by the responder's pacing \
-                             budget, most recently one from {paced})"
+                            "handshake timeout (across this handshake sequence every \
+                             handshake datagram the responder saw was dropped before \
+                             Noise by its pacing budget, most recently one from {paced})"
                         ),
                         (None, None) => "handshake timeout".into(),
                     },
