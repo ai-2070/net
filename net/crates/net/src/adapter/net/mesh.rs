@@ -21936,6 +21936,28 @@ impl MeshNode {
         self.routing_registry.new_family()
     }
 
+    /// Drive this node's routing family identity space to its TERMINAL state,
+    /// so the next mint is refused through the production path.
+    ///
+    /// Test/fixtures only. It exists because the SDK's sensing binding maps a
+    /// refused mint to an INERT binding, and that mapping is only worth
+    /// anything if a witness can reach the real refusal instead of a
+    /// substitute one. It fabricates no success and no authority.
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn exhaust_org_routing_families_for_test(&self) {
+        self.routing_registry.exhaust_family_ids_for_test();
+    }
+
+    /// How many family mints this node's registry refused for an exhausted
+    /// identity space. Test/fixtures only: the counter is how a witness sees
+    /// that a call path did not re-mint.
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn org_routing_family_refusals_for_test(&self) -> u64 {
+        self.routing_registry.family_id_refusals_for_test()
+    }
+
     /// A COHERENT sample of the routing authority epoch and the revocation view
     /// it qualifies: `(authority, poisoned, floor_generation)`, or `None` if the
     /// two could not be observed under one unchanging identity (review-pass-3

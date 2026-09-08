@@ -530,7 +530,9 @@ impl OrgClient {
         selected.map(|candidate| PlanAttempt::Minted(Box::new(self.intent_for(&candidate))))
     }
 
-    /// Permute an already-authorized candidate list into the SENSED order.
+    /// Permute an already-authorized candidate list into the SENSED order,
+    /// reconciling this capability's retained demand first when the call's own
+    /// authorized population says it must be.
     ///
     /// Advisory, and bounded by that word in every direction: it never adds,
     /// removes, filters or authorizes a candidate, it never mints, it produces
@@ -540,36 +542,100 @@ impl OrgClient {
     /// empty population, no observations at all - lands on the SAME outcome:
     /// the deterministic unsensed order the caller would have had anyway.
     ///
-    /// Acquisition happens at most ONCE per capability per binding, on the
-    /// first call that needs it, and is then reused by every warmed call. A
-    /// rotated sensing authority triggers exactly one re-convergence, not a
-    /// retry loop: a second refusal simply plans unsensed.
+    /// # The reconciliation trigger, and why it is the candidate list
+    ///
+    /// `authority_is_current()` covers SECURITY-authority publication, not
+    /// discovery rows, pins, or holder liveness. Reusing demand on that stamp
+    /// alone froze ordinary churn: a provider discovered after the first call
+    /// never entered the population, a departed one never left it, and a
+    /// provider whose acquisition was transiently refused stayed without a
+    /// holder forever.
+    ///
+    /// The trigger is therefore the thing this call already derived under one
+    /// coherent capture: its own pinned same-organization candidates. That set
+    /// IS what the demand should be retained over, so comparing it against
+    /// what the last convergence was driven by detects an addition, a removal
+    /// and a pin change alike, with no extra query and no clock. Convergence
+    /// runs when the expectation CHANGED - never on every call - plus one
+    /// floored retry when the last convergence could not take a holder it
+    /// wanted, which is what lets a transient refusal recover.
     fn apply_sensed_order(
         &self,
         capability: &CapabilityAuthorityId,
         sensed: &SensedSelection<'_>,
         candidates: &mut Vec<AuthorizedOrgCandidate>,
     ) {
-        if candidates.len() < 2 {
-            // Nothing an order could change. Charge no sensing work for it.
-            return;
-        }
-        let Some(family) = self._sensing.family() else {
+        let Some(acquisition) = self._sensing.acquisition() else {
             return; // Inert: the deterministic unsensed order, no work at all.
         };
-        let demand = match family.demand(capability) {
-            // Warmed: reuse the retained demand, unless its sensing authority
-            // has moved - in which case re-converge once, or plan unsensed.
-            Some(demand) if demand.authority_is_current() => demand,
-            _ => match family.retain(sensed.tag) {
-                Ok(demand) => demand,
-                Err(_refusal) => return,
-            },
+        let family = acquisition.family();
+
+        // What this capability's demand SHOULD be retained over: the pinned
+        // same-organization candidates of this very derivation, in the order
+        // core's population uses (ascending node id), so the comparison is by
+        // value and stable.
+        let mut expected: Vec<u64> = candidates
+            .iter()
+            .filter(|candidate| matches!(candidate.mode, Mode::SameOrg) && candidate.direct)
+            .map(|candidate| candidate.provider.node_id())
+            .collect();
+        expected.sort_unstable();
+        expected.dedup();
+
+        let now = Instant::now();
+        let stale_authority = family
+            .demand(capability)
+            .is_some_and(|demand| !demand.authority_is_current());
+        if stale_authority
+            || acquisition.schedule().needs_convergence(
+                capability,
+                &expected,
+                now,
+                RECONCILE_RETRY_FLOOR,
+            )
+        {
+            match family.retain(sensed.tag) {
+                Ok(demand) => {
+                    // A convergence is COMPLETE when every provider it was
+                    // driven by ended up with a live holder. Compared against
+                    // the demand's own population rather than `expected`,
+                    // because the population is what core authorized and
+                    // capped - `expected` is only this call's view of it.
+                    let mut retained = demand.retained_providers();
+                    retained.sort_unstable();
+                    let mut population = demand.population().to_vec();
+                    population.sort_unstable();
+                    acquisition.schedule().converged(
+                        *capability,
+                        expected,
+                        retained == population,
+                        now,
+                    );
+                }
+                // A refused convergence records the ATTEMPT, so a refusal that
+                // persists cannot turn every later call into another attempt.
+                Err(_refusal) => {
+                    acquisition
+                        .schedule()
+                        .converged(*capability, expected, false, now);
+                    return;
+                }
+            }
+        }
+
+        #[cfg(test)]
+        sensing_planning_seam();
+
+        let Some(demand) = family.demand(capability) else {
+            return;
         };
-        if demand.population().is_empty() {
+        if candidates.len() < 2 || demand.population().is_empty() {
+            // Nothing an order could change - but the reconciliation above
+            // still ran, so a departure that leaves one candidate is still
+            // applied to the retained demand rather than skipped.
             return;
         }
-        let projection = demand.project_sensed_order(Instant::now(), &sensed.budget);
+        let projection = demand.project_sensed_order(now, &sensed.budget);
         let permutation = org_sensed_candidate_permutation(
             candidates,
             projection.viable(),
@@ -587,7 +653,7 @@ impl OrgClient {
     /// Returns the CHOSEN CANDIDATE rather than a proof intent: the cold plan's
     /// final coherent authority comparison sits between selection and the mint
     /// (design §10), so selection must not be the thing that mints.
-    fn select_candidate<'a>(
+    pub(crate) fn select_candidate<'a>(
         &self,
         capability: &CapabilityAuthorityId,
         candidates: &'a [AuthorizedOrgCandidate],
@@ -1058,6 +1124,45 @@ fn nrpc_tag(service: &str) -> String {
 
 /// Keep one entry per provider — the same provider can surface on both planes
 /// (owner-private and under a grant) without becoming two candidates.
+/// The floor between two convergence attempts for one capability whose
+/// expected population has NOT changed.
+///
+/// It exists for exactly one case: the last convergence could not acquire a
+/// holder it wanted (a per-provider refusal is skipped, not fatal), so the
+/// missing holder must be retryable — but a retry on every call would turn a
+/// persistent refusal into per-call acquisition traffic. Any CHANGE in the
+/// expected population bypasses this floor entirely; only the retry is floored.
+const RECONCILE_RETRY_FLOOR: Duration = Duration::from_secs(2);
+
+// Test-only seam, fired inside `apply_sensed_order` after reconciliation and
+// before the projection.
+//
+// It is how a witness parks authority movement INSIDE the sensed window: the
+// final currentness comparison sits after this whole step, and a comparison
+// moved before it would let a plan minted here escape. `#[cfg(test)]` only -
+// no fixtures build, no production surface.
+#[cfg(test)]
+thread_local! {
+    static SENSING_PLANNING_SEAM: std::cell::RefCell<Option<std::sync::Arc<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Install the planning seam on THIS thread; returns the previous one.
+#[cfg(test)]
+pub(crate) fn set_sensing_planning_seam(
+    hook: Option<std::sync::Arc<dyn Fn()>>,
+) -> Option<std::sync::Arc<dyn Fn()>> {
+    SENSING_PLANNING_SEAM.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), hook))
+}
+
+#[cfg(test)]
+fn sensing_planning_seam() {
+    let hook = SENSING_PLANNING_SEAM.with(|slot| slot.borrow().clone());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 /// The request-relative half of one planning attempt.
 ///
 /// Exactly one input here is request-relative, by design (D7.5): the latency
@@ -1098,7 +1203,7 @@ impl<'a> SensedSelection<'a> {
 /// sort over the candidate list, no ordering structure, no second rule to
 /// diverge from the first. `Mode::Granted` maps to `false`, which is what
 /// keeps a granted candidate unsensed and unpruned.
-fn org_sensed_candidate_permutation(
+pub(crate) fn org_sensed_candidate_permutation(
     cands: &[AuthorizedOrgCandidate],
     ranked: &[u64],
     pruned: &[u64],
@@ -1119,7 +1224,7 @@ fn org_sensed_candidate_permutation(
 /// malformed permutation can degrade the ORDER but can never drop an
 /// authorized candidate. A duplicate index takes the slot once and is then
 /// vacant, so no candidate is emitted twice either.
-fn apply_permutation<T>(items: &mut Vec<T>, permutation: Vec<usize>) {
+pub(crate) fn apply_permutation<T>(items: &mut Vec<T>, permutation: Vec<usize>) {
     let mut slots: Vec<Option<T>> = items.drain(..).map(Some).collect();
     let mut ordered: Vec<T> = Vec::with_capacity(slots.len());
     for index in permutation {
