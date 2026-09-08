@@ -433,9 +433,13 @@ impl OrgSensingCapabilityDemand {
             .org_sensed_branch_snapshot(&population, &retained, now);
 
         // PHASE 2 - the proximity pass, off every sensing lock. One estimate
-        // per row, in row order.
+        // per row, in row order. Each estimate reports from its OWN callsite
+        // (`MeshNode::sensing_route_estimate`), so the off-lock property is
+        // observed at the work rather than beside it, and a projection that
+        // stopped consulting the route plane would report nothing at all.
         assert_off_sensing_locks("sensed projection proximity pass");
-        self.node.observe_sensing_projection_offlock("proximity");
+        self.node
+            .observe_sensing_projection_offlock("proximity", rows.len());
         let views: Vec<sensing::BranchView> = rows
             .iter()
             .map(
@@ -453,8 +457,16 @@ impl OrgSensingCapabilityDemand {
         // can never drift from the readiness it was derived from.
         assert_off_sensing_locks("sensed projection classification and ordering");
         self.node
-            .observe_sensing_projection_offlock("classification");
+            .observe_sensing_projection_offlock("classification", views.len());
         let delta = project_sensed_candidates(&views, budget);
+        // Reported on BOTH sides of the classifier: a lock taken for its
+        // duration is visible at the second point even if the first one was
+        // clean, and the counts prove the boundary had real work to do.
+        assert_off_sensing_locks("sensed projection ranked order");
+        self.node.observe_sensing_projection_offlock(
+            "ranked",
+            delta.viable.len() + delta.potential.len() + delta.non_viable.len(),
+        );
         OrgSensedProjection {
             rows: rows
                 .into_iter()
