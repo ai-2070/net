@@ -33919,8 +33919,7 @@ impl MeshNode {
         // Concurrent direct connects on the same node work either way
         // — each registers under its own peer_addr.
         if self.started.load(Ordering::Acquire) {
-            let (tx, mut rx) =
-                tokio::sync::mpsc::channel::<Bytes>(DIRECT_HANDSHAKE_INBOX_DEPTH);
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(DIRECT_HANDSHAKE_INBOX_DEPTH);
             // Register BEFORE sending msg1 so we can't miss a
             // fast responder that replies before we'd otherwise
             // be ready to receive. `insert` replaces any prior
@@ -33973,8 +33972,7 @@ impl MeshNode {
             // exactly one waiter. So register an inbox as well —
             // whichever consumer wins the race forwards what it cannot
             // use to whoever can, instead of destroying it.
-            let (tx, mut rx) =
-                tokio::sync::mpsc::channel::<Bytes>(DIRECT_HANDSHAKE_INBOX_DEPTH);
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(DIRECT_HANDSHAKE_INBOX_DEPTH);
             self.pending_direct_initiators.insert(peer_addr, tx);
 
             let socket_arc = self.socket.socket_arc();
@@ -34321,7 +34319,7 @@ impl MeshNode {
                         ),
                         (None, None) => "handshake timeout".into(),
                     },
-                ))
+                ));
             }
         };
 
