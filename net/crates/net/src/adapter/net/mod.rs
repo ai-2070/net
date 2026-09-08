@@ -132,6 +132,11 @@ pub use identity::{
     EntityError, EntityId, EntityKeypair, OriginStamp, PermissionToken, TokenCache, TokenError,
     TokenScope,
 };
+/// Exported for the same reason: the sensed-projection off-lock observations
+/// need a nameable type in the projection witnesses. `#[doc(hidden)]` and
+/// fixtures-gated at its definition.
+#[cfg(any(test, feature = "fixtures"))]
+pub use mesh::SensingOffLockObservation;
 /// Exported only so `upgrade_try_acquire_for_test` has a nameable
 /// return type in integration tests; `#[doc(hidden)]` at the definition.
 #[cfg(feature = "nat-traversal")]

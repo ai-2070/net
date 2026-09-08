@@ -45,13 +45,12 @@ use net::adapter::net::behavior::sensing::{
     AttestedStatus, ConsumerLatencyBudget, DeliveredBeat, Incarnation, ProjectedReadiness,
     ProviderInterestKey,
 };
-use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig};
+use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SensingOffLockObservation};
 
 const TAG: &str = "nrpc:gpu.infer";
 
-/// One off-lock observation: the phase, this thread's sensing-guard depth, and
-/// the guard set it held.
-type OffLockLog = Arc<parking_lot::Mutex<Vec<(&'static str, usize, String)>>>;
+/// Every off-lock observation the projection reported, in order.
+type OffLockLog = Arc<parking_lot::Mutex<Vec<SensingOffLockObservation>>>;
 const TTL: Duration = Duration::from_secs(30);
 
 /// A sensing-enabled, organization-authoritative node. No transport: every
@@ -484,47 +483,212 @@ async fn a_provider_removed_after_the_snapshot_is_advisory_and_cannot_authorize(
     drop(family);
 }
 
-/// The proximity pass, the budget classification and the ordering all run with
-/// every sensing guard released — observed from inside those phases, not
-/// asserted about them from outside.
+/// The proximity, classification and ranking work runs with every sensing lock
+/// released — observed AT the work, with the mutex's own availability as a
+/// second, independent fact.
+///
+/// Two failure modes a label-only observation cannot see, both covered here:
+///
+/// * a lock taken for the duration of one route lookup, after a clean
+///   phase label. Each lookup reports from its own callsite and carries
+///   `observations_available`, so an untracked raw `.lock()` held across it is
+///   visible even though the instrumented depth stays zero;
+/// * a projection that stopped doing the work at all. The route observations
+///   are counted against the captured rows, and the classification and ranking
+///   points carry their own work counts, so zero work fails instead of passing
+///   quietly.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn no_sensing_lock_is_held_during_route_budget_or_sort_work() {
     let node = projection_node("off-lock").await;
     let family = OrgSensingFamily::mint(&node).expect("mint");
-    let provider = node.node_id().wrapping_add(1);
-    let demand = family.reconcile(TAG, &[provider]).expect("retain");
-    let keys = branches(&demand);
-    admit(&node, &keys[0].1, beat(AttestedStatus::Ready, 5, 1, true));
+    let providers: Vec<u64> = (1..=3u64)
+        .map(|offset| node.node_id().wrapping_add(offset))
+        .collect();
+    let demand = family.reconcile(TAG, &providers).expect("retain");
+    for (_, branch) in branches(&demand) {
+        admit(&node, &branch, beat(AttestedStatus::Ready, 5, 1, true));
+    }
 
     let observed: OffLockLog = Arc::new(parking_lot::Mutex::new(Vec::new()));
     {
         let observed = Arc::clone(&observed);
-        node.set_sensing_projection_offlock_observer_for_test(Arc::new(
-            move |phase, depth, held| {
-                observed.lock().push((phase, depth, held));
-            },
-        ));
+        node.set_sensing_projection_offlock_observer_for_test(Arc::new(move |observation| {
+            observed.lock().push(observation);
+        }));
     }
 
     let projection = demand.project_sensed_order(Instant::now(), &ConsumerLatencyBudget::default());
-    assert_eq!(projection.viable(), &[provider], "the projection ran");
+    assert_eq!(projection.viable().len(), 3, "the projection did real work");
 
     let seen = observed.lock().clone();
-    let phases: Vec<&str> = seen.iter().map(|(phase, _, _)| *phase).collect();
-    assert!(
-        phases.contains(&"proximity") && phases.contains(&"classification"),
-        "both off-lock phases must report, or this witness proves nothing: {phases:?}"
-    );
-    for (phase, depth, held) in &seen {
+    for observation in &seen {
         assert_eq!(
-            *depth, 0,
-            "{phase} ran holding {depth} sensing guard(s): {held}"
+            observation.guard_depth, 0,
+            "{} ran holding {}",
+            observation.phase, observation.held
         );
         assert!(
-            !held.contains("sensing_"),
-            "{phase} ran holding {held}, which must be released first"
+            !observation.held.contains("sensing_"),
+            "{} ran holding {}",
+            observation.phase,
+            observation.held
+        );
+        assert!(
+            observation.observations_available,
+            "{} ran while the observation mutex was UNAVAILABLE to its own \
+             thread - something is holding it across the work: {observation:?}",
+            observation.phase
         );
     }
+
+    // The ROUTE work itself reported, once per captured row.
+    let routes = seen
+        .iter()
+        .filter(|observation| observation.phase == "route")
+        .count();
+    assert_eq!(
+        routes,
+        projection.rows().len(),
+        "one route lookup per captured row must report from its own callsite: \
+         {seen:?}"
+    );
+
+    // And the classification/ranking boundary reported with real work on both
+    // sides of the classifier.
+    for phase in ["proximity", "classification", "ranked"] {
+        let observation = seen
+            .iter()
+            .find(|observation| observation.phase == phase)
+            .unwrap_or_else(|| panic!("{phase} never reported: {seen:?}"));
+        assert!(
+            observation.work_units > 0,
+            "{phase} reported with nothing to do, which proves nothing: {observation:?}"
+        );
+    }
+
+    drop(demand);
+    drop(family);
+}
+
+/// ONE acquisition captures every row, and a writer is EXCLUDED from the
+/// traversal it overlaps.
+///
+/// The sibling fold witness cannot see this: bucket/row agreement is an
+/// algebraic consequence of folding one `Vec`, so a capture that reacquired the
+/// guard per row — stitching rows from different moments together — would still
+/// satisfy it, and would satisfy it even if no writer ever ran.
+///
+/// Three independent facts are asserted here instead:
+///
+/// 1. the capture is a nonempty MULTI-ROW traversal (four rows);
+/// 2. the counted acquisitions across the whole projection advance by exactly
+///    ONE. A per-row section advances it by four; an untracked raw `.lock()`
+///    does not advance it at all;
+/// 3. a writer that arrives INSIDE the traversal is genuinely blocked — it
+///    reports the mutex unavailable at a rendezvous taken from the middle of
+///    the capture — and then makes progress once the section ends. No sleeping,
+///    no repetition: the seam blocks until the writer's own probe arrives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_acquisition_captures_every_row_while_a_writer_is_excluded() {
+    let node = projection_node("one-section").await;
+    let family = OrgSensingFamily::mint(&node).expect("mint");
+    let providers: Vec<u64> = (1..=4u64)
+        .map(|offset| node.node_id().wrapping_add(offset))
+        .collect();
+    let demand = family.reconcile(TAG, &providers).expect("retain");
+    let keys = branches(&demand);
+    assert_eq!(keys.len(), 4, "a multi-row capture is the precondition");
+    for (_, branch) in &keys {
+        admit(&node, branch, beat(AttestedStatus::Ready, 5, 1, true));
+    }
+
+    // The writer flips the LAST row's status, so its beat would change what the
+    // traversal reports if it were let in mid-capture.
+    let target = keys[3].1.clone();
+    let (start_tx, start_rx) = std::sync::mpsc::channel::<()>();
+    let (probe_tx, probe_rx) = std::sync::mpsc::channel::<bool>();
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let writer = {
+        let node = Arc::clone(&node);
+        std::thread::spawn(move || {
+            start_rx.recv().expect("released from inside the capture");
+            // Taken while the capture holds the guard: this is the contention.
+            probe_tx
+                .send(node.sensing_observations_available_for_test())
+                .expect("report the probe");
+            // Blocks until the section ends, then lands.
+            node.sensing_admit_beat_for_test(
+                &target,
+                beat(AttestedStatus::NotReady, 5, 2, true),
+                Instant::now(),
+            )
+            .expect("the writer's beat lands once the capture releases");
+            done_tx.send(()).expect("report progress");
+        })
+    };
+
+    // The rendezvous: fired inside the section, after its first row.
+    let contended = Arc::new(parking_lot::Mutex::new(None::<bool>));
+    {
+        let contended = Arc::clone(&contended);
+        let start_tx = parking_lot::Mutex::new(Some(start_tx));
+        let probe_rx = parking_lot::Mutex::new(Some(probe_rx));
+        node.set_sensing_capture_seam_for_test(Arc::new(move || {
+            // ONCE: later captures in this test must not re-park.
+            let Some(start) = start_tx.lock().take() else {
+                return;
+            };
+            let probe = probe_rx.lock().take().expect("paired with the sender");
+            start.send(()).expect("wake the writer");
+            let available = probe
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the writer must reach its probe");
+            *contended.lock() = Some(available);
+        }));
+    }
+
+    let before = node.sensing_observation_acquisitions_for_test();
+    let projection = demand.project_sensed_order(Instant::now(), &ConsumerLatencyBudget::default());
+    let after = node.sensing_observation_acquisitions_for_test();
+    node.clear_sensing_capture_seam_for_test();
+
+    assert_eq!(
+        projection.rows().len(),
+        4,
+        "the capture really traversed four rows: {projection:?}"
+    );
+    assert_eq!(
+        after - before,
+        1,
+        "the whole population must be captured under ONE counted acquisition, \
+         not one per row and not through an untracked lock"
+    );
+    assert_eq!(
+        *contended.lock(),
+        Some(false),
+        "a writer arriving mid-traversal must find the observation mutex held - \
+         without that, the section spans nothing"
+    );
+    // Every row was read under that one acquisition, so the writer's flip
+    // cannot appear in it.
+    assert_eq!(
+        projection.viable().len(),
+        4,
+        "all four rows come from before the writer landed: {projection:?}"
+    );
+
+    // ...and the writer then makes progress, which is what proves it was
+    // blocked rather than absent.
+    done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the writer completes once the section ends");
+    writer.join().expect("writer");
+    let refreshed = demand.project_sensed_order(Instant::now(), &ConsumerLatencyBudget::default());
+    assert_eq!(
+        readiness_of(&refreshed, providers[3]),
+        ProjectedReadiness::NotReady,
+        "the next capture sees the writer's beat: {refreshed:?}"
+    );
 
     drop(demand);
     drop(family);

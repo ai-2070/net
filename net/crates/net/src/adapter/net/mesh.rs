@@ -7843,6 +7843,32 @@ impl<G> SensingGuard<G> {
     }
 }
 
+/// ONE off-lock observation from inside the sensed projection
+/// (fixtures/tests only).
+///
+/// Carries two INDEPENDENT facts about the same instant: the instrumented
+/// guard depth/set, and whether the observation mutex is actually available to
+/// this thread. A tracked guard held here moves the first; an untracked raw
+/// `.lock()` moves only the second.
+#[cfg(any(test, feature = "fixtures"))]
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct SensingOffLockObservation {
+    /// Which point of the projection reported.
+    pub phase: &'static str,
+    /// Instrumented sensing guards this thread holds.
+    pub guard_depth: usize,
+    /// Their names, for a failure message that says which one.
+    pub held: String,
+    /// Whether `sensing_observations` could be taken right now.
+    pub observations_available: bool,
+    /// How much WORK this point covers: one route lookup, or the number of
+    /// branch views a classification/ranking boundary is about to consume or
+    /// has just produced. Zero means the projection reached the label without
+    /// anything to do, which is what makes an off-lock claim vacuous.
+    pub work_units: usize,
+}
+
 /// Which sensing mutex a [`SensingGuard`] wraps. Present in every build so the
 /// production call sites are identical; only the recording is test-gated.
 #[derive(Clone, Copy)]
@@ -10522,13 +10548,22 @@ pub struct MeshNode {
     /// would make the zero-emission proof vacuous.
     #[cfg(any(test, feature = "fixtures"))]
     sensing_phase_two_seam: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Counted observation-guard acquisitions (fixtures/tests only). Counts
+    /// only acquisitions taken through `lock_sensing_observations`, which is
+    /// what makes "one section for the whole population" checkable.
+    #[cfg(any(test, feature = "fixtures"))]
+    sensing_observation_acquisitions: AtomicU64,
+    /// Fixtures seam: fires INSIDE the capture's critical section, after its
+    /// first row.
+    #[cfg(any(test, feature = "fixtures"))]
+    sensing_capture_seam: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Fixtures seam: fires at each labelled point of the sensed projection
     /// that must run OFF every sensing lock, carrying this thread's guard
     /// depth and set. Lets a witness prove the off-lock claim positively.
     #[cfg(any(test, feature = "fixtures"))]
     #[allow(clippy::type_complexity)]
     sensing_projection_offlock_observer:
-        parking_lot::Mutex<Option<Arc<dyn Fn(&'static str, usize, String) + Send + Sync>>>,
+        parking_lot::Mutex<Option<Arc<dyn Fn(SensingOffLockObservation) + Send + Sync>>>,
     /// Review L1 linearization: the LOCAL-projection transaction mutex. Every
     /// operation that changes OR applies the node-local consumer projection
     /// (the `Local`/`LeasedLocal` rows' derived
@@ -12411,6 +12446,10 @@ impl MeshNode {
             sensing_fence_seam: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(any(test, feature = "fixtures"))]
             sensing_phase_two_seam: parking_lot::Mutex::new(None),
+            #[cfg(any(test, feature = "fixtures"))]
+            sensing_observation_acquisitions: AtomicU64::new(0),
+            #[cfg(any(test, feature = "fixtures"))]
+            sensing_capture_seam: parking_lot::Mutex::new(None),
             #[cfg(any(test, feature = "fixtures"))]
             sensing_projection_offlock_observer: parking_lot::Mutex::new(None),
             sensing_local_projection_mu,
@@ -16220,29 +16259,102 @@ impl MeshNode {
         retained: &BTreeMap<u64, sensing::ProviderInterestKey>,
         now: Instant,
     ) -> Vec<(u64, sensing::ProjectedReadiness, Option<Duration>)> {
-        // The INSTRUMENTED guard, like every other sensing acquisition: the
-        // off-lock claim below is only measurable if this section registers
-        // itself, and a bare `.lock()` here would make the witness vacuous.
-        let observations = SensingGuard::new(
+        // ONE COUNTED acquisition for the WHOLE traversal. Counted, not merely
+        // instrumented: bucket/row agreement is an algebraic consequence of
+        // folding one `Vec` and would survive a per-row reacquisition that
+        // stitched rows from different moments together. The acquisition count
+        // is what separates one section from N, and it moves only for
+        // acquisitions taken through this helper — so replacing it with a bare
+        // `.lock()` does not move it either.
+        let observations = self.lock_sensing_observations();
+        let mut rows = Vec::with_capacity(population.len());
+        for (index, &provider) in population.iter().enumerate() {
+            let cell = retained
+                .get(&provider)
+                .and_then(|branch| observations.consumer_cells.get(branch));
+            rows.push(match cell {
+                None => (provider, sensing::ProjectedReadiness::Unknown, None),
+                Some(cell) => (
+                    provider,
+                    cell.projected_at(now),
+                    cell.observation().and_then(|obs| obs.estimated_start),
+                ),
+            });
+            // Fixtures seam, fired ONCE after the first row and while the guard
+            // is still held: every remaining row is read after this point, so a
+            // witness parked here is parked in the middle of the traversal and
+            // can prove a writer is excluded from it.
+            if index == 0 {
+                self.fire_sensing_capture_seam();
+            }
+        }
+        rows
+    }
+
+    /// Take the observation guard through the COUNTED path.
+    ///
+    /// The counter exists so a witness can distinguish "one section over the
+    /// whole population" from "one section per row" — and, because only this
+    /// helper moves it, from an untracked raw acquisition as well.
+    fn lock_sensing_observations(
+        &self,
+    ) -> SensingGuard<parking_lot::MutexGuard<'_, SensingObservations>> {
+        #[cfg(any(test, feature = "fixtures"))]
+        self.sensing_observation_acquisitions
+            .fetch_add(1, Ordering::Relaxed);
+        SensingGuard::new(
             self.sensing_observations.lock(),
             SensingGuardKind::Observations,
-        );
-        population
-            .iter()
-            .map(|&provider| {
-                let cell = retained
-                    .get(&provider)
-                    .and_then(|branch| observations.consumer_cells.get(branch));
-                match cell {
-                    None => (provider, sensing::ProjectedReadiness::Unknown, None),
-                    Some(cell) => (
-                        provider,
-                        cell.projected_at(now),
-                        cell.observation().and_then(|obs| obs.estimated_start),
-                    ),
-                }
-            })
-            .collect()
+        )
+    }
+
+    /// Counted observation-guard acquisitions taken through
+    /// [`Self::lock_sensing_observations`] (fixtures/tests only).
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn sensing_observation_acquisitions_for_test(&self) -> u64 {
+        self.sensing_observation_acquisitions
+            .load(Ordering::Acquire)
+    }
+
+    /// Whether the observation mutex is available to THIS thread right now
+    /// (fixtures/tests only).
+    ///
+    /// `parking_lot` mutexes are not reentrant, so a `false` here means this
+    /// thread is holding it — whether it took it through the instrumented guard
+    /// or a raw `.lock()`. That is the one check a guard-depth counter cannot
+    /// make, which is why the off-lock observation carries it.
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn sensing_observations_available_for_test(&self) -> bool {
+        self.sensing_observations.try_lock().is_some()
+    }
+
+    /// Fire the mid-capture seam (fixtures/tests only).
+    #[cfg(any(test, feature = "fixtures"))]
+    fn fire_sensing_capture_seam(&self) {
+        let hook = self.sensing_capture_seam.lock().clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(not(any(test, feature = "fixtures")))]
+    fn fire_sensing_capture_seam(&self) {}
+
+    /// Install the mid-capture seam. It fires inside the capture's critical
+    /// section, after its first row (fixtures/tests only).
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn set_sensing_capture_seam_for_test(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.sensing_capture_seam.lock() = Some(hook);
+    }
+
+    /// Remove the mid-capture seam (fixtures/tests only).
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn clear_sensing_capture_seam_for_test(&self) {
+        *self.sensing_capture_seam.lock() = None;
     }
 
     /// This consumer's current route estimate toward `provider`.
@@ -16251,6 +16363,11 @@ impl MeshNode {
     /// sensing guard released, which is what lets the sensed projection do its
     /// proximity pass off-lock.
     pub(crate) fn sensing_route_estimate(&self, provider: u64) -> Duration {
+        // Reported from the callsite that does the WORK, not from a label
+        // beside it: a lock taken for the duration of this lookup — instrumented
+        // or raw — is visible here and nowhere else, and a projection that
+        // stopped consulting the route plane stops reporting at all.
+        self.observe_sensing_projection_offlock("route", 1);
         sensing::proximity_route_estimate(&self.proximity_graph, provider)
     }
 
@@ -16262,29 +16379,38 @@ impl MeshNode {
     /// ran. This seam does: a witness records the phases it observed AND their
     /// guard sets, so "no lock was held" cannot pass vacuously.
     #[cfg(any(test, feature = "fixtures"))]
-    pub(crate) fn observe_sensing_projection_offlock(&self, phase: &'static str) {
+    pub(crate) fn observe_sensing_projection_offlock(
+        &self,
+        phase: &'static str,
+        work_units: usize,
+    ) {
         let hook = self.sensing_projection_offlock_observer.lock().clone();
         if let Some(hook) = hook {
             let depth = SENSING_GUARD_DEPTH.with(|d| d.get());
-            hook(
+            hook(SensingOffLockObservation {
                 phase,
-                depth as usize,
-                format!("{:?}", SensingGuards::held()),
-            );
+                guard_depth: depth as usize,
+                held: format!("{:?}", SensingGuards::held()),
+                // ACTUAL availability, not a bookkeeping count: an untracked
+                // raw acquisition held across this point makes this false while
+                // the depth stays zero.
+                observations_available: self.sensing_observations.try_lock().is_some(),
+                work_units,
+            });
         }
     }
 
     /// The uninstrumented build has no observer: the phases stay off-lock by
     /// construction, and there is nothing to report to.
     #[cfg(not(any(test, feature = "fixtures")))]
-    pub(crate) fn observe_sensing_projection_offlock(&self, _phase: &'static str) {}
+    pub(crate) fn observe_sensing_projection_offlock(&self, _phase: &'static str, _work: usize) {}
 
     /// Install the sensed-projection off-lock observer (fixtures/tests only).
     #[cfg(any(test, feature = "fixtures"))]
     #[doc(hidden)]
     pub fn set_sensing_projection_offlock_observer_for_test(
         &self,
-        hook: Arc<dyn Fn(&'static str, usize, String) + Send + Sync>,
+        hook: Arc<dyn Fn(SensingOffLockObservation) + Send + Sync>,
     ) {
         *self.sensing_projection_offlock_observer.lock() = Some(hook);
     }

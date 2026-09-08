@@ -1539,10 +1539,11 @@ jobs:
       # away — would be invisible while a sibling target still ran something.
       #
       # `--retries 0` deliberately: one witness drives a concurrent readiness
-      # writer against repeated captures, and another proves that no sensing
-      # guard is held during the proximity/budget/order phases. Both are
-      # properties of a specific interleaving, so a retry could only convert a
-      # real coherence or lock-order defect into a green run.
+      # writer against repeated captures, one parks a writer INSIDE the capture
+      # and requires it to find the observation mutex held, and another proves
+      # no sensing guard is held during the actual route/classification work.
+      # All three are properties of a specific interleaving, so a retry could
+      # only convert a real coherence or lock-order defect into a green run.
       #
       # The roster is DERIVED from `cargo nextest list` (which executes
       # nothing) and then re-run per name with an exact-equality filterset, so
@@ -1554,6 +1555,7 @@ jobs:
           BIN=sensing_org_exact_projection
           FEATURES="cortex tool fixtures"
           REQUIRED="counts_ranking_and_rows_agree_under_concurrent_status_change
+          one_acquisition_captures_every_row_while_a_writer_is_excluded
           unknown_never_prunes_and_an_over_budget_ready_stays_potential
           expiry_without_a_new_beat_maps_unknown_and_an_expired_not_ready_never_prunes
           a_provider_removed_before_the_snapshot_resolves_unknown_from_current_state
