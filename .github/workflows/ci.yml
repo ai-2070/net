@@ -731,22 +731,39 @@ jobs:
           if ! list=$(cargo test --lib --features "$UNIT_FEATURES" -- --list 2>&1); then
             die "cargo test -- --list failed" "$list"
           fi
+          # NOT deduplicated: the exactly-once check below is only honest if a
+          # duplicated record is visible as a duplicate.
           listed=$(printf '%s\n' "$list" | grep -E "^${DEMAND}::[a-z0-9_]+: test\$" \
-                     | sed "s|^${DEMAND}::||; s|: test\$||" | sort -u)
+                     | sed "s|^${DEMAND}::||; s|: test\$||" | sort)
           n=$(printf '%s\n' "$listed" | grep -c . || true)
           echo "inventory: $n witness(es) in $DEMAND"
 
           # The invariants this slice is accountable for. Each must be present
           # exactly once; the module may grow beyond them freely.
+          #
+          # The HOLD-repair outcomes are in here by name: shared-installation
+          # retirement, refused-release ownership, node binding, transactional
+          # convergence, discovery provenance, stale/postponed re-arm, the
+          # in-transaction no-mutation baseline, and cancellation-safe teardown.
           REQUIRED="only_the_last_family_owner_retires_retained_demand
+          a_nonfinal_family_retirement_keeps_the_shared_installation_refreshing
+          a_refused_retirement_release_keeps_the_holder_and_recovers_it
+          a_family_only_touches_the_node_it_was_minted_for
+          concurrent_convergences_of_one_capability_leak_nothing
           reconciliation_preserves_the_surviving_holders_installation
           a_refused_provider_does_not_cost_the_others_their_demand
           a_retention_without_live_authority_retains_nothing
           the_family_capability_bound_refuses_and_evicts_nothing
+          a_population_derived_under_a_moved_view_is_re_derived
           a_refresh_renews_without_acquiring_a_holder
+          a_rival_acquisition_inside_a_refresh_window_is_not_a_violation
           a_refresh_never_resurrects_retired_or_superseded_demand
-          authority_replacement_refuses_a_refresh_without_downgrading
-          the_single_worker_refreshes_retained_demand_and_shutdown_closes_it"
+          a_stale_rearm_cannot_displace_its_successor
+          a_joining_holder_cannot_postpone_a_live_renewal
+          an_authority_rotation_renews_and_a_foreign_owner_refuses
+          the_single_worker_refreshes_every_retained_installation
+          an_earlier_arm_shortens_a_live_park
+          a_cancelled_refresh_close_leaves_a_recoverable_worker"
           required_n=$(printf '%s\n' $REQUIRED | grep -c .)
           if [ "$n" -lt "$required_n" ]; then
             die "expected at least $required_n witnesses in $DEMAND, listed $n" \

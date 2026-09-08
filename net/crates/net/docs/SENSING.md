@@ -284,18 +284,35 @@ internal design is
 repository's `docs/internal/plans/`.
 
 Retained demand and refresh now exist in the core, still dark. An
-internal clone-shared family retains exact-provider demand over the
-AUTHORIZED provider population of one owner-scoped capability — the
-audience derived from installed organization authority and the
-population from verified owner-private discovery, neither ever
-caller-supplied. It reconciles as that population changes (surviving
-holders keep their installation identity), and one node-owned worker
-renews every retained installation at `ttl/2` on an absolute deadline —
-one task for the whole node, never a timer per lease. A refresh mints no
-holder and is identity-checked, so a retired or re-established
-installation is never resurrected, and a replaced or revoked authority
-makes it refuse rather than downgrade. Demand retires when the last
-family owner releases, on reconciliation, and on node shutdown.
+internal clone-shared family, BOUND to the node it was minted on,
+retains exact-provider demand over the AUTHORIZED provider population of
+one owner-scoped capability — the audience derived from installed
+organization authority and the population derived under that same
+captured view, neither ever caller-supplied; a view that moves before
+the derivation is re-proved makes the retention re-derive rather than
+publish facts its stamp never qualified. Each convergence is one
+transaction, so two concurrent reconciliations of a capability
+serialize instead of both establishing it.
+
+One node-owned worker renews every retained installation at `ttl/2` on
+an absolute deadline — one task for the whole node, never a timer per
+lease. A refresh mints no holder and is identity-checked, so a retired
+or re-established installation is never resurrected; a stale re-arm
+cannot displace its own successor's schedule, and a holder joining a
+live installation cannot postpone its renewal. An authority the node
+cannot author this audience under makes a refresh refuse rather than
+downgrade.
+
+Retirement is per-holder and honest about shared state: a lease key is
+node-global, so retiring one owner RELEASES its holder and then settles
+the refresh record only if that release actually retired the
+installation — a surviving holder keeps its row and its renewal. A
+release the transaction refuses leaves a holder that is still live and
+still this node's, so the ticket is retained on the node and retried on
+the worker's cadence instead of being dropped. Node shutdown closes and
+joins the refresh schedule — it does NOT release family-held tickets;
+those belong to the family's owners, and the whole lease registry goes
+away with the node.
 
 What is still genuinely absent: no query, watch, or snapshot surface, no
 readiness projection and no ranking. There are also no public
