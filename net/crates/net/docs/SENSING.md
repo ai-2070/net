@@ -385,12 +385,41 @@ shutdown is terminal — the lease registry is not a supported surface on
 a stopped node and goes away with it. A holder observable in the
 registry after shutdown is that retained state, not a live-node leak.
 
-What is still genuinely absent: no query, watch, or snapshot surface, no
-readiness projection and no ranking. There are also no public
-`OrgClient` sensing controls or wiring — the retained-demand substrate
-is not connected to call planning — no provider-free/leader sensing, no
-`Granted` or cross-organization sensing, and no language bindings.
-Acquisition is not a projection, so the SDK surface stays
+**Request-relative projection.** Retained demand can be turned into ONE
+readiness projection over the capability's authorized population, at one
+instant the CALLER supplies. Freshness is evaluated against that single
+instant — including its exact boundary, where the row stops vouching —
+non-mutatingly, so expired evidence reads `Unknown` with no worker tick
+and no state change. The capture is one bounded critical section that
+returns exactly one row per population member, in population order, and
+reads only that demand's own branch keys: a missing, removed,
+unretained or expired row is `Unknown`, and an unrelated interest can
+never answer for this one. Proximity, budget classification and
+ordering all run with every sensing lock released, and the claim is a
+coherent capture of THIS node's cells at that instant — not
+cross-plane or distributed linearizability.
+
+Classification is request-relative through the caller's own latency
+budget: `Unknown` stays potential, an over-budget `Ready` stays
+potential rather than being pruned, and only a fresh explicit
+`NotReady` is non-viable — for its own exact interest, never for
+discovery, membership or admission. With no deadline nothing is demoted
+for budget. The order the projection implies is a stable class
+permutation of the caller's COMPLETE authorized candidate list: sensed
+viable candidates first in sensed rank order, then everything with no
+verdict in the caller's own order, then the not-ready ones last — still
+present. The population cap bounds what is SENSED, never what is
+offered, so same-organization candidates beyond it, and every
+cross-organization one, survive as unsensed fallback. The result is
+advisory plain data: it holds no lease, mints no grant, reserves
+nothing, and cannot admit an invocation.
+
+What is still genuinely absent: no query, watch or snapshot surface,
+and no continuous ranking. There are also no public `OrgClient` sensing
+controls or wiring — neither the retained-demand substrate nor the
+projection is connected to call planning — no provider-free/leader
+sensing, no `Granted` or cross-organization sensing, and no language
+bindings. Acquisition is not a projection, so the SDK surface stays
 provider-lifecycle only.
 
 The plan's §4.5 node-authority refusal guards *owner-scoped* sensing,
