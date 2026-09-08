@@ -1562,6 +1562,8 @@ jobs:
           a_provider_removed_after_the_snapshot_is_advisory_and_cannot_authorize
           an_unrelated_interest_for_the_same_provider_never_contributes_readiness
           no_sensing_lock_is_held_during_route_budget_or_sort_work
+          the_off_lock_observer_itself_holds_nothing
+          an_unrelated_owner_does_not_make_off_lock_work_look_locked
           the_sensed_order_is_a_stable_class_permutation_of_the_complete_list
           a_candidate_list_beyond_the_sensing_cap_keeps_every_unsensed_member
           the_population_clamp_bounds_rows_but_never_drops_a_candidate"
