@@ -555,6 +555,48 @@ use crate::event::{Batch, StoredEvent};
 /// Inbound event queues (same type as NetAdapter uses).
 type InboundQueues = Arc<DashMap<u16, SegQueue<StoredEvent>>>;
 
+/// Where a direct-handshake initiator waits for its `msg2` while some
+/// OTHER consumer of the node's shared socket is the one that actually
+/// reads it — the dispatch loop post-`start()`, or a sibling
+/// `accept()`/`connect()` pre-`start()`.
+///
+/// Bounded and multi-delivery rather than a `oneshot`: a
+/// handshake-flagged datagram that turns out not to advance the
+/// initiator's state must not consume the registration, or a single
+/// spoofed packet ends the attempt — the same denial primitive the
+/// initiator's own drain loop exists to remove. Bounded so that
+/// forwarding from an unauthenticated source cannot grow a queue.
+type DirectHandshakeInbox = tokio::sync::mpsc::Sender<Bytes>;
+
+/// Depth of a [`DirectHandshakeInbox`]. A handshake expects exactly one
+/// useful reply; the slack is only there so a burst of junk from the
+/// peer's address doesn't push the real `msg2` out.
+const DIRECT_HANDSHAKE_INBOX_DEPTH: usize = 8;
+
+/// Hand a handshake payload read off the shared socket to the direct
+/// initiator waiting on `source`, if there is one. Returns whether the
+/// payload was claimed, so the caller knows not to also discard it.
+///
+/// Every consumer of the shared socket must go through this before
+/// dropping a handshake datagram it cannot use. A UDP datagram goes to
+/// exactly one waiter, so a consumer that discards someone else's
+/// `msg2` does not merely fail to help — it destroys the reply, and
+/// every retransmit of it too.
+fn forward_to_direct_initiator(
+    registry: &DashMap<SocketAddr, DirectHandshakeInbox>,
+    source: SocketAddr,
+    payload: Bytes,
+) -> bool {
+    let Some(entry) = registry.get(&source) else {
+        return false;
+    };
+    // Full: the initiator is already holding more candidates than a
+    // handshake can need. Closed: it gave up and has not yet
+    // deregistered. Either way the datagram is spent, not ours.
+    let _ = entry.try_send(payload);
+    true
+}
+
 /// One slot in [`MeshNode::fold_generations`]: a monotonic
 /// counter plus the wall-clock micros at which it was last
 /// bumped. The background GC loop evicts slots whose
@@ -1400,20 +1442,21 @@ struct DispatchCtx {
     /// matching routed msg2 arrives.
     pending_handshakes: Arc<DashMap<u64, PendingHandshake>>,
     /// In-flight DIRECT initiator handshakes, keyed by the peer's
-    /// socket address. The initiator registers a oneshot here
-    /// BEFORE sending msg1; the dispatch loop's direct-handshake
-    /// branch looks up the source, forwards the parsed payload
-    /// bytes through the oneshot, and removes the entry.
+    /// socket address. The initiator registers a
+    /// [`DirectHandshakeInbox`] here BEFORE sending msg1 and removes
+    /// it when the attempt ends; every consumer of the shared socket
+    /// runs [`forward_to_direct_initiator`] before dropping a
+    /// handshake datagram it cannot use.
     ///
-    /// Polling `socket_arc.recv_from` directly from
-    /// `try_handshake_initiator` would race the dispatch receive
-    /// loop spawned by `start()` — tokio dispatches each datagram
-    /// to exactly one waiter, so the handshake response could be
-    /// swallowed by either side. If no entry matches the source
-    /// (e.g., the
-    /// responder side or pre-start invocations), the dispatcher
-    /// falls through to its drop-direct-handshake behaviour.
-    pending_direct_initiators: Arc<DashMap<SocketAddr, oneshot::Sender<Bytes>>>,
+    /// Registration is NOT only for the post-`start()` path. Tokio
+    /// dispatches each datagram to exactly one waiter, so pre-`start()`
+    /// a sibling `accept()` or `connect()` polling the same socket can
+    /// win the race for this initiator's `msg2` — and a consumer that
+    /// discards it destroys the reply, and every retransmit of it.
+    /// If no entry matches the source (the responder side, or an
+    /// unsolicited handshake), the datagram falls through to the
+    /// caller's own drop behaviour.
+    pending_direct_initiators: Arc<DashMap<SocketAddr, DirectHandshakeInbox>>,
     /// Our Noise static keypair — needed to construct responder state
     /// when a routed msg1 arrives for us.
     static_keypair: StaticKeypair,
@@ -8709,10 +8752,12 @@ pub struct MeshNode {
     pending_handshakes: Arc<DashMap<u64, PendingHandshake>>,
     /// In-flight direct-handshake initiators, keyed by the peer's
     /// `SocketAddr`. Populated by `try_handshake_initiator` BEFORE
-    /// sending msg1; consumed by the dispatch loop when a matching
-    /// direct handshake response arrives. See the matching field
-    /// on `DispatchCtx` for context.
-    pending_direct_initiators: Arc<DashMap<SocketAddr, oneshot::Sender<Bytes>>>,
+    /// sending msg1, on BOTH sides of the `start()` boundary; fed by
+    /// whichever consumer of the shared socket reads the reply — the
+    /// dispatch loop, a sibling `connect()`, or the `accept()`
+    /// responder's drain. See the matching field on `DispatchCtx` for
+    /// context.
+    pending_direct_initiators: Arc<DashMap<SocketAddr, DirectHandshakeInbox>>,
     /// Handshake datagrams the direct responder read and threw away
     /// because they did not decrypt under the pairing being accepted
     /// — another pairing's retransmitted `msg1`, junk, a key
@@ -10281,7 +10326,7 @@ impl MeshNode {
         });
 
         let pending_handshakes: Arc<DashMap<u64, PendingHandshake>> = Arc::new(DashMap::new());
-        let pending_direct_initiators: Arc<DashMap<SocketAddr, oneshot::Sender<Bytes>>> =
+        let pending_direct_initiators: Arc<DashMap<SocketAddr, DirectHandshakeInbox>> =
             Arc::new(DashMap::new());
 
         // Hoist the subnet knobs before `config` is moved into the
@@ -18455,9 +18500,7 @@ impl MeshNode {
             // loop — tokio routes a UDP datagram to exactly one
             // waiter — and the response could be swallowed by
             // either consumer.
-            if let Some((_, tx)) = ctx.pending_direct_initiators.remove(&source) {
-                let _ = tx.send(parsed.payload);
-            }
+            forward_to_direct_initiator(&ctx.pending_direct_initiators, source, parsed.payload);
             return;
         }
 
@@ -33852,21 +33895,24 @@ impl MeshNode {
     ) -> Result<(), AdapterError> {
         let timeout = self.config.handshake_timeout;
 
-        // Polling `socket_arc.recv_from` directly would race
-        // `spawn_receive_loop`'s consumer post-`start()` (tokio
-        // dispatches a UDP datagram to exactly one waiter), so:
-        //   - Pre-`start()`: use `recv_from`; the dispatcher isn't
-        //     running, so there's no race. This preserves the
-        //     existing init-time ordering where `connect()` is
-        //     called before `start()`.
-        //   - Post-`start()`: register an oneshot in
-        //     `pending_direct_initiators`, then send msg1, then
-        //     await the oneshot. The dispatcher's direct-handshake
-        //     branch forwards the parsed payload bytes through.
-        // Concurrent direct connects on the same node also work
+        // Tokio dispatches a UDP datagram to exactly one waiter, so
+        // whoever else is reading this socket can take our `msg2`.
+        // Both branches below therefore register an inbox in
+        // `pending_direct_initiators` under our `peer_addr` before
+        // sending msg1, and every other consumer forwards what it
+        // cannot use. They differ only in who else is reading:
+        //   - Post-`start()`: the dispatch loop owns the socket, so
+        //     wait on the inbox alone.
+        //   - Pre-`start()`: no dispatcher, so read the socket
+        //     ourselves AND watch the inbox, because a sibling
+        //     `accept()` or `connect()` on this node polls the same
+        //     socket. This preserves the init-time ordering where
+        //     `connect()` is called before `start()`.
+        // Concurrent direct connects on the same node work either way
         // — each registers under its own peer_addr.
         if self.started.load(Ordering::Acquire) {
-            let (tx, rx) = oneshot::channel::<Bytes>();
+            let (tx, mut rx) =
+                tokio::sync::mpsc::channel::<Bytes>(DIRECT_HANDSHAKE_INBOX_DEPTH);
             // Register BEFORE sending msg1 so we can't miss a
             // fast responder that replies before we'd otherwise
             // be ready to receive. `insert` replaces any prior
@@ -33878,60 +33924,100 @@ impl MeshNode {
                 return Err(AdapterError::Connection(format!("send failed: {}", e)));
             }
 
-            let payload_bytes = match tokio::time::timeout(timeout, rx).await {
-                Ok(Ok(payload)) => payload,
-                Ok(Err(_)) => {
-                    // Sender dropped — the dispatcher removed our
-                    // entry without forwarding. Should not happen
-                    // unless start() shut down; treat as timeout.
-                    self.pending_direct_initiators.remove(&peer_addr);
-                    return Err(AdapterError::Connection("handshake channel dropped".into()));
-                }
-                Err(_) => {
-                    // Timeout — the responder never replied or its
-                    // reply arrived for a different source. Clean up.
-                    self.pending_direct_initiators.remove(&peer_addr);
-                    return Err(AdapterError::Connection("handshake timeout".into()));
-                }
-            };
-
-            handshake
-                .read_message(&payload_bytes)
-                .map_err(|e| AdapterError::Connection(format!("read_message failed: {}", e)))?;
-            Ok(())
-        } else {
-            // Pre-start fallback: dispatcher is not running, so
-            // there's nothing to forward through the registry.
-            // Poll the socket directly — no race exists yet.
-            let socket_arc = self.socket.socket_arc();
-            self.socket
-                .send_to(packet, peer_addr)
-                .await
-                .map_err(|e| AdapterError::Connection(format!("send failed: {}", e)))?;
-
-            tokio::time::timeout(timeout, async {
+            let outcome = tokio::time::timeout(timeout, async {
                 loop {
-                    let mut recv_buf = bytes::BytesMut::with_capacity(protocol::MAX_PACKET_SIZE);
-                    recv_buf.resize(protocol::MAX_PACKET_SIZE, 0);
-
-                    let (n, source) = socket_arc
-                        .recv_from(&mut recv_buf)
-                        .await
-                        .map_err(|e| AdapterError::Connection(format!("recv failed: {}", e)))?;
-
-                    if source != peer_addr {
-                        continue;
-                    }
-
-                    recv_buf.truncate(n);
-                    let data = recv_buf.freeze();
-
-                    let Some(p) = ParsedPacket::parse(data, source) else {
-                        continue;
+                    let Some(payload) = rx.recv().await else {
+                        // Every sender is gone, which while our own
+                        // registration stands means a concurrent
+                        // `connect()` to the same address replaced it.
+                        return Err(AdapterError::Connection("handshake channel dropped".into()));
                     };
-                    if !p.header.flags.is_handshake() {
-                        continue;
+                    // Same rule as the pre-start loop below: a
+                    // forwarded datagram that does not advance our
+                    // state is discarded, NOT fatal. A `oneshot` here
+                    // made one spoofed handshake from the peer's
+                    // address enough to end the attempt.
+                    match handshake.read_message(&payload) {
+                        Ok(_) => return Ok(()),
+                        Err(e) => tracing::debug!(
+                            %peer_addr,
+                            error = %e,
+                            "discarding a direct handshake reply that does not \
+                             advance our state"
+                        ),
                     }
+                }
+            })
+            .await;
+
+            self.pending_direct_initiators.remove(&peer_addr);
+            match outcome {
+                Ok(inner) => inner,
+                // The responder never replied, or its reply arrived
+                // for a different source.
+                Err(_) => Err(AdapterError::Connection("handshake timeout".into())),
+            }
+        } else {
+            // Pre-`start()` the dispatcher is not running, so this
+            // loop reads the socket itself. It is NOT the only reader:
+            // a sibling `accept()` or `connect()` on the same node
+            // polls the same socket, and tokio hands each datagram to
+            // exactly one waiter. So register an inbox as well —
+            // whichever consumer wins the race forwards what it cannot
+            // use to whoever can, instead of destroying it.
+            let (tx, mut rx) =
+                tokio::sync::mpsc::channel::<Bytes>(DIRECT_HANDSHAKE_INBOX_DEPTH);
+            self.pending_direct_initiators.insert(peer_addr, tx);
+
+            let socket_arc = self.socket.socket_arc();
+            if let Err(e) = self.socket.send_to(packet, peer_addr).await {
+                self.pending_direct_initiators.remove(&peer_addr);
+                return Err(AdapterError::Connection(format!("send failed: {}", e)));
+            }
+
+            let outcome = tokio::time::timeout(timeout, async {
+                // One buffer for the whole wait — see the matching
+                // note in `try_handshake_responder`.
+                let mut recv_buf = vec![0u8; protocol::MAX_PACKET_SIZE];
+                loop {
+                    // Both arms are cancel-safe, so losing the race
+                    // costs nothing.
+                    let payload = tokio::select! {
+                        forwarded = rx.recv() => match forwarded {
+                            Some(payload) => payload,
+                            None => {
+                                return Err(AdapterError::Connection(
+                                    "handshake channel dropped".into(),
+                                ))
+                            }
+                        },
+                        read = socket_arc.recv_from(&mut recv_buf) => {
+                            let (n, source) = read.map_err(|e| {
+                                AdapterError::Connection(format!("recv failed: {}", e))
+                            })?;
+                            let data = Bytes::copy_from_slice(&recv_buf[..n]);
+
+                            let Some(p) = ParsedPacket::parse(data, source) else {
+                                continue;
+                            };
+                            if !p.header.flags.is_handshake() {
+                                continue;
+                            }
+                            if source != peer_addr {
+                                // Someone else's handshake reply. Hand
+                                // it over rather than drop it: this is
+                                // the only copy, and so is every
+                                // retransmit we would swallow next.
+                                forward_to_direct_initiator(
+                                    &self.pending_direct_initiators,
+                                    source,
+                                    p.payload,
+                                );
+                                continue;
+                            }
+                            p.payload
+                        }
+                    };
 
                     // A handshake-flagged datagram that does not
                     // advance the state is discarded, NOT fatal: keep
@@ -33942,11 +34028,11 @@ impl MeshNode {
                     // costs nothing — whereas failing the attempt on
                     // one would hand an off-path sender a single
                     // garbage datagram as a denial primitive.
-                    match handshake.read_message(&p.payload) {
+                    match handshake.read_message(&payload) {
                         Ok(_) => return Ok::<(), AdapterError>(()),
                         Err(e) => {
                             tracing::debug!(
-                                %source,
+                                %peer_addr,
                                 error = %e,
                                 "discarding a direct handshake reply that does not \
                                  advance our state"
@@ -33955,8 +34041,13 @@ impl MeshNode {
                     }
                 }
             })
-            .await
-            .map_err(|_| AdapterError::Connection("handshake timeout".into()))?
+            .await;
+
+            self.pending_direct_initiators.remove(&peer_addr);
+            match outcome {
+                Ok(inner) => inner,
+                Err(_) => Err(AdapterError::Connection("handshake timeout".into())),
+            }
         }
     }
 
@@ -34121,6 +34212,23 @@ impl MeshNode {
                     continue;
                 };
                 if !p.header.flags.is_handshake() {
+                    continue;
+                }
+
+                // Someone else's `msg2` can land here: pre-`start()`
+                // a sibling `connect()` polls this same socket, and
+                // tokio gives each datagram to exactly one waiter.
+                // Hand it over before treating it as ours. Draining it
+                // instead would not merely fail to help — it destroys
+                // that reply and, since this loop no longer backs off
+                // between datagrams, every retransmit of it too,
+                // leaving the sibling to time out against a peer that
+                // answered every single time.
+                if forward_to_direct_initiator(
+                    &self.pending_direct_initiators,
+                    source,
+                    p.payload.clone(),
+                ) {
                     continue;
                 }
 

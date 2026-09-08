@@ -407,6 +407,61 @@ async fn a_one_source_handshake_flood_is_paced_and_does_not_starve_the_initiator
     assert_session_is_real(&a, &b).await;
 }
 
+/// A concurrent `accept()` must not destroy a `connect()`'s reply.
+///
+/// Pre-`start()` there is no dispatch loop, so `accept()`'s responder
+/// and `connect()`'s initiator both poll the node's one socket — and
+/// tokio hands each datagram to exactly one waiter. The responder sees
+/// the peer's `msg2` as a handshake datagram that does not decrypt
+/// under the pairing it is accepting, which is precisely the shape it
+/// now drains. Draining it does not merely fail to help: that datagram
+/// is the only copy, and because the drain loop no longer backs off
+/// between datagrams it is well placed to swallow every retransmit
+/// too, so the initiator times out against a peer that answered every
+/// single time.
+///
+/// The hub below accepts a peer that never arrives, so its responder
+/// camps on the shared socket for the whole budget while the hub's own
+/// `connect()` runs. The responder is given a head start on purpose so
+/// it is deterministically the one that reads the reply — without it
+/// the two racing `recv_from`s make the witness a coin flip. The
+/// connect must complete anyway.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_concurrent_accept_does_not_swallow_a_connects_reply() {
+    let hub = build_node([0x21; 32]).await;
+    let peer = build_node([0x23; 32]).await;
+
+    // Nobody will ever send this node's msg1, so the hub's responder
+    // stays in its drain loop for the accept's entire budget.
+    let absent_peer = 0x0dead_beefu64;
+
+    let hub_id = hub.node_id();
+    let responder = peer.clone();
+    let peer_accept = tokio::spawn(async move { responder.accept(hub_id).await });
+
+    // Its own task, and first on the socket: the accept must be the
+    // consumer that wins `msg2`, or the test proves nothing.
+    let camper = hub.clone();
+    let accept_task = tokio::spawn(async move { camper.accept(absent_peer).await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let connected = hub
+        .connect(peer.local_addr(), peer.public_key(), peer.node_id())
+        .await;
+    let accepted = accept_task.await.expect("accept task panicked");
+
+    assert!(
+        accepted.is_err(),
+        "the peer that never arrives cannot be accepted, got {accepted:?}",
+    );
+    connected.expect("a concurrent accept must not swallow the connect's msg2");
+    peer_accept
+        .await
+        .expect("peer accept task panicked")
+        .expect("the peer's side of the handshake must complete");
+
+    assert_session_is_real(&hub, &peer).await;
+}
+
 /// The diagnosis must survive the attempts that follow it.
 ///
 /// A responder's retry budget is its own, not the initiator's, so a
