@@ -758,6 +758,12 @@ jobs:
           # ownership at the invalidation that killed it, no capacity rejection
           # of a live ticket, and in-window rederivation of a NONEMPTY
           # population.
+          #
+          # FOURTH-review outcomes: a coherent one-read ownership observation
+          # (no cross-observation invariant to trip on legitimate movement),
+          # ledger admission closed against the invalidation that discharges
+          # it, and a CALLER-path witness that catches a family which stops
+          # consuming the acquisition's returned facts.
           REQUIRED="only_the_last_family_owner_retires_retained_demand
           a_nonfinal_family_retirement_keeps_the_shared_installation_refreshing
           a_refused_retirement_release_keeps_the_holder_and_recovers_it
@@ -788,7 +794,10 @@ jobs:
           adopting_an_aged_installation_renews_before_it_expires
           an_invalidation_discharges_the_releases_it_killed
           a_fresh_admission_at_the_ceiling_keeps_its_live_ticket
-          a_nonempty_population_is_rederived_when_the_view_moves_in_window"
+          a_nonempty_population_is_rederived_when_the_view_moves_in_window
+          an_invalidation_during_carry_validation_is_legitimate_movement
+          an_admission_after_its_invalidation_owns_nothing
+          a_concurrent_establishment_cannot_make_a_join_look_established"
           required_n=$(printf '%s\n' $REQUIRED | grep -c .)
           if [ "$n" -lt "$required_n" ]; then
             die "expected at least $required_n witnesses in $DEMAND, listed $n" \
