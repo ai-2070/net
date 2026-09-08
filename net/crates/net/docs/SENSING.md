@@ -424,19 +424,34 @@ already-authorized list, cannot add, remove or authorize a candidate,
 mints nothing, and runs strictly before the final currentness
 comparison that still gates the proof.
 
-**Reconciliation is driven by the call's own candidate list.** The
-authority stamp covers security-authority publication — not discovery
-rows, not pins, not holder liveness — so demand keyed on it alone
-would freeze ordinary churn. Each call therefore compares its own
-pinned same-organization candidates against what that capability's
-demand was last converged FOR. Unchanged: nothing is re-acquired.
-Changed — a newly discovered provider, a departed one, a pin that came
-or went: one convergence, which keeps every still-authorized holder's
-existing ticket. A convergence that could not take a holder it wanted
-(a per-provider refusal is skipped, never fatal) is retried on a floor,
-so a transient refusal recovers without turning every later call into
-acquisition traffic. A moved sensing authority is one more trigger, not
-a retry loop.
+**Reconciliation is driven by the call's own candidate list, and the
+record must certify the demand actually installed.** The authority
+stamp covers security-authority publication — not discovery rows, not
+pins, not holder liveness — so demand keyed on it alone would freeze
+ordinary churn. Each call therefore compares its own pinned
+same-organization candidates (plus this node, when it is its own
+authorized provider) against what that capability's demand was last
+CERTIFIED as. A record is reusable only while it still describes what
+is installed, so the decision re-checks the demand's identity, that
+the population core published still covers the expectation, that every
+retained holder is still the installation it was committed with, and
+the authority stamp. Unchanged and fully certified: nothing is
+re-acquired. Anything else: one convergence, which keeps every
+still-authorized holder's existing ticket.
+
+Incomplete certifications — a population narrower than the
+expectation because a discovery row expired between the caller's
+capture and core's own query, or a holder a per-provider refusal could
+not take — are retried on a floor; a retry that produces the identical
+population is a fixed point rather than a loop. Ownership that dies
+after a successful convergence is caught by the liveness question,
+which is the same one core's own convergence asks before carrying a
+ticket. Two bounds keep the state finite: a capability with an empty
+expectation certifies nothing and retires any demand it had, so an
+unknown or undiscovered service strands no capacity, and the record set
+itself is capped with least-recently-attempted eviction. The decision,
+the convergence and the record are one bounded synchronous section per
+binding, so two clones cannot both converge one change.
 
 Every degradation — inert binding, refused acquisition, empty
 population, `Unknown`, expired or over-budget evidence, an all-pruned

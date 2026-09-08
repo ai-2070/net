@@ -362,6 +362,27 @@ impl OrgSensingCapabilityDemand {
             .collect()
     }
 
+    /// Whether every retained holder is STILL the installation it was
+    /// committed with.
+    ///
+    /// `retained_providers` enumerates recorded tickets, which is HISTORY: a
+    /// ticket can stop being a holder after a successful convergence (a
+    /// refused restoration under an older authority invalidates the
+    /// installation, for instance), and neither the provider list nor the
+    /// authority stamp shows that. This is the same predicate the convergence
+    /// transaction itself applies before carrying a ticket (the convergence
+    /// transaction's own carry validation), exposed non-mutatingly
+    /// so a caller deciding whether to reconcile asks the question core would
+    /// answer rather than assuming the answer.
+    ///
+    /// Cheap and bounded: one registry lookup per retained provider,
+    /// `|population| <= 32`, no mutation and no lease-apply acquisition.
+    pub fn holders_are_live(&self) -> bool {
+        self.retained.iter().all(|held| {
+            self.node.sensing_lease_holder_installation(&held.ticket) == Some(held.installation_id)
+        })
+    }
+
     /// Whether the authority view this demand was derived against is STILL the
     /// live one. A replacement, revocation, rotation or poison makes it false,
     /// and a reconciliation then re-derives instead of reusing it.

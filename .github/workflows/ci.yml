@@ -2134,12 +2134,15 @@ jobs:
             a_provider_discovered_after_the_first_call_enters_the_population
             a_departed_provider_leaves_the_warmed_population
             a_capacity_refused_holder_is_recovered_by_a_later_call
+            a_holder_that_dies_after_convergence_is_reacquired
+            unknown_services_strand_no_sensing_capacity
+            overlapping_clones_converge_one_change_coherently
             live_evidence_stops_vouching_at_a_later_instant
             withdrawn_readiness_reads_unknown_and_plans_deterministically
             an_all_not_ready_population_still_calls_in_the_deterministic_order
             the_binding_owns_the_acquisition_and_the_last_owner_retires_it
             a_refused_mint_binds_inert_and_never_remints
-            a_pinned_but_dead_sensed_provider_is_selected_and_fails_at_transport
+            a_pinned_but_locally_dead_session_is_still_the_sensed_selection
             a_consumer_without_sensing_plans_the_deterministic_order
             the_sdk_sensed_adapter_adds_no_ordering_structure
           "
@@ -2156,8 +2159,8 @@ jobs:
               || { printf '%s\n' "$single"; echo "::error::$required did not run and pass as exactly one test"; exit 1; }
             pinned=$((pinned + 1))
           done
-          [ "$listed" -ge 14 ] \
-            || { echo "::error::expected at least 14 production witnesses, saw $listed"; exit 1; }
+          [ "$listed" -ge 17 ] \
+            || { echo "::error::expected at least 17 production witnesses, saw $listed"; exit 1; }
           echo "organization exact production call edge: $listed listed, $pinned pinned by name, all green"
 
       # The DARK-BOUNDARY fact for the production path: the SDK library builds
@@ -2175,9 +2178,9 @@ jobs:
           cargo nextest run --no-fail-fast --no-tests=fail --retries 0
           --features "net cortex fixtures" --lib
           -E 'test(=org::tests_call::authority_movement_inside_sensed_planning_is_still_fenced)
-            + test(=org::tests_call::the_sensed_adapter_never_ranks_a_granted_candidate)
+            + test(=org::tests_call::the_sensed_adapter_never_ranks_or_prunes_a_granted_candidate)
             + test(=org::tests_call::selection_and_its_errors_follow_the_reordered_list)
-            + test(=org::tests_call::the_reconciliation_trigger_fires_on_change_and_floors_a_retry)'
+            + test(=org::tests_call::the_reconciliation_trigger_certifies_the_installed_demand)'
 
       - name: Sensing — the production call path needs no fixtures seam (OA-6)
         if: ${{ !cancelled() }}

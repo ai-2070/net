@@ -283,9 +283,12 @@ fn provide_at(member: &Member, ready: bool, start: Duration) -> ReadinessRegistr
 fn bind(member: &Member) -> OrgClient {
     let entity = member.identity.entity_id().clone();
     let cert = OrgMembershipCert::try_issue(&org(), entity.clone(), 1, 3600).expect("membership");
-    let dispatcher =
-        OrgDispatcherGrant::try_issue(&org(), entity, DispatcherScope::Exact(capability()), 3600)
-            .expect("dispatcher grant");
+    // `Any` rather than `Exact`: a scheduler-grade dispatcher is a legitimate
+    // production credential, and it is what lets a call for an UNKNOWN service
+    // reach discovery and the sensed step instead of being refused a step
+    // earlier on scope - which is the path the capacity witness needs.
+    let dispatcher = OrgDispatcherGrant::try_issue(&org(), entity, DispatcherScope::Any, 3600)
+        .expect("dispatcher grant");
     let credentials = OrgCredentials::new(cert, dispatcher, vec![], vec![]).expect("credentials");
     member.mesh.org(credentials).expect("bind")
 }
@@ -916,6 +919,217 @@ async fn a_capacity_refused_holder_is_recovered_by_a_later_call() {
 }
 
 // ---------------------------------------------------------------------------
+// Bounds: unknown names strand nothing, and the record set is capped
+// ---------------------------------------------------------------------------
+
+/// Calls to services that resolve NOTHING must strand no sensing capacity and
+/// accumulate no reconciliation state — and a real service must still acquire
+/// afterwards, on the SAME binding.
+///
+/// This is the reviewer's public-call reproduction as a witness: an empty
+/// discovery is `Ok(vec![])`, so a capability with no authorized provider used
+/// to occupy one of core's per-family capability slots and one record apiece.
+/// Sixty-four unknown names later, the real service could no longer acquire on
+/// that binding at all, while a fresh binding on the same node could.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unknown_services_strand_no_sensing_capacity() {
+    let cell = Cell::stand_up(
+        "unknown",
+        true,
+        &[
+            (false, Duration::from_millis(1)),
+            (true, Duration::from_millis(1)),
+        ],
+    )
+    .await;
+
+    // A hundred distinct names that nothing serves. Every one is a local
+    // refusal - no RPC is admitted - and every one is planned through the
+    // production path, sensed step included.
+    for index in 0..100u32 {
+        let outcome: Result<Pong, _> = cell
+            .client
+            .call(&format!("absent.service.{index}"), &Ping { n: 1 })
+            .await;
+        assert!(
+            matches!(
+                outcome,
+                Err(net_sdk::org::OrgSdkError::Discovery(
+                    net_sdk::org::OrgDiscoveryError::NoAuthorizedProvider { .. }
+                ))
+            ),
+            "an unknown service is a local refusal: {outcome:?}"
+        );
+    }
+    assert!(
+        cell.client.sensing_capabilities().is_empty(),
+        "an unknown service acquires nothing, so it retains no demand: {:?}",
+        cell.client.sensing_capabilities()
+    );
+    assert_eq!(
+        cell.client.sensing_records(),
+        Some(0),
+        "and it leaves no reconciliation record behind either"
+    );
+    assert!(
+        cell.consumer.node.sensing_table_is_empty(),
+        "nor any interest row on the node"
+    );
+
+    // The REAL service, on that same binding, still acquires - the capacity
+    // was never spent.
+    let _armed = cell.call().await;
+    let (population, retained, _) = demand_state(&cell.client).expect("demand");
+    let mut two = vec![cell.id(0), cell.id(1)];
+    two.sort_unstable();
+    assert_eq!(
+        population, two,
+        "the real capability retains both providers"
+    );
+    assert_eq!(retained, two, "with a holder each");
+    assert_eq!(cell.client.sensing_capabilities(), vec![capability()]);
+    assert_eq!(cell.client.sensing_records(), Some(1));
+
+    // And it orders: the sensed provider wins, on the binding that just made a
+    // hundred failed calls.
+    cell.await_projection(&[cell.id(1)], &[cell.id(0)]).await;
+    let before = cell.served(1);
+    assert_eq!(cell.call().await, cell.names[1]);
+    assert_eq!(cell.served(1) - before, 1);
+    cell.cleanup();
+}
+
+// ---------------------------------------------------------------------------
+// Ownership that dies AFTER a successful convergence
+// ---------------------------------------------------------------------------
+
+/// A holder invalidated after a COMPLETE convergence is recovered, with the
+/// sensing authority still current and the population unchanged.
+///
+/// A recorded ticket list is history: an installation can stop being the
+/// holder after the fact. Nothing in the provider list or the authority stamp
+/// shows that, so the reuse decision asks core the same liveness question its
+/// own convergence asks before carrying a ticket. Here the holder is destroyed
+/// by RELEASING the ticket out from under the demand — a real release through
+/// the shipped node verb, which is exactly the state a refused restoration
+/// leaves behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_holder_that_dies_after_convergence_is_reacquired() {
+    let cell = Cell::stand_up(
+        "ownership",
+        true,
+        &[
+            (true, Duration::from_millis(1)),
+            (true, Duration::from_millis(1)),
+        ],
+    )
+    .await;
+    let _armed = cell.call().await;
+    let mut two = vec![cell.id(0), cell.id(1)];
+    two.sort_unstable();
+    let (population, retained, first_identity) = demand_state(&cell.client).expect("demand");
+    assert_eq!(population, two, "precondition: a COMPLETE convergence");
+    assert_eq!(retained, two);
+
+    // Kill one holder's ownership: release the very tickets the demand holds.
+    // The demand's recorded provider list is unchanged by this - that is the
+    // whole point - and no authority moves.
+    let killed = cell
+        .client
+        .sensing_release_holders_for_test(&capability())
+        .expect("the demand's own holders");
+    assert!(killed > 0, "a holder was actually released");
+    assert!(
+        cell.client.sensing_holders_are_live(&capability()) == Some(false),
+        "core reports the demand's ownership as no longer live"
+    );
+    let (_, still_recorded, _) = demand_state(&cell.client).expect("demand");
+    assert_eq!(
+        still_recorded, two,
+        "and the RECORDED list still names both providers: history, not ownership"
+    );
+
+    // A later call must reacquire rather than trust the record.
+    cell.call_until(
+        "a later call never recovered ownership that died after convergence",
+        Duration::from_secs(30),
+        || {
+            cell.client.sensing_holders_are_live(&capability()) == Some(true)
+                && demand_state(&cell.client)
+                    .map(|(population, retained, identity)| {
+                        population == two && retained == two && identity != first_identity
+                    })
+                    .unwrap_or(false)
+        },
+    )
+    .await;
+    cell.cleanup();
+}
+
+/// Two clones of one binding, calling concurrently, converge one change ONCE
+/// and agree about what is installed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn overlapping_clones_converge_one_change_coherently() {
+    let cell = Cell::stand_up(
+        "clones",
+        true,
+        &[
+            (true, Duration::from_millis(1)),
+            (true, Duration::from_millis(1)),
+        ],
+    )
+    .await;
+
+    // Eight concurrent first calls across four clones: nothing has converged
+    // yet, so every one of them would decide to converge without a section
+    // around the decision.
+    let clones: Vec<OrgClient> = (0..4).map(|_| cell.client.clone()).collect();
+    let mut tasks = Vec::new();
+    for clone in &clones {
+        for _ in 0..2 {
+            let clone = clone.clone();
+            tasks.push(tokio::spawn(async move {
+                clone
+                    .call::<Ping, Pong>(SERVICE, &Ping { n: 1 })
+                    .await
+                    .map(|reply| reply.served_by)
+            }));
+        }
+    }
+    for task in tasks {
+        task.await.expect("join").expect("admitted");
+    }
+
+    let mut two = vec![cell.id(0), cell.id(1)];
+    two.sort_unstable();
+    let (population, retained, identity) = demand_state(&cell.client).expect("demand");
+    assert_eq!(population, two, "one coherent population");
+    assert_eq!(retained, two, "with one holder each - no duplicate tickets");
+    assert_eq!(
+        cell.client.sensing_records(),
+        Some(1),
+        "one record, for one capability"
+    );
+    for clone in &clones {
+        let (clone_population, clone_retained, clone_identity) =
+            demand_state(clone).expect("demand");
+        assert_eq!(clone_population, population);
+        assert_eq!(clone_retained, retained);
+        assert_eq!(
+            clone_identity, identity,
+            "every clone reads the SAME installed demand"
+        );
+    }
+    // The node itself holds exactly the interests that demand describes.
+    assert_eq!(
+        cell.consumer.node.sensing_interest_count(),
+        2,
+        "no duplicate interest rows from the concurrent convergences"
+    );
+    cell.cleanup();
+}
+
+// ---------------------------------------------------------------------------
 // Aging, and withdrawal
 // ---------------------------------------------------------------------------
 
@@ -1221,22 +1435,24 @@ async fn a_refused_mint_binds_inert_and_never_remints() {
 // Direct-session attribution: what `direct` actually means today
 // ---------------------------------------------------------------------------
 
-/// `direct` is an IDENTITY PIN, not a live session — a predicate that predates
-/// this slice (`peer_entity_id` reads the pin map, and peer eviction removes
-/// session state without removing the pin). This witness ESTABLISHES the
-/// resulting behaviour rather than asserting a wish: a sensed order that
-/// prefers a provider whose process is gone, while its evidence is still
-/// fresh, selects that provider, and the call fails at TRANSPORT with no
-/// silent fallback to the live one.
+/// `direct` is an IDENTITY PIN, not a live session — and this establishes what
+/// that costs, on the CONSUMER's own local state.
 ///
-/// Nothing is manufactured: the pin was established by a real handshake and
-/// the session died because the provider really stopped. The behaviour is
-/// inherited, it is the same for the unsensed order (which also selects the
-/// first PINNED candidate), and correcting it would require a live-session
-/// predicate in transport, which this slice is not authorized to add. Recorded
-/// here so the attribution is explicit instead of implied.
+/// The predicate predates this slice: `peer_entity_id` reads the pin map, and
+/// a session can stop being usable without the pin going away. Rather than
+/// inferring that from a stopped remote process, this witness names the local
+/// state exactly: the consumer's own session to the sensed leader is
+/// DEACTIVATED while the pin remains, the provider process stays up, and the
+/// sensed evidence still ranks that provider first. Then it asserts what
+/// actually happens.
+///
+/// The outcome is recorded, not wished for: selection follows the pin, the
+/// call is planned for that provider, and the specific result is asserted. No
+/// fallback, retry or liveness predicate is introduced — correcting the
+/// predicate would be transport policy, which this slice is not authorized to
+/// change, and the same predicate governs the unsensed order.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_pinned_but_dead_sensed_provider_is_selected_and_fails_at_transport() {
+async fn a_pinned_but_locally_dead_session_is_still_the_sensed_selection() {
     let cell = Cell::stand_up(
         "dead",
         true,
@@ -1249,59 +1465,85 @@ async fn a_pinned_but_dead_sensed_provider_is_selected_and_fails_at_transport() 
     let _armed = cell.call().await;
     cell.await_projection(&[cell.id(1)], &[cell.id(0)]).await;
 
-    // The sensed leader's process goes away. Its pin remains, and its last
-    // Ready attestation is still inside its window.
-    net::adapter::Adapter::shutdown(cell.providers[1].node.as_ref())
-        .await
-        .expect("stop the sensed provider");
+    // THE LOCAL STATE, named: the consumer's session to the sensed leader is
+    // deactivated. The pin survives, and the provider is still running and
+    // still serving - so nothing about the REMOTE side explains the result.
+    let session = cell
+        .consumer
+        .node
+        .peer_session_for_test(cell.id(1))
+        .expect("the consumer has a session to the sensed leader");
+    assert!(session.is_active(), "precondition: it starts live");
+    session.deactivate();
+    assert!(
+        !session.is_active(),
+        "the consumer's own session to that provider is no longer live"
+    );
     assert!(
         cell.consumer.node.peer_entity_id(cell.id(1)).is_some(),
-        "the identity pin outlives the session - this is the inherited predicate"
+        "while the identity PIN survives - the inherited predicate"
+    );
+    assert!(
+        cell.consumer
+            .node
+            .peer_session_for_test(cell.id(0))
+            .is_some_and(|live| live.is_active()),
+        "and the other provider's session is still live, so a fallback WOULD \
+         have somewhere to go"
     );
 
+    // The intended reordered precondition still holds at selection time.
+    let projection = cell
+        .client
+        .sensing_projection(
+            &capability(),
+            Instant::now(),
+            &ConsumerLatencyBudget::default(),
+        )
+        .expect("demand");
+    assert_eq!(
+        projection.viable(),
+        [cell.id(1)],
+        "the sensed order still prefers the provider whose session is dead"
+    );
+
+    // THE OUTCOME. Bounded by a deadline so the witness cannot hang; the
+    // budget it implies is far above every estimate here.
     let before = (cell.served(0), cell.served(1));
-    // Bounded observation: a send to a dead peer has nothing to answer it, so
-    // the deadline is how this witness stays a witness instead of a hang. The
-    // budget it implies (1.5 s) is far above every estimate here, so it does
-    // not change the order under test.
     let body = serde_json::to_vec(&Ping { n: 1 }).expect("encode");
     let outcome = cell
         .client
         .call_bytes_deadline(SERVICE, bytes::Bytes::from(body), 1500, 0)
-        .await
-        .and_then(|reply| {
-            serde_json::from_slice::<Pong>(&reply).map_err(|e| {
-                net_sdk::org::OrgSdkError::Rpc(net_sdk::mesh_rpc::RpcError::Codec {
-                    direction: net_sdk::mesh_rpc::CodecDirection::Decode,
-                    message: format!("{e}"),
-                })
-            })
-        });
-    match outcome {
-        Err(net_sdk::org::OrgSdkError::Rpc(_)) => {
-            // Established behaviour: selection followed the pin, the send had
-            // nowhere to go, and the SDK does not retry or re-select.
-            assert_eq!(
-                cell.served(0) - before.0,
-                0,
-                "and no silent fallback to the live provider happened"
-            );
-        }
-        Ok(reply) => {
-            // If the transport did complete, it must have been the SELECTED
-            // provider - never a silent substitution.
-            assert_eq!(
-                reply.served_by, cell.names[1],
-                "a reply may only come from the selected provider"
-            );
-        }
-        Err(other) => panic!("unexpected local refusal: {other:?}"),
-    }
+        .await;
     assert_eq!(
-        cell.served(1) - before.1,
+        cell.served(0) - before.0,
         0,
-        "the stopped provider served nothing"
+        "there is no silent fallback: the live provider was never called"
     );
+    match outcome {
+        Ok(reply) => {
+            // The session was re-established underneath: the reply may then
+            // only come from the SELECTED provider, never a substitution.
+            let pong: Pong = serde_json::from_slice(&reply).expect("decode");
+            assert_eq!(
+                pong.served_by, cell.names[1],
+                "a reply may only come from the provider selection chose"
+            );
+            assert_eq!(cell.served(1) - before.1, 1);
+        }
+        Err(net_sdk::org::OrgSdkError::Rpc(_)) => {
+            // Or the send had nowhere to go, and the SDK reports transport
+            // rather than re-selecting.
+            assert_eq!(
+                cell.served(1) - before.1,
+                0,
+                "and nothing was served by anyone"
+            );
+        }
+        Err(other) => {
+            panic!("a dead local session must not become a LOCAL authority refusal: {other:?}")
+        }
+    }
     cell.cleanup();
 }
 
