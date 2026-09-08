@@ -303,16 +303,50 @@ live installation cannot postpone its renewal. An authority the node
 cannot author this audience under makes a refresh refuse rather than
 downgrade.
 
+The first deadline is grounded in the row's FRESHNESS, not in when the
+arm happened. An acquisition that coalesces onto an installation
+somebody else established (the public acquisition API arms nothing)
+re-registers neither table nor wire, so its age is unknown: unless
+something is already renewing it, adopting it renews it at once and the
+cadence starts from that renewal. Arming at join time would otherwise
+put the first renewal after the row's own expiry whenever the row was
+already older than a period.
+
+**Schedule contract.** The refresh period is `max(ttl/2, 1 ms)`. The
+floor is not a tuning choice: `sensing_interest_ttl` accepts any
+positive `Duration`, and an unfloored `ttl/2` on a nanosecond horizon
+makes the armed deadline elapse before the arm returns, so the worker's
+due-set is continuously due and its loop never parks — on a
+single-threaded executor that starves every other task on the runtime.
+A horizon below 2 ms therefore cannot be renewed ahead of its own
+expiry, and the floor says so instead of pretending otherwise; the
+worker also yields cooperatively after every effect, so due work can
+never monopolize an executor.
+
 Retirement is per-holder and honest about shared state: a lease key is
 node-global, so retiring one owner RELEASES its holder and then settles
 the refresh record only if that release actually retired the
 installation — a surviving holder keeps its row and its renewal. A
 release the transaction refuses leaves a holder that is still live and
 still this node's, so the ticket is retained on the node and retried on
-the worker's cadence instead of being dropped. Node shutdown closes and
-joins the refresh schedule — it does NOT release family-held tickets;
-those belong to the family's owners, and the whole lease registry goes
-away with the node.
+the worker's cadence instead of being dropped; a retry that fails puts
+it back unconditionally, and a retained entry whose installation has
+since been invalidated is reclaimed rather than counted against the
+retention bound.
+
+Ownership is also VALIDATED, not assumed. Production invalidates whole
+installations (a refused tightening whose surviving-holder restoration
+current authority will not author), which kills every holder of that
+key. A convergence therefore re-checks each carried ticket against the
+live installation identity and re-acquires when it is gone, rather than
+reporting a provider as retained with nothing behind it.
+
+**Terminal lifecycle.** Node shutdown closes and joins the refresh
+schedule and drops any retained refused releases with it. It does NOT
+release family-held tickets: those belong to the family's owners, and
+shutdown is terminal — the lease registry is not a supported surface on
+a stopped node and goes away with it. A holder observable in the
+registry after shutdown is that retained state, not a live-node leak.
 
 What is still genuinely absent: no query, watch, or snapshot surface, no
 readiness projection and no ranking. There are also no public

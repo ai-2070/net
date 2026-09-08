@@ -745,6 +745,12 @@ jobs:
           # retirement, refused-release ownership, node binding, transactional
           # convergence, discovery provenance, stale/postponed re-arm, the
           # in-transaction no-mutation baseline, and cancellation-safe teardown.
+          #
+          # SECOND-review outcomes, likewise: carried-ownership validation,
+          # stale-vs-live retention capacity, capacity-exempt reinstatement,
+          # aged-installation adoption, executor fairness under a
+          # continuously-due schedule, and a nonempty verified discovery
+          # population.
           REQUIRED="only_the_last_family_owner_retires_retained_demand
           a_nonfinal_family_retirement_keeps_the_shared_installation_refreshing
           a_refused_retirement_release_keeps_the_holder_and_recovers_it
@@ -755,14 +761,20 @@ jobs:
           a_retention_without_live_authority_retains_nothing
           the_family_capability_bound_refuses_and_evicts_nothing
           a_population_derived_under_a_moved_view_is_re_derived
+          a_verified_discovery_population_retains_and_follows_floor_movement
+          an_invalidated_installation_is_reacquired_not_carried_forward
+          a_stale_retained_release_cannot_hold_capacity_against_a_live_one
+          a_failed_retry_reinstates_its_ticket_even_at_capacity
           a_refresh_renews_without_acquiring_a_holder
           a_rival_acquisition_inside_a_refresh_window_is_not_a_violation
           a_refresh_never_resurrects_retired_or_superseded_demand
           a_stale_rearm_cannot_displace_its_successor
           a_joining_holder_cannot_postpone_a_live_renewal
+          adopting_an_unarmed_installation_renews_it_at_once
           an_authority_rotation_renews_and_a_foreign_owner_refuses
           the_single_worker_refreshes_every_retained_installation
           an_earlier_arm_shortens_a_live_park
+          a_nanosecond_horizon_cannot_starve_the_runtime
           a_cancelled_refresh_close_leaves_a_recoverable_worker"
           required_n=$(printf '%s\n' $REQUIRED | grep -c .)
           if [ "$n" -lt "$required_n" ]; then

@@ -75,7 +75,7 @@ pub(crate) const MAX_LEASED_INTERESTS: usize = 256;
 /// wrappers may share one identity" — and, as there, a DUPLICATE acquisition by
 /// an existing holder spends budget rather than bypassing it, because each
 /// acquisition mints its own token.
-const MAX_HOLDERS_PER_INTEREST: usize = 64;
+pub(crate) const MAX_HOLDERS_PER_INTEREST: usize = 64;
 
 /// The reserved end of the holder-token identity space.
 ///
