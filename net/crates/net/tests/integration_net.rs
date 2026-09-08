@@ -143,20 +143,39 @@ async fn test_net_handshake_survives_queued_foreign_handshakes() {
     let (initiator_config, responder_config) = create_config_pair(port1, port2);
     let responder_addr: SocketAddr = format!("127.0.0.1:{}", port2).parse().unwrap();
 
+    let responder = net::adapter::net::NetAdapter::new(responder_config).unwrap();
+    // Take the counters BEFORE the adapter moves into the task that
+    // runs the handshake: they are what makes this witness real.
+    let counters = responder.responder_handshake_counters();
     let responder_handle = tokio::spawn(async move {
-        let mut adapter = net::adapter::net::NetAdapter::new(responder_config).unwrap();
+        let mut adapter = responder;
         adapter.init().await
     });
 
-    // Let the responder bind and reach its recv loop, then queue the
-    // foreign handshakes AHEAD of any real `msg1`.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Spray until the responder's OWN counters say it read them.
+    //
+    // A fixed sleep would not do. `send_to` to a port nothing has bound
+    // yet is silently discarded, so on a slow or saturated runner — the
+    // environment this whole file exists for — the junk would vanish,
+    // the drain path would never run, and the test would pass while
+    // proving nothing. Resending until the responder accounts for
+    // `FOREIGN_HANDSHAKES` of them makes delivery an observation rather
+    // than an assumption.
     let sprayer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let junk = foreign_handshake_packet();
-    for _ in 0..FOREIGN_HANDSHAKES {
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while counters.drained() < FOREIGN_HANDSHAKES as u64 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the responder accounted for only {} of {} foreign handshakes (paced={}) — \
+             either they were never delivered, or it stopped reading",
+            counters.drained(),
+            FOREIGN_HANDSHAKES,
+            counters.paced(),
+        );
         sprayer.send_to(&junk, responder_addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    tokio::time::sleep(Duration::from_millis(100)).await;
 
     let initiator_handle = tokio::spawn(async move {
         let mut adapter = net::adapter::net::NetAdapter::new(initiator_config).unwrap();
@@ -176,6 +195,11 @@ async fn test_net_handshake_survives_queued_foreign_handshakes() {
     initiator_result
         .expect("initiator task panicked")
         .expect("initiator init failed");
+
+    assert!(
+        counters.drained() >= FOREIGN_HANDSHAKES as u64,
+        "the drain path must be what carried this test, not luck",
+    );
 }
 
 #[tokio::test]

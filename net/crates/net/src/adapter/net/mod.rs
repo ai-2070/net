@@ -211,7 +211,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use crossbeam_queue::SegQueue;
 use dashmap::DashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::Notify;
@@ -682,6 +682,53 @@ impl HandshakePacer {
     }
 }
 
+/// Live counters for the handshake responder's drain path.
+///
+/// Cloneable handles, not a snapshot: the handshake runs inside
+/// [`NetAdapter::init`], which takes `&mut self`, so anything that wants
+/// to observe the drain has usually handed the adapter to the task
+/// driving it and needs a view that outlives that move. Obtain one from
+/// [`NetAdapter::responder_handshake_counters`] before starting.
+///
+/// The mesh transport exposes the same two numbers as
+/// `MeshNode::responder_handshakes_drained` /
+/// `responder_handshakes_paced`.
+#[derive(Clone, Debug, Default)]
+pub struct ResponderHandshakeCounters {
+    drained: Arc<AtomicU64>,
+    paced: Arc<AtomicU64>,
+}
+
+impl ResponderHandshakeCounters {
+    /// Handshake datagrams the responder read and discarded because
+    /// they did not decrypt under this pairing — another pairing's
+    /// retransmitted `msg1`, junk from a sprayer, or a genuine key
+    /// mismatch.
+    ///
+    /// Nonzero is normal on a busy socket: an initiator retransmits by
+    /// design, and a responder answers only the first copy it reads.
+    pub fn drained(&self) -> u64 {
+        self.drained.load(Ordering::Relaxed)
+    }
+
+    /// Handshake datagrams dropped before any Noise work because the
+    /// pacer refused them.
+    ///
+    /// Nonzero means something is emitting handshakes faster than any
+    /// legitimate initiator does — the signature of a flood.
+    pub fn paced(&self) -> u64 {
+        self.paced.load(Ordering::Relaxed)
+    }
+
+    fn record_drained(&self) {
+        self.drained.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_paced(&self) {
+        self.paced.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Net adapter for high-performance UDP transport.
 pub struct NetAdapter {
     /// Configuration
@@ -707,6 +754,11 @@ pub struct NetAdapter {
     /// datagrams to monopolize the recv path or race a legitimate
     /// initiator's msg1.
     handshake_pacer: parking_lot::Mutex<HandshakePacer>,
+    /// What the responder's drain path threw away, and what the pacer
+    /// refused. Surfaced by
+    /// [`Self::responder_handshake_counters`] so the drain is
+    /// observable rather than inferred from a missing failure.
+    responder_handshakes: ResponderHandshakeCounters,
 }
 
 impl NetAdapter {
@@ -727,7 +779,17 @@ impl NetAdapter {
             shutdown_notify: Arc::new(Notify::new()),
             initialized: AtomicBool::new(false),
             handshake_pacer: parking_lot::Mutex::new(HandshakePacer::with_defaults()),
+            responder_handshakes: ResponderHandshakeCounters::default(),
         })
+    }
+
+    /// Live handles to the responder's drain counters — see
+    /// [`ResponderHandshakeCounters`].
+    ///
+    /// Take one before handing the adapter to the task that will call
+    /// [`Self::init`]; the handles keep working after the move.
+    pub fn responder_handshake_counters(&self) -> ResponderHandshakeCounters {
+        self.responder_handshakes.clone()
     }
 
     /// Perform Noise handshake with peer.
@@ -994,6 +1056,7 @@ impl NetAdapter {
                 // Pace BEFORE the Noise read, so a rejected source
                 // cannot buy a Diffie-Hellman.
                 if !self.handshake_pacer.lock().check_and_record(source) {
+                    self.responder_handshakes.record_paced();
                     *last_paced_source = Some(source);
                     tracing::debug!(
                         %source,
@@ -1004,6 +1067,7 @@ impl NetAdapter {
                 }
 
                 if let Err(e) = handshake.read_message(&p.payload) {
+                    self.responder_handshakes.record_drained();
                     *last_decrypt_reject = Some(format!("{source}: {e}"));
                     tracing::debug!(
                         %source,
