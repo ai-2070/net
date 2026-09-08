@@ -2875,16 +2875,20 @@ mod tests {
                 .saturating_duration_since(successor.armed_at),
             successor.deadline.saturating_duration_since(established_at)
         );
-        let sampled_seq = node
-            .sensing_refresh_arm_for_test(&key)
-            .expect("the row stays armed")
-            .1;
-        assert!(
-            sampled_seq > first.seq,
-            "precondition: a post-hoc sample never names the adoption record \
-             again - seq {sampled_seq} against the decision's {}",
-            first.seq
-        );
+        // A live sample of the map is corroboration only, never the evidence:
+        // it may be taken during a later tick's own dequeue-to-re-arm interval,
+        // when no record exists at all. When one IS there it can only be a
+        // record at or after the successor, never the adoption again.
+        if let Some((_, sampled_seq)) = node.sensing_refresh_arm_for_test(&key) {
+            assert!(
+                sampled_seq >= successor.seq,
+                "a sample of the schedule never names the adoption record again \
+                 - seq {sampled_seq} against the successor's {} and the \
+                 decision's {}",
+                successor.seq,
+                first.seq
+            );
+        }
 
         // And the DECISION is still exactly one due-now adoption.
         assert_eq!(first.provenance, SensingArmProvenance::Adopted, "{first:?}");
