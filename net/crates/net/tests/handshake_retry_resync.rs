@@ -45,9 +45,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use net::adapter::net::behavior::capability::CapabilitySet;
-use net::adapter::net::{
-    EntityKeypair, MeshNode, MeshNodeConfig, NetHeader, SocketBufferConfig,
-};
+use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, NetHeader, SocketBufferConfig};
 
 const PSK: [u8; 32] = [0x42u8; 32];
 const TEST_BUFFER_SIZE: usize = 256 * 1024;
@@ -67,9 +65,9 @@ fn attempt_opens_at(n: u32) -> Duration {
     windows + sleeps
 }
 
-fn test_config() -> MeshNodeConfig {
+fn config_with_psk(psk: [u8; 32]) -> MeshNodeConfig {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let mut cfg = MeshNodeConfig::new(addr, PSK)
+    let mut cfg = MeshNodeConfig::new(addr, psk)
         .with_heartbeat_interval(Duration::from_millis(200))
         .with_session_timeout(Duration::from_secs(5))
         .with_handshake(RETRIES, WINDOW);
@@ -80,9 +78,17 @@ fn test_config() -> MeshNodeConfig {
     cfg
 }
 
+fn test_config() -> MeshNodeConfig {
+    config_with_psk(PSK)
+}
+
 async fn build_node(seed: [u8; 32]) -> Arc<MeshNode> {
+    build_node_with_config(seed, test_config()).await
+}
+
+async fn build_node_with_config(seed: [u8; 32], cfg: MeshNodeConfig) -> Arc<MeshNode> {
     Arc::new(
-        MeshNode::new(EntityKeypair::from_bytes(seed), test_config())
+        MeshNode::new(EntityKeypair::from_bytes(seed), cfg)
             .await
             .expect("MeshNode::new"),
     )
@@ -213,6 +219,38 @@ async fn an_absent_responder_still_fails_inside_the_budget() {
     );
 }
 
+/// Mirrors `MeshNode::RESPONDER_HANDSHAKE_BURST` — the per-source
+/// handshake budget the responder paces to. Private in the crate, so
+/// the tests pin it here: if it moves, these witnesses say so.
+const RESPONDER_BURST: usize = 5;
+
+/// Build a well-formed handshake packet whose body cannot decrypt —
+/// exactly what another pairing's `msg1` looks like to this
+/// responder (handshake flag set, NKpsk0-sized body, wrong prologue).
+fn foreign_handshake_packet() -> Vec<u8> {
+    let mut packet = NetHeader::handshake(48).to_bytes().to_vec();
+    packet.extend_from_slice(&[0x5a; 48]);
+    packet
+}
+
+/// Spray `count` foreign handshakes at `target` from one source and
+/// return once they are all queued on its socket. `send_to`
+/// completing means the datagram is already in the receiver's queue,
+/// so everything sprayed here is ordered ahead of whatever the test
+/// sends afterwards.
+async fn spray_foreign_handshakes(target: &Arc<MeshNode>, count: usize) {
+    let sprayer = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind sprayer");
+    let packet = foreign_handshake_packet();
+    for _ in 0..count {
+        sprayer
+            .send_to(&packet, target.local_addr())
+            .await
+            .expect("spray a foreign handshake");
+    }
+}
+
 /// Handshake datagrams that belong to a DIFFERENT pairing must not
 /// consume the responder's attempt budget.
 ///
@@ -227,35 +265,113 @@ async fn an_absent_responder_still_fails_inside_the_budget() {
 /// with no responder, and the initiator reported `handshake timeout`
 /// after its full budget. Observed in CI as a topology-setup flake.
 ///
-/// Sprayed junk stands in for the stale copies: it is a well-formed
-/// handshake packet that fails Noise, which is exactly what a foreign
-/// `msg1` is from this responder's point of view — and one datagram
-/// more than `RETRIES`, so a budget-consuming responder cannot
-/// survive it.
+/// The drain counter — not just a successful connect — is the
+/// assertion: it proves the responder actually read and discarded
+/// every sprayed copy, so the test cannot pass vacuously by the junk
+/// never reaching the responder's recv loop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn foreign_handshakes_do_not_consume_the_responder_budget() {
     let a = build_node([0x77; 32]).await;
     let b = build_node([0x88; 32]).await;
 
-    // `send_to` completing means the datagram is queued on B's
-    // socket, so every junk copy is ordered ahead of A's msg1.
-    let sprayer = tokio::net::UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("bind sprayer");
-    // Same shape as a real msg1 packet — handshake header plus a
-    // NKpsk0-sized body — with a body that cannot decrypt.
-    let mut junk = NetHeader::handshake(48).to_bytes().to_vec();
-    junk.extend_from_slice(&[0x5a; 48]);
-    for _ in 0..=RETRIES {
-        sprayer
-            .send_to(&junk, b.local_addr())
-            .await
-            .expect("spray a foreign handshake");
-    }
+    // One more copy than `RETRIES`, so a budget-consuming responder
+    // cannot survive it; still inside the per-source pacing budget,
+    // so every copy reaches `read_message`.
+    let sprayed = RETRIES + 1;
+    assert!(
+        sprayed <= RESPONDER_BURST,
+        "the drain path, not the pacer, must be what handles these",
+    );
+    spray_foreign_handshakes(&b, sprayed).await;
 
     connect_with_late_accept(&a, &b, Duration::ZERO)
         .await
         .expect("queued foreign handshakes must be drained, not counted");
 
+    assert_eq!(
+        b.responder_handshakes_drained(),
+        sprayed as u64,
+        "the responder must have read and discarded every sprayed copy",
+    );
+    assert_eq!(
+        b.responder_handshakes_paced(),
+        0,
+        "nothing was over budget — the pacer must not have been involved",
+    );
+
     assert_session_is_real(&a, &b).await;
+}
+
+/// Draining is bounded work: a source that keeps spraying pays for at
+/// most `RESPONDER_BURST` Noise setups per window, and the legitimate
+/// initiator still connects.
+///
+/// Without pacing, "skip and keep waiting" would hand an off-path
+/// sprayer a full ephemeral-keypair generation per datagram for the
+/// whole deadline — trading the old kill-the-accept bug for a
+/// starve-the-accept one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_one_source_handshake_flood_is_paced_and_does_not_starve_the_initiator() {
+    let a = build_node([0x99; 32]).await;
+    let b = build_node([0xaa; 32]).await;
+
+    let flood = RESPONDER_BURST * 4;
+    spray_foreign_handshakes(&b, flood).await;
+
+    connect_with_late_accept(&a, &b, Duration::ZERO)
+        .await
+        .expect("a paced flood must not stop a legitimate initiator");
+
+    assert_eq!(
+        b.responder_handshakes_drained(),
+        RESPONDER_BURST as u64,
+        "only the in-budget prefix may buy Noise work",
+    );
+    assert_eq!(
+        b.responder_handshakes_paced(),
+        (flood - RESPONDER_BURST) as u64,
+        "every over-budget datagram must be dropped before Noise setup",
+    );
+
+    assert_session_is_real(&a, &b).await;
+}
+
+/// Draining must not swallow the diagnosis. A real initiator with the
+/// wrong PSK is indistinguishable from a stale foreign `msg1` at this
+/// layer, so it is drained too — but the responder's error names the
+/// decrypt failure instead of reporting a bare timeout, which is the
+/// only signal an operator has that the key exchange itself failed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wrong_psk_initiator_is_reported_as_a_decrypt_failure_not_a_bare_timeout() {
+    let responder = build_node([0xbb; 32]).await;
+    let stranger = build_node_with_config([0xcc; 32], config_with_psk([0x11u8; 32])).await;
+
+    let r = responder.clone();
+    let stranger_id = stranger.node_id();
+    let accept = tokio::spawn(async move { r.accept(stranger_id).await });
+
+    // Fails on both sides by construction: the responder cannot read
+    // a msg1 keyed with a different PSK, so it never answers.
+    let _ = stranger
+        .connect(
+            responder.local_addr(),
+            responder.public_key(),
+            responder.node_id(),
+        )
+        .await
+        .expect_err("a PSK mismatch cannot produce a session");
+
+    let err = accept
+        .await
+        .expect("accept task panicked")
+        .expect_err("the responder cannot complete a mismatched handshake");
+    let text = format!("{err:?}");
+    assert!(
+        text.contains("did not decrypt"),
+        "the failure must name the decrypt failure, got {text}",
+    );
+    assert!(
+        responder.responder_handshakes_drained() > 0,
+        "the mismatched msg1 must have been read and drained",
+    );
 }

@@ -8713,6 +8713,18 @@ pub struct MeshNode {
     /// direct handshake response arrives. See the matching field
     /// on `DispatchCtx` for context.
     pending_direct_initiators: Arc<DashMap<SocketAddr, oneshot::Sender<Bytes>>>,
+    /// Handshake datagrams the direct responder read and threw away
+    /// because they did not decrypt under the pairing being accepted
+    /// — another pairing's retransmitted `msg1`, junk, a key
+    /// mismatch. Surfaced by
+    /// [`MeshNode::responder_handshakes_drained`] so the drain is
+    /// observable rather than inferred from a missing failure.
+    responder_handshakes_drained: Arc<AtomicU64>,
+    /// Handshake datagrams the direct responder dropped BEFORE any
+    /// Noise work because their source had exhausted the per-source
+    /// pacing budget. Surfaced by
+    /// [`MeshNode::responder_handshakes_paced`].
+    responder_handshakes_paced: Arc<AtomicU64>,
     /// Proximity graph — topology awareness from pingwave propagation
     proximity_graph: Arc<ProximityGraph>,
     /// Per-peer serialization of the whole install transition —
@@ -10431,6 +10443,8 @@ impl MeshNode {
             emission_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             pending_handshakes,
             pending_direct_initiators,
+            responder_handshakes_drained: Arc::new(AtomicU64::new(0)),
+            responder_handshakes_paced: Arc::new(AtomicU64::new(0)),
             proximity_graph,
             peer_transitions: PeerTransitions::new(),
             reroute_policy,
@@ -15568,6 +15582,28 @@ impl MeshNode {
     /// Get the reroute policy (for checking reroute stats in tests).
     pub fn reroute_policy(&self) -> &Arc<ReroutePolicy> {
         &self.reroute_policy
+    }
+
+    /// Handshake datagrams [`Self::accept`]'s responder read and
+    /// discarded because they did not decrypt under the pairing it
+    /// was accepting — another pairing's retransmitted `msg1`, junk
+    /// from a sprayer, or a genuine key mismatch.
+    ///
+    /// Nonzero is normal on a busy node: the initiator retransmits by
+    /// design and `accept()` is one-shot, so late copies land on the
+    /// next accept.
+    pub fn responder_handshakes_drained(&self) -> u64 {
+        self.responder_handshakes_drained.load(Ordering::Relaxed)
+    }
+
+    /// Handshake datagrams [`Self::accept`]'s responder dropped
+    /// before doing any Noise work because their source had spent its
+    /// per-source budget (5 per second, per accept).
+    ///
+    /// Nonzero means something is emitting handshakes faster than any
+    /// legitimate initiator does — the signature of a flood.
+    pub fn responder_handshakes_paced(&self) -> u64 {
+        self.responder_handshakes_paced.load(Ordering::Relaxed)
     }
 
     /// Number of connected peers.
@@ -33901,14 +33937,38 @@ impl MeshNode {
         }
     }
 
+    /// Handshake datagrams one source may buy Noise work with per
+    /// [`Self::RESPONDER_HANDSHAKE_PACE_WINDOW`] during a single
+    /// `accept()`. A legitimate initiator sends at most
+    /// `handshake_retries` retransmits spread across its per-attempt
+    /// windows, so this is pure headroom for it; a flooder is capped
+    /// at five ephemeral keypairs per second. Same shape as
+    /// `NetAdapter`'s responder pacing.
+    const RESPONDER_HANDSHAKE_BURST: u32 = 5;
+    /// Window for [`Self::RESPONDER_HANDSHAKE_BURST`].
+    const RESPONDER_HANDSHAKE_PACE_WINDOW: Duration = Duration::from_secs(1);
+
     async fn handshake_responder(
         &self,
         peer_node_id: u64,
     ) -> Result<(SessionKeys, SocketAddr), AdapterError> {
+        // One pacer for the whole `accept()`, not one per attempt: a
+        // flooder that burns its budget during attempt 1 stays capped
+        // through the retries, and the state dies with this call so
+        // nothing carries over between accepts. Budget mirrors
+        // `NetAdapter`'s responder — 5 per second per source is far
+        // above any legitimate initiator (`handshake_retries`
+        // retransmits spread over `handshake_timeout` windows) and
+        // low enough that a flooder pays for at most 5 Noise setups
+        // per second per source.
+        let mut pacer = super::HandshakePacer::new(
+            Self::RESPONDER_HANDSHAKE_BURST,
+            Self::RESPONDER_HANDSHAKE_PACE_WINDOW,
+        );
         let mut attempt = 0;
         loop {
             attempt += 1;
-            match self.try_handshake_responder(peer_node_id).await {
+            match self.try_handshake_responder(peer_node_id, &mut pacer).await {
                 Ok(result) => return Ok(result),
                 Err(e) if attempt < self.config.handshake_retries => {
                     tracing::warn!(attempt, error = %e, "mesh accept failed, retrying");
@@ -33943,10 +34003,27 @@ impl MeshNode {
     /// non-matching handshake datagrams inside the deadline instead
     /// means only a genuine absence of `msg1` ends the attempt. It
     /// also removes a cheap off-path DoS: a sprayer of junk handshake
-    /// packets can now delay an `accept()`, not kill it.
+    /// packets can now delay an `accept()`, not kill it — and `pacer`
+    /// caps how much Noise work each source can buy per second, so
+    /// "delay" cannot become "starve".
+    ///
+    /// # Diagnosing a genuine key mismatch
+    ///
+    /// A stale foreign `msg1` and a real initiator with the wrong PSK
+    /// or peer key are indistinguishable here — both are handshake
+    /// bytes that don't decrypt — so draining necessarily costs the
+    /// old fail-fast `read_message failed` error. The cause is not
+    /// lost: the last rejection is carried into the timeout error, so
+    /// a misconfigured pair reports
+    /// `handshake timeout (last handshake datagram from … did not
+    /// decrypt: …)` instead of a bare timeout, and the retry loop
+    /// logs it at `warn` on every attempt. Per-datagram logging stays
+    /// at `debug` on purpose: at `warn` a junk sprayer would own the
+    /// operator's log.
     async fn try_handshake_responder(
         &self,
         peer_node_id: u64,
+        pacer: &mut super::HandshakePacer,
     ) -> Result<(SessionKeys, SocketAddr), AdapterError> {
         let timeout = self.config.handshake_timeout;
         let socket_arc = self.socket.socket_arc();
@@ -33955,12 +34032,17 @@ impl MeshNode {
         // prologue so direct and routed share one convention.
         let prologue = handshake_prologue(routing_id(peer_node_id), routing_id(self.node_id));
 
+        // Set by the drain path so a timeout can name what it threw
+        // away. Lives outside the future because the future is
+        // dropped when the deadline elapses.
+        let mut last_reject: Option<String> = None;
+
         // Wait for the initiator's handshake. `read_message` runs
         // INSIDE the wait (see the doc above): a datagram that isn't
         // this pairing's `msg1` costs one loop iteration, not one
         // attempt. Noise state is consumed by a failed read, so each
         // candidate gets a fresh responder.
-        let (mut handshake, source) = tokio::time::timeout(timeout, async {
+        let waited = tokio::time::timeout(timeout, async {
             loop {
                 let mut recv_buf = bytes::BytesMut::with_capacity(protocol::MAX_PACKET_SIZE);
                 recv_buf.resize(protocol::MAX_PACKET_SIZE, 0);
@@ -33980,6 +34062,19 @@ impl MeshNode {
                     continue;
                 }
 
+                // Pace BEFORE the Noise setup: the point is to bound
+                // per-source cryptographic work, and a rejected
+                // source must not buy an ephemeral keypair.
+                if !pacer.check_and_record(source) {
+                    self.responder_handshakes_paced
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(
+                        %source,
+                        "handshake responder: dropping packet from rate-limited source"
+                    );
+                    continue;
+                }
+
                 let mut handshake = NoiseHandshake::responder_with_prologue(
                     &self.config.psk,
                     &self.static_keypair,
@@ -33988,6 +34083,9 @@ impl MeshNode {
                 .map_err(|e| AdapterError::Fatal(format!("handshake init failed: {}", e)))?;
 
                 if let Err(e) = handshake.read_message(&p.payload) {
+                    self.responder_handshakes_drained
+                        .fetch_add(1, Ordering::Relaxed);
+                    last_reject = Some(format!("{source}: {e}"));
                     tracing::debug!(
                         %source,
                         error = %e,
@@ -33999,8 +34097,21 @@ impl MeshNode {
                 return Ok::<_, AdapterError>((handshake, source));
             }
         })
-        .await
-        .map_err(|_| AdapterError::Connection("handshake timeout".into()))??;
+        .await;
+
+        let (mut handshake, source) = match waited {
+            Ok(inner) => inner?,
+            Err(_) => {
+                return Err(AdapterError::Connection(match last_reject {
+                    Some(reject) => format!(
+                        "handshake timeout (last handshake datagram from {reject} \
+                         did not decrypt under this pairing's prologue — wrong PSK, \
+                         wrong peer key, or another pairing's msg1)"
+                    ),
+                    None => "handshake timeout".into(),
+                }))
+            }
+        };
 
         let msg2 = handshake
             .write_message(&[])
