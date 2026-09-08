@@ -34047,18 +34047,24 @@ impl MeshNode {
         // this pairing's `msg1` costs one loop iteration, not one
         // attempt. Noise state is consumed by a failed read, so each
         // candidate gets a fresh responder.
+        // One receive buffer for the whole wait, not one per datagram.
+        // The loop now runs for the full deadline under any handshake
+        // stream (that is the point of draining), so a per-iteration
+        // `BytesMut::with_capacity(MAX_PACKET_SIZE)` + `resize(.., 0)`
+        // would allocate AND zero 8 KiB per junk datagram — work that
+        // happens before the pacer and so is not bounded by it. Copy
+        // out only the `n` bytes that actually arrived instead; a
+        // `msg1` is ~64 of them.
+        let mut recv_buf = vec![0u8; protocol::MAX_PACKET_SIZE];
+
         let waited = tokio::time::timeout(timeout, async {
             loop {
-                let mut recv_buf = bytes::BytesMut::with_capacity(protocol::MAX_PACKET_SIZE);
-                recv_buf.resize(protocol::MAX_PACKET_SIZE, 0);
-
                 let (n, source) = socket_arc
                     .recv_from(&mut recv_buf)
                     .await
                     .map_err(|e| AdapterError::Connection(format!("recv failed: {}", e)))?;
 
-                recv_buf.truncate(n);
-                let data = recv_buf.freeze();
+                let data = Bytes::copy_from_slice(&recv_buf[..n]);
 
                 let Some(p) = ParsedPacket::parse(data, source) else {
                     continue;
