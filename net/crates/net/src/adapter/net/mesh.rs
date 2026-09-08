@@ -34048,11 +34048,29 @@ impl MeshNode {
         // dropped when the deadline elapses.
         let mut last_reject: Option<String> = None;
 
-        // Wait for the initiator's handshake. `read_message` runs
-        // INSIDE the wait (see the doc above): a datagram that isn't
-        // this pairing's `msg1` costs one loop iteration, not one
-        // attempt. Noise state is consumed by a failed read, so each
-        // candidate gets a fresh responder.
+        // ONE responder for the whole wait, exactly as the initiator
+        // loop above reuses one `NoiseHandshake` across rejected
+        // replies. Snow checkpoints the symmetric state before
+        // `read_message` and restores it on failure, and leaves
+        // `pattern_position` and `my_turn` untouched, so a rejected
+        // datagram cannot advance or corrupt the state; the remote
+        // ephemeral a failed read scratches into place is overwritten
+        // by the next read's `e` token before anything reads it.
+        // Rebuilding per candidate would additionally re-parse
+        // `NOISE_PATTERN` and re-derive the static public key on every
+        // junk datagram.
+        //
+        // This does NOT make the pacer redundant: the Diffie-Hellman
+        // is inside `read_message`, so every admitted candidate still
+        // costs one, reused state or not. The pacer is what bounds how
+        // many of those a flood can buy.
+        let mut handshake = NoiseHandshake::responder_with_prologue(
+            &self.config.psk,
+            &self.static_keypair,
+            &prologue,
+        )
+        .map_err(|e| AdapterError::Fatal(format!("handshake init failed: {}", e)))?;
+
         // One receive buffer for the whole wait, not one per datagram.
         // The loop now runs for the full deadline under any handshake
         // stream (that is the point of draining), so a per-iteration
@@ -34063,6 +34081,10 @@ impl MeshNode {
         // `msg1` is ~64 of them.
         let mut recv_buf = vec![0u8; protocol::MAX_PACKET_SIZE];
 
+        // Wait for the initiator's handshake. `read_message` runs
+        // INSIDE the wait (see the doc above): a datagram that isn't
+        // this pairing's `msg1` costs one loop iteration, not one
+        // attempt.
         let waited = tokio::time::timeout(timeout, async {
             loop {
                 let (n, source) = socket_arc
@@ -34092,13 +34114,6 @@ impl MeshNode {
                     continue;
                 }
 
-                let mut handshake = NoiseHandshake::responder_with_prologue(
-                    &self.config.psk,
-                    &self.static_keypair,
-                    &prologue,
-                )
-                .map_err(|e| AdapterError::Fatal(format!("handshake init failed: {}", e)))?;
-
                 if let Err(e) = handshake.read_message(&p.payload) {
                     self.responder_handshakes_drained
                         .fetch_add(1, Ordering::Relaxed);
@@ -34111,12 +34126,12 @@ impl MeshNode {
                     continue;
                 }
 
-                return Ok::<_, AdapterError>((handshake, source));
+                return Ok::<_, AdapterError>(source);
             }
         })
         .await;
 
-        let (mut handshake, source) = match waited {
+        let source = match waited {
             Ok(inner) => inner?,
             Err(_) => {
                 return Err(AdapterError::Connection(match last_reject {
