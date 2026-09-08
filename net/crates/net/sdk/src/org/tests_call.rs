@@ -1418,23 +1418,34 @@ async fn authority_movement_inside_sensed_planning_is_still_fenced() {
 }
 
 /// A provider on BOTH planes is one `SameOrg` candidate, a `Granted`-only
-/// provider is never sensed, and the permutation keeps the complete list.
+/// provider is never ranked and never pruned, and the permutation keeps the
+/// complete list.
 ///
-/// Real derivation (both envelope kinds through the real ingest path, a real
-/// cross-org grant), then the real adapter over plain ranked/pruned data: this
-/// is the boundary where the SDK's `Mode` mapping is decided.
+/// The granted-only provider sits in the MIDDLE of the globally sorted list
+/// deliberately. That position is what makes the mask load-bearing: a mapping
+/// that treated `Granted` as same-organization would move it to the FRONT when
+/// ranked and to the BACK when pruned, whereas at the head of the list both
+/// mistakes are invisible. Ranking and pruning are covered as separate cases
+/// for the same reason.
 #[tokio::test]
-async fn the_sensed_adapter_never_ranks_a_granted_candidate() {
+async fn the_sensed_adapter_never_ranks_or_prunes_a_granted_candidate() {
     let (a, b) = (org_a(), org_b());
     let (mesh, identity, dir) = mesh_with_authority("plan-sensed-modes", Some(&a)).await;
 
-    // An owner-plane provider, and a provider visible on BOTH planes.
-    let owner_only = EntityKeypair::generate();
-    let dual = EntityKeypair::generate();
-    // A stranger owned by B, visible only through the grant.
-    let granted_only = EntityKeypair::generate();
-    inject_owner_envelope(&mesh, &a, &owner_only, &["nrpc:internal.reindex"]);
+    // Three providers, ordered the way the candidate list is: by provider
+    // entity bytes. The MIDDLE one is the granted-only stranger.
+    let mut keys = vec![
+        EntityKeypair::generate(),
+        EntityKeypair::generate(),
+        EntityKeypair::generate(),
+    ];
+    keys.sort_by(|x, y| x.entity_id().as_bytes().cmp(y.entity_id().as_bytes()));
+    let dual = keys.remove(0);
+    let granted_only = keys.remove(0);
+    let owner_only = keys.remove(0);
+
     inject_owner_envelope(&mesh, &a, &dual, &["nrpc:internal.reindex"]);
+    inject_owner_envelope(&mesh, &a, &owner_only, &["nrpc:internal.reindex"]);
     let (grant, secret) = discover_grant(&b, a.org_id(), cap("nrpc:internal.reindex"), 3600);
     let client = bind(
         &mesh,
@@ -1464,56 +1475,65 @@ async fn the_sensed_adapter_never_ranks_a_granted_candidate() {
     assert_eq!(
         candidates.len(),
         3,
-        "three distinct providers, and the dual-plane one exactly ONCE: {candidates:?}"
+        "three distinct providers, the dual-plane one exactly ONCE: {candidates:?}"
     );
     assert_eq!(considered, 3, "considered is the discovery count");
-    let mode_of = |entity: &EntityKeypair| {
-        candidates
-            .iter()
-            .find(|c| &c.provider == entity.entity_id())
-            .map(|c| c.mode.clone())
-            .expect("candidate present")
-    };
+    assert_eq!(
+        &candidates[0].provider,
+        dual.entity_id(),
+        "precondition: the sorted list is dual, granted-only, owner-only"
+    );
+    assert_eq!(&candidates[1].provider, granted_only.entity_id());
+    assert_eq!(&candidates[2].provider, owner_only.entity_id());
     assert!(
-        matches!(mode_of(&dual), Mode::SameOrg),
+        matches!(candidates[0].mode, Mode::SameOrg),
         "owner-first dedup: a provider on both planes is SameOrg"
     );
-    assert!(matches!(mode_of(&owner_only), Mode::SameOrg));
     assert!(
-        matches!(mode_of(&granted_only), Mode::Granted(_)),
+        matches!(candidates[1].mode, Mode::Granted(_)),
         "and a stranger stays on the granted plane"
     );
+    assert!(matches!(candidates[2].mode, Mode::SameOrg));
 
-    // The adapter, asked to RANK the granted provider: it cannot. Sensing is
-    // owner-plane only, so a granted id in `ranked` moves nothing, and the
-    // complete list survives in its own order.
     let granted_id = granted_only.entity_id().node_id();
-    let permutation =
-        super::call::org_sensed_candidate_permutation(&candidates, &[granted_id], &[granted_id]);
-    let mut covered = permutation.clone();
-    covered.sort_unstable();
+    let identity_permutation: Vec<usize> = (0..candidates.len()).collect();
+
+    // CASE 1 - RANKED. Sensing is owner-plane only, so ranking the granted id
+    // moves nothing. A mapping that called it same-organization would emit it
+    // FIRST.
     assert_eq!(
-        covered,
-        (0..candidates.len()).collect::<Vec<_>>(),
-        "the permutation is over the COMPLETE list, exactly once each"
+        super::call::org_sensed_candidate_permutation(&candidates, &[granted_id], &[]),
+        identity_permutation,
+        "a Granted id cannot be ranked: the input order is kept"
     );
+
+    // CASE 2 - PRUNED. Same reasoning in the other direction: a mapping that
+    // called it same-organization would emit it LAST.
+    assert_eq!(
+        super::call::org_sensed_candidate_permutation(&candidates, &[], &[granted_id]),
+        identity_permutation,
+        "a Granted id cannot be pruned either"
+    );
+
+    // CASE 3 - both at once, which is what the granted plane looks like to a
+    // projection that has no row for it at all.
+    assert_eq!(
+        super::call::org_sensed_candidate_permutation(&candidates, &[granted_id], &[granted_id]),
+        identity_permutation,
+    );
+
+    // And a real SameOrg provider IS rankable: the last one leads, the granted
+    // candidate keeps its relative place, nothing is dropped.
+    let owner_id = owner_only.entity_id().node_id();
+    let mut reordered = candidates.clone();
+    let permutation = super::call::org_sensed_candidate_permutation(&reordered, &[owner_id], &[]);
     assert_eq!(
         permutation,
-        (0..candidates.len()).collect::<Vec<_>>(),
-        "and a Granted id neither ranks nor prunes: the input order is kept"
-    );
-
-    // Now rank a real SameOrg provider LAST-first: the order changes, the
-    // granted candidate keeps its relative place, and nothing is dropped.
-    let dual_id = dual.entity_id().node_id();
-    let mut reordered = candidates.clone();
-    let permutation = super::call::org_sensed_candidate_permutation(&reordered, &[dual_id], &[]);
-    super::call::apply_permutation(&mut reordered, permutation);
-    assert_eq!(
-        &reordered[0].provider,
-        dual.entity_id(),
+        vec![2, 0, 1],
         "the sensed SameOrg provider leads"
     );
+    super::call::apply_permutation(&mut reordered, permutation);
+    assert_eq!(&reordered[0].provider, owner_only.entity_id());
     assert_eq!(reordered.len(), 3, "and nothing was dropped");
     assert!(
         reordered
@@ -1576,8 +1596,11 @@ async fn selection_and_its_errors_follow_the_reordered_list() {
         other => panic!("expected ProviderNotDirect, got {other:?}"),
     }
 
-    // Now pin only the LOWER provider and rank the higher one first: DIRECT
-    // still decides, so selection takes the pinned one despite the rank.
+    // Now PIN only the lower provider and rank the higher one first: the
+    // pin-binding annotation still decides, so selection takes the pinned one
+    // despite the rank. (`direct` means an identity pin here - a predicate
+    // that predates this slice; the live-session question is a separate
+    // network witness.)
     mesh.node()
         .test_pin_peer_entity(lower.entity_id().node_id(), lower.entity_id().clone());
     let (candidates, considered) = client
@@ -1597,46 +1620,106 @@ async fn selection_and_its_errors_follow_the_reordered_list() {
     assert_eq!(
         &chosen.provider,
         lower.entity_id(),
-        "an unreachable sensed leader must not be selected over a direct one"
+        "an unpinned sensed leader must not be selected over a pinned one"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The reconciliation trigger, as a decision table.
+/// The reconciliation trigger, as a decision table over a REAL demand.
 ///
-/// It is what keeps churn from freezing and an unchanged population from being
-/// re-acquired on every call, and both halves are load-bearing.
-#[test]
-fn the_reconciliation_trigger_fires_on_change_and_floors_a_retry() {
+/// The record certifies the demand it was taken from, so this drives it with
+/// actual `OrgSensingCapabilityDemand` values: a record cannot outlive the
+/// demand's identity, cannot claim a narrower population settled the first
+/// time it sees it, and cannot grow without bound.
+#[tokio::test]
+async fn the_reconciliation_trigger_certifies_the_installed_demand() {
+    use net::adapter::net::behavior::org_sensing_demand::OrgSensingFamily;
     use std::time::{Duration, Instant};
+
+    let a = org_a();
+    let (mesh, _identity, dir) = mesh_with_authority("plan-trigger", Some(&a)).await;
+    let family = OrgSensingFamily::mint(mesh.node()).expect("mint");
     let capability = cap("nrpc:internal.reindex");
     let schedule = super::client::ConvergenceSchedule::default();
     let floor = Duration::from_secs(2);
     let t0 = Instant::now();
 
-    // Never converged: always.
-    assert!(schedule.needs_convergence(&capability, &[1, 2], t0, floor));
+    // No demand at all: converge.
+    assert!(schedule.needs_convergence(&capability, &[1, 2], None, t0, floor));
 
-    // Converged COMPLETELY for this population: never again on its own.
-    schedule.converged(capability, vec![1, 2], true, t0);
-    assert!(!schedule.needs_convergence(&capability, &[1, 2], t0, floor));
+    // A real demand, with nothing discovered - so its population is EMPTY and
+    // cannot cover an expectation of two providers.
+    let demand = family.retain("nrpc:internal.reindex").expect("retain");
+    assert!(demand.population().is_empty(), "nothing is discovered here");
+    assert!(schedule.needs_convergence(&capability, &[1, 2], Some(&demand), t0, floor));
+
+    // Certifying it does NOT settle it: the published population is narrower
+    // than the expectation, which is exactly the interleaving where a
+    // discovery row expired between the caller's capture and core's query.
+    schedule.certify(capability, vec![1, 2], &demand, t0);
     assert!(
-        !schedule.needs_convergence(&capability, &[1, 2], t0 + Duration::from_secs(600), floor),
-        "a complete convergence is not re-run by the passage of time"
-    );
-
-    // A CHANGED population: immediately, with no floor.
-    assert!(schedule.needs_convergence(&capability, &[1, 2, 3], t0, floor));
-    assert!(schedule.needs_convergence(&capability, &[1], t0, floor));
-
-    // An INCOMPLETE convergence: floored, then retried.
-    schedule.converged(capability, vec![1, 2], false, t0);
-    assert!(
-        !schedule.needs_convergence(&capability, &[1, 2], t0 + Duration::from_millis(500), floor),
-        "an incomplete convergence must not be retried on every call"
+        !schedule.needs_convergence(&capability, &[1, 2], Some(&demand), t0, floor),
+        "but it is floored, not retried on the very next call"
     );
     assert!(
-        schedule.needs_convergence(&capability, &[1, 2], t0 + floor, floor),
-        "but it must be retried once the floor has passed"
+        schedule.needs_convergence(&capability, &[1, 2], Some(&demand), t0 + floor, floor),
+        "and it IS retried once the floor has passed"
     );
+
+    // A retry that produces the identical population is a FIXED POINT, not a
+    // loop: certify the same pair again and it settles.
+    schedule.certify(capability, vec![1, 2], &demand, t0 + floor);
+    assert!(
+        !schedule.needs_convergence(
+            &capability,
+            &[1, 2],
+            Some(&demand),
+            t0 + Duration::from_secs(600),
+            floor
+        ),
+        "a fixed point is not re-run by the passage of time"
+    );
+
+    // A CHANGED expectation converges immediately, with no floor.
+    assert!(schedule.needs_convergence(&capability, &[1, 2, 3], Some(&demand), t0, floor));
+    assert!(schedule.needs_convergence(&capability, &[1], Some(&demand), t0, floor));
+
+    // A REPLACED demand invalidates the record outright, even though the
+    // expectation is unchanged: the record certified a different installation.
+    let replaced = family.retain("nrpc:internal.reindex").expect("re-retain");
+    assert!(
+        !std::sync::Arc::ptr_eq(&demand, &replaced),
+        "precondition: the convergence published a new demand"
+    );
+    assert!(
+        schedule.needs_convergence(
+            &capability,
+            &[1, 2],
+            Some(&replaced),
+            t0 + Duration::from_secs(600),
+            floor
+        ),
+        "a record must never certify a demand it was not taken from"
+    );
+
+    // A refusal certifies nothing.
+    schedule.certify(capability, vec![1, 2], &replaced, t0);
+    schedule.record_refusal(capability, vec![1, 2], t0);
+    assert!(schedule.needs_convergence(&capability, &[1, 2], Some(&replaced), t0, floor));
+
+    // And the record set is BOUNDED: many capability names cannot grow it.
+    for index in 0..200u32 {
+        let other = cap(&format!("nrpc:svc.{index}"));
+        schedule.record_refusal(other, vec![1], t0 + Duration::from_millis(index as u64));
+    }
+    assert!(
+        schedule.len() <= 64,
+        "the convergence record set must stay bounded, got {}",
+        schedule.len()
+    );
+
+    drop(demand);
+    drop(replaced);
+    drop(family);
+    let _ = std::fs::remove_dir_all(&dir);
 }

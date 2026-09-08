@@ -554,11 +554,36 @@ impl OrgClient {
     /// The trigger is therefore the thing this call already derived under one
     /// coherent capture: its own pinned same-organization candidates. That set
     /// IS what the demand should be retained over, so comparing it against
-    /// what the last convergence was driven by detects an addition, a removal
-    /// and a pin change alike, with no extra query and no clock. Convergence
-    /// runs when the expectation CHANGED - never on every call - plus one
-    /// floored retry when the last convergence could not take a holder it
-    /// wanted, which is what lets a transient refusal recover.
+    /// what the last convergence CERTIFIED detects an addition, a removal and
+    /// a pin change alike, with no extra query and no clock.
+    ///
+    /// # What the record certifies, and what bounds it
+    ///
+    /// A record is only reusable while it still describes the demand that is
+    /// actually installed. It therefore carries the demand's IDENTITY and the
+    /// population core published, and a reuse decision re-checks:
+    ///
+    /// * the expectation this call derived, against the one recorded;
+    /// * the installed demand's identity, so a demand replaced or retired by
+    ///   any other caller is never certified by an older record;
+    /// * that the population core published still covers this expectation -
+    ///   a discovery row that expired between the SDK's capture and core's own
+    ///   query yields a demand narrower than the expectation, which must not
+    ///   be recorded as settled;
+    /// * that every retained holder is still the installation it was committed
+    ///   with, because ownership can die AFTER a successful convergence;
+    /// * the sensing authority stamp.
+    ///
+    /// Two bounds, because an unbounded record set is its own defect: nothing
+    /// is recorded for a capability with an EMPTY expectation (an unknown or
+    /// undiscovered service acquires nothing, so it strands no capacity), and
+    /// the record set itself is capped, evicting the least recently attempted
+    /// entry - which only costs one later convergence.
+    ///
+    /// The decision, the convergence and the record are one bounded critical
+    /// section per capability, so two clones of one binding cannot both decide
+    /// to converge the same change. Everything inside it is synchronous: no
+    /// `.await`, no I/O, no user code.
     fn apply_sensed_order(
         &self,
         capability: &CapabilityAuthorityId,
@@ -571,54 +596,62 @@ impl OrgClient {
         let family = acquisition.family();
 
         // What this capability's demand SHOULD be retained over: the pinned
-        // same-organization candidates of this very derivation, in the order
-        // core's population uses (ascending node id), so the comparison is by
-        // value and stable.
+        // same-organization candidates of this very derivation, plus this node
+        // itself when it is its own authorized provider - core's population
+        // rule includes the self-provider, and an expectation that omitted it
+        // could never agree with what core publishes.
         let mut expected: Vec<u64> = candidates
             .iter()
             .filter(|candidate| matches!(candidate.mode, Mode::SameOrg) && candidate.direct)
             .map(|candidate| candidate.provider.node_id())
             .collect();
+        if candidates.iter().any(|candidate| {
+            matches!(candidate.mode, Mode::SameOrg) && candidate.provider == *self.node.entity_id()
+        }) {
+            expected.push(self.node.node_id());
+        }
         expected.sort_unstable();
         expected.dedup();
 
         let now = Instant::now();
-        let stale_authority = family
-            .demand(capability)
-            .is_some_and(|demand| !demand.authority_is_current());
-        if stale_authority
-            || acquisition.schedule().needs_convergence(
+        // ONE section: decide, converge, record. `retain` is synchronous and
+        // takes core's own transaction lock inside; nothing here awaits.
+        {
+            let _txn = acquisition.reconcile_lock();
+            let installed = family.demand(capability);
+            if expected.is_empty() {
+                // Nothing to sense for this capability. An installed demand is
+                // a DEPARTURE to zero and is retired; nothing is recorded, so
+                // an unknown service leaves no state behind and a capability
+                // whose providers appear later still converges on that call.
+                if installed.is_some() {
+                    family.retire(sensed.tag);
+                }
+                acquisition.schedule().forget(capability);
+                return;
+            }
+            if acquisition.schedule().needs_convergence(
                 capability,
                 &expected,
+                installed.as_ref(),
                 now,
                 RECONCILE_RETRY_FLOOR,
-            )
-        {
-            match family.retain(sensed.tag) {
-                Ok(demand) => {
-                    // A convergence is COMPLETE when every provider it was
-                    // driven by ended up with a live holder. Compared against
-                    // the demand's own population rather than `expected`,
-                    // because the population is what core authorized and
-                    // capped - `expected` is only this call's view of it.
-                    let mut retained = demand.retained_providers();
-                    retained.sort_unstable();
-                    let mut population = demand.population().to_vec();
-                    population.sort_unstable();
-                    acquisition.schedule().converged(
-                        *capability,
-                        expected,
-                        retained == population,
-                        now,
-                    );
-                }
-                // A refused convergence records the ATTEMPT, so a refusal that
-                // persists cannot turn every later call into another attempt.
-                Err(_refusal) => {
-                    acquisition
-                        .schedule()
-                        .converged(*capability, expected, false, now);
-                    return;
+            ) {
+                match family.retain(sensed.tag) {
+                    Ok(demand) => {
+                        acquisition
+                            .schedule()
+                            .certify(*capability, expected, &demand, now)
+                    }
+                    // A refused convergence records the ATTEMPT against the
+                    // demand it could not replace, so a persistent refusal
+                    // cannot turn every later call into another attempt.
+                    Err(_refusal) => {
+                        acquisition
+                            .schedule()
+                            .record_refusal(*capability, expected, now);
+                        return;
+                    }
                 }
             }
         }
