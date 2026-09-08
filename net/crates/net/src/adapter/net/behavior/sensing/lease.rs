@@ -152,7 +152,14 @@ struct LeaseMetrics {
 /// value. Reserved by the acquisition PREVIEW and recorded by its commit;
 /// [`SensingInterestLeases::release`] consumes it via the ticket. Node-local;
 /// never on the wire.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// `Ord` is MINT ORDER, and it is load-bearing rather than a convenience: the
+/// allocator is a single monotone counter, so `a < b` means exactly "`a` was
+/// issued before `b`". An installation identity is the first token issued for
+/// a key, so comparing two of them answers "which installation is the newer
+/// one" without consulting the registry — which is how the node's refresh
+/// schedule refuses to let a stale record overwrite its own successor's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LeaseToken(u64);
 
 /// The two sensing-interest lease shapes (§4.3).

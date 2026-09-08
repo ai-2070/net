@@ -6874,6 +6874,18 @@ pub(crate) struct OrgSensingDemandCounters {
     refresh_authority_refused: AtomicU64,
     /// Refreshes whose table/emitter application refused.
     refresh_refused: AtomicU64,
+    /// Arms REFUSED because the key's armed record already names a strictly
+    /// NEWER installation. A stale worker re-arm must never overwrite its own
+    /// successor's schedule.
+    refresh_arm_stale: AtomicU64,
+    /// Retirement releases the transaction REFUSED, whose still-live ticket
+    /// was therefore retained on the node for paced retry rather than lost.
+    refused_release_parked: AtomicU64,
+    /// Retained refused releases that a later retry discharged.
+    refused_release_recovered: AtomicU64,
+    /// Refused releases that could NOT be retained (the retention set is at
+    /// its bound, or the node is already terminal). Counted, never silent.
+    refused_release_unowned: AtomicU64,
 }
 
 impl OrgSensingDemandCounters {
@@ -6923,6 +6935,16 @@ pub struct OrgSensingDemandState {
     pub refresh_authority_refused: u64,
     /// Refreshes whose application refused.
     pub refresh_refused: u64,
+    /// Arms refused because a newer installation owns the key's schedule.
+    pub refresh_arm_stale: u64,
+    /// Refused retirement releases retained for paced retry.
+    pub refused_release_parked: u64,
+    /// Retained refused releases a later retry discharged.
+    pub refused_release_recovered: u64,
+    /// Refused releases that could not be retained at all.
+    pub refused_release_unowned: u64,
+    /// Refused releases still retained RIGHT NOW, awaiting retry.
+    pub refused_release_outstanding: u64,
     /// Installations currently armed for refresh.
     pub armed: u64,
     /// Whether the refresh worker exists.
@@ -6944,6 +6966,117 @@ struct ArmedRefresh {
     period: Duration,
 }
 
+/// How many refused retirement releases one node will RETAIN for retry.
+///
+/// A refused release means the transaction rolled back and the holder is still
+/// live and still ours, so dropping the ticket leaks a holder that nothing can
+/// ever release. Ownership therefore moves here. The set is bounded by the
+/// same figure that bounds armed records — one retained release is at most one
+/// live lease entry — and a park that cannot be admitted is counted, never
+/// silent.
+const MAX_SENSING_REFUSED_RELEASES: usize = MAX_SENSING_REFRESH_ARMED;
+
+/// A retirement release the transaction REFUSED, retained so the still-live
+/// holder keeps an owner.
+///
+/// Retries are paced on the refresh worker's own cadence and stop the moment
+/// one succeeds or the node goes terminal. Nothing retries inside a
+/// destructor: a destructor cannot wait on authority this node may never
+/// regain, which is exactly why ownership is handed to the worker instead.
+struct RefusedRelease {
+    ticket: sensing::SensingLeaseTicket,
+    /// The installation the refused release belonged to, so a successful retry
+    /// can settle the schedule against the identity it actually retired.
+    installation_id: sensing::LeaseToken,
+    provider: u64,
+}
+
+/// The single refresh worker's teardown ownership.
+///
+/// The handle is never MOVED out of the slot: a closer borrows it, awaits it
+/// in place, and clears the slot only after settlement is published. That is
+/// what makes a cancelled closer leave a recoverable handle behind instead of
+/// detaching the task — the defect class the ordered egress already fixed.
+struct RefreshTeardown {
+    worker: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// The refresh worker's identity and teardown boundary.
+///
+/// Shared by `Arc` and never taken out of the schedule, so every closer — the
+/// first, a concurrent one, or a successor to a cancelled one — finds the same
+/// boundary and either performs the settlement or observes it.
+struct SensingRefreshWorker {
+    /// TEARDOWN OWNERSHIP, held across the join. `tokio::sync` because it is
+    /// held across an await.
+    teardown: tokio::sync::Mutex<RefreshTeardown>,
+    /// Whether a closer has published settlement. Lock-free, so an observer
+    /// never has to take the teardown mutex to learn the outcome.
+    settled: AtomicBool,
+}
+
+impl SensingRefreshWorker {
+    /// Spawn the worker and take ownership of its handle.
+    fn spawn(weak: std::sync::Weak<MeshNode>, wake: Arc<tokio::sync::Notify>) -> Self {
+        Self {
+            teardown: tokio::sync::Mutex::new(RefreshTeardown {
+                worker: Some(tokio::spawn(MeshNode::run_sensing_refresh(weak, wake))),
+            }),
+            settled: AtomicBool::new(false),
+        }
+    }
+
+    /// JOIN the worker within `grace`, then abort-and-await it, and publish
+    /// settlement. Idempotent, and safe to cancel: the handle is borrowed in
+    /// place, so a cancelled call leaves it for the next closer.
+    async fn settle(&self, grace: Duration) {
+        let mut teardown = self.teardown.lock().await;
+        if self.settled.load(Ordering::Acquire) {
+            return;
+        }
+        if let Some(handle) = teardown.worker.as_mut() {
+            if tokio::time::timeout(grace, &mut *handle).await.is_err() {
+                handle.abort();
+                // Settlement, not just cancellation.
+                let _ = (&mut *handle).await;
+            }
+        }
+        teardown.worker = None;
+        self.settled.store(true, Ordering::Release);
+    }
+
+    /// The DESTRUCTOR path: abort without awaiting, explicitly best-effort
+    /// exactly like the ordered egress'. Never blocks, and never takes the
+    /// teardown mutex away from a live closer.
+    fn abort_detached(&self) {
+        if let Ok(teardown) = self.teardown.try_lock() {
+            if let Some(handle) = teardown.worker.as_ref() {
+                handle.abort();
+            }
+        }
+    }
+
+    /// Whether a closer has published settlement.
+    #[cfg(any(test, feature = "fixtures"))]
+    fn is_settled(&self) -> bool {
+        self.settled.load(Ordering::Acquire)
+    }
+
+    /// Whether the teardown slot still OWNS the worker handle.
+    ///
+    /// This is what separates "settled after really joining" from "settled
+    /// vacuously because a cancelled closer had already taken the handle
+    /// away". Try-locked deliberately: an observer must never wedge a live
+    /// teardown, and `None` is "a closer holds it right now".
+    #[cfg(any(test, feature = "fixtures"))]
+    fn handle_owned(&self) -> Option<bool> {
+        self.teardown
+            .try_lock()
+            .ok()
+            .map(|teardown| teardown.worker.is_some())
+    }
+}
+
 /// THE node-owned refresh schedule: one due-set, one worker, no timer per
 /// lease.
 ///
@@ -6959,8 +7092,13 @@ struct SensingRefreshState {
     /// than accumulates.
     armed: HashMap<sensing::SensingLeaseKey, ArmedRefresh>,
     next_seq: u64,
-    /// The single worker, retained so teardown can join it.
-    worker: Option<tokio::task::JoinHandle<()>>,
+    /// Refused retirement releases this node still OWNS, and when the worker
+    /// should next attempt them. The worker drives both this and `due`.
+    refused: Vec<RefusedRelease>,
+    refused_retry_at: Option<Instant>,
+    /// The single worker's teardown boundary. CLONED by closers, never taken,
+    /// so concurrent and cancelled closers share one ownership point.
+    worker: Option<Arc<SensingRefreshWorker>>,
     /// Set by node teardown. Nothing is armed and no worker is spawned after
     /// this, and the worker exits.
     terminal: bool,
@@ -6987,6 +7125,28 @@ impl SensingRefreshState {
             .iter()
             .next()
             .map(|((deadline, seq), key)| (*deadline, *seq, *key))
+    }
+
+    /// When the worker must next wake for the RETENTION set, if it holds
+    /// anything at all.
+    fn refused_due(&self) -> Option<Instant> {
+        if self.refused.is_empty() {
+            return None;
+        }
+        self.refused_retry_at
+    }
+
+    /// The next instant the worker must wake for ANY reason — the earliest
+    /// renewal deadline or the retention set's retry, whichever comes first.
+    /// `None` means "nothing to do at all".
+    fn next_wake(&self) -> Option<Instant> {
+        match (
+            self.earliest().map(|(deadline, _, _)| deadline),
+            self.refused_due(),
+        ) {
+            (Some(armed), Some(refused)) => Some(armed.min(refused)),
+            (armed, refused) => armed.or(refused),
+        }
     }
 }
 
@@ -10162,6 +10322,18 @@ pub struct MeshNode {
     /// window, so it is not part of the `fixtures` surface other crates see.
     #[cfg(test)]
     sensing_release_pre_apply_seam: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// In-crate witness seam: fires inside a REFRESH, between its Phase 0
+    /// capture and its transition/apply guards, with every sensing guard
+    /// released. Lets a witness drive the rival acquisition that shares the
+    /// installation being refreshed.
+    #[cfg(test)]
+    sensing_refresh_pre_apply_seam: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// In-crate witness seam: fires inside a retention, after the authorized
+    /// population has been derived and BEFORE the captured authority view's
+    /// currentness is re-proved. Lets a witness move the qualifying view in
+    /// exactly that window.
+    #[cfg(test)]
+    sensing_population_seam: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// In-crate witness seam: fires inside an acquisition immediately after the
     /// registry PREVIEW and before the plane-coherence refusals — with nothing
     /// yet mutated. Lets a witness prove the transition order was taken from
@@ -12048,6 +12220,8 @@ impl MeshNode {
                 due: std::collections::BTreeMap::new(),
                 armed: HashMap::new(),
                 next_seq: 0,
+                refused: Vec::new(),
+                refused_retry_at: None,
                 worker: None,
                 terminal: false,
             }),
@@ -12055,6 +12229,10 @@ impl MeshNode {
             org_sensing_demand_counters: Arc::new(OrgSensingDemandCounters::default()),
             #[cfg(test)]
             sensing_release_pre_apply_seam: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            sensing_refresh_pre_apply_seam: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            sensing_population_seam: parking_lot::Mutex::new(None),
             #[cfg(test)]
             sensing_acquire_previewed_seam: parking_lot::Mutex::new(None),
             #[cfg(test)]
@@ -12679,6 +12857,44 @@ impl MeshNode {
     #[cfg(test)]
     fn clear_sensing_release_pre_apply_seam_for_test(&self) {
         *self.sensing_release_pre_apply_seam.lock() = None;
+    }
+
+    /// Install the REFRESH pre-apply seam. It fires between a refresh's Phase 0
+    /// capture and its transition/apply guards.
+    #[cfg(test)]
+    pub(crate) fn set_sensing_refresh_pre_apply_seam_for_test(
+        &self,
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) {
+        *self.sensing_refresh_pre_apply_seam.lock() = Some(hook);
+    }
+
+    /// Remove the refresh pre-apply seam.
+    #[cfg(test)]
+    pub(crate) fn clear_sensing_refresh_pre_apply_seam_for_test(&self) {
+        *self.sensing_refresh_pre_apply_seam.lock() = None;
+    }
+
+    /// Install the population seam. It fires inside a retention, between the
+    /// population derivation and the captured view's currentness re-proof.
+    #[cfg(test)]
+    pub(crate) fn set_sensing_population_seam_for_test(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.sensing_population_seam.lock() = Some(hook);
+    }
+
+    /// Remove the population seam.
+    #[cfg(test)]
+    pub(crate) fn clear_sensing_population_seam_for_test(&self) {
+        *self.sensing_population_seam.lock() = None;
+    }
+
+    /// Fire the population seam, if one is installed. A no-op outside the
+    /// in-crate test build.
+    pub(crate) fn fire_sensing_population_seam(&self) {
+        #[cfg(test)]
+        if let Some(hook) = self.sensing_population_seam.lock().clone() {
+            hook();
+        }
     }
 
     /// Install the acquire previewed seam. It fires inside an acquisition right
@@ -13894,7 +14110,6 @@ impl MeshNode {
                 .fetch_add(1, Ordering::Relaxed);
             return SensingRefreshOutcome::Superseded;
         }
-        let holders_before = view.holders();
         let org_prepared = match view.plane() {
             sensing::LeasePlane::Legacy => None,
             sensing::LeasePlane::Organization => {
@@ -13912,6 +14127,14 @@ impl MeshNode {
                 }
             }
         };
+        // In-crate witness seam: fires with every sensing guard RELEASED, in
+        // exactly the window between this refresh's Phase 0 capture and its
+        // transition/apply guards — so a witness can drive the rival
+        // acquisition that used to make the stale holder-count assertion panic.
+        #[cfg(test)]
+        if let Some(hook) = self.sensing_refresh_pre_apply_seam.lock().clone() {
+            hook();
+        }
         let ordered = org_prepared.is_some();
         let _order = ordered.then(|| self.org_transition_mu.lock());
         let _apply = SensingGuard::new(
@@ -13934,6 +14157,13 @@ impl MeshNode {
                 .fetch_add(1, Ordering::Relaxed);
             return SensingRefreshOutcome::Superseded;
         }
+        // THE no-mutation baseline, captured INSIDE the transaction that holds
+        // it. A Phase 0 count is worthless here: a rival acquisition can join
+        // this very installation between the capture and the apply guard
+        // WITHOUT changing its identity, and comparing against the stale count
+        // would then panic on legitimate churn and take the node's only
+        // refresh worker with it.
+        let holders_before = current.holders();
         // The registry's OWN spec and cadence — never a caller's copy.
         let action = sensing::LeaseAction::Reregister {
             spec: Arc::clone(current.spec()),
@@ -13976,35 +14206,73 @@ impl MeshNode {
         SensingRefreshOutcome::Renewed
     }
 
-    /// ARM (or re-arm) `key`'s installation for refresh at `now + period`.
+    /// ARM `key`'s installation for refresh at `now + period`.
     ///
     /// Takes the node by `Arc` deliberately: the worker holds a `Weak` back to
     /// it, so the schedule can never keep the node alive, and no
     /// `self_weak`-style start-time wiring is required for the demand path to
-    /// work. Returns `false` when the schedule is terminal or at its bound —
-    /// nothing is evicted either way.
+    /// work.
+    ///
+    /// # What arming will NOT do
+    ///
+    /// * it will never let an OLDER installation replace a newer one's record.
+    ///   Installation identities are minted from one monotone allocator, so
+    ///   `existing > requested` is exactly "this request belongs to an
+    ///   installation that has already been superseded" — the interleaving
+    ///   where a fired worker's re-arm lands after its successor armed and
+    ///   destroys the successor's liveness;
+    /// * it will never POSTPONE a live cadence. A second holder joining an
+    ///   existing installation renews nothing, so pushing the deadline out to
+    ///   `now + period` on every join would walk the renewal past the row's own
+    ///   expiry (ttl 30 s, period 15 s: joins at 10 s and 20 s move it to 25 s
+    ///   then 35 s, and the row expires at 30 s). The EARLIEST deadline for an
+    ///   installation wins.
+    ///
+    /// Returns `false` when nothing is armed as a result: the schedule is
+    /// terminal, the bound refused, or the request was stale. Nothing is
+    /// evicted in any of those cases.
     pub(crate) fn arm_sensing_refresh(
         node: &Arc<MeshNode>,
         key: sensing::SensingLeaseKey,
         installation_id: sensing::LeaseToken,
         period: Duration,
     ) -> bool {
+        let deadline = Instant::now() + period;
         let mut schedule = node.sensing_refresh.lock();
         if schedule.terminal {
             return false;
         }
-        // The bound is checked BEFORE the mutation and only for a key that is
-        // not already armed: re-arming a live installation spends no budget.
-        if !schedule.armed.contains_key(&key) && schedule.armed.len() >= MAX_SENSING_REFRESH_ARMED {
-            node.org_sensing_demand_counters
-                .refused_at_capacity
-                .fetch_add(1, Ordering::Relaxed);
-            return false;
+        match schedule.armed.get(&key) {
+            Some(existing) if existing.installation_id > installation_id => {
+                node.org_sensing_demand_counters
+                    .refresh_arm_stale
+                    .fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+            Some(existing)
+                if existing.installation_id == installation_id && existing.deadline <= deadline =>
+            {
+                // Already armed no later than this. The cadence stands.
+                return true;
+            }
+            // A record naming a strictly newer installation cannot reach here;
+            // an equal one only with an EARLIER new deadline, and an older one
+            // is a stale record this fresh installation legitimately replaces.
+            Some(_) => {}
+            None => {
+                // The bound is checked BEFORE the mutation and only for a key
+                // that is not already armed: re-arming spends no budget.
+                if schedule.armed.len() >= MAX_SENSING_REFRESH_ARMED {
+                    node.org_sensing_demand_counters
+                        .refused_at_capacity
+                        .fetch_add(1, Ordering::Relaxed);
+                    return false;
+                }
+            }
         }
         let seq = schedule.next_seq;
         schedule.next_seq = schedule.next_seq.wrapping_add(1);
-        let deadline = Instant::now() + period;
-        let earliest_before = schedule.earliest().map(|(deadline, _, _)| deadline);
+        let wake_before = schedule.next_wake();
         schedule.insert(
             key,
             ArmedRefresh {
@@ -14014,12 +14282,8 @@ impl MeshNode {
                 period,
             },
         );
-        if schedule.worker.is_none() {
-            let weak = Arc::downgrade(node);
-            let wake = node.sensing_refresh_wake.clone();
-            schedule.worker = Some(tokio::spawn(Self::run_sensing_refresh(weak, wake)));
-        }
-        let rearm = earliest_before.is_none_or(|previous| deadline < previous);
+        Self::ensure_sensing_refresh_worker(node, &mut schedule);
+        let rearm = wake_before.is_none_or(|previous| deadline < previous);
         drop(schedule);
         if rearm {
             // An EARLIER deadline than the one the worker is parked on. Waking
@@ -14030,13 +14294,118 @@ impl MeshNode {
         true
     }
 
-    /// DISARM `key`. Idempotent, and the only way an armed record leaves the
-    /// schedule other than firing or terminal closure.
-    pub(crate) fn disarm_sensing_refresh(&self, key: &sensing::SensingLeaseKey) {
-        self.sensing_refresh.lock().remove(key);
+    /// SETTLE `key`'s schedule after releasing the holder that `released`
+    /// installed.
+    ///
+    /// This is deliberately not a `disarm`: a lease key is SHARED node state,
+    /// so several independent owners can hold the same installation. An
+    /// unconditional disarm on retirement therefore took the live survivor's
+    /// renewal away — the holder stayed legitimate, the row stayed installed,
+    /// and nothing was ever going to refresh it again.
+    ///
+    /// The record leaves only when the installation it names is no longer the
+    /// live one. A successor that established in the window between the read
+    /// and the lock carries a strictly newer identity, so it can never be
+    /// mistaken for the one being retired.
+    pub(crate) fn settle_sensing_refresh(
+        &self,
+        key: &sensing::SensingLeaseKey,
+        released: sensing::LeaseToken,
+    ) {
+        // The registry's own POST-release truth, read off the schedule lock.
+        if self.sensing_refresh_installation(key) == Some(released) {
+            // Another holder still owns this installation. The cadence must
+            // survive our retirement.
+            return;
+        }
+        let mut schedule = self.sensing_refresh.lock();
+        if schedule
+            .armed
+            .get(key)
+            .is_some_and(|armed| armed.installation_id == released)
+        {
+            schedule.remove(key);
+        }
     }
 
-    /// THE single refresh worker. One task for the whole node.
+    /// RETAIN a refused retirement release, so the still-live holder it owns
+    /// keeps an owner.
+    ///
+    /// The transaction refused, which means nothing moved and the holder is
+    /// still ours; dropping the ticket here would leak a holder that no later
+    /// release can ever reach (the remaining holders' own releases relax the
+    /// aggregate, they never deregister a row this one keeps referenced).
+    /// Ownership therefore moves to the node's refresh worker, which retries on
+    /// its own cadence.
+    ///
+    /// Returns `false` when the retention could not be admitted — the bound is
+    /// full, or the node is already terminal (its whole registry is going away
+    /// with it). Counted either way.
+    pub(crate) fn park_refused_release(
+        node: &Arc<MeshNode>,
+        ticket: sensing::SensingLeaseTicket,
+        installation_id: sensing::LeaseToken,
+        provider: u64,
+    ) -> bool {
+        let retained = Self::retain_refused_release(
+            node,
+            RefusedRelease {
+                ticket,
+                installation_id,
+                provider,
+            },
+        );
+        let counters = &node.org_sensing_demand_counters;
+        if retained {
+            counters
+                .refused_release_parked
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            counters
+                .refused_release_unowned
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        retained
+    }
+
+    /// Put one refused release back into the retention set WITHOUT counting a
+    /// fresh park — the worker's own retry loop, where the node has owned the
+    /// holder all along.
+    fn retain_refused_release(node: &Arc<MeshNode>, entry: RefusedRelease) -> bool {
+        let retry_at = Instant::now() + node.sensing_refresh_period();
+        let mut schedule = node.sensing_refresh.lock();
+        if schedule.terminal || schedule.refused.len() >= MAX_SENSING_REFUSED_RELEASES {
+            return false;
+        }
+        let wake_before = schedule.next_wake();
+        schedule.refused.push(entry);
+        schedule.refused_retry_at = Some(
+            schedule
+                .refused_retry_at
+                .map_or(retry_at, |existing| existing.min(retry_at)),
+        );
+        Self::ensure_sensing_refresh_worker(node, &mut schedule);
+        let rearm = wake_before.is_none_or(|previous| retry_at < previous);
+        drop(schedule);
+        if rearm {
+            node.sensing_refresh_wake.notify_one();
+        }
+        true
+    }
+
+    /// Spawn the single worker if this node does not have one yet. Called
+    /// under the schedule guard, from every path that adds work.
+    fn ensure_sensing_refresh_worker(node: &Arc<MeshNode>, schedule: &mut SensingRefreshState) {
+        if schedule.worker.is_none() {
+            schedule.worker = Some(Arc::new(SensingRefreshWorker::spawn(
+                Arc::downgrade(node),
+                node.sensing_refresh_wake.clone(),
+            )));
+        }
+    }
+
+    /// THE single refresh worker. One task for the whole node, driving both the
+    /// renewal schedule and the refused-release retention set.
     ///
     /// Parks on the EARLIEST absolute deadline raced against the wake, so an
     /// earlier arm shortens the park instead of being missed, and a sub-second
@@ -14051,9 +14420,12 @@ impl MeshNode {
         enum Step {
             /// This installation is due; its record has been taken out.
             Fire(sensing::SensingLeaseKey, ArmedRefresh),
+            /// These refused releases are due for another attempt; they have
+            /// been taken out of the retention set.
+            Retry(Vec<RefusedRelease>),
             /// Park until this absolute deadline, or until an earlier arm.
             Park(Instant),
-            /// Nothing armed; park until something is.
+            /// Nothing armed and nothing retained; park until something is.
             Idle,
             /// Terminal.
             Stop,
@@ -14062,12 +14434,17 @@ impl MeshNode {
             let Some(live) = node.upgrade() else { return };
             let step = {
                 let mut schedule = live.sensing_refresh.lock();
+                let now = Instant::now();
                 if schedule.terminal {
                     Step::Stop
+                } else if schedule.refused_due().is_some_and(|at| at <= now) {
+                    // The retention set first: a leaked holder keeps a row
+                    // installed, so discharging it outranks one renewal tick.
+                    schedule.refused_retry_at = None;
+                    Step::Retry(std::mem::take(&mut schedule.refused))
                 } else {
                     match schedule.earliest() {
-                        None => Step::Idle,
-                        Some((deadline, _, key)) if deadline <= Instant::now() => {
+                        Some((deadline, _, key)) if deadline <= now => {
                             // Take the record OUT before the guard is released:
                             // the effect runs off it, and a successful renewal
                             // re-arms below.
@@ -14076,7 +14453,10 @@ impl MeshNode {
                                 None => Step::Idle,
                             }
                         }
-                        Some((deadline, _, _)) => Step::Park(deadline),
+                        _ => match schedule.next_wake() {
+                            Some(deadline) => Step::Park(deadline),
+                            None => Step::Idle,
+                        },
                     }
                 }
             };
@@ -14098,6 +14478,20 @@ impl MeshNode {
                     wake.notified().await;
                 }
                 Step::Fire(key, record) => {
+                    // Re-read TERMINAL immediately before the effect: shutdown
+                    // publishes it and then joins this task, so a decision made
+                    // one instant earlier must not turn into an emission for a
+                    // node that has already begun going away.
+                    //
+                    // Bound to a local DELIBERATELY: a guard created in an `if`
+                    // condition lives to the end of the whole `if` statement,
+                    // which would hold the schedule lock across the effect
+                    // below — blocking every arm, and every closer's terminal
+                    // publication, for the length of one refresh.
+                    let terminal = live.sensing_refresh.lock().terminal;
+                    if terminal {
+                        return;
+                    }
                     // OFF the schedule lock: the effect takes sensing locks and
                     // may emit.
                     let outcome = live.refresh_sensing_interest_lease(&key, record.installation_id);
@@ -14112,7 +14506,8 @@ impl MeshNode {
                         // permanently stop refresh once authority returns.
                         // `Absent`/`Superseded` deliberately do NOT re-arm: the
                         // demand is retired or replaced, and re-arming either
-                        // would be exactly the resurrection this refuses.
+                        // would be exactly the resurrection this refuses. The
+                        // arm itself refuses to overwrite a successor's record.
                         MeshNode::arm_sensing_refresh(
                             &live,
                             key,
@@ -14121,50 +14516,72 @@ impl MeshNode {
                         );
                     }
                 }
+                Step::Retry(pending) => {
+                    for entry in pending {
+                        if live
+                            .try_release_sensing_interest_lease(entry.ticket)
+                            .is_err()
+                        {
+                            // Still refused. Keep OWNING it and try again on the
+                            // next cadence; the set is bounded, the ownership
+                            // was never dropped, and the whole retention dies
+                            // with the node.
+                            MeshNode::retain_refused_release(&live, entry);
+                            continue;
+                        }
+                        live.settle_sensing_refresh(&entry.ticket.key, entry.installation_id);
+                        live.org_sensing_demand_counters.note_released();
+                        live.org_sensing_demand_counters
+                            .refused_release_recovered
+                            .fetch_add(1, Ordering::Relaxed);
+                        tracing::debug!(
+                            provider = format!("{:#x}", entry.provider),
+                            "org sensing demand: refused retirement release recovered"
+                        );
+                    }
+                }
             }
         }
     }
 
-    /// Enter the schedule's TERMINAL state and join its worker within the same
-    /// bounded grace the ordered egress uses.
+    /// Enter the schedule's TERMINAL state and SETTLE its worker within the
+    /// same bounded grace the ordered egress uses.
     ///
-    /// After this returns nothing can be armed and no worker exists, so no
-    /// refresh can emit for a node that is gone.
+    /// The worker handle is never taken out of the schedule: closers CLONE the
+    /// shared teardown boundary, so a concurrent closer observes the same
+    /// settlement and a cancelled one leaves the handle recoverable. After a
+    /// completed call nothing can be armed and the worker has been joined or
+    /// aborted-and-awaited, so no refresh can emit for a node that is gone.
     async fn close_sensing_refresh(&self) {
-        let worker = {
-            let mut schedule = self.sensing_refresh.lock();
-            schedule.terminal = true;
-            schedule.due.clear();
-            schedule.armed.clear();
-            schedule.worker.take()
-        };
+        let worker = self.mark_sensing_refresh_terminal();
         self.sensing_refresh_wake.notify_waiters();
         self.sensing_refresh_wake.notify_one();
-        if let Some(mut worker) = worker {
-            if tokio::time::timeout(ORG_EGRESS_DRAIN_GRACE, &mut worker)
-                .await
-                .is_err()
-            {
-                worker.abort();
-                // Settlement, not just cancellation.
-                let _ = (&mut worker).await;
-            }
+        if let Some(worker) = worker {
+            worker.settle(ORG_EGRESS_DRAIN_GRACE).await;
         }
+    }
+
+    /// Publish the schedule's terminal state and hand back the shared worker
+    /// boundary, if one exists. The retention set is dropped with it: the whole
+    /// lease registry goes away with the node, so there is no holder left to
+    /// own.
+    fn mark_sensing_refresh_terminal(&self) -> Option<Arc<SensingRefreshWorker>> {
+        let mut schedule = self.sensing_refresh.lock();
+        schedule.terminal = true;
+        schedule.due.clear();
+        schedule.armed.clear();
+        schedule.refused.clear();
+        schedule.refused_retry_at = None;
+        schedule.worker.clone()
     }
 
     /// Close and abort the refresh worker WITHOUT awaiting — the destructor
     /// path, explicitly best-effort exactly like the egress'.
     fn close_sensing_refresh_detached(&self) {
-        let worker = {
-            let mut schedule = self.sensing_refresh.lock();
-            schedule.terminal = true;
-            schedule.due.clear();
-            schedule.armed.clear();
-            schedule.worker.take()
-        };
+        let worker = self.mark_sensing_refresh_terminal();
         self.sensing_refresh_wake.notify_waiters();
         if let Some(worker) = worker {
-            worker.abort();
+            worker.abort_detached();
         }
     }
 
@@ -14313,10 +14730,67 @@ impl MeshNode {
             refresh_superseded: counters.refresh_superseded.load(Ordering::Relaxed),
             refresh_authority_refused: counters.refresh_authority_refused.load(Ordering::Relaxed),
             refresh_refused: counters.refresh_refused.load(Ordering::Relaxed),
+            refresh_arm_stale: counters.refresh_arm_stale.load(Ordering::Relaxed),
+            refused_release_parked: counters.refused_release_parked.load(Ordering::Relaxed),
+            refused_release_recovered: counters.refused_release_recovered.load(Ordering::Relaxed),
+            refused_release_unowned: counters.refused_release_unowned.load(Ordering::Relaxed),
+            refused_release_outstanding: schedule.refused.len() as u64,
             armed: schedule.armed.len() as u64,
             worker_started: schedule.worker.is_some(),
             terminal: schedule.terminal,
         }
+    }
+
+    /// The armed refresh record's `(deadline, seq)` for `key`, if any.
+    ///
+    /// `seq` is minted per arm, so a witness can prove a record actually FIRED
+    /// and re-armed (the seq advances) rather than inferring it from an
+    /// aggregate renewal count, and `deadline` is what proves a joining holder
+    /// did not postpone a live cadence.
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn sensing_refresh_arm_for_test(
+        &self,
+        key: &sensing::SensingLeaseKey,
+    ) -> Option<(Instant, u64)> {
+        self.sensing_refresh
+            .lock()
+            .armed
+            .get(key)
+            .map(|armed| (armed.deadline, armed.seq))
+    }
+
+    /// Drive the refresh schedule's terminal close directly, so a witness can
+    /// interleave two closers or cancel one without tearing the whole node
+    /// down first.
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub async fn close_sensing_refresh_for_test(&self) {
+        self.close_sensing_refresh().await;
+    }
+
+    /// Whether the refresh worker's teardown has published SETTLEMENT.
+    /// `None` when no worker was ever spawned.
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn sensing_refresh_settled_for_test(&self) -> Option<bool> {
+        self.sensing_refresh
+            .lock()
+            .worker
+            .as_ref()
+            .map(|worker| worker.is_settled())
+    }
+
+    /// Whether the refresh worker's handle is still OWNED by its teardown
+    /// slot. `None` when no worker exists or a closer holds the slot.
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn sensing_refresh_handle_owned_for_test(&self) -> Option<bool> {
+        self.sensing_refresh
+            .lock()
+            .worker
+            .as_ref()
+            .and_then(|worker| worker.handle_owned())
     }
 
     /// [`Self::prepare_org_egress`] for a release, where the interest spec is
