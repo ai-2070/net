@@ -86,6 +86,18 @@ struct Candidate {
     provider: EntityId,
     owner_org: net::adapter::net::behavior::org::OrgId,
     same_org: bool,
+    /// Discovered on the OWNER-PRIVATE plane, as opposed to under a held
+    /// DISCOVER grant or on the public exported plane.
+    ///
+    /// Distinct from [`Self::same_org`], and deliberately so: a grant issued
+    /// by this organization to itself is valid, and its provider is same-org —
+    /// but it was never in owner-private discovery, which is the ONLY domain
+    /// core's sensed population is derived from
+    /// (`MeshNode::org_sensing_authorized_population`). Classifying by owner
+    /// org alone made the sensing expectation ask for a provider core cannot
+    /// publish, so the two sides never agreed and every call past the floor
+    /// reconverged the same unchanged owner population.
+    owner_plane: bool,
 }
 
 /// A discovered provider this credential set is authorized to invoke
@@ -108,6 +120,10 @@ pub(crate) struct AuthorizedOrgCandidate {
     /// (OA2-E0.3: protected RPC is direct-session-only). Annotated here, never
     /// a filter on authorization.
     pub(crate) direct: bool,
+    /// Whether owner-private discovery produced this candidate — the SENSING
+    /// domain, carried forward from [`Candidate::owner_plane`]. Never an
+    /// authorization input: a granted candidate is invoked exactly as before.
+    pub(crate) owner_plane: bool,
     /// The capability being invoked.
     pub(crate) capability: CapabilityAuthorityId,
 }
@@ -603,18 +619,30 @@ impl OrgClient {
         let family = acquisition.family();
 
         // What this capability's demand SHOULD be retained over: the pinned
-        // same-organization candidates of this very derivation, plus this node
+        // OWNER-PLANE candidates of this very derivation, plus this node
         // itself when it is its own authorized provider - core's population
         // rule includes the self-provider, and an expectation that omitted it
         // could never agree with what core publishes.
+        //
+        // The domain is provenance, not owner org. Core derives the sensed
+        // population from owner-private discovery alone
+        // (`org_sensing_authorized_population`), so a provider discovered only
+        // under a held DISCOVER grant is outside it even when that grant was
+        // issued by this organization to itself and the candidate is therefore
+        // `Mode::SameOrg`. Asking for one made agreement unreachable: the two
+        // sides differed by a provider core can never publish, so every call
+        // past the retry floor reconverged an owner population that had not
+        // changed. Invocation authority is untouched - the granted candidate
+        // is still authorized, still ordered and still callable.
         let mut expected: Vec<u64> = candidates
             .iter()
-            .filter(|candidate| matches!(candidate.mode, Mode::SameOrg) && candidate.direct)
+            .filter(|candidate| candidate.owner_plane && candidate.direct)
             .map(|candidate| candidate.provider.node_id())
             .collect();
-        if candidates.iter().any(|candidate| {
-            matches!(candidate.mode, Mode::SameOrg) && candidate.provider == *self.node.entity_id()
-        }) {
+        if candidates
+            .iter()
+            .any(|candidate| candidate.owner_plane && candidate.provider == *self.node.entity_id())
+        {
             expected.push(self.node.node_id());
         }
         expected.sort_unstable();
@@ -925,6 +953,7 @@ impl OrgClient {
                 provider_owner_org,
                 mode,
                 direct: false,
+                owner_plane: candidate.owner_plane,
                 capability: *capability,
             });
         }
@@ -997,6 +1026,9 @@ impl OrgClient {
                     same_org: p.owner_org == self.acting_org,
                     provider: p.provider,
                     owner_org: p.owner_org,
+                    // The public exported plane is not owner-private
+                    // discovery, and the exported path never senses anyway.
+                    owner_plane: false,
                 },
             );
         }
@@ -1010,7 +1042,9 @@ impl OrgClient {
     /// from grants this client holds DISCOVER on. The plane order — owner first,
     /// then held grants in held order — and the dedup rule are unchanged: an
     /// owner-plane duplicate wins, so a provider visible on both planes is
-    /// classified same-org exactly as before.
+    /// classified same-org exactly as before, and now also keeps the owner
+    /// plane's PROVENANCE — which is what sensing may derive an expectation
+    /// from.
     ///
     /// Pure over the capture (OLB-2B.3d-pre): no query, no clock, no lock. The
     /// grant loop still walks `self.grants` rather than the capture's rows, so
@@ -1029,6 +1063,7 @@ impl OrgClient {
                     provider: c.provider.clone(),
                     owner_org: c.owner_org,
                     same_org: true,
+                    owner_plane: true,
                 },
             );
         }
@@ -1050,6 +1085,9 @@ impl OrgClient {
                         provider: provider.clone(),
                         owner_org: *owner_org,
                         same_org,
+                        // Same-org or not, a grant-plane record is invisible
+                        // to core's owner-private population query.
+                        owner_plane: false,
                     },
                 );
             }

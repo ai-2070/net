@@ -293,6 +293,20 @@ fn bind(member: &Member) -> OrgClient {
     member.mesh.org(credentials).expect("bind")
 }
 
+/// [`bind`] for a credential set that also HOLDS `grants` — the granted
+/// discovery plane, through the same public verb.
+fn bind_with(member: &Member, grants: Vec<net_sdk::org::types::OrgCapabilityGrant>) -> OrgClient {
+    let entity = member.identity.entity_id().clone();
+    let cert = OrgMembershipCert::try_issue(&org(), entity.clone(), 1, 3600).expect("membership");
+    let dispatcher = OrgDispatcherGrant::try_issue(&org(), entity, DispatcherScope::Any, 3600)
+        .expect("dispatcher grant");
+    // No audience secret: the grant's discovery audience is installed on the
+    // NODE (`install_consumer_grant_audience`), which is what makes the
+    // granted plane resolvable — the client only needs the grant itself.
+    let credentials = OrgCredentials::new(cert, dispatcher, grants, vec![]).expect("credentials");
+    member.mesh.org(credentials).expect("bind")
+}
+
 /// The consumer's authorized SameOrg population: VERIFIED owner-private
 /// discovery intersected with this node's entity pins. Exactly what authorizes
 /// a candidate, and what sensing may reorder but never extend.
@@ -1078,14 +1092,33 @@ async fn a_holder_that_dies_after_convergence_is_reacquired() {
 }
 
 /// Concurrent clones that ACTUALLY contend for the reconciliation section
-/// produce exactly ONE convergence.
+/// produce exactly ONE convergence — and never occupy the section together.
 ///
 /// Spawning is not overlap, and final row cardinality is not convergence
-/// multiplicity — core serializes its own ticket transaction, so several
+/// multiplicity: core serializes its own ticket transaction, so several
 /// redundant convergences would still leave one demand and two rows behind.
-/// This witness therefore holds the section open from INSIDE while the other
-/// callers arrive at its door, counts the arrivals, and then counts how many
-/// callers got past the decision.
+///
+/// Nor is "one caller parked while the others arrive at the door" enough. That
+/// schedule survives an UNSERIALIZED section through a single early winner:
+/// the parked caller sleeps, one other completes the sole convergence, the
+/// rest reuse its record, and the parked one reuses it on waking — four
+/// arrivals, one convergence, nothing detected.
+///
+/// So this witness measures OCCUPANCY instead. Every caller that enters the
+/// section raises a gauge, waits — bounded — for the gauge to reach the caller
+/// count, and lowers it on the way out. Two things are then asserted, and only
+/// the first of them can discriminate:
+///
+/// * the gauge's high-water mark is 1. A second caller cannot be inside while
+///   the first is still there, so removing the serialization fails this
+///   immediately and by construction — all four are then inside together,
+///   which is exactly what the barrier waits for. It is not a timing accident:
+///   an executed run with the lock removed reports a peak of four every time.
+/// * exactly one caller converges. This is the PROPERTY serialization exists
+///   for, and deliberately not the discriminator: with the lock removed the
+///   same executed run still reported one convergence, because the caller that
+///   released the barrier committed its record before the others resumed —
+///   the reviewer's early-winner schedule, observed rather than argued.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn contending_clones_produce_exactly_one_convergence() {
     let cell = Cell::stand_up(
@@ -1098,33 +1131,31 @@ async fn contending_clones_produce_exactly_one_convergence() {
     )
     .await;
     const CALLERS: u64 = 4;
+    // Long enough that four serialized holds still finish quickly, and far
+    // longer than the microseconds an unserialized section needs to put every
+    // caller inside at once.
+    const HOLD: Duration = Duration::from_millis(400);
 
-    // The first caller into the section parks there until every other caller
-    // has arrived at the door. Arrivals are counted BEFORE the lock, so this
-    // is observed contention, not a sleep.
-    let parked = Arc::new(AtomicUsize::new(0));
+    let inside = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
     {
-        let client = cell.client.clone();
-        let parked = parked.clone();
+        let inside = inside.clone();
+        let peak = peak.clone();
         cell.client
             .set_sensing_section_hook_for_test(Some(Arc::new(move || {
-                if parked.fetch_add(1, Ordering::SeqCst) > 0 {
-                    return; // Only the first holder parks.
-                }
-                let deadline = Instant::now() + Duration::from_secs(10);
-                loop {
-                    let (arrivals, _) = client
-                        .sensing_section_counters()
-                        .expect("an active binding");
-                    if arrivals >= CALLERS {
-                        return;
+                let occupancy = inside.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(occupancy, Ordering::SeqCst);
+                let deadline = Instant::now() + HOLD;
+                while Instant::now() < deadline {
+                    let now_inside = inside.load(Ordering::SeqCst);
+                    peak.fetch_max(now_inside, Ordering::SeqCst);
+                    if now_inside >= CALLERS as usize {
+                        break; // Everyone is in here together - nothing serialized this.
                     }
-                    assert!(
-                        Instant::now() < deadline,
-                        "the other callers never reached the section door"
-                    );
-                    std::thread::sleep(Duration::from_millis(10));
+                    std::thread::sleep(Duration::from_millis(5));
                 }
+                peak.fetch_max(inside.load(Ordering::SeqCst), Ordering::SeqCst);
+                inside.fetch_sub(1, Ordering::SeqCst);
             })));
     }
 
@@ -1150,7 +1181,12 @@ async fn contending_clones_produce_exactly_one_convergence() {
         .expect("an active binding");
     assert!(
         arrivals >= CALLERS,
-        "precondition: the callers really contended for the section, saw {arrivals}"
+        "precondition: every caller reached the section door, saw {arrivals}"
+    );
+    assert_eq!(
+        peak.load(Ordering::SeqCst),
+        1,
+        "two callers were inside the reconciliation section at once"
     );
     assert_eq!(
         convergences, 1,
@@ -1186,16 +1222,19 @@ async fn contending_clones_produce_exactly_one_convergence() {
 // WITHIN-ATTEMPT discovery movement: the two directions, executed
 // ---------------------------------------------------------------------------
 
-/// Inject a real owner-scoped announcement for `provider` into `consumer`,
-/// expiring at `expires_at`, and pin the provider's entity.
+/// Inject a real owner-scoped announcement for `provider` into `consumer` at
+/// `sequence`, expiring at `expires_at`, and pin the provider's entity.
 ///
 /// Both halves go through the shipped verified paths: the envelope is built by
 /// the canonical builder and admitted by the real ingest, and the pin is the
-/// same TOFU entry a handshake writes.
-fn discover_synthetic(
+/// same TOFU entry a handshake writes. `sequence` is the announcement's own
+/// soft-state sequence, so a later one genuinely REPLACES an expired row
+/// rather than being dropped as stale.
+fn discover_synthetic_at(
     consumer: &Member,
     owner: &OrgKeypair,
     provider: &net::adapter::net::identity::EntityKeypair,
+    sequence: u64,
     expires_at: u64,
 ) {
     let authority = consumer.node.node_authority().expect("authority");
@@ -1209,7 +1248,7 @@ fn discover_synthetic(
             cert,
             authority.audience.audience_handle,
             authority.audience.discovery_key(),
-            1,
+            sequence,
             expires_at,
             &descriptor,
         )
@@ -1220,6 +1259,16 @@ fn discover_synthetic(
     consumer
         .node
         .test_pin_peer_entity(provider.entity_id().node_id(), provider.entity_id().clone());
+}
+
+/// [`discover_synthetic_at`] at the first sequence.
+fn discover_synthetic(
+    consumer: &Member,
+    owner: &OrgKeypair,
+    provider: &net::adapter::net::identity::EntityKeypair,
+    expires_at: u64,
+) {
+    discover_synthetic_at(consumer, owner, provider, 1, expires_at);
 }
 
 fn unix_now() -> u64 {
@@ -1436,15 +1485,19 @@ async fn a_capped_population_agrees_with_a_wider_expectation() {
     .await;
 
     let _armed = cell.try_call().await;
-    let (population, retained, identity) = demand_state(&cell.client).expect("demand");
+    let (published, retained, identity) = demand_state(&cell.client).expect("demand");
     assert_eq!(
-        population.len(),
+        published.len(),
         MAX_SENSED_POPULATION,
         "core truncated the population to its own bound"
     );
+    assert_eq!(retained, published, "with a holder for every capped member");
+    let mut canonical = population(&cell.consumer);
+    canonical.truncate(MAX_SENSED_POPULATION);
     assert_eq!(
-        retained, population,
-        "with a holder for every capped member"
+        published, canonical,
+        "and it is core's CANONICAL prefix - the lowest ids of the expectation - \
+         not merely some cap-sized subset of it"
     );
 
     // It SETTLES: repeated calls, and calls past the retry floor, reuse the
@@ -1460,6 +1513,298 @@ async fn a_capped_population_agrees_with_a_wider_expectation() {
         identity, identity_again,
         "a capped population is agreement, not a mismatch to retry forever"
     );
+    cell.cleanup();
+}
+
+/// A provider that belongs in the CANONICAL capped population, and went
+/// missing from one attempt, is recovered under an UNCHANGED expectation.
+///
+/// This is the reviewer's reproduction as a witness, and it is the exact case
+/// "cap-sized and contained" cannot see. The lowest-id provider's discovery
+/// row expires inside the attempt, so core publishes a full-sized population
+/// that is a subset of the expectation but NOT the prefix core's own rule
+/// would have produced. The provider is then republished at a later sequence
+/// BEFORE the next call, so the next expectation is byte-for-byte the recorded
+/// one: no changed input, no authority movement, no dead holder — nothing but
+/// the agreement rule can retry this, and nothing but the canonical rule can
+/// tell the two full-sized populations apart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_missing_canonical_member_is_recovered_under_an_unchanged_expectation() {
+    use net::adapter::net::behavior::org_sensing_demand::MAX_SENSED_POPULATION;
+    use net::adapter::net::identity::EntityKeypair;
+
+    let cell = Cell::stand_up(
+        "canon",
+        true,
+        &[
+            (true, Duration::from_millis(1)),
+            (true, Duration::from_millis(1)),
+        ],
+    )
+    .await;
+
+    // More authorized, pinned providers than the cap, so truncation is real.
+    let crowd: Vec<EntityKeypair> = (0..MAX_SENSED_POPULATION + 8)
+        .map(|_| EntityKeypair::generate())
+        .collect();
+    for member in &crowd {
+        discover_synthetic(&cell.consumer, &org(), member, unix_now() + 3600);
+    }
+
+    // ...plus ONE more whose node id is below every other member of the
+    // expectation, so it is unambiguously inside core's canonical prefix. Node
+    // ids come from entity bytes, so this is found by generating rather than
+    // chosen.
+    let floor_id = crowd
+        .iter()
+        .map(|member| member.entity_id().node_id())
+        .chain(cell.providers.iter().map(|p| p.node.node_id()))
+        .min()
+        .expect("a non-empty crowd");
+    let mut lowest = None;
+    for _ in 0..4096 {
+        let candidate = EntityKeypair::generate();
+        if candidate.entity_id().node_id() < floor_id {
+            lowest = Some(candidate);
+            break;
+        }
+    }
+    let lowest = lowest.expect("a provider below every other id");
+    let lowest_id = lowest.entity_id().node_id();
+    // Its row expires two seconds out; every other row outlives the witness.
+    discover_synthetic_at(&cell.consumer, &org(), &lowest, 1, unix_now() + 2);
+    until("the crowd was never discovered", SETTLE, || {
+        let seen = population(&cell.consumer);
+        seen.len() > MAX_SENSED_POPULATION && seen.contains(&lowest_id)
+    })
+    .await;
+    let expectation = population(&cell.consumer);
+    assert_eq!(
+        expectation.first(),
+        Some(&lowest_id),
+        "precondition: the ephemeral provider leads the canonical prefix"
+    );
+
+    // Hold ONE attempt open across that expiry: core's query no longer sees
+    // the lowest provider, so it publishes a full-sized population that is a
+    // strict subset of the expectation.
+    let fired = Arc::new(AtomicUsize::new(0));
+    {
+        let fired = fired.clone();
+        cell.client
+            .set_sensing_section_hook_for_test(Some(Arc::new(move || {
+                if fired.fetch_add(1, Ordering::SeqCst) == 0 {
+                    std::thread::sleep(Duration::from_millis(2500));
+                }
+            })));
+    }
+    let _armed = cell.try_call().await;
+    cell.client.set_sensing_section_hook_for_test(None);
+    assert_eq!(
+        fired.load(Ordering::SeqCst),
+        1,
+        "the section hook must have held one attempt open"
+    );
+    let (published, retained, identity) = demand_state(&cell.client).expect("demand");
+    assert_eq!(
+        published.len(),
+        MAX_SENSED_POPULATION,
+        "core still published a FULL-sized population: {published:?}"
+    );
+    assert_eq!(retained, published, "with a holder for every member");
+    assert!(
+        !published.contains(&lowest_id),
+        "and it is missing the canonical member: {published:?}"
+    );
+
+    // Restore it BEFORE the next call, at a later sequence, so the next
+    // expectation is the recorded one exactly.
+    discover_synthetic_at(&cell.consumer, &org(), &lowest, 2, unix_now() + 3600);
+    until("the lowest provider was never rediscovered", SETTLE, || {
+        population(&cell.consumer).contains(&lowest_id)
+    })
+    .await;
+    assert_eq!(
+        population(&cell.consumer),
+        expectation,
+        "precondition: the expectation is UNCHANGED - only the published \
+         population disagrees with it"
+    );
+
+    // The disagreement must be retried, and the canonical population restored.
+    cell.call_until(
+        "a full-sized non-canonical population was certified and never retried",
+        Duration::from_secs(30),
+        || {
+            demand_state(&cell.client)
+                .map(|(population, retained, _)| {
+                    population.contains(&lowest_id) && retained == population
+                })
+                .unwrap_or(false)
+        },
+    )
+    .await;
+    let (recovered, _, recovered_identity) = demand_state(&cell.client).expect("demand");
+    let mut canonical = population(&cell.consumer);
+    canonical.truncate(MAX_SENSED_POPULATION);
+    assert_eq!(
+        recovered, canonical,
+        "the recovered population is core's canonical prefix"
+    );
+    assert_ne!(
+        identity, recovered_identity,
+        "and it really re-converged rather than reporting the old demand"
+    );
+
+    // ...and now that the two sides agree, the cap settles again.
+    for _ in 0..3 {
+        let _ = cell.try_call().await;
+    }
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    let _ = cell.try_call().await;
+    let (_, _, settled) = demand_state(&cell.client).expect("demand");
+    assert_eq!(
+        recovered_identity, settled,
+        "a canonical capped population is agreement, not a mismatch to retry forever"
+    );
+    cell.cleanup();
+}
+
+/// A SAME-ORGANIZATION provider discovered only under a held DISCOVER grant is
+/// outside the sensing expectation, so stable inputs reuse the owner demand.
+///
+/// Same-org grants are legitimate — an organization may issue one to itself —
+/// and this witness installs a real one: a real audience, a real granted
+/// envelope through the ordinary ingest path, a real pin. What it must NOT do
+/// is enter the SENSED expectation: core derives the sensed population from
+/// owner-private discovery alone, so an expectation that asked for the
+/// grant-plane provider could never be met, and every call past the retry
+/// floor reconverged an owner population that had not changed.
+///
+/// Classifying by owner org alone cannot see this: the grant-plane provider IS
+/// same-org. Only its discovery provenance separates it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_same_org_grant_only_provider_is_outside_the_sensing_expectation() {
+    use net::adapter::net::behavior::org_scoped_ann::ScopedCapabilityAnnouncement;
+    use net::adapter::net::identity::EntityKeypair;
+    use net_sdk::org::types::{GrantRights, GrantTargetScope, OrgCapabilityGrant};
+
+    let cell = Cell::stand_up(
+        "sameorg-grant",
+        true,
+        &[
+            (true, Duration::from_millis(1)),
+            (true, Duration::from_millis(1)),
+        ],
+    )
+    .await;
+
+    // A REAL grant, issued by this organization TO ITSELF, carrying both
+    // rights - so the provider under it is genuinely discoverable and
+    // genuinely invocable.
+    let (grant, secret) = OrgCapabilityGrant::try_issue(
+        &org(),
+        org().org_id(),
+        capability(),
+        GrantRights::DISCOVER.union(GrantRights::INVOKE),
+        GrantTargetScope::AnyNodeOwnedBy(org().org_id()),
+        3600,
+    )
+    .expect("issue the same-organization grant");
+    let secret = secret.expect("a DISCOVER grant carries audience material");
+    let grant_id = grant.grant_id;
+    let audience_handle = secret.audience_handle;
+    let discovery_key = *secret.discovery_key();
+    cell.consumer
+        .node
+        .install_consumer_grant_audience(grant.clone(), secret)
+        .expect("install the consumer grant audience");
+
+    // The grant-plane provider: announced under that grant's audience, pinned
+    // exactly like an owner-plane one, and never announced on the owner plane.
+    let granted = EntityKeypair::generate();
+    let granted_id = granted.entity_id().node_id();
+    let cert = OrgMembershipCert::try_issue(&org(), granted.entity_id().clone(), 1, 3600)
+        .expect("membership");
+    let descriptor = CapabilitySet::new().add_tag(TAG).to_bytes_compact();
+    let envelope = ScopedCapabilityAnnouncement::build_granted(
+        &granted,
+        org().org_id(),
+        cert,
+        grant_id,
+        audience_handle,
+        &discovery_key,
+        1,
+        unix_now() + 3600,
+        &descriptor,
+    )
+    .expect("granted envelope");
+    cell.consumer
+        .node
+        .ingest_scoped_announcement_for_test(&envelope.to_bytes());
+    cell.consumer
+        .node
+        .test_pin_peer_entity(granted.entity_id().node_id(), granted.entity_id().clone());
+
+    // It really is on the granted plane, and really is not on the owner one -
+    // so the exclusion below is a decision, not an empty set.
+    until(
+        "the granted-plane provider was never discovered",
+        SETTLE,
+        || {
+            cell.consumer
+                .node
+                .org_cold_discovery(&capability(), &[grant_id])
+                .map(|capture| {
+                    capture
+                        .granted_providers(&grant_id)
+                        .iter()
+                        .any(|row| row.provider == *granted.entity_id())
+                })
+                .unwrap_or(false)
+        },
+    )
+    .await;
+    let owner_population = population(&cell.consumer);
+    assert!(
+        !owner_population.contains(&granted_id),
+        "precondition: owner-private discovery never saw it: {owner_population:?}"
+    );
+
+    // A client that HOLDS the grant: its candidate list includes the
+    // grant-plane provider, and its sensing expectation must not.
+    let client = bind_with(&cell.consumer, vec![grant]);
+    let _first = client
+        .call::<Ping, Pong>(SERVICE, &Ping { n: 1 })
+        .await
+        .map(|reply| reply.served_by);
+    let (population_now, retained, identity) = demand_state(&client).expect("demand");
+    assert_eq!(
+        population_now, owner_population,
+        "the sensed population is the OWNER plane's"
+    );
+    assert_eq!(retained, population_now, "with a holder for each");
+    let (_, converged) = client
+        .sensing_section_counters()
+        .expect("an active binding");
+    assert_eq!(converged, 1, "one convergence for the first call");
+
+    // Nothing changes: same discovery, same authority, same holders. Calls
+    // past the retry floor must REUSE the demand rather than reconverge it.
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    for _ in 0..3 {
+        let _ = client.call::<Ping, Pong>(SERVICE, &Ping { n: 1 }).await;
+    }
+    let (_, converged_again) = client
+        .sensing_section_counters()
+        .expect("an active binding");
+    let (_, _, identity_again) = demand_state(&client).expect("demand");
+    assert_eq!(
+        converged, converged_again,
+        "stable inputs must not reconverge: an unreachable expectation retried forever"
+    );
+    assert_eq!(identity, identity_again, "and the demand is the same one");
+    drop(client);
     cell.cleanup();
 }
 

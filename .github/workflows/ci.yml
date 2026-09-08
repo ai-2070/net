@@ -2140,6 +2140,8 @@ jobs:
             within_attempt_narrowing_is_not_certified_as_agreement
             within_attempt_widening_is_not_certified_as_agreement
             a_capped_population_agrees_with_a_wider_expectation
+            a_missing_canonical_member_is_recovered_under_an_unchanged_expectation
+            a_same_org_grant_only_provider_is_outside_the_sensing_expectation
             live_evidence_stops_vouching_at_a_later_instant
             withdrawn_readiness_reads_unknown_and_plans_deterministically
             an_all_not_ready_population_still_calls_in_the_deterministic_order
@@ -2162,8 +2164,8 @@ jobs:
               || { printf '%s\n' "$single"; echo "::error::$required did not run and pass as exactly one test"; exit 1; }
             pinned=$((pinned + 1))
           done
-          [ "$listed" -ge 20 ] \
-            || { echo "::error::expected at least 20 production witnesses, saw $listed"; exit 1; }
+          [ "$listed" -ge 22 ] \
+            || { echo "::error::expected at least 22 production witnesses, saw $listed"; exit 1; }
           echo "organization exact production call edge: $listed listed, $pinned pinned by name, all green"
 
       # The DARK-BOUNDARY fact for the production path: the SDK library builds
