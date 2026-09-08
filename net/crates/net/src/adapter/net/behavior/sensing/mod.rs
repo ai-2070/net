@@ -78,7 +78,7 @@ pub use lease::{
     LeaseAction, LeaseRefused, LeaseToken, SensingInterestLeases, SensingLeaseKey,
     SensingLeaseTicket,
 };
-pub(crate) use lease::{LeasePlane, MAX_LEASED_INTERESTS};
+pub(crate) use lease::{LeasePlane, MAX_HOLDERS_PER_INTEREST, MAX_LEASED_INTERESTS};
 pub use negotiation::{select_sensing_path, SensingPath, SENSING_CAPABILITY_TAG};
 pub use org_gate::{
     canonical_org_sensing_commitment, verify_org_sensing_registration, OrgSensingRejection,

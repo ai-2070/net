@@ -6878,14 +6878,27 @@ pub(crate) struct OrgSensingDemandCounters {
     /// NEWER installation. A stale worker re-arm must never overwrite its own
     /// successor's schedule.
     refresh_arm_stale: AtomicU64,
+    /// Arms that ADOPTED an installation whose freshness this node does not
+    /// know (a coalescing join onto a row somebody else established), and
+    /// therefore renewed it immediately instead of waiting a full period.
+    refresh_adopted: AtomicU64,
     /// Retirement releases the transaction REFUSED, whose still-live ticket
     /// was therefore retained on the node for paced retry rather than lost.
     refused_release_parked: AtomicU64,
+    /// Retained refused releases the worker ATTEMPTED again, successful or
+    /// not — the observable that a paced retry really ran.
+    refused_release_retried: AtomicU64,
     /// Retained refused releases that a later retry discharged.
     refused_release_recovered: AtomicU64,
     /// Refused releases that could NOT be retained (the retention set is at
     /// its bound, or the node is already terminal). Counted, never silent.
     refused_release_unowned: AtomicU64,
+    /// STALE retained releases reclaimed: their installation is gone, so there
+    /// is no live holder left to own and the slot is returned to the bound.
+    refused_release_reclaimed: AtomicU64,
+    /// Carried-forward holders whose installation was INVALIDATED under them,
+    /// so the convergence re-acquired rather than copying dead ownership.
+    ownership_invalidated: AtomicU64,
 }
 
 impl OrgSensingDemandCounters {
@@ -6902,6 +6915,13 @@ impl OrgSensingDemandCounters {
     /// A retention was refused at a bound; nothing was evicted.
     pub(crate) fn note_at_capacity(&self) {
         self.refused_at_capacity.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `count` carried-forward holders were dropped because their installation
+    /// no longer exists.
+    pub(crate) fn note_ownership_invalidated(&self, count: u64) {
+        self.ownership_invalidated
+            .fetch_add(count, Ordering::Relaxed);
     }
 
     /// A retention could not be authored under live organization authority.
@@ -6937,12 +6957,22 @@ pub struct OrgSensingDemandState {
     pub refresh_refused: u64,
     /// Arms refused because a newer installation owns the key's schedule.
     pub refresh_arm_stale: u64,
+    /// Arms that adopted an installation of unknown freshness.
+    pub refresh_adopted: u64,
     /// Refused retirement releases retained for paced retry.
     pub refused_release_parked: u64,
+    /// Retained refused releases the worker attempted again.
+    pub refused_release_retried: u64,
     /// Retained refused releases a later retry discharged.
     pub refused_release_recovered: u64,
     /// Refused releases that could not be retained at all.
     pub refused_release_unowned: u64,
+    /// Stale retained releases reclaimed because their installation is gone.
+    pub refused_release_reclaimed: u64,
+    /// Carried-forward holders dropped because their installation was
+    /// invalidated: the ownership was no longer real, so the provider was
+    /// re-acquired instead of reported as retained forever.
+    pub ownership_invalidated: u64,
     /// Refused releases still retained RIGHT NOW, awaiting retry.
     pub refused_release_outstanding: u64,
     /// Installations currently armed for refresh.
@@ -6966,15 +6996,60 @@ struct ArmedRefresh {
     period: Duration,
 }
 
+/// The FLOOR on the refresh period, and therefore on the rate at which the
+/// node's single refresh worker can become due again.
+///
+/// See [`MeshNode::sensing_refresh_period`]: without it a nanosecond-scale
+/// soft-state horizon makes the due-set continuously due, and the worker's
+/// loop never reaches a park.
+pub(crate) const MIN_SENSING_REFRESH_PERIOD: Duration = Duration::from_millis(1);
+
+/// What an arm KNOWS about the freshness of the installation it is arming.
+///
+/// The first deadline has to be grounded in the row's actual freshness, not in
+/// when the arm happened: a coalescing acquisition that joins an existing
+/// installation changes neither table nor wire, so `now + period` can land
+/// after a row that was already older than a period.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SensingArmProvenance {
+    /// This arm follows a wire-changing action for the installation — an
+    /// establishing acquisition, or a renewal the worker just performed. The
+    /// row is fresh by construction.
+    Established,
+    /// This arm follows a COALESCING acquisition: the installation already
+    /// existed and nothing was re-registered, so its age is unknown here.
+    Adopted,
+}
+
+/// Whether a refused release is entering the retention set for the FIRST time
+/// or being put back by the retry loop that extracted it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefusedReleaseAdmission {
+    /// A new refusal. Bounded, and refused fail-closed once live ownership
+    /// genuinely fills the set.
+    Fresh,
+    /// A ticket the node ALREADY owns, going back after a failed retry.
+    /// Capacity-exempt: dropping it would be the same lost-ownership defect
+    /// the retention exists to prevent.
+    Reinstated,
+}
+
 /// How many refused retirement releases one node will RETAIN for retry.
 ///
 /// A refused release means the transaction rolled back and the holder is still
 /// live and still ours, so dropping the ticket leaks a holder that nothing can
-/// ever release. Ownership therefore moves here. The set is bounded by the
-/// same figure that bounds armed records — one retained release is at most one
-/// live lease entry — and a park that cannot be admitted is counted, never
-/// silent.
-const MAX_SENSING_REFUSED_RELEASES: usize = MAX_SENSING_REFRESH_ARMED;
+/// ever release. Ownership therefore moves here.
+///
+/// DERIVED from the registry's own live-holder capacity, not from the interest
+/// count: several independent owners may each hold — and each be refused on —
+/// the SAME key, so "one pending entry per live key" is not a valid bound.
+/// Every pending entry names one distinct live `(key, token)` holder, and the
+/// registry admits at most `MAX_LEASED_INTERESTS * MAX_HOLDERS_PER_INTEREST`
+/// of those in total, so a LIVE refused ticket always fits once stale entries
+/// (whose installation is gone) have been reclaimed. The refusal path is kept
+/// as a counted fail-closed backstop for that invariant, not as a policy.
+const MAX_SENSING_REFUSED_RELEASES: usize =
+    sensing::MAX_LEASED_INTERESTS * sensing::MAX_HOLDERS_PER_INTEREST;
 
 /// A retirement release the transaction REFUSED, retained so the still-live
 /// holder keeps an owner.
@@ -10315,6 +10390,10 @@ pub struct MeshNode {
     sensing_refresh_wake: Arc<tokio::sync::Notify>,
     /// Organization exact-provider demand and refresh counters.
     org_sensing_demand_counters: Arc<OrgSensingDemandCounters>,
+    /// The live bound on the refused-release retention set. Initialized to
+    /// [`MAX_SENSING_REFUSED_RELEASES`] and only ever narrowed by a witness
+    /// (see [`MeshNode::set_refused_release_cap_for_test`]).
+    refused_release_cap: std::sync::atomic::AtomicUsize,
     /// In-crate witness seam: fires after a release's authority preparation has
     /// succeeded and BEFORE the final currentness application.
     ///
@@ -12227,6 +12306,7 @@ impl MeshNode {
             }),
             sensing_refresh_wake: Arc::new(tokio::sync::Notify::new()),
             org_sensing_demand_counters: Arc::new(OrgSensingDemandCounters::default()),
+            refused_release_cap: std::sync::atomic::AtomicUsize::new(MAX_SENSING_REFUSED_RELEASES),
             #[cfg(test)]
             sensing_release_pre_apply_seam: parking_lot::Mutex::new(None),
             #[cfg(test)]
@@ -12913,13 +12993,16 @@ impl MeshNode {
     /// Install the acquire pre-restore seam. It fires after a refused
     /// tightening's partition has moved the table and before the restoration.
     #[cfg(test)]
-    fn set_sensing_acquire_pre_restore_seam_for_test(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+    pub(crate) fn set_sensing_acquire_pre_restore_seam_for_test(
+        &self,
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) {
         *self.sensing_acquire_pre_restore_seam.lock() = Some(hook);
     }
 
     /// Remove the acquire pre-restore seam.
     #[cfg(test)]
-    fn clear_sensing_acquire_pre_restore_seam_for_test(&self) {
+    pub(crate) fn clear_sensing_acquire_pre_restore_seam_for_test(&self) {
         *self.sensing_acquire_pre_restore_seam.lock() = None;
     }
 
@@ -14206,7 +14289,7 @@ impl MeshNode {
         SensingRefreshOutcome::Renewed
     }
 
-    /// ARM `key`'s installation for refresh at `now + period`.
+    /// ARM `key`'s installation for refresh.
     ///
     /// Takes the node by `Arc` deliberately: the worker holds a `Weak` back to
     /// it, so the schedule can never keep the node alive, and no
@@ -14236,12 +14319,42 @@ impl MeshNode {
         key: sensing::SensingLeaseKey,
         installation_id: sensing::LeaseToken,
         period: Duration,
+        provenance: SensingArmProvenance,
     ) -> bool {
-        let deadline = Instant::now() + period;
+        let now = Instant::now();
         let mut schedule = node.sensing_refresh.lock();
         if schedule.terminal {
             return false;
         }
+        // THE FIRST deadline depends on what this arm knows about the
+        // installation's freshness, not on when the arm happened:
+        //
+        // * `Established`/`Renewed` — the wire row was (re-)registered just
+        //   now, so a full period is exactly right;
+        // * `Adopted` — this acquisition JOINED a row that already existed and
+        //   coalesced (no table or wire change). Its age is unknown and it may
+        //   already be older than a period, in which case `now + period` lands
+        //   AFTER its expiry. Unless somebody is already renewing it, adopt it
+        //   by renewing IMMEDIATELY; the upstream damper drops the emission if
+        //   the row turns out to be fresh after all.
+        let deadline = match provenance {
+            SensingArmProvenance::Established => now + period,
+            SensingArmProvenance::Adopted => {
+                if schedule
+                    .armed
+                    .get(&key)
+                    .is_some_and(|armed| armed.installation_id == installation_id)
+                {
+                    // Already on somebody's cadence: grounded, and postponing
+                    // it is exactly what the join rule forbids.
+                    return true;
+                }
+                node.org_sensing_demand_counters
+                    .refresh_adopted
+                    .fetch_add(1, Ordering::Relaxed);
+                now
+            }
+        };
         match schedule.armed.get(&key) {
             Some(existing) if existing.installation_id > installation_id => {
                 node.org_sensing_demand_counters
@@ -14338,9 +14451,9 @@ impl MeshNode {
     /// Ownership therefore moves to the node's refresh worker, which retries on
     /// its own cadence.
     ///
-    /// Returns `false` when the retention could not be admitted — the bound is
-    /// full, or the node is already terminal (its whole registry is going away
-    /// with it). Counted either way.
+    /// Returns `false` only when the node is already TERMINAL, or when the
+    /// retention set is genuinely full of LIVE ownership after stale entries
+    /// have been reclaimed. Counted either way, never silent.
     pub(crate) fn park_refused_release(
         node: &Arc<MeshNode>,
         ticket: sensing::SensingLeaseTicket,
@@ -14354,6 +14467,7 @@ impl MeshNode {
                 installation_id,
                 provider,
             },
+            RefusedReleaseAdmission::Fresh,
         );
         let counters = &node.org_sensing_demand_counters;
         if retained {
@@ -14368,13 +14482,36 @@ impl MeshNode {
         retained
     }
 
-    /// Put one refused release back into the retention set WITHOUT counting a
-    /// fresh park — the worker's own retry loop, where the node has owned the
-    /// holder all along.
-    fn retain_refused_release(node: &Arc<MeshNode>, entry: RefusedRelease) -> bool {
+    /// Put one refused release into the retention set.
+    ///
+    /// [`RefusedReleaseAdmission::Reinstated`] is capacity-EXEMPT and counts no
+    /// fresh park: the worker extracted the whole set to retry it, so it still
+    /// owns those tickets, and refusing to put an already-owned ticket back is
+    /// exactly the "extract, fail, discard" hole. The transient excess is
+    /// bounded by the extracted set, which came from the bound itself.
+    fn retain_refused_release(
+        node: &Arc<MeshNode>,
+        entry: RefusedRelease,
+        admission: RefusedReleaseAdmission,
+    ) -> bool {
+        if admission == RefusedReleaseAdmission::Fresh {
+            // A pending entry whose installation is gone owns NOTHING — the
+            // registry entry it referenced was invalidated or re-established,
+            // so its token can never be a holder again. Reclaim those before
+            // refusing live ownership for want of a slot.
+            let full = node.sensing_refresh.lock().refused.len() >= node.refused_release_cap();
+            if full {
+                Self::reclaim_stale_refused_releases(node);
+            }
+        }
         let retry_at = Instant::now() + node.sensing_refresh_period();
         let mut schedule = node.sensing_refresh.lock();
-        if schedule.terminal || schedule.refused.len() >= MAX_SENSING_REFUSED_RELEASES {
+        if schedule.terminal {
+            return false;
+        }
+        if admission == RefusedReleaseAdmission::Fresh
+            && schedule.refused.len() >= node.refused_release_cap()
+        {
             return false;
         }
         let wake_before = schedule.next_wake();
@@ -14391,6 +14528,48 @@ impl MeshNode {
             node.sensing_refresh_wake.notify_one();
         }
         true
+    }
+
+    /// Drop retained releases whose INSTALLATION is gone, returning the slots
+    /// to the bound. Such an entry owns nothing: production invalidates whole
+    /// installations (a refused tightening that current authority will not
+    /// restore), and a re-established key carries a strictly newer identity.
+    ///
+    /// Deliberately three phases so the registry lock is never taken UNDER the
+    /// schedule lock: snapshot the identities, ask the registry off-lock, then
+    /// remove exactly the entries proved dead.
+    fn reclaim_stale_refused_releases(node: &Arc<MeshNode>) -> usize {
+        let pending: Vec<(sensing::SensingLeaseKey, sensing::LeaseToken)> = node
+            .sensing_refresh
+            .lock()
+            .refused
+            .iter()
+            .map(|entry| (entry.ticket.key, entry.installation_id))
+            .collect();
+        let dead: std::collections::HashSet<(sensing::SensingLeaseKey, sensing::LeaseToken)> =
+            pending
+                .into_iter()
+                .filter(|(key, installation)| {
+                    node.sensing_refresh_installation(key) != Some(*installation)
+                })
+                .collect();
+        if dead.is_empty() {
+            return 0;
+        }
+        let mut schedule = node.sensing_refresh.lock();
+        let before = schedule.refused.len();
+        schedule
+            .refused
+            .retain(|entry| !dead.contains(&(entry.ticket.key, entry.installation_id)));
+        let reclaimed = before - schedule.refused.len();
+        if schedule.refused.is_empty() {
+            schedule.refused_retry_at = None;
+        }
+        drop(schedule);
+        node.org_sensing_demand_counters
+            .refused_release_reclaimed
+            .fetch_add(reclaimed as u64, Ordering::Relaxed);
+        reclaimed
     }
 
     /// Spawn the single worker if this node does not have one yet. Called
@@ -14508,13 +14687,25 @@ impl MeshNode {
                         // demand is retired or replaced, and re-arming either
                         // would be exactly the resurrection this refuses. The
                         // arm itself refuses to overwrite a successor's record.
+                        //
+                        // `Established`: this arm follows the renewal attempt
+                        // itself, so a full period is the grounded deadline.
                         MeshNode::arm_sensing_refresh(
                             &live,
                             key,
                             record.installation_id,
                             record.period,
+                            SensingArmProvenance::Established,
                         );
                     }
+                    // COOPERATIVE PROGRESS. `Fire` reaches no other await, so a
+                    // schedule that is due again immediately would otherwise
+                    // spin inside one poll and starve every other task on the
+                    // runtime — on a current-thread executor an unrelated timer
+                    // never fires at all. The period floor bounds how often
+                    // that can happen; this bounds what it costs when it does.
+                    drop(live);
+                    tokio::task::yield_now().await;
                 }
                 Step::Retry(pending) => {
                     for entry in pending {
@@ -14523,10 +14714,28 @@ impl MeshNode {
                             .is_err()
                         {
                             // Still refused. Keep OWNING it and try again on the
-                            // next cadence; the set is bounded, the ownership
-                            // was never dropped, and the whole retention dies
-                            // with the node.
-                            MeshNode::retain_refused_release(&live, entry);
+                            // next cadence. The reinstatement is capacity-exempt
+                            // deliberately: this ticket was already ours, and
+                            // refusing to put it back is the same lost-ownership
+                            // defect the retention exists to prevent. Only a
+                            // TERMINAL node declines, and its whole registry
+                            // goes away with it.
+                            if !MeshNode::retain_refused_release(
+                                &live,
+                                entry,
+                                RefusedReleaseAdmission::Reinstated,
+                            ) {
+                                live.org_sensing_demand_counters
+                                    .refused_release_unowned
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                            // Published LAST, deliberately: an observer that
+                            // sees this count has already seen the entry put
+                            // back, so "retried" never exposes the window in
+                            // which the set is transiently empty.
+                            live.org_sensing_demand_counters
+                                .refused_release_retried
+                                .fetch_add(1, Ordering::Relaxed);
                             continue;
                         }
                         live.settle_sensing_refresh(&entry.ticket.key, entry.installation_id);
@@ -14534,11 +14743,17 @@ impl MeshNode {
                         live.org_sensing_demand_counters
                             .refused_release_recovered
                             .fetch_add(1, Ordering::Relaxed);
+                        live.org_sensing_demand_counters
+                            .refused_release_retried
+                            .fetch_add(1, Ordering::Relaxed);
                         tracing::debug!(
                             provider = format!("{:#x}", entry.provider),
                             "org sensing demand: refused retirement release recovered"
                         );
                     }
+                    // Same cooperative yield as `Fire`, for the same reason.
+                    drop(live);
+                    tokio::task::yield_now().await;
                 }
             }
         }
@@ -14656,13 +14871,65 @@ impl MeshNode {
     }
 
     /// The refresh period: half this node's soft-state horizon, so a renewal
-    /// lands before the provider's row can expire even if one is missed.
+    /// lands before the provider's row can expire even if one is missed —
+    /// FLOORED at [`MIN_SENSING_REFRESH_PERIOD`].
     ///
     /// Kept as a `Duration` and armed as an ABSOLUTE deadline, so a sub-second
     /// horizon arms at sub-second precision instead of rounding to a whole
     /// second.
+    ///
+    /// # The floor is a schedule contract, not a policy tweak
+    ///
+    /// `sensing_interest_ttl` accepts any positive `Duration`, including
+    /// nanoseconds. An unfloored `ttl/2` then makes the armed deadline elapse
+    /// before the arm returns, so the worker's due-set is CONTINUOUSLY due and
+    /// its loop never reaches a park. On a single-threaded executor that
+    /// starves every other task on the runtime (an unrelated 20 ms timer never
+    /// fires), which is a real liveness defect rather than a slow test.
+    ///
+    /// A horizon below `2 * MIN_SENSING_REFRESH_PERIOD` therefore CANNOT be
+    /// renewed ahead of its own expiry, and the floor says so honestly instead
+    /// of pretending to meet an unmeetable deadline: rows on such a node
+    /// expire and are re-registered on the next tick. The retained-demand
+    /// cadence itself is still clamped to the ttl by the acquisition path.
     pub(crate) fn sensing_refresh_period(&self) -> Duration {
-        self.config.sensing_interest_ttl / 2
+        (self.config.sensing_interest_ttl / 2).max(MIN_SENSING_REFRESH_PERIOD)
+    }
+
+    /// The live bound on the refused-release retention set.
+    ///
+    /// A plain relaxed load of a field initialized to
+    /// [`MAX_SENSING_REFUSED_RELEASES`]. It exists so a witness can drive the
+    /// SATURATION behaviour — stale reclamation, fail-closed refusal of a fresh
+    /// park, capacity-exempt reinstatement — without fabricating sixteen
+    /// thousand real refused releases. Production never writes it.
+    fn refused_release_cap(&self) -> usize {
+        self.refused_release_cap.load(Ordering::Relaxed)
+    }
+
+    /// Shrink the refused-release retention bound (fixtures/tests only).
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn set_refused_release_cap_for_test(&self, cap: usize) {
+        self.refused_release_cap.store(cap, Ordering::Relaxed);
+    }
+
+    /// Run the retention set's STALE reclamation now, returning how many
+    /// entries owned nothing any more (fixtures/tests only). Production runs
+    /// this on the saturation path.
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn reclaim_stale_refused_releases_for_test(node: &Arc<MeshNode>) -> usize {
+        Self::reclaim_stale_refused_releases(node)
+    }
+
+    /// Pin `entity` as the TOFU identity of `node_id` (fixtures/tests only), so
+    /// a verified discovery record can be projected onto a node id exactly as a
+    /// real session pin would.
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn pin_peer_entity_for_test(&self, node_id: u64, entity: EntityId) {
+        self.peer_entity_ids.insert(node_id, entity);
     }
 
     /// This node's soft-state horizon for sensing rows — the ceiling the
@@ -14731,9 +14998,13 @@ impl MeshNode {
             refresh_authority_refused: counters.refresh_authority_refused.load(Ordering::Relaxed),
             refresh_refused: counters.refresh_refused.load(Ordering::Relaxed),
             refresh_arm_stale: counters.refresh_arm_stale.load(Ordering::Relaxed),
+            refresh_adopted: counters.refresh_adopted.load(Ordering::Relaxed),
             refused_release_parked: counters.refused_release_parked.load(Ordering::Relaxed),
+            refused_release_retried: counters.refused_release_retried.load(Ordering::Relaxed),
             refused_release_recovered: counters.refused_release_recovered.load(Ordering::Relaxed),
             refused_release_unowned: counters.refused_release_unowned.load(Ordering::Relaxed),
+            refused_release_reclaimed: counters.refused_release_reclaimed.load(Ordering::Relaxed),
+            ownership_invalidated: counters.ownership_invalidated.load(Ordering::Relaxed),
             refused_release_outstanding: schedule.refused.len() as u64,
             armed: schedule.armed.len() as u64,
             worker_started: schedule.worker.is_some(),
