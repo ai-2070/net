@@ -33976,10 +33976,27 @@ impl MeshNode {
         &self,
         peer_node_id: u64,
     ) -> Result<(SessionKeys, SocketAddr), AdapterError> {
+        // Rejection state for the WHOLE accept, not for one attempt.
+        // The case that matters is a genuine key mismatch whose `msg1`
+        // lands during an early attempt: the initiator's budget is not
+        // the responder's, so its retransmits can stop while the
+        // responder still has attempts left. Per-attempt state throws
+        // the diagnosis away, and the final attempt — which saw
+        // nothing at all on the wire — reports a bare
+        // `handshake timeout` for what is really a misconfiguration.
+        let mut last_decrypt_reject: Option<String> = None;
+        let mut last_paced_source: Option<SocketAddr> = None;
         let mut attempt = 0;
         loop {
             attempt += 1;
-            match self.try_handshake_responder(peer_node_id).await {
+            match self
+                .try_handshake_responder(
+                    peer_node_id,
+                    &mut last_decrypt_reject,
+                    &mut last_paced_source,
+                )
+                .await
+            {
                 Ok(result) => return Ok(result),
                 Err(e) if attempt < self.config.handshake_retries => {
                     tracing::warn!(attempt, error = %e, "mesh accept failed, retrying");
@@ -34029,12 +34046,23 @@ impl MeshNode {
     /// a misconfigured pair reports
     /// `handshake timeout (last handshake datagram from … did not
     /// decrypt: …)` instead of a bare timeout, and the retry loop
-    /// logs it at `warn` on every attempt. Per-datagram logging stays
-    /// at `debug` on purpose: at `warn` a junk sprayer would own the
+    /// logs it at `warn` on every attempt. That state is owned by
+    /// [`Self::handshake_responder`] and spans the whole `accept()`:
+    /// the initiator's budget is not the responder's, so a mismatched
+    /// peer can fall silent while the responder still has attempts
+    /// left, and per-attempt state would drop the diagnosis on the
+    /// floor in exactly that case. Per-datagram logging stays at
+    /// `debug` on purpose: at `warn` a junk sprayer would own the
     /// operator's log.
+    ///
+    /// `last_decrypt_reject` and `last_paced_source` are owned by
+    /// [`Self::handshake_responder`] and carry across every attempt of
+    /// one `accept()` — see the comment there.
     async fn try_handshake_responder(
         &self,
         peer_node_id: u64,
+        last_decrypt_reject: &mut Option<String>,
+        last_paced_source: &mut Option<SocketAddr>,
     ) -> Result<(SessionKeys, SocketAddr), AdapterError> {
         let timeout = self.config.handshake_timeout;
         let socket_arc = self.socket.socket_arc();
@@ -34042,11 +34070,6 @@ impl MeshNode {
         // Direct responder: mirror the initiator's `routing_id`-based
         // prologue so direct and routed share one convention.
         let prologue = handshake_prologue(routing_id(peer_node_id), routing_id(self.node_id));
-
-        // Set by the drain path so a timeout can name what it threw
-        // away. Lives outside the future because the future is
-        // dropped when the deadline elapses.
-        let mut last_reject: Option<String> = None;
 
         // ONE responder for the whole wait, exactly as the initiator
         // loop above reuses one `NoiseHandshake` across rejected
@@ -34107,6 +34130,11 @@ impl MeshNode {
                 if !self.handshake_pacer.lock().check_and_record(source) {
                     self.responder_handshakes_paced
                         .fetch_add(1, Ordering::Relaxed);
+                    // A paced drop is a diagnosis too: an accept that
+                    // only ever saw paced datagrams timed out without
+                    // once looking at a payload, and no bare
+                    // "handshake timeout" would tell an operator that.
+                    *last_paced_source = Some(source);
                     tracing::debug!(
                         %source,
                         "handshake responder: dropping packet from rate-limited source"
@@ -34117,7 +34145,7 @@ impl MeshNode {
                 if let Err(e) = handshake.read_message(&p.payload) {
                     self.responder_handshakes_drained
                         .fetch_add(1, Ordering::Relaxed);
-                    last_reject = Some(format!("{source}: {e}"));
+                    *last_decrypt_reject = Some(format!("{source}: {e}"));
                     tracing::debug!(
                         %source,
                         error = %e,
@@ -34134,14 +34162,24 @@ impl MeshNode {
         let source = match waited {
             Ok(inner) => inner?,
             Err(_) => {
-                return Err(AdapterError::Connection(match last_reject {
-                    Some(reject) => format!(
-                        "handshake timeout (last handshake datagram from {reject} \
-                         did not decrypt under this pairing's prologue — wrong PSK, \
-                         wrong peer key, or another pairing's msg1)"
-                    ),
-                    None => "handshake timeout".into(),
-                }))
+                // A decrypt failure outranks a paced drop: it is the
+                // one that names a misconfiguration.
+                return Err(AdapterError::Connection(
+                    match (last_decrypt_reject.as_deref(), *last_paced_source) {
+                        (Some(reject), _) => format!(
+                            "handshake timeout (last handshake datagram from {reject} \
+                             did not decrypt under this pairing's prologue — wrong PSK, \
+                             wrong peer key, or another pairing's msg1)"
+                        ),
+                        (None, Some(paced)) => format!(
+                            "handshake timeout (every handshake datagram this accept saw \
+                             was dropped before Noise by the responder's pacing budget, \
+                             most recently one from {paced} — under handshake traffic \
+                             this heavy the peer's msg1 may never have been read)"
+                        ),
+                        (None, None) => "handshake timeout".into(),
+                    },
+                ))
             }
         };
 

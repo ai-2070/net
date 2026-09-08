@@ -407,6 +407,47 @@ async fn a_one_source_handshake_flood_is_paced_and_does_not_starve_the_initiator
     assert_session_is_real(&a, &b).await;
 }
 
+/// The diagnosis must survive the attempts that follow it.
+///
+/// A responder's retry budget is its own, not the initiator's, so a
+/// misconfigured peer can fall silent while the responder still has
+/// attempts to burn. Every one of those later attempts sees an empty
+/// wire and times out with nothing to report — so if the rejection is
+/// per-attempt state, the operator gets a bare `handshake timeout` for
+/// a key mismatch that WAS diagnosed, three attempts ago, and thrown
+/// away.
+///
+/// One foreign handshake, delivered early and never repeated, is the
+/// smallest shape of that.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_decrypt_failure_survives_the_silent_attempts_that_follow_it() {
+    let responder = build_node([0xee; 32]).await;
+    // A peer that never actually shows up, so nothing but the single
+    // foreign datagram below ever reaches the responder.
+    let absent_peer = 0x0bad_0bad_0bad_0badu64;
+
+    let node = responder.clone();
+    let accept = tokio::spawn(async move { node.accept(absent_peer).await });
+
+    spray_foreign_handshakes(&responder, 1).await;
+    await_classified(&responder, 1).await;
+    assert!(
+        !accept.is_finished(),
+        "the rejection must land while the responder still has attempts left, \
+         or this witness proves nothing",
+    );
+
+    let err = accept
+        .await
+        .expect("accept task panicked")
+        .expect_err("nobody completed a handshake");
+    let text = format!("{err:?}");
+    assert!(
+        text.contains("did not decrypt"),
+        "a rejection from an earlier attempt must still name the cause, got {text}",
+    );
+}
+
 /// Draining must not swallow the diagnosis. A real initiator with the
 /// wrong PSK is indistinguishable from a stale foreign `msg1` at this
 /// layer, so it is drained too — but the responder's error names the
