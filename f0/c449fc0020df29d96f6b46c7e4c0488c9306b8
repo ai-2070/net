@@ -1,0 +1,14 @@
+net/crates/net/guards/fixtures_off_probe/.gitignore
+  h_64425bc75e3f3d 1-4
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "f0c449fc0020df29d96f6b46c7e4c0488c9306b8",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
