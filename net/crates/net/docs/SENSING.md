@@ -303,14 +303,25 @@ live installation cannot postpone its renewal. An authority the node
 cannot author this audience under makes a refresh refuse rather than
 downgrade.
 
-The first deadline is grounded in the row's FRESHNESS, not in when the
-arm happened. An acquisition that coalesces onto an installation
-somebody else established (the public acquisition API arms nothing)
-re-registers neither table nor wire, so its age is unknown: unless
-something is already renewing it, adopting it renews it at once and the
-cadence starts from that renewal. Arming at join time would otherwise
-put the first renewal after the row's own expiry whenever the row was
-already older than a period.
+A retention takes THREE facts from one acquisition transaction: the
+ticket, the installation that holder joined, and whether the wire row
+was (re-)registered. None of them is re-derived afterwards by a second
+read of the key. A ticket paired with a separately sampled installation
+can name two different incarnations — invalidate the row, let another
+holder re-establish it in the gap, and the pair describes a holder that
+never existed while every later validation of it agrees with itself —
+and freshness inferred from a before/after pair of reads fails the same
+way, making a coalescing acquisition look establishing.
+
+The first deadline is therefore grounded in the registry's own decided
+action, not in when the arm happened. `Register`/`Reregister` put the
+row on the wire here and now, so a full period is right. `Unchanged`
+coalesced onto a row whose age this node does not know (the public
+acquisition API arms nothing at all): unless something is already
+renewing it, adopting it renews it AT ONCE and the cadence starts from
+that renewal. Arming at join time would otherwise put the first renewal
+after the row's own expiry whenever the row was already older than a
+period.
 
 **Schedule contract.** The refresh period is `max(ttl/2, 1 ms)`. The
 floor is not a tuning choice: `sensing_interest_ttl` accepts any
@@ -326,20 +337,27 @@ never monopolize an executor.
 Retirement is per-holder and honest about shared state: a lease key is
 node-global, so retiring one owner RELEASES its holder and then settles
 the refresh record only if that release actually retired the
-installation — a surviving holder keeps its row and its renewal. A
-release the transaction refuses leaves a holder that is still live and
+installation — a surviving holder keeps its row and its renewal.
+
+A release the transaction refuses leaves a holder that is still live and
 still this node's, so the ticket is retained on the node and retried on
-the worker's cadence instead of being dropped; a retry that fails puts
-it back unconditionally, and a retained entry whose installation has
-since been invalidated is reclaimed rather than counted against the
-retention bound.
+the worker's cadence instead of being dropped. That retention is an
+ownership LEDGER, not a budget: every entry names one distinct live
+`(key, token)` holder, so its size is bounded by the registry's own
+holder capacity, entries are discharged at the invalidation that kills
+them, and admission never rejects — a retry that fails puts its ticket
+back unconditionally, and going over the derived ceiling is counted
+loudly rather than paid for by abandoning a live holder. A capacity
+rejection would have to be justified against the state it was decided
+on, and a check-then-lock pair cannot do that.
 
 Ownership is also VALIDATED, not assumed. Production invalidates whole
 installations (a refused tightening whose surviving-holder restoration
 current authority will not author), which kills every holder of that
-key. A convergence therefore re-checks each carried ticket against the
-live installation identity and re-acquires when it is gone, rather than
-reporting a provider as retained with nothing behind it.
+key. A convergence therefore re-checks each carried ticket against
+ACTUAL HOLDER MEMBERSHIP — is this exact token still a registration of
+this exact key — and re-acquires when it is not, rather than reporting a
+provider as retained with nothing behind it.
 
 **Terminal lifecycle.** Node shutdown closes and joins the refresh
 schedule and drops any retained refused releases with it. It does NOT

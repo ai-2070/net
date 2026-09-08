@@ -352,6 +352,23 @@ pub(crate) enum LeasePlane {
     Organization,
 }
 
+/// What a COMMITTED acquisition recorded: the holder identity, and the
+/// INSTALLATION that holder actually joined.
+///
+/// The pair is formed inside the commit's own critical section, so it always
+/// describes a real holder of a real entry. Sampling the installation with a
+/// second, key-only read cannot promise that: an invalidation and a same-key
+/// re-establishment in between produce a live successor whose registrations
+/// never contained this token, and the resulting pair describes ownership
+/// nobody holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CommittedAcquire {
+    /// The holder token this acquisition recorded.
+    pub(crate) token: LeaseToken,
+    /// The installation identity that holder belongs to.
+    pub(crate) installation_id: LeaseToken,
+}
+
 /// The immutable read one REFRESH of a live installation renews from.
 ///
 /// Produced by [`SensingInterestLeases::refresh_view`]; mints nothing, inserts
@@ -509,14 +526,26 @@ impl SensingInterestLeases {
     /// Whether `token` is a live holder of `key`, read from the registry
     /// itself.
     ///
-    /// Instrumented builds only. The contention witnesses need "the registry
-    /// and the returned action agree", which a holder COUNT cannot express.
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "fixtures"))]
-    pub fn holds_token_for_test(&self, key: &SensingLeaseKey, token: LeaseToken) -> bool {
+    /// This is ACTUAL OWNERSHIP, not a resemblance of it. Installation
+    /// identity answers "is the row I remember still the live one", which is a
+    /// different question: a ticket and an installation sampled by two
+    /// separate reads can name different incarnations of the same key, and
+    /// then the pair never described a holder at all. Membership cannot be
+    /// wrong that way — a token is in an entry's registrations exactly while
+    /// its holder exists.
+    pub(crate) fn holds_token(&self, key: &SensingLeaseKey, token: LeaseToken) -> bool {
         self.lock_entries()
             .get(key)
             .is_some_and(|entry| entry.registrations.contains_key(&token))
+    }
+
+    /// [`Self::holds_token`], for the contention witnesses that need "the
+    /// registry and the returned action agree" — which a holder COUNT cannot
+    /// express.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn holds_token_for_test(&self, key: &SensingLeaseKey, token: LeaseToken) -> bool {
+        self.holds_token(key, token)
     }
 
     /// DECIDE one acquisition against an ALREADY-HELD registry view, mutating
@@ -606,7 +635,7 @@ impl SensingInterestLeases {
     fn apply_acquire(
         entries: &mut HashMap<SensingLeaseKey, LeaseEntry>,
         previewed: PreviewedAcquire,
-    ) -> LeaseToken {
+    ) -> CommittedAcquire {
         let PreviewedAcquire {
             key,
             interval,
@@ -616,7 +645,7 @@ impl SensingInterestLeases {
             transition,
             token,
         } = previewed;
-        match entries.entry(key) {
+        let installation_id = match entries.entry(key) {
             Entry::Vacant(v) => {
                 debug_assert_eq!(
                     transition,
@@ -636,6 +665,7 @@ impl SensingInterestLeases {
                     // identity. Never rewritten while the entry lives.
                     installation_id: token,
                 });
+                token
             }
             Entry::Occupied(mut o) => {
                 let entry = o.get_mut();
@@ -650,9 +680,13 @@ impl SensingInterestLeases {
                 );
                 entry.registrations.insert(token, interval);
                 entry.installed_interval = interval.min(entry.installed_interval);
+                entry.installation_id
             }
+        };
+        CommittedAcquire {
+            token,
+            installation_id,
         }
-        token
     }
 
     /// PREVIEW one acquisition of the interest `key` at the requested
@@ -690,7 +724,7 @@ impl SensingInterestLeases {
     /// a terminal identity under the same `sensing_lease_apply_mu` the caller
     /// still holds, so nothing here can refuse and the caller can never be
     /// handed a ticket for a reference that was not recorded.
-    pub(crate) fn commit_acquire(&self, previewed: PreviewedAcquire) -> LeaseToken {
+    pub(crate) fn commit_acquire(&self, previewed: PreviewedAcquire) -> CommittedAcquire {
         let mut entries = self.lock_entries();
         Self::apply_acquire(&mut entries, previewed)
     }
@@ -752,7 +786,7 @@ impl SensingInterestLeases {
         let action = previewed.action();
         let in_force = previewed.plane();
         Ok((
-            Self::apply_acquire(&mut entries, previewed),
+            Self::apply_acquire(&mut entries, previewed).token,
             action,
             in_force,
         ))

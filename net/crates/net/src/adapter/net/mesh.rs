@@ -6896,6 +6896,10 @@ pub(crate) struct OrgSensingDemandCounters {
     /// STALE retained releases reclaimed: their installation is gone, so there
     /// is no live holder left to own and the slot is returned to the bound.
     refused_release_reclaimed: AtomicU64,
+    /// Retained releases admitted ABOVE the derived ceiling. Should be
+    /// unreachable while every entry is live; admitted anyway, because losing a
+    /// live holder is worse than exceeding a derived figure.
+    refused_release_overflow: AtomicU64,
     /// Carried-forward holders whose installation was INVALIDATED under them,
     /// so the convergence re-acquired rather than copying dead ownership.
     ownership_invalidated: AtomicU64,
@@ -6969,6 +6973,8 @@ pub struct OrgSensingDemandState {
     pub refused_release_unowned: u64,
     /// Stale retained releases reclaimed because their installation is gone.
     pub refused_release_reclaimed: u64,
+    /// Retained releases admitted above the derived ceiling.
+    pub refused_release_overflow: u64,
     /// Carried-forward holders dropped because their installation was
     /// invalidated: the ownership was no longer real, so the provider was
     /// re-acquired instead of reported as retained forever.
@@ -7003,6 +7009,19 @@ struct ArmedRefresh {
 /// soft-state horizon makes the due-set continuously due, and the worker's
 /// loop never reaches a park.
 pub(crate) const MIN_SENSING_REFRESH_PERIOD: Duration = Duration::from_millis(1);
+
+/// What ONE acquisition established, as a single fact from inside its own
+/// transaction: the ticket, the installation that holder joined, and whether
+/// the wire row was (re-)registered by this acquisition.
+///
+/// See [`MeshNode::acquire_sensing_interest_lease_owned`] for why none of the
+/// three may be re-derived afterwards by a separate key read.
+#[derive(Debug)]
+pub(crate) struct AcquiredSensingLease {
+    pub(crate) ticket: sensing::SensingLeaseTicket,
+    pub(crate) installation_id: sensing::LeaseToken,
+    pub(crate) provenance: SensingArmProvenance,
+}
 
 /// What an arm KNOWS about the freshness of the installation it is arming.
 ///
@@ -13605,6 +13624,35 @@ impl MeshNode {
         requested_sample_interval: Duration,
     ) -> Result<sensing::SensingLeaseTicket, SensingRegistrationError> {
         self.acquire_sensing_interest_lease_seamed(spec, provider, requested_sample_interval, None)
+            .map(|acquired| acquired.ticket)
+    }
+
+    /// [`Self::acquire_sensing_interest_lease`] returning everything the
+    /// COMMIT itself established: the ticket, the installation that holder
+    /// joined, and whether this acquisition (re-)registered the wire row.
+    ///
+    /// Retained demand needs all three as ONE fact, and every one of them has
+    /// to come from inside the transaction:
+    ///
+    /// * a ticket paired with an installation sampled afterwards by key can
+    ///   describe two different incarnations — an invalidation plus a same-key
+    ///   re-establishment in the gap yields a live successor whose
+    ///   registrations never contained this token, and every later validation
+    ///   of that pair agrees with itself while owning nothing;
+    /// * freshness inferred by comparing a before-read with an after-read has
+    ///   the same shape: a rival establishing in the gap makes a COALESCING
+    ///   acquisition look establishing, so an arbitrarily old row gets armed a
+    ///   full period out and expires before its first renewal. The registry's
+    ///   own decided action is the only evidence that cannot be raced —
+    ///   `Register`/`Reregister` re-registered the row here and now,
+    ///   `Unchanged` joined a row whose age this node does not know.
+    pub(crate) fn acquire_sensing_interest_lease_owned(
+        &self,
+        spec: &sensing::InterestSpec,
+        provider: u64,
+        requested_sample_interval: Duration,
+    ) -> Result<AcquiredSensingLease, SensingRegistrationError> {
+        self.acquire_sensing_interest_lease_seamed(spec, provider, requested_sample_interval, None)
     }
 
     /// [`Self::acquire_sensing_interest_lease`] with a test-only seam that runs
@@ -13620,7 +13668,7 @@ impl MeshNode {
         provider: u64,
         requested_sample_interval: Duration,
         pause_after_capture: Option<&(dyn Fn() + Sync)>,
-    ) -> Result<sensing::SensingLeaseTicket, SensingRegistrationError> {
+    ) -> Result<AcquiredSensingLease, SensingRegistrationError> {
         // PHASE 0 — off every sensing lock. See `prepare_org_egress`.
         let org_prepared = self.prepare_org_egress(&spec.audience, spec, provider)?;
         if let Some(pause) = pause_after_capture {
@@ -13767,16 +13815,37 @@ impl MeshNode {
         // COMMIT — the table/emitter transition succeeded, so the reference is
         // recorded. Infallible: the preview proved the bounds under this same
         // guard.
-        let ticket = sensing::SensingLeaseTicket {
-            key,
-            token: self.sensing_interest_leases.commit_acquire(previewed),
+        //
+        // The DECIDED action is read before the commit consumes the preview: it
+        // is this acquisition's own freshness evidence, and unlike a
+        // before/after pair of key reads it cannot be raced by a rival
+        // establishing in a sampling gap.
+        let provenance = match previewed.action() {
+            // This acquisition put the row on the wire, here and now.
+            sensing::LeaseAction::Register { .. } | sensing::LeaseAction::Reregister { .. } => {
+                SensingArmProvenance::Established
+            }
+            // Coalesced onto a row that already existed: nothing was
+            // re-registered, and its age is not this node's to assume.
+            sensing::LeaseAction::Unchanged | sensing::LeaseAction::Deregister { .. } => {
+                SensingArmProvenance::Adopted
+            }
+        };
+        let committed = self.sensing_interest_leases.commit_acquire(previewed);
+        let acquired = AcquiredSensingLease {
+            ticket: sensing::SensingLeaseTicket {
+                key,
+                token: committed.token,
+            },
+            installation_id: committed.installation_id,
+            provenance,
         };
         // PHASE 2 — every sensing guard, including the lease-apply guard, is
         // released before anything is authored, encoded, routed or sent. Only
         // the dedicated transition-order lock is still held.
         drop(_apply);
         self.commit_transition_phase_two(outcome, plan);
-        Ok(ticket)
+        Ok(acquired)
     }
 
     /// Put the interest table back to the aggregate the lease registry still
@@ -13833,9 +13902,18 @@ impl MeshNode {
             Ok(restored) => Some(restored),
             Err(err) => {
                 let dropped = self.sensing_interest_leases.invalidate_installation(&key);
+                // EVERY holder of this key is now dead, including any refused
+                // retirement release this node still owns for it: its token can
+                // never be a holder again. Discharging the retention set HERE,
+                // at the transition that kills them, is what keeps that set a
+                // ledger of LIVE ownership — so a later admission decision
+                // needs no off-lock liveness query, and cannot reject a live
+                // ticket against a stale observation of "full".
+                let discharged = self.discharge_refused_releases_for_key(&key);
                 tracing::warn!(
                     error = %err,
                     dropped_holders = dropped,
+                    discharged_pending = discharged,
                     "sensing lease: current organization authority refused to restore the \
                      surviving holders' cadence after a refused tightening partitioned the \
                      row; the lease installation is INVALIDATED rather than left claiming a \
@@ -14451,9 +14529,9 @@ impl MeshNode {
     /// Ownership therefore moves to the node's refresh worker, which retries on
     /// its own cadence.
     ///
-    /// Returns `false` only when the node is already TERMINAL, or when the
-    /// retention set is genuinely full of LIVE ownership after stale entries
-    /// have been reclaimed. Counted either way, never silent.
+    /// Returns `false` ONLY for a terminal node. There is deliberately no
+    /// capacity rejection of live ownership: see
+    /// [`Self::retain_refused_release`].
     pub(crate) fn park_refused_release(
         node: &Arc<MeshNode>,
         ticket: sensing::SensingLeaseTicket,
@@ -14484,21 +14562,34 @@ impl MeshNode {
 
     /// Put one refused release into the retention set.
     ///
-    /// [`RefusedReleaseAdmission::Reinstated`] is capacity-EXEMPT and counts no
-    /// fresh park: the worker extracted the whole set to retry it, so it still
-    /// owns those tickets, and refusing to put an already-owned ticket back is
-    /// exactly the "extract, fail, discard" hole. The transient excess is
-    /// bounded by the extracted set, which came from the bound itself.
+    /// # The set is an ownership LEDGER, not a budget
+    ///
+    /// Every entry names one distinct live `(key, token)` holder, and the
+    /// registry admits at most `MAX_LEASED_INTERESTS *
+    /// MAX_HOLDERS_PER_INTEREST` of those in total, so the ledger's size is
+    /// bounded by the registry itself rather than by a policy. Entries stop
+    /// being live only by invalidation, and
+    /// [`Self::discharge_refused_releases_for_key`] discharges them at that
+    /// exact transition.
+    ///
+    /// So there is NO capacity rejection here. A rejection would have to be
+    /// justified against the state it was decided on, and a check-then-lock
+    /// pair cannot do that: two admissions can both observe `N - 1`, one
+    /// appends, and the other's second look sees `N` and abandons a live
+    /// ticket whose sole release capability it was holding — with reclaimable
+    /// entries sitting in the set it never re-examined. Over-ceiling admission
+    /// is counted loudly (`refused_release_overflow`) and a reclamation pass
+    /// runs first, but losing ownership is never the outcome. `Reinstated`
+    /// (the worker putting back what it extracted) is likewise unconditional.
     fn retain_refused_release(
         node: &Arc<MeshNode>,
         entry: RefusedRelease,
         admission: RefusedReleaseAdmission,
     ) -> bool {
         if admission == RefusedReleaseAdmission::Fresh {
-            // A pending entry whose installation is gone owns NOTHING — the
-            // registry entry it referenced was invalidated or re-established,
-            // so its token can never be a holder again. Reclaim those before
-            // refusing live ownership for want of a slot.
+            // Best-effort tidy of anything the invalidation hook could not
+            // reach, so the ceiling is measured against live ownership. The
+            // outcome below does not depend on it.
             let full = node.sensing_refresh.lock().refused.len() >= node.refused_release_cap();
             if full {
                 Self::reclaim_stale_refused_releases(node);
@@ -14509,11 +14600,7 @@ impl MeshNode {
         if schedule.terminal {
             return false;
         }
-        if admission == RefusedReleaseAdmission::Fresh
-            && schedule.refused.len() >= node.refused_release_cap()
-        {
-            return false;
-        }
+        let over_ceiling = schedule.refused.len() >= node.refused_release_cap();
         let wake_before = schedule.next_wake();
         schedule.refused.push(entry);
         schedule.refused_retry_at = Some(
@@ -14524,16 +14611,51 @@ impl MeshNode {
         Self::ensure_sensing_refresh_worker(node, &mut schedule);
         let rearm = wake_before.is_none_or(|previous| retry_at < previous);
         drop(schedule);
+        if over_ceiling {
+            // The derived ceiling says this cannot happen while every entry is
+            // live. Admit anyway and say so: the ledger exceeding a derived
+            // figure is a diagnosable surprise, losing a live holder is a leak.
+            node.org_sensing_demand_counters
+                .refused_release_overflow
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                admission = ?admission,
+                "org sensing demand: refused-release retention exceeded its derived \
+                 ceiling; ownership is kept rather than dropped"
+            );
+        }
         if rearm {
             node.sensing_refresh_wake.notify_one();
         }
         true
     }
 
-    /// Drop retained releases whose INSTALLATION is gone, returning the slots
-    /// to the bound. Such an entry owns nothing: production invalidates whole
-    /// installations (a refused tightening that current authority will not
-    /// restore), and a re-established key carries a strictly newer identity.
+    /// DISCHARGE every retained release for `key`, at the transition that made
+    /// them dead.
+    ///
+    /// Called from the invalidation leg with the apply guard held; takes only
+    /// the schedule lock, so it introduces no registry-under-schedule ordering.
+    /// After an invalidation no token of this key can ever be a holder again,
+    /// so every pending entry for it owns nothing whatever its installation.
+    fn discharge_refused_releases_for_key(&self, key: &sensing::SensingLeaseKey) -> usize {
+        let mut schedule = self.sensing_refresh.lock();
+        let before = schedule.refused.len();
+        schedule.refused.retain(|entry| &entry.ticket.key != key);
+        let discharged = before - schedule.refused.len();
+        if schedule.refused.is_empty() {
+            schedule.refused_retry_at = None;
+        }
+        drop(schedule);
+        if discharged > 0 {
+            self.org_sensing_demand_counters
+                .refused_release_reclaimed
+                .fetch_add(discharged as u64, Ordering::Relaxed);
+        }
+        discharged
+    }
+
+    /// Drop retained releases whose INSTALLATION is gone — the pull-side
+    /// backstop for [`Self::discharge_refused_releases_for_key`].
     ///
     /// Deliberately three phases so the registry lock is never taken UNDER the
     /// schedule lock: snapshot the identities, ask the registry off-lock, then
@@ -14859,6 +14981,18 @@ impl MeshNode {
         population
     }
 
+    /// Whether `ticket` is STILL a live holder of its key.
+    ///
+    /// Actual ownership, straight out of the registry. This is what a
+    /// convergence validates carried tickets against: installation identity
+    /// answers a different question ("is the row I remember still the live
+    /// one"), and a pair whose two halves came from separate reads can be
+    /// self-consistent while describing a holder that never existed.
+    pub(crate) fn holds_sensing_lease_token(&self, ticket: &sensing::SensingLeaseTicket) -> bool {
+        self.sensing_interest_leases
+            .holds_token(&ticket.key, ticket.token)
+    }
+
     /// The INSTALLATION identity currently live for `key`, if any — what a
     /// refresh must be armed against.
     pub(crate) fn sensing_refresh_installation(
@@ -15004,6 +15138,7 @@ impl MeshNode {
             refused_release_recovered: counters.refused_release_recovered.load(Ordering::Relaxed),
             refused_release_unowned: counters.refused_release_unowned.load(Ordering::Relaxed),
             refused_release_reclaimed: counters.refused_release_reclaimed.load(Ordering::Relaxed),
+            refused_release_overflow: counters.refused_release_overflow.load(Ordering::Relaxed),
             ownership_invalidated: counters.ownership_invalidated.load(Ordering::Relaxed),
             refused_release_outstanding: schedule.refused.len() as u64,
             armed: schedule.armed.len() as u64,
