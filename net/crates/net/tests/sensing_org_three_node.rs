@@ -37,10 +37,10 @@ use std::time::Duration;
 use net::adapter::net::behavior::org::{OrgKeypair, OrgMembershipCert};
 use net::adapter::net::behavior::org_authority::NodeAuthority;
 use net::adapter::net::behavior::sensing::{
-    canonical_org_sensing_commitment, encode_interest_frame, AudienceScopeCommitment,
-    CanonicalConstraints, CapabilityId, DisclosureClass, DownstreamId, InterestSpec,
-    ProviderInterestKey, ProviderSelector, ResultMode, SensingCounters, SensingInterestFrame,
-    WorkLatencyEnvelope, SUBPROTOCOL_SENSING_INTEREST,
+    canonical_org_sensing_commitment, decode_interest_frame, encode_interest_frame,
+    AudienceScopeCommitment, CanonicalConstraints, CapabilityId, DisclosureClass, DownstreamId,
+    InterestSpec, ProviderInterestKey, ProviderSelector, ResultMode, SensingCounters,
+    SensingInterestFrame, WorkLatencyEnvelope, SUBPROTOCOL_SENSING_INTEREST,
 };
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
 
@@ -380,14 +380,26 @@ async fn a_floored_peer_with_sensing_off_drops_the_org_frame_and_stays_unknown()
         .await;
     }
 
-    // Acknowledge the node's OWN send boundary: one completed datagram per leg.
-    let sends = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // D'S OWN ARRIVAL EVIDENCE. An empty receiver proves nothing by itself:
+    // a datagram that was lost, or one aimed at a node that had already
+    // stopped, leaves exactly the same empty table. Only the receiver's own
+    // event distinguishes "the registration arrived and the dark plane
+    // dropped it" from "nothing arrived", so D acknowledges its own dark
+    // 0x0C02 drop and the witness identifies the registration it dropped:
+    // the authenticated sender, the target branch, the organization scope
+    // and the certificate naming the sending hop. Nothing is acknowledged on
+    // the wire - no reply, no retry, no reliability - and D's sensing plane
+    // stays off throughout.
+    let a_entity = a.entity_keypair().entity_id().clone();
+    let dropped = Arc::new(parking_lot::Mutex::new(Vec::<(
+        u64,
+        Option<SensingInterestFrame>,
+    )>::new()));
     {
-        let sends = Arc::clone(&sends);
-        a.set_org_egress_send_observer_for_test(Arc::new(move |_seq, phase| {
-            if phase == net::adapter::net::OrgEgressSendPhase::Completed {
-                sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            }
+        let dropped = Arc::clone(&dropped);
+        d.set_sensing_dark_drop_observer_for_test(Arc::new(move |from, payload| {
+            let frame = decode_interest_frame(payload).ok();
+            dropped.lock().push((from, frame));
         }));
     }
 
@@ -408,18 +420,51 @@ async fn a_floored_peer_with_sensing_off_drops_the_org_frame_and_stays_unknown()
          peer must not buy a legacy re-authoring"
     );
 
-    // ARRIVAL EVIDENCE. An empty receiver proves nothing on its own: a frame
-    // that never left, or never arrived, looks identical. Two acknowledgements
-    // close that, neither of which makes UDP reliable:
-    //
-    // 1. the node's OWN ordered egress reports a completed send for every
-    //    datagram it emitted in this window - so the D-directed leg was
-    //    authored and handed to the socket, not skipped;
-    // 2. a SECOND peer, E, identical in every way except that it runs the
-    //    sensing plane, is leased in the same window from the same egress and
-    //    DOES install the row. The positive control is what makes D's silence
-    //    attributable to the dark plane rather than to loss: the same code
-    //    path, the same node, the same instant, one difference.
+    // The registration REACHED D and D's disabled plane is what dropped it.
+    {
+        let dropped = Arc::clone(&dropped);
+        let a_entity = a_entity.clone();
+        await_condition(
+            Duration::from_secs(5),
+            "D's own dark plane acknowledged THIS registration arriving",
+            move || {
+                dropped.lock().iter().any(|(from, frame)| {
+                    *from == a_id
+                        && matches!(
+                            frame,
+                            Some(SensingInterestFrame::OrgProviderRegistration {
+                                target,
+                                audience_scope,
+                                subscriber_membership,
+                                ..
+                            }) if *target == d_id
+                                && *audience_scope == commitment
+                                && subscriber_membership.member == a_entity
+                                && subscriber_membership.org_id == org().org_id()
+                        )
+                })
+            },
+        )
+        .await;
+    }
+
+    // ...and it arrived exactly as an ORGANIZATION registration: no legacy
+    // shape was ever put on the wire for a peer that answers nothing.
+    for (from, frame) in dropped.lock().iter() {
+        assert_eq!(*from, a_id, "only A's session delivered anything here");
+        assert!(
+            matches!(
+                frame,
+                Some(SensingInterestFrame::OrgProviderRegistration { .. })
+            ),
+            "a silent peer must never buy a legacy downgrade: {frame:?}"
+        );
+    }
+
+    // E: an OPTIONAL positive control - same organization, same lease path,
+    // same instant, differing only in running the sensing plane. It cannot
+    // substitute for D's own event above; it shows the identical leg is one a
+    // sensing-enabled peer installs.
     let e_spec = org_spec(e_id, commitment);
     let e_key = ProviderInterestKey::new(e_spec.key(), e_id);
     let e_ticket = a
@@ -446,15 +491,7 @@ async fn a_floored_peer_with_sensing_off_drops_the_org_frame_and_stays_unknown()
         "and it is organization-rooted, so the leg D dropped was a well-formed \
          organization registration"
     );
-    {
-        let sends = Arc::clone(&sends);
-        await_condition(
-            Duration::from_secs(5),
-            "the ordered egress completed a send for BOTH legs",
-            move || sends.load(std::sync::atomic::Ordering::SeqCst) >= 2,
-        )
-        .await;
-    }
+
     assert!(
         d.sensing_table_is_empty(),
         "a dark peer must gain no sensing rows"
