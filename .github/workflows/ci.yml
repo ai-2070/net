@@ -1601,6 +1601,115 @@ jobs:
           done
           echo "organization exact projection: $listed listed, $req_n pinned by name, all green"
 
+      # === Sensing — organization exact COMPOSITION (OA-5) ================
+      # The fixtures-only seam assembly: authorized owner-private discovery ->
+      # the exact organization sensing lease on real loopback UDP -> the
+      # provider's signed observations -> one coherent projection and candidate
+      # order -> one protected invocation with real organization admission.
+      # Plus the dark-boundary guards for the bridge those witnesses reach
+      # through, and the per-binary floor for the three-node transport family.
+      #
+      # Own invocation, `--retries 0`: these are transport-timing AND ordering
+      # proofs, and a retry could turn a real regression (a dropped
+      # registration, a projection that stopped reading real observations, an
+      # order that stopped consuming the projection) into a green run. Each
+      # binary runs alone so `--no-tests=fail` is exact per binary, and every
+      # witness is re-run by exact name so a rename or an `#[ignore]` fails the
+      # step instead of shrinking the roster silently.
+      - name: Sensing — organization exact composition
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          FEATURES="cortex tool fixtures"
+          die() { echo "::error::$1"; shift; [ "$#" -gt 0 ] && printf '%s\n' "$@"; exit 1; }
+          strip_ansi() { sed -E "s/$(printf '\033')\\[[0-9;:?]*[a-zA-Z]//g"; }
+
+          run_binary() {   # $1=binary  $2..=required names
+            local bin="$1"; shift
+            local inventory listed required_n
+            inventory=$(cargo nextest list --color never --features "$FEATURES" \
+                          --test "$bin" 2>&1) \
+              || die "cargo nextest list failed for $bin" "$inventory"
+            listed=$(printf '%s\n' "$inventory" | strip_ansi \
+                       | grep -cE "^[A-Za-z0-9_-]+::${bin} [A-Za-z0-9_]+\$")
+            required_n=$#
+            [ "$listed" -ge "$required_n" ] \
+              || die "$bin lists $listed test(s), fewer than the $required_n pinned" "$inventory"
+            for required in "$@"; do
+              local n
+              n=$(printf '%s\n' "$inventory" | strip_ansi \
+                    | grep -cE "^[A-Za-z0-9_-]+::${bin} ${required}\$")
+              [ "$n" = 1 ] \
+                || die "$required is listed $n time(s) in $bin, expected exactly 1" "$inventory"
+            done
+            cargo nextest run --color never --no-fail-fast --no-tests=fail --retries 0 \
+              --features "$FEATURES" --test "$bin" \
+              || die "$bin did not pass as a whole"
+            for required in "$@"; do
+              cargo nextest run --color never --no-tests=fail --retries 0 \
+                --features "$FEATURES" --test "$bin" -E "test(=$required)" \
+                || die "$required did not run and pass as exactly one test"
+              echo "  exact: $bin::$required"
+            done
+            echo "$bin: $listed listed, $required_n pinned by name, all green"
+          }
+
+          # Literal `--test` flags for the pin guard, which scrapes this file.
+          cargo nextest list --color never --features "$FEATURES" \
+            --test sensing_org_exact_seam --test sensing_org_exact_guards >/dev/null \
+            || die "the OA-5 binaries do not even list"
+
+          run_binary sensing_org_exact_seam \
+            discovery_transport_observations_projection_and_admission_compose \
+            an_unproven_call_to_the_sensed_provider_is_denied \
+            sensing_is_advisory_and_neither_plane_lets_it_authorize \
+            real_sensed_evidence_orders_the_complete_candidate_list
+
+          run_binary sensing_org_exact_guards \
+            every_bridge_declaration_is_gated_hidden_and_marked_unstable \
+            the_bridge_is_declared_once_and_is_absent_from_mesh \
+            the_fixtures_off_probe_covers_every_bridge_declaration
+
+          run_binary sensing_org_three_node \
+            relay_reauthors_org_provider_under_its_own_membership \
+            a_floored_peer_with_sensing_off_drops_the_org_frame_and_stays_unknown
+
+      # === The fixtures-off DARKNESS probe (external consumer) =============
+      # No test inside this workspace can observe a fixtures-off build of the
+      # core crate: dev-dependency feature unification turns the feature on for
+      # every dev target that shares the graph. So the darkness claim is proved
+      # by an EXTERNAL crate with its own workspace root, compiled twice:
+      #
+      #   * WITHOUT `fixtures` it must FAIL to resolve the bridge module, and
+      #     the failure must be a resolution error (E0432/E0433) - not a typo,
+      #     a missing manifest or an unrelated build break;
+      #   * WITH `fixtures` it must compile, which is what keeps the negative
+      #     leg from passing for the wrong reason.
+      #
+      # `tests/sensing_org_exact_guards.rs` separately asserts the probe names
+      # exactly the bridge's declarations, so it cannot cover fewer symbols.
+      - name: Sensing — organization exact bridge darkness
+        if: ${{ !cancelled() }}
+        working-directory: net/crates/net/guards/fixtures_off_probe
+        run: |
+          set -uo pipefail
+          die() { echo "::error::$1"; shift; [ "$#" -gt 0 ] && printf '%s\n' "$@"; exit 1; }
+
+          negative=$(cargo check --message-format short 2>&1)
+          status=$?
+          [ "$status" -ne 0 ] \
+            || die "the fixtures-off probe COMPILED: the bridge is reachable in a \
+                    build without the feature" "$negative"
+          printf '%s\n' "$negative" \
+            | grep -qE 'error\[E043[23]\].*org_exact_sensing_bridge' \
+            || die "the fixtures-off probe failed for the WRONG reason: expected an \
+                    E0432/E0433 resolution failure naming the bridge module" "$negative"
+          echo "negative leg: bridge unresolvable without \`fixtures\` (exit $status)"
+
+          cargo check --features fixtures \
+            || die "the positive leg must compile, or the negative leg proves nothing"
+          echo "positive leg: bridge resolves with \`fixtures\`"
+
       # === NetDB ==========================================================
       - name: NetDB
         if: ${{ !cancelled() }}

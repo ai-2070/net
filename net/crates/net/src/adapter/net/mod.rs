@@ -70,6 +70,14 @@ pub mod mesh_rpc_metrics;
 pub mod netdb;
 #[cfg(feature = "cortex")]
 pub mod org_admission_gate;
+/// Fixtures-only composition bridge for organization exact-provider sensing.
+///
+/// Declared here rather than inside the private `mesh` module because a `pub`
+/// item in a private module is not nameable from another crate; the fixtures
+/// gate is the whole guard, exactly as for `subnet::alloc_probe`.
+#[cfg(any(test, feature = "fixtures"))]
+#[doc(hidden)]
+pub mod org_exact_sensing_bridge;
 mod pool;
 mod protocol;
 mod proxy;

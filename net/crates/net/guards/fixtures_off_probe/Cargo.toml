@@ -1,0 +1,40 @@
+# The fixtures-off darkness probe: an EXTERNAL consumer of the core crate.
+#
+# Why an external crate at all. No test inside the workspace can observe a
+# fixtures-off build of `net`: dev-dependency feature unification turns the
+# feature on for every dev target that shares the graph, so a `#[cfg]`-based
+# "it is absent" assertion inside the crate's own tests would be asserting
+# about a build that never happens. This probe names the fixtures-only bridge
+# symbols and is compiled twice: WITHOUT the feature, where it must fail to
+# resolve them, and WITH it, where it must compile. Both directions are
+# required - the positive leg is what keeps the negative leg from passing
+# because of an unrelated typo.
+[package]
+name = "net-mesh-fixtures-off-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Its OWN workspace root. The root workspace at ../../Cargo.toml neither
+# includes nor excludes it, and the root feature graph can never turn
+# `fixtures` on for it.
+[workspace]
+
+# `package = ` because the lib is named `net`, not `net-mesh`: `use net::…` is
+# what compiles. The `net` feature is the mesh adapter itself; `fixtures` is
+# deliberately NOT listed here - the CI step adds it only for the positive leg.
+# DEFAULT features, minus `fixtures` (which is off by default and is the whole
+# point). Using the crate's own default stack is deliberate: it is what a
+# downstream `cargo add net-mesh` gets, so the negative leg proves the bridge is
+# unreachable in the SHIPPED configuration rather than in a hand-narrowed one.
+[dependencies.net]
+package = "net-mesh"
+path = "../.."
+
+[features]
+# Forwards the core gate for the positive leg.
+fixtures = ["net/fixtures"]
+
+[[bin]]
+name = "fixtures_off_probe"
+path = "src/main.rs"

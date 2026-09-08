@@ -283,3 +283,120 @@ async fn relay_reauthors_org_provider_under_its_own_membership() {
     refresh_a.abort();
     let _ = refresh_a.await;
 }
+
+/// A compatible-floor peer with SENSING OFF drops the org frame and stays
+/// Unknown — with no legacy downgrade anywhere.
+///
+/// This drives the LOCAL-ORIGIN lease path, not a hand-built frame: A holds a
+/// real organization authority, so `acquire_sensing_interest_lease` takes the
+/// organization plane, authors the registration under the canonical commitment
+/// and sends it from the node-owned ordered egress. D is an ordinary
+/// same-organization peer that simply does not run the sensing plane.
+///
+/// What must hold, and what must NOT:
+///
+/// * D installs nothing and moves no sensing counter — the dark receiver drops
+///   both sensing subprotocols before decode;
+/// * A's own row is rooted at the ORGANIZATION commitment. A peer that cannot
+///   answer must never cause the local leg to be re-authored under a legacy
+///   entity root, which would be an authority downgrade bought with silence;
+/// * A's projection for that branch stays `Unknown`. Absence of evidence is
+///   never NotReady, so nothing about D is prunable.
+#[tokio::test]
+async fn a_floored_peer_with_sensing_off_drops_the_org_frame_and_stays_unknown() {
+    let commitment = canonical_org_sensing_commitment(&org().org_id());
+
+    // A: organization-authoritative consumer with sensing ON.
+    let a = Arc::new(
+        MeshNode::new(
+            EntityKeypair::generate(),
+            base_config().with_sensing_coalescing(true),
+        )
+        .await
+        .expect("MeshNode::new A"),
+    );
+    // D: same organization, compatible in every other way, sensing OFF (the
+    // default - asserted below rather than assumed).
+    let dark_config = base_config();
+    assert!(
+        !dark_config.enable_sensing_coalescing,
+        "sensing must be off by default, or this witness is testing nothing"
+    );
+    let d = Arc::new(
+        MeshNode::new(EntityKeypair::generate(), dark_config)
+            .await
+            .expect("MeshNode::new D"),
+    );
+    let _a_dir = adopt_and_install(&a, "dark-consumer").await;
+    let _d_dir = adopt_and_install(&d, "dark-peer").await;
+
+    connect_pair(&a, &d).await;
+    a.start();
+    d.start();
+    for node in [&a, &d] {
+        node.announce_capabilities(net::adapter::net::behavior::capability::CapabilitySet::new())
+            .await
+            .expect("announce");
+    }
+    let (a_id, d_id) = (a.node_id(), d.node_id());
+    {
+        let (a, d) = (a.clone(), d.clone());
+        await_condition(
+            Duration::from_secs(5),
+            "entity pins established",
+            move || a.peer_entity_id(d_id).is_some() && d.peer_entity_id(a_id).is_some(),
+        )
+        .await;
+    }
+    assert!(
+        a.sensing_enabled(),
+        "precondition: A runs the sensing plane"
+    );
+    assert!(!d.sensing_enabled(), "precondition: D does not");
+
+    // THE PRODUCTION LOCAL-ORIGIN PATH: an organization lease toward D.
+    let spec = org_spec(d_id, commitment);
+    let key = ProviderInterestKey::new(spec.key(), d_id);
+    let ticket = a
+        .acquire_sensing_interest_lease(&spec, d_id, D)
+        .expect("the organization lease is authored locally regardless of the peer");
+
+    // A's OWN row is organization-rooted. No downgrade, no legacy fallback.
+    let local = a
+        .sensing_downstream_entry(&key, DownstreamId::LeasedLocal)
+        .expect("A's own leased row exists");
+    assert_eq!(
+        local.owner_root, commitment,
+        "the local leg stays rooted at the organization commitment - a silent \
+         peer must not buy a legacy re-authoring"
+    );
+
+    // Give the frame every chance to land, then prove nothing did.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(
+        d.sensing_table_is_empty(),
+        "a dark peer must gain no sensing rows"
+    );
+    assert!(
+        d.sensing_downstreams(&key).is_empty(),
+        "and specifically none for this branch"
+    );
+    for counter in [
+        SensingCounters::get(&d.sensing_counters().protocol_invalid),
+        SensingCounters::get(&d.sensing_counters().scope_refusals),
+    ] {
+        assert_eq!(counter, 0, "a dark peer must move zero sensing counters");
+    }
+    assert_eq!(
+        a.sensing_projected(&key),
+        net::adapter::net::behavior::sensing::ProjectedReadiness::Unknown,
+        "silence is Unknown - never NotReady, so nothing about a dark peer is \
+         prunable"
+    );
+    assert!(
+        a.sensing_latest_attestation(&key).is_none(),
+        "and no observation exists to have derived a verdict from"
+    );
+
+    let _ = a.try_release_sensing_interest_lease(ticket);
+}
