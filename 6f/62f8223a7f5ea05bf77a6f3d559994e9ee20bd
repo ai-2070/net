@@ -1,0 +1,38 @@
+.github/workflows/ci.yml
+  h_64425bc75e3f3d 1604-1712
+net/crates/net/.config/nextest.toml
+  h_64425bc75e3f3d 66-72,74
+net/crates/net/guards/fixtures_off_probe/Cargo.lock
+  h_64425bc75e3f3d 1-1613
+net/crates/net/guards/fixtures_off_probe/Cargo.toml
+  h_64425bc75e3f3d 1-40
+net/crates/net/guards/fixtures_off_probe/MANIFEST
+  h_64425bc75e3f3d 1-2
+net/crates/net/guards/fixtures_off_probe/src/main.rs
+  h_64425bc75e3f3d 1-20
+net/crates/net/guards/fixtures_off_probe/target/.rustc_info.json
+  h_64425bc75e3f3d 1
+net/crates/net/guards/fixtures_off_probe/target/CACHEDIR.TAG
+  h_64425bc75e3f3d 1-3
+net/crates/net/src/adapter/net/mod.rs
+  h_64425bc75e3f3d 73-80
+net/crates/net/src/adapter/net/org_exact_sensing_bridge.rs
+  h_64425bc75e3f3d 1-94
+net/crates/net/tests/sensing_org_exact_guards.rs
+  h_64425bc75e3f3d 1-258
+net/crates/net/tests/sensing_org_exact_seam.rs
+  h_64425bc75e3f3d 1-829
+net/crates/net/tests/sensing_org_three_node.rs
+  h_64425bc75e3f3d 286-402
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "6f62f8223a7f5ea05bf77a6f3d559994e9ee20bd",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
