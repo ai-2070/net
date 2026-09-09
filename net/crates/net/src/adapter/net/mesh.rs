@@ -14492,15 +14492,59 @@ impl MeshNode {
     /// [`try_release_sensing_interest_lease`](Self::try_release_sensing_interest_lease),
     /// which hands the live ticket back with the reason.
     pub fn release_sensing_interest_lease(&self, ticket: sensing::SensingLeaseTicket) {
-        if let Err(refused) = self.try_release_sensing_interest_lease(ticket) {
+        let Err(refused) = self.try_release_sensing_interest_lease(ticket) else {
+            return;
+        };
+        // The refusal hands back a STILL-LIVE ticket, and this signature has
+        // nowhere to put it. Dropping it leaked the holder outright: a
+        // surviving-holder release only relaxes the aggregate, so the row and
+        // its upstream registration then outlived every owner with nothing left
+        // that could ever release them.
+        //
+        // That was unreachable on the organization plane while own-org
+        // audiences were refused at acquire time. This slice makes them
+        // acquirable, so any external `MeshNode` consumer still on this
+        // pre-existing surface would leak on the first authority hiccup.
+        //
+        // So park it on the node's own refused-release ledger, which is exactly
+        // what the in-crate path does, and let the refresh worker retry it on
+        // its cadence. This needs an `Arc<MeshNode>`, which only a node started
+        // through `start_arc` has (`self_weak`); a bare node cannot park, and
+        // says so rather than pretending it released something.
+        let owner = self
+            .self_weak
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+            .filter(|node| std::ptr::eq(Arc::as_ptr(node), self as *const MeshNode));
+        let Some(node) = owner else {
             tracing::error!(
                 reason = %refused.reason,
-                "sensing lease: release REFUSED and nothing was released, but this \
-                 unit-returning surface cannot report it — the lease is still held at \
-                 its pre-transition cadence. Use `try_release_sensing_interest_lease` \
-                 on the organization plane"
+                "sensing lease: release REFUSED and this node has no shared handle to \
+                 park the still-live ticket on, so the holder is LEAKED — the row and \
+                 its upstream registration will outlive every owner. Start the node \
+                 through `start_arc`, or use `try_release_sensing_interest_lease`, \
+                 which hands the live ticket back"
             );
-        }
+            return;
+        };
+        let Some(installation_id) = self.sensing_lease_holder_installation(&refused.ticket) else {
+            // The holder died under the refusal; there is nothing left to own
+            // and nothing to park.
+            return;
+        };
+        let provider = match refused.ticket.key {
+            sensing::SensingLeaseKey::ExactProvider { provider, .. } => provider,
+            sensing::SensingLeaseKey::ProviderFree { .. } => 0,
+        };
+        let outcome = Self::park_refused_release(&node, refused.ticket, installation_id, provider);
+        tracing::warn!(
+            reason = %refused.reason,
+            ?outcome,
+            "sensing lease: release REFUSED; this unit-returning surface cannot report \
+             it, so the still-live ticket was parked for paced retry rather than \
+             dropped. Use `try_release_sensing_interest_lease` on the organization \
+             plane to handle the refusal directly"
+        );
     }
 
     /// Release a sensing-interest lease acquired via
