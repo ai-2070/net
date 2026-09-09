@@ -7232,6 +7232,18 @@ struct ArmedRefresh {
     seq: u64,
     installation_id: sensing::LeaseToken,
     period: Duration,
+    /// When the WIRE ROW this record renews stops vouching at the provider,
+    /// as far as this node can know.
+    ///
+    /// `None` means genuinely unknown - an adopted installation, whose age is
+    /// not this node's to assume. It is NOT "already expired": the two lead to
+    /// different retry decisions and conflating them either spins or oversleeps.
+    ///
+    /// Carried unchanged across a re-arm that registered nothing, because such
+    /// an attempt does not move the row's expiry. Grounding a retry in `period`
+    /// alone assumed a full period was still available, which is only true when
+    /// an `Established` arm is followed by a punctual worker.
+    expires_at: Option<Instant>,
 }
 
 /// The FLOOR on the refresh period, and therefore on the rate at which the
@@ -7241,6 +7253,37 @@ struct ArmedRefresh {
 /// soft-state horizon makes the due-set continuously due, and the worker's
 /// loop never reaches a park.
 pub(crate) const MIN_SENSING_REFRESH_PERIOD: Duration = Duration::from_millis(1);
+
+/// The retry delay for a re-arm that registered NOTHING on the wire.
+///
+/// Derived from what is actually LEFT of the row, never from `period`. Grounding
+/// it in `period` assumed a full period was still available, which holds only
+/// for an `Established` arm followed by a punctual worker: a worker that fires
+/// late has `period - delta` remaining, and an adopted row's age is unknown
+/// altogether, so `period / 2` could land after the provider had already
+/// dropped the interest.
+///
+/// `expires_at` of `None` means genuinely unknown, and is treated the same as
+/// already-expired: in neither case is there a deadline left to beat, so both
+/// pace at the ordinary cadence rather than retrying in a tight loop against a
+/// row that is not there. The floor is what keeps a nanosecond-scale horizon
+/// from re-arming immediately-due - the worker REMOVES a record before firing
+/// it, so a zero deadline is a spin loop.
+pub(crate) fn unrenewed_retry_delay(
+    now: Instant,
+    expires_at: Option<Instant>,
+    period: Duration,
+) -> Duration {
+    let remaining = expires_at
+        .map(|expiry| expiry.saturating_duration_since(now))
+        .filter(|remaining| !remaining.is_zero());
+    match remaining {
+        // Half of what is left, and never more than the ordinary cadence.
+        Some(remaining) => (remaining / 2).min(period / 2),
+        None => period / 2,
+    }
+    .max(MIN_SENSING_REFRESH_PERIOD)
+}
 
 /// What ONE acquisition established, as a single fact from inside its own
 /// transaction: the ticket, the installation that holder joined, and whether
@@ -15006,6 +15049,9 @@ impl MeshNode {
         installation_id: sensing::LeaseToken,
         period: Duration,
         provenance: SensingArmProvenance,
+        // The expiry the FIRED record carried, for a re-arm that registered
+        // nothing. Ignored by every other provenance, which derive their own.
+        carried_expiry: Option<Instant>,
     ) -> bool {
         let now = Instant::now();
         let mut schedule = node.sensing_refresh.lock();
@@ -15023,13 +15069,24 @@ impl MeshNode {
         //   AFTER its expiry. Unless somebody is already renewing it, adopt it
         //   by renewing IMMEDIATELY; the upstream damper drops the emission if
         //   the row turns out to be fresh after all.
-        let deadline = match provenance {
-            SensingArmProvenance::Established => now + period,
-            // The row was registered one period ago and expires one period from
-            // now (`period` is `ttl/2`). Retry at the midpoint of what is left,
-            // floored so a nanosecond-scale horizon cannot make the schedule
-            // continuously due.
-            SensingArmProvenance::Unrenewed => now + (period / 2).max(MIN_SENSING_REFRESH_PERIOD),
+        let (deadline, expires_at) = match provenance {
+            // This arm follows a real wire registration, so the row vouches for
+            // a full soft-state horizon from now.
+            SensingArmProvenance::Established => {
+                (now + period, Some(now + node.sensing_interest_ttl()))
+            }
+            // NOTHING was registered, so the row's expiry has not moved and the
+            // retry has to be derived from what is actually LEFT of it - never
+            // from `period`, which silently assumed a full period was still
+            // available. That assumption holds only for an `Established` arm
+            // followed by a punctual worker: a worker that fires late has
+            // `period - delta` remaining, and an adopted row's age is unknown
+            // altogether, so `period / 2` could land after the provider had
+            // already dropped the interest.
+            SensingArmProvenance::Unrenewed => (
+                now + unrenewed_retry_delay(now, carried_expiry, period),
+                carried_expiry,
+            ),
             SensingArmProvenance::Adopted => {
                 if schedule
                     .armed
@@ -15043,7 +15100,10 @@ impl MeshNode {
                 node.org_sensing_demand_counters
                     .refresh_adopted
                     .fetch_add(1, Ordering::Relaxed);
-                now
+                // Unknown age, so unknown expiry - recorded as such rather than
+                // guessed at. This arm renews immediately anyway; the value
+                // only matters if that renewal fails.
+                (now, None)
             }
         };
         match schedule.armed.get(&key) {
@@ -15081,6 +15141,7 @@ impl MeshNode {
             key,
             ArmedRefresh {
                 deadline,
+                expires_at,
                 seq,
                 installation_id,
                 period,
@@ -15512,7 +15573,11 @@ impl MeshNode {
                     //   during an authority rotation was enough for the
                     //   provider's sweep to drop the interest before the retry
                     //   arrived. `Unrenewed` grounds the deadline against the
-                    //   row's remaining life instead.
+                    //   row's REMAINING LIFE instead, carried forward from the
+                    //   record that just fired - because a worker that fires
+                    //   late, or a record adopted with an unknown age, has less
+                    //   than a period left and deriving the retry from `period`
+                    //   would schedule it past the expiry all over again.
                     let rearm = match outcome {
                         SensingRefreshOutcome::Renewed => Some(SensingArmProvenance::Established),
                         SensingRefreshOutcome::Refused
@@ -15528,6 +15593,7 @@ impl MeshNode {
                             record.installation_id,
                             record.period,
                             provenance,
+                            record.expires_at,
                         );
                     }
                     // COOPERATIVE PROGRESS. `Fire` reaches no other await, so a

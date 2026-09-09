@@ -1074,6 +1074,9 @@ impl OrgSensingFamily {
             acquired.installation_id,
             node.sensing_refresh_period(),
             acquired.provenance,
+            // An acquisition carries no earlier record: `Established` derives a
+            // full horizon from now, `Adopted` records an unknown one.
+            None,
         ) {
             // NO REFRESH OWNER. Arming refuses when the schedule is terminal,
             // when it is at `MAX_SENSING_REFRESH_ARMED`, or when a strictly
@@ -1105,8 +1108,8 @@ mod tests {
     use crate::adapter::net::behavior::org::{OrgKeypair, OrgMembershipCert};
     use crate::adapter::net::behavior::org_authority::NodeAuthority;
     use crate::adapter::net::mesh::{
-        RefusedReleaseOutcome, SensingArmDecision, SensingArmProvenance, SensingRefreshOutcome,
-        SensingRegistrationError, MIN_SENSING_REFRESH_PERIOD,
+        unrenewed_retry_delay, RefusedReleaseOutcome, SensingArmDecision, SensingArmProvenance,
+        SensingRefreshOutcome, SensingRegistrationError, MIN_SENSING_REFRESH_PERIOD,
     };
     use crate::adapter::net::{EntityKeypair, MeshNodeConfig};
     use crate::adapter::Adapter;
@@ -1973,7 +1976,8 @@ mod tests {
                 key,
                 old,
                 Duration::from_millis(10),
-                SensingArmProvenance::Established
+                SensingArmProvenance::Established,
+                None,
             ),
             "an older installation must not be armable over a newer one"
         );
@@ -2036,7 +2040,8 @@ mod tests {
             key,
             installation,
             Duration::from_secs(5),
-            SensingArmProvenance::Established
+            SensingArmProvenance::Established,
+            None,
         ));
         let earlier = node
             .sensing_refresh_arm_for_test(&key)
@@ -2495,6 +2500,61 @@ mod tests {
         drop(family);
     }
 
+    /// A re-arm that registered nothing schedules from the row's REMAINING
+    /// life, not from a period it may no longer have.
+    ///
+    /// `Unrenewed` originally derived its retry as `period / 2`, which silently
+    /// assumed a full period was still available. That holds only for an
+    /// `Established` arm followed by a punctual worker. Two ways it breaks:
+    ///
+    /// * the worker fires LATE, so only `period - delta` is left and
+    ///   `period / 2` can land after the provider has already dropped the
+    ///   interest;
+    /// * the record was ADOPTED, so the row's age - and therefore its expiry -
+    ///   is not known at all.
+    ///
+    /// The record now carries the expiry it was armed with, and a re-arm that
+    /// changed nothing carries it forward unchanged, because such an attempt
+    /// does not move the row's expiry.
+    #[test]
+    fn an_unrenewed_rearm_schedules_inside_what_is_actually_left() {
+        let period = Duration::from_millis(200);
+        let now = Instant::now();
+
+        // A PUNCTUAL worker: a full period remains, so half of it is the retry.
+        let punctual = unrenewed_retry_delay(now, Some(now + period), period);
+        assert_eq!(punctual, period / 2);
+
+        // A LATE worker: only a tenth of the period is left. The retry must fit
+        // inside THAT, not inside the period it no longer has.
+        let remaining = period / 10;
+        let late = unrenewed_retry_delay(now, Some(now + remaining), period);
+        assert!(
+            late < remaining,
+            "a late-firing worker must retry inside the row's remaining {remaining:?}, \
+             not {late:?} - scheduling past it is what let the provider's sweep \
+             drop the interest before the retry arrived"
+        );
+        assert!(
+            late < punctual,
+            "and it must be strictly sooner than the punctual case"
+        );
+
+        // ALREADY EXPIRED, and NEVER KNOWN (an adopted row). Neither has a
+        // deadline left to beat, so both pace at the ordinary cadence rather
+        // than retrying in a tight loop against a row that is not there.
+        assert_eq!(unrenewed_retry_delay(now, Some(now), period), period / 2);
+        assert_eq!(unrenewed_retry_delay(now, None, period), period / 2);
+
+        // And nothing may ever schedule at zero: the worker REMOVES a record
+        // before firing it, so an immediately-due re-arm is a spin loop.
+        let tiny = Duration::from_nanos(1);
+        assert!(
+            unrenewed_retry_delay(now, Some(now + tiny), tiny) >= MIN_SENSING_REFRESH_PERIOD,
+            "a nanosecond-scale horizon must still park"
+        );
+    }
+
     // ---- BUCKET PERMUTATION ----------------------------------------------
 
     /// The bucket assignment is a PERMUTATION for every input, not only for
@@ -2645,7 +2705,8 @@ mod tests {
                 keys[0],
                 installations[0],
                 Duration::from_millis(20),
-                SensingArmProvenance::Established
+                SensingArmProvenance::Established,
+                None,
             ),
             "nothing may be armed after the schedule is terminal"
         );
@@ -2679,7 +2740,8 @@ mod tests {
             key,
             installation,
             Duration::from_millis(20),
-            SensingArmProvenance::Established
+            SensingArmProvenance::Established,
+            None,
         ));
         until(
             &node,
