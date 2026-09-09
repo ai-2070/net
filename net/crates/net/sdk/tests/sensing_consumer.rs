@@ -94,6 +94,11 @@ const PAST_FLOOR: Duration = POPULATION_RECONCILE_FLOOR.saturating_add(Duration:
 /// Well below the population re-derivation floor, so a wake inside it can only
 /// have come from the node's own change signal.
 const WAKE_BOUND: Duration = Duration::from_millis(250);
+/// The ABSOLUTE observation deadline a wake witness allows for its whole
+/// attributed observation — several bounded parks plus their synchronous
+/// captures — measured from the first park and still below the population
+/// fallback floor. Distinct from [`WAKE_BOUND`], which bounds ONE park.
+const OBSERVATION_BOUND: Duration = Duration::from_millis(900);
 /// A quiet park must outlast this and still stay below the population floor,
 /// so the control excludes both an always-immediate wake and a floor wake.
 const QUIET_BOUND: Duration = Duration::from_millis(700);
@@ -575,13 +580,23 @@ async fn acknowledge_parked(observation: &mut SensingWatch) -> Instant {
 /// Park until a wake arrives whose IMMEDIATE read satisfies `carried`, and
 /// return how many earlier wakes were skipped.
 ///
-/// This is the whole attribution, inside the bounded observation: every park
-/// must return within [`WAKE_BOUND`], the accepted wake's own immediate
-/// snapshot must already show the named state, and the total wait must finish
-/// before `fallback` — so the fallback timer cannot explain the return and no
-/// LATER producer can retroactively give meaning to an EARLIER unrelated wake.
-/// Unrelated wakes are counted and re-parked on, never accepted; joining the
-/// producer afterwards proves nothing and is deliberately not done.
+/// This is the whole attribution, inside the bounded observation. Two bounds,
+/// kept distinct:
+///
+/// * a PER-PARK bound — every individual park must return within
+///   [`WAKE_BOUND`];
+/// * an ABSOLUTE OBSERVATION DEADLINE — the earlier of the caller's saved
+///   fallback deadline and [`OBSERVATION_BOUND`] from the first park. It is
+///   checked when the wake returns AND AGAIN once the synchronous snapshot and
+///   predicate have COMPLETED, because an async timeout cannot interrupt
+///   synchronous work: a lock wait or descheduling inside the capture would
+///   otherwise let state observed after the deadline be accepted as if it had
+///   arrived inside it.
+///
+/// So the fallback timer cannot explain the return, and no LATER producer can
+/// retroactively give meaning to an EARLIER unrelated wake: unrelated wakes are
+/// counted and re-parked on, never accepted, and the producer is joined only
+/// after the evidence, for cleanup.
 ///
 /// The quiet acknowledgement that precedes this is a receiver/cursor proof
 /// only — a cancelled `changed()` is not a barrier on this wait — which is
@@ -592,6 +607,7 @@ async fn wake_carrying(
     fallback: Instant,
     mut carried: impl FnMut(&net_sdk::sensing::SensingSnapshot) -> bool,
 ) -> usize {
+    let deadline = fallback.min(Instant::now() + OBSERVATION_BOUND);
     let mut skipped = 0usize;
     loop {
         tokio::time::timeout(WAKE_BOUND, observation.changed())
@@ -599,11 +615,19 @@ async fn wake_carrying(
             .unwrap_or_else(|_| panic!("{what}: no wake arrived inside the wake bound"))
             .expect("changed");
         assert!(
-            Instant::now() < fallback,
-            "{what}: the wait must finish before the population fallback"
+            Instant::now() < deadline,
+            "{what}: the wake must arrive before the observation deadline"
         );
         let snapshot = observation.snapshot().expect("snapshot");
-        if carried(&snapshot) {
+        let accepted = carried(&snapshot);
+        // AFTER the synchronous capture and predicate: what is accepted is the
+        // COMPLETED observation, so it must meet the same deadline.
+        assert!(
+            Instant::now() < deadline,
+            "{what}: the completed capture must also meet the observation \
+             deadline — state read after it is not evidence of the wake"
+        );
+        if accepted {
             return skipped;
         }
         skipped += 1;
@@ -978,11 +1002,18 @@ async fn timed_continuity_expiry_publishes_a_wake_and_clears_the_estimate() {
          not accepted as the expiry"
     );
     expiry.await.expect("expiry task");
+    // The PUBLICATION evidence is the accepted wake itself: a parked
+    // `changed()` returns only on a published generation change, and the wake
+    // accepted above is the one whose own completed capture showed the expiry
+    // inside the observation deadline. The independent subscriber below is
+    // therefore only a liveness cross-check — the deliberate unrelated
+    // publisher alone would already have set it — and is NOT counted as
+    // expiry-specific publication evidence.
     assert!(
         generation
             .has_changed()
             .expect("the generation channel is live"),
-        "the expiry must have PUBLISHED a change, not merely aged the state"
+        "cross-check: this node's change generation moved at all"
     );
 
     let snapshot = observation.snapshot().expect("snapshot");
