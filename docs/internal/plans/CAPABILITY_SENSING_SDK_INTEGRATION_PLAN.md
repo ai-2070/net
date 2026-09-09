@@ -12,10 +12,19 @@
 
 **Revision (2026-07-22, applies Kyra's OLB review ruling):** (1) organization sensing registration is authenticated by membership-cert-carrying registration variants — a narrow additive extension at registration intake; the earlier "no sensing-wire work" claim is withdrawn (§1.4, S0). (2) The node-global interest lease key has two shapes — `ProviderFree { audience, interest_digest }` and `ExactProvider { audience, interest_digest, provider }` — and each entry aggregates cadence with token-indexed intervals, not a bare refcount (§4.3, S0). (3) Organization-private consumers use exact-provider leases derived from private authorized discovery, never provider-free rendezvous (§3.1, §3.6). (4) Pruning follows fresh-evidence viability, not raw `NotReady` status (§2 rule 3). **Re-review (same day):** the registration wire choice is pinned — the organization variants are APPENDED to `SensingInterestFrame` under the existing 0x0C02 subprotocol, never a new subprotocol (S0); and S4's sequencing gates on the org-required S0/S1 subset, not S0–S3 (S4).
 
-**Status (2026-09-09, read at `55fd0b7a4ebd0fa9ba14f93ddfcfd23755ced9de`).**
+**Status (2026-09-09).** Two different things are stated separately below,
+because the merged history and this contribution are not the same commit:
+
+- **merged base** `55fd0b7a4ebd0fa9ba14f93ddfcfd23755ced9de` — everything under
+  "core acquisition" and "OLB" below was read there;
+- **this contribution** — the S1 consumer lifecycle plus the review repairs, in
+  local commits on `LZL0/sending-sdk` above that base. The files it adds
+  (`sdk/src/sensing/consumer.rs`, `sdk/tests/sensing_consumer.rs`) do not exist
+  at the base SHA.
+
 Read this block, not the historical receipt below it, for current state.
 
-*Delivered.*
+*Delivered (merged base).*
 - **Core organization exact-provider acquisition, projection and refresh.** The
   own-organization exact lease authors and emits
   `SensingInterestFrame::OrgProviderRegistration` from installed authority,
@@ -30,6 +39,8 @@ Read this block, not the historical receipt below it, for current state.
   vehicle). See `ORG_CAPABILITY_LOAD_BALANCING_PLAN.md`.
 - **S1 provider lifecycle** — `SensingClient`, `provide` / `provide_replacing`,
   `ReadinessRegistration` (`sdk/src/sensing.rs`), unchanged by later work.
+
+*Delivered (this contribution).*
 - **S1 consumer lifecycle, own-organization EXACT-PROVIDER scope only** —
   `SensingQuery`, `SensingWatch`, `SensingSnapshot`, `SensedProvider`,
   `SensedViability` (`sdk/src/sensing/consumer.rs`), with witnesses in
@@ -38,6 +49,23 @@ Read this block, not the historical receipt below it, for current state.
   node-global lease with explicit close and drop cleanup, the exact snapshot
   projection over the authorized population, and missed-wakeup-safe
   `changed()`.
+- **The request states BOTH of its bounds.** `SensingQuery::start_within` is
+  the provider-evaluated predicate that rides the signed interest (defaulting
+  to the fixed policy the OLB retention asks, so a default watch shares that
+  interest); `SensingQuery::within` is the consumer-local end-to-end budget.
+  The core gained one narrow seam for this —
+  `OrgSensingFamily::mint_asking` binds the envelope per family — and OLB's own
+  `mint`/`retain` policy is unchanged.
+- **Every read requalifies and clamps.** `MeshNode::org_sensing_current_visibility`
+  re-derives live local membership (`capture_live_org_relay_membership`) plus
+  current owner-private visibility on each snapshot, off every pacing floor: a
+  revoked, expired or unreadable observer is refused with
+  `SensingError::ObserverNotQualified` while its leases and recovery survive,
+  and a provider outside current visibility leaves the next snapshot even
+  though acquisition of ADDITIONS stays paced.
+- **Row economics are the classification's own inputs.** `OrgSensedRow` carries
+  the route estimate the projection classified with, so the SDK samples no
+  plane a second time.
 
 *Not delivered — do not read the above as broader than it is.*
 - S1 work item 2 is delivered only as AUTHORITY-DERIVED CANDIDATE derivation
@@ -409,15 +437,24 @@ It does not expose:
 - raw private-discovery records.
 
 **As shipped (own-organization exact-provider scope).** `SensingQuery` carries
-the capability id and ONE optional end-to-end budget, and nothing else. The
-remaining items above are deliberately absent rather than defaulted: canonical
-constraints, result mode, disclosure class and sample interval are FIXED
-internal policy on the retained-demand path (a per-caller value would fork the
-interest digest and split one lease into many), the provider selector is always
-`Node(provider)` over the authorized population, and ttl is the node's own
-soft-state horizon. A blank capability and a zero budget are refused
-(`SensingError::EmptyCapability`, `SensingError::UnsatisfiableBudget`); no
-unimplemented selector form is accepted-and-ignored.
+the capability id, the PROVIDER-START bound (`start_within`, defaulting to the
+fixed two-second policy the OLB retention asks) and ONE optional consumer
+end-to-end budget (`within`) — nothing else. The provider-start bound is not a
+local filter: it rides the signed interest, reaches the evaluator as
+`EvaluationRequest::work_latency`, and a provider that cannot meet it answers
+`NotReady` — which no consumer budget can overturn. Two watches asking
+different bounds hold independent interests, and the digest binds the bound.
+
+The remaining items above are deliberately absent rather than defaulted:
+canonical constraints are fixed EMPTY, result mode and disclosure class are
+fixed internal policy, the sample interval is the node's own cadence clamped
+to its soft-state horizon (a per-caller cadence would fork the digest and
+split one lease into many), the provider selector is always `Node(provider)`
+over the authorized population, and ttl is the node's own horizon. A blank
+capability, a zero end-to-end budget and a zero provider-start bound are
+refused (`SensingError::EmptyCapability`,
+`SensingError::UnsatisfiableBudget`, `SensingError::UnsatisfiableStartBound`);
+no unimplemented selector form is accepted-and-ignored.
 
 ### 4.2 Snapshot
 
@@ -449,14 +486,19 @@ Do not expose a freshness timestamp or imply that readiness reserves capacity.
 `ranked()`, `preferred()` and `provider(node_id)`; each `SensedProvider`
 carries the provider node id, `Ready | Unknown | NotReady`, its
 `SensedViability` class for THIS request, the provider-signed start estimate
-when one is present and still vouched for, and this consumer's own route
-estimate (`None` when the proximity plane knows nothing). The three bucket
-accessors collapse into the per-row `SensedViability` — every reported provider
-is in exactly one class, so a caller reads one row instead of intersecting
-three slices. Deliberately NOT exposed: a combined ranking cost (the rank order
-is the ordering, and a synthetic cost invites arithmetic the protocol cannot
-back), capability generation (an internal key discriminator, not a consumer
-fact), and any freshness timestamp or evidence age.
+when one is present and still vouched for, and the consumer-local route
+estimate — the value the CLASSIFICATION used, carried out of the projection on
+`OrgSensedRow` rather than resampled afterwards, so a row's economics cannot
+contradict its own verdict or the rank order (`None` when the proximity plane
+knows nothing). Every row is also clamped to what is CURRENTLY visible, so the
+reported set is always a subset of current owner-private visibility.
+
+The three bucket accessors collapse into the per-row `SensedViability` — every
+reported provider is in exactly one class, so a caller reads one row instead of
+intersecting three slices. Deliberately NOT exposed: a combined ranking cost
+(the rank order is the ordering, and a synthetic cost invites arithmetic the
+protocol cannot back), capability generation (an internal key discriminator,
+not a consumer fact), and any freshness timestamp or evidence age.
 
 ### 4.3 Consumer lifecycle
 
@@ -490,18 +532,25 @@ the authorized exact-provider set and every registration is
 
 ```text
 watch(query)
-→ subscribe to the node's change generation FIRST
-→ mint this watch's demand ownership root (OrgSensingFamily)
+→ QUALIFY this observer (live local membership + current visibility);
+  refuse ObserverNotQualified before acquiring anything
+→ subscribe to the node's change generation
+→ mint this watch's demand ownership root (OrgSensingFamily), bound to
+  the query's provider-start predicate
 → capture installed authority, derive the authorized population,
   re-prove the captured view, acquire one exact lease per member,
   arm each installation's ttl/2 renewal on the node's refresh worker
 
 snapshot()
 → mark the change cursor seen BEFORE reading any state
-→ re-derive the population when due (1s floor) or when the installed
-  demand is degraded (moved authority, dead holder) — degradation
-  bypasses the floor
-→ project the retained population at one captured instant
+→ REQUALIFY: live local membership plus current owner-private
+  visibility, at this instant and off every pacing floor; an
+  unqualified observer is refused and keeps its leases
+→ re-derive the retained population when due (1s floor) or when the
+  installed demand is degraded (moved authority, dead holder) —
+  degradation bypasses the floor
+→ project the retained population at one captured instant and CLAMP
+  the rows and the rank order to current visibility
 
 changed()
 → return on the node's change generation moving (observation movement,
@@ -510,15 +559,17 @@ changed()
 
 close()/drop
 → release exactly this watch's leases; a survivor's row, cadence and
-  refresh record are untouched, and only the last release settles the
-  refresh and deregisters the row
+  refresh record are untouched (release-then-SETTLE), and only the last
+  release settles the refresh and deregisters the row
 ```
 
 A watch owns no refcount of its own: ownership is node-global in the sensing
 lease registry, which is what makes two separately constructed `Mesh` wrappers
-over one node share the interest row. Population re-derivation is paced on the
-application's own `snapshot` call plus the `changed` floor wake — no per-watch
-task and no per-watch timer.
+over one node share the interest row. Acquisition of ADDITIONS is paced on the
+application's own `snapshot` call plus the `changed` floor wake; RETRACTIONS
+are not paced at all, because visibility is re-derived per read. There is no
+background task and no permanent timer per watch — a parked `changed()` arms
+one `sleep_until` for the duration of that park.
 
 **The registration refcount lives on `MeshNode`, never on SDK `Mesh`.** A sensing registration mutates node state, and multiple SDK/binding wrappers can share one node (`Mesh::from_node_arc` is public; every binding holds `Arc<MeshNode>`). The audience-lease regression (`71c2fbf71`) proved the SDK-local shape wrong: two wrappers over one node each thought they were the first installer, and the first to drop withdrew a live client's registration. Copy the rehomed ownership template — a node-owned lease map with acquire/release methods on `MeshNode` (the `OrgAudienceLeases` pattern, `org_grant_registry.rs` + `mesh.rs` acquire/release), and RAII drop-guards in the SDK (`AudienceLeaseGuard` pattern). `SensingWatch` (and the org client's routing state) hold guards only.
 
