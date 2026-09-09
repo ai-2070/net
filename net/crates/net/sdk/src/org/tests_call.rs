@@ -1694,6 +1694,114 @@ async fn selection_and_its_errors_follow_the_reordered_list() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A refused wave paces itself, and a RESTORED authority does not wait for it.
+///
+/// Both halves through the caller: `plan_attempt` on a sensing-enabled node,
+/// with a real acquisition, the real `retain` path, and a real refusal recorded
+/// by the section itself. No synthetic `record_refusal` and no synthetic record
+/// table.
+///
+/// The refusal is driven by POISONING the revocation store, which is the
+/// production shape: the authority stays installed, so the caller keeps
+/// capturing and the sensed step keeps running, but `retain` can no longer
+/// capture a usable sensing authority and refuses. That is what makes both
+/// halves observable through the same path:
+///
+/// * **the wave.** A second caller derives the same expectation, sees the same
+///   stale demand, and runs under the same poisoned observation. It must NOT
+///   attempt again - that is the queued wave, where every caller behind one
+///   refusal re-derives the same corpse.
+/// * **the recovery.** Authority is then reinstalled through the real
+///   installer. The expectation is UNCHANGED and the old demand's own booleans
+///   are unchanged too - it is still stale - so a rule that paced on those
+///   booleans alone would make this call wait out the floor. It must converge
+///   at once, because the observation the refusal was recorded under is no
+///   longer the one in force.
+#[tokio::test]
+async fn a_refused_wave_paces_but_a_restored_authority_does_not_wait() {
+    let a = org_a();
+    let (mesh, identity, dir) =
+        super::tests::mesh_with_authority_sensing("plan-refusal-context", Some(&a), true).await;
+    let provider = EntityKeypair::generate();
+    let tag = "nrpc:internal.reindex";
+    inject_owner_envelope(&mesh, &a, &provider, &[tag]);
+    mesh.node()
+        .test_pin_peer_entity(provider.entity_id().node_id(), provider.entity_id().clone());
+    let client = bind(&mesh, &a, &identity, vec![]);
+    let capability = cap(tag);
+    let sensed = super::call::SensedSelection::new(tag, 0);
+
+    let converged = || {
+        client
+            .sensing_section_counters()
+            .expect("an active binding")
+            .2
+    };
+    let attempt = || {
+        let capture = client
+            .capture_private(&capability)
+            .expect("the authority stays installed, so the caller keeps capturing");
+        let _ = client.plan_attempt(&capability, &capture, &sensed);
+    };
+
+    // WARM: one real convergence under live authority.
+    attempt();
+    assert_eq!(converged(), 1, "the warm call converged once");
+    let expectation = client
+        .sensing_last_expectation()
+        .expect("an active binding");
+    assert!(
+        !expectation.is_empty(),
+        "precondition: the sensed step had a nonempty expectation"
+    );
+
+    // POISON: the store this node's sensing authority is qualified against.
+    mesh.node()
+        .org_revocation_store()
+        .expect("an installed store")
+        .mark_poisoned_for_test();
+
+    // THE REFUSED ATTEMPT: a real `retain` refusal, recorded with its context.
+    attempt();
+    assert_eq!(
+        converged(),
+        2,
+        "the poisoned attempt is an attempt: it decided to converge and `retain` \
+         refused"
+    );
+    assert_eq!(
+        client.sensing_last_expectation(),
+        Some(expectation.clone()),
+        "precondition: it derived the same expectation"
+    );
+
+    // THE WAVE: same expectation, same stale demand, same poisoned view.
+    attempt();
+    assert_eq!(
+        converged(),
+        2,
+        "a second caller in the same refused context must be paced by that \
+         refusal, not refused again"
+    );
+
+    // THE RECOVERY: a real same-organization reinstall. Nothing else moves.
+    renew_authority_at(&mesh, &a, &identity, &dir, "restored");
+    attempt();
+    assert_eq!(
+        client.sensing_last_expectation(),
+        Some(expectation),
+        "precondition: the recovery call's expectation is UNCHANGED - only the \
+         authority observation moved"
+    );
+    assert_eq!(
+        converged(),
+        3,
+        "a restored authority is a NEW context: reconciliation must resume at \
+         once rather than wait out the refusal floor"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The reconciliation trigger, as a decision table over REAL demands.
 ///
 /// Two things are paced independently here and neither may cancel the other:
@@ -1713,9 +1821,20 @@ async fn the_reconciliation_trigger_certifies_the_installed_demand() {
     let schedule = super::client::ConvergenceSchedule::default();
     let floor = Duration::from_secs(2);
     let t0 = Instant::now();
+    // The authority context a decision runs under, RE-CAPTURED per group
+    // exactly as the call path does it: every attempt derives under its own
+    // capture. A refusal records the capture it happened under, and a later
+    // decision asks the node whether that capture is still in force.
+    macro_rules! authority {
+        () => {
+            mesh.node().org_cold_authority().expect("authority capture")
+        };
+    }
+    let auth = authority!();
+    let ctx = super::client::RefusalContext::new(mesh.node(), &auth);
 
     // No demand and no record: converge.
-    assert!(schedule.needs_convergence(&capability, &[1, 2], None, t0, floor));
+    assert!(schedule.needs_convergence(&capability, &[1, 2], None, t0, floor, &ctx));
 
     // ---- a certified demand that DISAGREES ---------------------------------
     // Nothing is discovered here, so core publishes an EMPTY population: the
@@ -1725,11 +1844,11 @@ async fn the_reconciliation_trigger_certifies_the_installed_demand() {
     assert!(demand.population().is_empty());
     schedule.certify(capability, vec![1, 2], &demand, t0);
     assert!(
-        !schedule.needs_convergence(&capability, &[1, 2], Some(&demand), t0, floor),
+        !schedule.needs_convergence(&capability, &[1, 2], Some(&demand), t0, floor, &ctx),
         "the disagreement is floored, not retried on the very next call"
     );
     assert!(
-        schedule.needs_convergence(&capability, &[1, 2], Some(&demand), t0 + floor, floor),
+        schedule.needs_convergence(&capability, &[1, 2], Some(&demand), t0 + floor, floor, &ctx),
         "and it IS retried once the floor has passed"
     );
 
@@ -1743,7 +1862,8 @@ async fn the_reconciliation_trigger_certifies_the_installed_demand() {
             &[1, 2],
             Some(&demand),
             t0 + Duration::from_secs(600),
-            floor
+            floor,
+            &ctx
         ),
         "a repeated identical mismatch stays retryable"
     );
@@ -1757,7 +1877,8 @@ async fn the_reconciliation_trigger_certifies_the_installed_demand() {
             &[],
             Some(&demand),
             t0 + Duration::from_secs(600),
-            floor
+            floor,
+            &ctx
         ),
         "an agreed population is not re-run by the passage of time"
     );
@@ -1776,7 +1897,7 @@ async fn the_reconciliation_trigger_certifies_the_installed_demand() {
     let replaced = family.retain("nrpc:internal.reindex").expect("re-retain");
     schedule.certify(capability, Vec::new(), &replaced, t0);
     assert!(
-        !schedule.needs_convergence(&capability, &[], Some(&replaced), t0, floor),
+        !schedule.needs_convergence(&capability, &[], Some(&replaced), t0, floor, &ctx),
         "precondition: this record agrees about the replacement"
     );
     let third = family.retain("nrpc:internal.reindex").expect("re-retain");
@@ -1790,16 +1911,17 @@ async fn the_reconciliation_trigger_certifies_the_installed_demand() {
             &[],
             Some(&third),
             t0 + Duration::from_secs(600),
-            floor
+            floor,
+            &ctx
         ),
         "a record must never certify a demand it was not taken from"
     );
 
     // ---- a REFUSAL paces itself, installed demand or not -------------------
     let refused_capability = cap("nrpc:refused.capability");
-    schedule.record_refusal(refused_capability, vec![1, 2], None, t0);
+    schedule.record_refusal(refused_capability, vec![1, 2], None, &ctx, t0);
     assert!(
-        !schedule.needs_convergence(&refused_capability, &[1, 2], None, t0, floor),
+        !schedule.needs_convergence(&refused_capability, &[1, 2], None, t0, floor, &ctx),
         "a refused attempt with NO demand installed must still be paced - this \
          is the FamilyAtCapacity shape"
     );
@@ -1809,25 +1931,27 @@ async fn the_reconciliation_trigger_certifies_the_installed_demand() {
             &[1, 2],
             None,
             t0 + Duration::from_millis(500),
-            floor
+            floor,
+            &ctx
         ),
         "and stays paced within the floor"
     );
     assert!(
-        schedule.needs_convergence(&refused_capability, &[1, 2], None, t0 + floor, floor),
+        schedule.needs_convergence(&refused_capability, &[1, 2], None, t0 + floor, floor, &ctx),
         "then retries once"
     );
     assert!(
-        schedule.needs_convergence(&refused_capability, &[1, 2, 3], None, t0, floor),
+        schedule.needs_convergence(&refused_capability, &[1, 2, 3], None, t0, floor, &ctx),
         "a CHANGED expectation bypasses the pacing entirely"
     );
 
-    // ---- a DEAD demand converges once, then paces ---------------------------
-    // Authority movement makes the installed demand something no record can
+    // ---- a REFUSED CONTEXT paces; a new one does not ------------------------
+    // A demand staled by authority movement is something no certificate can
     // vouch for, so it converges immediately. But a wave of callers queued
-    // behind one refusal would each re-derive the SAME dead demand and be
-    // refused again, per call: after the refusal is recorded UNDER that state,
-    // the repeat is paced like any other refusal.
+    // behind one refusal would each re-derive the SAME dead demand under the
+    // SAME dead authority and be refused again, per call. A refusal therefore
+    // paces its own context - and only its own: the demand state AND the
+    // authority observation it happened under.
     let dead_capability = cap("nrpc:dead.demand");
     let dead = family.retain("nrpc:dead.demand").expect("retain");
     renew_authority(&mesh, &a, &identity, &dir);
@@ -1835,43 +1959,87 @@ async fn the_reconciliation_trigger_certifies_the_installed_demand() {
         !dead.authority_is_current(),
         "precondition: the installed demand's authority really moved"
     );
+    // The context the wave runs in: captured AFTER that movement, so it is the
+    // one actually in force while the wave is refused.
+    let dead_auth = authority!();
+    let dead_ctx = super::client::RefusalContext::new(mesh.node(), &dead_auth);
     assert!(
-        schedule.needs_convergence(&dead_capability, &[1, 2], Some(&dead), t0, floor),
+        schedule.needs_convergence(&dead_capability, &[1, 2], Some(&dead), t0, floor, &dead_ctx),
         "a demand whose authority moved converges IMMEDIATELY - no record \
          vouches for state it cannot see"
     );
-    schedule.record_refusal(dead_capability, vec![1, 2], Some(&dead), t0);
+    schedule.record_refusal(dead_capability, vec![1, 2], Some(&dead), &dead_ctx, t0);
     assert!(
-        !schedule.needs_convergence(&dead_capability, &[1, 2], Some(&dead), t0, floor),
-        "and the next caller in the same wave, deriving the same dead demand, \
-         is paced by that refusal instead of being refused again"
+        !schedule.needs_convergence(&dead_capability, &[1, 2], Some(&dead), t0, floor, &dead_ctx),
+        "and the next caller in the same wave - same dead demand, same \
+         authority still in force - is paced by that refusal instead of being \
+         refused again"
     );
     assert!(
-        schedule.needs_convergence(&dead_capability, &[1, 2], Some(&dead), t0 + floor, floor),
+        schedule.needs_convergence(
+            &dead_capability,
+            &[1, 2],
+            Some(&dead),
+            t0 + floor,
+            floor,
+            &dead_ctx
+        ),
         "the floor still expires"
     );
     assert!(
-        schedule.needs_convergence(&dead_capability, &[1, 2, 3], Some(&dead), t0, floor),
+        schedule.needs_convergence(
+            &dead_capability,
+            &[1, 2, 3],
+            Some(&dead),
+            t0,
+            floor,
+            &dead_ctx
+        ),
         "and a changed expectation still bypasses it"
     );
-    // A REPLACED demand is a different fact. Republished, then staled again by
-    // a second authority movement, it is dead in the same WAY but not the same
-    // demand - and its own first attempt is not paced by its predecessor's
-    // refusal.
+
+    // A REPLACED demand is a different fact: its own first attempt is never
+    // paced by the refusal its predecessor earned.
     let replacement = family.retain("nrpc:dead.demand").expect("re-retain");
     assert!(
         !std::sync::Arc::ptr_eq(&dead, &replacement),
         "precondition: a different demand"
     );
-    renew_authority_at(&mesh, &a, &identity, &dir, "successor-2");
     assert!(
-        !replacement.authority_is_current(),
-        "precondition: the replacement is dead in the same way"
+        schedule.needs_convergence(
+            &dead_capability,
+            &[1, 2],
+            Some(&replacement),
+            t0,
+            floor,
+            &dead_ctx
+        ),
+        "a replaced demand is not the state that was refused"
+    );
+
+    // ...and NEITHER IS A RESTORED AUTHORITY. Same capability, same
+    // expectation, same still-stale demand - the booleans a record could
+    // sample have not moved - but the authority observation the refusal was
+    // recorded under is no longer the one in force. This is the recovery case
+    // that must not wait out the floor.
+    renew_authority_at(&mesh, &a, &identity, &dir, "restored-unit");
+    let restored_auth = authority!();
+    let restored_ctx = super::client::RefusalContext::new(mesh.node(), &restored_auth);
+    assert!(
+        !mesh.node().org_cold_authority_is_current(&dead_auth),
+        "precondition: the refused capture is no longer in force"
     );
     assert!(
-        schedule.needs_convergence(&dead_capability, &[1, 2], Some(&replacement), t0, floor),
-        "a replaced demand's first attempt is never paced by the refusal its \
-         predecessor earned"
+        schedule.needs_convergence(
+            &dead_capability,
+            &[1, 2],
+            Some(&dead),
+            t0,
+            floor,
+            &restored_ctx
+        ),
+        "a restored authority is a NEW context: pacing a refusal from the old \
+         one would delay legitimate reconciliation until the floor expired"
     );
 
     // ---- and the record set is BOUNDED -------------------------------------
@@ -1881,6 +2049,7 @@ async fn the_reconciliation_trigger_certifies_the_installed_demand() {
             other,
             vec![1],
             None,
+            &restored_ctx,
             t0 + Duration::from_millis(index as u64),
         );
     }

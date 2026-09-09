@@ -919,12 +919,21 @@ jobs:
           # Scrape the real pins and ATTRIBUTE each one to the crate its
           # invocation targets. `--test <name>` is resolved against the crate
           # the invoking step runs in, so a pin only proves coverage for THAT
-          # crate: an explicit `-p <crate>`, else the step's own
-          # `working-directory`, else the job default. Without that
-          # attribution a root test would count as pinned merely because an
-          # SDK step names the same basename, and a pin placed under the wrong
-          # crate's directory (which names a real target somewhere else) would
-          # survive as if it covered something.
+          # crate: an explicit `-p <package>` (resolved to the crate it names,
+          # so a redundant `-p net-mesh` on a root step is still the root
+          # crate), else the step's own `working-directory`, else the job
+          # default. Without that attribution a root test would count as
+          # pinned merely because an SDK step names the same basename, and a
+          # pin placed under the wrong crate's directory (which names a real
+          # target somewhere else) would survive as if it covered something.
+          #
+          # Forms this attribution cannot resolve are REFUSED rather than
+          # guessed: a `working-directory:` declared after the `run:` block it
+          # would apply to, and a shell `cd` inside a run block before its
+          # pins. Both make the effective crate of a `--test` ambiguous to a
+          # line-ordered read, and a wrong guess is exactly the silent hole
+          # this guard exists to close. A `-p` that names neither crate is
+          # reported the same way.
           #
           # Comment lines and this step's own `echo` prose are dropped first:
           # both mention the flag by name and would be scraped as bogus
@@ -932,36 +941,70 @@ jobs:
           sed '/^[[:space:]]*#/d' "$GITHUB_WORKSPACE/.github/workflows/ci.yml" \
             | grep -v 'echo ' \
             | awk '
-                function crate_of(dir) {
+                function crate_of_dir(dir) {
                   if (dir == "net/crates/net") return "root"
                   if (dir == "net/crates/net/sdk") return "sdk"
                   return "dir:" (dir == "" ? "<repo root>" : dir)
                 }
+                function crate_of_pkg(pkg) {
+                  if (pkg == "net-mesh") return "root"
+                  if (pkg == "net-mesh-sdk") return "sdk"
+                  return "pkg:" pkg
+                }
+                function package_on(line) {
+                  if (match(line, /-p [A-Za-z0-9_-]+/)) {
+                    return substr(line, RSTART + 3, RLENGTH - 3)
+                  }
+                  return ""
+                }
                 /^  [A-Za-z0-9_-]+:[[:space:]]*$/ {
-                  jobdir=""; stepdir=""; insteps=0; crate=""; next
+                  jobdir=""; stepdir=""; insteps=0
+                  crate=""; incargo=0; steppinned=0; stepcd=0
+                  next
                 }
                 /^    steps:[[:space:]]*$/ { insteps=1; next }
-                /^      - / { stepdir="" }
+                /^      - / {
+                  stepdir=""; crate=""; incargo=0; steppinned=0; stepcd=0
+                }
                 /working-directory:/ {
                   sub(/^.*working-directory:[[:space:]]*/, "")
                   sub(/[[:space:]]+$/, "")
-                  if (insteps) { stepdir=$0 } else { jobdir=$0 }
+                  if (insteps) {
+                    if (steppinned) {
+                      print "unsupported\ta working-directory declared after the run block it applies to"
+                    }
+                    stepdir=$0
+                  } else {
+                    jobdir=$0
+                  }
                   next
                 }
-                /cargo (test|nextest (run|list))/ {
-                  if (match($0, /-p [A-Za-z0-9_-]+/)) {
-                    crate = substr($0, RSTART + 3, RLENGTH - 3)
-                  } else {
-                    crate = crate_of(stepdir != "" ? stepdir : jobdir)
-                  }
-                }
                 {
-                  rest = $0
+                  line = $0
+                  if (line ~ /cargo (test|nextest (run|list))/) {
+                    incargo=1
+                    pkg = package_on(line)
+                    crate = (pkg != "" ? crate_of_pkg(pkg) \
+                                       : crate_of_dir(stepdir != "" ? stepdir : jobdir))
+                  } else if (incargo) {
+                    # A package flag on a CONTINUATION line selects the crate
+                    # just as one on the command line does.
+                    pkg = package_on(line)
+                    if (pkg != "") { crate = crate_of_pkg(pkg) }
+                  }
+                  if (line ~ /(^|[[:space:](])cd [^[:space:]]/) { stepcd=1 }
+                  rest = line
                   while (match(rest, /--test [a-z0-9_]+/)) {
-                    print (crate == "" ? "unattributed" : crate) "\t" \
-                          substr(rest, RSTART + 7, RLENGTH - 7)
+                    name = substr(rest, RSTART + 7, RLENGTH - 7)
+                    if (stepcd) {
+                      print "unsupported\ta shell cd precedes this pin, so its crate is ambiguous: " name
+                    } else {
+                      print (crate == "" ? "unattributed" : crate) "\t" name
+                    }
+                    steppinned=1
                     rest = substr(rest, RSTART + RLENGTH)
                   }
+                  if (line !~ /\\[[:space:]]*$/) { incargo=0 }
                 }
               ' | sort -u > /tmp/pinned_by_crate.txt
           awk -F'\t' '$1 == "root" { print $2 }' /tmp/pinned_by_crate.txt \
@@ -979,6 +1022,22 @@ jobs:
           # SDK test that exists and runs.
           ls tests/*.rs | sed 's|tests/||; s|\.rs$||' | sort -u > /tmp/present_root.txt
           ls sdk/tests/*.rs | sed 's|sdk/tests/||; s|\.rs$||' | sort -u > /tmp/present_sdk.txt
+          # UNATTRIBUTABLE pins first, because they are the CAUSE of any
+          # inventory verdict below: a pin this read cannot resolve to a crate
+          # covers nothing, so the tests it was meant to cover would otherwise
+          # be reported as merely unpinned and the real reason - a foreign
+          # crate, an unknown package selector, or a form this attribution
+          # refuses to guess at - would be left for the reader to find.
+          if [ -s /tmp/pinned_foreign.txt ]; then
+            echo "::error::CI pin(s) that name no crate this guard inventories, or a form it will not guess at:"
+            sed 's/^/  /' /tmp/pinned_foreign.txt
+            echo ""
+            echo "Attribution resolves an explicit '-p <package>' to its crate,"
+            echo "else the step's own working-directory, else the job default."
+            echo "A working-directory declared after its run block, and a shell"
+            echo "cd before a pin, are refused rather than guessed."
+            exit 1
+          fi
           missing=$(comm -23 /tmp/present_root.txt <(sort -u /tmp/pinned_root.txt /tmp/allowed.txt))
           if [ -n "$missing" ]; then
             echo "::error::Integration test(s) present in tests/ but pinned to no CI step:"
@@ -2244,7 +2303,8 @@ jobs:
             authority_movement_inside_sensed_planning_is_still_fenced \
             the_sensed_adapter_never_ranks_or_prunes_a_granted_candidate \
             selection_and_its_errors_follow_the_reordered_list \
-            the_reconciliation_trigger_certifies_the_installed_demand
+            the_reconciliation_trigger_certifies_the_installed_demand \
+            a_refused_wave_paces_but_a_restored_authority_does_not_wait
           do
             out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
                     --retries 0 --features "net cortex fixtures" --lib \
@@ -2253,7 +2313,7 @@ jobs:
             printf '%s\n' "$out" | grep -qE '1 test run: 1 passed' \
               || { printf '%s\n' "$out"; echo "::error::$required did not run as exactly one test"; exit 1; }
           done
-          echo "organization exact planning units: 4 pinned by name, each executed"
+          echo "organization exact planning units: 5 pinned by name, each executed"
 
       # The SDK's `fixtures` feature must mean the same thing STANDALONE as it
       # does inside a workspace dev build: it forwards core's own `fixtures`

@@ -71,13 +71,26 @@ pub(super) async fn mesh_with_authority(
     tag: &str,
     owner: Option<&OrgKeypair>,
 ) -> (Mesh, Identity, std::path::PathBuf) {
+    mesh_with_authority_sensing(tag, owner, false).await
+}
+
+/// [`mesh_with_authority`] with the node's SENSING plane on, so a bound client
+/// mints a real acquisition and the call path's reconciliation actually runs.
+pub(super) async fn mesh_with_authority_sensing(
+    tag: &str,
+    owner: Option<&OrgKeypair>,
+    sensing: bool,
+) -> (Mesh, Identity, std::path::PathBuf) {
     let identity = Identity::generate();
-    let mesh = Mesh::builder("127.0.0.1:0", &[0x51u8; 32])
+    let builder = Mesh::builder("127.0.0.1:0", &[0x51u8; 32])
         .expect("builder")
-        .identity(identity.clone())
-        .build()
-        .await
-        .expect("mesh");
+        .identity(identity.clone());
+    let builder = if sensing {
+        builder.enable_sensing()
+    } else {
+        builder
+    };
+    let mesh = builder.build().await.expect("mesh");
     let dir = std::env::temp_dir().join(format!(
         "net-osdk-s0-{tag}-{}-{:?}",
         std::process::id(),
