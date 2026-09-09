@@ -1,0 +1,14 @@
+docs/internal/plans/CAPABILITY_SENSING_SDK_INTEGRATION_PLAN.md
+  h_64425bc75e3f3d 15-24,27,42-43,52-68,440-457,489-501,535-539,546-553,562-563,568-572
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "a84b32dcf275d7bf663ce6cd43d42ea42a8d2e08",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
