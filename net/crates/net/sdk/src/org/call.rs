@@ -199,9 +199,22 @@ impl OrgClient {
     /// This is the seam the C ABI's `net_org_call` reaches so a Go `Call(ctx,
     /// ..)` can carry a real deadline and cancel a call **in flight**, rather
     /// than only abandoning its own wait while an authorized side effect keeps
-    /// executing. Neither argument is an authorization input: they select no
-    /// provider, no grant, and no authority — the `plan()` decision is byte-for-
-    /// byte identical to `call_bytes`. `deadline_ms == 0` means the facade
+    /// executing. Neither argument is an AUTHORIZATION input: they select no
+    /// grant and no authority, and they can never widen what this caller may
+    /// invoke.
+    ///
+    /// `deadline_ms` is nonetheless a SELECTION input, and deliberately so:
+    /// `plan()` turns it into a [`ConsumerLatencyBudget`], which is what lets
+    /// the sensed order prefer a provider that can actually start in time. So
+    /// the same call issued with a tight deadline and with none can land on
+    /// DIFFERENT providers whenever a sensed-viable provider's route estimate
+    /// plus start estimate straddles the budget. That is the point of sensing,
+    /// not a leak — but it does mean a caller cannot predict the target from
+    /// the request alone, which matters when it has pre-reserved a cancel
+    /// token. Authorization, admission mode, grant matching and the
+    /// request-bound proof are all unchanged either way.
+    ///
+    /// `deadline_ms == 0` means the facade
     /// default; `cancel_token == 0` means uncancellable. Reserve the token with
     /// [`reserve_cancel_token`](Self::reserve_cancel_token) BEFORE calling.
     ///
