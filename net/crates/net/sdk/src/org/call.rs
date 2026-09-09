@@ -708,9 +708,12 @@ impl OrgClient {
                     // demand it could not replace, so a persistent refusal
                     // cannot turn every later call into another attempt.
                     Err(_refusal) => {
-                        acquisition
-                            .schedule()
-                            .record_refusal(*capability, expected, now);
+                        acquisition.schedule().record_refusal(
+                            *capability,
+                            expected,
+                            installed.as_ref(),
+                            now,
+                        );
                         acquisition.schedule().verify_holding(held);
                         return;
                     }

@@ -499,9 +499,11 @@ A sensed `org.call` performs exactly these seven steps, in this order:
    candidate list — three buckets concatenated, `O(C * S)` where `C` is the
    complete candidate count and is **NOT bounded by 32** (excess SameOrg survives
    as unsensed `Unknown`, and `Granted` candidates are in the list). At most
-   `S + 1` traversals of the complete list — step 2 traverses it once per sensed
-   `ranked` entry, step 3 once — and at most `2 * S` equality comparisons per
-   candidate. No comparator over `C`, no `sort_by`
+   `S + 1` traversals of the complete list — all of them inside THIS step's
+   bucket permutation: its rank-ordered pass traverses the list once per sensed
+   `ranked` entry, and its remainder pass traverses it once (design D7.2 steps
+   2-3 of the LOCAL algorithm, not steps 2-3 of this list) — and at most
+   `2 * S` equality comparisons per candidate. No comparator over `C`, no `sort_by`
    (design D7.2). **The bounded projection sorts inside
    `scheduler_bridge/readiness.rs:82`/`:84`/`:85`, each over `S <= 32` entries,
    already exist and remain permitted** (design D7.2a);
@@ -1547,8 +1549,10 @@ projection (readiness.rs:82/84/85) O(S log S)  three EXISTING bounded sorts,
 route estimate + budget classify  O(S)   OFF the lock
 linear stable bucket permutation  O(C*S) C = complete authorized candidates,
                                          NOT bounded by 32; <= S+1 traversals
-                                         of the complete list (step 2 once per
-                                         ranked entry, step 3 once), so
+                                         of the complete list, all inside this
+                                         permutation (its rank-ordered pass
+                                         once per ranked entry, its remainder
+                                         pass once), so
                                          <= 2*S compares per candidate; no
                                          comparison sort over C (design D7.2)
 proof construction                O(1)   unchanged
@@ -2511,8 +2515,9 @@ The plan is complete when all are true:
       over the **COMPLETE** authorized candidate list, whose count `C`
       is **NOT bounded by 32**; the 32 cap binds only the `S` sensed
       observation rows. Cost is `O(C * S)` over at most `S + 1`
-      traversals of the complete list (step 2 traverses it once per
-      sensed `ranked` entry, step 3 once), at most
+      traversals of the complete list, all inside that permutation (its
+      rank-ordered pass once per sensed `ranked` entry, its remainder
+      pass once), at most
       `2 * S` compares per candidate, with **no comparison sort over
       `C`** — while the three bounded projection sorts in
       `scheduler_bridge/readiness.rs:82`/`:84`/`:85` already exist and

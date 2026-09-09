@@ -2826,13 +2826,26 @@ mod tests {
     /// combinations across unrelated witnesses.
     #[test]
     fn a_scratch_dir_is_never_inherited_from_an_existing_directory() {
-        let base = std::env::temp_dir().join(format!(
-            "net-org-authority-claimtest-{}-{:x}",
-            std::process::id(),
-            scratch_salt()
-        ));
+        // The BASE is CLAIMED exclusively, with retry, exactly the way
+        // `Scratch::new` claims its own directory — and for the very hazard
+        // this test is about. `pid` plus process salt is not unique over time,
+        // and a `create_dir_all` base would ADOPT a retained base from an
+        // earlier run; that base already has a `fresh` child, so the positive
+        // `claim_scratch(fresh)` assertion below would fail on a CORRECT
+        // `claim_scratch`. Claiming the base makes both children provably
+        // never-seen. Fixture hygiene only: `claim_scratch`'s semantics are
+        // what is under test and are untouched.
+        let base = (0..64)
+            .find_map(|attempt| {
+                claim_scratch(&std::env::temp_dir().join(format!(
+                    "net-org-authority-claimtest-{}-{:x}-{attempt}",
+                    std::process::id(),
+                    scratch_salt()
+                )))
+            })
+            .expect("could not claim a unique scratch base after 64 attempts");
         let squatted = base.join("squatted");
-        std::fs::create_dir_all(&squatted).expect("pre-create the colliding dir");
+        std::fs::create_dir(&squatted).expect("pre-create the colliding dir");
         std::fs::write(squatted.join("owner-audience.key"), b"stale").expect("populate it");
         assert!(
             claim_scratch(&squatted).is_none(),

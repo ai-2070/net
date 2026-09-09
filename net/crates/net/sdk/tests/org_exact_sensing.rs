@@ -1291,7 +1291,25 @@ fn discover_synthetic_at(
     sequence: u64,
     expires_at: u64,
 ) {
-    let authority = consumer.node.node_authority().expect("authority");
+    ingest_synthetic_at(&consumer.node, owner, provider, sequence, expires_at);
+    consumer
+        .node
+        .test_pin_peer_entity(provider.entity_id().node_id(), provider.entity_id().clone());
+}
+
+/// The announcement half of [`discover_synthetic_at`], against a node handle.
+///
+/// A section hook outlives any borrow of a [`Member`], so a hook that moves
+/// discovery from INSIDE an attempt captures the node's `Arc` and announces
+/// through this.
+fn ingest_synthetic_at(
+    node: &Arc<MeshNode>,
+    owner: &OrgKeypair,
+    provider: &net::adapter::net::identity::EntityKeypair,
+    sequence: u64,
+    expires_at: u64,
+) {
+    let authority = node.node_authority().expect("authority");
     let cert = OrgMembershipCert::try_issue(owner, provider.entity_id().clone(), 1, 3600)
         .expect("membership");
     let descriptor = CapabilitySet::new().add_tag(TAG).to_bytes_compact();
@@ -1307,12 +1325,7 @@ fn discover_synthetic_at(
             &descriptor,
         )
         .expect("owner envelope");
-    consumer
-        .node
-        .ingest_scoped_announcement_for_test(&envelope.to_bytes());
-    consumer
-        .node
-        .test_pin_peer_entity(provider.entity_id().node_id(), provider.entity_id().clone());
+    node.ingest_scoped_announcement_for_test(&envelope.to_bytes());
 }
 
 /// [`discover_synthetic_at`] at the first sequence.
@@ -1336,9 +1349,13 @@ fn unix_now() -> u64 {
 /// query — the narrowing direction — must not be certified as agreement, and
 /// the next attempt must converge to what discovery now says.
 ///
-/// The disappearance is real: the synthetic provider's announcement expires,
-/// and the section hook holds the attempt open across that expiry, so core's
-/// population is genuinely narrower than the expectation the caller derived.
+/// The disappearance is real AND deterministically placed: the synthetic
+/// provider is announced with a long life, so the caller's capture cannot race
+/// its expiry, and it is RETIRED from inside the section hook — republished at
+/// a later sequence with a one-second life, then waited well past it. The
+/// caller's capture is complete before the hook fires and core's query happens
+/// after it returns, so the row is gone strictly between the two, by
+/// construction rather than by out-running a wall clock.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn within_attempt_narrowing_is_not_certified_as_agreement() {
     let cell = Cell::stand_up(
@@ -1350,9 +1367,10 @@ async fn within_attempt_narrowing_is_not_certified_as_agreement() {
         ],
     )
     .await;
-    // A third, synthetic provider whose discovery row expires in two seconds.
+    // A third, synthetic provider - announced to OUTLIVE this witness, so the
+    // only disappearance is the one the hook performs below.
     let ephemeral = net::adapter::net::identity::EntityKeypair::generate();
-    discover_synthetic(&cell.consumer, &org(), &ephemeral, unix_now() + 2);
+    discover_synthetic(&cell.consumer, &org(), &ephemeral, unix_now() + 3600);
     let ephemeral_id = ephemeral.entity_id().node_id();
     until(
         "the ephemeral provider was never discovered",
@@ -1361,15 +1379,23 @@ async fn within_attempt_narrowing_is_not_certified_as_agreement() {
     )
     .await;
 
-    // Hold the attempt open across the expiry: the caller's expectation
-    // already includes the ephemeral provider, and core's query will not.
+    // Retire it from INSIDE the attempt: the caller's expectation already
+    // includes the ephemeral provider, and core's query will not see it.
     let fired = Arc::new(AtomicUsize::new(0));
     let hook = SectionHook::install(&cell.client, {
         let fired = fired.clone();
+        let consumer_node = Arc::clone(&cell.consumer.node);
+        let owner = org();
+        let ephemeral_key = ephemeral.clone();
         Arc::new(move || {
-            if fired.fetch_add(1, Ordering::SeqCst) == 0 {
-                std::thread::sleep(Duration::from_millis(2500));
+            if fired.fetch_add(1, Ordering::SeqCst) > 0 {
+                return;
             }
+            // Replaced at a later sequence with a one-second life, then slept
+            // well past it - the whole-second granularity of an
+            // announcement's expiry is why the wait is not tight.
+            ingest_synthetic_at(&consumer_node, &owner, &ephemeral_key, 2, unix_now() + 1);
+            std::thread::sleep(Duration::from_millis(2500));
         })
     });
     let _armed = cell.try_call().await;
@@ -1378,6 +1404,19 @@ async fn within_attempt_narrowing_is_not_certified_as_agreement() {
         fired.load(Ordering::SeqCst),
         1,
         "the section hook must have held one attempt open"
+    );
+
+    // The expectation that attempt ACTUALLY derived, read from the call path
+    // rather than sampled beside it: it contains the provider core then failed
+    // to publish, which is the whole shape this witness exists for.
+    let first_expectation = cell
+        .client
+        .sensing_last_expectation()
+        .expect("an active binding");
+    assert!(
+        first_expectation.contains(&ephemeral_id),
+        "precondition: the first attempt captured the ephemeral provider: \
+         {first_expectation:?}"
     );
 
     let (population_now, _, _) = demand_state(&cell.client).expect("demand");
@@ -2414,16 +2453,65 @@ async fn a_consumer_without_sensing_plans_the_deterministic_order() {
 // W-55 — the SDK adapter adds no ordering structure
 // ---------------------------------------------------------------------------
 
-/// The ordering RULE lives once, in core, over plain data. The SDK's share is a
+/// The ordering RULE lives once, in core. The SDK's share is a
 /// projection of candidates onto that rule's two slices — so this guard reads
 /// the adapter's exact body and requires that it introduces no comparison sort
 /// and no ordering structure of its own. A second implementation is what would
 /// diverge; this is how the file stays unable to grow one.
 ///
-/// The span is walked by braces from the signature, skipping string and
-/// comment spans, and an unbalanced walk FAILS rather than passing.
+/// The span is walked by braces from the signature over LEXICALLY FILTERED
+/// source — comments and string literals blanked, so the scan sees code only
+/// and a `// HashMap::` note or a diagnostic message that names a forbidden
+/// construct is not a failure — and an unbalanced walk FAILS rather than
+/// passing. Filtering narrows what counts as an occurrence; it does not soften
+/// the contract: a comparison sort in the body still fails here even when it
+/// happens to produce the same order, and a renamed or deleted adapter fails
+/// too, because the span cannot be found.
+///
+/// The filtering is not taken on trust: the same scan is executed against
+/// synthetic sources here — one whose only forbidden tokens sit in a comment
+/// and a string literal (which must pass), one that really sorts (which must
+/// fail), and one whose adapter is renamed away (which must fail).
 #[test]
 fn the_sdk_sensed_adapter_adds_no_ordering_structure() {
+    let source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/org/call.rs"),
+    )
+    .expect("read the SDK call path");
+    scan_for_ordering_structure(&source).expect("the shipped SDK adapter");
+
+    // The filter narrows what counts as an occurrence...
+    let mentioned = synthetic_adapter(
+        "let _reason = \"a BinaryHeap or HashMap:: would be a second rule\";\n    \
+         // ...and neither is .sort_by_key( nor BTreeMap:: in this note",
+    );
+    scan_for_ordering_structure(&mentioned)
+        .expect("a forbidden construct NAMED in a comment or a string is not one");
+
+    // ...and narrows nothing else: written as code, it still fails, even
+    // though this body's output is identical to the unsorted one.
+    let sorted = synthetic_adapter("providers.sort_unstable();");
+    let complaint = scan_for_ordering_structure(&sorted)
+        .expect_err("a comparison sort in the body must fail this guard");
+    assert!(
+        complaint.contains(".sort_unstable("),
+        "and it must name the construct it found: {complaint}"
+    );
+
+    // A renamed or deleted adapter fails loudly rather than passing vacuously.
+    let renamed =
+        synthetic_adapter("").replace("org_sensed_candidate_permutation", "sensed_permutation");
+    scan_for_ordering_structure(&renamed)
+        .expect_err("a renamed adapter must fail this guard, not disappear from it");
+}
+
+/// Require that the adapter in `source` adds no ordering structure of its own.
+///
+/// `Err` on every way this can go wrong: an absent or unbalanced adapter, a
+/// vacuous body, a body that restates the rule instead of applying it, and a
+/// forbidden construct in CODE. Taking `&str` is what lets the controls above
+/// execute the real scan without mutating the shipped file.
+fn scan_for_ordering_structure(source: &str) -> Result<(), String> {
     const FORBIDDEN: &[&str] = &[
         ".sort(",
         ".sort_by(",
@@ -2439,81 +2527,222 @@ fn the_sdk_sensed_adapter_adds_no_ordering_structure() {
         "HashMap::",
         "HashSet::",
     ];
-    let source = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/org/call.rs"),
-    )
-    .expect("read the SDK call path");
-    let body = brace_body(&source, "fn org_sensed_candidate_permutation(")
-        .expect("the adapter exists and its body balances");
-    assert!(
-        body.contains("org_sensed_bucket_permutation("),
-        "the adapter must APPLY the core rule rather than restate it"
-    );
-    assert!(
-        body.lines().filter(|l| !l.trim().is_empty()).count() > 3,
-        "anti-vacuity: deleting the adapter's body must fail this guard, not satisfy it"
-    );
-    for needle in FORBIDDEN {
-        assert!(
-            !body.contains(needle),
-            "the SDK adapter must add no ordering structure, found `{needle}` in:\n{body}"
-        );
+    let body = brace_body(source, "fn org_sensed_candidate_permutation(")
+        .ok_or_else(|| "the adapter is absent, or its body does not balance".to_string())?;
+    if !body.contains("org_sensed_bucket_permutation(") {
+        return Err(format!(
+            "the adapter must APPLY the core rule rather than restate it:\n{body}"
+        ));
     }
+    if body.lines().filter(|l| !l.trim().is_empty()).count() <= 3 {
+        return Err(format!(
+            "anti-vacuity: deleting the adapter's body must fail this guard, \
+             not satisfy it:\n{body}"
+        ));
+    }
+    for needle in FORBIDDEN {
+        if body.contains(needle) {
+            return Err(format!(
+                "the SDK adapter must add no ordering structure, found `{needle}` in:\n{body}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The shipped adapter's shape with `extra` spliced into its body — the
+/// controls' source, so the guard's discrimination is executed rather than
+/// argued.
+fn synthetic_adapter(extra: &str) -> String {
+    const SHAPE: &str = r#"
+pub(crate) fn org_sensed_candidate_permutation(
+    cands: &[AuthorizedOrgCandidate],
+    ranked: &[u64],
+    pruned: &[u64],
+) -> Vec<usize> {
+    let mut providers: Vec<u64> = Vec::with_capacity(cands.len());
+    let mut same_org: Vec<bool> = Vec::with_capacity(cands.len());
+    for candidate in cands {
+        providers.push(candidate.provider.node_id());
+        same_org.push(matches!(candidate.mode, Mode::SameOrg));
+    }
+    EXTRA
+    org_sensed_bucket_permutation(&same_org, &providers, ranked, pruned)
+}
+"#;
+    SHAPE.replace("EXTRA", extra)
 }
 
 /// The body of the function whose signature starts with `signature`, from the
-/// first `{` at or after it to the matching `}`, ignoring braces inside string
-/// literals and comments. `None` when the function is absent or the walk fails
-/// to balance — both are guard failures, never silent passes.
+/// first `{` at or after it to the matching `}`, over [`code_only`] source.
+/// `None` when the function is absent or the walk fails to balance — both are
+/// guard failures, never silent passes.
 fn brace_body(source: &str, signature: &str) -> Option<String> {
-    let start = source.find(signature)?;
-    let bytes = source.as_bytes();
-    let open = start + source[start..].find('{')?;
+    let code = code_only(source);
+    let start = code.find(signature)?;
+    let open = start + code[start..].find('{')?;
+    let bytes = code.as_bytes();
     let mut depth = 0usize;
-    let mut index = open;
-    let mut in_string = false;
-    let mut in_line_comment = false;
-    let mut in_block_comment = false;
+    for index in open..bytes.len() {
+        match bytes[index] {
+            b'{' => depth += 1,
+            b'}' => {
+                // The walk starts ON the opening brace, so depth is at least
+                // one here and this cannot underflow.
+                depth -= 1;
+                if depth == 0 {
+                    return Some(code[open + 1..index].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `source` with every comment and every string, byte-string, raw-string and
+/// character literal blanked to spaces — newlines kept, so byte offsets, line
+/// numbers and indentation are all preserved.
+///
+/// This is what makes the guard above scan CODE. A forbidden construct NAMED
+/// in prose or in an error message is not an ordering structure; a forbidden
+/// construct written as code is, wherever it appears. Block comments nest, as
+/// they do in Rust, and a `'` that is not a character literal is a lifetime
+/// and stays code.
+fn code_only(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0usize;
+    // Blank `bytes[index..end]`, keeping newlines, and advance past it.
+    let blank = |out: &mut Vec<u8>, index: &mut usize, end: usize| {
+        for byte in &bytes[*index..end.min(bytes.len())] {
+            out.push(if *byte == b'\n' { b'\n' } else { b' ' });
+        }
+        *index = end.min(bytes.len());
+    };
     while index < bytes.len() {
         let byte = bytes[index];
         let next = bytes.get(index + 1).copied();
-        if in_line_comment {
-            if byte == b'\n' {
-                in_line_comment = false;
+        match (byte, next) {
+            (b'/', Some(b'/')) => {
+                let end = source[index..]
+                    .find('\n')
+                    .map_or(bytes.len(), |offset| index + offset);
+                blank(&mut out, &mut index, end);
             }
-        } else if in_block_comment {
-            if byte == b'*' && next == Some(b'/') {
-                in_block_comment = false;
-                index += 1;
-            }
-        } else if in_string {
-            if byte == b'\\' {
-                index += 1;
-            } else if byte == b'"' {
-                in_string = false;
-            }
-        } else {
-            match (byte, next) {
-                (b'/', Some(b'/')) => {
-                    in_line_comment = true;
-                    index += 1;
-                }
-                (b'/', Some(b'*')) => {
-                    in_block_comment = true;
-                    index += 1;
-                }
-                (b'"', _) => in_string = true,
-                (b'{', _) => depth += 1,
-                (b'}', _) => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(source[open + 1..index].to_string());
+            (b'/', Some(b'*')) => {
+                let mut depth = 0usize;
+                let mut scan = index;
+                while scan < bytes.len() {
+                    match (bytes[scan], bytes.get(scan + 1).copied()) {
+                        (b'/', Some(b'*')) => {
+                            depth += 1;
+                            scan += 2;
+                        }
+                        (b'*', Some(b'/')) => {
+                            depth -= 1;
+                            scan += 2;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => scan += 1,
                     }
                 }
-                _ => {}
+                blank(&mut out, &mut index, scan);
+            }
+            _ => {
+                if let Some(end) = raw_string_end(bytes, index) {
+                    blank(&mut out, &mut index, end);
+                } else if byte == b'"' {
+                    let mut scan = index + 1;
+                    while scan < bytes.len() {
+                        match bytes[scan] {
+                            b'\\' => scan += 2,
+                            b'"' => {
+                                scan += 1;
+                                break;
+                            }
+                            _ => scan += 1,
+                        }
+                    }
+                    blank(&mut out, &mut index, scan);
+                } else if let Some(end) = char_literal_end(bytes, index) {
+                    blank(&mut out, &mut index, end);
+                } else {
+                    out.push(byte);
+                    index += 1;
+                }
             }
         }
-        index += 1;
     }
-    None
+    String::from_utf8(out).expect("blanking whole literals keeps char boundaries")
+}
+
+/// The end offset of the raw or byte string literal starting at `index`, if one
+/// starts there: `r"..."`, `r#"..."#`, `br##"..."##`, and so on.
+fn raw_string_end(bytes: &[u8], index: usize) -> Option<usize> {
+    let prior = index.checked_sub(1).map(|before| bytes[before]);
+    if prior.is_some_and(|byte| byte.is_ascii_alphanumeric() || byte == b'_') {
+        // Part of an identifier, not a literal prefix.
+        return None;
+    }
+    let mut scan = index;
+    if bytes.get(scan) == Some(&b'b') {
+        scan += 1;
+    }
+    if bytes.get(scan) != Some(&b'r') {
+        return None;
+    }
+    scan += 1;
+    let hashes = bytes[scan..]
+        .iter()
+        .take_while(|byte| **byte == b'#')
+        .count();
+    scan += hashes;
+    if bytes.get(scan) != Some(&b'"') {
+        return None;
+    }
+    scan += 1;
+    while scan < bytes.len() {
+        if bytes[scan] == b'"'
+            && bytes[scan + 1..]
+                .iter()
+                .take(hashes)
+                .filter(|byte| **byte == b'#')
+                .count()
+                == hashes
+        {
+            return Some(scan + 1 + hashes);
+        }
+        scan += 1;
+    }
+    Some(bytes.len())
+}
+
+/// The end offset of the character or byte-character literal starting at
+/// `index`, if one starts there. A `'` that opens no literal is a LIFETIME and
+/// must stay code, so this recognizes only the closed forms.
+fn char_literal_end(bytes: &[u8], index: usize) -> Option<usize> {
+    let mut scan = index;
+    if bytes.get(scan) == Some(&b'b') && bytes.get(scan + 1) == Some(&b'\'') {
+        scan += 1;
+    }
+    if bytes.get(scan) != Some(&b'\'') {
+        return None;
+    }
+    scan += 1;
+    if bytes.get(scan) == Some(&b'\\') {
+        // An escape: everything up to the closing quote belongs to it.
+        scan += 1;
+        while scan < bytes.len() && bytes[scan] != b'\'' {
+            scan += 1;
+        }
+        return (bytes.get(scan) == Some(&b'\'')).then_some(scan + 1);
+    }
+    // One character - which may be multi-byte - then the closing quote.
+    let rest = std::str::from_utf8(&bytes[scan..]).ok()?;
+    let one = rest.chars().next()?;
+    let close = scan + one.len_utf8();
+    (bytes.get(close) == Some(&b'\'')).then_some(close + 1)
 }

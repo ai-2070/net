@@ -465,24 +465,60 @@ async fn a_floored_peer_with_sensing_off_drops_the_org_frame_and_stays_unknown()
     // same instant, differing only in running the sensing plane. It cannot
     // substitute for D's own event above; it shows the identical leg is one a
     // sensing-enabled peer installs.
+    //
+    // BOUNDED, FIXTURE-OWNED RE-DRIVE. One acquisition puts exactly one
+    // best-effort UDP datagram on the wire, nothing acknowledges it, and this
+    // slice has no ttl/2 refresh owner for the E leg - so a single lost
+    // datagram leaves E empty forever and a correct product times out. The
+    // fixture therefore re-drives the SHIPPED verb, exactly like the soft-state
+    // refresher above does for the relay leg: release the sole holder (which
+    // retires the row, so the next acquisition is a fresh `Register` that
+    // authors and emits again) and re-acquire, for a bounded number of attempts
+    // inside a hard deadline. Every ticket it acquires is owned here and
+    // released at the end of the test. A re-drive only ever happens after a
+    // full poll window has elapsed with nothing installed, so it is never
+    // inside the 100 ms upstream registration damper that would otherwise
+    // swallow the re-authored `Register`. NOTHING is added to production: no
+    // ACK, no retry protocol, no reliability - the wire stays best-effort and
+    // the assertion below is unchanged.
+    const E_ATTEMPTS: usize = 6;
+    const E_DEADLINE: Duration = Duration::from_secs(20);
+    let e_deadline = std::time::Instant::now() + E_DEADLINE;
     let e_spec = org_spec(e_id, commitment);
     let e_key = ProviderInterestKey::new(e_spec.key(), e_id);
-    let e_ticket = a
+    let mut e_ticket = a
         .acquire_sensing_interest_lease(&e_spec, e_id, D)
         .expect("the same lease path toward the sensing-enabled peer");
-    {
-        let e = e.clone();
-        let e_key = e_key.clone();
-        await_condition(
-            Duration::from_secs(5),
-            "the identical leg reaches a peer that RUNS the sensing plane",
-            move || {
-                e.sensing_downstream_entry(&e_key, DownstreamId::Peer(a_id))
-                    .is_some()
-            },
-        )
-        .await;
+    let mut e_attempts = 1usize;
+    let mut e_installed = false;
+    loop {
+        let (e2, k2) = (e.clone(), e_key.clone());
+        if poll_until(REFRESH * 5, move || {
+            e2.sensing_downstream_entry(&k2, DownstreamId::Peer(a_id))
+                .is_some()
+        })
+        .await
+        {
+            e_installed = true;
+            break;
+        }
+        if e_attempts >= E_ATTEMPTS || std::time::Instant::now() >= e_deadline {
+            break;
+        }
+        let _ = a.try_release_sensing_interest_lease(e_ticket);
+        e_ticket = a
+            .acquire_sensing_interest_lease(&e_spec, e_id, D)
+            .expect("the re-driven lease path toward the sensing-enabled peer");
+        e_attempts += 1;
     }
+    assert!(
+        e_installed,
+        "the identical leg never reached a peer that RUNS the sensing plane, \
+         after {e_attempts} bounded re-drives of the production lease path \
+         within the {E_DEADLINE:?} deadline. This is the POSITIVE control: if a \
+         sensing-enabled peer installs nothing from the same authored \
+         registration, the leg D dropped was never a well-formed one"
+    );
     let e_row = e
         .sensing_downstream_entry(&e_key, DownstreamId::Peer(a_id))
         .expect("E's row for A");

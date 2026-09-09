@@ -193,6 +193,11 @@ pub struct OrgSensedRow {
     /// removed, unretained and expired evidence alike.
     pub readiness: sensing::ProjectedReadiness,
     /// The provider-signed start estimate that backed the projection, if any.
+    ///
+    /// `None` whenever `readiness` is `Unknown`: an expired cell keeps its last
+    /// observation until the mutating sweep clears it, and reporting that start
+    /// alongside evidence that no longer vouches would hand a caller stale
+    /// metadata dressed as current.
     pub estimated_start: Option<Duration>,
 }
 
@@ -737,7 +742,10 @@ impl OrgSensingFamily {
             }
             return self.converge_under(&capability, tag, &snapshot, population);
         }
-        node.org_sensing_demand_counters().note_no_authority();
+        // The attempts are exhausted, not the authority: every pass captured a
+        // live view and then watched it move. Counted as its own class so a
+        // contended qualification is not read as a missing membership.
+        node.org_sensing_demand_counters().note_view_moved();
         Err(OrgSensingDemandRefused::NoAuthority)
     }
 
@@ -936,7 +944,13 @@ impl OrgSensingFamily {
         let acquired = match node.acquire_sensing_interest_lease_owned(&spec, provider, interval) {
             Ok(acquired) => acquired,
             Err(error) => {
-                node.org_sensing_demand_counters().note_no_authority();
+                // Counted by the refusal's OWN class. A full lease table, an
+                // interest at its holder bound and a cadence below a provider's
+                // cached floor are not "this node has no organization
+                // authority", and an operator reading that counter cannot act
+                // on a label that covers every failure alike.
+                node.org_sensing_demand_counters()
+                    .note_acquisition_refused(&error);
                 tracing::debug!(
                     provider = format!("{:#x}", provider),
                     %error,
@@ -1547,8 +1561,15 @@ mod tests {
         let state = node.org_sensing_demand_state_for_test();
         assert_eq!(state.retained, 1, "{state:?}");
         assert_eq!(
-            state.refused_no_authority, 2,
-            "both refusals must be counted: {state:?}"
+            state.refused_identity_exhausted, 2,
+            "both refusals must be counted, under the class they actually had: \
+             {state:?}"
+        );
+        assert_eq!(
+            state.refused_no_authority, 0,
+            "an exhausted identity space is not a missing organization \
+             authority - that mislabel is the defect this counter split \
+             removed: {state:?}"
         );
         drop(demand);
         drop(family);
@@ -2370,6 +2391,66 @@ mod tests {
             invalidated_before + 1,
             "precondition: current authority refused the restoration, so the whole \
              installation is invalidated"
+        );
+    }
+
+    /// An INVALIDATED installation leaves no armed refresh record behind.
+    ///
+    /// The registry entry and the refresh schedule are separate state. The
+    /// invalidation drops every holder of the key at once, so the armed record
+    /// names a row that no longer exists - it is not a cadence any more, only
+    /// occupancy in the schedule and in the armed count the capacity check
+    /// reads, until its old deadline came round for a renewal that could only
+    /// answer `Absent`. It is reclaimed at the transition that killed it.
+    ///
+    /// Identity, not truncation: the reclamation feeds the armed record's own
+    /// installation id through the same rule a retirement uses, so a successor
+    /// that established in the window keeps its cadence - which the
+    /// re-convergence below then observes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_invalidated_installation_leaves_no_armed_refresh() {
+        let node = emitter_demand_node(
+            "invalidated-arm",
+            Duration::from_secs(30),
+            Duration::from_secs(1),
+        )
+        .await;
+        let family = OrgSensingFamily::mint(&node).expect("mint");
+        let provider = node.node_id();
+        let key = lease_key_for(&node, provider);
+
+        let _demand = family.reconcile(TAG, &[provider]).expect("retain");
+        assert!(
+            node.sensing_refresh_arm_for_test(&key).is_some(),
+            "precondition: the retention armed a refresh for this key"
+        );
+        let armed_before = node.org_sensing_demand_state_for_test().armed;
+        assert!(armed_before >= 1, "precondition: {armed_before}");
+
+        invalidate_installation(&node, provider);
+        assert_eq!(
+            node.sensing_refresh_installation(&key),
+            None,
+            "precondition: the installation is gone"
+        );
+        assert_eq!(
+            node.sensing_refresh_arm_for_test(&key),
+            None,
+            "the dead installation's refresh record must be reclaimed at the \
+             invalidating transition, not left occupying the schedule until its \
+             old deadline"
+        );
+        assert_eq!(
+            node.org_sensing_demand_state_for_test().armed,
+            armed_before - 1,
+            "and the armed count the capacity check reads must drop with it"
+        );
+
+        // A successor arms its OWN record, which the reclamation cannot touch.
+        let _again = family.reconcile(TAG, &[provider]).expect("re-converge");
+        assert!(
+            node.sensing_refresh_arm_for_test(&key).is_some(),
+            "the re-convergence arms the fresh installation"
         );
     }
 

@@ -6976,7 +6976,26 @@ pub(crate) struct OrgSensingDemandCounters {
     refused_at_capacity: AtomicU64,
     /// Retentions refused because this node could not derive live organization
     /// authority for the audience.
+    ///
+    /// This is the AUTHORITY class only. An acquisition can also be refused
+    /// for want of room or against a provider's cadence floor, and folding
+    /// those in here told an operator "no authority" about a node whose
+    /// authority was live and whose lease table was simply full.
     refused_no_authority: AtomicU64,
+    /// Retentions refused because the lease holder-IDENTITY space is
+    /// exhausted. Terminal and node-wide, unlike an ordinary bound that frees
+    /// when a holder releases - so it gets its own tally rather than hiding
+    /// inside capacity or, worse, inside "no authority".
+    refused_identity_exhausted: AtomicU64,
+    /// Retentions refused for a reason that is neither a bound nor missing
+    /// authority - an out-of-bounds interval, a scope refusal, a disabled
+    /// plane. Kept as its own bucket rather than borrowing another class's
+    /// meaning.
+    refused_other: AtomicU64,
+    /// Qualifications abandoned because the authority view moved under every
+    /// attempt. The authority may well be live: what failed is deriving a
+    /// population and a stamp that went together.
+    refused_view_moved: AtomicU64,
     /// Authorized populations truncated at the sensing cap.
     truncated: AtomicU64,
     /// Refreshes that renewed a live installation on its own plane.
@@ -7011,8 +7030,15 @@ pub(crate) struct OrgSensingDemandCounters {
     /// Refused releases that could NOT be retained (the retention set is at
     /// its bound, or the node is already terminal). Counted, never silent.
     refused_release_unowned: AtomicU64,
-    /// STALE retained releases reclaimed: their installation is gone, so there
-    /// is no live holder left to own and the slot is returned to the bound.
+    /// Refused releases DISCHARGED instead of retained, because the ownership
+    /// they carry no longer exists.
+    ///
+    /// Wider than "a stale entry already in the ledger was dropped": a release
+    /// whose holder died before it was ever admitted is discharged on the way
+    /// in and counted here, and so is an extracted retry whose installation
+    /// vanished before reinsertion. What it always means is that this node no
+    /// longer owns anything through that ticket - never that a live holder was
+    /// abandoned.
     refused_release_reclaimed: AtomicU64,
     /// Retained releases admitted ABOVE the derived ceiling. Should be
     /// unreachable while every entry is live; admitted anyway, because losing a
@@ -7050,6 +7076,34 @@ impl OrgSensingDemandCounters {
     pub(crate) fn note_no_authority(&self) {
         self.refused_no_authority.fetch_add(1, Ordering::Relaxed);
     }
+
+    /// A bounded qualification gave up because the authority view kept moving.
+    pub(crate) fn note_view_moved(&self) {
+        self.refused_view_moved.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One provider acquisition was refused. The counter it lands on is the
+    /// error's OWN class: a bound is capacity, a missing/unusable organization
+    /// membership is authority, and anything else is its own bucket.
+    pub(crate) fn note_acquisition_refused(&self, error: &SensingRegistrationError) {
+        match error {
+            SensingRegistrationError::LeaseAtCapacity(sensing::LeaseRefused::IdentityExhausted) => {
+                self.refused_identity_exhausted
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            SensingRegistrationError::AtCapacity
+            | SensingRegistrationError::OverCapacity
+            | SensingRegistrationError::LeaseAtCapacity(_)
+            | SensingRegistrationError::RefusedByFloor { .. } => self.note_at_capacity(),
+            SensingRegistrationError::OrgAudienceUnsupported => self.note_no_authority(),
+            SensingRegistrationError::Disabled
+            | SensingRegistrationError::Scope(_)
+            | SensingRegistrationError::Interval { .. }
+            | SensingRegistrationError::ZeroTtl => {
+                self.refused_other.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
 }
 
 /// The observable organization sensing demand/refresh state.
@@ -7065,6 +7119,12 @@ pub struct OrgSensingDemandState {
     pub refused_at_capacity: u64,
     /// Retentions refused for want of live organization authority.
     pub refused_no_authority: u64,
+    /// Retentions refused because the lease identity space is exhausted.
+    pub refused_identity_exhausted: u64,
+    /// Retentions refused for a reason that is neither a bound nor authority.
+    pub refused_other: u64,
+    /// Qualifications abandoned because the authority view kept moving.
+    pub refused_view_moved: u64,
     /// Authorized populations truncated at the sensing cap.
     pub truncated: u64,
     /// Refreshes that renewed a live installation.
@@ -7089,7 +7149,8 @@ pub struct OrgSensingDemandState {
     pub refused_release_recovered: u64,
     /// Refused releases that could not be retained at all.
     pub refused_release_unowned: u64,
-    /// Stale retained releases reclaimed because their installation is gone.
+    /// Refused releases discharged because the ownership they carried is gone -
+    /// including ones never admitted to the ledger at all.
     pub refused_release_reclaimed: u64,
     /// Retained releases admitted above the derived ceiling.
     pub refused_release_overflow: u64,
@@ -14230,10 +14291,17 @@ impl MeshNode {
                 // needs no off-lock liveness query, and cannot reject a live
                 // ticket against a stale observation of "full".
                 let discharged = self.discharge_refused_releases_for_key(&key);
+                // ...and the armed REFRESH record the dead installation left
+                // behind. It named a row that no longer exists, so it is not a
+                // cadence any more - only occupancy in the schedule and in the
+                // armed count the capacity check reads, until its old deadline
+                // came round for a renewal that could only answer `Absent`.
+                let disarmed = self.settle_invalidated_sensing_refresh(&key);
                 tracing::warn!(
                     error = %err,
                     dropped_holders = dropped,
                     discharged_pending = discharged,
+                    disarmed_refresh = disarmed,
                     "sensing lease: current organization authority refused to restore the \
                      surviving holders' cadence after a refused tightening partitioned the \
                      row; the lease installation is INVALIDATED rather than left claiming a \
@@ -14851,6 +14919,37 @@ impl MeshNode {
         }
     }
 
+    /// Settle `key`'s schedule after its whole INSTALLATION was invalidated.
+    ///
+    /// Invalidation drops the registry entry, so every holder of that key is
+    /// dead at once — but the armed refresh record is separate state and used
+    /// to survive until its old deadline, occupying the schedule (and the
+    /// armed count the capacity check reads) for a row that no longer exists.
+    /// The worker would eventually dequeue it, find `Absent`, and stop; this
+    /// reclaims it at the transition that killed it instead.
+    ///
+    /// Identity, not truncation: the armed record's OWN installation id is fed
+    /// back through [`Self::settle_sensing_refresh`], so a successor that
+    /// established in the window keeps its cadence — exactly the rule a
+    /// retirement already uses, applied to the one transition that has no
+    /// releasing holder to name.
+    ///
+    /// Returns whether a record was reclaimed.
+    pub(crate) fn settle_invalidated_sensing_refresh(
+        &self,
+        key: &sensing::SensingLeaseKey,
+    ) -> bool {
+        let armed = {
+            let schedule = self.sensing_refresh.lock();
+            schedule.armed.get(key).map(|armed| armed.installation_id)
+        };
+        let Some(armed) = armed else {
+            return false;
+        };
+        self.settle_sensing_refresh(key, armed);
+        !self.sensing_refresh.lock().armed.contains_key(key)
+    }
+
     /// RETAIN a refused retirement release, so the still-live holder it owns
     /// keeps an owner.
     ///
@@ -15410,11 +15509,16 @@ impl MeshNode {
     /// starves every other task on the runtime (an unrelated 20 ms timer never
     /// fires), which is a real liveness defect rather than a slow test.
     ///
-    /// A horizon below `2 * MIN_SENSING_REFRESH_PERIOD` therefore CANNOT be
-    /// renewed ahead of its own expiry, and the floor says so honestly instead
-    /// of pretending to meet an unmeetable deadline: rows on such a node
-    /// expire and are re-registered on the next tick. The retained-demand
-    /// cadence itself is still clamped to the ttl by the acquisition path.
+    /// The floor engages below `2 * MIN_SENSING_REFRESH_PERIOD`, but engaging
+    /// is not the same as giving up: at `ttl = 1.5 ms` the floored period is
+    /// still 1 ms, which is shorter than the horizon, so the nominal renewal
+    /// still precedes expiry. It stops preceding expiry only at
+    /// `ttl <= MIN_SENSING_REFRESH_PERIOD`, where the period equals or exceeds
+    /// the horizon; the floor says so honestly instead of pretending to meet an
+    /// unmeetable deadline, and rows on such a node expire and are
+    /// re-registered on the next tick. This is the computed schedule, not a
+    /// promise that an executor meets any deadline. The retained-demand cadence
+    /// itself is still clamped to the ttl by the acquisition path.
     pub(crate) fn sensing_refresh_period(&self) -> Duration {
         (self.config.sensing_interest_ttl / 2).max(MIN_SENSING_REFRESH_PERIOD)
     }
@@ -15514,6 +15618,9 @@ impl MeshNode {
             released: counters.released.load(Ordering::Relaxed),
             refused_at_capacity: counters.refused_at_capacity.load(Ordering::Relaxed),
             refused_no_authority: counters.refused_no_authority.load(Ordering::Relaxed),
+            refused_identity_exhausted: counters.refused_identity_exhausted.load(Ordering::Relaxed),
+            refused_other: counters.refused_other.load(Ordering::Relaxed),
+            refused_view_moved: counters.refused_view_moved.load(Ordering::Relaxed),
             truncated: counters.truncated.load(Ordering::Relaxed),
             refresh_renewed: counters.refresh_renewed.load(Ordering::Relaxed),
             refresh_absent: counters.refresh_absent.load(Ordering::Relaxed),
@@ -16373,11 +16480,14 @@ impl MeshNode {
             .iter()
             .filter(|(key, _)| &key.interest == interest)
             .map(|(key, cell)| {
-                (
-                    key.provider,
-                    cell.projected(),
-                    cell.observation().and_then(|obs| obs.estimated_start),
-                )
+                // Same rule as the organization traversal: an estimate is
+                // reported only while the projection it backs still vouches.
+                let projected = cell.projected();
+                let estimate = match projected {
+                    sensing::ProjectedReadiness::Unknown => None,
+                    _ => cell.observation().and_then(|obs| obs.estimated_start),
+                };
+                (key.provider, projected, estimate)
             })
             .collect()
     }
@@ -16421,11 +16531,20 @@ impl MeshNode {
                 .and_then(|branch| observations.consumer_cells.get(branch));
             rows.push(match cell {
                 None => (provider, sensing::ProjectedReadiness::Unknown, None),
-                Some(cell) => (
-                    provider,
-                    cell.projected_at(now),
-                    cell.observation().and_then(|obs| obs.estimated_start),
-                ),
+                Some(cell) => {
+                    // The estimate BACKS the projection, so it is only
+                    // reported while the projection still vouches. A cell whose
+                    // deadline has passed reads `Unknown` at `now` but keeps
+                    // its last observation until the mutating sweep clears it,
+                    // and pairing that expired start estimate with `Unknown`
+                    // published stale metadata as if it were current evidence.
+                    let projected = cell.projected_at(now);
+                    let estimate = match projected {
+                        sensing::ProjectedReadiness::Unknown => None,
+                        _ => cell.observation().and_then(|obs| obs.estimated_start),
+                    };
+                    (provider, projected, estimate)
+                }
             });
             // Fixtures seam, fired ONCE after the first row and while the guard
             // is still held: every remaining row is read after this point, so a
@@ -21949,13 +22068,18 @@ impl MeshNode {
         self.routing_registry.exhaust_family_ids_for_test();
     }
 
-    /// How many family mints this node's registry refused for an exhausted
-    /// identity space. Test/fixtures only: the counter is how a witness sees
-    /// that a call path did not re-mint.
+    /// How many IDENTITY-SPACE reservations this node's registry refused —
+    /// family mints and slot-incarnation reservations alike, because both draw
+    /// on one `next_id` and increment one counter.
+    ///
+    /// Test/fixtures only, and meaningful as a DELTA across a call path that
+    /// reserves no slots: that is what makes "this path did not re-mint" a
+    /// sound reading. An absolute value is not a family-mint count, and a
+    /// different live family taking a new slot after exhaustion moves it too.
     #[cfg(any(test, feature = "fixtures"))]
     #[doc(hidden)]
     pub fn org_routing_family_refusals_for_test(&self) -> u64 {
-        self.routing_registry.family_id_refusals_for_test()
+        self.routing_registry.identity_space_refusals_for_test()
     }
 
     /// A COHERENT sample of the routing authority epoch and the revocation view
@@ -25168,9 +25292,21 @@ impl MeshNode {
                 // drop is already decided, so the dark path production
                 // compiles is unchanged - no decode, no counters, no reply.
                 #[cfg(any(test, feature = "fixtures"))]
-                if let Some(observe) = ctx.sensing_dark_drop_observer.lock().clone() {
-                    for payload in EventFrame::read_events(decrypted, parsed.header.event_count) {
-                        observe(from_node, &payload);
+                {
+                    // Snapshot OFF the slot lock before calling out. An
+                    // `if let` on `slot.lock().clone()` keeps the guard alive
+                    // for the whole body, so an observer that installs or
+                    // replaces an observer - the setter takes the same
+                    // non-reentrant mutex - would deadlock itself, and a
+                    // concurrent setter would block for the callback's whole
+                    // run. The off-lock observer beside this one already reads
+                    // its slot this way.
+                    let observer = ctx.sensing_dark_drop_observer.lock().clone();
+                    if let Some(observe) = observer {
+                        for payload in EventFrame::read_events(decrypted, parsed.header.event_count)
+                        {
+                            observe(from_node, &payload);
+                        }
                     }
                 }
                 return;

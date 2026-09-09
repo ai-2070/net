@@ -1009,9 +1009,24 @@ fn unsensed() -> super::call::SensedSelection<'static> {
 }
 
 fn renew_authority(mesh: &Mesh, org: &OrgKeypair, identity: &Identity, dir: &std::path::Path) {
+    renew_authority_at(mesh, org, identity, dir, "successor");
+}
+
+/// [`renew_authority`] into a NAMED successor directory.
+///
+/// A second renewal needs its own directory: the backing-identity registry
+/// keeps the previous store's identity for a path, so re-adopting the same one
+/// refuses with `BackingIdentityConflict`.
+fn renew_authority_at(
+    mesh: &Mesh,
+    org: &OrgKeypair,
+    identity: &Identity,
+    dir: &std::path::Path,
+    name: &str,
+) {
     let entity = identity.entity_id().clone();
     let cert = OrgMembershipCert::try_issue(org, entity.clone(), 1, 3600).expect("cert");
-    let next = dir.join("successor");
+    let next = dir.join(name);
     let _ = std::fs::remove_dir_all(&next);
     let authority = NodeAuthority::adopt(&next, cert, &entity, 0, None).expect("adopt successor");
     mesh.node()
@@ -1692,7 +1707,7 @@ async fn the_reconciliation_trigger_certifies_the_installed_demand() {
     use std::time::{Duration, Instant};
 
     let a = org_a();
-    let (mesh, _identity, dir) = mesh_with_authority("plan-trigger", Some(&a)).await;
+    let (mesh, identity, dir) = mesh_with_authority("plan-trigger", Some(&a)).await;
     let family = OrgSensingFamily::mint(mesh.node()).expect("mint");
     let capability = cap("nrpc:internal.reindex");
     let schedule = super::client::ConvergenceSchedule::default();
@@ -1782,7 +1797,7 @@ async fn the_reconciliation_trigger_certifies_the_installed_demand() {
 
     // ---- a REFUSAL paces itself, installed demand or not -------------------
     let refused_capability = cap("nrpc:refused.capability");
-    schedule.record_refusal(refused_capability, vec![1, 2], t0);
+    schedule.record_refusal(refused_capability, vec![1, 2], None, t0);
     assert!(
         !schedule.needs_convergence(&refused_capability, &[1, 2], None, t0, floor),
         "a refused attempt with NO demand installed must still be paced - this \
@@ -1807,10 +1822,67 @@ async fn the_reconciliation_trigger_certifies_the_installed_demand() {
         "a CHANGED expectation bypasses the pacing entirely"
     );
 
+    // ---- a DEAD demand converges once, then paces ---------------------------
+    // Authority movement makes the installed demand something no record can
+    // vouch for, so it converges immediately. But a wave of callers queued
+    // behind one refusal would each re-derive the SAME dead demand and be
+    // refused again, per call: after the refusal is recorded UNDER that state,
+    // the repeat is paced like any other refusal.
+    let dead_capability = cap("nrpc:dead.demand");
+    let dead = family.retain("nrpc:dead.demand").expect("retain");
+    renew_authority(&mesh, &a, &identity, &dir);
+    assert!(
+        !dead.authority_is_current(),
+        "precondition: the installed demand's authority really moved"
+    );
+    assert!(
+        schedule.needs_convergence(&dead_capability, &[1, 2], Some(&dead), t0, floor),
+        "a demand whose authority moved converges IMMEDIATELY - no record \
+         vouches for state it cannot see"
+    );
+    schedule.record_refusal(dead_capability, vec![1, 2], Some(&dead), t0);
+    assert!(
+        !schedule.needs_convergence(&dead_capability, &[1, 2], Some(&dead), t0, floor),
+        "and the next caller in the same wave, deriving the same dead demand, \
+         is paced by that refusal instead of being refused again"
+    );
+    assert!(
+        schedule.needs_convergence(&dead_capability, &[1, 2], Some(&dead), t0 + floor, floor),
+        "the floor still expires"
+    );
+    assert!(
+        schedule.needs_convergence(&dead_capability, &[1, 2, 3], Some(&dead), t0, floor),
+        "and a changed expectation still bypasses it"
+    );
+    // A REPLACED demand is a different fact. Republished, then staled again by
+    // a second authority movement, it is dead in the same WAY but not the same
+    // demand - and its own first attempt is not paced by its predecessor's
+    // refusal.
+    let replacement = family.retain("nrpc:dead.demand").expect("re-retain");
+    assert!(
+        !std::sync::Arc::ptr_eq(&dead, &replacement),
+        "precondition: a different demand"
+    );
+    renew_authority_at(&mesh, &a, &identity, &dir, "successor-2");
+    assert!(
+        !replacement.authority_is_current(),
+        "precondition: the replacement is dead in the same way"
+    );
+    assert!(
+        schedule.needs_convergence(&dead_capability, &[1, 2], Some(&replacement), t0, floor),
+        "a replaced demand's first attempt is never paced by the refusal its \
+         predecessor earned"
+    );
+
     // ---- and the record set is BOUNDED -------------------------------------
     for index in 0..200u32 {
         let other = cap(&format!("nrpc:svc.{index}"));
-        schedule.record_refusal(other, vec![1], t0 + Duration::from_millis(index as u64));
+        schedule.record_refusal(
+            other,
+            vec![1],
+            None,
+            t0 + Duration::from_millis(index as u64),
+        );
     }
     assert!(
         schedule.len() <= 64,

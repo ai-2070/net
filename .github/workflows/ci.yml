@@ -759,15 +759,15 @@ jobs:
           # of a live ticket, and in-window rederivation of a NONEMPTY
           # population.
           #
-          # FIFTH-review outcome: the adoption schedule decision is observed
-          # under the schedule guard that took it, so a completed renewal's
-          # re-arm can never be mistaken for the initial adoption arm.
-          #
           # FOURTH-review outcomes: a coherent one-read ownership observation
           # (no cross-observation invariant to trip on legitimate movement),
           # ledger admission closed against the invalidation that discharges
           # it, and a CALLER-path witness that catches a family which stops
           # consuming the acquisition's returned facts.
+          #
+          # FIFTH-review outcome: the adoption schedule decision is observed
+          # under the schedule guard that took it, so a completed renewal's
+          # re-arm can never be mistaken for the initial adoption arm.
           REQUIRED="only_the_last_family_owner_retires_retained_demand
           a_nonfinal_family_retirement_keeps_the_shared_installation_refreshing
           a_refused_retirement_release_keeps_the_holder_and_recovers_it
@@ -916,25 +916,70 @@ jobs:
           integration_jetstream  # required-features=[jetstream]; needs a service container
           natsim                 # runs in natsim.yml (privileged netns harness, --ignored)
           "
-          # Scrape the real pins only: drop YAML comment lines and this
-          # step's own `echo` prose, both of which mention the flag by name
-          # and would otherwise be scraped as bogus test targets.
+          # Scrape the real pins and ATTRIBUTE each one to the crate its
+          # invocation targets. `--test <name>` is resolved against the crate
+          # the invoking step runs in, so a pin only proves coverage for THAT
+          # crate: an explicit `-p <crate>`, else the step's own
+          # `working-directory`, else the job default. Without that
+          # attribution a root test would count as pinned merely because an
+          # SDK step names the same basename, and a pin placed under the wrong
+          # crate's directory (which names a real target somewhere else) would
+          # survive as if it covered something.
+          #
+          # Comment lines and this step's own `echo` prose are dropped first:
+          # both mention the flag by name and would be scraped as bogus
+          # targets.
           sed '/^[[:space:]]*#/d' "$GITHUB_WORKSPACE/.github/workflows/ci.yml" \
             | grep -v 'echo ' \
-            | grep -oE -- '--test [a-z0-9_]+' \
-            | sed 's/--test //' | sort -u > /tmp/pinned.txt
+            | awk '
+                function crate_of(dir) {
+                  if (dir == "net/crates/net") return "root"
+                  if (dir == "net/crates/net/sdk") return "sdk"
+                  return "dir:" (dir == "" ? "<repo root>" : dir)
+                }
+                /^  [A-Za-z0-9_-]+:[[:space:]]*$/ {
+                  jobdir=""; stepdir=""; insteps=0; crate=""; next
+                }
+                /^    steps:[[:space:]]*$/ { insteps=1; next }
+                /^      - / { stepdir="" }
+                /working-directory:/ {
+                  sub(/^.*working-directory:[[:space:]]*/, "")
+                  sub(/[[:space:]]+$/, "")
+                  if (insteps) { stepdir=$0 } else { jobdir=$0 }
+                  next
+                }
+                /cargo (test|nextest (run|list))/ {
+                  if (match($0, /-p [A-Za-z0-9_-]+/)) {
+                    crate = substr($0, RSTART + 3, RLENGTH - 3)
+                  } else {
+                    crate = crate_of(stepdir != "" ? stepdir : jobdir)
+                  }
+                }
+                {
+                  rest = $0
+                  while (match(rest, /--test [a-z0-9_]+/)) {
+                    print (crate == "" ? "unattributed" : crate) "\t" \
+                          substr(rest, RSTART + 7, RLENGTH - 7)
+                    rest = substr(rest, RSTART + RLENGTH)
+                  }
+                }
+              ' | sort -u > /tmp/pinned_by_crate.txt
+          awk -F'\t' '$1 == "root" { print $2 }' /tmp/pinned_by_crate.txt \
+            | sort -u > /tmp/pinned_root.txt
+          awk -F'\t' '$1 == "sdk" { print $2 }' /tmp/pinned_by_crate.txt \
+            | sort -u > /tmp/pinned_sdk.txt
+          awk -F'\t' '$1 != "root" && $1 != "sdk" { print $1 ": " $2 }' \
+            /tmp/pinned_by_crate.txt | sort -u > /tmp/pinned_foreign.txt
           printf '%s\n' "$UNPINNED_OK" | awk '{print $1}' | grep -v '^$' | sort -u > /tmp/allowed.txt
-          # The inventory is PER CRATE, because `--test <name>` is resolved
-          # against the crate a step runs in. The root crate's `tests/` are the
-          # ones that must be pinned (the `integration-*` jobs pin explicitly);
-          # the SDK's `tests/` are auto-discovered by `rust-sdk-tests`, so they
-          # are NOT required to appear here — but a pin that names one is still
-          # a REAL target, and attributing it to the root crate is what made
-          # this guard fail on an SDK test that exists and runs.
+          # One inventory per crate. The root crate's `tests/` are the ones
+          # that MUST be pinned (the `integration-*` jobs pin explicitly); the
+          # SDK's `tests/` are auto-discovered by `rust-sdk-tests`, so they are
+          # NOT required to appear here — but an SDK pin still has to name a
+          # real SDK test, which is what stops this guard from failing on an
+          # SDK test that exists and runs.
           ls tests/*.rs | sed 's|tests/||; s|\.rs$||' | sort -u > /tmp/present_root.txt
           ls sdk/tests/*.rs | sed 's|sdk/tests/||; s|\.rs$||' | sort -u > /tmp/present_sdk.txt
-          sort -u /tmp/present_root.txt /tmp/present_sdk.txt > /tmp/present_any.txt
-          missing=$(comm -23 /tmp/present_root.txt <(sort -u /tmp/pinned.txt /tmp/allowed.txt))
+          missing=$(comm -23 /tmp/present_root.txt <(sort -u /tmp/pinned_root.txt /tmp/allowed.txt))
           if [ -n "$missing" ]; then
             echo "::error::Integration test(s) present in tests/ but pinned to no CI step:"
             printf '  %s\n' $missing
@@ -944,17 +989,22 @@ jobs:
             echo "satisfy it compiles to a silent 0-test binary), or to UNPINNED_OK."
             exit 1
           fi
-          # The reverse drift: a --test flag naming a file that exists in NO
-          # crate fails the run with a confusing cargo error, so name it here
-          # instead. Checked against both crates' inventories, since both are
-          # pinned somewhere in this workflow.
-          stale=$(comm -13 /tmp/present_any.txt /tmp/pinned.txt)
+          # The reverse drift, checked per crate: a pin that names no test in
+          # the crate ITS OWN invocation runs in fails that run with a
+          # confusing cargo error, so name it here instead. A pin attributed to
+          # any other crate (or to no invocation at all) covers nothing this
+          # guard inventories and is reported the same way.
+          stale=$(
+            comm -13 /tmp/present_root.txt /tmp/pinned_root.txt | sed 's/^/root: /'
+            comm -13 /tmp/present_sdk.txt /tmp/pinned_sdk.txt | sed 's/^/sdk: /'
+            cat /tmp/pinned_foreign.txt
+          )
           if [ -n "$stale" ]; then
-            echo "::error::CI pins --test target(s) that exist in no crate's tests/:"
-            printf '  %s\n' $stale
+            echo "::error::CI pins --test target(s) that name no test in the crate their own invocation runs in:"
+            printf '%s\n' "$stale" | sed 's/^/  /'
             exit 1
           fi
-          echo "OK: $(wc -l < /tmp/present_root.txt) root + $(wc -l < /tmp/present_sdk.txt) sdk test files, all accounted for."
+          echo "OK: $(wc -l < /tmp/present_root.txt) root + $(wc -l < /tmp/present_sdk.txt) sdk test files; $(wc -l < /tmp/pinned_root.txt) root pin(s) + $(wc -l < /tmp/pinned_sdk.txt) sdk pin(s), each attributed to its own crate."
 
   # --- Family A: bare bus/FFI + net mesh -------------------------------
   integration-net-core:
@@ -1703,6 +1753,12 @@ jobs:
       #
       # `tests/sensing_org_exact_guards.rs` separately asserts the probe names
       # exactly the bridge's declarations, so it cannot cover fewer symbols.
+      #
+      # Both legs run `--locked` against the probe's OWN committed
+      # `Cargo.lock`. Its workspace root is separate, so it resolves
+      # independently of the parent lockfile: without a committed lockfile and
+      # this flag, a fresh CI run could pick different compatible transitive
+      # versions than the one this probe was verified against.
       - name: Sensing — organization exact bridge darkness
         if: ${{ !cancelled() }}
         working-directory: net/crates/net/guards/fixtures_off_probe
@@ -1717,7 +1773,7 @@ jobs:
           # control ever ran. Capturing it inside an `if` is what suppresses
           # errexit for exactly this one command, and nothing else.
           negative=""
-          if negative=$(cargo check --message-format short 2>&1); then
+          if negative=$(cargo check --locked --message-format short 2>&1); then
             die "the fixtures-off probe COMPILED: the bridge is reachable in a \
                  build without the feature" "$negative"
           fi
@@ -1727,7 +1783,7 @@ jobs:
                     E0432/E0433 resolution failure naming the bridge module" "$negative"
           echo "negative leg: bridge unresolvable without \`fixtures\`"
 
-          cargo check --features fixtures \
+          cargo check --locked --features fixtures \
             || die "the positive leg must compile, or the negative leg proves nothing"
           echo "positive leg: bridge resolves with \`fixtures\`"
 
@@ -2114,9 +2170,10 @@ jobs:
       # `.config/nextest.toml` override covers this binary for the same
       # reason - a retry could turn a lost readiness observation into green).
       #
-      # `--no-tests=fail` is load-bearing twice over: `-E 'test(=name)'` exits
-      # 0 when it matches nothing, so a renamed or deleted witness would be
-      # indistinguishable from a pass.
+      # `--no-tests=fail` is what makes the per-witness loop below honest:
+      # without it, `-E 'test(=name)'` matching NOTHING is a successful
+      # zero-test run, so a renamed or deleted witness would be
+      # indistinguishable from a pass. With it, that zero match FAILS.
       #
       # Feature note: this crate's dev-dependency on net-mesh enables
       # `fixtures`, so this step is NOT a fixtures-off proof. The production

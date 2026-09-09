@@ -855,10 +855,14 @@ impl SensingInterestLeases {
     /// states the truth — the lease is no longer installed — and makes each
     /// surviving ticket's release the no-op it already is, since an organization
     /// lease with no current authority cannot be re-authored either.
+    ///
+    /// Takes the registry through [`Self::lock_entries`] like every other
+    /// mutation: the acquisition count is documented as covering ALL registry
+    /// operations, and a transition that bypassed it would let an instrumented
+    /// witness read a smaller delta than the operation actually took.
     pub(crate) fn invalidate_installation(&self, key: &SensingLeaseKey) -> usize {
         let dropped = self
-            .entries
-            .lock()
+            .lock_entries()
             .remove(key)
             .map_or(0, |entry| entry.registrations.len());
         if dropped > 0 {

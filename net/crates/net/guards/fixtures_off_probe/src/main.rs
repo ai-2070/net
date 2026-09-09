@@ -10,7 +10,10 @@
 use net::adapter::net::org_exact_sensing_bridge::{authorized_population, sensed_provider_order};
 
 fn main() {
-    // Referenced as values, so the names must resolve AND keep their arity;
+    // Referenced as values so the NAMES must resolve in the bridge module —
+    // which is the whole darkness contract this probe pins: name + module
+    // availability across the feature boundary. The `as *const ()` casts do
+    // NOT pin arity or parameter/return types (any fn item coerces), and
     // nothing is invoked (that would need a live node).
     let names: [*const (); 2] = [
         authorized_population as *const (),

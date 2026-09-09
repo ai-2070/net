@@ -52,9 +52,9 @@ const TAG: &str = "nrpc:gpu.infer";
 /// Every off-lock observation the projection reported, in order.
 type OffLockLog = Arc<parking_lot::Mutex<Vec<SensingOffLockObservation>>>;
 
-/// What the observer itself could see about the lock it reports on:
-/// `(phase, mutex was free, this thread held it)`.
-type ObserverProbes = Arc<parking_lot::Mutex<Vec<(&'static str, bool, bool)>>>;
+/// What the observer itself could see about its OWN thread at each report:
+/// `(phase, this thread held the observation mutex, instrumented guard depth)`.
+type ObserverProbes = Arc<parking_lot::Mutex<Vec<(&'static str, bool, usize)>>>;
 const TTL: Duration = Duration::from_secs(30);
 
 /// A sensing-enabled, organization-authoritative node. No transport: every
@@ -764,8 +764,8 @@ async fn an_unrelated_interest_for_the_same_provider_never_contributes_readiness
     drop(family);
 }
 
-/// The observer runs with NOTHING held: it can take the observation mutex
-/// itself.
+/// The observer runs with NOTHING held BY ITS OWN THREAD: it could take the
+/// observation mutex itself.
 ///
 /// This is a regression for a real defect in the first version of this
 /// instrumentation. Availability was probed inline in the callback's argument
@@ -773,6 +773,20 @@ async fn an_unrelated_interest_for_the_same_provider_never_contributes_readiness
 /// statement: the diagnostic reported "off-lock, available" while the callback
 /// itself ran holding the observation lock. A callback that coordinated with
 /// another capture could then block it, or deadlock waiting for it.
+///
+/// WHAT IS CLAIMED HERE, AND WHAT IS NOT. The claim is THREAD-LOCAL: at every
+/// reported phase, the callback's own thread holds neither the observation
+/// mutex nor any instrumented sensing guard. That is precisely what the
+/// surviving probe guard violated — the temporary lived on THIS thread, so
+/// `held_here` reads true and the guard depth is nonzero.
+///
+/// It is NOT claimed that the mutex is globally free. Reconciliation starts a
+/// retained-demand refresh worker, so a legitimate renewal on another runtime
+/// worker can own the observation guard for the duration of a callback that is
+/// itself correctly holding nothing. An any-thread availability assertion would
+/// then blame this callback for an unrelated owner, which is the distinction
+/// [`an_unrelated_owner_does_not_make_off_lock_work_look_locked`] establishes
+/// directly.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_off_lock_observer_itself_holds_nothing() {
     let node = projection_node("observer-free").await;
@@ -782,18 +796,17 @@ async fn the_off_lock_observer_itself_holds_nothing() {
     let keys = branches(&demand);
     admit(&node, &keys[0].1, beat(AttestedStatus::Ready, 5, 1, true));
 
-    // The callback ACQUIRES the mutex it is being told about, and records
-    // whether it could - which a surviving probe guard makes impossible.
+    // The callback asks — from INSIDE itself — what its own thread owns, which
+    // a surviving probe guard would have made nonzero.
     let acquired: ObserverProbes = Arc::new(parking_lot::Mutex::new(Vec::new()));
     {
         let acquired = Arc::clone(&acquired);
-        let node = Arc::clone(&node);
-        node.clone()
-            .set_sensing_projection_offlock_observer_for_test(Arc::new(move |observation| {
-                let free = node.sensing_observations_free_for_test();
-                let held_here = MeshNode::sensing_observations_held_here_for_test();
-                acquired.lock().push((observation.phase, free, held_here));
-            }));
+        node.set_sensing_projection_offlock_observer_for_test(Arc::new(move |observation| {
+            let held_here = MeshNode::sensing_observations_held_here_for_test();
+            acquired
+                .lock()
+                .push((observation.phase, held_here, observation.guard_depth));
+        }));
     }
 
     let projection = demand.project_sensed_order(Instant::now(), &ConsumerLatencyBudget::default());
@@ -804,15 +817,16 @@ async fn the_off_lock_observer_itself_holds_nothing() {
         !seen.is_empty(),
         "the observer must have been called, or this witness proves nothing"
     );
-    for (phase, free, held_here) in seen {
-        assert!(
-            free,
-            "{phase}: the observer could not take the observation mutex, so \
-             the diagnostic is holding it across its own callback"
-        );
+    for (phase, held_here, guard_depth) in seen {
         assert!(
             !held_here,
-            "{phase}: the observer's own thread holds the observation guard"
+            "{phase}: the observer's own thread holds the observation guard, so \
+             the diagnostic is holding it across its own callback"
+        );
+        assert_eq!(
+            guard_depth, 0,
+            "{phase}: the observer's own thread holds {guard_depth} instrumented \
+             sensing guard(s) across the callback"
         );
     }
 

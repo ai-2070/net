@@ -1,4 +1,6 @@
 # Build artifacts of the standalone darkness probe. It has its OWN workspace
-# root, so the repository root ignore rules do not reach it.
+# root, so the repository root ignore rules do not reach it. `Cargo.lock` is
+# deliberately NOT ignored: the probe resolves independently of the parent
+# lockfile, and CI runs it with `--locked`, so the committed lockfile is what
+# keeps a fresh CI run from selecting different transitive versions.
 target/
-Cargo.lock
