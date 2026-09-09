@@ -126,6 +126,21 @@ pub(crate) struct ConvergenceSchedule {
     in_section: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(any(test, feature = "fixtures"))]
     last_expectation: parking_lot::Mutex<Vec<u64>>,
+    /// Instrumented builds only. Who HOLDS the section right now.
+    ///
+    /// Every acquisition takes a fresh ticket from `holder_seq` and publishes
+    /// it; releasing publishes zero. The transaction then re-checks its own
+    /// ticket at the points that must be protected - the decision, and the
+    /// record it commits - and `unguarded` counts the steps that ran when this
+    /// caller was NOT the holder. That is a statement about the guard itself,
+    /// so it needs no overlap: a section released early fails it even if the
+    /// awakened contender politely waits, and even with one caller.
+    #[cfg(any(test, feature = "fixtures"))]
+    holder_seq: std::sync::atomic::AtomicU64,
+    #[cfg(any(test, feature = "fixtures"))]
+    current_holder: std::sync::atomic::AtomicU64,
+    #[cfg(any(test, feature = "fixtures"))]
+    unguarded: std::sync::atomic::AtomicU64,
 }
 
 /// One capability's last convergence attempt.
@@ -395,6 +410,60 @@ impl ConvergenceSchedule {
         self.last_expectation.lock().clone()
     }
 
+    /// Publish a fresh holder ticket for an acquisition that just succeeded.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub(crate) fn take_holder(&self) -> u64 {
+        let ticket = self
+            .holder_seq
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        self.current_holder
+            .store(ticket, std::sync::atomic::Ordering::SeqCst);
+        ticket
+    }
+
+    #[cfg(not(any(test, feature = "fixtures")))]
+    pub(crate) fn take_holder(&self) -> u64 {
+        0
+    }
+
+    /// Retract `ticket`'s hold, if it is still the published one.
+    #[cfg(any(test, feature = "fixtures"))]
+    fn release_holder(&self, ticket: u64) {
+        let _ = self.current_holder.compare_exchange(
+            ticket,
+            0,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+
+    /// One step of the transaction that MUST run under this caller's own hold.
+    ///
+    /// Records a violation when the section has been released - or taken over -
+    /// since `ticket` acquired it. Nothing is thrown: the call proceeds exactly
+    /// as before, and the count is the witness's to read.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub(crate) fn verify_holding(&self, ticket: u64) {
+        if self
+            .current_holder
+            .load(std::sync::atomic::Ordering::SeqCst)
+            != ticket
+        {
+            self.unguarded
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[cfg(not(any(test, feature = "fixtures")))]
+    pub(crate) fn verify_holding(&self, _ticket: u64) {}
+
+    /// Transaction steps that ran without this caller's hold.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub(crate) fn unguarded_steps(&self) -> u64 {
+        self.unguarded.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Counters for a witness:
     /// `(arrivals, contended, convergences, peak_occupancy)`.
     #[cfg(any(test, feature = "fixtures"))]
@@ -478,14 +547,52 @@ impl OrgSensingAcquisition {
     /// said to have contended: it found the section held by somebody else. In
     /// production both arms are the same acquisition - `note_contended`
     /// compiles away.
-    pub(crate) fn reconcile_lock(&self) -> parking_lot::MutexGuard<'_, ()> {
-        match self.schedule.reconcile.try_lock() {
+    pub(crate) fn reconcile_lock(&self) -> ReconcileGuard<'_> {
+        let guard = match self.schedule.reconcile.try_lock() {
             Some(guard) => guard,
             None => {
                 self.schedule.note_contended();
                 self.schedule.reconcile.lock()
             }
+        };
+        ReconcileGuard {
+            ticket: self.schedule.take_holder(),
+            schedule: &self.schedule,
+            _guard: guard,
         }
+    }
+}
+
+/// The reconciliation section's guard, plus the HOLDER TICKET the transaction
+/// re-checks at the steps that must be protected.
+///
+/// Owning the guard is what serializes; owning the ticket is what makes that
+/// checkable. The ticket is a plain copy, so a transaction can ask "am I still
+/// the holder?" at the decision and at the record without borrowing the guard —
+/// which is the whole point: a guard released early still answers honestly,
+/// with no second caller and no overlap required.
+#[cfg(feature = "cortex")]
+pub(crate) struct ReconcileGuard<'a> {
+    ticket: u64,
+    schedule: &'a ConvergenceSchedule,
+    _guard: parking_lot::MutexGuard<'a, ()>,
+}
+
+#[cfg(feature = "cortex")]
+impl ReconcileGuard<'_> {
+    /// This hold's ticket.
+    pub(crate) fn ticket(&self) -> u64 {
+        self.ticket
+    }
+}
+
+#[cfg(feature = "cortex")]
+impl Drop for ReconcileGuard<'_> {
+    fn drop(&mut self) {
+        #[cfg(any(test, feature = "fixtures"))]
+        self.schedule.release_holder(self.ticket);
+        #[cfg(not(any(test, feature = "fixtures")))]
+        let _ = self.schedule;
     }
 }
 
@@ -690,6 +797,20 @@ impl OrgClient {
         self._sensing
             .acquisition()
             .map(|acquisition| acquisition.schedule().last_expectation())
+    }
+
+    /// How many transaction steps ran WITHOUT the section guard this caller
+    /// took — the decision and the record it commits each check.
+    ///
+    /// Zero is the property. It is independent of scheduling: a guard dropped
+    /// early is caught by the next step whether or not anybody else was
+    /// waiting, so a witness need not arrange an overlap to observe it.
+    #[cfg(all(feature = "cortex", any(test, feature = "fixtures")))]
+    #[doc(hidden)]
+    pub fn sensing_section_unguarded_steps(&self) -> Option<u64> {
+        self._sensing
+            .acquisition()
+            .map(|acquisition| acquisition.schedule().unguarded_steps())
     }
 
     /// Install a hook that fires INSIDE this binding's reconciliation section,
