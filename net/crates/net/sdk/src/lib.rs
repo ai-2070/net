@@ -193,14 +193,15 @@ pub mod a2a;
 pub mod subnet;
 #[cfg(feature = "net")]
 pub mod subnets;
-// Capability sensing — the PROVIDER lifecycle only: `provide`, the
-// ownership-safe registration handle, and state-edge notification. See
-// CAPABILITY_SENSING_SDK_INTEGRATION_PLAN.md §4.4/§4.5. There is no
-// query, watch, snapshot, or readiness projection in this slice. The
-// core does now author a dark own-organization exact-provider lease,
-// but acquisition is not a projection — the module docs record what is
-// implemented there and what is still absent above it. Rides `net`:
-// every operation is node state on a live `MeshNode`.
+// Capability sensing — the PROVIDER lifecycle (`provide`, the
+// ownership-safe registration handle, state-edge notification) plus the
+// own-organization EXACT-PROVIDER consumer observation (`watch`, one
+// request-relative snapshot, missed-wake-safe change notification,
+// explicit close). See CAPABILITY_SENSING_SDK_INTEGRATION_PLAN.md
+// §4.1-§4.5. Still absent above it, and named as absent in the module
+// docs: provider-free / leader-backed selection, cross-organization and
+// `Granted` sensing, and any sensed call verb. Rides `net`: every
+// operation is node state on a live `MeshNode`.
 #[cfg(feature = "net")]
 pub mod sensing;
 
@@ -319,17 +320,21 @@ pub use crate::a2a::{
 };
 #[cfg(feature = "net")]
 pub use crate::subnets::{SubnetId, SubnetPolicy};
-// Capability-sensing PROVIDER convenience re-exports (S1): the trait an
-// integration implements, its result model, the registration handle,
-// and the loud refusal. The incarnation derivation stays behind
-// `net_sdk::sensing::` so the crate root does not grow a second sensing
-// surface. There is no query, watch, or projection surface here — the
-// core's own-organization exact-provider acquisition is not re-exported
-// and grows no SDK vocabulary; see the module docs.
+// Capability-sensing convenience re-exports (S1): the provider trait an
+// integration implements with its result model and registration handle,
+// the own-organization exact-provider consumer observation, and the loud
+// refusal. The incarnation derivation and the population bound stay
+// behind `net_sdk::sensing::` so the crate root does not grow a second
+// sensing surface.
+//
+// What is NOT re-exported anywhere: interest, audience or wire
+// vocabulary, and any provider-free / cross-organization selector. See
+// the module docs for the exact boundary.
 #[cfg(feature = "net")]
 pub use crate::sensing::{
-    EvaluationRequest, ReadinessEvaluation, ReadinessEvaluator, ReadinessRegistration,
-    SensingClient, SensingError,
+    EvaluationRequest, ProjectedReadiness, ReadinessEvaluation, ReadinessEvaluator,
+    ReadinessRegistration, SensedProvider, SensedViability, SensingClient, SensingError,
+    SensingQuery, SensingSnapshot, SensingWatch,
 };
 
 impl NetBuilder {
