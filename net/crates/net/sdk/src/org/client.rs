@@ -1154,21 +1154,38 @@ impl OrgClient {
         // refused mint is an inert binding, not a failed bind, and the error
         // type of this function is unchanged. Recorded once, here - never per
         // call - because the mint does not happen again on this client.
+        //
+        // Gated on the node's MASTER SWITCH first. The mint depends only on
+        // routing-family id allocation, so on a mesh where
+        // `MeshBuilder::enable_sensing` was never called it still succeeded -
+        // and then every lease acquisition refused with `Disabled`, leaving a
+        // demand whose `retained` is empty, so `agreed` is false and
+        // `needs_convergence` answers true again after every retry floor. Every
+        // `org.call()` past that floor then drove a FULL convergence - capture,
+        // population derivation, up to `MAX_ORG_SENSING_POPULATION` refused
+        // acquisitions, republication - on the call's critical path,
+        // permanently, producing no ordering whatsoever. `docs/SENSING.md` says
+        // a node with sensing off does zero sensing work; an inert binding is
+        // what that means here, and it spends no routing-family id either.
         #[cfg(feature = "cortex")]
-        let _sensing = match OrgSensingFamily::mint(&node) {
-            Ok(family) => OrgSensingBinding::Active(OrgSensingAcquisition::new(family)),
-            Err(refusal) => {
-                // `eprintln!` because this crate takes no logging dependency
-                // (the `compute` verbs do the same for their one operator
-                // warning). Once per BIND, never per call: the mint does not
-                // happen again on this client, so there is nothing to rate
-                // limit. It names the typed refusal so an operator can tell
-                // "no authority" from "family space exhausted".
-                eprintln!(
-                    "WARN: org sensing family unavailable ({refusal:?}); \
+        let _sensing = if !node.sensing_enabled() {
+            OrgSensingBinding::Inert
+        } else {
+            match OrgSensingFamily::mint(&node) {
+                Ok(family) => OrgSensingBinding::Active(OrgSensingAcquisition::new(family)),
+                Err(refusal) => {
+                    // `eprintln!` because this crate takes no logging dependency
+                    // (the `compute` verbs do the same for their one operator
+                    // warning). Once per BIND, never per call: the mint does not
+                    // happen again on this client, so there is nothing to rate
+                    // limit. It names the typed refusal so an operator can tell
+                    // "no authority" from "family space exhausted".
+                    eprintln!(
+                        "WARN: org sensing family unavailable ({refusal:?}); \
                      this binding plans unsensed"
-                );
-                OrgSensingBinding::Inert
+                    );
+                    OrgSensingBinding::Inert
+                }
             }
         };
 

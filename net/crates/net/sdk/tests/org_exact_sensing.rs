@@ -2411,25 +2411,27 @@ async fn a_consumer_without_sensing_plans_the_deterministic_order() {
         "precondition: this consumer's sensing plane is off"
     );
 
-    let mut identity = None;
     for _ in 0..3 {
         assert_eq!(
             cell.call().await,
             cell.names[0],
             "with no evidence the order is the deterministic one"
         );
-        let (_, retained, current) = demand_state(&cell.client).expect("demand");
+        // NO DEMAND AT ALL - the point of the gate, and stronger than what
+        // this witness used to assert.
+        //
+        // The binding used to be minted whenever a routing-family id could be
+        // allocated, never consulting the node's master switch. Convergence
+        // then ran, every lease acquisition refused with `Disabled`, and the
+        // published demand had an empty `retained` - so `agreed` was false and
+        // `needs_convergence` answered true again after every retry floor.
+        // Asserting "a demand exists with no holders" accepted exactly that
+        // state; the loop only looked stable here because three calls fit
+        // inside one floor.
         assert!(
-            retained.is_empty(),
-            "a dark plane acquires no holder, so there is nothing to order by"
+            demand_state(&cell.client).is_none(),
+            "a node with sensing off must hold no demand whatsoever"
         );
-        match identity {
-            None => identity = Some(current),
-            Some(previous) => assert_eq!(
-                previous, current,
-                "no per-call re-acquisition: the same demand is reused"
-            ),
-        }
     }
     assert_eq!(cell.served(1), 0);
     assert_eq!(cell.served(0), 3);
@@ -2437,15 +2439,16 @@ async fn a_consumer_without_sensing_plans_the_deterministic_order() {
         cell.consumer.node.sensing_table_is_empty(),
         "a dark consumer registers no interest at all"
     );
-    let projection = cell
-        .client
-        .sensing_projection(
-            &capability(),
-            Instant::now(),
-            &ConsumerLatencyBudget::default(),
-        )
-        .expect("demand");
-    assert!(projection.viable().is_empty() && projection.non_viable().is_empty());
+    assert!(
+        cell.client
+            .sensing_projection(
+                &capability(),
+                Instant::now(),
+                &ConsumerLatencyBudget::default(),
+            )
+            .is_none(),
+        "and it projects nothing, because there is nothing to project from"
+    );
     cell.cleanup();
 }
 
