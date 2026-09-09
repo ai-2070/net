@@ -941,6 +941,40 @@ jobs:
           sed '/^[[:space:]]*#/d' "$GITHUB_WORKSPACE/.github/workflows/ci.yml" \
             | grep -v 'echo ' \
             | awk '
+                # FOLD YAML folded block scalars (`run: >`) onto one physical line.
+                #
+                # The attribution pass below carries command context across a
+                # continuation only when the line ends in a backslash, which is how a
+                # LITERAL block (`run: |`) writes one. A FOLDED block never has one -
+                # YAML joins its lines itself - so `incargo` was cleared after the first
+                # line and a `-p` sitting on any later line was never read. The pin then
+                # kept the crate derived from the working directory, which is how a test
+                # could be attributed to the wrong crate and counted as covering it.
+                #
+                # A blank line inside a folded block is a paragraph break, i.e. a real
+                # newline in the folded result and therefore a separate command, so it
+                # ends the current line instead of joining across it.
+                function emit() { if (buf != "") { print buf; buf = "" } }
+                /^[[:space:]]*run:[[:space:]]*>/ {
+                  emit()
+                  match($0, /^[[:space:]]*/); findent = RLENGTH
+                  folding = 1
+                  next
+                }
+                folding {
+                  if ($0 ~ /^[[:space:]]*$/) { emit(); next }
+                  match($0, /^[[:space:]]*/); cur = RLENGTH
+                  if (cur > findent) {
+                    if (buf == "") { buf = $0 }
+                    else { t = $0; sub(/^[[:space:]]+/, "", t); buf = buf " " t }
+                    next
+                  }
+                  emit(); folding = 0
+                }
+                { print }
+                END { emit() }
+              ' \
+            | awk '
                 function crate_of_dir(dir) {
                   if (dir == "net/crates/net") return "root"
                   if (dir == "net/crates/net/sdk") return "sdk"
