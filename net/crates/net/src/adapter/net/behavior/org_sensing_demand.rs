@@ -2427,6 +2427,74 @@ mod tests {
         drop(family);
     }
 
+    /// The unit-returning release surface PARKS a refused ticket rather than
+    /// dropping it on the floor.
+    ///
+    /// `release_sensing_interest_lease` returns `()`, so it has nowhere to put
+    /// the still-live ticket a refusal hands back. It used to log and drop it -
+    /// and because a surviving holder's release only relaxes the aggregate, the
+    /// row and its upstream registration then outlived every owner, with
+    /// nothing left in existence that could ever release them.
+    ///
+    /// That was unreachable while own-org audiences were refused at acquire
+    /// time. This slice makes them acquirable, so any external `MeshNode`
+    /// consumer still on this pre-existing surface would leak on the first
+    /// authority hiccup.
+    ///
+    /// Parking needs a shared handle to the node (`self_weak`), which only
+    /// `start_arc` populates - the production entry points all call it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_unit_returning_release_parks_a_refused_ticket() {
+        let node = demand_node("unit-release-park", Duration::from_secs(30)).await;
+        node.start_arc();
+        let family = OrgSensingFamily::mint(&node).expect("mint");
+        let provider = node.node_id().wrapping_add(1);
+
+        // A SURVIVING holder at a looser cadence, so the family's release
+        // previews `Reregister` - the only shape that can be refused.
+        let survivor = node
+            .acquire_sensing_interest_lease(
+                &spec_for(&node, provider),
+                provider,
+                SENSING_SAMPLE_INTERVAL * 2,
+            )
+            .expect("the surviving holder acquires");
+        let demand = family.reconcile(TAG, &[provider]).expect("retain");
+        let ticket = demand.retained[0].ticket;
+        let key_a = lease_key_for(&node, provider);
+        assert_eq!(holders(&node, &key_a), Some(2), "precondition");
+
+        node.clear_node_authority_for_test();
+        node.install_node_authority(adopt(&node, &other_org(), "unit-release-foreign"))
+            .expect("install a foreign owner");
+
+        let before = node.org_sensing_demand_state_for_test();
+        node.release_sensing_interest_lease(ticket);
+        let after = node.org_sensing_demand_state_for_test();
+
+        assert_eq!(
+            after.refused_release_parked,
+            before.refused_release_parked + 1,
+            "the refused ticket must be PARKED for paced retry; dropping it \
+             leaked the holder, and with it the row and its upstream \
+             registration, permanently"
+        );
+        assert_eq!(
+            after.refused_release_outstanding, 1,
+            "and it must actually be sitting in the retention set"
+        );
+        assert_eq!(
+            holders(&node, &key_a),
+            Some(2),
+            "corroboration: the refusal really did release nothing, so the \
+             ticket it handed back was genuinely still live"
+        );
+
+        node.release_sensing_interest_lease(survivor);
+        drop(demand);
+        drop(family);
+    }
+
     // ---- BUCKET PERMUTATION ----------------------------------------------
 
     /// The bucket assignment is a PERMUTATION for every input, not only for

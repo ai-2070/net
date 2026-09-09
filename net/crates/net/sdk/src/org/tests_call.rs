@@ -2066,7 +2066,6 @@ async fn the_reconciliation_trigger_certifies_the_installed_demand() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-
 /// A CERTIFIED demand that later degrades is converged, and PACED while it
 /// stays degraded.
 ///
@@ -2153,7 +2152,6 @@ async fn a_degraded_certified_demand_is_paced_and_a_replaced_one_is_not() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-
 /// A demand's identity is core's own monotone id, never its address.
 ///
 /// `DemandState` and `Outcome::Certified` hold NO `Arc` to the demand they
@@ -2199,4 +2197,3 @@ async fn a_demand_identity_is_never_reused() {
     drop(family);
     let _ = std::fs::remove_dir_all(&dir);
 }
-
