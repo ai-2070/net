@@ -102,6 +102,11 @@ const QUIET_BOUND: Duration = Duration::from_millis(700);
 const SDK_SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
 /// The LOOSER cadence the coexisting raw holder asks.
 const SLOWER_SAMPLE_INTERVAL: Duration = Duration::from_secs(4);
+/// The pacing floor the recovery witnesses widen to. Long enough that "the
+/// previous success floor is still unexpired" survives a signed on-disk
+/// ceremony, so those witnesses qualify the SCHEDULE instead of racing a
+/// short wall-clock interval.
+const RECOVERY_FLOOR: Duration = Duration::from_secs(120);
 
 fn org() -> OrgKeypair {
     OrgKeypair::from_bytes([0x71u8; 32])
@@ -567,6 +572,56 @@ async fn acknowledge_parked(observation: &mut SensingWatch) -> Instant {
     panic!("no quiet window to acknowledge a park in");
 }
 
+/// Park until a wake arrives whose IMMEDIATE read satisfies `carried`, and
+/// return how many earlier wakes were skipped.
+///
+/// This is the whole attribution, inside the bounded observation: every park
+/// must return within [`WAKE_BOUND`], the accepted wake's own immediate
+/// snapshot must already show the named state, and the total wait must finish
+/// before `fallback` — so the fallback timer cannot explain the return and no
+/// LATER producer can retroactively give meaning to an EARLIER unrelated wake.
+/// Unrelated wakes are counted and re-parked on, never accepted; joining the
+/// producer afterwards proves nothing and is deliberately not done.
+///
+/// The quiet acknowledgement that precedes this is a receiver/cursor proof
+/// only — a cancelled `changed()` is not a barrier on this wait — which is
+/// exactly why the accepted wake must carry the state itself.
+async fn wake_carrying(
+    what: &str,
+    observation: &mut SensingWatch,
+    fallback: Instant,
+    mut carried: impl FnMut(&net_sdk::sensing::SensingSnapshot) -> bool,
+) -> usize {
+    let mut skipped = 0usize;
+    loop {
+        tokio::time::timeout(WAKE_BOUND, observation.changed())
+            .await
+            .unwrap_or_else(|_| panic!("{what}: no wake arrived inside the wake bound"))
+            .expect("changed");
+        assert!(
+            Instant::now() < fallback,
+            "{what}: the wait must finish before the population fallback"
+        );
+        let snapshot = observation.snapshot().expect("snapshot");
+        if carried(&snapshot) {
+            return skipped;
+        }
+        skipped += 1;
+        assert!(
+            skipped <= 8,
+            "{what}: too many wakes carried nothing ({snapshot:?})"
+        );
+    }
+}
+
+/// Publish a REAL, UNRELATED node change: acquire and release one of this
+/// node's own local interests. Used to prove a witness cannot accept a wake
+/// that preceded its named event.
+fn publish_unrelated_change(node: &Arc<MeshNode>, provider: u64) {
+    let ticket = acquire_local_interest(node, provider);
+    let _ = node.try_release_sensing_interest_lease(ticket);
+}
+
 /// Snapshot until `predicate` holds, DRIVEN BY `changed()` — so every wait in
 /// these witnesses is a real park on the shipped notification, and a lost wake
 /// fails as a timeout rather than being polled around.
@@ -873,6 +928,19 @@ async fn timed_continuity_expiry_publishes_a_wake_and_clears_the_estimate() {
             .is_some_and(|p| p.readiness() == ProjectedReadiness::Ready)
     })
     .await;
+    // PRODUCTION LINK: the maintenance schedule must itself drive the shared
+    // age-and-publish operation. Nothing in this witness has called it yet, so
+    // a rising count can only come from the production task — and a build that
+    // stopped calling it there (or stopped scheduling the sweep) fails here
+    // even though the fixture-driven path below would still work.
+    let passes_before = consumer.node.sensing_expiry_passes_for_test();
+    until(
+        "the maintenance schedule never ran the expiry operation",
+        SETTLE,
+        || consumer.node.sensing_expiry_passes_for_test() > passes_before,
+    )
+    .await;
+
     let fallback = acknowledge_parked(&mut observation).await;
 
     // An INDEPENDENT view of the node's change generation, marked caught up
@@ -880,10 +948,16 @@ async fn timed_continuity_expiry_publishes_a_wake_and_clears_the_estimate() {
     let mut generation = consumer.node.subscribe_sensing_overlay_changes();
     let _ = generation.borrow_and_update();
 
-    // Only the continuity clock moves, from another task, while this one parks.
+    // An UNRELATED publisher fires FIRST, deliberately: a real local-interest
+    // release moves this node's change generation before the named event. A
+    // witness that accepted any first wake would be satisfied by this one.
+    publish_unrelated_change(&consumer.node, 0xE1_A1);
+
+    // Only the continuity clock moves after that, from another task, while
+    // this one parks.
     let clock = Arc::clone(&consumer.node);
     let expiry = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(40)).await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
         assert!(
             clock.expire_sensing_consumer_cells_for_test(
                 Instant::now() + Duration::from_secs(3_600)
@@ -892,15 +966,16 @@ async fn timed_continuity_expiry_publishes_a_wake_and_clears_the_estimate() {
         );
     });
 
-    tokio::time::timeout(WAKE_BOUND, observation.changed())
-        .await
-        .expect("the expiry must publish a wake a parked watcher receives")
-        .expect("changed");
-    let woke_at = Instant::now();
+    // The accepted wake is the one whose OWN immediate read shows the expiry.
+    let skipped = wake_carrying("timed expiry", &mut observation, fallback, |snap| {
+        snap.provider(provider_id)
+            .is_some_and(|p| p.readiness() == ProjectedReadiness::Unknown)
+    })
+    .await;
     assert!(
-        woke_at < fallback,
-        "the wake must arrive BEFORE the fallback deadline, {:?} of margin left",
-        fallback.saturating_duration_since(woke_at)
+        skipped >= 1,
+        "the deliberate unrelated wake must have been observed and SKIPPED, \
+         not accepted as the expiry"
     );
     expiry.await.expect("expiry task");
     assert!(
@@ -910,14 +985,8 @@ async fn timed_continuity_expiry_publishes_a_wake_and_clears_the_estimate() {
         "the expiry must have PUBLISHED a change, not merely aged the state"
     );
 
-    // ONE read, at the wake.
     let snapshot = observation.snapshot().expect("snapshot");
     let sensed = row(&snapshot, provider_id);
-    assert_eq!(
-        sensed.readiness(),
-        ProjectedReadiness::Unknown,
-        "the expired cell projects Unknown: {snapshot:?}"
-    );
     assert_eq!(
         sensed.estimated_start(),
         None,
@@ -1237,6 +1306,10 @@ async fn an_unavailable_authority_hides_the_population_and_recovery_restores_it(
     let provider_id = provider.node.node_id();
 
     let mut observation = watch(&consumer, SensingQuery::new(TAG));
+    // A LONG pacing floor: every "the previous success floor is still
+    // unexpired" claim below is then a statement about the schedule, not a
+    // race against however long the transition takes.
+    observation.set_population_floor_for_test(RECOVERY_FLOOR);
     until_snapshot("the provider never read Ready", &mut observation, |snap| {
         snap.provider(provider_id)
             .is_some_and(|p| p.readiness() == ProjectedReadiness::Ready)
@@ -1291,7 +1364,8 @@ async fn an_unavailable_authority_hides_the_population_and_recovery_restores_it(
     assert_eq!(
         observation.convergences_for_test(),
         convergences_before + 1,
-        "a moved authority bypasses the success floor and re-derives at once"
+        "a moved authority bypasses the success floor and ATTEMPTS a fresh \
+         convergence at once (the rows below are what say it succeeded)"
     );
     assert!(
         Instant::now() < unexpired_floor,
@@ -1336,6 +1410,10 @@ async fn a_self_revoked_observer_is_refused_on_existing_and_new_reads() {
     let provider_id = provider.node.node_id();
 
     let mut observation = watch(&consumer, SensingQuery::new(TAG));
+    // Same widened floor as the fixture transition: the signed ceremony writes
+    // to disk, so the window must not depend on that finishing inside a short
+    // wall-clock interval.
+    observation.set_population_floor_for_test(RECOVERY_FLOOR);
     until_snapshot("the provider never read Ready", &mut observation, |snap| {
         snap.provider(provider_id)
             .is_some_and(|p| p.readiness() == ProjectedReadiness::Ready)
@@ -1394,9 +1472,17 @@ async fn a_self_revoked_observer_is_refused_on_existing_and_new_reads() {
         }))
         .expect("install the renewed authority");
 
-    // The FIRST read after re-admission requalifies and re-derives: no
-    // eventual polling, and no waiting out a pacing floor.
+    // The FIRST read after re-admission requalifies and re-derives, WHILE the
+    // last successful convergence's floor is demonstrably unexpired — so a
+    // paced-only implementation would still be waiting and could not produce
+    // this result.
     let convergences_before = observation.convergences_for_test();
+    let unexpired_floor = observation.fallback_deadline_for_test();
+    assert!(
+        Instant::now() < unexpired_floor,
+        "precondition: the previous success floor has NOT elapsed after the \
+         signed ceremony"
+    );
     let restored = observation
         .snapshot()
         .expect("re-admission restores the observation on the next read");
@@ -1404,10 +1490,17 @@ async fn a_self_revoked_observer_is_refused_on_existing_and_new_reads() {
         restored.provider(provider_id).is_some(),
         "and it returns the currently authorized population: {restored:?}"
     );
+    // ATTEMPTS, precisely: the counter records that a convergence was
+    // attempted, not that a publication identity changed. The restored rows
+    // above are what say it succeeded.
     assert_eq!(
         observation.convergences_for_test(),
         convergences_before + 1,
-        "the moved authority forced a fresh convergence rather than waiting"
+        "the moved authority attempted a fresh convergence rather than waiting"
+    );
+    assert!(
+        Instant::now() < unexpired_floor,
+        "and it did so before that floor would have expired"
     );
 
     let _ = std::fs::remove_dir_all(&consumer.dir);
@@ -2086,9 +2179,14 @@ async fn an_already_parked_watcher_is_woken_by_a_provider_edge() {
     // assumed.
     let fallback = acknowledge_parked(&mut observation).await;
 
-    // Only now does the edge fire, from another task, while this one parks.
+    // An UNRELATED publisher fires FIRST, deliberately: a real local-interest
+    // release moves this node's change generation before the provider edge, so
+    // a witness that accepted any first wake would be satisfied by it.
+    publish_unrelated_change(&consumer.node, 0xE1_A2);
+
+    // Only then does the edge fire, from another task, while this one parks.
     let edge = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(40)).await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
         ready.store(false, Ordering::Relaxed);
         assert!(
             registration.changed(),
@@ -2097,28 +2195,20 @@ async fn an_already_parked_watcher_is_woken_by_a_provider_edge() {
         registration
     });
 
-    let parked = Instant::now();
-    tokio::time::timeout(WAKE_BOUND, observation.changed())
-        .await
-        .expect("a parked watcher must be woken by the provider edge")
-        .expect("changed");
-    let woke_at = Instant::now();
-    let waited = parked.elapsed();
+    // The accepted wake is the one whose OWN immediate read carries the edge;
+    // earlier wakes are skipped, and the producer is joined only afterwards,
+    // for cleanup, never to give an earlier wake meaning.
+    let skipped = wake_carrying("provider edge", &mut observation, fallback, |snap| {
+        snap.provider(provider_id)
+            .is_some_and(|p| p.readiness() == ProjectedReadiness::NotReady)
+    })
+    .await;
     assert!(
-        woke_at < fallback,
-        "the wake must arrive BEFORE the fallback deadline, waited {waited:?} \
-         with {:?} of margin left",
-        fallback.saturating_duration_since(woke_at)
+        skipped >= 1,
+        "the deliberate unrelated wake must have been observed and SKIPPED, \
+         not accepted as the provider edge"
     );
     let _registration = edge.await.expect("edge task");
-
-    // The admitted edge is already readable at the wake: ONE read, no polling.
-    let after = observation.snapshot().expect("snapshot");
-    assert_eq!(
-        row(&after, provider_id).readiness(),
-        ProjectedReadiness::NotReady,
-        "the wake carried a real admitted edge: {after:?}"
-    );
 
     let _ = std::fs::remove_dir_all(&consumer.dir);
     let _ = std::fs::remove_dir_all(&provider.dir);
@@ -2234,6 +2324,35 @@ async fn an_idle_watch_is_actually_renewed_and_stops_after_the_last_close() {
         .node
         .org_sensing_demand_state_for_test()
         .refresh_renewed;
+    // The interval a renewal re-authors from lives in the LEASE REGISTRY, so
+    // the renewal claim below is pinned against that, not only against a local
+    // cell. The node's soft-state horizon is 2s here, so the SDK's fixed
+    // cadence clamps to it.
+    let org_id = consumer
+        .node
+        .node_authority()
+        .expect("authority")
+        .owner_org();
+    let spec = net::adapter::net::behavior::org_sensing_demand::exact_provider_spec(
+        TAG,
+        net::adapter::net::behavior::sensing::canonical_org_sensing_commitment(&org_id),
+        net::adapter::net::behavior::org_sensing_demand::fixed_work_latency(),
+        provider_id,
+    );
+    let renewal_key = net::adapter::net::behavior::sensing::SensingLeaseKey::ExactProvider {
+        audience: spec.audience,
+        interest_digest: spec.interest_digest(),
+        provider: provider_id,
+    };
+    let installed_interval = consumer
+        .node
+        .sensing_lease_entry_for_test(&renewal_key)
+        .expect("the registry holds this watch's interest");
+    assert_eq!(
+        installed_interval,
+        (1, SDK_SAMPLE_INTERVAL),
+        "precondition: one holder, at the interval future renewals re-author"
+    );
 
     // IDLE: no watch call at all for longer than the ttl.
     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -2332,7 +2451,15 @@ async fn a_slower_raw_holder_survives_the_sdk_watch_release() {
         "precondition: the raw holder really joined the installation"
     );
     // The EFFECTIVE cadence while both hold it: the strictest, which is the
-    // SDK's 2s rather than the raw holder's 4s.
+    // SDK's 2s rather than the raw holder's 4s — in the LEASE REGISTRY, which
+    // is what future renewals re-author from, and in the local cell.
+    assert_eq!(
+        consumer
+            .node
+            .sensing_lease_entry_for_ticket_for_test(&slower),
+        Some((2, SDK_SAMPLE_INTERVAL)),
+        "precondition: two registry holders at the strictest installed interval"
+    );
     assert_eq!(
         consumer
             .node
@@ -2340,6 +2467,10 @@ async fn a_slower_raw_holder_survives_the_sdk_watch_release() {
         Some(SDK_SAMPLE_INTERVAL),
         "precondition: the shared cell runs at the strictest interval"
     );
+    let installation_before = consumer
+        .node
+        .sensing_lease_holder_installation_for_test(&slower)
+        .expect("precondition: the survivor's installation identity");
 
     // The stricter SDK owner leaves.
     assert!(observation.close());
@@ -2349,26 +2480,34 @@ async fn a_slower_raw_holder_survives_the_sdk_watch_release() {
         "release-then-SETTLE: a non-final release must NOT take the live \
          installation's renewal away from the surviving holder"
     );
-    let survivor_installation = consumer
-        .node
-        .sensing_lease_holder_installation_for_test(&slower)
-        .expect("the survivor's holder is still live — not merely releasable");
-    // The cadence RELAXES to the survivor's own request. A regression that
-    // left the aggregate pinned at the departed strict owner's 2s fails here,
-    // which a disarm-all assertion cannot see.
-    until("the survivor's cadence never relaxed", SETTLE, || {
-        consumer
-            .node
-            .sensing_consumer_cell_interval_for_test(&branch)
-            == Some(SLOWER_SAMPLE_INTERVAL)
-    })
+    // AUTHORITATIVE cadence first: the registry's own installed interval is
+    // what a future renewal re-authors from, so a regression that relaxed only
+    // the local cell — or only the emitted preview — is caught here. Exactly
+    // one holder remains, at the survivor's own 4s.
+    until(
+        "the survivor's registry cadence never relaxed",
+        SETTLE,
+        || {
+            consumer
+                .node
+                .sensing_lease_entry_for_ticket_for_test(&slower)
+                == Some((1, SLOWER_SAMPLE_INTERVAL))
+        },
+    )
     .await;
     assert_eq!(
         consumer
             .node
+            .sensing_consumer_cell_interval_for_test(&branch),
+        Some(SLOWER_SAMPLE_INTERVAL),
+        "and the local cell agrees with the registry"
+    );
+    assert_eq!(
+        consumer
+            .node
             .sensing_lease_holder_installation_for_test(&slower),
-        Some(survivor_installation),
-        "and it is the SAME installation, still owned, still renewed"
+        Some(installation_before),
+        "the SAME installation is still held — still owned, still renewed"
     );
     assert!(
         consumer.node.sensing_observation_count() >= 1,
@@ -2386,6 +2525,13 @@ async fn a_slower_raw_holder_survives_the_sdk_watch_release() {
             .sensing_lease_holder_installation_for_test(&slower),
         None,
         "the survivor's own release really removed its holder"
+    );
+    assert_eq!(
+        consumer
+            .node
+            .sensing_lease_entry_for_ticket_for_test(&slower),
+        None,
+        "and the registry entry itself is gone"
     );
     until(
         "the final release never deregistered the row",
