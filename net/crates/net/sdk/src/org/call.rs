@@ -647,6 +647,9 @@ impl OrgClient {
         }
         expected.sort_unstable();
         expected.dedup();
+        // Instrumented: the expectation THIS attempt derived from its own
+        // capture, recorded before anything acts on it.
+        acquisition.schedule().note_expectation(&expected);
 
         let now = Instant::now();
         // ONE section: decide, converge, record. `retain` is synchronous and
@@ -654,9 +657,15 @@ impl OrgClient {
         {
             // Instrumented: this caller has ARRIVED at the section's door. It
             // is counted before the lock, so a witness can tell contention
-            // from mere spawning.
+            // from mere spawning; the lock itself counts the callers that
+            // found it HELD, which is contention observed at acquisition.
             acquisition.schedule().note_arrival();
             let _txn = acquisition.reconcile_lock();
+            // Declared AFTER the guard, so its drop - the end of the whole
+            // transaction - runs while the guard is still held. Two callers
+            // inside this span at once means the transaction was not
+            // serialized, whatever the observer hook below saw.
+            let _span = acquisition.schedule().section_span();
             acquisition.schedule().fire_in_section();
             let installed = family.demand(capability);
             if expected.is_empty() {
