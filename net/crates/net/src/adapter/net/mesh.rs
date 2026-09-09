@@ -7047,6 +7047,15 @@ pub(crate) struct OrgSensingDemandCounters {
     /// Carried-forward holders whose installation was INVALIDATED under them,
     /// so the convergence re-acquired rather than copying dead ownership.
     ownership_invalidated: AtomicU64,
+    /// Carried-forward holders dropped because the ticket's key names a
+    /// DIFFERENT audience than the one this convergence derived - the owner
+    /// organization moved out from under the demand.
+    ///
+    /// Deliberately not folded into `ownership_invalidated`: "somebody else
+    /// invalidated my installation" and "the authority I registered under is
+    /// no longer mine" are different operational stories with different
+    /// remedies, and a single tally told neither.
+    audience_rotated: AtomicU64,
 }
 
 impl OrgSensingDemandCounters {
@@ -7070,6 +7079,12 @@ impl OrgSensingDemandCounters {
     pub(crate) fn note_ownership_invalidated(&self, count: u64) {
         self.ownership_invalidated
             .fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// `count` carried-forward holders were dropped because their key's
+    /// audience is no longer the one this node derives for the capability.
+    pub(crate) fn note_audience_rotated(&self, count: u64) {
+        self.audience_rotated.fetch_add(count, Ordering::Relaxed);
     }
 
     /// A retention could not be authored under live organization authority.
@@ -7158,6 +7173,9 @@ pub struct OrgSensingDemandState {
     /// invalidated: the ownership was no longer real, so the provider was
     /// re-acquired instead of reported as retained forever.
     pub ownership_invalidated: u64,
+    /// Carried-forward holders dropped because the owner organization rotated
+    /// under them, so the ticket's audience is no longer this node's.
+    pub audience_rotated: u64,
     /// Refused releases still retained RIGHT NOW, awaiting retry.
     pub refused_release_outstanding: u64,
     /// Installations currently armed for refresh.
@@ -15636,6 +15654,7 @@ impl MeshNode {
             refused_release_reclaimed: counters.refused_release_reclaimed.load(Ordering::Relaxed),
             refused_release_overflow: counters.refused_release_overflow.load(Ordering::Relaxed),
             ownership_invalidated: counters.ownership_invalidated.load(Ordering::Relaxed),
+            audience_rotated: counters.audience_rotated.load(Ordering::Relaxed),
             refused_release_outstanding: schedule.refused.len() as u64,
             armed: schedule.armed.len() as u64,
             worker_started: schedule.worker.is_some(),

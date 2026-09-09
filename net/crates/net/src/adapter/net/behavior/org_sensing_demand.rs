@@ -810,9 +810,29 @@ impl OrgSensingFamily {
         // was perfectly valid when it was committed. That is a property of the
         // observation, not of the ticket, and asserting on it panicked
         // debug-assertion builds on legitimate movement.
+        //
+        // Ownership being real is still not enough on its own. A ticket also
+        // has to have been minted under the audience this convergence just
+        // derived. `SensingLeaseKey::ExactProvider` is audience-keyed, but the
+        // authorized population is NOT: it is derived from the capability tag,
+        // expiry and revocation floors projected through the TOFU pin map
+        // (`owner_private_capability_providers`), with no owner-organization
+        // predicate anywhere on that path. So an A->B owner-org rotation
+        // leaves `wanted` byte-identical while every retained key still names
+        // A. Carrying those forward made the demand simultaneously BELIEVED
+        // CONVERGED by the SDK (the providers report as retained under the new
+        // stamp, so the reconciler stops) and UNREFRESHABLE by the node
+        // (`prepare_org_egress` cannot author an A-keyed egress under a B
+        // view, so every renewal answers `AuthorityUnavailable`) - a
+        // permanently dark demand that only `retire(tag)` could clear.
+        //
+        // The ticket's own key carries the audience, so this is a comparison,
+        // not a second observation, and it is counted apart from ownership
+        // invalidation because the two mean different things to an operator.
         let mut carried: Vec<RetainedProvider> = Vec::new();
         let mut departed: Vec<RetainedProvider> = Vec::new();
         let mut invalidated = 0u64;
+        let mut rotated = 0u64;
         if let Some(previous) = &previous {
             for retained in &previous.retained {
                 let moved = RetainedProvider {
@@ -832,6 +852,25 @@ impl OrgSensingFamily {
                     invalidated += 1;
                     continue;
                 }
+                if moved.key.audience() != audience {
+                    // The owner organization moved under this demand. Ownership
+                    // is real - the check above just proved it - but it is
+                    // ownership of the FORMER audience's key, which this node
+                    // can no longer renew.
+                    //
+                    // RELEASED, not merely dropped. A dropped reference would
+                    // leak the holder and its lease budget for good, since no
+                    // later convergence would ever see the ticket again. The
+                    // release is also the leg most likely to succeed: it needs
+                    // organization authority only for a surviving-holder
+                    // `Reregister`, so the ordinary single-holder case is a
+                    // `Deregister`, which tears the row down with no membership
+                    // claim at all. A refusal parks the ticket for paced retry
+                    // rather than losing it.
+                    rotated += 1;
+                    departed.push(moved);
+                    continue;
+                }
                 if wanted.binary_search(&retained.provider).is_ok() {
                     carried.push(moved);
                 } else {
@@ -842,6 +881,10 @@ impl OrgSensingFamily {
         if invalidated > 0 {
             node.org_sensing_demand_counters()
                 .note_ownership_invalidated(invalidated);
+        }
+        if rotated > 0 {
+            node.org_sensing_demand_counters()
+                .note_audience_rotated(rotated);
         }
         let already: Vec<u64> = carried.iter().map(|r| r.provider).collect();
         let mut retained = carried;
@@ -2040,6 +2083,97 @@ mod tests {
         );
         node.clear_sensing_phase_two_seam_for_test();
         drop(demand);
+        drop(family);
+    }
+
+    /// An owner-organization ROTATION must not carry retained tickets forward.
+    ///
+    /// The authorized population is derived from the capability tag, expiry and
+    /// revocation floors through the TOFU pin map — there is no owner-org
+    /// predicate anywhere on that path — so an A→B rotation leaves the wanted
+    /// set BYTE-IDENTICAL while every retained key still names A. A carry
+    /// predicate that asks only "is this token still a live holder of its own
+    /// installation" therefore says yes, and the provider is skipped by the
+    /// acquisition loop.
+    ///
+    /// The witness reads the retained KEY'S AUDIENCE, not the retained provider
+    /// list: `retained_providers()` is satisfied under the bug too. That is the
+    /// whole difficulty — the demand reported itself converged under the new
+    /// stamp while the node could never renew the lease again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_owner_org_rotation_reacquires_under_the_new_audience() {
+        let node = demand_node("carry-audience-rotation", Duration::from_secs(30)).await;
+        let family = OrgSensingFamily::mint(&node).expect("mint");
+        let provider = node.node_id().wrapping_add(1);
+
+        let before = family.reconcile(TAG, &[provider]).expect("retain");
+        let audience_a = audience_of(&node);
+        let key_a = lease_key_for(&node, provider);
+        assert_eq!(before.audience(), audience_a);
+        assert_eq!(before.retained.len(), 1);
+        assert_eq!(before.retained[0].key.audience(), audience_a);
+        assert_eq!(
+            node.sensing_lease_holder_installation(&before.retained[0].ticket),
+            Some(before.retained[0].installation_id),
+            "precondition: the A-audience ticket is a LIVE holder of its own              installation — exactly what made the membership-only predicate              carry it across the rotation"
+        );
+        assert_eq!(holders(&node, &key_a), Some(1));
+        drop(before);
+
+        // ROTATE the owner organization. Reachable only by relinquishing first:
+        // the one-owner rule refuses a direct cross-org install.
+        node.clear_node_authority_for_test();
+        node.install_node_authority(adopt(&node, &other_org(), "carry-audience-rotated"))
+            .expect("install a foreign owner");
+        let audience_b = audience_of(&node);
+        assert_ne!(audience_a, audience_b, "precondition: the audience moved");
+
+        let after = family.reconcile(TAG, &[provider]).expect("retain under B");
+        assert_eq!(
+            after.retained_providers(),
+            vec![provider],
+            "the population carries no owner-org predicate, so the provider is              still wanted — the bug and the fix agree on exactly this much"
+        );
+        assert_eq!(after.audience(), audience_b);
+        assert_eq!(
+            after.retained[0].key.audience(),
+            audience_b,
+            "THE property: the retained holder is registered under the audience              the demand reports. Carrying the A-keyed ticket forward satisfied              `retained_providers()` while leaving the lease unrenewable forever"
+        );
+
+        let state = node.org_sensing_demand_state_for_test();
+        assert_eq!(
+            state.audience_rotated, 1,
+            "the drop is counted as a ROTATION — 'the authority I registered              under is no longer mine' is a different operational story from              'somebody invalidated my installation'"
+        );
+        assert_eq!(
+            state.ownership_invalidated, 0,
+            "and it must not be charged to the ownership class"
+        );
+
+        // The A-keyed holder is RELEASED, not leaked: this demand was its only
+        // holder, so the release previews `Deregister`, which needs no
+        // membership claim and therefore succeeds under the foreign owner.
+        assert_eq!(
+            holders(&node, &key_a),
+            None,
+            "the former audience's lease must not outlive the rotation holding              this node's lease budget with nothing able to release it"
+        );
+
+        // And the fresh B-audience holder really renews — which is precisely
+        // what the carried ticket could never do.
+        let key_b = lease_key_for(&node, provider);
+        assert_eq!(holders(&node, &key_b), Some(1));
+        let installation_b = node
+            .sensing_refresh_installation(&key_b)
+            .expect("installed under B");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            node.refresh_sensing_interest_lease(&key_b, installation_b),
+            SensingRefreshOutcome::Renewed,
+            "the point of re-acquiring: this demand can actually be kept alive"
+        );
+        drop(after);
         drop(family);
     }
 
