@@ -6299,6 +6299,16 @@ struct OrgEgressCounters {
 /// counter says so.
 const MAX_PENDING_ORG_EGRESS: usize = 128;
 
+/// How many refused releases the refresh worker discharges between yields.
+///
+/// Strictly below [`MAX_PENDING_ORG_EGRESS`] because each discharge enqueues at
+/// most one frame and the queue's consumer is a SEPARATE task: on a
+/// current-thread runtime it cannot be polled until this worker yields, so a
+/// batch longer than the queue evicts its own oldest frames. Well below it, to
+/// leave the queue headroom for the emissions everything else on the node is
+/// producing at the same time.
+const ORG_EGRESS_DRAIN_STRIDE: usize = 32;
+
 /// How long `shutdown` lets the consumer drain before aborting it. A stalled
 /// socket must not stall node shutdown.
 const ORG_EGRESS_DRAIN_GRACE: Duration = Duration::from_secs(1);
@@ -15412,7 +15422,30 @@ impl MeshNode {
                     tokio::task::yield_now().await;
                 }
                 Step::Retry(pending) => {
-                    for entry in pending {
+                    // COOPERATIVE PROGRESS INSIDE the batch, not merely after
+                    // it. The retention set is bounded by
+                    // `MAX_SENSING_REFUSED_RELEASES`
+                    // (`MAX_LEASED_INTERESTS * MAX_HOLDERS_PER_INTEREST`), and
+                    // every iteration enqueues into `OrderedSensingEgress` — a
+                    // `MAX_PENDING_ORG_EGRESS`-slot queue drained by a SEPARATE
+                    // task. Draining the whole set in one poll therefore
+                    // overran the queue on a current-thread runtime, where the
+                    // consumer cannot be polled until this loop yields, and the
+                    // overflow evicts the OLDEST pending frame — predominantly
+                    // the `Deregister`s, which have no re-driver at all, so the
+                    // upstream registration simply survived. Yielding every
+                    // stride keeps the queue's occupancy bounded by the stride
+                    // rather than by the whole set.
+                    //
+                    // The node handle is HELD across this yield, unlike the
+                    // `Park`/`Idle` arms which drop it first. Those wait an
+                    // unbounded time and must never be what keeps the node
+                    // alive; a yield resumes on the next scheduler pass, and
+                    // the batch below still owns tickets it has to put back.
+                    for (drained, entry) in pending.into_iter().enumerate() {
+                        if drained > 0 && drained.is_multiple_of(ORG_EGRESS_DRAIN_STRIDE) {
+                            tokio::task::yield_now().await;
+                        }
                         let provider = entry.provider;
                         if live
                             .try_release_sensing_interest_lease(entry.ticket)
