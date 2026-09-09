@@ -1290,43 +1290,97 @@ async fn a_superseded_private_attempt_constructs_no_intent() {
 
 /// The exported attempt has the same sequence: select, compare, then mint.
 ///
-/// Its derivation refuses on an empty public plane, so this witness pairs the
-/// superseded arm with a construction count rather than with a minted intent —
-/// and asserts the count stays at zero in BOTH the refusing-current and the
-/// superseded cases, because neither may construct a proof.
+/// This needs a REACHABLE exported candidate to say anything. An empty public
+/// plane refuses before selection, so both legs construct nothing no matter
+/// where the mint sits — a witness built on it passes with the construction
+/// moved ahead of the comparison (PR #933 F2, reproduced by the reviewer in an
+/// isolated build). So the provider here is a signed owner-cert announcement
+/// on the plaintext plane, pinned to its own entity: exactly what
+/// `public_owned_service_providers` requires, and the same candidate on both
+/// legs.
+///
+/// Dies to moving `intent_for` back before the comparison: the superseded arm
+/// selects that candidate and would construct an intent it throws away.
 #[tokio::test]
 async fn a_superseded_exported_attempt_constructs_no_intent() {
     let a = org_a();
     let (mesh, identity, dir) = mesh_with_authority("cold-mint-order-exported", Some(&a)).await;
-    let client = bind(&mesh, &a, &identity, vec![]);
+    let service = "public.svc";
     let capability = cap("nrpc:public.svc");
-    let authority = mesh.node().org_cold_authority().expect("authority capture");
 
-    let before = super::call::intents_constructed_on_this_thread();
-    assert!(
-        client
-            .plan_exported_attempt(&capability, "public.svc", &authority)
-            .is_err(),
-        "control: the empty public plane refuses while the capture is current"
-    );
+    // A verified owner projection on the PUBLIC plane: signed, carrying this
+    // organization's membership cert, and pinned so the exported query's
+    // entity-identity check holds.
+    let provider = EntityKeypair::generate();
+    let cert = OrgMembershipCert::try_issue(&a, provider.entity_id().clone(), 1, 3600)
+        .expect("provider cert");
+    let mut announcement = CapabilityAnnouncement::new(
+        provider.entity_id().node_id(),
+        provider.entity_id().clone(),
+        1,
+        CapabilitySet::new().add_tag("nrpc:public.svc"),
+    )
+    .with_ttl(300)
+    .with_owner_cert(Some(cert));
+    announcement.sign(&provider);
+    mesh.node()
+        .test_inject_capability_announcement(announcement);
+    mesh.node()
+        .test_pin_peer_entity(provider.entity_id().node_id(), provider.entity_id().clone());
     assert_eq!(
-        super::call::intents_constructed_on_this_thread(),
-        before,
-        "a refusal constructs no intent"
+        mesh.node().public_owned_service_providers(service).len(),
+        1,
+        "precondition: the exported plane really carries one verified, pinned \
+         candidate - an empty plane would make both legs vacuous"
     );
 
-    renew_authority(&mesh, &a, &identity, &dir);
+    let client = bind(&mesh, &a, &identity, vec![]);
+
+    // Positive control FIRST, so a zero delta below cannot come from a plan
+    // that never selects anything.
+    let current = mesh.node().org_cold_authority().expect("authority capture");
+    let before = super::call::intents_constructed_on_this_thread();
     match client
-        .plan_exported_attempt(&capability, "public.svc", &authority)
+        .plan_exported_attempt(&capability, service, &current)
+        .expect("the control derivation succeeds")
+    {
+        super::call::PlanAttempt::Minted(intent) => {
+            assert_eq!(
+                intent.provider,
+                *provider.entity_id(),
+                "control: the exported candidate is the one selected"
+            );
+            assert_eq!(intent.capability, capability);
+        }
+        super::call::PlanAttempt::Superseded { .. } => {
+            panic!("control: an unmoved capture must mint")
+        }
+    }
+    assert_eq!(
+        super::call::intents_constructed_on_this_thread() - before,
+        1,
+        "control: a current exported attempt constructs EXACTLY one intent"
+    );
+
+    // Same candidate, same derivation - only the captured authority has moved.
+    let stale = mesh.node().org_cold_authority().expect("authority capture");
+    renew_authority(&mesh, &a, &identity, &dir);
+    let before = super::call::intents_constructed_on_this_thread();
+    match client
+        .plan_exported_attempt(&capability, service, &stale)
         .expect("a superseded derivation is not an error")
     {
-        super::call::PlanAttempt::Superseded { considered } => assert_eq!(considered, 0),
-        super::call::PlanAttempt::Minted(_) => panic!("nothing was mintable"),
+        super::call::PlanAttempt::Superseded { considered } => assert_eq!(
+            considered, 1,
+            "the superseded leg examined the SAME reachable candidate"
+        ),
+        super::call::PlanAttempt::Minted(_) => panic!("a superseded capture must not mint"),
     }
     assert_eq!(
         super::call::intents_constructed_on_this_thread(),
         before,
-        "and neither does a superseded exported attempt"
+        "a superseded exported attempt must construct NO proof intent - not \
+         even one it discards: the comparison sits BETWEEN selection and the mint"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

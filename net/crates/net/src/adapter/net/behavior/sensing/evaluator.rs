@@ -1984,13 +1984,35 @@ mod tests {
 
         // ...and the guard must not pass by the marker being everywhere:
         // the frozen evaluator-contract types are NOT bridges.
+        //
+        // Searched in the PRODUCTION half of this file only. `evaluator` is
+        // this whole file, test module included, so a declaration string that
+        // does not match the real item still matches the literal below —
+        // `attribute_block` then walks back over test code, finds no
+        // attributes, and the assertion passes having inspected nothing. That
+        // is exactly what `"pub struct EvaluationRequest {"` did: the real
+        // item is `pub struct EvaluationRequest<'a> {`, so this guard was
+        // reading its own array (PR #933). Cutting the tests off makes a
+        // mismatch a hard failure instead of a silent pass.
+        let production = evaluator
+            .split("\nmod tests {")
+            .next()
+            .expect("split always yields a first part");
+        assert!(
+            production.len() < evaluator.len(),
+            "the test module marker moved: this guard would search its own source",
+        );
         for supported in [
-            "pub struct EvaluationRequest {",
+            "pub struct EvaluationRequest<'a> {",
             "pub enum ReadinessEvaluation {",
             "pub trait ReadinessEvaluator {",
         ] {
-            let block = attribute_block(evaluator, supported)
-                .unwrap_or_else(|| panic!("`{supported}` not found"));
+            let block = attribute_block(production, supported).unwrap_or_else(|| {
+                panic!(
+                    "`{supported}` not found in production source — if the \
+                     declaration changed, update it here in the same commit",
+                )
+            });
             assert!(
                 !block.contains("#[doc(hidden)]"),
                 "`{supported}` is part of the SUPPORTED evaluator contract and must \
