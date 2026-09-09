@@ -121,7 +121,7 @@
     "@tailwindcss/postcss": "4.3.3",
     "@tailwindcss/typography": "0.5.20",
     "@tanstack/react-query-devtools": "5.102.8",
-    "@types/node": "24.13.3",
+    "@types/node": "24.13.4",
     "@types/prettier": "3.0.0",
     "@types/react": "19.2.18",
     "@types/react-dom": "19.2.7",
