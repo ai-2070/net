@@ -815,6 +815,11 @@ automatic provider retry, no waiting for actor work.** Preserves exactly:
 `AmbiguousCapabilityGrant`, `NoAuthorizedProvider`, Owner-before-Grant duplicate
 behaviour, provider-byte ordering, first-direct selection, exact considered count.
 
+**Step 1 — the capture, the derivation over it, and the mint gate — is
+IMPLEMENTED at a candidate and NOT SIGNED.** Entered on the user's explicit
+direction while 2B.3c step 2 is unsigned; that authorization is recorded here
+rather than claimed as a signature. Its record is §19.
+
 ## 11. Warmed path and sender boundary (2B.3d)
 
 ```text
@@ -833,6 +838,32 @@ final validation and `MeshNode::call`: no `.await`, no callback, no registry
 operation, no alternative-provider selection.** Authority movement after the
 final comparison is the ordinary linearization race and is accepted; **holding an
 authority lock across a network send is forbidden.**
+
+**Scope of "no scan" (added 2026-08-30).** Every clause above holds unchanged
+for this design's own path and for every witness it owns. One sibling design
+adds a read this section did not contemplate: an **organization-audience
+exact-provider SENSED** call inserts one bounded `sensing_observations`
+critical section, reading at most 32 rows, between candidate derivation and
+selection — see
+[`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md)
+D6.4, with the divergence stated and stop-gated in its D6.8/§12.10. That read
+is on the **observation plane only**: it takes no scoped-store query, performs
+no grant or provider scan, emits no registration, and does not move the
+final-validation → `MeshNode::call` boundary asserted above. **Ordering is the
+one exception, and it is deliberate:** a sensed call performs a **linear stable
+bucket permutation** over the **complete** authorized candidate list — three
+buckets concatenated, `O(C * S)` where `S <= 32` is the **sensed observation-row**
+count and `C` is the complete authorized candidate count, **which is NOT bounded
+by 32** (excess SameOrg providers survive as unsensed `Unknown` fallback and every
+`Granted` candidate is in the list). At most `S + 1` traversals of the complete
+list — step 2 traverses it once per sensed `ranked` entry, step 3 once — and at
+most `2 * S` equality comparisons per candidate. **No comparator over `C`, no `sort_by`, no P2C** (that design's D7.2).
+The existing global sort is untouched and remains the tie-break of record; **no
+comparison sort is added over the complete candidate list**. Sorts *inside* the
+bounded sensing projection helper already exist and are unchanged
+(`scheduler_bridge/readiness.rs:82`, `:84`, `:85`, each over `<= 32` entries) —
+that design's D7.2a inventories them. An unsensed or cold call is byte-for-byte as
+described here.
 
 ## 12. Witnesses
 
@@ -2891,6 +2922,298 @@ otherwise be satisfied by a strictly worse implementation:
   OWNING install.** Without it, "never republish at all" satisfies the
   non-publishing assertion perfectly, and it is the mutation that would make
   every pool on the node permanently stale rather than merely churned.
+
+## 19. 2B.3d-pre step 1 — the candidate record
+
+**Status: candidate `bd0589d1b` was HELD by two independent reviews; a second
+specification review HELD the repair on two further blockers. Both rounds are
+repaired additively — `436fb8c1a`, then `f52116d0b` + `5d02b9156` — and NOTHING
+here is SIGNED.** Entered on the user's explicit
+direction (2026-08-29) while 2B.3c step 2 remains unsigned; this section records
+the authorization, the content, the two HOLDs and the additive repair (§19.6),
+and claims no signature. Independent review owns the boundary.
+
+Nothing below should be read as calling the first candidate complete: it had four
+real defects — a capture that could stamp a predecessor view with the successor
+epoch, a final comparison that was not linearizable across routing and grant
+authority, negative derivations that escaped a superseded view, and an
+every-plane witness that executed no grant plane — plus an unauthorized public
+surface. §19.6 is the record of the first round, §19.7 of the second.
+
+### 19.1 What it changes, mechanism first
+
+The eight steps of §10 existed, spread across five functions that each
+re-sampled the world. Measured on the shipped path, for one capability with `G`
+held DISCOVER grants and `X` cross-org candidates over `g` held grants:
+
+```text
+wall clock                3 + G + X*g samples   ->  1
+revocation floor views    1 + G snapshots       ->  1
+consumer-grant loads      G                     ->  1
+scoped-store sections     1 + G                 ->  1
+installed node authority  read ONCE, at bind    ->  compared per call
+```
+
+The mixed-view classes that removes are concrete, not theoretical: a floor raise
+landing between the owner-plane query and a grant-plane query left one plane
+filtered pre-raise and the other post-raise, so a plan could select a provider
+the org had already revoked while a sibling plane had seen the raise; a
+membership window checked at one instant and a dispatcher window at another let a
+credential set that was never simultaneously valid authorize a call.
+
+```text
+behavior/org_cold_plan.rs   NEW — OrgColdRefusal, OrgColdGrantAuthority,
+                            OrgColdAuthorityStamp, OrgColdAuthority,
+                            OrgColdDiscovery. Data + the shared grant-row
+                            predicate; no query, no clock, no lock
+mesh.rs                     org_cold_discovery, org_cold_authority,
+                            capture_cold (the one implementation),
+                            org_cold_authority_is_current; two cfg(test) gap
+                            hooks; granted_providers_at now shares the pin and
+                            row predicate with the capture
+sdk/org/call.rs             plan / plan_exported loop over plan_attempt;
+                            PlanAttempt; capture_private;
+                            authorized_captured_candidates;
+                            discover_private_captured; select_candidate returns
+                            the CANDIDATE; cold_refusal_error;
+                            COLD_PLAN_ATTEMPTS
+sdk/org/client.rs           check_current_at — the captured-instant twin
+```
+
+`select` was split so the final comparison can sit between selection and the
+mint, which is where §10 puts it: the rows, the grant matching and the chosen
+provider all rest on the captured authority, so a moved authority invalidates the
+whole derivation rather than its last step.
+
+### 19.2 What is preserved, and how that is known
+
+No new error kind. The cross-language vocabulary is frozen with its golden
+fixture, and neither refusal here is a new KIND of failure: a node with no
+installed authority is exactly `NodeAuthorityRequired` (the bind-time refusal,
+now also checked per call), and an authority view that could not be observed
+coherently established no authorized provider, which is what
+`NoAuthorizedProvider` says — with the count the last derivation examined.
+
+The sixteen pre-existing `tests_call` witnesses are the preservation gate and
+pass unchanged: candidate order across planes, the considered count,
+Owner-before-Grant dedup, ambiguity in DISCOVERY order, first-direct selection,
+dispatcher scope, expired membership, both canonical intents.
+
+### 19.3 Witnesses, and the mutation each one dies to
+
+**Superseded by §19.6 for the four defects two independent reviews found.** The
+table below is the FIRST candidate's evidence, kept because the repair's own
+evidence only makes sense beside it — and corrected in two places where it
+overclaimed:
+
+| Witness | Where | Dies to |
+|---|---|---|
+| ~~`a_cold_capture_holds_one_store_section_across_every_plane`~~ | wiring | **RETIRED, twice insufficient.** Version 1 requested ZERO grant planes, so the production grant loop never ran (HOLD-4). Version 2 ran a real grant query but observed the lock only BEFORE the loop, so a split that reacquired around each query held a lock at every observation point and survived (F1). Replaced by `one_cold_capture_acquisition_spans_the_owner_and_grant_queries` — see §19.7. |
+| `an_authority_install_inside_a_cold_capture_is_never_captured_across` | wiring | dropping the epoch RE-CHECK. **Insufficient: it exercised an install COMPLETED after the capture's sample, never the writer's pre-publication window (HOLD-1). Replaced by `an_authority_install_during_a_cold_capture_waits_for_it` plus §19.6's window witness.** |
+| `an_unadopted_node_refuses_the_cold_capture` | wiring | reporting the no-authority arm as churn |
+| `a_spent_authority_epoch_refuses_the_cold_capture` | wiring | dropping the exhaustion check |
+| `a_captured_stamp_compares_the_revocation_floor_generation` | wiring | dropping `floor_generation` from the comparison |
+| `the_cold_capture_serves_exactly_what_the_live_plane_seams_serve` | sdk | not querying the grant planes |
+| `a_captured_stamp_notices_a_consumer_grant_replacement` | sdk | comparing `grant_id` only |
+| `a_plan_attempt_under_a_moved_authority_mints_nothing` | sdk | removing the final comparison. **Necessary but not sufficient: it proves no intent ESCAPES a superseded view, not that none is CONSTRUCTED. Both attempts did construct one before the comparison until F2 (§19.7).** |
+
+Every mutation was applied to production code, run, and reverted; each killed
+exactly the witness above and no other. Three carry adjacent controls that a
+strictly worse implementation would otherwise satisfy: the store-section witness
+proves the same `try_lock` SUCCEEDS once the capture returns; the stamp witnesses
+assert the untouched stamp compares CURRENT; the mint witness derives over an
+unmoved capture and asserts the canonical intent, so "never mint" fails it.
+
+**A real floor raise advances the routing epoch as well as the floor
+generation** on this node, so the end-to-end
+`a_raised_revocation_floor_supersedes_the_capture_it_preceded` proves the
+TRANSITION is caught, not which component caught it. The floor component is
+isolated in the wiring witness above, by naming the generation rather than racing
+the subscriber — the technique
+`facts_built_against_superseded_floors_read_cold` already uses for the same
+window. Both witnesses are kept, and labelled for what each proves.
+
+### 19.4 Deliberately NOT claimed
+
+- **the per-call authority checks are fail-closed, not reachable end-to-end.**
+  `install_node_authority` refuses replacement by a different owner org and there
+  is no uninstall, so a bound client's authority cannot vanish or change org. The
+  capture-level refusals are witnessed directly; no witness claims the SDK-level
+  transition, and none is constructed to imply otherwise.
+- **no witness isolates the single instant.** A two-sample defect only manifests
+  at a boundary instant, which no deterministic test can place without a clock
+  seam this slice does not add. The property is structural: one value is threaded
+  through every window check, and `plan` cannot reach the sampling twin.
+- **the directness pass is unchanged and carries no coherence claim.** It still
+  reads the live peer pin per candidate in sorted order. Folding session state
+  into the captured identity would refuse plans under ordinary peer churn, and
+  session state is reachability, not authority.
+- **the epoch-first SAMPLE ORDER inside the capture is not independently
+  witnessed, and cannot be.** Under the authority gate (§19.6, H1) the epoch
+  cannot move during the observation, so reversing the order is unobservable by
+  construction. The order is kept as the documented discipline — it is the shape
+  that stays correct if a future change moves a read out from under the gate, and
+  the closing re-check is the line that would then fail — but the SAFETY comes
+  from the gate, and this document does not claim a witness for the ordering
+  alone.
+
+### 19.5 Three consequences worth naming
+
+**The capture holds the AUTHORITY GATE and the scoped-store lock** (§19.6, H1;
+the store acquisition goes through `lock_cold_section`, §19.7),
+in the writer's own order. So an authority or store installation now waits for
+one capture rather than interleaving with it — at the gate, and again at the
+store lock its floor reconciliation needs. Bounded by construction: the
+observation performs two indexed lookups per plane, no I/O, no `.await`, and
+takes no third lock, so there is no ordering cycle. Cold captures also serialize
+with each other on the gate; they already serialized on the store lock, so this
+adds no new serialization class.
+
+**The two per-plane seams now have no production caller.**
+`MeshNode::owner_private_capability_providers` and
+`granted_capability_providers` are published API of the `net-mesh` crate and are
+deliberately kept — removing them is a public-API removal this slice is not
+authorized to make — but inside this repo their only remaining caller is the
+drift-guard witness that compares them against the capture. That is stated here
+rather than left for a reader to discover: the seams are the documented per-plane
+query surface, not a second cold path, and the shared pin/row predicate is what
+keeps them from drifting apart.
+
+**The cold plan still does not read the scoped route pool**, and that is the
+design, not an omission: §10's cold plan is the FRESH-authority derivation, and
+the pool is the warmed path's artifact (2B.3d). The pool accessors' consumer
+allows therefore stay exactly where 2B.3c left them.
+
+### 19.6 The two independent HOLDs, and the additive repair
+
+Two independent reviews of `bd0589d1b` returned **HOLD** with six blockers
+between them. All six are repaired additively at `436fb8c1a` (neither candidate
+commit amended), and the repair's own inverse mutations are below. Recording this
+in the plan rather than only in a commit message, because the first candidate's
+§19 asserted properties two of its witnesses did not hold.
+
+| # | Blocker | Repair |
+|---|---|---|
+| **H1** | The capture loaded the authority and revocation view before sampling the epoch, and `move_routing_authority` advances the epoch BEFORE publishing the successor — so a capture inside that interval stamps a PREDECESSOR view with the SUCCESSOR epoch, and a same-org replacement whose floors and poison bit happen to match aliases past the comparison. | The observation runs under the **authority gate**, so the interval is unobservable; the epoch is sampled before the views it qualifies, with the closing re-check kept as a structural assertion. Ordering alone could not fix it, and pointer identity is rejected by this crate as ABA-vulnerable — the repair is to make the epoch sample trustworthy. |
+| **H2** | The final comparison sampled routing and then grants independently, so a vector no instant ever held could compare equal (install X, sample routing, replace routing, remove X, load grants). | Linearizable comparison: grant snapshot A → coherent routing sample → grant snapshot B, both matching the stamp, plus `ConsumerGrantSnapshot::revision()` equality proving no grant publication straddled the sample. Bounded re-establishment on unrelated churn, fail-closed on exhaustion, and no lock — so no authority lock crosses the send. |
+| **H3** | Candidate derivation and selection used `?`, so a stale `NoAuthorizedProvider`, `ProviderNotDirect`, `AmbiguousCapabilityGrant` or credential refusal escaped from a superseded view and outside the bounded budget. | Both attempts derive into a VALUE plus the discovery count, run the comparison, and return `Superseded` on movement; the exact error is preserved verbatim when the capture is current. `plan_over` / `plan_exported_over` make the budget and the refusal mapping witnessable. |
+| **H4** | The every-plane witness passed `&[]`, so the production grant loop ran zero iterations. | The witness installs a real consumer DISCOVER grant, ingests a matching granted record through the real verified path, requests that grant id, and asserts the granted plane produced its row. |
+| **H5** | The bridge was ordinary documented public API, which the frozen boundary forbids. | Module, the three types the SDK names and the three `MeshNode` methods are `#[doc(hidden)]` and documented as unstable workspace-internal, not semver-covered; the stamp and grant-pin types became crate-internal; `stamp()` left the public surface (the comparison takes the capture); `tests/org_cold_plan_surface_guard.rs` enforces the attributes, the exact accessor inventory, the absence of any re-export in either crate, and the declaration itself. |
+| **H6** | Stale `intent_for` doc link; §19 overclaims. | Link now names `plan_attempt`; §19.3 carries the corrections above. |
+
+**Repair mutation ledger.** Each mutation was applied to production code, run,
+and reverted; each killed exactly the listed witnesses and nothing else.
+
+| Mutation | Killed |
+|---|---|
+| remove the authority gate from the capture | `a_cold_capture_cannot_observe_the_pre_publication_window`, `an_authority_install_during_a_cold_capture_waits_for_it` (both: the contention signal never arrives) |
+| drop the `A.revision == B.revision` requirement | `a_torn_authority_vector_cannot_compare_current` |
+| restore the single post-routing grant snapshot (the pre-repair shape) | `a_torn_authority_vector_cannot_compare_current` |
+| `?` on derivation/selection before the comparison (private) | `a_superseded_no_provider_derivation_does_not_escape`, `a_superseded_ambiguity_derivation_does_not_escape` |
+| `?` on derivation/selection before the comparison (exported) | `a_superseded_exported_derivation_does_not_escape` |
+| `COLD_PLAN_ATTEMPTS` 3 → 1 | `three_superseded_attempts_refuse_locally_with_the_last_count` |
+| split the store section around the NON-EMPTY grant loop | `a_cold_capture_holds_one_store_section_across_every_plane` |
+| remove `#[doc(hidden)]` from `OrgColdDiscovery` | guard: `the_cold_plan_bridge_is_doc_hidden` |
+| export `OrgColdAuthorityStamp` | guard: `the_bridge_exposes_nothing_the_sdk_does_not_need` |
+| add an SDK `pub use` of a bridge type | guard: `nothing_re_exports_the_bridge` |
+
+**The H1 window witness is driven by the production writer**, not by a test
+seam standing in for it: `pre_publish_hook` fires inside
+`move_routing_authority` with the gate held, after the advance and before the
+publication, and `contention_hook` proves the capture reached the gate before the
+witness asserts it has not returned. Determinism comes from those two signals,
+never from elapsed time, and the capture thread is joined by the test rather than
+by the hook (joining under the gate would wait on a thread waiting on the hook).
+
+**Still not claimed after the repair**, in addition to §19.4: no witness places
+movement between the successful comparison and `intent_for`/the core mint (§11
+accepts that linearization, and remote admission is final); no witness covers a
+peer-session change after reachability annotation; and the exported plane has no
+live public-provider movement witness — its superseded gating is witnessed on an
+empty plane.
+
+### 19.7 The specification review's two blockers, and their repair
+
+A second independent review ACCEPTED H1/H2/H3 and found two remaining blockers.
+Repaired at `f52116d0b`, with one corrective commit `5d02b9156` (below).
+
+**F1 — the every-plane evidence did not prove one ACQUISITION.** The repaired
+witness ran a real installed+ingested grant row, but its only lock observation
+was immediately BEFORE the grant loop. A split that dropped the guard after the
+owner plane and reacquired around each grant query therefore held a lock at
+every observation point, returned the right row, and released after the capture —
+it survived. Contention cannot express the property; identity can:
+
+```text
+capture_cold  ->  self.lock_cold_section()      the ONLY acquisition allowed here
+                  cfg(test): stamps a per-acquisition SECTION IDENTITY + counter
+
+pre-loop hook     rival try_lock fails; identity I; count N
+in-query hook     fired INSIDE the grant loop, AFTER that grant's real query
+                  produced its rows: rival try_lock fails; identity STILL I
+after capture     lock free; exactly ONE section opened for the capture
+```
+
+The in-query hook carries the query's row count, so an empty grant list cannot
+masquerade as an executed query, and the witness also asserts the row reached the
+returned capture.
+
+**Two legs, and neither is claimed to do the other's work.** A split that
+reacquires THROUGH the helper moves the identity and the count — the runtime
+witness dies. A split that BYPASSES the helper with a bare
+`scoped_discovery.lock()` stamps no identity, so the runtime witness passes; that
+case is caught by the structural leg,
+`org_cold_plan_surface_guard::the_cold_capture_holds_exactly_one_store_acquisition`,
+which asserts `capture_cold` contains exactly one `lock_cold_section()` call,
+zero bare acquisitions, and both production plane queries inside the section. The
+guard is non-vacuous by construction: it must find the function and both query
+calls, or its assertions cannot pass. It is CI-pinned in the no-features step
+beside `doc_link_guard`.
+
+**F2 — both attempts constructed the proof intent BEFORE the comparison.** No
+intent escaped, every behavioural assertion held, and the sequence was still
+wrong: §10 puts the comparison between selection and the mint, and the bridge and
+plan docs said so while the code minted first. Each attempt now derives and
+selects into an inert `AuthorizedOrgCandidate` result, runs the whole-vector
+comparison, and only then calls `intent_for`. A `cfg(test)` thread-local counter
+in `intent_for` makes the sequence observable rather than asserted.
+
+**What the F2 evidence proves, exactly:**
+
+- `a_superseded_private_attempt_constructs_no_intent` — positive control first (a
+  current capture constructs EXACTLY one), then a superseded capture constructs
+  ZERO. This is the load-bearing runtime witness.
+- `a_superseded_exported_attempt_constructs_no_intent` — the exported superseded
+  arm and the exported current-refusal arm both construct zero. **It does NOT
+  witness the exported ordering**: its derivation refuses on an empty public
+  plane, so `intent_for` is unreachable either way, and it PASSES under the
+  pre-repair exported shape. The exported ordering is held by the structural leg
+  `both_cold_plan_attempts_mint_after_the_comparison`; a real exported mint is
+  exercised live by
+  `sdk::org::tests_live::live_call_exported_reaches_a_subnet_exported_service`. A
+  unit-level exported mint would need an owned public projection, which requires
+  a core-internal fold helper the SDK test crate cannot reach — stated rather
+  than papered over.
+
+**F-round mutation ledger.** Applied to production, run, reverted.
+
+| Mutation | Runtime witness | Structural guard |
+|---|---|---|
+| drop after the owner plane, reacquire per grant query THROUGH the helper | **FAIL** (`identity … left: 1 right: 2`) | **FAIL** (two acquisitions) |
+| same split with a BARE `scoped_discovery.lock()` | passes — a bare acquisition stamps no identity, by construction | **FAIL** (bare acquisition present) |
+| query the grant plane with the section RELEASED | **FAIL** (`still held INSIDE the grant query`) | passes (one acquisition, none bare) |
+| private attempt mints inside the derivation (pre-repair shape) | **FAIL** (`right: 1` — the superseded arm constructed one) | **FAIL** (mint precedes compare) |
+| exported attempt mints inside the derivation | passes — the derivation refuses first (see above) | **FAIL** (mint precedes compare) |
+
+**One process failure, recorded rather than hidden.** While running the F1
+ledger I reverted `mesh.rs` with `git checkout` before the F1 production change
+was committed, lost it, and reapplied it with anchored replacements. The anchors
+matched the mutated text, so one probe — a `drop` plus a bare per-grant
+acquisition, i.e. exactly the F1 defect — was reapplied and COMMITTED in
+`f52116d0b`. The structural leg in that same commit rejects it; `5d02b9156`
+restores the single acquisition, and both legs are green. The lesson is the
+mechanical one: commit before mutating, and re-run the guard after any
+reapplication.
 
 ## Open questions
 

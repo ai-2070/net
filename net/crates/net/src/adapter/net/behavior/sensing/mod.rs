@@ -78,6 +78,7 @@ pub use lease::{
     LeaseAction, LeaseRefused, LeaseToken, SensingInterestLeases, SensingLeaseKey,
     SensingLeaseTicket,
 };
+pub(crate) use lease::{LeasePlane, MAX_HOLDERS_PER_INTEREST, MAX_LEASED_INTERESTS};
 pub use negotiation::{select_sensing_path, SensingPath, SENSING_CAPABILITY_TAG};
 pub use org_gate::{
     canonical_org_sensing_commitment, verify_org_sensing_registration, OrgSensingRejection,
@@ -85,9 +86,12 @@ pub use org_gate::{
 };
 pub(crate) use org_gate::{
     capture_current_sensing_stamp, capture_live_org_relay_membership,
-    capture_sensing_authority_snapshot, plan_provider_continuation, AdmittedSensingRegistration,
-    LiveOrgRelayMembership, RegistrationAuthority, RegistrationLeg, RelayMembershipUnavailable,
-    SensingAuthoritySnapshot, SensingAuthorityUnavailable,
+    capture_sensing_authority_snapshot, count_org_rejection, plan_local_org_provider_registration,
+    plan_provider_continuation, selector_names_target, validate_org_frame_shape,
+    verify_org_admission, with_fenced_current_authority, AdmittedSensingRegistration,
+    LiveOrgRelayMembership, LocalOrgEgress, RegistrationAuthority, RegistrationLeg,
+    RelayMembershipUnavailable, SensingAuthoritySnapshot, SensingAuthorityStamp,
+    SensingAuthorityUnavailable,
 };
 #[cfg(feature = "redex")]
 pub use rendezvous::{
@@ -125,10 +129,15 @@ pub use table::{
     DownstreamEntry, DownstreamId, InterestTable, RefusalPartition, RegisterOutcome, UpstreamAction,
 };
 
+// S0 item 7: only the opaque cross-crate id and its refusal are public.
+// The registry itself, its storage, its mutation methods, and the
+// publication fence are crate-internal — the supported surface is the
+// `MeshNode` lifecycle seams, not a second registry API.
+pub(crate) use evaluator::ReadinessEvaluators;
 pub use evaluator::{
     check_cadence, project_evaluation, validate_interest_constraints, CadenceRefusal,
-    EvaluationRequest, ReadinessEvaluation, ReadinessEvaluator, SensingCounters, StatusReason,
-    DEFAULT_ATTESTATION_CADENCE_FLOOR,
+    EvaluationRequest, EvaluatorInstallRefusal, EvaluatorRegistrationId, ReadinessEvaluation,
+    ReadinessEvaluator, SensingCounters, StatusReason, DEFAULT_ATTESTATION_CADENCE_FLOOR,
 };
 
 pub use continuity::{

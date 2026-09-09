@@ -193,6 +193,16 @@ pub mod a2a;
 pub mod subnet;
 #[cfg(feature = "net")]
 pub mod subnets;
+// Capability sensing — the PROVIDER lifecycle only: `provide`, the
+// ownership-safe registration handle, and state-edge notification. See
+// CAPABILITY_SENSING_SDK_INTEGRATION_PLAN.md §4.4/§4.5. There is no
+// query, watch, snapshot, or readiness projection in this slice. The
+// core does now author a dark own-organization exact-provider lease,
+// but acquisition is not a projection — the module docs record what is
+// implemented there and what is still absent above it. Rides `net`:
+// every operation is node state on a live `MeshNode`.
+#[cfg(feature = "net")]
+pub mod sensing;
 
 // Aggregator + lifecycle surfaces. Aggregator-daemon clients
 // (`RegistryClient`, `FoldQueryClient`) + the daemon-author
@@ -309,6 +319,18 @@ pub use crate::a2a::{
 };
 #[cfg(feature = "net")]
 pub use crate::subnets::{SubnetId, SubnetPolicy};
+// Capability-sensing PROVIDER convenience re-exports (S1): the trait an
+// integration implements, its result model, the registration handle,
+// and the loud refusal. The incarnation derivation stays behind
+// `net_sdk::sensing::` so the crate root does not grow a second sensing
+// surface. There is no query, watch, or projection surface here — the
+// core's own-organization exact-provider acquisition is not re-exported
+// and grows no SDK vocabulary; see the module docs.
+#[cfg(feature = "net")]
+pub use crate::sensing::{
+    EvaluationRequest, ReadinessEvaluation, ReadinessEvaluator, ReadinessRegistration,
+    SensingClient, SensingError,
+};
 
 impl NetBuilder {
     /// Build and start the node.

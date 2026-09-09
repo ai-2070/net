@@ -48,7 +48,12 @@ use bytes::Bytes;
 use serde::{de::DeserializeOwned, Serialize};
 
 use net::adapter::net::behavior::org_admission::CoarseAdmissionReason;
+use net::adapter::net::behavior::org_cold_plan::{
+    OrgColdAuthority, OrgColdDiscovery, OrgColdRefusal,
+};
 use net::adapter::net::behavior::org_scoped_store::PrivateCapabilityProvider;
+use net::adapter::net::behavior::org_sensing_demand::org_sensed_bucket_permutation;
+use net::adapter::net::behavior::sensing::ConsumerLatencyBudget;
 use net::adapter::net::identity::EntityId;
 use net::adapter::net::mesh_rpc::{CallOptions, RpcError};
 
@@ -81,6 +86,18 @@ struct Candidate {
     provider: EntityId,
     owner_org: net::adapter::net::behavior::org::OrgId,
     same_org: bool,
+    /// Discovered on the OWNER-PRIVATE plane, as opposed to under a held
+    /// DISCOVER grant or on the public exported plane.
+    ///
+    /// Distinct from [`Self::same_org`], and deliberately so: a grant issued
+    /// by this organization to itself is valid, and its provider is same-org —
+    /// but it was never in owner-private discovery, which is the ONLY domain
+    /// core's sensed population is derived from
+    /// (`MeshNode::org_sensing_authorized_population`). Classifying by owner
+    /// org alone made the sensing expectation ask for a provider core cannot
+    /// publish, so the two sides never agreed and every call past the floor
+    /// reconverged the same unchanged owner population.
+    owner_plane: bool,
 }
 
 /// A discovered provider this credential set is authorized to invoke
@@ -103,8 +120,32 @@ pub(crate) struct AuthorizedOrgCandidate {
     /// (OA2-E0.3: protected RPC is direct-session-only). Annotated here, never
     /// a filter on authorization.
     pub(crate) direct: bool,
+    /// Whether owner-private discovery produced this candidate — the SENSING
+    /// domain, carried forward from [`Candidate::owner_plane`]. Never an
+    /// authorization input: a granted candidate is invoked exactly as before.
+    pub(crate) owner_plane: bool,
     /// The capability being invoked.
     pub(crate) capability: CapabilityAuthorityId,
+}
+
+/// The outcome of one cold-plan derivation over one capture (OLB-2B.3d-pre).
+///
+/// `Superseded` is not an error: nothing was sent, nothing was signed, and the
+/// caller re-derives from a fresh capture. It is a value rather than a bool so a
+/// superseded attempt cannot be mistaken for "no candidates".
+#[derive(Debug)]
+pub(crate) enum PlanAttempt {
+    /// The captured authority still held, so exactly one proof intent exists.
+    ///
+    /// Boxed for the reason [`Mode::Granted`] is: the intent carries the whole
+    /// credential set, and the superseded arm carries a `usize`.
+    Minted(Box<OrgProofIntent>),
+    /// The captured authority moved before the mint. Carries the count this
+    /// derivation examined, so the eventual refusal reports a real number.
+    Superseded {
+        /// Private candidates examined before authority filtering.
+        considered: usize,
+    },
 }
 
 impl OrgClient {
@@ -158,9 +199,22 @@ impl OrgClient {
     /// This is the seam the C ABI's `net_org_call` reaches so a Go `Call(ctx,
     /// ..)` can carry a real deadline and cancel a call **in flight**, rather
     /// than only abandoning its own wait while an authorized side effect keeps
-    /// executing. Neither argument is an authorization input: they select no
-    /// provider, no grant, and no authority — the `plan()` decision is byte-for-
-    /// byte identical to `call_bytes`. `deadline_ms == 0` means the facade
+    /// executing. Neither argument is an AUTHORIZATION input: they select no
+    /// grant and no authority, and they can never widen what this caller may
+    /// invoke.
+    ///
+    /// `deadline_ms` is nonetheless a SELECTION input, and deliberately so:
+    /// `plan()` turns it into a [`ConsumerLatencyBudget`], which is what lets
+    /// the sensed order prefer a provider that can actually start in time. So
+    /// the same call issued with a tight deadline and with none can land on
+    /// DIFFERENT providers whenever a sensed-viable provider's route estimate
+    /// plus start estimate straddles the budget. That is the point of sensing,
+    /// not a leak — but it does mean a caller cannot predict the target from
+    /// the request alone, which matters when it has pre-reserved a cancel
+    /// token. Authorization, admission mode, grant matching and the
+    /// request-bound proof are all unchanged either way.
+    ///
+    /// `deadline_ms == 0` means the facade
     /// default; `cancel_token == 0` means uncancellable. Reserve the token with
     /// [`reserve_cancel_token`](Self::reserve_cancel_token) BEFORE calling.
     ///
@@ -174,8 +228,15 @@ impl OrgClient {
         deadline_ms: u64,
         cancel_token: u64,
     ) -> Result<Bytes, OrgSdkError> {
-        let intent = self.plan(service)?;
+        let intent = self.plan(service, deadline_ms)?;
         let provider = intent.provider.clone();
+        // Instrumented builds only: record WHICH provider planning selected,
+        // so a witness can attribute an outcome even when the send fails and
+        // no reply names anyone.
+        #[cfg(all(feature = "cortex", any(test, feature = "fixtures")))]
+        {
+            *self.selected.lock() = Some(provider.clone());
+        }
 
         let mut opts = CallOptions {
             org_proof_intent: Some(intent),
@@ -325,25 +386,388 @@ impl OrgClient {
         self.node.cancel(token);
     }
 
-    /// Everything `call` does before touching the network: capability
-    /// derivation, the stage-3 temporal recheck, private discovery, mode
-    /// classification, exact grant matching, deterministic selection, and the
-    /// canonical proof intent.
+    /// Everything `call` does before touching the network: the coherent
+    /// authority/discovery capture, the stage-3 temporal recheck, mode
+    /// classification, exact grant matching, deterministic selection, the final
+    /// coherent authority comparison, and the canonical proof intent.
     ///
     /// Split out so the whole authority decision is witnessable without a
     /// provider: `call` is exactly this plus encode → `MeshNode::call` → decode.
-    pub(crate) fn plan(&self, service: &str) -> Result<OrgProofIntent, OrgSdkError> {
-        let capability = CapabilityAuthorityId::for_tag(&nrpc_tag(service));
-        let (candidates, considered) = self.authorized_candidates(&capability)?;
-        self.select(&capability, &candidates, considered)
+    ///
+    /// **The coherent cold plan** (OLB-2B.3d-pre,
+    /// `docs/internal/plans/OLB_2B3B_WARMED_CALL_BOUNDARY_DESIGN.md` §10). Every
+    /// step below reads ONE captured observation of the node's private-discovery
+    /// authority — one instant, one revocation view, one consumer-grant view,
+    /// one scoped-store critical section — instead of re-sampling per credential
+    /// and per plane. Then, before the proof exists, it compares that authority
+    /// identity again and re-derives rather than minting under an identity that
+    /// has moved.
+    ///
+    /// The loop is bounded, and it is not a retry of anything: nothing has been
+    /// sent, no proof has been signed, and no provider has been contacted. A
+    /// re-derivation happens only on node-mediated authority movement (an
+    /// authority or store installation, a floor raise, a poison transition, a
+    /// consumer-grant install/remove/replacement), never on announcement
+    /// traffic — captured rows are values, already filtered per row.
+    ///
+    /// Exhausting the attempts is a LOCAL refusal reported as
+    /// [`OrgDiscoveryError::NoAuthorizedProvider`] with the last derivation's
+    /// considered count: the plan examined that many candidates and could not
+    /// establish an authorized provider under one coherent authority. It never
+    /// falls through to a send under a superseded capture.
+    pub(crate) fn plan(
+        &self,
+        service: &str,
+        deadline_ms: u64,
+    ) -> Result<OrgProofIntent, OrgSdkError> {
+        let tag = nrpc_tag(service);
+        let capability = CapabilityAuthorityId::for_tag(&tag);
+        let sensed = SensedSelection::new(&tag, deadline_ms);
+        self.plan_over(&capability, &sensed, || self.capture_private(&capability))
     }
 
-    /// [`Self::plan`] over the public exported plane — the same selection
-    /// rule applied to [`Self::authorized_exported_candidates`].
+    /// [`Self::plan`]'s bounded loop over an injectable capture.
+    ///
+    /// `pub(crate)` with the capture as a parameter because the loop's own
+    /// properties — that exhaustion refuses locally with the last considered
+    /// count, that the budget is bounded, and that each refusal class maps to the
+    /// existing vocabulary — are otherwise only reachable by racing authority
+    /// movement against three consecutive derivations.
+    pub(crate) fn plan_over(
+        &self,
+        capability: &CapabilityAuthorityId,
+        sensed: &SensedSelection<'_>,
+        mut capture: impl FnMut() -> Result<OrgColdDiscovery, OrgColdRefusal>,
+    ) -> Result<OrgProofIntent, OrgSdkError> {
+        let mut considered = 0usize;
+        for _ in 0..COLD_PLAN_ATTEMPTS {
+            let capture = match capture() {
+                Ok(capture) => capture,
+                Err(refusal) => return Err(cold_refusal_error(capability, refusal, considered)),
+            };
+            match self.plan_attempt(capability, &capture, sensed)? {
+                PlanAttempt::Minted(intent) => return Ok(*intent),
+                PlanAttempt::Superseded { considered: seen } => considered = seen,
+            }
+        }
+        Err(OrgDiscoveryError::NoAuthorizedProvider {
+            capability: hex_capability(capability),
+            considered,
+        }
+        .into())
+    }
+
+    /// ONE derivation over ONE capture: candidates, selection, the final
+    /// coherent authority comparison, and — only if that comparison holds — the
+    /// derivation's result.
+    ///
+    /// The comparison sits between selection and the RELEASE of the result
+    /// deliberately (design §10): the rows, the grant matching and the chosen
+    /// provider all rest on the captured authority, so a moved authority
+    /// invalidates the whole derivation rather than just its last step.
+    ///
+    /// **HOLD-3 (independent review, 2026-08-29): that includes the NEGATIVE
+    /// outcomes.** The derivation is computed into a value FIRST, and the
+    /// comparison gates it: `?` on candidate derivation or selection would have
+    /// let a stale `NoAuthorizedProvider`, `ProviderNotDirect`,
+    /// `AmbiguousCapabilityGrant` or credential refusal escape from a view the
+    /// node had already superseded — a wrong exact refusal, reported with
+    /// authority, and outside the bounded re-derivation budget. Movement can
+    /// CAUSE all four: a removed consumer grant empties a plane, a raised floor
+    /// retracts the only direct provider, and an installed grant can make two
+    /// grants match at once.
+    ///
+    /// When the capture is still current the exact error is preserved verbatim.
+    pub(crate) fn plan_attempt(
+        &self,
+        capability: &CapabilityAuthorityId,
+        capture: &OrgColdDiscovery,
+        sensed: &SensedSelection<'_>,
+    ) -> Result<PlanAttempt, OrgSdkError> {
+        // Derive and select into an INERT value — never `?`, and never a proof.
+        // The selected candidate is the whole outcome of the derivation; the
+        // intent does not exist yet, because §10 puts the comparison BETWEEN
+        // selection and the mint and F2 found this path minting before it.
+        let (candidates, considered) = self.derive_captured(capability, capture);
+        let selected: Result<AuthorizedOrgCandidate, OrgSdkError> =
+            candidates.and_then(|mut candidates| {
+                // ADVISORY sensed ORDER, between derivation and selection.
+                // It permutes an already-authorized list: it cannot add,
+                // remove or authorize a candidate, it mints nothing, and it
+                // runs strictly BEFORE the final currentness comparison below,
+                // which still gates the mint.
+                self.apply_sensed_order(capability, sensed, capture.authority(), &mut candidates);
+                self.select_candidate(capability, &candidates, considered)
+                    .cloned()
+            });
+        if !self.node.org_cold_authority_is_current(capture.authority()) {
+            return Ok(PlanAttempt::Superseded { considered });
+        }
+        // Current: NOW the proof intent may exist.
+        selected.map(|candidate| PlanAttempt::Minted(Box::new(self.intent_for(&candidate))))
+    }
+
+    /// [`Self::plan`] over the public exported plane — the same selection rule,
+    /// the same captured instant, the same final comparison, and the same
+    /// negative-outcome gating applied to
+    /// [`Self::authorized_exported_candidates`].
+    ///
+    /// The capture is the AUTHORITY half only: exported candidates come from the
+    /// plaintext fold, so there is no private plane to query. The temporal and
+    /// authority coherence is identical.
     pub(crate) fn plan_exported(&self, service: &str) -> Result<OrgProofIntent, OrgSdkError> {
         let capability = CapabilityAuthorityId::for_tag(&nrpc_tag(service));
-        let (candidates, considered) = self.authorized_exported_candidates(&capability, service)?;
-        self.select(&capability, &candidates, considered)
+        self.plan_exported_over(&capability, service, || self.node.org_cold_authority())
+    }
+
+    /// [`Self::plan_exported`]'s bounded loop over an injectable capture — the
+    /// exported twin of [`Self::plan_over`], for the same reason.
+    pub(crate) fn plan_exported_over(
+        &self,
+        capability: &CapabilityAuthorityId,
+        service: &str,
+        mut capture: impl FnMut() -> Result<OrgColdAuthority, OrgColdRefusal>,
+    ) -> Result<OrgProofIntent, OrgSdkError> {
+        let mut considered = 0usize;
+        for _ in 0..COLD_PLAN_ATTEMPTS {
+            let authority = match capture() {
+                Ok(authority) => authority,
+                Err(refusal) => return Err(cold_refusal_error(capability, refusal, considered)),
+            };
+            match self.plan_exported_attempt(capability, service, &authority)? {
+                PlanAttempt::Minted(intent) => return Ok(*intent),
+                PlanAttempt::Superseded { considered: seen } => considered = seen,
+            }
+        }
+        Err(OrgDiscoveryError::NoAuthorizedProvider {
+            capability: hex_capability(capability),
+            considered,
+        }
+        .into())
+    }
+
+    /// ONE exported derivation over ONE authority capture — the exported twin of
+    /// [`Self::plan_attempt`], including its negative-outcome gating (HOLD-3).
+    pub(crate) fn plan_exported_attempt(
+        &self,
+        capability: &CapabilityAuthorityId,
+        service: &str,
+        authority: &OrgColdAuthority,
+    ) -> Result<PlanAttempt, OrgSdkError> {
+        let (candidates, considered) = self.derive_exported(capability, service, authority);
+        let selected: Result<AuthorizedOrgCandidate, OrgSdkError> =
+            candidates.and_then(|candidates| {
+                self.select_candidate(capability, &candidates, considered)
+                    .cloned()
+            });
+        if !self.node.org_cold_authority_is_current(authority) {
+            return Ok(PlanAttempt::Superseded { considered });
+        }
+        selected.map(|candidate| PlanAttempt::Minted(Box::new(self.intent_for(&candidate))))
+    }
+
+    /// Permute an already-authorized candidate list into the SENSED order,
+    /// reconciling this capability's retained demand first when the call's own
+    /// authorized population says it must be.
+    ///
+    /// Advisory, and bounded by that word in every direction: it never adds,
+    /// removes, filters or authorizes a candidate, it never mints, it produces
+    /// no error, and every input it uses is either the caller's own request
+    /// (the budget) or evidence this node already holds. Every failure mode -
+    /// an inert binding, a refused acquisition, a rotated sensing authority, an
+    /// empty population, no observations at all - lands on the SAME outcome:
+    /// the deterministic unsensed order the caller would have had anyway.
+    ///
+    /// # The reconciliation trigger, and why it is the candidate list
+    ///
+    /// `authority_is_current()` covers SECURITY-authority publication, not
+    /// discovery rows, pins, or holder liveness. Reusing demand on that stamp
+    /// alone froze ordinary churn: a provider discovered after the first call
+    /// never entered the population, a departed one never left it, and a
+    /// provider whose acquisition was transiently refused stayed without a
+    /// holder forever.
+    ///
+    /// The trigger is therefore the thing this call already derived under one
+    /// coherent capture: its own pinned same-organization candidates. That set
+    /// IS what the demand should be retained over, so comparing it against
+    /// what the last convergence CERTIFIED detects an addition, a removal and
+    /// a pin change alike, with no extra query and no clock.
+    ///
+    /// # What the record certifies, and what bounds it
+    ///
+    /// A record is only reusable while it still describes the demand that is
+    /// actually installed. It therefore carries the demand's IDENTITY and the
+    /// population core published, and a reuse decision re-checks:
+    ///
+    /// * the expectation this call derived, against the one recorded;
+    /// * the installed demand's identity, so a demand replaced or retired by
+    ///   any other caller is never certified by an older record;
+    /// * that the population core published still covers this expectation -
+    ///   a discovery row that expired between the SDK's capture and core's own
+    ///   query yields a demand narrower than the expectation, which must not
+    ///   be recorded as settled;
+    /// * that every retained holder is still the installation it was committed
+    ///   with, because ownership can die AFTER a successful convergence;
+    /// * the sensing authority stamp.
+    ///
+    /// Two bounds, because an unbounded record set is its own defect: nothing
+    /// is recorded for a capability with an EMPTY expectation (an unknown or
+    /// undiscovered service acquires nothing, so it strands no capacity), and
+    /// the record set itself is capped, evicting the least recently attempted
+    /// entry - which only costs one later convergence.
+    ///
+    /// The decision, the convergence and the record are one bounded critical
+    /// section per capability, so two clones of one binding cannot both decide
+    /// to converge the same change. Everything inside it is synchronous: no
+    /// `.await`, no I/O, no user code.
+    fn apply_sensed_order(
+        &self,
+        capability: &CapabilityAuthorityId,
+        sensed: &SensedSelection<'_>,
+        authority: &OrgColdAuthority,
+        candidates: &mut Vec<AuthorizedOrgCandidate>,
+    ) {
+        // The authority observation THIS attempt derives under. A refusal
+        // records it, and a later decision asks the node whether it is still
+        // the one in force - which is how a restored authority stops being
+        // paced by the failure that preceded it.
+        let context = super::client::RefusalContext::new(&self.node, authority);
+        let Some(acquisition) = self._sensing.acquisition() else {
+            return; // Inert: the deterministic unsensed order, no work at all.
+        };
+        let family = acquisition.family();
+
+        // What this capability's demand SHOULD be retained over: the pinned
+        // OWNER-PLANE candidates of this very derivation, plus this node
+        // itself when it is its own authorized provider - core's population
+        // rule includes the self-provider, and an expectation that omitted it
+        // could never agree with what core publishes.
+        //
+        // The domain is provenance, not owner org. Core derives the sensed
+        // population from owner-private discovery alone
+        // (`org_sensing_authorized_population`), so a provider discovered only
+        // under a held DISCOVER grant is outside it even when that grant was
+        // issued by this organization to itself and the candidate is therefore
+        // `Mode::SameOrg`. Asking for one made agreement unreachable: the two
+        // sides differed by a provider core can never publish, so every call
+        // past the retry floor reconverged an owner population that had not
+        // changed. Invocation authority is untouched - the granted candidate
+        // is still authorized, still ordered and still callable.
+        let mut expected: Vec<u64> = candidates
+            .iter()
+            .filter(|candidate| candidate.owner_plane && candidate.direct)
+            .map(|candidate| candidate.provider.node_id())
+            .collect();
+        if candidates
+            .iter()
+            .any(|candidate| candidate.owner_plane && candidate.provider == *self.node.entity_id())
+        {
+            expected.push(self.node.node_id());
+        }
+        expected.sort_unstable();
+        expected.dedup();
+        // Instrumented: the expectation THIS attempt derived from its own
+        // capture, recorded before anything acts on it.
+        acquisition.schedule().note_expectation(&expected);
+
+        let now = Instant::now();
+        // ONE section: decide, converge, record. `retain` is synchronous and
+        // takes core's own transaction lock inside; nothing here awaits.
+        {
+            // Instrumented: this caller has ARRIVED at the section's door. It
+            // is counted before the lock, so a witness can tell contention
+            // from mere spawning; the lock itself counts the callers that
+            // found it HELD, which is contention observed at acquisition.
+            acquisition.schedule().note_arrival();
+            // DECLINE rather than block: see `try_reconcile_lock`. The holder
+            // is converging this same capability and publishes for everyone, so
+            // waiting would only buy this caller the state it can already see -
+            // at the price of blocking the runtime inside a synchronous
+            // section that authors and sends per provider.
+            let Some(_txn) = acquisition.try_reconcile_lock() else {
+                return;
+            };
+            // The hold's own ticket, copied out so the steps below can ask
+            // whether they are STILL running under it. Losing the hold - to an
+            // early release or to another caller - is then observable at the
+            // exact boundary that must be protected, with no second caller and
+            // no overlap needed to expose it.
+            let held = _txn.ticket();
+            // Declared AFTER the guard, so its drop - the end of the whole
+            // transaction - runs while the guard is still held. Two callers
+            // inside this span at once means the transaction was not
+            // serialized, whatever the observer hook below saw.
+            let _span = acquisition.schedule().section_span();
+            acquisition.schedule().fire_in_section();
+            let installed = family.demand(capability);
+            if expected.is_empty() {
+                // Nothing to sense for this capability. An installed demand is
+                // a DEPARTURE to zero and is retired; nothing is recorded, so
+                // an unknown service leaves no state behind and a capability
+                // whose providers appear later still converges on that call.
+                acquisition.schedule().verify_holding(held);
+                if installed.is_some() {
+                    family.retire(sensed.tag);
+                }
+                acquisition.schedule().forget(capability);
+                return;
+            }
+            // THE DECISION - read under this caller's own hold.
+            acquisition.schedule().verify_holding(held);
+            if acquisition.schedule().needs_convergence(
+                capability,
+                &expected,
+                installed.as_ref(),
+                now,
+                RECONCILE_RETRY_FLOOR,
+                &context,
+            ) {
+                acquisition.schedule().note_convergence();
+                match family.retain(sensed.tag) {
+                    Ok(demand) => {
+                        acquisition
+                            .schedule()
+                            .certify(*capability, expected, &demand, now);
+                        // ...and THE PUBLICATION, likewise.
+                        acquisition.schedule().verify_holding(held);
+                    }
+                    // A refused convergence records the ATTEMPT against the
+                    // demand it could not replace, so a persistent refusal
+                    // cannot turn every later call into another attempt.
+                    Err(_refusal) => {
+                        acquisition.schedule().record_refusal(
+                            *capability,
+                            expected,
+                            installed.as_ref(),
+                            &context,
+                            now,
+                        );
+                        acquisition.schedule().verify_holding(held);
+                        return;
+                    }
+                }
+            }
+        }
+
+        #[cfg(test)]
+        sensing_planning_seam();
+
+        let Some(demand) = family.demand(capability) else {
+            return;
+        };
+        if candidates.len() < 2 || demand.population().is_empty() {
+            // Nothing an order could change - but the reconciliation above
+            // still ran, so a departure that leaves one candidate is still
+            // applied to the retained demand rather than skipped.
+            return;
+        }
+        let projection = demand.project_sensed_order(now, &sensed.budget);
+        let permutation = org_sensed_candidate_permutation(
+            candidates,
+            projection.viable(),
+            projection.non_viable(),
+        );
+        apply_permutation(candidates, permutation);
     }
 
     /// The shared selection rule (OA2-E0.3): org-protected RPC is
@@ -351,14 +775,18 @@ impl OrgClient {
     /// (deterministic order) with a live direct session; if some are
     /// authorized but none is directly reachable, tell the caller which of
     /// the two it hit.
-    fn select(
+    ///
+    /// Returns the CHOSEN CANDIDATE rather than a proof intent: the cold plan's
+    /// final coherent authority comparison sits between selection and the mint
+    /// (design §10), so selection must not be the thing that mints.
+    pub(crate) fn select_candidate<'a>(
         &self,
         capability: &CapabilityAuthorityId,
-        candidates: &[AuthorizedOrgCandidate],
+        candidates: &'a [AuthorizedOrgCandidate],
         considered: usize,
-    ) -> Result<OrgProofIntent, OrgSdkError> {
+    ) -> Result<&'a AuthorizedOrgCandidate, OrgSdkError> {
         if let Some(candidate) = candidates.iter().find(|c| c.direct) {
-            return Ok(self.intent_for(candidate));
+            return Ok(candidate);
         }
         if let Some(candidate) = candidates.first() {
             return Err(OrgDiscoveryError::ProviderNotDirect {
@@ -373,6 +801,26 @@ impl OrgClient {
         .into())
     }
 
+    /// One coherent capture of the private planes for `capability`, over exactly
+    /// the audiences this credential set holds DISCOVER on.
+    ///
+    /// The grant ids are derived here, in HELD-GRANT ORDER, and the capture
+    /// answers per grant id in that same order — so the discovery order the
+    /// authority pipeline depends on is the facade's, not the node's.
+    pub(crate) fn capture_private(
+        &self,
+        capability: &CapabilityAuthorityId,
+    ) -> Result<OrgColdDiscovery, OrgColdRefusal> {
+        let discover_grant_ids: Vec<[u8; 32]> = self
+            .grants
+            .iter()
+            .filter(|g| &g.capability == capability && g.permits_discover())
+            .map(|g| g.grant_id)
+            .collect();
+        self.node
+            .org_cold_discovery(capability, &discover_grant_ids)
+    }
+
     /// The authorized candidate set: which discovered providers this credential
     /// set may invoke `capability` on, each annotated with its authority
     /// relation and current direct reachability, in deterministic order.
@@ -384,60 +832,151 @@ impl OrgClient {
     /// composes over this set. Returns the ordered candidates and how many
     /// private candidates were considered (the count `NoAuthorizedProvider`
     /// reports).
+    ///
+    /// Takes its own coherent capture. `plan` does NOT go through here — it
+    /// keeps its capture so the final comparison can name the exact authority the
+    /// candidates were derived under.
+    ///
+    /// Compiled only where its callers are (the `cortex`-gated call witnesses):
+    /// after OLB-2B.3d-pre the ONE production entry into the authority decision
+    /// is `plan`, and a seam kept alive by an `allow(dead_code)` would claim a
+    /// production consumer that does not exist.
+    #[cfg(all(test, feature = "cortex"))]
     pub(crate) fn authorized_candidates(
         &self,
         capability: &CapabilityAuthorityId,
     ) -> Result<(Vec<AuthorizedOrgCandidate>, usize), OrgSdkError> {
-        // Stage 3 of the validity contract: the credentials backing EVERY call.
-        self.check_current()?;
-        if !self.dispatcher.covers_capability(capability) {
-            return Err(OrgCredentialError::DispatcherScopeExcludesCapability {
-                capability: hex_capability(capability),
-            }
-            .into());
-        }
-
-        let discovered = self.discover_private(capability);
-        let considered = discovered.len();
-        Ok((
-            self.authorize_discovered(capability, discovered)?,
-            considered,
-        ))
+        let capture = self
+            .capture_private(capability)
+            .map_err(|refusal| cold_refusal_error(capability, refusal, 0))?;
+        self.authorized_captured_candidates(capability, &capture)
     }
 
-    /// The exported-plane counterpart of [`Self::authorized_candidates`]
+    /// The candidate derivation over an already-captured observation — the
+    /// PURE half: no clock sample, no store query, no authority read.
+    #[cfg(all(test, feature = "cortex"))]
+    fn authorized_captured_candidates(
+        &self,
+        capability: &CapabilityAuthorityId,
+        capture: &OrgColdDiscovery,
+    ) -> Result<(Vec<AuthorizedOrgCandidate>, usize), OrgSdkError> {
+        let (candidates, considered) = self.derive_captured(capability, capture);
+        candidates.map(|candidates| (candidates, considered))
+    }
+
+    /// [`Self::authorized_captured_candidates`] as a VALUE plus the count
+    /// discovery examined — the shape [`Self::plan_attempt`] needs.
+    ///
+    /// The count rides beside the result rather than inside the `Ok` arm because
+    /// it is a property of DISCOVERY, which succeeded even when authorization
+    /// then refused: an ambiguity examined its candidate. A credential or
+    /// authority refusal precedes discovery and therefore examined none (HOLD-3).
+    fn derive_captured(
+        &self,
+        capability: &CapabilityAuthorityId,
+        capture: &OrgColdDiscovery,
+    ) -> (Result<Vec<AuthorizedOrgCandidate>, OrgSdkError>, usize) {
+        // Stage 3 of the validity contract: the credentials backing EVERY call,
+        // at the captured instant.
+        if let Err(refusal) = self.check_current_at(capture.now_secs()) {
+            return (Err(refusal.into()), 0);
+        }
+        // Per-call authority currentness. Bind proved this relation once; a call
+        // is where it must still hold, and a plan against another org's authority
+        // would search private state this credential set cannot own.
+        //
+        // Fail-closed rather than reachable today: `install_node_authority`
+        // refuses replacement by a different owner org and there is no
+        // uninstall, so a bound client's authority cannot change org. No witness
+        // claims the end-to-end transition; the capture-level refusals are
+        // witnessed directly.
+        if capture.authority_org() != self.acting_org {
+            return (
+                Err(OrgCredentialError::NodeAuthorityOrgMismatch {
+                    authority_org: capture.authority_org(),
+                    membership_org: self.acting_org,
+                }
+                .into()),
+                0,
+            );
+        }
+        if !self.dispatcher.covers_capability(capability) {
+            return (
+                Err(OrgCredentialError::DispatcherScopeExcludesCapability {
+                    capability: hex_capability(capability),
+                }
+                .into()),
+                0,
+            );
+        }
+
+        let discovered = self.discover_private_captured(capability, capture);
+        let considered = discovered.len();
+        (
+            self.authorize_discovered(capability, discovered, capture.now_secs()),
+            considered,
+        )
+    }
+
+    /// The exported-plane counterpart of the private derivation
     /// (SUBNET_AUTH_SDK_PLAN.md §3.6): candidates come from the public
     /// verified-ownership query instead of the private planes; the
     /// credential checks and the whole authority pipeline are the SAME
     /// code, deliberately not forked.
-    pub(crate) fn authorized_exported_candidates(
+    ///
+    /// Derives over an already-captured authority observation, so the exported
+    /// path shares the private path's one instant and one authority identity —
+    /// and, like [`Self::derive_captured`], yields a VALUE plus the count so the
+    /// final comparison can gate a refusal (HOLD-3).
+    fn derive_exported(
         &self,
         capability: &CapabilityAuthorityId,
         service: &str,
-    ) -> Result<(Vec<AuthorizedOrgCandidate>, usize), OrgSdkError> {
-        self.check_current()?;
+        authority: &OrgColdAuthority,
+    ) -> (Result<Vec<AuthorizedOrgCandidate>, OrgSdkError>, usize) {
+        if let Err(refusal) = self.check_current_at(authority.now_secs()) {
+            return (Err(refusal.into()), 0);
+        }
+        if authority.authority_org() != self.acting_org {
+            return (
+                Err(OrgCredentialError::NodeAuthorityOrgMismatch {
+                    authority_org: authority.authority_org(),
+                    membership_org: self.acting_org,
+                }
+                .into()),
+                0,
+            );
+        }
         if !self.dispatcher.covers_capability(capability) {
-            return Err(OrgCredentialError::DispatcherScopeExcludesCapability {
-                capability: hex_capability(capability),
-            }
-            .into());
+            return (
+                Err(OrgCredentialError::DispatcherScopeExcludesCapability {
+                    capability: hex_capability(capability),
+                }
+                .into()),
+                0,
+            );
         }
 
         let discovered = self.discover_public_owned(service);
         let considered = discovered.len();
-        Ok((
-            self.authorize_discovered(capability, discovered)?,
+        (
+            self.authorize_discovered(capability, discovered, authority.now_secs()),
             considered,
-        ))
+        )
     }
 
     /// Phases 1–3 of the authority pipeline, shared verbatim by the
     /// private and exported paths — grant matching and proof-relevant
     /// classification must not fork per discovery plane.
+    ///
+    /// `now_secs` is the plan's captured instant: every grant window in phase 1
+    /// is evaluated at exactly it, so two candidates can never be authorized
+    /// against two different "now"s (OLB-2B.3d-pre).
     fn authorize_discovered(
         &self,
         capability: &CapabilityAuthorityId,
         discovered: Vec<Candidate>,
+        now_secs: u64,
     ) -> Result<Vec<AuthorizedOrgCandidate>, OrgSdkError> {
         // Phase 1 — authority construction in DISCOVERY order. Grant matching
         // (and its `AmbiguousCapabilityGrant` error) must run in this order, so
@@ -453,7 +992,7 @@ impl OrgClient {
             let (mode, provider_owner_org) = if candidate.same_org {
                 (Mode::SameOrg, self.acting_org)
             } else {
-                match self.match_invoke_grant(capability, &candidate)? {
+                match self.match_invoke_grant(capability, &candidate, now_secs)? {
                     Some(grant) => {
                         let issuer_org = grant.issuer_org;
                         (Mode::Granted(Box::new(grant)), issuer_org)
@@ -466,6 +1005,7 @@ impl OrgClient {
                 provider_owner_org,
                 mode,
                 direct: false,
+                owner_plane: candidate.owner_plane,
                 capability: *capability,
             });
         }
@@ -493,8 +1033,16 @@ impl OrgClient {
 
     /// Assemble the canonical nine-field proof intent for a chosen candidate.
     /// Pure construction — the authority decision already happened in
-    /// [`authorized_candidates`].
+    /// [`Self::plan_attempt`], which calls this ONLY after its final currentness
+    /// comparison holds.
+    ///
+    /// That ordering is witnessed rather than asserted: under `cfg(test)` every
+    /// construction bumps a thread-local counter, and the compare-before-mint
+    /// witnesses prove a superseded attempt leaves it untouched (independent
+    /// review F2).
     pub(crate) fn intent_for(&self, candidate: &AuthorizedOrgCandidate) -> OrgProofIntent {
+        #[cfg(test)]
+        INTENTS_CONSTRUCTED.with(|count| count.set(count.get() + 1));
         OrgProofIntent {
             caller: self.caller.clone(),
             membership: self.membership.clone(),
@@ -530,26 +1078,44 @@ impl OrgClient {
                     same_org: p.owner_org == self.acting_org,
                     provider: p.provider,
                     owner_org: p.owner_org,
+                    // The public exported plane is not owner-private
+                    // discovery, and the exported path never senses anyway.
+                    owner_plane: false,
                 },
             );
         }
         out
     }
 
-    /// The two private planes, in one candidate list. Owner-plane records are
-    /// same-org by construction (ingest requires the envelope's owner org to be
-    /// this node's own); granted-plane records come from grants this client
-    /// holds DISCOVER on.
-    fn discover_private(&self, capability: &CapabilityAuthorityId) -> Vec<Candidate> {
+    /// The two private planes of ONE capture, in one candidate list.
+    ///
+    /// Owner-plane records are same-org by construction (ingest requires the
+    /// envelope's owner org to be this node's own); granted-plane records come
+    /// from grants this client holds DISCOVER on. The plane order — owner first,
+    /// then held grants in held order — and the dedup rule are unchanged: an
+    /// owner-plane duplicate wins, so a provider visible on both planes is
+    /// classified same-org exactly as before, and now also keeps the owner
+    /// plane's PROVENANCE — which is what sensing may derive an expectation
+    /// from.
+    ///
+    /// Pure over the capture (OLB-2B.3d-pre): no query, no clock, no lock. The
+    /// grant loop still walks `self.grants` rather than the capture's rows, so
+    /// the facade's own grant order decides discovery order.
+    fn discover_private_captured(
+        &self,
+        capability: &CapabilityAuthorityId,
+        capture: &OrgColdDiscovery,
+    ) -> Vec<Candidate> {
         let mut out: Vec<Candidate> = Vec::new();
 
-        for c in self.node.owner_private_capability_providers(capability) {
+        for c in capture.owner_providers() {
             push_unique(
                 &mut out,
                 Candidate {
-                    provider: c.provider,
+                    provider: c.provider.clone(),
                     owner_org: c.owner_org,
                     same_org: true,
+                    owner_plane: true,
                 },
             );
         }
@@ -558,19 +1124,22 @@ impl OrgClient {
             if &grant.capability != capability || !grant.permits_discover() {
                 continue;
             }
-            for c in self.node.granted_capability_providers(&grant.grant_id) {
+            for c in capture.granted_providers(&grant.grant_id) {
                 let PrivateCapabilityProvider {
                     provider,
                     owner_org,
                     ..
                 } = c;
-                let same_org = owner_org == self.acting_org;
+                let same_org = *owner_org == self.acting_org;
                 push_unique(
                     &mut out,
                     Candidate {
-                        provider,
-                        owner_org,
+                        provider: provider.clone(),
+                        owner_org: *owner_org,
                         same_org,
+                        // Same-org or not, a grant-plane record is invisible
+                        // to core's owner-private population query.
+                        owner_plane: false,
                     },
                 );
             }
@@ -581,8 +1150,12 @@ impl OrgClient {
     /// The complete authority relation for invoking `capability` on this
     /// candidate: grantee org, issuer org, capability, INVOKE, target scope, and
     /// a current window — evaluated with the provider's OWN predicates
-    /// (`permits_invoke`, `GrantTargetScope::covers`, `is_valid_with_skew`), never
-    /// a reimplementation.
+    /// (`permits_invoke`, `GrantTargetScope::covers`,
+    /// `is_valid_at_with_skew`), never a reimplementation.
+    ///
+    /// The window is evaluated at the plan's captured instant rather than at a
+    /// fresh sample per grant per candidate, which is what let one plan mix
+    /// grants that were never simultaneously valid (OLB-2B.3d-pre).
     ///
     /// Zero matches is not an error here (another candidate may match);
     /// ambiguity is, and is never resolved silently.
@@ -590,6 +1163,7 @@ impl OrgClient {
         &self,
         capability: &CapabilityAuthorityId,
         candidate: &Candidate,
+        now_secs: u64,
     ) -> Result<Option<OrgCapabilityGrant>, OrgSdkError> {
         let mut matches: Vec<&OrgCapabilityGrant> = self
             .grants
@@ -601,7 +1175,7 @@ impl OrgClient {
                     && g.permits_invoke()
                     && g.target_scope
                         .covers(&candidate.provider, Some(&candidate.owner_org))
-                    && g.is_valid_with_skew(self.skew_secs).is_ok()
+                    && g.is_valid_at_with_skew(now_secs, self.skew_secs).is_ok()
             })
             .collect();
 
@@ -623,6 +1197,62 @@ impl OrgClient {
 /// on the substrate's frozen value.
 const DEFAULT_PROOF_TTL_SECS: u64 = net::adapter::net::behavior::org_call::MAX_ORG_PROOF_TTL_SECS;
 
+// Test-only: proof intents constructed on THIS thread.
+//
+// Plain comments, not `///`: rustdoc cannot document a macro invocation, so a
+// doc comment here is `unused_doc_comments` under `-D warnings`.
+//
+// Thread-local rather than global: the witnesses run their attempts inline on
+// the test's own thread, so a per-thread count is exact and cannot be raced by
+// a sibling test. It exists to make "no intent is constructed under a superseded
+// capture" observable instead of merely stated (independent review F2).
+#[cfg(test)]
+thread_local! {
+    static INTENTS_CONSTRUCTED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: the current thread's proof-intent construction count.
+#[cfg(test)]
+pub(crate) fn intents_constructed_on_this_thread() -> u64 {
+    INTENTS_CONSTRUCTED.with(std::cell::Cell::get)
+}
+
+/// How many times the cold plan re-derives from a fresh capture when the
+/// authority it derived under moved before the intent was minted
+/// (OLB-2B.3d-pre).
+///
+/// Bounded rather than looped, matching `MeshNode::sample_routing_authority`'s
+/// discipline: authority movement is node-mediated and rare, so exhausting the
+/// attempts means the node is genuinely churning and the honest answer is a
+/// local refusal. Never a retry of an ATTEMPTED call — no proof has been signed
+/// and nothing has been sent at the point this loops.
+const COLD_PLAN_ATTEMPTS: usize = 3;
+
+/// Map a capture refusal onto the facade's EXISTING local vocabulary — both arms
+/// are refusals where nothing was sent.
+///
+/// No new error kind: the cross-language error vocabulary is frozen with its
+/// golden fixture, and neither condition is a new KIND of failure. A node with no
+/// installed authority is exactly `NodeAuthorityRequired` (the bind-time
+/// refusal, now also checked per call); an authority view that could not be
+/// observed coherently established no authorized provider, which is what
+/// `NoAuthorizedProvider` says, with the count of candidates the last derivation
+/// examined.
+fn cold_refusal_error(
+    capability: &CapabilityAuthorityId,
+    refusal: OrgColdRefusal,
+    considered: usize,
+) -> OrgSdkError {
+    match refusal {
+        OrgColdRefusal::NoNodeAuthority => OrgCredentialError::NodeAuthorityRequired.into(),
+        OrgColdRefusal::IncoherentAuthority => OrgDiscoveryError::NoAuthorizedProvider {
+            capability: hex_capability(capability),
+            considered,
+        }
+        .into(),
+    }
+}
+
 /// The capability tag an nRPC service registers under.
 fn nrpc_tag(service: &str) -> String {
     format!("nrpc:{service}")
@@ -630,6 +1260,122 @@ fn nrpc_tag(service: &str) -> String {
 
 /// Keep one entry per provider — the same provider can surface on both planes
 /// (owner-private and under a grant) without becoming two candidates.
+/// The floor between two convergence attempts for one capability whose
+/// expected population has NOT changed.
+///
+/// It exists for exactly one case: the last convergence could not acquire a
+/// holder it wanted (a per-provider refusal is skipped, not fatal), so the
+/// missing holder must be retryable — but a retry on every call would turn a
+/// persistent refusal into per-call acquisition traffic. Any CHANGE in the
+/// expected population bypasses this floor entirely; only the retry is floored.
+const RECONCILE_RETRY_FLOOR: Duration = Duration::from_secs(2);
+
+// Test-only seam, fired inside `apply_sensed_order` after reconciliation and
+// before the projection.
+//
+// It is how a witness parks authority movement INSIDE the sensed window: the
+// final currentness comparison sits after this whole step, and a comparison
+// moved before it would let a plan minted here escape. `#[cfg(test)]` only -
+// no fixtures build, no production surface.
+#[cfg(test)]
+thread_local! {
+    static SENSING_PLANNING_SEAM: std::cell::RefCell<Option<std::sync::Arc<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Install the planning seam on THIS thread; returns the previous one.
+#[cfg(test)]
+pub(crate) fn set_sensing_planning_seam(
+    hook: Option<std::sync::Arc<dyn Fn()>>,
+) -> Option<std::sync::Arc<dyn Fn()>> {
+    SENSING_PLANNING_SEAM.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), hook))
+}
+
+#[cfg(test)]
+fn sensing_planning_seam() {
+    let hook = SENSING_PLANNING_SEAM.with(|slot| slot.borrow().clone());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// The request-relative half of one planning attempt.
+///
+/// Exactly one input here is request-relative, by design (D7.5): the latency
+/// budget, derived from THIS call's deadline. Everything else about the sensed
+/// interest is fixed internal policy owned by core. The capability tag rides
+/// along because acquisition is keyed by it.
+///
+/// Neither field is an authorization input: they select no provider, no grant
+/// and no authority, and an empty budget is not an error.
+pub(crate) struct SensedSelection<'a> {
+    /// The nRPC capability tag this call plans over.
+    tag: &'a str,
+    /// This call's own end-to-end budget, or unbounded when the caller gave no
+    /// deadline.
+    budget: ConsumerLatencyBudget,
+}
+
+impl<'a> SensedSelection<'a> {
+    /// Derive the budget from the caller's deadline. `0` = the facade default,
+    /// which is an UNBOUNDED budget: no deadline means no viability bound, not
+    /// a zero one.
+    pub(crate) fn new(tag: &'a str, deadline_ms: u64) -> Self {
+        Self {
+            tag,
+            budget: ConsumerLatencyBudget {
+                end_to_end_within: (deadline_ms > 0).then(|| Duration::from_millis(deadline_ms)),
+            },
+        }
+    }
+}
+
+/// The SDK's whole share of the sensed ordering rule: project candidates onto
+/// the two plain-data slices core's rule takes, and apply it.
+///
+/// The rule itself lives once, in core
+/// ([`org_sensed_bucket_permutation`]) - a stable class permutation of the
+/// COMPLETE list. This adapter deliberately adds nothing to it: no comparison
+/// sort over the candidate list, no ordering structure, no second rule to
+/// diverge from the first. `Mode::Granted` maps to `false`, which is what
+/// keeps a granted candidate unsensed and unpruned.
+pub(crate) fn org_sensed_candidate_permutation(
+    cands: &[AuthorizedOrgCandidate],
+    ranked: &[u64],
+    pruned: &[u64],
+) -> Vec<usize> {
+    let mut providers: Vec<u64> = Vec::with_capacity(cands.len());
+    let mut same_org: Vec<bool> = Vec::with_capacity(cands.len());
+    for candidate in cands {
+        providers.push(candidate.provider.node_id());
+        same_org.push(matches!(candidate.mode, Mode::SameOrg));
+    }
+    org_sensed_bucket_permutation(&same_org, &providers, ranked, pruned)
+}
+
+/// Reorder `items` by `permutation`, losing nothing.
+///
+/// Written by MOVE, not by clone, and defensively total: any index the
+/// permutation failed to name is appended in its original relative order, so a
+/// malformed permutation can degrade the ORDER but can never drop an
+/// authorized candidate. A duplicate index takes the slot once and is then
+/// vacant, so no candidate is emitted twice either.
+pub(crate) fn apply_permutation<T>(items: &mut Vec<T>, permutation: Vec<usize>) {
+    let mut slots: Vec<Option<T>> = items.drain(..).map(Some).collect();
+    let mut ordered: Vec<T> = Vec::with_capacity(slots.len());
+    for index in permutation {
+        if let Some(item) = slots.get_mut(index).and_then(Option::take) {
+            ordered.push(item);
+        }
+    }
+    for slot in slots.iter_mut() {
+        if let Some(item) = slot.take() {
+            ordered.push(item);
+        }
+    }
+    *items = ordered;
+}
+
 fn push_unique(out: &mut Vec<Candidate>, candidate: Candidate) {
     if out.iter().any(|c| c.provider == candidate.provider) {
         return;

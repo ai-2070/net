@@ -70,6 +70,14 @@ pub mod mesh_rpc_metrics;
 pub mod netdb;
 #[cfg(feature = "cortex")]
 pub mod org_admission_gate;
+/// Fixtures-only composition bridge for organization exact-provider sensing.
+///
+/// Declared here rather than inside the private `mesh` module because a `pub`
+/// item in a private module is not nameable from another crate; the fixtures
+/// gate is the whole guard, exactly as for `subnet::alloc_probe`.
+#[cfg(any(test, feature = "fixtures"))]
+#[doc(hidden)]
+pub mod org_exact_sensing_bridge;
 mod pool;
 mod protocol;
 mod proxy;
@@ -132,14 +140,25 @@ pub use identity::{
     EntityError, EntityId, EntityKeypair, OriginStamp, PermissionToken, TokenCache, TokenError,
     TokenScope,
 };
+/// Exported for the same reason: the sensed-projection off-lock observations
+/// need a nameable type in the projection witnesses. `#[doc(hidden)]` and
+/// fixtures-gated at its definition.
+#[cfg(any(test, feature = "fixtures"))]
+pub use mesh::SensingOffLockObservation;
 /// Exported only so `upgrade_try_acquire_for_test` has a nameable
 /// return type in integration tests; `#[doc(hidden)]` at the definition.
 #[cfg(feature = "nat-traversal")]
 pub use mesh::UpgradeAttemptGuard;
 pub use mesh::{
-    ControlPlaneStats, MeshNode, MeshNodeConfig, PartitionFilter, SensingReadinessOverlay,
-    SensingRegistrationError, UnregisteredChannelPolicy, ACK_RANGES_CAPABILITY_TAG,
+    ControlPlaneStats, MeshNode, MeshNodeConfig, PartitionFilter, SensingLeaseReleaseRefused,
+    SensingReadinessOverlay, SensingRegistrationError, UnregisteredChannelPolicy,
+    ACK_RANGES_CAPABILITY_TAG,
 };
+/// Exported only so the fixtures-gated ordered-egress accessors have nameable
+/// types in integration tests; each is `#[doc(hidden)]` at its definition and
+/// none of them exposes authority material or any control over the egress.
+#[cfg(any(test, feature = "fixtures"))]
+pub use mesh::{OrgEgressSendObserver, OrgEgressSendPhase, OrgEgressState};
 #[cfg(feature = "netdb")]
 pub use netdb::{MemoriesFilter, NetDb, NetDbBuilder, NetDbError, NetDbSnapshot, TasksFilter};
 // `SharedPacketPool` is intentionally not re-exported — see

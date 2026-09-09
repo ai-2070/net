@@ -163,7 +163,8 @@ async fn origin_streams_signed_readiness_then_edges_then_drains() {
         Arc::new(FlagEvaluator {
             ready: ready.clone(),
         }),
-    );
+    )
+    .expect("evaluator registers");
     assert!(
         p.sensing_origin_active(),
         "incarnation supplied → origin role active"
@@ -279,7 +280,8 @@ async fn below_floor_interest_refused_with_signed_beat() {
         Arc::new(FlagEvaluator {
             ready: Arc::new(AtomicBool::new(true)),
         }),
-    );
+    )
+    .expect("evaluator registers");
 
     let spec = shared_spec(fleet);
     let branch = ProviderInterestKey::new(spec.key(), p_id);
@@ -519,7 +521,8 @@ async fn reentrant_evaluator_cannot_deadlock_the_emitter() {
         node: parking_lot::Mutex::new(None),
     });
     *evaluator.node.lock() = Some(p.clone());
-    p.register_readiness_evaluator(CapabilityId::new("print.document"), evaluator);
+    p.register_readiness_evaluator(CapabilityId::new("print.document"), evaluator)
+        .expect("evaluator registers");
 
     let spec = shared_spec(fleet);
     let branch = ProviderInterestKey::new(spec.key(), p_id);
@@ -571,7 +574,8 @@ async fn out_of_bounds_intervals_refused_at_intake() {
         Arc::new(FlagEvaluator {
             ready: Arc::new(AtomicBool::new(true)),
         }),
-    );
+    )
+    .expect("evaluator registers");
     let spec = shared_spec(fleet);
 
     // Local API: both interval bounds refused synchronously, and
@@ -833,7 +837,8 @@ async fn mixed_cadence_refusal_recovers_the_survivor_through_the_relay() {
         Arc::new(FlagEvaluator {
             ready: Arc::new(AtomicBool::new(true)),
         }),
-    );
+    )
+    .expect("evaluator registers");
 
     connect_pair(&a, &r).await;
     connect_pair(&c, &r).await;
@@ -1136,7 +1141,8 @@ async fn short_ttl_rows_survive_the_damper() {
         Arc::new(FlagEvaluator {
             ready: Arc::new(AtomicBool::new(true)),
         }),
-    );
+    )
+    .expect("evaluator registers");
     let spec = shared_spec(fleet);
     let branch = ProviderInterestKey::new(spec.key(), p_id);
     let short_ttl = Duration::from_millis(100);
@@ -1366,7 +1372,8 @@ async fn interval_changes_re_anchor_windows_with_no_intervening_beat() {
         Arc::new(FlagEvaluator {
             ready: ready.clone(),
         }),
-    );
+    )
+    .expect("evaluator registers");
 
     let spec_tight = shared_spec(fleet);
     let spec_loose = {

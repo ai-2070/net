@@ -148,7 +148,8 @@ async fn flagship_two_watchers_one_stream_and_the_hop_rule() {
         Arc::new(FlagEvaluator {
             ready: ready.clone(),
         }),
-    );
+    )
+    .expect("evaluator registers");
 
     connect_pair(&a, &r).await;
     connect_pair(&b, &r).await;
@@ -410,7 +411,8 @@ async fn ttl_half_refreshes_do_not_starve_live_delivery() {
         Arc::new(FlagEvaluator {
             ready: Arc::new(AtomicBool::new(true)),
         }),
-    );
+    )
+    .expect("evaluator registers");
     connect_pair(&c, &r).await;
     connect_pair(&r, &p).await;
     for node in [&c, &r, &p] {

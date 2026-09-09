@@ -12,6 +12,34 @@
 
 **Revision (2026-07-22, applies Kyra's OLB review ruling):** (1) organization sensing registration is authenticated by membership-cert-carrying registration variants — a narrow additive extension at registration intake; the earlier "no sensing-wire work" claim is withdrawn (§1.4, S0). (2) The node-global interest lease key has two shapes — `ProviderFree { audience, interest_digest }` and `ExactProvider { audience, interest_digest, provider }` — and each entry aggregates cadence with token-indexed intervals, not a bare refcount (§4.3, S0). (3) Organization-private consumers use exact-provider leases derived from private authorized discovery, never provider-free rendezvous (§3.1, §3.6). (4) Pruning follows fresh-evidence viability, not raw `NotReady` status (§2 rule 3). **Re-review (same day):** the registration wire choice is pinned — the organization variants are APPENDED to `SensingInterestFrame` under the existing 0x0C02 subprotocol, never a new subprotocol (S0); and S4's sequencing gates on the org-required S0/S1 subset, not S0–S3 (S4).
 
+**Status correction (2026-08-30, read at `f9f423e7bfd5b3d90491600af27624a153f5f5bc`).**
+S1 shipped **provider-lifecycle only**. `net/crates/net/sdk/src/sensing.rs` delivers
+`SensingClient`, `provide` / `provide_replacing`, and `ReadinessRegistration`, and a
+`--lib` guard test (`sdk/src/sensing.rs:588`) fails if any consumer name returns.
+Items 1–5 of the S1 work list below — query validation/canonical conversion,
+owner-authority candidate/leader resolution, watch registration over the
+node-global lease, exact snapshot projection, and missed-wakeup-safe `changed()` —
+are **NOT delivered**, and neither are the `SensingQuery` / `SensingWatch` /
+`SensingSnapshot` / `SensedProvider` types §4 lists. An exact-provider projection
+seam landed in `a58293e58` and was **removed** in `52e1d8bb2` for a concrete
+reason, not for sequencing: `MeshNode::acquire_sensing_interest_lease`
+(`mesh.rs:11197`) refuses every organization-derived audience with
+`SensingRegistrationError::OrgAudienceUnsupported` (`mesh.rs:6161`, raised at
+`:11220-11227`), because the lease wire leg emits legacy
+`SensingInterestFrame::provider_registration` unconditionally
+(`mesh.rs:11154`) — the variant an org-authoritative receiver refuses
+(`mesh.rs:24888-24905`). Nothing in the SDK could therefore create the
+observations a projection would read.
+
+That authority boundary now has a dedicated design under review:
+[`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md)
+— **DESIGN FOR REVIEW, no implementation or arm lighting authorized.** It also
+records a second blocker this plan never named: `register_sensing_interest_as`
+routes local registrations through the legacy `validate_subscriber_scope`
+(`mesh.rs:10950`), which an organization audience can never pass. S4 below, and
+§3.6's "may internally consume sensing", remain gated on that design's review and
+on its OA-6 arm-lighting slice.
+
 ---
 
 ## 1. Repository audit and current state
@@ -66,7 +94,7 @@ The user hypothesis is confirmed for production decision paths:
 | Proximity/routing/failure detector | **Input producer and invalidation source**, not a final consumer. Supplies path estimate/reachability and wakes recomputation. |
 | nRPC `call_service` | **Not integrated.** Uses capability discovery, health filtering, authorization filtering, and `RoutingPolicy`, but not sensing. |
 | Ordinary compute `Scheduler` | **Not integrated.** Places daemons, migration targets, and group members from static capability state and placement filters. |
-| SDK | **Not integrated.** No sensing module or lifecycle; even sensed gang methods are not wrapped. |
+| SDK | **Provider lifecycle integrated (accepted S1); consumer side not integrated.** `net/crates/net/sdk/src/sensing.rs` ships `SensingClient` (`:220`), `Mesh::sensing` (`:267`), `provide` / `provide_replacing` (`:305` / `:338`), and the RAII `ReadinessRegistration` (`:399`, `Drop` `:486-489`). There is still no query, watch, snapshot, or projection surface, and sensed gang methods are still not wrapped. *(Corrected 2026-08-30: the original row's blanket "No sensing module or lifecycle" is false after S1.)* |
 | Organization SDK | **Not integrated.** Its thin facade performs verified private discovery and deterministic exact-provider selection. |
 | Tools/A2A/Hermes/OpenClaw integrations | **No direct integration.** Their capability calls flow through nRPC/tool paths. |
 | Dataforts/CAS/MeshDB | **No integration required.** Their target decisions are possession, coverage, and data-locality questions, not provider-readiness interests. |
@@ -87,7 +115,12 @@ Normal callers currently must understand too much:
 - evaluator installation and state-edge notification;
 - explicit and drop-time deregistration.
 
-There is no SDK-level ownership or cleanup contract for either consumer watches or provider evaluators.
+There is no SDK-level ownership or cleanup contract for **consumer watches**. For
+**provider evaluators** there now is one, delivered by accepted S1:
+`ReadinessRegistration` (`sdk/src/sensing.rs:399`) owns its registration id and
+releases it on `close()` / `Drop` (`:473-489`), removal is conditional on that
+exact id, and the ownership-aware state edge routes through
+`notify_sensing_state_changed_owned`. *(Corrected 2026-08-30.)*
 
 ### 1.4 Authority prerequisite
 
@@ -113,7 +146,7 @@ local NodeAuthority.owner_org
 
 The SDK never accepts a caller-supplied leader for its common path.
 
-**Deriving the commitment from `OrgId` does not authenticate the session (Kyra, 2026-07-22).** The current registration frame carries interest fields, the audience commitment, and the consumer node ID — no membership proof; intake derives the proven root from the authenticated session `EntityId` or the configured fleet-root escape hatch. The digest separates audiences only after authorization; it does not supply authorization. Nor is the capability fold a membership registry: a sensing consumer need not announce any capability, owner-cert emission is separately gated, private organization records are audience-scoped, and membership validity and floors must be checked at intake, not inferred from historical presence. S0 therefore defines one real authenticated seam — organization registration variants carrying the registering hop's `OrgMembershipCert`, validated at every receiving hop, with each relay proving its **own** membership when re-registering upstream. This is a narrow, additive registration-intake extension — **pinned (re-review 2026-07-22): the organization-authenticated variants are APPENDED to `SensingInterestFrame` under the existing 0x0C02 subprotocol** (existing variants never reordered; old nodes reject an unknown variant cleanly and cannot participate in organization sensing anyway; the existing 4 KiB frame cap comfortably holds one 156-byte membership certificate; no second dispatch arm or subprotocol lifecycle). The 0x0C03 attestation transcript, continuity, and epoch semantics are unchanged. The earlier claim that S0 requires no sensing-wire work is withdrawn.
+**Deriving the commitment from `OrgId` does not authenticate the session (Kyra, 2026-07-22).** The current registration frame carries interest fields, the audience commitment, and the consumer node ID — no membership proof; intake derives the proven root from the authenticated session `EntityId` or the configured fleet-root escape hatch. The digest separates audiences only after authorization; it does not supply authorization. Nor is the capability fold a membership registry: a sensing consumer need not announce any capability, owner-cert emission is separately gated, private organization records are audience-scoped, and membership validity and floors must be checked at intake, not inferred from historical presence. S0 therefore defines one real authenticated seam — organization registration variants carrying the registering hop's `OrgMembershipCert`, validated at every receiving hop, with each relay proving its **own** membership when re-registering upstream. This is a narrow, additive registration-intake extension — **pinned (re-review 2026-07-22): the organization-authenticated variants are APPENDED to `SensingInterestFrame` under the existing 0x0C02 subprotocol** (existing variants never reordered; old nodes at or past the 0.32.0 floor reject an unknown variant cleanly and cannot participate in organization sensing anyway, while PRE-0.32.0 nodes are excluded from the path outright (see requirement 8 and witness 37); the existing 4 KiB frame cap comfortably holds one 156-byte membership certificate; no second dispatch arm or subprotocol lifecycle). The 0x0C03 attestation transcript, continuity, and epoch semantics are unchanged. The earlier claim that S0 requires no sensing-wire work is withdrawn.
 
 Cross-organization sensing is deferred. `DISCOVER` or `INVOKE` authority does not silently become active readiness-surveillance authority. A later explicit authority relation may enable it without changing the v1 SDK shape.
 
@@ -151,7 +184,7 @@ Locked rules:
 
 1. Sensing is advisory and request-relative.
 2. `Unknown` is retained as potential capacity; absence of evidence never prunes.
-3. Pruning follows viability derived from fresh exact evidence, never absence: `Unknown` never prunes; a candidate may be pruned/deprioritized only as `NonViable` — from a fresh exact provider `NotReady`, or from a fresh exact `Ready` whose signed start estimate plus the current consumer-local route estimate exceeds a hard budget. Stale evidence degrades to `Potential`/`Unknown`, never `NonViable`.
+3. Pruning follows viability derived from fresh exact evidence, never absence: `Unknown` never prunes; a candidate may be pruned/deprioritized only as `NonViable`, and the ONLY input that yields `NonViable` is a **fresh exact provider `NotReady`**. Stale evidence degrades to `Potential`/`Unknown`, never `NonViable`. **A fresh exact `Ready` whose signed start estimate plus the current consumer-local route estimate exceeds the consumer budget is `Potential`, not `NonViable`, and is never pruned** — `classify_branch` maps it through its `_ =>` arm (`src/adapter/net/behavior/sensing/controller.rs:311-325`, variant doc `:301-303`), and `scheduler_bridge/readiness.rs` retains it (`:46-48`) with a test pinning it (comment `:125`, asserted `:134`). *(Corrected 2026-08-30: the original clause specified the inverse of the frozen primitive. See [`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md) §2.1 item 5 and D6.7.)*
 4. A result for one interest never mutates capability-fold membership or affects another interest.
 5. The candidate population comes from verified discovery/authority. Sensing never expands visibility.
 6. Selection names one exact provider.
@@ -540,7 +573,7 @@ Locked requirements:
 5. Relays emit a new organization variant carrying the relay's own membership.
 6. Legacy variants cannot enter an organization-derived audience.
 7. `Deregister` remains sender-row-scoped and therefore needs no delegated membership claim.
-8. Mixed-version refusal degrades to Unknown and deterministic routing, never an invocation failure.
+8. Mixed-version refusal degrades to Unknown and deterministic routing, never an invocation failure — **subject to the absolute path-member floor**: the unknown-subprotocol catch-all that makes this degradation real landed in `5362486afca2681e7c3b2ca9d096bd70dc3c6130` and first shipped in `crates-v0.32.0` / v0.32.0, so **pre-0.32.0 consumers, relays and providers are EXCLUDED from the exact-org-sensing path rather than degrading cleanly** (below that release a 0x0C02 frame is parsed as application events). Providers/relays-first ordering is necessary but not sufficient on its own, and there is no legacy fallback for an org-derived audience at any version. *(Corrected 2026-08-30; see [`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md) D8.3.)*
 
 **Gate:** No organization-auth implementation until its separate review is signed off at an exact commit.
 
@@ -698,7 +731,7 @@ This slice is optional for the generic sensing SDK release and gates only on the
 34. Dropping the strictest watcher relaxes the registration to the recomputed minimum; dropping a non-strictest watcher causes no wire change.
 35. **(local/node — this slice)** A final lease drop racing a new acquire leaves exactly one holder in the node-global lease registry; a stale lease ticket removes no successor holder from the registry.
 36. **(distributed/wire — OLB-2/S1 exit gate, NOT this slice)** Network delivery may reorder, so an adversarially-delivered stale `Deregister` may transiently remove the remote provider row. The surviving node-global lease re-registers at ttl/2; the observation is `Unknown`/`Potential` until repair and no protected invocation fails because sensing was absent; and a last-holder close cancels the refresh owner so no later refresh resurrects the retired row. This slice orders outbound frame construction only — it does not attempt linearizable installation ownership across the wire (see §4.3).
-37. A legacy (non-organization) registration variant cannot enter an organization-derived audience; an old node receiving an organization variant refuses cleanly, and the affected consumer degrades to Unknown plus deterministic routing — never an invocation failure.
+37. A legacy (non-organization) registration variant cannot enter an organization-derived audience; an old node **at or past the 0.32.0 floor** receiving an organization variant refuses cleanly, and the affected consumer degrades to Unknown plus deterministic routing — never an invocation failure. **subject to the absolute path-member floor**: the unknown-subprotocol catch-all that makes this degradation real landed in `5362486afca2681e7c3b2ca9d096bd70dc3c6130` and first shipped in `crates-v0.32.0` / v0.32.0, so **pre-0.32.0 consumers, relays and providers are EXCLUDED from the exact-org-sensing path rather than degrading cleanly** (below that release a 0x0C02 frame is parsed as application events). Providers/relays-first ordering is necessary but not sufficient on its own, and there is no legacy fallback for an org-derived audience at any version. *(Corrected 2026-08-30; see [`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md) D8.3.)*
 
 ---
 

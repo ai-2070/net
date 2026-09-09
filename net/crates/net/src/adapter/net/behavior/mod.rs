@@ -54,6 +54,10 @@ pub mod org_admission;
 pub mod org_admission_replay;
 pub mod org_authority;
 pub mod org_call;
+/// Unstable workspace-internal OLB implementation bridge — see the module docs.
+/// Hidden from generated documentation; not application API, not semver-covered.
+#[doc(hidden)]
+pub mod org_cold_plan;
 pub mod org_grant;
 pub mod org_grant_registry;
 pub mod org_revocation;
@@ -64,6 +68,11 @@ pub mod org_scoped_ann;
 pub mod org_scoped_ingest;
 pub mod org_scoped_relay;
 pub mod org_scoped_store;
+/// Retained organization exact-provider sensing demand and its refresh
+/// lifecycle — an internal ownership substrate, not application API and not
+/// semver-covered.
+#[doc(hidden)]
+pub mod org_sensing_demand;
 pub mod placement;
 pub mod placement_registry;
 pub mod predicate;

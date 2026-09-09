@@ -111,7 +111,8 @@ async fn provider_failure_expires_observations_and_recovery_re_establishes() {
         FD_TIMEOUT,
     )
     .await;
-    p.register_readiness_evaluator(CapabilityId::new("print.document"), Arc::new(AlwaysReady));
+    p.register_readiness_evaluator(CapabilityId::new("print.document"), Arc::new(AlwaysReady))
+        .expect("evaluator registers");
 
     connect_pair(&c, &p).await;
     c.start();
@@ -222,7 +223,8 @@ async fn next_hop_failure_disrupts_multi_hop_provider_branches() {
         FD_TIMEOUT,
     )
     .await;
-    p.register_readiness_evaluator(CapabilityId::new("print.document"), Arc::new(AlwaysReady));
+    p.register_readiness_evaluator(CapabilityId::new("print.document"), Arc::new(AlwaysReady))
+        .expect("evaluator registers");
 
     connect_pair(&c, &r).await;
     connect_pair(&r, &p).await;
@@ -310,7 +312,8 @@ async fn route_withdrawal_disrupts_provider_branches_at_remote_consumers() {
         FD_TIMEOUT,
     )
     .await;
-    p.register_readiness_evaluator(CapabilityId::new("print.document"), Arc::new(AlwaysReady));
+    p.register_readiness_evaluator(CapabilityId::new("print.document"), Arc::new(AlwaysReady))
+        .expect("evaluator registers");
 
     connect_pair(&c, &x).await;
     connect_pair(&x, &p).await;
@@ -557,7 +560,8 @@ async fn consumer_failure_drains_leader_demand() {
     let a = sensing_node(EntityKeypair::generate(), owner, None, FD_TIMEOUT).await;
     let r = sensing_node(EntityKeypair::generate(), owner, None, FD_TIMEOUT).await;
     let p = sensing_node(owner_kp, owner, Some(Incarnation::new(1)), FD_TIMEOUT).await;
-    p.register_readiness_evaluator(CapabilityId::new("print.document"), Arc::new(AlwaysReady));
+    p.register_readiness_evaluator(CapabilityId::new("print.document"), Arc::new(AlwaysReady))
+        .expect("evaluator registers");
 
     connect_pair(&a, &r).await;
     connect_pair(&r, &p).await;

@@ -171,6 +171,22 @@ impl CapabilityId {
     }
 }
 
+// A capability name IS a string; these exist so the SDK's provider
+// surface can take `impl Into<CapabilityId>` and callers may write the
+// name inline. Purely a constructor convenience — the canonical form,
+// the digest, and the serialized shape are unchanged.
+impl From<&str> for CapabilityId {
+    fn from(name: &str) -> Self {
+        Self(name.to_string())
+    }
+}
+
+impl From<String> for CapabilityId {
+    fn from(name: String) -> Self {
+        Self(name)
+    }
+}
+
 impl fmt::Display for CapabilityId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)

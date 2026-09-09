@@ -1,6 +1,6 @@
 //! OLB-0 §4.3: the node-global sensing-interest lease wiring
 //! (`MeshNode::acquire_sensing_interest_lease` /
-//! `release_sensing_interest_lease` / `deregister_sensing_interest`).
+//! `try_release_sensing_interest_lease` / `deregister_sensing_interest`).
 //!
 //! The pure refcount + cadence logic is unit-tested in
 //! `behavior::sensing::lease`. These are NODE-level registry/refcount
@@ -20,10 +20,13 @@ use std::time::{Duration, Instant};
 
 use net::adapter::net::behavior::sensing::{
     AudienceScopeCommitment, CanonicalConstraints, CapabilityId, DisclosureClass, DownstreamId,
-    Incarnation, InterestSpec, ProviderInterestKey, ProviderSelector, ResultMode, SensingLeaseKey,
+    Incarnation, InterestSpec, LeaseAction, LeaseRefused, LeaseToken, ProviderInterestKey,
+    ProviderSelector, ResultMode, SensingInterestLeases, SensingLeaseKey, SensingLeaseTicket,
     WorkLatencyEnvelope,
 };
-use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SensingRegistrationError};
+use net::adapter::net::{
+    EntityKeypair, MeshNode, MeshNodeConfig, SensingLeaseReleaseRefused, SensingRegistrationError,
+};
 
 const PSK: [u8; 32] = [0x42u8; 32];
 const D: Duration = Duration::from_millis(100);
@@ -89,14 +92,16 @@ async fn equivalent_acquires_share_one_registration_and_last_release_deregisters
         "the equivalent second acquire is still one registration"
     );
 
-    node.release_sensing_interest_lease(t1);
+    node.try_release_sensing_interest_lease(t1)
+        .expect("the release must not be refused");
     assert!(
         node.sensing_downstreams(&key)
             .contains(&DownstreamId::LeasedLocal),
         "a surviving holder keeps the registration live"
     );
 
-    node.release_sensing_interest_lease(t2);
+    node.try_release_sensing_interest_lease(t2)
+        .expect("the release must not be refused");
     assert!(
         node.sensing_downstreams(&key).is_empty(),
         "the last release deregisters the interest"
@@ -135,8 +140,10 @@ async fn a_stricter_acquire_keeps_one_local_registration() {
         "the tightened 50 ms cadence is actually installed on the row"
     );
 
-    node.release_sensing_interest_lease(strict);
-    node.release_sensing_interest_lease(loose);
+    node.try_release_sensing_interest_lease(strict)
+        .expect("the release must not be refused");
+    node.try_release_sensing_interest_lease(loose)
+        .expect("the release must not be refused");
     assert!(
         node.sensing_table_is_empty(),
         "both holders gone — interest deregistered"
@@ -162,7 +169,8 @@ async fn releasing_one_ticket_leaves_another_key_untouched() {
         .acquire_sensing_interest_lease(&spec_b, OTHER_PROVIDER, D)
         .expect("acquire B");
 
-    node.release_sensing_interest_lease(ta);
+    node.try_release_sensing_interest_lease(ta)
+        .expect("the release must not be refused");
     assert!(node.sensing_downstreams(&key_a).is_empty(), "A torn down");
     assert!(
         node.sensing_downstreams(&key_b)
@@ -209,7 +217,8 @@ async fn overcap_rolls_back_and_does_not_wedge_the_lease() {
     );
 
     // Free capacity, then the same interest registers cleanly (recovery).
-    node.release_sensing_interest_lease(ta);
+    node.try_release_sensing_interest_lease(ta)
+        .expect("the release must not be refused");
     let _tb = node
         .acquire_sensing_interest_lease(&spec_b, OTHER_PROVIDER, D)
         .expect("recovers once capacity frees");
@@ -278,10 +287,12 @@ async fn double_release_is_idempotent() {
     let ticket = node
         .acquire_sensing_interest_lease(&spec, PROVIDER, D)
         .expect("acquire");
-    node.release_sensing_interest_lease(ticket);
+    node.try_release_sensing_interest_lease(ticket)
+        .expect("the release must not be refused");
     assert!(node.sensing_downstreams(&key).is_empty());
     // Second release of the same ticket does nothing and must not panic.
-    node.release_sensing_interest_lease(ticket);
+    node.try_release_sensing_interest_lease(ticket)
+        .expect("the release must not be refused");
     assert!(node.sensing_table_is_empty());
 }
 
@@ -370,7 +381,8 @@ async fn stale_ticket_release_cannot_remove_a_live_successor() {
     let t1 = node
         .acquire_sensing_interest_lease(&spec, PROVIDER, D)
         .expect("acquire t1");
-    node.release_sensing_interest_lease(t1);
+    node.try_release_sensing_interest_lease(t1)
+        .expect("the release must not be refused");
     assert!(node.sensing_table_is_empty(), "t1 released — no rows");
 
     // A NEW holder for the same key mints a fresh, monotonic token.
@@ -384,7 +396,8 @@ async fn stale_ticket_release_cannot_remove_a_live_successor() {
     );
 
     // The STALE t1 release must be a pure no-op — it cannot tear down t2.
-    node.release_sensing_interest_lease(t1);
+    node.try_release_sensing_interest_lease(t1)
+        .expect("the release must not be refused");
     assert!(
         node.sensing_downstreams(&key)
             .contains(&DownstreamId::LeasedLocal),
@@ -396,7 +409,8 @@ async fn stale_ticket_release_cannot_remove_a_live_successor() {
     );
 
     // The successor's OWN release is what finally deregisters.
-    node.release_sensing_interest_lease(t2);
+    node.try_release_sensing_interest_lease(t2)
+        .expect("the release must not be refused");
     assert!(
         node.sensing_table_is_empty(),
         "t2 release deregisters — no rows remain"
@@ -444,7 +458,8 @@ async fn refused_non_first_holder_tighten_relaxes_back_to_survivor() {
     );
 
     // The loose holder still cleanly tears down.
-    node.release_sensing_interest_lease(loose);
+    node.try_release_sensing_interest_lease(loose)
+        .expect("the release must not be refused");
     assert!(node.sensing_table_is_empty(), "final release deregisters");
 }
 
@@ -483,7 +498,8 @@ async fn local_and_leased_share_one_aggregate_consumer_cadence() {
 
     // Releasing the lease leaves the direct row and relaxes the shared cell to
     // 100 ms — and, because the direct row survives, sends no upstream Deregister.
-    node.release_sensing_interest_lease(lease);
+    node.try_release_sensing_interest_lease(lease)
+        .expect("the release must not be refused");
     assert_eq!(
         node.sensing_downstreams(&key),
         vec![DownstreamId::Local],
@@ -528,7 +544,8 @@ async fn shared_consumer_cadence_is_order_independent() {
         "the shared cadence is min(50, 100), not the last-registered 100 ms"
     );
 
-    node.release_sensing_interest_lease(lease);
+    node.try_release_sensing_interest_lease(lease)
+        .expect("the release must not be refused");
     node.deregister_sensing_interest(&spec, PROVIDER);
     assert!(node.sensing_table_is_empty());
 }
@@ -913,5 +930,109 @@ async fn a_digest_watch_refresh_cannot_relax_a_stricter_direct_row() {
         node.sensing_consumer_cell_interval_for_test(&key),
         Some(tighter),
         "a stricter watch still tightens the shared cadence"
+    );
+}
+
+// ---- DOWNSTREAM COMPATIBILITY PROBES ------------------------------------
+//
+// This file is a SEPARATE CRATE, so it sees exactly the surface a downstream
+// user does. Two pre-existing shapes are pinned here by TYPE, not by call:
+// coercing each method to an explicit `fn` pointer fails to compile if its
+// arity or return type moves, which a plain call would not (a call still type
+// checks against a changed return the caller ignores).
+
+/// The pre-existing three-argument, two-element-`Ok` acquisition surface, as a
+/// named type so the probe below reads as a signature rather than as a nested
+/// generic expression.
+type LegacyAcquireFn = for<'a, 'b> fn(
+    &'a SensingInterestLeases,
+    SensingLeaseKey,
+    &'b InterestSpec,
+    Duration,
+) -> Result<(LeaseToken, LeaseAction), LeaseRefused>;
+
+/// The pre-existing shapes, plus the new fallible release, all still exist with
+/// exactly the signatures a downstream crate compiled against.
+#[test]
+fn the_pre_existing_lease_surfaces_keep_their_shapes() {
+    // `MeshNode::release_sensing_interest_lease` returned unit at the accepted
+    // base. A downstream `let () = node.release_sensing_interest_lease(t);`
+    // breaks the moment it becomes a `Result`.
+    let _release: fn(&MeshNode, SensingLeaseTicket) = MeshNode::release_sensing_interest_lease;
+
+    // The NEW fallible operation, the one the organization path uses.
+    let _try_release: fn(&MeshNode, SensingLeaseTicket) -> Result<(), SensingLeaseReleaseRefused> =
+        MeshNode::try_release_sensing_interest_lease;
+
+    // `SensingInterestLeases::acquire` was public with THREE arguments and a
+    // two-element `Ok`. The transactional preview/commit split must not have
+    // replaced it.
+    let _acquire: LegacyAcquireFn = SensingInterestLeases::acquire;
+
+    // And it still behaves: legacy-plane register, then the terminal identity
+    // refusal the repaired allocator introduces.
+    let leases = SensingInterestLeases::default();
+    let spec = spec_for(AudienceScopeCommitment::from_bytes([7u8; 32]), PROVIDER);
+    let key = SensingLeaseKey::ExactProvider {
+        audience: spec.audience,
+        interest_digest: spec.interest_digest(),
+        provider: PROVIDER,
+    };
+    let (_token, action) = leases.acquire(key, &spec, D).expect("acquire");
+    assert!(matches!(action, LeaseAction::Register { .. }));
+
+    leases.seed_token_space_for_test(SensingInterestLeases::token_space_end());
+    assert_eq!(
+        leases.acquire(key, &spec, D),
+        Err(LeaseRefused::IdentityExhausted),
+        "the compatibility surface must refuse once identity is exhausted"
+    );
+    assert_eq!(leases.identity_refusals(), 1);
+    assert_eq!(
+        leases.entry_for_test(&key),
+        Some((1, D)),
+        "and must leave the incumbent holder untouched"
+    );
+}
+
+/// A refused FALLIBLE release hands back a live ticket and moves neither the
+/// registry nor the interest table — observed from downstream, on the surface
+/// a caller actually holds.
+///
+/// Reached without organization authority by construction: only an
+/// organization-plane surviving-holder `Reregister` can be refused, so this
+/// uses the legacy plane to prove the OTHER half of the contract — a legacy
+/// release is never refused, which is exactly why the unit-returning
+/// compatibility surface is exact for every pre-existing caller.
+#[tokio::test]
+async fn a_legacy_release_is_never_refused_on_either_surface() {
+    let node = sensing_node().await;
+    let spec = spec_for(node.sensing_local_root(), PROVIDER);
+    let key = ProviderInterestKey::new(spec.key(), PROVIDER);
+
+    let strict = node
+        .acquire_sensing_interest_lease(&spec, PROVIDER, STRICT)
+        .expect("strict acquire");
+    let loose = node
+        .acquire_sensing_interest_lease(&spec, PROVIDER, D)
+        .expect("loose acquire");
+
+    // The surviving-holder transition — the only refusable shape — through the
+    // FALLIBLE surface.
+    node.try_release_sensing_interest_lease(strict)
+        .expect("a legacy surviving-holder release is never refused");
+    assert_eq!(
+        node.sensing_downstream_entry(&key, DownstreamId::LeasedLocal)
+            .expect("the shared row survives")
+            .requested_sample_interval,
+        D,
+        "and it relaxed the shared cadence to the surviving holder's"
+    );
+
+    // The final teardown through the UNIT-RETURNING compatibility surface.
+    node.release_sensing_interest_lease(loose);
+    assert!(
+        node.sensing_table_is_empty(),
+        "the compatibility surface must perform the same terminal deregistration"
     );
 }

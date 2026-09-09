@@ -4581,6 +4581,41 @@ impl GrantFixture {
         held
     }
 
+    /// Ingest a GRANTED scoped announcement from the fixture's provider through
+    /// the REAL verified ingest path, so the grant plane has a row to serve
+    /// (OLB-2B.3d-pre, HOLD-4).
+    ///
+    /// Takes the audience secret rather than the grant: install CONSUMES the
+    /// original, and the envelope needs the same audience handle and discovery
+    /// key the installed record carries.
+    fn ingest_granted(
+        &self,
+        secret: &crate::adapter::net::behavior::org_grant::OrgAudienceSecret,
+        tag: &str,
+    ) {
+        use crate::adapter::net::behavior::capability::CapabilitySet;
+        use crate::adapter::net::behavior::org::{current_timestamp, OrgMembershipCert};
+        use crate::adapter::net::behavior::org_scoped_ann::ScopedCapabilityAnnouncement;
+        let cert =
+            OrgMembershipCert::try_issue(&self.issuer, self.provider.entity_id().clone(), 1, 3600)
+                .expect("provider cert");
+        let descriptor = CapabilitySet::new().add_tag(tag).to_bytes_compact();
+        let envelope = ScopedCapabilityAnnouncement::build_granted(
+            &self.provider,
+            self.issuer.org_id(),
+            cert,
+            secret.grant_id,
+            secret.audience_handle,
+            secret.discovery_key(),
+            1,
+            current_timestamp() + 3600,
+            &descriptor,
+        )
+        .expect("granted envelope");
+        self.node
+            .ingest_scoped_announcement_for_test(&envelope.to_bytes());
+    }
+
     /// The production source over this node, for witnesses that assert on
     /// capture rather than on the read seam.
     fn source(&self) -> ScopedSlotSource {
@@ -8297,5 +8332,514 @@ async fn a_peer_replaced_after_revalidation_cannot_publish_its_old_session() {
             session_id: s1,
         },
         "the live projection names the LIVE incarnation"
+    );
+}
+
+// ---- OLB-2B.3d-pre: the coherent cold-plan capture -------------------------
+//
+// The capture is the cold plan's first step, and its whole value is coherence:
+// one instant, one revocation view, one consumer-grant view, one store critical
+// section, one authority identity. Every witness below drives the PRODUCTION
+// seam (`MeshNode::org_cold_discovery` / `org_cold_authority`) on a real node —
+// the per-row content is witnessed against the live plane seams in the SDK,
+// where real envelopes can be ingested; these four assert the properties only
+// the node's private state can show.
+
+/// What a cold-capture observation point records: the production section
+/// identity, how many sections have been opened, and whether a rival `try_lock`
+/// FAILED there (i.e. the store lock was held).
+type SectionObservation = (u64, u64, bool);
+
+/// One observation taken INSIDE the grant loop: [`SectionObservation`] plus that
+/// query's row count, which is what stops an empty grant list from passing as an
+/// executed query.
+type GrantQueryObservation = (u64, u64, bool, usize);
+
+/// The single pre-loop observation, filled by the plane-gap hook.
+type SectionObservationSlot = Arc<parking_lot::Mutex<Option<SectionObservation>>>;
+
+/// Every in-query observation, in loop order.
+type GrantQueryObservationLog = Arc<parking_lot::Mutex<Vec<GrantQueryObservation>>>;
+
+/// (C1) ONE ACQUISITION spans the owner plane and a real, non-empty grant query.
+///
+/// **Independent review F1: two earlier versions of this witness were weaker than
+/// their name.** The first requested no grant planes at all, so the production
+/// grant loop ran zero iterations. The second executed a real grant query but
+/// observed the lock only immediately BEFORE the loop — so a split that dropped
+/// the guard after the owner plane and reacquired around each grant query held a
+/// lock at every observation point and survived.
+///
+/// The property is not "a lock is held twice", it is "ONE acquisition spans
+/// both", so this witness compares the production SECTION IDENTITY stamped by
+/// `MeshNode::lock_cold_section` at the two production-coupled points:
+///
+/// ```text
+/// pre-loop hook      lock held (rival try_lock fails) + identity I, count N
+/// in-query hook      fired INSIDE the grant loop, after that grant's real query
+///                    produced its rows: lock still held + identity STILL I
+/// after the capture  the lock is free again; exactly ONE section was opened
+/// ```
+///
+/// The in-query hook receives the row count, so an empty grant list cannot be
+/// mistaken for an executed query, and the witness additionally asserts the row
+/// reached the returned capture. `tests/org_cold_plan_surface_guard.rs` carries
+/// the structural leg: `capture_cold` acquires the store only through
+/// `lock_cold_section`, exactly once, with both plane queries inside it — which
+/// is what catches a split that bypasses the instrumented acquisition.
+#[tokio::test]
+async fn one_cold_capture_acquisition_spans_the_owner_and_grant_queries() {
+    let fx = grant_fixture("cold-section").await;
+    let tag = "nrpc:cold.section";
+    let capability = CapabilityAuthorityId::for_tag(tag);
+    let (grant, secret) = fx.mint(tag, None, None);
+    let envelope_secret = copy_secret(&secret);
+    let (grant_id, _handle) = fx.install(grant, secret);
+    fx.ingest_granted(&envelope_secret, tag);
+
+    let pre_loop: SectionObservationSlot = Arc::new(parking_lot::Mutex::new(None));
+    let in_query: GrantQueryObservationLog = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let (_, acquisitions_before) = fx.node.cold_section_observation();
+    {
+        let node = fx.node.clone();
+        let scoped = fx.node.scoped_discovery.clone();
+        let pre_loop = pre_loop.clone();
+        *fx.node.cold_capture_plane_gap_hook.lock() = Some(Arc::new(move || {
+            let (identity, acquisitions) = node.cold_section_observation();
+            *pre_loop.lock() = Some((identity, acquisitions, scoped.try_lock().is_none()));
+        }));
+    }
+    {
+        let node = fx.node.clone();
+        let scoped = fx.node.scoped_discovery.clone();
+        let in_query = in_query.clone();
+        *fx.node.cold_capture_in_grant_query_hook.lock() = Some(Arc::new(move |rows| {
+            let (identity, acquisitions) = node.cold_section_observation();
+            in_query
+                .lock()
+                .push((identity, acquisitions, scoped.try_lock().is_none(), rows));
+        }));
+    }
+
+    let capture = fx
+        .node
+        .org_cold_discovery(&capability, &[grant_id])
+        .expect("an adopted node captures");
+
+    let (pre_identity, pre_acquisitions, pre_contended) = pre_loop
+        .lock()
+        .take()
+        .expect("the between-planes window was never entered, so this witness asserted nothing");
+    let queries = in_query.lock().clone();
+    assert_eq!(
+        queries.len(),
+        1,
+        "exactly one grant query must have executed inside the section — an empty \
+         grant list would make this witness vacuous (F1)"
+    );
+    let (query_identity, query_acquisitions, query_contended, rows) = queries[0];
+    assert_eq!(
+        rows, 1,
+        "the grant query must have produced the ingested row, so the observation \
+         below is about a REAL non-empty query"
+    );
+    assert_eq!(
+        capture.granted_providers(&grant_id).len(),
+        1,
+        "and that row reached the capture"
+    );
+    assert!(
+        pre_contended,
+        "the store lock must be held at the owner->grant boundary"
+    );
+    assert!(
+        query_contended,
+        "and still held INSIDE the grant query — the point the pre-loop \
+         observation alone cannot see"
+    );
+    assert_ne!(pre_identity, 0, "a section identity must have been stamped");
+    assert_eq!(
+        pre_identity, query_identity,
+        "the SAME acquisition must span the owner plane and the grant query; a \
+         drop-and-reacquire holds a lock at both points but moves this identity"
+    );
+    assert_eq!(
+        (pre_acquisitions, query_acquisitions),
+        (acquisitions_before + 1, acquisitions_before + 1),
+        "exactly ONE store section may be opened per capture"
+    );
+    let (_, acquisitions_after) = fx.node.cold_section_observation();
+    assert_eq!(
+        acquisitions_after,
+        acquisitions_before + 1,
+        "and none afterwards"
+    );
+    assert!(
+        fx.node.scoped_discovery.try_lock().is_some(),
+        "control: the store lock is free once the capture returns, so the \
+         contention above is about the capture and not about an unavailable lock"
+    );
+}
+
+/// (C2) An authority installation that ARRIVES during a capture waits for it,
+/// and supersedes it afterwards.
+///
+/// The other half of HOLD-1's repair. C6 proves a capture cannot observe the
+/// writer's pre-publication window; this proves the reverse direction — a writer
+/// that arrives while a capture is in flight cannot interleave with it. The
+/// capture completes under the PREDECESSOR epoch (which is what was installed
+/// while it ran), and the installation that was queued behind it then makes that
+/// stamp stale, so the plan re-derives rather than minting.
+///
+/// Deterministic through `contention_hook`, not timing: the installer is proven
+/// to be AT the gate before the capture is allowed to finish. Dies to removing
+/// the gate from the capture — the installer would not contend, and the capture
+/// could then splice the two authorities.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_authority_install_during_a_cold_capture_waits_for_it() {
+    let node = node().await;
+    let org = crate::adapter::net::behavior::org::OrgKeypair::from_bytes([0xc2u8; 32]);
+    node.install_node_authority(adopt_authority(&node, &org, "cold-arrives-a"))
+        .expect("install authority");
+    let before = node.routing_authority.epoch();
+
+    let blocked = Arc::new(parking_lot::Mutex::new(Some(arm_authority_contention(
+        &node,
+    ))));
+    let installer: Arc<parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>> =
+        Arc::new(parking_lot::Mutex::new(None));
+    let successor = adopt_authority(&node, &org, "cold-arrives-b");
+    {
+        let hook_node = node.clone();
+        let installer = installer.clone();
+        let blocked = blocked.clone();
+        *node.cold_capture_authority_gap_hook.lock() = Some(Arc::new(move || {
+            {
+                let node = hook_node.clone();
+                let successor = successor.clone();
+                *installer.lock() = Some(std::thread::spawn(move || {
+                    node.install_node_authority(successor)
+                        .expect("same-org renewal is accepted");
+                }));
+            }
+            blocked
+                .lock()
+                .as_ref()
+                .expect("contention receiver")
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the installation must contend on the authority gate the capture holds");
+        }));
+    }
+
+    let capture = node
+        .org_cold_discovery(&CapabilityAuthorityId::for_tag("nrpc:cold.arrives"), &[])
+        .expect("the capture completes under the authority installed while it ran");
+    assert_eq!(
+        capture.authority().stamp().epoch(),
+        before,
+        "the capture carries the epoch that was installed for its whole \
+         observation, never a mixture"
+    );
+    if let Some(handle) = installer.lock().take() {
+        handle.join().expect("installer thread");
+    }
+    assert_ne!(
+        node.routing_authority.epoch(),
+        before,
+        "precondition: the queued installation landed once the capture released \
+         the gate"
+    );
+    assert!(
+        !node.org_cold_authority_is_current(capture.authority()),
+        "and the completed capture is superseded by it, so no proof is minted \
+         under the predecessor"
+    );
+}
+
+/// (C3) A node with no installed authority refuses the capture, with the
+/// adjacent control that adopting one admits it.
+///
+/// Fail-closed: without authority there is no private-discovery authority to
+/// plan under, and reporting an empty provider set would misattribute a local
+/// configuration failure to the network.
+#[tokio::test]
+async fn an_unadopted_node_refuses_the_cold_capture() {
+    use crate::adapter::net::behavior::org_cold_plan::OrgColdRefusal;
+    let node = node().await;
+    let capability = CapabilityAuthorityId::for_tag("nrpc:cold.unadopted");
+    assert_eq!(
+        node.org_cold_discovery(&capability, &[]).err(),
+        Some(OrgColdRefusal::NoNodeAuthority),
+        "an un-adopted node cannot capture private-discovery authority"
+    );
+    assert_eq!(
+        node.org_cold_authority().err(),
+        Some(OrgColdRefusal::NoNodeAuthority),
+        "and neither can the authority-only shape the exported path uses"
+    );
+}
+
+/// (C4) A spent authority-epoch space refuses the capture rather than capturing
+/// under an identity that can no longer be compared.
+///
+/// At saturation every later authority receives the same identity, so a stamp
+/// taken there would compare EQUAL across an unrelated replacement — exactly the
+/// aliasing the routing plane already fences.
+#[tokio::test]
+async fn a_spent_authority_epoch_refuses_the_cold_capture() {
+    use crate::adapter::net::behavior::org_cold_plan::OrgColdRefusal;
+    let node = node().await;
+    let org = crate::adapter::net::behavior::org::OrgKeypair::from_bytes([0xc4u8; 32]);
+    node.install_node_authority(adopt_authority(&node, &org, "cold-spent"))
+        .expect("install authority");
+    let capability = CapabilityAuthorityId::for_tag("nrpc:cold.spent");
+    assert!(
+        node.org_cold_discovery(&capability, &[]).is_ok(),
+        "precondition: the capture works before the epoch space is spent"
+    );
+
+    node.routing_authority
+        .epoch
+        .store(u64::MAX, Ordering::Release);
+    {
+        let _gate = node.routing_authority.lock_gate();
+        assert_eq!(
+            node.routing_authority.advance(),
+            AuthorityAdvance::NewlyExhausted,
+            "precondition: the epoch space is now terminal"
+        );
+    }
+
+    assert_eq!(
+        node.org_cold_discovery(&capability, &[]).err(),
+        Some(OrgColdRefusal::IncoherentAuthority),
+        "a spent epoch space cannot witness currentness, so the capture fails \
+         closed"
+    );
+    assert_eq!(
+        node.org_cold_authority().err(),
+        Some(OrgColdRefusal::IncoherentAuthority),
+        "and so does the authority-only shape"
+    );
+}
+
+/// (C5) The captured revocation FLOOR generation is compared on its own.
+///
+/// A real floor raise also advances the routing epoch, so an end-to-end raise
+/// proves only that SOMETHING moved. The floor generation has to be compared
+/// independently: a floor publication is authoritative inside the revocation
+/// store before the subscriber that advances the epoch runs, which is the window
+/// the routing read seam keeps its own `floor_generation` for. Isolated the same
+/// way that seam's witness isolates it — by naming the generation rather than
+/// racing the subscriber.
+#[tokio::test]
+async fn a_captured_stamp_compares_the_revocation_floor_generation() {
+    let node = node().await;
+    let org = crate::adapter::net::behavior::org::OrgKeypair::from_bytes([0xc5u8; 32]);
+    node.install_node_authority(adopt_authority(&node, &org, "cold-floors"))
+        .expect("install authority");
+    let capture = node
+        .org_cold_discovery(&CapabilityAuthorityId::for_tag("nrpc:cold.floors"), &[])
+        .expect("capture");
+
+    assert!(
+        node.org_cold_authority_is_current(capture.authority()),
+        "control: the captured stamp compares CURRENT against its own view"
+    );
+    let superseded = capture.authority().with_floor_generation_for_test(
+        capture
+            .authority()
+            .stamp()
+            .floor_generation()
+            .wrapping_sub(1),
+    );
+    assert!(
+        !node.org_cold_authority_is_current(&superseded),
+        "a stamp naming a DIFFERENT floor generation must not compare current, \
+         even with the epoch and the poison bit unchanged"
+    );
+}
+
+/// (C6) HOLD-1. A capture cannot observe the writer's epoch-advanced,
+/// publication-pending state at all.
+///
+/// This is the window `move_routing_authority` creates on purpose: it advances
+/// the routing epoch and THEN publishes the successor authority and store, so for
+/// a few instructions the epoch names the successor while the installed
+/// authority, revocation store and discovery rows are still the predecessor's. A
+/// gate-free reader that sampled the epoch anywhere inside it — before OR after
+/// loading the views — would re-check it to the same value and stamp a
+/// PREDECESSOR view with the SUCCESSOR epoch.
+///
+/// Driven by the production writer's own `pre_publish_hook`, which fires under
+/// the authority gate after the advance and before the publication. Determinism
+/// comes from `contention_hook`: it fires when a gate acquisition finds the gate
+/// HELD, immediately before blocking, so the witness KNOWS the capture reached
+/// the gate rather than inferring it from elapsed time. Dies to removing the gate
+/// from the capture — the contention signal never arrives, and the capture
+/// returns from inside the window carrying the successor epoch.
+///
+/// The capture thread is joined by the TEST, never by the hook: the hook runs
+/// with the gate held, so joining there would wait on a thread that is waiting on
+/// the hook.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cold_capture_cannot_observe_the_pre_publication_window() {
+    let node = node().await;
+    let org = crate::adapter::net::behavior::org::OrgKeypair::from_bytes([0xc6u8; 32]);
+    node.install_node_authority(adopt_authority(&node, &org, "cold-prepub-a"))
+        .expect("install the predecessor");
+    let predecessor_epoch = node.routing_authority.epoch();
+
+    let blocked = Arc::new(parking_lot::Mutex::new(Some(arm_authority_contention(
+        &node,
+    ))));
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<u64>(1);
+    let (window_tx, window_rx) = std::sync::mpsc::sync_channel::<u64>(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let release_rx = Arc::new(parking_lot::Mutex::new(release_rx));
+    let inside = Arc::new(AtomicBool::new(false));
+    let capturer: Arc<parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>> =
+        Arc::new(parking_lot::Mutex::new(None));
+    {
+        let hook_node = node.clone();
+        let capturer = capturer.clone();
+        let inside = inside.clone();
+        *node.routing_authority.pre_publish_hook.lock() = Some(Arc::new(move |live| {
+            // Inside the window: the epoch already names the successor, and
+            // nothing this transaction publishes is visible yet.
+            let _ = window_tx.try_send(live);
+            {
+                let node = hook_node.clone();
+                let result_tx = result_tx.clone();
+                let inside = inside.clone();
+                *capturer.lock() = Some(std::thread::spawn(move || {
+                    let capture = node
+                        .org_cold_discovery(
+                            &CapabilityAuthorityId::for_tag("nrpc:cold.prepub"),
+                            &[],
+                        )
+                        .expect("the capture completes once the window closes");
+                    inside.store(false, Ordering::Release);
+                    let _ = result_tx.try_send(capture.authority().stamp().epoch());
+                }));
+            }
+            // The capture is provably AT the gate, about to block — not merely
+            // slow.
+            blocked
+                .lock()
+                .as_ref()
+                .expect("contention receiver")
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the capture must contend on the authority gate");
+            inside.store(true, Ordering::Release);
+            release_rx
+                .lock()
+                .recv_timeout(Duration::from_secs(10))
+                .expect("release");
+        }));
+    }
+
+    let successor = adopt_authority(&node, &org, "cold-prepub-b");
+    let node2 = node.clone();
+    let installer = std::thread::spawn(move || {
+        node2
+            .install_node_authority(successor)
+            .expect("same-org renewal is accepted");
+    });
+    let window_epoch = window_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the writer must enter its pre-publication window");
+    assert_ne!(
+        window_epoch, predecessor_epoch,
+        "precondition: the window is entered with the epoch ALREADY advanced"
+    );
+    release_tx.send(()).expect("release the window");
+    installer.join().expect("installer thread");
+    if let Some(handle) = capturer.lock().take() {
+        handle.join().expect("capture thread");
+    }
+
+    let stamped = result_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the capture returns after the publication");
+    assert_eq!(
+        stamped, window_epoch,
+        "the capture must carry the epoch it completed under — and, because it \
+         could not run inside the window, the successor's authority and store \
+         view with it"
+    );
+    assert!(
+        !inside.load(Ordering::Acquire),
+        "the capture completed while the writer was still inside its \
+         epoch-advanced, publication-pending window: it would carry the successor \
+         epoch over a predecessor view"
+    );
+}
+
+/// (C7) HOLD-2. A torn authority vector cannot compare current.
+///
+/// Routing authority and the consumer-grant registry publish under different
+/// gates, so a component-by-component comparison can accept a vector no single
+/// instant ever held: while routing still matched, a requested grant was
+/// installed; the routing sample was taken; the grant was removed again and
+/// routing replaced; the grant load then matched too. Every component equalled
+/// the capture at the instant it was read, and none of them together.
+///
+/// The hook fires in exactly that interval — after the routing sample, before the
+/// closing grant snapshot — and moves BOTH planes in opposite directions. Dies to
+/// the single-snapshot shape (sample routing, then load grants once), which
+/// returns `true` here.
+#[tokio::test]
+async fn a_torn_authority_vector_cannot_compare_current() {
+    let fx = grant_fixture("cold-torn").await;
+    let tag = "nrpc:cold.torn";
+    let capability = CapabilityAuthorityId::for_tag(tag);
+    // Requested but NOT installed: absence is part of the captured identity, so a
+    // later install is movement exactly as a removal is.
+    let (grant, secret) = fx.mint(tag, None, None);
+    let grant_id = grant.grant_id;
+    let capture = fx
+        .node
+        .org_cold_discovery(&capability, &[grant_id])
+        .expect("capture");
+    assert!(
+        fx.node.org_cold_authority_is_current(capture.authority()),
+        "control: with nothing moving, the captured vector compares CURRENT"
+    );
+
+    // The fixture's own org, reconstructed from its seed: `OrgKeypair` is not
+    // `Clone`, and a renewal has to come from the SAME org or the install refuses.
+    let org = crate::adapter::net::behavior::org::OrgKeypair::from_bytes([0xa1u8; 32]);
+    let entered = Arc::new(AtomicBool::new(false));
+    {
+        let node = fx.node.clone();
+        let entered = entered.clone();
+        let grant = grant.clone();
+        let secret = copy_secret(&secret);
+        *fx.node.cold_comparison_gap_hook.lock() = Some(Arc::new(move || {
+            entered.store(true, Ordering::Release);
+            // Present, then absent again: the grant plane ends where the capture
+            // left it, so only the PUBLICATION IDENTITY can reveal that it moved.
+            node.install_consumer_grant_audience(grant.clone(), copy_secret(&secret))
+                .expect("install the requested grant");
+            assert!(
+                node.remove_consumer_grant_audience(&grant.grant_id),
+                "and remove it again"
+            );
+            // Routing moves in the other direction, so no instant held both.
+            node.install_node_authority(adopt_authority(&node, &org, "cold-torn-b"))
+                .expect("same-org renewal is accepted");
+        }));
+    }
+
+    assert!(
+        !fx.node.org_cold_authority_is_current(capture.authority()),
+        "a torn vector — grant absent again, routing already replaced — must not \
+         compare current"
+    );
+    assert!(
+        entered.load(Ordering::Acquire),
+        "the interval between the two grant snapshots was never entered, so this \
+         witness asserted nothing"
     );
 }

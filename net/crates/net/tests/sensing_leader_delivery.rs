@@ -106,7 +106,8 @@ async fn provider_free_proofs_fan_back_through_the_leader() {
     let b = mk(EntityKeypair::generate(), None).await;
     let r = mk(EntityKeypair::generate(), None).await;
     let p = mk(owner_kp, Some(Incarnation::new(1))).await;
-    p.register_readiness_evaluator(CapabilityId::new("print.document"), Arc::new(AlwaysReady));
+    p.register_readiness_evaluator(CapabilityId::new("print.document"), Arc::new(AlwaysReady))
+        .expect("evaluator registers");
 
     connect_pair(&a, &r).await;
     connect_pair(&b, &r).await;
@@ -299,7 +300,8 @@ async fn divergent_leaders_at_one_provider_count_a_merge_miss() {
     let r1 = mk(EntityKeypair::generate(), None).await;
     let r2 = mk(EntityKeypair::generate(), None).await;
     let p = mk(owner_kp, Some(Incarnation::new(1))).await;
-    p.register_readiness_evaluator(CapabilityId::new("print.document"), Arc::new(AlwaysReady));
+    p.register_readiness_evaluator(CapabilityId::new("print.document"), Arc::new(AlwaysReady))
+        .expect("evaluator registers");
 
     connect_pair(&a1, &r1).await;
     connect_pair(&a2, &r2).await;
@@ -424,7 +426,8 @@ async fn provider_free_ttl_half_refreshes_do_not_starve_leader_delivery() {
     let a = mk(EntityKeypair::generate(), None).await;
     let r = mk(EntityKeypair::generate(), None).await;
     let p = mk(owner_kp, Some(Incarnation::new(1))).await;
-    p.register_readiness_evaluator(CapabilityId::new("print.document"), Arc::new(AlwaysReady));
+    p.register_readiness_evaluator(CapabilityId::new("print.document"), Arc::new(AlwaysReady))
+        .expect("evaluator registers");
 
     connect_pair(&a, &r).await;
     connect_pair(&r, &p).await;
@@ -538,7 +541,8 @@ async fn watch_expiry_fully_reclaims_provider_free_observation_state() {
     let a = mk(EntityKeypair::generate(), None).await;
     let r = mk(EntityKeypair::generate(), None).await;
     let p = mk(owner_kp, Some(Incarnation::new(1))).await;
-    p.register_readiness_evaluator(CapabilityId::new("print.document"), Arc::new(AlwaysReady));
+    p.register_readiness_evaluator(CapabilityId::new("print.document"), Arc::new(AlwaysReady))
+        .expect("evaluator registers");
 
     connect_pair(&a, &r).await;
     connect_pair(&r, &p).await;
@@ -660,7 +664,8 @@ async fn provider_refusal_partitions_the_leaders_real_consumer_rows() {
     let b = mk(EntityKeypair::generate(), None).await;
     let r = mk(EntityKeypair::generate(), None).await;
     let p = mk(owner_kp, Some(Incarnation::new(1))).await;
-    p.register_readiness_evaluator(CapabilityId::new("print.document"), Arc::new(AlwaysReady));
+    p.register_readiness_evaluator(CapabilityId::new("print.document"), Arc::new(AlwaysReady))
+        .expect("evaluator registers");
 
     connect_pair(&a, &r).await;
     connect_pair(&b, &r).await;
@@ -804,8 +809,10 @@ async fn leader_resolved_as_provider_serves_its_own_proofs() {
     // R holds the owner identity AND the origin role: leader,
     // provider, and owner are one node (the v1 single-owner shape).
     let r = mk(owner_kp, Some(Incarnation::new(1))).await;
-    r.register_readiness_evaluator(CapabilityId::new("print.document"), Arc::new(AlwaysReady));
-    a.register_readiness_evaluator(CapabilityId::new("print.document"), Arc::new(AlwaysReady));
+    r.register_readiness_evaluator(CapabilityId::new("print.document"), Arc::new(AlwaysReady))
+        .expect("evaluator registers");
+    a.register_readiness_evaluator(CapabilityId::new("print.document"), Arc::new(AlwaysReady))
+        .expect("evaluator registers");
 
     connect_pair(&a, &r).await;
     connect_pair(&b, &r).await;
@@ -989,7 +996,8 @@ async fn distinct_signer_that_knows_the_digest_is_not_solicited() {
     let r = mk(EntityKeypair::generate(), None).await;
     let p = mk(owner_kp, Some(Incarnation::new(1))).await;
     let x = mk(EntityKeypair::generate(), None).await;
-    p.register_readiness_evaluator(CapabilityId::new("print.document"), Arc::new(AlwaysReady));
+    p.register_readiness_evaluator(CapabilityId::new("print.document"), Arc::new(AlwaysReady))
+        .expect("evaluator registers");
 
     connect_pair(&a, &r).await;
     connect_pair(&r, &p).await;
@@ -1178,7 +1186,8 @@ async fn fold_withdrawal_reconciles_leader_demand() {
     let a = mk(EntityKeypair::generate(), None).await;
     let r = mk(EntityKeypair::generate(), None).await;
     let p = mk(owner_kp, Some(Incarnation::new(1))).await;
-    p.register_readiness_evaluator(CapabilityId::new("print.document"), Arc::new(AlwaysReady));
+    p.register_readiness_evaluator(CapabilityId::new("print.document"), Arc::new(AlwaysReady))
+        .expect("evaluator registers");
 
     connect_pair(&a, &r).await;
     connect_pair(&r, &p).await;
@@ -1315,7 +1324,8 @@ async fn suppressed_in_window_fold_change_reconciles_at_the_window_boundary() {
     let a = mk(EntityKeypair::generate(), None).await;
     let r = mk(EntityKeypair::generate(), None).await;
     let p = mk(owner_kp, Some(Incarnation::new(1))).await;
-    p.register_readiness_evaluator(CapabilityId::new("print.document"), Arc::new(AlwaysReady));
+    p.register_readiness_evaluator(CapabilityId::new("print.document"), Arc::new(AlwaysReady))
+        .expect("evaluator registers");
 
     connect_pair(&a, &r).await;
     connect_pair(&r, &p).await;

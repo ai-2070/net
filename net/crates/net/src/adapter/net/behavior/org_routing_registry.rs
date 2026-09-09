@@ -1842,6 +1842,37 @@ impl NodeOrgRoutingRegistry {
         }
     }
 
+    /// Drive the family identity space to its TERMINAL state.
+    ///
+    /// Test/fixtures only, and it exists so a witness can exercise the real
+    /// refusal boundary rather than a substitute: after this, `new_family`
+    /// returns `DemandRefused::IdSpaceExhausted` through exactly the
+    /// production path it always would - `allocate_id`'s `checked_add`
+    /// declining to wrap. Nothing else is mutated: no slot, no handle, no
+    /// generation.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub(crate) fn exhaust_family_ids_for_test(&self) {
+        self.inner.lock().next_id = u64::MAX;
+    }
+
+    /// How many identity reservations this registry has refused for an
+    /// exhausted identity space — family mints AND slot-incarnation
+    /// reservations alike, since all four writers share one counter and one
+    /// `next_id`.
+    ///
+    /// Test/fixtures only. A witness for "the mint happens once, at bind" uses
+    /// it as a DELTA over a call path that reserves no slots, which is what
+    /// makes the reading unambiguous there: a different live family taking a
+    /// new slot after exhaustion would move this counter too, without any
+    /// second bind-time mint. Do not read an absolute value as a family-mint
+    /// count.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub(crate) fn identity_space_refusals_for_test(&self) -> u64 {
+        self.metrics
+            .refused_id_space_exhausted
+            .load(Ordering::Acquire)
+    }
+
     /// Register demand for `key` from `family`.
     ///
     /// FIRST demand for a key creates the slot and queues an exact FULL recapture

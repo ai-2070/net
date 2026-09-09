@@ -172,7 +172,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           set -o pipefail
-          MIN=86
+          MIN=93
           out=$(cargo test --lib --features "$UNIT_FEATURES" \
                   org_routing_wiring_tests 2>&1 | tee /dev/stderr)
           n=$(printf '%s\n' "$out" \
@@ -248,7 +248,14 @@ jobs:
           a_projection_and_its_generation_are_never_observed_torn
           a_peer_snapshot_retains_no_shard_and_drops_the_ingress_peer
           a_peer_replaced_after_revalidation_cannot_publish_its_old_session
-          the_announce_lock_is_acquired_under_a_bound_and_refuses_past_it"
+          the_announce_lock_is_acquired_under_a_bound_and_refuses_past_it
+          one_cold_capture_acquisition_spans_the_owner_and_grant_queries
+          an_authority_install_during_a_cold_capture_waits_for_it
+          an_unadopted_node_refuses_the_cold_capture
+          a_spent_authority_epoch_refuses_the_cold_capture
+          a_captured_stamp_compares_the_revocation_floor_generation
+          a_cold_capture_cannot_observe_the_pre_publication_window
+          a_torn_authority_vector_cannot_compare_current"
           for required in $REQUIRED; do
             if ! printf "%s" "$out" | grep -q "$required"; then
               echo "::error::required routing witness missing: $required"
@@ -450,6 +457,379 @@ jobs:
           done
           echo "OLB-2B.3b: $rn registry (min $REG_MIN) + $sn state (min $STATE_MIN) passed; all named witnesses present"
 
+      # SELECTOR ↔ TARGET ORG INTAKE (organization exact-provider sensing, the
+      # intake slice only). The org-sensing authority gate is the single
+      # admission transaction that turns an attacker-controlled 0x0C02 org
+      # registration frame into a validated object, so every refusal arm is a
+      # security property. This step gates two things:
+      #
+      #   * `behavior::sensing::org_gate::tests` — the gate's own witnesses,
+      #     including the selector ↔ target relation and the authority-free
+      #     shape phase;
+      #   * `mesh::sensing_authority_witness_tests` — the PRODUCTION dispatch
+      #     ordering witness, plus the LOCAL-ORIGIN organization lease-egress
+      #     witnesses: an own-org exact lease registers under the
+      #     organization-derived proven root (never `sensing_local_root`), the
+      #     exactness rule holds on egress, a foreign audience never enters the
+      #     org path, a node without authority cannot produce an org lease, and
+      #     the legacy lease path is unchanged.
+      #
+      # This step gates local-origin org lease EGRESS. It does NOT gate
+      # projection, ranking, refresh workers, `OrgClient` wiring or any
+      # production arm lighting — none of that exists yet.
+      #
+      # WHY THIS SHAPE. An earlier revision parsed the first
+      # `test result: ok. N passed` it could find and checked required names
+      # with a substring `grep -q`. Both were spoofable: a test NAME or a panic
+      # message containing the summary text could supply the count, and
+      # `<required>_extra` satisfied a substring match for `<required>`. The
+      # replacement is structurally exact on four independent axes:
+      #
+      #   0. FAIL CLOSED ON STATUS. Every cargo invocation's exit status is
+      #      captured and checked. `accept_exact_run` takes the status as its
+      #      FIRST argument and rejects a nonzero one BEFORE reading any output,
+      #      so success-looking text can never rescue a failed command — the
+      #      previous shape could, because `out=$(cargo ...)` discarded the
+      #      status and only the text was examined. An adversarial SELF-TEST at
+      #      the top of the step executes that exact predicate against a
+      #      nonzero command carrying perfect success text and fails the step if
+      #      it is accepted, so this property is proven per run, not asserted.
+      #   1. INVENTORY comes from `-- --list`, which EXECUTES NOTHING, so no
+      #      test output exists to inject a summary line at all. Each line is
+      #      exactly `<fully::qualified::name>: test` and is matched anchored at
+      #      both ends with a name charset (`[a-z0-9_]`) that cannot contain
+      #      `: test`. A stray diagnostic cannot match `^…$`. The self-test also
+      #      runs this pattern against injected/indented/prefixed/decorated
+      #      lines and requires zero matches.
+      #   2. EXISTENCE of each required witness is an anchored full-path match
+      #      against that same inventory, so `<name>_extra` is a different
+      #      string and fails.
+      #   3. EXECUTION is one `-- --exact <fully::qualified::name>` run per
+      #      witness, asserting the zero exit status AND `running 1 test` AND a
+      #      `1 passed; 0 failed` summary — status, cardinality and verdict
+      #      pinned separately. `--exact` does not match `<name>_extra` either.
+      #
+      # `cargo test` has NO retry mechanism at all, so no ordering or race
+      # witness here can be retried into green (retries exist only under nextest
+      # via `.config/nextest.toml`). This job deliberately stays on `cargo test`
+      # — see the note at the top of the job.
+      #
+      # NOTE: `#[cfg(test)]`, NOT `feature = "fixtures"` — `$UNIT_FEATURES`
+      # deliberately excludes `fixtures`, so a fixtures gate would compile these
+      # modules to a silent 0-test no-op here.
+      #
+      # FLOOR accounting (verified against `cargo test --lib --features
+      # "$UNIT_FEATURES" -- --list`, NOT by hand):
+      #   org_gate                        = 60
+      #     42 baseline + 7 (selector-target intake) + 5 (local-origin planner)
+      #     + 6 (publication-pinned fence, off-lock relay crypto window)
+      #   sensing_authority_witness_tests = 67
+      #     28 baseline + 1 (dispatch ordering) + 6 (local org lease egress)
+      #     + 4 (lease-egress hold repair) + 10 (transition order, release
+      #     coherence, phase-2 coverage, currentness fence)
+      #     + 3 (release-through-fence, rollback plane, provenance ordering)
+      #     + 3 (acquisition transaction: partitioned-tightening restoration,
+      #     the partition-to-restoration authority race, the refused
+      #     remote-provider inverse)
+      #     + 7 (exact-head HOLD repair: 3 inbound-admission fence, 3 bounded
+      #     egress + terminal lifecycle, 1 terminal lease identity)
+      #     + 5 (exact-head RE-REVIEW repair: grace-expiry settlement, concurrent
+      #     teardown, cancelled teardown, the parked-creation/shutdown race, the
+      #     parked-enqueue/close race)
+      #     + 1 (exact-head THIRD-review repair: post-abort cancellation
+      #     recovered and retired exactly once, split off the drain-cancellation
+      #     leg it used to share)
+      #     net of 3 retired: the two manual-wrapper guard witnesses replaced by
+      #     production-observed ones, and the cached-floor "rollback plane"
+      #     witness replaced by the two destructive-partition witnesses above
+      # The mesh line previously read 35 while MESH_MIN read 39 — the arithmetic
+      # drifted from the pin. Re-derive both from `--list` when you change them.
+      #
+      # REQUIRED holds 58 names (18 gate + 40 mesh). Count with the loops below,
+      # not by eye: a prior comment claimed 34, which was neither the roster size
+      # nor any derived figure.
+      #
+      # A later slice RAISES a floor and APPENDS its names in the same commit
+      # that adds the witnesses — never separately, or the gate goes red on a
+      # name that does not exist yet. Likewise, RETIRING a witness removes its
+      # name here in the same commit, or the anchored existence check fails on a
+      # name that no longer exists.
+      - name: Selector-target org intake witnesses
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          GATE=adapter::net::behavior::sensing::org_gate::tests
+          MESH=adapter::net::mesh::sensing_authority_witness_tests
+          GATE_MIN=60
+          MESH_MIN=67
+
+          die() { echo "::error::$1"; shift; [ "$#" -gt 0 ] && printf '%s\n' "$@"; exit 1; }
+
+          # ACCEPTANCE PREDICATE for one exact-test run. Takes the command's
+          # EXIT STATUS first and rejects a nonzero status BEFORE looking at any
+          # output, so no amount of success-looking text can rescue a failed
+          # command. Factored out precisely so the adversarial self-test below
+          # exercises this exact code, not a paraphrase of it.
+          accept_exact_run() {   # $1=status  $2=output
+            [ "$1" -eq 0 ] || return 1
+            printf '%s\n' "$2" | grep -qE '^running 1 test$' || return 1
+            printf '%s\n' "$2" | grep -qE '^test result: ok\. 1 passed; 0 failed;' || return 1
+            return 0
+          }
+
+          # ---- ADVERSARIAL SELF-TEST, run before anything is trusted.
+          # A command that exits NONZERO while printing perfect success text
+          # must be rejected; the same text with status 0 must be accepted.
+          # This is the executable proof that the step is fail-closed on status.
+          spoof=$(printf 'running 1 test\ntest adapter::x ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n')
+          if accept_exact_run 1 "$spoof"; then
+            die "self-test FAILED: a nonzero command with spoofed success text was accepted"
+          fi
+          if ! accept_exact_run 0 "$spoof"; then
+            die "self-test FAILED: a zero-status run with valid success text was rejected"
+          fi
+          # And the anchored inventory pattern must ignore injected/decorated
+          # lines: only a bare, fully-qualified `<fqn>: test` line counts.
+          inject=$(printf 'test result: ok. 999 passed; 0 failed\n    %s::indented: test\nnote: %s::prefixed: test\n%s::bad!char: test\n%s::suffixed: test extra\n' "$GATE" "$GATE" "$GATE" "$GATE")
+          spoof_n=$(printf '%s\n' "$inject" | grep -cE "^${GATE}::[a-z0-9_]+: test\$" || true)
+          if [ "$spoof_n" != "0" ]; then
+            die "self-test FAILED: anchored inventory matched $spoof_n injected line(s), expected 0"
+          fi
+          echo "self-test: fail-closed-on-status and anchored-inventory checks both reject spoofs"
+
+          # (1) structural inventory — `--list` EXECUTES NOTHING, so there is no
+          #     test output at all to inject a summary line into. Fail closed on
+          #     the cargo status itself.
+          if ! list=$(cargo test --lib --features "$UNIT_FEATURES" -- --list 2>&1); then
+            die "cargo test -- --list failed" "$list"
+          fi
+          gate_n=$(printf '%s\n' "$list" | grep -cE "^${GATE}::[a-z0-9_]+: test\$" || true)
+          mesh_n=$(printf '%s\n' "$list" | grep -cE "^${MESH}::[a-z0-9_]+: test\$" || true)
+          echo "inventory: $gate_n in org_gate::tests (min $GATE_MIN), $mesh_n in sensing_authority_witness_tests (min $MESH_MIN)"
+          if [ "${gate_n:-0}" -lt "$GATE_MIN" ]; then
+            die "expected >= $GATE_MIN witnesses in $GATE, listed ${gate_n:-0}" \
+                "Module: the #[cfg(test)] mod tests in src/adapter/net/behavior/sensing/org_gate.rs." \
+                "If witnesses were intentionally removed, lower GATE_MIN in this step in the" \
+                "same commit — do not let the gate pass vacuously."
+          fi
+          if [ "${mesh_n:-0}" -lt "$MESH_MIN" ]; then
+            die "expected >= $MESH_MIN witnesses in $MESH, listed ${mesh_n:-0}" \
+                "Module: mod sensing_authority_witness_tests in src/adapter/net/mesh.rs." \
+                "Same rule as above."
+          fi
+
+          # (2)+(3) anchored existence + exact single-test execution, per name.
+          GATE_REQUIRED="local_org_admission_refuses_a_selector_that_does_not_name_the_target
+          every_non_exact_selector_shape_is_refused_at_intake
+          the_selector_target_refusal_bumps_protocol_invalid_and_creates_no_row
+          the_selector_target_check_precedes_every_other_authority_refusal
+          an_exact_selector_naming_the_target_is_admitted_unchanged
+          an_emitted_local_org_frame_passes_the_intake_gate_unmodified
+          the_shape_phase_refuses_a_malformed_selector_with_no_authority_input
+          the_local_org_planner_emits_only_the_org_variant_with_its_own_membership
+          the_local_org_planner_refuses_an_audience_it_did_not_derive
+          the_local_org_planner_refuses_a_selector_that_does_not_name_the_target
+          a_membership_for_another_org_yields_no_local_egress_plan
+          an_emitted_local_org_lease_frame_passes_the_real_intake_gate
+          the_fence_pins_the_store_rather_than_sampling_it
+          a_floor_publication_landing_in_the_fence_window_never_reaches_the_mutation
+          a_poison_landing_in_the_fence_window_never_reaches_the_mutation
+          the_relay_crypto_window_runs_with_org_install_released
+          an_authority_swap_during_the_relay_crypto_window_is_view_changed
+          an_a_b_a_rotation_during_the_relay_crypto_window_is_view_changed"
+          # The production dispatch-ordering + LOCAL LEASE EGRESS witnesses:
+          MESH_REQUIRED="a_malformed_selector_is_refused_before_any_authority_snapshot
+          an_own_org_exact_lease_registers_under_the_org_proven_root
+          an_own_org_lease_refuses_a_selector_that_does_not_name_the_target
+          a_foreign_org_audience_never_enters_the_local_org_egress
+          a_node_without_org_authority_cannot_produce_an_org_lease
+          a_legacy_audience_lease_still_registers_under_the_local_root
+          an_org_audience_sensing_lease_is_never_laundered_into_a_legacy_frame
+          releasing_the_strictest_org_holder_reauthors_at_the_relaxed_cadence
+          an_authority_swap_inside_the_capture_window_creates_no_org_row
+          a_floor_raise_inside_the_capture_window_creates_no_org_row
+          a_self_provider_org_lease_requires_selector_exactness
+          a_later_org_transition_cannot_overtake_a_parked_earlier_one
+          a_final_deregister_cannot_be_resurrected_by_a_racing_registration
+          a_surviving_holder_release_without_authority_is_refused_and_changes_nothing
+          a_final_org_release_without_authority_still_tears_the_row_down
+          an_owner_org_swap_cannot_reclassify_an_existing_org_lease
+          a_below_floor_membership_refuses_a_surviving_holder_release
+          a_legacy_lease_stays_legacy_after_an_authority_arrives
+          the_production_transaction_identifies_each_guard_it_holds
+          a_final_release_reaches_phase_two_holding_nothing
+          a_floor_raise_between_preparation_and_the_fence_refuses_the_release
+          a_partitioned_tightening_restores_the_row_and_never_moves_the_registry
+          an_authority_change_during_a_refused_tightening_leaves_one_state
+          a_refused_remote_acquisition_moves_nothing_and_emits_nothing
+          an_authority_loss_duplicate_cannot_strand_a_final_release
+          an_install_attempted_inside_the_fence_cannot_precede_the_mutation
+          a_stale_capture_window_emits_no_frame_at_all
+          an_inbound_org_row_mutation_cannot_interleave_with_a_publication
+          a_floor_publication_winning_the_inbound_fence_creates_no_row
+          a_poison_winning_the_inbound_fence_creates_no_row
+          a_stuck_org_send_retires_at_the_deadline_and_the_next_advances
+          a_shutdown_egress_can_be_neither_created_nor_enqueued
+          an_enqueue_after_close_is_refused_and_strands_no_queue
+          an_exhausted_lease_identity_space_moves_no_row_and_keeps_incumbents
+          a_grace_expiry_settles_and_releases_every_outstanding_datagram
+          concurrent_teardowns_both_observe_settlement
+          a_cancelled_teardown_leaves_the_consumer_recoverable
+          a_creation_parked_under_the_cell_cannot_be_overtaken_by_shutdown
+          an_enqueue_holding_the_queue_lock_blocks_close
+          a_post_abort_cancellation_is_recovered_and_retired_exactly_once"
+
+          check_one() {
+            fqn="$1"
+            hits=$(printf '%s\n' "$list" | grep -cE "^${fqn}: test\$" || true)
+            if [ "$hits" != "1" ]; then
+              die "required witness not found exactly once by anchored full path: $fqn (matched $hits)"
+            fi
+            # Capture the cargo STATUS explicitly and hand it to the predicate
+            # first. The script never enables errexit, so `out=$(cmd)` cannot
+            # abort mid-function and `$?` is exactly cargo's status.
+            out=$(cargo test --lib --features "$UNIT_FEATURES" -- --exact "$fqn" 2>&1)
+            st=$?
+            if ! accept_exact_run "$st" "$out"; then
+              die "$fqn did not run and pass as exactly one test (cargo exit $st)" "$out"
+            fi
+            echo "  exact: $fqn (cargo exit $st)"
+          }
+
+          for required in $GATE_REQUIRED; do check_one "${GATE}::${required}"; done
+          for required in $MESH_REQUIRED; do check_one "${MESH}::${required}"; done
+
+          # Whole-module runs, so a witness cannot be green in isolation while
+          # broken beside its siblings. Fail closed on status here too.
+          if ! gate_out=$(cargo test --lib --features "$UNIT_FEATURES" "${GATE}::" 2>&1); then
+            die "whole-module run failed for $GATE" "$gate_out"
+          fi
+          if ! mesh_out=$(cargo test --lib --features "$UNIT_FEATURES" "${MESH}::" 2>&1); then
+            die "whole-module run failed for $MESH" "$mesh_out"
+          fi
+          echo "selector-target org intake: self-test + inventory + anchored existence + exact per-witness runs + whole-module runs all green"
+
+      # The retained organization exact-provider DEMAND and REFRESH witnesses
+      # (`src/adapter/net/behavior/org_sensing_demand.rs`). Same discipline as
+      # the step above and for the same reason: these are `#[cfg(test)]` units,
+      # so a bare `cargo test --lib -- <filter>` that matched nothing would exit
+      # 0 and the coverage loss would be silent.
+      #
+      # The roster is DERIVED from `--list`, not asserted against a hand count:
+      # the floor is "every listed witness must run and pass, and there must be
+      # at least the ones this slice named". No future floor is inherited.
+      - name: Organization sensing demand + refresh witnesses
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          DEMAND=adapter::net::behavior::org_sensing_demand::tests
+
+          die() { echo "::error::$1"; shift; [ "$#" -gt 0 ] && printf '%s\n' "$@"; exit 1; }
+
+          # `--list` EXECUTES NOTHING, so there is no test output to inject a
+          # summary line into. Fail closed on cargo's own status.
+          if ! list=$(cargo test --lib --features "$UNIT_FEATURES" -- --list 2>&1); then
+            die "cargo test -- --list failed" "$list"
+          fi
+          # NOT deduplicated: the exactly-once check below is only honest if a
+          # duplicated record is visible as a duplicate.
+          listed=$(printf '%s\n' "$list" | grep -E "^${DEMAND}::[a-z0-9_]+: test\$" \
+                     | sed "s|^${DEMAND}::||; s|: test\$||" | sort)
+          n=$(printf '%s\n' "$listed" | grep -c . || true)
+          echo "inventory: $n witness(es) in $DEMAND"
+
+          # The invariants this slice is accountable for. Each must be present
+          # exactly once; the module may grow beyond them freely.
+          #
+          # The HOLD-repair outcomes are in here by name: shared-installation
+          # retirement, refused-release ownership, node binding, transactional
+          # convergence, discovery provenance, stale/postponed re-arm, the
+          # in-transaction no-mutation baseline, and cancellation-safe teardown.
+          #
+          # SECOND-review outcomes, likewise: carried-ownership validation,
+          # stale-vs-live retention capacity, capacity-exempt reinstatement,
+          # aged-installation adoption, executor fairness under a
+          # continuously-due schedule, and a nonempty verified discovery
+          # population.
+          #
+          # THIRD-review outcomes: the ticket/installation/freshness triple
+          # coming from one acquisition transaction, membership-based carry
+          # validation, adoption of an already-aged row, discharge of retained
+          # ownership at the invalidation that killed it, no capacity rejection
+          # of a live ticket, and in-window rederivation of a NONEMPTY
+          # population.
+          #
+          # FOURTH-review outcomes: a coherent one-read ownership observation
+          # (no cross-observation invariant to trip on legitimate movement),
+          # ledger admission closed against the invalidation that discharges
+          # it, and a CALLER-path witness that catches a family which stops
+          # consuming the acquisition's returned facts.
+          #
+          # FIFTH-review outcome: the adoption schedule decision is observed
+          # under the schedule guard that took it, so a completed renewal's
+          # re-arm can never be mistaken for the initial adoption arm.
+          REQUIRED="only_the_last_family_owner_retires_retained_demand
+          a_nonfinal_family_retirement_keeps_the_shared_installation_refreshing
+          a_refused_retirement_release_keeps_the_holder_and_recovers_it
+          a_family_only_touches_the_node_it_was_minted_for
+          concurrent_convergences_of_one_capability_leak_nothing
+          reconciliation_preserves_the_surviving_holders_installation
+          a_refused_provider_does_not_cost_the_others_their_demand
+          a_retention_without_live_authority_retains_nothing
+          the_family_capability_bound_refuses_and_evicts_nothing
+          a_population_derived_under_a_moved_view_is_re_derived
+          a_verified_discovery_population_retains_and_follows_floor_movement
+          an_invalidated_installation_is_reacquired_not_carried_forward
+          a_stale_retained_release_cannot_hold_capacity_against_a_live_one
+          a_failed_retry_reinstates_its_ticket_even_at_capacity
+          a_refresh_renews_without_acquiring_a_holder
+          a_rival_acquisition_inside_a_refresh_window_is_not_a_violation
+          a_refresh_never_resurrects_retired_or_superseded_demand
+          a_stale_rearm_cannot_displace_its_successor
+          a_joining_holder_cannot_postpone_a_live_renewal
+          adopting_an_unarmed_installation_renews_it_at_once
+          an_authority_rotation_renews_and_a_foreign_owner_refuses
+          the_single_worker_refreshes_every_retained_installation
+          an_earlier_arm_shortens_a_live_park
+          a_nanosecond_horizon_cannot_starve_the_runtime
+          a_cancelled_refresh_close_leaves_a_recoverable_worker
+          an_acquisition_reports_its_own_installation_and_freshness
+          a_carried_ticket_is_validated_by_membership_not_identity
+          adopting_an_aged_installation_renews_before_it_expires
+          an_invalidation_discharges_the_releases_it_killed
+          a_fresh_admission_at_the_ceiling_keeps_its_live_ticket
+          a_nonempty_population_is_rederived_when_the_view_moves_in_window
+          an_invalidation_during_carry_validation_is_legitimate_movement
+          an_admission_after_its_invalidation_owns_nothing
+          a_concurrent_establishment_cannot_make_a_join_look_established
+          a_completed_rearm_is_not_the_adoption_decision"
+          required_n=$(printf '%s\n' $REQUIRED | grep -c .)
+          if [ "$n" -lt "$required_n" ]; then
+            die "expected at least $required_n witnesses in $DEMAND, listed $n" \
+                "Module: the #[cfg(test)] mod tests in" \
+                "src/adapter/net/behavior/org_sensing_demand.rs." \
+                "If witnesses were intentionally removed, remove their names here in the" \
+                "same commit — do not let the gate pass vacuously."
+          fi
+          for required in $REQUIRED; do
+            hits=$(printf '%s\n' "$listed" | grep -cE "^${required}\$" || true)
+            if [ "$hits" != "1" ]; then
+              die "required demand/refresh witness not found exactly once: $required (matched $hits)"
+            fi
+          done
+
+          # WHOLE-MODULE run, fail closed on status, and every LISTED witness
+          # must have passed — the count comes from the inventory above, so an
+          # added witness is covered without editing this step.
+          out=$(cargo test --lib --features "$UNIT_FEATURES" "${DEMAND}::" 2>&1)
+          st=$?
+          printf '%s\n' "$out"
+          [ "$st" -eq 0 ] || die "whole-module run failed for $DEMAND (cargo exit $st)"
+          if ! printf '%s\n' "$out" | grep -qE "^test result: ok\. $n passed; 0 failed;"; then
+            die "the whole-module run did not pass exactly the $n inventoried witnesses"
+          fi
+          echo "organization sensing demand + refresh: $n witness(es) listed, $required_n pinned by name, all green"
+
       # Doctests live in `///` comment blocks across `src/` and `sdk/src/`.
       # `cargo test --lib` does not execute them — they need a separate
       # `cargo test --doc` invocation. Same broad feature set so doc
@@ -536,16 +916,163 @@ jobs:
           integration_jetstream  # required-features=[jetstream]; needs a service container
           natsim                 # runs in natsim.yml (privileged netns harness, --ignored)
           "
-          # Scrape the real pins only: drop YAML comment lines and this
-          # step's own `echo` prose, both of which mention the flag by name
-          # and would otherwise be scraped as bogus test targets.
+          # Scrape the real pins and ATTRIBUTE each one to the crate its
+          # invocation targets. `--test <name>` is resolved against the crate
+          # the invoking step runs in, so a pin only proves coverage for THAT
+          # crate: an explicit `-p <package>` (resolved to the crate it names,
+          # so a redundant `-p net-mesh` on a root step is still the root
+          # crate), else the step's own `working-directory`, else the job
+          # default. Without that attribution a root test would count as
+          # pinned merely because an SDK step names the same basename, and a
+          # pin placed under the wrong crate's directory (which names a real
+          # target somewhere else) would survive as if it covered something.
+          #
+          # Forms this attribution cannot resolve are REFUSED rather than
+          # guessed: a `working-directory:` declared after the `run:` block it
+          # would apply to, and a shell `cd` inside a run block before its
+          # pins. Both make the effective crate of a `--test` ambiguous to a
+          # line-ordered read, and a wrong guess is exactly the silent hole
+          # this guard exists to close. A `-p` that names neither crate is
+          # reported the same way.
+          #
+          # Comment lines and this step's own `echo` prose are dropped first:
+          # both mention the flag by name and would be scraped as bogus
+          # targets.
           sed '/^[[:space:]]*#/d' "$GITHUB_WORKSPACE/.github/workflows/ci.yml" \
             | grep -v 'echo ' \
-            | grep -oE -- '--test [a-z0-9_]+' \
-            | sed 's/--test //' | sort -u > /tmp/pinned.txt
+            | awk '
+                # FOLD YAML folded block scalars (`run: >`) onto one physical line.
+                #
+                # The attribution pass below carries command context across a
+                # continuation only when the line ends in a backslash, which is how a
+                # LITERAL block (`run: |`) writes one. A FOLDED block never has one -
+                # YAML joins its lines itself - so `incargo` was cleared after the first
+                # line and a `-p` sitting on any later line was never read. The pin then
+                # kept the crate derived from the working directory, which is how a test
+                # could be attributed to the wrong crate and counted as covering it.
+                #
+                # A blank line inside a folded block is a paragraph break, i.e. a real
+                # newline in the folded result and therefore a separate command, so it
+                # ends the current line instead of joining across it.
+                function emit() { if (buf != "") { print buf; buf = "" } }
+                /^[[:space:]]*run:[[:space:]]*>/ {
+                  emit()
+                  match($0, /^[[:space:]]*/); findent = RLENGTH
+                  folding = 1
+                  next
+                }
+                folding {
+                  if ($0 ~ /^[[:space:]]*$/) { emit(); next }
+                  match($0, /^[[:space:]]*/); cur = RLENGTH
+                  if (cur > findent) {
+                    if (buf == "") { buf = $0 }
+                    else { t = $0; sub(/^[[:space:]]+/, "", t); buf = buf " " t }
+                    next
+                  }
+                  emit(); folding = 0
+                }
+                { print }
+                END { emit() }
+              ' \
+            | awk '
+                function crate_of_dir(dir) {
+                  if (dir == "net/crates/net") return "root"
+                  if (dir == "net/crates/net/sdk") return "sdk"
+                  return "dir:" (dir == "" ? "<repo root>" : dir)
+                }
+                function crate_of_pkg(pkg) {
+                  if (pkg == "net-mesh") return "root"
+                  if (pkg == "net-mesh-sdk") return "sdk"
+                  return "pkg:" pkg
+                }
+                function package_on(line) {
+                  if (match(line, /-p [A-Za-z0-9_-]+/)) {
+                    return substr(line, RSTART + 3, RLENGTH - 3)
+                  }
+                  return ""
+                }
+                /^  [A-Za-z0-9_-]+:[[:space:]]*$/ {
+                  jobdir=""; stepdir=""; insteps=0
+                  crate=""; incargo=0; steppinned=0; stepcd=0
+                  next
+                }
+                /^    steps:[[:space:]]*$/ { insteps=1; next }
+                /^      - / {
+                  stepdir=""; crate=""; incargo=0; steppinned=0; stepcd=0
+                }
+                /working-directory:/ {
+                  sub(/^.*working-directory:[[:space:]]*/, "")
+                  sub(/[[:space:]]+$/, "")
+                  if (insteps) {
+                    if (steppinned) {
+                      print "unsupported\ta working-directory declared after the run block it applies to"
+                    }
+                    stepdir=$0
+                  } else {
+                    jobdir=$0
+                  }
+                  next
+                }
+                {
+                  line = $0
+                  if (line ~ /cargo (test|nextest (run|list))/) {
+                    incargo=1
+                    pkg = package_on(line)
+                    crate = (pkg != "" ? crate_of_pkg(pkg) \
+                                       : crate_of_dir(stepdir != "" ? stepdir : jobdir))
+                  } else if (incargo) {
+                    # A package flag on a CONTINUATION line selects the crate
+                    # just as one on the command line does.
+                    pkg = package_on(line)
+                    if (pkg != "") { crate = crate_of_pkg(pkg) }
+                  }
+                  if (line ~ /(^|[[:space:](])cd [^[:space:]]/) { stepcd=1 }
+                  rest = line
+                  while (match(rest, /--test [a-z0-9_]+/)) {
+                    name = substr(rest, RSTART + 7, RLENGTH - 7)
+                    if (stepcd) {
+                      print "unsupported\ta shell cd precedes this pin, so its crate is ambiguous: " name
+                    } else {
+                      print (crate == "" ? "unattributed" : crate) "\t" name
+                    }
+                    steppinned=1
+                    rest = substr(rest, RSTART + RLENGTH)
+                  }
+                  if (line !~ /\\[[:space:]]*$/) { incargo=0 }
+                }
+              ' | sort -u > /tmp/pinned_by_crate.txt
+          awk -F'\t' '$1 == "root" { print $2 }' /tmp/pinned_by_crate.txt \
+            | sort -u > /tmp/pinned_root.txt
+          awk -F'\t' '$1 == "sdk" { print $2 }' /tmp/pinned_by_crate.txt \
+            | sort -u > /tmp/pinned_sdk.txt
+          awk -F'\t' '$1 != "root" && $1 != "sdk" { print $1 ": " $2 }' \
+            /tmp/pinned_by_crate.txt | sort -u > /tmp/pinned_foreign.txt
           printf '%s\n' "$UNPINNED_OK" | awk '{print $1}' | grep -v '^$' | sort -u > /tmp/allowed.txt
-          ls tests/*.rs | sed 's|tests/||; s|\.rs$||' | sort -u > /tmp/present.txt
-          missing=$(comm -23 /tmp/present.txt <(sort -u /tmp/pinned.txt /tmp/allowed.txt))
+          # One inventory per crate. The root crate's `tests/` are the ones
+          # that MUST be pinned (the `integration-*` jobs pin explicitly); the
+          # SDK's `tests/` are auto-discovered by `rust-sdk-tests`, so they are
+          # NOT required to appear here — but an SDK pin still has to name a
+          # real SDK test, which is what stops this guard from failing on an
+          # SDK test that exists and runs.
+          ls tests/*.rs | sed 's|tests/||; s|\.rs$||' | sort -u > /tmp/present_root.txt
+          ls sdk/tests/*.rs | sed 's|sdk/tests/||; s|\.rs$||' | sort -u > /tmp/present_sdk.txt
+          # UNATTRIBUTABLE pins first, because they are the CAUSE of any
+          # inventory verdict below: a pin this read cannot resolve to a crate
+          # covers nothing, so the tests it was meant to cover would otherwise
+          # be reported as merely unpinned and the real reason - a foreign
+          # crate, an unknown package selector, or a form this attribution
+          # refuses to guess at - would be left for the reader to find.
+          if [ -s /tmp/pinned_foreign.txt ]; then
+            echo "::error::CI pin(s) that name no crate this guard inventories, or a form it will not guess at:"
+            sed 's/^/  /' /tmp/pinned_foreign.txt
+            echo ""
+            echo "Attribution resolves an explicit '-p <package>' to its crate,"
+            echo "else the step's own working-directory, else the job default."
+            echo "A working-directory declared after its run block, and a shell"
+            echo "cd before a pin, are refused rather than guessed."
+            exit 1
+          fi
+          missing=$(comm -23 /tmp/present_root.txt <(sort -u /tmp/pinned_root.txt /tmp/allowed.txt))
           if [ -n "$missing" ]; then
             echo "::error::Integration test(s) present in tests/ but pinned to no CI step:"
             printf '  %s\n' $missing
@@ -555,15 +1082,22 @@ jobs:
             echo "satisfy it compiles to a silent 0-test binary), or to UNPINNED_OK."
             exit 1
           fi
-          # The reverse drift: a --test flag naming a file that no longer exists
-          # fails the run with a confusing cargo error, so name it here instead.
-          stale=$(comm -13 /tmp/present.txt /tmp/pinned.txt)
+          # The reverse drift, checked per crate: a pin that names no test in
+          # the crate ITS OWN invocation runs in fails that run with a
+          # confusing cargo error, so name it here instead. A pin attributed to
+          # any other crate (or to no invocation at all) covers nothing this
+          # guard inventories and is reported the same way.
+          stale=$(
+            comm -13 /tmp/present_root.txt /tmp/pinned_root.txt | sed 's/^/root: /'
+            comm -13 /tmp/present_sdk.txt /tmp/pinned_sdk.txt | sed 's/^/sdk: /'
+            cat /tmp/pinned_foreign.txt
+          )
           if [ -n "$stale" ]; then
-            echo "::error::CI pins --test target(s) with no matching tests/*.rs:"
-            printf '  %s\n' $stale
+            echo "::error::CI pins --test target(s) that name no test in the crate their own invocation runs in:"
+            printf '%s\n' "$stale" | sed 's/^/  /'
             exit 1
           fi
-          echo "OK: $(wc -l < /tmp/present.txt) test files, all accounted for."
+          echo "OK: $(wc -l < /tmp/present_root.txt) root + $(wc -l < /tmp/present_sdk.txt) sdk test files; $(wc -l < /tmp/pinned_root.txt) root pin(s) + $(wc -l < /tmp/pinned_sdk.txt) sdk pin(s), each attributed to its own crate."
 
   # --- Family A: bare bus/FFI + net mesh -------------------------------
   integration-net-core:
@@ -645,6 +1179,7 @@ jobs:
           --test ffi_shutdown_race
           --test ffi_poll_buffer
           --test doc_link_guard
+          --test org_cold_plan_surface_guard
 
       # === Net mesh + capability + discovery + migration + nRPC dispatch ==
       # All --features net tests share one compile.
@@ -887,6 +1422,463 @@ jobs:
           --test sensing_resolver
           --test sensing_scheduler_bridge
           --test sensing_routed_origin
+
+      # === Sensing — organization lease WIRE (independent) =================
+      # `sensing_org_lease_wire` gets its OWN invocation rather than riding the
+      # group above. `--no-tests=fail` is RUN-WIDE, not per-binary: with fifteen
+      # `--test` targets in one command, this binary compiling to zero tests
+      # (its `#![cfg]` unsatisfied, or every witness renamed away) is invisible
+      # as long as any sibling still runs something. Alone, that same flag is
+      # exact — zero tests here is a failed step.
+      #
+      # `--retries 0` deliberately: `.config/nextest.toml` grants retries to
+      # absorb loopback-UDP transport-saturation flake, but these witnesses are
+      # ORDERING and EXCLUSION proofs whose signal is intermittent by
+      # construction — a "flake" here is the defect. Same feature set as the
+      # group, so no extra crate compile: these witnesses drive
+      # `fixtures`-gated seams (`org_egress_state_for_test`,
+      # `set_org_egress_send_observer_for_test`,
+      # `set_sensing_phase_two_seam_for_test`) and an integration test is a
+      # separate crate, so `test` is not set on `net` — only `fixtures` exposes
+      # them, and without it this binary is exactly the 0-test no-op above.
+      #
+      # === WHY THIS PARSES THE WAY IT DOES ================================
+      # Run 34149650635 at cea2fbc9 failed here with all nine tests PASSED and
+      # zero skipped: the job sets `CARGO_TERM_COLOR: always`, nextest coloured
+      # its records, and ANSI escapes landed after the binary name, before the
+      # test name and after the test name — so a `<binary><sep><name>$` regex
+      # matched nothing. Three independent defences, in order of strength:
+      #
+      #   1. structure over transcript — required PRESENCE and CARDINALITY come
+      #      from `cargo nextest list`, which EXECUTES NOTHING, so there is no
+      #      test output to decorate or inject into;
+      #   2. `--color never` on every nextest invocation, which overrides
+      #      `CARGO_TERM_COLOR` (verified: identical byte-for-byte output with
+      #      `CARGO_TERM_COLOR=always` set);
+      #   3. `strip_ansi` on every transcript before matching, so a future
+      #      environment or nextest change that reintroduces escapes cannot
+      #      turn passing tests into a red step again. The self-test below
+      #      feeds a deliberately ANSI-laden record and REQUIRES acceptance.
+      #
+      # Cardinality is derived from the real inventory, never from a counter
+      # incremented over the hard-coded list — that shape is a tautology and
+      # cannot notice a name that no longer exists.
+      - name: Sensing — organization lease wire
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          BIN=sensing_org_lease_wire
+          FEATURES="cortex tool fixtures"
+
+          die() { echo "::error::$1"; shift; [ "$#" -gt 0 ] && printf '%s\n' "$@"; exit 1; }
+
+          # Remove ANSI CSI sequences (colour, cursor, everything nextest can
+          # emit). Defence 3: see the note above the step.
+          strip_ansi() { sed -E "s/$(printf '\033')\\[[0-9;:?]*[a-zA-Z]//g"; }
+
+          # Inventory records for ONE test name. `cargo nextest list` prints
+          # `<crate>::<binary> <test>`, one per line, and executes nothing.
+          # ANCHORED at line start, so a `note:`/`test stdout:` line quoting a
+          # record cannot be counted as one.
+          inventory_count() {   # $1=inventory  $2=test name
+            printf '%s\n' "$1" | strip_ansi \
+              | grep -cE "^[A-Za-z0-9_-]+::${BIN} ${2}\$" || true
+          }
+          inventory_total() {   # $1=inventory
+            printf '%s\n' "$1" | strip_ansi \
+              | grep -cE "^[A-Za-z0-9_-]+::${BIN} [A-Za-z0-9_]+\$" || true
+          }
+          # Nextest's own final Summary RECORD, ANSI-free and anchored.
+          #
+          # `^\s*Summary \[..\]` plus end-of-line is what keeps a diagnostic
+          # substring out: a test that prints "1 test run: 1 passed, 0 skipped"
+          # on its own stdout, or a `note:`-prefixed paraphrase, matches
+          # nothing. `tail -1` then takes nextest's record, which always follows
+          # all test output.
+          #
+          # The `passed` count may carry runner annotations — nextest 0.9.143
+          # emits `9 passed (1 slow)` and can add `(1 slow, 1 leaky)` — and
+          # failure runs insert `N failed` before `skipped`. Both are accepted
+          # by the grammar and then judged on the extracted NUMBERS, which is
+          # why a `1 failed` run still fails the `passed == run` check below.
+          summary_record() {    # $1=output
+            printf '%s\n' "$1" | strip_ansi \
+              | grep -E '^[[:space:]]*Summary \[[^]]*\] [0-9]+ tests? run: [0-9]+ passed[^:]*, [0-9]+ skipped$' \
+              | tail -1
+          }
+          summary_field() {     # $1=record  $2=run|passed|skipped
+            case "$2" in
+              run)     printf '%s' "$1" | sed -E 's/.*\] ([0-9]+) tests? run:.*/\1/' ;;
+              passed)  printf '%s' "$1" | sed -E 's/.*run: ([0-9]+) passed.*/\1/' ;;
+              skipped) printf '%s' "$1" | sed -E 's/.*[ ,]([0-9]+) skipped$/\1/' ;;
+            esac
+          }
+          # WHOLE-BINARY acceptance: command status first (authoritative), then
+          # the run must cover EXACTLY the inventory, pass all of it, and skip
+          # nothing.
+          accept_whole_run() {  # $1=status  $2=output  $3=inventory count
+            [ "$1" -eq 0 ] || return 1
+            rec=$(summary_record "$2")
+            [ -n "$rec" ] || return 1
+            run=$(summary_field "$rec" run)
+            passed=$(summary_field "$rec" passed)
+            skipped=$(summary_field "$rec" skipped)
+            [ "$skipped" -eq 0 ] || return 1
+            [ "$run" -eq "$3" ] || return 1
+            [ "$passed" -eq "$run" ] || return 1
+            return 0
+          }
+          # EXACT-FILTER acceptance: status first, then EXACTLY one test ran and
+          # passed. `skipped` is the filtered-out remainder here and is ignored;
+          # an `#[ignore]`d target yields `0 tests run` and is rejected, as is a
+          # filter that matched more than one record.
+          accept_exact_run() {  # $1=status  $2=output
+            [ "$1" -eq 0 ] || return 1
+            rec=$(summary_record "$2")
+            [ -n "$rec" ] || return 1
+            [ "$(summary_field "$rec" run)" -eq 1 ] || return 1
+            [ "$(summary_field "$rec" passed)" -eq 1 ] || return 1
+            return 0
+          }
+
+          # ---- ADVERSARIAL SELF-TESTS, before anything is trusted ---------
+          # Fixtures use the grammar observed from nextest 0.9.143 itself. They
+          # are PARSER evidence only — the real runs below are the test
+          # evidence.
+          esc=$(printf '\033')
+          coloured_exact=$(printf '        PASS [   0.5s] (1/1) %s[32mnet-mesh::%s%s[0m %s[1man_org_lease_reaches_the_provider_through_real_intake%s[0m\n     Summary [   0.5s] 1 test run: 1 passed, 8 skipped\n' "$esc" "$BIN" "$esc" "$esc" "$esc")
+          coloured_slow_exact=$(printf '     %s[33mSummary%s[0m [   0.5s] 1 test run: 1 passed (1 slow), 8 skipped\n' "$esc" "$esc")
+          plain_exact=$(printf '     Summary [   0.5s] 1 test run: 1 passed, 8 skipped\n')
+          slow_exact=$(printf '     Summary [  61.0s] 1 test run: 1 passed (1 slow), 8 skipped\n')
+          ignored_exact=$(printf '     Summary [   0.0s] 0 tests run: 0 passed, 9 skipped\n')
+          two_exact=$(printf '     Summary [   0.5s] 2 tests run: 2 passed, 7 skipped\n')
+          whole_ok=$(printf '     Summary [   2.6s] 9 tests run: 9 passed, 0 skipped\n')
+          whole_slow=$(printf '     Summary [  61.0s] 9 tests run: 9 passed (1 slow, 1 leaky), 0 skipped\n')
+          whole_skipped=$(printf '     Summary [   2.6s] 9 tests run: 8 passed, 1 skipped\n')
+          whole_failed=$(printf '     Summary [   2.6s] 9 tests run: 8 passed, 1 failed, 0 skipped\n')
+          diag_only=$(printf 'test stdout: 1 test run: 1 passed, 0 skipped\nnote: fake Summary [   0.1s] 1 test run: 1 passed, 0 skipped\n')
+          diag_then_real=$(printf 'test stdout: 9 tests run: 9 passed, 0 skipped\n     Summary [   0.5s] 1 test run: 1 passed, 8 skipped\n')
+
+          # (a) THE REGRESSION: ANSI-decorated success must be ACCEPTED, with
+          #     and without a slow annotation.
+          accept_exact_run 0 "$coloured_exact" \
+            || die "self-test FAILED: an ANSI-decorated passing record was rejected — this is exactly the run-34149650635 failure mode"
+          accept_exact_run 0 "$coloured_slow_exact" \
+            || die "self-test FAILED: an ANSI-decorated SLOW passing record was rejected"
+          [ "$(inventory_count "$coloured_exact" an_org_lease_reaches_the_provider_through_real_intake)" = 0 ] \
+            || die "self-test FAILED: a run transcript was counted as an inventory record"
+          # (b) POSITIVE CONTROLS, including nextest's slow annotations.
+          accept_exact_run 0 "$plain_exact" || die "self-test FAILED: a valid exact run was rejected"
+          accept_exact_run 0 "$slow_exact" || die "self-test FAILED: a valid SLOW exact run was rejected"
+          accept_whole_run 0 "$whole_ok" 9 || die "self-test FAILED: a valid whole-binary run was rejected"
+          accept_whole_run 0 "$whole_slow" 9 || die "self-test FAILED: a valid SLOW/leaky whole-binary run was rejected"
+          # (c) NONZERO STATUS carrying success-looking text must be REJECTED.
+          if accept_exact_run 1 "$plain_exact"; then
+            die "self-test FAILED: a nonzero exact run with spoofed success text was accepted"
+          fi
+          if accept_whole_run 1 "$whole_ok" 9; then
+            die "self-test FAILED: a nonzero whole run with spoofed success text was accepted"
+          fi
+          # (d) IGNORED / renamed-away required test must be REJECTED.
+          if accept_exact_run 0 "$ignored_exact"; then
+            die "self-test FAILED: an ignored (zero-run) required test was accepted"
+          fi
+          # (e) A filter matching MORE than one record must be REJECTED.
+          if accept_exact_run 0 "$two_exact"; then
+            die "self-test FAILED: a duplicate/over-broad exact filter was accepted"
+          fi
+          # (f) A whole run that SKIPPED or FAILED anything must be REJECTED,
+          #     and so must one whose total disagrees with the inventory.
+          if accept_whole_run 0 "$whole_skipped" 9; then
+            die "self-test FAILED: a whole-binary run with a skipped test was accepted"
+          fi
+          if accept_whole_run 0 "$whole_failed" 9; then
+            die "self-test FAILED: a whole-binary run with a failed test was accepted"
+          fi
+          if accept_whole_run 0 "$whole_ok" 10; then
+            die "self-test FAILED: a whole-binary run covering fewer tests than the inventory was accepted"
+          fi
+          # (g) MISLEADING DIAGNOSTICS cannot stand in for nextest's record, and
+          #     cannot inflate the count when a real record follows.
+          if accept_exact_run 0 "$diag_only"; then
+            die "self-test FAILED: an unanchored diagnostic line satisfied the exact-run predicate"
+          fi
+          accept_exact_run 0 "$diag_then_real" \
+            || die "self-test FAILED: the real Summary record was not used when preceded by test output"
+          if accept_whole_run 0 "$diag_then_real" 9; then
+            die "self-test FAILED: a diagnostic line inflated the whole-run count over the real record"
+          fi
+          # (h) Inventory cardinality: duplicates, absences and quoted records.
+          dupe=$(printf 'net-mesh::%s dup_name\nnet-mesh::%s dup_name\n' "$BIN" "$BIN")
+          [ "$(inventory_count "$dupe" dup_name)" = 2 ] \
+            || die "self-test FAILED: duplicate inventory records were not both counted"
+          [ "$(inventory_count "$dupe" absent_name)" = 0 ] \
+            || die "self-test FAILED: an absent inventory record was counted"
+          quoted=$(printf 'note: net-mesh::%s quoted_name\n' "$BIN")
+          [ "$(inventory_count "$quoted" quoted_name)" = 0 ] \
+            || die "self-test FAILED: a quoted (non-anchored) inventory line was counted"
+          echo "self-test: ANSI/slow tolerance, fail-closed-on-status, ignored/duplicate/skipped/failed/count-mismatch rejection, anchored-record and inventory cardinality all behave"
+
+          # ---- (1) NON-EXECUTING INVENTORY --------------------------------
+          # The `--test` targets below are spelled LITERALLY, not through
+          # `$BIN`: the "Integration test pin guard" job scrapes real `--test
+          # <name>` flags out of this workflow to prove every `tests/*.rs` runs
+          # somewhere, and a shell variable is invisible to it. Run
+          # 34158104154 failed exactly there — this step passed while the guard
+          # reported the binary unpinned. `$BIN` stays for the match patterns.
+          if ! inv=$(cargo nextest list --color never --features "$FEATURES" \
+                       --test sensing_org_lease_wire 2>&1); then
+            die "cargo nextest list failed for $BIN" "$inv"
+          fi
+          REQUIRED="an_org_lease_reaches_the_provider_through_real_intake
+          releasing_the_strictest_org_holder_relaxes_the_provider_row
+          releasing_the_last_org_holder_deregisters_the_provider_row
+          a_stale_org_capture_refuses_and_puts_nothing_on_the_wire
+          the_later_org_cadence_decision_is_what_the_provider_finally_holds
+          a_parked_org_teardown_cannot_be_overtaken_by_its_own_reacquisition
+          the_production_send_boundary_is_strictly_serial_in_enqueue_order
+          the_ordered_egress_is_bounded_and_keeps_the_latest_decision
+          the_egress_consumer_does_not_survive_node_shutdown"
+          # Derived from the roster itself, never incremented inside the loop.
+          req_n=$(printf '%s\n' $REQUIRED | grep -c .)
+          total=$(inventory_total "$inv")
+          echo "inventory: $total test(s) in $BIN; $req_n pinned as required"
+          if [ "$req_n" -lt 9 ]; then
+            die "the organization lease wire boundary is nine witnesses; only $req_n are pinned" \
+                "If one was intentionally retired, remove its name AND lower this floor in the same commit."
+          fi
+          for required in $REQUIRED; do
+            hits=$(inventory_count "$inv" "$required")
+            if [ "$hits" != "1" ]; then
+              die "required organization lease wire witness not found exactly once in the inventory: $required (matched $hits)"
+            fi
+          done
+          if [ "$total" -lt "$req_n" ]; then
+            die "inventory holds $total test(s) but $req_n are required" "$inv"
+          fi
+
+          # ---- (2) WHOLE-BINARY RUN, zero retries -------------------------
+          # Every inventoried test must run and pass with nothing skipped, so
+          # the nine are green TOGETHER and not merely in isolation.
+          out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail --retries 0 \
+                  --features "$FEATURES" --test sensing_org_lease_wire 2>&1)
+          st=$?
+          printf '%s\n' "$out"
+          if ! accept_whole_run "$st" "$out" "$total"; then
+            die "$BIN did not run and pass all $total inventoried tests (nextest exit $st)"
+          fi
+
+          # ---- (3) PER-WITNESS EXACT RUNS ---------------------------------
+          # `test(=<name>)` is an exact-equality filterset, so this cannot pass
+          # on a prefix or a sibling; `--no-tests=fail` makes a renamed or
+          # `#[ignore]`d witness a failure rather than a silent skip.
+          for required in $REQUIRED; do
+            out=$(cargo nextest run --color never --no-tests=fail --retries 0 \
+                    --features "$FEATURES" --test sensing_org_lease_wire \
+                    -E "test(=$required)" 2>&1)
+            st=$?
+            if ! accept_exact_run "$st" "$out"; then
+              die "$required did not run and pass as exactly one test (nextest exit $st)" "$out"
+            fi
+            echo "  exact: $required (nextest exit $st)"
+          done
+          echo "organization lease wire: self-test + non-executing inventory + whole-binary zero-retry run + $req_n exact per-witness runs all green"
+
+      # === Sensing — organization exact-provider PROJECTION (independent) ==
+      # OA-4's request-relative projection witnesses
+      # (`tests/sensing_org_exact_projection.rs`). Its own invocation for the
+      # same reason as the lease-wire step above: `--no-tests=fail` is RUN-wide,
+      # so this binary compiling to zero tests — its `#![cfg(all(feature =
+      # "net", feature = "fixtures"))]` unsatisfied, or every witness renamed
+      # away — would be invisible while a sibling target still ran something.
+      #
+      # `--retries 0` deliberately: one witness drives a concurrent readiness
+      # writer against repeated captures, one parks a writer INSIDE the capture
+      # and requires it to find the observation mutex held, and another proves
+      # no sensing guard is held during the actual route/classification work.
+      # All three are properties of a specific interleaving, so a retry could
+      # only convert a real coherence or lock-order defect into a green run.
+      #
+      # The roster is DERIVED from `cargo nextest list` (which executes
+      # nothing) and then re-run per name with an exact-equality filterset, so
+      # a renamed or `#[ignore]`d witness fails the step instead of vanishing.
+      - name: Sensing — organization exact projection
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          BIN=sensing_org_exact_projection
+          FEATURES="cortex tool fixtures"
+          REQUIRED="counts_ranking_and_rows_agree_under_concurrent_status_change
+          one_acquisition_captures_every_row_while_a_writer_is_excluded
+          unknown_never_prunes_and_an_over_budget_ready_stays_potential
+          expiry_without_a_new_beat_maps_unknown_and_an_expired_not_ready_never_prunes
+          a_provider_removed_before_the_snapshot_resolves_unknown_from_current_state
+          a_provider_removed_after_the_snapshot_is_advisory_and_cannot_authorize
+          an_unrelated_interest_for_the_same_provider_never_contributes_readiness
+          no_sensing_lock_is_held_during_route_budget_or_sort_work
+          the_off_lock_observer_itself_holds_nothing
+          an_unrelated_owner_does_not_make_off_lock_work_look_locked
+          the_sensed_order_is_a_stable_class_permutation_of_the_complete_list
+          a_candidate_list_beyond_the_sensing_cap_keeps_every_unsensed_member
+          the_population_clamp_bounds_rows_but_never_drops_a_candidate"
+
+          die() { echo "::error::$1"; shift; [ "$#" -gt 0 ] && printf '%s\n' "$@"; exit 1; }
+          strip_ansi() { sed -E "s/$(printf '\033')\\[[0-9;:?]*[a-zA-Z]//g"; }
+
+          # Non-executing inventory: presence and cardinality come from the
+          # LIST, so there is no test output to decorate or inject into.
+          inventory=$(cargo nextest list --color never --features "$FEATURES" \
+                        --test sensing_org_exact_projection 2>&1) \
+            || die "cargo nextest list failed" "$inventory"
+          listed=$(printf '%s\n' "$inventory" | strip_ansi \
+                     | grep -cE "^[A-Za-z0-9_-]+::${BIN} [A-Za-z0-9_]+\$")
+          req_n=$(printf '%s\n' $REQUIRED | grep -c .)
+          [ "$listed" -ge "$req_n" ] \
+            || die "$BIN lists $listed test(s), fewer than the $req_n pinned by name" "$inventory"
+
+          for required in $REQUIRED; do
+            n=$(printf '%s\n' "$inventory" | strip_ansi \
+                  | grep -cE "^[A-Za-z0-9_-]+::${BIN} ${required}\$")
+            [ "$n" = 1 ] \
+              || die "$required is listed $n time(s) in $BIN, expected exactly 1" "$inventory"
+          done
+
+          # Whole binary, then each pinned name on its own with an exact filter.
+          cargo nextest run --color never --no-fail-fast --no-tests=fail --retries 0 \
+            --features "$FEATURES" --test sensing_org_exact_projection \
+            || die "$BIN did not pass as a whole"
+          for required in $REQUIRED; do
+            cargo nextest run --color never --no-tests=fail --retries 0 \
+              --features "$FEATURES" --test sensing_org_exact_projection -E "test(=$required)" \
+              || die "$required did not run and pass as exactly one test"
+            echo "  exact: $required"
+          done
+          echo "organization exact projection: $listed listed, $req_n pinned by name, all green"
+
+      # === Sensing — organization exact COMPOSITION (OA-5) ================
+      # The fixtures-only seam assembly: authorized owner-private discovery ->
+      # the exact organization sensing lease on real loopback UDP -> the
+      # provider's signed observations -> one coherent projection and candidate
+      # order -> one protected invocation with real organization admission.
+      # Plus the dark-boundary guards for the bridge those witnesses reach
+      # through, and the per-binary floor for the three-node transport family.
+      #
+      # Own invocation, `--retries 0`: these are transport-timing AND ordering
+      # proofs, and a retry could turn a real regression (a dropped
+      # registration, a projection that stopped reading real observations, an
+      # order that stopped consuming the projection) into a green run. Each
+      # binary runs alone so `--no-tests=fail` is exact per binary, and every
+      # witness is re-run by exact name so a rename or an `#[ignore]` fails the
+      # step instead of shrinking the roster silently.
+      - name: Sensing — organization exact composition
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          FEATURES="cortex tool fixtures"
+          die() { echo "::error::$1"; shift; [ "$#" -gt 0 ] && printf '%s\n' "$@"; exit 1; }
+          strip_ansi() { sed -E "s/$(printf '\033')\\[[0-9;:?]*[a-zA-Z]//g"; }
+
+          run_binary() {   # $1=binary  $2..=required names
+            local bin="$1"; shift
+            local inventory listed required_n
+            inventory=$(cargo nextest list --color never --features "$FEATURES" \
+                          --test "$bin" 2>&1) \
+              || die "cargo nextest list failed for $bin" "$inventory"
+            listed=$(printf '%s\n' "$inventory" | strip_ansi \
+                       | grep -cE "^[A-Za-z0-9_-]+::${bin} [A-Za-z0-9_]+\$")
+            required_n=$#
+            [ "$listed" -ge "$required_n" ] \
+              || die "$bin lists $listed test(s), fewer than the $required_n pinned" "$inventory"
+            for required in "$@"; do
+              local n
+              n=$(printf '%s\n' "$inventory" | strip_ansi \
+                    | grep -cE "^[A-Za-z0-9_-]+::${bin} ${required}\$")
+              [ "$n" = 1 ] \
+                || die "$required is listed $n time(s) in $bin, expected exactly 1" "$inventory"
+            done
+            cargo nextest run --color never --no-fail-fast --no-tests=fail --retries 0 \
+              --features "$FEATURES" --test "$bin" \
+              || die "$bin did not pass as a whole"
+            for required in "$@"; do
+              cargo nextest run --color never --no-tests=fail --retries 0 \
+                --features "$FEATURES" --test "$bin" -E "test(=$required)" \
+                || die "$required did not run and pass as exactly one test"
+              echo "  exact: $bin::$required"
+            done
+            echo "$bin: $listed listed, $required_n pinned by name, all green"
+          }
+
+          # Literal `--test` flags for the pin guard, which scrapes this file.
+          cargo nextest list --color never --features "$FEATURES" \
+            --test sensing_org_exact_seam --test sensing_org_exact_guards >/dev/null \
+            || die "the OA-5 binaries do not even list"
+
+          run_binary sensing_org_exact_seam \
+            discovery_transport_observations_projection_and_admission_compose \
+            a_stale_local_preparation_mints_no_intent_and_sends_nothing \
+            an_unproven_call_to_the_sensed_provider_is_denied \
+            sensing_is_advisory_and_neither_plane_lets_it_authorize \
+            real_sensed_evidence_orders_the_complete_candidate_list \
+            an_all_pruned_order_falls_back_to_the_callers_own_order \
+            a_granted_only_provider_is_never_sensed_and_a_dual_plane_provider_is_sensed_once \
+            an_unpinned_authorized_provider_is_neither_sensed_nor_callable
+
+          run_binary sensing_org_exact_guards \
+            every_bridge_declaration_is_gated_hidden_and_marked_unstable \
+            the_bridge_is_declared_once_and_is_absent_from_mesh \
+            the_fixtures_off_probe_covers_every_bridge_declaration
+
+          run_binary sensing_org_three_node \
+            relay_reauthors_org_provider_under_its_own_membership \
+            a_floored_peer_with_sensing_off_drops_the_org_frame_and_stays_unknown
+
+      # === The fixtures-off DARKNESS probe (external consumer) =============
+      # No test inside this workspace can observe a fixtures-off build of the
+      # core crate: dev-dependency feature unification turns the feature on for
+      # every dev target that shares the graph. So the darkness claim is proved
+      # by an EXTERNAL crate with its own workspace root, compiled twice:
+      #
+      #   * WITHOUT `fixtures` it must FAIL to resolve the bridge module, and
+      #     the failure must be a resolution error (E0432/E0433) - not a typo,
+      #     a missing manifest or an unrelated build break;
+      #   * WITH `fixtures` it must compile, which is what keeps the negative
+      #     leg from passing for the wrong reason.
+      #
+      # `tests/sensing_org_exact_guards.rs` separately asserts the probe names
+      # exactly the bridge's declarations, so it cannot cover fewer symbols.
+      #
+      # Both legs run `--locked` against the probe's OWN committed
+      # `Cargo.lock`. Its workspace root is separate, so it resolves
+      # independently of the parent lockfile: without a committed lockfile and
+      # this flag, a fresh CI run could pick different compatible transitive
+      # versions than the one this probe was verified against.
+      - name: Sensing — organization exact bridge darkness
+        if: ${{ !cancelled() }}
+        working-directory: net/crates/net/guards/fixtures_off_probe
+        run: |
+          set -uo pipefail
+          die() { echo "::error::$1"; shift; [ "$#" -gt 0 ] && printf '%s\n' "$@"; exit 1; }
+
+          # The negative leg is EXPECTED to fail, and the runner's shell has
+          # errexit on: `set -uo pipefail` does not clear an inherited `-e`, so
+          # a bare assignment from a failing command would exit the step right
+          # here - before the diagnostic classification and before the positive
+          # control ever ran. Capturing it inside an `if` is what suppresses
+          # errexit for exactly this one command, and nothing else.
+          negative=""
+          if negative=$(cargo check --locked --message-format short 2>&1); then
+            die "the fixtures-off probe COMPILED: the bridge is reachable in a \
+                 build without the feature" "$negative"
+          fi
+          printf '%s\n' "$negative" \
+            | grep -qE 'error\[E043[23]\].*org_exact_sensing_bridge' \
+            || die "the fixtures-off probe failed for the WRONG reason: expected an \
+                    E0432/E0433 resolution failure naming the bridge module" "$negative"
+          echo "negative leg: bridge unresolvable without \`fixtures\`"
+
+          cargo check --locked --features fixtures \
+            || die "the positive leg must compile, or the negative leg proves nothing"
+          echo "positive leg: bridge resolves with \`fixtures\`"
 
       # === NetDB ==========================================================
       - name: NetDB
@@ -1234,6 +2226,12 @@ jobs:
       #   - tool_macro              — `#[tool]` proc-macro
       #     expansion + serve-helper round-trip. Gated on
       #     `feature = "macros" + "cortex"`.
+      #   - sensing_provider        — S1 capability-sensing provider
+      #     lifecycle: registration ownership, the publication fence
+      #     (an in-flight evaluation released after a close or a
+      #     replacement), state-edge notification, and terminal
+      #     registration-identity exhaustion. Gated on
+      #     `feature = "net"`.
       #
       # nextest rather than `cargo test`: the SDK has 35 separate integration
       # test binaries and `cargo test` runs them ONE AT A TIME, so the suite
@@ -1243,8 +2241,125 @@ jobs:
       # hang guard (a stalled test becomes a named failure instead of eating
       # the 20-minute budget) and the `retries = 0` override that keeps the
       # security-race binaries from being retried into green.
-      - name: Run Rust SDK tests (includes mesh_stream_backpressure, mesh_rpc_bidi_typed, tool_*)
-        run: cargo nextest run --no-fail-fast --no-tests=fail --features "net cortex dataforts testing compute nat-traversal port-mapping aggregator tool macros"
+      #
+      # `sensing_provider` is in that zero-retry override, and
+      # `net_sdk::sensing::tests::the_provider_witness_binary_is_excluded_from_retries`
+      # reads `.config/nextest.toml` and fails if it ever drops out — the
+      # override is a filter expression, so it would otherwise stop matching
+      # silently.
+      #   - org_exact_sensing       — OA-6 production organization
+      #     exact-sensing call edge (14 tests). Needs the SDK's own
+      #     `fixtures` feature, which is what gates `OrgClient`'s
+      #     test-only sensing observation accessors; without it the
+      #     binary does not compile, which is loud rather than silent.
+      - name: Run Rust SDK tests (includes mesh_stream_backpressure, mesh_rpc_bidi_typed, tool_*, sensing_provider, org_exact_sensing)
+        run: cargo nextest run --no-fail-fast --no-tests=fail --features "net cortex dataforts testing compute nat-traversal port-mapping aggregator tool macros fixtures"
+
+      # === OA-6: the PRODUCTION organization exact-sensing call edge =======
+      #
+      # The step above already ran this binary by auto-discovery. This one
+      # exists so the roster cannot shrink silently: it names each witness and
+      # requires each to RUN and PASS on its own, with retries off (the
+      # `.config/nextest.toml` override covers this binary for the same
+      # reason - a retry could turn a lost readiness observation into green).
+      #
+      # `--no-tests=fail` is what makes the per-witness loop below honest:
+      # without it, `-E 'test(=name)'` matching NOTHING is a successful
+      # zero-test run, so a renamed or deleted witness would be
+      # indistinguishable from a pass. With it, that zero match FAILS.
+      #
+      # Feature note: this crate's dev-dependency on net-mesh enables
+      # `fixtures`, so this step is NOT a fixtures-off proof. The production
+      # path's independence from that feature is the separate lib-only build
+      # below, which compiles no dev-dependencies.
+      - name: Sensing — organization exact production call edge (OA-6)
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          FEATURES="net cortex dataforts testing compute nat-traversal port-mapping aggregator tool macros fixtures"
+          REQUIRED="
+            the_production_call_lands_on_the_sensed_provider
+            the_production_call_follows_the_sensed_rank_between_viable_providers
+            a_deadline_below_every_estimate_falls_back_to_the_deterministic_order
+            a_provider_discovered_after_the_first_call_enters_the_population
+            a_departed_provider_leaves_the_warmed_population
+            a_capacity_refused_holder_is_recovered_by_a_later_call
+            a_holder_that_dies_after_convergence_is_reacquired
+            unknown_services_strand_no_sensing_capacity
+            contending_clones_produce_exactly_one_convergence
+            within_attempt_narrowing_is_not_certified_as_agreement
+            within_attempt_widening_is_not_certified_as_agreement
+            a_capped_population_agrees_with_a_wider_expectation
+            a_missing_canonical_member_is_recovered_under_an_unchanged_expectation
+            a_same_org_grant_only_provider_is_outside_the_sensing_expectation
+            live_evidence_stops_vouching_at_a_later_instant
+            withdrawn_readiness_reads_unknown_and_plans_deterministically
+            an_all_not_ready_population_still_calls_in_the_deterministic_order
+            the_binding_owns_the_acquisition_and_the_last_owner_retires_it
+            a_refused_mint_binds_inert_and_never_remints
+            a_pinned_but_locally_dead_session_is_still_the_sensed_selection
+            a_consumer_without_sensing_plans_the_deterministic_order
+            the_sdk_sensed_adapter_adds_no_ordering_structure
+          "
+          out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                  --retries 0 --features "$FEATURES" --test org_exact_sensing 2>&1) \
+            || { printf '%s\n' "$out"; echo "::error::the OA-6 production witnesses did not pass"; exit 1; }
+          printf '%s\n' "$out" | tail -3
+          listed=$(printf '%s\n' "$out" | grep -cE '^ +(PASS|FAIL)')
+          pinned=0
+          for required in $REQUIRED; do
+            single=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                       --retries 0 --features "$FEATURES" --test org_exact_sensing \
+                       -E "test(=$required)" 2>&1) \
+              || { printf '%s\n' "$single"; echo "::error::$required did not run and pass as exactly one test"; exit 1; }
+            pinned=$((pinned + 1))
+          done
+          [ "$listed" -ge 22 ] \
+            || { echo "::error::expected at least 22 production witnesses, saw $listed"; exit 1; }
+          echo "organization exact production call edge: $listed listed, $pinned pinned by name, all green"
+
+      # The DARK-BOUNDARY fact for the production path: the SDK library builds
+      # with net-mesh's `fixtures` feature OFF. `--lib` compiles no
+      # dev-dependencies, and the SDK's own `[dependencies]` entry for net-mesh
+      # enables no features - so if the sensed call path ever reached a
+      # fixtures-gated seam, this step is what fails.
+      # The in-crate half of the OA-6 evidence: the sensed step inside the
+      # authority window, the Granted-mode mapping and selection under an
+      # actual reordering, and the reconciliation trigger's decision table.
+      # Named because a `--lib` run would otherwise absorb a rename silently.
+      - name: Sensing — organization exact planning unit witnesses (OA-6)
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          # Pinned INDIVIDUALLY: a union filterset is green as long as SOMETHING
+          # in it ran, so it cannot establish that each name executed.
+          for required in \
+            authority_movement_inside_sensed_planning_is_still_fenced \
+            the_sensed_adapter_never_ranks_or_prunes_a_granted_candidate \
+            selection_and_its_errors_follow_the_reordered_list \
+            the_reconciliation_trigger_certifies_the_installed_demand \
+            a_refused_wave_paces_but_a_restored_authority_does_not_wait
+          do
+            out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                    --retries 0 --features "net cortex fixtures" --lib \
+                    -E "test(=org::tests_call::$required)" 2>&1) \
+              || { printf '%s\n' "$out"; echo "::error::$required did not run and pass"; exit 1; }
+            printf '%s\n' "$out" | grep -qE '1 test run: 1 passed' \
+              || { printf '%s\n' "$out"; echo "::error::$required did not run as exactly one test"; exit 1; }
+          done
+          echo "organization exact planning units: 5 pinned by name, each executed"
+
+      # The SDK's `fixtures` feature must mean the same thing STANDALONE as it
+      # does inside a workspace dev build: it forwards core's own `fixtures`
+      # seam, and a dev-dependency used to hide the missing forwarding. This is
+      # the configuration the Go FFI jobs build, and the one that broke.
+      - name: Sensing — the fixtures observers build standalone (OA-6)
+        if: ${{ !cancelled() }}
+        run: cargo check --lib --features "net cortex fixtures"
+
+      - name: Sensing — the production call path needs no fixtures seam (OA-6)
+        if: ${{ !cancelled() }}
+        run: cargo check --lib --features "net cortex"
 
       # SDK doctests — `///` examples in `sdk/src/`. nextest does NOT run
       # doctests, so this `cargo test --doc` step is load-bearing, not a
@@ -1257,7 +2372,7 @@ jobs:
       # those two would have compiled to nothing and gone silently unverified.
       - name: Run Rust SDK doctests
         if: ${{ !cancelled() }}
-        run: cargo test --doc --features "net cortex dataforts testing compute nat-traversal port-mapping aggregator tool macros"
+        run: cargo test --doc --features "net cortex dataforts testing compute nat-traversal port-mapping aggregator tool macros fixtures"
 
       # net-payments — x402 envelope model unit tests plus
       # `payments_golden_vectors`, the Rust source-of-truth verifier for

@@ -25,6 +25,29 @@
 //! 8. the interest audience == the canonical organization sensing commitment
 //!    for `cert.org_id`.
 //!
+//! Between steps 2 and 3, on the provider-addressed leg only, the interest
+//! selector must name EXACTLY the frame's own `target`
+//! (`spec.providers == ProviderSelector::Node(target)`, design D2.6).
+//!
+//! # Two phases, and why the boundary is where it is
+//!
+//! Steps 1, 2 and that selector check need no authority, no revocation store
+//! and no lock — they are pure functions of bytes the frame already carries.
+//! They live in `validate_org_frame_shape`, which yields an
+//! `OrgFrameShape`. Steps 3–8 need the installed authority and the pinned
+//! revocation snapshot, and live in `verify_org_admission`, which can only
+//! be called WITH an `OrgFrameShape`.
+//!
+//! [`verify_org_sensing_registration`] is the single-call composition of both
+//! and is unchanged for callers that already hold an authority snapshot. The
+//! dispatch layer instead calls the two halves in order, so a frame whose own
+//! bytes are internally inconsistent is refused as protocol-invalid input
+//! WITHOUT that node taking an `org_install` snapshot — which would otherwise
+//! report the sender's malformation as a local `org_authority_unavailable`
+//! problem on an unadopted or poisoned node. `OrgFrameShape` has private
+//! fields and no public constructor, so that ordering is structural rather
+//! than a convention a future edit could quietly invert.
+//!
 //! Step 9 (the authority/store stability recheck immediately before mutation)
 //! and step 10 (the mutation itself) are the dispatch layer's job — the gate
 //! is validated against a pinned revocation snapshot the caller captured, and
@@ -39,7 +62,7 @@ use super::super::org::{OrgError, OrgId, OrgMembershipCert};
 use super::super::org_authority::{NodeAuthority, OrgAuthorityError};
 use super::super::org_revocation::{BarrieredGeneration, OrgRevocationState, OrgRevocationStore};
 use super::frames::{FrameSpecError, SensingInterestFrame};
-use super::identity::{AudienceScopeCommitment, InterestSpec};
+use super::identity::{AudienceScopeCommitment, InterestSpec, ProviderSelector};
 use super::SensingCounters;
 use crate::adapter::net::identity::EntityId;
 use arc_swap::ArcSwapOption;
@@ -245,6 +268,19 @@ pub enum OrgSensingRejection {
     BelowFloor,
     /// The interest audience is not the canonical commitment for the org.
     AudienceMismatch,
+    /// The provider-addressed leg's interest selector does not name EXACTLY
+    /// the frame's `target`: `spec.providers != ProviderSelector::Node(target)`
+    /// (design D2.6). An exact-provider interest is one interest per provider,
+    /// so `AnyAuthorized`, a `Group`, a `Tags` match, and even a one-element
+    /// `Nodes([target])` are all incoherent here — `Nodes` is canonically
+    /// sorted and deduplicated, so accepting it would split one semantic
+    /// interest across two digests.
+    ///
+    /// Appended after the eight original variants. `OrgSensingRejection` is
+    /// public and not `#[non_exhaustive]`, so this is a deliberate semver
+    /// break for any downstream exhaustive matcher; in-tree the cost is the
+    /// single wildcard-free match in this file.
+    SelectorTargetMismatch,
 }
 
 /// Steps 1–8 of the org-sensing authority gate against a PINNED revocation
@@ -271,39 +307,57 @@ pub fn verify_org_sensing_registration(
     now_secs: u64,
     counters: &SensingCounters,
 ) -> Result<ValidatedOrgSensingRegistration, OrgSensingRejection> {
-    let result = verify_org_sensing_registration_inner(
-        frame,
-        from_node,
-        sender_entity,
-        node_authority,
-        revocation,
-        now_secs,
-        counters,
-    );
+    let result = validate_org_frame_shape(frame, counters).and_then(|shape| {
+        verify_org_admission_with_shape(
+            &shape,
+            from_node,
+            sender_entity,
+            node_authority,
+            revocation,
+            now_secs,
+        )
+    });
     if let Err(rejection) = &result {
-        // One counter per reason; `Semantic` already counted upstream.
-        let counter = match rejection {
-            OrgSensingRejection::CertInvalid(_) => Some(&counters.org_cert_invalid),
-            OrgSensingRejection::BelowFloor => Some(&counters.org_below_floor),
-            OrgSensingRejection::ForeignOrg => Some(&counters.org_foreign_org),
-            OrgSensingRejection::SenderMemberMismatch => Some(&counters.org_sender_member_mismatch),
-            OrgSensingRejection::AudienceMismatch => Some(&counters.org_audience_mismatch),
-            OrgSensingRejection::MissingAuthority => Some(&counters.org_authority_unavailable),
-            // Routed-origin / frame-shape violations are protocol-invalid input.
-            OrgSensingRejection::ConsumerBindingMismatch
-            | OrgSensingRejection::NotOrgRegistration => Some(&counters.protocol_invalid),
-            OrgSensingRejection::Semantic(_) => None,
-        };
-        if let Some(counter) = counter {
-            counter.fetch_add(1, Ordering::Relaxed);
-        }
+        count_org_rejection(rejection, counters);
     }
     result
 }
 
-#[allow(clippy::too_many_arguments)]
-fn verify_org_sensing_registration_inner(
-    frame: &SensingInterestFrame,
+/// The ONE counter mapping for an org-gate refusal. Both the full verifier and
+/// the dispatch-layer shape pre-gate route through this, so a refusal can never
+/// be counted in two different classes depending on which entry point saw it.
+pub(crate) fn count_org_rejection(rejection: &OrgSensingRejection, counters: &SensingCounters) {
+    // One counter per reason; `Semantic` already counted upstream by
+    // `validated_spec`.
+    let counter = match rejection {
+        OrgSensingRejection::CertInvalid(_) => Some(&counters.org_cert_invalid),
+        OrgSensingRejection::BelowFloor => Some(&counters.org_below_floor),
+        OrgSensingRejection::ForeignOrg => Some(&counters.org_foreign_org),
+        OrgSensingRejection::SenderMemberMismatch => Some(&counters.org_sender_member_mismatch),
+        OrgSensingRejection::AudienceMismatch => Some(&counters.org_audience_mismatch),
+        OrgSensingRejection::MissingAuthority => Some(&counters.org_authority_unavailable),
+        // Routed-origin / frame-shape violations are protocol-invalid
+        // input. A selector that does not name the frame's own target is
+        // the same class: the sender's own bytes are internally
+        // inconsistent, so it is a protocol violation, not merely an
+        // authorization refusal (design D2.6).
+        OrgSensingRejection::ConsumerBindingMismatch
+        | OrgSensingRejection::NotOrgRegistration
+        | OrgSensingRejection::SelectorTargetMismatch => Some(&counters.protocol_invalid),
+        OrgSensingRejection::Semantic(_) => None,
+    };
+    if let Some(counter) = counter {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The AUTHORITY phase (steps 3–8) with counter dispatch, for a caller that has
+/// already validated the frame shape. This is the dispatch layer's entry point:
+/// it pairs with [`validate_org_frame_shape`] to give the same total validation
+/// as [`verify_org_sensing_registration`], in two explicitly ordered halves, so
+/// the authority-free refusals can be taken before any `org_install` work.
+pub(crate) fn verify_org_admission(
+    shape: &OrgFrameShape<'_>,
     from_node: u64,
     sender_entity: &EntityId,
     node_authority: Option<OrgAuthorityView>,
@@ -311,6 +365,58 @@ fn verify_org_sensing_registration_inner(
     now_secs: u64,
     counters: &SensingCounters,
 ) -> Result<ValidatedOrgSensingRegistration, OrgSensingRejection> {
+    let result = verify_org_admission_with_shape(
+        shape,
+        from_node,
+        sender_entity,
+        node_authority,
+        revocation,
+        now_secs,
+    );
+    if let Err(rejection) = &result {
+        count_org_rejection(rejection, counters);
+    }
+    result
+}
+
+/// The AUTHORITY-FREE prefix of the org gate, and an unforgeable proof that it
+/// ran: frame-kind discrimination (step 1), semantic spec reconstruction +
+/// interest-digest cross-check (step 2), and the selector ↔ target exactness
+/// check (step 2a).
+///
+/// None of those three needs an installed authority, a revocation store, or any
+/// lock — they are pure functions of bytes the frame already carries. Holding
+/// them in their own phase is what lets the dispatch layer reject a malformed
+/// frame BEFORE it pays for an `org_install` snapshot, and what makes that
+/// ordering structural rather than a convention: [`OrgFrameShape`] has private
+/// fields and no public constructor, so the authority phase literally cannot be
+/// entered without one.
+///
+/// The fields are the products the authority phase needs, so nothing is
+/// recomputed and the two phases cannot drift apart.
+pub(crate) struct OrgFrameShape<'a> {
+    spec: InterestSpec,
+    leg: Leg,
+    membership: &'a OrgMembershipCert,
+}
+
+impl OrgFrameShape<'_> {
+    /// The provider-addressed target, when this is the provider leg.
+    #[cfg(test)]
+    fn provider_target(&self) -> Option<u64> {
+        match self.leg {
+            Leg::Provider { target, .. } => Some(target),
+            Leg::Capability { .. } => None,
+        }
+    }
+}
+
+/// Steps 1, 2 and 2a. Authority-free, lock-free, and the mandatory entry point
+/// to the gate — see [`OrgFrameShape`].
+pub(crate) fn validate_org_frame_shape<'a>(
+    frame: &'a SensingInterestFrame,
+    counters: &SensingCounters,
+) -> Result<OrgFrameShape<'a>, OrgSensingRejection> {
     // Step 1: the frame must be an organization registration variant, and we
     // extract the leg parameters + the membership certificate exactly once.
     let (membership, leg) = match frame {
@@ -352,13 +458,58 @@ fn verify_org_sensing_registration_inner(
         .validated_spec(counters)
         .map_err(OrgSensingRejection::Semantic)?;
 
+    // Step 2a (design D2.6): on the provider-addressed leg the interest
+    // selector must name EXACTLY the frame's own `target`. This runs
+    // immediately after semantic reconstruction — before the membership,
+    // authority, signature, floor and audience work below, and therefore
+    // before ANY table mutation, evaluator feed, relay planning, cache
+    // publication or onward byte. It is a pure comparison of two values the
+    // frame already carries, so it needs no authority and no lock.
+    //
+    // `Node(target)` is the only coherent shape: an exact-provider interest is
+    // one interest per provider, and `ProviderSelector` is part of the interest
+    // digest, so a broader selector would either corrupt the merge-miss
+    // denominator (`AnyAuthorized` makes `is_provider_free()` true) or split one
+    // semantic interest across two digests (`Nodes` is canonically sorted and
+    // deduplicated). The capability leg carries a `consumer`, not a `target`,
+    // and is checked by the routed-origin binding in step 3 instead.
+    if let Leg::Provider { target, .. } = &leg {
+        if !selector_names_target(&spec, *target) {
+            return Err(OrgSensingRejection::SelectorTargetMismatch);
+        }
+    }
+
+    Ok(OrgFrameShape {
+        spec,
+        leg,
+        membership,
+    })
+}
+
+/// Steps 3–8: everything that needs the installed authority and the pinned
+/// revocation snapshot. Reachable only with an [`OrgFrameShape`], so steps 1, 2
+/// and 2a have provably already passed.
+fn verify_org_admission_with_shape(
+    shape: &OrgFrameShape<'_>,
+    from_node: u64,
+    sender_entity: &EntityId,
+    node_authority: Option<OrgAuthorityView>,
+    revocation: &OrgRevocationState,
+    now_secs: u64,
+) -> Result<ValidatedOrgSensingRegistration, OrgSensingRejection> {
+    let OrgFrameShape {
+        spec,
+        leg,
+        membership,
+    } = shape;
+
     // Step 3: the authenticated hop is the certificate's member. The
     // certificate binds an EntityId; it does NOT replace the routed-origin
     // cross-check, which the leader leg still enforces (consumer == from_node).
     if *sender_entity != membership.member {
         return Err(OrgSensingRejection::SenderMemberMismatch);
     }
-    if let Leg::Capability { consumer, .. } = &leg {
+    if let Leg::Capability { consumer, .. } = leg {
         if *consumer != from_node {
             return Err(OrgSensingRejection::ConsumerBindingMismatch);
         }
@@ -396,7 +547,8 @@ fn verify_org_sensing_registration_inner(
     // Steps 9 (stability recheck) and 10 (mutation) are the dispatch layer's.
     let subscriber = membership.member.clone();
     let org_id = membership.org_id;
-    Ok(ValidatedOrgSensingRegistration(match leg {
+    let spec = spec.clone();
+    Ok(ValidatedOrgSensingRegistration(match *leg {
         Leg::Capability {
             consumer,
             requested_sample_interval,
@@ -426,7 +578,108 @@ fn verify_org_sensing_registration_inner(
     }))
 }
 
-/// The leg-specific parameters extracted from the frame once (step 1).
+/// The ONE selector <-> target exactness rule (design D2.6), shared by the
+/// inbound intake gate and the local-origin egress planner so the two can never
+/// disagree about what "exact provider" means.
+///
+/// `Node(target)` is the only coherent shape: an exact-provider interest is one
+/// interest per provider, and `ProviderSelector` is part of the interest digest,
+/// so a broader selector would either corrupt the merge-miss denominator
+/// (`AnyAuthorized` makes `is_provider_free()` true) or split one semantic
+/// interest across two digests (`Nodes` is canonically sorted and deduplicated).
+pub(crate) fn selector_names_target(spec: &InterestSpec, target: u64) -> bool {
+    spec.providers == ProviderSelector::Node(target)
+}
+
+/// Why a LOCAL-ORIGIN organization egress was refused. Every variant is a hard
+/// refusal: nothing is minted, installed or emitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LocalOrgEgressRefusal {
+    /// The spec's audience is not the canonical sensing commitment of the
+    /// organization the captured membership proves. The audience is DERIVED
+    /// from installed authority; a caller cannot name one.
+    AudienceNotDerived,
+    /// The interest selector does not name the lease's own target
+    /// (design D2.6) — the same rule the inbound gate enforces.
+    SelectorTargetMismatch,
+}
+
+/// A validated local-origin organization egress plan, and an unforgeable proof
+/// that a LIVE local membership was captured for it.
+///
+/// Constructible only from a [`LiveOrgRelayMembership`], which is itself
+/// constructible only inside this module by
+/// [`capture_live_org_relay_membership`] — so a caller cannot inject an
+/// audience commitment, an owner root, a certificate, or an organization id,
+/// and cannot fabricate this token to reach the egress planner.
+///
+/// The certificate is cloned OUT of the live token deliberately: the token is
+/// deliberately not `Clone`, and the frame needs an owned certificate. Cloning
+/// the cert copies signed bytes only — it confers no authority and does not
+/// extend the token's lifetime.
+pub(crate) struct LocalOrgEgress {
+    proven_root: AudienceScopeCommitment,
+    membership: OrgMembershipCert,
+}
+
+impl LocalOrgEgress {
+    /// Derive the egress plan from a live local membership capture. The proven
+    /// root is `canonical_org_sensing_commitment(org)` — the SAME derivation
+    /// the admitted-wrapper uses, never a caller value and never
+    /// `validate_subscriber_scope`'s legacy entity root.
+    pub(crate) fn from_live_membership(membership: &LiveOrgRelayMembership) -> Self {
+        Self {
+            proven_root: canonical_org_sensing_commitment(&membership.org_id()),
+            membership: membership.owner_cert().clone(),
+        }
+    }
+
+    /// The organization-derived root the interest table row registers under.
+    pub(crate) fn proven_root(&self) -> AudienceScopeCommitment {
+        self.proven_root
+    }
+}
+
+/// Plan the LOCAL-ORIGIN organization provider registration frame.
+///
+/// There is deliberately **no `Legacy` arm**: this function is reachable only
+/// with a [`LocalOrgEgress`], which only a live organization membership capture
+/// can produce, so a legacy authority cannot reach it and it can emit nothing
+/// but [`SensingInterestFrame::OrgProviderRegistration`]. That is the structural
+/// counterpart to `plan_provider_continuation`'s exhaustive authority match on
+/// the inbound relay path — and unlike that planner, this one has no legacy
+/// frame to fall back to even in principle.
+///
+/// Both refusals are checked BEFORE the frame is built, so a refused plan emits
+/// nothing.
+pub(crate) fn plan_local_org_provider_registration(
+    egress: &LocalOrgEgress,
+    spec: &InterestSpec,
+    target: u64,
+    requested_sample_interval: Duration,
+    soft_state_ttl: Duration,
+) -> Result<SensingInterestFrame, LocalOrgEgressRefusal> {
+    // The audience must be the one DERIVED from the captured membership's
+    // organization. This is the local mirror of intake step 8, and it is what
+    // makes "no caller-supplied audience" checkable rather than merely intended.
+    if spec.audience != egress.proven_root {
+        return Err(LocalOrgEgressRefusal::AudienceNotDerived);
+    }
+    if !selector_names_target(spec, target) {
+        return Err(LocalOrgEgressRefusal::SelectorTargetMismatch);
+    }
+    Ok(SensingInterestFrame::org_provider_registration(
+        spec,
+        target,
+        requested_sample_interval,
+        soft_state_ttl,
+        egress.membership.clone(),
+    ))
+}
+
+/// The leg-specific parameters extracted from the frame once (step 1). `Copy`
+/// because [`OrgFrameShape`] hands it to the authority phase by reference.
+#[derive(Clone, Copy)]
 enum Leg {
     Capability {
         consumer: u64,
@@ -808,6 +1061,114 @@ pub(crate) fn capture_current_sensing_stamp(
     })
 }
 
+/// Run `mutate` if and only if `expected` is still the current authority stamp,
+/// with `org_install` AND the store's publication pin HELD across both the
+/// comparison and the mutation.
+///
+/// This closes a real window. [`capture_current_sensing_stamp`] releases
+/// `org_install` before it returns, so a caller that compared its result and
+/// then mutated a table was SAMPLING authority, not excluding it: an authority
+/// swap, a store swap, an `A -> B -> exact-A` rotation, a floor raise
+/// (`apply_bundle` -> `StoreCore::publish`) or a poison mark could all land in
+/// between and the row would be created anyway — a local row and a ticket for a
+/// frame the provider is now guaranteed to reject.
+///
+/// # Two exclusions, because one lock is not enough
+///
+/// `org_install` excludes authority INSTALLATION only. It does not order floor
+/// publication or poison: `apply_bundle` publishes through the store's own
+/// `live.write()`, and every poison transition takes the store's `poison_gate`;
+/// neither path touches `org_install`. So
+/// [`OrgRevocationStore::barriered_generation`] and
+/// [`OrgRevocationStore::is_poisoned`] are SAMPLES, not exclusions —
+/// `barriered_generation` takes `live.read()` into a local and drops it before
+/// returning, and `is_poisoned` only touches the process-wide poison registry.
+/// Comparing two such samples and then mutating left floor publication and
+/// poison free to land in between, which is exactly the interleaving this fence
+/// claims to exclude.
+///
+/// [`OrgRevocationStore::pin_publication`] is the missing half: it holds
+/// `poison_gate` and then `live.read()`, so while it lives no publication can
+/// complete (`StoreCore::publish` needs `live.write()`) and no poison
+/// transition can land. The stamp is therefore built from the PIN's own
+/// accessors — `pin.generation()` / `pin.poisoned()` — so the compared values
+/// are the pinned ones rather than two independent reads a transition can slip
+/// between.
+///
+/// # Lock order
+///
+/// `sensing_interest_table` -> `org_install` -> `poison_gate` -> `live`.
+///
+/// The first edge matches the two existing comparison sites. The second is new
+/// and acyclic: no publication, poison or reload path acquires `org_install`
+/// while holding `poison_gate` or `live`, and no authority-installation or
+/// floor-publication path acquires any sensing lock, so neither reverse edge
+/// exists. `poison_gate -> live` is the store's own FROZEN order, and
+/// `pin_publication` takes it in that direction.
+///
+/// # What may run inside
+///
+/// `mutate` MUST be a bounded, pure state mutation — the interest-table
+/// register/deregister call and nothing else. No cryptography, no frame
+/// authoring, no encoding, no I/O, no callbacks, no channel sends, no lock
+/// acquisition that is not already ordered below `org_install`. The bar is
+/// strictly harder than it was: the pin transitively blocks `apply_bundle`,
+/// which holds an interprocess file lock, so anything slow here stalls every
+/// opener of the same store path — not just local installs.
+///
+/// # Where the seam fires, and why not under the pin
+///
+/// `fence_seam` fires with `org_install` HELD and BEFORE the pin is taken,
+/// deliberately outside the pinned window. The seam is `dyn Fn()`, so the type
+/// cannot stop a witness from blocking inside it — and the in-crate
+/// installation witness does exactly that, sleeping to prove a rival install
+/// cannot complete. Sleeping under the pin would stall every same-path opener,
+/// which is precisely the discipline this slice exists to enforce. Firing it
+/// before the pin keeps that witness sound (its claim is about INSTALLATION,
+/// which `org_install` alone excludes and which is held across the seam) while
+/// leaving the pinned window with NO user-supplied code in it at all: pin,
+/// stamp, compare, mutate, release.
+///
+/// A transition that lands during the seam is not lost — it lands before the
+/// pin, so the comparison below is what catches it and the mutation never runs.
+/// What the pin adds is the case the seam can no longer reach: a transition
+/// attempted after the verdict, which now cannot complete until `mutate` has
+/// returned.
+pub(crate) fn with_fenced_current_authority<R>(
+    org_install: &Mutex<()>,
+    node_authority: &ArcSwapOption<NodeAuthority>,
+    org_revocation: &ArcSwapOption<OrgRevocationStore>,
+    org_install_generation: &AtomicU64,
+    expected: &SensingAuthorityStamp,
+    fence_seam: Option<&(dyn Fn() + Send + Sync)>,
+    mutate: impl FnOnce() -> R,
+) -> Option<R> {
+    let _install = org_install.lock();
+    let authority = node_authority.load_full()?;
+    let store = org_revocation.load_full()?;
+    // Outside the pin, deliberately — see "Where the seam fires" above.
+    if let Some(seam) = fence_seam {
+        seam();
+    }
+    // From here to the end of the function nothing user-supplied runs, and
+    // publication + poison are HELD STILL rather than merely observed.
+    let pin = store.pin_publication();
+    let current = SensingAuthorityStamp {
+        authority_ptr: Arc::as_ptr(&authority) as *const () as usize,
+        store_ptr: Arc::as_ptr(&store) as *const () as usize,
+        store_generation: pin.generation().ok(),
+        installation_generation: org_install_generation.load(Ordering::Acquire),
+        poisoned: pin.poisoned(),
+    };
+    if !expected.is_current(&current) {
+        return None;
+    }
+    // STILL HOLDING `org_install` AND the publication pin: no install, swap,
+    // rotation, floor publication or poison mark can land between the verdict
+    // above and the mutation below.
+    Some(mutate())
+}
+
 /// A pinned, live proof of THIS node's own organization membership, captured so
 /// a relay may re-author an organization sensing registration upstream under
 /// its OWN certificate.
@@ -899,13 +1260,18 @@ pub(crate) enum RelayMembershipUnavailable {
     /// This node's own certificate generation is below the current revocation
     /// floor for its `(org, member)` — its membership has been revoked.
     BelowFloor,
-    /// A revocation published — moving the store's floor generation — between
-    /// the coherent floor snapshot the verdict was computed against and the final
-    /// currency recheck, so the verdict is stale. Refused advisorily rather than
-    /// returning a membership (or a floor verdict) proven against a floor view
-    /// that is no longer live; the soft-state refresh retries naturally. (A store
-    /// that POISONS mid-capture is caught first as `Poisoned` — poison does not
-    /// move the generation, so the final live poison check is what catches it.)
+    /// The security view moved between the coherent floor snapshot the verdict
+    /// was computed against and the final currency recheck, so the verdict is
+    /// stale. Three shapes reach it: a revocation published (moving the store's
+    /// floor generation), and — because the cryptography runs with
+    /// `org_install` RELEASED — an authority or store swap, or an
+    /// `A -> B -> exact-Arc-A` rotation that reuses the original address and is
+    /// caught only by the installation generation. Refused advisorily rather
+    /// than returning a membership (or a floor verdict) proven against a view
+    /// that is no longer live; the soft-state refresh retries naturally. (A
+    /// store that POISONS mid-capture is caught first as `Poisoned` — poison
+    /// does not move the generation, so the live poison check in the recheck is
+    /// what catches it.)
     ViewChanged,
 }
 
@@ -913,19 +1279,41 @@ pub(crate) enum RelayMembershipUnavailable {
 /// re-authoring an org sensing registration whose (already-validated)
 /// organization is `expected_org`, at an explicit `now_secs`.
 ///
-/// `org_install` is held throughout so the authority and store IDENTITY cannot
-/// be replaced mid-gate (the same lock the piece-1 captures use). It does NOT,
-/// however, gate floor publication: a concurrent `apply_bundle` raises the floor
-/// through the store's OWN publication path, so a coherent floor snapshot alone
-/// is not a currency proof. The gate therefore captures the floor snapshot
-/// paired with its publication generation, runs the membership self-verify with
-/// no store publish guard held across the signature check, and makes the END of
-/// the gate the explicit linearization point: it crosses the store publication
-/// barrier and re-checks poison, and gates BOTH the success and the
-/// snapshot-dependent failure result behind that currency check. A floor raise
-/// or poison that publishes between the snapshot and the recheck yields an
-/// advisory `ViewChanged` — never a membership (or a specific floor verdict)
-/// computed against a floor view that is no longer live.
+/// # Three phases, and why the cryptography is in the middle one
+///
+/// `org_install` is the authority INSTALLATION lock. The installation path
+/// holds it across Ed25519 verification and a fold sweep, so every other holder
+/// must be bounded — a gate that runs its own signature check and a deep
+/// certificate clone under it directly stalls installs and every sibling that
+/// takes it. This gate therefore does NOT hold it across its cryptography:
+///
+/// - **A — under `org_install`.** Load the authority + store `Arc`s (retained,
+///   which pins them against allocator address reuse), refuse a poisoned store,
+///   refuse a foreign org, take the coherent `snapshot_with_generation()`, and
+///   stamp the view: both `Arc` pointers, the installation generation, and the
+///   store's publication generation. Nothing here is unbounded.
+/// - **B — lock RELEASED.** `self_verify_at` and the owner-certificate clone.
+/// - **C — under `org_install` again.** Re-establish currency over the whole
+///   stamp before anything is returned.
+///
+/// The pointers and the installation generation are load-bearing, not
+/// decoration. Once phase A releases the lock, an authority or store swap — and
+/// in particular an `A -> B -> exact-Arc-A` rotation, which reuses the original
+/// address — is invisible to the store's publication generation alone. The
+/// stamp is exactly [`SensingAuthorityStamp`], field for field, because the
+/// comparison it needs is exactly the sibling fence's.
+///
+/// # Why the linearization point is the END
+///
+/// `org_install` does NOT gate floor publication: a concurrent `apply_bundle`
+/// raises the floor through the store's OWN publication path, so a coherent
+/// floor snapshot alone is not a currency proof. Phase C is the explicit
+/// linearization point — it crosses the store publication barrier, re-checks
+/// poison, and gates BOTH the success and the snapshot-dependent failure result
+/// behind that check. A floor raise, a poison mark or an authority rotation
+/// that lands between the snapshot and the recheck yields an advisory
+/// `ViewChanged` — never a membership (or a specific floor verdict) computed
+/// against a view that is no longer live.
 ///
 /// The relay's membership bar is IDENTICAL to the startup ownership bar
 /// (`NodeAuthorityConfig::self_verify_at`) — binding, signature, window at
@@ -941,6 +1329,7 @@ pub(crate) fn capture_live_org_relay_membership(
     org_install: &Mutex<()>,
     node_authority: &ArcSwapOption<NodeAuthority>,
     org_revocation: &ArcSwapOption<OrgRevocationStore>,
+    org_install_generation: &AtomicU64,
     local_entity: &EntityId,
     expected_org: OrgId,
     now_secs: u64,
@@ -949,6 +1338,7 @@ pub(crate) fn capture_live_org_relay_membership(
         org_install,
         node_authority,
         org_revocation,
+        org_install_generation,
         local_entity,
         expected_org,
         now_secs,
@@ -957,69 +1347,101 @@ pub(crate) fn capture_live_org_relay_membership(
 }
 
 /// [`capture_live_org_relay_membership`] with a test seam invoked exactly once
-/// AFTER the coherent floor snapshot and BEFORE the final currency recheck. In
-/// production the seam is `|| {}` (inlined away); the in-crate race witnesses
-/// pass a pause closure to publish a floor raise / poison the store while the
-/// gate is parked between the snapshot and the recheck.
+/// AFTER phase A has released `org_install` and BEFORE the off-lock
+/// cryptography of phase B — i.e. at the head of the window phase C exists to
+/// close. In production the seam is `|| {}` (inlined away); the in-crate race
+/// witnesses pass a closure that publishes a floor raise, poisons the store or
+/// swaps the authority while the gate is parked there.
+#[allow(clippy::too_many_arguments)]
 fn capture_live_org_relay_membership_seamed(
     org_install: &Mutex<()>,
     node_authority: &ArcSwapOption<NodeAuthority>,
     org_revocation: &ArcSwapOption<OrgRevocationStore>,
+    org_install_generation: &AtomicU64,
     local_entity: &EntityId,
     expected_org: OrgId,
     now_secs: u64,
     after_floor_snapshot: impl FnOnce(),
 ) -> Result<LiveOrgRelayMembership, RelayMembershipUnavailable> {
-    let _install = org_install.lock();
-    let authority = node_authority
-        .load_full()
-        .ok_or(RelayMembershipUnavailable::NoAuthority)?;
-    let store = org_revocation
-        .load_full()
-        .ok_or(RelayMembershipUnavailable::NoStore)?;
-    if store.is_poisoned() {
-        return Err(RelayMembershipUnavailable::Poisoned);
-    }
-    // A relay only re-authors within its OWN organization. Checked before the
-    // floor snapshot — so ForeignOrg ordering is preserved — and doubling as the
-    // late-bound guard against an authority rotation to a different org between
-    // the incoming validation and this capture.
-    if authority.owner_org() != expected_org {
-        return Err(RelayMembershipUnavailable::ForeignOrg);
-    }
+    // ---- Phase A: bounded capture, under `org_install` ----------------
+    let (authority, store, floors, captured) = {
+        let _install = org_install.lock();
+        let authority = node_authority
+            .load_full()
+            .ok_or(RelayMembershipUnavailable::NoAuthority)?;
+        let store = org_revocation
+            .load_full()
+            .ok_or(RelayMembershipUnavailable::NoStore)?;
+        if store.is_poisoned() {
+            return Err(RelayMembershipUnavailable::Poisoned);
+        }
+        // A relay only re-authors within its OWN organization. Checked before
+        // the floor snapshot — so ForeignOrg ordering is preserved — and
+        // doubling as the late-bound guard against an authority rotation to a
+        // different org between the incoming validation and this capture.
+        if authority.owner_org() != expected_org {
+            return Err(RelayMembershipUnavailable::ForeignOrg);
+        }
+        let (floors, captured_generation) = store
+            .snapshot_with_generation()
+            .map_err(|_| RelayMembershipUnavailable::GenerationExhausted)?;
+        let captured = SensingAuthorityStamp {
+            authority_ptr: Arc::as_ptr(&authority) as *const () as usize,
+            store_ptr: Arc::as_ptr(&store) as *const () as usize,
+            store_generation: Some(captured_generation),
+            installation_generation: org_install_generation.load(Ordering::Acquire),
+            poisoned: false,
+        };
+        (authority, store, floors, captured)
+    };
 
-    // Capture a coherent floor snapshot paired with its publication generation,
-    // then run the membership self-verify WITHOUT holding any store publish guard
-    // across the signature check.
-    let (floors, captured_generation) = store
-        .snapshot_with_generation()
-        .map_err(|_| RelayMembershipUnavailable::GenerationExhausted)?;
     after_floor_snapshot();
+
+    // ---- Phase B: cryptography, `org_install` RELEASED ----------------
+    // The retained `authority`/`store` Arcs keep these objects alive and their
+    // addresses un-reusable for the whole window, which is what makes the
+    // pointer comparison in phase C meaningful rather than a coincidence.
     let verification = authority
         .config
         .self_verify_at(local_entity, &floors, now_secs);
+    let owner_cert = authority.config.owner_cert.clone();
 
-    // The END of the gate is the explicit linearization point. Cross the store
-    // publication barrier and re-check poison, then gate BOTH the success and the
-    // (snapshot-dependent) verification verdict behind currency: a floor raise or
-    // poison that published between the snapshot and here makes the verdict
-    // stale, so refuse with an advisory `ViewChanged` rather than returning a
-    // membership — or a specific floor verdict — proven against a floor view that
-    // is no longer live. An early `?` on `verification` would bypass this, so the
-    // Result is held, not propagated, until currency is established.
-    let current_generation = store
+    // ---- Phase C: bounded recheck, under `org_install` ----------------
+    // An early `?` on `verification` would bypass this, so the Result is held,
+    // not propagated, until currency is established over the WHOLE stamp: both
+    // pointers, the installation generation, the publication generation, and
+    // poison.
+    let _install = org_install.lock();
+    // Absence is a view CHANGE, not a fresh `NoAuthority`: something was
+    // installed at capture and is not installed now.
+    let authority_now = node_authority
+        .load_full()
+        .ok_or(RelayMembershipUnavailable::ViewChanged)?;
+    let store_now = org_revocation
+        .load_full()
+        .ok_or(RelayMembershipUnavailable::ViewChanged)?;
+    // Refusal ordering preserved exactly: exhaustion, then poison, then the
+    // staleness verdict, then the (snapshot-dependent) verification verdict.
+    let current_generation = store_now
         .barriered_generation()
         .map_err(|_| RelayMembershipUnavailable::GenerationExhausted)?;
-    if store.is_poisoned() {
+    if store_now.is_poisoned() {
         return Err(RelayMembershipUnavailable::Poisoned);
     }
-    if current_generation != captured_generation {
+    let current = SensingAuthorityStamp {
+        authority_ptr: Arc::as_ptr(&authority_now) as *const () as usize,
+        store_ptr: Arc::as_ptr(&store_now) as *const () as usize,
+        store_generation: Some(current_generation),
+        installation_generation: org_install_generation.load(Ordering::Acquire),
+        poisoned: false,
+    };
+    if !captured.is_current(&current) {
         return Err(RelayMembershipUnavailable::ViewChanged);
     }
     verification.map_err(map_self_verify_error)?;
 
     Ok(LiveOrgRelayMembership {
-        owner_cert: authority.config.owner_cert.clone(),
+        owner_cert,
         org_id: authority.owner_org(),
         _authority: authority,
         _store: store,
@@ -1661,7 +2083,16 @@ mod tests {
         let na = ArcSwapOption::from(authority);
         let rev = ArcSwapOption::from(store);
         let lock = Mutex::new(());
-        capture_live_org_relay_membership(&lock, &na, &rev, local_entity, expected_org, now)
+        let install_gen = AtomicU64::new(0);
+        capture_live_org_relay_membership(
+            &lock,
+            &na,
+            &rev,
+            &install_gen,
+            local_entity,
+            expected_org,
+            now,
+        )
     }
 
     #[test]
@@ -1881,6 +2312,7 @@ mod tests {
         let na = ArcSwapOption::from(Some(authority));
         let rev = ArcSwapOption::from(Some(store.clone()));
         let lock = Mutex::new(());
+        let install_gen = AtomicU64::new(0);
         let paused = Barrier::new(2);
         let release = Barrier::new(2);
 
@@ -1890,6 +2322,7 @@ mod tests {
                     &lock,
                     &na,
                     &rev,
+                    &install_gen,
                     &entity,
                     org_kp().org_id(),
                     now_secs(),
@@ -1926,6 +2359,7 @@ mod tests {
         let na = ArcSwapOption::from(Some(authority));
         let rev = ArcSwapOption::from(Some(store.clone()));
         let lock = Mutex::new(());
+        let install_gen = AtomicU64::new(0);
         let paused = Barrier::new(2);
         let release = Barrier::new(2);
 
@@ -1935,6 +2369,7 @@ mod tests {
                     &lock,
                     &na,
                     &rev,
+                    &install_gen,
                     &entity,
                     org_kp().org_id(),
                     now_secs(),
@@ -1949,6 +2384,334 @@ mod tests {
             release.wait();
             let result = gate.join().expect("gate thread");
             assert_eq!(result.err(), Some(RelayMembershipUnavailable::Poisoned));
+        });
+    }
+
+    // ---- repair B: the crypto window is OFF `org_install` --------------
+
+    /// Structural proof of repair B: the Ed25519 self-verify and the deep
+    /// owner-certificate clone do NOT run under the authority INSTALLATION
+    /// lock. The seam fires at the head of that window, and `org_install` is
+    /// free there.
+    ///
+    /// RED coupling: under the previous single-phase shape the lock was held
+    /// from the first `load_full` straight through the clone, so this
+    /// `try_lock` — on the very thread that holds it — returned `None`.
+    #[test]
+    fn the_relay_crypto_window_runs_with_org_install_released() {
+        let (entity, authority, store) = adopt_relay("crypto-offlock", 1);
+        let na = ArcSwapOption::from(Some(authority));
+        let rev = ArcSwapOption::from(Some(store));
+        let lock = Mutex::new(());
+        let install_gen = AtomicU64::new(0);
+        let free_in_window = AtomicU64::new(0);
+        let result = capture_live_org_relay_membership_seamed(
+            &lock,
+            &na,
+            &rev,
+            &install_gen,
+            &entity,
+            org_kp().org_id(),
+            now_secs(),
+            || {
+                if lock.try_lock().is_some() {
+                    free_in_window.store(1, Ordering::SeqCst);
+                }
+            },
+        );
+        assert_eq!(
+            result.err(),
+            None,
+            "the three-phase capture still admits a live relay membership"
+        );
+        assert_eq!(
+            free_in_window.load(Ordering::SeqCst),
+            1,
+            "`org_install` was still held at the head of the cryptography \
+             window — the Ed25519 self-verify and the deep certificate clone \
+             are running under the authority installation lock"
+        );
+    }
+
+    /// An authority SWAP during the off-lock cryptography window is caught by
+    /// the phase-C recheck and refused as `ViewChanged`.
+    ///
+    /// RED coupling: delete the phase-C stamp comparison and this returns
+    /// `Ok` — a membership vouched under an authority that has already been
+    /// replaced. The store, its generation and its poison state never move
+    /// here, so nothing but the pointer/installation-generation recheck can
+    /// catch it.
+    #[test]
+    fn an_authority_swap_during_the_relay_crypto_window_is_view_changed() {
+        let (entity, authority, store) = adopt_relay("swap-window", 1);
+        let (_rival_entity, rival, _rival_store) = adopt_relay("swap-window-rival", 1);
+        let na = ArcSwapOption::from(Some(authority));
+        let rev = ArcSwapOption::from(Some(store));
+        let lock = Mutex::new(());
+        let install_gen = AtomicU64::new(7);
+        let result = capture_live_org_relay_membership_seamed(
+            &lock,
+            &na,
+            &rev,
+            &install_gen,
+            &entity,
+            org_kp().org_id(),
+            now_secs(),
+            || {
+                // Exactly what a real installation does: publish the new
+                // authority and advance the installation generation.
+                na.store(Some(rival.clone()));
+                install_gen.fetch_add(1, Ordering::Release);
+            },
+        );
+        assert_eq!(result.err(), Some(RelayMembershipUnavailable::ViewChanged));
+    }
+
+    /// An `A -> B -> exact-Arc-A` rotation during the off-lock cryptography
+    /// window is caught ONLY by the installation generation: the authority
+    /// pointer is back to its original value, the store never moved, the
+    /// publication generation never moved, and nothing poisoned.
+    ///
+    /// RED coupling: drop `installation_generation` from the phase-C stamp (or
+    /// drop phase C entirely) and this returns `Ok`.
+    #[test]
+    fn an_a_b_a_rotation_during_the_relay_crypto_window_is_view_changed() {
+        let (entity, authority, store) = adopt_relay("aba-window", 1);
+        let (_rival_entity, rival, _rival_store) = adopt_relay("aba-window-rival", 1);
+        let na = ArcSwapOption::from(Some(authority.clone()));
+        let rev = ArcSwapOption::from(Some(store));
+        let lock = Mutex::new(());
+        let install_gen = AtomicU64::new(7);
+        let result = capture_live_org_relay_membership_seamed(
+            &lock,
+            &na,
+            &rev,
+            &install_gen,
+            &entity,
+            org_kp().org_id(),
+            now_secs(),
+            || {
+                na.store(Some(rival.clone()));
+                install_gen.fetch_add(1, Ordering::Release);
+                na.store(Some(authority.clone()));
+                install_gen.fetch_add(1, Ordering::Release);
+            },
+        );
+        assert_eq!(
+            result.err(),
+            Some(RelayMembershipUnavailable::ViewChanged),
+            "the authority Arc is byte-for-byte the captured one again, so only \
+             the installation generation can witness the rotation"
+        );
+    }
+
+    // ---- repair A: the currentness fence holds the publication PIN -----
+    //
+    // `with_fenced_current_authority` used to build its verdict from
+    // `barriered_generation()` + `is_poisoned()`. Both are SAMPLES: the first
+    // takes `live.read()` into a local and drops it before returning, and the
+    // second only touches the process-wide poison registry. Neither excludes
+    // anything, so a floor publication or a poison transition could land
+    // between the verdict and the mutation while the comment above the
+    // mutation claimed it could not. The fence now holds
+    // `OrgRevocationStore::pin_publication()` across both, and its stamp is
+    // built from that pin's accessors.
+
+    fn fence_stamp(
+        lock: &Mutex<()>,
+        na: &ArcSwapOption<NodeAuthority>,
+        rev: &ArcSwapOption<OrgRevocationStore>,
+        install_gen: &AtomicU64,
+    ) -> SensingAuthorityStamp {
+        capture_current_sensing_stamp(lock, na, rev, install_gen).expect("current stamp")
+    }
+
+    /// The fence really PINS the store rather than sampling it.
+    ///
+    /// This thread holds `pin_publication()` for the first half. A sampling
+    /// fence sails straight through that — `barriered_generation` only wants a
+    /// second `live.read()`, which coexists with ours, and `is_poisoned` wants
+    /// no store lock at all — so it compares and mutates immediately. A
+    /// pinning fence must block on `poison_gate`, which we hold, until we let
+    /// go.
+    ///
+    /// RED coupling: revert the fence to `store.barriered_generation().ok()` +
+    /// `store.is_poisoned()` and the `recv_timeout` below succeeds.
+    #[test]
+    fn the_fence_pins_the_store_rather_than_sampling_it() {
+        use std::sync::mpsc;
+
+        let (_entity, authority, store) = adopt_relay("fence-pin", 1);
+        let na = ArcSwapOption::from(Some(authority));
+        let rev = ArcSwapOption::from(Some(store.clone()));
+        let lock = Mutex::new(());
+        let install_gen = AtomicU64::new(0);
+        let expected = fence_stamp(&lock, &na, &rev, &install_gen);
+
+        // `SyncSender` (not `Sender`) because the seam must be `Sync`.
+        let (at_seam_tx, at_seam_rx) = mpsc::sync_channel::<()>(1);
+        let (mutated_tx, mutated_rx) = mpsc::sync_channel::<()>(1);
+        let seam = move || {
+            at_seam_tx.send(()).expect("seam signal");
+        };
+
+        // Publication AND poison are immobile for as long as this lives.
+        let held = store.pin_publication();
+
+        std::thread::scope(|s| {
+            let fence = s.spawn(|| {
+                with_fenced_current_authority(
+                    &lock,
+                    &na,
+                    &rev,
+                    &install_gen,
+                    &expected,
+                    Some(&seam),
+                    || {
+                        mutated_tx.send(()).expect("mutation signal");
+                    },
+                )
+            });
+            at_seam_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the fence must reach its seam — that needs only `org_install`");
+            assert!(
+                mutated_rx.recv_timeout(Duration::from_millis(500)).is_err(),
+                "the fenced mutation ran while this thread held the store's \
+                 publication pin — the fence is SAMPLING the store, so a floor \
+                 publication or a poison transition can still land between its \
+                 verdict and its mutation"
+            );
+            drop(held);
+            let out = fence.join().expect("fence thread");
+            assert!(
+                out.is_some(),
+                "once the pin is released the fence completes normally"
+            );
+            assert!(
+                mutated_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+                "and the mutation runs exactly once, after the pin was free"
+            );
+        });
+    }
+
+    /// A poison mark landing while the fence witness is parked never reaches
+    /// the mutation.
+    ///
+    /// The seam fires with `org_install` held and BEFORE the pin, so the
+    /// transition lands ahead of the verdict and the verdict — built from
+    /// `pin.poisoned()` — refuses.
+    ///
+    /// RED coupling: the pre-repair shape sampled `is_poisoned()`, compared,
+    /// and only THEN fired the seam, so this poison landed strictly between the
+    /// verdict and the mutation: the fence returned `Some(())` and the row was
+    /// created against a poisoned store.
+    #[test]
+    fn a_poison_landing_in_the_fence_window_never_reaches_the_mutation() {
+        use std::sync::Barrier;
+
+        let (_entity, authority, store) = adopt_relay("fence-poison", 1);
+        let na = ArcSwapOption::from(Some(authority));
+        let rev = ArcSwapOption::from(Some(store.clone()));
+        let lock = Mutex::new(());
+        let install_gen = AtomicU64::new(0);
+        let expected = fence_stamp(&lock, &na, &rev, &install_gen);
+        let paused = Barrier::new(2);
+        let release = Barrier::new(2);
+        let mutations = AtomicU64::new(0);
+        let seam = || {
+            paused.wait();
+            release.wait();
+        };
+
+        std::thread::scope(|s| {
+            let fence = s.spawn(|| {
+                with_fenced_current_authority(
+                    &lock,
+                    &na,
+                    &rev,
+                    &install_gen,
+                    &expected,
+                    Some(&seam),
+                    || {
+                        mutations.fetch_add(1, Ordering::SeqCst);
+                    },
+                )
+            });
+            paused.wait();
+            store.mark_poisoned_for_test();
+            release.wait();
+            let out = fence.join().expect("fence thread");
+            assert!(
+                out.is_none(),
+                "the fence admitted a mutation against a store that poisoned \
+                 inside its own window"
+            );
+            assert_eq!(
+                mutations.load(Ordering::SeqCst),
+                0,
+                "the bounded mutation ran even though the pinned verdict saw \
+                 poison — the fence is comparing samples, not pinned values"
+            );
+        });
+    }
+
+    /// The floor-publication companion: a real signed `apply_bundle` landing
+    /// while the fence witness is parked never reaches the mutation.
+    ///
+    /// RED coupling: identical to the poison cell — the pre-repair fence
+    /// sampled `barriered_generation()`, compared, fired the seam, and then
+    /// mutated, so the raise landed between the verdict and the row.
+    #[test]
+    fn a_floor_publication_landing_in_the_fence_window_never_reaches_the_mutation() {
+        use std::sync::Barrier;
+
+        let (entity, authority, store) = adopt_relay("fence-publish", 1);
+        let na = ArcSwapOption::from(Some(authority));
+        let rev = ArcSwapOption::from(Some(store.clone()));
+        let lock = Mutex::new(());
+        let install_gen = AtomicU64::new(0);
+        let expected = fence_stamp(&lock, &na, &rev, &install_gen);
+        let paused = Barrier::new(2);
+        let release = Barrier::new(2);
+        let mutations = AtomicU64::new(0);
+        let seam = || {
+            paused.wait();
+            release.wait();
+        };
+
+        std::thread::scope(|s| {
+            let fence = s.spawn(|| {
+                with_fenced_current_authority(
+                    &lock,
+                    &na,
+                    &rev,
+                    &install_gen,
+                    &expected,
+                    Some(&seam),
+                    || {
+                        mutations.fetch_add(1, Ordering::SeqCst);
+                    },
+                )
+            });
+            paused.wait();
+            let mut floors = BTreeMap::new();
+            floors.insert(entity.clone(), 2u32);
+            let bundle = OrgRevocationBundle::try_issue(&org_kp(), &floors).expect("bundle");
+            store.apply_bundle(&bundle).expect("apply floor raise");
+            release.wait();
+            let out = fence.join().expect("fence thread");
+            assert!(
+                out.is_none(),
+                "the fence admitted a mutation against a floor view that was \
+                 republished inside its own window"
+            );
+            assert_eq!(
+                mutations.load(Ordering::SeqCst),
+                0,
+                "the bounded mutation ran against a raised floor — the fence is \
+                 comparing samples, not pinned values"
+            );
         });
     }
 
@@ -2165,5 +2928,438 @@ mod tests {
             canonical_org_sensing_commitment(&org_kp().org_id()),
             "org authority preserved"
         );
+    }
+
+    // ---- D2.6: the selector <-> target intake invariant -----------------
+    //
+    // The provider-addressed leg carries BOTH a `target` and, inside the
+    // digest-bound spec, a `providers` selector. Before this slice the gate
+    // never compared them, so a frame naming provider A while selecting
+    // provider B was admitted and produced a real registration. These
+    // witnesses pin the comparison, its position in the locked order, its
+    // counter class, and the fact that the coherent shape still passes.
+
+    /// Build a provider frame whose selector and target are chosen
+    /// independently, so an incoherent pair can be constructed on purpose.
+    fn provider_frame_with(
+        selector: ProviderSelector,
+        target: u64,
+        audience: AudienceScopeCommitment,
+        cert: OrgMembershipCert,
+    ) -> SensingInterestFrame {
+        let mut spec = spec_with(audience);
+        spec.providers = selector;
+        SensingInterestFrame::org_provider_registration(&spec, target, D, TTL, cert)
+    }
+
+    /// The local-origin admission refuses a selector that names a provider
+    /// other than the leg's own target. Inverse mutation: drop the
+    /// `spec.providers == Node(target)` comparison — the frame is admitted and
+    /// a registration for a provider nobody selected is produced.
+    #[test]
+    fn local_org_admission_refuses_a_selector_that_does_not_name_the_target() {
+        let frame = provider_frame_with(
+            ProviderSelector::Node(0x77),
+            0x88,
+            org_commit(),
+            cert_gen(5),
+        );
+        assert_eq!(
+            run(&frame, &member(), Some(authority()), &empty_floors()),
+            Err(OrgSensingRejection::SelectorTargetMismatch),
+            "selector names 0x77 while the leg targets 0x88"
+        );
+        // The mirror image is refused too: the selector must not merely
+        // *contain* the target's neighbourhood, it must BE `Node(target)`.
+        let swapped = provider_frame_with(
+            ProviderSelector::Node(0x88),
+            0x77,
+            org_commit(),
+            cert_gen(5),
+        );
+        assert_eq!(
+            run(&swapped, &member(), Some(authority()), &empty_floors()),
+            Err(OrgSensingRejection::SelectorTargetMismatch)
+        );
+    }
+
+    /// Only `Node(target)` is exact. Every other selector shape is refused —
+    /// including a one-element `Nodes([target])`, which "contains" the target
+    /// but hashes to a different interest digest, and the three provider-free
+    /// shapes, which would make `is_provider_free()` true on a leg that
+    /// carries an explicit destination.
+    #[test]
+    fn every_non_exact_selector_shape_is_refused_at_intake() {
+        const TARGET: u64 = 0x77;
+        let shapes = [
+            ("AnyAuthorized", ProviderSelector::AnyAuthorized),
+            ("Nodes([target])", ProviderSelector::Nodes(vec![TARGET])),
+            (
+                "Nodes([target, other])",
+                ProviderSelector::Nodes(vec![TARGET, 0x88]),
+            ),
+            (
+                "Group",
+                ProviderSelector::Group(super::super::identity::GroupRef::from_bytes([0x5Au8; 32])),
+            ),
+            (
+                "Tags",
+                ProviderSelector::Tags(vec![super::super::identity::TagMatch {
+                    key: "rack".to_string(),
+                    value: "a1".to_string(),
+                }]),
+            ),
+        ];
+        for (label, selector) in shapes {
+            let frame = provider_frame_with(selector, TARGET, org_commit(), cert_gen(5));
+            assert_eq!(
+                run(&frame, &member(), Some(authority()), &empty_floors()),
+                Err(OrgSensingRejection::SelectorTargetMismatch),
+                "{label} is not an exact provider selector"
+            );
+        }
+    }
+
+    /// The refusal is protocol-invalid input — the sender's own bytes are
+    /// internally inconsistent — and it yields no validated registration, so
+    /// nothing downstream can mutate a table from it.
+    #[test]
+    fn the_selector_target_refusal_bumps_protocol_invalid_and_creates_no_row() {
+        let counters = SensingCounters::default();
+        let frame = provider_frame_with(
+            ProviderSelector::AnyAuthorized,
+            0x77,
+            org_commit(),
+            cert_gen(5),
+        );
+        let before = SensingCounters::get(&counters.protocol_invalid);
+        let outcome = verify_org_sensing_registration(
+            &frame,
+            FROM_NODE,
+            &member(),
+            Some(authority()),
+            &empty_floors(),
+            now_secs(),
+            &counters,
+        );
+        assert_eq!(outcome, Err(OrgSensingRejection::SelectorTargetMismatch));
+        assert_eq!(
+            SensingCounters::get(&counters.protocol_invalid),
+            before + 1,
+            "a selector/target mismatch is counted as protocol-invalid input"
+        );
+        // No other refusal class is touched — this is not an authority failure.
+        assert_eq!(SensingCounters::get(&counters.org_audience_mismatch), 0);
+        assert_eq!(SensingCounters::get(&counters.org_foreign_org), 0);
+        assert_eq!(SensingCounters::get(&counters.org_cert_invalid), 0);
+        assert_eq!(SensingCounters::get(&counters.org_authority_unavailable), 0);
+    }
+
+    /// Position in the locked order: the comparison is a pure function of two
+    /// values the frame already carries, so it must run BEFORE any authority,
+    /// signature, floor or audience work — and therefore before any effect. A
+    /// frame that is simultaneously selector-incoherent and unauthorized is
+    /// refused for the selector, proving nothing authority-shaped ran first.
+    #[test]
+    fn the_selector_target_check_precedes_every_other_authority_refusal() {
+        // (a) no authority installed at all: without step 2a this is
+        //     `MissingAuthority`.
+        let frame = provider_frame_with(
+            ProviderSelector::Node(0x77),
+            0x88,
+            org_commit(),
+            cert_gen(5),
+        );
+        assert_eq!(
+            run(&frame, &member(), None, &empty_floors()),
+            Err(OrgSensingRejection::SelectorTargetMismatch),
+            "step 2a precedes the installed-authority requirement"
+        );
+        // (b) a foreign organization's certificate: without step 2a this is
+        //     `ForeignOrg`.
+        let foreign_kp = OrgKeypair::from_bytes([0x77u8; 32]);
+        let foreign_cert =
+            OrgMembershipCert::try_issue(&foreign_kp, member(), 1, ORG_CERT_TTL_SECS_RECOMMENDED)
+                .expect("issue foreign cert");
+        let foreign = provider_frame_with(
+            ProviderSelector::Node(0x77),
+            0x88,
+            canonical_org_sensing_commitment(&foreign_kp.org_id()),
+            foreign_cert,
+        );
+        assert_eq!(
+            run(&foreign, &member(), Some(authority()), &empty_floors()),
+            Err(OrgSensingRejection::SelectorTargetMismatch),
+            "step 2a precedes the owner-org comparison"
+        );
+        // (c) a floored certificate: without step 2a this is `BelowFloor`.
+        let floors = floors_at(org_kp().org_id(), member(), 9);
+        assert_eq!(
+            run(&frame, &member(), Some(authority()), &floors),
+            Err(OrgSensingRejection::SelectorTargetMismatch),
+            "step 2a precedes the revocation floor"
+        );
+        // Control: with the selector coherent, each of those refusals is the
+        // one that actually fires — step 2a adds no false positives.
+        let ok = provider_frame_with(
+            ProviderSelector::Node(0x77),
+            0x77,
+            org_commit(),
+            cert_gen(5),
+        );
+        assert_eq!(
+            run(&ok, &member(), None, &empty_floors()),
+            Err(OrgSensingRejection::MissingAuthority)
+        );
+        assert_eq!(
+            run(&ok, &member(), Some(authority()), &floors),
+            Err(OrgSensingRejection::BelowFloor)
+        );
+    }
+
+    /// The coherent shape is still admitted, and the spec survives the gate
+    /// unchanged — step 2a is a refusal, never a rewrite.
+    #[test]
+    fn an_exact_selector_naming_the_target_is_admitted_unchanged() {
+        const TARGET: u64 = 0x5EED;
+        let frame = provider_frame_with(
+            ProviderSelector::Node(TARGET),
+            TARGET,
+            org_commit(),
+            cert_gen(5),
+        );
+        let validated =
+            run(&frame, &member(), Some(authority()), &empty_floors()).expect("admitted");
+        match &validated.0 {
+            ValidatedInner::Provider { spec, target, .. } => {
+                assert_eq!(*target, TARGET);
+                assert!(
+                    matches!(spec.providers, ProviderSelector::Node(n) if n == TARGET),
+                    "the selector reaches the admitted object verbatim"
+                );
+            }
+            _ => panic!("expected a provider registration"),
+        }
+    }
+
+    /// Round trip: a frame the org planner itself emits is admitted by the
+    /// gate with no modification, and specifically satisfies the new step 2a.
+    /// This is the coupling guard — the producer and the checker agree on the
+    /// exact shape, so tightening intake cannot orphan our own egress.
+    #[test]
+    fn an_emitted_local_org_frame_passes_the_intake_gate_unmodified() {
+        const TARGET: u64 = 0x77;
+        let seed = org_admitted(EntityId::from_bytes([0xCCu8; 32]));
+        let admitted = seed.provider_continuation(TARGET, D, TTL);
+        let (relay_entity, relay_authority, store) = adopt_relay("gate-round-trip", 1);
+        let membership = capture_relay(
+            Some(relay_authority),
+            Some(store),
+            &relay_entity,
+            org_kp().org_id(),
+            now_secs(),
+        )
+        .expect("relay membership");
+        let frame = plan_provider_continuation(&admitted, |_| Some(membership))
+            .expect("org continuation frame");
+        // The emitted frame is fed to the gate byte-for-byte as planned.
+        let validated = run(&frame, &relay_entity, Some(authority()), &empty_floors())
+            .expect("the planner's own frame must be admitted by the gate");
+        match &validated.0 {
+            ValidatedInner::Provider { spec, target, .. } => {
+                assert_eq!(*target, TARGET);
+                assert_eq!(
+                    spec,
+                    admitted.spec(),
+                    "the admitted spec equals the planned spec"
+                );
+            }
+            _ => panic!("expected a provider registration"),
+        }
+    }
+
+    /// The phase split is real, not cosmetic: `validate_org_frame_shape` takes
+    /// NO authority view, NO revocation state and NO `now_secs`, so the
+    /// selector/target refusal is structurally incapable of consulting — or
+    /// waiting on — any authority. This is the unit-level twin of the
+    /// production-path witness in `mesh::sensing_authority_witness_tests`.
+    #[test]
+    fn the_shape_phase_refuses_a_malformed_selector_with_no_authority_input() {
+        let counters = SensingCounters::default();
+        let malformed = provider_frame_with(
+            ProviderSelector::Node(0x77),
+            0x88,
+            org_commit(),
+            cert_gen(5),
+        );
+        assert_eq!(
+            validate_org_frame_shape(&malformed, &counters).err(),
+            Some(OrgSensingRejection::SelectorTargetMismatch),
+            "the authority-free phase refuses the malformation on its own"
+        );
+        // The coherent shape passes the phase and carries its products forward.
+        let coherent = provider_frame_with(
+            ProviderSelector::Node(0x77),
+            0x77,
+            org_commit(),
+            cert_gen(5),
+        );
+        let shape = validate_org_frame_shape(&coherent, &counters).expect("shape accepted");
+        assert_eq!(shape.provider_target(), Some(0x77));
+        // And the two phases compose to exactly the public verifier's verdict.
+        assert_eq!(
+            verify_org_admission(
+                &shape,
+                FROM_NODE,
+                &member(),
+                Some(authority()),
+                &empty_floors(),
+                now_secs(),
+                &counters,
+            )
+            .is_ok(),
+            run(&coherent, &member(), Some(authority()), &empty_floors()).is_ok(),
+            "shape + admission agrees with the single-call verifier"
+        );
+    }
+
+    // ---- LOCAL-ORIGIN ORG EGRESS PLANNER ---------------------------------
+
+    /// Build a live local membership capture for a freshly adopted relay, and
+    /// derive the egress plan from it. This is the ONLY way to obtain a
+    /// `LocalOrgEgress` — the plan cannot be constructed from caller-supplied
+    /// audience/root/certificate material.
+    fn local_egress(tag: &str) -> (EntityId, LocalOrgEgress) {
+        let (relay_entity, authority, store) = adopt_relay(tag, 1);
+        let membership = capture_relay(
+            Some(authority),
+            Some(store),
+            &relay_entity,
+            org_kp().org_id(),
+            now_secs(),
+        )
+        .expect("relay membership");
+        let plan = LocalOrgEgress::from_live_membership(&membership);
+        (relay_entity, plan)
+    }
+
+    /// The planner emits ONLY the org variant, carrying THIS node's own live
+    /// membership certificate. There is no `Legacy` arm to reach: a
+    /// `LocalOrgEgress` can only come from an organization membership capture,
+    /// so a legacy authority cannot produce a frame here even in principle.
+    #[test]
+    fn the_local_org_planner_emits_only_the_org_variant_with_its_own_membership() {
+        const TARGET: u64 = 0x77;
+        let (relay_entity, plan) = local_egress("local-egress-emit");
+        let spec = spec_with(plan.proven_root());
+        let frame = plan_local_org_provider_registration(&plan, &spec, TARGET, D, TTL)
+            .expect("a coherent own-org plan emits a frame");
+        match frame {
+            SensingInterestFrame::OrgProviderRegistration {
+                target,
+                subscriber_membership,
+                audience_scope,
+                ..
+            } => {
+                assert_eq!(target, TARGET);
+                assert_eq!(
+                    subscriber_membership.member, relay_entity,
+                    "the frame carries THIS node's own live membership"
+                );
+                assert_eq!(
+                    audience_scope,
+                    canonical_org_sensing_commitment(&org_kp().org_id()),
+                    "the audience is derived from installed authority"
+                );
+            }
+            other => panic!("expected OrgProviderRegistration, got {other:?}"),
+        }
+    }
+
+    /// The audience is DERIVED, not accepted: a caller-chosen audience that is
+    /// not the captured organization's canonical commitment is refused before
+    /// any frame is built.
+    #[test]
+    fn the_local_org_planner_refuses_an_audience_it_did_not_derive() {
+        let (_, plan) = local_egress("local-egress-audience");
+        // A legacy entity root, and a foreign organization's commitment.
+        for audience in [
+            AudienceScopeCommitment::owner_root(&member()),
+            canonical_org_sensing_commitment(&OrgKeypair::from_bytes([0x99u8; 32]).org_id()),
+        ] {
+            let spec = spec_with(audience);
+            assert_eq!(
+                plan_local_org_provider_registration(&plan, &spec, 0x77, D, TTL).err(),
+                Some(LocalOrgEgressRefusal::AudienceNotDerived),
+                "only the derived audience may be spoken for"
+            );
+        }
+    }
+
+    /// The planner enforces the SAME exactness rule as the inbound gate, via
+    /// the one shared predicate.
+    #[test]
+    fn the_local_org_planner_refuses_a_selector_that_does_not_name_the_target() {
+        let (_, plan) = local_egress("local-egress-selector");
+        let mut spec = spec_with(plan.proven_root());
+        for selector in [
+            ProviderSelector::Node(0x88),
+            ProviderSelector::AnyAuthorized,
+            ProviderSelector::Nodes(vec![0x77]),
+        ] {
+            spec.providers = selector;
+            assert_eq!(
+                plan_local_org_provider_registration(&plan, &spec, 0x77, D, TTL).err(),
+                Some(LocalOrgEgressRefusal::SelectorTargetMismatch)
+            );
+        }
+        // And the one shared predicate is the same rule the gate uses.
+        let coherent = spec_with(plan.proven_root());
+        assert!(selector_names_target(&coherent, 0x77));
+        assert!(!selector_names_target(&coherent, 0x88));
+    }
+
+    /// A membership captured for ANOTHER organization cannot be obtained at all:
+    /// the capture itself refuses, so no egress plan exists to speak for it.
+    #[test]
+    fn a_membership_for_another_org_yields_no_local_egress_plan() {
+        let (relay_entity, authority, store) = adopt_relay("local-egress-foreign", 1);
+        let outcome = capture_relay(
+            Some(authority),
+            Some(store),
+            &relay_entity,
+            foreign_org(),
+            now_secs(),
+        );
+        // `LiveOrgRelayMembership` is deliberately not `Debug` (it is an
+        // authority proof, not a printable value), so match rather than unwrap.
+        match outcome {
+            Err(RelayMembershipUnavailable::ForeignOrg) => {}
+            Err(other) => panic!("expected ForeignOrg, got {other:?}"),
+            Ok(_) => panic!("a capture for a foreign org must be refused"),
+        }
+    }
+
+    /// The emitted local frame passes the REAL intake gate unchanged — the
+    /// producer and the checker agree byte for byte, including the new
+    /// selector/target step.
+    #[test]
+    fn an_emitted_local_org_lease_frame_passes_the_real_intake_gate() {
+        const TARGET: u64 = 0x77;
+        let (relay_entity, plan) = local_egress("local-egress-roundtrip");
+        let spec = spec_with(plan.proven_root());
+        let frame = plan_local_org_provider_registration(&plan, &spec, TARGET, D, TTL)
+            .expect("frame planned");
+        let validated = run(&frame, &relay_entity, Some(authority()), &empty_floors())
+            .expect("the planner's own frame must be admitted by the intake gate");
+        match &validated.0 {
+            ValidatedInner::Provider {
+                target, spec: got, ..
+            } => {
+                assert_eq!(*target, TARGET);
+                assert_eq!(got, &spec, "the admitted spec equals the planned spec");
+            }
+            _ => panic!("expected a provider registration"),
+        }
     }
 }

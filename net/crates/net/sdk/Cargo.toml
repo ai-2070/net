@@ -168,7 +168,27 @@ cortex = ["net/netdb", "net/redex-disk"]
 # default so the generators are NOT compiled into a release binding library;
 # the `gen_org_*` examples enable it, and the crate's own tests reach the
 # module through `cfg(test)`.
-fixtures = ["net"]
+#
+# It also FORWARDS core's own `fixtures` seam (`net/fixtures`). The SDK's
+# test-only sensing observers read core test-only accessors — a retained
+# demand's holder tickets, for instance — and a feature that gated the SDK
+# half without enabling the core half compiled only inside a workspace dev
+# build, where a dev-dependency turned core fixtures on by accident. The
+# forwarding is what makes `--features fixtures` mean the same thing standalone
+# as it does under `cargo test`. Production darkness is unchanged: neither
+# feature is on by default, and nothing here is re-exported.
+#
+# KNOW WHAT THIS COSTS BEFORE ENABLING IT. The forwarding is transitive, so a
+# downstream crate that turns on `net-mesh-sdk/fixtures` - plausibly just to
+# reach the `gen_org_*` generators - also unlocks core's authority-relevant
+# test seams in that build, including `MeshNode::test_pin_peer_entity`, whose
+# own documentation says no production build may reach it and which the sensed
+# population rule reads. Inside this workspace that was already true through
+# dev-dependency unification; for an EXTERNAL consumer it is new. Splitting the
+# generators into a feature that does NOT forward `net/fixtures` is the way to
+# have one without the other - deliberately not done here, because every
+# in-tree consumer of `fixtures` wants both halves.
+fixtures = ["net", "net/fixtures"]
 # Compute surface — `MeshDaemon` trait + `DaemonRuntime` for local
 # spawn / snapshot / stop. Requires `net` because daemons have a
 # mesh identity (ed25519 keypair + origin_hash) that rides on the

@@ -178,8 +178,10 @@ async fn sensed_readiness_leads_the_claim_order_and_never_suspends() {
             ready: a_ready.clone(),
             start_ms: a_start_ms.clone(),
         }),
-    );
-    r.register_readiness_evaluator(CapabilityId::new("print.document"), Arc::new(SlowReady));
+    )
+    .expect("evaluator registers");
+    r.register_readiness_evaluator(CapabilityId::new("print.document"), Arc::new(SlowReady))
+        .expect("evaluator registers");
 
     connect_pair(&a, &r).await;
     a.start();
