@@ -183,6 +183,22 @@ pub enum SensingLeaseKey {
     },
 }
 
+impl SensingLeaseKey {
+    /// The authority audience scope this key is registered under.
+    ///
+    /// Total: both shapes are audience-keyed. Exposed because a holder that
+    /// outlives an owner-organization rotation is still a live registration of
+    /// its OWN key while being unrenewable and unreleasable under the node's
+    /// current view, so callers that carry tickets forward have to compare the
+    /// key's audience against the one they just derived.
+    pub fn audience(&self) -> AudienceScopeCommitment {
+        match self {
+            SensingLeaseKey::ProviderFree { audience, .. }
+            | SensingLeaseKey::ExactProvider { audience, .. } => *audience,
+        }
+    }
+}
+
 /// The wire transition a lease mutation calls for, carrying the authoritative
 /// spec the node must (re-)register or deregister with. The registry decides
 /// WHAT must happen and supplies the exact identity; the node performs the
