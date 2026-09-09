@@ -2066,6 +2066,94 @@ async fn the_reconciliation_trigger_certifies_the_installed_demand() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+
+/// A CERTIFIED demand that later degrades is converged, and PACED while it
+/// stays degraded.
+///
+/// The degraded branch used to return unconditionally. Its own comment said the
+/// repeat "is paced like any other refusal", but the floor was applied only
+/// under a `Refused` record - so once a convergence had succeeded and the
+/// record was `Certified`, a demand that degraded afterwards drove a FULL
+/// convergence on every single call. An external holder repeatedly
+/// invalidating the shared row was enough to make that permanent.
+///
+/// Pacing here must not cost responsiveness where it matters: a demand that is
+/// genuinely a different one still bypasses the floor outright.
+#[tokio::test]
+async fn a_degraded_certified_demand_is_paced_and_a_replaced_one_is_not() {
+    use net::adapter::net::behavior::org_sensing_demand::OrgSensingFamily;
+    use std::time::{Duration, Instant};
+
+    let a = org_a();
+    let (mesh, identity, dir) = mesh_with_authority("degraded-pacing", Some(&a)).await;
+    let family = OrgSensingFamily::mint(mesh.node()).expect("mint");
+    let capability = cap("nrpc:degraded.certified");
+    let schedule = super::client::ConvergenceSchedule::default();
+    let floor = Duration::from_secs(2);
+    let t0 = Instant::now();
+
+    // A demand that AGREES with its expectation: nothing is discovered here, so
+    // core publishes an empty population and an empty expectation matches it.
+    let demand = family.retain("nrpc:degraded.certified").expect("retain");
+    assert!(demand.population().is_empty());
+    schedule.certify(capability, Vec::new(), &demand, t0);
+
+    let auth = mesh.node().org_cold_authority().expect("authority capture");
+    let ctx = super::client::RefusalContext::new(mesh.node(), &auth);
+    assert!(
+        !schedule.needs_convergence(&capability, &[], Some(&demand), t0, floor, &ctx),
+        "precondition: an agreed, undegraded demand is simply reused"
+    );
+
+    // DEGRADE it: move the authority the demand recorded its epoch against.
+    renew_authority(&mesh, &a, &identity, &dir);
+    assert!(
+        !demand.authority_is_current(),
+        "precondition: the installed demand really is degraded now"
+    );
+    let moved = mesh.node().org_cold_authority().expect("authority capture");
+    let moved_ctx = super::client::RefusalContext::new(mesh.node(), &moved);
+
+    assert!(
+        !schedule.needs_convergence(&capability, &[], Some(&demand), t0, floor, &moved_ctx),
+        "a degraded demand under a CERTIFIED record must be paced: unpaced, an \
+         external holder invalidating the row drove a full convergence - \
+         capture, population derivation, acquisitions, republication - on every \
+         single call, forever"
+    );
+    assert!(
+        schedule.needs_convergence(
+            &capability,
+            &[],
+            Some(&demand),
+            t0 + floor,
+            floor,
+            &moved_ctx
+        ),
+        "and the floor still expires, so the degradation is acted on"
+    );
+
+    // A REPLACED demand is a different fact, and its first decision is never
+    // paced by its predecessor's record - checked before degradation exactly so
+    // that a replacement which is itself degraded still converges at once.
+    let replaced = family.retain("nrpc:degraded.certified").expect("re-retain");
+    assert_ne!(
+        demand.id(),
+        replaced.id(),
+        "precondition: core minted a fresh identity for the replacement"
+    );
+    assert!(
+        schedule.needs_convergence(&capability, &[], Some(&replaced), t0, floor, &moved_ctx),
+        "a replaced demand bypasses the floor outright, degraded or not"
+    );
+
+    drop(demand);
+    drop(replaced);
+    drop(family);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+
 /// A demand's identity is core's own monotone id, never its address.
 ///
 /// `DemandState` and `Outcome::Certified` hold NO `Arc` to the demand they
