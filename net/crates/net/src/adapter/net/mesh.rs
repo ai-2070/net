@@ -5539,6 +5539,26 @@ impl SensingObservations {
         sensing_scheduler_view(cell) != before
     }
 
+    /// Run the local consumer cells' CONTINUITY CLOCK at `now`, reporting
+    /// whether any projection moved (`Ready` → `Unknown`, say).
+    ///
+    /// One implementation of the timed-expiry pass. The maintenance loop calls
+    /// it on its own poll instant and folds the result into the overlay signal
+    /// it publishes; the fixtures seam
+    /// ([`MeshNode::expire_sensing_consumer_cells_for_test`]) calls the SAME
+    /// pass at a chosen instant, so a witness can attribute an expiry
+    /// notification without stopping a provider, withdrawing readiness or
+    /// breaking a path — none of which is timed expiry.
+    fn expire_consumer_cells(&mut self, now: Instant) -> bool {
+        let mut moved = false;
+        for cell in self.consumer_cells.values_mut() {
+            let before = cell.projected();
+            cell.expire_if_due(now);
+            moved |= cell.projected() != before;
+        }
+        moved
+    }
+
     /// Second closure round, item 3: drop epoch records whose
     /// provider has nothing left behind them — no warm-start
     /// observation and no refusal tombstone. Runs on every
@@ -17617,6 +17637,39 @@ impl MeshNode {
             .map(|cell| cell.own_interval())
     }
 
+    /// Fixtures-only witness seam: run the consumer cells' TIMED CONTINUITY
+    /// expiry at `now` and publish the overlay signal exactly as the
+    /// maintenance loop does, returning whether any projection moved.
+    ///
+    /// The same pass the loop runs ([`SensingObservations::expire_consumer_cells`]),
+    /// so a witness can isolate timed expiry from withdrawal, replacement and
+    /// failure-plane disruption: the provider stays up, keeps its readiness
+    /// registration and keeps its session, and only the continuity clock moves.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn expire_sensing_consumer_cells_for_test(&self, now: Instant) -> bool {
+        let moved = self.sensing_observations.lock().expire_consumer_cells(now);
+        if moved {
+            self.sensing_overlay_changed
+                .send_modify(|generation| *generation = generation.wrapping_add(1));
+        }
+        moved
+    }
+
+    /// Fixtures-only: the installation `ticket` is a live holder of, or `None`.
+    ///
+    /// Read-only. A witness needs it because releasing a ticket succeeds
+    /// idempotently for an already-released one, so a successful release is not
+    /// evidence that the holder was still live.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn sensing_lease_holder_installation_for_test(
+        &self,
+        ticket: &sensing::SensingLeaseTicket,
+    ) -> Option<sensing::LeaseToken> {
+        self.sensing_lease_holder_installation(ticket)
+    }
+
     /// Test seam (review L1 narrow-hold): run ONE periodic materialized-branch
     /// consumer-cell reconciliation at `now` — the production maintenance sweep's
     /// cell-lifecycle pass, in isolation. Witnesses drive lease-only survival and
@@ -27566,12 +27619,11 @@ impl MeshNode {
                                 // the same clock — an expiry that
                                 // moves a projection (Ready →
                                 // Unknown) fires the overlay
-                                // signal.
-                                for cell in observations.consumer_cells.values_mut() {
-                                    let before = cell.projected();
-                                    cell.expire_if_due(poll_now);
-                                    overlay_moved |= cell.projected() != before;
-                                }
+                                // signal. ONE implementation,
+                                // shared with the fixtures seam that
+                                // drives it at a chosen instant.
+                                overlay_moved |=
+                                    observations.expire_consumer_cells(poll_now);
                                 // SI-4 review P1: EVERY slot is
                                 // checked for row liveness — a
                                 // downstream that deregistered

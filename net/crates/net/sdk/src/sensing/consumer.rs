@@ -45,6 +45,14 @@
 //!   ADDITIONS remains paced, so the reported set is always a subset of
 //!   current visibility and never a superset.
 //!
+//! The qualification is a CAPTURE: it holds at the instant it is taken,
+//! and the projection that follows describes that capture. Authority or
+//! discovery movement concurrent with a single call may therefore
+//! appear on the NEXT read rather than inside this one — the ordinary
+//! property of an observation, not a stale-authorization window: no
+//! read reuses a qualification from an earlier call, and a refusal
+//! never falls back to a previously reported population.
+//!
 //! # What this owns, and what it reuses
 //!
 //! Nothing about the observation is invented here. A [`SensingWatch`] is
@@ -468,6 +476,14 @@ pub struct SensingWatch {
     /// Fixtures-only witness seam: see [`SensingWatch::set_capture_seam_for_test`].
     #[cfg(any(test, feature = "fixtures"))]
     capture_seam: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Fixtures-only: how many convergence ATTEMPTS this watch has made
+    /// ([`SensingWatch::convergences_for_test`]).
+    #[cfg(any(test, feature = "fixtures"))]
+    convergences: u64,
+    /// Fixtures-only: suspend the paced re-derivation
+    /// ([`SensingWatch::suspend_convergence_for_test`]).
+    #[cfg(any(test, feature = "fixtures"))]
+    convergence_suspended: bool,
 }
 
 impl SensingClient {
@@ -549,6 +565,10 @@ impl SensingClient {
             closed: false,
             #[cfg(any(test, feature = "fixtures"))]
             capture_seam: None,
+            #[cfg(any(test, feature = "fixtures"))]
+            convergences: 1,
+            #[cfg(any(test, feature = "fixtures"))]
+            convergence_suspended: false,
         })
     }
 }
@@ -703,6 +723,60 @@ impl SensingWatch {
         self.capture_seam = Some(hook);
     }
 
+    /// Unstable fixtures-only witness seam; not supported API.
+    ///
+    /// How many convergence ATTEMPTS this watch has made, counting the
+    /// eager one at `watch()`. A witness uses it to attribute a result
+    /// to the right mechanism: a row that disappeared with this count
+    /// unchanged was removed by the per-read visibility clamp, not by a
+    /// paced re-derivation, and a recovery that bumps it inside the old
+    /// success floor proves the floor was bypassed rather than waited
+    /// out.
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn convergences_for_test(&self) -> u64 {
+        self.convergences
+    }
+
+    /// Unstable fixtures-only witness seam; not supported API.
+    ///
+    /// The providers this watch's installed demand actually RETAINS a lease
+    /// for — a subset of the population, since a refused acquisition leaves
+    /// its member unretained. A witness distinguishing "a retained row was
+    /// removed" from "an unretained member was never there" needs this.
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn retained_providers_for_test(&self) -> Vec<u64> {
+        self.family
+            .demand(&self.authority)
+            .map(|demand| demand.retained_providers())
+            .unwrap_or_default()
+    }
+
+    /// Unstable fixtures-only witness seam; not supported API.
+    ///
+    /// SUSPEND the paced re-derivation: while suspended, a snapshot with
+    /// a demand installed never calls `retain`. It exists so a
+    /// visibility witness cannot be satisfied by a convergence that
+    /// happened to be due — with re-derivation off, only the clamp can
+    /// remove a row.
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn suspend_convergence_for_test(&mut self, suspended: bool) {
+        self.convergence_suspended = suspended;
+    }
+
+    /// Unstable fixtures-only witness seam; not supported API.
+    ///
+    /// When a parked [`Self::changed`] would return on the population
+    /// FALLBACK, so a wake witness can state its own margin instead of
+    /// assuming one.
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn fallback_deadline_for_test(&self) -> Instant {
+        self.floor_wake
+    }
+
     /// The demand to project, re-deriving the authorized population when
     /// that is due or when the installed one can no longer be trusted.
     fn converge(&mut self) -> Result<Arc<OrgSensingCapabilityDemand>, SensingError> {
@@ -719,10 +793,18 @@ impl SensingWatch {
                     || self.converged_at.elapsed() >= POPULATION_RECONCILE_FLOOR
             }
         };
+        // Fixtures-only: a suspended witness keeps whatever is installed,
+        // so nothing but the visibility clamp can change its rows.
+        #[cfg(any(test, feature = "fixtures"))]
+        let due = due && !self.convergence_suspended;
         if !due {
             if let Some(demand) = installed {
                 return Ok(demand);
             }
+        }
+        #[cfg(any(test, feature = "fixtures"))]
+        {
+            self.convergences += 1;
         }
         match self.family.retain(&self.capability) {
             Ok(demand) => {
