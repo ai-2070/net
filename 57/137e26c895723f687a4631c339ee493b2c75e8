@@ -1,0 +1,22 @@
+net/crates/net/sdk/src/org/client.rs
+  s_da07b5b1ec2c3f::t_22fdc54042168a 672-690,692-695
+  s_da07b5b1ec2c3f::t_bbccbb3e5d46d0 101-105,669-670,697,701
+net/crates/net/sdk/src/org/call.rs
+  s_da07b5b1ec2c3f::t_c91045f108584a 682-689
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "57137e26c895723f687a4631c339ee493b2c75e8",
+  "prompts": {},
+  "sessions": {
+    "s_da07b5b1ec2c3f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "784fba0f-4788-4484-a276-e2c81f1dc034",
+        "model": "claude-opus-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
