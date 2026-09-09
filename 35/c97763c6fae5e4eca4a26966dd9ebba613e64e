@@ -1,0 +1,14 @@
+net/crates/net/sdk/tests/sensing_consumer.rs
+  h_64425bc75e3f3d 97-101,583-599,610,618-619,622-630,1005-1011,1016
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "35c97763c6fae5e4eca4a26966dd9ebba613e64e",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
