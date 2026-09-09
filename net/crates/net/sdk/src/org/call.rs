@@ -679,7 +679,14 @@ impl OrgClient {
             // from mere spawning; the lock itself counts the callers that
             // found it HELD, which is contention observed at acquisition.
             acquisition.schedule().note_arrival();
-            let _txn = acquisition.reconcile_lock();
+            // DECLINE rather than block: see `try_reconcile_lock`. The holder
+            // is converging this same capability and publishes for everyone, so
+            // waiting would only buy this caller the state it can already see -
+            // at the price of blocking the runtime inside a synchronous
+            // section that authors and sends per provider.
+            let Some(_txn) = acquisition.try_reconcile_lock() else {
+                return;
+            };
             // The hold's own ticket, copied out so the steps below can ask
             // whether they are STILL running under it. Losing the hold - to an
             // early release or to another caller - is then observable at the
