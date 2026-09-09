@@ -425,6 +425,29 @@ async fn until(what: &str, deadline: Duration, mut probe: impl FnMut() -> bool) 
 // One shared cell: N same-organization providers of one capability
 // ---------------------------------------------------------------------------
 
+/// An installed in-section hook that removes itself on drop.
+///
+/// The hook lives inside the binding it observes and a witness's hook captures
+/// a clone of that same binding, so leaving one installed keeps a fixture-only
+/// cycle alive — and a failing assertion unwinds past any manual clear. This
+/// makes the removal structural instead.
+struct SectionHook<'a> {
+    client: &'a OrgClient,
+}
+
+impl<'a> SectionHook<'a> {
+    fn install(client: &'a OrgClient, hook: Arc<dyn Fn() + Send + Sync>) -> Self {
+        client.set_sensing_section_hook_for_test(Some(hook));
+        Self { client }
+    }
+}
+
+impl Drop for SectionHook<'_> {
+    fn drop(&mut self) {
+        self.client.set_sensing_section_hook_for_test(None);
+    }
+}
+
 /// A stood-up cell: the consumer's bound client, and providers ORDERED the way
 /// deterministic selection orders them (ascending provider entity id), so
 /// `providers[0]` is always the one the unsensed path would take.
@@ -1119,12 +1142,17 @@ async fn a_holder_that_dies_after_convergence_is_reacquired() {
 ///   contention count says the others are really blocked on it, not for a
 ///   fixed window — a window only establishes that time passed, and callers
 ///   spaced further apart than the window would never have overlapped at all.
-/// * **the observer.** The gauge is not the hook. It is entered by the call
-///   path immediately after the serializing guard and left when the whole
-///   transaction ends, with that guard still held, so it brackets the
-///   installed-state read, the decision, `retain` and the record. A lock
-///   narrowed to the hook alone leaves all of that overlapping, and the peak
-///   rises above one even though every hook ran alone.
+/// * **the observer.** Two separate things establish this, because occupancy
+///   alone cannot. The gauge is entered by the call path immediately after the
+///   serializing guard and left when the whole transaction ends, so it
+///   brackets the installed-state read, the decision, `retain` and the record
+///   — a lock narrowed to the hook leaves all of that overlapping and the peak
+///   rises. But overlap is a property of the SCHEDULE: a section released
+///   early is still wrong when the awakened contender happens to wait its
+///   turn, and no peak would show it. So the transaction also re-checks its
+///   OWN hold at the decision and at the record, and the count of steps that
+///   ran without it must be zero. That check needs no second caller and no
+///   interleaving: it is about the guard, not about who else was running.
 ///
 /// Nor is "one caller parked while the others arrive at the door" enough. That
 /// schedule survives an UNSERIALIZED section through a single early winner:
@@ -1133,6 +1161,8 @@ async fn a_holder_that_dies_after_convergence_is_reacquired() {
 /// So the assertions are ordered by what they can discriminate:
 ///
 /// * real contention was acknowledged at acquisition;
+/// * no step of the transaction ran outside its own hold — what an early
+///   `drop` of the guard fails, under EVERY permitted schedule;
 /// * the peak transaction occupancy is 1 — what both the removed lock and the
 ///   observer-only lock fail;
 /// * exactly one caller converges. The PROPERTY serialization exists for, and
@@ -1154,22 +1184,24 @@ async fn contending_clones_produce_exactly_one_convergence() {
     // The caller inside the section stays there until the others have really
     // blocked on it. The bound is a safety net for a broken build, not the
     // mechanism: a run that reaches it fails the contention assertion below.
-    {
+    // The guard clears the hook on the way out - including on unwind, so a
+    // failing assertion cannot leave the fixture's own clone inside the
+    // binding it is installed on.
+    let hook = SectionHook::install(&cell.client, {
         let client = cell.client.clone();
-        cell.client
-            .set_sensing_section_hook_for_test(Some(Arc::new(move || {
-                let deadline = Instant::now() + Duration::from_secs(10);
-                loop {
-                    let (_, contended, _, _) = client
-                        .sensing_section_counters()
-                        .expect("an active binding");
-                    if contended >= CALLERS - 1 || Instant::now() >= deadline {
-                        return;
-                    }
-                    std::thread::sleep(Duration::from_millis(5));
+        Arc::new(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let (_, contended, _, _) = client
+                    .sensing_section_counters()
+                    .expect("an active binding");
+                if contended >= CALLERS - 1 || Instant::now() >= deadline {
+                    return;
                 }
-            })));
-    }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        })
+    });
 
     let clones: Vec<OrgClient> = (0..CALLERS).map(|_| cell.client.clone()).collect();
     let mut tasks = Vec::new();
@@ -1185,7 +1217,7 @@ async fn contending_clones_produce_exactly_one_convergence() {
     for task in tasks {
         task.await.expect("join").expect("admitted");
     }
-    cell.client.set_sensing_section_hook_for_test(None);
+    drop(hook);
 
     let (arrivals, contended, convergences, peak) = cell
         .client
@@ -1199,6 +1231,12 @@ async fn contending_clones_produce_exactly_one_convergence() {
         contended >= CALLERS - 1,
         "the callers must have found the section HELD - acquisition-time \
          contention, not elapsed time - saw {contended}"
+    );
+    assert_eq!(
+        cell.client.sensing_section_unguarded_steps(),
+        Some(0),
+        "the decision and the record must run under the hold this caller took \
+         - a section released early loses it whether or not anyone overlapped"
     );
     assert_eq!(
         peak, 1,
@@ -1326,17 +1364,16 @@ async fn within_attempt_narrowing_is_not_certified_as_agreement() {
     // Hold the attempt open across the expiry: the caller's expectation
     // already includes the ephemeral provider, and core's query will not.
     let fired = Arc::new(AtomicUsize::new(0));
-    {
+    let hook = SectionHook::install(&cell.client, {
         let fired = fired.clone();
-        cell.client
-            .set_sensing_section_hook_for_test(Some(Arc::new(move || {
-                if fired.fetch_add(1, Ordering::SeqCst) == 0 {
-                    std::thread::sleep(Duration::from_millis(2500));
-                }
-            })));
-    }
+        Arc::new(move || {
+            if fired.fetch_add(1, Ordering::SeqCst) == 0 {
+                std::thread::sleep(Duration::from_millis(2500));
+            }
+        })
+    });
     let _armed = cell.try_call().await;
-    cell.client.set_sensing_section_hook_for_test(None);
+    drop(hook);
     assert_eq!(
         fired.load(Ordering::SeqCst),
         1,
@@ -1397,22 +1434,20 @@ async fn within_attempt_widening_is_not_certified_as_agreement() {
     let latecomer = net::adapter::net::identity::EntityKeypair::generate();
     let latecomer_id = latecomer.entity_id().node_id();
     let fired = Arc::new(AtomicUsize::new(0));
-    {
+    let hook = SectionHook::install(&cell.client, {
         let fired = fired.clone();
         let consumer_node = Arc::clone(&cell.consumer.node);
         let owner = org();
         let latecomer = latecomer.clone();
-        cell.client
-            .set_sensing_section_hook_for_test(Some(Arc::new(move || {
-                if fired.fetch_add(1, Ordering::SeqCst) > 0 {
-                    return;
-                }
-                let authority = consumer_node.node_authority().expect("authority");
-                let cert =
-                    OrgMembershipCert::try_issue(&owner, latecomer.entity_id().clone(), 1, 3600)
-                        .expect("membership");
-                let descriptor = CapabilitySet::new().add_tag(TAG).to_bytes_compact();
-                let envelope = net::adapter::net::behavior::org_scoped_ann::ScopedCapabilityAnnouncement::build_owner(
+        Arc::new(move || {
+            if fired.fetch_add(1, Ordering::SeqCst) > 0 {
+                return;
+            }
+            let authority = consumer_node.node_authority().expect("authority");
+            let cert = OrgMembershipCert::try_issue(&owner, latecomer.entity_id().clone(), 1, 3600)
+                .expect("membership");
+            let descriptor = CapabilitySet::new().add_tag(TAG).to_bytes_compact();
+            let envelope = net::adapter::net::behavior::org_scoped_ann::ScopedCapabilityAnnouncement::build_owner(
                     &latecomer,
                     owner.org_id(),
                     cert,
@@ -1423,15 +1458,15 @@ async fn within_attempt_widening_is_not_certified_as_agreement() {
                     &descriptor,
                 )
                 .expect("owner envelope");
-                consumer_node.ingest_scoped_announcement_for_test(&envelope.to_bytes());
-                consumer_node.test_pin_peer_entity(
-                    latecomer.entity_id().node_id(),
-                    latecomer.entity_id().clone(),
-                );
-            })));
-    }
+            consumer_node.ingest_scoped_announcement_for_test(&envelope.to_bytes());
+            consumer_node.test_pin_peer_entity(
+                latecomer.entity_id().node_id(),
+                latecomer.entity_id().clone(),
+            );
+        })
+    });
     let _armed = cell.try_call().await;
-    cell.client.set_sensing_section_hook_for_test(None);
+    drop(hook);
     assert_eq!(fired.load(Ordering::SeqCst), 1, "the hook must have fired");
 
     let (population_now, _, _) = demand_state(&cell.client).expect("demand");
@@ -1603,26 +1638,21 @@ async fn a_missing_canonical_member_is_recovered_under_an_unchanged_expectation(
     // it returns, so the disappearance is strictly between them - by
     // construction, not by out-racing a pre-call sample.
     let fired = Arc::new(AtomicUsize::new(0));
-    {
+    let hook = SectionHook::install(&cell.client, {
         let fired = fired.clone();
         let consumer_node = Arc::clone(&cell.consumer.node);
         let owner = org();
         let lowest_key = lowest.clone();
-        cell.client
-            .set_sensing_section_hook_for_test(Some(Arc::new(move || {
-                if fired.fetch_add(1, Ordering::SeqCst) > 0 {
-                    return;
-                }
-                let authority = consumer_node.node_authority().expect("authority");
-                let cert = OrgMembershipCert::try_issue(
-                    &owner,
-                    lowest_key.entity_id().clone(),
-                    1,
-                    3600,
-                )
-                .expect("membership");
-                let descriptor = CapabilitySet::new().add_tag(TAG).to_bytes_compact();
-                let envelope = net::adapter::net::behavior::org_scoped_ann::ScopedCapabilityAnnouncement::build_owner(
+        Arc::new(move || {
+            if fired.fetch_add(1, Ordering::SeqCst) > 0 {
+                return;
+            }
+            let authority = consumer_node.node_authority().expect("authority");
+            let cert =
+                OrgMembershipCert::try_issue(&owner, lowest_key.entity_id().clone(), 1, 3600)
+                    .expect("membership");
+            let descriptor = CapabilitySet::new().add_tag(TAG).to_bytes_compact();
+            let envelope = net::adapter::net::behavior::org_scoped_ann::ScopedCapabilityAnnouncement::build_owner(
                     &lowest_key,
                     owner.org_id(),
                     cert,
@@ -1633,17 +1663,17 @@ async fn a_missing_canonical_member_is_recovered_under_an_unchanged_expectation(
                     &descriptor,
                 )
                 .expect("owner envelope");
-                consumer_node.ingest_scoped_announcement_for_test(&envelope.to_bytes());
-                // Replaced at a later sequence with a one-second life, then
-                // slept well past it - the whole-second granularity of an
-                // announcement's expiry is why the wait is not tight. The row
-                // is gone by the time core queries, and the caller's capture -
-                // already taken - still contains it.
-                std::thread::sleep(Duration::from_millis(2500));
-            })));
-    }
+            consumer_node.ingest_scoped_announcement_for_test(&envelope.to_bytes());
+            // Replaced at a later sequence with a one-second life, then
+            // slept well past it - the whole-second granularity of an
+            // announcement's expiry is why the wait is not tight. The row
+            // is gone by the time core queries, and the caller's capture -
+            // already taken - still contains it.
+            std::thread::sleep(Duration::from_millis(2500));
+        })
+    });
     let _armed = cell.try_call().await;
-    cell.client.set_sensing_section_hook_for_test(None);
+    drop(hook);
     assert_eq!(
         fired.load(Ordering::SeqCst),
         1,

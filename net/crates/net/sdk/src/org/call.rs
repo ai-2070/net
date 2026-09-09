@@ -661,6 +661,12 @@ impl OrgClient {
             // found it HELD, which is contention observed at acquisition.
             acquisition.schedule().note_arrival();
             let _txn = acquisition.reconcile_lock();
+            // The hold's own ticket, copied out so the steps below can ask
+            // whether they are STILL running under it. Losing the hold - to an
+            // early release or to another caller - is then observable at the
+            // exact boundary that must be protected, with no second caller and
+            // no overlap needed to expose it.
+            let held = _txn.ticket();
             // Declared AFTER the guard, so its drop - the end of the whole
             // transaction - runs while the guard is still held. Two callers
             // inside this span at once means the transaction was not
@@ -673,12 +679,15 @@ impl OrgClient {
                 // a DEPARTURE to zero and is retired; nothing is recorded, so
                 // an unknown service leaves no state behind and a capability
                 // whose providers appear later still converges on that call.
+                acquisition.schedule().verify_holding(held);
                 if installed.is_some() {
                     family.retire(sensed.tag);
                 }
                 acquisition.schedule().forget(capability);
                 return;
             }
+            // THE DECISION - read under this caller's own hold.
+            acquisition.schedule().verify_holding(held);
             if acquisition.schedule().needs_convergence(
                 capability,
                 &expected,
@@ -691,7 +700,9 @@ impl OrgClient {
                     Ok(demand) => {
                         acquisition
                             .schedule()
-                            .certify(*capability, expected, &demand, now)
+                            .certify(*capability, expected, &demand, now);
+                        // ...and THE PUBLICATION, likewise.
+                        acquisition.schedule().verify_holding(held);
                     }
                     // A refused convergence records the ATTEMPT against the
                     // demand it could not replace, so a persistent refusal
@@ -700,6 +711,7 @@ impl OrgClient {
                         acquisition
                             .schedule()
                             .record_refusal(*capability, expected, now);
+                        acquisition.schedule().verify_holding(held);
                         return;
                     }
                 }
