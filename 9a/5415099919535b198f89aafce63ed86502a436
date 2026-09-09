@@ -1,0 +1,19 @@
+docs/internal/misc/CODE_REVIEW_2026_09_09_ORG_EXACT_SENSING.md
+  s_c748dae86f16d9::t_2535bc21e1dde1 1-529
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "9a5415099919535b198f89aafce63ed86502a436",
+  "prompts": {},
+  "sessions": {
+    "s_c748dae86f16d9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d5b3b207-c556-4260-8533-7f3827b2533f",
+        "model": "unknown"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
