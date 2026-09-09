@@ -16493,15 +16493,30 @@ impl MeshNode {
         &self,
         interest: &sensing::CapabilityInterestKey,
     ) -> Vec<(u64, sensing::ProjectedReadiness, Option<Duration>)> {
+        // ONE instant for every row, captured before the guard, so two
+        // providers in one result can never be judged against different nows.
+        let now = Instant::now();
         self.sensing_observations
             .lock()
             .consumer_cells
             .iter()
             .filter(|(key, _)| &key.interest == interest)
             .map(|(key, cell)| {
-                // Same rule as the organization traversal: an estimate is
-                // reported only while the projection it backs still vouches.
-                let projected = cell.projected();
+                // Same rule as the organization traversal, and now the same
+                // READ: freshness is evaluated at one captured instant.
+                //
+                // `projected()` ignores the cell's deadline entirely. A cell
+                // whose deadline has passed keeps its last observation until
+                // the mutating sweep clears it, and that sweep is the heartbeat
+                // loop — seconds-scale, against sample intervals that can be
+                // tens of milliseconds. So for up to a full heartbeat this
+                // frozen `SensingConsumer` surface reported a silent provider
+                // as `Ready` with a stale start estimate, while
+                // `org_sensed_branch_snapshot` read the very same map at the
+                // same instant and correctly answered `Unknown`. Two seams
+                // disagreeing about one instant is what let a selector route
+                // work to a provider that had stopped beating.
+                let projected = cell.projected_at(now);
                 let estimate = match projected {
                     sensing::ProjectedReadiness::Unknown => None,
                     _ => cell.observation().and_then(|obs| obs.estimated_start),
