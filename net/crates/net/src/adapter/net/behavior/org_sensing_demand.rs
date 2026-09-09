@@ -279,47 +279,70 @@ impl OrgSensedProjection {
 /// was never sensed keeps its place among the unverdicted ones; a not-ready one
 /// is ordered last rather than removed. Cross-organization candidates are never
 /// sensed and therefore never pruned.
+///
+/// Totality holds for ANY input, not just well-formed ones. Emission is tracked
+/// by index, so duplicate provider ids in `providers` cannot collapse two
+/// entries into one — each ranked id claims at most one not-yet-emitted index
+/// and any surplus occurrence falls through to the unverdicted bucket. A
+/// `same_org` slice shorter than `providers` reads as `false` past its end
+/// rather than truncating the result.
 pub fn org_sensed_bucket_permutation(
     same_org: &[bool],
     providers: &[u64],
     ranked: &[u64],
     pruned: &[u64],
 ) -> Vec<usize> {
-    debug_assert_eq!(
-        same_org.len(),
-        providers.len(),
-        "the two candidate slices are parallel views of one list"
-    );
     let mut viable: Vec<usize> = Vec::with_capacity(ranked.len());
     let mut potential: Vec<usize> = Vec::with_capacity(providers.len());
     let mut non_viable: Vec<usize> = Vec::with_capacity(providers.len());
+    // Emission is tracked by INDEX, not by provider id. Skipping by value made
+    // the result stop being a permutation the moment two same-org candidates
+    // shared a provider id: the ranked pass emits `position()`'s FIRST match
+    // only, while a `ranked.contains(&provider)` skip drops every occurrence,
+    // so `providers = [X, X]` with `ranked = [X]` yielded `[0]` and index 1
+    // landed in no bucket at all. `sensed_provider_order` indexes
+    // `providers[index]` on the documented totality, and the SDK's
+    // `apply_permutation` only survived it by being defensively total.
+    let mut emitted = vec![false; providers.len()];
+
+    // `same_org` is a parallel view, but a SHORTER one must not silently
+    // truncate the list: the old `zip` stopped at the shorter slice, and the
+    // `debug_assert_eq!` that was meant to catch that is compiled out in
+    // release - so a mismatch dropped the tail in exactly the builds that
+    // matter. HANDLED rather than asserted: a missing entry reads as "not
+    // same-org", the conservative answer - never sensed, never pruned.
+    let owned_at = |index: usize| same_org.get(index).copied().unwrap_or(false);
 
     // Sensed rank order, which is the whole point of sensing: the sensed order
     // drives the emission, not the input's own order.
     for wanted in ranked {
-        if let Some(index) = providers
-            .iter()
-            .zip(same_org)
-            .position(|(provider, &owned)| owned && provider == wanted)
+        if let Some(index) =
+            (0..providers.len()).find(|&i| !emitted[i] && owned_at(i) && providers[i] == *wanted)
         {
+            emitted[index] = true;
             viable.push(index);
         }
     }
 
-    // ONE pass over the input in its ORIGINAL order for everything else.
-    // Membership in `ranked` IS the "already emitted" test, so no second
-    // bookkeeping structure can disagree with the first.
-    for (index, (&provider, &owned)) in providers.iter().zip(same_org).enumerate() {
-        if owned && ranked.contains(&provider) {
+    // ONE pass over the input in its ORIGINAL order for everything else. Every
+    // index not already emitted lands in exactly one of the two buckets, so
+    // the three together cover `0..providers.len()` exactly once.
+    for index in 0..providers.len() {
+        if emitted[index] {
             continue;
         }
-        if owned && pruned.contains(&provider) {
+        if owned_at(index) && pruned.contains(&providers[index]) {
             non_viable.push(index);
         } else {
             potential.push(index);
         }
     }
 
+    debug_assert_eq!(
+        viable.len() + potential.len() + non_viable.len(),
+        providers.len(),
+        "the three buckets must partition the input exactly once"
+    );
     viable.extend(potential);
     viable.extend(non_viable);
     viable
@@ -2381,6 +2404,61 @@ mod tests {
         node.release_sensing_interest_lease(survivor);
         drop(demand);
         drop(family);
+    }
+    // ---- BUCKET PERMUTATION ----------------------------------------------
+
+    /// The bucket assignment is a PERMUTATION for every input, not only for
+    /// well-formed ones.
+    ///
+    /// `sensed_provider_order` indexes `providers[index]` on exactly this
+    /// contract, and the SDK's `apply_permutation` survived the old behaviour
+    /// only by being defensively total.
+    #[test]
+    fn the_bucket_assignment_is_total_for_degenerate_inputs() {
+        fn is_permutation(result: &[usize], len: usize) -> bool {
+            let mut seen = vec![false; len];
+            for &i in result {
+                if i >= len || seen[i] {
+                    return false;
+                }
+                seen[i] = true;
+            }
+            result.len() == len && seen.into_iter().all(|s| s)
+        }
+
+        // DUPLICATE provider ids. The ranked pass emitted `position()`'s first
+        // match only, while the second pass skipped every occurrence BY VALUE,
+        // so index 1 landed in no bucket at all.
+        let out = org_sensed_bucket_permutation(&[true, true], &[7, 7], &[7], &[]);
+        assert!(
+            is_permutation(&out, 2),
+            "duplicate provider ids must not collapse two candidates into one: {out:?}"
+        );
+        assert_eq!(out[0], 0, "the ranked id still claims one index first");
+
+        // A SHORTER parallel view. `zip` truncated silently and the
+        // `debug_assert_eq!` is compiled out in release.
+        let out = org_sensed_bucket_permutation(&[true], &[7, 8, 9], &[7], &[]);
+        assert!(
+            is_permutation(&out, 3),
+            "a short `same_org` must read as `false` past its end, not truncate \
+             the result: {out:?}"
+        );
+
+        // The ordinary case still orders by sensed rank, then unverdicted, then
+        // pruned - the property the buckets exist for.
+        let out = org_sensed_bucket_permutation(
+            &[true, true, true, true],
+            &[10, 11, 12, 13],
+            &[12, 10],
+            &[11],
+        );
+        assert!(is_permutation(&out, 4), "{out:?}");
+        assert_eq!(
+            out,
+            vec![2, 0, 3, 1],
+            "sensed rank first, then the unverdicted in input order, then pruned"
+        );
     }
     // ---- WORKER LIFECYCLE ------------------------------------------------
 
