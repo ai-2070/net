@@ -402,9 +402,14 @@ impl ObservationCell {
     /// still projects, `deadline` does not — instead of sleeping past a window
     /// and hoping. Production reads freshness through
     /// [`Self::projected_at`] alone.
+    ///
+    /// `pub(crate)` for the reason [`Self::own_interval`] is: its only caller
+    /// is in this crate, and a `pub` method on a `pub` type in a `pub` module
+    /// is nameable by any consumer that turns `fixtures` on, however hidden it
+    /// is from rustdoc.
     #[cfg(any(test, feature = "fixtures"))]
     #[doc(hidden)]
-    pub fn deadline_for_test(&self) -> Instant {
+    pub(crate) fn deadline_for_test(&self) -> Instant {
         self.deadline
     }
 

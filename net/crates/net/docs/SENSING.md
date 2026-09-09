@@ -162,7 +162,7 @@ outright, and it keeps its original `-> ()` signature and semantics.
 read by the crate's own integration suites as a plain observability
 query.
 
-Four rules follow, and they are what the ids exist for:
+Five rules follow, and they are what the ids exist for:
 
 - **No silent theft.** A second integration cannot take a served
   capability by accident; it is refused and the incumbent keeps
@@ -329,10 +329,14 @@ positive `Duration`, and an unfloored `ttl/2` on a nanosecond horizon
 makes the armed deadline elapse before the arm returns, so the worker's
 due-set is continuously due and its loop never parks — on a
 single-threaded executor that starves every other task on the runtime.
-A horizon below 2 ms therefore cannot be renewed ahead of its own
-expiry, and the floor says so instead of pretending otherwise; the
-worker also yields cooperatively after every effect, so due work can
-never monopolize an executor.
+The floor engages below 2 ms, but engaging is not giving up: at a 1.5 ms
+horizon the floored period is still 1 ms, so the nominal renewal still
+precedes expiry. Renewal stops preceding expiry only at a horizon of
+1 ms or less, where the period equals or exceeds the horizon — that is
+the boundary the floor is honest about instead of pretending otherwise.
+This is the computed schedule, not a promise that an executor meets any
+deadline; the worker also yields cooperatively after every effect, so
+due work can never monopolize an executor.
 
 Retirement is per-holder and honest about shared state: a lease key is
 node-global, so retiring one owner RELEASES its holder and then settles

@@ -174,7 +174,48 @@ enum Outcome {
     /// Core refused. Nothing is certified, and the ATTEMPT is what paces the
     /// next one — including when no demand is installed at all, which is
     /// exactly the shape a `FamilyAtCapacity` refusal leaves behind.
-    Refused,
+    ///
+    /// `under` is the installed demand's state at the moment of the refusal.
+    /// A demand whose authority moved or whose holders died forces an
+    /// immediate convergence, because no record can vouch for state it cannot
+    /// see — but a wave of callers that all queued behind one refusal would
+    /// otherwise each re-derive the SAME dead state and be refused again,
+    /// per call, forever. Recording the state the refusal happened under lets
+    /// the floor pace that repeat while any genuine CHANGE still bypasses it.
+    Refused {
+        /// `None` when no demand was installed.
+        under: Option<DemandState>,
+    },
+}
+
+/// The installed demand's identity and liveness at one instant.
+///
+/// Identity is included on purpose: a replaced demand is a different fact, and
+/// its first refusal is never paced by its predecessor's.
+#[cfg(feature = "cortex")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DemandState {
+    demand: usize,
+    authority_current: bool,
+    holders_live: bool,
+}
+
+#[cfg(feature = "cortex")]
+impl DemandState {
+    fn of(
+        demand: &Arc<net::adapter::net::behavior::org_sensing_demand::OrgSensingCapabilityDemand>,
+    ) -> Self {
+        Self {
+            demand: Arc::as_ptr(demand) as usize,
+            authority_current: demand.authority_is_current(),
+            holders_live: demand.holders_are_live(),
+        }
+    }
+
+    /// Whether this state is one no record can vouch for.
+    fn degraded(&self) -> bool {
+        !self.authority_current || !self.holders_live
+    }
 }
 
 /// The most capabilities one binding keeps convergence records for.
@@ -215,13 +256,28 @@ impl ConvergenceSchedule {
         now: Instant,
         retry_floor: Duration,
     ) -> bool {
-        if let Some(installed) = installed {
-            if !installed.authority_is_current() || !installed.holders_are_live() {
-                return true;
+        let state = installed.map(DemandState::of);
+        let records = self.records.lock();
+        let record = records.get(capability);
+        if let Some(state) = state {
+            if state.degraded() {
+                // A moved authority or a dead holder is not something a record
+                // can vouch for, so it converges immediately - ONCE. A repeat
+                // of the identical dead state, on the identical demand, whose
+                // last attempt was already refused, is the wave case: several
+                // callers queued behind one refusal each re-deriving the same
+                // corpse. That one is paced like any other refusal; any CHANGE
+                // - a replaced demand, a recovered holder, a different
+                // expectation - is a different fact and still converges now.
+                let paced = record.is_some_and(|record| {
+                    record.expected == expected
+                        && matches!(&record.outcome, Outcome::Refused { under } if *under == Some(state))
+                        && now.saturating_duration_since(record.attempted) < retry_floor
+                });
+                return !paced;
             }
         }
-        let records = self.records.lock();
-        let Some(record) = records.get(capability) else {
+        let Some(record) = record else {
             return true; // Never attempted for this capability.
         };
         if record.expected != expected {
@@ -229,7 +285,7 @@ impl ConvergenceSchedule {
         }
         let floored = now.saturating_duration_since(record.attempted) < retry_floor;
         match &record.outcome {
-            Outcome::Refused => !floored,
+            Outcome::Refused { .. } => !floored,
             Outcome::Certified {
                 demand,
                 population,
@@ -319,13 +375,18 @@ impl ConvergenceSchedule {
         &self,
         capability: CapabilityAuthorityId,
         expected: Vec<u64>,
+        installed: Option<
+            &Arc<net::adapter::net::behavior::org_sensing_demand::OrgSensingCapabilityDemand>,
+        >,
         now: Instant,
     ) {
         self.insert(
             capability,
             ConvergedFor {
                 expected,
-                outcome: Outcome::Refused,
+                outcome: Outcome::Refused {
+                    under: installed.map(DemandState::of),
+                },
                 attempted: now,
             },
         );

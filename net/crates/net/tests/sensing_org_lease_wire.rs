@@ -105,6 +105,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -141,12 +142,17 @@ const MID: Duration = Duration::from_millis(100);
 /// this file, so the provider row identifies exactly which decision authored
 /// it: only the re-acquisition can produce this value.
 const FRESH: Duration = Duration::from_millis(120);
-/// How long the runtime thread is held BLOCKED while two contending
-/// transitions hand their datagrams to the transport. See
-/// [`unpark_and_measure_queue`]: both transitions run on blocking threads and
-/// their whole commit-and-hand-off path is synchronous, so this only has to
-/// cover a 2 ms park poll, a mutex hand-off and two frame authorings.
+/// How long the production send boundary is held PARKED inside datagram 0's own
+/// send bracket in test 7, so a parallelising consumer would have had its rival
+/// sends in flight inside the window.
 const HANDOFF: Duration = Duration::from_millis(250);
+/// HARD FAILURE BOUND — not a timing premise — for the synchronous hand-off
+/// rendezvous in [`unpark_and_measure_queue`]: how long the deliberately
+/// blocked runtime thread waits for each contending transition to report that
+/// its commit-author-encode-enqueue returned. Generous, because the rendezvous
+/// waits for the EVENT: exceeding this means a transition hung, and it fails
+/// loudly instead of sampling a queue that is not finished being filled.
+const HANDOFF_LIMIT: Duration = Duration::from_secs(30);
 
 /// The one shared organization. Both nodes are members, and it defines the
 /// canonical sensing audience commitment the rows are keyed under.
@@ -788,25 +794,53 @@ fn arm_phase_two_park(a: &Arc<MeshNode>) -> Phase2Park {
     Phase2Park { entered, unpark }
 }
 
-/// Unpark the parked decision and let BOTH contending transitions hand their
-/// datagrams to the transport with the runtime thread deliberately BLOCKED,
-/// then report the ordered egress' depth.
+/// Unpark the parked decision, then wait — SYNCHRONOUSLY and with a hard bound
+/// — until BOTH contending transitions report their hand-off, and report the
+/// ordered egress' depth.
 ///
-/// Why this is deterministic, and why the tests below are single-threaded
-/// (`#[tokio::test]`, i.e. one worker): the two transitions run on
-/// `spawn_blocking` threads and their whole commit-author-encode-hand-off path
-/// is synchronous, so they both complete inside this window without needing a
-/// runtime worker. The ordered egress' consumer, by contrast, IS a runtime
-/// task, so it cannot be polled while this function sits in
-/// `std::thread::sleep`. The window therefore ends with the pair of datagrams
-/// QUEUED, in decision order, in one FIFO, and none of them sent.
+/// THE PREMISE THIS PRESERVES: the runtime's single worker stays BLOCKED for
+/// the whole window. The two transitions run on `spawn_blocking` threads and
+/// their entire commit-author-encode-enqueue path is synchronous, so they
+/// complete without a runtime worker; the ordered egress' consumer, by
+/// contrast, IS a runtime task, so it cannot be polled while this function
+/// sits in `recv_timeout` on a std channel. The window therefore ends with the
+/// pair of datagrams QUEUED, in decision order, in one FIFO, and none of them
+/// sent. This is also why the sample may NOT be taken after awaiting the
+/// `JoinHandle`s: an `await` frees the worker, the consumer runs, and the depth
+/// under assertion is drained before it can be read.
+///
+/// It is a RENDEZVOUS, not a delay. The previous shape slept a fixed
+/// [`HANDOFF`] and sampled whatever depth existed at that instant, so a second
+/// transition that had not yet enqueued — unrelated load, a descheduled
+/// blocking thread — made a CORRECT egress read depth 1 and failed the witness.
+/// Waiting for both reports removes that: the depth is sampled after both
+/// hand-offs are facts, and the consumer still cannot have run.
 ///
 /// A returned depth of 0 means the datagrams never entered the ordered egress
 /// at all — i.e. the racing per-datagram `tokio::spawn` this repair replaced,
-/// under which the peer-observable order is whatever the scheduler picks.
-fn unpark_and_measure_queue(a: &Arc<MeshNode>, park: &Phase2Park) -> u64 {
+/// under which the peer-observable order is whatever the scheduler picks. That
+/// mutant is named by the CALLER's assertion, so the depth is returned rather
+/// than asserted here.
+fn unpark_and_measure_queue(
+    a: &Arc<MeshNode>,
+    park: &Phase2Park,
+    handoffs: &mpsc::Receiver<&'static str>,
+    expected: usize,
+) -> u64 {
     park.unpark.store(true, Ordering::SeqCst);
-    std::thread::sleep(HANDOFF);
+    let mut reported: Vec<&'static str> = Vec::with_capacity(expected);
+    while reported.len() < expected {
+        match handoffs.recv_timeout(HANDOFF_LIMIT) {
+            Ok(who) => reported.push(who),
+            Err(err) => panic!(
+                "only {reported:?} of the {expected} contending transitions \
+                 reported their hand-off within {HANDOFF_LIMIT:?} ({err}). Each \
+                 one is a synchronous commit-author-encode-enqueue on its own \
+                 blocking thread, so this is a HUNG transition rather than slow \
+                 scheduling"
+            ),
+        }
+    }
     a.org_egress_state_for_test().depth
 }
 
@@ -901,10 +935,20 @@ async fn the_later_org_cadence_decision_is_what_the_provider_finally_holds() {
 
     // DECISION A: tighten to MID, and stop it between commit and transport.
     let park = arm_phase_two_park(&a);
+    // Both contending transitions report their hand-off on this SYNCHRONOUS
+    // channel, each AFTER its acquisition returned — i.e. after commit,
+    // authoring, encode and enqueue. The buffer holds both reports, so
+    // reporting never blocks a transition.
+    let (handed, handoffs) = mpsc::sync_channel::<&'static str>(2);
     let first = {
         let a = a.clone();
         let spec = spec.clone();
-        tokio::task::spawn_blocking(move || a.acquire_sensing_interest_lease(&spec, b_id, MID))
+        let handed = handed.clone();
+        tokio::task::spawn_blocking(move || {
+            let acquired = a.acquire_sensing_interest_lease(&spec, b_id, MID);
+            let _ = handed.send("the parked tightening");
+            acquired
+        })
     };
     await_condition(POLL, "the tightening decision parked in Phase 2", || {
         park.entered.load(Ordering::SeqCst)
@@ -923,7 +967,11 @@ async fn the_later_org_cadence_decision_is_what_the_provider_finally_holds() {
     let second = {
         let a = a.clone();
         let spec = spec.clone();
-        tokio::task::spawn_blocking(move || a.acquire_sensing_interest_lease(&spec, b_id, STRICT))
+        tokio::task::spawn_blocking(move || {
+            let acquired = a.acquire_sensing_interest_lease(&spec, b_id, STRICT);
+            let _ = handed.send("the later tightening");
+            acquired
+        })
     };
     tokio::time::sleep(SETTLE).await;
     assert!(
@@ -941,9 +989,9 @@ async fn the_later_org_cadence_decision_is_what_the_provider_finally_holds() {
          contender may reach the wire before the parked one is released"
     );
 
-    // Unpark. Both decisions hand off with the runtime thread blocked, so the
-    // pair is observable as queued-and-unsent.
-    let queued = unpark_and_measure_queue(&a, &park);
+    // Unpark, and wait for BOTH hand-offs with the runtime thread still
+    // deliberately blocked, so the pair is observable as queued-and-unsent.
+    let queued = unpark_and_measure_queue(&a, &park, &handoffs, 2);
     assert!(
         queued >= 2,
         "expected BOTH contending datagrams queued on the ORDERED egress and none \
@@ -1100,9 +1148,18 @@ async fn a_parked_org_teardown_cannot_be_overtaken_by_its_own_reacquisition() {
     // DECISION A: the FINAL release, stopped before its `Deregister` reaches
     // the transport.
     let park = arm_phase_two_park(&a);
+    // As in test 5: both transitions report their hand-off synchronously, so
+    // the depth below is sampled after both enqueues are facts and before the
+    // consumer — a runtime task, and the only worker is blocked — can run.
+    let (handed, handoffs) = mpsc::sync_channel::<&'static str>(2);
     let teardown = {
         let a = a.clone();
-        tokio::task::spawn_blocking(move || a.try_release_sensing_interest_lease(only))
+        let handed = handed.clone();
+        tokio::task::spawn_blocking(move || {
+            let released = a.try_release_sensing_interest_lease(only);
+            let _ = handed.send("the parked teardown");
+            released
+        })
     };
     await_condition(POLL, "the final teardown parked in Phase 2", || {
         park.entered.load(Ordering::SeqCst)
@@ -1120,7 +1177,11 @@ async fn a_parked_org_teardown_cannot_be_overtaken_by_its_own_reacquisition() {
     let reacquire = {
         let a = a.clone();
         let spec = spec.clone();
-        tokio::task::spawn_blocking(move || a.acquire_sensing_interest_lease(&spec, b_id, FRESH))
+        tokio::task::spawn_blocking(move || {
+            let acquired = a.acquire_sensing_interest_lease(&spec, b_id, FRESH);
+            let _ = handed.send("the re-acquisition");
+            acquired
+        })
     };
     tokio::time::sleep(SETTLE).await;
     assert!(
@@ -1139,7 +1200,7 @@ async fn a_parked_org_teardown_cannot_be_overtaken_by_its_own_reacquisition() {
          wire AHEAD of the teardown it must follow"
     );
 
-    let queued = unpark_and_measure_queue(&a, &park);
+    let queued = unpark_and_measure_queue(&a, &park, &handoffs, 2);
     assert!(
         queued >= 2,
         "expected the `Deregister` and the re-acquisition's `Register` BOTH queued \
@@ -1443,8 +1504,6 @@ async fn the_production_send_boundary_is_strictly_serial_in_enqueue_order() {
 /// run" a fact rather than a hope.
 #[tokio::test]
 async fn the_ordered_egress_is_bounded_and_keeps_the_latest_decision() {
-    use std::sync::mpsc;
-
     let OrgPair { a, b, .. } = org_pair("bounded").await;
     let a_id = a.node_id();
     let b_id = b.node_id();
@@ -1467,10 +1526,15 @@ async fn the_ordered_egress_is_bounded_and_keeps_the_latest_decision() {
     );
     let sent_before = a.org_egress_state_for_test().sent;
 
-    // Strictly more than the production bound, so eviction MUST happen. The
-    // bound is not exported; the burst is sized against it by construction and
-    // the accounting assertion below states the relationship it needs.
-    const BURST: usize = 140;
+    // The production bound this witness is sized against: `MAX_PENDING_ORG_EGRESS`
+    // in `src/adapter/net/mesh.rs`, which is private, so it cannot be imported
+    // and has to be restated — ONCE, here. Both the burst size and the depth
+    // assertion below derive from this name, so a production bound that moves
+    // moves this expectation with it instead of failing correctly bounded
+    // behaviour.
+    const EXPECTED_BOUND: u64 = 128;
+    // Strictly more than the bound, so eviction MUST happen.
+    const BURST: usize = EXPECTED_BOUND as usize + 12;
     let last_spec = distinct_org_spec(b_id, BURST - 1);
     let last_key = ProviderInterestKey::new(last_spec.key(), b_id);
 
@@ -1506,11 +1570,12 @@ async fn the_ordered_egress_is_bounded_and_keeps_the_latest_decision() {
          blocked, so this run does not observe a stalled egress at all: {state:?}"
     );
     assert!(
-        state.depth <= 128,
-        "the ordered egress grew to {} pending datagrams. It is supposed to be \
-         BOUNDED: an unbounded queue behind one stalled `send_to` is unbounded \
-         memory growth driven by transition rate, which the bounded lease \
-         registry does not limit. State: {state:?}",
+        state.depth <= EXPECTED_BOUND,
+        "the ordered egress grew to {} pending datagrams, past its bound of \
+         {EXPECTED_BOUND}. It is supposed to be BOUNDED: an unbounded queue \
+         behind one stalled `send_to` is unbounded memory growth driven by \
+         transition rate, which the bounded lease registry does not limit. \
+         State: {state:?}",
         state.depth
     );
     assert!(

@@ -10,8 +10,9 @@
 //! exhaustion state.
 //!
 //! There are deliberately NO projection witnesses: this slice ships no
-//! projection. See the module docs for why exact-provider acquisition
-//! and projection are deferred to S4.
+//! projection. Exact-provider acquisition IS implemented in core; what
+//! is absent is this module's own query / watch / snapshot /
+//! projection surface. See the `sdk/src/sensing.rs` module docs.
 //!
 //! Every critical case here is an INVERSE witness — it fails against a
 //! specific wrong implementation, named in the test's doc comment.
@@ -613,9 +614,11 @@ async fn an_evaluation_in_flight_cannot_publish_after_its_close_completes() {
 /// transition cannot complete in the middle of a publication.
 ///
 /// It is production-coupled: the emitter is parked by a hook placed at
-/// the real call site, inside the section, after a successful
-/// currentness test and after `sign_attestation`, immediately before the
-/// local publication. And the rival's blocking is acknowledged EXACTLY,
+/// the real call site, at the END of the section — after a successful
+/// currentness test, after `sign_attestation`, and after the local
+/// publication completes (the `latest` wire-cache insert and the
+/// consumer-cell feed), before the guard is released. And the rival's
+/// blocking is acknowledged EXACTLY,
 /// by the registry's contention observer, which fires only when a
 /// transition's `try_lock` on the ownership mutex finds it held.
 ///
@@ -645,8 +648,8 @@ async fn the_production_commit_section_is_held_across_signing_and_publication() 
         .provide(CapabilityId::new(CAPABILITY), evaluator)
         .expect("provide");
 
-    // Park the emitter INSIDE the section, immediately before the local
-    // publication.
+    // Park the emitter INSIDE the section, after local publication
+    // completes and before the guard is released.
     //
     // The park is BOUNDED. On the passing path the test releases it in
     // milliseconds; the deadline exists only so that a failing run (the
