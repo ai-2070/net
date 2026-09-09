@@ -2177,6 +2177,79 @@ mod tests {
         drop(family);
     }
 
+    /// A renewal that changed NOTHING on the wire must retry inside the row's
+    /// remaining life — and must still park between attempts.
+    ///
+    /// `Refused` and `AuthorityUnavailable` both return before any egress is
+    /// authored, so when the worker re-arms, the row's last registration is
+    /// already one period old and it expires one period from now (the period is
+    /// `ttl/2`). Re-arming as `Established` put the retry exactly on that
+    /// expiry with zero margin. Re-arming as `Adopted` would be worse: the
+    /// worker REMOVES a record before firing it, so a `now` deadline is
+    /// immediately due again and a standing authority outage becomes a spin
+    /// loop. `Unrenewed` is the only grounding that is both early enough and
+    /// bounded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failed_renewal_retries_inside_the_rows_remaining_life() {
+        // 400 ms horizon: period 200 ms, so a worker pass lands well inside a
+        // short test without a nanosecond-scale schedule.
+        let node = demand_node("unrenewed-rearm", Duration::from_millis(400)).await;
+        let family = OrgSensingFamily::mint(&node).expect("mint");
+        let provider = node.node_id().wrapping_add(1);
+        let period = node.sensing_refresh_period();
+
+        let decisions: Arc<parking_lot::Mutex<Vec<SensingArmDecision>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        {
+            let decisions = Arc::clone(&decisions);
+            node.set_sensing_arm_seam_for_test(Arc::new(move |decision| {
+                decisions.lock().push(decision);
+            }));
+        }
+
+        let demand = family.reconcile(TAG, &[provider]).expect("retain");
+        // Make every later renewal unauthorable on this lease's own plane
+        // without retiring the demand: a FOREIGN owner organization.
+        node.clear_node_authority_for_test();
+        node.install_node_authority(adopt(&node, &other_org(), "unrenewed-foreign"))
+            .expect("install a foreign owner");
+
+        until(&node, Duration::from_secs(5), "a refused renewal", || {
+            node.org_sensing_demand_state_for_test()
+                .refresh_authority_refused
+                > 0
+        })
+        .await;
+        until(&node, Duration::from_secs(5), "the re-arm after it", || {
+            decisions
+                .lock()
+                .iter()
+                .any(|d| d.provenance == SensingArmProvenance::Unrenewed)
+        })
+        .await;
+
+        let rearm = *decisions
+            .lock()
+            .iter()
+            .find(|d| d.provenance == SensingArmProvenance::Unrenewed)
+            .expect("the refused renewal must re-arm as unrenewed");
+        let out = rearm.deadline.saturating_duration_since(rearm.armed_at);
+        assert!(
+            out < period,
+            "an unrenewed retry must land strictly inside the row's remaining \
+             life: this one is {out:?} out against a {period:?} period, which is \
+             exactly when the provider's sweep drops the interest"
+        );
+        assert!(
+            !out.is_zero(),
+            "and it must still PARK: a zero deadline is immediately due again, \
+             and because the worker removes a record before firing it, that \
+             turns a standing authority outage into a spin loop"
+        );
+        node.clear_sensing_arm_seam_for_test();
+        drop(demand);
+        drop(family);
+    }
     // ---- WORKER LIFECYCLE ------------------------------------------------
 
     /// END TO END at the internal boundary: the node's ONE refresh worker fires
