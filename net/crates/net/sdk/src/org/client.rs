@@ -335,13 +335,31 @@ impl ConvergenceSchedule {
                     // The demand this record certified is gone.
                     return true;
                 };
-                if state.is_some_and(|state| state.degraded()) {
-                    // A moved authority or a dead holder: no certificate can
-                    // vouch for it, so this converges immediately.
+                if *demand != installed.id() || *population != population_of(installed) {
+                    // A DIFFERENT demand entirely. Not what was certified, and
+                    // its first attempt is never paced by its predecessor's -
+                    // checked before degradation so a replaced demand still
+                    // converges at once even if it is already degraded.
                     return true;
                 }
-                if *demand != installed.id() || *population != population_of(installed) {
-                    return true;
+                if state.is_some_and(|state| state.degraded()) {
+                    // A moved authority or a dead holder: no certificate can
+                    // vouch for it, so this converges - but it is PACED like
+                    // any other repeat.
+                    //
+                    // It used to return unconditionally, which the comment at
+                    // this site described as "paced like any other refusal". It
+                    // was not: the floor was applied only under a `Refused`
+                    // record, so once a convergence had succeeded and the
+                    // record was `Certified`, a demand that LATER degraded -
+                    // an invalidated holder, a moved stamp - drove a full
+                    // convergence on every single call. An external holder
+                    // repeatedly invalidating the shared row was enough.
+                    //
+                    // The floor keys off the degraded observation itself, so a
+                    // genuine change still bypasses it: a replaced demand is
+                    // caught above, and a changed expectation earlier still.
+                    return !floored;
                 }
                 !*agreed && !floored
             }
