@@ -399,7 +399,7 @@ fn release_sensing_capacity(node: &Arc<MeshNode>, tickets: Vec<SensingLeaseTicke
 }
 
 /// This capability's retained population, holders and demand identity.
-fn demand_state(client: &OrgClient) -> Option<(Vec<u64>, Vec<u64>, usize)> {
+fn demand_state(client: &OrgClient) -> Option<(Vec<u64>, Vec<u64>, u64)> {
     client
         .sensing_demand_state(&capability())
         .map(|(mut population, mut retained, identity)| {

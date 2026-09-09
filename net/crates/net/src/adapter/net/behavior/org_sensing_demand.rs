@@ -353,6 +353,15 @@ pub fn org_sensed_bucket_permutation(
 /// `population` is an IMMUTABLE input snapshot and `retained` is a subset of
 /// it, so a reconciliation's inputs can never be mutated underneath it.
 pub struct OrgSensingCapabilityDemand {
+    /// This demand's own identity, minted once per published demand.
+    ///
+    /// Callers used to identify a demand by its ADDRESS while holding no `Arc`
+    /// to keep it alive, which is an ABA hazard: once a demand is dropped a new
+    /// one can be allocated at the same address, and with the same capability
+    /// and population it compared equal to a record describing its predecessor,
+    /// so a needed convergence was skipped or a degraded state wrongly paced.
+    /// A monotone counter cannot alias, whatever the allocator does.
+    id: u64,
     node: Arc<MeshNode>,
     /// The authority view the retention was derived against. A later
     /// reconciliation compares it and re-derives when it is no longer current.
@@ -363,7 +372,16 @@ pub struct OrgSensingCapabilityDemand {
     retained: Vec<RetainedProvider>,
 }
 
+/// Mints [`OrgSensingCapabilityDemand::id`]. Process-wide and monotone, so no
+/// two live demands - on any node, for any capability - can share an identity.
+static ORG_SENSING_DEMAND_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 impl OrgSensingCapabilityDemand {
+    /// This demand's identity. Stable for its lifetime, never reused after it.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
     /// The authorized providers this demand was derived for.
     pub fn population(&self) -> &Arc<[u64]> {
         &self.population
@@ -921,6 +939,7 @@ impl OrgSensingFamily {
         }
 
         let demand = Arc::new(OrgSensingCapabilityDemand {
+            id: ORG_SENSING_DEMAND_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             node: Arc::clone(node),
             authority_epoch,
             audience,

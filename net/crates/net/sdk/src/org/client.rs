@@ -167,7 +167,13 @@ enum Outcome {
     Certified {
         /// The identity of the demand this record describes: a demand replaced
         /// or retired since then invalidates the record outright.
-        demand: usize,
+        ///
+        /// Core's own monotone id, NOT the demand's address. This record holds
+        /// no `Arc`, so an address could be reused by a fresh demand allocated
+        /// where a dropped one used to live - and with the same capability and
+        /// population that compared equal, skipping a convergence that was
+        /// genuinely needed.
+        demand: u64,
         /// The population core actually published for it.
         population: Vec<u64>,
         agreed: bool,
@@ -231,7 +237,7 @@ impl<'a> RefusalContext<'a> {
 #[cfg(feature = "cortex")]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DemandState {
-    demand: usize,
+    demand: u64,
     authority_current: bool,
     holders_live: bool,
 }
@@ -242,7 +248,7 @@ impl DemandState {
         demand: &Arc<net::adapter::net::behavior::org_sensing_demand::OrgSensingCapabilityDemand>,
     ) -> Self {
         Self {
-            demand: Arc::as_ptr(demand) as usize,
+            demand: demand.id(),
             authority_current: demand.authority_is_current(),
             holders_live: demand.holders_are_live(),
         }
@@ -334,9 +340,7 @@ impl ConvergenceSchedule {
                     // vouch for it, so this converges immediately.
                     return true;
                 }
-                if *demand != Arc::as_ptr(installed) as usize
-                    || *population != population_of(installed)
-                {
+                if *demand != installed.id() || *population != population_of(installed) {
                     return true;
                 }
                 !*agreed && !floored
@@ -399,7 +403,7 @@ impl ConvergenceSchedule {
             ConvergedFor {
                 expected,
                 outcome: Outcome::Certified {
-                    demand: Arc::as_ptr(demand) as usize,
+                    demand: demand.id(),
                     population,
                     agreed,
                 },
@@ -811,17 +815,19 @@ impl OrgClient {
     /// One capability's retained demand as plain data:
     /// `(population, retained_holders, demand_identity)`.
     ///
-    /// The identity is the retained `Arc`'s address, which is how a witness
+    /// The identity is core's own monotone demand id, which is how a witness
     /// distinguishes "the same demand was reused" from "an identical one was
-    /// re-acquired". It is an opaque number, not a handle.
+    /// re-acquired". It is an opaque number, not a handle - and deliberately
+    /// not the `Arc`'s address, which a later demand allocated where a dropped
+    /// one used to live can reuse.
     #[cfg(all(feature = "cortex", any(test, feature = "fixtures")))]
     #[doc(hidden)]
     pub fn sensing_demand_state(
         &self,
         capability: &CapabilityAuthorityId,
-    ) -> Option<(Vec<u64>, Vec<u64>, usize)> {
+    ) -> Option<(Vec<u64>, Vec<u64>, u64)> {
         let demand = self._sensing.acquisition()?.family().demand(capability)?;
-        let identity = std::sync::Arc::as_ptr(&demand) as usize;
+        let identity = demand.id();
         Some((
             demand.population().to_vec(),
             demand.retained_providers(),

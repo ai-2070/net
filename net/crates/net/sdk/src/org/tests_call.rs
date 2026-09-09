@@ -2065,3 +2065,50 @@ async fn the_reconciliation_trigger_certifies_the_installed_demand() {
     drop(family);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A demand's identity is core's own monotone id, never its address.
+///
+/// `DemandState` and `Outcome::Certified` hold NO `Arc` to the demand they
+/// describe. Identifying it by `Arc::as_ptr` was therefore an ABA hazard: once
+/// a demand is dropped, a new one can be allocated exactly where it lived, and
+/// with the same capability and population it compared equal to the record
+/// describing its predecessor - so a needed convergence was skipped, or a
+/// degraded state wrongly paced. A monotone counter cannot alias, whatever the
+/// allocator does.
+#[tokio::test]
+async fn a_demand_identity_is_never_reused() {
+    use net::adapter::net::behavior::org_sensing_demand::OrgSensingFamily;
+
+    let a = org_a();
+    let (mesh, _identity, dir) = mesh_with_authority("demand-identity", Some(&a)).await;
+    let family = OrgSensingFamily::mint(mesh.node()).expect("mint");
+
+    let mut seen = Vec::new();
+    for _ in 0..8 {
+        let demand = family.retain("nrpc:identity.churn").expect("retain");
+        seen.push(demand.id());
+        drop(demand);
+        // RETIRE, so the `Arc` is really released and its allocation is free to
+        // be handed straight back for the next one - which is the whole shape
+        // the address-based identity could not survive.
+        family.retire("nrpc:identity.churn");
+    }
+
+    let mut unique = seen.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        seen.len(),
+        "every demand must carry its own identity across retire/re-retain: {seen:?}"
+    );
+    assert!(
+        seen.windows(2).all(|w| w[1] > w[0]),
+        "and the identities must be monotone, so a later demand can never be \
+         mistaken for an earlier one: {seen:?}"
+    );
+
+    drop(family);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
