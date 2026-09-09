@@ -7029,6 +7029,13 @@ pub(crate) struct OrgSensingDemandCounters {
     refresh_authority_refused: AtomicU64,
     /// Refreshes whose table/emitter application refused.
     refresh_refused: AtomicU64,
+    /// Refused refreshes that also PARTITIONED the shared local row, and so
+    /// owed the interest table a reinstatement to the registry's aggregate.
+    ///
+    /// Its own tally because the two are operationally different: an ordinary
+    /// refused renewal leaves everything standing, while a partitioned one
+    /// removed a row every holder of the key shares.
+    refresh_partitioned: AtomicU64,
     /// Arms REFUSED because the key's armed record already names a strictly
     /// NEWER installation. A stale worker re-arm must never overwrite its own
     /// successor's schedule.
@@ -7178,6 +7185,8 @@ pub struct OrgSensingDemandState {
     pub refresh_authority_refused: u64,
     /// Refreshes whose application refused.
     pub refresh_refused: u64,
+    /// Refused refreshes that partitioned the shared row and reinstated it.
+    pub refresh_partitioned: u64,
     /// Arms refused because a newer installation owns the key's schedule.
     pub refresh_arm_stale: u64,
     /// Arms that adopted an installation of unknown freshness.
@@ -14559,19 +14568,32 @@ impl MeshNode {
                 SensingGuardKind::LeaseApply,
             );
             let action = self.sensing_interest_leases.release(ticket);
-            let pending = match self
-                .apply_sensing_lease_action(ticket.key, action, None, false)
-                .verdict
-            {
+            let applied = self.apply_sensing_lease_action(ticket.key, action, None, false);
+            let pending = match applied.verdict {
                 Ok(pending) => pending,
                 Err(err) => {
+                    // The registry HAS committed on this path (the release runs
+                    // before the apply), so `reconcile_failure` is the right
+                    // class here — unlike the organization arms, this really is
+                    // the registry/wire divergence window.
+                    //
+                    // A partition additionally removed the shared local row, so
+                    // reinstate it to the post-release aggregate rather than
+                    // leaving surviving holders claiming a row that is gone.
+                    let restored = applied
+                        .partitioned
+                        .then(|| self.sensing_interest_leases.reinstatement(&ticket.key))
+                        .flatten()
+                        .and_then(|restoration| {
+                            self.restore_partitioned_lease_row(ticket.key, restoration, None, false)
+                        });
                     self.sensing_interest_leases.note_reconcile_failure();
                     tracing::warn!(
                         error = %err,
-                        "sensing lease: release could not reconcile the wire; the lease \
-                         registry and the wire may disagree until the next mutation"
+                        partitioned = applied.partitioned,
+                        "sensing lease: release could not reconcile the wire; the lease                          registry and the wire may disagree until the next mutation"
                     );
-                    PendingTransition::default()
+                    restored.unwrap_or_default()
                 }
             };
             drop(_apply);
@@ -14673,31 +14695,57 @@ impl MeshNode {
                 SensingGuardKind::LeaseApply,
             );
             let action = self.sensing_interest_leases.preview_release(&ticket);
-            match self
-                .apply_sensing_lease_action(ticket.key, action.clone(), org_egress.as_ref(), true)
-                .verdict
-            {
+            let applied = self.apply_sensing_lease_action(
+                ticket.key,
+                action.clone(),
+                org_egress.as_ref(),
+                true,
+            );
+            match applied.verdict {
                 Ok(pending) => {
                     let committed = self.sensing_interest_leases.release(ticket);
                     debug_assert_eq!(
                         committed, action,
-                        "the previewed and committed release actions must agree — the \
-                         transition order and the apply guard are both held across both"
+                        "the previewed and committed release actions must agree — the                          transition order and the apply guard are both held across both"
                     );
                     pending
                 }
                 Err(reason) => {
-                    // NOTHING was committed. The registry still holds this
-                    // reference, the local row and the provider keep the
-                    // pre-transition cadence, and no frame is emitted. The
-                    // caller gets the real reason and a live ticket to retry.
+                    // NOTHING was committed to the REGISTRY, so its aggregate is
+                    // still authoritative and the caller keeps a live ticket.
+                    //
+                    // The TABLE is a different question. A self-provider emitter
+                    // refusal partitions the shared `LeasedLocal` row — the one
+                    // every holder of this key shares — and can remove it
+                    // outright, which made "the local row and the provider keep
+                    // the pre-transition cadence" false exactly when it mattered
+                    // and left nothing to put the row back. Reinstate it to the
+                    // aggregate the registry still holds; if current authority
+                    // refuses that too, the entry is invalidated rather than
+                    // left claiming a row that is gone.
+                    let restored = applied
+                        .partitioned
+                        .then(|| self.sensing_interest_leases.reinstatement(&ticket.key))
+                        .flatten()
+                        .and_then(|restoration| {
+                            self.restore_partitioned_lease_row(
+                                ticket.key,
+                                restoration,
+                                org_egress.as_ref(),
+                                true,
+                            )
+                        });
                     self.sensing_interest_leases.note_release_refused();
                     tracing::warn!(
                         provider = format!("{:#x}", provider),
                         error = %reason,
-                        "sensing lease: release refused at the final currentness fence; \
-                         nothing was released and nothing was emitted"
+                        partitioned = applied.partitioned,
+                        "sensing lease: release refused at the final currentness fence;                          nothing was released, and a partitioned row was reinstated to                          the registry's aggregate"
                     );
+                    drop(_apply);
+                    if let Some(restored) = restored {
+                        self.commit_transition_phase_two(restored, plan);
+                    }
                     return Err(SensingLeaseReleaseRefused { ticket, reason });
                 }
             }
@@ -14824,15 +14872,45 @@ impl MeshNode {
         let pending = match applied.verdict {
             Ok(pending) => pending,
             Err(error) => {
+                // The registry is untouched — a refresh never mutates it — so
+                // the pre-refresh aggregate is still authoritative. The TABLE
+                // may not be: a self-provider emitter refusal partitions the
+                // SHARED `LeasedLocal` row against every holder of the key and
+                // can remove it outright, so "the installation keeps its
+                // pre-refresh state" was false in exactly that case, and
+                // nothing put the row back. Reinstate it to the aggregate the
+                // registry still holds; if current authority refuses that too,
+                // the entry is INVALIDATED rather than left claiming a row that
+                // is gone.
+                let restored = applied
+                    .partitioned
+                    .then(|| self.sensing_interest_leases.reinstatement(key))
+                    .flatten()
+                    .and_then(|restoration| {
+                        self.restore_partitioned_lease_row(
+                            *key,
+                            restoration,
+                            org_egress.as_ref(),
+                            ordered,
+                        )
+                    });
                 drop(_apply);
+                if let Some(restored) = restored {
+                    self.commit_transition_phase_two(restored, plan);
+                }
                 self.org_sensing_demand_counters
                     .refresh_refused
                     .fetch_add(1, Ordering::Relaxed);
+                if applied.partitioned {
+                    self.org_sensing_demand_counters
+                        .refresh_partitioned
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 tracing::debug!(
                     provider = format!("{:#x}", provider),
                     %error,
-                    "sensing refresh: renewal refused; the installation keeps its \
-                     pre-refresh state"
+                    partitioned = applied.partitioned,
+                    "sensing refresh: renewal refused; the registry keeps its                      pre-refresh aggregate, and a partitioned row was reinstated to it"
                 );
                 return SensingRefreshOutcome::Refused;
             }
@@ -14907,9 +14985,7 @@ impl MeshNode {
             // now (`period` is `ttl/2`). Retry at the midpoint of what is left,
             // floored so a nanosecond-scale horizon cannot make the schedule
             // continuously due.
-            SensingArmProvenance::Unrenewed => {
-                now + (period / 2).max(MIN_SENSING_REFRESH_PERIOD)
-            }
+            SensingArmProvenance::Unrenewed => now + (period / 2).max(MIN_SENSING_REFRESH_PERIOD),
             SensingArmProvenance::Adopted => {
                 if schedule
                     .armed
@@ -14946,9 +15022,7 @@ impl MeshNode {
             None => {
                 // The bound is checked BEFORE the mutation and only for a key
                 // that is not already armed: re-arming spends no budget.
-                if schedule.armed.len()
-                    >= node.sensing_refresh_armed_cap.load(Ordering::Relaxed)
-                {
+                if schedule.armed.len() >= node.sensing_refresh_armed_cap.load(Ordering::Relaxed) {
                     node.org_sensing_demand_counters
                         .refused_at_capacity
                         .fetch_add(1, Ordering::Relaxed);
@@ -15775,13 +15849,14 @@ impl MeshNode {
             refused_identity_exhausted: counters.refused_identity_exhausted.load(Ordering::Relaxed),
             refused_other: counters.refused_other.load(Ordering::Relaxed),
             refused_view_moved: counters.refused_view_moved.load(Ordering::Relaxed),
-            refresh_unarmed: counters.refresh_unarmed.load(Ordering::Relaxed),
             truncated: counters.truncated.load(Ordering::Relaxed),
+            refresh_unarmed: counters.refresh_unarmed.load(Ordering::Relaxed),
             refresh_renewed: counters.refresh_renewed.load(Ordering::Relaxed),
             refresh_absent: counters.refresh_absent.load(Ordering::Relaxed),
             refresh_superseded: counters.refresh_superseded.load(Ordering::Relaxed),
             refresh_authority_refused: counters.refresh_authority_refused.load(Ordering::Relaxed),
             refresh_refused: counters.refresh_refused.load(Ordering::Relaxed),
+            refresh_partitioned: counters.refresh_partitioned.load(Ordering::Relaxed),
             refresh_arm_stale: counters.refresh_arm_stale.load(Ordering::Relaxed),
             refresh_adopted: counters.refresh_adopted.load(Ordering::Relaxed),
             refused_release_parked: counters.refused_release_parked.load(Ordering::Relaxed),
