@@ -976,6 +976,26 @@ impl SensingInterestLeases {
         self.lock_entries().get(key).map(|entry| entry.plane)
     }
 
+    /// The transition that puts the interest table back to the aggregate this
+    /// registry STILL holds for `key`.
+    ///
+    /// The counterpart of [`AcquirePreview::restoration`] for transitions that
+    /// never mutate the registry at all — a release whose application refused
+    /// before the commit, and a refresh, which by construction only renews.
+    /// For those the authoritative aggregate is simply the entry's current
+    /// state, so the restoration is a re-registration at it.
+    ///
+    /// `None` when the entry is gone, in which case there is nothing to
+    /// restore to and no holder left to claim a row.
+    pub(crate) fn reinstatement(&self, key: &SensingLeaseKey) -> Option<LeaseAction> {
+        self.lock_entries()
+            .get(key)
+            .map(|entry| LeaseAction::Reregister {
+                spec: Arc::clone(&entry.spec),
+                interval: entry.installed_interval,
+            })
+    }
+
     /// What [`release`](Self::release) WOULD return, without mutating anything.
     ///
     /// This exists because an organization release is transactional: a

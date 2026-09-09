@@ -2294,6 +2294,7 @@ mod tests {
         drop(demand);
         drop(family);
     }
+
     /// An acquisition that cannot be ARMED is released, not reported retained.
     ///
     /// A holder nothing renews is worse than no holder: the row expires at ttl
@@ -2333,6 +2334,7 @@ mod tests {
         drop(demand);
         drop(family);
     }
+
     /// A release refused because the lease's audience is no longer this node's
     /// organization is COUNTED, and counted as a refusal rather than as a
     /// registry/wire divergence.
@@ -2405,6 +2407,7 @@ mod tests {
         drop(demand);
         drop(family);
     }
+
     // ---- BUCKET PERMUTATION ----------------------------------------------
 
     /// The bucket assignment is a PERMUTATION for every input, not only for
