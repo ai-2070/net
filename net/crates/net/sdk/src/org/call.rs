@@ -483,7 +483,7 @@ impl OrgClient {
                 // remove or authorize a candidate, it mints nothing, and it
                 // runs strictly BEFORE the final currentness comparison below,
                 // which still gates the mint.
-                self.apply_sensed_order(capability, sensed, &mut candidates);
+                self.apply_sensed_order(capability, sensed, capture.authority(), &mut candidates);
                 self.select_candidate(capability, &candidates, considered)
                     .cloned()
             });
@@ -611,8 +611,14 @@ impl OrgClient {
         &self,
         capability: &CapabilityAuthorityId,
         sensed: &SensedSelection<'_>,
+        authority: &OrgColdAuthority,
         candidates: &mut Vec<AuthorizedOrgCandidate>,
     ) {
+        // The authority observation THIS attempt derives under. A refusal
+        // records it, and a later decision asks the node whether it is still
+        // the one in force - which is how a restored authority stops being
+        // paced by the failure that preceded it.
+        let context = super::client::RefusalContext::new(&self.node, authority);
         let Some(acquisition) = self._sensing.acquisition() else {
             return; // Inert: the deterministic unsensed order, no work at all.
         };
@@ -694,6 +700,7 @@ impl OrgClient {
                 installed.as_ref(),
                 now,
                 RECONCILE_RETRY_FLOOR,
+                &context,
             ) {
                 acquisition.schedule().note_convergence();
                 match family.retain(sensed.tag) {
@@ -712,6 +719,7 @@ impl OrgClient {
                             *capability,
                             expected,
                             installed.as_ref(),
+                            &context,
                             now,
                         );
                         acquisition.schedule().verify_holding(held);

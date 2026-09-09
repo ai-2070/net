@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "cortex")]
+use net::adapter::net::behavior::org_cold_plan::OrgColdAuthority;
 use net::adapter::net::behavior::org_grant::CapabilityAuthorityId;
 #[cfg(feature = "cortex")]
 use net::adapter::net::behavior::org_sensing_demand::{OrgSensingFamily, MAX_SENSED_POPULATION};
@@ -185,7 +186,42 @@ enum Outcome {
     Refused {
         /// `None` when no demand was installed.
         under: Option<DemandState>,
+        /// The AUTHORITY observation the refused attempt derived under.
+        ///
+        /// The installed demand's own booleans cannot carry this: a demand
+        /// staled by an authority loss stays stale after that authority is
+        /// restored, so a rule that compared only those booleans paced a
+        /// fresh, usable capture as if it were the same failure. Asking the
+        /// node whether THIS observation is still the one in force answers the
+        /// real question - a rotated or restored authority, a cleared poison,
+        /// a raised floor or consumer-grant churn all end the context the
+        /// refusal belonged to.
+        authority: OrgColdAuthority,
     },
+}
+
+/// What a reuse decision needs to know about the authority context.
+///
+/// Borrowed for the length of one decision: the node it asks, and the
+/// authority observation the CURRENT attempt is deriving under - which a
+/// refusal records so a later decision can ask whether it still holds.
+#[cfg(feature = "cortex")]
+pub(crate) struct RefusalContext<'a> {
+    node: &'a MeshNode,
+    authority: &'a OrgColdAuthority,
+}
+
+#[cfg(feature = "cortex")]
+impl<'a> RefusalContext<'a> {
+    pub(crate) fn new(node: &'a MeshNode, authority: &'a OrgColdAuthority) -> Self {
+        Self { node, authority }
+    }
+
+    /// Whether the authority a past refusal was recorded under is STILL the
+    /// one in force. `false` means that refusal's context is over.
+    fn still_in_force(&self, recorded: &OrgColdAuthority) -> bool {
+        self.node.org_cold_authority_is_current(recorded)
+    }
 }
 
 /// The installed demand's identity and liveness at one instant.
@@ -237,15 +273,23 @@ impl ConvergenceSchedule {
     ///
     /// * a REFUSED attempt paces the next attempt, whether or not a demand is
     ///   installed. A capability that keeps meeting `FamilyAtCapacity` must not
-    ///   retry on every call;
+    ///   retry on every call. But it paces only its OWN CONTEXT: the same
+    ///   authority observation still in force, and the same installed-demand
+    ///   state. That is what separates the queued wave - several callers behind
+    ///   one refusal, all re-deriving the same corpse under the same dead
+    ///   authority - from a genuinely new capture. A rotated or restored
+    ///   authority, a cleared poison, a raised floor, consumer-grant churn, a
+    ///   replaced demand or a recovered holder ends that context and converges
+    ///   at once, floor or no floor;
     /// * a CERTIFIED demand is reusable only while it still describes what is
     ///   installed and it AGREED with the expectation. A demand that disagrees
     ///   — narrower or wider than the expectation — is retried on the floor
     ///   until the two sides agree. Repetition is not agreement: an identical
     ///   mismatch seen twice is still a mismatch.
     ///
-    /// The demand's own state — a moved sensing authority, a dead holder —
-    /// overrides both, because no record can see it.
+    /// A degraded installed demand — moved sensing authority, dead holder —
+    /// overrides a CERTIFIED record outright, because no certificate can vouch
+    /// for state it cannot see.
     pub(crate) fn needs_convergence(
         &self,
         capability: &CapabilityAuthorityId,
@@ -255,29 +299,11 @@ impl ConvergenceSchedule {
         >,
         now: Instant,
         retry_floor: Duration,
+        context: &RefusalContext<'_>,
     ) -> bool {
         let state = installed.map(DemandState::of);
         let records = self.records.lock();
-        let record = records.get(capability);
-        if let Some(state) = state {
-            if state.degraded() {
-                // A moved authority or a dead holder is not something a record
-                // can vouch for, so it converges immediately - ONCE. A repeat
-                // of the identical dead state, on the identical demand, whose
-                // last attempt was already refused, is the wave case: several
-                // callers queued behind one refusal each re-deriving the same
-                // corpse. That one is paced like any other refusal; any CHANGE
-                // - a replaced demand, a recovered holder, a different
-                // expectation - is a different fact and still converges now.
-                let paced = record.is_some_and(|record| {
-                    record.expected == expected
-                        && matches!(&record.outcome, Outcome::Refused { under } if *under == Some(state))
-                        && now.saturating_duration_since(record.attempted) < retry_floor
-                });
-                return !paced;
-            }
-        }
-        let Some(record) = record else {
+        let Some(record) = records.get(capability) else {
             return true; // Never attempted for this capability.
         };
         if record.expected != expected {
@@ -285,7 +311,15 @@ impl ConvergenceSchedule {
         }
         let floored = now.saturating_duration_since(record.attempted) < retry_floor;
         match &record.outcome {
-            Outcome::Refused { .. } => !floored,
+            Outcome::Refused { under, authority } => {
+                if *under != state || !context.still_in_force(authority) {
+                    // A different demand state, or an authority observation
+                    // that is no longer the one in force: this is not the
+                    // situation that was refused.
+                    return true;
+                }
+                !floored
+            }
             Outcome::Certified {
                 demand,
                 population,
@@ -295,6 +329,11 @@ impl ConvergenceSchedule {
                     // The demand this record certified is gone.
                     return true;
                 };
+                if state.is_some_and(|state| state.degraded()) {
+                    // A moved authority or a dead holder: no certificate can
+                    // vouch for it, so this converges immediately.
+                    return true;
+                }
                 if *demand != Arc::as_ptr(installed) as usize
                     || *population != population_of(installed)
                 {
@@ -378,6 +417,7 @@ impl ConvergenceSchedule {
         installed: Option<
             &Arc<net::adapter::net::behavior::org_sensing_demand::OrgSensingCapabilityDemand>,
         >,
+        context: &RefusalContext<'_>,
         now: Instant,
     ) {
         self.insert(
@@ -386,6 +426,7 @@ impl ConvergenceSchedule {
                 expected,
                 outcome: Outcome::Refused {
                     under: installed.map(DemandState::of),
+                    authority: context.authority.clone(),
                 },
                 attempted: now,
             },
