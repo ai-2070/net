@@ -1418,7 +1418,8 @@ async fn a_superseded_exported_attempt_constructs_no_intent() {
 #[tokio::test]
 async fn authority_movement_inside_sensed_planning_is_still_fenced() {
     let a = org_a();
-    let (mesh, identity, dir) = mesh_with_authority("plan-sensed-fence", Some(&a)).await;
+    let (mesh, identity, dir) =
+        super::tests::mesh_with_authority_sensing("plan-sensed-fence", Some(&a), true).await;
     let p1 = EntityKeypair::generate();
     let p2 = EntityKeypair::generate();
     for provider in [&p1, &p2] {
@@ -2066,20 +2067,19 @@ async fn the_reconciliation_trigger_certifies_the_installed_demand() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A CERTIFIED demand that later degrades is converged, and PACED while it
-/// stays degraded.
+/// A degradation the record has NOT seen converges at once; the SAME one
+/// repeated is paced.
 ///
-/// The degraded branch used to return unconditionally. Its own comment said the
-/// repeat "is paced like any other refusal", but the floor was applied only
-/// under a `Refused` record - so once a convergence had succeeded and the
-/// record was `Certified`, a demand that degraded afterwards drove a FULL
-/// convergence on every single call. An external holder repeatedly
-/// invalidating the shared row was enough to make that permanent.
+/// Both halves matter and pull opposite ways. Unpaced, a degradation that
+/// RE-CONVERGED SUCCESSFULLY never formed a `Refused` record, so every later
+/// call re-derived the identical dead state on the call path forever. Paced
+/// unconditionally, an authority that had just moved would sit out the floor
+/// before anything responded to it - and a poisoned store is exactly that case.
 ///
-/// Pacing here must not cost responsiveness where it matters: a demand that is
-/// genuinely a different one still bypasses the floor outright.
+/// So the question is the one the refusal arm already asks: is this the context
+/// the record was made under?
 #[tokio::test]
-async fn a_degraded_certified_demand_is_paced_and_a_replaced_one_is_not() {
+async fn a_repeated_degradation_is_paced_and_a_new_one_is_not() {
     use net::adapter::net::behavior::org_sensing_demand::OrgSensingFamily;
     use std::time::{Duration, Instant};
 
@@ -2113,12 +2113,23 @@ async fn a_degraded_certified_demand_is_paced_and_a_replaced_one_is_not() {
     let moved = mesh.node().org_cold_authority().expect("authority capture");
     let moved_ctx = super::client::RefusalContext::new(mesh.node(), &moved);
 
+    // A degradation the record has not seen - acted on IMMEDIATELY, floor or
+    // no floor. Making this wait is what would leave a moved authority
+    // unnoticed for a whole floor.
+    assert!(
+        schedule.needs_convergence(&capability, &[], Some(&demand), t0, floor, &moved_ctx),
+        "a degradation the certified record was not made under is new \
+         information and must converge at once"
+    );
+
+    // Now certify UNDER that degraded state - the successful-reconvergence
+    // shape, which forms no refusal record and therefore had nothing pacing it.
+    schedule.certify(capability, Vec::new(), &demand, t0);
     assert!(
         !schedule.needs_convergence(&capability, &[], Some(&demand), t0, floor, &moved_ctx),
-        "a degraded demand under a CERTIFIED record must be paced: unpaced, an \
-         external holder invalidating the row drove a full convergence - \
-         capture, population derivation, acquisitions, republication - on every \
-         single call, forever"
+        "the SAME degraded observation is a repeat: unpaced, every call \
+         re-derived the identical dead state - capture, population, \
+         acquisitions, republication - on the call path forever"
     );
     assert!(
         schedule.needs_convergence(
@@ -2129,12 +2140,11 @@ async fn a_degraded_certified_demand_is_paced_and_a_replaced_one_is_not() {
             floor,
             &moved_ctx
         ),
-        "and the floor still expires, so the degradation is acted on"
+        "and the floor still expires, so the degradation is acted on again"
     );
 
     // A REPLACED demand is a different fact, and its first decision is never
-    // paced by its predecessor's record - checked before degradation exactly so
-    // that a replacement which is itself degraded still converges at once.
+    // paced by its predecessor's record.
     let replaced = family.retain("nrpc:degraded.certified").expect("re-retain");
     assert_ne!(
         demand.id(),

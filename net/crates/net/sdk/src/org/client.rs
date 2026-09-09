@@ -183,6 +183,14 @@ enum Outcome {
         /// The population core actually published for it.
         population: Vec<u64>,
         agreed: bool,
+        /// The demand's OBSERVED state at the moment it was certified.
+        ///
+        /// What makes a degraded repeat distinguishable from a NEW
+        /// degradation. Without it the two are the same question and pacing
+        /// either answers it wrongly: pace both and a moved authority waits out
+        /// the floor before anything acts on it, pace neither and an unchanged
+        /// degraded state re-converges on every call forever.
+        state: Option<DemandState>,
     },
     /// Core refused. Nothing is certified, and the ATTEMPT is what paces the
     /// next one — including when no demand is installed at all, which is
@@ -336,6 +344,7 @@ impl ConvergenceSchedule {
                 demand,
                 population,
                 agreed,
+                state: certified_under,
             } => {
                 let Some(installed) = installed else {
                     // The demand this record certified is gone.
@@ -349,22 +358,28 @@ impl ConvergenceSchedule {
                     return true;
                 }
                 if state.is_some_and(|state| state.degraded()) {
-                    // A moved authority or a dead holder: no certificate can
-                    // vouch for it, so this converges - but it is PACED like
-                    // any other repeat.
+                    // No certificate can vouch for a moved authority or a dead
+                    // holder. Whether to converge NOW turns on whether this
+                    // degradation is one the record has already seen - the same
+                    // question the refusal arm asks, and for the same reason.
                     //
-                    // It used to return unconditionally, which the comment at
-                    // this site described as "paced like any other refusal". It
-                    // was not: the floor was applied only under a `Refused`
-                    // record, so once a convergence had succeeded and the
-                    // record was `Certified`, a demand that LATER degraded -
-                    // an invalidated holder, a moved stamp - drove a full
-                    // convergence on every single call. An external holder
-                    // repeatedly invalidating the shared row was enough.
+                    // A degradation this record was NOT certified under is new
+                    // information and is acted on immediately: an authority
+                    // that has just moved must not wait out a floor before
+                    // anything responds to it.
                     //
-                    // The floor keys off the degraded observation itself, so a
-                    // genuine change still bypasses it: a replaced demand is
-                    // caught above, and a changed expectation earlier still.
+                    // The SAME degraded observation is a repeat, and repeats
+                    // are paced. Unpaced, they were not: the floor applied only
+                    // under a `Refused` record, so a degradation that
+                    // RE-CONVERGED SUCCESSFULLY never formed one, and every
+                    // later call re-derived the identical dead state - capture,
+                    // population, up to 32 acquisitions, republication - on the
+                    // call path. A refused degradation was always paced,
+                    // because its refusal record carries its own context; this
+                    // is the successful-reconvergence hole beside it.
+                    if *certified_under != state {
+                        return true;
+                    }
                     return !floored;
                 }
                 !*agreed && !floored
@@ -430,6 +445,7 @@ impl ConvergenceSchedule {
                     demand: demand.id(),
                     population,
                     agreed,
+                    state: Some(DemandState::of(demand)),
                 },
                 attempted: now,
             },
