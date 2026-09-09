@@ -2310,6 +2310,78 @@ mod tests {
         drop(demand);
         drop(family);
     }
+    /// A release refused because the lease's audience is no longer this node's
+    /// organization is COUNTED, and counted as a refusal rather than as a
+    /// registry/wire divergence.
+    ///
+    /// Two defects at one site. The arm bumped no counter at all, so after an
+    /// owner-org rotation every surviving-holder release was refused
+    /// permanently with nothing explaining why lease budget had stopped
+    /// draining. Its sibling arm bumped `reconcile_failures`, a `pub` surface
+    /// documented as "the registry committed and the wire did not" — reporting
+    /// a divergence on a node where nothing moved at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rotated_audience_release_is_counted_as_a_refusal() {
+        let node = demand_node("rotated-release-counter", Duration::from_secs(30)).await;
+        let family = OrgSensingFamily::mint(&node).expect("mint");
+        let provider = node.node_id().wrapping_add(1);
+
+        // A SURVIVING holder at a LOOSER cadence, so the family's release
+        // previews `Reregister` (which needs authority) rather than
+        // `Deregister` (which does not).
+        let survivor = node
+            .acquire_sensing_interest_lease(
+                &spec_for(&node, provider),
+                provider,
+                SENSING_SAMPLE_INTERVAL * 2,
+            )
+            .expect("the surviving holder acquires");
+        let demand = family.reconcile(TAG, &[provider]).expect("retain");
+        let ticket = demand.retained[0].ticket;
+        // Captured BEFORE the rotation. `lease_key_for` recomputes the audience
+        // from whatever authority is installed when it is called, and after the
+        // rotation that names a different key with no holders at all.
+        let key_a = lease_key_for(&node, provider);
+        assert_eq!(
+            holders(&node, &key_a),
+            Some(2),
+            "precondition: two holders, so the release relaxes rather than tears down"
+        );
+
+        node.clear_node_authority_for_test();
+        node.install_node_authority(adopt(&node, &other_org(), "rotated-release-foreign"))
+            .expect("install a foreign owner");
+
+        let refusals_before = node.sensing_interest_leases_for_test().release_refusals();
+        let diverged_before = node.sensing_lease_reconcile_failures();
+        let refused = node
+            .try_release_sensing_interest_lease(ticket)
+            .expect_err("this lease's audience is no longer this node's organization");
+        assert_eq!(
+            refused.reason,
+            SensingRegistrationError::OrgAudienceUnsupported
+        );
+        assert_eq!(
+            node.sensing_interest_leases_for_test().release_refusals(),
+            refusals_before + 1,
+            "the refusal must be observable — silent, this arm made an operator \
+             watch lease budget stop draining with nothing to read"
+        );
+        assert_eq!(
+            node.sensing_lease_reconcile_failures(),
+            diverged_before,
+            "and it must NOT be reported as a registry/wire divergence: nothing \
+             was committed, so registry, table and provider are all coherent"
+        );
+        assert_eq!(
+            holders(&node, &key_a),
+            Some(2),
+            "corroboration: the refusal really did release nothing"
+        );
+        node.release_sensing_interest_lease(survivor);
+        drop(demand);
+        drop(family);
+    }
     // ---- WORKER LIFECYCLE ------------------------------------------------
 
     /// END TO END at the internal boundary: the node's ONE refresh worker fires

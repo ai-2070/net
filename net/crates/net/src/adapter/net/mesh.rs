@@ -14584,6 +14584,18 @@ impl MeshNode {
                 // audience — the lease cannot be re-authored on its own plane,
                 // and must not silently drop to legacy.
                 Ok(None) => {
+                    // Authority is LIVE; this lease's audience simply is not
+                    // this node's organization any more. Counted like every
+                    // other refusal that committed nothing — silent, this arm
+                    // meant that after an owner-org rotation every
+                    // surviving-holder release was refused permanently with
+                    // nothing in the observability surface explaining why lease
+                    // budget had stopped draining.
+                    self.sensing_interest_leases.note_release_refused();
+                    tracing::warn!(
+                        provider = format!("{:#x}", provider),
+                        "sensing lease: release refused — this lease's audience is no                          longer this node's organization; nothing was released"
+                    );
                     return Err(SensingLeaseReleaseRefused {
                         ticket,
                         reason: SensingRegistrationError::OrgAudienceUnsupported,
@@ -14596,7 +14608,17 @@ impl MeshNode {
                     // table and provider remain coherent at the pre-transition
                     // cadence. The caller sees the real reason and keeps a live
                     // ticket to retry with.
-                    self.sensing_interest_leases.note_reconcile_failure();
+                    //
+                    // `release_refused`, NOT `reconcile_failure`:
+                    // `reconcile_failures` counts a wire reconciliation that
+                    // failed AFTER the registry committed — precisely the state
+                    // where the lease registry and the wire disagree — and
+                    // `sensing_lease_reconcile_failures` is a `pub`
+                    // observability surface. This arm is the one where nothing
+                    // was committed, which its own comment says, so reporting a
+                    // divergence here paged an operator about a coherent node
+                    // while the refusal itself went uncounted.
+                    self.sensing_interest_leases.note_release_refused();
                     tracing::warn!(
                         provider = format!("{:#x}", provider),
                         error = %reason,
