@@ -98,9 +98,11 @@ pub(crate) struct ConvergenceSchedule {
     ///
     /// * `arrivals` counts callers that reached the section's door;
     /// * `contended` counts callers that found the section ACTUALLY HELD -
-    ///   `reconcile_lock` tries first and only counts when the try fails, so
-    ///   this is acquisition-time contention, never an inference from elapsed
-    ///   time or from spawning;
+    ///   `try_reconcile_lock` counts only when its `try_lock` fails, so this
+    ///   is acquisition-time contention, never an inference from elapsed time
+    ///   or from spawning. Such a caller DECLINES rather than waiting, so this
+    ///   also counts the convergences that were skipped because somebody else
+    ///   was already doing them;
     /// * `convergences` counts attempts that got past the decision;
     /// * `occupancy`/`peak_occupancy` gauge how many callers are inside the
     ///   WHOLE transaction at once - entered before the decision and left
@@ -664,26 +666,39 @@ impl OrgSensingAcquisition {
         &self.schedule
     }
 
-    /// Take the reconciliation section for this binding.
+    /// Take the reconciliation section, or DECLINE if somebody already holds
+    /// it.
     ///
-    /// Try first, then block. The fast path is what `lock` would have done
-    /// anyway, and the slow path is the only place a caller can HONESTLY be
-    /// said to have contended: it found the section held by somebody else. In
-    /// production both arms are the same acquisition - `note_contended`
+    /// Declining rather than blocking is the whole point. The section is
+    /// synchronous by design: it performs a membership capture,
+    /// authority-rooted registration authoring and a wire send PER PROVIDER, up
+    /// to `MAX_ORG_SENSING_POPULATION`. It sits on the `org.call()` path before
+    /// that call's first `.await`, so a caller that BLOCKED here waited out
+    /// somebody else's entire convergence — on a current-thread runtime,
+    /// without the reactor being able to run at all. Every other clone of the
+    /// binding piled up behind it and missed its own `CallOptions::deadline`
+    /// with nothing ever sent on its behalf.
+    ///
+    /// Declining costs nothing real. The holder is converging this very
+    /// capability and publishes for everyone, so the decliner proceeds on the
+    /// demand currently installed — exactly what it would have found after
+    /// waiting. Sensing is an ordering optimization: skipping one round of it
+    /// is always sound, and the next call past the retry floor converges.
+    ///
+    /// Failing the `try_lock` is also the only place a caller can HONESTLY be
+    /// said to have contended — it found the section held by somebody else —
+    /// so that is where contention is counted. In production `note_contended`
     /// compiles away.
-    pub(crate) fn reconcile_lock(&self) -> ReconcileGuard<'_> {
-        let guard = match self.schedule.reconcile.try_lock() {
-            Some(guard) => guard,
-            None => {
-                self.schedule.note_contended();
-                self.schedule.reconcile.lock()
-            }
+    pub(crate) fn try_reconcile_lock(&self) -> Option<ReconcileGuard<'_>> {
+        let Some(guard) = self.schedule.reconcile.try_lock() else {
+            self.schedule.note_contended();
+            return None;
         };
-        ReconcileGuard {
+        Some(ReconcileGuard {
             ticket: self.schedule.take_holder(),
             schedule: &self.schedule,
             _guard: guard,
-        }
+        })
     }
 }
 
