@@ -1,0 +1,16 @@
+net/crates/net/sdk/src/sensing/consumer.rs
+  h_64425bc75e3f3d 487-490,576-577,687,786-810,824,843,854
+net/crates/net/src/adapter/net/mesh.rs
+  h_64425bc75e3f3d 5216-5241,5571-5573,11056-11064,12995-12996,17684-17718,27387-27388,27674-27691
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "7f36fca1777b2aabb5480a17736418694e726299",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
