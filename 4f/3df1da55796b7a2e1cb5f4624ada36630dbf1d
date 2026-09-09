@@ -1,0 +1,20 @@
+net/crates/net/sdk/src/sensing.rs
+  h_64425bc75e3f3d 162,284-315,317-318,724-734,742-750,815-837
+net/crates/net/sdk/src/sensing/consumer.rs
+  h_64425bc75e3f3d 6-46,66-68,70-73,87-94,98,101-107,130-143,149,193-206,214,218-221,231,235-250,261-263,279-284,292-294,299-308,485-498,511-523,528-532,543,572-576,579-580,582-597,614-619,622,749-750,752-759,763,777-781,788-793,796-820,880-886,889-890,892,896-898,901-904,909-940
+net/crates/net/src/adapter/net/behavior/org_sensing_demand.rs
+  h_64425bc75e3f3d 202-210,555-564,586-616,675-681,715-716,721-735,743,750-754,1008-1010,1069,1072
+net/crates/net/src/adapter/net/mesh.rs
+  h_64425bc75e3f3d 15910-15957
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "4f3df1da55796b7a2e1cb5f4624ada36630dbf1d",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
