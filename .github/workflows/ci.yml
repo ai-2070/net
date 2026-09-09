@@ -2291,7 +2291,7 @@ jobs:
             an_already_parked_watcher_is_woken_by_a_provider_edge
             a_change_landing_inside_a_capture_is_never_lost
             a_quiet_park_does_not_return_inside_the_wake_bound
-            a_quiet_expiry_reaches_a_parked_watcher_and_clears_the_estimate
+            timed_continuity_expiry_publishes_a_wake_and_clears_the_estimate
             a_departed_provider_ages_out_rather_than_being_replaced
             withdrawn_readiness_reads_unknown_and_keeps_the_provider
             one_attestation_yields_two_verdicts_under_two_budgets
@@ -2308,6 +2308,9 @@ jobs:
             a_retracted_provider_leaves_the_next_snapshot_inside_the_floor
             an_expired_announcement_leaves_the_population_and_a_live_one_stays
             the_population_follows_authorization_and_never_widens_past_it
+            a_new_signed_estimate_reverses_the_sdk_rank_while_both_stay_ready
+            a_granted_only_provider_is_never_sensed_and_the_owner_one_is
+            a_partial_acquisition_keeps_its_own_state_and_another_owners
           "
           out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
                   --retries 0 --features "$FEATURES" --test sensing_consumer 2>&1) \
@@ -2324,8 +2327,8 @@ jobs:
           done
           # `executed` counts PROGRESS LINES from the run above — it is a
           # floor on tests that actually ran, not a non-executing inventory.
-          [ "$listed" -ge 21 ] \
-            || { echo "::error::expected at least 21 consumer witnesses executed, saw $listed"; exit 1; }
+          [ "$listed" -ge 24 ] \
+            || { echo "::error::expected at least 24 consumer witnesses executed, saw $listed"; exit 1; }
           echo "consumer observation lifecycle: $listed executed, $pinned pinned by name, all green"
 
       # === OA-6: the PRODUCTION organization exact-sensing call edge =======

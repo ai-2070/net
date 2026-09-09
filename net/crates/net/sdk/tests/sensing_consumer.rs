@@ -59,7 +59,7 @@
 //! is what seals its owner-audience announcement envelope.
 #![cfg(all(feature = "net", feature = "cortex", feature = "fixtures"))]
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -97,6 +97,11 @@ const WAKE_BOUND: Duration = Duration::from_millis(250);
 /// A quiet park must outlast this and still stay below the population floor,
 /// so the control excludes both an always-immediate wake and a floor wake.
 const QUIET_BOUND: Duration = Duration::from_millis(700);
+/// The cadence the SDK's retained demand asks (the fixed internal policy,
+/// clamped to the node's soft-state horizon — 2s on these nodes).
+const SDK_SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
+/// The LOOSER cadence the coexisting raw holder asks.
+const SLOWER_SAMPLE_INTERVAL: Duration = Duration::from_secs(4);
 
 fn org() -> OrgKeypair {
     OrgKeypair::from_bytes([0x71u8; 32])
@@ -139,16 +144,19 @@ struct Asked {
 /// it cannot, which is the whole point of the predicate witnesses.
 struct Answer {
     ready: Arc<AtomicBool>,
-    /// This provider's own time-to-start.
-    start: Duration,
-    /// The last request this evaluator saw, for the witnesses that assert the
-    /// interest's real inputs rather than assuming them.
-    asked: Arc<parking_lot::Mutex<Option<Asked>>>,
+    /// This provider's own time-to-start, in milliseconds, published as
+    /// ordinary provider state so a witness can move it while readiness stays
+    /// `Ready`.
+    start_ms: Arc<AtomicU64>,
+    /// EVERY request this evaluator saw. A list, not a last value: two
+    /// watches asking different bounds are two concurrent beat streams, and a
+    /// single slot would let one overwrite the other's observation.
+    asked: Arc<parking_lot::Mutex<Vec<Asked>>>,
 }
 
 impl ReadinessEvaluator for Answer {
     fn evaluate(&self, request: &EvaluationRequest<'_>) -> ReadinessEvaluation {
-        *self.asked.lock() = Some(Asked {
+        self.asked.lock().push(Asked {
             capability: request.capability_id.as_str().to_string(),
             constraints: request.constraints.canonical_bytes(),
             start_within: request.work_latency.provider_start_within,
@@ -156,13 +164,14 @@ impl ReadinessEvaluator for Answer {
         if !self.ready.load(Ordering::Relaxed) {
             return ReadinessEvaluation::NotReady { reason: 7 };
         }
+        let start = Duration::from_millis(self.start_ms.load(Ordering::Relaxed));
         match request.work_latency.provider_start_within {
             // The provider cannot start inside the bound it was ASKED about.
             // A larger consumer budget cannot overturn this answer, because it
             // is an answer to a different question.
-            Some(bound) if self.start > bound => ReadinessEvaluation::NotReady { reason: 9 },
+            Some(bound) if start > bound => ReadinessEvaluation::NotReady { reason: 9 },
             _ => ReadinessEvaluation::Ready {
-                estimated_start: Some(self.start),
+                estimated_start: Some(start),
             },
         }
     }
@@ -334,17 +343,14 @@ fn provide(member: &Member, ready: Arc<AtomicBool>, start: Duration) -> Readines
     provide_recording(member, ready, start).0
 }
 
-/// [`provide`] plus the record of what the live evaluator was ASKED, so a
-/// witness reads the interest's real inputs instead of assuming them.
-fn provide_recording(
+/// [`provide`] with the provider's own time-to-start left ADJUSTABLE, so a
+/// witness can publish a new estimate while readiness stays `Ready`.
+fn provide_adjustable(
     member: &Member,
     ready: Arc<AtomicBool>,
     start: Duration,
-) -> (
-    ReadinessRegistration,
-    Arc<parking_lot::Mutex<Option<Asked>>>,
-) {
-    let asked = Arc::new(parking_lot::Mutex::new(None));
+) -> (ReadinessRegistration, Arc<AtomicU64>) {
+    let start_ms = Arc::new(AtomicU64::new(start.as_millis() as u64));
     let registration = member
         .mesh
         .sensing()
@@ -353,7 +359,31 @@ fn provide_recording(
             CapabilityId::new(TAG),
             Arc::new(Answer {
                 ready,
-                start,
+                start_ms: Arc::clone(&start_ms),
+                asked: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            }),
+        )
+        .expect("provide readiness");
+    (registration, start_ms)
+}
+
+/// [`provide`] plus the record of what the live evaluator was ASKED, so a
+/// witness reads the interest's real inputs instead of assuming them.
+fn provide_recording(
+    member: &Member,
+    ready: Arc<AtomicBool>,
+    start: Duration,
+) -> (ReadinessRegistration, Arc<parking_lot::Mutex<Vec<Asked>>>) {
+    let asked = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let registration = member
+        .mesh
+        .sensing()
+        .expect("the provider sensing surface binds")
+        .provide(
+            CapabilityId::new(TAG),
+            Arc::new(Answer {
+                ready,
+                start_ms: Arc::new(AtomicU64::new(start.as_millis() as u64)),
                 asked: Arc::clone(&asked),
             }),
         )
@@ -499,6 +529,42 @@ async fn until(what: &str, deadline: Duration, mut probe: impl FnMut() -> bool) 
         assert!(Instant::now() < end, "{what}");
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+/// PARK ACKNOWLEDGEMENT: converge, then prove the park really is `Pending`
+/// with the fallback deadline far outside [`WAKE_BOUND`], and return that
+/// deadline.
+///
+/// Retried across ordinary beat arrivals: a live provider legitimately beats
+/// at its cadence, so a wake landing inside the acknowledgement window is not
+/// a defect — it just means this attempt was not a quiet window. A wake
+/// consumed here is a wake this witness then cannot ride, which is the
+/// conservative direction. `changed` is cancel-safe and the seen-cursor lives
+/// on the receiver, so the timeout leaves no state behind.
+async fn acknowledge_parked(observation: &mut SensingWatch) -> Instant {
+    for _ in 0..40 {
+        let _ = observation.snapshot().expect("snapshot");
+        let fallback = observation.fallback_deadline_for_test();
+        if fallback.saturating_duration_since(Instant::now()) <= WAKE_BOUND.saturating_mul(2) {
+            // Too close to the fallback to attribute anything; let the floor
+            // elapse so the next snapshot re-arms it.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            continue;
+        }
+        if tokio::time::timeout(Duration::from_millis(80), observation.changed())
+            .await
+            .is_err()
+        {
+            assert_eq!(
+                observation.fallback_deadline_for_test(),
+                fallback,
+                "the acknowledged park must not have re-armed the fallback"
+            );
+            return fallback;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    panic!("no quiet window to acknowledge a park in");
 }
 
 /// Snapshot until `predicate` holds, DRIVEN BY `changed()` — so every wait in
@@ -759,16 +825,34 @@ async fn a_quiet_park_does_not_return_inside_the_wake_bound() {
     let _ = std::fs::remove_dir_all(&consumer.dir);
 }
 
-/// A provider that goes AWAY makes the observation expire, and the expiry
-/// reaches a parked watcher in an otherwise quiet network — no traffic, no
-/// replacement observation, no polling by the witness.
+/// TIMED CONTINUITY EXPIRY, isolated from every other cause of `Unknown`, and
+/// its NOTIFICATION distinguished from a timer reread.
 ///
-/// This is the pure continuity property: the provider process is shut down, so
-/// nothing arrives to overwrite the last `Ready`. The stale estimate must go
-/// with it — an expired cell's provider estimate is metadata nothing vouches
-/// for.
+/// The provider stays up, keeps its readiness registration installed, keeps
+/// beating and keeps its session — so there is no withdrawal, no replacement
+/// beat and no failure-plane disruption. The only thing that moves is the
+/// consumer cells' continuity clock, driven at a chosen instant through the
+/// SAME pass the maintenance loop runs
+/// (`MeshNode::expire_sensing_consumer_cells_for_test`).
+///
+/// Attribution rests on three things rather than on a wall clock:
+///
+/// * the park is ACKNOWLEDGED Pending first, and the fallback deadline is read
+///   (not assumed) and shown to be far outside the wake bound, so a fallback
+///   wake cannot explain the return;
+/// * an INDEPENDENT subscriber to the node's change generation shows it
+///   advanced across the transition — removing only the expiry publication
+///   leaves this unsatisfied even though the projection would still age out on
+///   a later read;
+/// * the last ADMITTED attestation is still `Ready`, so no replacement or
+///   withdrawal produced the `Unknown`, and the session is still live, so the
+///   failure plane did not.
+///
+/// `a_quiet_park_does_not_return_inside_the_wake_bound` remains the no-event
+/// control. No exact distributed expiry-instant notification is claimed: the
+/// claim is that the expiry publishes a change this consumer is woken by.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_quiet_expiry_reaches_a_parked_watcher_and_clears_the_estimate() {
+async fn timed_continuity_expiry_publishes_a_wake_and_clears_the_estimate() {
     let owner = org();
     let consumer = mesh_in_org("c-expiry", &owner, true, None).await;
     let audience = shared_audience(&consumer);
@@ -778,6 +862,8 @@ async fn a_quiet_expiry_reaches_a_parked_watcher_and_clears_the_estimate() {
     converge_population(&consumer, &[&provider], 1).await;
 
     let ready = Arc::new(AtomicBool::new(true));
+    // The registration is NEVER closed: a withdrawal is the cause this witness
+    // has to exclude.
     let registration = provide(&provider, ready, Duration::from_millis(90));
     let provider_id = provider.node.node_id();
 
@@ -787,40 +873,76 @@ async fn a_quiet_expiry_reaches_a_parked_watcher_and_clears_the_estimate() {
             .is_some_and(|p| p.readiness() == ProjectedReadiness::Ready)
     })
     .await;
+    let fallback = acknowledge_parked(&mut observation).await;
 
-    // The provider leaves. Its readiness registration and its whole mesh go
-    // with it, so the consumer receives nothing further about it.
-    drop(registration);
-    let Member {
-        mesh, dir: p_dir, ..
-    } = provider;
-    mesh.shutdown().await.expect("provider shutdown");
+    // An INDEPENDENT view of the node's change generation, marked caught up
+    // AFTER the acknowledgement, so only what follows can move it.
+    let mut generation = consumer.node.subscribe_sensing_overlay_changes();
+    let _ = generation.borrow_and_update();
 
-    until_snapshot(
-        "the quiet expiry never reached the watcher",
-        &mut observation,
-        |snap| {
-            snap.provider(provider_id)
-                .is_some_and(|p| p.readiness() == ProjectedReadiness::Unknown)
-        },
-    )
-    .await;
+    // Only the continuity clock moves, from another task, while this one parks.
+    let clock = Arc::clone(&consumer.node);
+    let expiry = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(
+            clock.expire_sensing_consumer_cells_for_test(
+                Instant::now() + Duration::from_secs(3_600)
+            ),
+            "precondition: the expiry pass must actually move a projection"
+        );
+    });
 
+    tokio::time::timeout(WAKE_BOUND, observation.changed())
+        .await
+        .expect("the expiry must publish a wake a parked watcher receives")
+        .expect("changed");
+    let woke_at = Instant::now();
+    assert!(
+        woke_at < fallback,
+        "the wake must arrive BEFORE the fallback deadline, {:?} of margin left",
+        fallback.saturating_duration_since(woke_at)
+    );
+    expiry.await.expect("expiry task");
+    assert!(
+        generation
+            .has_changed()
+            .expect("the generation channel is live"),
+        "the expiry must have PUBLISHED a change, not merely aged the state"
+    );
+
+    // ONE read, at the wake.
     let snapshot = observation.snapshot().expect("snapshot");
     let sensed = row(&snapshot, provider_id);
+    assert_eq!(
+        sensed.readiness(),
+        ProjectedReadiness::Unknown,
+        "the expired cell projects Unknown: {snapshot:?}"
+    );
     assert_eq!(
         sensed.estimated_start(),
         None,
         "an expired observation carries no start estimate"
     );
+    assert_eq!(sensed.viability(), SensedViability::Potential);
+
+    // The excluded causes, asserted rather than assumed.
     assert_eq!(
-        sensed.viability(),
-        SensedViability::Potential,
-        "Unknown retains potential capacity — it is not a not-ready verdict"
+        observation.last_attested_status_for_test(provider_id),
+        Some(net::adapter::net::behavior::sensing::AttestedStatus::Ready),
+        "no replacement or withdrawal beat was admitted"
     );
+    assert!(
+        consumer.node.peer_session_for_test(provider_id).is_some(),
+        "the session is still live, so the failure plane did not cause this"
+    );
+    assert!(
+        provider.node.sensing_live_streams() > 0,
+        "the provider is still emitting: nothing was withdrawn"
+    );
+    drop(registration);
 
     let _ = std::fs::remove_dir_all(&consumer.dir);
-    let _ = std::fs::remove_dir_all(&p_dir);
+    let _ = std::fs::remove_dir_all(&provider.dir);
 }
 
 /// WITHDRAWING readiness — the provider closes its registration while staying
@@ -1147,19 +1269,33 @@ async fn an_unavailable_authority_hides_the_population_and_recovery_restores_it(
         "hiding the population must not disarm the live renewal or release the lease"
     );
 
-    // And it comes back — INSIDE the population floor, so this cannot pass by
-    // waiting out a pacing timer.
+    // And it comes back. Recovery legitimately needs a FRESH convergence — the
+    // installed demand's authority stamp is stale under the reinstalled
+    // authority — so what must be proved is that it is not DELAYED by the
+    // previous success floor: the convergence count advances on the first read
+    // after re-admission, while that floor is demonstrably still unexpired.
+    let convergences_before = observation.convergences_for_test();
+    let unexpired_floor = observation.fallback_deadline_for_test();
     consumer
         .node
         .install_node_authority(installed)
         .expect("reinstall authority");
-    let recovered_at = Instant::now();
+    assert!(
+        Instant::now() < unexpired_floor,
+        "precondition: the previous success floor has NOT elapsed, so a paced \
+         implementation would still be waiting"
+    );
     let recovered = observation
         .snapshot()
         .expect("a requalified observer is answered again");
+    assert_eq!(
+        observation.convergences_for_test(),
+        convergences_before + 1,
+        "a moved authority bypasses the success floor and re-derives at once"
+    );
     assert!(
-        recovered_at.elapsed() < POPULATION_RECONCILE_FLOOR,
-        "recovery must not wait out the population floor"
+        Instant::now() < unexpired_floor,
+        "and it did so before that floor would have expired"
     );
     assert_eq!(
         recovered
@@ -1258,12 +1394,21 @@ async fn a_self_revoked_observer_is_refused_on_existing_and_new_reads() {
         }))
         .expect("install the renewed authority");
 
-    until_snapshot(
-        "re-admission never restored the observation",
-        &mut observation,
-        |snap| snap.provider(provider_id).is_some(),
-    )
-    .await;
+    // The FIRST read after re-admission requalifies and re-derives: no
+    // eventual polling, and no waiting out a pacing floor.
+    let convergences_before = observation.convergences_for_test();
+    let restored = observation
+        .snapshot()
+        .expect("re-admission restores the observation on the next read");
+    assert!(
+        restored.provider(provider_id).is_some(),
+        "and it returns the currently authorized population: {restored:?}"
+    );
+    assert_eq!(
+        observation.convergences_for_test(),
+        convergences_before + 1,
+        "the moved authority forced a fresh convergence rather than waiting"
+    );
 
     let _ = std::fs::remove_dir_all(&consumer.dir);
     let _ = std::fs::remove_dir_all(&provider.dir);
@@ -1570,6 +1715,21 @@ async fn a_retracted_provider_leaves_the_next_snapshot_inside_the_floor() {
     );
     let armed_before = armed(&consumer.node);
     assert!(armed_before >= 1, "precondition: the demand is retained");
+    // The departing member must itself be RETAINED, so its later absence is a
+    // removal rather than an unretained member that was never there.
+    assert!(
+        observation
+            .retained_providers_for_test()
+            .contains(&leaving_id),
+        "precondition: the departing member holds a lease of its own: {:?}",
+        observation.retained_providers_for_test()
+    );
+    // SUSPEND the paced re-derivation. From here nothing but the per-read
+    // visibility clamp can change which rows are reported, and the
+    // convergence count proves it: a clamp-free implementation has no other
+    // mechanism to remove the row.
+    observation.suspend_convergence_for_test(true);
+    let convergences_before = observation.convergences_for_test();
 
     // The RETRACTION: a later-sequence announcement that no longer declares
     // the capability.
@@ -1586,11 +1746,11 @@ async fn a_retracted_provider_leaves_the_next_snapshot_inside_the_floor() {
         "precondition: current visibility must already exclude it"
     );
 
-    let read_at = Instant::now();
     let after = observation.snapshot().expect("snapshot");
-    assert!(
-        read_at.elapsed() < POPULATION_RECONCILE_FLOOR,
-        "this read must land inside the population floor to be discriminating"
+    assert_eq!(
+        observation.convergences_for_test(),
+        convergences_before,
+        "no re-derivation ran, so only the per-read clamp can explain the result"
     );
     assert!(
         after.provider(leaving_id).is_none(),
@@ -1654,15 +1814,24 @@ async fn an_expired_announcement_leaves_the_population_and_a_live_one_stays() {
         opened.provider(ephemeral_node).is_some(),
         "the short-lived member is reported while it is visible: {opened:?}"
     );
+    // SUSPEND the paced re-derivation, so the expiry cannot be explained by a
+    // convergence that happened to come due while the announcement aged out.
+    observation.suspend_convergence_for_test(true);
+    let convergences_before = observation.convergences_for_test();
 
     until(
         "the announcement never expired out of discovery",
         SETTLE,
-        || !authorized(&consumer).contains(&ephemeral_node),
+        || authorized(&consumer).iter().all(|id| *id != ephemeral_node),
     )
     .await;
 
     let after = observation.snapshot().expect("snapshot");
+    assert_eq!(
+        observation.convergences_for_test(),
+        convergences_before,
+        "no re-derivation ran: the expiry left the snapshot through the clamp"
+    );
     assert!(
         after.provider(ephemeral_node).is_none(),
         "an expired announcement must leave the snapshot: {after:?}"
@@ -1729,22 +1898,21 @@ async fn the_query_asks_the_provider_start_bound_it_names() {
         "a provider that cannot start inside the asked bound answers NotReady: {refused:?}"
     );
     assert_eq!(sensed.viability(), SensedViability::NotViable);
+    // Keyed by the BOUND, not by recency: the recorder keeps every request it
+    // saw, so a second watch's concurrent beat stream cannot be mistaken for
+    // this one's.
+    let default_ask = asked
+        .lock()
+        .iter()
+        .find(|ask| ask.start_within == Some(DEFAULT_PROVIDER_START_WITHIN))
+        .cloned()
+        .expect("the default watch really asked the default bound");
     assert_eq!(
-        asked
-            .lock()
-            .clone()
-            .expect("the evaluator ran")
-            .start_within,
-        Some(DEFAULT_PROVIDER_START_WITHIN),
-        "the default watch really asked the default bound"
-    );
-    assert_eq!(
-        asked.lock().clone().expect("the evaluator ran").capability,
-        TAG,
+        default_ask.capability, TAG,
         "and it asked about this capability, verbatim"
     );
     assert_eq!(
-        asked.lock().clone().expect("the evaluator ran").constraints,
+        default_ask.constraints,
         CanonicalConstraints::default().canonical_bytes(),
         "canonical constraints are fixed EMPTY, as documented"
     );
@@ -1765,14 +1933,13 @@ async fn the_query_asks_the_provider_start_bound_it_names() {
     assert_eq!(sensed.viability(), SensedViability::Viable);
     assert_eq!(sensed.estimated_start(), Some(Duration::from_secs(3)));
     assert_eq!(honored.preferred(), Some(provider_id));
-    assert_eq!(
+    assert!(
         asked
             .lock()
-            .clone()
-            .expect("the evaluator ran")
-            .start_within,
-        Some(Duration::from_secs(5)),
-        "the asked bound reached the live evaluator verbatim"
+            .iter()
+            .any(|ask| ask.start_within == Some(Duration::from_secs(5))),
+        "the asked bound reached the live evaluator verbatim: {:?}",
+        asked.lock()
     );
 
     // 3. The two watches are INDEPENDENT questions: the default one still
@@ -1913,11 +2080,13 @@ async fn an_already_parked_watcher_is_woken_by_a_provider_edge() {
             .is_some_and(|p| p.readiness() == ProjectedReadiness::Ready)
     })
     .await;
-    // Fresh capture, so the change cursor is caught up and the fallback timer
-    // is a full floor away.
-    let _ = observation.snapshot().expect("snapshot");
+    // Converge, so the change cursor is caught up and the FALLBACK deadline is
+    // a known, freshly re-armed distance away. `snapshot` only re-arms it when
+    // it actually converges, which is why the deadline is read rather than
+    // assumed.
+    let fallback = acknowledge_parked(&mut observation).await;
 
-    // The edge fires only after this task is parked.
+    // Only now does the edge fire, from another task, while this one parks.
     let edge = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(40)).await;
         ready.store(false, Ordering::Relaxed);
@@ -1933,18 +2102,23 @@ async fn an_already_parked_watcher_is_woken_by_a_provider_edge() {
         .await
         .expect("a parked watcher must be woken by the provider edge")
         .expect("changed");
+    let woke_at = Instant::now();
     let waited = parked.elapsed();
     assert!(
-        waited < POPULATION_RECONCILE_FLOOR,
-        "the wake must arrive below the fallback floor, waited {waited:?}"
+        woke_at < fallback,
+        "the wake must arrive BEFORE the fallback deadline, waited {waited:?} \
+         with {:?} of margin left",
+        fallback.saturating_duration_since(woke_at)
     );
     let _registration = edge.await.expect("edge task");
 
-    until_snapshot("the edge never became visible", &mut observation, |snap| {
-        snap.provider(provider_id)
-            .is_some_and(|p| p.readiness() == ProjectedReadiness::NotReady)
-    })
-    .await;
+    // The admitted edge is already readable at the wake: ONE read, no polling.
+    let after = observation.snapshot().expect("snapshot");
+    assert_eq!(
+        row(&after, provider_id).readiness(),
+        ProjectedReadiness::NotReady,
+        "the wake carried a real admitted edge: {after:?}"
+    );
 
     let _ = std::fs::remove_dir_all(&consumer.dir);
     let _ = std::fs::remove_dir_all(&provider.dir);
@@ -1957,9 +2131,14 @@ async fn an_already_parked_watcher_is_woken_by_a_provider_edge() {
 ///
 /// The registration is deliberately NOT closed before the provider stops — a
 /// withdrawal would produce exactly the replacement this witness must exclude.
-/// The claim is bounded-eventual visibility of loss of continuity, observed
-/// through the shipped watch; it is not a claim of exact expiry-instant
-/// notification.
+///
+/// SCOPE, precisely: this excludes a replacement or withdrawal beat as the
+/// cause, and nothing more. A departing process also breaks the path, so
+/// failure-plane disruption is an admissible cause HERE; it is
+/// `timed_continuity_expiry_publishes_a_wake_and_clears_the_estimate` that
+/// isolates timed expiry from the failure plane and attributes the
+/// notification. This witness makes no notification claim: the loss becomes
+/// visible eventually, through either the change signal or the fallback.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_departed_provider_ages_out_rather_than_being_replaced() {
     let owner = org();
@@ -2141,23 +2320,55 @@ async fn a_slower_raw_holder_survives_the_sdk_watch_release() {
     );
     let slower = consumer
         .node
-        .acquire_sensing_interest_lease(&spec, provider_id, Duration::from_secs(4))
+        .acquire_sensing_interest_lease(&spec, provider_id, SLOWER_SAMPLE_INTERVAL)
         .expect("the slower holder joins the SDK watch's own interest");
+    let branch =
+        net::adapter::net::behavior::sensing::ProviderInterestKey::new(spec.key(), provider_id);
     assert!(
-        consumer.node.sensing_observation_count() >= 1,
-        "precondition: the interest row is live with both holders on it"
+        consumer
+            .node
+            .sensing_lease_holder_installation_for_test(&slower)
+            .is_some(),
+        "precondition: the raw holder really joined the installation"
+    );
+    // The EFFECTIVE cadence while both hold it: the strictest, which is the
+    // SDK's 2s rather than the raw holder's 4s.
+    assert_eq!(
+        consumer
+            .node
+            .sensing_consumer_cell_interval_for_test(&branch),
+        Some(SDK_SAMPLE_INTERVAL),
+        "precondition: the shared cell runs at the strictest interval"
     );
 
     // The stricter SDK owner leaves.
     assert!(observation.close());
-    // The survivor's own holder is proved still live by its release
-    // SUCCEEDING below; what is asserted here is that the row and its
-    // observation were not torn down with the other owner's release.
     assert_eq!(
         armed(&consumer.node),
         1,
         "release-then-SETTLE: a non-final release must NOT take the live \
          installation's renewal away from the surviving holder"
+    );
+    let survivor_installation = consumer
+        .node
+        .sensing_lease_holder_installation_for_test(&slower)
+        .expect("the survivor's holder is still live — not merely releasable");
+    // The cadence RELAXES to the survivor's own request. A regression that
+    // left the aggregate pinned at the departed strict owner's 2s fails here,
+    // which a disarm-all assertion cannot see.
+    until("the survivor's cadence never relaxed", SETTLE, || {
+        consumer
+            .node
+            .sensing_consumer_cell_interval_for_test(&branch)
+            == Some(SLOWER_SAMPLE_INTERVAL)
+    })
+    .await;
+    assert_eq!(
+        consumer
+            .node
+            .sensing_lease_holder_installation_for_test(&slower),
+        Some(survivor_installation),
+        "and it is the SAME installation, still owned, still renewed"
     );
     assert!(
         consumer.node.sensing_observation_count() >= 1,
@@ -2169,6 +2380,13 @@ async fn a_slower_raw_holder_survives_the_sdk_watch_release() {
         .node
         .try_release_sensing_interest_lease(slower)
         .expect("the survivor releases");
+    assert_eq!(
+        consumer
+            .node
+            .sensing_lease_holder_installation_for_test(&slower),
+        None,
+        "the survivor's own release really removed its holder"
+    );
     until(
         "the final release never deregistered the row",
         SETTLE,
@@ -2184,4 +2402,391 @@ async fn a_slower_raw_holder_survives_the_sdk_watch_release() {
 
     let _ = std::fs::remove_dir_all(&consumer.dir);
     let _ = std::fs::remove_dir_all(&provider.dir);
+}
+
+// ---------------------------------------------------------------------------
+// Same-Ready economics move the SDK's own result and rank
+// ---------------------------------------------------------------------------
+
+/// Two providers, both staying `Ready`, one publishing a NEW signed start
+/// estimate: the SDK must expose the new estimate and reverse `ranked()` and
+/// `preferred()` accordingly.
+///
+/// Nothing here changes readiness, population, authority or route: the only
+/// moving input is a semantically valid provider-signed estimate. The paired
+/// control reads the same watch twice with nothing moving and requires a
+/// stable order, so the reversal cannot be read as ordinary churn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_signed_estimate_reverses_the_sdk_rank_while_both_stay_ready() {
+    let owner = org();
+    let consumer = mesh_in_org("c-rank", &owner, true, None).await;
+    let audience = shared_audience(&consumer);
+    let fast = mesh_in_org("p-rank-1", &owner, true, Some(&audience)).await;
+    let slow = mesh_in_org("p-rank-2", &owner, true, Some(&audience)).await;
+    let _fast_service = serve(&fast);
+    let _slow_service = serve(&slow);
+    bring_up(&consumer, &[&fast, &slow]).await;
+    converge_population(&consumer, &[&fast, &slow], 2).await;
+
+    let fast_id = fast.node.node_id();
+    let slow_id = slow.node.node_id();
+    let (fast_registration, fast_start) = provide_adjustable(
+        &fast,
+        Arc::new(AtomicBool::new(true)),
+        Duration::from_millis(100),
+    );
+    let _slow_registration = provide_adjustable(
+        &slow,
+        Arc::new(AtomicBool::new(true)),
+        Duration::from_millis(600),
+    );
+
+    let mut observation = watch(&consumer, SensingQuery::new(TAG));
+    until_snapshot(
+        "the fixture never ranked both providers",
+        &mut observation,
+        |snap| {
+            snap.ranked().len() == 2
+                && snap
+                    .provider(fast_id)
+                    .is_some_and(|p| p.estimated_start() == Some(Duration::from_millis(100)))
+                && snap
+                    .provider(slow_id)
+                    .is_some_and(|p| p.estimated_start() == Some(Duration::from_millis(600)))
+        },
+    )
+    .await;
+    let first = observation.snapshot().expect("snapshot");
+    assert_eq!(
+        first.preferred(),
+        Some(fast_id),
+        "the lower signed estimate leads: {first:?}"
+    );
+    assert_eq!(first.ranked(), &[fast_id, slow_id]);
+
+    // CONTROL: nothing moves, the order is stable.
+    let again = observation.snapshot().expect("snapshot");
+    assert_eq!(again.ranked(), first.ranked(), "control: a stable order");
+
+    // ONE input moves: the fast provider publishes a much worse start, still
+    // `Ready`. State first, then the edge — the notification is a wake.
+    fast_start.store(1_500, Ordering::Relaxed);
+    assert!(fast_registration.changed());
+
+    until_snapshot(
+        "the new estimate never reached the consumer",
+        &mut observation,
+        |snap| {
+            snap.provider(fast_id)
+                .is_some_and(|p| p.estimated_start() == Some(Duration::from_millis(1_500)))
+        },
+    )
+    .await;
+    let reversed = observation.snapshot().expect("snapshot");
+    for provider in reversed.providers() {
+        assert_eq!(
+            provider.readiness(),
+            ProjectedReadiness::Ready,
+            "both providers must still be Ready: {reversed:?}"
+        );
+    }
+    assert_eq!(
+        reversed.ranked(),
+        &[slow_id, fast_id],
+        "the SDK's rank must follow the new signed economics: {reversed:?}"
+    );
+    assert_eq!(reversed.preferred(), Some(slow_id));
+    assert_eq!(
+        row(&reversed, fast_id).estimated_start(),
+        Some(Duration::from_millis(1_500)),
+        "and it exposes the estimate it ranked with"
+    );
+
+    let _ = std::fs::remove_dir_all(&consumer.dir);
+    let _ = std::fs::remove_dir_all(&fast.dir);
+    let _ = std::fs::remove_dir_all(&slow.dir);
+}
+
+// ---------------------------------------------------------------------------
+// Consumer-boundary negatives: the granted plane, and partial acquisition
+// ---------------------------------------------------------------------------
+
+/// A provider discovered ONLY under a held same-organization DISCOVER grant —
+/// positively announced on the granted plane and positively pinned — is never
+/// sensed through the SDK watch, while the owner-plane provider beside it is.
+///
+/// The grant is real (issued by this organization to itself, DISCOVER+INVOKE,
+/// its audience installed on the consumer node) and the announcement is a real
+/// `build_granted` envelope through the ordinary verified ingest. Only its
+/// discovery PROVENANCE separates it: an owner-org predicate cannot see this,
+/// because the grant-plane provider is same-org too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_granted_only_provider_is_never_sensed_and_the_owner_one_is() {
+    use net::adapter::net::behavior::org_scoped_ann::ScopedCapabilityAnnouncement;
+    use net::adapter::net::identity::EntityKeypair;
+    use net_sdk::org::types::{GrantRights, GrantTargetScope, OrgCapabilityGrant};
+
+    let owner = org();
+    let consumer = mesh_in_org("c-grant", &owner, true, None).await;
+    let audience = shared_audience(&consumer);
+    let provider = mesh_in_org("p-grant", &owner, true, Some(&audience)).await;
+    let _service = serve(&provider);
+    bring_up(&consumer, &[&provider]).await;
+    converge_population(&consumer, &[&provider], 1).await;
+    let provider_id = provider.node.node_id();
+
+    let (grant, secret) = OrgCapabilityGrant::try_issue(
+        &owner,
+        owner.org_id(),
+        capability(),
+        GrantRights::DISCOVER.union(GrantRights::INVOKE),
+        GrantTargetScope::AnyNodeOwnedBy(owner.org_id()),
+        3600,
+    )
+    .expect("issue the same-organization grant");
+    let secret = secret.expect("a DISCOVER grant carries audience material");
+    let grant_id = grant.grant_id;
+    let audience_handle = secret.audience_handle;
+    let discovery_key = *secret.discovery_key();
+    consumer
+        .node
+        .install_consumer_grant_audience(grant.clone(), secret)
+        .expect("install the consumer grant audience");
+
+    let granted = EntityKeypair::generate();
+    let granted_id = granted.entity_id().node_id();
+    let cert = OrgMembershipCert::try_issue(&owner, granted.entity_id().clone(), 1, 3600)
+        .expect("membership");
+    let descriptor = declared().to_bytes_compact();
+    let envelope = ScopedCapabilityAnnouncement::build_granted(
+        &granted,
+        owner.org_id(),
+        cert,
+        grant_id,
+        audience_handle,
+        &discovery_key,
+        1,
+        unix_now() + 3600,
+        &descriptor,
+    )
+    .expect("granted envelope");
+    consumer
+        .node
+        .ingest_scoped_announcement_for_test(&envelope.to_bytes());
+    consumer
+        .node
+        .test_pin_peer_entity(granted_id, granted.entity_id().clone());
+
+    // NONVACUOUS: it really is on the granted plane, and really is not on the
+    // owner one.
+    until(
+        "the granted-plane provider was never discovered",
+        SETTLE,
+        || {
+            consumer
+                .node
+                .org_cold_discovery(&capability(), &[grant_id])
+                .map(|capture| {
+                    capture
+                        .granted_providers(&grant_id)
+                        .iter()
+                        .any(|row| row.provider == *granted.entity_id())
+                })
+                .unwrap_or(false)
+        },
+    )
+    .await;
+    assert!(
+        authorized(&consumer).iter().all(|id| *id != granted_id),
+        "precondition: owner-private discovery never saw it"
+    );
+
+    let ready = Arc::new(AtomicBool::new(true));
+    let _registration = provide(&provider, ready, Duration::from_millis(75));
+    let mut observation = watch(&consumer, SensingQuery::new(TAG));
+    until_snapshot(
+        "the owner-plane provider never read Ready",
+        &mut observation,
+        |snap| {
+            snap.provider(provider_id)
+                .is_some_and(|p| p.readiness() == ProjectedReadiness::Ready)
+        },
+    )
+    .await;
+
+    let snapshot = observation.snapshot().expect("snapshot");
+    assert!(
+        snapshot.provider(granted_id).is_none(),
+        "a grant-plane-only provider must never be sensed: {snapshot:?}"
+    );
+    assert!(
+        snapshot.ranked().iter().all(|id| *id != granted_id),
+        "and it must not appear in the rank order either"
+    );
+    // OWNER-POSITIVE SURVIVOR: the exclusion is a decision, not an empty set.
+    assert_eq!(
+        snapshot
+            .providers()
+            .iter()
+            .map(|p| p.node_id())
+            .collect::<Vec<_>>(),
+        vec![provider_id],
+        "the owner-plane provider is still sensed: {snapshot:?}"
+    );
+    assert!(
+        observation
+            .retained_providers_for_test()
+            .iter()
+            .all(|id| *id != granted_id),
+        "and nothing was even retained for it"
+    );
+
+    let _ = std::fs::remove_dir_all(&consumer.dir);
+    let _ = std::fs::remove_dir_all(&provider.dir);
+}
+
+/// PARTIAL acquisition: with room for exactly one more interest, a watch over
+/// two authorized providers retains one and is refused the other. The retained
+/// one is a live observation, the refused one reads `Unknown`, and closing the
+/// watch cleans up ONLY its own acquired state — a second owner of the same
+/// interest keeps its holder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_partial_acquisition_keeps_its_own_state_and_another_owners() {
+    let owner = org();
+    let consumer = mesh_in_org("c-partial", &owner, true, None).await;
+    let audience = shared_audience(&consumer);
+    let first = mesh_in_org("p-partial-1", &owner, true, Some(&audience)).await;
+    let second = mesh_in_org("p-partial-2", &owner, true, Some(&audience)).await;
+    let _first_service = serve(&first);
+    let _second_service = serve(&second);
+    bring_up(&consumer, &[&first, &second]).await;
+    converge_population(&consumer, &[&first, &second], 2).await;
+
+    let _first_readiness = provide(
+        &first,
+        Arc::new(AtomicBool::new(true)),
+        Duration::from_millis(75),
+    );
+    let _second_readiness = provide(
+        &second,
+        Arc::new(AtomicBool::new(true)),
+        Duration::from_millis(75),
+    );
+    let population = authorized(&consumer);
+    assert_eq!(
+        population.len(),
+        2,
+        "precondition: two authorized providers"
+    );
+
+    // Leave room for EXACTLY ONE more interest, so the watch's second
+    // acquisition meets the production capacity refusal while its first
+    // succeeds.
+    let mut fillers = fill_sensing_capacity(&consumer.node);
+    let freed = fillers.pop().expect("one filler to free");
+    consumer
+        .node
+        .try_release_sensing_interest_lease(freed)
+        .expect("free exactly one slot");
+
+    let mut observation = watch(&consumer, SensingQuery::new(TAG));
+    let retained = observation.retained_providers_for_test();
+    assert_eq!(
+        retained.len(),
+        1,
+        "precondition: exactly one member was acquired and one refused: \
+         retained {retained:?} of {population:?}"
+    );
+    let acquired = retained[0];
+    let refused = population
+        .iter()
+        .copied()
+        .find(|id| *id != acquired)
+        .expect("the refused member");
+
+    let snapshot = observation.snapshot().expect("snapshot");
+    assert_eq!(
+        snapshot.providers().len(),
+        2,
+        "both authorized members are still reported: {snapshot:?}"
+    );
+    assert_eq!(
+        row(&snapshot, refused).readiness(),
+        ProjectedReadiness::Unknown,
+        "the refused member has no evidence: {snapshot:?}"
+    );
+    assert_eq!(
+        row(&snapshot, refused).viability(),
+        SensedViability::Potential,
+        "and refusal is not a verdict"
+    );
+    until_snapshot(
+        "the acquired member never read Ready",
+        &mut observation,
+        |snap| {
+            snap.provider(acquired)
+                .is_some_and(|p| p.readiness() == ProjectedReadiness::Ready)
+        },
+    )
+    .await;
+    assert_eq!(
+        armed(&consumer.node),
+        1,
+        "one acquisition, one armed record"
+    );
+
+    // A SECOND owner of the acquired member's exact interest.
+    let org_id = consumer
+        .node
+        .node_authority()
+        .expect("authority")
+        .owner_org();
+    let spec = net::adapter::net::behavior::org_sensing_demand::exact_provider_spec(
+        TAG,
+        net::adapter::net::behavior::sensing::canonical_org_sensing_commitment(&org_id),
+        net::adapter::net::behavior::org_sensing_demand::fixed_work_latency(),
+        acquired,
+    );
+    let other_owner = consumer
+        .node
+        .acquire_sensing_interest_lease(&spec, acquired, SDK_SAMPLE_INTERVAL)
+        .expect("a second owner joins the acquired interest");
+
+    // The watch closes: only ITS state goes.
+    assert!(observation.close());
+    assert!(
+        consumer
+            .node
+            .sensing_lease_holder_installation_for_test(&other_owner)
+            .is_some(),
+        "the other owner's holder survives the partial watch's close"
+    );
+    assert!(
+        consumer.node.sensing_observation_count() >= 1,
+        "and so does the row it keeps referenced"
+    );
+
+    consumer
+        .node
+        .try_release_sensing_interest_lease(other_owner)
+        .expect("the other owner releases");
+    until(
+        "the final release never deregistered the row",
+        SETTLE,
+        || consumer.node.sensing_observation_count() == 0,
+    )
+    .await;
+    until(
+        "the final release never settled the refresh",
+        SETTLE,
+        || armed(&consumer.node) == 0,
+    )
+    .await;
+    for ticket in fillers {
+        let _ = consumer.node.try_release_sensing_interest_lease(ticket);
+    }
+
+    let _ = std::fs::remove_dir_all(&consumer.dir);
+    let _ = std::fs::remove_dir_all(&first.dir);
+    let _ = std::fs::remove_dir_all(&second.dir);
 }
