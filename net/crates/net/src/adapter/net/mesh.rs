@@ -5213,6 +5213,32 @@ fn reconcile_materialized_consumer_cells(
     }
 }
 
+/// THE timed-expiry operation: age the local consumer cells' continuity at
+/// `now` and, if any projection moved, PUBLISH the overlay change. Returns
+/// whether it moved.
+///
+/// One operation rather than a state pass plus a separate publication at each
+/// caller: a caller that ages without notifying is then not expressible, and a
+/// witness driving this operation exercises the same link the maintenance loop
+/// does. The loop publishes here rather than folding expiry into its combined
+/// signal — an extra generation bump in a sweep that also moved for another
+/// reason is a spurious wake at worst, and the consumer contract is explicit
+/// that a wake is never the value.
+fn expire_and_publish_consumer_cells(
+    observations: &Arc<ObservationMutex>,
+    overlay: &Arc<tokio::sync::watch::Sender<u64>>,
+    now: Instant,
+    #[cfg(any(test, feature = "fixtures"))] passes: &AtomicU64,
+) -> bool {
+    #[cfg(any(test, feature = "fixtures"))]
+    passes.fetch_add(1, Ordering::Relaxed);
+    let moved = observations.lock().expire_consumer_cells(now);
+    if moved {
+        overlay.send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+    moved
+}
+
 /// attestations; the wire form is this hop's latest cache — matched
 /// on (incarnation, seq) so a torn race skips (the next beat
 /// repairs) and "relays forward identical signed bytes" holds for
@@ -5542,13 +5568,9 @@ impl SensingObservations {
     /// Run the local consumer cells' CONTINUITY CLOCK at `now`, reporting
     /// whether any projection moved (`Ready` → `Unknown`, say).
     ///
-    /// One implementation of the timed-expiry pass. The maintenance loop calls
-    /// it on its own poll instant and folds the result into the overlay signal
-    /// it publishes; the fixtures seam
-    /// ([`MeshNode::expire_sensing_consumer_cells_for_test`]) calls the SAME
-    /// pass at a chosen instant, so a witness can attribute an expiry
-    /// notification without stopping a provider, withdrawing readiness or
-    /// breaking a path — none of which is timed expiry.
+    /// The STATE half only. Every caller goes through
+    /// [`expire_and_publish_consumer_cells`], which is the operation that also
+    /// publishes, so aging can never be wired up without its notification.
     fn expire_consumer_cells(&mut self, now: Instant) -> bool {
         let mut moved = false;
         for cell in self.consumer_cells.values_mut() {
@@ -11031,6 +11053,15 @@ pub struct MeshNode {
     /// what makes "one section for the whole population" checkable.
     #[cfg(any(test, feature = "fixtures"))]
     sensing_observation_acquisitions: AtomicU64,
+    /// Counted invocations of the shared timed-expiry operation
+    /// (`expire_and_publish_consumer_cells`), fixtures/tests only.
+    ///
+    /// Shared with the maintenance task, so a witness can certify that
+    /// PRODUCTION actually drives that operation — the link from the
+    /// maintenance schedule to the notification — rather than only that a
+    /// fixture can.
+    #[cfg(any(test, feature = "fixtures"))]
+    sensing_expiry_passes: Arc<AtomicU64>,
     /// Fixtures seam: fires INSIDE the capture's critical section, after its
     /// first row.
     #[cfg(any(test, feature = "fixtures"))]
@@ -12960,6 +12991,8 @@ impl MeshNode {
             sensing_phase_two_seam: parking_lot::Mutex::new(None),
             #[cfg(any(test, feature = "fixtures"))]
             sensing_observation_acquisitions: AtomicU64::new(0),
+            #[cfg(any(test, feature = "fixtures"))]
+            sensing_expiry_passes: Arc::new(AtomicU64::new(0)),
             #[cfg(any(test, feature = "fixtures"))]
             sensing_capture_seam: parking_lot::Mutex::new(None),
             #[cfg(any(test, feature = "fixtures"))]
@@ -17648,12 +17681,41 @@ impl MeshNode {
     #[doc(hidden)]
     #[cfg(any(test, feature = "fixtures"))]
     pub fn expire_sensing_consumer_cells_for_test(&self, now: Instant) -> bool {
-        let moved = self.sensing_observations.lock().expire_consumer_cells(now);
-        if moved {
-            self.sensing_overlay_changed
-                .send_modify(|generation| *generation = generation.wrapping_add(1));
-        }
-        moved
+        expire_and_publish_consumer_cells(
+            &self.sensing_observations,
+            &self.sensing_overlay_changed,
+            now,
+            &self.sensing_expiry_passes,
+        )
+    }
+
+    /// Fixtures-only: how many times the shared timed-expiry operation has run
+    /// on this node, from ANY caller — including the production maintenance
+    /// schedule.
+    ///
+    /// A witness certifies the production link with it: the count advances with
+    /// no fixture call, which is only possible if the maintenance task drives
+    /// the same age-and-publish operation.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn sensing_expiry_passes_for_test(&self) -> u64 {
+        self.sensing_expiry_passes.load(Ordering::Acquire)
+    }
+
+    /// Fixtures-only: the lease registry's `(holder count, installed interval)`
+    /// for the key `ticket` belongs to.
+    ///
+    /// The INSTALLED interval is what a future renewal re-authors from, which a
+    /// local consumer cell's own interval does not establish — so a coexistence
+    /// witness asserts this, not only the cell. A ticket's key is
+    /// `pub(crate)`, hence a node-side accessor rather than exposing it.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn sensing_lease_entry_for_ticket_for_test(
+        &self,
+        ticket: &sensing::SensingLeaseTicket,
+    ) -> Option<(usize, Duration)> {
+        self.sensing_interest_leases.entry_for_test(&ticket.key)
     }
 
     /// Fixtures-only: the installation `ticket` is a live holder of, or `None`.
@@ -27322,6 +27384,8 @@ impl MeshNode {
         let sensing_observations = self.sensing_observations.clone();
         let sensing_interest_ttl = self.config.sensing_interest_ttl;
         let sensing_overlay_changed = self.sensing_overlay_changed.clone();
+        #[cfg(any(test, feature = "fixtures"))]
+        let sensing_expiry_passes = Arc::clone(&self.sensing_expiry_passes);
         let continuity_factor = self.config.continuity_factor;
         let sensing_capability_interests = self.sensing_capability_interests.clone();
         let sensing_local_projection_mu = self.sensing_local_projection_mu.clone();
@@ -27607,6 +27671,24 @@ impl MeshNode {
                             // sequential lock phases — never
                             // nested.
                             let poll_now = Instant::now();
+                            // SI-4b: local consumer cells run the
+                            // same clock — an expiry that moves a
+                            // projection (Ready → Unknown) fires the
+                            // overlay signal. THE shared operation
+                            // ages and publishes together, and the
+                            // fixtures seam drives this same one at a
+                            // chosen instant, so the caller-to-
+                            // publisher link is exercised rather than
+                            // reimplemented. Its own lock section,
+                            // because the operation takes the guard
+                            // itself.
+                            expire_and_publish_consumer_cells(
+                                &sensing_observations,
+                                &sensing_overlay_changed,
+                                poll_now,
+                                #[cfg(any(test, feature = "fixtures"))]
+                                &sensing_expiry_passes,
+                            );
                             let mut overlay_moved = false;
                             let (continuities, pending) = {
                                 let mut observations = sensing_observations.lock();
@@ -27615,15 +27697,6 @@ impl MeshNode {
                                     cell.expire_if_due(poll_now);
                                     continuities.push((branch.clone(), cell.continuity()));
                                 }
-                                // SI-4b: local consumer cells run
-                                // the same clock — an expiry that
-                                // moves a projection (Ready →
-                                // Unknown) fires the overlay
-                                // signal. ONE implementation,
-                                // shared with the fixtures seam that
-                                // drives it at a chosen instant.
-                                overlay_moved |=
-                                    observations.expire_consumer_cells(poll_now);
                                 // SI-4 review P1: EVERY slot is
                                 // checked for row liveness — a
                                 // downstream that deregistered

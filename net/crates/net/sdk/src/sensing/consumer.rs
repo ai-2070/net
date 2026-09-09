@@ -484,6 +484,10 @@ pub struct SensingWatch {
     /// ([`SensingWatch::suspend_convergence_for_test`]).
     #[cfg(any(test, feature = "fixtures"))]
     convergence_suspended: bool,
+    /// Fixtures-only override of [`POPULATION_RECONCILE_FLOOR`]
+    /// ([`SensingWatch::set_population_floor_for_test`]).
+    #[cfg(any(test, feature = "fixtures"))]
+    floor_override: Option<Duration>,
 }
 
 impl SensingClient {
@@ -569,6 +573,8 @@ impl SensingClient {
             convergences: 1,
             #[cfg(any(test, feature = "fixtures"))]
             convergence_suspended: false,
+            #[cfg(any(test, feature = "fixtures"))]
+            floor_override: None,
         })
     }
 }
@@ -678,7 +684,7 @@ impl SensingWatch {
                 // RE-ARM. Without this a consumer that wakes and does not
                 // snapshot would find the floor permanently elapsed and
                 // spin instead of parking.
-                self.floor_wake = Instant::now() + POPULATION_RECONCILE_FLOOR;
+                self.floor_wake = Instant::now() + self.floor();
             }
         }
         Ok(())
@@ -777,6 +783,31 @@ impl SensingWatch {
         self.floor_wake
     }
 
+    /// The pacing floor in force. [`POPULATION_RECONCILE_FLOOR`] in
+    /// production; a witness may widen it so a schedule-qualified claim
+    /// does not rest on a short wall-clock interval.
+    fn floor(&self) -> Duration {
+        #[cfg(any(test, feature = "fixtures"))]
+        if let Some(floor) = self.floor_override {
+            return floor;
+        }
+        POPULATION_RECONCILE_FLOOR
+    }
+
+    /// Unstable fixtures-only witness seam; not supported API.
+    ///
+    /// Widen (or narrow) this watch's population re-derivation floor and
+    /// re-arm its fallback from now. A recovery witness uses a long floor so
+    /// "the previous success floor is still unexpired" is a robust statement
+    /// about the SCHEDULE rather than a race against however long a signed
+    /// on-disk ceremony takes.
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn set_population_floor_for_test(&mut self, floor: Duration) {
+        self.floor_override = Some(floor);
+        self.floor_wake = self.converged_at + floor;
+    }
+
     /// The demand to project, re-deriving the authorized population when
     /// that is due or when the installed one can no longer be trusted.
     fn converge(&mut self) -> Result<Arc<OrgSensingCapabilityDemand>, SensingError> {
@@ -790,7 +821,7 @@ impl SensingWatch {
             Some(demand) => {
                 !demand.authority_is_current()
                     || !demand.holders_are_live()
-                    || self.converged_at.elapsed() >= POPULATION_RECONCILE_FLOOR
+                    || self.converged_at.elapsed() >= self.floor()
             }
         };
         // Fixtures-only: a suspended witness keeps whatever is installed,
@@ -809,7 +840,7 @@ impl SensingWatch {
         match self.family.retain(&self.capability) {
             Ok(demand) => {
                 self.converged_at = Instant::now();
-                self.floor_wake = self.converged_at + POPULATION_RECONCILE_FLOOR;
+                self.floor_wake = self.converged_at + self.floor();
                 Ok(demand)
             }
             // A refusal retains nothing, releases nothing and evicts
@@ -820,7 +851,7 @@ impl SensingWatch {
             Err(refusal) => match installed {
                 Some(demand) => {
                     self.converged_at = Instant::now();
-                    self.floor_wake = self.converged_at + POPULATION_RECONCILE_FLOOR;
+                    self.floor_wake = self.converged_at + self.floor();
                     Ok(demand)
                 }
                 None => Err(retention_refusal(refusal)),
