@@ -3,9 +3,47 @@
 //!
 //! `docs/internal/plans/CAPABILITY_SENSING_SDK_INTEGRATION_PLAN.md` §4.3
 //! (consumer surface). An ordinary application asks one question here —
-//! "which of the providers this node is authorized to see can currently
-//! satisfy capability Y inside my own latency budget?" — and the answer
-//! is [`SensingSnapshot`]: request-relative, advisory, plain data.
+//! "which of the providers this node is currently authorized to see can
+//! start capability Y within the bound I name, inside my own end-to-end
+//! latency budget?" — and the answer is [`SensingSnapshot`]:
+//! request-relative, advisory, plain data.
+//!
+//! # Two bounds, two parties
+//!
+//! The question has two halves, and both are the caller's to state:
+//!
+//! - [`SensingQuery::start_within`] is the PROVIDER-EVALUATED predicate.
+//!   It rides in the signed interest and reaches the provider's
+//!   evaluator as `EvaluationRequest::work_latency`, so a provider that
+//!   cannot start inside it answers `NotReady` — and no local budget can
+//!   overturn an answer to that bound. It defaults to
+//!   [`DEFAULT_PROVIDER_START_WITHIN`], the same fixed policy the
+//!   organization call path's retained demand asks, so a default watch
+//!   shares that path's interest rather than forking a second digest;
+//! - [`SensingQuery::within`] is the CONSUMER-local end-to-end budget.
+//!   It never rides the wire and is applied to this node's own route
+//!   economics plus the provider's signed start estimate.
+//!
+//! Anything a provider must be told is therefore said explicitly; a
+//! caller is never silently observing a different question.
+//!
+//! # Current authorization, on every read
+//!
+//! Every [`SensingWatch::snapshot`] requalifies before it reports, at
+//! that instant and off every pacing floor:
+//!
+//! - THIS node's own membership must be live — installed, readable,
+//!   unexpired, and at or above the current revocation floor. A stamp
+//!   being unchanged is publication identity, not membership, so a
+//!   revoked observer is refused with
+//!   [`SensingError::ObserverNotQualified`] while its leases and its
+//!   recovery path stay intact;
+//! - the reported rows are CLAMPED to what verified owner-private
+//!   discovery says right now. A provider whose announcement expired,
+//!   whose certificate clamped its lifetime, or whose pin went away is
+//!   absent from the next snapshot immediately — lease convergence for
+//!   ADDITIONS remains paced, so the reported set is always a subset of
+//!   current visibility and never a superset.
 //!
 //! # What this owns, and what it reuses
 //!
@@ -25,11 +63,14 @@
 //! - the CADENCE and its `ttl/2` renewal are the node's own — one
 //!   acquisition arms one refresh record on the node's single refresh
 //!   worker, so a watch keeps observing between application calls
-//!   without this module owning a task or a timer per watch;
+//!   without this module owning a background task or a permanent timer
+//!   per watch (a parked [`SensingWatch::changed`] does arm one
+//!   `sleep_until` for the duration of that park);
 //! - the PROJECTION is `OrgSensingCapabilityDemand::project_sensed_order`,
-//!   the same classifier the call path consults. This module adds no
-//!   second ranking rule — it maps the core's three buckets onto one
-//!   [`SensedViability`] per row and reports the rows.
+//!   the same classifier the call path consults, and the row economics
+//!   this module reports are the values that classification used. This
+//!   module adds no second ranking rule and samples no plane itself: it
+//!   maps the core's three buckets onto one [`SensedViability`] per row.
 //!
 //! # What a snapshot is not
 //!
@@ -43,15 +84,27 @@
 //!
 //! # The consumer loop
 //!
+//! The watched name is the capability id its PROVIDERS declare, and a
+//! provider only enters the population once this node has verified
+//! owner-private discovery for it and pinned its entity — for an
+//! organization service that means the provider served
+//! `Mesh::serve_org("infer", ..)` and the watched tag is
+//! `nrpc:infer`. `provide` alone makes a provider ready, not
+//! discoverable.
+//!
 //! ```no_run
 //! use std::time::Duration;
 //!
-//! use net_sdk::sensing::{SensingQuery, SensedViability};
+//! use net_sdk::sensing::{SensedViability, SensingQuery};
 //!
 //! # async fn example(mesh: &net_sdk::mesh::Mesh) -> Result<(), Box<dyn std::error::Error>> {
-//! let mut watch = mesh
-//!     .sensing()?
-//!     .watch(SensingQuery::new("gpu.infer").within(Duration::from_millis(800)))?;
+//! let mut watch = mesh.sensing()?.watch(
+//!     SensingQuery::new("nrpc:infer")
+//!         // What the PROVIDER is asked to answer.
+//!         .start_within(Duration::from_millis(500))
+//!         // What THIS consumer will accept end to end.
+//!         .within(Duration::from_millis(800)),
+//! )?;
 //!
 //! loop {
 //!     // Read coherent current state. A wake is never the value.
@@ -74,21 +127,26 @@
 //! # Unsupported forms are refused, not faked
 //!
 //! [`SensingQuery`] can express exactly what this slice implements: one
-//! capability name, and one optional end-to-end latency budget. There is
-//! deliberately no provider selector, tag/group predicate, constraint
-//! map, result mode, disclosure class or audience on it — a
-//! leader-backed provider-free (`AnyAuthorized`) path, cross-organization
-//! sensing and `Granted` discovery are not implemented, so this surface
-//! declines to name them rather than accepting an argument it would
-//! silently ignore. The two forms a caller can still get wrong are
-//! refused loudly: a blank capability name
-//! ([`SensingError::EmptyCapability`]) and a zero budget
-//! ([`SensingError::UnsatisfiableBudget`]).
+//! capability name, one provider-start bound, and one optional
+//! end-to-end budget. There is deliberately no provider selector,
+//! tag/group predicate, constraint map, result mode, disclosure class or
+//! audience on it — a leader-backed provider-free (`AnyAuthorized`)
+//! path, cross-organization sensing, `Granted` discovery and warmed
+//! pools are not implemented, so this surface declines to name them
+//! rather than accepting an argument it would silently ignore. Canonical
+//! constraints are fixed EMPTY for the same reason: a constraint map is
+//! provider-evaluated and digest-bound, and nothing here can honestly
+//! populate one yet. The forms a caller can still get wrong are refused
+//! loudly: a blank capability name
+//! ([`SensingError::EmptyCapability`]), a zero end-to-end budget
+//! ([`SensingError::UnsatisfiableBudget`]) and a zero provider-start
+//! bound ([`SensingError::UnsatisfiableStartBound`]).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use net::adapter::net::behavior::org_grant::CapabilityAuthorityId;
+use net::adapter::net::behavior::org_sensing_demand;
 use net::adapter::net::behavior::org_sensing_demand::{
     OrgSensedProjection, OrgSensingCapabilityDemand, OrgSensingDemandRefused, OrgSensingFamily,
 };
@@ -132,7 +190,20 @@ pub use net::adapter::net::behavior::org_sensing_demand::MAX_SENSED_POPULATION;
 /// watcher pace another's node-shared demand.
 pub const POPULATION_RECONCILE_FLOOR: Duration = Duration::from_secs(1);
 
-/// One bounded readiness question.
+/// One bounded readiness question, with BOTH of its bounds explicit.
+///
+/// The two are different questions, asked of different parties, and the
+/// module docs' "can this provider satisfy Y inside my budget" is only
+/// answerable because both are here:
+///
+/// * [`Self::start_within`] is the PROVIDER-EVALUATED predicate. It is
+///   part of the signed interest, reaches the provider's evaluator as
+///   `EvaluationRequest::work_latency`, and a provider that cannot start
+///   inside it legitimately attests `NotReady`. No local budget can undo
+///   that answer, because it is an answer to this bound;
+/// * [`Self::within`] is the CONSUMER-local end-to-end budget. It never
+///   rides the wire and is applied to this node's own route economics
+///   plus the provider's signed start estimate.
 ///
 /// Cheap plain data — build it inline at the call site. See the module
 /// docs for what this deliberately cannot express.
@@ -140,10 +211,14 @@ pub const POPULATION_RECONCILE_FLOOR: Duration = Duration::from_secs(1);
 pub struct SensingQuery {
     capability: String,
     budget: sensing::ConsumerLatencyBudget,
+    work_latency: sensing::WorkLatencyEnvelope,
 }
 
 impl SensingQuery {
-    /// Observe readiness for one capability.
+    /// Observe readiness for one capability, asking the DEFAULT
+    /// provider-start predicate ([`DEFAULT_PROVIDER_START_WITHIN`]) —
+    /// the same fixed policy the organization call path's own retained
+    /// demand asks, so a watch and that path share one interest.
     ///
     /// `capability` is the SAME id the provider passes to
     /// [`SensingClient::provide`](super::SensingClient::provide) — the
@@ -153,7 +228,24 @@ impl SensingQuery {
         Self {
             capability: capability.into(),
             budget: sensing::ConsumerLatencyBudget::default(),
+            work_latency: org_sensing_demand::fixed_work_latency(),
         }
+    }
+
+    /// Ask the provider whether it can START the work within `bound`.
+    ///
+    /// This is the predicate the provider actually evaluates and signs,
+    /// so it CHANGES THE QUESTION: two watches asking different bounds
+    /// hold independent interests on the same capability and provider,
+    /// and each provider answers each bound on its own merits. Raise it
+    /// when a provider's honest `NotReady` is only about the default
+    /// two-second bound rather than about your request.
+    ///
+    /// The evaluator sees the bound verbatim in
+    /// `EvaluationRequest::work_latency.provider_start_within`.
+    pub fn start_within(mut self, bound: Duration) -> Self {
+        self.work_latency = sensing::WorkLatencyEnvelope::start_within(bound);
+        self
     }
 
     /// Judge viability against this consumer's own end-to-end bound.
@@ -166,7 +258,9 @@ impl SensingQuery {
     /// change or a fresh beat can make it viable again.
     ///
     /// Left unset, viability asks only whether readiness projects
-    /// `Ready`; no path cost can then disqualify a provider.
+    /// `Ready`; no path cost can then disqualify a provider. It does NOT
+    /// widen the provider-start predicate — use [`Self::start_within`]
+    /// for that.
     pub fn within(mut self, end_to_end: Duration) -> Self {
         self.budget.end_to_end_within = Some(end_to_end);
         self
@@ -182,7 +276,12 @@ impl SensingQuery {
         self.budget.end_to_end_within
     }
 
-    /// Refuse the two shapes a caller can still get wrong.
+    /// The provider-start bound this query asks the provider.
+    pub fn provider_start_within(&self) -> Option<Duration> {
+        self.work_latency.provider_start_within
+    }
+
+    /// Refuse the shapes a caller can still get wrong.
     fn validate(&self) -> Result<(), SensingError> {
         if self.capability.trim().is_empty() {
             return Err(SensingError::EmptyCapability);
@@ -190,9 +289,22 @@ impl SensingQuery {
         if self.budget.end_to_end_within == Some(Duration::ZERO) {
             return Err(SensingError::UnsatisfiableBudget);
         }
+        if self.work_latency.provider_start_within == Some(Duration::ZERO) {
+            return Err(SensingError::UnsatisfiableStartBound);
+        }
         Ok(())
     }
 }
+
+/// The provider-start bound [`SensingQuery::new`] asks: the fixed
+/// internal policy the organization call path's retained demand uses, so
+/// a default watch shares that path's interest instead of forking a
+/// second digest for the same question.
+pub const DEFAULT_PROVIDER_START_WITHIN: Duration =
+    match org_sensing_demand::fixed_work_latency().provider_start_within {
+        Some(bound) => bound,
+        None => Duration::ZERO,
+    };
 
 /// How one provider's readiness relates to THIS request's budget.
 ///
@@ -370,13 +482,20 @@ impl SensingClient {
     ///
     /// Refuses with:
     ///
-    /// - [`SensingError::EmptyCapability`] / [`SensingError::UnsatisfiableBudget`]
-    ///   for a query that cannot mean anything;
-    /// - [`SensingError::NoOrganizationAuthority`] when this node has no
-    ///   live installed organization authority to derive the observation
-    ///   audience from, or its captured view kept moving underneath the
-    ///   attempt. There is no legacy fallback and no caller-supplied
-    ///   audience;
+    /// - [`SensingError::EmptyCapability`],
+    ///   [`SensingError::UnsatisfiableBudget`] or
+    ///   [`SensingError::UnsatisfiableStartBound`] for a query that
+    ///   cannot mean anything;
+    /// - [`SensingError::ObserverNotQualified`] when THIS node is not
+    ///   currently entitled to observe: no installed organization
+    ///   authority, a poisoned or exhausted revocation store, or its own
+    ///   membership certificate expired or revoked below the current
+    ///   floor. Checked before anything is acquired, and re-checked on
+    ///   every [`SensingWatch::snapshot`];
+    /// - [`SensingError::NoOrganizationAuthority`] when the retention
+    ///   itself could not derive an audience — the captured view kept
+    ///   moving underneath the attempt. There is no legacy fallback and
+    ///   no caller-supplied audience;
     /// - [`SensingError::ObservationIdentityUnavailable`] when the node
     ///   can no longer mint a demand-ownership identity;
     /// - [`SensingError::WatchesAtCapacity`] when a watch's own demand
@@ -389,12 +508,28 @@ impl SensingClient {
     /// population floor acquires it once the refusal clears.
     pub fn watch(&self, query: SensingQuery) -> Result<SensingWatch, SensingError> {
         query.validate()?;
-        // SUBSCRIBE FIRST. Everything below can move the generation —
+        let authority = CapabilityAuthorityId::for_tag(query.capability());
+        // QUALIFY THE OBSERVER FIRST. A revoked or expired local
+        // membership must not acquire anything, and must not be told
+        // "no authority installed" when an authority is installed and it
+        // is the caller who no longer qualifies under it.
+        if self
+            .node
+            .org_sensing_current_visibility(&authority)
+            .is_none()
+        {
+            return Err(SensingError::ObserverNotQualified);
+        }
+        // SUBSCRIBE next. Everything below can move the generation —
         // an acquisition registers rows and can admit a beat — and a
         // cursor taken afterwards would start out believing it had seen
         // that movement.
         let changes = self.node.subscribe_sensing_overlay_changes();
-        let family = OrgSensingFamily::mint(&self.node).map_err(retention_refusal)?;
+        // The family is bound to THIS query's provider-start predicate,
+        // so every registration it authors asks the question the caller
+        // actually asked.
+        let family = OrgSensingFamily::mint_asking(&self.node, query.work_latency)
+            .map_err(retention_refusal)?;
         // Establish the demand now, so a refusal is THIS call's error
         // rather than a silently empty snapshot later. The container is
         // re-read per snapshot, so nothing is cached from it here.
@@ -405,7 +540,7 @@ impl SensingClient {
         Ok(SensingWatch {
             node: Arc::clone(&self.node),
             family,
-            authority: CapabilityAuthorityId::for_tag(query.capability()),
+            authority,
             capability: query.capability,
             budget: query.budget,
             changes,
@@ -434,16 +569,32 @@ impl SensingWatch {
     ///    change landing during the capture leaves the cursor unseen and
     ///    the next [`Self::changed`] returns immediately instead of
     ///    parking on a value this capture never saw;
-    /// 2. re-derives the authorized population when it is due (see
+    /// 2. REQUALIFIES the observer and re-derives what is currently
+    ///    visible — this node's own live membership plus verified
+    ///    owner-private discovery, at this instant and independent of
+    ///    any pacing floor;
+    /// 3. re-derives the retained population when that is due (see
     ///    [`POPULATION_RECONCILE_FLOOR`]) or when the installed demand is
     ///    degraded, carrying live holders forward untouched;
-    /// 3. projects the retained population at one captured instant.
+    /// 4. projects the retained population at one captured instant and
+    ///    CLAMPS the result to what step 2 found currently visible.
     ///
-    /// Refuses only with [`SensingError::WatchClosed`], on a watch that
-    /// has been closed. A convergence refused while a demand is already
-    /// installed is NOT an error — the refusal retains nothing and
-    /// releases nothing, so the installed observation keeps serving and
-    /// the next call tries again.
+    /// So a returned row is always both retained and currently visible:
+    /// a provider whose announcement expired, whose certificate clamped
+    /// its lifetime, or whose pin went away is gone from the next
+    /// snapshot immediately, even though its lease release is paced.
+    /// Acquisition of NEW providers stays paced, so the reported set is
+    /// a subset of current visibility, never a superset.
+    ///
+    /// Refuses with [`SensingError::WatchClosed`] on a closed watch, and
+    /// with [`SensingError::ObserverNotQualified`] when this node is no
+    /// longer entitled to observe. The second refusal keeps the watch's
+    /// leases and recovery state intact — a later snapshot succeeds once
+    /// membership is valid again — but it will not present historical
+    /// authorization as a current answer. A convergence refused while a
+    /// qualified demand is already installed is NOT an error: the
+    /// refusal retains nothing and releases nothing, so the installed
+    /// observation keeps serving, clamped to current visibility.
     pub fn snapshot(&mut self) -> Result<SensingSnapshot, SensingError> {
         if self.closed {
             return Err(SensingError::WatchClosed);
@@ -460,9 +611,15 @@ impl SensingWatch {
         if let Some(seam) = self.capture_seam.clone() {
             seam();
         }
+        // Step 2 — the qualification gate, BEFORE any state is read and
+        // independent of the convergence floor.
+        let visible = self
+            .node
+            .org_sensing_current_visibility(&self.authority)
+            .ok_or(SensingError::ObserverNotQualified)?;
         let demand = self.converge()?;
         let projection = demand.project_sensed_order(Instant::now(), &self.budget);
-        Ok(self.assemble(&projection))
+        Ok(self.assemble(&projection, &visible))
     }
 
     /// Park until something that can change the answer moved.
@@ -589,18 +746,21 @@ impl SensingWatch {
         }
     }
 
-    /// Map ONE core projection onto the snapshot's rows.
+    /// Map ONE core projection onto the snapshot's rows, CLAMPED to the
+    /// currently visible population.
     ///
-    /// Adds no ordering structure: the rank order is the projection's
-    /// own `viable` slice, and the per-row class is membership in the
-    /// projection's own buckets. The only thing computed here is this
-    /// consumer's route estimate per row, read off the proximity plane
-    /// the projection itself consulted.
-    fn assemble(&self, projection: &OrgSensedProjection) -> SensingSnapshot {
-        let graph = self.node.proximity_graph();
+    /// Adds no ordering structure and samples no plane: the rank order
+    /// is the projection's own `viable` slice with the same clamp
+    /// applied, the per-row class is membership in the projection's own
+    /// buckets, and every economics value — readiness, provider start,
+    /// route estimate — is the value the projection CLASSIFIED with. A
+    /// second read of the proximity plane here would pair this row's
+    /// viability and rank with an input that never entered them.
+    fn assemble(&self, projection: &OrgSensedProjection, visible: &[u64]) -> SensingSnapshot {
         let providers = projection
             .rows()
             .iter()
+            .filter(|row| visible.contains(&row.provider))
             .map(|row| {
                 let viability = if projection.viable().contains(&row.provider) {
                     SensedViability::Viable
@@ -609,21 +769,54 @@ impl SensingWatch {
                 } else {
                     SensedViability::Potential
                 };
-                let route = sensing::proximity_route_estimate(graph, row.provider);
                 SensedProvider {
                     node_id: row.provider,
                     readiness: row.readiness,
                     viability,
                     estimated_start: row.estimated_start,
-                    route_estimate: (route != sensing::UNKNOWN_ROUTE_ESTIMATE).then_some(route),
+                    // The plane's own "nothing known" answer maps to
+                    // `None`; anything else is what the classification
+                    // charged this row.
+                    route_estimate: (row.route_estimate != sensing::UNKNOWN_ROUTE_ESTIMATE)
+                        .then_some(row.route_estimate),
                 }
             })
             .collect();
         SensingSnapshot {
             capability: self.capability.clone(),
             providers,
-            ranked: projection.viable().to_vec(),
+            ranked: projection
+                .viable()
+                .iter()
+                .copied()
+                .filter(|provider| visible.contains(provider))
+                .collect(),
         }
+    }
+
+    /// Unstable fixtures-only witness seam; not supported API.
+    ///
+    /// The status of the LAST admitted attestation the node holds for
+    /// this watch's own branch toward `provider` — the raw received
+    /// value, before any freshness projection.
+    ///
+    /// It exists to discriminate WHY a projection reads `Unknown`: a
+    /// last admitted status that is still `Ready` means the projection
+    /// aged out (continuity), while a replacement or withdrawal shows up
+    /// here as a new status. A witness cannot rebuild the branch key
+    /// outside — the acquisition canonicalized it — so this reads it
+    /// through the watch's own retained identity.
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn last_attested_status_for_test(&self, provider: u64) -> Option<sensing::AttestedStatus> {
+        let demand = self.family.demand(&self.authority)?;
+        let (_, branch) = demand
+            .retained_branches_for_test()
+            .into_iter()
+            .find(|(retained, _)| *retained == provider)?;
+        self.node
+            .sensing_latest_attestation(&branch)
+            .map(|attestation| attestation.status)
     }
 }
 
@@ -684,20 +877,65 @@ mod tests {
             .expect_err("zero budget");
         assert_eq!(zero, SensingError::UnsatisfiableBudget);
         assert!(zero.to_string().contains("budget"));
+
+        let unstartable = SensingQuery::new("gpu.infer")
+            .start_within(Duration::ZERO)
+            .validate()
+            .expect_err("zero start bound");
+        assert_eq!(unstartable, SensingError::UnsatisfiableStartBound);
+        assert!(unstartable.to_string().contains("start"));
     }
 
-    /// The inverse control for the two refusals above: a named
-    /// capability, with and without a real budget, validates.
+    /// The inverse control for the refusals above: a named capability,
+    /// with and without either bound, validates.
     #[test]
-    fn a_named_capability_validates_with_and_without_a_budget() {
+    fn a_named_capability_validates_with_and_without_its_bounds() {
         SensingQuery::new("gpu.infer")
             .validate()
             .expect("unbounded");
-        let bounded = SensingQuery::new("gpu.infer").within(Duration::from_millis(250));
+        let bounded = SensingQuery::new("gpu.infer")
+            .within(Duration::from_millis(250))
+            .start_within(Duration::from_millis(900));
         bounded.validate().expect("bounded");
         assert_eq!(bounded.budget(), Some(Duration::from_millis(250)));
+        assert_eq!(
+            bounded.provider_start_within(),
+            Some(Duration::from_millis(900))
+        );
         assert_eq!(bounded.capability(), "gpu.infer");
         assert_eq!(SensingQuery::new("gpu.infer").budget(), None);
+    }
+
+    /// The two bounds are INDEPENDENT: a consumer budget must not move
+    /// the provider-evaluated predicate, and the default predicate is
+    /// the organization call path's own fixed policy — so a default
+    /// watch shares that path's interest instead of forking a digest.
+    ///
+    /// The blind version of this API is exactly what a caller could not
+    /// see: `within()` alone left every observation asking two seconds.
+    #[test]
+    fn the_consumer_budget_never_moves_the_provider_predicate() {
+        let default = SensingQuery::new("gpu.infer");
+        assert_eq!(
+            default.provider_start_within(),
+            Some(DEFAULT_PROVIDER_START_WITHIN)
+        );
+        assert_eq!(
+            org_sensing_demand::fixed_work_latency().provider_start_within,
+            Some(DEFAULT_PROVIDER_START_WITHIN),
+            "the default must BE the fixed policy, not a copy of its value"
+        );
+
+        let budgeted = SensingQuery::new("gpu.infer").within(Duration::from_secs(100));
+        assert_eq!(
+            budgeted.provider_start_within(),
+            Some(DEFAULT_PROVIDER_START_WITHIN),
+            "a local budget is not a provider predicate"
+        );
+
+        let asked = SensingQuery::new("gpu.infer").start_within(Duration::from_secs(5));
+        assert_eq!(asked.provider_start_within(), Some(Duration::from_secs(5)));
+        assert_eq!(asked.budget(), None, "asking the provider is not a budget");
     }
 
     /// Every retention refusal maps onto a DISTINCT typed refusal — a

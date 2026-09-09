@@ -15907,6 +15907,54 @@ impl MeshNode {
         }
     }
 
+    /// The CURRENTLY qualified exact-provider visibility for one owner-scoped
+    /// capability, re-derived at this instant — the read-side counterpart of
+    /// the retention transaction's own derivation.
+    ///
+    /// `Some(population)` ONLY when all of the following hold right now:
+    ///
+    /// * an organization authority is installed and its store is neither
+    ///   poisoned nor generation-exhausted;
+    /// * THIS node's own membership certificate self-verifies — binding,
+    ///   wall-clock validity, and its generation at or above the CURRENT
+    ///   revocation floor (the same live-membership capture the registration
+    ///   path uses). A
+    ///   stamp being unchanged is publication identity, not live membership,
+    ///   so a consumer revoked below its own floor answers `None` here even
+    ///   though its retained leases are untouched;
+    /// * the qualifying view did not move while the population was derived.
+    ///
+    /// The population itself is the authorized-population derivation the
+    /// retention transaction uses,
+    /// so an announcement that expired, was clamped by its provider
+    /// certificate, fell below the provider's revocation floor, or lost its
+    /// pin is already absent — with no dependence on any caller's
+    /// reconciliation cadence.
+    ///
+    /// This qualifies what a caller may DISCLOSE as currently authorized. It
+    /// acquires no lease, releases none, and confers no invocation authority.
+    pub fn org_sensing_current_visibility(
+        &self,
+        capability: &super::behavior::org_grant::CapabilityAuthorityId,
+    ) -> Option<Vec<u64>> {
+        // Two attempts, then refuse — the same bound the retention transaction
+        // uses, and for the same reason: a view republished continuously must
+        // not spin, and a population must never be reported under a view that
+        // stopped qualifying it.
+        for _ in 0..2 {
+            let snapshot = self.capture_sensing_authority_snapshot().ok()?;
+            let org = snapshot.authority_view().owner_org;
+            // LIVE local membership, not merely an installed object.
+            self.capture_live_org_relay_membership(org, super::behavior::org::current_timestamp())
+                .ok()?;
+            let population = self.org_sensing_authorized_population(capability);
+            if self.sensing_authority_snapshot_current(&snapshot) {
+                return Some(population);
+            }
+        }
+        None
+    }
+
     /// The AUTHORIZED sensing population for one owner-scoped capability: the
     /// node ids of providers this node has verified private discovery for.
     ///

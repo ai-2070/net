@@ -159,7 +159,7 @@ pub mod consumer;
 /// and reuse contract.
 pub use consumer::{
     ProjectedReadiness, SensedProvider, SensedViability, SensingQuery, SensingSnapshot,
-    SensingWatch, MAX_SENSED_POPULATION, POPULATION_RECONCILE_FLOOR,
+    SensingWatch, DEFAULT_PROVIDER_START_WITHIN, MAX_SENSED_POPULATION, POPULATION_RECONCILE_FLOOR,
 };
 
 /// The provider-side evaluator contract. A capability integration
@@ -281,11 +281,41 @@ pub enum SensingError {
     )]
     NoOrganizationAuthority,
 
-    /// This watch's demand root already holds as many capabilities as
-    /// core retains per owner. Nothing is evicted to make room.
+    /// THIS node is not currently entitled to observe: no organization
+    /// authority is installed, its revocation store is poisoned or
+    /// generation-exhausted, or this node's OWN membership certificate
+    /// has expired or been revoked below the current floor.
+    ///
+    /// A watch keeps its leases and its recovery state across this
+    /// refusal — what it will not do is answer a new read with
+    /// authorization it no longer holds.
     #[error(
-        "this observation already retains the maximum number of capabilities — \
-         close a watch before opening another"
+        "this node is not currently entitled to observe capability readiness — \
+         its own organization membership is absent, expired, revoked below the \
+         current floor, or its authority view is unreadable; snapshots resume \
+         once membership is valid again"
+    )]
+    ObserverNotQualified,
+
+    /// A zero provider-start bound. No provider can attest that it will
+    /// start within no time at all, so every observation would be
+    /// `NotReady`.
+    #[error(
+        "a zero provider-start bound can never be satisfied — \
+         pass the real bound to SensingQuery::start_within"
+    )]
+    UnsatisfiableStartBound,
+
+    /// One observation root already retains as many capabilities as the
+    /// core keeps per owner.
+    ///
+    /// Not a public watch-count bound: every watch mints its own root
+    /// and retains exactly one capability, so a well-formed caller does
+    /// not reach this. It is mapped rather than swallowed because the
+    /// core bound is real and a silent refusal would be worse.
+    #[error(
+        "this observation root already retains the maximum number of \
+         capabilities — the node's observation state is exhausted"
     )]
     WatchesAtCapacity,
 
@@ -691,10 +721,17 @@ mod tests {
             include_str!("sensing.rs"),
             include_str!("sensing/consumer.rs"),
         ];
-        // WHOLE `pub use` statements (they span lines) plus public fn
-        // signatures — so prose and doc links that legitimately NAME a
-        // deferred concept do not trip the guard, and a name hidden on a
-        // re-export's continuation line cannot slip past it either.
+        // WHOLE declarations, not first lines: every `pub use` statement
+        // up to its `;`, and every public function signature — `pub fn`,
+        // `pub async fn`, `pub const fn` — from its keyword to the `{`
+        // or `;` that ends the signature. Prose and doc links that
+        // legitimately NAME a deferred concept do not trip the guard,
+        // while a type hidden on a continuation line, on an `async`
+        // signature, or on a public constant cannot slip past it.
+        //
+        // The earlier revision scanned only the FIRST line starting
+        // `pub fn`, so `pub async fn changed()` — a shipped method — and
+        // any wrapped parameter or return type were invisible to it.
         let mut declarations = String::new();
         for source in sources {
             for after in source.split("pub use ").skip(1) {
@@ -702,9 +739,15 @@ mod tests {
                 declarations.push_str(statement);
                 declarations.push('\n');
             }
-            for line in source.lines().map(str::trim) {
-                if line.starts_with("pub fn ") {
-                    declarations.push_str(line);
+            for keyword in ["pub fn ", "pub async fn ", "pub const fn ", "pub const "] {
+                for after in source.split(keyword).skip(1) {
+                    let end = after
+                        .find('{')
+                        .into_iter()
+                        .chain(after.find(';'))
+                        .min()
+                        .unwrap_or(after.len());
+                    declarations.push_str(&after[..end]);
                     declarations.push('\n');
                 }
             }
@@ -766,6 +809,29 @@ mod tests {
             assert!(
                 declarations.contains(required),
                 "the contract item `{required}` is missing from the surface",
+            );
+        }
+
+        // ...and the CONSUMER docs must disclose the two facts a caller
+        // cannot otherwise see: which bound the provider actually
+        // evaluates, and that every read requalifies and clamps.
+        let consumer_doc: String = sources[1]
+            .lines()
+            .take_while(|line| line.starts_with("//!") || line.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for disclosed in [
+            "PROVIDER-EVALUATED predicate",
+            "SensingQuery::start_within",
+            "ObserverNotQualified",
+            "CLAMPED",
+            "subset of\n//!   current visibility",
+        ] {
+            assert!(
+                consumer_doc.contains(disclosed),
+                "the consumer docs must disclose `{disclosed}` — the request's \
+                 provider-evaluated bound and the per-read requalification are \
+                 not inferable from the signatures",
             );
         }
 

@@ -199,6 +199,15 @@ pub struct OrgSensedRow {
     /// alongside evidence that no longer vouches would hand a caller stale
     /// metadata dressed as current.
     pub estimated_start: Option<Duration>,
+    /// The consumer-local route estimate THIS projection classified and ranked
+    /// with — the exact value the proximity pass sampled, not a later read.
+    ///
+    /// Carried rather than resampled because the proximity plane has its own
+    /// independent writers: a caller that read it again after the projection
+    /// could pair this row's viability and rank with an economics value that
+    /// never entered them, and report a `Viable` row whose own displayed
+    /// numbers exceed the budget it was judged against.
+    pub route_estimate: Duration,
 }
 
 /// ONE request-relative sensed projection over one capability's authorized
@@ -543,12 +552,16 @@ impl OrgSensingCapabilityDemand {
             delta.viable.len() + delta.potential.len() + delta.non_viable.len(),
         );
         OrgSensedProjection {
-            rows: rows
-                .into_iter()
-                .map(|(provider, readiness, estimated_start)| OrgSensedRow {
-                    provider,
-                    readiness,
-                    estimated_start,
+            // Built from the VIEWS the classifier consumed, not from a second
+            // pass over the plane: the row's economics and its bucket are then
+            // the same observation by construction.
+            rows: views
+                .iter()
+                .map(|view| OrgSensedRow {
+                    provider: view.provider,
+                    readiness: view.projection,
+                    estimated_start: view.estimated_start,
+                    route_estimate: view.route_estimate,
                 })
                 .collect(),
             viable: delta.viable,
@@ -568,6 +581,37 @@ impl OrgSensingCapabilityDemand {
             release_retained(&self.node, retained);
         }
     }
+}
+
+/// THE canonical exact-provider interest one retained demand registers.
+///
+/// One function, so the acquisition, the observation identity it derives, and
+/// any witness that has to name the same interest cannot drift into three
+/// resemblances of one digest. Everything except the capability, the audience,
+/// the provider and the provider-start predicate is fixed internal policy:
+/// empty canonical constraints, `Node(provider)` exactly, `ResultMode::Any`,
+/// and `DisclosureClass::Owner`.
+pub fn exact_provider_spec(
+    tag: &str,
+    audience: sensing::AudienceScopeCommitment,
+    work_latency: sensing::WorkLatencyEnvelope,
+    provider: u64,
+) -> sensing::InterestSpec {
+    sensing::InterestSpec {
+        capability_id: sensing::CapabilityId::new(tag),
+        constraints: sensing::CanonicalConstraints::default(),
+        work_latency,
+        providers: sensing::ProviderSelector::Node(provider),
+        result_mode: sensing::ResultMode::Any,
+        disclosure_class: sensing::DisclosureClass::Owner,
+        audience,
+    }
+}
+
+/// The FIXED internal provider-start predicate, for callers that must name the
+/// policy default rather than restate its value.
+pub const fn fixed_work_latency() -> sensing::WorkLatencyEnvelope {
+    SENSING_WORK_LATENCY
 }
 
 /// Release ONE retained provider and settle its refresh record.
@@ -628,6 +672,13 @@ struct OrgSensingFamilyInner {
     /// THE serializing lock for this family's demand map, and nothing else, so
     /// a reader never blocks behind an emission.
     demand_mu: parking_lot::Mutex<BTreeMap<CapabilityAuthorityId, Arc<OrgSensingCapabilityDemand>>>,
+    /// The PROVIDER-START predicate every registration this family authors
+    /// asks. Bound once at mint, never a per-call argument: the envelope is
+    /// part of the signed interest digest, so two convergences under different
+    /// envelopes would key different leases — and a carried-forward ticket
+    /// (validated on holder identity and audience, not on the digest) would
+    /// then be kept for an interest this family no longer asks.
+    work_latency: sensing::WorkLatencyEnvelope,
 }
 
 impl Drop for OrgSensingFamilyInner {
@@ -661,12 +712,27 @@ pub struct OrgSensingFamily {
 }
 
 impl OrgSensingFamily {
-    /// Mint a family BOUND to `node`. Fallible because the routing registry's
-    /// family identity space is bounded and terminal.
+    /// Mint a family BOUND to `node`, asking the FIXED internal
+    /// provider-start predicate (design D7.5) — the OLB policy, unchanged.
     ///
     /// The bound node is the only node this family will ever touch. There is
     /// deliberately no way to re-point it: see the module's node-binding note.
     pub fn mint(node: &Arc<MeshNode>) -> Result<Self, OrgSensingDemandRefused> {
+        Self::mint_asking(node, SENSING_WORK_LATENCY)
+    }
+
+    /// [`Self::mint`] against an EXPLICIT provider-start predicate.
+    ///
+    /// The envelope is a real question put to the provider's evaluator
+    /// (`EvaluationRequest::work_latency`), not a cadence or a local filter, so
+    /// a caller that means "can you start within X" must say X here rather than
+    /// hope a local budget rewrites the fixed one. It is digest-bound: two
+    /// families asking different envelopes hold independent leases on the same
+    /// capability and provider, which is correct — they are different questions.
+    pub fn mint_asking(
+        node: &Arc<MeshNode>,
+        work_latency: sensing::WorkLatencyEnvelope,
+    ) -> Result<Self, OrgSensingDemandRefused> {
         let family = node
             .org_routing_family()
             .map_err(|_| OrgSensingDemandRefused::FamilyUnavailable)?;
@@ -674,10 +740,16 @@ impl OrgSensingFamily {
             inner: Arc::new(OrgSensingFamilyInner {
                 node: Arc::clone(node),
                 _family: family,
+                work_latency,
                 txn_mu: parking_lot::Mutex::new(()),
                 demand_mu: parking_lot::Mutex::new(BTreeMap::new()),
             }),
         })
+    }
+
+    /// The provider-start predicate this family asks.
+    pub fn work_latency(&self) -> sensing::WorkLatencyEnvelope {
+        self.inner.work_latency
     }
 
     /// The node this family is bound to.
@@ -933,7 +1005,9 @@ impl OrgSensingFamily {
             if already.contains(provider) {
                 continue;
             }
-            if let Some(fresh) = Self::acquire_provider(node, tag, audience, *provider) {
+            if let Some(fresh) =
+                Self::acquire_provider(node, tag, audience, self.inner.work_latency, *provider)
+            {
                 retained.push(fresh);
             }
         }
@@ -992,17 +1066,10 @@ impl OrgSensingFamily {
         node: &Arc<MeshNode>,
         tag: &str,
         audience: sensing::AudienceScopeCommitment,
+        work_latency: sensing::WorkLatencyEnvelope,
         provider: u64,
     ) -> Option<RetainedProvider> {
-        let spec = sensing::InterestSpec {
-            capability_id: sensing::CapabilityId::new(tag),
-            constraints: sensing::CanonicalConstraints::default(),
-            work_latency: SENSING_WORK_LATENCY,
-            providers: sensing::ProviderSelector::Node(provider),
-            result_mode: sensing::ResultMode::Any,
-            disclosure_class: sensing::DisclosureClass::Owner,
-            audience,
-        };
+        let spec = exact_provider_spec(tag, audience, work_latency, provider);
         // Clamp the fixed cadence to the node's own soft-state horizon: the
         // acquisition path refuses an interval wider than the ttl outright, so
         // an unclamped constant would make retained demand impossible on a node
