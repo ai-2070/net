@@ -7255,6 +7255,25 @@ pub(crate) enum SensingArmProvenance {
     /// This arm follows a COALESCING acquisition: the installation already
     /// existed and nothing was re-registered, so its age is unknown here.
     Adopted,
+    /// This arm follows a renewal ATTEMPT that changed nothing on the wire —
+    /// refused, or unauthorable under current organization authority.
+    ///
+    /// Distinct from both siblings. `Established` is wrong because nothing was
+    /// registered: the row's last registration is already one period old when
+    /// this arm runs, and `sensing_refresh_period` is `ttl/2`, so `now +
+    /// period` lands exactly on the provider's soft-state expiry with zero
+    /// margin — one refused renewal during an authority rotation was enough to
+    /// lose the interest before the retry arrived.
+    ///
+    /// `Adopted` is wrong too, and worse: it grounds the deadline at `now`, and
+    /// because the worker REMOVES a record before firing it, the re-arm is
+    /// immediately due again. A persistent authority outage would turn the
+    /// node's single refresh worker into a spin loop that never parks.
+    ///
+    /// So the deadline is grounded at HALF the remaining life instead: soon
+    /// enough to retry with real margin before expiry, far enough out that a
+    /// standing refusal still parks between attempts.
+    Unrenewed,
 }
 
 /// What an admission into the refused-release ledger resolved to.
@@ -14823,6 +14842,13 @@ impl MeshNode {
         //   the row turns out to be fresh after all.
         let deadline = match provenance {
             SensingArmProvenance::Established => now + period,
+            // The row was registered one period ago and expires one period from
+            // now (`period` is `ttl/2`). Retry at the midpoint of what is left,
+            // floored so a nanosecond-scale horizon cannot make the schedule
+            // continuously due.
+            SensingArmProvenance::Unrenewed => {
+                now + (period / 2).max(MIN_SENSING_REFRESH_PERIOD)
+            }
             SensingArmProvenance::Adopted => {
                 if schedule
                     .armed
@@ -15282,28 +15308,45 @@ impl MeshNode {
                     // OFF the schedule lock: the effect takes sensing locks and
                     // may emit.
                     let outcome = live.refresh_sensing_interest_lease(&key, record.installation_id);
-                    if matches!(
-                        outcome,
-                        SensingRefreshOutcome::Renewed
-                            | SensingRefreshOutcome::Refused
-                            | SensingRefreshOutcome::AuthorityUnavailable
-                    ) {
-                        // A live installation for this identity still exists, so
-                        // keep the cadence — an authority outage must not
-                        // permanently stop refresh once authority returns.
-                        // `Absent`/`Superseded` deliberately do NOT re-arm: the
-                        // demand is retired or replaced, and re-arming either
-                        // would be exactly the resurrection this refuses. The
-                        // arm itself refuses to overwrite a successor's record.
-                        //
-                        // `Established`: this arm follows the renewal attempt
-                        // itself, so a full period is the grounded deadline.
+                    // A live installation for this identity still exists, so
+                    // keep the cadence — an authority outage must not
+                    // permanently stop refresh once authority returns.
+                    // `Absent`/`Superseded` deliberately do NOT re-arm: the
+                    // demand is retired or replaced, and re-arming either would
+                    // be exactly the resurrection this refuses. The arm itself
+                    // refuses to overwrite a successor's record.
+                    //
+                    // The PROVENANCE is what this attempt actually did to the
+                    // wire, not the fact that an attempt happened:
+                    //
+                    // * `Renewed` re-registered the row here and now, so a full
+                    //   period from now is the grounded deadline;
+                    // * `Refused`/`AuthorityUnavailable` registered NOTHING —
+                    //   both return before any egress is authored, so the row's
+                    //   last wire registration is already one period old.
+                    //   Grounding the retry at `now + period` puts it a further
+                    //   period out, and `sensing_refresh_period` is `ttl/2`, so
+                    //   the next attempt lands exactly at the provider's
+                    //   soft-state expiry with zero margin — one refused renewal
+                    //   during an authority rotation was enough for the
+                    //   provider's sweep to drop the interest before the retry
+                    //   arrived. `Unrenewed` grounds the deadline against the
+                    //   row's remaining life instead.
+                    let rearm = match outcome {
+                        SensingRefreshOutcome::Renewed => Some(SensingArmProvenance::Established),
+                        SensingRefreshOutcome::Refused
+                        | SensingRefreshOutcome::AuthorityUnavailable => {
+                            Some(SensingArmProvenance::Unrenewed)
+                        }
+                        SensingRefreshOutcome::Absent | SensingRefreshOutcome::Superseded => None,
+                    };
+                    if let Some(provenance) = rearm {
                         MeshNode::arm_sensing_refresh(
                             &live,
                             key,
                             record.installation_id,
                             record.period,
-                            SensingArmProvenance::Established,
+                            provenance,
                         );
                     }
                     // COOPERATIVE PROGRESS. `Fire` reaches no other await, so a
