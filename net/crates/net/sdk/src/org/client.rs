@@ -15,6 +15,10 @@ use std::time::{Duration, Instant};
 
 #[cfg(feature = "cortex")]
 use net::adapter::net::behavior::org_cold_plan::OrgColdAuthority;
+// Every use sits inside a `cortex` item - the convergence schedule and the
+// fixtures-only sensing observables - so the import has to carry the same gate
+// or a `net`-without-`cortex` build trips `-D unused-imports`.
+#[cfg(feature = "cortex")]
 use net::adapter::net::behavior::org_grant::CapabilityAuthorityId;
 #[cfg(feature = "cortex")]
 use net::adapter::net::behavior::org_sensing_demand::{OrgSensingFamily, MAX_SENSED_POPULATION};
