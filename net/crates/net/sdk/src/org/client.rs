@@ -93,17 +93,39 @@ pub(crate) struct ConvergenceSchedule {
     /// cannot both decide to converge one change. Held only across synchronous
     /// work.
     reconcile: parking_lot::Mutex<()>,
-    /// Instrumented builds only. `arrivals` counts callers that reached the
-    /// section's door (so a witness can prove overlap ACTUALLY contended
-    /// rather than merely being spawned), `convergences` counts attempts that
-    /// got past the decision, and `in_section` fires once inside the section
-    /// so a witness can hold it open while the others arrive.
+    /// Instrumented builds only.
+    ///
+    /// * `arrivals` counts callers that reached the section's door;
+    /// * `contended` counts callers that found the section ACTUALLY HELD -
+    ///   `reconcile_lock` tries first and only counts when the try fails, so
+    ///   this is acquisition-time contention, never an inference from elapsed
+    ///   time or from spawning;
+    /// * `convergences` counts attempts that got past the decision;
+    /// * `occupancy`/`peak_occupancy` gauge how many callers are inside the
+    ///   WHOLE transaction at once - entered before the decision and left
+    ///   after the record is committed, with the guard still held. A lock that
+    ///   covered only the observer would leave the real transaction
+    ///   overlapping and show a peak above one;
+    /// * `in_section` fires once inside the section so a witness can hold it
+    ///   open while the others arrive;
+    /// * `last_expectation` is the expectation the most recent attempt
+    ///   ACTUALLY derived, so a witness observes the captured input instead of
+    ///   assuming what a pre-call sample implies. Last-writer-wins: meaningful
+    ///   for a single-caller witness, not for concurrent ones.
     #[cfg(any(test, feature = "fixtures"))]
     arrivals: std::sync::atomic::AtomicU64,
     #[cfg(any(test, feature = "fixtures"))]
+    contended: std::sync::atomic::AtomicU64,
+    #[cfg(any(test, feature = "fixtures"))]
     convergences: std::sync::atomic::AtomicU64,
     #[cfg(any(test, feature = "fixtures"))]
+    occupancy: std::sync::atomic::AtomicU64,
+    #[cfg(any(test, feature = "fixtures"))]
+    peak_occupancy: std::sync::atomic::AtomicU64,
+    #[cfg(any(test, feature = "fixtures"))]
     in_section: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(any(test, feature = "fixtures"))]
+    last_expectation: parking_lot::Mutex<Vec<u64>>,
 }
 
 /// One capability's last convergence attempt.
@@ -326,12 +348,63 @@ impl ConvergenceSchedule {
     #[cfg(not(any(test, feature = "fixtures")))]
     pub(crate) fn fire_in_section(&self) {}
 
-    /// Counters for a witness: `(arrivals, convergences)`.
+    /// Instrumented: one caller found the section ALREADY HELD.
     #[cfg(any(test, feature = "fixtures"))]
-    pub(crate) fn instrumentation(&self) -> (u64, u64) {
+    pub(crate) fn note_contended(&self) {
+        self.contended
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(not(any(test, feature = "fixtures")))]
+    pub(crate) fn note_contended(&self) {}
+
+    /// Enter the transaction's OCCUPANCY span. The returned guard leaves it on
+    /// drop, which - declared after the serializing guard - happens while that
+    /// guard is still held, so the span covers decide, converge and record.
+    pub(crate) fn section_span(&self) -> SectionSpan<'_> {
+        #[cfg(any(test, feature = "fixtures"))]
+        {
+            let inside = self
+                .occupancy
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            self.peak_occupancy
+                .fetch_max(inside, std::sync::atomic::Ordering::SeqCst);
+        }
+        SectionSpan { schedule: self }
+    }
+
+    #[cfg(any(test, feature = "fixtures"))]
+    fn leave_section(&self) {
+        self.occupancy
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Instrumented: the expectation this attempt actually derived.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub(crate) fn note_expectation(&self, expected: &[u64]) {
+        *self.last_expectation.lock() = expected.to_vec();
+    }
+
+    #[cfg(not(any(test, feature = "fixtures")))]
+    pub(crate) fn note_expectation(&self, _expected: &[u64]) {}
+
+    /// The expectation the most recent attempt derived.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub(crate) fn last_expectation(&self) -> Vec<u64> {
+        self.last_expectation.lock().clone()
+    }
+
+    /// Counters for a witness:
+    /// `(arrivals, contended, convergences, peak_occupancy)`.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub(crate) fn instrumentation(&self) -> (u64, u64, u64, u64) {
         (
             self.arrivals.load(std::sync::atomic::Ordering::SeqCst),
+            self.contended.load(std::sync::atomic::Ordering::SeqCst),
             self.convergences.load(std::sync::atomic::Ordering::SeqCst),
+            self.peak_occupancy
+                .load(std::sync::atomic::Ordering::SeqCst),
         )
     }
 
@@ -399,8 +472,46 @@ impl OrgSensingAcquisition {
     }
 
     /// Take the reconciliation section for this binding.
+    ///
+    /// Try first, then block. The fast path is what `lock` would have done
+    /// anyway, and the slow path is the only place a caller can HONESTLY be
+    /// said to have contended: it found the section held by somebody else. In
+    /// production both arms are the same acquisition - `note_contended`
+    /// compiles away.
     pub(crate) fn reconcile_lock(&self) -> parking_lot::MutexGuard<'_, ()> {
-        self.schedule.reconcile.lock()
+        match self.schedule.reconcile.try_lock() {
+            Some(guard) => guard,
+            None => {
+                self.schedule.note_contended();
+                self.schedule.reconcile.lock()
+            }
+        }
+    }
+}
+
+/// The reconciliation transaction's occupancy span (instrumented builds
+/// measure it; production compiles it away).
+///
+/// Created immediately after the serializing guard and dropped at the end of
+/// the block — and because locals drop in reverse declaration order, that drop
+/// runs while the guard is still held. So the span brackets the DECISION, the
+/// convergence and the record, not just the observer hook: a lock narrowed to
+/// the hook alone would let a second caller enter the span while the first is
+/// still committing, and the peak would exceed one.
+#[cfg(feature = "cortex")]
+pub(crate) struct SectionSpan<'a> {
+    #[cfg_attr(
+        not(any(test, feature = "fixtures")),
+        allow(dead_code, reason = "the span is an instrumented-build gauge")
+    )]
+    schedule: &'a ConvergenceSchedule,
+}
+
+#[cfg(feature = "cortex")]
+impl Drop for SectionSpan<'_> {
+    fn drop(&mut self) {
+        #[cfg(any(test, feature = "fixtures"))]
+        self.schedule.leave_section();
     }
 }
 
@@ -550,18 +661,35 @@ impl OrgClient {
         Some(released)
     }
 
-    /// `(arrivals, convergences)` at this binding's reconciliation section.
+    /// `(arrivals, contended, convergences, peak_occupancy)` at this binding's
+    /// reconciliation section.
     ///
-    /// Arrivals are counted at the door, before the lock, so a witness can
-    /// establish that concurrent callers actually CONTENDED; convergences
-    /// count the attempts that got past the decision. One change under real
-    /// contention must produce many arrivals and exactly one convergence.
+    /// Arrivals are counted at the door; `contended` counts the callers whose
+    /// acquisition actually found the section held, which is what establishes
+    /// overlap without appealing to elapsed time; convergences count the
+    /// attempts that got past the decision; and the peak occupancy is the most
+    /// callers ever simultaneously inside the whole decide → converge → record
+    /// transaction. One change under real contention must produce many
+    /// arrivals, real contention, exactly one convergence, and a peak of one.
     #[cfg(all(feature = "cortex", any(test, feature = "fixtures")))]
     #[doc(hidden)]
-    pub fn sensing_section_counters(&self) -> Option<(u64, u64)> {
+    pub fn sensing_section_counters(&self) -> Option<(u64, u64, u64, u64)> {
         self._sensing
             .acquisition()
             .map(|acquisition| acquisition.schedule().instrumentation())
+    }
+
+    /// The expectation this binding's most recent attempt ACTUALLY derived.
+    ///
+    /// The sensed expectation is computed inside the call path from that
+    /// call's own capture, so a witness that sampled discovery beforehand is
+    /// asserting about a different observation. This reports the real one.
+    #[cfg(all(feature = "cortex", any(test, feature = "fixtures")))]
+    #[doc(hidden)]
+    pub fn sensing_last_expectation(&self) -> Option<Vec<u64>> {
+        self._sensing
+            .acquisition()
+            .map(|acquisition| acquisition.schedule().last_expectation())
     }
 
     /// Install a hook that fires INSIDE this binding's reconciliation section,

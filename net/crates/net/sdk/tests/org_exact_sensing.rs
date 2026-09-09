@@ -693,14 +693,25 @@ async fn the_production_call_follows_the_sensed_rank_between_viable_providers() 
 ///
 /// Ignoring `deadline_ms` in the planning input would leave all three calls
 /// identical, which is exactly what this discriminates.
+///
+/// The deadline is TWO things at once — the planning budget and the call's own
+/// wall clock — so the fixture separates them by scale rather than by shaving
+/// the margin: the estimates are tens of seconds and the budget is seconds, so
+/// "below every estimate" holds by a factor of four while the RPC itself has
+/// seconds of headroom. A budget just under the estimates made the loopback
+/// round trip race its own deadline, which is a runner-load failure and not
+/// the ordering property (exact-head CI, `Rpc(Timeout { elapsed_ms: 147 })`
+/// against a 150 ms deadline). Nothing about the rule under test moves: the
+/// unbounded calls still rank by estimate, and the bounded one still finds
+/// every provider over budget.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_deadline_below_every_estimate_falls_back_to_the_deterministic_order() {
     let cell = Cell::stand_up(
         "budget",
         true,
         &[
-            (true, Duration::from_millis(400)),
-            (true, Duration::from_millis(300)),
+            (true, Duration::from_secs(40)),
+            (true, Duration::from_secs(30)),
         ],
     )
     .await;
@@ -708,9 +719,10 @@ async fn a_deadline_below_every_estimate_falls_back_to_the_deterministic_order()
     // Unbounded: both viable, the cheaper one leading.
     cell.await_projection(&[cell.id(1), cell.id(0)], &[]).await;
 
-    // The same evidence under a 150 ms budget: nothing viable, nothing pruned.
+    // The same evidence under a budget below both estimates: nothing viable,
+    // nothing pruned.
     let bounded = ConsumerLatencyBudget {
-        end_to_end_within: Some(Duration::from_millis(150)),
+        end_to_end_within: Some(Duration::from_secs(10)),
     };
     let projection = cell
         .client
@@ -732,9 +744,12 @@ async fn a_deadline_below_every_estimate_falls_back_to_the_deterministic_order()
 
     // 2. A deadline below every estimate: the deterministic order returns,
     //    through the shipped execution-control seam, with no invented error.
+    //    Ten seconds is a quarter of the cheapest estimate and orders of
+    //    magnitude above a loopback round trip, so only the ORDER can decide
+    //    this.
     let before = (cell.served(0), cell.served(1));
     assert_eq!(
-        cell.call_with_deadline(150).await,
+        cell.call_with_deadline(10_000).await,
         cell.names[0],
         "the call's own deadline is the budget: an over-budget order falls back"
     );
@@ -1091,34 +1106,38 @@ async fn a_holder_that_dies_after_convergence_is_reacquired() {
     cell.cleanup();
 }
 
-/// Concurrent clones that ACTUALLY contend for the reconciliation section
-/// produce exactly ONE convergence — and never occupy the section together.
+/// Concurrent clones that ACTUALLY contend for the reconciliation transaction
+/// produce exactly ONE convergence — and never occupy that transaction
+/// together.
 ///
-/// Spawning is not overlap, and final row cardinality is not convergence
-/// multiplicity: core serializes its own ticket transaction, so several
-/// redundant convergences would still leave one demand and two rows behind.
+/// Three things this witness deliberately does not rest on:
+///
+/// * **spawning.** Four tasks are not four contenders. Contention is counted
+///   where it actually happens: the section's acquisition tries first and
+///   counts only the callers whose try FAILED because somebody else held it.
+/// * **elapsed time.** The caller inside the section holds it until that
+///   contention count says the others are really blocked on it, not for a
+///   fixed window — a window only establishes that time passed, and callers
+///   spaced further apart than the window would never have overlapped at all.
+/// * **the observer.** The gauge is not the hook. It is entered by the call
+///   path immediately after the serializing guard and left when the whole
+///   transaction ends, with that guard still held, so it brackets the
+///   installed-state read, the decision, `retain` and the record. A lock
+///   narrowed to the hook alone leaves all of that overlapping, and the peak
+///   rises above one even though every hook ran alone.
 ///
 /// Nor is "one caller parked while the others arrive at the door" enough. That
 /// schedule survives an UNSERIALIZED section through a single early winner:
 /// the parked caller sleeps, one other completes the sole convergence, the
-/// rest reuse its record, and the parked one reuses it on waking — four
-/// arrivals, one convergence, nothing detected.
+/// rest reuse its record — four arrivals, one convergence, nothing detected.
+/// So the assertions are ordered by what they can discriminate:
 ///
-/// So this witness measures OCCUPANCY instead. Every caller that enters the
-/// section raises a gauge, waits — bounded — for the gauge to reach the caller
-/// count, and lowers it on the way out. Two things are then asserted, and only
-/// the first of them can discriminate:
-///
-/// * the gauge's high-water mark is 1. A second caller cannot be inside while
-///   the first is still there, so removing the serialization fails this
-///   immediately and by construction — all four are then inside together,
-///   which is exactly what the barrier waits for. It is not a timing accident:
-///   an executed run with the lock removed reports a peak of four every time.
-/// * exactly one caller converges. This is the PROPERTY serialization exists
-///   for, and deliberately not the discriminator: with the lock removed the
-///   same executed run still reported one convergence, because the caller that
-///   released the barrier committed its record before the others resumed —
-///   the reviewer's early-winner schedule, observed rather than argued.
+/// * real contention was acknowledged at acquisition;
+/// * the peak transaction occupancy is 1 — what both the removed lock and the
+///   observer-only lock fail;
+/// * exactly one caller converges. The PROPERTY serialization exists for, and
+///   deliberately not the discriminator: an executed run with the lock removed
+///   still reported one convergence through that early-winner schedule.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn contending_clones_produce_exactly_one_convergence() {
     let cell = Cell::stand_up(
@@ -1131,31 +1150,24 @@ async fn contending_clones_produce_exactly_one_convergence() {
     )
     .await;
     const CALLERS: u64 = 4;
-    // Long enough that four serialized holds still finish quickly, and far
-    // longer than the microseconds an unserialized section needs to put every
-    // caller inside at once.
-    const HOLD: Duration = Duration::from_millis(400);
 
-    let inside = Arc::new(AtomicUsize::new(0));
-    let peak = Arc::new(AtomicUsize::new(0));
+    // The caller inside the section stays there until the others have really
+    // blocked on it. The bound is a safety net for a broken build, not the
+    // mechanism: a run that reaches it fails the contention assertion below.
     {
-        let inside = inside.clone();
-        let peak = peak.clone();
+        let client = cell.client.clone();
         cell.client
             .set_sensing_section_hook_for_test(Some(Arc::new(move || {
-                let occupancy = inside.fetch_add(1, Ordering::SeqCst) + 1;
-                peak.fetch_max(occupancy, Ordering::SeqCst);
-                let deadline = Instant::now() + HOLD;
-                while Instant::now() < deadline {
-                    let now_inside = inside.load(Ordering::SeqCst);
-                    peak.fetch_max(now_inside, Ordering::SeqCst);
-                    if now_inside >= CALLERS as usize {
-                        break; // Everyone is in here together - nothing serialized this.
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    let (_, contended, _, _) = client
+                        .sensing_section_counters()
+                        .expect("an active binding");
+                    if contended >= CALLERS - 1 || Instant::now() >= deadline {
+                        return;
                     }
                     std::thread::sleep(Duration::from_millis(5));
                 }
-                peak.fetch_max(inside.load(Ordering::SeqCst), Ordering::SeqCst);
-                inside.fetch_sub(1, Ordering::SeqCst);
             })));
     }
 
@@ -1175,7 +1187,7 @@ async fn contending_clones_produce_exactly_one_convergence() {
     }
     cell.client.set_sensing_section_hook_for_test(None);
 
-    let (arrivals, convergences) = cell
+    let (arrivals, contended, convergences, peak) = cell
         .client
         .sensing_section_counters()
         .expect("an active binding");
@@ -1183,10 +1195,14 @@ async fn contending_clones_produce_exactly_one_convergence() {
         arrivals >= CALLERS,
         "precondition: every caller reached the section door, saw {arrivals}"
     );
+    assert!(
+        contended >= CALLERS - 1,
+        "the callers must have found the section HELD - acquisition-time \
+         contention, not elapsed time - saw {contended}"
+    );
     assert_eq!(
-        peak.load(Ordering::SeqCst),
-        1,
-        "two callers were inside the reconciliation section at once"
+        peak, 1,
+        "two callers were inside the decide/converge/record transaction at once"
     );
     assert_eq!(
         convergences, 1,
@@ -1571,31 +1587,59 @@ async fn a_missing_canonical_member_is_recovered_under_an_unchanged_expectation(
     }
     let lowest = lowest.expect("a provider below every other id");
     let lowest_id = lowest.entity_id().node_id();
-    // Its row expires two seconds out; every other row outlives the witness.
-    discover_synthetic_at(&cell.consumer, &org(), &lowest, 1, unix_now() + 2);
+    // Every row, including this one, outlives the witness: the expiry that
+    // matters happens INSIDE the attempt, below, so the first capture cannot
+    // race it.
+    discover_synthetic_at(&cell.consumer, &org(), &lowest, 1, unix_now() + 3600);
     until("the crowd was never discovered", SETTLE, || {
         let seen = population(&cell.consumer);
         seen.len() > MAX_SENSED_POPULATION && seen.contains(&lowest_id)
     })
     .await;
-    let expectation = population(&cell.consumer);
-    assert_eq!(
-        expectation.first(),
-        Some(&lowest_id),
-        "precondition: the ephemeral provider leads the canonical prefix"
-    );
 
-    // Hold ONE attempt open across that expiry: core's query no longer sees
-    // the lowest provider, so it publishes a full-sized population that is a
-    // strict subset of the expectation.
+    // Hold ONE attempt open and RETIRE the lowest provider from inside it, at
+    // a later sequence with an expiry already in the past. The caller's
+    // capture is complete before the hook fires and core's query happens after
+    // it returns, so the disappearance is strictly between them - by
+    // construction, not by out-racing a pre-call sample.
     let fired = Arc::new(AtomicUsize::new(0));
     {
         let fired = fired.clone();
+        let consumer_node = Arc::clone(&cell.consumer.node);
+        let owner = org();
+        let lowest_key = lowest.clone();
         cell.client
             .set_sensing_section_hook_for_test(Some(Arc::new(move || {
-                if fired.fetch_add(1, Ordering::SeqCst) == 0 {
-                    std::thread::sleep(Duration::from_millis(2500));
+                if fired.fetch_add(1, Ordering::SeqCst) > 0 {
+                    return;
                 }
+                let authority = consumer_node.node_authority().expect("authority");
+                let cert = OrgMembershipCert::try_issue(
+                    &owner,
+                    lowest_key.entity_id().clone(),
+                    1,
+                    3600,
+                )
+                .expect("membership");
+                let descriptor = CapabilitySet::new().add_tag(TAG).to_bytes_compact();
+                let envelope = net::adapter::net::behavior::org_scoped_ann::ScopedCapabilityAnnouncement::build_owner(
+                    &lowest_key,
+                    owner.org_id(),
+                    cert,
+                    authority.audience.audience_handle,
+                    authority.audience.discovery_key(),
+                    2,
+                    unix_now() + 1,
+                    &descriptor,
+                )
+                .expect("owner envelope");
+                consumer_node.ingest_scoped_announcement_for_test(&envelope.to_bytes());
+                // Replaced at a later sequence with a one-second life, then
+                // slept well past it - the whole-second granularity of an
+                // announcement's expiry is why the wait is not tight. The row
+                // is gone by the time core queries, and the caller's capture -
+                // already taken - still contains it.
+                std::thread::sleep(Duration::from_millis(2500));
             })));
     }
     let _armed = cell.try_call().await;
@@ -1604,6 +1648,24 @@ async fn a_missing_canonical_member_is_recovered_under_an_unchanged_expectation(
         fired.load(Ordering::SeqCst),
         1,
         "the section hook must have held one attempt open"
+    );
+
+    // The expectation that attempt ACTUALLY derived - read from the call path,
+    // not sampled beside it - and it contains the provider core then failed to
+    // publish. That is the whole shape this witness exists for.
+    let first_expectation = cell
+        .client
+        .sensing_last_expectation()
+        .expect("an active binding");
+    assert!(
+        first_expectation.contains(&lowest_id),
+        "precondition: the first attempt captured the ephemeral provider: \
+         {first_expectation:?}"
+    );
+    assert_eq!(
+        first_expectation.first(),
+        Some(&lowest_id),
+        "and it leads the canonical prefix that attempt asked for"
     );
     let (published, retained, identity) = demand_state(&cell.client).expect("demand");
     assert_eq!(
@@ -1618,18 +1680,12 @@ async fn a_missing_canonical_member_is_recovered_under_an_unchanged_expectation(
     );
 
     // Restore it BEFORE the next call, at a later sequence, so the next
-    // expectation is the recorded one exactly.
-    discover_synthetic_at(&cell.consumer, &org(), &lowest, 2, unix_now() + 3600);
+    // attempt derives the SAME expectation the first one did.
+    discover_synthetic_at(&cell.consumer, &org(), &lowest, 3, unix_now() + 3600);
     until("the lowest provider was never rediscovered", SETTLE, || {
         population(&cell.consumer).contains(&lowest_id)
     })
     .await;
-    assert_eq!(
-        population(&cell.consumer),
-        expectation,
-        "precondition: the expectation is UNCHANGED - only the published \
-         population disagrees with it"
-    );
 
     // The disagreement must be retried, and the canonical population restored.
     cell.call_until(
@@ -1654,6 +1710,12 @@ async fn a_missing_canonical_member_is_recovered_under_an_unchanged_expectation(
     assert_ne!(
         identity, recovered_identity,
         "and it really re-converged rather than reporting the old demand"
+    );
+    assert_eq!(
+        cell.client.sensing_last_expectation(),
+        Some(first_expectation),
+        "and the attempt that recovered it derived the SAME expectation the \
+         frozen one did - nothing about the caller's inputs changed"
     );
 
     // ...and now that the two sides agree, the cap settles again.
@@ -1784,7 +1846,7 @@ async fn a_same_org_grant_only_provider_is_outside_the_sensing_expectation() {
         "the sensed population is the OWNER plane's"
     );
     assert_eq!(retained, population_now, "with a holder for each");
-    let (_, converged) = client
+    let (_, _, converged, _) = client
         .sensing_section_counters()
         .expect("an active binding");
     assert_eq!(converged, 1, "one convergence for the first call");
@@ -1795,7 +1857,7 @@ async fn a_same_org_grant_only_provider_is_outside_the_sensing_expectation() {
     for _ in 0..3 {
         let _ = client.call::<Ping, Pong>(SERVICE, &Ping { n: 1 }).await;
     }
-    let (_, converged_again) = client
+    let (_, _, converged_again, _) = client
         .sensing_section_counters()
         .expect("an active binding");
     let (_, _, identity_again) = demand_state(&client).expect("demand");
@@ -2186,13 +2248,16 @@ async fn a_pinned_but_locally_dead_session_is_still_the_sensed_selection() {
         "the sensed order still prefers the provider whose session is dead"
     );
 
-    // THE OUTCOME. Bounded by a deadline so the witness cannot hang; the
-    // budget it implies is far above every estimate here.
+    // THE OUTCOME. Bounded by a deadline so the witness cannot hang, and the
+    // bound is generous on purpose: the budget it implies must stay far above
+    // every estimate here, and the RPC must not race its own deadline on a
+    // loaded runner (the deadline-order witness above failed exactly that way
+    // in exact-head CI at 150 ms).
     let before = (cell.served(0), cell.served(1));
     let body = serde_json::to_vec(&Ping { n: 1 }).expect("encode");
     let outcome = cell
         .client
-        .call_bytes_deadline(SERVICE, bytes::Bytes::from(body), 1500, 0)
+        .call_bytes_deadline(SERVICE, bytes::Bytes::from(body), 10_000, 0)
         .await;
 
     // ATTRIBUTION, first: which provider did planning actually select, and was
