@@ -6998,6 +6998,14 @@ pub(crate) struct OrgSensingDemandCounters {
     refused_view_moved: AtomicU64,
     /// Authorized populations truncated at the sensing cap.
     truncated: AtomicU64,
+    /// Acquisitions RELEASED again because no refresh owner could be armed for
+    /// them (the schedule is terminal, at its bound, or already owned by a
+    /// strictly newer installation).
+    ///
+    /// A holder nothing renews is worse than no holder at all: the row expires
+    /// at ttl and readiness degrades to `Unknown` while the demand keeps
+    /// reporting the provider as retained.
+    refresh_unarmed: AtomicU64,
     /// Refreshes that renewed a live installation on its own plane.
     refresh_renewed: AtomicU64,
     /// Refreshes that found no installation at all — the demand was retired
@@ -7097,6 +7105,12 @@ impl OrgSensingDemandCounters {
         self.refused_view_moved.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// An acquisition was released again because nothing could be armed to
+    /// renew it.
+    pub(crate) fn note_refresh_unarmed(&self) {
+        self.refresh_unarmed.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// One provider acquisition was refused. The counter it lands on is the
     /// error's OWN class: a bound is capacity, a missing/unusable organization
     /// membership is authority, and anything else is its own bucket.
@@ -7142,6 +7156,8 @@ pub struct OrgSensingDemandState {
     pub refused_view_moved: u64,
     /// Authorized populations truncated at the sensing cap.
     pub truncated: u64,
+    /// Acquisitions released again for want of a refresh owner.
+    pub refresh_unarmed: u64,
     /// Refreshes that renewed a live installation.
     pub refresh_renewed: u64,
     /// Refreshes that found no installation.
@@ -10702,6 +10718,16 @@ pub struct MeshNode {
     /// [`MAX_SENSING_REFUSED_RELEASES`] and only ever narrowed by a witness
     /// (see [`MeshNode::set_refused_release_cap_for_test`]).
     refused_release_cap: std::sync::atomic::AtomicUsize,
+    /// The live bound on the refresh SCHEDULE. Initialized to
+    /// [`MAX_SENSING_REFRESH_ARMED`] and only ever narrowed by a witness (see
+    /// [`MeshNode::set_sensing_refresh_armed_cap_for_test`]).
+    ///
+    /// It exists for the same reason `refused_release_cap` does: the real bound
+    /// equals `MAX_LEASED_INTERESTS`, so an acquisition refuses at the lease
+    /// table long before it could ever fail to arm, and the "retained with no
+    /// refresh owner" state would otherwise be unreachable from a test.
+    /// Production never writes it.
+    sensing_refresh_armed_cap: std::sync::atomic::AtomicUsize,
     /// In-crate witness seam: fires after a release's authority preparation has
     /// succeeded and BEFORE the final currentness application.
     ///
@@ -12655,6 +12681,9 @@ impl MeshNode {
             sensing_refresh_wake: Arc::new(tokio::sync::Notify::new()),
             org_sensing_demand_counters: Arc::new(OrgSensingDemandCounters::default()),
             refused_release_cap: std::sync::atomic::AtomicUsize::new(MAX_SENSING_REFUSED_RELEASES),
+            sensing_refresh_armed_cap: std::sync::atomic::AtomicUsize::new(
+                MAX_SENSING_REFRESH_ARMED,
+            ),
             #[cfg(test)]
             sensing_release_pre_apply_seam: parking_lot::Mutex::new(None),
             #[cfg(test)]
@@ -14885,7 +14914,9 @@ impl MeshNode {
             None => {
                 // The bound is checked BEFORE the mutation and only for a key
                 // that is not already armed: re-arming spends no budget.
-                if schedule.armed.len() >= MAX_SENSING_REFRESH_ARMED {
+                if schedule.armed.len()
+                    >= node.sensing_refresh_armed_cap.load(Ordering::Relaxed)
+                {
                     node.org_sensing_demand_counters
                         .refused_at_capacity
                         .fetch_add(1, Ordering::Relaxed);
@@ -15602,6 +15633,13 @@ impl MeshNode {
         self.refused_release_cap.store(cap, Ordering::Relaxed);
     }
 
+    /// Shrink the refresh schedule's arming bound (fixtures/tests only).
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn set_sensing_refresh_armed_cap_for_test(&self, cap: usize) {
+        self.sensing_refresh_armed_cap.store(cap, Ordering::Relaxed);
+    }
+
     /// Run the retention set's STALE reclamation now, returning how many
     /// entries owned nothing any more (fixtures/tests only). Production runs
     /// this on the saturation path.
@@ -15682,6 +15720,7 @@ impl MeshNode {
             refused_identity_exhausted: counters.refused_identity_exhausted.load(Ordering::Relaxed),
             refused_other: counters.refused_other.load(Ordering::Relaxed),
             refused_view_moved: counters.refused_view_moved.load(Ordering::Relaxed),
+            refresh_unarmed: counters.refresh_unarmed.load(Ordering::Relaxed),
             truncated: counters.truncated.load(Ordering::Relaxed),
             refresh_renewed: counters.refresh_renewed.load(Ordering::Relaxed),
             refresh_absent: counters.refresh_absent.load(Ordering::Relaxed),

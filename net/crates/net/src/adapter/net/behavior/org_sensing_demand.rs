@@ -1014,14 +1014,7 @@ impl OrgSensingFamily {
         // Arming an installation another holder already armed keeps the EARLIER
         // deadline either way: joining renews nothing, so it must never
         // postpone the renewal.
-        MeshNode::arm_sensing_refresh(
-            node,
-            key,
-            acquired.installation_id,
-            node.sensing_refresh_period(),
-            acquired.provenance,
-        );
-        Some(RetainedProvider {
+        let retained = RetainedProvider {
             provider,
             key,
             // The observation identity of the interest this acquisition just
@@ -1032,7 +1025,35 @@ impl OrgSensingFamily {
             ),
             ticket: acquired.ticket,
             installation_id: acquired.installation_id,
-        })
+        };
+        if !MeshNode::arm_sensing_refresh(
+            node,
+            key,
+            acquired.installation_id,
+            node.sensing_refresh_period(),
+            acquired.provenance,
+        ) {
+            // NO REFRESH OWNER. Arming refuses when the schedule is terminal,
+            // when it is at `MAX_SENSING_REFRESH_ARMED`, or when a strictly
+            // NEWER installation already owns this key's record. Reporting the
+            // provider as retained anyway handed the demand a live ticket that
+            // nothing would ever renew: the row expires at ttl and readiness
+            // degrades to `Unknown` while every later convergence copies the
+            // same unrenewable holder forward.
+            //
+            // Released instead, so the convergence reports the provider as
+            // NOT retained — which is what makes the SDK's certification
+            // disagree with its expectation and try again past the floor,
+            // exactly as it does for any other refused acquisition.
+            node.org_sensing_demand_counters().note_refresh_unarmed();
+            tracing::warn!(
+                provider = format!("{:#x}", provider),
+                "org sensing demand: no refresh owner could be armed; releasing                  rather than retaining a holder nothing will renew"
+            );
+            release_retained(node, &retained);
+            return None;
+        }
+        Some(retained)
     }
 }
 
@@ -2247,6 +2268,45 @@ mod tests {
              turns a standing authority outage into a spin loop"
         );
         node.clear_sensing_arm_seam_for_test();
+        drop(demand);
+        drop(family);
+    }
+    /// An acquisition that cannot be ARMED is released, not reported retained.
+    ///
+    /// A holder nothing renews is worse than no holder: the row expires at ttl
+    /// and readiness degrades to `Unknown` while the demand keeps naming the
+    /// provider, and every later convergence copies the same unrenewable ticket
+    /// forward. The schedule's real bound equals the lease table's, so an
+    /// acquisition refuses at the table long before it could fail to arm —
+    /// hence the witness-only cap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_acquisition_that_cannot_arm_is_released_not_retained() {
+        let node = demand_node("unarmed-release", Duration::from_secs(30)).await;
+        node.set_sensing_refresh_armed_cap_for_test(0);
+        let family = OrgSensingFamily::mint(&node).expect("mint");
+        let provider = node.node_id().wrapping_add(1);
+
+        let demand = family.reconcile(TAG, &[provider]).expect("retain");
+        assert!(
+            demand.retained_providers().is_empty(),
+            "a provider with no refresh owner must not be reported as retained"
+        );
+        let state = node.org_sensing_demand_state_for_test();
+        assert_eq!(state.refresh_unarmed, 1, "and the release must be counted");
+        assert_eq!(
+            holders(&node, &lease_key_for(&node, provider)),
+            None,
+            "the lease itself must be released, not left held by a demand that \
+             does not report it"
+        );
+        assert!(
+            !row_present(&node, provider),
+            "and its row must not survive on the wire with no owner"
+        );
+        assert_eq!(
+            state.armed, 0,
+            "precondition: nothing was armed, which is what the cap forces"
+        );
         drop(demand);
         drop(family);
     }
