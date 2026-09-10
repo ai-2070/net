@@ -47297,6 +47297,23 @@ mod sensing_authority_witness_tests {
         sensing::canonical_org_sensing_commitment(&org().org_id())
     }
 
+    /// The validation instant an admission witness samples: the certificate's
+    /// OWN `not_before`, read AFTER issuance.
+    ///
+    /// `OrgMembershipCert::try_issue` stamps `not_before` with the wall-clock
+    /// second it runs in, and these fixtures adopt their authority with
+    /// `verification_skew_secs = 0` — deliberately strict. Sampling
+    /// `current_timestamp()` BEFORE issuing therefore refused admission
+    /// whenever the second ticked between the two statements
+    /// (`OrgError::NotYetValid`), which is what failed CI run 34427405228 in
+    /// `a_poison_winning_the_inbound_fence_creates_no_row`'s SETUP, before its
+    /// seam was installed. Binding the sample to the certificate removes the
+    /// boundary instead of widening the skew: the instant is inside the
+    /// window by construction, at its first valid second.
+    fn admission_sample(cert: &OrgMembershipCert) -> u64 {
+        cert.not_before
+    }
+
     fn member_cert(entity: &EntityId, generation: u32) -> OrgMembershipCert {
         OrgMembershipCert::try_issue(
             &org(),
@@ -47338,6 +47355,54 @@ mod sensing_authority_witness_tests {
         node.peer_entity_ids.insert(FROM_NODE, sender.clone());
     }
 
+    /// The admission sample is bound to the CERTIFICATE, and the zero-skew
+    /// boundary it sits on is real.
+    ///
+    /// The same signed registration is REFUSED one second before the
+    /// certificate's own `not_before` and ADMITTED at it. That is why every
+    /// witness here issues the certificate first and samples
+    /// [`admission_sample`]: sampling a fresh clock before issuance put the
+    /// validation instant one second below the window whenever the wall second
+    /// ticked between the two statements. Production validity semantics are
+    /// untouched — the refusal below is the strict `verification_skew_secs = 0`
+    /// behaviour, asserted rather than avoided.
+    #[tokio::test]
+    async fn admission_is_bound_to_the_certificates_own_window() {
+        let node = org_node("op-boundary").await;
+        let sender = EntityKeypair::generate().entity_id().clone();
+        pin_sender(&node, &sender);
+        let target = node.node_id().wrapping_add(1);
+        let ctx = node.dispatch_ctx();
+        let member = member_cert(&sender, 1);
+        let at = admission_sample(&member);
+        assert_eq!(
+            at, member.not_before,
+            "the sample IS the certificate's window opening, not a fresh clock read"
+        );
+        assert!(
+            MeshNode::admit_org_registration(
+                &ctx,
+                &org_provider_frame(target, org_commitment(), member.clone()),
+                FROM_NODE,
+                &sender,
+                at.saturating_sub(1),
+            )
+            .is_none(),
+            "one second before the certificate opens, admission must refuse"
+        );
+        assert!(
+            MeshNode::admit_org_registration(
+                &ctx,
+                &org_provider_frame(target, org_commitment(), member.clone()),
+                FROM_NODE,
+                &sender,
+                at,
+            )
+            .is_some(),
+            "and at its first valid second the same registration is admitted"
+        );
+    }
+
     // W1 — a valid org provider registration lands a row whose proven root is the
     // CANONICAL ORG COMMITMENT (not a legacy entity root).
     #[tokio::test]
@@ -47350,10 +47415,11 @@ mod sensing_authority_witness_tests {
             sensing::ProviderInterestKey::new(org_spec(target, org_commitment()).key(), target);
         let ctx = node.dispatch_ctx();
         let now = Instant::now();
-        let now_secs = current_timestamp();
+        let member = member_cert(&sender, 1);
+        let now_secs = admission_sample(&member);
         let (admitted, snapshot) = MeshNode::admit_org_registration(
             &ctx,
-            &org_provider_frame(target, org_commitment(), member_cert(&sender, 1)),
+            &org_provider_frame(target, org_commitment(), member.clone()),
             FROM_NODE,
             &sender,
             now_secs,
@@ -47474,10 +47540,11 @@ mod sensing_authority_witness_tests {
         let target = node.node_id().wrapping_add(1);
         let ctx = node.dispatch_ctx();
         let now = Instant::now();
-        let now_secs = current_timestamp();
+        let member = member_cert(&sender, 1);
+        let now_secs = admission_sample(&member);
         let (admitted, snapshot) = MeshNode::admit_org_registration(
             &ctx,
-            &org_provider_frame(target, org_commitment(), member_cert(&sender, 1)),
+            &org_provider_frame(target, org_commitment(), member.clone()),
             FROM_NODE,
             &sender,
             now_secs,
@@ -47514,10 +47581,11 @@ mod sensing_authority_witness_tests {
         let target = node.node_id().wrapping_add(1);
         let ctx = node.dispatch_ctx();
         let now = Instant::now();
-        let now_secs = current_timestamp();
+        let member = member_cert(&sender, 1);
+        let now_secs = admission_sample(&member);
         let (admitted, snapshot) = MeshNode::admit_org_registration(
             &ctx,
-            &org_provider_frame(target, org_commitment(), member_cert(&sender, 1)),
+            &org_provider_frame(target, org_commitment(), member.clone()),
             FROM_NODE,
             &sender,
             now_secs,
@@ -47548,10 +47616,11 @@ mod sensing_authority_witness_tests {
         let target = node.node_id().wrapping_add(1);
         let ctx = node.dispatch_ctx();
         let now = Instant::now();
-        let now_secs = current_timestamp();
+        let member = member_cert(&sender, 1);
+        let now_secs = admission_sample(&member);
         let (admitted, snapshot) = MeshNode::admit_org_registration(
             &ctx,
-            &org_provider_frame(target, org_commitment(), member_cert(&sender, 1)),
+            &org_provider_frame(target, org_commitment(), member.clone()),
             FROM_NODE,
             &sender,
             now_secs,
@@ -47629,10 +47698,11 @@ mod sensing_authority_witness_tests {
         let target = node.node_id().wrapping_add(1);
         let ctx = node.dispatch_ctx();
         let now = Instant::now();
-        let now_secs = current_timestamp();
+        let member = member_cert(&sender, 1);
+        let now_secs = admission_sample(&member);
         let (admitted, _snapshot) = MeshNode::admit_org_registration(
             &ctx,
-            &org_provider_frame(target, org_commitment(), member_cert(&sender, 1)),
+            &org_provider_frame(target, org_commitment(), member.clone()),
             FROM_NODE,
             &sender,
             now_secs,
@@ -47699,10 +47769,11 @@ mod sensing_authority_witness_tests {
         let target = node.node_id().wrapping_add(1);
         let ctx = node.dispatch_ctx();
         let now = Instant::now();
-        let now_secs = current_timestamp();
+        let member = member_cert(&sender, 1);
+        let now_secs = admission_sample(&member);
         let (admitted, snapshot) = MeshNode::admit_org_registration(
             &ctx,
-            &org_provider_frame(target, org_commitment(), member_cert(&sender, 1)),
+            &org_provider_frame(target, org_commitment(), member.clone()),
             FROM_NODE,
             &sender,
             now_secs,
@@ -49930,10 +50001,11 @@ mod sensing_authority_witness_tests {
 
         let ctx = node.dispatch_ctx();
         let now = Instant::now();
-        let now_secs = current_timestamp();
+        let member = member_cert(&sender, 1);
+        let now_secs = admission_sample(&member);
         let (admitted, snapshot) = MeshNode::admit_org_registration(
             &ctx,
-            &org_provider_frame(target, org_commitment(), member_cert(&sender, 1)),
+            &org_provider_frame(target, org_commitment(), member.clone()),
             FROM_NODE,
             &sender,
             now_secs,
@@ -50007,10 +50079,11 @@ mod sensing_authority_witness_tests {
 
         let ctx = node.dispatch_ctx();
         let now = Instant::now();
-        let now_secs = current_timestamp();
+        let member = member_cert(&sender, 1);
+        let now_secs = admission_sample(&member);
         let (admitted, snapshot) = MeshNode::admit_org_registration(
             &ctx,
-            &org_provider_frame(target, org_commitment(), member_cert(&sender, 1)),
+            &org_provider_frame(target, org_commitment(), member.clone()),
             FROM_NODE,
             &sender,
             now_secs,
@@ -50068,10 +50141,11 @@ mod sensing_authority_witness_tests {
 
         let ctx = node.dispatch_ctx();
         let now = Instant::now();
-        let now_secs = current_timestamp();
+        let member = member_cert(&sender, 1);
+        let now_secs = admission_sample(&member);
         let (admitted, snapshot) = MeshNode::admit_org_registration(
             &ctx,
-            &org_provider_frame(target, org_commitment(), member_cert(&sender, 1)),
+            &org_provider_frame(target, org_commitment(), member.clone()),
             FROM_NODE,
             &sender,
             now_secs,
