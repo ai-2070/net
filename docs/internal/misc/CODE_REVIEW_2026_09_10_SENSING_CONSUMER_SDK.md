@@ -1,7 +1,11 @@
 # CODE REVIEW 2026-09-10 — S1 capability-sensing CONSUMER surface (`LZL0/sending-sdk-2`)
 
-> **STATUS: OPEN.** No finding below has been adjudicated or fixed. Nothing here
-> is signed, and no witness has been written against any of it.
+> **STATUS: ADJUDICATED 2026-09-10** at
+> `c773b086dfa2882864d2fdedec8b3d134451edfd` (main CI 34421817765, 46/46
+> green). The findings below are the ORIGINAL text, unedited and unretracted;
+> what was accepted, narrowed and rejected is recorded in the **Adjudication
+> addendum** at the end of this document. Read both. Where the two disagree,
+> the addendum governs — it is the one backed by executed discriminators.
 
 **Scope:** the full branch diff `master...fa57a42a4`, merge base
 `55fd0b7a4ebd0fa9ba14f93ddfcfd23755ced9de` (= `master` at review time), tree
@@ -477,3 +481,37 @@ Nothing here blocks merge on correctness grounds except the reviewer's call on
 §1. §2 is the one that will cost CI time if left: with `retries = 0`, the flake
 direction is a hard red build and the vacuity direction is a witness that
 silently stops witnessing.
+
+---
+
+## Adjudication addendum (2026-09-10, at `c773b086d`)
+
+Independent adjudication of the sections above, plus the repairs actually
+landed. The original findings are preserved verbatim; nothing above was
+deleted or rewritten. Provenance: this addendum is the implementer's record of
+the reviewer's adjudication, and every "repaired" row below is backed by a
+discriminating inverse — a mutation that makes the strengthened witness fail —
+with retained logs and exit codes.
+
+| § | Adjudicated as | Action taken |
+|---|---|---|
+| 1 | **NOT established.** In the document's `changed()`-then-`snapshot()` schedule, Tokio's `changed()` has already acknowledged G+1; a direct `snapshot()` may acknowledge an unseen edge and then refuse. The shipped contract does not promise success-only acknowledgement, and the population floor bounds the retry. An unconditional `mark_changed()` on refusal lets a persistently refusing observer replay the same edge without pause. | **No behaviour change.** The contract is now stated explicitly on `SensingWatch::changed`, including why re-marking on refusal is not done. |
+| 2 | **ACCEPTED — two test attribution defects, not production wake defects.** `a_quiet_park_does_not_return_inside_the_wake_bound`: a snapshot on an already-installed, unexpired demand does not re-derive and so does not re-arm, leaving the floor able to fire legitimately inside the 700 ms negative window. `a_change_landing_inside_a_capture_is_never_lost`: an independent subscriber proves the stimulus, but a 250 ms timeout does not exclude a floor wake due inside it. | **Repaired.** Both now qualify against the floor deadline actually in force. The quiet control widens the floor (`set_population_floor_for_test`, which re-arms relative to the last convergence, not a fresh `now`), reads the margin and asserts it exceeds the window; default-floor liveness moved to its own witness `the_population_floor_wakes_a_quiet_parked_consumer`, which additionally requires the wake NOT to precede the published deadline. The lost-wake witness acknowledges the park first (`acknowledge_parked`) and accepts a wake only through `wake_carrying`, which bounds arrival AND the COMPLETED capture by the saved fallback. |
+| 3 | **Real but low.** The surface guard covers five older provider messages; consumer variants deserve representative remedy/terminal assertions. An exhaustive `match` forces future arms — inclusion in a separate sample roster does not. | **Not taken in this gate** (bounded improvement, not mandatory architecture). Recorded so it is not lost. |
+| 4 | **Not proof.** No in-repository caller is not evidence of no external caller for `work_latency`. | **No removal.** Public API untouched. |
+| 5 | **No drift.** `spec_for` duplicates the canonical constructor but the fields match today; not all 43 core tests depend on it. | **No refactor.** |
+| 6 | **Valid, in part.** | `ObserverNotQualified` recovery now names a readable, stable authority view as well as valid membership (`sensing.rs`, `consumer.rs`); the impossible "close after drop" wording is gone; the CI comment names the variable that exists (`listed`). The legitimate `NoOrganizationAuthority` retention-stage rotation wording is PRESERVED. The branch-name replacement is **not** justified — both refs exist — and `-ge` stays a LOWER bound (now 25, with the new witness pinned by name), never an equality. |
+
+Corrections to the review narrative, for the record: the population floor is
+initially armed AFTER the initial retain, and an installed-demand refusal also
+re-arms it; the whole-SDK job has three potential execution routes globally,
+two in the dedicated S1 step; and static scheduling findings do not certify
+any statistical flake frequency.
+
+One receipt-wording note carried over from the adjudication: the ~390 ms
+remaining margin that exposed §2's quiet control was **deliberately
+scheduled** — the probe slept until the saved fallback minus 400 ms after the
+snapshot had completed — and the positive consumed-edge case likewise parks
+deliberately near the fallback. Both model permissible descheduling. Neither is
+a measured natural setup delay, and neither says anything about how often the
+old witness would have failed in CI.

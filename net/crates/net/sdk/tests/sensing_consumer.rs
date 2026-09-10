@@ -818,7 +818,7 @@ async fn signed_readiness_reaches_the_snapshot_and_an_edge_wakes_the_watcher() {
 /// A change that lands DURING a capture is not lost: the next park returns at
 /// once rather than waiting out the population floor.
 ///
-/// Three things make this a lost-wake witness rather than a liveness one:
+/// Four things make this a lost-wake witness rather than a liveness one:
 ///
 /// * the interleaving is PLACED, not raced. The capture seam fires at the one
 ///   instant that discriminates the two possible orderings — after the change
@@ -829,12 +829,25 @@ async fn signed_readiness_reaches_the_snapshot_and_an_edge_wakes_the_watcher() {
 ///   asserted through an INDEPENDENT subscriber, so the witness cannot pass
 ///   on a change that never happened;
 /// * the node is otherwise QUIET — no providers, no readiness traffic, no
-///   discovery movement — so nothing but the seam's change can wake the park,
-///   and `WAKE_BOUND` is far below the population floor. A swallowed wake can
-///   then only be reported by the floor timer, which this bound excludes.
+///   discovery movement — so nothing but the seam's change can wake the park;
+/// * the FALLBACK is excluded by the deadline it actually has, not by the
+///   shortness of a timeout. The park is acknowledged first
+///   ([`acknowledge_parked`]), which proves the receiver is caught up and
+///   returns the floor deadline in force, checked to be far outside
+///   [`WAKE_BOUND`] and unmoved by the acknowledgement; the accepted wake is
+///   then required to arrive AND to have its capture COMPLETE before that
+///   saved deadline ([`wake_carrying`]). An earlier revision only bounded the
+///   park by `WAKE_BOUND`, which does not exclude a floor wake that happens
+///   to be due inside it: the review's discriminator parked DELIBERATELY near
+///   the saved fallback (sleeping to fallback − 400 ms, modelling permissible
+///   descheduling — not a measured natural setup delay and not a flake rate)
+///   and the old assertion accepted the floor's wake.
 ///
-/// The control below establishes that the same park does NOT return inside
-/// that bound when nothing changes.
+/// The seam's release moves the generation without changing what a snapshot
+/// REPORTS, so the accepted wake cannot be qualified by payload; the
+/// independent subscriber is the stimulus proof and `skipped == 0` records
+/// that no unrelated wake was ridden. The quiet control below establishes
+/// that the same park does NOT return inside that bound when nothing changes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_change_landing_inside_a_capture_is_never_lost() {
     let owner = org();
@@ -842,8 +855,14 @@ async fn a_change_landing_inside_a_capture_is_never_lost() {
     let mut observation = watch(&consumer, SensingQuery::new(TAG));
 
     // One live local interest, owned by this witness, so releasing it is a
-    // real movement of this node's observation state.
+    // real movement of this node's observation state. Acquired BEFORE the
+    // park is acknowledged, so the acquisition's own generation bump is
+    // consumed there rather than being mistaken for the seam's release.
     let doomed = acquire_local_interest(&consumer.node, 0xD0_0Du64);
+    let fallback = acknowledge_parked(&mut observation).await;
+
+    // Subscribed after the acknowledgement, so "the generation moved" is a
+    // statement about the seam and nothing that preceded it.
     let probe = consumer.node.subscribe_sensing_overlay_changes();
     assert!(
         !probe.has_changed().expect("the generation channel is live"),
@@ -867,20 +886,42 @@ async fn a_change_landing_inside_a_capture_is_never_lost() {
         "precondition: the seam's release must really move the change generation"
     );
 
-    tokio::time::timeout(WAKE_BOUND, observation.changed())
-        .await
-        .expect("a change that landed inside the capture was LOST")
-        .expect("changed");
+    let skipped = wake_carrying(
+        "a change that landed inside the capture was LOST",
+        &mut observation,
+        fallback,
+        |_| true,
+    )
+    .await;
+    assert_eq!(
+        skipped, 0,
+        "the placed change must be the wake this witness rode"
+    );
 
     let _ = std::fs::remove_dir_all(&consumer.dir);
 }
 
 /// The control for the witness above: with NOTHING changing, the same park
-/// does not return inside `WAKE_BOUND` — and the population floor still wakes
-/// it afterwards, so parking is bounded rather than indefinite.
+/// does not return inside a QUALIFIED quiet window.
 ///
 /// Without this, an always-immediate `changed()` would satisfy the lost-wake
 /// witness vacuously.
+///
+/// The window is qualified by the floor deadline actually in force. The
+/// pacing floor is WIDENED first ([`SensingWatch::set_population_floor_for_test`],
+/// which re-arms relative to the last convergence, not to a fresh `now`) and
+/// the remaining margin is then READ and asserted to exceed the negative
+/// window. A snapshot on an already-installed, unexpired demand does not
+/// re-derive and therefore does not re-arm, so under the production floor the
+/// margin left at the park is whatever the setup consumed: the review's
+/// discriminator parked DELIBERATELY with ~390 ms left (sleeping to the saved
+/// fallback − 400 ms, modelling permissible descheduling — not a measured
+/// natural setup delay and not a claim about flake frequency) and the floor
+/// legitimately fired inside the old 700 ms negative window. That is an
+/// attribution defect in this control, NOT a production wake defect.
+///
+/// Default-floor liveness is a SEPARATE statement and is kept in its own
+/// witness below, so widening the floor here cannot quietly delete it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_quiet_park_does_not_return_inside_the_wake_bound() {
     let owner = org();
@@ -889,17 +930,54 @@ async fn a_quiet_park_does_not_return_inside_the_wake_bound() {
     // No providers, no readiness, no discovery movement: nothing can bump the
     // node's change generation.
     let _ = observation.snapshot().expect("snapshot");
+    observation.set_population_floor_for_test(Duration::from_secs(120));
+    let fallback = observation.fallback_deadline_for_test();
+    let margin = fallback.saturating_duration_since(Instant::now());
+    assert!(
+        margin > QUIET_BOUND.saturating_mul(2),
+        "precondition: the widened floor must leave the negative window far \
+         inside the fallback, saw {margin:?}"
+    );
     assert!(
         tokio::time::timeout(QUIET_BOUND, observation.changed())
             .await
             .is_err(),
         "a quiet network must not produce a wake inside the bound"
     );
-    // And the floor still guarantees liveness.
+    // The floor was the only thing that could have explained a return, and it
+    // is still unexpired at the end of the window.
+    assert!(
+        observation.fallback_deadline_for_test() == fallback && Instant::now() < fallback,
+        "the qualified window must have closed before the fallback it was \
+         measured against"
+    );
+
+    let _ = std::fs::remove_dir_all(&consumer.dir);
+}
+
+/// Parking is BOUNDED rather than indefinite: under the production floor, a
+/// quiet consumer's park is woken by the population fallback.
+///
+/// Held separately from the quiet control above, which widens the floor to
+/// qualify its negative window. The wake is attributed rather than assumed:
+/// on a node with nothing to report, the return must not arrive BEFORE the
+/// deadline the watch itself published, so this cannot pass on an immediate
+/// or spurious wake.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_population_floor_wakes_a_quiet_parked_consumer() {
+    let owner = org();
+    let consumer = mesh_in_org("c-floorwake", &owner, true, None).await;
+    let mut observation = watch(&consumer, SensingQuery::new(TAG));
+    let _ = observation.snapshot().expect("snapshot");
+    let fallback = observation.fallback_deadline_for_test();
     tokio::time::timeout(SETTLE, observation.changed())
         .await
         .expect("the population floor must still wake a parked consumer")
         .expect("changed");
+    assert!(
+        Instant::now() >= fallback,
+        "a quiet consumer's wake must be the floor's, not an earlier one"
+    );
 
     let _ = std::fs::remove_dir_all(&consumer.dir);
 }

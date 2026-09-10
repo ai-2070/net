@@ -2275,12 +2275,15 @@ jobs:
       # `-E 'test(=name)'` matching nothing a FAILURE rather than a
       # zero-test success.
       #
-      # Two of these names are a matched pair and must both stay:
+      # Three of these names carry each other and must all stay:
       # `a_change_landing_inside_a_capture_is_never_lost` fails if a change
-      # placed inside a capture is swallowed, and
+      # placed inside a capture is swallowed;
       # `a_quiet_park_does_not_return_inside_the_wake_bound` fails if a park
-      # returns immediately regardless — dropping the control would let the
-      # first pass vacuously.
+      # returns inside a window QUALIFIED against the floor deadline actually
+      # in force — dropping the control would let the first pass vacuously;
+      # and `the_population_floor_wakes_a_quiet_parked_consumer` holds the
+      # default-floor liveness statement the control no longer makes, since it
+      # widens the floor to qualify its negative window.
       - name: Sensing — consumer observation lifecycle (S1)
         if: ${{ !cancelled() }}
         run: |
@@ -2311,6 +2314,7 @@ jobs:
             a_new_signed_estimate_reverses_the_sdk_rank_while_both_stay_ready
             a_granted_only_provider_is_never_sensed_and_the_owner_one_is
             a_partial_acquisition_keeps_its_own_state_and_another_owners
+            the_population_floor_wakes_a_quiet_parked_consumer
           "
           out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
                   --retries 0 --features "$FEATURES" --test sensing_consumer 2>&1) \
@@ -2325,10 +2329,10 @@ jobs:
               || { printf '%s\n' "$single"; echo "::error::$required did not run and pass as exactly one test"; exit 1; }
             pinned=$((pinned + 1))
           done
-          # `executed` counts PROGRESS LINES from the run above — it is a
+          # `listed` counts PROGRESS LINES from the run above — it is a
           # floor on tests that actually ran, not a non-executing inventory.
-          [ "$listed" -ge 24 ] \
-            || { echo "::error::expected at least 24 consumer witnesses executed, saw $listed"; exit 1; }
+          [ "$listed" -ge 25 ] \
+            || { echo "::error::expected at least 25 consumer witnesses executed, saw $listed"; exit 1; }
           echo "consumer observation lifecycle: $listed executed, $pinned pinned by name, all green"
 
       # === OA-6: the PRODUCTION organization exact-sensing call edge =======

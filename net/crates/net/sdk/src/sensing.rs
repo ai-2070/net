@@ -293,7 +293,8 @@ pub enum SensingError {
         "this node is not currently entitled to observe capability readiness — \
          its own organization membership is absent, expired, revoked below the \
          current floor, or its authority view is unreadable; snapshots resume \
-         once membership is valid again"
+         once membership is valid again AND the authority view is readable and \
+         stable"
     )]
     ObserverNotQualified,
 

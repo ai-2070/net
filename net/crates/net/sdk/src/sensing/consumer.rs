@@ -616,8 +616,11 @@ impl SensingWatch {
     /// with [`SensingError::ObserverNotQualified`] when this node is no
     /// longer entitled to observe. The second refusal keeps the watch's
     /// leases and recovery state intact — a later snapshot succeeds once
-    /// membership is valid again — but it will not present historical
-    /// authorization as a current answer. A convergence refused while a
+    /// this node is qualified again: a readable, unexhausted revocation
+    /// store and an installed authority whose view has not moved, as well
+    /// as its own membership valid at or above the current floor — but it
+    /// will not present historical authorization as a current answer. A
+    /// convergence refused while a
     /// qualified demand is already installed is NOT an error: the
     /// refusal retains nothing and releases nothing, so the installed
     /// observation keeps serving, clamped to current visibility.
@@ -665,6 +668,14 @@ impl SensingWatch {
     /// value: call [`Self::snapshot`] and read the current state. Spurious
     /// wakes are permitted by construction; a MISSED one is not.
     ///
+    /// A wake ACKNOWLEDGES the generation it observed, whatever the caller
+    /// does next. A snapshot that then refuses (an unqualified observer,
+    /// say) does not re-deliver that edge, so the retry is bounded by the
+    /// population floor rather than by a second notification. This is the
+    /// shipped contract, not an oversight: re-marking a cursor on every
+    /// refusal would let a persistently refusing observer replay the same
+    /// edge without pause.
+    ///
     /// Refuses with [`SensingError::WatchClosed`] on a closed watch.
     pub async fn changed(&mut self) -> Result<(), SensingError> {
         if self.closed {
@@ -693,7 +704,7 @@ impl SensingWatch {
     /// Stop observing.
     ///
     /// Returns whether THIS call retired the watch — so `true` at most
-    /// once, and `false` for a repeat close or a close after drop.
+    /// once, and `false` for a repeat close.
     /// Releases exactly this watch's own leases: an interest another
     /// owner still holds keeps its row, its cadence and its refresh
     /// record, and only the last owner's release deregisters it.
