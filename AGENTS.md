@@ -117,7 +117,7 @@ Header files: `net/crates/net/include/*.h` (C ABI) mirrored as `go/net.h`, `go/n
 
 ### Routing-plane witnesses
 
-`net/crates/net/src/adapter/net/org_routing_wiring_tests.rs` (included from `mesh.rs`) is a named CI gate: CI asserts a **minimum count** (currently 86) of tests matching `org_routing_wiring_tests` and pins specific test names that carry security properties. These tests are `#[cfg(test)]`, not `feature = "fixtures"`. If you remove/rename witnesses intentionally, lower MIN and update REQUIRED names in `ci.yml` in the same commit — the gate exists so coverage loss is loud, not vacuous.
+`net/crates/net/src/adapter/net/org_routing_wiring_tests.rs` (included from `mesh.rs`) is a named CI gate: CI asserts a **minimum count** (`MIN=93` at `ci.yml:175`; read the workflow, the floor rises with each routing slice) of tests matching `org_routing_wiring_tests` and pins specific test names that carry security properties. Three sibling floors work the same way: `behavior::org_routing::` (`MIN=24`), `behavior::org_routing_registry::` / routing state (`REG_MIN=62` / `STATE_MIN=41`), and the org gate/mesh pair (`GATE_MIN=60` / `MESH_MIN=67`). These tests are `#[cfg(test)]`, not `feature = "fixtures"`. If you remove/rename witnesses intentionally, lower the MIN and update REQUIRED names in `ci.yml` in the same commit — the gate exists so coverage loss is loud, not vacuous.
 
 ### Test-filter silent-skip hazard
 
