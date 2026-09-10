@@ -1,0 +1,19 @@
+net/crates/net/src/adapter/net/mesh.rs
+  s_c4df12b21b47e4::t_4b65e1098f9bfb 11069-11075,13006-13007,13788-13807,16009-16015,16037-16053,16062-16093
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "1c66f2a3673b4eb2609942aa31c7fc96d8901f96",
+  "prompts": {},
+  "sessions": {
+    "s_c4df12b21b47e4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "51916934-1485-437b-ba69-842966146e83",
+        "model": "claude-opus-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
