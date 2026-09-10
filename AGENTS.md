@@ -160,26 +160,32 @@ This project has a CodeGraph knowledge graph index (`.codegraph/`). CodeGraph is
 
 ### CLI usage reference
 
+Verified against the installed CLI (`codegraph --help`); there is no `search`, `trace`, or `affected <symbol>` subcommand.
+
 | Question | Command |
 |---|---|
-| "Find a symbol by name" | `codegraph search <name>` |
+| "Find a symbol by name" | `codegraph query <name>` (`-k <kind>`, `-l <limit>`, `-j`) |
+| "Show a symbol's source + call trail" | `codegraph node <name>` (`-f <file>` to disambiguate) |
+| "Read a file with line numbers + dependents" | `codegraph node -f <file>` (`--offset`, `--limit`, `--symbols-only`) |
 | "Find callers of a function" | `codegraph callers <symbol>` |
 | "Find callees a function calls" | `codegraph callees <symbol>` |
-| "Trace flow from X to Y" | `codegraph trace <from> <to>` |
-| "Impact analysis for symbol Z" | `codegraph affected <symbol>` |
-| "Show a symbol's source location" | `codegraph query 'select ...'` or callers/callees |
-| "What files exist under path/" | `codegraph files <path>` |
-| "Full-text search in indexed code" | `codegraph search --fts <query>` |
-| "Build context for a task" | `codegraph context <topic>` |
+| "Explore an area / trace flow" | `codegraph explore <query...>` (`--max-files`) |
+| "Impact analysis for symbol Z" | `codegraph impact <symbol>` (`-d <depth>`) |
+| "Which tests do these changed files affect?" | `codegraph affected <files...>` (`--stdin`, `-d`, `-f <glob>`) |
+| "What files exist under path/" | `codegraph files --filter <dir>` (`--pattern <glob>`, `--format tree\|flat\|grouped`) |
+| "Build context for a task" | `codegraph context <task...>` |
 | "Is the index healthy?" | `codegraph status` |
+| "Pick up changes since last index" | `codegraph sync` |
+| "Indexing is blocked by a stale lock" | `codegraph unlock` |
 
 ### Rules of thumb
 
-- **Use codegraph first** for structural questions (definitions, callers, callees, trace flows). It's faster and more accurate than grep.
+- **Use codegraph first** for structural questions (definitions, callers, callees, flows). It's faster and more accurate than grep.
 - **Trust codegraph results** — they come from a full AST parse. Do NOT re-verify with grep.
-- **When tracing a flow**, use `codegraph trace <from> <to>` — one call returns the whole path with dynamic hops bridged (callbacks, React re-render, JSX).
-- **Index lag**: the file watcher debounces ~500ms behind writes. If you get stale results, run `codegraph sync` first, or check `codegraph status` for pending files.
+- **Polyglot name collisions are the norm here**: one API exists as a Rust core fn, an FFI `net_mesh_*` shim, and Rust/TS/Python SDK methods, so `query` returns several definitions with the same name. Read the paths before picking one — `node -f <file>` disambiguates.
+- **When tracing a flow**, use `codegraph explore <query...>` — one call returns relevant symbols' source plus call paths. `node <symbol>` gives the caller/callee trail for a single hop-by-hop walk.
+- **Index lag**: the file watcher debounces ~500ms behind writes. If you get stale results, run `codegraph sync` first, or check `codegraph status`.
 
 ### If `.codegraph/` doesn't exist
 
-Run `codegraph init -i` to initialize and `codegraph index` to build the index.
+Run `codegraph init` — indexing runs by default. Add `-y` for non-interactive/CI bootstraps, and `codegraph index` to rebuild from scratch later.
