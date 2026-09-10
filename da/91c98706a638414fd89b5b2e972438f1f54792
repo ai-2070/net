@@ -1,0 +1,16 @@
+AGENTS.md
+  h_64425bc75e3f3d 120
+docs/internal/plans/BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md
+  h_64425bc75e3f3d 27-41,57,64,67,77-79,83,90,95-96,116,118,136,150-152,167,177-181,206-209,310-320,790-795,829-832,903-905,917-936,1045-1075
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "da91c98706a638414fd89b5b2e972438f1f54792",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
