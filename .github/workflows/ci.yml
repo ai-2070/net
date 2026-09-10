@@ -2333,6 +2333,11 @@ jobs:
           done
           # `listed` counts PROGRESS LINES from the run above — it is a
           # floor on tests that actually ran, not a non-executing inventory.
+          # The threshold is kept AT the current witness count and raised when
+          # one is added, so `$listed` equals it on a healthy run; `-ge` is
+          # what keeps adding a witness from tripping the gate, while a
+          # threshold below the count would let a silently dropped witness
+          # pass — which is the failure this exists to catch.
           [ "$listed" -ge 27 ] \
             || { echo "::error::expected at least 27 consumer witnesses executed, saw $listed"; exit 1; }
           echo "consumer observation lifecycle: $listed executed, $pinned pinned by name, all green"
