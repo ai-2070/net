@@ -24,8 +24,21 @@ the path.
 
 **Draft, revision 2 — not started.** First draft 2026-09-05 against
 `net-mesh` 0.36.0 (`master` at `079894c76`); revised the same day after
-Kyra's source-checked review (see [Review log](#review-log)). Line references
-below will drift.
+Kyra's source-checked review (see [Review log](#review-log)).
+
+**Re-baselined 2026-09-11 against `master`
+`132dbdcff251973e9eaf24e5c08eca7078d3b6f2`.** Every `path:line` and every
+count in §Context, §1 and §Critical files was re-derived at that commit; the
+numbers below are current, not carried over. What moved and why: the
+organization exact-sensing / sensing-SDK lane (PR #943 `a2efc950a`, PR #949
+`525b88ac0`) landed 62 commits on `mesh.rs` between the two heads and grew it
+**43,114 → 52,943 lines**, so every `mesh.rs` citation shifted by 6–7k lines.
+Nothing structural changed: `PeerTransport` has the same two variants and the
+same 19 match sites, the five outer packet formats are unchanged, the seven
+wire modules are byte-identical, and `str0m` is still at 0.23.1. Three of the
+original counts were also wrong when written, and are corrected in place
+(marked *corrected*). Line references will drift again — `mesh.rs` is the
+repository's most-edited file.
 
 Decision already taken by the product owner: WebRTC is the primary browser
 transport. WebSocket-to-anchor and WebTransport were considered and rejected
@@ -41,17 +54,17 @@ wide refactor (§Stage 0).
 
 ## Context
 
-Verified facts about the substrate as of the commit above.
+Verified facts about the substrate, re-derived at `132dbdcff`.
 
 **The transport is UDP by type, not by abstraction.**
 
 - `adapter/net/transport.rs` wraps a tokio `UdpSocket` behind `NetSocket`,
   `PacketSender`, `PacketReceiver` and the Linux `BatchedPacketReceiver`.
   There is no transport trait. `MeshNode::spawn_receive_loop`
-  (`mesh.rs:17815`) funnels the per-packet and batched paths through a local
+  (`mesh.rs:24203`) funnels the per-packet and batched paths through a local
   `IngressReceiver` enum.
 - Peer transport state **is already typed**. `PeerTransport`
-  (`mesh.rs:2800–2872`) separates *where a packet goes* from *who owns that
+  (`mesh.rs:2990–3005`) separates *where a packet goes* from *who owns that
   endpoint*:
 
   ```rust
@@ -61,25 +74,26 @@ Verified facts about the substrate as of the commit above.
   }
   ```
 
-  with `send_addr()` / `owned_addr()` / `is_direct()` accessors and 19 match
-  sites. Installation, direct↔routed migration, teardown and stale-session
+  with `send_addr()` (`:3011`), `owned_addr()` (`:3022`) and `is_direct()`
+  (`:3031`) accessors and 19 match sites. Installation, direct↔routed
+  migration, teardown and stale-session
   protection all hang off it. This is the state to *generalize*, not replace.
 - Around it, a peer endpoint is a `SocketAddr` at every keyed site: the
   identity binding map `addr_to_node: DashMap<SocketAddr, u64>`
-  (`mesh.rs:1281`), `RouteEntry::next_hop` (`route.rs:416`),
+  (`mesh.rs:1424`), `RouteEntry::next_hop` (`route.rs:416`),
   `NetSession::peer_addr` (`session.rs:67`), `NodeInfo::addr`
   (`swarm.rs:343`), `pending_direct_initiators`, the proxy forwarder, the
   failure detector and reroute. Occurrence counts, production code only:
 
   | File | `SocketAddr` mentions |
   |---|---|
-  | `mesh.rs` | 206 |
+  | `mesh.rs` | 224 |
   | `route.rs` | 70 |
   | `reroute.rs` | 44 |
   | `router.rs` | 33 |
   | `behavior/proximity.rs` | 29 |
-  | `swarm.rs`, `session.rs`, `proxy.rs`, `failure.rs` | 14–20 each |
-  | `traversal/*` | ~60 total (stays UDP-only, see §6) |
+  | `swarm.rs` / `session.rs` / `proxy.rs` / `failure.rs` | 20 / 17 / 16 / 14 |
+  | `traversal/*` | 46 total *(corrected — the "~60" was never accurate)*; stays UDP-only, see §6 |
 
 **Wire-level address inventory.** Three places serialize a `SocketAddr`:
 
@@ -99,9 +113,9 @@ five shapes by their leading bytes, and one of them has *no* discriminator:
 |---|---|---|
 | Net header | `MAGIC = 0x4E45` (`protocol.rs:9`, `to_bytes` at `:378`) | `45 4E` |
 | Routing envelope | `ROUTING_MAGIC = 0x5452` (`route.rs:28`) | `52 54` |
-| Protected route-hop | `ROUTE_HOP_MAGIC = 0x5248` (`subnet/route_hop.rs:53`, dispatched `mesh.rs:18214`) | `48 52` |
+| Protected route-hop | `ROUTE_HOP_MAGIC = 0x5248` (`subnet/route_hop.rs:53`, dispatched `mesh.rs:24602`) | `48 52` |
 | Punch keep-alive | `KEEPALIVE_MAGIC = 0x4850` (`traversal/rendezvous.rs:191`) | `50 48` |
-| Headerless pingwave | none — 72-byte fixed size, recognised by length and *not* starting with `MAGIC` (`mesh.rs:18014–18022`) | arbitrary (origin id) |
+| Headerless pingwave | none — 72-byte fixed size, recognised by length and *not* starting with `MAGIC` (`mesh.rs:24402–24410`) | arbitrary (origin id) |
 
 The pingwave's leading bytes are an origin id and can take any value,
 including the STUN (`0x00–0x03`) and DTLS (`0x14–0x3F`) ranges RFC 7983
@@ -119,7 +133,7 @@ modules a browser node needs have no socket coupling:
 | `batch.rs` | 394 | 0 | 0 | `protocol` |
 | `stream.rs` | 268 | 0 | 0 | none |
 | `reliability.rs` | 2529 | 0 | 7 | `protocol` |
-| `session.rs` | 3527 | 2 | 7 | `crate::event::StoredEvent`, `subnet::route_hop::SharedHopReplayWindow`, `pool`, `reliability`, `stream` |
+| `session.rs` | 3527 | 0 *(corrected — the two `tokio::` hits are prose in comments at `:458` and `:3100`, not call sites)* | 7 | `crate::event::StoredEvent` (`:16`), `subnet::route_hop::SharedHopReplayWindow` (`:19`), `pool`, `reliability`, `stream` |
 
 But `Cargo.toml:239` pulls tokio unconditionally with `rt-multi-thread`,
 `net` and `time`, and `lib.rs` exposes `bus`, `consumer`, `shard` and `ffi`
@@ -133,9 +147,9 @@ Poly1305 via `ring` 0.17 (builds for wasm32), Ed25519 / X25519 via the dalek
 None of this needs replacing.
 
 **The rest of the mesh is not portable and must not be ported.** `tokio::time`
-appears in 39 files under `adapter/net`, `Instant::now` in 88, `std::thread`
-spawns in ~20 production files, and `mesh.rs` alone is 43k lines. A browser
-node is a smaller node profile (§7), not the core compiled to wasm.
+appears in 40 files under `adapter/net`, `Instant::now` in 90, `thread::spawn`
+in 36 files (test modules included), and `mesh.rs` alone is now **53k lines**.
+A browser node is a smaller node profile (§7), not the core compiled to wasm.
 
 **Packet geometry fits DataChannels.** `MAX_PACKET_SIZE = 8192`
 (`protocol.rs:33`). RFC 8831 §6.6 *recommends* senders stay at or below
@@ -150,7 +164,7 @@ defines `Rendezvous { addr, noise_pubkey, node_id }` — the transport
 coordinates a device needs to dial an operator it has never met — encoded
 into an invite string alongside the ed25519 `root` that anchors delegation.
 The device dials with `MeshNode::connect_via` (the routed handshake;
-`mesh.rs:33114` requires `dest_pubkey`), then calls the enrollment nRPC
+`mesh.rs:39609` requires `dest_pubkey`), then calls the enrollment nRPC
 service. The Noise static key and the entity key are **different keypairs**;
 `NoiseHandshake::initiator_with_prologue` (`crypto.rs:206`) needs the
 responder's static key and the PSK before it can build msg1. Nothing in the
@@ -160,9 +174,11 @@ signature, but no Noise key.
 
 **Reachability learning already exists.** Forwarded capability announcements
 install a route toward their origin through the sender
-(`mesh.rs:26655–26715`: `hop_count > 0` → `add_route_with_metric(origin,
-next_hop = sender, hop_count + 2)`), preserving authenticated next-hop
-identity when direct adjacency is confirmed. A leaf does not need to
+(`mesh.rs:33150–33188`: `ann.hop_count > 0` (`:33160`) →
+`add_route_with_metric(ann.node_id, sender_addr, hop_count + 2)` (`:33185`),
+or `add_authenticated_route_with_metric` (`:33178`) when the adjacency is
+direct-confirmed), preserving authenticated next-hop identity when direct
+adjacency is confirmed. A leaf does not need to
 originate pingwaves to be reachable.
 
 **Non-forwarding is not a TTL.** `subnet/gateway.rs:329–342` treats
@@ -187,8 +203,10 @@ napi binding (Node ≥ 20). `web/` is a Next.js site. Every `wasm-bindgen` /
   across language tiers. The leaf joins that matrix.
 - The `reflex_addr` optional-field pattern on announcements — the exact
   wire-compat recipe for the two fields §5 and §6 add.
-- 123 `cfg(target_os = …)` sites under `adapter/net` — platform gating is
-  routine here.
+- 16 `cfg(target_os = …)` sites and 123 platform `cfg(…)` sites overall
+  (`target_os` / `unix` / `windows` / `target_family`) under `adapter/net`
+  *(corrected — the original "123 `cfg(target_os …)`" conflated the two)*.
+  Platform gating is routine here.
 - The MCP adapter doctrine ("adapters attach, nodes participate",
   `adapters/mcp/src/lib.rs`). A browser under this plan *participates*.
 
@@ -288,6 +306,17 @@ A non-reused `RtcPeerId` makes the *tuple-reuse* race impossible on the RTC
 path; it does **not** make stale callbacks or wrong direct/routed ownership
 impossible, so every protection stays and is re-exercised with an RTC
 endpoint in Stage 3's harness.
+
+**The floors this refactor must clear, as of `132dbdcff`.** The routing-plane
+witnesses are named CI gates with *minimum counts*, and they grew with the
+organization exact-sensing lane. `ci.yml` currently asserts
+`org_routing_wiring_tests >= 93` (`ci.yml:175`; `AGENTS.md`'s "currently 86"
+is stale), `behavior::org_routing:: >= 24` (`:285`),
+`behavior::org_routing_registry:: >= 62` / routing-state `>= 41`
+(`:345–346`), and the org gate/mesh floors `60` / `67` (`:563–564`). Those
+suites cover exactly the peer-keyed sites Stage 1 rewrites, so re-exercising
+them on `PeerAddr` — not the mechanical signature edit — is where Stage 1's
+cost actually sits. Re-read the floors before starting; they move.
 
 **Test policy for the refactor.** Changing a Rust parameter from
 `SocketAddr` to `PeerAddr` legitimately requires mechanical test edits. The
@@ -758,7 +787,12 @@ the new optional fields).
 - **Deterministic conformance:** extend the NAT simulator harness from
   [`NAT_TRAVERSAL_V2_PLAN.md`](NAT_TRAVERSAL_V2_PLAN.md) Stage 4 with two
   headless browsers behind simulated cone / port-restricted / symmetric NATs
-  and one anchor.
+  and one anchor. **Prerequisite, checked 2026-09-11:** that harness is
+  recorded as *"landed, pending first CI run"* — authored blind on a macOS box,
+  with only its loopback halves verified locally and the netns halves never
+  executed. `natsim.yml` exists. One green `natsim` run must exist before this
+  stage extends the harness, or the browser matrix inherits an unproven
+  substrate.
 - **Field telemetry:** `ice_direct / ice_attempted` exported through the
   existing stats surface and Deck; documented as a deployment metric with
   its own denominator.
@@ -792,9 +826,10 @@ the new optional fields).
 
 ### Stages 1–2 (endpoint generalization, wire crate)
 
-- `adapter/net/mesh.rs` — `PeerTransport` (`:2800`), `addr_to_node`,
-  `pending_direct_initiators`, dispatch context, `spawn_receive_loop`,
-  `connect*`, reroute call sites, announcement route-learning (`:26655`).
+- `adapter/net/mesh.rs` — `PeerTransport` (`:2990`), `addr_to_node` (`:1424`),
+  `pending_direct_initiators`, dispatch context, `spawn_receive_loop`
+  (`:24203`), `connect*` (`connect_via` at `:39609`), reroute call sites,
+  announcement route-learning (`:33150`).
 - `adapter/net/transport.rs` — `PeerAddr`, `Transport`.
 - `adapter/net/route.rs`, `reroute.rs`, `router.rs`, `proxy.rs`,
   `failure.rs`, `session.rs`, `swarm.rs`, `behavior/proximity.rs`,
@@ -865,7 +900,9 @@ Stage 3 harness before Stage 4 completes.
 
 - `str0m` 0.23.1 — sans-IO WebRTC. Native, feature `webrtc` only. MSRV
   1.85.0 (toolchain is 1.98.0), MIT OR Apache-2.0. ICE-TCP support to be
-  confirmed in S0b.
+  confirmed in S0b. *(Still the current release: `cargo search str0m` returns
+  0.23.1 at 2026-09-11. A web search claiming 0.21.0 is the latest is stale —
+  trust the registry.)*
 - `web-time` — `Instant` on wasm, `net-wire` on wasm32 only.
 - `getrandom` `wasm_js` — wasm32 only.
 - `wasm-bindgen`, `web-sys` (`RtcPeerConnection`, `RtcDataChannel`,
@@ -876,6 +913,26 @@ Stage 3 harness before Stage 4 completes.
 - Playwright — CI dev dependency.
 
 No new dependency reaches the default build.
+
+**CI capability this plan assumes and the repository does not have yet
+(checked 2026-09-11).** Three exit criteria are currently unfalsifiable
+because the jobs they name do not exist:
+
+- **No `wasm32` anywhere in CI** — zero matches for `wasm32` across
+  `.github/workflows/*.yml`. Stage 2's
+  `cargo check -p net-wire --target wasm32-unknown-unknown` needs the target
+  installed and a job written.
+- **No Playwright** — zero matches. Stage 5's browser matrix has no runner.
+- **No exported-symbol diff** — Stage 1's exit criterion ("exported C-ABI
+  symbol set unchanged (symbol diff in CI)") has nothing to compare against.
+  That job must exist *before* Stage 1, or the criterion cannot be met or
+  failed.
+
+Also absent, as expected at "not started": `crates/net/wire/`,
+`crates/net/leaf/`, and any `str0m` / `web-time` / `wasm-bindgen` entry in
+`net/crates/net/Cargo.toml` (every `wasm-bindgen` / `web-sys` line in
+`Cargo.lock` is still transitive). `getrandom` 0.4.3, `ring` 0.17.14 and
+`snow` 0.10.0 are present and are the versions §Context assumes.
 
 ---
 
@@ -985,3 +1042,34 @@ applied in this revision:
 | — | Name the announcement route-learning path; `reflex_addr` carries a `SocketAddr` on the wire | §Context, §7; wire-address inventory |
 | — | 2026-09-05, product owner: serverless-only hosting is anchorless, not UDP-blocked | §Non-goals, §6 "Serverless", Stage 7 packaged anchor |
 | — | 2026-09-05, product owner: document the serverless follow-on and keep v1 open to it | §Follow-on; `ControlPlane` trait + mock-driven exit criterion in Stage 5 |
+
+**2026-09-11 — re-baseline against `master` `132dbdcff`.** No design change;
+citations only. Every `path:line` and count in §Context, §1 and §Critical
+files re-derived at that head. What moved: the organization exact-sensing /
+sensing-SDK lane (PR #943, PR #949) put 62 commits on `mesh.rs` and grew it
+43,114 → 52,943 lines, shifting every `mesh.rs` reference by 6–7k lines
+(`PeerTransport` 2800 → 2990, `spawn_receive_loop` 17815 → 24203,
+`addr_to_node` 1281 → 1424, route-hop dispatch 18214 → 24602, headerless
+pingwave 18014 → 24402, `connect_via` 33114 → 39609, announcement
+route-learning 26655 → 33150). What did not move: the `PeerTransport` shape
+and its 19 match sites, all five outer packet formats, the seven wire modules
+(byte-identical), `MAX_PACKET_SIZE = 8192`, `route.rs:416` / `session.rs:67` /
+`swarm.rs:343` / `capability.rs:2319` / `crypto.rs:206` /
+`protocol.rs:9`+`:378` / `route.rs:28`+`:132` / `route_hop.rs:53` /
+`rendezvous.rs:191` / `gateway.rs:329–342` / `Cargo.toml:239`, the free
+`0x0D02` id, and `str0m` 0.23.1.
+
+Four claims were wrong when written and are corrected in place: `traversal/*`
+carries **46** `SocketAddr` mentions, not ~60; `session.rs` has **zero** tokio
+call sites (its two `tokio::` hits are prose in comments); the "123
+`cfg(target_os …)` sites" figure is **16** `target_os` sites out of 123
+platform `cfg(…)` sites overall; and `thread::spawn` appears in 36 files with
+test modules counted, not ~20 production files.
+
+Two prerequisites were added rather than discovered later: the routing-plane
+witness floors Stage 1 must clear (§1 — `MIN=93`, up from the 86 `AGENTS.md`
+still cited, plus four sibling floors; `AGENTS.md` corrected in the same
+commit), and the fact that the NAT simulator Stage 6 extends has never had a
+green CI run (Stage 6). §Dependencies now also records the three CI
+capabilities the plan's exit criteria assume and the repository lacks: wasm32,
+Playwright, and an exported-symbol diff.
