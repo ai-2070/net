@@ -1,0 +1,22 @@
+.github/workflows/ci.yml
+  h_64425bc75e3f3d 2278,2280,2282-2286,2317,2332,2334-2335
+docs/internal/misc/CODE_REVIEW_2026_09_10_SENSING_CONSUMER_SDK.md
+  h_64425bc75e3f3d 3-8,484-517
+net/crates/net/sdk/src/sensing.rs
+  h_64425bc75e3f3d 296-297
+net/crates/net/sdk/src/sensing/consumer.rs
+  h_64425bc75e3f3d 619-623,671-678,707
+net/crates/net/sdk/tests/sensing_consumer.rs
+  h_64425bc75e3f3d 821,832-844,846-850,858-860,862-865,889-899,905,909-924,933-940,947-972,977-980
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "b58816ce98788fc4b6b640d332e077fbd6b9c27f",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
