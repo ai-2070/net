@@ -20,61 +20,82 @@ pins are:
     (installation identity/generation + barriered revocation generation) before
     proof/send; token mismatch forbids use of the cached route set.
 
-Execution remains **OLB-1 → bounded stop-and-review → OLB-2**; the integrated
-leader design does not reopen OLB-0 or move the stop boundary.
+Execution was **OLB-1 → bounded stop-and-review → OLB-2**; both are past. The
+integrated leader design never reopened OLB-0 or moved the stop boundary.
 
-**Implementation status (2026-07-24) — Option-A exact-provider track.** The org
-sensing go-live ships **exact-provider first**: only the relay re-authoring of
-`OrgProviderRegistration` is live; the `OrgCapabilityRegistration` (leader /
-capability-resolution) path remains deliberately **dark**. The live provider
-slice is signed at **`SAFE_PROVIDER_LIVE_HEAD = b76f67284`**; its three-node
-transport/CI closure is signed at `e7fce993e`. Node-global local-projection and
-pre-leader race closure is signed at
-**`PRE_LEADER_CLOSURE_HEAD = cdb416a6b`**. The complete seed-derived leader
-lifecycle entry condition is signed at
-**`LEADER_ENTRY_CONDITION_HEAD = f2c82e467`**.
+**Implementation status (2026-09-11) — SIGNED, exact-provider track.**
+Same-organization sensed load balancing beneath `OrgClient::call` is merged and
+carries the owner's sign-off. The `OrgCapabilityRegistration` (leader /
+capability-resolution) arm remains deliberately **dark** — that is the LS
+track's, not this plan's.
 
-**OLB-0 exit correction (2026-08-30, read at
-`f9f423e7bfd5b3d90491600af27624a153f5f5bc`).** "These closures complete the
-practical Option-A OLB-0 substrate" is true for the INBOUND relay leg and for the
-node-global lease/refcount/cadence primitive, and false for the CONSUMER leg this
-plan actually needs. `MeshNode::acquire_sensing_interest_lease` (`mesh.rs:11197`)
-refuses every organization-derived audience with
-`SensingRegistrationError::OrgAudienceUnsupported` (`mesh.rs:6161`, raised at
-`:11220-11227`), added deliberately by `e0fb6b8e5` on review-pass-3 §4 rather than
-laundering a legacy frame onto the wire. Two consequences for the gates below:
+```text
+OLB_SIGNED_HEAD             = a2efc950ad4b903b2cc189db3929192f6bdabbc8  (PR #943)
+SAFE_ORG_EXACT_SENSING_HEAD = a2efc950ad4b903b2cc189db3929192f6bdabbc8
+OLB_2B3C_STEP2_HEAD         = d90493a5d75a2ab17e3105d7bb55d63ad0c144a5  (SIGNED)
+OLB_2B3D_PRE_HEAD           = 596e32190f245c819b12e3db97a08e455189e46b  (SIGNED)
+OWNER_SIGNOFF_READ_AT       = 132dbdcff251973e9eaf24e5c08eca7078d3b6f2
+SAFE_LIVE_HEAD              = still not established (provider-free leader only)
+```
 
-- OLB-0's exit witness "an org-private provider produces attestations under an
-  exact-provider lease while remaining absent from the provider-free population"
-  is **NOT satisfied** — no org-audience exact lease can be acquired at all.
-- §5.1a's sketch (`routing_state.acquire_exact_interest(..)` then
-  `node.sensed_candidates(..)`) and every OLB-2 bullet that acquires a lease per
-  authorized same-org provider are therefore **not reachable** at this head.
+Historical slice signatures, unchanged: the live provider slice at
+**`SAFE_PROVIDER_LIVE_HEAD = b76f67284`** with its three-node transport/CI
+closure at `e7fce993e`; node-global local-projection and pre-leader race
+closure at **`PRE_LEADER_CLOSURE_HEAD = cdb416a6b`**; the seed-derived leader
+lifecycle entry condition at **`LEADER_ENTRY_CONDITION_HEAD = f2c82e467`**.
 
-A second blocker, not previously recorded here: `register_sensing_interest_as`
-routes local registrations through the legacy `validate_subscriber_scope`
-(`mesh.rs:10950`), which requires `interest_audience == session_root ==
-local_root` — an organization commitment can never satisfy it, since
-`install_node_authority_inner` refuses exactly that collision
-(`mesh.rs:13866-13880`).
+The sign-off discharges the two OLB-2B pass-3 residuals that stood open — the
+independent RED mutation pass (discharged **by decision**, not by an executed
+independent pass; recorded as such) and the merged-head CI read (discharged by
+evidence). Evidence of
+record for the signed head: the CI-pinned witness rosters for
+`org_exact_sensing` (22), `sensing_org_exact_projection`,
+`sensing_org_exact_seam`, `sensing_org_exact_guards` and
+`sensing_org_lease_wire` all resolve and pass; main CI 34421817765 (46/46) at
+`c773b086d`, an ancestor of `master`; `org_exact_sensing` re-executed 22/22 at
+`132dbdcff`.
 
-Both are designed in
-[`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md)
-— **DESIGN FOR REVIEW; no implementation or arm lighting authorized**, and
-`SAFE_ORG_EXACT_SENSING_HEAD` is deliberately **not established**. OLB-2's
-same-org sensing join stays blocked on that design's review and its OA-6
-arm-lighting slice. The Rust SDK's sensing surface is provider-lifecycle only at
-this head; the exact-provider projection seam that briefly existed (`a58293e58`)
-was removed in `52e1d8bb2` for this same reason.
+**OLB-0 exit correction (2026-08-30) — CLOSED 2026-09-09.** The correction was
+real: at `f9f423e7b` the INBOUND relay leg and the node-global
+lease/refcount/cadence primitive were complete, and the CONSUMER leg was not.
+`MeshNode::acquire_sensing_interest_lease` refused every organization-derived
+audience with `SensingRegistrationError::OrgAudienceUnsupported` (added
+deliberately by `e0fb6b8e5` on review-pass-3 §4, rather than laundering a legacy
+frame onto the wire), and `register_sensing_interest_as` routed local
+registrations through the legacy `validate_subscriber_scope`, which an
+organization commitment can never satisfy because
+`install_node_authority_inner` refuses exactly that collision.
 
-These closures complete the practical Option-A OLB-0 substrate **for the inbound
-relay leg and the node-global lease/refcount/cadence primitive only** — see the
-OLB-0 exit correction above; the consumer leg remains unsatisfied. **OLB-1
-candidate factoring is SIGNED** at `OLB1_SIGNED_HEAD = 4dccb7767`
+Both blockers are now closed by the OA-1..OA-6 work of
+[`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md),
+merged at `a2efc950a`: the lease leg authors and emits
+`OrgProviderRegistration` from installed authority and registers its local row
+under the organization-derived proven root, so `OrgAudienceUnsupported` survives
+only in its narrowed meaning (no live membership to speak with, or a captured
+view that went stale). Consequences for the gates below:
+
+- OLB-0's exit witness — an org-private provider produces attestations under an
+  exact-provider lease while staying absent from the provider-free population —
+  **is satisfied**, at the org layer (`tests/sensing_org_exact_projection.rs`,
+  `tests/sensing_org_lease_wire.rs`, `sdk/tests/org_exact_sensing.rs`).
+- Every OLB-2 bullet that acquires a lease per authorized same-org provider is
+  **reachable and exercised**. §5.1a's `sensed_candidates` sketch is NOT how it
+  was built — ownership lives in `OrgSensingFamily`, and the projection is
+  per-request rather than published; see the scoped notes in §13 and the design's
+  D5.1/D5.2/D6.4.
+- The exact-provider projection seam removed in `52e1d8bb2` returned in its
+  reviewed form; the Rust SDK now also ships the S1 CONSUMER surface
+  (`SensingQuery`/`SensingWatch`, own-organization exact-provider only, PR #949),
+  so "provider-lifecycle only" no longer describes it.
+
+These closures complete the Option-A OLB-0 substrate on both legs — inbound
+relay, node-global lease/refcount/cadence, and the consumer leg closed above.
+
+**OLB-1 candidate factoring is SIGNED** at `OLB1_SIGNED_HEAD = 4dccb7767`
 (behavior-preserving `AuthorizedOrgCandidate` factoring in `call.rs`, with direct
 reachability sampled in sorted order to preserve the pre-factoring selection).
-The mandatory bounded stop-and-review passed, so **OLB-2 is authorized and its
-first slice, OLB-2A, is landing** — the GENERIC transactional indexed
+The mandatory bounded stop-and-review passed, so OLB-2 was authorized and its
+first slice, OLB-2A, landed — the GENERIC transactional indexed
 private-discovery substrate. **OLB-2A.1** (`ScopedDiscoveryState` wraps
 `ScopedDiscoveryStore`) makes the owner-plane capability query a SINGLE indexed
 bucket lookup (`owner_by_capability[cap]`, no scan of unrelated scopes) with NO
@@ -286,7 +307,9 @@ findings and four bounded corrections, all applied in this revision:
    non-stampeding) (§9) — for **UNSENSED** selection. A sensed
    organization-audience call does not use P2C; see §2A.
 
-**Current execution point:** architecture and Option-A OLB-0 are signed; OLB-1
+**Current execution point:** the exact-provider release is COMPLETE and SIGNED
+(see the implementation-status block at the top). Architecture and Option-A
+OLB-0 are signed; OLB-1
 candidate factoring is signed at `4dccb7767`. The bounded stop-and-review that
 gated OLB-2 has PASSED — see the implementation-status note above, which records
 the authorization and the OLB-2A slices that followed it. OLB-2A composed is
@@ -299,58 +322,59 @@ frozen boundary it must preserve.
 
 Within OLB-2B.3: `2B.3c-pre` is SIGNED at `2aa6431ed`, `2B.3b` at `5524bbc25`,
 and `2B.3a` at `fd05a89ba`. `2B.3c` step 1 was accepted and its lineage merged;
-step 2 is landed on master (`04a21d0b4`) and NOT SIGNED. **`2B.3d-pre` step 1 —
-the coherent current-authority cold plan — is IMPLEMENTED at a candidate and NOT
-SIGNED**, entered on the user's explicit direction while step 2 is unsigned; its
+**step 2 is SIGNED at `d90493a5d`** (merged as `04a21d0b4`). **`2B.3d-pre` step
+1 — the coherent current-authority cold plan — is SIGNED at `596e32190`**; its
 record is
 [`OLB_2B3B_WARMED_CALL_BOUNDARY_DESIGN.md`](OLB_2B3B_WARMED_CALL_BOUNDARY_DESIGN.md)
 §19. It changes no wire format, no public error vocabulary and no call surface:
-the cold path now derives from ONE captured observation of private-discovery
+the cold path derives from ONE captured observation of private-discovery
 authority and refuses to mint a proof under an identity that moved.
 `OrgCapabilityRegistration` remains dark and LS-1..LS-6 remain unbuilt.
-Two independent reviews HELD that candidate on six blockers (capture atomicity
-against the writer's pre-publication window, whole-vector currentness across
-routing and grant authority, superseded negative derivations, a witness that
-executed no grant plane, an unauthorized public bridge surface, and one stale doc
-link); the additive repair is landed and likewise unsigned. A second specification
-review then ACCEPTED that repair's concurrency/authority half and HELD two
-further blockers — one-acquisition evidence for the capture's store section, and
-a proof intent constructed before the final currentness comparison; both are
-repaired additively and remain unsigned.
 
-**Head tokens (corrected 2026-07-28).** The sign-off initially named `351f93480`
-as `SAFE_LIVE_HEAD`; that was withdrawn on review, since the token is reserved by
-this plan (below) and twice by
-[`ORG_SENSING_LEADER_SUBSTRATE_PLAN.md`](ORG_SENSING_LEADER_SUBSTRATE_PLAN.md)
-for a separately reviewed provider-free leader lighting that has not happened —
-`OrgCapabilityRegistration` is still dark and LS-1..LS-6 are unbuilt. The correct
-designations are:
+Both slices reached that signature the hard way, and the history stays on the
+record: two independent reviews HELD the 2B.3d-pre candidate on six blockers
+(capture atomicity against the writer's pre-publication window, whole-vector
+currentness across routing and grant authority, superseded negative
+derivations, a witness that executed no grant plane, an unauthorized public
+bridge surface, and one stale doc link); a second specification review ACCEPTED
+the repair's concurrency/authority half and HELD two further blockers —
+one-acquisition evidence for the capture's store section, and a proof intent
+constructed before the final currentness comparison. All were repaired
+additively (`00df2e43c`, `992bead9e`, `dff4e2df4`, `ae7394edd`, `596e32190`)
+and the repairs are inside the signed head.
+
+**Head tokens.** The 2026-07-28 correction stands: the sign-off that initially
+named `351f93480` as `SAFE_LIVE_HEAD` was withdrawn, because that token is
+reserved for the separately reviewed provider-free leader lighting — which
+still has not happened. `OrgCapabilityRegistration` is still dark and
+LS-1..LS-6 are still unbuilt. Current designations:
 
 ```text
 OLB_2B_SIGNED_HEAD = 351f93480ccd75f04cee305b5c53d8ab401e8724
-SAFE_LIVE_HEAD     = not established
+OLB_2B3C_STEP2_HEAD = d90493a5d75a2ab17e3105d7bb55d63ad0c144a5
+OLB_2B3D_PRE_HEAD   = 596e32190f245c819b12e3db97a08e455189e46b
+OLB_SIGNED_HEAD     = a2efc950ad4b903b2cc189db3929192f6bdabbc8
+SAFE_LIVE_HEAD      = not established
 ```
 
-The correction is to the token NAME only; it does not touch the E3c / OLB-2B.2
-signature or the 2B.3 authorization.
-
-**Merged is not signed, and the distinction is load-bearing here.** The
-merge-tier findings were closed before merge exactly as the pass-3 adjudication
-required, so the branch was mergeable; phase authorization is a separate gate
-that the merge does not discharge. The exact-head closure run demanded by that
-gate has now been EXECUTED at `80bb06b5a` and is recorded in
+**Merged is not signed — and both gates are now closed.** The merge-tier
+findings were closed before merge exactly as the pass-3 adjudication required,
+so the branch was mergeable; phase authorization was a separate gate. The
+exact-head closure run that gate demanded was EXECUTED at `80bb06b5a` and is
+recorded in
 [pass 3](../misc/CODE_REVIEW_2026_07_26_ORG_LOAD_BALANCING_PASS3.md#exact-head-closure-run--80bb06b5a).
-Two items remain, and neither is dischargeable by the author of the fixes: the
-independent RED mutations, and reading the CI conclusion for the merged head
-(this host has no `gh`, and its Windows runs cannot stand in for the `cfg(unix)`
-and serial-matrix coverage that only the Linux CI jobs provide).
+Its two residuals — the independent RED mutations, and reading the CI
+conclusion for the merged head — were **discharged by the owner's sign-off of
+2026-09-11**, whose evidence of record is listed in the implementation-status
+block at the top of this plan. The rule they encoded is not repealed: a future
+phase still needs its own exact-head closure, and the fix author still cannot
+sign their own RED pass.
 
 **OLB-2C entered at the user's explicit direction (2026-07-27) WITHOUT waiting
 for that signature**, after the hold was stated. Its first slice — the coherent
 authority publication half of 2B.2 — is landed and is recorded in
 [`OLB_2B_CONSUMER_ENTRY_DESIGN.md`](OLB_2B_CONSUMER_ENTRY_DESIGN.md) §8. It
-rests on the E1–E3c substrate, so an independent RED pass that invalidates a
-witness there also reaches this slice.
+rests on the E1–E3c substrate and is inside the signed head.
 
 *(review-pass-3 §19: this paragraph previously still said "OLB-2 does not begin
 until it signs off", contradicting the implementation-status note above it, which
@@ -2186,6 +2210,11 @@ including `ProviderNotDirect` and considered-count semantics).
 
 ### OLB-2 — same-org sensing join
 
+**DELIVERED and SIGNED** at `a2efc950a`, in the shape the scoped notes below
+describe (exact-provider leases owned by `OrgSensingFamily`, a per-call
+observation snapshot, no published sensing artifact) — not in the
+`sensed_candidates`/routing-actor shape the original bullets sketched.
+
 For same-org candidates:
 
 - consume the shared transactional indexed-discovery/source substrate specified
@@ -2404,6 +2433,14 @@ the X1 fixture, update the four binding classifiers plus the
 
 ### OLB-5 — live private-pool proof
 
+**DELIVERED and SIGNED** at `a2efc950a` as `sdk/tests/org_exact_sensing.rs`
+(22 witnesses, all through `Mesh::org` / `Mesh::serve_org` /
+`OrgClient::call` / `Mesh::sensing().provide`), with the org-layer producer and
+existence-oracle halves in `tests/sensing_org_exact_projection.rs`,
+`tests/sensing_org_lease_wire.rs` and `tests/sensing_org_three_node.rs`. Item 9
+is asserted in its corrected form: an all-pruned list still calls in the
+original authorized order and produces no new error.
+
 Three nodes in one organization: caller, provider A, provider B. Both
 providers privately advertise the same capability via `serve_org` and
 register readiness evaluators.
@@ -2458,22 +2495,34 @@ This slice does not block same-org load balancing.
 
 ## 14. Exit gate
 
+**Status (2026-09-11): 25 of 31 rows satisfied and signed; 6 not claimed by
+this release, each annotated in place.** The six are not oversights — four
+belong to the UNSENSED warmed-pool / OLB-4 lanes this release deliberately did
+not build (no P2C sampler exists in tree, and the exact lane introduces no
+no-viable error at all), and two are observability rows whose named counters
+(`org_sensing_truncated_total`, `org_sensing_fallback_total`) were never
+created, because the governing exact design authorized no new counter; the
+bounds and the fallback themselves are witnessed behaviourally. The
+reordered-`Deregister` repair row stays open by the same design's own §15
+non-goal. Nothing below is claimed of the provider-free leader arm, which is
+dark.
+
 The plan is complete when all are true:
 
-- [ ] Audience and sensing leases are node-global; the lease key
+- [x] Audience and sensing leases are node-global; the lease key
       supports both `ProviderFree` and `ExactProvider` shapes.
-- [ ] Organization candidates are authorized before sensing.
-- [ ] Org-private sensing is produced by exact-provider leases; the
+- [x] Organization candidates are authorized before sensing.
+- [x] Org-private sensing is produced by exact-provider leases; the
       provider-free population never contains locally private services
       (existence-oracle guard witnessed at the org layer).
-- [ ] Sensing registration is organization-authenticated
+- [x] Sensing registration is organization-authenticated
       (membership-carrying variants; forged/expired/floored/foreign
       membership refused; relays prove their own membership).
-- [ ] Sensing consumes only the authorized population
+- [x] Sensing consumes only the authorized population
       (`resolved_population` clamp witnessed as defense-in-depth).
-- [ ] Granted providers remain Unknown/Potential without explicit
+- [x] Granted providers remain Unknown/Potential without explicit
       sensing authority.
-- [ ] Lazy watches are retained in a bounded, clone-shared
+- [x] Lazy watches are retained in a bounded, clone-shared
       `OrgRoutingState`; a second call is warm; the last client drop
       releases every guard. *(Scoped 2026-08-30: this is the ROUTE plane.
       For organization exact sensing, sensing demand, lease tickets,
@@ -2484,20 +2533,24 @@ The plan is complete when all are true:
       clone retires the demand; see
       [`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md)
       D5.1/D5.2 and §2A.)*
-- [ ] Cadence relaxes when the strictest watcher drops; a stale lease
+- [x] Cadence relaxes when the strictest watcher drops; a stale lease
       ticket cannot remove a successor holder from the node-global
       registry (local invariant).
-- [ ] (OLB-2 exit) A reordered stale `Deregister` that transiently
+- [ ] **OPEN — not claimed by the signed release.** The governing exact design
+      lists "close the reordered-`Deregister` race" among its explicit
+      non-goals (§15), and no witness asserts the refresh repair below.
+      (OLB-2 exit) A reordered stale `Deregister` that transiently
       removes the remote row is repaired by the node-global lease's
       ttl/2 refresh; the observation is `Unknown`/`Potential` until
       repair and no `org.call` fails; a last-holder close disarms the
       refresh owner (no ghost demand).
-- [ ] The warmed **unsensed** org.call path is: ArcSwap route-set load →
+- [ ] **NOT CLAIMED — unsensed warmed-pool lane; no P2C sampler exists in
+      tree.** The warmed **unsensed** org.call path is: ArcSwap route-set load →
       two-index P2C → proof → send — no rediscovery, no candidate
       revalidation scan, no observation scan, no sorting, no interest
       reconciliation, no registration wait. Cold behavior is likewise
       unchanged.
-- [ ] A **sensed** org.call (OA-6 only) adds exactly ONE bounded
+- [x] A **sensed** org.call (OA-6 only) adds exactly ONE bounded
       `sensing_observations` critical section over the SENSED SameOrg
       observation rows (`S <= 32` rows, `O(S)` map lookups — the cap
       binds this row subset, never the complete authorized candidate
@@ -2525,11 +2578,11 @@ The plan is complete when all are true:
       remains the tie-break of record. *(Reconciled 2026-08-30; see
       [`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md)
       D6.4 for the mechanism and D6.8 for the divergence record.)*
-- [ ] Route sets are immutable, change-driven, single-flight rebuilt,
+- [x] Route sets are immutable, change-driven, single-flight rebuilt,
       and published **publish-if-current** over the full
       source-generation vector — a stale computation never publishes;
       staleness on read enqueues a rebuild, never performs one inline.
-- [ ] Authority validity deadlines arm a reconciler timer — **on the route/authority
+- [x] Authority validity deadlines arm a reconciler timer — **on the route/authority
       plane only.** *(Scoped 2026-08-30: family `OrgRouteSet` deadlines arm
       NOTHING, per
       [`OLB_2B3B_WARMED_CALL_BOUNDARY_DESIGN.md`](OLB_2B3B_WARMED_CALL_BOUNDARY_DESIGN.md)
@@ -2538,7 +2591,7 @@ The plan is complete when all are true:
       timer.)* expiry
       rebuilds and reselects without waiting for an external event;
       no expired credential enters `OrgProofIntent`.
-- [ ] The registration wire is the pinned appended 0x0C02 organization
+- [x] The registration wire is the pinned appended 0x0C02 organization
       variants; legacy variants never enter an organization-derived
       audience; mixed-version refusal degrades to Unknown and
       deterministic routing, never an invocation failure — **and every
@@ -2553,32 +2606,40 @@ The plan is complete when all are true:
       fallback at any version. *(Corrected 2026-08-30; see
       [`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md)
       D8.3.)*
-- [ ] The per-call temporal recheck of membership/dispatcher/grant
+- [x] The per-call temporal recheck of membership/dispatcher/grant
       remains on the hot path — the route cache is never an authority
       cache.
-- [ ] Sensed fan-out is bounded (32 sensed providers per capability /
+- [ ] **PARTIAL — the bound and its deterministic truncation are implemented
+      and witnessed; `org_sensing_truncated_total` does NOT exist (the exact
+      design authorized no new counter, and `MAX_SENSED_POPULATION` clamping is
+      observed through behaviour instead).**
+      Sensed fan-out is bounded (32 sensed providers per capability /
       **64 authority-scoped demands per clone family**, `MAX_HANDLES_PER_FAMILY`
       at `org_routing_registry.rs:52`) with
       deterministic truncation observable via
       `org_sensing_truncated_total`.
-- [ ] `OrgClient`'s internals are exactly: maintain candidates,
+- [x] `OrgClient`'s internals are exactly: maintain candidates,
       maintain leases, project route sets (route/authority plane), select —
       and, on the sensed path only, one per-call observation snapshot plus
       one linear bucket permutation (design D6.4/D7.2) — **no sensed
       `OrgRouteSet` and no published sensing artifact** — no retry queues,
       weights, EWMA, breakers, sticky sessions, probing, or policy
       configuration.
-- [ ] Viable is preferred over Potential; Potential remains eligible.
-- [ ] Unknown never prunes; NonViable prunes only from fresh exact
+- [x] Viable is preferred over Potential; Potential remains eligible.
+- [x] Unknown never prunes; NonViable prunes only from fresh exact
       evidence, and the ONLY such input is a fresh exact NotReady. A fresh
       Ready exceeding the hard E2E budget is Potential and is never pruned
       (`controller.rs:311-325`, arm `:323`), and stale evidence never becomes
       NonViable. *(Corrected 2026-08-30.)*
-- [ ] Cold/unavailable sensing preserves the current call path
+- [x] Cold/unavailable sensing preserves the current call path
       byte-for-byte, including `ProviderNotDirect`.
-- [ ] Sensing capacity fallback is observable
+- [ ] **OPEN — `org_sensing_fallback_total` does NOT exist. Every degradation
+      is witnessed behaviourally instead (it lands on the deterministic
+      unsensed order), which is weaker than a counter an operator can read.**
+      Sensing capacity fallback is observable
       (`org_sensing_fallback_total`).
-- [ ] No-viable is distinct from no-authority, local-only, counts
+- [ ] **NOT CLAIMED — unsensed OLB-4 lane only; superseded for this release.**
+      No-viable is distinct from no-authority, local-only, counts
       `non_viable`, and is pinned in the regenerated X1 fixture across
       all four binding suites. **SUPERSEDED FOR ORGANIZATION EXACT
       SENSING (2026-08-30) — not asserted of that lane.** The exact
@@ -2590,14 +2651,15 @@ The plan is complete when all are true:
       [`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md)
       §OA-6 and D7.3. This row remains live for the unsensed OLB-4
       balancing release only.
-- [ ] The P2C sampler contract (seed + nonce) is pinned, reproducible
+- [ ] **NOT CLAIMED — unsensed warmed-pool lane.**
+      The P2C sampler contract (seed + nonce) is pinned, reproducible
       under a fixed seed, and non-stampeding — on the **unsensed
       warmed-pool** track. *(Scoped 2026-08-30: the organization-audience
       exact-sensing path does not use P2C; it uses the per-call snapshot
       of design D6.4 plus the stable class-ordering pass of D7.2. This
       gate is not asserted of that path, and that path's ordering is not
       asserted of this gate.)*
-- [ ] (exact sensing) A sensed OA-6 call performs exactly ONE bounded
+- [x] (exact sensing) A sensed OA-6 call performs exactly ONE bounded
       `sensing_observations` critical section over the SENSED SameOrg
       observation rows (`S <= 32`; the complete authorized candidate
       count `C` is NOT capped, and the excess stays unsensed
@@ -2606,17 +2668,17 @@ The plan is complete when all are true:
       classification, the stable class-ordering pass, proof mint, and
       any `.await`/I/O. No `ArcSwap`-published sensing artifact and no
       routing-actor observation join exist for this slice.
-- [ ] (exact sensing) The mixed SameOrg/`Granted` list receives the
+- [x] (exact sensing) The mixed SameOrg/`Granted` list receives the
       defined stable class-ordering pass; `Granted` candidates are
       never sensed and never pruned; the existing global sort remains
       the tie-break of record.
-- [ ] Selection produces one exact provider.
-- [ ] Invocation still constructs canonical `OrgProofIntent`
+- [x] Selection produces one exact provider.
+- [x] Invocation still constructs canonical `OrgProofIntent`
       (nine fields unchanged).
-- [ ] Provider admission remains final.
-- [ ] No ambiguous execution is retried.
-- [ ] Node/Python/Go/TS/C implement no balancing logic.
-- [ ] The live witness proves the response came from the selected
+- [x] Provider admission remains final.
+- [x] No ambiguous execution is retried.
+- [x] Node/Python/Go/TS/C implement no balancing logic.
+- [x] The live witness proves the response came from the selected
       provider.
 
 ---

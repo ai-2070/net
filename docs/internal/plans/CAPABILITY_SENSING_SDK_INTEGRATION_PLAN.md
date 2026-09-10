@@ -12,19 +12,32 @@
 
 **Revision (2026-07-22, applies Kyra's OLB review ruling):** (1) organization sensing registration is authenticated by membership-cert-carrying registration variants — a narrow additive extension at registration intake; the earlier "no sensing-wire work" claim is withdrawn (§1.4, S0). (2) The node-global interest lease key has two shapes — `ProviderFree { audience, interest_digest }` and `ExactProvider { audience, interest_digest, provider }` — and each entry aggregates cadence with token-indexed intervals, not a bare refcount (§4.3, S0). (3) Organization-private consumers use exact-provider leases derived from private authorized discovery, never provider-free rendezvous (§3.1, §3.6). (4) Pruning follows fresh-evidence viability, not raw `NotReady` status (§2 rule 3). **Re-review (same day):** the registration wire choice is pinned — the organization variants are APPENDED to `SensingInterestFrame` under the existing 0x0C02 subprotocol, never a new subprotocol (S0); and S4's sequencing gates on the org-required S0/S1 subset, not S0–S3 (S4).
 
-**Status (2026-09-09).** Two different things are stated separately below,
-because the merged history and this contribution are not the same commit:
+**Status (2026-09-11) — S0 + S1 are MERGED and SIGNED.** Everything stated
+below as delivered is on `master` and carries the owner's sign-off. The
+earlier split between "merged base" and "this contribution" is spent: the S1
+consumer lifecycle merged in PR #949.
 
-- **merged base** `55fd0b7a4ebd0fa9ba14f93ddfcfd23755ced9de` — everything under
-  "core acquisition" and "OLB" below was read there;
-- **this contribution** — the S1 consumer lifecycle plus the review repairs, in
-  local commits on `LZL0/sending-sdk` above that base. The files it adds
-  (`sdk/src/sensing/consumer.rs`, `sdk/tests/sensing_consumer.rs`) do not exist
-  at the base SHA.
+```text
+SENSING_S0_S1_SIGNED_HEAD = 525b88ac04f17dd7b6cbe09eb1d305d8af0f62ae  (PR #949)
+SAFE_ORG_EXACT_SENSING_HEAD = a2efc950ad4b903b2cc189db3929192f6bdabbc8  (PR #943)
+OWNER_SIGNOFF_READ_AT      = 132dbdcff251973e9eaf24e5c08eca7078d3b6f2
+SAFE_LIVE_HEAD             = still not established — the provider-free leader
+                             arm is dark and LS-1..LS-6 are unbuilt
+```
+
+Sign-off evidence: main CI 34421817765 (46/46 green) at `c773b086d`, the S1
+consumer adjudication head, which is an ancestor of `master`; the CI-pinned
+rosters for `sensing_provider` (15), `sensing_consumer` (27) and
+`org_exact_sensing` (22) all resolve and pass; those three suites were
+re-executed at `132dbdcff` (15/15, 27/27, 22/22).
+
+What the sign-off does NOT cover: the provider-free leader arm
+(`OrgCapabilityRegistration` stays a dark drop), S2/S3/S4, and language
+bindings. Those remain unbuilt, not merely unsigned.
 
 Read this block, not the historical receipt below it, for current state.
 
-*Delivered (merged base).*
+*Delivered — core acquisition + the first product consumer (PR #943).*
 - **Core organization exact-provider acquisition, projection and refresh.** The
   own-organization exact lease authors and emits
   `SensingInterestFrame::OrgProviderRegistration` from installed authority,
@@ -40,7 +53,7 @@ Read this block, not the historical receipt below it, for current state.
 - **S1 provider lifecycle** — `SensingClient`, `provide` / `provide_replacing`,
   `ReadinessRegistration` (`sdk/src/sensing.rs`), unchanged by later work.
 
-*Delivered (this contribution).*
+*Delivered — the S1 consumer lifecycle (PR #949).*
 - **S1 consumer lifecycle, own-organization EXACT-PROVIDER scope only** —
   `SensingQuery`, `SensingWatch`, `SensingSnapshot`, `SensedProvider`,
   `SensedViability` (`sdk/src/sensing/consumer.rs`), with witnesses in
@@ -49,9 +62,9 @@ Read this block, not the historical receipt below it, for current state.
   node-global lease with explicit close and drop cleanup, the exact snapshot
   projection over the authorized population, and missed-wakeup-safe
   `changed()`. Work item 6 — provider evaluator installation and the
-  ownership-aware state-edge notification — is NOT part of this contribution:
-  it landed with the accepted S1 provider lifecycle in `sdk/src/sensing.rs`,
-  as the later S1 breakdown already states. *(Corrected 2026-09-10.)*
+  ownership-aware state-edge notification — landed earlier, with the S1
+  provider lifecycle in `sdk/src/sensing.rs`, as the later S1 breakdown
+  already states. *(Corrected 2026-09-10.)*
 - **The request states BOTH of its bounds.** `SensingQuery::start_within` is
   the provider-evaluated predicate that rides the signed interest (defaulting
   to the fixed policy the OLB retention asks, so a default watch shares that
@@ -730,7 +743,12 @@ Locked requirements:
 7. `Deregister` remains sender-row-scoped and therefore needs no delegated membership claim.
 8. Mixed-version refusal degrades to Unknown and deterministic routing, never an invocation failure — **subject to the absolute path-member floor**: the unknown-subprotocol catch-all that makes this degradation real landed in `5362486afca2681e7c3b2ca9d096bd70dc3c6130` and first shipped in `crates-v0.32.0` / v0.32.0, so **pre-0.32.0 consumers, relays and providers are EXCLUDED from the exact-org-sensing path rather than degrading cleanly** (below that release a 0x0C02 frame is parsed as application events). Providers/relays-first ordering is necessary but not sufficient on its own, and there is no legacy fallback for an org-derived audience at any version. *(Corrected 2026-08-30; see [`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md) D8.3.)*
 
-**Gate:** No organization-auth implementation until its separate review is signed off at an exact commit.
+**Gate — DISCHARGED.** The organization-auth review ran (its design is
+[`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md),
+its findings pass is
+[`CODE_REVIEW_2026_09_09_ORG_EXACT_SENSING.md`](../misc/CODE_REVIEW_2026_09_09_ORG_EXACT_SENSING.md)),
+and the implementation is signed at
+`SAFE_ORG_EXACT_SENSING_HEAD = a2efc950ad4b903b2cc189db3929192f6bdabbc8`.
 
 ### S1 — Rust SDK query/watch/provider lifecycle
 
@@ -738,10 +756,13 @@ Locked requirements:
 
 **Create/modify:**
 
-- Create `net/crates/net/sdk/src/sensing.rs`
-- Modify `net/crates/net/sdk/src/lib.rs`
-- Modify `net/crates/net/sdk/src/mesh.rs`
-- Add `net/crates/net/sdk/tests/sensing.rs` or the repository’s established SDK test location
+- Create `net/crates/net/sdk/src/sensing.rs` — **done**
+- Modify `net/crates/net/sdk/src/lib.rs` — **done**
+- Modify `net/crates/net/sdk/src/mesh.rs` — **done** (`enable_sensing`,
+  `sensing_incarnation`)
+- SDK witnesses — **done**, as `sdk/tests/sensing_provider.rs` (15) and
+  `sdk/tests/sensing_consumer.rs` (27); the consumer half additionally lives in
+  `sdk/src/sensing/consumer.rs`, which this list predates
 
 **Work:**
 
@@ -922,7 +943,10 @@ Not in this plan:
 
 ## 8. Release gate and success criterion
 
-The first useful release is S0–S2 plus the existing gang SDK wrapper from S3:
+The first useful release is S0–S2 plus the existing gang SDK wrapper from S3.
+**S0 and S1 are delivered and signed** (see the status block at the top); the
+shipped release is that chain with organization exact-provider selection in
+place of the generic nRPC step, which is still S2:
 
 ```text
 provider registers one readiness evaluator
@@ -936,11 +960,15 @@ provider registers one readiness evaluator
 
 S3 ordinary compute placement follows using the same projection. S4 organization composition is deliberately separate and does not block the generic SDK.
 
-The plan is successful when sophisticated sensing state collapses into two product-facing operations:
+The plan is successful when sophisticated sensing state collapses into two
+product-facing operations. As shipped:
 
 ```rust
-let watch = mesh.sensing().watch(query).await?;
-let readiness = mesh.sensing().provide(capability, evaluator)?;
+let mut watch = mesh.sensing()?.watch(SensingQuery::new(capability))?;
+let readiness = mesh.sensing()?.provide(capability, evaluator)?;
 ```
 
-Everything else is a thin adapter over `watch.current()`, not another framework.
+`watch` is synchronous (registration is node state, not a round trip); the
+await point is `watch.changed()`, and the state is read with
+`watch.snapshot()`. Everything else is a thin adapter over that snapshot, not
+another framework.
