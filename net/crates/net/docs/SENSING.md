@@ -110,7 +110,9 @@ The **supported** provider surface is the Rust SDK's
 `net_sdk::sensing`: `mesh.sensing()?.provide(..)` and the
 `ReadinessRegistration` it returns. That is what applications should
 use, and it is the only part of this lifecycle covered by the usual
-compatibility expectations.
+compatibility expectations. (Its consumer counterpart is
+`mesh.sensing()?.watch(..)` — same module, same expectations; see
+"Rust SDK" below.)
 
 Everything below it is **internal plumbing**. The registry itself
 (`behavior/sensing/evaluator.rs`) is crate-private; what remains `pub`
@@ -248,7 +250,8 @@ enforce it.
 
 ### Rust SDK
 
-`net_sdk::sensing` wraps the provider lifecycle and nothing else:
+`net_sdk::sensing` is two lifecycles: the PROVIDER side, and the
+own-organization EXACT-PROVIDER consumer observation.
 `mesh.sensing()?.provide(capability, evaluator)` returns a
 `ReadinessRegistration` that owns its registration and releases it on
 `close()` or drop. `changed()` routes through the ownership-aware seam,
@@ -263,12 +266,31 @@ restart), `IncarnationRequired` (the fail-closed origin gate),
 sensing plane at BUILD time is a compile error at the call site, not a
 runtime no-op: the module rides `feature = "net"`.
 
-**Not in the SDK.** There is no query, watch, snapshot, or readiness
-projection surface here, and none of the core's exact-provider
-acquisition is re-exported.
+**In the SDK.** `mesh.sensing()?.watch(SensingQuery::new(cap))` returns
+a `SensingWatch` over this node's own organization, exact-provider
+only: `snapshot()` yields a `SensingSnapshot` of `SensedProvider` rows
+(`readiness()`, `viability()`, `estimated_start()`, `route_estimate()`)
+plus the class-permuted `ranked()` order, `changed()` is a
+missed-wake-safe park, and `close()`/drop release the interest. The
+query states BOTH bounds and nothing else: `start_within` is the
+predicate the PROVIDER evaluates and rides the signed interest, while
+`within` is this consumer's own end-to-end budget. Its refusals are
+`EmptyCapability`, `UnsatisfiableStartBound`, `UnsatisfiableBudget`,
+`NoOrganizationAuthority`, `ObserverNotQualified`, `WatchesAtCapacity`,
+`ObservationIdentityUnavailable` and `WatchClosed` — a watch never
+degrades into a silently empty snapshot. Every read requalifies live
+membership and current owner-private visibility, off every pacing
+floor.
 
-The core boundary has moved. A local-origin OWN-ORGANIZATION
-exact-provider lease is implemented and dark: it plans and emits
+**Not in the SDK.** No interest, audience or wire vocabulary is
+re-exported (no `InterestSpec`, audience commitment, provider selector,
+result mode, lease ticket or leader id), and no provider-free
+(`AnyAuthorized`), tag, group, `Granted` or cross-organization query
+can be expressed — `SensingQuery` cannot name them and `watch` refuses
+what it cannot mean.
+
+The core boundary has moved, and it is LIT. A local-origin
+OWN-ORGANIZATION exact-provider lease plans and emits
 `SensingInterestFrame::OrgProviderRegistration` from installed
 authority, registers its local row under the organization-derived proven
 root, and reaches an organization-authoritative peer through that peer's
@@ -283,7 +305,8 @@ internal design is
 `ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md` under the
 repository's `docs/internal/plans/`.
 
-Retained demand and refresh now exist in the core, still dark. An
+Retained demand and refresh live in the core and carry the SDK's
+consumer watch and the organization call path. An
 internal clone-shared family, BOUND to the node it was minted on,
 retains exact-provider demand over the AUTHORIZED provider population of
 one owner-scoped capability — the audience derived from installed
@@ -487,12 +510,14 @@ order — lands on the same outcome: the deterministic unsensed order,
 with no new error. Only one input is request-relative: the latency
 budget, derived from that call's own deadline.
 
-What is still genuinely absent: no query, watch or snapshot surface,
-and no continuous ranking. There is no provider-free/leader sensing, no
-`Granted` or cross-organization sensing, no sensed ordering on the
-subnet-exported plane, and no language bindings — the consumer wiring
-is Rust-SDK-only. Acquisition is still not a projection, and the
-provider SDK surface stays provider-lifecycle only.
+What is still genuinely absent: no continuous ranking (a snapshot is
+asked for, never pushed as an order), no provider-free/leader sensing,
+no `Granted` or cross-organization sensing, no sensed ordering on the
+subnet-exported plane, no sensed `call_service` and no compute/gang
+sensed adapters, and no language bindings — both the consumer watch
+and the sensed call path are Rust-SDK-only. Acquisition is still not a
+projection: the SDK's `watch` reads the same per-request projection the
+call path does, and publishes no ranking artifact of its own.
 
 The plan's §4.5 node-authority refusal guards *owner-scoped* sensing,
 and the provider surface exposes none: registering an evaluator names

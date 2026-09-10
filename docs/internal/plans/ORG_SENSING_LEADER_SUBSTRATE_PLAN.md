@@ -1,27 +1,40 @@
 # Owner-Private Candidate Substrate — Design for Review (provider-free leader track)
 
-**Status:** DESIGN FOR REVIEW — nothing here is authorized for build. The
+**Status:** DESIGN FOR REVIEW — nothing here is authorized for build, and that
+is unchanged by the 2026-09-11 sign-off of the exact-provider track. The
 `OrgCapabilityRegistration` (leader) arm stays dark until (a) this design is
 signed off, (b) the substrate slice is built and reviewed, and (c) a separate
-arm-lighting slice passes its own review. Baselines this design builds on (all
-signed): `SAFE_PROVIDER_LIVE_HEAD b76f67284`, `PRE_LEADER_CLOSURE_HEAD
-cdb416a6b` (L1), `LEADER_ENTRY_CONDITION_HEAD f2c82e467` (§2).
+arm-lighting slice passes its own review. `SAFE_LIVE_HEAD` remains **not
+established**. Baselines this design builds on (all signed):
+`SAFE_PROVIDER_LIVE_HEAD b76f67284`, `PRE_LEADER_CLOSURE_HEAD cdb416a6b` (L1),
+`LEADER_ENTRY_CONDITION_HEAD f2c82e467` (§2), and now the whole exact-provider
+lane at `SAFE_ORG_EXACT_SENSING_HEAD a2efc950a` — which does not move any
+decision in this document, but does mean the leader track is the ONLY unbuilt
+sensing track left.
 
 **Track boundary:** this is a PARALLEL generic provider-free sensing track, not
 a prerequisite for the exact-provider-first organization load-balancing
-release. [`ORG_CAPABILITY_LOAD_BALANCING_PLAN.md`](ORG_CAPABILITY_LOAD_BALANCING_PLAN.md)
-continues through OLB-1..OLB-5 by deriving an authorized provider set from
+release — which has since shipped and been signed.
+[`ORG_CAPABILITY_LOAD_BALANCING_PLAN.md`](ORG_CAPABILITY_LOAD_BALANCING_PLAN.md)
+completed OLB-1..OLB-5 by deriving an authorized provider set from
 private discovery and acquiring one exact-provider lease per retained SameOrg
 provider. It never emits `OrgCapabilityRegistration`. The tracks share only the
 generic indexed private-discovery storage/source substrate and node-state
-revisions/wakes/timers (§6); neither consumes the other's authority-filtered
+revisions/wakes/timers (§6) — the OLB track landed that shared slice
+(`ScopedCapabilityIndex` / `ScopedDiscoveryState` in
+`behavior/org_scoped_store.rs`, i.e. §3 Stage A), so LS-1 starts against an
+existing indexed store with revisions, bounded dirty deltas and exact expiry
+already in place; neither track consumes the other's authority-filtered
 candidate projection, route/leader state, or lifecycle ownership.
 
 **Scope:** the org-scoped candidate projection that lets the sensing leader
 resolve an ORGANIZATION-admitted interest against the owner-private discovery
 plane, plus its reconciliation triggers and the (later-slice) leader intake
 wiring plan. Provider-only dispatch, exact-provider OLB selection, the wire
-format, the SDK surface, and grant-scoped sensing are untouched.
+format, the SDK surface, and grant-scoped sensing are untouched. The Rust SDK's
+shipped sensing surface (provider lifecycle plus the own-organization
+exact-provider consumer watch) expresses no provider-free selector at all, so
+lighting this arm would need its own SDK decision as well.
 
 ---
 
@@ -42,9 +55,15 @@ both directions:
   passes the legacy gate regardless of org membership or revocation floor.
 
 This is the exact reason the original full go-live (`83be13416`) was blocked
-and the arm was kept structurally dark. The two universes are disjoint today:
-the scoped store's only consumers are the SDK org-call queries
-(`sdk/src/org/call.rs:303,318`); sensing never reads it.
+and the arm was kept structurally dark. *(Corrected 2026-09-11: the closing
+sentence here used to read "the two universes are disjoint today: the scoped
+store's only consumers are the SDK org-call queries; sensing never reads it."
+The exact-provider lane changed that — organization EXACT sensing derives its
+population from owner-private discovery
+(`MeshNode::org_sensing_authorized_population`), so the scoped store now has a
+sensing consumer. What is still true, and is the whole problem below, is that
+the LEADER's candidate snapshot does not: it resolves from the plaintext fold
+under the §4.10 gate, which no owner-private provider can pass.)*
 
 ## 2. Inherited frozen invariants (not up for redesign)
 

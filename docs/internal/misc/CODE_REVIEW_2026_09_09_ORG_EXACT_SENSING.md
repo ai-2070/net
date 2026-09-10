@@ -1,11 +1,20 @@
 # CODE REVIEW 2026-09-09 — Organization exact-provider sensing (`netwriter/org-exact-sensing-design-2`)
 
-> **STATUS: OPEN.** No finding below has been adjudicated or fixed. Nothing in
-> this document is signed, and no witness has been written against any of it.
+> **STATUS: CLOSED 2026-09-11.** Every finding below was repaired before the
+> lane merged, and the lane is signed at
+> `SAFE_ORG_EXACT_SENSING_HEAD = a2efc950ad4b903b2cc189db3929192f6bdabbc8`
+> (PR #943), read at `master` `132dbdcff251973e9eaf24e5c08eca7078d3b6f2`. The
+> finding text below is the ORIGINAL, unedited and unretracted; the
+> **Closure addendum** at the end maps each finding to the commit that closed
+> it. Where the two disagree, the addendum governs.
 >
-> The branch's own closure commit (`ba27a29c6`, "close the 26 adjudicated
-> nonblocking findings") refers to an *earlier, separate* adjudication round —
-> it is not a response to this pass.
+> *(Superseded header, kept for the audit trail: "STATUS: OPEN. No finding
+> below has been adjudicated or fixed." That was true when this document was
+> filed at `58ab7a6ed`, 14:19 — the first repair landed 14 minutes later.)*
+>
+> The branch's own earlier closure commit (`ba27a29c6`, "close the 26
+> adjudicated nonblocking findings") refers to a *different, earlier*
+> adjudication round and is not a response to this pass.
 
 **Scope:** the full branch diff `master...ba27a29c6` (merge base `b7a669168`),
 tree clean. 52 files, +38940/−983, of which +5124/−102 is documentation.
@@ -527,3 +536,40 @@ Re-derived at the cited sites and found correct:
 §1, §2, §5, §10 and §11 each contradict a claim made in the surrounding
 comments or documentation. Whichever way they are adjudicated, the prose needs
 to move with the code.
+
+---
+
+## Closure addendum (2026-09-11)
+
+All thirteen findings were repaired on `2026-09-09` between `14:33` and `16:10`,
+i.e. after this document was filed (`58ab7a6ed`, `14:19`) and before the lane
+merged (`a2efc950a`, `16:33`). Every commit below is an ancestor of `master` at
+`132dbdcff`. The repairs are inside the signed head, so the sign-off covers them.
+
+| § | Severity | Closed by | What changed |
+|---|---|---|---|
+| 1 | HIGH | `46dcb7937` | `converge_under` no longer validates a carried-forward ticket against holder membership alone; an A→B owner-org rotation re-acquires instead of leaving a believed-converged, unrefreshable demand |
+| 2 | MEDIUM | `d798b4cb5`, `421258956` | `Refused`/`AuthorityUnavailable` no longer re-arm with `Established` provenance (nothing was registered); the `Unrenewed` retry is grounded in the row's real remaining life instead of `period / 2` |
+| 3 | MEDIUM | `77c02038c` | the `Step::Retry` drain is bounded against `OrderedSensingEgress`' 128-slot queue rather than releasing every parked entry in one poll |
+| 4 | MEDIUM | `b5166afbc`, `d214b8d9d` | `bind_node` consults the node's sensing master switch, so a sensing-dark node mints no acquisition and never enters `apply_sensed_order`; a contended reconciliation is declined rather than blocking the pre-`await` call path |
+| 5 | MEDIUM | `9a0059035`, `9ece0f71d` | the retry floor now applies under a `Certified` record too — and only to a REPEATED degradation, so a newly observed one is not floored |
+| 6 | MEDIUM | `5aac00249` | a refused organization release parks the still-live ticket instead of logging and dropping it, closing the row + upstream-registration leak |
+| 7 | LOW | `c273bcc5c` | the `Ok(None)` post-rotation arm counts a release refusal as a refusal (both defects at that site) |
+| 8 | LOW | `c273bcc5c` | …and a nothing-committed arm no longer reports a reconcile failure |
+| 9 | LOW | `79a20344c` | the release and refresh paths honour `partitioned` and reinstate the shared row, like the acquire path already did |
+| 10 | LOW | `14d33a604` | `arm_sensing_refresh`'s `false` is no longer discarded: an acquisition no refresh owner could be armed for is released instead of reported retained |
+| 11 | LOW | `45b2871d4` | `org_sensed_bucket_permutation` is a real permutation — emission is tracked by INDEX, duplicate provider ids cannot collapse, and a short `same_org` slice reads as `false` past its end rather than truncating |
+| 12 | LOW | `63ded660a` | adjudicated as a packaging decision, not a code fix: the `fixtures` forwarding stays, and the manifest now states exactly what a downstream crate unlocks by enabling it |
+| 13 | LOW | `ba5d2ee5f` | a demand is identified by a minted id, not by `Arc::as_ptr`; the ABA hazard is gone |
+
+One repair beyond the thirteen landed in the same batch: `f7b7622a7` makes
+`sensing_branch_projections` read branch freshness at one captured instant
+(`projected_at(now)`), matching the organization traversal beside it.
+
+The closing observation of the Disposition above — §1, §2, §5, §10 and §11 each
+contradicted surrounding prose — was honoured: each fix moved its comments with
+the code, and the plan-level prose was reconciled in
+[`ORG_CAPABILITY_LOAD_BALANCING_PLAN.md`](../plans/ORG_CAPABILITY_LOAD_BALANCING_PLAN.md),
+[`CAPABILITY_SENSING_SDK_INTEGRATION_PLAN.md`](../plans/CAPABILITY_SENSING_SDK_INTEGRATION_PLAN.md),
+[`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](../plans/ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md)
+and `net/crates/net/docs/SENSING.md`.

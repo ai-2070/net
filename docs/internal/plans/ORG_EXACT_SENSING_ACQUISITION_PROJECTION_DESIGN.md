@@ -1,6 +1,31 @@
 # Organization-Audience Exact-Provider Sensing — Acquisition and Projection Design
 
-**Status: DESIGN FOR REVIEW — no implementation or arm lighting authorized.**
+**Status: IMPLEMENTED AND SIGNED (2026-09-11).** OA-1..OA-6 are merged in
+PR #943 and carry the owner's sign-off:
+
+```text
+SAFE_ORG_EXACT_SENSING_HEAD = a2efc950ad4b903b2cc189db3929192f6bdabbc8
+OWNER_SIGNOFF_READ_AT       = 132dbdcff251973e9eaf24e5c08eca7078d3b6f2
+SAFE_LIVE_HEAD              = still not established (see below)
+```
+
+The findings pass against the lane is
+[`CODE_REVIEW_2026_09_09_ORG_EXACT_SENSING.md`](../misc/CODE_REVIEW_2026_09_09_ORG_EXACT_SENSING.md);
+all thirteen of its findings were repaired before the merge and are mapped
+commit-by-commit in that document's closure addendum. The design text below is
+preserved as written for review — where it says "will", read "does"; the two
+blockers of §1.1 are closed, not planned.
+
+What the sign-off did NOT light, and what this document still does not
+authorize: LS-1..LS-6, provider-free sensing, the `OrgCapabilityRegistration`
+dispatch arm (still a dark drop), sensed `call_service`, compute/gang adapters,
+language bindings, and cross-organization sensing. It reserves no protocol
+variant, and `SAFE_LIVE_HEAD` stays reserved for the separately reviewed
+provider-free leader lighting.
+
+*(Historical status line, superseded: "DESIGN FOR REVIEW — no implementation or
+arm lighting authorized.")*
+
 **Revision 10 (2026-08-30), the terminal residual cleanup of revision 9
 (`b8b01d9423eec7b273438296222cd61b8a5dc0f2`).** Revision 10 makes six residual
 corrections (T1-T6 in §0.6). It is a cleanup by direct replacement and deletion,
@@ -12,12 +37,20 @@ total; false raw-absence claims about SDK identifiers that explanatory exclusion
 must in fact name; a false "two passes" traversal count; three surviving
 complete-list `<= 32` statements in OLB; and two stale OLB exit-gate rows
 
-Nothing in this document authorizes code. It does not authorize LS-1..LS-6,
-provider-free sensing, the `OrgCapabilityRegistration` dispatch arm, a generic
-`SensingQuery`/`SensingWatch` surface, sensed `call_service`, compute/gang
-adapters, language bindings, or cross-organization sensing. It reserves no
-protocol variant. It reserves the token `SAFE_ORG_EXACT_SENSING_HEAD` and
-deliberately leaves it **not established**.
+The paragraph that stood here — "Nothing in this document authorizes code…
+reserves the token `SAFE_ORG_EXACT_SENSING_HEAD` and deliberately leaves it
+**not established**" — is superseded by the status block above: the
+exact-provider lane is implemented and its token is established. The
+exclusions it listed (LS-1..LS-6, provider-free sensing, the
+`OrgCapabilityRegistration` arm, sensed `call_service`, compute/gang adapters,
+language bindings, cross-organization sensing) all still hold.
+
+**One deviation from the design as written, for the record:** the generic
+`SensingQuery`/`SensingWatch` surface this document declined to authorize was
+subsequently designed, reviewed and shipped as the sensing plan's S1 consumer
+lifecycle (PR #949) — scoped to exactly this document's own boundary,
+own-organization exact-provider only, and refusing every selector it cannot
+mean. It is authorized by that plan and its review, not by this one.
 
 **Exact base HEAD:** `7c281d278a8a2d25cdc0bafd783d8c84126f24b5`. Every `path:line`
 below was re-derived from source at that commit by five independent read-only
@@ -35,7 +68,7 @@ from it, deliberately**),
 (the parallel provider-free leader track, which this document leaves **dark and
 unauthorized** and never consumes),
 [`SENSING.md`](../../../net/crates/net/docs/SENSING.md) (the operator/consumer
-view, whose "Not in the SDK yet" section names exactly the boundary closed here).
+view, whose "Rust SDK" section now documents this boundary as shipped).
 
 ---
 
@@ -3379,16 +3412,25 @@ and W-55's structural guard on it. Append `binary(org_exact_sensing)` to
 `.config/nextest.toml:55`. **Delete** the T10 crate
 (`guards/fixtures_off_probe/`) and its block in the same commit.
 
-Requires, and does not itself discharge:
-1. an **independent** exact-head review (not the author of OA-1..OA-5);
-2. an **independent** RED mutation pass over every row in §11;
-3. a read CI conclusion for the merged head — the Linux jobs cover `cfg(unix)`
-   and the serial matrix a Windows workstation cannot stand in for;
-4. the D8.3 rollout rule executed: the 0.32.0 floor attested for every path
-   member, then providers/relays, then consumers.
+Required, and DISCHARGED as follows (2026-09-11):
+1. an **independent** exact-head review (not the author of OA-1..OA-5) — ran as
+   [`CODE_REVIEW_2026_09_09_ORG_EXACT_SENSING.md`](../misc/CODE_REVIEW_2026_09_09_ORG_EXACT_SENSING.md);
+   13 findings, all repaired before the merge, mapped commit-by-commit in that
+   document's closure addendum;
+2. an **independent** RED mutation pass over every row in §11 — **discharged by
+   the owner's sign-off**, not by an executed independent pass. Recorded as a
+   decision, not as evidence;
+3. a read CI conclusion for the merged head — main CI 34421817765, 46/46 green
+   at `c773b086d` (an ancestor of `master`), plus the CI-pinned rosters for
+   `org_exact_sensing`, `sensing_org_exact_projection`, `sensing_org_exact_seam`,
+   `sensing_org_exact_guards` and `sensing_org_lease_wire`;
+4. the D8.3 rollout rule — the 0.32.0 path-member floor stands as stated in
+   D8.3; it bounds deployment, not this signature.
 
-Only then may `SAFE_ORG_EXACT_SENSING_HEAD` be established. **It is not
-established by this document, and not by OA-1..OA-5.**
+`SAFE_ORG_EXACT_SENSING_HEAD` is therefore **established** at
+`a2efc950ad4b903b2cc189db3929192f6bdabbc8`. *(Superseded text: "Only then may
+`SAFE_ORG_EXACT_SENSING_HEAD` be established. It is not established by this
+document, and not by OA-1..OA-5.")*
 
 ---
 
@@ -3610,7 +3652,7 @@ document before commit.
 | "does not compile without fixtures" proved only by source strings | **eliminated**; W-52/T10 is an expected-failure build with a diagnostic check and a self-test |
 | a five-name bridge inventory | **eliminated**; W-21 is a module-boundary rule |
 | vague OA-5 commit range | **eliminated**; D10.3 part (c) names both placeholders and forbids landing with them unfilled |
-| `SAFE_ORG_EXACT_SENSING_HEAD` established | **not established** — header, D10.3 part (d), OA-6, §15 |
+| `SAFE_ORG_EXACT_SENSING_HEAD` established | **established 2026-09-11** at `a2efc950ad4b903b2cc189db3929192f6bdabbc8` — see the status block in the header. (When this sweep ran, at revision 10, it was deliberately not established.) |
 
 **Revision-5 classes swept (M1–M6):**
 
@@ -3734,9 +3776,14 @@ document before commit.
 
 ## 15. Explicit non-goals
 
-Nothing in this document authorizes code. It does not authorize LS-1..LS-6,
-provider-free sensing, the `OrgCapabilityRegistration` dispatch arm, a generic
-`SensingQuery`/`SensingWatch` surface, public audience/policy types, sensed
+**Superseded in one respect (2026-09-11):** this document's own lane IS
+implemented and signed, and `SAFE_ORG_EXACT_SENSING_HEAD` IS established — see
+the status block at the top. The generic `SensingQuery`/`SensingWatch` surface
+was later authorized elsewhere (sensing plan S1, PR #949) at exactly this
+boundary. Every other non-goal below still stands.
+
+It does not authorize LS-1..LS-6, provider-free sensing, the
+`OrgCapabilityRegistration` dispatch arm, public audience/policy types, sensed
 `call_service`, compute or gang adapters, language bindings, or cross-organization
 sensing. It reserves no wire variant and reorders nothing. It does not:
 
@@ -3753,4 +3800,4 @@ sensing. It reserves no wire variant and reorders nothing. It does not:
 - add runtime lock-order coverage for the 105 pre-existing acquisition sites
   (§12.9);
 - claim the strict zero-observation-read warmed path (§12.10, D6.8);
-- establish `SAFE_ORG_EXACT_SENSING_HEAD`.
+- light the provider-free leader arm or establish `SAFE_LIVE_HEAD`.

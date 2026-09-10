@@ -19,11 +19,13 @@ steps and all 16 scope items. Its record is §16.
 is §17. 2B.3b's exact content is the §13 row, its accounting is §4/§4.1, its
 lookup shape is §8, and its refusal semantics are §9.
 
-**`2B.3c` is AUTHORIZED** from that exact head; its scope is §18. Step 1 (the
-second publication cell) was ACCEPTED and its lineage merged; **step 2 (the
-actor build cycle) is IMPLEMENTED at a candidate and NOT SIGNED** — §18.0.
-`2B.3d-pre`, `2B.3d` and every later OLB slice are not authorized, and step 2's
-candidate does not authorize `2B.3d-pre`.
+**`2B.3c` is SIGNED IN FULL.** Step 1 (the second publication cell) was
+ACCEPTED and its lineage merged; **step 2 (the actor build cycle) is SIGNED at
+`OLB_2B3C_STEP2_HEAD = d90493a5d75a2ab17e3105d7bb55d63ad0c144a5`** (merged as
+`04a21d0b4`) — §18.0, §18. **`2B.3d-pre` step 1 is SIGNED at
+`OLB_2B3D_PRE_HEAD = 596e32190f245c819b12e3db97a08e455189e46b`** — §19; the
+owner's 2026-09-11 sign-off of the exact-provider release covers both. `2B.3d`
+and every later OLB slice remain unauthorized.
 
 **Substrate:** `OLB_2B3A_SIGNED_HEAD = fd05a89ba` — the per-slot
 `Arc<ArcSwapOption<SlotBaseFacts>>` publication cell — plus
@@ -815,10 +817,11 @@ automatic provider retry, no waiting for actor work.** Preserves exactly:
 `AmbiguousCapabilityGrant`, `NoAuthorizedProvider`, Owner-before-Grant duplicate
 behaviour, provider-byte ordering, first-direct selection, exact considered count.
 
-**Step 1 — the capture, the derivation over it, and the mint gate — is
-IMPLEMENTED at a candidate and NOT SIGNED.** Entered on the user's explicit
-direction while 2B.3c step 2 is unsigned; that authorization is recorded here
-rather than claimed as a signature. Its record is §19.
+**Step 1 — the capture, the derivation over it, and the mint gate — is SIGNED**
+at `OLB_2B3D_PRE_HEAD = 596e32190f245c819b12e3db97a08e455189e46b`, under the
+owner's 2026-09-11 sign-off of the exact-provider release. It was entered on
+the user's explicit direction while 2B.3c step 2 was still unsigned; step 2 is
+now signed too. Its record is §19.
 
 ## 11. Warmed path and sender boundary (2B.3d)
 
