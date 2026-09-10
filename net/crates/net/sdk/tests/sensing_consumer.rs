@@ -649,16 +649,28 @@ fn publish_unrelated_change(node: &Arc<MeshNode>, provider: u64) {
 /// Snapshot until `predicate` holds, DRIVEN BY `changed()` — so every wait in
 /// these witnesses is a real park on the shipped notification, and a lost wake
 /// fails as a timeout rather than being polled around.
+///
+/// Returns the snapshot that SATISFIED the predicate, because that is the read
+/// a witness may assert on. Readiness and viability are continuity-based: a
+/// projection decays (`Ready` -> `Unknown`, `Viable`/`NotViable` ->
+/// `Potential`, an estimate to `None`) once a branch's continuity window
+/// elapses without a fresh qualifying beat. A witness that waits for a state
+/// and then takes a SECOND, independent snapshot to assert on is therefore
+/// asserting about a read it never qualified — which is how
+/// `the_population_follows_authorization_and_never_widens_past_it` failed CI
+/// run 34517413243 with `ranked` of length 1 and the newly authorized
+/// provider read as `Unknown`. Fold the claim into the predicate and assert on
+/// what comes back.
 async fn until_snapshot(
     what: &str,
     watch: &mut SensingWatch,
     mut predicate: impl FnMut(&net_sdk::sensing::SensingSnapshot) -> bool,
-) {
+) -> net_sdk::sensing::SensingSnapshot {
     let end = Instant::now() + SETTLE;
     loop {
         let snapshot = watch.snapshot().expect("snapshot");
         if predicate(&snapshot) {
-            return;
+            return snapshot;
         }
         assert!(Instant::now() < end, "{what}: last was {snapshot:?}");
         tokio::time::timeout(SETTLE, watch.changed())
@@ -786,7 +798,7 @@ async fn signed_readiness_reaches_the_snapshot_and_an_edge_wakes_the_watcher() {
         "the state edge must move a live observation path"
     );
 
-    until_snapshot(
+    let snapshot = until_snapshot(
         "the edge never reached the watcher",
         &mut observation,
         |snap| {
@@ -796,7 +808,9 @@ async fn signed_readiness_reaches_the_snapshot_and_an_edge_wakes_the_watcher() {
     )
     .await;
 
-    let snapshot = observation.snapshot().expect("snapshot");
+    // On the read that qualified: a second one could have aged the signed
+    // `NotReady` into `Unknown`, whose viability is `Potential`, not
+    // `NotViable` — a decay, not the demotion this asserts.
     let sensed = row(&snapshot, provider_id);
     assert_eq!(sensed.viability(), SensedViability::NotViable);
     assert_eq!(
@@ -1210,17 +1224,27 @@ async fn one_attestation_yields_two_verdicts_under_two_budgets() {
     let mut unbounded = watch(&consumer, asks.clone());
     let mut tight = watch(&consumer, asks.within(Duration::from_secs(1)));
 
-    until_snapshot("the provider never read Ready", &mut unbounded, |snap| {
+    let open = until_snapshot("the provider never read Ready", &mut unbounded, |snap| {
         snap.provider(provider_id)
             .is_some_and(|p| p.readiness() == ProjectedReadiness::Ready)
     })
     .await;
-
-    let open = unbounded.snapshot().expect("snapshot");
     assert_eq!(row(&open, provider_id).viability(), SensedViability::Viable);
     assert_eq!(open.preferred(), Some(provider_id));
 
-    let bounded = tight.snapshot().expect("snapshot");
+    // The tight watch is asked for ITS OWN qualified read rather than sampled
+    // once: it is a separate watch that was never waited on, and readiness
+    // decays between reads, so a bare snapshot here could carry `Unknown` and
+    // say nothing about the two verdicts this witness is about.
+    let bounded = until_snapshot(
+        "the tight watch never read the same signed Ready",
+        &mut tight,
+        |snap| {
+            snap.provider(provider_id)
+                .is_some_and(|p| p.readiness() == ProjectedReadiness::Ready)
+        },
+    )
+    .await;
     let sensed = row(&bounded, provider_id);
     assert_eq!(
         sensed.readiness(),
@@ -1286,8 +1310,21 @@ async fn independent_wrappers_share_ownership_and_the_last_close_stops_the_refre
         },
     )
     .await;
+    // The second wrapper is asked for its own qualified read: it shares the
+    // row, but a bare snapshot taken after the first watch's wait can carry a
+    // decayed projection and would then fail on ageing rather than on
+    // ownership.
+    let shared = until_snapshot(
+        "the second wrapper never observed the shared row",
+        &mut second_watch,
+        |snap| {
+            snap.provider(provider_id)
+                .is_some_and(|p| p.readiness() == ProjectedReadiness::Ready)
+        },
+    )
+    .await;
     assert_eq!(
-        row(&second_watch.snapshot().expect("snapshot"), provider_id).readiness(),
+        row(&shared, provider_id).readiness(),
         ProjectedReadiness::Ready,
         "both wrappers observe ONE shared interest row"
     );
@@ -1965,17 +2002,21 @@ async fn the_population_follows_authorization_and_never_widens_past_it() {
     let ready_two = Arc::new(AtomicBool::new(true));
     let _second_readiness = provide(&second, ready_two, Duration::from_millis(40));
     tokio::time::sleep(PAST_FLOOR).await;
-    until_snapshot(
-        "the newly authorized provider never entered the population",
+    // ONE read carries the whole claim: the newly authorized provider is in
+    // the population, Ready, and RANKED beside the incumbent. A second,
+    // independent snapshot could legitimately show it decayed to
+    // `Unknown`/`Potential` between the two reads - its cadence is 40 ms - and
+    // that is exactly how this witness failed CI run 34517413243.
+    let wide = until_snapshot(
+        "the newly authorized provider never entered the population as a ranked member",
         &mut observation,
         |snap| {
             snap.provider(second_id)
                 .is_some_and(|p| p.readiness() == ProjectedReadiness::Ready)
+                && snap.ranked().len() == 2
         },
     )
     .await;
-
-    let wide = observation.snapshot().expect("snapshot");
     assert_eq!(
         wide.providers()
             .iter()
@@ -2216,7 +2257,7 @@ async fn the_query_asks_the_provider_start_bound_it_names() {
         &consumer,
         SensingQuery::new(TAG).within(Duration::from_secs(100)),
     );
-    until_snapshot(
+    let refused = until_snapshot(
         "the default bound never got an answer",
         &mut default_watch,
         |snap| {
@@ -2225,7 +2266,6 @@ async fn the_query_asks_the_provider_start_bound_it_names() {
         },
     )
     .await;
-    let refused = default_watch.snapshot().expect("snapshot");
     let sensed = row(&refused, provider_id);
     assert_eq!(
         sensed.readiness(),
@@ -2258,12 +2298,11 @@ async fn the_query_asks_the_provider_start_bound_it_names() {
         &consumer,
         SensingQuery::new(TAG).start_within(Duration::from_secs(5)),
     );
-    until_snapshot("the asked bound never got a Ready", &mut asking, |snap| {
+    let honored = until_snapshot("the asked bound never got a Ready", &mut asking, |snap| {
         snap.provider(provider_id)
             .is_some_and(|p| p.readiness() == ProjectedReadiness::Ready)
     })
     .await;
-    let honored = asking.snapshot().expect("snapshot");
     let sensed = row(&honored, provider_id);
     assert_eq!(sensed.viability(), SensedViability::Viable);
     assert_eq!(sensed.estimated_start(), Some(Duration::from_secs(3)));
@@ -2278,8 +2317,18 @@ async fn the_query_asks_the_provider_start_bound_it_names() {
     );
 
     // 3. The two watches are INDEPENDENT questions: the default one still
-    //    reads NotReady after the generous one succeeded.
-    let still = default_watch.snapshot().expect("snapshot");
+    //    reads NotReady after the generous one succeeded. Asked for its own
+    //    qualified read — an aged `Unknown` here is decay, not a rewritten
+    //    answer, and would say nothing about independence.
+    let still = until_snapshot(
+        "the default watch never answered again",
+        &mut default_watch,
+        |snap| {
+            snap.provider(provider_id)
+                .is_some_and(|p| p.readiness() != ProjectedReadiness::Unknown)
+        },
+    )
+    .await;
     assert_eq!(
         row(&still, provider_id).readiness(),
         ProjectedReadiness::NotReady,
@@ -2318,14 +2367,14 @@ async fn a_row_never_reports_economics_its_verdict_did_not_use() {
     let budget = Duration::from_secs(1);
 
     let mut observation = watch(&consumer, SensingQuery::new(TAG).within(budget));
-    until_snapshot("the provider never read Ready", &mut observation, |snap| {
+    // CONTROL: with nothing moving, the row is Viable and its economics fit —
+    // asserted on the read that qualified, since a second read can age the
+    // projection out from under the control.
+    let control = until_snapshot("the provider never read Ready", &mut observation, |snap| {
         snap.provider(provider_id)
             .is_some_and(|p| p.readiness() == ProjectedReadiness::Ready)
     })
     .await;
-
-    // CONTROL: with nothing moving, the row is Viable and its economics fit.
-    let control = observation.snapshot().expect("snapshot");
     let sensed = row(&control, provider_id);
     assert_eq!(sensed.viability(), SensedViability::Viable);
     assert!(
@@ -2830,7 +2879,7 @@ async fn a_new_signed_estimate_reverses_the_sdk_rank_while_both_stay_ready() {
     );
 
     let mut observation = watch(&consumer, SensingQuery::new(TAG));
-    until_snapshot(
+    let first = until_snapshot(
         "the fixture never ranked both providers",
         &mut observation,
         |snap| {
@@ -2844,7 +2893,6 @@ async fn a_new_signed_estimate_reverses_the_sdk_rank_while_both_stay_ready() {
         },
     )
     .await;
-    let first = observation.snapshot().expect("snapshot");
     assert_eq!(
         first.preferred(),
         Some(fast_id),
@@ -2852,8 +2900,15 @@ async fn a_new_signed_estimate_reverses_the_sdk_rank_while_both_stay_ready() {
     );
     assert_eq!(first.ranked(), &[fast_id, slow_id]);
 
-    // CONTROL: nothing moves, the order is stable.
-    let again = observation.snapshot().expect("snapshot");
+    // CONTROL: nothing moves, the order is stable. A SECOND read, requalified
+    // on both rows still being ranked — so a row ageing out is not mistaken
+    // for the order changing, while a genuine reorder still fails here.
+    let again = until_snapshot(
+        "the order never re-read with both providers ranked",
+        &mut observation,
+        |snap| snap.ranked().len() == 2,
+    )
+    .await;
     assert_eq!(again.ranked(), first.ranked(), "control: a stable order");
 
     // ONE input moves: the fast provider publishes a much worse start, still
@@ -2861,16 +2916,16 @@ async fn a_new_signed_estimate_reverses_the_sdk_rank_while_both_stay_ready() {
     fast_start.store(1_500, Ordering::Relaxed);
     assert!(fast_registration.changed());
 
-    until_snapshot(
-        "the new estimate never reached the consumer",
+    let reversed = until_snapshot(
+        "the new estimate never reached the consumer as a re-ranked order",
         &mut observation,
         |snap| {
             snap.provider(fast_id)
                 .is_some_and(|p| p.estimated_start() == Some(Duration::from_millis(1_500)))
+                && snap.ranked().len() == 2
         },
     )
     .await;
-    let reversed = observation.snapshot().expect("snapshot");
     for provider in reversed.providers() {
         assert_eq!(
             provider.readiness(),
