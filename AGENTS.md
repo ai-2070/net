@@ -153,3 +153,33 @@ The reverse holds on a Windows workstation: no local command compiles `#[cfg(uni
 - Design docs: `net/crates/net/docs/*.md` (behavior, capabilities, channels, transport, subnets, storage/cortex, organizations, identity).
 - Internal plans/audits: `docs/internal/` (plans, reviews, performance, audits).
 - Skill examples that CI actually executes: `.claude/skills/net-event-bus/examples/` (guarded by ci.yml paths — editing them re-runs the jobs that hold the maturin wheel and libnet cdylib).
+
+## CodeGraph
+
+This project has a CodeGraph knowledge graph index (`.codegraph/`). CodeGraph is a tree-sitter-parsed database of every symbol, edge, and file. Reads are sub-millisecond and return structural information grep cannot.
+
+### CLI usage reference
+
+| Question | Command |
+|---|---|
+| "Find a symbol by name" | `codegraph search <name>` |
+| "Find callers of a function" | `codegraph callers <symbol>` |
+| "Find callees a function calls" | `codegraph callees <symbol>` |
+| "Trace flow from X to Y" | `codegraph trace <from> <to>` |
+| "Impact analysis for symbol Z" | `codegraph affected <symbol>` |
+| "Show a symbol's source location" | `codegraph query 'select ...'` or callers/callees |
+| "What files exist under path/" | `codegraph files <path>` |
+| "Full-text search in indexed code" | `codegraph search --fts <query>` |
+| "Build context for a task" | `codegraph context <topic>` |
+| "Is the index healthy?" | `codegraph status` |
+
+### Rules of thumb
+
+- **Use codegraph first** for structural questions (definitions, callers, callees, trace flows). It's faster and more accurate than grep.
+- **Trust codegraph results** — they come from a full AST parse. Do NOT re-verify with grep.
+- **When tracing a flow**, use `codegraph trace <from> <to>` — one call returns the whole path with dynamic hops bridged (callbacks, React re-render, JSX).
+- **Index lag**: the file watcher debounces ~500ms behind writes. If you get stale results, run `codegraph sync` first, or check `codegraph status` for pending files.
+
+### If `.codegraph/` doesn't exist
+
+Run `codegraph init -i` to initialize and `codegraph index` to build the index.
