@@ -44,11 +44,14 @@ Read this block, not the historical receipt below it, for current state.
 - **S1 consumer lifecycle, own-organization EXACT-PROVIDER scope only** —
   `SensingQuery`, `SensingWatch`, `SensingSnapshot`, `SensedProvider`,
   `SensedViability` (`sdk/src/sensing/consumer.rs`), with witnesses in
-  `sdk/tests/sensing_consumer.rs`. That covers S1 work items 1, 3, 4, 5, 6 and
+  `sdk/tests/sensing_consumer.rs`. That covers S1 work items 1, 3, 4, 5 and
   7 for this scope: bounded query validation, watch registration over the
   node-global lease with explicit close and drop cleanup, the exact snapshot
   projection over the authorized population, and missed-wakeup-safe
-  `changed()`.
+  `changed()`. Work item 6 — provider evaluator installation and the
+  ownership-aware state-edge notification — is NOT part of this contribution:
+  it landed with the accepted S1 provider lifecycle in `sdk/src/sensing.rs`,
+  as the later S1 breakdown already states. *(Corrected 2026-09-10.)*
 - **The request states BOTH of its bounds.** `SensingQuery::start_within` is
   the provider-evaluated predicate that rides the signed interest (defaulting
   to the fixed policy the OLB retention asks, so a default watch shares that
@@ -149,8 +152,8 @@ The user hypothesis is confirmed for production decision paths:
 | Proximity/routing/failure detector | **Input producer and invalidation source**, not a final consumer. Supplies path estimate/reachability and wakes recomputation. |
 | nRPC `call_service` | **Not integrated.** Uses capability discovery, health filtering, authorization filtering, and `RoutingPolicy`, but not sensing. |
 | Ordinary compute `Scheduler` | **Not integrated.** Places daemons, migration targets, and group members from static capability state and placement filters. |
-| SDK | **Provider lifecycle integrated (accepted S1); consumer side not integrated.** `net/crates/net/sdk/src/sensing.rs` ships `SensingClient` (`:220`), `Mesh::sensing` (`:267`), `provide` / `provide_replacing` (`:305` / `:338`), and the RAII `ReadinessRegistration` (`:399`, `Drop` `:486-489`). There is still no query, watch, snapshot, or projection surface, and sensed gang methods are still not wrapped. *(Corrected 2026-08-30: the original row's blanket "No sensing module or lifecycle" is false after S1.)* |
-| Organization SDK | **Not integrated.** Its thin facade performs verified private discovery and deterministic exact-provider selection. |
+| SDK | **Provider lifecycle integrated (accepted S1); consumer side integrated for the OWN-ORGANIZATION EXACT-PROVIDER scope only.** `net/crates/net/sdk/src/sensing.rs` ships `SensingClient`, `Mesh::sensing`, `provide` / `provide_replacing`, and the RAII `ReadinessRegistration`. `sdk/src/sensing/consumer.rs` now ships `SensingQuery` / `SensingWatch` / `SensingSnapshot` / `SensedProvider` / `SensedViability` — query, watch, snapshot and the exact-provider projection, with explicit close and drop cleanup. Still NOT integrated: provider-free (leader) registration, cross-organization scopes, and the sensed gang methods, none of which are wrapped. *(Corrected 2026-08-30: the original row's blanket "No sensing module or lifecycle" is false after S1. Corrected 2026-09-10: the "no query, watch, snapshot, or projection surface" clause is false after the S1 consumer contribution; the surface exists, in the narrow scope stated.)* |
+| Organization SDK | **Same-organization load balancing integrated (OLB, merged in PR #943 at `a2efc950a`); sensing consumption is the S1 consumer surface above.** Its facade performs verified private discovery and deterministic exact-provider selection, and the production call path consumes the sensed order. Cross-organization selection remains out. *(Corrected 2026-09-10: the original "Not integrated" row predates OLB's merge.)* |
 | Tools/A2A/Hermes/OpenClaw integrations | **No direct integration.** Their capability calls flow through nRPC/tool paths. |
 | Dataforts/CAS/MeshDB | **No integration required.** Their target decisions are possession, coverage, and data-locality questions, not provider-readiness interests. |
 | Transport router | **No integration required.** Routing supplies path facts; it must not select application providers. |
@@ -160,7 +163,7 @@ Tests and benchmarks consume sensing as evidence surfaces, but they are not runt
 
 ### 1.3 Missing product layer
 
-Normal callers currently must understand too much:
+Normal callers originally had to understand too much:
 
 - `InterestSpec`, digests, audience commitments, and provider selectors;
 - leader node IDs for provider-free registration;
@@ -170,12 +173,25 @@ Normal callers currently must understand too much:
 - evaluator installation and state-edge notification;
 - explicit and drop-time deregistration.
 
-There is no SDK-level ownership or cleanup contract for **consumer watches**. For
-**provider evaluators** there now is one, delivered by accepted S1:
-`ReadinessRegistration` (`sdk/src/sensing.rs:399`) owns its registration id and
-releases it on `close()` / `Drop` (`:473-489`), removal is conditional on that
-exact id, and the ownership-aware state edge routes through
-`notify_sensing_state_changed_owned`. *(Corrected 2026-08-30.)*
+*(Updated 2026-09-10.)* Two ownership contracts now exist, and the list above
+is historical for exactly those two:
+
+- **provider evaluators** — accepted S1's `ReadinessRegistration`
+  (`sdk/src/sensing.rs`) owns its registration id and releases it on `close()`
+  / `Drop`, removal is conditional on that exact id, and the ownership-aware
+  state edge routes through `notify_sensing_state_changed_owned`.
+  *(Corrected 2026-08-30.)*
+- **consumer watches, own-organization exact-provider scope only** —
+  `SensingWatch` (`sdk/src/sensing/consumer.rs`) owns this watch's own demand
+  over the node-global lease: `close()` and `Drop` release exactly its own
+  leases, another owner's row survives, and the last release deregisters. The
+  caller states a capability string plus two bounds and never touches an
+  interest digest, an audience commitment, a selector, a leader id, or the
+  ttl/2 refresh.
+
+What is still missing is unchanged: provider-free (leader) registration,
+cross-organization scopes, and the sensed gang methods have no SDK ownership
+or cleanup contract, and this plane still ships dark.
 
 ### 1.4 Authority prerequisite
 

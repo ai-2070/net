@@ -838,10 +838,12 @@ async fn signed_readiness_reaches_the_snapshot_and_an_edge_wakes_the_watcher() {
 ///   then required to arrive AND to have its capture COMPLETE before that
 ///   saved deadline ([`wake_carrying`]). An earlier revision only bounded the
 ///   park by `WAKE_BOUND`, which does not exclude a floor wake that happens
-///   to be due inside it: the review's discriminator parked DELIBERATELY near
-///   the saved fallback (sleeping to fallback − 400 ms, modelling permissible
-///   descheduling — not a measured natural setup delay and not a flake rate)
-///   and the old assertion accepted the floor's wake.
+///   to be due inside it: with the watch's edge consumed, a park scheduled
+///   DELIBERATELY to fallback − 150 ms — inside the old 250 ms bound, and
+///   modelling permissible descheduling rather than a measured natural delay
+///   or a flake rate — let the old assertion accept the floor's wake. (The
+///   fallback − 400 ms figure belongs to the quiet control below, whose
+///   negative window is 700 ms.)
 ///
 /// The seam's release moves the generation without changing what a snapshot
 /// REPORTS, so the accepted wake cannot be qualified by payload; the
@@ -1610,6 +1612,137 @@ async fn a_self_revoked_observer_is_refused_on_existing_and_new_reads() {
     assert!(
         Instant::now() < unexpired_floor,
         "and it did so before that floor would have expired"
+    );
+
+    let _ = std::fs::remove_dir_all(&consumer.dir);
+    let _ = std::fs::remove_dir_all(&provider.dir);
+}
+
+/// Publish a REAL, UNRELATED organization view movement: a revocation floor
+/// for an entity that is neither this consumer nor its provider, through the
+/// shipped bundle path. It moves the revocation store's publication
+/// generation — which is what a capture's currency recheck detects — without
+/// touching anyone's qualification.
+fn publish_unrelated_view_movement(node: &Arc<MeshNode>, owner: &OrgKeypair, floor: u32) {
+    let stranger = net::adapter::net::identity::EntityKeypair::generate();
+    let mut floors = std::collections::BTreeMap::new();
+    floors.insert(stranger.entity_id().clone(), floor);
+    let bundle = OrgRevocationBundle::try_issue(owner, &floors).expect("bundle");
+    node.node_authority()
+        .expect("authority")
+        .revocation
+        .apply_bundle(&bundle)
+        .expect("the organization publishes an unrelated floor");
+}
+
+/// ONE view movement inside the live-membership capture spends the read's
+/// second attempt and still answers — it is not an avoidable refusal.
+///
+/// The movement is PLACED, not raced: the fixtures capture-window seam fires
+/// inside each capture the read performs, at the head of the window the
+/// capture's own currency recheck closes, and this hook publishes a real
+/// unrelated revocation on the FIRST capture only. So attempt 1 observes a
+/// genuinely moved view, the view is then stable, and attempt 2 must succeed.
+///
+/// Distinct from the pre-existing end-of-attempt retry: the movement lands
+/// during the membership capture, which returned `ViewChanged` and — before
+/// this repair — exited the loop through `.ok()?` without using attempt 2.
+/// The seam counter proves the second attempt really ran, and the returned
+/// population proves it answered under a currently qualified view.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_view_movement_in_the_capture_spends_a_retry_and_still_answers() {
+    let owner = org();
+    let consumer = mesh_in_org("c-vmove", &owner, true, None).await;
+    let audience = shared_audience(&consumer);
+    let provider = mesh_in_org("p-vmove", &owner, true, Some(&audience)).await;
+    let _service = serve(&provider);
+    bring_up(&consumer, &[&provider]).await;
+    converge_population(&consumer, &[&provider], 1).await;
+    let provider_id = provider.node.node_id();
+
+    let mut observation = watch(&consumer, SensingQuery::new(TAG));
+    // CONTROL: with no movement placed, this read is qualified and reports the
+    // provider — so the refusal below can only come from the movement.
+    let baseline = observation.snapshot().expect("baseline");
+    assert!(
+        baseline.provider(provider_id).is_some(),
+        "precondition: the population is visible before any movement: {baseline:?}"
+    );
+
+    let captures = Arc::new(AtomicU64::new(0));
+    let seen = captures.clone();
+    let seam_owner = org();
+    let seam_node = Arc::clone(&consumer.node);
+    consumer
+        .node
+        .set_sensing_visibility_capture_seam_for_test(Arc::new(move || {
+            if seen.fetch_add(1, Ordering::SeqCst) > 0 {
+                // Stabilized: the second attempt sees an unmoving view.
+                return;
+            }
+            publish_unrelated_view_movement(&seam_node, &seam_owner, 11);
+        }));
+    let answered = observation
+        .snapshot()
+        .expect("one movement inside the capture must not refuse a qualified observer");
+    consumer
+        .node
+        .clear_sensing_visibility_capture_seam_for_test();
+    assert_eq!(
+        captures.load(Ordering::SeqCst),
+        2,
+        "the read must have spent its SECOND attempt, not answered on the first"
+    );
+    assert!(
+        answered.provider(provider_id).is_some(),
+        "and the answer is the currently authorized population: {answered:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&consumer.dir);
+    let _ = std::fs::remove_dir_all(&provider.dir);
+}
+
+/// A view that keeps moving stays BOUNDED and refuses: two attempts, then
+/// `ObserverNotQualified` — never a spin, and never a population reported
+/// under a view that stopped qualifying it.
+///
+/// The same seam as the witness above, without the once-only gate: every
+/// capture observes a fresh real movement. This is the control that keeps the
+/// retry honest — the repair must not have turned a bound into a loop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_continuously_moving_view_refuses_after_the_bound() {
+    let owner = org();
+    let consumer = mesh_in_org("c-vspin", &owner, true, None).await;
+    let audience = shared_audience(&consumer);
+    let provider = mesh_in_org("p-vspin", &owner, true, Some(&audience)).await;
+    let _service = serve(&provider);
+    bring_up(&consumer, &[&provider]).await;
+    converge_population(&consumer, &[&provider], 1).await;
+
+    let mut observation = watch(&consumer, SensingQuery::new(TAG));
+    let _ = observation.snapshot().expect("baseline");
+
+    let captures = Arc::new(AtomicU64::new(0));
+    let seen = captures.clone();
+    let seam_owner = org();
+    let seam_node = Arc::clone(&consumer.node);
+    consumer
+        .node
+        .set_sensing_visibility_capture_seam_for_test(Arc::new(move || {
+            let n = seen.fetch_add(1, Ordering::SeqCst);
+            publish_unrelated_view_movement(&seam_node, &seam_owner, 20 + n as u32);
+        }));
+    let refusal = observation
+        .snapshot()
+        .expect_err("a view that never stops moving must not be answered");
+    consumer
+        .node
+        .clear_sensing_visibility_capture_seam_for_test();
+    assert_eq!(refusal, SensingError::ObserverNotQualified);
+    assert_eq!(
+        captures.load(Ordering::SeqCst),
+        2,
+        "and it must refuse AT the bound: exactly two attempts, no spin"
     );
 
     let _ = std::fs::remove_dir_all(&consumer.dir);

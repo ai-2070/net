@@ -489,9 +489,10 @@ silently stops witnessing.
 Independent adjudication of the sections above, plus the repairs actually
 landed. The original findings are preserved verbatim; nothing above was
 deleted or rewritten. Provenance: this addendum is the implementer's record of
-the reviewer's adjudication, and every "repaired" row below is backed by a
-discriminating inverse — a mutation that makes the strengthened witness fail —
-with retained logs and exit codes.
+the reviewer's adjudication. The §2 timing repairs are backed by executed
+discriminating inverses — mutations that make the strengthened witnesses fail,
+with retained logs and exit codes; the §6 prose corrections and the §1/§3/§4/§5
+dispositions are documentation and judgement, not inverse-backed evidence.
 
 | § | Adjudicated as | Action taken |
 |---|---|---|

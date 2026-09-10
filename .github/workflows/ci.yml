@@ -2312,6 +2312,8 @@ jobs:
             an_expired_announcement_leaves_the_population_and_a_live_one_stays
             the_population_follows_authorization_and_never_widens_past_it
             a_new_signed_estimate_reverses_the_sdk_rank_while_both_stay_ready
+            one_view_movement_in_the_capture_spends_a_retry_and_still_answers
+            a_continuously_moving_view_refuses_after_the_bound
             a_granted_only_provider_is_never_sensed_and_the_owner_one_is
             a_partial_acquisition_keeps_its_own_state_and_another_owners
             the_population_floor_wakes_a_quiet_parked_consumer
@@ -2331,8 +2333,8 @@ jobs:
           done
           # `listed` counts PROGRESS LINES from the run above — it is a
           # floor on tests that actually ran, not a non-executing inventory.
-          [ "$listed" -ge 25 ] \
-            || { echo "::error::expected at least 25 consumer witnesses executed, saw $listed"; exit 1; }
+          [ "$listed" -ge 27 ] \
+            || { echo "::error::expected at least 27 consumer witnesses executed, saw $listed"; exit 1; }
           echo "consumer observation lifecycle: $listed executed, $pinned pinned by name, all green"
 
       # === OA-6: the PRODUCTION organization exact-sensing call edge =======

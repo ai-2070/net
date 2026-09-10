@@ -1353,7 +1353,7 @@ pub(crate) fn capture_live_org_relay_membership(
 /// witnesses pass a closure that publishes a floor raise, poisons the store or
 /// swaps the authority while the gate is parked there.
 #[allow(clippy::too_many_arguments)]
-fn capture_live_org_relay_membership_seamed(
+pub(crate) fn capture_live_org_relay_membership_seamed(
     org_install: &Mutex<()>,
     node_authority: &ArcSwapOption<NodeAuthority>,
     org_revocation: &ArcSwapOption<OrgRevocationStore>,

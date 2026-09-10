@@ -11066,6 +11066,13 @@ pub struct MeshNode {
     /// first row.
     #[cfg(any(test, feature = "fixtures"))]
     sensing_capture_seam: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Fixtures seam: fires ONCE inside each live-membership capture performed
+    /// by [`Self::org_sensing_current_visibility`], in the window the capture's
+    /// phase C exists to close — after the coherent floor snapshot, before the
+    /// currency recheck. A witness publishes a REAL view movement there to
+    /// place a `ViewChanged` on a chosen attempt.
+    #[cfg(any(test, feature = "fixtures"))]
+    sensing_visibility_capture_seam: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Fixtures seam: fires at each labelled point of the sensed projection
     /// that must run OFF every sensing lock, carrying this thread's guard
     /// depth and set. Lets a witness prove the off-lock claim positively.
@@ -12996,6 +13003,8 @@ impl MeshNode {
             #[cfg(any(test, feature = "fixtures"))]
             sensing_capture_seam: parking_lot::Mutex::new(None),
             #[cfg(any(test, feature = "fixtures"))]
+            sensing_visibility_capture_seam: parking_lot::Mutex::new(None),
+            #[cfg(any(test, feature = "fixtures"))]
             sensing_projection_offlock_observer: parking_lot::Mutex::new(None),
             sensing_local_projection_mu,
             #[cfg(feature = "fixtures")]
@@ -13774,6 +13783,26 @@ impl MeshNode {
     #[cfg(any(test, feature = "fixtures"))]
     pub fn clear_sensing_phase_two_seam_for_test(&self) {
         *self.sensing_phase_two_seam.lock() = None;
+    }
+
+    /// Install the visibility capture-window seam (fixtures only).
+    ///
+    /// `hook` runs inside every live-membership capture that
+    /// [`Self::org_sensing_current_visibility`] performs, at the head of the
+    /// window the capture's currency recheck closes. A witness that publishes
+    /// a real view movement there — a revocation floor raise, an authority
+    /// swap — places a `ViewChanged` deterministically instead of racing one,
+    /// and a hook that fires on the FIRST capture only models one movement
+    /// followed by stabilization.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn set_sensing_visibility_capture_seam_for_test(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.sensing_visibility_capture_seam.lock() = Some(hook);
+    }
+
+    /// Remove the visibility capture-window seam (fixtures only).
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn clear_sensing_visibility_capture_seam_for_test(&self) {
+        *self.sensing_visibility_capture_seam.lock() = None;
     }
 
     /// The shared node-local registration core, parameterized by the owning
@@ -15977,6 +16006,13 @@ impl MeshNode {
     ///   though its retained leases are untouched;
     /// * the qualifying view did not move while the population was derived.
     ///
+    /// A view that moves under the attempt is not an answer: it is retried
+    /// ONCE, whether it surfaces during the live-membership capture or at the
+    /// end-of-attempt currency check, so a single concurrent publication does
+    /// not turn into an avoidable refusal. A view republished continuously
+    /// still answers `None` after that bound, and a genuine qualification
+    /// failure is never retried.
+    ///
     /// The population itself is the authorized-population derivation the
     /// retention transaction uses,
     /// so an announcement that expired, was clamped by its provider
@@ -15998,14 +16034,61 @@ impl MeshNode {
             let snapshot = self.capture_sensing_authority_snapshot().ok()?;
             let org = snapshot.authority_view().owner_org;
             // LIVE local membership, not merely an installed object.
-            self.capture_live_org_relay_membership(org, super::behavior::org::current_timestamp())
-                .ok()?;
+            match self.capture_visibility_membership(org, super::behavior::org::current_timestamp())
+            {
+                Ok(_) => {}
+                // The view MOVED under the capture. That is the advisory race
+                // this loop's second attempt exists for — the same outcome the
+                // end-of-attempt currency check retries on, just observed one
+                // step earlier — so spend an attempt rather than reporting an
+                // avoidable `None`. Each attempt re-qualifies from scratch, so
+                // a persistently republished view still refuses after the
+                // bound instead of spinning.
+                Err(sensing::RelayMembershipUnavailable::ViewChanged) => continue,
+                // Every other outcome is a genuine qualification failure —
+                // nothing installed, poisoned, generation-exhausted, foreign,
+                // invalid or revoked below the floor — and retrying it would
+                // only ask the same question twice.
+                Err(_) => return None,
+            }
             let population = self.org_sensing_authorized_population(capability);
             if self.sensing_authority_snapshot_current(&snapshot) {
                 return Some(population);
             }
         }
         None
+    }
+
+    /// The live-membership capture [`Self::org_sensing_current_visibility`]
+    /// performs, carrying the fixtures capture-window seam
+    /// ([`Self::set_sensing_visibility_capture_seam_for_test`]) so a witness
+    /// can place a real view movement inside the window instead of racing one.
+    ///
+    /// Production is exactly
+    /// [`Self::capture_live_org_relay_membership`]: with no seam installed the
+    /// hook is `|| {}`, the same closure the unseamed entry point passes.
+    fn capture_visibility_membership(
+        &self,
+        org_id: super::behavior::org::OrgId,
+        now_secs: u64,
+    ) -> Result<sensing::LiveOrgRelayMembership, sensing::RelayMembershipUnavailable> {
+        #[cfg(any(test, feature = "fixtures"))]
+        let seam = self.sensing_visibility_capture_seam.lock().clone();
+        sensing::capture_live_org_relay_membership_seamed(
+            &self.org_install,
+            &self.node_authority,
+            &self.org_revocation,
+            &self.org_install_generation,
+            self.entity_id(),
+            org_id,
+            now_secs,
+            || {
+                #[cfg(any(test, feature = "fixtures"))]
+                if let Some(hook) = seam {
+                    hook();
+                }
+            },
+        )
     }
 
     /// The AUTHORIZED sensing population for one owner-scoped capability: the
