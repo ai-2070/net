@@ -1,0 +1,14 @@
+net/crates/net/sdk/tests/org_exact_sensing.rs
+  h_64425bc75e3f3d 1311-1334,1339,1376,1378-1396,1423,1426,1434-1456,1466-1471
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "e59109c6510f338d963ff18fac503fbc23842690",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
