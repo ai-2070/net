@@ -76,6 +76,14 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 # installs nothing and buys no legacy downgrade. Both are ordering/exclusion
 # proofs over real loopback UDP, where a retry can only convert a dropped
 # registration or a lost observation into a green run.
+#
+# `sensing_consumer` (net-mesh-sdk) joins on the same rule. Its lost-wake
+# witness fires a real change at one placed instant inside a capture and
+# requires the next park to return far below the population floor; its control
+# requires the same park NOT to return inside that bound. Both are properties
+# of one interleaving and of one timing boundary, so a retry could only turn a
+# swallowed wake — or an always-immediate one — into a green run. Its
+# ownership witnesses are the same shape as `sensing_provider`'s.
 [[profile.default.overrides]]
-filter = 'binary(integration_nrpc_protected) + binary(org_ownership) + binary(capability_exposure_revocation) + binary(org_admission_gate) + binary(org_admission_wire) + binary(nrpc_call_hijack) + binary(nrpc_response_routing) + binary(nrpc_service_equality) + binary(nrpc_route_discriminator) + binary(nrpc_streaming_gate) + binary(nrpc_registration_order) + binary(sensing_provider) + binary(sensing_org_lease_wire) + binary(sensing_org_exact_projection) + binary(sensing_org_exact_seam) + binary(sensing_org_three_node) + binary(org_exact_sensing)'
+filter = 'binary(integration_nrpc_protected) + binary(org_ownership) + binary(capability_exposure_revocation) + binary(org_admission_gate) + binary(org_admission_wire) + binary(nrpc_call_hijack) + binary(nrpc_response_routing) + binary(nrpc_service_equality) + binary(nrpc_route_discriminator) + binary(nrpc_streaming_gate) + binary(nrpc_registration_order) + binary(sensing_provider) + binary(sensing_consumer) + binary(sensing_org_lease_wire) + binary(sensing_org_exact_projection) + binary(sensing_org_exact_seam) + binary(sensing_org_three_node) + binary(org_exact_sensing)'
 retries = 0

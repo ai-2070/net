@@ -1309,10 +1309,34 @@ fn ingest_synthetic_at(
     sequence: u64,
     expires_at: u64,
 ) {
+    ingest_synthetic_declaring(
+        node,
+        owner,
+        provider,
+        sequence,
+        expires_at,
+        CapabilitySet::new().add_tag(TAG),
+    );
+}
+
+/// [`ingest_synthetic_at`] with an EXPLICIT capability descriptor.
+///
+/// A provider that stops serving the capability publishes a later-sequence
+/// announcement that no longer declares its tag; admitting one is how a
+/// witness retires a row from owner-private discovery for this capability
+/// DETERMINISTICALLY — the soft-state sequence decides it, not a wall clock.
+fn ingest_synthetic_declaring(
+    node: &Arc<MeshNode>,
+    owner: &OrgKeypair,
+    provider: &net::adapter::net::identity::EntityKeypair,
+    sequence: u64,
+    expires_at: u64,
+    capabilities: CapabilitySet,
+) {
     let authority = node.node_authority().expect("authority");
     let cert = OrgMembershipCert::try_issue(owner, provider.entity_id().clone(), 1, 3600)
         .expect("membership");
-    let descriptor = CapabilitySet::new().add_tag(TAG).to_bytes_compact();
+    let descriptor = capabilities.to_bytes_compact();
     let envelope =
         net::adapter::net::behavior::org_scoped_ann::ScopedCapabilityAnnouncement::build_owner(
             provider,
@@ -1349,13 +1373,27 @@ fn unix_now() -> u64 {
 /// query — the narrowing direction — must not be certified as agreement, and
 /// the next attempt must converge to what discovery now says.
 ///
-/// The disappearance is real AND deterministically placed: the synthetic
+/// The disappearance is real AND deterministically placed. The synthetic
 /// provider is announced with a long life, so the caller's capture cannot race
-/// its expiry, and it is RETIRED from inside the section hook — republished at
-/// a later sequence with a one-second life, then waited well past it. The
-/// caller's capture is complete before the hook fires and core's query happens
-/// after it returns, so the row is gone strictly between the two, by
-/// construction rather than by out-running a wall clock.
+/// its expiry, and it is RETIRED from inside the section hook by the supported
+/// soft-state route: a LATER-SEQUENCE owner announcement, signed and admitted
+/// through the same verified ingest, whose capability descriptor no longer
+/// declares this tag. Owner-private discovery for the tag therefore excludes
+/// it the moment that announcement is admitted — decided by the sequence, not
+/// by a wall clock — and the hook ASSERTS that exclusion before it returns, so
+/// the transition is observed rather than assumed.
+///
+/// The earlier revision instead republished with a one-second life and slept
+/// past it. `unix_now()` truncates to whole seconds, so that lifetime was
+/// anywhere from ~0 ms to 1 s and the intended transition rode a sub-second
+/// race at ingest time; it failed on CI (run 34410272924) with the ephemeral
+/// provider still in core's published population. What exactly a ~0 ms
+/// lifetime does at ingest was NOT established, so nothing here claims a
+/// mechanism — the repair removes the race instead of timing it better.
+///
+/// The caller's capture is complete before the hook fires and core's query
+/// happens after it returns, so the row is gone strictly between the two, by
+/// construction.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn within_attempt_narrowing_is_not_certified_as_agreement() {
     let cell = Cell::stand_up(
@@ -1382,8 +1420,10 @@ async fn within_attempt_narrowing_is_not_certified_as_agreement() {
     // Retire it from INSIDE the attempt: the caller's expectation already
     // includes the ephemeral provider, and core's query will not see it.
     let fired = Arc::new(AtomicUsize::new(0));
+    let retracted = Arc::new(AtomicUsize::new(0));
     let hook = SectionHook::install(&cell.client, {
         let fired = fired.clone();
+        let retracted = retracted.clone();
         let consumer_node = Arc::clone(&cell.consumer.node);
         let owner = org();
         let ephemeral_key = ephemeral.clone();
@@ -1391,11 +1431,29 @@ async fn within_attempt_narrowing_is_not_certified_as_agreement() {
             if fired.fetch_add(1, Ordering::SeqCst) > 0 {
                 return;
             }
-            // Replaced at a later sequence with a one-second life, then slept
-            // well past it - the whole-second granularity of an
-            // announcement's expiry is why the wait is not tight.
-            ingest_synthetic_at(&consumer_node, &owner, &ephemeral_key, 2, unix_now() + 1);
-            std::thread::sleep(Duration::from_millis(2500));
+            // A later-sequence announcement that no longer declares this
+            // capability — the supported way a provider stops serving it. No
+            // sleep and no clock margin: the row leaves this capability's
+            // owner-private discovery as soon as the announcement is admitted.
+            ingest_synthetic_declaring(
+                &consumer_node,
+                &owner,
+                &ephemeral_key,
+                2,
+                unix_now() + 3600,
+                CapabilitySet::new(),
+            );
+            // OBSERVED, not assumed: current discovery for the tag no longer
+            // carries the provider. If the retraction were ever refused, this
+            // stays zero and the assertion after the call fails loudly instead
+            // of the witness silently testing nothing.
+            let gone = consumer_node
+                .owner_private_capability_providers(&capability())
+                .into_iter()
+                .all(|row| row.provider.node_id() != ephemeral_key.entity_id().node_id());
+            if gone {
+                retracted.fetch_add(1, Ordering::SeqCst);
+            }
         })
     });
     let _armed = cell.try_call().await;
@@ -1404,6 +1462,12 @@ async fn within_attempt_narrowing_is_not_certified_as_agreement() {
         fired.load(Ordering::SeqCst),
         1,
         "the section hook must have held one attempt open"
+    );
+    assert_eq!(
+        retracted.load(Ordering::SeqCst),
+        1,
+        "precondition: the retraction must have removed the row from current \
+         owner-private discovery INSIDE the attempt"
     );
 
     // The expectation that attempt ACTUALLY derived, read from the call path
@@ -1610,14 +1674,28 @@ async fn a_capped_population_agrees_with_a_wider_expectation() {
 /// missing from one attempt, is recovered under an UNCHANGED expectation.
 ///
 /// This is the reviewer's reproduction as a witness, and it is the exact case
-/// "cap-sized and contained" cannot see. The lowest-id provider's discovery
-/// row expires inside the attempt, so core publishes a full-sized population
-/// that is a subset of the expectation but NOT the prefix core's own rule
-/// would have produced. The provider is then republished at a later sequence
-/// BEFORE the next call, so the next expectation is byte-for-byte the recorded
-/// one: no changed input, no authority movement, no dead holder — nothing but
-/// the agreement rule can retry this, and nothing but the canonical rule can
-/// tell the two full-sized populations apart.
+/// "cap-sized and contained" cannot see. The lowest-id provider LEAVES this
+/// capability's owner-private discovery inside the attempt, so core publishes
+/// a full-sized population that is a subset of the expectation but NOT the
+/// prefix core's own rule would have produced. The provider is then
+/// republished at a later sequence BEFORE the next call, so the next
+/// expectation is byte-for-byte the recorded one: no changed input, no
+/// authority movement, no dead holder — nothing but the agreement rule can
+/// retry this, and nothing but the canonical rule can tell the two full-sized
+/// populations apart.
+///
+/// The departure is CLOCK-FREE. An earlier revision republished the row with
+/// `unix_now() + 1` and slept past it; `unix_now()` truncates to whole
+/// seconds, so that envelope's life was 0-1000 ms and, when the second ticked
+/// before `verify_scoped_ingest` evaluated it, the ingest was REFUSED and the
+/// original `+3600` row stayed authorized — measured at 2 refusals in 300
+/// replays, and the shape that failed CI run 34427405228 with the canonical
+/// member still published. The hook now publishes a later-sequence signed
+/// owner announcement whose descriptor no longer declares this tag — the
+/// supported way a provider stops serving one — and ASSERTS the row is gone
+/// from current owner-private discovery before it returns. Separate expiry
+/// coverage lives in `an_expired_announcement_leaves_the_population_and_a_live_one_stays`
+/// and is untouched.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_missing_canonical_member_is_recovered_under_an_unchanged_expectation() {
     use net::adapter::net::behavior::org_sensing_demand::MAX_SENSED_POPULATION;
@@ -1671,14 +1749,16 @@ async fn a_missing_canonical_member_is_recovered_under_an_unchanged_expectation(
     })
     .await;
 
-    // Hold ONE attempt open and RETIRE the lowest provider from inside it, at
-    // a later sequence with an expiry already in the past. The caller's
-    // capture is complete before the hook fires and core's query happens after
-    // it returns, so the disappearance is strictly between them - by
-    // construction, not by out-racing a pre-call sample.
+    // Hold ONE attempt open and RETIRE the lowest provider from inside it,
+    // through a later-sequence announcement that no longer declares this
+    // capability. The caller's capture is complete before the hook fires and
+    // core's query happens after it returns, so the disappearance is strictly
+    // between them - decided by the soft-state sequence, not by a clock.
     let fired = Arc::new(AtomicUsize::new(0));
+    let retracted = Arc::new(AtomicUsize::new(0));
     let hook = SectionHook::install(&cell.client, {
         let fired = fired.clone();
+        let retracted = retracted.clone();
         let consumer_node = Arc::clone(&cell.consumer.node);
         let owner = org();
         let lowest_key = lowest.clone();
@@ -1686,29 +1766,25 @@ async fn a_missing_canonical_member_is_recovered_under_an_unchanged_expectation(
             if fired.fetch_add(1, Ordering::SeqCst) > 0 {
                 return;
             }
-            let authority = consumer_node.node_authority().expect("authority");
-            let cert =
-                OrgMembershipCert::try_issue(&owner, lowest_key.entity_id().clone(), 1, 3600)
-                    .expect("membership");
-            let descriptor = CapabilitySet::new().add_tag(TAG).to_bytes_compact();
-            let envelope = net::adapter::net::behavior::org_scoped_ann::ScopedCapabilityAnnouncement::build_owner(
-                    &lowest_key,
-                    owner.org_id(),
-                    cert,
-                    authority.audience.audience_handle,
-                    authority.audience.discovery_key(),
-                    2,
-                    unix_now() + 1,
-                    &descriptor,
-                )
-                .expect("owner envelope");
-            consumer_node.ingest_scoped_announcement_for_test(&envelope.to_bytes());
-            // Replaced at a later sequence with a one-second life, then
-            // slept well past it - the whole-second granularity of an
-            // announcement's expiry is why the wait is not tight. The row
-            // is gone by the time core queries, and the caller's capture -
-            // already taken - still contains it.
-            std::thread::sleep(Duration::from_millis(2500));
+            ingest_synthetic_declaring(
+                &consumer_node,
+                &owner,
+                &lowest_key,
+                2,
+                unix_now() + 3600,
+                CapabilitySet::new(),
+            );
+            // OBSERVED, not attempted: an ingest that was refused, or a
+            // retraction that did not take, leaves this at zero and the
+            // assertion after the call fails loudly rather than the witness
+            // testing a population nothing removed anything from.
+            let gone = consumer_node
+                .owner_private_capability_providers(&capability())
+                .into_iter()
+                .all(|row| row.provider.node_id() != lowest_key.entity_id().node_id());
+            if gone {
+                retracted.fetch_add(1, Ordering::SeqCst);
+            }
         })
     });
     let _armed = cell.try_call().await;
@@ -1717,6 +1793,12 @@ async fn a_missing_canonical_member_is_recovered_under_an_unchanged_expectation(
         fired.load(Ordering::SeqCst),
         1,
         "the section hook must have held one attempt open"
+    );
+    assert_eq!(
+        retracted.load(Ordering::SeqCst),
+        1,
+        "precondition: the retraction must have removed the row from current \
+         owner-private discovery INSIDE the attempt"
     );
 
     // The expectation that attempt ACTUALLY derived - read from the call path,

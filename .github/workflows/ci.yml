@@ -2242,18 +2242,105 @@ jobs:
       # the 20-minute budget) and the `retries = 0` override that keeps the
       # security-race binaries from being retried into green.
       #
-      # `sensing_provider` is in that zero-retry override, and
-      # `net_sdk::sensing::tests::the_provider_witness_binary_is_excluded_from_retries`
-      # reads `.config/nextest.toml` and fails if it ever drops out — the
+      # `sensing_provider` and `sensing_consumer` are both in that zero-retry
+      # override, and
+      # `net_sdk::sensing::tests::the_sensing_witness_binaries_are_excluded_from_retries`
+      # reads `.config/nextest.toml` and fails if either ever drops out — the
       # override is a filter expression, so it would otherwise stop matching
       # silently.
+      #   - sensing_consumer        — S1 capability-sensing CONSUMER
+      #     lifecycle for own-organization exact providers: signed
+      #     readiness into one snapshot, a state edge waking a parked
+      #     watcher, a change placed INSIDE a capture not being lost,
+      #     quiet expiry and withdrawal, node-global ownership across
+      #     separately constructed wrappers, authority loss/recovery,
+      #     and the structured refusals. Gated on
+      #     `feature = "net" + "cortex" + "fixtures"` (owner-scoped
+      #     service discovery, plus the refresh-schedule and
+      #     authority-clearing observations).
       #   - org_exact_sensing       — OA-6 production organization
       #     exact-sensing call edge (14 tests). Needs the SDK's own
       #     `fixtures` feature, which is what gates `OrgClient`'s
       #     test-only sensing observation accessors; without it the
       #     binary does not compile, which is loud rather than silent.
-      - name: Run Rust SDK tests (includes mesh_stream_backpressure, mesh_rpc_bidi_typed, tool_*, sensing_provider, org_exact_sensing)
+      - name: Run Rust SDK tests (includes mesh_stream_backpressure, mesh_rpc_bidi_typed, tool_*, sensing_provider, sensing_consumer, org_exact_sensing)
         run: cargo nextest run --no-fail-fast --no-tests=fail --features "net cortex dataforts testing compute nat-traversal port-mapping aggregator tool macros fixtures"
+
+      # === S1: the CONSUMER observation lifecycle ==========================
+      #
+      # Same discipline as the OA-6 step below, and for the same reason: the
+      # step above ran this binary by auto-discovery, so this one exists to
+      # keep the roster from shrinking silently. Each witness must RUN and
+      # PASS on its own with retries off — `--no-tests=fail` is what makes
+      # `-E 'test(=name)'` matching nothing a FAILURE rather than a
+      # zero-test success.
+      #
+      # Three of these names carry each other and must all stay:
+      # `a_change_landing_inside_a_capture_is_never_lost` fails if a change
+      # placed inside a capture is swallowed;
+      # `a_quiet_park_does_not_return_inside_the_wake_bound` fails if a park
+      # returns inside a window QUALIFIED against the floor deadline actually
+      # in force — dropping the control would let the first pass vacuously;
+      # and `the_population_floor_wakes_a_quiet_parked_consumer` holds the
+      # default-floor liveness statement the control no longer makes, since it
+      # widens the floor to qualify its negative window.
+      - name: Sensing — consumer observation lifecycle (S1)
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          FEATURES="net cortex dataforts testing compute nat-traversal port-mapping aggregator tool macros fixtures"
+          REQUIRED="
+            signed_readiness_reaches_the_snapshot_and_an_edge_wakes_the_watcher
+            an_already_parked_watcher_is_woken_by_a_provider_edge
+            a_change_landing_inside_a_capture_is_never_lost
+            a_quiet_park_does_not_return_inside_the_wake_bound
+            timed_continuity_expiry_publishes_a_wake_and_clears_the_estimate
+            a_departed_provider_ages_out_rather_than_being_replaced
+            withdrawn_readiness_reads_unknown_and_keeps_the_provider
+            one_attestation_yields_two_verdicts_under_two_budgets
+            the_query_asks_the_provider_start_bound_it_names
+            a_row_never_reports_economics_its_verdict_did_not_use
+            independent_wrappers_share_ownership_and_the_last_close_stops_the_refresh
+            a_dropped_watch_stops_pinning_the_cadence
+            a_slower_raw_holder_survives_the_sdk_watch_release
+            an_idle_watch_is_actually_renewed_and_stops_after_the_last_close
+            an_unavailable_authority_hides_the_population_and_recovery_restores_it
+            a_self_revoked_observer_is_refused_on_existing_and_new_reads
+            each_unsupported_request_is_refused_by_its_own_variant
+            a_capacity_refused_provider_reads_unknown_and_later_recovers
+            a_retracted_provider_leaves_the_next_snapshot_inside_the_floor
+            an_expired_announcement_leaves_the_population_and_a_live_one_stays
+            the_population_follows_authorization_and_never_widens_past_it
+            a_new_signed_estimate_reverses_the_sdk_rank_while_both_stay_ready
+            one_view_movement_in_the_capture_spends_a_retry_and_still_answers
+            a_continuously_moving_view_refuses_after_the_bound
+            a_granted_only_provider_is_never_sensed_and_the_owner_one_is
+            a_partial_acquisition_keeps_its_own_state_and_another_owners
+            the_population_floor_wakes_a_quiet_parked_consumer
+          "
+          out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                  --retries 0 --features "$FEATURES" --test sensing_consumer 2>&1) \
+            || { printf '%s\n' "$out"; echo "::error::the S1 consumer witnesses did not pass"; exit 1; }
+          printf '%s\n' "$out" | tail -3
+          listed=$(printf '%s\n' "$out" | grep -cE '^ +(PASS|FAIL)')
+          pinned=0
+          for required in $REQUIRED; do
+            single=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                       --retries 0 --features "$FEATURES" --test sensing_consumer \
+                       -E "test(=$required)" 2>&1) \
+              || { printf '%s\n' "$single"; echo "::error::$required did not run and pass as exactly one test"; exit 1; }
+            pinned=$((pinned + 1))
+          done
+          # `listed` counts PROGRESS LINES from the run above — it is a
+          # floor on tests that actually ran, not a non-executing inventory.
+          # The threshold is kept AT the current witness count and raised when
+          # one is added, so `$listed` equals it on a healthy run; `-ge` is
+          # what keeps adding a witness from tripping the gate, while a
+          # threshold below the count would let a silently dropped witness
+          # pass — which is the failure this exists to catch.
+          [ "$listed" -ge 27 ] \
+            || { echo "::error::expected at least 27 consumer witnesses executed, saw $listed"; exit 1; }
+          echo "consumer observation lifecycle: $listed executed, $pinned pinned by name, all green"
 
       # === OA-6: the PRODUCTION organization exact-sensing call edge =======
       #

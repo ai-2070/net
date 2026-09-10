@@ -5213,6 +5213,32 @@ fn reconcile_materialized_consumer_cells(
     }
 }
 
+/// THE timed-expiry operation: age the local consumer cells' continuity at
+/// `now` and, if any projection moved, PUBLISH the overlay change. Returns
+/// whether it moved.
+///
+/// One operation rather than a state pass plus a separate publication at each
+/// caller: a caller that ages without notifying is then not expressible, and a
+/// witness driving this operation exercises the same link the maintenance loop
+/// does. The loop publishes here rather than folding expiry into its combined
+/// signal — an extra generation bump in a sweep that also moved for another
+/// reason is a spurious wake at worst, and the consumer contract is explicit
+/// that a wake is never the value.
+fn expire_and_publish_consumer_cells(
+    observations: &Arc<ObservationMutex>,
+    overlay: &Arc<tokio::sync::watch::Sender<u64>>,
+    now: Instant,
+    #[cfg(any(test, feature = "fixtures"))] passes: &AtomicU64,
+) -> bool {
+    #[cfg(any(test, feature = "fixtures"))]
+    passes.fetch_add(1, Ordering::Relaxed);
+    let moved = observations.lock().expire_consumer_cells(now);
+    if moved {
+        overlay.send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+    moved
+}
+
 /// attestations; the wire form is this hop's latest cache — matched
 /// on (incarnation, seq) so a torn race skips (the next beat
 /// repairs) and "relays forward identical signed bytes" holds for
@@ -5537,6 +5563,22 @@ impl SensingObservations {
             },
         );
         sensing_scheduler_view(cell) != before
+    }
+
+    /// Run the local consumer cells' CONTINUITY CLOCK at `now`, reporting
+    /// whether any projection moved (`Ready` → `Unknown`, say).
+    ///
+    /// The STATE half only. Every caller goes through
+    /// [`expire_and_publish_consumer_cells`], which is the operation that also
+    /// publishes, so aging can never be wired up without its notification.
+    fn expire_consumer_cells(&mut self, now: Instant) -> bool {
+        let mut moved = false;
+        for cell in self.consumer_cells.values_mut() {
+            let before = cell.projected();
+            cell.expire_if_due(now);
+            moved |= cell.projected() != before;
+        }
+        moved
     }
 
     /// Second closure round, item 3: drop epoch records whose
@@ -11011,10 +11053,26 @@ pub struct MeshNode {
     /// what makes "one section for the whole population" checkable.
     #[cfg(any(test, feature = "fixtures"))]
     sensing_observation_acquisitions: AtomicU64,
+    /// Counted invocations of the shared timed-expiry operation
+    /// (`expire_and_publish_consumer_cells`), fixtures/tests only.
+    ///
+    /// Shared with the maintenance task, so a witness can certify that
+    /// PRODUCTION actually drives that operation — the link from the
+    /// maintenance schedule to the notification — rather than only that a
+    /// fixture can.
+    #[cfg(any(test, feature = "fixtures"))]
+    sensing_expiry_passes: Arc<AtomicU64>,
     /// Fixtures seam: fires INSIDE the capture's critical section, after its
     /// first row.
     #[cfg(any(test, feature = "fixtures"))]
     sensing_capture_seam: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Fixtures seam: fires ONCE inside each live-membership capture performed
+    /// by [`Self::org_sensing_current_visibility`], in the window the capture's
+    /// phase C exists to close — after the coherent floor snapshot, before the
+    /// currency recheck. A witness publishes a REAL view movement there to
+    /// place a `ViewChanged` on a chosen attempt.
+    #[cfg(any(test, feature = "fixtures"))]
+    sensing_visibility_capture_seam: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Fixtures seam: fires at each labelled point of the sensed projection
     /// that must run OFF every sensing lock, carrying this thread's guard
     /// depth and set. Lets a witness prove the off-lock claim positively.
@@ -12941,7 +12999,11 @@ impl MeshNode {
             #[cfg(any(test, feature = "fixtures"))]
             sensing_observation_acquisitions: AtomicU64::new(0),
             #[cfg(any(test, feature = "fixtures"))]
+            sensing_expiry_passes: Arc::new(AtomicU64::new(0)),
+            #[cfg(any(test, feature = "fixtures"))]
             sensing_capture_seam: parking_lot::Mutex::new(None),
+            #[cfg(any(test, feature = "fixtures"))]
+            sensing_visibility_capture_seam: parking_lot::Mutex::new(None),
             #[cfg(any(test, feature = "fixtures"))]
             sensing_projection_offlock_observer: parking_lot::Mutex::new(None),
             sensing_local_projection_mu,
@@ -13721,6 +13783,26 @@ impl MeshNode {
     #[cfg(any(test, feature = "fixtures"))]
     pub fn clear_sensing_phase_two_seam_for_test(&self) {
         *self.sensing_phase_two_seam.lock() = None;
+    }
+
+    /// Install the visibility capture-window seam (fixtures only).
+    ///
+    /// `hook` runs inside every live-membership capture that
+    /// [`Self::org_sensing_current_visibility`] performs, at the head of the
+    /// window the capture's currency recheck closes. A witness that publishes
+    /// a real view movement there — a revocation floor raise, an authority
+    /// swap — places a `ViewChanged` deterministically instead of racing one,
+    /// and a hook that fires on the FIRST capture only models one movement
+    /// followed by stabilization.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn set_sensing_visibility_capture_seam_for_test(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.sensing_visibility_capture_seam.lock() = Some(hook);
+    }
+
+    /// Remove the visibility capture-window seam (fixtures only).
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn clear_sensing_visibility_capture_seam_for_test(&self) {
+        *self.sensing_visibility_capture_seam.lock() = None;
     }
 
     /// The shared node-local registration core, parameterized by the owning
@@ -15907,6 +15989,108 @@ impl MeshNode {
         }
     }
 
+    /// The CURRENTLY qualified exact-provider visibility for one owner-scoped
+    /// capability, re-derived at this instant — the read-side counterpart of
+    /// the retention transaction's own derivation.
+    ///
+    /// `Some(population)` ONLY when all of the following hold right now:
+    ///
+    /// * an organization authority is installed and its store is neither
+    ///   poisoned nor generation-exhausted;
+    /// * THIS node's own membership certificate self-verifies — binding,
+    ///   wall-clock validity, and its generation at or above the CURRENT
+    ///   revocation floor (the same live-membership capture the registration
+    ///   path uses). A
+    ///   stamp being unchanged is publication identity, not live membership,
+    ///   so a consumer revoked below its own floor answers `None` here even
+    ///   though its retained leases are untouched;
+    /// * the qualifying view did not move while the population was derived.
+    ///
+    /// A view that moves under the attempt is not an answer: it is retried
+    /// ONCE, whether it surfaces during the live-membership capture or at the
+    /// end-of-attempt currency check, so a single concurrent publication does
+    /// not turn into an avoidable refusal. A view republished continuously
+    /// still answers `None` after that bound, and a genuine qualification
+    /// failure is never retried.
+    ///
+    /// The population itself is the authorized-population derivation the
+    /// retention transaction uses,
+    /// so an announcement that expired, was clamped by its provider
+    /// certificate, fell below the provider's revocation floor, or lost its
+    /// pin is already absent — with no dependence on any caller's
+    /// reconciliation cadence.
+    ///
+    /// This qualifies what a caller may DISCLOSE as currently authorized. It
+    /// acquires no lease, releases none, and confers no invocation authority.
+    pub fn org_sensing_current_visibility(
+        &self,
+        capability: &super::behavior::org_grant::CapabilityAuthorityId,
+    ) -> Option<Vec<u64>> {
+        // Two attempts, then refuse — the same bound the retention transaction
+        // uses, and for the same reason: a view republished continuously must
+        // not spin, and a population must never be reported under a view that
+        // stopped qualifying it.
+        for _ in 0..2 {
+            let snapshot = self.capture_sensing_authority_snapshot().ok()?;
+            let org = snapshot.authority_view().owner_org;
+            // LIVE local membership, not merely an installed object.
+            match self.capture_visibility_membership(org, super::behavior::org::current_timestamp())
+            {
+                Ok(_) => {}
+                // The view MOVED under the capture. That is the advisory race
+                // this loop's second attempt exists for — the same outcome the
+                // end-of-attempt currency check retries on, just observed one
+                // step earlier — so spend an attempt rather than reporting an
+                // avoidable `None`. Each attempt re-qualifies from scratch, so
+                // a persistently republished view still refuses after the
+                // bound instead of spinning.
+                Err(sensing::RelayMembershipUnavailable::ViewChanged) => continue,
+                // Every other outcome is a genuine qualification failure —
+                // nothing installed, poisoned, generation-exhausted, foreign,
+                // invalid or revoked below the floor — and retrying it would
+                // only ask the same question twice.
+                Err(_) => return None,
+            }
+            let population = self.org_sensing_authorized_population(capability);
+            if self.sensing_authority_snapshot_current(&snapshot) {
+                return Some(population);
+            }
+        }
+        None
+    }
+
+    /// The live-membership capture [`Self::org_sensing_current_visibility`]
+    /// performs, carrying the fixtures capture-window seam
+    /// ([`Self::set_sensing_visibility_capture_seam_for_test`]) so a witness
+    /// can place a real view movement inside the window instead of racing one.
+    ///
+    /// Production is exactly
+    /// [`Self::capture_live_org_relay_membership`]: with no seam installed the
+    /// hook is `|| {}`, the same closure the unseamed entry point passes.
+    fn capture_visibility_membership(
+        &self,
+        org_id: super::behavior::org::OrgId,
+        now_secs: u64,
+    ) -> Result<sensing::LiveOrgRelayMembership, sensing::RelayMembershipUnavailable> {
+        #[cfg(any(test, feature = "fixtures"))]
+        let seam = self.sensing_visibility_capture_seam.lock().clone();
+        sensing::capture_live_org_relay_membership_seamed(
+            &self.org_install,
+            &self.node_authority,
+            &self.org_revocation,
+            &self.org_install_generation,
+            self.entity_id(),
+            org_id,
+            now_secs,
+            || {
+                #[cfg(any(test, feature = "fixtures"))]
+                if let Some(hook) = seam {
+                    hook();
+                }
+            },
+        )
+    }
+
     /// The AUTHORIZED sensing population for one owner-scoped capability: the
     /// node ids of providers this node has verified private discovery for.
     ///
@@ -17567,6 +17751,68 @@ impl MeshNode {
             .consumer_cells
             .get(key)
             .map(|cell| cell.own_interval())
+    }
+
+    /// Fixtures-only witness seam: run the consumer cells' TIMED CONTINUITY
+    /// expiry at `now` and publish the overlay signal exactly as the
+    /// maintenance loop does, returning whether any projection moved.
+    ///
+    /// The same pass the loop runs ([`SensingObservations::expire_consumer_cells`]),
+    /// so a witness can isolate timed expiry from withdrawal, replacement and
+    /// failure-plane disruption: the provider stays up, keeps its readiness
+    /// registration and keeps its session, and only the continuity clock moves.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn expire_sensing_consumer_cells_for_test(&self, now: Instant) -> bool {
+        expire_and_publish_consumer_cells(
+            &self.sensing_observations,
+            &self.sensing_overlay_changed,
+            now,
+            &self.sensing_expiry_passes,
+        )
+    }
+
+    /// Fixtures-only: how many times the shared timed-expiry operation has run
+    /// on this node, from ANY caller — including the production maintenance
+    /// schedule.
+    ///
+    /// A witness certifies the production link with it: the count advances with
+    /// no fixture call, which is only possible if the maintenance task drives
+    /// the same age-and-publish operation.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn sensing_expiry_passes_for_test(&self) -> u64 {
+        self.sensing_expiry_passes.load(Ordering::Acquire)
+    }
+
+    /// Fixtures-only: the lease registry's `(holder count, installed interval)`
+    /// for the key `ticket` belongs to.
+    ///
+    /// The INSTALLED interval is what a future renewal re-authors from, which a
+    /// local consumer cell's own interval does not establish — so a coexistence
+    /// witness asserts this, not only the cell. A ticket's key is
+    /// `pub(crate)`, hence a node-side accessor rather than exposing it.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn sensing_lease_entry_for_ticket_for_test(
+        &self,
+        ticket: &sensing::SensingLeaseTicket,
+    ) -> Option<(usize, Duration)> {
+        self.sensing_interest_leases.entry_for_test(&ticket.key)
+    }
+
+    /// Fixtures-only: the installation `ticket` is a live holder of, or `None`.
+    ///
+    /// Read-only. A witness needs it because releasing a ticket succeeds
+    /// idempotently for an already-released one, so a successful release is not
+    /// evidence that the holder was still live.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn sensing_lease_holder_installation_for_test(
+        &self,
+        ticket: &sensing::SensingLeaseTicket,
+    ) -> Option<sensing::LeaseToken> {
+        self.sensing_lease_holder_installation(ticket)
     }
 
     /// Test seam (review L1 narrow-hold): run ONE periodic materialized-branch
@@ -27221,6 +27467,8 @@ impl MeshNode {
         let sensing_observations = self.sensing_observations.clone();
         let sensing_interest_ttl = self.config.sensing_interest_ttl;
         let sensing_overlay_changed = self.sensing_overlay_changed.clone();
+        #[cfg(any(test, feature = "fixtures"))]
+        let sensing_expiry_passes = Arc::clone(&self.sensing_expiry_passes);
         let continuity_factor = self.config.continuity_factor;
         let sensing_capability_interests = self.sensing_capability_interests.clone();
         let sensing_local_projection_mu = self.sensing_local_projection_mu.clone();
@@ -27506,6 +27754,24 @@ impl MeshNode {
                             // sequential lock phases — never
                             // nested.
                             let poll_now = Instant::now();
+                            // SI-4b: local consumer cells run the
+                            // same clock — an expiry that moves a
+                            // projection (Ready → Unknown) fires the
+                            // overlay signal. THE shared operation
+                            // ages and publishes together, and the
+                            // fixtures seam drives this same one at a
+                            // chosen instant, so the caller-to-
+                            // publisher link is exercised rather than
+                            // reimplemented. Its own lock section,
+                            // because the operation takes the guard
+                            // itself.
+                            expire_and_publish_consumer_cells(
+                                &sensing_observations,
+                                &sensing_overlay_changed,
+                                poll_now,
+                                #[cfg(any(test, feature = "fixtures"))]
+                                &sensing_expiry_passes,
+                            );
                             let mut overlay_moved = false;
                             let (continuities, pending) = {
                                 let mut observations = sensing_observations.lock();
@@ -27513,16 +27779,6 @@ impl MeshNode {
                                 for (branch, cell) in observations.upstream.iter_mut() {
                                     cell.expire_if_due(poll_now);
                                     continuities.push((branch.clone(), cell.continuity()));
-                                }
-                                // SI-4b: local consumer cells run
-                                // the same clock — an expiry that
-                                // moves a projection (Ready →
-                                // Unknown) fires the overlay
-                                // signal.
-                                for cell in observations.consumer_cells.values_mut() {
-                                    let before = cell.projected();
-                                    cell.expire_if_due(poll_now);
-                                    overlay_moved |= cell.projected() != before;
                                 }
                                 // SI-4 review P1: EVERY slot is
                                 // checked for row liveness — a
@@ -47041,6 +47297,23 @@ mod sensing_authority_witness_tests {
         sensing::canonical_org_sensing_commitment(&org().org_id())
     }
 
+    /// The validation instant an admission witness samples: the certificate's
+    /// OWN `not_before`, read AFTER issuance.
+    ///
+    /// `OrgMembershipCert::try_issue` stamps `not_before` with the wall-clock
+    /// second it runs in, and these fixtures adopt their authority with
+    /// `verification_skew_secs = 0` — deliberately strict. Sampling
+    /// `current_timestamp()` BEFORE issuing therefore refused admission
+    /// whenever the second ticked between the two statements
+    /// (`OrgError::NotYetValid`), which is what failed CI run 34427405228 in
+    /// `a_poison_winning_the_inbound_fence_creates_no_row`'s SETUP, before its
+    /// seam was installed. Binding the sample to the certificate removes the
+    /// boundary instead of widening the skew: the instant is inside the
+    /// window by construction, at its first valid second.
+    fn admission_sample(cert: &OrgMembershipCert) -> u64 {
+        cert.not_before
+    }
+
     fn member_cert(entity: &EntityId, generation: u32) -> OrgMembershipCert {
         OrgMembershipCert::try_issue(
             &org(),
@@ -47082,6 +47355,54 @@ mod sensing_authority_witness_tests {
         node.peer_entity_ids.insert(FROM_NODE, sender.clone());
     }
 
+    /// The admission sample is bound to the CERTIFICATE, and the zero-skew
+    /// boundary it sits on is real.
+    ///
+    /// The same signed registration is REFUSED one second before the
+    /// certificate's own `not_before` and ADMITTED at it. That is why every
+    /// witness here issues the certificate first and samples
+    /// [`admission_sample`]: sampling a fresh clock before issuance put the
+    /// validation instant one second below the window whenever the wall second
+    /// ticked between the two statements. Production validity semantics are
+    /// untouched — the refusal below is the strict `verification_skew_secs = 0`
+    /// behaviour, asserted rather than avoided.
+    #[tokio::test]
+    async fn admission_is_bound_to_the_certificates_own_window() {
+        let node = org_node("op-boundary").await;
+        let sender = EntityKeypair::generate().entity_id().clone();
+        pin_sender(&node, &sender);
+        let target = node.node_id().wrapping_add(1);
+        let ctx = node.dispatch_ctx();
+        let member = member_cert(&sender, 1);
+        let at = admission_sample(&member);
+        assert_eq!(
+            at, member.not_before,
+            "the sample IS the certificate's window opening, not a fresh clock read"
+        );
+        assert!(
+            MeshNode::admit_org_registration(
+                &ctx,
+                &org_provider_frame(target, org_commitment(), member.clone()),
+                FROM_NODE,
+                &sender,
+                at.saturating_sub(1),
+            )
+            .is_none(),
+            "one second before the certificate opens, admission must refuse"
+        );
+        assert!(
+            MeshNode::admit_org_registration(
+                &ctx,
+                &org_provider_frame(target, org_commitment(), member.clone()),
+                FROM_NODE,
+                &sender,
+                at,
+            )
+            .is_some(),
+            "and at its first valid second the same registration is admitted"
+        );
+    }
+
     // W1 — a valid org provider registration lands a row whose proven root is the
     // CANONICAL ORG COMMITMENT (not a legacy entity root).
     #[tokio::test]
@@ -47094,10 +47415,11 @@ mod sensing_authority_witness_tests {
             sensing::ProviderInterestKey::new(org_spec(target, org_commitment()).key(), target);
         let ctx = node.dispatch_ctx();
         let now = Instant::now();
-        let now_secs = current_timestamp();
+        let member = member_cert(&sender, 1);
+        let now_secs = admission_sample(&member);
         let (admitted, snapshot) = MeshNode::admit_org_registration(
             &ctx,
-            &org_provider_frame(target, org_commitment(), member_cert(&sender, 1)),
+            &org_provider_frame(target, org_commitment(), member.clone()),
             FROM_NODE,
             &sender,
             now_secs,
@@ -47218,10 +47540,11 @@ mod sensing_authority_witness_tests {
         let target = node.node_id().wrapping_add(1);
         let ctx = node.dispatch_ctx();
         let now = Instant::now();
-        let now_secs = current_timestamp();
+        let member = member_cert(&sender, 1);
+        let now_secs = admission_sample(&member);
         let (admitted, snapshot) = MeshNode::admit_org_registration(
             &ctx,
-            &org_provider_frame(target, org_commitment(), member_cert(&sender, 1)),
+            &org_provider_frame(target, org_commitment(), member.clone()),
             FROM_NODE,
             &sender,
             now_secs,
@@ -47258,10 +47581,11 @@ mod sensing_authority_witness_tests {
         let target = node.node_id().wrapping_add(1);
         let ctx = node.dispatch_ctx();
         let now = Instant::now();
-        let now_secs = current_timestamp();
+        let member = member_cert(&sender, 1);
+        let now_secs = admission_sample(&member);
         let (admitted, snapshot) = MeshNode::admit_org_registration(
             &ctx,
-            &org_provider_frame(target, org_commitment(), member_cert(&sender, 1)),
+            &org_provider_frame(target, org_commitment(), member.clone()),
             FROM_NODE,
             &sender,
             now_secs,
@@ -47292,10 +47616,11 @@ mod sensing_authority_witness_tests {
         let target = node.node_id().wrapping_add(1);
         let ctx = node.dispatch_ctx();
         let now = Instant::now();
-        let now_secs = current_timestamp();
+        let member = member_cert(&sender, 1);
+        let now_secs = admission_sample(&member);
         let (admitted, snapshot) = MeshNode::admit_org_registration(
             &ctx,
-            &org_provider_frame(target, org_commitment(), member_cert(&sender, 1)),
+            &org_provider_frame(target, org_commitment(), member.clone()),
             FROM_NODE,
             &sender,
             now_secs,
@@ -47373,10 +47698,11 @@ mod sensing_authority_witness_tests {
         let target = node.node_id().wrapping_add(1);
         let ctx = node.dispatch_ctx();
         let now = Instant::now();
-        let now_secs = current_timestamp();
+        let member = member_cert(&sender, 1);
+        let now_secs = admission_sample(&member);
         let (admitted, _snapshot) = MeshNode::admit_org_registration(
             &ctx,
-            &org_provider_frame(target, org_commitment(), member_cert(&sender, 1)),
+            &org_provider_frame(target, org_commitment(), member.clone()),
             FROM_NODE,
             &sender,
             now_secs,
@@ -47443,10 +47769,11 @@ mod sensing_authority_witness_tests {
         let target = node.node_id().wrapping_add(1);
         let ctx = node.dispatch_ctx();
         let now = Instant::now();
-        let now_secs = current_timestamp();
+        let member = member_cert(&sender, 1);
+        let now_secs = admission_sample(&member);
         let (admitted, snapshot) = MeshNode::admit_org_registration(
             &ctx,
-            &org_provider_frame(target, org_commitment(), member_cert(&sender, 1)),
+            &org_provider_frame(target, org_commitment(), member.clone()),
             FROM_NODE,
             &sender,
             now_secs,
@@ -49674,10 +50001,11 @@ mod sensing_authority_witness_tests {
 
         let ctx = node.dispatch_ctx();
         let now = Instant::now();
-        let now_secs = current_timestamp();
+        let member = member_cert(&sender, 1);
+        let now_secs = admission_sample(&member);
         let (admitted, snapshot) = MeshNode::admit_org_registration(
             &ctx,
-            &org_provider_frame(target, org_commitment(), member_cert(&sender, 1)),
+            &org_provider_frame(target, org_commitment(), member.clone()),
             FROM_NODE,
             &sender,
             now_secs,
@@ -49751,10 +50079,11 @@ mod sensing_authority_witness_tests {
 
         let ctx = node.dispatch_ctx();
         let now = Instant::now();
-        let now_secs = current_timestamp();
+        let member = member_cert(&sender, 1);
+        let now_secs = admission_sample(&member);
         let (admitted, snapshot) = MeshNode::admit_org_registration(
             &ctx,
-            &org_provider_frame(target, org_commitment(), member_cert(&sender, 1)),
+            &org_provider_frame(target, org_commitment(), member.clone()),
             FROM_NODE,
             &sender,
             now_secs,
@@ -49812,10 +50141,11 @@ mod sensing_authority_witness_tests {
 
         let ctx = node.dispatch_ctx();
         let now = Instant::now();
-        let now_secs = current_timestamp();
+        let member = member_cert(&sender, 1);
+        let now_secs = admission_sample(&member);
         let (admitted, snapshot) = MeshNode::admit_org_registration(
             &ctx,
-            &org_provider_frame(target, org_commitment(), member_cert(&sender, 1)),
+            &org_provider_frame(target, org_commitment(), member.clone()),
             FROM_NODE,
             &sender,
             now_secs,

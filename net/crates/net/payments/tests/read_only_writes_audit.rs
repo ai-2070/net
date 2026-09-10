@@ -101,6 +101,14 @@ async fn accept_read_only_denial_is_clean_but_fresh_admission_persists() {
         PaymentDecision::Served { .. }
     ));
     let ino0 = ino(&path);
+    // Pin ino0 for the read-only check below. An atomic-rename save FREES the
+    // prior inode, so on an inode-reusing filesystem (ext4) a later temp can
+    // recycle that number — which would let a forbidden rewrite read back as
+    // "unchanged". Holding an fd keeps ino0 allocated, so the equality below
+    // means "no rename happened", not "the number came back". Same hazard the
+    // sibling verify-rejected witness pins against.
+    let _pin0 = std::fs::File::open(&path).expect("pin the post-settle state inode");
+    let bytes0 = std::fs::read(&path).expect("state file is readable");
 
     // Read-only claim outcome: the SAME quote with a DIFFERENT payload hits
     // `rec.payload_hash != payload_hash` → QuoteAlreadyPaid, no mutation.
@@ -120,8 +128,22 @@ async fn accept_read_only_denial_is_clean_but_fresh_admission_persists() {
         ino0,
         "QuoteAlreadyPaid must not rewrite the store"
     );
+    assert_eq!(
+        std::fs::read(&path).expect("state file is readable"),
+        bytes0,
+        "QuoteAlreadyPaid must not change the store's contents either"
+    );
 
     // Dirty witness: a genuinely fresh admission persists (rename → new inode).
+    //
+    // The quote is issued FIRST and the pre-write measurement taken AFTER it,
+    // so this brackets `accept_payment` alone: `issue_quote`'s own persistence
+    // cannot satisfy the assertion below. The pre-write inode is pinned for the
+    // same reason as above — held allocated, so the admission's save is forced
+    // onto a DISTINCT inode and the assertion is deterministic on every
+    // filesystem. The pin cannot mask a regression: if the admission stopped
+    // writing, no new inode is created and the assertion still fails (see the
+    // executed inverses in the receipts for this repair).
     let quote2 = engine
         .issue_quote(
             caller.entity_id().clone(),
@@ -131,6 +153,11 @@ async fn accept_read_only_denial_is_clean_but_fresh_admission_persists() {
             TTL,
         )
         .unwrap();
+    let before_admission = ino(&path);
+    let _pin_before_admission =
+        std::fs::File::open(&path).expect("pin the pre-admission state inode");
+    let bytes_before_admission = std::fs::read(&path).expect("state file is readable");
+
     let pf = payload(&quote2, &quote2.quote_id);
     assert!(matches!(
         engine
@@ -141,8 +168,19 @@ async fn accept_read_only_denial_is_clean_but_fresh_admission_persists() {
     ));
     assert_ne!(
         ino(&path),
-        ino0,
+        before_admission,
         "a fresh admission must persist the claim + completion"
+    );
+    // ...and the durable CONTENT is what persisted, not just a rename: the
+    // store now carries this admission's own quote.
+    let after_admission = std::fs::read(&path).expect("state file is readable");
+    assert_ne!(
+        after_admission, bytes_before_admission,
+        "a fresh admission must change the store's contents"
+    );
+    assert!(
+        String::from_utf8_lossy(&after_admission).contains(&quote2.quote_id),
+        "the persisted store must carry the fresh admission's claim"
     );
 }
 

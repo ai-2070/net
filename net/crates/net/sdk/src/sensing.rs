@@ -1,4 +1,5 @@
-//! Capability sensing — the **provider** side.
+//! Capability sensing — the provider lifecycle and the own-organization
+//! exact-provider consumer observation.
 //!
 //! `docs/internal/plans/CAPABILITY_SENSING_SDK_INTEGRATION_PLAN.md` §4.4
 //! (provider lifecycle) and §4.5 (configuration). Sensing answers one
@@ -81,16 +82,25 @@
 //!
 //! # Scope of this slice
 //!
-//! **Provider lifecycle only.** There is deliberately no query surface,
-//! no watch, no snapshot, and no readiness projection here.
+//! Two surfaces live here, and neither is the whole plan:
 //!
-//! That scope no longer rests on a core dead end. The core now
-//! implements a dark local-origin exact-provider path: an
-//! OWN-ORGANIZATION exact-provider lease plans and emits
-//! `SensingInterestFrame::OrgProviderRegistration` from installed
+//! - the PROVIDER lifecycle — [`SensingClient::provide`],
+//!   [`SensingClient::provide_replacing`] and
+//!   [`ReadinessRegistration`], unchanged;
+//! - the CONSUMER observation for OWN-ORGANIZATION EXACT PROVIDERS —
+//!   [`SensingClient::watch`], [`SensingQuery`], [`SensingWatch`],
+//!   [`SensingSnapshot`]. See [`consumer`] for what it owns, what it
+//!   reuses from the core's retained demand substrate, and what a
+//!   snapshot deliberately does not promise.
+//!
+//! The consumer half rests on a core path that is fully implemented, not
+//! on a dead end: an OWN-ORGANIZATION exact-provider lease plans and
+//! emits `SensingInterestFrame::OrgProviderRegistration` from installed
 //! authority, registers its local row under the organization-derived
 //! proven root, and reaches an organization-authoritative peer through
-//! that peer's ordinary registration intake.
+//! that peer's ordinary registration intake. Each acquisition arms a
+//! `ttl/2` renewal on the node's single refresh worker, so a retained
+//! observation keeps its rows alive between application calls.
 //! `SensingRegistrationError::OrgAudienceUnsupported` survives with a
 //! NARROWED meaning — the audience is an organization commitment but
 //! this node has no live membership to speak with right now, or the
@@ -99,31 +109,30 @@
 //! side (a commitment is a one-way derivation), so it takes the legacy
 //! path unchanged.
 //!
-//! What is still genuinely absent HERE is everything a projection
-//! surface would stand on: no query, watch, or snapshot verb on this
-//! module, no readiness projection, no ranking, and
-//! no `ttl/2` refresh owner for a lease — an organization lease is a
-//! single registration with no re-authoring cadence. Also no
-//! provider-free/leader sensing, no `Granted` or cross-organization
-//! sensing, and no language bindings.
+//! What is genuinely absent, here and everywhere else in the SDK:
+//! provider-free / leader-backed sensing (no `AnyAuthorized`, tag or
+//! group selector), `Granted` and cross-organization sensing, a generic
+//! sensed CALL verb, compute/gang sensed adapters, warmed pools, and
+//! language bindings. [`SensingQuery`] can express none of them, and
+//! [`SensingClient::watch`] refuses what it cannot mean rather than
+//! accepting an argument it would ignore.
 //!
-//! The CONSUMER side is wired, and it is deliberately not wired here.
-//! [`crate::org::OrgClient`] binds one acquisition family per bind and
-//! applies the resulting order inside its own call planning; the whole
-//! surface is that ordering effect plus the `#[doc(hidden)]`
-//! observation seam its witnesses use. So this module stays provider
-//! lifecycle only: it ships no interest, projection or ranking verb,
-//! because a consumer does not ask for one — the call path consults the
-//! projection on its behalf.
+//! The other consumer of the same substrate is
+//! [`crate::org::OrgClient`], which binds one acquisition family per
+//! bind and applies the resulting order inside its own call planning.
+//! That path is unchanged by this module: a watch is an independent
+//! owner of node-global demand, so observing a capability neither
+//! disturbs nor depends on any client's call-path acquisition.
 //!
 //! # What this surface does and does not name
 //!
-//! This module re-exports NO interest, audience, or projection
-//! vocabulary: no `InterestSpec`, no audience commitment, no provider
-//! selector, no result mode, no disclosure class, no consumer latency
-//! budget, no projected readiness. It names no leader ids, wire digests,
-//! frames, private discovery records, or retry/admission policy, and no
-//! operation here is owner-scoped, so none of them is needed.
+//! The consumer surface names exactly one capability string, one
+//! optional end-to-end budget, and the projection's own results:
+//! [`ProjectedReadiness`], [`SensedViability`], [`SensedProvider`].
+//! It re-exports NO interest, audience or wire vocabulary: no
+//! `InterestSpec`, no audience commitment, no provider selector, no
+//! result mode, no disclosure class, no lease ticket, no leader id, no
+//! digest, no private discovery record, and no retry/admission policy.
 //!
 //! It does NOT follow that those core types are unreachable. This is a
 //! thin SDK over `net`, and [`EvaluationRequest`] necessarily carries
@@ -131,7 +140,8 @@
 //! and the work-latency envelope — as part of the already-frozen
 //! evaluator contract. Their types are therefore nameable transitively
 //! through `net`. What this slice declines to do is *re-export* them as
-//! SDK surface or build a query/projection API on top of them.
+//! SDK surface or grow a public interest/ranking vocabulary on top of
+//! them.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -140,6 +150,17 @@ use net::adapter::net::behavior::sensing;
 use net::adapter::net::MeshNode;
 
 use crate::mesh::Mesh;
+
+pub mod consumer;
+
+/// The own-organization exact-provider consumer observation: one bounded
+/// query, one request-relative snapshot, missed-wake-safe change
+/// notification, and explicit close. See [`consumer`] for the ownership
+/// and reuse contract.
+pub use consumer::{
+    ProjectedReadiness, SensedProvider, SensedViability, SensingQuery, SensingSnapshot,
+    SensingWatch, DEFAULT_PROVIDER_START_WITHIN, MAX_SENSED_POPULATION, POPULATION_RECONCILE_FLOOR,
+};
 
 /// The provider-side evaluator contract. A capability integration
 /// implements [`ReadinessEvaluator`] and needs nothing else from this
@@ -228,6 +249,90 @@ pub enum SensingError {
          no further provider registration can be installed on it"
     )]
     RegistrationIdentityExhausted,
+
+    /// A [`SensingQuery`] with no capability name. The name is the
+    /// interest's identity, so a blank one observes nothing.
+    #[error(
+        "a sensing query needs a capability name — \
+         the same id the provider passes to SensingClient::provide"
+    )]
+    EmptyCapability,
+
+    /// A zero end-to-end budget. No provider can satisfy
+    /// `route_estimate + estimated_start <= 0`, so every observation
+    /// would be reported as merely potential forever.
+    #[error(
+        "a zero end-to-end budget admits no provider — \
+         pass the request's real deadline to SensingQuery::within, or \
+         leave the budget unbounded"
+    )]
+    UnsatisfiableBudget,
+
+    /// Observing readiness needs this node's OWN installed organization
+    /// authority: the observation audience is derived from it, and
+    /// there is no caller-supplied audience and no legacy fallback.
+    /// Also reported when the captured authority view kept moving
+    /// underneath the attempt — a retention publishes the view its
+    /// population was derived under, or nothing.
+    #[error(
+        "observing capability readiness needs a live installed organization \
+         authority on this node — adopt one (net_sdk::org::provision) and \
+         install it before watching, and retry if it is being rotated"
+    )]
+    NoOrganizationAuthority,
+
+    /// THIS node is not currently entitled to observe: no organization
+    /// authority is installed, its revocation store is poisoned or
+    /// generation-exhausted, or this node's OWN membership certificate
+    /// has expired or been revoked below the current floor.
+    ///
+    /// A watch keeps its leases and its recovery state across this
+    /// refusal — what it will not do is answer a new read with
+    /// authorization it no longer holds.
+    #[error(
+        "this node is not currently entitled to observe capability readiness — \
+         its own organization membership is absent, expired, revoked below the \
+         current floor, or its authority view is unreadable; snapshots resume \
+         once membership is valid again AND the authority view is readable and \
+         stable"
+    )]
+    ObserverNotQualified,
+
+    /// A zero provider-start bound. No provider can attest that it will
+    /// start within no time at all, so every observation would be
+    /// `NotReady`.
+    #[error(
+        "a zero provider-start bound can never be satisfied — \
+         pass the real bound to SensingQuery::start_within"
+    )]
+    UnsatisfiableStartBound,
+
+    /// One observation root already retains as many capabilities as the
+    /// core keeps per owner.
+    ///
+    /// Not a public watch-count bound: every watch mints its own root
+    /// and retains exactly one capability, so a well-formed caller does
+    /// not reach this. It is mapped rather than swallowed because the
+    /// core bound is real and a silent refusal would be worse.
+    #[error(
+        "this observation root already retains the maximum number of \
+         capabilities — the node's observation state is exhausted"
+    )]
+    WatchesAtCapacity,
+
+    /// The node can no longer mint a demand-ownership identity, so no
+    /// further observation can be established on it. Terminal:
+    /// existing watches keep observing and can still be closed.
+    #[error(
+        "this node can no longer mint an observation identity — \
+         no further capability watch can be established on it"
+    )]
+    ObservationIdentityUnavailable,
+
+    /// The watch was closed (or its node is gone). A closed watch is
+    /// inert by design: it reports no state and removes nothing.
+    #[error("this capability watch is closed — open a new one with SensingClient::watch")]
+    WatchClosed,
 }
 
 /// The provider-side sensing surface bound to one live node.
@@ -600,159 +705,211 @@ mod tests {
         assert_eq!(odd.as_str(), " Mixed.Case ");
     }
 
-    /// This module's public surface is provider lifecycle ONLY. The
-    /// projection vocabulary the earlier candidate exposed — interest
-    /// specs, audience-bearing types, provider selectors, result modes,
-    /// budgets, projected readiness — must stay out, and no readiness
-    /// projection may reappear here without a separate authorization.
-    /// The core having grown a dark own-organization exact-provider
-    /// acquisition path does not relax that: acquisition is not a
-    /// projection, and this SDK still exposes neither.
+    /// The SDK sensing surface is the PROVIDER lifecycle plus the
+    /// own-organization EXACT-PROVIDER consumer observation — and
+    /// nothing else. Interest, audience and wire vocabulary must stay
+    /// out, and no provider-free / leader-backed / cross-organization
+    /// selector may appear, because none of them is implemented.
     ///
-    /// Non-vacuous by construction: it reads this module's own source,
-    /// so a re-export or a projection method fails it, and it pins the
-    /// scope statement plus the accurate account of what is absent, so
-    /// deleting either — or reviving the retired "deferred to S4"
-    /// story — fails it too.
+    /// Non-vacuous by construction: it reads this module's OWN source
+    /// and the consumer submodule's, so a re-export or a public method
+    /// that leaks the forbidden vocabulary fails it, and it requires
+    /// both halves of the shipped contract to be present, so the guard
+    /// cannot pass by the surface having been emptied.
     #[test]
-    fn the_public_surface_of_this_module_is_provider_lifecycle_only() {
-        let source = include_str!("sensing.rs");
-        // WHOLE `pub use` statements (they span lines) plus public fn
-        // signatures — so prose and doc links that legitimately NAME a
-        // deferred concept do not trip the guard, and a name hidden on a
-        // re-export's continuation line cannot slip past it either.
+    fn the_public_surface_is_provider_lifecycle_plus_exact_consumer_observation() {
+        let sources = [
+            include_str!("sensing.rs"),
+            include_str!("sensing/consumer.rs"),
+        ];
+        // WHOLE declarations, not first lines: every `pub use` statement
+        // up to its `;`, and every public function signature — `pub fn`,
+        // `pub async fn`, `pub const fn` — from its keyword to the `{`
+        // or `;` that ends the signature. Prose and doc links that
+        // legitimately NAME a deferred concept do not trip the guard,
+        // while a type hidden on a continuation line, on an `async`
+        // signature, or on a public constant cannot slip past it.
+        //
+        // The earlier revision scanned only the FIRST line starting
+        // `pub fn`, so `pub async fn changed()` — a shipped method — and
+        // any wrapped parameter or return type were invisible to it.
         let mut declarations = String::new();
-        for after in source.split("pub use ").skip(1) {
-            let statement = after.split(';').next().unwrap_or("");
-            declarations.push_str(statement);
-            declarations.push('\n');
-        }
-        for line in source.lines().map(str::trim) {
-            if line.starts_with("pub fn ") {
-                declarations.push_str(line);
+        for source in sources {
+            for after in source.split("pub use ").skip(1) {
+                let statement = after.split(';').next().unwrap_or("");
+                declarations.push_str(statement);
                 declarations.push('\n');
+            }
+            for keyword in ["pub fn ", "pub async fn ", "pub const fn ", "pub const "] {
+                for after in source.split(keyword).skip(1) {
+                    let end = after
+                        .find('{')
+                        .into_iter()
+                        .chain(after.find(';'))
+                        .min()
+                        .unwrap_or(after.len());
+                    declarations.push_str(&after[..end]);
+                    declarations.push('\n');
+                }
             }
         }
 
         for forbidden in [
+            // Interest, audience and wire vocabulary: the SDK owns the
+            // lifecycle so applications never name any of it.
             "InterestSpec",
+            "InterestRegistration",
             "AudienceScopeCommitment",
-            "ProviderSelector",
-            "ResultMode",
             "DisclosureClass",
-            "ConsumerLatencyBudget",
-            "ProjectedReadiness",
+            "ResultMode",
             "CanonicalConstraints",
             "WorkLatencyEnvelope",
-            "SensedProvider",
-            "ExactProviderReadiness",
-            "exact_provider_readiness",
+            "ConsumerLatencyBudget",
+            "CapabilityInterestKey",
+            "ProviderInterestKey",
+            "SensingLeaseKey",
+            "SensingLeaseTicket",
+            "Digest256",
+            // Selectors and planes that do not exist above this slice.
+            "ProviderSelector",
+            "AnyAuthorized",
+            "TagMatch",
+            "GroupRef",
+            "SensingLeader",
+            // Core-internal ownership and projection containers.
+            "OrgSensingFamily",
+            "OrgSensedProjection",
+            "OrgSensedRow",
         ] {
             assert!(
                 !declarations.contains(forbidden),
-                "`{forbidden}` is back in the SDK sensing surface — the SDK \
-                 sensing surface is provider lifecycle only, and no query, \
-                 watch, snapshot, or readiness-projection vocabulary may \
-                 reappear here without a separate authorization",
+                "`{forbidden}` is back in the SDK sensing surface — this surface \
+                 is the provider lifecycle plus the own-organization \
+                 exact-provider observation, and neither interest/wire \
+                 vocabulary nor an unimplemented selector plane may appear on \
+                 it without a separate authorization",
             );
         }
 
-        // ...and the provider contract IS present, so the guard cannot
-        // pass by the module having been emptied.
+        // ...and BOTH halves of the shipped contract are present.
         for required in [
+            // Provider lifecycle.
             "ReadinessEvaluator",
             "EvaluationRequest",
             "ReadinessEvaluation",
             "CapabilityId",
             "Incarnation",
+            // Consumer observation.
+            "SensingQuery",
+            "SensingWatch",
+            "SensingSnapshot",
+            "SensedProvider",
+            "SensedViability",
+            "ProjectedReadiness",
         ] {
             assert!(
                 declarations.contains(required),
-                "the provider contract item `{required}` is missing from the surface",
+                "the contract item `{required}` is missing from the surface",
             );
         }
 
-        // ...and the DOCS must not claim a projection the module does
-        // not have. The surface checks above only read declarations, so
-        // a stale heading would otherwise survive.
-        let module_doc: String = source
+        // ...and the CONSUMER docs must disclose the two facts a caller
+        // cannot otherwise see: which bound the provider actually
+        // evaluates, and that every read requalifies and clamps.
+        let consumer_doc: String = sources[1]
+            .lines()
+            .take_while(|line| line.starts_with("//!") || line.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for disclosed in [
+            "PROVIDER-EVALUATED predicate",
+            "SensingQuery::start_within",
+            "ObserverNotQualified",
+            "CLAMPED",
+            "subset of\n//!   current visibility",
+        ] {
+            assert!(
+                consumer_doc.contains(disclosed),
+                "the consumer docs must disclose `{disclosed}` — the request's \
+                 provider-evaluated bound and the per-read requalification are \
+                 not inferable from the signatures",
+            );
+        }
+
+        // ...and the DOCS must keep naming what is genuinely absent, so a
+        // later slice cannot quietly imply it shipped. The declaration
+        // scan above cannot see a stale or overreaching heading.
+        let module_doc: String = sources[0]
             .lines()
             .take_while(|line| line.starts_with("//!") || line.trim().is_empty())
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            !module_doc.contains("plus the exact-provider"),
-            "the module heading still advertises the exact-provider projection, \
-             which this slice does not ship",
+            module_doc.contains("OWN-ORGANIZATION EXACT PROVIDERS"),
+            "the module docs must state the consumer surface's exact scope",
         );
-        assert!(
-            module_doc.contains("**Provider lifecycle only.**"),
-            "the module docs must keep the scope statement — this surface is \
-             provider lifecycle only",
-        );
-        assert!(
-            module_doc.contains("no readiness projection"),
-            "the module docs must keep saying that no query, watch, snapshot, \
-             or readiness projection exists here",
-        );
-        assert!(
-            module_doc.contains("no `ttl/2` refresh owner"),
-            "the module docs must keep naming what is still absent beneath a \
-             projection — no ranking and no lease refresh cadence",
-        );
+        for absent in [
+            "AnyAuthorized",
+            "cross-organization sensing",
+            "warmed pools",
+        ] {
+            assert!(
+                module_doc.contains(absent),
+                "the module docs must keep naming `{absent}` as absent",
+            );
+        }
         assert!(
             !module_doc.contains("deferred to S4"),
             "the module docs still say exact-provider acquisition is deferred: \
-             the core now authors an own-organization exact-provider lease, so \
-             only the projection surface above it is absent",
+             the core implements it and this surface observes it",
         );
         assert!(
             module_doc.contains("OrgProviderRegistration"),
-            "the module docs must record the implemented dark own-organization \
+            "the module docs must record the implemented own-organization \
              exact-provider path instead of denying it",
         );
 
-        // The crate root must not advertise it either.
+        // The crate root must describe the same boundary.
         let root = include_str!("lib.rs");
         let sensing_comment = root
-            .split("pub mod sensing;")
+            .split("pub use crate::sensing::{")
             .next()
-            .and_then(|before| before.rsplit("// Capability sensing").next())
-            .expect("the sensing module comment must exist");
+            .and_then(|before| before.rsplit("// Capability-sensing").next())
+            .expect("the sensing re-export comment must exist");
         assert!(
-            sensing_comment.contains("PROVIDER lifecycle only"),
-            "lib.rs must describe the sensing module as provider-lifecycle only",
+            sensing_comment.contains("own-organization exact-provider consumer observation"),
+            "lib.rs must describe what the sensing re-exports actually are",
         );
         assert!(
-            !sensing_comment.contains("readiness projection over"),
-            "lib.rs still advertises the removed readiness projection",
-        );
-        assert!(
-            !sensing_comment.contains("deferred to S4"),
-            "lib.rs still says exact-provider acquisition is deferred to S4 — \
-             the core implements it; the SDK just does not expose it",
+            sensing_comment.contains("cross-organization selector"),
+            "lib.rs must keep recording that no cross-organization or \
+             provider-free selector is exposed",
         );
     }
 
-    /// The ownership and state-edge witnesses in
-    /// `sdk/tests/sensing_provider.rs` are race and timing proofs: a
-    /// retry can only turn a real defect green. The nextest profile
-    /// grants two retries by default, so that binary MUST be in the
-    /// zero-retry override.
+    /// The witnesses in `sdk/tests/sensing_provider.rs` and
+    /// `sdk/tests/sensing_consumer.rs` are race and timing proofs: a
+    /// retry can only turn a real defect green — a lost wake, a
+    /// superseded handle disturbing its successor, an edge that must
+    /// arrive inside a bound. The nextest profile grants two retries by
+    /// default, so both binaries MUST be in the zero-retry override.
     ///
     /// Guards the config rather than trusting it, because the override is
     /// a filter expression that fails silently when it stops matching.
     #[test]
-    fn the_provider_witness_binary_is_excluded_from_retries() {
+    fn the_sensing_witness_binaries_are_excluded_from_retries() {
         let config = include_str!("../../.config/nextest.toml");
         let override_block = config
             .split("[[profile.default.overrides]]")
             .find(|block| block.contains("retries = 0"))
             .expect("a zero-retry override block must exist");
-        assert!(
-            override_block.contains("binary(sensing_provider)"),
-            "sdk/tests/sensing_provider.rs must be in the zero-retry override — \
-             its ownership and state-edge witnesses must not be retried into green",
-        );
+        for binary in ["sensing_provider", "sensing_consumer"] {
+            assert!(
+                override_block.contains(&format!("binary({binary})")),
+                "sdk/tests/{binary}.rs must be in the zero-retry override — its \
+                 ownership, wake and state-edge witnesses must not be retried \
+                 into green",
+            );
+        }
     }
 }
