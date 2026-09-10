@@ -1,0 +1,16 @@
+net/crates/net/sdk/tests/org_exact_sensing.rs
+  h_64425bc75e3f3d 1677-1698,1752-1756,1758,1761,1769-1787,1797-1802
+net/crates/net/src/adapter/net/mesh.rs
+  h_64425bc75e3f3d 47300-47316,47358-47405,47418-47419,47422,47543-47544,47547,47584-47585,47588,47619-47620,47623,47701-47702,47705,47772-47773,47776,50004-50005,50008,50082-50083,50086,50144-50145,50148
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "153bb8a3cb6dd94d266e81156970a7a96a81bae1",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
