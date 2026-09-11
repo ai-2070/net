@@ -1,0 +1,14 @@
+spikes/S1_BRIEF.md
+  h_64425bc75e3f3d 1-255
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "a96c3ae6236103b6edb14bb1bba3d5dcbcc9faa7",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
