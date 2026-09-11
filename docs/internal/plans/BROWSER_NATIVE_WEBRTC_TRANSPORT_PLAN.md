@@ -1409,6 +1409,34 @@ preserved; **no new guards held across awaits.**
 **Stop condition.** A clean, committed candidate for review. No automatic
 continuation to Stage 2.
 
+**Candidate delivered: `10302333a` (2026-09-11), awaiting Kyra's
+acceptance.** Nine commits from `ad874ff43`: the export baseline
+(`3f73e04f4`), `PeerAddr` + `PeerSink` (`2db4406aa`), peer-keyed state /
+ingress source typing / every send site (`a55b8c78b`), fmt + test seam
+(`bb34926d0`), **witness and test edits in their own commits**
+(`57654b685`, `d65731727`), the Linux batched-ingress argument fix
+(`96dc9fdf4`), the report (`98cc22d2c`,
+`docs/internal/spikes/S1_REPORT.md`), and an identifier sweep
+(`10302333a`). Reviewer re-ran on the Windows host: `cargo test --lib`
+with CI's `UNIT_FEATURES` (5975 passed), the six witness floors
+(93/24/62/41/60/68, all 276 `REQUIRED` names present — the same 71
+live outside `src/` at both ends), strict clippy (`--all-features` and
+default, `--lib --bins -D warnings`), per-file `rustfmt --check` on all
+32 changed `.rs` files, a fresh `net-ffi` release build with the export
+checker (568/568 match, self-test green), diff scope (no `Rtc` /
+`webrtc` / provisional tokens; `proxy.rs` and `traversal/` untouched),
+the `org_routing_wiring_tests.rs` diff line by line (signature and field
+renames only), and the org-egress deadline arms against the original
+(identical). Three source-text pins followed a rename; each still fails
+if its property is removed (S1_REPORT §4). Deviations accepted: rows
+25/26 (punch train to `peer_reflex`) stay on the raw socket per decision
+1; rows 4/5 call the `bound_datagram_send` wrapper directly because the
+fixtures arm substitutes the future. **Not verifiable on this host, CI is
+the arbiter:** the `cfg(target_os = "linux")` batched-ingress arm and
+`sendmmsg` drain (no cross C toolchain; one such arm was broken for one
+commit and caught by reading), `go test ./...` (no cgo toolchain), and
+`cargo fmt --all` (Windows argument-length limit, os error 206).
+
 ### Exit criteria
 
 - S0d's applicable rows preserve their blocking, error-mapping and
