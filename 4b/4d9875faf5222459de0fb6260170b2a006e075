@@ -1,0 +1,34 @@
+docs/internal/spikes/S0B_RTC_LOOP.md
+  h_64425bc75e3f3d 1-438
+spikes/s0b-rtc/.gitignore
+  h_64425bc75e3f3d 1-4
+spikes/s0b-rtc/native/Cargo.lock
+  h_64425bc75e3f3d 1-1812
+spikes/s0b-rtc/native/Cargo.toml
+  h_64425bc75e3f3d 1-20
+spikes/s0b-rtc/native/src/main.rs
+  h_64425bc75e3f3d 1-1117
+spikes/s0b-rtc/run.ps1
+  h_64425bc75e3f3d 1-126
+spikes/s0b-rtc/web/Cargo.lock
+  h_64425bc75e3f3d 1-880
+spikes/s0b-rtc/web/Cargo.toml
+  h_64425bc75e3f3d 1-24
+spikes/s0b-rtc/web/page/app.js
+  h_64425bc75e3f3d 1-425
+spikes/s0b-rtc/web/page/index.html
+  h_64425bc75e3f3d 1-11
+spikes/s0b-rtc/web/src/lib.rs
+  h_64425bc75e3f3d 1-223
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "4b4d9875faf5222459de0fb6260170b2a006e075",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
