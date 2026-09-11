@@ -1658,6 +1658,27 @@ re-review.** `513ea73d4` C1, `c14199bcd` C2, `fb31c198c` C3, plus §10 of
 **Not verifiable here:** CI's own run of the corrected `wasm-wire` job
 at the submitted head.
 
+**Closure review (Kyra, code head `bdcd47125`, run head `a1610df3f`):
+C1 and C3 CLOSED; exact-head CI 49/49 green; one C2 test defect
+remains.** The new classifier witness asserted its own
+`CARGO_MANIFEST_DIR` is the Net workspace, so a packaged core's test
+module still failed — at the classifier test instead of the callee test.
+
+**C2 follow-up delivered: `01e4b0f20` (reviewer-authored, one file).**
+The positive case is a controlled complete fixture (temp tree with all
+three markers under a fake `.git`); a member-only manifest is a further
+negative; the real checkout is asserted only when `CI` is set, with a
+message naming the assumption — so the callee guard cannot skip on the
+machine that enforces it, and a packaged build never trips it. Missing
+callee in a valid layout stays fatal. Reproduced with the exact guard
+source under controlled manifest locations: outside any repo 7/7;
+beneath an unrelated consumer checkout at
+`target/package/net-mesh-0.36.0` 7/7; real workspace 7/7 (`CI` unset
+and set); complete layout with `wire/src/session.rs` missing 6/1 exit
+101; packaged layout with `CI=true` 6/1 exit 101 naming the assumption.
+Core `--lib` 5774; permissive all-targets clippy clean. Stage 3 not
+started.
+
 ## Stage 3 — Native `webrtc` feature: driver, dedicated socket, STUN, loopback harness
 
 - `adapter/net/rtc/{mod,driver,transport,stun,config}.rs`; `PeerAddr::Rtc`;

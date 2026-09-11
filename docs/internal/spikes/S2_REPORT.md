@@ -755,6 +755,40 @@ exactly the ordering the R4/release work set up and which only a
 publish resolves. The classifier's decision on those two shapes is what
 the witness pins.
 
+#### C2 follow-up — the classifier witness is itself package-safe (`01e4b0f20`)
+
+Kyra's closure review of `bdcd47125` found the residual defect in the
+witness added above: `net_workspace_detection_needs_every_layout_marker`
+asserted `is_net_workspace(env!("CARGO_MANIFEST_DIR"))` unconditionally,
+so a packaged core's test binary still failed the module — the failure
+had moved from the callee test to the classifier test (outside a repo
+6/1; under an unrelated consumer checkout 6/1; real workspace 7/0).
+
+Change (reviewer-authored, one file): the positive case is a
+**controlled complete fixture** — the temp tree gains the workspace
+`members` entry and the `path = "wire"` dependency and must then
+classify, wherever it sits (it is under a fake `.git`); a member-only
+manifest is added as a further negative. The real checkout is still
+verified where the guard is enforced: when `CI` is set the manifest dir
+**must** classify as the workspace, with a message naming the assumption,
+so the callee guard cannot skip itself into uselessness on the machine
+that runs it. Missing callee source in a valid layout stays fatal.
+
+Reproduced with the exact guard source compiled against controlled
+manifest locations (`include_str!` sources copied beside it, real
+`tempfile`, `CI` unset unless stated):
+
+| Placement | Result |
+|---|---|
+| outside any repository, packaged layout | 7 passed, exit 0 (callee test skips with its printed reason) |
+| beneath an unrelated consumer Git checkout at `target/package/net-mesh-0.36.0` | 7 passed, exit 0 |
+| real Net workspace | 7 passed, exit 0 — with `CI` unset and with `CI=true` |
+| complete layout, `wire/src/session.rs` missing | 6 passed, 1 failed (`wire_session_still_defines_the_heartbeat_helper`), exit 101 |
+| packaged layout with `CI=true` (the guard's own inverse) | 6 passed, 1 failed (`…needs_every_layout_marker`: "CI is set, so this must be the Net checkout…"), exit 101 |
+
+Core `--lib` with CI's features: 5774 passed; permissive all-targets
+clippy clean; `rustfmt --check` clean.
+
 ### C3 — the R1 witnesses observe the emitted packet
 
 `fb31c198c`. Both witnesses now read the datagram off the peer's
