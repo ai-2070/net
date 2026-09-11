@@ -1,0 +1,60 @@
+net/crates/net/Cargo.lock
+  h_64425bc75e3f3d 151,162,1025,1277,1422,1718,1721,1731,1735,2599-2608,2856,2946-2968,3198,3253,4233,4290,4697,4839,4852,5539-5577,5719
+net/crates/net/Cargo.toml
+  h_64425bc75e3f3d 4,239-244
+net/crates/net/src/adapter/net/heartbeat_api_drift_check.rs
+  h_64425bc75e3f3d 1-193
+net/crates/net/src/adapter/net/mod.rs
+  h_64425bc75e3f3d 33-37,54-57,88-95,99-154,159-162,164-167,326-330,332-336,1725-1732
+net/crates/net/src/adapter/net/route.rs
+  h_64425bc75e3f3d 6-17,20
+net/crates/net/src/adapter/net/subnet/mod.rs
+  h_64425bc75e3f3d 25-30
+net/crates/net/src/adapter/net/transport.rs
+  h_64425bc75e3f3d 16-18,340-342,449-450
+net/crates/net/src/event.rs
+  h_64425bc75e3f3d 453-459
+net/crates/net/wire/Cargo.toml
+  h_64425bc75e3f3d 1-81
+net/crates/net/wire/src/aead.rs
+  h_64425bc75e3f3d 1-174
+net/crates/net/wire/src/batch.rs
+  h_64425bc75e3f3d 8
+net/crates/net/wire/src/clock.rs
+  h_64425bc75e3f3d 1-70
+net/crates/net/wire/src/crypto.rs
+  h_64425bc75e3f3d 10,15,396-400,402,416-417,452,652,732,735,760,762,776,795-796,817-820,823-824,873
+net/crates/net/wire/src/event.rs
+  h_64425bc75e3f3d 1-159
+net/crates/net/wire/src/lib.rs
+  h_64425bc75e3f3d 1-56
+net/crates/net/wire/src/parsed_packet.rs
+  h_64425bc75e3f3d 1-55
+net/crates/net/wire/src/peer_addr.rs
+  h_64425bc75e3f3d 1-60
+net/crates/net/wire/src/pool.rs
+  h_64425bc75e3f3d 11-12,37-41,51
+net/crates/net/wire/src/reliability.rs
+  h_64425bc75e3f3d 13
+net/crates/net/wire/src/route_codec.rs
+  h_64425bc75e3f3d 1-323
+net/crates/net/wire/src/route_hop.rs
+  h_64425bc75e3f3d 40,94,572
+net/crates/net/wire/src/session.rs
+  h_64425bc75e3f3d 17-19,22-23,26-27,52,147,177,218,226,228-230,233,245,247,259,261,991,1818,1854-1855,3296,3312
+net/crates/net/wire/src/stream.rs
+  h_64425bc75e3f3d 56,101,232,234,239-242,248-250
+net/crates/net/wire/src/time.rs
+  h_64425bc75e3f3d 1-111
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "d7174a9309026d1c8cb024cc09d94abb18211179",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
