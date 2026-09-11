@@ -20,8 +20,16 @@ Base: `ad874ff43` (Stage 0 complete). The export-baseline commit
 | `57654b685` | **Test and witness edits only** |
 | `96dc9fdf4` | Linux `batched-ingress` argument fix + rustdoc private-link fix (production) |
 | `d65731727` | Witness field shorthand after the `relay` rename (test-side) |
+| `98cc22d2c` | This report |
+| `10302333a` | One doc-comment word in `transport.rs` (`Rtc` → `RTC`) so the identifier is absent from the tree until Stage 3; no code change |
 
-Candidate: **`d65731727`**.
+**Three heads, kept distinct:**
+
+| Role | Commit | Meaning |
+|---|---|---|
+| Validated head | `d65731727` | Every command in §5 was run at this commit; the row-table line numbers in §3 are at this commit. Historical attribution — do not re-point. |
+| Implementation candidate | `10302333a` | The Stage 1 candidate submitted for acceptance. Differs from the validated head by the report itself and a single doc-comment word (`git diff d65731727..10302333a -- net/` is one line, no code); the reviewer re-ran the unit surface, the six floors, strict clippy, per-file `rustfmt --check` and the export checker at this commit. |
+| Submitted head | `8605f26ec` + the docs-only correction commit that added this table | The branch head handed to Kyra (`git log -1 LZL0/webrtc-transport`): the candidate plus the reviewer's plan record and this attribution fix. `git diff 10302333a..HEAD -- net/` is empty. |
 
 `UNIT_FEATURES` as pinned in `.github/workflows/ci.yml` and used verbatim
 for every `--features "$UNIT_FEATURES"` command below:
@@ -80,7 +88,8 @@ publication, `accept`'s caller-facing return).
 
 ## 3. The S0d row table, with what each row became
 
-Line numbers in the "became" column are at the candidate commit.
+Line numbers in the "became" column are at the validated head `d65731727`
+(unchanged at `10302333a`, whose only `net/` delta is a doc comment).
 "`send`", "`try_send`", "`send_bounded`" are `PeerSink` entry points.
 
 ### 3.1 `mesh.rs` direct socket sends (rows 1–37)
@@ -225,7 +234,9 @@ the all-targets lint).
 
 ## 5. Validation
 
-From `net/crates/net`, at `d65731727`.
+From `net/crates/net`, at the validated head `d65731727`. The reviewer's
+re-run at the implementation candidate `10302333a` is recorded in the
+plan (§Stage 1, "Candidate delivered").
 
 | Command | Result |
 |---|---|

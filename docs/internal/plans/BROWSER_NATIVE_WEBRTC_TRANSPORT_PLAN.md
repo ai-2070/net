@@ -1410,7 +1410,14 @@ preserved; **no new guards held across awaits.**
 continuation to Stage 2.
 
 **Candidate delivered: `10302333a` (2026-09-11), awaiting Kyra's
-acceptance.** Nine commits from `ad874ff43`: the export baseline
+acceptance.** Three heads, kept distinct: the agent's **validated head**
+`d65731727` (every S1_REPORT §5 command ran there; historical
+attribution, preserved as such in the report), the **implementation
+candidate** `10302333a` (validated head + report + one doc-comment word,
+`git diff d65731727..10302333a -- net/` is a single non-code line), and
+the **submitted head** — the branch tip at handoff, `8605f26ec` plus the
+docs-only attribution fix, with `git diff 10302333a..HEAD -- net/` empty.
+Nine commits from `ad874ff43`: the export baseline
 (`3f73e04f4`), `PeerAddr` + `PeerSink` (`2db4406aa`), peer-keyed state /
 ingress source typing / every send site (`a55b8c78b`), fmt + test seam
 (`bb34926d0`), **witness and test edits in their own commits**
