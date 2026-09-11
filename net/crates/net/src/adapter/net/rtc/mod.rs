@@ -41,6 +41,8 @@ pub use config::{
 #[cfg(any(test, feature = "fixtures"))]
 pub use loopback::connect_rtc_loopback;
 pub use driver::{RtcDriver, RtcDriverHandle, RtcSignal};
+#[cfg(any(test, feature = "fixtures"))]
+pub use driver::RtcTestHooks;
 pub use stats::RtcStats;
 pub use stun::{binding_response, is_binding_request, parse_xor_mapped_address, STUN_MAGIC_COOKIE};
 pub use transport::{RtcSubmitError, RtcTransport};

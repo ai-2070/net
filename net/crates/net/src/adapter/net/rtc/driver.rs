@@ -105,6 +105,82 @@ pub enum RtcSignal {
     },
 }
 
+/// Test-only fault injection on the driver.
+///
+/// Every hook here exists because the property it exercises cannot
+/// be produced on demand from outside: a paused drain, a
+/// `Channel::write` that refuses after a passing precheck, DataChannel
+/// loss with `maxRetransmits: 0`, and an ICMP-induced
+/// `ConnectionReset` are all environmental. They are
+/// `cfg(any(test, feature = "fixtures"))`, so no production build can
+/// reach them.
+#[cfg(any(test, feature = "fixtures"))]
+#[derive(Debug, Default)]
+pub struct RtcTestHooks {
+    /// Stop the outbound pump without closing anything: queued
+    /// packets stay queued and the advisory reading goes stale,
+    /// which is exactly the state the reserved-bytes bound has to
+    /// hold on its own.
+    pause_pump: AtomicBool,
+    /// Treat every `Channel::write` as `Ok(false)` — a
+    /// post-acceptance refusal after a passing precheck. Exercises
+    /// retain-and-retry without needing a saturated peer.
+    force_write_false: AtomicBool,
+    /// Drop one in N inbound DataChannel messages (0 = no loss).
+    /// With `maxRetransmits: 0` there is no SCTP recovery, so this
+    /// is what makes `reliability.rs` the only recovery mechanism.
+    ingress_drop_one_in: std::sync::atomic::AtomicU64,
+    /// Counter for the loss injector.
+    ingress_seen: std::sync::atomic::AtomicU64,
+    /// Make the next socket read fail with `ConnectionReset`.
+    inject_conn_reset: AtomicBool,
+}
+
+#[cfg(any(test, feature = "fixtures"))]
+impl RtcTestHooks {
+    /// Pause or resume the outbound pump.
+    pub fn set_pump_paused(&self, paused: bool) {
+        self.pause_pump.store(paused, Ordering::Release);
+    }
+
+    /// Force every `Channel::write` to report `Ok(false)`.
+    pub fn set_force_write_false(&self, forced: bool) {
+        self.force_write_false.store(forced, Ordering::Release);
+    }
+
+    /// Drop one in `n` inbound DataChannel messages; `0` disables.
+    pub fn set_ingress_drop_one_in(&self, n: u64) {
+        self.ingress_drop_one_in.store(n, Ordering::Release);
+    }
+
+    /// Make the driver's next socket read surface a
+    /// `ConnectionReset`.
+    pub fn inject_conn_reset(&self) {
+        self.inject_conn_reset.store(true, Ordering::Release);
+    }
+
+    fn pump_paused(&self) -> bool {
+        self.pause_pump.load(Ordering::Acquire)
+    }
+
+    fn write_forced_false(&self) -> bool {
+        self.force_write_false.load(Ordering::Acquire)
+    }
+
+    fn take_conn_reset(&self) -> bool {
+        self.inject_conn_reset.swap(false, Ordering::AcqRel)
+    }
+
+    fn drop_this_ingress(&self) -> bool {
+        let n = self.ingress_drop_one_in.load(Ordering::Acquire);
+        if n == 0 {
+            return false;
+        }
+        let seen = self.ingress_seen.fetch_add(1, Ordering::Relaxed) + 1;
+        seen % n == 0
+    }
+}
+
 /// Mesh-side handle on the driver.
 #[derive(Debug, Clone)]
 pub struct RtcDriverHandle {
@@ -113,9 +189,18 @@ pub struct RtcDriverHandle {
     stats: Arc<RtcStats>,
     local_addr: SocketAddr,
     shutdown: Arc<AtomicBool>,
+    #[cfg(any(test, feature = "fixtures"))]
+    hooks: Arc<RtcTestHooks>,
 }
 
 impl RtcDriverHandle {
+    /// Test-only fault injection.
+    #[cfg(any(test, feature = "fixtures"))]
+    #[inline]
+    pub fn hooks(&self) -> &Arc<RtcTestHooks> {
+        &self.hooks
+    }
+
     /// The admission side.
     #[inline]
     pub fn transport(&self) -> &Arc<RtcTransport> {
@@ -242,6 +327,8 @@ impl RtcDriver {
         let transport = Arc::new(RtcTransport::new(&config, Arc::clone(&stats)));
         let (signal_tx, signal_rx) = mpsc::channel(64);
         let shutdown = Arc::new(AtomicBool::new(false));
+        #[cfg(any(test, feature = "fixtures"))]
+        let hooks = Arc::new(RtcTestHooks::default());
 
         let handle = RtcDriverHandle {
             signals: signal_tx,
@@ -249,6 +336,8 @@ impl RtcDriver {
             stats: Arc::clone(&stats),
             local_addr,
             shutdown: Arc::clone(&shutdown),
+            #[cfg(any(test, feature = "fixtures"))]
+            hooks: Arc::clone(&hooks),
         };
 
         tokio::spawn(driver_loop(
@@ -260,6 +349,8 @@ impl RtcDriver {
             ingress,
             signal_rx,
             shutdown,
+            #[cfg(any(test, feature = "fixtures"))]
+            hooks,
         ));
 
         Ok(handle)
@@ -279,6 +370,7 @@ async fn driver_loop(
     ingress: mpsc::Sender<(Bytes, RtcPeerId)>,
     mut signals: mpsc::Receiver<RtcSignal>,
     shutdown: Arc<AtomicBool>,
+    #[cfg(any(test, feature = "fixtures"))] hooks: Arc<RtcTestHooks>,
 ) {
     let mut sessions: HashMap<u32, Session> = HashMap::new();
     let mut buf = vec![0u8; RECV_BUF];
@@ -294,6 +386,8 @@ async fn driver_loop(
                 &transport,
                 &stats,
                 &ingress,
+                #[cfg(any(test, feature = "fixtures"))]
+                &hooks,
                 signal,
             )
             .await;
@@ -301,8 +395,24 @@ async fn driver_loop(
 
         // --- 2. outbound pump: one write per drain, retain on refusal -
         let slots: Vec<u32> = sessions.keys().copied().collect();
-        for slot in &slots {
-            pump_peer(*slot, &mut sessions, &socket, &transport, &stats, &ingress).await;
+        #[cfg(any(test, feature = "fixtures"))]
+        let pump_paused = hooks.pump_paused();
+        #[cfg(not(any(test, feature = "fixtures")))]
+        let pump_paused = false;
+        if !pump_paused {
+            for slot in &slots {
+                pump_peer(
+                    *slot,
+                    &mut sessions,
+                    &socket,
+                    &transport,
+                    &stats,
+                    &ingress,
+                    #[cfg(any(test, feature = "fixtures"))]
+                    &hooks,
+                )
+                .await;
+            }
         }
 
         // --- 3. advisory refresh --------------------------------------
@@ -339,7 +449,16 @@ async fn driver_loop(
                     if session.rtc.handle_input(Input::Timeout(now)).is_err() {
                         session.closed = true;
                     }
-                    drain_session(session, &socket, &transport, &stats, &ingress).await;
+                    drain_session(
+                        session,
+                        &socket,
+                        &transport,
+                        &stats,
+                        &ingress,
+                        #[cfg(any(test, feature = "fixtures"))]
+                        &hooks,
+                    )
+                    .await;
                 }
             }
             // ICE/DataChannel establishment deadline.
@@ -363,6 +482,14 @@ async fn driver_loop(
             .min(MAX_POLL_INTERVAL)
             .max(Duration::from_micros(500));
 
+        #[cfg(any(test, feature = "fixtures"))]
+        if hooks.take_conn_reset() {
+            // Rule 6, on demand: the reading is swallowed and
+            // counted, and every session stays up.
+            stats.note_udp_conn_reset();
+            continue;
+        }
+
         match tokio::time::timeout(wait, socket.recv_from(&mut buf)).await {
             Ok(Ok((n, source))) => {
                 receive(
@@ -373,6 +500,8 @@ async fn driver_loop(
                     &transport,
                     &stats,
                     &ingress,
+                    #[cfg(any(test, feature = "fixtures"))]
+                    &hooks,
                     &buf[..n],
                     source,
                 )
@@ -404,6 +533,10 @@ async fn driver_loop(
 }
 
 /// Pump one peer: at most one `Channel::write` per drain.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the pump reads the same state set the loop owns; bundling it would only rename the arguments"
+)]
 async fn pump_peer(
     slot: u32,
     sessions: &mut HashMap<u32, Session>,
@@ -411,6 +544,7 @@ async fn pump_peer(
     transport: &Arc<RtcTransport>,
     stats: &Arc<RtcStats>,
     ingress: &mpsc::Sender<(Bytes, RtcPeerId)>,
+    #[cfg(any(test, feature = "fixtures"))] hooks: &Arc<RtcTestHooks>,
 ) {
     loop {
         let Some(session) = sessions.get_mut(&slot) else {
@@ -442,7 +576,19 @@ async fn pump_peer(
         let amount = channel.buffered_amount();
         transport.publish_buffered(session.id.slot, amount);
 
-        match channel.write(true, &packet) {
+        #[cfg(any(test, feature = "fixtures"))]
+        let forced_false = hooks.write_forced_false();
+        #[cfg(not(any(test, feature = "fixtures")))]
+        let forced_false = false;
+        let wrote = if forced_false {
+            // The injected post-acceptance refusal: the precheck
+            // above passed, so this is the path that must retain
+            // rather than drop.
+            Ok(false)
+        } else {
+            channel.write(true, &packet)
+        };
+        match wrote {
             Ok(true) => {
                 stats.note_written();
             }
@@ -451,7 +597,16 @@ async fn pump_peer(
                 // iteration, and let admission do the refusing.
                 stats.note_write_false();
                 session.retry = Some(packet);
-                drain_session(session, socket, transport, stats, ingress).await;
+                drain_session(
+                    session,
+                    socket,
+                    transport,
+                    stats,
+                    ingress,
+                    #[cfg(any(test, feature = "fixtures"))]
+                    hooks,
+                )
+                .await;
                 return;
             }
             Err(e) => {
@@ -461,7 +616,16 @@ async fn pump_peer(
                 return;
             }
         }
-        drain_session(session, socket, transport, stats, ingress).await;
+        drain_session(
+            session,
+            socket,
+            transport,
+            stats,
+            ingress,
+            #[cfg(any(test, feature = "fixtures"))]
+            hooks,
+        )
+        .await;
         if sessions.get(&slot).is_some_and(|s| s.closed) {
             return;
         }
@@ -475,6 +639,7 @@ async fn drain_session(
     transport: &Arc<RtcTransport>,
     stats: &Arc<RtcStats>,
     ingress: &mpsc::Sender<(Bytes, RtcPeerId)>,
+    #[cfg(any(test, feature = "fixtures"))] hooks: &Arc<RtcTestHooks>,
 ) {
     loop {
         match session.rtc.poll_output() {
@@ -494,6 +659,14 @@ async fn drain_session(
                     }
                 }
                 Event::ChannelData(data) => {
+                    // Injected DataChannel loss. With
+                    // `maxRetransmits: 0` SCTP will not recover it,
+                    // which is the point: `reliability.rs` is the
+                    // only mechanism that can.
+                    #[cfg(any(test, feature = "fixtures"))]
+                    if hooks.drop_this_ingress() {
+                        continue;
+                    }
                     // Rule 5: never block the driver. A full input
                     // drops and counts.
                     match ingress.try_send((Bytes::from(data.data), session.id)) {
@@ -557,6 +730,7 @@ async fn receive(
     transport: &Arc<RtcTransport>,
     stats: &Arc<RtcStats>,
     ingress: &mpsc::Sender<(Bytes, RtcPeerId)>,
+    #[cfg(any(test, feature = "fixtures"))] hooks: &Arc<RtcTestHooks>,
     datagram: &[u8],
     source: SocketAddr,
 ) {
@@ -591,7 +765,16 @@ async fn receive(
     if session.rtc.handle_input(input).is_err() {
         session.closed = true;
     }
-    drain_session(session, socket, transport, stats, ingress).await;
+    drain_session(
+                        session,
+                        socket,
+                        transport,
+                        stats,
+                        ingress,
+                        #[cfg(any(test, feature = "fixtures"))]
+                        hooks,
+                    )
+                    .await;
 }
 
 #[expect(
@@ -606,6 +789,7 @@ async fn handle_signal(
     transport: &Arc<RtcTransport>,
     stats: &Arc<RtcStats>,
     ingress: &mpsc::Sender<(Bytes, RtcPeerId)>,
+    #[cfg(any(test, feature = "fixtures"))] hooks: &Arc<RtcTestHooks>,
     signal: RtcSignal,
 ) {
     match signal {
@@ -631,7 +815,16 @@ async fn handle_signal(
                     session.pending = Some(pending);
                     let id = session.id;
                     let sdp = offer.to_sdp_string();
-                    drain_session(&mut session, socket, transport, stats, ingress).await;
+                    drain_session(
+                        &mut session,
+                        socket,
+                        transport,
+                        stats,
+                        ingress,
+                        #[cfg(any(test, feature = "fixtures"))]
+                        hooks,
+                    )
+                    .await;
                     sessions.insert(id.slot, session);
                     let _ = reply.send(Ok((id, sdp)));
                 }
@@ -658,7 +851,16 @@ async fn handle_signal(
                 Ok(answer) => {
                     let id = session.id;
                     let sdp = answer.to_sdp_string();
-                    drain_session(&mut session, socket, transport, stats, ingress).await;
+                    drain_session(
+                        &mut session,
+                        socket,
+                        transport,
+                        stats,
+                        ingress,
+                        #[cfg(any(test, feature = "fixtures"))]
+                        hooks,
+                    )
+                    .await;
                     sessions.insert(id.slot, session);
                     let _ = reply.send(Ok((id, sdp)));
                 }
@@ -690,7 +892,16 @@ async fn handle_signal(
             };
             match session.rtc.sdp_api().accept_answer(pending, answer) {
                 Ok(()) => {
-                    drain_session(session, socket, transport, stats, ingress).await;
+                    drain_session(
+                        session,
+                        socket,
+                        transport,
+                        stats,
+                        ingress,
+                        #[cfg(any(test, feature = "fixtures"))]
+                        hooks,
+                    )
+                    .await;
                     let _ = reply.send(Ok(()));
                 }
                 Err(e) => {
@@ -711,7 +922,16 @@ async fn handle_signal(
             match Candidate::from_sdp_string(&candidate) {
                 Ok(c) => {
                     session.rtc.add_remote_candidate(c);
-                    drain_session(session, socket, transport, stats, ingress).await;
+                    drain_session(
+                        session,
+                        socket,
+                        transport,
+                        stats,
+                        ingress,
+                        #[cfg(any(test, feature = "fixtures"))]
+                        hooks,
+                    )
+                    .await;
                     let _ = reply.send(Ok(()));
                 }
                 Err(e) => {
