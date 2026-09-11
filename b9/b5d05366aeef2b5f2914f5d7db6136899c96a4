@@ -1,0 +1,30 @@
+.github/workflows/ci.yml
+  h_64425bc75e3f3d 4410-4413
+net/crates/net/Cargo.toml
+  h_64425bc75e3f3d 404
+net/crates/net/src/adapter/net/heartbeat_api_drift_check.rs
+  h_64425bc75e3f3d 204-214,217-240
+net/crates/net/tests/cross_lang_wire.rs
+  h_64425bc75e3f3d 169-175,237-257
+net/crates/net/wire/Cargo.toml
+  h_64425bc75e3f3d 26-28
+net/crates/net/wire/src/lib.rs
+  h_64425bc75e3f3d 32-34,57-58
+net/crates/net/wire/src/test_vectors.rs
+  h_64425bc75e3f3d 1-23
+net/crates/net/wire/src/test_vectors/aead_vector.json
+  h_64425bc75e3f3d 1-8
+net/crates/net/wire/tests/wasm_wire.rs
+  h_64425bc75e3f3d 172-175
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "b9b5d05366aeef2b5f2914f5d7db6136899c96a4",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
