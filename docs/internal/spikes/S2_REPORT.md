@@ -658,3 +658,189 @@ Export checker, fresh cdylib, `exports.baseline` untouched:
   the file list quickly; the verification build was then done by hand on
   the unpacked tree, natively and for wasm32, which is the stronger
   check and is what §R5 records.
+
+## 10. Closure after Kyra's second HOLD on `614b1c636`
+
+Repair credit retained: R1 opacity, R2 execution, R3 target install and
+R4 lockfile stand. Three bounded items, one commit each.
+
+| Head | Hash | What it is |
+|---|---|---|
+| Held candidate | `614b1c636` | 48 CI jobs green, one red (C1) |
+| Validated head | `fb31c198c` | C1–C3; every number below produced from it |
+| Closure candidate | the commit carrying this section | validated head + this text |
+
+### C1 — the wasm witnesses are linted with the feature they need
+
+`513ea73d4`. `tests/wasm_wire.rs` reads
+`net_wire::test_vectors::AEAD_VECTOR`, behind `test-vectors`; the
+all-targets clippy step was featureless, so it never linted the wasm
+witnesses — it failed to compile them.
+
+**Chosen fix: pass `--features test-vectors` to the clippy step**, not
+`required-features` on the test target and not a `#[cfg(feature)]` over
+the file. Either alternative makes a featureless command skip the
+witnesses silently, which is precisely what the executed step's grep
+exists to prevent; the direct fix keeps what CI lints and what CI runs
+the same build.
+
+Reproduction and fix, the exact commands, in the repository:
+
+```
+$ cargo clippy -p net-mesh-wire --target wasm32-unknown-unknown --all-targets \
+    -- -D warnings -A clippy::unwrap_used -A clippy::expect_used
+error[E0433]: cannot find `test_vectors` in `net_wire`
+error: could not compile `net-mesh-wire` (test "wasm_wire") due to 1 previous error
+
+$ cargo clippy -p net-mesh-wire --target wasm32-unknown-unknown --all-targets \
+    --features test-vectors -- -D warnings -A clippy::unwrap_used -A clippy::expect_used
+(clean)
+```
+
+and the same pair inside an unpacked `cargo package` tarball, plus the
+lean-build check there:
+
+```
+$ (unpacked) cargo clippy --offline --target wasm32-unknown-unknown --all-targets …
+error[E0433]: cannot find `test_vectors` in `net_wire`
+$ (unpacked) … --features test-vectors        → Finished `dev` profile
+$ (unpacked) cargo check --offline --target wasm32-unknown-unknown  → Finished `dev` profile
+```
+
+All four required properties hold: the featureless portable-library
+check remains (and its comment now says the lean build is **its** job,
+not clippy's); `--all-targets` reaches `tests/wasm_wire.rs`; the
+executed step still greps all three witnesses and they pass; both
+dependency-graph guards are untouched.
+
+### C2 — the guard recognizes the Net workspace, not any Git ancestor
+
+`c14199bcd`. `ancestors().any(|d| d.join(".git").exists())` answers yes
+for an unpacked package under a consumer's own repository, and the
+guard then demanded a `wire/` that a packaged crate cannot have —
+Kyra's middle placement, 5 pass 1 fail.
+
+`is_net_workspace(manifest_dir)` now requires all three layout markers
+that survive only in the real checkout: `wire/Cargo.toml` exists, the
+manifest declares `members = [` containing `"wire",`, and it depends on
+`net-mesh-wire = { version … path = "wire" }`. Real checkout → the
+missing/renamed callee stays fatal; anything else → an explicit skip
+naming the markers it did not find. Caller checks and the negative
+witness untouched.
+
+Kyra's three placements, now decided by the classifier and pinned by
+`net_workspace_detection_needs_every_layout_marker`:
+
+| Placement | Markers | Guard |
+|---|---|---|
+| real checkout | all three present | runs, fatal on drift — 7/7 drift tests pass |
+| unpacked package, no repo | no `wire/`, no member, no path dep | skip with reason |
+| unpacked package **under an unrelated `.git`** | same — a Git ancestor proves nothing | skip with reason (was: FAIL) |
+| tree with a stray `wire/` but no manifest markers | one of three | skip with reason |
+
+```
+test adapter::net::heartbeat_api_drift_check::net_workspace_detection_needs_every_layout_marker ... ok
+test adapter::net::heartbeat_api_drift_check::wire_session_still_defines_the_heartbeat_helper ... ok
+test adapter::net::heartbeat_api_drift_check::a_planted_production_caller_breaks_the_allowlist ... ok
+… 7 passed
+```
+
+The synthetic trees are built with `tempfile` (new dev-dependency), so
+the classification is witnessed without a filesystem sandbox. **Not
+reproduced end-to-end here:** running the real unpacked `net-mesh`
+package under each placement needs `cargo package -p net-mesh`, which
+fails locally with "no matching package named `net-mesh-wire` … location
+searched: crates.io index" — the wire crate is unpublished, which is
+exactly the ordering the R4/release work set up and which only a
+publish resolves. The classifier's decision on those two shapes is what
+the witness pins.
+
+### C3 — the R1 witnesses observe the emitted packet
+
+`fb31c198c`. Both witnesses now read the datagram off the peer's
+socket: `recv_from` the raw socket (the responder's receive loop is not
+started, so nothing else consumes it), skip any datagram whose
+`stream_id` is not the target so a heartbeat cannot be mistaken for it,
+`ParsedPacket::parse`, decrypt with the peer session's rx cipher —
+reading the header alone would accept any bytes that parse — then
+assert the RELIABLE bit and that the plaintext is the payload sent.
+
+The reliable witness pins descriptor identity instead of `.all(…)` over
+a possibly-empty iterator: a NACK naming the sequence the wire carried
+returns **exactly one** descriptor, with that `stream_id`, that `seq`,
+and the RELIABLE flag. `missing_bitmap: 0` is not an empty request —
+`next_expected` is itself the missing sequence.
+
+Kyra's production inverse, applied and reverted (never lands):
+
+```
+# builder.build(stream_id, seq, batch, flags) → …, PacketFlags::NONE)
+test …::a_fire_and_forget_stream_sends_unreliable_and_retains_nothing ... ok
+test …::a_reliable_stream_sends_reliable_and_retains_its_descriptor ... FAILED
+panicked at src\adapter\net\mesh.rs:53191:
+  regression: a reliable stream's packet must carry RELIABLE on the wire
+test result: FAILED. 1 passed; 1 failed
+exit 101
+
+# reverted; preimage SHA-256 matches
+test …::a_fire_and_forget_stream_sends_unreliable_and_retains_nothing ... ok
+test …::a_reliable_stream_sends_reliable_and_retains_its_descriptor ... ok
+test result: ok. 2 passed; 0 failed
+```
+
+The prose in `stream_handle.rs` and §9 is narrowed: the repair closes
+the mutation and forgery paths **Stage 2 newly exposed on the public
+handle**; it does not prevent every config/state disagreement. The
+inherited conflicting-config idempotent reopen remains inherited.
+
+### Validation at the closure candidate
+
+| Command | Result |
+|---|---|
+| `cargo fmt -p <touched members> -- --check` | pass |
+| `cargo check --workspace --all-targets` / `--all-features` | pass ×2 |
+| `cargo check -p net-mesh-wire --target wasm32-unknown-unknown` (featureless) | pass |
+| `cargo clippy -p net-mesh-wire --target wasm32 --all-targets --features test-vectors` (the new CI command) | pass |
+| `cargo test --locked -p net-mesh-wire --features json` | **206 passed**; guard `count=206`, `missing=0` |
+| executed wasm test (Node 24) | **3 passed** — all three witnesses |
+| `cargo test --test cross_lang_wire` | **8 passed** |
+| clippy: all-features lib/bins, lib/bins, no-default lib/bins, all-features all-targets, wire native all-targets | pass ×5 |
+| rustdoc `-D warnings`: core all-features, `-p net-mesh-wire` | pass ×2 |
+| `cargo test --lib --features "$UNIT_FEATURES"` | **5774 passed; 0 failed; 1 ignored** |
+| `cargo test --doc` | **8 passed; 31 ignored** |
+| fixtures-off probe | negative exit 101 with E0432 naming the bridge; positive exit 0 |
+| `cargo package -p net-mesh-wire` → unpack → featureless wasm check + feature-enabled `--all-targets` | pass |
+| C2 placements | classifier witness passes; real checkout runs the guard |
+| C3 production inverse | reliable witness fails, revert restores the preimage, both pass |
+| Integration families | core **478**, cortex/nRPC **279**, sensing **65**, NAT **84**, port-map **2**, RedEX **47** |
+| Linux-target check, `go test ./...` | still not runnable here (no cross C toolchain) |
+
+Witness floors: **93 / 24 / 62 / 41 / 60 / 68** against 93/24/62/41/60/67.
+
+Export checker, fresh cdylib, `exports.baseline` untouched:
+
+```
+  baseline count: 568
+✓ net.dll: export set matches the baseline
+```
+
+### Did not go cleanly (closure)
+
+- **C1 was a self-inflicted feature split.** R5 added the
+  `test-vectors` gate and enabled it on the *test* command while
+  leaving the clippy command featureless — and the comment I wrote
+  there claimed that was deliberate. It was a mistake dressed as a
+  decision, which is worse than the mistake; the comment is corrected
+  rather than deleted.
+- **C2's end-to-end placements are not reproducible on this machine.**
+  `cargo package -p net-mesh` cannot resolve the unpublished
+  `net-mesh-wire`, so the real unpacked-core trees Kyra built could not
+  be rebuilt here. The classifier is witnessed directly instead, on
+  synthetic trees of exactly those shapes — weaker evidence than
+  running the shipped test in all three placements, and stated as such.
+- **C3 found nothing wrong with the production code, which is the
+  point.** The inverse had to be applied by hand to prove the witnesses
+  bite, and the first version of the new assertions passed against the
+  inverse too — because they read the descriptor, not the datagram.
+  The receive-and-decrypt path is what makes the difference, and it
+  exists only because the review insisted on it.
