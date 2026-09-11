@@ -403,6 +403,10 @@ clap = { version = "4", features = ["derive", "env"], optional = true }
 # fixture pins the backend rather than only the packet path above it.
 net-mesh-wire = { version = "0.36.0", path = "wire", features = ["json", "test-vectors"] }
 tokio = { version = "1", features = ["full", "test-util"] }
+# `heartbeat_api_drift_check`'s workspace-layout classifier is
+# witnessed over synthetic trees (a packaged crate, the same tree
+# under a foreign `.git`, a stray `wire/` directory).
+tempfile = "3"
 criterion = { version = "0.8", features = ["async_tokio"] }
 # `examples/natsim_node.rs` only. The natsim scenarios run helper nodes
 # inside network namespaces, and the rendezvous drop paths they need to

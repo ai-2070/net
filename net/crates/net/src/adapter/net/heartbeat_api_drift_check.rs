@@ -203,38 +203,40 @@ fn mesh_rs_production_callers_match_allowlist() {
 /// tripwire would pass vacuously.
 ///
 /// **Repository-only, and says so.** `wire/src/session.rs` is a
-/// sibling path in this workspace; for a consumer who took
+/// sibling path in THIS workspace; for a consumer who took
 /// `net-mesh` from the registry, the wire crate is a versioned
 /// dependency unpacked somewhere else entirely and the path does not
 /// exist. Rather than fail there (a guard that breaks other people's
 /// builds) or pass silently (a guard that is inert exactly where no
-/// one is looking), the test detects a checkout by the workspace
-/// root's `.git` and **prints why it skipped** otherwise. CI is
-/// always a checkout, so the guard never goes vacuous where it
-/// matters.
+/// one is looking), the test detects the Net workspace by its
+/// **layout** and prints why it skipped otherwise.
+///
+/// "Is there a `.git` somewhere above me" is not that test: an
+/// unpacked package sitting under a consumer's own repository
+/// (`<consumer>/target/package/net-mesh-0.36.0`) answers yes, and
+/// then the guard demands a `wire/` that a packaged crate cannot
+/// have. [`is_net_workspace`] asks for the three markers only the
+/// real checkout carries.
 #[test]
 fn wire_session_still_defines_the_heartbeat_helper() {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let path = manifest_dir.join("wire").join("src").join("session.rs");
 
-    // `.git` is a directory in a normal clone and a file in a
-    // worktree or submodule; `exists()` covers both.
-    let in_checkout = manifest_dir
-        .ancestors()
-        .any(|dir| dir.join(".git").exists());
-    if !in_checkout {
+    if !is_net_workspace(manifest_dir) {
         println!(
-            "SKIPPED wire_session_still_defines_the_heartbeat_helper: no repository \
-             checkout above {manifest_dir:?}, so the sibling path {path:?} is not the \
-             wire crate this build links (a registry dependency is unpacked elsewhere). \
-             This guard is enforced in CI, which is always a checkout."
+            "SKIPPED wire_session_still_defines_the_heartbeat_helper: {manifest_dir:?} \
+             is not the Net workspace root (no `wire/Cargo.toml` member declared \
+             beside a `net-mesh-wire = {{ path = \"wire\" }}` dependency), so the \
+             sibling path {path:?} is not the wire crate this build links — a \
+             registry dependency is unpacked elsewhere. This guard is enforced in \
+             CI, which always builds from a checkout."
         );
         return;
     }
 
     let src = std::fs::read_to_string(&path).unwrap_or_else(|e| {
         panic!(
-            "this IS a repository checkout, so net-mesh-wire's session.rs must be \
+            "this IS the Net workspace, so net-mesh-wire's session.rs must be \
              readable at {path:?}: {e}"
         )
     });
@@ -243,6 +245,90 @@ fn wire_session_still_defines_the_heartbeat_helper() {
         "net-mesh-wire's NetSession must still define `build_heartbeat`; the \
          allowlist in this module names it as the ONLY approved way to \
          construct a production heartbeat."
+    );
+}
+
+/// Is `manifest_dir` the Net workspace root, with the wire crate as a
+/// path member?
+///
+/// Three markers, all of which a `cargo package` tarball loses and a
+/// foreign repository never has:
+///
+/// 1. `wire/Cargo.toml` exists — the sibling crate is present as
+///    source, not as a registry dependency;
+/// 2. this crate's own manifest declares the workspace and lists
+///    `"wire"` as a member;
+/// 3. …and depends on it **by path**, so the `wire/src/session.rs`
+///    read below is the code this build actually links.
+///
+/// Pure so it can be witnessed directly: see
+/// `net_workspace_detection_needs_every_layout_marker`.
+fn is_net_workspace(manifest_dir: &std::path::Path) -> bool {
+    if !manifest_dir.join("wire").join("Cargo.toml").is_file() {
+        return false;
+    }
+    let Ok(manifest) = std::fs::read_to_string(manifest_dir.join("Cargo.toml")) else {
+        return false;
+    };
+    let declares_member = manifest.contains("members = [") && manifest.contains("\"wire\",");
+    let depends_by_path =
+        manifest.contains("net-mesh-wire = { version") && manifest.contains("path = \"wire\"");
+    declares_member && depends_by_path
+}
+
+/// The classification itself, over synthetic trees.
+///
+/// This is the part Kyra's three placements exercise from the
+/// outside; here it is pinned without a filesystem sandbox. The
+/// interesting case is the third: a `.git` above the crate is exactly
+/// what an unpacked package under a consumer's repository has, and it
+/// must NOT read as the Net workspace.
+#[test]
+fn net_workspace_detection_needs_every_layout_marker() {
+    let real = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    assert!(
+        is_net_workspace(real),
+        "the real checkout must classify as the Net workspace, or this guard \
+         skips itself into uselessness"
+    );
+
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let root = tmp.path();
+
+    // A packaged crate: manifest, sources, no `wire/` member.
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"net-mesh\"\n\n[dependencies]\nnet-mesh-wire = { version = \"0.36.0\" }\n",
+    )
+    .expect("write manifest");
+    assert!(
+        !is_net_workspace(root),
+        "an unpacked package has no wire/ member and must not be mistaken for the \
+         workspace"
+    );
+
+    // …and the same tree beneath a Git checkout — a consumer's repo
+    // with our package under `target/package/`. The old `.git`-
+    // ancestor test said yes here and then demanded `wire/src`.
+    std::fs::create_dir_all(root.join(".git")).expect("fake .git");
+    assert!(
+        !is_net_workspace(root),
+        "a Git ancestor is not evidence of the NET workspace: an unpacked package \
+         under a consumer's repository has one"
+    );
+
+    // A tree that has `wire/Cargo.toml` but neither manifest marker
+    // is still not us (someone else's `wire` crate).
+    std::fs::create_dir_all(root.join("wire")).expect("wire dir");
+    std::fs::write(
+        root.join("wire").join("Cargo.toml"),
+        "[package]\nname = \"wire\"\n",
+    )
+    .expect("write wire manifest");
+    assert!(
+        !is_net_workspace(root),
+        "a sibling directory named `wire` is not the Net layout without the member \
+         and path-dependency declarations"
     );
 }
 
