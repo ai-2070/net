@@ -64,6 +64,38 @@ cargo test --lib
 
 Go bindings live in `go/` (`go test ./...`), the web docs in `web/`.
 
+### The `webrtc` feature needs a C toolchain (off by default)
+
+`--features webrtc` (Stage 3: the native WebRTC DataChannel
+transport) is the only feature in this repository whose build is not
+pure Rust. `str0m`'s pinned `rust-crypto` configuration still resolves
+`aws-lc-rs` / `aws-lc-sys`, whose build script compiles C:
+
+- **cmake** on `PATH`;
+- a C compiler — MSVC (`cl.exe`, via a Developer Prompt or
+  `vcvarsall`) on Windows, `gcc`/`clang` elsewhere;
+- **NASM** on x86_64, or the `aws-lc-sys/prebuilt-nasm` feature.
+
+Nothing else in the tree needs any of that, and a default
+`cargo build` / `cargo test` stays C-free — which is the reason the
+feature is off by default rather than merely optional. CI keeps it in
+one Linux-only job (`webrtc-feature`), where the runner already has
+cmake and gcc, so no default job pays the cost; that job also prints
+the dependency-build seconds so the trade-off can be revisited
+against a measurement.
+
+If you are only touching non-RTC code you can ignore all of this. If
+you are working on `src/adapter/net/rtc/`, the two harnesses are:
+
+```bash
+cargo test --features "webrtc fixtures" --test rtc_loopback
+cargo test --features "webrtc fixtures" --test rtc_backpressure
+```
+
+`fixtures` is required: `connect_rtc_loopback` and the driver's
+fault-injection hooks are `cfg(any(test, feature = "fixtures"))` so a
+production build cannot reach them.
+
 ### Faster local builds (optional: sccache)
 
 The pre-push checklist rebuilds the workspace several times over — three clippy

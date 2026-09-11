@@ -4480,3 +4480,97 @@ jobs:
             done
           done
           exit $status
+
+  webrtc-feature:
+    # Stage 3 of BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md. The `webrtc`
+    # feature is OFF by default and is the only feature in this crate
+    # with a C build-time dependency: `str0m`'s `rust-crypto` stack
+    # pulls `aws-lc-rs`/`aws-lc-sys`, which needs cmake and a C
+    # compiler (and NASM on x86_64). The ubuntu runner has all three,
+    # so nothing is installed here beyond the toolchain — but that is
+    # exactly why this is its own Linux job rather than a feature
+    # added to an existing matrix: no default job should start paying
+    # for a C build.
+    #
+    # `fixtures` rides along because the two harnesses use the
+    # driver's test-only hooks and `connect_rtc_loopback`, which are
+    # `cfg(any(test, feature = "fixtures"))` — a production build
+    # cannot reach them.
+    name: WebRTC feature (Stage 3)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: net/crates/net
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: webrtc
+          workspaces: net/crates/net -> target
+
+      # Recorded separately so the aws-lc-sys cost stays visible: if
+      # it grows, the decision to accept it (S3 report, option a) can
+      # be revisited against a number rather than a memory.
+      - name: Build the feature's dependency tree (aws-lc-sys cost)
+        run: |
+          start=$(date +%s)
+          cargo build --features webrtc --lib
+          echo "webrtc dependency + lib build: $(( $(date +%s) - start ))s"
+
+      - name: Clippy (production code, strict)
+        if: ${{ !cancelled() }}
+        run: cargo clippy --features webrtc --lib --bins -- -D warnings
+
+      - name: Clippy (all targets, permissive on test panics)
+        if: ${{ !cancelled() }}
+        run: >
+          cargo clippy --features "webrtc fixtures" --all-targets --
+          -D warnings
+          -A clippy::unwrap_used -A clippy::expect_used
+          -A clippy::undocumented_unsafe_blocks
+          -A clippy::multiple_unsafe_ops_per_block
+
+      - name: Documentation
+        if: ${{ !cancelled() }}
+        run: cargo doc --features webrtc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      # The unit surface WITH the feature: the default set plus
+      # `webrtc`, so the RTC modules' own units and every existing
+      # witness run in the same binary. The default `unit-tests` job
+      # is untouched — the point is that both pass.
+      - name: Unit tests (UNIT_FEATURES + webrtc)
+        if: ${{ !cancelled() }}
+        run: cargo test --lib --features "$UNIT_FEATURES webrtc"
+        env:
+          UNIT_FEATURES: net redex redex-disk cortex netdb meshdb meshos dataforts nat-traversal port-mapping tool batched-ingress cli regex
+
+      - name: Install cargo-nextest
+        if: ${{ !cancelled() }}
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
+      # The two Stage 3 harnesses, pinned by name like every other
+      # integration binary (the pin-guard job scrapes these flags).
+      - name: Stage 3 harnesses
+        if: ${{ !cancelled() }}
+        run: >
+          cargo nextest run --no-fail-fast --no-tests=fail --features "webrtc fixtures"
+          --test rtc_loopback
+          --test rtc_backpressure
+
+      # The wire crate's own `webrtc` feature adds the `PeerAddr::Rtc`
+      # variant and nothing else; lint it so the variant's arms cannot
+      # rot behind the core's feature.
+      - name: Clippy net-mesh-wire with its webrtc feature
+        if: ${{ !cancelled() }}
+        run: cargo clippy -p net-mesh-wire --features "json webrtc" --all-targets -- -D warnings
