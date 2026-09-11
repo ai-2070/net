@@ -185,9 +185,12 @@ build `net` / `rt-multi-thread` on `wasm32-unknown-unknown`. A "wire feature"
 on the core is therefore not a clock shim; it is a crate split (§7, Stage 2).
 
 Crypto is Noise NKpsk0 via `snow` (default pure-Rust resolver), ChaCha20-
-Poly1305 via `ring` 0.17 (builds for wasm32), Ed25519 / X25519 via the dalek
-3.x crates, BLAKE3, `postcard`. `getrandom` 0.4 needs `wasm_js` on wasm.
-None of this needs replacing.
+Poly1305 via `ring` 0.17, Ed25519 / X25519 via the dalek 3.x crates, BLAKE3,
+`postcard`. `getrandom` 0.4 needs `wasm_js` on wasm. None of this needs
+replacing on the native side. *(S0a, 2026-09-11, corrects the earlier
+"`ring` builds for wasm32": it does only with a wasm32-targeting `clang`
+on the build host — `ring`'s `build.rs` drives `cc` — so the packet AEAD
+needs a per-target backend seam; see §7 and Stage 2.)*
 
 **The rest of the mesh is not portable and must not be ported.** `tokio::time`
 appears in 40 files under `adapter/net`, `Instant::now` in 90, `thread::spawn`
@@ -766,12 +769,53 @@ is wrapped in a `RoutingHeader` (`send_routed`, `mesh.rs:28369–28427`;
 so a non-forwarding leaf still originates and receives routed packets.
 `RoutingHeader`, its flags/constants and `to_bytes` / `from_bytes` /
 `write_to` (`route.rs:182`, `:200`, `:215`, `:264`) move; the route *table*
-(`RouteEntry`, metrics, `next_hop`) does not. Two known couplings to cut in
-Stage 2: `session.rs` imports `crate::event::StoredEvent` (move the type or
-the dependency) and `subnet::route_hop::SharedHopReplayWindow` (move the
-window type into `net-wire`). The `Instant` uses go behind a `Clock` trait
-(native `std::time::Instant`; wasm `web_time::Instant`). CI adds
-`cargo check -p net-wire --target wasm32-unknown-unknown`.
+(`RouteEntry`, metrics, `next_hop`) does not.
+
+**What S0a established (`docs/internal/spikes/S0A_WIRE_BOUNDARY.md`,
+commit `4a95691d4`):**
+
+- The two `session.rs` couplings: `crate::event::StoredEvent` → **move the
+  type** (session only queues it); `subnet::route_hop::SharedHopReplayWindow`
+  → **move all of `subnet/route_hop.rs`** — `NetSession` also calls
+  `seal`/`seal_into`/`open`/`sealed_len` and names `OpenedHop` /
+  `RouteHopError`, so "move the window type" was insufficient. Adds
+  `blake2` + `subtle` to `net-wire`.
+- Also pulled in: `ParsedPacket` (split out of `transport.rs`),
+  `current_timestamp` / `coarse_clock_advance` (out of `mod.rs`), and
+  `tracing` as a real dependency (seven log sites survive, one a tripwire).
+- The packet AEAD gets a **backend seam**: `ring` natively (byte-identical),
+  the pure-Rust `chacha20poly1305` on wasm32 — same RFC 8439 bytes. Stage 2
+  adds a cross-backend golden vector to `cross_lang_wire`.
+- `snow` on wasm32 needs `default-features = false, features =
+  ["default-resolver", "default-resolver-crypto"]` (its `std` feature
+  force-activates `ring`); `getrandom` 0.2 **and** 0.3 both need their
+  browser opt-in in addition to 0.4's.
+- `Instant` / `Clock`: 13 sites across `reliability.rs`, `session.rs` and
+  the coarse clock. On wasm32 `std::time::Instant::now()` **compiles and
+  panics at runtime**, so a `cargo check` job alone cannot guard the seam —
+  Stage 2 needs an executed wasm test.
+- `NetSession::peer_addr` and `ParsedPacket::source` are `SocketAddr`:
+  compiles on wasm32 but a leaf has no peer socket address, so `net-wire`
+  cannot reach its final shape until Stage 1's `PeerAddr` exists (see
+  §Rough estimates, sequencing).
+- Every `#[cfg(test)]` module was left behind, including
+  `session.rs`'s `heartbeat_api_drift_check`, which greps `mesh.rs` /
+  `mod.rs` source text and cannot cross the crate boundary as-is. Stage 2
+  relocates each test module explicitly; losing the drift check silently
+  would remove the #97/#106 guard.
+- `adapter/net/subprotocol/*` codecs are **not** a compile dependency of
+  the wire modules; their move is driven by the leaf dispatcher's needs,
+  not by S0a.
+- Wasm size, `opt-level="z"` + lto + strip: 576 KiB raw / 161 KiB gzipped,
+  of which the copied Net wire code is ~21 KiB and the crypto ~93 KiB;
+  ~260 KiB is inert `wasm-bindgen` describe metadata pulled in by
+  `getrandom`'s browser backend. `net-leaf` pays that anyway; a
+  `net-wire`-only check job should not.
+
+The `Instant` uses go behind a `Clock` trait (native `std::time::Instant`;
+wasm `web_time::Instant`). CI adds
+`cargo check -p net-wire --target wasm32-unknown-unknown` **and** an
+executed wasm test.
 
 **`net-leaf` crate** (`crates/net/leaf/`, wasm32, `wasm-bindgen`):
 
@@ -1117,18 +1161,26 @@ admission) lands here — this stage is behaviour-neutral by definition.
 
 ## Stage 2 — `net-wire` crate + `Clock`
 
-Extract per §7 using S0a's type list; re-export under existing paths; add
-the wasm32 check and a `cross_lang_wire` golden fixture set (header,
-`RoutingHeader` envelope, `EventFrame`, `NackPayload`, `StreamWindow`,
-announcement with and without the new optional fields).
+Extract per §7 using S0a's type list (eight named items plus `route_hop.rs`,
+`ParsedPacket`, the coarse clock, `StoredEvent`); the AEAD backend seam;
+re-export under existing paths; add the wasm32 check and a
+`cross_lang_wire` golden fixture set (header, `RoutingHeader` envelope,
+`EventFrame`, `NackPayload`, `StreamWindow`, a **cross-backend AEAD
+vector** — same key/nonce/AAD/plaintext ⇒ identical ciphertext on `ring`
+and `chacha20poly1305` — and announcement with and without the new
+optional fields). Decide where each left-behind `#[cfg(test)]` module
+lands, including the `heartbeat_api_drift_check` tripwire.
 
 ### Exit criteria
 
-- `cargo check -p net-wire --target wasm32-unknown-unknown` in CI. **Stage 2
-  owns that job and the target installation** — a stage deliverable, not
-  unowned infrastructure.
+- `cargo check -p net-wire --target wasm32-unknown-unknown` in CI **plus an
+  executed wasm test** (wasm-bindgen-test or a wasmtime-hosted probe) that
+  runs the S0a routed round-trip on the wasm build — a check job cannot
+  catch `Instant::now()`'s runtime panic. **Stage 2 owns those jobs and the
+  target installation** — a stage deliverable, not unowned infrastructure.
 - `cargo test -p net-wire` runs the crypto, protocol, reliability and
-  session unit tests natively.
+  session unit tests natively; the `heartbeat_api_drift_check` guard still
+  exists somewhere and still fails on drift.
 - No behaviour change under default features; no `use` path in the core or
   any binding changes.
 
@@ -1456,8 +1508,12 @@ harness evidence; Stages 1–6 are re-estimated from those outputs, and the
 re-derived table replaces this section.
 
 Sequencing that survives the withdrawal: Stage 0 gates the trait and type
-decisions; Stages 1 and 2 can run in parallel after it; Stage 5 can start
-against the Stage 3 harness before Stage 4 completes.
+decisions; Stage 5 can start against the Stage 3 harness before Stage 4
+completes. **Corrected by S0a:** Stages 1 and 2 are *not* independent —
+`NetSession::peer_addr` and `ParsedPacket::source` are `SocketAddr`, so
+`net-wire`'s final shape needs `PeerAddr`. Either Stage 2 follows Stage 1,
+or Stage 2 makes the peer endpoint a type parameter of the wire types and
+Stage 1 instantiates it; the choice is made when Stage 1 is authorized.
 
 ---
 
