@@ -134,8 +134,14 @@ mod tests {
     #[test]
     fn the_advisory_default_is_below_str0ms_buffer_cap() {
         const STR0M_MAX_BUFFERED_ACROSS_STREAMS: usize = 128 * 1024;
+        // A `const` comparison, deliberately made a runtime assertion
+        // so the message travels with the failure: if someone raises
+        // the default past str0m's cap, the advisory silently stops
+        // firing — which is exactly what S0b measured (127 069 real
+        // refusals, zero advisory crossings).
+        let advisory = std::hint::black_box(DEFAULT_BUFFERED_AMOUNT_ADVISORY);
         assert!(
-            DEFAULT_BUFFERED_AMOUNT_ADVISORY < STR0M_MAX_BUFFERED_ACROSS_STREAMS,
+            advisory < STR0M_MAX_BUFFERED_ACROSS_STREAMS,
             "an advisory threshold at or above str0m's {STR0M_MAX_BUFFERED_ACROSS_STREAMS}-byte \
              cap can never fire"
         );

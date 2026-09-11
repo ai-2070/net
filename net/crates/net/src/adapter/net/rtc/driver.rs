@@ -177,7 +177,7 @@ impl RtcTestHooks {
             return false;
         }
         let seen = self.ingress_seen.fetch_add(1, Ordering::Relaxed) + 1;
-        seen % n == 0
+        seen.is_multiple_of(n)
     }
 }
 
@@ -231,7 +231,8 @@ impl RtcDriverHandle {
     pub async fn create_offer(&self) -> Result<(RtcPeerId, String), String> {
         let (tx, rx) = oneshot::channel();
         self.signal(RtcSignal::CreateOffer { reply: tx }).await?;
-        rx.await.map_err(|_| "driver dropped the reply".to_string())?
+        rx.await
+            .map_err(|_| "driver dropped the reply".to_string())?
     }
 
     /// Accept a remote offer, producing an answer.
@@ -242,7 +243,8 @@ impl RtcDriverHandle {
             reply: tx,
         })
         .await?;
-        rx.await.map_err(|_| "driver dropped the reply".to_string())?
+        rx.await
+            .map_err(|_| "driver dropped the reply".to_string())?
     }
 
     /// Apply an answer to a pending offer.
@@ -254,7 +256,8 @@ impl RtcDriverHandle {
             reply: tx,
         })
         .await?;
-        rx.await.map_err(|_| "driver dropped the reply".to_string())?
+        rx.await
+            .map_err(|_| "driver dropped the reply".to_string())?
     }
 
     /// Add a remote ICE candidate.
@@ -266,7 +269,8 @@ impl RtcDriverHandle {
             reply: tx,
         })
         .await?;
-        rx.await.map_err(|_| "driver dropped the reply".to_string())?
+        rx.await
+            .map_err(|_| "driver dropped the reply".to_string())?
     }
 
     /// Wait for the DataChannel to open.
@@ -274,7 +278,8 @@ impl RtcDriverHandle {
         let (tx, rx) = oneshot::channel();
         self.signal(RtcSignal::AwaitOpen { peer, reply: tx })
             .await?;
-        rx.await.map_err(|_| "driver dropped the reply".to_string())?
+        rx.await
+            .map_err(|_| "driver dropped the reply".to_string())?
     }
 
     /// Close a session.
@@ -533,10 +538,6 @@ async fn driver_loop(
 }
 
 /// Pump one peer: at most one `Channel::write` per drain.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the pump reads the same state set the loop owns; bundling it would only rename the arguments"
-)]
 async fn pump_peer(
     slot: u32,
     sessions: &mut HashMap<u32, Session>,
@@ -766,15 +767,15 @@ async fn receive(
         session.closed = true;
     }
     drain_session(
-                        session,
-                        socket,
-                        transport,
-                        stats,
-                        ingress,
-                        #[cfg(any(test, feature = "fixtures"))]
-                        hooks,
-                    )
-                    .await;
+        session,
+        socket,
+        transport,
+        stats,
+        ingress,
+        #[cfg(any(test, feature = "fixtures"))]
+        hooks,
+    )
+    .await;
 }
 
 #[expect(
@@ -959,7 +960,11 @@ async fn handle_signal(
     }
 }
 
-fn new_session(config: &RtcConfig, transport: &Arc<RtcTransport>, advertised: SocketAddr) -> Session {
+fn new_session(
+    config: &RtcConfig,
+    transport: &Arc<RtcTransport>,
+    advertised: SocketAddr,
+) -> Session {
     let mut rtc = Rtc::new(Instant::now());
     if let Ok(candidate) = Candidate::host(advertised, "udp") {
         rtc.add_local_candidate(candidate);

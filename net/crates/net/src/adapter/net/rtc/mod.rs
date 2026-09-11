@@ -39,10 +39,10 @@ pub use config::{
     DEFAULT_SEND_QUEUE_PACKETS,
 };
 #[cfg(any(test, feature = "fixtures"))]
-pub use loopback::connect_rtc_loopback;
+pub use driver::RtcTestHooks;
 pub use driver::{RtcDriver, RtcDriverHandle, RtcSignal};
 #[cfg(any(test, feature = "fixtures"))]
-pub use driver::RtcTestHooks;
+pub use loopback::connect_rtc_loopback;
 pub use stats::RtcStats;
 pub use stun::{binding_response, is_binding_request, parse_xor_mapped_address, STUN_MAGIC_COOKIE};
 pub use transport::{RtcSubmitError, RtcTransport};

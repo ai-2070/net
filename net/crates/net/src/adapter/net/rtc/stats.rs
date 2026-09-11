@@ -76,11 +76,7 @@ impl RtcStats {
         note_write_false,
         "`Channel::write` returning `Ok(false)` after a passing precheck. NOT a loss: the packet is retained and retried."
     );
-    counter!(
-        written,
-        note_written,
-        "Packets `Channel::write` accepted."
-    );
+    counter!(written, note_written, "Packets `Channel::write` accepted.");
     counter!(
         discarded_at_close,
         note_discarded_at_close,
@@ -121,7 +117,8 @@ impl RtcStats {
     /// Record an observed `buffered_amount`.
     #[inline]
     pub fn observe_buffered(&self, amount: usize) {
-        self.max_buffered.fetch_max(amount as u64, Ordering::Relaxed);
+        self.max_buffered
+            .fetch_max(amount as u64, Ordering::Relaxed);
     }
 
     /// Add `n` to [`Self::discarded_at_close`].

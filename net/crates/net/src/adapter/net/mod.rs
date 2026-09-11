@@ -155,11 +155,11 @@ mod reliability {
         }
     }
 }
-#[cfg(feature = "webrtc")]
-pub mod rtc;
 mod reroute;
 mod route;
 mod router;
+#[cfg(feature = "webrtc")]
+pub mod rtc;
 pub mod secret_file;
 mod session {
     //! Re-export shim: see `net_wire::session`.

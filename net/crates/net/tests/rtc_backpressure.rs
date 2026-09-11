@@ -105,6 +105,11 @@ async fn reserved_slots_refuse_at_admission_with_nothing_enqueued() {
     // running, a loopback channel drains faster than this loop fills.
     driver.hooks().set_pump_paused(true);
 
+    // The node's own traffic (heartbeats, announcements) shares this
+    // queue, so the counters are read as deltas and the loop's own
+    // admissions are bounded by — not equal to — the reserved slots.
+    let refused_before = a.rtc_stats().admission_refused_slots();
+    let queued_before = transport.queued_packets(id_a);
     let mut accepted = 0;
     let mut refused = 0;
     for _ in 0..64 {
@@ -115,14 +120,25 @@ async fn reserved_slots_refuse_at_admission_with_nothing_enqueued() {
         }
     }
 
-    assert_eq!(accepted, 4, "exactly the reserved slots are admitted");
-    assert_eq!(refused, 60);
+    assert_eq!(
+        accepted + refused,
+        64,
+        "every submit resolved one way or the other"
+    );
+    assert!(
+        accepted + queued_before <= 4,
+        "admission never over-admits past the reserved slots: {accepted} accepted \
+         on top of {queued_before} already queued"
+    );
     assert_eq!(
         transport.queued_packets(id_a),
         4,
         "a refusal must enqueue nothing: no packet is accepted and then dropped"
     );
-    assert_eq!(a.rtc_stats().admission_refused_slots(), 60);
+    assert!(
+        a.rtc_stats().admission_refused_slots() - refused_before >= refused as u64,
+        "every slot refusal is counted (the node's own traffic may add more)"
+    );
     assert_eq!(
         a.rtc_stats().discarded_at_close(),
         0,
@@ -157,6 +173,9 @@ async fn the_reserved_byte_bound_holds_while_the_advisory_is_stale() {
         "precondition: the advisory reads zero, so only the byte bound can refuse"
     );
 
+    // The node's own traffic shares this queue; the bound is exact
+    // over everything in it, not over this loop alone.
+    let queued_before = transport.queued_bytes(id_a);
     let mut accepted_bytes = 0usize;
     let mut refusal = None;
     for _ in 0..64 {
@@ -174,16 +193,21 @@ async fn the_reserved_byte_bound_holds_while_the_advisory_is_stale() {
         Some(RtcSubmitError::BytesFull),
         "the byte bound must be what refuses, with the advisory reading stale at zero"
     );
-    assert_eq!(accepted_bytes, 8 * 1024);
-    assert_eq!(
-        transport.queued_bytes(id_a),
-        8 * 1024,
-        "the bound is exact, not approximate"
+    assert!(
+        accepted_bytes + queued_before <= 8 * 1024,
+        "admission never over-admits past the reserved bytes: {accepted_bytes} \
+         accepted on top of {queued_before} already queued"
+    );
+    assert!(
+        transport.queued_bytes(id_a) <= 8 * 1024,
+        "the bound is a bound: the queue never exceeds it"
+    );
+    assert!(
+        transport.queued_bytes(id_a) > 8 * 1024 - 1024,
+        "…and it is tight: admission refused within one packet of the bound, not early"
     );
     assert_eq!(
-        transport
-            .published_buffered(id_a)
-            .expect("still published"),
+        transport.published_buffered(id_a).expect("still published"),
         0,
         "the reading stayed stale throughout: the bound did not depend on it"
     );

@@ -15,12 +15,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use net::adapter::Adapter;
 use net::adapter::net::rtc::{connect_rtc_loopback, RtcConfig, RtcPeerId};
 use net::adapter::net::{
     EntityKeypair, MeshNode, MeshNodeConfig, PeerAddr, Reliability, SocketBufferConfig,
     StreamConfig,
 };
+use net::adapter::Adapter;
 use net::event::{batch_process_nonce, Batch, InternalEvent};
 
 /// A batch of `count` application events, the shape every other
@@ -194,7 +194,10 @@ async fn rtc_ingress_preserves_per_source_order_through_one_owner() {
         .await
         .expect("send_to_peer_node");
     let seen = drain_until(&b, N, Duration::from_secs(15)).await;
-    assert!(seen >= N, "expected {N} events over one DataChannel, saw {seen}");
+    assert!(
+        seen >= N,
+        "expected {N} events over one DataChannel, saw {seen}"
+    );
 
     let stats = b.rtc_stats();
     assert_eq!(
@@ -297,11 +300,7 @@ async fn the_delivery_sequence_survives_a_datachannel_close() {
         .expect("close");
     assert!(
         wait_for(
-            || !a
-                .rtc_driver()
-                .expect("driver")
-                .transport()
-                .is_open(id_a),
+            || !a.rtc_driver().expect("driver").transport().is_open(id_a),
             Duration::from_secs(5)
         )
         .await,

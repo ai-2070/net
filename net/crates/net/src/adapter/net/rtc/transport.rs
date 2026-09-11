@@ -201,7 +201,8 @@ impl RtcTransport {
     /// The reading admission is currently judging this peer against.
     pub fn published_buffered(&self, id: RtcPeerId) -> Option<usize> {
         let entry = self.slots.get(&id.slot)?;
-        (entry.generation == id.generation).then(|| entry.published_buffered.load(Ordering::Relaxed))
+        (entry.generation == id.generation)
+            .then(|| entry.published_buffered.load(Ordering::Relaxed))
     }
 
     /// How many packets are waiting for the driver.
@@ -274,7 +275,6 @@ impl RtcTransport {
         let generation = entry.generation;
         Some(RtcPeerId { slot, generation })
     }
-
 }
 
 #[cfg(test)]

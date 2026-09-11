@@ -115,8 +115,7 @@ pub fn parse_xor_mapped_address(response: &[u8]) -> Option<SocketAddr> {
     if u16::from_be_bytes([response[0], response[1]]) != BINDING_RESPONSE {
         return None;
     }
-    if u32::from_be_bytes([response[4], response[5], response[6], response[7]])
-        != STUN_MAGIC_COOKIE
+    if u32::from_be_bytes([response[4], response[5], response[6], response[7]]) != STUN_MAGIC_COOKIE
     {
         return None;
     }
@@ -137,7 +136,8 @@ pub fn parse_xor_mapped_address(response: &[u8]) -> Option<SocketAddr> {
             if value.len() < 4 {
                 return None;
             }
-            let port = u16::from_be_bytes([value[2], value[3]]) ^ ((STUN_MAGIC_COOKIE >> 16) as u16);
+            let port =
+                u16::from_be_bytes([value[2], value[3]]) ^ ((STUN_MAGIC_COOKIE >> 16) as u16);
             return match value[1] {
                 0x01 if value.len() >= 8 => {
                     let mut octets = [0u8; 4];

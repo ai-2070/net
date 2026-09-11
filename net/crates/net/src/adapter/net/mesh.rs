@@ -736,6 +736,10 @@ const FOLD_GENERATION_GC_MAX_AGE: Duration = Duration::from_secs(3600);
 /// For nodes where we only have the derived u64 node_id, we zero-pad
 /// it to 32 bytes. This preserves uniqueness for topology tracking
 /// without requiring the full public key exchange.
+/// The bounded RTC input the driver feeds and the receive loop owns.
+#[cfg(feature = "webrtc")]
+type RtcIngressInput = tokio::sync::mpsc::Receiver<(Bytes, super::rtc::RtcPeerId)>;
+
 /// Is this RTC datagram something `dispatch_packet` can act on?
 ///
 /// The RTC path carries exactly what the UDP path carries: a routing
@@ -10525,8 +10529,7 @@ pub struct MeshNode {
     /// `spawn_receive_loop` takes it (it can only have one consumer,
     /// and `dispatch_packet` is the single owner).
     #[cfg(feature = "webrtc")]
-    rtc_ingress:
-        Arc<parking_lot::Mutex<Option<tokio::sync::mpsc::Receiver<(Bytes, super::rtc::RtcPeerId)>>>>,
+    rtc_ingress: Arc<parking_lot::Mutex<Option<RtcIngressInput>>>,
     /// RTC counters. Present whenever the feature is compiled, so a
     /// node without `rtc` configured still reads zeros rather than
     /// making every caller handle an `Option`.
@@ -22006,7 +22009,7 @@ impl MeshNode {
     /// `pending_direct_initiators` and waits for the dispatcher to
     /// forward msg2, which is transport-agnostic — the only thing
     /// that changes is which sink half carries msg1.
-    #[cfg(any(test, feature = "fixtures"))]
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
     pub async fn connect_rtc(
         &self,
         peer: super::rtc::RtcPeerId,
@@ -22046,7 +22049,7 @@ impl MeshNode {
     /// — so msg1 arrives through the one dispatch owner, and msg2
     /// leaves through the same `PeerSink` every other send uses. The
     /// crypto is `NoiseHandshake` unchanged.
-    #[cfg(any(test, feature = "fixtures"))]
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
     pub async fn accept_rtc(
         &self,
         peer: super::rtc::RtcPeerId,
@@ -22054,9 +22057,12 @@ impl MeshNode {
     ) -> Result<u64, AdapterError> {
         let peer_addr = PeerAddr::Rtc(peer);
         let prologue = handshake_prologue(routing_id(peer_node_id), routing_id(self.node_id));
-        let mut handshake =
-            NoiseHandshake::responder_with_prologue(&self.config.psk, &self.static_keypair, &prologue)
-                .map_err(|e| AdapterError::Fatal(format!("handshake init failed: {e}")))?;
+        let mut handshake = NoiseHandshake::responder_with_prologue(
+            &self.config.psk,
+            &self.static_keypair,
+            &prologue,
+        )
+        .map_err(|e| AdapterError::Fatal(format!("handshake init failed: {e}")))?;
 
         let inbox = Arc::new(DirectHandshakeInbox::new());
         if let Some(displaced) = self
