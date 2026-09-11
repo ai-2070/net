@@ -1,0 +1,14 @@
+net/crates/net/src/adapter/net/heartbeat_api_drift_check.rs
+  h_64425bc75e3f3d 194-257
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "ee257c215d15813e0450d54bf77fd0b597a41a85",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
