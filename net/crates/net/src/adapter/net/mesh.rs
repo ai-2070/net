@@ -1569,9 +1569,11 @@ struct DispatchCtx {
     static_keypair: StaticKeypair,
     /// PSK shared across the mesh.
     psk: [u8; 32],
-    /// Socket for sending outbound subprotocol responses.
-    socket: Arc<NetSocket>,
-    /// Submission surface for this dispatch context's sends.
+    /// Submission surface for this dispatch context's sends. The one
+    /// socket-level (non-peer-endpoint) send left on this path — the
+    /// punch train to a server-reflexive tuple — reaches the UDP socket
+    /// through [`PeerSink::udp_socket`], so no second `Arc<NetSocket>`
+    /// rides here to go unread when `nat-traversal` is off.
     sink: PeerSink,
     /// Proximity graph for topology awareness.
     proximity_graph: Arc<ProximityGraph>,
@@ -24082,7 +24084,6 @@ impl MeshNode {
             pending_direct_initiators: self.pending_direct_initiators.clone(),
             static_keypair: self.static_keypair.clone(),
             psk: self.config.psk,
-            socket: self.socket.clone(),
             sink: self.sink.clone(),
             proximity_graph: self.proximity_graph.clone(),
             partition_filter: self.partition_filter.clone(),
@@ -33923,7 +33924,9 @@ impl MeshNode {
         let local_node_id = ctx.local_node_id;
         let peer_reflex = intro.peer_reflex;
         let peer = intro.peer;
-        let socket_send = ctx.socket.clone();
+        // Traversal stays on the raw socket (Stage 1 decision 1): the
+        // destination is a reflexive tuple, not a peer endpoint.
+        let socket_send = ctx.sink.udp_socket().clone();
         let sink_ack = ctx.sink.clone();
         let deadline = ctx.traversal_config.punch_deadline;
         let punch_observers = ctx.punch_observers.clone();
