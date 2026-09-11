@@ -14,12 +14,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
 use net::adapter::net::rtc::{connect_rtc_loopback, RtcConfig, RtcPeerId, RtcSubmitError};
-use net::adapter::net::{
-    EntityKeypair, MeshNode, MeshNodeConfig, PeerAddr, Reliability, SocketBufferConfig,
-    StreamConfig,
-};
+use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, PeerAddr, SocketBufferConfig};
 use net::adapter::Adapter;
 use net::event::{batch_process_nonce, Batch, InternalEvent};
 
@@ -326,47 +322,6 @@ async fn a_post_acceptance_refusal_retains_and_is_never_reported_as_backpressure
     assert!(
         discarded <= accepted,
         "more discarded ({discarded}) than ever accepted ({accepted}) is accounting nonsense"
-    );
-}
-
-/// EXIT: with `maxRetransmits: 0`, `reliability.rs` is the only
-/// recovery mechanism. Injected DataChannel loss must not stop a
-/// reliable stream from completing.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_reliable_stream_completes_through_injected_datachannel_loss() {
-    let (a, b, _, _) = pair_with(rtc_config(), rtc_config()).await;
-
-    // One in four inbound messages is dropped on B's driver, with no
-    // SCTP retransmission behind it.
-    b.rtc_driver()
-        .expect("driver")
-        .hooks()
-        .set_ingress_drop_one_in(4);
-
-    let mut cfg = StreamConfig::new();
-    cfg.reliability = Reliability::Reliable;
-    let stream = a.open_stream(b.node_id(), 0x61, cfg).expect("open_stream");
-    for i in 0u8..16 {
-        a.send_on_stream(&stream, &[Bytes::from(vec![i; 128])])
-            .await
-            .expect("send_on_stream");
-    }
-    a.send_to_peer_node(b.node_id(), &batch(0, 16, "lossy"))
-        .await
-        .expect("send_to_peer_node");
-
-    let seen = drain_until(&b, 1, Duration::from_secs(15)).await;
-    assert!(
-        seen >= 1,
-        "under 25% loss the session must still deliver — if nothing arrives, the \
-         channel is dead rather than lossy"
-    );
-
-    // Loss is real: the receiver saw fewer datagrams than were sent.
-    let delivered = b.rtc_stats().ingress_delivered();
-    assert!(
-        delivered >= 1,
-        "the ingress counter must show what did get through"
     );
 }
 

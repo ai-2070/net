@@ -1006,13 +1006,33 @@ async fn a_fire_and_forget_stream_loses_packets_and_never_retransmits() {
             .expect("send");
     }
 
-    // Half the messages are dropped and nothing repairs them.
+    // Half the messages are dropped and nothing repairs them — and the
+    // other half ARRIVE. `seen.len() < N` alone is satisfied by a
+    // stream that never sent anything (Kyra's suppress-the-sends
+    // inverse passed it); the loss claim needs both bounds, and the
+    // survivors must be the sender's own values in the sender's order.
     let seen = collect_tagged(&b, b"R6FAF", N, Duration::from_secs(8)).await;
     assert!(
         seen.len() < N,
         "with every second message dropped and no recovery, a fire-and-forget \
          stream must actually lose packets; saw all {N}"
     );
+    assert!(
+        !seen.is_empty(),
+        "a fire-and-forget stream under 1-in-2 loss must still deliver the \
+         other half; nothing arrived, which is what a stream that never sent \
+         looks like"
+    );
+    let mut cursor = 0usize;
+    for got in &seen {
+        let pos = payloads[cursor..]
+            .iter()
+            .position(|p| p == got)
+            .unwrap_or_else(|| {
+                panic!("received a value the sender never sent, or out of order: {got:?}")
+            });
+        cursor += pos + 1;
+    }
     assert_eq!(
         a.control_plane_stats()
             .retransmit_packets_sent

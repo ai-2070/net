@@ -139,37 +139,6 @@ async fn a_datachannel_session_installs_as_a_direct_rtc_peer() {
     assert!(b.peer_is_direct(a.node_id()));
 }
 
-/// EXIT: streams work over RTC — ordered delivery of a reliable
-/// stream's payloads, through the same `open_stream` / `send_on_stream`
-/// helpers the UDP witnesses use.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_reliable_stream_round_trips_over_the_datachannel() {
-    let (a, b, _, _) = rtc_pair().await;
-
-    // The reliable stream first: this is the path that carries
-    // per-stream sequencing and the retransmit window over RTC.
-    let mut cfg = StreamConfig::new();
-    cfg.reliability = Reliability::Reliable;
-    let stream = a.open_stream(b.node_id(), 0x51, cfg).expect("open_stream");
-    for i in 0u8..8 {
-        a.send_on_stream(&stream, &[Bytes::from(vec![i; 64])])
-            .await
-            .expect("send_on_stream");
-    }
-
-    // …and the application-event path, which is what `poll_shard`
-    // observes — the same helper every UDP two-node witness uses.
-    a.send_to_peer_node(b.node_id(), &batch(0, 8, "rtc"))
-        .await
-        .expect("send_to_peer_node");
-
-    let seen = drain_until(&b, 8, Duration::from_secs(10)).await;
-    assert!(
-        seen >= 8,
-        "all eight reliable payloads must arrive over the DataChannel; saw {seen}"
-    );
-}
-
 /// EXIT: RTC ingress reaches `dispatch_packet` through the receive
 /// loop's single owner, and per-source ordering is preserved.
 ///

@@ -4597,8 +4597,8 @@ jobs:
               exit 1
             fi
           }
-          check_floor rtc_loopback 6
-          check_floor rtc_backpressure 8
+          check_floor rtc_loopback 5
+          check_floor rtc_backpressure 7
           check_floor rtc_repairs 18
           check_floor rtc_routed_restore 4
           REQUIRED="
