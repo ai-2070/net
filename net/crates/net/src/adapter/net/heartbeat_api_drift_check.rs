@@ -288,13 +288,17 @@ fn is_net_workspace(manifest_dir: &std::path::Path) -> bool {
 /// test it had just made package-safe (Kyra, closure review of
 /// `bdcd47125`).
 ///
-/// The real checkout is still verified where it matters: under CI
-/// (`CI=true`, which every GitHub job sets) the manifest directory
-/// MUST classify as the workspace, so the callee guard cannot skip
-/// itself into uselessness on the one machine that enforces it. A
-/// packaged build never runs with `CI` set by this repository, and if
-/// a consumer's CI does, the message says exactly which assumption
-/// broke.
+/// The real checkout is still verified where it matters — but only
+/// where the signal actually identifies *this* repository. Generic
+/// `CI=true` does not: a consumer's own CI testing the packaged crate
+/// sets it too (Kyra, Stage 3 review). GitHub Actions sets
+/// `GITHUB_REPOSITORY` to `owner/repo` for the workflow's checkout,
+/// so the assertion fires only when that equals
+/// [`OWNING_REPOSITORY`], i.e. inside `ai-2070/net`'s own workflows,
+/// where the manifest directory MUST classify as the workspace so the
+/// callee guard cannot skip itself into uselessness on the one machine
+/// that enforces it. A packaged crate under any consumer's CI — GitHub
+/// or otherwise, `CI` set or not — never carries that value.
 ///
 /// The interesting negative is the third: a `.git` above the crate is
 /// exactly what an unpacked package under a consumer's repository has,
@@ -370,18 +374,88 @@ fn net_workspace_detection_needs_every_layout_marker() {
 
     // Where the guard is enforced, the real checkout must classify —
     // otherwise the callee test skips on the only machine that runs
-    // it. Outside CI (a developer's packaged build, a consumer's
-    // `cargo test` on the registry crate) this is not asserted, and
-    // the callee test's printed skip is the behaviour.
-    if std::env::var_os("CI").is_some() {
+    // it. The signal is the owning repository's identity, not the
+    // generic `CI` flag: a consumer's CI testing the packaged crate
+    // must reach the callee test's printed skip, not this assertion.
+    if running_in_owning_repository() {
         let real = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         assert!(
             is_net_workspace(real),
-            "CI is set, so this must be the Net checkout, but {real:?} does not \
-             classify as the workspace: the callee drift guard would skip itself \
-             into uselessness here"
+            "GITHUB_REPOSITORY is {OWNING_REPOSITORY}, so this must be the Net \
+             checkout, but {real:?} does not classify as the workspace: the callee \
+             drift guard would skip itself into uselessness here"
         );
     }
+}
+
+/// The repository whose own workflows are the one place the callee
+/// guard is *required* to run rather than allowed to skip.
+const OWNING_REPOSITORY: &str = "ai-2070/net";
+
+/// `true` only inside the owning repository's GitHub Actions run.
+///
+/// `GITHUB_REPOSITORY` is set by Actions to the `owner/repo` the
+/// workflow checked out; it is absent on developer machines and holds
+/// the consumer's own slug under a consumer's Actions run. Generic
+/// `CI` is deliberately not consulted.
+fn running_in_owning_repository() -> bool {
+    std::env::var("GITHUB_REPOSITORY").is_ok_and(|r| r == OWNING_REPOSITORY)
+}
+
+/// The identity signal is the repository slug, not the generic flag.
+#[test]
+fn owning_repository_signal_ignores_generic_ci() {
+    // Pure function of the environment; probe it through a child
+    // process so this test does not mutate the harness's environment
+    // for its siblings.
+    let probe = |vars: &[(&str, Option<&str>)]| -> bool {
+        let mut cmd = std::process::Command::new(std::env::current_exe().expect("exe"));
+        cmd.args([
+            "--exact",
+            "adapter::net::heartbeat_api_drift_check::__owning_repository_probe",
+            "--nocapture",
+            "--include-ignored",
+        ]);
+        cmd.env_remove("CI").env_remove("GITHUB_REPOSITORY");
+        for (k, v) in vars {
+            match v {
+                Some(v) => {
+                    cmd.env(k, v);
+                }
+                None => {
+                    cmd.env_remove(k);
+                }
+            }
+        }
+        let out = cmd.output().expect("run probe");
+        String::from_utf8_lossy(&out.stdout).contains("OWNING_REPOSITORY_PROBE=true")
+    };
+    assert!(
+        !probe(&[]),
+        "no signal at all must not read as the owning repository"
+    );
+    assert!(
+        !probe(&[("CI", Some("true"))]),
+        "generic CI=true is not repository identity (a consumer's CI sets it too)"
+    );
+    assert!(
+        !probe(&[
+            ("CI", Some("true")),
+            ("GITHUB_REPOSITORY", Some("someone-else/consumer"))
+        ]),
+        "a consumer's own Actions run must not read as the owning repository"
+    );
+    assert!(
+        probe(&[("GITHUB_REPOSITORY", Some(OWNING_REPOSITORY))]),
+        "the owning repository's own Actions run must be recognised"
+    );
+}
+
+/// Child-process half of `owning_repository_signal_ignores_generic_ci`.
+#[test]
+#[ignore = "driven as a child process by owning_repository_signal_ignores_generic_ci"]
+fn __owning_repository_probe() {
+    println!("OWNING_REPOSITORY_PROBE={}", running_in_owning_repository());
 }
 
 /// Negative witness: the scan actually fails on a planted call site.
