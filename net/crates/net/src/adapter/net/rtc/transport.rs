@@ -275,14 +275,6 @@ impl RtcTransport {
         Some(RtcPeerId { slot, generation })
     }
 
-    /// Every currently-open slot, for the driver's pump.
-    pub(super) fn open_slots(&self) -> Vec<u32> {
-        self.slots
-            .iter()
-            .filter(|e| !e.closed.load(Ordering::Acquire))
-            .map(|e| *e.key())
-            .collect()
-    }
 }
 
 #[cfg(test)]

@@ -26,7 +26,9 @@
 //! ([`RtcStats::discarded_at_close`]).
 
 mod config;
+mod driver;
 mod stats;
+mod stun;
 mod transport;
 
 pub use config::{
@@ -34,7 +36,9 @@ pub use config::{
     DEFAULT_INGRESS_QUEUE_PACKETS, DEFAULT_MAX_PEERS, DEFAULT_SEND_QUEUE_BYTES,
     DEFAULT_SEND_QUEUE_PACKETS,
 };
+pub use driver::{RtcDriver, RtcDriverHandle, RtcSignal};
 pub use stats::RtcStats;
+pub use stun::{binding_response, is_binding_request, parse_xor_mapped_address, STUN_MAGIC_COOKIE};
 pub use transport::{RtcSubmitError, RtcTransport};
 
 pub use net_wire::peer_addr::RtcPeerId;
