@@ -1,0 +1,20 @@
+.github/scripts/check-ffi-exports.py
+  h_64425bc75e3f3d 1-294
+.github/workflows/ci.yml
+  h_64425bc75e3f3d 3108-3127
+docs/internal/plans/BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md
+  h_64425bc75e3f3d 1354-1355,1359-1395,1398-1410,1414-1425,1429-1432
+net/crates/net/bindings/go/net-ffi/exports.baseline
+  h_64425bc75e3f3d 1-576
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "3f73e04f4536fe02d4915c88527ec6d83ad4af4b",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
