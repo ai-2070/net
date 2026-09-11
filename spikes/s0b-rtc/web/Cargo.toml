@@ -1,0 +1,24 @@
+[package]
+name = "s0b-web"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Throwaway S0b spike: the browser leaf — a wasm-bindgen wrapper around the S0a wire crate. Not production code."
+
+# Standalone: NOT a member of net/crates/net.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+s0a-wire = { path = "../../s0a-wire" }
+# Pinned to the installed wasm-bindgen-cli (0.2.128); a mismatch is a
+# hard error at bindgen time.
+wasm-bindgen = "=0.2.128"
+bytes = "1.12.1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
