@@ -359,7 +359,7 @@ with `git status --porcelain` empty after each revert.
 | **R1** scheduler handoff | Kyra: 16 scheduled fire-and-forget sends over a connected pair with the pump paused → all `Ok`, scheduler depth 0, RTC admission +1 (background only). `git grep set_rtc_transport` found the definition and no caller. | `rtc_repairs::scheduled_fire_and_forget_packets_reach_rtc_admission_and_the_peer` — admission delta ≥ 16 with the pump paused, then all 16 exact payloads at the peer. `… ok` | Delete the `router.set_rtc_transport` call from `MeshNode::new` → **FAIL** |
 | **R1** drain disposition | `each_outbound_class_takes_its_stated_disposition` never read `drain_refused`; removing the drain's retry/drop path left it green. | `rtc_repairs::the_scheduler_drain_counts_what_it_drops_under_pressure` — `drain_refused` rises under a saturated reservation. `… ok` | Drop the `note_drain_refused()` call → **FAIL** |
 | **R2** typed pressure | Kyra: fill the four reservations, `send_on_stream` reliable → `Err(Transport("send failed: rtc admission: reserved queue slots exhausted"))`. | `rtc_repairs::rtc_admission_pressure_is_retryable_backpressure_not_a_transport_error` — exactly `Backpressure`, credit refunded, sequence rolled back, and `send_with_retry` succeeds after the drain. `… ok` | Restore the blanket `StreamError::Transport` mapping → **FAIL** |
-| **R2** partial call | No witness existed for a committed prefix meeting pressure. | `rtc_repairs::a_committed_prefix_is_never_replayed_when_the_suffix_is_refused` — one call, pressure mid-call, 12 payloads delivered, 12 distinct. `… ok` | (covered by the R2 mapping inverse; the whole-call-replay shape is what the duplicate assertion rejects) |
+| **R2** partial call | No witness existed for a committed prefix meeting pressure. | `rtc_repairs::a_committed_prefix_is_never_replayed_when_the_suffix_is_refused` — 12 × 3 KiB payloads, so the MTU split makes several packets and a prefix can exist at all; pressure mid-call; all 12 distinct at the receiver; and, sender-side, one sequence per packet plus retransmissions. `… ok` | R2's `Transport` mapping → **FAIL**; Kyra's suppress-the-sends → **FAIL** |
 | **R3-A** submit/close race | Kyra's barrier harness: after close, `Ok(())`, queued = 1, accepted = 1, discarded = 0 — an orphan. | `rtc_repairs::a_submit_that_races_a_close_is_refused_and_nothing_is_orphaned` — `Err(UnknownPeer)`, queued 0, and `accepted == written + discarded_at_close + retained` exactly. `… ok` | Remove the under-the-lock `closed` re-check → **FAIL** |
 | **R3-B** node lifetime | Kyra: after `shutdown` + drop, the RTC address stays bound while the runtime lives. | `rtc_repairs::node_shutdown_releases_the_rtc_socket` — the exact address rebinds. `… ok` | Remove `shutdown_and_join` from `MeshNode::shutdown` → **FAIL** |
 | **R3-C** generation in signals | `AwaitOpen`/`Close` resolved `peer.slot` only; a wrong-generation `Close` closed the live session. | `rtc_repairs::a_wrong_generation_handle_cannot_touch_the_live_session` — stale `AwaitOpen` errors, stale `Close` leaves the session open. `… ok` | Resolve by `slot` alone → **FAIL** |
@@ -370,7 +370,7 @@ with `git status --porcelain` empty after each revert.
 | **R4-B** prefilter | The filter admitted only routing magic or a validating `NetHeader`, so a route-hop envelope and a headerless pingwave were rejected and charged to `validate_rejected`. | `rtc_repairs::the_rtc_prefilter_admits_exactly_what_dispatch_accepts` — route-hop and pingwave admitted; bad magic, oversize declared payload and a too-short frame each counted; channel survives. `… ok` | Restore the two-format filter → **FAIL** |
 | **R5-A** feature unification | A consumer with default `net-mesh` + `net-mesh-wire/webrtc` produced six core errors (non-exhaustive patterns, refutable binding). | `spikes/tools/feature_consumer`, three configurations, all `cargo check --locked` clean. | Remove one totality arm → `error[E0004]: non-exhaustive patterns: PeerAddr::Rtc(_) not covered` (**rc 101**) |
 | **R5-B** default docs | CI's `Documentation` job — the one red of 49/50 — on `[PeerAddr::Rtc]` with default features. | `RUSTDOCFLAGS="-D warnings" cargo doc -p net-mesh-wire --no-deps` clean with default features and with `--features webrtc`. | Restore the intra-doc link → `error: unresolved link to PeerAddr::Rtc` (**rc 101**) |
-| **R6** reliable/F&F witnesses | Kyra's inverse: suppress all public stream sends on 0x51/0x61 → both reliability witnesses still passed (they observed independent batch events). | `a_reliable_stream_delivers_exact_values_in_order_through_loss` (12 distinct under 1-in-3 loss, retransmits ≥ 1, extra deliveries bounded by retransmission) and `a_fire_and_forget_stream_loses_packets_and_never_retransmits`. `… ok` | Kyra's own inverse — swallow `send_on_stream` for the witness stream ids → **FAIL** (also fails the conservation witness) |
+| **R6** reliable/F&F witnesses | Kyra's inverse: suppress all public stream sends on 0x51/0x61 → both reliability witnesses still passed (they observed independent batch events). | `a_reliable_stream_delivers_exact_values_in_order_through_loss` (12 distinct under 1-in-4 loss, retransmits ≥ 1, extra deliveries bounded by retransmission) and `a_fire_and_forget_stream_loses_packets_and_never_retransmits`. `… ok` | Kyra's own inverse — swallow `send_on_stream` for the witness stream ids → **FAIL** (also fails the conservation witness) |
 | **R6** conservation | The old witness allowed any discard in `1..=accepted`; a lost subset was invisible. | `retention_conserves_every_admitted_packet_and_then_delivers_it` — exact ledger while writes refuse, then every payload delivered once and `retained == 0`. `… ok` | Drop the packet on `Ok(false)` instead of retaining → **FAIL** |
 | **R6** reset path | The hook incremented the counter on its own branch and never entered the production `ConnectionReset` arm. | `a_connection_reset_is_swallowed_by_the_production_arm_with_siblings_intact` — two live sessions, both intact and delivering. `… ok` | Route the injection to a side branch and break the production arm → **FAIL** |
 | **R6** idle refresh | The decay test could be satisfied by ordinary pump publication. | `the_advisory_refreshes_for_a_queued_peer_the_pump_never_touches` — pump paused for the whole test. `… ok` | (the refresh block is the only code that can satisfy it; removing it leaves the reading unpublished) |
@@ -456,7 +456,15 @@ missing and who would own it.
    panics in the driver. Defaults are sane; an operator can still
    misconfigure this into a panic. Owner: `RtcConfig`, one validating
    constructor — not done.
-6. **The restoring `connect_via` is retried up to three times** while
+6. **Duplicate delivery is a real property, not a test artifact.**
+   A packet the reliable layer retransmits after the original also
+   arrived is delivered twice to the receiver's shard queue: events
+   are pushed in arrival order and nothing dedups them there. Both
+   reliable witnesses therefore assert completeness plus a duplicate
+   budget bounded by retransmission, and the replay question is
+   answered sender-side on the sequence counter. Whether the ingest
+   path *should* dedup is a question this stage does not answer.
+7. **The restoring `connect_via` is retried up to three times** while
    route withdrawal settles across three nodes. That is a fixture
    accommodation, not a proven bound on settle time.
 
@@ -483,5 +491,5 @@ missing and who would own it.
 | `cargo check -p net-mesh-wire --target wasm32-unknown-unknown --features "json webrtc"` | pass |
 | R5-A consumer graph, `--locked`, three configurations | pass ×3 |
 | Export checker on a fresh `net-ffi` release cdylib | `net.dll: export set matches the baseline`, 568 |
-| Every named inverse | applied, red, reverted; tree clean after each |
+| Every named inverse (18, including Kyra's own suppress-the-sends) | applied, red, reverted; tree clean after each |
 | Linux targets | still not runnable on this host (no cross C toolchain) |
