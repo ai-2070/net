@@ -2041,7 +2041,12 @@ mod tests {
         use super::super::route::RoutingHeader;
         use super::super::subnet::route_hop::{parse_prefix, sealed_len, RouteHopError};
 
-        let session = NetSession::new(test_keys(), "127.0.0.1:9999".parse().unwrap(), 4, false);
+        let session = NetSession::new(
+            test_keys(),
+            PeerAddr::Udp("127.0.0.1:9999".parse().unwrap()),
+            4,
+            false,
+        );
         let header = RoutingHeader::new(0xDEAD_BEEF, 0x1234, 8);
         let inner = b"an inner packet the relay never looks inside";
         let needed = sealed_len(inner.len());
@@ -2086,7 +2091,7 @@ mod tests {
     #[test]
     fn test_session_creation() {
         let keys = test_keys();
-        let peer_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let peer_addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9999".parse().unwrap());
 
         let session = NetSession::new(keys.clone(), peer_addr, 4, false);
 
@@ -2177,7 +2182,7 @@ mod tests {
     #[test]
     fn cached_node_id_returns_none_until_published_then_caches() {
         let keys = test_keys();
-        let peer_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let peer_addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9999".parse().unwrap());
         let session = NetSession::new(keys, peer_addr, 4, false);
 
         // Fresh session: no cached resolution.
@@ -2230,7 +2235,7 @@ mod tests {
     #[test]
     fn test_session_streams() {
         let keys = test_keys();
-        let peer_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let peer_addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9999".parse().unwrap());
 
         let session = NetSession::new(keys, peer_addr, 4, false);
 
@@ -2255,7 +2260,7 @@ mod tests {
     #[test]
     fn test_session_timeout() {
         let keys = test_keys();
-        let peer_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let peer_addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9999".parse().unwrap());
 
         let session = NetSession::new(keys, peer_addr, 4, false);
 
@@ -2274,7 +2279,7 @@ mod tests {
         assert!(!manager.has_session());
 
         let keys = test_keys();
-        let peer_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let peer_addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9999".parse().unwrap());
         let session = NetSession::new(keys, peer_addr, 4, false);
 
         manager.set_session(session);
@@ -2290,7 +2295,7 @@ mod tests {
     #[test]
     fn test_open_stream_with_idempotent() {
         let keys = test_keys();
-        let peer_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let peer_addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9999".parse().unwrap());
         let session = NetSession::new(keys, peer_addr, 4, false);
 
         // First open creates state.
@@ -2334,7 +2339,7 @@ mod tests {
         use std::thread;
 
         let keys = test_keys();
-        let peer_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let peer_addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9999".parse().unwrap());
         let session = Arc::new(NetSession::new(keys, peer_addr, 4, false));
 
         const RACERS: usize = 4;
@@ -2376,7 +2381,7 @@ mod tests {
     #[test]
     fn test_close_stream_removes_state() {
         let keys = test_keys();
-        let peer_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let peer_addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9999".parse().unwrap());
         let session = NetSession::new(keys, peer_addr, 4, false);
 
         session.open_stream_with(1, false, 1);
@@ -2403,7 +2408,7 @@ mod tests {
     #[test]
     fn test_evict_idle_streams_timeout_and_cap() {
         let keys = test_keys();
-        let peer_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let peer_addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9999".parse().unwrap());
         let session = NetSession::new(keys, peer_addr, 4, false);
 
         // Open three streams; touch only one so the other two look idle.
@@ -2440,7 +2445,7 @@ mod tests {
     #[test]
     fn evict_idle_streams_sweeps_recently_closed_past_quarantine_window() {
         let keys = test_keys();
-        let peer_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let peer_addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9999".parse().unwrap());
         let session = NetSession::new(keys, peer_addr, 4, false);
 
         // Manually pre-populate `recently_closed` with entries
@@ -2478,7 +2483,7 @@ mod tests {
         let manager = SessionManager::new(Duration::from_millis(50));
 
         let keys = test_keys();
-        let peer_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let peer_addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9999".parse().unwrap());
         let session = Arc::new(NetSession::new(keys, peer_addr, 4, false));
 
         manager.set_session_arc(session.clone());
@@ -2912,7 +2917,7 @@ mod tests {
     #[test]
     fn session_try_rollback_tx_seq_is_epoch_guarded() {
         let keys = test_keys();
-        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
         let session = Arc::new(NetSession::new(keys, addr, 4, false));
 
         let stream_id = 0x55;
@@ -3085,7 +3090,7 @@ mod tests {
     fn session_with_stream(stream_id: u64, tx_window: u32) -> Arc<NetSession> {
         let session = Arc::new(NetSession::new(
             test_keys(),
-            "127.0.0.1:9999".parse().unwrap(),
+            PeerAddr::Udp("127.0.0.1:9999".parse().unwrap()),
             4,
             false,
         ));
@@ -3365,7 +3370,7 @@ mod tests {
         // tx_seq untouched while control-seq advances independently.
         let session = Arc::new(NetSession::new(
             test_keys(),
-            "127.0.0.1:9999".parse().unwrap(),
+            PeerAddr::Udp("127.0.0.1:9999".parse().unwrap()),
             4,
             false,
         ));
@@ -3479,7 +3484,7 @@ mod tests {
         use bytes::Bytes;
 
         let keys = test_keys();
-        let peer_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let peer_addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9999".parse().unwrap());
         let session = NetSession::new(keys.clone(), peer_addr, 4, false);
 
         // Capture last_activity before the spoof attempts so we

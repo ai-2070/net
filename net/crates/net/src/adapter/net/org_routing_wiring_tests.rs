@@ -7009,9 +7009,11 @@ fn fresh_session_keys() -> crate::adapter::net::crypto::SessionKeys {
 fn seed_peer(node: &MeshNode, node_id: u64, direct: bool) -> u64 {
     let keys = fresh_session_keys();
 
-    let addr: SocketAddr = format!("10.9.0.{}:9000", (node_id % 250) + 1)
-        .parse()
-        .expect("addr");
+    let addr: PeerAddr = PeerAddr::Udp(
+        format!("10.9.0.{}:9000", (node_id % 250) + 1)
+            .parse()
+            .expect("addr"),
+    );
     let session = Arc::new(NetSession::new(keys, addr, 4, false));
     let session_id = session.session_id();
     node.peers.insert(
@@ -7019,10 +7021,10 @@ fn seed_peer(node: &MeshNode, node_id: u64, direct: bool) -> u64 {
         PeerInfo {
             node_id,
             transport: if direct {
-                PeerTransport::Direct { owned_addr: addr }
+                PeerTransport::Direct { owned: addr }
             } else {
                 PeerTransport::Routed {
-                    relay_addr: addr,
+                    relay: addr,
                     adjacent_relay_identity: None,
                 }
             },
@@ -7513,8 +7515,8 @@ async fn an_exhausted_session_generation_fences_the_pool_plane() {
 #[tokio::test]
 async fn a_lost_peer_install_publishes_no_session_generation() {
     let node = node().await;
-    let addr: SocketAddr = "10.9.9.1:9000".parse().expect("addr");
-    let other: SocketAddr = "10.9.9.2:9000".parse().expect("addr");
+    let addr: PeerAddr = PeerAddr::Udp("10.9.9.1:9000".parse().expect("addr"));
+    let other: PeerAddr = PeerAddr::Udp("10.9.9.2:9000".parse().expect("addr"));
 
     // The control, first: a transition that DOES own its peer record
     // republishes exactly once. Without it, "never republish" passes.
@@ -7889,10 +7891,10 @@ fn flip_peer_transport(node: &MeshNode, node_id: u64) -> bool {
     let addr = transport.send_addr();
     let flipped = match transport {
         PeerTransport::Direct { .. } => PeerTransport::Routed {
-            relay_addr: addr,
+            relay: addr,
             adjacent_relay_identity: None,
         },
-        PeerTransport::Routed { .. } => PeerTransport::Direct { owned_addr: addr },
+        PeerTransport::Routed { .. } => PeerTransport::Direct { owned: addr },
     };
     node.peers.insert(
         node_id,
@@ -8167,8 +8169,8 @@ async fn a_peer_replaced_after_revalidation_cannot_publish_its_old_session() {
     let node = node().await;
     let entity = EntityId::from_bytes([0xd1u8; 32]);
     const N: u64 = 0xd001;
-    let addr: SocketAddr = "10.9.8.1:9000".parse().expect("addr");
-    let replacement_addr: SocketAddr = "10.9.8.2:9000".parse().expect("addr");
+    let addr: PeerAddr = PeerAddr::Udp("10.9.8.1:9000".parse().expect("addr"));
+    let replacement_addr: PeerAddr = PeerAddr::Udp("10.9.8.2:9000".parse().expect("addr"));
 
     // Seeded through the REAL installer, so the state under test was published
     // by the production transition rather than written past it.

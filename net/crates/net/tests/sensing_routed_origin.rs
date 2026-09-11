@@ -64,7 +64,7 @@ use net::adapter::net::behavior::sensing::{
     SensingInterestFrame, SensingLeader, WorkLatencyEnvelope,
 };
 use net::adapter::net::cortex::RpcInboundDispatcher;
-use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
+use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, PeerAddr, SocketBufferConfig};
 use net::adapter::Adapter;
 use net::event::{batch_process_nonce, Batch, InternalEvent};
 use parking_lot::Mutex;
@@ -378,10 +378,10 @@ async fn routed_frames_authenticate_origin_coalesce_and_fan_back() {
     // Metric-1 overrides (unconditional insert; pingwave routes are
     // metric ≥ 2 and replace strictly-better-only, so these stick):
     // A reaches R via X, C via Y; R fans back via the same relays.
-    node_a.router().add_route(nid_r, addr_x);
-    node_c.router().add_route(nid_r, addr_y);
-    node_r.router().add_route(nid_a, addr_x);
-    node_r.router().add_route(nid_c, addr_y);
+    node_a.router().add_route(nid_r, PeerAddr::Udp(addr_x));
+    node_c.router().add_route(nid_r, PeerAddr::Udp(addr_y));
+    node_r.router().add_route(nid_a, PeerAddr::Udp(addr_x));
+    node_r.router().add_route(nid_c, PeerAddr::Udp(addr_y));
 
     // ── Two REAL frames: same predicate/selector/mode, different D ─
     let spec = InterestSpec {

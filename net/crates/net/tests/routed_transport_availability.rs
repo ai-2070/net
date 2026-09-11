@@ -30,7 +30,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use net::adapter::net::{ChannelName, EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
+use net::adapter::net::{
+    ChannelName, EntityKeypair, MeshNode, MeshNodeConfig, PeerAddr, SocketBufferConfig,
+};
 
 const TEST_BUFFER_SIZE: usize = 256 * 1024;
 const PSK: [u8; 32] = [0x42u8; 32];
@@ -186,5 +188,5 @@ async fn a_direct_session_is_both_reachable_and_adjacent() {
         .authenticated_next_hop(b_id)
         .expect("a direct handshake IS an authenticated adjacency");
     assert_eq!(hop.node_id, b_id);
-    assert_eq!(hop.addr, b_addr);
+    assert_eq!(hop.addr, PeerAddr::Udp(b_addr));
 }

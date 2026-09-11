@@ -60,7 +60,9 @@ use net::adapter::net::behavior::sensing::{
     DisclosureClass, DownstreamId, InterestSpec, ProviderInterestKey, ProviderSelector, ResultMode,
     SensingCounters, SensingInterestFrame, WorkLatencyEnvelope, SUBPROTOCOL_SENSING_INTEREST,
 };
-use net::adapter::net::{EntityId, EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
+use net::adapter::net::{
+    EntityId, EntityKeypair, MeshNode, MeshNodeConfig, PeerAddr, SocketBufferConfig,
+};
 use net::adapter::Adapter;
 
 /// The injected declarer — a fold+pin+route fixture, never a
@@ -127,7 +129,7 @@ fn inject_declarer(r: &Arc<MeshNode>, fleet_entity: &EntityId, via: SocketAddr) 
         caps,
     ));
     r.test_pin_peer_entity(P_DECLARER, fleet_entity.clone());
-    r.router().add_route(P_DECLARER, via);
+    r.router().add_route(P_DECLARER, PeerAddr::Udp(via));
     r.proximity_graph()
         .test_insert_edge(graph_id(r.node_id()), graph_id(P_DECLARER), 5_000);
 }

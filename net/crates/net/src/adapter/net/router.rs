@@ -1207,7 +1207,7 @@ mod tests {
             for _ in 0..4 {
                 let packet = QueuedPacket {
                     data: Bytes::from(vec![0u8; 64]),
-                    dest: "127.0.0.1:9000".parse().unwrap(),
+                    dest: PeerAddr::Udp("127.0.0.1:9000".parse().unwrap()),
                     stream_id: stream,
                     priority: false,
                     queued_at: Instant::now(),
@@ -1244,7 +1244,7 @@ mod tests {
         let scheduler = FairScheduler::new(2, 4); // per-queue cap = 4
         let mk = |stream_id: u64, priority: bool| QueuedPacket {
             data: Bytes::from(vec![0u8; 32]),
-            dest: "127.0.0.1:9000".parse().unwrap(),
+            dest: PeerAddr::Udp("127.0.0.1:9000".parse().unwrap()),
             stream_id,
             priority,
             queued_at: Instant::now(),
@@ -1293,12 +1293,12 @@ mod tests {
         // invariants the send loop relies on: (1) packets to the same peer
         // keep dequeue order; (2) the reuse-clear pattern empties the inner
         // vecs while keeping the dest slots for the next drain.
-        let a: SocketAddr = "127.0.0.1:1".parse().unwrap();
-        let b: SocketAddr = "127.0.0.1:2".parse().unwrap();
-        let c: SocketAddr = "127.0.0.1:3".parse().unwrap();
+        let a: PeerAddr = PeerAddr::Udp("127.0.0.1:1".parse().unwrap());
+        let b: PeerAddr = PeerAddr::Udp("127.0.0.1:2".parse().unwrap());
+        let c: PeerAddr = PeerAddr::Udp("127.0.0.1:3".parse().unwrap());
         let mk = |n: u8| Bytes::from(vec![n]);
 
-        let mut groups: Vec<(SocketAddr, Vec<Bytes>)> = Vec::new();
+        let mut groups: Vec<(PeerAddr, Vec<Bytes>)> = Vec::new();
         // Interleaved across three peers.
         group_by_dest(&mut groups, a, mk(1));
         group_by_dest(&mut groups, b, mk(2));
@@ -1333,11 +1333,11 @@ mod tests {
         // set would grow to one entry per peer ever seen (here 500); the
         // bounded reset must keep it at `cap + 1`.
         const CAP: usize = 64;
-        let mut groups: Vec<(SocketAddr, Vec<Bytes>)> = Vec::new();
+        let mut groups: Vec<(PeerAddr, Vec<Bytes>)> = Vec::new();
         let mut max_len = 0usize;
         for port in 0u16..500 {
             reset_dest_groups(&mut groups, CAP);
-            let dest: SocketAddr = format!("127.0.0.1:{}", port + 1).parse().unwrap();
+            let dest: PeerAddr = PeerAddr::Udp(format!("127.0.0.1:{}", port + 1).parse().unwrap());
             group_by_dest(&mut groups, dest, Bytes::from_static(b"x"));
             max_len = max_len.max(groups.len());
         }
@@ -1355,7 +1355,7 @@ mod tests {
         for _ in 0..4 {
             let packet = QueuedPacket {
                 data: Bytes::from(vec![0u8; 64]),
-                dest: "127.0.0.1:9000".parse().unwrap(),
+                dest: PeerAddr::Udp("127.0.0.1:9000".parse().unwrap()),
                 stream_id: 0,
                 priority: false,
                 queued_at: Instant::now(),
@@ -1366,7 +1366,7 @@ mod tests {
         // Enqueue priority packet
         let priority = QueuedPacket {
             data: Bytes::from(vec![1u8; 64]),
-            dest: "127.0.0.1:9000".parse().unwrap(),
+            dest: PeerAddr::Udp("127.0.0.1:9000".parse().unwrap()),
             stream_id: 1,
             priority: true,
             queued_at: Instant::now(),
@@ -1398,7 +1398,7 @@ mod tests {
             for _ in 0..packets_per_stream {
                 let packet = QueuedPacket {
                     data: Bytes::from(vec![stream as u8; 1]),
-                    dest: "127.0.0.1:9000".parse().unwrap(),
+                    dest: PeerAddr::Udp("127.0.0.1:9000".parse().unwrap()),
                     stream_id: stream,
                     priority: false,
                     queued_at: Instant::now(),
@@ -1484,7 +1484,7 @@ mod tests {
         let config = RouterConfig::new(0x1234, "127.0.0.1:0".parse().unwrap());
         let router = NetRouter::new(config).await.unwrap();
 
-        let dest: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+        let dest: PeerAddr = PeerAddr::Udp("127.0.0.1:9001".parse().unwrap());
         router.add_route(0x5678, dest);
 
         assert_eq!(router.routing_table().lookup(0x5678), Some(dest));
@@ -1522,7 +1522,7 @@ mod tests {
         packet.extend_from_slice(&routing_bytes);
         packet.extend_from_slice(&net_bytes);
 
-        let from: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let from: PeerAddr = PeerAddr::Udp("127.0.0.1:5000".parse().unwrap());
         let _ = router.route_packet(packet.freeze(), from);
 
         // The stream stats should be keyed by the correct stream_id
@@ -1549,7 +1549,7 @@ mod tests {
     async fn route_packet_drops_when_src_id_is_local() {
         let local_id = 0x1234u64;
         let dest_id = 0x9999u64;
-        let dest_addr: SocketAddr = "127.0.0.2:6000".parse().unwrap();
+        let dest_addr: PeerAddr = PeerAddr::Udp("127.0.0.2:6000".parse().unwrap());
 
         let config = RouterConfig::new(local_id, "127.0.0.1:0".parse().unwrap());
         let router = NetRouter::new(config).await.unwrap();
@@ -1575,7 +1575,7 @@ mod tests {
         packet.extend_from_slice(&routing_bytes);
         packet.extend_from_slice(&net_bytes);
 
-        let from: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let from: PeerAddr = PeerAddr::Udp("127.0.0.1:5000".parse().unwrap());
         let result = router.route_packet(packet.freeze(), from);
         match result {
             Err(RouterError::RoutingLoop) => {}
@@ -1609,7 +1609,7 @@ mod tests {
     async fn route_packet_drops_when_forward_makes_ttl_zero() {
         let local_id = 0x1234u64;
         let dest_id = 0x9999u64;
-        let dest_addr: SocketAddr = "127.0.0.2:6000".parse().unwrap();
+        let dest_addr: PeerAddr = PeerAddr::Udp("127.0.0.2:6000".parse().unwrap());
 
         let config = RouterConfig::new(local_id, "127.0.0.1:0".parse().unwrap());
         let router = NetRouter::new(config).await.unwrap();
@@ -1636,7 +1636,7 @@ mod tests {
         packet.extend_from_slice(&routing_bytes);
         packet.extend_from_slice(&net_bytes);
 
-        let from: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let from: PeerAddr = PeerAddr::Udp("127.0.0.1:5000".parse().unwrap());
         let result = router.route_packet(packet.freeze(), from);
 
         match result {
@@ -1655,7 +1655,7 @@ mod tests {
     async fn route_packet_forwards_when_ttl_remains_positive_after_decrement() {
         let local_id = 0x1234u64;
         let dest_id = 0x9999u64;
-        let dest_addr: SocketAddr = "127.0.0.2:6000".parse().unwrap();
+        let dest_addr: PeerAddr = PeerAddr::Udp("127.0.0.2:6000".parse().unwrap());
 
         let config = RouterConfig::new(local_id, "127.0.0.1:0".parse().unwrap());
         let router = NetRouter::new(config).await.unwrap();
@@ -1676,7 +1676,7 @@ mod tests {
         let mut packet = BytesMut::with_capacity(ROUTING_HEADER_SIZE + HEADER_SIZE);
         packet.extend_from_slice(&routing_bytes);
         packet.extend_from_slice(&net_bytes);
-        let from: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let from: PeerAddr = PeerAddr::Udp("127.0.0.1:5000".parse().unwrap());
         let result = router.route_packet(packet.freeze(), from);
         match result {
             Ok(RouteAction::Forwarded(addr)) => assert_eq!(addr, dest_addr),
@@ -1702,7 +1702,7 @@ mod tests {
     async fn ttl_drop_does_not_double_count_packets_in_for_stream() {
         let local_id = 0x1234u64;
         let dest_id = 0x9999u64;
-        let dest_addr: SocketAddr = "127.0.0.2:6000".parse().unwrap();
+        let dest_addr: PeerAddr = PeerAddr::Udp("127.0.0.2:6000".parse().unwrap());
 
         let config = RouterConfig::new(local_id, "127.0.0.1:0".parse().unwrap());
         let router = NetRouter::new(config).await.unwrap();
@@ -1728,7 +1728,7 @@ mod tests {
         let mut packet = BytesMut::with_capacity(ROUTING_HEADER_SIZE + HEADER_SIZE);
         packet.extend_from_slice(&routing_bytes);
         packet.extend_from_slice(&net_bytes);
-        let from: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let from: PeerAddr = PeerAddr::Udp("127.0.0.1:5000".parse().unwrap());
 
         let result = router.route_packet(packet.freeze(), from);
         assert!(matches!(result, Err(RouterError::TtlExpired)));
@@ -1769,7 +1769,7 @@ mod tests {
         for stream in 0..num_streams {
             let packet = QueuedPacket {
                 data: Bytes::from(vec![0u8; 8]),
-                dest: "127.0.0.1:9000".parse().unwrap(),
+                dest: PeerAddr::Udp("127.0.0.1:9000".parse().unwrap()),
                 stream_id: stream,
                 priority: false,
                 queued_at: Instant::now(),
@@ -1816,7 +1816,7 @@ mod tests {
         // Stream 0 with 1 packet (quantum = 1, so first pass drains it)
         scheduler.enqueue(QueuedPacket {
             data: Bytes::from_static(b"s0"),
-            dest: "127.0.0.1:9000".parse().unwrap(),
+            dest: PeerAddr::Udp("127.0.0.1:9000".parse().unwrap()),
             stream_id: 0,
             priority: false,
             queued_at: Instant::now(),
@@ -1829,7 +1829,7 @@ mod tests {
         // Now add stream 1 while the scheduler is "between rounds"
         scheduler.enqueue(QueuedPacket {
             data: Bytes::from_static(b"s1"),
-            dest: "127.0.0.1:9000".parse().unwrap(),
+            dest: PeerAddr::Udp("127.0.0.1:9000".parse().unwrap()),
             stream_id: 1,
             priority: false,
             queued_at: Instant::now(),
@@ -1865,7 +1865,7 @@ mod tests {
         // enqueue → new stream → rebuild.
         scheduler.enqueue(QueuedPacket {
             data: Bytes::from_static(b"a"),
-            dest: "127.0.0.1:9000".parse().unwrap(),
+            dest: PeerAddr::Udp("127.0.0.1:9000".parse().unwrap()),
             stream_id: 7,
             priority: false,
             queued_at: Instant::now(),
@@ -1882,7 +1882,7 @@ mod tests {
         let before_existing = Arc::as_ptr(&scheduler.active_streams.load_full());
         scheduler.enqueue(QueuedPacket {
             data: Bytes::from_static(b"b"),
-            dest: "127.0.0.1:9000".parse().unwrap(),
+            dest: PeerAddr::Udp("127.0.0.1:9000".parse().unwrap()),
             stream_id: 7,
             priority: false,
             queued_at: Instant::now(),
@@ -1972,7 +1972,7 @@ mod tests {
                     let stream_id = t * 100_000 + i;
                     sched.enqueue(QueuedPacket {
                         data: Bytes::from_static(b"x"),
-                        dest: "127.0.0.1:9000".parse().unwrap(),
+                        dest: PeerAddr::Udp("127.0.0.1:9000".parse().unwrap()),
                         stream_id,
                         priority: false,
                         queued_at: Instant::now(),
@@ -2029,7 +2029,7 @@ mod tests {
         scheduler.set_stream_weight(1, 1);
         scheduler.set_stream_weight(2, 4);
 
-        let dest: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let dest: PeerAddr = PeerAddr::Udp("127.0.0.1:9999".parse().unwrap());
         // Fill both streams with 8 packets each.
         for stream_id in [1u64, 2u64] {
             for _ in 0..8 {
@@ -2086,7 +2086,7 @@ mod tests {
         scheduler.set_stream_weight(bulk, 1);
         scheduler.set_stream_weight(interactive, 1);
 
-        let dest: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let dest: PeerAddr = PeerAddr::Udp("127.0.0.1:9999".parse().unwrap());
         // A transfer-scale backlog on the bulk stream …
         let bulk_backlog = 260usize;
         for _ in 0..bulk_backlog {
@@ -2170,7 +2170,7 @@ mod tests {
         for stream in 0..5u64 {
             scheduler.enqueue(QueuedPacket {
                 data: Bytes::from(vec![0u8; 8]),
-                dest: "127.0.0.1:9000".parse().unwrap(),
+                dest: PeerAddr::Udp("127.0.0.1:9000".parse().unwrap()),
                 stream_id: stream,
                 priority: false,
                 queued_at: Instant::now(),

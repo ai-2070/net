@@ -29,7 +29,7 @@ use net::adapter::net::behavior::fold::capability::capability_tags_for;
 use net::adapter::net::behavior::sensing::{
     select_sensing_path, SensingPath, SENSING_CAPABILITY_TAG,
 };
-use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
+use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, PeerAddr, SocketBufferConfig};
 use net::adapter::Adapter;
 use net::event::{batch_process_nonce, Batch, InternalEvent};
 use tokio::net::UdpSocket;
@@ -124,8 +124,8 @@ async fn old_relay_fallback_selects_and_traverses_the_real_routed_path() {
     r2.expect("B connect C");
 
     // A's route to C goes through B; B forwards direct.
-    node_a.router().add_route(nid_c, addr_b);
-    node_b.router().add_route(nid_c, addr_c);
+    node_a.router().add_route(nid_c, PeerAddr::Udp(addr_b));
+    node_b.router().add_route(nid_c, PeerAddr::Udp(addr_c));
 
     node_a.start();
     node_b.start();

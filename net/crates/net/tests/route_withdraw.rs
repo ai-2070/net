@@ -23,7 +23,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use net::adapter::net::{MeshNode, MeshNodeConfig, SocketBufferConfig};
+use net::adapter::net::{MeshNode, MeshNodeConfig, PeerAddr, SocketBufferConfig};
 use net::adapter::Adapter;
 
 fn base_config() -> MeshNodeConfig {
@@ -74,7 +74,7 @@ async fn chain(c_cfg: MeshNodeConfig) -> (Arc<MeshNode>, Arc<MeshNode>, Arc<Mesh
     let a_id = a.node_id();
     assert!(
         wait_until(
-            || c.router().routing_table().lookup(a_id) == Some(b.local_addr()),
+            || c.router().routing_table().lookup(a_id) == Some(PeerAddr::Udp(b.local_addr())),
             Duration::from_secs(3),
         )
         .await,
@@ -183,7 +183,7 @@ async fn withdrawal_is_not_undone_by_relayed_session_promotion() {
         .expect("A connect_via B to C");
     assert_eq!(
         a.router().routing_table().lookup(c_id),
-        Some(b_addr),
+        Some(PeerAddr::Udp(b_addr)),
         "precondition: A routes to C via the relay B",
     );
 
@@ -263,7 +263,7 @@ async fn node_death_withdraws_even_with_a_stale_graph_alternate() {
     assert!(
         wait_until(
             || {
-                d.router().routing_table().lookup(a_id) == Some(b.local_addr())
+                d.router().routing_table().lookup(a_id) == Some(PeerAddr::Udp(b.local_addr()))
                     && b.proximity_graph().path_to(&a_graph_id).is_some()
                     && b.proximity_graph()
                         .edge_latency(b.proximity_graph().my_id(), graph_id(c_id))

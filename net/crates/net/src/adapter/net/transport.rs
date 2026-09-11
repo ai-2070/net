@@ -974,7 +974,11 @@ mod tests {
         data.extend_from_slice(&header.to_bytes());
         data.extend_from_slice(&[0u8; 26]); // 10 bytes payload + 16 bytes tag
 
-        let parsed = ParsedPacket::parse(data.freeze(), "127.0.0.1:1234".parse().unwrap()).unwrap();
+        let parsed = ParsedPacket::parse(
+            data.freeze(),
+            PeerAddr::Udp("127.0.0.1:1234".parse().unwrap()),
+        )
+        .unwrap();
 
         assert_eq!(parsed.header.session_id, 0x1234);
         assert_eq!(parsed.header.stream_id, 0x5678);

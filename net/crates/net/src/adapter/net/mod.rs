@@ -1741,6 +1741,7 @@ fn event_id_gt(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::SocketAddr;
 
     #[test]
     fn test_adapter_creation() {
@@ -1946,12 +1947,12 @@ mod tests {
         // Responder processes the packet
         let resp_session = Arc::new(NetSession::new(
             resp_keys,
-            "127.0.0.1:5000".parse().unwrap(),
+            PeerAddr::Udp("127.0.0.1:5000".parse().unwrap()),
             4,
             false,
         ));
         let inbound: InboundQueues = Arc::new(DashMap::new());
-        let source: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let source: SocketAddr = "127.0.0.1:5000".parse().unwrap();
 
         NetAdapter::process_packet(packet, source, &resp_session, &inbound, 1);
 
@@ -2000,12 +2001,12 @@ mod tests {
 
         let resp_session = Arc::new(NetSession::new(
             resp_keys,
-            "127.0.0.1:5000".parse().unwrap(),
+            PeerAddr::Udp("127.0.0.1:5000".parse().unwrap()),
             4,
             false,
         ));
         let inbound: InboundQueues = Arc::new(DashMap::new());
-        let source: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let source: SocketAddr = "127.0.0.1:5000".parse().unwrap();
 
         // Truncate: remove last 10 bytes (partial auth tag)
         let truncated = packet.slice(..packet.len() - 10);
@@ -2028,12 +2029,12 @@ mod tests {
 
         let resp_session = Arc::new(NetSession::new(
             resp_keys,
-            "127.0.0.1:5000".parse().unwrap(),
+            PeerAddr::Udp("127.0.0.1:5000".parse().unwrap()),
             4,
             false,
         ));
         let inbound: InboundQueues = Arc::new(DashMap::new());
-        let source: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let source: SocketAddr = "127.0.0.1:5000".parse().unwrap();
 
         // Tamper: flip a byte in the encrypted payload
         let mut tampered = bytes::BytesMut::from(&packet[..]);
@@ -2061,12 +2062,12 @@ mod tests {
         wrong_keys.session_id = 0xDEAD;
         let resp_session = Arc::new(NetSession::new(
             wrong_keys,
-            "127.0.0.1:5000".parse().unwrap(),
+            PeerAddr::Udp("127.0.0.1:5000".parse().unwrap()),
             4,
             false,
         ));
         let inbound: InboundQueues = Arc::new(DashMap::new());
-        let source: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let source: SocketAddr = "127.0.0.1:5000".parse().unwrap();
 
         NetAdapter::process_packet(packet, source, &resp_session, &inbound, 1);
 
@@ -2085,12 +2086,12 @@ mod tests {
 
         let resp_session = Arc::new(NetSession::new(
             resp_keys,
-            "127.0.0.1:5000".parse().unwrap(),
+            PeerAddr::Udp("127.0.0.1:5000".parse().unwrap()),
             4,
             false,
         ));
         let inbound: InboundQueues = Arc::new(DashMap::new());
-        let source: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let source: SocketAddr = "127.0.0.1:5000".parse().unwrap();
 
         // Build events large enough to span multiple packets.
         // Each event is ~200 bytes, MAX_PAYLOAD_SIZE is ~8112, so ~40 per packet.
@@ -2141,14 +2142,19 @@ mod tests {
         use std::sync::Arc;
 
         let (init_keys, resp_keys) = make_session_keys();
-        let source: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let source: SocketAddr = "127.0.0.1:5000".parse().unwrap();
 
         // Direction 1: initiator → responder
         {
             let mut builder = PacketBuilder::new(&init_keys.tx_key, init_keys.session_id);
             let packet = builder.build(0, 0, &[Bytes::from_static(b"i2r")], PacketFlags::NONE);
 
-            let session = Arc::new(NetSession::new(resp_keys.clone(), source, 4, false));
+            let session = Arc::new(NetSession::new(
+                resp_keys.clone(),
+                PeerAddr::Udp(source),
+                4,
+                false,
+            ));
             let inbound: InboundQueues = Arc::new(DashMap::new());
             NetAdapter::process_packet(packet, source, &session, &inbound, 1);
 
@@ -2162,7 +2168,12 @@ mod tests {
             let mut builder = PacketBuilder::new(&resp_keys.tx_key, resp_keys.session_id);
             let packet = builder.build(0, 0, &[Bytes::from_static(b"r2i")], PacketFlags::NONE);
 
-            let session = Arc::new(NetSession::new(init_keys.clone(), source, 4, false));
+            let session = Arc::new(NetSession::new(
+                init_keys.clone(),
+                PeerAddr::Udp(source),
+                4,
+                false,
+            ));
             let inbound: InboundQueues = Arc::new(DashMap::new());
             NetAdapter::process_packet(packet, source, &session, &inbound, 1);
 
@@ -2184,12 +2195,12 @@ mod tests {
 
         let resp_session = Arc::new(NetSession::new(
             resp_keys,
-            "127.0.0.1:5000".parse().unwrap(),
+            PeerAddr::Udp("127.0.0.1:5000".parse().unwrap()),
             4,
             false,
         ));
         let inbound: InboundQueues = Arc::new(DashMap::new());
-        let source: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let source: SocketAddr = "127.0.0.1:5000".parse().unwrap();
 
         // Send 3 packets (sequences 0, 1, 2), each with 1 event
         let mut builder = PacketBuilder::new(&init_keys.tx_key, init_keys.session_id);
@@ -2234,12 +2245,12 @@ mod tests {
         let (init_keys, resp_keys) = make_session_keys();
         let resp_session = Arc::new(NetSession::new(
             resp_keys,
-            "127.0.0.1:5000".parse().unwrap(),
+            PeerAddr::Udp("127.0.0.1:5000".parse().unwrap()),
             4,
             false,
         ));
         let inbound: InboundQueues = Arc::new(DashMap::new());
-        let source: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let source: SocketAddr = "127.0.0.1:5000".parse().unwrap();
 
         // Send 1100 packets to advance the rx_counter past the replay window (1024)
         let mut builder = PacketBuilder::new(&init_keys.tx_key, init_keys.session_id);
@@ -2280,7 +2291,7 @@ mod tests {
         // before even attempting decryption.
         let resp_session = Arc::new(NetSession::new(
             resp_keys,
-            "127.0.0.1:5000".parse().unwrap(),
+            PeerAddr::Udp("127.0.0.1:5000".parse().unwrap()),
             4,
             false,
         ));
@@ -2325,12 +2336,12 @@ mod tests {
         // next_expected` (duplicates).
         let resp_session = Arc::new(NetSession::new(
             resp_keys,
-            "127.0.0.1:5000".parse().unwrap(),
+            PeerAddr::Udp("127.0.0.1:5000".parse().unwrap()),
             4,
             true, // default_reliable
         ));
         let inbound: InboundQueues = Arc::new(DashMap::new());
-        let source: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let source: SocketAddr = "127.0.0.1:5000".parse().unwrap();
 
         // Two packets on stream 7. First carries sequences 0..1,
         // second is a duplicate (same seq=0) that should be
@@ -2389,12 +2400,12 @@ mod tests {
 
         let resp_session = Arc::new(NetSession::new(
             resp_keys,
-            "127.0.0.1:5000".parse().unwrap(),
+            PeerAddr::Udp("127.0.0.1:5000".parse().unwrap()),
             4,
             false,
         ));
         let inbound: InboundQueues = Arc::new(DashMap::new());
-        let source: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let source: SocketAddr = "127.0.0.1:5000".parse().unwrap();
 
         // Build a legitimate heartbeat with the initiator's
         // session key and tag it.
@@ -2459,8 +2470,8 @@ mod tests {
         // Per-source 3, reserve 2, aggregate high enough not to bind.
         let mut pacer = HandshakePacer::new(3, 2, 100, Duration::from_millis(50));
 
-        let attacker: std::net::SocketAddr = "10.0.0.1:9000".parse().unwrap();
-        let legit: std::net::SocketAddr = "10.0.0.2:9000".parse().unwrap();
+        let attacker: PeerAddr = PeerAddr::Udp("10.0.0.1:9000".parse().unwrap());
+        let legit: PeerAddr = PeerAddr::Udp("10.0.0.2:9000".parse().unwrap());
 
         // 3 within the per-source budget, then 2 more off the shared
         // reserve — a spoofable address means an exhausted budget is
@@ -2510,7 +2521,7 @@ mod tests {
         use std::time::Duration;
         let mut pacer = HandshakePacer::new(3, 8, 100, Duration::from_secs(60));
 
-        let victim: std::net::SocketAddr = "10.0.0.7:9000".parse().unwrap();
+        let victim: PeerAddr = PeerAddr::Udp("10.0.0.7:9000".parse().unwrap());
 
         // Spoofer spends the victim's whole per-source budget.
         for _ in 0..3 {
@@ -2546,10 +2557,11 @@ mod tests {
         for i in 0..datagrams {
             // A distinct source per datagram, all fresh — nothing is
             // ever old enough for `retain` to reclaim.
-            let source: std::net::SocketAddr =
+            let source: PeerAddr = PeerAddr::Udp(
                 format!("10.2.{}.{}:9000", (i >> 8) & 0xff, i & 0xff)
                     .parse()
-                    .unwrap();
+                    .unwrap(),
+            );
             pacer.check_and_record(source);
         }
 
@@ -2575,10 +2587,11 @@ mod tests {
         let mut admitted = 0;
         for i in 0..4096u32 {
             // A distinct source per datagram — each is in budget.
-            let source: std::net::SocketAddr =
+            let source: PeerAddr = PeerAddr::Udp(
                 format!("10.1.{}.{}:9000", (i >> 8) & 0xff, i & 0xff)
                     .parse()
-                    .unwrap();
+                    .unwrap(),
+            );
             if pacer.check_and_record(source) {
                 admitted += 1;
             }

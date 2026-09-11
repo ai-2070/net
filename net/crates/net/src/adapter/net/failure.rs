@@ -1120,7 +1120,7 @@ mod tests {
             cleanup_interval: Duration::from_secs(60),
         });
 
-        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
         detector.heartbeat(0x1234, addr);
 
         assert_eq!(detector.status(0x1234), NodeStatus::Healthy);
@@ -1133,7 +1133,7 @@ mod tests {
     #[test]
     fn node_count_tracks_heartbeats_and_removal() {
         let detector = FailureDetector::new();
-        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
 
         detector.heartbeat(1, addr);
         detector.heartbeat(2, addr);
@@ -1173,7 +1173,7 @@ mod tests {
             cleanup_interval: Duration::from_secs(60),
         });
 
-        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
         detector.heartbeat(0x1234, addr);
 
         // Wait for timeout (~1.5× the timeout → 1 miss).
@@ -1202,7 +1202,7 @@ mod tests {
             cleanup_interval: Duration::from_secs(60),
         });
 
-        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
         detector.heartbeat(0x1234, addr);
 
         std::thread::sleep(Duration::from_millis(15));
@@ -1231,7 +1231,7 @@ mod tests {
             cleanup_interval: Duration::from_secs(60),
         });
 
-        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
         detector.heartbeat(0x1234, addr);
 
         // Wait long enough that multiple timeouts have elapsed
@@ -1669,7 +1669,7 @@ mod tests {
             }),
         );
 
-        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
         // Drive node into Failed state, then heartbeat to recover.
         detector_arc.heartbeat(0x4242, addr);
         std::thread::sleep(Duration::from_millis(25));
@@ -1799,7 +1799,7 @@ mod tests {
         // the internal `nodes` map directly (the same trick
         // existing tests use to stage failure-detector state
         // without sleeping out real timeouts).
-        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
         detector.heartbeat(1, addr);
         detector.heartbeat(2, addr);
         detector.heartbeat(3, addr);

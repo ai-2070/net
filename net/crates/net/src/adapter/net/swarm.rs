@@ -999,7 +999,7 @@ mod tests {
     #[test]
     fn on_pingwave_drops_novel_entries_when_seen_pingwaves_is_at_cap() {
         let graph = LocalGraph::new(0x1, 8);
-        let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let from: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
 
         // Pre-fill seen_pingwaves to the cap with synthetic keys
         // that won't collide with the test's input. The counted helper
@@ -1035,7 +1035,7 @@ mod tests {
     #[test]
     fn entry_counters_track_map_lengths() {
         let graph = LocalGraph::new(0x1, 8).with_node_timeout(Duration::from_millis(1));
-        let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let from: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
 
         // Insert several distinct origins via the real path.
         for origin in 0u64..5 {
@@ -1104,7 +1104,7 @@ mod tests {
     #[test]
     fn on_pingwave_likely_restart_only_touches_does_not_lower_last_seq() {
         let graph = LocalGraph::new(0x1, 8);
-        let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let from: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
 
         // Bring the peer up to a high seq.
         for seq in [100u64, 200, 500, 1000].iter() {
@@ -1116,7 +1116,7 @@ mod tests {
 
         // "Restart" pingwave (or, equivalently, an attacker spoof
         // — we can't tell from the wire) at seq=1.
-        let restart_from: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+        let restart_from: PeerAddr = PeerAddr::Udp("127.0.0.1:9001".parse().unwrap());
         let pw = Pingwave::new(0xCAFE, 1, 3);
         graph.on_pingwave(pw, restart_from);
 
@@ -1170,7 +1170,7 @@ mod tests {
     #[test]
     fn on_pingwave_likely_restart_must_not_overwrite_addr() {
         let graph = LocalGraph::new(0x1, 8);
-        let legit: SocketAddr = "10.0.0.5:9000".parse().unwrap();
+        let legit: PeerAddr = PeerAddr::Udp("10.0.0.5:9000".parse().unwrap());
 
         // Establish a high seq from the legitimate peer.
         for seq in [100u64, 500, 1000].iter() {
@@ -1185,7 +1185,7 @@ mod tests {
 
         // Attacker spoofs a restart-shaped pingwave from THEIR
         // address. Pre-CR-6 this overwrote n.addr.
-        let attacker: SocketAddr = "192.0.2.99:31337".parse().unwrap();
+        let attacker: PeerAddr = PeerAddr::Udp("192.0.2.99:31337".parse().unwrap());
         let spoof = Pingwave::new(0xBEEF, 1, 3);
         graph.on_pingwave(spoof, attacker);
 
@@ -1225,7 +1225,7 @@ mod tests {
     #[test]
     fn on_pingwave_below_last_seq_with_shorter_hops_does_not_overwrite_addr() {
         let graph = LocalGraph::new(0x1, 8);
-        let legit: SocketAddr = "10.0.0.5:9000".parse().unwrap();
+        let legit: PeerAddr = PeerAddr::Udp("10.0.0.5:9000".parse().unwrap());
 
         // Establish a high seq from the legitimate peer at
         // recorded hops=3 (constructor's hop_count starts at 0;
@@ -1248,7 +1248,7 @@ mod tests {
         // (recorded hops would become 1) from their own UDP
         // source. Pre-fix `hops < n.hops` (1 < 3) flipped
         // strict_progress true and overwrote n.addr.
-        let attacker: SocketAddr = "192.0.2.99:31337".parse().unwrap();
+        let attacker: PeerAddr = PeerAddr::Udp("192.0.2.99:31337".parse().unwrap());
         let spoof = Pingwave::new(0xBEEF, 800, 8);
         graph.on_pingwave(spoof, attacker);
 
@@ -1273,7 +1273,7 @@ mod tests {
     #[test]
     fn on_pingwave_ignores_small_seq_regression_without_restart_signal() {
         let graph = LocalGraph::new(0x1, 8);
-        let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let from: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
 
         for seq in [10u64, 20].iter() {
             let pw = Pingwave::new(0xCAFE, *seq, 3);
@@ -1294,7 +1294,7 @@ mod tests {
     #[test]
     fn on_pingwave_drops_novel_origin_when_nodes_is_at_cap() {
         let graph = LocalGraph::new(0x1, 8);
-        let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let from: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
 
         // Pre-populate `nodes` to the cap with synthetic ids. The counted
         // helper keeps `num_nodes` (which the soft-cap gate reads) in step
@@ -1375,7 +1375,7 @@ mod tests {
 
         // Simulate receiving a pingwave from a neighbor
         let pw = Pingwave::new(0x2222, 1, 3);
-        let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let from: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
 
         let forwarded = graph.on_pingwave(pw, from);
         assert!(forwarded.is_some());
@@ -1399,7 +1399,7 @@ mod tests {
         let graph = LocalGraph::new(0x1111, 3);
 
         // Add some nodes
-        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
         graph.insert_node_for_test(0x2222, NodeInfo::new(0x2222, addr, 1));
         graph.insert_node_for_test(0x3333, NodeInfo::new(0x3333, addr, 2));
 
@@ -1427,7 +1427,7 @@ mod tests {
         // advertisements for nodes not yet seen via pingwave were silently
         // dropped. The node never became searchable by capability.
         let graph = LocalGraph::new(0x1111, 3);
-        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
 
         // No pingwave — node 0x2222 is completely unknown
         assert!(graph.get_node(0x2222).is_none());
@@ -1505,9 +1505,9 @@ mod tests {
 
     // ---------- LocalGraph filter methods ----------
 
-    fn populate_graph_for_filter_tests() -> (LocalGraph, SocketAddr) {
+    fn populate_graph_for_filter_tests() -> (LocalGraph, PeerAddr) {
         let graph = LocalGraph::new(0x1111, 3);
-        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
         // Three nodes at distinct hop distances with distinct tags.
         graph.insert_node_for_test(0x2222, NodeInfo::new(0x2222, addr, 1));
         graph.insert_node_for_test(0x3333, NodeInfo::new(0x3333, addr, 2));

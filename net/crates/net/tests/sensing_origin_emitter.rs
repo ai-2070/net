@@ -41,7 +41,7 @@ use net::adapter::net::behavior::sensing::{
     StatusReason, UnsignedAttestation, WorkLatencyEnvelope, SUBPROTOCOL_READINESS_ATTESTATION,
     SUBPROTOCOL_SENSING_INTEREST,
 };
-use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
+use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, PeerAddr, SocketBufferConfig};
 use net::adapter::Adapter;
 
 /// Requested sample interval D: 200 ms → promised cadence
@@ -864,8 +864,8 @@ async fn mixed_cadence_refusal_recovers_the_survivor_through_the_relay() {
     })
     .await;
     // Consumers reach P through R.
-    a.router().add_route(p_id, r.local_addr());
-    c.router().add_route(p_id, r.local_addr());
+    a.router().add_route(p_id, PeerAddr::Udp(r.local_addr()));
+    c.router().add_route(p_id, PeerAddr::Udp(r.local_addr()));
     // SI-3 seam bound (documented on the 0x0C03 intake): a hop
     // verifies beats against the ORIGIN's TOFU pin, and pin
     // propagation to non-adjacent hops rides SI-4 — pin P at the

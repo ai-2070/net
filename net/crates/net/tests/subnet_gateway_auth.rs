@@ -25,7 +25,7 @@ use net::adapter::net::subnet::{
     SubnetGrant, SubnetRef, SubnetRights, TopologySubnetId,
 };
 use net::adapter::net::{
-    MeshNode, MeshNodeConfig, RoutingHeader, SocketBufferConfig, ROUTING_HEADER_SIZE,
+    MeshNode, MeshNodeConfig, PeerAddr, RoutingHeader, SocketBufferConfig, ROUTING_HEADER_SIZE,
 };
 use tokio::net::UdpSocket;
 
@@ -222,9 +222,10 @@ async fn a_protected_gateway_refuses_untagged_legacy_relay() {
 
     // Watch the intended egress.
     let watcher = wire().await;
-    f.gw.router()
-        .routing_table()
-        .add_route(f.right.node_id(), watcher.local_addr().unwrap());
+    f.gw.router().routing_table().add_route(
+        f.right.node_id(),
+        PeerAddr::Udp(watcher.local_addr().unwrap()),
+    );
 
     let sock = wire().await;
     let header = RoutingHeader::new(f.right.node_id(), 0x1234, 8);
@@ -259,7 +260,7 @@ async fn a_node_without_gateway_credentials_keeps_legacy_forwarding() {
     const LEARNED: u64 = 0x0FF1_CE01;
     f.gw.router()
         .routing_table()
-        .add_route(LEARNED, watcher.local_addr().unwrap());
+        .add_route(LEARNED, PeerAddr::Udp(watcher.local_addr().unwrap()));
 
     let sock = wire().await;
     let header = RoutingHeader::new(LEARNED, 0x1234, 8);
@@ -295,9 +296,10 @@ async fn an_invalid_hop_tag_is_dropped_before_any_forward() {
     .expect("install");
 
     let watcher = wire().await;
-    f.gw.router()
-        .routing_table()
-        .add_route(f.right.node_id(), watcher.local_addr().unwrap());
+    f.gw.router().routing_table().add_route(
+        f.right.node_id(),
+        PeerAddr::Udp(watcher.local_addr().unwrap()),
+    );
 
     let sock = wire().await;
     let header = RoutingHeader::new(f.right.node_id(), 0x1234, 8);
@@ -338,9 +340,10 @@ async fn an_unknown_hop_session_is_dropped() {
     .expect("install");
 
     let watcher = wire().await;
-    f.gw.router()
-        .routing_table()
-        .add_route(f.right.node_id(), watcher.local_addr().unwrap());
+    f.gw.router().routing_table().add_route(
+        f.right.node_id(),
+        PeerAddr::Udp(watcher.local_addr().unwrap()),
+    );
 
     let sock = wire().await;
     let header = RoutingHeader::new(f.right.node_id(), 0x1234, 8);
@@ -365,9 +368,10 @@ async fn missing_local_gateway_context_denies() {
     assert!(f.gw.subnet_gateway_contexts().is_none());
 
     let watcher = wire().await;
-    f.gw.router()
-        .routing_table()
-        .add_route(f.right.node_id(), watcher.local_addr().unwrap());
+    f.gw.router().routing_table().add_route(
+        f.right.node_id(),
+        PeerAddr::Udp(watcher.local_addr().unwrap()),
+    );
 
     // A correctly-keyed envelope is impossible for the test to build
     // without the session key, so assert the weaker but sufficient
@@ -472,7 +476,7 @@ async fn a_legacy_route_is_not_an_authenticated_next_hop() {
     const LEARNED: u64 = 0xDEAD_BEEF;
     f.gw.router()
         .routing_table()
-        .add_route(LEARNED, f.right.local_addr());
+        .add_route(LEARNED, PeerAddr::Udp(f.right.local_addr()));
     assert!(
         f.gw.router().routing_table().lookup(LEARNED).is_some(),
         "precondition: the legacy route resolves for ordinary routing",
@@ -504,31 +508,31 @@ async fn route_identity_survives_address_change_and_resists_address_reuse() {
     let right_id = f.right.node_id();
     let table = f.gw.router().routing_table();
 
-    table.add_authenticated_route(right_id, f.right.local_addr(), right_id);
+    table.add_authenticated_route(right_id, PeerAddr::Udp(f.right.local_addr()), right_id);
     let hop =
         f.gw.authenticated_next_hop(right_id)
             .expect("an identity-bound route resolves");
     assert_eq!(hop.node_id, right_id);
-    assert_eq!(hop.addr, f.right.local_addr());
+    assert_eq!(hop.addr, PeerAddr::Udp(f.right.local_addr()));
 
     // NAT rebind: the address moves under the SAME identity.
     let moved: SocketAddr = "127.0.0.1:59999".parse().unwrap();
     assert!(
-        table.rebind_authenticated_route(right_id, right_id, moved),
+        table.rebind_authenticated_route(right_id, right_id, PeerAddr::Udp(moved)),
         "an address change under the bound identity is permitted",
     );
     let (id, addr) = table
         .lookup_authenticated(right_id)
         .expect("route still present");
     assert_eq!(id, right_id, "identity is unchanged by an address move");
-    assert_eq!(addr, moved);
+    assert_eq!(addr, PeerAddr::Udp(moved));
 
     // Address reuse: a DIFFERENT identity cannot take the route over,
     // which is exactly what resolving identity from a mutable address
     // map would have allowed.
     let interloper = f.left.node_id();
     assert!(
-        !table.rebind_authenticated_route(right_id, interloper, f.left.local_addr()),
+        !table.rebind_authenticated_route(right_id, interloper, PeerAddr::Udp(f.left.local_addr())),
         "a different identity must not inherit an existing protected route",
     );
     let (id, _) = table
@@ -562,7 +566,7 @@ async fn outer_ttl_expires_while_the_inner_packet_is_untouched() {
     let watcher = wire().await;
     f.gw.router()
         .routing_table()
-        .add_route(LEARNED, watcher.local_addr().unwrap());
+        .add_route(LEARNED, PeerAddr::Udp(watcher.local_addr().unwrap()));
     let sock = wire().await;
 
     // ttl = 0 is already expired.

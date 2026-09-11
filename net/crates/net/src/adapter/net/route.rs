@@ -1897,6 +1897,7 @@ pub struct AggregateStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::SocketAddr;
 
     #[test]
     fn test_routing_header_roundtrip() {
@@ -2078,8 +2079,8 @@ mod tests {
     fn test_routing_table_basic() {
         let table = RoutingTable::new(0x1234);
 
-        let addr1: SocketAddr = "127.0.0.1:9000".parse().unwrap();
-        let addr2: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+        let addr1: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
+        let addr2: PeerAddr = PeerAddr::Udp("127.0.0.1:9001".parse().unwrap());
 
         table.add_route(0x5678, addr1);
         table.add_route(0x9ABC, addr2);
@@ -2095,7 +2096,7 @@ mod tests {
     #[test]
     fn test_routing_table_deactivate() {
         let table = RoutingTable::new(0x1234);
-        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
 
         table.add_route(0x5678, addr);
         assert_eq!(table.lookup(0x5678), Some(addr));
@@ -2144,8 +2145,8 @@ mod tests {
     #[test]
     fn route_and_stream_counts_track_inserts_and_removals() {
         let table = RoutingTable::new(0x1);
-        let a: SocketAddr = "127.0.0.1:1".parse().unwrap();
-        let b: SocketAddr = "127.0.0.1:2".parse().unwrap();
+        let a: PeerAddr = PeerAddr::Udp("127.0.0.1:1".parse().unwrap());
+        let b: PeerAddr = PeerAddr::Udp("127.0.0.1:2".parse().unwrap());
 
         table.add_route(0x10, a);
         table.add_route(0x11, b);
@@ -2187,8 +2188,8 @@ mod tests {
     #[test]
     fn test_add_route_with_metric_preserves_better_direct_route() {
         let table = RoutingTable::new(0x1111);
-        let direct: SocketAddr = "127.0.0.1:2000".parse().unwrap();
-        let indirect: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        let direct: PeerAddr = PeerAddr::Udp("127.0.0.1:2000".parse().unwrap());
+        let indirect: PeerAddr = PeerAddr::Udp("127.0.0.1:3000".parse().unwrap());
 
         // Direct insert (metric=1).
         table.add_route(0x2222, direct);
@@ -2206,7 +2207,7 @@ mod tests {
         // change, e.g., if the direct peer moved AND announced a
         // shorter path — only achievable for indirect-vs-indirect
         // since direct's metric=1 is already the floor).
-        let better: SocketAddr = "127.0.0.1:4000".parse().unwrap();
+        let better: PeerAddr = PeerAddr::Udp("127.0.0.1:4000".parse().unwrap());
         table.add_route_with_metric(0x2222, better, 0);
         assert_eq!(
             table.lookup(0x2222),
@@ -2225,8 +2226,8 @@ mod tests {
     #[test]
     fn add_route_with_metric_equal_does_not_overwrite_next_hop() {
         let table = RoutingTable::new(0x1111);
-        let real: SocketAddr = "127.0.0.1:2000".parse().unwrap();
-        let attacker: SocketAddr = "10.0.0.1:31337".parse().unwrap();
+        let real: PeerAddr = PeerAddr::Udp("127.0.0.1:2000".parse().unwrap());
+        let attacker: PeerAddr = PeerAddr::Udp("10.0.0.1:31337".parse().unwrap());
 
         table.add_route(0x2222, real);
         // Attacker announces same metric as direct; must NOT win.
@@ -2247,9 +2248,9 @@ mod tests {
     #[test]
     fn migrate_next_hop_repoints_matching_routes_only() {
         let table = RoutingTable::new(0x1111);
-        let old: SocketAddr = "127.0.0.1:5000".parse().unwrap();
-        let new: SocketAddr = "127.0.0.1:6000".parse().unwrap();
-        let other: SocketAddr = "127.0.0.1:7000".parse().unwrap();
+        let old: PeerAddr = PeerAddr::Udp("127.0.0.1:5000".parse().unwrap());
+        let new: PeerAddr = PeerAddr::Udp("127.0.0.1:6000".parse().unwrap());
+        let other: PeerAddr = PeerAddr::Udp("127.0.0.1:7000".parse().unwrap());
 
         table.add_route(0xAAA, old); // via the re-handshaking peer
         table.add_route(0xBBB, old); // also via it
@@ -2279,8 +2280,8 @@ mod tests {
     #[test]
     fn migrate_next_hop_is_identity_qualified() {
         let table = RoutingTable::new(0x1111);
-        let old: SocketAddr = "127.0.0.1:5000".parse().unwrap();
-        let new: SocketAddr = "127.0.0.1:6000".parse().unwrap();
+        let old: PeerAddr = PeerAddr::Udp("127.0.0.1:5000".parse().unwrap());
+        let new: PeerAddr = PeerAddr::Udp("127.0.0.1:6000".parse().unwrap());
         const PEER: u64 = 0x22;
         const OTHER: u64 = 0x33;
 
@@ -2317,9 +2318,9 @@ mod tests {
     #[test]
     fn migrate_next_hop_stale_caller_cannot_roll_back() {
         let table = RoutingTable::new(0x1111);
-        let a: SocketAddr = "127.0.0.1:1000".parse().unwrap();
-        let b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
-        let c: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        let a: PeerAddr = PeerAddr::Udp("127.0.0.1:1000".parse().unwrap());
+        let b: PeerAddr = PeerAddr::Udp("127.0.0.1:2000".parse().unwrap());
+        let c: PeerAddr = PeerAddr::Udp("127.0.0.1:3000".parse().unwrap());
         const P: u64 = 0x22;
 
         table.add_authenticated_route_with_metric(0xAAA, a, P, 3);
@@ -2345,8 +2346,8 @@ mod tests {
     fn another_peer_cannot_refresh_the_installed_route() {
         use std::time::Duration;
         let table = RoutingTable::new(0x1111);
-        let via_a: SocketAddr = "127.0.0.1:1000".parse().unwrap();
-        let via_b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let via_a: PeerAddr = PeerAddr::Udp("127.0.0.1:1000".parse().unwrap());
+        let via_b: PeerAddr = PeerAddr::Udp("127.0.0.1:2000".parse().unwrap());
         const A: u64 = 0xA;
         const B: u64 = 0xB;
         const DEST: u64 = 0xD60;
@@ -2381,8 +2382,8 @@ mod tests {
     fn unauthenticated_writes_cannot_reach_authenticated_route_state() {
         use std::time::Duration;
         let table = RoutingTable::new(0x1111);
-        let via_b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
-        let via_a: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        let via_b: PeerAddr = PeerAddr::Udp("127.0.0.1:2000".parse().unwrap());
+        let via_a: PeerAddr = PeerAddr::Udp("127.0.0.1:3000".parse().unwrap());
         const B: u64 = 0xB;
         const DEST: u64 = 0xD61;
 
@@ -2439,8 +2440,8 @@ mod tests {
     #[test]
     fn an_ordinary_install_does_not_erase_the_authenticated_candidate() {
         let table = RoutingTable::new(0x1111);
-        let real_hop: SocketAddr = "127.0.0.1:2000".parse().unwrap();
-        let relay: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let real_hop: PeerAddr = PeerAddr::Udp("127.0.0.1:2000".parse().unwrap());
+        let relay: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
         const ADJ: u64 = 0xAD;
         const DEST: u64 = 0xD63;
 
@@ -2465,9 +2466,9 @@ mod tests {
     #[test]
     fn install_if_unchanged_skips_after_an_intervening_write() {
         let table = RoutingTable::new(0x1111);
-        let b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
-        let c: SocketAddr = "127.0.0.1:3000".parse().unwrap();
-        let d: SocketAddr = "127.0.0.1:4000".parse().unwrap();
+        let b: PeerAddr = PeerAddr::Udp("127.0.0.1:2000".parse().unwrap());
+        let c: PeerAddr = PeerAddr::Udp("127.0.0.1:3000".parse().unwrap());
+        let d: PeerAddr = PeerAddr::Udp("127.0.0.1:4000".parse().unwrap());
         const DEST: u64 = 0xD64;
 
         table.add_route(DEST, b);
@@ -2497,8 +2498,8 @@ mod tests {
     #[test]
     fn install_metered_if_absent_declines_once_anything_exists() {
         let table = RoutingTable::new(0x1111);
-        let b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
-        let c: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        let b: PeerAddr = PeerAddr::Udp("127.0.0.1:2000".parse().unwrap());
+        let c: PeerAddr = PeerAddr::Udp("127.0.0.1:3000".parse().unwrap());
         const DEST: u64 = 0xD65;
 
         assert!(table.install_metered_if_absent(DEST, b, AlternateProvenance::Protected(0xB), 1));
@@ -2517,8 +2518,8 @@ mod tests {
     #[test]
     fn remove_route_if_from_hop_is_identity_qualified() {
         let table = RoutingTable::new(0x1111);
-        let x: SocketAddr = "127.0.0.1:1000".parse().unwrap();
-        let y: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let x: PeerAddr = PeerAddr::Udp("127.0.0.1:1000".parse().unwrap());
+        let y: PeerAddr = PeerAddr::Udp("127.0.0.1:2000".parse().unwrap());
         const B: u64 = 0xB;
         const C: u64 = 0xC;
 
@@ -2582,8 +2583,8 @@ mod tests {
     #[test]
     fn withdrawal_outcome_distinguishes_candidate_loss_from_unreachability() {
         let table = RoutingTable::new(0x1111);
-        let via_b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
-        let via_c: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        let via_b: PeerAddr = PeerAddr::Udp("127.0.0.1:2000".parse().unwrap());
+        let via_c: PeerAddr = PeerAddr::Udp("127.0.0.1:3000".parse().unwrap());
         const B: u64 = 0xB;
         const DEST: u64 = 0xD70;
 
@@ -2620,8 +2621,8 @@ mod tests {
     #[test]
     fn add_authenticated_route_with_metric_binds_upgrades_and_refuses() {
         let table = RoutingTable::new(0x1111);
-        let via_b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
-        let via_c: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        let via_b: PeerAddr = PeerAddr::Udp("127.0.0.1:2000".parse().unwrap());
+        let via_c: PeerAddr = PeerAddr::Udp("127.0.0.1:3000".parse().unwrap());
         const B: u64 = 0xB;
         const C: u64 = 0xC;
         const DEST: u64 = 0xD57;
@@ -2681,8 +2682,8 @@ mod tests {
         use std::time::Duration;
 
         let table = RoutingTable::new(0x1111);
-        let addr_a: SocketAddr = "127.0.0.1:2000".parse().unwrap();
-        let addr_b: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        let addr_a: PeerAddr = PeerAddr::Udp("127.0.0.1:2000".parse().unwrap());
+        let addr_b: PeerAddr = PeerAddr::Udp("127.0.0.1:3000".parse().unwrap());
 
         table.add_route(0x2222, addr_a);
         table.add_route(0x3333, addr_b);
@@ -2729,8 +2730,8 @@ mod tests {
     #[test]
     fn a_recreated_destination_refuses_a_pre_removal_observation() {
         let table = RoutingTable::new(0x1111);
-        let addr: SocketAddr = "127.0.0.1:2000".parse().unwrap();
-        let newer: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:2000".parse().unwrap());
+        let newer: PeerAddr = PeerAddr::Udp("127.0.0.1:3000".parse().unwrap());
 
         table.add_route(0x2222, addr);
         let stale = table.observe(0x2222).expect("present");
@@ -2768,8 +2769,8 @@ mod tests {
         // it only removes when the current next_hop still matches the
         // address the caller wrote.
         let table = RoutingTable::new(0x1111);
-        let original: SocketAddr = "127.0.0.1:2000".parse().unwrap();
-        let newer: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        let original: PeerAddr = PeerAddr::Udp("127.0.0.1:2000".parse().unwrap());
+        let newer: PeerAddr = PeerAddr::Udp("127.0.0.1:3000".parse().unwrap());
 
         // Install original route.
         table.add_route(0x4444, original);
@@ -2835,8 +2836,8 @@ mod tests {
                 // same destination 500 times. The dashmap entry
                 // API guarantees atomic compare-and-swap per
                 // iteration.
-                let next_hop: SocketAddr =
-                    format!("127.0.0.1:{}", 10_000 + metric).parse().unwrap();
+                let next_hop: PeerAddr =
+                    PeerAddr::Udp(format!("127.0.0.1:{}", 10_000 + metric).parse().unwrap());
                 for _ in 0..500 {
                     table.add_route_with_metric(dest, next_hop, metric);
                 }
@@ -2860,7 +2861,7 @@ mod tests {
         let winner = table.lookup(dest).expect("dest must resolve");
         assert_eq!(
             winner,
-            "127.0.0.1:10001".parse::<SocketAddr>().unwrap(),
+            PeerAddr::Udp("127.0.0.1:10001".parse::<SocketAddr>().unwrap()),
             "lookup should return the next_hop paired with the winning metric",
         );
     }
@@ -2879,7 +2880,7 @@ mod tests {
 
         let table = Arc::new(RoutingTable::new(0x1111));
         let dest = 0x2222u64;
-        let direct: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let direct: PeerAddr = PeerAddr::Udp("127.0.0.1:2000".parse().unwrap());
         table.add_route(dest, direct);
         assert_eq!(table.lookup(dest), Some(direct));
         let start = Arc::new(Barrier::new(9));
@@ -2890,8 +2891,8 @@ mod tests {
             let start = start.clone();
             handles.push(thread::spawn(move || {
                 start.wait();
-                let indirect: SocketAddr =
-                    format!("127.0.0.1:{}", 20_000 + metric).parse().unwrap();
+                let indirect: PeerAddr =
+                    PeerAddr::Udp(format!("127.0.0.1:{}", 20_000 + metric).parse().unwrap());
                 for _ in 0..500 {
                     table.add_route_with_metric(dest, indirect, metric);
                 }

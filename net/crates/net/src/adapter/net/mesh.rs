@@ -41703,8 +41703,8 @@ mod punch_observer_tests {
         }
     }
 
-    fn sample_peer() -> SocketAddr {
-        "198.51.100.5:9001".parse().unwrap()
+    fn sample_peer() -> PeerAddr {
+        PeerAddr::Udp("198.51.100.5:9001".parse().unwrap())
     }
 
     /// Expected counterpart node id stored alongside each observer.
@@ -41719,7 +41719,7 @@ mod punch_observer_tests {
     /// oneshot, so the helper doesn't need to remove anything.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fires_true_when_keepalive_arrives() {
-        let observers: DashMap<SocketAddr, (u64, oneshot::Sender<Keepalive>)> = DashMap::new();
+        let observers: DashMap<PeerAddr, (u64, oneshot::Sender<Keepalive>)> = DashMap::new();
         let peer = sample_peer();
         let (tx, rx) = oneshot::channel();
         observers.insert(peer, (EXPECTED_PEER, tx));
@@ -41739,7 +41739,7 @@ mod punch_observer_tests {
     /// keep-alive doesn't find it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn timeout_evicts_own_stale_entry() {
-        let observers: DashMap<SocketAddr, (u64, oneshot::Sender<Keepalive>)> = DashMap::new();
+        let observers: DashMap<PeerAddr, (u64, oneshot::Sender<Keepalive>)> = DashMap::new();
         let peer = sample_peer();
         let (tx, rx) = oneshot::channel();
         observers.insert(peer, (EXPECTED_PEER, tx));
@@ -41761,7 +41761,7 @@ mod punch_observer_tests {
     /// in the map.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sender_dropped_leaves_replacement_observer_intact() {
-        let observers: DashMap<SocketAddr, (u64, oneshot::Sender<Keepalive>)> = DashMap::new();
+        let observers: DashMap<PeerAddr, (u64, oneshot::Sender<Keepalive>)> = DashMap::new();
         let peer = sample_peer();
 
         // Install observer A.
@@ -41792,7 +41792,7 @@ mod punch_observer_tests {
     /// `remove` on every cleanup path.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn timeout_then_sender_drop_does_not_double_evict() {
-        let observers: DashMap<SocketAddr, (u64, oneshot::Sender<Keepalive>)> = DashMap::new();
+        let observers: DashMap<PeerAddr, (u64, oneshot::Sender<Keepalive>)> = DashMap::new();
         let peer = sample_peer();
 
         // First task: install A, let it time out, evict.
@@ -42479,7 +42479,7 @@ mod sensing_live_direct_session_tests {
         // reverse mapping for that address names X, not P. The old
         // `peers.contains_key(P)` predicate read this as a live
         // direct session and skipped disruption.
-        let relay_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+        let relay_addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9001".parse().unwrap());
         let addr_to_node: DashMap<PeerAddr, u64> = DashMap::new();
         addr_to_node.insert(relay_addr, 0xE0); // the RELAY's id
         assert!(
@@ -42490,13 +42490,13 @@ mod sensing_live_direct_session_tests {
 
     #[test]
     fn direct_session_reverse_maps_to_the_node_itself() {
-        let addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9002".parse().unwrap());
         let addr_to_node: DashMap<PeerAddr, u64> = DashMap::new();
         addr_to_node.insert(addr, 0xD1);
         assert!(sensing_addr_is_live_direct(&addr_to_node, None, 0xD1, addr));
         // And an address nobody reverse-maps is not direct either
         // (a torn/mid-eviction entry stays conservative).
-        let stale: SocketAddr = "127.0.0.1:9003".parse().unwrap();
+        let stale: PeerAddr = PeerAddr::Udp("127.0.0.1:9003".parse().unwrap());
         assert!(!sensing_addr_is_live_direct(
             &addr_to_node,
             None,
@@ -42814,13 +42814,13 @@ mod fold_publisher_helpers_tests {
         );
         assert_eq!(node.subscriber_chains.len(), 2);
 
-        node.failure_detector.heartbeat(dead, addr);
-        node.failure_detector.heartbeat(live, addr);
+        node.failure_detector.heartbeat(dead, PeerAddr::Udp(addr));
+        node.failure_detector.heartbeat(live, PeerAddr::Udp(addr));
 
         // Age `dead`'s heartbeat well past `miss_threshold × timeout`,
         // then refresh `live` so only `dead` trips.
         tokio::time::sleep(Duration::from_millis(20)).await;
-        node.failure_detector.heartbeat(live, addr);
+        node.failure_detector.heartbeat(live, PeerAddr::Udp(addr));
 
         let failed = node.failure_detector.check_all();
         assert!(failed.contains(&dead), "dead peer must be detected failed");
@@ -42979,11 +42979,10 @@ mod route_withdrawal_promotion_tests {
     //! reinstall exactly the route the withdrawal just dropped.
     use super::*;
     use crate::adapter::net::failure::{FailureDetector, FailureDetectorConfig, NodeStatus};
-    use std::net::SocketAddr;
     use std::time::Duration;
 
-    fn addr(port: u16) -> SocketAddr {
-        format!("127.0.0.1:{port}").parse().unwrap()
+    fn addr(port: u16) -> PeerAddr {
+        PeerAddr::Udp(format!("127.0.0.1:{port}").parse().unwrap())
     }
 
     /// A detector whose nodes go Failed after a hair of real time so
@@ -43145,11 +43144,16 @@ mod heartbeat_aead_tests {
     #[test]
     fn aead_authenticated_heartbeat_passes_verification_and_touches_session() {
         let (init_keys, resp_keys) = make_session_keys();
-        let resp_session = NetSession::new(resp_keys, "127.0.0.1:5000".parse().unwrap(), 4, false);
+        let resp_session = NetSession::new(
+            resp_keys,
+            PeerAddr::Udp("127.0.0.1:5000".parse().unwrap()),
+            4,
+            false,
+        );
         let mut builder = PacketBuilder::new(&init_keys.tx_key, init_keys.session_id);
         let bytes = builder.build_heartbeat();
 
-        let parsed = ParsedPacket::parse(bytes, "127.0.0.1:5000".parse().unwrap())
+        let parsed = ParsedPacket::parse(bytes, PeerAddr::Udp("127.0.0.1:5000".parse().unwrap()))
             .expect("legitimate heartbeat must parse");
         assert!(parsed.header.flags.is_heartbeat());
 
@@ -43171,7 +43175,12 @@ mod heartbeat_aead_tests {
     #[test]
     fn unauthenticated_heartbeat_fails_verification_and_does_not_touch() {
         let (_init_keys, resp_keys) = make_session_keys();
-        let resp_session = NetSession::new(resp_keys, "127.0.0.1:5000".parse().unwrap(), 4, false);
+        let resp_session = NetSession::new(
+            resp_keys,
+            PeerAddr::Udp("127.0.0.1:5000".parse().unwrap()),
+            4,
+            false,
+        );
 
         // Attacker forges a heartbeat header with the right
         // session_id but garbage 16-byte tail. Pre-fix this passed
@@ -43184,8 +43193,11 @@ mod heartbeat_aead_tests {
         header_bytes[16..24].copy_from_slice(&1u64.to_le_bytes());
         forged.extend_from_slice(&header_bytes);
         forged.extend_from_slice(&[0xAAu8; 16]); // garbage tag
-        let parsed = ParsedPacket::parse(forged.freeze(), "127.0.0.1:5000".parse().unwrap())
-            .expect("forged heartbeat must still parse — verification is downstream");
+        let parsed = ParsedPacket::parse(
+            forged.freeze(),
+            PeerAddr::Udp("127.0.0.1:5000".parse().unwrap()),
+        )
+        .expect("forged heartbeat must still parse — verification is downstream");
         assert!(parsed.header.flags.is_heartbeat());
 
         let last_before = resp_session.last_activity_ns();
@@ -43215,7 +43227,7 @@ mod heartbeat_aead_tests {
     #[tokio::test]
     async fn peer_registration_guard_rolls_back_on_drop_when_not_completed() {
         let peer_id = 0xDEAD_BEEFu64;
-        let next_hop: SocketAddr = "10.0.0.1:9000".parse().unwrap();
+        let next_hop: PeerAddr = PeerAddr::Udp("10.0.0.1:9000".parse().unwrap());
 
         let peers: Arc<DashMap<u64, PeerInfo>> = Arc::new(DashMap::new());
         let peer_addrs: Arc<DashMap<u64, PeerAddr>> = Arc::new(DashMap::new());
@@ -43243,9 +43255,7 @@ mod heartbeat_aead_tests {
             peer_id,
             PeerInfo {
                 node_id: peer_id,
-                transport: PeerTransport::Direct {
-                    owned_addr: next_hop,
-                },
+                transport: PeerTransport::Direct { owned: next_hop },
                 session,
                 remote_static_pub: [0u8; 32],
                 last_initiator_ephemeral: None,
@@ -43314,7 +43324,7 @@ mod heartbeat_aead_tests {
     #[tokio::test]
     async fn peer_registration_guard_is_no_op_on_drop_when_completed() {
         let peer_id = 0xCAFE_F00Du64;
-        let next_hop: SocketAddr = "10.0.0.2:9000".parse().unwrap();
+        let next_hop: PeerAddr = PeerAddr::Udp("10.0.0.2:9000".parse().unwrap());
 
         let peers: Arc<DashMap<u64, PeerInfo>> = Arc::new(DashMap::new());
         let peer_addrs: Arc<DashMap<u64, PeerAddr>> = Arc::new(DashMap::new());
@@ -43336,9 +43346,7 @@ mod heartbeat_aead_tests {
             peer_id,
             PeerInfo {
                 node_id: peer_id,
-                transport: PeerTransport::Direct {
-                    owned_addr: next_hop,
-                },
+                transport: PeerTransport::Direct { owned: next_hop },
                 session,
                 remote_static_pub: [0u8; 32],
                 last_initiator_ephemeral: None,
@@ -43444,8 +43452,8 @@ mod heartbeat_aead_tests {
     #[tokio::test]
     async fn peer_registration_guard_preserves_concurrent_overwrite() {
         let peer_id = 0xFACE_F00Du64;
-        let stale: SocketAddr = "10.0.0.3:9000".parse().unwrap();
-        let fresh: SocketAddr = "10.0.0.4:9000".parse().unwrap();
+        let stale: PeerAddr = PeerAddr::Udp("10.0.0.3:9000".parse().unwrap());
+        let fresh: PeerAddr = PeerAddr::Udp("10.0.0.4:9000".parse().unwrap());
 
         let peers: Arc<DashMap<u64, PeerInfo>> = Arc::new(DashMap::new());
         let peer_addrs: Arc<DashMap<u64, PeerAddr>> = Arc::new(DashMap::new());
@@ -43474,7 +43482,7 @@ mod heartbeat_aead_tests {
             peer_id,
             PeerInfo {
                 node_id: peer_id,
-                transport: PeerTransport::Direct { owned_addr: fresh },
+                transport: PeerTransport::Direct { owned: fresh },
                 session,
                 remote_static_pub: [0u8; 32],
                 last_initiator_ephemeral: None,
@@ -43533,7 +43541,7 @@ mod heartbeat_aead_tests {
     async fn a_stale_rollback_sharing_one_relay_address_leaves_the_replacement_whole() {
         let peer_id = 0x5EED_5EEDu64;
         // ONE address for both registrations: the shared relay.
-        let relay: SocketAddr = "10.0.0.9:9000".parse().unwrap();
+        let relay: PeerAddr = PeerAddr::Udp("10.0.0.9:9000".parse().unwrap());
 
         let peers: Arc<DashMap<u64, PeerInfo>> = Arc::new(DashMap::new());
         let peer_addrs: Arc<DashMap<u64, PeerAddr>> = Arc::new(DashMap::new());
@@ -43564,7 +43572,7 @@ mod heartbeat_aead_tests {
             PeerInfo {
                 node_id: peer_id,
                 transport: PeerTransport::Routed {
-                    relay_addr: relay,
+                    relay: relay,
                     adjacent_relay_identity: None,
                 },
                 session: fresh_session,
@@ -43638,7 +43646,7 @@ mod heartbeat_aead_tests {
     #[tokio::test]
     async fn an_owned_rollback_declines_a_route_another_writer_replaced() {
         let peer_id = 0x7A11_7A11u64;
-        let relay: SocketAddr = "10.0.0.11:9000".parse().unwrap();
+        let relay: PeerAddr = PeerAddr::Udp("10.0.0.11:9000".parse().unwrap());
 
         let peers: Arc<DashMap<u64, PeerInfo>> = Arc::new(DashMap::new());
         let peer_addrs: Arc<DashMap<u64, PeerAddr>> = Arc::new(DashMap::new());
@@ -43660,7 +43668,7 @@ mod heartbeat_aead_tests {
             PeerInfo {
                 node_id: peer_id,
                 transport: PeerTransport::Routed {
-                    relay_addr: relay,
+                    relay: relay,
                     adjacent_relay_identity: None,
                 },
                 session,
@@ -43730,7 +43738,7 @@ mod heartbeat_aead_tests {
     #[tokio::test]
     async fn routed_dispatch_lookup_filters_session_id_mismatch() {
         let peer_id = 0xBEEF_CAFEu64;
-        let peer_addr: SocketAddr = "10.1.1.1:9000".parse().unwrap();
+        let peer_addr: PeerAddr = PeerAddr::Udp("10.1.1.1:9000".parse().unwrap());
 
         let peers: Arc<DashMap<u64, PeerInfo>> = Arc::new(DashMap::new());
         let session_id_to_node: Arc<DashMap<u64, u64>> = Arc::new(DashMap::new());
@@ -43742,9 +43750,7 @@ mod heartbeat_aead_tests {
             peer_id,
             PeerInfo {
                 node_id: peer_id,
-                transport: PeerTransport::Direct {
-                    owned_addr: peer_addr,
-                },
+                transport: PeerTransport::Direct { owned: peer_addr },
                 session,
                 remote_static_pub: [0u8; 32],
                 last_initiator_ephemeral: None,
@@ -43806,7 +43812,7 @@ mod heartbeat_aead_tests {
             .expect("MeshNode::new");
 
         let peer_id = 0xFEED_F00Du64;
-        let peer_addr: SocketAddr = "10.2.2.2:9100".parse().unwrap();
+        let peer_addr: PeerAddr = PeerAddr::Udp("10.2.2.2:9100".parse().unwrap());
 
         let (first_keys, _) = make_session_keys();
         let first_session_id = first_keys.session_id;
@@ -43858,7 +43864,7 @@ mod heartbeat_aead_tests {
             .expect("MeshNode::new");
 
         let peer_id = 0xAB_CD_EF_01u64;
-        let relay_addr: SocketAddr = "10.9.9.9:9100".parse().unwrap();
+        let relay_addr: PeerAddr = PeerAddr::Udp("10.9.9.9:9100".parse().unwrap());
         let (relay_keys, _) = make_session_keys();
         let relay_session_id = relay_keys.session_id;
         node.install_routed(peer_id, relay_addr, relay_keys, None);
@@ -43872,7 +43878,7 @@ mod heartbeat_aead_tests {
 
         // Upgrade tries to install a punched session but expects the
         // pre-race session_id → CAS must refuse.
-        let punched_addr: SocketAddr = "10.1.1.1:7000".parse().unwrap();
+        let punched_addr: PeerAddr = PeerAddr::Udp("10.1.1.1:7000".parse().unwrap());
         let (punch_keys, _) = make_session_keys();
         let installed = node
             .install_direct(peer_id, punched_addr, punch_keys, Some(relay_session_id))
@@ -43907,7 +43913,7 @@ mod heartbeat_aead_tests {
         let peer_id = 0x11_22_33_44u64;
         // Direct install so addr_to_node[old_addr] = peer_id (a
         // stale mapping the swap should clean up).
-        let old_addr: SocketAddr = "10.5.5.5:9100".parse().unwrap();
+        let old_addr: PeerAddr = PeerAddr::Udp("10.5.5.5:9100".parse().unwrap());
         let (first_keys, _) = make_session_keys();
         let first_session_id = first_keys.session_id;
         node.install_direct(peer_id, old_addr, first_keys, None);
@@ -43917,7 +43923,7 @@ mod heartbeat_aead_tests {
             "precondition: old addr maps to the peer",
         );
 
-        let new_addr: SocketAddr = "10.1.1.1:7000".parse().unwrap();
+        let new_addr: PeerAddr = PeerAddr::Udp("10.1.1.1:7000".parse().unwrap());
         let (punch_keys, _) = make_session_keys();
         let punch_session_id = punch_keys.session_id;
         let installed = node
@@ -43963,8 +43969,8 @@ mod heartbeat_aead_tests {
         );
 
         let peer_id = 0xBA55_0001u64;
-        let addr_b: SocketAddr = "10.4.4.4:9100".parse().unwrap();
-        let addr_c: SocketAddr = "10.5.5.5:9100".parse().unwrap();
+        let addr_b: PeerAddr = PeerAddr::Udp("10.4.4.4:9100".parse().unwrap());
+        let addr_c: PeerAddr = PeerAddr::Udp("10.5.5.5:9100".parse().unwrap());
 
         for round in 0..64 {
             let (keys_b, _) = make_session_keys();
@@ -44046,7 +44052,7 @@ mod heartbeat_aead_tests {
             .expect("MeshNode::new");
 
         let dest_id = 0x0DE5_7000u64;
-        let relay_addr: SocketAddr = "10.8.8.8:9100".parse().unwrap();
+        let relay_addr: PeerAddr = PeerAddr::Udp("10.8.8.8:9100".parse().unwrap());
         let (keys, _) = make_session_keys();
         node.install_routed(dest_id, relay_addr, keys, None);
 
@@ -44064,7 +44070,7 @@ mod heartbeat_aead_tests {
 
         // The inverse of the inverse: a DIRECT install still binds.
         let direct_id = 0x0D12_EC70u64;
-        let direct_addr: SocketAddr = "10.8.8.9:9100".parse().unwrap();
+        let direct_addr: PeerAddr = PeerAddr::Udp("10.8.8.9:9100".parse().unwrap());
         let (keys, _) = make_session_keys();
         node.install_direct(direct_id, direct_addr, keys, None);
         assert_eq!(
@@ -44087,8 +44093,9 @@ mod heartbeat_aead_tests {
             .expect("MeshNode::new");
 
         let peer_id = 0x5EA1_0001u64;
-        let home: SocketAddr = "10.6.6.6:9100".parse().unwrap();
-        let moved: SocketAddr = "10.7.7.7:7100".parse().unwrap();
+        let home: PeerAddr = PeerAddr::Udp("10.6.6.6:9100".parse().unwrap());
+        let moved_tuple: SocketAddr = "10.7.7.7:7100".parse().unwrap();
+        let moved = PeerAddr::Udp(moved_tuple);
         let (keys, _) = make_session_keys();
         node.install_direct(peer_id, home, keys, None);
 
@@ -44118,12 +44125,12 @@ mod heartbeat_aead_tests {
         node.router
             .routing_table()
             .remove_destination_all_candidates(peer_id);
-        assert!(!node.set_peer_addr_for_test(peer_id, moved));
+        assert!(!node.set_peer_addr_for_test(peer_id, moved_tuple));
         assert_untouched("absent route");
 
         // Legacy (identity-less) direct route.
         node.router.add_route(peer_id, home);
-        assert!(!node.set_peer_addr_for_test(peer_id, moved));
+        assert!(!node.set_peer_addr_for_test(peer_id, moved_tuple));
         assert_untouched("legacy route");
         assert_eq!(
             node.router.routing_table().lookup(peer_id),
@@ -44139,7 +44146,7 @@ mod heartbeat_aead_tests {
         node.router
             .routing_table()
             .add_authenticated_route(peer_id, home, OTHER);
-        assert!(!node.set_peer_addr_for_test(peer_id, moved));
+        assert!(!node.set_peer_addr_for_test(peer_id, moved_tuple));
         assert_untouched("conflicting identity");
         assert_eq!(
             node.router.routing_table().lookup_authenticated(peer_id),
@@ -44161,8 +44168,9 @@ mod heartbeat_aead_tests {
             .expect("MeshNode::new");
 
         let peer_id = 0x5EA1_0002u64;
-        let home: SocketAddr = "10.6.6.7:9100".parse().unwrap();
-        let moved: SocketAddr = "10.7.7.8:7100".parse().unwrap();
+        let home: PeerAddr = PeerAddr::Udp("10.6.6.7:9100".parse().unwrap());
+        let moved_tuple: SocketAddr = "10.7.7.8:7100".parse().unwrap();
+        let moved = PeerAddr::Udp(moved_tuple);
         let (keys, _) = make_session_keys();
         node.install_direct(peer_id, home, keys, None);
 
@@ -44171,7 +44179,7 @@ mod heartbeat_aead_tests {
         const OTHER: u64 = 0x07_15u64;
         node.addr_to_node.insert(home, OTHER);
 
-        assert!(node.set_peer_addr_for_test(peer_id, moved));
+        assert!(node.set_peer_addr_for_test(peer_id, moved_tuple));
         assert_eq!(
             node.addr_to_node.get(&home).map(|e| *e),
             Some(OTHER),
@@ -44197,7 +44205,7 @@ mod heartbeat_aead_tests {
     #[test]
     fn a_bad_tag_does_not_burn_the_replay_sequence() {
         let (init_keys, resp_keys) = make_session_keys();
-        let addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:5000".parse().unwrap());
         let sender = NetSession::new(init_keys, addr, 4, false);
         let receiver = NetSession::new(resp_keys, addr, 4, false);
 
@@ -44234,7 +44242,7 @@ mod heartbeat_aead_tests {
             .expect("MeshNode::new");
 
         let peer_id = 0x2E01_0001u64;
-        let peer_addr: SocketAddr = "10.3.3.3:9100".parse().unwrap();
+        let peer_addr: PeerAddr = PeerAddr::Udp("10.3.3.3:9100".parse().unwrap());
         let header = crate::adapter::net::route::RoutingHeader::new(peer_id, 0x51C, 4);
 
         // First incarnation: the peer's sending side is the far half of
@@ -44271,7 +44279,7 @@ mod heartbeat_aead_tests {
     /// the edge.
     #[test]
     fn a_new_session_incarnation_starts_a_fresh_replay_window() {
-        let addr: SocketAddr = "127.0.0.1:5001".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:5001".parse().unwrap());
         let header = crate::adapter::net::route::RoutingHeader::new(0xD57, 0x51C, 4);
 
         let (init_keys, resp_keys) = make_session_keys();
@@ -44313,7 +44321,7 @@ mod heartbeat_aead_tests {
             .expect("MeshNode::new");
 
         let peer_id = 0xCAFE_D00Du64;
-        let peer_addr: SocketAddr = "10.3.3.3:9100".parse().unwrap();
+        let peer_addr: PeerAddr = PeerAddr::Udp("10.3.3.3:9100".parse().unwrap());
         let (keys, _) = make_session_keys();
         node.install_direct(peer_id, peer_addr, keys, None);
         let session = node
@@ -44381,11 +44389,16 @@ mod heartbeat_aead_tests {
         let (init_keys, resp_keys) = make_session_keys();
         let init_session = NetSession::new(
             init_keys.clone(),
-            "127.0.0.1:5001".parse().unwrap(),
+            PeerAddr::Udp("127.0.0.1:5001".parse().unwrap()),
             4,
             false,
         );
-        let resp_session = NetSession::new(resp_keys, "127.0.0.1:5000".parse().unwrap(), 4, false);
+        let resp_session = NetSession::new(
+            resp_keys,
+            PeerAddr::Udp("127.0.0.1:5000".parse().unwrap()),
+            4,
+            false,
+        );
 
         // Mirror the production sender — go through
         // `Session::build_heartbeat`, not a fresh
@@ -44393,9 +44406,9 @@ mod heartbeat_aead_tests {
         let h1_bytes = init_session.build_heartbeat();
         let h2_bytes = init_session.build_heartbeat();
 
-        let p1 = ParsedPacket::parse(h1_bytes, "127.0.0.1:5001".parse().unwrap())
+        let p1 = ParsedPacket::parse(h1_bytes, PeerAddr::Udp("127.0.0.1:5001".parse().unwrap()))
             .expect("first heartbeat must parse");
-        let p2 = ParsedPacket::parse(h2_bytes, "127.0.0.1:5001".parse().unwrap())
+        let p2 = ParsedPacket::parse(h2_bytes, PeerAddr::Udp("127.0.0.1:5001".parse().unwrap()))
             .expect("second heartbeat must parse");
 
         assert!(
@@ -44416,10 +44429,16 @@ mod heartbeat_aead_tests {
     #[test]
     fn replay_of_authenticated_heartbeat_fails_verification_on_second_try() {
         let (init_keys, resp_keys) = make_session_keys();
-        let resp_session = NetSession::new(resp_keys, "127.0.0.1:5000".parse().unwrap(), 4, false);
+        let resp_session = NetSession::new(
+            resp_keys,
+            PeerAddr::Udp("127.0.0.1:5000".parse().unwrap()),
+            4,
+            false,
+        );
         let mut builder = PacketBuilder::new(&init_keys.tx_key, init_keys.session_id);
         let bytes = builder.build_heartbeat();
-        let parsed = ParsedPacket::parse(bytes, "127.0.0.1:5000".parse().unwrap()).unwrap();
+        let parsed =
+            ParsedPacket::parse(bytes, PeerAddr::Udp("127.0.0.1:5000".parse().unwrap())).unwrap();
 
         assert!(resp_session.verify_and_touch_heartbeat(&parsed));
         // Replay: counter is now committed, so the second attempt
@@ -44455,7 +44474,7 @@ mod heartbeat_aead_tests {
         let (init_keys, _resp_keys) = make_session_keys();
         let init_session = NetSession::new(
             init_keys.clone(),
-            "127.0.0.1:5001".parse().unwrap(),
+            PeerAddr::Udp("127.0.0.1:5001".parse().unwrap()),
             4,
             false,
         );
@@ -44565,14 +44584,14 @@ mod heartbeat_aead_tests {
     /// reply.
     #[test]
     fn routed_rotation_outcome_drops_replay_for_matching_static_and_ephemeral() {
-        let addr: SocketAddr = "10.0.0.1:9000".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("10.0.0.1:9000".parse().unwrap());
         let (init_keys, _) = make_session_keys();
         let session = Arc::new(NetSession::new(init_keys, addr, 4, false));
         let static_a = [0xAAu8; 32];
         let ephemeral_a = [0xCCu8; 32];
         let info = PeerInfo {
             node_id: 0xBEEF_BEEFu64,
-            transport: PeerTransport::Direct { owned_addr: addr },
+            transport: PeerTransport::Direct { owned: addr },
             session,
             remote_static_pub: static_a,
             last_initiator_ephemeral: Some(ephemeral_a),
@@ -44591,7 +44610,7 @@ mod heartbeat_aead_tests {
     /// `connect_direct` retarget path. AcceptRotation now.
     #[test]
     fn routed_rotation_outcome_accepts_reinit_with_fresh_ephemeral() {
-        let addr: SocketAddr = "10.0.0.1:9000".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("10.0.0.1:9000".parse().unwrap());
         let (init_keys, _) = make_session_keys();
         let session = Arc::new(NetSession::new(init_keys, addr, 4, false));
         let static_a = [0xAAu8; 32];
@@ -44599,7 +44618,7 @@ mod heartbeat_aead_tests {
         let ephemeral_new = [0xDDu8; 32];
         let info = PeerInfo {
             node_id: 0xBEEF_BEEFu64,
-            transport: PeerTransport::Direct { owned_addr: addr },
+            transport: PeerTransport::Direct { owned: addr },
             session,
             remote_static_pub: static_a,
             last_initiator_ephemeral: Some(ephemeral_old),
@@ -44620,12 +44639,12 @@ mod heartbeat_aead_tests {
     /// verification on every legitimate packet to the affected peer.
     #[test]
     fn routed_rotation_outcome_refuses_rotation_while_session_is_fresh() {
-        let addr: SocketAddr = "10.0.0.1:9000".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("10.0.0.1:9000".parse().unwrap());
         let (init_keys, _) = make_session_keys();
         let session = Arc::new(NetSession::new(init_keys, addr, 4, false));
         let info = PeerInfo {
             node_id: 0xBEEF_BEEFu64,
-            transport: PeerTransport::Direct { owned_addr: addr },
+            transport: PeerTransport::Direct { owned: addr },
             session,
             remote_static_pub: [0xAAu8; 32],
             last_initiator_ephemeral: Some([0xCCu8; 32]),
@@ -44646,12 +44665,12 @@ mod heartbeat_aead_tests {
     /// could never reconnect).
     #[test]
     fn routed_rotation_outcome_accepts_rotation_after_session_timeout() {
-        let addr: SocketAddr = "10.0.0.1:9000".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("10.0.0.1:9000".parse().unwrap());
         let (init_keys, _) = make_session_keys();
         let session = Arc::new(NetSession::new(init_keys, addr, 4, false));
         let info = PeerInfo {
             node_id: 0xBEEF_BEEFu64,
-            transport: PeerTransport::Direct { owned_addr: addr },
+            transport: PeerTransport::Direct { owned: addr },
             session,
             remote_static_pub: [0xAAu8; 32],
             last_initiator_ephemeral: Some([0xCCu8; 32]),
@@ -44674,7 +44693,7 @@ mod heartbeat_aead_tests {
     /// so an in-flight transfer isn't dropped by the swap.
     #[test]
     fn routed_rotation_outcome_defers_while_session_busy() {
-        let addr: SocketAddr = "10.0.0.1:9000".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("10.0.0.1:9000".parse().unwrap());
         let (init_keys, _) = make_session_keys();
         let session = Arc::new(NetSession::new(init_keys, addr, 4, false));
         // Open an application stream → the session is now "busy".
@@ -44683,7 +44702,7 @@ mod heartbeat_aead_tests {
         let static_a = [0xAAu8; 32];
         let info = PeerInfo {
             node_id: 0xBEEF_BEEFu64,
-            transport: PeerTransport::Direct { owned_addr: addr },
+            transport: PeerTransport::Direct { owned: addr },
             session,
             remote_static_pub: static_a,
             last_initiator_ephemeral: Some([0xCCu8; 32]),
@@ -44701,7 +44720,7 @@ mod heartbeat_aead_tests {
     /// rebind — is never blocked by stale "busy" state.
     #[test]
     fn routed_rotation_outcome_accepts_busy_session_past_timeout() {
-        let addr: SocketAddr = "10.0.0.1:9000".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("10.0.0.1:9000".parse().unwrap());
         let (init_keys, _) = make_session_keys();
         let session = Arc::new(NetSession::new(init_keys, addr, 4, false));
         session.get_or_create_stream(1);
@@ -44709,7 +44728,7 @@ mod heartbeat_aead_tests {
         let static_a = [0xAAu8; 32];
         let info = PeerInfo {
             node_id: 0xBEEF_BEEFu64,
-            transport: PeerTransport::Direct { owned_addr: addr },
+            transport: PeerTransport::Direct { owned: addr },
             session,
             remote_static_pub: static_a,
             last_initiator_ephemeral: Some([0xCCu8; 32]),
@@ -44882,7 +44901,7 @@ mod heartbeat_aead_tests {
         let body = &src[start..scan_end];
 
         assert!(
-            body.contains("self.addr_to_node.insert(target_addr, peer_node_id)"),
+            body.contains(".insert(PeerAddr::Udp(target_addr), peer_node_id)"),
             "regression: connect_on_direct_path must refresh addr_to_node \
              on success — pre-fix the dispatch fast path missed on the \
              upgraded session's reflex addr and fell back to a linear \
@@ -46023,13 +46042,18 @@ mod stream_ack_batching_tests {
 
     fn session_at(addr: &str) -> Arc<NetSession> {
         let (_init, resp) = make_session_keys();
-        Arc::new(NetSession::new(resp, addr.parse().unwrap(), 4, false))
+        Arc::new(NetSession::new(
+            resp,
+            PeerAddr::Udp(addr.parse().unwrap()),
+            4,
+            false,
+        ))
     }
 
     fn pending(session: &Arc<NetSession>, addr: &str, consumed: u64) -> PendingStreamGrant {
         PendingStreamGrant {
             session: session.clone(),
-            peer_addr: addr.parse().unwrap(),
+            peer_addr: PeerAddr::Udp(addr.parse().unwrap()),
             total_consumed: consumed,
         }
     }
@@ -46093,7 +46117,7 @@ mod stream_ack_batching_tests {
         let grouped = group_grants_by_session(drained);
         assert_eq!(grouped.len(), 1, "one session ⇒ one batch");
         let (_, peer_addr, grants) = &grouped[&s.session_id()];
-        assert_eq!(*peer_addr, addr.parse().unwrap());
+        assert_eq!(*peer_addr, PeerAddr::Udp(addr.parse().unwrap()));
         let mut seen: Vec<(u64, u64)> = grants.clone();
         seen.sort_unstable();
         assert_eq!(
@@ -46315,8 +46339,14 @@ mod stream_ack_batching_tests {
         drained.insert((s2.session_id(), 1u64), pending(&s2, a2, 22));
         let grouped = group_grants_by_session(drained);
         assert_eq!(grouped.len(), 2);
-        assert_eq!(grouped[&s1.session_id()].1, a1.parse().unwrap());
-        assert_eq!(grouped[&s2.session_id()].1, a2.parse().unwrap());
+        assert_eq!(
+            grouped[&s1.session_id()].1,
+            PeerAddr::Udp(a1.parse().unwrap())
+        );
+        assert_eq!(
+            grouped[&s2.session_id()].1,
+            PeerAddr::Udp(a2.parse().unwrap())
+        );
     }
 
     /// Decrypt-side pin for `chunk` → `build_subprotocol` framing:
@@ -50234,7 +50264,7 @@ mod sensing_authority_witness_tests {
         let egress = node
             .org_egress()
             .expect("a fresh node's egress is creatable");
-        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9".parse().unwrap());
 
         assert!(egress.enqueue(Bytes::from_static(b"stuck"), addr));
         assert!(egress.enqueue(Bytes::from_static(b"next"), addr));
@@ -50316,7 +50346,7 @@ mod sensing_authority_witness_tests {
     async fn an_enqueue_after_close_is_refused_and_strands_no_queue() {
         let node = sensing_org_node("egress-close-race").await;
         let egress = node.org_egress().expect("creatable");
-        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9".parse().unwrap());
 
         // Close and JOIN, so the consumer has provably observed closed+empty
         // and exited before the racing enqueue is attempted.
@@ -50368,7 +50398,7 @@ mod sensing_authority_witness_tests {
         }));
 
         let egress = node.org_egress().expect("creatable");
-        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9".parse().unwrap());
         for _ in 0..3 {
             assert!(egress.enqueue(Bytes::from_static(b"stalled"), addr));
         }
@@ -50480,7 +50510,7 @@ mod sensing_authority_witness_tests {
         }
 
         let egress = node.org_egress().expect("creatable");
-        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9".parse().unwrap());
         assert!(egress.enqueue(Bytes::from_static(b"stalled"), addr));
 
         // FIRST attempt: parks holding teardown ownership.
@@ -50585,7 +50615,7 @@ mod sensing_authority_witness_tests {
             stall: Arc::new(|_| true),
         });
         let egress = node.org_egress().expect("creatable");
-        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9".parse().unwrap());
         assert!(egress.enqueue(Bytes::from_static(b"stalled"), addr));
 
         // CANCELLED WHILE DRAINING: well inside the grace window, so the
@@ -50667,7 +50697,7 @@ mod sensing_authority_witness_tests {
         });
 
         let egress = node.org_egress().expect("creatable");
-        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9".parse().unwrap());
         assert!(egress.enqueue(Bytes::from_static(b"stalled"), addr));
 
         let attempt = {
@@ -50847,7 +50877,7 @@ mod sensing_authority_witness_tests {
 
         let node = sensing_org_node("egress-enqueue-close-race").await;
         let egress = node.org_egress().expect("creatable");
-        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9".parse().unwrap());
 
         let (parked_tx, parked_rx) = mpsc::sync_channel::<()>(1);
         let (unpark_tx, unpark_rx) = mpsc::sync_channel::<()>(1);
@@ -52723,7 +52753,7 @@ mod protected_forward_allocation_pins {
              not spawn a send task per datagram",
         );
         assert!(
-            body.contains(&format!("try_send_to{}", "(")),
+            body.contains(&format!("try_send{}", "(")),
             "the relay egress must be the non-blocking send",
         );
     }
@@ -52755,7 +52785,8 @@ mod protected_forward_allocation_pins {
              legacy relay and pingwave re-broadcast both act on unauthenticated \
              ingress, so a spawn-per-packet turns downstream congestion into \
              unbounded heap and scheduler pressure driven by a source that never \
-             authenticated. Use socket.try_send_to and drop when it is not ready.",
+             authenticated. Use the sink's non-blocking try_send and drop when \
+             it is not ready.",
         );
         assert!(
             !body.contains(&awaited_send),
@@ -52763,7 +52794,7 @@ mod protected_forward_allocation_pins {
              it carries a send deadline, which is a bounded wait, not a drop",
         );
         assert!(
-            body.contains(&format!("try_send_to{}", "(")),
+            body.contains(&format!("try_send{}", "(")),
             "the forwarding egress must be the non-blocking send",
         );
     }

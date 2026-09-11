@@ -52,7 +52,7 @@ use net::adapter::net::behavior::sensing::{
     ProjectedReadiness, ProviderInterestKey, ProviderSelector, ReadinessEvaluation,
     ReadinessEvaluator, ResultMode, SensingCounters, StatusReason, WorkLatencyEnvelope,
 };
-use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
+use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, PeerAddr, SocketBufferConfig};
 use net::adapter::Adapter;
 
 const STRICT_D: Duration = Duration::from_millis(100);
@@ -183,7 +183,9 @@ async fn flagship_two_watchers_one_stream_and_the_hop_rule() {
     // a later slice).
     let p_entity = p.entity_keypair().entity_id().clone();
     for watcher in [&a, &b, &c2] {
-        watcher.router().add_route(p_id, r.local_addr());
+        watcher
+            .router()
+            .add_route(p_id, PeerAddr::Udp(r.local_addr()));
         watcher.test_pin_peer_entity(p_id, p_entity.clone());
     }
 
@@ -428,7 +430,7 @@ async fn ttl_half_refreshes_do_not_starve_live_delivery() {
             && p.peer_entity_id(r_id).is_some()
     })
     .await;
-    c.router().add_route(p_id, r.local_addr());
+    c.router().add_route(p_id, PeerAddr::Udp(r.local_addr()));
     c.test_pin_peer_entity(p_id, p.entity_keypair().entity_id().clone());
 
     let spec = shared_spec(fleet);
