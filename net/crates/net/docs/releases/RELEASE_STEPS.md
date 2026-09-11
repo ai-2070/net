@@ -16,7 +16,11 @@
 # Main release
 git tag vX && git push origin vX
 
-# Rust crates → crates.io
+# Rust crates → crates.io. One tag, one workflow, publishing in
+# dependency order: net-mesh-wire (the tokio-free wire layer, added
+# in Stage 2 — net-mesh depends on it by version, so it MUST go
+# first), then net-mesh + net-mesh-sdk-macros, then net-mesh-sdk,
+# then net-mesh-mcp.
 git tag crates-vX && git push origin crates-vX
 
 # Python binding wheels → PyPI (`net-mesh`)

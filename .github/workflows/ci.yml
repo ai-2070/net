@@ -1225,6 +1225,7 @@ jobs:
           --test gang_alloc_witness
           --test chain_discovery
           --test cross_lang_capability_fixtures
+          --test cross_lang_wire
           --test migration_integration
           --test migration_target_failure_mid_chunking
           --test netsocket_production_defaults
@@ -3536,6 +3537,16 @@ jobs:
             # the test step uses, so what the binary ships gets
             # linted (not the `demo` feature, which is dev-only).
             features: ""
+          - name: wire
+            # `net-mesh-wire` is the tokio-free wire layer the core
+            # depends on (Stage 2 of
+            # BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md). `json` is the
+            # only feature and is what the core turns on, so linting
+            # with it matches the surface every native consumer
+            # compiles. Its wasm32 target is linted by the dedicated
+            # `wasm-wire` job, which is where the other backend lives.
+            path: net/crates/net/wire
+            features: --features json
           - name: aggregator-daemon
             path: net/crates/net/aggregator-daemon
             # `net-aggregator-daemon` is a lib + bin crate that
@@ -4220,6 +4231,16 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+      # `net-mesh-wire` is the tokio-free wire layer the core depends
+      # on (Stage 2 of BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md). It
+      # denies `missing_docs`, and every type the core re-exports is
+      # documented there rather than in `adapter/net` now, so its
+      # rustdoc IS the wire-surface documentation.
+      - name: Build net-mesh-wire documentation
+        run: cargo doc -p net-mesh-wire --no-deps --features json
+        env:
+          RUSTDOCFLAGS: -D warnings
+
       # `net-payments` is a workspace member the bare `cargo doc` above
       # never documents, so its rustdoc has gone unchecked. Build it with
       # `--all-features` (matches the test job — turns on `unsafe-dev-signer`
@@ -4229,3 +4250,116 @@ jobs:
         run: cargo doc -p net-payments --no-deps --all-features
         env:
           RUSTDOCFLAGS: -D warnings
+
+  wasm-wire:
+    # Stage 2 of BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md: `net-mesh-wire`
+    # is the tokio-free wire layer, and the whole point of extracting it
+    # is that a browser leaf can run it. This job is the only place that
+    # is enforced.
+    #
+    # Two steps, and the second is NOT redundant. `cargo check --target
+    # wasm32-unknown-unknown` catches a native type leaking into the wire
+    # crate, but it CANNOT catch the failure S0a found: on
+    # `wasm32-unknown-unknown`, `std::time::Instant::now()` and
+    # `SystemTime::now()` compile fine and then panic at runtime ("time
+    # not implemented on this platform"). `session.rs` and
+    # `reliability.rs` read the clock on every packet, so a clock site
+    # that bypasses the `Clock` seam is a leaf that dies on its first
+    # datagram, with a green check job. The executed test also replays
+    # the packet-AEAD golden vector on the `chacha20poly1305` backend,
+    # which the native `cross_lang_wire` test asserts on the `ring`
+    # backend — a divergence there splits the wire format between native
+    # and browser nodes.
+    #
+    # `wasm-bindgen-test-runner` drives the tests under Node (the runner
+    # ships Node 24; `getrandom`'s `wasm_js` backend needs
+    # `crypto.getRandomValues`, which Node has). Its version MUST match
+    # the `wasm-bindgen` version in Cargo.lock or the runner refuses the
+    # module — `cargo install --locked` against this workspace's lock is
+    # what keeps them in lockstep.
+    name: Wasm wire (check + executed tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: net/crates/net
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: wasm-wire
+          workspaces: net/crates/net -> target
+
+      # A wire-only wasm build pays ~260 KB of `wasm-bindgen` describe
+      # metadata for `getrandom`'s browser backend (S0a §5). Fine for a
+      # test job; it is the `net-leaf` bundle, not this one, that has to
+      # care. Cached with the target dir so it is paid once.
+      - name: Install wasm-bindgen-test-runner
+        run: cargo install wasm-bindgen-cli --locked --version "$(cargo metadata --format-version 1 --locked | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "wasm-bindgen"))')"
+
+      # No `--features json`: the wasm build deliberately does not link
+      # serde_json, and this is what keeps that true.
+      - name: Check net-mesh-wire for wasm32
+        run: cargo check -p net-mesh-wire --target wasm32-unknown-unknown
+
+      - name: Clippy net-mesh-wire for wasm32
+        if: ${{ !cancelled() }}
+        run: cargo clippy -p net-mesh-wire --target wasm32-unknown-unknown --all-targets -- -D warnings -A clippy::unwrap_used -A clippy::expect_used
+
+      # `--no-tests=fail` has no nextest here (nextest cannot drive a
+      # wasm runner), so the grep below is the equivalent guard: a
+      # harness that compiled to zero tests would otherwise report
+      # success and prove nothing.
+      - name: Run the executed wasm tests (Node)
+        if: ${{ !cancelled() }}
+        env:
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+        run: |
+          set -o pipefail
+          out=$(cargo test -p net-mesh-wire --target wasm32-unknown-unknown 2>&1 | tee /dev/stderr)
+          for t in routed_round_trip_runs_on_wasm \
+                   clock_reads_do_not_panic_on_wasm \
+                   aead_golden_vector_matches_on_the_wasm_backend; do
+            printf '%s\n' "$out" | grep -q "test $t \.\.\. ok" || {
+              echo "::error::wasm test $t did not run or did not pass"
+              exit 1
+            }
+          done
+
+  wasm-wire-no-native-deps:
+    # `net-mesh-wire` exists to be linkable without a native runtime.
+    # A `tokio` (or `mio` / `socket2` / `net-mesh`) edge would still
+    # compile for wasm32 in some configurations and would certainly
+    # compile natively, so the wasm job above cannot be relied on to
+    # notice it. Assert the dependency graph directly.
+    name: Wasm wire (no native dependency)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: net/crates/net
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Assert the wire crate pulls in no runtime
+        run: |
+          set -o pipefail
+          tree=$(cargo tree -p net-mesh-wire --all-features --edges normal,build)
+          printf '%s\n' "$tree"
+          for forbidden in tokio mio socket2 net-mesh; do
+            if printf '%s\n' "$tree" | grep -qE "^[^a-z]*${forbidden} v"; then
+              echo "::error::net-mesh-wire depends on ${forbidden}; the wire layer must stay runtime-free"
+              exit 1
+            fi
+          done
+
