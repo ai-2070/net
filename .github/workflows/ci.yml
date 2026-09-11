@@ -103,6 +103,72 @@ jobs:
       - name: Run unit tests (all in-source units, full feature set)
         run: cargo test --lib --features "$UNIT_FEATURES"
 
+      # Stage 2 moved seven modules (and the routing-envelope codec)
+      # into `net-mesh-wire`, taking their `#[cfg(test)] mod`s with
+      # them. `--lib` above is the ROOT crate only, and no other job
+      # executes this suite — clippy compiles it, the wasm job runs
+      # three `wasm_bindgen_test`s. For one candidate, 196 real tests
+      # stopped gating anything. Explicit and `--locked`.
+      - name: Run net-mesh-wire unit tests (the moved suite)
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p net-mesh-wire --features json
+
+      # …and the count/roster guard, same discipline as the witness
+      # floors below: a suite that silently shrinks (a `#[cfg(test)]
+      # mod` dropped in a merge, a module renamed out of the build)
+      # would otherwise still exit 0 above.
+      #
+      # MIN is the post-move inventory. REQUIRED pins, by exact name,
+      # the two `should_panic` cases (a harness that stops honouring
+      # `should_panic` turns two real assertions into silent passes)
+      # and one test per moved module. `stream` is absent on purpose:
+      # it carries config/error/stats vocabulary and no unit tests of
+      # its own — its surface is gated by the core's pinned
+      # `--test stream_config_and_error_display`.
+      - name: Guard — the moved wire suite is intact
+        if: ${{ !cancelled() }}
+        run: |
+          set -o pipefail
+          MIN=196
+          out=$(cargo test --locked -p net-mesh-wire --features json 2>&1 | tee /dev/stderr)
+          n=$(printf '%s\n' "$out" \
+                | grep -oE 'test result: ok\. [0-9]+ passed' \
+                | grep -oE '[0-9]+' | head -1)
+          if [ -z "$n" ] || [ "$n" -lt "$MIN" ]; then
+            echo "::error::expected >= $MIN net-mesh-wire unit tests, ran ${n:-0}."
+            echo "These are the suites that moved out of src/adapter/net in Stage 2."
+            echo "If tests were intentionally removed, lower MIN in this step in the"
+            echo "same commit — do not let the gate pass vacuously."
+            exit 1
+          fi
+          # Cardinality cannot say WHICH suite vanished. A module that
+          # stopped being compiled into the test binary takes its whole
+          # roster with it and still leaves a plausible-looking count.
+          if ! roster=$(cargo test --locked -p net-mesh-wire --features json -- --list 2>&1); then
+            echo "::error::could not list net-mesh-wire tests"
+            printf '%s\n' "$roster"
+            exit 1
+          fi
+          REQUIRED="pool::tests::build_panics_on_event_count_exceeding_cap
+          pool::tests::build_subprotocol_panics_on_event_count_exceeding_cap
+          protocol::tests::header_validation_field_isolation
+          crypto::tests::crypto_error_display_covers_every_variant
+          pool::tests::build_roundtrips_through_decrypt_with_in_place_framing
+          batch::tests::test_adaptive_batcher_custom_config
+          reliability::tests::adaptive_rto_rfc6298_and_clamps
+          session::tests::a_refused_seal_does_not_consume_a_hop_sequence
+          route_codec::tests::test_regression_routing_discriminator_survives_magic_collision_node_id
+          route_hop::tests::a_duplicate_exactly_one_window_behind_is_refused"
+          missing=0
+          for name in $REQUIRED; do
+            printf '%s\n' "$roster" | grep -qF "$name: test" || {
+              echo "::error::required net-mesh-wire test missing from the roster: $name"
+              missing=1
+            }
+          done
+          [ "$missing" -eq 0 ] || exit 1
+          echo "net-mesh-wire: $n tests, roster complete"
+
       # OLB-2B-E3c: the production routing-plane wiring witnesses
       # (`src/adapter/net/org_routing_wiring_tests.rs`, included from `mesh.rs`).
       # The step above already runs them — this one exists to make the coverage
