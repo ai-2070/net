@@ -4352,16 +4352,34 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # `targets:` on the toolchain action installs into the
+      # **stable** installation, but every cargo command below runs
+      # under `net/crates/net`, where `rust-toolchain.toml` pins
+      # 1.98.1 — a separate installation with its own target set. The
+      # first candidate installed the target on stable and then asked
+      # 1.98.1 to build for it: `E0463: can't find crate for 'core'`.
+      # Install the toolchain the commands actually select, then add
+      # the target FROM the pinned directory so rustup resolves the
+      # same override file cargo does.
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-unknown-unknown
           components: clippy
 
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: wasm-wire
           workspaces: net/crates/net -> target
+
+      - name: Add wasm32 to the pinned toolchain
+        run: |
+          set -o pipefail
+          rustup target add wasm32-unknown-unknown
+          rustup show active-toolchain
+          rustup target list --installed | tee /dev/stderr | grep -qx wasm32-unknown-unknown || {
+            echo "::error::wasm32-unknown-unknown is not installed for the toolchain this directory selects"
+            exit 1
+          }
 
       # A wire-only wasm build pays ~260 KB of `wasm-bindgen` describe
       # metadata for `getrandom`'s browser backend (S0a §5). Fine for a
@@ -4417,14 +4435,32 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Assert the wire crate pulls in no runtime
+      # The target the check job builds for resolves a DIFFERENT
+      # graph: `[target.'cfg(target_arch = "wasm32")'.dependencies]`
+      # swaps ring/snow for chacha20poly1305 + web-time + the two
+      # getrandom browser backends. Checking only the host graph would
+      # miss a runtime edge that exists solely on wasm32, and vice
+      # versa, so both are asserted.
+      - name: Add wasm32 to the pinned toolchain
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Assert the wire crate pulls in no runtime (both graphs)
         run: |
           set -o pipefail
-          tree=$(cargo tree -p net-mesh-wire --all-features --edges normal,build)
-          printf '%s\n' "$tree"
-          for forbidden in tokio mio socket2 net-mesh; do
-            if printf '%s\n' "$tree" | grep -qE "^[^a-z]*${forbidden} v"; then
-              echo "::error::net-mesh-wire depends on ${forbidden}; the wire layer must stay runtime-free"
-              exit 1
+          status=0
+          for target in host wasm32-unknown-unknown; do
+            if [ "$target" = host ]; then
+              tree=$(cargo tree -p net-mesh-wire --all-features --edges normal,build)
+            else
+              tree=$(cargo tree -p net-mesh-wire --all-features --edges normal,build --target "$target")
             fi
+            echo "--- $target graph"
+            printf '%s\n' "$tree"
+            for forbidden in tokio mio socket2 net-mesh; do
+              if printf '%s\n' "$tree" | grep -qE "^[^a-z]*${forbidden} v"; then
+                echo "::error::net-mesh-wire depends on ${forbidden} in the $target graph; the wire layer must stay runtime-free"
+                status=1
+              fi
+            done
           done
+          exit $status
