@@ -1588,6 +1588,17 @@ struct DispatchCtx {
     router: Arc<NetRouter>,
     failure_detector: Arc<FailureDetector>,
     inbound: InboundQueues,
+    /// `0x0D02` intake: the budget and the engine's input. Both
+    /// `None` on a node without RTC configured, which is what makes
+    /// the dispatch arm inert there.
+    #[cfg(feature = "webrtc")]
+    rtc_signal_budget: Option<Arc<parking_lot::Mutex<super::rtc::SignalBudget>>>,
+    #[cfg(feature = "webrtc")]
+    rtc_signal_tx: Option<tokio::sync::mpsc::Sender<(u64, super::rtc::RtcSignalMsg)>>,
+    #[cfg(feature = "webrtc")]
+    rtc_stats: Option<Arc<super::rtc::RtcStats>>,
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    rtc_signal_tap: Option<Arc<parking_lot::Mutex<Vec<(u64, super::rtc::RtcSignalMsg)>>>>,
     /// Per-channel-hash dispatch hook for nRPC. See the matching
     /// field on `MeshNode`. Gated on `cortex` because the nRPC
     /// dispatcher type lives there and the `--features net`-only
@@ -10659,6 +10670,29 @@ pub struct MeshNode {
     /// and `dispatch_packet` is the single owner).
     #[cfg(feature = "webrtc")]
     rtc_ingress: Arc<parking_lot::Mutex<Option<RtcIngressInput>>>,
+    /// Per-sender `0x0D02` dialog and frame budget. A synchronous
+    /// lock taken and released inside the dispatch arm — never held
+    /// across an await.
+    #[cfg(feature = "webrtc")]
+    rtc_signal_budget: Arc<parking_lot::Mutex<super::rtc::SignalBudget>>,
+    /// Test-only record of every frame that passed the budget, so a
+    /// witness can assert what was *admitted* rather than inferring
+    /// it from an installed session.
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    rtc_signal_tap: Arc<parking_lot::Mutex<Vec<(u64, super::rtc::RtcSignalMsg)>>>,
+    /// Inbound signalling frames, handed from the dispatch arm to
+    /// the signalling engine. Bounded: a full input drops and
+    /// counts, exactly like the RTC ingress input, because the
+    /// dispatch loop must never block on a peer's signalling.
+    #[cfg(feature = "webrtc")]
+    rtc_signal_tx: Option<tokio::sync::mpsc::Sender<(u64, super::rtc::RtcSignalMsg)>>,
+    /// The receiving half, parked until the engine takes it.
+    #[cfg(feature = "webrtc")]
+    rtc_signal_rx: Arc<
+        parking_lot::Mutex<
+            Option<tokio::sync::mpsc::Receiver<(u64, super::rtc::RtcSignalMsg)>>,
+        >,
+    >,
     /// R3-E: channel-close notifications from the driver, consumed by
     /// the task `start()` spawns. Taken once, like `rtc_ingress`.
     #[cfg(feature = "webrtc")]
@@ -12312,6 +12346,17 @@ impl MeshNode {
             Some((ingress, closed)) => (Some(ingress), Some(closed)),
             None => (None, None),
         };
+        // The signalling intake exists only when RTC does: with no
+        // driver there is nothing an `Offer` could be acted on with,
+        // and the dispatch arm stays inert.
+        #[cfg(feature = "webrtc")]
+        let (rtc_signal_tx, rtc_signal_rx) = match rtc_driver.as_ref() {
+            Some(_) => {
+                let (tx, rx) = tokio::sync::mpsc::channel(256);
+                (Some(tx), Some(rx))
+            }
+            None => (None, None),
+        };
 
         let router_config = RouterConfig {
             local_id: node_id,
@@ -13070,6 +13115,16 @@ impl MeshNode {
             rtc_ingress: Arc::new(parking_lot::Mutex::new(rtc_ingress)),
             #[cfg(feature = "webrtc")]
             rtc_closed: Arc::new(parking_lot::Mutex::new(rtc_closed)),
+            #[cfg(feature = "webrtc")]
+            rtc_signal_budget: Arc::new(parking_lot::Mutex::new(
+                super::rtc::SignalBudget::new(),
+            )),
+            #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+            rtc_signal_tap: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            #[cfg(feature = "webrtc")]
+            rtc_signal_tx,
+            #[cfg(feature = "webrtc")]
+            rtc_signal_rx: Arc::new(parking_lot::Mutex::new(rtc_signal_rx)),
             #[cfg(feature = "webrtc")]
             rtc_stats,
             peers,
@@ -24507,6 +24562,20 @@ impl MeshNode {
             router: self.router.clone(),
             failure_detector: self.failure_detector.clone(),
             inbound: self.inbound.clone(),
+            #[cfg(feature = "webrtc")]
+            rtc_signal_budget: self
+                .rtc_driver
+                .as_ref()
+                .map(|_| Arc::clone(&self.rtc_signal_budget)),
+            #[cfg(feature = "webrtc")]
+            rtc_signal_tx: self.rtc_signal_tx.clone(),
+            #[cfg(feature = "webrtc")]
+            rtc_stats: self.rtc_driver.as_ref().map(|d| Arc::clone(d.stats())),
+            #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+            rtc_signal_tap: self
+                .rtc_driver
+                .as_ref()
+                .map(|_| Arc::clone(&self.rtc_signal_tap)),
             #[cfg(feature = "cortex")]
             rpc_inbound_dispatchers: self.rpc_inbound_dispatchers.clone(),
             num_shards: self.config.num_shards,
@@ -26560,6 +26629,22 @@ impl MeshNode {
             // session_id — no need to re-scan `peers` here.
             for payload in events {
                 Self::handle_membership_message(&payload, from_node, ctx);
+            }
+            return;
+        }
+
+        // RTC signalling (`0x0D02`, plan §5 Layer 3). Session
+        // authenticated: the frame arrived inside this peer's
+        // session, so origin and target are the endpoints and there
+        // is nothing on the wire to spoof. Decoded under a size
+        // bound, budgeted per sender, then handed to the engine
+        // over a bounded channel — the dispatch loop never blocks
+        // on signalling and never awaits here.
+        #[cfg(feature = "webrtc")]
+        if parsed.header.subprotocol_id == super::rtc::SUBPROTOCOL_RTC_SIGNAL {
+            let events = EventFrame::read_events(decrypted, parsed.header.event_count);
+            for payload in events {
+                Self::handle_rtc_signal(&payload, from_node, ctx);
             }
             return;
         }
@@ -33523,6 +33608,86 @@ impl MeshNode {
                 );
                 ScopedIngestDisposition::Final
             }
+        }
+    }
+
+    /// Send one `RtcSignalMsg` to `peer_node_id` over its existing
+    /// session (plan §5 Layer 3).
+    ///
+    /// The session may be routed — that is the point: signalling is
+    /// how a pair that has no direct path arranges one, and every
+    /// anchor between them forwards the packet without a key for
+    /// its contents.
+    #[cfg(feature = "webrtc")]
+    pub async fn send_rtc_signal(
+        &self,
+        peer_node_id: u64,
+        msg: &super::rtc::RtcSignalMsg,
+    ) -> Result<(), AdapterError> {
+        let encoded = msg
+            .to_bytes()
+            .map_err(|e| AdapterError::Connection(format!("rtc signal encode failed: {e}")))?;
+        self.send_subprotocol_to_node(
+            peer_node_id,
+            super::rtc::SUBPROTOCOL_RTC_SIGNAL,
+            &encoded,
+        )
+        .await
+    }
+
+    /// Test-only: every signalling frame this node admitted, in
+    /// arrival order, drained.
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    pub fn drain_rtc_signals_for_test(&self) -> Vec<(u64, super::rtc::RtcSignalMsg)> {
+        std::mem::take(&mut *self.rtc_signal_tap.lock())
+    }
+
+    /// One inbound `0x0D02` frame (plan §5 Layer 3).
+    ///
+    /// Four decisions, in this order and none of them skippable:
+    /// decode under [`super::rtc::MAX_SDP_BYTES`]; charge the
+    /// sender's budget; refuse — **counted** — if it is over; hand
+    /// the frame to the engine without awaiting. A malformed or
+    /// over-budget frame is never silently dropped, because silence
+    /// here looks exactly like a peer that never signalled.
+    #[cfg(feature = "webrtc")]
+    fn handle_rtc_signal(payload: &[u8], from_node: u64, ctx: &DispatchCtx) {
+        let (Some(budget), Some(stats)) = (&ctx.rtc_signal_budget, &ctx.rtc_stats) else {
+            // No RTC on this node: nothing to act on, and nothing
+            // to count it against either.
+            return;
+        };
+        let msg = match super::rtc::RtcSignalMsg::from_bytes(payload) {
+            Ok(msg) => msg,
+            Err(e) => {
+                tracing::debug!(error = %e, from = format!("{from_node:#x}"), "rtc signal refused");
+                stats.note_signal_over_budget();
+                return;
+            }
+        };
+        let admitted = {
+            // Synchronous, and released before anything else — the
+            // dispatch path holds no guard across an await.
+            let mut guard = budget.lock();
+            guard.admit(from_node, &msg, std::time::Instant::now())
+        };
+        if let super::rtc::SignalAdmit::Refused(e) = admitted {
+            tracing::debug!(error = %e, from = format!("{from_node:#x}"), "rtc signal over budget");
+            stats.note_signal_over_budget();
+            return;
+        }
+        stats.note_signal_delivered();
+        #[cfg(any(test, feature = "fixtures"))]
+        if let Some(tap) = ctx.rtc_signal_tap.as_ref() {
+            tap.lock().push((from_node, msg.clone()));
+        }
+        let Some(tx) = ctx.rtc_signal_tx.as_ref() else {
+            return;
+        };
+        if tx.try_send((from_node, msg)).is_err() {
+            // The engine is gone or saturated. Counted, like every
+            // other bounded input in this transport.
+            stats.note_signal_over_budget();
         }
     }
 

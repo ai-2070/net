@@ -29,6 +29,7 @@ mod config;
 mod driver;
 #[cfg(any(test, feature = "fixtures"))]
 mod loopback;
+mod signal;
 mod stats;
 mod stun;
 mod transport;
@@ -43,6 +44,10 @@ pub use driver::RtcTestHooks;
 pub use driver::{RtcDriver, RtcDriverHandle, RtcSignal};
 #[cfg(any(test, feature = "fixtures"))]
 pub use loopback::connect_rtc_loopback;
+pub use signal::{
+    RtcRejectReason, RtcSignalError, RtcSignalMsg, SignalAdmit, SignalBudget, BUDGET_WINDOW,
+    MAX_DIALOGS_PER_PEER, MAX_FRAMES_PER_WINDOW, MAX_SDP_BYTES, SUBPROTOCOL_RTC_SIGNAL,
+};
 pub use stats::RtcStats;
 pub use stun::{binding_response, is_binding_request, parse_xor_mapped_address, STUN_MAGIC_COOKIE};
 pub use transport::{RtcSubmitError, RtcTransport};

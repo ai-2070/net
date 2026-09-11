@@ -28,6 +28,12 @@ pub struct RtcStats {
     udp_conn_reset: AtomicU64,
     max_buffered: AtomicU64,
     retained: AtomicU64,
+    signal_over_budget: AtomicU64,
+    signal_forwarded: AtomicU64,
+    signal_delivered: AtomicU64,
+    ice_attempted: AtomicU64,
+    ice_direct: AtomicU64,
+    ice_relayed: AtomicU64,
 }
 
 macro_rules! counter {
@@ -102,6 +108,36 @@ impl RtcStats {
         validate_rejected,
         note_validate_rejected,
         "RTC datagrams `NetHeader::validate` rejected — S0c's silent 8 KiB black hole, now audible."
+    );
+    counter!(
+        signal_over_budget,
+        note_signal_over_budget,
+        "`0x0D02` frames refused by the per-sender dialog/frame budget. A silent drop here is indistinguishable from a peer that never signalled."
+    );
+    counter!(
+        signal_forwarded,
+        note_signal_forwarded,
+        "`0x0D02` frames this node forwarded for a pair it is relaying. Counted by `subprotocol_id`, which is cleartext AAD-authenticated header — the SDP is never read (plan §10)."
+    );
+    counter!(
+        signal_delivered,
+        note_signal_delivered,
+        "`0x0D02` frames delivered to this node's own signalling handler."
+    );
+    counter!(
+        ice_attempted,
+        note_ice_attempted,
+        "Direct-path attempts started from an `Offer` we sent or accepted (plan §10)."
+    );
+    counter!(
+        ice_direct,
+        note_ice_direct,
+        "Direct-path attempts that ended with an installed `PeerAddr::Rtc` endpoint."
+    );
+    counter!(
+        ice_relayed,
+        note_ice_relayed,
+        "Attempts where ICE never connected before `ice_deadline`; the routed session was simply never replaced."
     );
     counter!(
         udp_conn_reset,
