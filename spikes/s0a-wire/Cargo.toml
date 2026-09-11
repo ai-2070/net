@@ -1,0 +1,70 @@
+[package]
+name = "s0a-wire"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Throwaway S0a spike: the Net wire modules compiled for wasm32 with tokio cut out. Not a workspace member, not production code."
+
+# Deliberately NOT a member of the net/crates/net workspace, and no
+# path dependency on `net` — copying the source is the point of the
+# spike. `[workspace]` below stops cargo from walking up and adopting
+# an ancestor workspace.
+[workspace]
+
+[lib]
+# `cdylib` so the wasm artifact is a real linked module with the
+# crypto reachable from an exported symbol (see `wasm_wire_probe` in
+# src/lib.rs) rather than dead-stripped; `rlib` so the native test
+# target can link it.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# versions match net/crates/net/Cargo.lock
+bytes = "1.12.1"
+parking_lot = "0.12.5"
+crossbeam-queue = "0.3.14"
+dashmap = "6.2.1"
+blake2 = "0.11.0"
+# `route_hop.rs` verifies its 16-byte hop tag in constant time.
+subtle = "2.6.1"
+# Seven log sites in the copied code (crypto ×1, reliability ×1,
+# session ×3, route codec ×2). `tracing` is wasm32-clean and is what
+# the real `net-wire` will depend on; a local no-op shim would have
+# been a hidden stub. Recorded as a deviation from the brief's
+# dependency list in the report.
+tracing = "0.1.44"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ring = "0.17.14"
+snow = "0.10.0"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-time = "1.1.0"
+# snow WITHOUT default features. snow 0.10's `std` feature (part of
+# `default`) lists `ring/std`, which force-activates snow's optional
+# `ring` dependency — so a plain `snow = "0.10"` drags ring into the
+# wasm build no matter what this crate does. `default-resolver` +
+# `default-resolver-crypto` is the pure-Rust path.
+snow = { version = "0.10.0", default-features = false, features = [
+    "default-resolver",
+    "default-resolver-crypto",
+] }
+# Two getrandom majors are in the tree and BOTH have to be told about
+# the browser. 0.4 is what `net` itself depends on; 0.3 and 0.2 come
+# in under `ring` / `snow` / `curve25519-dalek`. Without these lines
+# the build stops at a `compile_error!` inside getrandom 0.2 —
+# nothing in the copied Net code is wrong. See the report.
+getrandom = { version = "0.3.4", features = ["wasm_js"] }
+getrandom_02 = { package = "getrandom", version = "0.2.17", features = ["js"] }
+# Packet AEAD for wasm32. 0.10.1 (aead 0.5, `AeadInPlace`) rather
+# than the 0.11 `net` pins: 0.11 moved to aead 0.6's `InOutBuf` API,
+# and 0.10.1 is already in the tree under snow's default resolver, so
+# picking it dedups instead of linking a second ChaCha20-Poly1305.
+chacha20poly1305 = "0.10.1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
