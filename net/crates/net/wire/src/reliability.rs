@@ -8,7 +8,12 @@ use bytes::Bytes;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+// Monotonic readings go through the `Clock` seam: `Instant` is
+// `std::time::Instant` natively and `web_time::Instant` on wasm32,
+// where `std::time::SystemClock::now()` compiles and then panics.
+use crate::clock::{Clock, Instant, SystemClock};
 
 use crate::protocol::{NackPayload, PacketFlags};
 
@@ -745,7 +750,7 @@ impl ReliabilityMode for ReliableStream {
         }
         self.pending.push_back(UnackedPacket {
             descriptor,
-            sent_at: Instant::now(),
+            sent_at: SystemClock::now(),
             retries: 0,
         });
     }
@@ -864,7 +869,7 @@ impl ReliabilityMode for ReliableStream {
                 if unacked.seq() == missing_seq && unacked.retries < self.max_retries {
                     retransmits.push(Arc::clone(&unacked.descriptor));
                     unacked.retries += 1;
-                    unacked.sent_at = Instant::now();
+                    unacked.sent_at = SystemClock::now();
                     break;
                 }
             }
@@ -879,7 +884,7 @@ impl ReliabilityMode for ReliableStream {
     }
 
     fn get_timed_out(&mut self) -> Vec<Arc<RetransmitDescriptor>> {
-        let now = Instant::now();
+        let now = SystemClock::now();
         let rto = self.rto;
         let max_retries = self.max_retries;
         let mut retransmits = Vec::new();
@@ -940,7 +945,7 @@ impl ReliabilityMode for ReliableStream {
         // packets (retries == 0) contribute RTT samples, and the
         // freshest such sample wins because we walk front-to-
         // back — same direction `retain` did pre-fix.
-        let now = Instant::now();
+        let now = SystemClock::now();
         let mut sample = None;
         let mut acked = 0usize;
         while let Some(front) = self.pending.front() {
@@ -1030,7 +1035,7 @@ impl ReliabilityMode for ReliableStream {
         // again. This is what kills the RTO flood: after one head
         // loss the window holds ONLY the genuinely missing packets,
         // so `get_timed_out` resends O(lost), not O(window).
-        let now = Instant::now();
+        let now = SystemClock::now();
         let mut sample: Option<Duration> = None;
         let mut sacked = 0usize;
         self.pending.retain(|unacked| {

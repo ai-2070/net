@@ -10,7 +10,10 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use std::time::Instant;
+// Monotonic readings go through the `Clock` seam (see
+// `crate::clock`): plain `std::time::SystemClock::now()` panics at
+// runtime on wasm32.
+use crate::clock::{Clock, Instant, SystemClock};
 
 use crate::event::StoredEvent;
 
@@ -795,7 +798,7 @@ impl NetSession {
     pub fn close_stream(&self, stream_id: u64) {
         if let Some((_, state)) = self.streams.remove(&stream_id) {
             state.deactivate();
-            self.recently_closed.insert(stream_id, Instant::now());
+            self.recently_closed.insert(stream_id, SystemClock::now());
         }
     }
 
@@ -841,7 +844,7 @@ impl NetSession {
         for sid in idle {
             if let Some((_, state)) = self.streams.remove(&sid) {
                 state.deactivate();
-                self.recently_closed.insert(sid, Instant::now());
+                self.recently_closed.insert(sid, SystemClock::now());
                 evicted += 1;
                 tracing::debug!(
                     stream_id = format!("{:#x}", sid),
@@ -879,7 +882,7 @@ impl NetSession {
                     match removed {
                         Some((_, state)) => {
                             state.deactivate();
-                            self.recently_closed.insert(sid, Instant::now());
+                            self.recently_closed.insert(sid, SystemClock::now());
                             evicted += 1;
                             tracing::warn!(
                                 stream_id = format!("{:#x}", sid),
@@ -2266,12 +2269,12 @@ mod tests {
 
         // Manually pre-populate `recently_closed` with entries
         // whose timestamps are well past the quarantine window.
-        let stale_inserted_at = Instant::now() - GRANT_QUARANTINE_WINDOW - Duration::from_secs(1);
+        let stale_inserted_at = SystemClock::now() - GRANT_QUARANTINE_WINDOW - Duration::from_secs(1);
         session.recently_closed.insert(0xAAAA, stale_inserted_at);
         session.recently_closed.insert(0xBBBB, stale_inserted_at);
 
         // Add a fresh entry that should NOT be swept yet.
-        session.recently_closed.insert(0xFEEDC0DE, Instant::now());
+        session.recently_closed.insert(0xFEEDC0DE, SystemClock::now());
 
         assert_eq!(session.recently_closed.len(), 3);
 
