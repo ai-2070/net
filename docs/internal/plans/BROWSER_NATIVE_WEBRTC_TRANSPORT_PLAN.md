@@ -59,7 +59,7 @@ authorization. Before Stage 1 may be authorized the plan must carry:
 | A | Send-path seam: UDP keeps its async/deadline/batching semantics; RTC uses bounded non-blocking admission; Stage 0 inventories the send and ingress paths and proposes the contract | §1, §2, Stage 0 (S0d), Stage 1 |
 | B | Pre-enrollment privileges — **CLOSED 2026-09-11: enrollment-gated.** Provisional sessions, action-level bootstrap allow-list, no pre-enrollment transit, session-bound promotion, provider authority unchanged; the PSK stated precisely, not as "public" | §5 Layer 0, §12, Open question 7 |
 | C | The routing-envelope codec is part of the portable wire inventory; S0a proves a routed round-trip | §7, Stage 0 (S0a) |
-| D | `str0m` pinned with `default-features = false, features = ["rust-crypto"]`; S0b proves it on supported native targets in both roles | §2, §Dependencies, Stage 0 (S0b) |
+| D | `str0m` pinned with `default-features = false, features = ["rust-crypto"]`; S0b proved both roles on it — **but it still compiles `aws-lc-sys` C via `dimpl`'s `rcgen` feature**; Stage 3 picks (a) accept, (b) per-platform provider, or (c) upstream fix before adding the dependency | §2, §Dependencies, Stage 0 (S0b) |
 
 Estimates are withdrawn, not doubled: Stage 0's outputs re-derive them
 (§Rough estimates).
@@ -451,7 +451,7 @@ instance, single-threaded, no shared locks:
   is preserved exactly: it belongs to the synchronous boundary.
 - **SCTP buffering is folded into admission, not bolted on after it.** The
   driver-published buffered-amount reading against
-  `RtcConfig::buffered_amount_advisory` (default 256 KiB) is an **input to
+  `RtcConfig::buffered_amount_advisory` is an **input to
   the admission decision** — consulted before `try_send` returns — so an
   over-buffered channel refuses at the same boundary a full queue does. It
   is advisory (see "Hard bound vs advisory reading" below); the hard bound
@@ -496,6 +496,50 @@ driver then handles actual SCTP acceptance, including `Ok(false)` after a
 passing advisory precheck, under the post-acceptance policy above. How the
 snapshot is factored (atomic, message, otherwise) is Stage 3's choice, not
 prescribed here.
+
+**What S0b established (`docs/internal/spikes/S0B_RTC_LOOP.md`, commit
+`4b4d9875f`; headless Chromium 149, str0m 0.23.1, both ICE roles, both
+directions, through the S0a `NetSession` on both ends):**
+
+- **str0m caps SCTP buffering at 128 KiB across all streams of one
+  `Rtc`** (`MAX_BUFFERED_ACROSS_STREAMS = 128 * 1024`, `sctp/mod.rs:30`,
+  not configurable). `Channel::write` returned `Ok(false)` at exactly
+  129 424 B buffered. So the earlier 256 KiB advisory default could never
+  fire; the advisory threshold must sit **below 128 KiB**, and several
+  channels on one `Rtc` would share one budget (untested — the spike ran
+  one channel per `Rtc`, which §3 already fixes as the design).
+- **Retention policy is not optional.** With the browser's event loop
+  blocked 3 s and 8 KB packets pushed: a drop-on-`Ok(false)` policy
+  silently lost 19 476 packets while reporting one admission refusal;
+  retain-and-retry turned the same workload into 2 343 admission refusals
+  and **zero** in-flight loss. Stage 3's policy is **retain-and-retry**:
+  a packet accepted at admission is retained until written or the channel
+  closes (249 discarded at close in the probe, counted). Loss then has one
+  named point — admission — plus terminal close.
+- **Staleness is real and bounded by one drain**: the published
+  `buffered_amount` lagged the true value by up to 8 089 B (mean 3 235 B),
+  i.e. about one packet. The reserved-bytes bound held throughout.
+- **The advisory is refreshed only when the driver writes to that peer.**
+  `Channel::buffered_amount` needs `&mut Rtc`, so an idle peer keeps
+  whatever it last published. Stage 3 specifies the refresh cadence (at
+  every drain for every peer with a non-empty queue, at minimum), not just
+  the factoring.
+- **One choke-point drain.** Two contract violations were hit while
+  writing the loop: returning from the pump after `Channel::write` without
+  draining (transmits sit until the next iteration — a ~5 ms latency
+  floor), and calling `Rtc::channel(cid)` twice around a
+  `buffered_amount` read. The driver gets a single `drain()` that every
+  mutation goes through.
+- **Windows `WSAECONNRESET` on UDP `recv_from`.** After a peer vanishes,
+  an ICMP port-unreachable makes the next `recv_from` on the shared RTC
+  socket fail with os error 10054 about a *different* peer. Treated as
+  fatal it kills every session on the socket. The driver swallows it and
+  counts it — the same per-packet-path treatment `spawn_receive_loop`
+  already gives `ConnectionReset` (`mesh.rs:24273–24304`). str0m's
+  `http-post` example does not handle it.
+- **Native-as-offerer worked**: no p2p asymmetry in str0m; the ~150 ms
+  extra open time was one additional signalling round trip in the spike's
+  HTTP shape, not the stack.
 
 **str0m's single-mutation invariant** (README, "The single-mutation
 invariant"): every mutation of an `Rtc` — `handle_input`, `Channel::write`,
@@ -718,6 +762,17 @@ credentialed ICE checks itself. Browsers get the anchor's `rtc_addr` as
 their `iceServers` entry from the invite (bootstrap) or, for other anchors,
 from announcements.
 
+**mDNS host candidates (S0b).** Chromium publishes host candidates as
+`<uuid>.local` names by default (`WebRtcHideLocalIpsWithMdns`);
+`Candidate::from_sdp_string` accepts them, but str0m has no mDNS resolver,
+so no pair forms from host candidates alone. The spike disabled the feature
+with a flag; production cannot. Stage 4 chooses among: the anchor accepting
+the **peer-reflexive** candidate str0m learns from the browser's inbound
+binding request, relying on the browser's **server-reflexive** candidates
+(gathered against the anchor's own STUN, §STUN above), or an mDNS client on
+the anchor. The first two need no new dependency and are the expected
+answer; the harness must run *without* the flag before Stage 4 exits.
+
 **Fallback and its limit.** When ICE fails for a pair whose *anchors are
 reachable*, the routed session from §5 Layer 2 is simply kept: the anchor
 forwards Noise-opaque packets, `TraversalStats.relay_fallbacks` and
@@ -739,8 +794,12 @@ pair failing, versus nothing at all reachable. If v1 cannot produce that
 evidence, it reports the timeout and says so.
 
 ICE-TCP passive candidates on anchors are the candidate future mechanism
-(str0m support to be verified in Stage 0) and are listed under deferred
-work, not promised.
+and are listed under deferred work, not promised. **S0b:** str0m 0.23.1
+constructs and accepts a passive TCP host candidate
+(`Candidate::builder().tcp().tcptype(TcpType::Passive)`;
+`str0m::net::{Protocol, TcpType}` are public), but as a sans-IO crate it
+leaves the TCP listener, RFC 4571 framing and connection lifecycle to the
+caller — not exercised end to end.
 
 "100 % of sessions established" is a Stage 6 exit criterion **only over
 pairs whose anchors are reachable**.
@@ -872,10 +931,10 @@ identity-rebind rules. Decision: **one node per origin, leader-elected**.
 Tabs contend for a Web Lock; the holder runs the node, others attach to it
 over `BroadcastChannel` / `MessagePort` and see the same API. On leader
 loss a new leader re-bootstraps with the same identity — a rebind, handled
-by the existing address-independent identity-binding path. (Running the
-node in a `SharedWorker` would be cleaner, but `RTCPeerConnection` is not
-available in worker contexts today; Stage 0 verifies current browser
-status.)
+by the existing address-independent identity-binding path. **S0b
+confirmed:** `RTCPeerConnection` is `ReferenceError: not defined` in both a
+dedicated `Worker` and a `SharedWorker` on Chromium 149 — the leaf's RTC
+driver is main-thread; the leader-elected design stands.
 
 **Leader lifecycle, to be specified in Stage 5** (Kyra, 2026-09-11). The
 dead leader owned every DataChannel; peers learn of it by ICE disconnect
@@ -1219,6 +1278,18 @@ lands, including the `heartbeat_api_drift_check` tripwire.
 - UDP behaviour with `webrtc` on is byte-for-byte the Stage 1 behaviour:
   `deliver_stream_packet`'s UDP arm, `bound_datagram_send` deadlines and
   the `sendmmsg` grouping are unchanged.
+- **Loss injection.** With `maxRetransmits: 0`, `reliability.rs` is the
+  only recovery mechanism, and S0b's round-trip never lost a packet so
+  the NACK/retransmit path never ran over a DataChannel. The harness
+  injects loss on the RTC path and asserts a `Reliability::Reliable`
+  stream completes and a fire-and-forget stream reports the loss.
+- **Retention policy is retain-and-retry** (§2, S0b): with a paused peer,
+  zero packets accepted at admission are lost before channel close; the
+  count discarded at close is reported. The advisory threshold is below
+  str0m's 128 KiB cap and its refresh cadence is asserted for an idle peer
+  with a non-empty queue.
+- The driver survives an injected `ConnectionReset` on the RTC socket
+  with every other session intact.
 - Every non-`Stream::send` outbound class (events, `0x0D02` signalling,
   forwarding, retransmission) has its stated pressure disposition asserted.
 - The §5 delivery sequence — routed → authenticated direct → forced direct
@@ -1247,9 +1318,15 @@ lands, including the `heartbeat_api_drift_check` tripwire.
   4 therefore delivers a browser-trusted certificate path (ACME or
   operator-supplied), an explicit cross-origin HTTP policy, and WebSocket
   `Origin` validation if trickling remains. CI must not hide deployment
-  failures behind certificate-ignore flags. A gather-complete single POST
-  (no WebSocket) is a valid simplification, decided on S0b's setup-latency
-  evidence, not by preference. **The browser bootstrap credential** of §5
+  failures behind certificate-ignore flags. **Trickle stays** (S0b:
+  offer-created → DataChannel-open, five runs each, one interface, no
+  STUN: trickle 20.8 / 22.5 / 22.7 ms min/median/max vs gather-complete
+  146.9 / 150.2 / 177.2 ms — 6.6× at the floor, worse once STUN gathering
+  is in the path). The WebSocket, or an equivalent trickle transport,
+  is a Stage 4 deliverable; a gather-complete POST is not offered. Stage 4
+  also answers the mDNS host-candidate question (§6) and its harness
+  runs Chromium without `--disable-features=WebRtcHideLocalIpsWithMdns`.
+  **The browser bootstrap credential** of §5
   Layer 0 — its encoding, minting path and expiry rules, reviewed as a new
   credential format, not as invite reuse; `Mesh::join` over a DataChannel
   session.
@@ -1377,7 +1454,8 @@ lands, including the `heartbeat_api_drift_check` tripwire.
   `serve_stun`, a pinned `rtc_addr`, invite minting), so that "deploy a
   browser-native Net app" means static assets plus one small always-on
   process. This is the answer to serverless-only hosting (§Non-goals).
-- ICE-TCP passive candidates on anchors (if S0b confirms str0m support).
+- ICE-TCP passive candidates on anchors (S0b: candidate constructible in
+  str0m; listener/framing/lifecycle are the caller's — still deferred).
 - DTLS-exporter shortcut (if S0c demands it).
 - Browser-side RedEX on IndexedDB (separate plan).
 
@@ -1520,19 +1598,33 @@ Stage 1 instantiates it; the choice is made when Stage 1 is authorized.
 ## Dependencies
 
 - `str0m` 0.23.1 — sans-IO WebRTC. Native, feature `webrtc` only. MSRV
-  1.85.0 (toolchain is 1.98.0), MIT OR Apache-2.0. **Pinned configuration**
-  (Kyra, 2026-09-11) — the crate's default features enable `aws-lc-rs` and
-  `examples`, which pull cmake/C (NASM on Windows) into the build:
+  1.85.0 (toolchain is 1.98.0), MIT OR Apache-2.0. **The pinned
+  configuration**
 
   ```toml
   str0m = { version = "0.23.1", optional = true, default-features = false, features = ["rust-crypto"] }
   ```
 
-  S0b proves this configuration on every supported native target;
-  dependency defaults do not get to make the decision. ICE-TCP support to
-  be confirmed in S0b. *(Still the current release: 0.23.1, 2026-08-21, per
-  docs.rs at 2026-09-11. A web search claiming 0.21.0 is the latest is
-  stale — trust the registry.)*
+  **does not exclude the C toolchain — the claim that it does is withdrawn
+  (S0b, 2026-09-11).** `str0m-rust-crypto` 0.6.0 → `dimpl` with features
+  `["rust-crypto", "rcgen"]`, and `dimpl`'s `rcgen` feature is
+  `["dep:rcgen", "aws-lc-rs"]` → `aws-lc-rs` 1.18.1 / `aws-lc-sys` 0.45.0
+  (`cargo tree -e features -i aws-lc-sys` in `spikes/s0b-rtc/native`). On
+  the Windows host that meant ~11 700 lines of `aws-lc-sys` build-script
+  output, C compiled by MSVC `cl.exe` (~40 s), and NASM absent — the build
+  survived only via `prebuilt-nasm`. The DTLS certificate generator
+  (`rcgen`) is the path that drags it in. **Stage 3 must pick one before
+  adding the dependency:** (a) accept `aws-lc-sys` as a build-time C
+  dependency behind the `webrtc` feature and document the host
+  requirements (cmake/MSVC or clang; NASM or prebuilt); (b) use a
+  per-platform provider (`wincrypto` / `apple-crypto` / `openssl`) so no
+  bundled C is compiled; (c) upstream a `dimpl` feature that generates the
+  self-signed DTLS certificate without `aws-lc-rs`. The `webrtc` feature is
+  off by default either way, so the default build stays C-free.
+  Everything else in S0b (DataChannel, both roles, DTLS, SCTP, ICE) ran on
+  this configuration. ICE-TCP: see §6. *(Still the current release: 0.23.1,
+  2026-08-21, per docs.rs at 2026-09-11. A web search claiming 0.21.0 is
+  the latest is stale — trust the registry.)*
 - `web-time` — `Instant` on wasm, `net-wire` on wasm32 only.
 - `getrandom` `wasm_js` — wasm32 only.
 - `wasm-bindgen`, `web-sys` (`RtcPeerConnection`, `RtcDataChannel`,
