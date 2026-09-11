@@ -121,9 +121,16 @@ files whose contents were split (`route.rs`, `transport.rs`):
 Three items had to widen from `pub(crate)` to `pub` because a crate
 boundary cannot express the old ceiling:
 `crypto::session_prefix_from_id`, `pool::PacketBuilder::new`,
-`stream::{Stream fields, ReliabilityMode::is_reliable}`. Only
-`PacketBuilder::new` carried a design invariant, and that invariant is
-now enforced solely by the drift check (§4).
+`stream::ReliabilityMode::is_reliable` (the `Stream` handle's fields
+were widened here too and reverted by R1, §9). `PacketBuilder::new`
+carried a design convention — production packet building goes through
+the session-owned pool path — and the relocated drift check is a
+**lexical guard over two core files** for that convention. *(Corrected
+after Kyra's review at `b6e522bb5`: the widening is not a newly
+established crypto vulnerability — equivalent raw-key constructors were
+already public and current zero-key production uses construct
+unencrypted handshake packets — and the drift check is not "whole
+enforcement" of nonce/key ownership.)*
 
 ## 4. Where each test module landed
 
@@ -294,18 +301,21 @@ python .github/scripts/check-ffi-exports.py
 4. **`PacketBuilder::new` is now `pub`.** `pub(crate)` cannot survive a
    crate split, and the brief's "no new abstractions" rules out a
    sealed-token dance. The doc comment records it and the drift check
-   is the enforcement — which is exactly why this stage added the
-   negative witness for it.
+   guards the two-file production convention lexically — which is why
+   this stage added the negative witness for it. Not a new crypto
+   exposure (see §3's correction).
 5. **The Clock seam went in as its own commit (`bb16dba76`), after the
    move.** The seam *files* landed with the crate; the 13 call sites
    did not, so for four commits the wire crate compiled for wasm32 and
    would have panicked there. Nothing shipped in that window, but it is
    the exact failure mode S0a warned about, and only the executed test
    made it visible.
-6. **The wasm test's fixture reader is hand-rolled.** `serde_json` is
-   not in the wasm dependency set, and adding it as a dev-dependency to
-   read six flat string fields would change what the test links. The
-   reader handles no escapes; the fixture is generated and has none.
+6. **The wasm test's fixture reader is hand-rolled.** *(Corrected after
+   Kyra's review: this is a choice, not a necessity — `serde_json` **is**
+   in the test graph as an unconditional dev-dependency and a
+   `wasm-bindgen-test` dependency, so the test graph is not JSON-free.
+   The hand-rolled reader keeps the wasm test's own link set minimal;
+   it handles no escapes and the fixture is generated and has none.)*
 7. **Noticed, not fixed:** S0a §5's two size levers (snow's
    `default-resolver-crypto` links AES-GCM/SHA-2/Blake2b that NKpsk0
    never uses; `dashmap`/`parking_lot_core`/`crossbeam-queue` exist for

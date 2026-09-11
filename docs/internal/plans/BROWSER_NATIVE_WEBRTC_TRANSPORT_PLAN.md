@@ -1563,6 +1563,54 @@ nonce/key-ownership enforcement; the wasm test graph is not JSON-free
 not lifecycle coverage; the duration-below-`u128::MAX` assertion does not
 prove monotonic ordering.
 
+**Repair candidate delivered: `614b1c636` (2026-09-11), awaiting Kyra's
+re-review.** One commit per repair (`512d808b2` R1, `3f22e5443` R2,
+`a0d8f2158` R3, `64b0256c9` R4, `b9b5d0536` R5) plus the §9 report;
+the submitted head adds this record and Kyra's non-blocking wording
+corrections to `S2_REPORT.md` §3/§7 and to S0d/S1 (`ee3cfaf18`).
+Reviewer re-ran on the Windows host at `614b1c636`:
+
+- **R1** — `Stream` lives in `adapter/net/stream_handle.rs` with private
+  fields, `pub(crate) fn new`, read-only accessors; three `compile_fail`
+  doctests (config write, epoch write, struct-literal forge) pass as
+  doctests (4 passed); two live-send witnesses over the real two-node
+  connect/accept path pass (fire-and-forget: unreliable on the wire and
+  nothing retained; reliable: `RELIABLE` on the wire and a descriptor
+  retained). `ffi/mesh.rs` tests use the crate constructor. Inherited,
+  not charged: the conflicting-config idempotent reopen.
+- **R2** — unit job runs `cargo test --locked -p net-mesh-wire
+  --features json` and a `MIN=196` count + exact-name roster guard (two
+  `should_panic` cases and one test per moved module). Reviewer: 206
+  passed (the ten `route.rs` codec tests moved with their code; core
+  `--lib` 5781 → 5773 = −10 codec + 2 R1 witnesses), roster names
+  present. Planted-failure demonstration recorded in §9 (exit 101,
+  reverted inside the commit).
+- **R3** — `rustup target add` runs from `net/crates/net` so the pinned
+  1.98.1 receives the target, with an installed-target assertion; the
+  deps gate checks host and wasm32 graphs. Reviewer: `rustup show
+  active-toolchain` = 1.98.1 (overridden by `rust-toolchain.toml`),
+  wasm32 installed, executed wasm tests 3 passed under Node, wasm-graph
+  forbidden-edge count 0.
+- **R4** — probe lockfile regenerated; reviewer: negative leg fails with
+  the intended `E0432 org_exact_sensing_bridge` (exit 101), positive
+  leg compiles.
+- **R5** — AEAD vector packaged inside the crate
+  (`src/test_vectors/aead_vector.json`, `net_wire::test_vectors::AEAD_VECTOR`
+  behind `test-vectors`); the core's `cross_lang_wire` reads the constant
+  and byte-checks the repository copy; the callee drift guard skips with
+  a printed reason only when no `.git` is found up the tree. Reviewer:
+  `cargo package` → unpacked `.crate` (23 files) compiles natively with
+  `json test-vectors` and for wasm32 `--all-targets --features
+  test-vectors`.
+- Sweep: `cargo test --locked --lib` 5773 passed; floors 93/24/62/41/60/68;
+  `cross_lang_wire` 8 passed; strict clippy pass; YAML + whitespace
+  clean; consumer diff since `10302333a` empty; fresh `net-ffi` release
+  rebuild → export checker 568/568.
+
+**Not verifiable here:** CI's own run of `wasm-wire`,
+`wasm-wire-no-native-deps`, the probe step and the wire-suite gate at
+the submitted head — CI is the arbiter.
+
 ## Stage 3 — Native `webrtc` feature: driver, dedicated socket, STUN, loopback harness
 
 - `adapter/net/rtc/{mod,driver,transport,stun,config}.rs`; `PeerAddr::Rtc`;
