@@ -158,6 +158,13 @@ The reverse holds on a Windows workstation: no local command compiles `#[cfg(uni
 
 This project has a CodeGraph knowledge graph index (`.codegraph/`). CodeGraph is a tree-sitter-parsed database of every symbol, edge, and file. Reads are sub-millisecond and return structural information grep cannot.
 
+### Access paths
+
+Two surfaces, one engine:
+
+- **MCP tool** — a harness wired to the codegraph MCP server (`codegraph serve --mcp`) exposes `codegraph_explore`; OMP registers it as `mcp__codegraph_explore` (route `xd://mcp__codegraph_explore`). Prefer it for the explore/trace question — identical output to the CLI with no shell round-trip. Only `explore` is exposed by default; `CODEGRAPH_MCP_TOOLS=explore,node,callers,callees,impact,search,status,files` widens the set.
+- **CLI** — always available, and the only way to reach the rest of the table below.
+
 ### CLI usage reference
 
 Verified against the installed CLI (`codegraph --help`); there is no `search`, `trace`, or `affected <symbol>` subcommand.
@@ -183,7 +190,7 @@ Verified against the installed CLI (`codegraph --help`); there is no `search`, `
 - **Use codegraph first** for structural questions (definitions, callers, callees, flows). It's faster and more accurate than grep.
 - **Trust codegraph results** — they come from a full AST parse. Do NOT re-verify with grep.
 - **Polyglot name collisions are the norm here**: one API exists as a Rust core fn, an FFI `net_mesh_*` shim, and Rust/TS/Python SDK methods, so `query` returns several definitions with the same name. Read the paths before picking one — `node -f <file>` disambiguates.
-- **When tracing a flow**, use `codegraph explore <query...>` — one call returns relevant symbols' source plus call paths. `node <symbol>` gives the caller/callee trail for a single hop-by-hop walk.
+- **When tracing a flow**, use `mcp__codegraph_explore` (or `codegraph explore <query...>`) — one call returns relevant symbols' source plus call paths. `node <symbol>` gives the caller/callee trail for a single hop-by-hop walk.
 - **Index lag**: the file watcher debounces ~500ms behind writes. If you get stale results, run `codegraph sync` first, or check `codegraph status`.
 
 ### If `.codegraph/` doesn't exist
