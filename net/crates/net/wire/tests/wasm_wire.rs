@@ -169,7 +169,10 @@ fn clock_reads_do_not_panic_on_wasm() {
 /// between native and browser nodes.
 #[wasm_bindgen_test]
 fn aead_golden_vector_matches_on_the_wasm_backend() {
-    const FIXTURE: &str = include_str!("../../tests/cross_lang_wire/aead_vector.json");
+    // The package's OWN copy. An `include_str!` reaching outside the
+    // package compiles in the repository and fails in an unpacked
+    // `cargo package` tarball — exactly the build a publish produces.
+    const FIXTURE: &str = net_wire::test_vectors::AEAD_VECTOR;
 
     let key: [u8; 32] = unhex(field(FIXTURE, "key_hex")).try_into().expect("key");
     let nonce: [u8; 12] = unhex(field(FIXTURE, "nonce_hex"))

@@ -23,6 +23,9 @@ default = []
 # `Serialize` impl. The core enables it — those are its callers; the
 # wasm32 build does not, so a browser leaf pays no serde_json.
 json = ["dep:serde", "dep:serde_json"]
+# The golden vectors, as constants inside the package. Tests only —
+# the wasm test target and the core's `cross_lang_wire` consumer.
+test-vectors = []
 
 [dependencies]
 # Versions track what the workspace already resolves (Cargo.lock);

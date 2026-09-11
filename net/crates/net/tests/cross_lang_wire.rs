@@ -166,7 +166,13 @@ fn stream_window_matches_the_fixture_bytes() {
 /// were built for different targets cannot talk.
 #[test]
 fn aead_golden_vector_matches_on_the_native_backend() {
-    let f = fixture("aead_vector.json");
+    // The wire crate owns the canonical copy (it has to: the wasm
+    // test cannot `include_str!` across a package boundary). The
+    // repository copy under `tests/cross_lang_wire/` is the mirror
+    // the other-language consumers this fixture set is shaped for
+    // would read, and is asserted byte-equal below.
+    let f: Value = serde_json::from_str(net_wire::test_vectors::AEAD_VECTOR)
+        .expect("the wire crate's AEAD vector must parse");
     let key: [u8; 32] = unhex(f["key_hex"].as_str().expect("key_hex"))
         .try_into()
         .expect("32-byte key");
@@ -226,5 +232,26 @@ fn capability_announcement_matches_the_fixture_bytes() {
         serde_json::from_str::<Value>(bytes).expect("bytes_utf8 parses"),
         f["json"],
         "fixture's `json` and `bytes_utf8` disagree"
+    );
+}
+
+/// The repository mirror and the package-owned constant are the same
+/// bytes.
+///
+/// Repository-only by nature — it reads a checkout path. Its job is
+/// to stop the two copies from drifting: the wasm test and the
+/// vector test above both assert against the constant, while the
+/// JSON under `tests/cross_lang_wire/` is what a Go / TypeScript /
+/// Python consumer would read.
+#[test]
+fn the_repository_aead_fixture_mirrors_the_package_constant() {
+    let on_disk = std::fs::read_to_string("tests/cross_lang_wire/aead_vector.json")
+        .expect("repository copy must exist in a checkout");
+    assert_eq!(
+        on_disk,
+        net_wire::test_vectors::AEAD_VECTOR,
+        "tests/cross_lang_wire/aead_vector.json has drifted from \
+         net_wire::test_vectors::AEAD_VECTOR — the wire crate owns the \
+         canonical copy; regenerate the mirror from it"
     );
 }

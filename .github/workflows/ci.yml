@@ -4407,7 +4407,10 @@ jobs:
           CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
         run: |
           set -o pipefail
-          out=$(cargo test -p net-mesh-wire --target wasm32-unknown-unknown 2>&1 | tee /dev/stderr)
+          # `test-vectors` carries the package-owned AEAD golden
+          # vector the wasm test replays; the check/clippy steps above
+          # deliberately stay featureless.
+          out=$(cargo test -p net-mesh-wire --target wasm32-unknown-unknown --features test-vectors 2>&1 | tee /dev/stderr)
           for t in routed_round_trip_runs_on_wasm \
                    clock_reads_do_not_panic_on_wasm \
                    aead_golden_vector_matches_on_the_wasm_backend; do

@@ -201,14 +201,43 @@ fn mesh_rs_production_callers_match_allowlist() {
 /// `build_heartbeat` in `net-mesh-wire` would otherwise leave the
 /// allowlist asserting about a method that no longer exists, and the
 /// tripwire would pass vacuously.
+///
+/// **Repository-only, and says so.** `wire/src/session.rs` is a
+/// sibling path in this workspace; for a consumer who took
+/// `net-mesh` from the registry, the wire crate is a versioned
+/// dependency unpacked somewhere else entirely and the path does not
+/// exist. Rather than fail there (a guard that breaks other people's
+/// builds) or pass silently (a guard that is inert exactly where no
+/// one is looking), the test detects a checkout by the workspace
+/// root's `.git` and **prints why it skipped** otherwise. CI is
+/// always a checkout, so the guard never goes vacuous where it
+/// matters.
 #[test]
 fn wire_session_still_defines_the_heartbeat_helper() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("wire")
-        .join("src")
-        .join("session.rs");
-    let src = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("net-mesh-wire session.rs must be readable at {path:?}: {e}"));
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let path = manifest_dir.join("wire").join("src").join("session.rs");
+
+    // `.git` is a directory in a normal clone and a file in a
+    // worktree or submodule; `exists()` covers both.
+    let in_checkout = manifest_dir
+        .ancestors()
+        .any(|dir| dir.join(".git").exists());
+    if !in_checkout {
+        println!(
+            "SKIPPED wire_session_still_defines_the_heartbeat_helper: no repository \
+             checkout above {manifest_dir:?}, so the sibling path {path:?} is not the \
+             wire crate this build links (a registry dependency is unpacked elsewhere). \
+             This guard is enforced in CI, which is always a checkout."
+        );
+        return;
+    }
+
+    let src = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "this IS a repository checkout, so net-mesh-wire's session.rs must be \
+             readable at {path:?}: {e}"
+        )
+    });
     assert!(
         src.contains("pub fn build_heartbeat(&self)"),
         "net-mesh-wire's NetSession must still define `build_heartbeat`; the \

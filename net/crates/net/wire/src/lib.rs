@@ -29,6 +29,9 @@
 //!   [`clock::Clock`].
 //! - [`event`] — `StoredEvent`, the element of the session's inbound
 //!   queue.
+//! - `test_vectors` (feature `test-vectors`) — the golden vectors the
+//!   crate's own tests and the core's `cross_lang_wire` test share,
+//!   carried inside the package so an unpacked `.crate` still builds.
 //!
 //! What is deliberately **not** here: sockets, tokio, the route table,
 //! the mesh node, the submission surface (`PeerSink`). This crate has
@@ -51,6 +54,8 @@ pub mod route_codec;
 pub mod route_hop;
 pub mod session;
 pub mod stream;
+#[cfg(feature = "test-vectors")]
+pub mod test_vectors;
 pub mod time;
 
 pub use peer_addr::PeerAddr;
