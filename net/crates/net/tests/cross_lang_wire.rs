@@ -235,6 +235,78 @@ fn capability_announcement_matches_the_fixture_bytes() {
     );
 }
 
+/// Stage 4a: the same announcement **with** the three browser-leaf
+/// fields. Pinned so a cross-language reader sees the exact key
+/// names, order and encodings — `noise_pubkey` as a 32-element byte
+/// array, `rtc_addr` as a `host:port` string.
+#[test]
+fn the_rtc_announcement_fixture_round_trips_and_keeps_field_order() {
+    let f = fixture("capability_announcement_rtc.json");
+    let bytes = f["bytes_utf8"].as_str().expect("bytes_utf8");
+
+    let decoded =
+        CapabilityAnnouncement::from_bytes(bytes.as_bytes()).expect("pinned RTC form decodes");
+    assert_eq!(decoded.noise_pubkey, Some([0x11u8; 32]));
+    assert_eq!(
+        decoded.rtc_bootstrap.as_deref(),
+        Some("https://anchor.example/rtc")
+    );
+    assert_eq!(
+        decoded.rtc_addr,
+        Some("198.51.100.7:4433".parse().expect("addr"))
+    );
+
+    let re_encoded = String::from_utf8(decoded.to_bytes()).expect("UTF-8 JSON");
+    assert_eq!(
+        re_encoded, bytes,
+        "the RTC announcement encoding drifted from the pinned JSON"
+    );
+}
+
+/// …and the same announcement with all three **absent** produces
+/// exactly the pre-Stage-4 pinned bytes. This is the wire-compat
+/// claim: a node that does not configure RTC is invisible to Stage
+/// 4a, signature included.
+#[test]
+fn dropping_the_rtc_fields_reproduces_the_pre_stage4_announcement_bytes() {
+    let with_rtc = fixture("capability_announcement_rtc.json");
+    let mut ann = CapabilityAnnouncement::from_bytes(
+        with_rtc["bytes_utf8"]
+            .as_str()
+            .expect("bytes_utf8")
+            .as_bytes(),
+    )
+    .expect("decodes");
+    ann.noise_pubkey = None;
+    ann.rtc_bootstrap = None;
+    ann.rtc_addr = None;
+
+    let plain = fixture("capability_announcement.json");
+    let expected = plain["bytes_utf8"].as_str().expect("bytes_utf8");
+    assert_eq!(
+        String::from_utf8(ann.to_bytes()).expect("UTF-8"),
+        expected,
+        "with the three fields cleared the encoding must be byte-identical to \
+         the pre-Stage-4 fixture"
+    );
+    // …and the signed transcript follows, because the canonical
+    // signer emits exactly this document with `signature` and
+    // `hop_count` omitted: sign the cleared announcement and verify
+    // it through the same path a pre-Stage-4 peer would.
+    let keypair = net::adapter::net::EntityKeypair::generate();
+    let mut signed = ann.clone();
+    signed.entity_id = keypair.entity_id().clone();
+    signed.sign(&keypair);
+    signed.verify().expect("the cleared form verifies");
+    let mut with_field_back = signed.clone();
+    with_field_back.noise_pubkey = Some([0x11; 32]);
+    assert!(
+        with_field_back.verify().is_err(),
+        "re-adding a Stage 4 field after signing must break verification — \
+         proof the field is inside the transcript, not beside it"
+    );
+}
+
 /// The repository mirror and the package-owned constant are the same
 /// bytes.
 ///

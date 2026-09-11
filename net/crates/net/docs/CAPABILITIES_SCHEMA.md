@@ -235,3 +235,25 @@ The `examples/gen_schema_*` binaries do not exist in the substrate today; runnin
 - [`plans/CAPABILITY_ENHANCEMENTS_PLAN.md`](../../../../docs/internal/plans/CAPABILITY_ENHANCEMENTS_PLAN.md) Phase 2 — the schema layer this doc anchors.
 - [`plans/CAPABILITY_SYSTEM_SDK_PLAN.md`](../../../../docs/internal/plans/CAPABILITY_SYSTEM_SDK_PLAN.md) §10 + Phase 9a — per-binding generators that read this doc.
 - [`BEHAVIOR.md`](BEHAVIOR.md) — overall behavior plane this lives in.
+
+## Announcement fields for the RTC transport (Stage 4a)
+
+Three optional fields on `CapabilityAnnouncement`, all with the
+`reflex_addr` wire-compat treatment (`#[serde(default,
+skip_serializing_if = "Option::is_none")]`) and all inside the signed
+transcript. An announcement that sets none of them is byte-identical
+to the pre-Stage-4 form, signature included.
+
+| Field | Type | Emitted when | Meaning |
+|---|---|---|---|
+| `noise_pubkey` | `Option<[u8; 32]>` | `MeshNodeConfig::rtc.is_some()` | The announcer's Noise static (X25519) public key. Key *discovery*, authenticated by the announcement's Ed25519 signature — it retires the out-of-band pubkey handoff `connect()` demands. |
+| `rtc_bootstrap` | `Option<String>` | `RtcConfig::serve_bootstrap` | The anchor's bootstrap URL, where a browser posts its first SDP offer. The listener that answers it is Stage 4b; advertising a URL nobody serves is why emission is tied to `serve_bootstrap`. |
+| `rtc_addr` | `Option<SocketAddr>` | `RtcConfig::public_addr.is_some()` | The announcer's public RTC/STUN socket (UDP). A node that has not been told its public address does not guess one; browsers omit it. |
+
+Tags in the same stage:
+
+| Tag | Set when | Read as |
+|---|---|---|
+| `transport:rtc` | `MeshNodeConfig::rtc.is_some()` | The peer can take a DataChannel; the traversal classifier returns `PairAction::Ice` for it rather than planning a punch. |
+| `rtc-anchor` | `RtcConfig::serve_bootstrap` | The peer serves the bootstrap endpoint named by `rtc_bootstrap`. |
+| `leaf` | Stage 5 (browser leaves) | Never a forwarding next hop and never re-flooded to. Stage 4 only reads it. |

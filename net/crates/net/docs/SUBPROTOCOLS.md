@@ -26,9 +26,20 @@ Every Net packet carries a `subprotocol_id: u16` identifying how the payload sho
 | `0x0C00` | Capability announcement |
 | `0x0D00` | NAT-traversal reflex |
 | `0x0D01` | NAT-traversal rendezvous |
+| `0x0D02` | RTC signalling (`RtcSignalMsg`: Offer / Answer / Candidate / Reject) — `webrtc` feature |
+| `0x0D03` | *Reserved* — port-mapping metadata (not allocated) |
 | `0x0E00` | RedEX Distributed replication |
 | `0x1000..0xEFFF` | Vendor / third-party |
 | `0xF000..0xFFFF` | Experimental / ephemeral |
+
+> **`0x0D02` is RTC signalling** (`BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md`
+> §5 Layer 3). It carries postcard-encoded `RtcSignalMsg` frames on an
+> already-authenticated session: origin and target are the session
+> endpoints, never wire fields, and the SDP is opaque to every relay that
+> forwards it. Dispatched only when the `webrtc` feature is compiled in.
+> `traversal/mod.rs` previously carried a comment-only reservation of
+> `0x0D02` for port-mapping metadata that was never allocated and never
+> appeared in this table; port-mapping now reserves **`0x0D03`** instead.
 
 > **`0x0601` was reclaimed.** Handshake relay originally consumed a
 > subprotocol ID. It no longer does: a relayed Noise NKpsk0 handshake rides as
