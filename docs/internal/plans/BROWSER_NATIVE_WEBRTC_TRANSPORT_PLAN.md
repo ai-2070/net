@@ -49,6 +49,16 @@ broad refactor. Stages 1–6 are **not** implementation-ready and are not
 authorized by this document. Neither a resolved question list nor a clean
 exit gate is implementation proof.
 
+**Stage 0 executed and complete (2026-09-11)** — five outputs, each
+reproduced by the reviewer before acceptance: S0a `4a95691d4`, S0b
+`4b4d9875f`, S0c `80fbe57bf`, S0d + S0e `1a0504131`. Evidence is folded
+into §Context, §1, §2, §3, §4, §6, §7, §8, §12, Stages 2–4, §Rough
+estimates and §Dependencies, each marked "What S0x established" or
+"(S0x)". The four pre-Stage-1 decisions (A–D below) now rest on measured
+evidence; decision D's dependency claim was withdrawn by S0b and reopened
+as a Stage 3 choice. **Stage 1 remains unauthorized**; the Stage 1
+authorization review has everything it asked for.
+
 **Revision 3 (2026-09-11) — Fable's source-checked review of revision 2,
 dispositions by Kyra.** Four repairs were accepted as *pre-Stage-1
 decisions*; none overturns the architecture and none widens the
@@ -398,10 +408,62 @@ admission contract:
 - RTC uses bounded, non-blocking queue admission (§2).
 - The scheduler drain distinguishes UDP batches from RTC submissions.
 
-Sequencing: Stage 0 (S0d) produces the send-path and ingress-path
-inventory and the proposed contract; Stage 1 implements only the
-UDP-preserving preparation; Stage 3 adds the RTC behaviour. That keeps the
-staging boundary real.
+**What S0d established (`docs/internal/spikes/S0D_SEND_INGRESS_INVENTORY.md`,
+commit `1a0504131`, read at `4b52454a1`):**
+
+- **49 production call sites, not ~30/36.** The list above is stale in
+  both directions at that head: it misses the three `try_send_to` shed
+  sites (`:24568`, `:24751`, `:25057`), `:33706`, `:33726`, `:33958`,
+  `:33992`, `:34054`, `:40747`, the five `send_datagram` funnel callers
+  (`:28302`, `:28323`, `:33389`, `:33443`, `:35820`), and
+  `router.rs:895` (`route_packet`'s `enqueue` — where a
+  `RouteEntry::next_hop` becomes a `QueuedPacket::dest`). Plus 7
+  primitive fns. The inventory's table, not this paragraph, is Stage 1's
+  checklist.
+- **Exactly three blocking shapes**, so the UDP seam has three entry
+  points and collapsing them would change behaviour: awaited
+  (`send`, 42 rows incl. 25 fire-and-forget), awaited under a caller
+  deadline (`send_bounded`, 3 rows — and `:6797`/`:6806` use the
+  org-egress queue's own deadline, only `:9317` uses
+  `DATAGRAM_SEND_DEADLINE = 5 s`, correcting the citation above), and
+  synchronous non-blocking shed (`try_send`, 3 rows whose comments
+  reject queuing). 14 rows spawn a task around the send; the seam must
+  preserve that structure, including the rollback guard that travels
+  into the task at `:25462–25477`.
+- **The `PeerAddr` leak surface is 10 rows**, not the 49 mechanical
+  sites: 5 destinations derived from `RouteEntry::next_hop`
+  (`:24699`, `:25213`, `:35497`, `router.rs:889`, the routed-forward
+  lookup feeding the drain), 5 from a packet source (`:25217`, `:25902`,
+  `:40747`, `mod.rs:1138`, `pending_direct_initiators` keyed at `:679`).
+  Those pull `PeerAddr` into `route.rs`, and `reroute.rs` / `failure.rs`
+  follow. Reflex/traversal (2 rows) and `config.peer_addr` (1 row) stay
+  `SocketAddr`.
+- **`proxy.rs` is a separate forwarder with its own route table**; the
+  plan never said whether it participates in `PeerAddr`. Stage 1 decides
+  explicitly: in scope, or frozen UDP-only.
+- **Guard-across-await audit: expected zero, found zero** at that head —
+  by reading, enforced by one witness
+  (`org_routing_wiring_tests.rs:7807`) for two funnels only. No
+  mechanical check prevents a new site from reintroducing it.
+- `transport.rs`'s connected-socket `send()` variants (`:265`, `:705`)
+  have no production caller and can be dropped rather than generalized.
+- **Two rows resist a single class**: `handle_routed_handshake`'s msg2
+  (destination is a route entry *or* the packet source, chosen at
+  runtime, `:25213–25217`) and `try_publish_to_peer` (`:35497`), which is
+  the transport for every nRPC frame, so its RTC disposition governs far
+  more than channel fan-out.
+
+Sequencing: Stage 0 (S0d) has produced the send-path and ingress-path
+inventory and the proposed contract (`S0D_SEND_INGRESS_INVENTORY.md` §3:
+`PeerSink::{send, try_send, send_bounded}` for UDP; `try_send(.., RtcPeerId)`
+for RTC; a partitioned scheduler drain; a bounded third `IngressReceiver`
+variant). Stage 1 implements only the UDP-preserving preparation; Stage 3
+adds the RTC behaviour. That keeps the staging boundary real. **S0d's
+Stage 1 exit criterion, stated as a property of its table:** after the
+edit every row's blocking, error-mapping and batching column is
+unchanged and no row's guard column becomes `yes` — `deliver_stream_packet`
+still maps failure to `StreamError::Transport` and the scheduler enqueue is
+still the only `Backpressure` producer.
 
 ### 2. `str0m` behind a single owning driver task with a bounded, non-blocking send contract
 
@@ -1119,6 +1181,75 @@ bootstrap-serving anchor**, or supplied through an explicit
 operator-controlled backend; a remote enrollment deployment is never solved
 by giving provisional browsers arbitrary transit.
 
+**What S0e established (`docs/internal/spikes/S0E_BOOTSTRAP_FRAMES.md`,
+commit `1a0504131`).** The frame table has 14 rows; rows 1–9 are required
+(routed handshake msg1/msg2; reply-channel `0x0A00` Subscribe + Ack; nRPC
+REQUEST / RESPONSE / CANCEL for `net.mesh.enroll`; `0x0B00` grants for the
+two bootstrap streams; NACK/retransmit on them), rows 10–14 incidental
+(heartbeat — permitted as maintenance; pingwave; periodic capability
+re-announce; a corrective re-announce; fold/sensing/migration/
+withdrawal/`0x0D02`). The allow-list Stage 4 enforces is S0e §2, verbatim;
+the points that shape it:
+
+- **The sharpest finding:** a rejected reply-channel Subscribe fires a
+  **rate-limit-bypassing corrective capability re-announce**
+  (`mesh_rpc.rs:5842–5870`, rationale `mesh.rs:29577–29581`). Left in
+  place it hands an unenrolled browser a mesh-wide flood trigger, one per
+  refused Subscribe. Removed from the provisional path.
+- The reply-channel Subscribe is fire-and-forget UDP retried up to
+  `membership_max_attempts` times **reusing one nonce**
+  (`mesh.rs:29695–29703`); the anchor's dedupe (`:29791`) makes that safe.
+  So the bound is "≤ N frames sharing one nonce", never "exactly one
+  frame" — a naive bound breaks the flow on the first dropped datagram.
+- The enrollment REQUEST is a generic `publish_to_peer` payload whose
+  service name lives **inside the nRPC envelope**
+  (`RpcRequestPayload.service`, `mesh_rpc.rs:5374–5380`) behind a
+  channel-hash discriminator. §12 step 3 therefore means decoding the
+  nRPC envelope under strict bounds *before* admission is decided — the
+  check cannot be a header test. A real cost, now named.
+- `0x0B00` is required-but-conditional: a single `JoinRequest` fits the
+  default window (`open_stream_with`, `mesh.rs:35421`; credit charged at
+  `:35429–35433`), but a larger payload or response makes a grant
+  load-bearing, so the two bootstrap streams get `0x0B00` regardless.
+- Heartbeat (`:27554`, permitted) and pingwave (`:27556`, denied) are
+  emitted two lines apart in one loop body; the provisional check splits
+  the statements, not the loop.
+- The allow-list is about **what the anchor accepts**, never what the
+  device sends: `Mesh::join` requires a started node, and `start_arc`
+  spawns seven loops (`mesh.rs:22389–22410`, `:22524`), three of which
+  emit traffic unrelated to enrollment.
+- **The attack is one `if` away today.** `connect_via`'s `relay_addr`
+  and `dest_node_id` are independent parameters (`mesh.rs:39514`); `join`
+  happens to pass the same anchor for both, which is what makes
+  local delivery true (`RoutingHeader::new(dest_node_id, …)` at `:39562`,
+  `dest_id == local_node_id` branch at `:24614`). Nothing enforces it — a
+  provisional peer calling the same path with a third-party `dest_node_id`
+  reaches the F1 forwarding branch unchecked.
+- **Seven forwarding sites need the adjacent-session admission check
+  (F1–F7):** `dispatch_packet`'s non-local arm (`:24675–24757`, forward
+  `:24751`); `relay_protected_hop` (`:24860`, `:25057`);
+  `Router::route_packet` (`router.rs:769` → `:895`); the pingwave
+  re-flood (`:24568`); `forward_scoped_announcement` /
+  `forward_capability_announcement` (`:33389`, `:33443`);
+  `forward_punch_ack` / rendezvous introduce (`:34104`, `:33706`,
+  `:33726`); `proxy.rs:349`. None has an admission gate today. F1 keeps
+  its `dest_id == local_node_id` test *above* the admission check so the
+  enrollment envelope is delivered, not refused.
+- Route installation from the routed handshake (`:25460–25477`,
+  `registered_next_hop: source`) is the concrete site where "a provisional
+  peer must not become a routing participant" lands: install the
+  session, withhold routing/discovery until admitted.
+- Renewal is `RENEWAL_SERVICE = "net.mesh.renew"`
+  (`sdk/src/mesh_enroll.rs:42`), runs on an admitted session, and is not
+  on the provisional list. `net.mesh.enroll` has no method dimension
+  (`serve_rpc_typed(service, codec, handler)`, `:175`): `(service, unary)`
+  is the whole identity; finer granularity is Stage 4's to add.
+- Whole-session bounds proposed by S0e (Stage 4 may tighten, not loosen):
+  provisional state expires 30 s after the handshake; ≤ 256 inbound
+  frames; ≤ 256 KiB inbound; ≤ 2 streams; ≤ 1 channel membership;
+  ≤ 1 in-flight enrollment call, ≤ 4 REQUEST frames, body ≤ 16 KiB; on
+  breach close and reclaim.
+
 **Enrollment enables eligibility, not unrestricted authority.** After
 enrollment the session becomes eligible for the anchor's configured,
 bounded services — announcement handling, discovery, signalling,
@@ -1202,24 +1333,43 @@ Stage 1's authorization and the re-estimate depend on.
   constrained, not allowed). Output: the action-level allow-list Stage 4
   enforces.
 
-### Exit criteria
+### Exit criteria — **MET 2026-09-11**
 
-- All five outputs written up; §2's RTC submission contract, §1's send
-  seam, §7's type list and §12's allow-list finalized from them.
-- Estimates for Stages 1–6 re-derived from the outputs (§Rough estimates).
-- No repository code outside `docs/` and a `spikes/` scratch directory
-  changed.
+- All five outputs written up: S0a `4a95691d4`
+  (`docs/internal/spikes/S0A_WIRE_BOUNDARY.md`), S0b `4b4d9875f`
+  (`S0B_RTC_LOOP.md`), S0c `80fbe57bf`
+  (`docs/internal/performance/WEBRTC_DOUBLE_AEAD.md`), S0d + S0e
+  `1a0504131` (`S0D_SEND_INGRESS_INVENTORY.md`, `S0E_BOOTSTRAP_FRAMES.md`).
+  Each was reproduced by the reviewer before acceptance (S0a test +
+  wasm check + size; S0b `run.ps1` + `cargo tree` + str0m source; S0c
+  `run.ps1 -Bench` 27/27 cells; S0d/S0e citations spot-checked at
+  `mesh.rs:39562`, `:24568`, `:29695–29703`, `:35421`, `router.rs:895`).
+- §2's RTC submission contract, §1's send seam, §7's type list and §12's
+  allow-list are finalized from them (folded into those sections).
+- Sizing inputs for Stages 1–6 recorded (§Rough estimates); day figures
+  are the Stage 1 authorization review's to set.
+- No repository code outside `docs/` and `spikes/` changed
+  (`git diff --stat 4b52454a1..1a0504131`).
+
+**Stage 0 is complete. Stage 1 is not authorized by this document.**
 
 ## Stage 1 — `PeerAddr` endpoint generalization (UDP-only, behaviour-neutral)
 
 Generalize `PeerTransport` and every peer-keyed site listed in §Context to
 `PeerAddr`, and introduce the send seam of §1 in its **UDP-preserving**
-form only: every raw `socket.send_to` site and the scheduler drain submit
-through the generalized endpoint with their current async behaviour,
-deadlines, error mapping and batching intact. Only the `Udp` variant
-exists; no feature flag yet; no RTC behaviour. Traversal modules keep
-`SocketAddr` at their edges. Nothing from Open question 7 (pre-enrollment
-admission) lands here — this stage is behaviour-neutral by definition.
+form only: the 49 production call sites and 7 primitives in
+`S0D_SEND_INGRESS_INVENTORY.md` §1 submit through
+`PeerSink::{send, try_send, send_bounded}` with their current async
+behaviour, deadlines, error mapping and batching intact; the 10 leak rows
+of S0d §3.5 carry `PeerAddr` into `route.rs` / `reroute.rs` /
+`failure.rs`; the scheduler drain partitions by `PeerAddr` variant with
+only the `Udp` arm live. Only the `Udp` variant exists; no feature flag
+yet; no RTC behaviour. Traversal modules keep `SocketAddr` at their
+edges. **Decide `proxy.rs`** (in scope or frozen UDP-only) before the
+first edit. Nothing from §12 (pre-enrollment admission) lands here — this
+stage is behaviour-neutral by definition. Whether `net-wire` (Stage 2)
+follows or the wire types take a peer-endpoint type parameter is decided
+here too (§Rough estimates, sequencing).
 
 ### Exit criteria
 
@@ -1612,6 +1762,18 @@ send/ingress inventory, the dependency build results and the browser
 harness evidence; Stages 1–6 are re-estimated from those outputs, and the
 re-derived table replaces this section.
 
+**Sizing inputs from Stage 0 (2026-09-11), for the Stage 1 authorization
+review to turn into figures:**
+
+| Stage | Inputs now known |
+|---|---|
+| 1 | 49 send sites + 7 primitives across 3 blocking shapes; 10 `PeerAddr` leak rows into `route.rs`/`reroute.rs`/`failure.rs`; scheduler drain partition; `proxy.rs` decision; witness floors 93/24/62/41/60/67 re-exercised; exported-symbol baseline job |
+| 2 | 8 named items + `route_hop.rs` (1 005 lines) + `ParsedPacket` + coarse clock + `StoredEvent`; AEAD backend seam; 13 `Clock` sites; ≥ 7 `#[cfg(test)]` modules to relocate incl. the drift-check tripwire; wasm check + executed wasm test jobs; cross-backend AEAD vector; the Stage 1 dependency |
+| 3 | driver with single `drain()`; retain-and-retry retention; advisory < 128 KiB with a refresh cadence; `ConnectionReset` swallow; `validate()` counter; loss injection; the `aws-lc-sys` decision (a/b/c); STUN responder; loopback harness re-running witness files |
+| 4 | three canonical-signer fields; `0x0D02`; bootstrap listener with browser-trusted TLS + CORS + WS `Origin` + trickle; mDNS answer; the credential format; **§12 admission contract at F1–F7 plus the allow-list with nRPC-envelope decode before admission**; six §12 witnesses |
+| 5 | leaf crate + wrapper; main-thread RTC driver (no worker); leader lifecycle + follower proxy; batch-per-packet event path; fragment at `MAX_PAYLOAD_SIZE`; Playwright runner; `ControlPlane` trait + anchorless mock |
+| 6 | §9 end to end; NAT simulator extension (green run first); telemetry; demo |
+
 Sequencing that survives the withdrawal: Stage 0 gates the trait and type
 decisions; Stage 5 can start against the Stage 3 harness before Stage 4
 completes. **Corrected by S0a:** Stages 1 and 2 are *not* independent —
@@ -1902,3 +2064,17 @@ from `PeerTransport`, no pre-enrollment relay, session-bound promotion,
 eligibility-not-authority, six witnesses), §11 registry row, S0e bootstrap
 frame inventory, Stage 4 scope + exit criteria, Critical files. Boundary
 unchanged: Stage 0 only.
+
+**2026-09-11 — Stage 0 executed (Opus 5 implementing agent; Fable
+reviewing).** Four slices, each briefed in `spikes/S0*_BRIEF.md`, each
+reviewed by reproduction before acceptance:
+
+| Slice | Commit | Reproduced | Plan corrections it forced |
+|---|---|---|---|
+| S0a wire boundary | `4a95691d4` | `cargo test` (2 pass), `cargo check --target wasm32`, wasm 576 461 B / 160 694 B gz | `ring` needs a wasm32 clang → AEAD backend seam; all of `route_hop.rs` moves; `ParsedPacket`, coarse clock, `StoredEvent`, `tracing` come along; `Instant::now()` panics at runtime on wasm32 → executed wasm test; `NetSession::peer_addr` is `SocketAddr` → Stages 1 and 2 not independent; `heartbeat_api_drift_check` must be relocated |
+| S0b RTC loop | `4b4d9875f` | `run.ps1` → `[run] OK`, four verdict lines both roles/directions; `cargo tree -i aws-lc-sys`; str0m `sctp/mod.rs:30` | `rust-crypto` pin still compiles `aws-lc-sys` via `dimpl`/`rcgen` (claim withdrawn; Stage 3 picks a/b/c); 128 KiB hard SCTP cap → advisory below it; retain-and-retry (drop policy silently lost 19 476 packets); advisory refresh cadence; single `drain()`; Windows `WSAECONNRESET` swallow; mDNS host candidates need a Stage 4 answer; trickle stays (22 ms vs 150 ms); no `RTCPeerConnection` in workers; loss-injection and reset-survival exit criteria |
+| S0c double-AEAD | `80fbe57bf` | `run.ps1 -Bench` 27/27 cells, same deltas | exporter stays deferred (+3.5 µs/1 KiB pkt hot, +0.21 ms/s at 60 Hz, +3–4.5 ms/MB bulk, no latency delta); `MAX_PAYLOAD_SIZE = 8108` silent drop → fragment there + `validate()` counter; batch events per packet |
+| S0d + S0e inventories | `1a0504131` | citations spot-checked (`mesh.rs:39562`, `:24568`, `:29695–29703`, `:35421`, `router.rs:895`) | 49 send sites / 3 blocking shapes / 10 `PeerAddr` leak rows / `proxy.rs` decision; `PeerSink::{send, try_send, send_bounded}`; bounded third `IngressReceiver` variant; §12 allow-list A–E with whole-session bounds; rate-limit-bypassing corrective re-announce removed from the provisional path; nRPC-envelope decode precedes admission; F1–F7 forwarding sites gated; `connect_via`'s independent `relay_addr`/`dest_node_id` is the attack one `if` away; `RENEWAL_SERVICE = "net.mesh.renew"` |
+
+Stage 0 exit criteria met; sizing inputs recorded in §Rough estimates.
+Boundary unchanged: **Stage 1 requires its own authorization.**
