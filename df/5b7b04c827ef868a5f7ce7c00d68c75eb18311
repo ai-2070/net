@@ -1,0 +1,14 @@
+docs/internal/spikes/S2_REPORT.md
+  h_64425bc75e3f3d 1-369
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "df5b7b04c827ef868a5f7ce7c00d68c75eb18311",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
