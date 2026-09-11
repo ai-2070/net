@@ -1,0 +1,18 @@
+.github/workflows/ci.yml
+  h_64425bc75e3f3d 1228,3540-3549,4234-4243,4253-4365
+.github/workflows/release-crates.yml
+  h_64425bc75e3f3d 3-4,7-10,34,53-72
+net/crates/net/docs/releases/RELEASE_STEPS.md
+  h_64425bc75e3f3d 19-23
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "5a85aff470e02be2042effd9b719e1610f7211a8",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
