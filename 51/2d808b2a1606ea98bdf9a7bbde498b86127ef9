@@ -1,0 +1,22 @@
+net/crates/net/src/adapter/net/mesh.rs
+  h_64425bc75e3f3d 39022,39091,39101-39102,39107,39119,39272-39286,39288-39291,39299-39306,39318,39330,53013-53146
+net/crates/net/src/adapter/net/mod.rs
+  h_64425bc75e3f3d 168-172,174-175,177
+net/crates/net/src/adapter/net/stream_handle.rs
+  h_64425bc75e3f3d 1-148
+net/crates/net/src/ffi/mesh.rs
+  h_64425bc75e3f3d 5429-5431,5436,5497-5498,5502
+net/crates/net/wire/src/stream.rs
+  h_64425bc75e3f3d 230-239
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "512d808b2a1606ea98bdf9a7bbde498b86127ef9",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
