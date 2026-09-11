@@ -1822,6 +1822,44 @@ reservation); positive gates independently re-run (6 + 8 RTC, 5 791 /
 5 775 core, 206 wire, 3 wasm); consumer trees unchanged. The 568-symbol
 claim was not re-measured by the reviewer.
 
+**Repair candidate delivered: `df473a33f` + reviewer fix `97815f9d9`
+(2026-09-12), awaiting Kyra's re-review.** Agent commits: `a1c4259d3`
+(S3-R1–R4 production defects), `e5716ce87` + `e8d0e7917` (S3-R5
+feature unification, default docs, consumer probe under
+`spikes/tools/feature_consumer`), `8c541d6b3` + `6b2ecb4f9` (S3-R6
+witnesses, bounded service policy `WRITE_QUANTUM_PER_TURN = 8` /
+`SIGNAL_QUANTUM_PER_TURN = 16`, CI name/count pins), `fd6b08bbc`
+(carried §5 as a three-node native fixture:
+`rtc_routed_restore::routed_then_direct_then_loss_then_manually_restored_routed`,
+labelled **manual restoration**; nRPC over RTC), `6ebd8e2a5` +
+`4a3dd9188` (fold over RTC, duplicate-handling corrections),
+`9ed58edff` (matrix fixes), `cf4f0b798` + `df473a33f` (§11). §11.1
+records an applied-red-reverted inverse per item.
+
+Reviewer re-ran: default-feature `cargo doc -p net-mesh-wire` (the CI
+red) clean; four RTC binaries under nextest `--no-tests=fail --retries
+0`; the R1 inverse (comment out `router.set_rtc_transport`) → the
+handoff witness fails, restored; the R5 consumer probe in all three
+configurations; the three lean FFI members and strict clippy; fresh
+cdylib → 568/568; default `--lib` 5776 with floors 93/24/62/41/60/68,
+`webrtc` `--lib` 5792; consumer diff since `01e4b0f20` empty.
+
+**Reviewer finding (fixed in `97815f9d9`):** Kyra's suppress-the-sends
+inverse (0x51/0x61), re-applied by the reviewer, still **passed** the
+two original witnesses — which the repair had left in the tree — and
+the new fire-and-forget witness, whose only loss assertion
+(`seen.len() < N`) is satisfied by zero deliveries. The reliable
+witness `a_reliable_stream_delivers_exact_values_in_order_through_loss`
+failed it correctly. Disposition: the two originals are **deleted**
+(replaced, not re-pinned; CI floors 6→5 / 8→7); the F&F witness now
+requires `0 < seen < N` and every survivor to be one of the sender's
+values in the sender's order, and fails the inverse. §11.1's claim that
+the inverse "also fails the conservation witness" was wrong (stream
+0x775) and is corrected in the report.
+
+**Not verifiable here:** the Linux `webrtc-feature` job at the fixed
+head; CI is the arbiter.
+
 ## Stage 4 — Announcement fields, `0x0D02`, bootstrap credential + listener
 
 - `noise_pubkey` / `rtc_bootstrap` / `rtc_addr` on the announcement, added to
