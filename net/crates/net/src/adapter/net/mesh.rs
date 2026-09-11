@@ -43574,7 +43574,7 @@ mod heartbeat_aead_tests {
             PeerInfo {
                 node_id: peer_id,
                 transport: PeerTransport::Routed {
-                    relay: relay,
+                    relay,
                     adjacent_relay_identity: None,
                 },
                 session: fresh_session,
@@ -43670,7 +43670,7 @@ mod heartbeat_aead_tests {
             PeerInfo {
                 node_id: peer_id,
                 transport: PeerTransport::Routed {
-                    relay: relay,
+                    relay,
                     adjacent_relay_identity: None,
                 },
                 session,
