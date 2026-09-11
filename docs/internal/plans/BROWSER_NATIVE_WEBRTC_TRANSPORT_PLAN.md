@@ -1611,6 +1611,53 @@ Reviewer re-ran on the Windows host at `614b1c636`:
 `wasm-wire-no-native-deps`, the probe step and the wire-suite gate at
 the submitted head — CI is the arbiter.
 
+**Second HOLD (Kyra, reviewed code head `614b1c636`, docs head
+`80eb147d4`), repair credit retained.** Exact-code CI 48 green / 1 red.
+R1 opacity, R2 execution, R3 target install, R4 lockfile accepted as
+substantively repaired; three bounded closure items:
+C1 — the wasm all-targets clippy step was featureless while the wasm
+test needs `test-vectors` (`E0433`, the one red job); C2 — the drift
+guard's "any `.git` ancestor" check misclassifies a package unpacked
+under a consumer repo as the Net checkout; C3 — the R1 witnesses never
+observed the emitted packet (Kyra's one-line production inverse,
+`builder.build(.., PacketFlags::NONE)` at `mesh.rs:39292`, left both
+passing).
+
+**Closure candidate delivered: `bdcd47125` (2026-09-11), awaiting
+re-review.** `513ea73d4` C1, `c14199bcd` C2, `fb31c198c` C3, plus §10 of
+`S2_REPORT.md`. Reviewer re-ran at `bdcd47125`:
+
+- **C1** — the previously wired featureless clippy command fails with
+  `E0433` (2 hits); the new command with `--features test-vectors`
+  passes; the featureless portable-library `cargo check` stays and
+  passes; the three wasm witnesses pass under Node; both graph guards
+  unchanged; an unpacked `.crate` passes featureless `check` and
+  feature-enabled `--all-targets`. Comment corrected.
+- **C2** — `is_net_workspace` requires `wire/Cargo.toml` **and** the
+  workspace `members` entry **and** the `net-mesh-wire = { path = "wire" }`
+  dependency; a `.git` ancestor is no longer a signal. New unit witness
+  `net_workspace_detection_needs_every_layout_marker` covers Kyra's
+  three placements (outside Git, under an unrelated repo at
+  `target/package/…`, real checkout); the seven drift-check tests pass,
+  missing callee source stays fatal in the real checkout.
+- **C3** — both witnesses now `recv_from` the peer's raw socket, parse
+  with `ParsedPacket::parse`, decrypt under the peer session's rx key,
+  assert `stream_id` and the `RELIABLE` bit (set / clear), and the
+  reliable witness NACKs `next_expected = header.sequence` and asserts
+  **exactly one** retained descriptor with matching `stream_id`, `seq`
+  and `RELIABLE`. Reviewer ran Kyra's inverse: the reliable witness
+  fails on "a reliable stream's packet must carry RELIABLE on the wire";
+  preimage restored and hash-checked (`4c24168709469794`); both pass.
+  Prose narrowed in `stream_handle.rs` and §9/§10 to "the mutation and
+  forgery paths Stage 2 newly exposed".
+- Sweep: `--lib` 5774 (+1 C2 witness); floors 93/24/62/41/60/68; wire
+  206; `cross_lang_wire` 8; strict clippy; forced `net-ffi` rebuild →
+  exports 568/568; consumer diff since `10302333a` empty; whitespace +
+  YAML clean.
+
+**Not verifiable here:** CI's own run of the corrected `wasm-wire` job
+at the submitted head.
+
 ## Stage 3 — Native `webrtc` feature: driver, dedicated socket, STUN, loopback harness
 
 - `adapter/net/rtc/{mod,driver,transport,stun,config}.rs`; `PeerAddr::Rtc`;
