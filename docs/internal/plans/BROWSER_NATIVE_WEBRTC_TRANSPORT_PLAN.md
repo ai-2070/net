@@ -563,7 +563,17 @@ Channels open with `ordered: false, maxRetransmits: 0` on both sides.
   and send buffering. §2's buffered-amount bound — consulted *at admission* —
   is how the plan keeps those from becoming invisible latency.
 - Stream-window backpressure (`0x0B00`) works unchanged. 8192-byte packet
-  cap stays; no fragmentation changes.
+  cap stays; no fragmentation changes. **Mind `MAX_PAYLOAD_SIZE = 8108`**
+  (`8192 − HEADER_SIZE 68 − TAG_SIZE 16`): S0c found that a payload of
+  8 192 bytes fails `NetHeader::validate` (`protocol.rs:478`) on arrival
+  and is dropped with **no log and no counter** — the channel looks dead.
+  The leaf fragments at `MAX_PAYLOAD_SIZE`, and Stage 3 adds a counter for
+  `validate()` rejections on the RTC ingress path so the black hole is
+  visible.
+- **Batch events per packet.** S0c: cost at 60 Hz is per-*packet*, not
+  per-byte (1 KiB → ~4.5 µs, 8 kB → ~25 µs to build; one `dc.send` per
+  packet is the dominant main-thread term). The leaf's event path
+  coalesces a frame's updates into one packet by default.
 
 One DataChannel per peer pair; stream multiplexing is Net's job.
 
@@ -579,7 +589,20 @@ top because:
 - **Relay blindness.** DTLS terminates *at* the anchor; Noise at the peer.
 - **Wire parity.** One `PacketCipher` path, one test matrix.
 
-The DTLS-exporter shortcut is **deferred** pending Stage 5's measurement.
+The DTLS-exporter shortcut is **deferred, and S0c says it stays so on
+performance grounds** (`docs/internal/performance/WEBRTC_DOUBLE_AEAD.md`,
+commit `80fbe57bf`; headless Chromium 149, wasm `opt-level="z"`, scalar
+ChaCha, three 30 s runs per cell): Net's AEAD on top of DTLS costs
++3.5 µs per 1 KiB packet hot (+0.21 ms of main-thread time per second at
+60 Hz; +0.6–1.7 ms/s measured cold inline, of which most is `dc.send` and
+the wasm/JS crossing the shortcut would still pay), +3–4 ms/MB browser CPU
+sending and +4.5 ms/MB receiving at 1 MB/s bulk (≈0.3–0.45 % of one core),
+and no measurable latency difference (≤0.06 ms in medians). The 1 MB/s
+workload was sustained with zero admission refusals; the unpaced ceiling
+was 6.3–7.4 MB/s. Cheaper levers if per-frame time ever binds: batch
+events per packet (§3), then `+simd128`. Reconsidering the exporter is a
+*security-model* change — it makes the anchor's DTLS the only
+confidentiality boundary for what it relays — not a performance change.
 
 ### 5. First contact: authenticated key discovery, then a routed end-to-end session, then opaque signalling over it
 
@@ -1288,6 +1311,9 @@ lands, including the `heartbeat_api_drift_check` tripwire.
   count discarded at close is reported. The advisory threshold is below
   str0m's 128 KiB cap and its refresh cadence is asserted for an idle peer
   with a non-empty queue.
+- The RTC ingress path counts `NetHeader::validate` rejections (S0c's
+  silent 8 192-byte black hole) and a test sends one oversize packet and
+  asserts the counter, not a dead channel.
 - The driver survives an injected `ConnectionReset` on the RTC socket
   with every other session intact.
 - Every non-`Stream::send` outbound class (events, `0x0D02` signalling,
@@ -1456,7 +1482,8 @@ lands, including the `heartbeat_api_drift_check` tripwire.
   process. This is the answer to serverless-only hosting (§Non-goals).
 - ICE-TCP passive candidates on anchors (S0b: candidate constructible in
   str0m; listener/framing/lifecycle are the caller's — still deferred).
-- DTLS-exporter shortcut (if S0c demands it).
+- DTLS-exporter shortcut — **stays deferred** (S0c, §4): not a performance
+  lever; only reconsidered as a security-model decision.
 - Browser-side RedEX on IndexedDB (separate plan).
 
 ---
