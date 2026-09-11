@@ -1679,6 +1679,20 @@ and set); complete layout with `wire/src/session.rs` missing 6/1 exit
 Core `--lib` 5774; permissive all-targets clippy clean. Stage 3 not
 started.
 
+**C2, still open after Kyra's Stage 3 review:** "generic CI does not
+prove this is the Net checkout" — packaged source under a consumer's CI
+(`CI=true`) failed the classifier witness. **Second follow-up
+`59c4b22dd` (reviewer-authored):** the workspace assertion keys on
+`GITHUB_REPOSITORY == "ai-2070/net"` (set by Actions for the owning
+workflow's checkout); generic `CI` is not consulted; a child-process
+witness pins the signal (no env / `CI=true` / `CI=true` + consumer slug
+all false; owning slug true). Exact-source matrix, 4 placements × 4
+environments: packaged source outside Git and under a consumer checkout
+passes 8/8 with no signal, `CI=true`, and `CI=true` + consumer slug;
+only the owning slug fails there naming the assumption; the real
+workspace passes everywhere; a complete layout missing
+`wire/src/session.rs` fails on the callee test everywhere (exit 101).
+
 ## Stage 3 — Native `webrtc` feature: driver, dedicated socket, STUN, loopback harness
 
 - `adapter/net/rtc/{mod,driver,transport,stun,config}.rs`; `PeerAddr::Rtc`;
@@ -1783,6 +1797,30 @@ tuple" and returns `None` for an RTC peer.
 
 **Not verifiable here:** the Linux `webrtc-feature` job and its
 `aws-lc-sys` build time; CI at the fixed head is the arbiter.
+
+**HOLD (Kyra, independent review at `0fcff7a16`; exact-head CI 49/50,
+the red being `Documentation`).** "A working native RTC happy path with
+concrete integration/lifetime defects, not 17/18 exit criteria met."
+Stages 1–2 credit stands; UDP/wire work not to be undone; Stage 4 out of
+scope. The reviewer's own "carried criterion" reasoning was rejected:
+the routed legs need no `0x0D02` — a third native relay with
+`connect_via` and the in-process SDP exchange can exercise the whole
+sequence now. Repairs in `spikes/S3_REPAIR_BRIEF.md`:
+
+| # | Defect (all reviewer-executed unless noted) |
+|---|---|
+| S3-R1 (P1) | construction never calls the router's `set_rtc_transport`; scheduled RTC packets are consumed silently (16 sends → admission +1, +16 after wiring) |
+| S3-R2 (P1) | RTC `WouldBlock` at the unscheduled stream seam becomes terminal `StreamError::Transport`, which `send_with_retry` does not retry |
+| S3-R3 (P1) | lifetime: submit/close race orphans an accepted packet (closed check precedes the queue lock); node shutdown leaks the driver and socket; driver signals ignore `generation` (stale `Close` evicts the live session); closed slots and deque capacity are retained forever; reap bypasses peer-removal; fixtures install without the CAS/quiescence gate |
+| S3-R4 (P1) | `serve_stun` answers every Binding Request before the ICE agent sees it (ICE checks are Binding Requests: the pair fails "session closed" with STUN on); the RTC prefilter rejects authenticated route-hop envelopes and headerless pingwaves that shared dispatch accepts |
+| S3-R5 (P2) | a default-core + `net-mesh-wire/webrtc` consumer fails to compile (non-exhaustive `PeerAddr` matches); `cargo doc` default features fails on the `[PeerAddr::Rtc]` link |
+| S3-R6 | the two reliability witnesses pass with all their stream sends suppressed (they observe unrelated batch events); conservation is an inequality; dispositions are enumerated, not exercised; injected `ConnectionReset` takes a separate branch; idle-refresh not isolated; CI pins binaries but not counts/names; the fairness claim is unfounded (no work quantum) |
+
+Retained credit: the 96 KiB advisory correction and the real bounded
+retry slot (scoped honestly as finite storage outside the queue
+reservation); positive gates independently re-run (6 + 8 RTC, 5 791 /
+5 775 core, 206 wire, 3 wasm); consumer trees unchanged. The 568-symbol
+claim was not re-measured by the reviewer.
 
 ## Stage 4 — Announcement fields, `0x0D02`, bootstrap credential + listener
 
