@@ -13,9 +13,12 @@ use std::net::SocketAddr;
 ///
 /// Stage 1 of `BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md`: peer-keyed state
 /// names an *endpoint*, not a UDP tuple. [`PeerAddr::Udp`] is the only
-/// variant in default builds; [`PeerAddr::Rtc`] appears under the
+/// variant in default builds; `PeerAddr::Rtc` appears under the
 /// `webrtc` feature (Stage 3) and names a DataChannel the core's RTC
-/// driver owns — the wire layer never touches str0m.
+/// driver owns — the wire layer never touches str0m. (Plain text, not
+/// an intra-doc link: with default features the variant does not
+/// exist, and a link to an absent item is a denied rustdoc warning —
+/// R5-B, which is what reddened CI's `Documentation` job.)
 ///
 /// Deliberately **not** `FromStr` and **not** `serde`: nothing serializes a
 /// `PeerAddr`. Operator-facing configuration

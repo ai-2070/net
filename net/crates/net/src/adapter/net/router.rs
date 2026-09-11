@@ -963,6 +963,16 @@ impl NetRouter {
     pub async fn send_to(&self, data: &[u8], dest: PeerAddr) -> std::io::Result<usize> {
         match dest {
             PeerAddr::Udp(addr) => self.socket.send_to(data, addr).await,
+            // R5-A: total over the shared wire type — a downstream
+            // consumer can enable `net-mesh-wire/webrtc` without the
+            // core's feature, and this crate then has no driver to
+            // submit to. Unreachable in practice: nothing here can
+            // mint an `Rtc` endpoint without the feature.
+            #[cfg(not(feature = "webrtc"))]
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "rtc endpoint without the core's webrtc feature",
+            )),
             #[cfg(feature = "webrtc")]
             PeerAddr::Rtc(id) => match self.rtc.load_full() {
                 Some(rtc) => rtc
@@ -1057,6 +1067,9 @@ impl NetRouter {
                                 PeerAddr::Udp(addr) => {
                                     let _ = socket.send_to(&first.data, addr).await;
                                 }
+                                // R5-A: see `NetRouter::send_to`.
+                                #[cfg(not(feature = "webrtc"))]
+                                _ => {}
                                 // RTC is never batched (str0m writes
                                 // one packet per drain), so the
                                 // depth-0 path and the group flush
@@ -1122,8 +1135,14 @@ impl NetRouter {
                                 continue;
                             }
                         };
+                        // R5-A: a `let`-binding cannot be refutable, and
+                        // the shared type may carry the `Rtc` variant
+                        // even here. Skip what this build cannot send.
                         #[cfg(not(feature = "webrtc"))]
-                        let PeerAddr::Udp(dest) = *dest;
+                        let PeerAddr::Udp(dest) = *dest
+                        else {
+                            continue;
+                        };
                         #[cfg(target_os = "linux")]
                         {
                             // `send_batch` is a synchronous `sendmmsg` on the

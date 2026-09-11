@@ -434,6 +434,18 @@ impl PeerSink {
             // disposition (S0d §3.2).
             #[cfg(feature = "webrtc")]
             PeerAddr::Rtc(id) => self.submit_rtc(packet, id),
+            // R5-A: the endpoint type lives in the wire crate, and a
+            // *downstream* consumer can turn on `net-mesh-wire/webrtc`
+            // without the core's `webrtc`. The variant then exists in
+            // the shared type while this crate has no RTC driver to
+            // hand it to, so the match must still be total. It is not
+            // reachable: nothing in a core without `webrtc` can mint
+            // an `Rtc` endpoint.
+            #[cfg(not(feature = "webrtc"))]
+            _ => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "rtc endpoint without the core's webrtc feature",
+            )),
         }
     }
 
@@ -446,6 +458,18 @@ impl PeerSink {
             PeerAddr::Udp(addr) => self.udp.try_send_to(packet, addr),
             #[cfg(feature = "webrtc")]
             PeerAddr::Rtc(id) => self.submit_rtc(packet, id),
+            // R5-A: the endpoint type lives in the wire crate, and a
+            // *downstream* consumer can turn on `net-mesh-wire/webrtc`
+            // without the core's `webrtc`. The variant then exists in
+            // the shared type while this crate has no RTC driver to
+            // hand it to, so the match must still be total. It is not
+            // reachable: nothing in a core without `webrtc` can mint
+            // an `Rtc` endpoint.
+            #[cfg(not(feature = "webrtc"))]
+            _ => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "rtc endpoint without the core's webrtc feature",
+            )),
         }
     }
 
@@ -476,6 +500,11 @@ impl PeerSink {
             PeerAddr::Rtc(id) => self.submit_rtc(packet, id).map(|_| ()).map_err(|e| {
                 AdapterError::Connection(format!("rtc submission to {to} refused: {e}"))
             }),
+            // R5-A: total over the shared wire type; see `send`.
+            #[cfg(not(feature = "webrtc"))]
+            _ => Err(AdapterError::Connection(
+                "rtc endpoint without the core's webrtc feature".into(),
+            )),
         }
     }
 }

@@ -1,0 +1,28 @@
+[package]
+name = "net-mesh-feature-consumer"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Its OWN workspace root: this probe is a *downstream* consumer, and a
+# consumer does not share the core's feature unification. Being a
+# member would let the workspace resolve features for it and hide the
+# very shape it exists to test.
+[workspace]
+
+[features]
+# The shape R5-A is about: a consumer that wants the wire crate's
+# endpoint variant WITHOUT the core's full native transport. Before
+# the repair this produced six errors in the core (non-exhaustive
+# patterns, refutable binding) because the variant existed in the
+# shared type while the core's matches were guarded by the *core's*
+# feature.
+wire-only = ["net-mesh-wire/webrtc"]
+# The control: the ordinary way to get RTC.
+core-rtc = ["net-mesh/webrtc"]
+
+[dependencies]
+# The SHIPPED default, not a hand-narrowed set: what a downstream
+# consumer actually gets from crates.io. `webrtc` is not in it.
+net-mesh = { path = "../../../net/crates/net" }
+net-mesh-wire = { path = "../../../net/crates/net/wire" }
