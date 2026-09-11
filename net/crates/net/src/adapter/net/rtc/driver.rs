@@ -53,6 +53,23 @@ const MAX_POLL_INTERVAL: Duration = Duration::from_millis(5);
 /// Maximum datagram the RTC socket reads.
 const RECV_BUF: usize = 2048;
 
+/// **Bounded service policy** (R6): the most `Channel::write`s one
+/// peer may take in one outer turn of the driver loop.
+///
+/// The earlier claim — "one write per peer per iteration" — was not
+/// what the code did: `pump_peer` looped until the peer's queue was
+/// empty, its write refused, or its channel closed, so a
+/// continuously-replenished producer could hold the phase and delay
+/// every other peer's writes, the timer pass and the socket read.
+/// str0m's mutate-then-drain ordering is preserved inside the
+/// quantum: each write is still followed by a complete drain, and the
+/// quantum only decides when the driver moves on.
+const WRITE_QUANTUM_PER_TURN: usize = 8;
+
+/// Same idea for signalling: a drain-until-empty loop over a channel
+/// somebody else is filling is not a bound.
+const SIGNAL_QUANTUM_PER_TURN: usize = 16;
+
 /// One signalling instruction for the driver.
 ///
 /// Stage 3 has no signalling subprotocol — `0x0D02` is Stage 4's — so
@@ -439,7 +456,9 @@ async fn driver_loop(
         // nothing left to serve. Treating it as "momentarily empty",
         // as this did, is what kept an orphaned driver — and its
         // socket — alive for the runtime's lifetime.
-        loop {
+        let mut signals_served = 0usize;
+        while signals_served < SIGNAL_QUANTUM_PER_TURN {
+            signals_served += 1;
             let signal = match signals.try_recv() {
                 Ok(signal) => signal,
                 Err(mpsc::error::TryRecvError::Empty) => break,
@@ -544,7 +563,7 @@ async fn driver_loop(
         }
 
         // --- 5. reap ---------------------------------------------------
-        reap(&mut sessions, &transport, &closed);
+        reap(&mut sessions, &transport, &stats, &closed);
 
         // --- 6. one bounded socket read --------------------------------
         let wait = sessions
@@ -556,15 +575,25 @@ async fn driver_loop(
             .min(MAX_POLL_INTERVAL)
             .max(Duration::from_micros(500));
 
+        // R6: the injected reset is fed to the **same** read-result
+        // handler a real `recv_from` error goes through. The earlier
+        // hook incremented the counter on its own branch, so deleting
+        // the production `ConnectionReset` arm would not have failed
+        // the witness that claimed to cover it.
         #[cfg(any(test, feature = "fixtures"))]
-        if hooks.take_conn_reset() {
-            // Rule 6, on demand: the reading is swallowed and
-            // counted, and every session stays up.
-            stats.note_udp_conn_reset();
-            continue;
-        }
+        let injected_reset = hooks.take_conn_reset();
+        #[cfg(not(any(test, feature = "fixtures")))]
+        let injected_reset = false;
+        let read = if injected_reset {
+            Ok(Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "injected ICMP port-unreachable",
+            )))
+        } else {
+            tokio::time::timeout(wait, socket.recv_from(&mut buf)).await
+        };
 
-        match tokio::time::timeout(wait, socket.recv_from(&mut buf)).await {
+        match read {
             Ok(Ok((n, source))) => {
                 receive(
                     &config,
@@ -602,6 +631,9 @@ async fn driver_loop(
             .get(&id.slot)
             .map(|s| usize::from(s.retry.is_some()))
             .unwrap_or(0);
+        if retained > 0 {
+            stats.note_unretained();
+        }
         transport.close_peer(id, retained);
         let _ = closed.try_send(id);
     }
@@ -617,7 +649,9 @@ async fn pump_peer(
     ingress: &mpsc::Sender<(Bytes, RtcPeerId)>,
     #[cfg(any(test, feature = "fixtures"))] hooks: &Arc<RtcTestHooks>,
 ) {
-    loop {
+    // The quantum: a busy peer gets a bounded share of this turn, not
+    // the whole of it (R6).
+    for _ in 0..WRITE_QUANTUM_PER_TURN {
         let Some(session) = sessions.get_mut(&slot) else {
             return;
         };
@@ -627,7 +661,10 @@ async fn pump_peer(
         let Some(cid) = session.cid else { return };
 
         let packet = match session.retry.take() {
-            Some(p) => p,
+            Some(p) => {
+                stats.note_unretained();
+                p
+            }
             None => match transport.pop(slot) {
                 Some(p) => p,
                 None => return,
@@ -640,6 +677,7 @@ async fn pump_peer(
         let Some(mut channel) = session.rtc.channel(cid) else {
             // The channel vanished between drains; the packet is
             // still ours, so retain it for the close accounting.
+            stats.note_retained();
             session.retry = Some(packet);
             session.closed = true;
             return;
@@ -667,6 +705,7 @@ async fn pump_peer(
                 // Rule 4: retain, stop this peer's pump for the
                 // iteration, and let admission do the refusing.
                 stats.note_write_false();
+                stats.note_retained();
                 session.retry = Some(packet);
                 drain_session(
                     session,
@@ -682,6 +721,7 @@ async fn pump_peer(
             }
             Err(e) => {
                 tracing::debug!(error = %e, "rtc channel write failed; closing session");
+                stats.note_retained();
                 session.retry = Some(packet);
                 session.closed = true;
                 return;
@@ -772,6 +812,7 @@ async fn drain_session(
 fn reap(
     sessions: &mut HashMap<u32, Session>,
     transport: &Arc<RtcTransport>,
+    stats: &Arc<RtcStats>,
     closed: &mpsc::Sender<RtcPeerId>,
 ) {
     let dead: Vec<u32> = sessions
@@ -784,6 +825,9 @@ fn reap(
             continue;
         };
         let retained = usize::from(session.retry.take().is_some());
+        if retained > 0 {
+            stats.note_unretained();
+        }
         transport.close_peer(session.id, retained);
         for waiter in session.open_waiters.drain(..) {
             let _ = waiter.send(Err("rtc session closed before the channel opened".into()));
@@ -814,6 +858,19 @@ async fn receive(
     datagram: &[u8],
     source: SocketAddr,
 ) {
+    // R4-A: an **uncredentialed** binding request is a gathering
+    // request and nothing else — no session negotiated it, so there
+    // is nothing to intercept. A request carrying `USERNAME` is an
+    // ICE connectivity check and belongs to whichever session
+    // negotiated those credentials; it goes to `Rtc::accepts` first,
+    // and reaches the bare responder only if no session claims it.
+    if config.serve_stun && stun::is_binding_request(datagram) && !stun::has_username(datagram) {
+        if let Some(response) = stun::binding_response(datagram, source) {
+            let _ = socket.send_to(&response, source).await;
+        }
+        return;
+    }
+
     let Ok(contents) = datagram.try_into() else {
         return;
     };
@@ -1060,7 +1117,7 @@ async fn handle_signal(
             if let Some(session) = session_for(sessions, peer) {
                 session.closed = true;
             }
-            reap(sessions, transport, closed);
+            reap(sessions, transport, stats, closed);
         }
     }
 }

@@ -24659,7 +24659,17 @@ impl MeshNode {
         let shutdown = self.shutdown.clone();
         let handle = tokio::spawn(async move {
             while !shutdown.load(Ordering::Acquire) {
-                let Some(id) = closed.recv().await else { break };
+                // A bounded wait, not a bare `recv().await`: this
+                // handle is joined by `shutdown`, and a task parked
+                // forever on an empty channel would make that join
+                // the deadlock instead of the teardown.
+                let next =
+                    tokio::time::timeout(Duration::from_millis(100), closed.recv()).await;
+                let id = match next {
+                    Ok(Some(id)) => id,
+                    Ok(None) => break,
+                    Err(_) => continue,
+                };
                 if let Some(node_id) = ctx.evict_endpoint(PeerAddr::Rtc(id)) {
                     tracing::debug!(
                         node_id = format!("{node_id:#x}"),

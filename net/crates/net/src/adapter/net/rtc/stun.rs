@@ -46,6 +46,40 @@ pub fn is_binding_request(datagram: &[u8]) -> bool {
     u32::from_be_bytes([datagram[4], datagram[5], datagram[6], datagram[7]]) == STUN_MAGIC_COOKIE
 }
 
+/// Does this binding request carry a `USERNAME` attribute?
+///
+/// The discriminator between an **ICE connectivity check** and an
+/// unsolicited gathering request (R4-A). Every ICE check carries
+/// `USERNAME` (RFC 8445 §7.2.2) with the peer's negotiated ufrag
+/// pair; a client asking "what is my reflexive address?" carries no
+/// attributes at all. Attribute walking is bounds-checked and
+/// bounded by the header's own length field — a malformed request
+/// simply stops the walk, and an unparsable one is treated as
+/// credentialed (the conservative answer: hand it to the sessions
+/// rather than answer it blind).
+pub fn has_username(datagram: &[u8]) -> bool {
+    if !is_binding_request(datagram) {
+        return false;
+    }
+    const ATTR_USERNAME: u16 = 0x0006;
+    let body = &datagram[HEADER_LEN..];
+    let mut i = 0usize;
+    while i + 4 <= body.len() {
+        let attr = u16::from_be_bytes([body[i], body[i + 1]]);
+        let len = u16::from_be_bytes([body[i + 2], body[i + 3]]) as usize;
+        if attr == ATTR_USERNAME {
+            return true;
+        }
+        // Attributes are padded to a 4-byte boundary.
+        let padded = len.div_ceil(4) * 4;
+        i = match i.checked_add(4).and_then(|i| i.checked_add(padded)) {
+            Some(next) if next > i => next,
+            _ => break,
+        };
+    }
+    false
+}
+
 /// Build the binding success response for `request`, reporting
 /// `source` as the reflexive address.
 ///

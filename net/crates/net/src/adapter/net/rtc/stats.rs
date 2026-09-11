@@ -27,6 +27,7 @@ pub struct RtcStats {
     validate_rejected: AtomicU64,
     udp_conn_reset: AtomicU64,
     max_buffered: AtomicU64,
+    retained: AtomicU64,
 }
 
 macro_rules! counter {
@@ -107,6 +108,36 @@ impl RtcStats {
         note_udp_conn_reset,
         "`ConnectionReset` readings swallowed on the RTC socket (an ICMP port-unreachable about a peer that went away, never a socket fault)."
     );
+
+    /// Packets the driver is holding in a retry slot right now —
+    /// admitted, popped from the reserved queue, and not yet written.
+    ///
+    /// A gauge, not a counter, and the reason it exists: the retry
+    /// slot is finite storage **outside** the queue reservation
+    /// (`pop` releases the slot and bytes before the packet moves
+    /// here), so `accepted == written + discarded_at_close + queued`
+    /// is *not* the conservation law. This term is the missing one.
+    #[inline]
+    pub fn retained(&self) -> u64 {
+        self.retained.load(Ordering::Relaxed)
+    }
+
+    /// Driver side: a packet entered a retry slot.
+    #[inline]
+    pub(super) fn note_retained(&self) {
+        self.retained.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Driver side: a retry slot was emptied (written, or discarded
+    /// at close).
+    #[inline]
+    pub(super) fn note_unretained(&self) {
+        let _ = self
+            .retained
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            });
+    }
 
     /// Largest `buffered_amount` the driver has observed.
     #[inline]

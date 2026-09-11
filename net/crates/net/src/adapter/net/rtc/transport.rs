@@ -131,7 +131,7 @@ pub struct RtcTransport {
     /// the queue lock, which is the exact window R3-A closed. Nothing
     /// else can produce that interleaving on demand.
     #[cfg(any(test, feature = "fixtures"))]
-    submit_gate: Mutex<Option<Arc<std::sync::Barrier>>>,
+    submit_gate: Mutex<Option<(Arc<std::sync::Barrier>, usize)>>,
 }
 
 impl RtcTransport {
@@ -238,10 +238,16 @@ impl RtcTransport {
         Ok(Some(RtcPeerId { slot, generation }))
     }
 
-    /// Test-only: park the next `submit` between its closed precheck
-    /// and the queue lock on this barrier.
+    /// Test-only: park **one** `submit` — the next one carrying a
+    /// packet of exactly `packet_len` bytes — between its closed
+    /// precheck and the queue lock, on `gate`.
+    ///
+    /// Both qualifiers matter. Gating every submit would park the
+    /// node's own heartbeat on a two-party barrier and deadlock the
+    /// runtime; gating more than once would park the *second*
+    /// caller with nobody to meet.
     #[cfg(any(test, feature = "fixtures"))]
-    pub fn set_submit_gate(&self, gate: Option<Arc<std::sync::Barrier>>) {
+    pub fn set_submit_gate(&self, gate: Option<(Arc<std::sync::Barrier>, usize)>) {
         *self.submit_gate.lock() = gate;
     }
 
@@ -270,7 +276,15 @@ impl RtcTransport {
 
         #[cfg(any(test, feature = "fixtures"))]
         {
-            let gate = self.submit_gate.lock().clone();
+            // Take it: one-shot, and only for the packet the witness
+            // named.
+            let gate = {
+                let mut slot = self.submit_gate.lock();
+                match slot.as_ref() {
+                    Some((_, len)) if *len == packet.len() => slot.take().map(|(g, _)| g),
+                    _ => None,
+                }
+            };
             if let Some(gate) = gate {
                 gate.wait();
             }
