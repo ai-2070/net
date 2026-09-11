@@ -1,0 +1,38 @@
+net/crates/net/Cargo.toml
+  h_64425bc75e3f3d 401-404
+net/crates/net/src/adapter/net/route.rs
+  h_64425bc75e3f3d 20
+net/crates/net/tests/cross_lang_wire.rs
+  h_64425bc75e3f3d 1-228
+net/crates/net/tests/cross_lang_wire/README.md
+  h_64425bc75e3f3d 1-32
+net/crates/net/tests/cross_lang_wire/aead_vector.json
+  h_64425bc75e3f3d 1-8
+net/crates/net/tests/cross_lang_wire/capability_announcement.json
+  h_64425bc75e3f3d 1-15
+net/crates/net/tests/cross_lang_wire/event_frame.json
+  h_64425bc75e3f3d 1-8
+net/crates/net/tests/cross_lang_wire/nack_payload.json
+  h_64425bc75e3f3d 1-8
+net/crates/net/tests/cross_lang_wire/net_header.json
+  h_64425bc75e3f3d 1-13
+net/crates/net/tests/cross_lang_wire/routing_header.json
+  h_64425bc75e3f3d 1-11
+net/crates/net/tests/cross_lang_wire/stream_window.json
+  h_64425bc75e3f3d 1-9
+net/crates/net/wire/src/session.rs
+  h_64425bc75e3f3d 2039-2042
+net/crates/net/wire/tests/wasm_wire.rs
+  h_64425bc75e3f3d 1-224
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "f88243bc5bb7fdc179b738e2fce9da6689c23e41",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
