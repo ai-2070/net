@@ -4559,14 +4559,90 @@ jobs:
         with:
           tool: nextest
 
-      # The two Stage 3 harnesses, pinned by name like every other
+      # The Stage 3 harnesses, pinned by name like every other
       # integration binary (the pin-guard job scrapes these flags).
+      #
+      # `--retries 0` overrides the profile default of 2: these are
+      # acceptance witnesses for races and lifetimes, and a genuine
+      # flake in one of them is itself a defect (the same reasoning
+      # `.config/nextest.toml` already applies to the org suites).
       - name: Stage 3 harnesses
         if: ${{ !cancelled() }}
         run: >
-          cargo nextest run --no-fail-fast --no-tests=fail --features "webrtc fixtures"
+          cargo nextest run --no-fail-fast --no-tests=fail --retries 0
+          --features "webrtc fixtures cortex"
           --test rtc_loopback
           --test rtc_backpressure
+          --test rtc_repairs
+          --test rtc_routed_restore
+
+      # Per-binary FLOORS and the required names. `--no-tests=fail`
+      # catches a whole binary vanishing; it does not catch a witness
+      # being deleted or renamed out of the set, which is exactly how
+      # coverage was lost before. Raise these with the suites.
+      - name: Stage 3 witness inventory
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          # `cargo nextest list` prints "<pkg>::<binary> <test name>".
+          list() {
+            cargo nextest list --features "webrtc fixtures cortex" --test "$1" 2>/dev/null \
+              | awk -v bin="net-mesh::$1" '$1 == bin { print $2 }'
+          }
+          check_floor() {
+            n=$(list "$1" | wc -l)
+            echo "$1: $n tests (min $2)"
+            if [ "$n" -lt "$2" ]; then
+              echo "::error::$1 has $n tests, floor is $2 — lower the floor deliberately or restore the witness"
+              exit 1
+            fi
+          }
+          check_floor rtc_loopback 6
+          check_floor rtc_backpressure 8
+          check_floor rtc_repairs 18
+          check_floor rtc_routed_restore 3
+          REQUIRED="
+          rtc_repairs:scheduled_fire_and_forget_packets_reach_rtc_admission_and_the_peer
+          rtc_repairs:the_scheduler_drain_counts_what_it_drops_under_pressure
+          rtc_repairs:rtc_admission_pressure_is_retryable_backpressure_not_a_transport_error
+          rtc_repairs:a_committed_prefix_is_never_replayed_when_the_suffix_is_refused
+          rtc_repairs:a_submit_that_races_a_close_is_refused_and_nothing_is_orphaned
+          rtc_repairs:retention_conserves_every_admitted_packet_and_then_delivers_it
+          rtc_repairs:node_shutdown_releases_the_rtc_socket
+          rtc_repairs:a_wrong_generation_handle_cannot_touch_the_live_session
+          rtc_repairs:thirty_two_lifetimes_do_not_grow_the_slot_table
+          rtc_repairs:a_dead_handle_cannot_be_installed_and_a_close_evicts_the_peer
+          rtc_repairs:a_busy_incumbent_survives_an_rtc_upgrade_attempt
+          rtc_repairs:serving_stun_does_not_intercept_ice_connectivity_checks
+          rtc_repairs:the_rtc_prefilter_admits_exactly_what_dispatch_accepts
+          rtc_repairs:a_reliable_stream_delivers_exact_values_in_order_through_loss
+          rtc_repairs:a_fire_and_forget_stream_loses_packets_and_never_retransmits
+          rtc_repairs:the_advisory_refreshes_for_a_queued_peer_the_pump_never_touches
+          rtc_repairs:a_connection_reset_is_swallowed_by_the_production_arm_with_siblings_intact
+          rtc_repairs:a_busy_peer_cannot_starve_a_sibling_or_the_socket
+          rtc_routed_restore:routed_then_direct_then_loss_then_manually_restored_routed
+          rtc_routed_restore:an_nrpc_call_round_trips_over_the_datachannel
+          "
+          for entry in $REQUIRED; do
+            bin="${entry%%:*}"
+            name="${entry#*:}"
+            if ! list "$bin" | grep -qx "$name"; then
+              echo "::error::required Stage 3 witness missing: $bin::$name"
+              exit 1
+            fi
+          done
+          echo "Stage 3 witness inventory complete"
+
+      # R5-A: a downstream consumer may enable `net-mesh-wire/webrtc`
+      # without the core's `webrtc`. Three configurations, all of
+      # which must build; the failing leg is the middle one.
+      - name: Wire-feature consumer graph (R5-A)
+        if: ${{ !cancelled() }}
+        working-directory: spikes/tools/feature_consumer
+        run: |
+          cargo check --locked
+          cargo check --locked --features wire-only
+          cargo check --locked --features core-rtc
 
       # The wire crate's own `webrtc` feature adds the `PeerAddr::Rtc`
       # variant and nothing else; lint it so the variant's arms cannot

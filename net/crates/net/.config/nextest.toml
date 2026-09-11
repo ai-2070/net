@@ -87,3 +87,15 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 [[profile.default.overrides]]
 filter = 'binary(integration_nrpc_protected) + binary(org_ownership) + binary(capability_exposure_revocation) + binary(org_admission_gate) + binary(org_admission_wire) + binary(nrpc_call_hijack) + binary(nrpc_response_routing) + binary(nrpc_service_equality) + binary(nrpc_route_discriminator) + binary(nrpc_streaming_gate) + binary(nrpc_registration_order) + binary(sensing_provider) + binary(sensing_consumer) + binary(sensing_org_lease_wire) + binary(sensing_org_exact_projection) + binary(sensing_org_exact_seam) + binary(sensing_org_three_node) + binary(org_exact_sensing)'
 retries = 0
+
+# Stage 3 RTC acceptance witnesses get NO retries.
+#
+# Same reasoning as the security suites above: these drive deliberate
+# races and lifetimes — a submit against a close, a wrong-generation
+# signal against a live session, a busy peer against a sibling's
+# service — and "it passed on the second try" is not an answer about
+# any of them. A genuine flake here is a defect in the transport or
+# in the witness, and either way it must be seen.
+[[profile.default.overrides]]
+filter = 'binary(rtc_loopback) or binary(rtc_backpressure) or binary(rtc_repairs) or binary(rtc_routed_restore)'
+retries = 0
