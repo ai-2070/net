@@ -307,17 +307,24 @@ async fn the_delivery_sequence_survives_a_datachannel_close() {
         "the handle must stop being addressable once the channel closes"
     );
 
-    // The session is still installed, but every send is refused at
-    // admission rather than silently accepted into a dead channel.
+    // R3-E: a closed channel is now a peer-removal, not a
+    // permanently stale entry whose every send fails. The eviction
+    // runs the ordinary transaction, so the peer and its address
+    // index both go.
+    assert!(
+        wait_for(
+            || a.peer_endpoint(b_id).is_none(),
+            Duration::from_secs(5)
+        )
+        .await,
+        "closing the DataChannel must evict the peer through the ordinary \
+         removal path, not leave a stale entry for the failure detector"
+    );
     let refused = a
         .send_on_stream(&stream, &[Bytes::from_static(b"after")])
         .await;
     assert!(
         refused.is_err(),
         "a send onto a closed DataChannel must fail loudly, not vanish"
-    );
-    assert!(
-        a.rtc_stats().admission_refused() >= 1,
-        "the refusal must be counted"
     );
 }

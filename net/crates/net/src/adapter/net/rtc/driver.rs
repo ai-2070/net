@@ -189,6 +189,12 @@ pub struct RtcDriverHandle {
     stats: Arc<RtcStats>,
     local_addr: SocketAddr,
     shutdown: Arc<AtomicBool>,
+    /// The driver task, so shutdown can **join** it. Without this the
+    /// task (and its bound UDP socket) outlived the node that created
+    /// it for as long as the runtime ran — a successor could not
+    /// rebind an explicit RTC port, and a shut-down node with
+    /// `serve_stun` kept answering (R3-B).
+    task: Arc<parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     #[cfg(any(test, feature = "fixtures"))]
     hooks: Arc<RtcTestHooks>,
 }
@@ -288,8 +294,46 @@ impl RtcDriverHandle {
     }
 
     /// Ask the driver to stop after its current iteration.
+    ///
+    /// Signal-only: use [`Self::shutdown_and_join`] when the caller
+    /// needs the socket to be released by the time it returns.
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
+    }
+
+    /// Stop the driver from a destructor: signal, then abort the
+    /// task so the socket is released without awaiting.
+    ///
+    /// `Drop` cannot await, and detaching the task — which is what
+    /// dropping the handle used to do — left it bound (R3-B).
+    pub fn shutdown_detached(&self) {
+        self.shutdown.store(true, Ordering::Release);
+        if let Some(handle) = self.task.lock().take() {
+            handle.abort();
+        }
+    }
+
+    /// Stop the driver and wait for the task to exit, so the RTC
+    /// socket is closed when this returns.
+    ///
+    /// Bounded: a driver wedged in a syscall is aborted rather than
+    /// hanging the caller's shutdown, and the abort is still a join.
+    pub async fn shutdown_and_join(&self) {
+        self.shutdown.store(true, Ordering::Release);
+        let handle = self.task.lock().take();
+        let Some(handle) = handle else { return };
+        let abort = handle.abort_handle();
+        // The loop's own bound is one poll interval; give it several,
+        // then stop being polite. An aborted task is still a joined
+        // task — what must not happen is returning while the socket
+        // is still open.
+        if tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .is_err()
+        {
+            tracing::debug!("rtc driver did not exit in time; aborting");
+            abort.abort();
+        }
     }
 }
 
@@ -324,6 +368,12 @@ impl RtcDriver {
         net_bind_addr: SocketAddr,
         stats: Arc<RtcStats>,
         ingress: mpsc::Sender<(Bytes, RtcPeerId)>,
+        // R3-E: every channel the driver closes is announced here, so
+        // the mesh can run its ordinary peer-removal transaction.
+        // Without it a reaped channel left the peer, its addresses and
+        // its routes installed until some unrelated failure detector
+        // noticed.
+        closed: mpsc::Sender<RtcPeerId>,
     ) -> std::io::Result<RtcDriverHandle> {
         let socket = UdpSocket::bind(config.resolved_bind_addr(net_bind_addr)).await?;
         let local_addr = socket.local_addr()?;
@@ -335,30 +385,30 @@ impl RtcDriver {
         #[cfg(any(test, feature = "fixtures"))]
         let hooks = Arc::new(RtcTestHooks::default());
 
-        let handle = RtcDriverHandle {
+        let task = tokio::spawn(driver_loop(
+            config,
+            socket,
+            advertised,
+            Arc::clone(&transport),
+            Arc::clone(&stats),
+            ingress,
+            closed,
+            signal_rx,
+            Arc::clone(&shutdown),
+            #[cfg(any(test, feature = "fixtures"))]
+            Arc::clone(&hooks),
+        ));
+
+        Ok(RtcDriverHandle {
             signals: signal_tx,
             transport: Arc::clone(&transport),
             stats: Arc::clone(&stats),
             local_addr,
             shutdown: Arc::clone(&shutdown),
-            #[cfg(any(test, feature = "fixtures"))]
-            hooks: Arc::clone(&hooks),
-        };
-
-        tokio::spawn(driver_loop(
-            config,
-            socket,
-            advertised,
-            transport,
-            stats,
-            ingress,
-            signal_rx,
-            shutdown,
+            task: Arc::new(parking_lot::Mutex::new(Some(task))),
             #[cfg(any(test, feature = "fixtures"))]
             hooks,
-        ));
-
-        Ok(handle)
+        })
     }
 }
 
@@ -373,6 +423,7 @@ async fn driver_loop(
     transport: Arc<RtcTransport>,
     stats: Arc<RtcStats>,
     ingress: mpsc::Sender<(Bytes, RtcPeerId)>,
+    closed: mpsc::Sender<RtcPeerId>,
     mut signals: mpsc::Receiver<RtcSignal>,
     shutdown: Arc<AtomicBool>,
     #[cfg(any(test, feature = "fixtures"))] hooks: Arc<RtcTestHooks>,
@@ -382,7 +433,21 @@ async fn driver_loop(
 
     while !shutdown.load(Ordering::Acquire) {
         // --- 1. signalling: each is one mutation plus a full drain ---
-        while let Ok(signal) = signals.try_recv() {
+        //
+        // A *disconnected* channel is terminal (R3-B): every sender is
+        // gone, so no further instruction can arrive and the loop has
+        // nothing left to serve. Treating it as "momentarily empty",
+        // as this did, is what kept an orphaned driver — and its
+        // socket — alive for the runtime's lifetime.
+        loop {
+            let signal = match signals.try_recv() {
+                Ok(signal) => signal,
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    shutdown.store(true, Ordering::Release);
+                    break;
+                }
+            };
             handle_signal(
                 &config,
                 &mut sessions,
@@ -393,9 +458,13 @@ async fn driver_loop(
                 &ingress,
                 #[cfg(any(test, feature = "fixtures"))]
                 &hooks,
+                &closed,
                 signal,
             )
             .await;
+        }
+        if shutdown.load(Ordering::Acquire) {
+            break;
         }
 
         // --- 2. outbound pump: one write per drain, retain on refusal -
@@ -475,7 +544,7 @@ async fn driver_loop(
         }
 
         // --- 5. reap ---------------------------------------------------
-        reap(&mut sessions, &transport);
+        reap(&mut sessions, &transport, &closed);
 
         // --- 6. one bounded socket read --------------------------------
         let wait = sessions
@@ -534,6 +603,7 @@ async fn driver_loop(
             .map(|s| usize::from(s.retry.is_some()))
             .unwrap_or(0);
         transport.close_peer(id, retained);
+        let _ = closed.try_send(id);
     }
 }
 
@@ -699,7 +769,11 @@ async fn drain_session(
 
 /// Remove dead sessions, bumping the generation and counting whatever
 /// was still owed.
-fn reap(sessions: &mut HashMap<u32, Session>, transport: &Arc<RtcTransport>) {
+fn reap(
+    sessions: &mut HashMap<u32, Session>,
+    transport: &Arc<RtcTransport>,
+    closed: &mpsc::Sender<RtcPeerId>,
+) {
     let dead: Vec<u32> = sessions
         .iter()
         .filter(|(_, s)| s.closed || !s.rtc.is_alive())
@@ -714,6 +788,11 @@ fn reap(sessions: &mut HashMap<u32, Session>, transport: &Arc<RtcTransport>) {
         for waiter in session.open_waiters.drain(..) {
             let _ = waiter.send(Err("rtc session closed before the channel opened".into()));
         }
+        // R3-E: tell the mesh, which owns peer removal. Bounded and
+        // non-blocking like every other driver output — a full
+        // notification channel cannot be allowed to stall the driver,
+        // and the failure detector remains the backstop.
+        let _ = closed.try_send(session.id);
     }
 }
 
@@ -735,13 +814,6 @@ async fn receive(
     datagram: &[u8],
     source: SocketAddr,
 ) {
-    if config.serve_stun && stun::is_binding_request(datagram) {
-        if let Some(response) = stun::binding_response(datagram, source) {
-            let _ = socket.send_to(&response, source).await;
-        }
-        return;
-    }
-
     let Ok(contents) = datagram.try_into() else {
         return;
     };
@@ -755,11 +827,28 @@ async fn receive(
         },
     );
 
+    // R4-A: **sessions first, STUN second.** An ICE connectivity
+    // check *is* a STUN Binding Request, so answering every Binding
+    // Request before asking the sessions meant a node with
+    // `serve_stun` intercepted its own (and its peers') ICE checks
+    // and could never finish a session. `Rtc::accepts` is the real
+    // discriminator: it matches the request's ICE credentials
+    // (USERNAME/MESSAGE-INTEGRITY) against the session that
+    // negotiated them. Only a request **no session claims** is an
+    // unsolicited gathering request, and only that one is answered by
+    // the bare responder.
     let target = sessions
         .iter()
         .find(|(_, s)| s.rtc.accepts(&input))
         .map(|(slot, _)| *slot);
-    let Some(slot) = target else { return };
+    let Some(slot) = target else {
+        if config.serve_stun && stun::is_binding_request(datagram) {
+            if let Some(response) = stun::binding_response(datagram, source) {
+                let _ = socket.send_to(&response, source).await;
+            }
+        }
+        return;
+    };
     let Some(session) = sessions.get_mut(&slot) else {
         return;
     };
@@ -791,6 +880,7 @@ async fn handle_signal(
     stats: &Arc<RtcStats>,
     ingress: &mpsc::Sender<(Bytes, RtcPeerId)>,
     #[cfg(any(test, feature = "fixtures"))] hooks: &Arc<RtcTestHooks>,
+    closed: &mpsc::Sender<RtcPeerId>,
     signal: RtcSignal,
 ) {
     match signal {
@@ -799,7 +889,13 @@ async fn handle_signal(
                 let _ = reply.send(Err("rtc: max_peers reached".into()));
                 return;
             }
-            let mut session = new_session(config, transport, advertised);
+            let mut session = match new_session(config, transport, advertised) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = reply.send(Err(format!("rtc: {e}")));
+                    return;
+                }
+            };
             let mut api = session.rtc.sdp_api();
             // §3: one DataChannel, unordered, zero retransmits — the
             // reliability that matters is `reliability.rs`'s, and two
@@ -847,7 +943,13 @@ async fn handle_signal(
                     return;
                 }
             };
-            let mut session = new_session(config, transport, advertised);
+            let mut session = match new_session(config, transport, advertised) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = reply.send(Err(format!("rtc: {e}")));
+                    return;
+                }
+            };
             match session.rtc.sdp_api().accept_offer(offer) {
                 Ok(answer) => {
                     let id = session.id;
@@ -876,8 +978,8 @@ async fn handle_signal(
             answer_sdp,
             reply,
         } => {
-            let Some(session) = sessions.get_mut(&peer.slot) else {
-                let _ = reply.send(Err("rtc: unknown session".into()));
+            let Some(session) = session_for(sessions, peer) else {
+                let _ = reply.send(Err(STALE_HANDLE.into()));
                 return;
             };
             let answer = match SdpAnswer::from_sdp_string(&answer_sdp) {
@@ -916,8 +1018,8 @@ async fn handle_signal(
             candidate,
             reply,
         } => {
-            let Some(session) = sessions.get_mut(&peer.slot) else {
-                let _ = reply.send(Err("rtc: unknown session".into()));
+            let Some(session) = session_for(sessions, peer) else {
+                let _ = reply.send(Err(STALE_HANDLE.into()));
                 return;
             };
             match Candidate::from_sdp_string(&candidate) {
@@ -941,36 +1043,57 @@ async fn handle_signal(
             }
         }
         RtcSignal::AwaitOpen { peer, reply } => {
-            match sessions.get_mut(&peer.slot) {
+            match session_for(sessions, peer) {
                 Some(session) if session.open => {
                     let _ = reply.send(Ok(()));
                 }
                 Some(session) => session.open_waiters.push(reply),
                 None => {
-                    let _ = reply.send(Err("rtc: unknown session".into()));
+                    let _ = reply.send(Err(STALE_HANDLE.into()));
                 }
             };
         }
         RtcSignal::Close { peer } => {
-            if let Some(session) = sessions.get_mut(&peer.slot) {
+            // R3-C: a handle from a previous lifetime of this slot
+            // must not be able to evict its successor. With slots
+            // recycled (R3-D) that is no longer theoretical.
+            if let Some(session) = session_for(sessions, peer) {
                 session.closed = true;
             }
-            reap(sessions, transport);
+            reap(sessions, transport, closed);
         }
     }
+}
+
+/// What every signal arm says to a handle that is not the live
+/// incarnation of its slot.
+const STALE_HANDLE: &str = "rtc: unknown session (stale or wrong-generation handle)";
+
+/// Resolve a signal's handle to the session **only** when the handle
+/// names the live incarnation. Looking up by `slot` alone let a
+/// wrong-generation `Close` kill a live successor and a
+/// wrong-generation `AwaitOpen` report someone else's open (R3-C).
+fn session_for<'a>(
+    sessions: &'a mut HashMap<u32, Session>,
+    peer: RtcPeerId,
+) -> Option<&'a mut Session> {
+    sessions.get_mut(&peer.slot).filter(|s| s.id == peer)
 }
 
 fn new_session(
     config: &RtcConfig,
     transport: &Arc<RtcTransport>,
     advertised: SocketAddr,
-) -> Session {
+) -> Result<Session, super::transport::RtcError> {
     let mut rtc = Rtc::new(Instant::now());
     if let Ok(candidate) = Candidate::host(advertised, "udp") {
         rtc.add_local_candidate(candidate);
     }
-    let id = transport.open_peer();
-    Session {
+    // R3-D: this is the recycling allocator now. It can refuse, and a
+    // refusal is a real answer — silently reusing an identity is what
+    // it exists to prevent.
+    let id = transport.open_peer()?;
+    Ok(Session {
         rtc,
         id,
         cid: None,
@@ -981,5 +1104,5 @@ fn new_session(
         closed: false,
         open_by: Instant::now() + config.ice_deadline,
         open_waiters: Vec::new(),
-    }
+    })
 }

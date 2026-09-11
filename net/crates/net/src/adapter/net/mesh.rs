@@ -742,23 +742,152 @@ type RtcIngressInput = tokio::sync::mpsc::Receiver<(Bytes, super::rtc::RtcPeerId
 
 /// Is this RTC datagram something `dispatch_packet` can act on?
 ///
-/// The RTC path carries exactly what the UDP path carries: a routing
-/// envelope, or a Net packet whose header validates. S0c found the
-/// failure mode this guards — an oversize frame was dropped with no
-/// counter anywhere, so a peer talking to a dead channel looked
-/// exactly like a quiet one. Rejections are counted
+/// The RTC path must admit **exactly** the outer formats the shared
+/// dispatcher accepts, no more and no less. R4-B: the first version
+/// admitted only a routing envelope or a validating `NetHeader`, so a
+/// full native RTC peer could not carry an authenticated route-hop
+/// (its own `ROUTE_HOP_MAGIC` discriminator) and could not carry a
+/// headerless pingwave — both were rejected before dispatch and
+/// charged to `validate_rejected`, which made valid native traffic
+/// look malformed.
+///
+/// Each admitted format keeps its own downstream check: this gate
+/// decides *shape*, never authority. `relay_protected_hop`
+/// authenticates the hop, the pingwave path still requires a
+/// registered direct source, and the routed and direct paths still
+/// decrypt under a session.
+///
+/// S0c found the failure mode the gate exists for — an oversize frame
+/// dropped with no counter anywhere, so a peer talking to a dead
+/// channel looked exactly like a quiet one. Rejections are counted
 /// (`RtcStats::validate_rejected`) and the channel stays up.
 #[cfg(feature = "webrtc")]
 fn rtc_ingress_is_well_formed(data: &Bytes) -> bool {
-    if data.len() >= 2 {
-        let first2 = u16::from_le_bytes([data[0], data[1]]);
-        if first2 == super::route::ROUTING_MAGIC
-            && data.len() >= super::route::ROUTING_HEADER_SIZE + super::protocol::HEADER_SIZE
-        {
-            return true;
-        }
+    let first2 = if data.len() >= 2 {
+        u16::from_le_bytes([data[0], data[1]])
+    } else {
+        return false;
+    };
+
+    // 1. Pre-session keep-alive (14 bytes, its own magic). Reachable
+    //    over RTC only in a punch-adjacent flow, but the dispatcher
+    //    accepts it, so the gate does too rather than silently
+    //    diverging from it.
+    if data.len() == super::traversal::rendezvous::KEEPALIVE_LEN
+        && super::traversal::rendezvous::decode_keepalive(data).is_some()
+    {
+        return true;
     }
+
+    // 2. Authenticated route-hop envelope (SUBNET_AUTH_PLAN D6).
+    //    `relay_protected_hop` verifies the hop tag; admitting the
+    //    shape is not admitting the hop.
+    if first2 == super::subnet::route_hop::ROUTE_HOP_MAGIC {
+        return true;
+    }
+
+    // 3. Legacy routing envelope, with room for the inner header.
+    if first2 == super::route::ROUTING_MAGIC
+        && data.len() >= super::route::ROUTING_HEADER_SIZE + super::protocol::HEADER_SIZE
+    {
+        return true;
+    }
+
+    // 4. Headerless pingwave: fixed size, and explicitly NOT Net
+    //    magic — the dispatcher's own discriminator, reproduced.
+    if data.len() == EnhancedPingwave::SIZE && first2 != MAGIC {
+        return true;
+    }
+
+    // 5. Direct Net packet: header parses AND validates. This is the
+    //    only arm that inspects the declared payload length, which is
+    //    what makes an oversize declaration a *validation* rejection
+    //    rather than a magic rejection.
     super::protocol::NetHeader::from_bytes(data).is_some_and(|h| h.validate())
+}
+
+/// Every sidecar a peer-eviction has to unwind, in one place, so the
+/// RTC close path runs the *same* transaction the failure sweep runs
+/// rather than a second, thinner one (R3-E).
+#[cfg(feature = "webrtc")]
+#[derive(Clone)]
+struct PeerEvictionCtx {
+    session_routing: Arc<NodeSessionRouting>,
+    routing_registry: Arc<super::behavior::org_routing_registry::NodeOrgRoutingRegistry>,
+    peers: Arc<DashMap<u64, PeerInfo>>,
+    peer_entity_ids: Arc<DashMap<u64, EntityId>>,
+    addr_to_node: Arc<DashMap<PeerAddr, u64>>,
+    peer_addrs: Arc<DashMap<u64, PeerAddr>>,
+    session_id_to_node: Arc<DashMap<u64, u64>>,
+    ack_ranges_peer_cache: Arc<DashMap<u64, (bool, Instant)>>,
+    peer_transitions: PeerTransitions,
+}
+
+#[cfg(feature = "webrtc")]
+impl PeerEvictionCtx {
+    /// Remove the peer installed on `addr`, if any, as ONE serialized
+    /// peer transition — exactly like the failure sweep's eviction,
+    /// including the exact-endpoint guard that keeps a close from
+    /// evicting a successor installed in the meantime.
+    ///
+    /// Returns the node id it evicted.
+    fn evict_endpoint(&self, addr: PeerAddr) -> Option<u64> {
+        let node_id = *self.addr_to_node.get(&addr)?.value();
+        let peers = &self.peers;
+        let addr_to_node = &self.addr_to_node;
+        let peer_addrs = &self.peer_addrs;
+        let session_id_to_node = &self.session_id_to_node;
+        let ack_ranges_peer_cache = &self.ack_ranges_peer_cache;
+        let evicted = commit_peer_transition(
+            &self.session_routing,
+            &self.routing_registry,
+            peers,
+            &self.peer_entity_ids,
+            || {
+                let evicted = self.peer_transitions.with(node_id, || {
+                    // Exact endpoint, not just the node id: if the
+                    // peer has already been re-installed on some other
+                    // endpoint, this close is about a session that is
+                    // already gone.
+                    let removed = peers.remove_if(&node_id, |_, info| info.addr() == addr);
+                    let Some((_, old_info)) = &removed else {
+                        return false;
+                    };
+                    let old_session_id = old_info.session.session_id();
+                    if let Some(old_owned) = old_info.owned_addr() {
+                        addr_to_node.remove_if(&old_owned, |_, n| *n == node_id);
+                    }
+                    peer_addrs.remove_if(&node_id, |_, a| *a == old_info.addr());
+                    session_id_to_node.remove_if(&old_session_id, |_, n| *n == node_id);
+                    ack_ranges_peer_cache.remove(&node_id);
+                    true
+                });
+                (evicted, evicted)
+            },
+        );
+        evicted.then_some(node_id)
+    }
+}
+
+/// RAII reclamation for an RTC responder's handshake-inbox
+/// registration (R3-E): a cancelled `accept_rtc` must not leave its
+/// inbox installed.
+#[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+struct RtcInboxGuard<'a> {
+    registry: &'a DashMap<PeerAddr, Arc<DirectHandshakeInbox>>,
+    addr: PeerAddr,
+    inbox: Arc<DirectHandshakeInbox>,
+}
+
+#[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+impl Drop for RtcInboxGuard<'_> {
+    fn drop(&mut self) {
+        // Remove only OUR registration: a later attempt that
+        // displaced us owns the slot now.
+        self.registry
+            .remove_if(&self.addr, |_, cur| Arc::ptr_eq(cur, &self.inbox));
+        self.inbox.close();
+    }
 }
 
 fn node_id_to_graph_id(node_id: u64) -> [u8; 32] {
@@ -10530,6 +10659,10 @@ pub struct MeshNode {
     /// and `dispatch_packet` is the single owner).
     #[cfg(feature = "webrtc")]
     rtc_ingress: Arc<parking_lot::Mutex<Option<RtcIngressInput>>>,
+    /// R3-E: channel-close notifications from the driver, consumed by
+    /// the task `start()` spawns. Taken once, like `rtc_ingress`.
+    #[cfg(feature = "webrtc")]
+    rtc_closed: Arc<parking_lot::Mutex<Option<tokio::sync::mpsc::Receiver<super::rtc::RtcPeerId>>>>,
     /// RTC counters. Present whenever the feature is compiled, so a
     /// node without `rtc` configured still reads zeros rather than
     /// making every caller handle an `Option`.
@@ -12156,17 +12289,28 @@ impl MeshNode {
             Some(rtc_config) => {
                 let (ingress_tx, ingress_rx) =
                     tokio::sync::mpsc::channel(rtc_config.ingress_queue_packets);
+                // R3-E: channel-close notifications. Small and
+                // bounded — one entry per closed channel, and
+                // `max_peers` bounds how many can be in flight.
+                let (closed_tx, closed_rx) =
+                    tokio::sync::mpsc::channel(rtc_config.max_peers.max(1));
                 let handle = super::rtc::RtcDriver::spawn(
                     rtc_config,
                     config.bind_addr,
                     Arc::clone(&rtc_stats),
                     ingress_tx,
+                    closed_tx,
                 )
                 .await
                 .map_err(|e| AdapterError::Connection(format!("rtc bind failed: {e}")))?;
                 let sink = sink.with_rtc(Arc::clone(handle.transport()));
-                (Some(handle), Some(ingress_rx), sink)
+                (Some(handle), Some((ingress_rx, closed_rx)), sink)
             }
+        };
+        #[cfg(feature = "webrtc")]
+        let (rtc_ingress, rtc_closed) = match rtc_ingress {
+            Some((ingress, closed)) => (Some(ingress), Some(closed)),
+            None => (None, None),
         };
 
         let router_config = RouterConfig {
@@ -12184,6 +12328,17 @@ impl MeshNode {
             .map_err(|e| AdapterError::Connection(format!("router bind failed: {}", e)))?;
 
         let router = Arc::new(router);
+
+        // R1: the scheduler drain needs the SAME admission side the
+        // sink got. Without this handoff a `scheduled` stream's
+        // packets are dequeued and dropped on the floor: the drain's
+        // RTC arm finds an empty option and returns, so the packet is
+        // neither admitted nor counted. `PeerSink` alone is not the
+        // handoff — the router has its own path to the wire.
+        #[cfg(feature = "webrtc")]
+        if let Some(handle) = rtc_driver.as_ref() {
+            router.set_rtc_transport(Arc::clone(handle.transport()));
+        }
 
         // Configure route staleness. Routes learned from pingwaves age
         // out if a fresh pingwave hasn't refreshed them in this window;
@@ -12913,6 +13068,8 @@ impl MeshNode {
             rtc_driver,
             #[cfg(feature = "webrtc")]
             rtc_ingress: Arc::new(parking_lot::Mutex::new(rtc_ingress)),
+            #[cfg(feature = "webrtc")]
+            rtc_closed: Arc::new(parking_lot::Mutex::new(rtc_closed)),
             #[cfg(feature = "webrtc")]
             rtc_stats,
             peers,
@@ -22017,10 +22174,25 @@ impl MeshNode {
         peer_node_id: u64,
     ) -> Result<u64, AdapterError> {
         let peer_addr = PeerAddr::Rtc(peer);
+        // R3-E: the quiescence gate, before anything is spent. The
+        // ordinary direct-path upgrade defers while the incumbent is
+        // busy (`attempt_direct_upgrade`'s C3 gate); a fixture that
+        // skipped it could replace a session with open streams or
+        // unacked data and lose that state.
+        let prior = self.rtc_upgrade_precheck(peer_node_id)?;
         let keys = self
             .handshake_initiator(peer_addr, peer_pubkey, peer_node_id)
             .await?;
-        self.install_direct(peer_node_id, peer_addr, keys, None);
+        // R3-E: fence on the exact live handle. A handshake that
+        // completed while the channel was being reaped must not
+        // install a dead endpoint.
+        self.require_live_rtc_endpoint(peer)?;
+        let outcome = self.install_direct(peer_node_id, peer_addr, keys, prior);
+        if !outcome.owned {
+            return Err(AdapterError::Connection(
+                "rtc install lost the compare-and-swap: a newer incarnation won".into(),
+            ));
+        }
 
         let peer_graph_id = node_id_to_graph_id(peer_node_id);
         let pw = EnhancedPingwave::new(peer_graph_id, 0, 1).with_load(0, HealthStatus::Healthy);
@@ -22056,6 +22228,7 @@ impl MeshNode {
         peer_node_id: u64,
     ) -> Result<u64, AdapterError> {
         let peer_addr = PeerAddr::Rtc(peer);
+        let prior = self.rtc_upgrade_precheck(peer_node_id)?;
         let prologue = handshake_prologue(routing_id(peer_node_id), routing_id(self.node_id));
         let mut handshake = NoiseHandshake::responder_with_prologue(
             &self.config.psk,
@@ -22071,6 +22244,15 @@ impl MeshNode {
         {
             displaced.close();
         }
+        // R3-E: reclaim the registration even if this future is
+        // *cancelled*. The explicit `deregister` below only runs when
+        // the future completes; a dropped `accept_rtc` used to leave
+        // its inbox installed until the next displacement.
+        let registration = RtcInboxGuard {
+            registry: &self.pending_direct_initiators,
+            addr: peer_addr,
+            inbox: Arc::clone(&inbox),
+        };
 
         let outcome = tokio::time::timeout(self.config.handshake_timeout, async {
             loop {
@@ -22089,7 +22271,7 @@ impl MeshNode {
             }
         })
         .await;
-        self.deregister_direct_initiator(peer_addr, &inbox);
+        drop(registration);
         match outcome {
             Ok(inner) => inner?,
             Err(_) => return Err(AdapterError::Connection("rtc handshake timeout".into())),
@@ -22108,8 +22290,59 @@ impl MeshNode {
         let keys = handshake
             .into_session_keys()
             .map_err(|e| AdapterError::Fatal(format!("key extraction failed: {e}")))?;
-        self.install_direct(peer_node_id, peer_addr, keys, None);
+        self.require_live_rtc_endpoint(peer)?;
+        let outcome = self.install_direct(peer_node_id, peer_addr, keys, prior);
+        if !outcome.owned {
+            return Err(AdapterError::Connection(
+                "rtc install lost the compare-and-swap: a newer incarnation won".into(),
+            ));
+        }
         Ok(peer_node_id)
+    }
+
+    /// The incumbent snapshot + quiescence gate every RTC install
+    /// goes through (R3-E).
+    ///
+    /// `Ok(Some(sid))` is the incarnation the install must
+    /// compare-and-swap against; `Ok(None)` means there is no
+    /// incumbent. A *busy* incumbent — open streams or unacked data —
+    /// is refused, not replaced: that is the same decision
+    /// `attempt_direct_upgrade` makes, and the reason it makes it is
+    /// that replacing a busy session drops its in-flight state.
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    fn rtc_upgrade_precheck(&self, peer_node_id: u64) -> Result<Option<u64>, AdapterError> {
+        let Some(entry) = self.peers.get(&peer_node_id) else {
+            return Ok(None);
+        };
+        let info = entry.value();
+        let busy = info.session.has_open_streams() || info.session.has_unacked();
+        let sid = info.session.session_id();
+        drop(entry);
+        if busy {
+            return Err(AdapterError::Connection(
+                "rtc upgrade deferred: the incumbent session is busy".into(),
+            ));
+        }
+        Ok(Some(sid))
+    }
+
+    /// Refuse to install on a handle the driver no longer holds
+    /// (R3-E). Checked immediately before the transition, so a
+    /// handshake that finished during a reap cannot publish a dead
+    /// endpoint.
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    fn require_live_rtc_endpoint(&self, peer: super::rtc::RtcPeerId) -> Result<(), AdapterError> {
+        let live = self
+            .rtc_driver
+            .as_ref()
+            .is_some_and(|d| d.transport().is_open(peer));
+        if live {
+            Ok(())
+        } else {
+            Err(AdapterError::Connection(
+                "rtc endpoint closed before the session could be installed".into(),
+            ))
+        }
     }
 
     /// Install a DIRECT session: the peer answered at `owned_addr`
@@ -22588,6 +22821,12 @@ impl MeshNode {
         }
 
         let recv_handle = self.spawn_receive_loop();
+        // R3-E: the driver's close notifications drive the ordinary
+        // peer-removal transaction. Spawned here, next to the receive
+        // loop, because it is the same lifecycle: it exits with the
+        // node.
+        #[cfg(feature = "webrtc")]
+        self.spawn_rtc_close_notifier();
         let heartbeat_handle = self.spawn_heartbeat_loop();
         let stream_grant_drainer_handle = self.spawn_stream_grant_drainer_loop();
         let retransmit_handle = self.spawn_retransmit_loop();
@@ -24391,6 +24630,45 @@ impl MeshNode {
             auth_failure_window: self.config.auth_failure_window,
             auth_throttle_duration: self.config.auth_throttle_duration,
         }
+    }
+
+    /// Consume the RTC driver's channel-close notifications and run
+    /// the peer-removal transaction for each (R3-E).
+    ///
+    /// Before this, a reaped DataChannel left the peer entry, its
+    /// address indexes and its routes installed until an unrelated
+    /// failure detector happened to notice — so "the channel closed"
+    /// and "the peer is gone" were different events an unbounded
+    /// distance apart.
+    #[cfg(feature = "webrtc")]
+    fn spawn_rtc_close_notifier(&self) {
+        let Some(mut closed) = self.rtc_closed.lock().take() else {
+            return;
+        };
+        let ctx = PeerEvictionCtx {
+            session_routing: Arc::clone(&self.session_routing),
+            routing_registry: Arc::clone(&self.routing_registry),
+            peers: Arc::clone(&self.peers),
+            peer_entity_ids: Arc::clone(&self.peer_entity_ids),
+            addr_to_node: Arc::clone(&self.addr_to_node),
+            peer_addrs: Arc::clone(&self.peer_addrs),
+            session_id_to_node: Arc::clone(&self.session_id_to_node),
+            ack_ranges_peer_cache: Arc::clone(&self.ack_ranges_peer_cache),
+            peer_transitions: self.peer_transitions.clone(),
+        };
+        let shutdown = self.shutdown.clone();
+        let handle = tokio::spawn(async move {
+            while !shutdown.load(Ordering::Acquire) {
+                let Some(id) = closed.recv().await else { break };
+                if let Some(node_id) = ctx.evict_endpoint(PeerAddr::Rtc(id)) {
+                    tracing::debug!(
+                        node_id = format!("{node_id:#x}"),
+                        "rtc channel closed; peer evicted"
+                    );
+                }
+            }
+        });
+        self.tasks.lock().push(handle);
     }
 
     /// Spawn the main receive loop.
@@ -39768,8 +40046,30 @@ impl MeshNode {
                 .send(packet, peer_addr)
                 .await
                 .map(|_| ())
-                .map_err(|e| StreamError::Transport(format!("send failed: {}", e)))
+                .map_err(|e| Self::stream_send_error(peer_addr, e))
         }
+    }
+
+    /// Classify a sink error for the unscheduled stream arm.
+    ///
+    /// **UDP is unchanged, byte for byte** (Stage 1 exit criterion):
+    /// every UDP failure — including a `WouldBlock` out of
+    /// `try_send_to` — stays `StreamError::Transport`, because on UDP
+    /// that is a socket fault the caller cannot wait out.
+    ///
+    /// RTC is different in kind, not in degree: its `WouldBlock` is
+    /// the admission gate refusing a *healthy* DataChannel whose
+    /// reserved queue is momentarily full. That is pressure, and
+    /// `send_with_retry` is built to ride pressure — returning
+    /// `Transport` made a congested channel look like a broken one
+    /// and killed the send outright (R2).
+    fn stream_send_error(peer_addr: PeerAddr, e: std::io::Error) -> StreamError {
+        #[cfg(feature = "webrtc")]
+        if matches!(peer_addr, PeerAddr::Rtc(_)) && e.kind() == std::io::ErrorKind::WouldBlock {
+            return StreamError::Backpressure;
+        }
+        let _ = peer_addr;
+        StreamError::Transport(format!("send failed: {}", e))
     }
 
     /// Send `events` on `stream`, retrying on `Backpressure` with
@@ -41951,6 +42251,16 @@ impl Adapter for MeshNode {
             let _ = handle.await;
         }
 
+        // R3-B: the RTC driver is this node's task and its socket is
+        // this node's socket, so this call owns ending both. Signalled
+        // AND joined: without the join, "shut down" would only mean
+        // "asked to stop", and a successor trying to rebind an
+        // explicit RTC port would lose a race it cannot see.
+        #[cfg(feature = "webrtc")]
+        if let Some(driver) = self.rtc_driver.as_ref() {
+            driver.shutdown_and_join().await;
+        }
+
         Ok(())
     }
 
@@ -42023,6 +42333,15 @@ impl Drop for MeshNode {
         // keep it alive — but it can still be parked on a deadline. Close the
         // schedule and abort it, best-effort, exactly like the egress below.
         self.close_sensing_refresh_detached();
+
+        // R3-B, the destructor's half: a `Drop` cannot await, so it
+        // signals and aborts rather than joining. Dropping the handle
+        // alone left the driver detached — still bound to its socket,
+        // still answering STUN if configured.
+        #[cfg(feature = "webrtc")]
+        if let Some(driver) = self.rtc_driver.as_ref() {
+            driver.shutdown_detached();
+        }
 
         // Same best-effort treatment for the ordered organization egress: a
         // destructor cannot await, and silently dropping the handle would merely

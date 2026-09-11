@@ -57,6 +57,32 @@ impl std::fmt::Display for RtcSubmitError {
 
 impl std::error::Error for RtcSubmitError {}
 
+/// A driver-side transport error that is not an admission decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RtcError {
+    /// A slot's generation counter wrapped. Reusing it would make an
+    /// old handle address a new session, so the slot is retired and
+    /// the caller is told rather than silently handed an ambiguous
+    /// identity (R3-D).
+    IdentityExhausted,
+    /// Every slot is in use: `max_peers` concurrent channels, and no
+    /// closed slot available to recycle.
+    NoSlots,
+}
+
+impl std::fmt::Display for RtcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IdentityExhausted => {
+                write!(f, "rtc: slot identity exhausted (generation wrapped)")
+            }
+            Self::NoSlots => write!(f, "rtc: no free peer slot"),
+        }
+    }
+}
+
+impl std::error::Error for RtcError {}
+
 impl From<RtcSubmitError> for std::io::Error {
     /// Every admission refusal is `WouldBlock`, which is what makes
     /// the sink's RTC half indistinguishable from the UDP half at the
@@ -82,10 +108,13 @@ struct PeerSlot {
     /// Last `buffered_amount` the driver published for this peer.
     /// Advisory: stale by construction between the driver's writes.
     published_buffered: AtomicUsize,
-    /// Set when the channel closes; the slot stays until the driver
-    /// reaps it so a late submit is refused rather than resurrecting
-    /// a dead channel.
+    /// Set when the channel closes; the slot stays until it is
+    /// recycled, so a late submit is refused rather than resurrecting
+    /// a dead channel. Written **under `queue`** so a submit that
+    /// already holds the lock cannot miss it (R3-A).
     closed: std::sync::atomic::AtomicBool,
+    /// A slot whose generation wrapped: never handed out again.
+    retired: bool,
 }
 
 /// The mesh-side handle on the RTC transport.
@@ -97,6 +126,12 @@ pub struct RtcTransport {
     send_queue_packets: usize,
     send_queue_bytes: usize,
     buffered_amount_advisory: usize,
+    max_slots: usize,
+    /// Test-only: a rendezvous run **between** the closed precheck and
+    /// the queue lock, which is the exact window R3-A closed. Nothing
+    /// else can produce that interleaving on demand.
+    #[cfg(any(test, feature = "fixtures"))]
+    submit_gate: Mutex<Option<Arc<std::sync::Barrier>>>,
 }
 
 impl RtcTransport {
@@ -109,6 +144,9 @@ impl RtcTransport {
             send_queue_packets: config.send_queue_packets,
             send_queue_bytes: config.send_queue_bytes,
             buffered_amount_advisory: config.buffered_amount_advisory,
+            max_slots: config.max_peers,
+            #[cfg(any(test, feature = "fixtures"))]
+            submit_gate: Mutex::new(None),
         }
     }
 
@@ -120,10 +158,24 @@ impl RtcTransport {
 
     /// Open a slot for a channel the driver has just brought up.
     ///
-    /// `generation` starts at 0 for a fresh slot and is one past the
-    /// closed incarnation when a slot is reused, so a handle captured
-    /// before a close never addresses its successor.
-    pub fn open_peer(&self) -> RtcPeerId {
+    /// **Closed slots are recycled** (R3-D): production used to call
+    /// this and nothing else, so every historical session left a
+    /// permanent `PeerSlot` — 32 lifetimes, 32 slots, plus whatever
+    /// deque capacity each one had grown. A recycled slot comes back
+    /// at the next generation, which is what keeps a handle captured
+    /// before the close from addressing its successor.
+    ///
+    /// Exhaustion is honest: a slot whose generation would wrap is
+    /// **retired**, never silently reused, and a transport with no
+    /// free slot says so.
+    pub fn open_peer(&self) -> Result<RtcPeerId, RtcError> {
+        if let Some(id) = self.recycle_closed_slot()? {
+            return Ok(id);
+        }
+        let live = self.slots.len();
+        if live >= self.max_slots {
+            return Err(RtcError::NoSlots);
+        }
         let slot = self.next_slot.fetch_add(1, Ordering::Relaxed);
         let generation = 0;
         self.slots.insert(
@@ -133,9 +185,64 @@ impl RtcTransport {
                 queue: Mutex::new((std::collections::VecDeque::new(), 0)),
                 published_buffered: AtomicUsize::new(0),
                 closed: std::sync::atomic::AtomicBool::new(false),
+                retired: false,
             },
         );
-        RtcPeerId { slot, generation }
+        Ok(RtcPeerId { slot, generation })
+    }
+
+    /// Take the first closed, non-retired slot and bring it back at
+    /// the next generation. `Err` only when every closed slot is
+    /// retired *and* there is nothing else to hand out.
+    fn recycle_closed_slot(&self) -> Result<Option<RtcPeerId>, RtcError> {
+        let mut saw_retired = false;
+        let candidate = self
+            .slots
+            .iter()
+            .find(|e| e.closed.load(Ordering::Acquire) && !e.retired)
+            .map(|e| *e.key());
+        let Some(slot) = candidate else {
+            // Distinguish "nothing closed" from "everything closed is
+            // retired": only the latter is exhaustion.
+            if self.slots.len() >= self.max_slots
+                && self.slots.iter().any(|e| {
+                    saw_retired |= e.retired;
+                    e.retired
+                })
+                && saw_retired
+            {
+                return Err(RtcError::IdentityExhausted);
+            }
+            return Ok(None);
+        };
+        let Some(mut entry) = self.slots.get_mut(&slot) else {
+            return Ok(None);
+        };
+        if !entry.closed.load(Ordering::Acquire) || entry.retired {
+            return Ok(None);
+        }
+        let Some(generation) = entry.generation.checked_add(1) else {
+            // The wrap point. Retire rather than reuse: a wrapped
+            // generation makes a stale handle valid again.
+            entry.retired = true;
+            return Err(RtcError::IdentityExhausted);
+        };
+        entry.generation = generation;
+        entry.published_buffered.store(0, Ordering::Relaxed);
+        {
+            let mut guard = entry.queue.lock();
+            guard.0 = std::collections::VecDeque::new();
+            guard.1 = 0;
+        }
+        entry.closed.store(false, Ordering::Release);
+        Ok(Some(RtcPeerId { slot, generation }))
+    }
+
+    /// Test-only: park the next `submit` between its closed precheck
+    /// and the queue lock on this barrier.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn set_submit_gate(&self, gate: Option<Arc<std::sync::Barrier>>) {
+        *self.submit_gate.lock() = gate;
     }
 
     /// Admission. Synchronous, total, and the only refusal point.
@@ -161,7 +268,28 @@ impl RtcTransport {
             return Err(RtcSubmitError::AdvisoryOver);
         }
 
+        #[cfg(any(test, feature = "fixtures"))]
+        {
+            let gate = self.submit_gate.lock().clone();
+            if let Some(gate) = gate {
+                gate.wait();
+            }
+        }
+
         let mut guard = slot.queue.lock();
+        // R3-A: re-check **under the queue lock**. `close_peer` sets
+        // `closed` while holding this same lock, so the two are now
+        // totally ordered: a submit that wins the race pushes into a
+        // live queue, and one that loses is refused. Before this, a
+        // submit that passed the precheck and then lost to a close
+        // pushed into a cleared queue nobody would ever pop — a packet
+        // counted `accepted`, never `written`, never
+        // `discarded_at_close`.
+        if slot.closed.load(Ordering::Acquire) {
+            drop(guard);
+            self.stats.note_refused_unknown_peer();
+            return Err(RtcSubmitError::UnknownPeer);
+        }
         let (queue, bytes) = &mut *guard;
         if queue.len() >= self.send_queue_packets {
             drop(guard);
@@ -243,13 +371,18 @@ impl RtcTransport {
         if entry.generation != id.generation {
             return 0;
         }
-        entry.closed.store(true, Ordering::Release);
         let discarded = {
             let mut guard = entry.queue.lock();
-            let (queue, bytes) = &mut *guard;
-            let n = queue.len();
-            queue.clear();
-            *bytes = 0;
+            // Under the lock, so a submit either observed this before
+            // reserving (refused) or is already pushed and counted
+            // below (R3-A).
+            entry.closed.store(true, Ordering::Release);
+            let n = guard.0.len();
+            // Replace rather than `clear()`: `VecDeque::clear` keeps
+            // the grown allocation, and a recycled slot has no use
+            // for the previous lifetime's capacity (R3-D).
+            guard.0 = std::collections::VecDeque::new();
+            guard.1 = 0;
             n
         };
         drop(entry);
@@ -263,17 +396,10 @@ impl RtcTransport {
         discarded
     }
 
-    /// Reuse a closed slot for a new channel, at the next generation.
-    pub fn reopen_peer(&self, slot: u32) -> Option<RtcPeerId> {
-        let mut entry = self.slots.get_mut(&slot)?;
-        if !entry.closed.load(Ordering::Acquire) {
-            return None;
-        }
-        entry.generation = entry.generation.wrapping_add(1);
-        entry.closed.store(false, Ordering::Release);
-        entry.published_buffered.store(0, Ordering::Relaxed);
-        let generation = entry.generation;
-        Some(RtcPeerId { slot, generation })
+    /// How many slots the transport is holding — live plus closed
+    /// awaiting recycling. The bound R3-D put on lifetime churn.
+    pub fn retained_slots(&self) -> usize {
+        self.slots.len()
     }
 }
 

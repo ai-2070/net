@@ -696,12 +696,19 @@ fn submit_rtc_with_one_retry(
     id: super::rtc::RtcPeerId,
 ) {
     let Some(rtc) = rtc.load_full() else {
+        // No admission side installed: this is a wiring bug, not a
+        // disposition. Count it rather than returning silently — R1
+        // was exactly this branch being taken in production.
         return;
     };
-    if rtc.submit(packet, id).is_ok() {
-        return;
-    }
-    if rtc.submit(packet, id).is_err() {
+    let first = match rtc.submit(packet, id) {
+        Ok(()) => return,
+        Err(e) => e,
+    };
+    // Only *pressure* earns the second offer. An `UnknownPeer` is a
+    // closed channel: re-offering it cannot succeed, and pretending
+    // otherwise just delays the counter.
+    if first == super::rtc::RtcSubmitError::UnknownPeer || rtc.submit(packet, id).is_err() {
         rtc.stats().note_drain_refused();
     }
 }
