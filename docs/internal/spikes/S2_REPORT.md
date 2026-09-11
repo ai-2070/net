@@ -13,8 +13,8 @@ Stage 1 candidate `10302333a`.
 |---|---|---|
 | Stage 1 candidate (base) | `10302333a` | what Stage 2 stacks on |
 | Validated head | `2a9a1d7c5` | the tree every number below was produced from |
-| Candidate | the commit carrying this report | validated head + this file; no code difference |
-| Submitted head | same commit | nothing added after validation |
+| Implementation candidate | `a9e7f223c` | validated head + this file; no code difference |
+| Submitted head | `a9e7f223c` + the reviewer's docs-only record commit | branch tip at handoff; `git diff a9e7f223c..HEAD -- net/ .github/` is a one-line trailing-newline fix in `ci.yml` |
 
 `cea1def23` (the reviewer's Stage 1 fix — `DispatchCtx.socket` was
 dead under the `meshdb`/`meshos`/`deck-ffi` feature sets) landed in the
@@ -210,7 +210,7 @@ S0a §5's 395 KB / 121 KB remains the closest figure for what a
 
 ## 6. Validation
 
-From `net/crates/net`, at `2a9a1d7c5`, which `df5b7b04c` changes only by adding this file.
+From `net/crates/net`, at the validated head `2a9a1d7c5`; the candidate `a9e7f223c` differs only by adding this file, and the reviewer re-ran the list below at `a9e7f223c`.
 
 | Command | Result |
 |---|---|

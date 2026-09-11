@@ -1491,6 +1491,48 @@ lands, including the `heartbeat_api_drift_check` tripwire.
 - No behaviour change under default features; no `use` path in the core or
   any binding changes.
 
+**Authorized by the product owner (2026-09-11), stacked on the Stage 1
+candidate `10302333a` before Kyra's acceptance** — a deliberate
+deviation from decision 2's "follows *accepted* Stage 1", taken with
+exact-head CI on `8605f26ec` running concurrently (its Unit, Linux
+batched send/recv, Go and Format jobs were green; its FFI-clippy failure
+for the meshdb/meshos/deck-ffi feature sets was a dead
+`DispatchCtx.socket` field, fixed in `cea1def23` — punch train now reads
+the socket via `PeerSink::udp_socket`, no behaviour change). Every
+Stage 2 commit is additive so a further Stage 1 fix cannot conflict.
+
+**Candidate delivered: `a9e7f223c` (2026-09-11), awaiting acceptance.**
+Validated head `2a9a1d7c5`; candidate = validated head + report; the
+submitted head adds this record and a one-line trailing-newline fix in
+`ci.yml`. Crate `net-mesh-wire` (lib `net_wire`) at
+`net/crates/net/wire/`: the eight named items, all of `route_hop.rs`,
+`ParsedPacket`, `PeerAddr` (decision 2: the endpoint type sits in the
+wire crate), the coarse clock, `StoredEvent` (+ its `serde_json` users
+behind a `json` feature the core enables — an inherent impl cannot stay
+in another crate), the AEAD seam (`ring` native / `chacha20poly1305`
+wasm32) and the `Clock` seam over the 13 sites. Core re-exports keep
+every path: consumer diff over `go/`, bindings, SDK, CLI, deck, MCP,
+payments is empty; 19 `adapter::net::<module>` consumer sites unedited.
+Three `pub(crate)` items widened to `pub` (`session_prefix_from_id`,
+`PacketBuilder::new`, `Stream` fields) — the `PacketBuilder::new`
+invariant is now enforced by the relocated drift check plus a **negative
+witness** (`a_planted_production_caller_breaks_the_allowlist`). New CI:
+`wasm-wire` (wasm32 check + clippy + **executed** `wasm-bindgen-test`
+under Node with a per-test grep so a zero-test harness cannot pass) and
+`wasm-wire-no-native-deps`; `net-mesh-wire` in the per-member lint/doc
+lists; `cross_lang_wire` pinned; `release-crates.yml` publishes
+`net-mesh-wire` before `net-mesh`. Reviewer re-ran on the Windows host:
+`cargo test --lib` with CI's features (5781 passed — the 194 moved tests
+now run as `cargo test -p net-mesh-wire --features json`, 196 passed),
+the six floors (93/24/62/41/60/68), `cross_lang_wire` (7), the six
+drift-check tests incl. the negative witness, `cargo check` +
+**executed** wasm tests (3 passed under Node, `wasm-bindgen` 0.2.128),
+`cargo tree` with zero tokio/mio/socket2/net-mesh edges, strict clippy,
+export checker on a fresh cdylib (568/568), YAML + script-permission
+checks, and the `mesh.rs` delta since `10302333a` (only `cea1def23`'s
+three lines). **Not verifiable here:** CI's own runs of the new jobs and
+the Linux/Go arms — CI at the submitted head is the arbiter.
+
 ## Stage 3 — Native `webrtc` feature: driver, dedicated socket, STUN, loopback harness
 
 - `adapter/net/rtc/{mod,driver,transport,stun,config}.rs`; `PeerAddr::Rtc`;
