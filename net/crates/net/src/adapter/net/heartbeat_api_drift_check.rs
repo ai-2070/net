@@ -191,3 +191,67 @@ fn mesh_rs_production_callers_match_allowlist() {
          See docs/internal/plans/HEARTBEAT_UNIFICATION_PLAN.md."
     );
 }
+
+/// The wire crate still owns the helper the allowlist points at.
+///
+/// `mod.rs` / `mesh.rs` are scanned above for *callers*; this reads
+/// the callee. After Stage 2 the definition lives one crate away, so
+/// `include_str!` cannot reach it — the path is resolved from
+/// `CARGO_MANIFEST_DIR` instead. A rename or removal of
+/// `build_heartbeat` in `net-mesh-wire` would otherwise leave the
+/// allowlist asserting about a method that no longer exists, and the
+/// tripwire would pass vacuously.
+#[test]
+fn wire_session_still_defines_the_heartbeat_helper() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("wire")
+        .join("src")
+        .join("session.rs");
+    let src = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("net-mesh-wire session.rs must be readable at {path:?}: {e}"));
+    assert!(
+        src.contains("pub fn build_heartbeat(&self)"),
+        "net-mesh-wire's NetSession must still define `build_heartbeat`; the \
+         allowlist in this module names it as the ONLY approved way to \
+         construct a production heartbeat."
+    );
+}
+
+/// Negative witness: the scan actually fails on a planted call site.
+///
+/// Cardinality tests that only ever see compliant input pass whether
+/// or not the detector works. This plants an unapproved caller into
+/// the real `mesh.rs` production prefix and asserts the comparison
+/// the two allowlist tests perform would reject it.
+#[test]
+fn a_planted_production_caller_breaks_the_allowlist() {
+    let approved = ["let packet = session.build_heartbeat();"];
+
+    let clean = production_prefix(include_str!("mesh.rs"));
+    let clean_callers = count_build_heartbeat_callers(&clean);
+    assert_eq!(
+        clean_callers,
+        approved.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        "precondition: the unplanted scan matches the allowlist"
+    );
+
+    // The bug shape behind #97/#106: a production caller that reaches
+    // into the pool instead of the session helper.
+    let planted = format!(
+        "{clean}\nfn smuggled_heartbeat(session: &NetSession) {{\n    \
+         let packet = session.thread_local_pool().get().build_heartbeat();\n}}\n"
+    );
+    let planted_callers = count_build_heartbeat_callers(&production_prefix(&planted));
+    assert_eq!(
+        planted_callers.len(),
+        clean_callers.len() + 1,
+        "the scan must see the planted caller"
+    );
+    assert_ne!(
+        planted_callers,
+        approved.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        "regression: a production `.build_heartbeat()` call site outside the \
+         allowlist must make this comparison fail — if it does not, the \
+         tripwire is inert and #97/#106 can come back unnoticed."
+    );
+}
