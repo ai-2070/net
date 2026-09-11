@@ -392,7 +392,7 @@ impl std::fmt::Display for PeerAddr {
 /// contains. UDP behaviour is **identical** to the raw socket calls these
 /// replace: [`Self::send`] is `NetSocket::send_to(..).await`,
 /// [`Self::try_send`] is `NetSocket::try_send_to`, and
-/// [`Self::send_bounded`] is [`bound_datagram_send`] around the former.
+/// [`Self::send_bounded`] is `bound_datagram_send` around the former.
 /// Nothing here converts a UDP `WouldBlock` into application backpressure.
 ///
 /// Stage 3 adds the RTC half beside `udp`; the entry points and their

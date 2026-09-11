@@ -24246,7 +24246,9 @@ impl MeshNode {
                 #[cfg(all(target_os = "linux", feature = "batched-ingress"))]
                 {
                     if batched_ingress {
-                        IngressReceiver::Batched(super::transport::BatchedPacketReceiver::new(sink))
+                        IngressReceiver::Batched(super::transport::BatchedPacketReceiver::new(
+                            socket,
+                        ))
                     } else {
                         IngressReceiver::Single(PacketReceiver::new(socket))
                     }
