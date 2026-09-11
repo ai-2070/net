@@ -1,0 +1,16 @@
+docs/internal/plans/BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md
+  h_64425bc75e3f3d 43-69,377-414,438-441,443-444,472-502,505-520,555-588,633-646,744-752,764-781,839-842,853-855,875-885,891-901,904-906,912-927,943-949,955-962,968-974,986-990,1053-1106,1200-1215,1313-1340
+docs/internal/plans/ORG_CAPABILITY_LOAD_BALANCING_PLAN.md
+  h_64425bc75e3f3d 47-51,2499-2511,2542-2551
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "9b1ce093330bae34ea5e192867f14e3df7466ead",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
