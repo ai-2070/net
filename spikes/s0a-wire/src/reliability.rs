@@ -1127,4 +1127,3 @@ pub fn create_reliability_mode(reliable: bool, max_pending: usize) -> Box<dyn Re
         Box::new(FireAndForget::new())
     }
 }
-

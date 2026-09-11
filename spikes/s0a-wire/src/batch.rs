@@ -234,4 +234,3 @@ impl std::fmt::Debug for AdaptiveBatcher {
             .finish()
     }
 }
-

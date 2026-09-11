@@ -565,4 +565,3 @@ impl SharedHopReplayWindow {
         result
     }
 }
-

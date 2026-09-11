@@ -1816,5 +1816,3 @@ impl std::fmt::Debug for SessionManager {
 }
 
 use crate::time::current_timestamp;
-
-

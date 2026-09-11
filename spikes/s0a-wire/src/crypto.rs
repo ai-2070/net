@@ -1006,4 +1006,3 @@ fn derive_key(ikm: &[u8], info: &[u8], out: &mut [u8; 32]) {
 fn hex_string(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
-

@@ -636,4 +636,3 @@ impl NackPayload {
         }))
     }
 }
-
