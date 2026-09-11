@@ -313,8 +313,11 @@ python .github/scripts/check-ffi-exports.py
    is that exact composition, so the deadline, the
    `OrgEgressCounters`/`OrgEgressSendPhase` bookkeeping and the
    "never counted as sent" rule are byte-identical either way. Rows 4/5
-   still use the queue's own `deadline` variable and row 7 still uses
-   `DATAGRAM_SEND_DEADLINE`; they are not unified.
+   still bind the fixtures-overridable `deadline` variable
+   (`DATAGRAM_SEND_DEADLINE` in production) and row 7 still uses
+   `DATAGRAM_SEND_DEADLINE` directly; the fixture seam is not removed.
+   *(Narrowed after Kyra's review: ordinary org-egress uses
+   `DATAGRAM_SEND_DEADLINE`; the queue-selected deadline is fixture-only.)*
 2. **Rows 25/26 stayed on the raw socket**, against S0d §3.1's
    `send`-range mapping. Their destination is `peer_reflex`, a
    server-reflexive tuple owned by traversal, and the brief freezes

@@ -38,7 +38,7 @@ documented at `mesh.rs:9309-9311`. **Every row below is `no`** — see
 | 1 | `mesh.rs:515` | `emit_control_chunks@495` | subprotocol reply — control-plane chunks (caller-supplied `subprotocol_id`), `CONTROL_STREAM_ID` | `SocketAddr` param, snapshotted from `PeerEntry::addr()` = `PeerTransport::send_addr()` (`:3070`) | awaited, no deadline | `is_ok()` → only counts stats on success; error dropped | per-packet, loop over chunks | no (addr copied in by caller) | refuse-at-admission |
 | 2 | `mesh.rs:4827` | `flood_event_pingwave_rounds@4797` | pingwave (raw UDP, unencrypted) | `SocketAddr` from a **pre-await snapshot** `Vec<SocketAddr>` of `peers.iter().map(addr())` (`:4813-4823`) | awaited, fire-and-forget `let _ =` | ignored | per-packet fan-out | no — explicit "snapshot before awaiting" (`:4811-4812`) | **drop with counter** (a leaf never originates pingwaves, §7; an anchor must not pingwave a provisional browser) |
 | 3 | `mesh.rs:5070` | `run_route_withdrawal_flood@5013` | subprotocol `SUBPROTOCOL_ROUTE_WITHDRAW` | `SocketAddr` from pre-await `targets` snapshot (`:4810`, `:5058`) | awaited, `let _ =` | ignored | per-packet fan-out | no | drop with counter |
-| 4 | `mesh.rs:6797` | `consume@6755` (org egress queue) | subprotocol — org sensing frame | `next.addr`, carried in the queued `EgressDatagram` (originally a peer `addr()`) | awaited under `bound_datagram_send(.., deadline)` — queue's own deadline, not `DATAGRAM_SEND_DEADLINE` | outcome recorded in `OrgEgressCounters`, never retried, "never counted as sent" (`:6745-6749`) | per-packet, single consumer | no (queue holds owned values; `queue.lock()` released before the send, `:6766-6772`) | refuse-at-admission (the queue is already bounded — this is the closest existing analogue of §2) |
+| 4 | `mesh.rs:6797` | `consume@6755` (org egress queue) | subprotocol — org sensing frame | `next.addr`, carried in the queued `EgressDatagram` (originally a peer `addr()`) | awaited under `bound_datagram_send(.., deadline)` — `DATAGRAM_SEND_DEADLINE` in production; a fixtures-only `policy.deadline` may substitute it under `cfg(any(test, feature = "fixtures"))` *(narrowed after Kyra's review of `b6e522bb5`)* | outcome recorded in `OrgEgressCounters`, never retried, "never counted as sent" (`:6745-6749`) | per-packet, single consumer | no (queue holds owned values; `queue.lock()` released before the send, `:6766-6772`) | refuse-at-admission (the queue is already bounded — this is the closest existing analogue of §2) |
 | 5 | `mesh.rs:6806` | `consume@6755` | same as #4, non-test arm | same | same | same | same | no | same |
 | 6 | `mesh.rs:7815` | `spawn_sensing_frame_send@7788` | subprotocol — sensing frame, spawned | `SocketAddr` param (peer `addr()`) | **spawned task**, `let _ =` | ignored | per-packet | no (moved into the task) | drop with counter |
 | 7 | `mesh.rs:9317` | `send_datagram@9312` | **funnel**: any subprotocol frame sent by node id | `SocketAddr` arg, always a released snapshot | awaited under `bound_datagram_send(.., DATAGRAM_SEND_DEADLINE)` (5 s, `:233`) | `Result<(), AdapterError>` to the caller | per-packet | no — its doc comment is the rule (`:9309-9311`) | refuse-at-admission |
@@ -174,8 +174,9 @@ the edit, every row's *blocking*, *error mapping* and *batching* column
 is unchanged, and no row's guard column becomes `yes`. Concretely:
 row 32 still maps failure to `StreamError::Transport` and row 33 is
 still the only `Backpressure` producer; rows 4/5/7 still carry their
-deadlines (the org-egress queue's own, and `DATAGRAM_SEND_DEADLINE` =
-5 s, `mesh.rs:233`); rows 8/9/10 remain synchronous sheds; rows 51–53
+deadlines (`DATAGRAM_SEND_DEADLINE` = 5 s, `mesh.rs:233`, for rows 4/5/7
+alike in production; rows 4/5 additionally accept a fixtures-only policy
+deadline); rows 8/9/10 remain synchronous sheds; rows 51–53
 still group by destination for `sendmmsg`.
 
 ### 3.2 RTC submission (Stage 3)
@@ -366,9 +367,12 @@ zero.**
   submission timing has to preserve *that* structure, not just the
   `send_to` call. §1 does not mention it.
 - **`bound_datagram_send`'s two deadlines are different things.** Rows
-  4/5 use the org-egress queue's own `deadline` variable; only row 7
-  uses the 5 s `DATAGRAM_SEND_DEADLINE` (`:233`). §1 cites
-  `:6797`/`:6806` *as* `DATAGRAM_SEND_DEADLINE` sites — they are not.
+  4/5 bind a `deadline` variable that a **fixtures-only** policy may
+  override; in production it is `DATAGRAM_SEND_DEADLINE` (`:233`) for
+  rows 4/5/7 alike, so §1's citation of `:6797`/`:6806` as
+  `DATAGRAM_SEND_DEADLINE` sites was right for production. *(Narrowed
+  after Kyra's review of `b6e522bb5`; the earlier text overstated the
+  separation.)*
 - **`transport.rs`'s `send()` (connected-socket) variants (`:265`,
   `:705`) have no production caller in `adapter/net`** at this commit.
   They are part of the primitive surface the seam replaces, so they are

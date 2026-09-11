@@ -423,9 +423,9 @@ commit `1a0504131`, read at `4b52454a1`):**
 - **Exactly three blocking shapes**, so the UDP seam has three entry
   points and collapsing them would change behaviour: awaited
   (`send`, 42 rows incl. 25 fire-and-forget), awaited under a caller
-  deadline (`send_bounded`, 3 rows — and `:6797`/`:6806` use the
-  org-egress queue's own deadline, only `:9317` uses
-  `DATAGRAM_SEND_DEADLINE = 5 s`, correcting the citation above), and
+  deadline (`send_bounded`, 3 rows — all `DATAGRAM_SEND_DEADLINE = 5 s`
+  in production; `:6797`/`:6806` additionally accept a fixtures-only
+  policy deadline, per Kyra's narrowing at `b6e522bb5`), and
   synchronous non-blocking shed (`try_send`, 3 rows whose comments
   reject queuing). 14 rows spawn a task around the send; the seam must
   preserve that structure, including the rollback guard that travels
@@ -1532,6 +1532,36 @@ export checker on a fresh cdylib (568/568), YAML + script-permission
 checks, and the `mesh.rs` delta since `10302333a` (only `cea1def23`'s
 three lines). **Not verifiable here:** CI's own runs of the new jobs and
 the Linux/Go arms — CI at the submitted head is the arbiter.
+
+**HOLD (Kyra, 2026-09-11, reviewed at `b6e522bb5`).** Stage 1 UDP
+preservation: no identified source blocker, all 56 inventory rows and
+the real Linux batched-ingress / `sendmmsg` source reviewed, its
+Linux/binding CI jobs green at the submitted head — credit preserved.
+The combined candidate is held on five Stage 2 defects, in repair
+(`spikes/S2_REPAIR_BRIEF.md`); Stage 3 is not authorized:
+
+| # | Defect | Repair |
+|---|---|---|
+| R1 (P2) | `Stream` handle fields became `pub`; an application can set `handle.config.reliability = Reliable` on a `FireAndForget` stream and the packet ships `wire_reliable=true` with no retransmit entry (reviewer-executed two-node probe; E0616 at Stage 1) | `Stream` handle back in the core, private fields + accessors, no public constructor; compile-probe and live-send witnesses |
+| R2 (P1) | the 196 moved native wire tests no longer gate CI (root unit job runs `net-mesh` only; clippy compiles, wasm runs three cases) | explicit `cargo test --locked -p net-mesh-wire --features json` + non-vacuous inventory/count guard; planted-failure demonstration |
+| R3 (P1, CI red) | wasm target installed for `@stable`, commands resolve the pinned 1.98.1 → `E0463` | install the target for the selected toolchain; deps gate checks host **and** wasm graphs |
+| R4 (P2, CI red) | `guards/fixtures_off_probe/Cargo.lock` not refreshed for `net-mesh-wire`; negative leg fails for the wrong reason | regenerate the probe lockfile; keep `--locked` and both legs |
+| R5 (P2) | wasm test includes `../../tests/cross_lang_wire/aead_vector.json` (outside the package); drift guard reads `wire/src/session.rs` (absent for a registry dependency) | package-owned shared fixture; guard explicitly repository-only, never silently vacuous; verified on an unpacked `.crate` |
+
+Retained from the review: 5781 / 196 / 7 / 3-wasm / 4-doc all green at
+the candidate; six floors 93/24/62/41/60/68 with all 209 floor-roster
+names executed; reviewer inverses (timeout arm → success fails the
+stalled-egress witness; a native monotonic read on wasm fails 2/3; a
+corrupted wasm AEAD nonce fails the golden vector; drift-guard source
+mutations fail 2 and 1) all restored and hash-checked. Non-blocking
+wording corrections: `PacketBuilder::new`'s widening is not a new crypto
+vulnerability and the drift check is a lexical two-file guard, not
+nonce/key-ownership enforcement; the wasm test graph is not JSON-free
+(`serde_json` is a dev-dependency); ordinary org-egress uses
+`DATAGRAM_SEND_DEADLINE` and the queue-selected deadline is fixture-only
+(S0d/S1 wording narrowed); the wasm smoke meets Stage 2's minimum and is
+not lifecycle coverage; the duration-below-`u128::MAX` assertion does not
+prove monotonic ordering.
 
 ## Stage 3 — Native `webrtc` feature: driver, dedicated socket, STUN, loopback harness
 
