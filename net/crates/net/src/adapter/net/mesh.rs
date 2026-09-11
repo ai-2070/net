@@ -300,8 +300,7 @@ struct PendingStreamGrant {
 fn group_grants_by_session(
     drained: HashMap<(u64, u64), PendingStreamGrant>,
 ) -> HashMap<u64, (Arc<NetSession>, PeerAddr, Vec<(u64, u64)>)> {
-    let mut by_session: HashMap<u64, (Arc<NetSession>, PeerAddr, Vec<(u64, u64)>)> =
-        HashMap::new();
+    let mut by_session: HashMap<u64, (Arc<NetSession>, PeerAddr, Vec<(u64, u64)>)> = HashMap::new();
     for ((session_id, stream_id), grant) in drained {
         let PendingStreamGrant {
             session,
@@ -6797,12 +6796,8 @@ impl OrderedSensingEgress {
                         // must retire it.
                         bound_datagram_send(std::future::pending(), next.addr, deadline).await
                     } else {
-                        bound_datagram_send(
-                            sink.send(&next.packet, next.addr),
-                            next.addr,
-                            deadline,
-                        )
-                        .await
+                        bound_datagram_send(sink.send(&next.packet, next.addr), next.addr, deadline)
+                            .await
                     }
                 };
                 #[cfg(not(any(test, feature = "fixtures")))]
@@ -9288,12 +9283,9 @@ fn snapshot_peers(peers: &DashMap<u64, PeerInfo>, exclude: Option<u64>) -> Vec<P
 /// `DashMap` shard guard held across an await wedges that shard for as long as
 /// the send pends — blocking peer replacement, eviction, and every other
 /// reader of the same shard. Clone what you need and release the guard first.
-async fn send_datagram(
-    sink: &PeerSink,
-    packet: &[u8],
-    addr: PeerAddr,
-) -> Result<(), AdapterError> {
-    sink.send_bounded(packet, addr, DATAGRAM_SEND_DEADLINE).await
+async fn send_datagram(sink: &PeerSink, packet: &[u8], addr: PeerAddr) -> Result<(), AdapterError> {
+    sink.send_bounded(packet, addr, DATAGRAM_SEND_DEADLINE)
+        .await
 }
 
 /// Publish an authority change and advance the routing epoch as ONE ordered unit
@@ -18122,6 +18114,8 @@ impl MeshNode {
     #[doc(hidden)]
     #[cfg(any(test, feature = "fixtures"))]
     pub fn set_peer_addr_for_test(&self, node_id: u64, addr: SocketAddr) -> bool {
+        // Operator-typed seam; the peer table keys on the endpoint.
+        let addr = PeerAddr::Udp(addr);
         // The consistent move is a peer-state transition and goes
         // through the same handle as every other publisher, so a
         // fixture build cannot interleave it with a real install.
@@ -18149,7 +18143,7 @@ impl MeshNode {
             {
                 return false;
             }
-            peer.transport = PeerTransport::Direct { owned_addr: addr };
+            peer.transport = PeerTransport::Direct { owned: addr };
             drop(peer);
             self.peer_addrs.insert(node_id, addr);
             // Learned multi-hop routes riding through this peer follow
@@ -22130,7 +22124,9 @@ impl MeshNode {
                 self.addr_to_node.insert(owned_addr, peer_node_id);
                 token
             }
-            PeerTransport::Routed { relay: relay_addr, .. } => {
+            PeerTransport::Routed {
+                relay: relay_addr, ..
+            } => {
                 // A routed end-to-end session is NOT an authenticated
                 // adjacent route-hop session: the recorded address is
                 // the immediate relay's, and the session authenticates
@@ -22285,9 +22281,9 @@ impl MeshNode {
         // transition can straddle the `.await`s below.
         // `accept` reports the UDP tuple to its caller; the peer table
         // keys on the endpoint.
-        let peer_addr = peer_endpoint.udp().ok_or_else(|| {
-            AdapterError::Connection("accept: peer is not a UDP endpoint".into())
-        })?;
+        let peer_addr = peer_endpoint
+            .udp()
+            .ok_or_else(|| AdapterError::Connection("accept: peer is not a UDP endpoint".into()))?;
         let session_id = self
             .install_direct(peer_node_id, peer_endpoint, keys, None)
             .session_id
@@ -24250,9 +24246,7 @@ impl MeshNode {
                 #[cfg(all(target_os = "linux", feature = "batched-ingress"))]
                 {
                     if batched_ingress {
-                        IngressReceiver::Batched(super::transport::BatchedPacketReceiver::new(
-                            sink,
-                        ))
+                        IngressReceiver::Batched(super::transport::BatchedPacketReceiver::new(sink))
                     } else {
                         IngressReceiver::Single(PacketReceiver::new(socket))
                     }
@@ -35771,7 +35765,7 @@ impl MeshNode {
             subprotocol_id,
             payload,
         )
-            .await
+        .await
     }
 
     /// Send a raw subprotocol message to a peer by NODE ID.
@@ -40492,11 +40486,7 @@ impl MeshNode {
     /// A later `connect()` to the same address replaces the entry —
     /// last writer wins — so an unconditional `remove` here would take
     /// that live registration down with us and strand it.
-    fn deregister_direct_initiator(
-        &self,
-        peer_addr: PeerAddr,
-        inbox: &Arc<DirectHandshakeInbox>,
-    ) {
+    fn deregister_direct_initiator(&self, peer_addr: PeerAddr, inbox: &Arc<DirectHandshakeInbox>) {
         self.pending_direct_initiators
             .remove_if(&peer_addr, |_, registered| Arc::ptr_eq(registered, inbox));
     }

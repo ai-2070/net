@@ -15,8 +15,8 @@ use std::time::Instant;
 use crate::event::StoredEvent;
 
 use super::crypto::{PacketCipher, SessionKeys};
-use super::transport::PeerAddr;
 use super::subnet::route_hop::SharedHopReplayWindow;
+use super::transport::PeerAddr;
 // `SharedPacketPool` is intentionally absent — `NetSession` uses
 // only `SharedLocalPool` as the single TX-side AEAD source.
 use super::pool::SharedLocalPool;

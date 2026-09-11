@@ -6,10 +6,10 @@
 //! - `LocalGraph` - Local view of the network topology (k-hop radius)
 //! - `NodeInfo` / `EdgeInfo` - Graph node and edge metadata
 
+use super::transport::PeerAddr;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use dashmap::DashMap;
 use std::collections::{HashMap, HashSet, VecDeque};
-use super::transport::PeerAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 

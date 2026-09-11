@@ -6,10 +6,10 @@
 //! - `RecoveryManager` - Route recovery and failover
 //! - `CircuitBreaker` - Prevent cascading failures
 
+use super::transport::PeerAddr;
 use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
 use std::collections::VecDeque;
-use super::transport::PeerAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};

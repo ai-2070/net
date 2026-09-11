@@ -100,10 +100,7 @@ pub struct ReroutePolicy {
 
 impl ReroutePolicy {
     /// Create a new reroute policy.
-    pub fn new(
-        routing_table: Arc<RoutingTable>,
-        peer_addrs: Arc<DashMap<u64, PeerAddr>>,
-    ) -> Self {
+    pub fn new(routing_table: Arc<RoutingTable>, peer_addrs: Arc<DashMap<u64, PeerAddr>>) -> Self {
         Self {
             routing_table,
             peer_addrs,

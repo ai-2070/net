@@ -7,10 +7,10 @@
 //! - Integration with load balancer for locality-aware selection
 //! - Automatic capability index updates from pingwave data
 
+use super::super::transport::PeerAddr;
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet, VecDeque};
-use super::super::transport::PeerAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 

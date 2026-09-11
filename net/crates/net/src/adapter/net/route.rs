@@ -5,9 +5,9 @@
 //! - `RoutingTable`: Stream-to-destination mapping
 //! - `SchedulerStreamStats`: Per-stream statistics for fairness monitoring
 
+use super::transport::PeerAddr;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use dashmap::DashMap;
-use super::transport::PeerAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
