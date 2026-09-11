@@ -312,11 +312,7 @@ async fn the_delivery_sequence_survives_a_datachannel_close() {
     // runs the ordinary transaction, so the peer and its address
     // index both go.
     assert!(
-        wait_for(
-            || a.peer_endpoint(b_id).is_none(),
-            Duration::from_secs(5)
-        )
-        .await,
+        wait_for(|| a.peer_endpoint(b_id).is_none(), Duration::from_secs(5)).await,
         "closing the DataChannel must evict the peer through the ordinary \
          removal path, not leave a stale entry for the failure detector"
     );

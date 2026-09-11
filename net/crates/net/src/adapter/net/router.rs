@@ -969,6 +969,10 @@ impl NetRouter {
             // submit to. Unreachable in practice: nothing here can
             // mint an `Rtc` endpoint without the feature.
             #[cfg(not(feature = "webrtc"))]
+            #[allow(
+                unreachable_patterns,
+                reason = "R5-A: reachable only when a downstream consumer enables `net-mesh-wire/webrtc` without the core's feature; with neither, `PeerAddr` has one variant and this arm is dead"
+            )]
             _ => Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "rtc endpoint without the core's webrtc feature",
@@ -1069,6 +1073,10 @@ impl NetRouter {
                                 }
                                 // R5-A: see `NetRouter::send_to`.
                                 #[cfg(not(feature = "webrtc"))]
+                                #[allow(
+                                    unreachable_patterns,
+                                    reason = "R5-A: reachable only when a downstream consumer enables `net-mesh-wire/webrtc` without the core's feature; with neither, `PeerAddr` has one variant and this arm is dead"
+                                )]
                                 _ => {}
                                 // RTC is never batched (str0m writes
                                 // one packet per drain), so the
@@ -1139,6 +1147,10 @@ impl NetRouter {
                         // the shared type may carry the `Rtc` variant
                         // even here. Skip what this build cannot send.
                         #[cfg(not(feature = "webrtc"))]
+                        #[allow(
+                            irrefutable_let_patterns,
+                            reason = "R5-A: reachable only when a downstream consumer enables `net-mesh-wire/webrtc` without the core's feature; with neither, `PeerAddr` has one variant and this arm is dead"
+                        )]
                         let PeerAddr::Udp(dest) = *dest
                         else {
                             continue;

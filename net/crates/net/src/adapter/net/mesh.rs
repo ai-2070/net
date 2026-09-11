@@ -24663,8 +24663,7 @@ impl MeshNode {
                 // handle is joined by `shutdown`, and a task parked
                 // forever on an empty channel would make that join
                 // the deadlock instead of the teardown.
-                let next =
-                    tokio::time::timeout(Duration::from_millis(100), closed.recv()).await;
+                let next = tokio::time::timeout(Duration::from_millis(100), closed.recv()).await;
                 let id = match next {
                     Ok(Some(id)) => id,
                     Ok(None) => break,

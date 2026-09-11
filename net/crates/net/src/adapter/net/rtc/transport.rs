@@ -434,7 +434,7 @@ mod tests {
     #[test]
     fn the_reserved_slot_bound_refuses_at_admission_and_queues_nothing() {
         let t = transport(2, 1 << 20, usize::MAX);
-        let id = t.open_peer();
+        let id = t.open_peer().expect("a slot");
         assert!(t.submit(b"a", id).is_ok());
         assert!(t.submit(b"b", id).is_ok());
         assert_eq!(t.submit(b"c", id), Err(RtcSubmitError::QueueFull));
@@ -450,7 +450,7 @@ mod tests {
     #[test]
     fn the_reserved_byte_bound_is_exact_and_independent_of_the_slot_bound() {
         let t = transport(1024, 8, usize::MAX);
-        let id = t.open_peer();
+        let id = t.open_peer().expect("a slot");
         assert!(t.submit(&[0u8; 8], id).is_ok());
         assert_eq!(t.submit(b"x", id), Err(RtcSubmitError::BytesFull));
         assert_eq!(t.queued_bytes(id), 8);
@@ -463,7 +463,7 @@ mod tests {
     #[test]
     fn the_advisory_refuses_before_the_hard_bound_is_reached() {
         let t = transport(1024, 1 << 20, 1024);
-        let id = t.open_peer();
+        let id = t.open_peer().expect("a slot");
         assert!(t.submit(b"fits", id).is_ok());
         t.publish_buffered(id.slot, 2048);
         assert_eq!(t.submit(b"nope", id), Err(RtcSubmitError::AdvisoryOver));
@@ -479,7 +479,7 @@ mod tests {
     #[test]
     fn a_closed_peer_refuses_and_reports_what_it_discarded() {
         let t = transport(16, 1 << 20, usize::MAX);
-        let id = t.open_peer();
+        let id = t.open_peer().expect("a slot");
         assert!(t.submit(b"one", id).is_ok());
         assert!(t.submit(b"two", id).is_ok());
 
@@ -494,9 +494,12 @@ mod tests {
     #[test]
     fn a_reused_slot_gets_a_new_generation_and_the_old_handle_stays_dead() {
         let t = transport(16, 1 << 20, usize::MAX);
-        let first = t.open_peer();
+        let first = t.open_peer().expect("a slot");
         t.close_peer(first, 0);
-        let second = t.reopen_peer(first.slot).expect("slot reopens");
+        // Recycling is the production allocator now (R3-D): the next
+        // `open_peer` reuses the closed slot at the next generation
+        // rather than growing the table.
+        let second = t.open_peer().expect("the closed slot is recycled");
 
         assert_eq!(second.slot, first.slot);
         assert_ne!(
@@ -514,7 +517,7 @@ mod tests {
     #[test]
     fn popping_returns_packets_in_order_and_frees_the_byte_reservation() {
         let t = transport(16, 16, usize::MAX);
-        let id = t.open_peer();
+        let id = t.open_peer().expect("a slot");
         assert!(t.submit(b"aaaa", id).is_ok());
         assert!(t.submit(b"bbbb", id).is_ok());
         assert_eq!(t.queued_bytes(id), 8);
@@ -535,7 +538,7 @@ mod tests {
     #[test]
     fn concurrent_submits_never_exceed_the_reserved_slots() {
         let t = Arc::new(transport(64, 1 << 20, usize::MAX));
-        let id = t.open_peer();
+        let id = t.open_peer().expect("a slot");
         let mut handles = Vec::new();
         for _ in 0..8 {
             let t = Arc::clone(&t);

@@ -106,15 +106,19 @@ fn batch(shard_id: u16, count: usize, tag: &str) -> Batch {
 /// `tag`, **in arrival order**, so a witness can assert values,
 /// order, completeness and duplicates rather than a count of
 /// unrelated events.
-async fn collect_tagged(node: &Arc<MeshNode>, tag: &[u8], want: usize, within: Duration) -> Vec<Vec<u8>> {
+async fn collect_tagged(
+    node: &Arc<MeshNode>,
+    tag: &[u8],
+    want: usize,
+    within: Duration,
+) -> Vec<Vec<u8>> {
     let deadline = tokio::time::Instant::now() + within;
     let mut seen: Vec<Vec<u8>> = Vec::new();
     // Progress is measured in **distinct** payloads: a retransmitted
     // packet that also arrived originally is a duplicate delivery,
     // not progress, and stopping on the raw count would hide a
     // missing payload behind a duplicated one.
-    while tokio::time::Instant::now() < deadline
-        && seen.iter().collect::<HashSet<_>>().len() < want
+    while tokio::time::Instant::now() < deadline && seen.iter().collect::<HashSet<_>>().len() < want
     {
         let mut got_any = false;
         for shard in 0..4u16 {
@@ -177,7 +181,9 @@ async fn scheduled_fire_and_forget_packets_reach_rtc_admission_and_the_peer() {
     let mut cfg = StreamConfig::new();
     cfg.reliability = Reliability::FireAndForget;
     cfg.scheduled = true;
-    let stream = a.open_stream(b.node_id(), 0x0772, cfg).expect("open_stream");
+    let stream = a
+        .open_stream(b.node_id(), 0x0772, cfg)
+        .expect("open_stream");
 
     // Paused pump: admitted packets stay in the reserved queue, so
     // the delta is attributable rather than raced by the drain.
@@ -254,13 +260,17 @@ async fn the_scheduler_drain_counts_what_it_drops_under_pressure() {
     let mut cfg = StreamConfig::new();
     cfg.reliability = Reliability::FireAndForget;
     cfg.scheduled = true;
-    let stream = a.open_stream(b.node_id(), 0x0773, cfg).expect("open_stream");
+    let stream = a
+        .open_stream(b.node_id(), 0x0773, cfg)
+        .expect("open_stream");
 
     let before = a.rtc_stats().drain_refused();
     for payload in tagged_payloads(b"R1DROP", 8) {
         // The scheduler accepts the enqueue; the refusal happens
         // later, in the drain, which is exactly the class boundary.
-        let _ = a.send_on_stream(&stream, std::slice::from_ref(&payload)).await;
+        let _ = a
+            .send_on_stream(&stream, std::slice::from_ref(&payload))
+            .await;
     }
 
     assert!(
@@ -297,7 +307,9 @@ async fn rtc_admission_pressure_is_retryable_backpressure_not_a_transport_error(
     let mut cfg = StreamConfig::new();
     cfg.reliability = Reliability::Reliable;
     cfg.scheduled = false;
-    let stream = a.open_stream(b.node_id(), 0x0771, cfg).expect("open_stream");
+    let stream = a
+        .open_stream(b.node_id(), 0x0771, cfg)
+        .expect("open_stream");
 
     driver.hooks().set_pump_paused(true);
     tokio::time::sleep(Duration::from_millis(30)).await;
@@ -370,13 +382,15 @@ async fn a_committed_prefix_is_never_replayed_when_the_suffix_is_refused() {
         send_queue_packets: 3,
         ..rtc_config()
     };
-    let (a, b, id_a, _) = pair_with(small, rtc_config()).await;
+    let (a, b, _id_a, _) = pair_with(small, rtc_config()).await;
     let driver = a.rtc_driver().expect("driver");
 
     let mut cfg = StreamConfig::new();
     cfg.reliability = Reliability::Reliable;
     cfg.scheduled = false;
-    let stream = a.open_stream(b.node_id(), 0x0774, cfg).expect("open_stream");
+    let stream = a
+        .open_stream(b.node_id(), 0x0774, cfg)
+        .expect("open_stream");
 
     // Pause the pump: the first packets of the call are admitted into
     // the three reserved slots and the rest meet a full reservation
@@ -508,7 +522,9 @@ async fn retention_conserves_every_admitted_packet_and_then_delivers_it() {
     const N: usize = 8;
     let mut cfg = StreamConfig::new();
     cfg.reliability = Reliability::Reliable;
-    let stream = a.open_stream(b.node_id(), 0x0775, cfg).expect("open_stream");
+    let stream = a
+        .open_stream(b.node_id(), 0x0775, cfg)
+        .expect("open_stream");
     let payloads = tagged_payloads(b"R3CONS", N);
     for payload in &payloads {
         a.send_with_retry(&stream, std::slice::from_ref(payload), 16)
@@ -633,11 +649,7 @@ async fn thirty_two_lifetimes_do_not_grow_the_slot_table() {
         }
         driver.close(id).await.expect("close");
         assert!(
-            wait_for(
-                || !driver.transport().is_open(id),
-                Duration::from_secs(5)
-            )
-            .await,
+            wait_for(|| !driver.transport().is_open(id), Duration::from_secs(5)).await,
             "the close must land before the next lifetime opens"
         );
     }
@@ -871,7 +883,9 @@ async fn a_reliable_stream_delivers_exact_values_in_order_through_loss() {
 
     let mut cfg = StreamConfig::new();
     cfg.reliability = Reliability::Reliable;
-    let stream = a.open_stream(b.node_id(), 0x0051, cfg).expect("open_stream");
+    let stream = a
+        .open_stream(b.node_id(), 0x0051, cfg)
+        .expect("open_stream");
 
     const N: usize = 12;
     let payloads = tagged_payloads(b"R6REL", N);
@@ -935,9 +949,12 @@ async fn a_fire_and_forget_stream_loses_packets_and_never_retransmits() {
 
     let mut cfg = StreamConfig::new();
     cfg.reliability = Reliability::FireAndForget;
-    let stream = a.open_stream(b.node_id(), 0x0061, cfg).expect("open_stream");
+    let stream = a
+        .open_stream(b.node_id(), 0x0061, cfg)
+        .expect("open_stream");
 
-    let before_retransmit = a.control_plane_stats()
+    let before_retransmit = a
+        .control_plane_stats()
         .retransmit_packets_sent
         .load(std::sync::atomic::Ordering::Relaxed);
     const N: usize = 16;
@@ -957,8 +974,8 @@ async fn a_fire_and_forget_stream_loses_packets_and_never_retransmits() {
     );
     assert_eq!(
         a.control_plane_stats()
-        .retransmit_packets_sent
-        .load(std::sync::atomic::Ordering::Relaxed),
+            .retransmit_packets_sent
+            .load(std::sync::atomic::Ordering::Relaxed),
         before_retransmit,
         "an unreliable stream must retain nothing and retransmit nothing"
     );
@@ -1040,9 +1057,14 @@ async fn a_connection_reset_is_swallowed_by_the_production_arm_with_siblings_int
     a.send_to_peer_node(c.node_id(), &batch(0, 2, "post-reset-c"))
         .await
         .expect("send to c");
+    let to_b = !collect_tagged(&b, b"", 1, Duration::from_secs(10))
+        .await
+        .is_empty();
+    let to_c = !collect_tagged(&c, b"", 1, Duration::from_secs(10))
+        .await
+        .is_empty();
     assert!(
-        collect_tagged(&b, b"", 1, Duration::from_secs(10)).await.len() >= 1
-            || collect_tagged(&c, b"", 1, Duration::from_secs(10)).await.len() >= 1,
+        to_b || to_c,
         "both sibling sessions must keep delivering after a swallowed reset"
     );
 }

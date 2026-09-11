@@ -442,6 +442,10 @@ impl PeerSink {
             // reachable: nothing in a core without `webrtc` can mint
             // an `Rtc` endpoint.
             #[cfg(not(feature = "webrtc"))]
+            #[allow(
+                unreachable_patterns,
+                reason = "R5-A: reachable only when a downstream consumer enables `net-mesh-wire/webrtc` without the core's feature; with neither, `PeerAddr` has one variant and this arm is dead"
+            )]
             _ => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "rtc endpoint without the core's webrtc feature",
@@ -466,6 +470,10 @@ impl PeerSink {
             // reachable: nothing in a core without `webrtc` can mint
             // an `Rtc` endpoint.
             #[cfg(not(feature = "webrtc"))]
+            #[allow(
+                unreachable_patterns,
+                reason = "R5-A: reachable only when a downstream consumer enables `net-mesh-wire/webrtc` without the core's feature; with neither, `PeerAddr` has one variant and this arm is dead"
+            )]
             _ => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "rtc endpoint without the core's webrtc feature",
@@ -502,6 +510,10 @@ impl PeerSink {
             }),
             // R5-A: total over the shared wire type; see `send`.
             #[cfg(not(feature = "webrtc"))]
+            #[allow(
+                unreachable_patterns,
+                reason = "R5-A: reachable only when a downstream consumer enables `net-mesh-wire/webrtc` without the core's feature; with neither, `PeerAddr` has one variant and this arm is dead"
+            )]
             _ => Err(AdapterError::Connection(
                 "rtc endpoint without the core's webrtc feature".into(),
             )),

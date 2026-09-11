@@ -1130,10 +1130,7 @@ const STALE_HANDLE: &str = "rtc: unknown session (stale or wrong-generation hand
 /// names the live incarnation. Looking up by `slot` alone let a
 /// wrong-generation `Close` kill a live successor and a
 /// wrong-generation `AwaitOpen` report someone else's open (R3-C).
-fn session_for<'a>(
-    sessions: &'a mut HashMap<u32, Session>,
-    peer: RtcPeerId,
-) -> Option<&'a mut Session> {
+fn session_for(sessions: &mut HashMap<u32, Session>, peer: RtcPeerId) -> Option<&mut Session> {
     sessions.get_mut(&peer.slot).filter(|s| s.id == peer)
 }
 

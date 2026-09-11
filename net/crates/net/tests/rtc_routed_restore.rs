@@ -239,10 +239,7 @@ async fn routed_then_direct_then_loss_then_manually_restored_routed() {
         "the interruption must clean up: peer removed, not left stale"
     );
     assert!(
-        !a.rtc_driver()
-            .expect("driver")
-            .transport()
-            .is_open(id_a),
+        !a.rtc_driver().expect("driver").transport().is_open(id_a),
         "the stale handle must be dead"
     );
 
@@ -350,9 +347,7 @@ async fn an_idle_routed_stream_is_replaced_cleanly_by_the_rtc_pair() {
     let mut cfg = StreamConfig::new();
     cfg.reliability = Reliability::Reliable;
     let stream = a.open_stream(b_id, 0x0090, cfg).expect("open_stream");
-    let payloads: Vec<Bytes> = (0..8u8)
-        .map(|i| Bytes::from(vec![i; 64]))
-        .collect();
+    let payloads: Vec<Bytes> = (0..8u8).map(|i| Bytes::from(vec![i; 64])).collect();
     for payload in &payloads {
         a.send_with_retry(&stream, std::slice::from_ref(payload), 16)
             .await
@@ -424,9 +419,7 @@ async fn an_nrpc_call_round_trips_over_the_datachannel() {
         .await
         .expect("rtc pair");
 
-    let _serve = server
-        .serve_rpc("echo", Arc::new(Echo))
-        .expect("serve_rpc");
+    let _serve = server.serve_rpc("echo", Arc::new(Echo)).expect("serve_rpc");
 
     let reply = caller
         .call(
