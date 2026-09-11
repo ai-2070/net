@@ -1738,6 +1738,52 @@ started.
   `webrtc` on.
 - Default build unchanged; `--features webrtc` clean under `-D warnings`.
 
+**Authorized by the product owner (2026-09-11), stacked on the Stage 2
+closure head `01e4b0f20`** while Kyra's C2 follow-up re-review was
+pending; additive and feature-gated by construction. Decisions fixed in
+`spikes/S3_BRIEF.md`: `aws-lc-sys` **option (a)** (accepted behind the
+off-by-default feature, host requirements in `CONTRIBUTING.md`, cost
+recorded: 105 s clean `--lib` build on the workstation); advisory default
+**96 KiB** (the 256 KiB above could never fire against str0m's 128 KiB
+cap — corrected here); retain-and-retry with `discarded_at_close`
+counted; bounded `IngressReceiver::Rtc` (1 024) dropping with a counter;
+`WSAECONNRESET` swallowed and counted.
+
+**Candidate delivered: `f1b13f5db` + reviewer fix `0fcff7a16`
+(2026-09-11), awaiting Kyra's review.** Validated head `6e7ba2116`;
+report `docs/internal/spikes/S3_REPORT.md`. The checkpoint head
+`8eef41940` was pushed mid-stage and went broadly red in CI (Format,
+Clippy, Unit, FFI members, bindings); `6e7ba2116` repaired the local
+matrix, and the reviewer found one more member-feature-set defect the
+report's sweep missed — `pair_action_for` referenced
+`super::traversal::classify` and `nat_class()` without the
+`nat-traversal` gate its three callers carry, so `go-meshdb-ffi` /
+`go-meshos-ffi` / `go-deck-ffi` could not compile the core (same class
+as `cea1def23` in Stage 1). Fixed in `0fcff7a16`; all seven FFI members,
+the SDK, `--no-default-features` and `--features webrtc` pass strict
+clippy. Reviewer re-ran at the fixed head: default `--lib` 5775 with the
+six floors 93/24/62/41/60/68; `--lib` with `webrtc` 5791; `rtc_loopback`
+6/6 and `rtc_backpressure` 8/8 (the agent soaked them ×10 / ×25);
+`--all-features` and default strict clippy, permissive `--all-targets`,
+`cargo doc --all-features`; export checker 568/568 on a fresh cdylib;
+consumer diff since `01e4b0f20` empty.
+
+**Exit-criterion status.** 17 of 18 rows in `S3_REPORT.md` §5 met. The
+§5 delivery sequence (routed → authenticated direct → forced direct
+failure → restored routed) is met **only in its direct half**: the
+loopback harness has no third node, no relay and no `0x0D02`, so the
+pre-direct routed leg and the "restored routed" leg cannot exist before
+Stage 4. Accepted as a **carried criterion**: Stage 4's exit re-asserts
+the whole sequence end to end. nRPC and fold over RTC are likewise
+covered as a *class* (row 30's disposition) rather than end to end, for
+the same reason; `stunclient` was not on the host, so the external-client
+STUN leg is CI's. Two new unconditional accessors (`peer_endpoint`,
+`peer_is_direct`) are additive; `peer_addr` still answers "which UDP
+tuple" and returns `None` for an RTC peer.
+
+**Not verifiable here:** the Linux `webrtc-feature` job and its
+`aws-lc-sys` build time; CI at the fixed head is the arbiter.
+
 ## Stage 4 — Announcement fields, `0x0D02`, bootstrap credential + listener
 
 - `noise_pubkey` / `rtc_bootstrap` / `rtc_addr` on the announcement, added to
