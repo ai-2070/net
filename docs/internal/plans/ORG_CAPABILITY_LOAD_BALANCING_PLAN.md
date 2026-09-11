@@ -44,10 +44,11 @@ closure at `e7fce993e`; node-global local-projection and pre-leader race
 closure at **`PRE_LEADER_CLOSURE_HEAD = cdb416a6b`**; the seed-derived leader
 lifecycle entry condition at **`LEADER_ENTRY_CONDITION_HEAD = f2c82e467`**.
 
-The sign-off discharges the two OLB-2B pass-3 residuals that stood open — the
-independent RED mutation pass (discharged **by decision**, not by an executed
-independent pass; recorded as such) and the merged-head CI read (discharged by
-evidence). Evidence of
+The sign-off closes the two OLB-2B pass-3 residuals that stood open, by two
+different means, and the difference is load-bearing: the independent RED
+mutation pass is **WAIVED by decision — not verified**, and reopening it
+takes an explicit decision rather than a re-reading of this plan; the
+merged-head CI read is discharged **by evidence**. Evidence of
 record for the signed head: the CI-pinned witness rosters for
 `org_exact_sensing` (22), `sensing_org_exact_projection`,
 `sensing_org_exact_seam`, `sensing_org_exact_guards` and
@@ -2495,17 +2496,19 @@ This slice does not block same-org load balancing.
 
 ## 14. Exit gate
 
-**Status (2026-09-11): 25 of 31 rows satisfied and signed; 6 not claimed by
-this release, each annotated in place.** The six are not oversights — four
-belong to the UNSENSED warmed-pool / OLB-4 lanes this release deliberately did
-not build (no P2C sampler exists in tree, and the exact lane introduces no
-no-viable error at all), and two are observability rows whose named counters
-(`org_sensing_truncated_total`, `org_sensing_fallback_total`) were never
-created, because the governing exact design authorized no new counter; the
-bounds and the fallback themselves are witnessed behaviourally. The
-reordered-`Deregister` repair row stays open by the same design's own §15
-non-goal. Nothing below is claimed of the provider-free leader arm, which is
-dark.
+**Status (2026-09-11): of the original 31 rows, 25 are satisfied and signed,
+5 are not claimed by this release, and 1 is struck from the gate entirely.**
+The six non-satisfied rows have **four distinct dispositions**, and
+conflating them would be its own defect (Kyra, 2026-09-11):
+
+| Disposition | Rows | Meaning |
+|---|---|---|
+| **Operational visibility owed** | `org_sensing_truncated_total`, `org_sensing_fallback_total` | The bounded behaviour and the fallback exist and are witnessed; what is missing is a counter an operator can read. A debt to pay, **not** evidence the behaviour is absent. |
+| **Excluded from this gate** | reordered-`Deregister` repair | Removed from this release's completion promise, because the governing exact design lists closing that race among its own §15 non-goals. An excluded behaviour must not sit in a gate as an implied promise: if it is wanted, it needs a named slice with a repair and a witness, and the row returns then. |
+| **Waived by decision** | the independent RED mutation pass (recorded in the status block at the top) | Waived by the owner's sign-off, **not verified**. Reopening it takes an explicit decision, not a re-reading of this plan. |
+| **Unimplemented product slices** | P2C sampler (OLB-3), `NoViableProvider` (OLB-4) | Unbuilt product work on the unsensed lane. Not administrative closure work, and not something a documentation pass can discharge. |
+
+Nothing below is claimed of the provider-free leader arm, which is dark.
 
 The plan is complete when all are true:
 
@@ -2536,14 +2539,16 @@ The plan is complete when all are true:
 - [x] Cadence relaxes when the strictest watcher drops; a stale lease
       ticket cannot remove a successor holder from the node-global
       registry (local invariant).
-- [ ] **OPEN — not claimed by the signed release.** The governing exact design
-      lists "close the reordered-`Deregister` race" among its explicit
-      non-goals (§15), and no witness asserts the refresh repair below.
-      (OLB-2 exit) A reordered stale `Deregister` that transiently
-      removes the remote row is repaired by the node-global lease's
-      ttl/2 refresh; the observation is `Unknown`/`Potential` until
-      repair and no `org.call` fails; a last-holder close disarms the
-      refresh owner (no ghost demand).
+- **EXCLUDED from this gate — not an open promise.** *(Removed 2026-09-11.
+  The governing exact design lists "close the reordered-`Deregister` race"
+  among its explicit §15 non-goals, and no witness asserts the repair. Leaving
+  it as an unticked box made an excluded behaviour read as an outstanding
+  commitment. To reinstate it, name a slice that owns the repair AND its
+  witness; the row returns with that slice, not before.)* The excluded text
+  was: "(OLB-2 exit) A reordered stale `Deregister` that transiently removes
+  the remote row is repaired by the node-global lease's ttl/2 refresh; the
+  observation is `Unknown`/`Potential` until repair and no `org.call` fails;
+  a last-holder close disarms the refresh owner (no ghost demand)."
 - [ ] **NOT CLAIMED — unsensed warmed-pool lane; no P2C sampler exists in
       tree.** The warmed **unsensed** org.call path is: ArcSwap route-set load →
       two-index P2C → proof → send — no rediscovery, no candidate
