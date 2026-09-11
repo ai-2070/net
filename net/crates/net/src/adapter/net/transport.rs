@@ -339,7 +339,7 @@ impl std::fmt::Debug for NetSocket {
 ///
 /// Stage 1 of `BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md`: peer-keyed state
 /// names an *endpoint*, not a UDP tuple. Only [`PeerAddr::Udp`] exists in
-/// this stage; the `Rtc` variant is Stage 3's and is feature-gated there.
+/// this stage; the RTC variant is Stage 3's and is feature-gated there.
 ///
 /// Deliberately **not** `FromStr` and **not** `serde`: nothing serializes a
 /// `PeerAddr`. Operator-facing configuration
