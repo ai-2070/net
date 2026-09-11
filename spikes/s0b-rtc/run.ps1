@@ -10,8 +10,13 @@
 param(
   [string]$Chrome = "",
   [int]$HttpPort = 8088,
-  [int]$TimeoutSec = 240
+  [int]$TimeoutSec = 240,
+  # S0c: run the double-AEAD measurement instead of the S0b scenario
+  # sequence. Takes ~13 minutes (7 cells x 30 s x 3 runs).
+  [switch]$Bench
 )
+
+if ($Bench -and $TimeoutSec -lt 1800) { $TimeoutSec = 1800 }
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -41,6 +46,7 @@ try {
   if ($LASTEXITCODE -ne 0) { throw "wasm-bindgen failed" }
   Copy-Item page/index.html dist/ -Force
   Copy-Item page/app.js dist/ -Force
+  Copy-Item page/bench.js dist/ -Force
   Pop-Location
 
   Write-Host "[run] building native anchor"
@@ -84,7 +90,7 @@ try {
     "--disable-features=WebRtcHideLocalIpsWithMdns",
     "--allow-running-insecure-content",
     "--unsafely-treat-insecure-origin-as-secure=http://127.0.0.1:$HttpPort",
-    "http://127.0.0.1:$HttpPort/"
+    $(if ($Bench) { "http://127.0.0.1:$HttpPort/?bench=1" } else { "http://127.0.0.1:$HttpPort/" })
   )
   $chromeProc = Start-Process -FilePath $Chrome -ArgumentList $chromeArgs `
     -RedirectStandardError $chromeLog -RedirectStandardOutput "$chromeLog.out" `
@@ -105,13 +111,24 @@ try {
   if (-not $native.HasExited) { Stop-Process -Id $native.Id -Force -ErrorAction SilentlyContinue }
 
   Write-Host ""
-  Write-Host "=== verdict lines (from the browser console, relayed via /result) ==="
-  $verdicts = Select-String -Path $nativeLog -Pattern "^\[browser\] S0B " | ForEach-Object { $_.Line }
+  Write-Host "=== $(if ($Bench) { 'S0C bench lines' } else { 'verdict lines' }) (from the browser console, relayed via /result) ==="
+  $pattern = if ($Bench) { "^\[browser\] S0C " } else { "^\[browser\] S0B " }
+  $verdicts = Select-String -Path $nativeLog -Pattern $pattern | ForEach-Object { $_.Line }
   $verdicts | ForEach-Object { Write-Host $_ }
   Write-Host ""
   Write-Host "=== the same lines as Chromium logged them to its own console ==="
-  Select-String -Path $chromeLog -Pattern "S0B " -ErrorAction SilentlyContinue |
+  Select-String -Path $chromeLog -Pattern $(if ($Bench) { "S0C " } else { "S0B " }) -ErrorAction SilentlyContinue |
     ForEach-Object { Write-Host $_.Line }
+
+  if ($Bench) {
+    $cells = @($verdicts | Where-Object { $_ -match "S0C (60hz|bulk|rx|saturate) run=" })
+    Write-Host ""
+    Write-Host "[run] bench cells: $($cells.Count) (expect 27)"
+    if (-not $done) { Write-Host "[run] TIMED OUT waiting for the page"; exit 1 }
+    if ($cells.Count -lt 27) { Write-Host "[run] MISSING bench cells"; exit 1 }
+    Write-Host "[run] OK"
+    exit 0
+  }
 
   $ok = ($verdicts | Where-Object { $_ -match "S0B OK role=answerer dir=b2n" }) -and
         ($verdicts | Where-Object { $_ -match "S0B OK role=answerer dir=n2b" }) -and

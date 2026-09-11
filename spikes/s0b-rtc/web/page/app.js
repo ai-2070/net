@@ -11,6 +11,7 @@
 // Every verdict line is both console.log'd and POSTed to /result so the
 // native process prints it on stdout.
 
+import { makeBench } from './bench.js';
 import init, {
   LeafEndpoint,
   keygen_probe,
@@ -175,13 +176,7 @@ async function connectAsAnswerer(sid) {
 // Handshake + round-trip over the channel
 // ---------------------------------------------------------------------
 
-async function handshakeAndRoundTrip(cfg, role, dc, q) {
-  const ep = new LeafEndpoint(cfg.psk, cfg.static, cfg.browser_id, cfg.native_id);
-  dc.send(tagged(TAG_NOISE_MSG1, ep.msg1()));
-  const m2 = await q.next(15000, 'noise msg2');
-  if (m2[0] !== TAG_NOISE_MSG2) throw new Error('expected msg2, got tag ' + m2[0]);
-  ep.read_msg2(m2.subarray(1));
-
+async function roundTrip(role, dc, q, ep) {
   const payload = new TextEncoder().encode(
     'S0B reliable-stream payload from the browser leaf, role=' + role,
   );
@@ -207,19 +202,33 @@ async function handshakeAndRoundTrip(cfg, role, dc, q) {
   return ep;
 }
 
-async function scenario(cfg, role) {
+/// Connect, open the channel, run NKpsk0 — no verdict logging, no
+/// round-trip. Shared by the S0b scenarios and the S0c bench.
+async function establish(cfg, role, { quiet = false } = {}) {
   const sid = role + '-' + Math.random().toString(16).slice(2, 8);
   const t0 = performance.now();
   const { pc, dc } =
     role === 'answerer' ? await connectAsOfferer(sid) : await connectAsAnswerer(sid);
   const q = messageQueue(dc);
   await withTimeout(waitOpen(dc), 20000, 'datachannel open (' + role + ')');
-  await log(
-    `S0B INFO role=${role} channel open after ${Math.round(performance.now() - t0)} ms ` +
-      `(ordered=${dc.ordered} maxRetransmits=${dc.maxRetransmits})`,
-  );
-  const ep = await handshakeAndRoundTrip(cfg, role, dc, q);
-  return { sid, pc, dc, q, ep };
+  if (!quiet) {
+    await log(
+      `S0B INFO role=${role} channel open after ${Math.round(performance.now() - t0)} ms ` +
+        `(ordered=${dc.ordered} maxRetransmits=${dc.maxRetransmits})`,
+    );
+  }
+  const ep = new LeafEndpoint(cfg.psk, cfg.static, cfg.browser_id, cfg.native_id);
+  dc.send(tagged(TAG_NOISE_MSG1, ep.msg1()));
+  const m2 = await q.next(15000, 'noise msg2');
+  if (m2[0] !== TAG_NOISE_MSG2) throw new Error('expected msg2, got tag ' + m2[0]);
+  ep.read_msg2(m2.subarray(1));
+  return { sid, pc, dc, q, ep, openMs: performance.now() - t0 };
+}
+
+async function scenario(cfg, role) {
+  const s = await establish(cfg, role);
+  await roundTrip(role, s.dc, s.q, s.ep);
+  return s;
 }
 
 // ---------------------------------------------------------------------
@@ -414,12 +423,22 @@ async function main() {
   await workerChecks();
 }
 
-main()
+/// S0c: `?bench=1` runs the double-AEAD measurement instead of the S0b
+/// scenario sequence. Same page, same wasm, same driver.
+async function benchMain() {
+  await init();
+  const bench = makeBench({ log, post, sleep, tagged, establish, getConfig });
+  await bench.run();
+}
+
+const isBench = new URLSearchParams(location.search).has('bench');
+
+(isBench ? benchMain() : main())
   .then(async () => {
-    await log('S0B COMPLETE');
+    await log(isBench ? 'S0C COMPLETE' : 'S0B COMPLETE');
     await post('/done');
   })
   .catch(async (e) => {
-    await log('S0B FAILED ' + (e && e.stack ? e.stack : e));
+    await log((isBench ? 'S0C FAILED ' : 'S0B FAILED ') + (e && e.stack ? e.stack : e));
     await post('/done');
   });

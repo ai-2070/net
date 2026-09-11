@@ -10,7 +10,7 @@ use wasm_bindgen::prelude::*;
 
 use s0a_wire::crypto::{handshake_prologue, NoiseHandshake, StaticKeypair};
 use s0a_wire::parsed_packet::ParsedPacket;
-use s0a_wire::protocol::{EventFrame, PacketFlags};
+use s0a_wire::protocol::{EventFrame, NetHeader, PacketFlags, HEADER_SIZE, NONCE_SIZE};
 use s0a_wire::session::NetSession;
 
 #[wasm_bindgen]
@@ -160,6 +160,43 @@ impl LeafEndpoint {
             return Err(JsError::new("no event frames"));
         }
         Ok(frames.remove(0).to_vec())
+    }
+
+    /// S0c config **B** (the DTLS-exporter shortcut, approximated):
+    /// the same real 68-byte `NetHeader`, payload copied straight in,
+    /// **no AEAD**. Same allocation and same wire size minus the
+    /// 16-byte tag, so the delta against `build_packet` is the
+    /// ChaCha20-Poly1305 seal plus the event framing.
+    pub fn build_plain(&mut self, payload: &[u8]) -> Result<Vec<u8>, JsError> {
+        let session = self
+            .session
+            .as_ref()
+            .ok_or_else(|| JsError::new("no session"))?;
+        let seq = session.get_or_create_stream(self.stream_id).next_tx_seq();
+        let header = NetHeader::new(
+            session.session_id(),
+            self.stream_id,
+            seq,
+            [0u8; NONCE_SIZE],
+            payload.len() as u16,
+            1,
+            PacketFlags::RELIABLE,
+        );
+        let mut out = Vec::with_capacity(HEADER_SIZE + payload.len());
+        out.extend_from_slice(&header.to_bytes());
+        out.extend_from_slice(payload);
+        Ok(out)
+    }
+
+    /// S0c config **B**, receive side: header parse and validate only,
+    /// no AEAD. Returns the payload length.
+    pub fn parse_plain(&self, raw: &[u8]) -> Result<u32, JsError> {
+        let addr = "127.0.0.1:1"
+            .parse()
+            .map_err(|_| JsError::new("addr parse"))?;
+        let parsed = ParsedPacket::parse(bytes::Bytes::copy_from_slice(raw), addr)
+            .ok_or_else(|| JsError::new("packet did not parse"))?;
+        Ok(parsed.payload.len() as u32)
     }
 
     /// S0c hook (not measured here): build `n` packets of `size` bytes

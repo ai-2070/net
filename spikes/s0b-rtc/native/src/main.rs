@@ -63,6 +63,21 @@ const TAG_NET_PACKET: u8 = 0x03;
 const TAG_PROBE_START: u8 = 0x04;
 const TAG_PROBE_FILL: u8 = 0x05;
 
+/// S0c bench tags (double-AEAD cost measurement).
+const TAG_BENCH_SYNC: u8 = 0x10;
+const TAG_BENCH_SYNC_ACK: u8 = 0x11;
+/// Browser -> native, config A: a real Net packet (AEAD).
+const TAG_BENCH_A: u8 = 0x12;
+/// Browser -> native, config B: real 68-byte header, no AEAD.
+const TAG_BENCH_B: u8 = 0x13;
+/// Native -> browser: `[tag][seq u32][native_us u64]`.
+const TAG_BENCH_ACK: u8 = 0x14;
+/// Browser -> native: start the receive-direction stream.
+const TAG_BENCH_RX_START: u8 = 0x15;
+const TAG_BENCH_RX_A: u8 = 0x16;
+const TAG_BENCH_RX_B: u8 = 0x17;
+const TAG_BENCH_RX_DONE: u8 = 0x18;
+
 /// Admission probe shape: how many filler packets the mesh side tries to
 /// push while the page's event loop is blocked, and how big each is.
 const PROBE_PACKETS: usize = 200_000;
@@ -112,11 +127,30 @@ struct ProbeStats {
     udp_connreset: usize,
 }
 
+/// S0c receive-side accounting on the native anchor.
+#[derive(Default)]
+struct BenchStats {
+    /// Config A: packets whose AEAD opened, and recovered payload bytes.
+    a_packets: u64,
+    a_payload_bytes: u64,
+    a_decrypt_ns: u64,
+    a_failed: u64,
+    /// Config B: header-parse-only packets and their payload bytes.
+    b_packets: u64,
+    b_payload_bytes: u64,
+    b_parse_ns: u64,
+    b_failed: u64,
+    /// Wall-clock window, in native micros, over which they arrived.
+    first_us: Option<u64>,
+    last_us: u64,
+}
+
 struct Shared {
     cmd_tx: mpsc::Sender<Cmd>,
     peers: Mutex<HashMap<String, PeerHandle>>,
     results: Mutex<Vec<String>>,
     probe: Mutex<ProbeStats>,
+    bench: Mutex<BenchStats>,
     notes: Mutex<Vec<String>>,
     done: Mutex<bool>,
 }
@@ -195,6 +229,7 @@ fn main() {
         peers: Mutex::new(HashMap::new()),
         results: Mutex::new(Vec::new()),
         probe: Mutex::new(ProbeStats::default()),
+        bench: Mutex::new(BenchStats::default()),
         notes: Mutex::new(Vec::new()),
         done: Mutex::new(false),
     });
@@ -816,6 +851,114 @@ fn mesh_loop(
                     p.accepted, p.admission_refusals, p.write_false, p.max_buffered
                 );
             }
+            // ---------------- S0c: double-AEAD cost ----------------
+            TAG_BENCH_SYNC => {
+                // Clock sync: echo the sequence with this process's
+                // monotonic reading so the page can express its own
+                // `performance.now()` in native micros.
+                let mut out = Vec::with_capacity(13);
+                out.push(TAG_BENCH_SYNC_ACK);
+                out.extend_from_slice(&body[..4.min(body.len())]);
+                out.resize(5, 0);
+                out.extend_from_slice(&native_us().to_le_bytes());
+                submit(&shared, &sid, gen, out);
+            }
+            TAG_BENCH_A | TAG_BENCH_B => {
+                let Some(session) = entry.session.as_ref() else {
+                    continue;
+                };
+                let t0 = Instant::now();
+                let recovered = if tag == TAG_BENCH_A {
+                    decrypt_packet(session, body)
+                } else {
+                    parse_plain(body)
+                };
+                let elapsed = t0.elapsed().as_nanos() as u64;
+                let arrival = native_us();
+                let mut b = shared.bench.lock();
+                if b.first_us.is_none() {
+                    b.first_us = Some(arrival);
+                }
+                b.last_us = arrival;
+                let seq = match &recovered {
+                    Some(p) if p.len() >= 4 => {
+                        let n = p.len() as u64;
+                        if tag == TAG_BENCH_A {
+                            b.a_packets += 1;
+                            b.a_payload_bytes += n;
+                            b.a_decrypt_ns += elapsed;
+                        } else {
+                            b.b_packets += 1;
+                            b.b_payload_bytes += n;
+                            b.b_parse_ns += elapsed;
+                        }
+                        u32::from_le_bytes([p[0], p[1], p[2], p[3]])
+                    }
+                    _ => {
+                        if tag == TAG_BENCH_A {
+                            b.a_failed += 1;
+                        } else {
+                            b.b_failed += 1;
+                        }
+                        continue;
+                    }
+                };
+                drop(b);
+                let mut out = Vec::with_capacity(13);
+                out.push(TAG_BENCH_ACK);
+                out.extend_from_slice(&seq.to_le_bytes());
+                out.extend_from_slice(&arrival.to_le_bytes());
+                submit(&shared, &sid, gen, out);
+            }
+            TAG_BENCH_RX_START => {
+                // `[mode u8][size u32][pps u32][duration_ms u32]`
+                if body.len() < 13 {
+                    continue;
+                }
+                let Some(session) = entry.session.as_ref() else {
+                    continue;
+                };
+                let mode = body[0];
+                let size = u32::from_le_bytes([body[1], body[2], body[3], body[4]]) as usize;
+                let pps = u32::from_le_bytes([body[5], body[6], body[7], body[8]]).max(1);
+                let dur_ms = u32::from_le_bytes([body[9], body[10], body[11], body[12]]) as u64;
+                shared.note(format!(
+                    "session {sid}: bench rx start mode={} size={size} pps={pps} dur={dur_ms}ms",
+                    mode as char
+                ));
+                let period = Duration::from_nanos(1_000_000_000 / pps as u64);
+                let start = Instant::now();
+                let deadline = start + Duration::from_millis(dur_ms);
+                let mut seq: u32 = 0;
+                let mut payload = vec![0x5Au8; size];
+                while Instant::now() < deadline {
+                    payload[..4].copy_from_slice(&seq.to_le_bytes());
+                    let (t, body) = if mode == b'A' {
+                        (
+                            TAG_BENCH_RX_A,
+                            build_packet(session, entry.stream_id ^ 2, &payload),
+                        )
+                    } else {
+                        (TAG_BENCH_RX_B, build_plain(session, &payload))
+                    };
+                    let mut out = Vec::with_capacity(1 + body.len());
+                    out.push(t);
+                    out.extend_from_slice(&body);
+                    if submit(&shared, &sid, gen, out) {
+                        seq = seq.wrapping_add(1);
+                    }
+                    let next = start + period * seq;
+                    let now = Instant::now();
+                    if next > now {
+                        thread::sleep(next - now);
+                    }
+                }
+                let mut out = Vec::with_capacity(5);
+                out.push(TAG_BENCH_RX_DONE);
+                out.extend_from_slice(&seq.to_le_bytes());
+                submit(&shared, &sid, gen, out);
+                shared.note(format!("session {sid}: bench rx done, sent {seq} packets"));
+            }
             _ => {}
         }
     }
@@ -874,6 +1017,39 @@ fn decrypt_packet(session: &NetSession, raw: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     Some(frames.remove(0).to_vec())
+}
+
+/// S0c config B, send side: the same real 68-byte `NetHeader`, payload
+/// copied in, no AEAD.
+fn build_plain(session: &NetSession, payload: &[u8]) -> Vec<u8> {
+    use s0a_wire::protocol::{NetHeader, HEADER_SIZE, NONCE_SIZE};
+    let header = NetHeader::new(
+        session.session_id(),
+        0,
+        0,
+        [0u8; NONCE_SIZE],
+        payload.len() as u16,
+        1,
+        PacketFlags::RELIABLE,
+    );
+    let mut out = Vec::with_capacity(HEADER_SIZE + payload.len());
+    out.extend_from_slice(&header.to_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+/// S0c config B, receive side: header parse and validate only.
+fn parse_plain(raw: &[u8]) -> Option<Vec<u8>> {
+    let src: SocketAddr = "127.0.0.1:1".parse().ok()?;
+    let parsed = ParsedPacket::parse(bytes::Bytes::copy_from_slice(raw), src)?;
+    Some(parsed.payload.to_vec())
+}
+
+/// Monotonic micros since process start — the native half of the S0c
+/// clock sync.
+fn native_us() -> u64 {
+    static START: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+    START.elapsed().as_micros() as u64
 }
 
 // ---------------------------------------------------------------------
@@ -1009,6 +1185,34 @@ fn handle_http(
             }
             ("200 OK", "text/plain", b"ok".to_vec())
         }
+        ("GET", "/bench-stats") => {
+            let b = shared.bench.lock();
+            let window_us = b.last_us.saturating_sub(b.first_us.unwrap_or(b.last_us));
+            (
+                "200 OK",
+                "text/plain",
+                format!(
+                    "a_packets={}\na_payload_bytes={}\na_decrypt_ns={}\na_failed={}\n\
+                     b_packets={}\nb_payload_bytes={}\nb_parse_ns={}\nb_failed={}\n\
+                     window_us={}\n",
+                    b.a_packets,
+                    b.a_payload_bytes,
+                    b.a_decrypt_ns,
+                    b.a_failed,
+                    b.b_packets,
+                    b.b_payload_bytes,
+                    b.b_parse_ns,
+                    b.b_failed,
+                    window_us,
+                )
+                .into_bytes(),
+            )
+        }
+        ("POST", "/bench-reset") => {
+            *shared.bench.lock() = BenchStats::default();
+            *shared.probe.lock() = ProbeStats::default();
+            ("200 OK", "text/plain", b"ok".to_vec())
+        }
         ("GET", "/probe-stats") => {
             let p = shared.probe.lock();
             let mean = if p.staleness_n > 0 {
@@ -1075,8 +1279,8 @@ fn handle_http(
             ("200 OK", "text/plain", b"ok".to_vec())
         }
         ("GET", p) => {
-            let rel = if p == "/" { "/index.html" } else { p };
-            let rel = rel.split('?').next().unwrap_or(rel);
+            let rel = p.split('?').next().unwrap_or(p);
+            let rel = if rel == "/" { "/index.html" } else { rel };
             let full = format!("{web_root}{rel}");
             match std::fs::read(&full) {
                 Ok(data) => ("200 OK", content_type(rel), data),
