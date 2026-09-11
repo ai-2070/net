@@ -1,0 +1,16 @@
+docs/internal/plans/BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md
+  h_64425bc75e3f3d 62,454,500-543,765-775,797-802,934-937,1281-1292,1321-1329,1457-1458,1601-1602,1608-1627
+spikes/S0C_BRIEF.md
+  h_64425bc75e3f3d 1-101
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "8f4cacc5d31a297e637f1480ec0b8fb0bf57ab37",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
