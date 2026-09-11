@@ -1,0 +1,24 @@
+docs/internal/performance/WEBRTC_DOUBLE_AEAD.md
+  h_64425bc75e3f3d 1-341
+spikes/s0b-rtc/native/src/main.rs
+  h_64425bc75e3f3d 66-80,130-147,153,232,854-961,1022-1054,1188-1215,1282-1283
+spikes/s0b-rtc/run.ps1
+  h_64425bc75e3f3d 13-16,19-20,49,93,114-116,120,123-132
+spikes/s0b-rtc/web/page/app.js
+  h_64425bc75e3f3d 14,179,205-207,214-231,426-436,438,442
+spikes/s0b-rtc/web/page/bench.js
+  h_64425bc75e3f3d 1-363
+spikes/s0b-rtc/web/src/lib.rs
+  h_64425bc75e3f3d 13,165-201
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "80fbe57bfafa72031c36d20066a4630ceb452416",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
