@@ -38200,7 +38200,14 @@ impl MeshNode {
     }
 
     /// The pair action for this peer, ICE short-circuit included.
-    /// The pair action for this peer, ICE short-circuit included.
+    ///
+    /// `nat-traversal`-gated like its three callers (`connect_direct`,
+    /// `connect_direct_auto`, `attempt_direct_upgrade`): the classifier
+    /// lives under `super::traversal`, which does not exist without the
+    /// feature — a member built with `webrtc` off and `nat-traversal`
+    /// off (the meshdb/meshos/deck FFI crates) otherwise fails to
+    /// compile the core.
+    #[cfg(feature = "nat-traversal")]
     fn pair_action_for(&self, peer_node_id: u64) -> super::traversal::classify::PairAction {
         #[cfg(feature = "webrtc")]
         let rtc_side = self.peer_endpoint_is_rtc(peer_node_id);
