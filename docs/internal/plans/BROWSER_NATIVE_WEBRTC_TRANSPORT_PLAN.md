@@ -22,9 +22,10 @@ the path.
 
 ## Status
 
-**Draft, revision 2 — not started.** First draft 2026-09-05 against
+**Draft, revision 3 — not started.** First draft 2026-09-05 against
 `net-mesh` 0.36.0 (`master` at `079894c76`); revised the same day after
-Kyra's source-checked review (see [Review log](#review-log)).
+Kyra's source-checked review; revised again 2026-09-11 after Fable's
+review of revision 2 and Kyra's dispositions (see [Review log](#review-log)).
 
 **Re-baselined 2026-09-11 against `master`
 `132dbdcff251973e9eaf24e5c08eca7078d3b6f2`.** Every `path:line` and every
@@ -47,6 +48,21 @@ identity, the explicit UDP-blocked limitation, real-browser spikes before the
 broad refactor. Stages 1–6 are **not** implementation-ready and are not
 authorized by this document. Neither a resolved question list nor a clean
 exit gate is implementation proof.
+
+**Revision 3 (2026-09-11) — Fable's source-checked review of revision 2,
+dispositions by Kyra.** Four repairs were accepted as *pre-Stage-1
+decisions*; none overturns the architecture and none widens the
+authorization. Before Stage 1 may be authorized the plan must carry:
+
+| # | Decision | Section |
+|---|---|---|
+| A | Send-path seam: UDP keeps its async/deadline/batching semantics; RTC uses bounded non-blocking admission; Stage 0 inventories the send and ingress paths and proposes the contract | §1, §2, Stage 0 (S0d), Stage 1 |
+| B | Pre-enrollment privileges: what a transport-authenticated peer may do before enrollment and what enrollment enables; the PSK stated precisely, not as "public" | §5 Layer 0, Open question 7 |
+| C | The routing-envelope codec is part of the portable wire inventory; S0a proves a routed round-trip | §7, Stage 0 (S0a) |
+| D | `str0m` pinned with `default-features = false, features = ["rust-crypto"]`; S0b proves it on supported native targets in both roles | §2, §Dependencies, Stage 0 (S0b) |
+
+Estimates are withdrawn, not doubled: Stage 0's outputs re-derive them
+(§Rough estimates).
 
 Six contract defects were found in draft 2 and are repaired in place; each is
 marked at its section and listed in the [Review log](#review-log):
@@ -355,6 +371,35 @@ line by line.
 Rejected — it lies to every `is_loopback` / partition / reflex check and
 would leak into `reflex_addr`.
 
+**The send path is part of the refactor, and its contract is fixed now
+(Fable / Kyra, 2026-09-11).** Peer-keyed *state* is not the whole
+surface: every outbound packet leaves through a raw
+`socket.send_to(packet, addr).await` — ~30 sites in `mesh.rs` (`:515`,
+`:4827`, `:5070`, `:6797`/`:6806` under `bound_datagram_send` with
+`DATAGRAM_SEND_DEADLINE`, `:7815`, `:9317`, `:25479`, `:25741`, `:25792`,
+`:25906`, `:26399`, `:27187`, `:27287`, `:27554`/`:27556`, `:28397`/`:28425`,
+`:33536`, `:34104`, `:34860`, `:35503`, `:37543`, `:39387`, `:39566`,
+`:40321`, `:40377`), five in `mod.rs`, `proxy.rs:357`, and the scheduler
+drain in `router.rs` (`QueuedPacket::dest: SocketAddr` at `:198`, grouped
+by destination for `sendmmsg` at `:945–1020`). None of them compiles once
+the destination is a `PeerAddr`, so Stage 1 necessarily introduces the
+send seam. Its contract is **transport-specific submission behind the
+generalized endpoint** — option B, chosen over forcing UDP through the RTC
+admission contract:
+
+- UDP keeps its current async behaviour, the applicable deadlines, its
+  error mapping (`deliver_stream_packet`'s unscheduled arm maps failure to
+  `StreamError::Transport`, `mesh.rs:39386–39391`, never `Backpressure`)
+  and its batching. A UDP `WouldBlock` is **not** converted into
+  application backpressure to make one trait look uniform.
+- RTC uses bounded, non-blocking queue admission (§2).
+- The scheduler drain distinguishes UDP batches from RTC submissions.
+
+Sequencing: Stage 0 (S0d) produces the send-path and ingress-path
+inventory and the proposed contract; Stage 1 implements only the
+UDP-preserving preparation; Stage 3 adds the RTC behaviour. That keeps the
+staging boundary real.
+
 ### 2. `str0m` behind a single owning driver task with a bounded, non-blocking send contract
 
 **Crate.** `str0m` 0.23.1 (checked 2026-09-05: MSRV 1.85.0 < toolchain
@@ -372,12 +417,20 @@ instance, single-threaded, no shared locks:
 
 - **Inbound:** datagrams from the RTC socket → STUN-binding responder
   (unsolicited, no ICE credentials) or `Rtc::handle_input`; DataChannel
-  payloads that come out are Net packets tagged `PeerAddr::Rtc(id)` and are
-  pushed to the mesh dispatch context exactly as UDP packets are.
-- **Outbound — admission is the ONLY refusal boundary.** The mesh calls
-  `Transport::try_send(packet, PeerAddr::Rtc(id))`, which is a **non-blocking**
-  push onto a bounded per-peer queue (`RtcConfig::send_queue_packets`, default
-  256). The admission decision is synchronous and total: the packet is either
+  payloads that come out are Net packets tagged `PeerAddr::Rtc(id)`.
+  **One dispatch owner is preserved** (Kyra, 2026-09-11): `dispatch_packet`
+  (`mesh.rs:24321`) is called only from the single receive loop today, and
+  that stays true — RTC ingress is fed into a bounded input of the
+  `IngressReceiver` orchestration (`mesh.rs:24218`), never dispatched
+  concurrently from the driver. The UDP socket and its framing are
+  unchanged; the ingress *orchestration* is not, and the earlier claim that
+  the seam is "left untouched" is withdrawn.
+- **Outbound — admission is the ONLY refusal boundary.** For an RTC
+  endpoint the send seam (§1) submits via `try_send(packet, RtcPeerId)`, a
+  **non-blocking** push onto a bounded per-peer queue
+  (`RtcConfig::send_queue_packets`, default 256, with reserved bytes/slots
+  as the hard bound — see below). The admission decision is synchronous
+  and total: the packet is either
   refused *now* with `WouldBlock` — which the stream layer maps to
   `StreamError::Backpressure`, meaning **no packets were enqueued**
   (`stream.rs:168–170`) — or accepted, after which the call has returned and
@@ -394,10 +447,12 @@ instance, single-threaded, no shared locks:
   send accounting (the rollback/`try_rollback_tx_seq` path at `mesh.rs:39284+`)
   is preserved exactly: it belongs to the synchronous boundary.
 - **SCTP buffering is folded into admission, not bolted on after it.** The
-  driver's buffered-amount reading against `RtcConfig::max_buffered_bytes`
-  (default 256 KiB) is an **input to the admission decision** — consulted
-  before `try_send` returns — so an over-buffered channel refuses at the same
-  boundary a full queue does. After acceptance the driver owns the packet
+  driver-published buffered-amount reading against
+  `RtcConfig::buffered_amount_advisory` (default 256 KiB) is an **input to
+  the admission decision** — consulted before `try_send` returns — so an
+  over-buffered channel refuses at the same boundary a full queue does. It
+  is advisory (see "Hard bound vs advisory reading" below); the hard bound
+  is `send_queue_packets` / `send_queue_bytes`. After acceptance the driver owns the packet
   under a bounded retention policy that Stage 3 must specify explicitly:
   how long a queued packet is retained, whether it is retried or dropped on a
   later `Ok(false)`, and what terminal channel close does to the remainder.
@@ -419,14 +474,32 @@ instance, single-threaded, no shared locks:
   is told via the existing peer-removal path so `addr_to_node` and
   `PeerTransport` are torn down in the normal order.
 
-The trait shape is fixed only after Stage 0's spike exercises this loop:
+The shape below is the **RTC submission contract**, not a uniform transport
+trait: UDP keeps its own async submission behind the same `PeerAddr`
+boundary (§1). It is fixed only after Stage 0's spike exercises this loop:
 
 ```rust
-pub trait Transport: Send + Sync {
-    fn try_send(&self, packet: &[u8], to: PeerAddr) -> io::Result<()>; // WouldBlock == Backpressure
-    fn kind(&self) -> TransportKind;
-}
+/// RTC half of the send seam. `WouldBlock` == `Backpressure`.
+fn try_send(&self, packet: &[u8], to: RtcPeerId) -> io::Result<()>;
 ```
+
+**Hard bound vs advisory reading** (Kyra, 2026-09-11).
+`Channel::buffered_amount` takes `&mut self` on a handle obtained from
+`&mut Rtc`, so the driver is the only reader; whatever it publishes to the
+admission side is a snapshot that is stale by up to one drain cycle. A
+snapshot is **advisory** — it cannot enforce a hard bound. The hard bound
+is provided by **reserved queue bytes/slots** accounted at admission; the
+driver then handles actual SCTP acceptance, including `Ok(false)` after a
+passing advisory precheck, under the post-acceptance policy above. How the
+snapshot is factored (atomic, message, otherwise) is Stage 3's choice, not
+prescribed here.
+
+**str0m's single-mutation invariant** (README, "The single-mutation
+invariant"): every mutation of an `Rtc` — `handle_input`, `Channel::write`,
+SDP/candidate changes — must be followed by a complete `poll_output` drain
+to `Output::Timeout` before the next mutation. The driver therefore pops one
+queued packet per `Channel::write` + drain; the per-peer queue is the only
+cross-task structure and is consumed only by the driver.
 
 ### 3. One Net packet per DataChannel message; unordered, zero-retransmit; Net's reliability stays authoritative
 
@@ -490,9 +563,29 @@ browser bootstrap credential =
 Its encoding, minting CLI and expiry rules are a **Stage 4 deliverable with
 its own review**, not an inherited format. The PSK is a standing transport
 secret while the invite `nonce` is single-use, so the two halves have
-different lifetimes and the credential must state both; a design that leaks
-the mesh PSK to every browser that was ever handed a bootstrap credential is
-the failure mode to argue about explicitly, before Stage 4 writes it.
+different lifetimes and the credential must state both.
+
+**The PSK, stated precisely** (Fable / Kyra, 2026-09-11). `psk: [u8; 32]`
+is "PSK shared across the mesh" (`mesh.rs:1570`). A secret shipped to
+browser JavaScript is available to every recipient of that credential; it
+becomes *public* exactly when credentials are handed out publicly. A
+browser does not by itself imply anonymous provisioning. Two rules follow:
+
+- **Never** distribute an existing private/native deployment's mesh PSK to
+  arbitrary public application visitors.
+- A public-browser deployment is a **deliberately separate transport trust
+  domain** with its own PSK.
+
+A separate PSK domain does **not** solve enforcement, because enrollment
+(the `JoinRequest` nRPC call) runs *after* the Noise session and nothing on
+the responder path today ties post-handshake behaviour to it: a
+transport-authenticated peer can announce capabilities, open streams, obtain
+routed forwarding via `connect_via` and emit `0x0D02` before enrolling.
+The plan cannot call enrollment "device admission" while leaving its
+enforcement effect unspecified. That is **Open question 7, to be decided
+before Stage 1's design freezes**; the recommended position is recorded
+there. Implementing the resulting admission behaviour is *not* part of the
+behaviour-neutral UDP refactor.
 
 With that in hand: for a browser `rendezvous` is the anchor's bootstrap URL.
 The browser POSTs an SDP offer to `https://<anchor>/rtc/offer`, trickles
@@ -661,24 +754,32 @@ flooding, so it is not offered.
 ### 7. The browser node is a leaf profile: a `net-wire` crate plus a `net-leaf` crate
 
 **`net-wire` crate** (`crates/net/wire/`). Extract `protocol`, `crypto`,
-`pool`, `batch`, `stream`, `reliability`, `session` and the wire-level
-subprotocol codecs into a tokio-free crate; the core depends on it and
-re-exports under the existing paths so no `use net::adapter::net::…` site
-changes. Two known couplings to cut in Stage 2: `session.rs` imports
-`crate::event::StoredEvent` (move the type or the dependency) and
-`subnet::route_hop::SharedHopReplayWindow` (move the window type into
-`net-wire`). The `Instant` uses go behind a `Clock` trait (native
-`std::time::Instant`; wasm `web_time::Instant`). CI adds
+`pool`, `batch`, `stream`, `reliability`, `session`, the wire-level
+subprotocol codecs **and the routing-envelope codec** into a tokio-free
+crate; the core depends on it and re-exports under the existing paths so no
+`use net::adapter::net::…` site changes. The routing envelope was missing
+from the seven-module list (Fable, 2026-09-11): every routed-session packet
+is wrapped in a `RoutingHeader` (`send_routed`, `mesh.rs:28369–28427`;
+`connect_via`, `:39565`), and Layer 2 is the leaf's only pre-direct path,
+so a non-forwarding leaf still originates and receives routed packets.
+`RoutingHeader`, its flags/constants and `to_bytes` / `from_bytes` /
+`write_to` (`route.rs:182`, `:200`, `:215`, `:264`) move; the route *table*
+(`RouteEntry`, metrics, `next_hop`) does not. Two known couplings to cut in
+Stage 2: `session.rs` imports `crate::event::StoredEvent` (move the type or
+the dependency) and `subnet::route_hop::SharedHopReplayWindow` (move the
+window type into `net-wire`). The `Instant` uses go behind a `Clock` trait
+(native `std::time::Instant`; wasm `web_time::Instant`). CI adds
 `cargo check -p net-wire --target wasm32-unknown-unknown`.
 
 **`net-leaf` crate** (`crates/net/leaf/`, wasm32, `wasm-bindgen`):
 
 - `RtcLeafTransport` over `web_sys::RtcPeerConnection` / `RtcDataChannel`,
   one channel per peer; same §2 bounded-send and buffered-amount rules.
-- Dispatcher for: plain events, channel membership (`0x0A00`), stream
-  window (`0x0B00`), capability announcement (`0x0C00`), fold (`0x1000`),
-  nRPC wire types, RTC signal (`0x0D02`). Unknown subprotocols dropped with a
-  counter.
+- Dispatcher for: routing envelopes addressed to itself (`ROUTING_MAGIC`,
+  unwrapped; anything else dropped per the non-forwarding role below),
+  plain events, channel membership (`0x0A00`), stream window (`0x0B00`),
+  capability announcement (`0x0C00`), fold (`0x1000`), nRPC wire types, RTC
+  signal (`0x0D02`). Unknown subprotocols dropped with a counter.
 - Session table keyed by node id; Noise handshakes; per-stream reliability;
   identity storage (§8).
 
@@ -729,6 +830,17 @@ by the existing address-independent identity-binding path. (Running the
 node in a `SharedWorker` would be cleaner, but `RTCPeerConnection` is not
 available in worker contexts today; Stage 0 verifies current browser
 status.)
+
+**Leader lifecycle, to be specified in Stage 5** (Kyra, 2026-09-11). The
+dead leader owned every DataChannel; peers learn of it by ICE disconnect
+(browser defaults on the order of 5–30 s) or Net failure detection. The
+specification must cover: the interruption budget; disposition of pending
+nRPC calls and in-flight stream sends; restoration of streams and channel
+subscriptions by the new leader; and stale-leader fencing so a suspended
+tab that resumes cannot present the identity alongside its successor. The
+follower-tab proxy (streams, nRPC futures, events over
+`BroadcastChannel` / `MessagePort`) is a real SDK surface, not glue. Tests
+must cover tab suspension/resumption as well as closing the leader.
 
 ### 9. Browser ↔ browser is the §5 sequence with the mesh as the signalling network
 
@@ -797,37 +909,63 @@ stage that introduces each.
 
 ## Stage 0 — Spikes (before any wide refactor)
 
-Three throwaway spikes, in parallel, none touching `mesh.rs`. Their purpose
-is to retire the unknowns that the wide refactor would otherwise be built on
-top of.
+Three throwaway spikes in parallel plus one desk inventory (S0d), none
+touching `mesh.rs`. Their purpose is to retire the unknowns that the wide
+refactor would otherwise be built on top of, and to return the evidence
+Stage 1's authorization and the re-estimate depend on.
 
-- **S0a — wire boundary.** Copy the seven wire modules into a scratch crate,
-  cut the two `session.rs` couplings, shim `Instant`, and get
-  `cargo check --target wasm32-unknown-unknown` green. Output: the exact list
-  of types that must move for Stage 2, and the wasm size of crypto + wire.
+- **S0a — wire boundary.** Copy the seven wire modules **plus the
+  routing-envelope codec** (§7) into a scratch crate, cut the two
+  `session.rs` couplings, shim `Instant`, and get
+  `cargo check --target wasm32-unknown-unknown` green. Minimum proof is a
+  **routed handshake/envelope round-trip** through the scratch crate, not
+  compilation alone — compilation can pass while omitting the leaf's
+  required pre-direct path. Output: the exact list of types that must move
+  for Stage 2, and the wasm size of crypto + wire.
 - **S0b — RTC loop.** A scratch native binary owning a UDP socket and a
-  str0m `Rtc`, plus a headless Chromium page: DataChannel up, then a Noise
-  NKpsk0 handshake and one reliable-stream round-trip over it using the S0a
-  crate on both ends. Output: the driver ownership shape (§2) validated, the
-  buffered-amount hook confirmed, ICE-TCP support in str0m confirmed or
-  denied, `RTCPeerConnection`-in-worker status confirmed.
+  str0m `Rtc` built with the pinned configuration (§Dependencies:
+  `default-features = false, features = ["rust-crypto"]`), plus a headless
+  Chromium page: DataChannel up, then a Noise NKpsk0 handshake and one
+  reliable-stream round-trip over it using the S0a crate on both ends.
+  Exercise **both roles** — native responder ↔ browser *and* native
+  initiator ↔ browser (str0m is developed as an SFU; its README says
+  peer-to-peer "has received less testing") — and observe the
+  mutate → drain-to-`Timeout` invariant between mutations. Output: the
+  driver ownership shape (§2) validated, the buffered-amount reading
+  confirmed as advisory and the reserved-bytes bound exercised, the pinned
+  dependency configuration built on every supported native target, ICE-TCP
+  support in str0m confirmed or denied, `RTCPeerConnection`-in-worker
+  status confirmed, and the offer → DataChannel-open setup latency with
+  and without trickle (Stage 4 decides the WebSocket on it).
 - **S0c — double-AEAD cost.** In S0b, measure ChaCha20-Poly1305 over DTLS
   at 60 Hz × 1 KiB and at 1 MB/s bulk in the browser. Output: a number in
   `docs/internal/performance/` and a decision on whether the DTLS-exporter
   shortcut leaves "deferred".
+- **S0d — send/ingress inventory.** Not a spike: enumerate every outbound
+  submission site (§1's list is the starting point, re-derived at the
+  current head) and every ingress entry into `dispatch_packet`, classify
+  each by deadline / error-mapping / batching behaviour, and propose the
+  UDP-preserving seam contract (§1) and the bounded RTC ingress input (§2).
+  Output: the inventory and the proposed contract, reviewed before Stage 1.
 
 ### Exit criteria
 
-- All three outputs written up; §2's trait and §7's type list finalized
-  from them.
+- All four outputs written up; §2's RTC submission contract, §1's send
+  seam and §7's type list finalized from them.
+- Estimates for Stages 1–6 re-derived from the outputs (§Rough estimates).
 - No repository code outside `docs/` and a `spikes/` scratch directory
   changed.
 
 ## Stage 1 — `PeerAddr` endpoint generalization (UDP-only, behaviour-neutral)
 
 Generalize `PeerTransport` and every peer-keyed site listed in §Context to
-`PeerAddr`. Only the `Udp` variant exists; no feature flag yet. Traversal
-modules keep `SocketAddr` at their edges.
+`PeerAddr`, and introduce the send seam of §1 in its **UDP-preserving**
+form only: every raw `socket.send_to` site and the scheduler drain submit
+through the generalized endpoint with their current async behaviour,
+deadlines, error mapping and batching intact. Only the `Udp` variant
+exists; no feature flag yet; no RTC behaviour. Traversal modules keep
+`SocketAddr` at their edges. Nothing from Open question 7 (pre-enrollment
+admission) lands here — this stage is behaviour-neutral by definition.
 
 ### Exit criteria
 
@@ -835,7 +973,15 @@ modules keep `SocketAddr` at their edges.
 - Every existing integration and witness test passes; mechanical signature
   edits allowed, assertion and coverage preserved, witness diffs reviewed
   line by line.
-- `cargo clippy --lib --bins -- -D warnings` clean.
+- The repository's full applicable pre-push matrix (`AGENTS.md`, "Pre-push
+  checklist"): `cargo fmt --check`, `cargo check --workspace --all-targets`,
+  the three strict `--lib --bins` clippy feature sets, the permissive
+  `--all-targets` clippy, and `RUSTDOCFLAGS="-D warnings" cargo doc` — not
+  one clippy command.
+- UDP send semantics unchanged: `deliver_stream_packet`'s unscheduled arm
+  still maps failure to `StreamError::Transport`; `bound_datagram_send`
+  deadlines and the `sendmmsg` drain grouping survive; no UDP `WouldBlock`
+  surfaces as `Backpressure`.
 - Default build: exported C-ABI symbol set unchanged. **Stage 1 owns this
   job**: establish the symbol baseline and the comparison *before* the
   endpoint refactor lands, so the criterion can actually fail. It is a stage
@@ -845,8 +991,8 @@ modules keep `SocketAddr` at their edges.
 
 Extract per §7 using S0a's type list; re-export under existing paths; add
 the wasm32 check and a `cross_lang_wire` golden fixture set (header,
-`EventFrame`, `NackPayload`, `StreamWindow`, announcement with and without
-the new optional fields).
+`RoutingHeader` envelope, `EventFrame`, `NackPayload`, `StreamWindow`,
+announcement with and without the new optional fields).
 
 ### Exit criteria
 
@@ -861,8 +1007,14 @@ the new optional fields).
 ## Stage 3 — Native `webrtc` feature: driver, dedicated socket, STUN, loopback harness
 
 - `adapter/net/rtc/{mod,driver,transport,stun,config}.rs`; `PeerAddr::Rtc`;
+  the RTC arm of the §1 send seam and of the scheduler drain; the bounded
+  RTC input on `IngressReceiver` (§2, one dispatch owner);
   `RtcConfig { bind_addr, public_addr, ice_deadline, max_peers,
-  send_queue_packets, max_buffered_bytes, serve_stun, serve_bootstrap }`.
+  send_queue_packets, send_queue_bytes, buffered_amount_advisory,
+  serve_stun, serve_bootstrap }` — `send_queue_packets` / `send_queue_bytes`
+  are the reserved slots/bytes that form the hard admission bound;
+  `buffered_amount_advisory` is the driver-published SCTP reading that may
+  refuse earlier but never defines the bound (§2).
 - **Harness:** two native nodes on loopback where B's session to A is forced
   onto a DataChannel via a test-only `connect_rtc_loopback`. Run the
   *existing* stream, reliability, backpressure, nRPC, fold and
@@ -872,13 +1024,21 @@ the new optional fields).
 
 - Those files pass with the peer on `PeerAddr::Rtc`, including the
   stale-session and direct/routed migration witnesses.
-- Admission refuses — full queue OR over-buffer — surface as
+- Admission refuses — reserved slots or reserved bytes exhausted, or the
+  advisory buffered-amount reading over threshold — surface as
   `Backpressure` *from `try_send` itself*, with no packets enqueued and no
   credit committed; nothing refuses after acceptance (§2). Test with an
   injected slow DataChannel, and separately with a `Channel::write` stub
-  returning `Ok(false)` after a passing precheck: that path must exercise the
-  post-acceptance retention policy and must NOT surface as whole-call
-  backpressure.
+  returning `Ok(false)` after a passing advisory precheck: that path must
+  exercise the post-acceptance retention policy and must NOT surface as
+  whole-call backpressure. A witness must show the reserved-bytes bound
+  holding while the advisory reading is stale (driver paused mid-drain).
+- RTC ingress reaches `dispatch_packet` only through the receive loop's
+  single owner: a witness asserts no second caller and preserved per-source
+  ordering across the UDP and RTC inputs.
+- UDP behaviour with `webrtc` on is byte-for-byte the Stage 1 behaviour:
+  `deliver_stream_packet`'s UDP arm, `bound_datagram_send` deadlines and
+  the `sendmmsg` grouping are unchanged.
 - Every non-`Stream::send` outbound class (events, `0x0D02` signalling,
   forwarding, retransmission) has its stated pressure disposition asserted.
 - The §5 delivery sequence — routed → authenticated direct → forced direct
@@ -901,9 +1061,18 @@ the new optional fields).
   pattern); `PairAction::Ice`.
 - `0x0D02` codec, dispatch, forwarding, per-sender budget.
 - Bootstrap HTTPS/WebSocket listener (`axum` + the payments crate's pinned
-  rustls), feature-gated; **the browser bootstrap credential** of §5 Layer 0
-  — its encoding, minting path and expiry rules, reviewed as a new credential
-  format, not as invite reuse; `Mesh::join` over a DataChannel session.
+  rustls), feature-gated. **Browser-trusted TLS is in scope** (Fable /
+  Kyra, 2026-09-11): browsers refuse a self-signed `https://<anchor>`, the
+  app origin differs from the anchor origin, and trickle rides `wss`. Stage
+  4 therefore delivers a browser-trusted certificate path (ACME or
+  operator-supplied), an explicit cross-origin HTTP policy, and WebSocket
+  `Origin` validation if trickling remains. CI must not hide deployment
+  failures behind certificate-ignore flags. A gather-complete single POST
+  (no WebSocket) is a valid simplification, decided on S0b's setup-latency
+  evidence, not by preference. **The browser bootstrap credential** of §5
+  Layer 0 — its encoding, minting path and expiry rules, reviewed as a new
+  credential format, not as invite reuse; `Mesh::join` over a DataChannel
+  session.
 - `net-mesh anchor` CLI subcommand; Deck surfaces anchors and their
   `rtc_addr`.
 
@@ -1025,7 +1194,8 @@ the new optional fields).
   `pending_direct_initiators`, dispatch context, `spawn_receive_loop`
   (`:24203`), `connect*` (`connect_via` at `:39609`), reroute call sites,
   announcement route-learning (`:33150`).
-- `adapter/net/transport.rs` — `PeerAddr`, `Transport`.
+- `adapter/net/transport.rs` — `PeerAddr`, the send seam (UDP submission in
+  Stage 1; the RTC half arrives in Stage 3).
 - `adapter/net/route.rs`, `reroute.rs`, `router.rs`, `proxy.rs`,
   `failure.rs`, `session.rs`, `swarm.rs`, `behavior/proximity.rs`,
   `behavior/fold/{routing,capability}.rs`.
@@ -1052,8 +1222,9 @@ the new optional fields).
 
 ## Open questions — dispositions (Kyra, 2026-09-11)
 
-Four are **closed** as recorded policy; two stay at their evidence gates.
-Closing these does **not** discharge the implementation defects in the
+Four are **closed** as recorded policy; two stay at their evidence gates;
+one (7) was added 2026-09-11 and must be decided before Stage 1. Closing
+these does **not** discharge the implementation defects in the
 [Review log](#review-log) — that is a separate repair list.
 
 1. **Anchor placement — CLOSED: explicitly operator-selected.** Compiling
@@ -1077,6 +1248,13 @@ Closing these does **not** discharge the implementation defects in the
    announcement TTL is not authority and not live-session failure detection,
    and must never become permission to use a dead or revoked peer for
    another minute.
+   **Leaf-side ingress is also unsized** (Kyra, 2026-09-11): each leaf
+   receives the flood its anchors forward, so measure leaf receive bytes
+   and signature-verification work as well — a per-second figure derived
+   from refresh frequency alone assumes an announcement size and a
+   deduplication behaviour it has not established. Filtering what anchors
+   forward to `leaf`-tagged peers would be a separate discovery-contract
+   decision, not a tuning knob.
 3. **Anchors per leaf — CLOSED: `min(3, n)` is a target, not a startup
    requirement.** Bootstrap through one; replenish toward the target as
    eligible anchors become known; never delay a usable direct connection
@@ -1104,34 +1282,55 @@ Closing these does **not** discharge the implementation defects in the
 6. **Safari — OPEN, evidence-gated.** Record exact tested versions and
    behaviours from the real leaf; decide support status from that, not from
    transport folklore.
+7. **Pre-enrollment privileges — OPEN, must be decided before Stage 1's
+   design freezes.** What can a transport-authenticated peer do before
+   enrollment, and what does enrollment subsequently enable? Recommended
+   position (Kyra, 2026-09-11): if enrollment is required for
+   participation, permit only the bounded bootstrap/enrollment exchange
+   before it completes, and admit subsequent protocol participation
+   explicitly; keep provider capability authorization separate throughout.
+   Conversely, an intentionally open mesh may allow bounded public
+   participation without enrollment — but then this document must say so
+   rather than imply enrollment is the gate. Either way the enforcement
+   effect is a stated contract with its own witnesses, implemented after
+   Stage 1, never smuggled into the behaviour-neutral refactor.
 
 ---
 
 ## Rough estimates
 
-| Stage | Surface | Complexity | Estimate |
-|---|---|---|---|
-| 0 | Three spikes | Small each, parallel | ~4–5 days |
-| 1 | `PeerAddr` generalization | Large, mechanical, security-sensitive | ~5–7 days |
-| 2 | `net-wire` crate + `Clock` | Medium (crate split, two couplings) | ~3–4 days |
-| 3 | Driver, socket, STUN, harness | Medium–large | ~5–6 days |
-| 4 | Fields, `0x0D02`, bootstrap, enrollment | Medium | ~4–5 days |
-| 5 | Leaf + browser SDK + Playwright | Large | ~7–9 days |
-| 6 | P2P, conformance matrix, telemetry, demo | Medium–large | ~5–6 days |
+**Withdrawn 2026-09-11.** The revision-2 figures (~33–42 days serial) did
+not include the send-path seam and scheduler work now in Stage 1, the
+routing-envelope extraction in Stage 2, or the follower-tab proxy and
+leader lifecycle in Stage 5; S0b's own budget did not cover a wasm build
+of S0a plus JS glue plus a scratch signalling server. Doubling them would
+not be evidence either. Stage 0 returns the actual extraction list, the
+send/ingress inventory, the dependency build results and the browser
+harness evidence; Stages 1–6 are re-estimated from those outputs, and the
+re-derived table replaces this section.
 
-Total: ~33–42 days serial. Stage 0 gates the trait and type decisions;
-Stages 1 and 2 can run in parallel after it; Stage 5 can start against the
-Stage 3 harness before Stage 4 completes.
+Sequencing that survives the withdrawal: Stage 0 gates the trait and type
+decisions; Stages 1 and 2 can run in parallel after it; Stage 5 can start
+against the Stage 3 harness before Stage 4 completes.
 
 ---
 
 ## Dependencies
 
 - `str0m` 0.23.1 — sans-IO WebRTC. Native, feature `webrtc` only. MSRV
-  1.85.0 (toolchain is 1.98.0), MIT OR Apache-2.0. ICE-TCP support to be
-  confirmed in S0b. *(Still the current release: `cargo search str0m` returns
-  0.23.1 at 2026-09-11. A web search claiming 0.21.0 is the latest is stale —
-  trust the registry.)*
+  1.85.0 (toolchain is 1.98.0), MIT OR Apache-2.0. **Pinned configuration**
+  (Kyra, 2026-09-11) — the crate's default features enable `aws-lc-rs` and
+  `examples`, which pull cmake/C (NASM on Windows) into the build:
+
+  ```toml
+  str0m = { version = "0.23.1", optional = true, default-features = false, features = ["rust-crypto"] }
+  ```
+
+  S0b proves this configuration on every supported native target;
+  dependency defaults do not get to make the decision. ICE-TCP support to
+  be confirmed in S0b. *(Still the current release: 0.23.1, 2026-08-21, per
+  docs.rs at 2026-09-11. A web search claiming 0.21.0 is the latest is
+  stale — trust the registry.)*
 - `web-time` — `Instant` on wasm, `net-wire` on wasm32 only.
 - `getrandom` `wasm_js` — wasm32 only.
 - `wasm-bindgen`, `web-sys` (`RtcPeerConnection`, `RtcDataChannel`,
@@ -1249,7 +1448,9 @@ existing boundary; without it, Tier A alone is a leaf refactor.
 - [`HERMES_INTEGRATION_PLAN_V2.md`](HERMES_INTEGRATION_PLAN_V2.md) — the
   invite / `Rendezvous` / enrollment flow §5 reuses for first contact.
 - [`NRPC_RECV_LOOP_BATCHING_PLAN.md`](NRPC_RECV_LOOP_BATCHING_PLAN.md) — the
-  `IngressReceiver` seam, which this plan now leaves untouched.
+  `IngressReceiver` seam. The UDP socket and its framing stay unchanged; the
+  ingress *orchestration* gains a bounded RTC input so dispatch keeps one
+  owner (§2). "Left untouched" was withdrawn 2026-09-11.
 - [`FAIRSCHEDULER_TRANSPORT_PLAN.md`](FAIRSCHEDULER_TRANSPORT_PLAN.md) —
   subprotocol-id and stream-allocation conventions.
 - [`MCP_BRIDGE_PLAN.md`](MCP_BRIDGE_PLAN.md) — attach vs participate;
@@ -1338,3 +1539,32 @@ forming an unowned infrastructure lane. `mesh.rs` sequencing: Stage 0 →
 bounded UDP-only Stage 1 → leader implementation, justified by avoiding
 overlapping structural edits, **not** by Stage 1 being harmless; "browser
 first" must not expand into Stages 2–6 before returning to sensing/OLB.
+
+**2026-09-11 — Fable, source-checked review of revision 2 (read at
+`9b1ce093330bae34ea5e192867f14e3df7466ead`); dispositions by Kyra the same
+day.** Verdict: the six revision-2 repairs verified; architecture holds;
+four gaps sit under Stage 1 and are repaired as pre-Stage-1 decisions.
+Accepted with three qualifications: the PSK is not necessarily publicly
+distributed (stated precisely in §5), a buffered-amount snapshot cannot
+enforce a hard bound (reserved queue bytes/slots do, §2), and doubling
+estimates is not evidence (withdrawn, §Rough estimates).
+
+| # | Finding | Verified at | Applied as |
+|---|---|---|---|
+| 1 | The send path is raw `socket.send_to(..).await` at ~30 `mesh.rs` sites plus `mod.rs`, `proxy.rs` and the `router.rs` `sendmmsg` drain; none compiles under `PeerAddr`, so Stage 1 introduces the seam, and §2's sync `try_send` contract conflicts with UDP's async / deadline / `Transport`-error semantics | `mesh.rs:39386–39391`, `:6797` / `:9317` (`bound_datagram_send`), `router.rs:198`, `:945–1020` | §1 send-path contract: option B, transport-specific submission behind the endpoint; UDP semantics preserved; §2 trait re-scoped to the RTC half; S0d inventory; Stage 1 scope and exit criteria |
+| 2 | The mesh PSK is one shared secret; enrollment runs after the Noise session with no responder-side enforcement, so a PSK holder has full session privileges before enrolling | `mesh.rs:1570`; no `enrolled` / `is_admitted` gate on the accept/dispatch path | §5 Layer 0 states the PSK precisely (separate trust domain for public-browser deployments; never ship a private deployment's PSK); Open question 7 (pre-enrollment privileges) added as a pre-Stage-1 decision |
+| 3 | `net-wire` omitted the routing-envelope codec, which every routed-session packet uses and the leaf's only pre-direct path needs | `mesh.rs:28369–28427`, `:39565`; `route.rs:182–268` | §7 adds the codec (not the table); §7 leaf dispatcher unwraps envelopes addressed to itself; S0a's minimum proof is a routed round-trip |
+| 4 | `str0m` defaults to `aws-lc-rs` + `examples`; provider unchosen; `buffered_amount` is `&mut`-only so any admission-side reading is a stale snapshot; str0m's own p2p caveat | docs.rs 0.23.1 feature and `Channel` docs; README single-mutation invariant | §Dependencies pins `default-features = false, features = ["rust-crypto"]`; §2 reserved-bytes hard bound + advisory snapshot + single-mutation invariant; S0b both roles on all native targets |
+| 5 | Ingress: "pushed to dispatch exactly as UDP" vs "seam left untouched" contradict; `dispatch_packet` has one caller | `mesh.rs:24218`, `:24321` | §2 one dispatch owner, bounded RTC input; Related plans corrected |
+| 6 | Bootstrap endpoint: browser-trusted TLS, cross-origin policy, WebSocket `Origin` unnamed | — | Stage 4 scope; no cert-ignore flags in CI; gather-complete POST decided on S0b latency evidence |
+| 7 | Leader-tab loss: interruption budget, pending-call disposition, restoration, stale-leader fencing unspecified; follower proxy is a real SDK surface | — | §8 leader lifecycle; Stage 5 tests suspension/resumption |
+| 8 | Leaf-side announcement ingress unsized | — | Open question 2 extended; filtering is a separate discovery-contract decision |
+| 9 | Stage 1 exit below the repository's pre-push bar | `AGENTS.md` | Stage 1 exit references the full matrix |
+| 10 | Estimates omit the above | — | Withdrawn; re-derived from Stage 0 outputs |
+
+**Operative boundary unchanged: Stage 0 only.** Before Stage 1: settle
+pre-enrollment semantics (OQ 7), approve the UDP-preserving send/ingress
+contract (S0d), include the routed codecs (S0a), and pin the RTC
+dependency configuration (S0b). A bounded repair to the plan — not another
+architecture program, and not authorization to start the production
+refactor.
