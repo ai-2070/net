@@ -1,0 +1,26 @@
+net/crates/net/src/adapter/net/mod.rs
+  h_64425bc75e3f3d 118-120,151-152,335-336,338
+net/crates/net/tests/cross_lang_wire.rs
+  h_64425bc75e3f3d 60-62
+net/crates/net/wire/src/aead.rs
+  h_64425bc75e3f3d 85-89
+net/crates/net/wire/src/crypto.rs
+  h_64425bc75e3f3d 8
+net/crates/net/wire/src/pool.rs
+  h_64425bc75e3f3d 42-50
+net/crates/net/wire/src/session.rs
+  h_64425bc75e3f3d 22,25,248-252,266,2274-2275,2280-2282,3323
+net/crates/net/wire/tests/wasm_wire.rs
+  h_64425bc75e3f3d 35,131-134,175-177
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "2a9a1d7c5c27f9f27cf52accaaddf270c1d2ce89",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
