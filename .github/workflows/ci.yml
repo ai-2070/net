@@ -3106,6 +3106,26 @@ jobs:
           RUSTFLAGS: "-Cforce-frame-pointers=yes"
         run: cargo build --release -p net-ffi --features net-ffi/test-helpers
 
+      # The cdylib's exported C-ABI symbol set is pinned, name for name.
+      #
+      # Every Go, Python and C consumer links this one artifact, so a symbol
+      # that appears or disappears breaks all of them at once — and until this
+      # step nothing compared the export table against anything, so the
+      # browser-native WebRTC plan's Stage 1 guarantee ("default build's
+      # exported symbol set unchanged" across a ~50-site endpoint refactor)
+      # was unfalsifiable. The baseline is pinned to the pre-refactor head in
+      # its header and regenerated only for an intended ABI change, in the
+      # same commit, with `--update`. `--self-test` plants an added, a removed
+      # and a renamed export and requires each to be rejected, so a green
+      # step means the comparison ran, not that the checker was a no-op.
+      # This complements `abi_stability_*_test.go`; it does not replace it.
+      - name: Guard — libnet exports match the pinned baseline
+        if: ${{ !cancelled() }}
+        run: |
+          python3 "$GITHUB_WORKSPACE/.github/scripts/check-ffi-exports.py" \
+            --artifact "$GITHUB_WORKSPACE/net/crates/net/target/release/libnet.so"
+          python3 "$GITHUB_WORKSPACE/.github/scripts/check-ffi-exports.py" --self-test
+
       # The public nRPC header must describe the library being built.
       #
       # `net_rpc.h` shipped at ABI 0x0002 against a 0x0004

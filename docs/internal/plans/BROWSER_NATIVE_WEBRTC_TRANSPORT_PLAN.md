@@ -1351,45 +1351,85 @@ Stage 1's authorization and the re-estimate depend on.
 - No repository code outside `docs/` and `spikes/` changed
   (`git diff --stat 4b52454a1..1a0504131`).
 
-**Stage 0 is complete. Stage 1 is not authorized by this document.**
+**Stage 0 is complete. Stage 1 was authorized from `ad874ff43` (Kyra,
+2026-09-11) — implementation only, not acceptance, merge, or Stage 2.**
 
 ## Stage 1 — `PeerAddr` endpoint generalization (UDP-only, behaviour-neutral)
 
-Generalize `PeerTransport` and every peer-keyed site listed in §Context to
-`PeerAddr`, and introduce the send seam of §1 in its **UDP-preserving**
-form only: the 49 production call sites and 7 primitives in
+**Authorized (Kyra, 2026-09-11) from `ad874ff433b89f20ce8813ecd8d6c93b2ec58f89`.**
+Implementation authorization only: not Stage 1 acceptance, not merge, not
+Stage 2. Kyra verified the branch head, that its commits touch only
+`docs/` and `spikes/`, re-ran the S0a routed round-trip (2 passed) and
+independently confirmed the `aws-lc-sys` pull; the browser benchmark was
+not re-run for authorization.
+
+**The three decisions, recorded with the first Stage 1 commit:**
+
+1. **`NetProxy` is frozen UDP-only.** `proxy.rs` owns its own UDP socket
+   and next-hop map; it is not the mesh's peer-session router. Its
+   endpoint API, next-hop storage and send behaviour stay unchanged; it is
+   not connected to RTC ingress or to provisional browser sessions; its
+   S0d rows (F7, row 48) are **preservation checks**, not instructions to
+   route it through `PeerSink`. Shared-type/import compatibility edits are
+   allowed; no transport redesign. The same distinction applies to
+   standalone UDP primitives (`transport.rs` `send()` variants, traversal
+   sockets): the inventory names behaviour to preserve, not a requirement
+   to generalize every socket API.
+2. **Stage 2 follows *accepted* Stage 1.** No endpoint type parameters
+   introduced to run the stages concurrently. Stage 1 establishes
+   `PeerAddr` and the UDP-preserving submission boundary; Stage 2 then
+   extracts the portable types, placing the endpoint types low enough that
+   `net-wire` never depends on the native runtime. No concurrent
+   production wire-crate extraction.
+3. **The exported-symbol baseline job is the first Stage 1 commit**,
+   established and exercised before any production endpoint type is
+   edited: baseline pinned to `ad874ff43`; comparison on matching build
+   target, profile and feature set; target is the actual exported C-ABI
+   artifact — the repository's single `net-ffi` cdylib (`libnet`), not an
+   arbitrary Rust library; the checker is demonstrated to reject both an
+   added and a removed export. An unchanged symbol set *complements* the
+   binding tests; it does not replace them.
+
+**Scope.** Generalize `PeerTransport` and every peer-keyed site listed in
+§Context to `PeerAddr`, and introduce the send seam of §1 in its
+**UDP-preserving** form only: the applicable production call sites in
 `S0D_SEND_INGRESS_INVENTORY.md` §1 submit through
 `PeerSink::{send, try_send, send_bounded}` with their current async
-behaviour, deadlines, error mapping and batching intact; the 10 leak rows
-of S0d §3.5 carry `PeerAddr` into `route.rs` / `reroute.rs` /
-`failure.rs`; the scheduler drain partitions by `PeerAddr` variant with
-only the `Udp` arm live. Only the `Udp` variant exists; no feature flag
-yet; no RTC behaviour. Traversal modules keep `SocketAddr` at their
-edges. **Decide `proxy.rs`** (in scope or frozen UDP-only) before the
-first edit. Nothing from §12 (pre-enrollment admission) lands here — this
-stage is behaviour-neutral by definition. Whether `net-wire` (Stage 2)
-follows or the wire types take a peer-endpoint type parameter is decided
-here too (§Rough estimates, sequencing).
+behaviour, deadlines, error mapping, batching and synchronous shedding
+intact; the 10 leak rows of S0d §3.5 carry `PeerAddr` into `route.rs` /
+`reroute.rs` / `failure.rs`; required peer-keyed state, source typing and
+scheduler plumbing move to `PeerAddr`, with the drain partitioned by
+variant and only the `Udp` arm live. `PeerAddr::Udp` only; no feature
+flag; no RTC variant or behaviour; no admission state or anything from
+§12; no crypto/backend change; no Stage 2 extraction. Traversal modules
+keep `SocketAddr` at their edges. Existing direct/routed ownership,
+session lifecycle, deadlines, error mappings, batching and shedding
+preserved; **no new guards held across awaits.**
+
+**Stop condition.** A clean, committed candidate for review. No automatic
+continuation to Stage 2.
 
 ### Exit criteria
 
-- Zero wire change: `cross_lang_*` golden tests pass unmodified.
-- Every existing integration and witness test passes; mechanical signature
-  edits allowed, assertion and coverage preserved, witness diffs reviewed
-  line by line.
+- S0d's applicable rows preserve their blocking, error-mapping and
+  batching columns; no row's guard column becomes `yes`
+  (`deliver_stream_packet` still maps failure to `StreamError::Transport`;
+  the scheduler enqueue is still the only `Backpressure` producer;
+  `bound_datagram_send` deadlines and the three `try_send_to` sheds
+  survive; the `sendmmsg` grouping survives; no UDP `WouldBlock` surfaces
+  as `Backpressure`).
+- Zero wire change: `cross_lang_*` golden fixtures pass unmodified; every
+  existing assertion intact. Mechanical signature edits allowed; witness
+  diffs reviewed line by line.
+- Witness floors 93 / 24 / 62 / 41 / 60 / 67 remain enforced, including
+  their named witnesses (`ci.yml`).
 - The repository's full applicable pre-push matrix (`AGENTS.md`, "Pre-push
   checklist"): `cargo fmt --check`, `cargo check --workspace --all-targets`,
   the three strict `--lib --bins` clippy feature sets, the permissive
-  `--all-targets` clippy, and `RUSTDOCFLAGS="-D warnings" cargo doc` — not
-  one clippy command.
-- UDP send semantics unchanged: `deliver_stream_packet`'s unscheduled arm
-  still maps failure to `StreamError::Transport`; `bound_datagram_send`
-  deadlines and the `sendmmsg` drain grouping survive; no UDP `WouldBlock`
-  surfaces as `Backpressure`.
-- Default build: exported C-ABI symbol set unchanged. **Stage 1 owns this
-  job**: establish the symbol baseline and the comparison *before* the
-  endpoint refactor lands, so the criterion can actually fail. It is a stage
-  deliverable, not unowned infrastructure.
+  `--all-targets` clippy, `RUSTDOCFLAGS="-D warnings" cargo doc`, plus the
+  per-member clippy/doc for every touched member — and exact-head CI green.
+- Export comparison green: the `libnet` cdylib's exported symbol set
+  matches the `ad874ff43` baseline (decision 3).
 
 ## Stage 2 — `net-wire` crate + `Clock`
 
