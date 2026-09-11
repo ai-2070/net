@@ -21,9 +21,16 @@
 //! So the fields are private again and the only constructor is
 //! `pub(crate)`, reachable through [`MeshNode::open_stream`]
 //! (`crate::adapter::net::MeshNode::open_stream`). An application can
-//! read the config and cannot write it; there is no way to mint a
-//! handle for an existing stream id with a config the session never
-//! agreed to.
+//! read the config and cannot write it, and cannot mint a handle for
+//! an existing stream id with a config the session never agreed to.
+//!
+//! Scope, precisely: this closes the mutation and forgery paths Stage
+//! 2 newly exposed. It does not make config and session state
+//! agreeable by construction — the inherited idempotent-reopen
+//! behaviour (`open_stream` logs and ignores a config that differs
+//! from the first call's, and hands back a handle describing the
+//! config you asked for) still lets the two disagree. That predates
+//! Stage 2 and is untouched here.
 
 use super::stream::StreamConfig;
 
@@ -40,7 +47,10 @@ use super::stream::StreamConfig;
 /// handle's `config` is what `send_on_stream` puts on the wire, while
 /// the retransmit window lives on the session's `StreamState`. If an
 /// application could write either, the two would disagree and the
-/// packet would claim a reliability the sender is not tracking.
+/// packet would claim a reliability the sender is not tracking. That
+/// is the path this closes — not every possible disagreement between
+/// a handle and its stream (see the module docs on the inherited
+/// idempotent reopen).
 ///
 /// Reading is fine:
 ///

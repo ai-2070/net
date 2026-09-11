@@ -53029,9 +53029,11 @@ mod exported_discovery_pin_coherence_tests {
 /// send retains exactly its own descriptor, flags included.
 #[cfg(test)]
 mod stream_handle_contract_tests {
+    use super::super::protocol::{NackPayload, NetHeader};
     use super::super::stream::Reliability;
     use super::*;
     use std::net::SocketAddr;
+    use std::time::Duration;
 
     async fn node() -> Arc<MeshNode> {
         let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr");
@@ -53043,8 +53045,11 @@ mod stream_handle_contract_tests {
         )
     }
 
-    /// Real handshake, deliberately WITHOUT `start()`.
-    async fn connected_pair() -> (Arc<MeshNode>, Arc<MeshNode>, u64) {
+    /// Real handshake, deliberately WITHOUT `start()`: no receive
+    /// loop on either side, so the responder's socket still holds
+    /// every datagram the initiator sends and this test can read it
+    /// off the wire itself.
+    async fn connected_pair() -> (Arc<MeshNode>, Arc<MeshNode>, u64, u64) {
         let a = node().await;
         let b = node().await;
         let (a_id, b_id) = (a.node_id(), b.node_id());
@@ -53056,7 +53061,7 @@ mod stream_handle_contract_tests {
             .await
             .expect("connect must establish a session");
         accept.await.expect("accept task").expect("accept");
-        (a, b, b_id)
+        (a, b, a_id, b_id)
     }
 
     /// What the sender retained for `stream_id`, as
@@ -53070,77 +53075,157 @@ mod stream_handle_contract_tests {
         state.with_reliability(|r| (r.name(), r.has_pending()))
     }
 
+    /// The header of the next datagram `receiver` gets on
+    /// `want_stream`, decrypted with the session's rx cipher.
+    ///
+    /// Reading the header alone would accept any bytes that happen to
+    /// parse; decrypting proves the datagram is this session's real
+    /// packet. Datagrams for other streams are skipped so a stray
+    /// control frame cannot be mistaken for the one under test.
+    async fn recv_stream_packet(
+        receiver: &MeshNode,
+        sender_id: u64,
+        want_stream: u64,
+    ) -> (NetHeader, Vec<u8>) {
+        let socket = receiver.socket.socket_arc();
+        let session = {
+            let peer = receiver
+                .peers
+                .get(&sender_id)
+                .expect("receiver must hold the sender's session");
+            peer.session.clone()
+        };
+
+        let mut buf = vec![0u8; 64 * 1024];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let (n, from) = tokio::time::timeout_at(deadline, socket.recv_from(&mut buf))
+                .await
+                .expect("a datagram for the target stream must arrive within 5s")
+                .expect("recv_from");
+
+            let data = Bytes::copy_from_slice(&buf[..n]);
+            let Some(parsed) = ParsedPacket::parse(data, PeerAddr::Udp(from)) else {
+                continue;
+            };
+            if parsed.header.stream_id != want_stream {
+                continue;
+            }
+            assert!(
+                parsed.is_valid_length(),
+                "the datagram under test must be a well-formed Net packet"
+            );
+
+            let aad = parsed.header.aad();
+            let counter = u64::from_le_bytes(
+                parsed.header.nonce[4..12]
+                    .try_into()
+                    .expect("nonce counter"),
+            );
+            let plaintext = session
+                .rx_cipher()
+                .decrypt_to_bytes(counter, &aad, parsed.payload.clone())
+                .expect("the packet must decrypt under this session's rx key");
+            return (parsed.header, plaintext.to_vec());
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_fire_and_forget_stream_sends_unreliable_and_retains_nothing() {
-        let (a, _b, b_id) = connected_pair().await;
+        let (a, b, a_id, b_id) = connected_pair().await;
+        const STREAM: u64 = 0xF00D;
 
         let handle = a
-            .open_stream(b_id, 0xF00D, StreamConfig::new())
+            .open_stream(b_id, STREAM, StreamConfig::new())
             .expect("open_stream");
         assert!(
             !handle.config().reliability.is_reliable(),
             "precondition: the default config is fire-and-forget"
         );
 
-        // The only thing an application can still do with the config
-        // is read it. `config()` hands out a `&StreamConfig`, so the
-        // assignment Kyra's probe used does not compile — see the
-        // `compile_fail` doctests on `Stream`.
-        let observed = *handle.config();
-        assert!(!observed.reliability.is_reliable());
-
         a.send_on_stream(&handle, &[Bytes::from_static(b"faf")])
             .await
             .expect("send_on_stream");
 
-        let (mode, pending) = retransmit_state(&a, b_id, 0xF00D);
-        assert_eq!(
-            mode, "fire-and-forget",
-            "the session's mode comes from the OPEN, which is what the wire flags must agree with"
+        // The wire bit, read off the datagram B actually received.
+        let (header, payload) = recv_stream_packet(&b, a_id, STREAM).await;
+        assert_eq!(header.stream_id, STREAM);
+        assert!(
+            !header.flags.is_reliable(),
+            "regression: a fire-and-forget stream must not set RELIABLE on the wire"
         );
         assert!(
+            payload.windows(3).any(|w| w == b"faf"),
+            "the observed packet must be the one this test sent"
+        );
+
+        // …and the bookkeeping the flags have to agree with.
+        let (mode, pending) = retransmit_state(&a, b_id, STREAM);
+        assert_eq!(mode, "fire-and-forget");
+        assert!(
             !pending,
-            "regression: a fire-and-forget stream must retain no retransmit entry"
+            "a fire-and-forget stream must retain no retransmit entry"
         );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_reliable_stream_sends_reliable_and_retains_its_descriptor() {
-        let (a, _b, b_id) = connected_pair().await;
+        let (a, b, a_id, b_id) = connected_pair().await;
+        const STREAM: u64 = 0xBEEF;
 
         let mut config = StreamConfig::new();
         config.reliability = Reliability::Reliable;
-        let handle = a.open_stream(b_id, 0xBEEF, config).expect("open_stream");
+        let handle = a.open_stream(b_id, STREAM, config).expect("open_stream");
         assert!(handle.config().reliability.is_reliable());
 
         a.send_on_stream(&handle, &[Bytes::from_static(b"rel")])
             .await
             .expect("send_on_stream");
 
-        let (mode, pending) = retransmit_state(&a, b_id, 0xBEEF);
-        assert_eq!(mode, "reliable");
+        // The wire bit. This is the assertion Kyra's production
+        // inverse breaks: building the packet with `PacketFlags::NONE`
+        // while still registering the retransmit leaves every
+        // sender-side assertion true and the packet unreliable.
+        let (header, payload) = recv_stream_packet(&b, a_id, STREAM).await;
+        assert_eq!(header.stream_id, STREAM);
         assert!(
-            pending,
-            "positive control: a reliable send must retain its retransmit entry — \
-             this is the half that was missing when the handle could be mutated"
+            header.flags.is_reliable(),
+            "regression: a reliable stream's packet must carry RELIABLE on the wire"
+        );
+        assert!(
+            payload.windows(3).any(|w| w == b"rel"),
+            "the observed packet must be the one this test sent"
         );
 
-        // The retained descriptor carries the exact `PacketFlags` the
-        // builder put on the wire, so this is the wire bit, not a
-        // restatement of the config.
+        let (mode, pending) = retransmit_state(&a, b_id, STREAM);
+        assert_eq!(mode, "reliable");
+        assert!(pending, "a reliable send must retain its retransmit entry");
+
+        // Exactly one entry, and it is THIS packet's. A NACK naming
+        // the sequence the wire carried must produce that descriptor
+        // and nothing else. (`missing_bitmap: 0` is not an empty
+        // request — `next_expected` itself is the missing sequence.)
         let peer_entry = a.peers.get(&b_id).expect("peer session");
-        let state = peer_entry.session.try_stream(0xBEEF).expect("stream state");
-        let wire_reliable = state.with_reliability(|r| {
-            r.on_nack(&super::super::protocol::NackPayload {
-                next_expected: 0,
+        let state = peer_entry.session.try_stream(STREAM).expect("stream state");
+        let resent = state.with_reliability(|r| {
+            r.on_nack(&NackPayload {
+                next_expected: header.sequence,
                 missing_bitmap: 0,
             })
-            .iter()
-            .all(|d| d.flags.contains(PacketFlags::RELIABLE))
         });
+        assert_eq!(
+            resent.len(),
+            1,
+            "a NACK for the sequence on the wire must name exactly one retained packet"
+        );
+        assert_eq!(resent[0].stream_id, STREAM);
+        assert_eq!(
+            resent[0].seq, header.sequence,
+            "the retained descriptor must be the packet that went out, not some other seq"
+        );
         assert!(
-            wire_reliable,
-            "every retained descriptor must carry the RELIABLE flag the packet went out with"
+            resent[0].flags.contains(PacketFlags::RELIABLE),
+            "the retained descriptor must carry the flags the packet was built with"
         );
     }
 }

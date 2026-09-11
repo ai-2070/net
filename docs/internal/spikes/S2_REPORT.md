@@ -449,6 +449,11 @@ restatement of the config. The mutation direction is now a compile
 error rather than a runtime assertion, which is why there is no
 "mutate and observe" case: there is no mutation path left.
 
+Scope, stated narrowly: the repair closes the **mutation and forgery
+paths Stage 2 newly exposed on the public handle**. It does not
+prevent every conceivable config/state disagreement — see the
+inherited item immediately below.
+
 **Inherited, not repaired:** the conflicting-config idempotent reopen
 (`open_stream` logs and ignores a config that differs from the first
 call's, returning a handle whose `config` describes a stream the
