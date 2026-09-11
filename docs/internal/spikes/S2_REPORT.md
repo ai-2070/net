@@ -368,3 +368,278 @@ python .github/scripts/check-ffi-exports.py
   toolchain, unchanged from Stage 1), and `cargo fmt --all` still fails
   with `os error 206`. Neither is Stage 2's doing; both were worked
   around the same way.
+
+## 9. Repairs after Kyra's HOLD on `b6e522bb5`
+
+Kyra held the Stage 1–2 candidate on five repairs, all Stage 2 (Stage 1
+UDP-preservation credit preserved; two CI jobs red). One commit each,
+in order, then this section.
+
+| Head | Hash | What it is |
+|---|---|---|
+| Held candidate | `b6e522bb5` | what the review ran; 47 jobs green, 2 red (R3, R4) |
+| Validated head | `b9b5d0536` | R1–R5; every number below produced from it, plus the `route.rs` import cleanup that lands with this report |
+| Repair candidate | the commit carrying this section | validated head + this text + one unused-import line |
+
+`UNIT_FEATURES`, toolchain, `wasm-bindgen` 0.2.128 / Node v24.19.0:
+unchanged from §1.
+
+### R1 — the `Stream` handle is core-owned and opaque again
+
+`512d808b2`. Stage 2 moved the handle into `net-mesh-wire`, where a
+crate boundary cannot express "private outside `adapter::net`", so its
+fields went `pub` — and `send_on_stream` reads the wire flags off the
+**handle** while every retransmit entry comes from the live
+`StreamState`. Kyra's probe put `RELIABLE` on the wire with nothing
+retained to resend.
+
+`Stream` now lives in `src/adapter/net/stream_handle.rs`: private
+fields, `peer_node_id()` / `stream_id()` / `epoch()` / `config() ->
+&StreamConfig`, `pub(crate) fn new` reachable only through
+`open_stream`. `net_wire::stream` keeps `StreamConfig`, `Reliability`,
+`CloseBehavior`, `StreamError`, `StreamStats`,
+`DEFAULT_STREAM_WINDOW_BYTES`; nothing in `wire/` referenced the
+handle. `adapter::net::stream::Stream` and `adapter::net::Stream`
+resolve unchanged and no consumer was edited — the SDK, bindings, CLI,
+deck, MCP adapter and payments diff is empty. The two `src/ffi/mesh.rs`
+unit tests that built a handle by field init call `Stream::new`.
+
+Before (Stage 2 head): the assignment compiled. After, an out-of-crate
+rustc probe against the built rlib:
+
+```
+error[E0616]: field `config` of struct `net::adapter::net::Stream` is private
+error[E0616]: field `epoch` of struct `net::adapter::net::Stream` is private
+```
+
+and the three `compile_fail` doctests (config write, epoch write, whole
+struct literal) plus a passing read-only one:
+
+```
+test src\adapter\net\stream_handle.rs - …::Stream (line 62) - compile fail ... ok
+test src\adapter\net\stream_handle.rs - …::Stream (line 72) - compile fail ... ok
+test src\adapter\net\stream_handle.rs - …::Stream (line 81) - compile fail ... ok
+test src\adapter\net\stream_handle.rs - …::Stream (line 47) ... ok
+```
+
+Live-send witness, real two-node connect/accept, **no `start()`** so no
+ACK worker can retire an entry behind the assertions:
+
+```
+test adapter::net::mesh::stream_handle_contract_tests::a_fire_and_forget_stream_sends_unreliable_and_retains_nothing ... ok
+test adapter::net::mesh::stream_handle_contract_tests::a_reliable_stream_sends_reliable_and_retains_its_descriptor ... ok
+```
+
+The fire-and-forget leg asserts the session is in `fire-and-forget`
+mode with `has_pending() == false` after a send; the reliable leg
+asserts `has_pending() == true` and that every retained descriptor
+carries `PacketFlags::RELIABLE` — the descriptor records the exact
+flags the builder put on the wire, so that is the wire bit, not a
+restatement of the config. The mutation direction is now a compile
+error rather than a runtime assertion, which is why there is no
+"mutate and observe" case: there is no mutation path left.
+
+**Inherited, not repaired:** the conflicting-config idempotent reopen
+(`open_stream` logs and ignores a config that differs from the first
+call's, returning a handle whose `config` describes a stream the
+session did not open that way). Kyra flagged it as inherited; it
+predates Stage 2 and is untouched here.
+
+### R2 — the moved wire suite executes and is gated
+
+`3f22e5443`. `cargo test --lib --features "$UNIT_FEATURES"` is the root
+crate; no job ran `net-mesh-wire`'s ordinary `#[test]`s. The unit job
+now runs `cargo test --locked -p net-mesh-wire --features json` after
+the root surface (unchanged), then an inventory guard in the
+witness-floor style: `MIN=196` against the `test result:` count plus a
+`REQUIRED` roster pinned by exact name — both `should_panic` cases and
+one test per moved module.
+
+The routing-envelope codec's ten tests moved from the core's `route.rs`
+into `wire/src/route_codec.rs`, where the code has lived since Stage 2;
+that is what gives `route_codec` a roster entry and takes the suite to
+**206**. `stream` is deliberately not in REQUIRED: it is
+config/error/stats vocabulary with no unit tests of its own, gated by
+the core's pinned `--test stream_config_and_error_display`. The core's
+`--lib` count moves 5781 → 5773 (ten codec tests out, two R1 witnesses
+in).
+
+Guard, run locally against the exact commands:
+
+```
+count=206
+missing=0
+```
+
+Planted-failure demonstration (planted, run, reverted **inside**
+`3f22e5443` — the planted test does not land). With
+`assert_eq!(1, 2, "planted")` added to `protocol::tests`:
+
+```
+test protocol::tests::planted_failure_for_the_r2_demonstration ... FAILED
+test result: FAILED. 206 passed; 1 failed; 0 ignored
+error: test failed, to rerun pass `-p net-mesh-wire --lib`
+exit: 101
+```
+
+after the revert: `test result: ok. 206 passed; 0 failed`, exit 0.
+
+**Counts, stated plainly:** 196 tests moved out of the core in Stage 2;
+the two new drift witnesses mean the core decreased by **194**; the old
+`heartbeat_api_drift_check` module had **four** tests, not five. §4's
+wording said five — corrected here.
+
+### R3 — wasm32 installed for the toolchain the commands select
+
+`a0d8f2158`. `dtolnay/rust-toolchain@stable` with `targets:` installs
+into the *stable* installation; every cargo command in the job runs
+under `net/crates/net`, where `rust-toolchain.toml` pins 1.98.1, a
+separate installation with its own target set.
+
+Reproduced locally on a toolchain without the target:
+
+```
+$ cargo +1.98.0 check -p net-mesh-wire --target wasm32-unknown-unknown
+error[E0463]: can't find crate for `core`
+error[E0463]: can't find crate for `std`
+```
+
+Fixed by adding the target *from* `net/crates/net`, so rustup resolves
+the same override file cargo does, and asserting it landed before any
+build. On the pinned toolchain:
+
+```
+$ rustup show active-toolchain
+1.98.1-x86_64-pc-windows-msvc (overridden by …/net/crates/net/rust-toolchain.toml)
+$ rustup target list --installed
+wasm32-unknown-unknown
+x86_64-pc-windows-msvc
+x86_64-unknown-linux-gnu
+$ cargo check -p net-mesh-wire --target wasm32-unknown-unknown
+(clean)
+```
+
+`wasm-wire-no-native-deps` now checks **both** graphs — host and
+`--target wasm32-unknown-unknown`, which is a different graph
+(`ring`/`snow` swap for `chacha20poly1305` + `web-time` + two
+`getrandom` browser backends). Zero `tokio` / `mio` / `socket2` /
+`net-mesh` edges in either.
+
+### R4 — the fixtures-off probe's lockfile
+
+`64b0256c9`. Reproduction first, in
+`net/crates/net/guards/fixtures_off_probe`:
+
+```
+$ cargo check --locked --offline --message-format short
+error: cannot update the lock file …/fixtures_off_probe/Cargo.lock because
+--locked was passed to prevent this
+```
+
+— a resolution refusal, not the E0432/E0433 the guard greps for, which
+is exactly why CI rejected it. Regenerated under the probe's own
+configuration (`cargo check --offline`, no feature change):
+`+net-mesh-wire`, `+web-time`, `+rand_core` and their pins, 65
+insertions. Both legs now behave:
+
+```
+$ cargo check --locked --message-format short          # negative leg
+src\main.rs:10:24: error[E0432]: unresolved import `net::adapter::net::org_exact_sensing_bridge`
+$ cargo check --locked --features fixtures             # positive leg
+    Finished `dev` profile [unoptimized + debuginfo] target(s)
+```
+
+### R5 — package-safe test inputs
+
+`b9b5d0536`. The AEAD vector is now package-owned:
+`wire/src/test_vectors/aead_vector.json`, exposed as
+`net_wire::test_vectors::AEAD_VECTOR` behind a `test-vectors` feature
+that only test commands enable. **Decision on the repository copy:**
+`net/crates/net/tests/cross_lang_wire/aead_vector.json` stays — it is
+the file a Go / TypeScript / Python consumer would read, and the whole
+fixture set is shaped for them — and a new repository-only test,
+`the_repository_aead_fixture_mirrors_the_package_constant`, asserts it
+is byte-identical to the constant so the two cannot drift.
+
+On the real artifact:
+
+```
+$ cargo package -p net-mesh-wire --allow-dirty
+    Packaged 23 files, 574.7KiB (154.0KiB compressed)
+# contents include src/test_vectors/aead_vector.json; no tests/cross_lang_wire/
+$ (unpacked) cargo check --offline --features "json test-vectors"
+    Finished `dev` profile
+$ (unpacked) cargo check --offline --target wasm32-unknown-unknown --all-targets --features test-vectors
+    Finished `dev` profile
+```
+
+and, restoring the pre-repair include inside the unpacked tree, the
+failure it was hiding:
+
+```
+tests\wasm_wire.rs:175:27: error: couldn't read `tests\../../tests/cross_lang_wire/aead_vector.json`:
+The system cannot find the path specified. (os error 3)
+```
+
+The callee drift guard is now explicitly repository-only: it looks for
+a `.git` above `CARGO_MANIFEST_DIR` (file or directory, so worktrees
+count) and outside a checkout prints
+`SKIPPED wire_session_still_defines_the_heartbeat_helper: …` naming the
+reason — never a silent pass, never a broken build for a registry
+consumer. Inside a checkout it is unchanged and still fails on a rename;
+the negative witness is untouched. All six drift tests pass.
+
+### Validation at the repair candidate
+
+| Command | Result |
+|---|---|
+| `cargo fmt -p <each touched member> -- --check` | pass |
+| `cargo check --workspace --all-targets` | pass |
+| `cargo check --workspace --all-targets --all-features` | pass |
+| `cargo check -p net-mesh-wire --target wasm32-unknown-unknown` | pass (pinned toolchain) |
+| `cargo test --locked -p net-mesh-wire --features json` | **206 passed, 0 failed** (guard: `count=206`, `missing=0`) |
+| executed wasm test (`--features test-vectors`, Node 24) | **3 passed, 0 failed** |
+| `cargo test --test cross_lang_wire` | **8 passed** (7 + the mirror assertion) |
+| `cargo clippy --all-features --lib --bins` / `--lib --bins` / `--no-default-features --lib --bins` | pass ×3 |
+| `cargo clippy --all-features --all-targets` (CI's `-A` set) | pass |
+| `cargo clippy -p net-mesh-wire --features "json test-vectors" --all-targets` / same for `--target wasm32` | pass ×2 |
+| `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features` / `-p net-mesh-wire` | pass ×2 |
+| `cargo test --lib --features "$UNIT_FEATURES"` | **5773 passed; 0 failed; 1 ignored** |
+| `cargo test --doc --features "$UNIT_FEATURES"` | **8 passed; 31 ignored** (4 new `Stream` doctests) |
+| fixtures-off probe, both legs | negative E0432, positive compiles |
+| `cargo package -p net-mesh-wire` + unpacked native & wasm builds | pass |
+| Integration families (CI's lists) | core **478**, cortex/nRPC **279**, sensing **65**, NAT **84**, port-mapping **2**, RedEX **47** — all pass |
+| `cargo tree -p net-mesh-wire`, host and wasm32 | no tokio / mio / socket2 / net-mesh |
+| Linux-target check, `go test ./...` | still not runnable here (no cross C toolchain) |
+
+Witness floors: 93 / 24 / 62 / 41 / 60 / 68 against 93 / 24 / 62 / 41 /
+60 / 67, REQUIRED names present.
+
+Export checker, fresh cdylib, `exports.baseline` untouched:
+
+```
+  baseline count: 568
+✓ net.dll: export set matches the baseline
+```
+
+### Did not go cleanly (repairs)
+
+- **R1's witness was written against guessed API names twice.** The
+  reliability mode's `name()` returns `"fire-and-forget"` /
+  `"reliable"`, not the type names; the test failed on the assertion
+  strings before it passed on the property. Cheap, but it is the second
+  time this stage that a test asserted what the code was assumed to say.
+- **R2's `route_codec` roster entry required moving tests, not writing
+  them.** The moved suite had no `route_codec` or `stream` tests at all,
+  because the codec's tests had stayed behind in the core's `route.rs`
+  and `stream.rs` never had any. Moving the ten codec tests is the
+  honest fix; for `stream` the honest answer is that it has no unit
+  tests, so REQUIRED says so rather than padding one in.
+- **The `route.rs` unused-import cleanup rides with this report, not
+  with R2.** Moving the codec tests out left `#[cfg(test)] use
+  bytes::BytesMut;` unused; the warning only surfaced on the full
+  `--all-targets` check after R5. One line, no behaviour.
+- **`cargo package` had to be run with `--no-verify` once** to inspect
+  the file list quickly; the verification build was then done by hand on
+  the unpacked tree, natively and for wasm32, which is the stronger
+  check and is what §R5 records.
