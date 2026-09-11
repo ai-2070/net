@@ -497,13 +497,13 @@ pub struct ParsedPacket {
     pub header: NetHeader,
     /// Encrypted payload (includes auth tag)
     pub payload: Bytes,
-    /// Source address
-    pub source: SocketAddr,
+    /// Endpoint the packet arrived from.
+    pub source: PeerAddr,
 }
 
 impl ParsedPacket {
     /// Parse a raw packet
-    pub fn parse(data: Bytes, source: SocketAddr) -> Option<Self> {
+    pub fn parse(data: Bytes, source: PeerAddr) -> Option<Self> {
         if data.len() < HEADER_SIZE {
             return None;
         }
@@ -577,7 +577,8 @@ impl PacketReceiver {
     /// Parse the next packet
     pub async fn recv_parsed(&mut self) -> io::Result<Option<ParsedPacket>> {
         let (data, addr) = self.recv().await?;
-        Ok(ParsedPacket::parse(data, addr))
+        // Receive boundary: the socket tuple becomes the peer endpoint.
+        Ok(ParsedPacket::parse(data, PeerAddr::Udp(addr)))
     }
 }
 

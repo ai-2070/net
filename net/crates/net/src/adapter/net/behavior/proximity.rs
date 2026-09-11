@@ -10,7 +10,7 @@
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::SocketAddr;
+use super::super::transport::PeerAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -275,7 +275,7 @@ pub struct ProximityNode {
     /// Node ID
     pub node_id: NodeId,
     /// Network address
-    pub addr: SocketAddr,
+    pub addr: PeerAddr,
     /// Hop distance
     pub hops: u8,
     /// Estimated latency in microseconds
@@ -319,7 +319,7 @@ impl Clone for ProximityNode {
 
 impl ProximityNode {
     /// Create new proximity node from pingwave
-    pub fn from_pingwave(pw: &EnhancedPingwave, addr: SocketAddr) -> Self {
+    pub fn from_pingwave(pw: &EnhancedPingwave, addr: PeerAddr) -> Self {
         // `pw.hop_count + 1` would panic in debug at u8::MAX and
         // silently wrap to 0 in release. A buggy or malicious peer
         // can advertise `hop_count == 255`, after which:
@@ -347,7 +347,7 @@ impl ProximityNode {
     }
 
     /// Update from new pingwave
-    pub fn update_from_pingwave(&mut self, pw: &EnhancedPingwave, addr: SocketAddr) {
+    pub fn update_from_pingwave(&mut self, pw: &EnhancedPingwave, addr: PeerAddr) {
         // Same `+ 1` overflow concern as `from_pingwave`. Use
         // `saturating_add` here too. The "better path" comparison
         // also uses the saturated value so a 255-hop pingwave
@@ -650,7 +650,7 @@ impl ProximityGraph {
     pub fn on_pingwave(
         &self,
         pw: EnhancedPingwave,
-        from_addr: SocketAddr,
+        from_addr: PeerAddr,
     ) -> Option<EnhancedPingwave> {
         let from_node = pw.origin_id;
         self.on_pingwave_from(pw, from_node, from_addr)
@@ -675,7 +675,7 @@ impl ProximityGraph {
         &self,
         pw: EnhancedPingwave,
         from_node: NodeId,
-        from_addr: SocketAddr,
+        from_addr: PeerAddr,
     ) -> Option<EnhancedPingwave> {
         match self.admit_pingwave_from(pw, from_node, from_addr) {
             PingwaveAdmission::AcceptedAndForward(fwd) => Some(fwd),
@@ -727,7 +727,7 @@ impl ProximityGraph {
         &self,
         mut pw: EnhancedPingwave,
         from_node: NodeId,
-        from_addr: SocketAddr,
+        from_addr: PeerAddr,
     ) -> PingwaveAdmission {
         self.stats
             .pingwaves_received

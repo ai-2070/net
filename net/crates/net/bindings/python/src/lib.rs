@@ -1937,7 +1937,8 @@ mod mesh_bindings {
             let addr: std::net::SocketAddr = next_hop_addr
                 .parse()
                 .map_err(|e| PyValueError::new_err(format!("invalid address: {}", e)))?;
-            node.router().add_route(dest_node_id, addr);
+            node.router()
+                .add_route(dest_node_id, net::adapter::net::PeerAddr::Udp(addr));
             Ok(())
         }
 

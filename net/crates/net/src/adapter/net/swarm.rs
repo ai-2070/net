@@ -9,7 +9,7 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use dashmap::DashMap;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::SocketAddr;
+use super::transport::PeerAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -340,7 +340,7 @@ pub struct NodeInfo {
     /// Node ID
     pub node_id: u64,
     /// Network address
-    pub addr: SocketAddr,
+    pub addr: PeerAddr,
     /// Hop distance from local node
     pub hops: u8,
     /// Last seen timestamp
@@ -355,7 +355,7 @@ pub struct NodeInfo {
 
 impl NodeInfo {
     /// Create new node info
-    pub fn new(node_id: u64, addr: SocketAddr, hops: u8) -> Self {
+    pub fn new(node_id: u64, addr: PeerAddr, hops: u8) -> Self {
         Self {
             node_id,
             addr,
@@ -541,7 +541,7 @@ impl LocalGraph {
     /// eases. Without the caps, a peer flooding pingwaves with
     /// random `(origin_id, seq)` could grow both maps at
     /// line-rate between the periodic eviction sweeps.
-    pub fn on_pingwave(&self, mut pw: Pingwave, from: SocketAddr) -> Option<Pingwave> {
+    pub fn on_pingwave(&self, mut pw: Pingwave, from: PeerAddr) -> Option<Pingwave> {
         // Ignore our own pingwaves
         if pw.origin_id == self.my_id {
             return None;
@@ -684,7 +684,7 @@ impl LocalGraph {
     }
 
     /// Process a capability advertisement
-    pub fn on_capability(&self, ad: CapabilityAd, from: SocketAddr) {
+    pub fn on_capability(&self, ad: CapabilityAd, from: PeerAddr) {
         let mut node_inserted = false;
         self.nodes
             .entry(ad.node_id)

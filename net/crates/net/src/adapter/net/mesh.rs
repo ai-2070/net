@@ -284,7 +284,7 @@ async fn await_credit_or_stall(
 #[derive(Clone)]
 struct PendingStreamGrant {
     session: Arc<NetSession>,
-    peer_addr: SocketAddr,
+    peer_addr: PeerAddr,
     total_consumed: u64,
 }
 
@@ -299,8 +299,8 @@ struct PendingStreamGrant {
 #[allow(clippy::type_complexity)]
 fn group_grants_by_session(
     drained: HashMap<(u64, u64), PendingStreamGrant>,
-) -> HashMap<u64, (Arc<NetSession>, SocketAddr, Vec<(u64, u64)>)> {
-    let mut by_session: HashMap<u64, (Arc<NetSession>, SocketAddr, Vec<(u64, u64)>)> =
+) -> HashMap<u64, (Arc<NetSession>, PeerAddr, Vec<(u64, u64)>)> {
+    let mut by_session: HashMap<u64, (Arc<NetSession>, PeerAddr, Vec<(u64, u64)>)> =
         HashMap::new();
     for ((session_id, stream_id), grant) in drained {
         let PendingStreamGrant {
@@ -492,10 +492,10 @@ fn pack_control_events(events: &[Bytes]) -> Vec<std::ops::Range<usize>> {
 /// per-stream `note_grant_sent` accounting keyed on the covered ids.
 #[allow(clippy::too_many_arguments)]
 async fn emit_control_chunks(
-    socket: &NetSocket,
+    sink: &PeerSink,
     builder: &mut super::pool::ThreadLocalPooledBuilder<'_>,
     session: &NetSession,
-    addr: SocketAddr,
+    addr: PeerAddr,
     events: &[Bytes],
     subprotocol_id: u16,
     packets_ctr: &AtomicU64,
@@ -511,7 +511,7 @@ async fn emit_control_chunks(
             PacketFlags::NONE,
             subprotocol_id,
         );
-        if socket.send_to(&packet, addr).await.is_ok() {
+        if sink.send(&packet, addr).await.is_ok() {
             ControlPlaneStats::record_packet(packets_ctr, events_ctr, chunk.len());
         }
     }
@@ -545,7 +545,8 @@ use super::subprotocol::stream_window::{
 };
 use super::subprotocol::MigrationSubprotocolHandler;
 use super::transport::{
-    bound_datagram_send, NetSocket, PacketReceiver, ParsedPacket, PeerAddr, SocketBufferConfig,
+    bound_datagram_send, NetSocket, PacketReceiver, ParsedPacket, PeerAddr, PeerSink,
+    SocketBufferConfig,
 };
 use super::Visibility;
 use tokio::sync::oneshot;
@@ -677,7 +678,7 @@ impl DirectHandshakeInbox {
 
 /// Direct-handshake initiators indexed by the peer address whose
 /// datagrams they are waiting for.
-type DirectHandshakeRegistry = DashMap<SocketAddr, Arc<DirectHandshakeInbox>>;
+type DirectHandshakeRegistry = DashMap<PeerAddr, Arc<DirectHandshakeInbox>>;
 
 /// Hand a handshake payload read off the shared socket to the direct
 /// initiator waiting on `source`, if there is one. Returns whether the
@@ -690,7 +691,7 @@ type DirectHandshakeRegistry = DashMap<SocketAddr, Arc<DirectHandshakeInbox>>;
 /// every retransmit of it too.
 fn forward_to_direct_initiator(
     registry: &DirectHandshakeRegistry,
-    source: SocketAddr,
+    source: PeerAddr,
     payload: Bytes,
 ) -> bool {
     let Some(entry) = registry.get(&source) else {
@@ -759,7 +760,7 @@ fn graph_id_to_node_id(graph_id: &[u8; 32]) -> u64 {
 /// Used by test harnesses to simulate network partitions. When a peer's
 /// address is in this set, both inbound and outbound packets are dropped
 /// as if the network link is severed.
-pub type PartitionFilter = Arc<dashmap::DashSet<SocketAddr>>;
+pub type PartitionFilter = Arc<dashmap::DashSet<PeerAddr>>;
 
 /// Waiter map for incoming `PunchIntroduce` messages keyed by the
 /// counterpart endpoint's `node_id`. Value is `(generation,
@@ -1106,7 +1107,7 @@ struct PeerRegistrationGuard {
     /// drop the `session_id_to_node` reverse-index entry alongside
     /// the other peer-keyed maps (PERF_AUDIT §2.4).
     registered_session_id: u64,
-    registered_next_hop: SocketAddr,
+    registered_next_hop: PeerAddr,
     /// The route transition token the registration's own install
     /// produced. The rollback removes that exact candidate rather than
     /// whatever currently sits at `(peer_node_id, registered_next_hop)`
@@ -1114,7 +1115,7 @@ struct PeerRegistrationGuard {
     /// identical pair.
     registered_route_token: u64,
     peers: Arc<DashMap<u64, PeerInfo>>,
-    peer_addrs: Arc<DashMap<u64, SocketAddr>>,
+    peer_addrs: Arc<DashMap<u64, PeerAddr>>,
     session_id_to_node: Arc<DashMap<u64, u64>>,
     router: Arc<NetRouter>,
     /// The control-path transition handle, so the rollback is one
@@ -1422,11 +1423,11 @@ pub(crate) enum ScopedIngestDisposition {
 struct DispatchCtx {
     local_node_id: u64,
     peers: Arc<DashMap<u64, PeerInfo>>,
-    addr_to_node: Arc<DashMap<SocketAddr, u64>>,
+    addr_to_node: Arc<DashMap<PeerAddr, u64>>,
     /// Node-id → addr map shared with the reroute policy. Must be kept in
     /// sync with `peers` on every registration so the reroute policy can
     /// resolve failed peers.
-    peer_addrs: Arc<DashMap<u64, SocketAddr>>,
+    peer_addrs: Arc<DashMap<u64, PeerAddr>>,
     /// Control-path peer-transition handle, so dispatch-side peer
     /// registration and its rollback serialize against every other
     /// publisher (see [`PeerTransitions::with`]).
@@ -1571,6 +1572,8 @@ struct DispatchCtx {
     psk: [u8; 32],
     /// Socket for sending outbound subprotocol responses.
     socket: Arc<NetSocket>,
+    /// Submission surface for this dispatch context's sends.
+    sink: PeerSink,
     /// Proximity graph for topology awareness.
     proximity_graph: Arc<ProximityGraph>,
     /// Partition filter — packets from blocked addresses are dropped.
@@ -1774,7 +1777,7 @@ struct DispatchCtx {
     #[cfg(feature = "nat-traversal")]
     punch_observers: Arc<
         DashMap<
-            SocketAddr,
+            PeerAddr,
             (
                 u64,
                 tokio::sync::oneshot::Sender<super::traversal::rendezvous::Keepalive>,
@@ -2992,7 +2995,7 @@ enum PeerTransport {
     /// Direct handshake. The peer answered at `owned_addr` itself, so
     /// the address is simultaneously where we send and what the peer
     /// owns — this is an authenticated adjacency.
-    Direct { owned_addr: SocketAddr },
+    Direct { owned: PeerAddr },
     /// Routed handshake. `relay_addr` is where datagrams go; the
     /// session authenticates the far endpoint, NOT the relay carrying
     /// it. `adjacent_relay_identity` names the relay when a direct
@@ -3000,7 +3003,7 @@ enum PeerTransport {
     /// and is `None` when nothing is known to own it — an unknown
     /// owner is never inferred to be the endpoint.
     Routed {
-        relay_addr: SocketAddr,
+        relay: PeerAddr,
         adjacent_relay_identity: Option<u64>,
     },
 }
@@ -3009,10 +3012,10 @@ impl PeerTransport {
     /// Where datagrams for this peer are sent. Always defined — every
     /// installed session has a wire destination.
     #[inline]
-    fn send_addr(&self) -> SocketAddr {
+    fn send_addr(&self) -> PeerAddr {
         match self {
-            Self::Direct { owned_addr } => *owned_addr,
-            Self::Routed { relay_addr, .. } => *relay_addr,
+            Self::Direct { owned } => *owned,
+            Self::Routed { relay, .. } => *relay,
         }
     }
 
@@ -3020,9 +3023,9 @@ impl PeerTransport {
     /// belongs to a relay. This is the only form that may be published
     /// into `addr_to_node` or used to decide adjacency.
     #[inline]
-    fn owned_addr(&self) -> Option<SocketAddr> {
+    fn owned_addr(&self) -> Option<PeerAddr> {
         match self {
-            Self::Direct { owned_addr } => Some(*owned_addr),
+            Self::Direct { owned } => Some(*owned),
             Self::Routed { .. } => None,
         }
     }
@@ -3068,14 +3071,14 @@ struct PeerInfo {
 impl PeerInfo {
     /// Where datagrams for this peer are sent.
     #[inline]
-    fn addr(&self) -> SocketAddr {
+    fn addr(&self) -> PeerAddr {
         self.transport.send_addr()
     }
 
     /// The address this peer owns as its own direct attachment, or
     /// `None` for a peer reached through a relay.
     #[inline]
-    fn owned_addr(&self) -> Option<SocketAddr> {
+    fn owned_addr(&self) -> Option<PeerAddr> {
         self.transport.owned_addr()
     }
 
@@ -3308,13 +3311,13 @@ async fn await_punch_observer_outcome(
     obs_rx: tokio::sync::oneshot::Receiver<super::traversal::rendezvous::Keepalive>,
     deadline: Duration,
     punch_observers: &DashMap<
-        SocketAddr,
+        PeerAddr,
         (
             u64,
             tokio::sync::oneshot::Sender<super::traversal::rendezvous::Keepalive>,
         ),
     >,
-    peer_reflex: SocketAddr,
+    peer_reflex: PeerAddr,
 ) -> bool {
     match tokio::time::timeout(deadline, obs_rx).await {
         // Observer fired with a sender-validated keep-alive.
@@ -4717,7 +4720,7 @@ fn spawn_event_pingwave(
     gate: &Arc<parking_lot::Mutex<EventPingwaveGate>>,
     min_gap: Duration,
     proximity_graph: &Arc<ProximityGraph>,
-    socket: &Arc<NetSocket>,
+    sink: &PeerSink,
     peers: &Arc<DashMap<u64, PeerInfo>>,
     partition_filter: &PartitionFilter,
     resend: bool,
@@ -4756,7 +4759,7 @@ fn spawn_event_pingwave(
             tokio::spawn(flood_event_pingwave_rounds(
                 rounds,
                 proximity_graph.clone(),
-                socket.clone(),
+                sink.clone(),
                 peers.clone(),
                 partition_filter.clone(),
             ));
@@ -4768,7 +4771,7 @@ fn spawn_event_pingwave(
             // bookkeeping has long settled.
             let gate = gate.clone();
             let proximity_graph = proximity_graph.clone();
-            let socket = socket.clone();
+            let sink = sink.clone();
             let peers = peers.clone();
             let filter = partition_filter.clone();
             tokio::spawn(async move {
@@ -4778,7 +4781,7 @@ fn spawn_event_pingwave(
                     g.deferred_scheduled = false;
                     g.last_emit = Some(std::time::Instant::now());
                 }
-                flood_event_pingwave_rounds(1, proximity_graph, socket, peers, filter).await;
+                flood_event_pingwave_rounds(1, proximity_graph, sink, peers, filter).await;
             });
         }
     }
@@ -4798,7 +4801,7 @@ fn spawn_event_pingwave(
 async fn flood_event_pingwave_rounds(
     rounds: u8,
     proximity_graph: Arc<ProximityGraph>,
-    socket: Arc<NetSocket>,
+    sink: PeerSink,
     peers: Arc<DashMap<u64, PeerInfo>>,
     filter: PartitionFilter,
 ) {
@@ -4811,7 +4814,7 @@ async fn flood_event_pingwave_rounds(
             .to_bytes();
         // Snapshot before awaiting — same shard-guard discipline as
         // the heartbeat loop's send pass.
-        let targets: Vec<SocketAddr> = peers
+        let targets: Vec<PeerAddr> = peers
             .iter()
             .filter_map(|e| {
                 let addr = e.value().addr();
@@ -4825,7 +4828,7 @@ async fn flood_event_pingwave_rounds(
         for addr in targets {
             // Raw UDP, unencrypted — same as the heartbeat tick's
             // pingwave emission; topology is public.
-            let _ = socket.send_to(&pw_bytes, addr).await;
+            let _ = sink.send(&pw_bytes, addr).await;
         }
     }
 }
@@ -5014,7 +5017,7 @@ fn route_withdraw_damp_admit(
 async fn run_route_withdrawal_flood(
     seq_counter: Arc<AtomicU64>,
     damper: Arc<DashMap<(u64, Option<u64>), std::time::Instant>>,
-    socket: Arc<NetSocket>,
+    sink: PeerSink,
     peers: Arc<DashMap<u64, PeerInfo>>,
     partition_filter: PartitionFilter,
     dest: u64,
@@ -5034,7 +5037,7 @@ async fn run_route_withdrawal_flood(
     // Snapshot targets (Arc clones only) — cheap even at high peer
     // counts. The withdrawal's own `seq` is authored once here so
     // every peer sees the same value (per-dest ordering gate input).
-    let mut targets: Vec<(SocketAddr, Arc<NetSession>)> = Vec::new();
+    let mut targets: Vec<(PeerAddr, Arc<NetSession>)> = Vec::new();
     for entry in peers.iter() {
         let peer_id = *entry.key();
         if peer_id == dest || Some(peer_id) == exclude {
@@ -5068,7 +5071,7 @@ async fn run_route_withdrawal_flood(
                 SUBPROTOCOL_ROUTE_WITHDRAW,
             )
         };
-        let _ = socket.send_to(&packet, addr).await;
+        let _ = sink.send(&packet, addr).await;
     }
 }
 
@@ -5079,7 +5082,7 @@ async fn run_route_withdrawal_flood(
 fn spawn_route_withdrawal_flood(
     seq_counter: &Arc<AtomicU64>,
     damper: &Arc<DashMap<(u64, Option<u64>), std::time::Instant>>,
-    socket: &Arc<NetSocket>,
+    sink: &PeerSink,
     peers: &Arc<DashMap<u64, PeerInfo>>,
     partition_filter: &PartitionFilter,
     dest: u64,
@@ -5088,7 +5091,7 @@ fn spawn_route_withdrawal_flood(
     tokio::spawn(run_route_withdrawal_flood(
         seq_counter.clone(),
         damper.clone(),
-        socket.clone(),
+        sink.clone(),
         peers.clone(),
         partition_filter.clone(),
         dest,
@@ -5249,9 +5252,9 @@ fn expire_and_publish_consumer_cells(
 #[cfg(feature = "redex")]
 #[allow(clippy::too_many_arguments)]
 fn dispatch_sensing_leader_deliveries(
-    socket: &Arc<NetSocket>,
+    sink: &PeerSink,
     peers: &Arc<DashMap<u64, PeerInfo>>,
-    addr_to_node: &Arc<DashMap<SocketAddr, u64>>,
+    addr_to_node: &Arc<DashMap<PeerAddr, u64>>,
     router: &Arc<NetRouter>,
     partition_filter: &PartitionFilter,
     local_node_id: u64,
@@ -5287,7 +5290,7 @@ fn dispatch_sensing_leader_deliveries(
                 };
                 if let Ok(bytes) = sensing::encode_attestation(&wire) {
                     spawn_sensing_frame_send(
-                        socket,
+                        sink,
                         peers,
                         addr_to_node,
                         router,
@@ -5772,7 +5775,7 @@ fn sensing_scheduler_view(
 /// already handled by identity).
 fn sensing_live_direct_session(
     peers: &DashMap<u64, PeerInfo>,
-    addr_to_node: &DashMap<SocketAddr, u64>,
+    addr_to_node: &DashMap<PeerAddr, u64>,
     failure_detector: Option<&FailureDetector>,
     node: u64,
 ) -> bool {
@@ -5787,10 +5790,10 @@ fn sensing_live_direct_session(
 /// the node itself; LIVE iff the detector — where the caller has
 /// one — does not hold it Failed or Suspected.
 fn sensing_addr_is_live_direct(
-    addr_to_node: &DashMap<SocketAddr, u64>,
+    addr_to_node: &DashMap<PeerAddr, u64>,
     failure_detector: Option<&FailureDetector>,
     node: u64,
-    addr: SocketAddr,
+    addr: PeerAddr,
 ) -> bool {
     if addr_to_node.get(&addr).map(|e| *e.value()) != Some(node) {
         return false;
@@ -5877,9 +5880,9 @@ fn apply_sensing_removal_action(
     observations: &ObservationMutex,
     emitter: &parking_lot::Mutex<Option<sensing::OriginEmitter>>,
     emitter_stamp: Option<u64>,
-    socket: &Arc<NetSocket>,
+    sink: &PeerSink,
     peers: &Arc<DashMap<u64, PeerInfo>>,
-    addr_to_node: &Arc<DashMap<SocketAddr, u64>>,
+    addr_to_node: &Arc<DashMap<PeerAddr, u64>>,
     router: &Arc<NetRouter>,
     partition_filter: &PartitionFilter,
     local_node_id: u64,
@@ -5900,7 +5903,7 @@ fn apply_sensing_removal_action(
                 };
                 if let Ok(bytes) = sensing::encode_interest_frame(&frame) {
                     spawn_sensing_frame_send(
-                        socket,
+                        sink,
                         peers,
                         addr_to_node,
                         router,
@@ -5933,9 +5936,9 @@ fn remove_sensing_downstream(
     table: &parking_lot::Mutex<sensing::InterestTable>,
     observations: &ObservationMutex,
     emitter: &parking_lot::Mutex<Option<sensing::OriginEmitter>>,
-    socket: &Arc<NetSocket>,
+    sink: &PeerSink,
     peers: &Arc<DashMap<u64, PeerInfo>>,
-    addr_to_node: &Arc<DashMap<SocketAddr, u64>>,
+    addr_to_node: &Arc<DashMap<PeerAddr, u64>>,
     router: &Arc<NetRouter>,
     partition_filter: &PartitionFilter,
     local_node_id: u64,
@@ -5955,7 +5958,7 @@ fn remove_sensing_downstream(
             observations,
             emitter,
             emitter_stamp,
-            socket,
+            sink,
             peers,
             addr_to_node,
             router,
@@ -5982,9 +5985,9 @@ fn remove_sensing_leader_consumer(
     table: &parking_lot::Mutex<sensing::InterestTable>,
     observations: &ObservationMutex,
     emitter: &parking_lot::Mutex<Option<sensing::OriginEmitter>>,
-    socket: &Arc<NetSocket>,
+    sink: &PeerSink,
     peers: &Arc<DashMap<u64, PeerInfo>>,
-    addr_to_node: &Arc<DashMap<SocketAddr, u64>>,
+    addr_to_node: &Arc<DashMap<PeerAddr, u64>>,
     router: &Arc<NetRouter>,
     partition_filter: &PartitionFilter,
     local_node_id: u64,
@@ -6020,7 +6023,7 @@ fn remove_sensing_leader_consumer(
                         observations,
                         emitter,
                         emitter_stamp,
-                        socket,
+                        sink,
                         peers,
                         addr_to_node,
                         router,
@@ -6280,7 +6283,7 @@ fn sensing_fold_gate_reclaim(
 #[allow(clippy::too_many_arguments)]
 fn build_sensing_frame_datagram(
     peers: &Arc<DashMap<u64, PeerInfo>>,
-    addr_to_node: &Arc<DashMap<SocketAddr, u64>>,
+    addr_to_node: &Arc<DashMap<PeerAddr, u64>>,
     router: &Arc<NetRouter>,
     partition_filter: &PartitionFilter,
     local_node_id: u64,
@@ -6288,7 +6291,7 @@ fn build_sensing_frame_datagram(
     stream_id: u64,
     subprotocol: u16,
     payload: Vec<u8>,
-) -> Option<(Bytes, SocketAddr)> {
+) -> Option<(Bytes, PeerAddr)> {
     let next_addr = peers
         .get(&target)
         .map(|p| p.value().addr())
@@ -6450,7 +6453,7 @@ struct PendingDatagram {
     #[cfg(any(test, feature = "fixtures"))]
     seq: u64,
     packet: Bytes,
-    addr: SocketAddr,
+    addr: PeerAddr,
 }
 
 /// Shared, monotonic counters for [`OrderedSensingEgress`].
@@ -6670,7 +6673,7 @@ pub struct OrgEgressState {
 impl OrderedSensingEgress {
     /// Create the bounded queue and spawn its single consumer.
     fn spawn(
-        socket: Arc<NetSocket>,
+        sink: PeerSink,
         #[cfg(any(test, feature = "fixtures"))] observer: OrgEgressObserverSlot,
         #[cfg(any(test, feature = "fixtures"))] policy: OrgEgressSendPolicySlot,
         #[cfg(any(test, feature = "fixtures"))] lifecycle: OrgEgressLifecycleSeamSlot,
@@ -6684,7 +6687,7 @@ impl OrderedSensingEgress {
         let wake = Arc::new(tokio::sync::Notify::new());
         let counters = Arc::new(OrgEgressCounters::default());
         let consumer = tokio::spawn(Self::consume(
-            socket,
+            sink,
             queue.clone(),
             wake.clone(),
             counters.clone(),
@@ -6754,7 +6757,7 @@ impl OrderedSensingEgress {
     /// always `pending + in_flight`, and an abort mid-send leaves the mark set
     /// for teardown to retire rather than losing the datagram silently.
     async fn consume(
-        socket: Arc<NetSocket>,
+        sink: PeerSink,
         queue: Arc<parking_lot::Mutex<EgressQueue>>,
         wake: Arc<tokio::sync::Notify>,
         counters: Arc<OrgEgressCounters>,
@@ -6792,12 +6795,11 @@ impl OrderedSensingEgress {
                         // An unwritable socket, exactly: the send never
                         // resolves. The SAME wrapper production uses is what
                         // must retire it.
-                        bound_datagram_send(std::future::pending(), PeerAddr::Udp(next.addr), deadline)
-                            .await
+                        bound_datagram_send(std::future::pending(), next.addr, deadline).await
                     } else {
                         bound_datagram_send(
-                            socket.send_to(&next.packet, next.addr),
-                            PeerAddr::Udp(next.addr),
+                            sink.send(&next.packet, next.addr),
+                            next.addr,
                             deadline,
                         )
                         .await
@@ -6805,8 +6807,8 @@ impl OrderedSensingEgress {
                 };
                 #[cfg(not(any(test, feature = "fixtures")))]
                 let outcome = bound_datagram_send(
-                    socket.send_to(&next.packet, next.addr),
-                    PeerAddr::Udp(next.addr),
+                    sink.send(&next.packet, next.addr),
+                    next.addr,
                     DATAGRAM_SEND_DEADLINE,
                 )
                 .await;
@@ -6852,7 +6854,7 @@ impl OrderedSensingEgress {
     /// datagram rather than stalling the caller. A closed queue refuses; the
     /// closure test and the push happen under one lock acquisition, so an
     /// accepted datagram is always one a live consumer will still observe.
-    fn enqueue(&self, packet: Bytes, addr: SocketAddr) -> bool {
+    fn enqueue(&self, packet: Bytes, addr: PeerAddr) -> bool {
         #[cfg(any(test, feature = "fixtures"))]
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         /// What one enqueue attempt resolved to under the queue lock.
@@ -7788,9 +7790,9 @@ pub(crate) enum SensingRefreshOutcome {
 /// bytes.
 #[allow(clippy::too_many_arguments)]
 fn spawn_sensing_frame_send(
-    socket: &Arc<NetSocket>,
+    sink: &PeerSink,
     peers: &Arc<DashMap<u64, PeerInfo>>,
-    addr_to_node: &Arc<DashMap<SocketAddr, u64>>,
+    addr_to_node: &Arc<DashMap<PeerAddr, u64>>,
     router: &Arc<NetRouter>,
     partition_filter: &PartitionFilter,
     local_node_id: u64,
@@ -7812,9 +7814,9 @@ fn spawn_sensing_frame_send(
     ) else {
         return;
     };
-    let socket = socket.clone();
+    let sink = sink.clone();
     tokio::spawn(async move {
-        let _ = socket.send_to(&packet, addr).await;
+        let _ = sink.send(&packet, addr).await;
     });
 }
 
@@ -9251,7 +9253,7 @@ struct ScopedSourceSnapshot {
 /// forwarding task that pends there can stop an exported FFI entry point from
 /// ever reaching its own send.
 struct PeerRecipient {
-    addr: SocketAddr,
+    addr: PeerAddr,
     session: Arc<NetSession>,
 }
 
@@ -9287,16 +9289,11 @@ fn snapshot_peers(peers: &DashMap<u64, PeerInfo>, exclude: Option<u64>) -> Vec<P
 /// the send pends — blocking peer replacement, eviction, and every other
 /// reader of the same shard. Clone what you need and release the guard first.
 async fn send_datagram(
-    socket: &NetSocket,
+    sink: &PeerSink,
     packet: &[u8],
-    addr: SocketAddr,
+    addr: PeerAddr,
 ) -> Result<(), AdapterError> {
-    bound_datagram_send(
-        socket.send_to(packet, addr),
-        PeerAddr::Udp(addr),
-        DATAGRAM_SEND_DEADLINE,
-    )
-    .await
+    sink.send_bounded(packet, addr, DATAGRAM_SEND_DEADLINE).await
 }
 
 /// Publish an authority change and advance the routing epoch as ONE ordered unit
@@ -10491,6 +10488,10 @@ pub struct MeshNode {
     config: MeshNodeConfig,
     /// Shared UDP socket
     socket: Arc<NetSocket>,
+    /// The one outbound submission surface (S0d §3.1). Wraps `socket`;
+    /// every peer-addressed send goes through it, receive-side and
+    /// socket-level uses keep `socket`.
+    sink: PeerSink,
     /// Per-peer sessions keyed by node_id. Keying by node_id (rather than
     /// SocketAddr) is required for relayed sessions: if A connects to C via
     /// relay B, both peers share B's wire address, so a SocketAddr-keyed map
@@ -10499,7 +10500,7 @@ pub struct MeshNode {
     /// Reverse lookup for dispatch: incoming source address → node_id. Only
     /// populated for directly-connected peers; relayed peers are resolved by
     /// session_id during dispatch.
-    addr_to_node: Arc<DashMap<SocketAddr, u64>>,
+    addr_to_node: Arc<DashMap<PeerAddr, u64>>,
     /// Router for forwarding decisions
     router: Arc<NetRouter>,
     /// Failure detector
@@ -11231,7 +11232,7 @@ pub struct MeshNode {
     /// Automatic reroute policy
     reroute_policy: Arc<ReroutePolicy>,
     /// Node ID → SocketAddr map (shared with reroute policy)
-    peer_addrs: Arc<DashMap<u64, SocketAddr>>,
+    peer_addrs: Arc<DashMap<u64, PeerAddr>>,
     /// Partition filter for simulating network splits
     partition_filter: PartitionFilter,
     /// Per-channel subscriber roster (daemon-layer fan-out).
@@ -11300,7 +11301,7 @@ pub struct MeshNode {
     #[cfg(feature = "nat-traversal")]
     punch_observers: Arc<
         DashMap<
-            SocketAddr,
+            PeerAddr,
             (
                 u64,
                 oneshot::Sender<super::traversal::rendezvous::Keepalive>,
@@ -12098,6 +12099,7 @@ impl MeshNode {
             .await
             .map_err(|e| AdapterError::Connection(format!("bind failed: {}", e)))?;
         let socket = Arc::new(socket);
+        let sink = PeerSink::new(socket.clone());
 
         let router_config = RouterConfig {
             local_id: node_id,
@@ -12123,7 +12125,7 @@ impl MeshNode {
             .routing_table()
             .set_max_route_age(config.session_timeout.saturating_mul(3));
 
-        let peer_addrs: Arc<DashMap<u64, SocketAddr>> = Arc::new(DashMap::new());
+        let peer_addrs: Arc<DashMap<u64, PeerAddr>> = Arc::new(DashMap::new());
 
         // Hoist `peers` and `addr_to_node` out of the struct literal so
         // the failure-detector `on_failure` callback below can evict
@@ -12135,7 +12137,7 @@ impl MeshNode {
         // and silently drop packets via UDP until an application-layer
         // timeout fired.
         let peers: Arc<DashMap<u64, PeerInfo>> = Arc::new(DashMap::new());
-        let addr_to_node: Arc<DashMap<SocketAddr, u64>> = Arc::new(DashMap::new());
+        let addr_to_node: Arc<DashMap<PeerAddr, u64>> = Arc::new(DashMap::new());
 
         // Create proximity graph for topology awareness.
         //
@@ -12320,7 +12322,7 @@ impl MeshNode {
         let event_pingwave_min_gap = config.event_pingwave_min_gap;
         let event_pingwave_gate_recovery = event_pingwave_gate.clone();
         let proximity_graph_recovery = proximity_graph.clone();
-        let socket_recovery = socket.clone();
+        let sink_recovery = sink.clone();
         let peers_recovery = peers.clone();
         let partition_filter_recovery = partition_filter.clone();
         // RT-5: route-withdrawal state + the clones the `on_failure`
@@ -12331,7 +12333,7 @@ impl MeshNode {
         let enable_route_withdraw = config.enable_route_withdraw;
         let route_withdraw_seq_failure = route_withdraw_seq.clone();
         let route_withdraw_damper_failure = route_withdraw_damper.clone();
-        let socket_failure = socket.clone();
+        let sink_failure = sink.clone();
         let peers_failure = peers.clone();
         let partition_filter_failure = partition_filter.clone();
         let proximity_graph_failure = proximity_graph.clone();
@@ -12585,7 +12587,7 @@ impl MeshNode {
                     &sensing_table_failure,
                     &sensing_observations_failure,
                     &sensing_emitter_failure,
-                    &socket_failure,
+                    &sink_failure,
                     &peers_failure,
                     &sensing_addr_to_node_failure,
                     &sensing_router_failure,
@@ -12601,7 +12603,7 @@ impl MeshNode {
                     &sensing_table_failure,
                     &sensing_observations_failure,
                     &sensing_emitter_failure,
-                    &socket_failure,
+                    &sink_failure,
                     &peers_failure,
                     &sensing_addr_to_node_failure,
                     &sensing_router_failure,
@@ -12720,7 +12722,7 @@ impl MeshNode {
                 spawn_route_withdrawal_flood(
                     &route_withdraw_seq_failure,
                     &route_withdraw_damper_failure,
-                    &socket_failure,
+                    &sink_failure,
                     &peers_failure,
                     &partition_filter_failure,
                     node_id,
@@ -12757,7 +12759,7 @@ impl MeshNode {
                 &event_pingwave_gate_recovery,
                 event_pingwave_min_gap,
                 &proximity_graph_recovery,
-                &socket_recovery,
+                &sink_recovery,
                 &peers_recovery,
                 &partition_filter_recovery,
                 // Recovery: no session-open race, so no second round.
@@ -12838,6 +12840,7 @@ impl MeshNode {
             node_id,
             config,
             socket,
+            sink,
             peers,
             addr_to_node,
             router,
@@ -13339,7 +13342,9 @@ impl MeshNode {
     /// orchestrator-originated messages (e.g. `TakeSnapshot`) to
     /// the source node by its `node_id`.
     pub fn peer_addr(&self, node_id: u64) -> Option<SocketAddr> {
-        self.peers.get(&node_id).map(|e| e.value().addr())
+        self.peers
+            .get(&node_id)
+            .and_then(|e| e.value().addr().udp())
     }
 
     // ── SI-2a: capability-sensing interest plane ──────────────────
@@ -13476,7 +13481,7 @@ impl MeshNode {
             }
         }
         let egress = Arc::new(OrderedSensingEgress::spawn(
-            self.socket.clone(),
+            self.sink.clone(),
             #[cfg(any(test, feature = "fixtures"))]
             self.org_egress_send_observer.clone(),
             #[cfg(any(test, feature = "fixtures"))]
@@ -14164,7 +14169,7 @@ impl MeshNode {
                             );
                             if let Ok(bytes) = sensing::encode_interest_frame(&frame) {
                                 spawn_sensing_frame_send(
-                                    &self.socket,
+                                    &self.sink,
                                     &self.peers,
                                     &self.addr_to_node,
                                     &self.router,
@@ -14324,7 +14329,7 @@ impl MeshNode {
     /// nothing left to order — and a refused enqueue means the queue closed;
     /// both are counted rather than silently swallowed, and neither is a
     /// delivery claim.
-    fn enqueue_org_datagram(&self, packet: Bytes, addr: SocketAddr) {
+    fn enqueue_org_datagram(&self, packet: Bytes, addr: PeerAddr) {
         match self.org_egress() {
             Some(egress) => {
                 if !egress.enqueue(packet, addr) {
@@ -16624,7 +16629,7 @@ impl MeshNode {
         };
         if let Ok(bytes) = sensing::encode_interest_frame(&frame) {
             spawn_sensing_frame_send(
-                &self.socket,
+                &self.sink,
                 &self.peers,
                 &self.addr_to_node,
                 &self.router,
@@ -16748,7 +16753,7 @@ impl MeshNode {
             );
             if let Ok(bytes) = sensing::encode_interest_frame(&frame) {
                 spawn_sensing_frame_send(
-                    &self.socket,
+                    &self.sink,
                     &self.peers,
                     &self.addr_to_node,
                     &self.router,
@@ -21790,17 +21795,17 @@ impl MeshNode {
 
     /// Block packets from/to a peer address (simulates network partition).
     pub fn block_peer(&self, addr: SocketAddr) {
-        self.partition_filter.insert(addr);
+        self.partition_filter.insert(PeerAddr::Udp(addr));
     }
 
     /// Unblock a peer address (simulates partition healing).
     pub fn unblock_peer(&self, addr: &SocketAddr) {
-        self.partition_filter.remove(addr);
+        self.partition_filter.remove(&PeerAddr::Udp(*addr));
     }
 
     /// Check if a peer is blocked.
     pub fn is_blocked(&self, addr: &SocketAddr) -> bool {
-        self.partition_filter.contains(addr)
+        self.partition_filter.contains(&PeerAddr::Udp(*addr))
     }
 
     /// Get the proximity graph.
@@ -21857,13 +21862,14 @@ impl MeshNode {
         peer_node_id: u64,
     ) -> Result<u64, AdapterError> {
         let keys = self
-            .handshake_initiator(peer_addr, peer_pubkey, peer_node_id)
+            .handshake_initiator(PeerAddr::Udp(peer_addr), peer_pubkey, peer_node_id)
             .await?;
 
         // Shared peer install (NetSession + router + peers +
         // peer_addrs + addr_to_node). DIRECT: the peer answered at
         // `peer_addr` itself, so the address is its own and the
         // session is an authenticated adjacency.
+        let peer_addr = PeerAddr::Udp(peer_addr);
         self.install_direct(peer_node_id, peer_addr, keys, None);
 
         // Direct-handshake-only post-install wiring. Routed
@@ -21912,13 +21918,13 @@ impl MeshNode {
     fn install_direct(
         &self,
         peer_node_id: u64,
-        owned_addr: SocketAddr,
+        owned_addr: PeerAddr,
         keys: SessionKeys,
         expected_prior_session_id: Option<u64>,
     ) -> PeerTransitionOutcome {
         self.install_peer_transition(
             peer_node_id,
-            PeerTransport::Direct { owned_addr },
+            PeerTransport::Direct { owned: owned_addr },
             keys,
             expected_prior_session_id,
         )
@@ -21930,7 +21936,7 @@ impl MeshNode {
     fn install_routed(
         &self,
         peer_node_id: u64,
-        relay_addr: SocketAddr,
+        relay_addr: PeerAddr,
         keys: SessionKeys,
         expected_prior_session_id: Option<u64>,
     ) -> PeerTransitionOutcome {
@@ -21948,7 +21954,7 @@ impl MeshNode {
         self.install_peer_transition(
             peer_node_id,
             PeerTransport::Routed {
-                relay_addr,
+                relay: relay_addr,
                 adjacent_relay_identity,
             },
             keys,
@@ -22097,7 +22103,7 @@ impl MeshNode {
         // endpoint's end-to-end session while aiming the envelope at
         // the relay, which cannot authenticate it.
         let route_token = match transport {
-            PeerTransport::Direct { owned_addr } => {
+            PeerTransport::Direct { owned: owned_addr } => {
                 // A direct handshake IS an authenticated adjacency:
                 // destination and next hop are the same session peer,
                 // so the route carries `next_hop_id` by construction.
@@ -22124,7 +22130,7 @@ impl MeshNode {
                 self.addr_to_node.insert(owned_addr, peer_node_id);
                 token
             }
-            PeerTransport::Routed { relay_addr, .. } => {
+            PeerTransport::Routed { relay: relay_addr, .. } => {
                 // A routed end-to-end session is NOT an authenticated
                 // adjacent route-hop session: the recorded address is
                 // the immediate relay's, and the session authenticates
@@ -22258,7 +22264,7 @@ impl MeshNode {
         // `accept_in_flight` (so `start()` refuses) for that whole
         // time. See `try_handshake_responder`'s doc for why that is
         // the right trade and what to tune.
-        let (keys, peer_addr) = self.handshake_responder(peer_node_id).await?;
+        let (keys, peer_endpoint) = self.handshake_responder(peer_node_id).await?;
 
         // The responder side of a handshake is the SAME lifecycle
         // operation as the initiator side, so it runs through the same
@@ -22277,17 +22283,22 @@ impl MeshNode {
         // `install_direct` holds a `parking_lot` guard, whose non-`Send`
         // type keeps the compiler enforcing that no part of the
         // transition can straddle the `.await`s below.
+        // `accept` reports the UDP tuple to its caller; the peer table
+        // keys on the endpoint.
+        let peer_addr = peer_endpoint.udp().ok_or_else(|| {
+            AdapterError::Connection("accept: peer is not a UDP endpoint".into())
+        })?;
         let session_id = self
-            .install_direct(peer_node_id, peer_addr, keys, None)
+            .install_direct(peer_node_id, peer_endpoint, keys, None)
             .session_id
             .unwrap_or_default();
 
         let peer_graph_id = node_id_to_graph_id(peer_node_id);
         let pw = EnhancedPingwave::new(peer_graph_id, 0, 1).with_load(0, HealthStatus::Healthy);
-        self.proximity_graph.on_pingwave(pw, peer_addr);
+        self.proximity_graph.on_pingwave(pw, peer_endpoint);
 
         self.failure_detector
-            .heartbeat_for_incarnation(peer_node_id, peer_addr, session_id);
+            .heartbeat_for_incarnation(peer_node_id, peer_endpoint, session_id);
 
         // See the matching comment in `connect`.
         self.push_local_announcement(peer_node_id).await;
@@ -23699,7 +23710,7 @@ impl MeshNode {
         let sensing_leader = self.sensing_leader.clone();
         let identity = self.identity.clone();
         let capability_version = self.capability_version.clone();
-        let socket = self.socket.clone();
+        let sink = self.sink.clone();
         let peers = self.peers.clone();
         let addr_to_node = self.addr_to_node.clone();
         let router = self.router.clone();
@@ -23933,7 +23944,7 @@ impl MeshNode {
                                 }
                             };
                             dispatch_sensing_leader_deliveries(
-                                &socket,
+                                &sink,
                                 &peers,
                                 &addr_to_node,
                                 &router,
@@ -23957,7 +23968,7 @@ impl MeshNode {
                     };
                     for node in peer_downstreams {
                         spawn_sensing_frame_send(
-                            &socket,
+                            &sink,
                             &peers,
                             &addr_to_node,
                             &router,
@@ -24076,6 +24087,7 @@ impl MeshNode {
             static_keypair: self.static_keypair.clone(),
             psk: self.config.psk,
             socket: self.socket.clone(),
+            sink: self.sink.clone(),
             proximity_graph: self.proximity_graph.clone(),
             partition_filter: self.partition_filter.clone(),
             enable_route_withdraw: self.config.enable_route_withdraw,
@@ -24239,7 +24251,7 @@ impl MeshNode {
                 {
                     if batched_ingress {
                         IngressReceiver::Batched(super::transport::BatchedPacketReceiver::new(
-                            socket,
+                            sink,
                         ))
                     } else {
                         IngressReceiver::Single(PacketReceiver::new(socket))
@@ -24262,7 +24274,9 @@ impl MeshNode {
                     result = receiver.recv() => {
                         match result {
                             Ok((data, source)) => {
-                                Self::dispatch_packet(data, source, &ctx);
+                                // The UDP receive loop is a boundary: the
+                                // socket's tuple becomes the peer endpoint here.
+                                Self::dispatch_packet(data, PeerAddr::Udp(source), &ctx);
                             }
                             // Batched receiver: a ConnectionReset means its recv
                             // thread exited (transport.rs) and every future
@@ -24300,7 +24314,7 @@ impl MeshNode {
     /// - Handshake packets are ignored (handled during connect/accept)
     /// - Heartbeat packets update the failure detector
     /// - Data packets are decrypted if local, forwarded if not
-    fn dispatch_packet(data: Bytes, source: SocketAddr, ctx: &DispatchCtx) {
+    fn dispatch_packet(data: Bytes, source: PeerAddr, ctx: &DispatchCtx) {
         // Partition filter: silently drop packets from blocked peers
         if ctx.partition_filter.contains(&source) {
             return;
@@ -24500,7 +24514,7 @@ impl MeshNode {
                     // Borrowed, not cloned: the re-broadcast below runs
                     // inline rather than in a spawned task, so nothing
                     // needs to outlive this scope.
-                    let socket = &ctx.socket;
+                    let sink = &ctx.sink;
                     let peers = &ctx.peers;
                     let filter = &ctx.partition_filter;
                     let router = &ctx.router;
@@ -24547,7 +24561,7 @@ impl MeshNode {
                         // liveness beacon, so the next one carries the
                         // same information. Dropping one is strictly
                         // better than queuing it.
-                        let _ = socket.try_send_to(&fwd_bytes, addr);
+                        let _ = sink.try_send(&fwd_bytes, addr);
                     }
                 }
                 return;
@@ -24730,7 +24744,7 @@ impl MeshNode {
                     // wrong response at the moment this node should be
                     // dropping. Verbatim `send_to` semantics are not
                     // lost — UDP was always allowed to drop this.
-                    if let Err(e) = ctx.socket.try_send_to(&forwarded, next_hop) {
+                    if let Err(e) = ctx.sink.try_send(&forwarded, next_hop) {
                         tracing::debug!(
                             dest = format!("{:#x}", routing_header.dest_id),
                             reason = %e,
@@ -25036,7 +25050,7 @@ impl MeshNode {
             // that queue grow without limit. If queuing is ever wanted
             // here it has to be an explicitly bounded worker-owned ring,
             // not one spawned task per datagram.
-            if let Err(e) = ctx.socket.try_send_to(&buf[..n], egress_addr) {
+            if let Err(e) = ctx.sink.try_send(&buf[..n], egress_addr) {
                 tracing::debug!(
                     egress = format!("{egress_node:#x}"),
                     reason = %e,
@@ -25069,7 +25083,7 @@ impl MeshNode {
     fn handle_routed_handshake(
         parsed: &ParsedPacket,
         routing_header: &RoutingHeader,
-        source: SocketAddr,
+        source: PeerAddr,
         ctx: &DispatchCtx,
     ) {
         // Routing id of the remote party: what we see in the routing
@@ -25331,7 +25345,7 @@ impl MeshNode {
                                         // assert an adjacency the handshake
                                         // never established.
                                         transport: PeerTransport::Routed {
-                                            relay_addr: source,
+                                            relay: source,
                                             adjacent_relay_identity: ctx
                                                 .addr_to_node
                                                 .get(&source)
@@ -25357,7 +25371,7 @@ impl MeshNode {
                             vac.insert(PeerInfo {
                                 node_id: peer_node_id,
                                 transport: PeerTransport::Routed {
-                                    relay_addr: source,
+                                    relay: source,
                                     adjacent_relay_identity: ctx
                                         .addr_to_node
                                         .get(&source)
@@ -25438,7 +25452,7 @@ impl MeshNode {
         // skip the rollback if the runtime was shutting down or
         // the task was cancelled before the send completed,
         // leaving the peer/session/route in an unsendable state.
-        let socket = ctx.socket.clone();
+        let sink = ctx.sink.clone();
         let payload = routed.freeze();
         let guard = PeerRegistrationGuard {
             peer_node_id,
@@ -25458,7 +25472,7 @@ impl MeshNode {
             peer_entity_ids: ctx.peer_entity_ids.clone(),
         };
         tokio::spawn(async move {
-            match socket.send_to(&payload, next_hop).await {
+            match sink.send(&payload, next_hop).await {
                 Ok(_) => {
                     // `commit` disarms the guard and drops it, so the
                     // rollback is skipped, the registrations stay in
@@ -25503,9 +25517,9 @@ impl MeshNode {
     #[inline]
     fn resolve_grant_peer(
         peers: &DashMap<u64, PeerInfo>,
-        addr_to_node: &DashMap<SocketAddr, u64>,
+        addr_to_node: &DashMap<PeerAddr, u64>,
         session: &NetSession,
-    ) -> Option<(SocketAddr, Arc<NetSession>)> {
+    ) -> Option<(PeerAddr, Arc<NetSession>)> {
         session
             .cached_node_id()
             .and_then(|nid| {
@@ -25702,7 +25716,7 @@ impl MeshNode {
                                     if ctx.partition_filter.contains(&dest_addr) {
                                         continue;
                                     }
-                                    let socket = ctx.socket.clone();
+                                    let sink = ctx.sink.clone();
                                     let payload = Bytes::from(msg.payload);
                                     tokio::spawn(async move {
                                         let pool = dest_sess.thread_local_pool();
@@ -25720,7 +25734,7 @@ impl MeshNode {
                                             PacketFlags::NONE,
                                             SUBPROTOCOL_MIGRATION,
                                         );
-                                        let _ = socket.send_to(&packet, dest_addr).await;
+                                        let _ = sink.send(&packet, dest_addr).await;
                                     });
                                 }
                             }
@@ -25754,7 +25768,7 @@ impl MeshNode {
                         .map(|e| (e.value().addr(), e.value().session.clone()));
                     if let Some((dest_addr, dest_sess)) = dest_session {
                         if !ctx.partition_filter.contains(&dest_addr) {
-                            let socket = ctx.socket.clone();
+                            let sink = ctx.sink.clone();
                             tokio::spawn(async move {
                                 let pool = dest_sess.thread_local_pool();
                                 let mut builder = pool.get();
@@ -25771,7 +25785,7 @@ impl MeshNode {
                                     PacketFlags::NONE,
                                     SUBPROTOCOL_MIGRATION,
                                 );
-                                let _ = socket.send_to(&packet, dest_addr).await;
+                                let _ = sink.send(&packet, dest_addr).await;
                             });
                         }
                     }
@@ -25880,12 +25894,12 @@ impl MeshNode {
                 }
             }
             if !packets.is_empty() {
-                let socket = ctx.socket.clone();
+                let sink = ctx.sink.clone();
                 let dest = parsed.source;
                 let control_stats = ctx.control_stats.clone();
                 tokio::spawn(async move {
                     for p in packets {
-                        if socket.send_to(&p, dest).await.is_ok() {
+                        if sink.send(&p, dest).await.is_ok() {
                             control_stats
                                 .retransmit_packets_sent
                                 .fetch_add(1, Ordering::Relaxed);
@@ -26359,8 +26373,13 @@ impl MeshNode {
                         if ctx.partition_filter.contains(&dest_addr) {
                             continue;
                         }
-                        let response = reflex::encode_response(dest_addr);
-                        let socket = ctx.socket.clone();
+                        // Reflex publication is a UDP-tuple boundary (the
+                        // wire field is a `SocketAddr`).
+                        let Some(observed) = dest_addr.udp() else {
+                            continue;
+                        };
+                        let response = reflex::encode_response(observed);
+                        let sink = ctx.sink.clone();
                         tokio::spawn(async move {
                             let pool = dest_sess.thread_local_pool();
                             let mut builder = pool.get();
@@ -26378,7 +26397,7 @@ impl MeshNode {
                                 PacketFlags::NONE,
                                 super::traversal::SUBPROTOCOL_REFLEX,
                             );
-                            let _ = socket.send_to(&packet, dest_addr).await;
+                            let _ = sink.send(&packet, dest_addr).await;
                         });
                     }
                     reflex::ReflexMsg::Response(observed) => {
@@ -27081,7 +27100,7 @@ impl MeshNode {
     /// overwrite delivers the freshest `total_consumed` the drainer
     /// needs.
     fn spawn_stream_grant_drainer_loop(&self) -> JoinHandle<()> {
-        let socket = self.socket.clone();
+        let sink = self.sink.clone();
         let partition_filter = self.partition_filter.clone();
         let pending = self.pending_stream_grants.clone();
         let notify = self.pending_stream_grants_notify.clone();
@@ -27166,7 +27185,7 @@ impl MeshNode {
                             PacketFlags::NONE,
                             SUBPROTOCOL_STREAM_WINDOW,
                         );
-                        if let Err(e) = socket.send_to(&packet, peer_addr).await {
+                        if let Err(e) = sink.send(&packet, peer_addr).await {
                             tracing::debug!(error = %e, "StreamWindow grant send failed");
                             continue;
                         }
@@ -27190,7 +27209,7 @@ impl MeshNode {
                         );
                     }
                     emit_control_chunks(
-                        &socket,
+                        &sink,
                         &mut builder,
                         &session,
                         peer_addr,
@@ -27201,7 +27220,7 @@ impl MeshNode {
                     )
                     .await;
                     emit_control_chunks(
-                        &socket,
+                        &sink,
                         &mut builder,
                         &session,
                         peer_addr,
@@ -27225,7 +27244,7 @@ impl MeshNode {
     /// past `max_retries` are dropped from the window by `get_timed_out`.
     fn spawn_retransmit_loop(&self) -> JoinHandle<()> {
         let peers = self.peers.clone();
-        let socket = self.socket.clone();
+        let sink = self.sink.clone();
         let shutdown = self.shutdown.clone();
         let shutdown_notify = self.shutdown_notify.clone();
         let control_stats = self.control_stats.clone();
@@ -27251,7 +27270,7 @@ impl MeshNode {
                 // below (that could deadlock against a concurrent peer
                 // insert/remove on the same shard).
                 let mut work: Vec<(
-                    SocketAddr,
+                    PeerAddr,
                     Arc<NetSession>,
                     Vec<Arc<super::RetransmitDescriptor>>,
                 )> = Vec::new();
@@ -27266,7 +27285,7 @@ impl MeshNode {
                     let mut builder = pool.get();
                     for d in due {
                         let packet = builder.build(d.stream_id, d.seq, &d.events, d.flags);
-                        if socket.send_to(&packet, addr).await.is_ok() {
+                        if sink.send(&packet, addr).await.is_ok() {
                             control_stats
                                 .retransmit_packets_sent
                                 .fetch_add(1, Ordering::Relaxed);
@@ -27277,7 +27296,7 @@ impl MeshNode {
                 // H-3: any stream whose reliable layer gave up
                 // retransmitting → tell the peer to fail its pending read
                 // now (a `StreamReset`) instead of stalling to a timeout.
-                let mut resets: Vec<(SocketAddr, Arc<NetSession>, Vec<u64>)> = Vec::new();
+                let mut resets: Vec<(PeerAddr, Arc<NetSession>, Vec<u64>)> = Vec::new();
                 for peer in peers.iter() {
                     let failed = peer.value().session.take_failed_stream_ids();
                     if !failed.is_empty() {
@@ -27297,7 +27316,7 @@ impl MeshNode {
                         })
                         .collect();
                     emit_control_chunks(
-                        &socket,
+                        &sink,
                         &mut builder,
                         &session,
                         addr,
@@ -27325,7 +27344,7 @@ impl MeshNode {
                 // NACKs are harmless (`on_nack` resends are bounded by
                 // `max_retries` and deduped by the receiver).
                 struct TickGaps {
-                    addr: SocketAddr,
+                    addr: PeerAddr,
                     session: Arc<NetSession>,
                     reports: Vec<super::session::GapReport>,
                 }
@@ -27376,7 +27395,7 @@ impl MeshNode {
                         })
                         .collect();
                     emit_control_chunks(
-                        &socket,
+                        &sink,
                         &mut builder,
                         &session,
                         addr,
@@ -27403,7 +27422,7 @@ impl MeshNode {
                         })
                         .collect();
                     emit_control_chunks(
-                        &socket,
+                        &sink,
                         &mut builder,
                         &session,
                         addr,
@@ -27420,7 +27439,7 @@ impl MeshNode {
 
     /// Spawn heartbeat sender for all peers.
     fn spawn_heartbeat_loop(&self) -> JoinHandle<()> {
-        let socket = self.socket.clone();
+        let sink = self.sink.clone();
         let peers = self.peers.clone();
         let addr_to_node = self.addr_to_node.clone();
         let peer_addrs = self.peer_addrs.clone();
@@ -27520,7 +27539,7 @@ impl MeshNode {
                         // counter=0 across heartbeats so the replay
                         // window would reject every heartbeat after
                         // the first.
-                        let snapshot: Vec<(SocketAddr, Arc<NetSession>)> = peers
+                        let snapshot: Vec<(PeerAddr, Arc<NetSession>)> = peers
                             .iter()
                             .filter_map(|entry| {
                                 let peer_addr = entry.value().addr();
@@ -27533,9 +27552,9 @@ impl MeshNode {
                             .collect();
                         for (peer_addr, session) in snapshot {
                             let packet = session.build_heartbeat();
-                            let _ = socket.send_to(&packet, peer_addr).await;
+                            let _ = sink.send(&packet, peer_addr).await;
                             // Pingwave (raw UDP — not encrypted, topology is public)
-                            let _ = socket.send_to(&pw_bytes, peer_addr).await;
+                            let _ = sink.send(&pw_bytes, peer_addr).await;
                         }
 
                         // Drop routes whose `updated_at` is past the age
@@ -27589,7 +27608,7 @@ impl MeshNode {
                                 };
                                 if !deliveries.is_empty() {
                                     dispatch_sensing_leader_deliveries(
-                                        &socket,
+                                        &sink,
                                         &peers,
                                         &addr_to_node,
                                         &router,
@@ -27669,7 +27688,7 @@ impl MeshNode {
                                     };
                                     if let Ok(bytes) = sensing::encode_interest_frame(&frame) {
                                         spawn_sensing_frame_send(
-                                            &socket,
+                                            &sink,
                                             &peers,
                                             &addr_to_node,
                                             &router,
@@ -27950,7 +27969,7 @@ impl MeshNode {
                                     }
                                 };
                                 dispatch_sensing_leader_deliveries(
-                                    &socket,
+                                    &sink,
                                     &peers,
                                     &addr_to_node,
                                     &router,
@@ -27975,7 +27994,7 @@ impl MeshNode {
                                     sensing::SENSING_PROVISIONAL_STREAM
                                 };
                                 spawn_sensing_frame_send(
-                                    &socket,
+                                    &sink,
                                     &peers,
                                     &addr_to_node,
                                     &router,
@@ -28207,7 +28226,7 @@ impl MeshNode {
     /// may be reachable through it. A caller that holds a node id must
     /// use the node-keyed form and never launder the id through an
     /// address to get back a (possibly different) id.
-    fn node_owning_addr(&self, peer_addr: SocketAddr) -> Result<u64, AdapterError> {
+    fn node_owning_addr(&self, peer_addr: PeerAddr) -> Result<u64, AdapterError> {
         self.addr_to_node
             .get(&peer_addr)
             .map(|e| *e.value())
@@ -28226,7 +28245,7 @@ impl MeshNode {
         peer_addr: SocketAddr,
         batch: &Batch,
     ) -> Result<(), AdapterError> {
-        self.send_to_peer_node(self.node_owning_addr(peer_addr)?, batch)
+        self.send_to_peer_node(self.node_owning_addr(PeerAddr::Udp(peer_addr))?, batch)
             .await
     }
 
@@ -28281,7 +28300,7 @@ impl MeshNode {
                     PacketFlags::NONE
                 };
                 let packet = builder.build(stream_id, seq, &current_batch, flags);
-                send_datagram(&self.socket, &packet, peer_addr).await?;
+                send_datagram(&self.sink, &packet, peer_addr).await?;
 
                 current_batch.clear();
                 current_size = 0;
@@ -28302,7 +28321,7 @@ impl MeshNode {
                 PacketFlags::NONE
             };
             let packet = builder.build(stream_id, seq, &current_batch, flags);
-            send_datagram(&self.socket, &packet, peer_addr).await?;
+            send_datagram(&self.sink, &packet, peer_addr).await?;
         }
 
         // builder is dropped here — auto-released back to the pool
@@ -28375,8 +28394,8 @@ impl MeshNode {
                 routed.extend_from_slice(&routing_bytes);
                 routed.extend_from_slice(&net_packet);
 
-                self.socket
-                    .send_to(&routed, next_hop)
+                self.sink
+                    .send(&routed, next_hop)
                     .await
                     .map_err(|e| AdapterError::Connection(format!("send failed: {}", e)))?;
 
@@ -28403,8 +28422,8 @@ impl MeshNode {
             routed.extend_from_slice(&routing_bytes);
             routed.extend_from_slice(&net_packet);
 
-            self.socket
-                .send_to(&routed, next_hop)
+            self.sink
+                .send(&routed, next_hop)
                 .await
                 .map_err(|e| AdapterError::Connection(format!("send failed: {}", e)))?;
         }
@@ -28753,7 +28772,7 @@ impl MeshNode {
             &self.event_pingwave_gate,
             self.config.event_pingwave_min_gap,
             &self.proximity_graph,
-            &self.socket,
+            &self.sink,
             &self.peers,
             &self.partition_filter,
             resend,
@@ -29977,11 +29996,11 @@ impl MeshNode {
     /// any hop whose address equals the withdrawing sender's, which
     /// would re-install exactly the route we just dropped.
     fn promotable_direct_hop(
-        addr_to_node: &DashMap<SocketAddr, u64>,
+        addr_to_node: &DashMap<PeerAddr, u64>,
         failure_detector: &FailureDetector,
         hop: u64,
-        addr: SocketAddr,
-        via_addr: SocketAddr,
+        addr: PeerAddr,
+        via_addr: PeerAddr,
     ) -> bool {
         if addr == via_addr {
             return false;
@@ -30004,12 +30023,12 @@ impl MeshNode {
     fn try_promote_graph_alternate(
         proximity_graph: &ProximityGraph,
         router: &NetRouter,
-        peer_addrs: &DashMap<u64, SocketAddr>,
-        addr_to_node: &DashMap<SocketAddr, u64>,
+        peer_addrs: &DashMap<u64, PeerAddr>,
+        addr_to_node: &DashMap<PeerAddr, u64>,
         failure_detector: &FailureDetector,
         dest: u64,
         from_node: u64,
-        via_addr: SocketAddr,
+        via_addr: PeerAddr,
     ) -> bool {
         // Exclude the withdrawing peer as a first hop: the UNRESTRICTED
         // shortest path to `dest` may still start with `from_node` (it
@@ -30278,7 +30297,7 @@ impl MeshNode {
         let failure_detector = ctx.failure_detector.clone();
         let route_withdraw_seq = ctx.route_withdraw_seq.clone();
         let route_withdraw_damper = ctx.route_withdraw_damper.clone();
-        let socket = ctx.socket.clone();
+        let sink = ctx.sink.clone();
         let peers = ctx.peers.clone();
         let partition_filter = ctx.partition_filter.clone();
         tokio::spawn(async move {
@@ -30303,7 +30322,7 @@ impl MeshNode {
                 run_route_withdrawal_flood(
                     route_withdraw_seq,
                     route_withdraw_damper,
-                    socket,
+                    sink,
                     peers,
                     partition_filter,
                     dest,
@@ -30608,7 +30627,7 @@ impl MeshNode {
                     // provider-free path).
                     if !registration.warm_starts.is_empty() {
                         dispatch_sensing_leader_deliveries(
-                            &ctx.socket,
+                            &ctx.sink,
                             &ctx.peers,
                             &ctx.addr_to_node,
                             &ctx.router,
@@ -30755,7 +30774,7 @@ impl MeshNode {
                         {
                             if let Ok(bytes) = sensing::encode_interest_frame(&upstream) {
                                 spawn_sensing_frame_send(
-                                    &ctx.socket,
+                                    &ctx.sink,
                                     &ctx.peers,
                                     &ctx.addr_to_node,
                                     &ctx.router,
@@ -31296,7 +31315,7 @@ impl MeshNode {
                 if let Some(cached) = cached {
                     if let Ok(bytes) = sensing::encode_attestation(&cached) {
                         spawn_sensing_frame_send(
-                            &ctx.socket,
+                            &ctx.sink,
                             &ctx.peers,
                             &ctx.addr_to_node,
                             &ctx.router,
@@ -31340,7 +31359,7 @@ impl MeshNode {
                 {
                     if let Ok(bytes) = sensing::encode_interest_frame(&upstream) {
                         spawn_sensing_frame_send(
-                            &ctx.socket,
+                            &ctx.sink,
                             &ctx.peers,
                             &ctx.addr_to_node,
                             &ctx.router,
@@ -31923,7 +31942,7 @@ impl MeshNode {
                 // Forward the origin's SIGNED bytes verbatim —
                 // relays never author attestations (§4.2).
                 spawn_sensing_frame_send(
-                    &ctx.socket,
+                    &ctx.sink,
                     &ctx.peers,
                     &ctx.addr_to_node,
                     &ctx.router,
@@ -32193,7 +32212,7 @@ impl MeshNode {
                     }
                 };
                 dispatch_sensing_leader_deliveries(
-                    &ctx.socket,
+                    &ctx.sink,
                     &ctx.peers,
                     &ctx.addr_to_node,
                     &ctx.router,
@@ -32223,7 +32242,7 @@ impl MeshNode {
         }
         for node in forwards {
             spawn_sensing_frame_send(
-                &ctx.socket,
+                &ctx.sink,
                 &ctx.peers,
                 &ctx.addr_to_node,
                 &ctx.router,
@@ -32256,7 +32275,7 @@ impl MeshNode {
         };
         for node in peers {
             spawn_sensing_frame_send(
-                &ctx.socket,
+                &ctx.sink,
                 &ctx.peers,
                 &ctx.addr_to_node,
                 &ctx.router,
@@ -32399,7 +32418,7 @@ impl MeshNode {
                     &ctx.sensing_observations,
                     &ctx.sensing_emitter,
                     emitter_stamp,
-                    &ctx.socket,
+                    &ctx.sink,
                     &ctx.peers,
                     &ctx.addr_to_node,
                     &ctx.router,
@@ -32452,7 +32471,7 @@ impl MeshNode {
                 {
                     if let Ok(bytes) = sensing::encode_interest_frame(&upstream) {
                         spawn_sensing_frame_send(
-                            &ctx.socket,
+                            &ctx.sink,
                             &ctx.peers,
                             &ctx.addr_to_node,
                             &ctx.router,
@@ -32512,7 +32531,7 @@ impl MeshNode {
             // The origin's EXACT signed bytes — the leader never
             // authors refusals for a foreign origin (§4.2).
             spawn_sensing_frame_send(
-                &ctx.socket,
+                &ctx.sink,
                 &ctx.peers,
                 &ctx.addr_to_node,
                 &ctx.router,
@@ -32570,7 +32589,7 @@ impl MeshNode {
         if let Some(upstream) = sensing::plan_provider_continuation(&continuation, |_org| None) {
             if let Ok(bytes) = sensing::encode_interest_frame(&upstream) {
                 spawn_sensing_frame_send(
-                    &ctx.socket,
+                    &ctx.sink,
                     &ctx.peers,
                     &ctx.addr_to_node,
                     &ctx.router,
@@ -32598,7 +32617,7 @@ impl MeshNode {
         };
         if let Ok(bytes) = sensing::encode_interest_frame(&frame) {
             spawn_sensing_frame_send(
-                &ctx.socket,
+                &ctx.sink,
                 &ctx.peers,
                 &ctx.addr_to_node,
                 &ctx.router,
@@ -33341,7 +33360,7 @@ impl MeshNode {
     /// ship verbatim — a relay never opens, stores, or re-signs them.
     fn forward_scoped_announcement(frame: Vec<u8>, from_node: u64, ctx: &DispatchCtx) {
         let peers = ctx.peers.clone();
-        let socket = ctx.socket.clone();
+        let sink = ctx.sink.clone();
         let partition_filter = ctx.partition_filter.clone();
 
         tokio::spawn(async move {
@@ -33368,7 +33387,7 @@ impl MeshNode {
                     PacketFlags::NONE,
                     SUBPROTOCOL_SCOPED_CAPABILITY_ANN,
                 );
-                let _ = send_datagram(&socket, &packet, peer.addr).await;
+                let _ = send_datagram(&sink, &packet, peer.addr).await;
                 drop(builder);
                 session.touch();
             }
@@ -33382,7 +33401,7 @@ impl MeshNode {
         ctx: &DispatchCtx,
     ) {
         let peers = ctx.peers.clone();
-        let socket = ctx.socket.clone();
+        let sink = ctx.sink.clone();
         let partition_filter = ctx.partition_filter.clone();
         let router = ctx.router.clone();
 
@@ -33422,7 +33441,7 @@ impl MeshNode {
                     PacketFlags::NONE,
                     SUBPROTOCOL_CAPABILITY_ANN,
                 );
-                let _ = send_datagram(&socket, &packet, peer.addr).await;
+                let _ = send_datagram(&sink, &packet, peer.addr).await;
                 drop(builder);
                 session.touch();
             }
@@ -33492,7 +33511,7 @@ impl MeshNode {
         let reject_punch_id = req.punch_id;
         let send_reject = |reason: RejectReason| {
             let session = a_session.clone();
-            let socket = ctx.socket.clone();
+            let sink = ctx.sink.clone();
             let body = RendezvousMsg::PunchReject(PunchReject {
                 target: reject_target,
                 punch_id: reject_punch_id,
@@ -33515,7 +33534,7 @@ impl MeshNode {
                     PacketFlags::NONE,
                     super::traversal::SUBPROTOCOL_RENDEZVOUS,
                 );
-                let _ = socket.send_to(&packet, a_addr).await;
+                let _ = sink.send(&packet, a_addr).await;
             });
         };
 
@@ -33576,7 +33595,7 @@ impl MeshNode {
         // against the relay IP and drop a legitimate request — but
         // that only costs the optimization (A falls back to the
         // relay), never correctness.
-        if req.self_reflex.ip() != a_addr.ip() {
+        if Some(req.self_reflex.ip()) != a_addr.udp().map(|a| a.ip()) {
             tracing::trace!(
                 from_node = format!("{:#x}", from_node),
                 claimed = %req.self_reflex,
@@ -33665,8 +33684,8 @@ impl MeshNode {
             "rendezvous: mediating punch, introducing both ends"
         );
 
-        let socket_a = ctx.socket.clone();
-        let socket_b = ctx.socket.clone();
+        let sink_a = ctx.sink.clone();
+        let sink_b = ctx.sink.clone();
         tokio::spawn(async move {
             let pool = a_session.thread_local_pool();
             let mut builder = pool.get();
@@ -33685,7 +33704,7 @@ impl MeshNode {
             );
             // A discarded send error here used to be indistinguishable
             // from a delivered introduce.
-            if let Err(e) = socket_a.send_to(&packet, a_addr).await {
+            if let Err(e) = sink_a.send(&packet, a_addr).await {
                 tracing::debug!(dest = %a_addr, error = %e, "rendezvous: introduce send to requester failed");
             }
         });
@@ -33705,7 +33724,7 @@ impl MeshNode {
                 PacketFlags::NONE,
                 super::traversal::SUBPROTOCOL_RENDEZVOUS,
             );
-            if let Err(e) = socket_b.send_to(&packet, b_addr).await {
+            if let Err(e) = sink_b.send(&packet, b_addr).await {
                 tracing::debug!(dest = %b_addr, error = %e, "rendezvous: introduce send to target failed");
             }
         });
@@ -33859,7 +33878,10 @@ impl MeshNode {
         if ctx.partition_filter.contains(&coord_addr) {
             return;
         }
-        if ctx.partition_filter.contains(&intro.peer_reflex) {
+        if ctx
+            .partition_filter
+            .contains(&PeerAddr::Udp(intro.peer_reflex))
+        {
             return;
         }
 
@@ -33872,7 +33894,7 @@ impl MeshNode {
         // oneshot.
         let (obs_tx, obs_rx) = oneshot::channel();
         ctx.punch_observers
-            .insert(intro.peer_reflex, (intro.peer, obs_tx));
+            .insert(PeerAddr::Udp(intro.peer_reflex), (intro.peer, obs_tx));
 
         // What this node is now waiting for. Paired with the
         // observer-miss log in the receive loop, this pins down the
@@ -33906,7 +33928,7 @@ impl MeshNode {
         let peer_reflex = intro.peer_reflex;
         let peer = intro.peer;
         let socket_send = ctx.socket.clone();
-        let socket_ack = ctx.socket.clone();
+        let sink_ack = ctx.sink.clone();
         let deadline = ctx.traversal_config.punch_deadline;
         let punch_observers = ctx.punch_observers.clone();
 
@@ -33994,7 +34016,13 @@ impl MeshNode {
             // keep-alive reached us. A wrong-sender packet is dropped
             // upstream *without* consuming the observer, so it can't
             // burn the attempt — a later valid keep-alive still fires.
-            if !await_punch_observer_outcome(obs_rx, deadline, &punch_observers, peer_reflex).await
+            if !await_punch_observer_outcome(
+                obs_rx,
+                deadline,
+                &punch_observers,
+                PeerAddr::Udp(peer_reflex),
+            )
+            .await
             {
                 tracing::debug!(
                     counterpart = format!("{:#x}", peer),
@@ -34033,7 +34061,7 @@ impl MeshNode {
                 PacketFlags::NONE,
                 super::traversal::SUBPROTOCOL_RENDEZVOUS,
             );
-            if let Err(e) = socket_ack.send_to(&packet, coord_addr).await {
+            if let Err(e) = sink_ack.send(&packet, coord_addr).await {
                 tracing::debug!(dest = %coord_addr, error = %e, "rendezvous: ack send to coordinator failed");
             }
         });
@@ -34066,7 +34094,7 @@ impl MeshNode {
         }
 
         let body = RendezvousMsg::PunchAck(ack).encode();
-        let socket = ctx.socket.clone();
+        let sink = ctx.sink.clone();
         tokio::spawn(async move {
             let pool = dest_session.thread_local_pool();
             let mut builder = pool.get();
@@ -34083,7 +34111,7 @@ impl MeshNode {
                 PacketFlags::NONE,
                 super::traversal::SUBPROTOCOL_RENDEZVOUS,
             );
-            let _ = socket.send_to(&packet, dest_addr).await;
+            let _ = sink.send(&packet, dest_addr).await;
         });
     }
 
@@ -34814,7 +34842,7 @@ impl MeshNode {
             return;
         }
         let dest_sess = peer_entry.value().session.clone();
-        let socket = ctx.socket.clone();
+        let sink = ctx.sink.clone();
         let ack = MembershipMsg::Ack {
             nonce,
             accepted,
@@ -34839,7 +34867,7 @@ impl MeshNode {
                 PacketFlags::NONE,
                 SUBPROTOCOL_CHANNEL_MEMBERSHIP,
             );
-            let _ = socket.send_to(&packet, dest_addr).await;
+            let _ = sink.send(&packet, dest_addr).await;
         });
     }
 
@@ -35482,7 +35510,7 @@ impl MeshNode {
             .lookup(peer_node_id)
             .unwrap_or(dest_addr);
 
-        if let Err(e) = self.socket.send_to(&packet, next_hop).await {
+        if let Err(e) = self.sink.send(&packet, next_hop).await {
             return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(
                 "publish send failed: {}",
                 e
@@ -35541,7 +35569,13 @@ impl MeshNode {
         let bytes = ann
             .encode()
             .map_err(|e| AdapterError::Connection(format!("fold: encode failed: {e}")))?;
-        let peer_addrs: Vec<SocketAddr> = self.peers.iter().map(|e| e.value().addr()).collect();
+        // `send_subprotocol` is the operator-facing seam and keeps its
+        // `SocketAddr`; resolve each endpoint's tuple at this boundary.
+        let peer_addrs: Vec<SocketAddr> = self
+            .peers
+            .iter()
+            .filter_map(|e| e.value().addr().udp())
+            .collect();
         // Share the encoded bytes by reference; each send
         // borrows the same slice. send_subprotocol clones into
         // its own internal allocation, so concurrent sends don't
@@ -35732,7 +35766,11 @@ impl MeshNode {
         subprotocol_id: u16,
         payload: &[u8],
     ) -> Result<(), AdapterError> {
-        self.send_subprotocol_to_node(self.node_owning_addr(peer_addr)?, subprotocol_id, payload)
+        self.send_subprotocol_to_node(
+            self.node_owning_addr(PeerAddr::Udp(peer_addr))?,
+            subprotocol_id,
+            payload,
+        )
             .await
     }
 
@@ -35799,7 +35837,7 @@ impl MeshNode {
         let packet =
             builder.build_subprotocol(stream_id, seq, &events, PacketFlags::NONE, subprotocol_id);
 
-        send_datagram(&self.socket, &packet, peer_addr).await?;
+        send_datagram(&self.sink, &packet, peer_addr).await?;
 
         drop(builder);
         session.touch();
@@ -36655,7 +36693,7 @@ impl MeshNode {
             .peers
             .get(&node_id)
             .map(|p| p.value().addr())
-            .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
+            .unwrap_or_else(|| PeerAddr::Udp(SocketAddr::from(([0, 0, 0, 0], 0))));
         if let Err(e) = self
             .send_subprotocol_to_node(node_id, SUBPROTOCOL_CAPABILITY_ANN, &emission.public)
             .await
@@ -37522,7 +37560,7 @@ impl MeshNode {
             PacketFlags::RELIABLE,
             super::dataforts::blob::SUBPROTOCOL_BLOB_TRANSFER,
         );
-        self.socket.send_to(&packet, dest_addr).await.map_err(|e| {
+        self.sink.send(&packet, dest_addr).await.map_err(|e| {
             super::AdapterError::Connection(format!("transfer control: send failed: {e}"))
         })?;
         Ok(())
@@ -37903,7 +37941,7 @@ impl MeshNode {
     /// [`Self::upgrade_is_loop_candidate`], so the three can't drift
     /// apart on the default or the ownership rule.
     #[cfg(feature = "nat-traversal")]
-    fn is_relayed_peer(&self, peer_id: u64, addr: &SocketAddr) -> bool {
+    fn is_relayed_peer(&self, peer_id: u64, addr: &PeerAddr) -> bool {
         self.addr_to_node
             .get(addr)
             .map(|owner| *owner != peer_id)
@@ -38132,9 +38170,11 @@ impl MeshNode {
         // from the SkipPunch / SinglePunch arms — `Direct`
         // routes via the routing table (below).
         let coordinator_addr = || {
+            // The coordinator is dialled through `connect_via`, the
+            // operator-facing seam, so resolve its UDP tuple here.
             self.peer_addrs
                 .get(&coordinator)
-                .map(|e| *e.value())
+                .and_then(|e| e.value().udp())
                 .ok_or(TraversalError::PeerNotReachable)
         };
 
@@ -38148,7 +38188,7 @@ impl MeshNode {
         // Unconditionally short-circuiting on any existing session
         // would leave callers stuck on the relay forever,
         // defeating the optimization.
-        let session_matches = |want_addr: std::net::SocketAddr| {
+        let session_matches = |want_addr: PeerAddr| {
             self.peers
                 .get(&peer_node_id)
                 .map(|e| e.value().addr() == want_addr)
@@ -38162,7 +38202,7 @@ impl MeshNode {
         // loop pending_handshakes path via `connect_via`, which
         // avoids recv-loop contention on a post-`start()` node.
         let connect_on_direct_path = |target_addr: std::net::SocketAddr| async move {
-            let id = if session_matches(target_addr) {
+            let id = if session_matches(PeerAddr::Udp(target_addr)) {
                 peer_node_id
             } else {
                 self.connect_via(target_addr, peer_pubkey, peer_node_id)
@@ -38202,9 +38242,10 @@ impl MeshNode {
                     .peers
                     .get(&peer_node_id)
                     .and_then(|p| p.value().owned_addr())
-                    == Some(target_addr);
+                    == Some(PeerAddr::Udp(target_addr));
                 if owns_target {
-                    self.addr_to_node.insert(target_addr, peer_node_id);
+                    self.addr_to_node
+                        .insert(PeerAddr::Udp(target_addr), peer_node_id);
                 }
             });
             Ok::<u64, TraversalError>(id)
@@ -38222,7 +38263,7 @@ impl MeshNode {
         // runs unless we can confirm the existing session is
         // already the one this call was asked to resolve.
         let connect_via_coordinator = |coord_addr: std::net::SocketAddr| async move {
-            if session_matches(coord_addr) {
+            if session_matches(PeerAddr::Udp(coord_addr)) {
                 return Ok(peer_node_id);
             }
             self.connect_via(coord_addr, peer_pubkey, peer_node_id)
@@ -39210,7 +39251,7 @@ impl MeshNode {
         builder: &mut super::pool::ThreadLocalPooledBuilder<'_>,
         stream: &Stream,
         stream_id: u64,
-        peer_addr: SocketAddr,
+        peer_addr: PeerAddr,
         scheduled: bool,
         flags: PacketFlags,
         batch: &[Bytes],
@@ -39346,7 +39387,7 @@ impl MeshNode {
         &self,
         scheduled: bool,
         packet: &[u8],
-        peer_addr: SocketAddr,
+        peer_addr: PeerAddr,
         stream_id: u64,
     ) -> Result<(), StreamError> {
         if scheduled {
@@ -39365,8 +39406,8 @@ impl MeshNode {
                 Err(StreamError::Backpressure)
             }
         } else {
-            self.socket
-                .send_to(packet, peer_addr)
+            self.sink
+                .send(packet, peer_addr)
                 .await
                 .map(|_| ())
                 .map_err(|e| StreamError::Transport(format!("send failed: {}", e)))
@@ -39495,7 +39536,7 @@ impl MeshNode {
     /// router + peers + addr_to_node).
     async fn try_connect_via_once(
         &self,
-        relay_addr: SocketAddr,
+        relay_addr: PeerAddr,
         dest_pubkey: &[u8; 32],
         dest_node_id: u64,
     ) -> Result<SessionKeys, AdapterError> {
@@ -39545,7 +39586,7 @@ impl MeshNode {
         let mut routed = bytes::BytesMut::with_capacity(ROUTING_HEADER_SIZE + inner.len());
         routed.extend_from_slice(&routing.to_bytes());
         routed.extend_from_slice(&inner);
-        if let Err(e) = self.socket.send_to(&routed, relay_addr).await {
+        if let Err(e) = self.sink.send(&routed, relay_addr).await {
             self.pending_handshakes.remove(&pending_key);
             return Err(AdapterError::Connection(format!("send failed: {}", e)));
         }
@@ -39612,7 +39653,7 @@ impl MeshNode {
         let keys = loop {
             attempt += 1;
             match self
-                .try_connect_via_once(relay_addr, dest_pubkey, dest_node_id)
+                .try_connect_via_once(PeerAddr::Udp(relay_addr), dest_pubkey, dest_node_id)
                 .await
             {
                 Ok(keys) => break keys,
@@ -39634,7 +39675,7 @@ impl MeshNode {
         // intentionally skip the post-install pingwave /
         // failure_detector / announcement push — see `connect`'s wiring
         // for the direct-handshake-only bookkeeping.
-        self.install_routed(dest_node_id, relay_addr, keys, None);
+        self.install_routed(dest_node_id, PeerAddr::Udp(relay_addr), keys, None);
 
         Ok(dest_node_id)
     }
@@ -39668,7 +39709,7 @@ impl MeshNode {
         let keys = loop {
             attempt += 1;
             match self
-                .try_connect_via_once(target_addr, dest_pubkey, dest_node_id)
+                .try_connect_via_once(PeerAddr::Udp(target_addr), dest_pubkey, dest_node_id)
                 .await
             {
                 Ok(keys) => break keys,
@@ -39681,9 +39722,9 @@ impl MeshNode {
         };
         let expected = Some(expected_prior_session_id);
         let outcome = if direct {
-            self.install_direct(dest_node_id, target_addr, keys, expected)
+            self.install_direct(dest_node_id, PeerAddr::Udp(target_addr), keys, expected)
         } else {
-            self.install_routed(dest_node_id, target_addr, keys, expected)
+            self.install_routed(dest_node_id, PeerAddr::Udp(target_addr), keys, expected)
         };
         Ok(outcome.owned)
     }
@@ -39947,7 +39988,7 @@ impl MeshNode {
         };
 
         // Guard against "upgrading" to the very path we're already on.
-        if target_addr == relay_addr {
+        if PeerAddr::Udp(target_addr) == relay_addr {
             self.upgrade_record_done(peer_id);
             return;
         }
@@ -40004,7 +40045,7 @@ impl MeshNode {
     /// peer straight from the `peers` iterator entry instead of doing a
     /// redundant `peers.get` shard-lookup on the map it is iterating.
     #[cfg(feature = "nat-traversal")]
-    fn upgrade_is_loop_candidate_at(&self, peer_id: u64, addr: SocketAddr) -> bool {
+    fn upgrade_is_loop_candidate_at(&self, peer_id: u64, addr: PeerAddr) -> bool {
         // C1: only the lower-node-id end initiates.
         if self.node_id >= peer_id {
             return false;
@@ -40180,6 +40221,12 @@ impl MeshNode {
                     dest_node_id
                 ))
             })?;
+        let first_hop = first_hop.udp().ok_or_else(|| {
+            AdapterError::Connection(format!(
+                "connect_routed: no route to peer {:#x}",
+                dest_node_id
+            ))
+        })?;
         self.connect_via(first_hop, dest_pubkey, dest_node_id).await
     }
 
@@ -40213,7 +40260,7 @@ impl MeshNode {
     /// on path.
     async fn handshake_initiator(
         &self,
-        peer_addr: SocketAddr,
+        peer_addr: PeerAddr,
         peer_pubkey: &[u8; 32],
         peer_node_id: u64,
     ) -> Result<SessionKeys, AdapterError> {
@@ -40264,7 +40311,7 @@ impl MeshNode {
     /// and are reused across attempts — see its doc for why.
     async fn try_handshake_initiator(
         &self,
-        peer_addr: SocketAddr,
+        peer_addr: PeerAddr,
         packet: &Bytes,
         handshake: &mut NoiseHandshake,
     ) -> Result<(), AdapterError> {
@@ -40300,7 +40347,7 @@ impl MeshNode {
                 displaced.close();
             }
 
-            if let Err(e) = self.socket.send_to(packet, peer_addr).await {
+            if let Err(e) = self.sink.send(packet, peer_addr).await {
                 self.deregister_direct_initiator(peer_addr, &inbox);
                 return Err(AdapterError::Connection(format!("send failed: {}", e)));
             }
@@ -40356,7 +40403,7 @@ impl MeshNode {
             }
 
             let socket_arc = self.socket.socket_arc();
-            if let Err(e) = self.socket.send_to(packet, peer_addr).await {
+            if let Err(e) = self.sink.send(packet, peer_addr).await {
                 self.deregister_direct_initiator(peer_addr, &inbox);
                 return Err(AdapterError::Connection(format!("send failed: {}", e)));
             }
@@ -40381,6 +40428,9 @@ impl MeshNode {
                             let (n, source) = read.map_err(|e| {
                                 AdapterError::Connection(format!("recv failed: {}", e))
                             })?;
+                            // Receive boundary: the socket tuple becomes
+                            // the peer endpoint here.
+                            let source = PeerAddr::Udp(source);
                             let data = Bytes::copy_from_slice(&recv_buf[..n]);
 
                             let Some(p) = ParsedPacket::parse(data, source) else {
@@ -40444,7 +40494,7 @@ impl MeshNode {
     /// that live registration down with us and strand it.
     fn deregister_direct_initiator(
         &self,
-        peer_addr: SocketAddr,
+        peer_addr: PeerAddr,
         inbox: &Arc<DirectHandshakeInbox>,
     ) {
         self.pending_direct_initiators
@@ -40466,7 +40516,7 @@ impl MeshNode {
     async fn handshake_responder(
         &self,
         peer_node_id: u64,
-    ) -> Result<(SessionKeys, SocketAddr), AdapterError> {
+    ) -> Result<(SessionKeys, PeerAddr), AdapterError> {
         // Rejection state for the WHOLE accept, not for one attempt.
         // The case that matters is a genuine key mismatch whose `msg1`
         // lands during an early attempt: the initiator's budget is not
@@ -40476,7 +40526,7 @@ impl MeshNode {
         // nothing at all on the wire — reports a bare
         // `handshake timeout` for what is really a misconfiguration.
         let mut last_decrypt_reject: Option<String> = None;
-        let mut last_paced_source: Option<SocketAddr> = None;
+        let mut last_paced_source: Option<PeerAddr> = None;
         let mut attempt = 0;
         loop {
             attempt += 1;
@@ -40579,8 +40629,8 @@ impl MeshNode {
         &self,
         peer_node_id: u64,
         last_decrypt_reject: &mut Option<String>,
-        last_paced_source: &mut Option<SocketAddr>,
-    ) -> Result<(SessionKeys, SocketAddr), AdapterError> {
+        last_paced_source: &mut Option<PeerAddr>,
+    ) -> Result<(SessionKeys, PeerAddr), AdapterError> {
         let timeout = self.config.handshake_timeout;
         let socket_arc = self.socket.socket_arc();
 
@@ -40632,6 +40682,9 @@ impl MeshNode {
                     .await
                     .map_err(|e| AdapterError::Connection(format!("recv failed: {}", e)))?;
 
+                // Receive boundary: the socket tuple becomes the peer
+                // endpoint here.
+                let source = PeerAddr::Udp(source);
                 let data = Bytes::copy_from_slice(&recv_buf[..n]);
 
                 let Some(p) = ParsedPacket::parse(data, source) else {
@@ -40725,8 +40778,8 @@ impl MeshNode {
         let mut builder = PacketBuilder::new(&[0u8; 32], 0);
         let packet = builder.build_handshake(&msg2);
 
-        self.socket
-            .send_to(&packet, source)
+        self.sink
+            .send(&packet, source)
             .await
             .map_err(|e| AdapterError::Connection(format!("send failed: {}", e)))?;
 
@@ -40769,10 +40822,13 @@ impl MeshNode {
     ) -> Result<std::net::SocketAddr, super::traversal::TraversalError> {
         use super::traversal::{reflex, TraversalError};
 
+        // Traversal edge: `send_subprotocol` is the operator-facing
+        // seam and keeps its `SocketAddr`, so resolve the endpoint's
+        // UDP tuple here.
         let peer_addr = self
             .peer_addrs
             .get(&peer_node_id)
-            .map(|e| *e.value())
+            .and_then(|e| e.value().udp())
             .ok_or(TraversalError::PeerNotReachable)?;
 
         // Install the pending-oneshot BEFORE sending so an
@@ -41092,10 +41148,11 @@ impl MeshNode {
         use super::traversal::rendezvous::{PunchRequest, RendezvousMsg};
         use super::traversal::TraversalError;
 
+        // Same boundary as the reflex probe above.
         let relay_addr = self
             .peer_addrs
             .get(&relay)
-            .map(|e| *e.value())
+            .and_then(|e| e.value().udp())
             .ok_or(TraversalError::PeerNotReachable)?;
 
         // Install the waiter BEFORE sending. An improbably fast
@@ -41482,7 +41539,7 @@ impl Adapter for MeshNode {
             .peers
             .iter()
             .next()
-            .map(|e| e.value().addr())
+            .and_then(|e| e.value().addr().udp())
             .ok_or_else(|| AdapterError::Connection("no peers connected".into()))?;
 
         self.send_to_peer(peer_addr, &batch).await
@@ -42433,7 +42490,7 @@ mod sensing_live_direct_session_tests {
         // `peers.contains_key(P)` predicate read this as a live
         // direct session and skipped disruption.
         let relay_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
-        let addr_to_node: DashMap<SocketAddr, u64> = DashMap::new();
+        let addr_to_node: DashMap<PeerAddr, u64> = DashMap::new();
         addr_to_node.insert(relay_addr, 0xE0); // the RELAY's id
         assert!(
             !sensing_addr_is_live_direct(&addr_to_node, None, 0xF0, relay_addr),
@@ -42444,7 +42501,7 @@ mod sensing_live_direct_session_tests {
     #[test]
     fn direct_session_reverse_maps_to_the_node_itself() {
         let addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
-        let addr_to_node: DashMap<SocketAddr, u64> = DashMap::new();
+        let addr_to_node: DashMap<PeerAddr, u64> = DashMap::new();
         addr_to_node.insert(addr, 0xD1);
         assert!(sensing_addr_is_live_direct(&addr_to_node, None, 0xD1, addr));
         // And an address nobody reverse-maps is not direct either
@@ -43171,7 +43228,7 @@ mod heartbeat_aead_tests {
         let next_hop: SocketAddr = "10.0.0.1:9000".parse().unwrap();
 
         let peers: Arc<DashMap<u64, PeerInfo>> = Arc::new(DashMap::new());
-        let peer_addrs: Arc<DashMap<u64, SocketAddr>> = Arc::new(DashMap::new());
+        let peer_addrs: Arc<DashMap<u64, PeerAddr>> = Arc::new(DashMap::new());
         let router = Arc::new(
             NetRouter::new(crate::adapter::net::router::RouterConfig::new(
                 0xCAFE_BABE,
@@ -43270,7 +43327,7 @@ mod heartbeat_aead_tests {
         let next_hop: SocketAddr = "10.0.0.2:9000".parse().unwrap();
 
         let peers: Arc<DashMap<u64, PeerInfo>> = Arc::new(DashMap::new());
-        let peer_addrs: Arc<DashMap<u64, SocketAddr>> = Arc::new(DashMap::new());
+        let peer_addrs: Arc<DashMap<u64, PeerAddr>> = Arc::new(DashMap::new());
         let router = Arc::new(
             NetRouter::new(crate::adapter::net::router::RouterConfig::new(
                 0xCAFE_BABE,
@@ -43401,7 +43458,7 @@ mod heartbeat_aead_tests {
         let fresh: SocketAddr = "10.0.0.4:9000".parse().unwrap();
 
         let peers: Arc<DashMap<u64, PeerInfo>> = Arc::new(DashMap::new());
-        let peer_addrs: Arc<DashMap<u64, SocketAddr>> = Arc::new(DashMap::new());
+        let peer_addrs: Arc<DashMap<u64, PeerAddr>> = Arc::new(DashMap::new());
         let router = Arc::new(
             NetRouter::new(crate::adapter::net::router::RouterConfig::new(
                 0xCAFE_BABE,
@@ -43489,7 +43546,7 @@ mod heartbeat_aead_tests {
         let relay: SocketAddr = "10.0.0.9:9000".parse().unwrap();
 
         let peers: Arc<DashMap<u64, PeerInfo>> = Arc::new(DashMap::new());
-        let peer_addrs: Arc<DashMap<u64, SocketAddr>> = Arc::new(DashMap::new());
+        let peer_addrs: Arc<DashMap<u64, PeerAddr>> = Arc::new(DashMap::new());
         let router = Arc::new(
             NetRouter::new(crate::adapter::net::router::RouterConfig::new(
                 0xCAFE_BABE,
@@ -43594,7 +43651,7 @@ mod heartbeat_aead_tests {
         let relay: SocketAddr = "10.0.0.11:9000".parse().unwrap();
 
         let peers: Arc<DashMap<u64, PeerInfo>> = Arc::new(DashMap::new());
-        let peer_addrs: Arc<DashMap<u64, SocketAddr>> = Arc::new(DashMap::new());
+        let peer_addrs: Arc<DashMap<u64, PeerAddr>> = Arc::new(DashMap::new());
         let session_id_to_node: Arc<DashMap<u64, u64>> = Arc::new(DashMap::new());
         let router = Arc::new(
             NetRouter::new(crate::adapter::net::router::RouterConfig::new(

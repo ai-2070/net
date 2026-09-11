@@ -1002,7 +1002,11 @@ impl Mesh {
         let addr: SocketAddr = next_hop_addr
             .parse()
             .map_err(|e| SdkError::Config(format!("invalid address: {}", e)))?;
-        self.node.router().add_route(dest_node_id, addr);
+        // The SDK takes an operator-typed address; the routing plane
+        // keys on the endpoint.
+        self.node
+            .router()
+            .add_route(dest_node_id, net::adapter::net::PeerAddr::Udp(addr));
         Ok(())
     }
 

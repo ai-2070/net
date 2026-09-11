@@ -6,7 +6,6 @@
 use bytes::Bytes;
 use crossbeam_queue::SegQueue;
 use dashmap::DashMap;
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,6 +15,7 @@ use std::time::Instant;
 use crate::event::StoredEvent;
 
 use super::crypto::{PacketCipher, SessionKeys};
+use super::transport::PeerAddr;
 use super::subnet::route_hop::SharedHopReplayWindow;
 // `SharedPacketPool` is intentionally absent — `NetSession` uses
 // only `SharedLocalPool` as the single TX-side AEAD source.
@@ -64,7 +64,7 @@ pub struct NetSession {
     /// Session ID (derived from handshake)
     session_id: u64,
     /// Remote peer address
-    peer_addr: SocketAddr,
+    peer_addr: PeerAddr,
     /// RX cipher (ChaCha20-Poly1305 with counter-based nonces)
     rx_cipher: PacketCipher,
     // No `tx_key` field: `thread_local_pool` is the only surface
@@ -161,7 +161,7 @@ impl NetSession {
     /// Create a new session from handshake results
     pub fn new(
         keys: SessionKeys,
-        peer_addr: SocketAddr,
+        peer_addr: PeerAddr,
         pool_size: usize,
         default_reliable: bool,
     ) -> Self {
@@ -315,7 +315,7 @@ impl NetSession {
 
     /// Get the peer address
     #[inline]
-    pub fn peer_addr(&self) -> SocketAddr {
+    pub fn peer_addr(&self) -> PeerAddr {
         self.peer_addr
     }
 

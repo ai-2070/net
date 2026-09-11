@@ -11,6 +11,8 @@ use bytes::{Bytes, BytesMut};
 use crossbeam_queue::ArrayQueue;
 use dashmap::DashMap;
 use std::net::SocketAddr;
+
+use super::transport::PeerAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -110,7 +112,7 @@ fn record_batch_flush(packets: u64) {
 /// over `groups` — fine, since the distinct-peer count per drain is small
 /// (and bounded by `reset_dest_groups`).
 #[inline]
-fn group_by_dest(groups: &mut Vec<(SocketAddr, Vec<Bytes>)>, dest: SocketAddr, data: Bytes) {
+fn group_by_dest(groups: &mut Vec<(PeerAddr, Vec<Bytes>)>, dest: PeerAddr, data: Bytes) {
     match groups.iter_mut().find(|(d, _)| *d == dest) {
         Some((_, v)) => v.push(data),
         None => groups.push((dest, vec![data])),
@@ -126,7 +128,7 @@ fn group_by_dest(groups: &mut Vec<(SocketAddr, Vec<Bytes>)>, dest: SocketAddr, d
 /// drain touches at most `cap` (`MAX_DRAIN`) dests, so the bounded set stays
 /// at `cap + 1` worst case.
 #[inline]
-fn reset_dest_groups(groups: &mut Vec<(SocketAddr, Vec<Bytes>)>, cap: usize) {
+fn reset_dest_groups(groups: &mut Vec<(PeerAddr, Vec<Bytes>)>, cap: usize) {
     if groups.len() > cap {
         groups.clear();
     } else {
@@ -195,7 +197,7 @@ pub struct QueuedPacket {
     /// Packet data
     pub data: Bytes,
     /// Destination address
-    pub dest: SocketAddr,
+    pub dest: PeerAddr,
     /// Stream identifier
     pub stream_id: u64,
     /// Whether this is a priority packet
@@ -727,7 +729,7 @@ impl NetRouter {
     }
 
     /// Add a route. Returns the transition token it produced.
-    pub fn add_route(&self, dest_id: u64, next_hop: SocketAddr) -> u64 {
+    pub fn add_route(&self, dest_id: u64, next_hop: PeerAddr) -> u64 {
         self.routing_table.add_route(dest_id, next_hop)
     }
 
@@ -747,7 +749,7 @@ impl NetRouter {
     /// because the only caller of `add_authenticated_route` was a test
     /// fixture.
     /// Returns the transition token it produced.
-    pub fn add_direct_route(&self, peer_node_id: u64, peer_addr: SocketAddr) -> u64 {
+    pub fn add_direct_route(&self, peer_node_id: u64, peer_addr: PeerAddr) -> u64 {
         self.routing_table
             .add_authenticated_route(peer_node_id, peer_addr, peer_node_id)
     }
@@ -766,7 +768,7 @@ impl NetRouter {
     }
 
     /// Route a packet (called from receive loop)
-    pub fn route_packet(&self, data: Bytes, _from: SocketAddr) -> Result<RouteAction, RouterError> {
+    pub fn route_packet(&self, data: Bytes, _from: PeerAddr) -> Result<RouteAction, RouterError> {
         let start = Instant::now();
         let len = data.len() as u64;
 
@@ -905,9 +907,17 @@ impl NetRouter {
         }
     }
 
-    /// Send a packet directly (bypassing routing)
-    pub async fn send_to(&self, data: &[u8], dest: SocketAddr) -> std::io::Result<usize> {
-        self.socket.send_to(data, dest).await
+    /// Send a packet directly (bypassing routing).
+    ///
+    /// The router owns its own ephemeral socket — a different socket from
+    /// the node's [`PeerSink`](super::transport::PeerSink) — so the
+    /// endpoint is resolved to its UDP tuple here, at the boundary, and
+    /// submitted on that socket exactly as before. Only the `Udp` variant
+    /// is live in this stage.
+    pub async fn send_to(&self, data: &[u8], dest: PeerAddr) -> std::io::Result<usize> {
+        match dest {
+            PeerAddr::Udp(addr) => self.socket.send_to(data, addr).await,
+        }
     }
 
     /// Receive a packet
@@ -950,7 +960,7 @@ impl NetRouter {
             // on the hot path; the slot set is bounded on reset (see below) so
             // it can't accumulate a stale entry per peer forever under churn.
             const MAX_DRAIN: usize = 64;
-            let mut groups: Vec<(SocketAddr, Vec<Bytes>)> = Vec::new();
+            let mut groups: Vec<(PeerAddr, Vec<Bytes>)> = Vec::new();
             // Linux-only batched sender over the same socket fd. The send loop
             // is the socket's sole, single-threaded sender, so it owns one
             // `BatchedTransport` for its whole lifetime and reuses the iovec /
@@ -981,7 +991,14 @@ impl NetRouter {
                     // zero-overhead path. Guarded by the live `current_depth`.
                     if scheduler.current_depth() == 0 {
                         if !drop_injected(&drop_every_n, &drop_counter) {
-                            let _ = socket.send_to(&first.data, first.dest).await;
+                            // Partitioned by endpoint variant; only the
+                            // `Udp` arm is live in this stage. The send
+                            // itself is byte-for-byte the previous one.
+                            match first.dest {
+                                PeerAddr::Udp(addr) => {
+                                    let _ = socket.send_to(&first.data, addr).await;
+                                }
+                            }
                         }
                         continue;
                     }
@@ -1012,6 +1029,10 @@ impl NetRouter {
                         if data.is_empty() {
                             continue;
                         }
+                        // Endpoint-variant partition for the flush. Only
+                        // `Udp` is live; the grouping above, `MAX_DRAIN`
+                        // and the drain instrumentation stay whole-drain.
+                        let PeerAddr::Udp(dest) = *dest;
                         #[cfg(target_os = "linux")]
                         {
                             // `send_batch` is a synchronous `sendmmsg` on the
@@ -1023,15 +1044,15 @@ impl NetRouter {
                             // send / EWOULDBLOCK), which re-registers the waker
                             // so we preserve backpressure rather than dropping
                             // or spinning.
-                            let sent = batch_sender.send_batch(data, *dest).unwrap_or(0);
+                            let sent = batch_sender.send_batch(data, dest).unwrap_or(0);
                             for d in &data[sent..] {
-                                let _ = socket.send_to(d, *dest).await;
+                                let _ = socket.send_to(d, dest).await;
                             }
                         }
                         #[cfg(not(target_os = "linux"))]
                         {
                             for d in data {
-                                let _ = socket.send_to(d, *dest).await;
+                                let _ = socket.send_to(d, dest).await;
                             }
                         }
                         if measure_drain {
@@ -1136,7 +1157,7 @@ pub enum RouteAction {
     /// Packet is for local delivery
     Local(Bytes),
     /// Packet was forwarded to next hop
-    Forwarded(SocketAddr),
+    Forwarded(PeerAddr),
 }
 
 /// Router errors

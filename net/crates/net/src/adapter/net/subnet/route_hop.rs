@@ -90,8 +90,8 @@ pub const ROUTE_HOP_REPLAY_WINDOW: u64 = 128;
 pub struct AuthenticatedNextHop {
     /// The authenticated peer this hop terminates at.
     pub node_id: u64,
-    /// That peer's current address.
-    pub addr: std::net::SocketAddr,
+    /// That peer's current endpoint.
+    pub addr: crate::adapter::net::transport::PeerAddr,
 }
 
 /// Why a route-hop operation failed, in either direction.

@@ -7,7 +7,7 @@
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use dashmap::DashMap;
-use std::net::SocketAddr;
+use super::transport::PeerAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
@@ -413,7 +413,7 @@ impl Default for SchedulerStreamStats {
 #[derive(Debug, Clone)]
 pub struct RouteEntry {
     /// Next hop address
-    pub next_hop: SocketAddr,
+    pub next_hop: PeerAddr,
     /// Authenticated identity of the next hop, when the route was
     /// installed with one (`SUBNET_AUTH_PLAN.md` D6).
     ///
@@ -440,7 +440,7 @@ pub struct RouteEntry {
 
 impl RouteEntry {
     /// Create a new route entry with default metric
-    pub fn new(next_hop: SocketAddr) -> Self {
+    pub fn new(next_hop: PeerAddr) -> Self {
         Self {
             next_hop,
             next_hop_id: None,
@@ -451,7 +451,7 @@ impl RouteEntry {
     }
 
     /// Create a route entry with specified metric
-    pub fn with_metric(next_hop: SocketAddr, metric: u16) -> Self {
+    pub fn with_metric(next_hop: PeerAddr, metric: u16) -> Self {
         Self {
             next_hop,
             next_hop_id: None,
@@ -463,7 +463,7 @@ impl RouteEntry {
 
     /// Create an identity-bound route entry usable for protected
     /// forwarding.
-    pub fn authenticated(next_hop: SocketAddr, next_hop_id: u64) -> Self {
+    pub fn authenticated(next_hop: PeerAddr, next_hop_id: u64) -> Self {
         Self {
             next_hop,
             next_hop_id: Some(next_hop_id),
@@ -478,7 +478,7 @@ impl RouteEntry {
     /// adjacent authenticated peer's address, `next_hop_id` that
     /// peer's identity, and the metric ranks it against other learned
     /// paths to the same destination.
-    pub fn authenticated_with_metric(next_hop: SocketAddr, next_hop_id: u64, metric: u16) -> Self {
+    pub fn authenticated_with_metric(next_hop: PeerAddr, next_hop_id: u64, metric: u16) -> Self {
         Self {
             next_hop,
             next_hop_id: Some(next_hop_id),
@@ -494,7 +494,7 @@ impl RouteEntry {
     /// Refuses when `identity` is not the bound one, so a different
     /// peer cannot take over an existing protected route by arriving
     /// at the same place.
-    pub fn rebind_addr(&mut self, identity: u64, new_addr: SocketAddr) -> bool {
+    pub fn rebind_addr(&mut self, identity: u64, new_addr: PeerAddr) -> bool {
         if self.next_hop_id != Some(identity) {
             return false;
         }
@@ -596,7 +596,7 @@ struct DestRoutes {
 /// conditional writer reasons about, and nothing that merely ages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CandidateFingerprint {
-    next_hop: SocketAddr,
+    next_hop: PeerAddr,
     next_hop_id: Option<u64>,
     metric: u16,
     active: bool,
@@ -685,7 +685,7 @@ impl DestRoutes {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RouteCandidateView {
     /// Where this candidate sends.
-    pub next_hop: SocketAddr,
+    pub next_hop: PeerAddr,
     /// Its bound identity — `Some` exactly for the protected candidate.
     pub next_hop_id: Option<u64>,
     /// Metric, for ranking against the other candidate.
@@ -757,9 +757,9 @@ pub struct TransitionOutcome {
     /// Whether an alternate was installed.
     pub installed: bool,
     /// The effective next hop before the transition.
-    pub effective_before: Option<SocketAddr>,
+    pub effective_before: Option<PeerAddr>,
     /// The effective next hop after it.
-    pub effective_after: Option<SocketAddr>,
+    pub effective_after: Option<PeerAddr>,
     /// Whether the destination still resolves for forwarding.
     pub reachable_after: bool,
 }
@@ -929,7 +929,7 @@ impl RoutingTable {
     /// that may later have to undo it can name the exact write rather
     /// than matching on a destination and address a replacement could
     /// already have reused.
-    pub fn add_route(&self, dest_id: u64, next_hop: SocketAddr) -> u64 {
+    pub fn add_route(&self, dest_id: u64, next_hop: PeerAddr) -> u64 {
         self.mutate_with_token(dest_id, |d| {
             d.ordinary = Some(RouteEntry::new(next_hop));
         })
@@ -949,7 +949,7 @@ impl RoutingTable {
     /// This writer cannot see, replace, or refresh the protected
     /// candidate: an unauthenticated datagram is not evidence about an
     /// authenticated adjacency, in either direction.
-    pub fn add_route_with_metric(&self, dest_id: u64, next_hop: SocketAddr, metric: u16) {
+    pub fn add_route_with_metric(&self, dest_id: u64, next_hop: PeerAddr, metric: u16) {
         self.mutate(dest_id, |d| match d.ordinary.as_mut() {
             None => d.ordinary = Some(RouteEntry::with_metric(next_hop, metric)),
             Some(e) if metric < e.metric => {
@@ -998,7 +998,7 @@ impl RoutingTable {
     pub fn add_authenticated_route_with_metric(
         &self,
         dest_id: u64,
-        next_hop: SocketAddr,
+        next_hop: PeerAddr,
         next_hop_id: u64,
         metric: u16,
     ) {
@@ -1169,7 +1169,7 @@ impl RoutingTable {
     pub fn remove_route_if_from_hop(
         &self,
         dest_id: u64,
-        next_hop: SocketAddr,
+        next_hop: PeerAddr,
         identity: u64,
         sender_is_direct: bool,
     ) -> TransitionOutcome {
@@ -1212,7 +1212,7 @@ impl RoutingTable {
     pub fn remove_ordinary_route_if_next_hop_is(
         &self,
         dest_id: u64,
-        expected_next_hop: SocketAddr,
+        expected_next_hop: PeerAddr,
     ) -> bool {
         self.mutate(dest_id, |d| {
             if d.ordinary
@@ -1269,7 +1269,7 @@ impl RoutingTable {
     /// (the caller knows exactly what it installed). Withdrawal — a
     /// claim from a REMOTE sender — must use
     /// [`Self::remove_route_if_from_hop`] instead.
-    pub fn remove_route_if_next_hop_is(&self, dest_id: u64, expected_next_hop: SocketAddr) -> bool {
+    pub fn remove_route_if_next_hop_is(&self, dest_id: u64, expected_next_hop: PeerAddr) -> bool {
         self.mutate(dest_id, |d| {
             let mut removed = false;
             for slot in [&mut d.ordinary, &mut d.protected] {
@@ -1315,7 +1315,7 @@ impl RoutingTable {
     ///   that belongs to someone else's authenticated adjacency.
     /// - A **legacy** entry (no identity) migrates by address match,
     ///   as before — it carries no protected traffic either way.
-    pub fn migrate_next_hop(&self, old: SocketAddr, new: SocketAddr, identity: u64) -> usize {
+    pub fn migrate_next_hop(&self, old: PeerAddr, new: PeerAddr, identity: u64) -> usize {
         if old == new {
             return 0;
         }
@@ -1352,7 +1352,7 @@ impl RoutingTable {
     /// large; call [`Self::set_max_route_age`] to enable expiry). Stale
     /// candidates stay in the map until a periodic [`Self::sweep_stale`]
     /// call removes them.
-    pub fn lookup(&self, dest_id: u64) -> Option<SocketAddr> {
+    pub fn lookup(&self, dest_id: u64) -> Option<PeerAddr> {
         let max_age = self.max_route_age();
         self.routes
             .get(&dest_id)
@@ -1365,7 +1365,7 @@ impl RoutingTable {
     pub fn add_authenticated_route(
         &self,
         dest_id: u64,
-        next_hop: SocketAddr,
+        next_hop: PeerAddr,
         next_hop_id: u64,
     ) -> u64 {
         self.mutate_with_token(dest_id, |d| {
@@ -1381,7 +1381,7 @@ impl RoutingTable {
     /// Reads the protected slot alone: an ordinary candidate, however
     /// good its metric and whoever installed it, resolves to `None`
     /// rather than to an unauthenticated guess.
-    pub fn lookup_authenticated(&self, dest_id: u64) -> Option<(u64, SocketAddr)> {
+    pub fn lookup_authenticated(&self, dest_id: u64) -> Option<(u64, PeerAddr)> {
         let max_age = self.max_route_age();
         self.routes.get(&dest_id).and_then(|d| {
             d.protected_live(max_age)
@@ -1396,7 +1396,7 @@ impl RoutingTable {
         &self,
         dest_id: u64,
         identity: u64,
-        new_addr: SocketAddr,
+        new_addr: PeerAddr,
     ) -> bool {
         self.mutate(dest_id, |d| {
             d.protected
@@ -1438,7 +1438,7 @@ impl RoutingTable {
         &self,
         dest_id: u64,
         observed: RouteObservation,
-        next_hop: SocketAddr,
+        next_hop: PeerAddr,
         provenance: AlternateProvenance,
         metric: u16,
     ) -> Option<TransitionOutcome> {
@@ -1499,7 +1499,7 @@ impl RoutingTable {
         dest_id: u64,
         observed: RouteObservation,
         failed_identity: u64,
-        failed_addr: SocketAddr,
+        failed_addr: PeerAddr,
     ) -> Option<TransitionOutcome> {
         if self.cas_poisoned() {
             return None;
@@ -1555,7 +1555,7 @@ impl RoutingTable {
     pub fn install_metered_if_absent(
         &self,
         dest_id: u64,
-        next_hop: SocketAddr,
+        next_hop: PeerAddr,
         provenance: AlternateProvenance,
         metric: u16,
     ) -> bool {

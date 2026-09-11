@@ -1949,7 +1949,8 @@ mod mesh_bindings {
                 .parse()
                 .map_err(|e| Error::from_reason(format!("invalid address: {}", e)))?;
             let dest_node_id = crate::common::bigint_u64(dest_node_id)?;
-            node.router().add_route(dest_node_id, addr);
+            node.router()
+                .add_route(dest_node_id, net::adapter::net::PeerAddr::Udp(addr));
             Ok(())
         }
 

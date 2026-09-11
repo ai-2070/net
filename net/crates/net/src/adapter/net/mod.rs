@@ -520,7 +520,7 @@ type InboundQueues = Arc<DashMap<u16, SegQueue<StoredEvent>>>;
 /// doesn't pay an O(n) sweep per packet.
 pub(crate) struct HandshakePacer {
     /// Per-source `(count_in_window, window_start)`.
-    entries: std::collections::HashMap<std::net::SocketAddr, (u32, std::time::Instant)>,
+    entries: std::collections::HashMap<transport::PeerAddr, (u32, std::time::Instant)>,
     /// Maximum attempts per source within `window`.
     max_per_window: u32,
     /// Maximum admissions per `window` across all sources that have
@@ -630,7 +630,7 @@ impl HandshakePacer {
     ///
     /// See the type doc for why an over-budget source is throttled
     /// against a shared reserve rather than dropped outright.
-    pub(crate) fn check_and_record(&mut self, source: std::net::SocketAddr) -> bool {
+    pub(crate) fn check_and_record(&mut self, source: transport::PeerAddr) -> bool {
         let now = std::time::Instant::now();
         // Amortized GC: only run the O(n) `retain` sweep when one
         // of two thresholds trips:
@@ -967,7 +967,9 @@ impl NetAdapter {
 
                 let data = bytes::Bytes::copy_from_slice(&recv_buf[..n]);
 
-                let Some(p) = ParsedPacket::parse(data, source) else {
+                // Receive boundary: the socket tuple becomes the peer
+                // endpoint here.
+                let Some(p) = ParsedPacket::parse(data, PeerAddr::Udp(source)) else {
                     continue;
                 };
                 if !p.header.flags.is_handshake() {
@@ -1067,7 +1069,9 @@ impl NetAdapter {
 
                 let data = Bytes::copy_from_slice(&recv_buf[..n]);
 
-                let Some(p) = ParsedPacket::parse(data, source) else {
+                // Receive boundary: the socket tuple becomes the peer
+                // endpoint here.
+                let Some(p) = ParsedPacket::parse(data, PeerAddr::Udp(source)) else {
                     continue;
                 };
                 if !p.header.flags.is_handshake() {
@@ -1076,7 +1080,11 @@ impl NetAdapter {
 
                 // Pace BEFORE the Noise read, so a rejected source
                 // cannot buy a Diffie-Hellman.
-                if !self.handshake_pacer.lock().check_and_record(source) {
+                if !self
+                    .handshake_pacer
+                    .lock()
+                    .check_and_record(PeerAddr::Udp(source))
+                {
                     self.responder_handshakes.record_paced();
                     *last_paced_source = Some(source);
                     tracing::debug!(
@@ -1157,7 +1165,7 @@ impl NetAdapter {
         num_shards: u16,
     ) {
         // Parse packet
-        let mut parsed = match ParsedPacket::parse(data, source) {
+        let mut parsed = match ParsedPacket::parse(data, PeerAddr::Udp(source)) {
             Some(p) => p,
             None => return,
         };
@@ -1199,7 +1207,7 @@ impl NetAdapter {
         // touch a session whose heartbeat failed verify, and can't
         // forget to touch on success.
         if parsed.header.flags.is_heartbeat() {
-            if source == session.peer_addr() {
+            if PeerAddr::Udp(source) == session.peer_addr() {
                 session.verify_and_touch_heartbeat(&parsed);
             }
             return;
@@ -1452,7 +1460,7 @@ impl Adapter for NetAdapter {
         // which may be stale or pre-NAT)
         let session = Arc::new(NetSession::new(
             keys,
-            actual_peer,
+            PeerAddr::Udp(actual_peer),
             self.config.packet_pool_size,
             self.config.default_reliability.is_reliable(),
         ));
@@ -1510,7 +1518,10 @@ impl Adapter for NetAdapter {
             .ok_or_else(|| AdapterError::Connection("socket not initialized".into()))?;
 
         let stream_id = batch.shard_id as u64;
-        let peer_addr = session.peer_addr();
+        let peer_addr = session
+            .peer_addr()
+            .udp()
+            .ok_or_else(|| AdapterError::Connection("peer is not a UDP endpoint".into()))?;
 
         // Read stream config under the lock, then drop it immediately.
         // Holding the DashMap RefMut across .await would deadlock against

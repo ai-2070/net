@@ -20,7 +20,7 @@
 //! This module is wired into `MeshNode` via the `FailureDetector`'s
 //! `on_failure` and `on_recovery` callbacks.
 
-use std::net::SocketAddr;
+use super::transport::PeerAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -48,11 +48,11 @@ pub struct PeerSnapshot {
     /// The incarnation this reading is of.
     pub session_id: u64,
     /// Where datagrams for this peer go.
-    pub send_addr: SocketAddr,
+    pub send_addr: PeerAddr,
     /// `Some(addr)` when the peer OWNS `send_addr` — i.e. the session
     /// terminates where it points, and the peer is adjacent. `None`
     /// for a peer reached through a relay.
-    pub owned_addr: Option<SocketAddr>,
+    pub owned_addr: Option<PeerAddr>,
 }
 
 /// Policy that removes invalidated routes when peers fail.
@@ -74,7 +74,7 @@ pub struct ReroutePolicy {
     /// Routing table to update
     routing_table: Arc<RoutingTable>,
     /// Connected peers (node_id → addr mapping)
-    peer_addrs: Arc<DashMap<u64, SocketAddr>>,
+    peer_addrs: Arc<DashMap<u64, PeerAddr>>,
     /// One coherent reading of a peer — incarnation and transport
     /// together — so a delayed failure/recovery callback can tell both
     /// that the peer it is about has been replaced and whether the
@@ -102,7 +102,7 @@ impl ReroutePolicy {
     /// Create a new reroute policy.
     pub fn new(
         routing_table: Arc<RoutingTable>,
-        peer_addrs: Arc<DashMap<u64, SocketAddr>>,
+        peer_addrs: Arc<DashMap<u64, PeerAddr>>,
     ) -> Self {
         Self {
             routing_table,
@@ -288,7 +288,7 @@ impl ReroutePolicy {
         &self,
         dest_id: u64,
         failed_node_id: u64,
-        failed_addr: SocketAddr,
+        failed_addr: PeerAddr,
         failed_incarnation: Option<u64>,
         verdict_seq: u64,
     ) -> bool {
