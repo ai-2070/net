@@ -1,0 +1,26 @@
+net/crates/net/src/adapter/net/behavior/proximity.rs
+  h_64425bc75e3f3d 10
+net/crates/net/src/adapter/net/failure.rs
+  h_64425bc75e3f3d 9
+net/crates/net/src/adapter/net/mesh.rs
+  h_64425bc75e3f3d 303,6799-6800,9286-9288,18117-18118,18146,22127-22129,22284-22286,24249,35768,40489
+net/crates/net/src/adapter/net/reroute.rs
+  h_64425bc75e3f3d 103
+net/crates/net/src/adapter/net/route.rs
+  h_64425bc75e3f3d 8
+net/crates/net/src/adapter/net/session.rs
+  h_64425bc75e3f3d 19
+net/crates/net/src/adapter/net/swarm.rs
+  h_64425bc75e3f3d 9
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "bb34926d09a07dc7471af92b07c25ea43d2f0498",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
