@@ -1,0 +1,16 @@
+net/crates/net/wire/src/reliability.rs
+  h_64425bc75e3f3d 11-16,753,872,887,948,1038
+net/crates/net/wire/src/session.rs
+  h_64425bc75e3f3d 13-16,801,847,885,2272,2277
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "bb16dba769de6522477613599381ff09e4c8d940",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
