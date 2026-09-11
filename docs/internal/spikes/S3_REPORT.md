@@ -336,7 +336,7 @@ class", and the fairness claim in §3 ("at most one write per peer per
 iteration"). The first two were enumeration standing in for
 execution; the third was false about the code as written.
 
-Repair candidate: **`9ed58edff`**, on `LZL0/webrtc-transport`,
+Repair candidate: **`4a3dd9188`**, on `LZL0/webrtc-transport`,
 stacked on the held head `0fcff7a16`.
 
 | Commit | What |
@@ -348,6 +348,7 @@ stacked on the held head `0fcff7a16`.
 | `6b2ecb4f9` | CI pins the witnesses by name and count |
 | `e8d0e7917` | the consumer probe names the lib crates |
 | `9ed58edff` | validation fixes across the feature matrix |
+| `6ebd8e2a5` / `4a3dd9188` | fold over RTC; two witnesses corrected about duplicates |
 
 ### 11.1 Per item: reproduction, proof, inverse
 
