@@ -57,7 +57,7 @@ authorization. Before Stage 1 may be authorized the plan must carry:
 | # | Decision | Section |
 |---|---|---|
 | A | Send-path seam: UDP keeps its async/deadline/batching semantics; RTC uses bounded non-blocking admission; Stage 0 inventories the send and ingress paths and proposes the contract | §1, §2, Stage 0 (S0d), Stage 1 |
-| B | Pre-enrollment privileges: what a transport-authenticated peer may do before enrollment and what enrollment enables; the PSK stated precisely, not as "public" | §5 Layer 0, Open question 7 |
+| B | Pre-enrollment privileges — **CLOSED 2026-09-11: enrollment-gated.** Provisional sessions, action-level bootstrap allow-list, no pre-enrollment transit, session-bound promotion, provider authority unchanged; the PSK stated precisely, not as "public" | §5 Layer 0, §12, Open question 7 |
 | C | The routing-envelope codec is part of the portable wire inventory; S0a proves a routed round-trip | §7, Stage 0 (S0a) |
 | D | `str0m` pinned with `default-features = false, features = ["rust-crypto"]`; S0b proves it on supported native targets in both roles | §2, §Dependencies, Stage 0 (S0b) |
 
@@ -581,10 +581,12 @@ A separate PSK domain does **not** solve enforcement, because enrollment
 the responder path today ties post-handshake behaviour to it: a
 transport-authenticated peer can announce capabilities, open streams, obtain
 routed forwarding via `connect_via` and emit `0x0D02` before enrolling.
-The plan cannot call enrollment "device admission" while leaving its
-enforcement effect unspecified. That is **Open question 7, to be decided
-before Stage 1's design freezes**; the recommended position is recorded
-there. Implementing the resulting admission behaviour is *not* part of the
+**Decided (Kyra, 2026-09-11): the v1 browser-facing anchor is
+enrollment-gated.** A successful handshake yields a *provisional* session
+that may exercise only the bounded bootstrap exchange; everything else is
+denied before effects until enrollment promotes that exact session. The
+contract is §12; Open question 7 records the closure. Implementing it is a
+new browser admission contract, landed *after* Stage 1 — never inside the
 behaviour-neutral UDP refactor.
 
 With that in hand: for a browser `rendezvous` is the anchor's bootstrap URL.
@@ -901,15 +903,134 @@ application data **without** decoding the SDP it carries.
 | Announcement fields (all optional, `reflex_addr` wire-compat pattern) | `noise_pubkey: Option<[u8; 32]>`, `rtc_bootstrap: Option<String>`, `rtc_addr: Option<SocketAddr>` |
 | `PairAction` variant | `Ice` |
 | Error | `RtcError::{UdpBlocked, IceTimeout, BootstrapRejected, …}` |
+| Peer admission state (distinct from `PeerTransport`) | `Provisional` → `Admitted`, bound to the exact live session incarnation (§12) |
 
 `docs/SUBPROTOCOLS.md` and `docs/CAPABILITIES_SCHEMA.md` are updated in the
 stage that introduces each.
+
+### 12. Browser admission contract: provisional sessions, enrollment-gated
+
+**Decision (Kyra, 2026-09-11, checked at `79ad91283`): enrollment-gated
+participation for the v1 browser-facing anchor. No intentionally open mode
+in this plan.** The gate protects the anchor's *participation and
+forwarding services*. It does not turn enrollment into organization
+membership, channel authority or permission to invoke providers.
+
+The bounded bootstrap target already exists: the enrollment service is
+`net.mesh.enroll` (`sdk/src/mesh_enroll.rs:38`), and the current flow is
+explicitly direct-addressed nRPC to the operator — `Mesh::join` dials with
+`connect_via` (`:290`) and then `call`s the service with a signed
+`JoinRequest`.
+
+**Before enrollment: a restricted session, not an ordinary participating
+peer.** A successful Noise handshake establishes a *provisional* session.
+Until admission succeeds, permit only:
+
+- Session establishment and teardown: the exact handshake addressed to the
+  anchor, bounded handshake retries, and necessary session maintenance.
+- Enrollment nRPC: a bounded unary `JoinRequest` to `net.mesh.enroll` *on
+  that anchor*, and its corresponding response / error / cancellation.
+- Channel membership (`0x0A00`): only the exact membership operations
+  required for that enrollment request and the authenticated caller's
+  reply channel. No wildcard subscriptions, arbitrary reply destinations or
+  unrelated channels.
+- Stream-window / reliability control: only for the bounded bootstrap
+  exchange's tracked streams and packets. No arbitrary stream creation or
+  caller-selected state allocation.
+- Any mandatory protocol negotiation: bounded and local to the anchor; it
+  must not trigger discovery, forwarding or application dispatch.
+
+Everything else is **denied before effects**, including: capability
+publication or discovery subscriptions; general event publication and
+channel membership; ordinary nRPC calls; fold publication, replication,
+sensing and migration; RTC peer signalling through `0x0D02`; forwarding or
+initiating a routed session to another destination.
+
+This is an **action-level allow-list, not "allow the nRPC subprotocol"**.
+Allowing a whole carrier would also admit unrelated operations carried
+inside it. Stage 0 (S0e) identifies the exact frames the existing
+enrollment exchange needs; if that exchange currently performs broader
+incidental work, the work is removed or constrained rather than the
+provisional privilege set widened.
+
+**Enforcement: installation plus checks before dispatch effects.** It
+cannot live only in `accept` — enrollment happens afterward, and routed
+forwarding can happen before application dispatch. The contract:
+
+1. Install new browser-facing RTC sessions as provisional.
+2. Check provisional/admitted status before route installation,
+   forwarding, subscription mutation, announcement ingestion or application
+   delivery.
+3. For locally addressed bootstrap traffic, decode within strict bounds and
+   validate the exact permitted action before its handler runs.
+4. On successful enrollment, promote the **exact live session incarnation
+   and authenticated identity** — not merely whichever session currently
+   occupies that `NodeId`.
+5. On rejection, expiry or resource-budget exhaustion, close and reclaim the
+   provisional state.
+
+Admission state is kept **distinct from `PeerTransport::{Direct, Routed}`**.
+Transport ownership answers *where this session goes*; admission answers
+*what this session may exercise*. They are coherently associated, never
+collapsed into one concept. A provisional peer must not become a normal
+discovery/routing participant merely because the handshake installer
+(`mesh.rs:22050–22103`) populated a peer entry.
+
+This is a new browser admission contract, implemented after Stage 1.
+Native UDP behaviour remains unchanged by the endpoint refactor.
+
+**No third-party relay forwarding before enrollment. No exceptions in
+v1.** An unenrolled session may address the anchor's own bootstrap
+service. It may not ask that anchor to forward handshake, signalling or
+application packets to another peer. Crucially, the existing enrollment
+flow uses `connect_via` even when the operator is the immediate
+destination: a routing envelope addressed to the anchor *itself* is local
+delivery, not permission to relay onward. Admission of the adjacent
+browser session is checked **before** forwarding, so an attacker cannot
+bypass it by putting another origin inside an opaque envelope.
+Consequently the enrollment authority must be available **locally at each
+bootstrap-serving anchor**, or supplied through an explicit
+operator-controlled backend; a remote enrollment deployment is never solved
+by giving provisional browsers arbitrary transit.
+
+**Enrollment enables eligibility, not unrestricted authority.** After
+enrollment the session becomes eligible for the anchor's configured,
+bounded services — announcement handling, discovery, signalling,
+forwarding. Existing channel, subnet, resource and provider checks still
+apply; enrollment bypasses none of them. In particular:
+
+> Device delegation ≠ `OrgMembershipCert` ≠ dispatcher grant ≠ provider
+> admission.
+
+Additional anchors and fresh direct sessions must verify an existing
+enrollment credential with **proof bound to the new session**; they cannot
+trust an "already enrolled" flag or inherit admission solely from a reused
+`NodeId`. The credential-presentation mechanism is named in the Stage 4
+implementation design.
+
+**Required witnesses** (Stage 4, native anchor with a scripted browser
+client; re-run in Stage 5 from the real leaf):
+
+1. A PSK holder can complete the permitted enrollment exchange.
+2. The same provisional session cannot publish an announcement, join an
+   unrelated channel, invoke another service or forward to another node.
+3. A local bootstrap routing envelope succeeds; the same envelope
+   redirected elsewhere is denied.
+4. Successful enrollment promotes only its exact live session; delayed
+   completion cannot promote a replacement.
+5. Provisional connections and bootstrap allocations remain globally
+   bounded.
+6. An enrolled peer without the required provider authority is still
+   denied.
+
+This closes the policy choice. It does not authorize implementation beyond
+the already approved Stage 0.
 
 ---
 
 ## Stage 0 — Spikes (before any wide refactor)
 
-Three throwaway spikes in parallel plus one desk inventory (S0d), none
+Three throwaway spikes in parallel plus two desk inventories (S0d, S0e), none
 touching `mesh.rs`. Their purpose is to retire the unknowns that the wide
 refactor would otherwise be built on top of, and to return the evidence
 Stage 1's authorization and the re-estimate depend on.
@@ -947,11 +1068,18 @@ Stage 1's authorization and the re-estimate depend on.
   each by deadline / error-mapping / batching behaviour, and propose the
   UDP-preserving seam contract (§1) and the bounded RTC ingress input (§2).
   Output: the inventory and the proposed contract, reviewed before Stage 1.
+- **S0e — bootstrap frame inventory.** Not a spike: trace the existing
+  `Mesh::join` exchange (`connect_via` handshake, `net.mesh.enroll` unary
+  call, reply-channel membership, stream-window / reliability control) and
+  list the exact frames, by subprotocol and action, the exchange needs.
+  Flag any incidental work outside that set (§12: it is removed or
+  constrained, not allowed). Output: the action-level allow-list Stage 4
+  enforces.
 
 ### Exit criteria
 
-- All four outputs written up; §2's RTC submission contract, §1's send
-  seam and §7's type list finalized from them.
+- All five outputs written up; §2's RTC submission contract, §1's send
+  seam, §7's type list and §12's allow-list finalized from them.
 - Estimates for Stages 1–6 re-derived from the outputs (§Rough estimates).
 - No repository code outside `docs/` and a `spikes/` scratch directory
   changed.
@@ -1075,6 +1203,16 @@ announcement with and without the new optional fields).
   session.
 - `net-mesh anchor` CLI subcommand; Deck surfaces anchors and their
   `rtc_addr`.
+- **Browser admission contract (§12).** Provisional installation for
+  browser-facing RTC sessions; admission checks before route installation,
+  forwarding, subscription mutation, announcement ingestion and application
+  delivery; strict-bounds decode + exact-action validation for local
+  bootstrap traffic; session-bound promotion on enrollment; reclaim on
+  rejection / expiry / budget exhaustion; global bounds on provisional
+  connections and bootstrap allocations. The credential-presentation
+  mechanism for additional anchors and fresh direct sessions is named in
+  this stage's design. Enrollment authority local to each bootstrap-serving
+  anchor or an explicit operator-controlled backend.
 
 ### Exit criteria
 
@@ -1097,6 +1235,13 @@ announcement with and without the new optional fields).
 - Bootstrap budget rejections are typed and fast.
 - An anchor behind a simulated NAT publishes a working `rtc_addr` via
   `public_addr` or port mapping.
+- The six §12 witnesses pass: permitted enrollment exchange completes;
+  provisional session denied announcement / unrelated channel / other
+  service / forwarding; local bootstrap envelope accepted, redirected
+  envelope denied; promotion binds the exact live session and a delayed
+  completion cannot promote a replacement; provisional connections and
+  bootstrap allocations globally bounded; enrolled peer without provider
+  authority still denied.
 
 ## Stage 5 — `net-leaf` + `@net-mesh/browser`
 
@@ -1211,6 +1356,10 @@ announcement with and without the new optional fields).
 - `adapter/net/subprotocol/mod.rs`, `docs/SUBPROTOCOLS.md` — `0x0D02`.
 - `sdk/src/mesh_enroll.rs` — RTC `Rendezvous` form.
 - `cli/` — `anchor`, `rtc stats`; `deck/` — anchors, leaves, `rtc_addr`.
+- `adapter/net/mesh.rs` — provisional/admitted state alongside `PeerInfo`,
+  checks at the forwarding, route-install, subscription, announcement and
+  delivery boundaries (§12); `sdk/src/mesh_enroll.rs` — local enrollment
+  authority at bootstrap-serving anchors.
 
 ### Stages 5–6 (leaf, P2P)
 
@@ -1222,8 +1371,8 @@ announcement with and without the new optional fields).
 
 ## Open questions — dispositions (Kyra, 2026-09-11)
 
-Four are **closed** as recorded policy; two stay at their evidence gates;
-one (7) was added 2026-09-11 and must be decided before Stage 1. Closing
+Five are **closed** as recorded policy; two stay at their evidence gates.
+Question 7 was added and closed on 2026-09-11 (§12). Closing
 these does **not** discharge the implementation defects in the
 [Review log](#review-log) — that is a separate repair list.
 
@@ -1282,18 +1431,15 @@ these does **not** discharge the implementation defects in the
 6. **Safari — OPEN, evidence-gated.** Record exact tested versions and
    behaviours from the real leaf; decide support status from that, not from
    transport folklore.
-7. **Pre-enrollment privileges — OPEN, must be decided before Stage 1's
-   design freezes.** What can a transport-authenticated peer do before
-   enrollment, and what does enrollment subsequently enable? Recommended
-   position (Kyra, 2026-09-11): if enrollment is required for
-   participation, permit only the bounded bootstrap/enrollment exchange
-   before it completes, and admit subsequent protocol participation
-   explicitly; keep provider capability authorization separate throughout.
-   Conversely, an intentionally open mesh may allow bounded public
-   participation without enrollment — but then this document must say so
-   rather than imply enrollment is the gate. Either way the enforcement
-   effect is a stated contract with its own witnesses, implemented after
-   Stage 1, never smuggled into the behaviour-neutral refactor.
+7. **Pre-enrollment privileges — CLOSED (Kyra, 2026-09-11): enrollment-gated
+   anchors, narrowly scoped bootstrap, no pre-enrollment transit,
+   session-bound promotion, provider authority unchanged.** No intentionally
+   open mode in this plan. Full contract, enforcement points and the six
+   required witnesses in §12. The gate protects the anchor's participation
+   and forwarding services; it is not organization membership, channel
+   authority or provider admission. Implemented after Stage 1, never inside
+   the behaviour-neutral refactor; does not authorize implementation beyond
+   Stage 0.
 
 ---
 
@@ -1563,8 +1709,21 @@ estimates is not evidence (withdrawn, §Rough estimates).
 | 10 | Estimates omit the above | — | Withdrawn; re-derived from Stage 0 outputs |
 
 **Operative boundary unchanged: Stage 0 only.** Before Stage 1: settle
-pre-enrollment semantics (OQ 7), approve the UDP-preserving send/ingress
-contract (S0d), include the routed codecs (S0a), and pin the RTC
-dependency configuration (S0b). A bounded repair to the plan — not another
-architecture program, and not authorization to start the production
-refactor.
+pre-enrollment semantics (OQ 7 — closed later the same day, see below),
+approve the UDP-preserving send/ingress contract (S0d), include the routed
+codecs (S0a), and pin the RTC dependency configuration (S0b). A bounded
+repair to the plan — not another architecture program, and not
+authorization to start the production refactor.
+
+**2026-09-11 — Kyra, closure of Open question 7 (checked at
+`79ad91283`).** Enrollment-gated participation for the v1 browser-facing
+anchor; no intentionally open mode. Verified in this tree:
+`ENROLLMENT_SERVICE = "net.mesh.enroll"` (`sdk/src/mesh_enroll.rs:38`);
+`Mesh::join` dials the operator with `connect_via` (`:290`) before the
+unary `JoinRequest`, so a routing envelope addressed to the anchor itself
+is local delivery, not transit. Applied as §12 (provisional sessions,
+action-level allow-list, five enforcement points, admission state distinct
+from `PeerTransport`, no pre-enrollment relay, session-bound promotion,
+eligibility-not-authority, six witnesses), §11 registry row, S0e bootstrap
+frame inventory, Stage 4 scope + exit criteria, Critical files. Boundary
+unchanged: Stage 0 only.
