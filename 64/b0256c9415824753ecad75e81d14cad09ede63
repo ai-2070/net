@@ -1,0 +1,14 @@
+net/crates/net/guards/fixtures_off_probe/Cargo.lock
+  h_64425bc75e3f3d 320,332,378,448,608,611,621,625,637,726,728,812,840-860,1017-1025,1190,1453,1455,1466,1468,1476,1478,1483,1489,1491,1498-1508,1510,1639
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "64b0256c9415824753ecad75e81d14cad09ede63",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
