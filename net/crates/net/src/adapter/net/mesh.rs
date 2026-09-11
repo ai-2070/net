@@ -13408,6 +13408,24 @@ impl MeshNode {
         )
     }
 
+    /// The endpoint a peer is reached at, whatever its transport.
+    ///
+    /// [`Self::peer_addr`] answers the narrower operator-facing
+    /// question ("what UDP tuple?") and returns `None` for a
+    /// DataChannel peer, which is correct — there is no tuple. This
+    /// is the transport-agnostic view.
+    pub fn peer_endpoint(&self, node_id: u64) -> Option<PeerAddr> {
+        self.peers.get(&node_id).map(|e| e.value().addr())
+    }
+
+    /// Is this peer an authenticated adjacency (direct), rather than
+    /// a session that terminates through a relay?
+    pub fn peer_is_direct(&self, node_id: u64) -> bool {
+        self.peers
+            .get(&node_id)
+            .is_some_and(|e| e.value().transport.is_direct())
+    }
+
     /// The peer's socket address, if we have an active session
     /// with them. Used by the migration subprotocol to route
     /// orchestrator-originated messages (e.g. `TakeSnapshot`) to
@@ -21976,6 +21994,115 @@ impl MeshNode {
         // races the peer's post-handshake bookkeeping, so resend.
         self.emit_event_pingwave(true);
 
+        Ok(peer_node_id)
+    }
+
+    /// Establish a Net session over an already-open DataChannel,
+    /// as the Noise **initiator** (Stage 3, test/fixtures only).
+    ///
+    /// Deliberately not a new handshake path: it is
+    /// [`Self::connect`]'s body with a `PeerAddr::Rtc` endpoint. The
+    /// post-`start()` initiator already registers an inbox in
+    /// `pending_direct_initiators` and waits for the dispatcher to
+    /// forward msg2, which is transport-agnostic — the only thing
+    /// that changes is which sink half carries msg1.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub async fn connect_rtc(
+        &self,
+        peer: super::rtc::RtcPeerId,
+        peer_pubkey: &[u8; 32],
+        peer_node_id: u64,
+    ) -> Result<u64, AdapterError> {
+        let peer_addr = PeerAddr::Rtc(peer);
+        let keys = self
+            .handshake_initiator(peer_addr, peer_pubkey, peer_node_id)
+            .await?;
+        self.install_direct(peer_node_id, peer_addr, keys, None);
+
+        let peer_graph_id = node_id_to_graph_id(peer_node_id);
+        let pw = EnhancedPingwave::new(peer_graph_id, 0, 1).with_load(0, HealthStatus::Healthy);
+        self.proximity_graph.on_pingwave(pw, peer_addr);
+        let installed_session_id = self
+            .peers
+            .get(&peer_node_id)
+            .map(|p| p.value().session.session_id())
+            .unwrap_or(0);
+        self.failure_detector.heartbeat_for_incarnation(
+            peer_node_id,
+            peer_addr,
+            installed_session_id,
+        );
+        self.push_local_announcement(peer_node_id).await;
+        self.emit_event_pingwave(true);
+        Ok(peer_node_id)
+    }
+
+    /// The responder half of [`Self::connect_rtc`].
+    ///
+    /// `accept()` cannot serve here: it reads the Net socket directly,
+    /// pre-`start()`, and a DataChannel has no socket to read. Instead
+    /// this registers an inbox under the RTC endpoint — the same
+    /// registry the dispatcher already forwards handshake payloads to
+    /// — so msg1 arrives through the one dispatch owner, and msg2
+    /// leaves through the same `PeerSink` every other send uses. The
+    /// crypto is `NoiseHandshake` unchanged.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub async fn accept_rtc(
+        &self,
+        peer: super::rtc::RtcPeerId,
+        peer_node_id: u64,
+    ) -> Result<u64, AdapterError> {
+        let peer_addr = PeerAddr::Rtc(peer);
+        let prologue = handshake_prologue(routing_id(peer_node_id), routing_id(self.node_id));
+        let mut handshake =
+            NoiseHandshake::responder_with_prologue(&self.config.psk, &self.static_keypair, &prologue)
+                .map_err(|e| AdapterError::Fatal(format!("handshake init failed: {e}")))?;
+
+        let inbox = Arc::new(DirectHandshakeInbox::new());
+        if let Some(displaced) = self
+            .pending_direct_initiators
+            .insert(peer_addr, inbox.clone())
+        {
+            displaced.close();
+        }
+
+        let outcome = tokio::time::timeout(self.config.handshake_timeout, async {
+            loop {
+                let Some(payload) = inbox.next().await else {
+                    return Err(AdapterError::Connection(
+                        "rtc handshake registration displaced".into(),
+                    ));
+                };
+                // A payload that does not advance the state is
+                // discarded, never fatal — same rule as the initiator
+                // side, and for the same reason: one malformed frame
+                // must not end the attempt.
+                if handshake.read_message(&payload).is_ok() {
+                    return Ok(());
+                }
+            }
+        })
+        .await;
+        self.deregister_direct_initiator(peer_addr, &inbox);
+        match outcome {
+            Ok(inner) => inner?,
+            Err(_) => return Err(AdapterError::Connection("rtc handshake timeout".into())),
+        }
+
+        let msg2 = handshake
+            .write_message(&[])
+            .map_err(|e| AdapterError::Connection(format!("write_message failed: {e}")))?;
+        let mut builder = PacketBuilder::new(&[0u8; 32], 0);
+        let packet = builder.build_handshake(&msg2);
+        self.sink
+            .send(&packet, peer_addr)
+            .await
+            .map_err(|e| AdapterError::Connection(format!("send failed: {e}")))?;
+
+        let keys = handshake
+            .into_session_keys()
+            .map_err(|e| AdapterError::Fatal(format!("key extraction failed: {e}")))?;
+        self.install_direct(peer_node_id, peer_addr, keys, None);
         Ok(peer_node_id)
     }
 

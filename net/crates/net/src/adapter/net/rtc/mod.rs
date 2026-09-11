@@ -27,6 +27,8 @@
 
 mod config;
 mod driver;
+#[cfg(any(test, feature = "fixtures"))]
+mod loopback;
 mod stats;
 mod stun;
 mod transport;
@@ -36,6 +38,8 @@ pub use config::{
     DEFAULT_INGRESS_QUEUE_PACKETS, DEFAULT_MAX_PEERS, DEFAULT_SEND_QUEUE_BYTES,
     DEFAULT_SEND_QUEUE_PACKETS,
 };
+#[cfg(any(test, feature = "fixtures"))]
+pub use loopback::connect_rtc_loopback;
 pub use driver::{RtcDriver, RtcDriverHandle, RtcSignal};
 pub use stats::RtcStats;
 pub use stun::{binding_response, is_binding_request, parse_xor_mapped_address, STUN_MAGIC_COOKIE};
