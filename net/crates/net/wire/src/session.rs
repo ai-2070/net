@@ -2036,7 +2036,10 @@ mod tests {
         assert_eq!(stream.current_rx_seq(), 5);
 
         // Inbound queue
-        let event = StoredEvent::from_value("1".into(), serde_json::json!({"test": 1}), 100, 0);
+        // `StoredEvent::new` rather than `from_value`: the queue
+        // never inspects the payload, and `from_value` rides the
+        // `json` feature the wasm build deliberately does not enable.
+        let event = StoredEvent::new("1".into(), Bytes::from_static(br#"{"test":1}"#), 100, 0);
         stream.push_event(event);
         assert_eq!(stream.inbound_len(), 1);
 

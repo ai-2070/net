@@ -17,6 +17,7 @@ pub use net_wire::route_codec::{RouteFlags, RoutingHeader, ROUTING_HEADER_SIZE, 
 pub use net_wire::route_codec::_MAX_TTL;
 
 use super::transport::PeerAddr;
+#[cfg(test)]
 use bytes::BytesMut;
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};

@@ -398,6 +398,10 @@ postcard = { version = "1", features = ["alloc"], optional = true, default-featu
 clap = { version = "4", features = ["derive", "env"], optional = true }
 
 [dev-dependencies]
+# The wire crate's own surface, for `tests/cross_lang_wire.rs`: the
+# AEAD golden vector is asserted against the seam directly, so the
+# fixture pins the backend rather than only the packet path above it.
+net-mesh-wire = { version = "0.36.0", path = "wire", features = ["json"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 criterion = { version = "0.8", features = ["async_tokio"] }
 # `examples/natsim_node.rs` only. The natsim scenarios run helper nodes

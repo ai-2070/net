@@ -1,0 +1,15 @@
+{
+  "description": "CapabilityAnnouncement::to_bytes / from_bytes (JSON). Pinned in its CURRENT form: the three optional browser-leaf fields (leaf, transport, omitted reflex_addr semantics) are Stage 4's and are deliberately absent here. Absent-and-defaulted fields (signature, hop_count, reflex_addr, allowed_*) are skipped when empty, which is what keeps pre-v0.4 peers round-tripping.",
+  "json": {
+    "node_id": 11651590505119483656,
+    "entity_id": "1111111111111111111111111111111111111111111111111111111111111111",
+    "version": 7,
+    "timestamp_ns": 1700000000000000000,
+    "ttl_secs": 300,
+    "capabilities": {
+      "tags": [],
+      "metadata": {}
+    }
+  },
+  "bytes_utf8": "{\"node_id\":11651590505119483656,\"entity_id\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"version\":7,\"timestamp_ns\":1700000000000000000,\"ttl_secs\":300,\"capabilities\":{\"tags\":[],\"metadata\":{}}}"
+}

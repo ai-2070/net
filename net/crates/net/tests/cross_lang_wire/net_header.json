@@ -1,0 +1,13 @@
+{
+  "description": "NetHeader::to_bytes / from_bytes. 68-byte fixed header, little-endian multi-byte fields; magic 0x4E45 ('NE') at bytes 0-1.",
+  "fields": {
+    "session_id": "0x0123456789abcdef",
+    "stream_id": "0x1122334455667788",
+    "sequence": 42,
+    "nonce_hex": "deadbeef0700000000000000",
+    "payload_len": 64,
+    "event_count": 3,
+    "flags": "RELIABLE"
+  },
+  "hex": "454e01010000000000000000deadbeef0700000000000000efcdab896745230188776655443322112a000000000000000000000000000000000000000000000040000300"
+}
