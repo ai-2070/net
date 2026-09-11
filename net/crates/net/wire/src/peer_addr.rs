@@ -12,8 +12,10 @@ use std::net::SocketAddr;
 /// Where a peer is reached.
 ///
 /// Stage 1 of `BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md`: peer-keyed state
-/// names an *endpoint*, not a UDP tuple. Only [`PeerAddr::Udp`] exists in
-/// this stage; the RTC variant is Stage 3's and is feature-gated there.
+/// names an *endpoint*, not a UDP tuple. [`PeerAddr::Udp`] is the only
+/// variant in default builds; [`PeerAddr::Rtc`] appears under the
+/// `webrtc` feature (Stage 3) and names a DataChannel the core's RTC
+/// driver owns — the wire layer never touches str0m.
 ///
 /// Deliberately **not** `FromStr` and **not** `serde`: nothing serializes a
 /// `PeerAddr`. Operator-facing configuration
@@ -25,6 +27,34 @@ use std::net::SocketAddr;
 pub enum PeerAddr {
     /// A UDP tuple — the only variant in default builds.
     Udp(SocketAddr),
+    /// A WebRTC DataChannel, identified by the slot the core's RTC
+    /// driver owns it in. Only under the `webrtc` feature.
+    #[cfg(feature = "webrtc")]
+    Rtc(RtcPeerId),
+}
+
+/// Identifies one DataChannel owned by the core's RTC driver.
+///
+/// Not an address: the driver holds the `str0m::Rtc` and the channel,
+/// and everything outside it names the peer by this handle. `slot` is
+/// the driver's table index; `generation` is bumped every time a slot
+/// closes, so a handle captured before a close can never address the
+/// session that reuses the slot. Ids are never reused — a
+/// `(slot, generation)` pair is spent once.
+#[cfg(feature = "webrtc")]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
+pub struct RtcPeerId {
+    /// Driver table index.
+    pub slot: u32,
+    /// Incarnation of `slot`; bumped on close.
+    pub generation: u32,
+}
+
+#[cfg(feature = "webrtc")]
+impl std::fmt::Display for RtcPeerId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "rtc:{}.{}", self.slot, self.generation)
+    }
 }
 
 impl PeerAddr {
@@ -37,6 +67,18 @@ impl PeerAddr {
     pub fn udp(&self) -> Option<SocketAddr> {
         match self {
             PeerAddr::Udp(addr) => Some(*addr),
+            #[cfg(feature = "webrtc")]
+            PeerAddr::Rtc(_) => None,
+        }
+    }
+
+    /// The DataChannel handle, when this endpoint is one.
+    #[cfg(feature = "webrtc")]
+    #[inline]
+    pub fn rtc(&self) -> Option<RtcPeerId> {
+        match self {
+            PeerAddr::Rtc(id) => Some(*id),
+            PeerAddr::Udp(_) => None,
         }
     }
 }
@@ -55,6 +97,8 @@ impl std::fmt::Display for PeerAddr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PeerAddr::Udp(addr) => write!(f, "{addr}"),
+            #[cfg(feature = "webrtc")]
+            PeerAddr::Rtc(id) => write!(f, "{id}"),
         }
     }
 }

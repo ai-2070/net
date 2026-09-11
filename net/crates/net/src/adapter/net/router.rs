@@ -674,6 +674,36 @@ pub struct NetRouter {
     /// relaxed load per send, negligible. Shared into the send-loop task.
     test_drop_every_n: Arc<AtomicU64>,
     test_drop_counter: Arc<AtomicU64>,
+    /// The RTC admission side, installed after construction when the
+    /// node is configured with `MeshNodeConfig::rtc`. `ArcSwapOption`
+    /// because the send loop reads it per drain and must never take a
+    /// lock the installer could hold.
+    #[cfg(feature = "webrtc")]
+    rtc: Arc<arc_swap::ArcSwapOption<super::rtc::RtcTransport>>,
+}
+
+/// Submit one packet to a DataChannel from the scheduler drain.
+///
+/// Admission is total, so a refusal is immediate and means the peer's
+/// reserved queue is full right now. The packet gets exactly one
+/// re-offer — the drain cannot park, and holding it would reorder the
+/// stream behind every later packet — and is then dropped **with a
+/// counter** (`RtcStats::drain_refused`), never silently.
+#[cfg(feature = "webrtc")]
+fn submit_rtc_with_one_retry(
+    rtc: &arc_swap::ArcSwapOption<super::rtc::RtcTransport>,
+    packet: &[u8],
+    id: super::rtc::RtcPeerId,
+) {
+    let Some(rtc) = rtc.load_full() else {
+        return;
+    };
+    if rtc.submit(packet, id).is_ok() {
+        return;
+    }
+    if rtc.submit(packet, id).is_err() {
+        rtc.stats().note_drain_refused();
+    }
 }
 
 impl NetRouter {
@@ -702,7 +732,16 @@ impl NetRouter {
             latency_samples: AtomicU64::new(0),
             test_drop_every_n: Arc::new(AtomicU64::new(0)),
             test_drop_counter: Arc::new(AtomicU64::new(0)),
+            #[cfg(feature = "webrtc")]
+            rtc: Arc::new(arc_swap::ArcSwapOption::empty()),
         })
+    }
+
+    /// Install the RTC admission side so the scheduler drain can
+    /// submit `PeerAddr::Rtc` destinations (Stage 3).
+    #[cfg(feature = "webrtc")]
+    pub fn set_rtc_transport(&self, rtc: Arc<super::rtc::RtcTransport>) {
+        self.rtc.store(Some(rtc));
     }
 
     /// Test-only: drop every `n`th dequeued (scheduled) packet in the
@@ -917,6 +956,17 @@ impl NetRouter {
     pub async fn send_to(&self, data: &[u8], dest: PeerAddr) -> std::io::Result<usize> {
         match dest {
             PeerAddr::Udp(addr) => self.socket.send_to(data, addr).await,
+            #[cfg(feature = "webrtc")]
+            PeerAddr::Rtc(id) => match self.rtc.load_full() {
+                Some(rtc) => rtc
+                    .submit(data, id)
+                    .map(|()| data.len())
+                    .map_err(std::io::Error::from),
+                None => Err(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "rtc endpoint addressed on a router with no RTC transport",
+                )),
+            },
         }
     }
 
@@ -944,6 +994,8 @@ impl NetRouter {
         let running = self.running.clone();
         let drop_every_n = self.test_drop_every_n.clone();
         let drop_counter = self.test_drop_counter.clone();
+        #[cfg(feature = "webrtc")]
+        let rtc = self.rtc.clone();
 
         Some(tokio::spawn(async move {
             // Phase 0 instrument: latch the arm flag once; when armed, count
@@ -998,6 +1050,17 @@ impl NetRouter {
                                 PeerAddr::Udp(addr) => {
                                     let _ = socket.send_to(&first.data, addr).await;
                                 }
+                                // RTC is never batched (str0m writes
+                                // one packet per drain), so the
+                                // depth-0 path and the group flush
+                                // below do the same thing for it:
+                                // submit once, and on refusal give it
+                                // exactly one more chance before
+                                // counting the drop.
+                                #[cfg(feature = "webrtc")]
+                                PeerAddr::Rtc(id) => {
+                                    submit_rtc_with_one_retry(&rtc, &first.data, id);
+                                }
                             }
                         }
                         continue;
@@ -1032,6 +1095,27 @@ impl NetRouter {
                         // Endpoint-variant partition for the flush. Only
                         // `Udp` is live; the grouping above, `MAX_DRAIN`
                         // and the drain instrumentation stay whole-drain.
+                        #[cfg(feature = "webrtc")]
+                        let dest = match *dest {
+                            PeerAddr::Udp(addr) => addr,
+                            PeerAddr::Rtc(id) => {
+                                // One at a time: str0m's contract is
+                                // one `Channel::write` per drain, so
+                                // there is nothing to batch. The
+                                // grouping above, `MAX_DRAIN` and the
+                                // drain instrumentation stay
+                                // whole-drain, so the UDP
+                                // measurements remain comparable.
+                                for packet in data {
+                                    submit_rtc_with_one_retry(&rtc, packet, id);
+                                }
+                                if measure_drain {
+                                    record_batch_flush(data.len() as u64);
+                                }
+                                continue;
+                            }
+                        };
+                        #[cfg(not(feature = "webrtc"))]
                         let PeerAddr::Udp(dest) = *dest;
                         #[cfg(target_os = "linux")]
                         {

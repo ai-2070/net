@@ -26,6 +26,10 @@ json = ["dep:serde", "dep:serde_json"]
 # The golden vectors, as constants inside the package. Tests only —
 # the wasm test target and the core's `cross_lang_wire` consumer.
 test-vectors = []
+# Adds the `PeerAddr::Rtc` variant and nothing else. No str0m here: the
+# wire layer names an endpoint, the core drives the transport. Stage 3
+# of BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md.
+webrtc = []
 
 [dependencies]
 # Versions track what the workspace already resolves (Cargo.lock);

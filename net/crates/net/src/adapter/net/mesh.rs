@@ -2050,6 +2050,15 @@ pub struct MeshNodeConfig {
     /// exists so that measurement can A/B the two paths on the real mesh loop.
     #[cfg(feature = "batched-ingress")]
     pub batched_ingress: bool,
+    /// WebRTC DataChannel transport (Stage 3, `webrtc` feature).
+    ///
+    /// `None` — the default — means no RTC socket, no driver and no
+    /// behaviour change whatsoever: compiling the feature is not
+    /// enabling it. `Some(..)` binds a **second** UDP socket (§6: a
+    /// dedicated socket, never a demux of the Net socket) and spawns
+    /// the one task that owns every `str0m::Rtc`.
+    #[cfg(feature = "webrtc")]
+    pub rtc: Option<super::rtc::RtcConfig>,
     /// Handshake timeout per attempt
     pub handshake_timeout: Duration,
     /// Handshake retries
@@ -2528,6 +2537,8 @@ impl MeshNodeConfig {
             default_reliable: false,
             #[cfg(feature = "batched-ingress")]
             batched_ingress: false,
+            #[cfg(feature = "webrtc")]
+            rtc: None,
             handshake_timeout: Duration::from_secs(5),
             handshake_retries: 3,
             socket_buffers: SocketBufferConfig::for_testing(),

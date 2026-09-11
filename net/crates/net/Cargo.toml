@@ -218,6 +218,19 @@ dataforts = [
 # Stages 1–3 of `docs/NAT_TRAVERSAL_PLAN.md`. No new deps; rides
 # the existing mesh + subprotocol surface. Sits on top of `net`.
 nat-traversal = ["net"]
+# Stage 3 of BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md: the native
+# WebRTC DataChannel transport — a dedicated UDP socket, one driver
+# task owning every `str0m::Rtc`, and `PeerAddr::Rtc` endpoints.
+#
+# **Off by default, and it is the only feature with a C build-time
+# dependency.** `str0m`'s `rust-crypto` stack still pulls
+# `aws-lc-rs`/`aws-lc-sys`, whose build needs cmake plus a C compiler
+# (MSVC or clang) and NASM on x86_64 — S0b measured this; see
+# CONTRIBUTING.md. A default `cargo build` remains C-free.
+#
+# Implies `nat-traversal`: ICE candidate classification reuses the
+# traversal pair logic (`PairAction::Ice`).
+webrtc = ["nat-traversal", "dep:str0m", "net-mesh-wire/webrtc"]
 # Opportunistic port mapping via UPnP-IGD / NAT-PMP / PCP.
 # Stage 4 of the plan. Adds two external deps; off by default
 # because port mapping modifies state on the user's router and
@@ -292,6 +305,13 @@ chacha20poly1305 = { version = "0.11", optional = true, features = ["zeroize"] }
 # oracle.
 ring = { version = "0.17", optional = true }
 snow = { version = "0.10.0", optional = true }
+# Sans-IO WebRTC: ICE + DTLS + SCTP + DataChannel state machines with
+# no runtime of their own, which is why the driver can own the socket.
+# `default-features = false, features = ["rust-crypto"]` is the exact
+# pin S0b validated.
+str0m = { version = "0.23.1", optional = true, default-features = false, features = [
+    "rust-crypto",
+] }
 getrandom = { version = "0.4.2", optional = true }
 dashmap = { version = "6", optional = true }
 crossbeam-queue = { version = "0.3", optional = true }

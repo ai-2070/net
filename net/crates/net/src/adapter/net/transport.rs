@@ -356,13 +356,60 @@ pub use net_wire::peer_addr::PeerAddr;
 #[derive(Clone)]
 pub struct PeerSink {
     udp: Arc<NetSocket>,
+    /// The RTC half (Stage 3). `None` until a node is configured with
+    /// `MeshNodeConfig::rtc`, so compiling the feature changes nothing.
+    #[cfg(feature = "webrtc")]
+    rtc: Option<Arc<super::rtc::RtcTransport>>,
 }
 
 impl PeerSink {
     /// Build a sink over the node's UDP socket.
     #[inline]
     pub fn new(udp: Arc<NetSocket>) -> Self {
-        Self { udp }
+        Self {
+            udp,
+            #[cfg(feature = "webrtc")]
+            rtc: None,
+        }
+    }
+
+    /// Attach the RTC admission side (Stage 3).
+    #[cfg(feature = "webrtc")]
+    #[must_use]
+    #[inline]
+    pub fn with_rtc(mut self, rtc: Arc<super::rtc::RtcTransport>) -> Self {
+        self.rtc = Some(rtc);
+        self
+    }
+
+    /// The RTC admission side, when this node has one.
+    #[cfg(feature = "webrtc")]
+    #[inline]
+    pub fn rtc(&self) -> Option<&Arc<super::rtc::RtcTransport>> {
+        self.rtc.as_ref()
+    }
+
+    /// Submit to a DataChannel. Synchronous and total: the reserved
+    /// slots/bytes and the published advisory decide here, and nothing
+    /// refuses after acceptance.
+    ///
+    /// Awaiting is not an option on this half — the driver is the one
+    /// task that owns every `str0m::Rtc`, so a sender that blocked
+    /// waiting for room would stall every other peer's `poll_output`,
+    /// not just its own. That is why `send` and `send_bounded` below
+    /// delegate here rather than waiting.
+    #[cfg(feature = "webrtc")]
+    #[inline]
+    fn submit_rtc(&self, packet: &[u8], id: super::rtc::RtcPeerId) -> io::Result<usize> {
+        let Some(rtc) = self.rtc.as_ref() else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "rtc endpoint addressed on a node with no RTC transport configured",
+            ));
+        };
+        rtc.submit(packet, id)
+            .map(|()| packet.len())
+            .map_err(io::Error::from)
     }
 
     /// The UDP socket this sink submits on.
@@ -380,6 +427,13 @@ impl PeerSink {
     pub async fn send(&self, packet: &[u8], to: PeerAddr) -> io::Result<usize> {
         match to {
             PeerAddr::Udp(addr) => self.udp.send_to(packet, addr).await,
+            // RTC: there is nothing to await. Admission is total and
+            // the driver owns what it accepts, so the awaited entry
+            // point is the synchronous one. `WouldBlock` reaches the
+            // caller unchanged and each row maps it per its
+            // disposition (S0d §3.2).
+            #[cfg(feature = "webrtc")]
+            PeerAddr::Rtc(id) => self.submit_rtc(packet, id),
         }
     }
 
@@ -390,6 +444,8 @@ impl PeerSink {
     pub fn try_send(&self, packet: &[u8], to: PeerAddr) -> io::Result<usize> {
         match to {
             PeerAddr::Udp(addr) => self.udp.try_send_to(packet, addr),
+            #[cfg(feature = "webrtc")]
+            PeerAddr::Rtc(id) => self.submit_rtc(packet, id),
         }
     }
 
@@ -410,6 +466,16 @@ impl PeerSink {
             PeerAddr::Udp(addr) => {
                 bound_datagram_send(self.udp.send_to(packet, addr), to, deadline).await
             }
+            // A deadline around a synchronous decision is a no-op by
+            // construction; the RTC half cannot block, so there is
+            // nothing for the deadline to bound. The refusal is mapped
+            // to the same `AdapterError::Connection` shape a UDP send
+            // failure produces, so callers' error handling is
+            // unchanged.
+            #[cfg(feature = "webrtc")]
+            PeerAddr::Rtc(id) => self.submit_rtc(packet, id).map(|_| ()).map_err(|e| {
+                AdapterError::Connection(format!("rtc submission to {to} refused: {e}"))
+            }),
         }
     }
 }

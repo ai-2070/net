@@ -155,6 +155,8 @@ mod reliability {
         }
     }
 }
+#[cfg(feature = "webrtc")]
+pub mod rtc;
 mod reroute;
 mod route;
 mod router;
