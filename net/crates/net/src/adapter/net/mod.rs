@@ -165,9 +165,16 @@ mod session {
 }
 pub mod state;
 mod stream {
-    //! Re-export shim: see `net_wire::stream`.
+    //! Re-export shim: see `net_wire::stream`. The application-facing
+    //! `Stream` handle is NOT part of it — it is core-owned so its
+    //! fields can stay private (see `super::stream_handle`), and is
+    //! re-exported here so `adapter::net::stream::Stream` still
+    //! resolves for every existing consumer.
     pub use net_wire::stream::*;
+
+    pub use super::stream_handle::Stream;
 }
+mod stream_handle;
 pub mod subnet;
 pub mod subprotocol;
 mod swarm;

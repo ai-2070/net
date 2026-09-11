@@ -39019,12 +39019,7 @@ impl MeshNode {
                 "cap_exceeded",
             );
         }
-        Ok(Stream {
-            peer_node_id,
-            stream_id,
-            epoch,
-            config,
-        })
+        Ok(Stream::new(peer_node_id, stream_id, epoch, config))
     }
 
     /// Close a stream: drop its `StreamState` from the session, ending
@@ -39093,7 +39088,7 @@ impl MeshNode {
     ) -> Result<(), StreamError> {
         let peer = self
             .peers
-            .get(&stream.peer_node_id)
+            .get(&stream.peer_node_id())
             .ok_or(StreamError::NotConnected)?;
         let peer_addr = peer.addr();
         let session = peer.session.clone();
@@ -39103,13 +39098,13 @@ impl MeshNode {
             return Ok(()); // matches send_to_peer's silent drop
         }
 
-        let stream_id = stream.stream_id;
-        let reliable = stream.config.reliability.is_reliable();
+        let stream_id = stream.stream_id();
+        let reliable = stream.config().reliability.is_reliable();
         // Opt-in: bulk-transfer streams route their originating sends
         // through the FairScheduler (T-0.5) instead of straight to the
         // socket, so they participate in per-stream weighted fairness.
         // Default streams keep the direct path (zero blast radius).
-        let scheduled = stream.config.scheduled;
+        let scheduled = stream.config().scheduled;
 
         // Refuse to send on a stream that isn't currently open, OR
         // whose live state has a different epoch than the handle. The
@@ -39121,7 +39116,7 @@ impl MeshNode {
         // stats, wrong tx_window accounting.
         match session.try_stream(stream_id) {
             None => return Err(StreamError::NotConnected),
-            Some(state) if state.epoch() != stream.epoch => {
+            Some(state) if state.epoch() != stream.epoch() => {
                 return Err(StreamError::NotConnected);
             }
             // Congestion gate (H-6): if in-flight is already at the
@@ -39274,24 +39269,26 @@ impl MeshNode {
             // `TxAdmit::Acquired` returns credit + sequence under the
             // same DashMap lookup — a close+reopen race can't slip a
             // stale sequence from the old lifetime onto the new state.
-            let (guard, seq) =
-                match session.try_acquire_tx_credit_matching_epoch(stream_id, stream.epoch, needed)
-                {
-                    TxAdmit::Acquired { guard, seq } => (guard, seq),
-                    TxAdmit::WindowFull => {
-                        if *committed_any {
-                            // Already committed earlier packets this call —
-                            // a return would trigger a whole-slice replay.
-                            // Wait for a receiver grant to free credit, but
-                            // give up (terminal error, no replay) once the
-                            // stall budget is exhausted.
-                            await_credit_or_stall(&mut delay, cap, stall_deadline).await?;
-                            continue;
-                        }
-                        return Err(StreamError::Backpressure);
+            let (guard, seq) = match session.try_acquire_tx_credit_matching_epoch(
+                stream_id,
+                stream.epoch(),
+                needed,
+            ) {
+                TxAdmit::Acquired { guard, seq } => (guard, seq),
+                TxAdmit::WindowFull => {
+                    if *committed_any {
+                        // Already committed earlier packets this call —
+                        // a return would trigger a whole-slice replay.
+                        // Wait for a receiver grant to free credit, but
+                        // give up (terminal error, no replay) once the
+                        // stall budget is exhausted.
+                        await_credit_or_stall(&mut delay, cap, stall_deadline).await?;
+                        continue;
                     }
-                    TxAdmit::StreamClosed => return Err(StreamError::NotConnected),
-                };
+                    return Err(StreamError::Backpressure);
+                }
+                TxAdmit::StreamClosed => return Err(StreamError::NotConnected),
+            };
             let packet = builder.build(stream_id, seq, batch, flags);
             match self
                 .deliver_stream_packet(scheduled, &packet, peer_addr, stream_id)
@@ -39299,7 +39296,14 @@ impl MeshNode {
             {
                 Ok(()) => {
                     guard.commit(); // accepted (socket or scheduler) — bytes are the receiver's now
-                    Self::register_retransmit(session, stream_id, stream.epoch, seq, batch, flags);
+                    Self::register_retransmit(
+                        session,
+                        stream_id,
+                        stream.epoch(),
+                        seq,
+                        batch,
+                        flags,
+                    );
                     *committed_any = true;
                     return Ok(());
                 }
@@ -39311,7 +39315,7 @@ impl MeshNode {
                     // prefix is already committed) or surface backpressure
                     // for a safe whole-slice replay.
                     drop(guard);
-                    session.try_rollback_tx_seq(stream_id, stream.epoch, seq);
+                    session.try_rollback_tx_seq(stream_id, stream.epoch(), seq);
                     if *committed_any {
                         await_credit_or_stall(&mut delay, cap, stall_deadline).await?;
                         continue;
@@ -39323,7 +39327,7 @@ impl MeshNode {
                     // credit. Roll back the seq too — the packet never
                     // reached the wire, so the sequence is unused.
                     drop(guard);
-                    session.try_rollback_tx_seq(stream_id, stream.epoch, seq);
+                    session.try_rollback_tx_seq(stream_id, stream.epoch(), seq);
                     return Err(e);
                 }
             }
@@ -53003,6 +53007,140 @@ mod exported_discovery_pin_coherence_tests {
         assert!(
             node.public_owned_service_providers(SERVICE).is_empty(),
             "no live pin means no entity-layer identity to authorize against",
+        );
+    }
+}
+
+/// R1 (Kyra's HOLD on `b6e522bb5`): the `Stream` handle's config and
+/// the session's retransmit bookkeeping cannot disagree.
+///
+/// Stage 2 briefly made the handle's fields public, which let an
+/// application write `handle.config.reliability = Reliable` on a
+/// stream the session had opened as fire-and-forget. `send_on_stream`
+/// takes the wire flags from the handle and every retransmit entry
+/// from the live `StreamState`, so the packet went out with
+/// `RELIABLE` set and nothing retained to resend it.
+///
+/// The write is a compile error again (the `compile_fail` doctests on
+/// `Stream`). This is the runtime half: over a real two-node
+/// connect/accept pair, with no `start()` — no ACK workers, no
+/// heartbeat, nothing that could retire an entry behind the
+/// assertions — a fire-and-forget send retains nothing and a reliable
+/// send retains exactly its own descriptor, flags included.
+#[cfg(test)]
+mod stream_handle_contract_tests {
+    use super::super::stream::Reliability;
+    use super::*;
+    use std::net::SocketAddr;
+
+    async fn node() -> Arc<MeshNode> {
+        let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr");
+        let cfg = MeshNodeConfig::new(addr, [0x5Au8; 32]);
+        Arc::new(
+            MeshNode::new(EntityKeypair::generate(), cfg)
+                .await
+                .expect("MeshNode::new"),
+        )
+    }
+
+    /// Real handshake, deliberately WITHOUT `start()`.
+    async fn connected_pair() -> (Arc<MeshNode>, Arc<MeshNode>, u64) {
+        let a = node().await;
+        let b = node().await;
+        let (a_id, b_id) = (a.node_id(), b.node_id());
+        let b_pub = *b.public_key();
+        let b_addr = b.local_addr();
+        let b_clone = b.clone();
+        let accept = tokio::spawn(async move { b_clone.accept(a_id).await });
+        a.connect(b_addr, &b_pub, b_id)
+            .await
+            .expect("connect must establish a session");
+        accept.await.expect("accept task").expect("accept");
+        (a, b, b_id)
+    }
+
+    /// What the sender retained for `stream_id`, as
+    /// `(reliability mode name, has_pending)`.
+    fn retransmit_state(node: &MeshNode, peer: u64, stream_id: u64) -> (&'static str, bool) {
+        let peer_entry = node.peers.get(&peer).expect("peer session");
+        let state = peer_entry
+            .session
+            .try_stream(stream_id)
+            .expect("stream state");
+        state.with_reliability(|r| (r.name(), r.has_pending()))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fire_and_forget_stream_sends_unreliable_and_retains_nothing() {
+        let (a, _b, b_id) = connected_pair().await;
+
+        let handle = a
+            .open_stream(b_id, 0xF00D, StreamConfig::new())
+            .expect("open_stream");
+        assert!(
+            !handle.config().reliability.is_reliable(),
+            "precondition: the default config is fire-and-forget"
+        );
+
+        // The only thing an application can still do with the config
+        // is read it. `config()` hands out a `&StreamConfig`, so the
+        // assignment Kyra's probe used does not compile — see the
+        // `compile_fail` doctests on `Stream`.
+        let observed = *handle.config();
+        assert!(!observed.reliability.is_reliable());
+
+        a.send_on_stream(&handle, &[Bytes::from_static(b"faf")])
+            .await
+            .expect("send_on_stream");
+
+        let (mode, pending) = retransmit_state(&a, b_id, 0xF00D);
+        assert_eq!(
+            mode, "fire-and-forget",
+            "the session's mode comes from the OPEN, which is what the wire flags must agree with"
+        );
+        assert!(
+            !pending,
+            "regression: a fire-and-forget stream must retain no retransmit entry"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reliable_stream_sends_reliable_and_retains_its_descriptor() {
+        let (a, _b, b_id) = connected_pair().await;
+
+        let mut config = StreamConfig::new();
+        config.reliability = Reliability::Reliable;
+        let handle = a.open_stream(b_id, 0xBEEF, config).expect("open_stream");
+        assert!(handle.config().reliability.is_reliable());
+
+        a.send_on_stream(&handle, &[Bytes::from_static(b"rel")])
+            .await
+            .expect("send_on_stream");
+
+        let (mode, pending) = retransmit_state(&a, b_id, 0xBEEF);
+        assert_eq!(mode, "reliable");
+        assert!(
+            pending,
+            "positive control: a reliable send must retain its retransmit entry — \
+             this is the half that was missing when the handle could be mutated"
+        );
+
+        // The retained descriptor carries the exact `PacketFlags` the
+        // builder put on the wire, so this is the wire bit, not a
+        // restatement of the config.
+        let peer_entry = a.peers.get(&b_id).expect("peer session");
+        let state = peer_entry.session.try_stream(0xBEEF).expect("stream state");
+        let wire_reliable = state.with_reliability(|r| {
+            r.on_nack(&super::super::protocol::NackPayload {
+                next_expected: 0,
+                missing_bitmap: 0,
+            })
+            .iter()
+            .all(|d| d.flags.contains(PacketFlags::RELIABLE))
+        });
+        assert!(
+            wire_reliable,
+            "every retained descriptor must carry the RELIABLE flag the packet went out with"
         );
     }
 }

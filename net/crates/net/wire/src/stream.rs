@@ -227,45 +227,13 @@ pub struct StreamStats {
     pub credit_grants_sent: u64,
 }
 
-/// A typed handle to a logical stream within a peer session.
-///
-/// Created by `MeshNode::open_stream` (core); dropped at any
-/// point without affecting the underlying `StreamState` — the stream is
-/// removed only when `MeshNode::close_stream` (core) is
-/// explicitly called, when it's idle-evicted, or when its parent session
-/// tears down.
-#[derive(Debug, Clone)]
-pub struct Stream {
-    /// Node id of the peer this stream terminates at.
-    pub peer_node_id: u64,
-    /// Caller-chosen, opaque stream id.
-    pub stream_id: u64,
-    /// Epoch of the `StreamState` this handle was opened against. If
-    /// the stream is closed and reopened (same `stream_id`), the new
-    /// state carries a different epoch and this handle's sends will
-    /// fail with `NotConnected`. Prevents a stale `Stream` from
-    /// silently operating on a different lifetime of the same id.
-    pub epoch: u64,
-    /// Reliability / window configuration this handle was opened with.
-    pub config: StreamConfig,
-}
-
-impl Stream {
-    /// The peer this stream terminates at.
-    #[inline]
-    pub fn peer_node_id(&self) -> u64 {
-        self.peer_node_id
-    }
-
-    /// The stream id. Caller-chosen, opaque `u64`.
-    #[inline]
-    pub fn stream_id(&self) -> u64 {
-        self.stream_id
-    }
-
-    /// The config this stream was opened with.
-    #[inline]
-    pub fn config(&self) -> &StreamConfig {
-        &self.config
-    }
-}
+// The `Stream` **handle** deliberately does NOT live here.
+//
+// It is an application-facing handle whose fields (`epoch`, `config`)
+// must stay private: `MeshNode::send_on_stream` reads the flags off
+// the handle while the retransmit bookkeeping reads the live
+// `StreamState`, so a writable `config` lets an application put
+// `wire_reliable=true` on the wire with no retransmit entry retained.
+// A crate boundary cannot express "private outside the core", so the
+// handle stays in the core (`adapter::net::stream_handle`) and only
+// the config/error/stats vocabulary lives here.

@@ -5426,18 +5426,14 @@ mod tests {
         // that requires an established session with the peer
         // (which the unit test can't synthesize), but `handles_match`
         // only inspects the cached `_node` Arc — the stream fields
-        // are irrelevant to the check. Direct field init is fine
-        // since we're in the same module.
+        // are irrelevant to the check. The crate-internal
+        // `Stream::new` is the constructor; the fields themselves are
+        // private so an application cannot mint one.
         let sh_a = {
             let h = unsafe { &*nh_a };
             let node_clone: Arc<MeshNode> = Arc::clone(&h.inner);
             MeshStreamHandle {
-                stream: ManuallyDrop::new(CoreStream {
-                    peer_node_id: 0xDEAD,
-                    stream_id: 1,
-                    epoch: 0,
-                    config: StreamConfig::new(),
-                }),
+                stream: ManuallyDrop::new(CoreStream::new(0xDEAD, 1, 0, StreamConfig::new())),
                 _node: ManuallyDrop::new(node_clone),
                 guard: HandleGuard::new(),
             }
@@ -5498,16 +5494,12 @@ mod tests {
         let mut nh: *mut MeshNodeHandle = std::ptr::null_mut();
         assert_eq!(unsafe { net_mesh_new(cfg_c.as_ptr(), &mut nh) }, 0);
 
-        // Direct field init, as in `handles_match_rejects_stream_node_mismatch`:
+        // Crate-internal `Stream::new`, as in
+        // `handles_match_rejects_stream_node_mismatch`:
         // `open_stream` needs an established session a unit test cannot
         // synthesize, and neither the guard nor the ids depend on one.
         let sh = Box::into_raw(Box::new(MeshStreamHandle {
-            stream: ManuallyDrop::new(CoreStream {
-                peer_node_id: 0xDEAD,
-                stream_id: 7,
-                epoch: 0,
-                config: StreamConfig::new(),
-            }),
+            stream: ManuallyDrop::new(CoreStream::new(0xDEAD, 7, 0, StreamConfig::new())),
             _node: ManuallyDrop::new(Arc::clone(&unsafe { &*nh }.inner)),
             guard: HandleGuard::new(),
         }));
