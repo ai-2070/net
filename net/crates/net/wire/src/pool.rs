@@ -8,8 +8,8 @@ use crossbeam_queue::ArrayQueue;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use super::crypto::{session_prefix_from_id, PacketCipher};
-use super::protocol::{
+use crate::crypto::{session_prefix_from_id, PacketCipher};
+use crate::protocol::{
     EventFrame, NetHeader, PacketFlags, HEADER_SIZE, MAX_PACKET_SIZE, MAX_PAYLOAD_SIZE, NONCE_SIZE,
     PAYLOAD_LEN_OFFSET,
 };
@@ -34,7 +34,11 @@ pub struct PacketBuilder {
 impl PacketBuilder {
     /// Create a new packet builder.
     ///
-    /// `pub(crate)` not `pub`: every legitimate caller is inside
+    /// Formerly `pub(crate)`: the crate split makes the visibility
+    /// ceiling unrepresentable, so the `heartbeat_api_drift_check`
+    /// tripwire in the core (which enumerates the approved call
+    /// sites in `mesh.rs` / `mod.rs`) is now the whole enforcement.
+    /// Every legitimate caller is inside
     /// `adapter/net/`. Demoted as part of the heartbeat-unification
     /// pass — see [`HEARTBEAT_UNIFICATION_PLAN.md`] — to prevent a
     /// caller from substituting `&[0u8; 32]` for the session's real
@@ -44,7 +48,7 @@ impl PacketBuilder {
     /// [`NetSession::build_heartbeat`]; data-path packets go
     /// through the pool. No external caller should be constructing
     /// raw-key builders.
-    pub(crate) fn new(key: &[u8; 32], session_id: u64) -> Self {
+    pub fn new(key: &[u8; 32], session_id: u64) -> Self {
         Self {
             payload: BytesMut::with_capacity(MAX_PAYLOAD_SIZE),
             cipher: PacketCipher::new(key, session_id),

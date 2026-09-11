@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::protocol::{NackPayload, PacketFlags};
+use crate::protocol::{NackPayload, PacketFlags};
 
 /// Pre-encryption inputs needed to rebuild a packet for
 /// retransmission.
@@ -2486,44 +2486,4 @@ mod tests {
         assert_eq!(s.protocol_anomalies(), 1);
     }
 
-    /// R-1/R-4 producer↔consumer consistency: ranges built by the
-    /// receiver are newest-first, truncate oldest-first, and always
-    /// pass the wire codec's strict validation.
-    #[test]
-    fn build_ack_ranges_newest_first_and_codec_valid() {
-        use crate::adapter::net::subprotocol::stream_window::{StreamAckRanges, MAX_ACK_RANGES};
-
-        let mut s = ReliableStream::with_settings(Duration::from_millis(50), 16_384, 3);
-        assert!(s.on_receive(0)); // next_expected = 1
-        for i in 0..20u64 {
-            assert!(s.on_receive(2 + 2 * i));
-        }
-        let ranges = s.build_ack_ranges(MAX_ACK_RANGES);
-        assert_eq!(ranges.len(), MAX_ACK_RANGES, "truncated to the cap");
-        assert_eq!(
-            ranges[0],
-            (2 + 2 * 19, 2 + 2 * 19 + 1),
-            "newest (highest) range first"
-        );
-        assert!(
-            ranges.windows(2).all(|w| w[0].0 > w[1].1),
-            "strictly descending, non-adjacent"
-        );
-        assert_eq!(
-            ranges.last().copied().unwrap(),
-            (2 + 2 * 4, 2 + 2 * 4 + 1),
-            "truncation dropped the 4 OLDEST ranges"
-        );
-
-        // Whatever the receiver produces must decode cleanly.
-        let msg = StreamAckRanges {
-            stream_id: 7,
-            ack_seq: s.rx_ack_seq(),
-            ranges,
-        };
-        assert_eq!(
-            StreamAckRanges::decode(&msg.encode()).expect("receiver output is always codec-valid"),
-            msg
-        );
-    }
 }

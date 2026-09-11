@@ -53,7 +53,7 @@ pub enum Reliability {
 impl Reliability {
     /// Whether this mode needs reliability state tracking.
     #[inline]
-    pub(crate) fn is_reliable(self) -> bool {
+    pub fn is_reliable(self) -> bool {
         matches!(self, Reliability::Reliable)
     }
 }
@@ -98,7 +98,7 @@ pub struct StreamConfig {
     /// means this stream gets proportionally more packets per round.
     pub fairness_weight: u8,
     /// Route this stream's *originating* sends through the router's
-    /// [`FairScheduler`](crate::adapter::net::router::FairScheduler)
+    /// `FairScheduler` (in the core's `adapter::net::router`)
     /// rather than straight to the socket. Default `false` — every
     /// existing caller (nRPC streaming, control traffic) keeps the
     /// direct `socket.send_to` path. Set `true` for bulk transfers so
@@ -229,22 +229,25 @@ pub struct StreamStats {
 
 /// A typed handle to a logical stream within a peer session.
 ///
-/// Created by [`crate::adapter::net::MeshNode::open_stream`]; dropped at any
+/// Created by `MeshNode::open_stream` (core); dropped at any
 /// point without affecting the underlying `StreamState` — the stream is
-/// removed only when [`crate::adapter::net::MeshNode::close_stream`] is
+/// removed only when `MeshNode::close_stream` (core) is
 /// explicitly called, when it's idle-evicted, or when its parent session
 /// tears down.
 #[derive(Debug, Clone)]
 pub struct Stream {
-    pub(crate) peer_node_id: u64,
-    pub(crate) stream_id: u64,
+    /// Node id of the peer this stream terminates at.
+    pub peer_node_id: u64,
+    /// Caller-chosen, opaque stream id.
+    pub stream_id: u64,
     /// Epoch of the `StreamState` this handle was opened against. If
     /// the stream is closed and reopened (same `stream_id`), the new
     /// state carries a different epoch and this handle's sends will
     /// fail with `NotConnected`. Prevents a stale `Stream` from
     /// silently operating on a different lifetime of the same id.
-    pub(crate) epoch: u64,
-    pub(crate) config: StreamConfig,
+    pub epoch: u64,
+    /// Reliability / window configuration this handle was opened with.
+    pub config: StreamConfig,
 }
 
 impl Stream {

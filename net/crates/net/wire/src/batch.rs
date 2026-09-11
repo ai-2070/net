@@ -5,7 +5,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::protocol::MAX_PAYLOAD_SIZE;
+use crate::protocol::MAX_PAYLOAD_SIZE;
 
 /// Default minimum batch size (1KB)
 pub const DEFAULT_MIN_BATCH_SIZE: usize = 1024;

@@ -37,7 +37,7 @@ use blake2::{
     Blake2sMac,
 };
 
-use crate::adapter::net::route::{RoutingHeader, ROUTING_HEADER_SIZE};
+use crate::route_codec::{RoutingHeader, ROUTING_HEADER_SIZE};
 
 /// Domain separator for the route-hop MAC transcript.
 pub const ROUTE_HOP_MAC_DOMAIN: &[u8] = b"net.subnet.route-hop.v1";
@@ -91,7 +91,7 @@ pub struct AuthenticatedNextHop {
     /// The authenticated peer this hop terminates at.
     pub node_id: u64,
     /// That peer's current endpoint.
-    pub addr: crate::adapter::net::transport::PeerAddr,
+    pub addr: crate::peer_addr::PeerAddr,
 }
 
 /// Why a route-hop operation failed, in either direction.
@@ -569,7 +569,7 @@ impl SharedHopReplayWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapter::net::route::RoutingHeader;
+    use crate::route_codec::RoutingHeader;
 
     fn header() -> RoutingHeader {
         RoutingHeader::new(0xDEAD_BEEF_CAFE, 0x1234, 8)

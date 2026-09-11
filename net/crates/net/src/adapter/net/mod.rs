@@ -30,7 +30,11 @@
 //! adapter.init().await?;
 //! ```
 
-mod batch;
+mod batch {
+    //! Re-export shim: the wire module lives in `net-mesh-wire`
+    //! since Stage 2. Keeps `crate::adapter::net::batch::*` resolving.
+    pub use net_wire::batch::*;
+}
 pub mod behavior;
 // SDK-level cancel-token registry consumed by the cortex `mesh_rpc`
 // call shapes. Always-built (no cortex feature gate) — the registry
@@ -47,7 +51,10 @@ pub mod contested;
 pub mod continuity;
 #[cfg(feature = "cortex")]
 pub mod cortex;
-mod crypto;
+mod crypto {
+    //! Re-export shim: see `net_wire::crypto`.
+    pub use net_wire::crypto::*;
+}
 mod failure;
 pub mod identity;
 mod mesh;
@@ -78,19 +85,86 @@ pub mod org_admission_gate;
 #[cfg(any(test, feature = "fixtures"))]
 #[doc(hidden)]
 pub mod org_exact_sensing_bridge;
-mod pool;
-mod protocol;
+mod pool {
+    //! Re-export shim: see `net_wire::pool`.
+    pub use net_wire::pool::*;
+}
+mod protocol {
+    //! Re-export shim: see `net_wire::protocol`.
+    pub use net_wire::protocol::*;
+}
 mod proxy;
 #[cfg(feature = "redex")]
 pub mod redex;
-mod reliability;
+mod reliability {
+    //! Re-export shim: see `net_wire::reliability`.
+    pub use net_wire::reliability::*;
+
+    /// The one `reliability.rs` test that could not travel with its
+    /// module: it pairs `ReliableStream::build_ack_ranges` with the
+    /// core's `subprotocol::stream_window` codec, and the subprotocol
+    /// codecs stayed in the core in Stage 2. Same assertions, same
+    /// name, now on the consumer side of the crate boundary.
+    #[cfg(test)]
+    mod core_codec_tests {
+        use super::{ReliabilityMode, ReliableStream};
+        use std::time::Duration;
+
+        /// R-1/R-4 producer↔consumer consistency: ranges built by the
+        /// receiver are newest-first, truncate oldest-first, and always
+        /// pass the wire codec's strict validation.
+        #[test]
+        fn build_ack_ranges_newest_first_and_codec_valid() {
+            use crate::adapter::net::subprotocol::stream_window::{StreamAckRanges, MAX_ACK_RANGES};
+
+            let mut s = ReliableStream::with_settings(Duration::from_millis(50), 16_384, 3);
+            assert!(s.on_receive(0)); // next_expected = 1
+            for i in 0..20u64 {
+                assert!(s.on_receive(2 + 2 * i));
+            }
+            let ranges = s.build_ack_ranges(MAX_ACK_RANGES);
+            assert_eq!(ranges.len(), MAX_ACK_RANGES, "truncated to the cap");
+            assert_eq!(
+                ranges[0],
+                (2 + 2 * 19, 2 + 2 * 19 + 1),
+                "newest (highest) range first"
+            );
+            assert!(
+                ranges.windows(2).all(|w| w[0].0 > w[1].1),
+                "strictly descending, non-adjacent"
+            );
+            assert_eq!(
+                ranges.last().copied().unwrap(),
+                (2 + 2 * 4, 2 + 2 * 4 + 1),
+                "truncation dropped the 4 OLDEST ranges"
+            );
+
+            // Whatever the receiver produces must decode cleanly.
+            let msg = StreamAckRanges {
+                stream_id: 7,
+                ack_seq: s.rx_ack_seq(),
+                ranges,
+            };
+            assert_eq!(
+                StreamAckRanges::decode(&msg.encode()).expect("receiver output is always codec-valid"),
+                msg
+            );
+        }
+    }
+}
 mod reroute;
 mod route;
 mod router;
 pub mod secret_file;
-mod session;
+mod session {
+    //! Re-export shim: see `net_wire::session`.
+    pub use net_wire::session::*;
+}
 pub mod state;
-mod stream;
+mod stream {
+    //! Re-export shim: see `net_wire::stream`.
+    pub use net_wire::stream::*;
+}
 pub mod subnet;
 pub mod subprotocol;
 mod swarm;
@@ -249,107 +323,17 @@ use transport::NetSocket as Socket;
 // Re-export xxh3 utilities for stream routing
 pub use routing::{route_to_shard, stream_id_from_bytes, stream_id_from_key};
 
-/// Threshold below which the cached coarse-clock reading is reused
-/// instead of re-reading the OS wall clock. 1 ms is well below the
-/// session-timeout / heartbeat / NACK cadence the consumers care
-/// about (those tick on the seconds scale), and well above the
-/// `Instant::now` cost (~10 ns) we still pay per call to gate the
-/// cache. Per PERF_AUDIT §2.7.
-const COARSE_CLOCK_REFRESH_NS: u64 = 1_000_000; // 1 ms
-
-/// Current timestamp in nanoseconds since the Unix epoch.
+/// The coarse packet clock, moved into `net-mesh-wire` in Stage 2
+/// (`session.rs` and `pool.rs` read it on every packet, and both now
+/// live there). Re-exported so `crate::adapter::net::current_timestamp`
+/// and its siblings still resolve; `current_timestamp_micros` below is
+/// diagnostics-only and stayed.
 ///
-/// Shared utility — avoids duplicating this across `causal.rs`, `snapshot.rs`,
-/// `observation.rs`, `migration.rs`, `session.rs`, and `token.rs`.
-///
-/// Saturates via `try_from` so future-dated clocks land at
-/// `u64::MAX` instead of wrapping near 0. A bare `as u64` would
-/// silently truncate the `u128` returned by
-/// `Duration::as_nanos()`. Practical wraparound from monotonic
-/// flow doesn't happen until ~year 2554, but a system whose clock
-/// was misconfigured to a far-future date would produce a tiny
-/// truncated timestamp — immediately tripping `is_timed_out`
-/// everywhere. `unwrap_or_default()` returning `Duration::ZERO`
-/// for a pre-epoch clock would also produce identical timestamps
-/// that break ordering.
-///
-/// Coarse-clock cached per thread at [`COARSE_CLOCK_REFRESH_NS`]
-/// granularity (PERF_AUDIT §2.7) — readings may be up to 1 ms
-/// stale, and two threads may disagree by up to that much.
-/// Consumers doing timeout arithmetic MUST use `saturating_sub`
-/// (they all do today) so a reader with a staler cache than the
-/// toucher can't wrap and false-expire.
-#[inline]
-pub(crate) fn current_timestamp() -> u64 {
-    // **PERF_AUDIT §2.7.** Per-packet RX/TX paths each call
-    // `current_timestamp()` twice (one stream `touch` + one session
-    // `touch`). On Windows `SystemTime::now()` is
-    // `GetSystemTimePreciseAsFileTime` (~600 ns); on Linux it's
-    // `clock_gettime(CLOCK_REALTIME)` (~120 ns). At sustained packet
-    // rates the four wall-clock reads per ping eat measurable CPU.
-    //
-    // Coarse-clock cache: a `thread_local!` Cell holds the last
-    // `(Instant, u64-ns)` pair. Each call asks `Instant::now()`
-    // (~10 ns — TSC-backed on both Linux and Windows) whether 1 ms
-    // has elapsed; if not, the cached `u64` is reused. Repeated
-    // calls within the same millisecond from the same thread pay
-    // one Instant comparison instead of one OS wall-clock syscall.
-    //
-    // Consumers (`session.is_timed_out` against multi-second
-    // timeouts, `last_activity_ns` for diagnostics) are insensitive
-    // to ≤ 1 ms drift; the wire envelopes that need absolute epoch
-    // ns (capability announcements, snapshots) call
-    // `current_timestamp_micros` or stamp `SystemTime::now()`
-    // directly — neither hits this path.
-    thread_local! {
-        static COARSE_CLOCK: std::cell::Cell<Option<(std::time::Instant, u64)>>
-            = const { std::cell::Cell::new(None) };
-    }
-    COARSE_CLOCK.with(|cell| {
-        let now_inst = std::time::Instant::now();
-        let (store, ns) = coarse_clock_advance(cell.get(), now_inst, || {
-            let elapsed = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default();
-            u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
-        });
-        if let Some(pair) = store {
-            cell.set(Some(pair));
-        }
-        ns
-    })
-}
-
-/// Pure core of the §2.7 coarse clock: given the cached
-/// `(instant, ns)` pair and the current `Instant`, decide whether
-/// to reuse the cached reading (younger than
-/// [`COARSE_CLOCK_REFRESH_NS`]) or call `read_wall` for a fresh
-/// wall-clock value. Returns `(cache update, value)` — `None`
-/// means a cache hit (nothing to store, keeping the hit path
-/// store-free); `Some(pair)` rebases the refresh window on the
-/// read instant.
-///
-/// Extracted from [`current_timestamp`] so the reuse/refresh
-/// decision is testable with synthetic instants. The previous
-/// test drove the real thread-local with a 100-read burst and
-/// asserted every value matched — correct on an idle machine, but
-/// a > 1 ms OS preemption mid-burst legitimately rolls the window,
-/// so the assertion was probabilistic under CI load even with
-/// retries.
-#[inline]
-fn coarse_clock_advance(
-    cached: Option<(std::time::Instant, u64)>,
-    now_inst: std::time::Instant,
-    read_wall: impl FnOnce() -> u64,
-) -> (Option<(std::time::Instant, u64)>, u64) {
-    if let Some((last_inst, last_ns)) = cached {
-        if now_inst.duration_since(last_inst).as_nanos() < COARSE_CLOCK_REFRESH_NS as u128 {
-            return (None, last_ns);
-        }
-    }
-    let ns = read_wall();
-    (Some((now_inst, ns)), ns)
-}
+/// `coarse_clock_advance` and `COARSE_CLOCK_REFRESH_NS` have only
+/// test consumers in this crate now, hence the allow.
+#[allow(unused_imports)]
+pub(crate) use net_wire::time::{coarse_clock_advance, COARSE_CLOCK_REFRESH_NS};
+pub(crate) use net_wire::time::current_timestamp;
 
 /// Current timestamp in microseconds since the Unix epoch.
 /// Saturates at `0` on pre-epoch clocks (the wire envelopes that
@@ -1737,6 +1721,14 @@ fn event_id_gt(a: &str, b: &str) -> bool {
         _ => a > b, // fallback to lexicographic
     }
 }
+
+// The heartbeat-unification tripwire scans `mod.rs` and `mesh.rs`, so
+// it stayed in the core when `session.rs` moved into `net-mesh-wire`.
+// Declared here, below every production item: the tripwire cuts its
+// own scan at the first column-0 `#[cfg(test)] mod`, so a declaration
+// further up would silently shrink the surface it inspects.
+#[cfg(test)]
+mod heartbeat_api_drift_check;
 
 #[cfg(test)]
 mod tests {

@@ -1,6 +1,7 @@
 [workspace]
 members = [
     ".",
+    "wire",
     "sdk",
     "sdk-macros",
     "payments",
@@ -235,6 +236,12 @@ port-mapping = ["nat-traversal", "dep:igd-next"]
 cli = ["dataforts", "redex-disk", "dep:clap"]
 
 [dependencies]
+# The wire layer (Stage 2 extraction): packet protocol, Noise
+# handshake, packet AEAD, reliability, sessions, the routing envelope.
+# tokio-free and wasm32-clean; the core re-exports every module of it
+# under its previous path.
+net-mesh-wire = { version = "0.36.0", path = "wire", features = ["json"] }
+
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "net", "io-util"] }
 

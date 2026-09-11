@@ -7,12 +7,12 @@
 
 use bytes::{Bytes, BytesMut};
 use parking_lot::Mutex;
-use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
+use crate::aead::AeadKey;
 use snow::{params::NoiseParams, Builder, HandshakeState};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use super::protocol::{NONCE_SIZE, TAG_SIZE};
+use crate::protocol::{NONCE_SIZE, TAG_SIZE};
 
 /// Noise protocol pattern: NKpsk0
 ///
@@ -393,9 +393,13 @@ impl NoiseHandshake {
     }
 }
 
-/// Build the `ring` AEAD key for the packet path.
+/// Build the packet AEAD key, through the backend seam
+/// ([`crate::aead`]): `ring` natively, the pure-Rust
+/// `chacha20poly1305` on `wasm32`, both RFC 8439 and therefore
+/// byte-identical on the wire (witnessed by this module's
+/// cross-backend vectors and the `cross_lang_wire` fixture).
 ///
-/// Boxed because `ring::aead::LessSafeKey` is 544 bytes — its inner
+/// Boxed because ring's `LessSafeKey` is 544 bytes — its inner
 /// `UnboundKey` is sized to ring's largest AEAD variant (AES-256-GCM's
 /// expanded key schedule + GHASH table), even though this path only ever
 /// holds a 32-byte ChaCha20-Poly1305 key. `PacketCipher` is embedded by
@@ -409,14 +413,8 @@ impl NoiseHandshake {
 /// pre-fill / refill / rekey — all cold), never on the steady-state
 /// reuse path, and the extra indirection inside seal/open is negligible
 /// against the AEAD itself.
-#[expect(
-    clippy::expect_used,
-    reason = "UnboundKey::new fails only on key-length mismatch; the [u8; 32] parameter makes that unrepresentable for CHACHA20_POLY1305"
-)]
-fn packet_key(key: &[u8; 32]) -> Box<LessSafeKey> {
-    Box::new(LessSafeKey::new(
-        UnboundKey::new(&CHACHA20_POLY1305, key).expect("32-byte ChaCha20-Poly1305 key"),
-    ))
+fn packet_key(key: &[u8; 32]) -> Box<AeadKey> {
+    Box::new(AeadKey::new(key))
 }
 
 /// Packet cipher using ChaCha20-Poly1305 with counter-based nonces.
@@ -451,7 +449,7 @@ fn packet_key(key: &[u8; 32]) -> Box<LessSafeKey> {
 pub struct PacketCipher {
     /// Boxed to keep this 544-byte key off the by-value pool-moved
     /// `PacketBuilder` — see [`packet_key`] for the size rationale.
-    cipher: Box<LessSafeKey>,
+    cipher: Box<AeadKey>,
     /// Pre-built nonce with the session prefix already filled into
     /// the first 4 bytes (and the counter bytes left as zeros for
     /// each per-packet overwrite). Per crypto-session perf #138,
@@ -651,7 +649,7 @@ impl ReplayWindow {
 /// receiver — and the wire header patching in `pool.rs` — must call
 /// this so the on-the-wire nonce matches what the cipher used.
 #[inline]
-pub(crate) fn session_prefix_from_id(session_id: u64) -> [u8; 4] {
+pub fn session_prefix_from_id(session_id: u64) -> [u8; 4] {
     let lo = session_id as u32;
     let hi = (session_id >> 32) as u32;
     (lo ^ hi).to_le_bytes()
@@ -731,14 +729,10 @@ impl PacketCipher {
 
         let tag = self
             .cipher
-            .seal_in_place_separate_tag(
-                Nonce::assume_unique_for_key(nonce),
-                Aad::from(aad),
-                buffer.as_mut(),
-            )
+            .seal_detached(nonce, aad, buffer.as_mut())
             .map_err(|_| CryptoError::Encryption("encryption failed".to_string()))?;
 
-        buffer.extend_from_slice(tag.as_ref());
+        buffer.extend_from_slice(&tag);
         Ok(counter)
     }
 
@@ -763,11 +757,9 @@ impl PacketCipher {
 
         let tag = self
             .cipher
-            .seal_in_place_separate_tag(Nonce::assume_unique_for_key(nonce), Aad::from(aad), buffer)
+            .seal_detached(nonce, aad, buffer)
             .map_err(|_| CryptoError::Encryption("encryption failed".to_string()))?;
-        let mut tag_bytes = [0u8; TAG_SIZE];
-        tag_bytes.copy_from_slice(tag.as_ref());
-        Ok((counter, tag_bytes))
+        Ok((counter, tag))
     }
 
     /// Encrypt payload with AAD.
@@ -781,11 +773,7 @@ impl PacketCipher {
         let mut ciphertext = Vec::with_capacity(plaintext.len() + TAG_SIZE);
         ciphertext.extend_from_slice(plaintext);
         self.cipher
-            .seal_in_place_append_tag(
-                Nonce::assume_unique_for_key(nonce),
-                Aad::from(aad),
-                &mut ciphertext,
-            )
+            .seal_append_tag(nonce, aad, &mut ciphertext)
             .map_err(|_| CryptoError::Encryption("encryption failed".to_string()))?;
 
         Ok((ciphertext, counter))
@@ -804,13 +792,8 @@ impl PacketCipher {
         let mut buf = ciphertext.to_vec();
         let plaintext_len = self
             .cipher
-            .open_in_place(
-                Nonce::assume_unique_for_key(nonce),
-                Aad::from(aad),
-                &mut buf,
-            )
-            .map_err(|_| CryptoError::Decryption("decryption failed".to_string()))?
-            .len();
+            .open_in_place(nonce, aad, &mut buf)
+            .map_err(|_| CryptoError::Decryption("decryption failed".to_string()))?;
         buf.truncate(plaintext_len);
         Ok(buf)
     }
@@ -831,15 +814,14 @@ impl PacketCipher {
 
         let nonce = self.nonce_from_counter(nonce_counter);
 
-        // ring's `open_in_place` consumes the wire layout directly:
-        // ciphertext followed by the 16-byte tag in one contiguous
-        // buffer, decrypted in place. Returns the plaintext slice
-        // (buffer.len() - TAG_SIZE).
+        // The seam's `open_in_place` consumes the wire layout
+        // directly: ciphertext followed by the 16-byte tag in one
+        // contiguous buffer, decrypted in place. Returns the
+        // plaintext length (buffer.len() - TAG_SIZE).
         let plaintext_len = self
             .cipher
-            .open_in_place(Nonce::assume_unique_for_key(nonce), Aad::from(aad), buffer)
-            .map_err(|_| CryptoError::Decryption("decryption failed".to_string()))?
-            .len();
+            .open_in_place(nonce, aad, buffer)
+            .map_err(|_| CryptoError::Decryption("decryption failed".to_string()))?;
 
         Ok(plaintext_len)
     }
@@ -888,7 +870,7 @@ impl PacketCipher {
     /// a small stack-allocated scratch buffer so the AEAD verify
     /// runs without a `Vec` allocation per call.
     ///
-    /// Used by [`super::session::NetSession::verify_and_touch_heartbeat`]
+    /// Used by [`crate::session::NetSession::verify_and_touch_heartbeat`]
     /// where the inbound packet is a 16-byte tag-only payload —
     /// pre-fix this routed through `decrypt(...)` and immediately
     /// dropped the freshly-allocated `Vec<u8>` plaintext. The

@@ -14,17 +14,17 @@ use std::time::Instant;
 
 use crate::event::StoredEvent;
 
-use super::crypto::{PacketCipher, SessionKeys};
-use super::subnet::route_hop::SharedHopReplayWindow;
-use super::transport::PeerAddr;
+use crate::crypto::{PacketCipher, SessionKeys};
+use crate::route_hop::SharedHopReplayWindow;
+use crate::peer_addr::PeerAddr;
 // `SharedPacketPool` is intentionally absent — `NetSession` uses
 // only `SharedLocalPool` as the single TX-side AEAD source.
-use super::pool::SharedLocalPool;
-use super::reliability::{
+use crate::pool::SharedLocalPool;
+use crate::reliability::{
     create_reliability_mode, ReliabilityMode, ReliableStream, RetransmitDescriptor,
 };
-use super::stream::DEFAULT_STREAM_WINDOW_BYTES;
-use super::transport::ParsedPacket;
+use crate::stream::DEFAULT_STREAM_WINDOW_BYTES;
+use crate::parsed_packet::ParsedPacket;
 
 /// TIME_WAIT-style quarantine window after `close_stream`. A
 /// `StreamWindow` grant that arrives for a stream closed within
@@ -49,7 +49,7 @@ pub struct GapReport {
     pub stream_id: u64,
     /// Legacy negative ack for the gap (always present — every gapped
     /// stream emits one, capability-independent).
-    pub nack: super::protocol::NackPayload,
+    pub nack: crate::protocol::NackPayload,
     /// Cumulative ack (`next_expected`) captured in the same snapshot
     /// as `ranges`, so the outgoing `StreamAckRanges` is internally
     /// consistent (every range strictly above `ack_seq`).
@@ -144,7 +144,7 @@ pub struct NetSession {
     /// the ordinary path pays no locking. A second concurrent caller
     /// — only reachable by breaking that ownership rule — is refused
     /// immediately and its packet dropped
-    /// ([`super::subnet::route_hop::RouteHopError::Contended`]).
+    /// ([`crate::route_hop::RouteHopError::Contended`]).
     route_hop_replay: SharedHopReplayWindow,
 }
 
@@ -174,7 +174,7 @@ impl NetSession {
         // `tx_key` comment above. The data path uses
         // `thread_local_pool` exclusively.
         let thread_local_pool =
-            super::pool::shared_local_pool(pool_size, &keys.tx_key, keys.session_id);
+            crate::pool::shared_local_pool(pool_size, &keys.tx_key, keys.session_id);
 
         // `tx_key` is consumed only by `shared_local_pool` above.
         // Copying it into a struct field would be dead storage and
@@ -215,7 +215,7 @@ impl NetSession {
     /// This is the form the forwarding path uses: the buffer belongs
     /// to the forwarder and is reused across packets, so relaying does
     /// not allocate. Size it with
-    /// [`route_hop::sealed_len`](super::subnet::route_hop::sealed_len).
+    /// [`route_hop::sealed_len`](crate::route_hop::sealed_len).
     ///
     /// A too-small buffer is refused *before* a sequence is taken —
     /// burning one on a local sizing mistake would open a gap in this
@@ -223,14 +223,14 @@ impl NetSession {
     pub fn seal_route_hop_into(
         &self,
         out: &mut [u8],
-        header: &super::route::RoutingHeader,
+        header: &crate::route_codec::RoutingHeader,
         inner: &[u8],
-    ) -> Result<usize, super::subnet::route_hop::RouteHopError> {
-        if out.len() < super::subnet::route_hop::sealed_len(inner.len()) {
-            return Err(super::subnet::route_hop::RouteHopError::BufferTooSmall);
+    ) -> Result<usize, crate::route_hop::RouteHopError> {
+        if out.len() < crate::route_hop::sealed_len(inner.len()) {
+            return Err(crate::route_hop::RouteHopError::BufferTooSmall);
         }
         let seq = self.route_hop_tx_seq.fetch_add(1, Ordering::Relaxed);
-        super::subnet::route_hop::seal_into(
+        crate::route_hop::seal_into(
             out,
             &self.route_hop_tx_key,
             self.session_id,
@@ -242,9 +242,9 @@ impl NetSession {
 
     /// Allocating form of [`Self::seal_route_hop_into`], for callers
     /// off the forwarding path.
-    pub fn seal_route_hop(&self, header: &super::route::RoutingHeader, inner: &[u8]) -> Vec<u8> {
+    pub fn seal_route_hop(&self, header: &crate::route_codec::RoutingHeader, inner: &[u8]) -> Vec<u8> {
         let seq = self.route_hop_tx_seq.fetch_add(1, Ordering::Relaxed);
-        super::subnet::route_hop::seal(&self.route_hop_tx_key, self.session_id, seq, header, inner)
+        crate::route_hop::seal(&self.route_hop_tx_key, self.session_id, seq, header, inner)
     }
 
     /// Verify an inbound route-hop envelope and admit its sequence
@@ -256,9 +256,9 @@ impl NetSession {
     pub fn open_route_hop<'a>(
         &self,
         buf: &'a [u8],
-    ) -> Result<super::subnet::route_hop::OpenedHop<'a>, super::subnet::route_hop::RouteHopError>
+    ) -> Result<crate::route_hop::OpenedHop<'a>, crate::route_hop::RouteHopError>
     {
-        let opened = super::subnet::route_hop::open(&self.route_hop_rx_key, buf)?;
+        let opened = crate::route_hop::open(&self.route_hop_rx_key, buf)?;
         self.route_hop_replay.admit(opened.hop_sequence)?;
         Ok(opened)
     }
@@ -988,7 +988,7 @@ impl NetSession {
         // CPU on the decrypt path. ChaCha20-Poly1305 isn't
         // hugely expensive per packet, but the gate is free
         // and removes the cipher from the per-probe budget.
-        if parsed.payload.len() != super::protocol::TAG_SIZE {
+        if parsed.payload.len() != crate::protocol::TAG_SIZE {
             return false;
         }
         let aad = parsed.header.aad();
@@ -1815,195 +1815,8 @@ impl std::fmt::Debug for SessionManager {
     }
 }
 
-use super::current_timestamp;
+use crate::time::current_timestamp;
 
-#[cfg(test)]
-mod heartbeat_api_drift_check {
-    //! Tripwire for the heartbeat-unification invariant: every
-    //! production-side caller in `mod.rs` and `mesh.rs` that
-    //! constructs a heartbeat must go through
-    //! [`NetSession::build_heartbeat`]. See
-    //! `docs/internal/plans/HEARTBEAT_UNIFICATION_PLAN.md` Step 4.
-    //!
-    //! `PacketBuilder::new` is `pub(crate)` so the type system
-    //! already forbids external callers. Within the crate,
-    //! though, a future contributor could legitimately add a new
-    //! production caller that reaches into the pool directly
-    //! (`session.thread_local_pool().get().build_heartbeat()`)
-    //! and bypass the session helper — that pattern was the bug
-    //! shape behind #97/#106. This test counts the approved
-    //! production call sites and fails if a new one appears
-    //! without an explicit allowlist update, forcing the
-    //! contributor to confirm the design choice.
-    //!
-    //! The test scans only the *production* prefixes of each
-    //! file (everything before the first column-0
-    //! `#[cfg(test)]`), which excludes the test modules where
-    //! `PacketBuilder::new(&keys.tx_key, ...)` is the canonical
-    //! way to build a heartbeat for a manually-constructed
-    //! peer session.
-
-    /// Everything before the first column-0 `#[cfg(test)] mod`.
-    ///
-    /// Top-level test modules are tagged with a column-0 `#[cfg(test)]`
-    /// immediately followed by `mod`. Nested `#[cfg(test)]` mods (indented
-    /// inside an `impl` or inline `mod` block) are deliberately NOT cut here, so
-    /// production code following a nested test mod is still checked. False
-    /// positives from nested-test-mod content are unlikely because none of the
-    /// nested test mods in this codebase reference `build_heartbeat`.
-    ///
-    /// **Scanned line by line, not by substring.** This used to search for the
-    /// literal `"\n#[cfg(test)]\nmod "`, which silently fails on CRLF: the
-    /// needle never matches, the whole file is treated as production, and the
-    /// allowlist assertion then reports every TEST caller as a drifted
-    /// production one. That is a confusing failure a long way from its cause —
-    /// it cost a real debugging detour during OLB-2B.3c-pre, where an editor
-    /// rewrote `mesh.rs` with CRLF and this guard blamed eight test call sites.
-    /// `str::lines` strips a trailing `\r`, so a line-based scan cannot regress
-    /// that way. Witnessed by `production_prefix_is_line_ending_agnostic`.
-    fn production_prefix(src: &str) -> String {
-        let mut prefix = String::with_capacity(src.len());
-        let mut lines = src.lines().peekable();
-        while let Some(line) = lines.next() {
-            // Column 0 for BOTH lines, matching the original substring form:
-            // `line == "#[cfg(test)]"` rejects an indented attribute, and
-            // `starts_with("mod ")` rejects an indented or re-exported module.
-            let opens_test_mod =
-                line == "#[cfg(test)]" && lines.peek().is_some_and(|next| next.starts_with("mod "));
-            if opens_test_mod {
-                break;
-            }
-            prefix.push_str(line);
-            prefix.push('\n');
-        }
-        prefix
-    }
-
-    fn count_build_heartbeat_callers(src: &str) -> Vec<String> {
-        src.lines()
-            .filter(|line| {
-                let trimmed = line.trim_start();
-                // Skip comments / doc-comments.
-                if trimmed.starts_with("//") {
-                    return false;
-                }
-                line.contains(".build_heartbeat(")
-            })
-            .map(|line| line.trim().to_string())
-            .collect()
-    }
-
-    /// The prefix scan must not care about line endings.
-    ///
-    /// This is the regression that actually happened. `production_prefix`
-    /// searched for the literal `"\n#[cfg(test)]\nmod "`; an editor rewrote
-    /// `mesh.rs` with CRLF during OLB-2B.3c-pre, the needle stopped matching,
-    /// the whole file was treated as production, and this guard reported eight
-    /// TEST call sites as drifted production callers. The real change was a
-    /// line ending, and the failure pointed at `build_heartbeat`.
-    ///
-    /// A guard whose false-positive mode is that confusing has to prove it
-    /// cannot do that again. Both fixtures below carry the SAME code, so both
-    /// must yield the same single production caller.
-    #[test]
-    fn production_prefix_is_line_ending_agnostic() {
-        const SRC: &str = "\
-fn production() {
-    let a = session.build_heartbeat();
-}
-
-#[cfg(test)]
-mod tests {
-    fn t() {
-        let b = builder.build_heartbeat();
-    }
-}
-";
-        let lf = production_prefix(SRC);
-        let crlf = production_prefix(&SRC.replace('\n', "\r\n"));
-
-        let expected = vec!["let a = session.build_heartbeat();".to_string()];
-        assert_eq!(
-            count_build_heartbeat_callers(&lf),
-            expected,
-            "LF: the test-module caller must be cut"
-        );
-        assert_eq!(
-            count_build_heartbeat_callers(&crlf),
-            expected,
-            "CRLF: the same source with CRLF endings must cut the same test \
-             module. Leaking `builder.build_heartbeat()` here means the prefix \
-             scan is substring-based again, and the allowlist assertion will \
-             blame test call sites for a line-ending change"
-        );
-    }
-
-    /// The cut is column-0-only, in both endings.
-    ///
-    /// Pinned because the line-based rewrite could easily have loosened it: a
-    /// `trim()` on either line would start cutting at NESTED `#[cfg(test)] mod`
-    /// blocks, silently shrinking the production surface this guard inspects.
-    /// That failure is invisible — the assertion just stops seeing callers.
-    #[test]
-    fn production_prefix_cuts_only_column_zero_test_mods() {
-        const SRC: &str = "\
-impl Thing {
-    #[cfg(test)]
-    mod nested {
-        fn t() {}
-    }
-}
-
-fn still_production() {
-    let a = session.build_heartbeat();
-}
-";
-        for (label, src) in [("LF", SRC.to_string()), ("CRLF", SRC.replace('\n', "\r\n"))] {
-            let prod = production_prefix(&src);
-            assert_eq!(
-                count_build_heartbeat_callers(&prod),
-                vec!["let a = session.build_heartbeat();".to_string()],
-                "{label}: an INDENTED `#[cfg(test)] mod` must not cut the scan — \
-                 production code after a nested test mod is still checked"
-            );
-        }
-    }
-
-    #[test]
-    fn mod_rs_production_callers_match_allowlist() {
-        let prod = production_prefix(include_str!("mod.rs"));
-        let callers = count_build_heartbeat_callers(&prod);
-        // The only approved production caller in mod.rs:
-        //   `let packet = session.build_heartbeat();`
-        // inside `spawn_heartbeat`. Pre-fix this read
-        //   `let packet = pooled.build_heartbeat();`
-        // — that pattern is the regression we want to catch.
-        let approved = ["let packet = session.build_heartbeat();"];
-        assert_eq!(
-            callers,
-            approved.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-            "mod.rs production callers of `.build_heartbeat()` drifted from the \
-             approved allowlist. If you intentionally added a new caller, route it \
-             through `Session::build_heartbeat` and update this allowlist. \
-             See docs/internal/plans/HEARTBEAT_UNIFICATION_PLAN.md."
-        );
-    }
-
-    #[test]
-    fn mesh_rs_production_callers_match_allowlist() {
-        let prod = production_prefix(include_str!("mesh.rs"));
-        let callers = count_build_heartbeat_callers(&prod);
-        let approved = ["let packet = session.build_heartbeat();"];
-        assert_eq!(
-            callers,
-            approved.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-            "mesh.rs production callers of `.build_heartbeat()` drifted from the \
-             approved allowlist. If you intentionally added a new caller, route it \
-             through `Session::build_heartbeat` and update this allowlist. \
-             See docs/internal/plans/HEARTBEAT_UNIFICATION_PLAN.md."
-        );
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -2038,8 +1851,8 @@ mod tests {
     /// by observing the sequence actually emitted.
     #[test]
     fn a_refused_seal_does_not_consume_a_hop_sequence() {
-        use super::super::route::RoutingHeader;
-        use super::super::subnet::route_hop::{parse_prefix, sealed_len, RouteHopError};
+        use crate::route_codec::RoutingHeader;
+        use crate::route_hop::{parse_prefix, sealed_len, RouteHopError};
 
         let session = NetSession::new(
             test_keys(),
@@ -3480,7 +3293,7 @@ mod tests {
     /// liveness inference.
     #[test]
     fn verify_and_touch_heartbeat_rejects_wrong_length_before_decrypt() {
-        use super::super::protocol::{NetHeader, PacketFlags, TAG_SIZE};
+        use crate::protocol::{NetHeader, PacketFlags, TAG_SIZE};
         use bytes::Bytes;
 
         let keys = test_keys();
@@ -3496,7 +3309,7 @@ mod tests {
         // but we want to assert the length gate fires first
         // (no cipher work, no last_activity nudge).
         let mut nonce = [0u8; 12];
-        nonce[0..4].copy_from_slice(&crate::adapter::net::crypto::session_prefix_from_id(
+        nonce[0..4].copy_from_slice(&crate::crypto::session_prefix_from_id(
             keys.session_id,
         ));
         nonce[4..12].copy_from_slice(&0u64.to_le_bytes());

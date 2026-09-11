@@ -22,7 +22,12 @@ mod error;
 mod gateway;
 mod id;
 pub mod provision;
-pub mod route_hop;
+pub mod route_hop {
+    //! Re-export shim: the authenticated route-hop envelope moved
+    //! into `net-mesh-wire` in Stage 2 — `NetSession` seals and opens
+    //! hops, so the module had to travel with it (S0a §3.2).
+    pub use net_wire::route_hop::*;
+}
 
 pub use admission::{SubnetChallengeStore, SubnetContextStore};
 pub use assignment::{SubnetPolicy, SubnetRule};

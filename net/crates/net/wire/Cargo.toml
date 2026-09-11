@@ -1,0 +1,81 @@
+[package]
+name = "net-mesh-wire"
+version = "0.36.0"
+edition = "2021"
+description = "Net mesh wire layer: packet protocol, Noise handshake, packet AEAD, reliability, sessions and the routing envelope. tokio-free and wasm32-clean."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ai-2070/net"
+keywords = ["networking", "protocol", "noise", "wasm"]
+categories = ["network-programming", "no-std::no-alloc", "wasm"]
+
+[lib]
+# `net_wire` mirrors `net-mesh-sdk` / `net_sdk`: the published name
+# carries the `net-mesh` prefix, the import path stays short.
+name = "net_wire"
+path = "src/lib.rs"
+
+[lints.rust]
+missing_docs = "warn"
+
+[features]
+default = []
+# `StoredEvent`'s JSON conveniences (`from_value`, `parse`) and its
+# `Serialize` impl. The core enables it — those are its callers; the
+# wasm32 build does not, so a browser leaf pays no serde_json.
+json = ["dep:serde", "dep:serde_json"]
+
+[dependencies]
+# Versions track what the workspace already resolves (Cargo.lock);
+# this crate introduces no new version of an existing dependency.
+bytes = "1"
+parking_lot = "0.12"
+crossbeam-queue = "0.3"
+dashmap = "6"
+# `route_hop.rs`'s keyed BLAKE2s hop MAC, verified in constant time.
+blake2 = "0.11"
+subtle = "2"
+# Seven log sites survive the extraction (crypto x1, reliability x1,
+# session x3, routing codec x2, including the `RouteFlags::from_u8`
+# high-nibble wire-compatibility tripwire). `tracing` is wasm32-clean;
+# a no-op shim here would be a hidden stub.
+tracing = "0.1"
+serde = { version = "1", features = ["derive", "rc"], optional = true }
+serde_json = { version = "1", features = ["raw_value"], optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Native packet AEAD, byte-identical to the pre-extraction behaviour.
+ring = "0.17"
+snow = "0.10.0"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-time = "1.1"
+# snow WITHOUT default features. snow 0.10's `std` feature (part of
+# `default`) lists `ring/std`, which force-activates snow's optional
+# `ring` dependency, and `ring` cannot build for wasm32 without a
+# clang that targets wasm32. `default-resolver` +
+# `default-resolver-crypto` is the pure-Rust path. (S0a §6.2.)
+snow = { version = "0.10.0", default-features = false, features = [
+    "default-resolver",
+    "default-resolver-crypto",
+] }
+# Both getrandom majors reachable from this dependency graph need the
+# browser opt-in of their own major, or the build stops at a
+# `compile_error!` inside getrandom itself. (S0a §6.2.)
+getrandom = { version = "0.3.4", features = ["wasm_js"] }
+getrandom_02 = { package = "getrandom", version = "0.2.17", features = ["js"] }
+# Packet AEAD for wasm32: 0.10.1 (aead 0.5, `AeadInPlace`), not the
+# 0.11 the core pins — 0.11 moved to aead 0.6's `InOutBuf` API, and
+# 0.10.1 is already in the tree under snow's default resolver, so this
+# dedups rather than linking a second ChaCha20-Poly1305.
+chacha20poly1305 = "0.10.1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+# `crypto.rs`'s cross-backend vectors seal with ring and open with
+# RustCrypto (and back), which is what keeps the AEAD seam wire-safe.
+chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+[dev-dependencies]
+serde_json = "1"
