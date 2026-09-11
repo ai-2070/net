@@ -736,6 +736,27 @@ const FOLD_GENERATION_GC_MAX_AGE: Duration = Duration::from_secs(3600);
 /// For nodes where we only have the derived u64 node_id, we zero-pad
 /// it to 32 bytes. This preserves uniqueness for topology tracking
 /// without requiring the full public key exchange.
+/// Is this RTC datagram something `dispatch_packet` can act on?
+///
+/// The RTC path carries exactly what the UDP path carries: a routing
+/// envelope, or a Net packet whose header validates. S0c found the
+/// failure mode this guards — an oversize frame was dropped with no
+/// counter anywhere, so a peer talking to a dead channel looked
+/// exactly like a quiet one. Rejections are counted
+/// (`RtcStats::validate_rejected`) and the channel stays up.
+#[cfg(feature = "webrtc")]
+fn rtc_ingress_is_well_formed(data: &Bytes) -> bool {
+    if data.len() >= 2 {
+        let first2 = u16::from_le_bytes([data[0], data[1]]);
+        if first2 == super::route::ROUTING_MAGIC
+            && data.len() >= super::route::ROUTING_HEADER_SIZE + super::protocol::HEADER_SIZE
+        {
+            return true;
+        }
+    }
+    super::protocol::NetHeader::from_bytes(data).is_some_and(|h| h.validate())
+}
+
 fn node_id_to_graph_id(node_id: u64) -> [u8; 32] {
     let mut id = [0u8; 32];
     id[0..8].copy_from_slice(&node_id.to_le_bytes());
@@ -10497,6 +10518,20 @@ pub struct MeshNode {
     /// every peer-addressed send goes through it, receive-side and
     /// socket-level uses keep `socket`.
     sink: PeerSink,
+    /// The RTC driver handle, when `MeshNodeConfig::rtc` is set.
+    #[cfg(feature = "webrtc")]
+    rtc_driver: Option<super::rtc::RtcDriverHandle>,
+    /// The bounded RTC ingress input, parked here until
+    /// `spawn_receive_loop` takes it (it can only have one consumer,
+    /// and `dispatch_packet` is the single owner).
+    #[cfg(feature = "webrtc")]
+    rtc_ingress:
+        Arc<parking_lot::Mutex<Option<tokio::sync::mpsc::Receiver<(Bytes, super::rtc::RtcPeerId)>>>>,
+    /// RTC counters. Present whenever the feature is compiled, so a
+    /// node without `rtc` configured still reads zeros rather than
+    /// making every caller handle an `Option`.
+    #[cfg(feature = "webrtc")]
+    rtc_stats: Arc<super::rtc::RtcStats>,
     /// Per-peer sessions keyed by node_id. Keying by node_id (rather than
     /// SocketAddr) is required for relayed sessions: if A connects to C via
     /// relay B, both peers share B's wire address, so a SocketAddr-keyed map
@@ -12106,6 +12141,31 @@ impl MeshNode {
         let socket = Arc::new(socket);
         let sink = PeerSink::new(socket.clone());
 
+        // RTC: a dedicated socket and one driver task, only when the
+        // operator asked for it. `rtc: None` (the default) leaves
+        // every line below untouched — compiling the feature is not
+        // enabling it.
+        #[cfg(feature = "webrtc")]
+        let rtc_stats = Arc::new(super::rtc::RtcStats::default());
+        #[cfg(feature = "webrtc")]
+        let (rtc_driver, rtc_ingress, sink) = match config.rtc.clone() {
+            None => (None, None, sink),
+            Some(rtc_config) => {
+                let (ingress_tx, ingress_rx) =
+                    tokio::sync::mpsc::channel(rtc_config.ingress_queue_packets);
+                let handle = super::rtc::RtcDriver::spawn(
+                    rtc_config,
+                    config.bind_addr,
+                    Arc::clone(&rtc_stats),
+                    ingress_tx,
+                )
+                .await
+                .map_err(|e| AdapterError::Connection(format!("rtc bind failed: {e}")))?;
+                let sink = sink.with_rtc(Arc::clone(handle.transport()));
+                (Some(handle), Some(ingress_rx), sink)
+            }
+        };
+
         let router_config = RouterConfig {
             local_id: node_id,
             // Router binds to an ephemeral port for its send loop. It uses
@@ -12846,6 +12906,12 @@ impl MeshNode {
             config,
             socket,
             sink,
+            #[cfg(feature = "webrtc")]
+            rtc_driver,
+            #[cfg(feature = "webrtc")]
+            rtc_ingress: Arc::new(parking_lot::Mutex::new(rtc_ingress)),
+            #[cfg(feature = "webrtc")]
+            rtc_stats,
             peers,
             addr_to_node,
             router,
@@ -24212,6 +24278,14 @@ impl MeshNode {
         let batched_ingress = self.config.batched_ingress;
 
         let ctx = self.dispatch_ctx();
+        // The RTC input, when this node is configured for it. A second
+        // input, not a replacement: a node can carry UDP and RTC peers
+        // at once, and `dispatch_packet` stays the single owner of
+        // both (§2, §3.4).
+        #[cfg(feature = "webrtc")]
+        let rtc_ingress = self.rtc_ingress.lock().take();
+        #[cfg(feature = "webrtc")]
+        let rtc_stats = self.rtc_stats.clone();
 
         // Local receiver abstraction so the select! loop body below is
         // written once across the per-packet path and the Linux batched-
@@ -24221,14 +24295,40 @@ impl MeshNode {
             Single(PacketReceiver),
             #[cfg(all(target_os = "linux", feature = "batched-ingress"))]
             Batched(super::transport::BatchedPacketReceiver),
+            /// Bounded RTC input, fed by the driver (§3.4). Bounded
+            /// because a full input must drop and count rather than
+            /// block: blocking here stalls every peer's
+            /// `poll_output`, not just the noisy one's.
+            #[cfg(feature = "webrtc")]
+            Rtc(tokio::sync::mpsc::Receiver<(Bytes, super::rtc::RtcPeerId)>),
         }
         impl IngressReceiver {
+            /// One packet, in arrival order, with the endpoint it came
+            /// from. The UDP arms convert the socket tuple here — the
+            /// receive loop is the boundary — and the RTC arm carries
+            /// the driver's handle, which is already an endpoint.
             #[inline]
-            async fn recv(&mut self) -> std::io::Result<(Bytes, SocketAddr)> {
+            async fn recv(&mut self) -> std::io::Result<(Bytes, PeerAddr)> {
                 match self {
-                    IngressReceiver::Single(r) => r.recv().await,
+                    IngressReceiver::Single(r) => {
+                        r.recv().await.map(|(b, a)| (b, PeerAddr::Udp(a)))
+                    }
                     #[cfg(all(target_os = "linux", feature = "batched-ingress"))]
-                    IngressReceiver::Batched(r) => r.recv().await,
+                    IngressReceiver::Batched(r) => {
+                        r.recv().await.map(|(b, a)| (b, PeerAddr::Udp(a)))
+                    }
+                    // The driver's sender being dropped is the ONLY
+                    // fatal ingress condition for RTC (§3.4): a
+                    // `ConnectionReset` on the RTC *socket* never
+                    // reaches here, the driver swallows and counts it.
+                    #[cfg(feature = "webrtc")]
+                    IngressReceiver::Rtc(r) => match r.recv().await {
+                        Some((data, id)) => Ok((data, PeerAddr::Rtc(id))),
+                        None => Err(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionReset,
+                            "rtc driver stopped",
+                        )),
+                    },
                 }
             }
 
@@ -24245,6 +24345,8 @@ impl MeshNode {
                     IngressReceiver::Single(_) => false,
                     #[cfg(all(target_os = "linux", feature = "batched-ingress"))]
                     IngressReceiver::Batched(_) => true,
+                    #[cfg(feature = "webrtc")]
+                    IngressReceiver::Rtc(_) => true,
                 }
             }
         }
@@ -24276,15 +24378,66 @@ impl MeshNode {
             // recv thread died); for the per-packet path it's transient. Decide
             // once by receiver variant rather than re-checking the flag.
             let reset_is_fatal = receiver.reset_is_fatal();
+            #[cfg(feature = "webrtc")]
+            let mut rtc_receiver = rtc_ingress.map(IngressReceiver::Rtc);
 
             while !shutdown.load(Ordering::Acquire) {
                 tokio::select! {
+                    // Fair interleave (§3.4): per-source ordering is
+                    // preserved *within* each input, never across
+                    // them — and no packet stream can split across
+                    // both, because a session belongs to exactly one
+                    // endpoint at a time.
+                    result = async {
+                        #[cfg(feature = "webrtc")]
+                        {
+                            match rtc_receiver.as_mut() {
+                                Some(r) => r.recv().await,
+                                None => std::future::pending().await,
+                            }
+                        }
+                        #[cfg(not(feature = "webrtc"))]
+                        {
+                            // No RTC input compiled in: this arm never
+                            // completes, so the select! is exactly the
+                            // pre-Stage-3 one.
+                            std::future::pending::<std::io::Result<(Bytes, PeerAddr)>>().await
+                        }
+                    } => {
+                        match result {
+                            Ok((data, source)) => {
+                                #[cfg(feature = "webrtc")]
+                                if !rtc_ingress_is_well_formed(&data) {
+                                    // S0c's silent 8 KiB black hole:
+                                    // an oversize or malformed frame
+                                    // used to vanish with the channel
+                                    // looking healthy. Count it, and
+                                    // keep the channel.
+                                    rtc_stats.note_validate_rejected();
+                                    continue;
+                                }
+                                Self::dispatch_packet(data, source, &ctx);
+                            }
+                            Err(e) => {
+                                // The driver's sender was dropped: the
+                                // driver is gone, so this input is
+                                // permanently dead (§3.4).
+                                if !shutdown.load(Ordering::Acquire) {
+                                    tracing::warn!(error = %e, "rtc ingress closed");
+                                }
+                                #[cfg(feature = "webrtc")]
+                                {
+                                    rtc_receiver = None;
+                                }
+                            }
+                        }
+                    }
                     result = receiver.recv() => {
                         match result {
                             Ok((data, source)) => {
                                 // The UDP receive loop is a boundary: the
                                 // socket's tuple becomes the peer endpoint here.
-                                Self::dispatch_packet(data, PeerAddr::Udp(source), &ctx);
+                                Self::dispatch_packet(data, source, &ctx);
                             }
                             // Batched receiver: a ConnectionReset means its recv
                             // thread exited (transport.rs) and every future
@@ -37886,6 +38039,47 @@ impl MeshNode {
         super::behavior::fold::reflex_addr_for(&self.capability_fold, peer_node_id)
     }
 
+    /// The RTC counters (Stage 3). Zeroed and inert on a node
+    /// without `MeshNodeConfig::rtc`.
+    #[cfg(feature = "webrtc")]
+    pub fn rtc_stats(&self) -> &Arc<super::rtc::RtcStats> {
+        &self.rtc_stats
+    }
+
+    /// The RTC driver handle, when this node has one.
+    #[cfg(feature = "webrtc")]
+    pub fn rtc_driver(&self) -> Option<&super::rtc::RtcDriverHandle> {
+        self.rtc_driver.as_ref()
+    }
+
+    /// Is this peer reached over a DataChannel?
+    ///
+    /// The Stage 3 signal for [`PairAction::Ice`](super::traversal::classify::PairAction::Ice):
+    /// the installed endpoint. The announcement's `transport:rtc` tag
+    /// is Stage 4's, so a peer we have never had a session with is
+    /// classified by the classic matrix — which is correct, because
+    /// without an RTC session there is nothing for ICE to own.
+    #[cfg(feature = "webrtc")]
+    fn peer_endpoint_is_rtc(&self, peer_node_id: u64) -> bool {
+        self.peers
+            .get(&peer_node_id)
+            .is_some_and(|p| matches!(p.value().addr(), PeerAddr::Rtc(_)))
+    }
+
+    /// The pair action for this peer, ICE short-circuit included.
+    /// The pair action for this peer, ICE short-circuit included.
+    fn pair_action_for(&self, peer_node_id: u64) -> super::traversal::classify::PairAction {
+        #[cfg(feature = "webrtc")]
+        let rtc_side = self.peer_endpoint_is_rtc(peer_node_id);
+        #[cfg(not(feature = "webrtc"))]
+        let rtc_side = false;
+        super::traversal::classify::pair_action_with_transport(
+            self.nat_class(),
+            self.peer_nat_class(peer_node_id),
+            rtc_side,
+        )
+    }
+
     /// Read a peer's most recently advertised NAT classification
     /// from the capability index. Parses the `nat:*` tag on the
     /// peer's announcement. Returns `NatClass::Unknown` when the
@@ -38078,14 +38272,21 @@ impl MeshNode {
         peer_node_id: u64,
         peer_pubkey: &[u8; 32],
     ) -> Result<u64, super::traversal::TraversalError> {
-        use super::traversal::classify::{pair_action, PairAction};
+        use super::traversal::classify::PairAction;
         use super::traversal::TraversalError;
 
-        let action = pair_action(self.nat_class(), self.peer_nat_class(peer_node_id));
+        let action = self.pair_action_for(peer_node_id);
         match action {
             // Direct pairs ignore the coordinator entirely; pass a
             // sentinel `0` — the Direct arm never reads it.
             PairAction::Direct => self.connect_direct(peer_node_id, peer_pubkey, 0).await,
+            // ICE owns connectivity for a DataChannel peer: there is
+            // no UDP tuple to punch toward, and a coordinator cannot
+            // help. Refuse rather than burn a rendezvous budget on a
+            // punch that is meaningless by construction.
+            PairAction::Ice => Err(TraversalError::Transport(
+                "peer is reached over a DataChannel; ICE owns connectivity, no punch".into(),
+            )),
             PairAction::SinglePunch | PairAction::SkipPunch => {
                 match self.select_punch_coordinator(peer_node_id) {
                     Some(coord) => self.connect_direct(peer_node_id, peer_pubkey, coord).await,
@@ -38157,7 +38358,7 @@ impl MeshNode {
         peer_pubkey: &[u8; 32],
         coordinator: u64,
     ) -> Result<u64, super::traversal::TraversalError> {
-        use super::traversal::classify::{pair_action, PairAction};
+        use super::traversal::classify::PairAction;
         use super::traversal::TraversalError;
 
         // NOTE: `peer_reflex` and `coordinator` are deliberately
@@ -38172,9 +38373,7 @@ impl MeshNode {
         // Both lookups now happen lazily inside the arms that
         // actually consume them.
 
-        let local_class = self.nat_class();
-        let remote_class = self.peer_nat_class(peer_node_id);
-        let action = pair_action(local_class, remote_class);
+        let action = self.pair_action_for(peer_node_id);
 
         // Resolve `coordinator` into a wire address. Only call
         // from the SkipPunch / SinglePunch arms — `Direct`
@@ -38282,6 +38481,11 @@ impl MeshNode {
         };
 
         match action {
+            // No punch, no coordinator: the peer is on a DataChannel
+            // and ICE already did the connectivity work.
+            PairAction::Ice => Err(TraversalError::Transport(
+                "peer is reached over a DataChannel; ICE owns connectivity, no punch".into(),
+            )),
             PairAction::Direct => {
                 // `Direct` pairs (Open/Open, Open/Cone,
                 // Open/Unknown, Unknown/Unknown, etc.) don't
@@ -39906,7 +40110,7 @@ impl MeshNode {
     /// reconnects starts from a clean slate.
     #[cfg(feature = "nat-traversal")]
     async fn attempt_direct_upgrade(&self, peer_id: u64) {
-        use super::traversal::classify::{pair_action, PairAction};
+        use super::traversal::classify::PairAction;
 
         // Re-evaluate a not-yet-upgradable `SinglePunch` pair after
         // this long, so a NAT reclassification that makes it `Direct`
@@ -39947,7 +40151,7 @@ impl MeshNode {
             return;
         }
 
-        let action = pair_action(self.nat_class(), self.peer_nat_class(peer_id));
+        let action = self.pair_action_for(peer_id);
         let target_addr = match action {
             PairAction::Direct => match self.peer_reflex_addr(peer_id) {
                 Some(addr) => addr,
@@ -39972,6 +40176,14 @@ impl MeshNode {
             // ticking at 1 s, well inside that window. Marking `done`
             // here pinned such a peer to the relay for the life of its
             // peer entry, on a classification that was about to change.
+            // An RTC peer is already on its best path: ICE negotiated
+            // it. The direct-upgrade scan has nothing to upgrade to,
+            // so it is done with this peer rather than deferred —
+            // re-checking would re-derive the same answer forever.
+            PairAction::Ice => {
+                self.upgrade_record_done(peer_id);
+                return;
+            }
             PairAction::SkipPunch => {
                 self.upgrade_record_defer(
                     peer_id,

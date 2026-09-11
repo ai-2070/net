@@ -133,6 +133,34 @@ pub enum PairAction {
     /// coordinator round-trip when one side can't hole-punch
     /// reliably). Stats: `relay_fallbacks` bumps.
     SkipPunch,
+    /// The pair has a WebRTC side: ICE does the connectivity work, so
+    /// the punch logic must never run (Stage 3).
+    ///
+    /// A DataChannel peer's reachability is negotiated by ICE inside
+    /// str0m, on the dedicated RTC socket. A rendezvous punch aimed at
+    /// it would be a UDP packet to an address the peer does not own,
+    /// coordinated by a third party that cannot help — wasted budget
+    /// at best, and a misleading `punches_attempted` at worst. Stats:
+    /// no punch counters bump.
+    Ice,
+}
+
+/// Does either side of this pair speak WebRTC?
+///
+/// Kept next to [`pair_action`] rather than folded into it: the NAT
+/// classes say nothing about transport, so the RTC short-circuit is a
+/// separate question asked first, and a caller that does not know the
+/// transports still gets the classic matrix.
+#[inline]
+pub fn pair_action_with_transport(
+    local: NatClass,
+    remote: NatClass,
+    either_side_is_rtc: bool,
+) -> PairAction {
+    if either_side_is_rtc {
+        return PairAction::Ice;
+    }
+    pair_action(local, remote)
 }
 
 /// Decide what `connect_direct` should do given the local and
@@ -1097,6 +1125,29 @@ mod tests {
                 rev.classify(bind),
                 "iter {iter}: classification must not depend on observe order",
             );
+        }
+    }
+
+    /// A WebRTC side short-circuits the whole matrix: ICE owns
+    /// connectivity, so no punch is ever offered — not even for the
+    /// pairs whose NAT classes would otherwise demand one.
+    #[test]
+    fn any_rtc_side_selects_ice_over_every_matrix_cell() {
+        use NatClass::*;
+        for local in [Open, Cone, Symmetric, Unknown] {
+            for remote in [Open, Cone, Symmetric, Unknown] {
+                assert_eq!(
+                    pair_action_with_transport(local, remote, true),
+                    PairAction::Ice,
+                    "{local:?} x {remote:?} with an RTC side must not run the punch logic"
+                );
+                assert_eq!(
+                    pair_action_with_transport(local, remote, false),
+                    pair_action(local, remote),
+                    "{local:?} x {remote:?} without an RTC side must be the classic matrix, \
+                     byte for byte"
+                );
+            }
         }
     }
 }
