@@ -438,3 +438,53 @@ async fn an_nrpc_call_round_trips_over_the_datachannel() {
     );
     assert!(reply.latency_ns > 0);
 }
+
+/// A **fold** applied over an RTC pair: a named remote fact crosses
+/// the DataChannel and lands in the receiver's capability fold, with
+/// the existing consumer assertion (`find_nodes_by_filter`) intact.
+///
+/// This is the half of "nRPC and fold" the report claimed as a
+/// disposition class. A class witness proves a packet was admitted;
+/// it says nothing about whether the fold applied the fact.
+///
+/// Inverse: drop all RTC ingress on the receiver
+/// (`set_ingress_drop_one_in(1)`) and the fold never learns the tag.
+#[cfg(feature = "cortex")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_capability_fold_applies_a_remote_fact_received_over_rtc() {
+    use net::adapter::net::behavior::capability::{CapabilityFilter, CapabilitySet};
+
+    let a = node(Some(rtc_config())).await;
+    let b = node(Some(rtc_config())).await;
+    a.start();
+    b.start();
+    connect_rtc_loopback(&a, &b).await.expect("rtc pair");
+
+    // A announces over the only transport it has to B: the
+    // DataChannel.
+    let caps = CapabilitySet::new().add_tag("rtc-folded").add_tag("gpu");
+    a.announce_capabilities(caps)
+        .await
+        .expect("announce over RTC");
+
+    let filter = CapabilityFilter::new().require_tag("rtc-folded");
+    let a_id = a.node_id();
+    let folded = wait_for(
+        || b.find_nodes_by_filter(&filter).contains(&a_id),
+        Duration::from_secs(20),
+    )
+    .await;
+    assert!(
+        folded,
+        "B's capability fold must APPLY the announcement that crossed the \
+         DataChannel — admitting the packet is not applying the fact"
+    );
+
+    // And the fold's answer is about A specifically: a tag nobody
+    // announced resolves to nothing.
+    let absent = CapabilityFilter::new().require_tag("never-announced");
+    assert!(
+        b.find_nodes_by_filter(&absent).is_empty(),
+        "the fold must not answer for a tag no peer announced"
+    );
+}

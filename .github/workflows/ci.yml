@@ -4600,7 +4600,7 @@ jobs:
           check_floor rtc_loopback 6
           check_floor rtc_backpressure 8
           check_floor rtc_repairs 18
-          check_floor rtc_routed_restore 3
+          check_floor rtc_routed_restore 4
           REQUIRED="
           rtc_repairs:scheduled_fire_and_forget_packets_reach_rtc_admission_and_the_peer
           rtc_repairs:the_scheduler_drain_counts_what_it_drops_under_pressure
@@ -4622,6 +4622,7 @@ jobs:
           rtc_repairs:a_busy_peer_cannot_starve_a_sibling_or_the_socket
           rtc_routed_restore:routed_then_direct_then_loss_then_manually_restored_routed
           rtc_routed_restore:an_nrpc_call_round_trips_over_the_datachannel
+          rtc_routed_restore:a_capability_fold_applies_a_remote_fact_received_over_rtc
           "
           for entry in $REQUIRED; do
             bin="${entry%%:*}"

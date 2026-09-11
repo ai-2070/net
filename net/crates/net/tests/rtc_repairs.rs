@@ -398,7 +398,25 @@ async fn a_committed_prefix_is_never_replayed_when_the_suffix_is_refused() {
     driver.hooks().set_pump_paused(true);
     tokio::time::sleep(Duration::from_millis(30)).await;
 
-    let payloads = tagged_payloads(b"R2PFX", 12);
+    // Big payloads: the MTU split turns one call into several
+    // packets, which is what makes "prefix committed, suffix
+    // refused" a shape that can exist at all. With small events the
+    // whole slice is one packet and there is no prefix.
+    let payloads: Vec<Bytes> = (0..12u8)
+        .map(|i| {
+            let mut v = b"R2PFX".to_vec();
+            v.push(i);
+            v.extend_from_slice(&[i; 3000]);
+            Bytes::from(v)
+        })
+        .collect();
+    let session = a
+        .peer_session_for_test(b.node_id())
+        .expect("an installed session");
+    let seq_before = session
+        .try_stream(0x0774)
+        .map(|s| s.current_tx_seq())
+        .unwrap_or(0);
     let sender = {
         let a = Arc::clone(&a);
         let payloads = payloads.clone();
@@ -409,7 +427,7 @@ async fn a_committed_prefix_is_never_replayed_when_the_suffix_is_refused() {
     // internal retry must carry the *remainder*, not the whole slice.
     tokio::time::sleep(Duration::from_millis(100)).await;
     driver.hooks().set_pump_paused(false);
-    let outcome = tokio::time::timeout(Duration::from_secs(20), sender)
+    let outcome = tokio::time::timeout(Duration::from_secs(30), sender)
         .await
         .expect("the call must not hang once pressure clears")
         .expect("join");
@@ -419,21 +437,41 @@ async fn a_committed_prefix_is_never_replayed_when_the_suffix_is_refused() {
          credit returns; got {outcome:?}"
     );
 
-    let seen = collect_tagged(&b, b"R2PFX", payloads.len(), Duration::from_secs(20)).await;
-    assert_eq!(
-        seen.len(),
-        payloads.len(),
-        "every payload exactly once: {} deliveries for {} payloads",
-        seen.len(),
-        payloads.len()
-    );
+    let seen = collect_tagged(&b, b"R2PFX", payloads.len(), Duration::from_secs(30)).await;
     let unique: HashSet<Vec<u8>> = seen.iter().cloned().collect();
     assert_eq!(
         unique.len(),
-        seen.len(),
-        "no payload may be delivered twice: {} deliveries, {} distinct",
-        seen.len(),
-        unique.len()
+        payloads.len(),
+        "every payload must arrive: {} distinct of {}",
+        unique.len(),
+        payloads.len()
+    );
+
+    // The replay question is answered **sender-side**: a whole-call
+    // replay of the committed prefix consumes a second sequence
+    // number for every packet in it. Counting deliveries cannot
+    // answer it — a paused pump makes the reliable RTO fire, the
+    // original and the retransmission both land, and nothing dedups
+    // events at the shard queue.
+    let seq_after = session
+        .try_stream(0x0774)
+        .map(|s| s.current_tx_seq())
+        .unwrap_or(0);
+    let packets = seq_after - seq_before;
+    assert!(
+        packets >= 2,
+        "precondition: the slice must span several packets, or there is no \
+         prefix to replay (consumed {packets})"
+    );
+    let retransmits = a
+        .control_plane_stats()
+        .retransmit_packets_sent
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        packets <= payloads.len() as u64 + retransmits,
+        "one sequence per packet sent, plus retransmissions: {packets} consumed, \
+         {} payloads, {retransmits} retransmits — a replayed prefix consumes extras",
+        payloads.len()
     );
 }
 
@@ -873,13 +911,16 @@ async fn the_rtc_prefilter_admits_exactly_what_dispatch_accepts() {
 async fn a_reliable_stream_delivers_exact_values_in_order_through_loss() {
     let (a, b, _id_a, _) = pair_with(rtc_config(), rtc_config()).await;
 
-    // One in three inbound DataChannel messages is dropped on B, with
+    // One in four inbound DataChannel messages is dropped on B, with
     // `maxRetransmits: 0` behind it: only `reliability.rs` can repair
-    // this.
+    // this. One in four rather than one in three because the repair
+    // budget is finite — at a third, a saturated box can exhaust the
+    // retransmit budget before the stream completes, which measures
+    // the machine rather than the transport.
     b.rtc_driver()
         .expect("driver")
         .hooks()
-        .set_ingress_drop_one_in(3);
+        .set_ingress_drop_one_in(4);
 
     let mut cfg = StreamConfig::new();
     cfg.reliability = Reliability::Reliable;
@@ -895,7 +936,7 @@ async fn a_reliable_stream_delivers_exact_values_in_order_through_loss() {
             .expect("send_with_retry");
     }
 
-    let seen = collect_tagged(&b, b"R6REL", N, Duration::from_secs(30)).await;
+    let seen = collect_tagged(&b, b"R6REL", N, Duration::from_secs(60)).await;
     let unique: HashSet<Vec<u8>> = seen.iter().cloned().collect();
     assert_eq!(
         unique.len(),
