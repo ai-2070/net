@@ -1,0 +1,16 @@
+net/crates/net/src/adapter/net/transport.rs
+  h_64425bc75e3f3d 395
+net/crates/net/src/adapter/net/mesh.rs
+  h_64425bc75e3f3d 24249-24251
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "96dc9fdf4684476e7812b4400eee439832cacddb",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
