@@ -1,0 +1,56 @@
+docs/internal/spikes/S0A_WIRE_BOUNDARY.md
+  h_64425bc75e3f3d 1-373
+spikes/S0A_BRIEF.md
+  h_64425bc75e3f3d 1-97
+spikes/s0a-wire/.gitignore
+  h_64425bc75e3f3d 1
+spikes/s0a-wire/Cargo.lock
+  h_64425bc75e3f3d 1-871
+spikes/s0a-wire/Cargo.toml
+  h_64425bc75e3f3d 1-70
+spikes/s0a-wire/src/aead.rs
+  h_64425bc75e3f3d 1-168
+spikes/s0a-wire/src/batch.rs
+  h_64425bc75e3f3d 1-237
+spikes/s0a-wire/src/clock.rs
+  h_64425bc75e3f3d 1-70
+spikes/s0a-wire/src/crypto.rs
+  h_64425bc75e3f3d 1-1009
+spikes/s0a-wire/src/event.rs
+  h_64425bc75e3f3d 1-52
+spikes/s0a-wire/src/lib.rs
+  h_64425bc75e3f3d 1-65
+spikes/s0a-wire/src/parsed_packet.rs
+  h_64425bc75e3f3d 1-62
+spikes/s0a-wire/src/pool.rs
+  h_64425bc75e3f3d 1-1047
+spikes/s0a-wire/src/protocol.rs
+  h_64425bc75e3f3d 1-639
+spikes/s0a-wire/src/reliability.rs
+  h_64425bc75e3f3d 1-1130
+spikes/s0a-wire/src/roundtrip.rs
+  h_64425bc75e3f3d 1-206
+spikes/s0a-wire/src/route_codec.rs
+  h_64425bc75e3f3d 1-316
+spikes/s0a-wire/src/route_hop.rs
+  h_64425bc75e3f3d 1-568
+spikes/s0a-wire/src/session.rs
+  h_64425bc75e3f3d 1-1820
+spikes/s0a-wire/src/stream.rs
+  h_64425bc75e3f3d 1-268
+spikes/s0a-wire/src/time.rs
+  h_64425bc75e3f3d 1-55
+spikes/s0a-wire/tests/routed_roundtrip.rs
+  h_64425bc75e3f3d 1-55
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "4a95691d4e689762dca8190a320c8d5140f05c82",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
