@@ -57,7 +57,9 @@ fn expected_hex(v: &Value) -> String {
 fn net_header_matches_the_fixture_bytes() {
     let f = fixture("net_header.json");
     let mut nonce = [0u8; NONCE_SIZE];
-    nonce.copy_from_slice(&unhex(f["fields"]["nonce_hex"].as_str().expect("nonce_hex")));
+    nonce.copy_from_slice(&unhex(
+        f["fields"]["nonce_hex"].as_str().expect("nonce_hex"),
+    ));
 
     let header = NetHeader::new(
         0x0123_4567_89ab_cdef,

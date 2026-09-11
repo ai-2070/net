@@ -39,13 +39,15 @@ impl PacketBuilder {
     /// tripwire in the core (which enumerates the approved call
     /// sites in `mesh.rs` / `mod.rs`) is now the whole enforcement.
     /// Every legitimate caller is inside
-    /// `adapter/net/`. Demoted as part of the heartbeat-unification
-    /// pass — see [`HEARTBEAT_UNIFICATION_PLAN.md`] — to prevent a
-    /// caller from substituting `&[0u8; 32]` for the session's real
-    /// TX key, which would produce AEAD-tagged heartbeats whose tag
-    /// the receiver could never verify against the session's actual
-    /// key. Heartbeats now go through
-    /// [`NetSession::build_heartbeat`]; data-path packets go
+    /// `adapter/net/` or in this crate. Demoted as part of the
+    /// heartbeat-unification pass — see
+    /// `docs/internal/plans/HEARTBEAT_UNIFICATION_PLAN.md` — to
+    /// prevent a caller from substituting `&[0u8; 32]` for the
+    /// session's real TX key, which would produce AEAD-tagged
+    /// heartbeats whose tag the receiver could never verify against
+    /// the session's actual key. Heartbeats now go through
+    /// [`NetSession::build_heartbeat`](crate::session::NetSession::build_heartbeat);
+    /// data-path packets go
     /// through the pool. No external caller should be constructing
     /// raw-key builders.
     pub fn new(key: &[u8; 32], session_id: u64) -> Self {

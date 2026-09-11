@@ -115,7 +115,9 @@ mod reliability {
         /// pass the wire codec's strict validation.
         #[test]
         fn build_ack_ranges_newest_first_and_codec_valid() {
-            use crate::adapter::net::subprotocol::stream_window::{StreamAckRanges, MAX_ACK_RANGES};
+            use crate::adapter::net::subprotocol::stream_window::{
+                StreamAckRanges, MAX_ACK_RANGES,
+            };
 
             let mut s = ReliableStream::with_settings(Duration::from_millis(50), 16_384, 3);
             assert!(s.on_receive(0)); // next_expected = 1
@@ -146,7 +148,8 @@ mod reliability {
                 ranges,
             };
             assert_eq!(
-                StreamAckRanges::decode(&msg.encode()).expect("receiver output is always codec-valid"),
+                StreamAckRanges::decode(&msg.encode())
+                    .expect("receiver output is always codec-valid"),
                 msg
             );
         }
@@ -329,11 +332,10 @@ pub use routing::{route_to_shard, stream_id_from_bytes, stream_id_from_key};
 /// and its siblings still resolve; `current_timestamp_micros` below is
 /// diagnostics-only and stayed.
 ///
-/// `coarse_clock_advance` and `COARSE_CLOCK_REFRESH_NS` have only
-/// test consumers in this crate now, hence the allow.
+/// `coarse_clock_advance` and `COARSE_CLOCK_REFRESH_NS` have only test
+/// consumers in this crate now, hence the allow.
 #[allow(unused_imports)]
-pub(crate) use net_wire::time::{coarse_clock_advance, COARSE_CLOCK_REFRESH_NS};
-pub(crate) use net_wire::time::current_timestamp;
+pub(crate) use net_wire::time::{coarse_clock_advance, current_timestamp, COARSE_CLOCK_REFRESH_NS};
 
 /// Current timestamp in microseconds since the Unix epoch.
 /// Saturates at `0` on pre-epoch clocks (the wire envelopes that

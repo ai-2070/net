@@ -82,7 +82,11 @@ mod imp {
             buffer: &mut Vec<u8>,
         ) -> Result<(), AeadError> {
             self.0
-                .seal_in_place_append_tag(Nonce::assume_unique_for_key(nonce), Aad::from(aad), buffer)
+                .seal_in_place_append_tag(
+                    Nonce::assume_unique_for_key(nonce),
+                    Aad::from(aad),
+                    buffer,
+                )
                 .map_err(|_| AeadError)
         }
 

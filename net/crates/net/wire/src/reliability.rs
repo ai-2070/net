@@ -2490,5 +2490,4 @@ mod tests {
         );
         assert_eq!(s.protocol_anomalies(), 1);
     }
-
 }

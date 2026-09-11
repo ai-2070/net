@@ -32,7 +32,7 @@ use net_wire::crypto::{handshake_prologue, NoiseHandshake, StaticKeypair};
 use net_wire::parsed_packet::ParsedPacket;
 use net_wire::peer_addr::PeerAddr;
 use net_wire::protocol::{EventFrame, PacketFlags};
-use net_wire::route_codec::{RoutingHeader, ROUTING_HEADER_SIZE, ROUTING_MAGIC, _MAX_TTL};
+use net_wire::route_codec::{RoutingHeader, _MAX_TTL, ROUTING_HEADER_SIZE, ROUTING_MAGIC};
 use net_wire::session::NetSession;
 
 const INITIATOR_NODE_ID: u64 = 0x1111_2222_3333_4444;
@@ -128,7 +128,10 @@ fn routed_round_trip_runs_on_wasm() {
     let decrypted = rx
         .decrypt_to_bytes(counter, &aad, parsed.payload.clone())
         .expect("decrypt on the RustCrypto backend");
-    assert!(rx.try_admit_rx_counter(counter), "replay window admits once");
+    assert!(
+        rx.try_admit_rx_counter(counter),
+        "replay window admits once"
+    );
 
     let frames = EventFrame::read_events(decrypted, parsed.header.event_count);
     assert_eq!(frames.len(), 1);
@@ -169,7 +172,9 @@ fn aead_golden_vector_matches_on_the_wasm_backend() {
     const FIXTURE: &str = include_str!("../../tests/cross_lang_wire/aead_vector.json");
 
     let key: [u8; 32] = unhex(field(FIXTURE, "key_hex")).try_into().expect("key");
-    let nonce: [u8; 12] = unhex(field(FIXTURE, "nonce_hex")).try_into().expect("nonce");
+    let nonce: [u8; 12] = unhex(field(FIXTURE, "nonce_hex"))
+        .try_into()
+        .expect("nonce");
     let aad = unhex(field(FIXTURE, "aad_hex"));
     let plaintext = field(FIXTURE, "plaintext_utf8");
     let expected = field(FIXTURE, "ciphertext_and_tag_hex");

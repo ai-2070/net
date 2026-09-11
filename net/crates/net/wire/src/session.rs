@@ -18,16 +18,16 @@ use crate::clock::{Clock, Instant, SystemClock};
 use crate::event::StoredEvent;
 
 use crate::crypto::{PacketCipher, SessionKeys};
-use crate::route_hop::SharedHopReplayWindow;
 use crate::peer_addr::PeerAddr;
+use crate::route_hop::SharedHopReplayWindow;
 // `SharedPacketPool` is intentionally absent — `NetSession` uses
 // only `SharedLocalPool` as the single TX-side AEAD source.
+use crate::parsed_packet::ParsedPacket;
 use crate::pool::SharedLocalPool;
 use crate::reliability::{
     create_reliability_mode, ReliabilityMode, ReliableStream, RetransmitDescriptor,
 };
 use crate::stream::DEFAULT_STREAM_WINDOW_BYTES;
-use crate::parsed_packet::ParsedPacket;
 
 /// TIME_WAIT-style quarantine window after `close_stream`. A
 /// `StreamWindow` grant that arrives for a stream closed within
@@ -245,7 +245,11 @@ impl NetSession {
 
     /// Allocating form of [`Self::seal_route_hop_into`], for callers
     /// off the forwarding path.
-    pub fn seal_route_hop(&self, header: &crate::route_codec::RoutingHeader, inner: &[u8]) -> Vec<u8> {
+    pub fn seal_route_hop(
+        &self,
+        header: &crate::route_codec::RoutingHeader,
+        inner: &[u8],
+    ) -> Vec<u8> {
         let seq = self.route_hop_tx_seq.fetch_add(1, Ordering::Relaxed);
         crate::route_hop::seal(&self.route_hop_tx_key, self.session_id, seq, header, inner)
     }
@@ -259,8 +263,7 @@ impl NetSession {
     pub fn open_route_hop<'a>(
         &self,
         buf: &'a [u8],
-    ) -> Result<crate::route_hop::OpenedHop<'a>, crate::route_hop::RouteHopError>
-    {
+    ) -> Result<crate::route_hop::OpenedHop<'a>, crate::route_hop::RouteHopError> {
         let opened = crate::route_hop::open(&self.route_hop_rx_key, buf)?;
         self.route_hop_replay.admit(opened.hop_sequence)?;
         Ok(opened)
@@ -1820,7 +1823,6 @@ impl std::fmt::Debug for SessionManager {
 
 use crate::time::current_timestamp;
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2269,12 +2271,15 @@ mod tests {
 
         // Manually pre-populate `recently_closed` with entries
         // whose timestamps are well past the quarantine window.
-        let stale_inserted_at = SystemClock::now() - GRANT_QUARANTINE_WINDOW - Duration::from_secs(1);
+        let stale_inserted_at =
+            SystemClock::now() - GRANT_QUARANTINE_WINDOW - Duration::from_secs(1);
         session.recently_closed.insert(0xAAAA, stale_inserted_at);
         session.recently_closed.insert(0xBBBB, stale_inserted_at);
 
         // Add a fresh entry that should NOT be swept yet.
-        session.recently_closed.insert(0xFEEDC0DE, SystemClock::now());
+        session
+            .recently_closed
+            .insert(0xFEEDC0DE, SystemClock::now());
 
         assert_eq!(session.recently_closed.len(), 3);
 
@@ -3315,9 +3320,7 @@ mod tests {
         // but we want to assert the length gate fires first
         // (no cipher work, no last_activity nudge).
         let mut nonce = [0u8; 12];
-        nonce[0..4].copy_from_slice(&crate::crypto::session_prefix_from_id(
-            keys.session_id,
-        ));
+        nonce[0..4].copy_from_slice(&crate::crypto::session_prefix_from_id(keys.session_id));
         nonce[4..12].copy_from_slice(&0u64.to_le_bytes());
 
         let header = NetHeader::new(
