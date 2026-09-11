@@ -1,0 +1,16 @@
+.github/workflows/ci.yml
+  h_64425bc75e3f3d 106-171
+net/crates/net/wire/src/route_codec.rs
+  h_64425bc75e3f3d 324-504
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "3f22e5443bf2b06690250adc38c07f843d6a7d0c",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
