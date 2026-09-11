@@ -213,7 +213,9 @@ pub use swarm::{
     Capabilities, CapabilityAd, EdgeInfo, GraphStats, LocalGraph, NodeInfo, Pingwave,
     MAX_GRAPH_NODES, MAX_SEEN_PINGWAVES, PINGWAVE_SIZE,
 };
-pub use transport::{NetSocket, PacketReceiver, PacketSender, ParsedPacket, SocketBufferConfig};
+pub use transport::{
+    NetSocket, PacketReceiver, PacketSender, ParsedPacket, PeerAddr, PeerSink, SocketBufferConfig,
+};
 // Recv-loop batching instrument (NRPC_RECV_LOOP_BATCHING_PLAN), symmetric to
 // the send-side drain instrument. Compiled only under the `batched-ingress`
 // build feature (it measures that path). Re-exported only so the in-repo

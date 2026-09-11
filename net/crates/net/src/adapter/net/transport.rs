@@ -4,10 +4,14 @@
 //! for high-throughput UDP communication.
 
 use bytes::{Bytes, BytesMut};
+use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::UdpSocket;
+
+use crate::error::AdapterError;
 
 use super::protocol::{NetHeader, HEADER_SIZE, MAX_PACKET_SIZE};
 
@@ -328,6 +332,161 @@ impl std::fmt::Debug for NetSocket {
         f.debug_struct("NetSocket")
             .field("local_addr", &self.local_addr)
             .finish()
+    }
+}
+
+/// Where a peer is reached.
+///
+/// Stage 1 of `BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md`: peer-keyed state
+/// names an *endpoint*, not a UDP tuple. Only [`PeerAddr::Udp`] exists in
+/// this stage; the `Rtc` variant is Stage 3's and is feature-gated there.
+///
+/// Deliberately **not** `FromStr` and **not** `serde`: nothing serializes a
+/// `PeerAddr`. Operator-facing configuration
+/// (`MeshNodeConfig::{bind_addr, peer_addr}`, `reflex_override`) and every
+/// wire field (`reflex_addr`, `ReflexMsg`, `RendezvousMsg`) stay
+/// `SocketAddr`. Convert at the boundary with [`PeerAddr::Udp`] /
+/// [`PeerAddr::udp`], never through a lossy helper that invents a tuple.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum PeerAddr {
+    /// A UDP tuple — the only variant in default builds.
+    Udp(SocketAddr),
+}
+
+impl PeerAddr {
+    /// The UDP tuple, when this endpoint is one.
+    ///
+    /// The single conversion back to `SocketAddr`, used at the boundaries
+    /// that genuinely need a tuple: binding, `is_loopback` / partition
+    /// checks, traversal input and reflex publication.
+    #[inline]
+    pub fn udp(&self) -> Option<SocketAddr> {
+        match self {
+            PeerAddr::Udp(addr) => Some(*addr),
+        }
+    }
+}
+
+impl From<SocketAddr> for PeerAddr {
+    #[inline]
+    fn from(addr: SocketAddr) -> Self {
+        PeerAddr::Udp(addr)
+    }
+}
+
+impl std::fmt::Display for PeerAddr {
+    /// Renders the inner `SocketAddr` unchanged, so every log line and
+    /// error string that formats a peer endpoint is byte-identical to the
+    /// pre-`PeerAddr` text.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PeerAddr::Udp(addr) => write!(f, "{addr}"),
+        }
+    }
+}
+
+/// The one outbound submission surface for peer-addressed packets.
+///
+/// Three entry points, one per blocking shape the send inventory
+/// (`docs/internal/spikes/S0D_SEND_INGRESS_INVENTORY.md` §3.1) actually
+/// contains. UDP behaviour is **identical** to the raw socket calls these
+/// replace: [`Self::send`] is `NetSocket::send_to(..).await`,
+/// [`Self::try_send`] is `NetSocket::try_send_to`, and
+/// [`Self::send_bounded`] is [`bound_datagram_send`] around the former.
+/// Nothing here converts a UDP `WouldBlock` into application backpressure.
+///
+/// Stage 3 adds the RTC half beside `udp`; the entry points and their
+/// contracts do not change when it does.
+#[derive(Clone)]
+pub struct PeerSink {
+    udp: Arc<NetSocket>,
+}
+
+impl PeerSink {
+    /// Build a sink over the node's UDP socket.
+    #[inline]
+    pub fn new(udp: Arc<NetSocket>) -> Self {
+        Self { udp }
+    }
+
+    /// The UDP socket this sink submits on.
+    ///
+    /// For the paths that need the socket itself rather than a submission:
+    /// receive loops, `local_addr`, and the two handshake `recv_from`
+    /// bypasses. Not a send path.
+    #[inline]
+    pub fn udp_socket(&self) -> &Arc<NetSocket> {
+        &self.udp
+    }
+
+    /// Awaited submission. UDP: exactly `socket.send_to(..).await`.
+    #[inline]
+    pub async fn send(&self, packet: &[u8], to: PeerAddr) -> io::Result<usize> {
+        match to {
+            PeerAddr::Udp(addr) => self.udp.send_to(packet, addr).await,
+        }
+    }
+
+    /// Non-blocking submission. UDP: exactly `socket.try_send_to(..)`,
+    /// including its `WouldBlock` — the deliberate-shed call sites depend
+    /// on that error reaching them unchanged.
+    #[inline]
+    pub fn try_send(&self, packet: &[u8], to: PeerAddr) -> io::Result<usize> {
+        match to {
+            PeerAddr::Udp(addr) => self.udp.try_send_to(packet, addr),
+        }
+    }
+
+    /// Awaited submission under a caller-chosen deadline. UDP: today's
+    /// `bound_datagram_send(socket.send_to(..), addr, deadline)`.
+    ///
+    /// The deadline is the caller's: the ordered organization egress queue
+    /// passes its own, the caller-facing datagram seam passes
+    /// `DATAGRAM_SEND_DEADLINE`. They are not unified.
+    #[inline]
+    pub async fn send_bounded(
+        &self,
+        packet: &[u8],
+        to: PeerAddr,
+        deadline: Duration,
+    ) -> Result<(), AdapterError> {
+        match to {
+            PeerAddr::Udp(addr) => {
+                bound_datagram_send(self.udp.send_to(packet, addr), to, deadline).await
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for PeerSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerSink")
+            .field("udp", &self.udp.local_addr())
+            .finish()
+    }
+}
+
+/// Bound one ALREADY-ISSUED datagram send future by `deadline`.
+///
+/// The single place the datagram-send bound is expressed. Taking the future
+/// rather than the socket is what lets both [`PeerSink::send_bounded`] and
+/// the ordered organization egress share the exact same retirement policy —
+/// and lets an instrumented witness substitute a send that never resolves
+/// without duplicating the deadline wrapper it is meant to exercise.
+pub(crate) async fn bound_datagram_send<F>(
+    send: F,
+    addr: PeerAddr,
+    deadline: Duration,
+) -> Result<(), AdapterError>
+where
+    F: Future<Output = io::Result<usize>>,
+{
+    match tokio::time::timeout(deadline, send).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(AdapterError::Connection(format!("send failed: {e}"))),
+        Err(_) => Err(AdapterError::Connection(format!(
+            "send to {addr} exceeded the {deadline:?} datagram deadline"
+        ))),
     }
 }
 

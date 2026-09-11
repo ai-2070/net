@@ -29,7 +29,6 @@
 //! ```
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
@@ -545,7 +544,9 @@ use super::subprotocol::stream_window::{
     SUBPROTOCOL_STREAM_WINDOW,
 };
 use super::subprotocol::MigrationSubprotocolHandler;
-use super::transport::{NetSocket, PacketReceiver, ParsedPacket, SocketBufferConfig};
+use super::transport::{
+    bound_datagram_send, NetSocket, PacketReceiver, ParsedPacket, PeerAddr, SocketBufferConfig,
+};
 use super::Visibility;
 use tokio::sync::oneshot;
 
@@ -6791,11 +6792,12 @@ impl OrderedSensingEgress {
                         // An unwritable socket, exactly: the send never
                         // resolves. The SAME wrapper production uses is what
                         // must retire it.
-                        bound_datagram_send(std::future::pending(), next.addr, deadline).await
+                        bound_datagram_send(std::future::pending(), PeerAddr::Udp(next.addr), deadline)
+                            .await
                     } else {
                         bound_datagram_send(
                             socket.send_to(&next.packet, next.addr),
-                            next.addr,
+                            PeerAddr::Udp(next.addr),
                             deadline,
                         )
                         .await
@@ -6804,7 +6806,7 @@ impl OrderedSensingEgress {
                 #[cfg(not(any(test, feature = "fixtures")))]
                 let outcome = bound_datagram_send(
                     socket.send_to(&next.packet, next.addr),
-                    next.addr,
+                    PeerAddr::Udp(next.addr),
                     DATAGRAM_SEND_DEADLINE,
                 )
                 .await;
@@ -9275,31 +9277,6 @@ fn snapshot_peers(peers: &DashMap<u64, PeerInfo>, exclude: Option<u64>) -> Vec<P
         .collect()
 }
 
-/// Bound one ALREADY-ISSUED datagram send future by `deadline`.
-///
-/// The single place the datagram-send bound is expressed. Taking the future
-/// rather than the socket is what lets both the caller-facing
-/// [`send_datagram`] seam and the ordered organization egress share the exact
-/// same retirement policy — and lets an instrumented witness substitute a send
-/// that never resolves without duplicating the deadline wrapper it is meant to
-/// exercise.
-async fn bound_datagram_send<F>(
-    send: F,
-    addr: SocketAddr,
-    deadline: Duration,
-) -> Result<(), AdapterError>
-where
-    F: Future<Output = std::io::Result<usize>>,
-{
-    match tokio::time::timeout(deadline, send).await {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(e)) => Err(AdapterError::Connection(format!("send failed: {e}"))),
-        Err(_) => Err(AdapterError::Connection(format!(
-            "send to {addr} exceeded the {deadline:?} datagram deadline"
-        ))),
-    }
-}
-
 /// Send ONE datagram under [`DATAGRAM_SEND_DEADLINE`].
 ///
 /// Every send on a caller-facing path goes through here, so the bound is a
@@ -9314,7 +9291,12 @@ async fn send_datagram(
     packet: &[u8],
     addr: SocketAddr,
 ) -> Result<(), AdapterError> {
-    bound_datagram_send(socket.send_to(packet, addr), addr, DATAGRAM_SEND_DEADLINE).await
+    bound_datagram_send(
+        socket.send_to(packet, addr),
+        PeerAddr::Udp(addr),
+        DATAGRAM_SEND_DEADLINE,
+    )
+    .await
 }
 
 /// Publish an authority change and advance the routing epoch as ONE ordered unit
