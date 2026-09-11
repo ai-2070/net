@@ -279,19 +279,28 @@ fn is_net_workspace(manifest_dir: &std::path::Path) -> bool {
 /// The classification itself, over synthetic trees.
 ///
 /// This is the part Kyra's three placements exercise from the
-/// outside; here it is pinned without a filesystem sandbox. The
-/// interesting case is the third: a `.git` above the crate is exactly
-/// what an unpacked package under a consumer's repository has, and it
-/// must NOT read as the Net workspace.
+/// outside; here it is pinned without depending on where the test
+/// itself happens to be compiled. The positive case is a **controlled
+/// complete fixture** — a temp tree carrying all three markers — not
+/// this crate's own `CARGO_MANIFEST_DIR`: an earlier revision asserted
+/// `is_net_workspace(env!("CARGO_MANIFEST_DIR"))` unconditionally, so a
+/// packaged core's test binary failed here instead of at the callee
+/// test it had just made package-safe (Kyra, closure review of
+/// `bdcd47125`).
+///
+/// The real checkout is still verified where it matters: under CI
+/// (`CI=true`, which every GitHub job sets) the manifest directory
+/// MUST classify as the workspace, so the callee guard cannot skip
+/// itself into uselessness on the one machine that enforces it. A
+/// packaged build never runs with `CI` set by this repository, and if
+/// a consumer's CI does, the message says exactly which assumption
+/// broke.
+///
+/// The interesting negative is the third: a `.git` above the crate is
+/// exactly what an unpacked package under a consumer's repository has,
+/// and it must NOT read as the Net workspace.
 #[test]
 fn net_workspace_detection_needs_every_layout_marker() {
-    let real = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    assert!(
-        is_net_workspace(real),
-        "the real checkout must classify as the Net workspace, or this guard \
-         skips itself into uselessness"
-    );
-
     let tmp = tempfile::tempdir().expect("temp dir");
     let root = tmp.path();
 
@@ -330,6 +339,49 @@ fn net_workspace_detection_needs_every_layout_marker() {
         "a sibling directory named `wire` is not the Net layout without the member \
          and path-dependency declarations"
     );
+
+    // The member declaration alone is not enough either: the path
+    // dependency is what ties `wire/src/session.rs` to the code this
+    // build links.
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\n    \".\",\n    \"wire\",\n]\n\n[package]\nname = \"net-mesh\"\n\n\
+         [dependencies]\nnet-mesh-wire = { version = \"0.36.0\" }\n",
+    )
+    .expect("write member-only manifest");
+    assert!(
+        !is_net_workspace(root),
+        "a workspace member entry without a path dependency is not the Net layout"
+    );
+
+    // The controlled positive: every marker present, and nothing else
+    // about the location matters (it is a temp dir under a fake `.git`).
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\n    \".\",\n    \"wire\",\n]\n\n[package]\nname = \"net-mesh\"\n\n\
+         [dependencies]\nnet-mesh-wire = { version = \"0.36.0\", path = \"wire\" }\n",
+    )
+    .expect("write complete manifest");
+    assert!(
+        is_net_workspace(root),
+        "a tree with wire/Cargo.toml, the workspace member entry and the path \
+         dependency IS the Net layout, wherever it sits"
+    );
+
+    // Where the guard is enforced, the real checkout must classify —
+    // otherwise the callee test skips on the only machine that runs
+    // it. Outside CI (a developer's packaged build, a consumer's
+    // `cargo test` on the registry crate) this is not asserted, and
+    // the callee test's printed skip is the behaviour.
+    if std::env::var_os("CI").is_some() {
+        let real = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert!(
+            is_net_workspace(real),
+            "CI is set, so this must be the Net checkout, but {real:?} does not \
+             classify as the workspace: the callee drift guard would skip itself \
+             into uselessness here"
+        );
+    }
 }
 
 /// Negative witness: the scan actually fails on a planted call site.
