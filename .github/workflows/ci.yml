@@ -4388,14 +4388,25 @@ jobs:
       - name: Install wasm-bindgen-test-runner
         run: cargo install wasm-bindgen-cli --locked --version "$(cargo metadata --format-version 1 --locked | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "wasm-bindgen"))')"
 
-      # No `--features json`: the wasm build deliberately does not link
-      # serde_json, and this is what keeps that true.
-      - name: Check net-mesh-wire for wasm32
+      # THE LEAN-BUILD GUARD. Featureless and library-only on
+      # purpose: no `json` (so the wasm build links no serde_json), no
+      # `test-vectors` (so it carries no test data). This is the shape
+      # a browser leaf would depend on, and the only step that keeps
+      # it honest — every step below deliberately enables more.
+      - name: Check net-mesh-wire for wasm32 (portable library, no features)
         run: cargo check -p net-mesh-wire --target wasm32-unknown-unknown
 
-      - name: Clippy net-mesh-wire for wasm32
+      # `--all-targets` includes `tests/wasm_wire.rs`, which reads the
+      # package-owned AEAD vector — `net_wire::test_vectors::AEAD_VECTOR`,
+      # behind `test-vectors`. Featureless, this step did not lint the
+      # wasm witnesses at all; it failed to compile them
+      # (`E0433: cannot find test_vectors in net_wire`) and the job went
+      # red. The feature is what makes `--all-targets` actually mean all
+      # targets here; the lean-build property is the step above's job,
+      # not this one's.
+      - name: Clippy net-mesh-wire for wasm32 (all targets, test vectors on)
         if: ${{ !cancelled() }}
-        run: cargo clippy -p net-mesh-wire --target wasm32-unknown-unknown --all-targets -- -D warnings -A clippy::unwrap_used -A clippy::expect_used
+        run: cargo clippy -p net-mesh-wire --target wasm32-unknown-unknown --all-targets --features test-vectors -- -D warnings -A clippy::unwrap_used -A clippy::expect_used
 
       # `--no-tests=fail` has no nextest here (nextest cannot drive a
       # wasm runner), so the grep below is the equivalent guard: a
@@ -4408,8 +4419,10 @@ jobs:
         run: |
           set -o pipefail
           # `test-vectors` carries the package-owned AEAD golden
-          # vector the wasm test replays; the check/clippy steps above
-          # deliberately stay featureless.
+          # vector the wasm test replays — the same feature the
+          # all-targets clippy step above passes, so what CI lints and
+          # what CI runs are the same build. Only the portable-library
+          # check stays featureless.
           out=$(cargo test -p net-mesh-wire --target wasm32-unknown-unknown --features test-vectors 2>&1 | tee /dev/stderr)
           for t in routed_round_trip_runs_on_wasm \
                    clock_reads_do_not_panic_on_wasm \
