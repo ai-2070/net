@@ -40,6 +40,33 @@ original counts were also wrong when written, and are corrected in place
 (marked *corrected*). Line references will drift again — `mesh.rs` is the
 repository's most-edited file.
 
+**Authorization (Kyra, 2026-09-11): Stage 0 and its prerequisite evidence
+ONLY.** The architecture is accepted — WebRTC primary, browser leaf,
+dedicated RTC socket, preserved direct/routed ownership, Noise endpoint
+identity, the explicit UDP-blocked limitation, real-browser spikes before the
+broad refactor. Stages 1–6 are **not** implementation-ready and are not
+authorized by this document. Neither a resolved question list nor a clean
+exit gate is implementation proof.
+
+Six contract defects were found in draft 2 and are repaired in place; each is
+marked at its section and listed in the [Review log](#review-log):
+
+| # | Defect | Repaired in |
+|---|---|---|
+| 1 | The existing invite carries no PSK — "enrollment reuse" was a new credential format | §5 Layer 0, Stage 4 |
+| 2 | Device enrollment is not organization membership; `0x0C04` is dropped by the leaf | §5, §7; v1 scoped to the public-capability path |
+| 3 | Queue admission and later SCTP refusal are different outcomes | §2, §3, Stage 3 |
+| 4 | Session replacement retains no live routed backup | §5 direct path, §9, Stage 3 |
+| 5 | New announcement fields must enter `SignedPayloadCanonical`, not just the derived `Serialize` | Stage 4 |
+| 6 | The serverless hook's startup sequence is incompatible with a routed prerequisite | Stage 5, §Follow-on |
+
+Four acceptance tests were also mis-specified and are corrected: the MITM
+witness (substitute the responder, don't mutate an ignored field), failure
+typing (an ICE timeout is not proof of UDP blocking), the direct-path witness
+(positive receipt plus a forced-relay inverse, not a flat counter alone), and
+relay visibility (`0x0D02` is classifiable in the clear header; only the SDP
+is confidential).
+
 Decision already taken by the product owner: WebRTC is the primary browser
 transport. WebSocket-to-anchor and WebTransport were considered and rejected
 as primaries because both are client-to-server by construction and cannot
@@ -347,18 +374,44 @@ instance, single-threaded, no shared locks:
   (unsolicited, no ICE credentials) or `Rtc::handle_input`; DataChannel
   payloads that come out are Net packets tagged `PeerAddr::Rtc(id)` and are
   pushed to the mesh dispatch context exactly as UDP packets are.
-- **Outbound:** the mesh calls `Transport::try_send(packet, PeerAddr::Rtc(id))`,
-  which is a **non-blocking** push onto a bounded per-peer queue
-  (`RtcConfig::send_queue_packets`, default 256). A full queue returns
-  `WouldBlock`, which the stream layer maps to
-  `StreamError::Backpressure` — the same signal a slow receiver produces
-  today, so daemon policy (drop / retry / app buffer) applies unchanged.
-- **SCTP buffering:** receiver credits bound Net's window, not the browser's
-  or str0m's SCTP send buffer, and fire-and-forget streams have no credit at
-  all. The driver therefore checks the channel's buffered amount before each
-  write and refuses above `RtcConfig::max_buffered_bytes` (default 256 KiB),
-  reporting `Backpressure`. Loss happens at the source, never as unbounded
-  SCTP growth.
+- **Outbound — admission is the ONLY refusal boundary.** The mesh calls
+  `Transport::try_send(packet, PeerAddr::Rtc(id))`, which is a **non-blocking**
+  push onto a bounded per-peer queue (`RtcConfig::send_queue_packets`, default
+  256). The admission decision is synchronous and total: the packet is either
+  refused *now* with `WouldBlock` — which the stream layer maps to
+  `StreamError::Backpressure`, meaning **no packets were enqueued**
+  (`stream.rs:168–170`) — or accepted, after which the call has returned and
+  the caller has already committed credit, sequence and retransmission state
+  (`mesh.rs:39273–39292`: `guard.commit()` then `register_retransmit`).
+
+  **Nothing after acceptance may retroactively become whole-call
+  backpressure** (Kyra, 2026-09-11). Draft 2's §2 promised exactly that: the
+  buffered-amount check ran *after* `try_send` returned, and the trait had no
+  way to hand that refusal back to a completed call. Any later refusal —
+  including `str0m`'s `Channel::write` returning `Ok(false)` **after** a
+  passing buffered-amount precheck — is a post-acceptance event and is handled
+  by post-acceptance policy, never by rewriting the caller's result. Partial-
+  send accounting (the rollback/`try_rollback_tx_seq` path at `mesh.rs:39284+`)
+  is preserved exactly: it belongs to the synchronous boundary.
+- **SCTP buffering is folded into admission, not bolted on after it.** The
+  driver's buffered-amount reading against `RtcConfig::max_buffered_bytes`
+  (default 256 KiB) is an **input to the admission decision** — consulted
+  before `try_send` returns — so an over-buffered channel refuses at the same
+  boundary a full queue does. After acceptance the driver owns the packet
+  under a bounded retention policy that Stage 3 must specify explicitly:
+  how long a queued packet is retained, whether it is retried or dropped on a
+  later `Ok(false)`, and what terminal channel close does to the remainder.
+  Loss still happens at a named point, never as unbounded SCTP growth — but
+  the named point is now honest about *which side of the call* it is on.
+- **Credit and reliability are independent** *(corrected — draft 2 said
+  "fire-and-forget streams have no credit at all", which is wrong)*. An
+  explicitly fire-and-forget stream can carry a receiver window. Stage 3
+  therefore maps pressure behaviour for **every** outbound class, not just
+  `Stream::send`: ordinary events, `0x0D02` signalling, forwarded packets on
+  behalf of other peers, and retransmissions. None of those return
+  `StreamError`, so each needs its own stated disposition (refuse at
+  admission / drop with a counter / defer), and Stage 3's exit criteria assert
+  them.
 - **Timers:** the driver runs `Rtc::poll_output` to completion after every
   input and arms one timer per instance from the returned `Timeout`.
 - **Close / stale work:** closing a channel bumps its `generation`; queued
@@ -382,10 +435,13 @@ Channels open with `ordered: false, maxRetransmits: 0` on both sides.
 - `Reliability::Reliable` streams get NACK-driven retransmission from
   `reliability.rs`, identical to UDP. No retransmission stacking, no
   SCTP head-of-line blocking *from retransmits*.
-- `Reliability::FireAndForget` streams are genuinely lossy.
+- `Reliability::FireAndForget` streams are genuinely lossy in the
+  *retransmission* sense only — dropping a packet is not an error. That is
+  independent of flow control: such a stream may still carry a receiver
+  window, so "fire-and-forget" never implies "uncredited" (§2).
 - What remains underneath and is **not** removed: SCTP congestion control
-  and send buffering. §2's buffered-amount bound is how the plan keeps those
-  from becoming invisible latency.
+  and send buffering. §2's buffered-amount bound — consulted *at admission* —
+  is how the plan keeps those from becoming invisible latency.
 - Stream-window backpressure (`0x0B00`) works unchanged. 8192-byte packet
   cap stays; no fragmentation changes.
 
@@ -413,20 +469,55 @@ build. The corrected sequence has three layers, each authenticated by the
 one below it.
 
 **Layer 0 — bootstrap to an anchor (browser's first session).** The
-application hands the browser an **invite**, the same artefact
-`Mesh::join` devices consume today: `Rendezvous { addr, noise_pubkey,
-node_id }` for the anchor, the PSK, and the delegation `root`. For a browser
-`addr` is the anchor's bootstrap URL. The browser POSTs an SDP offer to
-`https://<anchor>/rtc/offer`, trickles candidates over a short-lived
-WebSocket on the same origin, gets an answer, and opens a DataChannel. Over
-that channel it runs the Noise initiator against the `noise_pubkey` **from
-the invite, not from the HTTP response** — a substituted anchor fails the
-handshake. It then calls the existing enrollment nRPC service with a signed
+application hands the browser a **browser bootstrap credential**. This is a
+**new artefact**, and calling it "the existing invite, reused" was wrong
+(Kyra, 2026-09-11): `InviteToken` carries `root`, `rendezvous`, `nonce` and
+`expires_at` and **no PSK** (`sdk/src/enrollment.rs:216–228`), and
+`Rendezvous`'s own doc states the mesh PSK "is an out-of-band build-time
+property of both nodes, not carried here"
+(`sdk/src/mesh_enroll.rs:47–54`). A browser has no build-time provisioning
+step, so the secret has to come from somewhere named. The credential is
+therefore defined as:
+
+```text
+browser bootstrap credential =
+    InviteToken           (root, rendezvous, nonce, expires_at — unchanged)
+  + anchor Noise static pubkey   (X25519; the key Layer 0 pins)
+  + mesh PSK                     (the NKpsk0 admission secret)
+  + anchor bootstrap URL
+```
+
+Its encoding, minting CLI and expiry rules are a **Stage 4 deliverable with
+its own review**, not an inherited format. The PSK is a standing transport
+secret while the invite `nonce` is single-use, so the two halves have
+different lifetimes and the credential must state both; a design that leaks
+the mesh PSK to every browser that was ever handed a bootstrap credential is
+the failure mode to argue about explicitly, before Stage 4 writes it.
+
+With that in hand: for a browser `rendezvous` is the anchor's bootstrap URL.
+The browser POSTs an SDP offer to `https://<anchor>/rtc/offer`, trickles
+candidates over a short-lived WebSocket on the same origin, gets an answer,
+and opens a DataChannel. Over that channel it runs the Noise initiator
+against the anchor static key **from the credential, not from the HTTP
+response**. It then calls the existing enrollment nRPC service with a signed
 `JoinRequest` and verifies the grant, exactly as a native device does.
 
-*PSK provisioning path, named precisely:* the invite string. Org membership:
-the enrollment grant's delegation chain. Subnet bearer secrets are a separate
-mechanism and are not used for first contact.
+**What enrollment gets you, and what it does not.** Enrollment yields a
+`DelegationChain::derive_device` (`sdk/src/enrollment.rs:836–842`) — device
+admission to the mesh. It is **not** organization membership. Protected
+organization invocation consumes an `OrgMembershipCert`, an
+`OrgDispatcherGrant` and an exact call-binding signature
+(`OrgCallProof`, `behavior/org_call.rs:175–189`), and owner-private services
+are announced only on the encrypted `0x0C04`
+(`SUBPROTOCOL_SCOPED_CAPABILITY_ANN`, `behavior/broadcast.rs:35–44`) — which
+the §7 leaf drops as an unknown subprotocol. **v1 browser scope is therefore
+the PUBLIC capability path**: plaintext `0x0C00` discovery, ordinary nRPC,
+no org-protected calls. Extending a leaf to organization capabilities is a
+separate slice that must provision org credentials, decrypt scoped
+discovery, and construct call proofs — and its gate is one browser
+discovery → protected-invocation witness plus a refusal witness with no
+dispatcher authority. No new authority scheme is needed or permitted; the
+existing one is simply not free.
 
 **Layer 1 — learning a peer's Noise key.** `CapabilityAnnouncement` gains
 `noise_pubkey: Option<[u8; 32]>` with the `reflex_addr` wire-compat
@@ -461,13 +552,40 @@ Origin and target are the session endpoints, never wire fields. SDP is
 opaque. Anchors forward these as ordinary routed packets and cannot read
 them. No key material rides here — it is already established.
 
-**Direct path.** When ICE connects, the direct DataChannel gets its own Noise
-handshake using the already-known key, mirroring the punched-path upgrade
-(`connect_direct → connect_on_direct_path → connect_via` today). The routed
-session is retained as the fallback until the direct one is healthy, then
-handled by the existing punched-path retention policy. Whether a session
-*migration* (routed→direct without a second handshake) is preferable is an
-open question for Stage 3.
+**Direct path — replacement, not a dual session.** When ICE connects, the
+direct DataChannel gets its own Noise handshake using the already-known key,
+mirroring the punched-path upgrade
+(`connect_direct → connect_on_direct_path → connect_via` today).
+
+Draft 2 said "the routed session is retained as the fallback until the direct
+one is healthy." **That is not what the substrate does** (Kyra,
+2026-09-11). The installer replaces the *sole* peer session and removes the
+displaced session's reverse index (`mesh.rs:22050–22103`); the existing
+upgrade protects the incumbent only by *deferring* while streams or unacked
+traffic remain (`mesh.rs:39886–39897`). So the incumbent survives a **failed**
+upgrade — it does not survive a **successful** one. There are never two
+simultaneously usable sessions today.
+
+**The behaviour required of v1, settled now** (the mechanism is still Stage
+3's to choose, per open question 4): direct-path loss must produce either
+(a) explicit interruption followed by routed reconnection, or (b) continuity
+through a migration mechanism designed and reviewed as such. Silent
+half-working fallback is excluded. The default this plan assumes is (a) —
+fresh-session replacement with quiescence, then routed reconnection on
+direct loss — because it is what the installer already implements.
+
+**Required delivery witness** (Stage 3, harness; Stage 6, browsers). Not ICE
+state — actual traffic, in this order:
+
+```text
+routed delivery
+→ authenticated direct delivery
+→ forced direct failure
+→ restored routed delivery
+```
+
+ICE reaching `connected` is not the health gate and must not be asserted as
+one.
 
 **Bootstrap endpoint budget.** Per-source-IP rate limit with the shape
 Finding 5 in [`NAT_TRAVERSAL_V2_PLAN.md`](NAT_TRAVERSAL_V2_PLAN.md)
@@ -512,10 +630,20 @@ logic never runs.
 This is **not** TURN. A browser on a UDP-blocked network cannot reach its
 anchor either, because that DataChannel is also ICE-over-UDP. v1 therefore
 declares such networks **unsupported**: bootstrap fails within
-`RtcConfig::ice_deadline` (default 10 s) with a typed `RtcError::UdpBlocked`
-that `@net-mesh/browser` surfaces to the application. ICE-TCP passive
-candidates on anchors are the candidate future mechanism (str0m support to
-be verified in Stage 0) and are listed under deferred work, not promised.
+`RtcConfig::ice_deadline` (default 10 s) with a typed error that
+`@net-mesh/browser` surfaces to the application. **That error is
+`RtcError::IceTimeout`, not `UdpBlocked`, unless the narrower cause is
+actually established** (Kyra, 2026-09-11): an unreachable or misconfigured
+anchor produces an identical timeout, and reporting "your network blocks
+UDP" for a broken anchor sends the operator to the wrong place. `UdpBlocked`
+requires distinguishing evidence — e.g. STUN reachable but every candidate
+pair failing, versus nothing at all reachable. If v1 cannot produce that
+evidence, it reports the timeout and says so.
+
+ICE-TCP passive candidates on anchors are the candidate future mechanism
+(str0m support to be verified in Stage 0) and are listed under deferred
+work, not promised.
+
 "100 % of sessions established" is a Stage 6 exit criterion **only over
 pairs whose anchors are reachable**.
 
@@ -613,11 +741,15 @@ A wants B, discovered by capability query like any native pair:
    flow back the same way; anchors forward blind.
 4. ICE connects using the anchors' STUN; a direct DataChannel opens; a Noise
    handshake runs over it; `PeerTransport` for B becomes
-   `Direct { owned: PeerAddr::Rtc(id) }`. A leaf has no routing table, so
-   this is a session-table update, not a route install.
-5. If ICE fails within `ice_deadline`, the routed session stays,
-   `ice_relayed += 1`, and ICE is retried only on a browser network-change
-   event or the periodic reclassify tick — never per packet.
+   `Direct { owned: PeerAddr::Rtc(id) }`, **replacing** the routed session
+   rather than joining it (§5, "replacement, not a dual session"). A leaf
+   has no routing table, so this is a session-table update, not a route
+   install.
+5. On later direct loss, B is re-reached by routed reconnection through an
+   anchor — an explicit interruption, not a silent failover.
+6. If ICE never connects within `ice_deadline`, the routed session is simply
+   never replaced, `ice_relayed += 1`, and ICE is retried only on a browser
+   network-change event or the periodic reclassify tick — never per packet.
 
 A native node with `webrtc` on follows the same steps when its peer is a
 leaf.
@@ -629,11 +761,24 @@ leaf.
 `signal_forwarded`. `ice_direct / ice_attempted` is the deployment
 telemetry; it is reported, not gated.
 
-The **witness** that a pair is off the anchor is per-pair: the anchor's
-forwarded-packet counter keyed by `(src, dst)` for *application-data*
-subprotocols stays flat while the pair exchanges traffic. A globally flat
-anchor counter is not the witness — signalling, announcements and unrelated
-pairs legitimately keep flowing.
+The **witness** that a pair is off the anchor has three parts, because a flat
+counter alone is also what dropped traffic looks like (Kyra, 2026-09-11):
+
+1. **Positive receipt over the selected direct connection** — the payload
+   arrives, and the receiver attributes it to the direct endpoint.
+2. **A flat per-pair anchor counter** — the anchor's forwarded-packet
+   counter keyed by `(src, dst)` for *application-data* subprotocols stays
+   flat while that traffic flows. A globally flat anchor counter is not the
+   witness: signalling, announcements and unrelated pairs legitimately keep
+   flowing.
+3. **An inverse forced-relay phase** — force the pair back onto the anchor
+   and assert the same counter *increments*. Without this leg, part 2 cannot
+   distinguish "direct" from "broken".
+
+Anchor-side classification is viable as designed: `subprotocol_id` is a
+cleartext, AAD-authenticated header field (`protocol.rs:171`, folded into the
+AAD at `:357`), so an anchor can count `0x0D02` separately from
+application data **without** decoding the SDP it carries.
 
 ### 11. Registry additions
 
@@ -691,7 +836,10 @@ modules keep `SocketAddr` at their edges.
   edits allowed, assertion and coverage preserved, witness diffs reviewed
   line by line.
 - `cargo clippy --lib --bins -- -D warnings` clean.
-- Default build: exported C-ABI symbol set unchanged (symbol diff in CI).
+- Default build: exported C-ABI symbol set unchanged. **Stage 1 owns this
+  job**: establish the symbol baseline and the comparison *before* the
+  endpoint refactor lands, so the criterion can actually fail. It is a stage
+  deliverable, not unowned infrastructure.
 
 ## Stage 2 — `net-wire` crate + `Clock`
 
@@ -702,7 +850,9 @@ the new optional fields).
 
 ### Exit criteria
 
-- `cargo check -p net-wire --target wasm32-unknown-unknown` in CI.
+- `cargo check -p net-wire --target wasm32-unknown-unknown` in CI. **Stage 2
+  owns that job and the target installation** — a stage deliverable, not
+  unowned infrastructure.
 - `cargo test -p net-wire` runs the crypto, protocol, reliability and
   session unit tests natively.
 - No behaviour change under default features; no `use` path in the core or
@@ -722,33 +872,59 @@ the new optional fields).
 
 - Those files pass with the peer on `PeerAddr::Rtc`, including the
   stale-session and direct/routed migration witnesses.
-- Full-queue and over-buffer conditions surface as `Backpressure`, never as
-  blocking or unbounded growth (test with an injected slow DataChannel).
+- Admission refuses — full queue OR over-buffer — surface as
+  `Backpressure` *from `try_send` itself*, with no packets enqueued and no
+  credit committed; nothing refuses after acceptance (§2). Test with an
+  injected slow DataChannel, and separately with a `Channel::write` stub
+  returning `Ok(false)` after a passing precheck: that path must exercise the
+  post-acceptance retention policy and must NOT surface as whole-call
+  backpressure.
+- Every non-`Stream::send` outbound class (events, `0x0D02` signalling,
+  forwarding, retransmission) has its stated pressure disposition asserted.
+- The §5 delivery sequence — routed → authenticated direct → forced direct
+  failure → restored routed — passes on the loopback harness.
 - External `stunclient` gets a correct XOR-MAPPED-ADDRESS from the RTC
   socket; the Net socket's ingress tests are byte-for-byte unchanged with
   `webrtc` on.
 - Default build unchanged; `--features webrtc` clean under `-D warnings`.
 
-## Stage 4 — Announcement fields, `0x0D02`, bootstrap, enrollment reuse
+## Stage 4 — Announcement fields, `0x0D02`, bootstrap credential + listener
 
-- `noise_pubkey` / `rtc_bootstrap` / `rtc_addr` on the announcement (emission
-  off by default, OA-1 migration pattern); `PairAction::Ice`.
+- `noise_pubkey` / `rtc_bootstrap` / `rtc_addr` on the announcement, added to
+  the **hand-maintained canonical signer** `SignedPayloadCanonical`
+  (`behavior/capability.rs:2402–2463`; signed via `serde_json::to_vec` at
+  `:2634`) — **not** merely to the derived `Serialize`. That serializer is
+  where the signature preimage is actually produced, and its own doc warns
+  that field order, names and `skip_serializing_if` must match the struct
+  declaration exactly; adding a field to one and not the other silently
+  breaks signing or wire compat. Emission off by default (OA-1 migration
+  pattern); `PairAction::Ice`.
 - `0x0D02` codec, dispatch, forwarding, per-sender budget.
 - Bootstrap HTTPS/WebSocket listener (`axum` + the payments crate's pinned
-  rustls), feature-gated; invite decoding for the RTC `Rendezvous` form;
-  `Mesh::join` over a DataChannel session.
+  rustls), feature-gated; **the browser bootstrap credential** of §5 Layer 0
+  — its encoding, minting path and expiry rules, reviewed as a new credential
+  format, not as invite reuse; `Mesh::join` over a DataChannel session.
 - `net-mesh anchor` CLI subcommand; Deck surfaces anchors and their
   `rtc_addr`.
 
 ### Exit criteria
 
-- A native node with `webrtc` on completes invite → offer/answer →
-  DataChannel → Noise (against the invite's key) → enrollment grant with a
-  scripted Chromium client.
-- A wrong `noise_pubkey` in the HTTP answer (MITM simulation) fails the
-  handshake; the invite's key is the only one honoured.
-- Signalling between two nodes sharing no direct session is delivered via
-  an intermediate anchor; a test asserts the anchor never decodes `0x0D02`.
+- A native node with `webrtc` on completes bootstrap-credential →
+  offer/answer → DataChannel → Noise (against the credential's pinned anchor
+  key) → enrollment grant with a scripted Chromium client.
+- **MITM witness, correctly shaped.** Mutating a key in the HTTP response
+  proves nothing — that field is ignored by construction. The test must
+  substitute the actual responder with one that does **not** hold the
+  credential-pinned static private key, and assert the Noise handshake fails.
+- **Canonical-signer witnesses:** tampering with each of the three new fields
+  invalidates the signature; an announcement with all three absent produces
+  byte-identical signed bytes to the pre-field form; announcement encoding
+  remains JSON.
+- Signalling between two nodes sharing no direct session is delivered via an
+  intermediate anchor; a test asserts the anchor never reads the **SDP**. It
+  may legitimately *classify* the packet as `0x0D02` — `subprotocol_id` is a
+  cleartext AAD-authenticated header field (`protocol.rs:171`, `:357`) — so
+  the assertion is about payload confidentiality, not id obscurity.
 - Bootstrap budget rejections are typed and fast.
 - An anchor behind a simulated NAT publishes a working `rtc_addr` via
   `public_addr` or port mapping.
@@ -764,21 +940,38 @@ the new optional fields).
   behind one trait. `AnchorControlPlane` (DataChannel to a native anchor,
   §5) is the only v1 implementation. The trait exists so the serverless
   follow-on (§Follow-on) is a second implementation, not a refactor; it
-  must not leak `PeerAddr::Rtc` or any anchor-specific type.
+  must not leak `PeerAddr::Rtc` or any anchor-specific type. **The trait
+  alone does not reconcile the two startup sequences** (Kyra, 2026-09-11):
+  the native §5 path requires a routed A↔B Noise session *before* signalling,
+  while serverless Tier A promises signalling and discovery with no relay,
+  and therefore cannot establish that prerequisite. Stage 5 must specify the
+  **session-independent signalling path** that makes an anchorless start
+  possible, or the follow-on is a refactor after all.
 - `cross_lang_wire` replay inside the wasm test runner.
 - Playwright CI: Chromium + Firefox against a native anchor — handshake,
   reliable round-trip, fire-and-forget loss under injected DataChannel loss,
   nRPC to a native service, a native peer's `find_best_node` returning the
   browser node, two tabs sharing one identity without evicting each other,
-  `RtcError::UdpBlocked` surfaced promptly under a UDP-blocked profile.
+  and a prompt **typed** failure under a UDP-blocked profile. **Stage 5 owns
+  the browser runner and matrix** — a stage deliverable, not unowned
+  infrastructure.
+- **Failure typing, corrected.** An ICE timeout does not prove UDP blocking:
+  an unreachable, misconfigured or overloaded anchor produces the same
+  symptom. The surfaced result stays a typed timeout/unreachable
+  (`RtcError::IceTimeout`) unless the narrower cause is actually established;
+  `RtcError::UdpBlocked` is reserved for evidence that distinguishes it.
 
 ### Exit criteria
 
 - All scenarios green on Chromium and Firefox; Safari best-effort, recorded.
 - Bundle and wasm sizes recorded; wasm ≤ 1.5 MB gzipped target.
-- A mock `ControlPlane` (in-memory, no anchor) drives the leaf through
-  handshake and one direct browser ↔ browser session in the wasm test
-  runner, proving the trait boundary is complete.
+- The anchorless mock `ControlPlane` (in-memory, no anchor) drives the leaf
+  through handshake and one direct browser ↔ browser session in the wasm test
+  runner. To count, it must be **genuinely anchorless**: no forwarding of
+  pre-direct Net packets behind the mock, and every input it needs —
+  identity, keys, admission — explicitly provisioned by the test. A mock that
+  quietly relays is a re-implementation of the anchor and proves nothing
+  about the trait boundary.
 
 ## Stage 6 — Browser ↔ browser direct, NAT conformance, telemetry, demo
 
@@ -790,9 +983,11 @@ the new optional fields).
   and one anchor. **Prerequisite, checked 2026-09-11:** that harness is
   recorded as *"landed, pending first CI run"* — authored blind on a macOS box,
   with only its loopback halves verified locally and the netns halves never
-  executed. `natsim.yml` exists. One green `natsim` run must exist before this
-  stage extends the harness, or the browser matrix inherits an unproven
-  substrate.
+  executed. `natsim.yml` exists. **Check for a green run at the relevant
+  revision first; if there is none, dispatch the existing workflow before
+  authoring the browser extension.** Execution is cheap, but a failed
+  environment or a broken simulator is repair work with its own cost — do not
+  treat this as free.
 - **Field telemetry:** `ice_direct / ice_attempted` exported through the
   existing stats surface and Deck; documented as a deployment metric with
   its own denominator.
@@ -855,26 +1050,60 @@ the new optional fields).
 
 ---
 
-## Open questions
+## Open questions — dispositions (Kyra, 2026-09-11)
 
-1. **Anchor placement policy.** Every `webrtc`-enabled native node, or only
-   operator-marked ones? Proposal: `serve_bootstrap` opt-in; STUN automatic
-   for any node with a published `rtc_addr`. Decide before Stage 4.
-2. **Leaf announcement TTL.** A closed tab cannot withdraw. Proposal: 60 s
-   TTL with 20 s re-announce for `leaf`-tagged entries; check against the
-   announce rate limit.
-3. **Anchors per leaf.** One anchor is a single point of failure for
-   signalling and fallback. Proposal: bootstrap to one, learn others from
-   `rtc-anchor` announcements, hold `min(3, n)` sessions. Affects Stage 5.
-4. **Direct-path session: fresh handshake or migration?** §5 mirrors the
-   punched-path upgrade (fresh handshake). A routed→direct *migration* of
-   the same session would save a round-trip and a key; decide in Stage 3
-   once the harness exists.
-5. **Identity lifetime for browsers.** Same-origin XSS owns the identity
-   (§8). Whether leaf identities need shorter certificate lifetimes under
-   the org revocation floors is an org-auth question, tracked against OA-4.
-6. **Safari.** `maxRetransmits: 0` semantics and ICE restart differ; Stage 5
-   records behaviour and Stage 6 decides whether it gates.
+Four are **closed** as recorded policy; two stay at their evidence gates.
+Closing these does **not** discharge the implementation defects in the
+[Review log](#review-log) — that is a separate repair list.
+
+1. **Anchor placement — CLOSED: explicitly operator-selected.** Compiling
+   `webrtc`, or enabling browser connectivity, does **not** make a node a
+   public anchor. `serve_bootstrap` is opt-in. Publishing an `rtc_addr` as a
+   STUN endpoint requires its responder to be enabled and reachable. An
+   ordinary WebRTC-capable native provider need not accept bootstrap
+   traffic. Browser connectivity and volunteering public infrastructure stay
+   separate decisions.
+2. **Leaf announcement TTL — CLOSED: 60 s TTL, 20 s re-announce, both
+   configurable.** One wording correction to the proposal: 3× gives more
+   missed-refresh margin than the native 2× (`DEFAULT_TTL_SECS` 300 /
+   `capability_reannounce_interval` 150) — it is *not* a stricter invariant.
+   Cost, sized not certified: the refresh-frequency increase is 7.5×, so at
+   1,000 leaves that is ~50 distinct refresh announcements per second, ~150
+   submissions per second if each leaf sends every refresh to three anchors,
+   plus mesh forwarding that depends on topology and duplicate suppression.
+   Enough to pick a default; not enough to certify deployment cost — measure
+   serialized bytes, verification work and forwarded copies in a
+   representative deployment. **And the bound is on stale discovery only:**
+   announcement TTL is not authority and not live-session failure detection,
+   and must never become permission to use a dead or revoked peer for
+   another minute.
+3. **Anchors per leaf — CLOSED: `min(3, n)` is a target, not a startup
+   requirement.** Bootstrap through one; replenish toward the target as
+   eligible anchors become known; never delay a usable direct connection
+   waiting for three. Prefer independent failure domains where that is
+   knowable — three processes behind one failed uplink are not redundancy.
+   No placement subsystem. This belongs in the `ControlPlane` lifecycle
+   **before the trait freezes** in Stage 5.
+4. **Direct-path mechanism — OPEN at Stage 3, but the required behaviour is
+   settled now.** Direct-path loss must produce either explicit interruption
+   followed by routed reconnection, or continuity through a supported
+   migration mechanism. The harness may choose how; it may not decide
+   afterwards what "fallback" was supposed to mean. Single-session
+   replacement must never be described as retaining a simultaneously usable
+   routed backup (§5).
+5. **Browser identity lifetime — CLOSED: keep the persistent browser
+   identity; no blanket short-lived-identity policy.** Use the existing
+   membership lifecycle and revocation with bounded, capability-specific
+   dispatch authority. Shortening every membership certificate is not an XSS
+   remedy: hostile same-origin code can use live authority and may also reach
+   the renewal machinery, so short grants help only where renewal and
+   issuance enforce a separate boundary. Managed browser nodes use the
+   existing managed membership policy; ephemeral guest identities are an
+   explicit application option. **No browser-specific identity-rotation
+   subsystem in this plan.**
+6. **Safari — OPEN, evidence-gated.** Record exact tested versions and
+   behaviours from the real leaf; decide support status from that, not from
+   transport folklore.
 
 ---
 
@@ -968,14 +1197,22 @@ DataChannels, Noise end to end, the same wire.
 | Discovery / announcement flooding (§7) | The same object stores signed announcements; tabs subscribe. Announcements are self-authenticating (entity signature), so the store is dumb and the leaf verifies on receipt | small–medium |
 | STUN (§6) | A third-party STUN server, configured as `iceServers`. Serverless cannot answer UDP. **Policy relaxation, one config line** | trivial |
 | Relay fallback for ICE failures (§6) | Net packets over the room object's WebSocket, Noise-opaque to it; or a managed TURN. The only place a Net packet touches a WebSocket, and only for the failure case | medium |
-| Enrollment / admission (§5 Layer 0) | `net-wire` compiled to wasm inside the worker runs the enrollment handler; the delegation root lives in the platform secret store | medium–large |
+| Enrollment / admission (§5 Layer 0) | The enrollment handler is **SDK code, not wire code** — porting it to the worker runtime is its own scoped work, not a consequence of `net-wire` targeting wasm; the delegation root lives in the platform secret store | medium–large |
 
-**Why it is additive.** `net-wire` already targets wasm, so it runs inside
-Workers as well as browsers. Signed announcements need no trusted store.
-`PeerAddr` gains a `Ws` variant used only by the leaf's control plane and
-the relay fallback. The invite / enrollment flow is unchanged. The framing
-"anchors are how browsers *find* each other" holds exactly — only the
-finder moves.
+**Why it is additive.** `net-wire` targets wasm, so it runs inside Workers as
+well as browsers. Signed announcements need no trusted store. `PeerAddr`
+gains a `Ws` variant used only by the leaf's control plane and the relay
+fallback. The framing "anchors are how browsers *find* each other" holds
+exactly — only the finder moves.
+
+**Two corrections to that claim** (Kyra, 2026-09-11). First, compiling
+`net-wire` to wasm does **not** hand the worker an enrollment handler: that
+service lives in the SDK, not the wire layer, so its portability is
+follow-on work to be scoped, not a free consequence of the crate split.
+Second, "the invite / enrollment flow is unchanged" no longer holds — v1
+introduces a browser bootstrap credential (§5 Layer 0), and the follow-on
+inherits that artefact, including the question of where its PSK lives when
+there is no always-on anchor to hold one.
 
 **What it costs, honestly.**
 
@@ -1073,3 +1310,31 @@ commit), and the fact that the NAT simulator Stage 6 extends has never had a
 green CI run (Stage 6). §Dependencies now also records the three CI
 capabilities the plan's exit criteria assume and the repository lacks: wasm32,
 Playwright, and an exported-symbol diff.
+
+**2026-09-11 — Kyra, source-checked review of revision 2 (read at
+`18e73e4dbf0a35cbfe5ea06de7c1edb7a9d64d62`).** Verdict: architecture right,
+not implementation-ready; **authorize the bounded Stage 0 spikes only**. Kept
+without change: WebRTC primary, browser leaf, dedicated RTC socket, preserved
+direct/routed ownership, Noise endpoint identity, the explicit UDP-blocked
+limitation, and real-browser spikes before the broad refactor. Every citation
+below was re-verified against this tree before applying.
+
+| # | Finding | Verified at | Applied as |
+|---|---|---|---|
+| 1 | The existing invite does **not** contain the PSK — `InviteToken` is `root`/`rendezvous`/`nonce`/`expires_at`, and `Rendezvous`'s own doc calls the PSK an out-of-band build-time property | `sdk/src/enrollment.rs:216–228`, `sdk/src/mesh_enroll.rs:47–54` | §5 Layer 0 defines an explicit **browser bootstrap credential** (invite + anchor static key + PSK + bootstrap URL) as a NEW format with its own Stage 4 review; the "unchanged enrollment reuse" claim is withdrawn |
+| 2 | Device enrollment ≠ organization membership: enrollment yields `DelegationChain::derive_device`, while protected invocation needs `OrgMembershipCert` + `OrgDispatcherGrant` + call-binding signature; owner-private services announce only on `0x0C04`, which the leaf drops | `sdk/src/enrollment.rs:836–842`, `behavior/org_call.rs:175–189`, `behavior/broadcast.rs:35–44` | §5 scopes v1 to the **public-capability path**; org capabilities become a separate slice gated on one discovery→invocation witness plus a no-dispatcher-authority refusal witness |
+| 3 | Queue admission and a later SCTP refusal are different outcomes; `StreamError::Backpressure` means *nothing was enqueued*, while a returned `try_send` has already committed credit and retransmission state — and `Channel::write` can return `Ok(false)` after a passing precheck | `stream.rs:168–170`, `mesh.rs:39273–39292` | §2 makes bounded admission the single synchronous refusal boundary, folds the buffered-amount check into it, and assigns post-acceptance retention/retry/drop/close to Stage 3; partial-send accounting preserved. §3's "fire-and-forget has no credit" corrected — credit and reliability are independent |
+| 4 | Session replacement does not retain a live routed backup: the installer replaces the sole session and drops the displaced reverse index; the upgrade protects the incumbent only by *deferring* while streams/unacked remain | `mesh.rs:22050–22103`, `mesh.rs:39886–39897` | §5 and §9 state replacement, not dual-session; the required behaviour (interruption + routed reconnection, or a designed migration) is settled now, with the delivery-sequence witness routed → direct → forced failure → restored routed |
+| 5 | The signature preimage comes from a hand-maintained `SignedPayloadCanonical`, not the derived `Serialize` | `behavior/capability.rs:2402–2463`, signed at `:2634` via `serde_json::to_vec` | Stage 4 names that serializer in the implementation contract and requires the three witnesses: per-field tamper invalidation, all-absent byte identity, JSON encoding retained |
+| 6 | The serverless hook is startup-incompatible: the native path needs a routed A↔B session before signalling, which Tier A cannot establish; and `net-wire`-on-wasm does not supply the enrollment handler (it is SDK code) | plan §5 vs §Follow-on | Stage 5 must specify the session-independent signalling path and prove it with a **genuinely anchorless** mock (no pre-direct packet forwarding, explicit identity/key/admission provisioning); §Follow-on's portability claim corrected |
+| — | Acceptance-test corrections: MITM must substitute the responder, not mutate an ignored field; an ICE timeout is not proof of UDP blocking; a flat anchor counter alone can mean dropped traffic; `0x0D02` *is* classifiable in the clear header, only the SDP is confidential | `protocol.rs:171`, `:357` | Stage 4 exit criteria; §6 typed failure; §10 three-part witness incl. forced-relay inverse |
+
+**Dispositions and sequencing recorded the same day.** Open questions 1, 2, 3
+and 5 closed as policy (see §Open questions — dispositions); 4 and 6 stay at
+their evidence gates, with 4's *required behaviour* fixed now. Missing CI
+jobs are assigned to their consuming stages — Stage 1 owns the exported-symbol
+baseline, Stage 2 the wasm target, Stage 5 the browser runner — rather than
+forming an unowned infrastructure lane. `mesh.rs` sequencing: Stage 0 →
+bounded UDP-only Stage 1 → leader implementation, justified by avoiding
+overlapping structural edits, **not** by Stage 1 being harmless; "browser
+first" must not expand into Stages 2–6 before returning to sensing/OLB.
