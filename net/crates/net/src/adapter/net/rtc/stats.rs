@@ -37,6 +37,8 @@ pub struct RtcStats {
     admission_promoted: AtomicU64,
     close_notify_deferred: AtomicU64,
     close_notify_redelivered: AtomicU64,
+    admission_reservation_retired: AtomicU64,
+    admission_promotion_orphaned: AtomicU64,
     admission_rejected_outcome: AtomicU64,
     admission_reclaimed: AtomicU64,
     signal_over_budget: AtomicU64,
@@ -164,6 +166,16 @@ impl RtcStats {
         close_notify_deferred,
         note_close_notify_deferred,
         "Channel closes the mesh's notification channel could not take immediately. Recorded on the slot and re-offered on a later driver turn (H3) — not discarded."
+    );
+    counter!(
+        admission_reservation_retired,
+        note_admission_reservation_retired,
+        "Enrollment reservations retired because their session was evicted or replaced (R2). A late completion for one of these promotes nothing."
+    );
+    counter!(
+        admission_promotion_orphaned,
+        note_admission_promotion_orphaned,
+        "Enrollment completions that found no reservation of their own (R2) - a retired call, or a response for a call that was never authorized."
     );
     counter!(
         admission_rejected_outcome,

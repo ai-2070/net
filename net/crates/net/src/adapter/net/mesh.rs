@@ -10833,7 +10833,15 @@ pub struct MeshNode {
     /// delayed completion whose session was replaced promotes
     /// nothing.
     #[cfg(feature = "webrtc")]
-    pending_promotions: Arc<DashMap<u64, (u64, PeerAddr)>>,
+    /// Enrollment reservations keyed by `(node_id, session_id,
+    /// call_id)` (R2).
+    ///
+    /// It was keyed by node id alone, so a second REQUEST
+    /// overwrote the first's reservation and the first call's
+    /// success then consumed — and promoted — the *replacement*
+    /// session (Kyra: `old_success_promoted_replacement=true`).
+    /// A completion now consumes only its own call's reservation.
+    pending_promotions: Arc<DashMap<(u64, u64, u64), PeerAddr>>,
     /// Dialogs this node is driving (plan §9 steps 3–6).
     #[cfg(feature = "webrtc")]
     rtc_dialogs: super::rtc::SharedDialogs,
@@ -25348,6 +25356,9 @@ impl MeshNode {
         let ctx = self.peer_eviction_ctx();
         let registrations = Arc::clone(&self.pending_direct_initiators);
         let transport = self.rtc_driver.as_ref().map(|d| Arc::clone(d.transport()));
+        // R2: the notifier retires the evicted peer's enrollment
+        // reservations, which needs the node itself.
+        let mesh_for_eviction = Arc::clone(&self.self_weak);
         #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
         let paused = Arc::clone(&self.rtc_close_consumer_paused);
         let shutdown = self.shutdown.clone();
@@ -25379,10 +25390,29 @@ impl MeshNode {
                     inbox.close();
                 }
                 match ctx.evict_endpoint(PeerAddr::Rtc(id)) {
-                    Some(node_id) => tracing::debug!(
-                        node_id = format!("{node_id:#x}"),
-                        "rtc channel closed; peer evicted"
-                    ),
+                    Some(node_id) => {
+                        // R2: the peer is gone, so every
+                        // reservation it held is retired — a late
+                        // completion for one of them promotes
+                        // nothing and is counted.
+                        //
+                        // Defence in depth, honestly scoped: the
+                        // key already carries the session id, so a
+                        // late completion for a dead incarnation
+                        // fails `promote_admission` anyway and
+                        // removing this arm alone leaves the
+                        // witnesses green (§12: R2b). It exists so
+                        // the retirement is *counted* rather than
+                        // inferred, and so reservations do not
+                        // accumulate per dead peer.
+                        if let Some(mesh) = mesh_for_eviction.get().and_then(|w| w.upgrade()) {
+                            mesh.retire_enrollment_reservations(node_id);
+                        }
+                        tracing::debug!(
+                            node_id = format!("{node_id:#x}"),
+                            "rtc channel closed; peer evicted"
+                        );
+                    }
                     // R-B: nothing installed on that endpoint *yet*,
                     // but an installer holds an intent on it — its
                     // publish may land after this. Re-arm the close
@@ -28393,6 +28423,10 @@ impl MeshNode {
                             continue;
                         }
                         disp(crate::adapter::net::cortex::RpcInboundEvent {
+                            // R2: the incarnation that carried this
+                            // request, not whatever is installed
+                            // when the bridge drains it.
+                            session_id: session.session_id(),
                             channel_hash: canonical,
                             origin_hash,
                             from_node,
@@ -28417,6 +28451,7 @@ impl MeshNode {
                                 (matching.next(), matching.next())
                             {
                                 disp(crate::adapter::net::cortex::RpcInboundEvent {
+                                    session_id: session.session_id(),
                                     channel_hash: *canonical,
                                     origin_hash,
                                     from_node,
@@ -28428,6 +28463,7 @@ impl MeshNode {
                             // the legacy fan-out to every candidate.
                             for (canonical, disp) in &pairs {
                                 disp(crate::adapter::net::cortex::RpcInboundEvent {
+                                    session_id: session.session_id(),
                                     channel_hash: *canonical,
                                     origin_hash,
                                     from_node,
@@ -34727,18 +34763,149 @@ impl MeshNode {
         true
     }
 
+    /// Arm an enrollment reservation exactly as the gate does
+    /// (R2 witness seam).
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    pub fn arm_enrollment_reservation_for_test(
+        &self,
+        node_id: u64,
+        session_id: u64,
+        endpoint: PeerAddr,
+        call_id: u64,
+    ) {
+        self.pending_promotions
+            .insert((node_id, session_id, call_id), endpoint);
+    }
+
+    /// Replace this peer's provisional session with a fresh
+    /// incarnation on the same endpoint, returning the new session
+    /// id (R2 witness seam: the reconnection Kyra's probe performs
+    /// over the wire, without the reconnect).
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    pub fn replace_provisional_for_test(&self, node_id: u64, endpoint: PeerAddr) -> u64 {
+        let mut entry = self
+            .peers
+            .get_mut(&node_id)
+            .expect("the peer must be installed");
+        let keys = super::crypto::SessionKeys {
+            tx_key: [0x11u8; 32],
+            rx_key: [0x22u8; 32],
+            session_id: super::current_timestamp_micros() | 1,
+            remote_static_pub: [0u8; 32],
+            route_hop_tx_key: [0u8; 32],
+            route_hop_rx_key: [0u8; 32],
+        };
+        let session = Arc::new(NetSession::new(
+            keys,
+            endpoint,
+            self.config.packet_pool_size,
+            self.config.default_reliable,
+        ));
+        let session_id = session.session_id();
+        entry.value_mut().session = session;
+        self.retire_enrollment_reservations(node_id);
+        session_id
+    }
+
+    /// Drive the response half by call id (R2 witness seam).
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    pub fn promote_on_enrollment_response_for_test(&self, node_id: u64, call_id: u64) -> bool {
+        let origin = self
+            .provisional_reply_origin(node_id)
+            .unwrap_or_else(|| self.bind_origin_for_test(node_id));
+        self.promote_on_enrollment_response(
+            node_id,
+            &super::rtc::enroll_reply_channel(origin),
+            call_id,
+        )
+    }
+
+    /// Drive the rejection half by call id (R2 witness seam).
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    pub fn note_enrollment_rejected_for_test(&self, node_id: u64, call_id: u64) {
+        let origin = self
+            .provisional_reply_origin(node_id)
+            .unwrap_or_else(|| self.bind_origin_for_test(node_id));
+        self.note_enrollment_rejected(node_id, &super::rtc::enroll_reply_channel(origin), call_id);
+    }
+
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    fn bind_origin_for_test(&self, node_id: u64) -> u64 {
+        let origin = 0x4B59_5241_0000_0001u64;
+        Self::bind_provisional_origin_locked(node_id, origin, &self.peers);
+        origin
+    }
+
+    /// The `call_id` an nRPC frame carries, read from its
+    /// `EventMeta` prefix (R2).
+    #[cfg(feature = "webrtc")]
+    fn rpc_call_id_of(frame: &Bytes) -> u64 {
+        use super::cortex::{EventMeta, EVENT_META_SIZE};
+        if frame.len() < EVENT_META_SIZE {
+            return 0;
+        }
+        // The request's `call_id` rides in `seq_or_ts` (see
+        // `EventMeta::new` at the client's publish site).
+        EventMeta::from_bytes(&frame[..EVENT_META_SIZE]).map_or(0, |meta| meta.seq_or_ts)
+    }
+
+    /// Consume the reservation for **this** `(node, call)` — and
+    /// only it (R2). `None` when the call holds none.
+    #[cfg(feature = "webrtc")]
+    fn take_enrollment_reservation(&self, node_id: u64, call_id: u64) -> Option<(u64, PeerAddr)> {
+        let key = self
+            .pending_promotions
+            .iter()
+            .map(|e| *e.key())
+            .find(|(node, _, call)| *node == node_id && *call == call_id)?;
+        let (_, endpoint) = self.pending_promotions.remove(&key)?;
+        Some((key.1, endpoint))
+    }
+
+    /// Retire every reservation this node holds (R2): the peer was
+    /// evicted or replaced, so a late success or rejection for it
+    /// must be a counted no-op rather than a promotion.
+    #[cfg(feature = "webrtc")]
+    pub(crate) fn retire_enrollment_reservations(&self, node_id: u64) {
+        let keys: Vec<(u64, u64, u64)> = self
+            .pending_promotions
+            .iter()
+            .map(|e| *e.key())
+            .filter(|(node, _, _)| *node == node_id)
+            .collect();
+        for key in keys {
+            if self.pending_promotions.remove(&key).is_some() {
+                if let Some(stats) = self.rtc_driver.as_ref().map(|d| d.stats()) {
+                    stats.note_admission_reservation_retired();
+                }
+            }
+        }
+    }
+
     /// §12 step 4, the response half: an enrollment call that
     /// produced a response promotes the incarnation captured at its
-    /// REQUEST decode — and only that one.
+    /// own REQUEST decode — and only that one (R2).
     #[cfg(feature = "webrtc")]
-    pub(crate) fn promote_on_enrollment_response(&self, node_id: u64, reply_channel: &str) -> bool {
+    pub(crate) fn promote_on_enrollment_response(
+        &self,
+        node_id: u64,
+        reply_channel: &str,
+        call_id: u64,
+    ) -> bool {
         let Some(origin) = self.provisional_reply_origin(node_id) else {
             return false;
         };
         if reply_channel != super::rtc::enroll_reply_channel(origin) {
             return false;
         }
-        let Some((_, (session_id, endpoint))) = self.pending_promotions.remove(&node_id) else {
+        let Some((session_id, endpoint)) = self.take_enrollment_reservation(node_id, call_id)
+        else {
+            // Not this call's reservation to spend. A completion
+            // whose own reservation was retired (eviction,
+            // replacement, timeout) promotes nothing.
+            if let Some(stats) = self.rtc_driver.as_ref().map(|d| d.stats()) {
+                stats.note_admission_promotion_orphaned();
+            }
             return false;
         };
         self.promote_admission(node_id, session_id, endpoint)
@@ -34782,14 +34949,14 @@ impl MeshNode {
     /// own clock; the refusal is counted so it is visible as a
     /// refusal rather than as an absence.
     #[cfg(feature = "webrtc")]
-    pub(crate) fn note_enrollment_rejected(&self, node_id: u64, reply_channel: &str) {
+    pub(crate) fn note_enrollment_rejected(&self, node_id: u64, reply_channel: &str, call_id: u64) {
         let Some(origin) = self.provisional_reply_origin(node_id) else {
             return;
         };
         if reply_channel != super::rtc::enroll_reply_channel(origin) {
             return;
         }
-        if self.pending_promotions.remove(&node_id).is_some() {
+        if self.take_enrollment_reservation(node_id, call_id).is_some() {
             if let Some(stats) = self.rtc_driver.as_ref().map(|d| d.stats()) {
                 stats.note_admission_rejected_outcome();
             }
@@ -34909,18 +35076,15 @@ impl MeshNode {
             inbound.origin_hash,
         );
         if allowed {
-            // §12 step 4: bind the promotion to THIS incarnation,
-            // captured at REQUEST decode. The response path can only
-            // promote what was bound here, and `promote_admission`
-            // re-verifies it — so a session replaced in between
-            // promotes nothing.
-            if let Some(session_id) = self.peer_session_id(inbound.from_node) {
-                // At most one in-flight enrollment call per
-                // provisional session (S0e §2 B), so the node id is
-                // the whole key.
-                self.pending_promotions
-                    .insert(inbound.from_node, (session_id, endpoint));
-            }
+            // §12 step 4 + R2: bind the reservation to the exact
+            // call AND the incarnation that carried it. The
+            // response path may consume only its own key, and
+            // `promote_admission` re-verifies the session — so
+            // neither a replaced session nor another call's
+            // completion can promote anything.
+            let call_id = Self::rpc_call_id_of(&inbound.payload);
+            self.pending_promotions
+                .insert((inbound.from_node, inbound.session_id, call_id), endpoint);
         }
         if !allowed {
             tracing::debug!(

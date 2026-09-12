@@ -826,3 +826,66 @@ async fn a_registered_streaming_provider_refuses_a_provisional_caller() {
         invocations.load(Ordering::SeqCst)
     );
 }
+
+/// R2: an old call's **rejection** after the session was replaced
+/// leaves the replacement provisional and unpromoted, and consumes
+/// none of its reservation.
+///
+/// The mirror of Kyra's promotion probe: reservations were keyed by
+/// node id, so *either* terminal outcome of a superseded call
+/// reached into the successor's state. The rejection path also
+/// counted a refusal against a session that never asked.
+///
+/// Inverse: key `pending_promotions` by node id again — the old
+/// rejection consumes the replacement's reservation, and the
+/// replacement's own success then promotes nothing.
+#[cfg(feature = "cortex")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn an_old_rejection_after_replacement_consumes_nothing() {
+    let (anchor, client, endpoint) = anchor_and_provisional_client().await;
+    let client_id = client.node_id();
+    let first_session = anchor
+        .peer_session_id(client_id)
+        .expect("the first session");
+
+    // The first call's reservation, armed the way the gate arms it.
+    anchor.arm_enrollment_reservation_for_test(
+        client_id,
+        first_session,
+        PeerAddr::Rtc(endpoint),
+        0xC1,
+    );
+
+    // The session is replaced: a new incarnation, its own call.
+    let replacement = anchor.replace_provisional_for_test(client_id, PeerAddr::Rtc(endpoint));
+    assert_ne!(replacement, first_session);
+    anchor.arm_enrollment_reservation_for_test(
+        client_id,
+        replacement,
+        PeerAddr::Rtc(endpoint),
+        0xC2,
+    );
+
+    // The OLD call rejects, late.
+    anchor.note_enrollment_rejected_for_test(client_id, 0xC1);
+    assert!(
+        anchor.peer_is_provisional(client_id),
+        "a rejection may never promote anything"
+    );
+
+    // The replacement's own success must still be able to promote:
+    // the old rejection must not have eaten its reservation.
+    assert!(
+        anchor.promote_on_enrollment_response_for_test(client_id, 0xC2),
+        "the replacement's own call must still hold its reservation"
+    );
+    assert!(
+        !anchor.peer_is_provisional(client_id),
+        "and promote the session that actually earned it"
+    );
+    assert_eq!(
+        anchor.peer_session_id(client_id),
+        Some(replacement),
+        "the promoted session is the replacement, by identity"
+    );
+}

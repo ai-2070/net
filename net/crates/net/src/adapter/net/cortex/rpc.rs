@@ -1142,6 +1142,16 @@ pub fn response_wire_size(payload: &RpcResponsePayload) -> usize {
 /// One inbound event delivered to a registered RPC dispatcher.
 #[derive(Debug, Clone)]
 pub struct RpcInboundEvent {
+    /// The **receiving session's** id (R2), resolved from the
+    /// AEAD-verified packet at ingress.
+    ///
+    /// Authorization and enrollment ownership are properties of the
+    /// incarnation that actually carried the request. The event
+    /// used to carry only `from_node`, so a request queued in the
+    /// bridge and drained after a reconnection captured the
+    /// *current* session instead of its own. `0` on loopback/test
+    /// paths that have no session, like `from_node`.
+    pub session_id: u64,
     /// Canonical [`ChannelHash`](crate::adapter::net::channel::ChannelHash)
     /// (u32) of the channel this event arrived on — widened from the
     /// per-packet wire `u16` `NetHeader::channel_hash` via the
@@ -5180,6 +5190,7 @@ mod tests {
     /// and `payload` are load-bearing for the call-identity key.
     fn inbound(from_node: u64, frame: bytes::Bytes) -> RpcInboundEvent {
         RpcInboundEvent {
+            session_id: 0,
             channel_hash: 0,
             origin_hash: 0,
             from_node,

@@ -837,6 +837,7 @@ async fn emit_capability_denial(
     let _ = publish_response_to_caller(
         mesh,
         reply_origin,
+        call_id,
         Some(from_node),
         &reply_channel,
         reply_channel_hash,
@@ -972,6 +973,7 @@ fn strip_public_admission_header(inbound: &RpcInboundEvent) -> Option<RpcInbound
     let mut buf = inbound.payload[..RPC_FRAME_BODY_OFFSET].to_vec();
     req.encode_into(&mut buf);
     Some(RpcInboundEvent {
+        session_id: inbound.session_id,
         channel_hash: inbound.channel_hash,
         origin_hash: inbound.origin_hash,
         from_node: inbound.from_node,
@@ -2719,6 +2721,7 @@ fn build_request_grant_emitter(
                 if let Err(e) = publish_response_to_caller(
                     &mesh,
                     caller,
+                    call_id,
                     target_hint,
                     &reply_channel,
                     reply_channel_hash,
@@ -2932,6 +2935,9 @@ fn enrollment_outcome_is_admitted(frame: &Bytes) -> Option<bool> {
 async fn publish_response_to_caller(
     mesh: &MeshNode,
     caller_origin: u64,
+    // R2: which call this response answers. Enrollment promotion
+    // may consume only this call's own reservation.
+    call_id: u64,
     target_hint: Option<u64>,
     reply_channel: &ChannelName,
     reply_channel_hash: ChannelHash,
@@ -2998,7 +3004,7 @@ async fn publish_response_to_caller(
     {
         match enrollment_outcome_is_admitted(&payload) {
             Some(true) => {
-                if mesh.promote_on_enrollment_response(node_id, reply_channel.as_str()) {
+                if mesh.promote_on_enrollment_response(node_id, reply_channel.as_str(), call_id) {
                     tracing::debug!(
                         node_id = format!("{node_id:#x}"),
                         "§12: enrollment admitted; session promoted"
@@ -3010,7 +3016,7 @@ async fn publish_response_to_caller(
                 // expires on its own 30 s clock — and is counted, so
                 // an operator sees refusals rather than inferring
                 // them from an absence of promotions.
-                mesh.note_enrollment_rejected(node_id, reply_channel.as_str());
+                mesh.note_enrollment_rejected(node_id, reply_channel.as_str(), call_id);
                 tracing::debug!(
                     node_id = format!("{node_id:#x}"),
                     "§12: enrollment rejected; session stays provisional"
@@ -3899,6 +3905,7 @@ impl MeshNode {
                 if let Err(e) = publish_response_to_caller(
                     &response_drain_mesh,
                     job.caller_origin,
+                    job.call_id,
                     job.target_hint,
                     &job.reply_channel,
                     job.reply_channel_hash,
@@ -4050,6 +4057,7 @@ impl MeshNode {
                     if let Err(e) = publish_response_to_caller(
                         &mesh,
                         caller_origin,
+                        call_id,
                         target_hint,
                         &reply_channel,
                         reply_channel_hash,
@@ -4266,6 +4274,7 @@ impl MeshNode {
                     if let Err(e) = publish_response_to_caller(
                         &mesh,
                         caller_origin,
+                        call_id,
                         target_hint,
                         &reply_channel,
                         reply_channel_hash,
@@ -4633,6 +4642,7 @@ impl MeshNode {
                     if let Err(e) = publish_response_to_caller(
                         &mesh,
                         caller_origin,
+                        call_id,
                         target_hint,
                         &reply_channel,
                         reply_channel_hash,
@@ -5454,6 +5464,7 @@ impl MeshNode {
     /// handler.
     /// Can this node address `service` on `target` at all? Keeps
     /// the R1 witness from racing service discovery.
+    /// Can this node address `service` on `target` at all?
     #[cfg(any(test, feature = "fixtures"))]
     pub fn publish_rpc_request_unsubscribed_is_routable(
         self: &Arc<Self>,
@@ -7492,6 +7503,7 @@ mod roster_fallback_tests {
                      dispatch: u8,
                      window: Option<&[u8]>| {
             RpcInboundEvent {
+                session_id: 0,
                 channel_hash: chan,
                 origin_hash: claimed_origin,
                 from_node,
@@ -7679,6 +7691,7 @@ mod roster_fallback_tests {
                      call_id: u64,
                      window: Option<&[u8]>| {
             RpcInboundEvent {
+                session_id: 0,
                 channel_hash,
                 origin_hash: packet_origin,
                 from_node,
@@ -7875,6 +7888,7 @@ mod roster_fallback_tests {
                      call_id: u64,
                      window: Option<&[u8]>| {
             RpcInboundEvent {
+                session_id: 0,
                 channel_hash,
                 origin_hash: packet_origin,
                 from_node,
@@ -8141,6 +8155,7 @@ mod roster_fallback_tests {
             encode_rpc_route(&mut f, 0);
             f.extend_from_slice(&req.encode());
             RpcInboundEvent {
+                session_id: 0,
                 channel_hash,
                 origin_hash: caller_origin,
                 from_node: CALLER_NODE,
@@ -8271,6 +8286,7 @@ mod roster_fallback_tests {
             encode_rpc_route(&mut f, 0);
             f.extend_from_slice(&req.encode());
             RpcInboundEvent {
+                session_id: 0,
                 channel_hash,
                 origin_hash: caller_origin,
                 from_node: CALLER_NODE,
@@ -8376,6 +8392,7 @@ mod roster_fallback_tests {
             encode_rpc_route(&mut f, 0);
             f.extend_from_slice(&req.encode());
             RpcInboundEvent {
+                session_id: 0,
                 channel_hash: 0,
                 origin_hash: 0,
                 from_node: 1,
@@ -8470,6 +8487,7 @@ mod roster_fallback_tests {
         // `from_node == 0` is the loopback/local exemption, so the origin bind
         // and the capability gate both pass — this test is about the strip.
         let inbound = RpcInboundEvent {
+            session_id: 0,
             channel_hash: 0,
             origin_hash: 0,
             from_node: 0,
@@ -8511,6 +8529,7 @@ mod roster_fallback_tests {
         encode_rpc_route(&mut payload, 0);
         payload.extend_from_slice(&clean.encode());
         let inbound = RpcInboundEvent {
+            session_id: 0,
             channel_hash: 0,
             origin_hash: 0,
             from_node: 0,
@@ -9014,6 +9033,7 @@ mod roster_fallback_tests {
         encode_rpc_route(&mut frame, 0);
         frame.extend_from_slice(&payload.encode());
         let event = RpcInboundEvent {
+            session_id: 0,
             channel_hash,
             origin_hash: caller_origin,
             from_node: CALLER_NODE,
@@ -9155,6 +9175,7 @@ mod roster_fallback_tests {
         frame.extend_from_slice(&payload.encode());
         let frame = Bytes::from(frame);
         let event = |payload: Bytes| RpcInboundEvent {
+            session_id: 0,
             channel_hash,
             origin_hash: caller_origin,
             from_node: CALLER_NODE,
@@ -9327,6 +9348,7 @@ mod roster_fallback_tests {
             encode_rpc_route(&mut frame, 0);
             frame.extend_from_slice(&payload.encode());
             RpcInboundEvent {
+                session_id: 0,
                 channel_hash,
                 origin_hash: caller_origin,
                 from_node: CALLER_NODE,
@@ -9451,6 +9473,7 @@ mod roster_fallback_tests {
         assert!(server.deliver_rpc_inbound_for_test(
             channel_hash,
             RpcInboundEvent {
+                session_id: 0,
                 channel_hash,
                 origin_hash: caller_origin,
                 from_node: CALLER_NODE,
@@ -9577,6 +9600,7 @@ mod roster_fallback_tests {
         assert!(server.deliver_rpc_inbound_for_test(
             channel_hash,
             RpcInboundEvent {
+                session_id: 0,
                 channel_hash,
                 origin_hash: caller_origin,
                 from_node: CALLER_NODE,
@@ -9730,6 +9754,7 @@ mod roster_fallback_tests {
             encode_rpc_route(&mut frame, 0);
             frame.extend_from_slice(&payload.encode());
             RpcInboundEvent {
+                session_id: 0,
                 channel_hash,
                 origin_hash: caller_origin,
                 from_node: CALLER_NODE,
@@ -10126,6 +10151,7 @@ mod roster_fallback_tests {
             encode_rpc_route(&mut frame, 0);
             frame.extend_from_slice(&payload.encode());
             RpcInboundEvent {
+                session_id: 0,
                 channel_hash,
                 origin_hash: caller_origin,
                 from_node: CALLER_NODE,
@@ -10524,6 +10550,7 @@ mod roster_fallback_tests {
             encode_rpc_route(&mut frame, 0);
             frame.extend_from_slice(&payload.encode());
             RpcInboundEvent {
+                session_id: 0,
                 channel_hash: ch,
                 origin_hash: caller_origin,
                 from_node: CALLER_NODE,
@@ -10786,6 +10813,7 @@ mod roster_fallback_tests {
             encode_rpc_route(&mut f, 0);
             f.extend_from_slice(&req.encode());
             RpcInboundEvent {
+                session_id: 0,
                 channel_hash,
                 origin_hash: frame_origin,
                 from_node: CALLER_NODE,
@@ -10898,6 +10926,7 @@ mod roster_fallback_tests {
         let direct = publish_response_to_caller(
             &server,
             /* caller_origin */ 0x3,
+            /* call_id */ 0,
             Some(GONE_NODE),
             &reply,
             reply_hash,
@@ -10914,6 +10943,7 @@ mod roster_fallback_tests {
         let roster = publish_response_to_caller(
             &server,
             /* caller_origin */ 0x3,
+            /* call_id */ 0,
             Some(GONE_NODE),
             &reply,
             reply_hash,
@@ -10949,6 +10979,7 @@ mod roster_fallback_tests {
         let result = publish_response_to_caller(
             &server,
             /* caller_origin */ 0x1,
+            /* call_id */ 0,
             Some(STALE_NODE),
             &reply,
             reply_hash,
