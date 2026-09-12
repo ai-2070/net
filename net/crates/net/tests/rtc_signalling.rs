@@ -720,12 +720,36 @@ async fn a_reject_for_our_own_offer_correlates_and_releases() {
 /// Inverse: drop `release_signal_budget` from the Reject arm — the
 /// malformed offers keep their slots and the real offer that
 /// follows is refused as over budget.
+///
+/// **The precondition has to be established, not merely observed.**
+/// `open_signal_dialogs(a) == 0` is true *before the first offer
+/// arrives* as well as after the last one is released, so waiting
+/// for it alone let the real offer be sent into a table the four
+/// malformed offers were still filling: the real offer was then
+/// refused as over budget, and the drain 4 → 3 → 2 → 1 satisfied
+/// the "one open dialog" wait on its way past. That is the CI
+/// failure on Linux, where the arrival timing differs; the
+/// assertion below is unchanged, the state it asserts about is now
+/// actually reached. The arrival of all four is counted
+/// (`signal_delivered`), so it can be waited for rather than
+/// assumed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn a_failed_allocation_holds_no_dialog_reservation() {
     let (a, b) = signalling_pair().await;
     let a_id = a.node_id();
     let b_id = b.node_id();
 
+    // The evidence for the diagnosis above, asserted rather than
+    // argued: the old precondition is ALREADY TRUE here, before a
+    // single offer has been sent. Waiting for it proved nothing.
+    assert_eq!(
+        b.open_signal_dialogs(a_id),
+        0,
+        "no dialogs are open before any offer is sent — which is why \
+         `open_signal_dialogs == 0` cannot mean 'all four were refused'"
+    );
+
+    let delivered_before = b.rtc_stats().signal_delivered();
     for dialog in 0..MAX_DIALOGS_PER_PEER as u64 {
         a.send_rtc_signal(
             b_id,
@@ -738,13 +762,25 @@ async fn a_failed_allocation_holds_no_dialog_reservation() {
         .expect("send malformed offer");
     }
     assert!(
+        wait_for(
+            || b.rtc_stats().signal_delivered() >= delivered_before + MAX_DIALOGS_PER_PEER as u64,
+            Duration::from_secs(10)
+        )
+        .await,
+        "precondition: all four malformed offers must have ARRIVED (saw {} of {})",
+        b.rtc_stats().signal_delivered() - delivered_before,
+        MAX_DIALOGS_PER_PEER
+    );
+    assert!(
         wait_for(|| b.open_signal_dialogs(a_id) == 0, Duration::from_secs(10)).await,
-        "a refused allocation must leave no reservation behind (held {})",
+        "…and every refused allocation must then leave no reservation behind (held {})",
         b.open_signal_dialogs(a_id)
     );
 
     // And a real offer is still admitted.
-    let before = b.rtc_stats().signal_over_budget();
+    let over_budget_before = b.rtc_stats().signal_over_budget();
+    let malformed_before = b.rtc_stats().signal_malformed();
+    let engine_full_before = b.rtc_stats().signal_engine_full();
     let sdp = a
         .rtc_driver()
         .expect("driver")
@@ -759,11 +795,88 @@ async fn a_failed_allocation_holds_no_dialog_reservation() {
         wait_for(|| b.open_signal_dialogs(a_id) == 1, Duration::from_secs(10)).await,
         "the real offer must be admitted after four failed allocations"
     );
+    // Three distinct refusal causes, three counters (they shared one
+    // until this witness could not say which had fired).
     assert_eq!(
         b.rtc_stats().signal_over_budget(),
-        before,
-        "and nothing may be counted as over budget"
+        over_budget_before,
+        "nothing may be refused as over budget"
     );
+    assert_eq!(
+        b.rtc_stats().signal_malformed(),
+        malformed_before,
+        "…nor rejected as undecodable — a real offer decodes"
+    );
+    assert_eq!(
+        b.rtc_stats().signal_engine_full(),
+        engine_full_before,
+        "…nor dropped at the engine queue"
+    );
+}
+
+/// The three refusal causes are three counters, and each names its
+/// own. One counter for all three made
+/// `a_failed_allocation_holds_no_dialog_reservation` unable to say
+/// which had fired when CI went red.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn each_signalling_refusal_is_counted_under_its_own_cause() {
+    let (a, b) = signalling_pair().await;
+    let a_id = a.node_id();
+    let b_id = b.node_id();
+
+    // 1. Undecodable: an SDP past `MAX_SDP_BYTES` is refused by the
+    //    codec, before any budget question is asked.
+    let malformed_before = b.rtc_stats().signal_malformed();
+    let over_budget_before = b.rtc_stats().signal_over_budget();
+    a.send_subprotocol_to_node(
+        b_id,
+        net::adapter::net::rtc::SUBPROTOCOL_RTC_SIGNAL,
+        b"not a postcard-encoded RtcSignalMsg",
+    )
+    .await
+    .expect("send an undecodable signalling frame");
+    assert!(
+        wait_for(
+            || b.rtc_stats().signal_malformed() > malformed_before,
+            Duration::from_secs(5)
+        )
+        .await,
+        "an undecodable frame is counted as malformed"
+    );
+    assert_eq!(
+        b.rtc_stats().signal_over_budget(),
+        over_budget_before,
+        "…and NOT as a budget refusal: the sender was inside every bound"
+    );
+
+    // 2. Over budget: the frame window, with well-formed frames.
+    let malformed_before = b.rtc_stats().signal_malformed();
+    for i in 0..(MAX_FRAMES_PER_WINDOW as usize + 4) {
+        let _ = a
+            .send_rtc_signal(
+                b_id,
+                &RtcSignalMsg::Candidate {
+                    dialog: 7,
+                    candidate: format!("candidate:{i} 1 udp 1 127.0.0.1 4444 typ host"),
+                    mid: "0".to_string(),
+                },
+            )
+            .await;
+    }
+    assert!(
+        wait_for(
+            || b.rtc_stats().signal_over_budget() > over_budget_before,
+            Duration::from_secs(10)
+        )
+        .await,
+        "the frame window refuses, and says it was the budget"
+    );
+    assert_eq!(
+        b.rtc_stats().signal_malformed(),
+        malformed_before,
+        "…and those frames decoded perfectly well"
+    );
+    let _ = a_id;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]

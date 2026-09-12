@@ -36064,7 +36064,13 @@ impl MeshNode {
             Ok(msg) => msg,
             Err(e) => {
                 tracing::debug!(error = %e, from = format!("{from_node:#x}"), "rtc signal refused");
-                stats.note_signal_over_budget();
+                // A frame that did not decode is not a budget
+                // refusal: the sender may be within every bound and
+                // still have sent something this build cannot read
+                // (an unknown variant, or an SDP over
+                // `MAX_SDP_BYTES`). One counter for three causes made
+                // a witness unable to say which fired.
+                stats.note_signal_malformed();
                 return;
             }
         };
@@ -36111,8 +36117,10 @@ impl MeshNode {
         };
         if tx.try_send((from_node, msg)).is_err() {
             // The engine is gone or saturated. Counted, like every
-            // other bounded input in this transport.
-            stats.note_signal_over_budget();
+            // other bounded input in this transport — but as OUR
+            // failure to keep up, not as the sender exceeding a
+            // budget it was in fact inside.
+            stats.note_signal_engine_full();
         }
     }
 

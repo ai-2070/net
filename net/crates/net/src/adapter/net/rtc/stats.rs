@@ -41,7 +41,18 @@ pub struct RtcStats {
     admission_promotion_orphaned: AtomicU64,
     admission_rejected_outcome: AtomicU64,
     admission_reclaimed: AtomicU64,
+    /// The **budget** refusal: a well-formed frame this sender may
+    /// not send right now (too many open dialogs, too many frames in
+    /// the window). Kept distinct from the two below so a witness
+    /// that expects "no refusals" can say which refusal happened.
     signal_over_budget: AtomicU64,
+    /// The frame did not decode as an `RtcSignalMsg` at all — bad
+    /// postcard, unknown variant, or an SDP over `MAX_SDP_BYTES`.
+    signal_malformed: AtomicU64,
+    /// The frame was admitted but the engine's bounded queue was
+    /// full (or the engine is gone), so it was dropped after
+    /// admission.
+    signal_engine_full: AtomicU64,
     signal_forwarded: AtomicU64,
     signal_delivered: AtomicU64,
     signal_unknown_dialog: AtomicU64,
@@ -192,6 +203,16 @@ impl RtcStats {
         signal_over_budget,
         note_signal_over_budget,
         "`0x0D02` frames refused by the per-sender dialog/frame budget. A silent drop here is indistinguishable from a peer that never signalled."
+    );
+    counter!(
+        signal_malformed,
+        note_signal_malformed,
+        "`0x0D02` frames that did not decode as an `RtcSignalMsg`: bad postcard, an unknown variant, or an SDP over `MAX_SDP_BYTES`. Split out from `signal_over_budget` so a refusal names its cause."
+    );
+    counter!(
+        signal_engine_full,
+        note_signal_engine_full,
+        "`0x0D02` frames admitted by the budget and then dropped because the engine's bounded queue was full (or the engine is gone). Split out from `signal_over_budget`: the sender did nothing wrong, this node did not keep up."
     );
     counter!(
         signal_forwarded,
