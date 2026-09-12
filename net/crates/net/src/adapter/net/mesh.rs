@@ -3243,6 +3243,16 @@ struct PeerInfo {
     /// gate only fires on the responder side) or from a test path
     /// without a real handshake.
     last_initiator_ephemeral: Option<[u8; 32]>,
+    /// §12 admission state — **what this session may exercise**,
+    /// kept beside `transport`, which answers where it goes.
+    ///
+    /// `Admitted` for every native session and for RTC sessions on
+    /// a node that serves no bootstrap: the gate exists for
+    /// browser-facing anchors and must be invisible everywhere
+    /// else. Only a session installed on a `PeerAddr::Rtc` endpoint
+    /// by a `serve_bootstrap` anchor starts `Provisional`.
+    #[cfg(feature = "webrtc")]
+    admission: super::rtc::PeerAdmission,
 }
 
 impl PeerInfo {
@@ -3383,8 +3393,6 @@ pub(super) struct RpcRoute {
 /// TTL, token sweep 30 s), so it never masks a legitimate
 /// fine-grained config — those values are already well above 1 s.
 /// Parse an inbound migration payload just far enough to decide
-/// whether it's a migration-initiating message that needs a
-/// `ComputeNotSupported` response. Returns the encoded reply for
 /// `TakeSnapshot` / `SnapshotReady`; `None` for decode failures or
 /// mid-migration message types (which arrive only inside an
 /// already-live migration and so can't reach a node with no
@@ -10675,6 +10683,11 @@ pub struct MeshNode {
     /// across an await.
     #[cfg(feature = "webrtc")]
     rtc_signal_budget: Arc<parking_lot::Mutex<super::rtc::SignalBudget>>,
+    /// Endpoints whose sessions are provisional, mirrored from
+    /// `PeerInfo::admission` for the forwarding sites that never
+    /// touch the peer map (F3 router drain, F6 traversal, F7 proxy).
+    #[cfg(feature = "webrtc")]
+    provisional_endpoints: super::rtc::ProvisionalEndpoints,
     /// Test-only record of every frame that passed the budget, so a
     /// witness can assert what was *admitted* rather than inferring
     /// it from an installed session.
@@ -10689,9 +10702,7 @@ pub struct MeshNode {
     /// The receiving half, parked until the engine takes it.
     #[cfg(feature = "webrtc")]
     rtc_signal_rx: Arc<
-        parking_lot::Mutex<
-            Option<tokio::sync::mpsc::Receiver<(u64, super::rtc::RtcSignalMsg)>>,
-        >,
+        parking_lot::Mutex<Option<tokio::sync::mpsc::Receiver<(u64, super::rtc::RtcSignalMsg)>>>,
     >,
     /// R3-E: channel-close notifications from the driver, consumed by
     /// the task `start()` spawns. Taken once, like `rtc_ingress`.
@@ -12384,6 +12395,16 @@ impl MeshNode {
         if let Some(handle) = rtc_driver.as_ref() {
             router.set_rtc_transport(Arc::clone(handle.transport()));
         }
+        // §12 F3: the router's view of which adjacent sessions are
+        // provisional. Installed unconditionally under the feature
+        // — an empty set is the correct answer for a node with no
+        // browser-facing sessions, and a missing projection would
+        // be indistinguishable from "nobody is provisional".
+        #[cfg(feature = "webrtc")]
+        let provisional_endpoints: super::rtc::ProvisionalEndpoints =
+            Arc::new(dashmap::DashSet::new());
+        #[cfg(feature = "webrtc")]
+        router.set_provisional_endpoints(Arc::clone(&provisional_endpoints));
 
         // Configure route staleness. Routes learned from pingwaves age
         // out if a fresh pingwave hasn't refreshed them in this window;
@@ -13116,9 +13137,9 @@ impl MeshNode {
             #[cfg(feature = "webrtc")]
             rtc_closed: Arc::new(parking_lot::Mutex::new(rtc_closed)),
             #[cfg(feature = "webrtc")]
-            rtc_signal_budget: Arc::new(parking_lot::Mutex::new(
-                super::rtc::SignalBudget::new(),
-            )),
+            rtc_signal_budget: Arc::new(parking_lot::Mutex::new(super::rtc::SignalBudget::new())),
+            #[cfg(feature = "webrtc")]
+            provisional_endpoints,
             #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
             rtc_signal_tap: Arc::new(parking_lot::Mutex::new(Vec::new())),
             #[cfg(feature = "webrtc")]
@@ -22494,6 +22515,30 @@ impl MeshNode {
     }
 
     /// The install body, running under this peer's transition guard.
+    /// §12 step 1: which admission state a freshly installed
+    /// session starts in.
+    ///
+    /// The condition is deliberately narrow. `serve_bootstrap` is
+    /// what makes a node browser-facing; an RTC session between two
+    /// native nodes that serve no bootstrap is an ordinary session
+    /// and gating it would change Stage 3's behaviour for no
+    /// security gain.
+    #[cfg(feature = "webrtc")]
+    fn initial_admission(&self, peer_addr: PeerAddr) -> super::rtc::PeerAdmission {
+        let browser_facing = self
+            .config
+            .rtc
+            .as_ref()
+            .is_some_and(|rtc| rtc.serve_bootstrap);
+        if browser_facing && matches!(peer_addr, PeerAddr::Rtc(_)) {
+            let admission = super::rtc::PeerAdmission::provisional(std::time::Instant::now());
+            self.provisional_endpoints.insert(peer_addr);
+            admission
+        } else {
+            super::rtc::PeerAdmission::default()
+        }
+    }
+
     fn install_peer_locked(
         &self,
         peer_node_id: u64,
@@ -22523,6 +22568,14 @@ impl MeshNode {
             // Initiator-side: replay-guard is a responder-side
             // concern, leave empty.
             last_initiator_ephemeral: None,
+            // §12 step 1: a session on an RTC endpoint, installed by
+            // a node that serves bootstrap, is **provisional**.
+            // Everything else — every UDP session, and every RTC
+            // session on a node that serves no bootstrap — is
+            // admitted, which is what keeps native ↔ native and the
+            // Stage 3 harness byte-for-byte unchanged.
+            #[cfg(feature = "webrtc")]
+            admission: self.initial_admission(peer_addr),
         };
 
         // CAS + insert atomically under the entry's shard write lock.
@@ -25054,6 +25107,14 @@ impl MeshNode {
         // authenticate pingwaves against a spoofing attacker; that is a
         // separate protocol concern.
         if data.len() == EnhancedPingwave::SIZE && u16::from_le_bytes([data[0], data[1]]) != MAGIC {
+            // §12 F4, inbound half: a pingwave FROM a provisional
+            // peer is dropped and counted. It is a topology beacon —
+            // acting on one installs routes and graph edges for a
+            // peer that has not enrolled (S0e §3 row 11).
+            #[cfg(feature = "webrtc")]
+            if !Self::admission_gate_forward(&source, ctx) {
+                return;
+            }
             if let Some(pw) = EnhancedPingwave::from_bytes(&data) {
                 let origin_nid = graph_id_to_node_id(&pw.origin_id);
 
@@ -25206,6 +25267,16 @@ impl MeshNode {
                         if filter.contains(&addr) {
                             continue;
                         }
+                        // §12 F4, outbound half: an anchor does not
+                        // pingwave a provisional peer either. The
+                        // rule is symmetric because the beacon is.
+                        #[cfg(feature = "webrtc")]
+                        if Self::is_provisional(&addr, ctx) {
+                            if let Some(stats) = ctx.rtc_stats.as_ref() {
+                                stats.note_admission_refused_forward();
+                            }
+                            continue;
+                        }
                         // A full egress socket means that peer is
                         // already behind; a pingwave is a periodic
                         // liveness beacon, so the next one carries the
@@ -25246,7 +25317,7 @@ impl MeshNode {
         // whether this node is even a gateway — is decided inside
         // `relay_protected_hop`, which authenticates before it acts.
         if first2 == super::subnet::route_hop::ROUTE_HOP_MAGIC {
-            Self::relay_protected_hop(&data, ctx);
+            Self::relay_protected_hop(&data, source, ctx);
             return;
         }
         if !is_routed && !is_direct {
@@ -25319,6 +25390,17 @@ impl MeshNode {
                         session.touch();
                     }
                 } else {
+                    // §12 F1: the `dest_id == local_node_id` test is
+                    // ABOVE this arm, so the enrollment envelope is
+                    // already delivered. What remains is transit for
+                    // somebody else, and a provisional adjacent
+                    // session may not ask for it — no exceptions in
+                    // v1. Checked here, before TTL, before the route
+                    // lookup, before anything is sent.
+                    #[cfg(feature = "webrtc")]
+                    if !Self::admission_gate_forward(&source, ctx) {
+                        return;
+                    }
                     // Not for us — forward without decrypting (header-only
                     // routing). We send via the main socket so the
                     // receiving node sees `source` = our bound addr,
@@ -25503,8 +25585,18 @@ impl MeshNode {
     ///    hop-local attachments;
     /// 6. only then decrement the outer TTL and re-tag for the next
     ///    hop. The inner packet is copied through byte for byte.
-    fn relay_protected_hop(data: &[u8], ctx: &DispatchCtx) {
+    fn relay_protected_hop(data: &[u8], source: PeerAddr, ctx: &DispatchCtx) {
         use super::subnet::route_hop;
+
+        // §12 F2: hop authentication proves the *envelope*; it says
+        // nothing about whether the adjacent session may ask this
+        // anchor to carry it onward.
+        #[cfg(feature = "webrtc")]
+        if !Self::admission_gate_forward(&source, ctx) {
+            return;
+        }
+        #[cfg(not(feature = "webrtc"))]
+        let _ = source;
 
         // Measured-section marker for the production allocation witness
         // (`tests/subnet_relay_alloc_e2e.rs`). RAII, so it covers every
@@ -26005,6 +26097,9 @@ impl MeshNode {
                                         session,
                                         remote_static_pub,
                                         last_initiator_ephemeral: Some(initiator_ephemeral),
+                                        #[cfg(feature = "webrtc")]
+                                        admission: crate::adapter::net::rtc::PeerAdmission::default(
+                                        ),
                                     });
                                     Some(session_id)
                                 }
@@ -26031,6 +26126,8 @@ impl MeshNode {
                                 session,
                                 remote_static_pub,
                                 last_initiator_ephemeral: Some(initiator_ephemeral),
+                                #[cfg(feature = "webrtc")]
+                                admission: crate::adapter::net::rtc::PeerAdmission::default(),
                             });
                             Some(session_id)
                         }
@@ -26054,7 +26151,36 @@ impl MeshNode {
                     // actually carried the handshake, the route stays
                     // address-only and protected forwarding fails closed on
                     // it.
-                    let route_token = ctx.router.add_route(peer_node_id, source);
+                    // §12 gate 2: install the session, withhold the
+                    // route. A provisional adjacent session must not
+                    // make this anchor a routing participant on its
+                    // behalf — S0e names this exact site as where
+                    // "a provisional peer must not become a normal
+                    // discovery/routing participant" lands.
+                    #[cfg(feature = "webrtc")]
+                    let gate_open = Self::admission_gate_route_install(&source, ctx);
+                    #[cfg(not(feature = "webrtc"))]
+                    let gate_open = true;
+                    // A withheld route still yields a token: the
+                    // rollback machinery is keyed on it, and "no
+                    // route was installed" must not read as "no
+                    // registration happened".
+                    // A withheld route still needs a transition
+                    // token: the rollback machinery is keyed on one,
+                    // and "no route installed" must not read as "no
+                    // registration happened". Re-reading the current
+                    // token without mutating is exactly that.
+                    let route_token = if gate_open {
+                        ctx.router.add_route(peer_node_id, source)
+                    } else {
+                        // No route was installed, so the rollback
+                        // has nothing to remove: token 0 never
+                        // matches a live entry, and
+                        // `remove_ordinary_route_if_token_is`
+                        // declines rather than evicting somebody
+                        // else's route.
+                        0
+                    };
                     ctx.session_id_to_node
                         .insert(registered_session_id, peer_node_id);
                     // Fresh session incarnation (Vacant or accepted
@@ -30443,6 +30569,35 @@ impl MeshNode {
             }
         };
 
+        // §12 gate 3: subscription mutation. A provisional session
+        // may subscribe to exactly its own enrollment reply
+        // channel, bare — a wildcard, a token, a queue group or
+        // anyone else's channel is refused, not ignored.
+        #[cfg(feature = "webrtc")]
+        if let Some(endpoint) = Self::endpoint_of(from_node, ctx) {
+            let action = match &msg {
+                MembershipMsg::Subscribe {
+                    channel,
+                    token,
+                    queue_group,
+                    ..
+                } => super::rtc::BootstrapAction::Subscribe {
+                    channel: channel.as_str(),
+                    has_token: token.is_some(),
+                    has_queue_group: queue_group.is_some(),
+                },
+                MembershipMsg::Unsubscribe { channel, .. } => {
+                    super::rtc::BootstrapAction::Unsubscribe {
+                        channel: channel.as_str(),
+                    }
+                }
+                _ => super::rtc::BootstrapAction::Other,
+            };
+            if !Self::admission_gate_subscribe(&endpoint, ctx, &action, from_node) {
+                return;
+            }
+        }
+
         match msg {
             MembershipMsg::Subscribe {
                 channel,
@@ -33627,12 +33782,52 @@ impl MeshNode {
         let encoded = msg
             .to_bytes()
             .map_err(|e| AdapterError::Connection(format!("rtc signal encode failed: {e}")))?;
-        self.send_subprotocol_to_node(
-            peer_node_id,
-            super::rtc::SUBPROTOCOL_RTC_SIGNAL,
-            &encoded,
-        )
-        .await
+        self.send_subprotocol_to_node(peer_node_id, super::rtc::SUBPROTOCOL_RTC_SIGNAL, &encoded)
+            .await
+    }
+
+    /// §12 gate 5 for the nRPC carrier: may this caller's session
+    /// have this service invoked on its behalf?
+    ///
+    /// Admitted and native sessions pass unconditionally. A
+    /// provisional session passes only the bounded enrollment call
+    /// — the same service, addressed to this node, with its own
+    /// reply channel — and every refusal is counted.
+    #[cfg(all(feature = "webrtc", feature = "cortex"))]
+    pub(crate) fn rtc_admission_allows_rpc(
+        &self,
+        inbound: &super::cortex::RpcInboundEvent,
+        service: &str,
+    ) -> bool {
+        let Some(entry) = self.peers.get(&inbound.from_node) else {
+            return true;
+        };
+        if !entry.value().admission.is_provisional() {
+            return true;
+        }
+        let endpoint = entry.value().addr();
+        drop(entry);
+        let reply_channel = super::rtc::enroll_reply_channel(inbound.origin_hash);
+        let action = super::rtc::BootstrapAction::NrpcRequest {
+            service,
+            target_node: self.node_id,
+            reply_channel: &reply_channel,
+            body_len: inbound.payload.len(),
+        };
+        let allowed =
+            super::rtc::allow_provisional_action(&action, self.node_id, inbound.origin_hash)
+                .is_ok();
+        if !allowed {
+            if let Some(stats) = self.rtc_driver.as_ref().map(|d| d.stats()) {
+                stats.note_admission_refused_deliver();
+            }
+            tracing::debug!(
+                service = service,
+                from_node = format!("{:#x}", inbound.from_node),
+                "§12: refusing an nRPC service to a provisional session"
+            );
+        }
+        allowed
     }
 
     /// Test-only: every signalling frame this node admitted, in
@@ -33640,6 +33835,129 @@ impl MeshNode {
     #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
     pub fn drain_rtc_signals_for_test(&self) -> Vec<(u64, super::rtc::RtcSignalMsg)> {
         std::mem::take(&mut *self.rtc_signal_tap.lock())
+    }
+
+    /// **Gate 1 of 5 (§12): forwarding.** May this anchor forward
+    /// on behalf of the *adjacent* session `source`?
+    ///
+    /// Called at F1–F7 (S0e §4). At F1 it sits **below** the
+    /// `dest_id == local_node_id` test, so the enrollment envelope —
+    /// which `connect_via` addresses to the anchor itself — is
+    /// delivered locally rather than refused. That ordering is the
+    /// whole of S0e's named attack: `relay_addr` and `dest_node_id`
+    /// are independent parameters, and nothing but this check stops
+    /// a provisional peer putting a third party in the envelope.
+    #[cfg(feature = "webrtc")]
+    fn admission_gate_forward(source: &PeerAddr, ctx: &DispatchCtx) -> bool {
+        Self::admission_allows(source, ctx, |stats| stats.note_admission_refused_forward())
+    }
+
+    /// **Gate 2 of 5 (§12): route installation.** A provisional peer
+    /// gets a session, not discovery participation — the routed
+    /// handshake installs the peer and withholds the route.
+    #[cfg(feature = "webrtc")]
+    fn admission_gate_route_install(source: &PeerAddr, ctx: &DispatchCtx) -> bool {
+        Self::admission_allows(source, ctx, |stats| stats.note_admission_refused_route())
+    }
+
+    /// **Gate 3 of 5 (§12): subscription mutation.**
+    ///
+    /// A provisional peer may subscribe to exactly one channel: its
+    /// own enrollment reply channel, bare. Everything else — a
+    /// wildcard, a token, a queue group, someone else's channel — is
+    /// refused, not ignored.
+    #[cfg(feature = "webrtc")]
+    fn admission_gate_subscribe(
+        source: &PeerAddr,
+        ctx: &DispatchCtx,
+        action: &super::rtc::BootstrapAction<'_>,
+        caller_origin: u64,
+    ) -> bool {
+        if !Self::is_provisional(source, ctx) {
+            return true;
+        }
+        let allowed =
+            super::rtc::allow_provisional_action(action, ctx.local_node_id, caller_origin).is_ok();
+        if !allowed {
+            if let Some(stats) = ctx.rtc_stats.as_ref() {
+                stats.note_admission_refused_subscribe();
+            }
+        }
+        allowed
+    }
+
+    /// **Gate 4 of 5 (§12): announcement ingest.** A provisional
+    /// peer's announcement is neither ingested nor flooded — that
+    /// would be route installation for an unadmitted peer (S0e §3
+    /// row 12).
+    #[cfg(feature = "webrtc")]
+    fn admission_gate_announce(source: &PeerAddr, ctx: &DispatchCtx) -> bool {
+        Self::admission_allows(source, ctx, |stats| stats.note_admission_refused_announce())
+    }
+
+    /// **Gate 5 of 5 (§12): application delivery.**
+    ///
+    /// The one gate that cannot be a header test: the enrollment
+    /// REQUEST's service name lives *inside* the nRPC envelope, so
+    /// the caller decodes under strict bounds and hands the decoded
+    /// facts here (§12 step 3, S0e §6).
+    #[cfg(feature = "webrtc")]
+    fn admission_gate_deliver(
+        source: &PeerAddr,
+        ctx: &DispatchCtx,
+        action: &super::rtc::BootstrapAction<'_>,
+        caller_origin: u64,
+    ) -> bool {
+        if !Self::is_provisional(source, ctx) {
+            return true;
+        }
+        let allowed =
+            super::rtc::allow_provisional_action(action, ctx.local_node_id, caller_origin).is_ok();
+        if !allowed {
+            if let Some(stats) = ctx.rtc_stats.as_ref() {
+                stats.note_admission_refused_deliver();
+            }
+        }
+        allowed
+    }
+
+    /// The endpoint a node id's session sits on, for the gates that
+    /// are handed a node id rather than an address.
+    #[cfg(feature = "webrtc")]
+    fn endpoint_of(node_id: u64, ctx: &DispatchCtx) -> Option<PeerAddr> {
+        ctx.peers.get(&node_id).map(|e| e.value().addr())
+    }
+
+    /// Is the session on `source` provisional? A synchronous read of
+    /// `PeerInfo` — the gates hold no guard across an await because
+    /// they never await.
+    #[cfg(feature = "webrtc")]
+    fn is_provisional(source: &PeerAddr, ctx: &DispatchCtx) -> bool {
+        let Some(node_id) = ctx.addr_to_node.get(source).map(|e| *e.value()) else {
+            // No session on this endpoint: not a provisional peer,
+            // and not this gate's business either.
+            return false;
+        };
+        ctx.peers
+            .get(&node_id)
+            .is_some_and(|e| e.value().admission.is_provisional())
+    }
+
+    /// Shared body of the three yes/no gates: provisional ⇒ refuse
+    /// and count, with the counter the caller names.
+    #[cfg(feature = "webrtc")]
+    fn admission_allows(
+        source: &PeerAddr,
+        ctx: &DispatchCtx,
+        count: impl FnOnce(&super::rtc::RtcStats),
+    ) -> bool {
+        if !Self::is_provisional(source, ctx) {
+            return true;
+        }
+        if let Some(stats) = ctx.rtc_stats.as_ref() {
+            count(stats);
+        }
+        false
     }
 
     /// One inbound `0x0D02` frame (plan §5 Layer 3).
@@ -33692,6 +34010,16 @@ impl MeshNode {
     }
 
     fn handle_capability_announcement(payload: &[u8], from_node: u64, ctx: &DispatchCtx) {
+        // §12 gate 4: a provisional peer's announcement is neither
+        // ingested nor flooded. Ingesting it would install routes
+        // and publish discovery state for a peer that has not
+        // enrolled — S0e §3 row 12.
+        #[cfg(feature = "webrtc")]
+        if let Some(endpoint) = Self::endpoint_of(from_node, ctx) {
+            if !Self::admission_gate_announce(&endpoint, ctx) {
+                return;
+            }
+        }
         let Some(mut ann) = CapabilityAnnouncement::from_bytes(payload) else {
             tracing::trace!(
                 from_node = format!("{:#x}", from_node),
@@ -34105,6 +34433,15 @@ impl MeshNode {
     /// and a relay generally has no route to the provider anyway. The frame bytes
     /// ship verbatim — a relay never opens, stores, or re-signs them.
     fn forward_scoped_announcement(frame: Vec<u8>, from_node: u64, ctx: &DispatchCtx) {
+        // §12 F5, scoped half. Same rule; `0x0C04` itself is out of
+        // v1 browser scope, but the forwarding gate is not selective
+        // about which announcement kind it refuses to carry.
+        #[cfg(feature = "webrtc")]
+        if let Some(endpoint) = Self::endpoint_of(from_node, ctx) {
+            if !Self::admission_gate_forward(&endpoint, ctx) {
+                return;
+            }
+        }
         let peers = ctx.peers.clone();
         let sink = ctx.sink.clone();
         let partition_filter = ctx.partition_filter.clone();
@@ -34146,6 +34483,15 @@ impl MeshNode {
         sender_node_id: u64,
         ctx: &DispatchCtx,
     ) {
+        // §12 F5: do not flood on behalf of a provisional sender.
+        // Gate 4 already refuses to ingest it; this refuses to be
+        // its megaphone.
+        #[cfg(feature = "webrtc")]
+        if let Some(endpoint) = Self::endpoint_of(sender_node_id, ctx) {
+            if !Self::admission_gate_forward(&endpoint, ctx) {
+                return;
+            }
+        }
         let peers = ctx.peers.clone();
         let sink = ctx.sink.clone();
         let partition_filter = ctx.partition_filter.clone();
@@ -34223,6 +34569,15 @@ impl MeshNode {
         req: super::traversal::rendezvous::PunchRequest,
         ctx: &DispatchCtx,
     ) {
+        // §12 F6: introducing two peers is forwarding on behalf of
+        // the requester. A provisional session does not get to ask
+        // this anchor to introduce it to anybody.
+        #[cfg(feature = "webrtc")]
+        if let Some(endpoint) = Self::endpoint_of(from_node, ctx) {
+            if !Self::admission_gate_forward(&endpoint, ctx) {
+                return;
+            }
+        }
         use super::traversal::rendezvous::{
             PunchIntroduce, PunchReject, RejectReason, RendezvousMsg,
         };
@@ -34825,6 +35180,16 @@ impl MeshNode {
     #[cfg(feature = "nat-traversal")]
     fn forward_punch_ack(ack: super::traversal::rendezvous::PunchAck, ctx: &DispatchCtx) {
         use super::traversal::rendezvous::RendezvousMsg;
+
+        // §12 F6: and it does not get to have its acknowledgements
+        // relayed onward either — the destination side of the same
+        // rule.
+        #[cfg(feature = "webrtc")]
+        if let Some(endpoint) = Self::endpoint_of(ack.to_peer, ctx) {
+            if !Self::admission_gate_forward(&endpoint, ctx) {
+                return;
+            }
+        }
 
         let Some((dest_addr, dest_session)) = ctx
             .peers
@@ -44124,6 +44489,8 @@ mod heartbeat_aead_tests {
                 session,
                 remote_static_pub: [0u8; 32],
                 last_initiator_ephemeral: None,
+                #[cfg(feature = "webrtc")]
+                admission: crate::adapter::net::rtc::PeerAdmission::default(),
             },
         );
         peer_addrs.insert(peer_id, next_hop);
@@ -44215,6 +44582,8 @@ mod heartbeat_aead_tests {
                 session,
                 remote_static_pub: [0u8; 32],
                 last_initiator_ephemeral: None,
+                #[cfg(feature = "webrtc")]
+                admission: crate::adapter::net::rtc::PeerAdmission::default(),
             },
         );
         peer_addrs.insert(peer_id, next_hop);
@@ -44351,6 +44720,8 @@ mod heartbeat_aead_tests {
                 session,
                 remote_static_pub: [0u8; 32],
                 last_initiator_ephemeral: None,
+                #[cfg(feature = "webrtc")]
+                admission: crate::adapter::net::rtc::PeerAdmission::default(),
             },
         );
         peer_addrs.insert(peer_id, fresh);
@@ -44443,6 +44814,8 @@ mod heartbeat_aead_tests {
                 session: fresh_session,
                 remote_static_pub: [0u8; 32],
                 last_initiator_ephemeral: None,
+                #[cfg(feature = "webrtc")]
+                admission: crate::adapter::net::rtc::PeerAdmission::default(),
             },
         );
         peer_addrs.insert(peer_id, relay);
@@ -44539,6 +44912,8 @@ mod heartbeat_aead_tests {
                 session,
                 remote_static_pub: [0u8; 32],
                 last_initiator_ephemeral: None,
+                #[cfg(feature = "webrtc")]
+                admission: crate::adapter::net::rtc::PeerAdmission::default(),
             },
         );
         peer_addrs.insert(peer_id, relay);
@@ -44619,6 +44994,8 @@ mod heartbeat_aead_tests {
                 session,
                 remote_static_pub: [0u8; 32],
                 last_initiator_ephemeral: None,
+                #[cfg(feature = "webrtc")]
+                admission: crate::adapter::net::rtc::PeerAdmission::default(),
             },
         );
         session_id_to_node.insert(live_session_id, peer_id);
@@ -45460,6 +45837,8 @@ mod heartbeat_aead_tests {
             session,
             remote_static_pub: static_a,
             last_initiator_ephemeral: Some(ephemeral_a),
+            #[cfg(feature = "webrtc")]
+            admission: crate::adapter::net::rtc::PeerAdmission::default(),
         };
         assert_eq!(
             routed_rotation_outcome(&info, &static_a, &ephemeral_a, Duration::from_secs(30)),
@@ -45487,6 +45866,8 @@ mod heartbeat_aead_tests {
             session,
             remote_static_pub: static_a,
             last_initiator_ephemeral: Some(ephemeral_old),
+            #[cfg(feature = "webrtc")]
+            admission: crate::adapter::net::rtc::PeerAdmission::default(),
         };
         assert_eq!(
             routed_rotation_outcome(&info, &static_a, &ephemeral_new, Duration::from_secs(30)),
@@ -45513,6 +45894,8 @@ mod heartbeat_aead_tests {
             session,
             remote_static_pub: [0xAAu8; 32],
             last_initiator_ephemeral: Some([0xCCu8; 32]),
+            #[cfg(feature = "webrtc")]
+            admission: crate::adapter::net::rtc::PeerAdmission::default(),
         };
         let new_static = [0xBBu8; 32];
         let new_ephemeral = [0xDDu8; 32];
@@ -45539,6 +45922,8 @@ mod heartbeat_aead_tests {
             session,
             remote_static_pub: [0xAAu8; 32],
             last_initiator_ephemeral: Some([0xCCu8; 32]),
+            #[cfg(feature = "webrtc")]
+            admission: crate::adapter::net::rtc::PeerAdmission::default(),
         };
         // Wait past a 1 ms session_timeout. `current_timestamp()`
         // uses wall-clock `SystemTime::now()` so a real sleep
@@ -45571,6 +45956,8 @@ mod heartbeat_aead_tests {
             session,
             remote_static_pub: static_a,
             last_initiator_ephemeral: Some([0xCCu8; 32]),
+            #[cfg(feature = "webrtc")]
+            admission: crate::adapter::net::rtc::PeerAdmission::default(),
         };
         // Same static, fresh ephemeral, live (30 s timeout) + busy.
         assert_eq!(
@@ -45597,6 +45984,8 @@ mod heartbeat_aead_tests {
             session,
             remote_static_pub: static_a,
             last_initiator_ephemeral: Some([0xCCu8; 32]),
+            #[cfg(feature = "webrtc")]
+            admission: crate::adapter::net::rtc::PeerAdmission::default(),
         };
         // Let the session go idle past a 1 ms timeout — not live.
         std::thread::sleep(Duration::from_millis(5));

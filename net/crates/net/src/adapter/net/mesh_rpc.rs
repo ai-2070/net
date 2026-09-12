@@ -3709,6 +3709,19 @@ impl MeshNode {
         let bridge = tokio::spawn(async move {
             let tag = format!("nrpc:{}", service_for_bridge);
             while let Some(inbound) = rx.recv().await {
+                // §12 gate 5 — application delivery, and the one
+                // gate that cannot be a header test: the service
+                // name lives INSIDE the nRPC envelope, behind a
+                // channel-hash discriminator. The envelope has been
+                // decoded under the bounds the fold already
+                // enforces, so the decision is made on decoded
+                // facts, before the handler runs (§12 step 3, S0e
+                // §6). A provisional caller reaches exactly
+                // `net.mesh.enroll` on this node and nothing else.
+                #[cfg(feature = "webrtc")]
+                if !mesh_for_bridge.rtc_admission_allows_rpc(&inbound, &service_for_bridge) {
+                    continue;
+                }
                 match reg_for_bridge.admission() {
                     OrgAdmission::PublicAuthenticated => {
                         // The ONE shared public callee preflight: captured-

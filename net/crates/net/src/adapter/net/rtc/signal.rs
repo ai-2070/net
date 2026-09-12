@@ -139,9 +139,7 @@ impl RtcSignalMsg {
         let msg: Self = postcard::from_bytes(bytes).map_err(|_| RtcSignalError::Malformed)?;
         let oversize = match &msg {
             Self::Offer { sdp, .. } | Self::Answer { sdp, .. } => sdp.len() > MAX_SDP_BYTES,
-            Self::Candidate { candidate, mid, .. } => {
-                candidate.len() + mid.len() > MAX_SDP_BYTES
-            }
+            Self::Candidate { candidate, mid, .. } => candidate.len() + mid.len() > MAX_SDP_BYTES,
             Self::Reject { .. } => false,
         };
         if oversize {
@@ -221,11 +219,14 @@ impl SignalBudget {
     /// frame kind including `Reject`: a peer that has exhausted its
     /// window does not get to keep talking by rejecting.
     pub fn admit(&mut self, from_node: u64, msg: &RtcSignalMsg, now: Instant) -> SignalAdmit {
-        let state = self.senders.entry(from_node).or_insert_with(|| SenderState {
-            dialogs: Vec::new(),
-            window_started: now,
-            frames_in_window: 0,
-        });
+        let state = self
+            .senders
+            .entry(from_node)
+            .or_insert_with(|| SenderState {
+                dialogs: Vec::new(),
+                window_started: now,
+                frames_in_window: 0,
+            });
         if now.duration_since(state.window_started) >= BUDGET_WINDOW {
             state.window_started = now;
             state.frames_in_window = 0;

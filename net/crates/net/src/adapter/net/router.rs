@@ -680,6 +680,12 @@ pub struct NetRouter {
     /// lock the installer could hold.
     #[cfg(feature = "webrtc")]
     rtc: Arc<arc_swap::ArcSwapOption<super::rtc::RtcTransport>>,
+    /// §12 F3: the mesh's projection of which endpoints hold a
+    /// provisional session. The router forwards for whoever handed
+    /// it a packet and never touches the peer map, so it cannot
+    /// read `PeerInfo::admission` itself.
+    #[cfg(feature = "webrtc")]
+    provisional: Arc<arc_swap::ArcSwapOption<dashmap::DashSet<PeerAddr>>>,
 }
 
 /// Submit one packet to a DataChannel from the scheduler drain.
@@ -741,7 +747,19 @@ impl NetRouter {
             test_drop_counter: Arc::new(AtomicU64::new(0)),
             #[cfg(feature = "webrtc")]
             rtc: Arc::new(arc_swap::ArcSwapOption::empty()),
+            #[cfg(feature = "webrtc")]
+            provisional: Arc::new(arc_swap::ArcSwapOption::empty()),
         })
+    }
+
+    /// Install the §12 provisional-endpoint projection (F3).
+    ///
+    /// The router forwards for whoever handed it a packet and never
+    /// touches the peer map, so it cannot read `PeerInfo::admission`
+    /// itself. This is the mirror the mesh maintains.
+    #[cfg(feature = "webrtc")]
+    pub fn set_provisional_endpoints(&self, set: super::rtc::ProvisionalEndpoints) {
+        self.provisional.store(Some(set));
     }
 
     /// Install the RTC admission side so the scheduler drain can
@@ -815,6 +833,19 @@ impl NetRouter {
 
     /// Route a packet (called from receive loop)
     pub fn route_packet(&self, data: Bytes, _from: PeerAddr) -> Result<RouteAction, RouterError> {
+        // §12 F3: no transit for a provisional adjacent session. The
+        // router is the one forwarding site with no view of the peer
+        // map, so it consults the mesh's projection.
+        #[cfg(feature = "webrtc")]
+        if self
+            .provisional
+            .load()
+            .as_ref()
+            .is_some_and(|set| set.contains(&_from))
+        {
+            self.packets_dropped.fetch_add(1, Ordering::Relaxed);
+            return Err(RouterError::NoRoute);
+        }
         let start = Instant::now();
         let len = data.len() as u64;
 

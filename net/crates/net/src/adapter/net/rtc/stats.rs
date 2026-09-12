@@ -28,6 +28,13 @@ pub struct RtcStats {
     udp_conn_reset: AtomicU64,
     max_buffered: AtomicU64,
     retained: AtomicU64,
+    admission_refused_forward: AtomicU64,
+    admission_refused_route: AtomicU64,
+    admission_refused_subscribe: AtomicU64,
+    admission_refused_announce: AtomicU64,
+    admission_refused_deliver: AtomicU64,
+    admission_promoted: AtomicU64,
+    admission_reclaimed: AtomicU64,
     signal_over_budget: AtomicU64,
     signal_forwarded: AtomicU64,
     signal_delivered: AtomicU64,
@@ -108,6 +115,41 @@ impl RtcStats {
         validate_rejected,
         note_validate_rejected,
         "RTC datagrams `NetHeader::validate` rejected — S0c's silent 8 KiB black hole, now audible."
+    );
+    counter!(
+        admission_refused_forward,
+        note_admission_refused_forward,
+        "Forwarding refused for a provisional adjacent session (§12: no third-party relay before enrollment)."
+    );
+    counter!(
+        admission_refused_route,
+        note_admission_refused_route,
+        "Route installation withheld from a provisional session — it holds a session, not discovery participation."
+    );
+    counter!(
+        admission_refused_subscribe,
+        note_admission_refused_subscribe,
+        "Channel subscription outside the bootstrap allow-list."
+    );
+    counter!(
+        admission_refused_announce,
+        note_admission_refused_announce,
+        "Capability announcement from a provisional session, neither ingested nor flooded."
+    );
+    counter!(
+        admission_refused_deliver,
+        note_admission_refused_deliver,
+        "Application delivery outside the bootstrap allow-list, decided after the nRPC envelope was decoded under bounds (§12 step 3)."
+    );
+    counter!(
+        admission_promoted,
+        note_admission_promoted,
+        "Provisional sessions promoted by the enrollment handler, bound to the exact live session incarnation."
+    );
+    counter!(
+        admission_reclaimed,
+        note_admission_reclaimed,
+        "Provisional sessions closed and reclaimed: expiry, a breached whole-session bound, or `max_provisional`."
     );
     counter!(
         signal_over_budget,

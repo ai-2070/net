@@ -25,6 +25,7 @@
 //! takes it or closes; a close discards the remainder **and counts it**
 //! ([`RtcStats::discarded_at_close`]).
 
+mod admission;
 mod config;
 mod driver;
 #[cfg(any(test, feature = "fixtures"))]
@@ -34,6 +35,12 @@ mod stats;
 mod stun;
 mod transport;
 
+pub use admission::{
+    allow_provisional_action, enroll_reply_channel, AdmissionRefusal, BootstrapAction,
+    PeerAdmission, ProvisionalBudget, ProvisionalEndpoints, ENROLL_SERVICE, MAX_ENROLL_BODY_BYTES,
+    MAX_ENROLL_REQUEST_FRAMES, MAX_PROVISIONAL_BYTES, MAX_PROVISIONAL_CHANNELS,
+    MAX_PROVISIONAL_FRAMES, MAX_PROVISIONAL_STREAMS, PROVISIONAL_TTL, RENEWAL_SERVICE,
+};
 pub use config::{
     RtcConfig, DEFAULT_BUFFERED_AMOUNT_ADVISORY, DEFAULT_ICE_DEADLINE,
     DEFAULT_INGRESS_QUEUE_PACKETS, DEFAULT_MAX_PEERS, DEFAULT_SEND_QUEUE_BYTES,

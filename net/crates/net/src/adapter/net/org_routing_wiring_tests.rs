@@ -7031,6 +7031,8 @@ fn seed_peer(node: &MeshNode, node_id: u64, direct: bool) -> u64 {
             session,
             remote_static_pub: [0u8; 32],
             last_initiator_ephemeral: None,
+            #[cfg(feature = "webrtc")]
+            admission: crate::adapter::net::rtc::PeerAdmission::default(),
         },
     );
     session_id
@@ -7904,6 +7906,8 @@ fn flip_peer_transport(node: &MeshNode, node_id: u64) -> bool {
             session,
             remote_static_pub,
             last_initiator_ephemeral,
+            #[cfg(feature = "webrtc")]
+            admission: crate::adapter::net::rtc::PeerAdmission::default(),
         },
     );
     true
