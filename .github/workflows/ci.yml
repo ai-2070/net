@@ -4614,7 +4614,13 @@ jobs:
           # Self-check: the parser itself must work before any floor
           # is believed. An empty list here means the tooling moved,
           # not that the witnesses vanished.
-          probe=$(list rtc_loopback | wc -l)
+          # R7: count NON-EMPTY lines. `wc -l` on this helper's
+          # output reads an empty suite as ONE test, because the
+          # printer emits a trailing newline either way — so the
+          # self-check below could never fire and a floor of 1 would
+          # pass on a vacuous binary.
+          count() { grep -c . || true; }
+          probe=$(list rtc_loopback | count)
           if [ "$probe" -eq 0 ]; then
             echo "::error::witness-inventory parser returned nothing for rtc_loopback — \
           the nextest list format changed; fix the parser before trusting any floor"
@@ -4624,7 +4630,7 @@ jobs:
           echo "parser self-check: rtc_loopback lists $probe tests"
 
           check_floor() {
-            n=$(list "$1" | wc -l)
+            n=$(list "$1" | count)
             echo "$1: $n tests (min $2)"
             if [ "$n" -lt "$2" ]; then
               echo "::error::$1 has $n tests, floor is $2 — lower the floor deliberately or restore the witness"
@@ -4637,10 +4643,10 @@ jobs:
           check_floor rtc_routed_restore 4
           check_floor rtc_install_race 8
           check_floor rtc_reclaim 5
-          check_floor rtc_classifier 1
+          check_floor rtc_classifier 2
           check_floor rtc_admission_probes 8
-          check_floor rtc_signalling 6
-          check_floor rtc_admission 13
+          check_floor rtc_signalling 9
+          check_floor rtc_admission 19
           REQUIRED="
           rtc_repairs:scheduled_fire_and_forget_packets_reach_rtc_admission_and_the_peer
           rtc_repairs:the_scheduler_drain_counts_what_it_drops_under_pressure
@@ -4701,6 +4707,16 @@ jobs:
           rtc_admission:a_provisional_rejecter_never_triggers_a_corrective_reannounce
           rtc_admission:pingwave_is_denied_while_heartbeat_is_permitted
           rtc_admission:a_rejected_enrollment_outcome_promotes_nothing
+          rtc_admission:a_registered_streaming_provider_refuses_a_provisional_caller
+          rtc_admission:an_old_rejection_after_replacement_consumes_nothing
+          rtc_admission:a_sweep_cannot_reclaim_a_session_promoted_after_selection
+          rtc_admission:a_sweep_cannot_reclaim_a_replacement_it_never_selected
+          rtc_admission:a_provisional_sender_cannot_allocate_arbitrary_streams
+          rtc_admission:enrollment_requests_are_charged_and_released_and_churn_returns_to_baseline
+          rtc_signalling:four_expired_dialogs_release_their_budget_for_a_fifth
+          rtc_signalling:a_reject_for_our_own_offer_correlates_and_releases
+          rtc_signalling:a_failed_allocation_holds_no_dialog_reservation
+          rtc_classifier:an_ice_pair_schedules_the_upgrade_attempt
           rtc_admission:an_admitted_enrollment_outcome_promotes_the_session
           rtc_admission:the_provisional_frame_bound_closes_the_session
           rtc_admission:the_provisional_byte_bound_closes_the_session

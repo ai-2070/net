@@ -372,41 +372,108 @@ async fn the_provisional_cap_closes_and_reclaims() {
     );
 }
 
-/// WITNESS 6: enrollment is eligibility, not authority. An
-/// **admitted** peer with no provider authority is still denied a
-/// protected invocation — the existing org gate is *reached*, not
-/// bypassed, which is the thing worth proving.
+/// WITNESS 6 (R7): an admitted peer without provider authority is
+/// denied by a **registered protected provider** — and the handler
+/// never runs.
+///
+/// The landed version registered no service under
+/// `org.protected.invoke` and accepted any error or outer timeout,
+/// so it could not tell "the protected engine refused" from "there
+/// is nothing there" — removing the gate could not fail it. Here
+/// the anchor installs a real `NodeAuthority`, registers a real
+/// `OrgAdmission::OwnerDelegated` service, and the observable is
+/// the handler's invocation count.
+///
+/// Scope, stated: the authorized positive control for the protected
+/// engine lives in the crate's own protected suites
+/// (`tests/integration_nrpc_protected.rs`, which builds a signed
+/// owner-delegated proof). This witness's job is that transport
+/// admission is **not** invocation authority.
 #[cfg(feature = "cortex")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn an_admitted_peer_without_authority_is_still_denied() {
-    use net::adapter::net::mesh_rpc::{CallOptions, RpcError};
+    use net::adapter::net::behavior::org::{OrgKeypair, OrgMembershipCert};
+    use net::adapter::net::behavior::org_admission::OrgAdmission;
+    use net::adapter::net::behavior::org_authority::NodeAuthority;
+    use net::adapter::net::cortex::{RpcContext, RpcHandlerError, RpcResponsePayload, RpcStatus};
+    use net::adapter::net::mesh_rpc::CallOptions;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Counting(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl net::adapter::net::cortex::RpcHandler for Counting {
+        async fn call(&self, _: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(RpcResponsePayload {
+                status: RpcStatus::Ok,
+                headers: vec![],
+                body: Bytes::from_static(b"served"),
+            })
+        }
+    }
 
     let (anchor, client, endpoint) = anchor_and_provisional_client().await;
     let client_id = client.node_id();
+
+    // A real authority, so a real protected registration is
+    // possible at all.
+    let org = OrgKeypair::generate();
+    let entity = anchor.entity_id().clone();
+    let cert = OrgMembershipCert::try_issue(&org, entity.clone(), 1, 3600).expect("cert");
+    let dir = std::env::temp_dir().join(format!("net-r7-protected-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let authority = NodeAuthority::adopt(&dir, cert, &entity, 0, None).expect("adopt");
+    anchor
+        .install_node_authority(Arc::new(authority))
+        .expect("install authority");
+
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let _serve = anchor
+        .serve_rpc_protected(
+            "org.protected.invoke",
+            Arc::new(Counting(Arc::clone(&invocations))),
+            OrgAdmission::OwnerDelegated,
+            Arc::new(|_| true),
+        )
+        .expect("register a REAL protected provider");
+
+    // Promote the caller: §12 admission is satisfied, and nothing
+    // else is.
     let session_id = anchor.peer_session_id(client_id).expect("session");
     assert!(anchor.promote_admission(client_id, session_id, PeerAddr::Rtc(endpoint)));
     assert!(!anchor.peer_is_provisional(client_id));
 
-    // No service is registered under this name on the anchor, and
-    // the client holds no grant of any kind. The call must fail —
-    // admission got it past §12 and no further.
-    let outcome = tokio::time::timeout(
+    // The call carries no proof at all.
+    let _ = tokio::time::timeout(
         Duration::from_secs(5),
         client.call(
             anchor.node_id(),
             "org.protected.invoke",
-            bytes::Bytes::from_static(b"{}"),
+            Bytes::from_static(b"{}"),
             CallOptions::default(),
         ),
     )
     .await;
-    match outcome {
-        Ok(Err(RpcError::Timeout { .. })) | Err(_) | Ok(Err(_)) => {}
-        Ok(Ok(_)) => panic!(
-            "enrollment is device admission, not organization membership, channel \
-             authority or permission to invoke a provider"
-        ),
-    }
+    // And the hostile shape too: publishing the request without a
+    // reply subscription, so no client-side gate can be what
+    // refused it.
+    let _ = client
+        .publish_rpc_request_unsubscribed(
+            anchor.node_id(),
+            "org.protected.invoke",
+            Bytes::from_static(b"{}"),
+        )
+        .await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    assert_eq!(
+        invocations.load(Ordering::SeqCst),
+        0,
+        "enrollment is device admission, not organization membership, channel \
+         authority or permission to invoke a provider — the registered handler \
+         must never run for a caller with no grant"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// EXIT 8: a pingwave from a provisional peer is dropped and
