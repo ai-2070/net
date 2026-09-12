@@ -813,6 +813,17 @@ async fn dropping_a_node_tears_down_the_transport_not_just_the_socket() {
     driver.hooks().set_pump_paused(true);
     tokio::time::sleep(Duration::from_millis(150)).await;
 
+    // R-D: a transport slot the driver has NO `Session` for.
+    // `create_offer` would not do — it creates a driver session the
+    // teardown loop walks. This slot is only reachable through
+    // `shutdown_terminal`, which is the claim under test: "every
+    // historical handle refused", not "every session closed".
+    let orphan = driver.transport().open_peer().expect("a bare slot");
+    assert!(
+        driver.transport().is_open(orphan),
+        "the orphan slot must be live before teardown"
+    );
+
     let discarded_before = driver.stats().discarded_at_close();
     for _ in 0..3 {
         driver
@@ -859,6 +870,17 @@ async fn dropping_a_node_tears_down_the_transport_not_just_the_socket() {
         driver.transport().submit(&[0x49u8; 64], id),
         Err(RtcSubmitError::UnknownPeer),
         "a historical handle must be refused once the driver is gone"
+    );
+    // R-D: and so must a handle the teardown loop never walked.
+    assert!(
+        !driver.transport().is_open(orphan),
+        "a slot with no session must also be closed by teardown"
+    );
+    assert_eq!(
+        driver.transport().submit(&[0x4Au8; 64], orphan),
+        Err(RtcSubmitError::UnknownPeer),
+        "\"every historical handle refused\" includes the slots the session \
+         loop never walks — that is what makes the transport terminal"
     );
     drop(b);
 }
