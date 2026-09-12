@@ -634,7 +634,7 @@ Every row was executed on this host at the commit named above.
 | `RUSTDOCFLAGS="-D warnings" cargo doc --features webrtc --no-deps` / `-p net-mesh-wire --no-deps` | pass ×2 |
 | `cargo test --lib --features "$UNIT_FEATURES"` | **5779 passed**, 0 failed, 2 ignored |
 | `cargo test --lib --features "$UNIT_FEATURES webrtc"` | **5811 passed**, 0 failed, 2 ignored |
-| Nine RTC binaries, `--no-tests=fail --retries 0` (Stage 4a's two included) | **68 run, 68 passed, 0 skipped** |
+| Nine RTC binaries, `--no-tests=fail --retries 0` (Stage 4a's two included) | **68 run, 68 passed, 0 skipped**, three consecutive whole-suite runs |
 | Per-binary counts vs CI floors | 5 / 7 / 22 / 4 / 6 / 4 / 1 / 6 / 13 — sum 68, every floor met |
 | Witness floors | **93 / 24 / 62 / 41 / 60 / 68** unchanged |
 | `cargo test --test cross_lang_wire --features net` | 10 passed |
@@ -649,6 +649,14 @@ newly pinned names; `rtc_repairs`' floor rises 18 → 22; the job
 gains `nat-traversal` (the classifier binary is gated on it); all
 three binaries take the `retries = 0` override in
 `.config/nextest.toml`.
+
+One flake was found and fixed rather than retried: under the full
+nine-binary load, `a_close_the_channel_refused_is_re_delivered_not_dropped`
+timed out on its post-resume waits (the re-delivery is driven by
+driver turns, which are slower when every RTC binary is running).
+The windows are now 30–45 s; the assertions are unchanged. These
+binaries run at `retries = 0` by policy, so a timing-sensitive
+window is a defect in the witness.
 
 ### 12.5 Still open, named
 

@@ -273,7 +273,7 @@ async fn a_close_the_channel_refused_is_re_delivered_not_dropped() {
     assert!(
         wait_for(
             || driver.stats().close_notify_deferred() > deferred_before,
-            Duration::from_secs(10)
+            Duration::from_secs(30)
         )
         .await,
         "the held consumer must make the bounded channel refuse a close — \
@@ -283,14 +283,14 @@ async fn a_close_the_channel_refused_is_re_delivered_not_dropped() {
     a.set_rtc_close_consumer_paused(false);
 
     assert!(
-        wait_for(|| a.peer_endpoint(b_id).is_none(), Duration::from_secs(15)).await,
+        wait_for(|| a.peer_endpoint(b_id).is_none(), Duration::from_secs(45)).await,
         "the exact lifetime whose close was refused must still be evicted, \
          without waiting for the failure detector"
     );
     assert!(
         wait_for(
             || (0..8).all(|slot| !driver.transport().has_pending_eviction(slot)),
-            Duration::from_secs(10)
+            Duration::from_secs(45)
         )
         .await,
         "every deferred close must be re-delivered, not merely recorded"
