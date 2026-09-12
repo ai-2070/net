@@ -9,8 +9,8 @@
 //! Linux box):
 //!
 //! ```text
-//! cargo build --example natsim_node --features net,nat-traversal
-//! cargo test --test natsim --features net,nat-traversal -- --ignored --test-threads=1
+//! cargo build --example natsim_node --features net,nat-traversal,webrtc
+//! cargo test --test natsim --features net,nat-traversal,webrtc -- --ignored --test-threads=1
 //! ```
 //!
 //! `--test-threads=1` is required — scenarios share the namespace
@@ -249,6 +249,15 @@ fn stat(v: &serde_json::Value, key: &str) -> u64 {
     })
 }
 
+/// One RTC counter from the initiator's snapshot (`stats.rtc`,
+/// present only for a node that actually runs an RTC driver).
+#[cfg(feature = "webrtc")]
+fn rtc_stat(v: &serde_json::Value, key: &str) -> u64 {
+    v["stats"]["rtc"][key].as_u64().unwrap_or_else(|| {
+        panic!("stats.rtc.{key} missing from outcome: {v:#}");
+    })
+}
+
 /// Cone × Cone across two real masqueraded namespaces: the punch
 /// lands and the session sits on B's *public NAT mapping* — the
 /// first validation of the feature against actual NAT behavior
@@ -344,6 +353,67 @@ fn natsim_relay_session_upgrades_to_direct() {
     );
 }
 
+/// Stage 4b's exit shape, against a real masquerade: an anchor
+/// behind a cone NAT publishes the **mapped** address of its RTC
+/// socket, and a native client outside the NAT ends up talking to it
+/// over a DataChannel (`PeerAddr::Rtc`) rather than over the relay
+/// the signalling rode.
+///
+/// Two facts, and it is worth being exact about which is which:
+///
+/// 1. **The announcement.** The anchor's RTC socket is bound to
+///    `192.168.101.2:7101`, which nothing outside the NAT can reach.
+///    `10.99.0.2:7101` is what `setup.sh --rtc-port-a` pins the
+///    gateway to map it to, and it is what the anchor must put on the
+///    wire. `anchor_rtc_addr` is read back from the anchor's own
+///    emitted `CapabilityAnnouncement`, not echoed from its flags.
+/// 2. **The reachability.** A DataChannel installs across the real
+///    masquerade, so the client genuinely reaches the anchor's RTC
+///    socket at the gateway's mapping — the only address its packets
+///    can be arriving on.
+///
+/// What this deliberately does NOT claim: that the *advertised*
+/// candidate is the pair ICE selected. The anchor's own connectivity
+/// checks leave through the same mapping, so a client that was told
+/// nothing would discover `10.99.0.2:7101` as a peer-reflexive
+/// candidate anyway (measured: with a deliberately wrong
+/// `--rtc-public`, ICE still connects). The address is the same
+/// either way; the provenance is not, and only the announcement half
+/// above pins it. The gateway's side of the story — that the pinned
+/// 1:1 SNAT really produced `sport=7101` — is captured in
+/// `nsim_gwa_nat.log`, which `ScenarioRun`'s `Drop` prints on any
+/// failure here.
+#[cfg(feature = "webrtc")]
+#[test]
+#[ignore = "requires root + Linux netns; run via the natsim CI job"]
+fn natsim_natted_anchor_publishes_a_reachable_rtc_addr() {
+    let v = scenario("rtc_anchor_direct");
+    assert_eq!(v["ok"], true, "the relayed session must resolve: {v:#}");
+    assert_eq!(v["started_on_relay"], true, "{v:#}");
+    assert_eq!(
+        v["anchor_rtc_addr"], "10.99.0.2:7101",
+        "the anchor must announce its MAPPED RTC socket, never the private \
+         address it is bound to: {v:#}",
+    );
+    assert_eq!(
+        v["transport"], "rtc",
+        "the client's session must end up on the DataChannel: {v:#}",
+    );
+    assert_eq!(v["direct"], true, "an RTC endpoint is a direct one: {v:#}");
+    assert!(
+        rtc_stat(&v, "ice_direct") >= 1,
+        "the attempt must be counted as an installed direct path: {v:#}",
+    );
+    // The routed leg is what carried the signalling; if the UDP punch
+    // had produced this session instead, the verdict would be a
+    // different mechanism wearing the same result.
+    assert_eq!(
+        stat(&v, "punches_succeeded"),
+        0,
+        "the direct path under test is the DataChannel, not a punch: {v:#}",
+    );
+}
+
 // =========================================================================
 // Configuration-validation guards (no root, no netns — run anywhere
 // the suite compiles). These pin the harness's fail-loudly behavior
@@ -387,6 +457,32 @@ fn setup_rejects_public_b_with_a_natted_b_side() {
     assert!(
         stderr.contains("--public-b requires --nat-b none"),
         "must name the conflict; got: {stderr}",
+    );
+}
+
+/// `--rtc-port-a` pins a 1:1 mapping the anchor then advertises.
+/// A symmetric NAT has no such mapping, so the combination must be
+/// refused rather than producing an anchor that advertises an
+/// address its own gateway never emits.
+#[test]
+fn setup_rejects_a_pinned_rtc_port_on_a_symmetric_side() {
+    let out = setup_sh(&["--nat-a", "symmetric", "--rtc-port-a", "7101"]);
+    assert_eq!(out.status.code(), Some(2), "conflicting config must exit 2");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--rtc-port-a requires --nat-a cone"),
+        "must name the conflict; got: {stderr}",
+    );
+}
+
+#[test]
+fn setup_rejects_a_non_port_rtc_port() {
+    let out = setup_sh(&["--rtc-port-a", "not-a-port"]);
+    assert_eq!(out.status.code(), Some(2), "a bad port must exit 2");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--rtc-port-a wants a UDP port"),
+        "must name the problem; got: {stderr}",
     );
 }
 

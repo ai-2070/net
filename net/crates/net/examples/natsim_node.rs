@@ -18,10 +18,20 @@
 //!   target). Accepts the named joiners in file-coordinated order,
 //!   then serves until killed.
 //! - `joiner`  — a node that dials the publics, classifies,
-//!   announces, and (optionally) drives a punch / upgrade toward a
-//!   target joiner, writing the outcome.
+//!   announces, and (optionally) drives a punch / upgrade / RTC
+//!   upgrade toward a target joiner, writing the outcome.
+//! - `capabilities` — print which optional cargo features this
+//!   binary was built with, so a scenario that needs one can refuse
+//!   before provisioning anything.
+//!
+//! RTC (`webrtc` feature): a joiner given `--rtc-bind` (and, behind
+//! a NAT, `--rtc-public`) runs a second, dedicated RTC socket and
+//! announces `rtc_addr`. `--mode rtc` additionally drives the
+//! client half: a relay-routed session, then `offer_direct_path`
+//! until the peer sits on a `PeerAddr::Rtc` DataChannel.
 //!
 //! Build: `cargo build --example natsim_node --features net,nat-traversal`
+//!        (add `webrtc` for the RTC scenarios)
 //! Not intended to run outside the natsim harness.
 
 #![cfg_attr(not(all(feature = "net", feature = "nat-traversal")), allow(unused))]
@@ -54,10 +64,12 @@ mod natsim {
 
     fn usage() -> ! {
         eprintln!(
-            "usage:\n  natsim_node keygen\n  natsim_node public --name N --bind IP:PORT \
+            "usage:\n  natsim_node keygen\n  natsim_node capabilities\n  \
+         natsim_node public --name N --bind IP:PORT \
          --state DIR --joiners a,b [--connect-to x]\n  natsim_node joiner --name N \
          --bind IP:PORT --state DIR --publics r,x [--seed-hex H] [--auto-upgrade] \
-         [--target N --mode punch|upgrade] "
+         [--rtc-bind IP:PORT] [--rtc-public IP:PORT] \
+         [--target N --mode punch|upgrade|rtc] "
         );
         std::process::exit(2);
     }
@@ -118,12 +130,55 @@ mod natsim {
         cfg
     }
 
+    /// The RTC half of a joiner's config, built from `--rtc-bind` /
+    /// `--rtc-public`. `None` when neither is given, which is every
+    /// pre-Stage-4 scenario — a node with `rtc: None` announces none
+    /// of the RTC fields and behaves exactly as before.
+    ///
+    /// `--rtc-public` is what a NAT'd anchor is told about its own
+    /// mapping: the driver advertises it as the host candidate and
+    /// the mesh announces it as `rtc_addr`. A node that is not given
+    /// one does not guess, so a public client simply omits it.
+    #[cfg(feature = "webrtc")]
+    fn rtc_config_from(
+        flags: &HashMap<String, String>,
+    ) -> Option<net::adapter::net::rtc::RtcConfig> {
+        use net::adapter::net::rtc::RtcConfig;
+        let bind: Option<SocketAddr> = flags.get("rtc-bind").map(|s| {
+            s.parse()
+                .unwrap_or_else(|_| panic!("--rtc-bind must be IP:PORT, got {s:?}"))
+        });
+        let public: Option<SocketAddr> = flags.get("rtc-public").map(|s| {
+            s.parse()
+                .unwrap_or_else(|_| panic!("--rtc-public must be IP:PORT, got {s:?}"))
+        });
+        if bind.is_none() && public.is_none() {
+            return None;
+        }
+        let mut cfg = RtcConfig::new();
+        cfg.bind_addr = bind;
+        cfg.public_addr = public;
+        // A real network between the endpoints, not loopback: give ICE
+        // room for the restricted-cone pinhole to open (the anchor's
+        // first outbound check is what makes the client's checks
+        // deliverable), while staying well inside the scenario's own
+        // 120 s verdict budget.
+        cfg.ice_deadline = Duration::from_secs(15);
+        Some(cfg)
+    }
+
     #[derive(serde::Serialize, serde::Deserialize)]
     struct NodeInfo {
         name: String,
         node_id: u64,
         pubkey_hex: String,
         addr: String,
+        /// The `rtc_addr` this node actually **announced**, read back
+        /// from its own emitted `CapabilityAnnouncement` once it has
+        /// announced. Written by the RTC roles only; `#[serde(default)]`
+        /// so every existing scenario's info file still parses.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rtc_addr: Option<String>,
     }
 
     async fn wait_for_file(path: &Path) -> Vec<u8> {
@@ -184,9 +239,37 @@ mod natsim {
         write_atomic(&state.join(marker), b"ok\n");
     }
 
+    /// The RTC counters, for the scenarios that configure an RTC
+    /// socket. Nested under `stats.rtc` rather than flattened so the
+    /// traversal keys every other scenario asserts on keep their
+    /// exact shape.
+    #[cfg(feature = "webrtc")]
+    fn rtc_stats_json(node: &MeshNode) -> serde_json::Value {
+        let s = node.rtc_stats();
+        serde_json::json!({
+            "ice_attempted": s.ice_attempted(),
+            "ice_direct": s.ice_direct(),
+            "ice_relayed": s.ice_relayed(),
+            // Which side lost a signalling frame, if one was lost:
+            // `delivered` is this node's own handler, `forwarded` is
+            // the relay leg, and the two refusal counters name a
+            // cause instead of a silent drop.
+            "signal_delivered": s.signal_delivered(),
+            "signal_forwarded": s.signal_forwarded(),
+            "signal_malformed": s.signal_malformed(),
+            "signal_over_budget": s.signal_over_budget(),
+            "signal_engine_full": s.signal_engine_full(),
+            "signal_unknown_dialog": s.signal_unknown_dialog(),
+        })
+    }
+
     fn stats_json(node: &MeshNode) -> serde_json::Value {
         let s = node.traversal_stats();
-        serde_json::json!({
+        #[cfg_attr(
+            not(feature = "webrtc"),
+            expect(unused_mut, reason = "the RTC block is the only mutation")
+        )]
+        let mut out = serde_json::json!({
             "punches_attempted": s.punches_attempted,
             "punches_succeeded": s.punches_succeeded,
             "punches_failed": s.punches_failed,
@@ -199,7 +282,15 @@ mod natsim {
             "upgrades_deferred_busy": s.upgrades_deferred_busy,
             "port_mapping_active": s.port_mapping_active,
             "port_mapping_renewals": s.port_mapping_renewals,
-        })
+        });
+        // Only for a node that actually runs an RTC driver: a key
+        // that is always present but always zero reads as "RTC did
+        // nothing" on nodes that never had RTC at all.
+        #[cfg(feature = "webrtc")]
+        if node.rtc_driver().is_some() {
+            out["rtc"] = rtc_stats_json(node);
+        }
+        out
     }
 
     /// Park for the rest of the scenario, republishing this node's
@@ -276,6 +367,7 @@ mod natsim {
                 node_id: node.node_id(),
                 pubkey_hex: hex::encode(node.public_key()),
                 addr: bind.to_string(),
+                rtc_addr: None,
             },
         );
 
@@ -330,9 +422,35 @@ mod natsim {
         let auto_upgrade = flags.contains_key("auto-upgrade");
         let target = flags.get("target").cloned();
         let mode = flags.get("mode").cloned().unwrap_or_else(|| "wait".into());
+        // Fail the configuration loudly rather than silently running a
+        // node with no RTC socket: without the feature the flags below
+        // are accepted by `parse_flags` and then do nothing, and the
+        // scenario would fail much later as "offer_direct_path: rtc is
+        // not configured". `run_scenario.sh` pre-flights the same fact
+        // via the `capabilities` role before touching a namespace.
+        #[cfg(not(feature = "webrtc"))]
+        if flags.contains_key("rtc-bind") || flags.contains_key("rtc-public") || mode == "rtc" {
+            eprintln!(
+                "natsim_node: --rtc-bind/--rtc-public/--mode rtc need the `webrtc` \
+                 cargo feature (rebuild with --features net,nat-traversal,webrtc)"
+            );
+            std::process::exit(2);
+        }
 
+        #[cfg_attr(
+            not(feature = "webrtc"),
+            expect(unused_mut, reason = "the RTC half is the only mutation")
+        )]
+        let mut cfg = node_config(bind, auto_upgrade);
+        #[cfg(feature = "webrtc")]
+        let rtc_enabled = {
+            let rtc = rtc_config_from(&flags);
+            let enabled = rtc.is_some();
+            cfg.rtc = rtc;
+            enabled
+        };
         let node = Arc::new(
-            MeshNode::new(keypair_from(&flags), node_config(bind, auto_upgrade))
+            MeshNode::new(keypair_from(&flags), cfg)
                 .await
                 .expect("joiner node"),
         );
@@ -344,6 +462,7 @@ mod natsim {
                 node_id: node.node_id(),
                 pubkey_hex: hex::encode(node.public_key()),
                 addr: bind.to_string(),
+                rtc_addr: None,
             },
         );
 
@@ -403,6 +522,32 @@ mod natsim {
         node.announce_capabilities(CapabilitySet::new())
             .await
             .expect("joiner announce");
+        // Republish this node's identity with the `rtc_addr` it
+        // ACTUALLY announced, read back out of its own emitted
+        // `CapabilityAnnouncement` rather than echoed from the flag.
+        // That is the fact the scenario is about: a NAT'd anchor must
+        // put its *mapped* address on the wire, not the private
+        // address its RTC socket is bound to. The rewrite lands before
+        // the `_ready` marker below, so a peer that waits for the
+        // marker and then re-reads the info file cannot observe the
+        // pre-announce version.
+        #[cfg(feature = "webrtc")]
+        if rtc_enabled {
+            let announced = node
+                .local_announcement_for_test()
+                .and_then(|ann| ann.rtc_addr)
+                .map(|a| a.to_string());
+            write_info(
+                &state,
+                &NodeInfo {
+                    name: name.clone(),
+                    node_id: node.node_id(),
+                    pubkey_hex: hex::encode(node.public_key()),
+                    addr: bind.to_string(),
+                    rtc_addr: announced,
+                },
+            );
+        }
         write_marker(&state, &format!("{name}_ready"));
 
         let Some(target) = target else {
@@ -494,6 +639,104 @@ mod natsim {
                     "stats": stats_json(&node),
                 })
             }
+            // The client half of the RTC-anchor scenario: a public
+            // native node outside the NAT, reaching a NAT'd anchor
+            // over a DataChannel. Signalling rides the relay-routed
+            // session (`0x0D02`); the only address the client is ever
+            // told for the anchor's RTC socket is the mapped one the
+            // anchor advertises, so an installed `PeerAddr::Rtc`
+            // endpoint IS the proof that the published `rtc_addr`
+            // works through the NAT.
+            #[cfg(feature = "webrtc")]
+            "rtc" => {
+                use net::adapter::net::PeerAddr;
+                let relay_addr: SocketAddr = public_infos[0].addr.parse().unwrap();
+                let started = tokio::time::Instant::now();
+                let connected = node
+                    .connect_via(relay_addr, &t_pk, tinfo.node_id)
+                    .await
+                    .is_ok();
+                let on_relay = node.peer_addr(tinfo.node_id) == Some(relay_addr);
+
+                // §5 Layer 1: the anchor's Noise static arrives in its
+                // signed announcement, and the offerer's half of the
+                // install handshakes against exactly that key. Waiting
+                // for it here keeps an announcement that has not
+                // propagated yet from being reported as an ICE failure.
+                let key_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+                while node.peer_announced_noise_pubkey(tinfo.node_id) != Some(t_pk)
+                    && tokio::time::Instant::now() < key_deadline
+                {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                let learned_noise_key =
+                    node.peer_announced_noise_pubkey(tinfo.node_id) == Some(t_pk);
+
+                // The anchor rewrote its info file with the `rtc_addr`
+                // it announced before it wrote `<target>_ready`, which
+                // this initiator already awaited — so this read cannot
+                // observe the pre-announce version.
+                let anchor_rtc_addr = wait_for_info(&state, &target).await.rtc_addr;
+
+                // Offer, then let the dialog's own completion owner
+                // carry it into the fenced install. Retried, not raced:
+                // the §12/C3 quiescence gate can refuse the first
+                // replacement while the fresh routed session still has
+                // unacked frames, and an attempt that loses ICE is one
+                // attempt, not a verdict. The budget is sized so the
+                // FAILING path still writes a verdict inside
+                // `run_scenario.sh`'s 120 s wait: two 20 s attempts
+                // behind the 15 s key wait, plus the classification
+                // sweep before all of it. A scenario that times out
+                // with no outcome file reports nothing but a tail of
+                // logs; one that writes `transport: "udp"` names what
+                // happened.
+                let mut offers = 0u32;
+                let mut on_rtc = false;
+                let attempts_until = tokio::time::Instant::now() + Duration::from_secs(45);
+                while connected && !on_rtc && tokio::time::Instant::now() < attempts_until {
+                    if node.offer_direct_path(tinfo.node_id).await.is_ok() {
+                        offers += 1;
+                    }
+                    // One `ice_deadline` (15 s) plus the Noise install
+                    // and the announcement round trip behind it.
+                    let settle_by = tokio::time::Instant::now() + Duration::from_secs(20);
+                    while tokio::time::Instant::now() < settle_by {
+                        if matches!(node.peer_endpoint(tinfo.node_id), Some(PeerAddr::Rtc(_))) {
+                            on_rtc = true;
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
+                }
+                serde_json::json!({
+                    "mode": "rtc",
+                    "ok": connected,
+                    "started_on_relay": on_relay,
+                    // The whole verdict in one field: `rtc` means the
+                    // session sits on a DataChannel, `udp` means it is
+                    // still on the relay (or a punched path).
+                    "transport": match node.peer_endpoint(tinfo.node_id) {
+                        Some(PeerAddr::Rtc(_)) => "rtc",
+                        Some(_) => "udp",
+                        None => "none",
+                    },
+                    "direct": node.peer_is_direct(tinfo.node_id),
+                    "upgraded": on_rtc,
+                    "offers": offers,
+                    "learned_noise_key": learned_noise_key,
+                    // What the anchor put on the wire. Behind a NAT
+                    // this MUST be the gateway's mapped address, never
+                    // the private address its RTC socket is bound to.
+                    "anchor_rtc_addr": anchor_rtc_addr,
+                    "elapsed_ms": started.elapsed().as_millis() as u64,
+                    "session_addr": node.peer_addr(tinfo.node_id).map(|a| a.to_string()),
+                    "relay_addr": relay_addr.to_string(),
+                    "self_nat_class": format!("{:?}", node.nat_class()),
+                    "peer_nat_class": format!("{:?}", node.peer_nat_class(tinfo.node_id)),
+                    "stats": stats_json(&node),
+                })
+            }
             other => {
                 eprintln!("natsim_node: unknown mode {other}");
                 std::process::exit(2);
@@ -548,6 +791,24 @@ mod natsim {
         tracing::trace!(target: "net::adapter::net::selftest", "natsim_node: trace enabled");
     }
 
+    /// `capabilities`: which optional features this binary carries.
+    ///
+    /// A scenario that needs one (today: `webrtc`) pre-flights it and
+    /// refuses before a single namespace is provisioned, instead of
+    /// discovering the gap 120 s later as an empty outcome file. The
+    /// no-feature build never reaches here — its stub `main` exits 2
+    /// with its own message, which the same check catches.
+    fn run_capabilities() {
+        println!(
+            "{}",
+            serde_json::json!({
+                "webrtc": cfg!(feature = "webrtc"),
+                "nat_traversal": cfg!(feature = "nat-traversal"),
+                "fixtures": cfg!(feature = "fixtures"),
+            })
+        );
+    }
+
     pub fn main() {
         init_tracing();
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -561,6 +822,7 @@ mod natsim {
             let flags = parse_flags(&args[1..]);
             match role.as_str() {
                 "keygen" => run_keygen().await,
+                "capabilities" => run_capabilities(),
                 "public" => run_public(flags).await,
                 "joiner" => run_joiner(flags).await,
                 _ => usage(),

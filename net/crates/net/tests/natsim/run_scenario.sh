@@ -14,6 +14,11 @@
 #   dropped_keepalives         both cone + direct-UDP drop → fallback
 #   relay_upgrade              A cone-NAT'd (lower id), B public,
 #                              auto-upgrade migrates off the relay
+#   rtc_anchor_direct          A cone-NAT'd anchor with a pinned RTC
+#                              socket, B a public native client that
+#                              upgrades the relayed session onto a
+#                              DataChannel reached at A's MAPPED
+#                              `rtc_addr` (needs a `webrtc` helper)
 #
 # Requires root (netns + nft). The helper binary must already be
 # built: NATSIM_NODE_BIN or target/debug/examples/natsim_node.
@@ -38,15 +43,54 @@ chmod 700 "$STATE"
   exit 2
 }
 
-NAT_A=cone NAT_B=cone SETUP_EXTRA=() PUBLIC_B=0 MODE=punch
+# Per-scenario knobs. `OUTCOME_NODE` names the side that writes the
+# verdict: `a` for every punch/upgrade scenario (A is the initiator),
+# `b` for the RTC scenario, where the *client* outside the NAT is the
+# one that drives the upgrade and therefore the one with a verdict.
+NAT_A=cone NAT_B=cone SETUP_EXTRA=() PUBLIC_B=0 MODE=punch OUTCOME_NODE=a
+# Extra helper args per side, resolved with the scenario.
+A_EXTRA=() PUBLIC_B_EXTRA=(--auto-upgrade)
+# Side A's RTC (second) socket, when the scenario runs one. The port
+# is pinned 1:1 by the cone gateway (`setup.sh --rtc-port-a`), which
+# is the only reason the anchor can advertise it.
+RTC_PORT_A=7101
+RTC_PORT_B=7102
 case "$SCENARIO" in
   cone_cone_punch)          NAT_A=cone;      NAT_B=cone ;;
   symmetric_cone_punch)     NAT_A=symmetric; NAT_B=cone ;;
   symmetric_symmetric_skip) NAT_A=symmetric; NAT_B=symmetric ;;
   dropped_keepalives)       NAT_A=cone;      NAT_B=cone; SETUP_EXTRA+=(--drop-direct) ;;
   relay_upgrade)            NAT_A=cone;      NAT_B=none; PUBLIC_B=1; MODE=upgrade ;;
+  rtc_anchor_direct)
+    NAT_A=cone; NAT_B=none; PUBLIC_B=1; MODE=rtc; OUTCOME_NODE=b
+    SETUP_EXTRA+=(--rtc-port-a "$RTC_PORT_A")
+    # A is the anchor: it runs an RTC socket on the pinned port and
+    # is told its own mapped address, which is what it announces as
+    # `rtc_addr`. No `--target`, so it is the responder here.
+    A_EXTRA=(--rtc-bind "192.168.101.2:$RTC_PORT_A"
+             --rtc-public "10.99.0.2:$RTC_PORT_A")
+    # B is the client: public, its own RTC socket needs no advertised
+    # address (it IS reachable), and it drives the upgrade. No
+    # `--auto-upgrade`: the only direct path under test is the
+    # DataChannel, and a UDP punch racing it would decide the verdict.
+    PUBLIC_B_EXTRA=(--target a --mode rtc --rtc-bind "10.99.0.12:$RTC_PORT_B")
+    ;;
   *) echo "unknown scenario: $SCENARIO" >&2; exit 2 ;;
 esac
+
+# Pre-flight the feature the scenario needs, BEFORE any namespace is
+# touched. Without this a helper built with the default features runs
+# happily with no RTC socket and the scenario fails 120 s later as an
+# empty verdict with nothing naming the cause.
+if [[ "$MODE" == rtc ]]; then
+  CAPS="$("$BIN" capabilities 2>/dev/null || true)"
+  case "$CAPS" in
+    *'"webrtc":true'*) ;;
+    *) echo "natsim: $SCENARIO needs a helper built with the webrtc feature \
+(cargo build --example natsim_node --features net,nat-traversal,webrtc); got: ${CAPS:-<no output>}" >&2
+       exit 2 ;;
+  esac
+fi
 
 PIDS=()
 cleanup() {
@@ -115,7 +159,7 @@ launch nsim_wan r  public --name r --bind 10.99.0.10:7000 --state "$STATE" --joi
 if [[ "$PUBLIC_B" == 1 ]]; then
   # B runs publicly inside the wan namespace (no NAT).
   launch nsim_wan b joiner --name b --bind 10.99.0.12:7002 --state "$STATE" \
-    --publics r,x --auto-upgrade "${SEED_ARGS_B[@]}"
+    --publics r,x "${PUBLIC_B_EXTRA[@]}" "${SEED_ARGS_B[@]}"
 else
   # Bind the concrete LAN IP (192.168.102.2), NOT 0.0.0.0. The
   # classifier's Open check does port-only matching on a wildcard bind
@@ -130,15 +174,21 @@ else
     --publics r,x "${SEED_ARGS_B[@]}"
 fi
 
-A_EXTRA=(--target b --mode "$MODE")
-[[ "$MODE" == upgrade ]] && A_EXTRA+=(--auto-upgrade)
+# A's role: initiator for every punch/upgrade scenario, responder (the
+# anchor) for the RTC one, where the scenario already filled A_EXTRA.
+if [[ "$MODE" != rtc ]]; then
+  A_EXTRA=(--target b --mode "$MODE")
+  if [[ "$MODE" == upgrade ]]; then
+    A_EXTRA+=(--auto-upgrade)
+  fi
+fi
 # Concrete LAN IP (192.168.101.2), not 0.0.0.0 — see the B side above
 # for why a wildcard bind misclassifies a port-preserving cone NAT.
 launch nsim_a a joiner --name a --bind 192.168.101.2:7001 --state "$STATE" \
   --publics r,x "${A_EXTRA[@]}" "${SEED_ARGS_A[@]}"
 
-# Wait for the initiator's verdict.
-OUTCOME="$STATE/a_outcome.json"
+# Wait for the verdict from whichever side drives this scenario.
+OUTCOME="$STATE/${OUTCOME_NODE}_outcome.json"
 for _ in $(seq 1 240); do
   [[ -s "$OUTCOME" ]] && break
   sleep 0.5
@@ -179,9 +229,13 @@ for gw in nsim_gwa nsim_gwb; do
     # Dead last, and the whole point of the capture: the A<->B flows.
     # On gwb a healthy punch shows the B->A flow SNAT'd to sport=7002
     # (the reflex A was told); anything else is the port-mismatch
-    # hypothesis confirmed.
-    echo "### PUNCH-RELEVANT: flows mentioning BOTH 10.99.0.2 and 10.99.0.3 ($gw)"
-    awk '/10\.99\.0\.2/ && /10\.99\.0\.3/' "$CT" || true
+    # hypothesis confirmed. 10.99.0.12 is B when it plays the public
+    # peer (relay_upgrade, rtc_anchor_direct) — for the RTC scenario
+    # this is where the anchor's pinned RTC mapping shows up, and
+    # `sport` other than the pinned port means the gateway did not
+    # honour the 1:1 SNAT the anchor advertised.
+    echo "### PUNCH-RELEVANT: flows mentioning 10.99.0.2 and (10.99.0.3|10.99.0.12) ($gw)"
+    awk '/10\.99\.0\.2/ && (/10\.99\.0\.3/ || /10\.99\.0\.12/)' "$CT" || true
     echo "### (end $gw)"
   } >"$STATE/${gw}_nat.log" 2>&1
   rm -f "$CT"

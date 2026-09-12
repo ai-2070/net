@@ -3,9 +3,15 @@
 #
 # Provisions network namespaces with genuine nftables masquerade
 # (cone = plain, symmetric = fully-random) and runs the punch /
-# fallback / upgrade scenario matrix across them — the only place
-# the feature is exercised against actual NAT behavior rather than
-# loopback. See net/crates/net/tests/natsim/README.md.
+# fallback / upgrade / RTC scenario matrix across them — the only
+# place the feature is exercised against actual NAT behavior rather
+# than loopback. See net/crates/net/tests/natsim/README.md.
+#
+# `webrtc` is in the feature set because `rtc_anchor_direct` needs a
+# helper with a real RTC socket; every other scenario is unaffected
+# by it (a node with `rtc: None` announces nothing RTC-shaped and
+# takes no RTC path), and the scenario refuses to provision anything
+# when the helper lacks the feature.
 #
 # Runs on traversal-touching PRs, nightly, and on demand.
 name: natsim
@@ -51,8 +57,8 @@ jobs:
       - name: Build helper + test binaries
         working-directory: net/crates/net
         run: |
-          cargo build --example natsim_node --features net,nat-traversal
-          cargo test --test natsim --features net,nat-traversal --no-run
+          cargo build --example natsim_node --features net,nat-traversal,webrtc
+          cargo test --test natsim --features net,nat-traversal,webrtc --no-run
 
       # Serial on purpose: scenarios share namespace names and the
       # 10.99.0.0/24 range. Each test provisions + tears down its own
@@ -60,7 +66,7 @@ jobs:
       - name: Run scenario matrix
         working-directory: net/crates/net
         run: |
-          cargo test --test natsim --features net,nat-traversal \
+          cargo test --test natsim --features net,nat-traversal,webrtc \
             -- --ignored --test-threads=1 --nocapture
 
       - name: Teardown (paranoia)
