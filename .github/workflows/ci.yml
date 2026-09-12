@@ -2528,6 +2528,54 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --doc --features "net cortex dataforts testing compute nat-traversal port-mapping aggregator tool macros fixtures"
 
+      # === Stage 4a: the SDK's RTC enrollment binary ======================
+      #
+      # `enrollment_over_rtc` is gated on the SDK's OWN `webrtc` feature,
+      # which forwards to `net-mesh/webrtc`. Every step above runs with a
+      # feature list that does NOT contain it, so the binary compiled to
+      # nothing and CI proved nothing about the SDK's WebRTC surface — the
+      # `--no-tests=fail` discipline used everywhere else cannot help when
+      # the binary itself is cfg'd out.
+      #
+      # Both witnesses are pinned by name and must each run and pass as
+      # exactly one test:
+      #   - a_real_sdk_enrollment_promotes_the_exact_session — the whole
+      #     §12 path through the public SDK: raw enrollment service,
+      #     provisional install, one permitted call, promotion of that
+      #     exact incarnation.
+      #   - a_rejected_sdk_enrollment_leaves_the_session_provisional — the
+      #     negative half; a refusal admits nothing.
+      - name: SDK WebRTC enrollment (Stage 4a)
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          FEATURES="net webrtc"
+          REQUIRED="
+            a_real_sdk_enrollment_promotes_the_exact_session
+            a_rejected_sdk_enrollment_leaves_the_session_provisional
+          "
+          out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                  --retries 0 --features "$FEATURES" --test enrollment_over_rtc 2>&1) \
+            || { printf '%s\n' "$out"; echo "::error::the SDK RTC enrollment witnesses did not pass"; exit 1; }
+          printf '%s\n' "$out" | tail -3
+          for required in $REQUIRED; do
+            single=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                       --retries 0 --features "$FEATURES" --test enrollment_over_rtc \
+                       -E "test(=$required)" 2>&1) \
+              || { printf '%s\n' "$single"; echo "::error::$required did not run and pass as exactly one test"; exit 1; }
+          done
+          echo "SDK RTC enrollment: both witnesses green"
+
+      # The SDK's `webrtc` surface under the same lint bar as the rest of
+      # the crate, and its rustdoc — neither was reachable from any step's
+      # feature list before Stage 4a.
+      - name: Lint and document the SDK's WebRTC surface (Stage 4a)
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          cargo clippy --features "net webrtc" --lib -- -D warnings
+          RUSTDOCFLAGS="-D warnings" cargo doc -p net-mesh-sdk --no-deps --features "net webrtc"
+
       # net-payments — x402 envelope model unit tests plus
       # `payments_golden_vectors`, the Rust source-of-truth verifier for
       # `tests/cross_lang_payments/` (the Node / Python / Go verifiers run
@@ -4646,8 +4694,13 @@ jobs:
           check_floor rtc_classifier 2
           check_floor rtc_admission_probes 11
           check_floor rtc_signalling 11
-          check_floor rtc_admission 19
+          check_floor rtc_admission 25
           REQUIRED="
+          rtc_admission:a_registered_client_streaming_provider_refuses_a_provisional_caller
+          rtc_admission:a_registered_duplex_provider_refuses_a_provisional_caller
+          rtc_admission:a_provisional_peer_cannot_drive_migration
+          rtc_admission:a_promotion_inside_the_teardown_window_survives
+          rtc_admission:an_outcome_that_only_looks_admitted_promotes_nothing
           rtc_repairs:scheduled_fire_and_forget_packets_reach_rtc_admission_and_the_peer
           rtc_repairs:the_scheduler_drain_counts_what_it_drops_under_pressure
           rtc_repairs:rtc_admission_pressure_is_retryable_backpressure_not_a_transport_error
