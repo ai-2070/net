@@ -1933,6 +1933,69 @@ head; CI is the arbiter.
   bootstrap allocations globally bounded; enrolled peer without provider
   authority still denied.
 
+**Stage 4 split (product owner, 2026-09-12): 4a native, 4b browser.**
+4a — announcement fields, `0x0D02`, §12 admission, §9 native end to end —
+is authorized and stacked on the Stage 3 repair head `97815f9d9` while
+Kyra reviews it; additive, feature-gated, field emission off unless
+`rtc` is configured. 4b — bootstrap listener, the credential, TLS/CORS,
+the Chromium harness, mDNS — follows in its own brief. Registry
+correction made here: `traversal/mod.rs:451` carried a comment-only
+reservation of `0x0D02` for port-mapping that was never allocated and is
+absent from `SUBPROTOCOLS.md`; `0x0D02` is `SUBPROTOCOL_RTC_SIGNAL` and
+port-mapping is reserved `0x0D03`.
+
+**4a candidate delivered: `652c786c9` + closure `85951522d` + reviewer
+fix `c59630b5f` (2026-09-12), awaiting Kyra's review.** Report
+`docs/internal/spikes/S4A_REPORT.md`. The three fields are in the struct
+**and** `SignedPayloadCanonical`; `0x0D02` codec/dispatch/budget; five
+named gates at F1–F6 (F7 `proxy.rs` unguarded — named gap, no RTC peer
+reaches it); the S0e allow-list A–E with the corrective re-announce
+guarded; §9 native end to end with the §10 three-part witness; the six
+§12 witnesses with a native browser stand-in.
+
+**Two of the agent's "named gaps" were §12 contract holes, returned as
+a closure before acceptance:** (1) promotion fired on *any* enrollment
+RESPONSE, so a **Rejected** enrollment promoted — closed by reading
+`JoinOutcome`'s self-describing wire prefix (`b"NMO1"` + tag, 0 =
+Admitted) at the promotion site, fail-closed on unknown tags, with a
+cross-crate pin test in the SDK (the only consumer-tree delta); (2)
+`ProvisionalBudget::charge_frame` had no production caller, so the
+≤ 256-frame / ≤ 256 KiB bounds were unenforced — now charged on the RTC
+ingress path before `admission_gate_deliver`. Reviewer ran both
+inverses: promote-on-Rejected → `a_rejected_enrollment_outcome_promotes_nothing`
+fails; disable the charge → both bound witnesses fail; restored,
+hash-checked.
+
+**Reviewer finding (fixed in `c59630b5f`):** the two provisional-bound
+witnesses broke their send loop on the first refused send, but under a
+loaded runtime the RTC seam refuses with typed backpressure (S3-R2)
+before the anchor has received the bound — ~1 run in 6 timed out. They
+now retry refusals (bounded) and stop only when the anchor itself
+reclaims the session; 12/12 after.
+
+Reviewer re-ran at `c59630b5f`: six RTC binaries under `--no-tests=fail
+--retries 0` (53 passed); default `--lib` 5779 with floors
+93/24/62/41/60/68; `webrtc` `--lib` 5811; the three canonical-signer
+witnesses and the `noise_pubkey` `skip_field` inverse (2 of 3 fail);
+pre-existing `cross_lang_*` suites untouched, `cross_lang_wire` 10;
+strict clippy default + `webrtc`; lean FFI members; default-feature
+wire docs; fresh cdylib 568/568.
+
+**Named gaps carried to 4b:** F7 proxy gate; `rtc_bootstrap` URL shape
+(`https://<addr>/rtc` synthesized, no listener yet); the §9 witness's
+DataChannel still comes from the in-process ICE fixture — the signalling
+is real, the candidate exchange is not yet exercised end to end.
+
+**Also fixed on this branch by the reviewer:** the Skills drift check
+failed on the Stage 3 repair head because `streams.md` /
+`observability.md` cited wire modules at their pre-Stage-2 paths
+(`d0a51fa2f`, seven citations re-derived; `bb803e40c` adds the wire
+crate to `skills.yml`'s trigger globs). The Stage 3 `webrtc-feature` job
+failed its own witness-inventory step with "`rtc_loopback` has 0 tests"
+— the `nextest list` filter matched nothing on the Linux runner; routed
+to the agent and repaired in `22fb4ae23` ("a CI inventory that cannot
+read zero"). CI at the 4a head is the arbiter for both.
+
 ## Stage 5 — `net-leaf` + `@net-mesh/browser`
 
 - Leaf crate and TypeScript wrapper; identity storage and leader election
