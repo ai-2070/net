@@ -115,6 +115,47 @@ struct PeerSlot {
     closed: AtomicBool,
     /// A slot whose generation wrapped: never handed out again.
     retired: bool,
+    /// Installs in flight against this exact incarnation (H2).
+    /// Registered and validated **under `queue`**, the same lock
+    /// `close_peer` publishes `closed` under, so a close between an
+    /// installer's liveness check and its commit is observed at the
+    /// commit rather than missed.
+    install_intents: AtomicU32,
+}
+
+/// A claim on one exact `(slot, generation)` for the duration of an
+/// install (H2).
+///
+/// Held from before the handshake's final liveness check until the
+/// installer commits under its own entry lock. It carries no
+/// exclusion — a close still wins — but it makes the close
+/// *observable* at the commit point and tells the close path that
+/// an installer was mid-flight.
+#[derive(Debug)]
+pub struct RtcInstallIntent {
+    transport: Arc<RtcTransport>,
+    id: RtcPeerId,
+}
+
+impl RtcInstallIntent {
+    /// The incarnation this intent is for.
+    #[inline]
+    pub fn peer(&self) -> RtcPeerId {
+        self.id
+    }
+
+    /// Re-validate at commit: `false` means the endpoint closed
+    /// after the intent was taken, so nothing may be installed.
+    #[inline]
+    pub fn still_live(&self) -> bool {
+        self.transport.intent_still_live(self.id)
+    }
+}
+
+impl Drop for RtcInstallIntent {
+    fn drop(&mut self) {
+        self.transport.release_install_intent(self.id);
+    }
 }
 
 /// The mesh-side handle on the RTC transport.
@@ -194,6 +235,7 @@ impl RtcTransport {
                 published_buffered: AtomicUsize::new(0),
                 closed: AtomicBool::new(false),
                 retired: false,
+                install_intents: AtomicU32::new(0),
             },
         );
         Ok(RtcPeerId { slot, generation })
@@ -423,6 +465,73 @@ impl RtcTransport {
             self.stats.note_discarded_at_close_n(discarded);
         }
         discarded
+    }
+
+    /// Take an **install intent** on this exact `(slot,
+    /// generation)` (H2).
+    ///
+    /// The liveness check and the registration happen under the
+    /// slot's queue lock — the lock `close_peer` sets `closed`
+    /// under — so the intent either predates the close (and
+    /// [`RtcInstallIntent::still_live`] will observe it at commit)
+    /// or is refused outright. A precheck that merely *read*
+    /// `is_open` and released could be overtaken by a close whose
+    /// notification was consumed before the installer had published
+    /// anything for it to evict.
+    pub fn begin_install(self: &Arc<Self>, id: RtcPeerId) -> Option<RtcInstallIntent> {
+        if self.terminal.load(Ordering::Acquire) {
+            return None;
+        }
+        let slot = self.slots.get(&id.slot)?;
+        if slot.generation != id.generation {
+            return None;
+        }
+        let _guard = slot.queue.lock();
+        if slot.closed.load(Ordering::Acquire) {
+            return None;
+        }
+        slot.install_intents.fetch_add(1, Ordering::AcqRel);
+        Some(RtcInstallIntent {
+            transport: Arc::clone(self),
+            id,
+        })
+    }
+
+    /// Is this intent's exact incarnation still installable?
+    /// Re-read under the queue lock, so the answer is ordered
+    /// against `close_peer` rather than racing it.
+    fn intent_still_live(&self, id: RtcPeerId) -> bool {
+        if self.terminal.load(Ordering::Acquire) {
+            return false;
+        }
+        let Some(slot) = self.slots.get(&id.slot) else {
+            return false;
+        };
+        if slot.generation != id.generation {
+            return false;
+        }
+        let _guard = slot.queue.lock();
+        !slot.closed.load(Ordering::Acquire)
+    }
+
+    fn release_install_intent(&self, id: RtcPeerId) {
+        if let Some(slot) = self.slots.get(&id.slot) {
+            if slot.generation == id.generation {
+                let _ =
+                    slot.install_intents
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+            }
+        }
+    }
+
+    /// Was an install in flight against this incarnation when it
+    /// closed? Used by the close path to decide whether the mesh
+    /// must be told again (H3's pending eviction).
+    pub(super) fn had_install_in_flight(&self, id: RtcPeerId) -> bool {
+        self.slots
+            .get(&id.slot)
+            .filter(|e| e.generation == id.generation)
+            .is_some_and(|e| e.install_intents.load(Ordering::Acquire) > 0)
     }
 
     /// Has the driver torn down? (H1.)

@@ -9465,6 +9465,45 @@ struct ScopedSourceSnapshot {
 /// shard — and the announcement path funnels through the same map, so a
 /// forwarding task that pends there can stop an exported FFI entry point from
 /// ever reaching its own send.
+/// What an installer believes about the peer's current incarnation
+/// (H2).
+///
+/// The shared installer used to take `Option<u64>`, where `None`
+/// meant *replace whatever is there*. The RTC caller passed the
+/// `None` it got from "no incumbent" snapshot and described it as a
+/// compare-and-swap; it was not one. Making the three cases
+/// distinct types means a caller cannot spell "I expect nothing" and
+/// get "I accept anything".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PriorSession {
+    /// Replace whatever is installed, if anything.
+    Any,
+    /// Replace only this exact incarnation.
+    Exactly(u64),
+    /// Install only if there is still **no** peer.
+    Absent,
+}
+
+impl PriorSession {
+    /// The ordinary callers' `Option<u64>` contract, unchanged.
+    #[inline]
+    fn from_option(expected: Option<u64>) -> Self {
+        match expected {
+            Some(sid) => Self::Exactly(sid),
+            None => Self::Any,
+        }
+    }
+}
+
+/// The RTC install path's commit fence (H2): an intent on the exact
+/// `(slot, generation)` plus whether the incumbent must still be
+/// quiescent when the install lands.
+#[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+struct RtcInstallFence {
+    intent: super::rtc::RtcInstallIntent,
+    require_quiescent: bool,
+}
+
 struct PeerRecipient {
     addr: PeerAddr,
     session: Arc<NetSession>,
@@ -10730,6 +10769,10 @@ pub struct MeshNode {
     /// Dialogs this node is driving (plan §9 steps 3–6).
     #[cfg(feature = "webrtc")]
     rtc_dialogs: super::rtc::SharedDialogs,
+    /// H2 witness seam: park an RTC install between the completed
+    /// Noise exchange and the commit.
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    rtc_install_pause: Arc<super::rtc::RtcInstallPause>,
     /// §10 part 2: packets this node forwarded per `(src, dst)`
     /// pair, **excluding signalling**. A globally flat forward
     /// counter is not the direct-path witness — signalling,
@@ -13193,6 +13236,8 @@ impl MeshNode {
             pending_promotions: Arc::new(DashMap::new()),
             #[cfg(feature = "webrtc")]
             rtc_dialogs: Arc::new(tokio::sync::Mutex::new(super::rtc::DialogTable::new())),
+            #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+            rtc_install_pause: Arc::new(super::rtc::RtcInstallPause::default()),
             #[cfg(feature = "webrtc")]
             forwarded_app_packets: Arc::new(DashMap::new()),
             #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
@@ -22311,14 +22356,21 @@ impl MeshNode {
         // skipped it could replace a session with open streams or
         // unacked data and lose that state.
         let prior = self.rtc_upgrade_precheck(peer_node_id)?;
+        // H2: the intent is taken **before** the handshake wait, on
+        // the exact `(slot, generation)`, under the transport's own
+        // slot lock. A check taken after the wait answers a question
+        // about a handle that may already have been closed and had
+        // its notification consumed; the claim taken here is what
+        // the commit re-validates.
+        let fence = self.rtc_install_fence(peer)?;
         let keys = self
             .handshake_initiator(peer_addr, peer_pubkey, peer_node_id)
             .await?;
-        // R3-E: fence on the exact live handle. A handshake that
-        // completed while the channel was being reaped must not
-        // install a dead endpoint.
-        self.require_live_rtc_endpoint(peer)?;
-        let outcome = self.install_direct(peer_node_id, peer_addr, keys, prior);
+        // H2: a pausable completed exchange — the witnesses need the
+        // gap between "Noise finished" and "install commits" to be an
+        // observable point rather than a timing accident.
+        self.rtc_install_pause_point().await;
+        let outcome = self.install_direct_fenced(peer_node_id, peer_addr, keys, prior, &fence);
         if !outcome.owned {
             return Err(AdapterError::Connection(
                 "rtc install lost the compare-and-swap: a newer incarnation won".into(),
@@ -22360,6 +22412,8 @@ impl MeshNode {
     ) -> Result<u64, AdapterError> {
         let peer_addr = PeerAddr::Rtc(peer);
         let prior = self.rtc_upgrade_precheck(peer_node_id)?;
+        // H2, responder half: same intent, taken before the wait.
+        let fence = self.rtc_install_fence(peer)?;
         let prologue = handshake_prologue(routing_id(peer_node_id), routing_id(self.node_id));
         let mut handshake = NoiseHandshake::responder_with_prologue(
             &self.config.psk,
@@ -22421,8 +22475,10 @@ impl MeshNode {
         let keys = handshake
             .into_session_keys()
             .map_err(|e| AdapterError::Fatal(format!("key extraction failed: {e}")))?;
-        self.require_live_rtc_endpoint(peer)?;
-        let outcome = self.install_direct(peer_node_id, peer_addr, keys, prior);
+        // H2, responder half: the same pause seam; the fence was
+        // taken before the wait, and the commit re-validates it.
+        self.rtc_install_pause_point().await;
+        let outcome = self.install_direct_fenced(peer_node_id, peer_addr, keys, prior, &fence);
         if !outcome.owned {
             return Err(AdapterError::Connection(
                 "rtc install lost the compare-and-swap: a newer incarnation won".into(),
@@ -22441,25 +22497,15 @@ impl MeshNode {
     /// `attempt_direct_upgrade` makes, and the reason it makes it is
     /// that replacing a busy session drops its in-flight state.
     #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
-    fn rtc_upgrade_precheck(&self, peer_node_id: u64) -> Result<Option<u64>, AdapterError> {
+    fn rtc_upgrade_precheck(&self, peer_node_id: u64) -> Result<PriorSession, AdapterError> {
         let Some(entry) = self.peers.get(&peer_node_id) else {
-            return Ok(None);
+            // H2: "nothing is installed" is an expectation the commit
+            // must re-check, not permission to overwrite whatever
+            // arrives in the meantime.
+            return Ok(PriorSession::Absent);
         };
         let info = entry.value();
-        // The signalling stream itself is NOT application state.
-        // `0x0D02` rides the very session the upgrade is about, so
-        // counting it as "busy" would make a session that is
-        // negotiating its own replacement permanently ineligible
-        // for it. Everything else — application streams, unacked
-        // reliable data — still defers, which is the C3 decision
-        // `attempt_direct_upgrade` makes.
-        let signalling_stream = super::rtc::SUBPROTOCOL_RTC_SIGNAL as u64;
-        let busy = info
-            .session
-            .stream_ids()
-            .iter()
-            .any(|id| *id != signalling_stream)
-            || info.session.has_unacked();
+        let busy = Self::session_is_busy(info);
         let sid = info.session.session_id();
         drop(entry);
         if busy {
@@ -22467,26 +22513,92 @@ impl MeshNode {
                 "rtc upgrade deferred: the incumbent session is busy".into(),
             ));
         }
-        Ok(Some(sid))
+        Ok(PriorSession::Exactly(sid))
     }
 
-    /// Refuse to install on a handle the driver no longer holds
-    /// (R3-E). Checked immediately before the transition, so a
-    /// handshake that finished during a reap cannot publish a dead
-    /// endpoint.
+    /// Is this peer's session carrying application state an upgrade
+    /// would lose?
+    ///
+    /// The signalling stream itself is NOT application state.
+    /// `0x0D02` rides the very session the upgrade is about, so
+    /// counting it as "busy" would make a session that is
+    /// negotiating its own replacement permanently ineligible for
+    /// it. Everything else — application streams, unacked reliable
+    /// data — still defers, which is the C3 decision
+    /// `attempt_direct_upgrade` makes.
     #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
-    fn require_live_rtc_endpoint(&self, peer: super::rtc::RtcPeerId) -> Result<(), AdapterError> {
-        let live = self
+    fn session_is_busy(info: &PeerInfo) -> bool {
+        let signalling_stream = super::rtc::SUBPROTOCOL_RTC_SIGNAL as u64;
+        info.session
+            .stream_ids()
+            .iter()
+            .any(|id| *id != signalling_stream)
+            || info.session.has_unacked()
+    }
+
+    /// Take the install fence for this endpoint (R3-E, H2).
+    ///
+    /// Refuses immediately on a handle the driver no longer holds,
+    /// and carries the claim the commit re-validates under the
+    /// transport's slot lock. `require_quiescent` is set whenever
+    /// there is an incumbent to preserve.
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    fn rtc_install_fence(
+        &self,
+        peer: super::rtc::RtcPeerId,
+    ) -> Result<RtcInstallFence, AdapterError> {
+        let intent = self
             .rtc_driver
             .as_ref()
-            .is_some_and(|d| d.transport().is_open(peer));
-        if live {
-            Ok(())
-        } else {
-            Err(AdapterError::Connection(
-                "rtc endpoint closed before the session could be installed".into(),
-            ))
-        }
+            .and_then(|d| d.transport().begin_install(peer))
+            .ok_or_else(|| {
+                AdapterError::Connection(
+                    "rtc endpoint closed before the session could be installed".into(),
+                )
+            })?;
+        Ok(RtcInstallFence {
+            intent,
+            require_quiescent: true,
+        })
+    }
+
+    /// Test hook: park an RTC install between "Noise completed" and
+    /// "commit" (H2). Unarmed in production — one relaxed load.
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    async fn rtc_install_pause_point(&self) {
+        self.rtc_install_pause.wait_if_armed().await;
+    }
+
+    /// The install pause the H2 witnesses drive.
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    pub fn rtc_install_pause(&self) -> &Arc<super::rtc::RtcInstallPause> {
+        &self.rtc_install_pause
+    }
+
+    /// Install a DIRECT session with an RTC **install fence** (H2).
+    ///
+    /// Everything the fence carries is re-evaluated inside the
+    /// installer's entry lock: the endpoint's liveness on the exact
+    /// `(slot, generation)`, the caller's expectation about the
+    /// incumbent, and — for an upgrade — the incumbent's
+    /// quiescence. A precheck that answered before the Noise wait
+    /// answers a question about the past.
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    fn install_direct_fenced(
+        &self,
+        peer_node_id: u64,
+        owned_addr: PeerAddr,
+        keys: SessionKeys,
+        expectation: PriorSession,
+        fence: &RtcInstallFence,
+    ) -> PeerTransitionOutcome {
+        self.install_peer_transition_inner(
+            peer_node_id,
+            PeerTransport::Direct { owned: owned_addr },
+            keys,
+            expectation,
+            Some(fence),
+        )
     }
 
     /// Install a DIRECT session: the peer answered at `owned_addr`
@@ -22509,7 +22621,7 @@ impl MeshNode {
             peer_node_id,
             PeerTransport::Direct { owned: owned_addr },
             keys,
-            expected_prior_session_id,
+            PriorSession::from_option(expected_prior_session_id),
         )
     }
 
@@ -22541,7 +22653,7 @@ impl MeshNode {
                 adjacent_relay_identity,
             },
             keys,
-            expected_prior_session_id,
+            PriorSession::from_option(expected_prior_session_id),
         )
     }
 
@@ -22564,7 +22676,27 @@ impl MeshNode {
         peer_node_id: u64,
         transport: PeerTransport,
         keys: SessionKeys,
-        expected_prior_session_id: Option<u64>,
+        expectation: PriorSession,
+    ) -> PeerTransitionOutcome {
+        self.install_peer_transition_inner(
+            peer_node_id,
+            transport,
+            keys,
+            expectation,
+            #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+            None,
+        )
+    }
+
+    fn install_peer_transition_inner(
+        &self,
+        peer_node_id: u64,
+        transport: PeerTransport,
+        keys: SessionKeys,
+        expectation: PriorSession,
+        #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))] fence: Option<
+            &RtcInstallFence,
+        >,
     ) -> PeerTransitionOutcome {
         // OLB-2B.3c step 2, HOLD-2 item 1: the peer swap and the republication
         // it causes are ONE serialized transition. The session publication gate
@@ -22575,7 +22707,14 @@ impl MeshNode {
         // nothing.
         self.commit_peer_transition(|| {
             let outcome = self.peer_transitions.with(peer_node_id, || {
-                self.install_peer_locked(peer_node_id, transport, keys, expected_prior_session_id)
+                self.install_peer_locked(
+                    peer_node_id,
+                    transport,
+                    keys,
+                    expectation,
+                    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+                    fence,
+                )
             });
             let published = outcome.owned;
             (outcome, published)
@@ -22612,9 +22751,23 @@ impl MeshNode {
         peer_node_id: u64,
         transport: PeerTransport,
         keys: SessionKeys,
-        expected_prior_session_id: Option<u64>,
+        expectation: PriorSession,
+        #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))] fence: Option<
+            &RtcInstallFence,
+        >,
     ) -> PeerTransitionOutcome {
         use dashmap::mapref::entry::Entry;
+
+        // H2: the endpoint's liveness, re-read under the transport's
+        // own slot lock at the moment of commit. The intent was taken
+        // before the handshake's last wait; a close that landed since
+        // is observed here instead of publishing a dead peer that
+        // nothing will ever evict (its close notification was
+        // consumed while no reverse index existed).
+        #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+        if fence.is_some_and(|f| !f.intent.still_live()) {
+            return PeerTransitionOutcome::lost();
+        }
 
         let peer_addr = transport.send_addr();
         let remote_static_pub = keys.remote_static_pub;
@@ -22652,15 +22805,38 @@ impl MeshNode {
         // session untouched.
         let displaced: Option<PeerInfo> = match self.peers.entry(peer_node_id) {
             Entry::Occupied(mut occ) => {
-                if let Some(expected) = expected_prior_session_id {
-                    if occ.get().session.session_id() != expected {
-                        return PeerTransitionOutcome::lost();
+                match expectation {
+                    // H2: `Absent` is a real expectation, not the
+                    // absence of one. The RTC caller that snapshotted
+                    // "no incumbent" used to pass `None`, which this
+                    // helper reads as *unconditional replacement* — so
+                    // a session installed while Noise was in flight was
+                    // overwritten by the older attempt.
+                    PriorSession::Absent => return PeerTransitionOutcome::lost(),
+                    PriorSession::Exactly(expected) => {
+                        if occ.get().session.session_id() != expected {
+                            return PeerTransitionOutcome::lost();
+                        }
+                        // H2: quiescence is a commit-time property.
+                        // The incumbent was quiet when the caller
+                        // sampled it; a stream opened during the
+                        // handshake does not change its session id, so
+                        // the id CAS alone happily replaced a session
+                        // that had become busy — losing exactly the
+                        // in-flight state the gate exists to protect.
+                        #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+                        if fence.is_some_and(|f| f.require_quiescent)
+                            && Self::session_is_busy(occ.get())
+                        {
+                            return PeerTransitionOutcome::lost();
+                        }
                     }
+                    PriorSession::Any => {}
                 }
                 Some(occ.insert(new_entry))
             }
             Entry::Vacant(vac) => {
-                if expected_prior_session_id.is_some() {
+                if matches!(expectation, PriorSession::Exactly(_)) {
                     // CAS expected a prior session, but it's gone (torn
                     // down). Abort rather than resurrect a session the
                     // upgrade didn't intend to create.

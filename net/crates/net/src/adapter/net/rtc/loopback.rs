@@ -37,6 +37,41 @@ pub async fn connect_rtc_loopback(
     a: &Arc<MeshNode>,
     b: &Arc<MeshNode>,
 ) -> Result<(RtcPeerId, RtcPeerId), AdapterError> {
+    let (id_a, id_b) = open_rtc_channel(a, b).await?;
+
+    // Noise over the DataChannel, through the production paths.
+    // The responder registers first: its inbox has to exist before
+    // msg1 lands, exactly as in the UDP case.
+    let b_task = {
+        let b = Arc::clone(b);
+        let a_node_id = a.node_id();
+        tokio::spawn(async move { b.accept_rtc(id_b, a_node_id).await })
+    };
+    // Give the responder a moment to register its inbox before msg1
+    // is sent; the initiator retries on timeout anyway, but this
+    // keeps the happy path to one attempt.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let b_pubkey = *b.public_key();
+    a.connect_rtc(id_a, &b_pubkey, b.node_id()).await?;
+    b_task
+        .await
+        .map_err(|e| AdapterError::Connection(format!("rtc accept task: {e}")))??;
+
+    Ok((id_a, id_b))
+}
+
+/// Open the DataChannel **without** running Noise over it, and
+/// return both endpoint handles.
+///
+/// Split out of [`connect_rtc_loopback`] for the H2 install-race
+/// witnesses: they need the handles before the handshake so they can
+/// close, supersede or busy the endpoint while a completed exchange
+/// is parked at the install seam.
+pub async fn open_rtc_channel(
+    a: &Arc<MeshNode>,
+    b: &Arc<MeshNode>,
+) -> Result<(RtcPeerId, RtcPeerId), AdapterError> {
     let driver_a = a
         .rtc_driver()
         .ok_or_else(|| AdapterError::Connection("node a has no rtc driver".into()))?;
@@ -74,25 +109,6 @@ pub async fn connect_rtc_loopback(
     // 3. Wait for the channel on both sides.
     driver_a.await_open(id_a).await.map_err(err)?;
     driver_b.await_open(id_b).await.map_err(err)?;
-
-    // 4. Noise over the DataChannel, through the production paths.
-    //    The responder registers first: its inbox has to exist before
-    //    msg1 lands, exactly as in the UDP case.
-    let b_task = {
-        let b = Arc::clone(b);
-        let a_node_id = a.node_id();
-        tokio::spawn(async move { b.accept_rtc(id_b, a_node_id).await })
-    };
-    // Give the responder a moment to register its inbox before msg1
-    // is sent; the initiator retries on timeout anyway, but this
-    // keeps the happy path to one attempt.
-    tokio::time::sleep(Duration::from_millis(20)).await;
-
-    let b_pubkey = *b.public_key();
-    a.connect_rtc(id_a, &b_pubkey, b.node_id()).await?;
-    b_task
-        .await
-        .map_err(|e| AdapterError::Connection(format!("rtc accept task: {e}")))??;
 
     Ok((id_a, id_b))
 }

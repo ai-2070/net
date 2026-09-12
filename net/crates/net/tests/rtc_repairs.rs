@@ -691,29 +691,41 @@ async fn two_concurrent_joiners_both_observe_completed_teardown() {
     driver.hooks().set_stall_loop(true);
     tokio::time::sleep(Duration::from_millis(300)).await;
 
+    // Each joiner reports the completion marker the task's own
+    // teardown guard publishes — `terminal` is set after every slot
+    // is closed and before the socket is released, so observing it
+    // is observing completed teardown. The socket is bound once,
+    // after both return: two joiners racing the same `bind` would
+    // fail each other on `AddrInUse` and say nothing about the
+    // driver.
     let first = {
         let d = driver.clone();
         tokio::spawn(async move {
             d.shutdown_and_join().await;
-            std::net::UdpSocket::bind(addr).is_ok() && d.transport().is_terminal()
+            d.transport().is_terminal()
         })
     };
     let second = {
         let d = driver.clone();
         tokio::spawn(async move {
             d.shutdown_and_join().await;
-            std::net::UdpSocket::bind(addr).is_ok() && d.transport().is_terminal()
+            d.transport().is_terminal()
         })
     };
     let (first, second) = tokio::join!(first, second);
     assert!(
         first.expect("first joiner"),
-        "the joiner that owned the handle must see a released socket"
+        "the joiner that owned the handle must see completed teardown"
     );
     assert!(
         second.expect("second joiner"),
         "the joiner that found no handle must wait for the SAME completion, \
          not return on the assumption that someone else finished"
+    );
+    let rebound = std::net::UdpSocket::bind(addr);
+    assert!(
+        rebound.is_ok(),
+        "both joins returned, so the socket must be free: {rebound:?}"
     );
     drop(a);
 }

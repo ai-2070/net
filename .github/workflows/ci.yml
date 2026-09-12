@@ -4575,6 +4575,7 @@ jobs:
           --test rtc_backpressure
           --test rtc_repairs
           --test rtc_routed_restore
+          --test rtc_install_race
           --test rtc_signalling
           --test rtc_admission
 
@@ -4631,6 +4632,7 @@ jobs:
           check_floor rtc_backpressure 7
           check_floor rtc_repairs 18
           check_floor rtc_routed_restore 4
+          check_floor rtc_install_race 6
           check_floor rtc_signalling 6
           check_floor rtc_admission 13
           REQUIRED="
@@ -4655,6 +4657,11 @@ jobs:
           rtc_routed_restore:routed_then_direct_then_loss_then_manually_restored_routed
           rtc_routed_restore:an_nrpc_call_round_trips_over_the_datachannel
           rtc_routed_restore:a_capability_fold_applies_a_remote_fact_received_over_rtc
+          rtc_install_race:a_close_consumed_before_the_commit_refuses_the_dead_endpoint
+          rtc_install_race:a_close_before_the_responder_commits_refuses_the_dead_endpoint
+          rtc_install_race:an_absent_snapshot_cannot_overwrite_a_session_installed_during_the_handshake
+          rtc_install_race:an_expected_present_snapshot_loses_to_a_newer_incarnation
+          rtc_install_race:an_incumbent_that_becomes_busy_during_the_handshake_is_preserved
           rtc_signalling:signalling_crosses_an_anchor_that_cannot_read_it
           rtc_signalling:the_full_section_9_sequence_with_the_three_part_witness
           rtc_signalling:over_budget_signalling_is_dropped_and_counted

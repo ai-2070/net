@@ -48,20 +48,20 @@ pub use config::{
     DEFAULT_INGRESS_QUEUE_PACKETS, DEFAULT_MAX_PEERS, DEFAULT_MAX_PROVISIONAL,
     DEFAULT_SEND_QUEUE_BYTES, DEFAULT_SEND_QUEUE_PACKETS,
 };
-#[cfg(any(test, feature = "fixtures"))]
-pub use driver::RtcTestHooks;
 pub use driver::{RtcDriver, RtcDriverHandle, RtcSignal};
+#[cfg(any(test, feature = "fixtures"))]
+pub use driver::{RtcInstallPause, RtcTestHooks};
 pub use engine::{
     expire_dialogs, handle_signal, start_dialog, Dialog, DialogTable, SharedDialogs, SignalOutcome,
 };
 #[cfg(any(test, feature = "fixtures"))]
-pub use loopback::connect_rtc_loopback;
+pub use loopback::{connect_rtc_loopback, open_rtc_channel};
 pub use signal::{
     RtcRejectReason, RtcSignalError, RtcSignalMsg, SignalAdmit, SignalBudget, BUDGET_WINDOW,
     MAX_DIALOGS_PER_PEER, MAX_FRAMES_PER_WINDOW, MAX_SDP_BYTES, SUBPROTOCOL_RTC_SIGNAL,
 };
 pub use stats::RtcStats;
 pub use stun::{binding_response, is_binding_request, parse_xor_mapped_address, STUN_MAGIC_COOKIE};
-pub use transport::{RtcSubmitError, RtcTransport};
+pub use transport::{RtcInstallIntent, RtcSubmitError, RtcTransport};
 
 pub use net_wire::peer_addr::RtcPeerId;

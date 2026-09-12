@@ -211,6 +211,74 @@ impl RtcTestHooks {
     }
 }
 
+/// A pausable seam between "the RTC Noise exchange completed" and
+/// "the install commits" (H2).
+///
+/// The install-race witnesses need that gap to be an observable
+/// point, not a timing accident: arm the pause, start the exchange,
+/// wait until the installer has *reached* it, interfere (close the
+/// endpoint, install a competing incarnation, open a stream on the
+/// incumbent), then release. Unarmed — which is every production
+/// build path — it is one relaxed load.
+#[cfg(any(test, feature = "fixtures"))]
+#[derive(Debug, Default)]
+pub struct RtcInstallPause {
+    /// How many more arriving installs to park. A bound rather than
+    /// a flag because a witness usually parks *one* attempt and
+    /// then needs a second, competing attempt to run to completion.
+    park_budget: std::sync::atomic::AtomicU32,
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    arrivals: std::sync::atomic::AtomicU32,
+}
+
+#[cfg(any(test, feature = "fixtures"))]
+impl RtcInstallPause {
+    /// Park the **next** install that reaches the seam; later ones
+    /// pass straight through.
+    pub fn arm_once(&self) {
+        self.park_budget.store(1, Ordering::Release);
+    }
+
+    /// Let parked installs through and stop parking new ones.
+    pub fn release(&self) {
+        self.park_budget.store(0, Ordering::Release);
+        self.release.notify_waiters();
+    }
+
+    /// How many installs have reached the seam.
+    pub fn arrivals(&self) -> u32 {
+        self.arrivals.load(Ordering::Acquire)
+    }
+
+    /// Wait until an install is parked at the seam.
+    pub async fn wait_until_reached(&self) {
+        loop {
+            let notified = self.reached.notified();
+            if self.arrivals() > 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub(crate) async fn wait_if_armed(&self) {
+        let taken = self
+            .park_budget
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n > 0).then(|| n - 1)
+            })
+            .is_ok();
+        if !taken {
+            return;
+        }
+        let released = self.release.notified();
+        self.arrivals.fetch_add(1, Ordering::AcqRel);
+        self.reached.notify_waiters();
+        released.await;
+    }
+}
+
 /// Mesh-side handle on the driver.
 #[derive(Debug, Clone)]
 pub struct RtcDriverHandle {
