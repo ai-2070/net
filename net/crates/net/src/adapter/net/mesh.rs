@@ -26928,6 +26928,17 @@ impl MeshNode {
         // serialized under the session publication gate, taken FIRST — so no
         // projection build can be sitting between its revalidation and its
         // store while this registration lands.
+        // **R1-A: compute the derived admission BEFORE taking the
+        // `peers` entry.** `derived_admission` re-enters
+        // `peers.get` through `ingress_admission`, and both arms of
+        // the constructor below run while holding a `peers.entry`
+        // write guard — a same-node routed re-handshake over its
+        // own indexed RTC endpoint reacquires its own DashMap shard
+        // and deadlocks. The decision is about the *upstream*
+        // endpoint and does not depend on this entry, so it is
+        // taken here, once.
+        #[cfg(feature = "webrtc")]
+        let inherited_admission = Self::derived_admission(source, ctx);
         let Some((registered_session_id, registered_route_token)) = commit_peer_transition(
             &ctx.session_routing,
             &ctx.routing_registry,
@@ -27019,7 +27030,7 @@ impl MeshNode {
                                         // which then satisfied the
                                         // node-keyed unary gate.
                                         #[cfg(feature = "webrtc")]
-                                        admission: Self::derived_admission(source, ctx),
+                                        admission: inherited_admission,
                                     });
                                     Some(session_id)
                                 }
@@ -27049,7 +27060,7 @@ impl MeshNode {
                                 // R1: derive, never default (see
                                 // the rotation arm above).
                                 #[cfg(feature = "webrtc")]
-                                admission: Self::derived_admission(source, ctx),
+                                admission: inherited_admission,
                             });
                             Some(session_id)
                         }
@@ -27308,6 +27319,14 @@ impl MeshNode {
 
         // Check subprotocol — migration messages are sent as single event frames
         if parsed.header.subprotocol_id == SUBPROTOCOL_MIGRATION {
+            // **R1-A: migration is a local effect too.** The
+            // dispatch invoked the application's migration handler
+            // before any admission decision, so an unenrolled peer
+            // could drive it.
+            #[cfg(feature = "webrtc")]
+            if !Self::admission_gate_deliver_source(&parsed.source, ctx) {
+                return;
+            }
             // `ArcSwapOption::load` — lock-free on the hot path.
             let handler_guard = ctx.migration_handler.load();
             if let Some(handler) = handler_guard.as_ref() {

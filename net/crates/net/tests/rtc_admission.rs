@@ -1146,3 +1146,268 @@ async fn a_provisional_sender_cannot_allocate_arbitrary_streams() {
         net::adapter::net::rtc::MAX_PROVISIONAL_STREAMS
     );
 }
+
+/// R1-A: a routed re-handshake **through a provisional RTC
+/// endpoint** completes instead of deadlocking.
+///
+/// `derived_admission` re-enters `peers.get` through
+/// `ingress_admission`, and the routed constructor ran it while
+/// holding that same peer's `peers.entry` write guard: the
+/// same-node case reacquires its own DashMap shard. The decision is
+/// now taken before the entry.
+///
+/// The whole test is wrapped in an **external timeout**: a deadlock
+/// is a hang, not a failed assertion, so the witness has to fail
+/// rather than wedge the suite.
+///
+/// Inverse: move `derived_admission` back inside the entry arms —
+/// this test times out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_routed_rehandshake_through_a_provisional_endpoint_does_not_deadlock() {
+    let outcome = tokio::time::timeout(Duration::from_secs(30), async {
+        let (anchor, client, _endpoint) = anchor_and_provisional_client().await;
+        let client_id = client.node_id();
+        assert!(anchor.peer_is_provisional(client_id));
+
+        // The provisional client runs a routed handshake addressed
+        // to the anchor itself, through its own RTC endpoint — the
+        // bootstrap shape, and the same-node case that reacquires
+        // the shard.
+        for _ in 0..3 {
+            let _ = client
+                .send_transit_probe_for_test(anchor.node_id(), anchor.node_id())
+                .await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // The dispatch loop is still alive and still answering.
+        assert!(
+            wait_for(
+                || anchor.peer_endpoint(client_id).is_some(),
+                Duration::from_secs(5)
+            )
+            .await,
+            "the anchor's dispatch must still be serving this peer"
+        );
+        anchor.peer_is_provisional(client_id)
+    })
+    .await;
+    assert!(
+        outcome.is_ok(),
+        "a routed re-handshake through a provisional RTC endpoint must not \
+         deadlock the dispatch loop"
+    );
+    assert!(
+        outcome.expect("no timeout"),
+        "and the peer it introduces is not admitted by the relay's own session"
+    );
+}
+
+/// R1-A: the **client-streaming** bridge refuses a provisional
+/// caller and serves an admitted one. Its gate is a separate
+/// mutable call site from the server-streaming one.
+///
+/// Inverse: remove `rtc_admission_allows_rpc` from the
+/// client-streaming bridge — the provisional publish invokes the
+/// handler.
+#[cfg(feature = "cortex")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_registered_client_streaming_provider_refuses_a_provisional_caller() {
+    use net::adapter::net::cortex::{RpcHandlerError, RpcResponsePayload, RpcStatus};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Counting(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl net::adapter::net::cortex::RpcClientStreamingHandler for Counting {
+        async fn call(
+            &self,
+            _ctx: net::adapter::net::cortex::RpcStreamingContext,
+            _chunks: net::adapter::net::cortex::RequestStream,
+        ) -> Result<RpcResponsePayload, RpcHandlerError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(RpcResponsePayload {
+                status: RpcStatus::Ok,
+                headers: vec![],
+                body: Bytes::from_static(b"served"),
+            })
+        }
+    }
+
+    let (anchor, client, endpoint) = anchor_and_provisional_client().await;
+    let client_id = client.node_id();
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let _serve = anchor
+        .serve_rpc_client_stream("r1.upload", Arc::new(Counting(Arc::clone(&invocations))))
+        .expect("register a real client-streaming provider");
+    assert!(
+        wait_for(
+            || client.publish_rpc_request_unsubscribed_is_routable("r1.upload", anchor.node_id()),
+            Duration::from_secs(10)
+        )
+        .await,
+        "the client must be able to address the registered service"
+    );
+
+    let refused_before = anchor.rtc_stats().admission_refused_deliver();
+    client
+        .publish_rpc_request_unsubscribed(anchor.node_id(), "r1.upload", Bytes::from_static(b"hi"))
+        .await
+        .expect("publish");
+    assert!(
+        wait_for(
+            || anchor.rtc_stats().admission_refused_deliver() > refused_before,
+            Duration::from_secs(5)
+        )
+        .await,
+        "the client-streaming bridge must refuse the provisional caller at its own gate \
+         and count it"
+    );
+    assert_eq!(
+        invocations.load(Ordering::SeqCst),
+        0,
+        "the client-streaming handler must never run for an unenrolled peer"
+    );
+
+    let session = anchor.peer_session_id(client_id).expect("session");
+    assert!(anchor.promote_admission(client_id, session, PeerAddr::Rtc(endpoint)));
+    let refused_after_promotion = anchor.rtc_stats().admission_refused_deliver();
+    client
+        .publish_rpc_request_unsubscribed(anchor.node_id(), "r1.upload", Bytes::from_static(b"hi"))
+        .await
+        .expect("publish");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        anchor.rtc_stats().admission_refused_deliver(),
+        refused_after_promotion,
+        "the positive control: after promotion the SAME publish passes this \
+         bridge's gate — the effect the gate owns. Driving the client-streaming handler \
+         to completion additionally needs the chunk/grant protocol, which is \
+         not what admission decides, so it is not claimed here."
+    );
+}
+
+/// R1-A: the **duplex** bridge, same contract, its own call site.
+///
+/// Inverse: remove `rtc_admission_allows_rpc` from the duplex
+/// bridge.
+#[cfg(feature = "cortex")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_registered_duplex_provider_refuses_a_provisional_caller() {
+    use net::adapter::net::cortex::RpcHandlerError;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Counting(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl net::adapter::net::cortex::RpcDuplexHandler for Counting {
+        async fn call(
+            &self,
+            _ctx: net::adapter::net::cortex::RpcStreamingContext,
+            _chunks: net::adapter::net::cortex::RequestStream,
+            sink: net::adapter::net::cortex::RpcResponseSink,
+        ) -> Result<(), RpcHandlerError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            sink.send(Bytes::from_static(b"served"));
+            Ok(())
+        }
+    }
+
+    let (anchor, client, endpoint) = anchor_and_provisional_client().await;
+    let client_id = client.node_id();
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let _serve = anchor
+        .serve_rpc_duplex("r1.duplex", Arc::new(Counting(Arc::clone(&invocations))))
+        .expect("register a real duplex provider");
+    assert!(
+        wait_for(
+            || client.publish_rpc_request_unsubscribed_is_routable("r1.duplex", anchor.node_id()),
+            Duration::from_secs(10)
+        )
+        .await,
+        "the client must be able to address the registered service"
+    );
+
+    let refused_before = anchor.rtc_stats().admission_refused_deliver();
+    client
+        .publish_rpc_request_unsubscribed(anchor.node_id(), "r1.duplex", Bytes::from_static(b"hi"))
+        .await
+        .expect("publish");
+    assert!(
+        wait_for(
+            || anchor.rtc_stats().admission_refused_deliver() > refused_before,
+            Duration::from_secs(5)
+        )
+        .await,
+        "the duplex bridge must refuse the provisional caller at its own gate \
+         and count it"
+    );
+    assert_eq!(
+        invocations.load(Ordering::SeqCst),
+        0,
+        "the duplex handler must never run for an unenrolled peer"
+    );
+
+    let session = anchor.peer_session_id(client_id).expect("session");
+    assert!(anchor.promote_admission(client_id, session, PeerAddr::Rtc(endpoint)));
+    let refused_after_promotion = anchor.rtc_stats().admission_refused_deliver();
+    client
+        .publish_rpc_request_unsubscribed(anchor.node_id(), "r1.duplex", Bytes::from_static(b"hi"))
+        .await
+        .expect("publish");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        anchor.rtc_stats().admission_refused_deliver(),
+        refused_after_promotion,
+        "the positive control: after promotion the SAME publish passes this \
+         bridge's gate — the effect the gate owns. Driving the duplex handler \
+         to completion additionally needs the chunk/grant protocol, which is \
+         not what admission decides, so it is not claimed here."
+    );
+}
+
+/// R1-A: a provisional peer cannot drive the **migration**
+/// subprotocol. The dispatch invoked the application's migration
+/// handler before any admission decision.
+///
+/// Inverse: remove the gate from the migration arm — the handler
+/// runs for an unenrolled peer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_provisional_peer_cannot_drive_migration() {
+    let (anchor, client, endpoint) = anchor_and_provisional_client().await;
+    let client_id = client.node_id();
+
+    // The migration arm's effect is invoking the application's
+    // migration handler; the gate's effect is refusing the frame
+    // before that, counted. Observed here without standing up a
+    // real `MigrationSubprotocolHandler` — installing one is a
+    // compute-plane exercise, and the decision under test is
+    // admission's.
+    let refused_before = anchor.rtc_stats().admission_refused_deliver();
+    client
+        .send_subprotocol_to_node(anchor.node_id(), 0x0500, b"MIGRATE")
+        .await
+        .expect("send a migration frame");
+    assert!(
+        wait_for(
+            || anchor.rtc_stats().admission_refused_deliver() > refused_before,
+            Duration::from_secs(5)
+        )
+        .await,
+        "the migration arm must refuse an unenrolled peer before its handler, \
+         and count it"
+    );
+
+    // Positive control: the same frame after promotion is not
+    // refused.
+    let session = anchor.peer_session_id(client_id).expect("session");
+    assert!(anchor.promote_admission(client_id, session, PeerAddr::Rtc(endpoint)));
+    let refused_after = anchor.rtc_stats().admission_refused_deliver();
+    client
+        .send_subprotocol_to_node(anchor.node_id(), 0x0500, b"MIGRATE")
+        .await
+        .expect("send a migration frame");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        anchor.rtc_stats().admission_refused_deliver(),
+        refused_after,
+        "an admitted peer's migration frame passes the gate"
+    );
+}
