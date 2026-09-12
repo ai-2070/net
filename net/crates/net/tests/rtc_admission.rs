@@ -736,3 +736,93 @@ async fn the_provisional_byte_bound_closes_the_session() {
     );
     assert!(!anchor.peer_is_provisional(client_id));
 }
+
+/// R1 (streaming): a **registered** server-streaming provider is
+/// not invoked by a provisional caller — and is invoked once the
+/// same caller is admitted.
+///
+/// Gate 5 sat on the unary bridge alone, so this handler ran for an
+/// unenrolled peer. The request is published **without** a reply
+/// subscription (`publish_rpc_request_unsubscribed`): the ordinary
+/// client subscribes first, and that subscribe is refused at gate 3
+/// for a non-enrollment channel, which would make the refusal say
+/// nothing about the serve bridge. A sender that does not care
+/// about the reply is exactly the case the bridge must refuse, and
+/// **handler invocation** is the observed effect.
+///
+/// Inverse: remove the `rtc_admission_allows_rpc` check from the
+/// server-streaming bridge — the provisional publish invokes the
+/// handler.
+#[cfg(feature = "cortex")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_registered_streaming_provider_refuses_a_provisional_caller() {
+    use net::adapter::net::cortex::{RpcContext, RpcHandlerError};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingStream(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl net::adapter::net::cortex::RpcStreamingHandler for CountingStream {
+        async fn call(
+            &self,
+            _ctx: RpcContext,
+            sink: net::adapter::net::cortex::RpcResponseSink,
+        ) -> Result<(), RpcHandlerError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            sink.send(Bytes::from_static(b"served"));
+            Ok(())
+        }
+    }
+
+    let (anchor, client, endpoint) = anchor_and_provisional_client().await;
+    let client_id = client.node_id();
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let _serve = anchor
+        .serve_rpc_streaming(
+            "r1.stream",
+            Arc::new(CountingStream(Arc::clone(&invocations))),
+        )
+        .expect("register a real streaming provider");
+    // Let the registration's announcement reach the client, so its
+    // route lookup resolves the service.
+    assert!(
+        wait_for(
+            || client.publish_rpc_request_unsubscribed_is_routable("r1.stream", anchor.node_id()),
+            Duration::from_secs(10)
+        )
+        .await,
+        "the client must be able to address the registered service at all"
+    );
+
+    client
+        .publish_rpc_request_unsubscribed(anchor.node_id(), "r1.stream", Bytes::from_static(b"hi"))
+        .await
+        .expect("the hostile publish itself is a send, not an authorization");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        invocations.load(Ordering::SeqCst),
+        0,
+        "the handler must never run for an unenrolled peer — this is the effect, \
+         not an error string"
+    );
+
+    // Positive control: the SAME registered service, the same
+    // caller, the same publish, after promotion.
+    let session = anchor
+        .peer_session_id(client_id)
+        .expect("the provisional session");
+    assert!(anchor.promote_admission(client_id, session, PeerAddr::Rtc(endpoint)));
+    client
+        .publish_rpc_request_unsubscribed(anchor.node_id(), "r1.stream", Bytes::from_static(b"hi"))
+        .await
+        .expect("publish");
+    assert!(
+        wait_for(
+            || invocations.load(Ordering::SeqCst) == 1,
+            Duration::from_secs(10)
+        )
+        .await,
+        "once admitted, the same publish must invoke the handler exactly once \
+         (saw {})",
+        invocations.load(Ordering::SeqCst)
+    );
+}

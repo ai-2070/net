@@ -4111,6 +4111,14 @@ impl MeshNode {
         let bridge = tokio::spawn(async move {
             let tag = format!("nrpc:{}", service_for_bridge);
             while let Some(inbound) = rx.recv().await {
+                // **R1 gate 5 on this shape too.** The RTC
+                // admission decision used to sit on the unary
+                // bridge alone, so a provisional caller could
+                // invoke a *registered* streaming provider.
+                #[cfg(feature = "webrtc")]
+                if !mesh_for_bridge.rtc_admission_allows_rpc(&inbound, &service_for_bridge) {
+                    continue;
+                }
                 // The shared callee preflight (see the unary bridge).
                 match bridge_preflight(
                     &mesh_for_bridge,
@@ -4326,6 +4334,14 @@ impl MeshNode {
         let bridge = tokio::spawn(async move {
             let tag = format!("nrpc:{}", service_for_bridge);
             while let Some(inbound) = rx.recv().await {
+                // **R1 gate 5 on this shape too.** The RTC
+                // admission decision used to sit on the unary
+                // bridge alone, so a provisional caller could
+                // invoke a *registered* streaming provider.
+                #[cfg(feature = "webrtc")]
+                if !mesh_for_bridge.rtc_admission_allows_rpc(&inbound, &service_for_bridge) {
+                    continue;
+                }
                 // NC1: the SAME shared callee preflight the unary /
                 // response-streaming bridges run — client-streaming
                 // used to skip may_execute entirely, leaving it
@@ -4675,6 +4691,14 @@ impl MeshNode {
         let bridge = tokio::spawn(async move {
             let tag = format!("nrpc:{}", service_for_bridge);
             while let Some(inbound) = rx.recv().await {
+                // **R1 gate 5 on this shape too.** The RTC
+                // admission decision used to sit on the unary
+                // bridge alone, so a provisional caller could
+                // invoke a *registered* streaming provider.
+                #[cfg(feature = "webrtc")]
+                if !mesh_for_bridge.rtc_admission_allows_rpc(&inbound, &service_for_bridge) {
+                    continue;
+                }
                 // NC1: the shared callee preflight — duplex used to skip
                 // may_execute entirely (transport-authenticated but not
                 // capability-authorized).
@@ -5428,6 +5452,66 @@ impl MeshNode {
     /// On `opts.deadline` expiring OR the future being dropped,
     /// emits a CANCEL event so the server can drop the in-flight
     /// handler.
+    /// Can this node address `service` on `target` at all? Keeps
+    /// the R1 witness from racing service discovery.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn publish_rpc_request_unsubscribed_is_routable(
+        self: &Arc<Self>,
+        service: &str,
+        target_node_id: u64,
+    ) -> bool {
+        self.rpc_route_or_no_route(target_node_id, service).is_ok()
+    }
+
+    /// Publish an nRPC REQUEST **without** subscribing a reply
+    /// channel (R1 witness seam).
+    ///
+    /// This is the hostile sender Kyra describes: the ordinary
+    /// client sets up its reply subscription first, and for a
+    /// provisional peer that subscription is refused at gate 3 — so
+    /// the ordinary API can never show whether the *serve* bridges
+    /// gate anything. Publishing the request directly is what a
+    /// sender who does not care about the reply does, and handler
+    /// invocation is the effect the gate must prevent.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub async fn publish_rpc_request_unsubscribed(
+        self: &Arc<Self>,
+        target_node_id: u64,
+        service: &str,
+        body: Bytes,
+    ) -> Result<(), AdapterError> {
+        let route = self
+            .rpc_route_or_no_route(target_node_id, service)
+            .map_err(|e| AdapterError::Connection(format!("{e}")))?;
+        let req = RpcRequestPayload {
+            service: service.to_string(),
+            deadline_ns: 0,
+            flags: 0,
+            headers: Vec::new(),
+            body,
+        };
+        let meta = EventMeta::new(
+            DISPATCH_RPC_REQUEST,
+            0,
+            self.identity_origin_hash(),
+            mint_random_call_id(),
+            0,
+        );
+        let mut buf = Vec::with_capacity(EVENT_META_SIZE + RPC_ROUTE_V1_SIZE + req.encoded_len());
+        buf.extend_from_slice(&meta.to_bytes());
+        encode_rpc_route(&mut buf, route.request_channel_hash);
+        req.encode_into(&mut buf);
+        let payload = Bytes::from(buf);
+        self.publish_to_peer(
+            target_node_id,
+            route.request_channel_hash,
+            route.request_stream_id,
+            true,
+            std::slice::from_ref(&payload),
+        )
+        .await
+    }
+
     pub async fn call(
         self: &Arc<Self>,
         target_node_id: u64,

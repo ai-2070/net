@@ -9562,6 +9562,16 @@ struct RtcInstallFence {
     require_quiescent: bool,
 }
 
+/// The ingress admission verdict (R1). `Denied` covers every
+/// state that is not a live, admitted session on the endpoint the
+/// frame actually arrived on.
+#[cfg(feature = "webrtc")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IngressAdmission {
+    Permitted,
+    Denied,
+}
+
 struct PeerRecipient {
     addr: PeerAddr,
     session: Arc<NetSession>,
@@ -26752,9 +26762,16 @@ impl MeshNode {
                                         session,
                                         remote_static_pub,
                                         last_initiator_ephemeral: Some(initiator_ephemeral),
+                                        // R1: derive, never default.
+                                        // A routed Noise handshake
+                                        // relayed *through* a
+                                        // provisional RTC endpoint
+                                        // used to install an
+                                        // ADMITTED logical peer,
+                                        // which then satisfied the
+                                        // node-keyed unary gate.
                                         #[cfg(feature = "webrtc")]
-                                        admission: crate::adapter::net::rtc::PeerAdmission::default(
-                                        ),
+                                        admission: Self::derived_admission(source, ctx),
                                     });
                                     Some(session_id)
                                 }
@@ -26781,8 +26798,10 @@ impl MeshNode {
                                 session,
                                 remote_static_pub,
                                 last_initiator_ephemeral: Some(initiator_ephemeral),
+                                // R1: derive, never default (see
+                                // the rotation arm above).
                                 #[cfg(feature = "webrtc")]
-                                admission: crate::adapter::net::rtc::PeerAdmission::default(),
+                                admission: Self::derived_admission(source, ctx),
                             });
                             Some(session_id)
                         }
@@ -27423,6 +27442,15 @@ impl MeshNode {
         // on signalling and never awaits here.
         #[cfg(feature = "webrtc")]
         if parsed.header.subprotocol_id == super::rtc::SUBPROTOCOL_RTC_SIGNAL {
+            // **R1: signalling is a local effect too.** A valid
+            // Offer from a provisional peer reached the engine and
+            // allocated an ICE agent (Kyra: `KYRA_SIGNAL
+            // ice_allocations=1`). Signalling is what an *admitted*
+            // peer uses to upgrade; an unenrolled one has no
+            // business allocating an agent.
+            if !Self::admission_gate_deliver_source(&parsed.source, ctx) {
+                return;
+            }
             let events = EventFrame::read_events(decrypted, parsed.header.event_count);
             for payload in events {
                 Self::handle_rtc_signal(&payload, from_node, ctx);
@@ -28021,7 +28049,12 @@ impl MeshNode {
                             // bytes — `from_peer` still points at the
                             // original sender, which is what the
                             // recipient correlates on.
-                            Self::forward_punch_ack(ack, ctx);
+                            Self::forward_punch_ack(
+                                ack,
+                                #[cfg(feature = "webrtc")]
+                                from_node,
+                                ctx,
+                            );
                         }
                     }
                     rendezvous::RendezvousMsg::PunchReject(rej) => {
@@ -28501,6 +28534,21 @@ impl MeshNode {
         // blob-transfer engine's reorder buffer); ones that frame their
         // own ordering (nRPC keys on EventMeta/call_id) or tolerate
         // reordering ignore it.
+        // **R1: the application queue is a local effect.** Gate 5
+        // sat on the unary RPC bridge only, so an ordinary event
+        // from a provisional peer was pushed straight into the
+        // anchor's application queue (Kyra: `KYRA_APP
+        // delivered=true still_provisional=true`). This is the
+        // non-RPC arm — a frame with a registered nRPC dispatcher
+        // has already been handed to the bridge above, where the
+        // decision is made on the DECODED service name, because
+        // `net.mesh.enroll` is exactly the one call a provisional
+        // peer is allowed to make.
+        #[cfg(feature = "webrtc")]
+        if !Self::admission_gate_deliver_source(&parsed.source, ctx) {
+            return;
+        }
+
         let queue = inbound.entry(shard_id).or_default();
         let seq = parsed.header.sequence;
         for (i, event_data) in events.into_iter().enumerate() {
@@ -34985,6 +35033,40 @@ impl MeshNode {
         }
     }
 
+    /// The admission a session installed *through* `source`
+    /// inherits (R1).
+    ///
+    /// A peer reached over a relay is no more authorized than the
+    /// relay that carried its handshake: if the immediate upstream
+    /// endpoint is an unenrolled RTC session, the logical peer it
+    /// introduces starts provisional too. A native/UDP upstream is
+    /// unchanged.
+    #[cfg(feature = "webrtc")]
+    fn derived_admission(source: PeerAddr, ctx: &DispatchCtx) -> super::rtc::PeerAdmission {
+        if matches!(source, PeerAddr::Rtc(_))
+            && matches!(
+                Self::ingress_admission(&source, ctx),
+                IngressAdmission::Denied
+            )
+        {
+            super::rtc::PeerAdmission::provisional(std::time::Instant::now())
+        } else {
+            super::rtc::PeerAdmission::default()
+        }
+    }
+
+    /// **Gate 5 of 5 (§12), by authenticated source (R1).**
+    ///
+    /// The local-effect decision every ingress path consults before
+    /// its effect: application enqueue, signalling, ICE allocation
+    /// and the streaming serve bridges. The node-id-keyed wrapper
+    /// on the unary bridge remains for callers that only hold a
+    /// node id.
+    #[cfg(feature = "webrtc")]
+    fn admission_gate_deliver_source(source: &PeerAddr, ctx: &DispatchCtx) -> bool {
+        Self::admission_allows(source, ctx, |stats| stats.note_admission_refused_deliver())
+    }
+
     /// **Gate 4 of 5 (§12): announcement ingest.** A provisional
     /// peer's announcement is neither ingested nor flooded — that
     /// would be route installation for an unadmitted peer (S0e §3
@@ -35112,19 +35194,56 @@ impl MeshNode {
         ctx.peers.get(&node_id).map(|e| e.value().addr())
     }
 
-    /// Is the session on `source` provisional? A synchronous read of
-    /// `PeerInfo` — the gates hold no guard across an await because
-    /// they never await.
+    /// The **one** ingress admission decision (R1).
+    ///
+    /// Fail-closed for RTC: an endpoint with no installed
+    /// `PeerInfo`, a peer whose installed endpoint is a *different*
+    /// incarnation, or a session marked provisional is `Denied`.
+    /// The previous `is_provisional` read answered `false` — "not
+    /// provisional", taken as permission — for exactly the states
+    /// that carry the least authority: a DataChannel that is open
+    /// but has not completed Noise, and frames still queued behind
+    /// a peer that has already been removed.
+    ///
+    /// Legacy UDP is untouched: a UDP source is `Permitted` here
+    /// and continues to be judged by its own authorization, which
+    /// is what "browser admission does not apply to native peers"
+    /// means.
+    #[cfg(feature = "webrtc")]
+    fn ingress_admission(source: &PeerAddr, ctx: &DispatchCtx) -> IngressAdmission {
+        let PeerAddr::Rtc(_) = source else {
+            return IngressAdmission::Permitted;
+        };
+        let Some(node_id) = ctx.addr_to_node.get(source).map(|e| *e.value()) else {
+            // Unknown RTC endpoint: pre-Noise, or post-removal.
+            // Neither may borrow an admitted peer's permissions.
+            return IngressAdmission::Denied;
+        };
+        let Some(entry) = ctx.peers.get(&node_id) else {
+            return IngressAdmission::Denied;
+        };
+        let info = entry.value();
+        if info.addr() != *source {
+            // The mapping points at a node whose live session sits
+            // on a different endpoint: this frame belongs to a
+            // retired incarnation.
+            return IngressAdmission::Denied;
+        }
+        if info.admission.is_provisional() {
+            return IngressAdmission::Denied;
+        }
+        IngressAdmission::Permitted
+    }
+
+    /// Is the session on `source` provisional **or unknown**? Kept
+    /// as the name the gates read, now answering the fail-closed
+    /// question.
     #[cfg(feature = "webrtc")]
     fn is_provisional(source: &PeerAddr, ctx: &DispatchCtx) -> bool {
-        let Some(node_id) = ctx.addr_to_node.get(source).map(|e| *e.value()) else {
-            // No session on this endpoint: not a provisional peer,
-            // and not this gate's business either.
-            return false;
-        };
-        ctx.peers
-            .get(&node_id)
-            .is_some_and(|e| e.value().admission.is_provisional())
+        matches!(
+            Self::ingress_admission(source, ctx),
+            IngressAdmission::Denied
+        )
     }
 
     /// Shared body of the three yes/no gates: provisional ⇒ refuse
@@ -36362,12 +36481,28 @@ impl MeshNode {
     /// the original sender so the recipient can correlate
     /// against its `pending_punch_acks` map.
     #[cfg(feature = "nat-traversal")]
-    fn forward_punch_ack(ack: super::traversal::rendezvous::PunchAck, ctx: &DispatchCtx) {
+    fn forward_punch_ack(
+        ack: super::traversal::rendezvous::PunchAck,
+        #[cfg(feature = "webrtc")] from_node: u64,
+        ctx: &DispatchCtx,
+    ) {
         use super::traversal::rendezvous::RendezvousMsg;
 
-        // §12 F6: and it does not get to have its acknowledgements
-        // relayed onward either — the destination side of the same
-        // rule.
+        // **§12 F6, by the authenticated requester (R1).** This arm
+        // used to gate `ack.to_peer` — the *recipient* — so an
+        // admitted destination satisfied the gate on behalf of a
+        // provisional sender, and the relay emitted third-party
+        // traffic for an unenrolled peer. `handle_punch_request`
+        // always checked `from_node`; the two arms are now
+        // equivalent.
+        #[cfg(feature = "webrtc")]
+        if let Some(endpoint) = Self::endpoint_of(from_node, ctx) {
+            if !Self::admission_gate_forward(&endpoint, ctx) {
+                return;
+            }
+        }
+        // The destination's own admission still applies: an
+        // unenrolled peer is not a relay *target* either.
         #[cfg(feature = "webrtc")]
         if let Some(endpoint) = Self::endpoint_of(ack.to_peer, ctx) {
             if !Self::admission_gate_forward(&endpoint, ctx) {
