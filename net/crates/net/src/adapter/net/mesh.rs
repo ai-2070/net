@@ -22452,7 +22452,7 @@ impl MeshNode {
         // R-B: the entry is published now; re-read liveness and take
         // it back if the endpoint closed while it was being
         // published.
-        self.confirm_rtc_install_or_evict(peer_node_id, &fence)?;
+        self.confirm_rtc_install_or_evict(peer_node_id, outcome.session_id, &fence)?;
 
         let peer_graph_id = node_id_to_graph_id(peer_node_id);
         let pw = EnhancedPingwave::new(peer_graph_id, 0, 1).with_load(0, HealthStatus::Healthy);
@@ -22562,7 +22562,7 @@ impl MeshNode {
             ));
         }
         // R-B, responder half: same post-publish re-read.
-        self.confirm_rtc_install_or_evict(peer_node_id, &fence)?;
+        self.confirm_rtc_install_or_evict(peer_node_id, outcome.session_id, &fence)?;
         Ok(peer_node_id)
     }
 
@@ -22596,18 +22596,22 @@ impl MeshNode {
     /// its exact session id, or the close happened after the
     /// publish and its notification finds the entry.
     ///
-    /// `Err` means nothing is installed: the caller must report a
-    /// lost install.
+    /// `Err` means nothing of ours is installed: the caller must
+    /// report a lost install. The eviction is keyed by the session id
+    /// **this** install published, never by whatever `peers` holds at
+    /// the moment of the re-read — a competitor that superseded the
+    /// entry in that instant keeps its session.
     #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
     fn confirm_rtc_install_or_evict(
         &self,
         peer_node_id: u64,
+        installed_session_id: Option<u64>,
         fence: &RtcInstallFence,
     ) -> Result<(), AdapterError> {
         if fence.intent.still_live() {
             return Ok(());
         }
-        if let Some(session_id) = self.peer_session_id(peer_node_id) {
+        if let Some(session_id) = installed_session_id {
             self.peer_eviction_ctx()
                 .evict_session(peer_node_id, session_id);
         }
