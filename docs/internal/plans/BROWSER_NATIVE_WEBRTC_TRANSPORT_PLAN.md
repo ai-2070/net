@@ -2064,6 +2064,30 @@ failed its own witness-inventory step with "`rtc_loopback` has 0 tests"
 to the agent and repaired in `22fb4ae23` ("a CI inventory that cannot
 read zero"). CI at the 4a head is the arbiter for both.
 
+**Kyra: HOLD on Stage 4a at `047ac7e0a` (exact-head CI 50/50; her
+eight adversarial probes 1 pass / 7 fail; reviewer reproduced 1/7 at
+`c84d60a6f`).** Verdict: "the native production upgrade is incomplete,
+admission can permit pre-enrollment effects, and an old enrollment
+response can promote a replacement session." Credit retained: canonical
+pairing, parser, route authentication, provider policy, driver
+generations, the native consumer evidence, CI. Brief
+`spikes/S4A_R_BRIEF.md`; her probes vendored at
+`spikes/kyra/kyra_4a_probes.rs` to become the acceptance binary.
+
+| # | Finding (executed unless noted) |
+|---|---|
+| R1 (P1) | admission fails **open**: pre-Noise RTC egress reached a UDP sink; provisional application delivery; a provisional Offer allocated ICE; unknown map entry ⇒ "not provisional"; streaming serve bridges, signalling and F6 `PunchAck` (by `to_peer`, not requester) ungated; a routed handshake via a provisional RTC source installs Admitted (source) |
+| R2 (P1) | `pending_promotions[node_id]` overwritten; an old call's success promoted a replacement session |
+| R3 (P1) | REQUEST counter never charged (fifth request executed the handler); ordinary close leaves the provisional projection; stream/64 KiB/deadline/`max_provisional`/bootstrap-byte bounds unwired (source); stale cleanup by node state (source) |
+| R4 (P1) | **no production consumer** turns the engine's DataChannel-open into Noise + fenced install — `connect_rtc`/`accept_rtc` are fixture-only; the flagship witness let the production attempt expire and substituted `connect_rtc_loopback`; `PairAction::Ice` marks the scan done without scheduling the attempt |
+| R5 (P1/P2) | `SignalBudget` never released on expiry/reject/failure; duplicate Offer with one dialog id allocates a second ICE agent; immediate Reject of a local offer refused as unknown; queues keyed by node not incarnation (source) |
+| R6 (P1) | the SDK's typed adapter JSON-encodes the `Vec<u8>` enrollment reply while the core expects raw `NMO1` — a real SDK enrollment cannot promote; fixture outcome code `u32` vs wire `u16`; origin-bound reply needs an identity a new provisional peer lacks |
+| R7 (P2) | witnesses pass while the probes fail (helper calls, non-strict counters, no protected service registered, fixture substitution); CI empty-suite self-check counts a newline as a test; exit table overclaims |
+
+§9's "native end to end" exit criterion was therefore met by fixture
+substitution, not by production code — R4 is the substantive 4a work
+still owed, and it precedes 4b.
+
 ## Stage 5 — `net-leaf` + `@net-mesh/browser`
 
 - Leaf crate and TypeScript wrapper; identity storage and leader election
