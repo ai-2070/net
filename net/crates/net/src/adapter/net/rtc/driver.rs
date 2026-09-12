@@ -151,6 +151,10 @@ pub struct RtcTestHooks {
     ingress_seen: std::sync::atomic::AtomicU64,
     /// Make the next socket read fail with `ConnectionReset`.
     inject_conn_reset: AtomicBool,
+    /// Park the loop in a long sleep so a caller can exercise the
+    /// **timeout** arm of [`RtcDriverHandle::shutdown_and_join`]
+    /// against a task that will not cooperate (H1).
+    stall_loop: AtomicBool,
 }
 
 #[cfg(any(test, feature = "fixtures"))]
@@ -174,6 +178,15 @@ impl RtcTestHooks {
     /// `ConnectionReset`.
     pub fn inject_conn_reset(&self) {
         self.inject_conn_reset.store(true, Ordering::Release);
+    }
+
+    /// Park the driver loop, so shutdown must abort it.
+    pub fn set_stall_loop(&self, stalled: bool) {
+        self.stall_loop.store(stalled, Ordering::Release);
+    }
+
+    fn loop_stalled(&self) -> bool {
+        self.stall_loop.load(Ordering::Acquire)
     }
 
     fn pump_paused(&self) -> bool {
@@ -212,6 +225,11 @@ pub struct RtcDriverHandle {
     /// rebind an explicit RTC port, and a shut-down node with
     /// `serve_stun` kept answering (R3-B).
     task: Arc<parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Teardown **completion**, published by the task's own guard
+    /// (H1). `task` is ownership of the join, not completion of it:
+    /// a second caller that found `None` used to return while the
+    /// driver was still running. Every caller now waits on this.
+    done: tokio::sync::watch::Sender<bool>,
     #[cfg(any(test, feature = "fixtures"))]
     hooks: Arc<RtcTestHooks>,
 }
@@ -319,10 +337,14 @@ impl RtcDriverHandle {
     }
 
     /// Stop the driver from a destructor: signal, then abort the
-    /// task so the socket is released without awaiting.
+    /// task.
     ///
     /// `Drop` cannot await, and detaching the task — which is what
-    /// dropping the handle used to do — left it bound (R3-B).
+    /// dropping the handle used to do — left it bound (R3-B). The
+    /// abort itself no longer skips cleanup: the task's teardown
+    /// guard runs on cancellation, closing every slot, counting what
+    /// was queued and making the transport terminal (H1), so a
+    /// retained handle cannot submit into a dead driver.
     pub fn shutdown_detached(&self) {
         self.shutdown.store(true, Ordering::Release);
         if let Some(handle) = self.task.lock().take() {
@@ -330,26 +352,84 @@ impl RtcDriverHandle {
         }
     }
 
-    /// Stop the driver and wait for the task to exit, so the RTC
-    /// socket is closed when this returns.
+    /// Stop the driver and wait until the task is **gone**, so the
+    /// RTC socket is closed and the transport is terminal when this
+    /// returns.
     ///
     /// Bounded: a driver wedged in a syscall is aborted rather than
-    /// hanging the caller's shutdown, and the abort is still a join.
+    /// hanging the caller's shutdown — and then awaited, because
+    /// `abort()` requests cancellation, it does not perform it (H1).
+    /// Concurrent callers all wait for the same completion, and a
+    /// caller cancelled mid-join returns the handle rather than
+    /// detaching the task.
     pub async fn shutdown_and_join(&self) {
         self.shutdown.store(true, Ordering::Release);
         let handle = self.task.lock().take();
-        let Some(handle) = handle else { return };
-        let abort = handle.abort_handle();
-        // The loop's own bound is one poll interval; give it several,
-        // then stop being polite. An aborted task is still a joined
-        // task — what must not happen is returning while the socket
-        // is still open.
-        if tokio::time::timeout(Duration::from_secs(2), handle)
-            .await
-            .is_err()
-        {
+        let Some(handle) = handle else {
+            // Someone else owns the join. Wait for the task's own
+            // completion signal, not for that caller's return.
+            self.await_teardown().await;
+            return;
+        };
+        // Cancel-safety: if this future is dropped mid-await the
+        // handle goes back where it came from, so a later
+        // `shutdown_detached` can still abort the task.
+        let mut slot = JoinSlot {
+            home: Arc::clone(&self.task),
+            handle: Some(handle),
+        };
+        let joined = {
+            let handle = slot.handle.as_mut().expect("just set");
+            tokio::time::timeout(Duration::from_secs(2), handle).await
+        };
+        if joined.is_err() {
             tracing::debug!("rtc driver did not exit in time; aborting");
-            abort.abort();
+            let handle = slot.handle.as_mut().expect("still held");
+            handle.abort();
+            // The join the abort is not: without this the method
+            // returned while cancellation — and the socket's
+            // release — was still pending.
+            let _ = handle.await;
+        }
+        // Joined: the task is gone, so drop the handle rather than
+        // returning it.
+        let _ = slot.handle.take();
+        // The guard publishes completion from inside the task; on a
+        // runtime that never polls the aborted task again this is
+        // the backstop, and it is idempotent.
+        let _ = self.done.send(true);
+    }
+
+    /// Park until the driver task's teardown guard has run.
+    async fn await_teardown(&self) {
+        let mut rx = self.done.subscribe();
+        if *rx.borrow() {
+            return;
+        }
+        // `changed()` errors only if every sender is gone, which
+        // cannot happen while this handle holds one.
+        while rx.changed().await.is_ok() {
+            if *rx.borrow() {
+                return;
+            }
+        }
+    }
+}
+
+/// Returns a taken [`tokio::task::JoinHandle`] to its home if the
+/// joining future is cancelled (H1).
+///
+/// Without it a cancelled joiner detached the task: later shutdowns
+/// found `None`, and `shutdown_detached` had nothing left to abort.
+struct JoinSlot {
+    home: Arc<parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for JoinSlot {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            *self.home.lock() = Some(handle);
         }
     }
 }
@@ -402,7 +482,9 @@ impl RtcDriver {
         #[cfg(any(test, feature = "fixtures"))]
         let hooks = Arc::new(RtcTestHooks::default());
 
+        let (done_tx, _done_rx) = tokio::sync::watch::channel(false);
         let task = tokio::spawn(driver_loop(
+            done_tx.clone(),
             config,
             socket,
             advertised,
@@ -423,6 +505,7 @@ impl RtcDriver {
             local_addr,
             shutdown: Arc::clone(&shutdown),
             task: Arc::new(parking_lot::Mutex::new(Some(task))),
+            done: done_tx,
             #[cfg(any(test, feature = "fixtures"))]
             hooks,
         })
@@ -434,6 +517,7 @@ impl RtcDriver {
     reason = "the driver owns every piece of RTC state by design; bundling them into a struct would only move the argument list"
 )]
 async fn driver_loop(
+    done: tokio::sync::watch::Sender<bool>,
     config: RtcConfig,
     socket: UdpSocket,
     advertised: SocketAddr,
@@ -445,10 +529,35 @@ async fn driver_loop(
     shutdown: Arc<AtomicBool>,
     #[cfg(any(test, feature = "fixtures"))] hooks: Arc<RtcTestHooks>,
 ) {
-    let mut sessions: HashMap<u32, Session> = HashMap::new();
+    // H1: the session table lives inside a guard whose `Drop` owns
+    // teardown, so the **same** cleanup runs whether the loop exits
+    // cooperatively or the task is aborted. Previously the cleanup
+    // was the loop's tail: an abort — which is what `Drop` on the
+    // node does — released the socket while leaving slots open,
+    // queued packets uncounted and `submit` returning `Ok(())`.
+    let mut table = SessionTable {
+        sessions: HashMap::new(),
+        socket: Some(socket),
+        transport: Arc::clone(&transport),
+        stats: Arc::clone(&stats),
+        closed: closed.clone(),
+        done,
+    };
+    let mut sessions = &mut table.sessions;
+    let socket = table
+        .socket
+        .as_ref()
+        .expect("the socket is taken only by teardown");
     let mut buf = vec![0u8; RECV_BUF];
 
     while !shutdown.load(Ordering::Acquire) {
+        // H1 witness support: a driver that will not notice the
+        // shutdown flag, so `shutdown_and_join` has to take its
+        // timeout/abort arm.
+        #[cfg(any(test, feature = "fixtures"))]
+        if hooks.loop_stalled() {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
         // --- 1. signalling: each is one mutation plus a full drain ---
         //
         // A *disconnected* channel is terminal (R3-B): every sender is
@@ -623,19 +732,49 @@ async fn driver_loop(
         }
     }
 
-    // Shutting down: every remaining session's backlog is discarded,
-    // and counted, exactly as a close would.
-    let ids: Vec<RtcPeerId> = sessions.values().map(|s| s.id).collect();
-    for id in ids {
-        let retained = sessions
-            .get(&id.slot)
-            .map(|s| usize::from(s.retry.is_some()))
-            .unwrap_or(0);
-        if retained > 0 {
-            stats.note_unretained();
+    // Teardown is `SessionTable::drop`, below — one implementation
+    // for the cooperative exit and the aborted one.
+    drop(table);
+}
+
+/// The driver's session table plus the teardown its `Drop` owns
+/// (H1).
+///
+/// Every remaining session's backlog is discarded and counted, each
+/// close is announced to the mesh, and the transport is made
+/// terminal so no historical handle can admit another packet. The
+/// socket is a separate binding in `driver_loop`, dropped after
+/// this one, so the transport contract is settled before the port
+/// is free.
+struct SessionTable {
+    sessions: HashMap<u32, Session>,
+    /// The RTC socket, owned here so teardown order is explicit:
+    /// slots closed and counted, transport terminal, **socket
+    /// released**, and only then completion published. A joiner
+    /// woken by `done` therefore always finds the port free.
+    socket: Option<UdpSocket>,
+    transport: Arc<RtcTransport>,
+    stats: Arc<RtcStats>,
+    closed: mpsc::Sender<RtcPeerId>,
+    done: tokio::sync::watch::Sender<bool>,
+}
+
+impl Drop for SessionTable {
+    fn drop(&mut self) {
+        for session in self.sessions.values() {
+            let retained = usize::from(session.retry.is_some());
+            if retained > 0 {
+                self.stats.note_unretained();
+            }
+            self.transport.close_peer(session.id, retained);
+            let _ = self.closed.try_send(session.id);
         }
-        transport.close_peer(id, retained);
-        let _ = closed.try_send(id);
+        // Slots the driver never had a `Session` for — an offer that
+        // never opened — are closed here too, and the transport
+        // becomes terminal.
+        self.transport.shutdown_terminal();
+        drop(self.socket.take());
+        let _ = self.done.send(true);
     }
 }
 

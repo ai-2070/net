@@ -609,8 +609,10 @@ async fn retention_conserves_every_admitted_packet_and_then_delivers_it() {
     );
 }
 
-/// R3-B: node shutdown releases the RTC socket — while the runtime is
-/// still alive, so runtime teardown cannot be what does it.
+/// R3-B: node shutdown releases the RTC socket — while the runtime
+/// **and the node** are still alive, so neither runtime teardown nor
+/// the destructor's abort can be what does it (H1: the original
+/// dropped the node before rebinding, mixing the two paths).
 ///
 /// Inverse: drop the `shutdown_and_join` call from `MeshNode::shutdown`
 /// (or make the disconnected signal channel non-terminal again) and
@@ -622,15 +624,169 @@ async fn node_shutdown_releases_the_rtc_socket() {
     let addr = a.rtc_driver().expect("driver").local_addr();
 
     a.shutdown().await.expect("shutdown");
-    drop(a);
 
-    // Bind the exact address: if the driver is still alive, this is
-    // the failure a successor node would hit.
+    // Bind the exact address with the node still held: if the driver
+    // is still alive, this is the failure a successor node would hit.
     let rebound = tokio::net::UdpSocket::bind(addr).await;
     assert!(
         rebound.is_ok(),
-        "shutdown must release the dedicated RTC socket at {addr}: {rebound:?}"
+        "shutdown must release the dedicated RTC socket at {addr} \
+         before it returns, with the node still alive: {rebound:?}"
     );
+    drop(rebound);
+    drop(a);
+}
+
+/// H1: `shutdown_and_join` takes its **timeout** arm and still
+/// returns only after the task is gone.
+///
+/// The loop is parked in a 60 s sleep, so the cooperative exit
+/// cannot happen: shutdown must abort — and then *await* the abort.
+/// `abort()` requests cancellation, it does not perform it, so the
+/// pre-repair code returned with the socket still bound.
+///
+/// Inverse: move the handle into `timeout(...)` again (dropping it on
+/// the timeout) or delete the `handle.await` after `abort()` — the
+/// immediate rebind fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stalled_driver_is_aborted_and_joined_before_shutdown_returns() {
+    let a = node(Some(rtc_config())).await;
+    a.start();
+    let driver = a.rtc_driver().expect("driver").clone();
+    let addr = driver.local_addr();
+    driver.hooks().set_stall_loop(true);
+    // Let the loop reach the stall.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    driver.shutdown_and_join().await;
+
+    // No yield, no sleep, no wait_for: the method's contract is that
+    // the socket is released when it returns.
+    let rebound = std::net::UdpSocket::bind(addr);
+    assert!(
+        rebound.is_ok(),
+        "shutdown_and_join returned before its aborted task released the socket: {rebound:?}"
+    );
+    assert!(
+        driver.transport().is_terminal(),
+        "an aborted teardown must still make the transport terminal"
+    );
+    drop(a);
+}
+
+/// H1: two concurrent joiners both observe **completed** teardown.
+///
+/// One of them finds the handle; the other finds `None`. Before the
+/// repair, `None` was read as "already done" and that caller
+/// returned while the driver was still running.
+///
+/// Inverse: return immediately on `None` instead of waiting on the
+/// shared completion — the second joiner's rebind fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_concurrent_joiners_both_observe_completed_teardown() {
+    let a = node(Some(rtc_config())).await;
+    a.start();
+    let driver = a.rtc_driver().expect("driver").clone();
+    let addr = driver.local_addr();
+    driver.hooks().set_stall_loop(true);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let first = {
+        let d = driver.clone();
+        tokio::spawn(async move {
+            d.shutdown_and_join().await;
+            std::net::UdpSocket::bind(addr).is_ok() && d.transport().is_terminal()
+        })
+    };
+    let second = {
+        let d = driver.clone();
+        tokio::spawn(async move {
+            d.shutdown_and_join().await;
+            std::net::UdpSocket::bind(addr).is_ok() && d.transport().is_terminal()
+        })
+    };
+    let (first, second) = tokio::join!(first, second);
+    assert!(
+        first.expect("first joiner"),
+        "the joiner that owned the handle must see a released socket"
+    );
+    assert!(
+        second.expect("second joiner"),
+        "the joiner that found no handle must wait for the SAME completion, \
+         not return on the assumption that someone else finished"
+    );
+    drop(a);
+}
+
+/// H1: `Drop` — which aborts rather than exiting cooperatively —
+/// still runs the whole transport teardown.
+///
+/// Kyra's schedule: a connected pair with the pump paused and three
+/// packets admitted, then drop the node while holding a driver
+/// clone. The abort used to release the socket and stop there:
+/// `slot_open = true`, `queued = 3`, and a fresh `submit` returned
+/// `Ok(())` into a driver that no longer existed.
+///
+/// Inverse: perform teardown in the loop tail again instead of in
+/// `SessionTable::drop` (or skip `shutdown_terminal`) — the slot
+/// stays open, the queue keeps its packets and the fresh submit is
+/// admitted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dropping_a_node_tears_down_the_transport_not_just_the_socket() {
+    let (a, b, id, _) = pair_with(rtc_config(), rtc_config()).await;
+    let driver = a.rtc_driver().expect("driver").clone();
+    let addr = driver.local_addr();
+    driver.hooks().set_pump_paused(true);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let discarded_before = driver.stats().discarded_at_close();
+    for _ in 0..3 {
+        driver
+            .transport()
+            .submit(&[0x48u8; 256], id)
+            .expect("admitted before teardown");
+    }
+    // The node's own maintenance traffic also queues behind the
+    // paused pump, so the exact figure teardown must account for is
+    // whatever is settled in the queue at the moment of the drop —
+    // not the three this test admitted.
+    let queued_at_drop = driver.transport().queued_packets(id);
+    assert!(
+        queued_at_drop >= 3,
+        "the three admitted packets must still be queued behind the paused pump"
+    );
+
+    drop(a);
+
+    assert!(
+        wait_for(
+            || std::net::UdpSocket::bind(addr).is_ok(),
+            Duration::from_secs(5)
+        )
+        .await,
+        "the destructor must release the RTC socket"
+    );
+    assert!(
+        !driver.transport().is_open(id),
+        "the aborted teardown must close the slot, not leave it addressable"
+    );
+    assert_eq!(
+        driver.transport().queued_packets(id),
+        0,
+        "queued packets must be drained by teardown, not left in a dead queue"
+    );
+    assert_eq!(
+        driver.stats().discarded_at_close() - discarded_before,
+        queued_at_drop as u64,
+        "every admitted packet teardown throws away must be counted, not \
+         silently dropped with the aborted task"
+    );
+    assert_eq!(
+        driver.transport().submit(&[0x49u8; 64], id),
+        Err(RtcSubmitError::UnknownPeer),
+        "a historical handle must be refused once the driver is gone"
+    );
+    drop(b);
 }
 
 /// R3-C: a stale (wrong-generation) handle cannot close a live

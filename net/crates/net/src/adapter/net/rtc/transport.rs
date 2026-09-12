@@ -17,7 +17,7 @@
 //!    only refreshed while the driver is writing to that peer (S0b
 //!    §4b: an idle-then-burst peer reads a stale zero).
 
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -112,7 +112,7 @@ struct PeerSlot {
     /// recycled, so a late submit is refused rather than resurrecting
     /// a dead channel. Written **under `queue`** so a submit that
     /// already holds the lock cannot miss it (R3-A).
-    closed: std::sync::atomic::AtomicBool,
+    closed: AtomicBool,
     /// A slot whose generation wrapped: never handed out again.
     retired: bool,
 }
@@ -127,6 +127,13 @@ pub struct RtcTransport {
     send_queue_bytes: usize,
     buffered_amount_advisory: usize,
     max_slots: usize,
+    /// The driver is gone (H1). Set by teardown — cooperative or
+    /// aborted — after every slot has been closed and accounted for.
+    /// Terminal is permanent: a transport whose driver has exited can
+    /// never carry another packet, so every historical `RtcPeerId`
+    /// handle is refused rather than admitting into a queue nobody
+    /// will ever pop.
+    terminal: AtomicBool,
     /// Test-only: a rendezvous run **between** the closed precheck and
     /// the queue lock, which is the exact window R3-A closed. Nothing
     /// else can produce that interleaving on demand.
@@ -145,6 +152,7 @@ impl RtcTransport {
             send_queue_bytes: config.send_queue_bytes,
             buffered_amount_advisory: config.buffered_amount_advisory,
             max_slots: config.max_peers,
+            terminal: AtomicBool::new(false),
             #[cfg(any(test, feature = "fixtures"))]
             submit_gate: Mutex::new(None),
         }
@@ -184,7 +192,7 @@ impl RtcTransport {
                 generation,
                 queue: Mutex::new((std::collections::VecDeque::new(), 0)),
                 published_buffered: AtomicUsize::new(0),
-                closed: std::sync::atomic::AtomicBool::new(false),
+                closed: AtomicBool::new(false),
                 retired: false,
             },
         );
@@ -258,6 +266,13 @@ impl RtcTransport {
     /// the channel closes with it still queued, which is counted
     /// ([`RtcStats::discarded_at_close`]).
     pub fn submit(&self, packet: &[u8], to: RtcPeerId) -> Result<(), RtcSubmitError> {
+        // H1: the driver is gone. Nothing will ever pop this queue,
+        // so admitting would be counting a packet as accepted that
+        // cannot be written, discarded or retained.
+        if self.terminal.load(Ordering::Acquire) {
+            self.stats.note_refused_unknown_peer();
+            return Err(RtcSubmitError::UnknownPeer);
+        }
         let Some(slot) = self.slots.get(&to.slot) else {
             self.stats.note_refused_unknown_peer();
             return Err(RtcSubmitError::UnknownPeer);
@@ -408,6 +423,40 @@ impl RtcTransport {
             self.stats.note_discarded_at_close_n(discarded);
         }
         discarded
+    }
+
+    /// Has the driver torn down? (H1.)
+    #[inline]
+    pub fn is_terminal(&self) -> bool {
+        self.terminal.load(Ordering::Acquire)
+    }
+
+    /// Driver teardown: close **every** slot, count what was still
+    /// queued into `discarded_at_close`, and make the transport
+    /// terminal (H1).
+    ///
+    /// Called from the driver task's teardown guard, so it runs on
+    /// the cooperative exit **and** on abort/unwind — the path that
+    /// used to release the socket while leaving slots open, queued
+    /// packets uncounted and `submit` returning `Ok(())` into a dead
+    /// driver.
+    ///
+    /// Returns the packets discarded by this call.
+    pub(super) fn shutdown_terminal(&self) -> u64 {
+        // Terminal first: a submit racing this either loses the
+        // slot's own `closed` check below or is refused outright, so
+        // no packet can be admitted behind the drain.
+        self.terminal.store(true, Ordering::Release);
+        let ids: Vec<RtcPeerId> = self
+            .slots
+            .iter()
+            .filter(|e| !e.closed.load(Ordering::Acquire))
+            .map(|e| RtcPeerId {
+                slot: *e.key(),
+                generation: e.generation,
+            })
+            .collect();
+        ids.into_iter().map(|id| self.close_peer(id, 0)).sum()
     }
 
     /// How many slots the transport is holding — live plus closed
