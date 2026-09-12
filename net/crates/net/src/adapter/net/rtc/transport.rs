@@ -558,9 +558,21 @@ impl RtcTransport {
         }
     }
 
+    /// Is an install in flight against this exact incarnation
+    /// (R-B)? Read by the close notifier: a close that matched no
+    /// installed peer while an installer was mid-flight is re-armed
+    /// rather than forgotten, so the installer's own post-publish
+    /// re-read is backed by a second delivery.
+    pub(crate) fn install_in_flight(&self, id: RtcPeerId) -> bool {
+        self.slots
+            .get(&id.slot)
+            .filter(|e| e.generation == id.generation)
+            .is_some_and(|e| e.install_intents.load(Ordering::Acquire) > 0)
+    }
+
     /// Record a close notification the driver could not deliver
     /// (H3). Re-delivered on a later driver turn.
-    pub(super) fn mark_pending_eviction(&self, id: RtcPeerId) {
+    pub(crate) fn mark_pending_eviction(&self, id: RtcPeerId) {
         if let Some(slot) = self.slots.get(&id.slot) {
             if slot.generation == id.generation {
                 slot.pending_eviction

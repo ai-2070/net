@@ -834,6 +834,47 @@ struct PeerEvictionCtx {
 
 #[cfg(feature = "webrtc")]
 impl PeerEvictionCtx {
+    /// Remove the peer whose **exact session id** is `session_id`,
+    /// as one serialized transition (R-B).
+    ///
+    /// The installer's own post-publish liveness re-read uses this
+    /// to take back an entry it published onto an endpoint that
+    /// closed underneath it. Idempotent with
+    /// [`Self::evict_endpoint`]: whichever runs first removes the
+    /// entry and the other finds nothing, and neither can touch a
+    /// successor, because both match on identity rather than on the
+    /// node id alone.
+    fn evict_session(&self, node_id: u64, session_id: u64) -> bool {
+        let peers = &self.peers;
+        let addr_to_node = &self.addr_to_node;
+        let peer_addrs = &self.peer_addrs;
+        let session_id_to_node = &self.session_id_to_node;
+        let ack_ranges_peer_cache = &self.ack_ranges_peer_cache;
+        commit_peer_transition(
+            &self.session_routing,
+            &self.routing_registry,
+            peers,
+            &self.peer_entity_ids,
+            || {
+                let evicted = self.peer_transitions.with(node_id, || {
+                    let removed = peers
+                        .remove_if(&node_id, |_, info| info.session.session_id() == session_id);
+                    let Some((_, old_info)) = &removed else {
+                        return false;
+                    };
+                    if let Some(old_owned) = old_info.owned_addr() {
+                        addr_to_node.remove_if(&old_owned, |_, n| *n == node_id);
+                    }
+                    peer_addrs.remove_if(&node_id, |_, a| *a == old_info.addr());
+                    session_id_to_node.remove_if(&session_id, |_, n| *n == node_id);
+                    ack_ranges_peer_cache.remove(&node_id);
+                    true
+                });
+                (evicted, evicted)
+            },
+        )
+    }
+
     /// Remove the peer installed on `addr`, if any, as ONE serialized
     /// peer transition — exactly like the failure sweep's eviction,
     /// including the exact-endpoint guard that keeps a close from
@@ -10786,6 +10827,13 @@ pub struct MeshNode {
     /// the bounded channel can actually fill.
     #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
     rtc_close_consumer_paused: Arc<AtomicBool>,
+    /// R-B witness seam: a synchronous callback run **between**
+    /// the commit-time liveness check and the `peers` insert, so a
+    /// witness can land a close in exactly that window. Synchronous
+    /// by construction — nothing may await inside the transition.
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    #[allow(clippy::type_complexity)]
+    rtc_pre_insert_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// H2 witness seam: park an RTC install between the completed
     /// Noise exchange and the commit.
     #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
@@ -13255,6 +13303,8 @@ impl MeshNode {
             rtc_dialogs: Arc::new(tokio::sync::Mutex::new(super::rtc::DialogTable::new())),
             #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
             rtc_close_consumer_paused: Arc::new(AtomicBool::new(false)),
+            #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+            rtc_pre_insert_hook: parking_lot::Mutex::new(None),
             #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
             rtc_install_pause: Arc::new(super::rtc::RtcInstallPause::default()),
             #[cfg(feature = "webrtc")]
@@ -22395,6 +22445,10 @@ impl MeshNode {
                 "rtc install lost the compare-and-swap: a newer incarnation won".into(),
             ));
         }
+        // R-B: the entry is published now; re-read liveness and take
+        // it back if the endpoint closed while it was being
+        // published.
+        self.confirm_rtc_install_or_evict(peer_node_id, &fence)?;
 
         let peer_graph_id = node_id_to_graph_id(peer_node_id);
         let pw = EnhancedPingwave::new(peer_graph_id, 0, 1).with_load(0, HealthStatus::Healthy);
@@ -22503,7 +22557,59 @@ impl MeshNode {
                 "rtc install lost the compare-and-swap: a newer incarnation won".into(),
             ));
         }
+        // R-B, responder half: same post-publish re-read.
+        self.confirm_rtc_install_or_evict(peer_node_id, &fence)?;
         Ok(peer_node_id)
+    }
+
+    /// The eviction context the close notifier and the installer's
+    /// own post-publish re-read share (R-B).
+    #[cfg(feature = "webrtc")]
+    fn peer_eviction_ctx(&self) -> PeerEvictionCtx {
+        PeerEvictionCtx {
+            session_routing: Arc::clone(&self.session_routing),
+            routing_registry: Arc::clone(&self.routing_registry),
+            peers: Arc::clone(&self.peers),
+            peer_entity_ids: Arc::clone(&self.peer_entity_ids),
+            addr_to_node: Arc::clone(&self.addr_to_node),
+            peer_addrs: Arc::clone(&self.peer_addrs),
+            session_id_to_node: Arc::clone(&self.session_id_to_node),
+            ack_ranges_peer_cache: Arc::clone(&self.ack_ranges_peer_cache),
+            peer_transitions: self.peer_transitions.clone(),
+        }
+    }
+
+    /// The **post-publish** liveness re-read (R-B).
+    ///
+    /// The commit-time check inside `install_peer_locked` runs
+    /// before the `peers` entry exists; a close landing between it
+    /// and the insert is consumed by the notifier with nothing to
+    /// evict, and the dead endpoint stays published. `close_peer`
+    /// sets `closed` under the queue lock **before** its
+    /// notification is sent, so re-reading liveness *after* the
+    /// entry is published closes the window in both directions:
+    /// either this read sees the close and takes the entry back by
+    /// its exact session id, or the close happened after the
+    /// publish and its notification finds the entry.
+    ///
+    /// `Err` means nothing is installed: the caller must report a
+    /// lost install.
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    fn confirm_rtc_install_or_evict(
+        &self,
+        peer_node_id: u64,
+        fence: &RtcInstallFence,
+    ) -> Result<(), AdapterError> {
+        if fence.intent.still_live() {
+            return Ok(());
+        }
+        if let Some(session_id) = self.peer_session_id(peer_node_id) {
+            self.peer_eviction_ctx()
+                .evict_session(peer_node_id, session_id);
+        }
+        Err(AdapterError::Connection(
+            "rtc endpoint closed before the session could be installed".into(),
+        ))
     }
 
     /// The incumbent snapshot + quiescence gate every RTC install
@@ -22606,6 +22712,13 @@ impl MeshNode {
     #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
     pub fn has_handshake_registration(&self, addr: PeerAddr) -> bool {
         self.pending_direct_initiators.contains_key(&addr)
+    }
+
+    /// Install a callback fired between the commit-time liveness
+    /// check and the `peers` insert (R-B witnesses).
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    pub fn set_rtc_pre_insert_hook(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self.rtc_pre_insert_hook.lock() = hook;
     }
 
     /// The install pause the H2 witnesses drive.
@@ -22806,6 +22919,15 @@ impl MeshNode {
         #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
         if fence.is_some_and(|f| !f.intent.still_live()) {
             return PeerTransitionOutcome::lost();
+        }
+        // R-B seam: the window between that check and the insert
+        // below is the one Kyra's schedule (1) lives in.
+        #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+        if fence.is_some() {
+            let hook = self.rtc_pre_insert_hook.lock().clone();
+            if let Some(hook) = hook {
+                hook();
+            }
         }
 
         let peer_addr = transport.send_addr();
@@ -25205,18 +25327,9 @@ impl MeshNode {
         let Some(mut closed) = self.rtc_closed.lock().take() else {
             return;
         };
-        let ctx = PeerEvictionCtx {
-            session_routing: Arc::clone(&self.session_routing),
-            routing_registry: Arc::clone(&self.routing_registry),
-            peers: Arc::clone(&self.peers),
-            peer_entity_ids: Arc::clone(&self.peer_entity_ids),
-            addr_to_node: Arc::clone(&self.addr_to_node),
-            peer_addrs: Arc::clone(&self.peer_addrs),
-            session_id_to_node: Arc::clone(&self.session_id_to_node),
-            ack_ranges_peer_cache: Arc::clone(&self.ack_ranges_peer_cache),
-            peer_transitions: self.peer_transitions.clone(),
-        };
+        let ctx = self.peer_eviction_ctx();
         let registrations = Arc::clone(&self.pending_direct_initiators);
+        let transport = self.rtc_driver.as_ref().map(|d| Arc::clone(d.transport()));
         #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
         let paused = Arc::clone(&self.rtc_close_consumer_paused);
         let shutdown = self.shutdown.clone();
@@ -25247,11 +25360,35 @@ impl MeshNode {
                 if let Some((_, inbox)) = registrations.remove(&PeerAddr::Rtc(id)) {
                     inbox.close();
                 }
-                if let Some(node_id) = ctx.evict_endpoint(PeerAddr::Rtc(id)) {
-                    tracing::debug!(
+                match ctx.evict_endpoint(PeerAddr::Rtc(id)) {
+                    Some(node_id) => tracing::debug!(
                         node_id = format!("{node_id:#x}"),
                         "rtc channel closed; peer evicted"
-                    );
+                    ),
+                    // R-B: nothing installed on that endpoint *yet*,
+                    // but an installer holds an intent on it — its
+                    // publish may land after this. Re-arm the close
+                    // so the next driver turn offers it again; the
+                    // intent is released when the install finishes
+                    // either way, so this cannot spin.
+                    //
+                    // This is the second delivery, not the primary
+                    // one: the installer's own post-publish re-read
+                    // (`confirm_rtc_install_or_evict`) already
+                    // covers the window, and removing this arm
+                    // leaves the R-B witnesses green (recorded in
+                    // S3_REPORT §12.2 as R-B2). It exists so
+                    // `install_intents` is read rather than
+                    // decorative, and so a future caller that
+                    // publishes without the re-read is still
+                    // reconciled.
+                    None => {
+                        if let Some(transport) = transport.as_ref() {
+                            if transport.install_in_flight(id) {
+                                transport.mark_pending_eviction(id);
+                            }
+                        }
+                    }
                 }
             }
         });

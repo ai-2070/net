@@ -406,3 +406,122 @@ async fn a_quiet_incumbent_is_replaced_by_the_parked_exchange() {
     );
     let _ = responder.await;
 }
+
+/// R-B, Kyra's schedule (1) verbatim: the close lands **between**
+/// the commit-time liveness check and the `peers` insert.
+///
+/// The H2 witnesses park before `install_peer_locked`, so they only
+/// ever exercise close-before-the-check. Here a synchronous hook
+/// fires inside the transition, in the window the check cannot
+/// cover: the endpoint is closed and the notifier's eviction runs
+/// against a peer map that does not contain the entry yet.
+/// Nothing may be published afterwards.
+///
+/// Inverse: delete the post-publish
+/// `confirm_rtc_install_or_evict` re-read — the dead endpoint stays
+/// installed, with no close notification left to remove it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_close_inside_the_commit_window_leaves_nothing_published() {
+    let (a, b) = pair().await;
+    let b_id = b.node_id();
+    let (id_a, id_b) = open_rtc_channel(&a, &b).await.expect("datachannel");
+
+    // The seam: close A's endpoint *inside* the transition, after
+    // the liveness check and before the insert, and let the mesh
+    // consume the resulting notification (there is nothing to
+    // evict — the entry does not exist yet).
+    let driver = a.rtc_driver().expect("driver").clone();
+    let closed_at_seam = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let driver = driver.clone();
+        let flag = Arc::clone(&closed_at_seam);
+        a.set_rtc_pre_insert_hook(Some(Arc::new(move || {
+            if !flag.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                driver.transport().close_peer(id_a, 0);
+            }
+        })));
+    }
+
+    let responder = {
+        let b = Arc::clone(&b);
+        let a_id = a.node_id();
+        tokio::spawn(async move { b.accept_rtc(id_b, a_id).await })
+    };
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let b_pub = *b.public_key();
+    let result = a.connect_rtc(id_a, &b_pub, b_id).await;
+    a.set_rtc_pre_insert_hook(None);
+
+    assert!(
+        closed_at_seam.load(std::sync::atomic::Ordering::Acquire),
+        "the seam must actually have fired, or this witness tests nothing"
+    );
+    assert!(
+        result.is_err(),
+        "an install whose endpoint closed inside the commit window must be refused"
+    );
+    assert_eq!(
+        a.peer_endpoint(b_id),
+        None,
+        "and nothing may stay published: the close notification for that \
+         endpoint ran while the entry did not exist"
+    );
+    assert_eq!(
+        a.peer_session_id(b_id),
+        None,
+        "no session may survive under the node id either"
+    );
+    let _ = responder.await;
+}
+
+/// The same window on the **responder** branch.
+///
+/// Inverse: the same one — `accept_rtc` publishes a dead endpoint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_close_inside_the_responders_commit_window_leaves_nothing_published() {
+    let (a, b) = pair().await;
+    let a_id = a.node_id();
+    let (id_a, id_b) = open_rtc_channel(&a, &b).await.expect("datachannel");
+
+    let driver_b = b.rtc_driver().expect("driver").clone();
+    let closed_at_seam = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let driver_b = driver_b.clone();
+        let flag = Arc::clone(&closed_at_seam);
+        b.set_rtc_pre_insert_hook(Some(Arc::new(move || {
+            if !flag.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                driver_b.transport().close_peer(id_b, 0);
+            }
+        })));
+    }
+
+    let responder = {
+        let b = Arc::clone(&b);
+        tokio::spawn(async move { b.accept_rtc(id_b, a_id).await })
+    };
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let initiator = {
+        let a = Arc::clone(&a);
+        let b_pub = *b.public_key();
+        let b_id = b.node_id();
+        tokio::spawn(async move { a.connect_rtc(id_a, &b_pub, b_id).await })
+    };
+    let result = responder.await.expect("responder task");
+    b.set_rtc_pre_insert_hook(None);
+
+    assert!(
+        closed_at_seam.load(std::sync::atomic::Ordering::Acquire),
+        "the responder's seam must actually have fired"
+    );
+    assert!(
+        result.is_err(),
+        "the responder must refuse an install whose endpoint closed in the \
+         commit window"
+    );
+    assert_eq!(
+        b.peer_endpoint(a_id),
+        None,
+        "and publish nothing for the dead endpoint"
+    );
+    let _ = initiator.await;
+}
