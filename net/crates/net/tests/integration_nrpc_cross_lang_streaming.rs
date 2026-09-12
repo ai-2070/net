@@ -244,12 +244,12 @@ impl ClientStreamLoopback {
         let client_fold = Arc::new(Mutex::new(RpcClientFold::new(pending.clone())));
         let emit: RpcResponseEmitter =
             Arc::new(move |_from_node, _session, origin, call_id, resp| {
-            let ev = response_event(origin, call_id, &resp);
-            client_fold
-                .lock()
-                .apply(&ev, &mut ())
-                .expect("client fold apply");
-        });
+                let ev = response_event(origin, call_id, &resp);
+                client_fold
+                    .lock()
+                    .apply(&ev, &mut ())
+                    .expect("client fold apply");
+            });
         let server_fold = Arc::new(Mutex::new(RpcStreamingRequestFold::new(
             Arc::new(ClientStreamSumHandler),
             emit,

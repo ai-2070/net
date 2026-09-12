@@ -5756,7 +5756,9 @@ mod tests {
         .unwrap();
         assert!(
             wait_until(
-                || fold.in_flight_keys().contains(&(VICTIM, 0, ORIGIN, CALL_ID)),
+                || fold
+                    .in_flight_keys()
+                    .contains(&(VICTIM, 0, ORIGIN, CALL_ID)),
                 Duration::from_secs(1)
             )
             .await
@@ -5769,7 +5771,8 @@ mod tests {
         .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
-            fold.in_flight_keys().contains(&(VICTIM, 0, ORIGIN, CALL_ID)),
+            fold.in_flight_keys()
+                .contains(&(VICTIM, 0, ORIGIN, CALL_ID)),
             "forged CANCEL from a foreign session must not remove the victim's entry",
         );
         assert!(
