@@ -1152,11 +1152,22 @@ async fn the_rtc_prefilter_admits_exactly_what_dispatch_accepts() {
 /// one: reorder by the embedded sequence, then require the exact
 /// vector.
 ///
-/// Inverses: (1) suppress the sends on this stream id — nothing
-/// arrives and the value assertion fails; (2) permute the values at
-/// the send seam — the reordered sequence no longer matches;
-/// (3) disable the loss injector — the recovery evidence assertion
-/// fails.
+/// **What this witness can and cannot discriminate** (R-C). It
+/// claims set completion plus the consumer's reorder by `seq`, so
+/// by construction no set-preserving permutation can fail it —
+/// Kyra's `v[5] = 11 - v[5]` at the send seam rewrites which
+/// sequence each body claims, leaves the delivered *set* identical,
+/// and is **green**. That is the correct answer for this claim, not
+/// a gap: an ordered-arrival claim would contradict the documented
+/// substrate (`streams.md`).
+///
+/// Executed inverses that DO discriminate it:
+/// (1) drop one value at the send seam — 11 distinct sequences,
+///     red; (2) corrupt one payload's body on the wire — the
+///     byte-identical-copies / exact-vector assertion, red;
+///     (3) suppress the sends on `0x51` — zero deliveries, red;
+/// (4) disable the loss injector — the retransmit evidence
+///     assertion, red.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_reliable_stream_delivers_every_value_and_reorders_by_seq() {
     let (a, b, _id_a, _) = pair_with(rtc_config(), rtc_config()).await;
