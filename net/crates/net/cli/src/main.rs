@@ -309,7 +309,7 @@ async fn dispatch(cli: Cli) -> Result<(), CliError> {
         Command::Netdb(cmd) => commands::netdb::run(cmd, output, config_path, profile).await,
         Command::Org(cmd) => commands::org::run(cmd, output).await,
         Command::Node(cmd) => commands::node::run(cmd, output).await,
-        Command::Anchor(cmd) => commands::anchor::run(cmd, output).await,
+        Command::Anchor(cmd) => commands::anchor::run(cmd, output, config_path, profile).await,
         Command::Subnet(cmd) => commands::subnet::run(cmd, output, config_path, profile).await,
         Command::Gateway(cmd) => commands::gateway::run(cmd, output, config_path, profile).await,
         Command::Channel(cmd) => commands::channel::run(cmd, output, config_path, profile).await,

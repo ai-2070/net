@@ -41448,6 +41448,48 @@ impl MeshNode {
         })
     }
 
+    /// Every peer this node has heard advertise the RTC anchor role,
+    /// with the two addresses that make the role usable (Stage 4b:
+    /// `net-mesh anchor ls` and Deck's ANCHORS column).
+    ///
+    /// Read from **signature-verified** announcements, the same
+    /// fold `peer_announced_noise_pubkey` reads: an anchor row is a
+    /// claim its own entity signed, not something a peer asserted
+    /// about a third party. Sorted by node id so two calls agree.
+    #[cfg(feature = "webrtc")]
+    pub fn rtc_anchors(&self) -> Vec<super::behavior::deck::RtcAnchorRow> {
+        use super::behavior::deck::RtcAnchorRow;
+        let mut rows: Vec<RtcAnchorRow> = self.capability_fold.with_state(|state| {
+            let mut rows = Vec::new();
+            for (node_id, keys) in state.by_node.iter() {
+                let mut row: Option<RtcAnchorRow> = None;
+                for entry in keys.iter().filter_map(|key| state.entries.get(key)) {
+                    let is_anchor = entry.payload.tags.iter().any(|tag| tag == RTC_ANCHOR_TAG);
+                    if !is_anchor {
+                        continue;
+                    }
+                    let candidate = RtcAnchorRow {
+                        node_id: *node_id,
+                        rtc_addr: entry.payload.rtc_addr,
+                        rtc_bootstrap: entry.payload.rtc_bootstrap.clone(),
+                        noise_pubkey: entry.payload.noise_pubkey,
+                    };
+                    // Several announcements from one node: prefer the
+                    // one that actually carries a bootstrap URL, since
+                    // that is the row an operator is looking for.
+                    row = match row {
+                        Some(existing) if existing.rtc_bootstrap.is_some() => Some(existing),
+                        _ => Some(candidate),
+                    };
+                }
+                rows.extend(row);
+            }
+            rows
+        });
+        rows.sort_by_key(|row| row.node_id);
+        rows
+    }
+
     /// The pair action for this peer, ICE short-circuit included.
     ///
     /// `nat-traversal`-gated like its three callers (`connect_direct`,

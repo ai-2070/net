@@ -46,6 +46,32 @@ pub enum AnchorCommand {
     /// Browser bootstrap credentials (mint / inspect).
     #[command(subcommand)]
     Credential(CredentialCommand),
+    /// List the RTC anchors this node has heard announce
+    /// themselves, with their `rtc_addr` / `rtc_bootstrap`.
+    ///
+    /// Requires the `webrtc` build: an anchor row a build cannot act
+    /// on is a listing with nothing behind it.
+    #[cfg(feature = "webrtc")]
+    Ls(LsArgs),
+    /// Serve the browser bootstrap listener on this node.
+    ///
+    /// Requires the `rtc-bootstrap` build, which is the one that
+    /// carries an HTTP server at all.
+    #[cfg(feature = "rtc-bootstrap")]
+    Serve(Box<ServeArgs>),
+}
+
+/// `net-mesh anchor ls`.
+#[cfg(feature = "webrtc")]
+#[derive(Args, Debug)]
+pub struct LsArgs {
+    /// Operator identity file.
+    #[arg(long, value_name = "PATH")]
+    pub identity: Option<PathBuf>,
+
+    /// Supervisor node to query.
+    #[arg(long, default_value_t = crate::prelude::DEFAULT_SUPERVISOR_NODE)]
+    pub node: u64,
 }
 
 #[derive(Subcommand, Debug)]
@@ -155,13 +181,67 @@ struct InspectReport {
     trust_domain_matches: Option<bool>,
 }
 
-pub async fn run(cmd: AnchorCommand, output: Option<OutputFormat>) -> Result<(), CliError> {
+/// One row of `net-mesh anchor ls`.
+#[cfg(feature = "webrtc")]
+#[derive(serde::Serialize)]
+struct AnchorRow {
+    node: String,
+    rtc_addr: Option<String>,
+    rtc_bootstrap: Option<String>,
+    noise_pubkey: Option<String>,
+}
+
+pub async fn run(
+    cmd: AnchorCommand,
+    output: Option<OutputFormat>,
+    #[cfg_attr(
+        not(any(feature = "webrtc", feature = "rtc-bootstrap")),
+        allow(unused_variables)
+    )]
+    config_path: Option<&std::path::Path>,
+    #[cfg_attr(
+        not(any(feature = "webrtc", feature = "rtc-bootstrap")),
+        allow(unused_variables)
+    )]
+    profile_name: &str,
+) -> Result<(), CliError> {
     match cmd {
         AnchorCommand::Credential(CredentialCommand::Mint(args)) => run_mint(args, output).await,
         AnchorCommand::Credential(CredentialCommand::Inspect(args)) => {
             run_inspect(args, output).await
         }
+        #[cfg(feature = "webrtc")]
+        AnchorCommand::Ls(args) => run_ls(args, output, config_path, profile_name).await,
+        #[cfg(feature = "rtc-bootstrap")]
+        AnchorCommand::Serve(args) => run_serve(*args, output, config_path, profile_name).await,
     }
+}
+
+#[cfg(feature = "webrtc")]
+async fn run_ls(
+    args: LsArgs,
+    output: Option<OutputFormat>,
+    config_path: Option<&std::path::Path>,
+    profile_name: &str,
+) -> Result<(), CliError> {
+    use crate::context::{resolve_profile, CliContext};
+
+    let profile = resolve_profile(config_path, profile_name).await?;
+    let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
+    let rows: Vec<AnchorRow> = ctx
+        .deck()
+        .rtc_anchors()
+        .into_iter()
+        .map(|row| AnchorRow {
+            node: format!("{:#x}", row.node_id),
+            rtc_addr: row.rtc_addr.map(|a| a.to_string()),
+            rtc_bootstrap: row.rtc_bootstrap,
+            noise_pubkey: row.noise_pubkey.as_ref().map(|k| hex_string(k)),
+        })
+        .collect();
+    emit_value(OutputFormat::resolve_oneshot(output), &rows)
+        .map_err(|e| generic(format!("write anchor ls: {e}")))?;
+    Ok(())
 }
 
 async fn run_mint(args: MintArgs, output: Option<OutputFormat>) -> Result<(), CliError> {
@@ -305,4 +385,207 @@ async fn publish_staged_or_replace(
 
 fn hex_string(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// `net-mesh anchor serve` — run a browser-facing anchor: an RTC
+/// socket, the §12 admission contract, and the bootstrap listener.
+#[cfg(feature = "rtc-bootstrap")]
+#[derive(Args, Debug)]
+pub struct ServeArgs {
+    /// Mesh bind address for the node itself.
+    #[arg(long, value_name = "ADDR", default_value = "0.0.0.0:0")]
+    pub bind: String,
+
+    /// The transport trust domain's PSK (64 hex chars), read from a
+    /// file. The same PSK the credentials were minted against.
+    #[arg(long = "psk-file", value_name = "PATH")]
+    pub psk_file: PathBuf,
+
+    /// Address for the HTTPS bootstrap listener.
+    #[arg(long = "listen", value_name = "ADDR", default_value = "0.0.0.0:8443")]
+    pub listen: String,
+
+    /// The externally reachable base URL of that listener. It is
+    /// published as `rtc_bootstrap` on the announcement, so it must
+    /// be the name on the certificate.
+    #[arg(long = "url", value_name = "URL")]
+    pub url: String,
+
+    /// Public address of the RTC/STUN socket, published as
+    /// `rtc_addr`. Required behind NAT; without it a browser has no
+    /// address to aim ICE at.
+    #[arg(long = "rtc-public-addr", value_name = "ADDR")]
+    pub rtc_public_addr: Option<String>,
+
+    /// Bind address of the RTC socket. Pin it when `--rtc-public-addr`
+    /// maps a fixed port.
+    #[arg(long = "rtc-bind", value_name = "ADDR")]
+    pub rtc_bind: Option<String>,
+
+    /// Operator-supplied certificate chain (PEM). With `--tls-key`.
+    #[arg(long = "tls-cert", value_name = "PATH", requires = "tls_key")]
+    pub tls_cert: Option<PathBuf>,
+
+    /// Operator-supplied private key (PEM).
+    #[arg(long = "tls-key", value_name = "PATH")]
+    pub tls_key: Option<PathBuf>,
+
+    /// ACME directory URL (HTTP-01 on this same listener).
+    /// Mutually exclusive with `--tls-cert`.
+    #[arg(
+        long = "acme-directory",
+        value_name = "URL",
+        conflicts_with = "tls_cert"
+    )]
+    pub acme_directory: Option<String>,
+
+    /// ACME contact e-mail.
+    #[arg(long = "acme-email", value_name = "EMAIL")]
+    pub acme_email: Option<String>,
+
+    /// Where issued certificates are cached.
+    #[arg(long = "acme-cache", value_name = "DIR")]
+    pub acme_cache: Option<PathBuf>,
+
+    /// Browser origins allowed to call the endpoints and open the
+    /// trickle socket. Repeatable. **No wildcard** — an endpoint
+    /// that takes a credential does not get one.
+    #[arg(long = "allow-origin", value_name = "ORIGIN", required = true)]
+    pub allow_origin: Vec<String>,
+
+    /// Per-source-IP `POST /rtc/offer` ceiling per minute.
+    #[arg(long = "offers-per-minute")]
+    pub offers_per_minute: Option<u32>,
+}
+
+/// What `serve` reports once it is up.
+#[cfg(feature = "rtc-bootstrap")]
+#[derive(serde::Serialize)]
+struct ServeReport {
+    node: String,
+    listening_on: String,
+    bootstrap_url: String,
+    rtc_addr: Option<String>,
+    trust_domain: String,
+    noise_pubkey: String,
+}
+
+#[cfg(feature = "rtc-bootstrap")]
+async fn run_serve(
+    args: ServeArgs,
+    output: Option<OutputFormat>,
+    _config_path: Option<&std::path::Path>,
+    _profile_name: &str,
+) -> Result<(), CliError> {
+    use net_sdk::rtc_bootstrap::{
+        serve_bootstrap, AcmeConfig, AcmeState, BootstrapConfig, BootstrapTls,
+    };
+    use net_sdk::Mesh;
+
+    let psk_hex = tokio::fs::read_to_string(&args.psk_file)
+        .await
+        .map_err(|e| invalid_args(format!("--psk-file {}: {e}", args.psk_file.display())))?;
+    let psk = hex_decode_32(psk_hex.trim()).map_err(|e| invalid_args(format!("psk: {e}")))?;
+
+    let tls = match (&args.tls_cert, &args.tls_key, &args.acme_directory) {
+        (Some(cert), Some(key), None) => BootstrapTls::Operator {
+            cert_pem: cert.clone(),
+            key_pem: key.clone(),
+        },
+        (None, _, Some(directory)) => {
+            let domain = args
+                .url
+                .trim_start_matches("https://")
+                .split('/')
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            BootstrapTls::Acme(AcmeConfig {
+                directory_url: directory.clone(),
+                domain,
+                contact_email: args.acme_email.clone().ok_or_else(|| {
+                    invalid_args("--acme-email is required with --acme-directory")
+                })?,
+                cache_dir: args
+                    .acme_cache
+                    .clone()
+                    .unwrap_or_else(|| std::env::temp_dir().join("net-mesh-acme")),
+            })
+        }
+        _ => {
+            return Err(invalid_args(
+                "browser-trusted TLS is required: pass --tls-cert/--tls-key, or \
+                 --acme-directory/--acme-email. There is no self-signed mode, because \
+                 a browser refuses one",
+            ))
+        }
+    };
+
+    let mut rtc = net::adapter::net::rtc::RtcConfig::new().with_bootstrap_url(args.url.clone());
+    rtc.serve_stun = true;
+    if let Some(bind) = args.rtc_bind.as_ref() {
+        rtc.bind_addr = Some(
+            bind.parse()
+                .map_err(|e| invalid_args(format!("--rtc-bind: {e}")))?,
+        );
+    }
+    if let Some(public) = args.rtc_public_addr.as_ref() {
+        rtc.public_addr = Some(
+            public
+                .parse()
+                .map_err(|e| invalid_args(format!("--rtc-public-addr: {e}")))?,
+        );
+    }
+
+    let mesh = Mesh::builder(&args.bind, &psk)
+        .map_err(|e| generic(format!("mesh builder: {e}")))?
+        .rtc(rtc)
+        .build()
+        .await
+        .map_err(|e| generic(format!("starting the anchor: {e}")))?;
+    mesh.start();
+
+    let sdk_psk = Psk::new(psk);
+    let mut listener_config = BootstrapConfig::new(
+        args.listen
+            .parse()
+            .map_err(|e| invalid_args(format!("--listen: {e}")))?,
+        sdk_psk.clone(),
+        tls,
+        args.allow_origin
+            .first()
+            .cloned()
+            .unwrap_or_else(|| args.url.clone()),
+    );
+    listener_config.allowed_origins = args.allow_origin.clone();
+    listener_config.ws_allowed_origins = args.allow_origin.clone();
+    listener_config.acme = AcmeState::new();
+    if let Some(limit) = args.offers_per_minute {
+        listener_config.offers_per_ip_per_minute = limit;
+    }
+
+    let node = std::sync::Arc::clone(mesh.node());
+    let handle = serve_bootstrap(node, listener_config)
+        .await
+        .map_err(|e| generic(format!("starting the bootstrap listener: {e}")))?;
+
+    emit_value(
+        OutputFormat::resolve_oneshot(output),
+        &ServeReport {
+            node: format!("{:#x}", mesh.node().node_id()),
+            listening_on: handle.local_addr().to_string(),
+            bootstrap_url: args.url.clone(),
+            rtc_addr: args.rtc_public_addr.clone(),
+            trust_domain: sdk_psk.trust_domain().to_string(),
+            noise_pubkey: hex_string(mesh.node().public_key()),
+        },
+    )
+    .map_err(|e| generic(format!("write anchor serve: {e}")))?;
+
+    // Serve until interrupted; the listener owns its own accept loop.
+    tokio::signal::ctrl_c()
+        .await
+        .map_err(|e| generic(format!("waiting for ctrl-c: {e}")))?;
+    handle.shutdown().await;
+    Ok(())
 }

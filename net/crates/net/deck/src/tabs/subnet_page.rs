@@ -226,6 +226,10 @@ fn render_members(
         cursor,
         local_id,
         local_maintenance_mirror,
+        // The MEMBERS panel shares the NODES columns; anchors are a
+        // NODES-tab concern, so this panel passes none rather than
+        // showing a column it has no data for.
+        &std::collections::BTreeMap::new(),
     );
 }
 

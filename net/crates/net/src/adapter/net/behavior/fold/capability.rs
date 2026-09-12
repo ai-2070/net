@@ -118,6 +118,18 @@ pub struct CapabilityMembership {
     /// announcement itself and fills this locally.
     #[serde(skip)]
     pub noise_pubkey: Option<[u8; 32]>,
+    /// Publisher's announced bootstrap listener URL
+    /// (`rtc_bootstrap`, plan §11; Stage 4b). Projected exactly like
+    /// `noise_pubkey`, and `#[serde(skip)]` for the same reason:
+    /// every node ingests the announcement itself, so this
+    /// projection never travels in the fold envelope.
+    #[serde(skip)]
+    pub rtc_bootstrap: Option<String>,
+    /// Publisher's announced public RTC/STUN socket (`rtc_addr`,
+    /// plan §11; Stage 4b). Same projection rules as
+    /// `rtc_bootstrap`.
+    #[serde(skip)]
+    pub rtc_addr: Option<std::net::SocketAddr>,
     /// v0.4 capability-auth allow-list — peer `node_id`s
     /// authorized to invoke any of this publisher's `tags`. Empty
     /// = unrestricted (permissive default). Union semantics with
@@ -1052,6 +1064,10 @@ mod tests {
                 price_quote: None,
                 reflex_addr,
                 noise_pubkey: None,
+                rtc_bootstrap: None,
+                rtc_addr: None,
+                rtc_bootstrap: None,
+                rtc_addr: None,
                 allowed_nodes: Vec::new(),
                 allowed_subnets: Vec::new(),
                 allowed_groups: Vec::new(),
@@ -1266,6 +1282,8 @@ mod tests {
             price_quote: None,
             reflex_addr: None,
             noise_pubkey: None,
+            rtc_bootstrap: None,
+            rtc_addr: None,
             allowed_nodes: Vec::new(),
             allowed_subnets: Vec::new(),
             allowed_groups: Vec::new(),
@@ -1356,6 +1374,12 @@ mod tests {
                     price_quote: None,
                     reflex_addr: None,
                     noise_pubkey: None,
+                    rtc_bootstrap: None,
+                    rtc_addr: None,
+                    rtc_bootstrap: None,
+                    rtc_addr: None,
+                    rtc_bootstrap: None,
+                    rtc_addr: None,
                     allowed_nodes: Vec::new(),
                     allowed_subnets: Vec::new(),
                     allowed_groups: Vec::new(),
@@ -2029,6 +2053,10 @@ mod tests {
                 price_quote: None,
                 reflex_addr: None,
                 noise_pubkey: None,
+                rtc_bootstrap: None,
+                rtc_addr: None,
+                rtc_bootstrap: None,
+                rtc_addr: None,
                 allowed_nodes: Vec::new(),
                 allowed_subnets: Vec::new(),
                 allowed_groups: Vec::new(),

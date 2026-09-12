@@ -32,6 +32,10 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [features]
 default = []
+# Stage 4b: surface announced `rtc_addr` / `rtc_bootstrap` in the
+# NODES table. Off by default because the fields only exist in a
+# `webrtc` build of the core.
+webrtc = ["net-mesh-sdk/webrtc"]
 # `demo` boots a real 5-node in-process MeshOS cluster via
 # `net_sdk::testing::ClusterHarness` and registers real daemons
 # across the nodes. The deck observes node[0]'s view; the

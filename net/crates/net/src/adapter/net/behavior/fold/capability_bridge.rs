@@ -1287,6 +1287,8 @@ pub fn translate_announcement(
             price_quote: None,
             reflex_addr: ann.reflex_addr,
             noise_pubkey: ann.noise_pubkey,
+            rtc_bootstrap: ann.rtc_bootstrap.clone(),
+            rtc_addr: ann.rtc_addr,
             allowed_nodes: ann.allowed_nodes.clone(),
             allowed_subnets: ann.allowed_subnets.clone(),
             allowed_groups: ann.allowed_groups.clone(),

@@ -36,6 +36,67 @@ pub struct LogsBackTarget {
 }
 
 /// Navigation half of [`LogsBackTarget`] — the three
+
+/// The two addresses that make an RTC anchor usable, as the NODES
+/// table shows them (Stage 4b).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AnchorAddresses {
+    /// The announced public RTC/STUN socket.
+    pub rtc_addr: Option<String>,
+    /// The announced bootstrap listener URL.
+    pub rtc_bootstrap: Option<String>,
+}
+
+impl AnchorAddresses {
+    /// One cell's worth: the RTC socket if there is one, else the
+    /// bootstrap URL's host, else the bare anchor marker. An anchor
+    /// with neither address announced is still an anchor — and
+    /// showing it as one is how an operator notices it is
+    /// unreachable.
+    pub fn cell(&self) -> String {
+        if let Some(addr) = self.rtc_addr.as_deref() {
+            return addr.to_string();
+        }
+        if let Some(url) = self.rtc_bootstrap.as_deref() {
+            let host = url
+                .trim_start_matches("https://")
+                .trim_start_matches("http://")
+                .split('/')
+                .next()
+                .unwrap_or(url);
+            return host.to_string();
+        }
+        "anchor (no address)".to_string()
+    }
+}
+
+/// Read the anchor rollup from the deck client. Empty without
+/// `webrtc`: the fields do not exist in that build, and a column of
+/// blanks would imply "no anchors" rather than "not this build".
+fn collect_rtc_anchors(
+    #[cfg_attr(not(feature = "webrtc"), allow(unused_variables))] deck: &Arc<DeckClient>,
+) -> std::collections::BTreeMap<u64, AnchorAddresses> {
+    #[cfg(feature = "webrtc")]
+    {
+        deck.rtc_anchors()
+            .into_iter()
+            .map(|row| {
+                (
+                    row.node_id,
+                    AnchorAddresses {
+                        rtc_addr: row.rtc_addr.map(|a| a.to_string()),
+                        rtc_bootstrap: row.rtc_bootstrap,
+                    },
+                )
+            })
+            .collect()
+    }
+    #[cfg(not(feature = "webrtc"))]
+    {
+        std::collections::BTreeMap::new()
+    }
+}
+
 /// contexts `filter_logs_for_id` is reachable from.
 #[derive(Clone, Debug)]
 pub enum LogsBackContext {
@@ -200,6 +261,12 @@ pub struct App {
     /// collections are empty to decide between live and
     /// fixture rendering paths.
     pub snapshot: Arc<MeshOsSnapshot>,
+    /// Stage 4b: the RTC anchors this node has heard announce
+    /// themselves, keyed by node id, refreshed with the snapshot.
+    /// `rtc_addr` / `rtc_bootstrap` do not ride `PeerSnapshot`, so
+    /// the NODES table reads them from here. Empty on a build
+    /// without `webrtc`, which is also a build that cannot use them.
+    pub rtc_anchors: std::collections::BTreeMap<u64, AnchorAddresses>,
     /// Memoized SUBNETS-tab derivation against the current
     /// snapshot. `subnet_rollups_with_local` and
     /// `aggregator_source_subnets` get called every frame on
@@ -611,6 +678,7 @@ impl App {
         this_node: net_sdk::meshos::NodeId,
     ) -> Self {
         let snapshot = Arc::new(deck.status());
+        let rtc_anchors = collect_rtc_anchors(&deck);
         let (toast_tx, toast_rx) = std::sync::mpsc::channel();
         let crate::streams::Tails {
             logs: logs_tail,
@@ -642,6 +710,7 @@ impl App {
             tick: 0,
             deck,
             snapshot,
+            rtc_anchors,
             subnet_view_cache: std::cell::RefCell::new(SubnetViewCache::default()),
             groups_cursor: DaemonCursor::default(),
             daemons_cursor: 0,
@@ -709,6 +778,7 @@ impl App {
 
     fn refresh_snapshot(&mut self) {
         self.snapshot = Arc::new(self.deck.status());
+        self.rtc_anchors = collect_rtc_anchors(&self.deck);
         // Snapshot just swapped — every memoized derivation
         // against it is now stale.
         self.subnet_view_cache.borrow_mut().invalidate();
@@ -3339,6 +3409,7 @@ impl App {
                     Some(&self.snapshot),
                     self.nodes_cursor,
                     Some(local_row),
+                    &self.rtc_anchors,
                 );
             }
             Tab::Daemons => {
@@ -3520,5 +3591,34 @@ impl App {
             }
             None => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod anchor_cell_tests {
+    use super::AnchorAddresses;
+
+    /// The ANCHOR cell prefers the address a browser aims ICE at,
+    /// falls back to the bootstrap host, and never renders an
+    /// announced anchor as if it were not one.
+    #[test]
+    fn the_anchor_cell_prefers_the_rtc_socket_then_the_bootstrap_host() {
+        let both = AnchorAddresses {
+            rtc_addr: Some("203.0.113.7:7101".to_string()),
+            rtc_bootstrap: Some("https://anchor.example.com/rtc".to_string()),
+        };
+        assert_eq!(both.cell(), "203.0.113.7:7101");
+
+        let url_only = AnchorAddresses {
+            rtc_addr: None,
+            rtc_bootstrap: Some("https://anchor.example.com/rtc".to_string()),
+        };
+        assert_eq!(url_only.cell(), "anchor.example.com");
+
+        // An anchor that announced neither is still an anchor —
+        // showing it as one is how an operator notices it is
+        // unreachable, and a blank cell would read as "not an
+        // anchor".
+        assert_eq!(AnchorAddresses::default().cell(), "anchor (no address)");
     }
 }

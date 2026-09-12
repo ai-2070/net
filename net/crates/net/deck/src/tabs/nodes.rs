@@ -29,12 +29,13 @@ pub fn render(
     snapshot: Option<&MeshOsSnapshot>,
     cursor: usize,
     local: Option<LocalNodeRow<'_>>,
+    anchors: &std::collections::BTreeMap<u64, crate::app::AnchorAddresses>,
 ) {
     let has_peers = snapshot.map(|s| !s.peers.is_empty()).unwrap_or(false);
     let has_local = local.is_some();
     if has_peers || has_local {
         if let Some(s) = snapshot {
-            render_live_nodes_table(frame, area, s, cursor, local);
+            render_live_nodes_table(frame, area, s, cursor, local, anchors);
         }
     } else {
         render_empty_nodes_table(frame, area);
@@ -63,6 +64,10 @@ pub(crate) fn render_nodes_view(
     cursor: usize,
     local_id: Option<u64>,
     local_maintenance_mirror: Option<net_sdk::deck::MaintenanceMirrorSnapshot>,
+    // Stage 4b: announced `rtc_addr` / `rtc_bootstrap`, which do not
+    // ride `PeerSnapshot`. Empty map ⇒ the ANCHOR column shows `—`
+    // for every row, which is what a mesh with no anchors looks like.
+    anchors: &std::collections::BTreeMap<u64, crate::app::AnchorAddresses>,
 ) {
     use net_sdk::deck::{MaintenanceMirrorSnapshot, PeerHealthSnapshot};
 
@@ -102,6 +107,7 @@ pub(crate) fn render_nodes_view(
         cell_dim("SAT"),
         cell_dim("DAEMONS"),
         cell_dim("MAINT"),
+        cell_dim("ANCHOR"),
     ])
     .height(1);
 
@@ -212,6 +218,10 @@ pub(crate) fn render_nodes_view(
             Cell::from(Span::styled(sat_text, sat_style)),
             Cell::from(Span::styled(format!("{daemon_count:>3}"), theme::text())),
             Cell::from(Span::styled(maint_text, maint_style)),
+            Cell::from(match anchors.get(&peer_id) {
+                Some(addresses) => Span::styled(addresses.cell(), theme::cyan()),
+                None => Span::styled("—".to_string(), theme::chrome()),
+            }),
         ]));
     }
 
@@ -228,6 +238,7 @@ pub(crate) fn render_nodes_view(
             Constraint::Length(5),  // SAT
             Constraint::Length(8),  // DAEMONS
             Constraint::Length(10), // MAINT
+            Constraint::Min(21),    // ANCHOR (rtc_addr / bootstrap host)
         ],
     )
     .header(header)
@@ -293,6 +304,7 @@ fn render_live_nodes_table(
     snapshot: &MeshOsSnapshot,
     cursor: usize,
     local: Option<LocalNodeRow<'_>>,
+    anchors: &std::collections::BTreeMap<u64, crate::app::AnchorAddresses>,
 ) {
     use net_sdk::deck::PeerHealthSnapshot;
 
@@ -337,6 +349,7 @@ fn render_live_nodes_table(
         cursor,
         local_id,
         local_maintenance_mirror,
+        anchors,
     );
 }
 

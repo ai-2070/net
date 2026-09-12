@@ -350,6 +350,25 @@ pub struct SubnetRollup {
     pub is_local: bool,
 }
 
+/// One RTC anchor, as [`DeckClient::rtc_anchors`] reports it.
+///
+/// A row exists only for a peer whose own signed announcement
+/// carries the `rtc-anchor` tag; the two address fields are the ones
+/// that make the role usable, and either may be absent (an anchor
+/// that serves no bootstrap listener, or one whose operator has not
+/// told it its public address).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RtcAnchorRow {
+    /// The anchor's node id.
+    pub node_id: u64,
+    /// Its public RTC/STUN socket (`rtc_addr`), when announced.
+    pub rtc_addr: Option<std::net::SocketAddr>,
+    /// Its bootstrap listener URL (`rtc_bootstrap`), when announced.
+    pub rtc_bootstrap: Option<String>,
+    /// Its Noise static public key, when announced (plan §5 Layer 1).
+    pub noise_pubkey: Option<[u8; 32]>,
+}
+
 /// One-shot snapshot returned by [`DeckClient::aggregator_snapshot`].
 /// Bundles every field a renderer needs in a single struct so
 /// callers don't pay for five per-field lock acquisitions per
@@ -768,6 +787,20 @@ impl DeckClient {
                 }
             })
             .collect()
+    }
+
+    /// Every RTC anchor this node has heard announce itself, sorted
+    /// by node id (Stage 4b). Empty when no `MeshNode` is wired in,
+    /// or when the build has no `webrtc` — an anchor row this build
+    /// cannot act on would be a listing with nothing behind it.
+    ///
+    /// Powers `net-mesh anchor ls` and Deck's ANCHORS view.
+    #[cfg(feature = "webrtc")]
+    pub fn rtc_anchors(&self) -> Vec<RtcAnchorRow> {
+        self.mesh
+            .as_ref()
+            .map(|m| m.rtc_anchors())
+            .unwrap_or_default()
     }
 
     /// Aggregate gateway counters for `net gateway stats`.

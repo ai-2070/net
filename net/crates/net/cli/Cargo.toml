@@ -12,6 +12,13 @@ name = "net-mesh"
 path = "src/main.rs"
 
 [features]
+# Stage 4b: `net-mesh anchor ls` reads the announced `rtc_addr` /
+# `rtc_bootstrap`, which only exist in a `webrtc` build.
+webrtc = ["net-sdk/webrtc"]
+# Stage 4b: `net-mesh anchor serve` runs the browser bootstrap
+# listener, so it pulls the SDK's HTTP surface. Off by default —
+# the standard CLI stays free of an HTTP server.
+rtc-bootstrap = ["webrtc", "net-sdk/rtc-bootstrap"]
 # `keychain` turns on the OS-keychain secret value store so `net-mesh
 # forwarding set-value` can persist a forwarded secret (it enables
 # `net-mesh-mcp`'s own

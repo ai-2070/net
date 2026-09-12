@@ -107,6 +107,13 @@ pub enum RtcSignal {
         /// Completion.
         reply: oneshot::Sender<Result<(), String>>,
     },
+    /// Stage 4b: report the pair ICE actually selected.
+    SelectedPair {
+        /// Which session.
+        peer: RtcPeerId,
+        /// `(local, remote, how the remote address was learned)`.
+        reply: oneshot::Sender<Option<(std::net::SocketAddr, std::net::SocketAddr, &'static str)>>,
+    },
     /// Wait until the DataChannel is open (or the deadline passes).
     AwaitOpen {
         /// Which session.
@@ -391,6 +398,30 @@ impl RtcDriverHandle {
             .map_err(|_| "driver dropped the reply".to_string())?
     }
 
+    /// **Stage 4b (§6).** The candidate pair ICE selected for
+    /// `peer`, as `(local, remote, learned)`, once traffic is
+    /// flowing on it. `learned` is `"signalled"` when the remote
+    /// address arrived as a candidate over signalling, and
+    /// `"peer-reflexive"` when it did not — the address was learned
+    /// from the peer's own inbound binding request, which is the
+    /// mechanism §6 names for a browser that hides its host IPs
+    /// behind `<uuid>.local`.
+    ///
+    /// Reported from what the ICE stack is transmitting to: str0m
+    /// 0.23.1 exposes no nominated-pair accessor and emits no event
+    /// for one, so "the address it sends to" is the observable that
+    /// exists. `None` before anything has been sent.
+    pub async fn selected_pair(
+        &self,
+        peer: RtcPeerId,
+    ) -> Option<(std::net::SocketAddr, std::net::SocketAddr, &'static str)> {
+        let (tx, rx) = oneshot::channel();
+        self.signal(RtcSignal::SelectedPair { peer, reply: tx })
+            .await
+            .ok()?;
+        rx.await.ok().flatten()
+    }
+
     /// Close a session.
     pub async fn close(&self, peer: RtcPeerId) -> Result<(), String> {
         self.signal(RtcSignal::Close { peer }).await
@@ -519,6 +550,20 @@ struct Session {
     open_by: Instant,
     /// Waiters parked on [`RtcSignal::AwaitOpen`].
     open_waiters: Vec<oneshot::Sender<Result<(), String>>>,
+    /// **Stage 4b (§6, the mDNS question).** The destination str0m
+    /// is currently transmitting to — after nomination, that is the
+    /// remote half of the selected candidate pair. str0m 0.23.1
+    /// exposes no nominated-pair accessor and emits no event for
+    /// it, so this is the observable that exists: what the ICE
+    /// stack actually sends to.
+    last_transmit: Option<std::net::SocketAddr>,
+    /// Remote candidate addresses this session was *told* about
+    /// through signalling. An address in `last_transmit` that is
+    /// NOT in here was learned from the peer's own inbound binding
+    /// request — i.e. peer-reflexive, which is precisely the answer
+    /// §6 asks for when a browser hides its host IPs behind
+    /// `<uuid>.local`.
+    signalled_remotes: Vec<std::net::SocketAddr>,
 }
 
 /// The driver task.
@@ -983,6 +1028,7 @@ async fn drain_session(
                 return;
             }
             Ok(Output::Transmit(t)) => {
+                session.last_transmit = Some(t.destination);
                 let _ = socket.send_to(&t.contents, t.destination).await;
             }
             Ok(Output::Event(event)) => match event {
@@ -1300,6 +1346,21 @@ async fn handle_signal(
                 }
             }
         }
+        RtcSignal::SelectedPair { peer, reply } => {
+            let socket_addr = socket
+                .local_addr()
+                .unwrap_or_else(|_| "0.0.0.0:0".parse().expect("literal"));
+            let answer = session_for(sessions, peer).and_then(|session| {
+                let remote = session.last_transmit?;
+                let learned = if session.signalled_remotes.contains(&remote) {
+                    "signalled"
+                } else {
+                    "peer-reflexive"
+                };
+                Some((socket_addr, remote, learned))
+            });
+            let _ = reply.send(answer);
+        }
         RtcSignal::RemoteCandidate {
             peer,
             candidate,
@@ -1311,6 +1372,12 @@ async fn handle_signal(
             };
             match Candidate::from_sdp_string(&candidate) {
                 Ok(c) => {
+                    if let Some(addr) = c.addr().into() {
+                        let addr: std::net::SocketAddr = addr;
+                        if !session.signalled_remotes.contains(&addr) {
+                            session.signalled_remotes.push(addr);
+                        }
+                    }
                     session.rtc.add_remote_candidate(c);
                     drain_session(
                         session,
@@ -1383,6 +1450,8 @@ fn new_session(
         cid: None,
         pending: None,
         retry: None,
+        last_transmit: None,
+        signalled_remotes: Vec::new(),
         timeout: Instant::now(),
         open: false,
         closed: false,
