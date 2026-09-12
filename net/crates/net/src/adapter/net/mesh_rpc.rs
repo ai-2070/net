@@ -2914,6 +2914,20 @@ async fn publish_response_to_caller(
     // the reply channel's canonical hash — once, centrally. The
     // caller's mesh ingress selects exactly this dispatcher.
     let payload = crate::adapter::net::cortex::insert_rpc_route(payload, reply_channel_hash);
+    // §12 step 4: an enrollment RESPONSE leaving this anchor
+    // promotes the session that asked for it — the exact
+    // incarnation captured when the REQUEST was decoded, re-checked
+    // inside `promote_admission`. Keyed on the reply channel, so no
+    // other service's response can promote anything.
+    #[cfg(feature = "webrtc")]
+    if let Some(node_id) = target_hint {
+        if mesh.promote_on_enrollment_response(node_id, reply_channel.as_str()) {
+            tracing::debug!(
+                node_id = format!("{node_id:#x}"),
+                "§12: enrollment succeeded; session promoted"
+            );
+        }
+    }
     // A `DirectOnly` frame trusts ONLY the explicit `target_hint` (the
     // AEAD-authenticated session peer): it must never resolve a
     // destination through the origin reverse-index, which could point at
@@ -5929,7 +5943,19 @@ impl MeshNode {
                     // corrective announce until an unrelated peer
                     // failure cleared the latch. Refund it: nothing was
                     // broadcast, so there is nothing to bound.
-                    if self.claim_corrective_announce(target_node_id) {
+                    // S0e §3 row 13 — the sharpest finding: this
+                    // corrective announce deliberately BYPASSES the
+                    // announce rate limit, so a peer that can make
+                    // us keep failing a Subscribe has a mesh-wide
+                    // flood trigger, one per refused attempt. A
+                    // provisional session's refusal is a POLICY
+                    // answer, not a stale-announcement problem, so
+                    // it earns no announce at all.
+                    #[cfg(feature = "webrtc")]
+                    let provisional_rejecter = self.peer_is_provisional(target_node_id);
+                    #[cfg(not(feature = "webrtc"))]
+                    let provisional_rejecter = false;
+                    if !provisional_rejecter && self.claim_corrective_announce(target_node_id) {
                         if let Err(e) = self.reannounce_for_authorization().await {
                             tracing::debug!(
                                 target = format!("{target_node_id:#x}"),

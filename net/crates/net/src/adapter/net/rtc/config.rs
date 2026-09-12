@@ -43,6 +43,9 @@ pub const DEFAULT_ICE_DEADLINE: Duration = Duration::from_secs(10);
 /// Default ceiling on concurrent RTC sessions.
 pub const DEFAULT_MAX_PEERS: usize = 256;
 
+/// Default for [`RtcConfig::max_provisional`] (§12 global bound).
+pub const DEFAULT_MAX_PROVISIONAL: usize = 64;
+
 /// RTC transport configuration.
 #[derive(Debug, Clone)]
 pub struct RtcConfig {
@@ -73,6 +76,12 @@ pub struct RtcConfig {
     /// Serve the browser bootstrap listener. **Stage 4 consumes this**;
     /// Stage 3 carries the flag and nothing reads it.
     pub serve_bootstrap: bool,
+    /// §12 global bound: concurrent **provisional** sessions this
+    /// anchor will hold. Past it the oldest are closed and
+    /// reclaimed, counted — an unenrolled session is the cheapest
+    /// thing for an attacker to create and the most expendable
+    /// thing for an anchor to drop.
+    pub max_provisional: usize,
 }
 
 impl Default for RtcConfig {
@@ -88,6 +97,7 @@ impl Default for RtcConfig {
             ingress_queue_packets: DEFAULT_INGRESS_QUEUE_PACKETS,
             serve_stun: false,
             serve_bootstrap: false,
+            max_provisional: DEFAULT_MAX_PROVISIONAL,
         }
     }
 }

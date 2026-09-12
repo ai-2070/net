@@ -10688,6 +10688,13 @@ pub struct MeshNode {
     /// touch the peer map (F3 router drain, F6 traversal, F7 proxy).
     #[cfg(feature = "webrtc")]
     provisional_endpoints: super::rtc::ProvisionalEndpoints,
+    /// §12 step 4: the session incarnation an in-flight enrollment
+    /// call was decoded against, keyed by `(node_id, call_id)`.
+    /// Promotion consumes it and re-verifies the binding — a
+    /// delayed completion whose session was replaced promotes
+    /// nothing.
+    #[cfg(feature = "webrtc")]
+    pending_promotions: Arc<DashMap<u64, (u64, PeerAddr)>>,
     /// Test-only record of every frame that passed the budget, so a
     /// witness can assert what was *admitted* rather than inferring
     /// it from an installed session.
@@ -13140,6 +13147,8 @@ impl MeshNode {
             rtc_signal_budget: Arc::new(parking_lot::Mutex::new(super::rtc::SignalBudget::new())),
             #[cfg(feature = "webrtc")]
             provisional_endpoints,
+            #[cfg(feature = "webrtc")]
+            pending_promotions: Arc::new(DashMap::new()),
             #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
             rtc_signal_tap: Arc::new(parking_lot::Mutex::new(Vec::new())),
             #[cfg(feature = "webrtc")]
@@ -22935,6 +22944,11 @@ impl MeshNode {
         // node.
         #[cfg(feature = "webrtc")]
         self.spawn_rtc_close_notifier();
+        // §12 step 5: expiry, budget breach and `max_provisional`
+        // all end the same way — close and reclaim — so one sweep
+        // owns all three.
+        #[cfg(feature = "webrtc")]
+        self.spawn_provisional_reclaim_loop();
         let heartbeat_handle = self.spawn_heartbeat_loop();
         let stream_grant_drainer_handle = self.spawn_stream_grant_drainer_loop();
         let retransmit_handle = self.spawn_retransmit_loop();
@@ -24752,6 +24766,38 @@ impl MeshNode {
             auth_failure_window: self.config.auth_failure_window,
             auth_throttle_duration: self.config.auth_throttle_duration,
         }
+    }
+
+    /// Sweep provisional sessions: reclaim the expired and, when
+    /// the anchor is over `max_provisional`, the oldest (§12 step
+    /// 5). One second is well inside the 30 s provisional TTL and
+    /// cheap — the sweep touches only peers whose admission is
+    /// provisional.
+    #[cfg(feature = "webrtc")]
+    fn spawn_provisional_reclaim_loop(&self) {
+        let Some(weak) = self.self_weak.get().cloned() else {
+            // A node started without `start_arc` has no weak self;
+            // its provisional sessions are reclaimed on close and
+            // on shutdown, and the Stage 3 harness never creates
+            // any (it serves no bootstrap).
+            return;
+        };
+        let shutdown = self.shutdown.clone();
+        let shutdown_notify = self.shutdown_notify.clone();
+        let handle = tokio::spawn(async move {
+            while !shutdown.load(Ordering::Acquire) {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                    _ = shutdown_notify.notified() => break,
+                }
+                let Some(node) = weak.upgrade() else { break };
+                let reclaimed = node.reclaim_provisional_sessions();
+                if reclaimed > 0 {
+                    tracing::debug!(reclaimed, "§12: reclaimed provisional sessions");
+                }
+            }
+        });
+        self.tasks.lock().push(handle);
     }
 
     /// Consume the RTC driver's channel-close notifications and run
@@ -28331,20 +28377,49 @@ impl MeshNode {
                         // counter=0 across heartbeats so the replay
                         // window would reject every heartbeat after
                         // the first.
-                        let snapshot: Vec<(PeerAddr, Arc<NetSession>)> = peers
+                        // §12 / S0e §3 rows 10–11: heartbeat is
+                        // permitted maintenance for a provisional
+                        // session; the pingwave two lines below is
+                        // not. The split is per statement, not per
+                        // loop — which is exactly how they are
+                        // emitted, and why a coarser check would
+                        // have taken the heartbeat with it.
+                        #[cfg(feature = "webrtc")]
+                        let snapshot: Vec<(PeerAddr, Arc<NetSession>, bool)> = peers
                             .iter()
                             .filter_map(|entry| {
                                 let peer_addr = entry.value().addr();
                                 if partition_filter.contains(&peer_addr) {
                                     None
                                 } else {
-                                    Some((peer_addr, entry.value().session.clone()))
+                                    Some((
+                                        peer_addr,
+                                        entry.value().session.clone(),
+                                        entry.value().admission.is_provisional(),
+                                    ))
                                 }
                             })
                             .collect();
-                        for (peer_addr, session) in snapshot {
+                        #[cfg(not(feature = "webrtc"))]
+                        let snapshot: Vec<(PeerAddr, Arc<NetSession>, bool)> = peers
+                            .iter()
+                            .filter_map(|entry| {
+                                let peer_addr = entry.value().addr();
+                                if partition_filter.contains(&peer_addr) {
+                                    None
+                                } else {
+                                    Some((peer_addr, entry.value().session.clone(), false))
+                                }
+                            })
+                            .collect();
+                        for (peer_addr, session, provisional) in snapshot {
                             let packet = session.build_heartbeat();
                             let _ = sink.send(&packet, peer_addr).await;
+                            if provisional {
+                                // No pingwave to an unenrolled peer:
+                                // a topology beacon is participation.
+                                continue;
+                            }
                             // Pingwave (raw UDP — not encrypted, topology is public)
                             let _ = sink.send(&pw_bytes, peer_addr).await;
                         }
@@ -33786,6 +33861,139 @@ impl MeshNode {
             .await
     }
 
+    /// Is this peer's session provisional? Public so the enrollment
+    /// and reply-subscription paths can ask without reaching into
+    /// `PeerInfo`.
+    #[cfg(feature = "webrtc")]
+    pub fn peer_is_provisional(&self, node_id: u64) -> bool {
+        self.peers
+            .get(&node_id)
+            .is_some_and(|e| e.value().admission.is_provisional())
+    }
+
+    /// §12 step 4: promote **the exact live session incarnation**.
+    ///
+    /// `expected_session_id` is captured when the enrollment REQUEST
+    /// is decoded, and `expected_endpoint` is the RTC handle it
+    /// arrived on. If either has moved by the time the handler
+    /// succeeds — the peer re-handshaked, the channel closed and
+    /// reopened, another incarnation took the `node_id` — this
+    /// promotes **nothing** and the current session stays
+    /// provisional. Promoting "whichever session currently occupies
+    /// that NodeId" is precisely what §12 forbids.
+    ///
+    /// Returns whether a promotion happened.
+    #[cfg(feature = "webrtc")]
+    pub fn promote_admission(
+        &self,
+        node_id: u64,
+        expected_session_id: u64,
+        expected_endpoint: PeerAddr,
+    ) -> bool {
+        let Some(mut entry) = self.peers.get_mut(&node_id) else {
+            return false;
+        };
+        let info = entry.value_mut();
+        if info.session.session_id() != expected_session_id || info.addr() != expected_endpoint {
+            return false;
+        }
+        if !info.admission.is_provisional() {
+            return false;
+        }
+        info.admission = super::rtc::PeerAdmission::Admitted {
+            promoted_at: std::time::Instant::now(),
+            session_id: expected_session_id,
+        };
+        drop(entry);
+        self.provisional_endpoints.remove(&expected_endpoint);
+        if let Some(stats) = self.rtc_driver.as_ref().map(|d| d.stats()) {
+            stats.note_admission_promoted();
+        }
+        true
+    }
+
+    /// §12 step 4, the response half: an enrollment call that
+    /// produced a response promotes the incarnation captured at its
+    /// REQUEST decode — and only that one.
+    #[cfg(feature = "webrtc")]
+    pub(crate) fn promote_on_enrollment_response(&self, node_id: u64, reply_channel: &str) -> bool {
+        let origin = match self.peer_entity_id(node_id) {
+            Some(e) => e.origin_hash(),
+            None => return false,
+        };
+        if reply_channel != super::rtc::enroll_reply_channel(origin) {
+            return false;
+        }
+        let Some((_, (session_id, endpoint))) = self.pending_promotions.remove(&node_id) else {
+            return false;
+        };
+        self.promote_admission(node_id, session_id, endpoint)
+    }
+
+    /// How many provisional sessions this node currently holds.
+    #[cfg(feature = "webrtc")]
+    pub fn provisional_count(&self) -> usize {
+        self.provisional_endpoints.len()
+    }
+
+    /// §12 step 5: close and reclaim provisional sessions that have
+    /// expired, breached a bound, or exceeded `max_provisional`.
+    ///
+    /// Called on the heartbeat tick. The oldest are reclaimed first
+    /// when the global cap is over, because a browser that has sat
+    /// unenrolled for 29 s is a worse bet than one that arrived a
+    /// moment ago.
+    #[cfg(feature = "webrtc")]
+    pub fn reclaim_provisional_sessions(&self) -> usize {
+        let max = self
+            .config
+            .rtc
+            .as_ref()
+            .map(|rtc| rtc.max_provisional)
+            .unwrap_or(usize::MAX);
+        let now = std::time::Instant::now();
+        let mut candidates: Vec<(u64, PeerAddr, std::time::Instant)> = Vec::new();
+        let mut expired: Vec<(u64, PeerAddr)> = Vec::new();
+        for entry in self.peers.iter() {
+            let info = entry.value();
+            if let super::rtc::PeerAdmission::Provisional { since, .. } = info.admission {
+                if info.admission.is_expired(now) {
+                    expired.push((info.node_id, info.addr()));
+                } else {
+                    candidates.push((info.node_id, info.addr(), since));
+                }
+            }
+        }
+        // Oldest first, so the cap sheds the least promising.
+        candidates.sort_by_key(|(_, _, since)| *since);
+        let over = candidates.len().saturating_sub(max);
+        let mut doomed = expired;
+        doomed.extend(candidates.into_iter().take(over).map(|(n, a, _)| (n, a)));
+
+        let count = doomed.len();
+        for (node_id, endpoint) in doomed {
+            self.close_provisional_session(node_id, endpoint);
+        }
+        count
+    }
+
+    /// Close one provisional session and reclaim its state.
+    #[cfg(feature = "webrtc")]
+    fn close_provisional_session(&self, node_id: u64, endpoint: PeerAddr) {
+        self.provisional_endpoints.remove(&endpoint);
+        self.peers
+            .remove_if(&node_id, |_, info| info.admission.is_provisional());
+        self.peer_addrs.remove_if(&node_id, |_, a| *a == endpoint);
+        self.addr_to_node.remove_if(&endpoint, |_, n| *n == node_id);
+        if let (Some(driver), PeerAddr::Rtc(id)) = (self.rtc_driver.as_ref(), endpoint) {
+            driver.stats().note_admission_reclaimed();
+            let driver = driver.clone();
+            tokio::spawn(async move {
+                let _ = driver.close(id).await;
+            });
+        }
+    }
+
     /// §12 gate 5 for the nRPC carrier: may this caller's session
     /// have this service invoked on its behalf?
     ///
@@ -33817,6 +34025,20 @@ impl MeshNode {
         let allowed =
             super::rtc::allow_provisional_action(&action, self.node_id, inbound.origin_hash)
                 .is_ok();
+        if allowed {
+            // §12 step 4: bind the promotion to THIS incarnation,
+            // captured at REQUEST decode. The response path can only
+            // promote what was bound here, and `promote_admission`
+            // re-verifies it — so a session replaced in between
+            // promotes nothing.
+            if let Some(session_id) = self.peer_session_id(inbound.from_node) {
+                // At most one in-flight enrollment call per
+                // provisional session (S0e §2 B), so the node id is
+                // the whole key.
+                self.pending_promotions
+                    .insert(inbound.from_node, (session_id, endpoint));
+            }
+        }
         if !allowed {
             if let Some(stats) = self.rtc_driver.as_ref().map(|d| d.stats()) {
                 stats.note_admission_refused_deliver();
