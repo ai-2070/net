@@ -878,21 +878,25 @@ impl PeerEvictionCtx {
     }
 }
 
-/// RAII reclamation for an RTC responder's handshake-inbox
-/// registration (R3-E): a cancelled `accept_rtc` must not leave its
-/// inbox installed.
-#[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
-struct RtcInboxGuard<'a> {
+/// RAII reclamation for a handshake-inbox registration (R3-E, H3).
+///
+/// Both halves need it. The responder's `accept_rtc` had it; the
+/// **initiator** relied on an explicit `deregister_direct_initiator`
+/// after the await, which a cancelled future never reaches — so a
+/// dropped `connect`/`connect_rtc` left its inbox installed, keyed
+/// by an endpoint (including an RTC generation) that no later
+/// lifetime can displace.
+///
+/// Removal is identity-conditional: a later attempt that displaced
+/// us owns the slot now, and must not be taken down with us.
+struct DirectInboxGuard<'a> {
     registry: &'a DashMap<PeerAddr, Arc<DirectHandshakeInbox>>,
     addr: PeerAddr,
     inbox: Arc<DirectHandshakeInbox>,
 }
 
-#[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
-impl Drop for RtcInboxGuard<'_> {
+impl Drop for DirectInboxGuard<'_> {
     fn drop(&mut self) {
-        // Remove only OUR registration: a later attempt that
-        // displaced us owns the slot now.
         self.registry
             .remove_if(&self.addr, |_, cur| Arc::ptr_eq(cur, &self.inbox));
         self.inbox.close();
@@ -10769,6 +10773,10 @@ pub struct MeshNode {
     /// Dialogs this node is driving (plan §9 steps 3–6).
     #[cfg(feature = "webrtc")]
     rtc_dialogs: super::rtc::SharedDialogs,
+    /// H3 witness seam: hold the RTC close-notification consumer, so
+    /// the bounded channel can actually fill.
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    rtc_close_consumer_paused: Arc<AtomicBool>,
     /// H2 witness seam: park an RTC install between the completed
     /// Noise exchange and the commit.
     #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
@@ -13236,6 +13244,8 @@ impl MeshNode {
             pending_promotions: Arc::new(DashMap::new()),
             #[cfg(feature = "webrtc")]
             rtc_dialogs: Arc::new(tokio::sync::Mutex::new(super::rtc::DialogTable::new())),
+            #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+            rtc_close_consumer_paused: Arc::new(AtomicBool::new(false)),
             #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
             rtc_install_pause: Arc::new(super::rtc::RtcInstallPause::default()),
             #[cfg(feature = "webrtc")]
@@ -22433,7 +22443,7 @@ impl MeshNode {
         // *cancelled*. The explicit `deregister` below only runs when
         // the future completes; a dropped `accept_rtc` used to leave
         // its inbox installed until the next displacement.
-        let registration = RtcInboxGuard {
+        let registration = DirectInboxGuard {
             registry: &self.pending_direct_initiators,
             addr: peer_addr,
             inbox: Arc::clone(&inbox),
@@ -22567,6 +22577,26 @@ impl MeshNode {
     #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
     async fn rtc_install_pause_point(&self) {
         self.rtc_install_pause.wait_if_armed().await;
+    }
+
+    /// Hold (or release) the RTC close-notification consumer, so a
+    /// witness can fill the bounded channel (H3).
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    pub fn set_rtc_close_consumer_paused(&self, paused: bool) {
+        self.rtc_close_consumer_paused
+            .store(paused, Ordering::Release);
+    }
+
+    /// How many handshake inboxes are registered (H3 witnesses).
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    pub fn pending_handshake_registrations(&self) -> usize {
+        self.pending_direct_initiators.len()
+    }
+
+    /// Is a handshake inbox registered for this endpoint?
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    pub fn has_handshake_registration(&self, addr: PeerAddr) -> bool {
+        self.pending_direct_initiators.contains_key(&addr)
     }
 
     /// The install pause the H2 witnesses drive.
@@ -25177,6 +25207,9 @@ impl MeshNode {
             ack_ranges_peer_cache: Arc::clone(&self.ack_ranges_peer_cache),
             peer_transitions: self.peer_transitions.clone(),
         };
+        let registrations = Arc::clone(&self.pending_direct_initiators);
+        #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+        let paused = Arc::clone(&self.rtc_close_consumer_paused);
         let shutdown = self.shutdown.clone();
         let handle = tokio::spawn(async move {
             while !shutdown.load(Ordering::Acquire) {
@@ -25184,12 +25217,27 @@ impl MeshNode {
                 // handle is joined by `shutdown`, and a task parked
                 // forever on an empty channel would make that join
                 // the deadlock instead of the teardown.
+                // H3 witness seam: a held consumer is how the
+                // bounded channel is made to overflow on purpose.
+                #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+                if paused.load(Ordering::Acquire) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    continue;
+                }
                 let next = tokio::time::timeout(Duration::from_millis(100), closed.recv()).await;
                 let id = match next {
                     Ok(Some(id)) => id,
                     Ok(None) => break,
                     Err(_) => continue,
                 };
+                // H3: a closed or recycled endpoint also drops any
+                // handshake inbox registered under it. Nothing else
+                // visits this registry for RTC, and a recycled slot
+                // comes back at a new generation — a different key —
+                // so a registration left here was permanent.
+                if let Some((_, inbox)) = registrations.remove(&PeerAddr::Rtc(id)) {
+                    inbox.close();
+                }
                 if let Some(node_id) = ctx.evict_endpoint(PeerAddr::Rtc(id)) {
                     tracing::debug!(
                         node_id = format!("{node_id:#x}"),
@@ -42607,8 +42655,18 @@ impl MeshNode {
                 displaced.close();
             }
 
+            // H3: reclaim on **cancel**, not only on completion.
+            // Dropping this future while parked on `inbox.next()`
+            // skipped the explicit deregistration below, and nothing
+            // else visits this registry — a recycled RTC generation
+            // is a different key, so the stale entry was permanent.
+            let registration = DirectInboxGuard {
+                registry: &self.pending_direct_initiators,
+                addr: peer_addr,
+                inbox: Arc::clone(&inbox),
+            };
+
             if let Err(e) = self.sink.send(packet, peer_addr).await {
-                self.deregister_direct_initiator(peer_addr, &inbox);
                 return Err(AdapterError::Connection(format!("send failed: {}", e)));
             }
 
@@ -42639,7 +42697,7 @@ impl MeshNode {
             })
             .await;
 
-            self.deregister_direct_initiator(peer_addr, &inbox);
+            drop(registration);
             match outcome {
                 Ok(inner) => inner,
                 // The responder never replied, or its reply arrived
@@ -42662,9 +42720,15 @@ impl MeshNode {
                 displaced.close();
             }
 
+            // H3: same RAII reclamation on the pre-`start()` branch.
+            let registration = DirectInboxGuard {
+                registry: &self.pending_direct_initiators,
+                addr: peer_addr,
+                inbox: Arc::clone(&inbox),
+            };
+
             let socket_arc = self.socket.socket_arc();
             if let Err(e) = self.sink.send(packet, peer_addr).await {
-                self.deregister_direct_initiator(peer_addr, &inbox);
                 return Err(AdapterError::Connection(format!("send failed: {}", e)));
             }
 
@@ -42739,22 +42803,12 @@ impl MeshNode {
             })
             .await;
 
-            self.deregister_direct_initiator(peer_addr, &inbox);
+            drop(registration);
             match outcome {
                 Ok(inner) => inner,
                 Err(_) => Err(AdapterError::Connection("handshake timeout".into())),
             }
         }
-    }
-
-    /// Remove OUR direct-handshake registration, and only ours.
-    ///
-    /// A later `connect()` to the same address replaces the entry —
-    /// last writer wins — so an unconditional `remove` here would take
-    /// that live registration down with us and strand it.
-    fn deregister_direct_initiator(&self, peer_addr: PeerAddr, inbox: &Arc<DirectHandshakeInbox>) {
-        self.pending_direct_initiators
-            .remove_if(&peer_addr, |_, registered| Arc::ptr_eq(registered, inbox));
     }
 
     /// Handshake datagrams one source may buy Noise work with per

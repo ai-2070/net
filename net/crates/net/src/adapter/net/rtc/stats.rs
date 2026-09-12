@@ -35,6 +35,7 @@ pub struct RtcStats {
     admission_refused_announce: AtomicU64,
     admission_refused_deliver: AtomicU64,
     admission_promoted: AtomicU64,
+    close_notify_deferred: AtomicU64,
     admission_rejected_outcome: AtomicU64,
     admission_reclaimed: AtomicU64,
     signal_over_budget: AtomicU64,
@@ -152,6 +153,11 @@ impl RtcStats {
         admission_promoted,
         note_admission_promoted,
         "Provisional sessions promoted by the enrollment handler, bound to the exact live session incarnation."
+    );
+    counter!(
+        close_notify_deferred,
+        note_close_notify_deferred,
+        "Channel closes the mesh's notification channel could not take immediately. Recorded on the slot and re-offered on a later driver turn (H3) — not discarded."
     );
     counter!(
         admission_rejected_outcome,

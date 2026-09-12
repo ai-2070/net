@@ -115,6 +115,14 @@ struct PeerSlot {
     closed: AtomicBool,
     /// A slot whose generation wrapped: never handed out again.
     retired: bool,
+    /// A close whose notification the mesh never received (H3):
+    /// `generation + 1`, or `0` for none. The close channel is
+    /// bounded and `try_send` can fail under lifetime churn — a
+    /// live peer's close used to be discarded with nothing recorded
+    /// and no retry, leaving the mesh's removal to the failure
+    /// detector. The bit is per slot, so this is a fixed amount of
+    /// state, not a queue.
+    pending_eviction: AtomicU32,
     /// Installs in flight against this exact incarnation (H2).
     /// Registered and validated **under `queue`**, the same lock
     /// `close_peer` publishes `closed` under, so a close between an
@@ -236,6 +244,7 @@ impl RtcTransport {
                 closed: AtomicBool::new(false),
                 retired: false,
                 install_intents: AtomicU32::new(0),
+                pending_eviction: AtomicU32::new(0),
             },
         );
         Ok(RtcPeerId { slot, generation })
@@ -249,7 +258,15 @@ impl RtcTransport {
         let candidate = self
             .slots
             .iter()
-            .find(|e| e.closed.load(Ordering::Acquire) && !e.retired)
+            .find(|e| {
+                e.closed.load(Ordering::Acquire)
+                    && !e.retired
+                    // H3: a slot whose close the mesh has not been
+                    // told about yet keeps its identity until it
+                    // has been — recycling first would replace the
+                    // generation the eviction names.
+                    && e.pending_eviction.load(Ordering::Acquire) == 0
+            })
             .map(|e| *e.key());
         let Some(slot) = candidate else {
             // Distinguish "nothing closed" from "everything closed is
@@ -524,14 +541,37 @@ impl RtcTransport {
         }
     }
 
-    /// Was an install in flight against this incarnation when it
-    /// closed? Used by the close path to decide whether the mesh
-    /// must be told again (H3's pending eviction).
-    pub(super) fn had_install_in_flight(&self, id: RtcPeerId) -> bool {
+    /// Record a close notification the driver could not deliver
+    /// (H3). Re-delivered on a later driver turn.
+    pub(super) fn mark_pending_eviction(&self, id: RtcPeerId) {
+        if let Some(slot) = self.slots.get(&id.slot) {
+            if slot.generation == id.generation {
+                slot.pending_eviction
+                    .store(id.generation.saturating_add(1), Ordering::Release);
+            }
+        }
+    }
+
+    /// Take every close still owed to the mesh.
+    pub(super) fn take_pending_evictions(&self) -> Vec<RtcPeerId> {
+        let mut out = Vec::new();
+        for entry in self.slots.iter() {
+            let marked = entry.pending_eviction.swap(0, Ordering::AcqRel);
+            if marked > 0 {
+                out.push(RtcPeerId {
+                    slot: *entry.key(),
+                    generation: marked - 1,
+                });
+            }
+        }
+        out
+    }
+
+    /// Is a close still owed for this slot?
+    pub fn has_pending_eviction(&self, slot: u32) -> bool {
         self.slots
-            .get(&id.slot)
-            .filter(|e| e.generation == id.generation)
-            .is_some_and(|e| e.install_intents.load(Ordering::Acquire) > 0)
+            .get(&slot)
+            .is_some_and(|e| e.pending_eviction.load(Ordering::Acquire) > 0)
     }
 
     /// Has the driver torn down? (H1.)

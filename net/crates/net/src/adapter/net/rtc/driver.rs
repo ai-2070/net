@@ -740,7 +740,17 @@ async fn driver_loop(
         }
 
         // --- 5. reap ---------------------------------------------------
-        reap(&mut sessions, &transport, &stats, &closed);
+        reap(sessions, &transport, &stats, &closed);
+
+        // H3: re-offer closes the mesh never received. Still
+        // non-blocking — a notification that cannot be delivered now
+        // goes back on its slot and is offered again next turn.
+        for id in transport.take_pending_evictions() {
+            if closed.try_send(id).is_err() {
+                transport.mark_pending_eviction(id);
+                break;
+            }
+        }
 
         // --- 6. one bounded socket read --------------------------------
         let wait = sessions
@@ -1041,9 +1051,15 @@ fn reap(
         }
         // R3-E: tell the mesh, which owns peer removal. Bounded and
         // non-blocking like every other driver output — a full
-        // notification channel cannot be allowed to stall the driver,
-        // and the failure detector remains the backstop.
-        let _ = closed.try_send(session.id);
+        // notification channel cannot be allowed to stall the
+        // driver. H3: a `try_send` that fails is no longer a
+        // discarded fact. The close is recorded on the slot and
+        // re-offered on a later turn, so an exact lifetime's removal
+        // does not depend on the failure detector noticing.
+        if closed.try_send(session.id).is_err() {
+            transport.mark_pending_eviction(session.id);
+            stats.note_close_notify_deferred();
+        }
     }
 }
 

@@ -4576,6 +4576,7 @@ jobs:
           --test rtc_repairs
           --test rtc_routed_restore
           --test rtc_install_race
+          --test rtc_reclaim
           --test rtc_signalling
           --test rtc_admission
 
@@ -4633,6 +4634,7 @@ jobs:
           check_floor rtc_repairs 18
           check_floor rtc_routed_restore 4
           check_floor rtc_install_race 6
+          check_floor rtc_reclaim 4
           check_floor rtc_signalling 6
           check_floor rtc_admission 13
           REQUIRED="
@@ -4662,6 +4664,10 @@ jobs:
           rtc_install_race:an_absent_snapshot_cannot_overwrite_a_session_installed_during_the_handshake
           rtc_install_race:an_expected_present_snapshot_loses_to_a_newer_incarnation
           rtc_install_race:an_incumbent_that_becomes_busy_during_the_handshake_is_preserved
+          rtc_reclaim:cancelling_initiators_returns_the_registry_to_baseline
+          rtc_reclaim:a_cancelled_responder_does_not_strand_or_remove_a_successor
+          rtc_reclaim:closing_an_endpoint_clears_its_handshake_registration
+          rtc_reclaim:a_close_the_channel_refused_is_re_delivered_not_dropped
           rtc_signalling:signalling_crosses_an_anchor_that_cannot_read_it
           rtc_signalling:the_full_section_9_sequence_with_the_three_part_witness
           rtc_signalling:over_budget_signalling_is_dropped_and_counted
