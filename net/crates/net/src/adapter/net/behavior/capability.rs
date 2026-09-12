@@ -3900,25 +3900,25 @@ mod tests {
         )
         .with_ttl(300);
         let payload = String::from_utf8(ann.signed_payload()).expect("JSON");
-        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("parses");
-        let keys: Vec<&str> = parsed
-            .as_object()
-            .expect("object")
-            .keys()
-            .map(String::as_str)
-            .collect();
+        // Key ORDER, read off the emitted document rather than a
+        // parsed map: `serde_json::Value` sorts its keys, which
+        // would hide exactly the reordering this pins.
+        let order: Vec<usize> = [
+            "\"node_id\"",
+            "\"entity_id\"",
+            "\"version\"",
+            "\"timestamp_ns\"",
+            "\"ttl_secs\"",
+            "\"capabilities\"",
+        ]
+        .iter()
+        .map(|k| payload.find(k).unwrap_or_else(|| panic!("missing key {k}")))
+        .collect();
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
         assert_eq!(
-            keys,
-            vec![
-                "node_id",
-                "entity_id",
-                "version",
-                "timestamp_ns",
-                "ttl_secs",
-                "capabilities"
-            ],
-            "an announcement with none of the Stage 4 fields must carry exactly \
-             the pre-Stage-4 key set, in order"
+            order, sorted,
+            "the pre-Stage-4 keys must appear in declaration order: {payload}"
         );
     }
 

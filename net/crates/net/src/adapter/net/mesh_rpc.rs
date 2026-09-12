@@ -6708,10 +6708,16 @@ mod reply_subscribe_retry_tests {
              retrying anything else cannot change the answer"
         );
         assert!(
-            body.contains("if self.claim_corrective_announce(target_node_id) {"),
+            body.contains("self.claim_corrective_announce(target_node_id) {"),
             "regression: the corrective announce must stay behind the \
              once-per-target latch, or one persistently-denying target turns \
              every RPC into extra rate-limit-bypassing capability broadcasts"
+        );
+        assert!(
+            body.contains("provisional_rejecter"),
+            "S0e §3 row 13: a provisional rejecter must not reach the latch at \
+             all — its Subscribe refusal is a policy answer, and this announce \
+             bypasses the rate limit"
         );
     }
 }

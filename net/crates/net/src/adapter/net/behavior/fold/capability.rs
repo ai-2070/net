@@ -111,7 +111,12 @@ pub struct CapabilityMembership {
     /// receivers read it to build a session without an
     /// out-of-band key handoff. `None` for every publisher that
     /// does not announce one, which is every pre-Stage-4 node.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// **Not serialized.** The fold envelope is a non-self-describing
+    /// binary encoding, so an omitted-when-`None` field is a decode
+    /// error on the far side rather than a default — and this
+    /// projection does not need to travel: every node ingests the
+    /// announcement itself and fills this locally.
+    #[serde(skip)]
     pub noise_pubkey: Option<[u8; 32]>,
     /// v0.4 capability-auth allow-list — peer `node_id`s
     /// authorized to invoke any of this publisher's `tags`. Empty
