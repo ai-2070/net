@@ -252,10 +252,15 @@ impl ProvisionalBudget {
     /// Reserve an in-flight enrollment call (R3). Released by
     /// [`Self::release_enrollment`] on every terminal path.
     pub fn reserve_enrollment(&mut self) -> Result<(), AdmissionRefusal> {
-        self.inflight_enrollments = self.inflight_enrollments.saturating_add(1);
-        if self.inflight_enrollments > MAX_INFLIGHT_ENROLLMENTS {
+        // R3-A: **check, then increment.** Incrementing first and
+        // refusing afterwards left a phantom owner: the refused
+        // attempt's count was never rolled back, so releasing the
+        // one real owner left `inflight_enrollments` at 1 and every
+        // later call was refused for ever.
+        if self.inflight_enrollments >= MAX_INFLIGHT_ENROLLMENTS {
             return Err(AdmissionRefusal::BudgetExhausted);
         }
+        self.inflight_enrollments += 1;
         Ok(())
     }
 
@@ -266,10 +271,13 @@ impl ProvisionalBudget {
 
     /// Charge one enrollment REQUEST frame.
     pub fn charge_enroll_request(&mut self) -> Result<(), AdmissionRefusal> {
-        self.enroll_requests = self.enroll_requests.saturating_add(1);
-        if self.enroll_requests > MAX_ENROLL_REQUEST_FRAMES {
+        // R3-A: same discipline — a refused REQUEST does not consume
+        // one of the four, so the allowance cannot be spent by
+        // frames that were never dispatched.
+        if self.enroll_requests >= MAX_ENROLL_REQUEST_FRAMES {
             return Err(AdmissionRefusal::BudgetExhausted);
         }
+        self.enroll_requests += 1;
         Ok(())
     }
 }

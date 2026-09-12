@@ -1626,8 +1626,16 @@ pub trait RpcHandler: Send + Sync + 'static {
 /// delivered the REQUEST — the authoritative response destination, so
 /// two sessions pinned to the same entity/origin submitting the same
 /// call_id each route their response to their OWN session.
+/// `(from_node, receiving_session_id, caller_origin, call_id,
+/// payload)`.
+///
+/// R2-A: the **receiving incarnation** rides with the response.
+/// Enrollment ownership is `(node, session, call)`, and call ids
+/// are sender-controlled, so a completion that knows only
+/// `(node, call)` can consume a successor's reservation after a
+/// reconnection that reuses the call id.
 pub type RpcResponseEmitter =
-    Arc<dyn Fn(u64, u64, u64, RpcResponsePayload) + Send + Sync + 'static>;
+    Arc<dyn Fn(u64, u64, u64, u64, RpcResponsePayload) + Send + Sync + 'static>;
 
 /// Async counterpart of [`RpcResponseEmitter`] used by the
 /// streaming fold's pump task to serialize per-call publishes.
@@ -1653,6 +1661,18 @@ pub type RpcAsyncResponseEmitter = Arc<
 /// server folds.
 type InFlightCalls = Arc<Mutex<HashMap<(u64, u64, u64), RpcCancellationToken>>>;
 
+/// The unary server fold's in-flight map, keyed
+/// `(from_node, receiving_session_id, caller_origin, call_id)`
+/// (R2-A).
+///
+/// The receiving incarnation is part of the key: a peer that
+/// reconnects and reuses a call id is making a **new** call, and
+/// the old parked handler's entry must not make it look like a
+/// duplicate of a call belonging to a session that no longer
+/// exists. (The streaming folds keep the three-part key; their
+/// own ownership work is separate.)
+type UnaryInFlightCalls = Arc<Mutex<HashMap<(u64, u64, u64, u64), RpcCancellationToken>>>;
+
 /// Server-side fold. Sees REQUEST events on the configured channel,
 /// dispatches to the user-supplied handler, emits RESPONSE events
 /// via the supplied emitter. CANCEL events flip the matching
@@ -1666,6 +1686,11 @@ type InFlightCalls = Arc<Mutex<HashMap<(u64, u64, u64), RpcCancellationToken>>>;
 pub struct RpcServerFold {
     handler: Arc<dyn RpcHandler>,
     emit: RpcResponseEmitter,
+    /// The **receiving incarnation** of the frame currently being
+    /// applied (R2-A), set by `apply_inbound*` from the event and
+    /// handed to the emitter with the response. `0` on
+    /// test/loopback paths, like `from_node`.
+    session_id: u64,
     /// (from_node, caller_origin, call_id) → cancellation token for
     /// the in-flight handler. `from_node` is the AEAD-authenticated
     /// last-hop session peer (AV-1 item 1): binding it into the key
@@ -1676,7 +1701,7 @@ pub struct RpcServerFold {
     /// the fold on CANCEL. Wrapped in `Arc<Mutex<...>>` so spawned
     /// tasks can remove their own entries without going back through
     /// the fold.
-    in_flight: InFlightCalls,
+    in_flight: UnaryInFlightCalls,
     /// Optional per-service metrics handle. When `Some`, the
     /// spawned handler task bumps `handler_invocations_total` /
     /// `handler_in_flight` / `handler_panics_total` and records
@@ -1703,6 +1728,7 @@ impl RpcServerFold {
         Self {
             handler,
             emit,
+            session_id: 0,
             in_flight: Arc::new(Mutex::new(HashMap::new())),
             metrics: None,
             #[cfg(test)]
@@ -1782,6 +1808,7 @@ impl RpcServerFold {
     /// another peer's call by copying its origin + call_id (AV-1
     /// item 1).
     pub fn apply_inbound(&mut self, ev: &RpcInboundEvent) -> Result<(), RedexError> {
+        self.session_id = ev.session_id;
         self.apply_frame(ev.from_node, &ev.payload, None)
     }
 
@@ -1797,6 +1824,7 @@ impl RpcServerFold {
         ev: &RpcInboundEvent,
         admitted: crate::adapter::net::behavior::org_admission::Admitted,
     ) -> Result<(), RedexError> {
+        self.session_id = ev.session_id;
         self.apply_frame(ev.from_node, &ev.payload, Some(admitted))
     }
 
@@ -1829,7 +1857,7 @@ impl RpcServerFold {
             );
             return Ok(());
         };
-        let key = (from_node, meta.origin_hash, meta.seq_or_ts);
+        let key = (from_node, self.session_id, meta.origin_hash, meta.seq_or_ts);
         match meta.dispatch {
             DISPATCH_RPC_REQUEST => {
                 let mut payload =
@@ -1853,7 +1881,13 @@ impl RpcServerFold {
                                 headers: vec![],
                                 body: Bytes::from(format!("malformed request: {e}")),
                             };
-                            (self.emit)(from_node, meta.origin_hash, meta.seq_or_ts, resp);
+                            (self.emit)(
+                                from_node,
+                                self.session_id,
+                                meta.origin_hash,
+                                meta.seq_or_ts,
+                                resp,
+                            );
                             return Ok(());
                         }
                     };
@@ -1880,7 +1914,13 @@ impl RpcServerFold {
                         headers: vec![],
                         body: Bytes::from_static(b"deadline already passed when request landed"),
                     };
-                    (self.emit)(from_node, meta.origin_hash, meta.seq_or_ts, resp);
+                    (self.emit)(
+                        from_node,
+                        self.session_id,
+                        meta.origin_hash,
+                        meta.seq_or_ts,
+                        resp,
+                    );
                     return Ok(());
                 }
                 // Refuse a duplicate REQUEST with the same
@@ -1907,7 +1947,13 @@ impl RpcServerFold {
                                 b"duplicate REQUEST for already-in-flight call_id",
                             ),
                         };
-                        (self.emit)(from_node, meta.origin_hash, meta.seq_or_ts, resp);
+                        (self.emit)(
+                            from_node,
+                            self.session_id,
+                            meta.origin_hash,
+                            meta.seq_or_ts,
+                            resp,
+                        );
                         return Ok(());
                     }
                 }
@@ -1916,6 +1962,10 @@ impl RpcServerFold {
                 let handler = self.handler.clone();
                 let emit = self.emit.clone();
                 let in_flight = self.in_flight.clone();
+                // R2-A: the receiving incarnation rides into the
+                // spawned handler task with the rest of the call's
+                // identity.
+                let session_id = self.session_id;
                 let caller_origin = meta.origin_hash;
                 let call_id = meta.seq_or_ts;
                 // Decode the W3C Trace Context if the caller
@@ -2033,7 +2083,7 @@ impl RpcServerFold {
                         }
                     };
                     in_flight.lock().remove(&key);
-                    emit(from_node, caller_origin, call_id, resp);
+                    emit(from_node, session_id, caller_origin, call_id, resp);
                 });
             }
             DISPATCH_RPC_CANCEL => {
@@ -3002,6 +3052,8 @@ fn apply_request_chunk_to_senders(
 ///
 /// Bidi streaming plan (Phase B).
 pub struct RpcStreamingRequestFold {
+    /// R2-A: the receiving incarnation of the frame being applied.
+    session_id: u64,
     handler: Arc<dyn RpcClientStreamingHandler>,
     emit: RpcResponseEmitter,
     /// Optional request-direction grant emitter. `Some(...)`
@@ -3035,6 +3087,7 @@ impl RpcStreamingRequestFold {
     /// response-side fold is not needed here.
     pub fn new(handler: Arc<dyn RpcClientStreamingHandler>, emit: RpcResponseEmitter) -> Self {
         Self {
+            session_id: 0,
             handler,
             emit,
             grant_emit: None,
@@ -3123,7 +3176,13 @@ impl RpcStreamingRequestFold {
                             headers: vec![],
                             body: Bytes::from(format!("malformed request: {e}")),
                         };
-                        (self.emit)(from_node, meta.origin_hash, meta.seq_or_ts, resp);
+                        (self.emit)(
+                            from_node,
+                            self.session_id,
+                            meta.origin_hash,
+                            meta.seq_or_ts,
+                            resp,
+                        );
                         return Ok(());
                     }
                 };
@@ -3144,7 +3203,13 @@ impl RpcStreamingRequestFold {
                             b"REQUEST on a client-streaming service must set FLAG_RPC_CLIENT_STREAMING_REQUEST",
                         ),
                     };
-                    (self.emit)(from_node, meta.origin_hash, meta.seq_or_ts, resp);
+                    (self.emit)(
+                        from_node,
+                        self.session_id,
+                        meta.origin_hash,
+                        meta.seq_or_ts,
+                        resp,
+                    );
                     return Ok(());
                 }
                 // Refuse a duplicate REQUEST with the same
@@ -3169,7 +3234,13 @@ impl RpcStreamingRequestFold {
                                 b"duplicate REQUEST for already-in-flight call_id",
                             ),
                         };
-                        (self.emit)(from_node, meta.origin_hash, meta.seq_or_ts, resp);
+                        (self.emit)(
+                            from_node,
+                            self.session_id,
+                            meta.origin_hash,
+                            meta.seq_or_ts,
+                            resp,
+                        );
                         return Ok(());
                     }
                 }
@@ -3254,6 +3325,7 @@ impl RpcStreamingRequestFold {
                 let emit = self.emit.clone();
                 let in_flight = self.in_flight.clone();
                 let senders = self.senders.clone();
+                let session_id = self.session_id;
                 let caller_origin = meta.origin_hash;
                 let call_id = meta.seq_or_ts;
                 let cancel_probe = cancellation.clone();
@@ -3369,7 +3441,7 @@ impl RpcStreamingRequestFold {
                     // that returned without consuming all chunks
                     // doesn't leak the entry).
                     senders.lock().remove(&key);
-                    (emit)(from_node, caller_origin, call_id, terminal);
+                    (emit)(from_node, session_id, caller_origin, call_id, terminal);
                 });
             }
             DISPATCH_RPC_REQUEST_CHUNK => {
@@ -5202,9 +5274,10 @@ mod tests {
     fn capturing_emitter() -> (RpcResponseEmitter, CapturedResponses) {
         let captured: CapturedResponses = Arc::new(Mutex::new(Vec::new()));
         let captured_clone = captured.clone();
-        let emit: RpcResponseEmitter = Arc::new(move |_from_node, origin, call_id, resp| {
-            captured_clone.lock().push((origin, call_id, resp));
-        });
+        let emit: RpcResponseEmitter =
+            Arc::new(move |_from_node, _session_id, origin, call_id, resp| {
+                captured_clone.lock().push((origin, call_id, resp));
+            });
         (emit, captured)
     }
 

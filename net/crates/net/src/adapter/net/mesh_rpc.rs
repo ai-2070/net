@@ -838,6 +838,9 @@ async fn emit_capability_denial(
         mesh,
         reply_origin,
         call_id,
+        // A denial is emitted before any handler ran; it answers no
+        // reservation, so it carries no receiving incarnation.
+        0,
         Some(from_node),
         &reply_channel,
         reply_channel_hash,
@@ -915,6 +918,8 @@ fn emit_admission_denial(
         .try_send(RpcResponseJob {
             caller_origin: reply_origin,
             call_id,
+            // A denial answers no reservation.
+            session_id: 0,
             target_hint: Some(from_node),
             reply_channel,
             reply_channel_hash,
@@ -1407,6 +1412,10 @@ fn reject_relayed_flow_controlled_request(
 struct RpcResponseJob {
     caller_origin: u64,
     call_id: u64,
+    /// R2-A: the incarnation that received the request this
+    /// response answers. Enrollment promotion consumes the exact
+    /// `(node, session, call)` reservation or nothing.
+    session_id: u64,
     target_hint: Option<u64>,
     reply_channel: ChannelName,
     /// PERF_AUDIT §3.10 — cached
@@ -2722,6 +2731,7 @@ fn build_request_grant_emitter(
                     &mesh,
                     caller,
                     call_id,
+                    0,
                     target_hint,
                     &reply_channel,
                     reply_channel_hash,
@@ -2940,6 +2950,10 @@ async fn publish_response_to_caller(
     // `webrtc` path; the parameter stays so every caller keeps
     // threading the fact rather than re-deriving it later.
     #[cfg_attr(not(feature = "webrtc"), allow(unused_variables))] call_id: u64,
+    // R2-A: the incarnation that received the request this response
+    // answers. Enrollment promotion consumes that exact
+    // `(node, session, call)` reservation or nothing.
+    #[cfg_attr(not(feature = "webrtc"), allow(unused_variables))] receiving_session_id: u64,
     target_hint: Option<u64>,
     reply_channel: &ChannelName,
     reply_channel_hash: ChannelHash,
@@ -3006,7 +3020,7 @@ async fn publish_response_to_caller(
     {
         match enrollment_outcome_is_admitted(&payload) {
             Some(true) => {
-                if mesh.promote_on_enrollment_response(node_id, reply_channel.as_str(), call_id) {
+                if mesh.promote_on_enrollment_response(node_id, reply_channel.as_str(), call_id, receiving_session_id) {
                     tracing::debug!(
                         node_id = format!("{node_id:#x}"),
                         "§12: enrollment admitted; session promoted"
@@ -3018,16 +3032,23 @@ async fn publish_response_to_caller(
                 // expires on its own 30 s clock — and is counted, so
                 // an operator sees refusals rather than inferring
                 // them from an absence of promotions.
-                mesh.note_enrollment_rejected(node_id, reply_channel.as_str(), call_id);
+                mesh.note_enrollment_rejected(node_id, reply_channel.as_str(), call_id, receiving_session_id);
                 tracing::debug!(
                     node_id = format!("{node_id:#x}"),
                     "§12: enrollment rejected; session stays provisional"
                 );
             }
-            // Not an enrollment response, or a body this anchor
-            // cannot read as one: promote nothing. An unreadable
-            // verdict is not an admission.
-            None => {}
+            // R3-A: **a terminal non-outcome is still terminal.**
+            // A handler error, a panic, an `UnknownVersion` or any
+            // body this anchor cannot read as an outcome used to
+            // leave the reservation and the in-flight slot in
+            // place, so the peer's next REQUEST was refused at the
+            // gate and never reached the handler. Promote nothing —
+            // an unreadable verdict is not an admission — but
+            // retire the call that produced it.
+            None => {
+                mesh.retire_enrollment_call(node_id, reply_channel.as_str(), call_id, receiving_session_id);
+            }
         }
     }
 
@@ -3591,7 +3612,8 @@ impl MeshNode {
         // `emit_for_bridge`, which existed for exactly this reason on the
         // capability-denial path.
         let resp_tx_for_denials = resp_tx.clone();
-        let emit: RpcResponseEmitter = Arc::new(move |from_node, caller_origin, call_id, resp| {
+        let emit: RpcResponseEmitter =
+            Arc::new(move |from_node, session_id, caller_origin, call_id, resp| {
             let target_hint = origin_node_cache_for_emit.get((from_node, caller_origin, call_id));
             // Resolve the reply channel from cache (Arc bump on hit; one
             // `format!` + `ChannelName::new` the first time we see a caller).
@@ -3637,6 +3659,7 @@ impl MeshNode {
                 .try_send(RpcResponseJob {
                     caller_origin,
                     call_id,
+                    session_id,
                     target_hint,
                     reply_channel: cached.name,
                     reply_channel_hash: cached.hash,
@@ -3908,6 +3931,7 @@ impl MeshNode {
                     &response_drain_mesh,
                     job.caller_origin,
                     job.call_id,
+                    job.session_id,
                     job.target_hint,
                     &job.reply_channel,
                     job.reply_channel_hash,
@@ -4060,6 +4084,7 @@ impl MeshNode {
                         &mesh,
                         caller_origin,
                         call_id,
+                        0,
                         target_hint,
                         &reply_channel,
                         reply_channel_hash,
@@ -4239,7 +4264,8 @@ impl MeshNode {
         let emit_resp_service = service_for_emit.clone();
         let origin_node_cache_for_emit = Arc::clone(&origin_node_cache);
         let emit_resp: RpcResponseEmitter =
-            Arc::new(move |from_node, caller_origin, call_id, resp| {
+            Arc::new(move |from_node, session_id, caller_origin, call_id, resp| {
+                let _ = session_id;
                 let mesh = Arc::clone(&emit_resp_mesh);
                 let service = emit_resp_service.clone();
                 let target_hint =
@@ -4277,6 +4303,7 @@ impl MeshNode {
                         &mesh,
                         caller_origin,
                         call_id,
+                        0,
                         target_hint,
                         &reply_channel,
                         reply_channel_hash,
@@ -4645,6 +4672,7 @@ impl MeshNode {
                         &mesh,
                         caller_origin,
                         call_id,
+                        0,
                         target_hint,
                         &reply_channel,
                         reply_channel_hash,
@@ -10959,6 +10987,7 @@ mod roster_fallback_tests {
             &server,
             /* caller_origin */ 0x3,
             /* call_id */ 0,
+            /* receiving_session_id */ 0,
             Some(GONE_NODE),
             &reply,
             reply_hash,
@@ -10976,6 +11005,7 @@ mod roster_fallback_tests {
             &server,
             /* caller_origin */ 0x3,
             /* call_id */ 0,
+            /* receiving_session_id */ 0,
             Some(GONE_NODE),
             &reply,
             reply_hash,
@@ -11012,6 +11042,7 @@ mod roster_fallback_tests {
             &server,
             /* caller_origin */ 0x1,
             /* call_id */ 0,
+            /* receiving_session_id */ 0,
             Some(STALE_NODE),
             &reply,
             reply_hash,

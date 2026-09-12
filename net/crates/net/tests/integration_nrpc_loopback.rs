@@ -104,18 +104,19 @@ impl<H: RpcHandler> Loopback<H> {
         // need a separate handle on the fold — `pending` is the
         // shared state that both sides observe.
         let client_fold = Arc::new(Mutex::new(RpcClientFold::new(pending.clone())));
-        let emit: RpcResponseEmitter = Arc::new(move |_from_node, origin, call_id, resp| {
-            let ev = response_event(origin, call_id, &resp);
-            // Drive the client fold synchronously. In the real
-            // Mesh wire-up the emit closure publishes the RESPONSE
-            // event onto the reply channel; the bus routes it
-            // through the network to the caller's local cortex
-            // adapter, which folds it via the same client fold.
-            // The synchronous in-process path here is the
-            // loopback's stand-in for that round-trip.
-            let mut fold = client_fold.lock();
-            fold.apply(&ev, &mut ()).expect("client fold apply");
-        });
+        let emit: RpcResponseEmitter =
+            Arc::new(move |_from_node, _session_id, origin, call_id, resp| {
+                let ev = response_event(origin, call_id, &resp);
+                // Drive the client fold synchronously. In the real
+                // Mesh wire-up the emit closure publishes the RESPONSE
+                // event onto the reply channel; the bus routes it
+                // through the network to the caller's local cortex
+                // adapter, which folds it via the same client fold.
+                // The synchronous in-process path here is the
+                // loopback's stand-in for that round-trip.
+                let mut fold = client_fold.lock();
+                fold.apply(&ev, &mut ()).expect("client fold apply");
+            });
         let server_fold = Arc::new(Mutex::new(RpcServerFold::new(handler, emit)));
         Self {
             server_fold,

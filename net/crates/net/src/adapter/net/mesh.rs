@@ -35033,8 +35033,14 @@ impl MeshNode {
     /// Release the in-flight enrollment reservation on a terminal
     /// outcome (R3): success, rejection, or a retired call.
     #[cfg(feature = "webrtc")]
-    fn release_enrollment_slot(&self, node_id: u64) {
+    fn release_enrollment_slot_of(&self, node_id: u64, session_id: u64) {
         if let Some(mut entry) = self.peers.get_mut(&node_id) {
+            // R3-A: only the incarnation that holds the reservation
+            // gets its slot back. An obsolete completion must never
+            // release a successor's budget.
+            if entry.value().session.session_id() != session_id {
+                return;
+            }
             if let super::rtc::PeerAdmission::Provisional { budget, .. } =
                 &mut entry.value_mut().admission
             {
@@ -35112,10 +35118,12 @@ impl MeshNode {
         let origin = self
             .provisional_reply_origin(node_id)
             .unwrap_or_else(|| self.bind_origin_for_test(node_id));
+        let session = self.peer_session_id(node_id).unwrap_or(0);
         self.promote_on_enrollment_response(
             node_id,
             &super::rtc::enroll_reply_channel(origin),
             call_id,
+            session,
         )
     }
 
@@ -35125,7 +35133,13 @@ impl MeshNode {
         let origin = self
             .provisional_reply_origin(node_id)
             .unwrap_or_else(|| self.bind_origin_for_test(node_id));
-        self.note_enrollment_rejected(node_id, &super::rtc::enroll_reply_channel(origin), call_id);
+        let session = self.peer_session_id(node_id).unwrap_or(0);
+        self.note_enrollment_rejected(
+            node_id,
+            &super::rtc::enroll_reply_channel(origin),
+            call_id,
+            session,
+        );
     }
 
     #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
@@ -35133,6 +35147,16 @@ impl MeshNode {
         let origin = 0x4B59_5241_0000_0001u64;
         Self::bind_provisional_origin_locked(node_id, origin, &self.peers);
         origin
+    }
+
+    /// The dispatch byte an nRPC frame carries (R3-A).
+    #[cfg(feature = "webrtc")]
+    fn rpc_dispatch_of(frame: &Bytes) -> Option<u8> {
+        use super::cortex::{EventMeta, EVENT_META_SIZE};
+        if frame.len() < EVENT_META_SIZE {
+            return None;
+        }
+        EventMeta::from_bytes(&frame[..EVENT_META_SIZE]).map(|meta| meta.dispatch)
     }
 
     /// The `call_id` an nRPC frame carries, read from its
@@ -35151,14 +35175,24 @@ impl MeshNode {
     /// Consume the reservation for **this** `(node, call)` — and
     /// only it (R2). `None` when the call holds none.
     #[cfg(feature = "webrtc")]
-    fn take_enrollment_reservation(&self, node_id: u64, call_id: u64) -> Option<(u64, PeerAddr)> {
-        let key = self
+    /// Consume the reservation for **this exact** `(node, session,
+    /// call)` — never a scan (R2-A).
+    ///
+    /// It used to find by node + call, scanning across session ids:
+    /// call ids are sender-controlled, so a peer that reconnected
+    /// and reused a call id had its *successor's* reservation
+    /// consumed — and promoted — by the old call's completion.
+    #[cfg(feature = "webrtc")]
+    fn take_enrollment_reservation(
+        &self,
+        node_id: u64,
+        call_id: u64,
+        session_id: u64,
+    ) -> Option<(u64, PeerAddr)> {
+        let (_, endpoint) = self
             .pending_promotions
-            .iter()
-            .map(|e| *e.key())
-            .find(|(node, _, call)| *node == node_id && *call == call_id)?;
-        let (_, endpoint) = self.pending_promotions.remove(&key)?;
-        Some((key.1, endpoint))
+            .remove(&(node_id, session_id, call_id))?;
+        Some((session_id, endpoint))
     }
 
     /// Retire every reservation this node holds (R2): the peer was
@@ -35190,6 +35224,7 @@ impl MeshNode {
         node_id: u64,
         reply_channel: &str,
         call_id: u64,
+        receiving_session_id: u64,
     ) -> bool {
         let Some(origin) = self.provisional_reply_origin(node_id) else {
             return false;
@@ -35197,8 +35232,12 @@ impl MeshNode {
         if reply_channel != super::rtc::enroll_reply_channel(origin) {
             return false;
         }
-        self.release_enrollment_slot(node_id);
-        let Some((session_id, endpoint)) = self.take_enrollment_reservation(node_id, call_id)
+        // R3-A: the in-flight slot is released **only** for the
+        // call that owned it, and only when its own reservation is
+        // consumed here. Releasing before proving ownership handed
+        // a successor's budget to an obsolete completion.
+        let Some((session_id, endpoint)) =
+            self.take_enrollment_reservation(node_id, call_id, receiving_session_id)
         else {
             // Not this call's reservation to spend. A completion
             // whose own reservation was retired (eviction,
@@ -35208,6 +35247,7 @@ impl MeshNode {
             }
             return false;
         };
+        self.release_enrollment_slot_of(node_id, session_id);
         self.promote_admission(node_id, session_id, endpoint)
     }
 
@@ -35243,21 +35283,62 @@ impl MeshNode {
             .and_then(|e| e.value().admission.bound_origin())
     }
 
-    /// §12 step 4, the refusal half: an enrollment that was
-    /// **rejected** consumes its pending promotion and promotes
-    /// nothing. The session stays provisional and expires on its
-    /// own clock; the refusal is counted so it is visible as a
-    /// refusal rather than as an absence.
+    /// R3-A: retire the owned call on a terminal outcome this
+    /// anchor cannot read as an admission or a rejection — a
+    /// handler error, a panic, a malformed body.
+    ///
+    /// Promotes nothing and counts nothing as a rejection; it
+    /// releases exactly the reservation and in-flight slot the call
+    /// held, so the peer's remaining allowance is usable.
     #[cfg(feature = "webrtc")]
-    pub(crate) fn note_enrollment_rejected(&self, node_id: u64, reply_channel: &str, call_id: u64) {
+    pub(crate) fn retire_enrollment_call(
+        &self,
+        node_id: u64,
+        reply_channel: &str,
+        call_id: u64,
+        receiving_session_id: u64,
+    ) {
         let Some(origin) = self.provisional_reply_origin(node_id) else {
             return;
         };
         if reply_channel != super::rtc::enroll_reply_channel(origin) {
             return;
         }
-        self.release_enrollment_slot(node_id);
-        if self.take_enrollment_reservation(node_id, call_id).is_some() {
+        if self
+            .take_enrollment_reservation(node_id, call_id, receiving_session_id)
+            .is_some()
+        {
+            self.release_enrollment_slot_of(node_id, receiving_session_id);
+            if let Some(stats) = self.rtc_driver.as_ref().map(|d| d.stats()) {
+                stats.note_admission_reservation_retired();
+            }
+        }
+    }
+
+    /// §12 step 4, the refusal half: an enrollment that was
+    /// **rejected** consumes its pending promotion and promotes
+    /// nothing. The session stays provisional and expires on its
+    /// own clock; the refusal is counted so it is visible as a
+    /// refusal rather than as an absence.
+    #[cfg(feature = "webrtc")]
+    pub(crate) fn note_enrollment_rejected(
+        &self,
+        node_id: u64,
+        reply_channel: &str,
+        call_id: u64,
+        receiving_session_id: u64,
+    ) {
+        let Some(origin) = self.provisional_reply_origin(node_id) else {
+            return;
+        };
+        if reply_channel != super::rtc::enroll_reply_channel(origin) {
+            return;
+        }
+        if self
+            .take_enrollment_reservation(node_id, call_id, receiving_session_id)
+            .is_some()
+        {
+            self.release_enrollment_slot_of(node_id, receiving_session_id);
             if let Some(stats) = self.rtc_driver.as_ref().map(|d| d.stats()) {
                 stats.note_admission_rejected_outcome();
             }
@@ -35398,6 +35479,24 @@ impl MeshNode {
             &action,
             inbound.origin_hash,
         );
+        // R3-A: classify the frame **before** any accounting. A
+        // CANCEL is the caller retiring its own call, not another
+        // REQUEST: charging it spent one of the four and refused
+        // it, so a cancelling caller lost its allowance and its
+        // in-flight slot stayed held.
+        if Self::rpc_dispatch_of(&inbound.payload) == Some(super::cortex::DISPATCH_RPC_CANCEL) {
+            let call_id = Self::rpc_call_id_of(&inbound.payload);
+            let origin = self.provisional_reply_origin(inbound.from_node);
+            if let Some(origin) = origin {
+                self.retire_enrollment_call(
+                    inbound.from_node,
+                    &super::rtc::enroll_reply_channel(origin),
+                    call_id,
+                    inbound.session_id,
+                );
+            }
+            return allowed;
+        }
         // R3: charge the REQUEST and reserve the in-flight call
         // BEFORE the frame is dispatched. The declared bounds
         // (initial + 3 retries, one call in flight) existed only as
