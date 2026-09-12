@@ -844,6 +844,10 @@ impl PeerEvictionCtx {
     /// entry and the other finds nothing, and neither can touch a
     /// successor, because both match on identity rather than on the
     /// node id alone.
+    #[cfg_attr(
+        not(all(feature = "webrtc", any(test, feature = "fixtures"))),
+        allow(dead_code)
+    )]
     fn evict_session(&self, node_id: u64, session_id: u64) -> bool {
         let peers = &self.peers;
         let addr_to_node = &self.addr_to_node;
