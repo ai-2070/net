@@ -633,17 +633,26 @@ async fn the_provisional_frame_bound_closes_the_session() {
     let client_id = client.node_id();
     let before = anchor.rtc_stats().admission_reclaimed();
 
-    // Small frames: the byte bound cannot be what fires here.
-    for i in 0..(MAX_PROVISIONAL_FRAMES as usize + 8) {
-        if client
+    // Small frames: the byte bound cannot be what fires here. As in
+    // the byte-bound witness below, a refused send is retried — only
+    // the anchor reclaiming the session ends the loop early.
+    let mut sent = 0usize;
+    let mut refusals = 0usize;
+    while sent < MAX_PROVISIONAL_FRAMES as usize + 8 && anchor.peer_is_provisional(client_id) {
+        match client
             .send_to_peer_node(anchor.node_id(), &batch(0, 1, "budget"))
             .await
-            .is_err()
         {
-            break;
-        }
-        if i % 32 == 0 && !anchor.peer_is_provisional(client_id) {
-            break;
+            Ok(()) => sent += 1,
+            Err(_) => {
+                refusals += 1;
+                assert!(
+                    refusals < 512,
+                    "the sender was refused {refusals} times without the anchor ever \
+                     reclaiming the session"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
         }
     }
 
@@ -676,9 +685,17 @@ async fn the_provisional_byte_bound_closes_the_session() {
 
     // ~6 KiB of payload per frame: the 256 KiB bound is crossed
     // around frame 45, an order of magnitude under the frame bound.
+    //
+    // A refused `send_to_peer_node` is NOT evidence the bound fired:
+    // under a loaded runtime the RTC admission seam refuses with
+    // typed backpressure (S3-R2) before the anchor has *received*
+    // 256 KiB, and stopping there left this witness timing out about
+    // one run in six. Only the anchor's own view — the peer no longer
+    // provisional — ends the loop early; a refusal is retried.
     let bulk = "b".repeat(6 * 1024);
     let mut frames = 0usize;
-    while frames < 96 {
+    let mut refusals = 0usize;
+    while frames < 96 && anchor.peer_is_provisional(client_id) {
         let events = vec![net::event::InternalEvent::from_value(
             serde_json::json!({ "bulk": bulk }),
             frames as u64,
@@ -690,16 +707,17 @@ async fn the_provisional_byte_bound_closes_the_session() {
             sequence_start: 0,
             process_nonce: batch_process_nonce(),
         };
-        if client
-            .send_to_peer_node(anchor.node_id(), &heavy)
-            .await
-            .is_err()
-        {
-            break;
-        }
-        frames += 1;
-        if !anchor.peer_is_provisional(client_id) {
-            break;
+        match client.send_to_peer_node(anchor.node_id(), &heavy).await {
+            Ok(()) => frames += 1,
+            Err(_) => {
+                refusals += 1;
+                assert!(
+                    refusals < 512,
+                    "the sender was refused {refusals} times without the anchor ever \
+                     reclaiming the session: neither the byte bound nor delivery is working"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
         }
     }
 
