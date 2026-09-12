@@ -36,6 +36,7 @@ pub struct RtcStats {
     admission_refused_deliver: AtomicU64,
     admission_promoted: AtomicU64,
     close_notify_deferred: AtomicU64,
+    close_notify_redelivered: AtomicU64,
     admission_rejected_outcome: AtomicU64,
     admission_reclaimed: AtomicU64,
     signal_over_budget: AtomicU64,
@@ -153,6 +154,11 @@ impl RtcStats {
         admission_promoted,
         note_admission_promoted,
         "Provisional sessions promoted by the enrollment handler, bound to the exact live session incarnation."
+    );
+    counter!(
+        close_notify_redelivered,
+        note_close_notify_redelivered,
+        "Deferred closes later accepted by the mesh's notification channel. Every deferred close must eventually appear here: the difference is a close the driver recorded and then lost (R-A)."
     );
     counter!(
         close_notify_deferred,

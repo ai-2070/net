@@ -747,11 +747,16 @@ async fn driver_loop(
         // H3: re-offer closes the mesh never received. Still
         // non-blocking — a notification that cannot be delivered now
         // goes back on its slot and is offered again next turn.
-        for id in transport.take_pending_evictions() {
+        for id in transport.pending_evictions() {
+            // R-A: the mark is cleared only once the notification
+            // has been ACCEPTED. A refusal leaves every remaining
+            // mark standing — the previous loop cleared them all up
+            // front and abandoned the rest on the first refusal.
             if closed.try_send(id).is_err() {
-                transport.mark_pending_eviction(id);
                 break;
             }
+            transport.clear_pending_eviction(id);
+            stats.note_close_notify_redelivered();
         }
 
         // --- 6. one bounded socket read --------------------------------

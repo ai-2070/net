@@ -61,6 +61,17 @@ async fn wait_for<F: Fn() -> bool>(predicate: F, within: Duration) -> bool {
     predicate()
 }
 
+async fn connect_udp(a: &Arc<MeshNode>, b: &Arc<MeshNode>) {
+    let a_id = a.node_id();
+    let b_pub = *b.public_key();
+    let b_addr = b.local_addr();
+    let b_id = b.node_id();
+    let b_clone = Arc::clone(b);
+    let accept = tokio::spawn(async move { b_clone.accept(a_id).await });
+    a.connect(b_addr, &b_pub, b_id).await.expect("connect");
+    accept.await.expect("accept task").expect("accept");
+}
+
 async fn pair() -> (Arc<MeshNode>, Arc<MeshNode>) {
     let a = node(Some(rtc_config())).await;
     let b = node(Some(rtc_config())).await;
@@ -224,14 +235,18 @@ async fn closing_an_endpoint_clears_its_handshake_registration() {
     let _ = responder.await;
 }
 
-/// H3: a close the notification channel could not take is **not**
-/// lost. It is recorded on the slot and re-offered on a later driver
-/// turn, so the exact lifetime is evicted without waiting for the
-/// failure detector — while a live peer keeps its session.
+/// H3/R-A: a close the notification channel could not take is
+/// **not** lost. It is recorded on the slot and re-offered on a
+/// later driver turn, so the exact lifetime is evicted promptly —
+/// while a live peer keeps its session.
 ///
 /// The consumer is held so the bounded channel (capacity
-/// `max_peers`) genuinely overflows, which is Kyra's delayed-consumer
-/// schedule rather than a single close on a large queue.
+/// `max_peers`) genuinely overflows, which is Kyra's
+/// delayed-consumer schedule rather than a single close on a large
+/// queue. The windows are deliberately short: re-delivery takes a
+/// few driver turns, and a long window would let the **failure
+/// detector** satisfy the assertions instead — which is the path
+/// this repair exists to replace.
 ///
 /// Inverse: drop `mark_pending_eviction` on a failed `try_send`
 /// (back to `let _ = closed.try_send(...)`) — the deferred close is
@@ -245,9 +260,18 @@ async fn a_close_the_channel_refused_is_re_delivered_not_dropped() {
     }))
     .await;
     let b = node(Some(rtc_config())).await;
+    // A live successor on another transport: the churn and the
+    // re-delivery must not touch it.
+    let survivor = node(None).await;
+    connect_udp(&a, &survivor).await;
     a.start();
     b.start();
+    survivor.start();
     let b_id = b.node_id();
+    let survivor_id = survivor.node_id();
+    let survivor_session = a
+        .peer_session_id(survivor_id)
+        .expect("the survivor's session");
     let (id_a, _id_b) = net::adapter::net::rtc::connect_rtc_loopback(&a, &b)
         .await
         .expect("rtc pair");
@@ -273,7 +297,7 @@ async fn a_close_the_channel_refused_is_re_delivered_not_dropped() {
     assert!(
         wait_for(
             || driver.stats().close_notify_deferred() > deferred_before,
-            Duration::from_secs(30)
+            Duration::from_secs(5)
         )
         .await,
         "the held consumer must make the bounded channel refuse a close — \
@@ -283,17 +307,23 @@ async fn a_close_the_channel_refused_is_re_delivered_not_dropped() {
     a.set_rtc_close_consumer_paused(false);
 
     assert!(
-        wait_for(|| a.peer_endpoint(b_id).is_none(), Duration::from_secs(45)).await,
-        "the exact lifetime whose close was refused must still be evicted, \
-         without waiting for the failure detector"
+        wait_for(|| a.peer_endpoint(b_id).is_none(), Duration::from_secs(5)).await,
+        "the exact lifetime whose close was refused must be evicted by the \
+         re-delivery, well inside any failure-detector timeout"
     );
     assert!(
         wait_for(
             || (0..8).all(|slot| !driver.transport().has_pending_eviction(slot)),
-            Duration::from_secs(45)
+            Duration::from_secs(5)
         )
         .await,
         "every deferred close must be re-delivered, not merely recorded"
+    );
+    assert_eq!(
+        a.peer_session_id(survivor_id),
+        Some(survivor_session),
+        "the live successor's session must survive the churn and the \
+         re-delivery untouched"
     );
     // The bound is the point: a per-slot bit, not a queue that grows
     // with churn.
@@ -303,4 +333,74 @@ async fn a_close_the_channel_refused_is_re_delivered_not_dropped() {
         driver.transport().retained_slots()
     );
     drop(b);
+}
+
+/// R-A: with **three or more** closes deferred at once, every one of
+/// them is re-delivered — not just whichever the loop happened to
+/// reach first.
+///
+/// The old loop cleared every slot's mark up front and abandoned
+/// the rest on the first refused send, so which closes survived
+/// depended on `DashMap` iteration order. Driver turns are allowed
+/// to run while the consumer is still held, which is exactly when
+/// the abandoned marks were destroyed.
+///
+/// Inverse: restore the take-and-break loop (`take_pending_evictions`
+/// + re-mark one + `break`) — `close_notify_redelivered` stalls
+/// below the deferred count and the marks are gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_one_of_several_deferred_closes_is_re_delivered() {
+    let a = node(Some(RtcConfig {
+        max_peers: 8,
+        ..rtc_config()
+    }))
+    .await;
+    a.start();
+    let driver = a.rtc_driver().expect("driver").clone();
+    let deferred_before = driver.stats().close_notify_deferred();
+    let redelivered_before = driver.stats().close_notify_redelivered();
+
+    a.set_rtc_close_consumer_paused(true);
+    for _ in 0..16 {
+        let Ok((id, _sdp)) = driver.create_offer().await else {
+            break;
+        };
+        let _ = driver.close(id).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        wait_for(
+            || driver.stats().close_notify_deferred() >= deferred_before + 3,
+            Duration::from_secs(5)
+        )
+        .await,
+        "the schedule needs at least three closes deferred at once; got {}",
+        driver.stats().close_notify_deferred() - deferred_before
+    );
+    let deferred = driver.stats().close_notify_deferred() - deferred_before;
+
+    // Let several driver turns run while the channel is STILL full:
+    // this is where a loop that clears marks speculatively loses
+    // them.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    a.set_rtc_close_consumer_paused(false);
+    assert!(
+        wait_for(
+            || driver.stats().close_notify_redelivered() - redelivered_before >= deferred,
+            Duration::from_secs(5)
+        )
+        .await,
+        "every deferred close must be delivered: {} deferred, {} re-delivered",
+        deferred,
+        driver.stats().close_notify_redelivered() - redelivered_before
+    );
+    assert!(
+        wait_for(
+            || (0..16).all(|slot| !driver.transport().has_pending_eviction(slot)),
+            Duration::from_secs(5)
+        )
+        .await,
+        "and no mark may be left standing afterwards"
+    );
 }

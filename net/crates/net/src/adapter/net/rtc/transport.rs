@@ -569,11 +569,22 @@ impl RtcTransport {
         }
     }
 
-    /// Take every close still owed to the mesh.
-    pub(super) fn take_pending_evictions(&self) -> Vec<RtcPeerId> {
+    /// Every close still owed to the mesh, **without clearing the
+    /// marks** (R-A).
+    ///
+    /// The previous shape swapped every mark to zero up front and
+    /// handed back the vector: one refused `try_send` re-marked
+    /// that id and abandoned the rest, so with three deferred
+    /// closes which ones survived depended on `DashMap` iteration
+    /// order. Between the swap and the re-mark the slot also looked
+    /// unmarked, so the allocator could recycle it and the re-mark
+    /// would then fail its generation check. A mark is now cleared
+    /// only by [`Self::clear_pending_eviction`], after the
+    /// notification has actually been accepted.
+    pub(super) fn pending_evictions(&self) -> Vec<RtcPeerId> {
         let mut out = Vec::new();
         for entry in self.slots.iter() {
-            let marked = entry.pending_eviction.swap(0, Ordering::AcqRel);
+            let marked = entry.pending_eviction.load(Ordering::Acquire);
             if marked > 0 {
                 out.push(RtcPeerId {
                     slot: *entry.key(),
@@ -582,6 +593,24 @@ impl RtcTransport {
             }
         }
         out
+    }
+
+    /// Clear the mark for this exact incarnation after its close
+    /// was delivered (R-A).
+    ///
+    /// Compare-exchange on `generation + 1`: if the slot was
+    /// recycled and re-marked for a newer lifetime in the meantime,
+    /// that newer mark is left standing rather than erased by a
+    /// stale success.
+    pub(super) fn clear_pending_eviction(&self, id: RtcPeerId) {
+        if let Some(slot) = self.slots.get(&id.slot) {
+            let _ = slot.pending_eviction.compare_exchange(
+                id.generation.saturating_add(1),
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
     }
 
     /// Is a close still owed for this slot?
