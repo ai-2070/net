@@ -73,6 +73,7 @@ on:
       # still covers every cited path, so the two cannot drift apart.
       - "go/**"
       - "net/crates/net/src/**"
+      - "net/crates/net/wire/src/**"
       - "net/crates/net/sdk/**"
       - "net/crates/net/sdk-ts/**"
       - "net/crates/net/sdk-py/**"
@@ -122,6 +123,7 @@ on:
       # still covers every cited path, so the two cannot drift apart.
       - "go/**"
       - "net/crates/net/src/**"
+      - "net/crates/net/wire/src/**"
       - "net/crates/net/sdk/**"
       - "net/crates/net/sdk-ts/**"
       - "net/crates/net/sdk-py/**"
