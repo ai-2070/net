@@ -1411,3 +1411,50 @@ async fn a_provisional_peer_cannot_drive_migration() {
         "an admitted peer's migration frame passes the gate"
     );
 }
+
+/// R3-B: a promotion landing **inside** the teardown window is not
+/// evicted.
+///
+/// The precheck used to run under `peers.get`, release the guard,
+/// and then remove with a session-id-only predicate — so a session
+/// promoted between the two was still removed and its channel still
+/// closed. The three facts (session, endpoint, still-provisional)
+/// are now the removal predicate itself, under the write guard that
+/// removes.
+///
+/// The seam fires inside that window: `set_rtc_pre_insert_hook` is
+/// the wrong one (it is the install path), so this uses the
+/// promotion itself as the interference and asserts the transition
+/// owns nothing — with the selection taken *before* the promotion,
+/// which the landed witness could not express.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_promotion_inside_the_teardown_window_survives() {
+    let (anchor, client, endpoint) = anchor_and_provisional_client().await;
+    let client_id = client.node_id();
+    let selected = anchor.peer_session_id(client_id).expect("session");
+
+    // The sweep's selection is (node, endpoint, session) taken here.
+    // The promotion happens after the selection and before the
+    // removal — the window the old shape lost.
+    let promoted = anchor.promote_admission(client_id, selected, PeerAddr::Rtc(endpoint));
+    assert!(promoted);
+    let reclaimed =
+        anchor.close_provisional_session_for_test(client_id, PeerAddr::Rtc(endpoint), selected);
+
+    assert!(
+        !reclaimed,
+        "the selection is obsolete the moment the session is admitted: it owns \
+         neither the removal nor any side effect"
+    );
+    assert_eq!(
+        anchor.peer_session_id(client_id),
+        Some(selected),
+        "the promoted session stays installed"
+    );
+    assert_eq!(
+        anchor.peer_endpoint(client_id),
+        Some(PeerAddr::Rtc(endpoint)),
+        "on its own endpoint, with its channel not closed"
+    );
+    assert!(!anchor.peer_is_provisional(client_id));
+}

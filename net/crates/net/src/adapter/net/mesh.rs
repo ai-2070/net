@@ -855,20 +855,47 @@ impl PeerEvictionCtx {
         allow(dead_code)
     )]
     fn evict_session_at(&self, node_id: u64, session_id: u64, endpoint: PeerAddr) -> bool {
-        // The selection must still describe what is installed: the
-        // same session on the same endpoint, and still provisional.
-        // Any of the three having moved on means this verdict is
-        // obsolete and owns nothing (R3).
-        let still_the_selection = self.peers.get(&node_id).is_some_and(|e| {
-            let info = e.value();
-            info.session.session_id() == session_id
-                && info.addr() == endpoint
-                && info.admission.is_provisional()
-        });
-        if !still_the_selection {
-            return false;
-        }
-        self.evict_session(node_id, session_id)
+        // **R3-B: one conditional transition.** The precheck used
+        // to run under `peers.get`, release the guard, and then
+        // remove with a session-id-only predicate — so a promotion
+        // (or a replacement on the same session id) landing in that
+        // window was still evicted, and every side effect ran. The
+        // three facts are now the removal predicate itself, decided
+        // under the write guard that performs the removal, and
+        // every side effect below is conditional on it.
+        let peers = &self.peers;
+        let addr_to_node = &self.addr_to_node;
+        let peer_addrs = &self.peer_addrs;
+        let session_id_to_node = &self.session_id_to_node;
+        let ack_ranges_peer_cache = &self.ack_ranges_peer_cache;
+        commit_peer_transition(
+            &self.session_routing,
+            &self.routing_registry,
+            peers,
+            &self.peer_entity_ids,
+            || {
+                let evicted = self.peer_transitions.with(node_id, || {
+                    let removed = peers.remove_if(&node_id, |_, info| {
+                        info.session.session_id() == session_id
+                            && info.addr() == endpoint
+                            && info.admission.is_provisional()
+                    });
+                    let Some((_, old_info)) = &removed else {
+                        return false;
+                    };
+                    if let Some(old_owned) = old_info.owned_addr() {
+                        addr_to_node.remove_if(&old_owned, |_, n| *n == node_id);
+                    }
+                    peer_addrs.remove_if(&node_id, |_, a| *a == old_info.addr());
+                    session_id_to_node.remove_if(&session_id, |_, n| *n == node_id);
+                    ack_ranges_peer_cache.remove(&node_id);
+                    #[cfg(feature = "webrtc")]
+                    self.provisional_endpoints.remove(&endpoint);
+                    true
+                });
+                (evicted, evicted)
+            },
+        )
     }
 
     fn evict_session(&self, node_id: u64, session_id: u64) -> bool {
@@ -35794,16 +35821,22 @@ impl MeshNode {
         let Some(node_id) = ctx.addr_to_node.get(source).map(|e| *e.value()) else {
             return Ok(());
         };
-        let breached = {
+        let (breached, charged_session) = {
             let Some(mut entry) = ctx.peers.get_mut(&node_id) else {
                 return Ok(());
             };
+            // R3-B: remember WHICH incarnation was charged, so the
+            // reclamation below can only remove that one.
+            let charged_session = entry.value().session.session_id();
             let super::rtc::PeerAdmission::Provisional { budget, .. } =
                 &mut entry.value_mut().admission
             else {
                 return Ok(());
             };
-            budget.charge_frame(data.len() as u64).is_err()
+            (
+                budget.charge_frame(data.len() as u64).is_err(),
+                charged_session,
+            )
         };
         if !breached {
             return Ok(());
@@ -35815,7 +35848,7 @@ impl MeshNode {
         // its whole-session budget has nothing further it is
         // allowed to do, and leaving it open would make the bound
         // advisory.
-        Self::reclaim_breached_provisional(node_id, *source, ctx);
+        Self::reclaim_breached_provisional(node_id, *source, charged_session, ctx);
         Err(super::rtc::AdmissionRefusal::BudgetExhausted)
     }
 
@@ -35823,9 +35856,29 @@ impl MeshNode {
     /// whole-session bound, from the dispatch path (which holds a
     /// `DispatchCtx`, not a `MeshNode`).
     #[cfg(feature = "webrtc")]
-    fn reclaim_breached_provisional(node_id: u64, endpoint: PeerAddr, ctx: &DispatchCtx) {
-        ctx.peers
-            .remove_if(&node_id, |_, info| info.admission.is_provisional());
+    fn reclaim_breached_provisional(
+        node_id: u64,
+        endpoint: PeerAddr,
+        session_id: u64,
+        ctx: &DispatchCtx,
+    ) {
+        // **R3-B: the breach path uses the same conditional
+        // transition as the sweep**, carrying the session that was
+        // actually charged. It used to remove by "is provisional"
+        // alone and take its side effects unconditionally — so a
+        // breach charged against one incarnation could close a
+        // successor's channel.
+        let owned = ctx
+            .peers
+            .remove_if(&node_id, |_, info| {
+                info.session.session_id() == session_id
+                    && info.addr() == endpoint
+                    && info.admission.is_provisional()
+            })
+            .is_some();
+        if !owned {
+            return;
+        }
         ctx.peer_addrs.remove_if(&node_id, |_, a| *a == endpoint);
         ctx.addr_to_node.remove_if(&endpoint, |_, n| *n == node_id);
         ctx.provisional_endpoints.remove(&endpoint);
