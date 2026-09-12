@@ -182,6 +182,10 @@ enum Command {
     /// Node ownership provisioning (`adopt`) — OA-1.
     #[command(subcommand)]
     Node(commands::node::NodeCommand),
+    /// Browser-facing anchor surface: bootstrap credentials
+    /// (plan §5 Layer 0, Stage 4b).
+    #[command(subcommand)]
+    Anchor(commands::anchor::AnchorCommand),
     /// Hierarchical subnet inspection (`show|ls|tree`).
     #[command(subcommand)]
     Subnet(commands::subnet::SubnetCommand),
@@ -305,6 +309,7 @@ async fn dispatch(cli: Cli) -> Result<(), CliError> {
         Command::Netdb(cmd) => commands::netdb::run(cmd, output, config_path, profile).await,
         Command::Org(cmd) => commands::org::run(cmd, output).await,
         Command::Node(cmd) => commands::node::run(cmd, output).await,
+        Command::Anchor(cmd) => commands::anchor::run(cmd, output).await,
         Command::Subnet(cmd) => commands::subnet::run(cmd, output, config_path, profile).await,
         Command::Gateway(cmd) => commands::gateway::run(cmd, output, config_path, profile).await,
         Command::Channel(cmd) => commands::channel::run(cmd, output, config_path, profile).await,

@@ -135,6 +135,14 @@ pub mod delegation;
 // delegation surface and pulls `getrandom` for the single-use invite nonce.
 #[cfg(feature = "net")]
 pub mod enrollment;
+// The browser bootstrap credential (plan §5 Layer 0) — a NEW format,
+// not an invite with fields bolted on: invite + the anchor Noise key
+// a browser pins + the NKpsk0 PSK + the trust domain that PSK
+// defines + the bootstrap URL, with the single-use and standing
+// lifetimes both stated in the encoding. Rides `net` for the same
+// reason `enrollment` does (identity, base64, blake3).
+#[cfg(feature = "net")]
+pub mod bootstrap_credential;
 // Machine-shared device registry — the operator's inventory of enrolled devices
 // (Hermes V2 Phase 1), backing `mesh.devices()`. Inventory/display state, not
 // enforcement (that's `revocation`); mirrors the revocation store's file

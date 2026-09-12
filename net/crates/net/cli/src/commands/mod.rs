@@ -12,6 +12,7 @@
 
 pub mod admin;
 pub mod aggregator;
+pub mod anchor;
 pub mod audit;
 pub mod blob;
 pub mod cap;
