@@ -494,3 +494,173 @@ missing and who would own it.
 | Export checker on a fresh `net-ffi` release cdylib | `net.dll: export set matches the baseline`, 568 |
 | Every named inverse (18, including Kyra's own suppress-the-sends) | applied, red, reverted; tree clean after each |
 | Linux targets | still not runnable on this host (no cross C toolchain) |
+
+## 12. Second-round repairs after Kyra's HOLD on `97815f9d9`
+
+Kyra's re-review holds on five bounded groups (C2 closed; R1/R2/R5
+and the bounded parts of R3/R4/R6 retain credit). One commit per
+group, on `LZL0/webrtc-transport`, stacked on the Stage 4a work,
+which is untouched and green.
+
+| Commit | Group |
+|---|---|
+| `12429e426` | H1 — joined teardown and abort cleanup |
+| `160856e44` | H2 — the RTC install is a commit fence |
+| `7c52a9843` | H3 — cancellation and historical-close reclamation |
+| `2aa87b0aa` | H4 — an RTC relay is not an RTC target |
+| `d00efc927` | H5 — witnesses that assert what they claim |
+
+### 12.1 What changed
+
+**H1.** `shutdown_and_join` retains the `JoinHandle` across the
+timeout and awaits it after `abort()` (an abort is a request, not a
+join); concurrent joiners wait on a `watch` the task's own guard
+sets; a cancelled joiner returns the handle to its home
+(`JoinSlot`) instead of detaching the task. Teardown moved from the
+loop tail into `SessionTable::drop`, so the same cleanup runs on
+the cooperative exit and on abort: slots closed, queued and retry
+packets counted into `discarded_at_close`, closes announced, the
+transport made **terminal** (every historical handle refused), the
+socket released, and only then completion published.
+
+**H2.** The RTC install path takes an **install intent** on the
+exact `(slot, generation)` before the handshake wait, under the
+queue lock `close_peer` publishes `closed` under, and
+`install_peer_locked` re-validates it at the commit. The caller's
+expectation is a type — `PriorSession::{Any, Exactly, Absent}` —
+so "I expect nothing" can no longer be spelled as "I accept
+anything". Quiescence is re-checked at the commit for fenced
+installs. No guard is held across a Noise wait.
+
+**H3.** The responder's RAII inbox guard is now both halves'
+(`DirectInboxGuard`), so a cancelled initiator reclaims its
+registration; the close notifier drops the registration keyed by
+the endpoint it evicts; a close the bounded channel refuses is
+recorded as a generation-tagged **pending-eviction bit on the
+slot**, counted (`close_notify_deferred`) and re-offered on later
+driver turns, and such a slot is not recycled before the mesh has
+heard about it.
+
+**H4.** The classifier reads target-owned direct attachment
+(`Direct { owned: PeerAddr::Rtc(_) }`) or the target's announced
+`transport:rtc` tag, never a routed session's relay endpoint — and
+requires both ends, since a locally configured driver is not
+evidence about the target.
+
+**H5.** Witness corrections, below.
+
+### 12.2 Per-item ledger — exact probe, branch, tests, outcome
+
+Every row was executed on this host at the commit named above.
+"Branch" is the mutation applied to HEAD; each was reverted and
+`git diff --name-only` was empty before the next.
+
+| # | Probe (what was run) | Mutated branch | Selected test(s) | Outcome |
+|---|---|---|---|---|
+| H1a | `cargo nextest run --test rtc_repairs -E 'test(=a_stalled_driver_is_aborted_and_joined_before_shutdown_returns)'` | move the handle into `timeout(...)` and drop the post-`abort()` await | that test | **red** |
+| H1b | same runner, `two_concurrent_joiners_both_observe_completed_teardown` | `let Some(handle) = handle else { return }` (treat `None` as completion) | that test | **red** |
+| H1c | same runner, `dropping_a_node_tears_down_the_transport_not_just_the_socket` | `SessionTable::drop` cleans up only on the cooperative exit (pre-repair shape) | that test | **red** |
+| H1d | Kyra's `probe_shutdown.py`, re-aimed at HEAD's method (her harness, her assertions, HEAD's `shutdown_and_join` + `JoinSlot` + `await_teardown`) | — (control) | probe binary | **green**: `socket released when shutdown_and_join returned=true`; second joiner returns after completion |
+| H1e | Kyra's `probe_lifecycle_evidence.py` teardown pair (`kyra_abort_must_close_transport`, `kyra_cooperative_close_control`), appended verbatim to `rtc_repairs.rs` and removed after | — (control) | both | **green** (`!open && queued==0 && admission==UnknownPeer` on both paths) |
+| H2a | `--test rtc_install_race -E 'test(=a_close_consumed_before_the_commit_refuses_the_dead_endpoint)'` and the responder twin | delete the `intent.still_live()` re-check in `install_peer_locked` | both close witnesses | **red** ×2 |
+| H2b | same runner, `an_absent_snapshot_cannot_overwrite_a_session_installed_during_the_handshake` | `rtc_upgrade_precheck` returns `PriorSession::Any` for an absent incumbent | that test | **red** |
+| H2c | same runner, `an_incumbent_that_becomes_busy_during_the_handshake_is_preserved` | delete the commit-time `require_quiescent` check | that test | **red** |
+| H2d | same runner, `an_expected_present_snapshot_loses_to_a_newer_incarnation` | delete the `Exactly` arm's session-id comparison | that test | **red** |
+| H3a | `--test rtc_reclaim -E 'test(=cancelling_initiators_returns_the_registry_to_baseline)'` | remove `DirectInboxGuard` from the post-`start()` initiator; deregister explicitly after the await | that test | **red** |
+| H3b | same runner, `a_cancelled_responder_does_not_strand_or_remove_a_successor` | guard removal made unconditional (drop the `Arc::ptr_eq` predicate) | that test | **red** |
+| H3c | same runner, `closing_an_endpoint_clears_its_handshake_registration` | delete the registration removal from the close notifier | that test | **red** |
+| H3d | same runner, `a_close_the_channel_refused_is_re_delivered_not_dropped` | `let _ = closed.try_send(...)` (no `mark_pending_eviction`) | that test | **red** |
+| H4a | `--test rtc_classifier -E 'test(=an_rtc_relay_does_not_make_a_udp_target_an_ice_pair)'` | classify on `PeerInfo::addr()` (the send endpoint) again | that test | **red** |
+| H4b | same | `rtc_side = owned \|\| self.config.rtc.is_some() \|\| announced` (our own driver alone decides) | that test | **red** |
+| H5a | `--test rtc_repairs -E 'test(=a_reliable_stream_delivers_every_value_and_reorders_by_seq)'` | permute the values at the send seam (Kyra's own mutation) | that test | **red** (the pre-H5 body passed this) |
+| H5b | same runner, both advisory witnesses | delete the independent advisory-refresh phase from the driver loop | queued arm; idle arm | **red** ×2 (the pre-H5 body passed this) |
+| H5c | same runner, `the_advisory_decays_for_an_idle_peer_with_an_empty_queue` | restrict the refresh to peers with queued work (drop `stale_high`) | that test | **red** |
+| H5d | same runner, `a_connection_reset_is_swallowed_by_the_production_arm_with_siblings_intact` | serve only one sibling after the reset | that test | **red** (the `to_b \|\| to_c` body passed this) |
+| H5e | same runner, `a_busy_peer_cannot_starve_a_sibling_or_the_socket` | one-shot burst instead of a continuously refilled backlog | that test | **red** (precondition now measured) |
+| H5f | same runner, `retention_conserves_every_admitted_packet_and_then_delivers_it` | `Ok(false)` drops the packet instead of retaining it | that test | **red** |
+| H5g | same runner, same test | remove `WRITE_QUANTUM_PER_TURN` (drain-until-empty pump) | that test | **green — recorded, not claimed**: a fast unbounded pump drains each refill and yields, so this witness cannot certify the service bound. The quanta are credited from source; the test's doc comment now says exactly this. |
+
+### 12.3 H5 evidence corrections
+
+- **Reliable witness** renamed
+  `a_reliable_stream_delivers_every_value_and_reorders_by_seq`. UDP
+  and raw-dispatch semantics are unchanged — out-of-order and
+  repeated *observations* remain allowed (`streams.md`: "no loss,
+  not in order"). The claim asserted is the real one: every value
+  arrives; order is the consumer's, via `seq`. The body groups by
+  the embedded sequence, requires byte-identical copies, and
+  compares the reordered vector to the sender's exact sequence.
+- **Advisory refresh** now starts from a poisoned **stale-high**
+  reading (new `poison_published_buffered` fixture seam), asserts
+  that reading is refusing admission, and only then requires decay
+  — the initialised zero made the old predicate vacuous. The
+  empty-queue arm has its own witness, isolated by leaving the pump
+  running with an empty queue.
+- **Reset witness** drains first and requires **each** sibling's own
+  exact payload.
+- **Prefix and conservation** assert the exact reordered vector
+  rather than set cardinality, and conservation samples at a
+  settled ownership boundary (two consecutive agreeing reads) — the
+  snapshot skew Kyra's caveat predicted was also a live flake.
+- **Fairness** narrowed to one stress schedule with measured
+  preconditions (backlog sampled and required to stay deep; the
+  sibling's own tagged payload), with H5g recorded in the test.
+- **Shaped ingress** labelled format-acceptance only: not
+  authenticated route-hop forwarding, not native pingwave route
+  learning.
+- **Report reconciliation.** The Stage 3 inventory is
+  **5 + 7 + 18 + 4 = 34**, not 35 (§8's row was historical);
+  capability-fold evidence exists and is name-pinned
+  (`a_capability_fold_applies_a_remote_fact_received_over_rtc`);
+  the routed witness is **manual restoration**, not automatic
+  fallback — nothing in Stage 3 owns "the direct path died,
+  therefore re-establish the routed one". The per-inverse table
+  above replaces the earlier blanket "every inverse observed red".
+- **CI parser.** Kyra's forced-color finding was repaired on this
+  branch by `22fb4ae23`, which switched the inventory step to
+  `--message-format json` with a parser self-check. Confirmed at
+  this head: `CARGO_TERM_COLOR=always cargo nextest list … json`
+  parses (`rtc_loopback` → 5). That commit also added the
+  `rtc_signalling` (6) and `rtc_admission` (9, now 13) floors.
+
+### 12.4 Validation at this head
+
+| Command | Result |
+|---|---|
+| `cargo fmt -p net-mesh -- --check` | pass |
+| `cargo check --workspace --all-targets` | 0 errors |
+| `cargo clippy --lib --bins` / `--no-default-features` / `--features webrtc` / `--all-features` (`-D warnings`) | pass ×4 |
+| `cargo clippy --features "webrtc fixtures cortex nat-traversal" --all-targets` (CI `-A` set) | pass |
+| `RUSTDOCFLAGS="-D warnings" cargo doc --features webrtc --no-deps` / `-p net-mesh-wire --no-deps` | pass ×2 |
+| `cargo test --lib --features "$UNIT_FEATURES"` | **5779 passed**, 0 failed, 2 ignored |
+| `cargo test --lib --features "$UNIT_FEATURES webrtc"` | **5811 passed**, 0 failed, 2 ignored |
+| Nine RTC binaries, `--no-tests=fail --retries 0` (Stage 4a's two included) | **68 run, 68 passed, 0 skipped** |
+| Per-binary counts vs CI floors | 5 / 7 / 22 / 4 / 6 / 4 / 1 / 6 / 13 — sum 68, every floor met |
+| Witness floors | **93 / 24 / 62 / 41 / 60 / 68** unchanged |
+| `cargo test --test cross_lang_wire --features net` | 10 passed |
+| Export checker on a fresh `net-ffi` release cdylib | `net.dll: export set matches the baseline`, 568 |
+| Consumer diff since `01e4b0f20` (`go`, SDKs, bindings, headers) | **SDK-pin only** — `sdk/src/enrollment.rs`, +25 (the Stage 4a `JoinOutcome` wire-prefix test) |
+| Kyra's `probe_shutdown.py` (re-aimed at HEAD) and her teardown pair | green (§12.2 H1d/H1e) |
+| Linux targets | still not runnable on this host (no cross C toolchain) |
+
+CI additions: three new binaries join the RTC job with floors
+(`rtc_install_race` 6, `rtc_reclaim` 4, `rtc_classifier` 1) and ten
+newly pinned names; `rtc_repairs`' floor rises 18 → 22; the job
+gains `nat-traversal` (the classifier binary is gated on it); all
+three binaries take the `retries = 0` override in
+`.config/nextest.toml`.
+
+### 12.5 Still open, named
+
+- **F7 (`proxy.rs`) has no admission gate** (Stage 4a's gap 1,
+  unchanged here).
+- **The fairness service bound is credited from source, not
+  witnessed** (H5g above).
+- **`PeerEvictionCtx` is narrower than the failure callback.** The
+  re-delivered close runs peer/index/session/ACK cleanup and
+  routing republication; reroute, withdrawal, capability/roster
+  cleanup and sensing disruption remain the failure plane's. The
+  `rtc_reclaim` header says so.
+- **Driver `AwaitOpen` waiters** are still an uncapped `Vec`
+  bounded only by the establishment deadline (Kyra's L4 second
+  half). Not addressed by H3, which is about registry reclamation.
