@@ -105,6 +105,14 @@ pub struct CapabilityMembership {
     /// (one publisher tends to publish the same reflex across
     /// every class it joins).
     pub reflex_addr: Option<std::net::SocketAddr>,
+    /// Publisher's announced Noise static public key (plan §5
+    /// Layer 1, Stage 4a). Projected exactly like `reflex_addr`:
+    /// the publisher emits it only when it has RTC configured, and
+    /// receivers read it to build a session without an
+    /// out-of-band key handoff. `None` for every publisher that
+    /// does not announce one, which is every pre-Stage-4 node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub noise_pubkey: Option<[u8; 32]>,
     /// v0.4 capability-auth allow-list — peer `node_id`s
     /// authorized to invoke any of this publisher's `tags`. Empty
     /// = unrestricted (permissive default). Union semantics with
@@ -1038,6 +1046,7 @@ mod tests {
                 region: region.map(String::from),
                 price_quote: None,
                 reflex_addr,
+                noise_pubkey: None,
                 allowed_nodes: Vec::new(),
                 allowed_subnets: Vec::new(),
                 allowed_groups: Vec::new(),
@@ -1251,6 +1260,7 @@ mod tests {
             region: Some("us-east".into()),
             price_quote: None,
             reflex_addr: None,
+            noise_pubkey: None,
             allowed_nodes: Vec::new(),
             allowed_subnets: Vec::new(),
             allowed_groups: Vec::new(),
@@ -1340,6 +1350,7 @@ mod tests {
                     region: Some("us-east".into()),
                     price_quote: None,
                     reflex_addr: None,
+                    noise_pubkey: None,
                     allowed_nodes: Vec::new(),
                     allowed_subnets: Vec::new(),
                     allowed_groups: Vec::new(),
@@ -2012,6 +2023,7 @@ mod tests {
                 region: None,
                 price_quote: None,
                 reflex_addr: None,
+                noise_pubkey: None,
                 allowed_nodes: Vec::new(),
                 allowed_subnets: Vec::new(),
                 allowed_groups: Vec::new(),

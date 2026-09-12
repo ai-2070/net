@@ -10412,6 +10412,7 @@ mod roster_fallback_tests {
                 region: None,
                 price_quote: None,
                 reflex_addr: None,
+                noise_pubkey: None,
                 allowed_nodes: vec![0xDEAD],
                 allowed_subnets: vec![],
                 allowed_groups: vec![],

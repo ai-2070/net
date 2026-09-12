@@ -144,6 +144,7 @@ fn fixture(
             region: Some("us-east".into()),
             price_quote: None,
             reflex_addr: None,
+            noise_pubkey: None,
             allowed_nodes: Vec::new(),
             allowed_subnets: Vec::new(),
             allowed_groups: Vec::new(),

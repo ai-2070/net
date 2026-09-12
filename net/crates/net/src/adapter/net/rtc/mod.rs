@@ -28,6 +28,7 @@
 mod admission;
 mod config;
 mod driver;
+mod engine;
 #[cfg(any(test, feature = "fixtures"))]
 mod loopback;
 mod signal;
@@ -49,6 +50,9 @@ pub use config::{
 #[cfg(any(test, feature = "fixtures"))]
 pub use driver::RtcTestHooks;
 pub use driver::{RtcDriver, RtcDriverHandle, RtcSignal};
+pub use engine::{
+    expire_dialogs, handle_signal, start_dialog, Dialog, DialogTable, SharedDialogs, SignalOutcome,
+};
 #[cfg(any(test, feature = "fixtures"))]
 pub use loopback::connect_rtc_loopback;
 pub use signal::{

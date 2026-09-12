@@ -890,6 +890,23 @@ impl Drop for RtcInboxGuard<'_> {
     }
 }
 
+/// Capability tag: this node can take a WebRTC DataChannel
+/// (plan §11). Read by the traversal classifier — an RTC-capable
+/// pair negotiates with ICE and never spends punch budget.
+#[cfg(feature = "webrtc")]
+pub const RTC_TRANSPORT_TAG: &str = "transport:rtc";
+
+/// Capability tag: this node serves the bootstrap endpoint named by
+/// its `rtc_bootstrap` announcement field (plan §11).
+#[cfg(feature = "webrtc")]
+pub const RTC_ANCHOR_TAG: &str = "rtc-anchor";
+
+/// Capability tag a browser leaf sets (Stage 5). Stage 4 only reads
+/// it: a `leaf`-tagged peer is never a forwarding next hop and is
+/// never re-flooded to.
+#[cfg(feature = "webrtc")]
+pub const RTC_LEAF_TAG: &str = "leaf";
+
 fn node_id_to_graph_id(node_id: u64) -> [u8; 32] {
     let mut id = [0u8; 32];
     id[0..8].copy_from_slice(&node_id.to_le_bytes());
@@ -10695,6 +10712,9 @@ pub struct MeshNode {
     /// nothing.
     #[cfg(feature = "webrtc")]
     pending_promotions: Arc<DashMap<u64, (u64, PeerAddr)>>,
+    /// Dialogs this node is driving (plan §9 steps 3–6).
+    #[cfg(feature = "webrtc")]
+    rtc_dialogs: super::rtc::SharedDialogs,
     /// Test-only record of every frame that passed the budget, so a
     /// witness can assert what was *admitted* rather than inferring
     /// it from an installed session.
@@ -13149,6 +13169,8 @@ impl MeshNode {
             provisional_endpoints,
             #[cfg(feature = "webrtc")]
             pending_promotions: Arc::new(DashMap::new()),
+            #[cfg(feature = "webrtc")]
+            rtc_dialogs: Arc::new(tokio::sync::Mutex::new(super::rtc::DialogTable::new())),
             #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
             rtc_signal_tap: Arc::new(parking_lot::Mutex::new(Vec::new())),
             #[cfg(feature = "webrtc")]
@@ -22949,6 +22971,8 @@ impl MeshNode {
         // owns all three.
         #[cfg(feature = "webrtc")]
         self.spawn_provisional_reclaim_loop();
+        #[cfg(feature = "webrtc")]
+        self.spawn_rtc_signal_engine();
         let heartbeat_handle = self.spawn_heartbeat_loop();
         let stream_grant_drainer_handle = self.spawn_stream_grant_drainer_loop();
         let retransmit_handle = self.spawn_retransmit_loop();
@@ -24766,6 +24790,116 @@ impl MeshNode {
             auth_failure_window: self.config.auth_failure_window,
             auth_throttle_duration: self.config.auth_throttle_duration,
         }
+    }
+
+    /// Drain inbound `0x0D02` frames and drive them against the
+    /// driver (plan §9 steps 3–6).
+    ///
+    /// One task, so the dialog table has one mutator; the dispatch
+    /// arm only hands frames over. Every effect that leaves this
+    /// node — the answer, the rejection — goes back over the same
+    /// session the frame arrived on, which is the routed path an
+    /// anchor is forwarding blind.
+    #[cfg(feature = "webrtc")]
+    fn spawn_rtc_signal_engine(&self) {
+        let Some(mut rx) = self.rtc_signal_rx.lock().take() else {
+            return;
+        };
+        let Some(driver) = self.rtc_driver.clone() else {
+            return;
+        };
+        let Some(weak) = self.self_weak.get().cloned() else {
+            return;
+        };
+        let dialogs = Arc::clone(&self.rtc_dialogs);
+        let ice_deadline = self
+            .config
+            .rtc
+            .as_ref()
+            .map(|rtc| rtc.ice_deadline)
+            .unwrap_or_else(|| Duration::from_secs(10));
+        let shutdown = self.shutdown.clone();
+        let handle = tokio::spawn(async move {
+            while !shutdown.load(Ordering::Acquire) {
+                let next = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+                // Deadlines are checked on every turn, including the
+                // idle ones — an attempt that never gets another
+                // frame is exactly the case `ice_deadline` exists
+                // for.
+                {
+                    let mut table = dialogs.lock().await;
+                    let _ = super::rtc::expire_dialogs(&driver, &mut table, Instant::now()).await;
+                }
+                let (from_node, msg) = match next {
+                    Ok(Some(frame)) => frame,
+                    Ok(None) => break,
+                    Err(_) => continue,
+                };
+                let outcome = {
+                    let mut table = dialogs.lock().await;
+                    super::rtc::handle_signal(&driver, &mut table, from_node, msg, ice_deadline)
+                        .await
+                };
+                let Some(node) = weak.upgrade() else { break };
+                match outcome {
+                    super::rtc::SignalOutcome::Answer { dialog, sdp } => {
+                        let _ = node
+                            .send_rtc_signal(
+                                from_node,
+                                &super::rtc::RtcSignalMsg::Answer { dialog, sdp },
+                            )
+                            .await;
+                    }
+                    super::rtc::SignalOutcome::Reject { dialog, reason } => {
+                        let _ = node
+                            .send_rtc_signal(
+                                from_node,
+                                &super::rtc::RtcSignalMsg::Reject { dialog, reason },
+                            )
+                            .await;
+                    }
+                    _ => {}
+                }
+            }
+        });
+        self.tasks.lock().push(handle);
+    }
+
+    /// Open a direct path to `peer_node_id` over the session that
+    /// already exists (plan §9 step 3): send an `Offer` on
+    /// `0x0D02` and let the engine carry the rest.
+    ///
+    /// Returns the dialog id. Retry policy is the caller's and must
+    /// never be per packet (§9 step 6).
+    #[cfg(feature = "webrtc")]
+    pub async fn offer_direct_path(&self, peer_node_id: u64) -> Result<u64, AdapterError> {
+        let driver = self
+            .rtc_driver
+            .as_ref()
+            .ok_or_else(|| AdapterError::Connection("rtc is not configured".into()))?;
+        let ice_deadline = self
+            .config
+            .rtc
+            .as_ref()
+            .map(|rtc| rtc.ice_deadline)
+            .unwrap_or_else(|| Duration::from_secs(10));
+        // A dialog id only has to be unique between these two
+        // endpoints; the session already authenticates who is
+        // talking. A counter plus the clock is sufficient and needs
+        // no RNG dependency on this path.
+        let dialog = self
+            .capability_version
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ super::current_timestamp();
+        let offer = {
+            let mut table = self.rtc_dialogs.lock().await;
+            super::rtc::start_dialog(driver, &mut table, peer_node_id, dialog, ice_deadline)
+                .await
+                .map_err(AdapterError::Connection)?
+        };
+        self.send_rtc_signal(peer_node_id, &offer).await?;
+        Ok(dialog)
     }
 
     /// Sweep provisional sessions: reclaim the expired and, when
@@ -33861,6 +33995,37 @@ impl MeshNode {
             .await
     }
 
+    /// Attach the Stage 4a RTC fields to an announcement being
+    /// built, each under its own condition (plan §5, §11).
+    ///
+    /// `noise_pubkey` rides on `rtc.is_some()` — it is what lets a
+    /// peer build a session with us without an out-of-band key
+    /// handoff, and a node with no RTC has no use advertising it
+    /// yet. `rtc_bootstrap` needs `serve_bootstrap`, because
+    /// advertising a URL nobody serves is worse than advertising
+    /// nothing. `rtc_addr` needs `public_addr`: a node that has not
+    /// been told its public address does not guess one.
+    #[cfg(feature = "webrtc")]
+    fn with_rtc_announcement_fields(&self, ann: CapabilityAnnouncement) -> CapabilityAnnouncement {
+        let Some(rtc) = self.config.rtc.as_ref() else {
+            return ann;
+        };
+        let bootstrap = if rtc.serve_bootstrap {
+            rtc.public_addr
+                .map(|addr| format!("https://{addr}/rtc"))
+                .or_else(|| {
+                    self.rtc_driver
+                        .as_ref()
+                        .map(|d| format!("https://{}/rtc", d.local_addr()))
+                })
+        } else {
+            None
+        };
+        ann.with_noise_pubkey(Some(*self.public_key()))
+            .with_rtc_bootstrap(bootstrap)
+            .with_rtc_addr(rtc.public_addr)
+    }
+
     /// Is this peer's session provisional? Public so the enrollment
     /// and reply-subscription paths can ask without reaching into
     /// `PeerInfo`.
@@ -37665,6 +37830,26 @@ impl MeshNode {
                 caps
             };
 
+            // Stage 4a §11 tags. `transport:rtc` is how a peer
+            // learns it can take a DataChannel with us — the
+            // classifier reads it and returns `PairAction::Ice`
+            // instead of planning a punch. `rtc-anchor` says this
+            // node serves the bootstrap endpoint its
+            // `rtc_bootstrap` field names. `leaf` is Stage 5's to
+            // emit; Stage 4 only reads it.
+            #[cfg(feature = "webrtc")]
+            let caps = match self.config.rtc.as_ref() {
+                Some(rtc) => {
+                    let caps = caps.add_tag(RTC_TRANSPORT_TAG.to_string());
+                    if rtc.serve_bootstrap {
+                        caps.add_tag(RTC_ANCHOR_TAG.to_string())
+                    } else {
+                        caps
+                    }
+                }
+                None => caps,
+            };
+
             let version = self.capability_version.fetch_add(1, Ordering::Relaxed) + 1;
 
             // Piggyback the current NAT classification as a `nat:*`
@@ -37748,6 +37933,15 @@ impl MeshNode {
             {
                 broadcast_ann = broadcast_ann.with_reflex_addr(reflex_snapshot);
             }
+            // Stage 4a §5 Layer 1: the RTC discovery fields, each
+            // emitted only when the operator configured the thing it
+            // describes. A node without `rtc` sets none of them and
+            // its announcement is byte-identical to the pre-Stage-4
+            // one, signature included.
+            #[cfg(feature = "webrtc")]
+            {
+                broadcast_ann = self.with_rtc_announcement_fields(broadcast_ann);
+            }
             if sign {
                 broadcast_ann.sign(&self.identity);
             }
@@ -37781,6 +37975,10 @@ impl MeshNode {
                     #[cfg(feature = "nat-traversal")]
                     {
                         a = a.with_reflex_addr(reflex_snapshot);
+                    }
+                    #[cfg(feature = "webrtc")]
+                    {
+                        a = self.with_rtc_announcement_fields(a);
                     }
                     if sign {
                         a.sign(&self.identity);
@@ -39238,6 +39436,39 @@ impl MeshNode {
             .is_some_and(|p| matches!(p.value().addr(), PeerAddr::Rtc(_)))
     }
 
+    /// Does this peer's most recent announcement carry
+    /// `transport:rtc` (plan §11)?
+    #[cfg(feature = "webrtc")]
+    fn peer_announces_rtc(&self, peer_node_id: u64) -> bool {
+        self.capability_fold.with_state(|state| {
+            let Some(keys) = state.by_node.get(&peer_node_id) else {
+                return false;
+            };
+            keys.iter()
+                .filter_map(|key| state.entries.get(key))
+                .any(|entry| {
+                    entry
+                        .payload
+                        .tags
+                        .iter()
+                        .any(|tag| tag.to_string() == RTC_TRANSPORT_TAG)
+                })
+        })
+    }
+
+    /// The peer's announced Noise static key, if it published one
+    /// (plan §5 Layer 1) — the key `connect_via` needs and a
+    /// browser has no out-of-band way to obtain.
+    #[cfg(feature = "webrtc")]
+    pub fn peer_announced_noise_pubkey(&self, peer_node_id: u64) -> Option<[u8; 32]> {
+        self.capability_fold.with_state(|state| {
+            let keys = state.by_node.get(&peer_node_id)?;
+            keys.iter()
+                .filter_map(|key| state.entries.get(key))
+                .find_map(|entry| entry.payload.noise_pubkey)
+        })
+    }
+
     /// The pair action for this peer, ICE short-circuit included.
     ///
     /// `nat-traversal`-gated like its three callers (`connect_direct`,
@@ -39248,8 +39479,15 @@ impl MeshNode {
     /// compile the core.
     #[cfg(feature = "nat-traversal")]
     fn pair_action_for(&self, peer_node_id: u64) -> super::traversal::classify::PairAction {
+        // Stage 4a: an *announced* `transport:rtc` counts too, not
+        // only an already-installed RTC endpoint. That is the whole
+        // point of §5 Layer 1 — the pair learns it can use ICE from
+        // discovery, before either side has a DataChannel, which is
+        // exactly when the decision matters.
         #[cfg(feature = "webrtc")]
-        let rtc_side = self.peer_endpoint_is_rtc(peer_node_id);
+        let rtc_side = self.peer_endpoint_is_rtc(peer_node_id)
+            || self.config.rtc.is_some()
+            || self.peer_announces_rtc(peer_node_id);
         #[cfg(not(feature = "webrtc"))]
         let rtc_side = false;
         super::traversal::classify::pair_action_with_transport(
@@ -44053,6 +44291,7 @@ mod fold_publisher_helpers_tests {
                 region: Some("us-east".into()),
                 price_quote: None,
                 reflex_addr: None,
+                noise_pubkey: None,
                 allowed_nodes: Vec::new(),
                 allowed_subnets: Vec::new(),
                 allowed_groups: Vec::new(),
