@@ -321,7 +321,7 @@ empty-suite self-check can actually fire.
 | Cleanup is incarnation-safe and returns to baseline | `kyra_normal_close_reclaims_provisional_projection`, the two sweep witnesses | GC-vs-promotion and GC-vs-replacement via the production reclaim entry point, not a paused background sweep |
 | The native upgrade completes in production | `kyra_engine_must_install_without_loopback_noise_fixture`, `the_full_section_9_sequence_with_the_three_part_witness`, `an_ice_pair_schedules_the_upgrade_attempt` | Same attempt, no fixture substitution; both endpoints' new session ids, receiver-attributed payload, flat anchor transit |
 | Signalling admission follows the dialog | the four R5 witnesses | Expiry, own Reject, failed allocation, outbound correlation; per-incarnation queue keys are **not** claimed |
-| Real SDK enrollment promotes | `sdk/tests/enrollment_over_rtc.rs` (both outcomes) | The real service, client, codec and registry; the device's `join()` flow over UDP rendezvous is unchanged and separately covered by SDK units |
+| Real SDK enrollment promotes | `sdk/tests/enrollment_over_rtc.rs` (both outcomes) | The real service, client, codec and registry. **Reviewer correction:** the enrollment and renewal RPC bodies now travel raw on *both* sides, so the device's `join()` flow over UDP rendezvous is **not** unchanged — its body encoding changed from a JSON `Vec<u8>` (shipped in `net-mesh-sdk` since `cli-v0.31.0`) to raw bytes. Only the Rust SDK speaks these services (no TS/Python/Go implementation), so the break is between SDK versions: a mixed-version device/authority pair cannot enroll. Owner decision, not the reviewer's: ship as a breaking change with a release note, or dual-accept the JSON body for one release. |
 | Transport admission is not invocation authority | `an_admitted_peer_without_authority_is_still_denied` | A real protected provider, zero invocations; the authorized proof control is `tests/integration_nrpc_protected.rs` |
 
 ### 12.5 Still open, by name
@@ -369,3 +369,24 @@ early ten-binary run; its two **settling** waits (routed
 quiescence, B's own install) went 20 s → 30 s, and six consecutive
 whole-suite runs were clean afterwards. At `retries = 0` a
 load-dependent verdict is a defect in the witness, not a retry.
+
+### 12.7 Reviewer verification at `7fccb155c`
+
+`tests/rtc_admission_probes.rs` is Kyra's file modulo rustfmt (bodies
+identical with whitespace, comments and trailing commas removed). Ten
+RTC binaries `--no-tests=fail --retries 0`: **89/89 ×6**; `--lib`
+5779 / 5811; strict clippy default + `webrtc`; all-targets clippy with
+CI's `-A` set; `webrtc` rustdoc; SDK `--lib` 292 and
+`enrollment_over_rtc` 2/2; export set 568/568 on CI's
+`net-ffi/test-helpers` build; consumer diff since `01e4b0f20` is
+`sdk/` only (listed in §12.6). Inverses at the production sites, each
+hash-restored: unknown RTC endpoint → `Permitted` (pre-Noise probe
+red); provisional → `Permitted` (transit control, app delivery, ICE
+allocation all red); `charge_enrollment_request` bypassed (fifth
+request red); promotion consumed by node only (old-success probe red);
+both `spawn_dialog_completion` arms removed (engine probe red, and the
+§9 flagship red at 21 s — the same attempt no longer completes).
+
+Reviewer edits in this record: the stale "test/fixtures only" note on
+`connect_rtc` (it is the production owner's callee since R4), and the
+§12.4 R6 row, which claimed the device's `join()` flow was unchanged.

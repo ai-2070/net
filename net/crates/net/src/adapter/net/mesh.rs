@@ -22456,7 +22456,8 @@ impl MeshNode {
     }
 
     /// Establish a Net session over an already-open DataChannel,
-    /// as the Noise **initiator** (Stage 3, test/fixtures only).
+    /// as the Noise **initiator** (Stage 3; production since R4, where
+    /// the dialog completion owner calls it in the offerer's role).
     ///
     /// Deliberately not a new handshake path: it is
     /// [`Self::connect`]'s body with a `PeerAddr::Rtc` endpoint. The

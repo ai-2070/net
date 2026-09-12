@@ -2088,6 +2088,45 @@ generations, the native consumer evidence, CI. Brief
 substitution, not by production code — R4 is the substantive 4a work
 still owed, and it precedes 4b.
 
+**4a repair candidate `7fccb155c` (2026-09-12) — verified, forwarded
+to Kyra.** `S4A_REPORT.md` §12. Kyra's eight probes landed verbatim as
+`tests/rtc_admission_probes.rs` (floor 8, names pinned): **8/8**. R1
+one fail-closed `ingress_admission` (unknown / retired / provisional
+RTC source ⇒ `Denied`) consulted before the application enqueue,
+signalling and ICE allocation, all three streaming bridges, F6 by the
+authenticated requester, both routed-handshake constructors. R2
+reservations keyed `(node, session, call)`, the inbound RPC event
+carries its receiving session, eviction retires. R3 REQUEST count and
+in-flight slot charged before dispatch, stream count / 64 KiB before
+allocation, ordinary eviction clears the projection, reclaim through the
+exact-incarnation transition. **R4** a per-dialog completion owner
+(`spawn_dialog_completion`: `await_open` → Noise in the dialog's role
+with the announced key → the Stage 3 fenced install → retirement) on
+both engine arms; `connect_rtc`/`accept_rtc` are now its production
+callees; the flagship §9 witness completes the **same** attempt with no
+`connect_rtc_loopback` substitution; `PairAction::Ice` schedules the
+attempt. R5 every terminal path releases the `SignalBudget`; outbound
+dialogs known to the inbound budget. R6 enrollment/renewal bodies travel
+raw (`serve_rpc_raw_bytes`/`call_raw_bytes`), `u16` outcome code, a
+bootstrap-only origin substitute; `sdk/tests/enrollment_over_rtc.rs`
+proves both outcomes through the real service, client, codec and
+registry. R7 a real authority-backed protected provider; CI's inventory
+counts non-empty lines.
+
+Reviewer at `7fccb155c` (§12.7): probes are Kyra's modulo rustfmt;
+89/89 ×6 at retries 0; `--lib` 5779/5811; SDK 292 + 2; 568/568;
+inverses at the production sites all red (fail-open, provisional
+permit, uncharged REQUEST, node-keyed promotion, no completion owner —
+the §9 flagship goes red without it). **Owner decision surfaced:** R6
+changes the enrollment body encoding shipped in `net-mesh-sdk` since
+`cli-v0.31.0`; only the Rust SDK speaks it, so the break is between SDK
+versions — breaking change with a release note, or dual-accept JSON for
+one release. Still open by name (§12.5): F7; `max_provisional` as
+shedding not reservation; no aggregate bootstrap-byte ledger; signal
+queues keyed by node; the enrollment deadline as sweep + TTL;
+client-streaming/duplex without their own witness; reflex/relay ICE,
+listener, TLS, browser → 4b.
+
 ## Stage 5 — `net-leaf` + `@net-mesh/browser`
 
 - Leaf crate and TypeScript wrapper; identity storage and leader election
