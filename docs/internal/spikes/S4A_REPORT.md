@@ -21,7 +21,8 @@ emits nothing new and behaves exactly as before.
 | `5c5341829` | §9 wiring: field emission, the signalling engine, `Ice` from the tag |
 | `22fb4ae23` | the two witness binaries + the CI inventory fix |
 | `3ed9ad6a6` | validation fixes (key-order scan, fold projection is not wire, latch scan) |
-| *(this commit)* | candidate: fmt, validation, this report |
+| `652c786c9` | report |
+| *(this commit)* | **closure**: outcome-gated promotion, live provisional budget |
 
 ## 2. Exit criteria
 
@@ -48,6 +49,11 @@ emits nothing new and behaves exactly as before.
 | 8 | Pingwave denied both directions; heartbeat permitted | `rtc_admission::pingwave_is_denied_while_heartbeat_is_permitted`, `rtc::admission::tests::heartbeat_is_maintenance_and_pingwave_is_not` | pass |
 | 9 | Stage 3's four RTC binaries, the default `--lib` count and six floors, and the export checker are unchanged | see §4 | pass |
 | — | A node that serves no bootstrap installs RTC sessions as **admitted** (Stage 3 untouched) | `rtc_admission::a_non_bootstrap_node_installs_rtc_sessions_as_admitted` | pass |
+| C1 | A **Rejected** `JoinOutcome` promotes nothing: the session stays provisional and the refusal is counted | `rtc_admission::a_rejected_enrollment_outcome_promotes_nothing` | pass |
+| C1b | The same real exchange with an **Admitted** outcome does promote (the control that gives C1 meaning) | `rtc_admission::an_admitted_enrollment_outcome_promotes_the_session` | pass |
+| C1c | The outcome prefix the core reads is the form the SDK emits | `net-mesh-sdk` `enrollment::tests::join_outcome_wire_prefix_is_what_the_core_promotion_gate_reads` | pass |
+| C2 | The 257th inbound frame from a provisional peer closes and reclaims the session | `rtc_admission::the_provisional_frame_bound_closes_the_session` | pass |
+| C2b | The 256 KiB byte bound is a separate axis and fires far below the frame bound | `rtc_admission::the_provisional_byte_bound_closes_the_session` | pass |
 
 ## 3. Inverses
 
@@ -64,6 +70,9 @@ empty after each.
 | Remove the session binding from promotion | `a_replaced_session_promotes_nothing` | **FAIL** |
 | Remove `serialize_field("noise_pubkey")` from the canonical signer | `tampering_…`, `the_canonical_signer_matches_…` | **FAIL** (2 of 3) |
 | Restore the corrective re-announce on the provisional path | `a_provisional_rejecter_never_triggers_a_corrective_reannounce` | **FAIL** |
+| Promote on **any** outcome tag (the pre-closure behaviour) | `a_rejected_enrollment_outcome_promotes_nothing` | **FAIL** |
+| Remove the ingress budget charge | `the_provisional_frame_bound_closes_the_session` | **FAIL** |
+| Remove the ingress budget charge | `the_provisional_byte_bound_closes_the_session` | **FAIL** |
 
 ## 4. Validation
 
@@ -78,13 +87,14 @@ empty after each.
 | `RUSTDOCFLAGS="-D warnings" cargo doc --features webrtc --no-deps` | pass |
 | `RUSTDOCFLAGS="-D warnings" cargo doc -p net-mesh-wire --no-deps` (default features) | pass |
 | `cargo test --lib --features "$UNIT_FEATURES"` | **5779 passed**, 0 failed, 2 ignored |
+| `cargo test -p net-mesh-sdk --lib` | **292 passed**, 0 failed |
 | `cargo test --lib --features "$UNIT_FEATURES webrtc"` | **5811 passed**, 0 failed, 2 ignored |
-| Six RTC binaries, `--no-tests=fail --retries 0` | **49 run, 49 passed** |
+| Six RTC binaries, `--no-tests=fail --retries 0` | **53 run, 53 passed** |
 | Witness floors | **93 / 24 / 62 / 41 / 60 / 68** (unchanged) |
 | `cargo test --test cross_lang_wire --features net` | 10 passed |
 | `cargo test --test integration_net` | 14 passed |
 | Export checker on a fresh `net-ffi` cdylib | `net.dll: export set matches the baseline`, 568 |
-| CI inventory step, simulated locally against real `nextest list` output | floors 5/7/18/4/6/9 met, 0 required names missing |
+| CI inventory step, simulated locally against real `nextest list` output | floors 5/7/18/4/6/**13** met, 0 required names missing |
 
 ## 5. Design notes and deviations
 
@@ -132,7 +142,40 @@ empty after each.
    provisional peer's signalling can be refused at either the
    delivery or the forwarding gate depending on where it lands.
 
+9. **A provisional session binds one origin.** A peer with no
+   pinned identity (it has not announced, and gate 4 refuses to
+   ingest one from it) claims an origin in its reply-channel name
+   and again in its REQUEST header. Those claims are now bound to
+   the session on first use and every later claim must match, so a
+   peer cannot subscribe as one origin and enroll as another. This
+   also made the permitted exchange actually work: gate 3 was
+   comparing the channel's origin against a **node id**, so every
+   enrollment subscribe timed out — a defect the pre-closure
+   witnesses could not see, because they only asserted refusals and
+   called `promote_admission` directly.
+10. **Promotion resolves the enrolling node three ways.** A
+   browser's first call arrives before the anchor has pinned any
+   identity, so `target_hint` is `None` and the origin reverse-index
+   is empty; the provisional session bound to the reply channel's
+   origin is the third resolution. Breadth is safe because
+   `promote_admission` still re-verifies the session id and the
+   endpoint captured at REQUEST decode — witness 6.4 is unchanged
+   and still passes.
+11. **The §9 witness was flaky and is now deterministic.** The
+   offer opens a real local ICE endpoint; the in-process fixture
+   then opened a second one for the same peer, and which the driver
+   reaped was a coin flip (it failed 4 runs in 5 in isolation, on
+   the pre-closure head too). The witness now waits for the offer's
+   own attempt to reach its §9 step 6 expiry — `ice_relayed`, with
+   the routed session asserted untouched — before the fixture
+   installs the pair, so the abandoned endpoint is gone first.
+
 ## 6. Gaps, named
+
+Two of the six gaps this report first named were §12 contract
+holes, not deferrable work, and are closed above: promotion on any
+enrollment response (C1) and the unenforced whole-session bounds
+(C2). Three remain, and one is new.
 
 1. **F7 (`proxy.rs:349`) has no admission gate.** The proxy forwards
    from its own route table and has no view of the mesh's peer map
@@ -140,24 +183,18 @@ empty after each.
    it today. Wiring it needs the projection threaded into the proxy
    adapter — not done, and it is the one F-site of the seven that is
    unguarded.
-2. **The provisional whole-session frame/byte counters are defined
-   and unit-tested but not yet charged on the ingress path.** The
-   cap that *is* enforced live is `max_provisional` plus the 30 s
-   expiry; `ProvisionalBudget::charge_frame` has no production
-   caller. That is a real gap in "≤ 256 frames / ≤ 256 KiB", and it
-   is the first thing 4b should close.
-3. **Promotion is driven by the enrollment RESPONSE leaving the
-   anchor**, keyed on the reply channel. It does not inspect the
-   `JoinOutcome`: a *rejected* enrollment that still produces a
-   response would promote. Binding promotion to the outcome needs a
-   core-visible success signal from the SDK handler, which the brief
-   holds out of scope ("SDK surface unchanged").
-4. **`rtc_bootstrap` is synthesized as `https://<addr>/rtc`.** There
+2. **`rtc_bootstrap` is synthesized as `https://<addr>/rtc`.** There
    is no listener behind it in 4a; the URL shape is 4b's to fix if
    it differs.
-5. **The §9 witness uses the in-process ICE fixture** for the
+3. **The §9 witness uses the in-process ICE fixture** for the
    DataChannel itself: `offer_direct_path` sends the real `Offer`
    over the routed session and the engine handles what comes back,
    but two loopback nodes cannot complete ICE against each other
    without the Stage 3 fixture. The signalling is real; the
    candidate exchange is not yet the thing being exercised.
+4. **The frame/byte charge is on the RTC ingress path only.** A
+   provisional session can exist only on an RTC endpoint today, so
+   that is every frame it can send — but if a later stage installs a
+   provisional session on any other transport, the charge does not
+   follow it. The bound belongs to the admission state, and the
+   single call site is in `spawn_receive_loop`'s RTC arm.

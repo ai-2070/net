@@ -81,6 +81,15 @@ pub enum PeerAdmission {
         since: Instant,
         /// Consumption against the whole-session bounds.
         budget: ProvisionalBudget,
+        /// The origin hash this session has claimed, bound on first
+        /// use. A provisional peer has no pinned identity — it has
+        /// not announced, and the anchor must not ingest an
+        /// announcement from it (gate 4) — so the only identity
+        /// available pre-enrollment is the one the session itself
+        /// claims. Binding it on first use makes it **one session,
+        /// one identity**: a peer cannot subscribe as one origin
+        /// and then enroll as another.
+        origin: Option<u64>,
     },
     /// Enrollment promoted this exact session incarnation.
     Admitted {
@@ -111,7 +120,50 @@ impl PeerAdmission {
         Self::Provisional {
             since: now,
             budget: ProvisionalBudget::default(),
+            origin: None,
         }
+    }
+
+    /// Bind — or re-check — the origin this provisional session
+    /// claims. `true` when the claim is this session's; `false`
+    /// when the session already claimed a *different* one.
+    ///
+    /// Admitted sessions always answer `true`: they are past the
+    /// point where this binding is the identity that matters.
+    pub fn bind_origin(&mut self, claimed: u64) -> bool {
+        match self {
+            Self::Provisional { origin, .. } => match origin {
+                Some(bound) => *bound == claimed,
+                None => {
+                    *origin = Some(claimed);
+                    true
+                }
+            },
+            Self::Admitted { .. } => true,
+        }
+    }
+
+    /// The origin this provisional session is bound to, if it has
+    /// claimed one yet.
+    pub fn bound_origin(&self) -> Option<u64> {
+        match self {
+            Self::Provisional { origin, .. } => *origin,
+            Self::Admitted { .. } => None,
+        }
+    }
+
+    /// Parse the origin out of an enrollment reply-channel name,
+    /// the inverse of [`enroll_reply_channel`]. `None` for any
+    /// other channel.
+    ///
+    /// A provisional peer subscribes before it sends its REQUEST,
+    /// so the channel name is where its origin claim first appears.
+    pub fn origin_from_enroll_reply_channel(channel: &str) -> Option<u64> {
+        let suffix = channel.strip_prefix("net.mesh.enroll.replies.")?;
+        if suffix.len() != 16 {
+            return None;
+        }
+        u64::from_str_radix(suffix, 16).ok()
     }
 
     /// Is this session still provisional?

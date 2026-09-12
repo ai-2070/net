@@ -1625,6 +1625,10 @@ struct DispatchCtx {
     rtc_stats: Option<Arc<super::rtc::RtcStats>>,
     #[cfg(feature = "webrtc")]
     forwarded_app_packets: Arc<DashMap<(u32, u64), u64>>,
+    #[cfg(feature = "webrtc")]
+    provisional_endpoints: super::rtc::ProvisionalEndpoints,
+    #[cfg(feature = "webrtc")]
+    rtc_driver: Option<super::rtc::RtcDriverHandle>,
     #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
     rtc_signal_tap: Option<RtcSignalTap>,
     /// Per-channel-hash dispatch hook for nRPC. See the matching
@@ -24697,6 +24701,10 @@ impl MeshNode {
             rtc_stats: self.rtc_driver.as_ref().map(|d| Arc::clone(d.stats())),
             #[cfg(feature = "webrtc")]
             forwarded_app_packets: Arc::clone(&self.forwarded_app_packets),
+            #[cfg(feature = "webrtc")]
+            provisional_endpoints: Arc::clone(&self.provisional_endpoints),
+            #[cfg(feature = "webrtc")]
+            rtc_driver: self.rtc_driver.clone(),
             #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
             rtc_signal_tap: self
                 .rtc_driver
@@ -25171,6 +25179,19 @@ impl MeshNode {
                                     // looking healthy. Count it, and
                                     // keep the channel.
                                     rtc_stats.note_validate_rejected();
+                                    continue;
+                                }
+                                // §12 / S0e §2 whole-session bounds:
+                                // charge this frame to the sender's
+                                // provisional budget BEFORE it can
+                                // reach any handler. A breach is not
+                                // a clamp — §12 step 5 says close and
+                                // reclaim — so the session ends here
+                                // and the frame is never dispatched.
+                                #[cfg(feature = "webrtc")]
+                                if Self::charge_provisional_ingress(&source, &data, &ctx)
+                                    .is_err()
+                                {
                                     continue;
                                 }
                                 Self::dispatch_packet(data, source, &ctx);
@@ -34285,9 +34306,8 @@ impl MeshNode {
     /// REQUEST decode — and only that one.
     #[cfg(feature = "webrtc")]
     pub(crate) fn promote_on_enrollment_response(&self, node_id: u64, reply_channel: &str) -> bool {
-        let origin = match self.peer_entity_id(node_id) {
-            Some(e) => e.origin_hash(),
-            None => return false,
+        let Some(origin) = self.provisional_reply_origin(node_id) else {
+            return false;
         };
         if reply_channel != super::rtc::enroll_reply_channel(origin) {
             return false;
@@ -34296,6 +34316,58 @@ impl MeshNode {
             return false;
         };
         self.promote_admission(node_id, session_id, endpoint)
+    }
+
+    /// The provisional peer bound to this enrollment reply
+    /// channel's origin, if any.
+    ///
+    /// A browser's enrollment REQUEST is its first message: the
+    /// anchor has pinned no identity for it and its origin is in no
+    /// reverse index, so neither of the response path's ordinary
+    /// resolutions finds it. The session's own bound origin does.
+    #[cfg(feature = "webrtc")]
+    pub(crate) fn provisional_node_for_reply_channel(&self, reply_channel: &str) -> Option<u64> {
+        let origin = super::rtc::PeerAdmission::origin_from_enroll_reply_channel(reply_channel)?;
+        self.peers
+            .iter()
+            .find_map(|e| (e.value().admission.bound_origin() == Some(origin)).then(|| *e.key()))
+    }
+
+    /// Which origin may name this peer's enrollment reply channel?
+    ///
+    /// A pinned identity wins — that is an announcement this node
+    /// verified. A provisional peer has none by construction (gate
+    /// 4 refuses to ingest one), so it falls back to the origin the
+    /// session bound on first use. A session that has claimed
+    /// nothing yet answers `None`, and promotes nothing.
+    #[cfg(feature = "webrtc")]
+    fn provisional_reply_origin(&self, node_id: u64) -> Option<u64> {
+        if let Some(entity) = self.peer_entity_id(node_id) {
+            return Some(entity.origin_hash());
+        }
+        self.peers
+            .get(&node_id)
+            .and_then(|e| e.value().admission.bound_origin())
+    }
+
+    /// §12 step 4, the refusal half: an enrollment that was
+    /// **rejected** consumes its pending promotion and promotes
+    /// nothing. The session stays provisional and expires on its
+    /// own clock; the refusal is counted so it is visible as a
+    /// refusal rather than as an absence.
+    #[cfg(feature = "webrtc")]
+    pub(crate) fn note_enrollment_rejected(&self, node_id: u64, reply_channel: &str) {
+        let Some(origin) = self.provisional_reply_origin(node_id) else {
+            return;
+        };
+        if reply_channel != super::rtc::enroll_reply_channel(origin) {
+            return;
+        }
+        if self.pending_promotions.remove(&node_id).is_some() {
+            if let Some(stats) = self.rtc_driver.as_ref().map(|d| d.stats()) {
+                stats.note_admission_rejected_outcome();
+            }
+        }
     }
 
     /// How many provisional sessions this node currently holds.
@@ -34383,6 +34455,19 @@ impl MeshNode {
         }
         let endpoint = entry.value().addr();
         drop(entry);
+        // Same one-session-one-identity binding the subscribe gate
+        // applies: the REQUEST's claimed origin must be the origin
+        // this session already claimed, if any.
+        if !Self::bind_provisional_origin_locked(
+            inbound.from_node,
+            inbound.origin_hash,
+            &self.peers,
+        ) {
+            if let Some(stats) = self.rtc_driver.as_ref().map(|d| d.stats()) {
+                stats.note_admission_refused_deliver();
+            }
+            return false;
+        }
         let reply_channel = super::rtc::enroll_reply_channel(inbound.origin_hash);
         let action = super::rtc::BootstrapAction::NrpcRequest {
             service,
@@ -34462,19 +34547,64 @@ impl MeshNode {
         source: &PeerAddr,
         ctx: &DispatchCtx,
         action: &super::rtc::BootstrapAction<'_>,
-        caller_origin: u64,
+        caller_origin_node: u64,
     ) -> bool {
         if !Self::is_provisional(source, ctx) {
             return true;
         }
-        let allowed =
-            super::rtc::allow_provisional_action(action, ctx.local_node_id, caller_origin).is_ok();
+        // A provisional peer has no pinned identity, so the origin
+        // that names its reply channel IS its claim. Bind it to the
+        // session on first use and require every later claim to
+        // match, so a peer cannot subscribe as one origin and
+        // enroll as another.
+        let claimed = match action {
+            super::rtc::BootstrapAction::Subscribe { channel, .. }
+            | super::rtc::BootstrapAction::Unsubscribe { channel } => {
+                super::rtc::PeerAdmission::origin_from_enroll_reply_channel(channel)
+            }
+            _ => None,
+        };
+        let allowed = match claimed {
+            Some(origin) if Self::bind_provisional_origin(caller_origin_node, origin, ctx) => {
+                super::rtc::allow_provisional_action(action, ctx.local_node_id, origin).is_ok()
+            }
+            // No enrollment-shaped channel, or a second, different
+            // origin claim on the same session: run the allow-list
+            // against an origin this channel cannot match, so the
+            // answer is a refusal with a counter rather than a drop.
+            _ => false,
+        };
         if !allowed {
             if let Some(stats) = ctx.rtc_stats.as_ref() {
                 stats.note_admission_refused_subscribe();
             }
         }
         allowed
+    }
+
+    /// [`Self::bind_provisional_origin`] against a peer map held
+    /// directly rather than through a [`DispatchCtx`].
+    #[cfg(feature = "webrtc")]
+    fn bind_provisional_origin_locked(
+        node_id: u64,
+        origin: u64,
+        peers: &DashMap<u64, PeerInfo>,
+    ) -> bool {
+        match peers.get_mut(&node_id) {
+            Some(mut entry) => entry.value_mut().admission.bind_origin(origin),
+            None => false,
+        }
+    }
+
+    /// Bind `origin` to `node_id`'s provisional session, or
+    /// re-check an existing binding. `false` means the session
+    /// already claimed a different origin.
+    #[cfg(feature = "webrtc")]
+    fn bind_provisional_origin(node_id: u64, origin: u64, ctx: &DispatchCtx) -> bool {
+        match ctx.peers.get_mut(&node_id) {
+            Some(mut entry) => entry.value_mut().admission.bind_origin(origin),
+            None => false,
+        }
     }
 
     /// **Gate 4 of 5 (§12): announcement ingest.** A provisional
@@ -34517,6 +34647,68 @@ impl MeshNode {
         }
         let _ = endpoint;
         allowed
+    }
+
+    /// Charge one inbound RTC frame to a provisional sender's
+    /// whole-session budget (S0e §2: ≤ 256 frames, ≤ 256 KiB).
+    ///
+    /// `Err` means the session breached a bound and has been closed
+    /// and reclaimed (§12 step 5) — the caller must not dispatch
+    /// the frame. Admitted and native senders are never charged,
+    /// so this is one `DashMap` read on their path.
+    #[cfg(feature = "webrtc")]
+    fn charge_provisional_ingress(
+        source: &PeerAddr,
+        data: &Bytes,
+        ctx: &DispatchCtx,
+    ) -> Result<(), super::rtc::AdmissionRefusal> {
+        let Some(node_id) = ctx.addr_to_node.get(source).map(|e| *e.value()) else {
+            return Ok(());
+        };
+        let breached = {
+            let Some(mut entry) = ctx.peers.get_mut(&node_id) else {
+                return Ok(());
+            };
+            let super::rtc::PeerAdmission::Provisional { budget, .. } =
+                &mut entry.value_mut().admission
+            else {
+                return Ok(());
+            };
+            budget.charge_frame(data.len() as u64).is_err()
+        };
+        if !breached {
+            return Ok(());
+        }
+        if let Some(stats) = ctx.rtc_stats.as_ref() {
+            stats.note_admission_refused_deliver();
+        }
+        // Close and reclaim on the spot: a session that has spent
+        // its whole-session budget has nothing further it is
+        // allowed to do, and leaving it open would make the bound
+        // advisory.
+        Self::reclaim_breached_provisional(node_id, *source, ctx);
+        Err(super::rtc::AdmissionRefusal::BudgetExhausted)
+    }
+
+    /// Close and reclaim a provisional session that breached a
+    /// whole-session bound, from the dispatch path (which holds a
+    /// `DispatchCtx`, not a `MeshNode`).
+    #[cfg(feature = "webrtc")]
+    fn reclaim_breached_provisional(node_id: u64, endpoint: PeerAddr, ctx: &DispatchCtx) {
+        ctx.peers
+            .remove_if(&node_id, |_, info| info.admission.is_provisional());
+        ctx.peer_addrs.remove_if(&node_id, |_, a| *a == endpoint);
+        ctx.addr_to_node.remove_if(&endpoint, |_, n| *n == node_id);
+        ctx.provisional_endpoints.remove(&endpoint);
+        if let Some(stats) = ctx.rtc_stats.as_ref() {
+            stats.note_admission_reclaimed();
+        }
+        if let (Some(driver), PeerAddr::Rtc(id)) = (ctx.rtc_driver.as_ref(), endpoint) {
+            let driver = driver.clone();
+            tokio::spawn(async move {
+                let _ = driver.close(id).await;
+            });
+        }
     }
 
     /// Does this peer announce itself as a `leaf` (§7, §11)?

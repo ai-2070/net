@@ -2890,6 +2890,37 @@ enum ResponseRouteFallback {
     DirectOnly,
 }
 
+/// Is this RPC RESPONSE frame carrying an **Admitted**
+/// `JoinOutcome`?
+///
+/// `Some(true)` admitted, `Some(false)` rejected, `None` when the
+/// frame is not a readable enrollment outcome — which promotes
+/// nothing, because an unreadable verdict is not an admission.
+///
+/// Reads the versioned wire form directly (`b"NMO1"` + tag) rather
+/// than depending on the SDK type: the core cannot link the SDK,
+/// and the encoding is a pinned, self-describing one.
+#[cfg(feature = "webrtc")]
+fn enrollment_outcome_is_admitted(frame: &Bytes) -> Option<bool> {
+    /// `OUTCOME_MAGIC` from `sdk/src/enrollment.rs`.
+    const OUTCOME_MAGIC: [u8; 4] = *b"NMO1";
+    if frame.len() < RPC_FRAME_BODY_OFFSET {
+        return None;
+    }
+    let payload = RpcResponsePayload::decode(frame.slice(RPC_FRAME_BODY_OFFSET..)).ok()?;
+    let body = payload.body.as_ref();
+    if body.len() < OUTCOME_MAGIC.len() + 1 || body[..OUTCOME_MAGIC.len()] != OUTCOME_MAGIC {
+        return None;
+    }
+    match body[OUTCOME_MAGIC.len()] {
+        0 => Some(true),
+        1 => Some(false),
+        // An unknown tag is a version this anchor does not
+        // understand. Refusing to promote is the safe reading.
+        _ => None,
+    }
+}
+
 // The reply-channel triple (`reply_channel`, `reply_channel_hash`,
 // `reply_stream_id`) is deliberately passed pre-split rather than bundled:
 // PERF_AUDIT §3.10 computes and caches the hash + stream_id per caller so
@@ -2919,15 +2950,15 @@ async fn publish_response_to_caller(
     // incarnation captured when the REQUEST was decoded, re-checked
     // inside `promote_admission`. Keyed on the reply channel, so no
     // other service's response can promote anything.
-    #[cfg(feature = "webrtc")]
-    if let Some(node_id) = target_hint {
-        if mesh.promote_on_enrollment_response(node_id, reply_channel.as_str()) {
-            tracing::debug!(
-                node_id = format!("{node_id:#x}"),
-                "§12: enrollment succeeded; session promoted"
-            );
-        }
-    }
+    //
+    // **Only an ADMITTED outcome promotes.** `JoinOutcome`'s wire
+    // form is self-describing — `b"NMO1"` then a tag byte, `0`
+    // Admitted, `1` Rejected (`sdk/src/enrollment.rs`) — so the
+    // anchor can read the verdict it is about to send without any
+    // SDK surface change. Promoting on *any* response was a
+    // security defect: a rejected enrollment (wrong nonce, expired
+    // invite) would have been admitted to the mesh by the very
+    // message that refused it.
     // A `DirectOnly` frame trusts ONLY the explicit `target_hint` (the
     // AEAD-authenticated session peer): it must never resolve a
     // destination through the origin reverse-index, which could point at
@@ -2940,6 +2971,58 @@ async fn publish_response_to_caller(
             target_hint.or_else(|| mesh.get_node_by_origin_hash(caller_origin))
         }
     };
+    // §12 step 4: an enrollment RESPONSE leaving this anchor
+    // promotes the session that asked for it — the exact
+    // incarnation captured when the REQUEST was decoded, re-checked
+    // inside `promote_admission`. Keyed on the reply channel, so no
+    // other service's response can promote anything.
+    //
+    // **Only an ADMITTED outcome promotes.** `JoinOutcome`'s wire
+    // form is self-describing — `b"NMO1"` then a tag byte, `0`
+    // Admitted, `1` Rejected (`sdk/src/enrollment.rs`) — so the
+    // anchor reads the verdict it is about to send without any SDK
+    // surface change. Promoting on *any* response was a security
+    // defect: a rejected enrollment (wrong nonce, expired invite)
+    // would have been admitted to the mesh by the very message that
+    // refused it.
+    //
+    // A browser's first call arrives before the anchor has pinned
+    // any identity for it, so `target_hint` can be `None` and the
+    // origin reverse-index empty; the provisional peer bound to
+    // this reply channel's origin is the third resolution. Breadth
+    // here is safe: `promote_admission` re-verifies the session id
+    // AND the endpoint captured at REQUEST decode.
+    #[cfg(feature = "webrtc")]
+    if let Some(node_id) =
+        resolved.or_else(|| mesh.provisional_node_for_reply_channel(reply_channel.as_str()))
+    {
+        match enrollment_outcome_is_admitted(&payload) {
+            Some(true) => {
+                if mesh.promote_on_enrollment_response(node_id, reply_channel.as_str()) {
+                    tracing::debug!(
+                        node_id = format!("{node_id:#x}"),
+                        "§12: enrollment admitted; session promoted"
+                    );
+                }
+            }
+            Some(false) => {
+                // A refusal leaves the session Provisional — it
+                // expires on its own 30 s clock — and is counted, so
+                // an operator sees refusals rather than inferring
+                // them from an absence of promotions.
+                mesh.note_enrollment_rejected(node_id, reply_channel.as_str());
+                tracing::debug!(
+                    node_id = format!("{node_id:#x}"),
+                    "§12: enrollment rejected; session stays provisional"
+                );
+            }
+            // Not an enrollment response, or a body this anchor
+            // cannot read as one: promote nothing. An unreadable
+            // verdict is not an admission.
+            None => {}
+        }
+    }
+
     // R2-6: attempt the direct send and branch on the ATOMIC typed
     // outcome, eliminating the `has_peer_session`-then-`publish` TOCTOU
     // that AV-5 used. `try_publish_to_peer` makes the session-existence

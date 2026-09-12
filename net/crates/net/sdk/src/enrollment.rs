@@ -2023,4 +2023,29 @@ mod tests {
             .chars()
             .all(|c| c == '-' || c.is_ascii_hexdigit() && !c.is_ascii_lowercase()));
     }
+
+    /// The core's §12 promotion gate (`mesh_rpc.rs`,
+    /// `enrollment_outcome_is_admitted`) reads this encoding
+    /// directly — it cannot link the SDK — so the prefix is a
+    /// cross-crate contract, not an implementation detail. Drift
+    /// here would silently un-gate promotion: an unreadable verdict
+    /// promotes nothing, so *every* enrollment would stop promoting
+    /// (fail-closed, but broken).
+    #[test]
+    fn join_outcome_wire_prefix_is_what_the_core_promotion_gate_reads() {
+        let admitted = JoinOutcome::Admitted {
+            chain: vec![1, 2, 3],
+        }
+        .to_bytes();
+        assert_eq!(&admitted[..4], b"NMO1");
+        assert_eq!(admitted[4], 0, "tag 0 is the only value that promotes");
+
+        let rejected = JoinOutcome::Rejected {
+            code: 7,
+            message: "expired invite".into(),
+        }
+        .to_bytes();
+        assert_eq!(&rejected[..4], b"NMO1");
+        assert_eq!(rejected[4], 1, "tag 1 must leave the session provisional");
+    }
 }

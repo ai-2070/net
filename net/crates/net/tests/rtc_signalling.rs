@@ -37,7 +37,13 @@ async fn node(rtc: Option<RtcConfig>) -> Arc<MeshNode> {
 }
 
 fn rtc_config() -> RtcConfig {
-    RtcConfig::new().with_bind_addr("127.0.0.1:0".parse().expect("addr"))
+    RtcConfig {
+        // Production's 10 s is not a test's patience, and the §9
+        // witness needs the *expiry* path (step 6) to be reached
+        // deterministically rather than raced.
+        ice_deadline: Duration::from_secs(2),
+        ..RtcConfig::new().with_bind_addr("127.0.0.1:0".parse().expect("addr"))
+    }
 }
 
 async fn connect_udp(a: &Arc<MeshNode>, b: &Arc<MeshNode>) {
@@ -406,7 +412,33 @@ async fn the_full_section_9_sequence_with_the_three_part_witness() {
         "the routed session must quiesce before replacement"
     );
 
+    let attempts_before = a.rtc_stats().ice_attempted();
     let _dialog = a.offer_direct_path(b_id).await.expect("offer sent");
+    assert_eq!(
+        a.rtc_stats().ice_attempted(),
+        attempts_before + 1,
+        "the offer opens a real local endpoint and counts the ICE attempt"
+    );
+    // Two loopback nodes cannot complete ICE against each other, so
+    // the dialog's own endpoint must reach its §9 step 6 end —
+    // `ice_deadline` expiry, counted as `ice_relayed` — before the
+    // fixture installs the pair. Otherwise the abandoned endpoint
+    // and the fixture's race for the same peer, and which one the
+    // driver reaps is a coin flip (observed: this witness failed 4
+    // runs in 5 in isolation).
+    assert!(
+        wait_for(
+            || a.rtc_stats().ice_relayed() >= 1,
+            Duration::from_secs(15)
+        )
+        .await,
+        "§9 step 6: an attempt that never connects expires and is counted as          relayed — the pair stays on the anchor"
+    );
+    assert!(
+        a.peer_session_id(b_id).is_some(),
+        "§9 step 6: an expired attempt must NOT touch the routed session"
+    );
+
     let (id_a, _id_b) = connect_rtc_loopback(&a, &b)
         .await
         .expect("DataChannel + Noise replacing the routed session");

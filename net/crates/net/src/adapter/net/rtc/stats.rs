@@ -35,6 +35,7 @@ pub struct RtcStats {
     admission_refused_announce: AtomicU64,
     admission_refused_deliver: AtomicU64,
     admission_promoted: AtomicU64,
+    admission_rejected_outcome: AtomicU64,
     admission_reclaimed: AtomicU64,
     signal_over_budget: AtomicU64,
     signal_forwarded: AtomicU64,
@@ -151,6 +152,11 @@ impl RtcStats {
         admission_promoted,
         note_admission_promoted,
         "Provisional sessions promoted by the enrollment handler, bound to the exact live session incarnation."
+    );
+    counter!(
+        admission_rejected_outcome,
+        note_admission_rejected_outcome,
+        "Enrollment exchanges whose `JoinOutcome` was Rejected. The session stays provisional — promoting on any response would have admitted a peer by the very message that refused it."
     );
     counter!(
         admission_reclaimed,

@@ -10,9 +10,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use net::adapter::net::rtc::{
     allow_provisional_action, connect_rtc_loopback, enroll_reply_channel, AdmissionRefusal,
-    BootstrapAction, RtcConfig, RtcSignalMsg, ENROLL_SERVICE, RENEWAL_SERVICE,
+    BootstrapAction, RtcConfig, RtcSignalMsg, ENROLL_SERVICE, MAX_PROVISIONAL_FRAMES,
+    RENEWAL_SERVICE,
 };
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, PeerAddr, SocketBufferConfig};
 use net::event::{batch_process_nonce, Batch, InternalEvent};
@@ -478,4 +480,241 @@ async fn a_non_bootstrap_node_installs_rtc_sessions_as_admitted() {
     a.send_to_peer_node(b.node_id(), &batch(0, 2, "native"))
         .await
         .expect("send");
+}
+
+/// The enrollment-outcome bytes the anchor reads, in `JoinOutcome`'s
+/// pinned wire form (`sdk/src/enrollment.rs`: `b"NMO1"`, then `0`
+/// Admitted / `1` Rejected). The SDK side pins this same prefix in
+/// `join_outcome_wire_prefix_is_what_the_core_promotion_gate_reads`,
+/// so a drift in either direction is a failing test rather than a
+/// silently un-gated promotion.
+#[cfg(feature = "cortex")]
+fn outcome_bytes(admitted: bool) -> Bytes {
+    let mut buf = Vec::from(*b"NMO1");
+    if admitted {
+        buf.push(0);
+        let chain = b"delegation-chain";
+        buf.extend_from_slice(&(chain.len() as u32).to_le_bytes());
+        buf.extend_from_slice(chain);
+    } else {
+        buf.push(1);
+        buf.extend_from_slice(&7u32.to_le_bytes());
+        let msg = b"invite expired";
+        buf.extend_from_slice(&(msg.len() as u32).to_le_bytes());
+        buf.extend_from_slice(msg);
+    }
+    Bytes::from(buf)
+}
+
+/// An enrollment service that answers with a fixed outcome.
+#[cfg(feature = "cortex")]
+struct FixedOutcome(bool);
+
+#[cfg(feature = "cortex")]
+#[async_trait::async_trait]
+impl net::adapter::net::cortex::RpcHandler for FixedOutcome {
+    async fn call(
+        &self,
+        _ctx: net::adapter::net::cortex::RpcContext,
+    ) -> Result<
+        net::adapter::net::cortex::RpcResponsePayload,
+        net::adapter::net::cortex::RpcHandlerError,
+    > {
+        Ok(net::adapter::net::cortex::RpcResponsePayload {
+            status: net::adapter::net::cortex::RpcStatus::Ok,
+            headers: vec![],
+            body: outcome_bytes(self.0),
+        })
+    }
+}
+
+/// WITNESS 7: **only an admitted outcome promotes.** A provisional
+/// client runs the whole permitted enrollment call against a real
+/// handler on the anchor; when the handler's `JoinOutcome` is
+/// `Rejected`, the session that asked must still be provisional
+/// afterwards, and the refusal must be counted.
+///
+/// Promoting on *any* response would have admitted a peer to the
+/// mesh by the very message that refused it.
+#[cfg(feature = "cortex")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_rejected_enrollment_outcome_promotes_nothing() {
+    use net::adapter::net::mesh_rpc::CallOptions;
+
+    let (anchor, client, _endpoint) = anchor_and_provisional_client().await;
+    let client_id = client.node_id();
+    let _serve = anchor
+        .serve_rpc(ENROLL_SERVICE, Arc::new(FixedOutcome(false)))
+        .expect("serve the enrollment service");
+
+    let reply = client
+        .call(
+            anchor.node_id(),
+            ENROLL_SERVICE,
+            Bytes::from_static(b"join request"),
+            CallOptions::default(),
+        )
+        .await
+        .expect("the allow-list permits exactly this call");
+    assert_eq!(
+        reply.body.as_ref(),
+        outcome_bytes(false).as_ref(),
+        "the refusal itself must reach the client — it is a response, not a drop"
+    );
+
+    assert!(
+        anchor.peer_is_provisional(client_id),
+        "a Rejected outcome leaves the session provisional"
+    );
+    assert_eq!(
+        anchor.rtc_stats().admission_promoted(),
+        0,
+        "nothing was admitted"
+    );
+    assert!(
+        wait_for(
+            || anchor.rtc_stats().admission_rejected_outcome() == 1,
+            Duration::from_secs(10)
+        )
+        .await,
+        "the refusal is counted, not merely an absence of promotion"
+    );
+    assert_eq!(
+        anchor.provisional_count(),
+        1,
+        "the projection the forwarding gates read must still refuse this peer"
+    );
+}
+
+/// The positive control for witness 7, on the same real path: the
+/// identical exchange with an **Admitted** outcome does promote.
+/// Without this, "nothing promotes" would also pass on a node whose
+/// promotion is simply broken.
+#[cfg(feature = "cortex")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn an_admitted_enrollment_outcome_promotes_the_session() {
+    use net::adapter::net::mesh_rpc::CallOptions;
+
+    let (anchor, client, _endpoint) = anchor_and_provisional_client().await;
+    let client_id = client.node_id();
+    let _serve = anchor
+        .serve_rpc(ENROLL_SERVICE, Arc::new(FixedOutcome(true)))
+        .expect("serve the enrollment service");
+
+    client
+        .call(
+            anchor.node_id(),
+            ENROLL_SERVICE,
+            Bytes::from_static(b"join request"),
+            CallOptions::default(),
+        )
+        .await
+        .expect("the allow-list permits exactly this call");
+
+    assert!(
+        wait_for(
+            || !anchor.peer_is_provisional(client_id),
+            Duration::from_secs(10)
+        )
+        .await,
+        "an Admitted outcome promotes the session that asked"
+    );
+    assert_eq!(anchor.rtc_stats().admission_promoted(), 1);
+    assert_eq!(anchor.rtc_stats().admission_rejected_outcome(), 0);
+}
+
+/// WITNESS 8: the whole-session **frame** bound is enforced on the
+/// live ingress path, not merely defined. The 257th inbound frame
+/// from a provisional peer closes and reclaims the session (§12
+/// step 5) rather than being clamped or silently counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn the_provisional_frame_bound_closes_the_session() {
+    let (anchor, client, _endpoint) = anchor_and_provisional_client().await;
+    let client_id = client.node_id();
+    let before = anchor.rtc_stats().admission_reclaimed();
+
+    // Small frames: the byte bound cannot be what fires here.
+    for i in 0..(MAX_PROVISIONAL_FRAMES as usize + 8) {
+        if client
+            .send_to_peer_node(anchor.node_id(), &batch(0, 1, "budget"))
+            .await
+            .is_err()
+        {
+            break;
+        }
+        if i % 32 == 0 && !anchor.peer_is_provisional(client_id) {
+            break;
+        }
+    }
+
+    assert!(
+        wait_for(
+            || anchor.rtc_stats().admission_reclaimed() > before,
+            Duration::from_secs(10)
+        )
+        .await,
+        "breaching the whole-session frame bound closes and reclaims the session"
+    );
+    assert_eq!(
+        anchor.provisional_count(),
+        0,
+        "the reclaimed session leaves the projection the gates read"
+    );
+    assert!(
+        !anchor.peer_is_provisional(client_id),
+        "the peer is gone, not still provisional"
+    );
+}
+
+/// WITNESS 8b: the **byte** bound is a separate axis. Far fewer than
+/// 256 frames, each large enough that 256 KiB is crossed first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn the_provisional_byte_bound_closes_the_session() {
+    let (anchor, client, _endpoint) = anchor_and_provisional_client().await;
+    let client_id = client.node_id();
+    let before = anchor.rtc_stats().admission_reclaimed();
+
+    // ~6 KiB of payload per frame: the 256 KiB bound is crossed
+    // around frame 45, an order of magnitude under the frame bound.
+    let bulk = "b".repeat(6 * 1024);
+    let mut frames = 0usize;
+    while frames < 96 {
+        let events = vec![net::event::InternalEvent::from_value(
+            serde_json::json!({ "bulk": bulk }),
+            frames as u64,
+            0,
+        )];
+        let heavy = Batch {
+            shard_id: 0,
+            events,
+            sequence_start: 0,
+            process_nonce: batch_process_nonce(),
+        };
+        if client
+            .send_to_peer_node(anchor.node_id(), &heavy)
+            .await
+            .is_err()
+        {
+            break;
+        }
+        frames += 1;
+        if !anchor.peer_is_provisional(client_id) {
+            break;
+        }
+    }
+
+    assert!(
+        wait_for(
+            || anchor.rtc_stats().admission_reclaimed() > before,
+            Duration::from_secs(10)
+        )
+        .await,
+        "breaching the whole-session byte bound closes and reclaims the session"
+    );
+    assert!(
+        frames < MAX_PROVISIONAL_FRAMES as usize,
+        "the BYTE bound must be what fired: {frames} frames sent, bound is \
+         {MAX_PROVISIONAL_FRAMES}"
+    );
+    assert!(!anchor.peer_is_provisional(client_id));
 }

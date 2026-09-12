@@ -4632,7 +4632,7 @@ jobs:
           check_floor rtc_repairs 18
           check_floor rtc_routed_restore 4
           check_floor rtc_signalling 6
-          check_floor rtc_admission 9
+          check_floor rtc_admission 13
           REQUIRED="
           rtc_repairs:scheduled_fire_and_forget_packets_reach_rtc_admission_and_the_peer
           rtc_repairs:the_scheduler_drain_counts_what_it_drops_under_pressure
@@ -4667,6 +4667,10 @@ jobs:
           rtc_admission:an_admitted_peer_without_authority_is_still_denied
           rtc_admission:a_provisional_rejecter_never_triggers_a_corrective_reannounce
           rtc_admission:pingwave_is_denied_while_heartbeat_is_permitted
+          rtc_admission:a_rejected_enrollment_outcome_promotes_nothing
+          rtc_admission:an_admitted_enrollment_outcome_promotes_the_session
+          rtc_admission:the_provisional_frame_bound_closes_the_session
+          rtc_admission:the_provisional_byte_bound_closes_the_session
           "
           for entry in $REQUIRED; do
             bin="${entry%%:*}"
