@@ -1,0 +1,91 @@
+diff --git a/net/crates/net/src/adapter/net/mesh.rs b/net/crates/net/src/adapter/net/mesh.rs
+index 31eb70437..629b15197 100644
+--- a/net/crates/net/src/adapter/net/mesh.rs
++++ b/net/crates/net/src/adapter/net/mesh.rs
+@@ -56483,3 +56483,8 @@ mod stream_handle_contract_tests {
+         );
+     }
+ }
++
++#[cfg(all(feature="webrtc",any(test,feature="fixtures")))]
++impl MeshNode {
++ pub fn kyra_has_enrollment_reservation(&self,node:u64,session:u64,call:u64)->bool {self.pending_promotions.contains_key(&(node,session,call))}
++}
+diff --git a/net/crates/net/src/adapter/net/mesh_rpc.rs b/net/crates/net/src/adapter/net/mesh_rpc.rs
+index 675c6a91a..fee9299f0 100644
+--- a/net/crates/net/src/adapter/net/mesh_rpc.rs
++++ b/net/crates/net/src/adapter/net/mesh_rpc.rs
+@@ -10996,3 +10996,46 @@ mod roster_fallback_tests {
+         );
+     }
+ }
++
++#[cfg(any(test, feature="fixtures"))]
++impl MeshNode {
++    pub async fn kyra_publish_fixed_request(
++        self: &Arc<Self>,
++        call_id: u64,
++        target_node_id: u64,
++        service: &str,
++        body: Bytes,
++    ) -> Result<(), AdapterError> {
++        let route = self
++            .rpc_route_or_no_route(target_node_id, service)
++            .map_err(|e| AdapterError::Connection(format!("{e}")))?;
++        let req = RpcRequestPayload {
++            service: service.to_string(),
++            deadline_ns: 0,
++            flags: 0,
++            headers: Vec::new(),
++            body,
++        };
++        let meta = EventMeta::new(
++            DISPATCH_RPC_REQUEST,
++            0,
++            self.identity_origin_hash(),
++            call_id,
++            0,
++        );
++        let mut buf = Vec::with_capacity(EVENT_META_SIZE + RPC_ROUTE_V1_SIZE + req.encoded_len());
++        buf.extend_from_slice(&meta.to_bytes());
++        encode_rpc_route(&mut buf, route.request_channel_hash);
++        req.encode_into(&mut buf);
++        let payload = Bytes::from(buf);
++        self.publish_to_peer(
++            target_node_id,
++            route.request_channel_hash,
++            route.request_stream_id,
++            true,
++            std::slice::from_ref(&payload),
++        )
++        .await
++    }
++
++}
+diff --git a/net/crates/net/tests/rtc_signalling.rs b/net/crates/net/tests/rtc_signalling.rs
+index 4fdfe2bcd..1e06d9ace 100644
+--- a/net/crates/net/tests/rtc_signalling.rs
++++ b/net/crates/net/tests/rtc_signalling.rs
+@@ -732,3 +732,22 @@ async fn a_failed_allocation_holds_no_dialog_reservation() {
+         "and nothing may be counted as over budget"
+     );
+ }
++
++#[tokio::test(flavor="multi_thread",worker_threads=6)]
++async fn kyra_unknown_candidates_cannot_own_dialog_budget(){
++ let (a,b)=signalling_pair().await;let before=b.rtc_stats().signal_delivered();
++ for dialog in 0x701..0x705 {a.send_rtc_signal(b.node_id(),&RtcSignalMsg::Candidate{mid:"0".into(),dialog,candidate:"candidate:1 1 udp 2130706431 127.0.0.1 4444 typ host".into()}).await.unwrap();}
++ assert!(wait_for(|| b.rtc_stats().signal_delivered()>=before+4,Duration::from_secs(3)).await,"four frames really received");
++ tokio::time::sleep(Duration::from_secs(3)).await;
++ let slots=b.open_signal_dialogs(a.node_id());eprintln!("KYRA_UNKNOWN_CANDIDATES received=4 past_ice_deadline=true phantom_budget_slots={slots}");
++ assert_eq!(slots,0,"ignored unknown candidates have no engine owner but retain reservations");
++}
++#[test]
++fn kyra_reject_then_late_candidate_does_not_resurrect_reservation(){
++ use net::adapter::net::rtc::{SignalBudget,RtcRejectReason};let mut b=SignalBudget::new();let now=std::time::Instant::now();
++ b.note_outbound_dialog(7,42);
++ b.admit(7,&RtcSignalMsg::Reject{dialog:42,reason:RtcRejectReason::Declined},now);
++ assert_eq!(b.open_dialogs(7),0);
++ b.admit(7,&RtcSignalMsg::Candidate{mid:"0".into(),dialog:42,candidate:"late".into()},now);
++ eprintln!("KYRA_LATE_CANDIDATE rejected_dialog_recreated={}",b.open_dialogs(7));assert_eq!(b.open_dialogs(7),0,"late candidate resurrected retired budget id");
++}
