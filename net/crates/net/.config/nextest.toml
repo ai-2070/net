@@ -97,5 +97,5 @@ retries = 0
 # any of them. A genuine flake here is a defect in the transport or
 # in the witness, and either way it must be seen.
 [[profile.default.overrides]]
-filter = 'binary(rtc_loopback) or binary(rtc_backpressure) or binary(rtc_repairs) or binary(rtc_routed_restore) or binary(rtc_signalling) or binary(rtc_admission) or binary(rtc_install_race) or binary(rtc_reclaim)'
+filter = 'binary(rtc_loopback) or binary(rtc_backpressure) or binary(rtc_repairs) or binary(rtc_routed_restore) or binary(rtc_signalling) or binary(rtc_admission) or binary(rtc_install_race) or binary(rtc_reclaim) or binary(rtc_classifier)'
 retries = 0

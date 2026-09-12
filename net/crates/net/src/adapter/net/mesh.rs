@@ -40065,18 +40065,21 @@ impl MeshNode {
         self.rtc_driver.as_ref()
     }
 
-    /// Is this peer reached over a DataChannel?
+    /// Does this peer **own** a DataChannel attachment to us?
     ///
-    /// The Stage 3 signal for [`PairAction::Ice`](super::traversal::classify::PairAction::Ice):
-    /// the installed endpoint. The announcement's `transport:rtc` tag
-    /// is Stage 4's, so a peer we have never had a session with is
-    /// classified by the classic matrix — which is correct, because
-    /// without an RTC session there is nothing for ICE to own.
+    /// Target-owned direct attachment, never a routed session's
+    /// relay endpoint (H4). `PeerInfo::addr()` is where datagrams
+    /// *go*, which for a routed peer is the relay: in
+    /// X —UDP— R —RTC— Y, Y's routed session to X has an RTC next
+    /// hop, and reading the send endpoint classified **X** as
+    /// `Ice` — marking X's native upgrade done although ICE had only
+    /// negotiated Y↔R. Only `Direct { owned: PeerAddr::Rtc(_) }` is
+    /// evidence about the target itself.
     #[cfg(feature = "webrtc")]
-    fn peer_endpoint_is_rtc(&self, peer_node_id: u64) -> bool {
+    fn peer_owns_rtc_attachment(&self, peer_node_id: u64) -> bool {
         self.peers
             .get(&peer_node_id)
-            .is_some_and(|p| matches!(p.value().addr(), PeerAddr::Rtc(_)))
+            .is_some_and(|p| matches!(p.value().transport.owned_addr(), Some(PeerAddr::Rtc(_))))
     }
 
     /// Does this peer's most recent announcement carry
@@ -40127,10 +40130,16 @@ impl MeshNode {
         // point of §5 Layer 1 — the pair learns it can use ICE from
         // discovery, before either side has a DataChannel, which is
         // exactly when the decision matters.
+        //
+        // H4: it is a property of **this pair**, so both ends must
+        // carry it. Our own driver alone is not evidence about the
+        // target, and neither is a relay we happen to reach over
+        // RTC — only the target's own direct attachment or its
+        // announced `transport:rtc` tag.
         #[cfg(feature = "webrtc")]
-        let rtc_side = self.peer_endpoint_is_rtc(peer_node_id)
-            || self.config.rtc.is_some()
-            || self.peer_announces_rtc(peer_node_id);
+        let rtc_side = self.config.rtc.is_some()
+            && (self.peer_owns_rtc_attachment(peer_node_id)
+                || self.peer_announces_rtc(peer_node_id));
         #[cfg(not(feature = "webrtc"))]
         let rtc_side = false;
         super::traversal::classify::pair_action_with_transport(
@@ -40138,6 +40147,16 @@ impl MeshNode {
             self.peer_nat_class(peer_node_id),
             rtc_side,
         )
+    }
+
+    /// The pair action this node would take for `peer_node_id`
+    /// (H4 witness).
+    #[cfg(all(feature = "nat-traversal", any(test, feature = "fixtures")))]
+    pub fn pair_action_for_test(
+        &self,
+        peer_node_id: u64,
+    ) -> super::traversal::classify::PairAction {
+        self.pair_action_for(peer_node_id)
     }
 
     /// Read a peer's most recently advertised NAT classification

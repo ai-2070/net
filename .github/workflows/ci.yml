@@ -4570,13 +4570,14 @@ jobs:
         if: ${{ !cancelled() }}
         run: >
           cargo nextest run --no-fail-fast --no-tests=fail --retries 0
-          --features "webrtc fixtures cortex"
+          --features "webrtc fixtures cortex nat-traversal"
           --test rtc_loopback
           --test rtc_backpressure
           --test rtc_repairs
           --test rtc_routed_restore
           --test rtc_install_race
           --test rtc_reclaim
+          --test rtc_classifier
           --test rtc_signalling
           --test rtc_admission
 
@@ -4604,7 +4605,7 @@ jobs:
         run: |
           set -euo pipefail
           list() {
-            cargo nextest list --features "webrtc fixtures cortex" \
+            cargo nextest list --features "webrtc fixtures cortex nat-traversal" \
               --test "$1" --message-format json 2>/dev/null \
               | python3 -c "import json,sys;d=json.load(sys.stdin);s=d.get('rust-suites',{}).get('net-mesh::$1',{});print(chr(10).join(sorted(s.get('testcases',{}))))"
           }
@@ -4616,7 +4617,7 @@ jobs:
           if [ "$probe" -eq 0 ]; then
             echo "::error::witness-inventory parser returned nothing for rtc_loopback — \
           the nextest list format changed; fix the parser before trusting any floor"
-            cargo nextest list --features "webrtc fixtures cortex" --test rtc_loopback | head -20
+            cargo nextest list --features "webrtc fixtures cortex nat-traversal" --test rtc_loopback | head -20
             exit 1
           fi
           echo "parser self-check: rtc_loopback lists $probe tests"
@@ -4631,10 +4632,11 @@ jobs:
           }
           check_floor rtc_loopback 5
           check_floor rtc_backpressure 7
-          check_floor rtc_repairs 18
+          check_floor rtc_repairs 21
           check_floor rtc_routed_restore 4
           check_floor rtc_install_race 6
           check_floor rtc_reclaim 4
+          check_floor rtc_classifier 1
           check_floor rtc_signalling 6
           check_floor rtc_admission 13
           REQUIRED="
@@ -4656,6 +4658,9 @@ jobs:
           rtc_repairs:the_advisory_refreshes_for_a_queued_peer_the_pump_never_touches
           rtc_repairs:a_connection_reset_is_swallowed_by_the_production_arm_with_siblings_intact
           rtc_repairs:a_busy_peer_cannot_starve_a_sibling_or_the_socket
+          rtc_repairs:a_stalled_driver_is_aborted_and_joined_before_shutdown_returns
+          rtc_repairs:two_concurrent_joiners_both_observe_completed_teardown
+          rtc_repairs:dropping_a_node_tears_down_the_transport_not_just_the_socket
           rtc_routed_restore:routed_then_direct_then_loss_then_manually_restored_routed
           rtc_routed_restore:an_nrpc_call_round_trips_over_the_datachannel
           rtc_routed_restore:a_capability_fold_applies_a_remote_fact_received_over_rtc
@@ -4668,6 +4673,7 @@ jobs:
           rtc_reclaim:a_cancelled_responder_does_not_strand_or_remove_a_successor
           rtc_reclaim:closing_an_endpoint_clears_its_handshake_registration
           rtc_reclaim:a_close_the_channel_refused_is_re_delivered_not_dropped
+          rtc_classifier:an_rtc_relay_does_not_make_a_udp_target_an_ice_pair
           rtc_signalling:signalling_crosses_an_anchor_that_cannot_read_it
           rtc_signalling:the_full_section_9_sequence_with_the_three_part_witness
           rtc_signalling:over_budget_signalling_is_dropped_and_counted
