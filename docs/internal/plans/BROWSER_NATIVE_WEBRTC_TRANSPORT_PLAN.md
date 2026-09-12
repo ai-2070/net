@@ -2154,6 +2154,28 @@ bound, the 10 s enrollment deadline with handler cancellation, subscribe
 nonce/retry bounds and incarnation-keyed signal queues remain contract
 obligations unless an explicit policy is proposed to the owner.
 
+**4a second-round candidate `c44633c36` (docs `091c99424`) — verified,
+forwarded to Kyra; product owner authorizes Stage 4b on top.**
+`S4A_REPORT.md` §13. Kyra's five new probes landed verbatim; the red
+CI witness diagnosed as R5-A (B's trailing trickled Candidate for a
+dialog A had already rejected re-created the owner) — reviewer confirms:
+with Answer/Candidate creating owners again, both new signalling probes
+**and** `a_reject_for_our_own_offer_correlates_and_releases` go red.
+R2-A one exact `(node, incarnation, call)` owner (inverse red); R3-A
+rollback on refusal and retirement on every terminal path; R1-A lock
+recursion removed, migration gate, client-streaming/duplex witnesses;
+R3-B one conditional teardown transition; R4-A attempt ownership,
+absolute deadline, weak node, shutdown select; R6-A structural outcome
+parsing; R6-B reply routed by the call's owner; R7 SDK CI step with
+`--features "net webrtc"` (previously zero tests selected). Reviewer
+quick verification: 101/101 ×2 at retries 0; all 13 Kyra probes; SDK RTC
+2/2 under the right features; `--lib` 5779/5811; all-targets clippy.
+**Owner-pending policy proposals** (§13.4): install-time
+`max_provisional`, aggregate bootstrap-byte ledger, enrollment deadline
+with handler cancellation, subscribe bounds, incarnation-keyed signal
+queues — not implemented, not waived. Stage 4b brief:
+`spikes/S4B_BRIEF.md`.
+
 ## Stage 5 — `net-leaf` + `@net-mesh/browser`
 
 - Leaf crate and TypeScript wrapper; identity storage and leader election
