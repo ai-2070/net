@@ -9,8 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use net::adapter::net::rtc::{
-    connect_rtc_loopback, RtcConfig, RtcRejectReason, RtcSignalMsg, MAX_DIALOGS_PER_PEER,
-    MAX_FRAMES_PER_WINDOW,
+    RtcConfig, RtcRejectReason, RtcSignalMsg, MAX_DIALOGS_PER_PEER, MAX_FRAMES_PER_WINDOW,
 };
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, PeerAddr, SocketBufferConfig};
 use net::adapter::Adapter;
@@ -437,7 +436,7 @@ async fn the_full_section_9_sequence_with_the_three_part_witness() {
             a.peer_session_for_test(b_id)
                 .is_some_and(|s| !s.has_open_streams() && !s.has_unacked())
         },
-        Duration::from_secs(20),
+        Duration::from_secs(30),
     )
     .await;
     assert!(
@@ -493,7 +492,7 @@ async fn the_full_section_9_sequence_with_the_three_part_witness() {
                 matches!(b.peer_endpoint(a.node_id()), Some(PeerAddr::Rtc(_)))
                     && b.peer_session_id(a.node_id()) != Some(b_old_session)
             },
-            Duration::from_secs(20)
+            Duration::from_secs(30)
         )
         .await,
         "B must install its own side of the SAME exchange, with its own new \

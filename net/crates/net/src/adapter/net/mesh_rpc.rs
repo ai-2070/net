@@ -2936,8 +2936,10 @@ async fn publish_response_to_caller(
     mesh: &MeshNode,
     caller_origin: u64,
     // R2: which call this response answers. Enrollment promotion
-    // may consume only this call's own reservation.
-    call_id: u64,
+    // may consume only this call's own reservation. Read on the
+    // `webrtc` path; the parameter stays so every caller keeps
+    // threading the fact rather than re-deriving it later.
+    #[cfg_attr(not(feature = "webrtc"), allow(unused_variables))] call_id: u64,
     target_hint: Option<u64>,
     reply_channel: &ChannelName,
     reply_channel_hash: ChannelHash,
@@ -5448,20 +5450,6 @@ impl MeshNode {
         }
     }
 
-    /// Issue an RPC call to `target_node_id` for `service`.
-    ///
-    /// Phase 1 — direct entity-to-entity addressing. The caller
-    /// specifies which target to send to; service discovery (the
-    /// "find me a healthy instance of X" lookup) is Phase 2.
-    ///
-    /// Lazily subscribes the local node's `RpcClientFold` to
-    /// `<service>.replies.<self_origin>` from `target_node_id` on
-    /// the first call to that (target, service) pair. The
-    /// subscription is reused across subsequent calls.
-    ///
-    /// On `opts.deadline` expiring OR the future being dropped,
-    /// emits a CANCEL event so the server can drop the in-flight
-    /// handler.
     /// Can this node address `service` on `target` at all? Keeps
     /// the R1 witness from racing service discovery.
     /// Can this node address `service` on `target` at all?
@@ -5523,6 +5511,20 @@ impl MeshNode {
         .await
     }
 
+    /// Issue an RPC call to `target_node_id` for `service`.
+    ///
+    /// Phase 1 — direct entity-to-entity addressing. The caller
+    /// specifies which target to send to; service discovery (the
+    /// "find me a healthy instance of X" lookup) is Phase 2.
+    ///
+    /// Lazily subscribes the local node's `RpcClientFold` to
+    /// `<service>.replies.<self_origin>` from `target_node_id` on
+    /// the first call to that (target, service) pair. The
+    /// subscription is reused across subsequent calls.
+    ///
+    /// On `opts.deadline` expiring OR the future being dropped,
+    /// emits a CANCEL event so the server can drop the in-flight
+    /// handler.
     pub async fn call(
         self: &Arc<Self>,
         target_node_id: u64,

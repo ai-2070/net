@@ -35074,10 +35074,9 @@ impl MeshNode {
     /// over the wire, without the reconnect).
     #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
     pub fn replace_provisional_for_test(&self, node_id: u64, endpoint: PeerAddr) -> u64 {
-        let mut entry = self
-            .peers
-            .get_mut(&node_id)
-            .expect("the peer must be installed");
+        let Some(mut entry) = self.peers.get_mut(&node_id) else {
+            return 0;
+        };
         let keys = super::crypto::SessionKeys {
             tx_key: [0x11u8; 32],
             rx_key: [0x22u8; 32],
@@ -37262,6 +37261,10 @@ impl MeshNode {
         // retries on it, so first-call and post-reconnect races
         // self-heal rather than failing permanently.
         if let Some(binding) = cfg.subscriber_origin_binding {
+            #[cfg(feature = "webrtc")]
+            let bootstrap_origin = Self::bootstrap_reply_origin(channel, from_node, ctx);
+            #[cfg(not(feature = "webrtc"))]
+            let bootstrap_origin: Option<u64> = None;
             let pinned_origin = ctx
                 .peer_entity_ids
                 .get(&from_node)
@@ -37281,7 +37284,7 @@ impl MeshNode {
                 // already claimed (one session, one identity). Every
                 // other origin-bound channel still requires a pinned
                 // identity.
-                .or_else(|| Self::bootstrap_reply_origin(channel, from_node, ctx));
+                .or(bootstrap_origin);
             if !binding.authorizes(channel.as_str(), matched_prefix.as_deref(), pinned_origin) {
                 tracing::debug!(
                     from_node = format!("{:#x}", from_node),
