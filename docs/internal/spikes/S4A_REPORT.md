@@ -580,8 +580,19 @@ instruction.
 | `cargo clippy --features "webrtc fixtures cortex nat-traversal" --all-targets` (CI `-A` set) | 0 |
 | `cargo clippy -p net-mesh-sdk --features "net webrtc" --lib` | 0 |
 | `RUSTDOCFLAGS="-D warnings" cargo doc --features webrtc --no-deps` / SDK `net webrtc` | 0 / 0 |
-| `cargo test --lib --features "$UNIT_FEATURES"` / `+ webrtc` | see below |
-| Ten RTC binaries, `--no-tests=fail --retries 0`, three consecutive whole-suite runs | see below |
-| `sdk/tests/enrollment_over_rtc.rs --features "net webrtc"` | 2 passed |
-| Export checker | 568, unchanged |
-| Consumer diff since `01e4b0f20` | see below |
+| `cargo test --lib --features "$UNIT_FEATURES"` / `+ webrtc` | **5779** / **5811** passed, 0 failed, 2 ignored |
+| `cargo test --doc --features "… webrtc"` | 8 passed, 31 ignored |
+| `cargo test -p net-mesh-sdk --lib` | **292 passed** |
+| Ten RTC binaries, `--no-tests=fail --retries 0` | **101 run, 101 passed**, three consecutive whole-suite runs |
+| Per-binary counts vs CI floors | 5 / 7 / 22 / 4 / 8 / 5 / 2 / 11 / 26 / 11 = 101; every floor met (`rtc_admission` 19 → 26, `rtc_admission_probes` 8 → 11, `rtc_signalling` 9 → 11), all pinned names present |
+| `sdk/tests/enrollment_over_rtc.rs --features "net webrtc"` | 2 passed — and now run by CI, which never ran them before |
+| Export checker on CI's `net-ffi/test-helpers` release build | `net.dll: export set matches the baseline`, **568** (self-test: add / remove / rename each rejected) |
+| Consumer diff since `01e4b0f20` | `go`, `sdk-ts`, `sdk-py`, `bindings`, `include`: **untouched**. `sdk/`: `Cargo.toml` +6, `src/mesh_rpc.rs` +84, `src/mesh_enroll.rs` +32/-20, `src/mesh.rs` +24, `src/enrollment.rs` +25, `tests/enrollment_over_rtc.rs` +207 (new) — all first-round, unchanged this round |
+| Files changed since `7fccb155c` | `ci.yml`, the report, five core sources, five test files, the spike/probe drops — no `include/`, `bindings/`, `go/`, or `extern "C"` definition, so the export set could not move |
+
+One process note, recorded because it is the same class of gap the
+repo's own checklist warns about: R2-A's widened emitter signature
+and session-qualified key broke three **test targets** that
+`cargo check --lib` never builds. It was caught by
+`--all-targets` clippy in this sweep and fixed in `c44633c36` —
+`--lib` green is not a green branch.
