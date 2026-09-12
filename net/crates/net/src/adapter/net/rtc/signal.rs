@@ -278,6 +278,24 @@ impl SignalBudget {
         }
     }
 
+    /// Record a dialog **we** offered (R5).
+    ///
+    /// The offerer's dialog lives in our outbound state, so an
+    /// immediate `Reject` for it used to be refused as
+    /// `UnknownDialog` — leaving our own offer alive until its
+    /// timeout. Tracking it here costs the same slot the answer or
+    /// candidate would have taken a moment later.
+    pub fn note_outbound_dialog(&mut self, to_node: u64, dialog: u64) {
+        let state = self.senders.entry(to_node).or_insert_with(|| SenderState {
+            dialogs: Vec::new(),
+            window_started: Instant::now(),
+            frames_in_window: 0,
+        });
+        if !state.dialogs.contains(&dialog) && state.dialogs.len() < MAX_DIALOGS_PER_PEER {
+            state.dialogs.push(dialog);
+        }
+    }
+
     /// End a dialog locally — an `ice_deadline` expiry, or our own
     /// `Reject`. Releases the slot so the peer may open another.
     pub fn end_dialog(&mut self, from_node: u64, dialog: u64) {

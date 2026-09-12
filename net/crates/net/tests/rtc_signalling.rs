@@ -99,6 +99,23 @@ async fn delivered_with_tag(node: &Arc<MeshNode>, tag: &str, within: Duration) -
     count
 }
 
+/// Two started RTC nodes with a direct UDP session, for the
+/// signalling-lifecycle witnesses.
+async fn signalling_pair() -> (Arc<MeshNode>, Arc<MeshNode>) {
+    let a = node(Some(rtc_config())).await;
+    let b = node(Some(rtc_config())).await;
+    let a_id = a.node_id();
+    let b_clone = Arc::clone(&b);
+    let accept = tokio::spawn(async move { b_clone.accept(a_id).await });
+    a.connect(b.local_addr(), b.public_key(), b.node_id())
+        .await
+        .expect("udp handshake");
+    accept.await.expect("accept task").expect("accept");
+    a.start_arc();
+    b.start_arc();
+    (a, b)
+}
+
 async fn wait_for<F: Fn() -> bool>(predicate: F, within: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + within;
     while tokio::time::Instant::now() < deadline {
@@ -214,27 +231,41 @@ async fn the_dialog_bound_holds_and_a_reject_ends_the_dialog() {
     let (a, _r, b) = routed_trio().await;
     let b_id = b.node_id();
 
-    for dialog in 0..MAX_DIALOGS_PER_PEER as u64 {
-        let _ = a
-            .send_rtc_signal(
-                b_id,
-                &RtcSignalMsg::Offer {
-                    dialog,
-                    sdp: "v=0".to_string(),
-                },
-            )
-            .await;
+    // R5: the offers must be REAL. A malformed SDP is a failed
+    // allocation, and a failed allocation now holds no reservation
+    // at all — so filling the bound with malformed offers would
+    // measure nothing. Each of these allocates an actual agent on
+    // the receiver, which is what the bound protects.
+    async fn real_offer(node: &Arc<MeshNode>) -> String {
+        node.rtc_driver()
+            .expect("driver")
+            .create_offer()
+            .await
+            .expect("offer")
+            .1
     }
-    let before = b.rtc_stats().signal_over_budget();
-    let _ = a
-        .send_rtc_signal(
-            b_id,
-            &RtcSignalMsg::Offer {
-                dialog: 999,
-                sdp: "v=0".to_string(),
-            },
+
+    for dialog in 0..MAX_DIALOGS_PER_PEER as u64 {
+        let sdp = real_offer(&a).await;
+        a.send_rtc_signal(b_id, &RtcSignalMsg::Offer { dialog, sdp })
+            .await
+            .expect("send offer");
+    }
+    assert!(
+        wait_for(
+            || b.open_signal_dialogs(a.node_id()) == MAX_DIALOGS_PER_PEER,
+            Duration::from_secs(10)
         )
-        .await;
+        .await,
+        "precondition: the bound is full (saw {})",
+        b.open_signal_dialogs(a.node_id())
+    );
+
+    let before = b.rtc_stats().signal_over_budget();
+    let sdp = real_offer(&a).await;
+    a.send_rtc_signal(b_id, &RtcSignalMsg::Offer { dialog: 999, sdp })
+        .await
+        .expect("send offer");
     assert!(
         wait_for(
             || b.rtc_stats().signal_over_budget() > before,
@@ -248,25 +279,27 @@ async fn the_dialog_bound_holds_and_a_reject_ends_the_dialog() {
     // A Reject for an open dialog frees its slot: the next offer is
     // admitted rather than refused.
     let refused_before = b.rtc_stats().signal_over_budget();
-    let _ = a
-        .send_rtc_signal(
-            b_id,
-            &RtcSignalMsg::Reject {
-                dialog: 0,
-                reason: RtcRejectReason::Declined,
-            },
+    a.send_rtc_signal(
+        b_id,
+        &RtcSignalMsg::Reject {
+            dialog: 0,
+            reason: RtcRejectReason::Declined,
+        },
+    )
+    .await
+    .expect("send reject");
+    assert!(
+        wait_for(
+            || b.open_signal_dialogs(a.node_id()) < MAX_DIALOGS_PER_PEER,
+            Duration::from_secs(10)
         )
-        .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let _ = a
-        .send_rtc_signal(
-            b_id,
-            &RtcSignalMsg::Offer {
-                dialog: 1000,
-                sdp: "v=0".to_string(),
-            },
-        )
-        .await;
+        .await,
+        "the Reject must free its slot"
+    );
+    let sdp = real_offer(&a).await;
+    a.send_rtc_signal(b_id, &RtcSignalMsg::Offer { dialog: 1000, sdp })
+        .await
+        .expect("send offer");
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
         b.rtc_stats().signal_over_budget(),
@@ -546,4 +579,157 @@ async fn the_full_section_9_sequence_with_the_three_part_witness() {
 
 fn b_pub_of(b: &Arc<MeshNode>) -> [u8; 32] {
     *b.public_key()
+}
+
+/// R5: four expired dialogs release their budget slots, so the
+/// fifth offer is admitted.
+///
+/// `expire_dialogs` returned the ids it abandoned and the caller
+/// **discarded** them, so an expired dialog kept its `SignalBudget`
+/// slot for ever: after four attempts the peer's offers were
+/// refused as over budget although no dialog was open.
+///
+/// Inverse: drop the `end_dialog` loop from the expiry arm — the
+/// fifth offer is refused and `open_signal_dialogs` stays at four.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn four_expired_dialogs_release_their_budget_for_a_fifth() {
+    let (a, b) = signalling_pair().await;
+    let a_id = a.node_id();
+
+    for dialog in 1..=4u64 {
+        let (_id, sdp) = a
+            .rtc_driver()
+            .expect("driver")
+            .create_offer()
+            .await
+            .expect("offer");
+        a.send_rtc_signal(b.node_id(), &RtcSignalMsg::Offer { dialog, sdp })
+            .await
+            .expect("send offer");
+    }
+    assert!(
+        wait_for(|| b.open_signal_dialogs(a_id) == 4, Duration::from_secs(10)).await,
+        "precondition: four dialogs open against the budget (saw {})",
+        b.open_signal_dialogs(a_id)
+    );
+
+    // Let every attempt reach its `ice_deadline`.
+    assert!(
+        wait_for(|| b.open_signal_dialogs(a_id) == 0, Duration::from_secs(20)).await,
+        "expiry must release every slot it abandons (still {})",
+        b.open_signal_dialogs(a_id)
+    );
+
+    // The fifth is admitted, which is the property the count is for.
+    let (_id, sdp) = a
+        .rtc_driver()
+        .expect("driver")
+        .create_offer()
+        .await
+        .expect("offer");
+    let before = b.rtc_stats().signal_over_budget();
+    a.send_rtc_signal(b.node_id(), &RtcSignalMsg::Offer { dialog: 5, sdp })
+        .await
+        .expect("send fifth offer");
+    assert!(
+        wait_for(|| b.open_signal_dialogs(a_id) == 1, Duration::from_secs(10)).await,
+        "the fifth offer must be admitted once the four have ended"
+    );
+    assert_eq!(
+        b.rtc_stats().signal_over_budget(),
+        before,
+        "and nothing may be counted as over budget"
+    );
+}
+
+/// R5: an immediate `Reject` for a dialog **we** offered
+/// correlates, instead of being refused as unknown and leaving our
+/// own offer alive until its timeout.
+///
+/// Inverse: drop `register_outbound_dialog` from
+/// `offer_direct_path` — the Reject is refused as an unknown dialog
+/// and the slot is never released.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_reject_for_our_own_offer_correlates_and_releases() {
+    let (a, b) = signalling_pair().await;
+    let b_id = b.node_id();
+
+    let dialog = a.offer_direct_path(b_id).await.expect("offer sent");
+    assert_eq!(
+        a.open_signal_dialogs(b_id),
+        1,
+        "our own outbound dialog must be known to the inbound budget"
+    );
+
+    // B rejects it immediately.
+    b.send_rtc_signal(
+        a.node_id(),
+        &RtcSignalMsg::Reject {
+            dialog,
+            reason: net::adapter::net::rtc::RtcRejectReason::Declined,
+        },
+    )
+    .await
+    .expect("send reject");
+
+    assert!(
+        wait_for(|| a.open_signal_dialogs(b_id) == 0, Duration::from_secs(10)).await,
+        "the reject must correlate with our own dialog and release its slot \
+         (still {})",
+        a.open_signal_dialogs(b_id)
+    );
+}
+
+/// R5: a **failed allocation** holds no reservation. A malformed
+/// offer costs the receiver no ICE agent, so it must not cost the
+/// sender a dialog slot either — otherwise four malformed frames
+/// silently exhaust a peer's allowance.
+///
+/// Inverse: drop `release_signal_budget` from the Reject arm — the
+/// malformed offers keep their slots and the real offer that
+/// follows is refused as over budget.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_failed_allocation_holds_no_dialog_reservation() {
+    let (a, b) = signalling_pair().await;
+    let a_id = a.node_id();
+    let b_id = b.node_id();
+
+    for dialog in 0..MAX_DIALOGS_PER_PEER as u64 {
+        a.send_rtc_signal(
+            b_id,
+            &RtcSignalMsg::Offer {
+                dialog,
+                sdp: "v=0".to_string(),
+            },
+        )
+        .await
+        .expect("send malformed offer");
+    }
+    assert!(
+        wait_for(|| b.open_signal_dialogs(a_id) == 0, Duration::from_secs(10)).await,
+        "a refused allocation must leave no reservation behind (held {})",
+        b.open_signal_dialogs(a_id)
+    );
+
+    // And a real offer is still admitted.
+    let before = b.rtc_stats().signal_over_budget();
+    let sdp = a
+        .rtc_driver()
+        .expect("driver")
+        .create_offer()
+        .await
+        .expect("offer")
+        .1;
+    a.send_rtc_signal(b_id, &RtcSignalMsg::Offer { dialog: 77, sdp })
+        .await
+        .expect("send real offer");
+    assert!(
+        wait_for(|| b.open_signal_dialogs(a_id) == 1, Duration::from_secs(10)).await,
+        "the real offer must be admitted after four failed allocations"
+    );
+    assert_eq!(
+        b.rtc_stats().signal_over_budget(),
+        before,
+        "and nothing may be counted as over budget"
+    );
 }

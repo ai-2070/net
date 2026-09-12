@@ -25249,6 +25249,7 @@ impl MeshNode {
             return;
         };
         let dialogs = Arc::clone(&self.rtc_dialogs);
+        let rtc_budget = Arc::clone(&self.rtc_signal_budget);
         let ice_deadline = self
             .config
             .rtc
@@ -25265,13 +25266,26 @@ impl MeshNode {
                 // for.
                 {
                     let mut table = dialogs.lock().await;
-                    let _ = super::rtc::expire_dialogs(&driver, &mut table, Instant::now()).await;
+                    let expired =
+                        super::rtc::expire_dialogs(&driver, &mut table, Instant::now()).await;
+                    // **R5: expiry releases the budget.** The
+                    // returned ids used to be discarded, so an
+                    // expired dialog kept its `SignalBudget` slot
+                    // for ever and the peer's fifth offer was
+                    // refused although four had ended.
+                    if !expired.is_empty() {
+                        let mut guard = rtc_budget.lock();
+                        for (node, dialog) in &expired {
+                            guard.end_dialog(*node, *dialog);
+                        }
+                    }
                 }
                 let (from_node, msg) = match next {
                     Ok(Some(frame)) => frame,
                     Ok(None) => break,
                     Err(_) => continue,
                 };
+                let dialog_of_frame = msg.dialog();
                 let outcome = {
                     let mut table = dialogs.lock().await;
                     super::rtc::handle_signal(&driver, &mut table, from_node, msg, ice_deadline)
@@ -25307,6 +25321,17 @@ impl MeshNode {
                                 &super::rtc::RtcSignalMsg::Reject { dialog, reason },
                             )
                             .await;
+                        // R5: our own Reject is a terminal path
+                        // too — a failed allocation used to keep
+                        // the slot it never got to use.
+                        node.release_signal_budget(from_node, dialog);
+                    }
+                    super::rtc::SignalOutcome::Ended(_) => {
+                        // R5: the peer's Reject ended the dialog;
+                        // `admit` already released its slot, and
+                        // this keeps our own outbound bookkeeping
+                        // in step for a dialog *we* offered.
+                        node.release_signal_budget(from_node, dialog_of_frame);
                     }
                     _ => {}
                 }
@@ -25348,6 +25373,9 @@ impl MeshNode {
                 .await
                 .map_err(AdapterError::Connection)?
         };
+        // R5: the inbound budget learns about our outbound dialog
+        // here, so the peer's `Reject` for it correlates.
+        self.register_outbound_dialog(peer_node_id, dialog);
         self.send_rtc_signal(peer_node_id, &offer).await?;
         // R4: trickle our own host candidate immediately. On a
         // native pair both sides know their bind address, so the
@@ -25356,6 +25384,37 @@ impl MeshNode {
         // relay candidates a NAT'd browser needs are 4b's.
         self.trickle_local_candidate(peer_node_id, dialog).await;
         Ok(dialog)
+    }
+
+    /// Release one dialog's `SignalBudget` slot (R5).
+    ///
+    /// Every terminal path calls this: expiry, our own `Reject`,
+    /// the peer's `Reject`, and the completion owner's success or
+    /// failure. A reservation that is never released is a peer that
+    /// silently loses its dialog allowance.
+    #[cfg(feature = "webrtc")]
+    pub(crate) fn release_signal_budget(&self, peer_node_id: u64, dialog: u64) {
+        self.rtc_signal_budget
+            .lock()
+            .end_dialog(peer_node_id, dialog);
+    }
+
+    /// Make a dialog **we** offered known to the inbound budget
+    /// (R5), so an immediate `Reject` for it correlates instead of
+    /// being refused as unknown — which kept the offer alive until
+    /// its timeout.
+    #[cfg(feature = "webrtc")]
+    fn register_outbound_dialog(&self, peer_node_id: u64, dialog: u64) {
+        self.rtc_signal_budget
+            .lock()
+            .note_outbound_dialog(peer_node_id, dialog);
+    }
+
+    /// How many dialogs this peer holds against the inbound budget
+    /// (R5 witnesses).
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    pub fn open_signal_dialogs(&self, peer_node_id: u64) -> usize {
+        self.rtc_signal_budget.lock().open_dialogs(peer_node_id)
     }
 
     /// Send this node's host candidate for `dialog` (R4).
@@ -25446,6 +25505,9 @@ impl MeshNode {
                 let mut table = dialogs.lock().await;
                 table.remove(peer_node_id, dialog);
             }
+            // R5: the dialog is over either way — release its
+            // budget slot so the peer may open another.
+            node.release_signal_budget(peer_node_id, dialog);
             match installed {
                 Ok(()) => {
                     driver.stats().note_ice_direct();
