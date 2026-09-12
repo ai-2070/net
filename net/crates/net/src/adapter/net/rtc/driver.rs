@@ -1347,9 +1347,13 @@ async fn handle_signal(
             }
         }
         RtcSignal::SelectedPair { peer, reply } => {
-            let socket_addr = socket
-                .local_addr()
-                .unwrap_or_else(|_| "0.0.0.0:0".parse().expect("literal"));
+            // An unnamed socket cannot report a local half; the
+            // unspecified address says "not known" without panicking
+            // on a path an operator is only observing.
+            let socket_addr = socket.local_addr().unwrap_or(std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                0,
+            ));
             let answer = session_for(sessions, peer).and_then(|session| {
                 let remote = session.last_transmit?;
                 let learned = if session.signalled_remotes.contains(&remote) {

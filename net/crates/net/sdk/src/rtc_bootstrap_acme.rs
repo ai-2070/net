@@ -117,30 +117,31 @@ async fn order_certificate(
         .map_err(|e| BootstrapError::Acme(format!("placing the order: {e}")))?;
 
     let mut installed = Vec::new();
-    let mut authorizations = order.authorizations();
-    while let Some(mut authorization) = authorizations
-        .next()
-        .await
-        .transpose()
-        .map_err(|e| BootstrapError::Acme(format!("reading an authorization: {e}")))?
     {
-        if authorization.status != AuthorizationStatus::Pending {
-            continue;
-        }
-        let mut challenge = authorization
-            .challenge(ChallengeType::Http01)
-            .ok_or_else(|| BootstrapError::Acme("no http-01 challenge was offered".into()))?;
-        challenges.set_challenge(
-            challenge.token.to_string(),
-            challenge.key_authorization().as_str().to_string(),
-        );
-        installed.push(challenge.token.to_string());
-        challenge
-            .set_ready()
+        let mut authorizations = order.authorizations();
+        while let Some(mut authorization) = authorizations
+            .next()
             .await
-            .map_err(|e| BootstrapError::Acme(format!("triggering the challenge: {e}")))?;
+            .transpose()
+            .map_err(|e| BootstrapError::Acme(format!("reading an authorization: {e}")))?
+        {
+            if authorization.status != AuthorizationStatus::Pending {
+                continue;
+            }
+            let mut challenge = authorization
+                .challenge(ChallengeType::Http01)
+                .ok_or_else(|| BootstrapError::Acme("no http-01 challenge was offered".into()))?;
+            challenges.set_challenge(
+                challenge.token.to_string(),
+                challenge.key_authorization().as_str().to_string(),
+            );
+            installed.push(challenge.token.to_string());
+            challenge
+                .set_ready()
+                .await
+                .map_err(|e| BootstrapError::Acme(format!("triggering the challenge: {e}")))?;
+        }
     }
-    drop(authorizations);
 
     let status = order
         .poll_ready(&instant_acme::RetryPolicy::default())

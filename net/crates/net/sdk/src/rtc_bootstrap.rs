@@ -590,26 +590,26 @@ fn parse_node_id(raw: &str) -> Option<u64> {
 /// Validate a presented credential against this anchor: it must
 /// parse, both lifetimes must be live, and it must belong to this
 /// anchor's transport trust domain.
-fn check_credential(raw: &str, psk: &Psk) -> Result<BrowserBootstrapCredential, Response> {
+fn check_credential(raw: &str, psk: &Psk) -> Result<BrowserBootstrapCredential, Box<Response>> {
     let credential = BrowserBootstrapCredential::decode(raw).map_err(|e| {
-        refuse(
+        Box::new(refuse(
             BootstrapRefusal::MalformedCredential,
             format!("the credential did not parse: {e}"),
-        )
+        ))
     })?;
     // Domain first: telling a caller from another trust domain that
     // their nonce expired would send them to the wrong knob.
     credential.check_trust_domain(psk).map_err(|e| {
-        refuse(
+        Box::new(refuse(
             BootstrapRefusal::WrongTrustDomain,
             format!("this anchor does not serve that trust domain: {e}"),
-        )
+        ))
     })?;
     credential.validate().map_err(|e| {
-        refuse(
+        Box::new(refuse(
             BootstrapRefusal::ExpiredCredential,
             format!("the credential is not presentable: {e}"),
-        )
+        ))
     })?;
     Ok(credential)
 }
@@ -641,7 +641,7 @@ async fn post_offer(
     }
     let credential = match check_credential(&request.credential, &state.psk) {
         Ok(credential) => credential,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let Some(node_id) = parse_node_id(&request.node_id) else {
         return refuse(
