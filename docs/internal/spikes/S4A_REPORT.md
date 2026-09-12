@@ -198,3 +198,174 @@ enrollment response (C1) and the unenforced whole-session bounds
    provisional session on any other transport, the charge does not
    follow it. The bound belongs to the admission state, and the
    single call site is in `spawn_receive_loop`'s RTC arm.
+
+## 12. Repairs for Kyra's HOLD at `047ac7e0a` (R1–R7)
+
+Her verdict was the contract: *the native production upgrade is
+incomplete, admission can permit pre-enrollment effects, and an old
+enrollment response can promote a replacement session.* All three
+are closed, with her own eight probes as the acceptance witnesses.
+
+### 12.1 Kyra's probes, landed verbatim and now green
+
+`spikes/kyra/kyra_4a_probes.rs` → `tests/rtc_admission_probes.rs`,
+copied with **no edit to any assertion or setup** (it compiles and
+runs as shipped, so no setup had to follow a repaired API). At
+`c84d60a6f` it reproduced her result exactly — 1 passed / 7 failed,
+her markers verbatim. At this head: **8/8**.
+
+| Probe | Before | After |
+|---|---|---|
+| `kyra_pre_noise_rtc_cannot_forward` | `installed_provisional=false actual_udp_marker=true refused=0` | pass (R1) |
+| `kyra_installed_provisional_transit_control` | pass (control) | pass |
+| `kyra_provisional_app_delivery_is_denied` | `delivered=true` | pass (R1) |
+| `kyra_provisional_signal_does_not_allocate_ice` | `ice_allocations=1` | pass (R1) |
+| `kyra_normal_close_reclaims_provisional_projection` | `provisional_projection=1` | pass (R3) |
+| `kyra_old_success_cannot_promote_replacement_request` | `old_success_promoted_replacement=true` | pass (R2) |
+| `kyra_fifth_enrollment_request_is_not_executed` | `executions=5` | pass (R3) |
+| `kyra_engine_must_install_without_loopback_noise_fixture` | `endpoint=None attempted=1 relayed=1` | pass (R4) |
+
+Binary in the CI RTC job, floor 8, all eight names pinned,
+`retries = 0`.
+
+### 12.2 Per-inverse ledger
+
+Each mutation was applied to the **production call site**, the named
+test run, and the tree restored (`git diff --name-only` empty)
+before the next.
+
+| # | Mutated production site | Witness | Outcome |
+|---|---|---|---|
+| R1a | `ingress_admission`: unknown RTC endpoint → `Permitted` (the fail-open) | `kyra_pre_noise_rtc_cannot_forward` | **red** |
+| R1b | remove the application-enqueue gate | `kyra_provisional_app_delivery_is_denied` | **red** |
+| R1c | remove the signalling gate | `kyra_provisional_signal_does_not_allocate_ice` | **red** |
+| R1d | remove `rtc_admission_allows_rpc` from the server-streaming bridge | `a_registered_streaming_provider_refuses_a_provisional_caller` | **red** |
+| R2a | key `pending_promotions` by node id again | `kyra_old_success_cannot_promote_replacement_request`; `an_old_rejection_after_replacement_consumes_nothing` | **red** ×2 |
+| R2b | eviction does not retire the peer's reservations | same | **green — defence in depth.** The key already carries the session id, so a late completion fails `promote_admission` anyway; the arm exists so retirement is *counted*. Recorded, not claimed. |
+| R3a | drop `charge_enrollment_request` from the gate | `kyra_fifth_enrollment_request_is_not_executed` | **red** |
+| R3b | never release the in-flight enrollment slot | `enrollment_requests_are_charged_and_released_and_churn_returns_to_baseline` | **red** |
+| R3c | ordinary eviction leaves the projection | `kyra_normal_close_reclaims_provisional_projection` | **red** |
+| R3d | reclaim by provisional state, not the selected incarnation | `a_sweep_cannot_reclaim_a_replacement_it_never_selected` | **red** |
+| R3d″ | reclaim without the still-provisional condition | `a_sweep_cannot_reclaim_a_session_promoted_after_selection` | **red** |
+| R3e | remove the stream reservation before allocation | `a_provisional_sender_cannot_allocate_arbitrary_streams` | **red** |
+| R4a | remove the dialog completion owner (the shipped state) | `kyra_engine_must_install_without_loopback_noise_fixture`; `the_full_section_9_sequence_with_the_three_part_witness` | **red** ×2 |
+| R4b | the offerer does not trickle its candidate | `kyra_engine_must_install_…` | **green** — the answerer's candidate suffices on loopback. Both sides still trickle; recorded, not claimed. |
+| R4c | `PairAction::Ice` marks the scan done, scheduling nothing | `an_ice_pair_schedules_the_upgrade_attempt` | **red** |
+| R5a | expiry discards the dialog ids (no budget release) | `four_expired_dialogs_release_their_budget_for_a_fifth` | **red** |
+| R5b | our own outbound dialog unknown to the inbound budget | `a_reject_for_our_own_offer_correlates_and_releases` | **red** |
+| R5c | a failed allocation keeps its reservation | `a_failed_allocation_holds_no_dialog_reservation` | **red** |
+| R6a | restore `serve_rpc_typed(.., Codec::Json, ..)` for enrollment | `a_real_sdk_enrollment_promotes_the_exact_session` | **red** |
+| R6b | drop the permitted bootstrap origin binding | same | **red** |
+| R7a | register the protected provider as public instead | `an_admitted_peer_without_authority_is_still_denied` | **red** |
+
+### 12.3 What changed, by group
+
+**R1.** One `ingress_admission` decision, **fail-closed** for RTC:
+no installed `PeerInfo`, an installed peer on a *different*
+endpoint, or a provisional session are all `Denied` — the old read
+answered "not provisional" (taken as permission) for exactly the
+pre-Noise and post-removal states. Legacy UDP is untouched. Gates
+now sit before the effect on: the application enqueue (non-RPC arm;
+an RPC frame is judged on its **decoded** service, because
+`net.mesh.enroll` is the one permitted call), signalling/ICE
+allocation, all three streaming serve bridges, F6 `PunchAck` by the
+**authenticated requester** (it gated `ack.to_peer`, the
+recipient), and both routed-handshake constructors, which installed
+an **Admitted** logical peer through a provisional relay.
+
+**R2.** Reservations keyed `(node_id, session_id, call_id)`;
+`RpcInboundEvent` carries the **receiving** session id from
+ingress; the response path threads `call_id`; eviction retires and
+counts. A completion consumes only its own call's reservation.
+
+**R3.** REQUEST count and in-flight slot charged before dispatch
+and released on every terminal path; stream count / 64 KiB charged
+before allocation; ordinary eviction clears the admission
+projection; reclaim routed through an exact-incarnation transition
+whose side effects run only when it owned the removal.
+
+**R4.** A bounded per-dialog **completion owner**: `await_open` →
+Noise in the dialog's role with the peer's **announced** key → the
+Stage 3 fenced install (byte-for-byte unchanged; only its
+reachability) → retirement. Candidate trickle is part of the
+production dialog. `PairAction::Ice` schedules the attempt on the
+existing retry ladder.
+
+**R5.** Every terminal path releases the `SignalBudget`: expiry,
+our Reject, the peer's Reject, and completion; an outbound dialog
+is known to the inbound budget so its Reject correlates.
+
+**R6.** Enrollment and renewal bodies travel **raw**
+(`serve_rpc_raw_bytes` / `call_raw_bytes`), so the core sees
+`NMO1`; the outcome code is `u16`; and the reply subscription
+accepts a **bootstrap-only** origin substitute (provisional
+session + exactly that origin's enrollment reply channel + the
+origin the session bound). Nothing else about origin-bound
+subscriptions changed.
+
+**R7.** The protected-invocation witness registers a real
+authority-backed `OwnerDelegated` provider and counts handler
+invocations; CI's inventory counts non-empty lines, so the
+empty-suite self-check can actually fire.
+
+### 12.4 Revised exit table — demonstrated scope only
+
+| Claim | Demonstrated by | Scope |
+|---|---|---|
+| Pre-Noise / post-removal RTC ingress obtains no permissions | `kyra_pre_noise_rtc_cannot_forward` + the installed-provisional control | Anchor egress and local effects; not downstream decryption |
+| No pre-enrollment application delivery | `kyra_provisional_app_delivery_is_denied` | The event plane's non-RPC arm; the RPC arm is judged on the decoded service |
+| No pre-enrollment signalling/ICE allocation | `kyra_provisional_signal_does_not_allocate_ice` | ICE agent allocation, observed by counter |
+| A registered provider is not invoked pre-enrollment | `a_registered_streaming_provider_refuses_a_provisional_caller` (+ admitted control) | Server-streaming bridge; client-streaming/duplex share the same call site, not separately witnessed |
+| A completion promotes only its own call and incarnation | `kyra_old_success_cannot_promote_replacement_request`, `an_old_rejection_after_replacement_consumes_nothing` | Success and rejection; the earlier-window queued-request schedule is closed by the event's session id but has no separate witness |
+| Declared action bounds are enforced | `kyra_fifth_enrollment_request_is_not_executed`, `a_provisional_sender_cannot_allocate_arbitrary_streams`, `enrollment_requests_are_charged_and_released_…` | REQUEST count, in-flight slot, stream count/bytes, frame/byte budget |
+| Cleanup is incarnation-safe and returns to baseline | `kyra_normal_close_reclaims_provisional_projection`, the two sweep witnesses | GC-vs-promotion and GC-vs-replacement via the production reclaim entry point, not a paused background sweep |
+| The native upgrade completes in production | `kyra_engine_must_install_without_loopback_noise_fixture`, `the_full_section_9_sequence_with_the_three_part_witness`, `an_ice_pair_schedules_the_upgrade_attempt` | Same attempt, no fixture substitution; both endpoints' new session ids, receiver-attributed payload, flat anchor transit |
+| Signalling admission follows the dialog | the four R5 witnesses | Expiry, own Reject, failed allocation, outbound correlation; per-incarnation queue keys are **not** claimed |
+| Real SDK enrollment promotes | `sdk/tests/enrollment_over_rtc.rs` (both outcomes) | The real service, client, codec and registry; the device's `join()` flow over UDP rendezvous is unchanged and separately covered by SDK units |
+| Transport admission is not invocation authority | `an_admitted_peer_without_authority_is_still_denied` | A real protected provider, zero invocations; the authorized proof control is `tests/integration_nrpc_protected.rs` |
+
+### 12.5 Still open, by name
+
+- **F7 (`proxy.rs`) has no admission gate** — documented
+  non-reachability, unchanged.
+- **`max_provisional` is periodic shedding, not an install-time
+  reservation**, and there is **no aggregate bootstrap-byte
+  ledger** (`max_bootstrap_bytes_in_flight` does not exist). The
+  live caps are the per-session frame/byte/stream/REQUEST bounds
+  and the 30 s TTL.
+- **Async signal queues key on node id, not incarnation** (R5's
+  last item).
+- **Subscribe nonce/retry bounds** are still absent; the roster is
+  set-like, so this is a policy gap, not multiple memberships.
+- **The enrollment deadline is not an exact per-action fence** — it
+  is the sweep plus the TTL.
+- **Client-streaming and duplex bridges** share R1's gate call site
+  but have no witness of their own.
+- The reflex/relay candidate half of ICE, the bootstrap listener,
+  TLS and the browser remain 4b.
+
+### 12.6 Validation at this head
+
+| Command | Result |
+|---|---|
+| `cargo fmt -p net-mesh -p net-mesh-sdk -- --check` | pass |
+| `cargo check --workspace --all-targets` | 0 errors |
+| `cargo clippy --lib --bins` at default / no-default / `webrtc` / `--all-features` | **0 ×4** |
+| `cargo clippy --features "webrtc fixtures cortex nat-traversal" --all-targets` (CI `-A` set) | 0 |
+| `cargo clippy -p net-mesh-sdk --features "net webrtc" --lib` | 0 |
+| `RUSTDOCFLAGS="-D warnings" cargo doc --features webrtc --no-deps` / SDK | 0 / 0 |
+| `cargo test --lib --features "$UNIT_FEATURES"` | **5779 passed**, 0 failed, 2 ignored |
+| `cargo test --lib --features "$UNIT_FEATURES webrtc"` | **5811 passed**, 0 failed, 2 ignored |
+| `cargo test -p net-mesh-sdk --lib` | **292 passed** |
+| Ten RTC binaries, `--no-tests=fail --retries 0` | **89 run, 89 passed**, three consecutive whole-suite runs |
+| Per-binary counts vs CI floors | 5 / 7 / 22 / 4 / 8 / 5 / 2 / 8 / 9 / 19 = 89; every floor met, **all 72 pinned names present** |
+| `sdk/tests/enrollment_over_rtc.rs` | 2 passed |
+| Export checker on CI's `net-ffi/test-helpers` release build | `net.dll: export set matches the baseline`, **568** (unchanged — R6 changed no C ABI) |
+| Consumer diff since `01e4b0f20` | `go`, `sdk-ts`, `sdk-py`, `bindings`, `include`: **untouched**. `sdk/`: `Cargo.toml` (+6/-0 — `webrtc` passthrough, dev-dep), `src/mesh_rpc.rs` (+84 — `serve_rpc_raw_bytes`, `call_raw_bytes`, variant count), `src/mesh_enroll.rs` (+32/-20 — raw bodies), `src/mesh.rs` (+24 — `rtc()`, public `node()`), `src/enrollment.rs` (+25 — the H-round prefix pin), `tests/enrollment_over_rtc.rs` (+207, new) |
+| Linux targets | still not runnable on this host (no cross C toolchain) |
+
+One load-dependent failure of the §9 witness was observed in an
+early ten-binary run; its two **settling** waits (routed
+quiescence, B's own install) went 20 s → 30 s, and six consecutive
+whole-suite runs were clean afterwards. At `retries = 0` a
+load-dependent verdict is a defect in the witness, not a retry.
