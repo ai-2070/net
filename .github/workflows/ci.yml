@@ -4629,6 +4629,8 @@ jobs:
           --test rtc_admission_probes
           --test rtc_signalling
           --test rtc_admission
+          --test rtc_anchor_registry
+          --test rtc_proxy_boundary
 
       # Per-binary FLOORS and the required names. `--no-tests=fail`
       # catches a whole binary vanishing; it does not catch a witness
@@ -4695,12 +4697,19 @@ jobs:
           check_floor rtc_admission_probes 11
           check_floor rtc_signalling 12
           check_floor rtc_admission 26
+          # Stage 4b: the anchor registry an operator surface reads,
+          # and the F7 boundary's own evidence.
+          check_floor rtc_anchor_registry 2
+          check_floor rtc_proxy_boundary 2
           REQUIRED="
           rtc_admission:a_registered_client_streaming_provider_refuses_a_provisional_caller
           rtc_admission:a_registered_duplex_provider_refuses_a_provisional_caller
           rtc_admission:a_provisional_peer_cannot_drive_migration
           rtc_admission:a_promotion_inside_the_teardown_window_survives
           rtc_signalling:each_signalling_refusal_is_counted_under_its_own_cause
+          rtc_anchor_registry:an_announced_anchor_is_listed_with_its_addresses_and_a_plain_peer_is_not
+          rtc_proxy_boundary:an_rtc_peers_routed_envelope_never_reaches_the_proxy
+          rtc_proxy_boundary:a_proxy_socket_cannot_become_the_authenticated_adjacency_a_relay_needs
           rtc_admission:an_outcome_that_only_looks_admitted_promotes_nothing
           rtc_admission:a_claimant_is_not_promoted_by_another_peers_enrollment
           rtc_repairs:scheduled_fire_and_forget_packets_reach_rtc_admission_and_the_peer
