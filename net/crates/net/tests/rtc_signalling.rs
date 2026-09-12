@@ -677,6 +677,39 @@ async fn a_reject_for_our_own_offer_correlates_and_releases() {
          (still {})",
         a.open_signal_dialogs(b_id)
     );
+
+    // **The real cause of this witness going red in CI (R5-A),
+    // made deterministic.** B trickles its candidate right after
+    // answering, so a Candidate for this dialog could arrive
+    // *after* the Reject freed the slot — and an Answer/Candidate
+    // was allowed to create an owner, so the slot came back and
+    // stayed at 1 for ever. Ordering decided whether the run was
+    // green; here the late frame is delivered explicitly.
+    b.send_rtc_signal(
+        a.node_id(),
+        &RtcSignalMsg::Candidate {
+            dialog,
+            candidate: "candidate:1 1 udp 2130706431 127.0.0.1 4444 typ host".to_string(),
+            mid: "0".to_string(),
+        },
+    )
+    .await
+    .expect("send a late candidate for the retired dialog");
+    let unknown_before = a.rtc_stats().signal_unknown_dialog();
+    assert!(
+        wait_for(
+            || a.rtc_stats().signal_unknown_dialog() > unknown_before,
+            Duration::from_secs(5)
+        )
+        .await,
+        "the late frame must be refused as an unknown dialog and counted"
+    );
+    assert_eq!(
+        a.open_signal_dialogs(b_id),
+        0,
+        "a frame cannot create the attempt it claims to belong to — the retired \
+         slot must stay retired"
+    );
 }
 
 /// R5: a **failed allocation** holds no reservation. A malformed

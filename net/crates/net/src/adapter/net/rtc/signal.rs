@@ -259,21 +259,27 @@ impl SignalBudget {
                 }
             }
             RtcSignalMsg::Answer { .. } | RtcSignalMsg::Candidate { .. } => {
-                // An answer or a candidate may legitimately be the
-                // first frame *we* see for a dialog **we** offered:
-                // the offerer's dialog lives in our own outbound
-                // state, not in this peer's inbound slot list. So
-                // track it rather than refusing it — the budget's
-                // job is bounding concurrency, not re-deriving who
-                // offered.
-                if !state.dialogs.contains(&dialog) {
-                    if state.dialogs.len() >= MAX_DIALOGS_PER_PEER {
-                        return SignalAdmit::Refused(RtcSignalError::OverBudget);
-                    }
-                    state.dialogs.push(dialog);
-                    return SignalAdmit::NewDialog;
+                // **R5-A: only an Offer creates a dialog owner.**
+                // These frames used to establish one, which made
+                // four well-formed Candidates for ids nobody
+                // offered into four reservations the engine had no
+                // dialog for — so nothing could ever expire them —
+                // and let a late Candidate **resurrect** an id that
+                // a Reject or an expiry had already retired. That
+                // resurrection is the red CI witness: A's own
+                // dialog slot was freed by B's Reject and then
+                // re-created by B's trailing trickled Candidate,
+                // and stayed 1 for ever.
+                //
+                // A dialog *we* offered is in this list already —
+                // `note_outbound_dialog` puts it there when the
+                // offer is sent — so the legitimate answer/candidate
+                // for our own attempt still finds its owner here.
+                if state.dialogs.contains(&dialog) {
+                    SignalAdmit::OpenDialog
+                } else {
+                    SignalAdmit::Refused(RtcSignalError::UnknownDialog)
                 }
-                SignalAdmit::OpenDialog
             }
         }
     }

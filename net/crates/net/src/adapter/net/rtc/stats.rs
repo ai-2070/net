@@ -44,6 +44,7 @@ pub struct RtcStats {
     signal_over_budget: AtomicU64,
     signal_forwarded: AtomicU64,
     signal_delivered: AtomicU64,
+    signal_unknown_dialog: AtomicU64,
     ice_attempted: AtomicU64,
     ice_direct: AtomicU64,
     ice_relayed: AtomicU64,
@@ -196,6 +197,11 @@ impl RtcStats {
         signal_forwarded,
         note_signal_forwarded,
         "`0x0D02` frames this node forwarded for a pair it is relaying. Counted by `subprotocol_id`, which is cleartext AAD-authenticated header — the SDP is never read (plan §10)."
+    );
+    counter!(
+        signal_unknown_dialog,
+        note_signal_unknown_dialog,
+        "Signalling frames naming a dialog this node has no live attempt for (R5-A): unknown, already rejected, expired or completed. They reserve nothing — a frame cannot create the attempt it claims to belong to."
     );
     counter!(
         signal_delivered,

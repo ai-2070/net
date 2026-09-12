@@ -35837,18 +35837,40 @@ impl MeshNode {
                 return;
             }
         };
+        // R5-A: **receipt** is counted here, before the dialog
+        // decision. The frame decoded inside this peer's session and
+        // reached this handler; whether it names a live attempt is
+        // the next question, and the two facts have separate
+        // counters. (Previously a refusal was indistinguishable
+        // from a frame that never arrived.)
+        stats.note_signal_delivered();
         let admitted = {
             // Synchronous, and released before anything else — the
             // dispatch path holds no guard across an await.
             let mut guard = budget.lock();
             guard.admit(from_node, &msg, std::time::Instant::now())
         };
-        if let super::rtc::SignalAdmit::Refused(e) = admitted {
-            tracing::debug!(error = %e, from = format!("{from_node:#x}"), "rtc signal over budget");
-            stats.note_signal_over_budget();
-            return;
+        match admitted {
+            super::rtc::SignalAdmit::Refused(super::rtc::RtcSignalError::UnknownDialog) => {
+                // R5-A: an Answer/Candidate/Reject for an id nobody
+                // offered — or one already rejected, expired or
+                // completed. It reserves nothing and allocates
+                // nothing, and it is counted as what it is.
+                tracing::debug!(
+                    from = format!("{from_node:#x}"),
+                    dialog = msg.dialog(),
+                    "rtc signal for an unknown dialog refused"
+                );
+                stats.note_signal_unknown_dialog();
+                return;
+            }
+            super::rtc::SignalAdmit::Refused(e) => {
+                tracing::debug!(error = %e, from = format!("{from_node:#x}"), "rtc signal over budget");
+                stats.note_signal_over_budget();
+                return;
+            }
+            _ => {}
         }
-        stats.note_signal_delivered();
         #[cfg(any(test, feature = "fixtures"))]
         if let Some(tap) = ctx.rtc_signal_tap.as_ref() {
             tap.lock().push((from_node, msg.clone()));
