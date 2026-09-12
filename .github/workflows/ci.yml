@@ -4694,13 +4694,14 @@ jobs:
           check_floor rtc_classifier 2
           check_floor rtc_admission_probes 11
           check_floor rtc_signalling 11
-          check_floor rtc_admission 25
+          check_floor rtc_admission 26
           REQUIRED="
           rtc_admission:a_registered_client_streaming_provider_refuses_a_provisional_caller
           rtc_admission:a_registered_duplex_provider_refuses_a_provisional_caller
           rtc_admission:a_provisional_peer_cannot_drive_migration
           rtc_admission:a_promotion_inside_the_teardown_window_survives
           rtc_admission:an_outcome_that_only_looks_admitted_promotes_nothing
+          rtc_admission:a_claimant_is_not_promoted_by_another_peers_enrollment
           rtc_repairs:scheduled_fire_and_forget_packets_reach_rtc_admission_and_the_peer
           rtc_repairs:the_scheduler_drain_counts_what_it_drops_under_pressure
           rtc_repairs:rtc_admission_pressure_is_retryable_backpressure_not_a_transport_error

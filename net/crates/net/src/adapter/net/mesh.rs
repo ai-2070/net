@@ -35333,6 +35333,30 @@ impl MeshNode {
         self.promote_admission(node_id, session_id, endpoint)
     }
 
+    /// **R6-B: which node actually holds the reservation for this
+    /// `(session, call)`?**
+    ///
+    /// Session ids are assigned by this node and never appear on
+    /// the wire as a claim, so `(session, call)` names one
+    /// incarnation unforgeably. Resolving the promotion target this
+    /// way — rather than from a claimed origin — is what stops a
+    /// provisional peer that binds a *victim's* origin from being
+    /// promoted by the victim's own enrollment response, which the
+    /// `bound_origin` scan below would have allowed (it takes the
+    /// first match, and an unauthenticated peer may claim any
+    /// origin).
+    #[cfg(feature = "webrtc")]
+    pub(crate) fn enrollment_reservation_owner(
+        &self,
+        session_id: u64,
+        call_id: u64,
+    ) -> Option<u64> {
+        self.pending_promotions.iter().find_map(|e| {
+            let (node, session, call) = *e.key();
+            (session == session_id && call == call_id).then_some(node)
+        })
+    }
+
     /// The provisional peer bound to this enrollment reply
     /// channel's origin, if any.
     ///

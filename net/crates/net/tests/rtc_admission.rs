@@ -1569,3 +1569,81 @@ impl net::adapter::net::cortex::RpcHandler for RawOutcome {
         })
     }
 }
+
+/// R6-B: an enrollment response promotes the peer that holds the
+/// call's **reservation**, never a peer that merely *claims* the
+/// same origin.
+///
+/// A provisional peer is unauthenticated by construction, so it may
+/// bind any origin it likes by subscribing to that origin's
+/// enrollment reply channel. The response path resolved its
+/// promotion target from that claim — `provisional_node_for_reply_channel`
+/// returns the *first* peer whose bound origin matches — so a
+/// claimant could be promoted by a victim's enrollment response.
+/// Resolution now starts from `(session, call)`, which is assigned
+/// locally and never appears on the wire as a claim.
+#[cfg(feature = "cortex")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_claimant_is_not_promoted_by_another_peers_enrollment() {
+    use net::adapter::net::mesh_rpc::CallOptions;
+
+    let anchor = node(Some(anchor_config())).await;
+    let claimant = node(Some(rtc_config())).await;
+    let joiner = node(Some(rtc_config())).await;
+    anchor.start_arc();
+    claimant.start_arc();
+    joiner.start_arc();
+    connect_rtc_loopback(&anchor, &claimant)
+        .await
+        .expect("DataChannel + Noise");
+    connect_rtc_loopback(&anchor, &joiner)
+        .await
+        .expect("DataChannel + Noise");
+    let claimant_id = claimant.node_id();
+    let joiner_id = joiner.node_id();
+    assert!(anchor.peer_is_provisional(claimant_id));
+    assert!(anchor.peer_is_provisional(joiner_id));
+
+    // The claimant binds the joiner's origin: permitted, because a
+    // provisional peer's claims are claims.
+    let joiner_origin = joiner.origin_hash();
+    claimant
+        .subscribe_channel(
+            anchor.node_id(),
+            net::adapter::net::channel::ChannelName::new(&enroll_reply_channel(joiner_origin))
+                .expect("a valid channel name"),
+        )
+        .await
+        .expect("a provisional peer may subscribe to the reply channel it names");
+
+    let _serve = anchor
+        .serve_rpc(ENROLL_SERVICE, Arc::new(FixedOutcome(true)))
+        .expect("serve the enrollment service");
+    joiner
+        .call(
+            anchor.node_id(),
+            ENROLL_SERVICE,
+            Bytes::from_static(b"join request"),
+            CallOptions::default(),
+        )
+        .await
+        .expect("the allow-list permits exactly this call");
+
+    assert!(
+        wait_for(
+            || !anchor.peer_is_provisional(joiner_id),
+            Duration::from_secs(5)
+        )
+        .await,
+        "the peer that made the call is the peer that is admitted"
+    );
+    assert!(
+        anchor.peer_is_provisional(claimant_id),
+        "claiming an origin is not enrolling: the claimant stays provisional"
+    );
+    assert_eq!(
+        anchor.rtc_stats().admission_promoted(),
+        1,
+        "exactly one promotion — the caller's"
+    );
+}

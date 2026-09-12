@@ -3045,9 +3045,22 @@ async fn publish_response_to_caller(
     // this reply channel's origin is the third resolution. Breadth
     // here is safe: `promote_admission` re-verifies the session id
     // AND the endpoint captured at REQUEST decode.
+    // **R6-B: the reservation, not the claim, names the peer being
+    // promoted.** The resolutions below answer "where does this
+    // frame go" — a routing question, answered from a hint or from
+    // a claimed origin. Promotion is an authorization question, and
+    // must be answered by the call's own reservation: an
+    // unauthenticated provisional peer may bind any origin, and the
+    // `bound_origin` scan returns the first match, so a peer
+    // claiming a victim's origin could be promoted by the victim's
+    // enrollment response. The routing fallbacks remain, but only
+    // as a fallback for a call that holds no reservation (which
+    // then promotes nothing).
     #[cfg(feature = "webrtc")]
-    if let Some(node_id) =
-        resolved.or_else(|| mesh.provisional_node_for_reply_channel(reply_channel.as_str()))
+    if let Some(node_id) = mesh
+        .enrollment_reservation_owner(receiving_session_id, call_id)
+        .or(resolved)
+        .or_else(|| mesh.provisional_node_for_reply_channel(reply_channel.as_str()))
     {
         match enrollment_outcome_is_admitted(&payload) {
             Some(true) => {
