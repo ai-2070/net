@@ -4634,8 +4634,8 @@ jobs:
           check_floor rtc_backpressure 7
           check_floor rtc_repairs 22
           check_floor rtc_routed_restore 4
-          check_floor rtc_install_race 6
-          check_floor rtc_reclaim 4
+          check_floor rtc_install_race 8
+          check_floor rtc_reclaim 5
           check_floor rtc_classifier 1
           check_floor rtc_signalling 6
           check_floor rtc_admission 13
@@ -4670,10 +4670,13 @@ jobs:
           rtc_install_race:an_absent_snapshot_cannot_overwrite_a_session_installed_during_the_handshake
           rtc_install_race:an_expected_present_snapshot_loses_to_a_newer_incarnation
           rtc_install_race:an_incumbent_that_becomes_busy_during_the_handshake_is_preserved
+          rtc_install_race:a_close_inside_the_commit_window_leaves_nothing_published
+          rtc_install_race:a_close_inside_the_responders_commit_window_leaves_nothing_published
           rtc_reclaim:cancelling_initiators_returns_the_registry_to_baseline
           rtc_reclaim:a_cancelled_responder_does_not_strand_or_remove_a_successor
           rtc_reclaim:closing_an_endpoint_clears_its_handshake_registration
           rtc_reclaim:a_close_the_channel_refused_is_re_delivered_not_dropped
+          rtc_reclaim:every_one_of_several_deferred_closes_is_re_delivered
           rtc_classifier:an_rtc_relay_does_not_make_a_udp_target_an_ice_pair
           rtc_signalling:signalling_crosses_an_anchor_that_cannot_read_it
           rtc_signalling:the_full_section_9_sequence_with_the_three_part_witness
