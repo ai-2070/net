@@ -3,7 +3,7 @@
 //! A browser has no build-time provisioning step, so the secret a
 //! Noise `NKpsk0` handshake needs has to come from somewhere named.
 //! This module names it. The credential is a **new format**, not an
-//! [`InviteToken`](crate::enrollment::InviteToken) with extra fields
+//! [`InviteToken`] with extra fields
 //! bolted on:
 //!
 //! ```text

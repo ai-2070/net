@@ -73,9 +73,21 @@ pub struct RtcConfig {
     pub ingress_queue_packets: usize,
     /// Answer RFC 5389 binding requests on the RTC socket.
     pub serve_stun: bool,
-    /// Serve the browser bootstrap listener. **Stage 4 consumes this**;
-    /// Stage 3 carries the flag and nothing reads it.
+    /// Serve the browser bootstrap listener. Stage 3 carried the
+    /// flag and nothing read it; Stage 4b's listener does.
     pub serve_bootstrap: bool,
+    /// The **externally reachable** base URL of that listener, e.g.
+    /// `https://anchor.example.com`. Stage 4b: this is what
+    /// `rtc_bootstrap` carries on the announcement.
+    ///
+    /// It has to be configured rather than derived: the listener
+    /// binds a socket, but a browser needs the name on the
+    /// certificate, which no amount of introspecting a bind address
+    /// produces. When it is absent the announcement falls back to
+    /// Stage 4a's synthesised `https://<addr>/rtc`, which is
+    /// honest about being a placeholder — it names the RTC socket,
+    /// not a listener.
+    pub bootstrap_url: Option<String>,
     /// §12 global bound: concurrent **provisional** sessions this
     /// anchor will hold. Past it the oldest are closed and
     /// reclaimed, counted — an unenrolled session is the cheapest
@@ -97,6 +109,7 @@ impl Default for RtcConfig {
             ingress_queue_packets: DEFAULT_INGRESS_QUEUE_PACKETS,
             serve_stun: false,
             serve_bootstrap: false,
+            bootstrap_url: None,
             max_provisional: DEFAULT_MAX_PROVISIONAL,
         }
     }
@@ -122,6 +135,17 @@ impl RtcConfig {
     #[inline]
     pub fn with_serve_stun(mut self, serve: bool) -> Self {
         self.serve_stun = serve;
+        self
+    }
+
+    /// Serve the bootstrap listener at this externally reachable
+    /// base URL (Stage 4b). Turns `serve_bootstrap` on: a URL to
+    /// advertise and no listener would be worse than neither.
+    #[must_use]
+    #[inline]
+    pub fn with_bootstrap_url(mut self, url: impl Into<String>) -> Self {
+        self.bootstrap_url = Some(url.into());
+        self.serve_bootstrap = true;
         self
     }
 

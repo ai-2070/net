@@ -25418,6 +25418,211 @@ impl MeshNode {
         Ok(dialog)
     }
 
+    // === Stage 4b: the bootstrap listener's hooks ================
+    //
+    // These are NEW functions, added for the HTTPS listener; no
+    // Stage 3 seam and no 4a admission code is modified by them.
+    // They exist because an HTTP-originated offer has no session to
+    // arrive on, so the listener cannot reach the `0x0D02` engine
+    // the way a routed peer does — but everything downstream of the
+    // decision (the dialog table, `handle_signal`, the completion
+    // owner, the fenced install, §12 admission) is the same code.
+
+    /// Accept a **browser's** offer, arriving over HTTPS rather than
+    /// over `0x0D02`, and return the answer SDP (Stage 4b).
+    ///
+    /// `claimed_node_id` is exactly that — a claim. It is not
+    /// trusted: it goes into the Noise **prologue**
+    /// (`accept_rtc` → `handshake_prologue`), so a browser that
+    /// claims a node id it cannot handshake as fails the handshake,
+    /// and the session it does get is Provisional until enrollment
+    /// promotes it (§12). The listener validates the credential
+    /// before calling this; this function's job is the dialog.
+    ///
+    /// The path below is the engine's own Offer arm minus the two
+    /// mesh-shaped effects a browser cannot receive: the answer
+    /// goes back in the HTTP response instead of a `0x0D02` frame,
+    /// and the candidate rides the trickle socket
+    /// ([`Self::bootstrap_host_candidate`]) instead of
+    /// `send_rtc_signal`. The completion owner, and therefore the
+    /// install, is the identical production task.
+    #[cfg(feature = "webrtc")]
+    pub async fn accept_bootstrap_offer(
+        self: &Arc<Self>,
+        claimed_node_id: u64,
+        dialog: u64,
+        sdp: String,
+    ) -> Result<String, AdapterError> {
+        let driver = self
+            .rtc_driver
+            .as_ref()
+            .ok_or_else(|| AdapterError::Connection("rtc is not configured".into()))?;
+        let ice_deadline = self
+            .config
+            .rtc
+            .as_ref()
+            .map(|rtc| rtc.ice_deadline)
+            .unwrap_or_else(|| Duration::from_secs(10));
+        // The same per-sender budget an over-the-mesh offer spends,
+        // keyed the same way. A browser that opens five dialogs is
+        // refused by the same rule a native peer is.
+        let admitted = {
+            let msg = super::rtc::RtcSignalMsg::Offer {
+                dialog,
+                sdp: String::new(),
+            };
+            let mut guard = self.rtc_signal_budget.lock();
+            guard.admit(claimed_node_id, &msg, std::time::Instant::now())
+        };
+        if let super::rtc::SignalAdmit::Refused(e) = admitted {
+            if let Some(stats) = self.rtc_stats_opt() {
+                stats.note_signal_over_budget();
+            }
+            return Err(AdapterError::Connection(format!(
+                "bootstrap offer refused: {e}"
+            )));
+        }
+        let outcome = {
+            let mut table = self.rtc_dialogs.lock().await;
+            super::rtc::handle_signal(
+                driver,
+                &mut table,
+                claimed_node_id,
+                super::rtc::RtcSignalMsg::Offer { dialog, sdp },
+                ice_deadline,
+            )
+            .await
+        };
+        match outcome {
+            super::rtc::SignalOutcome::Answer {
+                dialog, sdp, peer, ..
+            } => {
+                // Spawned BEFORE the answer leaves, for the reason
+                // R4-A gives on the mesh path: the responder's
+                // `accept_rtc` inbox must exist before the browser's
+                // first Noise msg1 can arrive.
+                self.spawn_dialog_completion(claimed_node_id, dialog, peer, false);
+                Ok(sdp)
+            }
+            super::rtc::SignalOutcome::Reject { dialog, reason } => {
+                self.release_signal_budget(claimed_node_id, dialog);
+                Err(AdapterError::Connection(format!(
+                    "the offer was refused: {reason:?}"
+                )))
+            }
+            other => Err(AdapterError::Connection(format!(
+                "unexpected outcome for a bootstrap offer: {other:?}"
+            ))),
+        }
+    }
+
+    /// Apply a browser's trickled ICE candidate to its dialog
+    /// (Stage 4b). Same engine path as an inbound `0x0D02`
+    /// `Candidate`; a candidate for a dialog this node does not hold
+    /// is refused rather than ignored, so the trickle socket can
+    /// close with a typed code.
+    #[cfg(feature = "webrtc")]
+    pub async fn apply_bootstrap_candidate(
+        &self,
+        claimed_node_id: u64,
+        dialog: u64,
+        candidate: String,
+        mid: String,
+    ) -> Result<(), AdapterError> {
+        let driver = self
+            .rtc_driver
+            .as_ref()
+            .ok_or_else(|| AdapterError::Connection("rtc is not configured".into()))?;
+        let ice_deadline = self
+            .config
+            .rtc
+            .as_ref()
+            .map(|rtc| rtc.ice_deadline)
+            .unwrap_or_else(|| Duration::from_secs(10));
+        let outcome = {
+            let mut table = self.rtc_dialogs.lock().await;
+            super::rtc::handle_signal(
+                driver,
+                &mut table,
+                claimed_node_id,
+                super::rtc::RtcSignalMsg::Candidate {
+                    dialog,
+                    candidate,
+                    mid,
+                },
+                ice_deadline,
+            )
+            .await
+        };
+        match outcome {
+            super::rtc::SignalOutcome::CandidateApplied => Ok(()),
+            _ => Err(AdapterError::Connection(
+                "no such dialog on this anchor".into(),
+            )),
+        }
+    }
+
+    /// This anchor's host candidate in SDP form, for the trickle
+    /// socket to send (Stage 4b). The same string
+    /// `trickle_local_candidate` puts on a `0x0D02` frame — the
+    /// public address when the operator configured one, since a
+    /// browser outside the NAT cannot use the bound address.
+    #[cfg(feature = "webrtc")]
+    pub fn bootstrap_host_candidate(&self) -> Option<String> {
+        let driver = self.rtc_driver.as_ref()?;
+        let addr = self
+            .config
+            .rtc
+            .as_ref()
+            .and_then(|rtc| rtc.public_addr)
+            .unwrap_or_else(|| driver.local_addr());
+        str0m::Candidate::host(addr, "udp")
+            .ok()
+            .map(|c| c.to_sdp_string())
+    }
+
+    /// End a bootstrap dialog the browser abandoned (Stage 4b): the
+    /// trickle socket closing before the channel opens is the
+    /// browser going away, and the attempt should not sit until its
+    /// deadline holding a budget slot.
+    #[cfg(feature = "webrtc")]
+    pub async fn end_bootstrap_dialog(&self, claimed_node_id: u64, dialog: u64) {
+        let entry = {
+            let mut table = self.rtc_dialogs.lock().await;
+            table.remove(claimed_node_id, dialog)
+        };
+        if let (Some(entry), Some(driver)) = (entry, self.rtc_driver.as_ref()) {
+            let _ = driver.close(entry.peer).await;
+        }
+        self.release_signal_budget(claimed_node_id, dialog);
+    }
+
+    /// The §12 global provisional bound this anchor was configured
+    /// with, so the listener can refuse an offer it knows the
+    /// admission layer would immediately shed (Stage 4b).
+    #[cfg(feature = "webrtc")]
+    pub fn rtc_max_provisional(&self) -> usize {
+        self.config
+            .rtc
+            .as_ref()
+            .map(|rtc| rtc.max_provisional)
+            .unwrap_or(0)
+    }
+
+    /// The address this anchor publishes as `rtc_addr` (Stage 4b:
+    /// `GET /rtc/anchor` reports it so a browser can aim its ICE at
+    /// the same socket the announcement names).
+    #[cfg(feature = "webrtc")]
+    pub fn rtc_public_addr(&self) -> Option<SocketAddr> {
+        self.config.rtc.as_ref().and_then(|rtc| rtc.public_addr)
+    }
+
+    /// `rtc_stats()` without requiring a driver to exist.
+    #[cfg(feature = "webrtc")]
+    fn rtc_stats_opt(&self) -> Option<&Arc<super::rtc::RtcStats>> {
+        self.rtc_driver.as_ref().map(|d| d.stats())
+    }
+
     /// Release one dialog's `SignalBudget` slot (R5).
     ///
     /// Every terminal path calls this: expiry, our own `Reject`,
@@ -34950,8 +35155,15 @@ impl MeshNode {
             return ann;
         };
         let bootstrap = if rtc.serve_bootstrap {
-            rtc.public_addr
-                .map(|addr| format!("https://{addr}/rtc"))
+            // **Stage 4b: the configured listener URL is the real
+            // one.** 4a could only synthesise `https://<rtc addr>/rtc`
+            // from the ICE socket — an address no browser can present
+            // to a certificate — and that placeholder was a carried
+            // gap. It remains only as the fallback for an operator
+            // who turned the flag on without naming a URL.
+            rtc.bootstrap_url
+                .clone()
+                .or_else(|| rtc.public_addr.map(|addr| format!("https://{addr}/rtc")))
                 .or_else(|| {
                     self.rtc_driver
                         .as_ref()

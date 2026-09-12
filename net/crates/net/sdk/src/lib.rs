@@ -143,6 +143,16 @@ pub mod enrollment;
 // reason `enrollment` does (identity, base64, blake3).
 #[cfg(feature = "net")]
 pub mod bootstrap_credential;
+// The browser bootstrap LISTENER (plan §5 Layer 0, Stage 4 bullet
+// 3): HTTPS `POST /rtc/offer`, `GET /rtc/anchor`, and the `wss`
+// trickle socket, over the core's production dialog path. It lives
+// here rather than in the core for the reason the MCP adapter does:
+// the credential is an SDK type, and the core must not grow an HTTP
+// server in its dependency tree.
+#[cfg(feature = "rtc-bootstrap")]
+pub mod rtc_bootstrap;
+#[cfg(feature = "rtc-bootstrap")]
+mod rtc_bootstrap_acme;
 // Machine-shared device registry — the operator's inventory of enrolled devices
 // (Hermes V2 Phase 1), backing `mesh.devices()`. Inventory/display state, not
 // enforcement (that's `revocation`); mirrors the revocation store's file

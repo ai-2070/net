@@ -71,6 +71,68 @@ getrandom = { version = "0.4", optional = true }
 # (`enrollment::InviteToken::encode`). Version-matched to core (`0.22`).
 # Pulled in with the `net` feature (enrollment rides the same surface).
 base64 = { version = "0.23", optional = true }
+# --- Stage 4b bootstrap listener (feature `rtc-bootstrap`) --------
+# axum 0.8 is the hyper-1 / http-1 / tower-0.5 line the workspace
+# already resolves; `ws` is the trickle socket. Default features
+# that would pull a second TLS stack are off.
+axum = { version = "0.8", optional = true, default-features = false, features = [
+    "http1",
+    "json",
+    "query",
+    "tokio",
+    "ws",
+] }
+# The SAME rustls net-payments pins: 0.23, ring provider, and never
+# installed process-globally (payments/src/tls_roots.rs explains
+# why — a global would leak into other rustls users in the same
+# process, e.g. the Python extension).
+rustls = { version = "0.23", optional = true, default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+    "logging",
+] }
+tokio-rustls = { version = "0.26", optional = true, default-features = false, features = [
+    "ring",
+    "tls12",
+] }
+rustls-pemfile = { version = "2", optional = true }
+tower-http = { version = "0.6", optional = true, default-features = false, features = [
+    "cors",
+] }
+hyper = { version = "1", optional = true, default-features = false, features = [
+    "http1",
+    "server",
+] }
+tower = { version = "0.5", optional = true, default-features = false }
+tracing = { version = "0.1", optional = true, default-features = false, features = [
+    "std",
+] }
+hyper-util = { version = "0.1", optional = true, default-features = false, features = [
+    "tokio",
+    "server",
+    "http1",
+] }
+futures-util = { version = "0.3", optional = true, default-features = false }
+# ACME (HTTP-01) for the browser-trusted certificate path.
+# `default-features = false` matters: the default pulls `aws-lc-rs`,
+# whose build needs cmake + a C toolchain — the exact cost the
+# workspace avoids everywhere except `webrtc` itself. `ring` is the
+# provider the rest of this feature already uses.
+instant-acme = { version = "0.8", optional = true, default-features = false, features = [
+    "ring",
+    "hyper-rustls",
+] }
+# The keypair + CSR the ACME order is finalized with.
+rcgen = { version = "0.14", optional = true, default-features = false, features = [
+    "pem",
+    "ring",
+] }
+# The candidate string the anchor trickles is str0m's own SDP form;
+# building it here rather than re-implementing the grammar.
+str0m = { version = "0.23.1", optional = true, default-features = false, features = [
+    "rust-crypto",
+] }
 
 [dev-dependencies]
 # Re-declare the core dependency with its `fixtures` seam for THIS
@@ -89,6 +151,10 @@ net = { package = "net-mesh", version = "0.36.0", path = "..", features = ["fixt
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
 # Isolated temp dirs for the pin-store file tests.
 tempfile = "3"
+# `tests/bootstrap_dep_boundary.rs` reads this crate's and the core's
+# manifests to hold the "a default build has no HTTP server" line,
+# the same way the MCP adapter's boundary test reads its own.
+toml = "0.9"
 # Workspace lock discipline (clippy disallows std::sync::Mutex::lock);
 # the paid-tool serve test's scripted gate records under a lock.
 parking_lot = "0.12"
@@ -105,6 +171,38 @@ schemars = "1"
 # consumer can build the browser-facing anchor whose enrollment
 # service the core's §12 admission gates.
 webrtc = ["net/webrtc"]
+# Stage 4b: the browser bootstrap listener — HTTPS `POST /rtc/offer`,
+# `GET /rtc/anchor`, and the `wss` trickle socket, over the core's
+# production dialog path.
+#
+# It lives in the SDK, not the core, for the reason the MCP adapter
+# does: the credential type is an SDK type, and the core must not
+# grow an HTTP server in its dependency tree. A default build of
+# either crate has no axum and no rustls — asserted by
+# `tests/bootstrap_dep_boundary.rs`.
+#
+# rustls is the version `net-payments` already pins (0.23, ring),
+# so the workspace keeps exactly one.
+rtc-bootstrap = [
+    "net",
+    "webrtc",
+    "dep:axum",
+    "dep:rustls",
+    "dep:tokio-rustls",
+    "dep:rustls-pemfile",
+    "dep:tower-http",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:tower",
+    "dep:tracing",
+    "dep:futures-util",
+    "dep:str0m",
+    "dep:instant-acme",
+    "dep:rcgen",
+    "tokio/net",
+    "tokio/rt-multi-thread",
+    "tokio/io-util",
+]
 # Out-of-the-box "I downloaded the SDK and it just works": real
 # mesh transport + NAT traversal + typed nRPC + capability-based
 # service discovery + daemon supervision + replica/fork/standby
