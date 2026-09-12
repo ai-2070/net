@@ -419,29 +419,55 @@ async fn the_full_section_9_sequence_with_the_three_part_witness() {
         attempts_before + 1,
         "the offer opens a real local endpoint and counts the ICE attempt"
     );
-    // Two loopback nodes cannot complete ICE against each other, so
-    // the dialog's own endpoint must reach its §9 step 6 end —
-    // `ice_deadline` expiry, counted as `ice_relayed` — before the
-    // fixture installs the pair. Otherwise the abandoned endpoint
-    // and the fixture's race for the same peer, and which one the
-    // driver reaps is a coin flip (observed: this witness failed 4
-    // runs in 5 in isolation).
+
+    // **R4: the SAME attempt completes.** No fixture substitution:
+    // the production owner carries this dialog's DataChannel-open
+    // event through Noise in the offerer's role and into the Stage 3
+    // fenced install. Before R4 nothing did, and this witness waited
+    // for the attempt to EXPIRE and then built a different
+    // connection with `connect_rtc_loopback` — which is not a
+    // continuation of the attempt under test.
+    let a_old_session = a.peer_session_id(b_id).expect("routed session");
+    let b_old_session = b.peer_session_id(a.node_id()).expect("routed session");
     assert!(
         wait_for(
-            || a.rtc_stats().ice_relayed() >= 1,
-            Duration::from_secs(15)
+            || matches!(a.peer_endpoint(b_id), Some(PeerAddr::Rtc(_))),
+            Duration::from_secs(20)
         )
         .await,
-        "§9 step 6: an attempt that never connects expires and is counted as          relayed — the pair stays on the anchor"
+        "§9 steps 3-6: the offered dialog must install the direct session itself"
+    );
+    let id_a = match a.peer_endpoint(b_id) {
+        Some(PeerAddr::Rtc(id)) => id,
+        other => panic!("expected a direct RTC endpoint, got {other:?}"),
+    };
+    assert_eq!(
+        a.rtc_stats().ice_relayed(),
+        0,
+        "the attempt connected, so nothing may be counted as relayed"
+    );
+    // Both endpoints' new session identities: a replacement is a new
+    // incarnation on both sides, not the old session at a new
+    // address.
+    assert_ne!(
+        a.peer_session_id(b_id),
+        Some(a_old_session),
+        "A's session must be a new incarnation after the upgrade"
     );
     assert!(
-        a.peer_session_id(b_id).is_some(),
-        "§9 step 6: an expired attempt must NOT touch the routed session"
+        wait_for(
+            || {
+                matches!(b.peer_endpoint(a.node_id()), Some(PeerAddr::Rtc(_)))
+                    && b.peer_session_id(a.node_id()) != Some(b_old_session)
+            },
+            Duration::from_secs(20)
+        )
+        .await,
+        "B must install its own side of the SAME exchange, with its own new \
+         session id (endpoint {:?}, session {:?})",
+        b.peer_endpoint(a.node_id()),
+        b.peer_session_id(a.node_id())
     );
-
-    let (id_a, _id_b) = connect_rtc_loopback(&a, &b)
-        .await
-        .expect("DataChannel + Noise replacing the routed session");
     assert_eq!(
         a.peer_endpoint(b_id),
         Some(PeerAddr::Rtc(id_a)),

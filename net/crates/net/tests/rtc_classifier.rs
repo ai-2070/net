@@ -41,6 +41,17 @@ fn rtc_config() -> RtcConfig {
     RtcConfig::new().with_bind_addr("127.0.0.1:0".parse().expect("addr"))
 }
 
+/// A node with RTC and the direct-upgrade scan enabled.
+async fn node_with(rtc: Option<RtcConfig>, auto_upgrade: bool) -> Arc<MeshNode> {
+    let mut cfg = config(rtc);
+    cfg.auto_direct_upgrade = auto_upgrade;
+    Arc::new(
+        MeshNode::new(EntityKeypair::generate(), cfg)
+            .await
+            .expect("MeshNode::new"),
+    )
+}
+
 async fn connect_udp(a: &Arc<MeshNode>, b: &Arc<MeshNode>) {
     let a_id = a.node_id();
     let b_pub = *b.public_key();
@@ -128,4 +139,65 @@ async fn an_rtc_relay_does_not_make_a_udp_target_an_ice_pair() {
         PairAction::Ice,
         "a target that owns a direct RTC attachment is still an ICE pair"
     );
+}
+
+/// R4: an `Ice` pair **schedules the upgrade attempt**. The scan
+/// used to mark such a peer done — "ICE already negotiated it" —
+/// with nothing anywhere scheduling the dialog, so an RTC-capable
+/// routed pair stayed on the relay for the life of its peer entry.
+///
+/// Nothing here calls `offer_direct_path`: the upgrade loop must do
+/// it, and the production owner must carry it through to the
+/// installed direct session.
+///
+/// Inverse: mark the scan done on `PairAction::Ice` again — the
+/// pair stays routed for ever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn an_ice_pair_schedules_the_upgrade_attempt() {
+    let a = node_with(Some(rtc_config()), true).await;
+    let r = node_with(None, false).await;
+    let b = node_with(Some(rtc_config()), true).await;
+
+    connect_udp(&a, &r).await;
+    connect_udp(&r, &b).await;
+    a.start_arc();
+    r.start_arc();
+    b.start_arc();
+
+    // Both ends announce `transport:rtc`, which is what makes the
+    // pair classify `Ice`.
+    let caps = net::adapter::net::behavior::capability::CapabilitySet::new();
+    a.announce_capabilities(caps.clone())
+        .await
+        .expect("A announces");
+    b.announce_capabilities(caps).await.expect("B announces");
+
+    let b_id = b.node_id();
+    a.connect_via(r.local_addr(), b.public_key(), b_id)
+        .await
+        .expect("routed handshake");
+    assert!(!a.peer_is_direct(b_id), "the pair starts on the relay");
+    assert!(
+        wait_for(
+            || a.pair_action_for_test(b_id) == PairAction::Ice,
+            Duration::from_secs(15)
+        )
+        .await,
+        "precondition: the pair must classify Ice (got {:?})",
+        a.pair_action_for_test(b_id)
+    );
+
+    assert!(
+        wait_for(
+            || matches!(a.peer_endpoint(b_id), Some(PeerAddr::Rtc(_))),
+            Duration::from_secs(30)
+        )
+        .await,
+        "the upgrade scan must schedule the dialog and the production owner \
+         must install it, with no test calling offer_direct_path (endpoint {:?}, \
+         attempts {})",
+        a.peer_endpoint(b_id),
+        a.rtc_stats().ice_attempted()
+    );
+    assert!(a.peer_is_direct(b_id));
 }

@@ -9587,7 +9587,7 @@ impl PriorSession {
 /// The RTC install path's commit fence (H2): an intent on the exact
 /// `(slot, generation)` plus whether the incumbent must still be
 /// quiescent when the install lands.
-#[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+#[cfg(feature = "webrtc")]
 struct RtcInstallFence {
     intent: super::rtc::RtcInstallIntent,
     require_quiescent: bool,
@@ -22464,7 +22464,7 @@ impl MeshNode {
     /// `pending_direct_initiators` and waits for the dispatcher to
     /// forward msg2, which is transport-agnostic — the only thing
     /// that changes is which sink half carries msg1.
-    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    #[cfg(feature = "webrtc")]
     pub async fn connect_rtc(
         &self,
         peer: super::rtc::RtcPeerId,
@@ -22530,7 +22530,7 @@ impl MeshNode {
     /// — so msg1 arrives through the one dispatch owner, and msg2
     /// leaves through the same `PeerSink` every other send uses. The
     /// crypto is `NoiseHandshake` unchanged.
-    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    #[cfg(feature = "webrtc")]
     pub async fn accept_rtc(
         &self,
         peer: super::rtc::RtcPeerId,
@@ -22652,7 +22652,7 @@ impl MeshNode {
     /// **this** install published, never by whatever `peers` holds at
     /// the moment of the re-read — a competitor that superseded the
     /// entry in that instant keeps its session.
-    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    #[cfg(feature = "webrtc")]
     fn confirm_rtc_install_or_evict(
         &self,
         peer_node_id: u64,
@@ -22680,7 +22680,7 @@ impl MeshNode {
     /// is refused, not replaced: that is the same decision
     /// `attempt_direct_upgrade` makes, and the reason it makes it is
     /// that replacing a busy session drops its in-flight state.
-    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    #[cfg(feature = "webrtc")]
     fn rtc_upgrade_precheck(&self, peer_node_id: u64) -> Result<PriorSession, AdapterError> {
         let Some(entry) = self.peers.get(&peer_node_id) else {
             // H2: "nothing is installed" is an expectation the commit
@@ -22710,7 +22710,7 @@ impl MeshNode {
     /// it. Everything else — application streams, unacked reliable
     /// data — still defers, which is the C3 decision
     /// `attempt_direct_upgrade` makes.
-    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    #[cfg(feature = "webrtc")]
     fn session_is_busy(info: &PeerInfo) -> bool {
         let signalling_stream = super::rtc::SUBPROTOCOL_RTC_SIGNAL as u64;
         info.session
@@ -22726,7 +22726,7 @@ impl MeshNode {
     /// and carries the claim the commit re-validates under the
     /// transport's slot lock. `require_quiescent` is set whenever
     /// there is an incumbent to preserve.
-    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    #[cfg(feature = "webrtc")]
     fn rtc_install_fence(
         &self,
         peer: super::rtc::RtcPeerId,
@@ -22747,9 +22747,11 @@ impl MeshNode {
     }
 
     /// Test hook: park an RTC install between "Noise completed" and
-    /// "commit" (H2). Unarmed in production — one relaxed load.
-    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    /// "commit" (H2). Unarmed in production — one relaxed load, and
+    /// nothing at all in a build without fixtures.
+    #[cfg(feature = "webrtc")]
     async fn rtc_install_pause_point(&self) {
+        #[cfg(any(test, feature = "fixtures"))]
         self.rtc_install_pause.wait_if_armed().await;
     }
 
@@ -22794,7 +22796,7 @@ impl MeshNode {
     /// incumbent, and — for an upgrade — the incumbent's
     /// quiescence. A precheck that answered before the Noise wait
     /// answers a question about the past.
-    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    #[cfg(feature = "webrtc")]
     fn install_direct_fenced(
         &self,
         peer_node_id: u64,
@@ -22894,7 +22896,7 @@ impl MeshNode {
             transport,
             keys,
             expectation,
-            #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+            #[cfg(feature = "webrtc")]
             None,
         )
     }
@@ -22905,9 +22907,7 @@ impl MeshNode {
         transport: PeerTransport,
         keys: SessionKeys,
         expectation: PriorSession,
-        #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))] fence: Option<
-            &RtcInstallFence,
-        >,
+        #[cfg(feature = "webrtc")] fence: Option<&RtcInstallFence>,
     ) -> PeerTransitionOutcome {
         // OLB-2B.3c step 2, HOLD-2 item 1: the peer swap and the republication
         // it causes are ONE serialized transition. The session publication gate
@@ -22923,7 +22923,7 @@ impl MeshNode {
                     transport,
                     keys,
                     expectation,
-                    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+                    #[cfg(feature = "webrtc")]
                     fence,
                 )
             });
@@ -22963,9 +22963,7 @@ impl MeshNode {
         transport: PeerTransport,
         keys: SessionKeys,
         expectation: PriorSession,
-        #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))] fence: Option<
-            &RtcInstallFence,
-        >,
+        #[cfg(feature = "webrtc")] fence: Option<&RtcInstallFence>,
     ) -> PeerTransitionOutcome {
         use dashmap::mapref::entry::Entry;
 
@@ -22975,7 +22973,7 @@ impl MeshNode {
         // is observed here instead of publishing a dead peer that
         // nothing will ever evict (its close notification was
         // consumed while no reverse index existed).
-        #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+        #[cfg(feature = "webrtc")]
         if fence.is_some_and(|f| !f.intent.still_live()) {
             return PeerTransitionOutcome::lost();
         }
@@ -23044,7 +23042,7 @@ impl MeshNode {
                         // the id CAS alone happily replaced a session
                         // that had become busy — losing exactly the
                         // in-flight state the gate exists to protect.
-                        #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+                        #[cfg(feature = "webrtc")]
                         if fence.is_some_and(|f| f.require_quiescent)
                             && Self::session_is_busy(occ.get())
                         {
@@ -25281,13 +25279,26 @@ impl MeshNode {
                 };
                 let Some(node) = weak.upgrade() else { break };
                 match outcome {
-                    super::rtc::SignalOutcome::Answer { dialog, sdp } => {
+                    super::rtc::SignalOutcome::Answer { dialog, sdp, peer } => {
                         let _ = node
                             .send_rtc_signal(
                                 from_node,
                                 &super::rtc::RtcSignalMsg::Answer { dialog, sdp },
                             )
                             .await;
+                        // R4: the answerer trickles its own
+                        // candidate and owns the completion of this
+                        // dialog — DataChannel open, Noise in the
+                        // answerer's role, fenced install.
+                        node.trickle_local_candidate(from_node, dialog).await;
+                        node.spawn_dialog_completion(from_node, dialog, peer, false);
+                    }
+                    super::rtc::SignalOutcome::AnswerApplied { dialog, peer } => {
+                        // R4: the offerer's half. ICE is running;
+                        // the completion owner takes it from the
+                        // channel-open event onward.
+                        node.trickle_local_candidate(from_node, dialog).await;
+                        node.spawn_dialog_completion(from_node, dialog, peer, true);
                     }
                     super::rtc::SignalOutcome::Reject { dialog, reason } => {
                         let _ = node
@@ -25338,7 +25349,118 @@ impl MeshNode {
                 .map_err(AdapterError::Connection)?
         };
         self.send_rtc_signal(peer_node_id, &offer).await?;
+        // R4: trickle our own host candidate immediately. On a
+        // native pair both sides know their bind address, so the
+        // pair does not have to wait for a gathering round trip
+        // (S0b measured trickle at 6.6x the floor). The reflex /
+        // relay candidates a NAT'd browser needs are 4b's.
+        self.trickle_local_candidate(peer_node_id, dialog).await;
         Ok(dialog)
+    }
+
+    /// Send this node's host candidate for `dialog` (R4).
+    #[cfg(feature = "webrtc")]
+    async fn trickle_local_candidate(&self, peer_node_id: u64, dialog: u64) {
+        let Some(driver) = self.rtc_driver.as_ref() else {
+            return;
+        };
+        let Ok(candidate) = str0m::Candidate::host(driver.local_addr(), "udp") else {
+            return;
+        };
+        let _ = self
+            .send_rtc_signal(
+                peer_node_id,
+                &super::rtc::RtcSignalMsg::Candidate {
+                    dialog,
+                    candidate: candidate.to_sdp_string(),
+                    mid: "0".to_string(),
+                },
+            )
+            .await;
+    }
+
+    /// **The production completion owner for one dialog (R4).**
+    ///
+    /// This is the piece that was missing: the engine processed
+    /// Offer/Answer/Candidate and expired attempts, but nothing
+    /// carried the dialog's DataChannel-open event through Noise
+    /// and the fenced install — `connect_rtc`/`accept_rtc` were
+    /// reachable only from fixtures, and the flagship test waited
+    /// for the attempt to expire and then built a *different*
+    /// connection with `connect_rtc_loopback`.
+    ///
+    /// Bounded by the dialog's own `ice_deadline`: if the channel
+    /// never opens, the task ends and `expire_dialogs` reclaims the
+    /// attempt exactly as before — the routed session is untouched.
+    /// On success the attempt is retired so the expiry sweep cannot
+    /// close the endpoint the install now owns.
+    #[cfg(feature = "webrtc")]
+    fn spawn_dialog_completion(
+        self: &Arc<Self>,
+        peer_node_id: u64,
+        dialog: u64,
+        peer: super::rtc::RtcPeerId,
+        offerer: bool,
+    ) {
+        let Some(driver) = self.rtc_driver.clone() else {
+            return;
+        };
+        let ice_deadline = self
+            .config
+            .rtc
+            .as_ref()
+            .map(|rtc| rtc.ice_deadline)
+            .unwrap_or_else(|| Duration::from_secs(10));
+        let node = Arc::clone(self);
+        let dialogs = Arc::clone(&self.rtc_dialogs);
+        let handle = tokio::spawn(async move {
+            // 1. The dialog's own DataChannel-open event.
+            if tokio::time::timeout(ice_deadline, driver.await_open(peer))
+                .await
+                .map(|r| r.is_err())
+                .unwrap_or(true)
+            {
+                // Never opened: leave the attempt to the expiry
+                // sweep, which is what keeps the routed session.
+                return;
+            }
+            // 2. Noise over it, in this dialog's role. The offerer
+            //    initiates, so both sides do not send msg1.
+            let peer_pubkey = node
+                .peer_announced_noise_pubkey(peer_node_id)
+                .or_else(|| node.peer_static_x25519(peer_node_id));
+            let installed = if offerer {
+                match peer_pubkey {
+                    Some(key) => node.connect_rtc(peer, &key, peer_node_id).await.map(|_| ()),
+                    None => Err(AdapterError::Connection(
+                        "rtc upgrade: no announced Noise key for the peer".into(),
+                    )),
+                }
+            } else {
+                node.accept_rtc(peer, peer_node_id).await.map(|_| ())
+            };
+            // 3. Retire the attempt either way: on success so the
+            //    expiry sweep cannot close the endpoint the install
+            //    now owns, on failure because the attempt is over.
+            {
+                let mut table = dialogs.lock().await;
+                table.remove(peer_node_id, dialog);
+            }
+            match installed {
+                Ok(()) => {
+                    driver.stats().note_ice_direct();
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        peer = format!("{peer_node_id:#x}"),
+                        "rtc upgrade did not install; the routed session stands"
+                    );
+                    let _ = driver.close(peer).await;
+                }
+            }
+        });
+        self.tasks.lock().push(handle);
     }
 
     /// Sweep provisional sessions: reclaim the expired and, when
@@ -42908,7 +43030,35 @@ impl MeshNode {
             // so it is done with this peer rather than deferred —
             // re-checking would re-derive the same answer forever.
             PairAction::Ice => {
-                self.upgrade_record_done(peer_id);
+                // **R4:** an `Ice` pair is not *already* upgraded —
+                // it is the pair whose upgrade is an RTC dialog.
+                // Marking the scan done here pinned such a peer to
+                // the relay for the life of its peer entry, with
+                // nothing ever scheduling the attempt. Offer the
+                // direct path, and defer on the existing retry
+                // ladder so a failed or expired attempt is
+                // revisited rather than abandoned.
+                #[cfg(feature = "webrtc")]
+                if !self.peer_is_direct(peer_id) {
+                    if let Some(node) = self.self_weak.get().and_then(|w| w.upgrade()) {
+                        tokio::spawn(async move {
+                            if let Err(e) = node.offer_direct_path(peer_id).await {
+                                tracing::debug!(
+                                    error = %e,
+                                    peer = format!("{peer_id:#x}"),
+                                    "rtc upgrade: offer not sent"
+                                );
+                            }
+                        });
+                    }
+                }
+                self.upgrade_record_defer(
+                    peer_id,
+                    upgrade_jitter(
+                        upgrade_jitter_seed(self.node_id, peer_id, 0),
+                        SKIPPUNCH_RECHECK,
+                    ),
+                );
                 return;
             }
             PairAction::SkipPunch => {

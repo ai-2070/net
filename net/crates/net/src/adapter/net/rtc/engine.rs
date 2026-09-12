@@ -105,9 +105,17 @@ pub enum SignalOutcome {
         dialog: u64,
         /// The answer SDP produced by the local driver.
         sdp: String,
+        /// The local endpoint this dialog runs on (R4): the caller
+        /// trickles its candidate and owns the completion.
+        peer: RtcPeerId,
     },
-    /// The answer was applied; ICE is now running.
-    AnswerApplied,
+    /// The answer was applied; ICE is now running on `peer` (R4).
+    AnswerApplied {
+        /// The dialog this answer belongs to.
+        dialog: u64,
+        /// The local endpoint ICE is running on.
+        peer: RtcPeerId,
+    },
     /// The candidate was applied.
     CandidateApplied,
     /// The dialog ended.
@@ -156,6 +164,7 @@ pub async fn handle_signal(
                     SignalOutcome::Answer {
                         dialog,
                         sdp: answer,
+                        peer,
                     }
                 }
                 Err(_) => SignalOutcome::Reject {
@@ -172,7 +181,7 @@ pub async fn handle_signal(
                 return SignalOutcome::Ignored;
             };
             match driver.accept_answer(peer, sdp).await {
-                Ok(()) => SignalOutcome::AnswerApplied,
+                Ok(()) => SignalOutcome::AnswerApplied { dialog, peer },
                 Err(_) => {
                     dialogs.remove(from_node, dialog);
                     SignalOutcome::Reject {
