@@ -4644,8 +4644,8 @@ jobs:
           check_floor rtc_install_race 8
           check_floor rtc_reclaim 5
           check_floor rtc_classifier 2
-          check_floor rtc_admission_probes 8
-          check_floor rtc_signalling 9
+          check_floor rtc_admission_probes 11
+          check_floor rtc_signalling 11
           check_floor rtc_admission 19
           REQUIRED="
           rtc_repairs:scheduled_fire_and_forget_packets_reach_rtc_admission_and_the_peer
@@ -4694,6 +4694,11 @@ jobs:
           rtc_admission_probes:kyra_old_success_cannot_promote_replacement_request
           rtc_admission_probes:kyra_fifth_enrollment_request_is_not_executed
           rtc_admission_probes:kyra_engine_must_install_without_loopback_noise_fixture
+          rtc_admission_probes:kyra_same_call_id_old_success_must_not_promote_replacement
+          rtc_admission_probes:kyra_failed_inflight_reservation_does_not_create_an_owner
+          rtc_admission_probes:kyra_terminal_handler_error_releases_enrollment_owner
+          rtc_signalling:kyra_unknown_candidates_cannot_own_dialog_budget
+          rtc_signalling:kyra_reject_then_late_candidate_does_not_resurrect_reservation
           rtc_signalling:signalling_crosses_an_anchor_that_cannot_read_it
           rtc_signalling:the_full_section_9_sequence_with_the_three_part_witness
           rtc_signalling:over_budget_signalling_is_dropped_and_counted

@@ -35055,6 +35055,14 @@ impl MeshNode {
         self.close_provisional_session(node_id, endpoint, session_id)
     }
 
+    /// Is there a reservation for this **exact** key (Kyra's
+    /// seam)? The witnesses need to see the key, not infer it from
+    /// a promotion that may have consumed someone else's.
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    pub fn kyra_has_enrollment_reservation(&self, node: u64, session: u64, call: u64) -> bool {
+        self.pending_promotions.contains_key(&(node, session, call))
+    }
+
     /// Arm an enrollment reservation exactly as the gate does
     /// (R2 witness seam).
     #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]

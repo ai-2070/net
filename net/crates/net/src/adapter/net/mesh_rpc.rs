@@ -5462,6 +5462,24 @@ impl MeshNode {
         self.rpc_route_or_no_route(target_node_id, service).is_ok()
     }
 
+    /// [`Self::publish_rpc_request_unsubscribed`] with a
+    /// **caller-selected `call_id`** (Kyra's seam).
+    ///
+    /// Call ids are sender-controlled on the wire, so a witness
+    /// must be able to choose one: reusing a call id across a
+    /// reconnection is exactly the R2-A schedule.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub async fn kyra_publish_fixed_request(
+        self: &Arc<Self>,
+        call_id: u64,
+        target_node_id: u64,
+        service: &str,
+        body: Bytes,
+    ) -> Result<(), AdapterError> {
+        self.publish_rpc_request_with_call_id(target_node_id, service, body, Some(call_id))
+            .await
+    }
+
     /// Publish an nRPC REQUEST **without** subscribing a reply
     /// channel (R1 witness seam).
     ///
@@ -5479,6 +5497,18 @@ impl MeshNode {
         service: &str,
         body: Bytes,
     ) -> Result<(), AdapterError> {
+        self.publish_rpc_request_with_call_id(target_node_id, service, body, None)
+            .await
+    }
+
+    #[cfg(any(test, feature = "fixtures"))]
+    async fn publish_rpc_request_with_call_id(
+        self: &Arc<Self>,
+        target_node_id: u64,
+        service: &str,
+        body: Bytes,
+        call_id: Option<u64>,
+    ) -> Result<(), AdapterError> {
         let route = self
             .rpc_route_or_no_route(target_node_id, service)
             .map_err(|e| AdapterError::Connection(format!("{e}")))?;
@@ -5493,7 +5523,7 @@ impl MeshNode {
             DISPATCH_RPC_REQUEST,
             0,
             self.identity_origin_hash(),
-            mint_random_call_id(),
+            call_id.unwrap_or_else(mint_random_call_id),
             0,
         );
         let mut buf = Vec::with_capacity(EVENT_META_SIZE + RPC_ROUTE_V1_SIZE + req.encoded_len());
