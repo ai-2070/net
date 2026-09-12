@@ -2127,6 +2127,33 @@ queues keyed by node; the enrollment deadline as sweep + TTL;
 client-streaming/duplex without their own witness; reflex/relay ICE,
 listener, TLS, browser → 4b.
 
+**Kyra: HOLD again at `7fccb155c` (reviewed head `bdba10bb7`).** The
+eight probes and the R4 completion owner are credited — "the missing
+native signalling-to-Noise/install continuation is genuinely
+repaired" — but five new probes fail (reviewer reproduced 8/3 and 0/2
+with her seams) and **exact-head CI is red** (RTC job 88/89:
+`a_reject_for_our_own_offer_correlates_and_releases`, slot still 1
+after 10 s — the reviewer missed this; the run was queued at record
+time). Brief `spikes/S4A_R2_BRIEF.md`; probes and seams vendored under
+`spikes/kyra/`.
+
+| # | Finding |
+|---|---|
+| R2-A (P1) | same **call id** across reconnection: `take_enrollment_reservation` consumes by node + call across session ids; the old success promoted the successor |
+| R3-A (P1) | `inflight_enrollments` increments before refusing (refused reservation strands a slot); a handler `Internal` error completes the RPC but never releases the owner, so the next request is refused at the gate; CANCEL treated as REQUEST; obsolete completion releases the current slot (source) |
+| R5-A (P1/P2) | Answer/Candidate for unknown dialogs create budget owners that never expire; a late Candidate after Reject recreates the slot — the executed mechanism consistent with the CI red |
+| R1 | `derived_admission` called under a `peers.entry` write guard re-enters `peers.get` — repair-induced lock recursion (source); migration dispatch before the gate; unmapped-handle bootstrap skips accounting; client-streaming/duplex unwitnessed |
+| R3 | `evict_session_at` prechecks under `peers.get` then removes by session id only; the budget-breach path bypasses the transition |
+| R4/R5 | duplicate Offers overwrite `(node, dialog)` and a stale completion releases the successor's budget; expiry can close a just-installed endpoint; completion tasks hold strong Arcs, ignore shutdown, accumulate; responder inbox registered after channel open |
+| R6 | the encoding break also reaches the **Node and Python bindings** (they call the SDK's join/enrollment/renewal), requests and replies, UDP too; `NMO1` classified without structural validation; bootstrap reply origin is first-claimed, not authenticated |
+| R7 | SDK CI (`ci.yml:2334`) lacks SDK-local `webrtc` — `enrollment_over_rtc` selects zero tests (exit 4) |
+
+§12.5's "still open" list is a disclosure ledger, not a waiver: the
+install-time `max_provisional` reservation, the aggregate bootstrap-byte
+bound, the 10 s enrollment deadline with handler cancellation, subscribe
+nonce/retry bounds and incarnation-keyed signal queues remain contract
+obligations unless an explicit policy is proposed to the owner.
+
 ## Stage 5 — `net-leaf` + `@net-mesh/browser`
 
 - Leaf crate and TypeScript wrapper; identity storage and leader election
