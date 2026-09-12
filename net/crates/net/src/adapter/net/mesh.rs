@@ -9485,6 +9485,15 @@ enum PriorSession {
     /// Replace only this exact incarnation.
     Exactly(u64),
     /// Install only if there is still **no** peer.
+    ///
+    /// Only the RTC install path (fixtures/test) takes this
+    /// expectation today; a default build has no constructor for
+    /// it, and the arm still has to exist so the installer's match
+    /// is total.
+    #[cfg_attr(
+        not(all(feature = "webrtc", any(test, feature = "fixtures"))),
+        allow(dead_code)
+    )]
     Absent,
 }
 

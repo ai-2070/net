@@ -1481,7 +1481,7 @@ async fn a_connection_reset_is_swallowed_by_the_production_arm_with_siblings_int
     let mut cfg = StreamConfig::new();
     cfg.reliability = Reliability::Reliable;
     let to_b_stream = a
-        .open_stream(b.node_id(), 0x0B01, cfg.clone())
+        .open_stream(b.node_id(), 0x0B01, cfg)
         .expect("stream to b");
     let to_c_stream = a
         .open_stream(c.node_id(), 0x0C01, cfg)

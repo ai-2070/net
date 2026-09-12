@@ -446,18 +446,20 @@ impl RtcDriverHandle {
             home: Arc::clone(&self.task),
             handle: Some(handle),
         };
-        let joined = {
-            let handle = slot.handle.as_mut().expect("just set");
-            tokio::time::timeout(Duration::from_secs(2), handle).await
-        };
-        if joined.is_err() {
-            tracing::debug!("rtc driver did not exit in time; aborting");
-            let handle = slot.handle.as_mut().expect("still held");
-            handle.abort();
-            // The join the abort is not: without this the method
-            // returned while cancellation — and the socket's
-            // release — was still pending.
-            let _ = handle.await;
+        // `slot.handle` is `Some` here by construction — it is set
+        // immediately above and taken only after this block.
+        if let Some(handle) = slot.handle.as_mut() {
+            if tokio::time::timeout(Duration::from_secs(2), &mut *handle)
+                .await
+                .is_err()
+            {
+                tracing::debug!("rtc driver did not exit in time; aborting");
+                handle.abort();
+                // The join the abort is not: without this the
+                // method returned while cancellation — and the
+                // socket's release — was still pending.
+                let _ = handle.await;
+            }
         }
         // Joined: the task is gone, so drop the handle rather than
         // returning it.
@@ -611,11 +613,11 @@ async fn driver_loop(
         closed: closed.clone(),
         done,
     };
-    let mut sessions = &mut table.sessions;
-    let socket = table
-        .socket
-        .as_ref()
-        .expect("the socket is taken only by teardown");
+    let sessions = &mut table.sessions;
+    // Taken only by teardown, which runs after this borrow ends.
+    let Some(socket) = table.socket.as_ref() else {
+        return;
+    };
     let mut buf = vec![0u8; RECV_BUF];
 
     while !shutdown.load(Ordering::Acquire) {
@@ -646,9 +648,9 @@ async fn driver_loop(
             };
             handle_signal(
                 &config,
-                &mut sessions,
+                sessions,
                 advertised,
-                &socket,
+                socket,
                 &transport,
                 &stats,
                 &ingress,
@@ -673,8 +675,8 @@ async fn driver_loop(
             for slot in &slots {
                 pump_peer(
                     *slot,
-                    &mut sessions,
-                    &socket,
+                    sessions,
+                    socket,
                     &transport,
                     &stats,
                     &ingress,
@@ -721,7 +723,7 @@ async fn driver_loop(
                     }
                     drain_session(
                         session,
-                        &socket,
+                        socket,
                         &transport,
                         &stats,
                         &ingress,
@@ -784,9 +786,9 @@ async fn driver_loop(
             Ok(Ok((n, source))) => {
                 receive(
                     &config,
-                    &mut sessions,
+                    sessions,
                     advertised,
-                    &socket,
+                    socket,
                     &transport,
                     &stats,
                     &ingress,
