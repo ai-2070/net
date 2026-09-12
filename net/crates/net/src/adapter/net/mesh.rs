@@ -829,6 +829,12 @@ struct PeerEvictionCtx {
     peer_addrs: Arc<DashMap<u64, PeerAddr>>,
     session_id_to_node: Arc<DashMap<u64, u64>>,
     ack_ranges_peer_cache: Arc<DashMap<u64, (bool, Instant)>>,
+    /// The admission projection the §12 gates read (R3). Ordinary
+    /// eviction never cleared it, so a normally closed provisional
+    /// endpoint stayed in the projection for ever (Kyra:
+    /// `KYRA_CLOSE peer_gone=true provisional_projection=1`).
+    #[cfg(feature = "webrtc")]
+    provisional_endpoints: super::rtc::ProvisionalEndpoints,
     peer_transitions: PeerTransitions,
 }
 
@@ -848,6 +854,23 @@ impl PeerEvictionCtx {
         not(all(feature = "webrtc", any(test, feature = "fixtures"))),
         allow(dead_code)
     )]
+    fn evict_session_at(&self, node_id: u64, session_id: u64, endpoint: PeerAddr) -> bool {
+        // The selection must still describe what is installed: the
+        // same session on the same endpoint, and still provisional.
+        // Any of the three having moved on means this verdict is
+        // obsolete and owns nothing (R3).
+        let still_the_selection = self.peers.get(&node_id).is_some_and(|e| {
+            let info = e.value();
+            info.session.session_id() == session_id
+                && info.addr() == endpoint
+                && info.admission.is_provisional()
+        });
+        if !still_the_selection {
+            return false;
+        }
+        self.evict_session(node_id, session_id)
+    }
+
     fn evict_session(&self, node_id: u64, session_id: u64) -> bool {
         let peers = &self.peers;
         let addr_to_node = &self.addr_to_node;
@@ -872,6 +895,10 @@ impl PeerEvictionCtx {
                     peer_addrs.remove_if(&node_id, |_, a| *a == old_info.addr());
                     session_id_to_node.remove_if(&session_id, |_, n| *n == node_id);
                     ack_ranges_peer_cache.remove(&node_id);
+                    // R3: same projection cleanup on the
+                    // exact-session path.
+                    #[cfg(feature = "webrtc")]
+                    self.provisional_endpoints.remove(&old_info.addr());
                     true
                 });
                 (evicted, evicted)
@@ -914,6 +941,10 @@ impl PeerEvictionCtx {
                     peer_addrs.remove_if(&node_id, |_, a| *a == old_info.addr());
                     session_id_to_node.remove_if(&old_session_id, |_, n| *n == node_id);
                     ack_ranges_peer_cache.remove(&node_id);
+                    // R3: the admission projection is part of the
+                    // peer's state, so ordinary eviction clears it.
+                    #[cfg(feature = "webrtc")]
+                    self.provisional_endpoints.remove(&addr);
                     true
                 });
                 (evicted, evicted)
@@ -22597,6 +22628,8 @@ impl MeshNode {
             peer_addrs: Arc::clone(&self.peer_addrs),
             session_id_to_node: Arc::clone(&self.session_id_to_node),
             ack_ranges_peer_cache: Arc::clone(&self.ack_ranges_peer_cache),
+            #[cfg(feature = "webrtc")]
+            provisional_endpoints: Arc::clone(&self.provisional_endpoints),
             peer_transitions: self.peer_transitions.clone(),
         }
     }
@@ -28229,6 +28262,21 @@ impl MeshNode {
             // sequences. The sender's reliability is a property of the
             // traffic (the flag), not the receiver's default_reliable.
             let reliable_pkt = parsed.header.flags.contains(PacketFlags::RELIABLE);
+            // R3: a provisional sender's stream allocation is
+            // reserved BEFORE it happens — the two-stream and
+            // 64 KiB rules were declared constants that nothing
+            // checked, so arbitrary receive streams could be
+            // created pre-enrollment.
+            #[cfg(feature = "webrtc")]
+            if !Self::charge_provisional_stream(
+                &parsed.source,
+                stream_id,
+                payload_bytes as u64,
+                session,
+                ctx,
+            ) {
+                return;
+            }
             let stream = session
                 .get_or_create_stream_for_packet(stream_id, ctx.default_reliable || reliable_pkt);
             let accepted = stream.with_reliability(|r| r.on_receive(parsed.header.sequence));
@@ -34763,6 +34811,65 @@ impl MeshNode {
         true
     }
 
+    /// Charge one enrollment REQUEST frame and reserve its
+    /// in-flight slot against the sender's provisional budget (R3).
+    ///
+    /// `false` refuses the frame **before** dispatch, counted. Only
+    /// the enrollment service is charged: everything else a
+    /// provisional peer might send was already refused above.
+    #[cfg(all(feature = "webrtc", feature = "cortex"))]
+    fn charge_enrollment_request(&self, node_id: u64, service: &str) -> bool {
+        if service != super::rtc::ENROLL_SERVICE {
+            return true;
+        }
+        let refused = {
+            let Some(mut entry) = self.peers.get_mut(&node_id) else {
+                return false;
+            };
+            let super::rtc::PeerAdmission::Provisional { budget, .. } =
+                &mut entry.value_mut().admission
+            else {
+                return true;
+            };
+            budget
+                .charge_enroll_request()
+                .and_then(|()| budget.reserve_enrollment())
+                .is_err()
+        };
+        if refused {
+            if let Some(stats) = self.rtc_driver.as_ref().map(|d| d.stats()) {
+                stats.note_admission_refused_deliver();
+            }
+            return false;
+        }
+        true
+    }
+
+    /// Release the in-flight enrollment reservation on a terminal
+    /// outcome (R3): success, rejection, or a retired call.
+    #[cfg(feature = "webrtc")]
+    fn release_enrollment_slot(&self, node_id: u64) {
+        if let Some(mut entry) = self.peers.get_mut(&node_id) {
+            if let super::rtc::PeerAdmission::Provisional { budget, .. } =
+                &mut entry.value_mut().admission
+            {
+                budget.release_enrollment();
+            }
+        }
+    }
+
+    /// Run the reclaim decision for one selected incarnation
+    /// (R3 witness seam). `true` when this call owned the removal.
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    pub fn close_provisional_session_for_test(
+        &self,
+        node_id: u64,
+        endpoint: PeerAddr,
+        session_id: u64,
+    ) -> bool {
+        self.close_provisional_session(node_id, endpoint, session_id)
+    }
+
     /// Arm an enrollment reservation exactly as the gate does
     /// (R2 witness seam).
     #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
@@ -34898,6 +35005,7 @@ impl MeshNode {
         if reply_channel != super::rtc::enroll_reply_channel(origin) {
             return false;
         }
+        self.release_enrollment_slot(node_id);
         let Some((session_id, endpoint)) = self.take_enrollment_reservation(node_id, call_id)
         else {
             // Not this call's reservation to spend. A completion
@@ -34956,6 +35064,7 @@ impl MeshNode {
         if reply_channel != super::rtc::enroll_reply_channel(origin) {
             return;
         }
+        self.release_enrollment_slot(node_id);
         if self.take_enrollment_reservation(node_id, call_id).is_some() {
             if let Some(stats) = self.rtc_driver.as_ref().map(|d| d.stats()) {
                 stats.note_admission_rejected_outcome();
@@ -34985,39 +35094,60 @@ impl MeshNode {
             .map(|rtc| rtc.max_provisional)
             .unwrap_or(usize::MAX);
         let now = std::time::Instant::now();
-        let mut candidates: Vec<(u64, PeerAddr, std::time::Instant)> = Vec::new();
-        let mut expired: Vec<(u64, PeerAddr)> = Vec::new();
+        // R3: the snapshot carries the **session id** as well, so
+        // the removal names the exact incarnation it selected. The
+        // predicate used to be "is provisional", which let a sweep
+        // remove a *replacement* it never looked at, and close the
+        // endpoint of a session that had since been promoted.
+        let mut candidates: Vec<(u64, PeerAddr, u64, std::time::Instant)> = Vec::new();
+        let mut expired: Vec<(u64, PeerAddr, u64)> = Vec::new();
         for entry in self.peers.iter() {
             let info = entry.value();
             if let super::rtc::PeerAdmission::Provisional { since, .. } = info.admission {
+                let session_id = info.session.session_id();
                 if info.admission.is_expired(now) {
-                    expired.push((info.node_id, info.addr()));
+                    expired.push((info.node_id, info.addr(), session_id));
                 } else {
-                    candidates.push((info.node_id, info.addr(), since));
+                    candidates.push((info.node_id, info.addr(), session_id, since));
                 }
             }
         }
         // Oldest first, so the cap sheds the least promising.
-        candidates.sort_by_key(|(_, _, since)| *since);
+        candidates.sort_by_key(|(_, _, _, since)| *since);
         let over = candidates.len().saturating_sub(max);
         let mut doomed = expired;
-        doomed.extend(candidates.into_iter().take(over).map(|(n, a, _)| (n, a)));
+        doomed.extend(
+            candidates
+                .into_iter()
+                .take(over)
+                .map(|(n, a, s, _)| (n, a, s)),
+        );
 
-        let count = doomed.len();
-        for (node_id, endpoint) in doomed {
-            self.close_provisional_session(node_id, endpoint);
+        let mut count = 0usize;
+        for (node_id, endpoint, session_id) in doomed {
+            if self.close_provisional_session(node_id, endpoint, session_id) {
+                count += 1;
+            }
         }
         count
     }
 
     /// Close one provisional session and reclaim its state.
     #[cfg(feature = "webrtc")]
-    fn close_provisional_session(&self, node_id: u64, endpoint: PeerAddr) {
-        self.provisional_endpoints.remove(&endpoint);
-        self.peers
-            .remove_if(&node_id, |_, info| info.admission.is_provisional());
-        self.peer_addrs.remove_if(&node_id, |_, a| *a == endpoint);
-        self.addr_to_node.remove_if(&endpoint, |_, n| *n == node_id);
+    fn close_provisional_session(&self, node_id: u64, endpoint: PeerAddr, session_id: u64) -> bool {
+        // R3: route the removal through the exact-incarnation
+        // transition, and take side effects ONLY if it owned the
+        // removal. The old path removed by "still provisional" and
+        // closed the endpoint regardless — so a replacement could
+        // be removed, and a session promoted between selection and
+        // removal could still have its channel closed.
+        let owned = self
+            .peer_eviction_ctx()
+            .evict_session_at(node_id, session_id, endpoint);
+        if !owned {
+            return false;
+        }
+        self.retire_enrollment_reservations(node_id);
         if let (Some(driver), PeerAddr::Rtc(id)) = (self.rtc_driver.as_ref(), endpoint) {
             driver.stats().note_admission_reclaimed();
             let driver = driver.clone();
@@ -35025,6 +35155,7 @@ impl MeshNode {
                 let _ = driver.close(id).await;
             });
         }
+        true
     }
 
     /// §12 gate 5 for the nRPC carrier: may this caller's session
@@ -35075,6 +35206,12 @@ impl MeshNode {
             &action,
             inbound.origin_hash,
         );
+        // R3: charge the REQUEST and reserve the in-flight call
+        // BEFORE the frame is dispatched. The declared bounds
+        // (initial + 3 retries, one call in flight) existed only as
+        // constants — five sequential REQUESTs each reached the
+        // handler (Kyra: `KYRA_ENROLL executions=5`).
+        let allowed = allowed && self.charge_enrollment_request(inbound.from_node, service);
         if allowed {
             // §12 step 4 + R2: bind the reservation to the exact
             // call AND the incarnation that carried it. The
@@ -35217,6 +35354,42 @@ impl MeshNode {
         } else {
             super::rtc::PeerAdmission::default()
         }
+    }
+
+    /// Reserve a provisional sender's stream allocation (R3).
+    ///
+    /// `false` refuses the frame before any receive state is
+    /// created. Admitted and native senders are one map read.
+    #[cfg(feature = "webrtc")]
+    fn charge_provisional_stream(
+        source: &PeerAddr,
+        stream_id: u64,
+        bytes: u64,
+        session: &NetSession,
+        ctx: &DispatchCtx,
+    ) -> bool {
+        let Some(node_id) = ctx.addr_to_node.get(source).map(|e| *e.value()) else {
+            return true;
+        };
+        let new_stream = !session.stream_ids().contains(&stream_id);
+        let refused = {
+            let Some(mut entry) = ctx.peers.get_mut(&node_id) else {
+                return true;
+            };
+            let super::rtc::PeerAdmission::Provisional { budget, .. } =
+                &mut entry.value_mut().admission
+            else {
+                return true;
+            };
+            budget.charge_stream(new_stream, bytes).is_err()
+        };
+        if refused {
+            if let Some(stats) = ctx.rtc_stats.as_ref() {
+                stats.note_admission_refused_deliver();
+            }
+            return false;
+        }
+        true
     }
 
     /// **Gate 5 of 5 (§12), by authenticated source (R1).**

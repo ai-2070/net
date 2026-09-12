@@ -889,3 +889,190 @@ async fn an_old_rejection_after_replacement_consumes_nothing() {
         "the promoted session is the replacement, by identity"
     );
 }
+
+/// R3: a sweep that selected a session which is then **promoted**
+/// must not tear it down.
+///
+/// The old reclaim removed by "is provisional" and closed the
+/// endpoint regardless of whether the removal succeeded, so a
+/// session admitted between selection and removal lost its channel
+/// anyway.
+///
+/// Inverse: remove by `info.admission.is_provisional()` again (drop
+/// the exact-incarnation `evict_session_at`) — the promoted session
+/// survives the map but its endpoint is closed and the count is
+/// wrong.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_sweep_cannot_reclaim_a_session_promoted_after_selection() {
+    let (anchor, client, endpoint) = anchor_and_provisional_client().await;
+    let client_id = client.node_id();
+    let session = anchor.peer_session_id(client_id).expect("session");
+
+    // Promote first, then run the sweep with the selection it would
+    // have made a moment earlier: the exact incarnation is what the
+    // removal must name.
+    assert!(anchor.promote_admission(client_id, session, PeerAddr::Rtc(endpoint)));
+    let reclaimed =
+        anchor.close_provisional_session_for_test(client_id, PeerAddr::Rtc(endpoint), session);
+
+    assert!(
+        !reclaimed,
+        "an obsolete provisional verdict must not own the removal of an admitted session"
+    );
+    assert_eq!(
+        anchor.peer_session_id(client_id),
+        Some(session),
+        "the promoted session stays installed"
+    );
+    assert!(!anchor.peer_is_provisional(client_id), "and stays admitted");
+}
+
+/// R3: the same sweep against a **replacement**. The stale
+/// selection names an incarnation that no longer exists, so it owns
+/// nothing.
+///
+/// Inverse: the same one — the sweep removes the successor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_sweep_cannot_reclaim_a_replacement_it_never_selected() {
+    let (anchor, client, endpoint) = anchor_and_provisional_client().await;
+    let client_id = client.node_id();
+    let selected = anchor.peer_session_id(client_id).expect("session");
+    let replacement = anchor.replace_provisional_for_test(client_id, PeerAddr::Rtc(endpoint));
+    assert_ne!(selected, replacement);
+
+    let reclaimed =
+        anchor.close_provisional_session_for_test(client_id, PeerAddr::Rtc(endpoint), selected);
+    assert!(!reclaimed, "the stale selection owns nothing");
+    assert_eq!(
+        anchor.peer_session_id(client_id),
+        Some(replacement),
+        "the replacement survives a sweep that selected its predecessor"
+    );
+}
+
+/// R3: the enrollment REQUEST bound is charged **before** dispatch,
+/// and a full churn returns every admission counter to baseline.
+///
+/// Kyra's fifth-request probe covers the refusal; this covers the
+/// accounting around it: the in-flight reservation is released on
+/// each terminal outcome, so four sequential calls do not exhaust
+/// the one-in-flight slot, and the projection returns to zero after
+/// the session goes away.
+///
+/// Inverse: drop the `charge_enrollment_request` call from the gate
+/// — the fifth REQUEST is dispatched (Kyra's probe) — or drop
+/// `release_enrollment_slot` from the terminal paths: the second
+/// call is refused although the first had finished.
+#[cfg(feature = "cortex")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn enrollment_requests_are_charged_and_released_and_churn_returns_to_baseline() {
+    use net::adapter::net::cortex::{RpcContext, RpcHandlerError, RpcResponsePayload, RpcStatus};
+    use net::adapter::net::mesh_rpc::CallOptions;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Rejecting(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl net::adapter::net::cortex::RpcHandler for Rejecting {
+        async fn call(&self, _: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            let mut body = b"NMO1".to_vec();
+            body.push(1);
+            body.extend_from_slice(&7u16.to_le_bytes());
+            body.extend_from_slice(&0u32.to_le_bytes());
+            Ok(RpcResponsePayload {
+                status: RpcStatus::Ok,
+                headers: vec![],
+                body: body.into(),
+            })
+        }
+    }
+
+    let (anchor, client, endpoint) = anchor_and_provisional_client().await;
+    let client_id = client.node_id();
+    let executions = Arc::new(AtomicUsize::new(0));
+    let _serve = anchor
+        .serve_rpc(ENROLL_SERVICE, Arc::new(Rejecting(Arc::clone(&executions))))
+        .expect("serve enrollment");
+
+    // Four sequential calls: each releases its in-flight slot, so
+    // the one-in-flight bound never refuses a *sequential* caller.
+    for index in 0..4 {
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.call(
+                anchor.node_id(),
+                ENROLL_SERVICE,
+                Bytes::from_static(b"join"),
+                CallOptions::default(),
+            ),
+        )
+        .await;
+        assert!(
+            matches!(result, Ok(Ok(_))),
+            "call {index} of the permitted four must reach the service: {result:?}"
+        );
+    }
+    assert_eq!(
+        executions.load(Ordering::SeqCst),
+        4,
+        "the allowance is initial + 3 retries"
+    );
+    assert!(
+        anchor.peer_is_provisional(client_id),
+        "rejections leave the session provisional"
+    );
+
+    // Churn: the session goes away, and the projection the gates
+    // read returns to baseline.
+    assert_eq!(anchor.provisional_count(), 1);
+    anchor
+        .rtc_driver()
+        .expect("driver")
+        .close(endpoint)
+        .await
+        .expect("close");
+    assert!(
+        wait_for(
+            || anchor.peer_endpoint(client_id).is_none() && anchor.provisional_count() == 0,
+            Duration::from_secs(5)
+        )
+        .await,
+        "after the close: no peer and an empty projection (saw {} in the projection)",
+        anchor.provisional_count()
+    );
+}
+
+/// R3: a provisional sender cannot create arbitrary receive
+/// streams. `MAX_PROVISIONAL_STREAMS` and the per-session stream
+/// byte bound were declared constants nothing checked.
+///
+/// Inverse: remove the `charge_provisional_stream` call from the
+/// event plane — the anchor's session tracks a receive stream per
+/// stream id the unenrolled peer names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_provisional_sender_cannot_allocate_arbitrary_streams() {
+    let (anchor, client, _endpoint) = anchor_and_provisional_client().await;
+    let client_id = client.node_id();
+
+    // Six distinct stream ids, each carrying a real frame.
+    for id in 0..6u64 {
+        let mut cfg = net::adapter::net::StreamConfig::new();
+        cfg.reliability = net::adapter::net::Reliability::FireAndForget;
+        if let Ok(stream) = client.open_stream(anchor.node_id(), 0x7000u64 + id, cfg) {
+            let _ = client
+                .send_with_retry(&stream, &[Bytes::from_static(b"R3STREAM")], 4)
+                .await;
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let tracked = anchor
+        .peer_session_for_test(client_id)
+        .map(|s| s.stream_ids().len())
+        .unwrap_or(0);
+    assert!(
+        tracked <= net::adapter::net::rtc::MAX_PROVISIONAL_STREAMS as usize,
+        "a provisional session may track at most {} receive streams; tracked {tracked}",
+        net::adapter::net::rtc::MAX_PROVISIONAL_STREAMS
+    );
+}

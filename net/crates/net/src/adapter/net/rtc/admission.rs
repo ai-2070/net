@@ -205,6 +205,8 @@ pub struct ProvisionalBudget {
     pub enroll_requests: u32,
     /// Enrollment calls currently in flight.
     pub inflight_enrollments: u32,
+    /// Bytes tracked across this session's streams (R3).
+    pub stream_bytes: u64,
 }
 
 impl ProvisionalBudget {
@@ -227,6 +229,39 @@ impl ProvisionalBudget {
             return Err(AdmissionRefusal::BudgetExhausted);
         }
         Ok(())
+    }
+
+    /// Charge a **new** tracked stream, and `bytes` against the
+    /// per-stream bound (R3). `Err` means the stream may not be
+    /// allocated: the bounds exist to stop an unenrolled peer
+    /// creating arbitrary receive state.
+    pub fn charge_stream(&mut self, new_stream: bool, bytes: u64) -> Result<(), AdmissionRefusal> {
+        if new_stream {
+            self.streams = self.streams.saturating_add(1);
+            if self.streams > MAX_PROVISIONAL_STREAMS {
+                return Err(AdmissionRefusal::BudgetExhausted);
+            }
+        }
+        self.stream_bytes = self.stream_bytes.saturating_add(bytes);
+        if self.stream_bytes > MAX_PROVISIONAL_STREAM_BYTES {
+            return Err(AdmissionRefusal::BudgetExhausted);
+        }
+        Ok(())
+    }
+
+    /// Reserve an in-flight enrollment call (R3). Released by
+    /// [`Self::release_enrollment`] on every terminal path.
+    pub fn reserve_enrollment(&mut self) -> Result<(), AdmissionRefusal> {
+        self.inflight_enrollments = self.inflight_enrollments.saturating_add(1);
+        if self.inflight_enrollments > MAX_INFLIGHT_ENROLLMENTS {
+            return Err(AdmissionRefusal::BudgetExhausted);
+        }
+        Ok(())
+    }
+
+    /// Release one in-flight enrollment reservation (R3).
+    pub fn release_enrollment(&mut self) {
+        self.inflight_enrollments = self.inflight_enrollments.saturating_sub(1);
     }
 
     /// Charge one enrollment REQUEST frame.
