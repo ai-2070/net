@@ -71,7 +71,7 @@ pub fn enroll_reply_channel(origin: u64) -> String {
 }
 
 /// What a session may exercise (§12), kept beside — never inside —
-/// [`super::super::PeerTransport`].
+/// `PeerTransport`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerAdmission {
     /// The handshake completed; enrollment has not. Only the S0e

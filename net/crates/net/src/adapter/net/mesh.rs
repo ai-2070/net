@@ -740,6 +740,15 @@ const FOLD_GENERATION_GC_MAX_AGE: Duration = Duration::from_secs(3600);
 #[cfg(feature = "webrtc")]
 type RtcIngressInput = tokio::sync::mpsc::Receiver<(Bytes, super::rtc::RtcPeerId)>;
 
+/// The bounded `0x0D02` input the dispatch arm feeds and the
+/// signalling engine owns.
+#[cfg(feature = "webrtc")]
+type RtcSignalInput = tokio::sync::mpsc::Receiver<(u64, super::rtc::RtcSignalMsg)>;
+
+/// Test-only record of admitted signalling frames.
+#[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+type RtcSignalTap = Arc<parking_lot::Mutex<Vec<(u64, super::rtc::RtcSignalMsg)>>>;
+
 /// Is this RTC datagram something `dispatch_packet` can act on?
 ///
 /// The RTC path must admit **exactly** the outer formats the shared
@@ -1617,7 +1626,7 @@ struct DispatchCtx {
     #[cfg(feature = "webrtc")]
     forwarded_app_packets: Arc<DashMap<(u32, u64), u64>>,
     #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
-    rtc_signal_tap: Option<Arc<parking_lot::Mutex<Vec<(u64, super::rtc::RtcSignalMsg)>>>>,
+    rtc_signal_tap: Option<RtcSignalTap>,
     /// Per-channel-hash dispatch hook for nRPC. See the matching
     /// field on `MeshNode`. Gated on `cortex` because the nRPC
     /// dispatcher type lives there and the `--features net`-only
@@ -10730,7 +10739,7 @@ pub struct MeshNode {
     /// witness can assert what was *admitted* rather than inferring
     /// it from an installed session.
     #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
-    rtc_signal_tap: Arc<parking_lot::Mutex<Vec<(u64, super::rtc::RtcSignalMsg)>>>,
+    rtc_signal_tap: RtcSignalTap,
     /// Inbound signalling frames, handed from the dispatch arm to
     /// the signalling engine. Bounded: a full input drops and
     /// counts, exactly like the RTC ingress input, because the
@@ -10739,9 +10748,7 @@ pub struct MeshNode {
     rtc_signal_tx: Option<tokio::sync::mpsc::Sender<(u64, super::rtc::RtcSignalMsg)>>,
     /// The receiving half, parked until the engine takes it.
     #[cfg(feature = "webrtc")]
-    rtc_signal_rx: Arc<
-        parking_lot::Mutex<Option<tokio::sync::mpsc::Receiver<(u64, super::rtc::RtcSignalMsg)>>>,
-    >,
+    rtc_signal_rx: Arc<parking_lot::Mutex<Option<RtcSignalInput>>>,
     /// R3-E: channel-close notifications from the driver, consumed by
     /// the task `start()` spawns. Taken once, like `rtc_ingress`.
     #[cfg(feature = "webrtc")]
@@ -25478,6 +25485,18 @@ impl MeshNode {
                         // §12 F4, outbound half: an anchor does not
                         // pingwave a provisional peer either. The
                         // rule is symmetric because the beacon is.
+                        // §7/§11: a `leaf`-tagged peer is never a
+                        // forwarding next hop and is never
+                        // re-flooded to — a browser has no routing
+                        // table and nothing downstream of it.
+                        #[cfg(feature = "webrtc")]
+                        if ctx
+                            .addr_to_node
+                            .get(&addr)
+                            .is_some_and(|n| Self::peer_is_leaf(*n.value(), ctx))
+                        {
+                            continue;
+                        }
                         #[cfg(feature = "webrtc")]
                         if Self::is_provisional(&addr, ctx) {
                             if let Some(stats) = ctx.rtc_stats.as_ref() {
@@ -34371,9 +34390,13 @@ impl MeshNode {
             reply_channel: &reply_channel,
             body_len: inbound.payload.len(),
         };
-        let allowed =
-            super::rtc::allow_provisional_action(&action, self.node_id, inbound.origin_hash)
-                .is_ok();
+        let allowed = Self::admission_gate_deliver(
+            endpoint,
+            self.rtc_driver.as_ref().map(|d| Arc::clone(d.stats())),
+            self.node_id,
+            &action,
+            inbound.origin_hash,
+        );
         if allowed {
             // §12 step 4: bind the promotion to THIS incarnation,
             // captured at REQUEST decode. The response path can only
@@ -34389,9 +34412,6 @@ impl MeshNode {
             }
         }
         if !allowed {
-            if let Some(stats) = self.rtc_driver.as_ref().map(|d| d.stats()) {
-                stats.note_admission_refused_deliver();
-            }
             tracing::debug!(
                 service = service,
                 from_node = format!("{:#x}", inbound.from_node),
@@ -34472,24 +34492,47 @@ impl MeshNode {
     /// REQUEST's service name lives *inside* the nRPC envelope, so
     /// the caller decodes under strict bounds and hands the decoded
     /// facts here (§12 step 3, S0e §6).
+    ///
+    /// Takes the resolved session rather than a `DispatchCtx`,
+    /// because its caller is the nRPC bridge, which holds a
+    /// `MeshNode` and no dispatch context.
+    /// [`Self::admission_gate_deliver`] for a caller that has
+    /// already resolved the session (the nRPC bridge holds no
+    /// `DispatchCtx`). Same decision, same counter, one
+    /// implementation of the allow-list.
     #[cfg(feature = "webrtc")]
     fn admission_gate_deliver(
-        source: &PeerAddr,
-        ctx: &DispatchCtx,
+        endpoint: PeerAddr,
+        stats: Option<Arc<super::rtc::RtcStats>>,
+        local_node_id: u64,
         action: &super::rtc::BootstrapAction<'_>,
         caller_origin: u64,
     ) -> bool {
-        if !Self::is_provisional(source, ctx) {
-            return true;
-        }
         let allowed =
-            super::rtc::allow_provisional_action(action, ctx.local_node_id, caller_origin).is_ok();
+            super::rtc::allow_provisional_action(action, local_node_id, caller_origin).is_ok();
         if !allowed {
-            if let Some(stats) = ctx.rtc_stats.as_ref() {
+            if let Some(stats) = stats {
                 stats.note_admission_refused_deliver();
             }
         }
+        let _ = endpoint;
         allowed
+    }
+
+    /// Does this peer announce itself as a `leaf` (§7, §11)?
+    /// Stage 4 only reads the tag; Stage 5 emits it. A leaf is
+    /// never a forwarding next hop and is never re-flooded to —
+    /// it has no routing table and nothing downstream of it.
+    #[cfg(feature = "webrtc")]
+    fn peer_is_leaf(node_id: u64, ctx: &DispatchCtx) -> bool {
+        ctx.capability_fold.with_state(|state| {
+            let Some(keys) = state.by_node.get(&node_id) else {
+                return false;
+            };
+            keys.iter()
+                .filter_map(|key| state.entries.get(key))
+                .any(|entry| entry.payload.tags.iter().any(|t| t == RTC_LEAF_TAG))
+        })
     }
 
     /// The endpoint a node id's session sits on, for the gates that
@@ -39635,7 +39678,7 @@ impl MeshNode {
                         .payload
                         .tags
                         .iter()
-                        .any(|tag| tag.to_string() == RTC_TRANSPORT_TAG)
+                        .any(|tag| tag == RTC_TRANSPORT_TAG)
                 })
         })
     }

@@ -15,7 +15,6 @@ use net::adapter::net::rtc::{
     BootstrapAction, RtcConfig, RtcSignalMsg, ENROLL_SERVICE, RENEWAL_SERVICE,
 };
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, PeerAddr, SocketBufferConfig};
-use net::adapter::Adapter;
 use net::event::{batch_process_nonce, Batch, InternalEvent};
 
 const PSK: [u8; 32] = [0x5Cu8; 32];
@@ -150,7 +149,6 @@ async fn a_permitted_enrollment_exchange_promotes_and_nothing_else_does() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn every_denied_action_is_refused_at_its_named_gate_and_counted() {
     let (anchor, client, _endpoint) = anchor_and_provisional_client().await;
-    let client_id = client.node_id();
     let third_party = node(None).await;
     let origin = client.origin_hash();
 
