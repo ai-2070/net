@@ -121,6 +121,12 @@ pub struct MeshBuilder {
     subnet_attachment: Option<crate::subnet::TopologySubnetId>,
     subnet_control_channel: Option<net::adapter::net::ChannelName>,
     subnet_exports: Vec<crate::subnet::NamedSubnetExport>,
+    /// RTC transport for this node (R6): a browser-facing anchor
+    /// has to be constructible from the SDK, or the SDK's own
+    /// enrollment service cannot be exercised on the surface the
+    /// core's §12 admission actually gates.
+    #[cfg(feature = "webrtc")]
+    rtc: Option<net::adapter::net::rtc::RtcConfig>,
     enable_sensing: bool,
     sensing_incarnation: Option<net::adapter::net::behavior::sensing::Incarnation>,
     #[cfg(feature = "nat-traversal")]
@@ -150,6 +156,8 @@ impl MeshBuilder {
             subnet_attachment: None,
             subnet_control_channel: None,
             subnet_exports: Vec::new(),
+            #[cfg(feature = "webrtc")]
+            rtc: None,
             enable_sensing: false,
             sensing_incarnation: None,
             #[cfg(feature = "nat-traversal")]
@@ -172,6 +180,15 @@ impl MeshBuilder {
     /// also bound to this mesh; tokens installed via
     /// [`Identity::install_token`](crate::identity::Identity::install_token)
     /// become available to the channel auth path at subscribe time.
+    /// Serve RTC on this node (R6). `serve_bootstrap` in the
+    /// config is what makes it a browser-facing anchor, whose RTC
+    /// sessions install provisional under §12.
+    #[cfg(feature = "webrtc")]
+    pub fn rtc(mut self, config: net::adapter::net::rtc::RtcConfig) -> Self {
+        self.rtc = Some(config);
+        self
+    }
+
     pub fn identity(mut self, identity: crate::identity::Identity) -> Self {
         self.identity = Some(identity);
         self
@@ -398,6 +415,11 @@ impl MeshBuilder {
         // facade refuses to bind credentials to a generated fallback, and a
         // binding holding only `Arc<MeshNode>` cannot otherwise tell.
         config.configured_identity = sdk_identity.is_some();
+        // R6: the RTC transport, if the caller asked for one.
+        #[cfg(feature = "webrtc")]
+        {
+            config.rtc = self.rtc;
+        }
         if let Some(id) = self.subnet {
             config = config.with_subnet(id);
         }
@@ -614,7 +636,7 @@ impl Mesh {
     /// combination as its sole consumer (`mesh_rpc` /
     /// `mesh_rpc_resilience`) so feature combinations that
     /// exclude either don't trip dead-code lints.
-    pub(crate) fn node(&self) -> &Arc<MeshNode> {
+    pub fn node(&self) -> &Arc<MeshNode> {
         &self.node
     }
 

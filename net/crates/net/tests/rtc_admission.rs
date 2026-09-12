@@ -498,7 +498,10 @@ fn outcome_bytes(admitted: bool) -> Bytes {
         buf.extend_from_slice(chain);
     } else {
         buf.push(1);
-        buf.extend_from_slice(&7u32.to_le_bytes());
+        // R6: the outcome CODE is a `u16` on the wire
+        // (`sdk/src/enrollment.rs`); the fixture used to write a
+        // `u32`, and prefix-only assertions never noticed.
+        buf.extend_from_slice(&7u16.to_le_bytes());
         let msg = b"invite expired";
         buf.extend_from_slice(&(msg.len() as u32).to_le_bytes());
         buf.extend_from_slice(msg);

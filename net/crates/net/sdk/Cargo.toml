@@ -85,7 +85,7 @@ base64 = { version = "0.23", optional = true }
 # is cfg'd `any(test, feature = "fixtures")` in net-mesh — and the
 # dependency's `test` cfg is never active when the SDK is the crate
 # under test, so the feature is the only way to reach the seam.
-net = { package = "net-mesh", version = "0.36.0", path = "..", features = ["fixtures"] }
+net = { package = "net-mesh", version = "0.36.0", path = "..", features = ["fixtures", "webrtc"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
 # Isolated temp dirs for the pin-store file tests.
 tempfile = "3"
@@ -101,6 +101,10 @@ anyhow = "1"
 schemars = "1"
 
 [features]
+# R6: pass the core's `webrtc` transport through, so an SDK
+# consumer can build the browser-facing anchor whose enrollment
+# service the core's §12 admission gates.
+webrtc = ["net/webrtc"]
 # Out-of-the-box "I downloaded the SDK and it just works": real
 # mesh transport + NAT traversal + typed nRPC + capability-based
 # service discovery + daemon supervision + replica/fork/standby

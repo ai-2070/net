@@ -35576,6 +35576,28 @@ impl MeshNode {
         true
     }
 
+    /// The origin a **provisional** peer may name in its enrollment
+    /// reply channel (R6).
+    ///
+    /// `None` for every other case, so this widens nothing: not
+    /// another channel, not an admitted peer's subscription, and not
+    /// an origin the session has not bound.
+    #[cfg(feature = "webrtc")]
+    fn bootstrap_reply_origin(
+        channel: &ChannelName,
+        from_node: u64,
+        ctx: &DispatchCtx,
+    ) -> Option<u64> {
+        let claimed =
+            super::rtc::PeerAdmission::origin_from_enroll_reply_channel(channel.as_str())?;
+        let entry = ctx.peers.get(&from_node)?;
+        let admission = entry.value().admission;
+        if !admission.is_provisional() {
+            return None;
+        }
+        (admission.bound_origin() == Some(claimed)).then_some(claimed)
+    }
+
     /// **Gate 5 of 5 (§12), by authenticated source (R1).**
     ///
     /// The local-effect decision every ingress path consults before
@@ -37243,7 +37265,23 @@ impl MeshNode {
             let pinned_origin = ctx
                 .peer_entity_ids
                 .get(&from_node)
-                .map(|e| e.value().origin_hash());
+                .map(|e| e.value().origin_hash())
+                // **R6, the bootstrap exception — and nothing wider.**
+                // A genuinely new provisional peer has no pinned
+                // entity by construction: gate 4 refuses to ingest
+                // its announcement, so the origin binding rejected
+                // the ONE subscription §12 permits and the real SDK
+                // enrollment could never receive its reply.
+                //
+                // The substitute is the origin the session itself
+                // bound on first use, and it is accepted only when
+                // ALL of these hold: the session is provisional, the
+                // channel is exactly that origin's enrollment reply
+                // channel, and the origin is the one this session
+                // already claimed (one session, one identity). Every
+                // other origin-bound channel still requires a pinned
+                // identity.
+                .or_else(|| Self::bootstrap_reply_origin(channel, from_node, ctx));
             if !binding.authorizes(channel.as_str(), matched_prefix.as_deref(), pinned_origin) {
                 tracing::debug!(
                     from_node = format!("{:#x}", from_node),

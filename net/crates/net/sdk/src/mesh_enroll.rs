@@ -31,7 +31,7 @@ use crate::enrollment::{
     EnrollmentError, InviteToken, JoinError, JoinOutcome, JoinRequest, RenewalRequest,
 };
 use crate::mesh::Mesh;
-use crate::mesh_rpc::{CallOptionsTyped, Codec, ServeError, ServeHandle};
+use crate::mesh_rpc::{ServeError, ServeHandle};
 use crate::operator::OperatorEnrollment;
 
 /// The nRPC service name the operator serves and a joining device calls.
@@ -172,7 +172,11 @@ impl Mesh {
         F: Fn(JoinRequest) -> Fut + Clone + Send + Sync + 'static,
         Fut: Future<Output = bool> + Send + 'static,
     {
-        self.serve_rpc_typed(ENROLLMENT_SERVICE, Codec::Json, move |req: Vec<u8>| {
+        // R6: the outcome bytes travel RAW. A JSON-encoded
+        // `Vec<u8>` is a JSON array of numbers, and the core's
+        // promotion gate reads the body's own `NMO1` prefix — so a
+        // real SDK enrollment could never promote its session.
+        self.serve_rpc_raw_bytes(ENROLLMENT_SERVICE, move |req: Vec<u8>| {
             let operator = operator.clone();
             let approver = approver.clone();
             async move {
@@ -200,7 +204,8 @@ impl Mesh {
         grant_ttl: Duration,
         max_depth: u8,
     ) -> Result<ServeHandle, ServeError> {
-        self.serve_rpc_typed(ENROLLMENT_SERVICE, Codec::Json, move |req: Vec<u8>| {
+        // R6: raw bodies, same reason as `serve_enrollment`.
+        self.serve_rpc_raw_bytes(ENROLLMENT_SERVICE, move |req: Vec<u8>| {
             let operator = operator.clone();
             async move {
                 Ok::<Vec<u8>, String>(operator.handle_join_request(&req, grant_ttl, max_depth))
@@ -218,7 +223,8 @@ impl Mesh {
         grant_ttl: Duration,
         max_depth: u8,
     ) -> Result<ServeHandle, ServeError> {
-        self.serve_rpc_typed(RENEWAL_SERVICE, Codec::Json, move |req: Vec<u8>| {
+        // R6: raw bodies (see `serve_enrollment`).
+        self.serve_rpc_raw_bytes(RENEWAL_SERVICE, move |req: Vec<u8>| {
             let operator = operator.clone();
             async move {
                 Ok::<Vec<u8>, String>(operator.handle_renewal_request(&req, grant_ttl, max_depth))
@@ -249,13 +255,11 @@ impl Mesh {
             .connect_via(&rv.addr, &rv.noise_pubkey, rv.node_id)
             .await;
         let request = RenewalRequest::create(&device, current_chain);
+        // R6: raw both ways. The outcome is already a serialized
+        // protocol; a codec on top of it is what made the core's
+        // `NMO1` prefix check unsatisfiable.
         let response: Vec<u8> = self
-            .call_typed(
-                rv.node_id,
-                RENEWAL_SERVICE,
-                &request.to_bytes(),
-                CallOptionsTyped::default(),
-            )
+            .call_raw_bytes(rv.node_id, RENEWAL_SERVICE, request.to_bytes())
             .await
             .map_err(|e| JoinFlowError::Transport(format!("call: {e}")))?;
         // The renewed grant must anchor at the same root and bind to this
@@ -292,13 +296,9 @@ impl Mesh {
             .map_err(|e| JoinFlowError::Transport(format!("connect: {e}")))?;
 
         let request = JoinRequest::create(&device, name, tags, &invite);
+        // R6: raw both ways (see `renew`).
         let response: Vec<u8> = self
-            .call_typed(
-                rv.node_id,
-                ENROLLMENT_SERVICE,
-                &request.to_bytes(),
-                CallOptionsTyped::default(),
-            )
+            .call_raw_bytes(rv.node_id, ENROLLMENT_SERVICE, request.to_bytes())
             .await
             .map_err(|e| JoinFlowError::Transport(format!("call: {e}")))?;
 
