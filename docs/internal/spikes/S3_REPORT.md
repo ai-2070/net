@@ -726,3 +726,32 @@ and three discriminating inverses are recorded red.
 `close_peer` alone satisfied it. It now allocates a transport slot
 with **no** session and requires that handle refused after
 teardown; removing `shutdown_terminal()` is red.
+
+### 13.1 Reviewer verification at `047ac7e0a` and the tightening `c84d60a6f`
+
+Reviewer re-executed, each mutation reverted with a hash check:
+
+| Probe | Mutation | Selected tests | Outcome |
+|---|---|---|---|
+| R-A faithful reproduction | clear **every** mark up front, then the old re-mark-one-and-`break` loop | `every_one_of_several_deferred_closes_is_re_delivered`, `a_close_the_channel_refused_is_re_delivered_not_dropped` | **red** ×3 (the several-closes witness, in 6.6 s — no failure-detector rescue) |
+| H3d | drop `mark_pending_eviction` on the refused close (counter kept) | `a_close_the_channel_refused_is_re_delivered_not_dropped` | **red** (was green at `9d036f584`) |
+| R-B | `confirm_rtc_install_or_evict` returns `Ok` unconditionally | both `a_close_inside_the_…commit_window_leaves_nothing_published` | **red** ×2 |
+| R-D | drop `shutdown_terminal()` from `SessionTable::drop` | `dropping_a_node_tears_down_the_transport_not_just_the_socket` | **red** (was green) |
+| H5a | Kyra's set-preserving seq-byte reversal | `a_reliable_stream_delivers_every_value_and_reorders_by_seq` | **green**, by design |
+| H1a | drop the post-abort `handle.await` | `a_stalled_driver_is_aborted_and_joined_before_shutdown_returns` | **red** |
+| H1d/H1e | Kyra's `probe_shutdown.py` re-aimed at HEAD's method; her teardown pair appended verbatim | — | green (0); green ×2 |
+
+One tightening by the reviewer (`c84d60a6f`): `confirm_rtc_install_or_evict`
+evicted whatever `peers` held for the node at the moment of the
+re-read; a competitor that superseded the entry in that instant would
+have lost its live session. It now evicts the `session_id` the
+outcome itself published (initiator and responder).
+
+Sweep after the tightening: nine binaries `--no-tests=fail --retries 0`
+**71/71 ×3**; `--lib` 5779 default; `--lib` with `webrtc` 5811 (one
+run failed `ffi::handle_guard::tests::begin_free_returns_false_after_timed_out_first_call`,
+a 20 ms/40 ms sleep race in pre-existing `master` FFI code while a
+release build was queued — 3/3 green on rerun, not an RTC finding);
+strict clippy; `webrtc` rustdoc; export set 568/568 (CI's
+`net-ffi/test-helpers` build); consumer diff since `01e4b0f20` still
+SDK-pin only.

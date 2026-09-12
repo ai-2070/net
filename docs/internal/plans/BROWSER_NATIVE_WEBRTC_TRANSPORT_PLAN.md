@@ -1910,6 +1910,24 @@ mutation is green against the seq-reorder witness, as any honest
 set-completion witness must be. **R-D** the Drop witness passes with
 `shutdown_terminal()` removed (every slot has a `Session`).
 
+**R-round candidate `047ac7e0a` + reviewer tightening `c84d60a6f`
+(2026-09-12) — forwarded to Kyra as the Stage 3 second-round repair
+candidate.** `S3_REPORT.md` §13. R-A: `pending_evictions()` only
+reads; the mark is cleared on delivery by compare-exchange on the exact
+`generation + 1`; windows back to ≤ 5 s; a live-successor assertion and
+a ≥ 3-deferred-closes witness. R-B: post-publish liveness re-read with
+self-eviction by the session id the install published (the reviewer's
+tightening: the candidate evicted the *current* entry); the notifier
+re-arms a close that matches no installed peer while an intent is in
+flight, so `install_intents` is read; a pre-insert seam drives the
+exact commit-window witnesses on both branches. R-C: the H5a row is
+corrected, the witness keeps its honest claim, three discriminating
+inverses recorded red. R-D: the Drop witness holds a slot with no
+session. Reviewer re-ran (§13.1): the faithful R-A reproduction red
+×3 in 6.6 s; H3d, R-B, R-D, H1a red; H5a green by design; Kyra's
+probes green; 71/71 ×3 at retries 0; `--lib` 5779/5811; 568/568;
+SDK-pin-only consumer diff.
+
 ## Stage 4 — Announcement fields, `0x0D02`, bootstrap credential + listener
 
 - `noise_pubkey` / `rtc_bootstrap` / `rtc_addr` on the announcement, added to
