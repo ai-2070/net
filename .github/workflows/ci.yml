@@ -4578,6 +4578,7 @@ jobs:
           --test rtc_install_race
           --test rtc_reclaim
           --test rtc_classifier
+          --test rtc_admission_probes
           --test rtc_signalling
           --test rtc_admission
 
@@ -4637,6 +4638,7 @@ jobs:
           check_floor rtc_install_race 8
           check_floor rtc_reclaim 5
           check_floor rtc_classifier 1
+          check_floor rtc_admission_probes 8
           check_floor rtc_signalling 6
           check_floor rtc_admission 13
           REQUIRED="
@@ -4678,6 +4680,14 @@ jobs:
           rtc_reclaim:a_close_the_channel_refused_is_re_delivered_not_dropped
           rtc_reclaim:every_one_of_several_deferred_closes_is_re_delivered
           rtc_classifier:an_rtc_relay_does_not_make_a_udp_target_an_ice_pair
+          rtc_admission_probes:kyra_pre_noise_rtc_cannot_forward
+          rtc_admission_probes:kyra_installed_provisional_transit_control
+          rtc_admission_probes:kyra_provisional_app_delivery_is_denied
+          rtc_admission_probes:kyra_provisional_signal_does_not_allocate_ice
+          rtc_admission_probes:kyra_normal_close_reclaims_provisional_projection
+          rtc_admission_probes:kyra_old_success_cannot_promote_replacement_request
+          rtc_admission_probes:kyra_fifth_enrollment_request_is_not_executed
+          rtc_admission_probes:kyra_engine_must_install_without_loopback_noise_fixture
           rtc_signalling:signalling_crosses_an_anchor_that_cannot_read_it
           rtc_signalling:the_full_section_9_sequence_with_the_three_part_witness
           rtc_signalling:over_budget_signalling_is_dropped_and_counted
