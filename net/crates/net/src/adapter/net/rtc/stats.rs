@@ -29,6 +29,7 @@ pub struct RtcStats {
     max_buffered: AtomicU64,
     retained: AtomicU64,
     admission_refused_forward: AtomicU64,
+    admission_refused_transit: AtomicU64,
     admission_refused_route: AtomicU64,
     admission_refused_subscribe: AtomicU64,
     admission_refused_announce: AtomicU64,
@@ -120,6 +121,11 @@ impl RtcStats {
         admission_refused_forward,
         note_admission_refused_forward,
         "Forwarding refused for a provisional adjacent session (§12: no third-party relay before enrollment)."
+    );
+    counter!(
+        admission_refused_transit,
+        note_admission_refused_transit,
+        "Routed-envelope TRANSIT refused for a provisional adjacent session (F1 specifically). Separate from the other forwarding sites so a witness can tell 'refused to relay onward' from 'refused to re-flood a pingwave'."
     );
     counter!(
         admission_refused_route,

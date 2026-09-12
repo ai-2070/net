@@ -1614,6 +1614,8 @@ struct DispatchCtx {
     rtc_signal_tx: Option<tokio::sync::mpsc::Sender<(u64, super::rtc::RtcSignalMsg)>>,
     #[cfg(feature = "webrtc")]
     rtc_stats: Option<Arc<super::rtc::RtcStats>>,
+    #[cfg(feature = "webrtc")]
+    forwarded_app_packets: Arc<DashMap<(u32, u64), u64>>,
     #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
     rtc_signal_tap: Option<Arc<parking_lot::Mutex<Vec<(u64, super::rtc::RtcSignalMsg)>>>>,
     /// Per-channel-hash dispatch hook for nRPC. See the matching
@@ -10715,6 +10717,15 @@ pub struct MeshNode {
     /// Dialogs this node is driving (plan §9 steps 3–6).
     #[cfg(feature = "webrtc")]
     rtc_dialogs: super::rtc::SharedDialogs,
+    /// §10 part 2: packets this node forwarded per `(src, dst)`
+    /// pair, **excluding signalling**. A globally flat forward
+    /// counter is not the direct-path witness — signalling,
+    /// announcements and unrelated pairs legitimately keep
+    /// flowing — so the witness needs this one, keyed by pair and
+    /// blind to `0x0D02`, which it can separate because
+    /// `subprotocol_id` is cleartext AAD-authenticated header.
+    #[cfg(feature = "webrtc")]
+    forwarded_app_packets: Arc<DashMap<(u32, u64), u64>>,
     /// Test-only record of every frame that passed the budget, so a
     /// witness can assert what was *admitted* rather than inferring
     /// it from an installed session.
@@ -13171,6 +13182,8 @@ impl MeshNode {
             pending_promotions: Arc::new(DashMap::new()),
             #[cfg(feature = "webrtc")]
             rtc_dialogs: Arc::new(tokio::sync::Mutex::new(super::rtc::DialogTable::new())),
+            #[cfg(feature = "webrtc")]
+            forwarded_app_packets: Arc::new(DashMap::new()),
             #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
             rtc_signal_tap: Arc::new(parking_lot::Mutex::new(Vec::new())),
             #[cfg(feature = "webrtc")]
@@ -22422,7 +22435,20 @@ impl MeshNode {
             return Ok(None);
         };
         let info = entry.value();
-        let busy = info.session.has_open_streams() || info.session.has_unacked();
+        // The signalling stream itself is NOT application state.
+        // `0x0D02` rides the very session the upgrade is about, so
+        // counting it as "busy" would make a session that is
+        // negotiating its own replacement permanently ineligible
+        // for it. Everything else — application streams, unacked
+        // reliable data — still defers, which is the C3 decision
+        // `attempt_direct_upgrade` makes.
+        let signalling_stream = super::rtc::SUBPROTOCOL_RTC_SIGNAL as u64;
+        let busy = info
+            .session
+            .stream_ids()
+            .iter()
+            .any(|id| *id != signalling_stream)
+            || info.session.has_unacked();
         let sid = info.session.session_id();
         drop(entry);
         if busy {
@@ -24662,6 +24688,8 @@ impl MeshNode {
             rtc_signal_tx: self.rtc_signal_tx.clone(),
             #[cfg(feature = "webrtc")]
             rtc_stats: self.rtc_driver.as_ref().map(|d| Arc::clone(d.stats())),
+            #[cfg(feature = "webrtc")]
+            forwarded_app_packets: Arc::clone(&self.forwarded_app_packets),
             #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
             rtc_signal_tap: self
                 .rtc_driver
@@ -25578,8 +25606,37 @@ impl MeshNode {
                     // v1. Checked here, before TTL, before the route
                     // lookup, before anything is sent.
                     #[cfg(feature = "webrtc")]
-                    if !Self::admission_gate_forward(&source, ctx) {
+                    if !Self::admission_allows(&source, ctx, |stats| {
+                        // F1's own counter: "refused to relay this
+                        // envelope onward" is a different fact from
+                        // "refused to re-flood a pingwave", and the
+                        // §12 witness has to be able to tell them
+                        // apart.
+                        stats.note_admission_refused_transit();
+                        stats.note_admission_refused_forward();
+                    }) {
                         return;
+                    }
+                    // §10 part 2: count this forward for the pair,
+                    // unless it is signalling. Reading
+                    // `subprotocol_id` off the inner header is
+                    // exactly the anchor-side classification §10
+                    // sanctions — the field is cleartext and
+                    // AAD-authenticated, and the SDP it carries
+                    // stays unread.
+                    #[cfg(feature = "webrtc")]
+                    {
+                        let inner_sub = data
+                            .get(ROUTING_HEADER_SIZE..ROUTING_HEADER_SIZE + protocol::HEADER_SIZE)
+                            .and_then(protocol::NetHeader::from_bytes)
+                            .map(|h| h.subprotocol_id);
+                        if inner_sub != Some(super::rtc::SUBPROTOCOL_RTC_SIGNAL) {
+                            *ctx.forwarded_app_packets
+                                .entry((routing_header.src_id, routing_header.dest_id))
+                                .or_insert(0) += 1;
+                        } else if let Some(stats) = ctx.rtc_stats.as_ref() {
+                            stats.note_signal_forwarded();
+                        }
                     }
                     // Not for us — forward without decrypting (header-only
                     // routing). We send via the main socket so the
@@ -30517,6 +30574,15 @@ impl MeshNode {
     /// latch is for.
     #[cfg(feature = "cortex")]
     pub(super) fn claim_corrective_announce(&self, target: u64) -> bool {
+        // S0e §3 row 13, enforced at the claim so no caller can
+        // reach around it: this announce bypasses the rate limit,
+        // and a provisional peer must never hold a mesh-wide flood
+        // trigger. Its Subscribe refusal is a policy answer, not a
+        // stale-announcement problem.
+        #[cfg(feature = "webrtc")]
+        if self.peer_is_provisional(target) {
+            return false;
+        }
         if self.rpc_corrective_announced.contains(&target) {
             return false;
         }
@@ -33991,8 +34057,64 @@ impl MeshNode {
         let encoded = msg
             .to_bytes()
             .map_err(|e| AdapterError::Connection(format!("rtc signal encode failed: {e}")))?;
-        self.send_subprotocol_to_node(peer_node_id, super::rtc::SUBPROTOCOL_RTC_SIGNAL, &encoded)
+        // Route-aware by necessity: signalling exists precisely for
+        // a pair with NO direct path, so the common case is a
+        // routed session and the frame has to ride a routing
+        // envelope. `send_subprotocol_to_node` sends the bare Net
+        // packet to the peer's send address — for a routed peer
+        // that is the anchor, which holds no session for it and
+        // would drop it.
+        let (dest_addr, session, is_direct) = self
+            .peers
+            .get(&peer_node_id)
+            .map(|e| {
+                (
+                    e.value().addr(),
+                    e.value().session.clone(),
+                    e.value().is_direct(),
+                )
+            })
+            .ok_or_else(|| {
+                AdapterError::Connection(format!("no session for node {peer_node_id:#x}"))
+            })?;
+        if is_direct {
+            return self
+                .send_subprotocol_to_node(
+                    peer_node_id,
+                    super::rtc::SUBPROTOCOL_RTC_SIGNAL,
+                    &encoded,
+                )
+                .await;
+        }
+
+        let stream_id = super::rtc::SUBPROTOCOL_RTC_SIGNAL as u64;
+        let seq = {
+            let stream = session.get_or_create_stream(stream_id);
+            stream.next_tx_seq()
+        };
+        let pool = session.thread_local_pool();
+        let mut builder = pool.get();
+        let packet = builder.build_subprotocol(
+            stream_id,
+            seq,
+            &[Bytes::from(encoded)],
+            PacketFlags::NONE,
+            super::rtc::SUBPROTOCOL_RTC_SIGNAL,
+        );
+        let routing_header = RoutingHeader::new(peer_node_id, self.node_id as u32, 8);
+        let mut routed = bytes::BytesMut::with_capacity(ROUTING_HEADER_SIZE + packet.len());
+        routed.extend_from_slice(&routing_header.to_bytes());
+        routed.extend_from_slice(&packet);
+        let next_hop = self
+            .router
+            .routing_table()
+            .lookup(peer_node_id)
+            .unwrap_or(dest_addr);
+        self.sink
+            .send(&routed, next_hop)
             .await
+            .map(|_| ())
+            .map_err(|e| AdapterError::Connection(format!("rtc signal send failed: {e}")))
     }
 
     /// Attach the Stage 4a RTC fields to an announcement being
@@ -34024,6 +34146,68 @@ impl MeshNode {
         ann.with_noise_pubkey(Some(*self.public_key()))
             .with_rtc_bootstrap(bootstrap)
             .with_rtc_addr(rtc.public_addr)
+    }
+
+    /// §10 part 2: how many **application-data** packets this node
+    /// has forwarded from `src` to `dst`. Signalling is excluded by
+    /// construction.
+    #[cfg(feature = "webrtc")]
+    pub fn forwarded_app_packets(&self, src_id: u32, dest_id: u64) -> u64 {
+        self.forwarded_app_packets
+            .get(&(src_id, dest_id))
+            .map(|e| *e.value())
+            .unwrap_or(0)
+    }
+
+    /// Test-only: send a routed envelope addressed to
+    /// `dest_node_id` **over this peer's own session**, the way a
+    /// browser would.
+    ///
+    /// The §12 witness needs this because `connect_via` takes a
+    /// `SocketAddr` relay and therefore always leaves over UDP; a
+    /// browser has no UDP path and asks its anchor for transit on
+    /// the DataChannel. Without it the F1 gate could only ever be
+    /// witnessed on a path a browser does not have.
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    pub async fn send_transit_probe_for_test(
+        &self,
+        via_node_id: u64,
+        dest_node_id: u64,
+    ) -> Result<(), AdapterError> {
+        let (addr, session) = self
+            .peers
+            .get(&via_node_id)
+            .map(|e| (e.value().addr(), e.value().session.clone()))
+            .ok_or_else(|| AdapterError::Connection("no session with the anchor".into()))?;
+        let stream_id = 0x0F00u64;
+        let seq = {
+            let stream = session.get_or_create_stream(stream_id);
+            stream.next_tx_seq()
+        };
+        let pool = session.thread_local_pool();
+        let mut builder = pool.get();
+        let inner = builder.build(
+            stream_id,
+            seq,
+            &[Bytes::from_static(b"transit")],
+            PacketFlags::NONE,
+        );
+        let routing = RoutingHeader::new(dest_node_id, self.node_id as u32, 8);
+        let mut routed = bytes::BytesMut::with_capacity(ROUTING_HEADER_SIZE + inner.len());
+        routed.extend_from_slice(&routing.to_bytes());
+        routed.extend_from_slice(&inner);
+        self.sink
+            .send(&routed, addr)
+            .await
+            .map(|_| ())
+            .map_err(|e| AdapterError::Connection(format!("transit probe failed: {e}")))
+    }
+
+    /// Test-only view of the corrective-announce claim, so the
+    /// §12 witness can assert the guard rather than the flood.
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    pub fn claim_corrective_announce_for_test(&self, target: u64) -> bool {
+        self.claim_corrective_announce(target)
     }
 
     /// Is this peer's session provisional? Public so the enrollment

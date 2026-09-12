@@ -4575,20 +4575,50 @@ jobs:
           --test rtc_backpressure
           --test rtc_repairs
           --test rtc_routed_restore
+          --test rtc_signalling
+          --test rtc_admission
 
       # Per-binary FLOORS and the required names. `--no-tests=fail`
       # catches a whole binary vanishing; it does not catch a witness
       # being deleted or renamed out of the set, which is exactly how
       # coverage was lost before. Raise these with the suites.
-      - name: Stage 3 witness inventory
+      # Per-binary FLOORS and the required names. `--no-tests=fail`
+      # catches a whole binary vanishing; it does not catch a witness
+      # being deleted or renamed out of the set, which is exactly how
+      # coverage is lost quietly.
+      #
+      # The list is read from `--message-format json` and parsed by
+      # name, NOT scraped from the human table. The first version
+      # awk'd column 1 of the default output and matched nothing on
+      # the Linux runner, so every floor read zero and the step
+      # failed with "rtc_loopback has 0 tests" — the
+      # filter-matches-nothing hazard AGENTS.md warns about, arriving
+      # in the guard that exists to prevent it. Hence the
+      # self-check below: the helper must be proved non-empty for a
+      # known binary BEFORE any floor is trusted, so a broken parser
+      # can never read as "the tests are gone" *or* as "all clear".
+      - name: Stage 3 + 4a witness inventory
         if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
-          # `cargo nextest list` prints "<pkg>::<binary> <test name>".
           list() {
-            cargo nextest list --features "webrtc fixtures cortex" --test "$1" 2>/dev/null \
-              | awk -v bin="net-mesh::$1" '$1 == bin { print $2 }'
+            cargo nextest list --features "webrtc fixtures cortex" \
+              --test "$1" --message-format json 2>/dev/null \
+              | python3 -c "import json,sys;d=json.load(sys.stdin);s=d.get('rust-suites',{}).get('net-mesh::$1',{});print(chr(10).join(sorted(s.get('testcases',{}))))"
           }
+
+          # Self-check: the parser itself must work before any floor
+          # is believed. An empty list here means the tooling moved,
+          # not that the witnesses vanished.
+          probe=$(list rtc_loopback | wc -l)
+          if [ "$probe" -eq 0 ]; then
+            echo "::error::witness-inventory parser returned nothing for rtc_loopback — \
+          the nextest list format changed; fix the parser before trusting any floor"
+            cargo nextest list --features "webrtc fixtures cortex" --test rtc_loopback | head -20
+            exit 1
+          fi
+          echo "parser self-check: rtc_loopback lists $probe tests"
+
           check_floor() {
             n=$(list "$1" | wc -l)
             echo "$1: $n tests (min $2)"
@@ -4601,6 +4631,8 @@ jobs:
           check_floor rtc_backpressure 7
           check_floor rtc_repairs 18
           check_floor rtc_routed_restore 4
+          check_floor rtc_signalling 6
+          check_floor rtc_admission 9
           REQUIRED="
           rtc_repairs:scheduled_fire_and_forget_packets_reach_rtc_admission_and_the_peer
           rtc_repairs:the_scheduler_drain_counts_what_it_drops_under_pressure
@@ -4623,16 +4655,28 @@ jobs:
           rtc_routed_restore:routed_then_direct_then_loss_then_manually_restored_routed
           rtc_routed_restore:an_nrpc_call_round_trips_over_the_datachannel
           rtc_routed_restore:a_capability_fold_applies_a_remote_fact_received_over_rtc
+          rtc_signalling:signalling_crosses_an_anchor_that_cannot_read_it
+          rtc_signalling:the_full_section_9_sequence_with_the_three_part_witness
+          rtc_signalling:over_budget_signalling_is_dropped_and_counted
+          rtc_signalling:a_node_without_rtc_emits_no_stage4_fields
+          rtc_admission:a_permitted_enrollment_exchange_promotes_and_nothing_else_does
+          rtc_admission:every_denied_action_is_refused_at_its_named_gate_and_counted
+          rtc_admission:local_delivery_survives_the_forwarding_refusal
+          rtc_admission:a_replaced_session_promotes_nothing
+          rtc_admission:the_provisional_cap_closes_and_reclaims
+          rtc_admission:an_admitted_peer_without_authority_is_still_denied
+          rtc_admission:a_provisional_rejecter_never_triggers_a_corrective_reannounce
+          rtc_admission:pingwave_is_denied_while_heartbeat_is_permitted
           "
           for entry in $REQUIRED; do
             bin="${entry%%:*}"
             name="${entry#*:}"
             if ! list "$bin" | grep -qx "$name"; then
-              echo "::error::required Stage 3 witness missing: $bin::$name"
+              echo "::error::required witness missing: $bin::$name"
               exit 1
             fi
           done
-          echo "Stage 3 witness inventory complete"
+          echo "witness inventory complete"
 
       # R5-A: a downstream consumer may enable `net-mesh-wire/webrtc`
       # without the core's `webrtc`. Three configurations, all of
