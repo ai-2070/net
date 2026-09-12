@@ -1693,6 +1693,15 @@ only the owning slug fails there naming the assumption; the real
 workspace passes everywhere; a complete layout missing
 `wire/src/session.rs` fails on the callee test everywhere (exit 101).
 
+**C2 CLOSED (Kyra, Stage 3 repair review at `97815f9d9`).** The exact
+guard module compiled under four layouts (checkout, source archive,
+package-shaped outside Git, package-shaped beneath a consumer checkout)
+× four environments (local, generic CI, foreign-repository CI, owning
+repository CI): all 16 outcomes as intended; only
+`GITHUB_REPOSITORY=ai-2070/net` makes non-owning layouts fail their
+owner assertion; the missing-callee negative control fails without any
+CI variable. **Stages 1–2 have no open findings.**
+
 ## Stage 3 — Native `webrtc` feature: driver, dedicated socket, STUN, loopback harness
 
 - `adapter/net/rtc/{mod,driver,transport,stun,config}.rs`; `PeerAddr::Rtc`;
@@ -1859,6 +1868,26 @@ the inverse "also fails the conservation witness" was wrong (stream
 
 **Not verifiable here:** the Linux `webrtc-feature` job at the fixed
 head; CI is the arbiter.
+
+**Second HOLD (Kyra, repair review at `97815f9d9`; exact-head CI
+49/50, the red being the witness-inventory parser).** Credit retained:
+R1 (handoff; removing it turns the witness red), R2 (typed
+`Backpressure`, UDP untouched), R5 (three consumer configurations,
+default docs), bounded R3/R4/R6 (serialized close, full-handle signals,
+slot recycling with exhaustion, ICE not stolen, five outer formats
+admitted, the two weak witnesses really deleted, suppress-the-sends
+now red for both replacements), and the new native consumer evidence
+(routed → direct → interruption → manual restoration; exact nRPC echo;
+remotely applied fold state). Five bounded groups remain
+(`spikes/S3_H_BRIEF.md`):
+
+| # | Finding |
+|---|---|
+| H1 (P1) | `shutdown_and_join` moves the `JoinHandle` into `timeout` and detaches it on timeout — `abort()` is not a join; the `Drop` path aborts and skips the cooperative tail: socket released but `slot_open = true`, `queued = 3`, fresh `submit` → `Ok(())` (both executed) |
+| H2 (P1) | installation checks are not a commit fence: `is_open` precheck not atomic with install; RTC caller passes `None` as if it were "expect absent" but the installer treats it as unconditional replacement; final fence checks session id, not current quiescence; the dead-handle and busy fixtures pass with their guards removed |
+| H3 (P2) | initiator cancellation skips deregistration; closing/recycling leaves the historical inbox; a full close-notification channel loses a later exact-lifetime close |
+| H4 (P2) | `peer_endpoint_is_rtc` reads the send endpoint, so a routed session whose *relay* is RTC classifies the far target `Ice` (X —UDP— R —RTC— Y) |
+| H5 | reliable witness proves set completion, not order (permuted values passed — do **not** change raw-dispatch semantics; resolve the boundary via `seq`); advisory-refresh precondition implicit; reset test `to_b \|\| to_c`; conservation dedupes; fairness claims exceed observations; shaped-ingress is format acceptance only; inventory is 34 not 35; the forced-color `nextest list` parser (already repaired by `22fb4ae23`) |
 
 ## Stage 4 — Announcement fields, `0x0D02`, bootstrap credential + listener
 
