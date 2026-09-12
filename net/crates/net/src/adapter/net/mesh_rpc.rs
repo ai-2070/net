@@ -3020,7 +3020,12 @@ async fn publish_response_to_caller(
     {
         match enrollment_outcome_is_admitted(&payload) {
             Some(true) => {
-                if mesh.promote_on_enrollment_response(node_id, reply_channel.as_str(), call_id, receiving_session_id) {
+                if mesh.promote_on_enrollment_response(
+                    node_id,
+                    reply_channel.as_str(),
+                    call_id,
+                    receiving_session_id,
+                ) {
                     tracing::debug!(
                         node_id = format!("{node_id:#x}"),
                         "§12: enrollment admitted; session promoted"
@@ -3032,7 +3037,12 @@ async fn publish_response_to_caller(
                 // expires on its own 30 s clock — and is counted, so
                 // an operator sees refusals rather than inferring
                 // them from an absence of promotions.
-                mesh.note_enrollment_rejected(node_id, reply_channel.as_str(), call_id, receiving_session_id);
+                mesh.note_enrollment_rejected(
+                    node_id,
+                    reply_channel.as_str(),
+                    call_id,
+                    receiving_session_id,
+                );
                 tracing::debug!(
                     node_id = format!("{node_id:#x}"),
                     "§12: enrollment rejected; session stays provisional"
@@ -3047,7 +3057,12 @@ async fn publish_response_to_caller(
             // an unreadable verdict is not an admission — but
             // retire the call that produced it.
             None => {
-                mesh.retire_enrollment_call(node_id, reply_channel.as_str(), call_id, receiving_session_id);
+                mesh.retire_enrollment_call(
+                    node_id,
+                    reply_channel.as_str(),
+                    call_id,
+                    receiving_session_id,
+                );
             }
         }
     }
@@ -3614,71 +3629,72 @@ impl MeshNode {
         let resp_tx_for_denials = resp_tx.clone();
         let emit: RpcResponseEmitter =
             Arc::new(move |from_node, session_id, caller_origin, call_id, resp| {
-            let target_hint = origin_node_cache_for_emit.get((from_node, caller_origin, call_id));
-            // Resolve the reply channel from cache (Arc bump on hit; one
-            // `format!` + `ChannelName::new` the first time we see a caller).
-            let cached = match reply_channel_cache.get(caller_origin) {
-                Some(c) => c,
-                None => {
-                    let name = format!("{service_for_emit}.replies.{caller_origin:016x}");
-                    match ChannelName::new(&name) {
-                        Ok(channel_name) => {
-                            // Compute hash + stream_id ONCE per caller_origin
-                            // and stash them alongside the name.
-                            let channel_id = ChannelId::new(channel_name.clone());
-                            let triple = CachedReplyChannel {
-                                hash: channel_id.hash(),
-                                stream_id: MeshNode::publish_stream_id(&channel_id),
-                                name: channel_name,
-                            };
-                            reply_channel_cache.insert(caller_origin, triple.clone());
-                            triple
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, channel = %name,
+                let target_hint =
+                    origin_node_cache_for_emit.get((from_node, caller_origin, call_id));
+                // Resolve the reply channel from cache (Arc bump on hit; one
+                // `format!` + `ChannelName::new` the first time we see a caller).
+                let cached = match reply_channel_cache.get(caller_origin) {
+                    Some(c) => c,
+                    None => {
+                        let name = format!("{service_for_emit}.replies.{caller_origin:016x}");
+                        match ChannelName::new(&name) {
+                            Ok(channel_name) => {
+                                // Compute hash + stream_id ONCE per caller_origin
+                                // and stash them alongside the name.
+                                let channel_id = ChannelId::new(channel_name.clone());
+                                let triple = CachedReplyChannel {
+                                    hash: channel_id.hash(),
+                                    stream_id: MeshNode::publish_stream_id(&channel_id),
+                                    name: channel_name,
+                                };
+                                reply_channel_cache.insert(caller_origin, triple.clone());
+                                triple
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, channel = %name,
                                 "rpc serve_rpc: invalid reply channel name");
-                            return;
+                                return;
+                            }
                         }
                     }
-                }
-            };
-            // Build the RESPONSE event envelope (24-byte meta + encoded
-            // payload) synchronously — pure CPU, no await — then hand it to
-            // the drainer.
-            let meta = EventMeta::new(
-                crate::adapter::net::cortex::DISPATCH_RPC_RESPONSE,
-                0,
-                server_origin,
-                call_id,
-                0,
-            );
-            let mut buf = Vec::with_capacity(EVENT_META_SIZE + 64);
-            buf.extend_from_slice(&meta.to_bytes());
-            resp.encode_into(&mut buf);
-            if resp_tx
-                .try_send(RpcResponseJob {
-                    caller_origin,
+                };
+                // Build the RESPONSE event envelope (24-byte meta + encoded
+                // payload) synchronously — pure CPU, no await — then hand it to
+                // the drainer.
+                let meta = EventMeta::new(
+                    crate::adapter::net::cortex::DISPATCH_RPC_RESPONSE,
+                    0,
+                    server_origin,
                     call_id,
-                    session_id,
-                    target_hint,
-                    reply_channel: cached.name,
-                    reply_channel_hash: cached.hash,
-                    reply_stream_id: cached.stream_id,
-                    payload: Bytes::from(buf),
-                })
-                .is_err()
-            {
-                tracing::debug!(
-                    caller_origin = format!("{:#x}", caller_origin),
-                    call_id,
-                    "rpc serve_rpc: response drainer at capacity; dropping response"
+                    0,
                 );
-            }
-            // AV-4 item 4: a unary call emits exactly one, always-
-            // terminal RESPONSE — retire its cached response route now
-            // (target_hint for THIS response was already captured above).
-            origin_node_cache_for_emit.remove((from_node, caller_origin, call_id));
-        });
+                let mut buf = Vec::with_capacity(EVENT_META_SIZE + 64);
+                buf.extend_from_slice(&meta.to_bytes());
+                resp.encode_into(&mut buf);
+                if resp_tx
+                    .try_send(RpcResponseJob {
+                        caller_origin,
+                        call_id,
+                        session_id,
+                        target_hint,
+                        reply_channel: cached.name,
+                        reply_channel_hash: cached.hash,
+                        reply_stream_id: cached.stream_id,
+                        payload: Bytes::from(buf),
+                    })
+                    .is_err()
+                {
+                    tracing::debug!(
+                        caller_origin = format!("{:#x}", caller_origin),
+                        call_id,
+                        "rpc serve_rpc: response drainer at capacity; dropping response"
+                    );
+                }
+                // AV-4 item 4: a unary call emits exactly one, always-
+                // terminal RESPONSE — retire its cached response route now
+                // (target_hint for THIS response was already captured above).
+                origin_node_cache_for_emit.remove((from_node, caller_origin, call_id));
+            });
 
         // Build the server fold and wrap it in an Arc<Mutex<...>>
         // so the bridge task can drive it (the trait takes
