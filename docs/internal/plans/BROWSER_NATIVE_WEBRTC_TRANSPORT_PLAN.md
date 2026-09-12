@@ -1889,6 +1889,27 @@ remotely applied fold state). Five bounded groups remain
 | H4 (P2) | `peer_endpoint_is_rtc` reads the send endpoint, so a routed session whose *relay* is RTC classifies the far target `Ice` (X —UDP— R —RTC— Y) |
 | H5 | reliable witness proves set completion, not order (permuted values passed — do **not** change raw-dispatch semantics; resolve the boundary via `seq`); advisory-refresh precondition implicit; reset test `to_b \|\| to_c`; conservation dedupes; fairness claims exceed observations; shaped-ingress is format acceptance only; inventory is 34 not 35; the forced-color `nextest list` parser (already repaired by `22fb4ae23`) |
 
+**H-round candidate `9d036f584` (2026-09-12) — returned by the
+reviewer (`spikes/S3_H_RETURN.md`), not forwarded to Kyra.** Verified
+at that head: `probe_shutdown.py` re-aimed at HEAD's exact
+`shutdown_and_join` green, red again with the post-abort await removed;
+Kyra's teardown pair green ×2; inverses H1a, H2a/b/c, H4a red as
+claimed. Credited: H1, H2's `PriorSession::{Any, Exactly, Absent}` and
+commit-time quiescence, H4, the H5 corrections. Returned:
+**R-A (P1)** the H3 re-offer loop clears every pending-eviction mark up
+front and `break`s on the first refused send, dropping the rest — the
+witness's ≈1-in-6 failure under load *is* that bug (2/8 red at HEAD;
+12/12 with the loop re-marking every undelivered id), and the 15 s → 45 s
+widening in `9d036f584` let the failure detector satisfy the witness:
+with `mark_pending_eviction` removed it now passes, so its §12.2 row is
+stale. **R-B (P1)** H2 schedule (1) is narrowed, not closed:
+`still_live()` runs before `peers.entry(..).insert`, and the
+`install_intents` counter that was to inform the close path is never
+read. **R-C** §12.2's H5a row is false — Kyra's set-preserving
+mutation is green against the seq-reorder witness, as any honest
+set-completion witness must be. **R-D** the Drop witness passes with
+`shutdown_terminal()` removed (every slot has a `Session`).
+
 ## Stage 4 — Announcement fields, `0x0D02`, bootstrap credential + listener
 
 - `noise_pubkey` / `rtc_bootstrap` / `rtc_addr` on the announcement, added to
