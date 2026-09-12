@@ -25328,12 +25328,16 @@ impl MeshNode {
                                 &super::rtc::RtcSignalMsg::Answer { dialog, sdp },
                             )
                             .await;
-                        // R4: the answerer trickles its own
-                        // candidate and owns the completion of this
-                        // dialog — DataChannel open, Noise in the
-                        // answerer's role, fenced install.
-                        node.trickle_local_candidate(from_node, dialog).await;
+                        // R4/R4-A: the answerer owns this dialog's
+                        // completion. The owner is spawned FIRST —
+                        // before the candidate that can make the
+                        // channel open — so its `accept_rtc` inbox
+                        // is registered before the first msg1 can
+                        // arrive. Spawning after the trickle left a
+                        // window where the initiator's msg1 reached
+                        // a node with no inbox and was lost.
                         node.spawn_dialog_completion(from_node, dialog, peer, false);
+                        node.trickle_local_candidate(from_node, dialog).await;
                     }
                     super::rtc::SignalOutcome::AnswerApplied { dialog, peer } => {
                         // R4: the offerer's half. ICE is running;
@@ -25498,44 +25502,76 @@ impl MeshNode {
             .as_ref()
             .map(|rtc| rtc.ice_deadline)
             .unwrap_or_else(|| Duration::from_secs(10));
-        let node = Arc::clone(self);
+        // **R4-A: a weak node reference.** A strong `Arc` held
+        // across these waits stops `MeshNode::drop` — the path that
+        // sets `shutdown` — from ever running for a node dropped
+        // without an explicit `shutdown()`.
+        let weak = self.self_weak.get().cloned();
         let dialogs = Arc::clone(&self.rtc_dialogs);
+        let shutdown = self.shutdown.clone();
+        let shutdown_notify = self.shutdown_notify.clone();
+        // **One absolute deadline per attempt** (R4-A): the channel
+        // wait, Noise and the install share it, so the table can no
+        // longer expire an attempt that is already installing.
+        let deadline = tokio::time::Instant::now() + ice_deadline;
         let handle = tokio::spawn(async move {
-            // 1. The dialog's own DataChannel-open event.
-            if tokio::time::timeout(ice_deadline, driver.await_open(peer))
-                .await
-                .map(|r| r.is_err())
-                .unwrap_or(true)
-            {
-                // Never opened: leave the attempt to the expiry
-                // sweep, which is what keeps the routed session.
+            // 1. The dialog's own DataChannel-open event, under the
+            //    attempt's own deadline, and cancellable by
+            //    shutdown.
+            let opened = tokio::select! {
+                r = tokio::time::timeout_at(deadline, driver.await_open(peer)) => {
+                    matches!(r, Ok(Ok(())))
+                }
+                _ = shutdown_notify.notified() => false,
+            };
+            if !opened || shutdown.load(Ordering::Acquire) {
+                // Never opened, or we are going away: leave the
+                // attempt to the expiry sweep, which is what keeps
+                // the routed session.
                 return;
             }
-            // 2. Noise over it, in this dialog's role. The offerer
-            //    initiates, so both sides do not send msg1.
-            let peer_pubkey = node
-                .peer_announced_noise_pubkey(peer_node_id)
-                .or_else(|| node.peer_static_x25519(peer_node_id));
-            let installed = if offerer {
-                match peer_pubkey {
-                    Some(key) => node.connect_rtc(peer, &key, peer_node_id).await.map(|_| ()),
-                    None => Err(AdapterError::Connection(
-                        "rtc upgrade: no announced Noise key for the peer".into(),
-                    )),
-                }
-            } else {
-                node.accept_rtc(peer, peer_node_id).await.map(|_| ())
+            let Some(node) = weak.as_ref().and_then(|w| w.upgrade()) else {
+                return;
             };
-            // 3. Retire the attempt either way: on success so the
-            //    expiry sweep cannot close the endpoint the install
-            //    now owns, on failure because the attempt is over.
+            // 2. **Retire the attempt BEFORE the install commits**
+            //    (R4-A): expiry used to be able to close a
+            //    just-installed direct endpoint after the routed
+            //    incumbent had already been displaced, because the
+            //    table stayed expirable across the install and the
+            //    post-install announcement await.
             {
                 let mut table = dialogs.lock().await;
                 table.remove(peer_node_id, dialog);
             }
-            // R5: the dialog is over either way — release its
-            // budget slot so the peer may open another.
             node.release_signal_budget(peer_node_id, dialog);
+            // 3. Noise over it, in this dialog's role. The offerer
+            //    initiates, so both sides do not send msg1.
+            let peer_pubkey = node
+                .peer_announced_noise_pubkey(peer_node_id)
+                .or_else(|| node.peer_static_x25519(peer_node_id));
+            let install = async {
+                if offerer {
+                    match peer_pubkey {
+                        Some(key) => node.connect_rtc(peer, &key, peer_node_id).await.map(|_| ()),
+                        None => Err(AdapterError::Connection(
+                            "rtc upgrade: no announced Noise key for the peer".into(),
+                        )),
+                    }
+                } else {
+                    node.accept_rtc(peer, peer_node_id).await.map(|_| ())
+                }
+            };
+            let installed = tokio::select! {
+                r = tokio::time::timeout_at(deadline, install) => match r {
+                    Ok(inner) => inner,
+                    Err(_) => Err(AdapterError::Connection(
+                        "rtc upgrade: the attempt's deadline passed during Noise".into(),
+                    )),
+                },
+                _ = shutdown_notify.notified() => Err(AdapterError::Connection(
+                    "rtc upgrade: node shutting down".into(),
+                )),
+            };
             match installed {
                 Ok(()) => {
                     driver.stats().note_ice_direct();
