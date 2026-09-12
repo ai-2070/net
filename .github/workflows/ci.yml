@@ -4632,7 +4632,7 @@ jobs:
           }
           check_floor rtc_loopback 5
           check_floor rtc_backpressure 7
-          check_floor rtc_repairs 21
+          check_floor rtc_repairs 22
           check_floor rtc_routed_restore 4
           check_floor rtc_install_race 6
           check_floor rtc_reclaim 4
@@ -4653,9 +4653,10 @@ jobs:
           rtc_repairs:a_busy_incumbent_survives_an_rtc_upgrade_attempt
           rtc_repairs:serving_stun_does_not_intercept_ice_connectivity_checks
           rtc_repairs:the_rtc_prefilter_admits_exactly_what_dispatch_accepts
-          rtc_repairs:a_reliable_stream_delivers_exact_values_in_order_through_loss
+          rtc_repairs:a_reliable_stream_delivers_every_value_and_reorders_by_seq
           rtc_repairs:a_fire_and_forget_stream_loses_packets_and_never_retransmits
           rtc_repairs:the_advisory_refreshes_for_a_queued_peer_the_pump_never_touches
+          rtc_repairs:the_advisory_decays_for_an_idle_peer_with_an_empty_queue
           rtc_repairs:a_connection_reset_is_swallowed_by_the_production_arm_with_siblings_intact
           rtc_repairs:a_busy_peer_cannot_starve_a_sibling_or_the_socket
           rtc_repairs:a_stalled_driver_is_aborted_and_joined_before_shutdown_returns

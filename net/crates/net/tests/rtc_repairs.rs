@@ -70,6 +70,31 @@ fn rtc_config() -> RtcConfig {
     RtcConfig::new().with_bind_addr("127.0.0.1:0".parse().expect("addr"))
 }
 
+/// A pair whose heartbeat is far outside any witness window, so
+/// "the queue is empty" can actually hold with the pump paused.
+async fn quiet_pair() -> (Arc<MeshNode>, Arc<MeshNode>, RtcPeerId) {
+    let mut a_cfg = config(Some(rtc_config()));
+    a_cfg.heartbeat_interval = Duration::from_secs(600);
+    let mut b_cfg = config(Some(rtc_config()));
+    b_cfg.heartbeat_interval = Duration::from_secs(600);
+    let a = Arc::new(
+        MeshNode::new(EntityKeypair::generate(), a_cfg)
+            .await
+            .expect("MeshNode::new"),
+    );
+    let b = Arc::new(
+        MeshNode::new(EntityKeypair::generate(), b_cfg)
+            .await
+            .expect("MeshNode::new"),
+    );
+    a.start();
+    b.start();
+    let (id_a, _id_b) = connect_rtc_loopback(&a, &b)
+        .await
+        .expect("DataChannel + Noise handshake");
+    (a, b, id_a)
+}
+
 async fn pair_with(
     a_cfg: RtcConfig,
     b_cfg: RtcConfig,
@@ -438,13 +463,19 @@ async fn a_committed_prefix_is_never_replayed_when_the_suffix_is_refused() {
     );
 
     let seen = collect_tagged(&b, b"R2PFX", payloads.len(), Duration::from_secs(30)).await;
-    let unique: HashSet<Vec<u8>> = seen.iter().cloned().collect();
+    // H5: the exact expected vector after the consumer's reorder,
+    // not a count of distinct values — a foreign payload plus a
+    // missing one satisfied the cardinality check.
+    let mut by_seq: std::collections::BTreeMap<u8, Vec<u8>> = std::collections::BTreeMap::new();
+    for p in &seen {
+        by_seq.insert(p[b"R2PFX".len()], p.clone());
+    }
+    let reordered: Vec<Vec<u8>> = by_seq.values().cloned().collect();
+    let expected: Vec<Vec<u8>> = payloads.iter().map(|p| p.to_vec()).collect();
     assert_eq!(
-        unique.len(),
-        payloads.len(),
-        "every payload must arrive: {} distinct of {}",
-        unique.len(),
-        payloads.len()
+        reordered, expected,
+        "every payload must arrive, and reordered by seq they must be exactly \
+         what was sent"
     );
 
     // The replay question is answered **sender-side**: a whole-call
@@ -572,18 +603,42 @@ async fn retention_conserves_every_admitted_packet_and_then_delivers_it() {
 
     // While every write refuses, nothing may be lost: each admitted
     // packet is either still queued or held in the retry slot.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    // Absolute totals: the retained gauge is absolute, so the ledger
-    // has to be too.
+    //
+    // H5: sample at a **settled ownership boundary**. These are
+    // independent relaxed atomics, not a transactional ledger: a
+    // pump between popping a packet (retained decremented) and
+    // recording its outcome makes the arithmetic momentarily
+    // untrue without anything being lost. Wait for the ledger to
+    // hold and *stay* holding across consecutive reads, and only
+    // then treat a violation as loss — a single mid-flight read
+    // diagnoses scheduling, not conservation.
+    let settled = wait_for(
+        || {
+            let sample = || {
+                let accepted = a.rtc_stats().accepted();
+                let written = a.rtc_stats().written();
+                let queued = driver.transport().queued_packets(id_a) as u64;
+                let retained = a.rtc_stats().retained();
+                (accepted, written + queued + retained)
+            };
+            let first = sample();
+            // Two consecutive agreeing reads with no accepted-count
+            // movement between them: nothing was in flight across
+            // the observation.
+            first.0 == first.1 && sample() == first
+        },
+        Duration::from_secs(10),
+    )
+    .await;
     let accepted = a.rtc_stats().accepted();
     let written = a.rtc_stats().written();
     let queued = driver.transport().queued_packets(id_a) as u64;
     let retained = a.rtc_stats().retained();
-    assert_eq!(
-        accepted,
-        written + queued + retained,
-        "while writes refuse: accepted({accepted}) == written({written}) + \
-         queued({queued}) + retained({retained})"
+    assert!(
+        settled,
+        "while writes refuse, the settled ledger must balance: \
+         accepted({accepted}) == written({written}) + queued({queued}) + \
+         retained({retained})"
     );
     assert!(
         a.rtc_stats().write_false() >= 1,
@@ -594,13 +649,20 @@ async fn retention_conserves_every_admitted_packet_and_then_delivers_it() {
     // delivered, exactly once each.
     driver.hooks().set_force_write_false(false);
     let seen = collect_tagged(&b, b"R3CONS", N, Duration::from_secs(20)).await;
-    let unique: HashSet<Vec<u8>> = seen.iter().cloned().collect();
+    // H5: the exact expected vector after the consumer's reorder,
+    // not a set cardinality. The old assertion counted distinct
+    // values, so a foreign payload plus a missing one would have
+    // passed.
+    let mut by_seq: std::collections::BTreeMap<u8, Vec<u8>> = std::collections::BTreeMap::new();
+    for payload in &seen {
+        by_seq.insert(payload[b"R3CONS".len()], payload.clone());
+    }
+    let reordered: Vec<Vec<u8>> = by_seq.values().cloned().collect();
+    let expected: Vec<Vec<u8>> = payloads.iter().map(|p| p.to_vec()).collect();
     assert_eq!(
-        unique.len(),
-        N,
-        "every retained packet must be delivered after the refusal clears; \
-         saw {} distinct of {N}",
-        unique.len()
+        reordered, expected,
+        "every admitted packet must be delivered once the refusal clears, and \
+         reordered by seq they must be exactly what was sent"
     );
     assert_eq!(
         a.rtc_stats().retained(),
@@ -999,12 +1061,20 @@ async fn serving_stun_does_not_intercept_ice_connectivity_checks() {
     );
 }
 
-/// R4-B: the prefilter admits every outer format the dispatcher
-/// handles, and rejects only what the dispatcher would reject — with
-/// each rejection *reason* exercised separately.
+/// R4-B: the RTC ingress prefilter admits exactly the five outer
+/// **formats** dispatch accepts, and counts what it rejects.
 ///
-/// Inverse: restore the two-format filter (routing magic or a
-/// validating `NetHeader`) and the route-hop and pingwave cases fail.
+/// Scope, labelled (H5): this is **format acceptance only**. It
+/// says nothing about authenticated route-hop forwarding or native
+/// pingwave route learning — a shape being admitted by the
+/// prefilter is not the same as the packet being authenticated,
+/// forwarded or learned from, and those are separate gates several
+/// modules away (`relay_protected_hop`, the pingwave admission
+/// path). Do not read this witness as evidence about either.
+///
+/// Inverse: restore the narrow prefilter (Net magic only) — the
+/// valid route-hop and pingwave shapes are rejected and the
+/// rejection delta assertion fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_rtc_prefilter_admits_exactly_what_dispatch_accepts() {
     let (a, b, id_a, _) = pair_with(rtc_config(), rtc_config()).await;
@@ -1067,16 +1137,28 @@ async fn the_rtc_prefilter_admits_exactly_what_dispatch_accepts() {
 // S3-R6 — the properties the old witnesses could not discriminate
 // ---------------------------------------------------------------
 
-/// R6: a reliable stream's **exact payloads**, in order, complete and
-/// without duplicates, through real selected loss — with the
-/// retransmit evidence that says recovery is what carried it.
+/// R6: a reliable stream delivers **every value**, and the
+/// consumer's reorder by `seq` reproduces the sender's exact
+/// sequence, each value exactly once — through real selected loss,
+/// with the retransmit evidence that says recovery carried it.
+///
+/// The claim is deliberately the one the substrate makes. RTC and
+/// raw dispatch permit out-of-order and repeated *observations*
+/// (`streams.md`: "no loss, not in order"); ordering is the
+/// consumer's, via the sequence each payload carries. Kyra
+/// permuted the values at the send seam and the old assertions —
+/// a `HashSet` of size N — passed, so the name promised an
+/// ordering property the body never tested. This asserts the real
+/// one: reorder by the embedded sequence, then require the exact
+/// vector.
 ///
 /// Inverses: (1) suppress the sends on this stream id — nothing
-/// arrives and the value assertion fails, where the old
-/// count-the-other-batch witness passed; (2) disable the loss
-/// injector — the recovery evidence assertion fails.
+/// arrives and the value assertion fails; (2) permute the values at
+/// the send seam — the reordered sequence no longer matches;
+/// (3) disable the loss injector — the recovery evidence assertion
+/// fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_reliable_stream_delivers_exact_values_in_order_through_loss() {
+async fn a_reliable_stream_delivers_every_value_and_reorders_by_seq() {
     let (a, b, _id_a, _) = pair_with(rtc_config(), rtc_config()).await;
 
     // One in four inbound DataChannel messages is dropped on B, with
@@ -1105,26 +1187,47 @@ async fn a_reliable_stream_delivers_exact_values_in_order_through_loss() {
     }
 
     let seen = collect_tagged(&b, b"R6REL", N, Duration::from_secs(60)).await;
-    let unique: HashSet<Vec<u8>> = seen.iter().cloned().collect();
+
+    // The consumer's reorder: each payload carries its sequence in
+    // the byte after the tag (`tagged_payloads`), which is what a
+    // real consumer reorders on.
+    let mut by_seq: std::collections::BTreeMap<u8, Vec<Vec<u8>>> =
+        std::collections::BTreeMap::new();
+    for payload in &seen {
+        let seq = payload[b"R6REL".len()];
+        by_seq.entry(seq).or_default().push(payload.clone());
+    }
     assert_eq!(
-        unique.len(),
+        by_seq.len(),
         N,
-        "a reliable stream must deliver every payload under loss; \
-         {} distinct of {N} (deliveries: {})",
-        unique.len(),
+        "a reliable stream must deliver every value: {} distinct sequences of \
+         {N} ({} deliveries)",
+        by_seq.len(),
         seen.len()
     );
-    for (i, payload) in payloads.iter().enumerate() {
-        assert!(
-            unique.contains(payload.as_ref()),
-            "reliable payload {i} never arrived"
-        );
-    }
+    // Reordered, the result is the sender's exact sequence — each
+    // value once, in its own position, with no foreign or corrupted
+    // value in between.
+    let reordered: Vec<Vec<u8>> = by_seq
+        .values()
+        .map(|copies| {
+            // Every copy of a sequence must be byte-identical: a
+            // differing copy is corruption, not a retransmission.
+            assert!(
+                copies.windows(2).all(|w| w[0] == w[1]),
+                "two deliveries claimed the same sequence with different bytes"
+            );
+            copies[0].clone()
+        })
+        .collect();
+    let expected: Vec<Vec<u8>> = payloads.iter().map(|p| p.to_vec()).collect();
+    assert_eq!(
+        reordered, expected,
+        "reordered by seq, the stream must be exactly what the sender sent"
+    );
 
-    // Duplicates are bounded by retransmission and never by luck:
-    // with no loss injected this same flow delivers 12 for 12 (see
-    // the no-loss control in the delivery witness), so any extra
-    // delivery here is a re-sent packet whose original also landed.
+    // Duplicate *observations* are permitted — the substrate allows
+    // them — but only as retransmissions, and the count says so.
     let retransmits = a
         .control_plane_stats()
         .retransmit_packets_sent
@@ -1210,14 +1313,22 @@ async fn a_fire_and_forget_stream_loses_packets_and_never_retransmits() {
     );
 }
 
-/// R6: the idle-refresh arm specifically — a peer with a **non-empty
-/// queue and no writes** must still have its advisory reading
-/// refreshed. Ordinary pumping cannot satisfy this, because the pump
-/// is paused for the whole test.
+/// R6/H5: the advisory refresh publishes a fresh reading for a
+/// queued peer the pump never touches — from a **stale-high**
+/// starting point.
 ///
-/// Inverse: delete the advisory-refresh block from the driver loop
-/// (or narrow it to peers the pump just wrote to) and the reading
-/// never moves.
+/// The precondition is the whole test. `open_peer` initialises the
+/// published reading to zero and recycling resets it, so the
+/// original `Some(0)` predicate was already true before the action:
+/// the witness passed with the entire refresh arm deleted. Here the
+/// reading is poisoned to a value above the advisory bound, that is
+/// asserted to be non-zero *and* admission-refusing, and only then
+/// is decay required — with the pump paused throughout, so no write
+/// can be what published it.
+///
+/// Inverse: delete the independent advisory-refresh phase from the
+/// driver loop — the poisoned reading never decays and admission
+/// stays refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_advisory_refreshes_for_a_queued_peer_the_pump_never_touches() {
     let (a, _b, id_a, _) = pair_with(rtc_config(), rtc_config()).await;
@@ -1227,23 +1338,101 @@ async fn the_advisory_refreshes_for_a_queued_peer_the_pump_never_touches() {
     driver.hooks().set_pump_paused(true);
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Poison the published reading, then queue work without ever
-    // letting the pump write.
+    // Queue work first: this is the QUEUED arm of the refresh, and
+    // it must be distinguishable from the empty-queue case.
     transport
         .submit(&[0u8; 256], id_a)
         .expect("queue something so the refresh arm considers this peer");
+
+    // Poison the reading above the advisory bound.
+    let poisoned = RtcConfig::new().buffered_amount_advisory + 1;
+    transport.poison_published_buffered(id_a, poisoned);
+    assert_eq!(
+        transport.published_buffered(id_a),
+        Some(poisoned),
+        "precondition: the published reading is stale-HIGH, not an initialised zero"
+    );
+    assert_eq!(
+        transport.submit(&[0u8; 64], id_a),
+        Err(RtcSubmitError::AdvisoryOver),
+        "precondition: that reading is refusing admission"
+    );
+    assert!(
+        transport.queued_packets(id_a) >= 1,
+        "precondition: the pump is paused, so no write can publish a reading"
+    );
+
     let refreshed = wait_for(
-        || transport.published_buffered(id_a) == Some(0),
-        Duration::from_secs(5),
+        || {
+            transport
+                .published_buffered(id_a)
+                .is_some_and(|v| v < poisoned)
+        },
+        Duration::from_secs(10),
     )
     .await;
     assert!(
         refreshed,
-        "the refresh arm must publish a reading for a queued peer with no writes"
+        "the refresh arm must publish a fresh reading for a queued peer the pump \
+         never touches; still {:?}",
+        transport.published_buffered(id_a)
     );
     assert!(
-        driver.transport().queued_packets(id_a) >= 1,
-        "precondition: the pump really is paused, so nothing wrote this reading"
+        transport.queued_packets(id_a) >= 1,
+        "and it must do so without draining the queue"
+    );
+}
+
+/// The other half of the same arm: an **empty** queue with a
+/// stale-high reading must also decay, or an idle peer stays
+/// refused forever.
+///
+/// Inverse: restrict the refresh to peers with queued work (drop
+/// the `stale_high` term) — the reading never decays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_advisory_decays_for_an_idle_peer_with_an_empty_queue() {
+    let (a, _b, id_a) = quiet_pair().await;
+    let driver = a.rtc_driver().expect("driver");
+    let transport = driver.transport();
+
+    // The pump is left RUNNING and the queue left EMPTY: `pump_peer`
+    // returns before publishing anything when it finds nothing to
+    // pop, so any reading published here can only come from the
+    // independent stale-high refresh arm. (Pausing the pump instead
+    // cannot hold "empty" — the node's own maintenance traffic
+    // queues behind it.)
+    assert!(
+        wait_for(
+            || transport.queued_packets(id_a) == 0,
+            Duration::from_secs(10)
+        )
+        .await,
+        "precondition: the queue must be empty for the idle arm to be the \
+         only thing that can fire"
+    );
+
+    let poisoned = RtcConfig::new().buffered_amount_advisory + 1;
+    transport.poison_published_buffered(id_a, poisoned);
+    assert_eq!(
+        transport.submit(&[0u8; 64], id_a),
+        Err(RtcSubmitError::AdvisoryOver),
+        "precondition: the stale reading refuses admission — and the refusal \
+         leaves the queue empty, which is the arm under test"
+    );
+
+    assert!(
+        wait_for(
+            || transport
+                .published_buffered(id_a)
+                .is_some_and(|v| v < poisoned),
+            Duration::from_secs(10)
+        )
+        .await,
+        "an idle peer's stale-high reading must decay without any write"
+    );
+    assert!(
+        transport.submit(&[0u8; 64], id_a).is_ok(),
+        "and admission must recover once the reading is the truth"
     );
 }
 
@@ -1280,32 +1469,61 @@ async fn a_connection_reset_is_swallowed_by_the_production_arm_with_siblings_int
         transport.is_open(id_ab) && transport.is_open(id_ac),
         "an ICMP port-unreachable about some other peer must not close either session"
     );
-    a.send_to_peer_node(b.node_id(), &batch(0, 2, "post-reset-b"))
+    // Drain whatever the setup produced, so only post-reset traffic
+    // can satisfy the assertions below (H5: the original collected
+    // with an EMPTY tag and accepted `to_b || to_c`, so one broken
+    // sibling — or an unrelated earlier event — passed it).
+    let _ = collect_tagged(&b, b"", 64, Duration::from_millis(200)).await;
+    let _ = collect_tagged(&c, b"", 64, Duration::from_millis(200)).await;
+
+    let payload_b = Bytes::from_static(b"RESETB");
+    let payload_c = Bytes::from_static(b"RESETC");
+    let mut cfg = StreamConfig::new();
+    cfg.reliability = Reliability::Reliable;
+    let to_b_stream = a
+        .open_stream(b.node_id(), 0x0B01, cfg.clone())
+        .expect("stream to b");
+    let to_c_stream = a
+        .open_stream(c.node_id(), 0x0C01, cfg)
+        .expect("stream to c");
+    a.send_with_retry(&to_b_stream, std::slice::from_ref(&payload_b), 16)
         .await
         .expect("send to b");
-    a.send_to_peer_node(c.node_id(), &batch(0, 2, "post-reset-c"))
+    a.send_with_retry(&to_c_stream, std::slice::from_ref(&payload_c), 16)
         .await
         .expect("send to c");
-    let to_b = !collect_tagged(&b, b"", 1, Duration::from_secs(10))
-        .await
-        .is_empty();
-    let to_c = !collect_tagged(&c, b"", 1, Duration::from_secs(10))
-        .await
-        .is_empty();
+
+    let seen_b = collect_tagged(&b, b"RESETB", 1, Duration::from_secs(15)).await;
+    let seen_c = collect_tagged(&c, b"RESETC", 1, Duration::from_secs(15)).await;
     assert!(
-        to_b || to_c,
-        "both sibling sessions must keep delivering after a swallowed reset"
+        seen_b.iter().any(|p| p == payload_b.as_ref()),
+        "B must receive ITS post-reset payload; saw {seen_b:?}"
+    );
+    assert!(
+        seen_c.iter().any(|p| p == payload_c.as_ref()),
+        "C must receive ITS post-reset payload — one working sibling is not \
+         'siblings intact'; saw {seen_c:?}"
     );
 }
 
-/// R6: the bounded service policy. One continuously busy peer cannot
-/// hold the driver: a sibling peer's packet and the driver's own
-/// socket read both make progress while the busy peer is being
-/// served.
+/// R6/H5: **one stress schedule**, with its preconditions measured
+/// — not a proof of the service bound.
 ///
-/// Inverse: remove `WRITE_QUANTUM_PER_TURN` (restore the
-/// drain-until-empty pump) and the sibling's delivery time becomes a
-/// function of the busy peer's backlog rather than the quantum.
+/// A producer refills B's queue to refusal for the whole window,
+/// the backlog is sampled and required to stay deep, and C's own
+/// tagged payload must arrive within the window. That is what this
+/// test establishes: under a continuously deep backlog on one peer,
+/// a sibling is still served.
+///
+/// It is deliberately **not** advertised as a proof of
+/// `WRITE_QUANTUM_PER_TURN`. Executed inverse (H5g): removing the
+/// quantum — restoring the drain-until-empty pump — leaves this
+/// test green, because a fast unbounded pump drains each refill and
+/// yields anyway. The bounded quanta are credited from source
+/// (`driver.rs`: 8 writes per peer per turn, 16 signals per turn);
+/// this witness is the stress schedule around them. A real
+/// service-bound proof needs a driver-side scheduling observation
+/// this fixture does not have.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_busy_peer_cannot_starve_a_sibling_or_the_socket() {
     let big = RtcConfig {
@@ -1327,30 +1545,62 @@ async fn a_busy_peer_cannot_starve_a_sibling_or_the_socket() {
     let busy = tokio::spawn(async move {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
         while tokio::time::Instant::now() < deadline {
-            for _ in 0..64 {
-                let _ = transport.submit(&[0x7Au8; 1024], id_ab);
-            }
+            // Fill to refusal, not a fixed burst: the backlog has to
+            // be *continuously* deep for the sibling's progress to
+            // say anything about fairness (H5), and a fixed burst
+            // drains between iterations.
+            while transport.submit(&[0x7Au8; 1024], id_ab).is_ok() {}
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
     });
 
-    // While B is saturated, C must still get served promptly.
+    // While B is saturated, C must still get served promptly — with
+    // an EXACT payload (H5: an empty tag accepted any pre-existing
+    // event) and with B's backlog observed to stay deep for the
+    // whole measurement, so "saturated" is a measured precondition
+    // rather than an assumption about the producer.
     tokio::time::sleep(Duration::from_millis(200)).await;
+    let backlog_probe = {
+        let transport = Arc::clone(a.rtc_driver().expect("driver").transport());
+        tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            let mut min_seen = usize::MAX;
+            while tokio::time::Instant::now() < deadline {
+                min_seen = min_seen.min(transport.queued_packets(id_ab));
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            min_seen
+        })
+    };
+    let payload = Bytes::from_static(b"R6FAIRC");
+    let mut cfg = StreamConfig::new();
+    cfg.reliability = Reliability::Reliable;
+    let sibling_stream = a
+        .open_stream(c.node_id(), 0x0C77, cfg)
+        .expect("stream to the sibling");
     let started = tokio::time::Instant::now();
-    a.send_to_peer_node(c.node_id(), &batch(0, 4, "sibling"))
+    a.send_with_retry(&sibling_stream, std::slice::from_ref(&payload), 16)
         .await
         .expect("send to the sibling");
-    let seen = collect_tagged(&c, b"", 1, Duration::from_secs(10)).await;
+    let seen = collect_tagged(&c, b"R6FAIRC", 1, Duration::from_secs(10)).await;
     let elapsed = started.elapsed();
+    let min_backlog = backlog_probe.await.expect("backlog probe");
     busy.abort();
 
     assert!(
-        !seen.is_empty(),
-        "the sibling peer must be served while another peer is saturated"
+        min_backlog >= 8,
+        "precondition: B's queue must stay deeply backlogged for the whole \
+         measurement, or the producer saturated nothing and the sibling's \
+         progress says nothing about fairness (min {min_backlog})"
+    );
+    assert!(
+        seen.iter().any(|p| p == payload.as_ref()),
+        "the sibling must receive ITS payload while another peer is saturated; \
+         saw {seen:?}"
     );
     assert!(
         elapsed < Duration::from_secs(5),
-        "a bounded service policy means the sibling's latency is a function of the \
-         quantum, not of the busy peer's backlog; took {elapsed:?}"
+        "under a bounded per-peer quantum the sibling is served while the busy \
+         peer's backlog stands; took {elapsed:?}"
     );
 }

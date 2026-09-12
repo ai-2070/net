@@ -414,6 +414,23 @@ impl RtcTransport {
         self.stats.observe_buffered(amount);
     }
 
+    /// Test-only: force the published reading to a value the driver
+    /// did not publish (H5).
+    ///
+    /// The advisory-refresh witness needs a **stale-high** state.
+    /// `open_peer` initialises this atomic to zero and recycling
+    /// resets it, so `published_buffered == Some(0)` was already
+    /// true before the action — the witness could pass with the
+    /// entire refresh arm deleted.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn poison_published_buffered(&self, id: RtcPeerId, amount: usize) {
+        if let Some(entry) = self.slots.get(&id.slot) {
+            if entry.generation == id.generation {
+                entry.published_buffered.store(amount, Ordering::Relaxed);
+            }
+        }
+    }
+
     /// The reading admission is currently judging this peer against.
     pub fn published_buffered(&self, id: RtcPeerId) -> Option<usize> {
         let entry = self.slots.get(&id.slot)?;
