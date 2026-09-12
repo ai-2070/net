@@ -2922,16 +2922,47 @@ fn enrollment_outcome_is_admitted(frame: &Bytes) -> Option<bool> {
     }
     let payload = RpcResponsePayload::decode(frame.slice(RPC_FRAME_BODY_OFFSET..)).ok()?;
     let body = payload.body.as_ref();
-    if body.len() < OUTCOME_MAGIC.len() + 1 || body[..OUTCOME_MAGIC.len()] != OUTCOME_MAGIC {
-        return None;
-    }
-    match body[OUTCOME_MAGIC.len()] {
-        0 => Some(true),
-        1 => Some(false),
+    // **R6-A: parse structurally, exactly as `JoinOutcome::from_bytes`
+    // does — magic, tag, the tag's own fields, and NO trailing bytes.**
+    // A prefix test on `b"NMO1"` + one byte accepted a truncated
+    // Admitted (magic + tag with no chain), an Admitted whose
+    // length prefix overruns the body, and any payload that merely
+    // begins with those five bytes. Anything this parser cannot
+    // fully account for is not a readable verdict, and an
+    // unreadable verdict promotes nothing.
+    let mut rest = body.strip_prefix(&OUTCOME_MAGIC[..])?;
+    let (&tag, after_tag) = rest.split_first()?;
+    rest = after_tag;
+    let admitted = match tag {
+        // Admitted { chain: length-prefixed bytes }.
+        0 => {
+            rest = take_lp(rest)?;
+            true
+        }
+        // Rejected { code: u16 LE, message: length-prefixed UTF-8 }.
+        1 => {
+            if rest.len() < 2 {
+                return None;
+            }
+            rest = take_lp(&rest[2..])?;
+            false
+        }
         // An unknown tag is a version this anchor does not
         // understand. Refusing to promote is the safe reading.
-        _ => None,
-    }
+        _ => return None,
+    };
+    // Trailing bytes mean this is not the outcome it claims to be.
+    rest.is_empty().then_some(admitted)
+}
+
+/// Skip one `u32`-LE length-prefixed field, returning the remainder,
+/// or `None` when the prefix is truncated or overruns the buffer.
+/// Mirrors `Reader::take_lp` in `sdk/src/enrollment.rs`.
+#[cfg(feature = "webrtc")]
+fn take_lp(bytes: &[u8]) -> Option<&[u8]> {
+    let (len, rest) = bytes.split_at_checked(4)?;
+    let len = u32::from_le_bytes(len.try_into().ok()?) as usize;
+    rest.get(len..)
 }
 
 // The reply-channel triple (`reply_channel`, `reply_channel_hash`,

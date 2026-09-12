@@ -1458,3 +1458,114 @@ async fn a_promotion_inside_the_teardown_window_survives() {
     );
     assert!(!anchor.peer_is_provisional(client_id));
 }
+
+/// R6-A: an outcome that only *looks* admitted promotes nothing.
+///
+/// The gate matched `b"NMO1"` + a tag byte and stopped. A body of
+/// exactly those five bytes — a truncated Admitted with no chain —
+/// promoted the session, as did an Admitted whose length prefix
+/// overruns the body, and any payload merely beginning with them.
+/// The gate now parses the whole outcome (tag, the tag's fields,
+/// no trailing bytes) as `JoinOutcome::from_bytes` does.
+///
+/// Inverse: restore the prefix test — each of these promotes.
+#[cfg(feature = "cortex")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn an_outcome_that_only_looks_admitted_promotes_nothing() {
+    use net::adapter::net::mesh_rpc::CallOptions;
+
+    // Three bodies that pass a prefix test and are not readable
+    // `JoinOutcome::Admitted` values: truncated (no chain), an
+    // overrunning length prefix, and trailing bytes after a
+    // well-formed one.
+    let mut overrun = Vec::from(*b"NMO1");
+    overrun.push(0);
+    overrun.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+    overrun.extend_from_slice(b"short");
+    let mut trailing = Vec::from(outcome_bytes(true).as_ref());
+    trailing.extend_from_slice(b"extra");
+
+    for (label, body) in [
+        (
+            "truncated: magic and tag only",
+            Bytes::from_static(b"NMO1\0"),
+        ),
+        (
+            "a length prefix that overruns the body",
+            Bytes::from(overrun),
+        ),
+        (
+            "trailing bytes after a valid outcome",
+            Bytes::from(trailing),
+        ),
+    ] {
+        let (anchor, client, _endpoint) = anchor_and_provisional_client().await;
+        let client_id = client.node_id();
+        let _serve = anchor
+            .serve_rpc(ENROLL_SERVICE, Arc::new(RawOutcome(body.clone())))
+            .expect("serve the enrollment service");
+
+        let reply = client
+            .call(
+                anchor.node_id(),
+                ENROLL_SERVICE,
+                Bytes::from_static(b"join request"),
+                CallOptions::default(),
+            )
+            .await
+            .expect("the allow-list permits exactly this call");
+        assert_eq!(reply.body, body, "the response itself is delivered");
+        assert!(
+            anchor.peer_is_provisional(client_id),
+            "{label}: an unreadable verdict is not an admission"
+        );
+        assert_eq!(anchor.rtc_stats().admission_promoted(), 0, "{label}");
+    }
+
+    // Positive control: the same path with a well-formed Admitted
+    // outcome promotes.
+    let (anchor, client, _endpoint) = anchor_and_provisional_client().await;
+    let client_id = client.node_id();
+    let _serve = anchor
+        .serve_rpc(ENROLL_SERVICE, Arc::new(RawOutcome(outcome_bytes(true))))
+        .expect("serve the enrollment service");
+    client
+        .call(
+            anchor.node_id(),
+            ENROLL_SERVICE,
+            Bytes::from_static(b"join request"),
+            CallOptions::default(),
+        )
+        .await
+        .expect("call");
+    assert!(
+        wait_for(
+            || !anchor.peer_is_provisional(client_id),
+            Duration::from_secs(5)
+        )
+        .await,
+        "a structurally valid Admitted outcome still promotes"
+    );
+}
+
+/// An enrollment service answering with caller-chosen bytes.
+#[cfg(feature = "cortex")]
+struct RawOutcome(Bytes);
+
+#[cfg(feature = "cortex")]
+#[async_trait::async_trait]
+impl net::adapter::net::cortex::RpcHandler for RawOutcome {
+    async fn call(
+        &self,
+        _ctx: net::adapter::net::cortex::RpcContext,
+    ) -> Result<
+        net::adapter::net::cortex::RpcResponsePayload,
+        net::adapter::net::cortex::RpcHandlerError,
+    > {
+        Ok(net::adapter::net::cortex::RpcResponsePayload {
+            status: net::adapter::net::cortex::RpcStatus::Ok,
+            headers: vec![],
+            body: self.0.clone(),
+        })
+    }
+}
