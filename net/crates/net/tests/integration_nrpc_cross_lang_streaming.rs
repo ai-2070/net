@@ -242,7 +242,8 @@ impl ClientStreamLoopback {
     fn new() -> Self {
         let pending = Arc::new(RpcClientPending::new());
         let client_fold = Arc::new(Mutex::new(RpcClientFold::new(pending.clone())));
-        let emit: RpcResponseEmitter = Arc::new(move |_from_node, origin, call_id, resp| {
+        let emit: RpcResponseEmitter =
+            Arc::new(move |_from_node, _session, origin, call_id, resp| {
             let ev = response_event(origin, call_id, &resp);
             client_fold
                 .lock()

@@ -390,3 +390,198 @@ both `spawn_dialog_completion` arms removed (engine probe red, and the
 Reviewer edits in this record: the stale "test/fixtures only" note on
 `connect_rtc` (it is the production owner's callee since R4), and the
 §12.4 R6 row, which claimed the device's `join()` flow was unchanged.
+
+## 13. Second-round repairs for Kyra's HOLD at `7fccb155c` / `bdba10bb7`
+
+Eight commits, one per item, each with its inverse run at **this**
+head. The first landed Kyra's five probes verbatim before any
+production change, so every repair below was written against a
+failing witness she wrote.
+
+### 13.1 Commits
+
+| Commit | Item |
+|---|---|
+| `557cc7fd2` | Kyra's five new probes, verbatim, + her two seams (`kyra_publish_fixed_request`, `kyra_has_enrollment_reservation`) |
+| `ace3cddb1` | **R5-A** — only an Offer creates a dialog owner; the receipt is counted before the dialog decision |
+| `e6e6d1818` | **R2-A** (cortex half) — the receiving incarnation travels with the call; the unary in-flight key is session-qualified |
+| `eb9455973` | **R3-A** (+ R2-A mesh half) — exact reservation consumption, ownership-checked slot release, check-then-increment, CANCEL classified before accounting |
+| `fb6c40402` | **R1-A** — lock recursion, the migration gate, the client-streaming and duplex bridges |
+| `5b39f95cf` | **R3-B** — teardown is one conditional transition; the breach path carries the charged incarnation |
+| `ccbeb8948` | **R4-A** — one absolute deadline per attempt, retire before install, weak node + shutdown `select!`, responder inbox first |
+| `e3b0dd5f7` | **R6-A** — the promotion gate parses the outcome instead of its prefix |
+| `1dd5c4582` | **R6-B** — the response promotes the call's reservation owner, not a claimed origin |
+| `c86a8c5e7` | **R7** — the SDK's RTC binary, clippy and rustdoc actually run in CI; `rtc_admission` floor 19 → 26 |
+
+Reproduction of Kyra's probes at `557cc7fd2`, before any repair:
+**8 of 11** admission probes green (three of her five red: the
+replacement-request pair and the fifth-request accounting), **9 of
+11** signalling (both of her new ones red).
+
+### 13.2 The red CI run at `bdba10bb7`, diagnosed
+
+Not flake, and not a wait that was too short. The witness
+`a_reject_for_our_own_offer_correlates_and_releases` failed because
+B's trailing trickled Candidate for a dialog A had already
+**rejected and released** re-created that dialog's owner on A: the
+signalling ingress installed an owner for *any* frame naming an
+unknown dialog. The freed budget slot was consumed again, after
+the test had observed it free, so the final assertion raced a
+resurrection rather than a delay.
+
+The repair is R5-A: only an **Offer** creates a dialog owner.
+Answer, Candidate and Reject for an unknown, rejected or expired
+dialog are refused and counted (`signal_unknown_dialog`). The
+witness was then made deterministic by delivering the late frame
+explicitly instead of waiting for it — **its waits are unchanged**.
+
+### 13.3 Inverses at this head
+
+Each mutation was applied at the final head, the named witness run,
+and the tree hash-restored.
+
+| Inverse | Witness | Result |
+|---|---|---|
+| Any frame may create a dialog owner | `kyra_unknown_candidates_cannot_own_dialog_budget` | RED |
+| Receipt counted after the dialog decision | `kyra_every_inbound_signal_frame_is_counted_once` | RED |
+| Emitter drops the receiving incarnation (3-tuple key) | `kyra_same_call_id_old_success_must_not_promote_replacement` | RED |
+| Unary in-flight key without the session | `kyra_old_success_cannot_promote_replacement_request` | RED |
+| Reservation consumed by `(node, call)` scan | `kyra_same_call_id_old_success_must_not_promote_replacement` | RED |
+| Slot released without ownership check | `enrollment_requests_are_charged_and_released_and_churn_returns_to_baseline` | RED |
+| Increment before the cap check | `kyra_fifth_enrollment_request_is_not_executed` | RED |
+| No retirement on an unreadable outcome | `kyra_unreadable_outcome_retires_the_reservation` | RED |
+| Client-streaming bridge gate removed | `a_registered_client_streaming_provider_refuses_a_provisional_caller` | RED |
+| Duplex bridge gate removed | `a_registered_duplex_provider_refuses_a_provisional_caller` | RED |
+| Migration dispatch ungated | `a_provisional_peer_cannot_drive_migration` | RED |
+| Removal predicate is session-id only | `a_promotion_inside_the_teardown_window_survives` | RED |
+| Prefix-only outcome test | `an_outcome_that_only_looks_admitted_promotes_nothing` | RED |
+| Promotion target resolved from the claimed origin | `a_claimant_is_not_promoted_by_another_peers_enrollment` | RED |
+| `derived_admission` back inside the `peers.entry` guard | `a_routed_rehandshake_through_a_provisional_endpoint_does_not_deadlock` | **GREEN — recorded, not claimed** |
+| Breach path removes by state, side effects unconditional | `a_sweep_cannot_reclaim_a_session_promoted_after_selection` | **GREEN — recorded, not claimed** |
+
+The two green inverses are stated as such rather than relabelled:
+
+- **The lock-recursion repair is source-established.** The landed
+  witness drives the routed path through a provisional endpoint
+  under an external timeout and asserts the dispatch stays live,
+  but re-nesting the call does not reproduce the exact same-node
+  DashMap shard re-entry, so the witness does not discriminate. A
+  discriminating witness needs a routed re-handshake whose upstream
+  endpoint indexes the node being installed — a topology this
+  in-process fixture cannot build.
+- **The breach-path inverse** is not discriminated by any existing
+  witness: the surviving sweep witnesses exercise the sweep, not
+  the byte-budget breach, and constructing a breach that races a
+  promotion needs a seam inside `charge_provisional_ingress`. The
+  code change is the same conditional-transition shape as the sweep
+  and is argued from the source, not from a red test.
+
+### 13.4 §12.5, item by item
+
+§12.5 was a list of things left undone, not a waiver. Two of its
+items are now implemented (the client-streaming/duplex witnesses,
+in `fb6c40402`). For the rest, this is the **proposed policy** the
+owner is asked to accept or replace — none is a silent deferral.
+
+**Install-time `max_provisional`.** Proposed: reserve at install.
+`install_provisional` takes a slot from a counter bounded by
+`max_provisional` and fails the install when the counter is full,
+so the cap is enforced at admission rather than by a sweep that
+runs afterwards. The sweep stays as the release path for expiry.
+Cost: one atomic on the install path, and a new refusal an anchor
+operator sees as "provisional capacity full" instead of a session
+that is installed and then shed. This is a behaviour change for
+operators sizing anchors and belongs in a Stage 4b slice with its
+own witness (install refused at the cap, released on promotion and
+on expiry), not in a repair round.
+
+**Aggregate bootstrap-byte bound.** Proposed:
+`max_bootstrap_bytes_in_flight`, a node-wide ledger charged by the
+same call site that charges the per-session byte budget, released
+by the same paths that release the per-session one. The per-session
+bound already caps one peer; the aggregate is what caps
+`max_provisional` peers acting together. It needs a chosen default
+(the natural one is `max_provisional × per-session bytes`, which is
+today's implicit bound, so the value only matters once it is set
+lower) and a witness that the N+1st peer's bootstrap traffic is
+refused while each peer is individually under budget.
+
+**An enrollment deadline that supervises the action.** Today the
+10 s enrollment action is bounded by the 30 s TTL and the sweep,
+so a handler that hangs holds its slot until expiry. Proposed: the
+in-flight REQUEST record carries a deadline, and the accounting
+path that charges it also spawns the supervisor that, at the
+deadline, retires the reservation, releases the slot **and cancels
+the handler task** (the join handle is held by the record). The
+cancellation is the part that matters: retiring the reservation
+without cancelling leaves a task that can still emit a response
+whose reservation is gone — which the R3-A retirement path makes
+harmless but not free.
+
+**Subscribe nonce/retry bounds.** The roster is set-like, so a
+repeated subscribe is idempotent and this is not a multiplicity
+bug. Proposed: a per-session subscribe counter charged in
+`admission_gate_subscribe`, refusing past a small bound (4 is the
+number of channels a legitimate enrollment needs), counted as its
+own refusal reason. This is the only §12.5 item with no
+correctness argument behind it — it is pure resource policy — so
+it should be sized against a real browser client's subscribe
+pattern before a number is picked.
+
+**Incarnation-keyed signal queues.** Async signal queues key on
+node id, so a queued frame for a session that has been replaced is
+delivered to its successor. Proposed: key on `(node, session)` and
+drop the queue when the session is evicted, mirroring exactly what
+R2-A did for in-flight calls and what R3-B did for teardown. The
+same argument applies: session ids are locally assigned, so the
+key is unforgeable, and the drop is the natural place to release
+whatever the queue holds.
+
+**F7 (`proxy.rs`)**, the reflex/relay candidate half, the bootstrap
+listener, TLS and the browser remain out of this round by
+instruction.
+
+### 13.5 Record corrections
+
+- **The bindings break too, for requests *and* replies.** §12.4's
+  R6 row said the Rust SDK's enrollment flow is the only consumer
+  the RTC allow-list breaks. Node
+  (`bindings/node/src/enrollment.rs`, `join` / `serve_enrollment_auto`)
+  and Python (`bindings/python/src/enrollment.rs`, `mesh_join` /
+  `mesh_renew`) both route through the same
+  `net_sdk::mesh_enroll::mesh_over(...).join(...)`, so they inherit
+  the identical failure: a typed request body that is not the raw
+  `NMJ1` bytes the allow-list expects, **and** a typed reply the
+  §12 promotion gate cannot read as a `JoinOutcome`. No binding
+  ships an RTC path today, so nothing regresses; the record was
+  wrong about the scope, and no bridge has been added — that
+  remains the owner's call.
+- **Public API delta this round.** Core: no new public items; two
+  `pub(crate)` additions (`enrollment_reservation_owner`,
+  `retire_enrollment_call`), one changed `pub(crate)` signature
+  (`reclaim_breached_provisional` takes the charged `session_id`),
+  and two `#[cfg(feature = "fixtures")]` seams landed for Kyra
+  (`kyra_publish_fixed_request`, `kyra_has_enrollment_reservation`).
+  `RpcResponseEmitter` gains a `receiving_session_id` field — it is
+  `pub(crate)`. SDK: unchanged this round. C ABI: unchanged; the
+  export set is still 568.
+- **The R4 completion owner is production, and now owns its
+  lifetime.** The earlier record said the owner exists; R4-A is
+  what makes the statement load-bearing (one deadline, retirement
+  before the install, a weak node reference, and every wait racing
+  shutdown).
+
+### 13.6 Validation at the final head
+
+| Command | Result |
+|---|---|
+| `cargo fmt -p net-mesh -p net-mesh-sdk -- --check` | pass |
+| `cargo clippy --lib --bins` default / no-default / `webrtc` / `--all-features` | 0 × 4 |
+| `cargo clippy --features "webrtc fixtures cortex nat-traversal" --all-targets` (CI `-A` set) | 0 |
+| `cargo clippy -p net-mesh-sdk --features "net webrtc" --lib` | 0 |
+| `RUSTDOCFLAGS="-D warnings" cargo doc --features webrtc --no-deps` / SDK `net webrtc` | 0 / 0 |
+| `cargo test --lib --features "$UNIT_FEATURES"` / `+ webrtc` | see below |
+| Ten RTC binaries, `--no-tests=fail --retries 0`, three consecutive whole-suite runs | see below |
+| `sdk/tests/enrollment_over_rtc.rs --features "net webrtc"` | 2 passed |
+| Export checker | 568, unchanged |
+| Consumer diff since `01e4b0f20` | see below |

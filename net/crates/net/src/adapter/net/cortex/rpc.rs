@@ -1758,9 +1758,11 @@ impl RpcServerFold {
         self
     }
 
-    /// Test-only: snapshot of the in-flight call set.
+    /// Test-only: snapshot of the in-flight call set. R2-A keyed it
+    /// on `(node, session, origin, call)` — the receiving
+    /// incarnation is part of a call's identity.
     #[cfg(test)]
-    pub fn in_flight_keys(&self) -> Vec<(u64, u64, u64)> {
+    pub fn in_flight_keys(&self) -> Vec<(u64, u64, u64, u64)> {
         self.in_flight.lock().keys().copied().collect()
     }
 
@@ -5659,7 +5661,7 @@ mod tests {
         // CANCEL.
         assert!(
             wait_until(
-                || fold.in_flight_keys().contains(&(0, 1, 42)),
+                || fold.in_flight_keys().contains(&(0, 0, 1, 42)),
                 Duration::from_secs(1)
             )
             .await
@@ -5754,7 +5756,7 @@ mod tests {
         .unwrap();
         assert!(
             wait_until(
-                || fold.in_flight_keys().contains(&(VICTIM, ORIGIN, CALL_ID)),
+                || fold.in_flight_keys().contains(&(VICTIM, 0, ORIGIN, CALL_ID)),
                 Duration::from_secs(1)
             )
             .await
@@ -5767,7 +5769,7 @@ mod tests {
         .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
-            fold.in_flight_keys().contains(&(VICTIM, ORIGIN, CALL_ID)),
+            fold.in_flight_keys().contains(&(VICTIM, 0, ORIGIN, CALL_ID)),
             "forged CANCEL from a foreign session must not remove the victim's entry",
         );
         assert!(
@@ -6116,7 +6118,7 @@ mod tests {
             .unwrap();
         assert!(
             wait_until(
-                || fold.in_flight_keys().contains(&(0, 1, 99)),
+                || fold.in_flight_keys().contains(&(0, 0, 1, 99)),
                 Duration::from_secs(1)
             )
             .await
@@ -6187,7 +6189,7 @@ mod tests {
         // before the handler's sleep elapses.
         assert!(
             wait_until(
-                || fold.in_flight_keys().contains(&(0, 7, 11)),
+                || fold.in_flight_keys().contains(&(0, 0, 7, 11)),
                 Duration::from_secs(1)
             )
             .await
