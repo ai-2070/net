@@ -72,6 +72,8 @@ fn prime_capability(node: &MeshNode, kp: &EntityKeypair, node_id: u64, tags: Vec
         price_quote: None,
         reflex_addr: None,
         noise_pubkey: None,
+        rtc_bootstrap: None,
+        rtc_addr: None,
         allowed_nodes: Vec::new(),
         allowed_subnets: Vec::new(),
         allowed_groups: Vec::new(),
