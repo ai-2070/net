@@ -22,6 +22,7 @@ const HTTP_STACK: &[&str] = &[
     "axum",
     "hyper",
     "hyper-util",
+    "hyper-rustls",
     "tower",
     "tower-http",
     "rustls",

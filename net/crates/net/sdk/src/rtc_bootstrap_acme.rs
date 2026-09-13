@@ -21,6 +21,7 @@
 //! no self-signed path at all, here or in the operator path.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::rtc_bootstrap::{read_pem_pair, AcmeConfig, AcmeState, BootstrapError};
@@ -304,6 +305,77 @@ pub(crate) async fn renew_certificate(
     })
 }
 
+/// The ACME account builder, with the directory connection's trust
+/// anchored where [`AcmeConfig::directory_roots`] says.
+///
+/// Empty list — the overwhelmingly common case, Let's Encrypt —
+/// means [`instant_acme::Account::builder`], i.e. the platform trust
+/// store, unchanged.
+///
+/// Non-empty means a private ACME CA, and the connection to the
+/// directory is verified against exactly those roots. Note what is
+/// NOT used here: `Account::builder_with_root` exists in
+/// instant-acme 0.8 and would be one line, but it accepts a single
+/// certificate from a single file, and it reaches
+/// `rustls::ClientConfig::builder()`, which installs a
+/// **process-global** crypto provider. This crate's rule — the same
+/// one `server_config` follows and `net-payments` documents — is an
+/// explicit provider, never a global, because a global leaks into
+/// every other rustls user sharing the process. So the HTTP client
+/// is built here and handed over through
+/// `Account::builder_with_http`.
+fn account_builder(config: &AcmeConfig) -> Result<instant_acme::AccountBuilder, BootstrapError> {
+    if config.directory_roots.is_empty() {
+        return instant_acme::Account::builder()
+            .map_err(|e| BootstrapError::Acme(format!("acme client: {e}")));
+    }
+
+    let mut roots = rustls::RootCertStore::empty();
+    for path in &config.directory_roots {
+        let pem = std::fs::read(path).map_err(|e| {
+            BootstrapError::Acme(format!("reading directory root {}: {e}", path.display()))
+        })?;
+        let mut found = 0usize;
+        for cert in rustls_pemfile::certs(&mut pem.as_slice()) {
+            let cert = cert.map_err(|e| {
+                BootstrapError::Acme(format!("parsing directory root {}: {e}", path.display()))
+            })?;
+            roots.add(cert).map_err(|e| {
+                BootstrapError::Acme(format!("trusting directory root {}: {e}", path.display()))
+            })?;
+            found += 1;
+        }
+        // A silently-empty trust store would make every directory
+        // connection fail with an opaque handshake error; say which
+        // file was empty instead.
+        if found == 0 {
+            return Err(BootstrapError::Acme(format!(
+                "directory root {} contains no certificate",
+                path.display()
+            )));
+        }
+    }
+
+    let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|e| BootstrapError::Acme(format!("acme directory tls: {e}")))?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    let connector = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(tls)
+        // `https_only`: the directory URL is HTTPS, and a private CA
+        // is no reason to let it be downgraded.
+        .https_only()
+        .enable_http1()
+        .enable_http2()
+        .build();
+    let http = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+        .build::<_, instant_acme::BodyWrapper<bytes::Bytes>>(connector);
+    Ok(instant_acme::Account::builder_with_http(Box::new(http)))
+}
+
 /// Run one ACME order to completion, returning PEM (chain, key).
 ///
 /// The HTTP-01 key authorization is installed into `challenges`
@@ -315,12 +387,11 @@ async fn order_certificate(
     challenges: &AcmeState,
 ) -> Result<(String, String), BootstrapError> {
     use instant_acme::{
-        Account, AuthorizationStatus, ChallengeType, Identifier, NewAccount, NewOrder, OrderStatus,
+        AuthorizationStatus, ChallengeType, Identifier, NewAccount, NewOrder, OrderStatus,
     };
 
     let contact = format!("mailto:{}", config.contact_email);
-    let (account, _credentials) = Account::builder()
-        .map_err(|e| BootstrapError::Acme(format!("acme client: {e}")))?
+    let (account, _credentials) = account_builder(config)?
         .create(
             &NewAccount {
                 contact: &[&contact],
@@ -717,5 +788,175 @@ mod tests {
         let (cert, key) = cache_paths(&nested);
         assert_eq!(std::fs::read_to_string(cert).unwrap(), "cert");
         assert_eq!(std::fs::read_to_string(key).unwrap(), "key");
+    }
+
+    /// R4, hosted closure: the directory-trust seam loads real roots,
+    /// names a bad root file instead of failing later as an opaque
+    /// handshake error, and — the rule this module shares with
+    /// `server_config` — does NOT install a process-global crypto
+    /// provider on the way.
+    ///
+    /// That last point is why `Account::builder_with_root` is not
+    /// used: it reaches `rustls::ClientConfig::builder()`, which
+    /// installs one from crate features, and it would take exactly
+    /// one certificate from exactly one file.
+    #[test]
+    fn directory_roots_are_loaded_without_a_global_crypto_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = AcmeConfig::new(
+            "https://directory.example/dir",
+            "anchor.example",
+            "o@example.invalid",
+            dir.path().into(),
+        );
+
+        let root = dir.path().join("ca.pem");
+        let (_ca, ca_pem, _key) = issue_for("directory.example", 3600);
+        std::fs::write(&root, &ca_pem).unwrap();
+        // Two roots in one store, and more than one certificate in a
+        // file: the CA-rotation shape a single-root API cannot
+        // express.
+        let pair = dir.path().join("both.pem");
+        let (_ca2, ca2_pem, _key2) = issue_for("directory.other", 3600);
+        std::fs::write(&pair, format!("{ca_pem}{ca2_pem}")).unwrap();
+
+        let had_global = rustls::crypto::CryptoProvider::get_default().is_some();
+        assert!(
+            account_builder(&base.clone().with_directory_roots([root, pair])).is_ok(),
+            "several roots, and several certificates per file, are accepted"
+        );
+        if !had_global {
+            assert!(
+                rustls::crypto::CryptoProvider::get_default().is_none(),
+                "building the ACME directory client must not install a process-global \
+                 crypto provider — it would leak into every other rustls user here"
+            );
+        }
+
+        let empty = dir.path().join("empty.pem");
+        std::fs::write(&empty, "").unwrap();
+        let Err(err) = account_builder(&base.clone().with_directory_roots([empty])) else {
+            panic!("a root file with no certificate in it is not usable trust");
+        };
+        let err = err.to_string();
+        assert!(err.contains("contains no certificate"), "{err}");
+
+        let missing = dir.path().join("absent.pem");
+        let Err(err) = account_builder(&base.with_directory_roots([missing])) else {
+            panic!("a root file that is not there is an error");
+        };
+        assert!(err.to_string().contains("reading directory root"), "{err}");
+    }
+
+    /// A CA, and a certificate it signed for `127.0.0.1`.
+    ///
+    /// An IP SAN rather than a name so the test never depends on how
+    /// this machine resolves `localhost`.
+    fn issue_ca_and_loopback_leaf() -> (String, String, String) {
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "net-mesh directory test CA");
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca = ca_params.clone().self_signed(&ca_key).unwrap();
+        let issuer = rcgen::Issuer::new(ca_params, ca_key);
+
+        let leaf_params = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap();
+        let leaf_key = rcgen::KeyPair::generate().unwrap();
+        let leaf = leaf_params.signed_by(&leaf_key, &issuer).unwrap();
+        (
+            ca.pem(),
+            format!("{}{}", leaf.pem(), ca.pem()),
+            leaf_key.serialize_pem(),
+        )
+    }
+
+    /// **The failure this closes.** The hosted cold-start job died at
+    /// `creating the ACME account: client error (Connect)` while the
+    /// directory logged `remote error: tls: unknown certificate
+    /// authority` — the ACME client refused the directory's
+    /// certificate. This drives a real TLS handshake from the real
+    /// client `account_builder` produces and observes the SERVER side
+    /// of it: a root in `directory_roots` completes the handshake, an
+    /// unrelated root still refuses it.
+    ///
+    /// The negative half is the part that matters: the fix trusts one
+    /// more CA, it does not stop verifying.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_directory_root_decides_whether_the_handshake_completes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ca_pem, chain_pem, key_pem) = issue_ca_and_loopback_leaf();
+        let (unrelated_pem, _, _) = issue_ca_and_loopback_leaf();
+        let good = dir.path().join("directory-ca.pem");
+        let wrong = dir.path().join("someone-elses-ca.pem");
+        std::fs::write(&good, &ca_pem).unwrap();
+        std::fs::write(&wrong, &unrelated_pem).unwrap();
+
+        let chain: Vec<_> = rustls_pemfile::certs(&mut chain_pem.as_bytes())
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
+            .unwrap()
+            .unwrap();
+        let server = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(chain, key)
+        .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<bool>();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let _ = tx.send(acceptor.accept(stream).await.is_ok());
+                });
+            }
+        });
+
+        let url = format!("https://127.0.0.1:{port}/dir");
+        // The server answers nothing, so the ACME call always fails;
+        // WHERE it fails is the point, and the server says where.
+        async fn attempt(cache: &Path, roots: PathBuf, url: String) {
+            let config = AcmeConfig::new(
+                url.clone(),
+                "anchor.example",
+                "o@example.invalid",
+                cache.to_path_buf(),
+            )
+            .with_directory_roots([roots]);
+            let account = instant_acme::NewAccount {
+                contact: &[],
+                terms_of_service_agreed: true,
+                only_return_existing: false,
+            };
+            let Ok(builder) = account_builder(&config) else {
+                panic!("the builder accepts a real root file");
+            };
+            let _ =
+                tokio::time::timeout(Duration::from_secs(20), builder.create(&account, url, None))
+                    .await;
+        }
+
+        attempt(dir.path(), good, url.clone()).await;
+        assert!(
+            rx.recv().await.unwrap(),
+            "a CA named in `directory_roots` completes the handshake to the directory"
+        );
+
+        attempt(dir.path(), wrong, url).await;
+        assert!(
+            !rx.recv().await.unwrap(),
+            "an unrelated CA is still refused — the seam adds a trust anchor, it does \
+             not stop verifying"
+        );
     }
 }

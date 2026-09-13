@@ -121,6 +121,36 @@ pub struct AcmeConfig {
     /// Where the issued certificate and key are cached, so a restart
     /// does not re-order.
     pub cache_dir: PathBuf,
+    /// **Additional trust roots for the ACME DIRECTORY connection
+    /// only.**
+    ///
+    /// Each entry is a PEM file of one or more CA certificates. When
+    /// this list is non-empty, the HTTPS connection this client
+    /// makes *to `directory_url`* is verified against exactly these
+    /// roots instead of the platform trust store. That is the real
+    /// shape of the need: an operator running a private ACME CA
+    /// (step-ca, Boulder/Pebble in a lab, an internal Smallstep
+    /// deployment) has a closed PKI, and folding the public web PKI
+    /// in beside it would only widen the set of issuers allowed to
+    /// impersonate the directory. Leave it empty for Let's Encrypt
+    /// or any other publicly-trusted directory.
+    ///
+    /// What this does **not** relax, at all:
+    ///
+    /// - It does not weaken verification of that connection. The
+    ///   directory's certificate must still chain to one of these
+    ///   roots, still match the hostname in `directory_url`, and
+    ///   still be inside its validity window. There is no
+    ///   "accept invalid certificate" mode here or anywhere else in
+    ///   this module.
+    /// - It says nothing about the certificate the directory
+    ///   **issues**. That one is presented to browsers, which trust
+    ///   their own root program and neither know nor care what is in
+    ///   this list.
+    /// - It is not installed process-globally and does not touch the
+    ///   bootstrap listener's own TLS, the mesh transport, or any
+    ///   other outbound connection this process makes.
+    pub directory_roots: Vec<PathBuf>,
 }
 
 impl AcmeConfig {
@@ -138,7 +168,15 @@ impl AcmeConfig {
             domain: domain.into(),
             contact_email: contact_email.into(),
             cache_dir,
+            directory_roots: Vec::new(),
         }
+    }
+
+    /// Verify the directory connection against these roots instead
+    /// of the platform store — see [`Self::directory_roots`].
+    pub fn with_directory_roots(mut self, roots: impl IntoIterator<Item = PathBuf>) -> Self {
+        self.directory_roots = roots.into_iter().collect();
+        self
     }
 }
 
@@ -151,6 +189,7 @@ impl AcmeConfig {
 #[derive(Debug, Default, Clone)]
 pub struct AcmeState {
     tokens: Arc<Mutex<HashMap<String, String>>>,
+    answered: Arc<AtomicU64>,
 }
 
 impl AcmeState {
@@ -171,8 +210,26 @@ impl AcmeState {
         self.tokens.lock().remove(token);
     }
 
+    /// How many HTTP-01 challenge fetches this store has **answered**
+    /// with a key authorization.
+    ///
+    /// The cold-start witness needs to distinguish "the directory
+    /// issued a certificate" from "the directory came back to this
+    /// process for the token it issued against". A directory
+    /// configured to short-circuit validation (pebble's
+    /// `PEBBLE_VA_ALWAYS_VALID=1`) issues happily without ever
+    /// dialling the ingress, so issuance alone is not evidence that
+    /// the HTTP-01 reverse path works. This counter is.
+    pub fn answered_challenges(&self) -> u64 {
+        self.answered.load(Ordering::Relaxed)
+    }
+
     fn key_authorization(&self, token: &str) -> Option<String> {
-        self.tokens.lock().get(token).cloned()
+        let found = self.tokens.lock().get(token).cloned();
+        if found.is_some() {
+            self.answered.fetch_add(1, Ordering::Relaxed);
+        }
+        found
     }
 }
 

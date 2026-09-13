@@ -445,8 +445,10 @@ async fn the_anchor_endpoint_publishes_the_live_key_for_comparison() {
 }
 
 /// The ACME HTTP-01 challenge route serves exactly the tokens the
-/// ordering client installed, on the same listener. (The ordering
-/// half needs a live directory and is a named gap in the report.)
+/// ordering client installed, on the same listener, and **counts the
+/// fetches it answers** — the cold-start witness reads that counter
+/// to tell "the directory validated against this process" apart from
+/// "the directory issued without ever asking".
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_acme_challenge_route_serves_installed_tokens_only() {
     let anchor = anchor().await;
@@ -474,11 +476,19 @@ async fn the_acme_challenge_route_serves_installed_tokens_only() {
         }
     };
 
+    assert_eq!(cfg.acme.answered_challenges(), 0);
     assert_eq!(
         fetch("tok-1").await,
         (StatusCode::OK, "tok-1.thumbprint".to_string())
     );
+    assert_eq!(cfg.acme.answered_challenges(), 1);
     assert_eq!(fetch("tok-2").await.0, StatusCode::NOT_FOUND);
+    assert_eq!(
+        cfg.acme.answered_challenges(),
+        1,
+        "a fetch for a token this process never installed is not evidence \
+         that the directory reached it"
+    );
 }
 
 /// **Browser-trusted TLS, actually served.** A certificate issued by
@@ -668,12 +678,12 @@ async fn kyra_acme_cache_must_match_the_requested_domain() {
     std::fs::write(dir.path().join("bootstrap-cert.pem"), cert).unwrap();
     std::fs::write(dir.path().join("bootstrap-key.pem"), key).unwrap();
     let mut cfg = config(PSK);
-    cfg.tls = BootstrapTls::Acme(net_sdk::rtc_bootstrap::AcmeConfig {
-        directory_url: "http://127.0.0.1:9/directory".into(),
-        domain: "different.example".into(),
-        contact_email: "review@example.invalid".into(),
-        cache_dir: dir.path().into(),
-    });
+    cfg.tls = BootstrapTls::Acme(net_sdk::rtc_bootstrap::AcmeConfig::new(
+        "http://127.0.0.1:9/directory",
+        "different.example",
+        "review@example.invalid",
+        dir.path().into(),
+    ));
     let result = serve_bootstrap(Arc::clone(&anchor), cfg).await;
     let accepted_wrong_name = result.is_ok();
     if let Ok(handle) = result {

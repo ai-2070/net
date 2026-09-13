@@ -5029,23 +5029,54 @@ jobs:
     # anything, so HTTP-01 could never be answered on a cold cache —
     # a listener that can only start when it is already started.
     #
-    # pebble is Let's Encrypt's own test ACME server. It runs as a
-    # service container; `PEBBLE_VA_NOSLEEP` makes validation
-    # immediate, and its HTTP-01 validation dials port 5002 on the
-    # host it resolves the domain to, which is why the harness binds
-    # its challenge ingress there.
+    # pebble is Let's Encrypt's own test ACME server. Two things this
+    # job has to provision, and previously provisioned neither:
+    #
+    # 1. **Directory trust.** Pebble serves `:14000` and `:15000`
+    #    over `test/certs/localhost/cert.pem`, signed by its own
+    #    `test/certs/pebble.minica.pem`. Nothing on a runner trusts
+    #    that CA, so the ACME client's handshake was refused —
+    #    `client error (Connect)` on our side, `remote error: tls:
+    #    unknown certificate authority` in pebble's log. The minica
+    #    is extracted from the SAME pinned image that is then run, so
+    #    the trust material cannot drift from the server presenting
+    #    it, and it is handed to `AcmeConfig::directory_roots`, which
+    #    scopes it to the directory connection alone. No verifier is
+    #    relaxed anywhere: the `--cacert` fetch below would fail if
+    #    the chain, the hostname or the validity window were wrong.
+    #
+    # 2. **The validation reverse path.** Pebble's VA resolves the
+    #    identifier itself and dials `<identifier>:5002` from its own
+    #    network namespace (`va/va.go` builds the URL from the
+    #    identifier and dials `addrs[0]` — a single address, no
+    #    fallback). The challenge ingress, though, is a socket the
+    #    Rust test binds on the runner. Under GitHub's `services:`
+    #    block those are different namespaces and the identifier
+    #    resolves to nothing that can reach the host; `services:`
+    #    also cannot set `--network`, and its `options:` cannot
+    #    compute the docker-bridge gateway address at job scope. So
+    #    pebble is started here instead, with **host networking**:
+    #    one namespace, `localhost` means the same interface to the
+    #    VA and to the listener, and no DNS server, `--add-host`
+    #    mapping or gateway discovery is needed at all. The runner's
+    #    `/etc/hosts` — which docker reuses in host mode — maps
+    #    `localhost` to `127.0.0.1` only, so `addrs[0]` is
+    #    unambiguous; the preflight step asserts exactly that rather
+    #    than assuming it.
+    #
+    # `PEBBLE_VA_NOSLEEP` removes the random validation delay;
+    # `PEBBLE_VA_ALWAYS_VALID=0` keeps validation REAL (with it on,
+    # pebble issues without ever fetching the challenge and the
+    # witness would prove nothing); `PEBBLE_WFE_NONCEREJECT=0` turns
+    # off pebble's deliberate 5% nonce rejection, which is a client
+    # retry exercise and not what this job is about.
     name: ACME cold start (pebble, Stage 4b)
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    services:
-      pebble:
-        image: ghcr.io/letsencrypt/pebble:2.7.0
-        ports:
-          - 14000:14000
-          - 15000:15000
-        env:
-          PEBBLE_VA_NOSLEEP: "1"
-          PEBBLE_VA_ALWAYS_VALID: "0"
+    env:
+      # Pinned by digest as well as tag: the minica extracted from
+      # this image is the trust anchor the test is handed.
+      PEBBLE_IMAGE: ghcr.io/letsencrypt/pebble:2.7.0@sha256:c156cabea562e43ed0060bddc03539c07de40e311b52c6b0e5ea710a496e56b8
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust
@@ -5054,21 +5085,77 @@ jobs:
         with:
           shared-key: acme-cold-start
           workspaces: net/crates/net -> target
-
-      # pebble resolves every name to its configured host; point the
-      # domain at this runner so its HTTP-01 validation comes back to
-      # the challenge ingress the listener binds.
       - uses: taiki-e/install-action@nextest
 
-      - name: Point pebble's validation at this runner
+      - name: Start pebble on the host network
         run: |
           set -euo pipefail
-          curl -ks https://localhost:15000/roots/0 -o "$RUNNER_TEMP/pebble-root.pem"
+          docker pull "$PEBBLE_IMAGE"
+          # The image is FROM scratch — no shell, no cat. `docker cp`
+          # out of a created (never started) container is how its
+          # test CA comes out.
+          cid=$(docker create "$PEBBLE_IMAGE")
+          docker cp "$cid:/test/certs/pebble.minica.pem" "$RUNNER_TEMP/pebble.minica.pem"
+          docker rm "$cid" >/dev/null
+          test -s "$RUNNER_TEMP/pebble.minica.pem"
+          docker run -d --name pebble --network host \
+            -e PEBBLE_VA_NOSLEEP=1 \
+            -e PEBBLE_VA_ALWAYS_VALID=0 \
+            -e PEBBLE_WFE_NONCEREJECT=0 \
+            "$PEBBLE_IMAGE" -config test/config/pebble-config.json
+
+      - name: Wait for pebble, and verify its certificate against that CA
+        run: |
+          set -euo pipefail
+          # No `-k`. A successful fetch IS the evidence that the
+          # extracted minica verifies pebble's serving certificate for
+          # the name the ACME client will use — i.e. that the trust
+          # fix is sound before any Rust runs.
+          for _ in $(seq 1 60); do
+            if curl -sS --cacert "$RUNNER_TEMP/pebble.minica.pem" \
+                 https://localhost:15000/roots/0 -o "$RUNNER_TEMP/pebble-root.pem"; then
+              break
+            fi
+            sleep 1
+          done
           test -s "$RUNNER_TEMP/pebble-root.pem"
-          echo "PEBBLE_ROOT_PEM=$RUNNER_TEMP/pebble-root.pem" >> "$GITHUB_ENV"
-          echo "PEBBLE_DIRECTORY_URL=https://localhost:14000/dir" >> "$GITHUB_ENV"
-          echo "PEBBLE_DOMAIN=localhost" >> "$GITHUB_ENV"
-          echo "PEBBLE_HTTP01_ADDR=0.0.0.0:5002" >> "$GITHUB_ENV"
+          curl -sS --cacert "$RUNNER_TEMP/pebble.minica.pem" \
+            https://localhost:14000/dir >/dev/null
+          {
+            echo "PEBBLE_MINICA_PEM=$RUNNER_TEMP/pebble.minica.pem"
+            echo "PEBBLE_ROOT_PEM=$RUNNER_TEMP/pebble-root.pem"
+            echo "PEBBLE_DIRECTORY_URL=https://localhost:14000/dir"
+            echo "PEBBLE_DOMAIN=localhost"
+            echo "PEBBLE_HTTP01_ADDR=0.0.0.0:5002"
+          } >> "$GITHUB_ENV"
+
+      - name: Assert the HTTP-01 reverse path resolves to this host
+        run: |
+          set -euo pipefail
+          # Pebble is a static Go binary using the pure-Go resolver:
+          # `resolveIP` -> `net.DefaultResolver.LookupHost`, which
+          # answers from /etc/hosts in FILE ORDER, and the VA then
+          # dials `addrs[0]` with no fallback. Docker mounts the
+          # host's own /etc/hosts into a `--network host` container
+          # (that is why `--add-host` is rejected in this mode), so
+          # the file below is the one the VA reads. Assert the first
+          # entry naming `localhost` is 127.0.0.1 rather than assume
+          # it: if it were ::1 the challenge fetch would go to a
+          # socket the test does not bind, and the only symptom would
+          # be an opaque validation timeout.
+          echo "--- /etc/hosts"
+          cat /etc/hosts
+          first=$(awk '{ sub(/#.*/, ""); for (i = 2; i <= NF; i++) if ($i == "localhost") { print $1; exit } }' /etc/hosts)
+          echo "pebble will dial: ${first:-<unresolved>}:5002"
+          if [ "$first" != "127.0.0.1" ]; then
+            echo "::error::pebble would dial '${first:-<unresolved>}':5002, not the challenge ingress the test binds on 0.0.0.0:5002"
+            exit 1
+          fi
+          # 5002 must be free for the listener the test binds.
+          if ss -ltn "( sport = :5002 )" | grep -q 5002; then
+            echo "::error::something already holds :5002"
+            exit 1
+          fi
 
       - name: Cold-cache order + verifying TLS client
         working-directory: net/crates/net
@@ -5082,3 +5169,7 @@ jobs:
           printf '%s\n' "$out" \
             | grep -q 'a_cold_cache_orders_a_certificate_and_then_serves_tls' \
             || { echo "::error::the cold-start witness did not run"; exit 1; }
+
+      - name: Pebble log
+        if: always()
+        run: docker logs pebble 2>&1 | tail -100 || true

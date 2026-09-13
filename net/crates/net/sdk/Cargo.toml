@@ -102,6 +102,8 @@ tower-http = { version = "0.6", optional = true, default-features = false, featu
 ] }
 hyper = { version = "1", optional = true, default-features = false, features = [
     "http1",
+    "http2",
+    "client",
     "server",
 ] }
 tower = { version = "0.5", optional = true, default-features = false }
@@ -111,7 +113,10 @@ tracing = { version = "0.1", optional = true, default-features = false, features
 hyper-util = { version = "0.1", optional = true, default-features = false, features = [
     "tokio",
     "server",
+    "client",
+    "client-legacy",
     "http1",
+    "http2",
 ] }
 futures-util = { version = "0.3", optional = true, default-features = false }
 # ACME (HTTP-01) for the browser-trusted certificate path.
@@ -126,6 +131,24 @@ x509-parser = { version = "0.18", optional = true }
 instant-acme = { version = "0.8", optional = true, default-features = false, features = [
     "ring",
     "hyper-rustls",
+] }
+# The HTTPS connector for the ACME DIRECTORY connection
+# (`AcmeConfig::directory_roots`). instant-acme 0.8 offers exactly
+# two seams for trust: `Account::builder_with_root(one_path)`, which
+# goes through `rustls::ClientConfig::builder()` and therefore
+# INSTALLS a process-global crypto provider — forbidden here, see
+# the rustls note above — and `Account::builder_with_http`, which
+# takes any `HttpClient`. We take the second and build the connector
+# ourselves with an explicit ring provider. Every crate this pulls is
+# already in the graph via instant-acme's own `hyper-rustls` feature;
+# naming it directly is so this crate does not depend on another
+# crate's feature activation to compile.
+hyper-rustls = { version = "0.27", optional = true, default-features = false, features = [
+    "http1",
+    "http2",
+    "ring",
+    "tls12",
+    "logging",
 ] }
 # The keypair + CSR the ACME order is finalized with.
 rcgen = { version = "0.14", optional = true, default-features = false, features = [
@@ -205,6 +228,7 @@ rtc-bootstrap = [
     "dep:tower-http",
     "dep:hyper",
     "dep:hyper-util",
+    "dep:hyper-rustls",
     "dep:tower",
     "dep:tracing",
     "dep:futures-util",
