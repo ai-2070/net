@@ -5023,6 +5023,8 @@ jobs:
       # pebble resolves every name to its configured host; point the
       # domain at this runner so its HTTP-01 validation comes back to
       # the challenge ingress the listener binds.
+      - uses: taiki-e/install-action@nextest
+
       - name: Point pebble's validation at this runner
         run: |
           set -euo pipefail
