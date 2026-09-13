@@ -165,6 +165,15 @@ pub struct BootstrapConfig {
     /// this anchor were minted against. Used only to derive the
     /// trust-domain id a presented credential is checked against.
     pub psk: Psk,
+    /// The **issuer** whose signature this anchor accepts on a
+    /// credential (R3). Public half only: the anchor verifies, it
+    /// does not mint.
+    ///
+    /// This is what makes the two lifetimes enforceable. A recipient
+    /// holds the PSK, so anything keyed on the PSK is forgeable by
+    /// every recipient; only a key they do NOT hold can bind the
+    /// deadlines they would like to extend.
+    pub credential_issuer: crate::identity::EntityId,
     /// How to get a browser-trusted certificate.
     pub tls: BootstrapTls,
     /// Exact origins allowed to call the HTTP endpoints. **No
@@ -188,6 +197,7 @@ impl BootstrapConfig {
     pub fn new(
         bind_addr: SocketAddr,
         psk: Psk,
+        credential_issuer: crate::identity::EntityId,
         tls: BootstrapTls,
         origin: impl Into<String>,
     ) -> Self {
@@ -195,6 +205,7 @@ impl BootstrapConfig {
         Self {
             bind_addr,
             psk,
+            credential_issuer,
             tls,
             allowed_origins: vec![origin.clone()],
             ws_allowed_origins: vec![origin],
@@ -410,6 +421,7 @@ impl Attempts {
 struct AppState {
     node: Arc<MeshNode>,
     psk: Arc<Psk>,
+    issuer: Arc<crate::identity::EntityId>,
     ws_allowed_origins: Arc<Vec<String>>,
     rate: Arc<RateLimiter>,
     acme: AcmeState,
@@ -470,6 +482,7 @@ pub fn bootstrap_router(node: Arc<MeshNode>, config: &BootstrapConfig) -> Router
     let state = AppState {
         node,
         psk: Arc::new(config.psk.clone()),
+        issuer: Arc::new(config.credential_issuer.clone()),
         ws_allowed_origins: Arc::new(config.ws_allowed_origins.clone()),
         rate: Arc::new(RateLimiter::new(config.offers_per_ip_per_minute)),
         acme: config.acme.clone(),
@@ -696,27 +709,49 @@ fn parse_node_id(raw: &str) -> Option<u64> {
 }
 
 /// Validate a presented credential against this anchor: it must
-/// parse, both lifetimes must be live, and it must belong to this
-/// anchor's transport trust domain.
-fn check_credential(raw: &str, psk: &Psk) -> Result<BrowserBootstrapCredential, Box<Response>> {
+/// parse, carry **this issuer's** signature over its own canonical
+/// bytes, belong to this anchor's transport trust domain, and have
+/// both lifetimes live — in that order.
+fn check_credential(
+    raw: &str,
+    psk: &Psk,
+    issuer: &crate::identity::EntityId,
+) -> Result<BrowserBootstrapCredential, Box<Response>> {
     let credential = BrowserBootstrapCredential::decode(raw).map_err(|e| {
         Box::new(refuse(
             BootstrapRefusal::MalformedCredential,
             format!("the credential did not parse: {e}"),
         ))
     })?;
-    // Domain first: telling a caller from another trust domain that
+    // **Refusal REPORTING prefers the operator-actionable cause.**
+    // A credential whose own stated deadlines have already passed is
+    // reported as expired whether or not its signature verifies:
+    // both facts are things its holder already knows, and "mint a
+    // fresh invite" is the actionable one. Acceptance is a different
+    // question and is answered below — nothing is ever accepted
+    // without the issuer signature.
+    if let Err(e) = credential.validate() {
+        return Err(Box::new(refuse(
+            BootstrapRefusal::ExpiredCredential,
+            format!("the credential is not presentable: {e}"),
+        )));
+    }
+    // **The issuer signature (R3).** Everything else reads fields the
+    // credential asserts about itself; until this verifies, those
+    // fields are the caller's claims. The review edited the two
+    // deadlines on an expired credential and was admitted.
+    credential.verify_issuer(issuer).map_err(|e| {
+        Box::new(refuse(
+            BootstrapRefusal::MalformedCredential,
+            format!("the credential's issuer did not verify: {e}"),
+        ))
+    })?;
+    // Domain next: telling a caller from another trust domain that
     // their nonce expired would send them to the wrong knob.
     credential.check_trust_domain(psk).map_err(|e| {
         Box::new(refuse(
             BootstrapRefusal::WrongTrustDomain,
             format!("this anchor does not serve that trust domain: {e}"),
-        ))
-    })?;
-    credential.validate().map_err(|e| {
-        Box::new(refuse(
-            BootstrapRefusal::ExpiredCredential,
-            format!("the credential is not presentable: {e}"),
         ))
     })?;
     Ok(credential)
@@ -747,7 +782,7 @@ async fn post_offer(
             "too many bootstrap offers from this address",
         );
     }
-    let credential = match check_credential(&request.credential, &state.psk) {
+    let credential = match check_credential(&request.credential, &state.psk, &state.issuer) {
         Ok(credential) => credential,
         Err(response) => return *response,
     };

@@ -74,7 +74,12 @@ use crate::identity::EntityId;
 const CREDENTIAL_MAGIC: [u8; 4] = *b"NMBC";
 
 /// The only format version this build mints or accepts.
-pub const CREDENTIAL_VERSION: u8 = 1;
+///
+/// Bumped to 2 by R3: v1 had no issuer signature, so a recipient
+/// could edit its own deadlines and present the result. There is no
+/// v1 compatibility path — an unsigned credential is exactly the
+/// artefact the repair exists to refuse.
+pub const CREDENTIAL_VERSION: u8 = 2;
 
 /// Scheme-like prefix on the copy-paste string form, so it is
 /// self-describing and cannot be confused with an invite string.
@@ -82,6 +87,11 @@ const CREDENTIAL_STRING_PREFIX: &str = "net-bootstrap:";
 
 /// Domain separation for [`TrustDomainId`] derivation.
 const TRUST_DOMAIN_KDF_CONTEXT: &str = "net-mesh browser bootstrap trust-domain v1";
+
+/// Domain separation for the issuer signature (R3), so a credential
+/// signature can never be replayed as any other signature the
+/// operator's key produces.
+const CREDENTIAL_SIGNING_DOMAIN: &[u8] = b"net-mesh browser bootstrap credential v2";
 
 /// Upper bound on the encoded credential, so a hostile blob cannot
 /// make a parser walk megabytes before failing.
@@ -134,6 +144,18 @@ pub enum BootstrapCredentialError {
     /// honest minter produces.
     #[error("the credential's trust-domain id does not match its own PSK")]
     TrustDomainMismatch,
+    /// The credential names an issuer this anchor does not serve.
+    #[error("the credential was issued by {presented}, this anchor trusts {ours}")]
+    ForeignIssuer {
+        /// The issuer the credential names.
+        presented: String,
+        /// The issuer this anchor is configured with.
+        ours: String,
+    },
+    /// The issuer signature does not verify over the credential's
+    /// canonical bytes — a field was edited after minting.
+    #[error("the credential's issuer signature does not verify: a field was edited after minting")]
+    BadIssuerSignature,
     /// The bootstrap URL is not an `https://` (or `http://localhost`)
     /// URL a browser could actually fetch.
     #[error("the credential's bootstrap URL is not usable by a browser: {0}")]
@@ -235,6 +257,18 @@ pub struct BrowserBootstrapCredential {
     /// Unix seconds after which the **standing** PSK half is no longer
     /// usable. Distinct from the invite's nonce deadline.
     pub psk_expires_at: u64,
+    /// The **issuer** — the operator key that minted this credential
+    /// (R3). Its public half is configured on the anchor; the
+    /// recipient holds no private key that can produce this
+    /// signature, which is the whole point.
+    pub issuer: EntityId,
+    /// Ed25519 signature by [`Self::issuer`] over
+    /// [`Self::signing_bytes`] — every field including **both
+    /// deadlines and the invite nonce**.
+    ///
+    /// A MAC under the PSK cannot work here: every recipient holds
+    /// the PSK, so every recipient could forge one.
+    pub signature: [u8; 64],
 }
 
 impl BrowserBootstrapCredential {
@@ -242,6 +276,7 @@ impl BrowserBootstrapCredential {
     /// single-use half's deadline comes from `invite` and is not
     /// touched here.
     pub fn mint(
+        issuer: &crate::identity::Identity,
         invite: InviteToken,
         anchor_noise_pubkey: [u8; 32],
         psk: Psk,
@@ -249,6 +284,7 @@ impl BrowserBootstrapCredential {
         psk_ttl: Duration,
     ) -> Self {
         Self::mint_at(
+            issuer,
             invite,
             anchor_noise_pubkey,
             psk,
@@ -261,6 +297,7 @@ impl BrowserBootstrapCredential {
     /// [`Self::mint`] with an explicit `now` (unix secs) — for
     /// deterministic tests and callers holding a clock reading.
     pub fn mint_at(
+        issuer: &crate::identity::Identity,
         invite: InviteToken,
         anchor_noise_pubkey: [u8; 32],
         psk: Psk,
@@ -269,14 +306,55 @@ impl BrowserBootstrapCredential {
         now: u64,
     ) -> Self {
         let trust_domain = psk.trust_domain();
-        Self {
+        let mut credential = Self {
             invite,
             anchor_noise_pubkey,
             psk,
             trust_domain,
             bootstrap_url: bootstrap_url.into(),
             psk_expires_at: now.saturating_add(psk_ttl.as_secs()),
+            issuer: issuer.entity_id().clone(),
+            signature: [0u8; 64],
+        };
+        credential.signature = issuer.sign(&credential.signing_bytes());
+        credential
+    }
+
+    /// The bytes the issuer signs (R3): every field except the
+    /// signature itself, in the canonical encoding order, with a
+    /// domain-separation prefix so this signature can never be
+    /// confused with any other the operator key produces.
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::from(CREDENTIAL_SIGNING_DOMAIN);
+        buf.push(CREDENTIAL_VERSION);
+        push_lp(&mut buf, &self.invite.to_bytes());
+        buf.extend_from_slice(&self.anchor_noise_pubkey);
+        buf.extend_from_slice(self.psk.expose_bytes());
+        buf.extend_from_slice(self.trust_domain.as_bytes());
+        buf.extend_from_slice(&self.psk_expires_at.to_le_bytes());
+        push_lp(&mut buf, self.bootstrap_url.as_bytes());
+        buf.extend_from_slice(self.issuer.as_bytes());
+        buf
+    }
+
+    /// Verify the issuer signature, and that it is **this** issuer
+    /// (R3).
+    ///
+    /// The anchor calls this before anything else: a credential is
+    /// only as good as the operator key that minted it, and the
+    /// recipient holds no key that can produce this signature —
+    /// which is why editing the two deadlines, as the review did,
+    /// now changes nothing except making the credential invalid.
+    pub fn verify_issuer(&self, expected: &EntityId) -> Result<(), BootstrapCredentialError> {
+        if &self.issuer != expected {
+            return Err(BootstrapCredentialError::ForeignIssuer {
+                presented: hex32(self.issuer.as_bytes()),
+                ours: hex32(expected.as_bytes()),
+            });
         }
+        self.issuer
+            .verify_bytes(&self.signing_bytes(), &self.signature)
+            .map_err(|_| BootstrapCredentialError::BadIssuerSignature)
     }
 
     /// The mesh root the invite admits into.
@@ -353,6 +431,8 @@ impl BrowserBootstrapCredential {
         buf.extend_from_slice(self.trust_domain.as_bytes());
         buf.extend_from_slice(&self.psk_expires_at.to_le_bytes());
         push_lp(&mut buf, self.bootstrap_url.as_bytes());
+        buf.extend_from_slice(self.issuer.as_bytes());
+        buf.extend_from_slice(&self.signature);
         buf
     }
 
@@ -409,6 +489,15 @@ impl BrowserBootstrapCredential {
         let bootstrap_url = std::str::from_utf8(url_bytes)
             .map_err(|_| BootstrapCredentialError::Malformed("non-UTF-8 URL"))?
             .to_string();
+        let issuer = EntityId::from_bytes(
+            r.take_arr::<32>()
+                .ok_or(BootstrapCredentialError::Malformed("truncated issuer"))?,
+        );
+        let signature = r
+            .take_arr::<64>()
+            .ok_or(BootstrapCredentialError::Malformed(
+                "truncated issuer signature",
+            ))?;
         if !r.done() {
             return Err(BootstrapCredentialError::Malformed("trailing bytes"));
         }
@@ -423,6 +512,8 @@ impl BrowserBootstrapCredential {
             trust_domain,
             bootstrap_url,
             psk_expires_at,
+            issuer,
+            signature,
         })
     }
 
@@ -466,8 +557,13 @@ impl fmt::Debug for BrowserBootstrapCredential {
             .field("trust_domain", &self.trust_domain)
             .field("bootstrap_url", &self.bootstrap_url)
             .field("psk_expires_at", &self.psk_expires_at)
+            .field("issuer", &hex16(self.issuer.as_bytes()))
             .finish()
     }
+}
+
+fn hex32(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn hex16(bytes: &[u8; 32]) -> String {
@@ -556,6 +652,12 @@ mod tests {
 
     const T0: u64 = 1_700_000_000;
 
+    fn issuer() -> Identity {
+        // A fixed seed keeps `credential_at` deterministic across
+        // calls within a test while still exercising real Ed25519.
+        Identity::from_seed([0x2Au8; 32])
+    }
+
     fn credential_at(now: u64) -> BrowserBootstrapCredential {
         let root = Identity::generate().entity_id().clone();
         let invite = InviteToken::mint_at(
@@ -565,6 +667,7 @@ mod tests {
             now,
         );
         BrowserBootstrapCredential::mint_at(
+            &issuer(),
             invite,
             [7u8; 32],
             Psk::new([9u8; 32]),
@@ -645,6 +748,7 @@ mod tests {
             T0,
         );
         let short_psk = BrowserBootstrapCredential::mint_at(
+            &issuer(),
             long_invite,
             [7u8; 32],
             Psk::new([9u8; 32]),
@@ -740,10 +844,67 @@ mod tests {
     fn a_future_version_is_refused_by_number_not_by_magic() {
         let credential = credential_at(T0);
         let mut bytes = credential.to_bytes();
-        bytes[4] = 2;
+        bytes[4] = 3;
         assert!(matches!(
             BrowserBootstrapCredential::from_bytes(&bytes),
-            Err(BootstrapCredentialError::UnsupportedVersion(2))
+            Err(BootstrapCredentialError::UnsupportedVersion(3))
+        ));
+    }
+
+    /// R3: the recipient holds the PSK and can re-encode anything —
+    /// but not the issuer's key. Editing only the two deadlines, the
+    /// exact move the review made, now fails verification.
+    #[test]
+    fn only_the_issuer_can_set_the_two_deadlines() {
+        let credential = credential_at(T0);
+        credential
+            .verify_issuer(issuer().entity_id())
+            .expect("a freshly minted credential verifies");
+
+        let mut extended = credential.clone();
+        extended.invite.expires_at = u64::MAX;
+        extended.psk_expires_at = u64::MAX;
+        assert!(matches!(
+            extended.verify_issuer(issuer().entity_id()),
+            Err(BootstrapCredentialError::BadIssuerSignature)
+        ));
+        // …and it survives the encode/decode round trip a caller
+        // would use to present it, i.e. the bytes on the wire carry
+        // the signature that fails.
+        let reparsed = BrowserBootstrapCredential::from_bytes(&extended.to_bytes())
+            .expect("the edited credential still parses; it just does not verify");
+        assert!(reparsed.verify_issuer(issuer().entity_id()).is_err());
+    }
+
+    /// R3: a credential signed by somebody else's key is refused as
+    /// a FOREIGN ISSUER, not as a bad signature — the operator needs
+    /// to know which of the two happened.
+    #[test]
+    fn a_foreign_issuers_credential_is_refused_by_issuer_identity() {
+        let other = Identity::from_seed([0x99u8; 32]);
+        let invite = InviteToken::mint_at(
+            other.entity_id(),
+            "https://anchor.example/rtc",
+            Duration::from_secs(600),
+            T0,
+        );
+        let foreign = BrowserBootstrapCredential::mint_at(
+            &other,
+            invite,
+            [7u8; 32],
+            Psk::new([9u8; 32]),
+            "https://anchor.example/rtc",
+            Duration::from_secs(600),
+            T0,
+        );
+        // It verifies under its OWN issuer — it is a real credential,
+        // just not ours.
+        foreign
+            .verify_issuer(other.entity_id())
+            .expect("valid under its own issuer");
+        assert!(matches!(
+            foreign.verify_issuer(issuer().entity_id()),
+            Err(BootstrapCredentialError::ForeignIssuer { .. })
         ));
     }
 

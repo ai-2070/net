@@ -27,7 +27,7 @@ use net_sdk::bootstrap_credential::{BrowserBootstrapCredential, Psk};
 use net_sdk::enrollment::InviteToken;
 use serde::Serialize;
 
-use crate::commands::identity::parse_entity_hex;
+use crate::commands::identity::{parse_entity_hex, read_identity_file};
 use crate::commands::org::{publish_staged, stage_beside};
 use crate::error::{generic, invalid_args, CliError};
 use crate::parsers::hex_decode_32;
@@ -88,6 +88,20 @@ pub struct MintArgs {
     /// key a joining browser anchor-verifies its grant against.
     #[arg(long, value_name = "HEX")]
     pub root: String,
+
+    /// The **issuer** identity file (TOML, from
+    /// `net-mesh identity generate`) that signs this credential.
+    ///
+    /// The anchor is configured with its public half and verifies
+    /// the signature before reading any other field, so the two
+    /// lifetimes are the issuer's to set. A recipient holds the PSK
+    /// and can re-encode anything — but cannot sign.
+    #[arg(long = "issuer-identity", value_name = "PATH")]
+    pub issuer_identity: PathBuf,
+
+    /// Allow a permissive identity-file mode on Unix.
+    #[arg(long)]
+    pub insecure_permissions: bool,
 
     /// The anchor's Noise static X25519 **public** key (64 hex
     /// chars). This is the key the browser pins; it is never read
@@ -151,6 +165,7 @@ pub struct InspectArgs {
 struct MintReport {
     credential: String,
     trust_domain: String,
+    issuer: String,
     bootstrap_url: String,
     /// The single-use half's deadline (unix seconds).
     nonce_expires_at: u64,
@@ -171,6 +186,7 @@ struct InspectReport {
     bootstrap_url: String,
     anchor_noise_pubkey: String,
     trust_domain: String,
+    issuer: String,
     nonce_expires_at: u64,
     psk_expires_at: u64,
     /// `Ok` / the reason the credential is not presentable right now.
@@ -255,12 +271,17 @@ async fn run_mint(args: MintArgs, output: Option<OutputFormat>) -> Result<(), Cl
         ));
     }
 
+    let issuer_file = read_identity_file(&args.issuer_identity, args.insecure_permissions).await?;
+    let seed = hex_decode_32(&issuer_file.seed_hex)
+        .map_err(|e| invalid_args(format!("--issuer-identity: seed_hex: {e}")))?;
+    let issuer = net_sdk::identity::Identity::from_seed(seed);
     let invite = InviteToken::mint(
         &root,
         args.url.clone(),
         Duration::from_secs(args.invite_ttl_secs),
     );
     let credential = BrowserBootstrapCredential::mint(
+        &issuer,
         invite,
         anchor_noise_pubkey,
         psk,
@@ -300,6 +321,7 @@ async fn run_mint(args: MintArgs, output: Option<OutputFormat>) -> Result<(), Cl
         &MintReport {
             credential: encoded,
             trust_domain: parsed.trust_domain.to_string(),
+            issuer: hex_string(parsed.issuer.as_bytes()),
             bootstrap_url: parsed.bootstrap_url.clone(),
             nonce_expires_at: parsed.nonce_expires_at(),
             psk_expires_at: parsed.psk_expires_at(),
@@ -341,6 +363,7 @@ async fn run_inspect(args: InspectArgs, output: Option<OutputFormat>) -> Result<
             bootstrap_url: credential.bootstrap_url.clone(),
             anchor_noise_pubkey: hex_string(&credential.anchor_noise_pubkey),
             trust_domain: credential.trust_domain.to_string(),
+            issuer: hex_string(credential.issuer.as_bytes()),
             nonce_expires_at: credential.nonce_expires_at(),
             psk_expires_at: credential.psk_expires_at(),
             status,

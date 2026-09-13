@@ -1047,6 +1047,11 @@ async fn run(
     println!("[harness] page: {page_url}");
 
     // --- 5. the bootstrap listeners --------------------------------
+    //
+    // R3: one issuer for the whole harness; every listener is
+    // configured with its public half and every credential below is
+    // signed with it.
+    let issuer = Identity::generate();
     let tls = BootstrapTls::Operator {
         cert_pem: ca.cert_pem_path.clone(),
         key_pem: ca.key_pem_path.clone(),
@@ -1054,6 +1059,7 @@ async fn run(
     let mut cfg = BootstrapConfig::new(
         "127.0.0.1:0".parse().expect("addr"),
         Psk::new(PSK),
+        issuer.entity_id().clone(),
         tls.clone(),
         origin.clone(),
     );
@@ -1078,6 +1084,7 @@ async fn run(
     let credential = |anchor_pub: [u8; 32], url: &str| {
         let invite = InviteToken::mint(&root_entity, url, Duration::from_secs(600));
         BrowserBootstrapCredential::mint(
+            &issuer,
             invite,
             anchor_pub,
             Psk::new(PSK),

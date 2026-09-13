@@ -68,10 +68,17 @@ async fn offerer() -> Arc<MeshNode> {
     node
 }
 
+/// The fixture issuer. Fixed seed so `config()` can name the same
+/// public half the credentials are signed with (R3).
+fn issuer() -> Identity {
+    Identity::from_seed([0x51u8; 32])
+}
+
 fn credential_for(psk: [u8; 32], invite_ttl: Duration) -> BrowserBootstrapCredential {
     let root = Identity::generate().entity_id().clone();
     let invite = InviteToken::mint(&root, "https://anchor.example", invite_ttl);
     BrowserBootstrapCredential::mint(
+        &issuer(),
         invite,
         [3u8; 32],
         Psk::new(psk),
@@ -84,6 +91,7 @@ fn config(psk: [u8; 32]) -> BootstrapConfig {
     BootstrapConfig::new(
         "127.0.0.1:0".parse().expect("addr"),
         Psk::new(psk),
+        issuer().entity_id().clone(),
         BootstrapTls::Operator {
             // Never read on the router path; the TLS witness below
             // uses a real pair.
@@ -1040,4 +1048,64 @@ async fn an_http_caller_cannot_spend_the_claimed_nodes_budget() {
 
     anchor.shutdown().await.expect("shutdown");
     victim.shutdown().await.expect("shutdown");
+}
+
+/// R3 at the listener: a credential this anchor's issuer did not
+/// sign is refused, and a freshly issued one is accepted.
+///
+/// The probe above covers the recipient editing its own deadlines.
+/// This covers the other half: a *valid* credential from someone
+/// else's issuer is not this anchor's to honour.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_credential_from_another_issuer_is_refused() {
+    let anchor = anchor().await;
+    let offerer = offerer().await;
+    let router = bootstrap_router(Arc::clone(&anchor), &config(PSK));
+
+    // Same PSK, same trust domain, same everything — except the key
+    // that signed it.
+    let other_issuer = Identity::from_seed([0xEEu8; 32]);
+    let root = Identity::generate().entity_id().clone();
+    let invite = InviteToken::mint(&root, "https://anchor.example", Duration::from_secs(600));
+    let foreign = BrowserBootstrapCredential::mint(
+        &other_issuer,
+        invite,
+        [3u8; 32],
+        Psk::new(PSK),
+        "https://anchor.example",
+        Duration::from_secs(86_400),
+    );
+    let sdp = offerer
+        .rtc_driver()
+        .expect("driver")
+        .create_offer()
+        .await
+        .expect("offer")
+        .1;
+
+    let (status, body) = post_offer(&router, &foreign, offerer.node_id(), &sdp).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let message: ErrorBody = serde_json::from_slice(&body).expect("an error body");
+    assert!(
+        message.message.contains("issued by"),
+        "the refusal must name the issuer, not the lifetime: {}",
+        message.message
+    );
+    assert_eq!(
+        anchor.open_signal_dialogs(offerer.node_id()),
+        0,
+        "nothing was allocated for a credential this anchor's issuer did not sign"
+    );
+
+    // The control: our issuer's credential, same path, accepted.
+    let ours = credential_for(PSK, Duration::from_secs(600));
+    let sdp = offerer
+        .rtc_driver()
+        .expect("driver")
+        .create_offer()
+        .await
+        .expect("offer")
+        .1;
+    let (status, _) = post_offer(&router, &ours, offerer.node_id(), &sdp).await;
+    assert_eq!(status, StatusCode::OK);
 }

@@ -17,14 +17,28 @@ const PSK_B: &str = "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0
 const ROOT: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 const ANCHOR_KEY: &str = "2222222222222222222222222222222222222222222222222222222222222222";
 
+/// A generated operator identity file, reused by every mint in this
+/// binary: R3 makes the credential's validity the ISSUER's, so
+/// minting needs a signing key.
+fn issuer_identity() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("issuer.toml");
+    Command::cargo_bin("net-mesh")
+        .unwrap()
+        .args(["identity", "generate", "--out"])
+        .arg(&path)
+        .assert()
+        .code(0);
+    (dir, path)
+}
+
 fn mint(extra: &[&str]) -> std::process::Output {
+    let (_keep, issuer) = issuer_identity();
     let mut cmd = Command::cargo_bin("net-mesh").unwrap();
+    cmd.arg("--output").arg("json");
+    cmd.args(["anchor", "credential", "mint", "--issuer-identity"]);
+    cmd.arg(&issuer);
     cmd.args([
-        "--output",
-        "json",
-        "anchor",
-        "credential",
-        "mint",
         "--root",
         ROOT,
         "--anchor-noise-pubkey",
@@ -199,12 +213,12 @@ fn writing_a_credential_file_refuses_to_overwrite_without_force() {
 
 #[test]
 fn a_url_no_browser_could_fetch_is_refused_at_mint_time() {
+    let (_keep, issuer) = issuer_identity();
     let out = Command::cargo_bin("net-mesh")
         .unwrap()
+        .args(["anchor", "credential", "mint", "--issuer-identity"])
+        .arg(&issuer)
         .args([
-            "anchor",
-            "credential",
-            "mint",
             "--root",
             ROOT,
             "--anchor-noise-pubkey",
@@ -225,12 +239,12 @@ fn a_url_no_browser_could_fetch_is_refused_at_mint_time() {
 
 #[test]
 fn minting_without_a_psk_is_refused() {
+    let (_keep, issuer) = issuer_identity();
     let out = Command::cargo_bin("net-mesh")
         .unwrap()
+        .args(["anchor", "credential", "mint", "--issuer-identity"])
+        .arg(&issuer)
         .args([
-            "anchor",
-            "credential",
-            "mint",
             "--root",
             ROOT,
             "--anchor-noise-pubkey",
@@ -250,6 +264,7 @@ fn minting_without_a_psk_is_refused() {
 
 #[test]
 fn the_psk_may_come_from_a_file_instead_of_argv() {
+    let (_keep, issuer) = issuer_identity();
     let dir = tempfile::tempdir().unwrap();
     let psk_path = dir.path().join("domain.psk");
     std::fs::write(&psk_path, format!("{PSK_A}\n")).unwrap();
@@ -261,6 +276,10 @@ fn the_psk_may_come_from_a_file_instead_of_argv() {
             "anchor",
             "credential",
             "mint",
+            "--issuer-identity",
+        ])
+        .arg(&issuer)
+        .args([
             "--root",
             ROOT,
             "--anchor-noise-pubkey",
