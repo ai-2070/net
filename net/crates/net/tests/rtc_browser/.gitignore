@@ -1,0 +1,7 @@
+# Build artifacts of the two nested crates and the harness's scratch
+# directory. CI builds these; the repo never carries them.
+leaf/target/
+leaf/dist/
+runner/target/
+work/
+logs/

@@ -4817,3 +4817,155 @@ jobs:
       - name: Clippy net-mesh-wire with its webrtc feature
         if: ${{ !cancelled() }}
         run: cargo clippy -p net-mesh-wire --features "json webrtc" --all-targets -- -D warnings
+
+  webrtc-browser:
+    # Stage 4b exit criterion 1: the six §12 admission witnesses, the
+    # MITM witness and the mDNS measurement, against a REAL Chromium
+    # and a REAL native anchor served by the production bootstrap
+    # listener. 4a could only witness §12 with a native stand-in;
+    # this job is the browser that replaces it.
+    #
+    # Its own job rather than a step on `webrtc-feature` for the same
+    # reason that job exists: it pays for a browser download, a
+    # wasm32 toolchain and an NSS trust store on top of the
+    # aws-lc-sys C build, and no default job should pay any of that.
+    #
+    # NOTE ON TLS: there is no `--ignore-certificate-errors` here or
+    # in the harness, and there cannot be — `BootstrapTls` has no
+    # self-signed variant. The harness issues a CA + `localhost` leaf
+    # with rcgen and installs the CA into the NSS database Chromium
+    # reads (`$HOME/.pki/nssdb`), removing it again on exit. A
+    # harness that skipped verification would prove something no
+    # deployment can rely on.
+    name: WebRTC browser harness (Stage 4b)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Add wasm32 to the toolchain
+        run: rustup target add wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: webrtc-browser
+          workspaces: |
+            net/crates/net/tests/rtc_browser/runner -> target
+            net/crates/net/tests/rtc_browser/leaf -> target
+
+      # `certutil` is how the CA reaches Chromium's trust store on
+      # Linux. Without it the harness REFUSES to run rather than
+      # falling back to ignoring certificate errors, so a missing
+      # package is a loud failure, not a silently weakened witness.
+      - name: Install libnss3-tools (certutil)
+        run: sudo apt-get update && sudo apt-get install -y libnss3-tools
+
+      # Chromium from Playwright's cache, the same build S0b measured
+      # against. `--with-deps` pulls the shared libraries headless
+      # Chromium needs on a bare runner.
+      - name: Install Chromium from Playwright's cache
+        run: npx --yes playwright@1.56.0 install --with-deps chromium
+
+      # The bindgen CLI version must EQUAL the crate version the leaf
+      # pins (`wasm-bindgen = "=0.2.128"`); a mismatch is a hard error
+      # at bindgen time, which is exactly what we want it to be.
+      - name: Install wasm-bindgen-cli 0.2.128
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@0.2.128
+
+      # One command. It builds the wasm leaf against `net-mesh-wire`,
+      # issues and installs the CA, starts the anchor + the impostor +
+      # the real listeners, launches Chromium WITHOUT
+      # `--disable-features=WebRtcHideLocalIpsWithMdns` (slice 3's
+      # measurement is the point), drives every witness through the
+      # browser, and exits non-zero on any failed one.
+      - name: Stage 4b browser harness
+        if: ${{ !cancelled() }}
+        run: |
+          # No `-e`: the exit code is taken from PIPESTATUS below, so
+          # a failing harness still leaves a complete log for the
+          # inventory step to read.
+          set -uo pipefail
+          net/crates/net/tests/rtc_browser/run.sh 2>&1 | tee "$RUNNER_TEMP/rtcb.log"
+          exit "${PIPESTATUS[0]}"
+
+      # The floor and the pinned names, on the same discipline the
+      # other RTC jobs use. The harness exiting 0 is the
+      # `--no-tests=fail` equivalent for a binary that could in
+      # principle emit ZERO witnesses and still succeed; this step is
+      # what makes that impossible, and what makes a witness being
+      # renamed or dropped a failure rather than a quiet shrink.
+      #
+      # Same parser self-check as the Stage 3 inventory: prove the
+      # grep finds a KNOWN line before believing any count, so a
+      # changed output format reads as "fix the parser", never as
+      # "all clear" or "the witnesses are gone".
+      - name: Stage 4b witness inventory
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/rtcb.log"
+          probe=$(grep -c '^RTCB PASS enrollment_exchange_promotes_this_session ' "$log" || true)
+          if [ "$probe" -eq 0 ]; then
+            echo "::error::witness-verdict parser found no known PASS line — the \
+          harness output format changed; fix the parser before trusting any floor"
+            tail -40 "$log"
+            exit 1
+          fi
+          passes=$(grep -c '^RTCB PASS ' "$log" || true)
+          fails=$(grep -c '^RTCB FAIL ' "$log" || true)
+          echo "rtc_browser: $passes passed, $fails failed (floor 9)"
+          if [ "$fails" -ne 0 ]; then
+            grep '^RTCB FAIL ' "$log"
+            echo "::error::a Stage 4b browser witness failed"
+            exit 1
+          fi
+          if [ "$passes" -lt 9 ]; then
+            echo "::error::rtc_browser emitted $passes witnesses, floor is 9 — \
+          lower the floor deliberately or restore the witness"
+            exit 1
+          fi
+          REQUIRED="
+          enrollment_exchange_promotes_this_session
+          provisional_announcement_is_refused
+          provisional_subscribe_to_an_unrelated_channel_is_refused
+          provisional_call_to_another_service_is_refused
+          provisional_transit_is_refused
+          local_envelope_accepted_redirected_denied
+          enrolled_without_authority_is_still_denied
+          mitm_anchor_fails_the_handshake_and_installs_nothing
+          mdns_candidate_pair_measured
+          "
+          for required in $REQUIRED; do
+            if ! grep -q "^RTCB PASS $required " "$log"; then
+              echo "::error::required browser witness missing or failed: $required"
+              exit 1
+            fi
+            echo "  exact: $required"
+          done
+          echo "browser witness inventory complete"
+
+      # The mDNS measurement is evidence, not a gate: surface it in
+      # the job summary so a regression in which candidate pair forms
+      # is visible without opening the log.
+      - name: mDNS candidate-pair evidence
+        if: ${{ !cancelled() }}
+        run: |
+          {
+            echo '### Stage 4b — mDNS candidate pair'
+            echo '```'
+            grep -E '^\[mdns\]|^\[browser\] \[cand ' "$RUNNER_TEMP/rtcb.log" || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload harness log
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: rtc-browser-harness-log
+          path: ${{ runner.temp }}/rtcb.log
+          if-no-files-found: warn

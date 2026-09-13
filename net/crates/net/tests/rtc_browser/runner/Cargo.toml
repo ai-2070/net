@@ -1,0 +1,36 @@
+[package]
+name = "rtc-browser-harness"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Stage 4b: drives a real Chromium against a real native anchor over the production bootstrap listener, and asserts the six §12 witnesses, the MITM witness and the mDNS measurement."
+
+# Its own workspace root. This crate lives under `net/crates/net/tests/`
+# and is deliberately NOT a member of the `net-mesh` workspace: it is a
+# harness binary, not a library target, and `net/crates/net/Cargo.toml`
+# is not ours to edit (Stage 4b is strictly additive).
+[workspace]
+
+[[bin]]
+name = "rtc-browser-harness"
+path = "src/main.rs"
+
+[dependencies]
+# The anchor under test, with the features the §12 contract needs.
+net-mesh = { path = "../../..", features = ["webrtc", "fixtures", "cortex"] }
+# The Stage 4b bootstrap listener + the browser credential.
+net-mesh-sdk = { path = "../../../sdk", features = ["rtc-bootstrap"] }
+
+# The routing-envelope codec the transit witness needs: `route` is a
+# private module in `net-mesh`, but the envelope type lives in the
+# wire crate, which is public.
+net-mesh-wire = { path = "../../../wire" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "process", "fs", "io-util"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytes = "1"
+async-trait = "0.1"
+# The local CA + leaf. Same version the SDK's own TLS witness uses, so
+# one rcgen resolves.
+rcgen = { version = "0.14", default-features = false, features = ["pem", "crypto", "aws_lc_rs"] }
