@@ -350,13 +350,18 @@ Per-binary counts vs CI floors: 5 / 7 / 22 / 4 / 8 / 5 / 2 / 12 / 26 / 11 / 2 / 
 
 ## 10. CI — green
 
-**Head `490568ecd`, run
-[34737303326](https://github.com/ai-2070/net/actions/runs/34737303326):
-52 jobs, 52 success.** That includes the **first execution of
-`webrtc-browser`**, on Linux, which reports `rtc_browser: 9 passed,
-0 failed (floor 9)` and `browser witness inventory complete` — so
-the Stage 4b exit criteria are witnessed by CI, not only on the
-author's host.
+**Head `871e0138d`, run
+[34739822992](https://github.com/ai-2070/net/actions/runs/34739822992):
+52 jobs, 52 success** — the branch head as delivered. The first
+green was `490568ecd`
+([34737303326](https://github.com/ai-2070/net/actions/runs/34737303326),
+also 52/52); the two commits since are this report and the
+browser-job deadline fix in §10.1.
+
+Both runs include `webrtc-browser`, on Linux, reporting
+`rtc_browser: 9 passed, 0 failed (floor 9)` and `browser witness
+inventory complete` — so the Stage 4b exit criteria are witnessed by
+CI, not only on the author's host.
 
 The mDNS measurement reproduced on the runner and **agrees with
 §6.3 on a completely different network**:
