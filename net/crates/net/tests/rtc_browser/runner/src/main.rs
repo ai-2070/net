@@ -165,38 +165,106 @@ fn admitted_outcome() -> Bytes {
     Bytes::from(buf)
 }
 
-/// A request body beginning with this parks the call until the
-/// harness releases it (R7a: an old exchange that completes after
-/// its session is gone).
+/// A request body beginning with this parks the call inside the
+/// provider until the harness releases **that exact body** (R7a: an
+/// old exchange and its successor's exchange, both in flight at
+/// once).
 const HOLD_PREFIX: &[u8] = b"hold:";
+
+/// The gate parked enrollment calls wait on, keyed by the request
+/// body.
+///
+/// It replaced a counted semaphore because the replacement
+/// discriminator needs TWO enrollment calls carrying the **same call
+/// id** parked at the same time, and needs to release exactly one of
+/// them: `add_permits(1)` can only say "let one of the parked calls
+/// go", which would make the witness depend on the semaphore's
+/// wakeup order for the property it is trying to establish. The body
+/// is the key because the call id deliberately is not unique here.
+#[derive(Default)]
+struct HoldGate {
+    parked: std::sync::Mutex<Vec<Vec<u8>>>,
+    released: std::sync::Mutex<Vec<Vec<u8>>>,
+    wake: tokio::sync::Notify,
+}
+
+impl HoldGate {
+    /// Park this call until its own body is released. The arrival is
+    /// recorded first, so the harness can observe both calls sitting
+    /// inside the provider before it releases either.
+    async fn hold(&self, body: &[u8]) {
+        Self::push(&self.parked, body);
+        loop {
+            // Registered BEFORE the check: `notify_waiters` only
+            // wakes waiters that are already registered, so a
+            // release landing between the two must not be missed.
+            let wake = self.wake.notified();
+            if Self::contains(&self.released, body) {
+                return;
+            }
+            wake.await;
+        }
+    }
+
+    /// Let the call carrying exactly this body finish.
+    fn release(&self, body: &[u8]) {
+        Self::push(&self.released, body);
+        self.wake.notify_waiters();
+    }
+
+    /// Is the call carrying this body inside the provider, parked?
+    fn is_parked(&self, body: &[u8]) -> bool {
+        Self::contains(&self.parked, body)
+    }
+
+    fn push(log: &std::sync::Mutex<Vec<Vec<u8>>>, body: &[u8]) {
+        log.lock()
+            .expect("the hold gate's logs are never poisoned")
+            .push(body.to_vec());
+    }
+
+    fn contains(log: &std::sync::Mutex<Vec<Vec<u8>>>, body: &[u8]) -> bool {
+        log.lock()
+            .expect("the hold gate's logs are never poisoned")
+            .iter()
+            .any(|b| b.as_slice() == body)
+    }
+}
 
 /// The **real** enrollment provider the anchor serves, with the two
 /// seams the browser witnesses read:
 ///
-/// * `completed` records `(call_id, body)` for every call this
-///   handler actually finished. That is what makes the
+/// * `delivered` records `(call_id, body)` for every call that
+///   actually reached this handler. That is what makes the
 ///   locally-addressed envelope's outcome an *observed decoded
 ///   fact* (R7c) instead of "a transit counter that did not move":
 ///   the runner generates a nonce, the browser seals it into a
 ///   routed envelope addressed at the anchor itself, and the
 ///   witness passes only if THIS handler ran with THAT payload.
-/// * a body starting with [`HOLD_PREFIX`] parks the call on
-///   `release` until the harness adds a permit, which is how the
-///   replacement witness holds an old enrollment exchange open
-///   across a session replacement.
+///   The entry is appended **inside** the handler, before it
+///   returns, so it is decoded handler delivery — not a correlated
+///   successful enrollment terminal, which is a different
+///   observation and is made elsewhere (witness (a) reads the
+///   browser-received RESPONSE).
+/// * a body starting with [`HOLD_PREFIX`] parks the call on the
+///   [`HoldGate`] until the harness releases that body, which is how
+///   the replacement witness holds an old enrollment exchange and
+///   its successor's exchange open at the same time.
 struct Enrollment {
-    completed: Arc<std::sync::Mutex<Vec<(u64, Vec<u8>)>>>,
-    parked: Arc<AtomicUsize>,
-    release: Arc<tokio::sync::Semaphore>,
+    delivered: Arc<std::sync::Mutex<Vec<(u64, Vec<u8>)>>>,
+    gate: Arc<HoldGate>,
 }
 
 impl Enrollment {
-    /// Did this handler complete a call with exactly this
-    /// `(call_id, body)`?
-    fn completed_call(completed: &std::sync::Mutex<Vec<(u64, Vec<u8>)>>, call: u64, body: &[u8]) -> bool {
-        completed
+    /// Did this handler RUN with exactly this `(call_id, body)`?
+    fn handler_ran(
+        delivered: &std::sync::Mutex<Vec<(u64, Vec<u8>)>>,
+        call: u64,
+        body: &[u8],
+    ) -> bool {
+        delivered
             .lock()
-            .expect("the completed-call log is never poisoned")
+            .expect("the delivered-call log is never poisoned")
             .iter()
             .any(|(c, b)| *c == call && b.as_slice() == body)
     }
@@ -207,14 +275,11 @@ impl RpcHandler for Enrollment {
     async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
         let body = ctx.payload.body.to_vec();
         if body.starts_with(HOLD_PREFIX) {
-            self.parked.fetch_add(1, Ordering::SeqCst);
-            if let Ok(permit) = self.release.acquire().await {
-                permit.forget();
-            }
+            self.gate.hold(&body).await;
         }
-        self.completed
+        self.delivered
             .lock()
-            .expect("the completed-call log is never poisoned")
+            .expect("the delivered-call log is never poisoned")
             .push((ctx.call_id, body));
         Ok(RpcResponsePayload {
             status: RpcStatus::Ok,
@@ -299,6 +364,18 @@ enum Step {
     /// Close one session's DataChannel, trickle socket and
     /// `RTCPeerConnection` from the browser end.
     Close { id: u64, session: String },
+    /// Wait until the ANCHOR has torn this session's transport
+    /// down, observed in the browser: the DataChannel leaves
+    /// `open`, or the `RTCPeerConnection` leaves a live state. The
+    /// page never closes the session itself, so this is the far
+    /// end's observation that the anchor actually reclaimed the
+    /// endpoint — the counter on the anchor records the reclaim
+    /// DECISION, this records the transport going away.
+    ExpectClosed {
+        id: u64,
+        session: String,
+        timeout_ms: u64,
+    },
     /// Wait for one inbound frame on `subprotocol` and return it.
     /// `0` is the event plane; a control subprotocol (membership,
     /// capability announcement) carries its own id. Filtering here
@@ -378,6 +455,7 @@ impl Script {
             | Step::Send { id: s, .. }
             | Step::Burst { id: s, .. }
             | Step::Close { id: s, .. }
+            | Step::ExpectClosed { id: s, .. }
             | Step::Expect { id: s, .. }
             | Step::Stats { id: s, .. }
             | Step::Done { id: s } => *s = id,
@@ -501,6 +579,7 @@ async fn next_step(State(s): State<PageState>) -> Response {
                 | Step::Send { id, .. }
                 | Step::Burst { id, .. }
                 | Step::Close { id, .. }
+                | Step::ExpectClosed { id, .. }
                 | Step::Expect { id, .. }
                 | Step::Stats { id, .. }
                 | Step::Done { id } => *id,
@@ -1096,17 +1175,15 @@ async fn run(
     println!("[harness] loopback anchor rtc socket: {loop_rtc_addr}");
 
     // --- 3. services on the anchor ---------------------------------
-    let enroll_completed: Arc<std::sync::Mutex<Vec<(u64, Vec<u8>)>>> =
+    let enroll_delivered: Arc<std::sync::Mutex<Vec<(u64, Vec<u8>)>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
-    let enroll_parked = Arc::new(AtomicUsize::new(0));
-    let enroll_release = Arc::new(tokio::sync::Semaphore::new(0));
+    let enroll_gate = Arc::new(HoldGate::default());
     let _enroll = anchor
         .serve_rpc(
             ENROLL_SERVICE,
             Arc::new(Enrollment {
-                completed: Arc::clone(&enroll_completed),
-                parked: Arc::clone(&enroll_parked),
-                release: Arc::clone(&enroll_release),
+                delivered: Arc::clone(&enroll_delivered),
+                gate: Arc::clone(&enroll_gate),
             }),
         )
         .map_err(|e| format!("serve {ENROLL_SERVICE}: {e}"))?;
@@ -1936,13 +2013,19 @@ async fn run(
     //     enrollment REQUEST — the one action §12 permits a
     //     provisional session — whose nonce the runner generated,
     //     and the witness passes only when the anchor's REAL
-    //     registered enrollment handler completed THAT call with
-    //     THAT body. The outcome is decoded on the anchor, not
-    //     inferred from an absence.
+    //     registered enrollment handler RAN with THAT call id and
+    //     THAT body. What that establishes is **decoded handler
+    //     delivery**: the envelope was decrypted, routed locally,
+    //     decoded and dispatched, and the marker is appended
+    //     inside the handler before it returns. It is deliberately
+    //     NOT "a completed successful enrollment" — no correlated
+    //     successful terminal is observed here (witness (a) is
+    //     where a browser-received RESPONSE is read). The fact is
+    //     decoded on the anchor, not inferred from an absence.
     //
     // The redirected envelope goes first, while the session is
-    // still provisional: the local one ends with this session
-    // enrolled.
+    // still provisional: the local one ends with this session's
+    // enrollment call delivered.
     {
         let node_id: u64 = 0xB0B0_0005;
         let origin: u64 = 0xE1E1_0000_0000_0005;
@@ -2043,7 +2126,7 @@ async fn run(
                 .await;
             let delivered = local.ok
                 && wait_for(
-                    || Enrollment::completed_call(&enroll_completed, local_call, &local_body),
+                    || Enrollment::handler_ran(&enroll_delivered, local_call, &local_body),
                     Duration::from_secs(20),
                 )
                 .await;
@@ -2053,9 +2136,12 @@ async fn run(
                 subscribed.ok && local.ok && delivered && after_local == before_local && refused,
                 format!(
                     "reply-channel Subscribe sent={}; the locally-addressed ROUTED \
-                     envelope was sent={} ({}); the anchor's registered {ENROLL_SERVICE} \
-                     handler COMPLETED call 0x{local_call:X} with the runner's nonce \
-                     {nonce:016x}={delivered}; transit refusals {before_local} -> \
+                     envelope was sent={} ({}); DECODED HANDLER DELIVERY: the anchor's \
+                     registered {ENROLL_SERVICE} handler RAN for call 0x{local_call:X} \
+                     carrying the runner's nonce {nonce:016x}={delivered} (the marker is \
+                     appended inside the handler before it returns, so this is delivery \
+                     of a decoded call — NOT an observed successful enrollment \
+                     terminal); transit refusals {before_local} -> \
                      {after_local} (a local envelope is not transit); redirected \
                      envelope refused={refused}",
                     subscribed.ok,
@@ -2081,11 +2167,67 @@ async fn run(
     // anchor with the SAME credential: if that cannot reach a
     // session, the negative result above is not evidence about the
     // pinned key.
+    //
+    // **R7, the settlement gap.** "The impostor installed nothing"
+    // used to be a peer-count sample taken 1.5 s after the page
+    // gave up. The page gives up after 15 s; the impostor's own
+    // `ice_deadline` is 90 s, and a failed `doConnect` used to
+    // leave its DataChannel, trickle socket and PeerConnection
+    // open — so the attempt the impostor ACCEPTED was still alive,
+    // still owned by its completion task, when the counts were
+    // read. A zero there is not evidence of anything.
+    //
+    // So the exact attempt's terminal owner boundary is required
+    // FIRST, and it is established without sampling a race:
+    //
+    //   * OWNERSHIP is monotonic. The impostor admitted this
+    //     attempt's signalling (`signal_delivered`, a counter that
+    //     only goes up) and the page reports its offer ACCEPTED
+    //     (HTTP 200) with the DataChannel OPEN — which only happens
+    //     because the impostor answered the offer, and answering is
+    //     the one path that registers the attempt's dialog under
+    //     this claimed node id.
+    //   * SETTLEMENT is the terminal state of that registration:
+    //     this claimed node's open-attempt count back at zero.
+    //     Given the ownership fact above the registration
+    //     definitely happened, so zero here means it was RETIRED,
+    //     rather than never having existed. Zero is reached only
+    //     through the one release path — the accepted-attempt row
+    //     dropped and the signalling reservation its ingress took
+    //     released — whichever terminal owner drives it: the
+    //     trickle socket closing (`end_bootstrap_dialog`), the
+    //     attempt's own completion, or its expiry. This witness
+    //     asserts the boundary, not which owner reached it; the
+    //     browser's `[trickle …]` log lines say which one did on
+    //     any given run.
+    //
+    // The page also settles its own handles when the attempt
+    // fails, so an abandoned attempt is not left for the anchor to
+    // discover at its 90 s deadline. The peak below is reported as
+    // the attempt's observed liveness window, NOT as the premise:
+    // the retirement can land within milliseconds of the answer,
+    // and a sampler that misses that window must not turn a
+    // correctly settled attempt into a failure.
     // ================================================================
     {
         let node_id: u64 = 0xB0B0_0006;
         let peers_before = impostor.peer_count();
         let prov_before = impostor.provisional_count();
+        let dialogs_before = impostor.open_signal_dialogs(node_id);
+        let signals_before = impostor.rtc_stats().signal_delivered();
+        // Diagnostic only: how long this attempt's dialog was
+        // observably open on the impostor.
+        let dialog_peak = Arc::new(AtomicUsize::new(0));
+        let watcher = {
+            let impostor = Arc::clone(&impostor);
+            let peak = Arc::clone(&dialog_peak);
+            tokio::spawn(async move {
+                loop {
+                    peak.fetch_max(impostor.open_signal_dialogs(node_id), Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+        };
         // The SAME credential — so the impostor accepts it, answers
         // the offer, and the DataChannel opens. The browser pins the
         // REAL anchor's static key, which the impostor does not hold.
@@ -2121,7 +2263,31 @@ async fn run(
                 expect_failure: true,
             })
             .await;
-        tokio::time::sleep(Duration::from_millis(1500)).await;
+        watcher.abort();
+        let dialog_peak = dialog_peak.load(Ordering::SeqCst);
+        let signals_delta = impostor.rtc_stats().signal_delivered() - signals_before;
+        // The impostor really did accept and own an attempt for this
+        // claimed node: it admitted the attempt's signalling, and
+        // the page's own stages say the offer was accepted and the
+        // DataChannel opened — which is the impostor having answered
+        // that offer, the one path that registers the dialog.
+        let stage_bool = |field: &str| {
+            r.stage
+                .as_ref()
+                .and_then(|s| s.get(field))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        };
+        let owned_an_attempt = signals_delta > 0 && stage_bool("offer_accepted") && stage_bool("dc_open");
+        // The terminal owner boundary of THAT attempt, not a sleep:
+        // its registration is back to zero, which it reaches only by
+        // being retired.
+        let settled = wait_for(
+            || impostor.open_signal_dialogs(node_id) == 0,
+            Duration::from_secs(30),
+        )
+        .await;
+        let dialogs_after = impostor.open_signal_dialogs(node_id);
         let peers_after = impostor.peer_count();
         let prov_after = impostor.provisional_count();
         // `expect_failure` inverts `ok`: `ok` means "reached the
@@ -2143,11 +2309,23 @@ async fn run(
             failed_at_pinned_key
                 && !test_error
                 && control_ok
+                && owned_an_attempt
+                && settled
                 && peers_after == peers_before
                 && prov_after == prov_before,
             format!(
                 "impostor attempt: failed AT THE PINNED-KEY BOUNDARY={failed_at_pinned_key}, \
-                 test_error={test_error} — {} [stages {}]; impostor peer_count \
+                 test_error={test_error} — {} [stages {}]; the impostor ACCEPTED AND OWNED \
+                 this attempt={owned_an_attempt} (it admitted its signalling, \
+                 signal_delivered +{signals_delta}, and answered the offer, which is what \
+                 registers the dialog for claimed node 0x{node_id:X}; that dialog was \
+                 observed open with a peak of {dialog_peak} while the attempt ran); THAT \
+                 attempt has now SETTLED={settled} — this claimed node's open-attempt \
+                 registration is back to {dialogs_after} from {dialogs_before}, which it \
+                 reaches only by being retired: its accepted-attempt row dropped and the \
+                 signalling reservation its ingress took released (whichever terminal \
+                 owner drove it — see the browser's [trickle mitm] lines); ONLY THEN \
+                 sampled: impostor peer_count \
                  {peers_before} -> {peers_after}, provisional {prov_before} -> \
                  {prov_after}; correct-key control against the real anchor reached a \
                  session={control_ok} (browser {:?}, anchor {:?})",
@@ -2170,22 +2348,60 @@ async fn run(
     // Stage 4b never drove from a browser.
     // ================================================================
 
-    // ---- an old enrollment exchange cannot promote a SUCCESSOR ----
+    // ---- a COLLIDING-CALL replacement promotes nothing ------------
     //
-    // The 4a R2-A property, now driven from Chromium: an enrollment
-    // call is parked inside the anchor's real provider, the browser
-    // session that made it goes away, a SECOND browser session
-    // claims the same node id, and only then does the old call
-    // complete. Its completion must promote nothing — the
-    // reservation it was armed with named an incarnation that no
-    // longer exists — while the successor's OWN call still can.
+    // The 4a R2-A property, driven from Chromium, with the
+    // discriminator the first version of this witness lacked (R7).
+    //
+    // The historical defect was a completion that consumed an
+    // enrollment reservation by `(node, call)`, scanning across
+    // session ids: call ids are sender-chosen, so a browser that
+    // reconnected and reused one had its SUCCESSOR's reservation
+    // spent — and its successor promoted — by the obsolete
+    // incarnation's completion. The repair keys the reservation on
+    // the composite `(node, session, call)` and re-verifies the
+    // session inside `promote_admission`.
+    //
+    // A schedule whose two calls carry DIFFERENT call ids cannot
+    // tell the repair from the defect: with no successor
+    // reservation under the old call id, both a captured-incarnation
+    // lookup and a current-session lookup find nothing and record an
+    // orphan. So this schedule collides them deliberately — same
+    // node id, same origin, same reply channel, and the SAME call id
+    // on both sides:
+    //
+    //   1. the old exchange is parked inside the anchor's real
+    //      provider and its browser session is then replaced;
+    //   2. the successor's own exchange — same call id — is parked
+    //      too, so BOTH handlers sit in the provider at once, and
+    //      the successor's reservation `(node, new_session, call)`
+    //      is positively armed (`kyra_has_enrollment_reservation`)
+    //      rather than inferred;
+    //   3. ONLY the old result is released. A completion that looks
+    //      up the incarnation it CAPTURED finds nothing — that
+    //      reservation was retired with its peer — and is counted
+    //      orphaned. A completion that looks up the CURRENT session
+    //      finds the successor's live reservation under the same
+    //      call id and promotes it. The verdict requires the first
+    //      AND requires the successor to still hold its own
+    //      reservation and still be provisional afterwards;
+    //   4. then the successor's OWN result is released and promotes
+    //      it — the positive control, without which this would also
+    //      pass on an anchor that can never promote anything.
+    //
+    // The source inverse that turns this RED: pass the CURRENT
+    // session instead of the captured `receiving_session_id` to
+    // `promote_on_enrollment_response` in `mesh_rpc.rs`'s
+    // `Some(true)` arm.
     {
         let node_id: u64 = 0xB0B0_0007;
         let origin: u64 = 0xE1E1_0000_0000_0007;
         let reply_channel = enroll_reply_channel(origin);
-        let hold_call: u64 = 0xC0FF_EE07;
-        let own_call: u64 = 0xC0FF_EE08;
-        let hold_body = Vec::from(*b"hold:the-old-exchange");
+        // ONE call id, both incarnations. The reservations differ in
+        // the session id and in nothing else.
+        let call: u64 = 0xC0FF_EE07;
+        let old_body = Vec::from(*b"hold:the-old-exchange");
+        let new_body = Vec::from(*b"hold:the-successors-own-exchange");
 
         let old = conn.connect(&mut script, "replace-old", node_id).await;
         if !old.ok {
@@ -2213,8 +2429,7 @@ async fn run(
                     payload: hex(&sub),
                 })
                 .await;
-            let parked_before = enroll_parked.load(Ordering::SeqCst);
-            let frame = rpc_request_frame(ENROLL_SERVICE, origin, hold_call, &hold_body);
+            let frame = rpc_request_frame(ENROLL_SERVICE, origin, call, &old_body);
             let held_sent = script
                 .run(Step::Send {
                     id: 0,
@@ -2230,15 +2445,14 @@ async fn run(
                 .await;
             // The call is INSIDE the provider, parked, with its
             // promotion reservation armed against this incarnation.
-            let parked = held_sent.ok
+            let old_parked = held_sent.ok
                 && wait_for(
-                    || enroll_parked.load(Ordering::SeqCst) > parked_before,
+                    || enroll_gate.is_parked(&old_body),
                     Duration::from_secs(20),
                 )
                 .await;
-            let reserved = old_session.is_some_and(|s| {
-                anchor.kyra_has_enrollment_reservation(node_id, s, hold_call)
-            });
+            let old_reserved = old_session
+                .is_some_and(|s| anchor.kyra_has_enrollment_reservation(node_id, s, call));
 
             // The browser session goes away with the call still in
             // flight.
@@ -2253,6 +2467,12 @@ async fn run(
                 Duration::from_secs(25),
             )
             .await;
+            // Recorded because it is WHY the correct lookup finds
+            // nothing below: the evicted peer's reservations are
+            // retired with it, so the old completion's own key is
+            // gone while the successor's is live.
+            let old_reservation_retired = old_session
+                .is_some_and(|s| !anchor.kyra_has_enrollment_reservation(node_id, s, call));
 
             // The SUCCESSOR: a second browser session claiming the
             // same node id, and — as a reconnecting browser would —
@@ -2291,32 +2511,9 @@ async fn run(
                     payload: hex(&sub),
                 })
                 .await;
-
-            // Release the OLD exchange, and watch what it can do.
-            let promoted_before = anchor.rtc_stats().admission_promoted();
-            let orphaned_before = anchor.rtc_stats().admission_promotion_orphaned();
-            enroll_release.add_permits(1);
-            let old_completed = wait_for(
-                || Enrollment::completed_call(&enroll_completed, hold_call, &hold_body),
-                Duration::from_secs(20),
-            )
-            .await;
-            let orphaned = wait_for(
-                || anchor.rtc_stats().admission_promotion_orphaned() > orphaned_before,
-                Duration::from_secs(10),
-            )
-            .await;
-            tokio::time::sleep(Duration::from_millis(1500)).await;
-            let promoted_delta = anchor.rtc_stats().admission_promoted() - promoted_before;
-            let successor_untouched = anchor.peer_is_provisional(node_id)
-                && anchor.peer_session_id(node_id) == new_session
-                && new_session.is_some()
-                && new_session != old_session;
-
-            // The positive control: the successor's OWN enrollment
-            // call still promotes it. Without this the verdict would
-            // also pass on an anchor that can never promote anything.
-            let frame = rpc_request_frame(ENROLL_SERVICE, origin, own_call, b"join");
+            // The successor's OWN exchange, carrying the SAME call
+            // id, parked in the provider alongside the old one.
+            let frame = rpc_request_frame(ENROLL_SERVICE, origin, call, &new_body);
             let own_sent = script
                 .run(Step::Send {
                     id: 0,
@@ -2330,47 +2527,105 @@ async fn run(
                     payload: hex(&frame.payload),
                 })
                 .await;
-            let own_promoted = own_sent.ok
+            let new_parked = own_sent.ok
                 && wait_for(
-                    || {
-                        anchor.rtc_stats().admission_promoted() > promoted_before
-                            && !anchor.peer_is_provisional(node_id)
-                            && anchor.peer_session_id(node_id) == new_session
-                    },
-                    Duration::from_secs(25),
+                    || enroll_gate.is_parked(&new_body),
+                    Duration::from_secs(20),
                 )
                 .await;
+            // The discriminator's premise, positively armed: a LIVE
+            // reservation under the same `(node, call)` that differs
+            // from the old one only in the session id.
+            let successor_armed = new_session
+                .is_some_and(|s| anchor.kyra_has_enrollment_reservation(node_id, s, call));
+            // Both handlers are parked at the same time, and neither
+            // has returned: nothing has been released yet.
+            let both_parked = old_parked
+                && new_parked
+                && !Enrollment::handler_ran(&enroll_delivered, call, &old_body)
+                && !Enrollment::handler_ran(&enroll_delivered, call, &new_body);
+
+            // Release the OLD result, and only that one.
+            let promoted_before = anchor.rtc_stats().admission_promoted();
+            let orphaned_before = anchor.rtc_stats().admission_promotion_orphaned();
+            enroll_gate.release(&old_body);
+            let old_delivered = wait_for(
+                || Enrollment::handler_ran(&enroll_delivered, call, &old_body),
+                Duration::from_secs(20),
+            )
+            .await;
+            let orphaned = wait_for(
+                || anchor.rtc_stats().admission_promotion_orphaned() > orphaned_before,
+                Duration::from_secs(20),
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            let promoted_delta = anchor.rtc_stats().admission_promoted() - promoted_before;
+            // The successor still OWNS its call: the obsolete
+            // completion spent none of its reservation.
+            let successor_keeps_ownership = new_session
+                .is_some_and(|s| anchor.kyra_has_enrollment_reservation(node_id, s, call));
+            let successor_untouched = anchor.peer_is_provisional(node_id)
+                && anchor.peer_session_id(node_id) == new_session
+                && new_session.is_some()
+                && new_session != old_session
+                && !Enrollment::handler_ran(&enroll_delivered, call, &new_body);
+
+            // Now the successor's own result: the same call id, its
+            // own reservation, and it promotes.
+            enroll_gate.release(&new_body);
+            let own_promoted = wait_for(
+                || {
+                    Enrollment::handler_ran(&enroll_delivered, call, &new_body)
+                        && anchor.rtc_stats().admission_promoted() > promoted_before
+                        && !anchor.peer_is_provisional(node_id)
+                        && anchor.peer_session_id(node_id) == new_session
+                },
+                Duration::from_secs(25),
+            )
+            .await;
+            let own_reservation_spent = new_session
+                .is_some_and(|s| !anchor.kyra_has_enrollment_reservation(node_id, s, call));
 
             ledger.record(
                 "browser_enrollment_survives_replacement",
                 subscribed.ok
-                    && parked
-                    && reserved
+                    && old_parked
+                    && old_reserved
                     && closed.ok
                     && evicted
                     && new.ok
                     && new_subscribed.ok
-                    && old_completed
+                    && new_parked
+                    && successor_armed
+                    && both_parked
+                    && old_delivered
                     && orphaned
                     && promoted_delta == 0
+                    && successor_keeps_ownership
                     && successor_untouched
-                    && own_promoted,
+                    && own_promoted
+                    && own_reservation_spent,
                 format!(
-                    "old session {old_session:?}: call 0x{hold_call:X} parked in the \
-                     provider={parked}, reservation armed for that incarnation={reserved}; \
-                     browser closed it={} and the anchor evicted the peer={evicted}; \
-                     successor session {new_session:?} installed={} (browser said {:?}) \
-                     (subscribed={}); the \
-                     OLD call then completed={old_completed} and was counted \
-                     orphaned={orphaned} (admission_promotion_orphaned {} -> {}); \
-                     admission_promoted +{promoted_delta} and the successor is \
-                     untouched={successor_untouched} (provisional={}); the successor's OWN \
-                     call 0x{own_call:X} promoted it={own_promoted}",
+                    "ONE call id 0x{call:X} on both sides. Old session {old_session:?}: \
+                     parked in the provider={old_parked}, its reservation armed={old_reserved}; \
+                     browser closed it={} and the anchor evicted the peer={evicted}, \
+                     retiring that reservation={old_reservation_retired}. Successor session \
+                     {new_session:?} installed={} (browser said {:?}, subscribed={}); its OWN \
+                     call — same id — parked={new_parked} with its reservation \
+                     (node, successor session, 0x{call:X}) ARMED={successor_armed}, both \
+                     handlers parked and neither returned={both_parked}. Released the OLD \
+                     result ONLY: it reached the handler={old_delivered} and was counted \
+                     ORPHANED={orphaned} (admission_promotion_orphaned {orphaned_before} -> \
+                     {}); admission_promoted +{promoted_delta}; the successor still HOLDS its \
+                     reservation={successor_keeps_ownership} and is untouched and still \
+                     provisional={successor_untouched} (provisional={}). Then released the \
+                     successor's own result: it promoted={own_promoted} and its reservation \
+                     was spent={own_reservation_spent}",
                     closed.ok,
                     new.ok,
                     new.error.as_deref().unwrap_or("ok"),
                     new_subscribed.ok,
-                    orphaned_before,
                     anchor.rtc_stats().admission_promotion_orphaned(),
                     anchor.peer_is_provisional(node_id),
                 ),
@@ -2384,7 +2639,25 @@ async fn run(
     // `MAX_PROVISIONAL_BYTES`, `MAX_PROVISIONAL_STREAMS`), NOT the
     // owner-pending §12.5 policies. A burst under every bound leaves
     // the session installed; crossing the whole-session BYTE bound
-    // closes and reclaims it, observed on the anchor.
+    // ends it.
+    //
+    // **What this witness does and does not establish (R7).** It
+    // observes exactly three things: the control burst leaving the
+    // session installed, the anchor REMOVING this session's peer
+    // entry after the byte bound is crossed (and `admission_reclaimed`
+    // — the reclaim decision's own counter — moving with it), and the
+    // BROWSER then seeing this session's transport go down: its
+    // DataChannel leaving `open`, or its `RTCPeerConnection` leaving
+    // a live state because ICE consent to the anchor's endpoint
+    // lapsed. The page never closes this session itself, so that is
+    // the far end's evidence that the close reached the TRANSPORT
+    // and not only the peer table. It does NOT establish the other
+    // §12 bounds (only the byte bound is crossed here, deliberately,
+    // with the frame count kept under its own bound), and it does
+    // not read the provisional-endpoint projection for this exact
+    // endpoint: no accessor exposes one endpoint's membership, and
+    // the aggregate count moves for unrelated sessions' expiry too,
+    // so it would not be evidence about this one.
     {
         let node_id: u64 = 0xB0B0_0009;
         let origin: u64 = 0xE1E1_0000_0000_0009;
@@ -2444,6 +2717,19 @@ async fn run(
             )
             .await;
             let reclaimed = anchor.rtc_stats().admission_reclaimed() > reclaimed_before;
+            // The transport teardown, observed at the far end: the
+            // page never closes this session itself, so its
+            // DataChannel leaving `open` — or its peer connection
+            // leaving a live state, ICE consent to the anchor's
+            // endpoint having lapsed — is the anchor's close having
+            // reached the transport and not only the peer table.
+            let torn_down = script
+                .run(Step::ExpectClosed {
+                    id: 0,
+                    session: "bounds".into(),
+                    timeout_ms: 20_000,
+                })
+                .await;
             let elapsed = installed.elapsed();
             // The whole schedule finishes well inside
             // `PROVISIONAL_TTL`, so expiry cannot be the reason the
@@ -2454,6 +2740,7 @@ async fn run(
                 alive_after_control
                     && closed
                     && reclaimed
+                    && torn_down.ok
                     && before_ttl
                     && sent_bytes > MAX_PROVISIONAL_BYTES
                     && sent_frames < u64::from(MAX_PROVISIONAL_FRAMES),
@@ -2463,14 +2750,25 @@ async fn run(
                      for {sent_bytes} bytes total — over MAX_PROVISIONAL_BYTES \
                      ({MAX_PROVISIONAL_BYTES}) and under MAX_PROVISIONAL_FRAMES \
                      ({MAX_PROVISIONAL_FRAMES}), so the BYTE bound is the one crossed; \
-                     the anchor closed the session={closed} (now {:?}), \
-                     admission_reclaimed {reclaimed_before} -> {} ({reclaimed}), \
+                     the anchor REMOVED this session's peer entry={closed} (now {:?}) and \
+                     counted the reclaim decision, admission_reclaimed {reclaimed_before} \
+                     -> {} ({reclaimed}); the BROWSER then observed this session's \
+                     TRANSPORT go down={} — it never closes this session itself, so this \
+                     is the anchor's close reaching the transport rather than only the \
+                     peer table ({}); it is NOT a read of the provisional-endpoint \
+                     projection for this endpoint; \
                      {:.1} s after install, inside PROVISIONAL_TTL={before_ttl} ({})",
                     control.sent_frames.unwrap_or(0),
                     control.sent_bytes.unwrap_or(0),
                     sent_frames,
                     anchor.peer_session_id(node_id),
                     anchor.rtc_stats().admission_reclaimed(),
+                    torn_down.ok,
+                    torn_down
+                        .info
+                        .clone()
+                        .or_else(|| torn_down.error.clone())
+                        .unwrap_or_else(|| "no detail".into()),
                     elapsed.as_secs_f64(),
                     over.info.clone().unwrap_or_default(),
                 ),

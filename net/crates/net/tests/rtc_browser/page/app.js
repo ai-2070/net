@@ -78,6 +78,83 @@ function waitOpen(dc) {
   });
 }
 
+/// Close every handle one attempt owns: the DataChannel, the
+/// trickle socket and the `RTCPeerConnection`.
+///
+/// **R7: a FAILED attempt has to settle its own handles.** A
+/// `doConnect` that threw used to leave all three open, so the
+/// ANCHOR's attempt stayed alive under its own ICE deadline (90 s
+/// in this harness) while the page had already given up after 15.
+/// Sampling "the anchor installed nothing" in that window is a
+/// reading taken while the attempt is still running and still
+/// owns work. A trickle socket that is still LIVE is the handle
+/// the listener reads as "the browser went away" when it closes:
+/// that ends the bootstrap dialog, removing the dialog table
+/// entry, closing the RTC endpoint behind it and releasing the
+/// signalling budget. (On a fast local host the upgrade is often
+/// already refused by the time the browser asks — the
+/// `[trickle …]` lines say which — so the DataChannel and the
+/// PeerConnection are the handles that actually still hold
+/// anything open, and all three are closed here regardless.)
+function settleHandles(label, pc, dc, ws) {
+  const state = [
+    'dc=' + (dc ? dc.readyState : '<none>'),
+    'ws=' + (ws ? ws.readyState : '<none>'),
+    'pc=' + (pc ? pc.connectionState : '<none>'),
+  ].join(' ');
+  log('[page] settling the handles of ' + label + ' (' + state + ')');
+  try {
+    if (dc) dc.close();
+  } catch (e) {
+    log('[page] dc.close: ' + e);
+  }
+  try {
+    if (ws) ws.close();
+  } catch (e) {
+    log('[page] ws.close: ' + e);
+  }
+  try {
+    if (pc) pc.close();
+  } catch (e) {
+    log('[page] pc.close: ' + e);
+  }
+}
+
+/// The handles the attempt currently being built owns. `doConnect`
+/// publishes each one as it is created and [`connectAttempt`]
+/// retires them when the attempt fails, which is the whole point:
+/// the failure can arrive at any one of a dozen awaits, and the
+/// handles have to be settled at every one of them.
+const inflight = { pc: null, dc: null, ws: null };
+
+/// `doConnect`, with a FAILED attempt's handles settled.
+///
+/// A successful attempt hands its handles to `sessions` and keeps
+/// them; nothing here touches those. A failed one owns an accepted
+/// offer, an open DataChannel and a live trickle socket on the
+/// anchor it reached, and the anchor's attempt lives until its own
+/// ICE deadline unless the browser goes away — so the attempt is
+/// retired here, at the browser end, before the runner is told the
+/// attempt failed.
+async function connectAttempt(step, stage) {
+  inflight.pc = null;
+  inflight.dc = null;
+  inflight.ws = null;
+  try {
+    const r = await doConnect(step, stage);
+    inflight.pc = null;
+    inflight.dc = null;
+    inflight.ws = null;
+    return r;
+  } catch (e) {
+    settleHandles(step.session, inflight.pc, inflight.dc, inflight.ws);
+    inflight.pc = null;
+    inflight.dc = null;
+    inflight.ws = null;
+    throw e;
+  }
+}
+
 // ---------------------------------------------------------------------
 // connect: offer -> trickle -> DataChannel -> NKpsk0
 // ---------------------------------------------------------------------
@@ -93,6 +170,12 @@ async function doConnect(step, stage) {
   const pc = new RTCPeerConnection({ iceServers });
   const dc = pc.createDataChannel('net', { ordered: false, maxRetransmits: 0 });
   const q = messageQueue(dc);
+  // R7 settlement: publish the handles as they come into
+  // existence, so `connectAttempt` can retire them if this attempt
+  // fails at any await below. The step loop runs one step at a
+  // time, so there is only ever one attempt being built.
+  inflight.pc = pc;
+  inflight.dc = dc;
 
   // The candidate handler is installed BEFORE `setLocalDescription`,
   // which is what starts gathering. Installing it after the offer
@@ -161,12 +244,14 @@ async function doConnect(step, stage) {
   // history, and this is a bearer credential for a live ICE
   // attempt. The anchor refuses the upgrade without it.
   const ws = new WebSocket(wsUrl, ['net-bootstrap-attempt.' + body.attempt_token]);
+  inflight.ws = ws;
   const pendingOut = [];
   let wsOpen = false;
   const frame = (line, mid) =>
     JSON.stringify({ type: 'candidate', dialog: body.dialog, candidate: line, mid });
   ws.onopen = () => {
     wsOpen = true;
+    log('[trickle ' + step.session + '] open');
     for (const m of pendingOut.splice(0)) ws.send(m);
   };
   ws.onmessage = async (ev) => {
@@ -184,8 +269,16 @@ async function doConnect(step, stage) {
       await log('[page] trickle inbound ignored: ' + e);
     }
   };
+  ws.onerror = () => log('[trickle ' + step.session + '] ERROR (readyState ' + ws.readyState + ')');
+  // Every close, not only the typed refusals: WHEN this socket goes
+  // away decides when the anchor treats the attempt as abandoned,
+  // so a witness reading the anchor's attempt state needs it in the
+  // log (R7 settlement).
   ws.onclose = (ev) => {
-    if (ev.code >= 4400) log('[page] trickle closed with typed code ' + ev.code);
+    log(
+      '[trickle ' + step.session + '] closed code=' + ev.code + ' clean=' + ev.wasClean +
+        (ev.reason ? ' reason=' + ev.reason : ''),
+    );
   };
   sendCandidate = (line, mid) => {
     const m = frame(line, mid);
@@ -251,7 +344,7 @@ async function execute(step) {
           failure: null,
         };
         try {
-          await doConnect(step, stage);
+          await connectAttempt(step, stage);
         } catch (e) {
           stage.failure = e.message || String(e);
         }
@@ -321,7 +414,7 @@ async function execute(step) {
               'authenticating msg2 ever arrived: ' + f,
         };
       }
-      return await doConnect(step, {});
+      return await connectAttempt(step, {});
     }
 
     case 'send': {
@@ -408,23 +501,46 @@ async function execute(step) {
     case 'close': {
       const s = sessions.get(step.session);
       if (!s) return { ok: false, error: 'no session ' + step.session };
-      try {
-        s.dc.close();
-      } catch (e) {
-        await log('[page] dc.close: ' + e);
-      }
-      try {
-        if (s.ws) s.ws.close();
-      } catch (e) {
-        await log('[page] ws.close: ' + e);
-      }
-      try {
-        s.pc.close();
-      } catch (e) {
-        await log('[page] pc.close: ' + e);
-      }
+      settleHandles(step.session, s.pc, s.dc, s.ws);
       sessions.delete(step.session);
       return { ok: true, info: 'closed the browser end of ' + step.session };
+    }
+
+    /// Wait until this session's transport goes DOWN, observed from
+    /// the far end: the DataChannel leaves `open`, or the
+    /// `RTCPeerConnection` leaves a live state — which on this host
+    /// is ICE consent to the anchor's endpoint lapsing, because the
+    /// endpoint behind it stopped answering.
+    ///
+    /// This is the peer-side observation that the anchor's close
+    /// reached the TRANSPORT, which no counter on the anchor
+    /// establishes: `admission_reclaimed` says the reclaim DECISION
+    /// was taken. The page never closes this session itself, so
+    /// whichever of the two states moves, the anchor moved it.
+    case 'expect_closed': {
+      const s = sessions.get(step.session);
+      if (!s) return { ok: false, error: 'no session ' + step.session };
+      const t0 = performance.now();
+      const deadline = Date.now() + step.timeout_ms;
+      const down = () =>
+        s.dc.readyState !== 'open' ||
+        s.pc.connectionState === 'disconnected' ||
+        s.pc.connectionState === 'failed' ||
+        s.pc.connectionState === 'closed';
+      while (Date.now() < deadline && !down()) await sleep(50);
+      const torn = down();
+      const state =
+        'datachannel=' + s.dc.readyState + ', pc=' + s.pc.connectionState +
+        ', ice=' + s.pc.iceConnectionState;
+      return {
+        ok: torn,
+        open_ms: performance.now() - t0,
+        info: state + ' after ' + Math.round(performance.now() - t0) + ' ms',
+        error: torn
+          ? undefined
+          : 'the transport of ' + step.session + ' is still up (' + state +
+            '): the anchor did not tear it down',
+      };
     }
 
     case 'expect': {
