@@ -51,7 +51,7 @@ pub enum AnchorCommand {
     ///
     /// Requires the `webrtc` build: an anchor row a build cannot act
     /// on is a listing with nothing behind it.
-    #[cfg(feature = "webrtc")]
+    #[cfg(feature = "rtc-bootstrap")]
     Ls(LsArgs),
     /// Serve the browser bootstrap listener on this node.
     ///
@@ -62,7 +62,7 @@ pub enum AnchorCommand {
 }
 
 /// `net-mesh anchor ls`.
-#[cfg(feature = "webrtc")]
+#[cfg(feature = "rtc-bootstrap")]
 #[derive(Args, Debug)]
 pub struct LsArgs {
     /// Operator identity file.
@@ -72,6 +72,19 @@ pub struct LsArgs {
     /// Supervisor node to query.
     #[arg(long, default_value_t = crate::prelude::DEFAULT_SUPERVISOR_NODE)]
     pub node: u64,
+
+    /// How long to wait for the attached node to ingest the
+    /// daemon's announcements before answering. An attach is a fresh
+    /// session: the rows arrive as the announcements flood to it.
+    #[arg(long = "wait-secs", default_value_t = 5)]
+    pub wait_secs: u64,
+
+    /// The daemon to attach to. Anchor rows come from
+    /// signature-verified announcements a LIVE mesh has ingested, so
+    /// this listing needs a mesh — the Deck client the CLI builds
+    /// in-process has none (R6).
+    #[command(flatten)]
+    pub remote: crate::commands::aggregator::RemoteAttachArgs,
 }
 
 #[derive(Subcommand, Debug)]
@@ -198,7 +211,7 @@ struct InspectReport {
 }
 
 /// One row of `net-mesh anchor ls`.
-#[cfg(feature = "webrtc")]
+#[cfg(feature = "rtc-bootstrap")]
 #[derive(serde::Serialize)]
 struct AnchorRow {
     node: String,
@@ -226,35 +239,88 @@ pub async fn run(
         AnchorCommand::Credential(CredentialCommand::Inspect(args)) => {
             run_inspect(args, output).await
         }
-        #[cfg(feature = "webrtc")]
+        #[cfg(feature = "rtc-bootstrap")]
         AnchorCommand::Ls(args) => run_ls(args, output, config_path, profile_name).await,
         #[cfg(feature = "rtc-bootstrap")]
         AnchorCommand::Serve(args) => run_serve(*args, output, config_path, profile_name).await,
     }
 }
 
-#[cfg(feature = "webrtc")]
+#[cfg(feature = "rtc-bootstrap")]
 async fn run_ls(
     args: LsArgs,
     output: Option<OutputFormat>,
     config_path: Option<&std::path::Path>,
     profile_name: &str,
 ) -> Result<(), CliError> {
-    use crate::context::{resolve_profile, CliContext};
+    use crate::context::{resolve_profile, resolve_remote_attach, CliContext};
 
     let profile = resolve_profile(config_path, profile_name).await?;
-    let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
-    let rows: Vec<AnchorRow> = ctx
-        .deck()
-        .rtc_anchors()
-        .into_iter()
-        .map(|row| AnchorRow {
-            node: format!("{:#x}", row.node_id),
-            rtc_addr: row.rtc_addr.map(|a| a.to_string()),
-            rtc_bootstrap: row.rtc_bootstrap,
-            noise_pubkey: row.noise_pubkey.as_ref().map(|k| hex_string(k)),
-        })
-        .collect();
+    // **R6: the rows come from a live mesh.** The in-process Deck
+    // client is built with `mesh: None`, so `rtc_anchors()` on it was
+    // structurally empty — the listing could never show an anchor no
+    // matter how many announced. Attaching to the daemon is the same
+    // path every other cross-node listing uses.
+    let remote_node_id = args
+        .remote
+        .remote_node_id
+        .clone()
+        .or_else(|| profile.node_id.clone())
+        .ok_or_else(|| {
+            invalid_args("anchor ls needs --node-id (or a profile default) to address the daemon")
+        })?;
+    let remote = resolve_remote_attach(
+        &profile,
+        args.remote.node_addr.as_deref(),
+        args.remote.node_pubkey.as_deref(),
+        args.remote.remote_node_id.as_deref(),
+        args.remote.psk_hex.as_deref(),
+    )?
+    .ok_or_else(|| {
+        invalid_args(
+            "anchor ls reads announcements from a live mesh: pass --node-addr / \
+             --node-pubkey / --node-id / --psk-hex, or set them in your profile",
+        )
+    })?;
+    let ctx =
+        CliContext::build_with_remote(&profile, args.identity.as_deref(), args.node, false, remote)
+            .await?;
+    // **Ask the node that has ingested the announcements.** The two
+    // address fields are locally-filled fold projections that
+    // deliberately do not travel, so a freshly attached client's own
+    // view is empty by construction — which is precisely how this
+    // listing used to be structurally empty. The anchor answers for
+    // itself over `net.mesh.anchors`.
+    let mesh = ctx.require_mesh()?;
+    let target = crate::parsers::parse_u64_flexible(remote_node_id.as_str())
+        .map_err(|e| invalid_args(format!("--node-id: {e}")))?;
+    let raw = tokio::time::timeout(
+        std::time::Duration::from_secs(args.wait_secs.max(1)),
+        mesh.call_raw_bytes(
+            target,
+            net_sdk::rtc_bootstrap::ANCHOR_DIRECTORY_SERVICE,
+            Vec::new(),
+        ),
+    )
+    .await
+    .map_err(|_| generic("the anchor directory did not answer in time"))?
+    .map_err(|e| {
+        generic(format!(
+            "the anchor directory did not answer ({e}) — is this node running \
+             `net-mesh anchor serve`?"
+        ))
+    })?;
+    let rows: Vec<AnchorRow> =
+        serde_json::from_slice::<Vec<net_sdk::rtc_bootstrap::AnchorDirectoryRow>>(&raw)
+            .map_err(|e| generic(format!("the anchor directory's reply did not parse: {e}")))?
+            .into_iter()
+            .map(|row| AnchorRow {
+                node: row.node,
+                rtc_addr: row.rtc_addr,
+                rtc_bootstrap: row.rtc_bootstrap,
+                noise_pubkey: row.noise_pubkey,
+            })
+            .collect();
     emit_value(OutputFormat::resolve_oneshot(output), &rows)
         .map_err(|e| generic(format!("write anchor ls: {e}")))?;
     Ok(())
@@ -607,6 +673,9 @@ async fn run_serve(
         listener_config.offers_per_ip_per_minute = limit;
     }
 
+    // R6: operator tooling reads the anchors THIS node has ingested.
+    let _directory = net_sdk::rtc_bootstrap::serve_anchor_directory(&mesh)
+        .map_err(|e| generic(format!("serving the anchor directory: {e}")))?;
     let node = std::sync::Arc::clone(mesh.node());
     let handle = serve_bootstrap(node, listener_config)
         .await

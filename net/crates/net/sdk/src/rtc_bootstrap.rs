@@ -1302,3 +1302,58 @@ mod tests {
         assert_eq!(state.key_authorization("tok"), None);
     }
 }
+
+// ===================================================================
+// The anchor directory service (R6)
+// ===================================================================
+
+/// The nRPC service an anchor serves so operator tooling can read
+/// the anchors IT knows about.
+pub const ANCHOR_DIRECTORY_SERVICE: &str = "net.mesh.anchors";
+
+/// One row of [`ANCHOR_DIRECTORY_SERVICE`]'s reply.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnchorDirectoryRow {
+    /// The anchor's node id, hex.
+    pub node: String,
+    /// Its announced public RTC/STUN socket.
+    pub rtc_addr: Option<String>,
+    /// Its announced bootstrap listener URL.
+    pub rtc_bootstrap: Option<String>,
+    /// Its announced Noise static public key, hex.
+    pub noise_pubkey: Option<String>,
+}
+
+/// Serve the anchor directory on `mesh`.
+///
+/// **Why a service rather than a query (R6).** The two address
+/// fields are `#[serde(skip)]` projections in the capability fold —
+/// every node fills them from the announcement it ingested itself,
+/// and they deliberately do not travel in fold envelopes. So a
+/// remote fold query cannot carry them, and a freshly attached
+/// client has not ingested anything yet: the CLI's own view is
+/// empty by construction, which is exactly the defect the review
+/// found. The node that HAS ingested them answers instead.
+///
+/// Read-only, and it exposes nothing an announcement did not already
+/// broadcast in the clear.
+pub fn serve_anchor_directory(mesh: &crate::Mesh) -> Result<crate::mesh_rpc::ServeHandle, String> {
+    let node = Arc::clone(mesh.node());
+    mesh.serve_rpc_raw_bytes(ANCHOR_DIRECTORY_SERVICE, move |_request| {
+        let node = Arc::clone(&node);
+        async move {
+            let rows: Vec<AnchorDirectoryRow> = node
+                .rtc_anchors()
+                .into_iter()
+                .map(|row| AnchorDirectoryRow {
+                    node: format!("{:#x}", row.node_id),
+                    rtc_addr: row.rtc_addr.map(|a| a.to_string()),
+                    rtc_bootstrap: row.rtc_bootstrap,
+                    noise_pubkey: row.noise_pubkey.as_ref().map(|k| hex_of(k)),
+                })
+                .collect();
+            serde_json::to_vec(&rows).map_err(|e| e.to_string())
+        }
+    })
+    .map_err(|e| e.to_string())
+}

@@ -68,9 +68,15 @@ impl AnchorAddresses {
     }
 }
 
-/// Read the anchor rollup from the deck client. Empty without
-/// `webrtc`: the fields do not exist in that build, and a column of
-/// blanks would imply "no anchors" rather than "not this build".
+/// Read the anchor rollup from the deck client.
+///
+/// **R6: this is only ever non-empty when the Deck's client has a
+/// mesh.** `DeckClient::rtc_anchors` returns nothing when it was
+/// built without one, which is the CLI's old failure mode; Deck
+/// runs in-process against the node it observes, so its client does
+/// have one. Empty also without `webrtc`, where the fields do not
+/// exist at all — in both cases the column renders `—` rather than
+/// implying "no anchors".
 fn collect_rtc_anchors(
     #[cfg_attr(not(feature = "webrtc"), allow(unused_variables))] deck: &Arc<DeckClient>,
 ) -> std::collections::BTreeMap<u64, AnchorAddresses> {
