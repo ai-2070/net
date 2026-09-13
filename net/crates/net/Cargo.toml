@@ -789,10 +789,27 @@ codegen-units = 1
 # `abort` via `[profile.release]`.
 panic = "unwind"
 
-# Fast compile times for development
+# Fast compile times for development.
+#
+# `debug = "line-tables-only"` rather than `true`: this workspace links ~170
+# integration test binaries against one large crate, and full DWARF/PDB is the
+# dominant cost in both link time and artifact mass. Measured on a 24-core
+# workstation (rustc 1.98.1, warm lib, `tests/three_node_integration.rs`):
+# relink 3.18 s -> 1.68 s (-47%), and `target/debug/deps` carried 6.9 GB of
+# `.pdb` against 667 MB of executables before the change. Test EXECUTION is
+# unchanged (5.21 s -> 5.21 s for the same 66 tests), and panics still resolve
+# to file:line, so no assertion or witness changes meaning.
+#
+# What is lost: variable inspection in a debugger. When you need it, override
+# per invocation without editing this file:
+#
+#   cargo --config 'profile.dev.debug=2' test --lib --features "..."
+#   CARGO_PROFILE_DEV_DEBUG=2 cargo nextest run --test <name>
+#
+# (Both rebuild the crates they touch, so use them on a focused target.)
 [profile.dev]
 opt-level = 0
-debug = true
+debug = "line-tables-only"
 
 # Release with debug symbols for profiling
 [profile.release-with-debug]

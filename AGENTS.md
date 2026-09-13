@@ -30,6 +30,14 @@ go test ./...          # from go/ — cgo must actually be enabled (see Bindings
 npm run check          # from web/ — docs links + releases sync + types
 ```
 
+`TESTS.md` (repo root) is the guide to running tests without wasting time —
+notably the `cargo t` / `cargo tl` aliases, which pin ONE feature graph.
+Alternating `--features` sets is the single most expensive habit here: cargo
+fingerprints per set, so each new one rebuilds the root crate from scratch.
+Measurements behind that (and behind the dev profile's
+`debug = "line-tables-only"`) are in
+`docs/internal/misc/PERF_AUDIT_2026_09_13_TEST_EXECUTION.md`.
+
 ### Pre-push checklist (Rust)
 
 `cargo check` plus a `--lib` clippy is **not** a green branch — several CI lints only fire on targets those commands never build (that exact gap has let three different CI failures through in a single day: a cfg'd test that never compiled, a lint that fires only on the lib-test target, and a rustdoc link error). Before calling a branch ready:

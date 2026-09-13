@@ -99,3 +99,22 @@ retries = 0
 [[profile.default.overrides]]
 filter = 'binary(rtc_loopback) or binary(rtc_backpressure) or binary(rtc_repairs) or binary(rtc_routed_restore) or binary(rtc_signalling) or binary(rtc_admission) or binary(rtc_install_race) or binary(rtc_reclaim) or binary(rtc_classifier) or binary(rtc_admission_probes)'
 retries = 0
+
+# Machine-readable results for the named-witness gates.
+#
+# Several CI steps pin security- and ordering-critical tests BY NAME and must
+# prove each one ran and passed. The original shape proved that by re-invoking
+# the runner once per name — 27 + 22 in `rust-sdk-tests`, ~33 in
+# `integration-cortex` — after the suite had already executed those exact
+# tests in the same job. With this file written, one run produces a result set
+# the gate can verify instead (`.github/scripts/check-witness-results.py`),
+# and the verification is STRICTER than the fan-out was: JUnit records a
+# retried-then-passed test as `<flakyFailure>`, so "it went green on attempt
+# two" is visible and rejected, which a per-name re-run could not see.
+#
+# On `[profile.default]` deliberately, not a dedicated profile: per-profile
+# `[[overrides]]` do NOT carry across profiles, so a witness profile would
+# silently drop the `retries = 0` rules above — the opposite of the property
+# these gates exist to hold. Written to `target/nextest/default/junit.xml`.
+[profile.default.junit]
+path = "junit.xml"

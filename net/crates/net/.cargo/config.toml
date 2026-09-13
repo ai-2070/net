@@ -41,6 +41,28 @@
 # LTO and codegen-units are already set in Cargo.toml
 # Additional flags can be added here if needed
 
-# Alias for running benchmarks with native CPU
+# Aliases.
+#
+# `t` / `tl` exist to keep a local session on ONE feature graph. Cargo
+# fingerprints per feature set, so alternating between the sets CI uses
+# (`fixtures`, `fixtures port-mapping`, `batched-ingress`, `netdb cli`,
+# `cortex tool fixtures`, `$UNIT_FEATURES`) recompiles the root crate from
+# scratch on every switch — measured at 87-98 s per switch on a 24-core box,
+# against 2 s for a warm re-run and 9 s for a lib edit. Switching back is
+# cheap (~12 s) because the previous fingerprint survives, so the cost is
+# paid per NEW set, and a day of hopping between four sets pays it repeatedly.
+#
+# The set below is the union of every graph CI's integration families use, so
+# one local fingerprint covers the whole integration surface. It is WIDER
+# than any single CI job: feature-gated code that only compiles with a
+# feature OFF will not be caught here (that is what the
+# `narrow-feature-check` job is for), and `webrtc` is deliberately absent
+# because it is the one feature with a C toolchain dependency.
+#
+#   cargo t --test three_node_integration
+#   cargo t -E 'binary(subnet_grant)'
+#   cargo tl org_routing_wiring_tests
 [alias]
 bench-native = "bench --release"
+t = "nextest run --no-fail-fast --no-tests=fail --features fixtures,port-mapping,batched-ingress,netdb,cli,tool,regex"
+tl = "nextest run --no-fail-fast --no-tests=fail --lib --features net,redex,redex-disk,cortex,netdb,meshdb,meshos,dataforts,nat-traversal,port-mapping,tool,batched-ingress,cli,regex"
