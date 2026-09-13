@@ -225,33 +225,45 @@ the env hash is part of both the primary key and the restore prefix.
 
 ---
 
-## 6. Defects found while measuring
+## 6. Defects found while measuring (both since FIXED)
 
-**Narrow feature configurations do not compile.** `cargo check --lib
---no-default-features --features <set>`:
+**Narrow feature configurations did not compile.** `cargo check --lib
+--no-default-features --features <set>`, as first measured:
 
 | set | result |
 |---|---|
-| `<none>`, `net tool`, `cortex`, `netdb`, `meshdb`, `meshos` | builds |
-| `net`, `net nat-traversal`, `net batched-ingress`, `net regex`, `redex`, `redex redex-disk`, `dataforts` | **fails** |
+| `<none>`, `net tool`, `cortex`, `netdb`, `meshdb`, `meshos` | built |
+| `net`, `net nat-traversal`, `net batched-ingress`, `net regex`, `redex`, `redex redex-disk`, `dataforts` | **failed** |
 
-One defect, two sites, shared by every `net`-without-`cortex` selection:
-`src/adapter/net/channel/config.rs:13` imports
-`crate::adapter::net::mesh_rpc::ServeError` while `mesh_rpc` is gated
-`#[cfg(feature = "cortex")]` (`src/adapter/net/mod.rs:70`), and
-`src/adapter/net/mesh.rs:1674` names
-`crate::adapter::net::cortex::RpcInboundDispatcher` unconditionally
-(`mod.rs:53`). The `redex`/`dataforts` rows add `LocalServiceRegistry` and
-`MeshNode::rpc_local_services` on top of the same root cause. The
-`narrow-feature-check` CI job records this as a ratchet: the six that build
-must keep building, the seven that fail must keep failing *for that reason*.
+One defect, four sites, all the same shape — an nRPC surface named from code
+that is not itself nRPC-gated:
 
-**Four integration test targets do not compile on this branch** (as of
+- `channel/config.rs` imported `mesh_rpc::ServeError` unconditionally, while
+  `mesh_rpc` is `#[cfg(feature = "cortex")]` (`adapter/net/mod.rs`);
+- `mesh.rs`'s `RpcInboundDispatcherMap` alias named
+  `cortex::RpcInboundDispatcher` with no gate, though every initialisation of
+  the fields it types was already cortex-gated;
+- `DispatchCtx::rpc_local_services` was gated on `redex` while its type
+  `LocalServiceRegistry` is gated on `cortex` (`cortex` implies `redex`, not
+  the reverse) — that is the `redex` row;
+- `dataforts::blob::transfer_rpc`, an nRPC service definition, was exposed
+  from a feature that does not imply `cortex` — that is the `dataforts` row.
+
+Fixed in `2a5ac182a`: the four sites carry the gate of the surface they name,
+`capability_is_locally_private` answers `false` by construction without
+`cortex` (a node with no nRPC serves nothing privately, and the sensing plane
+still has to ask), and all thirteen configurations are now must-build rows in
+`narrow-feature-check`. The ratchet step that asserted the seven kept failing
+is gone with the defect.
+
+**Four integration test targets did not compile on this branch** (as of
 `caed88ac9`): `aggregator_fold_query`, `gang_alloc_witness`, `gang_claim_node`,
 `sensing_scheduler_bridge` — `missing fields rtc_addr and rtc_bootstrap in
 initializer of CapabilityMembership` (fields are unconditional at
-`behavior/capability.rs:2425,2434`). Consequence for the local loop: any broad
-`cargo nextest run` aborts before running anything.
+`behavior/capability.rs:2425,2434`). `54befc493` had repaired the ~20
+`#[cfg(test)]` constructors but not these four integration ones. Consequence
+for the local loop: any broad `cargo nextest run` aborted before running
+anything. Fixed in `a70b33f17`; the four targets run green (17 tests).
 
 ---
 
@@ -273,7 +285,7 @@ initializer of CapabilityMembership` (fields are unconditional at
 
 ## 8. Open, not done
 
-- The library defect in §6 (a real downstream-visible packaging bug).
+- Nothing from §6 — both defects are fixed (`a70b33f17`, `2a5ac182a`).
 - Sleep conversion (§4): ~31–36 s of nominal sleep is convertible with zero
   witness risk; the rest needs config knobs, not smaller literals.
 - CI wall clock (§5): the four ceilings above 10 min are each dominated by one
