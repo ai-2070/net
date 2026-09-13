@@ -82,8 +82,14 @@ impl AnchorAddresses {
 /// that means something else.
 #[derive(Clone, Debug)]
 pub struct AnchorRollup(
-    /// What [`DeckClient::rtc_anchors`] returned, keyed by node
-    /// id — or `None` on a build that cannot read it.
+    /// What `DeckClient::rtc_anchors` returned, keyed by node id —
+    /// or `None` on a build that cannot read it.
+    ///
+    /// Not an intra-doc link on purpose: that accessor is
+    /// `#[cfg(feature = "webrtc")]` on the core crate, so it does
+    /// not exist in the documentation configuration CI builds
+    /// (`cargo doc -p net-deck --no-deps`, default features) and a
+    /// link to it is a hard error there.
     Option<std::collections::BTreeMap<u64, AnchorAddresses>>,
 );
 
