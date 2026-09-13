@@ -61,12 +61,12 @@ use std::time::Duration;
 use bytes::Bytes;
 // The workspace disallows `std::sync::Mutex::lock`
 // (clippy `disallowed_methods`): every lock here is parking_lot's.
-use parking_lot::Mutex;
 use net::adapter::net::rtc::{connect_rtc_loopback, RtcConfig};
 use net::adapter::net::{
     EntityKeypair, MeshNode, MeshNodeConfig, MultiHopPacketBuilder, NetProxy, PeerAddr,
     ProxyConfig, RoutingHeader, SocketBufferConfig, ROUTING_HEADER_SIZE,
 };
+use parking_lot::Mutex;
 use tokio::net::UdpSocket;
 
 const PSK: [u8; 32] = [0x5Cu8; 32];

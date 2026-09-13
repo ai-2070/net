@@ -2253,13 +2253,21 @@ jobs:
       - name: Run Rust SDK tests (includes mesh_stream_backpressure, mesh_rpc_bidi_typed, tool_*, sensing_provider, sensing_consumer, org_exact_sensing)
         run: |
           set -uo pipefail
-          rm -f target/nextest/default/junit.xml
+          # This job's steps run from `net/crates/net/sdk`, but nextest writes
+          # its JUnit under the WORKSPACE target directory
+          # (`net/crates/net/target`) — a member crate has no target dir of
+          # its own. A relative `target/nextest/...` here names a path that
+          # never exists, which is why the artifact was reported missing
+          # rather than the run being reported bad.
+          JUNIT="$(cargo metadata --format-version 1 --no-deps \
+            | python3 -c 'import json,sys;print(json.load(sys.stdin)["target_directory"])')/nextest/default/junit.xml"
+          rm -f "$JUNIT"
           cargo nextest run --no-fail-fast --no-tests=fail --features "net cortex dataforts testing compute nat-traversal port-mapping aggregator tool macros fixtures"
           st=$?
           # PRESERVE this run's result set before any later step's run
           # overwrites it. The named-witness steps below verify against this
           # artifact instead of re-executing each witness by name.
-          cp target/nextest/default/junit.xml "$RUNNER_TEMP/sdk-suite-junit.xml"
+          cp "$JUNIT" "$RUNNER_TEMP/sdk-suite-junit.xml"
           exit "$st"
 
       # === S1: the CONSUMER observation lifecycle ==========================
@@ -2413,7 +2421,10 @@ jobs:
           # each name to appear exactly once as a PASSED case, which the old
           # five separate runs established at the cost of five build-graph
           # walks.
-          rm -f target/nextest/default/junit.xml
+          # Same workspace-target rule as the suite step above.
+          JUNIT="$(cargo metadata --format-version 1 --no-deps \
+            | python3 -c 'import json,sys;print(json.load(sys.stdin)["target_directory"])')/nextest/default/junit.xml"
+          rm -f "$JUNIT"
           cargo nextest run --color never --no-fail-fast --no-tests=fail \
             --retries 0 --features "net cortex fixtures" --lib \
             -E 'test(=org::tests_call::authority_movement_inside_sensed_planning_is_still_fenced)
@@ -2423,7 +2434,7 @@ jobs:
                 + test(=org::tests_call::a_refused_wave_paces_but_a_restored_authority_does_not_wait)' \
             || { echo "::error::the OA-6 planning-unit witnesses did not pass"; exit 1; }
           python3 "$GITHUB_WORKSPACE/.github/scripts/check-witness-results.py" \
-            --junit target/nextest/default/junit.xml \
+            --junit "$JUNIT" \
             --min 5 \
             --required-file - <<'REQUIRED'
           org::tests_call::authority_movement_inside_sensed_planning_is_still_fenced
