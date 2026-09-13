@@ -2,6 +2,9 @@
 # directory. CI builds these; the repo never carries them.
 leaf/target/
 leaf/dist/
+# `wasm-bindgen --out-dir` for the page; the runner regenerates it on
+# every run, and CI builds it from source.
+page/dist/
 runner/target/
 work/
 logs/
