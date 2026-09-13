@@ -30,6 +30,18 @@ synthesised placeholder.
 | `805acc2c0` | 8 — the F7 proxy boundary, witnessed |
 | `19c626499` | 6 — the anchor-behind-NAT `rtc_addr` natsim scenario |
 | `31968594d` | lint follow-up for the three new surfaces |
+| `9bfb86bb7` | CI: the two new RTC binaries get floors and pinned names |
+| `54befc493` | the fold's new projections reach every in-crate test constructor |
+| `caed88ac9` | 3+4+5 — the Chromium harness: the six §12 witnesses with a real browser, the MITM witness, the mDNS measurement, and the `webrtc-browser` CI job |
+| `549e97f15` | this report |
+| `32b91909a` | the Deck ANCHOR type no longer splits a doc comment (`empty_line_after_doc_comments`, denied) |
+
+Interleaved on the same branch by the owner while 4b was in flight —
+listed so the history reads correctly, not claimed as 4b work:
+`fd3c03f09` (one feature graph per test family), `a70b33f17` (the
+fold projections' last four constructors), `2a5ac182a` (a bare-mesh
+build compiles again — nRPC surfaces cortex-gated), `4f07ae880`
+(audit-defect record).
 
 Slices 3, 4 and 5 (the Chromium harness, the MITM witness and the
 mDNS measurement) are one body of work in `tests/rtc_browser/`; see
@@ -41,13 +53,13 @@ mDNS measurement) are one body of work in `tests/rtc_browser/`; see
 
 | Stage 4 exit criterion | Status |
 |---|---|
-| Bootstrap credential → offer/answer → DataChannel → Noise against the pinned key → enrollment, with a scripted Chromium client | §6 |
-| MITM witness, correctly shaped (substitute the responder, not a field) | §6 |
+| Bootstrap credential → offer/answer → DataChannel → Noise against the pinned key → enrollment, with a scripted Chromium client | **Met** — real Chromium 149, executed twice on this host (§6.1) |
+| MITM witness, correctly shaped (substitute the responder, not a field) | **Met** — a second anchor with a fresh keypair; inverse RED (§6.2) |
 | Anchor behind simulated NAT publishes a working `rtc_addr` | Scenario landed; **not executed** — no netns on this host (§7) |
 | Bootstrap budget rejections are typed and fast | **Met** — `BootstrapRefusal` with per-cause HTTP status / WS close code, per-source-IP ceiling checked before the credential |
-| The six §12 witnesses | Native ones remain green from 4a; the browser-driven replacements are §6 |
+| The six §12 witnesses | **Met with a real browser** (§6.1); 4a's native ones remain green |
 | `rtc_bootstrap` names a real listener | **Met** (`RtcConfig::bootstrap_url`) |
-| mDNS host-candidate question answered with a measurement | §6 |
+| mDNS host-candidate question answered with a measurement | **Met, and it narrows the plan**: (a) peer-reflexive alone; (b) made things worse here (§6.3) |
 | Browser-trusted TLS, no certificate-ignore flag in CI | **Met** — operator PEM and ACME HTTP-01; a real listener + verifying client is witnessed, and its paired negative (empty root store) fails |
 | Explicit cross-origin policy, `Origin` validated on the WebSocket | **Met** |
 | `net-mesh anchor` CLI + Deck surfaces anchors | **Met** |
@@ -325,3 +337,31 @@ truncation test cuts at every length.
 | Default-build boundary | `bootstrap_dep_boundary` holds it by manifest; the core declares no HTTP dependency at all |
 
 Per-binary counts vs CI floors: 5 / 7 / 22 / 4 / 8 / 5 / 2 / 12 / 26 / 11 / 2 / 2 = 106; every floor met, the two new binaries pinned.
+
+---
+
+## 10. CI at the time of writing
+
+Local validation is §9. CI on the branch is a separate fact and is
+recorded as one:
+
+- The 4a second-round head `51e1e011b` is **green** — that is the
+  base 4b is stacked on.
+- The 4b heads have gone red twice, both times for a *compile*
+  break the local `--lib`-shaped checks do not see, and both times
+  fixed rather than waived:
+  1. `E0063` — the two new `CapabilityMembership` fold projections
+     are two more fields on a struct that ~25 `#[cfg(test)]` sites
+     construct literally, several of them in `tests/` and
+     `benches/` targets that `cargo check --lib` never builds
+     (`54befc493`, and the owner's `a70b33f17` for the last four).
+     This is the same class of gap AGENTS.md's pre-push checklist
+     names, and it caught the same way twice in one stage.
+  2. `clippy::empty_line_after_doc_comments` in Deck — inserting a
+     type between an enum's doc comment and the enum
+     (`32b91909a`).
+- The `webrtc-browser` job has **never executed**; see §7 gap 5.
+
+The final CI verdict at head `32b91909a` is pending at the time of
+writing and is the one that matters — nothing in this report should
+be read as claiming a green branch until that run reports.
