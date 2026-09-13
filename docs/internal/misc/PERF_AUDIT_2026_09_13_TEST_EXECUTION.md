@@ -283,6 +283,41 @@ anything. Fixed in `a70b33f17`; the four targets run green (17 tests).
   an identical env hash and an identical build, with one designated saver each
   (§5.4).
 
+## 7b. The edit-verify loop: what each rung costs
+
+Measured after the changes in §7, warm tree, same machine. This is the table
+behind `TESTS.md`'s ladder, and the answer to "why does re-verifying feel
+expensive".
+
+| rung | cost |
+|---|---|
+| `cargo check --lib`, no change | 5 s |
+| `cargo check --lib`, after touching one source file | 5 s |
+| targeted run, 3 integration binaries (15 tests) | 18 s |
+| targeted run, one unit module (54 of 5781 tests) | 2 s |
+| **whole in-source unit suite** (`cargo tl`, 5779 tests) | **49 s** (28.9 s executing) |
+| **whole integration family** (47 binaries, 469 tests), warm | **16 s** (11.2 s executing) |
+| one feature graph the session has not built yet | 87–98 s |
+
+The shape of the problem: running *everything* on a warm tree costs about a
+minute. Acquiring one more feature graph costs more than that on its own, and
+a loop that alternates graphs pays it repeatedly. So the saving is not in
+running fewer tests — it is in (a) owning few fingerprints, (b) not
+re-running a suite whose result you already have, and (c) using
+`cargo check --lib` as the inner loop, which is an order of magnitude cheaper
+than any test run.
+
+`codegraph affected` was evaluated as a selection tool and mostly does not
+narrow: `traversal/portmap/natpmp.rs` → 2 test files, but
+`dataforts/blob/cdc.rs` → 421 and `behavior/org_sensing_demand.rs` → 403,
+because nearly every test reaches the mesh. Correct, and useless as a filter
+for central code; selection by CI family is the practical substitute.
+
+Token cost matters as much as seconds for an agent loop, hence the `tf` /
+`tfl` aliases: `--status-level fail --failure-output final` turns a 15-test
+run from 15 progress lines plus a summary into 4 lines, and fail-fast stops
+at the first failure rather than reporting every consequence of it.
+
 ## 8. Open, not done
 
 - Nothing from §6 — both defects are fixed (`a70b33f17`, `2a5ac182a`).

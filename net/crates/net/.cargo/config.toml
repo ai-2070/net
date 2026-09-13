@@ -62,7 +62,16 @@
 #   cargo t --test three_node_integration
 #   cargo t -E 'binary(subnet_grant)'
 #   cargo tl org_routing_wiring_tests
+#
+# `tf` / `tfl` are the same two graphs for a TIGHT loop — an edit-run cycle,
+# a bisect, an agent working through a change. They stop at the first
+# failure instead of running the rest, and print only failures plus the
+# summary. That is the right default when you are iterating (you are going
+# to fix the first failure anyway) and the wrong one before you push, where
+# you want the full picture: use `t` / `tl` for that.
 [alias]
 bench-native = "bench --release"
 t = "nextest run --no-fail-fast --no-tests=fail --features fixtures,port-mapping,batched-ingress,netdb,cli,tool,regex"
 tl = "nextest run --no-fail-fast --no-tests=fail --lib --features net,redex,redex-disk,cortex,netdb,meshdb,meshos,dataforts,nat-traversal,port-mapping,tool,batched-ingress,cli,regex"
+tf = "nextest run --no-tests=fail --status-level fail --failure-output final --features fixtures,port-mapping,batched-ingress,netdb,cli,tool,regex"
+tfl = "nextest run --no-tests=fail --status-level fail --failure-output final --lib --features net,redex,redex-disk,cortex,netdb,meshdb,meshos,dataforts,nat-traversal,port-mapping,tool,batched-ingress,cli,regex"

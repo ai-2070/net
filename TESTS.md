@@ -77,6 +77,49 @@ change that hangs a test fails by name instead of stalling the run.
   dependencies with `[profile.dev.package."*"]`, and swapping in a faster
   linker. Neither pays for itself. Don't re-litigate them without new numbers.
 
+## Working in a loop (humans, and agents especially)
+
+The expensive habit is not "running too many tests" — a warm run of a whole
+integration family, or of the entire in-source unit suite, is quick. It is
+re-entering the *compile* side over and over: a new feature graph, a fresh
+target directory, or a sequence of differently-flagged invocations where one
+would have done. Work the cheap end of the ladder and escalate only when the
+step below has something to say:
+
+1. **`cargo check --lib`** after a source edit. It answers "does this still
+   compile" for the price of metadata, no linking, and it is what catches the
+   majority of in-progress mistakes.
+2. **The narrowest test selection that covers the change** —
+   `cargo tf --test <binary>` or `cargo tf -E 'binary(a) + binary(b)'`, or
+   `cargo tfl <module path>` for in-source units. `tf`/`tfl` stop at the first
+   failure and print only failures, which is what you want while iterating.
+3. **One full family or the full unit suite, once, at the end** — `cargo t` /
+   `cargo tl`, which run everything and report everything.
+
+Rules that keep the ladder cheap:
+
+- **Never paste a `--features` list out of `ci.yml` into a local run.** That
+  is how a session acquires a fifth feature graph and pays a full root-crate
+  rebuild for it. The two aliases exist precisely so a session owns two
+  fingerprints, both warm.
+- **One invocation per checkpoint, not four.** Each `cargo nextest run` walks
+  the build graph; four sequential narrow runs cost more than one run naming
+  four binaries, and if they disagree on features they cost a rebuild each.
+- **Do not re-run a suite to confirm it passed.** The run you already have is
+  the evidence. Re-running to be sure is the single most common way an
+  edit-verify loop doubles its own cost.
+- **Keep the target directory.** `cargo clean` throws away every fingerprint
+  in it; almost nothing is worth that. Keep disk headroom instead.
+
+### Choosing what to run
+
+Pick by surface, not by intuition: the `integration-*` jobs in `ci.yml` group
+the integration binaries by the area they exercise, so the family that pins
+your file's tests is the set worth running. `codegraph affected <file>` helps
+only for genuine leaf modules — for anything central (the mesh, the
+capability layer) it correctly answers "almost everything", which is true and
+useless as a filter.
+
 ## Batches, worktrees and disk
 
 For a batch of RED/GREEN mutations, reuse one detached worktree and one target
