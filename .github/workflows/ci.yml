@@ -2507,6 +2507,46 @@ jobs:
           done
           echo "SDK RTC enrollment: both witnesses green"
 
+      # === Stage 4b: the bootstrap listener's witnesses ===================
+      #
+      # `rtc_bootstrap_listener` needs the SDK's `rtc-bootstrap`
+      # feature (axum + rustls), which no other step turns on, so
+      # without this step the whole binary compiles to nothing —
+      # the same silent-skip hazard the RTC step above exists for.
+      #
+      # The six `kyra_*` names are the Stage 4b review's probes,
+      # landed verbatim. They reproduced 0/6 before the repairs and
+      # are pinned individually: a repair that regresses must fail
+      # here by name, not shrink the roster.
+      - name: SDK bootstrap listener (Stage 4b)
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          FEATURES="rtc-bootstrap"
+          REQUIRED="
+            kyra_uncredentialed_websocket_cannot_retire_another_offer
+            kyra_bootstrap_candidates_must_keep_the_native_size_bound
+            kyra_bootstrap_candidates_must_keep_the_native_frame_budget
+            kyra_expired_credential_holder_cannot_extend_its_own_deadlines
+            kyra_acme_cache_must_match_the_requested_domain
+            kyra_offer_debug_must_not_expose_the_encoded_credential
+            an_http_offer_reaches_the_production_dialog_path_and_is_answered
+            the_listener_serves_browser_trusted_tls_and_a_client_verifies_it
+            the_trickle_socket_refuses_a_foreign_origin_before_upgrading
+          "
+          out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                  --retries 0 --features "$FEATURES" --test rtc_bootstrap_listener \
+                  --test bootstrap_dep_boundary 2>&1) \
+            || { printf '%s\n' "$out"; echo "::error::the Stage 4b listener witnesses did not pass"; exit 1; }
+          printf '%s\n' "$out" | tail -3
+          for required in $REQUIRED; do
+            single=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                       --retries 0 --features "$FEATURES" --test rtc_bootstrap_listener \
+                       -E "test(=$required)" 2>&1) \
+              || { printf '%s\n' "$single"; echo "::error::$required did not run and pass as exactly one test"; exit 1; }
+          done
+          echo "Stage 4b listener: all pinned witnesses green"
+
       # The SDK's `webrtc` surface under the same lint bar as the rest of
       # the crate, and its rustdoc — neither was reachable from any step's
       # feature list before Stage 4a.
