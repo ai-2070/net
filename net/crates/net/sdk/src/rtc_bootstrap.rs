@@ -58,7 +58,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{ConnectInfo, Query, State};
+use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -265,6 +265,16 @@ pub struct OfferRequest {
 /// `POST /rtc/offer` success body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OfferResponse {
+    /// **The attempt token** (R1): 32 random bytes, hex, minted for
+    /// THIS accepted offer and bound to its `(node, dialog,
+    /// incarnation)`. The trickle socket will not upgrade without
+    /// it, so a second client that guesses the dialog id cannot
+    /// trickle into, or retire, someone else's live attempt.
+    ///
+    /// It is carried as the WebSocket **subprotocol**, never in a
+    /// URL: a query string lands in proxy and browser history, and
+    /// this is a bearer credential for an in-flight ICE attempt.
+    pub attempt_token: String,
     /// The dialog id the anchor assigned; the browser passes it to
     /// the trickle socket.
     pub dialog: u64,
@@ -332,6 +342,70 @@ impl BootstrapHandle {
     }
 }
 
+/// One accepted offer's authorization to trickle (R1).
+///
+/// The token is the identity: `(node, dialog)` are caller-visible
+/// and guessable, `incarnation` distinguishes two attempts that
+/// reuse a dialog id, and the token itself is what a socket must
+/// present. Nothing here is derived from anything the caller chose.
+#[derive(Debug, Clone)]
+struct Attempt {
+    node_id: u64,
+    dialog: u64,
+    incarnation: u64,
+    /// The pre-authentication identity this attempt's ingress is
+    /// accounted against (R2): the token's own incarnation, NOT the
+    /// unverified `node_id` the caller claimed.
+    budget_id: u64,
+}
+
+/// The live attempts, keyed by token.
+#[derive(Debug, Default)]
+struct Attempts {
+    by_token: Mutex<HashMap<String, Attempt>>,
+}
+
+impl Attempts {
+    /// Mint a token for this attempt. The **budget id is derived
+    /// from the token's own random bytes** (R2): uniform, unrelated
+    /// to anything the caller sent, and therefore not another peer's
+    /// node id.
+    fn mint(&self, node_id: u64, dialog: u64, incarnation: u64) -> Option<(String, u64)> {
+        let mut raw = [0u8; 32];
+        if getrandom::fill(&mut raw).is_err() {
+            // A predictable attempt token is a credential anyone can
+            // guess. Refuse to mint rather than mint a weak one.
+            return None;
+        }
+        let budget_id = u64::from_le_bytes(raw[..8].try_into().ok()?);
+        let token: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+        self.by_token.lock().insert(
+            token.clone(),
+            Attempt {
+                node_id,
+                dialog,
+                incarnation,
+                budget_id,
+            },
+        );
+        Some((token, budget_id))
+    }
+
+    /// The attempt this token authorizes, if it names exactly this
+    /// `(node, dialog)`. A token for another tuple is as good as no
+    /// token.
+    fn authorize(&self, token: &str, node_id: u64, dialog: u64) -> Option<Attempt> {
+        let guard = self.by_token.lock();
+        let attempt = guard.get(token)?;
+        (attempt.node_id == node_id && attempt.dialog == dialog).then(|| attempt.clone())
+    }
+
+    /// Retire a token; `true` when this call owned the removal.
+    fn retire(&self, token: &str) -> bool {
+        self.by_token.lock().remove(token).is_some()
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     node: Arc<MeshNode>,
@@ -340,6 +414,7 @@ struct AppState {
     rate: Arc<RateLimiter>,
     acme: AcmeState,
     dialogs: Arc<AtomicU64>,
+    attempts: Arc<Attempts>,
 }
 
 /// Fixed-window per-source-IP counter. Deliberately not a token
@@ -399,6 +474,7 @@ pub fn bootstrap_router(node: Arc<MeshNode>, config: &BootstrapConfig) -> Router
         rate: Arc::new(RateLimiter::new(config.offers_per_ip_per_minute)),
         acme: config.acme.clone(),
         dialogs: Arc::new(AtomicU64::new(1)),
+        attempts: Arc::new(Attempts::default()),
     };
     // The trickle socket's `Origin` check is a LAYER, not a line in
     // the handler: an axum extractor rejection (`426`, "not a
@@ -406,18 +482,50 @@ pub fn bootstrap_router(node: Arc<MeshNode>, config: &BootstrapConfig) -> Router
     // before the check ran, and a refusal has to name the reason it
     // actually is.
     let ws_origins = Arc::clone(&state.ws_allowed_origins);
+    let ws_attempts = Arc::clone(&state.attempts);
     let trickle = get(get_trickle).layer(axum::middleware::from_fn(
         move |request: axum::extract::Request, next: axum::middleware::Next| {
             let allowed = Arc::clone(&ws_origins);
+            let attempts = Arc::clone(&ws_attempts);
             async move {
-                if origin_allowed(request.headers(), &allowed) {
-                    next.run(request).await
-                } else {
-                    refuse(
+                if !origin_allowed(request.headers(), &allowed) {
+                    return refuse(
                         BootstrapRefusal::ForbiddenOrigin,
                         "this origin may not open the trickle socket",
-                    )
+                    );
                 }
+                // **R1: the attempt token, decided at the upgrade.**
+                // In the layer rather than the handler for the same
+                // reason the origin check is: an axum extractor
+                // rejection would otherwise answer first, and a
+                // socket that upgrades and is then closed has
+                // already held anchor state. `(node, dialog)` are
+                // guessable; the token is not.
+                let Some((node_id, dialog)) = trickle_ids(request.uri()) else {
+                    return refuse(
+                        BootstrapRefusal::MalformedCredential,
+                        "the trickle socket needs node_id and dialog",
+                    );
+                };
+                let Some(token) = presented_token(request.headers()) else {
+                    return refuse(
+                        BootstrapRefusal::ForbiddenOrigin,
+                        "the trickle socket requires the attempt token from \
+                         POST /rtc/offer, presented as the \
+                         `net-bootstrap-attempt.<token>` subprotocol",
+                    );
+                };
+                let Some(attempt) = attempts.authorize(&token, node_id, dialog) else {
+                    return refuse(
+                        BootstrapRefusal::UnknownDialog,
+                        "no such attempt for that token, node and dialog",
+                    );
+                };
+                let mut request = request;
+                request
+                    .extensions_mut()
+                    .insert(Authorized { attempt, token });
+                next.run(request).await
             }
         },
     ));
@@ -661,9 +769,22 @@ async fn post_offer(
     }
 
     let dialog = state.dialogs.fetch_add(1, Ordering::Relaxed);
+    // The incarnation is this listener's own counter for the
+    // attempt, so two attempts that reuse a dialog id are still
+    // distinct identities (R1).
+    let incarnation = state.dialogs.fetch_add(1, Ordering::Relaxed);
+    // Mint FIRST: the token's random bytes are what the offer's
+    // signalling budget is charged to (R2), so it has to exist
+    // before the offer is accepted.
+    let Some((attempt_token, budget_id)) = state.attempts.mint(node_id, dialog, incarnation) else {
+        return refuse(
+            BootstrapRefusal::OfferRefused,
+            "the anchor could not mint an attempt token",
+        );
+    };
     match state
         .node
-        .accept_bootstrap_offer(node_id, dialog, request.sdp)
+        .accept_bootstrap_offer_keyed(budget_id, node_id, dialog, request.sdp)
         .await
     {
         Ok(sdp) => {
@@ -675,13 +796,17 @@ async fn post_offer(
                 "bootstrap offer accepted"
             );
             Json(OfferResponse {
+                attempt_token,
                 dialog,
                 sdp,
                 candidate,
             })
             .into_response()
         }
-        Err(e) => refuse(BootstrapRefusal::OfferRefused, e.to_string()),
+        Err(e) => {
+            state.attempts.retire(&attempt_token);
+            refuse(BootstrapRefusal::OfferRefused, e.to_string())
+        }
     }
 }
 
@@ -718,25 +843,77 @@ fn origin_allowed(headers: &HeaderMap, allowed: &[String]) -> bool {
         .is_some_and(|origin| allowed.iter().any(|a| a == origin))
 }
 
-async fn get_trickle(
-    State(state): State<AppState>,
-    Query(query): Query<TrickleQuery>,
-    ws: WebSocketUpgrade,
-) -> Response {
-    // The origin was already checked by this route's layer, before
-    // the upgrade — a socket that opens and then closes has already
-    // let a foreign origin hold anchor state.
-    let Some(node_id) = parse_node_id(&query.node_id) else {
-        return refuse(
-            BootstrapRefusal::MalformedCredential,
-            "node_id is not a u64",
-        );
-    };
-    ws.on_upgrade(move |socket| trickle_socket(socket, state, node_id, query.dialog))
+/// The subprotocol that carries the attempt token (R1). A browser
+/// cannot set arbitrary headers on a WebSocket handshake, but it can
+/// name a subprotocol — and a subprotocol is a header, not a URL, so
+/// the token stays out of proxy logs and browser history.
+const ATTEMPT_SUBPROTOCOL_PREFIX: &str = "net-bootstrap-attempt.";
+
+/// The token a handshake presents, from
+/// `Sec-WebSocket-Protocol: net-bootstrap-attempt.<hex>`.
+fn presented_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(axum::http::header::SEC_WEBSOCKET_PROTOCOL)
+        .and_then(|v| v.to_str().ok())?
+        .split(',')
+        .map(str::trim)
+        .find_map(|p| p.strip_prefix(ATTEMPT_SUBPROTOCOL_PREFIX))
+        .map(str::to_string)
 }
 
-async fn trickle_socket(mut socket: WebSocket, state: AppState, node_id: u64, dialog: u64) {
+async fn get_trickle(
+    State(state): State<AppState>,
+    axum::Extension(authorized): axum::Extension<Authorized>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    // Origin AND the attempt token were both decided by this route's
+    // layer, before the upgrade. Reaching this function means the
+    // socket is authorized for exactly one attempt.
+    let Authorized { attempt, token } = authorized;
+    let protocol = format!("{ATTEMPT_SUBPROTOCOL_PREFIX}{token}");
+    ws.protocols([protocol])
+        .on_upgrade(move |socket| trickle_socket(socket, state, attempt, token))
+}
+
+/// What the trickle layer proved before the upgrade.
+#[derive(Clone)]
+struct Authorized {
+    attempt: Attempt,
+    token: String,
+}
+
+/// `(node_id, dialog)` from the trickle URI, without an extractor —
+/// the layer runs before extraction.
+fn trickle_ids(uri: &axum::http::Uri) -> Option<(u64, u64)> {
+    let query = uri.query()?;
+    let mut node = None;
+    let mut dialog = None;
+    for pair in query.split('&') {
+        let (k, v) = pair.split_once('=')?;
+        match k {
+            "node_id" => node = parse_node_id(v),
+            "dialog" => dialog = v.parse().ok(),
+            _ => {}
+        }
+    }
+    Some((node?, dialog?))
+}
+
+async fn trickle_socket(mut socket: WebSocket, state: AppState, attempt: Attempt, token: String) {
     use axum::extract::ws::CloseFrame;
+
+    let Attempt {
+        node_id,
+        dialog,
+        incarnation,
+        ..
+    } = attempt;
+    tracing::debug!(
+        node = format!("{node_id:#x}"),
+        dialog,
+        incarnation,
+        "trickle socket authorized by its attempt token"
+    );
 
     // The anchor's own candidate goes first: the browser can start
     // checks against it while it is still gathering its own. S0b
@@ -774,27 +951,48 @@ async fn trickle_socket(mut socket: WebSocket, state: AppState, node_id: u64, di
         }
         let candidate = value["candidate"].as_str().unwrap_or_default().to_string();
         let mid = value["mid"].as_str().unwrap_or("0").to_string();
-        if state
+        // **R2: the same bounds the native ingress applies**, run by
+        // the same function, and charged to the attempt's own
+        // identity rather than the node id the caller claimed.
+        match state
             .node
-            .apply_bootstrap_candidate(node_id, dialog, candidate, mid)
+            .apply_bootstrap_candidate_checked(attempt.budget_id, node_id, dialog, candidate, mid)
             .await
-            .is_err()
         {
-            // A candidate for a dialog this anchor does not hold:
-            // typed close, so the browser learns *which* thing was
-            // wrong rather than seeing a silent hang.
-            let _ = socket
-                .send(Message::Close(Some(CloseFrame {
-                    code: BootstrapRefusal::UnknownDialog.close_code(),
-                    reason: "unknown dialog".into(),
-                })))
-                .await;
-            return;
+            Ok(()) => {}
+            Err(e) => {
+                // A candidate this anchor will not apply — over a
+                // bound, or for a dialog it does not hold: typed
+                // close, so the browser learns WHICH thing was wrong
+                // rather than seeing a silent hang.
+                let refusal = if e.to_string().contains("bound") || e.to_string().contains("budget")
+                {
+                    BootstrapRefusal::RateLimited
+                } else {
+                    BootstrapRefusal::UnknownDialog
+                };
+                let _ = socket
+                    .send(Message::Close(Some(CloseFrame {
+                        code: refusal.close_code(),
+                        reason: e.to_string().into(),
+                    })))
+                    .await;
+                state.attempts.retire(&token);
+                return;
+            }
         }
     }
     // The browser went away before the channel opened; do not leave
     // the attempt holding a budget slot until its deadline.
-    state.node.end_bootstrap_dialog(node_id, dialog).await;
+    //
+    // **Only the socket that holds the token may do this** (R1).
+    // `retire` returns whether THIS call owned the removal, so a
+    // second socket for the same token — or a late close after the
+    // attempt was already retired — cannot end an attempt twice, and
+    // a socket that never held the token never reaches here at all.
+    if state.attempts.retire(&token) {
+        state.node.end_bootstrap_dialog(node_id, dialog).await;
+    }
 }
 
 fn hex_of(bytes: &[u8]) -> String {

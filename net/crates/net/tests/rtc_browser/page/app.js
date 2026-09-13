@@ -149,7 +149,11 @@ async function doConnect(step) {
     body.dialog +
     '&node_id=0x' +
     step.node_id;
-  const ws = new WebSocket(wsUrl);
+  // R1: the attempt token rides the WebSocket SUBPROTOCOL, never
+  // the URL — a query string lands in proxy logs and browser
+  // history, and this is a bearer credential for a live ICE
+  // attempt. The anchor refuses the upgrade without it.
+  const ws = new WebSocket(wsUrl, ['net-bootstrap-attempt.' + body.attempt_token]);
   const pendingOut = [];
   let wsOpen = false;
   const frame = (line, mid) =>
