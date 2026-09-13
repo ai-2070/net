@@ -186,17 +186,37 @@ async fn routed_then_direct_then_loss_then_manually_restored_routed() {
     // is real — attempting the upgrade while phase 1's reliable
     // traffic is still unacked is refused, so the contract's
     // "quiesce first" is what this waits for rather than talks about.
+    //
+    // **Both ends, not just A.** The quiescence gate is checked
+    // independently by each side's own `rtc_upgrade_precheck`: B
+    // refuses to accept the replacement while ITS view of the routed
+    // session still carries an open stream or unacked reliable data.
+    // Waiting only on A's view left B's ack of phase 1 in flight on a
+    // loaded runner, so `accept_rtc` returned "the incumbent session
+    // is busy" immediately, nothing answered msg1, and the initiator
+    // failed with `handshake timeout` — the Linux failure in CI runs
+    // 34727420769 and 652c786c9, on the initiator's error rather than
+    // the responder's cause. No wait was widened: the precondition
+    // the test claims to establish is now actually established.
+    let a_id = a.node_id();
     let quiescent = wait_for(
         || {
             a.peer_session_for_test(b_id)
                 .is_some_and(|s| !s.has_open_streams() && !s.has_unacked())
+                && b.peer_session_for_test(a_id)
+                    .is_some_and(|s| !s.has_open_streams() && !s.has_unacked())
         },
         Duration::from_secs(15),
     )
     .await;
     assert!(
         quiescent,
-        "the routed session must quiesce before it can be replaced"
+        "the routed session must quiesce at BOTH ends before it can be replaced \
+         (A quiet: {}, B quiet: {})",
+        a.peer_session_for_test(b_id)
+            .is_some_and(|s| !s.has_open_streams() && !s.has_unacked()),
+        b.peer_session_for_test(a_id)
+            .is_some_and(|s| !s.has_open_streams() && !s.has_unacked())
     );
 
     let (id_a, id_b) = connect_rtc_loopback(&a, &b)
