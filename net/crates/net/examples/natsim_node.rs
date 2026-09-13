@@ -56,6 +56,65 @@ mod natsim {
     use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig};
 
     const PSK: [u8; 32] = [0x42u8; 32];
+
+    /// The result of one unsolicited STUN binding request (R8).
+    #[derive(Default)]
+    struct StunProbe {
+        ok: bool,
+        target: Option<String>,
+        mapped: Option<String>,
+    }
+
+    /// Send ONE RFC 5389 binding request to `target` and read the
+    /// response's XOR-MAPPED-ADDRESS.
+    ///
+    /// Deliberately not an ICE check: a check carries `USERNAME`,
+    /// belongs to a session, and never reaches the anchor's bare
+    /// responder — so it could not show that the ADVERTISED address
+    /// is the one being aimed at.
+    #[cfg(feature = "webrtc")]
+    async fn stun_probe(target: &str) -> StunProbe {
+        use net::adapter::net::rtc::{parse_xor_mapped_address, STUN_MAGIC_COOKIE};
+
+        let mut probe = StunProbe {
+            target: Some(target.to_string()),
+            ..StunProbe::default()
+        };
+        let Ok(addr) = target.parse::<SocketAddr>() else {
+            return probe;
+        };
+        let Ok(socket) = tokio::net::UdpSocket::bind("0.0.0.0:0").await else {
+            return probe;
+        };
+        // A binding request is 20 bytes: type, length, cookie, id.
+        let mut request = Vec::with_capacity(20);
+        request.extend_from_slice(&0x0001u16.to_be_bytes());
+        request.extend_from_slice(&0u16.to_be_bytes());
+        request.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+        request.extend_from_slice(&[0x2Au8; 12]);
+        for _ in 0..5 {
+            if socket.send_to(&request, addr).await.is_err() {
+                continue;
+            }
+            let mut buf = [0u8; 512];
+            match tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut buf)).await {
+                Ok(Ok((n, from))) if from == addr => {
+                    if let Some(mapped) = parse_xor_mapped_address(&buf[..n]) {
+                        probe.ok = true;
+                        probe.mapped = Some(mapped.to_string());
+                        return probe;
+                    }
+                }
+                _ => {}
+            }
+        }
+        probe
+    }
+
+    #[cfg(not(feature = "webrtc"))]
+    async fn stun_probe(_target: &str) -> StunProbe {
+        StunProbe::default()
+    }
     /// How long coordination waits (files, reflex visibility) may take.
     const COORD_TIMEOUT: Duration = Duration::from_secs(60);
     // How long a joiner keeps re-running the classification sweep
@@ -260,6 +319,10 @@ mod natsim {
             "signal_over_budget": s.signal_over_budget(),
             "signal_engine_full": s.signal_engine_full(),
             "signal_unknown_dialog": s.signal_unknown_dialog(),
+            // R8: unsolicited binding requests this node's own STUN
+            // responder answered — a peer aiming at the address we
+            // published, which an ICE check could never demonstrate.
+            "stun_binding_requests": s.stun_binding_requests(),
         })
     }
 
@@ -678,6 +741,21 @@ mod natsim {
                 // observe the pre-announce version.
                 let anchor_rtc_addr = wait_for_info(&state, &target).await.rtc_addr;
 
+                // **R8: the published address is used as the STUN
+                // target, and that use is observable at the anchor.**
+                // An ICE connectivity check carries `USERNAME` and is
+                // consumed by whichever session negotiated those
+                // credentials, so it never reaches the anchor's bare
+                // responder and proves nothing about the ADVERTISED
+                // address. One unsolicited binding request does: it
+                // can only be answered by the responder listening on
+                // the address the announcement named, and the anchor
+                // counts it (`stun_binding_requests`).
+                let stun_probe = match anchor_rtc_addr.as_deref() {
+                    Some(addr) => stun_probe(addr).await,
+                    None => StunProbe::default(),
+                };
+
                 // Offer, then let the dialog's own completion owner
                 // carry it into the fenced install. Retried, not raced:
                 // the §12/C3 quiescence gate can refuse the first
@@ -729,6 +807,12 @@ mod natsim {
                     // this MUST be the gateway's mapped address, never
                     // the private address its RTC socket is bound to.
                     "anchor_rtc_addr": anchor_rtc_addr,
+                    // R8: did an unsolicited binding request to THAT
+                    // address get a well-formed success response, and
+                    // what did it say our mapped address was?
+                    "stun_probe_ok": stun_probe.ok,
+                    "stun_probe_target": stun_probe.target,
+                    "stun_probe_mapped": stun_probe.mapped,
                     "elapsed_ms": started.elapsed().as_millis() as u64,
                     "session_addr": node.peer_addr(tinfo.node_id).map(|a| a.to_string()),
                     "relay_addr": relay_addr.to_string(),

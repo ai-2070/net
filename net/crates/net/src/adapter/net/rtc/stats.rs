@@ -56,6 +56,12 @@ pub struct RtcStats {
     signal_forwarded: AtomicU64,
     signal_delivered: AtomicU64,
     signal_unknown_dialog: AtomicU64,
+    /// Unsolicited STUN binding requests this anchor's own responder
+    /// answered (Stage 4b R8). An ICE connectivity check carries
+    /// `USERNAME` and belongs to a session, so it is NOT counted
+    /// here: this is "somebody used us as their STUN server", which
+    /// is what a published `rtc_addr` is for.
+    stun_binding_requests: AtomicU64,
     ice_attempted: AtomicU64,
     ice_direct: AtomicU64,
     ice_relayed: AtomicU64,
@@ -228,6 +234,11 @@ impl RtcStats {
         signal_delivered,
         note_signal_delivered,
         "`0x0D02` frames delivered to this node's own signalling handler."
+    );
+    counter!(
+        stun_binding_requests,
+        note_stun_binding_request,
+        "Unsolicited STUN binding requests answered by this anchor's own responder — a peer using the published `rtc_addr` as its STUN target. ICE checks carry `USERNAME` and belong to a session; they are not counted here."
     );
     counter!(
         ice_attempted,

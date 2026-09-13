@@ -1143,6 +1143,10 @@ async fn receive(
     if config.serve_stun && stun::is_binding_request(datagram) && !stun::has_username(datagram) {
         if let Some(response) = stun::binding_response(datagram, source) {
             let _ = socket.send_to(&response, source).await;
+            // R8: a peer aiming at our published `rtc_addr` is
+            // observable here, and nowhere else — an ICE check
+            // carries `USERNAME` and never reaches this arm.
+            stats.note_stun_binding_request();
         }
         return;
     }
@@ -1178,6 +1182,7 @@ async fn receive(
         if config.serve_stun && stun::is_binding_request(datagram) {
             if let Some(response) = stun::binding_response(datagram, source) {
                 let _ = socket.send_to(&response, source).await;
+                stats.note_stun_binding_request();
             }
         }
         return;

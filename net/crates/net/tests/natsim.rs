@@ -372,14 +372,25 @@ fn natsim_relay_session_upgrades_to_direct() {
 ///    socket at the gateway's mapping — the only address its packets
 ///    can be arriving on.
 ///
-/// What this deliberately does NOT claim: that the *advertised*
+/// 3. **The use** (R8). The client aims ONE unsolicited STUN
+///    binding request at the announced address and gets a
+///    well-formed success response carrying its own mapped address.
+///    This is the fact an ICE connectivity check cannot supply: a
+///    check carries `USERNAME`, is consumed by the session that
+///    negotiated those credentials, and never reaches the anchor's
+///    bare responder — so it says nothing about the ADVERTISED
+///    address. The anchor counts the ones its responder answered
+///    (`stun_binding_requests`), so the same event is observable
+///    from both ends.
+///
+/// What this still deliberately does NOT claim: that the advertised
 /// candidate is the pair ICE selected. The anchor's own connectivity
 /// checks leave through the same mapping, so a client that was told
 /// nothing would discover `10.99.0.2:7101` as a peer-reflexive
 /// candidate anyway (measured: with a deliberately wrong
-/// `--rtc-public`, ICE still connects). The address is the same
-/// either way; the provenance is not, and only the announcement half
-/// above pins it. The gateway's side of the story — that the pinned
+/// `--rtc-public`, ICE still connects). What R8 adds is that the
+/// published address is genuinely serving as a STUN target, at both
+/// ends. The gateway's side of the story — that the pinned
 /// 1:1 SNAT really produced `sport=7101` — is captured in
 /// `nsim_gwa_nat.log`, which `ScenarioRun`'s `Drop` prints on any
 /// failure here.
@@ -403,6 +414,20 @@ fn natsim_natted_anchor_publishes_a_reachable_rtc_addr() {
     assert!(
         rtc_stat(&v, "ice_direct") >= 1,
         "the attempt must be counted as an installed direct path: {v:#}",
+    );
+    // R8: the published address was aimed at, and answered.
+    assert_eq!(
+        v["stun_probe_ok"], true,
+        "the client's binding request to the ANNOUNCED rtc_addr must be answered — \
+         an address nobody can use as a STUN target is not a published one: {v:#}",
+    );
+    assert_eq!(
+        v["stun_probe_target"], "10.99.0.2:7101",
+        "…and it must have been aimed at the announced address: {v:#}",
+    );
+    assert!(
+        v["stun_probe_mapped"].is_string(),
+        "the response must carry the client's mapped address: {v:#}",
     );
     // The routed leg is what carried the signalling; if the UDP punch
     // had produced this session instead, the verdict would be a
