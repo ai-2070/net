@@ -734,7 +734,22 @@ fn anchor_rtc(bind: SocketAddr) -> RtcConfig {
     RtcConfig {
         serve_bootstrap: true,
         serve_stun: true,
-        ice_deadline: Duration::from_secs(30),
+        // **This must be strictly larger than the page's per-step
+        // budget (30 s).** R4-A made the attempt deadline ONE
+        // absolute budget covering DataChannel open + Noise + the
+        // fenced install, and it starts when the offer is accepted —
+        // the same instant the page starts its own wait. With both
+        // set to 30 s, a slow ICE on a loaded runner eats the
+        // anchor's Noise budget, the completion owner correctly
+        // retires the attempt, and the page reports
+        // `timeout: noise msg2` — a symptom that cannot be told
+        // apart from an anchor that never answered. That is the CI
+        // failure in run 34737303... at head f44088908 (2 of 9
+        // witnesses).
+        //
+        // 90 s keeps the anchor's budget three times the page's, so
+        // a `noise msg2` timeout means what it says.
+        ice_deadline: Duration::from_secs(90),
         ..RtcConfig::new().with_bind_addr(bind)
     }
 }
