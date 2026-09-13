@@ -305,7 +305,7 @@ pub struct App {
     /// node id, refreshed with the snapshot. `rtc_addr` /
     /// `rtc_bootstrap` do not ride `PeerSnapshot`, so the NODES
     /// table reads them from here.
-    /// [`AnchorRollup::NotThisBuild`] on a build without `webrtc`,
+    /// [`AnchorRollup::not_this_build`] on a build without `webrtc`,
     /// which is also a build that cannot use them.
     pub rtc_anchors: AnchorRollup,
     /// Memoized SUBNETS-tab derivation against the current

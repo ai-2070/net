@@ -585,23 +585,6 @@ fn issue_localhost_certificate() -> (rustls::pki_types::CertificateDer<'static>,
     )
 }
 
-/// A client that trusts exactly the CA we issued with.
-fn client_config_trusting(
-    ca: &rustls::pki_types::CertificateDer<'static>,
-) -> Arc<rustls::ClientConfig> {
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(ca.clone()).unwrap();
-    Arc::new(
-        rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_root_certificates(roots)
-        .with_no_client_auth(),
-    )
-}
-
 /// A minimal verifying HTTPS GET — enough to prove the TLS layer
 /// serves, without pulling an HTTP client into the dev-dependencies.
 async fn https_get(
@@ -1180,7 +1163,7 @@ async fn an_attempt_that_ended_on_the_anchor_stops_authorizing_its_token() {
         StatusCode::UPGRADE_REQUIRED,
     );
     assert!(
-        anchor.bootstrap_attempt_is_live(offerer.node_id(), offered.dialog, 0) == false,
+        !anchor.bootstrap_attempt_is_live(offerer.node_id(), offered.dialog, 0),
         "the row is keyed by the accounting identity, not by a guessable zero",
     );
 
