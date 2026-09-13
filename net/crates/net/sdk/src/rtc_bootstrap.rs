@@ -51,6 +51,7 @@
 //!   query string — the offer body carries them, over TLS.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -262,7 +263,12 @@ impl BootstrapRefusal {
 }
 
 /// `POST /rtc/offer` request body.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Its [`Debug`] is hand-written: the `credential` field is the
+/// whole PSK-bearing credential string, and a derived `Debug` put it
+/// into any log line, panic message or `tracing` field that
+/// formatted a request (R5a).
+#[derive(Clone, Serialize, Deserialize)]
 pub struct OfferRequest {
     /// The `net-bootstrap:` credential string.
     pub credential: String,
@@ -271,6 +277,23 @@ pub struct OfferRequest {
     pub node_id: String,
     /// The SDP offer.
     pub sdp: String,
+}
+
+impl fmt::Debug for OfferRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The credential is a bearer secret. Its LENGTH is the most
+        // that helps a diagnosis; the trust domain and the issuer are
+        // available from the parsed credential, which redacts its own
+        // PSK.
+        f.debug_struct("OfferRequest")
+            .field(
+                "credential",
+                &format_args!("<{} redacted bytes>", self.credential.len()),
+            )
+            .field("node_id", &self.node_id)
+            .field("sdp_bytes", &self.sdp.len())
+            .finish()
+    }
 }
 
 /// `POST /rtc/offer` success body.

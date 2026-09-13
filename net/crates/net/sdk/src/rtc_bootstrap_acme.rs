@@ -68,16 +68,64 @@ fn write_cache(dir: &Path, cert_pem: &str, key_pem: &str) -> Result<(), Bootstra
     let (cert, key) = cache_paths(dir);
     std::fs::write(&cert, cert_pem)
         .map_err(|e| BootstrapError::Acme(format!("writing {}: {e}", cert.display())))?;
-    std::fs::write(&key, key_pem)
-        .map_err(|e| BootstrapError::Acme(format!("writing {}: {e}", key.display())))?;
-    // The private key is key material: same 0600 rule the rest of the
-    // SDK applies (a no-op on Windows, where the ACL is inherited —
-    // stated rather than pretended).
+    write_private_key(&key, key_pem)?;
+    Ok(())
+}
+
+/// Write the private key **created 0600 from inception**, and fail
+/// hard if the mode cannot be applied (R5b).
+///
+/// The old shape wrote the file with default permissions and then
+/// chmod'd, ignoring the result: there was a window in which the key
+/// was world-readable, and a filesystem that refuses the mode left a
+/// readable key with no error at all.
+fn write_private_key(path: &Path, pem: &str) -> Result<(), BootstrapError> {
+    use std::io::Write as _;
+
+    // Never inherit a previous file's mode.
+    if path.exists() {
+        std::fs::remove_file(path)
+            .map_err(|e| BootstrapError::Acme(format!("replacing {}: {e}", path.display())))?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600));
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
     }
+    let mut file = options
+        .open(path)
+        .map_err(|e| BootstrapError::Acme(format!("creating {}: {e}", path.display())))?;
+    file.write_all(pem.as_bytes())
+        .map_err(|e| BootstrapError::Acme(format!("writing {}: {e}", path.display())))?;
+    file.sync_all()
+        .map_err(|e| BootstrapError::Acme(format!("syncing {}: {e}", path.display())))?;
+
+    // Verify rather than assume: a filesystem that ignored the mode
+    // (or a umask-independent path) must be a loud error, because the
+    // whole point is that this file is not readable by anyone else.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(path)
+            .map_err(|e| BootstrapError::Acme(format!("stat {}: {e}", path.display())))?
+            .permissions()
+            .mode()
+            & 0o777;
+        if mode != 0o600 {
+            let _ = std::fs::remove_file(path);
+            return Err(BootstrapError::Acme(format!(
+                "{} was created with mode {mode:o}, not 0600 — refusing to leave a \
+                 readable private key on disk",
+                path.display()
+            )));
+        }
+    }
+    // On Windows the file inherits the parent directory's ACL. The
+    // cache directory is the operator's to protect; this is stated
+    // rather than silently assumed, and the Unix path above is what
+    // CI enforces.
     Ok(())
 }
 
@@ -187,6 +235,37 @@ mod tests {
         // …and neither is a pair that does not parse.
         std::fs::write(&key, "not a pem either").unwrap();
         assert!(read_cache(dir.path()).is_none());
+    }
+
+    /// R5b: the key is created 0600 from inception, and a mode that
+    /// does not come out 0600 is a hard error with the file removed
+    /// — never a readable key and a swallowed chmod result.
+    #[cfg(unix)]
+    #[test]
+    fn the_private_key_is_created_0600_and_a_wrong_mode_is_fatal() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("k.pem");
+        write_private_key(&key, "PEM").expect("write");
+        let mode = std::fs::metadata(&key).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "created 0600, not chmod'd afterwards");
+
+        // Fault injection: an existing file with a permissive mode
+        // must not be inherited — the writer replaces it.
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_private_key(&key, "PEM AGAIN").expect("rewrite");
+        let mode = std::fs::metadata(&key).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "a permissive predecessor is replaced, not reused"
+        );
+        assert_eq!(std::fs::read_to_string(&key).unwrap(), "PEM AGAIN");
+
+        // …and a directory that cannot hold the file at all is an
+        // error, not a silent skip.
+        let missing = dir.path().join("nope").join("k.pem");
+        assert!(write_private_key(&missing, "PEM").is_err());
     }
 
     #[test]
