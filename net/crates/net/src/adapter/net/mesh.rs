@@ -10931,6 +10931,15 @@ pub struct MeshNode {
     /// Dialogs this node is driving (plan §9 steps 3–6).
     #[cfg(feature = "webrtc")]
     rtc_dialogs: super::rtc::SharedDialogs,
+    /// Open HTTP-originated attempts per claimed peer (R2).
+    ///
+    /// An HTTP attempt's signalling budget is charged to a
+    /// per-attempt identity the caller could not choose, so the
+    /// budget no longer answers "how many attempts does this peer
+    /// have open". This does, without taking the dialog table's
+    /// async lock from a synchronous accessor.
+    #[cfg(feature = "webrtc")]
+    rtc_bootstrap_dialogs: Arc<DashMap<u64, usize>>,
     /// H3 witness seam: hold the RTC close-notification consumer, so
     /// the bounded channel can actually fill.
     #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
@@ -13410,6 +13419,8 @@ impl MeshNode {
             pending_promotions: Arc::new(DashMap::new()),
             #[cfg(feature = "webrtc")]
             rtc_dialogs: Arc::new(tokio::sync::Mutex::new(super::rtc::DialogTable::new())),
+            #[cfg(feature = "webrtc")]
+            rtc_bootstrap_dialogs: Arc::new(DashMap::new()),
             #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
             rtc_close_consumer_paused: Arc::new(AtomicBool::new(false)),
             #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
@@ -25492,6 +25503,30 @@ impl MeshNode {
         dialog: u64,
         sdp: String,
     ) -> Result<String, AdapterError> {
+        // The unkeyed form charges the claim, which is what a test
+        // measuring "the browser's own budget" wants. Production
+        // callers use the keyed form below and pass an identity the
+        // caller could not choose (R2).
+        self.accept_bootstrap_offer_keyed(claimed_node_id, claimed_node_id, dialog, sdp)
+            .await
+    }
+
+    /// [`Self::accept_bootstrap_offer`] with the signalling budget
+    /// charged to `budget_key` instead of the claimed node id (R2).
+    ///
+    /// `claimed_node_id` still names the dialog (the table is keyed
+    /// by it, and the Noise prologue binds it), but it is a claim:
+    /// charging it let any credential holder spend another peer's
+    /// dialog and frame allowance. `budget_key` is the listener's
+    /// per-attempt random identity.
+    #[cfg(feature = "webrtc")]
+    pub async fn accept_bootstrap_offer_keyed(
+        self: &Arc<Self>,
+        budget_key: u64,
+        claimed_node_id: u64,
+        dialog: u64,
+        sdp: String,
+    ) -> Result<String, AdapterError> {
         let driver = self
             .rtc_driver
             .as_ref()
@@ -25502,25 +25537,16 @@ impl MeshNode {
             .as_ref()
             .map(|rtc| rtc.ice_deadline)
             .unwrap_or_else(|| Duration::from_secs(10));
-        // The same per-sender budget an over-the-mesh offer spends,
-        // keyed the same way. A browser that opens five dialogs is
-        // refused by the same rule a native peer is.
-        let admitted = {
-            let msg = super::rtc::RtcSignalMsg::Offer {
+        // The same size bound and the same per-sender budget an
+        // over-the-mesh frame spends — one function, two callers
+        // (R2) — charged to `budget_key`.
+        self.admit_signal_frame(
+            budget_key,
+            &super::rtc::RtcSignalMsg::Offer {
                 dialog,
-                sdp: String::new(),
-            };
-            let mut guard = self.rtc_signal_budget.lock();
-            guard.admit(claimed_node_id, &msg, std::time::Instant::now())
-        };
-        if let super::rtc::SignalAdmit::Refused(e) = admitted {
-            if let Some(stats) = self.rtc_stats_opt() {
-                stats.note_signal_over_budget();
-            }
-            return Err(AdapterError::Connection(format!(
-                "bootstrap offer refused: {e}"
-            )));
-        }
+                sdp: sdp.clone(),
+            },
+        )?;
         let outcome = {
             let mut table = self.rtc_dialogs.lock().await;
             super::rtc::handle_signal(
@@ -25541,10 +25567,14 @@ impl MeshNode {
                 // `accept_rtc` inbox must exist before the browser's
                 // first Noise msg1 can arrive.
                 self.spawn_dialog_completion(claimed_node_id, dialog, peer, false);
+                *self
+                    .rtc_bootstrap_dialogs
+                    .entry(claimed_node_id)
+                    .or_insert(0) += 1;
                 Ok(sdp)
             }
             super::rtc::SignalOutcome::Reject { dialog, reason } => {
-                self.release_signal_budget(claimed_node_id, dialog);
+                self.release_signal_budget(budget_key, dialog);
                 Err(AdapterError::Connection(format!(
                     "the offer was refused: {reason:?}"
                 )))
@@ -25560,8 +25590,105 @@ impl MeshNode {
     /// `Candidate`; a candidate for a dialog this node does not hold
     /// is refused rather than ignored, so the trickle socket can
     /// close with a typed code.
+    /// **The shared ingress check (R2).** Size bound, then the
+    /// per-sender `SignalBudget`, with the same counters the native
+    /// `0x0D02` path increments.
+    ///
+    /// Stage 4b's HTTP/WebSocket ingress constructed frames directly
+    /// and reached the engine without either: the review pushed a
+    /// 16 KiB `mid` and 65 candidates in one window through it. This
+    /// is the one function both paths call.
+    #[cfg(feature = "webrtc")]
+    pub fn admit_signal_frame(
+        &self,
+        budget_key: u64,
+        msg: &super::rtc::RtcSignalMsg,
+    ) -> Result<(), AdapterError> {
+        let stats = self.rtc_stats_opt().cloned();
+        if let Err(e) = msg.validate_size() {
+            if let Some(stats) = stats.as_ref() {
+                stats.note_signal_malformed();
+            }
+            return Err(AdapterError::Connection(format!(
+                "signalling frame over the size bound: {e}"
+            )));
+        }
+        if let Some(stats) = stats.as_ref() {
+            stats.note_signal_delivered();
+        }
+        let admitted = {
+            let mut guard = self.rtc_signal_budget.lock();
+            guard.admit(budget_key, msg, std::time::Instant::now())
+        };
+        match admitted {
+            super::rtc::SignalAdmit::Refused(super::rtc::RtcSignalError::UnknownDialog) => {
+                if let Some(stats) = stats.as_ref() {
+                    stats.note_signal_unknown_dialog();
+                }
+                Err(AdapterError::Connection(
+                    "signalling frame for an unknown dialog".into(),
+                ))
+            }
+            super::rtc::SignalAdmit::Refused(e) => {
+                if let Some(stats) = stats.as_ref() {
+                    stats.note_signal_over_budget();
+                }
+                Err(AdapterError::Connection(format!(
+                    "signalling frame over budget: {e}"
+                )))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// [`Self::apply_bootstrap_candidate`] with the budget charged to
+    /// `budget_key` rather than the claimed node id (R2).
+    #[cfg(feature = "webrtc")]
+    pub async fn apply_bootstrap_candidate_checked(
+        &self,
+        budget_key: u64,
+        claimed_node_id: u64,
+        dialog: u64,
+        candidate: String,
+        mid: String,
+    ) -> Result<(), AdapterError> {
+        self.admit_signal_frame(
+            budget_key,
+            &super::rtc::RtcSignalMsg::Candidate {
+                dialog,
+                candidate: candidate.clone(),
+                mid: mid.clone(),
+            },
+        )?;
+        self.dispatch_bootstrap_candidate(claimed_node_id, dialog, candidate, mid)
+            .await
+    }
+
+    /// Apply a browser's trickled ICE candidate, charging the
+    /// claimed node id's own budget. Production callers use
+    /// [`Self::apply_bootstrap_candidate_checked`] with an identity
+    /// the caller could not choose.
     #[cfg(feature = "webrtc")]
     pub async fn apply_bootstrap_candidate(
+        &self,
+        claimed_node_id: u64,
+        dialog: u64,
+        candidate: String,
+        mid: String,
+    ) -> Result<(), AdapterError> {
+        self.apply_bootstrap_candidate_checked(
+            claimed_node_id,
+            claimed_node_id,
+            dialog,
+            candidate,
+            mid,
+        )
+        .await
+    }
+
+    /// The engine half, after the bounds have been applied.
+    #[cfg(feature = "webrtc")]
+    async fn dispatch_bootstrap_candidate(
         &self,
         claimed_node_id: u64,
         dialog: u64,
@@ -25626,6 +25753,9 @@ impl MeshNode {
     /// deadline holding a budget slot.
     #[cfg(feature = "webrtc")]
     pub async fn end_bootstrap_dialog(&self, claimed_node_id: u64, dialog: u64) {
+        if let Some(mut count) = self.rtc_bootstrap_dialogs.get_mut(&claimed_node_id) {
+            *count = count.saturating_sub(1);
+        }
         let entry = {
             let mut table = self.rtc_dialogs.lock().await;
             table.remove(claimed_node_id, dialog)
@@ -25690,7 +25820,22 @@ impl MeshNode {
     /// (R5 witnesses).
     #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
     pub fn open_signal_dialogs(&self, peer_node_id: u64) -> usize {
-        self.rtc_signal_budget.lock().open_dialogs(peer_node_id)
+        // The budget's view and the dialog table's view, whichever is
+        // larger (R2). They agree on the native path — one dialog is
+        // one budget slot and one table entry. They differ for an
+        // HTTP-originated attempt, whose BUDGET is charged to a
+        // per-attempt identity the caller could not choose while the
+        // dialog itself still names the peer it is for. "How many
+        // attempts does this peer have open" is the question every
+        // caller of this accessor is asking, and the table answers it
+        // without re-exposing another peer's allowance to a claim.
+        let budgeted = self.rtc_signal_budget.lock().open_dialogs(peer_node_id);
+        let http = self
+            .rtc_bootstrap_dialogs
+            .get(&peer_node_id)
+            .map(|e| *e.value())
+            .unwrap_or(0);
+        budgeted.max(http)
     }
 
     /// Send this node's host candidate for `dialog` (R4).

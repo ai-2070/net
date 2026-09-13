@@ -374,12 +374,20 @@ async fn the_trickle_socket_refuses_a_foreign_origin_before_upgrading() {
     // refused too.
     assert_eq!(handshake(None).await.0, StatusCode::FORBIDDEN);
 
-    // The control: the configured origin is NOT refused — it reaches
-    // the upgrade extractor.
-    assert_eq!(
-        handshake(Some(ORIGIN)).await.0,
-        StatusCode::UPGRADE_REQUIRED,
-        "the allowed origin passes the layer and reaches the upgrade"
+    // The control: the configured origin is not refused *for its
+    // origin*. Since R1 it must also present an attempt token, so
+    // the allowed origin without one is refused — and the refusal
+    // names the token, not the origin, which is how these two
+    // independent gates stay distinguishable. The token holder's
+    // path to the upgrade is
+    // `the_attempt_token_holder_can_trickle_and_abandon_its_own_attempt`.
+    let (status, body) = handshake(Some(ORIGIN)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let message: ErrorBody = serde_json::from_slice(&body).expect("an error body");
+    assert!(
+        message.message.contains("attempt token"),
+        "an allowed origin is refused for the TOKEN, not the origin: {}",
+        message.message
     );
 }
 
@@ -902,4 +910,134 @@ async fn kyra_bootstrap_candidates_must_keep_the_native_frame_budget() {
         bootstrap_ok < MAX_FRAMES_PER_WINDOW,
         "bootstrap hook applied every candidate beyond the shared64-frame limit"
     );
+}
+
+// ===================================================================
+// R1 / R2 — the repairs' own witnesses (the probes above are the
+// negatives; these are the controls and the attribution facts).
+// ===================================================================
+
+/// R1 positive control: the socket that HOLDS the attempt token
+/// upgrades, trickles, and its close retires its own attempt.
+///
+/// Without this, "a foreign socket cannot retire" could be
+/// satisfied by a trickle socket nobody can use.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_attempt_token_holder_can_trickle_and_abandon_its_own_attempt() {
+    let anchor = kyra_long_lived_anchor().await;
+    let offerer = offerer().await;
+    let router = bootstrap_router(Arc::clone(&anchor), &config(PSK));
+    let credential = credential_for(PSK, Duration::from_secs(600));
+    let sdp = offerer
+        .rtc_driver()
+        .expect("driver")
+        .create_offer()
+        .await
+        .expect("offer")
+        .1;
+    let (status, body) = post_offer(&router, &credential, offerer.node_id(), &sdp).await;
+    assert_eq!(status, StatusCode::OK);
+    let offered: OfferResponse = serde_json::from_slice(&body).expect("offer response");
+    assert_eq!(offered.attempt_token.len(), 64, "32 random bytes, hex");
+    assert_eq!(anchor.open_signal_dialogs(offerer.node_id()), 1);
+
+    // The token upgrades where the probe's tokenless socket did not.
+    let upgrade = |token: Option<String>, dialog: u64| {
+        let router = router.clone();
+        let node = offerer.node_id();
+        async move {
+            let mut builder = Request::builder()
+                .uri(format!("/rtc/trickle?dialog={dialog}&node_id={node}"))
+                .header(header::ORIGIN, ORIGIN)
+                .header(header::CONNECTION, "upgrade")
+                .header(header::UPGRADE, "websocket")
+                .header(header::SEC_WEBSOCKET_VERSION, "13")
+                .header(header::SEC_WEBSOCKET_KEY, "dGhlIHNhbXBsZSBub25jZQ==");
+            if let Some(token) = token {
+                builder = builder.header(
+                    header::SEC_WEBSOCKET_PROTOCOL,
+                    format!("net-bootstrap-attempt.{token}"),
+                );
+            }
+            router
+                .oneshot(builder.body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+
+    // 426 = the origin layer and the token check both passed and the
+    // upgrade extractor is what a `oneshot` harness cannot complete.
+    assert_eq!(
+        upgrade(Some(offered.attempt_token.clone()), offered.dialog).await,
+        StatusCode::UPGRADE_REQUIRED,
+        "the token holder reaches the upgrade"
+    );
+    // …and every way of not holding it is refused BEFORE the upgrade.
+    assert_eq!(upgrade(None, offered.dialog).await, StatusCode::FORBIDDEN);
+    assert_eq!(
+        upgrade(Some("00".repeat(32)), offered.dialog).await,
+        StatusCode::NOT_FOUND,
+        "an invented token names no attempt"
+    );
+    assert_eq!(
+        upgrade(Some(offered.attempt_token.clone()), offered.dialog + 1).await,
+        StatusCode::NOT_FOUND,
+        "a real token for a different dialog is as good as no token"
+    );
+
+    anchor.shutdown().await.expect("shutdown");
+    offerer.shutdown().await.expect("shutdown");
+}
+
+/// R2 attribution: a credential holder cannot spend another node's
+/// signalling budget.
+///
+/// The listener charges each attempt to the token's own random
+/// identity, so an HTTP caller claiming node X leaves X's budget
+/// untouched — before the repair the offer was charged to the
+/// claimed id, which is a claim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_http_caller_cannot_spend_the_claimed_nodes_budget() {
+    let anchor = kyra_long_lived_anchor().await;
+    let victim = offerer().await;
+    let router = bootstrap_router(Arc::clone(&anchor), &config(PSK));
+    let credential = credential_for(PSK, Duration::from_secs(600));
+
+    // Four offers, all claiming the victim's node id: the per-peer
+    // dialog bound is four, so a claim-keyed budget would be full.
+    let mut tokens = Vec::new();
+    for _ in 0..4 {
+        let sdp = victim
+            .rtc_driver()
+            .expect("driver")
+            .create_offer()
+            .await
+            .expect("offer")
+            .1;
+        let (status, body) = post_offer(&router, &credential, victim.node_id(), &sdp).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let offered: OfferResponse = serde_json::from_slice(&body).expect("offer response");
+        tokens.push(offered.attempt_token);
+    }
+
+    // The victim's OWN budget is untouched: it can still open a
+    // native dialog, which is what "another peer cannot spend my
+    // allowance" means operationally.
+    let native = anchor.admit_signal_frame(
+        victim.node_id(),
+        &net::adapter::net::rtc::RtcSignalMsg::Offer {
+            dialog: 0xBEEF,
+            sdp: "v=0".into(),
+        },
+    );
+    assert!(
+        native.is_ok(),
+        "four HTTP attempts claiming this node consumed its own signalling budget: {native:?}"
+    );
+    assert_eq!(tokens.len(), 4);
+
+    anchor.shutdown().await.expect("shutdown");
+    victim.shutdown().await.expect("shutdown");
 }

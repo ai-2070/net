@@ -130,14 +130,16 @@ impl RtcSignalMsg {
         postcard::to_allocvec(self)
     }
 
-    /// Decode a frame, refusing oversize payloads **before** the
-    /// dialog state is touched.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, RtcSignalError> {
-        if bytes.len() > MAX_SDP_BYTES {
-            return Err(RtcSignalError::TooLarge);
-        }
-        let msg: Self = postcard::from_bytes(bytes).map_err(|_| RtcSignalError::Malformed)?;
-        let oversize = match &msg {
+    /// The size bound the decoder applies, as a function any
+    /// ingress can call (R2).
+    ///
+    /// Stage 4b's HTTP/WebSocket ingress builds an `RtcSignalMsg`
+    /// directly instead of decoding one, so it never went through
+    /// `from_bytes` and therefore never hit this bound — the review
+    /// pushed a 16 KiB `mid` through the bootstrap hook that the
+    /// native decoder refuses. One function, two callers.
+    pub fn validate_size(&self) -> Result<(), RtcSignalError> {
+        let oversize = match self {
             Self::Offer { sdp, .. } | Self::Answer { sdp, .. } => sdp.len() > MAX_SDP_BYTES,
             Self::Candidate { candidate, mid, .. } => candidate.len() + mid.len() > MAX_SDP_BYTES,
             Self::Reject { .. } => false,
@@ -145,6 +147,17 @@ impl RtcSignalMsg {
         if oversize {
             return Err(RtcSignalError::TooLarge);
         }
+        Ok(())
+    }
+
+    /// Decode a frame, refusing oversize payloads **before** the
+    /// dialog state is touched.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, RtcSignalError> {
+        if bytes.len() > MAX_SDP_BYTES {
+            return Err(RtcSignalError::TooLarge);
+        }
+        let msg: Self = postcard::from_bytes(bytes).map_err(|_| RtcSignalError::Malformed)?;
+        msg.validate_size()?;
         Ok(msg)
     }
 }

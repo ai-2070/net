@@ -84,6 +84,17 @@ impl DialogTable {
             .collect()
     }
 
+    /// How many dialogs this peer holds (R2): the dialog table's own
+    /// view, which stays keyed by the peer the dialog names even
+    /// when the signalling BUDGET is charged to an attempt identity
+    /// the caller could not choose.
+    pub fn open_for(&self, peer_node: u64) -> usize {
+        self.dialogs
+            .keys()
+            .filter(|(node, _)| *node == peer_node)
+            .count()
+    }
+
     /// How many dialogs are open.
     pub fn len(&self) -> usize {
         self.dialogs.len()
