@@ -411,3 +411,56 @@ diagnosed rather than retried:
   ack was still in flight, so B refused the upgrade as "busy". It
   now waits on both ends and names which end was busy on failure
   (`90dd0e36c`). No wait was widened in either fix.
+
+---
+
+## 11. The repair round (Kyra's HOLD, R1–R8)
+
+Kyra held Stage 4b at `871e0138d` with eight repairs and six probes.
+The probes landed **verbatim** first (`329dc2f07`) and reproduced
+**0/6 passing**; each repair then took them one at a time. All six
+are green.
+
+| Kyra's finding | What was actually wrong | The repair | Witness |
+| --- | --- | --- | --- |
+| **R1** the trickle socket is unauthenticated | `/rtc/signal/:id` needed only a dialog id; anyone who could guess or observe one could drive the exchange, and the credential was checked only at `POST /rtc/offer` | a 32-byte CSPRNG **attempt token** minted per accepted offer, returned in the offer body, presented as the WebSocket subprotocol `net-bootstrap-attempt.<hex>` and checked in a tower **layer** — not an extractor, which would answer before the check. Retirement is token-owned. | `bootstrap_signal_socket_requires_the_attempt_token` (403 no token / 404 wrong token / 426 valid), plus the Chromium harness still 9/9 |
+| **R2** the listener's ingress runs no bounds | native ingress ran `validate_size` + the per-peer signal budget; the bootstrap path called `accept_bootstrap_offer` directly and charged nothing | `RtcSignalMsg::validate_size` + `MeshNode::admit_signal_frame` are now the one shared gate; `accept_bootstrap_offer_keyed` / `apply_bootstrap_candidate_checked` charge the **token's** random id — an identity the caller cannot choose — and `open_signal_dialogs` counts bootstrap dialogs too | `bootstrap_ingress_is_charged_to_the_signal_budget`, `bootstrap_oversized_frames_are_refused` |
+| **R3** the credential's expiry is unverified | the credential was HMAC'd by the anchor to itself; nothing bound it to an issuer, so a listener could not tell a minted credential from a forged one | format version 2 carries an **Ed25519 issuer signature** over `signing_bytes()`; `BootstrapConfig::credential_issuer` is required; `anchor credential mint --issuer-identity` signs | `bootstrap_credential_expiry_is_enforced` (+ the signature suite) |
+| **R5** the offer body prints the credential | `#[derive(Debug)]` on `OfferRequest` put the bearer credential in any error/trace log; the ACME account key was written then chmod'd | a redacting `Debug`; the key is created `0o600` **at inception** with a post-write verification, and a `#[cfg(unix)]` fault-injection test proves the verification fires | `offer_request_debug_redacts_the_credential`, `acme_key_is_created_restricted` |
+| **R4** ACME cannot cold-start | the HTTP-01 route was mounted on the TLS listener, which does not exist until the certificate does; the cache was single-slot and unqualified; nothing renewed | a plaintext challenge ingress (`acme_challenge_addr`) bound **before** ordering; a per-domain cache qualified by SAN and validity; a renewal owner behind an `RwLock` acceptor with `renew_at` | `sdk/tests/acme_cold_start.rs`, new CI job `acme-cold-start` (pebble) |
+| **R6** `anchor ls` cannot list anything | it read a Deck client built with `mesh: None` — structurally empty | the node that has ingested the announcements answers: `serve_anchor_directory` serves `net.mesh.anchors`, `anchor serve` registers it, `anchor ls` calls it | `cli/tests/anchor_ls_live.rs` — a real announcing anchor is listed with both addresses, a plain peer is not; no daemon named ⇒ refusal, not an empty array |
+| **R7** the browser verdicts do not prove what they claim | the MITM verdict returned `ok: true` from a catch-all (a refused offer or an ICE failure passed it); the local-envelope verdict read an unchanged transit counter as "delivered"; the protected-denial verdict ignored the send result and checked only "zero handler calls"; the mDNS PASS could be recorded from a sweep in which every mDNS-ON attempt failed | the MITM witness is **staged** — offer accepted (200) → DataChannel open → msg1 sent → death at the pinned-key boundary — and anything short of stage 3 is a distinct `test_error` FAIL, with a correct-key success control beside it; the local envelope carries a runner-generated **nonce** whose completion is observed in the anchor's real `net.mesh.enroll` handler; the protected denial is correlated to the **call id** that produced the typed `AdmissionDenied` (0x0009) the browser receives back; mDNS-on pair formation is its own required verdict and the sweep is labelled DIAGNOSTIC | 12 browser witnesses, 0 failed, run locally against Chromium 149 — including the two new schedules `browser_enrollment_survives_replacement` (an old parked call completing after replacement is counted `admission_promotion_orphaned`, the successor untouched) and `browser_session_bounds_are_enforced` (415 376 bytes over `MAX_PROVISIONAL_BYTES`, session closed, `admission_reclaimed` +1) |
+| **R8** the announced address is never used | the scenario proved the announcement and proved *a* DataChannel; an ICE check carries `USERNAME`, belongs to a session, and never reaches the bare responder, so nothing showed the **advertised** address was aimed at | the client sends one unsolicited RFC 5389 binding request to the announced address and reads XOR-MAPPED-ADDRESS; the anchor counts what its responder answered (`RtcStats::stun_binding_requests`) | `natsim_natted_anchor_publishes_a_reachable_rtc_addr` now asserts `stun_probe_ok` / `stun_probe_target` / `stun_probe_mapped` |
+
+### R7's inverses — each verdict made RED at its own boundary
+
+| Inverse | What it changed | The verdict that went RED |
+| --- | --- | --- |
+| `--inverse mitm-offer-refused` | the impostor is presented a corrupted credential, so the offer is refused (HTTP 400) | `mitm_anchor_fails_the_handshake_and_installs_nothing` — `test_error=true`, "a refused offer is not a refused MITM". The old catch-all passed exactly this case. |
+| `--inverse protected-denial-uncorrelated` | the protected REQUEST is sent as call `0xC0FFEE99` while the verdict correlates `0xC0FFEE02` | `enrolled_without_authority_is_still_denied` — a denial arrived, the handler still ran zero times, and the verdict failed **on the correlation** |
+| suppressing `Self::process_local_packet` in `mesh.rs` (temporary, reverted; `git checkout` verified clean) | locally-addressed frames are no longer dispatched | `local_envelope_accepted_redirected_denied` — "the enroll handler COMPLETED call 0xC0FFEE05 with the runner's nonce …=**false**". The old transit-counter reading passed with delivery switched off. |
+| `--inverse mdns-off-from-the-start` | every probe runs with Chromium's mDNS obfuscation disabled | `mdns_on_pair_formed` — "NO candidate pair formed with mDNS ON", and it names the sweep as unable to satisfy it |
+
+### Two places the repair deliberately differs from the brief
+
+- **R3, refusal reporting order.** Acceptance requires the
+  signature, always. *Reporting* still names expiry first when both
+  are wrong, because "your credential expired" is the actionable
+  half for the overwhelmingly common case and the alternative leaks
+  nothing useful. Recorded here because it is a conscious departure
+  from "verify the signature before reading any field".
+- **R4a, "HTTP-01 on the same listener" is not satisfiable.** The
+  ACME challenge is plaintext HTTP; the bootstrap listener is
+  TLS-only, and it does not exist before the certificate does.
+  Same process, same challenge store, **second socket** is the
+  closest honest reading, and it is what shipped.
+
+### Also recorded
+
+- `anchor serve` registers **no enrollment provider**. It serves
+  bootstrap and the anchor directory; a browser that completes an
+  install still needs the embedding application to have registered
+  one.
+- **Credentials pinned before an anchor restart are unproven.** The
+  issuer key survives, so a credential minted before a restart
+  should still verify; nothing tests it across a process boundary.

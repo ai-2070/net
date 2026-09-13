@@ -4085,6 +4085,20 @@ jobs:
       - name: Run net-cli tests
         run: cargo test -p net-cli
 
+      # `cargo test -p net-cli` above builds default features, so the
+      # anchor-directory witness (`#![cfg(feature = "rtc-bootstrap")]`)
+      # is compiled out of it entirely. Run it explicitly, and pin the
+      # count: a `--test <name>` filter that matches nothing still
+      # exits 0, which is the silent-skip hazard this repo has been
+      # bitten by twice.
+      - name: Run net-cli anchor directory witness (Stage 4b)
+        run: |
+          set -o pipefail
+          cargo test -p net-cli --features rtc-bootstrap \
+            --test anchor_ls_live 2>&1 | tee /tmp/anchor_ls.log
+          grep -q "2 passed" /tmp/anchor_ls.log || {
+            echo "::error::anchor_ls_live must run its 2 tests"; exit 1; }
+
   aggregator-daemon-tests:
     # `net-aggregator-daemon` is a lib + bin crate. The lib hosts
     # the `boot` / `run` entry points + config parsing + template
@@ -4918,14 +4932,14 @@ jobs:
           fi
           passes=$(grep -c '^RTCB PASS ' "$log" || true)
           fails=$(grep -c '^RTCB FAIL ' "$log" || true)
-          echo "rtc_browser: $passes passed, $fails failed (floor 9)"
+          echo "rtc_browser: $passes passed, $fails failed (floor 12)"
           if [ "$fails" -ne 0 ]; then
             grep '^RTCB FAIL ' "$log"
             echo "::error::a Stage 4b browser witness failed"
             exit 1
           fi
-          if [ "$passes" -lt 9 ]; then
-            echo "::error::rtc_browser emitted $passes witnesses, floor is 9 — \
+          if [ "$passes" -lt 12 ]; then
+            echo "::error::rtc_browser emitted $passes witnesses, floor is 12 — \
           lower the floor deliberately or restore the witness"
             exit 1
           fi
@@ -4939,6 +4953,9 @@ jobs:
           enrolled_without_authority_is_still_denied
           mitm_anchor_fails_the_handshake_and_installs_nothing
           mdns_candidate_pair_measured
+          mdns_on_pair_formed
+          browser_enrollment_survives_replacement
+          browser_session_bounds_are_enforced
           "
           for required in $REQUIRED; do
             if ! grep -q "^RTCB PASS $required " "$log"; then

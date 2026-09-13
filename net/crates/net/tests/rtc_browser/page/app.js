@@ -82,7 +82,12 @@ function waitOpen(dc) {
 // connect: offer -> trickle -> DataChannel -> NKpsk0
 // ---------------------------------------------------------------------
 
-async function doConnect(step) {
+/// `stage` is filled in as the attempt advances, so a caller that
+/// EXPECTS this to fail can say WHERE it failed instead of treating
+/// every exception as the failure it was hoping for. Each field is
+/// set only once the step it names has actually happened.
+async function doConnect(step, stage) {
+  const st = stage || {};
   const t0 = performance.now();
   const iceServers = step.stun ? [{ urls: step.stun }] : [];
   const pc = new RTCPeerConnection({ iceServers });
@@ -129,7 +134,9 @@ async function doConnect(step) {
     }),
   });
   const text = await res.text();
+  st.offer_status = res.status;
   if (!res.ok) throw new Error('POST /rtc/offer -> ' + res.status + ' ' + text);
+  st.offer_accepted = true;
   const body = JSON.parse(text);
 
   await pc.setRemoteDescription({ type: 'answer', sdp: body.sdp });
@@ -188,12 +195,17 @@ async function doConnect(step) {
   for (const [line, mid] of outbox.splice(0)) sendCandidate(line, mid);
 
   await withTimeout(waitOpen(dc), step.timeout_ms, 'datachannel open');
+  st.dc_open = true;
   const openMs = performance.now() - t0;
 
   const ep = new LeafEndpoint(step.psk, step.anchor_pub, step.node_id, step.anchor_node_id);
+  st.noise_constructed = true;
   dc.send(ep.msg1_packet());
+  st.msg1_sent = true;
   const pkt = await q.next(step.timeout_ms, 'noise msg2');
+  st.msg2_received = true;
   ep.read_msg2_packet(pkt);
+  st.msg2_authenticated = true;
 
   sessions.set(step.session, { pc, dc, q, ep, ws });
   return { ok: true, session_id: ep.session_id(), open_ms: openMs };
@@ -207,20 +219,109 @@ async function execute(step) {
   switch (step.kind) {
     case 'connect': {
       if (step.expect_failure) {
-        // The MITM witness: the handshake MUST fail. `ok: true` here
-        // means "failed as required"; the runner inverts nothing.
+        // ---------------------------------------------------------
+        // The pinned-key (MITM) witness.
+        //
+        // This used to be `try { connect() } catch { ok: true }`,
+        // which passed on ANY exception: a refused offer, a
+        // certificate problem, an ICE failure, a DataChannel that
+        // never opened — none of which say anything about the
+        // credential's pinned static key. It asserts, IN ORDER:
+        //
+        //   1. the offer was ACCEPTED (HTTP 200),
+        //   2. the DataChannel OPENED,
+        //   3. Noise was constructed and msg1 was SENT,
+        //   4. the attempt then died AT THE PINNED-KEY BOUNDARY:
+        //      either an msg2 that does not authenticate under the
+        //      pinned static key, or no authenticated msg2 at all
+        //      after msg1 was sent.
+        //
+        // Anything short of stage 3 is a TEST ERROR (`test_error`),
+        // which the runner reports as a distinct FAIL — never as a
+        // refused MITM. `ok: true` here means "failed at the pinned
+        // key"; the runner inverts nothing.
+        const stage = {
+          offer_status: 0,
+          offer_accepted: false,
+          dc_open: false,
+          noise_constructed: false,
+          msg1_sent: false,
+          msg2_received: false,
+          msg2_authenticated: false,
+          failure: null,
+        };
         try {
-          await doConnect(step);
+          await doConnect(step, stage);
+        } catch (e) {
+          stage.failure = e.message || String(e);
+        }
+        const f = stage.failure || '<no error>';
+        if (!stage.offer_accepted) {
           return {
             ok: false,
+            test_error: true,
+            stage,
+            error:
+              'TEST ERROR: the offer was never accepted (HTTP ' + stage.offer_status + '): ' + f +
+              ' — the pinned-key witness requires an ACCEPTED offer; a refused offer is not a refused MITM',
+          };
+        }
+        if (!stage.dc_open) {
+          return {
+            ok: false,
+            test_error: true,
+            stage,
+            error:
+              'TEST ERROR: the DataChannel never opened (ICE/transport): ' + f +
+              ' — an ICE failure proves nothing about the credential-pinned key',
+          };
+        }
+        if (!stage.noise_constructed) {
+          return {
+            ok: false,
+            test_error: true,
+            stage,
+            error: 'TEST ERROR: the Noise initiator could not be constructed: ' + f,
+          };
+        }
+        if (!stage.msg1_sent) {
+          return {
+            ok: false,
+            test_error: true,
+            stage,
+            error: 'TEST ERROR: Noise msg1 was never sent: ' + f,
+          };
+        }
+        if (stage.msg2_authenticated) {
+          return {
+            ok: false,
+            stage,
             error: 'the handshake SUCCEEDED against an anchor that does not hold the pinned key',
             info: 'a session was installed — this is the MITM the credential is supposed to stop',
           };
-        } catch (e) {
-          return { ok: true, info: 'noise/transport failure: ' + (e.message || String(e)) };
         }
+        const timedOutAfterMsg1 = !!stage.failure && stage.failure.indexOf('timeout: noise msg2') === 0;
+        if (!stage.msg2_received && !timedOutAfterMsg1) {
+          return {
+            ok: false,
+            test_error: true,
+            stage,
+            error:
+              'TEST ERROR: after msg1 the attempt died for a reason that is not the pinned-key ' +
+              'boundary (no msg2, no msg2 timeout): ' + f,
+          };
+        }
+        return {
+          ok: true,
+          stage,
+          info: stage.msg2_received
+            ? 'offer accepted (' + stage.offer_status + '), DataChannel open, msg1 sent, and msg2 ' +
+              'FAILED to authenticate under the credential-pinned static key: ' + f
+            : 'offer accepted (' + stage.offer_status + '), DataChannel open, msg1 sent, and no ' +
+              'authenticating msg2 ever arrived: ' + f,
+        };
       }
-      return await doConnect(step);
+      return await doConnect(step, {});
     }
 
     case 'send': {
@@ -235,8 +336,95 @@ async function execute(step) {
         unhex(step.payload),
       );
       const out = step.prefix ? concat(unhex(step.prefix), pkt) : pkt;
-      s.dc.send(out);
-      return { ok: true, info: 'sent ' + out.length + ' bytes' };
+      // A send on a channel that is not open is a FAILED send, and
+      // the runner asserts on this: "the frame was sent" is a
+      // premise of every delivery verdict, never an assumption.
+      if (s.dc.readyState !== 'open') {
+        return { ok: false, error: 'the DataChannel is ' + s.dc.readyState + ', not open' };
+      }
+      try {
+        s.dc.send(out);
+      } catch (e) {
+        return { ok: false, error: 'DataChannel.send: ' + (e.message || String(e)) };
+      }
+      return { ok: true, sent_frames: 1, sent_bytes: out.length, info: 'sent ' + out.length + ' bytes' };
+    }
+
+    /// N frames of the same shape, built and sent from the browser
+    /// so a whole-session bound can be crossed without N HTTP round
+    /// trips. Reports exactly how many frames and bytes left the
+    /// page, and why it stopped early if it did.
+    case 'burst': {
+      const s = sessions.get(step.session);
+      if (!s) return { ok: false, error: 'no session ' + step.session };
+      const payload = new Uint8Array(step.payload_len);
+      payload.fill(step.fill & 0xff);
+      let frames = 0;
+      let bytes = 0;
+      let stopped = null;
+      for (let i = 0; i < step.frames; i++) {
+        if (s.dc.readyState !== 'open') {
+          stopped = 'the DataChannel went ' + s.dc.readyState + ' after ' + frames + ' frames';
+          break;
+        }
+        let pkt;
+        try {
+          pkt = s.ep.build_frame(
+            step.stream_id,
+            step.subprotocol,
+            step.channel_hash,
+            step.origin_hash,
+            step.reliable,
+            payload,
+          );
+        } catch (e) {
+          stopped = 'build_frame: ' + (e.message || String(e));
+          break;
+        }
+        try {
+          s.dc.send(pkt);
+        } catch (e) {
+          stopped = 'DataChannel.send: ' + (e.message || String(e));
+          break;
+        }
+        frames++;
+        bytes += pkt.length;
+        if (s.dc.bufferedAmount > 1 << 20) await sleep(20);
+      }
+      return {
+        ok: frames > 0,
+        sent_frames: frames,
+        sent_bytes: bytes,
+        error: frames > 0 ? undefined : 'not one frame was sent: ' + stopped,
+        info:
+          'sent ' + frames + ' frame(s), ' + bytes + ' bytes' +
+          (stopped ? '; stopped early: ' + stopped : ''),
+      };
+    }
+
+    /// Drop one session from the browser end: the DataChannel, the
+    /// trickle socket and the PeerConnection. The anchor must
+    /// observe the close and evict the peer.
+    case 'close': {
+      const s = sessions.get(step.session);
+      if (!s) return { ok: false, error: 'no session ' + step.session };
+      try {
+        s.dc.close();
+      } catch (e) {
+        await log('[page] dc.close: ' + e);
+      }
+      try {
+        if (s.ws) s.ws.close();
+      } catch (e) {
+        await log('[page] ws.close: ' + e);
+      }
+      try {
+        s.pc.close();
+      } catch (e) {
+        await log('[page] pc.close: ' + e);
+      }
+      sessions.delete(step.session);
+      return { ok: true, info: 'closed the browser end of ' + step.session };
     }
 
     case 'expect': {

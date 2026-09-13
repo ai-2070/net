@@ -88,7 +88,10 @@ use net::adapter::net::cortex::{
     RpcResponsePayload, RpcStatus, DISPATCH_RPC_REQUEST, DISPATCH_RPC_RESPONSE, EVENT_META_SIZE,
     RPC_FRAME_BODY_OFFSET, RPC_ROUTE_V1_SIZE,
 };
-use net::adapter::net::rtc::{enroll_reply_channel, RtcConfig, ENROLL_SERVICE};
+use net::adapter::net::rtc::{
+    enroll_reply_channel, RtcConfig, ENROLL_SERVICE, MAX_PROVISIONAL_BYTES,
+    MAX_PROVISIONAL_FRAMES, PROVISIONAL_TTL,
+};
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, PeerAddr};
 use net_sdk::bootstrap_credential::{BrowserBootstrapCredential, Psk};
 use net_sdk::enrollment::InviteToken;
@@ -162,11 +165,57 @@ fn admitted_outcome() -> Bytes {
     Bytes::from(buf)
 }
 
-struct Enrollment;
+/// A request body beginning with this parks the call until the
+/// harness releases it (R7a: an old exchange that completes after
+/// its session is gone).
+const HOLD_PREFIX: &[u8] = b"hold:";
+
+/// The **real** enrollment provider the anchor serves, with the two
+/// seams the browser witnesses read:
+///
+/// * `completed` records `(call_id, body)` for every call this
+///   handler actually finished. That is what makes the
+///   locally-addressed envelope's outcome an *observed decoded
+///   fact* (R7c) instead of "a transit counter that did not move":
+///   the runner generates a nonce, the browser seals it into a
+///   routed envelope addressed at the anchor itself, and the
+///   witness passes only if THIS handler ran with THAT payload.
+/// * a body starting with [`HOLD_PREFIX`] parks the call on
+///   `release` until the harness adds a permit, which is how the
+///   replacement witness holds an old enrollment exchange open
+///   across a session replacement.
+struct Enrollment {
+    completed: Arc<std::sync::Mutex<Vec<(u64, Vec<u8>)>>>,
+    parked: Arc<AtomicUsize>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+impl Enrollment {
+    /// Did this handler complete a call with exactly this
+    /// `(call_id, body)`?
+    fn completed_call(completed: &std::sync::Mutex<Vec<(u64, Vec<u8>)>>, call: u64, body: &[u8]) -> bool {
+        completed
+            .lock()
+            .expect("the completed-call log is never poisoned")
+            .iter()
+            .any(|(c, b)| *c == call && b.as_slice() == body)
+    }
+}
 
 #[async_trait::async_trait]
 impl RpcHandler for Enrollment {
-    async fn call(&self, _ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+    async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+        let body = ctx.payload.body.to_vec();
+        if body.starts_with(HOLD_PREFIX) {
+            self.parked.fetch_add(1, Ordering::SeqCst);
+            if let Ok(permit) = self.release.acquire().await {
+                permit.forget();
+            }
+        }
+        self.completed
+            .lock()
+            .expect("the completed-call log is never poisoned")
+            .push((ctx.call_id, body));
         Ok(RpcResponsePayload {
             status: RpcStatus::Ok,
             headers: vec![],
@@ -228,6 +277,28 @@ enum Step {
         reliable: bool,
         payload: String,
     },
+    /// `frames` copies of one frame shape, built and sent inside
+    /// the browser. The only way to cross a WHOLE-SESSION bound
+    /// (§12 / S0e §2: 256 frames, 256 KiB) without one HTTP round
+    /// trip per frame.
+    Burst {
+        id: u64,
+        session: String,
+        stream_id: String,
+        subprotocol: u16,
+        channel_hash: u16,
+        origin_hash: String,
+        reliable: bool,
+        /// How many frames to send.
+        frames: u64,
+        /// Payload bytes per frame (the packet is slightly larger).
+        payload_len: u64,
+        /// The byte the payload is filled with.
+        fill: u8,
+    },
+    /// Close one session's DataChannel, trickle socket and
+    /// `RTCPeerConnection` from the browser end.
+    Close { id: u64, session: String },
     /// Wait for one inbound frame on `subprotocol` and return it.
     /// `0` is the event plane; a control subprotocol (membership,
     /// capability announcement) carries its own id. Filtering here
@@ -261,6 +332,19 @@ struct StepResult {
     stats: Option<serde_json::Value>,
     #[serde(default)]
     info: Option<String>,
+    /// The negative `Connect` step could not even reach the
+    /// boundary it is supposed to fail at — an unaccepted offer, an
+    /// ICE failure, a DataChannel that never opened. A TEST ERROR,
+    /// never a pass (R7b).
+    #[serde(default)]
+    test_error: Option<bool>,
+    /// How far the negative `Connect` step got, stage by stage.
+    #[serde(default)]
+    stage: Option<serde_json::Value>,
+    #[serde(default)]
+    sent_frames: Option<u64>,
+    #[serde(default)]
+    sent_bytes: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -292,6 +376,8 @@ impl Script {
         match &mut step {
             Step::Connect { id: s, .. }
             | Step::Send { id: s, .. }
+            | Step::Burst { id: s, .. }
+            | Step::Close { id: s, .. }
             | Step::Expect { id: s, .. }
             | Step::Stats { id: s, .. }
             | Step::Done { id: s } => *s = id,
@@ -413,6 +499,8 @@ async fn next_step(State(s): State<PageState>) -> Response {
             let id = match &step {
                 Step::Connect { id, .. }
                 | Step::Send { id, .. }
+                | Step::Burst { id, .. }
+                | Step::Close { id, .. }
                 | Step::Expect { id, .. }
                 | Step::Stats { id, .. }
                 | Step::Done { id } => *id,
@@ -875,6 +963,20 @@ async fn main() {
             //     IMPOSTOR's own static key instead of the
             //     credential's, so the MITM handshake succeeds and
             //     the MITM witness must FAIL.
+            //   mitm-offer-refused      — the MITM step presents a
+            //     corrupted credential, so the offer is REFUSED. The
+            //     pinned-key boundary is never reached, and the
+            //     witness must FAIL as a TEST ERROR — this is the
+            //     shape the old `catch { ok: true }` passed (R7b).
+            //   protected-denial-uncorrelated — the protected
+            //     REQUEST is sent under a different call id than the
+            //     verdict correlates against: the denial still
+            //     arrives and the handler still never runs, so only
+            //     the CALL CORRELATION fails (R7d).
+            //   mdns-off-from-the-start — the measurement launch
+            //     disables Chromium's mDNS obfuscation. Pairs still
+            //     form, so the diagnostic sweep still passes, but
+            //     `mdns_on_pair_formed` must FAIL.
             //   skip-enrollment-request — the enrollment REQUEST is
             //     never sent, so nothing may be promoted and the
             //     enrollment witness must FAIL.
@@ -994,8 +1096,19 @@ async fn run(
     println!("[harness] loopback anchor rtc socket: {loop_rtc_addr}");
 
     // --- 3. services on the anchor ---------------------------------
+    let enroll_completed: Arc<std::sync::Mutex<Vec<(u64, Vec<u8>)>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let enroll_parked = Arc::new(AtomicUsize::new(0));
+    let enroll_release = Arc::new(tokio::sync::Semaphore::new(0));
     let _enroll = anchor
-        .serve_rpc(ENROLL_SERVICE, Arc::new(Enrollment))
+        .serve_rpc(
+            ENROLL_SERVICE,
+            Arc::new(Enrollment {
+                completed: Arc::clone(&enroll_completed),
+                parked: Arc::clone(&enroll_parked),
+                release: Arc::clone(&enroll_release),
+            }),
+        )
         .map_err(|e| format!("serve {ENROLL_SERVICE}: {e}"))?;
     let other_calls = Arc::new(AtomicUsize::new(0));
     let _other = anchor
@@ -1103,9 +1216,23 @@ async fn run(
     // --- 7. Chromium ------------------------------------------------
     let profile = work.join("chrome-profile");
     let chrome_log = work.join("chrome.log");
-    let mut child = launch_chromium(&chrome, &profile, &page_url, false, &chrome_log)
+    // `mdns-off-from-the-start` is the inverse for the mDNS split:
+    // the diagnostic sweep still records pairs (so the old
+    // measurement verdict is still satisfied), but nothing ran with
+    // Chromium's obfuscation ON, so `mdns_on_pair_formed` must FAIL.
+    let measure_with_mdns_off = inverse == "mdns-off-from-the-start";
+    let mut child = launch_chromium(&chrome, &profile, &page_url, measure_with_mdns_off, &chrome_log)
         .map_err(|e| format!("chromium: {e}"))?;
-    println!("[harness] chromium launched WITHOUT --disable-features=WebRtcHideLocalIpsWithMdns");
+    // Every probe below is attributed to this flag: a pair that
+    // formed with the obfuscation DISABLED can never satisfy the
+    // mDNS-on verdict.
+    let mdns_on_for_measurement = !measure_with_mdns_off;
+    println!(
+        "[harness] chromium launched {} --disable-features=WebRtcHideLocalIpsWithMdns \
+         (mDNS obfuscation {})",
+        if measure_with_mdns_off { "WITH" } else { "WITHOUT" },
+        if mdns_on_for_measurement { "ON" } else { "OFF" },
+    );
 
     let mut script = Script {
         tx: step_tx,
@@ -1114,9 +1241,43 @@ async fn run(
 
     // ================================================================
     // Slice 3 — the mDNS measurement
+    //
+    // Two separate things live here, and they are now two separate
+    // verdicts:
+    //
+    //   `mdns_candidate_pair_measured` — the DIAGNOSTIC sweep. It
+    //     records what each `(interface, iceServers)` configuration
+    //     did, including "NO PAIR", because the sweep's value is the
+    //     comparison. It cannot, and must not, stand in for pair
+    //     formation.
+    //   `mdns_on_pair_formed` — the REQUIRED verdict: a pair that
+    //     actually formed with Chromium's mDNS obfuscation ON,
+    //     naming the interface and BOTH halves of the selected pair
+    //     (the browser's `getStats()` and the anchor's
+    //     `selected_pair`). Previously a nonempty diagnostic log
+    //     passed while every mDNS-on attempt had failed and the
+    //     §12 witnesses ran with the obfuscation disabled.
     // ================================================================
     let mut mdns_lines: Vec<String> = Vec::new();
     let mut working_stun: Option<Option<String>> = None;
+
+    /// One probe's pair evidence, kept structured so the required
+    /// verdict reads facts rather than re-parsing a log line.
+    struct PairEvidence {
+        label: &'static str,
+        /// The interface the ANCHOR is bound to for this probe.
+        interface: String,
+        /// Was Chromium's mDNS obfuscation ON for this attempt?
+        mdns_on: bool,
+        /// Did the browser reach a Noise session at all?
+        session: bool,
+        /// The browser's selected candidate pair, if it reported one.
+        browser_pair: Option<serde_json::Value>,
+        /// The anchor's own transmit destination for this peer.
+        anchor_pair: Option<String>,
+        open_ms: f64,
+    }
+    let mut pair_evidence: Vec<PairEvidence> = Vec::new();
 
     struct Probe {
         label: &'static str,
@@ -1126,6 +1287,8 @@ async fn run(
         anchor_node: u64,
         stun: Option<String>,
         node_id: u64,
+        /// The anchor-side interface this probe exercises.
+        interface: String,
     }
     // Ordering is deliberate: the STUN variant runs FIRST on
     // loopback and SECOND on the interface. If a failure tracked
@@ -1133,6 +1296,11 @@ async fn run(
     // together on the same position — they do not, so a failure is
     // the `iceServers` configuration and not "the second session
     // on this anchor".
+    let loop_iface = format!("loopback 127.0.0.1 (anchor rtc {loop_rtc_addr})");
+    let lan_iface = match lan {
+        Some(v4) => format!("{v4} (anchor rtc {anchor_rtc_addr})"),
+        None => "<none>".to_string(),
+    };
     let mut probes = vec![
         Probe {
             label: "loopback/anchor-stun",
@@ -1142,6 +1310,7 @@ async fn run(
             anchor_node: loop_anchor.node_id(),
             stun: Some(format!("stun:{loop_rtc_addr}")),
             node_id: 0xB0B0_0102,
+            interface: loop_iface.clone(),
         },
         Probe {
             label: "loopback/no-stun",
@@ -1151,6 +1320,7 @@ async fn run(
             anchor_node: loop_anchor.node_id(),
             stun: None,
             node_id: 0xB0B0_0101,
+            interface: loop_iface.clone(),
         },
     ];
     if lan.is_some() {
@@ -1162,6 +1332,7 @@ async fn run(
             anchor_node: anchor.node_id(),
             stun: None,
             node_id: 0xB0B0_0103,
+            interface: lan_iface.clone(),
         });
         probes.push(Probe {
             label: "interface/anchor-stun",
@@ -1171,6 +1342,7 @@ async fn run(
             anchor_node: anchor.node_id(),
             stun: Some(format!("stun:{anchor_rtc_addr}")),
             node_id: 0xB0B0_0104,
+            interface: lan_iface.clone(),
         });
     } else {
         mdns_lines.push(
@@ -1205,6 +1377,15 @@ async fn run(
                 probe.label,
                 r.error.clone().unwrap_or_else(|| "unknown".into())
             ));
+            pair_evidence.push(PairEvidence {
+                label: probe.label,
+                interface: probe.interface.clone(),
+                mdns_on: mdns_on_for_measurement,
+                session: false,
+                browser_pair: None,
+                anchor_pair: None,
+                open_ms: f64::NAN,
+            });
             continue;
         }
         if working_stun.is_none() {
@@ -1216,32 +1397,49 @@ async fn run(
                 session: format!("mdns-{}", probe.label),
             })
             .await;
+        // `{"selected":null}` is the page saying "no pair in
+        // getStats"; only a pair with a `state` is evidence.
+        let browser_selected = stats
+            .stats
+            .as_ref()
+            .filter(|v| v.get("state").is_some())
+            .cloned();
         let browser_pair = stats
             .stats
+            .as_ref()
             .map(|v| v.to_string())
             .unwrap_or_else(|| "<no getStats>".into());
         // The anchor-side half. str0m 0.23.1 exposes no candidate
         // TYPE; `selected_pair` reports the address traffic is going
         // to and whether that address was ever signalled.
-        let anchor_pair = match node.peer_endpoint(probe.node_id) {
-            Some(PeerAddr::Rtc(id)) => match node
+        let anchor_selected = match node.peer_endpoint(probe.node_id) {
+            Some(PeerAddr::Rtc(id)) => node
                 .rtc_driver()
                 .expect("rtc driver")
                 .selected_pair(id)
                 .await
-            {
-                Some((local, remote, learned)) => {
+                .map(|(local, remote, learned)| {
                     format!("local={local} remote={remote} learned={learned}")
-                }
-                None => "<no transmit destination recorded yet>".into(),
-            },
-            _ => "<no rtc endpoint on the anchor>".into(),
+                }),
+            _ => None,
         };
+        let anchor_pair = anchor_selected
+            .clone()
+            .unwrap_or_else(|| "<no transmit destination recorded yet>".into());
         mdns_lines.push(format!(
             "{}: PAIR FORMED in {:.0} ms; browser getStats {browser_pair}; anchor {anchor_pair}",
             probe.label,
             r.open_ms.unwrap_or(f64::NAN)
         ));
+        pair_evidence.push(PairEvidence {
+            label: probe.label,
+            interface: probe.interface.clone(),
+            mdns_on: mdns_on_for_measurement,
+            session: true,
+            browser_pair: browser_selected,
+            anchor_pair: anchor_selected,
+            open_ms: r.open_ms.unwrap_or(f64::NAN),
+        });
     }
 
     // If nothing formed with mDNS on, relaunch the browser with the
@@ -1267,11 +1465,69 @@ async fn run(
     for line in &mdns_lines {
         println!("[mdns] {line}");
     }
+    // The DIAGNOSTIC sweep. "NO PAIR" rows are part of its value,
+    // so it passes on a nonempty comparison — and for exactly that
+    // reason it can never be the pair-formation evidence.
     ledger.record(
         "mdns_candidate_pair_measured",
         !mdns_lines.is_empty(),
-        mdns_lines.join(" | "),
+        format!("DIAGNOSTIC sweep (not pair evidence): {}", mdns_lines.join(" | ")),
     );
+
+    // The REQUIRED verdict: a candidate pair that formed while
+    // Chromium's mDNS obfuscation was ON, with both halves of the
+    // pair named. When the host has a routable interface, that
+    // interface is where it has to be proven — a loopback pair says
+    // nothing about a browser reaching an anchor across a LAN.
+    {
+        let want_interface = lan.is_some();
+        let qualifies = |e: &&PairEvidence| {
+            e.mdns_on
+                && e.session
+                && e.browser_pair.is_some()
+                && e.anchor_pair.is_some()
+                && (!want_interface || e.label.starts_with("interface/"))
+        };
+        let formed = pair_evidence.iter().find(qualifies);
+        let detail = match formed {
+            Some(e) => format!(
+                "interface={} pair=browser{} anchor[{}] — probe {} formed in {:.0} ms with \
+                 Chromium's mDNS obfuscation ON (no --disable-features=WebRtcHideLocalIpsWithMdns)",
+                e.interface,
+                e.browser_pair
+                    .as_ref()
+                    .map(std::string::ToString::to_string)
+                    .unwrap_or_default(),
+                e.anchor_pair.clone().unwrap_or_default(),
+                e.label,
+                e.open_ms,
+            ),
+            None => format!(
+                "NO candidate pair formed with Chromium's mDNS obfuscation ON{}. \
+                 Evidence per probe: [{}]. The diagnostic sweep above CANNOT satisfy \
+                 this verdict; an mDNS client on the anchor (the plan's answer (c)) is \
+                 required on this host.",
+                if want_interface {
+                    format!(" on the routable interface {lan_iface}")
+                } else {
+                    String::new()
+                },
+                pair_evidence
+                    .iter()
+                    .map(|e| format!(
+                        "{}: mdns_on={} session={} browser_pair={} anchor_pair={}",
+                        e.label,
+                        e.mdns_on,
+                        e.session,
+                        e.browser_pair.is_some(),
+                        e.anchor_pair.is_some()
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+        };
+        ledger.record("mdns_on_pair_formed", formed.is_some(), detail);
+    }
 
     // ================================================================
     // The §12 witnesses
@@ -1433,9 +1689,48 @@ async fn run(
             );
 
             // ---- the sixth §12 item: enrolled is not authorized ----
+            //
+            // R7d. This used to ignore the Send result and check
+            // only "the handler ran zero times", which is equally
+            // true of a frame that never arrived, a session that
+            // was reclaimed, or a service that was never
+            // registered. The evidence is now **call-correlated at
+            // the completed boundary**, and the correlation used is
+            // the TYPED ERROR THE BROWSER RECEIVES BACK: an
+            // `RpcStatus::AdmissionDenied` (0x0009) whose
+            // `EventMeta` call id is the call id this witness sent,
+            // decrypted in the browser and decoded here.
+            //
+            // Why that and not a refusal counter: `RtcStats` has no
+            // per-call-id refusal counter (and adding one to the
+            // core is out of this repair's scope), so a counter
+            // could only say "some call was refused in this
+            // window" — which a concurrent witness could satisfy.
+            // The typed terminal is call-correlated BY
+            // CONSTRUCTION: it carries the call id, it can only
+            // exist if the REQUEST reached the protected service's
+            // admission gate, and it is unicast to the
+            // AEAD-authenticated session that sent it. Zero handler
+            // executions stays as the second half — the denial has
+            // to be a refusal, not a reply from a handler that ran.
             let before = protected_calls.load(Ordering::SeqCst);
-            let frame = rpc_request_frame(PROTECTED_SERVICE, enroll_origin, 0xC0FF_EE02, b"{}");
-            let _ = script
+            let protected_call: u64 = 0xC0FF_EE02;
+            // The inverse for R7d: send the REQUEST under a
+            // DIFFERENT call id than the verdict correlates
+            // against. The denial still arrives, the handler still
+            // never runs — and the verdict must go RED, because it
+            // is the correlation that is being asserted.
+            let sent_call = if inverse == "protected-denial-uncorrelated" {
+                println!(
+                    "[harness] INVERSE: sending the protected REQUEST as call \
+                     0xC0FFEE99 while the verdict correlates 0x{protected_call:X}"
+                );
+                0xC0FF_EE99
+            } else {
+                protected_call
+            };
+            let frame = rpc_request_frame(PROTECTED_SERVICE, enroll_origin, sent_call, b"{}");
+            let sent = script
                 .run(Step::Send {
                     id: 0,
                     session: "enroll".into(),
@@ -1448,7 +1743,22 @@ async fn run(
                     payload: hex(&frame.payload),
                 })
                 .await;
-            tokio::time::sleep(Duration::from_millis(1200)).await;
+            // The terminal the browser gets back for that call.
+            let terminal = script
+                .run(Step::Expect {
+                    id: 0,
+                    session: "enroll".into(),
+                    subprotocol: 0,
+                    timeout_ms: 15_000,
+                })
+                .await;
+            let observed = terminal
+                .frame
+                .as_deref()
+                .map(unhex)
+                .and_then(|f| response_call_and_status(&f));
+            let denied_this_call =
+                observed == Some((protected_call, RpcStatus::AdmissionDenied));
             let after = protected_calls.load(Ordering::SeqCst);
             // The caller must still BE there and be enrolled: a
             // session that was reclaimed also never invokes the
@@ -1457,13 +1767,22 @@ async fn run(
             let still_live = anchor.peer_session_id(enroll_node) == session_at_install;
             ledger.record(
                 "enrolled_without_authority_is_still_denied",
-                promoted && still_live && after == before,
+                promoted && still_live && sent.ok && denied_this_call && after == before,
                 format!(
                     "the caller is ENROLLED and still the same live session \
                      (promoted={promoted}, session unchanged={still_live}, \
-                     peer_is_provisional={}); the registered protected handler ran {} \
-                     time(s)",
+                     peer_is_provisional={}); the REQUEST was sent={} ({}); the \
+                     browser received back {:?} and the witness correlates \
+                     (call=0x{protected_call:X}, AdmissionDenied)={denied_this_call} \
+                     ({}); the registered protected handler ran {} time(s)",
                     anchor.peer_is_provisional(enroll_node),
+                    sent.ok,
+                    sent.error.clone().unwrap_or_else(|| "no error".into()),
+                    observed,
+                    terminal
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "terminal received".into()),
                     after - before
                 ),
             );
@@ -1604,8 +1923,29 @@ async fn run(
     }
 
     // ---- (e) + (f) transit, local delivery, redirection -----------
+    //
+    // R7c. The locally-addressed half used to send `b"transit"` and
+    // read an UNCHANGED transit-refusal counter as "delivered
+    // locally" — which is equally true of a frame that was refused
+    // at the *delivery* gate, dropped, or never sent at all (the
+    // Send result was discarded too). Both halves are now positive
+    // facts:
+    //
+    //   * the REDIRECTED envelope is refused as transit, counted;
+    //   * the LOCALLY-ADDRESSED envelope carries a correlated
+    //     enrollment REQUEST — the one action §12 permits a
+    //     provisional session — whose nonce the runner generated,
+    //     and the witness passes only when the anchor's REAL
+    //     registered enrollment handler completed THAT call with
+    //     THAT body. The outcome is decoded on the anchor, not
+    //     inferred from an absence.
+    //
+    // The redirected envelope goes first, while the session is
+    // still provisional: the local one ends with this session
+    // enrolled.
     {
         let node_id: u64 = 0xB0B0_0005;
+        let origin: u64 = 0xE1E1_0000_0000_0005;
         let r = conn.connect(&mut script, "transit", node_id).await;
         if !r.ok {
             ledger.record(
@@ -1619,28 +1959,9 @@ async fn run(
                 "no session",
             );
         } else {
-            // (f) part 1 — an envelope whose dest IS the anchor is
-            // local delivery, never transit.
-            let before_local = anchor.rtc_stats().admission_refused_transit();
-            let _ = script
-                .run(Step::Send {
-                    id: 0,
-                    session: "transit".into(),
-                    prefix: hex(&routing_prefix(anchor.node_id(), node_id)),
-                    stream_id: format!("{TRANSIT_STREAM_ID:x}"),
-                    subprotocol: 0,
-                    channel_hash: 0,
-                    origin_hash: format!("{node_id:016x}"),
-                    reliable: false,
-                    payload: hex(b"transit"),
-                })
-                .await;
-            tokio::time::sleep(Duration::from_millis(800)).await;
-            let after_local = anchor.rtc_stats().admission_refused_transit();
-
-            // (e) + (f) part 2 — the same envelope redirected at a
-            // third party.
-            let _ = script
+            // (e) — the envelope redirected at a third party.
+            let before_transit = anchor.rtc_stats().admission_refused_transit();
+            let redirected = script
                 .run(Step::Send {
                     id: 0,
                     session: "transit".into(),
@@ -1648,39 +1969,118 @@ async fn run(
                     stream_id: format!("{TRANSIT_STREAM_ID:x}"),
                     subprotocol: 0,
                     channel_hash: 0,
-                    origin_hash: format!("{node_id:016x}"),
+                    origin_hash: format!("{origin:016x}"),
                     reliable: false,
                     payload: hex(b"transit"),
                 })
                 .await;
-            let refused = wait_for(
-                || anchor.rtc_stats().admission_refused_transit() > after_local,
-                Duration::from_secs(10),
-            )
-            .await;
+            let refused = redirected.ok
+                && wait_for(
+                    || anchor.rtc_stats().admission_refused_transit() > before_transit,
+                    Duration::from_secs(10),
+                )
+                .await;
             ledger.record(
                 "provisional_transit_is_refused",
                 refused,
                 format!(
-                    "admission_refused_transit {} -> {} for a third-party dest_id",
-                    after_local,
+                    "the envelope was sent={} ({}); admission_refused_transit {} -> {} \
+                     for a third-party dest_id",
+                    redirected.ok,
+                    redirected.error.clone().unwrap_or_else(|| "no error".into()),
+                    before_transit,
                     anchor.rtc_stats().admission_refused_transit()
                 ),
             );
+
+            // (f) — the locally-addressed envelope. Its reply
+            // channel subscription first: the same single
+            // subscription §12 permits, and the same shape witness
+            // (a) uses, so the enrollment call inside the envelope
+            // is the permitted action and nothing here widens the
+            // allow-list.
+            let sub = subscribe_payload(&enroll_reply_channel(origin), 0x5B5B_0005);
+            let subscribed = script
+                .run(Step::Send {
+                    id: 0,
+                    session: "transit".into(),
+                    prefix: String::new(),
+                    stream_id: format!("{:x}", SUBPROTOCOL_CHANNEL_MEMBERSHIP as u64),
+                    subprotocol: SUBPROTOCOL_CHANNEL_MEMBERSHIP,
+                    channel_hash: 0,
+                    origin_hash: format!("{origin:016x}"),
+                    reliable: false,
+                    payload: hex(&sub),
+                })
+                .await;
+            // The nonce is generated HERE, so the handler seeing it
+            // cannot be explained by anything but this envelope
+            // having been decrypted, routed locally, decoded and
+            // dispatched.
+            let nonce: u64 = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0x5EED_5EED_5EED_5EED);
+            let mut local_body = Vec::from(*b"local-envelope:");
+            local_body.extend_from_slice(format!("{nonce:016x}").as_bytes());
+            let local_call: u64 = 0xC0FF_EE05;
+            let frame = rpc_request_frame(ENROLL_SERVICE, origin, local_call, &local_body);
+            let before_local = anchor.rtc_stats().admission_refused_transit();
+            let local = script
+                .run(Step::Send {
+                    id: 0,
+                    session: "transit".into(),
+                    // The envelope's dest IS the anchor: local
+                    // delivery, never transit.
+                    prefix: hex(&routing_prefix(anchor.node_id(), node_id)),
+                    stream_id: format!("{:x}", frame.stream_id),
+                    subprotocol: 0,
+                    channel_hash: frame.channel_hash_u16,
+                    origin_hash: format!("{origin:016x}"),
+                    reliable: true,
+                    payload: hex(&frame.payload),
+                })
+                .await;
+            let delivered = local.ok
+                && wait_for(
+                    || Enrollment::completed_call(&enroll_completed, local_call, &local_body),
+                    Duration::from_secs(20),
+                )
+                .await;
+            let after_local = anchor.rtc_stats().admission_refused_transit();
             ledger.record(
                 "local_envelope_accepted_redirected_denied",
-                after_local == before_local && refused,
+                subscribed.ok && local.ok && delivered && after_local == before_local && refused,
                 format!(
-                    "locally-addressed envelope: refusals {before_local} -> {after_local} \
-                     (unchanged means it was delivered locally, not refused); \
-                     redirected envelope refused = {refused}"
+                    "reply-channel Subscribe sent={}; the locally-addressed ROUTED \
+                     envelope was sent={} ({}); the anchor's registered {ENROLL_SERVICE} \
+                     handler COMPLETED call 0x{local_call:X} with the runner's nonce \
+                     {nonce:016x}={delivered}; transit refusals {before_local} -> \
+                     {after_local} (a local envelope is not transit); redirected \
+                     envelope refused={refused}",
+                    subscribed.ok,
+                    local.ok,
+                    local.error.clone().unwrap_or_else(|| "no error".into()),
                 ),
             );
         }
     }
 
     // ================================================================
-    // Slice 5 — the MITM witness
+    // Slice 5 — the pinned-key (MITM) witness
+    //
+    // R7b. The page no longer reports "failed as required" for any
+    // exception: it asserts, in order, that the offer was ACCEPTED,
+    // the DataChannel OPENED, Noise was constructed and msg1 was
+    // SENT, and only then that the attempt died at the PINNED-KEY
+    // boundary. Anything short of that arrives here as
+    // `test_error`, and is recorded as a distinct FAIL — an HTTP or
+    // ICE failure is a broken witness, not a refused MITM.
+    //
+    // The success control is the same code path against the REAL
+    // anchor with the SAME credential: if that cannot reach a
+    // session, the negative result above is not evidence about the
+    // pinned key.
     // ================================================================
     {
         let node_id: u64 = 0xB0B0_0006;
@@ -1704,7 +2104,18 @@ async fn run(
                     anchor_pub_hex.clone()
                 },
                 anchor_node_id: format!("{:016x}", impostor.node_id()),
-                credential: anchor_cred.clone(),
+                credential: if inverse == "mitm-offer-refused" {
+                    // The inverse that proves the catch-all is gone:
+                    // a credential the listener must refuse, so the
+                    // offer is never accepted. The old code reported
+                    // that as a PASS.
+                    println!("[harness] INVERSE: presenting a corrupted credential to the impostor");
+                    let mut bad = anchor_cred.clone();
+                    bad.push('x');
+                    bad
+                } else {
+                    anchor_cred.clone()
+                },
                 stun: stun.clone(),
                 timeout_ms: 15_000,
                 expect_failure: true,
@@ -1713,17 +2124,338 @@ async fn run(
         tokio::time::sleep(Duration::from_millis(1500)).await;
         let peers_after = impostor.peer_count();
         let prov_after = impostor.provisional_count();
-        let handshake_failed = r.ok; // `expect_failure` inverts `ok`
+        // `expect_failure` inverts `ok`: `ok` means "reached the
+        // pinned-key boundary and failed there".
+        let failed_at_pinned_key = r.ok;
+        let test_error = r.test_error.unwrap_or(false);
+
+        // The correct-key success control: the real anchor, the same
+        // credential, the same `doConnect` path.
+        let control_node: u64 = 0xB0B0_0016;
+        let control = conn.connect(&mut script, "mitm-control", control_node).await;
+        let control_session_on_anchor = anchor.peer_session_id(control_node);
+        let control_ok = control.ok
+            && control.session_id.is_some()
+            && control_session_on_anchor.map(|s| format!("{s:016x}")) == control.session_id;
+
         ledger.record(
             "mitm_anchor_fails_the_handshake_and_installs_nothing",
-            handshake_failed && peers_after == peers_before && prov_after == prov_before,
+            failed_at_pinned_key
+                && !test_error
+                && control_ok
+                && peers_after == peers_before
+                && prov_after == prov_before,
             format!(
-                "browser handshake against the credential-pinned key failed = \
-                 {handshake_failed} ({}); impostor peer_count {peers_before} -> \
-                 {peers_after}, provisional {prov_before} -> {prov_after}",
-                r.info.unwrap_or_else(|| "no detail".into())
+                "impostor attempt: failed AT THE PINNED-KEY BOUNDARY={failed_at_pinned_key}, \
+                 test_error={test_error} — {} [stages {}]; impostor peer_count \
+                 {peers_before} -> {peers_after}, provisional {prov_before} -> \
+                 {prov_after}; correct-key control against the real anchor reached a \
+                 session={control_ok} (browser {:?}, anchor {:?})",
+                r.info
+                    .clone()
+                    .or_else(|| r.error.clone())
+                    .unwrap_or_else(|| "no detail".into()),
+                r.stage
+                    .as_ref()
+                    .map(std::string::ToString::to_string)
+                    .unwrap_or_else(|| "<none>".into()),
+                control.session_id,
+                control_session_on_anchor,
             ),
         );
+    }
+
+    // ================================================================
+    // R7a — the two browser schedules the original brief named and
+    // Stage 4b never drove from a browser.
+    // ================================================================
+
+    // ---- an old enrollment exchange cannot promote a SUCCESSOR ----
+    //
+    // The 4a R2-A property, now driven from Chromium: an enrollment
+    // call is parked inside the anchor's real provider, the browser
+    // session that made it goes away, a SECOND browser session
+    // claims the same node id, and only then does the old call
+    // complete. Its completion must promote nothing — the
+    // reservation it was armed with named an incarnation that no
+    // longer exists — while the successor's OWN call still can.
+    {
+        let node_id: u64 = 0xB0B0_0007;
+        let origin: u64 = 0xE1E1_0000_0000_0007;
+        let reply_channel = enroll_reply_channel(origin);
+        let hold_call: u64 = 0xC0FF_EE07;
+        let own_call: u64 = 0xC0FF_EE08;
+        let hold_body = Vec::from(*b"hold:the-old-exchange");
+
+        let old = conn.connect(&mut script, "replace-old", node_id).await;
+        if !old.ok {
+            ledger.record(
+                "browser_enrollment_survives_replacement",
+                false,
+                format!(
+                    "the first browser session never established: {}",
+                    old.error.unwrap_or_default()
+                ),
+            );
+        } else {
+            let old_session = anchor.peer_session_id(node_id);
+            let sub = subscribe_payload(&reply_channel, 0x5B5B_0007);
+            let subscribed = script
+                .run(Step::Send {
+                    id: 0,
+                    session: "replace-old".into(),
+                    prefix: String::new(),
+                    stream_id: format!("{:x}", SUBPROTOCOL_CHANNEL_MEMBERSHIP as u64),
+                    subprotocol: SUBPROTOCOL_CHANNEL_MEMBERSHIP,
+                    channel_hash: 0,
+                    origin_hash: format!("{origin:016x}"),
+                    reliable: false,
+                    payload: hex(&sub),
+                })
+                .await;
+            let parked_before = enroll_parked.load(Ordering::SeqCst);
+            let frame = rpc_request_frame(ENROLL_SERVICE, origin, hold_call, &hold_body);
+            let held_sent = script
+                .run(Step::Send {
+                    id: 0,
+                    session: "replace-old".into(),
+                    prefix: String::new(),
+                    stream_id: format!("{:x}", frame.stream_id),
+                    subprotocol: 0,
+                    channel_hash: frame.channel_hash_u16,
+                    origin_hash: format!("{origin:016x}"),
+                    reliable: true,
+                    payload: hex(&frame.payload),
+                })
+                .await;
+            // The call is INSIDE the provider, parked, with its
+            // promotion reservation armed against this incarnation.
+            let parked = held_sent.ok
+                && wait_for(
+                    || enroll_parked.load(Ordering::SeqCst) > parked_before,
+                    Duration::from_secs(20),
+                )
+                .await;
+            let reserved = old_session.is_some_and(|s| {
+                anchor.kyra_has_enrollment_reservation(node_id, s, hold_call)
+            });
+
+            // The browser session goes away with the call still in
+            // flight.
+            let closed = script
+                .run(Step::Close {
+                    id: 0,
+                    session: "replace-old".into(),
+                })
+                .await;
+            let evicted = wait_for(
+                || anchor.peer_session_id(node_id).is_none(),
+                Duration::from_secs(25),
+            )
+            .await;
+
+            // The SUCCESSOR: a second browser session claiming the
+            // same node id, and — as a reconnecting browser would —
+            // the same origin and reply channel.
+            let new = conn.connect(&mut script, "replace-new", node_id).await;
+            let new_session = anchor.peer_session_id(node_id);
+            let sub = subscribe_payload(&reply_channel, 0x5B5B_0008);
+            let new_subscribed = script
+                .run(Step::Send {
+                    id: 0,
+                    session: "replace-new".into(),
+                    prefix: String::new(),
+                    stream_id: format!("{:x}", SUBPROTOCOL_CHANNEL_MEMBERSHIP as u64),
+                    subprotocol: SUBPROTOCOL_CHANNEL_MEMBERSHIP,
+                    channel_hash: 0,
+                    origin_hash: format!("{origin:016x}"),
+                    reliable: false,
+                    payload: hex(&sub),
+                })
+                .await;
+
+            // Release the OLD exchange, and watch what it can do.
+            let promoted_before = anchor.rtc_stats().admission_promoted();
+            let orphaned_before = anchor.rtc_stats().admission_promotion_orphaned();
+            enroll_release.add_permits(1);
+            let old_completed = wait_for(
+                || Enrollment::completed_call(&enroll_completed, hold_call, &hold_body),
+                Duration::from_secs(20),
+            )
+            .await;
+            let orphaned = wait_for(
+                || anchor.rtc_stats().admission_promotion_orphaned() > orphaned_before,
+                Duration::from_secs(10),
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            let promoted_delta = anchor.rtc_stats().admission_promoted() - promoted_before;
+            let successor_untouched = anchor.peer_is_provisional(node_id)
+                && anchor.peer_session_id(node_id) == new_session
+                && new_session.is_some()
+                && new_session != old_session;
+
+            // The positive control: the successor's OWN enrollment
+            // call still promotes it. Without this the verdict would
+            // also pass on an anchor that can never promote anything.
+            let frame = rpc_request_frame(ENROLL_SERVICE, origin, own_call, b"join");
+            let own_sent = script
+                .run(Step::Send {
+                    id: 0,
+                    session: "replace-new".into(),
+                    prefix: String::new(),
+                    stream_id: format!("{:x}", frame.stream_id),
+                    subprotocol: 0,
+                    channel_hash: frame.channel_hash_u16,
+                    origin_hash: format!("{origin:016x}"),
+                    reliable: true,
+                    payload: hex(&frame.payload),
+                })
+                .await;
+            let own_promoted = own_sent.ok
+                && wait_for(
+                    || {
+                        anchor.rtc_stats().admission_promoted() > promoted_before
+                            && !anchor.peer_is_provisional(node_id)
+                            && anchor.peer_session_id(node_id) == new_session
+                    },
+                    Duration::from_secs(25),
+                )
+                .await;
+
+            ledger.record(
+                "browser_enrollment_survives_replacement",
+                subscribed.ok
+                    && parked
+                    && reserved
+                    && closed.ok
+                    && evicted
+                    && new.ok
+                    && new_subscribed.ok
+                    && old_completed
+                    && orphaned
+                    && promoted_delta == 0
+                    && successor_untouched
+                    && own_promoted,
+                format!(
+                    "old session {old_session:?}: call 0x{hold_call:X} parked in the \
+                     provider={parked}, reservation armed for that incarnation={reserved}; \
+                     browser closed it={} and the anchor evicted the peer={evicted}; \
+                     successor session {new_session:?} installed={} (subscribed={}); the \
+                     OLD call then completed={old_completed} and was counted \
+                     orphaned={orphaned} (admission_promotion_orphaned {} -> {}); \
+                     admission_promoted +{promoted_delta} and the successor is \
+                     untouched={successor_untouched} (provisional={}); the successor's OWN \
+                     call 0x{own_call:X} promoted it={own_promoted}",
+                    closed.ok,
+                    new.ok,
+                    new_subscribed.ok,
+                    orphaned_before,
+                    anchor.rtc_stats().admission_promotion_orphaned(),
+                    anchor.peer_is_provisional(node_id),
+                ),
+            );
+        }
+    }
+
+    // ---- the per-session §12 bounds close a browser session -------
+    //
+    // The bounds that landed in 4a (`MAX_PROVISIONAL_FRAMES`,
+    // `MAX_PROVISIONAL_BYTES`, `MAX_PROVISIONAL_STREAMS`), NOT the
+    // owner-pending §12.5 policies. A burst under every bound leaves
+    // the session installed; crossing the whole-session BYTE bound
+    // closes and reclaims it, observed on the anchor.
+    {
+        let node_id: u64 = 0xB0B0_0009;
+        let origin: u64 = 0xE1E1_0000_0000_0009;
+        let r = conn.connect(&mut script, "bounds", node_id).await;
+        if !r.ok {
+            ledger.record(
+                "browser_session_bounds_are_enforced",
+                false,
+                format!("no session: {}", r.error.unwrap_or_default()),
+            );
+        } else {
+            let installed = std::time::Instant::now();
+            let session = anchor.peer_session_id(node_id);
+            // Well under 256 frames, 256 KiB and the 64 KiB tracked
+            // stream bytes: the session must survive this, or the
+            // close below would prove nothing about a bound.
+            let control = script
+                .run(Step::Burst {
+                    id: 0,
+                    session: "bounds".into(),
+                    stream_id: format!("{TRANSIT_STREAM_ID:x}"),
+                    subprotocol: 0,
+                    channel_hash: 0,
+                    origin_hash: format!("{origin:016x}"),
+                    reliable: false,
+                    frames: 4,
+                    payload_len: 7_900,
+                    fill: 0xA5,
+                })
+                .await;
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+            let alive_after_control = anchor.peer_session_id(node_id) == session;
+            let reclaimed_before = anchor.rtc_stats().admission_reclaimed();
+
+            // Now cross `MAX_PROVISIONAL_BYTES`.
+            let over = script
+                .run(Step::Burst {
+                    id: 0,
+                    session: "bounds".into(),
+                    stream_id: format!("{TRANSIT_STREAM_ID:x}"),
+                    subprotocol: 0,
+                    channel_hash: 0,
+                    origin_hash: format!("{origin:016x}"),
+                    reliable: false,
+                    frames: 48,
+                    payload_len: 7_900,
+                    fill: 0xA5,
+                })
+                .await;
+            let sent_bytes =
+                control.sent_bytes.unwrap_or(0) + over.sent_bytes.unwrap_or(0);
+            let sent_frames =
+                control.sent_frames.unwrap_or(0) + over.sent_frames.unwrap_or(0);
+            let closed = wait_for(
+                || anchor.peer_session_id(node_id) != session,
+                Duration::from_secs(20),
+            )
+            .await;
+            let reclaimed = anchor.rtc_stats().admission_reclaimed() > reclaimed_before;
+            let elapsed = installed.elapsed();
+            // The whole schedule finishes well inside
+            // `PROVISIONAL_TTL`, so expiry cannot be the reason the
+            // session went away.
+            let before_ttl = elapsed < PROVISIONAL_TTL;
+            ledger.record(
+                "browser_session_bounds_are_enforced",
+                alive_after_control
+                    && closed
+                    && reclaimed
+                    && before_ttl
+                    && sent_bytes > MAX_PROVISIONAL_BYTES
+                    && sent_frames < u64::from(MAX_PROVISIONAL_FRAMES),
+                format!(
+                    "session {session:?}: {} control frame(s) ({} bytes) left it \
+                     installed={alive_after_control}; the browser then sent {} frame(s) \
+                     for {sent_bytes} bytes total — over MAX_PROVISIONAL_BYTES \
+                     ({MAX_PROVISIONAL_BYTES}) and under MAX_PROVISIONAL_FRAMES \
+                     ({MAX_PROVISIONAL_FRAMES}), so the BYTE bound is the one crossed; \
+                     the anchor closed the session={closed} (now {:?}), \
+                     admission_reclaimed {reclaimed_before} -> {} ({reclaimed}), \
+                     {:.1} s after install, inside PROVISIONAL_TTL={before_ttl} ({})",
+                    control.sent_frames.unwrap_or(0),
+                    control.sent_bytes.unwrap_or(0),
+                    sent_frames,
+                    anchor.peer_session_id(node_id),
+                    anchor.rtc_stats().admission_reclaimed(),
+                    elapsed.as_secs_f64(),
+                    over.info.clone().unwrap_or_default(),
+                ),
+            );
+        }
     }
 
     // --- done -------------------------------------------------------
@@ -1760,6 +2492,22 @@ fn response_carries_admitted_outcome(frame: &[u8]) -> bool {
         return false;
     };
     resp.body.as_ref() == admitted_outcome().as_ref()
+}
+
+/// The `(call_id, status)` of a decrypted event-plane nRPC RESPONSE
+/// — the typed terminal a caller gets back, including a refusal
+/// (`RpcStatus::AdmissionDenied`) emitted instead of dispatching a
+/// handler. The call id rides `EventMeta::seq_or_ts`, which is where
+/// the client's publish site puts it, so a terminal can be matched
+/// to the exact call that produced it (R7d).
+fn response_call_and_status(frame: &[u8]) -> Option<(u64, RpcStatus)> {
+    let meta = EventMeta::from_bytes(frame)?;
+    if meta.dispatch != DISPATCH_RPC_RESPONSE {
+        return None;
+    }
+    let body = frame.get(RPC_FRAME_BODY_OFFSET..)?;
+    let resp = RpcResponsePayload::decode(Bytes::copy_from_slice(body)).ok()?;
+    Some((meta.seq_or_ts, resp.status))
 }
 
 async fn wait_for<F: Fn() -> bool>(predicate: F, within: Duration) -> bool {
