@@ -217,6 +217,40 @@ fn write_cache(dir: &Path, cert_pem: &str, key_pem: &str) -> Result<(), Bootstra
 /// was world-readable, and a filesystem that refuses the mode left a
 /// readable key with no error at all.
 fn write_private_key(path: &Path, pem: &str) -> Result<(), BootstrapError> {
+    write_private_key_verified(path, pem, observed_mode)
+}
+
+/// The observed mode of a file, as the protection check reads it.
+#[cfg(unix)]
+fn observed_mode(path: &Path) -> Result<u32, BootstrapError> {
+    use std::os::unix::fs::PermissionsExt as _;
+    Ok(std::fs::metadata(path)
+        .map_err(|e| BootstrapError::Acme(format!("stat {}: {e}", path.display())))?
+        .permissions()
+        .mode()
+        & 0o777)
+}
+
+/// On Windows the file inherits the parent directory's ACL; there is
+/// no mode to read, and the check has nothing to assert.
+#[cfg(not(unix))]
+fn observed_mode(_path: &Path) -> Result<u32, BootstrapError> {
+    Ok(0o600)
+}
+
+/// [`write_private_key`] with the protection observation injectable,
+/// so the FAILURE branch can be exercised (R5, round two).
+///
+/// The review's point: the existing test covered normal creation, a
+/// permissive predecessor and an unopenable parent — never a created
+/// file that fails the check, so removing the verification would
+/// have kept every assertion green. A filesystem that ignores mode
+/// bits cannot be conjured in a unit test; the observation can.
+fn write_private_key_verified(
+    path: &Path,
+    pem: &str,
+    observe: fn(&Path) -> Result<u32, BootstrapError>,
+) -> Result<(), BootstrapError> {
     use std::io::Write as _;
 
     // Never inherit a previous file's mode.
@@ -242,27 +276,15 @@ fn write_private_key(path: &Path, pem: &str) -> Result<(), BootstrapError> {
     // Verify rather than assume: a filesystem that ignored the mode
     // (or a umask-independent path) must be a loud error, because the
     // whole point is that this file is not readable by anyone else.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let mode = std::fs::metadata(path)
-            .map_err(|e| BootstrapError::Acme(format!("stat {}: {e}", path.display())))?
-            .permissions()
-            .mode()
-            & 0o777;
-        if mode != 0o600 {
-            let _ = std::fs::remove_file(path);
-            return Err(BootstrapError::Acme(format!(
-                "{} was created with mode {mode:o}, not 0600 — refusing to leave a \
-                 readable private key on disk",
-                path.display()
-            )));
-        }
+    let mode = observe(path)?;
+    if mode != 0o600 {
+        let _ = std::fs::remove_file(path);
+        return Err(BootstrapError::Acme(format!(
+            "{} was created with mode {mode:o}, not 0600 — refusing to leave a \
+             readable private key on disk",
+            path.display()
+        )));
     }
-    // On Windows the file inherits the parent directory's ACL. The
-    // cache directory is the operator's to protect; this is stated
-    // rather than silently assumed, and the Unix path above is what
-    // CI enforces.
     Ok(())
 }
 
@@ -580,6 +602,35 @@ mod tests {
             old_cert,
             "…and must still be the OLD certificate",
         );
+    }
+
+    /// R5 (round two): the protection CHECK is what is under test.
+    ///
+    /// Removing the verification used to leave every other assertion
+    /// green, because nothing ever made a created file fail it. Here
+    /// the observation reports a permissive mode: the write must be
+    /// a hard error naming the mode, and — the part that matters —
+    /// the readable key must not be left on disk. Runs on every
+    /// platform, because the injected observation is the fault, not
+    /// the filesystem.
+    #[test]
+    fn a_key_that_fails_its_protection_check_is_an_error_and_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("k.pem");
+        let err = write_private_key_verified(&key, "PEM", |_| Ok(0o644))
+            .expect_err("a key observed as 0644 must not be accepted");
+        assert!(
+            err.to_string().contains("644") && err.to_string().contains("0600"),
+            "the error must name what it saw and what it required: {err}",
+        );
+        assert!(
+            !key.exists(),
+            "a key that failed its protection check must not survive the failure",
+        );
+        // The positive control: the same path with a conforming
+        // observation writes the file.
+        write_private_key_verified(&key, "PEM", |_| Ok(0o600)).expect("write");
+        assert_eq!(std::fs::read_to_string(&key).unwrap(), "PEM");
     }
 
     /// A self-signed leaf for `name`, valid over an explicit window.

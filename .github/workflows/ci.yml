@@ -2547,6 +2547,37 @@ jobs:
           done
           echo "Stage 4b listener: all pinned witnesses green"
 
+      # The listener step above selects INTEGRATION tests only, and the
+      # main SDK suite's feature list has no `rtc-bootstrap` — so the
+      # library witnesses that live inside `sdk/src` (the ACME cache
+      # qualification, the private key's protection check, the renewal
+      # horizon) were compiled out of every job. On Linux the Unix
+      # branch of that protection check is real code, which is exactly
+      # where it has to run.
+      - name: SDK library witnesses under rtc-bootstrap (Stage 4b)
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          REQUIRED="
+            rtc_bootstrap_acme::tests::a_key_that_fails_its_protection_check_is_an_error_and_is_removed
+            rtc_bootstrap_acme::tests::the_private_key_is_created_0600_and_a_wrong_mode_is_fatal
+            rtc_bootstrap_acme::tests::a_certificate_that_is_not_valid_yet_is_not_served
+            rtc_bootstrap_acme::tests::a_matching_common_name_cannot_override_a_wrong_san
+            rtc_bootstrap_acme::tests::a_failed_publication_leaves_the_previous_pair_intact
+            rtc_bootstrap_acme::tests::a_cached_pair_is_reused_only_when_it_qualifies
+          "
+          out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                  --retries 0 --features rtc-bootstrap --lib 2>&1) \
+            || { printf '%s\n' "$out"; echo "::error::the SDK library witnesses did not pass"; exit 1; }
+          printf '%s\n' "$out" | tail -3
+          for required in $REQUIRED; do
+            single=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                       --retries 0 --features rtc-bootstrap --lib \
+                       -E "test(=$required)" 2>&1) \
+              || { printf '%s\n' "$single"; echo "::error::$required did not run and pass as exactly one test"; exit 1; }
+          done
+          echo "Stage 4b SDK library witnesses: green, with the Unix protection branch compiled"
+
       # The SDK's `webrtc` surface under the same lint bar as the rest of
       # the crate, and its rustdoc — neither was reachable from any step's
       # feature list before Stage 4a.

@@ -7,7 +7,9 @@
 //! peer, then drives the real binary against the anchor and asserts
 //! the anchor is listed with its addresses and the plain peer is not.
 //!
-//! Run: `cargo test -p net-cli --features webrtc --test anchor_ls_live`
+//! Run: `cargo test -p net-cli --features rtc-bootstrap --test anchor_ls_live`
+//! (the file is `#![cfg(feature = "rtc-bootstrap")]`, which is where
+//! `anchor ls` itself lives; `--features webrtc` compiles nothing here.)
 #![cfg(feature = "rtc-bootstrap")]
 
 use std::sync::Arc;

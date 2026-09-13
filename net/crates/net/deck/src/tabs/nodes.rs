@@ -29,7 +29,7 @@ pub fn render(
     snapshot: Option<&MeshOsSnapshot>,
     cursor: usize,
     local: Option<LocalNodeRow<'_>>,
-    anchors: &std::collections::BTreeMap<u64, crate::app::AnchorAddresses>,
+    anchors: &crate::app::AnchorRollup,
 ) {
     let has_peers = snapshot.map(|s| !s.peers.is_empty()).unwrap_or(false);
     let has_local = local.is_some();
@@ -64,10 +64,11 @@ pub(crate) fn render_nodes_view(
     cursor: usize,
     local_id: Option<u64>,
     local_maintenance_mirror: Option<net_sdk::deck::MaintenanceMirrorSnapshot>,
-    // Stage 4b: announced `rtc_addr` / `rtc_bootstrap`, which do not
-    // ride `PeerSnapshot`. Empty map ⇒ the ANCHOR column shows `—`
-    // for every row, which is what a mesh with no anchors looks like.
-    anchors: &std::collections::BTreeMap<u64, crate::app::AnchorAddresses>,
+    // Stage 4b: the announced `rtc_addr` / `rtc_bootstrap`, which
+    // do not ride `PeerSnapshot`. A row with no entry shows `—`
+    // (not an anchor); a build that cannot read the fields at all
+    // says so, because those are not the same statement.
+    anchors: &crate::app::AnchorRollup,
 ) {
     use net_sdk::deck::{MaintenanceMirrorSnapshot, PeerHealthSnapshot};
 
@@ -218,10 +219,7 @@ pub(crate) fn render_nodes_view(
             Cell::from(Span::styled(sat_text, sat_style)),
             Cell::from(Span::styled(format!("{daemon_count:>3}"), theme::text())),
             Cell::from(Span::styled(maint_text, maint_style)),
-            Cell::from(match anchors.get(&peer_id) {
-                Some(addresses) => Span::styled(addresses.cell(), theme::cyan()),
-                None => Span::styled("—".to_string(), theme::chrome()),
-            }),
+            Cell::from(anchor_span(anchors, peer_id)),
         ]));
     }
 
@@ -249,6 +247,26 @@ pub(crate) fn render_nodes_view(
         .filter(|s| start + *s < end);
     let mut state = TableState::default().with_selected(selected);
     frame.render_stateful_widget(table, area, &mut state);
+}
+
+/// The ANCHOR cell for one node row. Three outcomes, because the
+/// column answers three different questions:
+///
+/// * this node announced the anchor role → its addresses, in the
+///   accent color an operator can act on;
+/// * it did not → `—`;
+/// * this build has no `rtc_addr` / `rtc_bootstrap` to read at
+///   all → say that, rather than borrow the `—` that means "not
+///   an anchor" and turn an unreadable column into a claim about
+///   the mesh.
+fn anchor_span(anchors: &crate::app::AnchorRollup, peer_id: u64) -> Span<'static> {
+    if anchors.not_this_build() {
+        return Span::styled("not in this build", theme::dim());
+    }
+    match anchors.get(peer_id) {
+        Some(addresses) => Span::styled(addresses.cell(), theme::cyan()),
+        None => Span::styled("—".to_string(), theme::chrome()),
+    }
 }
 
 /// Map the local node's `MaintenanceStateSnapshot` (state machine
@@ -304,7 +322,7 @@ fn render_live_nodes_table(
     snapshot: &MeshOsSnapshot,
     cursor: usize,
     local: Option<LocalNodeRow<'_>>,
-    anchors: &std::collections::BTreeMap<u64, crate::app::AnchorAddresses>,
+    anchors: &crate::app::AnchorRollup,
 ) {
     use net_sdk::deck::PeerHealthSnapshot;
 

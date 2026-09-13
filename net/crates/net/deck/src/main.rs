@@ -5,9 +5,12 @@
 //! site aesthetic (neon-green on pitch black).
 //!
 //! Build modes:
-//! - default: live in-process single-node `MeshOsRuntime`, no
-//!   cluster data. Every tab reads from the snapshot — empty
-//!   until real cluster sources are wired.
+//! - default: a live in-process single-node `MeshOsRuntime`
+//!   plus the deck's own live mesh node (loopback, ephemeral
+//!   port). Snapshot-fed tabs are empty until a real cluster
+//!   source is wired; the substrate-fed ones (subnets,
+//!   gateways, the NODES table's ANCHOR column) read the mesh
+//!   node and show whatever it has ingested.
 //! - `--features demo`: boots a real 5-node in-process
 //!   MeshOS cluster via `net_sdk::testing::ClusterHarness`
 //!   with real daemons, real migrations, real blob adapters,

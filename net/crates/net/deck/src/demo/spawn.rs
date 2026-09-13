@@ -222,9 +222,17 @@ pub async fn spawn(nrpc_tail: NrpcTail) -> color_eyre::Result<Harness> {
         group_handles.push(h);
     }
 
-    // Build the DeckClient anchored on node[0]'s MeshOsRuntime.
+    // Build the DeckClient anchored on node[0]'s MeshOsRuntime,
+    // with node[0]'s live mesh node attached. The runtime carries
+    // the snapshot fold; the mesh node carries what only the
+    // substrate knows — subnet / gateway / channel state and the
+    // signed RTC-anchor announcements the NODES table's ANCHOR
+    // column reads. Without `with_mesh` every one of those
+    // accessors returns its mesh-less default.
     let identity = OperatorIdentity::from_keypair(operator_keypair);
-    let deck = Arc::new(DeckClient::from_runtime(sdk0.runtime(), identity));
+    let deck = Arc::new(
+        DeckClient::from_runtime(sdk0.runtime(), identity).with_mesh(node0.mesh().node_arc()),
+    );
     let this_node = node0.node_id();
 
     // Build one MeshBlobAdapter per node (Phase 2 of

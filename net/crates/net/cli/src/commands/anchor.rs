@@ -49,8 +49,9 @@ pub enum AnchorCommand {
     /// List the RTC anchors this node has heard announce
     /// themselves, with their `rtc_addr` / `rtc_bootstrap`.
     ///
-    /// Requires the `webrtc` build: an anchor row a build cannot act
-    /// on is a listing with nothing behind it.
+    /// Requires the `rtc-bootstrap` build: it reads the listing
+    /// from a live daemon's anchor directory, and an anchor row a
+    /// build cannot act on is a listing with nothing behind it.
     #[cfg(feature = "rtc-bootstrap")]
     Ls(LsArgs),
     /// Serve the browser bootstrap listener on this node.

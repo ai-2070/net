@@ -3189,6 +3189,8 @@ dependencies = [
  "crossterm",
  "dirs",
  "futures",
+ "getrandom 0.4.3",
+ "net-mesh",
  "net-mesh-sdk",
  "parking_lot 0.12.5",
  "ratatui",

@@ -68,20 +68,54 @@ impl AnchorAddresses {
     }
 }
 
-/// Read the anchor rollup from the deck client.
+/// The ANCHOR column's data for one frame: either the anchors the
+/// Deck's node has ingested, or the statement that this build
+/// cannot read them at all.
 ///
-/// **R6: this is only ever non-empty when the Deck's client has a
-/// mesh.** `DeckClient::rtc_anchors` returns nothing when it was
-/// built without one, which is the CLI's old failure mode; Deck
-/// runs in-process against the node it observes, so its client does
-/// have one. Empty also without `webrtc`, where the fields do not
-/// exist at all — in both cases the column renders `—` rather than
-/// implying "no anchors".
+/// Two states, because they are two different facts and one map
+/// cannot express both. A `webrtc` build that has heard no anchor
+/// announce itself holds an empty map, and the column renders `—`
+/// per row: there is no anchor here. A build without `webrtc` has
+/// no `rtc_addr` / `rtc_bootstrap` fields to read at all, so "no
+/// anchors" is a claim it is not entitled to make — it holds
+/// `None`, and the column says so instead of borrowing the `—`
+/// that means something else.
+#[derive(Clone, Debug)]
+pub struct AnchorRollup(
+    /// What [`DeckClient::rtc_anchors`] returned, keyed by node
+    /// id — or `None` on a build that cannot read it.
+    Option<std::collections::BTreeMap<u64, AnchorAddresses>>,
+);
+
+impl AnchorRollup {
+    /// The addresses `node_id` announced, if it announced the
+    /// anchor role at all.
+    pub fn get(&self, node_id: u64) -> Option<&AnchorAddresses> {
+        self.0.as_ref().and_then(|rows| rows.get(&node_id))
+    }
+
+    /// `true` when this build cannot read the anchor fields, so a
+    /// row's `—` must not be read as "not an anchor".
+    pub fn not_this_build(&self) -> bool {
+        self.0.is_none()
+    }
+}
+
+/// Read the anchor rollup off the deck client.
+///
+/// **R6: the rows come from the mesh node the client is attached
+/// to.** `DeckClient::rtc_anchors` returns the mesh-less default
+/// when no `MeshNode` was wired in, which is why this used to be
+/// structurally empty; both Deck construction sites
+/// (`crate::runtime::spawn_with_psk` and `crate::demo::spawn`) now
+/// attach the live node they observe via `DeckClient::with_mesh`,
+/// so what lands here is what that node has ingested from signed
+/// announcements.
 fn collect_rtc_anchors(
     #[cfg_attr(not(feature = "webrtc"), allow(unused_variables))] deck: &Arc<DeckClient>,
-) -> std::collections::BTreeMap<u64, AnchorAddresses> {
+) -> AnchorRollup {
     #[cfg(feature = "webrtc")]
-    {
+    let rows = Some(
         deck.rtc_anchors()
             .into_iter()
             .map(|row| {
@@ -93,12 +127,13 @@ fn collect_rtc_anchors(
                     },
                 )
             })
-            .collect()
-    }
+            .collect(),
+    );
+    // No `rtc_addr` / `rtc_bootstrap` in this build's announcement
+    // type; there is nothing to read and nothing to claim.
     #[cfg(not(feature = "webrtc"))]
-    {
-        std::collections::BTreeMap::new()
-    }
+    let rows = None;
+    AnchorRollup(rows)
 }
 
 /// Navigation half of [`LogsBackTarget`] — the three
@@ -266,12 +301,13 @@ pub struct App {
     /// collections are empty to decide between live and
     /// fixture rendering paths.
     pub snapshot: Arc<MeshOsSnapshot>,
-    /// Stage 4b: the RTC anchors this node has heard announce
-    /// themselves, keyed by node id, refreshed with the snapshot.
-    /// `rtc_addr` / `rtc_bootstrap` do not ride `PeerSnapshot`, so
-    /// the NODES table reads them from here. Empty on a build
-    /// without `webrtc`, which is also a build that cannot use them.
-    pub rtc_anchors: std::collections::BTreeMap<u64, AnchorAddresses>,
+    /// Stage 4b: the RTC anchors this node has ingested, keyed by
+    /// node id, refreshed with the snapshot. `rtc_addr` /
+    /// `rtc_bootstrap` do not ride `PeerSnapshot`, so the NODES
+    /// table reads them from here.
+    /// [`AnchorRollup::NotThisBuild`] on a build without `webrtc`,
+    /// which is also a build that cannot use them.
+    pub rtc_anchors: AnchorRollup,
     /// Memoized SUBNETS-tab derivation against the current
     /// snapshot. `subnet_rollups_with_local` and
     /// `aggregator_source_subnets` get called every frame on
@@ -3372,7 +3408,14 @@ impl App {
                 peer: &local_peer,
                 local_maintenance: &self.snapshot.local_maintenance,
             };
-            tabs::subnet_page::render(frame, chunks[3], focus, &self.snapshot, Some(local_row));
+            tabs::subnet_page::render(
+                frame,
+                chunks[3],
+                focus,
+                &self.snapshot,
+                Some(local_row),
+                &self.rtc_anchors,
+            );
             widgets::footer::render(
                 frame,
                 chunks[4],
@@ -3601,7 +3644,74 @@ impl App {
 
 #[cfg(test)]
 mod anchor_cell_tests {
-    use super::AnchorAddresses;
+    use super::{AnchorAddresses, AnchorRollup};
+
+    /// Draw the NODES tab into an offscreen terminal and return
+    /// every symbol it painted. Row-major, so a cell's text is
+    /// contiguous in the result.
+    fn nodes_tab_text(rollup: &AnchorRollup) -> String {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut snapshot = net_sdk::deck::MeshOsSnapshot::default();
+        snapshot
+            .peers
+            .insert(0xA11CE, net_sdk::deck::PeerSnapshot::default());
+        // Wide enough that the ANCHOR column (the last, `Min(21)`)
+        // gets real width after the ten fixed columns.
+        let mut terminal = Terminal::new(TestBackend::new(150, 8)).expect("offscreen terminal");
+        terminal
+            .draw(|frame| {
+                crate::tabs::nodes::render(frame, frame.area(), Some(&snapshot), 0, None, rollup);
+            })
+            .expect("draw NODES");
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    /// **R6.** The NODES tab paints the rollup's addresses in the
+    /// ANCHOR column, and a build that cannot read the fields says
+    /// so instead of painting the `—` that means "not an anchor".
+    #[test]
+    fn the_anchor_column_paints_the_rollup_and_distinguishes_a_build_that_cannot_read_it() {
+        let ingested = AnchorRollup(Some(
+            [(
+                0xA11CE,
+                AnchorAddresses {
+                    rtc_addr: Some("203.0.113.7:7101".to_string()),
+                    rtc_bootstrap: Some("https://anchor.example.com".to_string()),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        ));
+        let painted = nodes_tab_text(&ingested);
+        assert!(
+            painted.contains("ANCHOR"),
+            "the column must be in the header: {painted}"
+        );
+        assert!(
+            painted.contains("203.0.113.7:7101"),
+            "the announced RTC socket must reach the operator's screen, not just the \
+             rollup: {painted}"
+        );
+
+        // Same peer, `webrtc` off: nothing was read, so the column
+        // must not imply the peer is not an anchor.
+        let painted = nodes_tab_text(&AnchorRollup(None));
+        assert!(
+            painted.contains("not in this build"),
+            "a build that cannot read the anchor fields must say so: {painted}"
+        );
+        assert!(
+            !painted.contains("203.0.113.7:7101"),
+            "…and must not invent addresses it never read: {painted}"
+        );
+    }
 
     /// The ANCHOR cell prefers the address a browser aims ICE at,
     /// falls back to the bootstrap host, and never renders an
@@ -3625,5 +3735,112 @@ mod anchor_cell_tests {
         // unreachable, and a blank cell would read as "not an
         // anchor".
         assert_eq!(AnchorAddresses::default().cell(), "anchor (no address)");
+    }
+
+    /// **R6 wiring witness.** The rollup the ANCHOR column renders
+    /// carries a real anchor's announced addresses.
+    ///
+    /// Built the way production builds it:
+    /// `crate::runtime::spawn_with_psk` is the entire body of
+    /// `crate::runtime::spawn` (which differs only in minting the
+    /// PSK), so the `DeckClient` here is the one the binary hands
+    /// to `App::new`. A real anchor — RTC configured, public
+    /// `rtc_addr`, bootstrap URL — handshakes with that runtime's
+    /// own mesh node and announces itself; the assertion reads
+    /// back exactly what `App::refresh_snapshot` reads.
+    ///
+    /// Inverse: drop `.with_mesh(mesh.node_arc())` in
+    /// `crate::runtime::spawn_with_psk` and the rollup is
+    /// `Ingested({})` forever — the announcement still arrives,
+    /// the client just has no node to read it from. That was the
+    /// shipped state: a comment claiming a mesh the constructor
+    /// never attached.
+    #[cfg(feature = "webrtc")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_rollup_the_anchor_column_renders_carries_an_ingested_anchor() {
+        use net::adapter::net::rtc::RtcConfig;
+
+        // One trust domain for the deck's node and the anchor that
+        // peers with it; `spawn` mints a random one per process.
+        const PSK: [u8; 32] = [0x4Bu8; 32];
+        let public: std::net::SocketAddr = "203.0.113.7:7101".parse().expect("addr");
+
+        let harness = crate::runtime::spawn_with_psk(&PSK)
+            .await
+            .expect("the deck runtime");
+        let deck = harness.deck();
+
+        let anchor = net_sdk::MeshBuilder::new("127.0.0.1:0", &PSK)
+            .expect("anchor builder")
+            .rtc(RtcConfig {
+                public_addr: Some(public),
+                ..RtcConfig::new()
+                    .with_bind_addr("127.0.0.1:0".parse().expect("addr"))
+                    .with_bootstrap_url("https://anchor.example.com")
+            })
+            .build()
+            .await
+            .expect("the anchor node");
+        anchor.start();
+        // The deck's node is already dispatching (`spawn` starts
+        // it), so the anchor joins over the routed handshake — the
+        // same path any peer takes against a running node.
+        anchor
+            .connect_via(
+                &harness.mesh().local_addr().to_string(),
+                harness.mesh().public_key(),
+                harness.mesh().node_id(),
+            )
+            .await
+            .expect("the anchor must reach the deck's node");
+        let anchor_id = anchor.node_id();
+        // `start` only schedules the re-announce loop; the first
+        // announcement is this one.
+        anchor
+            .announce_capabilities(net_sdk::capabilities::CapabilitySet::new())
+            .await
+            .expect("announce");
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let rollup = loop {
+            let rollup = super::collect_rtc_anchors(&deck);
+            if rollup.get(anchor_id).is_some() || tokio::time::Instant::now() >= deadline {
+                break rollup;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        };
+
+        assert!(
+            !rollup.not_this_build(),
+            "this build reads the anchor fields; the rollup must not claim otherwise"
+        );
+        // The map the ANCHOR column indexes, straight off the
+        // rollup the render path holds.
+        let rows = rollup.0.as_ref().expect("the ingested rows");
+        assert!(
+            !rows.is_empty(),
+            "the deck's node ingested an anchor announcement, so the column's rollup \
+             cannot be empty — an empty one means the client is reading a mesh it does \
+             not have"
+        );
+        let row = rows
+            .get(&anchor_id)
+            .unwrap_or_else(|| panic!("the anchor row (rollup has {:?})", rows.keys()));
+        assert_eq!(
+            row.rtc_addr.as_deref(),
+            Some("203.0.113.7:7101"),
+            "the ANCHOR cell renders the announced RTC socket; without it the column \
+             lists an anchor nobody can reach"
+        );
+        assert_eq!(
+            row.rtc_bootstrap.as_deref(),
+            Some("https://anchor.example.com"),
+            "…and the operator's configured bootstrap URL, not a synthesised one"
+        );
+        assert_eq!(
+            row.cell(),
+            "203.0.113.7:7101",
+            "the cell the operator actually sees"
+        );
     }
 }
