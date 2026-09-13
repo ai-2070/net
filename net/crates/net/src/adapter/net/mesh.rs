@@ -25861,12 +25861,31 @@ impl MeshNode {
     }
 
     /// Send this node's host candidate for `dialog` (R4).
+    ///
+    /// **The announced address, when there is one (Stage 4b R8).**
+    /// This used to send `driver.local_addr()` unconditionally — the
+    /// address the RTC socket is BOUND to. Behind a NAT that is a
+    /// private address no peer outside can use, so the session
+    /// formed anyway but formed **peer-reflexively**: the client
+    /// discovered the mapped address from this node's own inbound
+    /// check, and the candidate this node signalled contributed
+    /// nothing. Measured in `natsim`'s `rtc_anchor_direct`, where
+    /// the client's selected pair read `learned=peer-reflexive` at
+    /// the very address the announcement named. `rtc_addr`,
+    /// `bootstrap_host_candidate` and this frame now all name the
+    /// same socket.
     #[cfg(feature = "webrtc")]
     async fn trickle_local_candidate(&self, peer_node_id: u64, dialog: u64) {
         let Some(driver) = self.rtc_driver.as_ref() else {
             return;
         };
-        let Ok(candidate) = str0m::Candidate::host(driver.local_addr(), "udp") else {
+        let addr = self
+            .config
+            .rtc
+            .as_ref()
+            .and_then(|rtc| rtc.public_addr)
+            .unwrap_or_else(|| driver.local_addr());
+        let Ok(candidate) = str0m::Candidate::host(addr, "udp") else {
             return;
         };
         let _ = self

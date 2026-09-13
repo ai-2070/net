@@ -217,6 +217,13 @@ mod natsim {
         let mut cfg = RtcConfig::new();
         cfg.bind_addr = bind;
         cfg.public_addr = public;
+        // An anchor publishes an `rtc_addr` so peers can aim at it;
+        // answering a bare binding request on that socket is part of
+        // what publishing it means, and the responder is off by
+        // default (R8: the probe's refusal was over-determined —
+        // the responder was disabled AND the gateway drops
+        // unsolicited inbound; only the second is by design).
+        cfg.serve_stun = true;
         // A real network between the endpoints, not loopback: give ICE
         // room for the restricted-cone pinhole to open (the anchor's
         // first outbound check is what makes the client's checks
