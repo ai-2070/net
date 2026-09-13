@@ -25778,6 +25778,28 @@ impl MeshNode {
             .unwrap_or(0)
     }
 
+    /// The candidate pair this node's ICE stack is transmitting to
+    /// for `node_id`, as `(local, remote, learned)` (Stage 4b R8).
+    ///
+    /// `learned` is `"signalled"` when the remote address arrived as
+    /// a candidate over signalling and `"peer-reflexive"` when it was
+    /// learned from the peer's own inbound binding request — which is
+    /// what distinguishes "we are talking to the address the anchor
+    /// ANNOUNCED" from "we discovered an address that happens to
+    /// match". `None` unless the peer sits on a DataChannel and
+    /// something has been sent.
+    #[cfg(feature = "webrtc")]
+    pub async fn rtc_selected_pair(
+        &self,
+        node_id: u64,
+    ) -> Option<(SocketAddr, SocketAddr, &'static str)> {
+        let driver = self.rtc_driver.as_ref()?;
+        match self.peer_endpoint(node_id)? {
+            PeerAddr::Rtc(id) => driver.selected_pair(id).await,
+            _ => None,
+        }
+    }
+
     /// The address this anchor publishes as `rtc_addr` (Stage 4b:
     /// `GET /rtc/anchor` reports it so a browser can aim its ICE at
     /// the same socket the announcement names).

@@ -741,16 +741,19 @@ mod natsim {
                 // observe the pre-announce version.
                 let anchor_rtc_addr = wait_for_info(&state, &target).await.rtc_addr;
 
-                // **R8: the published address is used as the STUN
-                // target, and that use is observable at the anchor.**
-                // An ICE connectivity check carries `USERNAME` and is
-                // consumed by whichever session negotiated those
-                // credentials, so it never reaches the anchor's bare
-                // responder and proves nothing about the ADVERTISED
-                // address. One unsolicited binding request does: it
-                // can only be answered by the responder listening on
-                // the address the announcement named, and the anchor
-                // counts it (`stun_binding_requests`).
+                // **R8, evidence half.** One unsolicited binding
+                // request aimed at the announced address, from a
+                // FRESH socket. Under this topology it is expected to
+                // be dropped, and that is worth recording rather than
+                // asserting: the cone gateway is address-restricted
+                // by construction (`setup.sh` installs
+                // `iifname gw?-wan udp dport <rtc> ct state new drop`
+                // precisely so the scenario models a restricted NAT
+                // and not a full-cone one). An anchor behind such a
+                // NAT is reachable only after its own outbound check
+                // opens the mapping — so "a stranger can use it as a
+                // STUN server" is false here BY DESIGN, and asserting
+                // it would be asserting the wrong topology.
                 let stun_probe = match anchor_rtc_addr.as_deref() {
                     Some(addr) => stun_probe(addr).await,
                     None => StunProbe::default(),
@@ -787,6 +790,10 @@ mod natsim {
                         tokio::time::sleep(Duration::from_millis(200)).await;
                     }
                 }
+                #[cfg(feature = "webrtc")]
+                let selected = node.rtc_selected_pair(tinfo.node_id).await;
+                #[cfg(not(feature = "webrtc"))]
+                let selected: Option<(SocketAddr, SocketAddr, &'static str)> = None;
                 serde_json::json!({
                     "mode": "rtc",
                     "ok": connected,
@@ -811,8 +818,21 @@ mod natsim {
                     // address get a well-formed success response, and
                     // what did it say our mapped address was?
                     "stun_probe_ok": stun_probe.ok,
+                    "stun_probe_note": "unsolicited inbound is dropped by the \
+                                        address-restricted cone gateway by design; \
+                                        evidence, not a verdict",
                     "stun_probe_target": stun_probe.target,
                     "stun_probe_mapped": stun_probe.mapped,
+                    // **R8, verdict half.** The address the client's
+                    // ICE stack is actually transmitting to, and
+                    // WHERE IT CAME FROM. `signalled` means it was
+                    // learned from the anchor's announced candidate;
+                    // `peer-reflexive` means it was discovered from
+                    // the anchor's own inbound check and the
+                    // announcement contributed nothing.
+                    "selected_local": selected.as_ref().map(|(l, _, _)| l.to_string()),
+                    "selected_remote": selected.as_ref().map(|(_, r, _)| r.to_string()),
+                    "selected_learned": selected.as_ref().map(|(_, _, k)| *k),
                     "elapsed_ms": started.elapsed().as_millis() as u64,
                     "session_addr": node.peer_addr(tinfo.node_id).map(|a| a.to_string()),
                     "relay_addr": relay_addr.to_string(),

@@ -4087,17 +4087,21 @@ jobs:
 
       # `cargo test -p net-cli` above builds default features, so the
       # anchor-directory witness (`#![cfg(feature = "rtc-bootstrap")]`)
-      # is compiled out of it entirely. Run it explicitly, and pin the
-      # count: a `--test <name>` filter that matches nothing still
-      # exits 0, which is the silent-skip hazard this repo has been
-      # bitten by twice.
-      - name: Run net-cli anchor directory witness (Stage 4b)
+      # is compiled out of it entirely. Run the crate again WITH the
+      # feature, and name the two tests: a filter that matches nothing
+      # still exits 0, which is the silent-skip hazard this repo has
+      # been bitten by twice. No `--test` pin — the integration-test
+      # guard inventories the root crate's `tests/`, and `net-cli` is
+      # auto-discovered by design.
+      - name: Run net-cli tests with rtc-bootstrap (Stage 4b)
         run: |
           set -o pipefail
-          cargo test -p net-cli --features rtc-bootstrap \
-            --test anchor_ls_live 2>&1 | tee /tmp/anchor_ls.log
-          grep -q "2 passed" /tmp/anchor_ls.log || {
-            echo "::error::anchor_ls_live must run its 2 tests"; exit 1; }
+          cargo test -p net-cli --features rtc-bootstrap 2>&1 | tee /tmp/cli_rtc.log
+          for t in anchor_ls_lists_a_live_announcing_anchor_and_not_a_plain_peer \
+                   anchor_ls_without_a_daemon_refuses_rather_than_printing_nothing; do
+            grep -q "test $t ... ok" /tmp/cli_rtc.log || {
+              echo "::error::$t did not run"; exit 1; }
+          done
 
   aggregator-daemon-tests:
     # `net-aggregator-daemon` is a lib + bin crate. The lib hosts

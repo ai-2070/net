@@ -2258,6 +2258,24 @@ async fn run(
             // same node id, and — as a reconnecting browser would —
             // the same origin and reply channel.
             let new = conn.connect(&mut script, "replace-new", node_id).await;
+            // The browser's handshake finishing is not the anchor
+            // having INSTALLED the peer: msg2 leaves the anchor
+            // before it publishes the session, so reading the table
+            // the instant `connect` returns is a race. Every other
+            // capture site in this harness follows a step the anchor
+            // already answered; this one follows an eviction, so it
+            // waits for a session id that is present AND is not the
+            // one that was just evicted. (Observed on the Linux CI
+            // runner: `new_session` read `None` here and the verdict
+            // failed with nothing else wrong.)
+            let _installed = wait_for(
+                || {
+                    let now = anchor.peer_session_id(node_id);
+                    now.is_some() && now != old_session
+                },
+                Duration::from_secs(25),
+            )
+            .await;
             let new_session = anchor.peer_session_id(node_id);
             let sub = subscribe_payload(&reply_channel, 0x5B5B_0008);
             let new_subscribed = script
@@ -2341,7 +2359,8 @@ async fn run(
                     "old session {old_session:?}: call 0x{hold_call:X} parked in the \
                      provider={parked}, reservation armed for that incarnation={reserved}; \
                      browser closed it={} and the anchor evicted the peer={evicted}; \
-                     successor session {new_session:?} installed={} (subscribed={}); the \
+                     successor session {new_session:?} installed={} (browser said {:?}) \
+                     (subscribed={}); the \
                      OLD call then completed={old_completed} and was counted \
                      orphaned={orphaned} (admission_promotion_orphaned {} -> {}); \
                      admission_promoted +{promoted_delta} and the successor is \
@@ -2349,6 +2368,7 @@ async fn run(
                      call 0x{own_call:X} promoted it={own_promoted}",
                     closed.ok,
                     new.ok,
+                    new.error.as_deref().unwrap_or("ok"),
                     new_subscribed.ok,
                     orphaned_before,
                     anchor.rtc_stats().admission_promotion_orphaned(),

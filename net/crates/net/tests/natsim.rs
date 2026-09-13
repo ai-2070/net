@@ -372,25 +372,27 @@ fn natsim_relay_session_upgrades_to_direct() {
 ///    socket at the gateway's mapping — the only address its packets
 ///    can be arriving on.
 ///
-/// 3. **The use** (R8). The client aims ONE unsolicited STUN
-///    binding request at the announced address and gets a
-///    well-formed success response carrying its own mapped address.
-///    This is the fact an ICE connectivity check cannot supply: a
-///    check carries `USERNAME`, is consumed by the session that
-///    negotiated those credentials, and never reaches the anchor's
-///    bare responder — so it says nothing about the ADVERTISED
-///    address. The anchor counts the ones its responder answered
-///    (`stun_binding_requests`), so the same event is observable
-///    from both ends.
+/// 3. **The use, with provenance** (R8). The client's ICE stack is
+///    transmitting to `10.99.0.2:7101`, and it learned that address
+///    as a **signalled** candidate — not peer-reflexively. This is
+///    what closes the gap the doc comment used to concede: the
+///    earlier verdict could not distinguish "we are talking to the
+///    address the anchor announced" from "we discovered an address
+///    that happens to equal it", because the anchor's own checks
+///    leave through the same mapping (measured: with a deliberately
+///    wrong `--rtc-public`, ICE still connects — and now it would
+///    connect `peer-reflexive`, which this assertion refuses).
 ///
-/// What this still deliberately does NOT claim: that the advertised
-/// candidate is the pair ICE selected. The anchor's own connectivity
-/// checks leave through the same mapping, so a client that was told
-/// nothing would discover `10.99.0.2:7101` as a peer-reflexive
-/// candidate anyway (measured: with a deliberately wrong
-/// `--rtc-public`, ICE still connects). What R8 adds is that the
-/// published address is genuinely serving as a STUN target, at both
-/// ends. The gateway's side of the story — that the pinned
+/// A fourth fact is recorded but deliberately NOT asserted:
+/// `stun_probe_ok`, one unsolicited binding request from a fresh
+/// socket to the announced address. It is expected to be dropped
+/// here — `setup.sh` installs
+/// `iifname gw?-wan udp dport <rtc> ct state new drop` so the
+/// scenario models an address-restricted cone NAT rather than a
+/// full-cone one, and a restricted NAT is unreachable to a stranger
+/// until its own outbound opens the mapping. Asserting it would be
+/// asserting a different topology; the probe stays as evidence of
+/// which kind of NAT this is. The gateway's side of the story — that the pinned
 /// 1:1 SNAT really produced `sport=7101` — is captured in
 /// `nsim_gwa_nat.log`, which `ScenarioRun`'s `Drop` prints on any
 /// failure here.
@@ -415,19 +417,20 @@ fn natsim_natted_anchor_publishes_a_reachable_rtc_addr() {
         rtc_stat(&v, "ice_direct") >= 1,
         "the attempt must be counted as an installed direct path: {v:#}",
     );
-    // R8: the published address was aimed at, and answered.
+    // R8: the announced address is the one the client transmits to,
+    // and it got there from the announcement.
     assert_eq!(
-        v["stun_probe_ok"], true,
-        "the client's binding request to the ANNOUNCED rtc_addr must be answered — \
-         an address nobody can use as a STUN target is not a published one: {v:#}",
+        v["selected_remote"], "10.99.0.2:7101",
+        "the client's ICE stack must be transmitting to the ANNOUNCED address: {v:#}",
+    );
+    assert_eq!(
+        v["selected_learned"], "signalled",
+        "…and must have learned it from the announced candidate, not peer-reflexively — \
+         a peer-reflexive selection is the same address with none of the provenance: {v:#}",
     );
     assert_eq!(
         v["stun_probe_target"], "10.99.0.2:7101",
-        "…and it must have been aimed at the announced address: {v:#}",
-    );
-    assert!(
-        v["stun_probe_mapped"].is_string(),
-        "the response must carry the client's mapped address: {v:#}",
+        "the evidence probe must have been aimed at the announced address: {v:#}",
     );
     // The routed leg is what carried the signalling; if the UDP punch
     // had produced this session instead, the verdict would be a
