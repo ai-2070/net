@@ -4,12 +4,21 @@
 //! for access rules, combined with L1 permission tokens. This avoids
 //! building a separate rule engine.
 
-use super::name::{ChannelHash, ChannelId, ChannelName};
+use super::name::{ChannelHash, ChannelId};
+// Only `install_rpc_service_defaults` builds channel NAMES here, and that
+// method is `cortex`-gated (see below).
+#[cfg(feature = "cortex")]
+use super::name::ChannelName;
 use crate::adapter::net::behavior::capability::{CapabilityFilter, CapabilitySet};
 use crate::adapter::net::identity::{EntityId, RevocationRegistry, TokenChain, TokenScope};
 // `ServeError` lives with the nRPC surface; the registry owns the
 // policy that surface requires, so it reports failure in that
-// surface's vocabulary rather than inventing a parallel one.
+// surface's vocabulary rather than inventing a parallel one. That
+// surface (`adapter::net::mesh_rpc`) is `cortex`-gated, so the one
+// method that speaks it is gated identically — a `--features net`
+// build has channels but no nRPC, and an unconditional import here
+// broke it.
+#[cfg(feature = "cortex")]
 use crate::adapter::net::mesh_rpc::ServeError;
 use dashmap::DashMap;
 
@@ -899,6 +908,7 @@ impl ChannelConfigRegistry {
     /// no policy, so every request to that service was refused as an
     /// unknown channel — with the refusal surfacing on the caller's
     /// side, far from the registration that caused it.
+    #[cfg(feature = "cortex")]
     pub fn install_rpc_service_defaults(&self, service: &str) -> Result<(), ServeError> {
         let invalid = || ServeError::InvalidServiceName(service.to_string());
         let Ok(req_channel) = ChannelName::new(&format!("{service}.requests")) else {

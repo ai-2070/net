@@ -1666,6 +1666,7 @@ impl RetainedChain {
 /// dispatcher)` (OA2-E0.1 — the id enables conditional teardown).
 /// Shared by `DispatchCtx` (read on the hot path) and `MeshNode`
 /// (registration).
+#[cfg(feature = "cortex")]
 type RpcInboundDispatcherMap = DashMap<
     u16,
     Vec<(
@@ -1754,6 +1755,7 @@ struct DispatchCtx {
     // OA2-E0.1: entries carry a monotonic registration id — a stale
     // `ServeHandle` teardown removes ONLY its own id, so it cannot
     // evict a newer registration for the same canonical channel.
+    #[cfg(feature = "cortex")]
     rpc_inbound_dispatchers: Arc<RpcInboundDispatcherMap>,
     num_shards: u16,
     /// Optional subprotocol handler for migration messages.
@@ -1963,7 +1965,10 @@ struct DispatchCtx {
     /// the sensing audience gate keys on OWNER ROOT rather than grant
     /// scope — so without this a same-root peer holding no grant could
     /// confirm a grant-private service exists by probing for it.
-    #[cfg(feature = "redex")]
+    // `LocalServiceRegistry` itself is `cortex`-gated, so this field must
+    // be too: `cortex` implies `redex`, but not the reverse, and a
+    // `--features redex` build got the field without the type.
+    #[cfg(feature = "cortex")]
     rpc_local_services: Arc<LocalServiceRegistry>,
     /// SI-3: the origin-emission scheduler slot. See the matching
     /// field on `MeshNode`; the dispatch arm feeds it when a
@@ -2259,6 +2264,29 @@ impl DispatchCtx {
     #[cfg(not(test))]
     fn sensing_fence_seam_hook(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
         None
+    }
+
+    /// Does `capability_id` name a service this node serves under a private
+    /// visibility?
+    ///
+    /// Mirrors `MeshNode::capability_is_locally_private`. The registry it
+    /// consults is the nRPC one, so without `cortex` this node serves no
+    /// services at all and the answer is `false` by construction — the
+    /// sensing plane (`redex`) still needs to ask.
+    #[cfg(feature = "redex")]
+    fn capability_is_locally_private(&self, capability_id: &sensing::CapabilityId) -> bool {
+        #[cfg(feature = "cortex")]
+        {
+            capability_id
+                .as_str()
+                .strip_prefix("nrpc:")
+                .is_some_and(|svc| self.rpc_local_services.is_private(svc))
+        }
+        #[cfg(not(feature = "cortex"))]
+        {
+            let _ = capability_id;
+            false
+        }
     }
 }
 
@@ -10982,6 +11010,7 @@ pub struct MeshNode {
     // typical sizing there is exactly one entry per bucket.
     // OA2-E0.1: entries carry a monotonic registration id (see the
     // `DispatchCtx` field for the teardown rationale).
+    #[cfg(feature = "cortex")]
     rpc_inbound_dispatchers: Arc<RpcInboundDispatcherMap>,
     /// OA2-E0.1: monotonic source of registration ids for
     /// [`Self::register_rpc_inbound`]. Bumped once per successful
@@ -18582,10 +18611,20 @@ impl MeshNode {
     /// else is public by construction and answers `false` without a map probe.
     #[cfg(feature = "redex")]
     fn capability_is_locally_private(&self, capability_id: &sensing::CapabilityId) -> bool {
-        capability_id
-            .as_str()
-            .strip_prefix("nrpc:")
-            .is_some_and(|svc| self.rpc_local_services.is_private(svc))
+        // The registry is the nRPC one; without `cortex` this node serves no
+        // services, so nothing is privately served.
+        #[cfg(feature = "cortex")]
+        {
+            capability_id
+                .as_str()
+                .strip_prefix("nrpc:")
+                .is_some_and(|svc| self.rpc_local_services.is_private(svc))
+        }
+        #[cfg(not(feature = "cortex"))]
+        {
+            let _ = capability_id;
+            false
+        }
     }
 
     /// Test-only helper — TOFU-pin `entity_id` for `node_id` exactly
@@ -25184,7 +25223,7 @@ impl MeshNode {
             sensing_local_entity_root: sensing::AudienceScopeCommitment::owner_root(
                 self.identity.entity_id(),
             ),
-            #[cfg(feature = "redex")]
+            #[cfg(feature = "cortex")]
             rpc_local_services: self.rpc_local_services.clone(),
             sensing_emitter: self.sensing_emitter.clone(),
             sensing_emitter_notify: self.sensing_emitter_notify.clone(),
@@ -32676,11 +32715,7 @@ impl MeshNode {
                         ctx.sensing_local_entity_root,
                         &ctx.sensing_local_root,
                         capability_id,
-                        |cap| {
-                            cap.as_str()
-                                .strip_prefix("nrpc:")
-                                .is_some_and(|svc| ctx.rpc_local_services.is_private(svc))
-                        },
+                        |cap| ctx.capability_is_locally_private(cap),
                     );
                     let mut slot = ctx.sensing_leader.lock();
                     let Some(leader) = slot.as_mut() else {
@@ -34508,11 +34543,7 @@ impl MeshNode {
             ctx.sensing_local_entity_root,
             &ctx.sensing_local_root,
             capability_id,
-            |cap| {
-                cap.as_str()
-                    .strip_prefix("nrpc:")
-                    .is_some_and(|svc| ctx.rpc_local_services.is_private(svc))
-            },
+            |cap| ctx.capability_is_locally_private(cap),
         );
         let reconciliation = {
             let mut slot = ctx.sensing_leader.lock();

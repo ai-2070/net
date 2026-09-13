@@ -2035,24 +2035,24 @@ jobs:
   # test binary. Each row is a configuration a downstream `cargo add net-mesh`
   # can actually select.
   #
-  # WHAT THE FIRST HONEST RUN FOUND. Seven of the thirteen configurations do
-  # not compile at all. They are not listed as passing rows; they are listed
-  # as BROKEN rows, and the job asserts they still fail — so whoever repairs
-  # the gating is told to promote the row, and nobody can quietly assume the
-  # configuration works. The cause is one defect with two sites, shared by
-  # every `net`-without-`cortex` configuration:
+  # WHAT THE FIRST HONEST RUN FOUND, and what it fixed. Seven of the thirteen
+  # configurations did not compile at all — every `net`-without-`cortex`
+  # selection — from one defect with two sites:
   #
-  #   src/adapter/net/channel/config.rs:13 imports
-  #     `crate::adapter::net::mesh_rpc::ServeError`, but `mesh_rpc` is gated
-  #     `#[cfg(feature = "cortex")]` at src/adapter/net/mod.rs:70;
-  #   src/adapter/net/mesh.rs:1674 names
-  #     `crate::adapter::net::cortex::RpcInboundDispatcher` unconditionally,
-  #     and `cortex` is gated at src/adapter/net/mod.rs:53.
+  #   src/adapter/net/channel/config.rs imported
+  #     `crate::adapter::net::mesh_rpc::ServeError` unconditionally while
+  #     `mesh_rpc` is `#[cfg(feature = "cortex")]` (src/adapter/net/mod.rs);
+  #   src/adapter/net/mesh.rs named
+  #     `crate::adapter::net::cortex::RpcInboundDispatcher` in an ungated type
+  #     alias, and carried `rpc_local_services` under a `redex` cfg while its
+  #     type `LocalServiceRegistry` is `cortex`-gated — `cortex` implies
+  #     `redex`, not the reverse.
   #
-  # `redex` / `redex redex-disk` / `dataforts` add
-  # `LocalServiceRegistry` / `MeshNode::rpc_local_services` on top of the same
-  # root cause. Repairing it is a library change (where `ServeError` lives,
-  # and cfg-gating the dispatcher field), not a CI change.
+  # `dataforts` additionally exposed `blob::transfer_rpc`, an nRPC service
+  # definition, without `cortex`. All repaired; every row below is now a
+  # must-build row, which is the state this job exists to hold. If you gate
+  # something new on `cortex`, this job is what tells you that a downstream
+  # `cargo add net-mesh --no-default-features --features net` broke.
   #
   # This is deliberately NOT a behavior gate. Anything that must be OBSERVED
   # with a feature off needs a real test run, not a row here — add it to a
@@ -2075,7 +2075,7 @@ jobs:
           shared-key: narrow-feature-check
           workspaces: net/crates/net -> target
 
-      - name: Configurations that must build
+      - name: Every narrow configuration builds
         run: |
           set -uo pipefail
           check() {   # $1=feature set ("" = none)  $2=why
@@ -2086,49 +2086,22 @@ jobs:
               cargo check --locked --lib --no-default-features --features "$1"
             fi
           }
-          check "" "the bare event bus, no mesh at all" || exit 1
-          check "net tool" "the mesh plus the AI tool surface (tool pulls cortex)" || exit 1
-          check "cortex" "folded state without NetDb, MeshDB or MeshOS" || exit 1
-          check "netdb" "NetDb without MeshDB or MeshOS" || exit 1
-          check "meshdb" "the query layer alone" || exit 1
-          check "meshos" "the cluster-behavior engine alone" || exit 1
-          echo "every supported narrow configuration builds"
-
-      # A ratchet, not a green light. Each row below is a configuration a
-      # downstream consumer CAN select and that does NOT build today. The
-      # assertion is that it still fails FOR THE RECORDED REASON: a build that
-      # starts succeeding means the gating defect was fixed and the row must
-      # move up to the step above; a build that fails for some OTHER reason
-      # means the recorded diagnosis is stale. Either way the job goes red and
-      # says which.
-      - name: Configurations known not to build (must still fail, for the recorded reason)
-        if: ${{ !cancelled() }}
-        run: |
-          set -uo pipefail
-          broken() {   # $1=feature set  $2=marker the failure must mention
-            echo "==> --no-default-features --features '$1'  (expected to fail: $2)"
-            out=$(cargo check --locked --lib --no-default-features --features "$1" 2>&1)
-            st=$?
-            if [ "$st" -eq 0 ]; then
-              echo "::error::--features '$1' now BUILDS. The gating defect is fixed — promote this row into the step above and delete it here."
-              return 1
-            fi
-            if ! printf '%s\n' "$out" | grep -q "$2"; then
-              echo "::error::--features '$1' failed, but not for the recorded reason ($2). The diagnosis in this job's comment is stale; re-derive it."
-              printf '%s\n' "$out" | grep -E '^error' | head -10
-              return 1
-            fi
-            echo "    still fails as recorded"
-          }
           rc=0
-          broken "net"                 "mesh_rpc" || rc=1
-          broken "net nat-traversal"   "mesh_rpc" || rc=1
-          broken "net batched-ingress" "mesh_rpc" || rc=1
-          broken "net regex"           "mesh_rpc" || rc=1
-          broken "redex"               "mesh_rpc" || rc=1
-          broken "redex redex-disk"    "mesh_rpc" || rc=1
-          broken "dataforts"           "mesh_rpc" || rc=1
-          exit "$rc"
+          check "" "the bare event bus, no mesh at all" || rc=1
+          check "net" "the mesh transport with no nRPC, CortEX or storage" || rc=1
+          check "net nat-traversal" "traversal without port mapping" || rc=1
+          check "net batched-ingress" "the batched receive path on a bare mesh" || rc=1
+          check "net regex" "regex capability matching on a bare mesh" || rc=1
+          check "net tool" "the AI tool surface (tool pulls cortex)" || rc=1
+          check "redex" "the in-memory log with no on-disk segment" || rc=1
+          check "redex redex-disk" "the on-disk log without CortEX" || rc=1
+          check "cortex" "folded state without NetDb, MeshDB or MeshOS" || rc=1
+          check "netdb" "NetDb without MeshDB or MeshOS" || rc=1
+          check "meshdb" "the query layer alone" || rc=1
+          check "meshos" "the cluster-behavior engine alone" || rc=1
+          check "dataforts" "blob storage (pulls redex-disk by definition)" || rc=1
+          [ "$rc" -eq 0 ] || { echo "::error::a narrow configuration does not build"; exit 1; }
+          echo "every narrow configuration builds"
 
   loom-tests:
     name: Loom concurrency models
