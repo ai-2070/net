@@ -55,10 +55,13 @@
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+// The workspace disallows `std::sync::Mutex::lock`
+// (clippy `disallowed_methods`): every lock here is parking_lot's.
+use parking_lot::Mutex;
 use net::adapter::net::rtc::{connect_rtc_loopback, RtcConfig};
 use net::adapter::net::{
     EntityKeypair, MeshNode, MeshNodeConfig, MultiHopPacketBuilder, NetProxy, PeerAddr,
@@ -190,7 +193,7 @@ impl ProxySidecar {
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 4096];
                 while let Ok((n, _from)) = sink.recv_from(&mut buf).await {
-                    *last.lock().expect("sink mutex") = buf[..n].to_vec();
+                    *last.lock() = buf[..n].to_vec();
                     hits.fetch_add(1, Ordering::SeqCst);
                 }
             });
@@ -335,7 +338,7 @@ async fn an_rtc_peers_routed_envelope_never_reaches_the_proxy() {
     assert_eq!(stats.packets_dropped, 0);
 
     // …and what left F7 is the real forward, header rewritten.
-    let forwarded = f7.last_at_sink.lock().expect("sink mutex").clone();
+    let forwarded = f7.last_at_sink.lock().clone();
     let header =
         RoutingHeader::from_bytes(&forwarded[..ROUTING_HEADER_SIZE]).expect("forwarded header");
     assert_eq!(header.dest_id, dest);
@@ -379,12 +382,11 @@ async fn a_proxy_socket_cannot_become_the_authenticated_adjacency_a_relay_needs(
         peer.connect(f7.proxy_addr, &[0x11u8; 32], 0x7777),
     )
     .await;
-    match outcome {
-        Ok(Ok(node_id)) => panic!(
+    if let Ok(Ok(node_id)) = outcome {
+        panic!(
             "a proxy socket must never become a mesh adjacency — it 'completed' a \
              handshake as node {node_id:#x}"
-        ),
-        Ok(Err(_)) | Err(_) => {}
+        );
     }
     assert_eq!(
         peer.peer_count(),
