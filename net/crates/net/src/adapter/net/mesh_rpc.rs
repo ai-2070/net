@@ -10733,6 +10733,8 @@ mod roster_fallback_tests {
                 price_quote: None,
                 reflex_addr: None,
                 noise_pubkey: None,
+                rtc_bootstrap: None,
+                rtc_addr: None,
                 allowed_nodes: vec![0xDEAD],
                 allowed_subnets: vec![],
                 allowed_groups: vec![],
