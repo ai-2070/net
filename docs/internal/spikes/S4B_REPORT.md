@@ -321,47 +321,88 @@ truncation test cuts at every length.
 
 ## 9. Validation at the final head
 
+The AGENTS.md pre-push checklist, not `--lib`-shaped substitutes —
+three CI reds on this branch came from targets a `--lib` or
+`--test`-scoped command never builds (test constructors, a bench,
+a lint that only fires on `--all-targets`).
+
 | Command | Result |
 |---|---|
-| `cargo fmt -p net-mesh -p net-mesh-sdk -p net-cli -p net-deck -- --check` | pass |
+| `cargo fmt -p <each member> -- --check` | pass. **`cargo fmt --all -- --check` cannot run on this host** — `os error 206`, the argument list is too long — so it ran per package; CI's `Format` job is the authority and is green |
+| `cargo check --workspace --all-targets` | 0 errors |
+| `cargo clippy --all-features --all-targets` with CI's `-A` set | 0 |
 | `cargo clippy --features webrtc --lib --bins -- -D warnings` | 0 |
 | `cargo clippy -p net-mesh-sdk --features rtc-bootstrap --lib -- -D warnings` | 0 |
-| `RUSTDOCFLAGS="-D warnings" cargo doc -p net-mesh-sdk --no-deps --features rtc-bootstrap` | 0 |
+| `cargo clippy -p net-deck --all-targets` / `--features webrtc --all-targets` | 0 / 0 |
+| `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features` | 0 |
 | `cargo test --lib --features "$UNIT_FEATURES"` / `+ webrtc` | **5779** / **5811** passed, 0 failed |
 | Twelve RTC binaries, `--no-tests=fail --retries 0` | **106 run, 106 passed** |
 | `sdk --features rtc-bootstrap`: `rtc_bootstrap_listener` + `bootstrap_dep_boundary` | 13 passed |
 | `sdk --features net`: credential unit witnesses | 10 passed |
 | `net-cli --test anchor_credential` | 8 passed |
-| Browser harness (real Chromium 149) | **9 witnesses, 0 failed**, exit 0, run twice |
+| `sdk --test org_exact_sensing` (the repaired OA-6 binary) | 22 passed |
+| Browser harness (real Chromium 149, Windows) | **9 witnesses, 0 failed**, exit 0, run twice |
 | `cargo tree -d` for `-p net-mesh-sdk --features rtc-bootstrap` | no duplicate `rustls` / `axum` / `hyper` / `aws-lc` |
-| Default-build boundary | `bootstrap_dep_boundary` holds it by manifest; the core declares no HTTP dependency at all |
 
 Per-binary counts vs CI floors: 5 / 7 / 22 / 4 / 8 / 5 / 2 / 12 / 26 / 11 / 2 / 2 = 106; every floor met, the two new binaries pinned.
 
 ---
 
-## 10. CI at the time of writing
+## 10. CI — green
 
-Local validation is §9. CI on the branch is a separate fact and is
-recorded as one:
+**Head `490568ecd`, run
+[34737303326](https://github.com/ai-2070/net/actions/runs/34737303326):
+52 jobs, 52 success.** That includes the **first execution of
+`webrtc-browser`**, on Linux, which reports `rtc_browser: 9 passed,
+0 failed (floor 9)` and `browser witness inventory complete` — so
+the Stage 4b exit criteria are witnessed by CI, not only on the
+author's host.
 
-- The 4a second-round head `51e1e011b` is **green** — that is the
-  base 4b is stacked on.
-- The 4b heads have gone red twice, both times for a *compile*
-  break the local `--lib`-shaped checks do not see, and both times
-  fixed rather than waived:
-  1. `E0063` — the two new `CapabilityMembership` fold projections
-     are two more fields on a struct that ~25 `#[cfg(test)]` sites
-     construct literally, several of them in `tests/` and
-     `benches/` targets that `cargo check --lib` never builds
-     (`54befc493`, and the owner's `a70b33f17` for the last four).
-     This is the same class of gap AGENTS.md's pre-push checklist
-     names, and it caught the same way twice in one stage.
-  2. `clippy::empty_line_after_doc_comments` in Deck — inserting a
-     type between an enum's doc comment and the enum
-     (`32b91909a`).
-- The `webrtc-browser` job has **never executed**; see §7 gap 5.
+The mDNS measurement reproduced on the runner and **agrees with
+§6.3 on a completely different network**:
 
-The final CI verdict at head `32b91909a` is pending at the time of
-writing and is the one that matters — nothing in this report should
-be read as claiming a green branch until that run reports.
+```
+[mdns] loopback/anchor-stun: NO PAIR — timeout: datachannel open
+[mdns] loopback/no-stun:     PAIR FORMED in 20 ms; getStats local type=prflx;
+                             anchor learned=peer-reflexive
+[mdns] interface/no-stun:    PAIR FORMED in 18 ms (10.1.0.23);
+                             anchor learned=peer-reflexive
+```
+
+Peer-reflexive alone, on both loopback and a real interface, with
+mDNS obfuscation on — and the anchor's own STUN as an `iceServer`
+again prevents the pair. Two hosts, two networks, same answer: plan
+§6's "(a)+(b)" narrows to **(a)**.
+
+### 10.1 What was red, and why — the record
+
+Seven distinct breaks over the stage, each fixed at its cause, none
+waived:
+
+| Red | Cause | Fix |
+|---|---|---|
+| `E0063` in `src` test modules | the two new fold projections are fields ~25 `#[cfg(test)]` sites construct literally | `54befc493` |
+| `E0063` in `tests/` | same, four more constructors | owner's `a70b33f17` |
+| `E0063` in `benches/` | same, three benches — **no `--lib` or `--test` command builds a bench** | `fde741901` |
+| `empty_line_after_doc_comments` (Deck) | a new type inserted between an enum's doc comment and the enum | `32b91909a` |
+| `disallowed_methods` + single-arm `match` (F7 witness) | `std::sync::Mutex` where the workspace uses parking_lot | `5e6beb255` |
+| `Format` | the same commit's import order, fixed locally by a later `cargo fmt` and never committed | `490568ecd` |
+| `run.sh` / `check-witness-results.py` `Permission denied` | committed `100644`, run by path | `490568ecd` |
+| `Rust SDK tests`: "no JUnit artifact" | the job runs from `net/crates/net/sdk`, but a workspace **member has no target dir** — nextest writes under `net/crates/net/target` | `490568ecd`, via `cargo metadata`'s `target_directory` |
+
+Two witnesses were **load-dependent, not flaky**, and both were
+diagnosed rather than retried:
+
+- `a_missing_canonical_member_is_recovered_under_an_unchanged_expectation`
+  (OA-6) rejection-sampled a node id below a random minimum with a
+  fixed budget. The honest failure rate is `40/4136` ≈ **1 % per
+  run**, not the naive `(1-1/41)^4096`: the floor is itself a
+  minimum with a heavy tail. Now it draws the pool and *takes* its
+  minimum — below-the-crowd by construction (`7f62646d5`).
+- `routed_then_direct_then_loss_then_manually_restored_routed`
+  failed with the initiator's `handshake timeout`. The cause is that
+  the quiescence gate is evaluated **by each side independently**,
+  and the witness waited only on A's view; on a loaded runner B's
+  ack was still in flight, so B refused the upgrade as "busy". It
+  now waits on both ends and names which end was busy on failure
+  (`90dd0e36c`). No wait was widened in either fix.
