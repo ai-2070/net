@@ -35,8 +35,6 @@ pub struct LogsBackTarget {
     pub prior_paused: Option<Vec<net_sdk::deck::LogRecord>>,
 }
 
-/// Navigation half of [`LogsBackTarget`] — the three
-
 /// The two addresses that make an RTC anchor usable, as the NODES
 /// table shows them (Stage 4b).
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -97,6 +95,7 @@ fn collect_rtc_anchors(
     }
 }
 
+/// Navigation half of [`LogsBackTarget`] — the three
 /// contexts `filter_logs_for_id` is reachable from.
 #[derive(Clone, Debug)]
 pub enum LogsBackContext {
