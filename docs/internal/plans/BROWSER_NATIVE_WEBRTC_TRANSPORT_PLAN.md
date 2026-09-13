@@ -2176,6 +2176,40 @@ with handler cancellation, subscribe bounds, incarnation-keyed signal
 queues — not implemented, not waived. Stage 4b brief:
 `spikes/S4B_BRIEF.md`.
 
+**Stage 4b candidate `871e0138d` (report `f9ddd2543`) — delivered;
+Kyra: HOLD.** `S4B_REPORT.md`. What landed: the credential as a new
+format; the `rtc-bootstrap` listener (axum over the pinned rustls;
+`POST /rtc/offer` into the production dialog owner, `wss` trickle with
+`Origin`, explicit CORS, operator-PEM and ACME HTTP-01 paths);
+`rtc_bootstrap` names the real listener; `net-mesh anchor` + Deck; the
+F7 boundary witness; the natsim scenario (never run here); the
+Chromium harness — real Chromium 149 through credential → offer →
+trickle → DataChannel → Noise → enrollment, the six §12 witnesses
+observed on the anchor, a `webrtc-browser` CI job; **the mDNS answer
+measured**: peer-reflexive alone forms the pair on loopback (14–27 ms)
+and a real interface (326–334 ms); adding the anchor's own STUN as
+`iceServers` *prevented* the pair (not root-caused in str0m 0.23.1) —
+§6's "(a)+(b)" narrows to (a). Exact-head CI 52/52 after two rounds of
+all-targets fallout the `--lib`-shaped local checks had missed.
+
+Kyra's HOLD (`spikes/S4B_R_BRIEF.md`; six probes reproduced 0/6 at
+`f9ddd2543`; the page's MITM verdict confirmed by source):
+
+| # | Finding |
+|---|---|
+| R1 (P1) | an uncredentialed WebSocket with an allowed `Origin` and the victim's `node/dialog` retires the victim's pending attempt on close (executed) |
+| R2 (P1) | the listener's candidate path skips the native size bound and `SignalBudget` (65 accepted where native refuses); offers charge the budget under the unverified `claimed_node_id` |
+| R3 (P2) | both credential deadlines are recipient-editable: expired → 400, edited → 200 (executed); no issuer authentication over the fields |
+| R4 (P1/P2) | ACME cold start impossible (TLS-only listener bound after acquisition; no plaintext HTTP-01 ingress); cache returns `localhost`'s cert for `different.example` (executed); no SAN/time qualification, no renewal owner |
+| R5 (P2) | `OfferRequest`'s derived `Debug` prints the PSK-bearing credential (executed); private key written before chmod, failure ignored |
+| R6 (P2) | CLI/Deck anchor listings have no live mesh source (`mesh: None`) |
+| R7 (P1/P2) | MITM verdict `ok: true` on **any** exception (HTTP failure passes); local-delivery and protected-denial witnesses ignore the Send result; mDNS PASS recordable from a failed mDNS-on run; browser replacement and bounds schedules missing |
+| R8 (P2) | natsim never run; the scenario does not show the announced `rtc_addr` being the STUN target |
+
+Also recorded: `anchor serve` registers no enrollment provider (the
+harness supplies one — operational boundary, not a new mandate);
+credentials pinned before an anchor restart are not proven reusable.
+
 ## Stage 5 — `net-leaf` + `@net-mesh/browser`
 
 - Leaf crate and TypeScript wrapper; identity storage and leader election
