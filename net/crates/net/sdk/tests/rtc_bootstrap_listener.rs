@@ -1279,3 +1279,50 @@ fn offered_budget_key(anchor: &Arc<MeshNode>, node_id: u64, dialog: u64) -> u64 
         .bootstrap_attempt_key(node_id, dialog)
         .expect("the anchor recorded an owner for this attempt")
 }
+
+/// R4 (round two): a failed startup does not keep its challenge
+/// port.
+///
+/// The ingress is bound BEFORE ordering, which is what makes a cold
+/// start possible — but the handle was dropped when the order
+/// failed, and dropping a `JoinHandle` DETACHES the task. The review
+/// watched the port stay bound for the life of the process. The
+/// observable is the port itself: after the failure, it binds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_acme_startup_releases_its_challenge_port() {
+    let anchor = kyra_long_lived_anchor().await;
+    // A port nobody else holds, released before the listener claims
+    // it. Binding it again at the end is the whole verdict.
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("probe bind");
+    let challenge_addr = probe.local_addr().expect("probe addr");
+    drop(probe);
+
+    let cache = tempfile::tempdir().expect("cache dir");
+    let mut config = config(PSK);
+    // A directory that refuses connections: ordering fails, and it
+    // fails AFTER the challenge ingress is up.
+    config.tls = BootstrapTls::Acme(net_sdk::rtc_bootstrap::AcmeConfig::new(
+        "http://127.0.0.1:1/directory",
+        "localhost",
+        "operator@example.invalid",
+        cache.path().into(),
+    ));
+    config.acme_challenge_addr = challenge_addr;
+
+    let started = serve_bootstrap(Arc::clone(&anchor), config).await;
+    assert!(
+        started.is_err(),
+        "the premise: a directory on a closed port cannot issue",
+    );
+
+    let rebound = tokio::net::TcpListener::bind(challenge_addr).await;
+    assert!(
+        rebound.is_ok(),
+        "the failed startup left {challenge_addr} bound: {:?}",
+        rebound.err(),
+    );
+
+    anchor.shutdown().await.expect("shutdown");
+}

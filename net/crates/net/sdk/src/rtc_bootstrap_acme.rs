@@ -107,31 +107,50 @@ fn read_cache(dir: &Path, domain: &str, now: u64) -> Option<Chain> {
     }
     let (chain, private) = read_pem_pair(&cert, &key).ok()?;
     let leaf = chain.first()?;
-    let (covers, not_after) = qualify_leaf(leaf, domain)?;
-    if !covers || not_after <= now {
+    let (covers, not_before, not_after) = qualify_leaf(leaf, domain)?;
+    // **The WHOLE window** (R4, round two): a leaf whose validity
+    // starts in the future was being served — the review cached one
+    // and watched it accepted. Every verifying client would refuse
+    // it, so serving it is an outage with a cache hit in front of
+    // it.
+    if !covers || not_after <= now || not_before > now {
         return None;
     }
     Some((chain, private))
 }
 
-/// `(covers the domain, not_after)` for a leaf certificate.
-fn qualify_leaf(leaf: &rustls::pki_types::CertificateDer<'_>, domain: &str) -> Option<(bool, u64)> {
+/// `(covers the domain, not_before, not_after)` for a leaf.
+///
+/// **SAN is authoritative** (R4, round two). The previous form OR'd
+/// Common Name with the SAN, so a matching CN overrode a
+/// non-matching DNS SAN — the review cached exactly that pair and
+/// watched it accepted. Every browser and every rustls client has
+/// ignored CN for hostname verification for years: a certificate
+/// that carries a SAN is covered by its SAN or not at all. CN is
+/// consulted only for a certificate with no SAN extension, which is
+/// the legacy shape those clients also refuse but which this cache
+/// has no business inventing an opinion about.
+fn qualify_leaf(
+    leaf: &rustls::pki_types::CertificateDer<'_>,
+    domain: &str,
+) -> Option<(bool, u64, u64)> {
     use x509_parser::prelude::*;
 
     let (_, parsed) = X509Certificate::from_der(leaf.as_ref()).ok()?;
     let not_after = parsed.validity().not_after.timestamp().max(0) as u64;
-    let mut covers = parsed
-        .subject()
-        .iter_common_name()
-        .filter_map(|cn| cn.as_str().ok())
-        .any(|cn| name_matches(cn, domain));
-    if let Ok(Some(san)) = parsed.subject_alternative_name() {
-        covers |= san.value.general_names.iter().any(|name| match name {
+    let not_before = parsed.validity().not_before.timestamp().max(0) as u64;
+    let covers = match parsed.subject_alternative_name() {
+        Ok(Some(san)) => san.value.general_names.iter().any(|name| match name {
             GeneralName::DNSName(dns) => name_matches(dns, domain),
             _ => false,
-        });
-    }
-    Some((covers, not_after))
+        }),
+        _ => parsed
+            .subject()
+            .iter_common_name()
+            .filter_map(|cn| cn.as_str().ok())
+            .any(|cn| name_matches(cn, domain)),
+    };
+    Some((covers, not_before, not_after))
 }
 
 /// Exact match, plus the one wildcard form a certificate may carry.
@@ -152,17 +171,41 @@ fn name_matches(name: &str, domain: &str) -> bool {
 pub(crate) fn renew_at(config: &AcmeConfig, horizon: Duration) -> Option<u64> {
     let (cert, key) = cache_paths(&domain_cache_dir(config));
     let (chain, _) = read_pem_pair(&cert, &key).ok()?;
-    let (_, not_after) = qualify_leaf(chain.first()?, &config.domain)?;
+    let (_, _, not_after) = qualify_leaf(chain.first()?, &config.domain)?;
     Some(not_after.saturating_sub(horizon.as_secs()))
 }
 
+/// Publish a new pair **without destroying a usable old one**
+/// (R4, round two).
+///
+/// The old shape wrote the certificate over the live one and then
+/// deleted the key to recreate it: an I/O failure in between left a
+/// new certificate beside a deleted key, and the process could not
+/// restart on either. Both halves are now written to siblings first
+/// — the key created 0600 from inception, as before — and only when
+/// BOTH are on disk are they renamed into place. A crash leaves the
+/// previous pair intact; a crash after the first rename leaves a
+/// mismatched pair, which `read_cache` rejects (the leaf will not
+/// verify against the key) and the next order replaces.
 fn write_cache(dir: &Path, cert_pem: &str, key_pem: &str) -> Result<(), BootstrapError> {
     std::fs::create_dir_all(dir)
         .map_err(|e| BootstrapError::Acme(format!("creating {}: {e}", dir.display())))?;
     let (cert, key) = cache_paths(dir);
-    std::fs::write(&cert, cert_pem)
-        .map_err(|e| BootstrapError::Acme(format!("writing {}: {e}", cert.display())))?;
-    write_private_key(&key, key_pem)?;
+    let cert_tmp = cert.with_extension("pem.new");
+    let key_tmp = key.with_extension("pem.new");
+    let _ = std::fs::remove_file(&cert_tmp);
+    std::fs::write(&cert_tmp, cert_pem)
+        .map_err(|e| BootstrapError::Acme(format!("writing {}: {e}", cert_tmp.display())))?;
+    write_private_key(&key_tmp, key_pem)?;
+    std::fs::rename(&cert_tmp, &cert).map_err(|e| {
+        let _ = std::fs::remove_file(&cert_tmp);
+        let _ = std::fs::remove_file(&key_tmp);
+        BootstrapError::Acme(format!("publishing {}: {e}", cert.display()))
+    })?;
+    std::fs::rename(&key_tmp, &key).map_err(|e| {
+        let _ = std::fs::remove_file(&key_tmp);
+        BootstrapError::Acme(format!("publishing {}: {e}", key.display()))
+    })?;
     Ok(())
 }
 
@@ -274,7 +317,25 @@ async fn order_certificate(
         .await
         .map_err(|e| BootstrapError::Acme(format!("placing the order: {e}")))?;
 
-    let mut installed = Vec::new();
+    // **Every exit retires this order's challenges** (R4, round
+    // two). `set_ready` and `poll_ready` can both fail, and the
+    // early return used to leave key authorizations installed on the
+    // public challenge route for the life of the process.
+    struct Installed<'a> {
+        challenges: &'a AcmeState,
+        tokens: Vec<String>,
+    }
+    impl Drop for Installed<'_> {
+        fn drop(&mut self) {
+            for token in &self.tokens {
+                self.challenges.clear_challenge(token);
+            }
+        }
+    }
+    let mut installed = Installed {
+        challenges,
+        tokens: Vec::new(),
+    };
     {
         let mut authorizations = order.authorizations();
         while let Some(mut authorization) = authorizations
@@ -293,7 +354,7 @@ async fn order_certificate(
                 challenge.token.to_string(),
                 challenge.key_authorization().as_str().to_string(),
             );
-            installed.push(challenge.token.to_string());
+            installed.tokens.push(challenge.token.to_string());
             challenge
                 .set_ready()
                 .await
@@ -305,9 +366,7 @@ async fn order_certificate(
         .poll_ready(&instant_acme::RetryPolicy::default())
         .await
         .map_err(|e| BootstrapError::Acme(format!("polling the order: {e}")))?;
-    for token in &installed {
-        challenges.clear_challenge(token);
-    }
+    drop(installed);
     if status != OrderStatus::Ready {
         return Err(BootstrapError::Acme(format!(
             "the order did not become ready (status {status:?})"
@@ -444,6 +503,115 @@ mod tests {
             base.path().into(),
         );
         assert!(renew_at(&cold, horizon).is_none());
+    }
+
+    /// R4 (round two): a leaf whose validity has not STARTED is not
+    /// a usable pair.
+    ///
+    /// The review cached one and watched the helper accept it. Every
+    /// verifying client refuses a not-yet-valid certificate, so
+    /// serving it is an outage with a cache hit in front of it.
+    #[test]
+    fn a_certificate_that_is_not_valid_yet_is_not_served() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = now_unix();
+        let (_ca, cert_pem, key_pem) = issue_between("localhost", now + 3600, now + 7200);
+        std::fs::write(dir.path().join(CERT_FILE), &cert_pem).unwrap();
+        std::fs::write(dir.path().join(KEY_FILE), &key_pem).unwrap();
+        assert!(
+            read_cache(dir.path(), "localhost", now).is_none(),
+            "a leaf whose not_before is in the future must not be served",
+        );
+        // The positive control: the same pair once its window opens.
+        assert!(
+            read_cache(dir.path(), "localhost", now + 4000).is_some(),
+            "…and it IS usable inside its window",
+        );
+    }
+
+    /// R4 (round two): the SAN is authoritative for the hostname.
+    ///
+    /// A matching Common Name used to override a non-matching DNS
+    /// SAN, so the cache served a certificate every browser and
+    /// every rustls client would refuse for that name.
+    #[test]
+    fn a_matching_common_name_cannot_override_a_wrong_san() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = now_unix();
+        let (_ca, cert_pem, key_pem) = issue_with_cn("wanted.example", "other.example");
+        std::fs::write(dir.path().join(CERT_FILE), &cert_pem).unwrap();
+        std::fs::write(dir.path().join(KEY_FILE), &key_pem).unwrap();
+        assert!(
+            read_cache(dir.path(), "wanted.example", now).is_none(),
+            "CN says yes, the SAN says no, and the SAN is what clients check",
+        );
+        assert!(
+            read_cache(dir.path(), "other.example", now).is_some(),
+            "the name it is genuinely for is still served",
+        );
+    }
+
+    /// R4 (round two): publishing a new pair never destroys a usable
+    /// old one.
+    #[test]
+    fn a_failed_publication_leaves_the_previous_pair_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_ca, old_cert, old_key) = issue_for("localhost", 3600);
+        write_cache(dir.path(), &old_cert, &old_key).expect("first publication");
+        let before = read_cache(dir.path(), "localhost", now_unix());
+        assert!(before.is_some(), "the premise: a usable cached pair");
+
+        // A key path that cannot be created: publication must fail
+        // BEFORE anything live is touched.
+        let (cert, key) = cache_paths(dir.path());
+        let blocker = key.with_extension("pem.new");
+        std::fs::create_dir_all(&blocker).expect("occupy the key's staging path");
+        let (_ca2, new_cert, new_key) = issue_for("localhost", 7200);
+        assert!(
+            write_cache(dir.path(), &new_cert, &new_key).is_err(),
+            "the premise: this publication fails",
+        );
+        assert!(
+            read_cache(dir.path(), "localhost", now_unix()).is_some(),
+            "the previous pair must still be usable after a failed publication",
+        );
+        assert_eq!(
+            std::fs::read_to_string(&cert).unwrap(),
+            old_cert,
+            "…and must still be the OLD certificate",
+        );
+    }
+
+    /// A self-signed leaf for `name`, valid over an explicit window.
+    fn issue_between(
+        name: &str,
+        not_before: u64,
+        not_after: u64,
+    ) -> (rcgen::Certificate, String, String) {
+        let mut params = rcgen::CertificateParams::new(vec![name.to_string()]).unwrap();
+        params.not_before = time::OffsetDateTime::from_unix_timestamp(not_before as i64).unwrap();
+        params.not_after = time::OffsetDateTime::from_unix_timestamp(not_after as i64).unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        let pem = cert.pem();
+        let key_pem = key.serialize_pem();
+        (cert, pem, key_pem)
+    }
+
+    /// A leaf whose Common Name and DNS SAN name different hosts.
+    fn issue_with_cn(common_name: &str, san: &str) -> (rcgen::Certificate, String, String) {
+        let mut params = rcgen::CertificateParams::new(vec![san.to_string()]).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, common_name);
+        params.not_before = rcgen::date_time_ymd(2000, 1, 1);
+        let secs = (now_unix() + 3600) as i64;
+        params.not_after = time::OffsetDateTime::from_unix_timestamp(secs).unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        let pem = cert.pem();
+        let key_pem = key.serialize_pem();
+        (cert, pem, key_pem)
     }
 
     /// A self-signed leaf for `name`, valid for `ttl` seconds.

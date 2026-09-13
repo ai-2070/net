@@ -663,12 +663,24 @@ pub async fn serve_bootstrap(
     let tls: Arc<RwLock<Arc<tokio_rustls::TlsAcceptor>>> = Arc::new(RwLock::new(initial));
     let renewal = spawn_renewal(&config, Arc::clone(&tls));
     let router = bootstrap_router(node, &config);
-    let listener = tokio::net::TcpListener::bind(config.bind_addr)
+    // A TLS bind that fails AFTER the challenge ingress and the
+    // renewal owner exist must not detach them either (R4, round
+    // two): same reasoning as the ordering failure, same remedy.
+    let bound = tokio::net::TcpListener::bind(config.bind_addr)
         .await
-        .map_err(|e| BootstrapError::Bind(e.to_string()))?;
-    let local_addr = listener
-        .local_addr()
-        .map_err(|e| BootstrapError::Bind(e.to_string()))?;
+        .and_then(|listener| listener.local_addr().map(|addr| (listener, addr)));
+    let (listener, local_addr) = match bound {
+        Ok(pair) => pair,
+        Err(e) => {
+            if let Some(renewal) = renewal {
+                abort_and_join(renewal).await;
+            }
+            if let Some(challenge) = challenge_task {
+                abort_and_join(challenge).await;
+            }
+            return Err(BootstrapError::Bind(e.to_string()));
+        }
+    };
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
         let service = router.into_make_service_with_connect_info::<SocketAddr>();
@@ -689,11 +701,13 @@ pub async fn serve_bootstrap(
                 serve_one(stream, remote, tls, service).await;
             });
         }
+        // Settled, not merely signalled: `shutdown().await`
+        // returning must mean the challenge port is free.
         if let Some(renewal) = renewal {
-            renewal.abort();
+            abort_and_join(renewal).await;
         }
         if let Some(challenge) = challenge_task {
-            challenge.abort();
+            abort_and_join(challenge).await;
         }
     });
     Ok(BootstrapHandle {
@@ -702,6 +716,11 @@ pub async fn serve_bootstrap(
         task,
     })
 }
+
+/// The shortest gap between two SUCCESSFUL renewals (R4, round
+/// two). Long enough that a short-lived certificate cannot spin the
+/// loop, far shorter than any real renewal horizon.
+const MIN_RENEWAL_INTERVAL: Duration = Duration::from_secs(300);
 
 /// The renewal owner (R4c): re-orders at
 /// `not_after - renewal_horizon` and swaps the acceptor in place.
@@ -740,6 +759,18 @@ fn spawn_renewal(
                     Ok(acceptor) => {
                         *tls.write() = acceptor;
                         tracing::info!(domain = %acme.domain, "bootstrap certificate renewed");
+                        // **Successful orders are paced too** (R4,
+                        // round two). Only errors used to back off,
+                        // so a certificate issued with a lifetime at
+                        // or below the horizon — a short-lived test
+                        // CA, a directory that trims validity — put
+                        // this loop straight back into `renew_at <=
+                        // now` and ordered again immediately, for
+                        // ever. A floor between SUCCESSFUL orders
+                        // bounds that without weakening the horizon:
+                        // the next wake still respects `renew_at`
+                        // when it is further out.
+                        tokio::time::sleep(MIN_RENEWAL_INTERVAL).await;
                     }
                     Err(e) => tracing::error!(error = %e, "renewed certificate did not load"),
                 },
@@ -793,6 +824,16 @@ pub enum BootstrapError {
     /// ACME could not obtain a certificate.
     #[error("bootstrap ACME: {0}")]
     Acme(String),
+}
+
+/// Cancel a task and WAIT for it to be gone.
+///
+/// `abort()` requests cancellation, it does not perform it — and for
+/// a task that owns a listening socket the difference is whether the
+/// port is free when the caller returns (R4, round two).
+async fn abort_and_join(task: tokio::task::JoinHandle<()>) {
+    task.abort();
+    let _ = task.await;
 }
 
 /// The plaintext HTTP-01 challenge ingress (R4a).
@@ -877,11 +918,34 @@ async fn tls_acceptor(
                 domain = %acme.domain,
                 "acme http-01 ingress bound before ordering"
             );
-            challenge_task = Some(task);
-            crate::rtc_bootstrap_acme::obtain_certificate(acme, &config.acme).await?
+            match crate::rtc_bootstrap_acme::obtain_certificate(acme, &config.acme).await {
+                Ok(pair) => {
+                    challenge_task = Some(task);
+                    pair
+                }
+                Err(e) => {
+                    // **A failed startup owns its port** (R4, round
+                    // two). Dropping the handle DETACHES the task:
+                    // the challenge socket stayed bound for the life
+                    // of the process, and the review could not
+                    // rebind it after a failed order. `abort`
+                    // requests cancellation; only the await makes
+                    // the listener gone by the time this returns.
+                    abort_and_join(task).await;
+                    return Err(e);
+                }
+            }
         }
     };
-    Ok((server_config(chain, key)?, challenge_task))
+    match server_config(chain, key) {
+        Ok(acceptor) => Ok((acceptor, challenge_task)),
+        Err(e) => {
+            if let Some(task) = challenge_task {
+                abort_and_join(task).await;
+            }
+            Err(e)
+        }
+    }
 }
 
 pub(crate) fn read_pem_pair(
