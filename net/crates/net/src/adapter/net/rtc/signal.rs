@@ -147,6 +147,21 @@ impl RtcSignalMsg {
         if oversize {
             return Err(RtcSignalError::TooLarge);
         }
+        // **The bound the native ingress actually applies is on the
+        // SERIALIZED frame**, and the field sums above are smaller
+        // than it: a candidate whose `candidate + mid` lands exactly
+        // on the limit encodes to more than the limit once postcard
+        // has written the tag, the dialog id and the two length
+        // prefixes. The review pushed exactly that frame through the
+        // bootstrap hook — `validate_size` accepted it, the native
+        // decoder refused the bytes. Measuring the encoding closes
+        // the gap instead of approximating it; `serialized_size`
+        // walks the value without allocating a buffer.
+        let encoded =
+            postcard::experimental::serialized_size(self).map_err(|_| RtcSignalError::Malformed)?;
+        if encoded > MAX_SDP_BYTES {
+            return Err(RtcSignalError::TooLarge);
+        }
         Ok(())
     }
 
@@ -348,6 +363,44 @@ mod tests {
             dialog,
             sdp: "v=0".to_string(),
         }
+    }
+
+    /// The bound both ingresses apply is the same bound (R2, round
+    /// two).
+    ///
+    /// The review built a candidate whose `candidate + mid` lands
+    /// EXACTLY on the semantic limit: the field sum accepted it, and
+    /// the native decoder — which bounds the serialized bytes —
+    /// refused the frame it encodes to, because postcard also writes
+    /// a tag, a dialog id and two length prefixes. Parity means
+    /// `validate_size` refuses precisely what `from_bytes` refuses.
+    #[test]
+    fn a_frame_at_the_field_limit_is_refused_by_both_ingresses() {
+        let mid = "0".to_string();
+        let candidate = "c".repeat(MAX_SDP_BYTES - mid.len());
+        let frame = RtcSignalMsg::Candidate {
+            dialog: 7,
+            candidate,
+            mid,
+        };
+        // The old field sum is exactly at the limit, so the old
+        // check accepted this frame.
+        let encoded = frame.to_bytes().expect("encode");
+        assert!(
+            encoded.len() > MAX_SDP_BYTES,
+            "the premise: this encodes larger than the limit ({} bytes)",
+            encoded.len(),
+        );
+        assert_eq!(
+            frame.validate_size(),
+            Err(RtcSignalError::TooLarge),
+            "the direct-construction ingress must refuse it",
+        );
+        assert_eq!(
+            RtcSignalMsg::from_bytes(&encoded),
+            Err(RtcSignalError::TooLarge),
+            "…exactly as the native decoder does",
+        );
     }
 
     #[test]

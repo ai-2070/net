@@ -10939,7 +10939,19 @@ pub struct MeshNode {
     /// have open". This does, without taking the dialog table's
     /// async lock from a synchronous accessor.
     #[cfg(feature = "webrtc")]
-    rtc_bootstrap_dialogs: Arc<DashMap<u64, usize>>,
+    /// The accepted bootstrap attempts, `(claimed node, dialog)` ->
+    /// the accounting identity its ingress is charged to (R1/R2).
+    ///
+    /// This is the attempt's OWNER record, not a counter. The
+    /// previous `node -> count` side map drifted from the real
+    /// dialog table (it was incremented after the completion spawn
+    /// and decremented on exactly one teardown), and because the
+    /// terminal paths release `(claimed node, dialog)` while the
+    /// ingress is charged to a random key, an owner close left the
+    /// random reservation live. Every terminal path now resolves the
+    /// key from here and releases the reservation that was actually
+    /// taken.
+    rtc_attempt_keys: Arc<DashMap<(u64, u64), u64>>,
     /// H3 witness seam: hold the RTC close-notification consumer, so
     /// the bounded channel can actually fill.
     #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
@@ -13420,7 +13432,7 @@ impl MeshNode {
             #[cfg(feature = "webrtc")]
             rtc_dialogs: Arc::new(tokio::sync::Mutex::new(super::rtc::DialogTable::new())),
             #[cfg(feature = "webrtc")]
-            rtc_bootstrap_dialogs: Arc::new(DashMap::new()),
+            rtc_attempt_keys: Arc::new(DashMap::new()),
             #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
             rtc_close_consumer_paused: Arc::new(AtomicBool::new(false)),
             #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
@@ -25328,6 +25340,7 @@ impl MeshNode {
         };
         let dialogs = Arc::clone(&self.rtc_dialogs);
         let rtc_budget = Arc::clone(&self.rtc_signal_budget);
+        let rtc_attempts = Arc::clone(&self.rtc_attempt_keys);
         let ice_deadline = self
             .config
             .rtc
@@ -25355,6 +25368,17 @@ impl MeshNode {
                         let mut guard = rtc_budget.lock();
                         for (node, dialog) in &expired {
                             guard.end_dialog(*node, *dialog);
+                            // …and the reservation a bootstrap
+                            // attempt actually took, which is keyed
+                            // by its accounting identity rather than
+                            // by the claim (R2). Expiry is a
+                            // terminal path like any other: the
+                            // owner record goes with the row.
+                            if let Some((_, key)) = rtc_attempts.remove(&(*node, *dialog)) {
+                                if key != *node {
+                                    guard.end_dialog(key, *dialog);
+                                }
+                            }
                         }
                     }
                 }
@@ -25567,13 +25591,15 @@ impl MeshNode {
                 // `accept_rtc` inbox must exist before the browser's
                 // first Noise msg1 can arrive.
                 self.spawn_dialog_completion(claimed_node_id, dialog, peer, false);
-                *self
-                    .rtc_bootstrap_dialogs
-                    .entry(claimed_node_id)
-                    .or_insert(0) += 1;
+                // The attempt's accounting owner, so every terminal
+                // path releases the reservation this ingress took
+                // rather than one keyed by the caller's claim (R2).
+                self.rtc_attempt_keys
+                    .insert((claimed_node_id, dialog), budget_key);
                 Ok(sdp)
             }
             super::rtc::SignalOutcome::Reject { dialog, reason } => {
+                self.rtc_attempt_keys.remove(&(claimed_node_id, dialog));
                 self.release_signal_budget(budget_key, dialog);
                 Err(AdapterError::Connection(format!(
                     "the offer was refused: {reason:?}"
@@ -25753,9 +25779,6 @@ impl MeshNode {
     /// deadline holding a budget slot.
     #[cfg(feature = "webrtc")]
     pub async fn end_bootstrap_dialog(&self, claimed_node_id: u64, dialog: u64) {
-        if let Some(mut count) = self.rtc_bootstrap_dialogs.get_mut(&claimed_node_id) {
-            *count = count.saturating_sub(1);
-        }
         let entry = {
             let mut table = self.rtc_dialogs.lock().await;
             table.remove(claimed_node_id, dialog)
@@ -25822,9 +25845,47 @@ impl MeshNode {
     /// silently loses its dialog allowance.
     #[cfg(feature = "webrtc")]
     pub(crate) fn release_signal_budget(&self, peer_node_id: u64, dialog: u64) {
-        self.rtc_signal_budget
-            .lock()
-            .end_dialog(peer_node_id, dialog);
+        // **The reservation that was actually taken** (R2). A
+        // bootstrap attempt's ingress is charged to a random key the
+        // caller could not choose, while the dialog itself is named
+        // by the claimed node id — so releasing only the claim left
+        // the random reservation admitting frames after the owner's
+        // socket had closed. The owner record says which key, and it
+        // is consumed here: this is the one place every terminal
+        // path (owner close, expiry, our Reject, the peer's Reject,
+        // completion success and failure) already goes through.
+        let owned = self.rtc_attempt_keys.remove(&(peer_node_id, dialog));
+        let mut guard = self.rtc_signal_budget.lock();
+        guard.end_dialog(peer_node_id, dialog);
+        if let Some((_, key)) = owned {
+            if key != peer_node_id {
+                guard.end_dialog(key, dialog);
+            }
+        }
+    }
+
+    /// The accounting identity recorded for an accepted attempt
+    /// (R2 witnesses): what its ingress is charged to, and what its
+    /// terminal path must release.
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    pub fn bootstrap_attempt_key(&self, claimed_node_id: u64, dialog: u64) -> Option<u64> {
+        self.rtc_attempt_keys
+            .get(&(claimed_node_id, dialog))
+            .map(|e| *e.value())
+    }
+
+    /// Is this exactly the accepted, still-live bootstrap attempt
+    /// (R1)?
+    ///
+    /// The listener's token map proves token ownership; it does not
+    /// prove the CORE attempt is still there. An attempt that
+    /// expired, was rejected or completed has had its row released
+    /// here, and a token for it must stop authorizing a socket.
+    #[cfg(feature = "webrtc")]
+    pub fn bootstrap_attempt_is_live(&self, claimed_node_id: u64, dialog: u64, key: u64) -> bool {
+        self.rtc_attempt_keys
+            .get(&(claimed_node_id, dialog))
+            .is_some_and(|e| *e.value() == key)
     }
 
     /// Make a dialog **we** offered known to the inbound budget
@@ -25842,22 +25903,22 @@ impl MeshNode {
     /// (R5 witnesses).
     #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
     pub fn open_signal_dialogs(&self, peer_node_id: u64) -> usize {
-        // The budget's view and the dialog table's view, whichever is
-        // larger (R2). They agree on the native path — one dialog is
-        // one budget slot and one table entry. They differ for an
-        // HTTP-originated attempt, whose BUDGET is charged to a
-        // per-attempt identity the caller could not choose while the
-        // dialog itself still names the peer it is for. "How many
-        // attempts does this peer have open" is the question every
-        // caller of this accessor is asking, and the table answers it
-        // without re-exposing another peer's allowance to a claim.
+        // The peer's own budget reservations, plus its LIVE accepted
+        // bootstrap attempts (R2). Not a maximum of two views: a
+        // bootstrap attempt's ingress is charged to a random key, so
+        // it is absent from the peer's budget count, and the owner
+        // records are the real rows — an attempt is here exactly
+        // while its reservation exists, because both are consumed by
+        // `release_signal_budget`. The previous `max(...)` of a
+        // drifting counter reported an open attempt after the core
+        // row was gone, and zero while a reservation was still live.
         let budgeted = self.rtc_signal_budget.lock().open_dialogs(peer_node_id);
-        let http = self
-            .rtc_bootstrap_dialogs
-            .get(&peer_node_id)
-            .map(|e| *e.value())
-            .unwrap_or(0);
-        budgeted.max(http)
+        let attempts = self
+            .rtc_attempt_keys
+            .iter()
+            .filter(|e| e.key().0 == peer_node_id)
+            .count();
+        budgeted + attempts
     }
 
     /// Send this node's host candidate for `dialog` (R4).

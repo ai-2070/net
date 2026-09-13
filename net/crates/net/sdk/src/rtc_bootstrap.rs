@@ -332,7 +332,7 @@ impl fmt::Debug for OfferRequest {
 }
 
 /// `POST /rtc/offer` success body.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct OfferResponse {
     /// **The attempt token** (R1): 32 random bytes, hex, minted for
     /// THIS accepted offer and bound to its `(node, dialog,
@@ -352,6 +352,26 @@ pub struct OfferResponse {
     /// The anchor's host candidate, so a browser that never opens
     /// the trickle socket can still form a pair.
     pub candidate: String,
+}
+
+/// The response carries a bearer credential too (R5).
+///
+/// `attempt_token` authorizes the trickle socket for a live ICE
+/// attempt: whoever holds it can trickle into that attempt or retire
+/// it. The derived `Debug` printed it in full, which is the same
+/// class of defect as the request printing its credential — a
+/// response logged on an error path hands out pending-attempt
+/// control. It is not the domain PSK, and no production logging call
+/// is known to print it; it is redacted anyway.
+impl std::fmt::Debug for OfferResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OfferResponse")
+            .field("attempt_token", &"<redacted>")
+            .field("dialog", &self.dialog)
+            .field("sdp_bytes", &self.sdp.len())
+            .field("candidate", &self.candidate)
+            .finish()
+    }
 }
 
 /// `GET /rtc/anchor` body — the announcement fields, over HTTP.
@@ -554,10 +574,12 @@ pub fn bootstrap_router(node: Arc<MeshNode>, config: &BootstrapConfig) -> Router
     // actually is.
     let ws_origins = Arc::clone(&state.ws_allowed_origins);
     let ws_attempts = Arc::clone(&state.attempts);
+    let ws_node_outer = Arc::clone(&state.node);
     let trickle = get(get_trickle).layer(axum::middleware::from_fn(
         move |request: axum::extract::Request, next: axum::middleware::Next| {
             let allowed = Arc::clone(&ws_origins);
             let attempts = Arc::clone(&ws_attempts);
+            let ws_node = Arc::clone(&ws_node_outer);
             async move {
                 if !origin_allowed(request.headers(), &allowed) {
                     return refuse(
@@ -592,6 +614,22 @@ pub fn bootstrap_router(node: Arc<MeshNode>, config: &BootstrapConfig) -> Router
                         "no such attempt for that token, node and dialog",
                     );
                 };
+                // **The token is not the attempt** (R1). A token
+                // proves who minted it; the anchor's own row proves
+                // the attempt still exists. An offer whose core
+                // attempt has expired, been rejected or already
+                // completed kept authorizing a socket — the review
+                // observed the core reporting no dialog while the
+                // same token still upgraded. The key is the one the
+                // acceptance recorded, so this is the exact accepted
+                // attempt and not a same-tuple successor.
+                if !ws_node.bootstrap_attempt_is_live(node_id, dialog, attempt.budget_id) {
+                    attempts.retire(&token);
+                    return refuse(
+                        BootstrapRefusal::UnknownDialog,
+                        "that attempt is no longer live on this anchor",
+                    );
+                }
                 let mut request = request;
                 request
                     .extensions_mut()

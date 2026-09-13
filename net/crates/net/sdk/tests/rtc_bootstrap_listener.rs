@@ -1109,3 +1109,173 @@ async fn a_credential_from_another_issuer_is_refused() {
     let (status, _) = post_offer(&router, &ours, offerer.node_id(), &sdp).await;
     assert_eq!(status, StatusCode::OK);
 }
+
+// ===================================================================
+// Kyra's second round: the attempt's OWNER, not the token alone
+// ===================================================================
+
+/// R1 (round 2): a token whose CORE attempt is gone stops
+/// authorizing a socket.
+///
+/// The review's probe watched the production candidate path report
+/// "no core dialog" after expiry while the same token still passed
+/// the middleware and reached the upgrade. A token proves who minted
+/// it; only the anchor's own row proves the attempt exists. The row
+/// is keyed by the accounting identity the acceptance recorded, so
+/// this is the exact accepted attempt and not a same-tuple
+/// successor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attempt_that_ended_on_the_anchor_stops_authorizing_its_token() {
+    let anchor = kyra_long_lived_anchor().await;
+    let offerer = offerer().await;
+    let router = bootstrap_router(Arc::clone(&anchor), &config(PSK));
+    let credential = credential_for(PSK, Duration::from_secs(600));
+    let sdp = offerer
+        .rtc_driver()
+        .expect("driver")
+        .create_offer()
+        .await
+        .expect("offer")
+        .1;
+    let (status, body) = post_offer(&router, &credential, offerer.node_id(), &sdp).await;
+    assert_eq!(status, StatusCode::OK);
+    let offered: OfferResponse = serde_json::from_slice(&body).expect("offer response");
+
+    let upgrade = |token: String, dialog: u64| {
+        let router = router.clone();
+        let node = offerer.node_id();
+        async move {
+            let request = Request::builder()
+                .uri(format!("/rtc/trickle?dialog={dialog}&node_id={node}"))
+                .header(header::ORIGIN, ORIGIN)
+                .header(header::CONNECTION, "upgrade")
+                .header(header::UPGRADE, "websocket")
+                .header(header::SEC_WEBSOCKET_VERSION, "13")
+                .header(header::SEC_WEBSOCKET_KEY, "dGhlIHNhbXBsZSBub25jZQ==")
+                .header(
+                    header::SEC_WEBSOCKET_PROTOCOL,
+                    format!("net-bootstrap-attempt.{token}"),
+                );
+            router
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+
+    // While the attempt is live the token reaches the upgrade.
+    assert_eq!(
+        upgrade(offered.attempt_token.clone(), offered.dialog).await,
+        StatusCode::UPGRADE_REQUIRED,
+    );
+    assert!(
+        anchor.bootstrap_attempt_is_live(offerer.node_id(), offered.dialog, 0) == false,
+        "the row is keyed by the accounting identity, not by a guessable zero",
+    );
+
+    // The attempt ends on the anchor — the same terminal path expiry
+    // and completion take.
+    anchor
+        .end_bootstrap_dialog(offerer.node_id(), offered.dialog)
+        .await;
+
+    assert_eq!(
+        upgrade(offered.attempt_token.clone(), offered.dialog).await,
+        StatusCode::NOT_FOUND,
+        "the token outlived its attempt and must stop authorizing",
+    );
+
+    anchor.shutdown().await.expect("shutdown");
+    offerer.shutdown().await.expect("shutdown");
+}
+
+/// R2 (round 2): the terminal path releases the reservation the
+/// ingress actually took.
+///
+/// The review opened a real socket, sent an owner Close, watched the
+/// token retire — and the RANDOM-key reservation still admitted a
+/// candidate. Offer/candidate admission charge the attempt's random
+/// identity while the core released `(claimed node, dialog)`, so the
+/// two never met. The observable here is the budget itself, not a
+/// counter: after the attempt ends, a frame charged to the same
+/// accounting identity is refused as an unknown dialog.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ending_an_attempt_releases_the_identity_its_ingress_was_charged_to() {
+    let anchor = kyra_long_lived_anchor().await;
+    let offerer = offerer().await;
+    let router = bootstrap_router(Arc::clone(&anchor), &config(PSK));
+    let credential = credential_for(PSK, Duration::from_secs(600));
+    let sdp = offerer
+        .rtc_driver()
+        .expect("driver")
+        .create_offer()
+        .await
+        .expect("offer")
+        .1;
+    let (status, body) = post_offer(&router, &credential, offerer.node_id(), &sdp).await;
+    assert_eq!(status, StatusCode::OK);
+    let offered: OfferResponse = serde_json::from_slice(&body).expect("offer response");
+
+    // One live attempt, counted from the owner rows rather than a
+    // side counter.
+    assert_eq!(anchor.open_signal_dialogs(offerer.node_id()), 1);
+
+    // A candidate on the live attempt is admitted.
+    assert!(
+        anchor
+            .apply_bootstrap_candidate_checked(
+                offered_budget_key(&anchor, offerer.node_id(), offered.dialog),
+                offerer.node_id(),
+                offered.dialog,
+                "candidate:1 1 udp 2113937151 192.0.2.9 41234 typ host".into(),
+                "0".into(),
+            )
+            .await
+            .is_ok(),
+        "the live attempt takes candidates",
+    );
+
+    let key = offered_budget_key(&anchor, offerer.node_id(), offered.dialog);
+    anchor
+        .end_bootstrap_dialog(offerer.node_id(), offered.dialog)
+        .await;
+
+    // The reservation is gone: the same accounting identity no longer
+    // has that dialog open.
+    let refused = anchor.admit_signal_frame(
+        key,
+        &net::adapter::net::rtc::RtcSignalMsg::Candidate {
+            dialog: offered.dialog,
+            candidate: "candidate:2 1 udp 2113937151 192.0.2.9 41235 typ host".into(),
+            mid: "0".into(),
+        },
+    );
+    assert!(
+        refused.is_err(),
+        "the random-key reservation outlived the attempt: {refused:?}",
+    );
+    assert_eq!(
+        anchor.open_signal_dialogs(offerer.node_id()),
+        0,
+        "and the anchor reports no open attempt for that peer",
+    );
+
+    anchor.shutdown().await.expect("shutdown");
+    offerer.shutdown().await.expect("shutdown");
+}
+
+/// The accounting identity the anchor recorded for an accepted
+/// attempt, found by asking which key the row answers to.
+///
+/// The listener hands the browser a token, not the key; a test that
+/// wants to charge the same identity has to discover it. Brute force
+/// is impossible (64 bits of CSPRNG), so the anchor exposes the
+/// liveness question and this walks the one candidate it has: the
+/// key recorded at acceptance, read back through the fixtures-only
+/// accessor.
+fn offered_budget_key(anchor: &Arc<MeshNode>, node_id: u64, dialog: u64) -> u64 {
+    anchor
+        .bootstrap_attempt_key(node_id, dialog)
+        .expect("the anchor recorded an owner for this attempt")
+}
