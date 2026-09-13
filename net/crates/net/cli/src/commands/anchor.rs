@@ -466,9 +466,22 @@ pub struct ServeArgs {
     #[arg(long = "acme-email", value_name = "EMAIL")]
     pub acme_email: Option<String>,
 
-    /// Where issued certificates are cached.
+    /// Where issued certificates are cached. One subdirectory per
+    /// domain (R4b).
     #[arg(long = "acme-cache", value_name = "DIR")]
     pub acme_cache: Option<PathBuf>,
+
+    /// Address for the plaintext HTTP-01 challenge ingress, bound
+    /// before ordering. Defaults to `0.0.0.0:80`, the port an ACME
+    /// directory dials.
+    #[arg(long = "acme-challenge-addr", value_name = "ADDR")]
+    pub acme_challenge_addr: Option<String>,
+
+    /// The issuer whose signature this anchor accepts on a
+    /// credential (64 hex chars) — the public half of the key
+    /// `anchor credential mint --issuer-identity` uses (R3).
+    #[arg(long = "credential-issuer", value_name = "HEX")]
+    pub credential_issuer: String,
 
     /// Browser origins allowed to call the endpoints and open the
     /// trickle socket. Repeatable. **No wildcard** — an endpoint
@@ -523,17 +536,18 @@ async fn run_serve(
                 .next()
                 .unwrap_or_default()
                 .to_string();
-            BootstrapTls::Acme(AcmeConfig {
-                directory_url: directory.clone(),
+            let acme = AcmeConfig::new(
+                directory.clone(),
                 domain,
-                contact_email: args.acme_email.clone().ok_or_else(|| {
+                args.acme_email.clone().ok_or_else(|| {
                     invalid_args("--acme-email is required with --acme-directory")
                 })?,
-                cache_dir: args
-                    .acme_cache
+                // One subdirectory per domain inside this path (R4b).
+                args.acme_cache
                     .clone()
                     .unwrap_or_else(|| std::env::temp_dir().join("net-mesh-acme")),
-            })
+            );
+            BootstrapTls::Acme(acme)
         }
         _ => {
             return Err(invalid_args(
@@ -574,6 +588,7 @@ async fn run_serve(
             .parse()
             .map_err(|e| invalid_args(format!("--listen: {e}")))?,
         sdk_psk.clone(),
+        parse_entity_hex(&args.credential_issuer)?,
         tls,
         args.allow_origin
             .first()
@@ -583,6 +598,11 @@ async fn run_serve(
     listener_config.allowed_origins = args.allow_origin.clone();
     listener_config.ws_allowed_origins = args.allow_origin.clone();
     listener_config.acme = AcmeState::new();
+    if let Some(addr) = args.acme_challenge_addr.as_ref() {
+        listener_config.acme_challenge_addr = addr
+            .parse()
+            .map_err(|e| invalid_args(format!("--acme-challenge-addr: {e}")))?;
+    }
     if let Some(limit) = args.offers_per_minute {
         listener_config.offers_per_ip_per_minute = limit;
     }

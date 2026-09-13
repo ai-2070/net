@@ -21,12 +21,25 @@
 //! no self-signed path at all, here or in the operator path.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::rtc_bootstrap::{read_pem_pair, AcmeConfig, AcmeState, BootstrapError};
 
-/// File names inside [`AcmeConfig::cache_dir`].
+/// File names inside the **per-domain** cache directory (R4b).
+///
+/// The cache used to be one flat pair in `cache_dir`, so asking for
+/// `different.example` returned the `localhost` certificate that
+/// happened to be there. The directory is now
+/// `<cache_dir>/<domain>/`, and even then the pair is only reused
+/// after it is qualified: it must actually cover the domain and
+/// still be inside its validity window.
 const CERT_FILE: &str = "bootstrap-cert.pem";
 const KEY_FILE: &str = "bootstrap-key.pem";
+
+/// Renew this long before `not_after` (R4c). Let's Encrypt issues
+/// 90-day certificates and recommends renewing at 30 days left.
+/// Default renewal horizon (R4c).
+pub const DEFAULT_RENEWAL_HORIZON: Duration = Duration::from_secs(30 * 24 * 3600);
 
 type Chain = (
     Vec<rustls::pki_types::CertificateDer<'static>>,
@@ -40,26 +53,107 @@ pub(crate) async fn obtain_certificate(
     config: &AcmeConfig,
     challenges: &AcmeState,
 ) -> Result<Chain, BootstrapError> {
-    if let Some(cached) = read_cache(&config.cache_dir) {
+    let dir = domain_cache_dir(config);
+    if let Some(cached) = read_cache(&dir, &config.domain, now_unix()) {
         return Ok(cached);
     }
     let (cert_pem, key_pem) = order_certificate(config, challenges).await?;
-    write_cache(&config.cache_dir, &cert_pem, &key_pem)?;
-    read_cache(&config.cache_dir).ok_or_else(|| {
-        BootstrapError::Acme("the freshly issued certificate did not read back".into())
+    write_cache(&dir, &cert_pem, &key_pem)?;
+    read_cache(&dir, &config.domain, now_unix()).ok_or_else(|| {
+        BootstrapError::Acme(format!(
+            "the freshly issued certificate does not qualify for {} — it was written \
+             but does not cover the domain, or is already outside its validity window",
+            config.domain
+        ))
     })
+}
+
+/// Seconds since the epoch.
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The cache directory for THIS domain (R4b).
+pub(crate) fn domain_cache_dir(config: &AcmeConfig) -> PathBuf {
+    // A domain is a DNS name: letters, digits, `-`, `.`. Anything
+    // else is replaced rather than trusted as a path component.
+    let safe: String = config
+        .domain
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    config.cache_dir.join(safe)
 }
 
 fn cache_paths(dir: &Path) -> (PathBuf, PathBuf) {
     (dir.join(CERT_FILE), dir.join(KEY_FILE))
 }
 
-fn read_cache(dir: &Path) -> Option<Chain> {
+/// Read a cached pair, **qualified** (R4b): it must parse, cover
+/// `domain`, and be inside its validity window at `now`.
+fn read_cache(dir: &Path, domain: &str, now: u64) -> Option<Chain> {
     let (cert, key) = cache_paths(dir);
     if !cert.exists() || !key.exists() {
         return None;
     }
-    read_pem_pair(&cert, &key).ok()
+    let (chain, private) = read_pem_pair(&cert, &key).ok()?;
+    let leaf = chain.first()?;
+    let (covers, not_after) = qualify_leaf(leaf, domain)?;
+    if !covers || not_after <= now {
+        return None;
+    }
+    Some((chain, private))
+}
+
+/// `(covers the domain, not_after)` for a leaf certificate.
+fn qualify_leaf(leaf: &rustls::pki_types::CertificateDer<'_>, domain: &str) -> Option<(bool, u64)> {
+    use x509_parser::prelude::*;
+
+    let (_, parsed) = X509Certificate::from_der(leaf.as_ref()).ok()?;
+    let not_after = parsed.validity().not_after.timestamp().max(0) as u64;
+    let mut covers = parsed
+        .subject()
+        .iter_common_name()
+        .filter_map(|cn| cn.as_str().ok())
+        .any(|cn| name_matches(cn, domain));
+    if let Ok(Some(san)) = parsed.subject_alternative_name() {
+        covers |= san.value.general_names.iter().any(|name| match name {
+            GeneralName::DNSName(dns) => name_matches(dns, domain),
+            _ => false,
+        });
+    }
+    Some((covers, not_after))
+}
+
+/// Exact match, plus the one wildcard form a certificate may carry.
+fn name_matches(name: &str, domain: &str) -> bool {
+    if name.eq_ignore_ascii_case(domain) {
+        return true;
+    }
+    match name.strip_prefix("*.") {
+        Some(suffix) => domain
+            .split_once('.')
+            .is_some_and(|(_, rest)| rest.eq_ignore_ascii_case(suffix)),
+        None => false,
+    }
+}
+
+/// When the cached certificate for `config` should be renewed (R4c):
+/// `not_after - horizon`, or `None` when there is nothing cached.
+pub(crate) fn renew_at(config: &AcmeConfig, horizon: Duration) -> Option<u64> {
+    let (cert, key) = cache_paths(&domain_cache_dir(config));
+    let (chain, _) = read_pem_pair(&cert, &key).ok()?;
+    let (_, not_after) = qualify_leaf(chain.first()?, &config.domain)?;
+    Some(not_after.saturating_sub(horizon.as_secs()))
 }
 
 fn write_cache(dir: &Path, cert_pem: &str, key_pem: &str) -> Result<(), BootstrapError> {
@@ -127,6 +221,22 @@ fn write_private_key(path: &Path, pem: &str) -> Result<(), BootstrapError> {
     // rather than silently assumed, and the Unix path above is what
     // CI enforces.
     Ok(())
+}
+
+/// Force a fresh order, ignoring the cache, and write it (R4c).
+pub(crate) async fn renew_certificate(
+    config: &AcmeConfig,
+    challenges: &AcmeState,
+) -> Result<Chain, BootstrapError> {
+    let dir = domain_cache_dir(config);
+    let (cert_pem, key_pem) = order_certificate(config, challenges).await?;
+    write_cache(&dir, &cert_pem, &key_pem)?;
+    read_cache(&dir, &config.domain, now_unix()).ok_or_else(|| {
+        BootstrapError::Acme(format!(
+            "the renewed certificate does not qualify for {}",
+            config.domain
+        ))
+    })
 }
 
 /// Run one ACME order to completion, returning PEM (chain, key).
@@ -225,21 +335,133 @@ mod tests {
     #[test]
     fn a_cached_pair_is_used_and_a_half_written_one_is_not() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(read_cache(dir.path()).is_none(), "an empty cache is empty");
+        assert!(
+            read_cache(dir.path(), "localhost", now_unix()).is_none(),
+            "an empty cache is empty"
+        );
 
         // A cert with no key is not a usable pair.
         let (cert, key) = cache_paths(dir.path());
         std::fs::write(&cert, "not a pem").unwrap();
-        assert!(read_cache(dir.path()).is_none());
+        assert!(read_cache(dir.path(), "localhost", now_unix()).is_none());
 
         // …and neither is a pair that does not parse.
         std::fs::write(&key, "not a pem either").unwrap();
-        assert!(read_cache(dir.path()).is_none());
+        assert!(read_cache(dir.path(), "localhost", now_unix()).is_none());
     }
 
     /// R5b: the key is created 0600 from inception, and a mode that
     /// does not come out 0600 is a hard error with the file removed
     /// — never a readable key and a swallowed chmod result.
+    /// R4b: a cached pair is only reused when it actually covers the
+    /// domain asked for and is still inside its validity window.
+    ///
+    /// The review asked for `different.example` and got the
+    /// `localhost` certificate that happened to be in the directory.
+    #[test]
+    fn a_cached_pair_is_reused_only_when_it_qualifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_ca, cert_pem, key_pem) = issue_for("localhost", 3600);
+        std::fs::write(dir.path().join(CERT_FILE), &cert_pem).unwrap();
+        std::fs::write(dir.path().join(KEY_FILE), &key_pem).unwrap();
+
+        let now = now_unix();
+        assert!(
+            read_cache(dir.path(), "localhost", now).is_some(),
+            "the domain it was issued for is reused"
+        );
+        assert!(
+            read_cache(dir.path(), "different.example", now).is_none(),
+            "a certificate for another name must never be served for this one"
+        );
+        assert!(
+            read_cache(dir.path(), "localhost", now + 7200).is_none(),
+            "an expired pair is not a usable pair"
+        );
+    }
+
+    /// R4b: the cache is keyed by domain, so two domains cannot
+    /// collide in one directory at all.
+    #[test]
+    fn the_cache_directory_is_per_domain() {
+        let base = tempfile::tempdir().unwrap();
+        let one = AcmeConfig::new(
+            "http://d/",
+            "a.example",
+            "o@example.invalid",
+            base.path().into(),
+        );
+        let two = AcmeConfig::new(
+            "http://d/",
+            "b.example",
+            "o@example.invalid",
+            base.path().into(),
+        );
+        assert_ne!(domain_cache_dir(&one), domain_cache_dir(&two));
+        assert!(domain_cache_dir(&one).ends_with("a.example"));
+        // A domain that is not a plain DNS name cannot escape the
+        // parent directory.
+        let evil = AcmeConfig::new(
+            "http://d/",
+            "../../etc",
+            "o@example.invalid",
+            base.path().into(),
+        );
+        assert_eq!(domain_cache_dir(&evil), base.path().join(".._.._etc"));
+    }
+
+    /// R4c: the renewal owner wakes at `not_after - horizon`.
+    #[test]
+    fn the_renewal_horizon_is_read_from_the_cached_certificate() {
+        let base = tempfile::tempdir().unwrap();
+        let config = AcmeConfig::new(
+            "http://d/",
+            "localhost",
+            "o@example.invalid",
+            base.path().into(),
+        );
+        let dir = domain_cache_dir(&config);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (_ca, cert_pem, key_pem) = issue_for("localhost", 90 * 24 * 3600);
+        std::fs::write(dir.join(CERT_FILE), &cert_pem).unwrap();
+        std::fs::write(dir.join(KEY_FILE), &key_pem).unwrap();
+
+        let horizon = Duration::from_secs(30 * 24 * 3600);
+        let at = renew_at(&config, horizon).expect("a cached certificate");
+        let now = now_unix();
+        // ~60 days out, i.e. 90 - 30, with generous slack for the
+        // issuing clock.
+        assert!(
+            at > now + 55 * 24 * 3600 && at < now + 65 * 24 * 3600,
+            "renewal is scheduled at not_after - horizon (in {} days)",
+            (at.saturating_sub(now)) / 86_400
+        );
+        // Nothing cached for a domain means "renew now".
+        let cold = AcmeConfig::new(
+            "http://d/",
+            "cold.example",
+            "o@example.invalid",
+            base.path().into(),
+        );
+        assert!(renew_at(&cold, horizon).is_none());
+    }
+
+    /// A self-signed leaf for `name`, valid for `ttl` seconds.
+    fn issue_for(name: &str, ttl: u64) -> (rcgen::Certificate, String, String) {
+        let mut params = rcgen::CertificateParams::new(vec![name.to_string()]).unwrap();
+        params.not_before = rcgen::date_time_ymd(2000, 1, 1);
+        let not_after = std::time::SystemTime::now() + Duration::from_secs(ttl);
+        let secs = not_after
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        params.not_after = time::OffsetDateTime::from_unix_timestamp(secs).unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        let pem = cert.pem();
+        (cert, pem, key.serialize_pem())
+    }
+
     #[cfg(unix)]
     #[test]
     fn the_private_key_is_created_0600_and_a_wrong_mode_is_fatal() {

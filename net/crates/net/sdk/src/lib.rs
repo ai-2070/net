@@ -152,7 +152,7 @@ pub mod bootstrap_credential;
 #[cfg(feature = "rtc-bootstrap")]
 pub mod rtc_bootstrap;
 #[cfg(feature = "rtc-bootstrap")]
-mod rtc_bootstrap_acme;
+pub mod rtc_bootstrap_acme;
 // Machine-shared device registry — the operator's inventory of enrolled devices
 // (Hermes V2 Phase 1), backing `mesh.devices()`. Inventory/display state, not
 // enforcement (that's `revocation`); mirrors the revocation store's file

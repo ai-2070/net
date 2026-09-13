@@ -119,6 +119,10 @@ futures-util = { version = "0.3", optional = true, default-features = false }
 # whose build needs cmake + a C toolchain — the exact cost the
 # workspace avoids everywhere except `webrtc` itself. `ring` is the
 # provider the rest of this feature already uses.
+# R4b: qualifying a cached certificate needs its SAN list and its
+# validity window — reusing one by directory alone returned a
+# `localhost` certificate for `different.example`.
+x509-parser = { version = "0.18", optional = true }
 instant-acme = { version = "0.8", optional = true, default-features = false, features = [
     "ring",
     "hyper-rustls",
@@ -151,6 +155,9 @@ net = { package = "net-mesh", version = "0.36.0", path = "..", features = ["fixt
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
 # Isolated temp dirs for the pin-store file tests.
 tempfile = "3"
+# `rtc_bootstrap_acme`'s qualification tests mint certificates with
+# explicit validity windows; rcgen takes `time` offsets.
+time = "0.3"
 # `tests/bootstrap_dep_boundary.rs` reads this crate's and the core's
 # manifests to hold the "a default build has no HTTP server" line,
 # the same way the MCP adapter's boundary test reads its own.
@@ -183,6 +190,11 @@ webrtc = ["net/webrtc"]
 #
 # rustls is the version `net-payments` already pins (0.23, ring),
 # so the workspace keeps exactly one.
+# R4a: the cold-start ACME witness needs a live local directory
+# (pebble). Off by default and gated in its own CI job — there is no
+# mock, because the defect it covers is that ordering could never
+# complete without a plaintext ingress bound first.
+acme-pebble = ["rtc-bootstrap"]
 rtc-bootstrap = [
     "net",
     "webrtc",
@@ -198,6 +210,7 @@ rtc-bootstrap = [
     "dep:futures-util",
     "dep:str0m",
     "dep:instant-acme",
+    "dep:x509-parser",
     "dep:rcgen",
     "tokio/net",
     "tokio/rt-multi-thread",

@@ -4969,3 +4969,62 @@ jobs:
           name: rtc-browser-harness-log
           path: ${{ runner.temp }}/rtcb.log
           if-no-files-found: warn
+
+  acme-cold-start:
+    # R4a: a COLD-CACHE ACME order against a real local directory,
+    # then a verifying TLS client. The defect this exists for is that
+    # `serve_bootstrap` used to wait for a certificate before binding
+    # anything, so HTTP-01 could never be answered on a cold cache —
+    # a listener that can only start when it is already started.
+    #
+    # pebble is Let's Encrypt's own test ACME server. It runs as a
+    # service container; `PEBBLE_VA_NOSLEEP` makes validation
+    # immediate, and its HTTP-01 validation dials port 5002 on the
+    # host it resolves the domain to, which is why the harness binds
+    # its challenge ingress there.
+    name: ACME cold start (pebble, Stage 4b)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      pebble:
+        image: ghcr.io/letsencrypt/pebble:2.7.0
+        ports:
+          - 14000:14000
+          - 15000:15000
+        env:
+          PEBBLE_VA_NOSLEEP: "1"
+          PEBBLE_VA_ALWAYS_VALID: "0"
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: acme-cold-start
+          workspaces: net/crates/net -> target
+
+      # pebble resolves every name to its configured host; point the
+      # domain at this runner so its HTTP-01 validation comes back to
+      # the challenge ingress the listener binds.
+      - name: Point pebble's validation at this runner
+        run: |
+          set -euo pipefail
+          curl -ks https://localhost:15000/roots/0 -o "$RUNNER_TEMP/pebble-root.pem"
+          test -s "$RUNNER_TEMP/pebble-root.pem"
+          echo "PEBBLE_ROOT_PEM=$RUNNER_TEMP/pebble-root.pem" >> "$GITHUB_ENV"
+          echo "PEBBLE_DIRECTORY_URL=https://localhost:14000/dir" >> "$GITHUB_ENV"
+          echo "PEBBLE_DOMAIN=localhost" >> "$GITHUB_ENV"
+          echo "PEBBLE_HTTP01_ADDR=0.0.0.0:5002" >> "$GITHUB_ENV"
+
+      - name: Cold-cache order + verifying TLS client
+        working-directory: net/crates/net
+        run: |
+          set -uo pipefail
+          out=$(cargo nextest run --color never -p net-mesh-sdk --no-fail-fast \
+                  --no-tests=fail --retries 0 --features "rtc-bootstrap acme-pebble" \
+                  --test acme_cold_start 2>&1) \
+            || { printf '%s\n' "$out"; echo "::error::the cold-start ACME witness did not pass"; exit 1; }
+          printf '%s\n' "$out" | tail -5
+          printf '%s\n' "$out" \
+            | grep -q 'a_cold_cache_orders_a_certificate_and_then_serves_tls' \
+            || { echo "::error::the cold-start witness did not run"; exit 1; }

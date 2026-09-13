@@ -65,7 +65,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use net::adapter::net::MeshNode;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
 
@@ -121,6 +121,25 @@ pub struct AcmeConfig {
     /// Where the issued certificate and key are cached, so a restart
     /// does not re-order.
     pub cache_dir: PathBuf,
+}
+
+impl AcmeConfig {
+    /// An ACME config for one domain. The HTTP-01 ingress address
+    /// and the renewal horizon live on [`BootstrapConfig`], because
+    /// they are the listener's, not the directory's.
+    pub fn new(
+        directory_url: impl Into<String>,
+        domain: impl Into<String>,
+        contact_email: impl Into<String>,
+        cache_dir: PathBuf,
+    ) -> Self {
+        Self {
+            directory_url: directory_url.into(),
+            domain: domain.into(),
+            contact_email: contact_email.into(),
+            cache_dir,
+        }
+    }
 }
 
 /// Tokens the HTTP-01 challenge route serves.
@@ -190,6 +209,20 @@ pub struct BootstrapConfig {
     pub offers_per_ip_per_minute: u32,
     /// ACME challenge store; ignored unless [`BootstrapTls::Acme`].
     pub acme: AcmeState,
+    /// Address for the **plaintext** HTTP-01 challenge ingress
+    /// (R4a), bound BEFORE any order is placed and kept for
+    /// renewals. Defaults to `0.0.0.0:80`, the port a directory
+    /// dials.
+    ///
+    /// The brief said "HTTP-01 on the same listener"; HTTP-01 is a
+    /// plaintext protocol and the bootstrap listener is TLS-only, so
+    /// on a cold cache there was no way to answer the challenge that
+    /// produces the certificate the TLS listener needs. Same
+    /// process, same challenge store, second socket — reconciled in
+    /// the report.
+    pub acme_challenge_addr: SocketAddr,
+    /// Renew this long before the certificate expires (R4c).
+    pub acme_renewal_horizon: Duration,
 }
 
 impl BootstrapConfig {
@@ -212,6 +245,8 @@ impl BootstrapConfig {
             ws_allowed_origins: vec![origin],
             offers_per_ip_per_minute: DEFAULT_OFFERS_PER_IP_PER_MINUTE,
             acme: AcmeState::new(),
+            acme_challenge_addr: SocketAddr::from(([0, 0, 0, 0], 80)),
+            acme_renewal_horizon: crate::rtc_bootstrap_acme::DEFAULT_RENEWAL_HORIZON,
         }
     }
 }
@@ -583,7 +618,12 @@ pub async fn serve_bootstrap(
     node: Arc<MeshNode>,
     config: BootstrapConfig,
 ) -> Result<BootstrapHandle, BootstrapError> {
-    let tls = tls_acceptor(&config).await?;
+    let (initial, challenge_task) = tls_acceptor(&config).await?;
+    // **R4c: the acceptor is swappable.** A static one meant the
+    // certificate a process started with was the certificate it died
+    // with; ACME certificates expire in weeks.
+    let tls: Arc<RwLock<Arc<tokio_rustls::TlsAcceptor>>> = Arc::new(RwLock::new(initial));
+    let renewal = spawn_renewal(&config, Arc::clone(&tls));
     let router = bootstrap_router(node, &config);
     let listener = tokio::net::TcpListener::bind(config.bind_addr)
         .await
@@ -602,11 +642,20 @@ pub async fn serve_bootstrap(
             let Ok((stream, remote)) = accepted else {
                 continue;
             };
-            let tls = tls.clone();
+            // Read the CURRENT acceptor per connection, so a
+            // renewal swap takes effect on the next handshake
+            // without dropping live ones (R4c).
+            let tls = Arc::clone(&*tls.read());
             let service = service.clone();
             tokio::spawn(async move {
                 serve_one(stream, remote, tls, service).await;
             });
+        }
+        if let Some(renewal) = renewal {
+            renewal.abort();
+        }
+        if let Some(challenge) = challenge_task {
+            challenge.abort();
         }
     });
     Ok(BootstrapHandle {
@@ -614,6 +663,57 @@ pub async fn serve_bootstrap(
         shutdown: shutdown_tx,
         task,
     })
+}
+
+/// The renewal owner (R4c): re-orders at
+/// `not_after - renewal_horizon` and swaps the acceptor in place.
+///
+/// `None` for operator-supplied PEM — that lifecycle is the
+/// operator's, and the documented path is to restart or reload with
+/// the new files.
+fn spawn_renewal(
+    config: &BootstrapConfig,
+    tls: Arc<RwLock<Arc<tokio_rustls::TlsAcceptor>>>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let BootstrapTls::Acme(acme) = config.tls.clone() else {
+        return None;
+    };
+    let challenges = config.acme.clone();
+    let horizon = config.acme_renewal_horizon;
+    Some(tokio::spawn(async move {
+        loop {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let renew_at = crate::rtc_bootstrap_acme::renew_at(&acme, horizon);
+            let sleep_for = match renew_at {
+                // Nothing cached, or already inside the horizon:
+                // re-order now rather than sleeping on a certificate
+                // that is about to stop working.
+                Some(at) if at > now => Duration::from_secs(at - now),
+                _ => Duration::ZERO,
+            };
+            if !sleep_for.is_zero() {
+                tokio::time::sleep(sleep_for).await;
+            }
+            match crate::rtc_bootstrap_acme::renew_certificate(&acme, &challenges).await {
+                Ok((chain, key)) => match server_config(chain, key) {
+                    Ok(acceptor) => {
+                        *tls.write() = acceptor;
+                        tracing::info!(domain = %acme.domain, "bootstrap certificate renewed");
+                    }
+                    Err(e) => tracing::error!(error = %e, "renewed certificate did not load"),
+                },
+                Err(e) => {
+                    tracing::error!(error = %e, domain = %acme.domain, "certificate renewal failed");
+                    // Back off rather than spin against a directory
+                    // that is refusing us.
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                }
+            }
+        }
+    }))
 }
 
 async fn serve_one(
@@ -657,19 +757,54 @@ pub enum BootstrapError {
     Acme(String),
 }
 
-async fn tls_acceptor(
-    config: &BootstrapConfig,
+/// The plaintext HTTP-01 challenge ingress (R4a).
+///
+/// Bound BEFORE any order is placed, serving exactly one route from
+/// the same [`AcmeState`] the ordering client writes into. The
+/// brief said "HTTP-01 on the same listener"; HTTP-01 is a
+/// plaintext protocol and the bootstrap listener is TLS-only, so on
+/// a cold cache there was no way to answer the challenge that
+/// produces the certificate the TLS listener needs. Same process,
+/// same challenge store, second socket.
+async fn serve_challenge_ingress(
+    addr: SocketAddr,
+    acme: AcmeState,
+) -> Result<(tokio::task::JoinHandle<()>, SocketAddr), BootstrapError> {
+    let router = Router::new()
+        .route("/.well-known/acme-challenge/{token}", get(challenge_route))
+        .with_state(acme);
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|e| BootstrapError::Bind(format!("acme http-01 ingress on {addr}: {e}")))?;
+    let bound = listener
+        .local_addr()
+        .map_err(|e| BootstrapError::Bind(e.to_string()))?;
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    Ok((task, bound))
+}
+
+async fn challenge_route(
+    State(acme): State<AcmeState>,
+    axum::extract::Path(token): axum::extract::Path<String>,
+) -> Response {
+    match acme.key_authorization(&token) {
+        Some(auth) => (StatusCode::OK, auth).into_response(),
+        None => (StatusCode::NOT_FOUND, "no such challenge").into_response(),
+    }
+}
+
+/// Build a TLS acceptor from a chain and key.
+///
+/// The payments crate's rule, for the reason its module doc gives:
+/// an explicit provider, NEVER `CryptoProvider::install_default`,
+/// which is process-global and would leak into every other rustls
+/// user in this process.
+fn server_config(
+    chain: Vec<rustls::pki_types::CertificateDer<'static>>,
+    key: rustls::pki_types::PrivateKeyDer<'static>,
 ) -> Result<Arc<tokio_rustls::TlsAcceptor>, BootstrapError> {
-    let (chain, key) = match &config.tls {
-        BootstrapTls::Operator { cert_pem, key_pem } => read_pem_pair(cert_pem, key_pem)?,
-        BootstrapTls::Acme(acme) => {
-            crate::rtc_bootstrap_acme::obtain_certificate(acme, &config.acme).await?
-        }
-    };
-    // The payments crate's rule, for the reason its module doc gives:
-    // build with an explicit provider, NEVER
-    // `CryptoProvider::install_default`, which is process-global and
-    // would leak into every other rustls user in this process.
     let server_config = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -681,6 +816,34 @@ async fn tls_acceptor(
     Ok(Arc::new(tokio_rustls::TlsAcceptor::from(Arc::new(
         server_config,
     ))))
+}
+
+async fn tls_acceptor(
+    config: &BootstrapConfig,
+) -> Result<
+    (
+        Arc<tokio_rustls::TlsAcceptor>,
+        Option<tokio::task::JoinHandle<()>>,
+    ),
+    BootstrapError,
+> {
+    let mut challenge_task = None;
+    let (chain, key) = match &config.tls {
+        BootstrapTls::Operator { cert_pem, key_pem } => read_pem_pair(cert_pem, key_pem)?,
+        BootstrapTls::Acme(acme) => {
+            // R4a: the challenge ingress exists before we order.
+            let (task, bound) =
+                serve_challenge_ingress(config.acme_challenge_addr, config.acme.clone()).await?;
+            tracing::info!(
+                %bound,
+                domain = %acme.domain,
+                "acme http-01 ingress bound before ordering"
+            );
+            challenge_task = Some(task);
+            crate::rtc_bootstrap_acme::obtain_certificate(acme, &config.acme).await?
+        }
+    };
+    Ok((server_config(chain, key)?, challenge_task))
 }
 
 pub(crate) fn read_pem_pair(
