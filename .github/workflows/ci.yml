@@ -4896,8 +4896,20 @@ jobs:
         with:
           components: clippy, rustfmt
 
-      - name: Add wasm32 to the toolchain
-        run: rustup target add wasm32-unknown-unknown
+      # This job's steps already run inside the pinned directory,
+      # but the assertion is the point: `rustup target add` is silent
+      # about WHICH installation it added to, and the browser job's
+      # `E0463: can't find crate for 'core'` is what that silence
+      # looks like one step later.
+      - name: Add wasm32 to the pinned toolchain
+        run: |
+          set -o pipefail
+          rustup target add wasm32-unknown-unknown
+          rustup show active-toolchain
+          rustup target list --installed | tee /dev/stderr | grep -qx wasm32-unknown-unknown || {
+            echo "::error::wasm32-unknown-unknown is not installed for the toolchain this directory selects"
+            exit 1
+          }
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -5009,8 +5021,15 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-      - name: Add wasm32 to the toolchain
-        run: rustup target add wasm32-unknown-unknown
+      - name: Add wasm32 to the pinned toolchain
+        working-directory: net/crates/net/leaf
+        run: |
+          set -o pipefail
+          rustup target add wasm32-unknown-unknown
+          rustup target list --installed | grep -qx wasm32-unknown-unknown || {
+            echo "::error::wasm32-unknown-unknown is not installed for the toolchain this directory selects"
+            exit 1
+          }
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: leaf-wasm
@@ -5075,8 +5094,25 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Add wasm32 to the toolchain
-        run: rustup target add wasm32-unknown-unknown
+      # `targets:` on the toolchain action, and a bare `rustup
+      # target add` from the repo root, install into the STABLE
+      # installation — but every cargo command here runs under
+      # `net/crates/net`, whose `rust-toolchain.toml` pins 1.98.1,
+      # a separate installation with its own target set. The Stage 5
+      # candidate hit exactly that: `E0463: can't find crate for
+      # 'core'` when building the leaf bundle. Add the target FROM
+      # the pinned directory, and assert it, as the wasm-wire job
+      # already does.
+      - name: Add wasm32 to the pinned toolchain
+        working-directory: net/crates/net
+        run: |
+          set -o pipefail
+          rustup target add wasm32-unknown-unknown
+          rustup show active-toolchain
+          rustup target list --installed | tee /dev/stderr | grep -qx wasm32-unknown-unknown || {
+            echo "::error::wasm32-unknown-unknown is not installed for the toolchain this directory selects"
+            exit 1
+          }
 
       - uses: Swatinem/rust-cache@v2
         with:
