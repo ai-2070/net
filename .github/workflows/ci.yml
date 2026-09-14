@@ -4998,6 +4998,39 @@ jobs:
       - name: Formatting
         run: cargo fmt -- --check
 
+      # Kyra's Stage 5 review probes, landed VERBATIM (assertions
+      # untouched) and pinned by name. They reproduced 12 failures
+      # out of 15 when they landed; a repair that regresses one must
+      # fail here by name rather than shrink the roster.
+      - name: Kyra's review probes (Stage 5)
+        run: |
+          set -uo pipefail
+          REQUIRED="
+            kyra_small_reliable_control
+            kyra_reliable_fragmented_payload_is_delivered
+            kyra_session_replacement_resets_receive_sequence
+            kyra_channel_publication_is_not_misclassified_as_stream
+            kyra_reply_from_another_session_cannot_complete_call
+            kyra_same_peer_wrong_reply_route_cannot_complete_call
+            kyra_reordered_stream_events_keep_their_own_sequences
+            kyra_correct_peer_and_route_reply_control
+            kyra_fire_and_forget_fragment_control
+            kyra_session_replacement_fails_old_pending_call
+            kyra_other_entity_cannot_replace_victim_and_authorize_signal
+            kyra_two_distinct_ice_candidates_in_one_dialog_survive_dedup
+            kyra_expired_announcement_is_not_discovery_or_signal_authority
+            kyra_incomplete_fragment_coverage_is_rejected
+            kyra_reliable_packet_build_retains_retransmit_owner
+          "
+          set -o pipefail
+          cargo test --features mock-control-plane --test kyra_review 2>&1 \
+            | tee /tmp/kyra-review.log
+          for required in $REQUIRED; do
+            grep -q "^test $required \.\.\. ok$" /tmp/kyra-review.log || {
+              echo "::error::Kyra's probe $required did not run and pass"; exit 1; }
+          done
+          echo "Kyra's Stage 5 probes: 15/15"
+
       - name: Native tests (the sans-IO half)
         run: |
           set -o pipefail
