@@ -1102,7 +1102,9 @@ async fn a_peer_that_superseded_its_own_channel_is_not_locked_out_by_it() {
     let (mine, _sdp) = driver.create_offer().await.expect("a second endpoint");
     let b_pub = *b.public_key();
     let refused = a.connect_rtc(mine, &b_pub, b_id).await;
-    let why = refused.expect_err("the initiator must still defer").to_string();
+    let why = refused
+        .expect_err("the initiator must still defer")
+        .to_string();
     assert!(
         why.contains("the incumbent session is busy") && why.contains("Initiator"),
         "the initiator's deferral must survive and say whose state it is \
