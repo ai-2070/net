@@ -2346,6 +2346,26 @@ under the limit" does not establish larger-payload interoperability
 while native peers do not reassemble leaf fragments. Repairs dispatched
 with assertions retained; Stage 6 and merge not authorized.
 
+**Stage 5 candidate at CI-green head `92eb3337d` (2026-09-14), run
+34904478362: 55/55 — Chromium 19/19, Firefox 19/19 (both gate engines
+executed in CI for the first time), WebKit 3/3 recorded best-effort;
+leaf wasm runner 14 + 6 + anchorless in headless Chrome 153; ACME
+cold-start, TS package, sensing guard green.** Forwarded to Kyra as
+the Stage 5 candidate. Eleven commits after her interim, all CI
+environment: wasm32 installed into the toolchain the directory selects;
+Chrome/chromedriver pinned to one build and asserted; the darkness
+probe's lockfile refreshed with a staleness message; the bundle built
+after the bindgen CLI exists; `webdriver.json` opened relative to the
+job's working directory; the cross-lang guard pinning the five replay
+test names instead of a substring no name contained; a second engine
+no longer re-initialising the first engine's NSS database (`certutil
+-N` on an existing DB prompted on inherited stdin — the 35-minute
+hang); per-engine step timeouts; the Firefox trust control reading the
+field the seeder actually returns. No assertion changed. `S5_REPORT.md`
+§9 names the Stage 3/4 witnesses covering `4bb03a069`'s changed
+completion/quiescence paths and states the payload-size claim exactly
+— both for Kyra's adjudication.
+
 ## Stage 6 — Browser ↔ browser direct, NAT conformance, telemetry, demo
 
 - §9 end to end; `RtcStats`; browser network-change retry trigger; per-pair
