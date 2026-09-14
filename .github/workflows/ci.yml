@@ -4558,6 +4558,10 @@ jobs:
         if: ${{ !cancelled() }}
         env:
           CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+          # Names the capabilities file explicitly rather than
+          # relying on a default lookup: it is what carries the
+          # `binary` pin the step above wrote.
+          WASM_BINDGEN_TEST_WEBDRIVER_JSON: webdriver.json
         run: |
           set -o pipefail
           # `test-vectors` carries the package-owned AEAD golden
@@ -4965,7 +4969,7 @@ jobs:
           set -o pipefail
           python3 - "$CHROME_BIN" <<'PY'
           import json, sys
-          path = "net/crates/net/leaf/webdriver.json"
+          path = "webdriver.json"
           with open(path) as f:
               caps = json.load(f)
           caps.setdefault("goog:chromeOptions", {})["binary"] = sys.argv[1]
