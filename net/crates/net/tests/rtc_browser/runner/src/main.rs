@@ -915,7 +915,23 @@ struct Trust {
 /// is exempt from the unknown-issuer rejection.
 fn establish_trust(ca: &Ca, engine: Engine) -> Result<Trust, String> {
     if !cfg!(windows) {
-        return install_nss_store(ca).map(|how| Trust { how, pin: None });
+        // `~/.pki/nssdb` is CHROMIUM's shared NSS store. Firefox does
+        // not read it — it reads `cert9.db` inside its own profile,
+        // which the driver seeds before launch. Touching Chromium's
+        // database for a Firefox run bought nothing and cost the CI
+        // job 35 minutes: `certutil -N` against the database the
+        // Chromium leg had already created prompted for its password
+        // on inherited stdin and blocked until the job timed out.
+        return match engine {
+            Engine::Chromium | Engine::Webkit => {
+                install_nss_store(ca).map(|how| Trust { how, pin: None })
+            }
+            Engine::Firefox => Ok(Trust {
+                how: "Firefox's own NSS database inside the launch profile (cert9.db),                       seeded by the driver; Chromium's ~/.pki/nssdb is not touched"
+                    .into(),
+                pin: None,
+            }),
+        };
     }
     match engine {
         Engine::Chromium => Ok(Trust {
@@ -969,6 +985,7 @@ fn establish_trust(ca: &Ca, engine: Engine) -> Result<Trust, String> {
 #[cfg(windows)]
 fn windows_root_has_harness_ca() -> bool {
     Command::new("certutil")
+        .stdin(Stdio::null())
         .args(["-store", "-user", "Root", CA_COMMON_NAME])
         .output()
         .is_ok_and(|o| o.status.success())
@@ -985,14 +1002,24 @@ fn install_nss_store(ca: &Ca) -> Result<String, String> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
     let db = format!("{home}/.pki/nssdb");
     let _ = std::fs::create_dir_all(&db);
-    // An absent database is created empty; an existing one is left
-    // alone.
-    let _ = Command::new("certutil")
-        .args(["-N", "--empty-password", "-d", &format!("sql:{db}")])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    // **Only an ABSENT database is initialised.** `certutil -N`
+    // against an existing one asks for its current password on
+    // stdin, and a CI run's stdin is inherited and never answered:
+    // the second engine's install hung for 35 minutes and the job
+    // died on its own timeout with no output after "building the
+    // wasm leaf". The comment here used to claim an existing
+    // database was left alone; the code did not.
+    if !std::path::Path::new(&db).join("cert9.db").exists() {
+        let _ = Command::new("certutil")
+            .stdin(Stdio::null())
+            .args(["-N", "--empty-password", "-d", &format!("sql:{db}")])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
     let out = Command::new("certutil")
+        .stdin(Stdio::null())
         .args([
             "-d",
             &format!("sql:{db}"),
@@ -1034,6 +1061,7 @@ fn uninstall_nss_store_if_owed() {
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
     let _ = Command::new("certutil")
+        .stdin(Stdio::null())
         .args([
             "-d",
             &format!("sql:{home}/.pki/nssdb"),
@@ -1044,6 +1072,53 @@ fn uninstall_nss_store_if_owed() {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
+}
+
+/// Prove the SEEDED PROFILE is what makes a Firefox run's TLS
+/// verify — the same control as [`tls_pin_control`], for the engine
+/// whose mechanism is a certificate database rather than a flag.
+async fn tls_trust_control(
+    driver: &Driver,
+    engine: Engine,
+    url: &str,
+    executable: Option<&str>,
+    ca: &Ca,
+) -> Result<String, String> {
+    let ca_path = ca.ca_pem_path.to_string_lossy().to_string();
+    let unseeded = driver
+        .tls_probe(engine, url, None, executable, None, None)
+        .await?;
+    let seeded = driver
+        .tls_probe(
+            engine,
+            url,
+            None,
+            executable,
+            Some(&ca_path),
+            Some(NSS_NICKNAME),
+        )
+        .await?;
+    if unseeded.verified {
+        return Err(format!(
+            "the Firefox trust control FAILED: a profile with NO seeded CA already trusts \
+             {url} ({}). Something on this machine trusts the harness CA, so no TLS \
+             observation in this run can be attributed to the seeding.",
+            unseeded.detail
+        ));
+    }
+    if !seeded.verified {
+        return Err(format!(
+            "the Firefox trust control FAILED the other way: even with this run's CA seeded \
+             into the profile's cert9.db, Firefox could not load {url} ({}). The seeding is \
+             not in effect — check that the `certutil` on PATH is NSS's.",
+            seeded.detail
+        ));
+    }
+    Ok(format!(
+        "an unseeded Firefox profile is refused ({}) and a seeded one verifies ({}) — the \
+         profile's own cert9.db is what makes this run's TLS verify",
+        unseeded.detail, seeded.detail
+    ))
 }
 
 /// Prove the SPKI pin is what makes this run's TLS verify.
@@ -1074,8 +1149,12 @@ async fn tls_pin_control(
     url: &str,
     executable: Option<&str>,
 ) -> Result<String, String> {
-    let unpinned = driver.tls_probe(engine, url, None, executable).await?;
-    let pinned = driver.tls_probe(engine, url, Some(pin), executable).await?;
+    let unpinned = driver
+        .tls_probe(engine, url, None, executable, None, None)
+        .await?;
+    let pinned = driver
+        .tls_probe(engine, url, Some(pin), executable, None, None)
+        .await?;
     if unpinned.verified {
         // Read the store — never write it — so the diagnosis can say
         // whether the leftover really is there.
@@ -1695,6 +1774,23 @@ async fn run(
         )
         .await?;
         println!("[harness] TLS pin control: {control}");
+    } else if engine == Engine::Firefox {
+        // Firefox's mechanism is a seeded PROFILE, so its control has
+        // the same shape as Chromium's with a different difference:
+        // two throwaway profiles, one seeded with this run's CA and
+        // one not. Without the seeding the navigation must be
+        // refused; with it, it must complete. Without both halves a
+        // Firefox run's TLS observations would be statements about
+        // whatever else the machine trusts.
+        let control = tls_trust_control(
+            &driver,
+            engine,
+            &format!("{anchor_base}/rtc/anchor"),
+            browser_path.as_deref(),
+            &ca,
+        )
+        .await?;
+        println!("[harness] TLS trust control: {control}");
     } else {
         println!(
             "[harness] TLS pin control: not applicable — this run's mechanism is a trust \

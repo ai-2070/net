@@ -34,6 +34,7 @@
 import { chromium, firefox, webkit } from 'playwright-core';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
 
@@ -340,19 +341,45 @@ async function opShutdown() {
 async function opTlsProbe(req) {
   const type = ENGINES[req.engine];
   if (!type) throw new Error(`unknown engine ${req.engine}`);
-  if (req.engine !== 'chromium') {
+  if (req.engine === 'webkit') {
     throw new Error(
-      `the SPKI-pin control is Chromium-only; ${req.engine} has no such flag, so a probe ` +
+      'WebKit has neither an SPKI-pin flag nor a profile-local trust store, so a probe ' +
         'here would report nothing about how that engine trusts the listener',
     );
   }
-  const browser = await type.launch({
-    headless: true,
-    executablePath: req.executablePath || undefined,
-    args: chromiumArgs(req.spkiPin),
-  });
+  // Firefox's control is the same shape with a different mechanism:
+  // the difference between the two halves is whether the throwaway
+  // profile's own cert9.db was seeded with this run's CA. Without it
+  // the navigation must be refused (SEC_ERROR_UNKNOWN_ISSUER); with
+  // it, it must complete — which is what makes every later TLS
+  // observation attributable to the seeding rather than to whatever
+  // else the machine happens to trust.
+  let browser;
+  let context;
+  let profileDir;
+  if (req.engine === 'firefox') {
+    profileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rtcb-ffprobe-'));
+    if (req.caPemPath) {
+      const seeded = seedFirefoxProfile(profileDir, req.caPemPath, req.caNickname);
+      if (!seeded.nss) {
+        throw new Error(`the Firefox trust control could not seed its profile: ${seeded.how}`);
+      }
+    }
+    context = await type.launchPersistentContext(profileDir, {
+      headless: true,
+      executablePath: req.executablePath || undefined,
+    });
+  } else {
+    browser = await type.launch({
+      headless: true,
+      executablePath: req.executablePath || undefined,
+      args: chromiumArgs(req.spkiPin),
+    });
+  }
   try {
-    const page = await (await browser.newContext()).newPage();
+    const page = context
+      ? await context.newPage()
+      : await (await browser.newContext()).newPage();
     let outcome;
     try {
       const res = await page.goto(req.url, { waitUntil: 'domcontentloaded', timeout: 20000 });
@@ -368,13 +395,19 @@ async function opTlsProbe(req) {
         detail: ((e && (e.message || String(e))) || 'navigation rejected').split('\n')[0],
       };
     }
+    const mechanism =
+      req.engine === 'firefox'
+        ? `profile-CA=${req.caPemPath ? 'seeded' : 'ABSENT'}`
+        : `pin=${req.spkiPin ? 'present' : 'ABSENT'}`;
     log(
-      `[tls-probe] pin=${req.spkiPin ? 'present' : 'ABSENT'} ${req.url} -> ` +
+      `[tls-probe] ${req.engine} ${mechanism} ${req.url} -> ` +
         `${outcome.verified ? 'verified' : 'refused'}: ${outcome.detail}`,
     );
     return outcome;
   } finally {
-    await browser.close().catch(() => {});
+    if (context) await context.close().catch(() => {});
+    if (browser) await browser.close().catch(() => {});
+    if (profileDir) fs.rmSync(profileDir, { recursive: true, force: true });
   }
 }
 

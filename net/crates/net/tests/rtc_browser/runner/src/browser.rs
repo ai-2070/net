@@ -322,6 +322,8 @@ impl Driver {
         url: &str,
         spki_pin: Option<&str>,
         executable: Option<&str>,
+        ca_pem: Option<&str>,
+        ca_nickname: Option<&str>,
     ) -> Result<TlsProbe, String> {
         let reply = self
             .request(
@@ -331,6 +333,10 @@ impl Driver {
                     "url": url,
                     "spkiPin": spki_pin,
                     "executablePath": executable,
+                    // Firefox's mechanism is a seeded profile, not a
+                    // flag: `null` here is the control's "without".
+                    "caPemPath": ca_pem,
+                    "caNickname": ca_nickname,
                 }),
             )
             .await?;
