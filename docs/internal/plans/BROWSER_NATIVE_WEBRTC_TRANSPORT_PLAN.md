@@ -2331,6 +2331,21 @@ announcements; browser ↔ browser from a page is Stage 6's (four
 `#[wasm_bindgen]` methods named, `peer_handshake` takes only a peer
 id); close-to-eviction latency unbounded by anything but ICE.
 
+**Kyra, interim on the Stage 5 candidate CI (run 34882375169):** three
+environment blockers — the browser-harness job builds the wasm bundle
+without the wasm32 std for the directory's pinned toolchain (`E0463`;
+the fix pattern is already in `ci.yml:4483–4508`); the leaf wasm job's
+ChromeDriver 153 cannot drive the installed Chrome 152; the sensing
+darkness guard's standalone probe lockfile is stale (wasm-bindgen
+0.2.126 → 0.2.128), so `--locked` fails before the compile-negative
+assertion. ACME cold-start and the TypeScript package job pass. Two
+points flagged for the independent review: `4bb03a069` changes native
+completion/replacement behaviour beyond the additive scope and needs
+review against the earlier lifecycle guarantees; "harness payloads
+under the limit" does not establish larger-payload interoperability
+while native peers do not reassemble leaf fragments. Repairs dispatched
+with assertions retained; Stage 6 and merge not authorized.
+
 ## Stage 6 — Browser ↔ browser direct, NAT conformance, telemetry, demo
 
 - §9 end to end; `RtcStats`; browser network-change retry trigger; per-pair
