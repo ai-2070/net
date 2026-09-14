@@ -5282,6 +5282,7 @@ jobs:
       # browser, and exits non-zero on any failed one.
       - name: Browser harness — Chromium
         if: ${{ !cancelled() }}
+        timeout-minutes: 20
         run: |
           # No `-e`: the exit code is taken from PIPESTATUS below, so
           # a failing harness still leaves a complete log for the
@@ -5293,6 +5294,7 @@ jobs:
 
       - name: Browser harness — Firefox
         if: ${{ !cancelled() }}
+        timeout-minutes: 20
         run: |
           set -uo pipefail
           net/crates/net/tests/rtc_browser/run.sh --engine firefox 2>&1 \
@@ -5304,6 +5306,7 @@ jobs:
       # about a related engine, not about Safari.
       - name: Browser harness — WebKit (recorded, not a gate)
         if: ${{ !cancelled() }}
+        timeout-minutes: 15
         continue-on-error: true
         run: |
           set -uo pipefail
