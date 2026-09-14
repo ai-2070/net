@@ -21,6 +21,12 @@
 //! - [`route_codec`] — the routing **envelope** codec (the route table
 //!   stays in the core).
 //! - [`route_hop`] — the authenticated route-hop envelope.
+//! - [`channel`], [`stream_window`] — the wire-level subprotocol
+//!   codecs §7 assigns to this crate: channel naming and the
+//!   `0x0A00` membership messages, and the `0x0B00`–`0x0B03` stream
+//!   credit / NACK / reset / SACK messages. Moved out of the core in
+//!   Stage 5, when the leaf dispatcher became their second consumer;
+//!   the core re-exports both under their previous paths.
 //! - [`parsed_packet`], [`peer_addr`] — the receive-side packet view
 //!   and the endpoint type the session and the packet are keyed on.
 //! - [`clock`], [`time`] — the monotonic/wall-clock seam. On
@@ -42,6 +48,7 @@
 
 pub mod aead;
 pub mod batch;
+pub mod channel;
 pub mod clock;
 pub mod crypto;
 pub mod event;
@@ -54,6 +61,7 @@ pub mod route_codec;
 pub mod route_hop;
 pub mod session;
 pub mod stream;
+pub mod stream_window;
 #[cfg(feature = "test-vectors")]
 pub mod test_vectors;
 pub mod time;

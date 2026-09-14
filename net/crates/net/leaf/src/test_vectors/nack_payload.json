@@ -1,0 +1,8 @@
+{
+  "description": "NackPayload::to_bytes / from_bytes. 16 bytes: next_expected(8) | missing_bitmap(8), both little-endian. Bit i of the bitmap means sequence next_expected + 1 + i is missing.",
+  "fields": {
+    "next_expected": "0x0102030405060708",
+    "missing_bitmap": 11
+  },
+  "hex": "08070605040302010b00000000000000"
+}

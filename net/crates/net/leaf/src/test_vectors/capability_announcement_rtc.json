@@ -1,0 +1,51 @@
+{
+  "description": "CapabilityAnnouncement WITH the three Stage 4a browser-leaf fields set (noise_pubkey, rtc_bootstrap, rtc_addr). Each is optional and omitted when None \u2014 the sibling fixture capability_announcement.json is the same announcement WITHOUT them, and its bytes are unchanged by Stage 4a. Declaration order puts the three after owner_cert, and SignedPayloadCanonical emits them in that order, so these bytes are also the signed transcript.",
+  "json": {
+    "node_id": 11651590505119483656,
+    "entity_id": "1111111111111111111111111111111111111111111111111111111111111111",
+    "version": 7,
+    "timestamp_ns": 1700000000000000000,
+    "ttl_secs": 300,
+    "capabilities": {
+      "tags": [],
+      "metadata": {}
+    },
+    "noise_pubkey": [
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17
+    ],
+    "rtc_bootstrap": "https://anchor.example/rtc",
+    "rtc_addr": "198.51.100.7:4433"
+  },
+  "bytes_utf8": "{\"node_id\":11651590505119483656,\"entity_id\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"version\":7,\"timestamp_ns\":1700000000000000000,\"ttl_secs\":300,\"capabilities\":{\"tags\":[],\"metadata\":{}},\"noise_pubkey\":[17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17],\"rtc_bootstrap\":\"https://anchor.example/rtc\",\"rtc_addr\":\"198.51.100.7:4433\"}"
+}

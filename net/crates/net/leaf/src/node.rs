@@ -1,0 +1,1325 @@
+//! The leaf node: everything above the transport, and nothing that
+//! touches `web_sys`.
+//!
+//! This is a **sans-IO** core. It takes bytes in
+//! ([`LeafNode::on_datagram`]), hands bytes out
+//! ([`LeafNode::take_outbound`]), and emits events
+//! ([`LeafNode::drain_events`]). The RTC driver and the control plane
+//! pump it; nothing in here knows what a `RtcDataChannel` is.
+//!
+//! That shape is not aesthetic. It is what makes the leaf's protocol
+//! behaviour — dispatch, reassembly, reorder, call disposition,
+//! announcement verification — testable natively, including a full
+//! handshake and round trip against a real responder session. A
+//! browser is then needed only to prove the transport, which is what
+//! the Playwright matrix and the wasm runner are for.
+
+use std::collections::{HashMap, VecDeque};
+
+use bytes::Bytes;
+use net_wire::clock::Instant;
+
+use crate::announce::{self, AnnouncementStore, VerifiedAnnouncement, SUBPROTOCOL_FOLD};
+use crate::channel::{reply_channel, request_channel, Channel, SUBPROTOCOL_MEMBERSHIP};
+use crate::clock;
+use crate::control_plane::{NodeId, SignalEnvelope};
+use crate::counters::{DropReason, LeafCounters};
+use crate::dispatch::{self, Decoded, SUBPROTOCOL_EVENT_PLANE};
+use crate::error::{LeafError, Result, RpcError};
+use crate::frame::Reassembler;
+use crate::identity::{unhex, LeafIdentity};
+use crate::rpc::{CallResult, CallTable, DEFAULT_CALL_TIMEOUT_MS};
+use crate::rpc_wire::{self, RpcRequestPayload};
+use crate::session::{rtc_addr, PendingHandshake, SessionTable};
+use crate::signal::{self, SeenSignals};
+use crate::stream::{stream_id_from_label, Reliability, RxStream};
+
+/// One thing that happened, as the SDK sees it.
+///
+/// Every `u64` crosses the wasm boundary as a decimal **string**:
+/// `channel_hash`, `origin_hash`, `stream_id`, `node_id` and
+/// `call_id` all exceed 2^53, and `JSON.parse` would round them — a
+/// page filtering `channel_message` by hash would silently match the
+/// wrong channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeafEvent {
+    /// A session with `peer` is established.
+    Connected {
+        /// This leaf's node id.
+        node_id: NodeId,
+        /// The peer's node id.
+        peer_node: NodeId,
+        /// The peer's public RTC socket, when the bootstrap
+        /// published one. The datum the `UdpBlocked` correction
+        /// needs: the STUN probe aims here, never at an ICE server.
+        rtc_addr: Option<String>,
+    },
+    /// A session with `peer` is gone.
+    Disconnected {
+        /// The peer.
+        peer_node: NodeId,
+        /// Why.
+        reason: String,
+    },
+    /// An event-plane frame that is not an nRPC reply.
+    ChannelMessage {
+        /// Wire `u16` channel hint.
+        channel_hash: u16,
+        /// The publisher's origin hash.
+        origin_hash: NodeId,
+        /// The payload.
+        payload: Bytes,
+    },
+    /// Data on an application stream, already reordered.
+    StreamData {
+        /// The stream.
+        stream_id: u64,
+        /// The sequence this batch arrived under.
+        seq: u64,
+        /// The payload.
+        payload: Bytes,
+    },
+    /// A verified announcement was ingested.
+    Announcement(VerifiedAnnouncement),
+    /// A verified signalling envelope arrived for this leaf.
+    Signal(SignalEnvelope),
+    /// Something was refused. Carries the reason's stable name.
+    Dropped {
+        /// The reason.
+        reason: DropReason,
+    },
+}
+
+impl LeafEvent {
+    /// The JSON one `on_event` callback receives.
+    pub fn to_json(&self) -> String {
+        match self {
+            Self::Connected {
+                node_id,
+                peer_node,
+                rtc_addr,
+            } => format!(
+                "{{\"type\":\"connected\",\"node_id\":\"{node_id}\",\"node_id_hex\":\"{node_id:016x}\",\"peer_node\":\"{peer_node}\",\"rtc_addr\":{}}}",
+                json_string_or_null(rtc_addr.as_deref())
+            ),
+            Self::Disconnected { peer_node, reason } => format!(
+                "{{\"type\":\"disconnected\",\"peer_node\":\"{peer_node}\",\"reason\":{}}}",
+                json_string(reason)
+            ),
+            Self::ChannelMessage {
+                channel_hash,
+                origin_hash,
+                payload,
+            } => format!(
+                "{{\"type\":\"channel_message\",\"channel_hash\":\"{channel_hash}\",\"origin_hash\":\"{origin_hash}\",\"payload\":\"{}\"}}",
+                base64(payload)
+            ),
+            Self::StreamData {
+                stream_id,
+                seq,
+                payload,
+            } => format!(
+                "{{\"type\":\"stream_data\",\"stream_id\":\"{stream_id}\",\"seq\":\"{seq}\",\"payload\":\"{}\"}}",
+                base64(payload)
+            ),
+            Self::Announcement(a) => {
+                format!("{{\"type\":\"announcement\",\"announcement\":{}}}", a.to_json())
+            }
+            Self::Signal(envelope) => format!(
+                "{{\"type\":\"signal\",\"from\":\"{}\",\"to\":\"{}\",\"dialog\":\"{}\",\"kind\":{},\"payload\":\"{}\",\"not_after\":\"{}\"}}",
+                envelope.from,
+                envelope.to,
+                envelope.dialog,
+                envelope.kind.tag(),
+                base64(&envelope.payload),
+                envelope.not_after
+            ),
+            Self::Dropped { reason } => format!(
+                "{{\"type\":\"dropped\",\"reason\":\"{}\"}}",
+                reason.as_str()
+            ),
+        }
+    }
+}
+
+/// One outbound packet and who it is for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Outbound {
+    /// The peer whose DataChannel carries it.
+    pub peer: NodeId,
+    /// The packet.
+    pub packet: Bytes,
+}
+
+/// An open application stream's parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamHandle {
+    /// The peer.
+    pub peer: NodeId,
+    /// The wire stream id.
+    pub stream_id: u64,
+    /// The `u16` channel hint stamped on its packets.
+    pub channel_hash: u16,
+    /// Reliable or fire-and-forget.
+    pub reliability: Reliability,
+}
+
+/// The leaf.
+pub struct LeafNode {
+    identity: LeafIdentity,
+    sessions: SessionTable,
+    handshakes: HashMap<NodeId, PendingHandshake>,
+    reassembler: Reassembler,
+    rx_streams: HashMap<(NodeId, u64), RxStream>,
+    calls: CallTable,
+    /// `call_id` → the peer and route it was sent on, so a timeout
+    /// can emit a CANCEL to the right place.
+    call_routes: HashMap<u64, (NodeId, u64)>,
+    announcements: AnnouncementStore,
+    seen_signals: SeenSignals,
+    counters: LeafCounters,
+    outbound: VecDeque<Outbound>,
+    events: Vec<LeafEvent>,
+    /// Monotonic announcement version. Starts at 1: the fold rejects
+    /// generation 0 outright.
+    announcement_version: u64,
+    /// The peer's published RTC socket, per peer, for the
+    /// `UdpBlocked` evidence and the `connected` event.
+    peer_rtc_addr: HashMap<NodeId, String>,
+    /// Subscribe nonces, so an Ack can be correlated.
+    next_nonce: u64,
+}
+
+impl LeafNode {
+    /// A node with this identity and no sessions.
+    ///
+    /// `call_id_seed` seeds the call table — see
+    /// [`CallTable::with_seed`] for why it is not zero.
+    pub fn new(identity: LeafIdentity, call_id_seed: u64) -> Self {
+        Self {
+            identity,
+            sessions: SessionTable::new(),
+            handshakes: HashMap::new(),
+            reassembler: Reassembler::new(),
+            rx_streams: HashMap::new(),
+            calls: CallTable::with_seed(call_id_seed),
+            call_routes: HashMap::new(),
+            announcements: AnnouncementStore::new(),
+            seen_signals: SeenSignals::new(),
+            counters: LeafCounters::new(),
+            outbound: VecDeque::new(),
+            events: Vec::new(),
+            announcement_version: 1,
+            peer_rtc_addr: HashMap::new(),
+            next_nonce: 1,
+        }
+    }
+
+    /// This node's id.
+    #[inline]
+    pub fn node_id(&self) -> NodeId {
+        self.identity.node_id()
+    }
+
+    /// This node's identity.
+    #[inline]
+    pub fn identity(&self) -> &LeafIdentity {
+        &self.identity
+    }
+
+    /// The counters.
+    #[inline]
+    pub fn counters(&self) -> &LeafCounters {
+        &self.counters
+    }
+
+    /// Whether a session with `peer` is installed.
+    pub fn has_session(&self, peer: NodeId) -> bool {
+        self.sessions.get(peer).is_some()
+    }
+
+    /// Record what the bootstrap published for `peer`.
+    pub fn set_peer_rtc_addr(&mut self, peer: NodeId, addr: Option<String>) {
+        match addr {
+            Some(addr) => {
+                self.peer_rtc_addr.insert(peer, addr);
+            }
+            None => {
+                self.peer_rtc_addr.remove(&peer);
+            }
+        }
+    }
+
+    /// Start the NKpsk0 handshake with `peer` as initiator, returning
+    /// the message-1 packet to put on the wire.
+    ///
+    /// `responder_static` must come from the bootstrap credential.
+    /// Passing a key read from `GET /rtc/anchor` would make the MITM
+    /// witness meaningless, which is why this takes the key rather
+    /// than fetching one.
+    pub fn begin_handshake(
+        &mut self,
+        peer: NodeId,
+        psk: &[u8; 32],
+        responder_static: &[u8; 32],
+        slot: u32,
+    ) -> Result<Bytes> {
+        let (pending, packet) = PendingHandshake::initiate(
+            psk,
+            responder_static,
+            self.identity.node_id(),
+            peer,
+            rtc_addr(slot, 1),
+        )?;
+        self.handshakes.insert(peer, pending);
+        Ok(packet)
+    }
+
+    /// Finish the handshake with `peer` from its message-2 packet.
+    pub fn complete_handshake(&mut self, peer: NodeId, msg2: &[u8]) -> Result<()> {
+        let pending = self
+            .handshakes
+            .remove(&peer)
+            .ok_or_else(|| LeafError::Session(format!("no handshake in flight with {peer:#x}")))?;
+        let session = pending.read_msg2(msg2)?;
+        self.sessions.install(session);
+        self.events.push(LeafEvent::Connected {
+            node_id: self.identity.node_id(),
+            peer_node: peer,
+            rtc_addr: self.peer_rtc_addr.get(&peer).cloned(),
+        });
+        Ok(())
+    }
+
+    /// Tear down the session with `peer`.
+    ///
+    /// Pending calls on it fail [`RpcError::SessionLost`] — typed,
+    /// never silently retried (§8).
+    pub fn drop_session(&mut self, peer: NodeId, reason: impl Into<String>) {
+        self.sessions.remove(peer);
+        self.handshakes.remove(&peer);
+        self.rx_streams.retain(|(p, _), _| *p != peer);
+        self.calls.fail_peer(peer);
+        self.call_routes.retain(|_, (p, _)| *p != peer);
+        self.events.push(LeafEvent::Disconnected {
+            peer_node: peer,
+            reason: reason.into(),
+        });
+    }
+
+    /// Fail every in-flight call because this tab lost the identity.
+    ///
+    /// §8's disposition rule: the caller is told which generation
+    /// owned the call and decides. Nothing is re-issued.
+    pub fn fail_calls_on_leader_loss(&mut self, generation: u64) -> usize {
+        self.call_routes.clear();
+        self.calls.fail_all(RpcError::LeaderLost { generation })
+    }
+
+    /// Periodic work: expire call deadlines and stale reassemblies.
+    ///
+    /// Called on every inbound packet and from the wasm surface's
+    /// timer. Returns how many calls timed out.
+    pub fn tick(&mut self, now: Instant) -> usize {
+        let expired = self.calls.expire(now);
+        for call_id in &expired {
+            // Tell the server, so it is not left running work
+            // nobody awaits.
+            if let Some((peer, route)) = self.call_routes.remove(call_id) {
+                let frame =
+                    rpc_wire::encode_cancel_frame(self.identity.origin_hash(), *call_id, route);
+                let _ =
+                    self.send_event_plane(peer, route_stream_id(route), route as u16, &frame, true);
+            }
+        }
+        self.reassembler.expire(now, &self.counters);
+        expired.len()
+    }
+
+    /// Take everything queued for the transport.
+    pub fn take_outbound(&mut self) -> Vec<Outbound> {
+        self.outbound.drain(..).collect()
+    }
+
+    /// Take everything queued for the application.
+    pub fn drain_events(&mut self) -> Vec<LeafEvent> {
+        core::mem::take(&mut self.events)
+    }
+
+    // ───────────────────────────── outbound ─────────────────────────
+
+    /// Queue one payload on the event plane.
+    fn send_event_plane(
+        &mut self,
+        peer: NodeId,
+        stream_id: u64,
+        channel_hash: u16,
+        payload: &[u8],
+        reliable: bool,
+    ) -> Result<()> {
+        self.send_subprotocol(
+            peer,
+            stream_id,
+            SUBPROTOCOL_EVENT_PLANE,
+            channel_hash,
+            payload,
+            reliable,
+        )
+    }
+
+    /// Queue one payload under `subprotocol_id`.
+    fn send_subprotocol(
+        &mut self,
+        peer: NodeId,
+        stream_id: u64,
+        subprotocol_id: u16,
+        channel_hash: u16,
+        payload: &[u8],
+        reliable: bool,
+    ) -> Result<()> {
+        let origin_hash = self.identity.origin_hash();
+        let session = self
+            .sessions
+            .get(peer)
+            .ok_or_else(|| LeafError::Session(format!("no session with {peer:#x}")))?;
+        let packets = session.build_packets(
+            stream_id,
+            subprotocol_id,
+            channel_hash,
+            origin_hash,
+            reliable,
+            payload,
+        )?;
+        let fragmented = packets.len() > 1;
+        for packet in packets {
+            self.counters.packet_out();
+            if fragmented {
+                self.counters.fragment_out();
+            }
+            self.outbound.push_back(Outbound { peer, packet });
+        }
+        Ok(())
+    }
+
+    /// Subscribe to `channel` on `peer`, through the production
+    /// `0x0A00` encoder.
+    ///
+    /// Returns the nonce the Ack will echo.
+    pub fn subscribe(&mut self, peer: NodeId, channel: &str) -> Result<u64> {
+        let channel = Channel::new(channel)?;
+        let nonce = self.next_nonce;
+        self.next_nonce = self.next_nonce.wrapping_add(1);
+        let payload = channel.subscribe_payload(nonce);
+        self.send_subprotocol(
+            peer,
+            channel.publish_stream_id(),
+            SUBPROTOCOL_MEMBERSHIP,
+            channel.wire_hash(),
+            &payload,
+            true,
+        )?;
+        Ok(nonce)
+    }
+
+    /// Publish `payload` on `channel` to `peer`.
+    ///
+    /// The stream id and the header's channel hint are the ones
+    /// `MeshNode::try_publish_to_peer` derives, so the receiver's
+    /// per-channel dispatcher sees the frame.
+    pub fn publish(&mut self, peer: NodeId, channel: &str, payload: &[u8]) -> Result<()> {
+        let channel = Channel::new(channel)?;
+        self.send_event_plane(
+            peer,
+            channel.publish_stream_id(),
+            channel.wire_hash(),
+            payload,
+            true,
+        )
+    }
+
+    /// Open an application stream.
+    ///
+    /// `stream_id` and `channel_hash` override the derivation when
+    /// the caller must match a specific publish contract — which is
+    /// how a stream's payload reaches a native node's real handler
+    /// rather than only moving a counter.
+    pub fn open_stream(
+        &mut self,
+        peer: NodeId,
+        label: &str,
+        reliability: Reliability,
+        stream_id: Option<u64>,
+        channel_hash: Option<u16>,
+    ) -> Result<StreamHandle> {
+        if self.sessions.get(peer).is_none() {
+            return Err(LeafError::Session(format!("no session with {peer:#x}")));
+        }
+        let stream_id = stream_id.unwrap_or_else(|| stream_id_from_label(label));
+        Ok(StreamHandle {
+            peer,
+            stream_id,
+            channel_hash: channel_hash.unwrap_or(0),
+            reliability,
+        })
+    }
+
+    /// Send on an open stream.
+    pub fn stream_send(&mut self, handle: StreamHandle, payload: &[u8]) -> Result<()> {
+        self.send_event_plane(
+            handle.peer,
+            handle.stream_id,
+            handle.channel_hash,
+            payload,
+            handle.reliability.is_reliable(),
+        )
+    }
+
+    /// Make an nRPC call. The future resolves to the reply body or a
+    /// typed failure.
+    ///
+    /// Registers the call **before** the request goes out, so a
+    /// reply that arrives while this function is still returning
+    /// cannot find an empty table.
+    pub fn call(
+        &mut self,
+        peer: NodeId,
+        service: &str,
+        payload: &[u8],
+        timeout_ms: Option<u64>,
+    ) -> Result<CallResult> {
+        let request = request_channel(service)?;
+        let request = Channel::from_name(request);
+        // The route discriminator is the CANONICAL u64 hash of the
+        // channel the frame rides, not the u16 bucket.
+        let route = request.canonical();
+        let timeout_ms = timeout_ms.unwrap_or(DEFAULT_CALL_TIMEOUT_MS);
+        let (call_id, receiver) = self
+            .calls
+            .register(peer, timeout_ms)
+            .map_err(LeafError::Rpc)?;
+        self.call_routes.insert(call_id, (peer, route));
+
+        let deadline_ns =
+            clock::now_unix_nanos().saturating_add(timeout_ms.saturating_mul(1_000_000));
+        let frame = rpc_wire::encode_request_frame(
+            self.identity.origin_hash(),
+            call_id,
+            route,
+            &RpcRequestPayload::unary(service, deadline_ns, Bytes::copy_from_slice(payload)),
+        )?;
+        if let Err(e) = self.send_event_plane(
+            peer,
+            request.publish_stream_id(),
+            request.wire_hash(),
+            &frame,
+            true,
+        ) {
+            // The call never reached the wire. Fail it now rather
+            // than let it time out — and never retry it.
+            self.call_routes.remove(&call_id);
+            self.calls.take(call_id);
+            return Err(e);
+        }
+        Ok(receiver)
+    }
+
+    /// The reply channel this leaf must be subscribed to before a
+    /// call to `service` can be answered.
+    pub fn reply_channel_for(&self, service: &str) -> Result<String> {
+        reply_channel(service, self.identity.origin_hash()).map(|c| c.as_str().to_string())
+    }
+
+    /// Build and sign this leaf's announcement, bumping its version.
+    ///
+    /// The bytes are for
+    /// [`ControlPlane::publish_announcement`](crate::control_plane::ControlPlane::publish_announcement);
+    /// [`Self::announce_to_peer`] additionally sends them to one peer
+    /// as a fold frame, which is the route-learning path §7 reuses.
+    pub fn build_announcement(&mut self, capabilities: &[String]) -> Result<Vec<u8>> {
+        let version = self.announcement_version;
+        self.announcement_version = self.announcement_version.saturating_add(1);
+        announce::build_announcement(
+            &self.identity,
+            capabilities,
+            version,
+            clock::now_unix_nanos(),
+            announce::DEFAULT_TTL_SECS,
+        )
+    }
+
+    /// Send an already-signed announcement to one peer as a
+    /// `0x1000` fold frame.
+    pub fn announce_to_peer(&mut self, peer: NodeId, announcement: &[u8]) -> Result<()> {
+        self.send_subprotocol(
+            peer,
+            SUBPROTOCOL_FOLD as u64,
+            SUBPROTOCOL_FOLD,
+            0,
+            announcement,
+            true,
+        )
+    }
+
+    /// Ingest an announcement the control plane returned, verifying
+    /// it first.
+    ///
+    /// `false` means it was refused or superseded — and a refusal
+    /// moves [`DropReason::AnnouncementUnverified`].
+    pub fn ingest_announcement(&mut self, bytes: &[u8]) -> bool {
+        match announce::verify_announcement(bytes) {
+            Ok(verified) => {
+                let changed = self.announcements.ingest(verified.clone());
+                if changed {
+                    self.events.push(LeafEvent::Announcement(verified));
+                }
+                changed
+            }
+            Err(_) => {
+                self.counters.drop_for(DropReason::AnnouncementUnverified);
+                self.events.push(LeafEvent::Dropped {
+                    reason: DropReason::AnnouncementUnverified,
+                });
+                false
+            }
+        }
+    }
+
+    /// Answer a capability query from verified state.
+    pub fn query(&self, capability: &str) -> String {
+        self.announcements.query_json(capability)
+    }
+
+    /// The announcement held for `node`, if this leaf verified one.
+    pub fn announcement_for(&self, node: NodeId) -> Option<&VerifiedAnnouncement> {
+        self.announcements.get(node)
+    }
+
+    // ───────────────────────────── inbound ──────────────────────────
+
+    /// Feed one datagram from the transport.
+    ///
+    /// The whole receive path: routing-envelope discrimination,
+    /// session lookup, AEAD open, reassembly, per-stream reorder,
+    /// subprotocol dispatch. Every refusal moves a counter.
+    pub fn on_datagram(&mut self, peer: NodeId, bytes: Bytes, now: Instant) {
+        self.counters.packet_in();
+        let self_node = self.identity.node_id();
+        let Some(inner) = dispatch::unwrap_routing(bytes, self_node, &self.counters) else {
+            return;
+        };
+
+        let Some(session) = self.sessions.get(peer) else {
+            self.counters.drop_for(DropReason::NoSession);
+            return;
+        };
+        let opened = match session.open_packet(&inner) {
+            Ok(opened) => opened,
+            Err(LeafError::Wire(reason)) if reason.contains("replay") => {
+                self.counters.drop_for(DropReason::Replay);
+                return;
+            }
+            Err(_) => {
+                self.counters.drop_for(DropReason::Unparsable);
+                return;
+            }
+        };
+
+        // The header fields the dispatch arms need, copied out
+        // before the events are consumed.
+        let meta = opened_meta(&opened);
+
+        // Reassembly is per (peer, fragment group). One event per
+        // packet on this path, which is what "one Batch per packet"
+        // means on the receive side too.
+        let mut payloads = Vec::with_capacity(opened.events.len());
+        for event in opened.events {
+            if let Some(whole) = self.reassembler.accept(
+                peer,
+                opened.fragment_id,
+                opened.fragment_offset,
+                opened.frag_flags,
+                event,
+                now,
+                &self.counters,
+            ) {
+                payloads.push(whole);
+            }
+        }
+        if payloads.is_empty() {
+            return;
+        }
+
+        // The consumer-side reorder, per stream. Control
+        // subprotocols ride the control stream and are not
+        // reordered: a credit grant held behind a gap would deadlock
+        // the very stream it is trying to refill.
+        let batches = if opened.subprotocol_id == SUBPROTOCOL_EVENT_PLANE {
+            let reliability = if opened.reliable {
+                Reliability::Reliable
+            } else {
+                Reliability::FireAndForget
+            };
+            let stream = self
+                .rx_streams
+                .entry((peer, opened.stream_id))
+                .or_insert_with(|| RxStream::new(reliability));
+            stream
+                .accept(opened.sequence, payloads, &self.counters)
+                .into_iter()
+                .map(|events| (opened.sequence, events))
+                .collect()
+        } else {
+            vec![(opened.sequence, payloads)]
+        };
+
+        for (seq, events) in batches {
+            for payload in events {
+                self.handle_event(peer, &meta, seq, payload, now);
+            }
+        }
+    }
+
+    /// One decoded event.
+    fn handle_event(
+        &mut self,
+        peer: NodeId,
+        meta: &EventMetaView,
+        seq: u64,
+        payload: Bytes,
+        now: Instant,
+    ) {
+        let Some(decoded) = dispatch::dispatch_event(meta.subprotocol_id, payload, &self.counters)
+        else {
+            self.events.push(LeafEvent::Dropped {
+                reason: DropReason::UnknownSubprotocol,
+            });
+            return;
+        };
+        match decoded {
+            Decoded::Event(payload) => self.handle_event_plane(peer, meta, seq, payload),
+            Decoded::Announcement(bytes) | Decoded::Fold(bytes) => {
+                self.ingest_announcement(&bytes);
+            }
+            Decoded::Signal(envelope) => self.handle_signal(envelope, now),
+            // The wire crate's stream state owns credit and
+            // retransmission; the leaf applies grants to it.
+            Decoded::StreamWindow(grant) => {
+                if let Some(session) = self.sessions.get(peer) {
+                    if let Some(stream) = session.wire().try_stream(grant.stream_id) {
+                        // The wire crate owns the credit
+                        // arithmetic, including the clamp against
+                        // our own `tx_bytes_sent` watermark that
+                        // stops a hostile grant underflowing it.
+                        stream.apply_authoritative_grant(grant.total_consumed);
+                    }
+                }
+            }
+            // A leaf retains no retransmit window of its own beyond
+            // what the wire session holds, and it serves no
+            // membership requests: these are observations.
+            Decoded::StreamNack(_)
+            | Decoded::StreamReset(_)
+            | Decoded::StreamAck(_)
+            | Decoded::Membership(_) => {}
+        }
+    }
+
+    /// An event-plane frame: an nRPC reply for one of our calls, or
+    /// an application message.
+    fn handle_event_plane(
+        &mut self,
+        _peer: NodeId,
+        meta: &EventMetaView,
+        seq: u64,
+        payload: Bytes,
+    ) {
+        match rpc_wire::decode_reply_frame(payload.clone()) {
+            Ok(Some(frame)) => {
+                let call_id = match &frame {
+                    rpc_wire::RpcFrame::Response { call_id, .. }
+                    | rpc_wire::RpcFrame::DeadlineExceeded { call_id } => *call_id,
+                };
+                if self.calls.deliver(frame, &self.counters) {
+                    self.call_routes.remove(&call_id);
+                }
+            }
+            // Well-formed but not the client half, or not an nRPC
+            // frame at all: an application message.
+            Ok(None) | Err(_) => {
+                if meta.stream_id & crate::stream::LEAF_STREAM_DISCRIMINATOR != 0 {
+                    self.events.push(LeafEvent::StreamData {
+                        stream_id: meta.stream_id,
+                        seq,
+                        payload,
+                    });
+                } else {
+                    self.events.push(LeafEvent::ChannelMessage {
+                        channel_hash: meta.channel_hash,
+                        origin_hash: meta.origin_hash,
+                        payload,
+                    });
+                }
+            }
+        }
+    }
+
+    /// A `0x0D02` envelope: verify against the announcement we hold
+    /// for the sender, then admit it once.
+    fn handle_signal(&mut self, envelope: SignalEnvelope, _now: Instant) {
+        let now_secs = clock::now_unix_secs();
+        let Some(announcement) = self.announcements.get(envelope.from) else {
+            // §5 Layer 1: key discovery precedes signalling. With
+            // no announcement there is nothing to verify against,
+            // and accepting it would make the carrier trusted.
+            self.reject_signal();
+            return;
+        };
+        let Ok(entity_bytes) = unhex(&announcement.entity_id) else {
+            self.reject_signal();
+            return;
+        };
+        let Ok(entity_id) = <[u8; 32]>::try_from(entity_bytes.as_slice()) else {
+            self.reject_signal();
+            return;
+        };
+        if signal::verify(&envelope, &entity_id, self.identity.node_id(), now_secs).is_err() {
+            self.reject_signal();
+            return;
+        }
+        if !self.seen_signals.admit(&envelope, now_secs) {
+            self.reject_signal();
+            return;
+        }
+        self.events.push(LeafEvent::Signal(envelope));
+    }
+
+    fn reject_signal(&mut self) {
+        self.counters.drop_for(DropReason::SignalRejected);
+        self.events.push(LeafEvent::Dropped {
+            reason: DropReason::SignalRejected,
+        });
+    }
+
+    /// Sign an outbound signalling envelope for `peer`.
+    ///
+    /// The control plane carries it; no session with `peer` is
+    /// needed, which is the whole point of the envelope.
+    pub fn sign_signal(
+        &self,
+        peer: NodeId,
+        dialog: u64,
+        kind: crate::control_plane::SignalKind,
+        payload: Vec<u8>,
+    ) -> SignalEnvelope {
+        signal::sign(
+            &self.identity,
+            peer,
+            dialog,
+            kind,
+            payload,
+            clock::now_unix_secs() + signal::MAX_SIGNAL_LIFETIME_SECS / 2,
+        )
+    }
+}
+
+/// The header fields `handle_event` needs, copied out so the
+/// borrow on the session ends before dispatch.
+struct EventMetaView {
+    subprotocol_id: u16,
+    channel_hash: u16,
+    origin_hash: u64,
+    stream_id: u64,
+}
+
+fn opened_meta(opened: &crate::session::OpenedPacket) -> EventMetaView {
+    EventMetaView {
+        subprotocol_id: opened.subprotocol_id,
+        channel_hash: opened.channel_hash,
+        origin_hash: opened.origin_hash,
+        stream_id: opened.stream_id,
+    }
+}
+
+/// The stream id an nRPC frame for `route` rides.
+fn route_stream_id(route: u64) -> u64 {
+    crate::channel::publish_stream_id(route)
+}
+
+/// Standard padded base64, which is what the TS wrapper decodes.
+fn base64(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+fn json_string(s: &str) -> String {
+    serde_json::Value::String(s.to_string()).to_string()
+}
+
+fn json_string_or_null(s: Option<&str>) -> String {
+    match s {
+        Some(s) => json_string(s),
+        None => "null".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control_plane::SignalKind;
+    use crate::identity::EntityKeypair;
+    use crate::rpc_wire::{EventMeta, RpcStatus, DISPATCH_RPC_RESPONSE};
+    use net_wire::crypto::{handshake_prologue, NoiseHandshake, StaticKeypair};
+    use net_wire::parsed_packet::ParsedPacket;
+    use net_wire::pool::PacketBuilder;
+    use net_wire::protocol::{EventFrame, PacketFlags};
+    use net_wire::session::NetSession;
+
+    const ANCHOR: NodeId = 0xAAAA_BBBB_CCCC_DDDD;
+    const PSK: [u8; 32] = [0x4B; 32];
+
+    fn identity(seed: u8) -> LeafIdentity {
+        LeafIdentity::from_secrets(EntityKeypair::from_secret([seed; 32]), [seed ^ 0xFF; 32])
+    }
+
+    fn anchor_static() -> StaticKeypair {
+        let secret = x25519_dalek::StaticSecret::from([7u8; 32]);
+        let public = x25519_dalek::PublicKey::from(&secret);
+        StaticKeypair::from_keys([7u8; 32], *public.as_bytes())
+    }
+
+    /// A node with a live session against a real responder session,
+    /// which is what lets the whole receive path run natively.
+    fn connected() -> (LeafNode, NetSession) {
+        let mut node = LeafNode::new(identity(0x11), 0x1000);
+        let anchor_key = anchor_static();
+        let prologue = handshake_prologue(
+            crate::session::routing_id(node.node_id()),
+            crate::session::routing_id(ANCHOR),
+        );
+        let mut responder = NoiseHandshake::responder_with_prologue(&PSK, &anchor_key, &prologue)
+            .expect("responder");
+
+        let msg1 = node
+            .begin_handshake(ANCHOR, &PSK, anchor_key.public_key(), 0)
+            .expect("msg1");
+        let parsed = ParsedPacket::parse(msg1, rtc_addr(0, 1)).expect("parses");
+        responder.read_message(&parsed.payload).expect("reads msg1");
+        let msg2 = responder.write_message(&[]).expect("msg2");
+        let msg2_packet = PacketBuilder::new(&[0u8; 32], 0).build_handshake(&msg2);
+
+        node.set_peer_rtc_addr(ANCHOR, Some("198.51.100.7:4433".into()));
+        node.complete_handshake(ANCHOR, &msg2_packet)
+            .expect("install");
+        let keys = responder.into_session_keys().expect("keys");
+        (node, NetSession::new(keys, rtc_addr(1, 1), 2, false))
+    }
+
+    /// Build a packet the anchor would send, so the node's whole
+    /// inbound path is exercised.
+    fn anchor_packet(
+        anchor: &NetSession,
+        stream_id: u64,
+        subprotocol_id: u16,
+        channel_hash: u16,
+        reliable: bool,
+        payload: &[u8],
+    ) -> Bytes {
+        anchor.open_stream_with(stream_id, reliable, 1);
+        let seq = anchor.get_or_create_stream(stream_id).next_tx_seq();
+        let events = [Bytes::copy_from_slice(payload)];
+        let mut builder = anchor.thread_local_pool().get();
+        builder.set_channel_hash(channel_hash);
+        builder.set_origin_hash(0xFEED_FACE_0000_0001);
+        builder.build_subprotocol(
+            stream_id,
+            seq,
+            &events,
+            if reliable {
+                PacketFlags::RELIABLE
+            } else {
+                PacketFlags::NONE
+            },
+            subprotocol_id,
+        )
+    }
+
+    #[test]
+    fn the_handshake_emits_a_connected_event_carrying_the_published_rtc_addr() {
+        let (mut node, _anchor) = connected();
+        assert!(node.has_session(ANCHOR));
+        let events = node.drain_events();
+        assert_eq!(
+            events,
+            vec![LeafEvent::Connected {
+                node_id: node.node_id(),
+                peer_node: ANCHOR,
+                rtc_addr: Some("198.51.100.7:4433".into()),
+            }],
+            "the rtc_addr is the datum the UdpBlocked correction needs"
+        );
+        let json = events[0].to_json();
+        assert!(json.contains("\"type\":\"connected\""), "{json}");
+        assert!(
+            json.contains(&format!("\"node_id\":\"{}\"", node.node_id())),
+            "u64s must cross as decimal strings: {json}"
+        );
+        assert!(
+            json.contains("\"rtc_addr\":\"198.51.100.7:4433\""),
+            "{json}"
+        );
+    }
+
+    /// The full outbound path: a publish is one packet whose header
+    /// carries the derived stream id and channel hint, and whose
+    /// payload is the caller's bytes verbatim.
+    #[test]
+    fn a_publish_rides_the_derived_stream_and_carries_the_payload_verbatim() {
+        let (mut node, anchor) = connected();
+        node.publish(ANCHOR, "sensors/lidar", b"frame bytes")
+            .expect("publish");
+        let out = node.take_outbound();
+        assert_eq!(out.len(), 1, "one Batch per packet");
+        assert_eq!(out[0].peer, ANCHOR);
+
+        let parsed = ParsedPacket::parse(out[0].packet.clone(), rtc_addr(0, 1)).expect("parses");
+        let channel = Channel::new("sensors/lidar").expect("valid");
+        assert_eq!(parsed.header.stream_id, channel.publish_stream_id());
+        assert_eq!(parsed.header.channel_hash, channel.wire_hash());
+        assert_eq!(parsed.header.subprotocol_id, 0, "the event plane");
+        assert_eq!(
+            parsed.header.origin_hash,
+            node.identity().origin_hash(),
+            "the receiver maps this back to our node id"
+        );
+
+        let aad = parsed.header.aad();
+        let counter = u64::from_le_bytes(parsed.header.nonce[4..12].try_into().expect("nonce"));
+        let plain = anchor
+            .rx_cipher()
+            .decrypt_to_bytes(counter, &aad, parsed.payload.clone())
+            .expect("the anchor decrypts");
+        let events = EventFrame::read_events(plain, parsed.header.event_count);
+        assert_eq!(&events[0][..], b"frame bytes", "no added framing");
+    }
+
+    #[test]
+    fn a_subscribe_goes_out_under_the_membership_subprotocol() {
+        let (mut node, _anchor) = connected();
+        let nonce = node
+            .subscribe(ANCHOR, "net.mesh.enroll.replies.0000000000000001")
+            .expect("subscribe");
+        assert_eq!(nonce, 1);
+        let out = node.take_outbound();
+        let parsed = ParsedPacket::parse(out[0].packet.clone(), rtc_addr(0, 1)).expect("parses");
+        assert_eq!(parsed.header.subprotocol_id, 0x0A00);
+    }
+
+    /// A call goes out as `EventMeta ‖ route ‖ payload` and its reply
+    /// resolves the caller's future.
+    #[test]
+    fn a_call_round_trips_and_resolves_the_callers_future() {
+        let (mut node, anchor) = connected();
+        let mut rx = node
+            .call(ANCHOR, "net.mesh.enroll", b"join request", Some(5_000))
+            .expect("call");
+        let out = node.take_outbound();
+        assert_eq!(out.len(), 1);
+
+        // Read the call_id off the wire, exactly as the anchor would.
+        let parsed = ParsedPacket::parse(out[0].packet.clone(), rtc_addr(0, 1)).expect("parses");
+        let aad = parsed.header.aad();
+        let counter = u64::from_le_bytes(parsed.header.nonce[4..12].try_into().expect("nonce"));
+        let plain = anchor
+            .rx_cipher()
+            .decrypt_to_bytes(counter, &aad, parsed.payload.clone())
+            .expect("decrypts");
+        let frames = EventFrame::read_events(plain, parsed.header.event_count);
+        let meta = EventMeta::from_bytes(&frames[0]).expect("meta");
+        assert_eq!(meta.dispatch, crate::rpc_wire::DISPATCH_RPC_REQUEST);
+        let request_channel = Channel::new("net.mesh.enroll.requests").expect("valid");
+        assert_eq!(
+            rpc_wire::decode_route(&frames[0]),
+            Some(request_channel.canonical()),
+            "the route discriminator selects exactly one dispatcher"
+        );
+        assert_eq!(parsed.header.stream_id, request_channel.publish_stream_id());
+
+        // The anchor answers on the reply channel.
+        let reply_name = node.reply_channel_for("net.mesh.enroll").expect("name");
+        let reply = Channel::new(&reply_name).expect("valid");
+        let mut response = Vec::new();
+        response.extend_from_slice(
+            &EventMeta::new(DISPATCH_RPC_RESPONSE, 0, 1, meta.seq_or_ts, 0).to_bytes(),
+        );
+        response.extend_from_slice(&reply.canonical().to_le_bytes());
+        response.extend_from_slice(&RpcStatus::Ok.to_wire().to_le_bytes());
+        response.push(0);
+        response.extend_from_slice(&4u32.to_le_bytes());
+        response.extend_from_slice(b"NMO1");
+
+        let packet = anchor_packet(
+            &anchor,
+            reply.publish_stream_id(),
+            0,
+            reply.wire_hash(),
+            true,
+            &response,
+        );
+        node.on_datagram(ANCHOR, packet, clock::now());
+
+        let outcome = rx
+            .try_recv()
+            .expect("the sender is alive")
+            .expect("resolved");
+        assert_eq!(outcome.expect("Ok"), Bytes::from_static(b"NMO1"));
+        assert_eq!(node.counters().total_drops(), 0);
+    }
+
+    /// The §8 rule end to end: losing the session fails the call
+    /// typed, and does not re-issue it.
+    #[test]
+    fn losing_the_session_fails_an_in_flight_call_typed() {
+        let (mut node, _anchor) = connected();
+        let mut rx = node
+            .call(ANCHOR, "net.mesh.enroll", b"join", Some(60_000))
+            .expect("call");
+        node.take_outbound();
+
+        node.drop_session(ANCHOR, "the DataChannel closed");
+        assert_eq!(
+            rx.try_recv().expect("alive").expect("resolved"),
+            Err(RpcError::SessionLost)
+        );
+        assert!(!node.has_session(ANCHOR));
+        assert!(
+            node.take_outbound().is_empty(),
+            "a lost session must never re-issue the request"
+        );
+    }
+
+    #[test]
+    fn a_deadline_sweep_times_out_the_call_and_emits_a_cancel() {
+        let (mut node, _anchor) = connected();
+        let mut rx = node
+            .call(ANCHOR, "net.mesh.enroll", b"join", Some(10))
+            .expect("call");
+        node.take_outbound();
+
+        let later = clock::now() + core::time::Duration::from_millis(50);
+        assert_eq!(node.tick(later), 1);
+        assert_eq!(
+            rx.try_recv().expect("alive").expect("resolved"),
+            Err(RpcError::Timeout)
+        );
+        let cancels = node.take_outbound();
+        assert_eq!(
+            cancels.len(),
+            1,
+            "the server must be told, not left running work nobody awaits"
+        );
+    }
+
+    /// An over-cap payload fragments on the way out and reassembles
+    /// on the way in — the S0c decision, end to end through a real
+    /// session pair.
+    #[test]
+    fn an_over_cap_payload_survives_fragmentation_and_reassembly() {
+        let (mut node, anchor) = connected();
+        let big: Vec<u8> = (0..crate::frame::MAX_FRAGMENT_PAYLOAD * 2 + 7)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        node.publish(ANCHOR, "bulk/frames", &big).expect("publish");
+        let out = node.take_outbound();
+        assert_eq!(out.len(), 3, "three packets, none over the cap");
+        assert_eq!(node.counters().drops(DropReason::Unparsable), 0);
+
+        // Decrypt each and reassemble on the anchor side using the
+        // leaf's own reassembler, which is the receiving half a
+        // native node still lacks (named in the report).
+        let c = LeafCounters::new();
+        let mut reassembler = Reassembler::new();
+        let mut whole = None;
+        for packet in out {
+            let parsed = ParsedPacket::parse(packet.packet, rtc_addr(0, 1)).expect("parses");
+            assert!(parsed.header.validate(), "no packet may fail validate()");
+            let aad = parsed.header.aad();
+            let counter = u64::from_le_bytes(parsed.header.nonce[4..12].try_into().expect("nonce"));
+            let plain = anchor
+                .rx_cipher()
+                .decrypt_to_bytes(counter, &aad, parsed.payload.clone())
+                .expect("decrypts");
+            let events = EventFrame::read_events(plain, parsed.header.event_count);
+            whole = reassembler.accept(
+                ANCHOR,
+                parsed.header.fragment_id,
+                parsed.header.fragment_offset,
+                parsed.header.frag_flags,
+                events[0].clone(),
+                clock::now(),
+                &c,
+            );
+        }
+        assert_eq!(whole.expect("completes").as_ref(), &big[..]);
+    }
+
+    /// The non-forwarding role, observed on the node rather than in
+    /// the dispatcher unit test.
+    #[test]
+    fn a_routed_envelope_for_someone_else_is_dropped_with_a_counter() {
+        use net_wire::route_codec::{RoutingHeader, _MAX_TTL};
+        let (mut node, anchor) = connected();
+        node.drain_events(); // the Connected event
+        let inner = anchor_packet(&anchor, 1, 0, 0, true, b"not for us");
+        let header = RoutingHeader::new(0x1234_5678, node.node_id() as u32, _MAX_TTL);
+        let mut wire = header.to_bytes().to_vec();
+        wire.extend_from_slice(&inner);
+
+        node.on_datagram(ANCHOR, Bytes::from(wire), clock::now());
+        assert_eq!(node.counters().drops(DropReason::NotAddressedToUs), 1);
+        assert!(
+            node.drain_events().is_empty(),
+            "a forwarded packet produces no application event"
+        );
+    }
+
+    #[test]
+    fn an_unknown_subprotocol_from_a_live_session_is_dropped_and_surfaced() {
+        let (mut node, anchor) = connected();
+        node.drain_events(); // the Connected event
+        let packet = anchor_packet(&anchor, 1, 0x0F00, 0, true, b"meshdb frame");
+        node.on_datagram(ANCHOR, packet, clock::now());
+        assert_eq!(node.counters().drops(DropReason::UnknownSubprotocol), 1);
+        assert_eq!(
+            node.drain_events(),
+            vec![LeafEvent::Dropped {
+                reason: DropReason::UnknownSubprotocol
+            }]
+        );
+    }
+
+    #[test]
+    fn a_packet_from_a_peer_with_no_session_is_dropped() {
+        let (mut node, anchor) = connected();
+        let packet = anchor_packet(&anchor, 1, 0, 0, true, b"hello");
+        node.on_datagram(0xDEAD, packet, clock::now());
+        assert_eq!(node.counters().drops(DropReason::NoSession), 1);
+    }
+
+    /// An announcement must verify before it can answer a query.
+    #[test]
+    fn query_answers_only_from_verified_announcements() {
+        let (mut node, anchor) = connected();
+        let peer = identity(0x22);
+        let signed = announce::build_announcement(
+            &peer,
+            &["gpu".to_string()],
+            1,
+            clock::now_unix_nanos(),
+            300,
+        )
+        .expect("build");
+
+        // Tampered: refused, counted, and invisible to query.
+        let mut tampered = signed.clone();
+        let at = tampered.len() / 2;
+        tampered[at] ^= 0x01;
+        let packet = anchor_packet(&anchor, 0x1000, 0x1000, 0, true, &tampered);
+        node.on_datagram(ANCHOR, packet, clock::now());
+        assert_eq!(node.counters().drops(DropReason::AnnouncementUnverified), 1);
+        assert_eq!(node.query("gpu"), "[]");
+
+        // Genuine: ingested and queryable.
+        let packet = anchor_packet(&anchor, 0x1000, 0x1000, 0, true, &signed);
+        node.on_datagram(ANCHOR, packet, clock::now());
+        assert!(
+            node.query("gpu").contains(&peer.node_id().to_string()),
+            "a verified announcement must answer its capability"
+        );
+        assert!(node.announcement_for(peer.node_id()).is_some());
+    }
+
+    /// A leaf's own announcement carries the role tags and no
+    /// `reflex_addr`, and its version advances.
+    #[test]
+    fn the_leafs_announcement_is_versioned_and_role_tagged() {
+        let (mut node, _anchor) = connected();
+        let first = node
+            .build_announcement(&["stage5.browser".into()])
+            .expect("build");
+        let verified = announce::verify_announcement(&first).expect("verifies");
+        assert_eq!(verified.version, 1, "the fold rejects generation 0");
+        assert!(verified.capabilities.contains(&"leaf".to_string()));
+        assert!(verified.capabilities.contains(&"transport:rtc".to_string()));
+        assert_eq!(verified.rtc_addr, None);
+
+        let second = node.build_announcement(&[]).expect("build");
+        assert_eq!(
+            announce::verify_announcement(&second)
+                .expect("verifies")
+                .version,
+            2,
+            "each announcement must supersede the last"
+        );
+
+        node.announce_to_peer(ANCHOR, &first).expect("send");
+        let out = node.take_outbound();
+        let parsed = ParsedPacket::parse(out[0].packet.clone(), rtc_addr(0, 1)).expect("parses");
+        assert_eq!(parsed.header.subprotocol_id, SUBPROTOCOL_FOLD);
+    }
+
+    /// Signalling: verified against the sender's announcement, and
+    /// admitted once.
+    #[test]
+    fn a_signal_envelope_needs_a_verified_announcement_and_is_admitted_once() {
+        let (mut node, anchor) = connected();
+        let peer = identity(0x33);
+        let envelope = signal::sign(
+            &peer,
+            node.node_id(),
+            0x99,
+            SignalKind::Offer,
+            b"v=0".to_vec(),
+            clock::now_unix_secs() + 10,
+        );
+        let bytes = signal::encode(&envelope).expect("encode");
+
+        // No announcement for the sender: refused.
+        let packet = anchor_packet(&anchor, 0x0D02, 0x0D02, 0, true, &bytes);
+        node.on_datagram(ANCHOR, packet, clock::now());
+        assert_eq!(node.counters().drops(DropReason::SignalRejected), 1);
+
+        // With its announcement ingested, the same envelope lands.
+        let signed = announce::build_announcement(&peer, &[], 1, clock::now_unix_nanos(), 300)
+            .expect("build");
+        assert!(node.ingest_announcement(&signed));
+        node.drain_events();
+        let packet = anchor_packet(&anchor, 0x0D02, 0x0D02, 0, true, &bytes);
+        node.on_datagram(ANCHOR, packet, clock::now());
+        assert_eq!(
+            node.drain_events(),
+            vec![LeafEvent::Signal(envelope.clone())],
+            "a verified envelope reaches the application"
+        );
+
+        // Replayed: refused by the seen-set.
+        let packet = anchor_packet(&anchor, 0x0D02, 0x0D02, 0, true, &bytes);
+        node.on_datagram(ANCHOR, packet, clock::now());
+        assert_eq!(node.counters().drops(DropReason::SignalRejected), 2);
+    }
+
+    #[test]
+    fn the_event_json_keeps_every_u64_as_a_decimal_string() {
+        let event = LeafEvent::StreamData {
+            stream_id: u64::MAX,
+            seq: 9_007_199_254_740_993,
+            payload: Bytes::from_static(b"\x00\xFF"),
+        };
+        let json = event.to_json();
+        assert!(
+            json.contains(&format!("\"stream_id\":\"{}\"", u64::MAX)),
+            "{json}"
+        );
+        assert!(json.contains("\"seq\":\"9007199254740993\""), "{json}");
+        assert!(json.contains("\"payload\":\"AP8=\""), "base64: {json}");
+    }
+}

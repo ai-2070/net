@@ -327,3 +327,198 @@ fn the_repository_aead_fixture_mirrors_the_package_constant() {
          canonical copy; regenerate the mirror from it"
     );
 }
+
+// ===================================================================
+// Stage 5 — the OTHER direction of the leaf's two second copies.
+//
+// `net-mesh-leaf` compiles to wasm32 and therefore cannot link this
+// crate, so Stage 5 carries a deliberate second WRITER for two
+// documents: the capability announcement and the nRPC client frame.
+// The announcement's reasoning is in the leaf's `announce` module
+// (its verifier is codec-free, so no field of a native announcement
+// can be dropped or reordered by the leaf); the nRPC codec's is in
+// the leaf's `rpc_wire` module (the production codec is not a
+// severable head of `cortex/rpc.rs`).
+//
+// The tests below are the pin from THIS side: the leaf-generated
+// fixtures must decode through the production decoders, re-encode
+// byte-identically, and verify. A one-directional pin is exactly the
+// gap that makes a second copy dangerous — a drift on either side
+// now reddens the other side's suite.
+// ===================================================================
+
+/// The leaf's announcement decodes, re-encodes byte-identically and
+/// verifies through the production `CapabilityAnnouncement`.
+#[test]
+fn the_leaf_generated_announcement_round_trips_through_the_production_codec() {
+    let f = fixture("capability_announcement_leaf.json");
+    let bytes = f["bytes_utf8"].as_str().expect("bytes_utf8");
+
+    let decoded = CapabilityAnnouncement::from_bytes(bytes.as_bytes())
+        .expect("a leaf's announcement must decode with the production decoder");
+
+    // The leaf derives its node id and origin hash from its entity
+    // key; the fixture names both, and the production `EntityId`
+    // derivation must agree — otherwise the leaf would announce one
+    // identity and publish packets under another.
+    let expected_node_id: u64 = f["identity"]["node_id"]
+        .as_str()
+        .expect("identity.node_id")
+        .parse()
+        .expect("node_id is a u64");
+    assert_eq!(decoded.node_id, expected_node_id);
+    assert_eq!(
+        decoded.entity_id.node_id(),
+        expected_node_id,
+        "the leaf's node id must be the core's keyed-BLAKE2s derivation \
+         over the same entity key"
+    );
+
+    // §7's role tags, and the fields a leaf must NOT set.
+    let tags: Vec<String> = decoded
+        .capabilities
+        .tags
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect();
+    for required in ["leaf", "transport:rtc"] {
+        assert!(
+            tags.iter().any(|t| t == required),
+            "a leaf's announcement must carry the {required:?} tag, got {tags:?}"
+        );
+    }
+    assert!(
+        decoded.reflex_addr.is_none(),
+        "§7: a leaf omits reflex_addr — it has no observer-visible socket"
+    );
+    assert!(
+        decoded.rtc_addr.is_none(),
+        "a browser has no server-reflexive socket to advertise"
+    );
+    assert!(
+        decoded.noise_pubkey.is_some(),
+        "§5 Layer 1: the Noise static is what makes first contact possible"
+    );
+    assert_eq!(decoded.hop_count, 0, "a leaf originates at hop 0");
+
+    // The signature the LEAF produced must verify under the CORE's
+    // canonical transcript. This is the load-bearing assertion: it
+    // proves the leaf's hand-written writer and the core's
+    // `SignedPayloadCanonical` agree byte for byte.
+    decoded
+        .verify()
+        .expect("the leaf's signature must verify against the core's canonical transcript");
+
+    let re_encoded = String::from_utf8(decoded.to_bytes()).expect("announcement is UTF-8 JSON");
+    assert_eq!(
+        re_encoded, bytes,
+        "the production encoder produced different bytes than the leaf's — \
+         the two writers have drifted; net-mesh-leaf's `announce` module and \
+         this fixture move together or not at all"
+    );
+}
+
+/// A tampered leaf announcement must fail the production verifier,
+/// so the round trip above is not passing on a signature nobody
+/// checks.
+#[test]
+fn a_tampered_leaf_announcement_fails_the_production_verifier() {
+    let f = fixture("capability_announcement_leaf.json");
+    let bytes = f["bytes_utf8"].as_str().expect("bytes_utf8");
+    let tampered = bytes.replace("\"ttl_secs\":300", "\"ttl_secs\":301");
+    assert_ne!(tampered, bytes, "the substitution must apply");
+    let decoded = CapabilityAnnouncement::from_bytes(tampered.as_bytes()).expect("still decodes");
+    assert!(
+        decoded.verify().is_err(),
+        "one changed signed field must fail verification"
+    );
+}
+
+/// The leaf's nRPC REQUEST frame decodes through the production
+/// `EventMeta` + `RpcRequestPayload` and re-encodes byte-identically.
+#[test]
+fn the_leaf_generated_nrpc_frame_round_trips_through_the_production_codec() {
+    use net::adapter::net::channel::channel_hash;
+    use net::adapter::net::cortex::{
+        decode_rpc_route, encode_rpc_route, peek_request_service, EventMeta, RpcRequestPayload,
+        DISPATCH_RPC_REQUEST, EVENT_META_SIZE, RPC_FRAME_BODY_OFFSET,
+    };
+
+    let f = fixture("nrpc_frame.json");
+    let frame = unhex(&expected_hex(&f));
+
+    let meta = EventMeta::from_bytes(&frame).expect("the EventMeta prefix must decode");
+    assert_eq!(meta.dispatch, DISPATCH_RPC_REQUEST);
+    assert_eq!(meta.flags, 0, "a leaf client is unary only");
+    assert_eq!(
+        meta.origin_hash.to_string(),
+        f["fields"]["origin_hash"].as_str().expect("origin_hash")
+    );
+    assert_eq!(
+        meta.seq_or_ts.to_string(),
+        f["fields"]["call_id"].as_str().expect("call_id"),
+        "the call_id must ride EventMeta::seq_or_ts, where the client's \
+         publish site puts it"
+    );
+    assert_eq!(
+        meta.checksum, 0,
+        "a mesh frame's checksum is zero — the value protects on-disk \
+         RedEX records, and a mesh frame is covered by the packet AEAD"
+    );
+
+    // The RpcRouteV1 discriminator must be the canonical hash of the
+    // channel the fixture names, so mesh ingress selects exactly one
+    // registered dispatcher.
+    let route = decode_rpc_route(&frame).expect("the route discriminator must decode");
+    let channel = f["fields"]["route_channel"]
+        .as_str()
+        .expect("route_channel");
+    assert_eq!(
+        route,
+        channel_hash(channel),
+        "the leaf's route discriminator is not the canonical hash of {channel}"
+    );
+
+    // The payload decodes through the production decoder, including
+    // the header codec and the service peek the serve bridge uses.
+    // `decode` takes the payload region — everything after the
+    // `EventMeta` prefix and the route discriminator.
+    let payload = RpcRequestPayload::decode(Bytes::from(frame[RPC_FRAME_BODY_OFFSET..].to_vec()))
+        .expect("the production decoder must accept the leaf's payload");
+    assert_eq!(
+        payload.service,
+        f["fields"]["service"].as_str().expect("service")
+    );
+    assert_eq!(
+        payload.deadline_ns,
+        f["fields"]["deadline_ns"].as_u64().expect("deadline_ns")
+    );
+    assert_eq!(payload.flags, 0);
+    assert_eq!(
+        payload.headers,
+        vec![(
+            "content-type".to_string(),
+            b"application/octet-stream".to_vec()
+        )]
+    );
+    assert_eq!(payload.body, Bytes::from_static(b"join"));
+    assert_eq!(
+        peek_request_service(&frame),
+        Some(payload.service.as_str()),
+        "the serve bridge's zero-decode service peek must read the leaf's frame"
+    );
+
+    // And the production encoder reproduces the leaf's bytes exactly.
+    let mut rebuilt = Vec::with_capacity(frame.len());
+    rebuilt.extend_from_slice(&meta.to_bytes());
+    encode_rpc_route(&mut rebuilt, route);
+    payload.encode_into(&mut rebuilt);
+    assert_eq!(
+        hex(&rebuilt),
+        expected_hex(&f),
+        "the production nRPC encoder produced different bytes than the \
+         leaf's — the two copies have drifted; net-mesh-leaf's `rpc_wire` \
+         module and this fixture move together or not at all"
+    );
+    assert_eq!(RPC_FRAME_BODY_OFFSET, EVENT_META_SIZE + 8);
+}

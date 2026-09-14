@@ -41,6 +41,14 @@ dashmap = "6"
 # `route_hop.rs`'s keyed BLAKE2s hop MAC, verified in constant time.
 blake2 = "0.11"
 subtle = "2"
+# `channel::name`'s canonical/wire channel hashes. Same version and
+# feature set the core already resolves.
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+# The two moved subprotocol codecs (`channel::membership`,
+# `stream_window`) type their decode failures with `thiserror`, as
+# they did in the core. A hand-written Display here would be a
+# gratuitous divergence from the file that moved.
+thiserror = "2"
 # Seven log sites survive the extraction (crypto x1, reliability x1,
 # session x3, routing codec x2, including the `RouteFlags::from_u8`
 # high-nibble wire-compatibility tripwire). `tracing` is wasm32-clean;

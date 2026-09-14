@@ -3393,9 +3393,11 @@ dependencies = [
  "serde_json",
  "snow",
  "subtle",
+ "thiserror 2.0.20",
  "tracing",
  "wasm-bindgen-test",
  "web-time",
+ "xxhash-rust",
 ]
 
 [[package]]

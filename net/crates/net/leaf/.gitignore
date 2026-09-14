@@ -1,0 +1,11 @@
+# The leaf carries its own `[workspace]`, so it also carries its own
+# target directory.
+/target
+
+# `wasm-bindgen --target web --out-dir pkg` output. Generated from
+# `target/wasm32-unknown-unknown/release/net_leaf.wasm` by the build
+# command in the Stage 5 report; the browser runner and
+# `@net-mesh/browser`'s size script both build it rather than read a
+# committed copy, so a stale bundle can never be what a witness ran
+# against.
+/pkg

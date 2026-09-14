@@ -29,6 +29,22 @@ pub struct PacketBuilder {
     origin_hash: u64,
     /// Channel hash for the current stream (0 if not bound to a channel)
     channel_hash: u16,
+    /// **One-shot** fragment stamp for the next `build*` call:
+    /// `(fragment_id, fragment_offset, frag_flags)`.
+    ///
+    /// Unlike `origin_hash` / `channel_hash`, which are sticky
+    /// per-session properties, this is cleared by every `build*`
+    /// call. A fragment stamp describes ONE packet's position in ONE
+    /// group; leaving it sticky on a pooled builder would silently
+    /// mark the next unrelated packet as a fragment of a group that
+    /// no longer exists, and `aad()` authenticates the field, so the
+    /// receiver could not tell the difference from a legitimate one.
+    ///
+    /// Added in Stage 5 for the browser leaf's fragmentation path
+    /// (`net-mesh-leaf`'s `frame` module is the only reader of
+    /// `frag_flags` in the tree). Default `(0, 0, 0)` reproduces the
+    /// pre-Stage-5 header byte for byte.
+    fragment: (u16, u16, u8),
 }
 
 impl PacketBuilder {
@@ -58,6 +74,7 @@ impl PacketBuilder {
             session_id,
             origin_hash: 0,
             channel_hash: 0,
+            fragment: (0, 0, 0),
         }
     }
 
@@ -70,6 +87,7 @@ impl PacketBuilder {
             session_id,
             origin_hash,
             channel_hash: 0,
+            fragment: (0, 0, 0),
         }
     }
 
@@ -91,6 +109,7 @@ impl PacketBuilder {
             session_id,
             origin_hash,
             channel_hash: 0,
+            fragment: (0, 0, 0),
         }
     }
 
@@ -114,6 +133,23 @@ impl PacketBuilder {
     /// Set the channel hash for outgoing packets
     pub fn set_channel_hash(&mut self, channel_hash: u16) {
         self.channel_hash = channel_hash;
+    }
+
+    /// Stamp the fragment fields on the **next** `build` /
+    /// `build_subprotocol` call, which then clears them.
+    ///
+    /// `flags` is `frag_flags`; `net-mesh-leaf`'s `frame` module
+    /// defines the bits. One-shot by design — see the `fragment`
+    /// field's comment for why sticky would be a correctness bug
+    /// rather than a convenience.
+    pub fn set_fragment(&mut self, fragment_id: u16, fragment_offset: u16, flags: u8) {
+        self.fragment = (fragment_id, fragment_offset, flags);
+    }
+
+    /// Consume the one-shot fragment stamp.
+    #[inline]
+    fn take_fragment(&mut self) -> (u16, u16, u8) {
+        core::mem::replace(&mut self.fragment, (0, 0, 0))
     }
 
     /// Build a packet from events using counter-based encryption.
@@ -170,6 +206,7 @@ impl PacketBuilder {
         // memcpy per TX.
         self.packet.clear();
         self.packet.resize(HEADER_SIZE, 0);
+        let fragment = self.take_fragment();
 
         // Append event frames after the header placeholder. The
         // payload-region length tracked below excludes HEADER_SIZE.
@@ -192,7 +229,8 @@ impl PacketBuilder {
             flags,
         )
         .with_origin(self.origin_hash)
-        .with_channel_hash(self.channel_hash);
+        .with_channel_hash(self.channel_hash)
+        .with_fragment(fragment.0, fragment.1, fragment.2);
         let aad = header.aad();
         let mut header_bytes = header.to_bytes();
 
@@ -275,6 +313,7 @@ impl PacketBuilder {
         // `build()`. See that method for the full rationale.
         self.packet.clear();
         self.packet.resize(HEADER_SIZE, 0);
+        let fragment = self.take_fragment();
 
         EventFrame::write_events(events, &mut self.packet);
         let plaintext_len = self.packet.len() - HEADER_SIZE;
@@ -290,7 +329,8 @@ impl PacketBuilder {
         )
         .with_origin(self.origin_hash)
         .with_channel_hash(self.channel_hash)
-        .with_subprotocol(subprotocol_id);
+        .with_subprotocol(subprotocol_id)
+        .with_fragment(fragment.0, fragment.1, fragment.2);
         let aad = header.aad();
         let mut header_bytes = header.to_bytes();
 
@@ -992,6 +1032,16 @@ impl<'a> ThreadLocalPooledBuilder<'a> {
             .set_channel_hash(channel_hash);
     }
 
+    /// Stamp the fragment fields on the next `build*` call. One-shot
+    /// — see [`PacketBuilder::set_fragment`].
+    #[inline]
+    pub fn set_fragment(&mut self, fragment_id: u16, fragment_offset: u16, flags: u8) {
+        self.builder
+            .as_mut()
+            .expect("BUG: PooledBuilder used after drop")
+            .set_fragment(fragment_id, fragment_offset, flags);
+    }
+
     /// Set the origin hash on the underlying builder so the next
     /// `build*` call stamps it on the outgoing packet header.
     /// Used by the publish path to thread the publisher's chain
@@ -1070,6 +1120,80 @@ mod tests {
         assert_eq!(
             pool.local_capacity(),
             ThreadLocalPool::DEFAULT_LOCAL_CAPACITY
+        );
+    }
+
+    /// **The pre-Stage-5 byte-for-byte guarantee.** `set_fragment`
+    /// was added for the browser leaf; a builder that never calls it
+    /// must emit the header it emitted before the field existed —
+    /// `aad()` authenticates all three fragment fields, so a
+    /// non-zero default would break every native peer's tag.
+    #[test]
+    fn an_unstamped_builder_emits_zero_fragment_fields() {
+        let key = [0x42u8; 32];
+        let mut builder = PacketBuilder::new(&key, 0x1234);
+        let events = [Bytes::from_static(b"payload")];
+
+        for packet in [
+            builder.build(7, 1, &events, PacketFlags::NONE),
+            builder.build_subprotocol(7, 2, &events, PacketFlags::NONE, 0x0A00),
+        ] {
+            let header = NetHeader::from_bytes(&packet).expect("header decodes");
+            assert_eq!(header.fragment_id, 0);
+            assert_eq!(header.fragment_offset, 0);
+            assert_eq!(
+                header.frag_flags, 0,
+                "an unstamped packet must be byte-identical to the \
+                 pre-Stage-5 form"
+            );
+        }
+    }
+
+    /// The stamp lands on the next build and is consumed by it.
+    ///
+    /// One-shot is the correctness property, not a convenience: a
+    /// sticky stamp on a pooled builder would silently mark the next
+    /// unrelated packet as a fragment of a group that no longer
+    /// exists, and the receiver could not tell it from a real one
+    /// because `aad()` covers the field.
+    #[test]
+    fn a_fragment_stamp_applies_once_and_then_clears() {
+        let key = [0x42u8; 32];
+        let mut builder = PacketBuilder::new(&key, 0x1234);
+        let events = [Bytes::from_static(b"piece")];
+
+        builder.set_fragment(0x0A0B, 0x0C0D, 0b11);
+        let stamped = builder.build_subprotocol(7, 1, &events, PacketFlags::NONE, 0);
+        let header = NetHeader::from_bytes(&stamped).expect("decodes");
+        assert_eq!(header.fragment_id, 0x0A0B);
+        assert_eq!(header.fragment_offset, 0x0C0D);
+        assert_eq!(header.frag_flags, 0b11);
+
+        let next = builder.build_subprotocol(7, 2, &events, PacketFlags::NONE, 0);
+        let header = NetHeader::from_bytes(&next).expect("decodes");
+        assert_eq!(
+            (
+                header.fragment_id,
+                header.fragment_offset,
+                header.frag_flags
+            ),
+            (0, 0, 0),
+            "the stamp must not leak into the next packet"
+        );
+
+        // And through the pooled guard, which is what the leaf uses.
+        let pool = ThreadLocalPool::new(2, &key, 0x1234);
+        let mut guard = pool.get();
+        guard.set_fragment(1, 2, 3);
+        let packet = guard.build_subprotocol(7, 3, &events, PacketFlags::NONE, 0);
+        let header = NetHeader::from_bytes(&packet).expect("decodes");
+        assert_eq!(
+            (
+                header.fragment_id,
+                header.fragment_offset,
+                header.frag_flags
+            ),
+            (1, 2, 3)
         );
     }
 

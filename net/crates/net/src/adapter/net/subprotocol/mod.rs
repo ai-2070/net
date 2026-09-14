@@ -11,7 +11,12 @@ mod descriptor;
 pub mod migration_handler;
 mod negotiation;
 mod registry;
-pub mod stream_window;
+// `stream_window` moved to `net-mesh-wire` in Stage 5 (plan §7: the
+// wire-level subprotocol codecs belong to the wire crate; S0a
+// deferred the move until the leaf dispatcher needed it). Re-exported
+// under its previous path so no `use
+// …::subprotocol::stream_window::…` site changed.
+pub use net_wire::stream_window;
 
 /// Subprotocol ID for negotiation messages.
 pub const SUBPROTOCOL_NEGOTIATION: u16 = 0x0600;
