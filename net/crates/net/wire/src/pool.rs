@@ -149,7 +149,7 @@ impl PacketBuilder {
     /// Consume the one-shot fragment stamp.
     #[inline]
     fn take_fragment(&mut self) -> (u16, u16, u8) {
-        core::mem::replace(&mut self.fragment, (0, 0, 0))
+        core::mem::take(&mut self.fragment)
     }
 
     /// Build a packet from events using counter-based encryption.

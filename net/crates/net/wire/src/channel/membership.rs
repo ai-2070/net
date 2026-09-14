@@ -45,7 +45,7 @@ pub enum MembershipMsg {
         channel: ChannelName,
         /// Request correlation nonce — echoed back in `Ack`.
         nonce: u64,
-        /// Serialized [`super::super::identity::PermissionToken`]
+        /// Serialized `super::super::identity::PermissionToken`
         /// presented alongside the subscribe request. `None` / empty
         /// when the sender has no token to offer — the publisher's
         /// `authorize_subscribe` decides whether a token is required.
