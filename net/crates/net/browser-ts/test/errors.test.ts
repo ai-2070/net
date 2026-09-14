@@ -155,3 +155,52 @@ describe('fromWasmError', () => {
     expect(fromWasmError(already)).toBe(already);
   });
 });
+
+describe('enrollment failures', () => {
+  // The property: the §12 admission step routes by PREFIX, and a page's
+  // whole diagnosis rests on telling admission apart from carriage — a
+  // refusal is `identity:` (the anchor answered and said no, or the
+  // invite is unusable), a silent anchor is `rpc:` (nothing answered).
+  //
+  // The sentences below are representative, NOT pinned: the detail text
+  // after the prefix is the leaf's human-facing prose and must stay free
+  // to be reworded. So these assert the kind and that the detail crosses
+  // verbatim, never the wording itself. (The 15 `Display` strings of the
+  // error *enums* are a different matter and are pinned above — those are
+  // the contract.)
+  it.each([
+    'the anchor rejected enrollment: replay (5): that invite was already redeemed',
+    'the anchor rejected enrollment: unknown (42): a code newer than this package',
+    "the credential's invite expired at 1757000000 (now 1757900000)",
+    "the enrollment request is 20000 bytes, over \u00a712's 16384-byte bound",
+  ])('routes an identity-prefixed refusal to identity, detail intact: %s', (detail) => {
+    const error = fromWasmError(new Error(`identity: ${detail}`));
+    expect(error.kind).toBe('identity');
+    expect(error).toBeInstanceOf(IdentityError);
+    if (error instanceof IdentityError) expect(error.detail).toBe(detail);
+  });
+
+  it.each([
+    ["rpc: the call's deadline elapsed", 'rpc-timeout'],
+    ['rpc: the session carrying the call went away', 'session-lost'],
+  ])('keeps %s as transport, not admission', (display, kind) => {
+    // These two ARE pinned: they are `RpcError`'s own `Display`.
+    expect(fromWasmError(new Error(display)).kind).toBe(kind);
+  });
+
+  it('ignores an unrecognised own property, so the Rust side can ship data before TS reads it', () => {
+    // The agreed `EnrollmentRejected` design is "additive on all three
+    // sides, unordered": the leaf may start attaching
+    // `enrollmentCode` to the thrown value before this package grows
+    // the arm that narrows on it. That is only safe if an unknown own
+    // property changes nothing today — routing still by prefix, no
+    // throw, message intact.
+    const thrown = Object.assign(
+      new Error('identity: the anchor rejected enrollment: replay (5): that invite was already redeemed'),
+      { enrollmentCode: 5 },
+    );
+    const error = fromWasmError(thrown);
+    expect(error.kind).toBe('identity');
+    expect(error.message).toBe(thrown.message);
+  });
+});

@@ -27,6 +27,8 @@ for await (const payload of stream) consume(payload);
 node.anchorIdHex();     // the anchor this leaf is bootstrapped to
 node.counters();        // every leaf counter, u64s as exact strings
 await node.signal(peerHex, dialog, 'offer', sdpBytes);  // 0x0D02, no session needed
+await node.enroll();    // connect() already did this; explicit for harnesses
+node.isEnrolled();      // false => the anchor still has this peer provisional
 
 node.close();
 ```
@@ -127,6 +129,31 @@ guess.
 `RpcError::SessionLost` and `RpcError::LeaderLost` are surfaced, never
 retried silently — that is §8's rule for a call whose leader or
 session went away, and the caller is the one who gets to decide.
+
+**Admission is not carriage.** An enrollment refusal is `identity` —
+`identity: the anchor rejected enrollment: replay (5): …`, or an
+expired invite, or a request over §12's 16 384-byte bound — because the
+anchor answered and said no. `control-plane` is for carriage:
+offer/trickle/announcement-publish/signal. An anchor that never
+answered at all is neither: it is `rpc-timeout`. That three-way
+distinction plus `node.isEnrolled()` is how a page tells "my invite was
+already redeemed" from "the anchor is slow" from "the anchor is
+broken", all of which otherwise look like a call that never returned.
+
+**Why `reliability` is required, not defaulted.** The wasm surface
+treats an absent reliability as `reliable`, which is the right default
+there — a stream with nothing said about it genuinely wants
+retransmission, unlike an identity, which has no meaningful default and
+so hard-fails above. But at the wasm boundary an absent key and a
+*misspelled* one are the same thing, so `open_stream({ reliabilty:
+'fireAndForget' })` silently yields a reliable stream. Making
+`reliability` a required field of `OpenStreamOptions` is how this
+package removes that footgun for its callers: a typo is a compile error
+on an object literal. It is not removed for code that builds the
+options object dynamically and widens the type, nor for pages that call
+the wasm surface directly — which is why the leaf also asserts at the
+wire level that a fire-and-forget stream emits packets with the
+`RELIABLE` flag clear.
 
 ## `udp-blocked`: the correction, and what actually establishes it
 
@@ -231,14 +258,31 @@ takes down its siblings nor unwinds into the wasm frame that called it.
 
 ## Identity and the trust boundary
 
-The node's identity is generated inside the wasm leaf from the
+By default the identity is generated inside the wasm leaf from the
 platform CSPRNG: an Ed25519 `EntityKeypair` (which `node_id` and
-`origin_hash` are derived from) plus a Noise X25519 static key. A
-custodial identity can be supplied on the Rust surface
-(`LeafIdentity::from_secrets`, the shape of
-`MeshNodeConfig::entity_keypair`); that path is **not** yet reachable
-through `connect()`'s options, so today a page always gets a
-leaf-generated identity.
+`origin_hash` are derived from) plus a Noise X25519 static key.
+
+**Custodial injection** hands both halves in instead, as 32 bytes of
+hex each:
+
+```typescript
+const node = await connect({ credentialB64, entitySecretHex, noiseSecretHex });
+```
+
+Two pages given the same pair are the same node id — which is how a
+deployment holds the key elsewhere, and how a test forces two tabs
+onto one identity before §8's Web Lock election exists.
+`noiseSecretHex` is read only when `entitySecretHex` is also present,
+so supplying it alone is rejected rather than half-honoured: letting
+the entity half be generated would give two tabs one Noise key and two
+identities.
+
+**An unusable identity option fails loudly.** A secret that is not 64
+hex digits, or a `noiseSecretHex` without its entity half, rejects with
+`IdentityError` (kind `identity`) *before* the leaf is called. It never
+falls through to a generated identity — a silent fallback there reads
+as "the leaf ignores the option", which is two tabs disagreeing about
+who they are with nothing in either log saying why.
 
 **The origin is the trust boundary.** Persisting the identity —
 IndexedDB under a non-extractable WebCrypto AES-GCM key — belongs to

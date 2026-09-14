@@ -12,8 +12,8 @@
 
 /**
  * `LeafNode.connect`'s argument, exactly as the Rust side reads it
- * (`pkg/net_leaf.d.ts`: `{ credentialB64, bootstrapUrl?, origin,
- * iceServers? }`).
+ * (`wasm.rs`: `credentialB64`, `bootstrapUrl?`, `origin`,
+ * `iceServers?`, `entitySecretHex?`, `noiseSecretHex?`).
  */
 export interface LeafWasmConnectOptions {
   /** The bootstrap credential, base64. */
@@ -27,6 +27,13 @@ export interface LeafWasmConnectOptions {
   origin: string;
   /** Extra ICE servers, when the page wants them. */
   iceServers?: readonly RTCIceServer[];
+  /** Custodial Ed25519 entity secret, 32 bytes of hex. */
+  entitySecretHex?: string;
+  /**
+   * Custodial Noise X25519 static secret, 32 bytes of hex. The Rust
+   * side reads it only when `entitySecretHex` is also present.
+   */
+  noiseSecretHex?: string;
 }
 
 /** How a stream behaves. Mirrors the leaf's two stream profiles. */
@@ -56,11 +63,42 @@ export interface LeafWasmStream {
   close(): void;
 }
 
+/**
+ * The stream object a **session**'s `open_stream` resolves to.
+ *
+ * Identical to {@link LeafWasmStream} but for `send`, which is a
+ * promise because on a follower the packet is put on the wire by
+ * another tab.
+ */
+export interface LeafWasmProxyStream {
+  send(payload: Uint8Array): Promise<void>;
+  on_message(callback: (payload: Uint8Array) => void): void;
+  is_reliable(): boolean;
+  stream_id_hex(): string;
+  close(): void;
+}
+
+/** Either stream object, since the wrapper serves both. */
+export type LeafWasmStreamLike = LeafWasmStream | LeafWasmProxyStream;
+
 /** The node object `LeafNode.connect` resolves to. */
 export interface LeafWasmNode {
   node_id_hex(): string;
   /** The anchor's node id, 16 lowercase hex digits. */
   anchor_id_hex(): string;
+  /**
+   * Run the enrollment exchange. `connect` awaits it internally after
+   * the handshake; the explicit method exists so a caller can drive or
+   * observe the step. Until a leaf is enrolled the anchor keeps the
+   * peer provisional and §12 refuses everything above the transport.
+   */
+  enroll(): Promise<void>;
+  /**
+   * Whether the anchor has admitted this leaf. `false` means the
+   * session is still §12-provisional and every call will die on its
+   * deadline, which is a very different fact from a slow anchor.
+   */
+  is_enrolled(): boolean;
   call(service: string, payload: Uint8Array, timeout_ms?: number): Promise<Uint8Array>;
   subscribe(channel: string): Promise<void>;
   publish(channel: string, payload: Uint8Array): Promise<void>;
@@ -83,7 +121,14 @@ export interface LeafWasmNode {
   close(): void;
 }
 
-/** The module `wasm-bindgen --target web` generates. */
+/**
+ * The module `wasm-bindgen --target web` generates.
+ *
+ * `MeshSession` is typed as `unknown` here on purpose: §8's
+ * leader/follower boundary lives in `src/leader/wasm.ts`, which owns
+ * its shape. This file keeps only what the direct surface needs, so
+ * the two cannot drift into two spellings of one contract.
+ */
 export interface LeafWasmModule {
   /**
    * The generated initialiser. Instantiates the `.wasm` next to the
@@ -93,6 +138,11 @@ export interface LeafWasmModule {
   LeafNode: {
     connect(options: LeafWasmConnectOptions): Promise<LeafWasmNode>;
   };
+  /**
+   * §8's surface, refined by `src/leader/wasm.ts`. Absent from a
+   * bundle built before Stage 5 slice 3.
+   */
+  MeshSession?: unknown;
 }
 
 /** Where the wasm comes from. */

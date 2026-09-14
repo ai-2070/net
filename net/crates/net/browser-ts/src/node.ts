@@ -17,7 +17,7 @@ import {
   type LeafEventOf,
   type Unsubscribe,
 } from './events.js';
-import { fromWasmError, RtcError, type LeafError } from './errors.js';
+import { fromWasmError, IdentityError, RtcError, type LeafError } from './errors.js';
 import { LeafStream, type OpenStreamOptions } from './stream.js';
 import {
   classifyRtcError,
@@ -27,7 +27,12 @@ import {
   type StunProbeOptions,
   type StunProbeOutcome,
 } from './udp-probe.js';
-import { loadLeafWasm, type LeafWasmNode, type WasmSource } from './wasm.js';
+import {
+  loadLeafWasm,
+  type LeafWasmConnectOptions,
+  type LeafWasmNode,
+  type WasmSource,
+} from './wasm.js';
 
 /** One node the mesh knows about, from {@link BrowserNode.query}. */
 export interface NodeDescriptor {
@@ -81,6 +86,22 @@ export interface ConnectOptions extends WasmSource {
   /** Extra ICE servers, when the page wants them. */
   iceServers?: readonly RTCIceServer[];
   /**
+   * Custodial identity: the Ed25519 entity secret as 32 bytes of hex.
+   *
+   * Supplied, the leaf builds its identity from this instead of
+   * generating one, so two tabs (or two pages) handed the same secret
+   * are the same node id. Absent, the leaf generates from the platform
+   * CSPRNG.
+   */
+  entitySecretHex?: string;
+  /**
+   * The Noise X25519 static secret as 32 bytes of hex. Only read when
+   * {@link ConnectOptions.entitySecretHex} is also given — the leaf
+   * generates this half otherwise, which would leave two tabs sharing
+   * an entity but not a static key.
+   */
+  noiseSecretHex?: string;
+  /**
    * The `rtc_addr` the anchor publishes, supplied out of band.
    *
    * The STUN probe needs a subject, and before a `connected` event
@@ -125,6 +146,34 @@ export class BrowserNode {
   /** The anchor's mesh id, hex. */
   anchorIdHex(): string {
     return this.inner.anchor_id_hex();
+  }
+
+  /**
+   * Run the enrollment exchange.
+   *
+   * {@link connect} already awaits it, so a page needs this only to
+   * drive or observe the step — a harness proving that an unenrolled
+   * leaf is exactly what a provisional peer looks like, for instance.
+   * Until a leaf is enrolled the anchor keeps its peer provisional and
+   * §12 refuses everything above the transport, which surfaces here as
+   * `rpc-timeout` on calls rather than as a transport failure.
+   */
+  async enroll(): Promise<void> {
+    try {
+      await this.inner.enroll();
+    } catch (error) {
+      throw fromWasmError(error);
+    }
+  }
+
+  /**
+   * Whether the anchor has admitted this leaf. `false` means the
+   * session is still §12-provisional, so a call will die on its
+   * deadline — check this before blaming a `rpc-timeout` on a slow
+   * anchor.
+   */
+  isEnrolled(): boolean {
+    return this.inner.is_enrolled();
   }
 
   /**
@@ -191,13 +240,7 @@ export class BrowserNode {
    * decimal strings because they are `u64` on the Rust side.
    */
   counters(): Record<string, string> {
-    const parsed: unknown = JSON.parse(this.inner.counters_json());
-    if (parsed === null || typeof parsed !== 'object') return {};
-    const out: Record<string, string> = {};
-    for (const [key, value] of Object.entries(parsed)) {
-      out[key] = typeof value === 'string' ? value : String(value);
-    }
-    return out;
+    return parseCounters(this.inner.counters_json());
   }
 
   /** Publish this node's capabilities as a signed fold announcement. */
@@ -292,18 +335,12 @@ export class BrowserNode {
  * failure is classified per {@link BrowserNode.refineIceFailure}.
  */
 export async function connect(options: ConnectOptions): Promise<BrowserNode> {
-  const credentialB64 = resolveCredential(options);
-  const origin = options.origin ?? defaultOrigin();
+  const request = buildConnectRequest(options);
   const failureTyping = options.failureTyping ?? {};
   const wasm = await loadLeafWasm(options);
 
   try {
-    const inner = await wasm.LeafNode.connect({
-      credentialB64,
-      origin,
-      ...(options.bootstrapUrl === undefined ? {} : { bootstrapUrl: options.bootstrapUrl }),
-      ...(options.iceServers ? { iceServers: options.iceServers } : {}),
-    });
+    const inner = await wasm.LeafNode.connect(request);
     return new BrowserNode(inner, options.bootstrapUrl ?? null, failureTyping, options.anchorRtcAddr ?? null);
   } catch (error) {
     throw await refineIceFailure(fromWasmError(error), {
@@ -313,6 +350,42 @@ export async function connect(options: ConnectOptions): Promise<BrowserNode> {
       failureTyping,
     });
   }
+}
+
+/**
+ * Build exactly the options object `LeafNode.connect` reads, credential
+ * resolved, origin defaulted, custodial identity validated.
+ *
+ * Exported because `src/leader/` builds `MeshSession.open`'s options on
+ * top of it: the two surfaces take the same connect keys, and a key
+ * added here must not be silently missing there. A dropped option is
+ * invisible from a page — it has already cost one witness — so the two
+ * share the builder rather than each listing the keys.
+ */
+export function buildConnectRequest(options: ConnectOptions): LeafWasmConnectOptions {
+  return {
+    credentialB64: resolveCredential(options),
+    origin: options.origin ?? defaultOrigin(),
+    ...(options.bootstrapUrl === undefined ? {} : { bootstrapUrl: options.bootstrapUrl }),
+    ...(options.iceServers ? { iceServers: options.iceServers } : {}),
+    ...resolveCustodialIdentity(options),
+  };
+}
+
+/**
+ * Parse a `counters_json()` payload. Values stay strings because they
+ * are `u64` on the Rust side and a JS number would round the large
+ * ones. Exported for the session surface, whose `counters_json` is a
+ * promise but whose payload is identical.
+ */
+export function parseCounters(json: string): Record<string, string> {
+  const parsed: unknown = JSON.parse(json);
+  if (parsed === null || typeof parsed !== 'object') return {};
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(parsed)) {
+    out[key] = typeof value === 'string' ? value : String(value);
+  }
+  return out;
 }
 
 /** What {@link refineIceFailure} is allowed to know. */
@@ -377,6 +450,49 @@ export function parseDescriptors(json: string): NodeDescriptor[] {
     });
   }
   return out;
+}
+
+/** A 32-byte secret is 64 hex digits, nothing else. */
+const SECRET_HEX = /^[0-9a-fA-F]{64}$/;
+
+/**
+ * Validate the custodial identity options and return exactly the keys
+ * the wasm side reads.
+ *
+ * **Loud, never silent.** A malformed secret, or a Noise half without
+ * an entity half, throws {@link IdentityError} here rather than
+ * reaching the leaf — the same rule the Rust side now follows. The
+ * failure this guards against has already cost a witness once: a
+ * dropped or unusable identity option that falls through to a
+ * generated identity looks like two tabs disagreeing about who they
+ * are, with nothing in either log saying why.
+ */
+function resolveCustodialIdentity(options: ConnectOptions): {
+  entitySecretHex?: string;
+  noiseSecretHex?: string;
+} {
+  const { entitySecretHex, noiseSecretHex } = options;
+  if (entitySecretHex === undefined) {
+    if (noiseSecretHex !== undefined) {
+      throw new IdentityError(
+        'noiseSecretHex was supplied without entitySecretHex: the leaf would generate the entity half, ' +
+          'so the identity would not be the one you meant to inject',
+      );
+    }
+    return {};
+  }
+  if (!SECRET_HEX.test(entitySecretHex)) {
+    throw new IdentityError(
+      `entitySecretHex must be 32 bytes of hex (64 hex digits), got ${entitySecretHex.length} characters`,
+    );
+  }
+  if (noiseSecretHex === undefined) return { entitySecretHex };
+  if (!SECRET_HEX.test(noiseSecretHex)) {
+    throw new IdentityError(
+      `noiseSecretHex must be 32 bytes of hex (64 hex digits), got ${noiseSecretHex.length} characters`,
+    );
+  }
+  return { entitySecretHex, noiseSecretHex };
 }
 
 function exactId(value: unknown): string {

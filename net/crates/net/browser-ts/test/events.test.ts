@@ -160,3 +160,51 @@ describe('EventHub', () => {
     await expect(iterator.next()).resolves.toEqual({ value: undefined, done: true });
   });
 });
+
+describe('EventHub, generic over the event union', () => {
+  // §8's session surface is `LeafEvent` plus its lifecycle tags, and it
+  // reuses this fan-out rather than growing a second one beside it. The
+  // seam is only worth having if a wider union really gets typed
+  // delivery and the default really stays exact.
+  interface GenerationFenced {
+    readonly type: 'generation_fenced';
+    readonly presented: string;
+    readonly current: string;
+  }
+  type SessionEvent = LeafEvent | GenerationFenced;
+
+  const parseSessionEvent = (json: string): SessionEvent => {
+    const parsed: unknown = JSON.parse(json);
+    if (parsed !== null && typeof parsed === 'object' && 'type' in parsed && parsed.type === 'generation_fenced') {
+      const fields: Record<string, unknown> = { ...parsed };
+      return {
+        type: 'generation_fenced',
+        presented: String(fields.presented),
+        current: String(fields.current),
+      };
+    }
+    return parseEvent(json);
+  };
+
+  it('delivers a wider union through the same typed fan-out', () => {
+    const hub = new EventHub<SessionEvent>();
+    const fenced: GenerationFenced[] = [];
+    const seen: string[] = [];
+    hub.on('generation_fenced', (event) => fenced.push(event));
+    hub.onAny((event) => seen.push(event.type));
+
+    hub.deliver('{"type":"generation_fenced","presented":"7","current":"8"}', parseSessionEvent);
+    hub.deliver('{"type":"disconnected","reason":"anchor went away"}', parseSessionEvent);
+
+    expect(fenced).toEqual([{ type: 'generation_fenced', presented: '7', current: '8' }]);
+    expect(seen).toEqual(['generation_fenced', 'disconnected']);
+  });
+
+  it('parses with parseEvent when no parser is given, so the default surface is unchanged', () => {
+    const hub = new EventHub();
+    const seen: LeafEvent[] = [];
+    hub.onAny((event) => seen.push(event));
+    hub.deliver('{"type":"disconnected","reason":"default parser"}');
+    expect(seen).toEqual([{ type: 'disconnected', reason: 'default parser' }]);
+  });
+});

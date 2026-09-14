@@ -267,19 +267,24 @@ export type Unsubscribe = () => void;
  * node's lifetime; everything above it is TypeScript. A throwing
  * listener is reported and skipped — it must not take the others down,
  * and it must not unwind into Rust.
+ *
+ * Generic over the event union so §8's session surface, whose union is
+ * `LeafEvent` plus its five lifecycle tags, reuses this fan-out instead
+ * of growing a second one beside it. The default parameter keeps the
+ * direct surface's type exactly as it was.
  */
-export class EventHub {
-  private readonly typed = new Map<string, Set<(event: LeafEvent) => void>>();
-  private readonly any = new Set<(event: LeafEvent) => void>();
-  private readonly queues = new Set<AsyncQueue<LeafEvent>>();
+export class EventHub<E extends { readonly type: string } = LeafEvent> {
+  private readonly typed = new Map<string, Set<(event: E) => void>>();
+  private readonly any = new Set<(event: E) => void>();
+  private readonly queues = new Set<AsyncQueue<E>>();
 
   /** Listen for one tag. */
-  on<T extends LeafEvent['type']>(type: T, handler: (event: LeafEventOf<T>) => void): Unsubscribe {
-    const handlers = this.typed.get(type) ?? new Set<(event: LeafEvent) => void>();
+  on<T extends E['type']>(type: T, handler: (event: Extract<E, { type: T }>) => void): Unsubscribe {
+    const handlers = this.typed.get(type) ?? new Set<(event: E) => void>();
     this.typed.set(type, handlers);
     // Variance the compiler cannot unify: the map erases the tag, and
     // `dispatch` only ever hands a handler the tag it registered for.
-    const erased = handler as (event: LeafEvent) => void;
+    const erased = handler as (event: E) => void;
     handlers.add(erased);
     return () => {
       handlers.delete(erased);
@@ -287,7 +292,7 @@ export class EventHub {
   }
 
   /** Listen for every event. */
-  onAny(handler: (event: LeafEvent) => void): Unsubscribe {
+  onAny(handler: (event: E) => void): Unsubscribe {
     this.any.add(handler);
     return () => {
       this.any.delete(handler);
@@ -303,19 +308,30 @@ export class EventHub {
    * consuming stops paying. A page that starts a loop and never awaits
    * it will grow the buffer; leave the loop instead of abandoning it.
    */
-  events(): AsyncIterableIterator<LeafEvent> {
-    const queue: AsyncQueue<LeafEvent> = new AsyncQueue(() => this.queues.delete(queue));
+  events(): AsyncIterableIterator<E> {
+    const queue: AsyncQueue<E> = new AsyncQueue(() => this.queues.delete(queue));
     this.queues.add(queue);
     return queue;
   }
 
-  /** Feed one raw JSON string in — the wasm callback's only job. */
-  deliver(json: string): void {
-    this.dispatch(parseEvent(json));
+  /**
+   * Feed one raw JSON string in — the wasm callback's only job.
+   *
+   * `parse` defaults to {@link parseEvent}; a surface with a wider
+   * union passes its own parser. Like `parseEvent`, a parser handed
+   * here must never throw: this runs inside a callback the wasm module
+   * invokes, and an exception would unwind through Rust.
+   */
+  deliver(json: string, parse?: (json: string) => E): void {
+    // Without a parser the events are `LeafEvent`s, which is exact for
+    // the default `E` and a subset of any wider union built on it —
+    // the only instantiations that exist. A surface whose union is not
+    // a superset of `LeafEvent` must pass its own parser.
+    this.dispatch(parse ? parse(json) : (parseEvent(json) as unknown as E));
   }
 
   /** Feed one already-parsed event in. */
-  dispatch(event: LeafEvent): void {
+  dispatch(event: E): void {
     for (const handler of this.typed.get(event.type) ?? []) {
       invoke(handler, event);
     }
@@ -338,7 +354,7 @@ export class EventHub {
   }
 }
 
-function invoke(handler: (event: LeafEvent) => void, event: LeafEvent): void {
+function invoke<E>(handler: (event: E) => void, event: E): void {
   try {
     handler(event);
   } catch (error) {

@@ -51,6 +51,65 @@ describe('connect', () => {
     expect(seen.credentialB64).toBe('Y3JlZA==');
   });
 
+  it('forwards a custodial identity, so two pages given one secret are one node', async () => {
+    // The wrapper builds a fixed options object rather than spreading
+    // the caller's bag, so every key the Rust side reads must be named
+    // here. Dropping these silently gave two tabs two different node
+    // ids and cost the two-tabs-one-identity witness its property.
+    const seen: Array<Record<string, unknown>> = [];
+    const module = {
+      LeafNode: {
+        async connect(options: Record<string, unknown>) {
+          seen.push(options);
+          return new FakeNode();
+        },
+      },
+    };
+    const identity = {
+      entitySecretHex: '21'.repeat(32),
+      noiseSecretHex: '22'.repeat(32),
+    };
+    await connect({ ...BASE, ...identity, wasm: module });
+    await connect({ ...BASE, ...identity, wasm: module });
+    expect(seen).toEqual([
+      { ...BASE, ...identity },
+      { ...BASE, ...identity },
+    ]);
+  });
+
+  it('omits the custodial keys entirely when the page did not supply them', async () => {
+    let seen: Record<string, unknown> = {};
+    const module = {
+      LeafNode: {
+        async connect(options: Record<string, unknown>) {
+          seen = options;
+          return new FakeNode();
+        },
+      },
+    };
+    await connect({ ...BASE, wasm: module });
+    expect('entitySecretHex' in seen).toBe(false);
+    expect('noiseSecretHex' in seen).toBe(false);
+  });
+
+  it('fails loudly on an unusable identity option instead of falling through to a generated one', async () => {
+    // A silent fallback here is what made a dropped identity look like
+    // "the leaf ignores the option": two tabs disagreeing about who
+    // they are, with nothing in either log saying why.
+    const inner = new FakeNode();
+    const wasm = fakeModule(inner);
+    await expect(connect({ ...BASE, wasm, entitySecretHex: 'ab12' })).rejects.toMatchObject({
+      kind: 'identity',
+    });
+    await expect(
+      connect({ ...BASE, wasm, entitySecretHex: '21'.repeat(32), noiseSecretHex: 'zz'.repeat(32) }),
+    ).rejects.toMatchObject({ kind: 'identity' });
+    await expect(connect({ ...BASE, wasm, noiseSecretHex: '22'.repeat(32) })).rejects.toMatchObject({
+      kind: 'identity',
+      message: /without entitySecretHex/,
+    });
+  });
+
   it('re-types a rejected connect', async () => {
     const module = failingModule(new Error('control plane: the anchor refused the offer'));
     await expect(connect({ ...BASE, wasm: module })).rejects.toMatchObject({
@@ -145,6 +204,33 @@ describe('BrowserNode', () => {
     ]);
   });
 
+  it('drives the enrollment exchange, reports the state, and re-types a refusal', async () => {
+    const inner = new FakeNode();
+    const node = await connected(inner);
+    // An unenrolled leaf is a §12-provisional peer, and a page must be
+    // able to see that rather than read the resulting rpc-timeout as a
+    // slow anchor.
+    expect(node.isEnrolled()).toBe(false);
+    await node.enroll();
+    expect(inner.enrollments).toBe(1);
+    expect(node.isEnrolled()).toBe(true);
+
+    // An enrollment refusal is admission, not carriage: the leaf emits
+    // `LeafError::Identity`, so the kind is `identity`. `control-plane`
+    // is for offer/trickle/announcement/signal carriage.
+    const refusing = new FakeNode({
+      enrollError: new Error(
+        'identity: the anchor rejected enrollment: replay (5): that invite was already redeemed',
+      ),
+    });
+    const other = await connected(refusing);
+    await expect(other.enroll()).rejects.toMatchObject({
+      kind: 'identity',
+      message: 'identity: the anchor rejected enrollment: replay (5): that invite was already redeemed',
+    });
+    expect(other.isEnrolled()).toBe(false);
+  });
+
   it('subscribes, publishes and announces through the boundary', async () => {
     const inner = new FakeNode();
     const node = await connected(inner);
@@ -181,6 +267,25 @@ describe('BrowserNode', () => {
     const stream = node.openStream({ reliability: 'reliable' });
     stream.close();
     await expect(stream.send(new Uint8Array([1]))).rejects.toMatchObject({ kind: 'session' });
+  });
+
+  it('delivers every stream option to the boundary, not just the ones it reads itself', async () => {
+    // Far-end test, deliberately. Each of these crosses page ->
+    // OpenStreamOptions -> wasm opts -> LeaderRequest::StreamOpen ->
+    // follower, and a field dropped in the middle is invisible from a
+    // page: the leader honours it, the follower silently does not. The
+    // near-end version of this test (does the wrapper accept the field?)
+    // would have passed while the field went nowhere.
+    const inner = new FakeNode();
+    const node = await connected(inner);
+    const options = {
+      reliability: 'fireAndForget',
+      label: 'frames',
+      streamId: '18446744073709551615',
+      channelHash: '9007199254740993',
+    } as const;
+    node.openStream(options);
+    expect(inner.streams[0]?.options).toEqual(options);
   });
 
   it('surfaces leaf events on the typed surface', async () => {

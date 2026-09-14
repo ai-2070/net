@@ -5,7 +5,7 @@
 
 import { AsyncQueue } from './async-queue.js';
 import { fromWasmError, SessionError } from './errors.js';
-import type { LeafWasmStream, StreamReliability } from './wasm.js';
+import type { LeafWasmStreamLike, StreamReliability } from './wasm.js';
 
 /** Options for {@link BrowserNode.openStream}. */
 export interface OpenStreamOptions {
@@ -40,8 +40,14 @@ export class LeafStream implements AsyncIterable<Uint8Array> {
   private readonly pending: Uint8Array[] = [];
   private closed = false;
 
-  /** @internal — built by {@link BrowserNode.openStream}. */
-  constructor(private readonly inner: LeafWasmStream) {
+  /**
+   * @internal — built by `BrowserNode.openStream` (a leader-local
+   * stream, whose `send` is synchronous) or by
+   * `MeshSession.openStream` (a proxied one, whose `send` is a
+   * promise because another tab puts the packet on the wire). A page
+   * writes `await stream.send(bytes)` either way.
+   */
+  constructor(private readonly inner: LeafWasmStreamLike) {
     inner.on_message((payload) => this.receive(payload));
   }
 

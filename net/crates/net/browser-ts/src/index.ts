@@ -14,7 +14,14 @@
  * which a browser bundle must never try to resolve. See the README.
  */
 
-export { connect, BrowserNode, parseDescriptors, refineIceFailure } from './node.js';
+export {
+  connect,
+  BrowserNode,
+  buildConnectRequest,
+  parseCounters,
+  parseDescriptors,
+  refineIceFailure,
+} from './node.js';
 export type { ConnectOptions, FailureTypingOptions, NodeDescriptor } from './node.js';
 
 export { LeafStream } from './stream.js';
@@ -90,10 +97,19 @@ export type {
   LeafWasmConnectOptions,
   LeafWasmModule,
   LeafWasmNode,
+  LeafWasmProxyStream,
   LeafWasmStream,
+  LeafWasmStreamLike,
   LeafWasmStreamOptions,
   StreamReliability,
   WasmSource,
 } from './wasm.js';
 
 export { AsyncQueue } from './async-queue.js';
+
+// §8's leader/follower surface: `openSession`, `MeshSession`, the five
+// lifecycle events and their boundary types. A page that might be open
+// in more than one tab — which is every real page — uses `openSession`
+// rather than `connect`, because two nodes on one origin contend for
+// one identity.
+export * from './leader/index.js';

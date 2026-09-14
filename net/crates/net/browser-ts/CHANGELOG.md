@@ -19,8 +19,9 @@ the README on why it is a sibling package rather than a sub-path.
 ### Added
 
 - **The package.** `connect()`, `BrowserNode` (`call`, `subscribe`,
-  `publish`, `openStream`, `announce`, `query`, `signal`,
-  `anchorIdHex`, `nodeIdHex`, `counters`, `close`), `LeafStream`, and a
+  `publish`, `openStream`, `announce`, `query`, `signal`, `enroll`,
+  `isEnrolled`, `anchorIdHex`, `nodeIdHex`, `counters`, `close`),
+  `LeafStream`, and a
   typed event surface (`on`, `onEvent`, `events()`) over the
   `net-mesh-leaf` wasm node. `query` resolves parsed descriptors
   (`{ nodeId, entityId, capabilities, rtcAddr, noisePubkey, version }`)
@@ -45,6 +46,16 @@ the README on why it is a sibling package rather than a sub-path.
   before its first `connected` event; `connect({ failureTyping: {
   probeOnIceTimeout: false } })` switches the probe off, which means
   `ice-timeout` always.
+
+- **Custodial identity.** `connect({ entitySecretHex, noiseSecretHex })`
+  (32 bytes of hex each) makes the leaf build its identity from those
+  secrets instead of generating one, so two pages given the same pair
+  are the same node id. `noiseSecretHex` is read only alongside
+  `entitySecretHex`. An unusable option — a secret that is not 64 hex
+  digits, or
+  `noiseSecretHex` without its entity half — rejects with
+  `IdentityError` before the leaf is called, never falling through to a
+  generated identity.
 
 - **`npm run size`** — raw and gzipped bytes for the wasm, the
   wasm-bindgen glue, the ESM directory and the single-file bundle, with

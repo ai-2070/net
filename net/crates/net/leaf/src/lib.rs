@@ -53,9 +53,12 @@ pub mod identity;
 /// proxy. Deliberately `web_sys`-free — the browser half is
 /// [`leader_session`] — so the lifecycle is reviewable and tested
 /// without a browser.
+pub mod leader;
 /// The browser half of leader election: the Web Lock, the
 /// `BroadcastChannel` carrier, and `MeshSession` as JavaScript sees
 /// it. `wasm32`-only.
+#[cfg(target_arch = "wasm32")]
+pub mod leader_session;
 /// The genuinely anchorless in-memory `ControlPlane` (slice 6).
 /// Test-only by feature, so a mock cannot become a production path
 /// by accident.
@@ -75,6 +78,8 @@ pub mod signal;
 /// AES-GCM key, plus the fenced generation counter. `wasm32`-only;
 /// the at-rest *format* lives in [`identity`], which is natively
 /// tested.
+#[cfg(target_arch = "wasm32")]
+pub mod storage;
 pub mod stream;
 /// The `cross_lang_wire` golden vectors, carried inside the
 /// package so the wasm test target can replay them (and so an
@@ -98,7 +103,16 @@ pub use dispatch::{Decoded, Subprotocol};
 pub use enroll::{Invite, JoinOutcome};
 pub use error::{LeafError, Result, RpcError, RtcError, UdpBlockedEvidence};
 pub use frame::{Fragment, Reassembler};
-pub use identity::{EntityKeypair, LeafIdentity};
+pub use identity::{
+    EntityKeypair, IdentitySecrets, LeafIdentity, IDENTITY_BLOB_LEN, IDENTITY_BLOB_MAGIC,
+};
+pub use leader::{
+    scope_name, Admission, FollowerEvent, FollowerRegistry, GenerationGate, LeaderBackend,
+    LeaderRequest, ProxyBody, ProxyClient, ProxyEnvelope, ProxyFailure, ProxyOutcome, ProxyServer,
+    ProxySide, ProxyTransport, ProxyValue, RecordingTransport, Replier,
+};
+#[cfg(target_arch = "wasm32")]
+pub use leader_session::{MeshSession, ProxyStream};
 #[cfg(feature = "mock-control-plane")]
 pub use mock_control_plane::{Carried, CarriedKind, MockControlPlane, MockMesh};
 pub use node::{LeafEvent, LeafNode, Outbound, StreamHandle};

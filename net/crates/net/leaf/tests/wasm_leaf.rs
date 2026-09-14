@@ -282,6 +282,54 @@ fn the_nrpc_frame_vector_replays_inside_wasm() {
     assert_eq!(decode_route(&bytes), Some(route));
 }
 
+/// The enrollment request, signed and pinned, inside wasm.
+///
+/// This is the exchange that promotes a session out of PROVISIONAL,
+/// so it is the difference between a browser node that can call a
+/// service and one whose every call dies on its deadline. The
+/// signature is produced by the browser's own Ed25519 code path
+/// here; a byte of drift and the anchor's provider — which
+/// reconstructs the challenge itself — refuses.
+#[wasm_bindgen_test]
+fn the_enrollment_request_replays_inside_wasm() {
+    use net_leaf::enroll::{build_join_request, join_challenge, Invite, JoinOutcome};
+    use net_leaf::identity::verify_entity_signature;
+
+    let f = json(test_vectors::ENROLL_EXCHANGE);
+    let invite = Invite::decode(&unhex(field(&f, "/invite/invite_hex"))).expect("invite decodes");
+    let identity = LeafIdentity::from_secrets(EntityKeypair::from_secret([0x21; 32]), [0x22; 32]);
+    let tags = vec!["browser".to_string(), "leaf".to_string()];
+
+    let body = build_join_request(&identity, "chrome-tab", &tags, &invite).expect("build");
+    assert_eq!(
+        hex(&body),
+        field(&f, "/join_request/join_request_hex"),
+        "the enrollment request differs on wasm32 — the anchor would refuse it \
+         and every session would stay provisional"
+    );
+
+    // magic(4) device(32) nonce(16) root(32) signature(64)
+    let device: [u8; 32] = body[4..36].try_into().expect("device");
+    let signature: [u8; 64] = body[84..148].try_into().expect("signature");
+    let challenge = join_challenge(&device, "chrome-tab", &tags, &invite.nonce, &invite.root);
+    verify_entity_signature(&device, &challenge, &signature)
+        .expect("the browser's own signature must verify against the challenge");
+
+    // Both outcome shapes, decoded by the browser.
+    let admitted = JoinOutcome::decode(&unhex(field(&f, "/join_outcome/admitted_hex")))
+        .expect("admitted decodes");
+    assert_eq!(
+        admitted.into_chain().expect("tag 0 promotes"),
+        field(&f, "/join_outcome/admitted_chain_utf8").as_bytes()
+    );
+    let rejected = JoinOutcome::decode(&unhex(field(&f, "/join_outcome/rejected_hex")))
+        .expect("rejected decodes");
+    assert!(
+        rejected.into_chain().is_err(),
+        "tag 1 must leave the session provisional"
+    );
+}
+
 // ────────────────────────── the clock seam ──────────────────────────
 
 /// Every clock read the leaf makes, on the target where

@@ -61,6 +61,7 @@ export interface FakeNodeBehaviour {
   anchorIdHex?: string;
   countersJson?: string;
   signalError?: unknown;
+  enrollError?: unknown;
   /** Thrown by `call`, as `wasm-bindgen` would: an `Error` with Display text. */
   callError?: unknown;
   callReply?: Uint8Array;
@@ -79,6 +80,8 @@ export class FakeNode implements LeafWasmNode {
   readonly calls: Array<{ service: string; payload: Uint8Array; timeoutMs?: number }> = [];
   readonly streams: FakeStream[] = [];
   readonly signals: Array<{ peerHex: string; dialog: number; kind: string; payload: Uint8Array }> = [];
+  enrollments = 0;
+  enrolled = false;
   closed = false;
   private sink: ((json: string) => void) | null = null;
 
@@ -131,6 +134,16 @@ export class FakeNode implements LeafWasmNode {
   async signal(peer_hex: string, dialog: number, kind: string, payload: Uint8Array): Promise<void> {
     if (this.behaviour.signalError !== undefined) throw this.behaviour.signalError;
     this.signals.push({ peerHex: peer_hex, dialog, kind, payload });
+  }
+
+  async enroll(): Promise<void> {
+    if (this.behaviour.enrollError !== undefined) throw this.behaviour.enrollError;
+    this.enrollments += 1;
+    this.enrolled = true;
+  }
+
+  is_enrolled(): boolean {
+    return this.enrolled;
   }
 
   counters_json(): string {
