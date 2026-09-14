@@ -22,7 +22,7 @@
 //! object, an in-memory mock — forward these blind: it learns
 //! nothing and can tamper with nothing that verifies.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use crate::control_plane::{DialogId, NodeId, SignalEnvelope, SignalKind};
 use crate::error::{LeafError, Result};
@@ -170,12 +170,42 @@ pub fn verify(
         .map_err(|_| LeafError::ControlPlane("signal signature did not verify".into()))
 }
 
-/// The `(from, dialog, kind)` seen-set for the replay window.
+/// A 32-byte digest of an envelope's payload, so two candidates in
+/// one dialog are two facts rather than one repeated fact.
+fn payload_digest(payload: &[u8]) -> [u8; 32] {
+    use blake2::digest::{Digest, consts::U32};
+    let mut hasher = blake2::Blake2s::<U32>::new();
+    hasher.update(payload);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&hasher.finalize());
+    out
+}
+
+/// The hard cap on remembered envelopes (R8).
+///
+/// The set used to be bounded only by what fits inside the lifetime
+/// ceiling, which is a bound on nothing an attacker respects: a peer
+/// that signs envelopes faster than they expire grows it without
+/// limit. At the cap the OLDEST admission is evicted, so the window
+/// is a window.
+pub const MAX_REMEMBERED_SIGNALS: usize = 4096;
+
+/// The exact-replay set for the signalling window.
+///
+/// **Keyed by payload digest as well as dialog and kind** (R8). The
+/// old `(from, dialog, kind)` key made the SECOND legitimate ICE
+/// candidate of a dialog a replay of the first — every dialog was
+/// limited to one candidate per kind, which is not a property
+/// anybody wanted and which silently degraded connectivity to
+/// whatever the first candidate could reach. Only a byte-identical
+/// re-send is a replay now.
 #[derive(Debug, Default)]
 pub struct SeenSignals {
     /// Key → the `not_after` it was admitted under, so a prune needs
     /// no second timestamp.
-    seen: HashMap<(NodeId, DialogId, u8), u64>,
+    seen: HashMap<(NodeId, DialogId, u8, [u8; 32]), u64>,
+    /// Admission order, for the eviction the cap needs.
+    order: VecDeque<(NodeId, DialogId, u8, [u8; 32])>,
 }
 
 impl SeenSignals {
@@ -191,11 +221,31 @@ impl SeenSignals {
     /// [`MAX_SIGNAL_LIFETIME_SECS`] rather than by uptime.
     pub fn admit(&mut self, envelope: &SignalEnvelope, now_unix_secs: u64) -> bool {
         self.seen.retain(|_, not_after| *not_after >= now_unix_secs);
-        let key = (envelope.from, envelope.dialog, envelope.kind.tag());
+        self.order
+            .retain(|key| self.seen.contains_key(key));
+        let key = (
+            envelope.from,
+            envelope.dialog,
+            envelope.kind.tag(),
+            payload_digest(&envelope.payload),
+        );
         if self.seen.contains_key(&key) {
             return false;
         }
+        // The cap is a hard one: evict the oldest admission rather
+        // than grow. An evicted entry can be replayed once more,
+        // which is the honest cost of a bounded window and is why
+        // the bound is thousands rather than tens.
+        while self.seen.len() >= MAX_REMEMBERED_SIGNALS {
+            match self.order.pop_front() {
+                Some(oldest) => {
+                    self.seen.remove(&oldest);
+                }
+                None => break,
+            }
+        }
         self.seen.insert(key, envelope.not_after);
+        self.order.push_back(key);
         true
     }
 
