@@ -2210,6 +2210,35 @@ Also recorded: `anchor serve` registers no enrollment provider (the
 harness supplies one — operational boundary, not a new mandate);
 credentials pinned before an anchor restart are not proven reusable.
 
+**4b repair rounds delivered; head `c40357404` (2026-09-13), CI green
+and the natsim job green for the first time; product owner authorizes
+Stage 5 on top.** `S4B_REPORT.md` §11–12. Kyra's six probes landed
+verbatim (0/6 → 6/6, reviewer re-ran at `c40357404`: listener suite
+22/22). R1 a per-offer CSPRNG attempt token presented as the WebSocket
+subprotocol, checked in a tower layer, retirement token-owned, and
+(round two) the token stops authorizing once the core attempt has
+ended; R2 one shared gate (`validate_size` on the *encoded* bytes +
+`admit_signal_frame`) for native and HTTP ingress, charged to the
+token's random identity, released by the same `release_signal_budget`
+every terminal path uses; R3 credential format v2 with an **Ed25519
+issuer signature** (reporting still names expiry first — accepted
+deviation); R4 a plaintext HTTP-01 ingress bound before ordering
+(second socket — "same listener" is not satisfiable), per-domain cache
+qualified by SAN (authoritative over CN) and the whole validity window,
+a renewal owner with a pacing floor, staged publication, a pebble
+cold-start CI job; R5 redacting `Debug` on request and response, key
+files 0600 at inception with an injectable protection check; R6
+`net.mesh.anchors` served by the ingesting node, Deck attaches a real
+mesh; R7 staged MITM verdict (offer 200 → channel → msg1 → death at the
+pinned key; anything short is `test_error`), nonce-correlated local
+delivery and protected denial, mDNS-on pair formation as its own
+required step, plus the replacement schedule; R8 the native trickle
+signals `rtc.public_addr`, the natsim scenario asserts the selected
+pair's remote **and** `learned == "signalled"`. Recorded, not claimed:
+`anchor serve` registers no enrollment provider; pre-restart
+credentials untested across a process boundary. Stage 5 brief:
+`spikes/S5_BRIEF.md`.
+
 ## Stage 5 — `net-leaf` + `@net-mesh/browser`
 
 - Leaf crate and TypeScript wrapper; identity storage and leader election
