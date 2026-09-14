@@ -5048,10 +5048,26 @@ jobs:
               exit 1
             fi
           done
-          # The cross_lang replay is the named exit criterion; assert
-          # it by name rather than trusting the suite's total.
-          grep -q "cross_lang" /tmp/wasm_leaf.log || {
-            echo "::error::the wasm suite did not run the cross_lang replay"; exit 1; }
+          # The cross_lang replay is the named exit criterion, so
+          # assert the witnesses BY NAME rather than trusting the
+          # suite's total — or a renamed vector would leave the
+          # criterion silently unmet. (The first cut grepped for the
+          # string "cross_lang", which appears in the fixtures' paths
+          # but in none of the test names.)
+          for replay in the_net_header_vector_replays_inside_wasm \
+                        the_routing_header_vector_replays_inside_wasm \
+                        the_event_frame_vector_replays_inside_wasm \
+                        the_stream_control_vectors_replay_inside_wasm \
+                        the_aead_vector_replays_on_the_wasm_backend \
+                        the_leaf_announcement_vector_replays_inside_wasm \
+                        the_nrpc_frame_vector_replays_inside_wasm \
+                        the_enrollment_request_replays_inside_wasm; do
+            grep -q "^test $replay \.\.\. ok$" /tmp/wasm_leaf.log || {
+              echo "::error::the cross_lang replay witness $replay did not run and pass inside wasm"
+              exit 1
+            }
+          done
+          echo "cross_lang replay: 8 vectors replayed inside wasm"
 
       # Exit criterion: the shipped bundle stays under 1.5 MB gzipped.
       - name: Bundle size
