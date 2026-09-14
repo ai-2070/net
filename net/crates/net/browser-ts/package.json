@@ -1,0 +1,54 @@
+{
+  "name": "@net-mesh/browser",
+  "version": "0.36.0",
+  "description": "Browser-native Net mesh leaf — idiomatic TypeScript over the net-mesh-leaf wasm node",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./bundle": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.bundle.js"
+    }
+  },
+  "sideEffects": false,
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ai-2070/net.git"
+  },
+  "keywords": [
+    "net",
+    "mesh",
+    "browser",
+    "webrtc",
+    "datachannel",
+    "wasm",
+    "nrpc",
+    "rust"
+  ],
+  "files": [
+    "dist",
+    "CHANGELOG.md",
+    "LICENSE-APACHE",
+    "LICENSE-MIT"
+  ],
+  "scripts": {
+    "build": "tsc && node scripts/bundle.mjs",
+    "size": "node scripts/size.mjs",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.0",
+    "typescript": "^6.0.0",
+    "vitest": "^5.0.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

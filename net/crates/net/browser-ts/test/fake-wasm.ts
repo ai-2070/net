@@ -1,0 +1,171 @@
+/**
+ * A fake `net-mesh-leaf` module.
+ *
+ * The real wasm is exercised by the Playwright matrix in
+ * `net/crates/net/tests/rtc_browser/`; these unit tests are about the
+ * TypeScript layer — the error re-typing, the event parsing and the
+ * failure classification — so the boundary is faked at exactly the
+ * shape `src/wasm.ts` declares. If the Rust surface changes, `src/`
+ * stops compiling against it and this file stops satisfying the
+ * interface: both are compile-time failures, not silent drift.
+ */
+
+import type {
+  LeafWasmConnectOptions,
+  LeafWasmModule,
+  LeafWasmNode,
+  LeafWasmStream,
+  LeafWasmStreamOptions,
+} from '../src/wasm.js';
+
+export class FakeStream implements LeafWasmStream {
+  readonly sent: Uint8Array[] = [];
+  closed = false;
+  private sink: ((payload: Uint8Array) => void) | null = null;
+
+  constructor(
+    readonly options: LeafWasmStreamOptions,
+    private readonly sendError: unknown = null,
+  ) {}
+
+  send(payload: Uint8Array): void {
+    if (this.sendError !== null) throw this.sendError;
+    this.sent.push(payload);
+  }
+
+  on_message(callback: (payload: Uint8Array) => void): void {
+    this.sink = callback;
+  }
+
+  is_reliable(): boolean {
+    return this.options.reliability === 'reliable';
+  }
+
+  stream_id_hex(): string {
+    return '00000000000000ff';
+  }
+
+  close(): void {
+    this.closed = true;
+  }
+
+  /** Drive an inbound payload from a test. */
+  arrive(payload: Uint8Array): void {
+    this.sink?.(payload);
+  }
+}
+
+/** What a test wants the fake node to do. */
+export interface FakeNodeBehaviour {
+  nodeIdHex?: string;
+  anchorIdHex?: string;
+  countersJson?: string;
+  signalError?: unknown;
+  /** Thrown by `call`, as `wasm-bindgen` would: an `Error` with Display text. */
+  callError?: unknown;
+  callReply?: Uint8Array;
+  queryJson?: string;
+  queryError?: unknown;
+  subscribeError?: unknown;
+  publishError?: unknown;
+  announceError?: unknown;
+  streamSendError?: unknown;
+}
+
+export class FakeNode implements LeafWasmNode {
+  readonly subscribed: string[] = [];
+  readonly published: Array<{ channel: string; payload: Uint8Array }> = [];
+  readonly announced: string[][] = [];
+  readonly calls: Array<{ service: string; payload: Uint8Array; timeoutMs?: number }> = [];
+  readonly streams: FakeStream[] = [];
+  readonly signals: Array<{ peerHex: string; dialog: number; kind: string; payload: Uint8Array }> = [];
+  closed = false;
+  private sink: ((json: string) => void) | null = null;
+
+  constructor(private readonly behaviour: FakeNodeBehaviour = {}) {}
+
+  node_id_hex(): string {
+    return this.behaviour.nodeIdHex ?? 'beefcafe00000001';
+  }
+
+  async call(service: string, payload: Uint8Array, timeout_ms?: number): Promise<Uint8Array> {
+    this.calls.push({ service, payload, ...(timeout_ms === undefined ? {} : { timeoutMs: timeout_ms }) });
+    if (this.behaviour.callError !== undefined) throw this.behaviour.callError;
+    return this.behaviour.callReply ?? new Uint8Array(0);
+  }
+
+  async subscribe(channel: string): Promise<void> {
+    if (this.behaviour.subscribeError !== undefined) throw this.behaviour.subscribeError;
+    this.subscribed.push(channel);
+  }
+
+  async publish(channel: string, payload: Uint8Array): Promise<void> {
+    if (this.behaviour.publishError !== undefined) throw this.behaviour.publishError;
+    this.published.push({ channel, payload });
+  }
+
+  open_stream(options: LeafWasmStreamOptions): LeafWasmStream {
+    const stream = new FakeStream(options, this.behaviour.streamSendError ?? null);
+    this.streams.push(stream);
+    return stream;
+  }
+
+  async announce(capabilities: string[]): Promise<void> {
+    if (this.behaviour.announceError !== undefined) throw this.behaviour.announceError;
+    this.announced.push(capabilities);
+  }
+
+  async query(capability: string): Promise<string> {
+    if (this.behaviour.queryError !== undefined) throw this.behaviour.queryError;
+    return this.behaviour.queryJson ?? `[{"node_id":"1","capabilities":["${capability}"],"rtc_addr":null}]`;
+  }
+
+  on_event(callback: (json: string) => void): void {
+    this.sink = callback;
+  }
+
+  anchor_id_hex(): string {
+    return this.behaviour.anchorIdHex ?? '00000000000000aa';
+  }
+
+  async signal(peer_hex: string, dialog: number, kind: string, payload: Uint8Array): Promise<void> {
+    if (this.behaviour.signalError !== undefined) throw this.behaviour.signalError;
+    this.signals.push({ peerHex: peer_hex, dialog, kind, payload });
+  }
+
+  counters_json(): string {
+    return this.behaviour.countersJson ?? '{"packets_sent":"18446744073709551615","dropped_oversize":"2"}';
+  }
+
+  close(): void {
+    this.closed = true;
+  }
+
+  /** Deliver one event JSON string, as the wasm node would. */
+  emit(json: string): void {
+    if (this.sink === null) throw new Error('no on_event callback registered');
+    this.sink(json);
+  }
+}
+
+/** A module object satisfying `LeafWasmModule`, with no wasm behind it. */
+export function fakeModule(node: FakeNode | (() => FakeNode | Promise<FakeNode>)): LeafWasmModule {
+  return {
+    LeafNode: {
+      async connect(_options: LeafWasmConnectOptions): Promise<LeafWasmNode> {
+        return typeof node === 'function' ? await node() : node;
+      },
+    },
+  };
+}
+
+/** A module whose `connect` rejects the way `wasm-bindgen` would. */
+export function failingModule(error: unknown): LeafWasmModule {
+  return {
+    LeafNode: {
+      connect(): Promise<LeafWasmNode> {
+        return Promise.reject(error);
+      },
+    },
+  };
+}

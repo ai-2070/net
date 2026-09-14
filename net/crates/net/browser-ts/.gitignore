@@ -1,0 +1,3 @@
+# `tsc` + esbuild output, and the leaf wasm the build copies in beside
+# it. CI builds these from source; the repo never carries them.
+dist/
