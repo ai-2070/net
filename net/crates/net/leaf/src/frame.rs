@@ -48,16 +48,12 @@ use net_wire::protocol::{EventFrame, MAX_PAYLOAD_SIZE};
 use crate::counters::{DropReason, LeafCounters};
 use crate::error::{LeafError, Result};
 
-/// `frag_flags` bit 0: this packet carries a piece of a payload that
-/// did not fit one packet. Clear on every unfragmented packet, so an
-/// implementation that ignores the field sees exactly the traffic it
-/// saw before fragmentation existed.
-pub const FRAG_FRAGMENTED: u8 = 0b0000_0001;
-
-/// `frag_flags` bit 1: this is the **final** piece of its group, so
-/// `fragment_offset + payload.len()` is the reassembled length.
-/// Meaningless without [`FRAG_FRAGMENTED`].
-pub const FRAG_LAST: u8 = 0b0000_0010;
+// The interpretation of `frag_flags` now lives beside the header
+// that carries it, in the wire crate, because the native RTC
+// ingress reassembles leaf fragments and the two ends must read one
+// definition. Re-exported here so this module stays the leaf's
+// single fragmentation vocabulary.
+pub use net_wire::protocol::{FRAG_FRAGMENTED, FRAG_LAST};
 
 /// The largest single event that fits in one packet: the payload cap
 /// minus the event frame's 4-byte length prefix.
@@ -145,6 +141,38 @@ pub fn split_payload(payload: &[u8]) -> Result<Vec<Fragment>> {
     Ok(out)
 }
 
+/// Where one inbound piece came from.
+///
+/// The fields a delivered event is attributed to. They are carried
+/// per piece rather than read off whichever packet happened to
+/// complete a group: a group's payload belongs to its **first**
+/// fragment's sequence and header, and synthesising that from the
+/// completing arrival is exactly the defect R7 names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PieceMeta {
+    /// Per-stream sequence the piece's packet carried.
+    pub sequence: u64,
+    /// Stream the piece arrived on.
+    pub stream_id: u64,
+    /// The publisher's full 64-bit origin hash.
+    pub origin_hash: u64,
+    /// The `u16` channel-hash hint.
+    pub channel_hash: u16,
+}
+
+/// A complete payload, and the stream sequences it consumed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Assembled {
+    /// Provenance of the group's **first** piece — the sequence the
+    /// reorder buffer must key this payload under.
+    pub meta: PieceMeta,
+    /// How many stream sequences the group occupies. One for an
+    /// unfragmented packet; the group's sequence span otherwise.
+    pub span: u64,
+    /// The reassembled payload.
+    pub data: Bytes,
+}
+
 /// One partially reassembled group.
 #[derive(Debug)]
 struct Partial {
@@ -157,6 +185,11 @@ struct Partial {
     held: usize,
     /// When the group opened, for the TTL sweep.
     opened: Instant,
+    /// Provenance of the lowest-sequence piece seen so far.
+    first: PieceMeta,
+    /// Highest sequence seen, so the group's span is known without
+    /// assuming the pieces arrived in order.
+    highest_seq: u64,
 }
 
 /// Inbound reassembly, bounded in both directions.
@@ -177,24 +210,34 @@ impl Reassembler {
         self.groups.len()
     }
 
-    /// Offer one inbound piece.
+    /// Drop every group belonging to `scope`.
     ///
-    /// `Some(payload)` when this piece completed its group;
-    /// `None` when the piece was buffered, refused or discarded — in
-    /// which case a counter moved.
+    /// A replaced session restarts its fragment ids at 1, so a
+    /// partial group left behind by the predecessor would be
+    /// indistinguishable from the successor's first group and the two
+    /// would interleave into one corrupt payload. Retiring by scope
+    /// is what keeps a re-handshake from mixing them.
+    pub fn retire(&mut self, scope: u64) {
+        self.groups.retain(|(s, _), _| *s != scope);
+    }
+
+    /// Offer one inbound piece, without sequence context.
     ///
-    /// An unfragmented packet (`flags & FRAG_FRAGMENTED == 0`) is
-    /// returned straight through, so the common path costs one bit
-    /// test and no map lookup.
+    /// The control subprotocols ride the control stream and are not
+    /// reordered, so a fragment of one owns no sequence span; this is
+    /// their entry point, and the pure statement of the reassembly
+    /// contract. Event-plane traffic goes through
+    /// [`Self::accept_piece`], which additionally carries the
+    /// provenance the consumer-side reorder keys on.
     #[expect(
         clippy::too_many_arguments,
-        reason = "the fragment header's four wire fields plus the peer, the \
+        reason = "the fragment header's four wire fields plus the scope, the \
                   clock reading and the counter sink; a struct would only \
                   move the list and add a construction at every call site"
     )]
     pub fn accept(
         &mut self,
-        peer: u64,
+        scope: u64,
         fragment_id: u16,
         offset: u16,
         flags: u8,
@@ -202,11 +245,55 @@ impl Reassembler {
         now: Instant,
         counters: &LeafCounters,
     ) -> Option<Bytes> {
+        self.accept_piece(
+            scope,
+            PieceMeta::default(),
+            fragment_id,
+            offset,
+            flags,
+            data,
+            now,
+            counters,
+        )
+        .map(|assembled| assembled.data)
+    }
+
+    /// Offer one inbound piece carrying its packet's provenance.
+    ///
+    /// `Some(assembled)` when this piece completed its group — with
+    /// the **first** piece's sequence and header, and the number of
+    /// sequences the group consumed. `None` when the piece was
+    /// buffered, refused or discarded, in which case a counter moved.
+    ///
+    /// An unfragmented packet (`flags & FRAG_FRAGMENTED == 0`) is
+    /// returned straight through owning its own single sequence, so
+    /// the common path costs one bit test and no map lookup.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the fragment header's four wire fields plus the scope, the \
+                  arrival's provenance, the clock reading and the counter \
+                  sink; a struct would only move the list"
+    )]
+    pub fn accept_piece(
+        &mut self,
+        scope: u64,
+        meta: PieceMeta,
+        fragment_id: u16,
+        offset: u16,
+        flags: u8,
+        data: Bytes,
+        now: Instant,
+        counters: &LeafCounters,
+    ) -> Option<Assembled> {
         if flags & FRAG_FRAGMENTED == 0 {
-            return Some(data);
+            return Some(Assembled {
+                meta,
+                span: 1,
+                data,
+            });
         }
 
-        let key = (peer, fragment_id);
+        let key = (scope, fragment_id);
         let last = flags & FRAG_LAST != 0;
         let end = offset as usize + data.len();
         if end > MAX_FRAGMENTED_PAYLOAD {
@@ -231,6 +318,8 @@ impl Reassembler {
                     total: None,
                     held: 0,
                     opened: now,
+                    first: meta,
+                    highest_seq: meta.sequence,
                 },
             );
         }
@@ -248,7 +337,16 @@ impl Reassembler {
             s < end && (offset as usize) < e
         }) || partial.pieces.len() >= MAX_FRAGMENTS
             || partial.total.is_some_and(|t| end > t || (last && end != t))
-            || (!last && end > MAX_FRAGMENTED_PAYLOAD);
+            // The declared end binds pieces that arrived BEFORE it.
+            // Checking only pieces that arrive after the LAST fragment
+            // is what let a group hold bytes past its own total while
+            // its prefix was missing, and still assemble because the
+            // held-byte count happened to equal the total.
+            || (last
+                && partial
+                    .pieces
+                    .iter()
+                    .any(|(o, d)| *o as usize + d.len() > end));
         if inconsistent {
             self.groups.remove(&key);
             counters.drop_for(DropReason::ReassemblyInconsistent);
@@ -257,6 +355,10 @@ impl Reassembler {
 
         partial.held += data.len();
         partial.pieces.push((offset, data));
+        if meta.sequence < partial.first.sequence {
+            partial.first = meta;
+        }
+        partial.highest_seq = partial.highest_seq.max(meta.sequence);
         if last {
             partial.total = Some(end);
         }
@@ -265,17 +367,51 @@ impl Reassembler {
         if partial.held != total {
             return None;
         }
-        // Held bytes equal the total and no two pieces overlap, so
-        // coverage of `0..total` is complete. Assemble in offset
-        // order.
         let mut partial = self.groups.remove(&key)?;
         partial.pieces.sort_unstable_by_key(|(o, _)| *o);
+
+        // Prove the coverage rather than infer it from the byte
+        // count: walk the sorted pieces and require each to start
+        // exactly where the last one ended, from zero to the declared
+        // total. Eight pieces at most, so this is cheaper than the
+        // reasoning needed to be sure the byte count implied it.
+        let mut covered = 0usize;
+        for (o, piece) in &partial.pieces {
+            if *o as usize != covered {
+                counters.drop_for(DropReason::ReassemblyInconsistent);
+                return None;
+            }
+            covered += piece.len();
+        }
+        if covered != total {
+            counters.drop_for(DropReason::ReassemblyInconsistent);
+            return None;
+        }
+
+        // The group owns the sequences its fragments arrived on. The
+        // span is the range they cover, bounded by the number of
+        // fragments a group may have — a peer that scattered one
+        // group across a wide sequence range does not get to advance
+        // its stream's reorder cursor by that range.
+        let span = partial
+            .highest_seq
+            .saturating_sub(partial.first.sequence)
+            .saturating_add(1);
+        if span > MAX_FRAGMENTS as u64 {
+            counters.drop_for(DropReason::ReassemblyInconsistent);
+            return None;
+        }
+
         let mut out = BytesMut::with_capacity(total);
         for (_, piece) in &partial.pieces {
             out.extend_from_slice(piece);
         }
         counters.reassembled();
-        Some(out.freeze())
+        Some(Assembled {
+            meta: partial.first,
+            span,
+            data: out.freeze(),
+        })
     }
 
     /// Reap groups older than [`REASSEMBLY_TTL_MS`], counting each.

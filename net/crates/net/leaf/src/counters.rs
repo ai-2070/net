@@ -68,8 +68,17 @@ pub enum DropReason {
     /// deliver the same sequence twice.
     DuplicateSequence,
     /// An nRPC frame whose `call_id` matches nothing in the call
-    /// table — a late reply to a call that already ended.
+    /// table — a late reply to a call that already ended, or one
+    /// whose peer, session incarnation or reply route is not the
+    /// triple the pending call was issued under.
     UnknownCall,
+    /// A stream sequence so far beyond the next expected one that
+    /// admitting it would let one authenticated packet retire an
+    /// arbitrary span of the stream's sequence space.
+    SequenceGapTooLarge,
+    /// A reliable stream whose retransmits were exhausted, or that
+    /// the peer reset. Terminal for that stream.
+    StreamFailed,
 }
 
 impl DropReason {
@@ -91,12 +100,14 @@ impl DropReason {
             Self::SignalRejected => "signal_rejected",
             Self::DuplicateSequence => "duplicate_sequence",
             Self::UnknownCall => "unknown_call",
+            Self::SequenceGapTooLarge => "sequence_gap_too_large",
+            Self::StreamFailed => "stream_failed",
         }
     }
 
     /// Every reason, in declaration order. Used by the snapshot so a
     /// new variant appears in the JSON without a second edit.
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 17] = [
         Self::NotAddressedToUs,
         Self::RoutingExpired,
         Self::UnknownSubprotocol,
@@ -112,6 +123,8 @@ impl DropReason {
         Self::SignalRejected,
         Self::DuplicateSequence,
         Self::UnknownCall,
+        Self::SequenceGapTooLarge,
+        Self::StreamFailed,
     ];
 }
 
@@ -140,6 +153,18 @@ impl LeafCounters {
     pub fn drop_for(&self, reason: DropReason) {
         let slot = &self.drops[reason as usize];
         slot.set(slot.get().saturating_add(1));
+    }
+
+    /// Record `n` drops for one reason in constant time.
+    ///
+    /// A sequence gap is `n` lost packets, and the aggregate must
+    /// say so — but an authenticated peer picks the gap's size, so
+    /// the receive path must not pay a loop iteration per absent
+    /// sequence. One saturating add, whatever `n` is.
+    #[inline]
+    pub fn drop_n(&self, reason: DropReason, n: u64) {
+        let slot = &self.drops[reason as usize];
+        slot.set(slot.get().saturating_add(n));
     }
 
     /// How many drops have been recorded for `reason`.

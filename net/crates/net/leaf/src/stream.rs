@@ -110,12 +110,48 @@ pub fn stream_id_from_label(label: &str) -> u64 {
         | (net_wire::channel::name::channel_hash(label) & 0x0000_FFFF_FFFF_FFFF)
 }
 
+/// The largest sequence jump a single packet may declare.
+///
+/// The sequence is a `u64` an authenticated peer chooses, and the
+/// gap disposition is per-sequence bookkeeping. Without a ceiling a
+/// one-byte packet claiming sequence `u64::MAX` asks the receive
+/// path to account for 2^64 losses; with one, a jump past the
+/// ceiling is refused and counted and the stream keeps its cursor.
+/// 65 536 is three orders of magnitude above the reorder depth a
+/// DataChannel produces and above any burst loss a retransmit
+/// window would leave behind.
+pub const MAX_SEQUENCE_GAP: u64 = 65_536;
+
+/// One delivery and everything it is attributed to.
+///
+/// The reorder buffer holds these rather than bare bytes: a packet
+/// released when a later arrival fills the gap keeps **its own**
+/// sequence, origin and channel, instead of borrowing the metadata
+/// of whichever packet happened to unblock it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamRecord {
+    /// The sequence this delivery owns — the first of its span.
+    pub seq: u64,
+    /// How many stream sequences it consumes. One for an ordinary
+    /// packet; a reassembled group consumes the sequences its
+    /// fragments arrived on.
+    pub span: u64,
+    /// The stream it belongs to.
+    pub stream_id: u64,
+    /// The publisher's full 64-bit origin hash.
+    pub origin_hash: u64,
+    /// The `u16` channel-hash hint from its header.
+    pub channel_hash: u16,
+    /// The events it carries.
+    pub payloads: Vec<Bytes>,
+}
+
 /// The consumer side of one inbound stream.
 #[derive(Debug)]
 pub struct RxStream {
     reliability: Reliability,
     next_expected: u64,
-    held: BTreeMap<u64, Vec<Bytes>>,
+    held: BTreeMap<u64, StreamRecord>,
 }
 
 impl RxStream {
@@ -141,53 +177,67 @@ impl RxStream {
         self.next_expected
     }
 
-    /// How many sequences are held awaiting a gap.
+    /// How many records are held awaiting a gap.
     #[inline]
     pub fn held(&self) -> usize {
         self.held.len()
     }
 
-    /// Offer one packet's events at sequence `seq`.
+    /// Whether `seq` is already owned — delivered, or covered by the
+    /// span of a record still held.
+    fn already_owned(&self, seq: u64) -> bool {
+        if seq < self.next_expected {
+            return true;
+        }
+        self.held
+            .range(..=seq)
+            .next_back()
+            .is_some_and(|(start, rec)| start.saturating_add(rec.span) > seq)
+    }
+
+    /// Offer one delivery record.
     ///
     /// Returns what is now deliverable, **in sequence order** — zero
-    /// entries when the packet was held or dropped, more than one
-    /// when it filled a gap and released everything behind it.
-    pub fn accept(
-        &mut self,
-        seq: u64,
-        events: Vec<Bytes>,
-        counters: &LeafCounters,
-    ) -> Vec<Vec<Bytes>> {
-        if seq < self.next_expected || self.held.contains_key(&seq) {
+    /// entries when the record was held or dropped, more than one
+    /// when it filled a gap and released everything behind it. Each
+    /// returned record is the one that was buffered, carrying the
+    /// sequence and header it arrived with.
+    pub fn accept(&mut self, record: StreamRecord, counters: &LeafCounters) -> Vec<StreamRecord> {
+        let seq = record.seq;
+        if self.already_owned(seq) {
             counters.drop_for(DropReason::DuplicateSequence);
+            return Vec::new();
+        }
+        if seq.saturating_sub(self.next_expected) > MAX_SEQUENCE_GAP {
+            counters.drop_for(DropReason::SequenceGapTooLarge);
             return Vec::new();
         }
 
         if seq > self.next_expected && !self.reliability.is_reliable() {
-            // Fire-and-forget: the gap is a loss, counted per
-            // skipped sequence, and the consumer is not stalled.
-            for _ in self.next_expected..seq {
-                counters.drop_for(DropReason::FireAndForgetGap);
-            }
+            // Fire-and-forget: the gap is a loss, counted once per
+            // skipped sequence but in one arithmetic step, and the
+            // consumer is not stalled.
+            counters.drop_n(DropReason::FireAndForgetGap, seq - self.next_expected);
             self.next_expected = seq;
         }
 
-        self.held.insert(seq, events);
+        self.held.insert(seq, record);
         if self.held.len() > MAX_REORDER_HELD {
             // Abandon the head gap: release from the lowest held
             // sequence rather than hold unboundedly.
             if let Some(lowest) = self.held.keys().next().copied() {
-                for _ in self.next_expected..lowest {
-                    counters.drop_for(DropReason::ReorderBufferFull);
-                }
+                counters.drop_n(
+                    DropReason::ReorderBufferFull,
+                    lowest.saturating_sub(self.next_expected),
+                );
                 self.next_expected = lowest;
             }
         }
 
         let mut out = Vec::new();
-        while let Some(events) = self.held.remove(&self.next_expected) {
-            out.push(events);
-            self.next_expected += 1;
+        while let Some(record) = self.held.remove(&self.next_expected) {
+            self.next_expected = self.next_expected.saturating_add(record.span.max(1));
+            out.push(record);
         }
         out
     }
@@ -197,12 +247,19 @@ impl RxStream {
 mod tests {
     use super::*;
 
-    fn ev(tag: u8) -> Vec<Bytes> {
-        vec![Bytes::from(vec![tag])]
+    fn rec(seq: u64, tag: u8) -> StreamRecord {
+        StreamRecord {
+            seq,
+            span: 1,
+            stream_id: LEAF_STREAM_DISCRIMINATOR | 1,
+            origin_hash: 0xA1 + seq,
+            channel_hash: tag as u16,
+            payloads: vec![Bytes::from(vec![tag])],
+        }
     }
 
-    fn tags(batches: &[Vec<Bytes>]) -> Vec<u8> {
-        batches.iter().map(|b| b[0][0]).collect()
+    fn tags(records: &[StreamRecord]) -> Vec<u8> {
+        records.iter().map(|r| r.payloads[0][0]).collect()
     }
 
     /// The H5 property from `rtc_repairs.rs`, at the unit level:
@@ -213,15 +270,23 @@ mod tests {
         let c = LeafCounters::new();
         let mut s = RxStream::new(Reliability::Reliable);
 
-        assert!(s.accept(2, ev(2), &c).is_empty(), "2 waits for 0 and 1");
-        assert!(s.accept(1, ev(1), &c).is_empty(), "1 waits for 0");
+        assert!(s.accept(rec(2, 2), &c).is_empty(), "2 waits for 0 and 1");
+        assert!(s.accept(rec(1, 1), &c).is_empty(), "1 waits for 0");
         assert_eq!(s.held(), 2);
 
-        let released = s.accept(0, ev(0), &c);
+        let released = s.accept(rec(0, 0), &c);
         assert_eq!(
-            tags(&released),
-            vec![0, 1, 2],
-            "filling the head gap must release everything behind it, in order"
+            released
+                .iter()
+                .map(|r| (r.seq, r.payloads[0][0]))
+                .collect::<Vec<_>>(),
+            vec![(0, 0), (1, 1), (2, 2)],
+            "each released record keeps its own sequence, not the gap-filling arrival's"
+        );
+        assert_eq!(
+            released.iter().map(|r| r.origin_hash).collect::<Vec<_>>(),
+            vec![0xA1, 0xA2, 0xA3],
+            "and its own header provenance"
         );
         assert_eq!(s.held(), 0);
         assert_eq!(s.next_expected(), 3);
@@ -232,11 +297,11 @@ mod tests {
     fn a_reliable_stream_holds_a_gap_rather_than_delivering_past_it() {
         let c = LeafCounters::new();
         let mut s = RxStream::new(Reliability::Reliable);
-        assert_eq!(tags(&s.accept(0, ev(0), &c)), vec![0]);
-        assert!(s.accept(2, ev(2), &c).is_empty());
-        assert!(s.accept(3, ev(3), &c).is_empty());
+        assert_eq!(tags(&s.accept(rec(0, 0), &c)), vec![0]);
+        assert!(s.accept(rec(2, 2), &c).is_empty());
+        assert!(s.accept(rec(3, 3), &c).is_empty());
         assert_eq!(s.next_expected(), 1, "the stream is waiting for 1");
-        assert_eq!(tags(&s.accept(1, ev(1), &c)), vec![1, 2, 3]);
+        assert_eq!(tags(&s.accept(rec(1, 1), &c)), vec![1, 2, 3]);
     }
 
     /// Fire-and-forget's whole point: a gap does not stall.
@@ -244,9 +309,9 @@ mod tests {
     fn fire_and_forget_skips_a_gap_and_counts_every_lost_sequence() {
         let c = LeafCounters::new();
         let mut s = RxStream::new(Reliability::FireAndForget);
-        assert_eq!(tags(&s.accept(0, ev(0), &c)), vec![0]);
+        assert_eq!(tags(&s.accept(rec(0, 0), &c)), vec![0]);
 
-        let out = s.accept(4, ev(4), &c);
+        let out = s.accept(rec(4, 4), &c);
         assert_eq!(
             tags(&out),
             vec![4],
@@ -265,10 +330,10 @@ mod tests {
     fn a_late_arrival_after_a_fire_and_forget_skip_is_dropped_as_a_duplicate() {
         let c = LeafCounters::new();
         let mut s = RxStream::new(Reliability::FireAndForget);
-        s.accept(0, ev(0), &c);
-        s.accept(4, ev(4), &c);
+        s.accept(rec(0, 0), &c);
+        s.accept(rec(4, 4), &c);
         assert!(
-            s.accept(2, ev(2), &c).is_empty(),
+            s.accept(rec(2, 2), &c).is_empty(),
             "a sequence the stream already skipped past cannot be delivered"
         );
         assert_eq!(c.drops(DropReason::DuplicateSequence), 1);
@@ -278,16 +343,16 @@ mod tests {
     fn a_retransmitted_duplicate_is_delivered_once() {
         let c = LeafCounters::new();
         let mut s = RxStream::new(Reliability::Reliable);
-        assert_eq!(tags(&s.accept(0, ev(0), &c)), vec![0]);
+        assert_eq!(tags(&s.accept(rec(0, 0), &c)), vec![0]);
         assert!(
-            s.accept(0, ev(0), &c).is_empty(),
+            s.accept(rec(0, 0), &c).is_empty(),
             "the same sequence must never be delivered twice"
         );
         assert_eq!(c.drops(DropReason::DuplicateSequence), 1);
 
         // A duplicate of a HELD (not yet delivered) sequence too.
-        assert!(s.accept(2, ev(2), &c).is_empty());
-        assert!(s.accept(2, ev(2), &c).is_empty());
+        assert!(s.accept(rec(2, 2), &c).is_empty());
+        assert!(s.accept(rec(2, 2), &c).is_empty());
         assert_eq!(c.drops(DropReason::DuplicateSequence), 2);
     }
 
@@ -298,14 +363,14 @@ mod tests {
         let mut s = RxStream::new(Reliability::Reliable);
         // Sequence 0 never arrives; 1..=MAX_REORDER_HELD do.
         for seq in 1..=MAX_REORDER_HELD as u64 {
-            assert!(s.accept(seq, ev(1), &c).is_empty(), "seq {seq} must hold");
+            assert!(s.accept(rec(seq, 1), &c).is_empty(), "seq {seq} must hold");
         }
         assert_eq!(s.held(), MAX_REORDER_HELD);
         assert_eq!(s.next_expected(), 0, "still waiting for 0");
         assert_eq!(c.total_drops(), 0);
 
         // One more, and the head gap is abandoned.
-        let released = s.accept(MAX_REORDER_HELD as u64 + 1, ev(2), &c);
+        let released = s.accept(rec(MAX_REORDER_HELD as u64 + 1, 2), &c);
         assert_eq!(
             released.len(),
             MAX_REORDER_HELD + 1,
@@ -338,11 +403,16 @@ mod tests {
     fn leaf_stream_ids_cannot_alias_the_publish_or_subprotocol_spaces() {
         let id = stream_id_from_label("app/telemetry");
         assert_eq!(id & LEAF_STREAM_DISCRIMINATOR, LEAF_STREAM_DISCRIMINATOR);
-        // The guarantee that actually holds: out of the subprotocol
-        // id range, unconditionally. NOT asserted: that bit 48 is
-        // clear — `stream_id_from_label` ORs bit 49 into a full
-        // 64-bit hash, so bit 48 carries whatever the hash had, and
-        // asserting otherwise would pin an accident of this label.
+        // Bit 48 — the native publisher-stream discriminator — is
+        // MASKED OFF, unconditionally. That is what lets a receiver
+        // tell a channel publication from a leaf stream by the
+        // namespace rather than by one bit of a hash that both
+        // formulas leave to chance.
+        assert_eq!(
+            id & crate::channel::PUBLISH_STREAM_DISCRIMINATOR,
+            0,
+            "a leaf stream id must never carry the publish discriminator"
+        );
         assert!(
             id > 0x1_0000,
             "a leaf stream id must never land in the subprotocol id range"

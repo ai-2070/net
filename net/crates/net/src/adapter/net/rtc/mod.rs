@@ -29,6 +29,7 @@ mod admission;
 mod config;
 mod driver;
 mod engine;
+mod fragment;
 #[cfg(any(test, feature = "fixtures"))]
 mod loopback;
 mod signal;
@@ -53,6 +54,9 @@ pub use driver::{RtcDriver, RtcDriverHandle, RtcSignal};
 pub use driver::{RtcInstallPause, RtcTestHooks};
 pub use engine::{
     expire_dialogs, handle_signal, start_dialog, Dialog, DialogTable, SharedDialogs, SignalOutcome,
+};
+pub use fragment::{
+    FragmentOutcome, RtcReassembly, GROUP_TTL, MAX_GROUPS_PER_SESSION, MAX_REASSEMBLED_BYTES,
 };
 #[cfg(any(test, feature = "fixtures"))]
 pub use loopback::{connect_rtc_loopback, open_rtc_channel};

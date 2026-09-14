@@ -19,16 +19,23 @@
 //! handshake. This module takes the key as an argument and never
 //! fetches one.
 
-use std::cell::Cell;
-use std::collections::HashMap;
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use net_wire::crypto::{handshake_prologue, NoiseHandshake, StaticKeypair};
 use net_wire::parsed_packet::ParsedPacket;
 use net_wire::peer_addr::{PeerAddr, RtcPeerId};
 use net_wire::pool::PacketBuilder;
-use net_wire::protocol::{EventFrame, PacketFlags};
+use net_wire::protocol::{EventFrame, PacketFlags, HEADER_SIZE, TAG_SIZE};
+use net_wire::reliability::RetransmitDescriptor;
 use net_wire::session::NetSession;
+use net_wire::stream_window::{
+    StreamAckRanges, StreamNack, StreamWindow, SUBPROTOCOL_STREAM_ACK, SUBPROTOCOL_STREAM_NACK,
+    SUBPROTOCOL_STREAM_RESET, SUBPROTOCOL_STREAM_WINDOW,
+};
 
 use crate::control_plane::NodeId;
 use crate::error::{LeafError, Result};
@@ -41,6 +48,61 @@ use crate::frame::split_payload;
 /// fragments while another is in flight without reserving 8 KiB ×
 /// pool-size per peer.
 const POOL_SIZE: usize = 4;
+
+/// Retransmit stamps a session retains at once.
+///
+/// A stamp is the header a retransmitted packet must be rebuilt
+/// with. It is retired when the peer's cumulative ack passes its
+/// sequence, so the live set is the reliable window; the cap is the
+/// backstop for a peer that never acks, at ~32 bytes an entry.
+const MAX_RETRANSMIT_STAMPS: usize = 1_024;
+
+/// Process-wide session incarnation counter.
+///
+/// Every installed session gets an id no replaced session can ever
+/// hold again. Receive, reorder, reassembly and call-ownership state
+/// key on it, which is what makes "the old session's work" a set the
+/// node can retire exactly once — a peer node id cannot express that,
+/// because the successor has the same one.
+static NEXT_INCARNATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_incarnation() -> u64 {
+    NEXT_INCARNATION.fetch_add(1, Ordering::Relaxed)
+}
+
+/// On-wire bytes one packet carrying `event_bytes` of framed events
+/// costs, which is the unit both credit halves count in.
+///
+/// `mesh.rs::wire_bytes_for_payload`, reproduced because the two
+/// ends must agree: the native sender debits
+/// `events + HEADER_SIZE + TAG_SIZE` and the native receiver credits
+/// the same quantity, so a leaf that counted body bytes alone would
+/// drift its peer's window by 84 bytes a packet.
+#[inline]
+fn wire_bytes(event_bytes: usize) -> u32 {
+    event_bytes
+        .saturating_add(HEADER_SIZE + TAG_SIZE)
+        .min(u32::MAX as usize) as u32
+}
+
+/// The framed size of one event inside a packet's payload.
+#[inline]
+pub fn event_frame_bytes(events: &[Bytes]) -> usize {
+    events.iter().map(|e| EventFrame::LEN_SIZE + e.len()).sum()
+}
+
+/// Whether `subprotocol_id` is one of the four stream-control
+/// messages — the credit and reliability feedback loop itself.
+#[inline]
+pub fn is_stream_control(subprotocol_id: u16) -> bool {
+    matches!(
+        subprotocol_id,
+        SUBPROTOCOL_STREAM_WINDOW
+            | SUBPROTOCOL_STREAM_NACK
+            | SUBPROTOCOL_STREAM_RESET
+            | SUBPROTOCOL_STREAM_ACK
+    )
+}
 
 /// The 32-bit routing projection of a node id — `mesh.rs`'s
 /// `routing_id`, which both halves of the handshake feed into the
@@ -136,11 +198,10 @@ impl PendingHandshake {
             .handshake
             .into_session_keys()
             .map_err(|e| LeafError::Session(format!("session keys: {e}")))?;
-        Ok(LeafSession {
-            peer: self.peer,
-            session: NetSession::new(keys, self.addr, POOL_SIZE, false),
-            next_fragment_id: Cell::new(1),
-        })
+        Ok(LeafSession::install(
+            self.peer,
+            NetSession::new(keys, self.addr, POOL_SIZE, false),
+        ))
     }
 
     /// The **responder** half: consume a peer's Noise message 1 and
@@ -205,11 +266,7 @@ impl PendingHandshake {
             .into_session_keys()
             .map_err(|e| LeafError::Session(format!("session keys: {e}")))?;
         Ok((
-            LeafSession {
-                peer: initiator,
-                session: NetSession::new(keys, addr, POOL_SIZE, false),
-                next_fragment_id: Cell::new(1),
-            },
+            LeafSession::install(initiator, NetSession::new(keys, addr, POOL_SIZE, false)),
             packet,
         ))
     }
@@ -241,19 +298,64 @@ pub struct OpenedPacket {
     pub events: Vec<Bytes>,
 }
 
+/// The header one retransmitted packet must be rebuilt with.
+///
+/// `RetransmitDescriptor` carries the stream, sequence, events and
+/// flags — everything the wire layer needs to decide *whether* to
+/// resend, and nothing that says where the packet was addressed on
+/// the event plane. A leaf packet's channel hint, origin hash and
+/// fragment position all live in the header and are authenticated by
+/// the AEAD, so a rebuild that dropped them would arrive as a
+/// differently-addressed, differently-positioned packet. The sender
+/// keeps them beside the wire window and retires them on ack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PacketStamp {
+    subprotocol_id: u16,
+    channel_hash: u16,
+    origin_hash: u64,
+    fragment_id: u16,
+    fragment_offset: u16,
+    frag_flags: u8,
+}
+
 /// One established session with one peer.
 #[derive(Debug)]
 pub struct LeafSession {
     peer: NodeId,
     session: NetSession,
     next_fragment_id: Cell<u16>,
+    /// This session's process-unique incarnation.
+    incarnation: u64,
+    /// Rebuild headers for packets still in the retransmit window,
+    /// keyed `(stream_id, sequence)`.
+    stamps: RefCell<BTreeMap<(u64, u64), PacketStamp>>,
 }
 
 impl LeafSession {
+    /// Wrap a freshly negotiated wire session, minting its
+    /// incarnation.
+    fn install(peer: NodeId, session: NetSession) -> Self {
+        Self {
+            peer,
+            session,
+            next_fragment_id: Cell::new(1),
+            incarnation: next_incarnation(),
+            stamps: RefCell::new(BTreeMap::new()),
+        }
+    }
+
     /// The peer's node id.
     #[inline]
     pub fn peer(&self) -> NodeId {
         self.peer
+    }
+
+    /// This session's incarnation — unique for the life of the
+    /// process, so a replacement never collides with what it
+    /// replaced.
+    #[inline]
+    pub fn incarnation(&self) -> u64 {
+        self.incarnation
     }
 
     /// The session id both halves derived from the handshake.
@@ -292,6 +394,16 @@ impl LeafSession {
     /// Each packet consumes one stream sequence, which is what makes
     /// the consumer-side reorder work: fragments of one payload are
     /// contiguous sequences on the same stream.
+    ///
+    /// **This is where the wire's send-side machinery is driven.**
+    /// The whole payload is admitted against the stream's send
+    /// credit **before** any sequence is consumed — a fragmented
+    /// message is admitted whole or refused whole, synchronously and
+    /// bounded, never half-sent — and every reliable packet is
+    /// registered with the stream's reliability mode together with
+    /// the header a retransmit must be rebuilt with. Sharing
+    /// `NetSession` does not do either of these by itself: the wire
+    /// APIs are passive and want a driver.
     pub fn build_packets(
         &self,
         stream_id: u64,
@@ -314,17 +426,224 @@ impl LeafSession {
         };
         self.session.open_stream_with(stream_id, reliable, 1);
 
+        // The stream-control subprotocols carry the credit loop
+        // itself. Gating a grant or an ack on the credit it exists
+        // to replenish would deadlock the stream it is refilling, so
+        // they ride outside the window — the same reason the receive
+        // path does not reorder them.
+        if !is_stream_control(subprotocol_id) {
+            let needed: u32 = fragments
+                .iter()
+                .map(|f| wire_bytes(EventFrame::LEN_SIZE + f.data.len()))
+                .fold(0u32, u32::saturating_add);
+            let admitted = {
+                let stream = self.session.get_or_create_stream(stream_id);
+                if stream.try_acquire_tx_credit(needed) {
+                    None
+                } else {
+                    Some(stream.tx_credit_remaining())
+                }
+            };
+            if let Some(remaining) = admitted {
+                return Err(LeafError::Backpressure {
+                    stream_id,
+                    needed,
+                    remaining,
+                });
+            }
+        }
+
         let mut out = Vec::with_capacity(fragments.len());
         for fragment in fragments {
+            let offset = fragment.offset;
+            let frag_flags = fragment.flags;
             let seq = self.session.get_or_create_stream(stream_id).next_tx_seq();
             let events = [fragment.data];
             let mut builder = self.session.thread_local_pool().get();
             builder.set_channel_hash(channel_hash);
             builder.set_origin_hash(origin_hash);
-            builder.set_fragment(fragment_id, fragment.offset, fragment.flags);
+            builder.set_fragment(fragment_id, offset, frag_flags);
             out.push(builder.build_subprotocol(stream_id, seq, &events, flags, subprotocol_id));
+
+            if reliable {
+                self.retain_retransmit(
+                    stream_id,
+                    seq,
+                    &events,
+                    flags,
+                    PacketStamp {
+                        subprotocol_id,
+                        channel_hash,
+                        origin_hash,
+                        fragment_id,
+                        fragment_offset: offset,
+                        frag_flags,
+                    },
+                );
+            }
         }
         Ok(out)
+    }
+
+    /// Hand one just-built reliable packet to the stream's
+    /// reliability mode, and keep the header its rebuild needs.
+    fn retain_retransmit(
+        &self,
+        stream_id: u64,
+        seq: u64,
+        events: &[Bytes],
+        flags: PacketFlags,
+        stamp: PacketStamp,
+    ) {
+        let descriptor = Arc::new(RetransmitDescriptor {
+            seq,
+            stream_id,
+            events: events.to_vec(),
+            flags,
+        });
+        let Some(stream) = self.session.try_stream(stream_id) else {
+            return;
+        };
+        stream.with_reliability(|r| r.on_send(descriptor));
+        drop(stream);
+        let mut stamps = self.stamps.borrow_mut();
+        stamps.insert((stream_id, seq), stamp);
+        while stamps.len() > MAX_RETRANSMIT_STAMPS {
+            let Some(oldest) = stamps.keys().next().copied() else {
+                break;
+            };
+            stamps.remove(&oldest);
+        }
+    }
+
+    /// Retire the stamps for every sequence below `ack_seq` on
+    /// `stream_id` — the peer has them, so they can never be rebuilt.
+    pub fn retire_acked_stamps(&self, stream_id: u64, ack_seq: u64) {
+        let mut stamps = self.stamps.borrow_mut();
+        let stale: Vec<(u64, u64)> = stamps
+            .range((stream_id, 0)..(stream_id, ack_seq))
+            .map(|(k, _)| *k)
+            .collect();
+        for key in stale {
+            stamps.remove(&key);
+        }
+    }
+
+    /// Rebuild `descriptors` into packets with fresh AEAD counters.
+    ///
+    /// A retransmit cannot replay the original ciphertext — the
+    /// receiver's replay window refuses the repeated counter — so
+    /// each packet is rebuilt from the descriptor's pre-encryption
+    /// events plus the header stamp retained at send time.
+    pub fn rebuild(&self, descriptors: &[Arc<RetransmitDescriptor>]) -> Vec<Bytes> {
+        let stamps = self.stamps.borrow();
+        let mut out = Vec::with_capacity(descriptors.len());
+        for d in descriptors {
+            let Some(stamp) = stamps.get(&(d.stream_id, d.seq)) else {
+                // No stamp means the packet's header is gone: a
+                // rebuild would be a differently-addressed packet,
+                // which is worse than not resending.
+                continue;
+            };
+            let mut builder = self.session.thread_local_pool().get();
+            builder.set_channel_hash(stamp.channel_hash);
+            builder.set_origin_hash(stamp.origin_hash);
+            builder.set_fragment(stamp.fragment_id, stamp.fragment_offset, stamp.frag_flags);
+            out.push(builder.build_subprotocol(
+                d.stream_id,
+                d.seq,
+                &d.events,
+                d.flags,
+                stamp.subprotocol_id,
+            ));
+        }
+        out
+    }
+
+    /// Every reliable packet whose retransmit timer has expired,
+    /// rebuilt and ready for the transport.
+    pub fn due_retransmits(&self) -> Vec<Bytes> {
+        let due = self.session.collect_timed_out_retransmits();
+        if due.is_empty() {
+            return Vec::new();
+        }
+        self.rebuild(&due)
+    }
+
+    /// Record one accepted inbound packet against the wire's
+    /// receive state, and return the grant owed to its sender.
+    ///
+    /// `None` when the reliability layer refused the sequence (a
+    /// duplicate, or past its acceptance horizon): crediting those
+    /// bytes would refund the sender window for traffic that never
+    /// became progress.
+    pub fn note_received(
+        &self,
+        stream_id: u64,
+        reliable: bool,
+        sequence: u64,
+        event_bytes: usize,
+    ) -> Option<StreamWindow> {
+        let stream = self
+            .session
+            .get_or_create_stream_for_packet(stream_id, reliable);
+        if !stream.with_reliability(|r| r.on_receive(sequence)) {
+            return None;
+        }
+        stream.update_rx_seq(sequence);
+        let total_consumed = stream.on_bytes_consumed(u64::from(wire_bytes(event_bytes)))?;
+        let ack_seq = stream.with_reliability(|r| r.rx_ack_seq());
+        stream.note_grant_sent();
+        Some(StreamWindow {
+            stream_id,
+            total_consumed,
+            ack_seq,
+        })
+    }
+
+    /// Apply a peer's cumulative ack: prune the retransmit window
+    /// and the stamps that belong to it.
+    pub fn apply_ack(&self, stream_id: u64, ack_seq: u64) {
+        if let Some(stream) = self.session.try_stream(stream_id) {
+            stream.with_reliability(|r| r.on_ack(ack_seq));
+        }
+        self.retire_acked_stamps(stream_id, ack_seq);
+    }
+
+    /// Apply a peer's SACK ranges, then its cumulative ack.
+    pub fn apply_ack_ranges(&self, ack: &StreamAckRanges) {
+        if let Some(stream) = self.session.try_stream(ack.stream_id) {
+            stream.with_reliability(|r| r.on_ack_ranges(ack.ack_seq, &ack.ranges));
+        }
+        self.retire_acked_stamps(ack.stream_id, ack.ack_seq);
+    }
+
+    /// The packets a peer's NACK asks this session to resend.
+    pub fn nack_retransmits(&self, nack: &StreamNack) -> Vec<Bytes> {
+        let payload = net_wire::protocol::NackPayload {
+            next_expected: nack.next_expected,
+            missing_bitmap: nack.missing_bitmap,
+        };
+        let Some(stream) = self.session.try_stream(nack.stream_id) else {
+            return Vec::new();
+        };
+        let due = stream.with_reliability(|r| r.on_nack(&payload));
+        drop(stream);
+        self.rebuild(&due)
+    }
+
+    /// The NACKs this session's receive side owes its peer — one per
+    /// stream currently missing a sequence.
+    pub fn gap_nacks(&self) -> Vec<StreamNack> {
+        self.session
+            .collect_gap_reports(false, 0)
+            .into_iter()
+            .map(|report| StreamNack {
+                stream_id: report.stream_id,
+                next_expected: report.nack.next_expected,
+                missing_bitmap: report.nack.missing_bitmap,
+            })
+            .collect()
     }
 
     /// Decrypt one inbound packet and unframe its events.
