@@ -99,15 +99,27 @@ function seedFirefoxProfile(profileDir, caPemPath, nickname) {
       { stdio: 'pipe' },
     );
     if (fs.existsSync(path.join(profileDir, 'cert9.db'))) {
-      return { how: `certutil -d ${db} -A -t C,, (Firefox's own NSS database)`, enterpriseRoots: false };
+      // `nss: true` ONLY here: certutil reported success AND the
+      // database it claims to have written exists. Every other
+      // return says the profile was not seeded, which is what the
+      // trust control must be able to distinguish — it was reading
+      // a field nobody set, so a successful seed read as a failure
+      // and the success string was printed as the reason.
+      return {
+        nss: true,
+        how: `certutil -d ${db} -A -t C,, (Firefox's own NSS database)`,
+        enterpriseRoots: false,
+      };
     }
     return {
+      nss: false,
       how: `certutil -A reported success but ${profileDir}/cert9.db is absent; the only \
 remaining mechanism is security.enterprise_roots.enabled — see above`,
       enterpriseRoots: true,
     };
   } catch (e) {
     return {
+      nss: false,
       how: `NSS certutil unusable (${(e.message || String(e)).split('\n')[0]}); \
 the only remaining mechanism is security.enterprise_roots.enabled, which reads \
 a platform root store this harness never writes — the runner refuses the run`,
