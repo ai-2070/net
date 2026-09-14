@@ -1252,8 +1252,10 @@ dependencies = [
  "serde_json",
  "snow",
  "subtle",
+ "thiserror",
  "tracing",
  "web-time",
+ "xxhash-rust",
 ]
 
 [[package]]
