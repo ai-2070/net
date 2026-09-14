@@ -26,6 +26,10 @@ path = "src/lib.rs"
 crate-type = ["cdylib", "rlib"]
 
 [lints.rust]
+# Production items must be documented. Integration-test crates are
+# not a documentation surface, and one of them — `tests/kyra_review.rs`
+# — is a reviewer's file landed VERBATIM, so a crate-level doc
+# comment cannot be added to it without editing her probe file.
 missing_docs = "warn"
 
 [features]

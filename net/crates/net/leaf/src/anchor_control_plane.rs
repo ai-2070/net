@@ -37,24 +37,25 @@
 //! [`BootstrapAccepted::peer_static`] — the pinned key the leaf then
 //! handshakes against.
 //!
-//! # `signal`, and the gap it names
+//! # `signal`: refused here, on purpose (R14)
 //!
 //! An envelope is self-authenticating (see [`SignalEnvelope`]), so
-//! the carrier can be anything. v1 carries it on the bootstrap
-//! dialog the anchor already owns — the trickle socket — as
-//! `{"type":"signal","dialog":…,"envelope":"<base64>"}`, and admits
-//! inbound envelopes the same way. It does **not** ride the data
-//! path: a control plane that put a Net packet on the wire would be
-//! a relay wearing a trait.
+//! the carrier can be anything — but this carrier cannot carry it.
+//! The Stage 4b listener reads exactly one trickle frame type,
+//! `type == "candidate"` (`sdk/src/rtc_bootstrap.rs::trickle_socket`),
+//! and forwards nothing to a third party at all. The first cut of
+//! this adapter serialised envelopes into a `type: "signal"` frame
+//! and reported the local send as delivery; the anchor discarded
+//! every one of them.
 //!
-//! The gap, stated plainly: today's listener forwards trickle frames
-//! only when `type == "candidate"`
-//! (`sdk/src/rtc_bootstrap.rs::trickle_socket`), so an envelope
-//! addressed to a third node reaches the anchor and stops there.
-//! Peer-to-peer signalling through a native anchor needs one more
-//! listener-side case; the leaf half — signing, carrying, verifying
-//! — is complete and is exercised end to end by the anchorless mock,
-//! which carries the identical envelopes.
+//! So `signal` returns a typed refusal naming the peer it could not
+//! reach. Carrying envelopes end to end needs a listener route that
+//! forwards WITH an acknowledgement — generic peer coordination,
+//! which is Stage 6's. The trait's shape already admits it, which is
+//! why `signal` takes a peer id and an envelope rather than a
+//! session; the anchorless `MockControlPlane` carries envelopes for
+//! real today, and that is where the leaf's signalling path is
+//! witnessed.
 
 #![cfg(target_arch = "wasm32")]
 
@@ -299,22 +300,37 @@ impl ControlPlane for AnchorControlPlane {
         )))
     }
 
+    /// **Refused, typed** (R14).
+    ///
+    /// This used to serialise the envelope into a `type: "signal"`
+    /// frame on the trickle socket and report the local send as
+    /// success. The Stage 4b listener reads exactly one frame type —
+    /// `type: "candidate"` — and drops everything else without a
+    /// word (`sdk/src/rtc_bootstrap.rs`), so every such envelope was
+    /// discarded by the anchor while the caller was told it had been
+    /// delivered. A control plane that reports delivery it cannot
+    /// perform is worse than one that cannot perform it.
+    ///
+    /// The honest v1 answer is a typed refusal. Carrying envelopes
+    /// end to end needs a listener route that forwards them to
+    /// another peer WITH an acknowledgement, which is generic peer
+    /// coordination and belongs to Stage 6; the trait's shape
+    /// already admits it, which was the point of taking a peer id
+    /// and an envelope rather than a session.
+    ///
+    /// The anchorless `MockControlPlane` carries envelopes for real
+    /// and is unaffected: the leaf's signalling path is exercised
+    /// there, against a carrier that actually delivers.
     async fn signal(&self, envelope: SignalEnvelope) -> Result<()> {
-        let dialog = self
-            .state
-            .dialog
-            .get()
-            .ok_or_else(|| refused("there is no bootstrap dialog to carry an envelope on"))?;
-        let bytes = signal::encode(&envelope)?;
-        self.send_frame(
-            dialog,
-            &serde_json::json!({
-                "type": "signal",
-                "dialog": envelope.dialog,
-                "to": format!("{:#x}", envelope.to),
-                "envelope": base64::engine::general_purpose::STANDARD.encode(&bytes),
-            }),
-        )
+        Err(LeafError::ControlPlane(format!(
+            "this anchor control plane cannot carry a signalling envelope to {:#x}: the \
+             Stage 4b bootstrap listener serves POST /rtc/offer, GET /rtc/anchor and the \
+             trickle socket's `candidate` frames, and forwards nothing to a third party. \
+             Peer-to-peer signalling over an anchor is Stage 6 work; refusing here is \
+             deliberate, because the previous behaviour reported a local send as a \
+             delivery the anchor discarded",
+            envelope.to
+        )))
     }
 
     fn drain_events(&self) -> Vec<ControlEvent> {
