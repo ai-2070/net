@@ -2366,6 +2366,38 @@ field the seeder actually returns. No assertion changed. `S5_REPORT.md`
 completion/quiescence paths and states the payload-size claim exactly
 — both for Kyra's adjudication.
 
+**Kyra: HOLD on Stage 5 at `9f8bde0c7` — "not a CI-only hold".**
+Fifteen public-API leaf probes: 12 fail / 3 controls pass (reviewer
+reproduced 12/3 at `3051d3e61`); R16 (the Firefox helper) credited and
+its execution gate closed by run 34904478362. Brief
+`spikes/S5_R_BRIEF.md`; probes vendored under `spikes/kyra/`.
+
+| # | Finding |
+|---|---|
+| R1 (P1) | announcement signatures do not bind the claimed node id: an attacker's own key with the victim's id and a later version replaces the honest record and authorizes spoofed signals (native checks the derivation; the leaf does not) |
+| R2 (P1) | RPC completion matched on call id only — another peer, or the same peer on a different reply channel, completes the call |
+| R3 (P1) | sharing `NetSession` does not implement reliability/credit: no retransmit owner registered, no credit debit, no ACK/grant, no retransmit timer — reliability is SCTP's, not Net's |
+| R4 (P1) | loss-free reliable fragmented payloads never reach the consumer (reassembly vs reorder sequence ownership); the reassembler accepts incomplete coverage; **native ingress does not reassemble** — the enrollment body limit reaches this |
+| R5 (P1) | same-peer session replacement keeps the old reorder state (sequence 0 suppressed) and never fails the old pending call |
+| R6 (P1) | a channel hash with bit 49 set is classified as `StreamData` |
+| R7 (P2) | reorder emits wrong sequence labels (2,0,1 → 0,1,1) and inherits the current arrival's metadata |
+| R8 (P2) | `(from, dialog, kind)` replay key rejects the second legitimate candidate; expired announcements stay discoverable and authoritative; uncapped replay map; per-gap work in the reorder buffer |
+| R9 (P1) | leadership stand-down drops the proxy and releases the Web Lock without closing the node, cancelling in-flight ops or failing pending calls; `IdentityVault::fence` has no outbound caller |
+| R10 (P1/P2) | attach dropped during initial bootstrap; close during promotion yields a lock-holding non-functional leader; stale stream handles lack their generation; follower deadlines only executed by the leader |
+| R11 (P1/P2) | TS declarations disagree with the Rust ABI (JSON string vs `Uint8Array`; text vs numeric `channelHash`; `RTCIceServer[]` vs strings); the package's fake WASM matches the declarations |
+| R12 (P1) | native `Stream` handles carry no session incarnation — a same-id successor accepts the predecessor's handle; `4bb03a069`'s responder displacement makes it load-bearing |
+| R13 (P2) | IndexedDB put awaited, transaction complete/abort not |
+| R14 (P2) | the adapter's `type: signal` frames are silently ignored by the listener while D1 says v1 carries envelopes |
+| R15 (P1/P2) | witness predicates that do not close their claims (two-tab, busy-responder stops before Noise, reconnect passes the absent-session branch, nft rule too broad, Firefox logs not uploaded, new native names unpinned) |
+| R16 | credited — Firefox 19/19 in the descendant run |
+
+Credit retained: the packages, wire/codec sharing, the real Chromium
+handshake → enrollment → nRPC path, fire-and-forget elision, UDP
+controls, two-tab coverage, the non-relaying mock, the threat model,
+the 12 Stage 4b names. Kyra's own summary: the forged-announcement
+issue "limits authority correctness, not the fact that these
+mechanisms execute."
+
 ## Stage 6 — Browser ↔ browser direct, NAT conformance, telemetry, demo
 
 - §9 end to end; `RtcStats`; browser network-change retry trigger; per-pair
