@@ -2283,6 +2283,54 @@ credentials untested across a process boundary. Stage 5 brief:
   quietly relays is a re-implementation of the anchor and proves nothing
   about the trait boundary.
 
+**Stage 5 candidate `55d9c5077` (2026-09-14) — delivered; reviewer
+quick verification green; forwarded to Kyra.** `S5_REPORT.md`.
+`net-leaf` (its own workspace, `leaf/`) over the production wire crate:
+sans-IO protocol half with 145 native units, 14 `cross_lang_wire`
+replays **inside** headless Chromium, `web_sys` confined to three
+modules by test; `ControlPlane` with eight boundary tripwires and
+`AnchorControlPlane` as the one implementation; **D1** the
+session-independent signalling path specified — a self-authenticating
+`SignalEnvelope` signed by the entity key already bound by the
+announcement, domain-separated, `not_after` + seen-set replay bound,
+carrier-blind, no new trust root; the trait's `signal(peer, envelope)`
+shape admits it; **D2** the leader lifecycle specified and witnessed
+(lock, generation gate, proxy round trip, leader loss, frozen tab
+fenced); `@net-mesh/browser` with `UdpBlocked` a pure function of two
+observations (HTTPS bootstrap ok ∧ STUN to `rtc_addr` unanswered),
+measured; one merged Playwright runner, 19/19 Chromium here, Firefox
+CI-only (no NSS `certutil` on Windows), WebKit recorded; the anchorless
+mock's ledger is eight signalling legs, zero Net packets, and did not
+move when a `0x0A00` frame was later added to the data path. Sizes:
+wasm 553 668 B / **225 369 B gz** (6.7× under the 1.5 MB target), page
+total 239 595 B gz vs S0a's 160 694 B.
+
+**Core changes (`4bb03a069`, a departure from strictly additive,
+justified):** the matrix found three merged meanings, two already
+failing 4b witnesses on Linux — the completion owner released the
+signalling budget at DataChannel-open, which since 4b/R2 also retired
+the attempt's identity, so post-open candidates were "unknown dialog"
+and the socket closed under the Noise handshake (now: out of the
+expiry table at open, budget released after install resolves); a late
+candidate on a live attempt is accepted and dropped, not unknown; the
+quiescence gate is now role-aware (a Responder facing a busy incumbent
+on a *different* RTC endpoint displaces it — the only party who could
+close a vanished tab's streams was the one being refused).
+
+Reviewer at `55d9c5077`: eleven RTC binaries 105/105 ×2 at retries 0;
+listener 24/24; `--lib` 5726 / 5759 — the 53 fewer units are exactly
+`channel::membership` (23), `channel::name` (17) and
+`subprotocol::stream_window` (13) moved into `net-mesh-wire` (206 →
+261); floors 93/24/62/41/60/68 intact; leaf 145 + 8 + 5 native, wasm32
+check clean; `--all-targets` clean. Named gaps: Firefox unproven here;
+routable-interface mDNS leg opt-in on Windows; two deliberate codec
+copies (nRPC client, announcement writer) pinned by fixtures; **no
+native node reassembles fragments** (leaf ↔ leaf only; harness keeps
+payloads under 8 104 B); `query_capability` answers from verified
+announcements; browser ↔ browser from a page is Stage 6's (four
+`#[wasm_bindgen]` methods named, `peer_handshake` takes only a peer
+id); close-to-eviction latency unbounded by anything but ICE.
+
 ## Stage 6 — Browser ↔ browser direct, NAT conformance, telemetry, demo
 
 - §9 end to end; `RtcStats`; browser network-change retry trigger; per-pair
