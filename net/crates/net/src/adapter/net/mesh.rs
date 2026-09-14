@@ -1734,6 +1734,8 @@ struct DispatchCtx {
     #[cfg(feature = "webrtc")]
     forwarded_app_packets: Arc<DashMap<(u32, u64), u64>>,
     #[cfg(feature = "webrtc")]
+    rtc_reassembly: Arc<super::rtc::RtcReassembly>,
+    #[cfg(feature = "webrtc")]
     provisional_endpoints: super::rtc::ProvisionalEndpoints,
     #[cfg(feature = "webrtc")]
     rtc_driver: Option<super::rtc::RtcDriverHandle>,
@@ -11003,6 +11005,16 @@ pub struct MeshNode {
     /// `subprotocol_id` is cleartext AAD-authenticated header.
     #[cfg(feature = "webrtc")]
     forwarded_app_packets: Arc<DashMap<(u32, u64), u64>>,
+    /// Leaf-fragment reassembly for the RTC ingress (Stage 5 R4).
+    ///
+    /// A browser leaf fragments anything over one packet and stamps
+    /// `frag_flags`; until this existed nothing in the core read
+    /// that field, so a fragmented publish reached a subscriber as
+    /// partial events and a fragmented enrollment request never
+    /// decoded. Keyed by wire session id and bounded per session by
+    /// the same byte budget that bounds provisional receive state.
+    #[cfg(feature = "webrtc")]
+    rtc_reassembly: Arc<super::rtc::RtcReassembly>,
     /// Test-only record of every frame that passed the budget, so a
     /// witness can assert what was *admitted* rather than inferring
     /// it from an installed session.
@@ -13468,6 +13480,8 @@ impl MeshNode {
             rtc_install_pause: Arc::new(super::rtc::RtcInstallPause::default()),
             #[cfg(feature = "webrtc")]
             forwarded_app_packets: Arc::new(DashMap::new()),
+            #[cfg(feature = "webrtc")]
+            rtc_reassembly: Arc::new(super::rtc::RtcReassembly::new()),
             #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
             rtc_signal_tap: Arc::new(parking_lot::Mutex::new(Vec::new())),
             #[cfg(feature = "webrtc")]
@@ -18721,6 +18735,34 @@ impl MeshNode {
     #[cfg(any(test, feature = "fixtures"))]
     pub fn peer_session_for_test(&self, node_id: u64) -> Option<Arc<NetSession>> {
         self.peers.get(&node_id).map(|e| e.value().session.clone())
+    }
+
+    /// Put one already-built packet on the wire to `node_id`.
+    ///
+    /// The fragment witness needs to send a packet whose
+    /// `frag_flags`, `fragment_id` and `fragment_offset` it chose —
+    /// exactly what a browser leaf emits and what no native send
+    /// path produces, because only the leaf fragments. Everything
+    /// below this is production: the peer's real session sealed the
+    /// packet, and the real transport carries it to the real
+    /// ingress.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
+    pub async fn send_built_packet_for_test(
+        &self,
+        node_id: u64,
+        packet: &[u8],
+    ) -> Result<(), AdapterError> {
+        let addr = self
+            .peers
+            .get(&node_id)
+            .map(|e| e.value().addr())
+            .ok_or_else(|| AdapterError::Connection(format!("unknown peer {node_id:#x}")))?;
+        self.sink
+            .send(packet, addr)
+            .await
+            .map(|_| ())
+            .map_err(|e| AdapterError::Connection(format!("raw send: {e}")))
     }
 
     /// Seal ONE route-hop envelope on the edge to `node_id`.
@@ -25289,6 +25331,8 @@ impl MeshNode {
             #[cfg(feature = "webrtc")]
             forwarded_app_packets: Arc::clone(&self.forwarded_app_packets),
             #[cfg(feature = "webrtc")]
+            rtc_reassembly: Arc::clone(&self.rtc_reassembly),
+            #[cfg(feature = "webrtc")]
             provisional_endpoints: Arc::clone(&self.provisional_endpoints),
             #[cfg(feature = "webrtc")]
             rtc_driver: self.rtc_driver.clone(),
@@ -29259,6 +29303,23 @@ impl MeshNode {
                 }
             }
         }
+
+        // **Leaf fragments become one event here (Stage 5 R4).**
+        //
+        // A browser leaf cannot exceed `MAX_PAYLOAD_SIZE` in one
+        // packet, so anything larger arrives as a `frag_flags`
+        // group. Nothing in the core read that field before, which
+        // is why an over-cap leaf publish reached a native
+        // subscriber as partial events and a fragmented enrollment
+        // request declared a body longer than it carried and timed
+        // out. This runs AFTER credit accounting on purpose: every
+        // piece crossed the wire and its window must be returned
+        // even when the group is still incomplete.
+        #[cfg(feature = "webrtc")]
+        let events = match Self::reassemble_rtc_fragments(&parsed, session, events, ctx) {
+            Some(events) => events,
+            None => return,
+        };
 
         // nRPC dispatch hook: if a dispatcher is registered for the
         // inbound packet's `channel_hash`, route every event from
@@ -36421,6 +36482,70 @@ impl MeshNode {
         }
     }
 
+    /// Reassemble a leaf fragment group at the RTC ingress (R4).
+    ///
+    /// `Some(events)` is what the rest of the dispatch path should
+    /// treat as this packet's events: the packet's own events when
+    /// it is not a fragment, or the single reassembled payload when
+    /// this piece completed its group. `None` means the piece was
+    /// buffered, refused or contradicted its group — nothing is
+    /// delivered, and nothing partial ever reaches a handler.
+    ///
+    /// Confined to RTC sources. A UDP peer is a native node that
+    /// never sets `frag_flags`, and widening this to every ingress
+    /// would put a map lookup on the datagram hot path for a case
+    /// that cannot occur there.
+    #[cfg(feature = "webrtc")]
+    fn reassemble_rtc_fragments(
+        parsed: &ParsedPacket,
+        session: &NetSession,
+        events: Vec<Bytes>,
+        ctx: &DispatchCtx,
+    ) -> Option<Vec<Bytes>> {
+        use net_wire::protocol::FRAG_FRAGMENTED;
+
+        if parsed.header.frag_flags & FRAG_FRAGMENTED == 0
+            || !matches!(parsed.source, PeerAddr::Rtc(_))
+        {
+            return Some(events);
+        }
+        // A fragment carries exactly one event: the leaf splits a
+        // payload, it does not batch several into a piece. Anything
+        // else is a claim this ingress will not reconstruct.
+        let [piece] = events.as_slice() else {
+            tracing::debug!(
+                session_id = session.session_id(),
+                events = events.len(),
+                "rtc: fragmented packet carrying more than one event dropped"
+            );
+            return None;
+        };
+        match ctx.rtc_reassembly.accept(
+            session.session_id(),
+            parsed.header.fragment_id,
+            parsed.header.fragment_offset,
+            parsed.header.frag_flags,
+            piece.clone(),
+            std::time::Instant::now(),
+        ) {
+            Ok(Some(whole)) => Some(vec![whole]),
+            // Not a fragment after all — the flag check above means
+            // this cannot happen, but the codec, not this caller,
+            // owns that decision.
+            Ok(None) => Some(events),
+            Err(super::rtc::FragmentOutcome::Buffered) => None,
+            Err(outcome) => {
+                tracing::debug!(
+                    session_id = session.session_id(),
+                    fragment_id = parsed.header.fragment_id,
+                    ?outcome,
+                    "rtc: leaf fragment refused"
+                );
+                None
+            }
+        }
+    }
+
     /// Reserve a provisional sender's stream allocation (R3).
     ///
     /// `false` refuses the frame before any receive state is
@@ -39379,6 +39504,17 @@ impl MeshNode {
             TxAdmit::StreamClosed => {
                 return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(
                     "publish: stream {:#x} closed",
+                    stream_id
+                )));
+            }
+            // `try_acquire_tx_credit_guard` carries no handle and so
+            // no incarnation to mismatch: the publish path resolved
+            // this `session` itself moments ago. Unreachable, and
+            // reported as the closed stream it effectively is rather
+            // than silently treated as success.
+            TxAdmit::SessionSuperseded => {
+                return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(
+                    "publish: stream {:#x} belongs to a superseded session",
                     stream_id
                 )));
             }
@@ -43115,9 +43251,14 @@ impl MeshNode {
             ))
         })?;
         let reliable = config.reliability.is_reliable();
-        // Capture the freshly-allocated (or existing, on idempotent
-        // re-open) epoch so the returned `Stream` handle can later
-        // reject stale sends after a close+reopen.
+        // The handle's two-part identity (R12): the incarnation this
+        // stream belongs to, and the freshly-allocated (or existing,
+        // on idempotent re-open) epoch within it. The epoch alone
+        // rejects a stale handle after a close+reopen on this session;
+        // the session id is what rejects a handle whose session has
+        // been displaced entirely — the epoch counter restarts at 1
+        // per session, so the two collide on the first stream.
+        let session_id = peer.session.session_id();
         let epoch = peer.session.open_stream_full(
             stream_id,
             reliable,
@@ -43144,16 +43285,67 @@ impl MeshNode {
                 "cap_exceeded",
             );
         }
-        Ok(Stream::new(peer_node_id, stream_id, epoch, config))
+        Ok(Stream::new(
+            peer_node_id,
+            session_id,
+            stream_id,
+            epoch,
+            config,
+        ))
     }
 
-    /// Close a stream: drop its `StreamState` from the session, ending
-    /// delivery of any buffered inbound events for the stream and
-    /// dropping outbound packets that haven't hit the wire yet.
-    /// Idempotent. `CloseBehavior::DrainThenClose` is honored only to
+    /// Close the stream this handle owns: drop its `StreamState` from
+    /// the session, ending delivery of any buffered inbound events for
+    /// the stream and dropping outbound packets that haven't hit the
+    /// wire yet. `CloseBehavior::DrainThenClose` is honored only to
     /// the extent the router's scheduler has already flushed; there is
     /// no wire "drain-then-close" signal in v1.
-    pub fn close_stream(&self, peer_node_id: u64, stream_id: u64) {
+    ///
+    /// Idempotent for the lifetime the handle names: closing a stream
+    /// that is already gone is `Ok(())`.
+    ///
+    /// Refuses with [`StreamError::SessionSuperseded`] when the peer's
+    /// current session is not the one the handle was opened against
+    /// (R12). That refusal is the point: a close addressed by
+    /// `(peer, stream_id)` alone would tear down the **successor's**
+    /// stream of the same id — the displaced session's owner
+    /// destroying live state belonging to the session that replaced
+    /// it. Callers holding no handle — a peer-driven reset, a
+    /// receive-side teardown — use [`Self::close_stream_id`], which is
+    /// explicit about addressing whatever is open under that id.
+    pub fn close_stream(&self, stream: &Stream) -> Result<(), StreamError> {
+        let Some(peer) = self.peers.get(&stream.peer_node_id()) else {
+            // No session at all: the lifetime this handle named is
+            // definitively over, and there is nothing to tear down.
+            return Ok(());
+        };
+        if peer.session.session_id() != stream.session_id() {
+            return Err(StreamError::SessionSuperseded);
+        }
+        // Epoch check inside the same lookup: a close+reopen on this
+        // session is a different lifetime too, and closing it would
+        // drop the successor stream's retransmit window.
+        let stale = peer
+            .session
+            .try_stream(stream.stream_id())
+            .is_some_and(|state| state.epoch() != stream.epoch());
+        if stale {
+            return Err(StreamError::NotConnected);
+        }
+        peer.session.close_stream(stream.stream_id());
+        Ok(())
+    }
+
+    /// Close whatever stream is open under `(peer_node_id, stream_id)`,
+    /// for callers that hold no [`Stream`] handle: an inbound
+    /// `StreamReset`, a receive-side transfer teardown, the
+    /// language bindings' id-addressed surface.
+    ///
+    /// Idempotent, and deliberately *not* fenced — there is no handle
+    /// to fence against. Anyone holding a handle must use
+    /// [`Self::close_stream`] instead, or they can close a successor
+    /// session's stream with a displaced session's coordinates.
+    pub fn close_stream_id(&self, peer_node_id: u64, stream_id: u64) {
         if let Some(peer) = self.peers.get(&peer_node_id) {
             peer.session.close_stream(stream_id);
         }
@@ -43164,21 +43356,29 @@ impl MeshNode {
     /// receiver has acked everything (with H-9 ack-pruning, `pending`
     /// empties as grants arrive) — or `timeout` elapses, then close. Use
     /// after the last bytes of a reliable send so retransmit can still
-    /// fill gaps before teardown; closing eagerly (`close_stream`) drops
-    /// the retransmit window and can strand a lost tail packet on a lossy
-    /// link. A fire-and-forget stream (nothing tracked) drains instantly.
+    /// fill gaps before teardown; closing eagerly ([`Self::close_stream`])
+    /// drops the retransmit window and can strand a lost tail packet on a
+    /// lossy link. A fire-and-forget stream (nothing tracked) drains
+    /// instantly.
+    ///
+    /// Fenced exactly like [`Self::close_stream`], and the drain loop
+    /// itself stops as soon as the handle's session is gone — waiting
+    /// for a successor's unacked data to settle would be waiting on
+    /// somebody else's stream.
     pub async fn close_stream_graceful(
         &self,
-        peer_node_id: u64,
-        stream_id: u64,
+        stream: &Stream,
         timeout: Duration,
-    ) {
+    ) -> Result<(), StreamError> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            let drained = match self.peers.get(&peer_node_id) {
+            let drained = match self.peers.get(&stream.peer_node_id()) {
+                Some(p) if p.session.session_id() != stream.session_id() => {
+                    return Err(StreamError::SessionSuperseded)
+                }
                 Some(p) => p
                     .session
-                    .try_stream(stream_id)
+                    .try_stream(stream.stream_id())
                     .map(|s| !s.with_reliability(|r| r.has_pending()))
                     .unwrap_or(true), // stream already gone → nothing to drain
                 None => true, // peer gone → nothing to drain
@@ -43188,7 +43388,7 @@ impl MeshNode {
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
-        self.close_stream(peer_node_id, stream_id);
+        self.close_stream(stream)
     }
 
     /// Send a batch of events on an explicit stream.
@@ -43201,11 +43401,16 @@ impl MeshNode {
     /// and preserves pre-backpressure behavior. `Transport` is returned
     /// for underlying socket send failures.
     ///
-    /// Returns `NotConnected` when the stream was never opened or has
-    /// been closed since (`close_stream`, idle eviction, cap-exceeded
-    /// LRU). A previously-closed `Stream` handle is inert by design —
-    /// reusing it does NOT silently re-create the stream with default
-    /// config; the caller must explicitly re-open.
+    /// Returns `NotConnected` when the stream was never opened on this
+    /// session or has been closed since (`close_stream`, idle eviction,
+    /// cap-exceeded LRU). A previously-closed `Stream` handle is inert
+    /// by design — reusing it does NOT silently re-create the stream
+    /// with default config; the caller must explicitly re-open.
+    ///
+    /// Returns [`StreamError::SessionSuperseded`] when the peer's
+    /// session is no longer the incarnation the handle was opened
+    /// against (R12) — the handle is inert for good, and the stream id
+    /// it names may be live on the successor with a different config.
     pub async fn send_on_stream(
         &self,
         stream: &Stream,
@@ -43216,6 +43421,16 @@ impl MeshNode {
             .get(&stream.peer_node_id())
             .ok_or(StreamError::NotConnected)?;
         let peer_addr = peer.addr();
+        // R12: the incarnation check and the `Arc` clone happen under
+        // the same `peers` lookup. Everything after this point — the
+        // epoch check, the credit admission, every flush — runs
+        // against *this* session object, so a displacement racing the
+        // send either loses to this read (and the send completes on a
+        // session that was current when it was admitted) or wins it
+        // (and the handle is refused here).
+        if peer.session.session_id() != stream.session_id() {
+            return Err(StreamError::SessionSuperseded);
+        }
         let session = peer.session.clone();
         drop(peer);
 
@@ -43394,8 +43609,12 @@ impl MeshNode {
             // `TxAdmit::Acquired` returns credit + sequence under the
             // same DashMap lookup — a close+reopen race can't slip a
             // stale sequence from the old lifetime onto the new state.
-            let (guard, seq) = match session.try_acquire_tx_credit_matching_epoch(
+            // The session id is passed too so the admission itself
+            // refuses a predecessor's lifetime rather than relying on
+            // the caller having resolved the right session (R12).
+            let (guard, seq) = match session.try_acquire_tx_credit_for_lifetime(
                 stream_id,
+                stream.session_id(),
                 stream.epoch(),
                 needed,
             ) {
@@ -43413,6 +43632,7 @@ impl MeshNode {
                     return Err(StreamError::Backpressure);
                 }
                 TxAdmit::StreamClosed => return Err(StreamError::NotConnected),
+                TxAdmit::SessionSuperseded => return Err(StreamError::SessionSuperseded),
             };
             let packet = builder.build(stream_id, seq, batch, flags);
             match self

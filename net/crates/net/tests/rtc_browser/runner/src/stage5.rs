@@ -54,11 +54,30 @@ const ECHO_SERVICE: &str = "app.stage5.echo";
 const RESTORE_CHANNEL: &str = "stage5.restore";
 /// The native service the fire-and-forget stream's events dispatch to.
 const SINK_SERVICE: &str = "app.stage5.sink";
+/// The native service the leader-close leg parks a call inside, so a
+/// call can be genuinely IN FLIGHT — entered on the anchor, unanswered
+/// — at the moment the leader stands down.
+const PARK_SERVICE: &str = "app.stage5.park";
+/// A capability tag announced at RUNTIME, through the leader, by the
+/// tab that is NOT the leader. A promoted follower must re-announce
+/// current intent, so the anchor must still resolve this tag after the
+/// handoff.
+const RESTORE_TAG: &str = "stage5.restore.tag";
 
-/// How many round trips the reliable witness makes. Enough that a
-/// reordering or a dropped-and-not-retransmitted frame shows up, few
-/// enough to stay inside one HTTP step.
+/// How many sequential round trips the reliable witness makes, and
+/// how many it then puts IN FLIGHT at once.
+///
+/// The sequential leg establishes exact replies and the native
+/// handler's arrival order. It is deliberately not described as
+/// retransmission or reorder correctness: awaiting each reply before
+/// sending the next never puts two requests on the wire together, so
+/// a fire-and-forget stream on a loss-free link satisfies it too.
+/// What the concurrent leg adds is the property sequencing hides —
+/// N replies outstanding at once, each of which must come back to
+/// its OWN caller exactly once. Recovery from real loss is a
+/// separate, separately named witness.
 const RELIABLE_ROUND_TRIPS: usize = 64;
+const RELIABLE_IN_FLIGHT: usize = 16;
 /// Events the fire-and-forget witness sends, and the drop period.
 const FAF_EVENTS: usize = 40;
 const FAF_DROP_EVERY: u64 = 4;
@@ -66,13 +85,14 @@ const FAF_DROP_EVERY: u64 = 4;
 /// Every Stage 5 witness name, in ledger order. The CI job pins these
 /// exactly; the list is here so a rename is one edit and a drop is
 /// impossible to do quietly.
-pub const WITNESSES: [&str; 7] = [
+pub const WITNESSES: [&str; 8] = [
     "stage5_leaf_handshake_over_the_real_listener",
     "stage5_reliable_round_trip",
     "stage5_nrpc_call_to_a_native_service",
     "stage5_fire_and_forget_tolerates_injected_loss",
     "stage5_find_best_node_returns_the_browser_node",
     "stage5_two_tabs_share_one_identity_without_eviction",
+    "stage5_reconnect_displaces_a_busy_incumbent",
     "stage5_udp_blocked_surfaces_a_typed_failure",
 ];
 
@@ -129,14 +149,46 @@ pub enum Step5 {
         payload: String,
         timeout_ms: u64,
     },
-    /// `payloads.len()` sequential calls, so an ordering assertion
-    /// costs one HTTP round trip instead of one per call.
+    /// Issue `call(...)` and return WITHOUT awaiting it, parking the
+    /// promise under `handle`. The point is a call that is genuinely
+    /// outstanding while the runner does something else to the tab —
+    /// a leader stand-down, for instance.
+    CallBegin {
+        id: u64,
+        session: String,
+        service: String,
+        payload: String,
+        timeout_ms: u64,
+        handle: String,
+    },
+    /// Await a call parked by [`Step5::CallBegin`].
+    ///
+    /// A promise that has not settled within `timeout_ms` comes back
+    /// as `info = "never settled"` rather than hanging the step, so a
+    /// call that was silently abandoned is a reportable outcome and
+    /// not a harness timeout.
+    CallAwait {
+        id: u64,
+        handle: String,
+        timeout_ms: u64,
+    },
+    /// `payloads.len()` calls on one session, so a multi-call
+    /// assertion costs one HTTP round trip instead of one per call.
+    ///
+    /// `concurrent` decides which property is under test. `false`
+    /// awaits each reply before issuing the next — one request on the
+    /// wire at a time, which is what makes arrival ORDER assertable.
+    /// `true` issues every call before awaiting any of them, so N
+    /// requests are outstanding together and each reply has to find
+    /// its own caller; `replies[i]` is still the reply to
+    /// `payloads[i]`, by index, never by arrival.
     CallMany {
         id: u64,
         session: String,
         service: String,
         payloads: Vec<String>,
         timeout_ms: u64,
+        concurrent: bool,
     },
     /// `openStream(opts)` + one `send` per payload, with the page's
     /// DataChannel drop hook armed at `drop_every`.
@@ -184,6 +236,8 @@ impl Step5 {
             Self::Connect { id, .. }
             | Self::Info { id, .. }
             | Self::Call { id, .. }
+            | Self::CallBegin { id, .. }
+            | Self::CallAwait { id, .. }
             | Self::CallMany { id, .. }
             | Self::StreamSend { id, .. }
             | Self::Announce { id, .. }
@@ -199,6 +253,8 @@ impl Step5 {
             Self::Connect { id, .. }
             | Self::Info { id, .. }
             | Self::Call { id, .. }
+            | Self::CallBegin { id, .. }
+            | Self::CallAwait { id, .. }
             | Self::CallMany { id, .. }
             | Self::StreamSend { id, .. }
             | Self::Announce { id, .. }
@@ -330,6 +386,44 @@ impl RpcHandler for Sink {
             status: RpcStatus::Ok,
             headers: vec![],
             body: Bytes::from_static(b"sunk"),
+        })
+    }
+}
+
+/// A service that ENTERS and then does not answer until the runner
+/// releases it.
+///
+/// This is what makes "a call was pending across the leader's
+/// stand-down" a fact rather than a hope: the body is recorded the
+/// moment the anchor's handler runs, so the runner can prove the
+/// request really reached the native side, and the reply is withheld
+/// so the call is still outstanding in the tab when the leader goes
+/// away. `entered` keeps one entry PER INVOCATION, so a duplicated
+/// dispatch (the same logical call executed twice) is visible as a
+/// length of 2.
+struct Park {
+    entered: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+#[async_trait::async_trait]
+impl RpcHandler for Park {
+    async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+        let body = ctx.payload.body.to_vec();
+        self.entered
+            .lock()
+            .expect("the park log is never poisoned")
+            .push(body.clone());
+        // Parked. The permit is added by the runner once it has
+        // finished with the interruption it arranged.
+        let _permit = self.release.acquire().await;
+        let mut out = Vec::with_capacity(body.len() + 7);
+        out.extend_from_slice(b"parked:");
+        out.extend_from_slice(&body);
+        Ok(RpcResponsePayload {
+            status: RpcStatus::Ok,
+            headers: vec![],
+            body: Bytes::from(out),
         })
     }
 }
@@ -496,6 +590,20 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
             }),
         )
         .map_err(|e| format!("serve {SINK_SERVICE}: {e}"))?;
+    let park_log: Arc<std::sync::Mutex<Vec<Vec<u8>>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    // Zero permits: the first (and only) call parks until the runner
+    // adds one.
+    let park_release = Arc::new(tokio::sync::Semaphore::new(0));
+    let _park = cx
+        .anchor
+        .serve_rpc(
+            PARK_SERVICE,
+            Arc::new(Park {
+                entered: Arc::clone(&park_log),
+                release: Arc::clone(&park_release),
+            }),
+        )
+        .map_err(|e| format!("serve {PARK_SERVICE}: {e}"))?;
 
     let mut script = Script5 {
         tabs: cx.tabs.clone(),
@@ -632,16 +740,36 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
     }
 
     // ================================================================
-    // 2 — a reliable round trip, 64 of them, in order
+    // 2 — reliable round trips: 64 sequential, then 16 in flight
     //
-    // `call()` is the leaf's nRPC client over a RELIABLE stream. The
-    // round trip is proven on both sides at once: the browser gets
-    // the echo body back for every call, and the anchor's handler
-    // saw the bodies in the order they were sent. Ordering is the
-    // property a reliable stream adds over a fire-and-forget one, so
-    // it is the property asserted.
+    // `call()` is the leaf's nRPC client over a RELIABLE stream.
+    //
+    // The sequential leg proves the round trip on both sides at
+    // once: the browser gets the echo body back for every call, and
+    // the anchor's handler saw the bodies in the order they were
+    // sent. It does NOT prove retransmission or reorder recovery —
+    // awaiting each reply before sending the next never puts two
+    // requests on the wire together, and a fire-and-forget stream on
+    // a loss-free link satisfies exactly the same observations. That
+    // property has its own witness, with real injected loss.
+    //
+    // The concurrent leg adds what sequencing hides. Sixteen calls
+    // are issued before any is awaited, so sixteen pending entries
+    // exist at once and every reply has to find its OWN caller.
+    // `replies[i]` is the reply to `payloads[i]` by index, so a
+    // reply handed to the wrong pending call is a mismatch here
+    // rather than something arrival order papers over. The anchor's
+    // handler must have run exactly sixteen times over exactly the
+    // sixteen distinct bodies — once each, so a duplicated
+    // completion is caught too.
     // ================================================================
     {
+        let echoed = |sent: &String| {
+            let mut v = b"echo:".to_vec();
+            v.extend_from_slice(&unhex(sent));
+            hex(&v)
+        };
+
         echo_log.lock().expect("echo log").clear();
         let payloads: Vec<String> = (0..RELIABLE_ROUND_TRIPS)
             .map(|i| hex(format!("s5-reliable-{i:04}").as_bytes()))
@@ -655,38 +783,87 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                     service: ECHO_SERVICE.into(),
                     payloads: payloads.clone(),
                     timeout_ms: 20_000,
+                    concurrent: false,
                 },
             )
             .await;
         let replies = r.replies.clone().unwrap_or_default();
         let replies_correct = replies.len() == payloads.len()
-            && replies.iter().zip(&payloads).all(|(got, sent)| {
-                let want = {
-                    let mut v = b"echo:".to_vec();
-                    v.extend_from_slice(&unhex(sent));
-                    hex(&v)
-                };
-                *got == want
-            });
+            && replies
+                .iter()
+                .zip(&payloads)
+                .all(|(got, sent)| *got == echoed(sent));
         let delivered = echo_log.lock().expect("echo log").clone();
         let in_order = delivered.len() == payloads.len()
             && delivered
                 .iter()
                 .zip(&payloads)
                 .all(|(got, sent)| *got == unhex(sent));
+
+        // In flight together, on the same session.
+        echo_log.lock().expect("echo log").clear();
+        let burst: Vec<String> = (0..RELIABLE_IN_FLIGHT)
+            .map(|i| hex(format!("s5-inflight-{i:04}-{:016x}", rand_u64()).as_bytes()))
+            .collect();
+        let c = script
+            .run(
+                "a",
+                Step5::CallMany {
+                    id: 0,
+                    session: "main".into(),
+                    service: ECHO_SERVICE.into(),
+                    payloads: burst.clone(),
+                    timeout_ms: 20_000,
+                    concurrent: true,
+                },
+            )
+            .await;
+        let burst_replies = c.replies.clone().unwrap_or_default();
+        // Correlation, by index: reply i must be the echo of request
+        // i. Every request body is distinct and carries a nonce, so
+        // this cannot be satisfied by a reply that went to the wrong
+        // pending call.
+        let correlated = burst_replies.len() == burst.len()
+            && burst_replies
+                .iter()
+                .zip(&burst)
+                .all(|(got, sent)| *got == echoed(sent));
+        let burst_seen = echo_log.lock().expect("echo log").clone();
+        // Exactly once each, as a multiset: a duplicated handler
+        // invocation fails this as surely as a missing one.
+        let mut want: Vec<Vec<u8>> = burst.iter().map(|p| unhex(p)).collect();
+        let mut got = burst_seen.clone();
+        want.sort();
+        got.sort();
+        let handled_exactly_once = got == want;
+
         ledger.record(
             WITNESSES[1],
-            r.ok && replies_correct && in_order,
+            r.ok && replies_correct && in_order && c.ok && correlated && handled_exactly_once,
             format!(
-                "{RELIABLE_ROUND_TRIPS} sequential leaf nRPC round trips on one session: the \
+                "{RELIABLE_ROUND_TRIPS} SEQUENTIAL leaf nRPC round trips on one session: the \
                  browser received {} reply(ies) and every one carried `echo:` + its own \
                  request body={replies_correct}; the ANCHOR's handler ran {} time(s) and saw \
-                 the bodies in exactly the order sent={in_order}{}. ANCHOR STATE: {}",
+                 the bodies in exactly the order sent={in_order}{}. Then \
+                 {RELIABLE_IN_FLIGHT} calls IN FLIGHT together on the same session (issued \
+                 before any was awaited): {} reply(ies) returned and each matched its OWN \
+                 request by index={correlated}; the anchor's handler saw exactly the \
+                 {RELIABLE_IN_FLIGHT} distinct nonce bodies, once each={handled_exactly_once} \
+                 (saw {} invocation(s)){}. What this does NOT establish: retransmission or \
+                 reorder recovery — no loss is injected here and sequential loss-free calls \
+                 are satisfied by a fire-and-forget stream too; the injected-loss reliable \
+                 stream witness is the one that establishes that. ANCHOR STATE: {}",
                 replies.len(),
                 delivered.len(),
                 r.error
                     .as_deref()
                     .map(|e| format!("; error: {e}"))
+                    .unwrap_or_default(),
+                burst_replies.len(),
+                burst_seen.len(),
+                c.error
+                    .as_deref()
+                    .map(|e| format!("; concurrent error: {e}"))
                     .unwrap_or_default(),
                 peer_state(cx.anchor, node_id),
             ),
@@ -1054,7 +1231,24 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
             || (role_a == "follower" && role_b == "leader");
         let same_generation = !gen_a.is_empty() && gen_a == gen_b;
 
-        // Evidence, not a gate — see the header.
+        // Which tab holds the lock decides the whole schedule below,
+        // so it is asserted rather than assumed: tab a ran
+        // `openSession` to completion before tab b was opened, so tab
+        // a must be the leader. A run where that is not true cannot
+        // be driven by this script and says so instead of quietly
+        // closing the wrong tab.
+        let leader_is_a = role_a == "leader" && role_b == "follower";
+
+        // GATED, and the O1 repair: the FOLLOWER's own nRPC must
+        // reach the anchor's REAL handler and its reply must come
+        // back to the follower. That chain is proxy → leader → the
+        // leader's node → DataChannel → the anchor's dispatcher, and
+        // breaking only the follower half of it used to leave every
+        // named real-browser verdict green. Recording both calls as
+        // "evidence" was an observation, not an acceptance predicate.
+        let leader_nonce = format!("tab-leader-{:016x}", rand_u64());
+        let follower_nonce = format!("tab-follower-{:016x}", rand_u64());
+        echo_log.lock().expect("echo log").clear();
         let call_a = script
             .run(
                 "a",
@@ -1062,12 +1256,12 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                     id: 0,
                     session: "lead".into(),
                     service: ECHO_SERVICE.into(),
-                    payload: hex(b"tab-a-after"),
+                    payload: hex(leader_nonce.as_bytes()),
                     timeout_ms: 15_000,
                 },
             )
             .await;
-        let call_b = if same_identity {
+        let call_b = if same_identity && leader_is_a {
             script
                 .run(
                     "b",
@@ -1075,14 +1269,27 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                         id: 0,
                         session: "second".into(),
                         service: ECHO_SERVICE.into(),
-                        payload: hex(b"tab-b-after"),
+                        payload: hex(follower_nonce.as_bytes()),
                         timeout_ms: 15_000,
                     },
                 )
                 .await
         } else {
-            fail("not attempted: the second tab did not share the first tab's identity")
+            fail("not attempted: the two tabs did not reach one shared identity with tab a leading")
         };
+        let echoed = |r: &StepResult, nonce: &str| {
+            let mut want = b"echo:".to_vec();
+            want.extend_from_slice(nonce.as_bytes());
+            r.ok && r.reply.as_deref() == Some(hex(&want).as_str())
+        };
+        let handler_bodies = echo_log.lock().expect("echo log").clone();
+        let handler_saw = |nonce: &str| {
+            handler_bodies
+                .iter()
+                .any(|b| b.as_slice() == nonce.as_bytes())
+        };
+        let leader_rpc = echoed(&call_a, &leader_nonce) && handler_saw(&leader_nonce);
+        let follower_rpc = echoed(&call_b, &follower_nonce) && handler_saw(&follower_nonce);
 
         // The frozen-tab leg, with a MEASURED correction from
         // slice 3: on current Chromium a frozen tab KEEPS its Web
@@ -1133,19 +1340,240 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
         // reported a promotion does.
         let freeze_pass = frozen.is_err() || thawed.is_err() || still_follower;
 
+        // ---- the leader CLOSES, with work pending and state to
+        // ---- restore (the half O1 says this witness never took)
+        //
+        // The script used to close the FOLLOWER, which proves
+        // nothing about handoff: the remaining tab was already the
+        // leader. Here the LEADER stands down while a follower is
+        // attached, a call is genuinely outstanding on the anchor,
+        // and a capability was announced at RUNTIME through the
+        // leader by the other tab. Four things then have to hold, and
+        // all four are gated:
+        //
+        //   * the pending call FAILS, typed, and the anchor's handler
+        //     was entered exactly ONCE — a silent replay would show
+        //     up as two invocations;
+        //   * the follower is PROMOTED, at a strictly higher
+        //     generation;
+        //   * the successor REBOOTSTRAPS: the anchor holds a session
+        //     for the same node id again, and it is a DIFFERENT
+        //     session id, so a retained one cannot pass;
+        //   * the announcement intent SURVIVES — the anchor resolves
+        //     the runtime tag after the handoff — and a new nRPC
+        //     round trip works end to end.
+        let restore_req =
+            CapabilityRequirement::from_filter(CapabilityFilter::new().require_tag(RESTORE_TAG));
+        let driveable = same_identity && leader_is_a;
+        let announced_at_runtime = if driveable {
+            script
+                .run(
+                    "b",
+                    Step5::Announce {
+                        id: 0,
+                        session: "second".into(),
+                        capabilities: vec![STAGE5_TAG.to_string(), RESTORE_TAG.to_string()],
+                    },
+                )
+                .await
+        } else {
+            fail("not attempted: the two tabs did not reach one shared identity with tab a leading")
+        };
+        park_log.lock().expect("park log").clear();
+        let park_nonce = format!("across-handoff-{:016x}", rand_u64());
+        let pending_issued = if driveable {
+            script
+                .run(
+                    "b",
+                    Step5::CallBegin {
+                        id: 0,
+                        session: "second".into(),
+                        service: PARK_SERVICE.into(),
+                        payload: hex(park_nonce.as_bytes()),
+                        timeout_ms: 60_000,
+                        handle: "across-handoff".into(),
+                    },
+                )
+                .await
+        } else {
+            fail("not attempted")
+        };
+        // The call is only "pending" if it actually reached the
+        // anchor. Without this the leg would also pass for a call
+        // that never left the tab.
+        let park_entered = pending_issued.ok
+            && wait_for(
+                || !park_log.lock().expect("park log").is_empty(),
+                Duration::from_secs(20),
+            )
+            .await;
+
+        let session_before_close = cx.anchor.peer_session_id(leader_node);
+        let close_at = std::time::Instant::now();
+        let leader_stood_down = if driveable {
+            script
+                .run(
+                    "a",
+                    Step5::Close {
+                        id: 0,
+                        session: "lead".into(),
+                    },
+                )
+                .await
+        } else {
+            fail("not attempted")
+        };
+        let _ = cx.driver.close_page("leaf5-a").await;
+
+        // Pending work: typed failure, once.
+        let pending_outcome = if park_entered {
+            script
+                .run(
+                    "b",
+                    Step5::CallAwait {
+                        id: 0,
+                        handle: "across-handoff".into(),
+                        timeout_ms: 45_000,
+                    },
+                )
+                .await
+        } else {
+            fail("not attempted: nothing was pending on the anchor")
+        };
+        let pending_failed_typed = !pending_outcome.ok
+            && pending_outcome.info.as_deref() != Some("never settled")
+            && pending_outcome.kind.is_some();
+        let park_invocations = park_log.lock().expect("park log").len();
+        // Let the anchor's parked handler finish; its reply has
+        // nowhere to go, which is the honest shape of "the remote
+        // operation may still have executed".
+        park_release.add_permits(1);
+
+        // Promotion, polled on the surviving tab.
+        let old_generation = gen_a.parse::<u128>().ok();
+        let mut promoted = fail("not attempted");
+        for _ in 0..40 {
+            if !driveable {
+                break;
+            }
+            let info = script
+                .run(
+                    "b",
+                    Step5::Info {
+                        id: 0,
+                        session: "second".into(),
+                    },
+                )
+                .await;
+            let is_leader = info.role.as_deref() == Some("leader");
+            promoted = info;
+            if is_leader {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        let promoted_role = promoted.role.clone().unwrap_or_default();
+        let promoted_gen = promoted.generation.clone().unwrap_or_default();
+        let generation_advanced = match (old_generation, promoted_gen.parse::<u128>().ok()) {
+            (Some(old), Some(new)) => new > old,
+            _ => false,
+        };
+
+        // Successor rebootstrap, read at the anchor.
+        let rebootstrapped = wait_for(
+            || {
+                let now = cx.anchor.peer_session_id(leader_node);
+                now.is_some() && now != session_before_close
+            },
+            Duration::from_secs(45),
+        )
+        .await;
+        let successor_session = cx.anchor.peer_session_id(leader_node);
+
+        // Restoration of announcement intent, read at the anchor.
+        let restored_tag = rebootstrapped
+            && wait_for(
+                || cx.anchor.find_best_node(&restore_req) == Some(leader_node),
+                Duration::from_secs(30),
+            )
+            .await;
+
+        // And traffic again, from the promoted tab, through the real
+        // native handler.
+        let after_nonce = format!("after-handoff-{:016x}", rand_u64());
+        echo_log.lock().expect("echo log").clear();
+        let call_after = if rebootstrapped {
+            script
+                .run(
+                    "b",
+                    Step5::Call {
+                        id: 0,
+                        session: "second".into(),
+                        service: ECHO_SERVICE.into(),
+                        payload: hex(after_nonce.as_bytes()),
+                        timeout_ms: 30_000,
+                    },
+                )
+                .await
+        } else {
+            fail("not attempted: the successor never rebootstrapped")
+        };
+        let after_bodies = echo_log.lock().expect("echo log").clone();
+        let recovered_rpc = echoed(&call_after, &after_nonce)
+            && after_bodies
+                .iter()
+                .any(|b| b.as_slice() == after_nonce.as_bytes());
+        let interruption_ms = close_at.elapsed().as_millis();
+
         ledger.record(
             WITNESSES[5],
-            same_identity && one_leader && same_generation && no_eviction && freeze_pass,
+            same_identity
+                && one_leader
+                && leader_is_a
+                && same_generation
+                && no_eviction
+                && freeze_pass
+                && leader_rpc
+                && follower_rpc
+                && announced_at_runtime.ok
+                && leader_stood_down.ok
+                && park_entered
+                && pending_failed_typed
+                && park_invocations == 1
+                && promoted_role == "leader"
+                && generation_advanced
+                && rebootstrapped
+                && restored_tag
+                && recovered_rpc,
             format!(
                 "both tabs opened through §8's openSession on one Web Lock scope. Tab a is \
                  node {} role={role_a:?} generation={gen_a:?}; tab b reported {}{} \
                  role={role_b:?} generation={gen_b:?} — same identity={same_identity}, \
-                 exactly one leader and one follower={one_leader}, same \
-                 generation={same_generation}. The ANCHOR's session for that node id was \
-                 {session_before:?} before tab b arrived and {session_after:?} after, so tab \
-                 b did NOT evict tab a's session={no_eviction} (a replacement session would \
-                 be an eviction under another name). {freeze_leg}. EVIDENCE, not gated here: \
-                 tab a call ok={}, tab b call ok={}{}. ANCHOR STATE: {}",
+                 exactly one leader and one follower={one_leader}, tab a is the \
+                 leader={leader_is_a}, same generation={same_generation}. The ANCHOR's \
+                 session for that node id was {session_before:?} before tab b arrived and \
+                 {session_after:?} after, so tab b did NOT evict tab a's \
+                 session={no_eviction} (a replacement session would be an eviction under \
+                 another name). {freeze_leg}. GATED I/O: the LEADER's nRPC nonce reached the \
+                 anchor's real handler and its exact reply came back={leader_rpc}; the \
+                 FOLLOWER's nonce did the same, across proxy → leader → node → DataChannel \
+                 → dispatcher={follower_rpc}{}. LEADER CLOSE with work pending: tab b \
+                 announced `{RESTORE_TAG}` at runtime through the leader (ok={}), a call to \
+                 `{PARK_SERVICE}` was issued and left outstanding and the anchor's handler \
+                 confirmed it ENTERED={park_entered}; tab a's session then stood down \
+                 (ok={}) and its page was closed. The pending call failed with a TYPED \
+                 rejection={pending_failed_typed} (kind={:?} message={:?} info={:?}), and \
+                 the anchor's parked handler was entered {park_invocations} time(s) — \
+                 exactly once is the requirement, so a silent replay fails here. Tab b was \
+                 promoted to role={promoted_role:?} at generation={promoted_gen:?}, strictly \
+                 higher than {gen_a:?}={generation_advanced}. The anchor then held a session \
+                 for the SAME node id again: {successor_session:?} vs {session_before_close:?} \
+                 before the close, a different incarnation={rebootstrapped}. \
+                 find_best_node(require_tag=`{RESTORE_TAG}`) resolved to the node after the \
+                 handoff={restored_tag}, so the runtime announcement intent survived it. A \
+                 new nRPC round trip from the promoted tab reached the real handler and came \
+                 back={recovered_rpc}. End-to-end interruption, close → recovered round \
+                 trip: {interruption_ms} ms. ANCHOR STATE: {}",
                 if leader_hex.is_empty() {
                     "nothing"
                 } else {
@@ -1161,31 +1589,188 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                     .as_deref()
                     .map(|e| format!(" (error: {e})"))
                     .unwrap_or_default(),
-                call_a.ok,
-                call_b.ok,
                 call_b
                     .error
                     .as_deref()
-                    .map(|e| format!("; tab b error: {e}"))
+                    .map(|e| format!("; follower error: {e}"))
                     .unwrap_or_default(),
+                announced_at_runtime.ok,
+                leader_stood_down.ok,
+                pending_outcome.kind,
+                pending_outcome.message,
+                pending_outcome.info,
                 peer_state(cx.anchor, leader_node),
             ),
         );
-        // Close the second session through its own API before the
-        // tab goes away, so the anchor sees an orderly departure
-        // rather than a transport that vanished.
-        if same_identity {
+    }
+
+    // ================================================================
+    // 6b — a reconnect that DISPLACES an extant busy incumbent
+    //
+    // The browser counterpart of the native R12 witness, and the O2
+    // repair. The retry control in witness 7 below waits for the
+    // anchor to FORGET the identity before reconnecting, and
+    // continues either way — so a green run can take the
+    // absent-session branch and never exercise the responder's
+    // busy-displacement path at all. Here the premise is asserted
+    // before the reconnect is attempted:
+    //
+    //   * the anchor holds a session for this node id, and
+    //   * that session is BUSY by the gate's own definition — at
+    //     least one application stream open, not just the signalling
+    //     stream.
+    //
+    // Then the SAME custodial identity connects again from the same
+    // tab: a new DataChannel, the anchor as RESPONDER, the incumbent
+    // busy on a different RTC endpoint. It must succeed, the
+    // anchor's session must be a DIFFERENT incarnation afterwards,
+    // and traffic must work on the successor.
+    // ================================================================
+    {
+        let name = WITNESSES[6];
+        let signalling = u64::from(net::adapter::net::rtc::SUBPROTOCOL_RTC_SIGNAL);
+        let busy_ids = |node: u64| -> Vec<u64> {
+            cx.anchor
+                .peer_session_for_test(node)
+                .map(|s| {
+                    s.stream_ids()
+                        .into_iter()
+                        .filter(|id| *id != signalling)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
+        // Make the incumbent busy the way an application does: one
+        // nRPC REQUEST event on a stream the page opens, encoded
+        // natively under the leaf's own origin so the anchor admits
+        // and DISPATCHES it.
+        let frame = rpc_request_frame(SINK_SERVICE, origin_hash, 0x6B00, b"s5-busy-premise");
+        let busied = script
+            .run(
+                "b",
+                Step5::StreamSend {
+                    id: 0,
+                    session: "second".into(),
+                    reliable: false,
+                    stream_id: format!("{}", frame.stream_id),
+                    channel_hash: frame.channel_hash_u16,
+                    payloads: vec![hex(&frame.payload)],
+                    drop_every: 0,
+                },
+            )
+            .await;
+        let incumbent_live =
+            wait_for(|| !busy_ids(node_id).is_empty(), Duration::from_secs(20)).await;
+        let incumbent_session = cx.anchor.peer_session_id(node_id);
+        let open_streams = busy_ids(node_id);
+        // HARD premise. An absent or quiet incumbent means the
+        // displacement branch was never reached, which is a FAILURE
+        // of this witness rather than a pass by another route.
+        let premise = incumbent_session.is_some() && incumbent_live;
+
+        let reconnected = if premise {
+            script.run("b", connect_step("reconnect", false)).await
+        } else {
+            fail(
+                "not attempted: there was no extant BUSY incumbent to displace, so the \
+                  responder's displacement branch could not be reached",
+            )
+        };
+        let reconnect_node = reconnected
+            .node_id
+            .as_deref()
+            .map(|h| u64::from_str_radix(h.trim_start_matches("0x"), 16).unwrap_or(0))
+            .unwrap_or(0);
+        let same_identity_again = reconnect_node == node_id;
+        let displaced = premise
+            && reconnected.ok
+            && wait_for(
+                || {
+                    let now = cx.anchor.peer_session_id(node_id);
+                    now.is_some() && now != incumbent_session
+                },
+                Duration::from_secs(30),
+            )
+            .await;
+        let successor = cx.anchor.peer_session_id(node_id);
+
+        // The successor has to carry traffic, or "displaced" would
+        // only mean the incumbent was destroyed.
+        let nonce = format!("after-displacement-{:016x}", rand_u64());
+        echo_log.lock().expect("echo log").clear();
+        let call = if displaced {
+            script
+                .run(
+                    "b",
+                    Step5::Call {
+                        id: 0,
+                        session: "reconnect".into(),
+                        service: ECHO_SERVICE.into(),
+                        payload: hex(nonce.as_bytes()),
+                        timeout_ms: 30_000,
+                    },
+                )
+                .await
+        } else {
+            fail("not attempted: nothing was displaced")
+        };
+        let mut want = b"echo:".to_vec();
+        want.extend_from_slice(nonce.as_bytes());
+        let handler_saw_it = echo_log
+            .lock()
+            .expect("echo log")
+            .iter()
+            .any(|b| b.as_slice() == nonce.as_bytes());
+        let successor_works =
+            call.ok && call.reply.as_deref() == Some(hex(&want).as_str()) && handler_saw_it;
+
+        ledger.record(
+            name,
+            premise && reconnected.ok && same_identity_again && displaced && successor_works,
+            format!(
+                "PREMISE FIRST, because the absent-session branch proves nothing about \
+                 displacement: before the reconnect the anchor held session \
+                 {incumbent_session:?} for node {node_id:#018x} and that session was BUSY \
+                 by the gate's own definition — application streams {open_streams:?} open \
+                 besides the signalling stream {signalling:#x} (busy={incumbent_live}, the \
+                 event that made it so ok={}). The SAME custodial identity then connected \
+                 again from the same tab (a new DataChannel, so the anchor is the RESPONDER \
+                 facing a busy incumbent on a DIFFERENT RTC endpoint): ok={}{}, reported node \
+                 {:?} which is the same identity={same_identity_again}. The anchor's session \
+                 afterwards is {successor:?} — a different incarnation than the one \
+                 displaced={displaced}. A nonce round trip on the successor reached the \
+                 anchor's real handler and came back exactly={successor_works}. ANCHOR \
+                 STATE: {}",
+                busied.ok,
+                reconnected.ok,
+                reconnected
+                    .error
+                    .as_deref()
+                    .map(|e| format!(" (error: {e})"))
+                    .unwrap_or_default(),
+                reconnected.node_id,
+                peer_state(cx.anchor, node_id),
+            ),
+        );
+
+        // Hand the identity back through the session's own API, then
+        // let tab b go and bring tab a back for the last witness.
+        for session in ["reconnect", "second"] {
             let _ = script
                 .run(
                     "b",
                     Step5::Close {
                         id: 0,
-                        session: "second".into(),
+                        session: session.into(),
                     },
                 )
                 .await;
         }
         let _ = cx.driver.close_page("leaf5-b").await;
+        if let Err(e) = cx.driver.open_page("leaf5-a", &url_a).await {
+            println!("[stage5] WARNING: could not reopen tab a for the UDP witness: {e}");
+        }
     }
 
     // ================================================================
@@ -1216,27 +1801,20 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
     // "typed failure under a blocked network".
     // ================================================================
     {
-        let name = WITNESSES[6];
-        // Hand the previous witness's session back FIRST. The
-        // shared-identity witness leaves tab a's leader session open,
-        // and this witness connects the SAME identity twice more
-        // (blocked, then the control). An anchor still holding a live
-        // peer entry for that node id closes the next bootstrap
-        // dialog — observed as `the anchor closed the bootstrap
-        // dialog: 1006` on the control leg, which is one identity
-        // arriving twice, not a defect in the typed failure. Closing
-        // through the session's own API is an orderly departure; the
-        // browser relaunch below would otherwise just make the
-        // transport vanish.
-        let _ = script
-            .run(
-                "a",
-                Step5::Close {
-                    id: 0,
-                    session: "lead".into(),
-                },
-            )
-            .await;
+        let name = WITNESSES[7];
+        // The sessions of the two witnesses above are already handed
+        // back through their own APIs (the displacement witness
+        // closes `reconnect` and `second`; the leader-close leg
+        // stands `lead` down). Tab a was reopened fresh for this
+        // witness, so there is nothing of its own to close — but the
+        // ANCHOR's side of those departures is asynchronous, which is
+        // what the wait below is for. This witness connects the SAME
+        // identity twice more (blocked, then the control), and an
+        // anchor still holding a live peer entry for that node id
+        // closes the next bootstrap dialog — observed as `the anchor
+        // closed the bootstrap dialog: 1006` on the control leg,
+        // which is one identity arriving twice, not a defect in the
+        // typed failure.
         // Closing is asynchronous ON THE ANCHOR: the peer entry goes
         // when the transport actually drops, not when the page
         // returns. The control leg below presents the SAME custodial
@@ -1314,7 +1892,12 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                 } else {
                     fail("not attempted: the profile was not established")
                 };
-                profile.remove().await;
+                // H2: the removal result is no longer discarded. A
+                // rule the kernel refused to delete would otherwise
+                // be reported as "removed" on the strength of the
+                // command having been issued, and left behind on the
+                // host.
+                let removed = profile.remove().await;
                 let kind = blocked.kind.clone().unwrap_or_default();
                 let message = blocked.message.clone().unwrap_or_default();
                 let elapsed = blocked.elapsed_ms.unwrap_or(f64::NAN);
@@ -1345,7 +1928,12 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                 // the engine profile "gone" means relaunched without
                 // the flag, which is also what undoes it.
                 let restored = match &profile {
-                    UdpProfile::Firewall(_) => Ok(String::from("the kernel rule was removed")),
+                    UdpProfile::Firewall(_) => removed
+                        .clone()
+                        .map(|()| {
+                            String::from("the kernel rule was removed and the kernel took it")
+                        })
+                        .map_err(|e| format!("the kernel REFUSED the removal: {e}")),
                     UdpProfile::EngineUdpOff { .. } => {
                         relaunch(&cx, false, &url_a, "with its UDP restored").await
                     }
@@ -1363,7 +1951,8 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                         && stun_failed
                         && control.ok
                         && probe_is_sound
-                        && profile_in_force,
+                        && profile_in_force
+                        && removed.is_ok(),
                     format!(
                         "FALSIFIER FIRST: against the HEALTHY anchor an unauthenticated STUN \
                          binding to {} came back {healthy_outcome:?}, so the probe the typing \

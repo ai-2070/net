@@ -67,6 +67,11 @@ function originOf(node) {
 const logEl = document.getElementById('log');
 const TAB = new URLSearchParams(location.search).get('tab') || 'a';
 const nodes = new Map();
+/// Calls issued by `call_begin` and awaited later by `call_await`.
+/// Keyed by the runner's handle name; the value is a promise that
+/// always fulfils, carrying either the reply or the typed failure, so
+/// an unhandled rejection can never escape between the two steps.
+const pending = new Map();
 
 function log(line) {
   const text = '[' + TAB + '] ' + line;
@@ -248,11 +253,76 @@ async function execute(step) {
       }
     }
 
-    // `calls` sequential round trips on one session, so a 64-call
-    // ordering assertion costs one HTTP round trip rather than 64.
+    // A call that is issued now and awaited later, so the runner can
+    // act on the tab — stand the leader down, for instance — while
+    // the call is genuinely outstanding.
+    case 'call_begin': {
+      const node = nodes.get(step.session);
+      if (!node) return { ok: false, error: 'no such session ' + step.session };
+      const promise = node
+        .call(step.service, unhex(step.payload), step.timeout_ms)
+        .then((reply) => ({ settled: 'resolved', reply: hex(new Uint8Array(reply)) }))
+        .catch((e) => ({ settled: 'rejected', failure: typedFailure(e) }));
+      pending.set(step.handle, promise);
+      return { ok: true, info: 'issued, not awaited' };
+    }
+
+    case 'call_await': {
+      const promise = pending.get(step.handle);
+      if (!promise) return { ok: false, error: 'no pending call ' + step.handle };
+      pending.delete(step.handle);
+      // Raced against a local timer: a promise that never settles is
+      // a REPORTABLE outcome ("never settled"), not a hung step.
+      const HUNG = Symbol('hung');
+      const out = await Promise.race([promise, sleep(step.timeout_ms).then(() => HUNG)]);
+      if (out === HUNG) {
+        return { ok: false, error: 'the pending call never settled', info: 'never settled' };
+      }
+      if (out.settled === 'resolved') {
+        return { ok: true, reply: out.reply, info: 'resolved' };
+      }
+      return { ...out.failure, info: 'rejected' };
+    }
+
+    // `calls` round trips on one session, so a multi-call assertion
+    // costs one HTTP round trip rather than one per call.
+    //
+    // Two modes, two different properties. Sequential awaits each
+    // reply before issuing the next, which is what makes the
+    // anchor's arrival ORDER meaningful. Concurrent issues every
+    // call first and awaits them together, so N requests are
+    // outstanding at once and each reply has to reach its own
+    // caller; `replies[i]` stays the reply to `payloads[i]` by
+    // INDEX, so a reply delivered to the wrong pending call shows
+    // up as a mismatch rather than being masked by arrival order.
     case 'call_many': {
       const node = nodes.get(step.session);
       if (!node) return { ok: false, error: 'no such session ' + step.session };
+      if (step.concurrent) {
+        const settled = await Promise.allSettled(
+          step.payloads.map((payload) =>
+            node.call(step.service, unhex(payload), step.timeout_ms),
+          ),
+        );
+        const replies = [];
+        let firstFailure = null;
+        for (let i = 0; i < settled.length; i += 1) {
+          const outcome = settled[i];
+          if (outcome.status === 'fulfilled') {
+            replies.push(hex(new Uint8Array(outcome.value)));
+          } else {
+            replies.push('');
+            if (firstFailure === null) firstFailure = { index: i, reason: outcome.reason };
+          }
+        }
+        if (firstFailure !== null) {
+          const out = typedFailure(firstFailure.reason);
+          out.replies = replies;
+          out.info = 'concurrent call ' + firstFailure.index + ' of ' + settled.length + ' failed';
+          return out;
+        }
+        return { ok: true, replies };
+      }
       const replies = [];
       for (const payload of step.payloads) {
         try {

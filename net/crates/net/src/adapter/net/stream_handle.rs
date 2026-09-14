@@ -31,6 +31,19 @@
 //! from the first call's, and hands back a handle describing the
 //! config you asked for) still lets the two disagree. That predates
 //! Stage 2 and is untouched here.
+//!
+//! S5-R12 added the other half of the handle's identity: the
+//! **session incarnation**. The handle used to name a peer, a stream
+//! id and a per-session epoch, which is enough while a peer node id
+//! has one session for the life of every handle. It stopped being
+//! enough when the RTC responder was allowed to displace a *busy*
+//! incumbent the peer had itself superseded: the successor session
+//! restarts the epoch counter at 1, so the predecessor's first-stream
+//! handle matched the successor's first-stream epoch exactly and its
+//! sends landed on the new lifetime carrying the old config. A handle
+//! now records the `session_id` it was minted against, and every
+//! operation that touches stream state refuses a mismatch with
+//! `StreamError::SessionSuperseded`.
 
 use super::stream::StreamConfig;
 
@@ -56,9 +69,10 @@ use super::stream::StreamConfig;
 ///
 /// ```
 /// # use net::adapter::net::{Reliability, Stream, StreamConfig};
-/// fn inspect(handle: &Stream) -> (u64, u64, u64, Reliability) {
+/// fn inspect(handle: &Stream) -> (u64, u64, u64, u64, Reliability) {
 ///     (
 ///         handle.peer_node_id(),
+///         handle.session_id(),
 ///         handle.stream_id(),
 ///         handle.epoch(),
 ///         handle.config().reliability,
@@ -86,6 +100,16 @@ use super::stream::StreamConfig;
 /// }
 /// ```
 ///
+/// So is writing the session incarnation, which would let a handle
+/// from a displaced session address its successor:
+///
+/// ```compile_fail
+/// # use net::adapter::net::Stream;
+/// fn revive(handle: &mut Stream) {
+///     handle.session_id = 7;
+/// }
+/// ```
+///
 /// And a handle cannot be minted for an existing stream id at all:
 ///
 /// ```compile_fail
@@ -93,7 +117,8 @@ use super::stream::StreamConfig;
 /// fn forge() -> Stream {
 ///     Stream {
 ///         peer_node_id: 1,
-///         stream_id: 2,
+///         session_id: 2,
+///         stream_id: 3,
 ///         epoch: 0,
 ///         config: StreamConfig::default(),
 ///     }
@@ -102,6 +127,7 @@ use super::stream::StreamConfig;
 #[derive(Debug, Clone)]
 pub struct Stream {
     peer_node_id: u64,
+    session_id: u64,
     stream_id: u64,
     epoch: u64,
     config: StreamConfig,
@@ -111,12 +137,20 @@ impl Stream {
     /// Build a handle for a stream the session has just opened.
     ///
     /// `pub(crate)` by design: `epoch` is only meaningful when it came
-    /// from `NetSession::open_stream_full`, and `config` is only
-    /// truthful when it is the config that open actually installed.
+    /// from `NetSession::open_stream_full` on the session identified
+    /// by `session_id`, and `config` is only truthful when it is the
+    /// config that open actually installed.
     #[inline]
-    pub(crate) fn new(peer_node_id: u64, stream_id: u64, epoch: u64, config: StreamConfig) -> Self {
+    pub(crate) fn new(
+        peer_node_id: u64,
+        session_id: u64,
+        stream_id: u64,
+        epoch: u64,
+        config: StreamConfig,
+    ) -> Self {
         Self {
             peer_node_id,
+            session_id,
             stream_id,
             epoch,
             config,
@@ -129,6 +163,31 @@ impl Stream {
         self.peer_node_id
     }
 
+    /// The **session incarnation** this stream belongs to: the
+    /// `NetSession::session_id` that was installed for
+    /// [`Self::peer_node_id`] when the stream was opened.
+    ///
+    /// A peer node id is not a session. One identity can be installed
+    /// many times over a node's life — a reconnect, a key rotation,
+    /// or (since the RTC responder is allowed to displace a *busy*
+    /// incumbent that the peer itself superseded) a replacement while
+    /// this node still holds open streams on the predecessor.
+    ///
+    /// The stream [`epoch`](Self::epoch) cannot stand in for this: it
+    /// is allocated by a counter that restarts at 1 for every session,
+    /// so the successor's first stream carries exactly the epoch the
+    /// predecessor's first stream carried. Without this field a handle
+    /// from the displaced session resolves onto the successor's state
+    /// and transmits under the *old* handle's reliability flags.
+    ///
+    /// `send_on_stream`, `close_stream` and the credit admission all
+    /// refuse with `StreamError::SessionSuperseded` when this does not
+    /// match the peer's current session.
+    #[inline]
+    pub fn session_id(&self) -> u64 {
+        self.session_id
+    }
+
     /// The stream id. Caller-chosen, opaque `u64`.
     #[inline]
     pub fn stream_id(&self) -> u64 {
@@ -137,10 +196,10 @@ impl Stream {
 
     /// Epoch of the `StreamState` this handle was opened against.
     ///
-    /// If the stream is closed and reopened under the same id, the new
-    /// state carries a different epoch and this handle's sends fail
-    /// with `NotConnected` — which is what stops a stale handle from
-    /// silently operating on a different lifetime of the same id.
+    /// If the stream is closed and reopened under the same id **on the
+    /// same session**, the new state carries a different epoch and this
+    /// handle's sends fail with `NotConnected`. Across sessions the
+    /// epoch proves nothing — that is [`Self::session_id`]'s job.
     #[inline]
     pub fn epoch(&self) -> u64 {
         self.epoch

@@ -72,6 +72,16 @@ pub enum SdkError {
     #[error("stream not connected")]
     NotConnected,
 
+    /// The stream handle's session has been replaced by a successor
+    /// incarnation of the same peer. Distinct from
+    /// [`Self::NotConnected`]: the peer is connected, the stream id
+    /// may even be open — but on a different session than the one
+    /// this handle was minted against, with its own credit, sequence
+    /// space and reliability config. Re-open against the current
+    /// session; retrying the handle can never succeed.
+    #[error("stream's session has been replaced by a successor")]
+    SessionSuperseded,
+
     /// A publisher's `Ack` rejected a Subscribe / Unsubscribe
     /// request. `None` means the rejection arrived without a
     /// structured reason. Gated behind `net` because
@@ -112,6 +122,7 @@ impl From<net::adapter::net::StreamError> for SdkError {
         match e {
             StreamError::Backpressure => SdkError::Backpressure,
             StreamError::NotConnected => SdkError::NotConnected,
+            StreamError::SessionSuperseded => SdkError::SessionSuperseded,
             StreamError::Transport(msg) => SdkError::Adapter(msg),
         }
     }

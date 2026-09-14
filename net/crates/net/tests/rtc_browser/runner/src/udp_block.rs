@@ -147,11 +147,13 @@ impl UdpProfile {
         }
     }
 
-    /// Remove whatever was installed. A no-op for the engine policy,
-    /// which the caller undoes by relaunching the browser without it.
-    pub async fn remove(&self) {
-        if let Self::Firewall(block) = self {
-            block.remove().await;
+    /// Remove whatever was installed, reporting failure rather than
+    /// discarding it. A no-op (and `Ok`) for the engine policy, which
+    /// the caller undoes by relaunching the browser without it.
+    pub async fn remove(&self) -> Result<(), String> {
+        match self {
+            Self::Firewall(block) => block.remove().await,
+            Self::EngineUdpOff { .. } => Ok(()),
         }
     }
 }
@@ -177,6 +179,9 @@ impl UdpBlock {
         }
         let ip = target.ip().to_string();
         let port = target.port().to_string();
+        // `inet` tables carry both families, so an address match has
+        // to name the one it is matching.
+        let family = if target.is_ipv4() { "ip" } else { "ip6" };
 
         // nftables first: it is what a current Linux runner has, and
         // its own table means removal cannot disturb a rule the
@@ -207,6 +212,17 @@ impl UdpBlock {
                 "in".into(),
                 "{ type filter hook input priority 0; policy accept; }".into(),
             ],
+            // Address AND port, in that order — H2. These rules used
+            // to match the port on EVERY address in the host's `inet`
+            // table, so same-port UDP to an unrelated IP was dropped
+            // too, while the comment and the returned message
+            // promised address+port isolation and the iptables
+            // fallback below actually implemented it. The injected
+            // fault now matches what it claims to match.
+            //
+            // `inet` carries both families, so the address matcher is
+            // family-qualified: `ip`/`ip6` daddr, chosen from the
+            // target rather than assumed v4.
             vec![
                 "nft".into(),
                 "add".into(),
@@ -214,6 +230,9 @@ impl UdpBlock {
                 "inet".into(),
                 TABLE.into(),
                 "out".into(),
+                family.into(),
+                "daddr".into(),
+                ip.clone(),
                 "udp".into(),
                 "dport".into(),
                 port.clone(),
@@ -226,6 +245,9 @@ impl UdpBlock {
                 "inet".into(),
                 TABLE.into(),
                 "in".into(),
+                family.into(),
+                "saddr".into(),
+                ip.clone(),
                 "udp".into(),
                 "sport".into(),
                 port.clone(),
@@ -243,8 +265,10 @@ impl UdpBlock {
         if run_all(&nft_add).await.is_ok() {
             return Ok(Self {
                 how: format!(
-                    "nft table inet {TABLE}: drop udp dport/sport {port} (the anchor's \
-                     rtc_addr {target}); TCP, DNS and every other flow untouched"
+                    "nft table inet {TABLE}: drop udp to {family} daddr {ip} dport {port} and \
+                     from {family} saddr {ip} sport {port} (the anchor's rtc_addr {target}); \
+                     same-port UDP to any OTHER address, TCP, DNS and every other flow \
+                     untouched"
                 ),
                 undo: nft_undo,
             });
@@ -327,8 +351,17 @@ impl UdpBlock {
         }
     }
 
-    pub async fn remove(&self) {
-        let _ = run_all(&self.undo).await;
+    /// Remove the profile, reporting whether the kernel actually took
+    /// the removal.
+    ///
+    /// The result used to be discarded, which made "the rule was
+    /// removed" a claim about a command having been issued. A
+    /// successful control connect afterwards is evidence of
+    /// restoration; an UNSUCCESSFUL one does not tell the host
+    /// whether a rule was left behind, so the failure is surfaced
+    /// here instead of swallowed.
+    pub async fn remove(&self) -> Result<(), String> {
+        run_all(&self.undo).await
     }
 }
 

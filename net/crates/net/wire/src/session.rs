@@ -304,10 +304,20 @@ impl NetSession {
 
     /// Allocate a unique epoch for a freshly-opened stream.
     ///
-    /// Monotonic per session — a stream closed and reopened gets a
-    /// **new** epoch, which is how stale `Stream` handles and
-    /// `TxSlotGuard`s are prevented from operating on a different
-    /// lifetime of the same `stream_id`.
+    /// Monotonic **within one session** — a stream closed and reopened
+    /// on the same session gets a new epoch, which is how stale
+    /// `Stream` handles and `TxSlotGuard`s are kept off a different
+    /// lifetime of the same `stream_id` *on that session*.
+    ///
+    /// It says nothing across sessions. The counter restarts at 1 for
+    /// every `NetSession`, so the first stream of a successor session
+    /// carries the same epoch as the first stream of the session it
+    /// replaced. A handle is therefore only safe to resolve after its
+    /// recorded session incarnation has been matched against
+    /// [`Self::session_id`] — which is what
+    /// [`Self::try_acquire_tx_credit_for_lifetime`] requires and
+    /// `MeshNode::send_on_stream` / `close_stream` check before they
+    /// touch any stream state.
     #[inline]
     fn next_stream_epoch(&self) -> u64 {
         self.stream_epoch_counter.fetch_add(1, Ordering::Relaxed)
@@ -471,19 +481,28 @@ impl NetSession {
         self.try_acquire_tx_credit_inner(stream_id, None, bytes)
     }
 
-    /// Like [`Self::try_acquire_tx_credit_guard`], but additionally
-    /// rejects the admission if the live `StreamState`'s epoch
-    /// differs from `expected_epoch`.
+    /// Like [`Self::try_acquire_tx_credit_guard`], but admits only for
+    /// one exact stream lifetime: the caller's `session_id` must be
+    /// this session's own incarnation, and the live `StreamState`'s
+    /// epoch must equal `expected_epoch`.
     ///
-    /// Use from the typed-handle `send_on_stream` path so a handle
-    /// held across a close+reopen cycle doesn't admit against the new
-    /// stream's state.
-    pub fn try_acquire_tx_credit_matching_epoch(
+    /// Both halves are needed and neither implies the other. The epoch
+    /// catches a close+reopen *within* one session; the session id
+    /// catches a handle minted against a session that has since been
+    /// replaced — whose first stream reuses epoch 1 and would
+    /// otherwise admit here (see [`Self::next_stream_epoch`]).
+    ///
+    /// Use from the typed-handle `send_on_stream` path.
+    pub fn try_acquire_tx_credit_for_lifetime(
         self: &Arc<Self>,
         stream_id: u64,
+        session_id: u64,
         expected_epoch: u64,
         bytes: u32,
     ) -> TxAdmit {
+        if session_id != self.session_id {
+            return TxAdmit::SessionSuperseded;
+        }
         self.try_acquire_tx_credit_inner(stream_id, Some(expected_epoch), bytes)
     }
 
@@ -561,7 +580,7 @@ impl NetSession {
     }
 
     /// Roll back a TX sequence allocated by
-    /// [`Self::try_acquire_tx_credit_matching_epoch`] when the packet it
+    /// [`Self::try_acquire_tx_credit_for_lifetime`] when the packet it
     /// was minted for never reached the wire (scheduler/socket
     /// backpressure after the seq was consumed). Guarded by `epoch` so a
     /// close+reopen race can't roll back a sequence on a fresh stream
@@ -581,7 +600,7 @@ impl NetSession {
     }
 }
 
-/// Outcome of [`NetSession::try_acquire_tx_credit_matching_epoch`].
+/// Outcome of [`NetSession::try_acquire_tx_credit_for_lifetime`].
 #[derive(Debug)]
 pub enum TxAdmit {
     /// Admission succeeded; the guard holds the credit until dropped
@@ -600,6 +619,12 @@ pub enum TxAdmit {
     WindowFull,
     /// The stream isn't currently open on this session.
     StreamClosed,
+    /// The caller addressed a session incarnation this is not: its
+    /// handle was minted against a predecessor that has since been
+    /// replaced. Never retryable with the same handle — the stream
+    /// id may be open on the successor, but it is a different
+    /// lifetime with its own credit, sequence space and config.
+    SessionSuperseded,
 }
 
 /// RAII guard holding a byte credit acquired from a stream's
@@ -3075,7 +3100,12 @@ mod tests {
         session.open_stream_full(sid, false, 1, 100);
 
         assert!(matches!(
-            session.try_acquire_tx_credit_matching_epoch(sid, original_epoch, 10),
+            session.try_acquire_tx_credit_for_lifetime(
+                sid,
+                session.session_id(),
+                original_epoch,
+                10
+            ),
             TxAdmit::StreamClosed
         ));
         assert_eq!(
@@ -3086,7 +3116,75 @@ mod tests {
 
         let cur_epoch = session.try_stream(sid).unwrap().epoch();
         assert!(matches!(
-            session.try_acquire_tx_credit_matching_epoch(sid, cur_epoch, 10),
+            session.try_acquire_tx_credit_for_lifetime(sid, session.session_id(), cur_epoch, 10),
+            TxAdmit::Acquired { .. }
+        ));
+    }
+
+    /// The stream epoch restarts at 1 for every session, so a
+    /// successor's first stream carries the *same* epoch as the
+    /// predecessor's first stream. The epoch check alone therefore
+    /// admits a handle from the displaced session. Only the session
+    /// incarnation separates them.
+    ///
+    /// Inverse: drop the `session_id != self.session_id` guard in
+    /// `try_acquire_tx_credit_for_lifetime` — the first assertion
+    /// gets `Acquired` and the predecessor's handle debits the
+    /// successor's credit.
+    #[test]
+    fn test_regression_equal_epochs_across_sessions_are_not_the_same_lifetime() {
+        let sid = 0x776u64;
+        let incarnation = |session_id: u64| {
+            let mut keys = test_keys();
+            keys.session_id = session_id;
+            let session = Arc::new(NetSession::new(
+                keys,
+                PeerAddr::Udp("127.0.0.1:9999".parse().unwrap()),
+                4,
+                false,
+            ));
+            session.open_stream_full(sid, false, 1, 100);
+            session
+        };
+        let predecessor = incarnation(0xAAAA_0000_0000_0001);
+        let successor = incarnation(0xBBBB_0000_0000_0002);
+        assert_eq!(
+            predecessor.try_stream(sid).unwrap().epoch(),
+            successor.try_stream(sid).unwrap().epoch(),
+            "the premise: per-session epochs collide across incarnations",
+        );
+        assert_ne!(
+            predecessor.session_id(),
+            successor.session_id(),
+            "two incarnations must be distinguishable at all",
+        );
+
+        let stale_epoch = predecessor.try_stream(sid).unwrap().epoch();
+        assert!(
+            matches!(
+                successor.try_acquire_tx_credit_for_lifetime(
+                    sid,
+                    predecessor.session_id(),
+                    stale_epoch,
+                    10
+                ),
+                TxAdmit::SessionSuperseded
+            ),
+            "a predecessor's lifetime must not admit on the successor",
+        );
+        assert_eq!(
+            successor.try_stream(sid).unwrap().tx_credit_remaining(),
+            100,
+            "and it must not have debited the successor's credit",
+        );
+
+        assert!(matches!(
+            successor.try_acquire_tx_credit_for_lifetime(
+                sid,
+                successor.session_id(),
+                stale_epoch,
+                10
+            ),
             TxAdmit::Acquired { .. }
         ));
     }
@@ -3238,8 +3336,12 @@ mod tests {
         let epoch_before = session.try_stream(sid).unwrap().epoch();
         let tx_seq_before = session.try_stream(sid).unwrap().current_tx_seq();
 
-        let (guard, seq) = match session.try_acquire_tx_credit_matching_epoch(sid, epoch_before, 40)
-        {
+        let (guard, seq) = match session.try_acquire_tx_credit_for_lifetime(
+            sid,
+            session.session_id(),
+            epoch_before,
+            40,
+        ) {
             TxAdmit::Acquired { guard, seq } => (guard, seq),
             other => panic!("expected Acquired, got {:?}", other),
         };

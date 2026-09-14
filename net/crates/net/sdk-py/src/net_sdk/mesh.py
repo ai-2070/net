@@ -33,13 +33,15 @@ from dataclasses import dataclass
 from typing import Any, Callable, List, Literal, Optional
 
 # The PyO3 module is `_net`; binding classes and exceptions come from it.
-# `BackpressureError` and `NotConnectedError` are `PyException` subclasses
-# defined via `pyo3::create_exception!` — re-export them here so users
-# import from `net_sdk`, not the private binding module.
+# `BackpressureError`, `NotConnectedError` and `SessionSupersededError`
+# are `PyException` subclasses defined via `pyo3::create_exception!` —
+# re-export them here so users import from `net_sdk`, not the private
+# binding module.
 from net import (  # type: ignore[attr-defined]
     NetMesh as _NetMesh,
     BackpressureError,
     NotConnectedError,
+    SessionSupersededError,
 )
 
 

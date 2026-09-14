@@ -116,11 +116,13 @@ let stream = mesh.open_stream(peer_node_id, stream_id, StreamConfig::new()
 
 mesh.send_on_stream(&stream, &events).await?;
 
-mesh.close_stream(peer_node_id, stream_id);
+mesh.close_stream(&stream)?;
 ```
 
 - `open_stream` is **idempotent** for a given `(peer_node_id, stream_id)`. Re-opening returns a handle backed by the same underlying state; a config argument that differs from the first open is logged and ignored (first-open wins).
-- `close_stream` drops the `StreamState` and stops inbound delivery for the stream. `CloseBehavior::DrainThenClose` is honored to the extent the scheduler has already flushed; there is no wire "drain" signal in v1.
+- `close_stream` takes the **handle**, drops the `StreamState` and stops inbound delivery for the stream. `CloseBehavior::DrainThenClose` is honored to the extent the scheduler has already flushed; there is no wire "drain" signal in v1. `close_stream_id(peer_node_id, stream_id)` is the unfenced form for callers that hold no handle (an inbound `StreamReset`, a receive-side teardown, the id-addressed language bindings).
+
+**Handle identity.** A `Stream` handle names four things: the peer, the **session incarnation** the stream was opened on, the stream id, and the stream's epoch within that session. All three of `send_on_stream`, `close_stream` and the credit admission refuse with `StreamError::SessionSuperseded` once the peer's session is not the incarnation the handle was minted against — a handle is inert for good at that point, and the stream id it names may be live on the successor session with a different config. The epoch alone cannot express this: it is allocated by a counter that restarts at 1 for every session, so a successor's first stream carries exactly the epoch the predecessor's first stream carried. The case that makes it reachable is the RTC responder displacing a *busy* incumbent the peer itself superseded.
 
 **Lifecycle.**
 
@@ -148,6 +150,7 @@ match mesh.send_on_stream(&stream, &[event]).await {
     Err(StreamError::Backpressure) => metrics.inc("dropped_under_pressure"),
     Err(StreamError::Transport(e)) => tracing::warn!(error = %e, "send failed"),
     Err(StreamError::NotConnected) => {/* peer gone */}
+    Err(StreamError::SessionSuperseded) => {/* re-open against the current session */}
 }
 
 // 2. Retry with backoff — best for important events.

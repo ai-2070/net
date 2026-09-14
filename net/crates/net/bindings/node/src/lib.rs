@@ -1141,6 +1141,7 @@ mod mesh_bindings {
     /// of the SDK contract.
     pub(crate) const ERR_BACKPRESSURE_PREFIX: &str = "stream would block";
     pub(crate) const ERR_NOT_CONNECTED_PREFIX: &str = "stream not connected";
+    pub(crate) const ERR_SESSION_SUPERSEDED_PREFIX: &str = "stream session superseded";
 
     pub(crate) fn stream_error_to_napi(e: StreamError) -> Error {
         // Map each variant to a stable, prefix-sniffable message. The
@@ -1153,6 +1154,10 @@ mod mesh_bindings {
             StreamError::NotConnected => {
                 Error::from_reason(format!("{}: peer session gone", ERR_NOT_CONNECTED_PREFIX))
             }
+            StreamError::SessionSuperseded => Error::from_reason(format!(
+                "{}: the peer's session was replaced since this stream was opened",
+                ERR_SESSION_SUPERSEDED_PREFIX
+            )),
             StreamError::Transport(msg) => {
                 Error::from_reason(format!("stream transport error: {}", msg))
             }
@@ -1993,14 +1998,19 @@ mod mesh_bindings {
             })
         }
 
-        /// Close a stream. Idempotent.
+        /// Close whatever stream is open under `(peerNodeId, streamId)`.
+        /// Idempotent, and id-addressed: it closes the current
+        /// session's stream of that id, not a particular handle's
+        /// lifetime. `sendOnStream` is the handle-addressed operation
+        /// and it *is* fenced — it throws `stream session superseded`
+        /// once the peer's session has been replaced (R12).
         #[napi]
         pub fn close_stream(&self, peer_node_id: BigInt, stream_id: BigInt) -> Result<()> {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
             let peer_u64 = crate::common::bigint_u64(peer_node_id)?;
             let stream_u64 = crate::common::bigint_u64(stream_id)?;
-            node.close_stream(peer_u64, stream_u64);
+            node.close_stream_id(peer_u64, stream_u64);
             Ok(())
         }
 

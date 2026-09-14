@@ -999,6 +999,14 @@ class NotConnectedError(Exception):
     """Raised when a stream's peer session is gone (disconnected,
     never connected, or the stream was closed)."""
 
+class SessionSupersededError(Exception):
+    """Raised when the stream handle's session has been replaced by a
+    successor incarnation of the same peer (S5-R12). Distinct from
+    `NotConnectedError`: the peer is connected and the stream id may
+    even be open — on a different session, with its own credit,
+    sequence space and reliability config. Never retryable with the
+    same handle; re-open against the current session."""
+
 class ChannelError(Exception):
     """Raised when a channel operation fails for a non-auth reason:
     invalid name / visibility, unknown channel, rate limit,

@@ -171,6 +171,22 @@ pub enum StreamError {
     /// The underlying session is gone (peer disconnected, never
     /// connected, or the stream was closed).
     NotConnected,
+    /// The handle belongs to a session that has since been replaced.
+    ///
+    /// Distinct from [`Self::NotConnected`] on purpose. `NotConnected`
+    /// says "this stream id is not open on the session you addressed";
+    /// this says "the session you addressed is no longer the peer's
+    /// session at all" — a successor incarnation is installed, and the
+    /// stream id may well be open *on it*. The stream epoch cannot
+    /// tell the two apart: it restarts at 1 for every session, so a
+    /// successor's first stream carries the same epoch as the
+    /// predecessor's first stream (see
+    /// `NetSession::next_stream_epoch`). Only the session incarnation
+    /// recorded on the handle can.
+    ///
+    /// A caller that sees this must re-open against the current
+    /// session; retrying the same handle can never succeed.
+    SessionSuperseded,
     /// Underlying transport failure (socket error, encryption error).
     /// Wraps the originating adapter-level error's message.
     Transport(String),
@@ -181,6 +197,9 @@ impl fmt::Display for StreamError {
         match self {
             StreamError::Backpressure => write!(f, "stream would block (queue full)"),
             StreamError::NotConnected => write!(f, "stream not connected"),
+            StreamError::SessionSuperseded => {
+                write!(f, "stream's session has been replaced by a successor")
+            }
             StreamError::Transport(msg) => write!(f, "stream transport error: {}", msg),
         }
     }

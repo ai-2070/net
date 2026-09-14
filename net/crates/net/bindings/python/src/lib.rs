@@ -932,6 +932,19 @@ pyo3::create_exception!(
 #[cfg(feature = "net")]
 pyo3::create_exception!(
     _net,
+    SessionSupersededError,
+    pyo3::exceptions::PyException,
+    "Raised when the stream handle's session has been replaced by a \
+     successor incarnation of the same peer (S5-R12). The peer is \
+     connected and the stream id may even be open — on a different \
+     session, with its own credit, sequence space and reliability \
+     config. Never retryable with the same handle; re-open the \
+     stream against the current session."
+);
+
+#[cfg(feature = "net")]
+pyo3::create_exception!(
+    _net,
     ChannelError,
     pyo3::exceptions::PyException,
     "Raised when a channel operation fails for a reason other than \
@@ -970,6 +983,9 @@ mod mesh_bindings {
                 super::BackpressureError::new_err("stream would block (queue full)")
             }
             StreamError::NotConnected => super::NotConnectedError::new_err("stream not connected"),
+            StreamError::SessionSuperseded => super::SessionSupersededError::new_err(
+                "stream's session has been replaced by a successor",
+            ),
             StreamError::Transport(msg) => {
                 PyRuntimeError::new_err(format!("stream transport error: {}", msg))
             }
@@ -2000,10 +2016,16 @@ mod mesh_bindings {
             })
         }
 
-        /// Close a stream. Idempotent.
+        /// Close whatever stream is open under
+        /// ``(peer_node_id, stream_id)``. Idempotent, and
+        /// id-addressed: it closes the current session's stream of
+        /// that id, not a particular handle's lifetime.
+        /// ``send_on_stream`` is the handle-addressed operation and it
+        /// *is* fenced — it raises ``SessionSupersededError`` once the
+        /// peer's session has been replaced (S5-R12).
         fn close_stream(&self, peer_node_id: u64, stream_id: u64) -> PyResult<()> {
             let node = self.get_node()?;
-            node.close_stream(peer_node_id, stream_id);
+            node.close_stream_id(peer_node_id, stream_id);
             Ok(())
         }
 
@@ -3629,9 +3651,11 @@ mod mesh_bindings {
             })
         }
 
-        /// Close a stream. Sync — idempotent local operation.
+        /// Close whatever stream is open under
+        /// ``(peer_node_id, stream_id)``. Sync — idempotent local
+        /// operation, id-addressed (see ``NetMesh.close_stream``).
         fn close_stream(&self, peer_node_id: u64, stream_id: u64) {
-            self.node.close_stream(peer_node_id, stream_id);
+            self.node.close_stream_id(peer_node_id, stream_id);
         }
 
         /// Snapshot of per-stream stats.
@@ -3782,6 +3806,11 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("BackpressureError", m.py().get_type::<BackpressureError>())?;
     #[cfg(feature = "net")]
     m.add("NotConnectedError", m.py().get_type::<NotConnectedError>())?;
+    #[cfg(feature = "net")]
+    m.add(
+        "SessionSupersededError",
+        m.py().get_type::<SessionSupersededError>(),
+    )?;
     #[cfg(feature = "net")]
     m.add("ChannelError", m.py().get_type::<ChannelError>())?;
     #[cfg(feature = "net")]

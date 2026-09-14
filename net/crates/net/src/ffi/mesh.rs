@@ -88,6 +88,11 @@ pub(crate) const NET_ERR_MESH_NOT_CONNECTED: c_int = -113;
 pub(crate) const NET_ERR_MESH_TRANSPORT: c_int = -114;
 pub(crate) const NET_ERR_CHANNEL: c_int = -115;
 pub(crate) const NET_ERR_CHANNEL_AUTH: c_int = -116;
+/// The stream handle names a session incarnation the peer no longer
+/// has (R12). Distinct from `NOT_CONNECTED`: the peer is connected
+/// and the stream id may be open on its successor session, which this
+/// handle does not own. Re-open; retrying the handle cannot succeed.
+pub(crate) const NET_ERR_MESH_SESSION_SUPERSEDED: c_int = -117;
 
 // Identity + token error codes. Block -120..-129 mirrors the
 // `"identity: ..."` / `"token: <kind>"` prefix convention used by
@@ -344,6 +349,7 @@ fn stream_err_to_code(err: &StreamError) -> c_int {
     match err {
         StreamError::Backpressure => NET_ERR_MESH_BACKPRESSURE,
         StreamError::NotConnected => NET_ERR_MESH_NOT_CONNECTED,
+        StreamError::SessionSuperseded => NET_ERR_MESH_SESSION_SUPERSEDED,
         StreamError::Transport(_) => NET_ERR_MESH_TRANSPORT,
     }
 }
@@ -1695,8 +1701,18 @@ pub unsafe extern "C" fn net_mesh_close_stream(handle: *mut MeshStreamHandle) ->
             Some(op) => op,
             None => return NetError::ShuttingDown.into(),
         };
-        h._node
-            .close_stream(h.stream.peer_node_id(), h.stream.stream_id());
+        // The handle-addressed close (R12): this pointer owns a
+        // `CoreStream`, so closing by `(peer, stream_id)` would let a
+        // handle whose session was displaced tear down the successor
+        // session's stream of the same id. A refusal is reported and
+        // the handle is still freed — it is inert either way, and
+        // leaking it would be worse.
+        if let Err(e) = h._node.close_stream(&h.stream) {
+            let code = stream_err_to_code(&e);
+            drop(_op);
+            unsafe { net_mesh_stream_free(handle) };
+            return code;
+        }
     }
     unsafe { net_mesh_stream_free(handle) };
     0
@@ -5433,7 +5449,7 @@ mod tests {
             let h = unsafe { &*nh_a };
             let node_clone: Arc<MeshNode> = Arc::clone(&h.inner);
             MeshStreamHandle {
-                stream: ManuallyDrop::new(CoreStream::new(0xDEAD, 1, 0, StreamConfig::new())),
+                stream: ManuallyDrop::new(CoreStream::new(0xDEAD, 0, 1, 0, StreamConfig::new())),
                 _node: ManuallyDrop::new(node_clone),
                 guard: HandleGuard::new(),
             }
@@ -5499,7 +5515,7 @@ mod tests {
         // `open_stream` needs an established session a unit test cannot
         // synthesize, and neither the guard nor the ids depend on one.
         let sh = Box::into_raw(Box::new(MeshStreamHandle {
-            stream: ManuallyDrop::new(CoreStream::new(0xDEAD, 7, 0, StreamConfig::new())),
+            stream: ManuallyDrop::new(CoreStream::new(0xDEAD, 0, 7, 0, StreamConfig::new())),
             _node: ManuallyDrop::new(Arc::clone(&unsafe { &*nh }.inner)),
             guard: HandleGuard::new(),
         }));

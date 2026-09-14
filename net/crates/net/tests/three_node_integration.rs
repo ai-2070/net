@@ -4009,7 +4009,7 @@ async fn test_stream_open_close_idempotency() {
     );
 
     // Close + re-open creates fresh state.
-    a.close_stream(nid_b, 77);
+    a.close_stream(&second).expect("handle-addressed close");
     assert!(a.stream_stats(nid_b, 77).is_none());
     let third = a.open_stream(nid_b, 77, StreamConfig::new()).unwrap();
     a.send_on_stream(&third, &[Bytes::from_static(b"{}")])
@@ -4076,7 +4076,7 @@ async fn test_regression_send_on_stream_rejects_closed_stream() {
 
     // Close the stream. The `stream` handle is now stale — the
     // session no longer tracks stream_id 123.
-    a.close_stream(nid_b, 123);
+    a.close_stream(&stream).expect("handle-addressed close");
     assert!(a.stream_stats(nid_b, 123).is_none());
 
     // Send on the stale handle. Must return NotConnected — NOT
@@ -5038,6 +5038,7 @@ async fn test_send_on_stream_backpressure_when_concurrent() {
             Err(StreamError::Backpressure) => backpressure += 1,
             Err(StreamError::Transport(_)) => transport += 1,
             Err(StreamError::NotConnected) => panic!("unexpected NotConnected"),
+            Err(StreamError::SessionSuperseded) => panic!("unexpected SessionSuperseded"),
         }
     }
     // At least one caller must have hit the cap. We don't assert an
@@ -5212,6 +5213,7 @@ async fn test_v2_serial_sender_sees_backpressure_on_slow_receiver() {
                  credit exhaustion should always present as Backpressure"
             ),
             Err(StreamError::NotConnected) => panic!("unexpected NotConnected"),
+            Err(StreamError::SessionSuperseded) => panic!("unexpected SessionSuperseded"),
         }
     }
 

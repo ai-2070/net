@@ -400,6 +400,117 @@ async fn an_idle_routed_stream_is_replaced_cleanly_by_the_rtc_pair() {
     );
 }
 
+/// S5-R15 / R12: the responder's busy-displacement branch is scoped
+/// to an incumbent the peer superseded on **another RTC channel**. A
+/// busy ROUTED incumbent is not that, and must still be deferred.
+///
+/// The two existing routed tests above cannot see this. Both arrange
+/// quiescence first — one waits for both ends to go quiet before
+/// invoking the upgrade, the other starts its replacement with no
+/// open streams — so neither exercises the negative role/transport
+/// boundary they were cited as proof of. This does: the same busy
+/// incumbent, the responder role, and a relayed endpoint.
+///
+/// Inverse: widen `superseded_by_its_owner` in
+/// `rtc_upgrade_precheck` to any responder facing a busy incumbent
+/// (drop the `PeerAddr::Rtc(id) if id != peer` discriminator) — this
+/// `accept_rtc` parks on the handshake inbox instead of returning,
+/// so the immediate-refusal assertion fails on the timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_busy_routed_responder_still_defers_to_its_relay_session() {
+    let a = node(Some(rtc_config())).await;
+    let r = node(None).await;
+    let b = node(Some(rtc_config())).await;
+    connect_udp(&a, &r).await;
+    connect_udp(&r, &b).await;
+    a.start();
+    r.start();
+    b.start();
+
+    let b_id = b.node_id();
+    let b_pub = *b.public_key();
+    a.connect_via(r.local_addr(), &b_pub, b_id)
+        .await
+        .expect("routed handshake");
+    let routed_session = a.peer_session_id(b_id).expect("a routed session");
+    let routed_endpoint = a.peer_endpoint(b_id);
+    assert!(
+        !matches!(routed_endpoint, Some(PeerAddr::Rtc(_))),
+        "the premise is a RELAYED incumbent; got {routed_endpoint:?}",
+    );
+
+    // Delivery through the relay before the attempt, so "the routed
+    // path works" is established rather than assumed. `send_routed`
+    // is the routed send path — a typed-handle `send_on_stream` goes
+    // straight to the peer's endpoint and does not wrap a routing
+    // header, which is why the phases above use this call too.
+    a.send_routed(b_id, &batch(0, 4, "routed-before-refusal"))
+        .await
+        .expect("routed send");
+    assert!(
+        delivered_with_tag(&b, "routed-before-refusal", Duration::from_secs(15)).await >= 1,
+        "the routed incumbent must actually be carrying traffic A → R → B",
+    );
+
+    // Now make it busy in exactly the shape the gate reads — an open
+    // application stream the peer cannot close — and attempt at once:
+    // this fixture's `stream_idle_timeout` is 1 s and an evicted
+    // stream would make the premise vacuous.
+    let mut cfg = StreamConfig::new();
+    cfg.reliability = Reliability::Reliable;
+    let _busy = a.open_stream(b_id, 0x00A1, cfg).expect("open_stream");
+    assert!(
+        a.peer_session_for_test(b_id)
+            .is_some_and(|s| s.stream_ids().contains(&0x00A1)),
+        "the routed incumbent must be busy at the moment of the attempt",
+    );
+
+    // RESPONDER on a fresh RTC endpoint against that busy routed
+    // incumbent. Refused, immediately, naming the role — not parked
+    // on the handshake inbox the way the RTC-superseded case is.
+    let driver = a.rtc_driver().expect("driver");
+    let (fresh, _sdp) = driver.create_offer().await.expect("a fresh endpoint");
+    let attempted = tokio::time::timeout(Duration::from_millis(500), a.accept_rtc(fresh, b_id))
+        .await
+        .expect(
+            "a busy ROUTED responder must be refused at the gate, not wait for \
+             msg1 — the displacement branch is for a superseded RTC channel only",
+        );
+    let why = attempted
+        .expect_err("the routed responder must defer")
+        .to_string();
+    assert!(
+        why.contains("the incumbent session is busy") && why.contains("Responder"),
+        "the refusal must name the role it applied; got {why:?}",
+    );
+
+    // Nothing was lost by it: same incarnation, same relayed
+    // endpoint, the busy stream still registered on it, and the
+    // routed path still delivers a fresh nonce.
+    assert_eq!(
+        a.peer_session_id(b_id),
+        Some(routed_session),
+        "the refused attempt must leave the routed incarnation in place",
+    );
+    assert_eq!(
+        a.peer_endpoint(b_id),
+        routed_endpoint,
+        "and must not retarget the endpoint",
+    );
+    assert!(
+        a.peer_session_for_test(b_id)
+            .is_some_and(|s| s.stream_ids().contains(&0x00A1)),
+        "nor discard the very stream it declined to throw away",
+    );
+    a.send_routed(b_id, &batch(0, 4, "routed-after-refusal"))
+        .await
+        .expect("routed send after the refusal");
+    assert!(
+        delivered_with_tag(&b, "routed-after-refusal", Duration::from_secs(15)).await >= 1,
+        "and the relay path must still deliver after it",
+    );
+}
+
 /// The echo handler the existing two-node nRPC witness uses,
 /// unchanged — only its transport differs here.
 #[cfg(feature = "cortex")]

@@ -35,6 +35,21 @@ pub const MAX_PACKET_SIZE: usize = 8192;
 /// Maximum payload size (packet - header - tag)
 pub const MAX_PAYLOAD_SIZE: usize = MAX_PACKET_SIZE - HEADER_SIZE - TAG_SIZE;
 
+/// `frag_flags` bit 0: this packet carries a piece of a payload
+/// that did not fit one packet.
+///
+/// The field has always been on the wire and authenticated by
+/// `aad()`; this is its interpretation, and it lives here — beside
+/// the header that carries it — because both ends read it. A leaf
+/// that fragments and a native ingress that reassembles must agree
+/// on one definition, not two copies of the same bit.
+pub const FRAG_FRAGMENTED: u8 = 0b0000_0001;
+
+/// `frag_flags` bit 1: the **final** piece of its group, so
+/// `fragment_offset + payload.len()` is the reassembled length.
+/// Meaningless without [`FRAG_FRAGMENTED`].
+pub const FRAG_LAST: u8 = 0b0000_0010;
+
 /// Packet flags for protocol control.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(transparent)]

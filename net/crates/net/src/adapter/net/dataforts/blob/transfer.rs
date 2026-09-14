@@ -539,7 +539,9 @@ impl BlobTransferEngine {
     /// stream that finds no pending entry and idles out.
     fn close_receive_stream(&self, holder: u64, stream_id: u64) {
         if let Some(mesh) = self.mesh.upgrade() {
-            mesh.close_stream(holder, stream_id);
+            // Receive side: this engine never opened the stream, so it
+            // holds no handle and closes by id (R12).
+            mesh.close_stream_id(holder, stream_id);
         }
     }
 }
@@ -631,8 +633,11 @@ async fn serve_chunk(
     // tail packet on a lossy link. Bounded by `TRANSFER_TIMEOUT` so a
     // vanished receiver can't pin the stream; reclaiming it also stops
     // directory-scale fan-out from leaking one live stream per chunk.
-    mesh.close_stream_graceful(requester, stream_id, TRANSFER_TIMEOUT)
-        .await;
+    // A `SessionSuperseded` refusal here needs no handling: the
+    // session that owned this stream is gone, which reclaimed the
+    // stream with it, and the successor's streams are not ours to
+    // close.
+    let _ = mesh.close_stream_graceful(&stream, TRANSFER_TIMEOUT).await;
 }
 
 fn postcard_event<T: Serialize>(value: &T) -> Bytes {

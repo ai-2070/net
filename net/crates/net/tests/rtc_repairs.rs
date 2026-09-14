@@ -13,7 +13,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use net::adapter::net::rtc::{connect_rtc_loopback, RtcConfig, RtcPeerId, RtcSubmitError};
+use net::adapter::net::rtc::{
+    connect_rtc_loopback, open_rtc_channel, RtcConfig, RtcPeerId, RtcSubmitError,
+};
 use net::adapter::net::{
     EntityKeypair, MeshNode, MeshNodeConfig, PeerAddr, Reliability, SocketBufferConfig,
     StreamConfig, StreamError,
@@ -107,6 +109,50 @@ async fn pair_with(
         .await
         .expect("DataChannel + Noise handshake");
     (a, b, id_a, id_b)
+}
+
+/// A node with a *chosen* entity identity, so a second node can
+/// reconnect as the same `node_id` from its own UDP socket. That is
+/// what a browser tab whose DataChannel died looks like from the
+/// anchor's side, and it is the only way to get two live sessions for
+/// one identity on different 5-tuples in-process.
+async fn node_with_identity(secret: [u8; 32], rtc: RtcConfig) -> Arc<MeshNode> {
+    Arc::new(
+        MeshNode::new(EntityKeypair::from_bytes(secret), config(Some(rtc)))
+            .await
+            .expect("MeshNode::new"),
+    )
+}
+
+/// Burn stream epochs on `peer`'s current session until the **next**
+/// epoch it allocates is exactly `target`.
+///
+/// The collision this arranges is the whole point of the R12 witness:
+/// `stream_epoch_counter` restarts at 1 per session, so a successor
+/// can hand out an epoch a predecessor's handle already holds. Left
+/// to whatever ordinal the two sessions happen to reach, the witness
+/// would sometimes pass because the epochs differed — an accident,
+/// not a discriminator. Panics rather than returning if the counter
+/// is already at or past `target`: a premise that cannot be arranged
+/// must fail loudly.
+fn arrange_next_stream_epoch(node: &Arc<MeshNode>, peer: u64, target: u64) {
+    const SCRATCH: u64 = 0x7F00_0000;
+    for _ in 0..4096 {
+        let probe = node
+            .open_stream(peer, SCRATCH, StreamConfig::new())
+            .expect("scratch open");
+        let epoch = probe.epoch();
+        node.close_stream(&probe).expect("scratch close");
+        assert!(
+            epoch < target,
+            "this session's epoch counter is already at {epoch}, past the \
+             target {target}: the equal-epoch premise cannot be arranged",
+        );
+        if epoch + 1 == target {
+            return;
+        }
+    }
+    panic!("could not reach epoch {target} within the scratch budget");
 }
 
 fn batch(shard_id: u16, count: usize, tag: &str) -> Batch {
@@ -1115,6 +1161,161 @@ async fn a_peer_that_superseded_its_own_channel_is_not_locked_out_by_it() {
         Some(stale),
         "and neither attempt installed anything over the incumbent",
     );
+}
+
+/// S5-R12: a native `Stream` handle from the session the busy-responder
+/// branch DISPLACED must not be able to address the session that
+/// replaced it.
+///
+/// The test above establishes that the responder gets past the
+/// quiescence gate. It stops there — it never reaches Noise or the
+/// installer, so it cannot see what the displacement does to the
+/// handles the responder itself still holds. This one does the whole
+/// transition against a real second peer process: same identity, its
+/// own UDP socket and RTC driver, a second DataChannel, real Noise,
+/// real `install_direct_fenced`.
+///
+/// What made this reachable: the handle recorded `(peer, stream_id,
+/// epoch, config)` and `send_on_stream` resolved the peer's CURRENT
+/// session and compared only the epoch. `stream_epoch_counter`
+/// restarts at 1 for every `NetSession`, so a successor's stream at
+/// the same creation ordinal carries the same epoch — the
+/// predecessor's handle passed the check and transmitted into the new
+/// lifetime under the OLD handle's reliability flags. The epoch
+/// collision is arranged explicitly here rather than left to
+/// coincidence, because a witness that passes only when the ordinals
+/// happen to differ discriminates nothing.
+///
+/// Inverse: drop the `peer.session.session_id() != stream.session_id()`
+/// refusal from `send_on_stream` and from `close_stream` — the stale
+/// send succeeds (equal epochs) and the stale close tears down the
+/// successor's stream, so the `SessionSuperseded` assertions and the
+/// survival assertion all fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_displaced_sessions_handle_cannot_address_its_successor() {
+    // One identity, two processes. `b` holds the incumbent; `b2` is
+    // the same node id arriving on a different RTC endpoint.
+    let b_secret = [0xB2u8; 32];
+    let a = node(Some(rtc_config())).await;
+    let b = node_with_identity(b_secret, rtc_config()).await;
+    a.start();
+    b.start();
+    connect_rtc_loopback(&a, &b)
+        .await
+        .expect("DataChannel + Noise handshake");
+    let b_id = b.node_id();
+    let displaced_sid = a.peer_session_id(b_id).expect("an installed session");
+
+    // Put the stale handle at a high ordinal so the successor's
+    // counter can be walked up to meet it.
+    arrange_next_stream_epoch(&a, b_id, 24);
+    let stale = a
+        .open_stream(
+            b_id,
+            0x0776,
+            StreamConfig::new().with_reliability(Reliability::Reliable),
+        )
+        .expect("open_stream on the incumbent");
+    assert_eq!(stale.epoch(), 24, "the arranged ordinal");
+    assert_eq!(
+        stale.session_id(),
+        displaced_sid,
+        "a handle must record the incarnation it was opened on",
+    );
+    assert!(
+        a.peer_session_for_test(b_id)
+            .is_some_and(|s| s.stream_ids().contains(&0x0776)),
+        "the incumbent must really be busy, or the responder branch is \
+         not the one under test",
+    );
+
+    // The displacement, end to end. A is the RESPONDER — the only
+    // role the busy branch permits — on a DataChannel it has never
+    // seen before, so the precheck's `superseded_by_its_owner` arm
+    // fires and the commit runs with `require_quiescent: false`.
+    let b2 = node_with_identity(b_secret, rtc_config()).await;
+    b2.start();
+    assert_eq!(b2.node_id(), b_id, "b2 must be the same identity");
+    let (a_endpoint, b2_endpoint) = open_rtc_channel(&a, &b2)
+        .await
+        .expect("a second DataChannel on its own socket");
+    let accept = {
+        let a = Arc::clone(&a);
+        tokio::spawn(async move { a.accept_rtc(a_endpoint, b_id).await })
+    };
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let a_pub = *a.public_key();
+    b2.connect_rtc(b2_endpoint, &a_pub, a.node_id())
+        .await
+        .expect("b2 initiates Noise over the fresh channel");
+    accept
+        .await
+        .expect("join")
+        .expect("the responder must complete Noise and install over the busy incumbent");
+
+    let successor_sid = a.peer_session_id(b_id).expect("a successor session");
+    assert_ne!(
+        successor_sid, displaced_sid,
+        "the busy incumbent must actually have been replaced — this is the \
+         Noise/install the precheck-only witness never reached",
+    );
+
+    // Arrange the exact collision: the successor hands 0x0776 the
+    // same epoch the stale handle holds.
+    arrange_next_stream_epoch(&a, b_id, stale.epoch());
+    let fresh = a
+        .open_stream(
+            b_id,
+            0x0776,
+            StreamConfig::new().with_reliability(Reliability::FireAndForget),
+        )
+        .expect("reopen the same id on the successor");
+    assert_eq!(
+        fresh.epoch(),
+        stale.epoch(),
+        "the premise: the epoch check cannot tell these two lifetimes apart",
+    );
+    assert_ne!(
+        fresh.session_id(),
+        stale.session_id(),
+        "but the incarnation can",
+    );
+
+    // The refusals, typed. `NotConnected` would be the wrong answer
+    // and would also be indistinguishable from "that id is closed":
+    // the id IS open, on a session this handle does not own.
+    let sent = a
+        .send_on_stream(&stale, &[Bytes::from_static(b"R12STALE")])
+        .await;
+    assert!(
+        matches!(sent, Err(StreamError::SessionSuperseded)),
+        "a displaced session's handle must not transmit into its \
+         successor; got {sent:?}",
+    );
+    let closed = a.close_stream(&stale);
+    assert!(
+        matches!(closed, Err(StreamError::SessionSuperseded)),
+        "nor tear the successor's stream down; got {closed:?}",
+    );
+    assert!(
+        a.stream_stats(b_id, 0x0776).is_some(),
+        "and the refused close must have left the successor's stream alive",
+    );
+
+    // Restored positive: the successor's own handle works, end to
+    // end, on the session that replaced the one above.
+    a.send_on_stream(&fresh, &[Bytes::from_static(b"R12FRESH")])
+        .await
+        .expect("the successor's handle must deliver");
+    let seen = collect_tagged(&b2, b"R12FRESH", 1, Duration::from_secs(10)).await;
+    assert_eq!(
+        seen,
+        vec![b"R12FRESH".to_vec()],
+        "exactly the successor's payload, once, at the peer that replaced \
+         the displaced session",
+    );
+    a.close_stream(&fresh)
+        .expect("and the successor's handle may close its own stream");
 }
 
 // ---------------------------------------------------------------
