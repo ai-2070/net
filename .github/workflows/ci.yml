@@ -5043,8 +5043,17 @@ jobs:
               echo "::error::$suite did not report a passing result"; exit 1; }
             ran=$(sed -n 's/.*test result: ok\. \([0-9]*\) passed.*/\1/p' "/tmp/$suite.log" | tail -1)
             echo "$suite: $ran passed"
-            if [ "${ran:-0}" -lt 1 ]; then
-              echo "::error::$suite ran no tests — a filter that matches nothing exits 0"
+            # Per-suite FLOORS, not just "more than zero": a suite
+            # that lost half its witnesses would otherwise still pass
+            # this step.
+            case "$suite" in
+              wasm_leaf)       floor=14 ;;
+              wasm_leader)     floor=6  ;;
+              wasm_anchorless) floor=2  ;;
+            esac
+            if [ "${ran:-0}" -lt "$floor" ]; then
+              echo "::error::$suite ran ${ran:-0} tests, floor is $floor — \
+          lower the floor deliberately or restore the witness"
               exit 1
             fi
           done
