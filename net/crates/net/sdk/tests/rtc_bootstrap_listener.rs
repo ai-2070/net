@@ -1319,3 +1319,268 @@ async fn a_failed_acme_startup_releases_its_challenge_port() {
 
     anchor.shutdown().await.expect("shutdown");
 }
+
+/// Stage 5 (found by the browser harness's UDP-blocked control leg):
+/// a client whose attempt FAILED must be able to start another one.
+///
+/// The browser gets a typed failure, abandons the attempt, and
+/// immediately reconnects — which is exactly what a page does after
+/// `RtcError::UdpBlocked`. The second attempt's trickle socket was
+/// being refused, which the browser reports as a bare 1006.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_whose_attempt_was_abandoned_can_open_another_one() {
+    let anchor = kyra_long_lived_anchor().await;
+    let offerer = offerer().await;
+    let router = bootstrap_router(Arc::clone(&anchor), &config(PSK));
+    let credential = credential_for(PSK, Duration::from_secs(600));
+
+    let upgrade = |token: String, dialog: u64| {
+        let router = router.clone();
+        let node = offerer.node_id();
+        async move {
+            let request = Request::builder()
+                .uri(format!("/rtc/trickle?dialog={dialog}&node_id={node}"))
+                .header(header::ORIGIN, ORIGIN)
+                .header(header::CONNECTION, "upgrade")
+                .header(header::UPGRADE, "websocket")
+                .header(header::SEC_WEBSOCKET_VERSION, "13")
+                .header(header::SEC_WEBSOCKET_KEY, "dGhlIHNhbXBsZSBub25jZQ==")
+                .header(
+                    header::SEC_WEBSOCKET_PROTOCOL,
+                    format!("net-bootstrap-attempt.{token}"),
+                );
+            router
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+
+    let mut statuses = Vec::new();
+    for _ in 0..3 {
+        let sdp = offerer
+            .rtc_driver()
+            .expect("driver")
+            .create_offer()
+            .await
+            .expect("offer")
+            .1;
+        let (status, body) = post_offer(&router, &credential, offerer.node_id(), &sdp).await;
+        assert_eq!(status, StatusCode::OK, "each offer is accepted");
+        let offered: OfferResponse = serde_json::from_slice(&body).expect("offer response");
+        statuses.push(upgrade(offered.attempt_token.clone(), offered.dialog).await);
+        // The page abandons it, exactly as `LeafNode::connect` now
+        // does on a post-offer failure.
+        anchor
+            .end_bootstrap_dialog(offerer.node_id(), offered.dialog)
+            .await;
+    }
+
+    assert!(
+        statuses.iter().all(|s| *s == StatusCode::UPGRADE_REQUIRED),
+        "every attempt's own token must reach its upgrade; got {statuses:?}",
+    );
+
+    anchor.shutdown().await.expect("shutdown");
+    offerer.shutdown().await.expect("shutdown");
+}
+
+/// Stage 5 (the browser harness's UDP-blocked CONTROL leg, and two
+/// Stage 4b witnesses on Linux CI): an attempt whose DataChannel has
+/// just opened is still IN FLIGHT — its own trickle socket must
+/// still be able to upgrade, and the candidates it is still
+/// trickling must still be admitted.
+///
+/// # What actually broke
+///
+/// The anchor's host candidate rides the offer BODY — str0m adds the
+/// local candidate in `new_session` before it answers — so on a fast
+/// path (loopback, or a warm LAN) ICE completes before the trickle
+/// socket's own fresh TCP+TLS handshake lands. The completion owner
+/// released the attempt's reservation at channel-open, the R1 layer
+/// then found no live attempt and answered **HTTP 404**, and a
+/// browser reports a refused WebSocket HANDSHAKE as a bare `1006`
+/// with no code and no reason. Measured in the harness:
+///
+/// ```text
+/// [cand mdns-loopback/no-stun] iceConnectionState=connected
+/// [trickle mdns-loopback/no-stun] closed code=1006 clean=false
+/// [main] error: WebSocket connection to 'wss://…/rtc/trickle?dialog=3…'
+///        failed: Error during WebSocket handshake: Unexpected response code: 404
+/// ```
+///
+/// The same merge, seen from the socket that DID upgrade: every
+/// candidate trickled after the channel opened became "signalling
+/// frame for an unknown dialog", the listener closed the socket with
+/// a typed `4404`, and the handshake riding that DataChannel died —
+/// `browser_enrollment_survives_replacement` and
+/// `mitm_anchor_fails_the_handshake_and_installs_nothing` both
+/// failed on `timeout: noise msg2` behind exactly that close.
+///
+/// "The accounting slot may be given back" and "this attempt is
+/// over" are different facts. The retirement now happens when the
+/// attempt is terminal — and a completed install is terminal, which
+/// is the last thing asserted here.
+///
+/// # Why this level
+///
+/// The router-level sequence (offer, upgrade, `end_bootstrap_dialog`,
+/// repeat) passes both before and after the repair: it never opens a
+/// DataChannel, so it never reaches the completion owner, which is
+/// where the two meanings were merged. This drives the REAL path —
+/// a real offer, the real answer, real ICE over loopback, the real
+/// completion owner — and uses the client's raw driver rather than
+/// its dialog engine so that nothing sends Noise `msg1`: the
+/// anchor's owner then parks in `accept_rtc` for the whole
+/// `ice_deadline`, which makes "the channel is open and the install
+/// has not completed" a window a test can stand in rather than a
+/// race it has to win.
+///
+/// Inverse: move `release_signal_budget` back above the install in
+/// `spawn_dialog_completion` — the late candidate is refused as an
+/// unknown dialog and the upgrade answers 404.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attempt_whose_channel_just_opened_is_not_over_yet() {
+    let anchor = kyra_long_lived_anchor().await;
+    let client = offerer().await;
+    let router = bootstrap_router(Arc::clone(&anchor), &config(PSK));
+    let credential = credential_for(PSK, Duration::from_secs(600));
+    let driver = client.rtc_driver().expect("driver");
+
+    // A real offer from a real ICE stack, through the real route.
+    let (peer, sdp) = driver.create_offer().await.expect("offer");
+    let (status, body) = post_offer(&router, &credential, client.node_id(), &sdp).await;
+    assert_eq!(status, StatusCode::OK);
+    let offered: OfferResponse = serde_json::from_slice(&body).expect("offer response");
+    let node_id = client.node_id();
+    let key = offered_budget_key(&anchor, node_id, offered.dialog);
+
+    let upgrade = |token: String, dialog: u64| {
+        let router = router.clone();
+        async move {
+            let request = Request::builder()
+                .uri(format!("/rtc/trickle?dialog={dialog}&node_id={node_id}"))
+                .header(header::ORIGIN, ORIGIN)
+                .header(header::CONNECTION, "upgrade")
+                .header(header::UPGRADE, "websocket")
+                .header(header::SEC_WEBSOCKET_VERSION, "13")
+                .header(header::SEC_WEBSOCKET_KEY, "dGhlIHNhbXBsZSBub25jZQ==")
+                .header(
+                    header::SEC_WEBSOCKET_PROTOCOL,
+                    format!("net-bootstrap-attempt.{token}"),
+                );
+            router
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+
+    // Both halves of the exchange the browser's page does: the
+    // answer, the anchor's candidate out of the offer body, and this
+    // side's host candidate through the same checked ingress the
+    // trickle socket uses.
+    driver
+        .accept_answer(peer, offered.sdp.clone())
+        .await
+        .expect("answer");
+    driver
+        .remote_candidate(peer, offered.candidate.clone())
+        .await
+        .expect("the anchor's candidate");
+    let ours = client
+        .bootstrap_host_candidate()
+        .expect("this side's host candidate");
+    anchor
+        .apply_bootstrap_candidate_checked(key, node_id, offered.dialog, ours, "0".into())
+        .await
+        .expect("the live attempt takes candidates");
+
+    driver
+        .await_open(peer)
+        .await
+        .expect("the DataChannel opens");
+
+    // **The barrier.** The completion owner's first act after the
+    // channel opens is to take the dialog out of the EXPIRY table
+    // (R4-A), which it does either way — so this is the one
+    // observable that says "the window under test has been entered"
+    // without being the thing under test. Without it this test could
+    // pass by asking its question too early.
+    let mut owner_ran = false;
+    for _ in 0..80 {
+        if !anchor.holds_bootstrap_dialog(node_id, offered.dialog).await {
+            owner_ran = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        owner_ran,
+        "the completion owner never reached its channel-open step, so the \
+         window under test was never entered",
+    );
+
+    // A browser goes on trickling while it gathers, and the engine
+    // has no row left to place the candidate in. That is LATE, not
+    // unknown: refusing it closed the trickle socket with a typed
+    // 4404 in the middle of Noise, and the anchor's own log carried
+    // `signalling frame for an unknown dialog` while the handshake
+    // died on `timeout: noise msg2`.
+    anchor
+        .apply_bootstrap_candidate_checked(
+            key,
+            node_id,
+            offered.dialog,
+            "candidate:9 1 udp 2113937151 192.0.2.9 41299 typ host".into(),
+            "0".into(),
+        )
+        .await
+        .expect(
+            "a candidate trickled after the channel opened must be admitted and \
+             dropped, not refused as an unknown dialog",
+        );
+
+    // THE REGRESSION. The channel is open, the install is parked
+    // waiting for a `msg1` nothing will send, and the attempt is
+    // still in flight — so its own token must still reach the
+    // upgrade. This answered 404 before the repair.
+    assert!(
+        anchor.bootstrap_attempt_is_live(node_id, offered.dialog, key),
+        "an attempt whose channel opened is still in flight",
+    );
+    assert_eq!(
+        upgrade(offered.attempt_token.clone(), offered.dialog).await,
+        StatusCode::UPGRADE_REQUIRED,
+        "the trickle socket lost a race with ICE and was refused; a browser \
+         can only read that as a bare 1006",
+    );
+
+    // And the other meaning, unchanged: a COMPLETED install is
+    // terminal. The client runs the Noise half its own completion
+    // owner would, the anchor's parked `accept_rtc` finishes, and
+    // the token stops authorizing.
+    client
+        .connect_rtc(peer, anchor.public_key(), anchor.node_id())
+        .await
+        .expect("Noise over the DataChannel");
+    let mut retired = StatusCode::UPGRADE_REQUIRED;
+    for _ in 0..80 {
+        retired = upgrade(offered.attempt_token.clone(), offered.dialog).await;
+        if retired == StatusCode::NOT_FOUND {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        retired,
+        StatusCode::NOT_FOUND,
+        "an installed session owns the peer; the attempt is over and its token \
+         must stop authorizing",
+    );
+
+    anchor.shutdown().await.expect("shutdown");
+    client.shutdown().await.expect("shutdown");
+}

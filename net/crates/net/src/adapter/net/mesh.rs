@@ -9648,6 +9648,33 @@ struct RtcInstallFence {
     require_quiescent: bool,
 }
 
+/// Which side of an RTC handshake is asking for the install, because
+/// a busy incumbent does not mean the same thing on both.
+///
+/// The quiescence gate exists to stop an upgrade throwing away
+/// in-flight state — but only one party can have that state, and
+/// which party it is depends on who initiated.
+#[cfg(feature = "webrtc")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum UpgradeRole {
+    /// **We** are replacing our own session. The in-flight state is
+    /// ours, and the deferral is this node declining to throw it
+    /// away — `attempt_direct_upgrade`'s C3 decision.
+    Initiator,
+    /// The **remote** completed a Noise handshake on a new endpoint
+    /// under its own identity.
+    Responder,
+}
+
+/// What the snapshot decided: the incarnation to compare-and-swap
+/// against, and whether the commit must re-apply the quiescence
+/// check.
+#[cfg(feature = "webrtc")]
+struct UpgradePlan {
+    prior: PriorSession,
+    require_quiescent: bool,
+}
+
 /// The ingress admission verdict (R1). `Denied` covers every
 /// state that is not a live, admitted session on the endpoint the
 /// frame actually arrived on.
@@ -22540,14 +22567,12 @@ impl MeshNode {
         // flood speed, not on the next heartbeat tick. Session open
         // races the peer's post-handshake bookkeeping, so resend.
         self.emit_event_pingwave(true);
-
         Ok(peer_node_id)
     }
 
     /// Establish a Net session over an already-open DataChannel,
     /// as the Noise **initiator** (Stage 3; production since R4, where
     /// the dialog completion owner calls it in the offerer's role).
-    ///
     /// Deliberately not a new handshake path: it is
     /// [`Self::connect`]'s body with a `PeerAddr::Rtc` endpoint. The
     /// post-`start()` initiator already registers an inbox in
@@ -22567,14 +22592,15 @@ impl MeshNode {
         // busy (`attempt_direct_upgrade`'s C3 gate); a fixture that
         // skipped it could replace a session with open streams or
         // unacked data and lose that state.
-        let prior = self.rtc_upgrade_precheck(peer_node_id)?;
+        let plan = self.rtc_upgrade_precheck(peer_node_id, peer, UpgradeRole::Initiator)?;
+        let prior = plan.prior;
         // H2: the intent is taken **before** the handshake wait, on
         // the exact `(slot, generation)`, under the transport's own
         // slot lock. A check taken after the wait answers a question
         // about a handle that may already have been closed and had
         // its notification consumed; the claim taken here is what
         // the commit re-validates.
-        let fence = self.rtc_install_fence(peer)?;
+        let fence = self.rtc_install_fence(peer, plan.require_quiescent)?;
         let keys = self
             .handshake_initiator(peer_addr, peer_pubkey, peer_node_id)
             .await?;
@@ -22627,9 +22653,14 @@ impl MeshNode {
         peer_node_id: u64,
     ) -> Result<u64, AdapterError> {
         let peer_addr = PeerAddr::Rtc(peer);
-        let prior = self.rtc_upgrade_precheck(peer_node_id)?;
+        // R3-E, responder half. The role is load-bearing: a busy
+        // incumbent on a DIFFERENT RTC endpoint is a channel the
+        // remote itself superseded, and only the remote could lose
+        // state by it — see `rtc_upgrade_precheck`.
+        let plan = self.rtc_upgrade_precheck(peer_node_id, peer, UpgradeRole::Responder)?;
+        let prior = plan.prior;
         // H2, responder half: same intent, taken before the wait.
-        let fence = self.rtc_install_fence(peer)?;
+        let fence = self.rtc_install_fence(peer, plan.require_quiescent)?;
         let prologue = handshake_prologue(routing_id(peer_node_id), routing_id(self.node_id));
         let mut handshake = NoiseHandshake::responder_with_prologue(
             &self.config.psk,
@@ -22762,32 +22793,97 @@ impl MeshNode {
     }
 
     /// The incumbent snapshot + quiescence gate every RTC install
-    /// goes through (R3-E).
+    /// goes through (R3-E), and how the commit must re-check it.
     ///
-    /// `Ok(Some(sid))` is the incarnation the install must
-    /// compare-and-swap against; `Ok(None)` means there is no
+    /// `PriorSession::Exactly(sid)` is the incarnation the install
+    /// must compare-and-swap against; `Absent` means there is no
     /// incumbent. A *busy* incumbent — open streams or unacked data —
-    /// is refused, not replaced: that is the same decision
-    /// `attempt_direct_upgrade` makes, and the reason it makes it is
-    /// that replacing a busy session drops its in-flight state.
+    /// is normally refused rather than replaced, because replacing it
+    /// drops that state.
+    ///
+    /// **One case is not that.** When the RESPONDER finds the
+    /// incumbent on a DIFFERENT RTC endpoint, the peer that just
+    /// completed a handshake has superseded its own channel: it is
+    /// the only party whose state could be lost, and it has already
+    /// abandoned it. Deferring there preserves nothing and locks the
+    /// identity out for good, because the streams that make the
+    /// session busy can only be closed by the peer that is gone — a
+    /// browser that got a typed failure and reconnected was refused
+    /// with `the incumbent session is busy` against six subscription
+    /// and reply channels left by its previous tab, on an endpoint
+    /// the anchor still believed was open. So that one case
+    /// displaces, and says so.
+    ///
+    /// Every other shape is unchanged: the initiator still defers
+    /// (its own state, its own call), and a responder facing a
+    /// ROUTED incumbent still defers — that session is live, the new
+    /// RTC endpoint is an optimisation, and the routed path keeps
+    /// working meanwhile.
     #[cfg(feature = "webrtc")]
-    fn rtc_upgrade_precheck(&self, peer_node_id: u64) -> Result<PriorSession, AdapterError> {
+    fn rtc_upgrade_precheck(
+        &self,
+        peer_node_id: u64,
+        peer: super::rtc::RtcPeerId,
+        role: UpgradeRole,
+    ) -> Result<UpgradePlan, AdapterError> {
         let Some(entry) = self.peers.get(&peer_node_id) else {
             // H2: "nothing is installed" is an expectation the commit
             // must re-check, not permission to overwrite whatever
             // arrives in the meantime.
-            return Ok(PriorSession::Absent);
+            return Ok(UpgradePlan {
+                prior: PriorSession::Absent,
+                require_quiescent: true,
+            });
         };
         let info = entry.value();
         let busy = Self::session_is_busy(info);
         let sid = info.session.session_id();
+        // Named in the refusal, because "busy" on its own sends the
+        // reader nowhere: which streams, and whether the incumbent's
+        // endpoint is even still there.
+        let streams: Vec<u64> = info.session.stream_ids().to_vec();
+        let unacked = info.session.has_unacked();
         drop(entry);
-        if busy {
-            return Err(AdapterError::Connection(
-                "rtc upgrade deferred: the incumbent session is busy".into(),
-            ));
+        if !busy {
+            return Ok(UpgradePlan {
+                prior: PriorSession::Exactly(sid),
+                require_quiescent: true,
+            });
         }
-        Ok(PriorSession::Exactly(sid))
+        let endpoint = self.peer_endpoint(peer_node_id);
+        let superseded_by_its_owner = role == UpgradeRole::Responder
+            && matches!(endpoint, Some(PeerAddr::Rtc(id)) if id != peer);
+        if superseded_by_its_owner {
+            let endpoint_open = match endpoint {
+                Some(PeerAddr::Rtc(id)) => self
+                    .rtc_driver
+                    .as_ref()
+                    .is_some_and(|d| d.transport().is_open(id)),
+                _ => false,
+            };
+            tracing::debug!(
+                peer = format!("{peer_node_id:#x}"),
+                ?endpoint,
+                endpoint_open,
+                ?streams,
+                unacked,
+                "the peer superseded its own RTC channel; displacing the busy \
+                 incumbent rather than locking the identity out"
+            );
+            // The commit must NOT re-apply the quiescence check for
+            // this install, or it would refuse at the seam what the
+            // snapshot just allowed. Everything else the fence does
+            // — the exact `(slot, generation)` claim and the
+            // compare-and-swap against `sid` — still holds.
+            return Ok(UpgradePlan {
+                prior: PriorSession::Exactly(sid),
+                require_quiescent: false,
+            });
+        }
+        Err(AdapterError::Connection(format!(
+            "rtc upgrade deferred: the incumbent session is busy \
+             (role={role:?} endpoint={endpoint:?} streams={streams:?} unacked={unacked})"
+        )))
     }
 
     /// Is this peer's session carrying application state an upgrade
@@ -22814,12 +22910,19 @@ impl MeshNode {
     ///
     /// Refuses immediately on a handle the driver no longer holds,
     /// and carries the claim the commit re-validates under the
-    /// transport's slot lock. `require_quiescent` is set whenever
-    /// there is an incumbent to preserve.
+    /// transport's slot lock.
+    ///
+    /// `require_quiescent` comes from the SNAPSHOT
+    /// ([`Self::rtc_upgrade_precheck`]) rather than being hard-coded
+    /// true: the commit re-checks what the snapshot decided, and an
+    /// install the snapshot allowed against a busy incumbent the
+    /// remote itself superseded must not be refused at the seam for
+    /// the reason the snapshot already weighed.
     #[cfg(feature = "webrtc")]
     fn rtc_install_fence(
         &self,
         peer: super::rtc::RtcPeerId,
+        require_quiescent: bool,
     ) -> Result<RtcInstallFence, AdapterError> {
         let intent = self
             .rtc_driver
@@ -22832,7 +22935,7 @@ impl MeshNode {
             })?;
         Ok(RtcInstallFence {
             intent,
-            require_quiescent: true,
+            require_quiescent,
         })
     }
 
@@ -25669,6 +25772,24 @@ impl MeshNode {
 
     /// [`Self::apply_bootstrap_candidate`] with the budget charged to
     /// `budget_key` rather than the claimed node id (R2).
+    ///
+    /// **A candidate that arrives after the channel opened is LATE,
+    /// not unknown.** The completion owner takes the dialog out of
+    /// the expiry table the moment the DataChannel opens (R4-A), and
+    /// a browser goes on trickling for as long as it is still
+    /// gathering — so the engine has no row to apply the candidate
+    /// to, through no fault of the caller's. Reporting that as a
+    /// refusal made the listener close the browser's trickle socket
+    /// with a typed `4404` in the middle of the Noise handshake,
+    /// which the leaf reads as the attempt failing:
+    /// `browser_enrollment_survives_replacement` and
+    /// `mitm_anchor_fails_the_handshake_and_installs_nothing` both
+    /// died on `timeout: noise msg2` behind
+    /// `closed code=4404 reason=… signalling frame for an unknown
+    /// dialog`. So: while the attempt is still LIVE, a candidate the
+    /// engine cannot place is accepted and dropped. Once the attempt
+    /// is gone the refusal stands, which is what lets the socket
+    /// close with a reason instead of hanging.
     #[cfg(feature = "webrtc")]
     pub async fn apply_bootstrap_candidate_checked(
         &self,
@@ -25686,8 +25807,24 @@ impl MeshNode {
                 mid: mid.clone(),
             },
         )?;
-        self.dispatch_bootstrap_candidate(claimed_node_id, dialog, candidate, mid)
+        match self
+            .dispatch_bootstrap_candidate(claimed_node_id, dialog, candidate, mid)
             .await
+        {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if self.bootstrap_attempt_is_live(claimed_node_id, dialog, budget_key) {
+                    tracing::debug!(
+                        peer = format!("{claimed_node_id:#x}"),
+                        dialog,
+                        "a late bootstrap candidate: the attempt's channel is already \
+                         open, so there is nothing left to apply it to"
+                    );
+                    return Ok(());
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Apply a browser's trickled ICE candidate, charging the
@@ -25888,6 +26025,23 @@ impl MeshNode {
             .is_some_and(|e| *e.value() == key)
     }
 
+    /// Does this anchor still hold `dialog` in the **expiry table**?
+    ///
+    /// The witness barrier for "the completion owner has passed its
+    /// channel-open step": the owner's first act after the channel
+    /// opens is to take the row out of this table so expiry cannot
+    /// close an endpoint the install is about to own (R4-A). It is a
+    /// different question from [`Self::bootstrap_attempt_is_live`],
+    /// and the difference is precisely what the two got merged into.
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    pub async fn holds_bootstrap_dialog(&self, claimed_node_id: u64, dialog: u64) -> bool {
+        self.rtc_dialogs
+            .lock()
+            .await
+            .peer_for(claimed_node_id, dialog)
+            .is_some()
+    }
+
     /// Make a dialog **we** offered known to the inbound budget
     /// (R5), so an immediate `Reject` for it correlates instead of
     /// being refused as unknown — which kept the offer alive until
@@ -26024,17 +26178,32 @@ impl MeshNode {
             let Some(node) = weak.as_ref().and_then(|w| w.upgrade()) else {
                 return;
             };
-            // 2. **Retire the attempt BEFORE the install commits**
-            //    (R4-A): expiry used to be able to close a
-            //    just-installed direct endpoint after the routed
-            //    incumbent had already been displaced, because the
-            //    table stayed expirable across the install and the
-            //    post-install announcement await.
+            // 2. **Take the dialog out of the EXPIRY TABLE before
+            //    the install commits** (R4-A): expiry used to be
+            //    able to close a just-installed direct endpoint
+            //    after the routed incumbent had already been
+            //    displaced, because the table stayed expirable
+            //    across the install and the post-install
+            //    announcement await.
+            //
+            //    Only the table. The attempt's RESERVATION — and
+            //    with it the row that authorizes the attempt's own
+            //    bootstrap socket — is NOT released here: an
+            //    attempt whose channel has just opened is still in
+            //    flight, and "the accounting slot may be given
+            //    back" is a different fact from "this attempt is
+            //    over". Releasing at channel-open merged them, and
+            //    the browser paid for it: the anchor's host
+            //    candidate rides the offer body, so on a fast path
+            //    ICE completes before the trickle socket's own
+            //    TCP+TLS handshake lands, the R1 layer found no
+            //    live attempt and answered 404 — which a page can
+            //    only read as a bare `1006`. The attempt is retired
+            //    below, when it is genuinely terminal.
             {
                 let mut table = dialogs.lock().await;
                 table.remove(peer_node_id, dialog);
             }
-            node.release_signal_budget(peer_node_id, dialog);
             // 3. Noise over it, in this dialog's role. The offerer
             //    initiates, so both sides do not send msg1.
             let peer_pubkey = node
@@ -26063,6 +26232,15 @@ impl MeshNode {
                     "rtc upgrade: node shutting down".into(),
                 )),
             };
+            // 4. **Now the attempt is terminal**, whichever way it
+            //    went: a completed install means the session, not
+            //    the attempt, owns this peer from here on, and a
+            //    failed one means the attempt cannot succeed. Both
+            //    stop the token authorizing and both give the
+            //    accounting slot back — the single release every
+            //    other terminal path (expiry, our Reject, the
+            //    peer's Reject, the owner's close) already uses.
+            node.release_signal_budget(peer_node_id, dialog);
             match installed {
                 Ok(()) => {
                     driver.stats().note_ice_direct();

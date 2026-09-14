@@ -19,7 +19,7 @@ use std::collections::{HashMap, VecDeque};
 use bytes::Bytes;
 use net_wire::clock::Instant;
 
-use crate::announce::{self, AnnouncementStore, VerifiedAnnouncement, SUBPROTOCOL_FOLD};
+use crate::announce::{self, AnnouncementStore, VerifiedAnnouncement, SUBPROTOCOL_CAPABILITY_ANN};
 use crate::channel::{reply_channel, request_channel, Channel, SUBPROTOCOL_MEMBERSHIP};
 use crate::clock;
 use crate::control_plane::{NodeId, SignalEnvelope};
@@ -239,6 +239,14 @@ impl LeafNode {
     #[inline]
     pub fn node_id(&self) -> NodeId {
         self.identity.node_id()
+    }
+
+    /// This node's origin hash — the value every packet header it
+    /// seals carries, and the one a receiver checks an event
+    /// payload's `EventMeta.origin_hash` against.
+    #[inline]
+    pub fn origin_hash(&self) -> u64 {
+        self.identity.origin_hash()
     }
 
     /// This node's identity.
@@ -700,7 +708,7 @@ impl LeafNode {
     /// The bytes are for
     /// [`ControlPlane::publish_announcement`](crate::control_plane::ControlPlane::publish_announcement);
     /// [`Self::announce_to_peer`] additionally sends them to one peer
-    /// as a fold frame, which is the route-learning path §7 reuses.
+    /// over the session, which is the route-learning path §7 reuses.
     pub fn build_announcement(&mut self, capabilities: &[String]) -> Result<Vec<u8>> {
         let version = self.announcement_version;
         self.announcement_version = self.announcement_version.saturating_add(1);
@@ -714,12 +722,25 @@ impl LeafNode {
     }
 
     /// Send an already-signed announcement to one peer as a
-    /// `0x1000` fold frame.
+    /// `0x0C00` capability-announcement frame.
+    ///
+    /// **Not a fold frame.** It used to ride `0x1000`, and the
+    /// receiving anchor dropped every one of them: `0x1000` is routed
+    /// to the fold router, which expects a fold envelope and refuses
+    /// a bare announcement document at `debug` level — so the leaf
+    /// announced, the anchor logged nothing an operator would see,
+    /// and `find_best_node` never resolved the browser node.
+    /// `0x0C00` is the subprotocol whose handler
+    /// (`handle_capability_announcement`) verifies the signature,
+    /// pins the entity and feeds the capability index that
+    /// `find_best_node` reads. The stream id is the subprotocol id,
+    /// which is what the core's own `build_subprotocol_packet` uses
+    /// for control frames.
     pub fn announce_to_peer(&mut self, peer: NodeId, announcement: &[u8]) -> Result<()> {
         self.send_subprotocol(
             peer,
-            SUBPROTOCOL_FOLD as u64,
-            SUBPROTOCOL_FOLD,
+            u64::from(SUBPROTOCOL_CAPABILITY_ANN),
+            SUBPROTOCOL_CAPABILITY_ANN,
             0,
             announcement,
             true,
@@ -1541,7 +1562,13 @@ mod tests {
         node.announce_to_peer(ANCHOR, &first).expect("send");
         let out = node.take_outbound();
         let parsed = ParsedPacket::parse(out[0].packet.clone(), rtc_addr(0, 1)).expect("parses");
-        assert_eq!(parsed.header.subprotocol_id, SUBPROTOCOL_FOLD);
+        assert_eq!(
+            parsed.header.subprotocol_id, SUBPROTOCOL_CAPABILITY_ANN,
+            "an announcement must ride 0x0C00: that is the subprotocol whose handler \
+             verifies it and feeds the receiver's capability index. 0x1000 reaches the \
+             fold router instead, which refuses a bare announcement document — the \
+             anchor then resolves nothing for this node and says so only at debug level"
+        );
     }
 
     /// Signalling: verified against the sender's announcement, and

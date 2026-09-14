@@ -1025,6 +1025,96 @@ async fn a_busy_incumbent_survives_an_rtc_upgrade_attempt() {
     );
 }
 
+/// Stage 5 (the browser harness's UDP-blocked CONTROL leg): the
+/// quiescence gate must not lock an identity out of its own mesh.
+///
+/// The gate above is right when WE are replacing OUR session: the
+/// in-flight state is ours and the deferral is this node declining
+/// to throw it away. It is wrong in one shape, and the browser
+/// harness paid for it: a peer that has ALREADY superseded its own
+/// RTC channel — new DataChannel, completed Noise, same identity —
+/// was refused with `the incumbent session is busy`, against six
+/// subscription and nRPC-reply streams its previous tab had left
+/// open on an endpoint the anchor still believed was live. Nothing
+/// could ever clear them: the only party that could close those
+/// streams is the party being refused. The identity was locked out
+/// for good, and the observable was
+/// `session: the anchor did not complete the Noise handshake inside
+/// the deadline`.
+///
+/// So the RESPONDER, facing a busy incumbent on a DIFFERENT RTC
+/// endpoint, displaces it. The remote is the only party whose state
+/// could be lost and it has already abandoned it.
+///
+/// The two roles are asserted against the SAME busy incumbent, so
+/// the discriminator is the role and nothing else: the responder
+/// gets past the gate and waits for `msg1` (there is none to come,
+/// so it is still waiting when the window closes), while the
+/// initiator is refused immediately and names the reason. A second
+/// live DataChannel between the same pair of UDP sockets is not
+/// available to assert the full install here — the in-process
+/// fixture signalling cannot demux two sessions on one 5-tuple —
+/// and the full install over a real second channel is what the
+/// browser harness measures end to end.
+///
+/// Inverse: make `rtc_upgrade_precheck` role-blind again (defer
+/// whenever the incumbent is busy) — the responder is refused
+/// immediately instead of waiting, and the first assertion fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_peer_that_superseded_its_own_channel_is_not_locked_out_by_it() {
+    let (a, b, _id_a, _id_b) = pair_with(rtc_config(), rtc_config()).await;
+    let b_id = b.node_id();
+    let stale = a.peer_session_id(b_id).expect("an installed session");
+
+    // The state that made the gate refuse: a stream open on A's view
+    // of the incumbent. Nothing is sent on it, so B never learns of
+    // it — exactly the asymmetry the anchor was stuck in, where the
+    // streams belonged to a browser that had gone away and could
+    // never close them.
+    let _stranded = a
+        .open_stream(b_id, 0x0776, StreamConfig::new())
+        .expect("open_stream");
+    assert!(
+        a.peer_session_for_test(b_id)
+            .is_some_and(|s| s.stream_ids().contains(&0x0776)),
+        "the incumbent must really be busy, or this witness proves nothing",
+    );
+
+    let driver = a.rtc_driver().expect("driver");
+
+    // RESPONDER on a DIFFERENT RTC endpoint: the remote has
+    // superseded its own channel, so the gate must let this through.
+    // Getting past it means parking on the handshake inbox — nothing
+    // will send msg1 here, so "still waiting" IS "the gate allowed
+    // it". Before the repair this returned immediately with
+    // `the incumbent session is busy`.
+    let (fresh, _sdp) = driver.create_offer().await.expect("a fresh endpoint");
+    let waited = tokio::time::timeout(Duration::from_millis(500), a.accept_rtc(fresh, b_id)).await;
+    assert!(
+        waited.is_err(),
+        "the responder must get past the quiescence gate and wait for msg1; it \
+         returned {waited:?}",
+    );
+
+    // INITIATOR against the same incumbent: unchanged: this node's
+    // own in-flight state, this node's own call, refused at once and
+    // naming the role.
+    let (mine, _sdp) = driver.create_offer().await.expect("a second endpoint");
+    let b_pub = *b.public_key();
+    let refused = a.connect_rtc(mine, &b_pub, b_id).await;
+    let why = refused.expect_err("the initiator must still defer").to_string();
+    assert!(
+        why.contains("the incumbent session is busy") && why.contains("Initiator"),
+        "the initiator's deferral must survive and say whose state it is \
+         protecting; got {why:?}",
+    );
+    assert_eq!(
+        a.peer_session_id(b_id),
+        Some(stale),
+        "and neither attempt installed anything over the incumbent",
+    );
+}
+
 // ---------------------------------------------------------------
 // S3-R4 — input classification
 // ---------------------------------------------------------------

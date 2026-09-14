@@ -638,7 +638,16 @@ pub fn bootstrap_router(node: Arc<MeshNode>, config: &BootstrapConfig) -> Router
             let attempts = Arc::clone(&ws_attempts);
             let ws_node = Arc::clone(&ws_node_outer);
             async move {
+                // **Every refusal below is logged** because a
+                // refused WebSocket *handshake* is invisible to the
+                // page: a browser reports it as a bare `1006` with
+                // no code and no reason, so the anchor's log is the
+                // only place the actual reason can be read.
                 if !origin_allowed(request.headers(), &allowed) {
+                    tracing::debug!(
+                        origin = ?request.headers().get(axum::http::header::ORIGIN),
+                        "trickle upgrade refused: origin not on the allow-list"
+                    );
                     return refuse(
                         BootstrapRefusal::ForbiddenOrigin,
                         "this origin may not open the trickle socket",
@@ -652,12 +661,21 @@ pub fn bootstrap_router(node: Arc<MeshNode>, config: &BootstrapConfig) -> Router
                 // already held anchor state. `(node, dialog)` are
                 // guessable; the token is not.
                 let Some((node_id, dialog)) = trickle_ids(request.uri()) else {
+                    tracing::debug!(
+                        query = ?request.uri().query(),
+                        "trickle upgrade refused: no node_id/dialog in the query"
+                    );
                     return refuse(
                         BootstrapRefusal::MalformedCredential,
                         "the trickle socket needs node_id and dialog",
                     );
                 };
                 let Some(token) = presented_token(request.headers()) else {
+                    tracing::debug!(
+                        node = format!("{node_id:#x}"),
+                        dialog,
+                        "trickle upgrade refused: no attempt token subprotocol"
+                    );
                     return refuse(
                         BootstrapRefusal::ForbiddenOrigin,
                         "the trickle socket requires the attempt token from \
@@ -666,6 +684,11 @@ pub fn bootstrap_router(node: Arc<MeshNode>, config: &BootstrapConfig) -> Router
                     );
                 };
                 let Some(attempt) = attempts.authorize(&token, node_id, dialog) else {
+                    tracing::debug!(
+                        node = format!("{node_id:#x}"),
+                        dialog,
+                        "trickle upgrade refused: that token names no such attempt"
+                    );
                     return refuse(
                         BootstrapRefusal::UnknownDialog,
                         "no such attempt for that token, node and dialog",
@@ -681,6 +704,12 @@ pub fn bootstrap_router(node: Arc<MeshNode>, config: &BootstrapConfig) -> Router
                 // acceptance recorded, so this is the exact accepted
                 // attempt and not a same-tuple successor.
                 if !ws_node.bootstrap_attempt_is_live(node_id, dialog, attempt.budget_id) {
+                    tracing::debug!(
+                        node = format!("{node_id:#x}"),
+                        dialog,
+                        incarnation = attempt.incarnation,
+                        "trickle upgrade refused: the attempt is no longer live on this anchor"
+                    );
                     attempts.retire(&token);
                     return refuse(
                         BootstrapRefusal::UnknownDialog,

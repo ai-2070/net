@@ -235,27 +235,42 @@ impl LeafNode {
             .map_err(js)?;
         inner.borrow_mut().dialog = accepted.dialog;
 
-        // Layer 0 step 3: wait for the channel, trickling both ways
-        // through the boundary.
-        wait_for_channel(&inner, anchor).await?;
+        // From here on the anchor has an ACCEPTED ATTEMPT registered
+        // for this node id, so every failure below must hand it back:
+        // an attempt the page walks away from holds an ICE agent and
+        // a signalling reservation on the anchor until its own
+        // deadline. A page is told to decide after a typed failure,
+        // and deciding to try again must not be charged for the
+        // attempt that failed.
+        let brought_up = async {
+            // Layer 0 step 3: wait for the channel, trickling both
+            // ways through the boundary.
+            wait_for_channel(&inner, anchor).await?;
 
-        // Layer 1: the NKpsk0 handshake. `accepted.peer_static` is
-        // the CREDENTIAL's key — the control plane returns what
-        // authenticated the attempt, and `attach` already refused a
-        // live key that differed from it. This is the whole MITM
-        // property.
-        let msg1 = {
-            let mut guard = inner.borrow_mut();
-            let slot = guard.transport.next_slot();
-            let packet = guard
-                .node
-                .begin_handshake(anchor, &credential.psk, &accepted.peer_static, slot)
-                .map_err(js)?;
-            guard.transport.send(anchor, packet.clone()).map_err(js)?;
-            packet
-        };
-        debug_assert!(!msg1.is_empty());
-        wait_for_session(&inner, anchor).await?;
+            // Layer 1: the NKpsk0 handshake. `accepted.peer_static`
+            // is the CREDENTIAL's key — the control plane returns
+            // what authenticated the attempt, and `attach` already
+            // refused a live key that differed from it. This is the
+            // whole MITM property.
+            let msg1 = {
+                let mut guard = inner.borrow_mut();
+                let slot = guard.transport.next_slot();
+                let packet = guard
+                    .node
+                    .begin_handshake(anchor, &credential.psk, &accepted.peer_static, slot)
+                    .map_err(js)?;
+                guard.transport.send(anchor, packet.clone()).map_err(js)?;
+                packet
+            };
+            debug_assert!(!msg1.is_empty());
+            wait_for_session(&inner, anchor).await?;
+            Ok::<(), JsError>(())
+        }
+        .await;
+        if let Err(failure) = brought_up {
+            abandon_attempt(&inner).await;
+            return Err(failure);
+        }
 
         // Layer 2: enrollment, over the session just installed.
         // §12 admits a browser's session as **provisional** and
@@ -269,7 +284,12 @@ impl LeafNode {
         // the reply only arrives when something drains.
         start_ticker(Rc::downgrade(&inner));
         let node = LeafNode { inner };
-        node.enroll().await?;
+        if let Err(failure) = node.enroll().await {
+            // Same rule one layer up: the session and the attempt
+            // both go back, so the anchor is not left holding either.
+            node.close();
+            return Err(failure);
+        }
         Ok(node)
     }
 
@@ -281,6 +301,21 @@ impl LeafNode {
     /// The anchor's node id, as 16 lowercase hex digits.
     pub fn anchor_id_hex(&self) -> String {
         format!("{:016x}", self.inner.borrow().anchor)
+    }
+
+    /// This node's **origin hash**, as 16 lowercase hex digits.
+    ///
+    /// Not the node id, and not interchangeable with it: the origin
+    /// hash is derived from the entity key and is what rides every
+    /// packet header this node seals, what names its nRPC reply
+    /// channels (`<service>.replies.<origin>`), and what a receiver
+    /// compares an event's `EventMeta.origin_hash` against — a
+    /// direct peer whose packet origin and payload origin disagree
+    /// has its frame dropped before admission, so anything that
+    /// builds an event payload for this node to send MUST name this
+    /// value.
+    pub fn origin_hash_hex(&self) -> String {
+        format!("{:016x}", self.inner.borrow().node.origin_hash())
     }
 
     /// Every counter, as JSON. u64s are decimal strings.
@@ -664,9 +699,21 @@ async fn wait_for_channel(inner: &Rc<RefCell<Inner>>, peer: NodeId) -> Result<()
         // own candidate as the trickle socket's first frame, and
         // applying it immediately is the head start S0b measured
         // (6.6× gather-complete at the floor).
-        service_control_plane(inner).await.map_err(js)?;
+        //
+        // **Openness is decided before the dialog's end is.** The
+        // bootstrap dialog exists to carry SDP and candidates; once
+        // the channel is up it has done its job, and the anchor
+        // retires it as a matter of course. Failing the connect on
+        // its close regardless of whether the channel had already
+        // opened turned the anchor's own completion into
+        // `the anchor closed the bootstrap dialog: 1006` — a socket
+        // whose handshake merely lost a race with ICE.
+        let ended = service_control_plane(inner).await.err();
         if inner.borrow().transport.is_open(peer) {
             return Ok(());
+        }
+        if let Some(ended) = ended {
+            return Err(js(ended));
         }
         gloo_timer_sleep(TICK_MS).await.ok();
         waited += TICK_MS;
@@ -688,10 +735,19 @@ async fn wait_for_channel(inner: &Rc<RefCell<Inner>>, peer: NodeId) -> Result<()
 }
 
 /// Poll until the handshake installs a session.
+///
+/// The channel is already open here, so the bootstrap dialog has
+/// nothing left to carry: `msg1` and `msg2` ride the DataChannel,
+/// not the control plane. Its end is therefore not this wait's
+/// failure — but it IS the best diagnosis available if the session
+/// never arrives, so it is kept and reported then.
 async fn wait_for_session(inner: &Rc<RefCell<Inner>>, peer: NodeId) -> Result<(), JsError> {
     let mut waited = 0;
+    let mut dialog_ended: Option<LeafError> = None;
     while waited < ICE_DEADLINE_MS {
-        service_control_plane(inner).await.map_err(js)?;
+        if let Err(e) = service_control_plane(inner).await {
+            dialog_ended = Some(e);
+        }
         {
             let mut guard = inner.borrow_mut();
             guard.pump();
@@ -702,9 +758,40 @@ async fn wait_for_session(inner: &Rc<RefCell<Inner>>, peer: NodeId) -> Result<()
         gloo_timer_sleep(TICK_MS).await.ok();
         waited += TICK_MS;
     }
-    Err(js(LeafError::Session(
-        "the anchor did not complete the Noise handshake inside the deadline".into(),
-    )))
+    Err(js(match dialog_ended {
+        Some(ended) => LeafError::Session(format!(
+            "the anchor did not complete the Noise handshake inside the deadline ({ended})"
+        )),
+        None => LeafError::Session(
+            "the anchor did not complete the Noise handshake inside the deadline".into(),
+        ),
+    }))
+}
+
+/// Hand a failed attempt back to the anchor.
+///
+/// A `connect()` that rejects must leave NOTHING behind: the anchor
+/// registers an accepted attempt the moment it answers the offer,
+/// and an attempt nobody retires holds an ICE agent, a dialog row
+/// and a signalling reservation until its `ice_deadline` — which on
+/// a real anchor is tens of seconds and is charged against the
+/// bound the next offer is measured against. Handing it back is the
+/// page saying "I am done with this one", and it is the only thing
+/// that can say so: the anchor cannot distinguish a browser that
+/// gave up from one that is still gathering.
+///
+/// Awaited rather than spawned, so the caller's rejection is the
+/// last thing that happens.
+async fn abandon_attempt(inner: &Rc<RefCell<Inner>>) {
+    let (control, dialog, transport) = {
+        let guard = inner.borrow();
+        (guard.control.clone(), guard.dialog, guard.transport.clone())
+    };
+    inner.borrow_mut().closed = true;
+    if dialog != 0 {
+        let _ = control.end_attempt(dialog).await;
+    }
+    transport.close_all();
 }
 
 /// The periodic tick: the control plane is serviced, deadlines and
