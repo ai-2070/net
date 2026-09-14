@@ -638,8 +638,10 @@ mod tests {
         let id = identity();
         let mut store = AnnouncementStore::new();
         store.ingest(
-            verify_announcement(&build_announcement(&id, &[], 1, fresh_stamp(1), 300).expect("build"))
-                .expect("verify"),
+            verify_announcement(
+                &build_announcement(&id, &[], 1, fresh_stamp(1), 300).expect("build"),
+            )
+            .expect("verify"),
         );
         let json = store.query_json(TAG_LEAF);
         assert!(

@@ -173,7 +173,7 @@ pub fn verify(
 /// A 32-byte digest of an envelope's payload, so two candidates in
 /// one dialog are two facts rather than one repeated fact.
 fn payload_digest(payload: &[u8]) -> [u8; 32] {
-    use blake2::digest::{Digest, consts::U32};
+    use blake2::digest::{consts::U32, Digest};
     let mut hasher = blake2::Blake2s::<U32>::new();
     hasher.update(payload);
     let mut out = [0u8; 32];
@@ -221,8 +221,7 @@ impl SeenSignals {
     /// [`MAX_SIGNAL_LIFETIME_SECS`] rather than by uptime.
     pub fn admit(&mut self, envelope: &SignalEnvelope, now_unix_secs: u64) -> bool {
         self.seen.retain(|_, not_after| *not_after >= now_unix_secs);
-        self.order
-            .retain(|key| self.seen.contains_key(key));
+        self.order.retain(|key| self.seen.contains_key(key));
         let key = (
             envelope.from,
             envelope.dialog,
