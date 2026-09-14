@@ -148,6 +148,7 @@ crossed the boundary; `.kind` is a flat, stable discriminant:
 | `rpc-timeout` | `RpcError` | `RpcError::Timeout` |
 | `session-lost` | `RpcError` | `RpcError::SessionLost` |
 | `leader-lost` | `RpcError` | `RpcError::LeaderLost` |
+| `rpc-indeterminate` | `RpcError` | `RpcError::Indeterminate` |
 | `rpc-malformed` | `RpcError` | `RpcError::Malformed` |
 | `unknown` | `UnknownLeafError` | *nothing* — see below |
 
@@ -324,6 +325,52 @@ Two invariants worth knowing:
 
 A throwing listener is reported to the console and skipped; it neither
 takes down its siblings nor unwinds into the wasm frame that called it.
+
+## The stream boundary: one contract, tested through the built package
+
+`LeafStream.onMessage` and `for await (const bytes of stream)` yield
+`Uint8Array`. That promise is kept **here**, in TypeScript: the wasm
+boundary hands this package the node's own `stream_data` event JSON —
+the same string `on_event` delivers, filtered to the stream's id —
+and `LeafStream` parses it and base64-decodes `payload`.
+
+```text
+Rust  LeafStream::on_message(cb)  ->  cb('{"type":"stream_data","stream_id":"9","seq":"1","payload":"AQI="}')
+TS    new LeafStream(inner)       ->  onMessage(Uint8Array([1, 2]))
+```
+
+Emitting bytes from Rust instead would mean a second encoding of an
+event that already exists, and would throw away `seq` and the rest of
+the event's provenance at the boundary. So the direction is fixed:
+**Rust emits its canonical event JSON, TypeScript decodes it**, on the
+direct stream and the leader-proxied one alike — `MeshSession`
+streams are the same `LeafStream` over the same event shape.
+
+Two consequences a page can see:
+
+- The event's `stream_id` is **decimal** and `LeafStream.streamId` is
+  **hex**; they are the same `u64`. The wrapper matches inbound events
+  numerically, so an id past 2^53 routes correctly.
+- Options are typed at the shape Rust actually reads.
+  `OpenStreamOptions.channelHash` is a **number** in `0..=65535` (it
+  was a string that Rust read with `as_f64` and therefore ignored, so
+  the stream rode hash 0), `streamId` is a decimal or `0x`-hex
+  **string** because a `u64` does not survive a JS number, and
+  `ConnectOptions.iceServers` is a real `RTCIceServer[]` — `urls` a
+  string or an array, `username`/`credential` carried through for
+  TURN. Each is refused with a typed error rather than silently
+  dropped.
+
+None of that is taken on trust. `tests/abi_real_package.mjs` loads the
+**built** `dist/` and the wasm-bindgen `pkg/` beside it and asserts the
+decode, the ids, the ICE parse and the effective stream options against
+the real artifacts; `LeafNode.effective_ice_servers(opts)` and
+`LeafNode.effective_stream_options(opts)` are the static, pure readers
+it uses, and they are the same ones `connect` and `open_stream` call.
+The package's test doubles no longer invent a shape either: they emit
+the vectors in `test/fixtures/leaf-abi.json`, which
+`leaf/tests/ts_abi_fixture.rs` regenerates and pins against production
+`LeafEvent::to_json`.
 
 ## Identity and the trust boundary
 

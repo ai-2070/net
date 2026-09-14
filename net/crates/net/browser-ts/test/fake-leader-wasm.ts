@@ -6,13 +6,21 @@
  * `wasm_leader` tests (Web Locks, IndexedDB, `BroadcastChannel`) and
  * by the two-tab Playwright witness. These unit tests are about the
  * TypeScript layer — the option builder, the error re-typing, the five
- * lifecycle tags, the stream wrapper — so the boundary is faked. If
- * the Rust surface changes, `src/leader/` stops compiling against it
- * and this file stops satisfying the interface: both are compile-time
- * failures, not silent drift.
+ * lifecycle tags, the stream wrapper — so the boundary is faked.
+ *
+ * **At the Rust shape.** Inbound stream payloads arrive as the
+ * node's `stream_data` event JSON, exactly as
+ * `ProxyStream::on_message` delivers them; see `test/leaf-abi.ts`
+ * for the pin that keeps this honest. The old double produced
+ * `Uint8Array` and agreed only with the hand-written declaration.
  */
 
-import type { LeafWasmStreamOptions, LeafWasmProxyStream } from '../src/wasm.js';
+import { streamDataEvent } from './leaf-abi.js';
+import type {
+  LeafWasmStreamOptions,
+  LeafWasmProxyStream,
+  StreamCallbackPayload,
+} from '../src/wasm.js';
 import type {
   LeafWasmSession,
   LeafWasmSessionModule,
@@ -22,7 +30,10 @@ import type {
 export class FakeProxyStream implements LeafWasmProxyStream {
   readonly sent: Uint8Array[] = [];
   closed = false;
-  private sink: ((payload: Uint8Array) => void) | null = null;
+  /** The decimal id the events it emits carry; `0xff` in hex. */
+  readonly wireId = '255';
+  private seq = 0;
+  private sink: ((event: StreamCallbackPayload) => void) | null = null;
 
   constructor(
     readonly options: LeafWasmStreamOptions,
@@ -34,7 +45,7 @@ export class FakeProxyStream implements LeafWasmProxyStream {
     this.sent.push(payload);
   }
 
-  on_message(callback: (payload: Uint8Array) => void): void {
+  on_message(callback: (event: StreamCallbackPayload) => void): void {
     this.sink = callback;
   }
 
@@ -50,9 +61,10 @@ export class FakeProxyStream implements LeafWasmProxyStream {
     this.closed = true;
   }
 
-  /** Drive an inbound payload from a test. */
+  /** Drive an inbound payload from a test, the way Rust delivers it. */
   arrive(payload: Uint8Array): void {
-    this.sink?.(payload);
+    this.seq += 1;
+    this.sink?.(streamDataEvent(this.wireId, String(this.seq), payload));
   }
 }
 

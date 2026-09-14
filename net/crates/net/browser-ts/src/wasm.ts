@@ -25,7 +25,14 @@ export interface LeafWasmConnectOptions {
   bootstrapUrl?: string;
   /** The origin this node belongs to — the identity's trust boundary. */
   origin: string;
-  /** Extra ICE servers, when the page wants them. */
+  /**
+   * Extra ICE servers, when the page wants them.
+   *
+   * Real `RTCIceServer` objects: `urls` a string or an array of
+   * them, plus `username`/`credential` for TURN. Rust parses this
+   * shape (`wasm.rs: parse_ice_servers`) and refuses anything else
+   * — a bare URL string included — rather than dropping it.
+   */
   iceServers?: readonly RTCIceServer[];
   /** Custodial Ed25519 entity secret, 32 bytes of hex. */
   entitySecretHex?: string;
@@ -46,19 +53,53 @@ export interface LeafWasmStreamOptions {
   label?: string;
   /**
    * Used verbatim when present, so a stream can match a publish
-   * contract a native handler dispatches on.
+   * contract a native handler dispatches on. Decimal or `0x`-hex,
+   * and a **string** because a `u64` does not survive a JS number.
    */
   streamId?: string;
-  /** Likewise verbatim: the channel hash the stream rides. */
-  channelHash?: string;
+  /**
+   * Likewise verbatim: the `u16` channel hash the stream rides.
+   *
+   * A **number**, which is what Rust reads. It was declared a
+   * string here while `wasm.rs` read it with `as_f64`, so every
+   * typed caller that obeyed this file got hash 0 — silently, on
+   * the wrong channel. Out of `0..=65535` is now an error, not a
+   * saturating cast.
+   */
+  channelHash?: number;
 }
+
+/**
+ * What a stream's `on_message` callback receives from Rust.
+ *
+ * The wasm boundary hands over **the node's `stream_data` event
+ * JSON string**, the same text `on_event` delivers, filtered to this
+ * stream's id:
+ *
+ * ```json
+ * {"type":"stream_data","stream_id":"9","seq":"1","payload":"AQI="}
+ * ```
+ *
+ * `stream_id`/`seq` are decimal `u64` strings, `payload` is padded
+ * base64. {@link LeafStream} decodes it, which is where the promise
+ * of `Uint8Array` is kept; this declaration states what actually
+ * arrives. Before Stage 5's repair it said `Uint8Array` and the
+ * string was handed to pages verbatim.
+ *
+ * `Uint8Array` is admitted as already-decoded payload for a host
+ * that supplies its own {@link LeafWasmStreamLike} — the wrapper is
+ * a public type — and it is what keeps the plain-bytes path honest
+ * in the ABI probes.
+ */
+export type StreamCallbackPayload = string | Uint8Array;
 
 /** The stream object `open_stream` returns. */
 export interface LeafWasmStream {
   /** Synchronous on the Rust side: one payload, one packet, no framing. */
   send(payload: Uint8Array): void;
-  on_message(callback: (payload: Uint8Array) => void): void;
+  on_message(callback: (event: StreamCallbackPayload) => void): void;
   is_reliable(): boolean;
+  /** 16 lowercase hex digits. The event JSON's `stream_id` is the same id in decimal. */
   stream_id_hex(): string;
   close(): void;
 }
@@ -68,11 +109,12 @@ export interface LeafWasmStream {
  *
  * Identical to {@link LeafWasmStream} but for `send`, which is a
  * promise because on a follower the packet is put on the wire by
- * another tab.
+ * another tab. `on_message` delivers the same event JSON — one
+ * decoder serves both.
  */
 export interface LeafWasmProxyStream {
   send(payload: Uint8Array): Promise<void>;
-  on_message(callback: (payload: Uint8Array) => void): void;
+  on_message(callback: (event: StreamCallbackPayload) => void): void;
   is_reliable(): boolean;
   stream_id_hex(): string;
   close(): void;
@@ -143,6 +185,33 @@ export interface LeafWasmModule {
   default?: (init?: { module_or_path: string | URL }) => Promise<unknown>;
   LeafNode: {
     connect(options: LeafWasmConnectOptions): Promise<LeafWasmNode>;
+    /**
+     * The ICE servers a `connect()` with these options would hand
+     * the `RTCPeerConnection`, as JSON:
+     * `[{"urls":["stun:host:3478"],"username":"u","credential":"c"}]`.
+     *
+     * Static and pure, so the ABI it reports can be asserted
+     * against the real built wasm without an anchor — which is the
+     * only reason the `RTCIceServer[]` drop went unnoticed. Throws
+     * the same typed error `connect()` would.
+     *
+     * Optional because {@link loadLeafWasm} will happily load a glue
+     * built before this existed; `tests/abi_real_package.mjs`
+     * asserts the shipped one has it.
+     */
+    effective_ice_servers?(options: LeafWasmConnectOptions): string;
+    /**
+     * What an `open_stream()` with these options would ask the node
+     * for, as JSON: `{"reliability":"reliable","label":"app",
+     * "streamId":"0000000000000009","channelHash":7}`, `streamId`
+     * `null` when unpinned, `channelHash` `null` when absent.
+     *
+     * The same reader `MeshSession.open_stream` uses, so one
+     * assertion covers the direct and the leader-proxied surface.
+     *
+     * Optional for the same reason as the reader above.
+     */
+    effective_stream_options?(options: LeafWasmStreamOptions): string;
   };
   /**
    * §8's surface, refined by `src/leader/wasm.ts`. Absent from a

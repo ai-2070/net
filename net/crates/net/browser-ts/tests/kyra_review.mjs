@@ -1,8 +1,14 @@
 import fs from 'node:fs';
 import vm from 'node:vm';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
-const repo = 'C:/Users/chief/orca/workspaces/net/kyra-stage5-9f8bde0c7';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+// ADAPTATION (the only one): the reviewer's absolute worktree path,
+// `C:/Users/chief/orca/workspaces/net/kyra-stage5-9f8bde0c7`, cannot
+// resolve in CI or in this repository. Derived from this file's own
+// location instead — it sits at
+// <repo>/net/crates/net/browser-ts/tests/. Every assertion below is
+// verbatim.
+const repo = fileURLToPath(new URL('../../../../../', import.meta.url)).replace(/[\\/]+$/, '');
 const records = [];
 async function probe(name, fn) {
   try { await fn(); records.push({ name, pass: true }); }

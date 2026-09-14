@@ -2,26 +2,40 @@
  * A fake `net-mesh-leaf` module.
  *
  * The real wasm is exercised by the Playwright matrix in
- * `net/crates/net/tests/rtc_browser/`; these unit tests are about the
- * TypeScript layer — the error re-typing, the event parsing and the
- * failure classification — so the boundary is faked at exactly the
- * shape `src/wasm.ts` declares. If the Rust surface changes, `src/`
- * stops compiling against it and this file stops satisfying the
- * interface: both are compile-time failures, not silent drift.
+ * `net/crates/net/tests/rtc_browser/`, by
+ * `tests/abi_real_package.mjs` against the built `pkg/`, and by the
+ * leaf's own wasm suites; these unit tests are about the TypeScript
+ * layer — the error re-typing, the event parsing and the failure
+ * classification — so the boundary is faked.
+ *
+ * **Faked at the Rust shape, not at the declaration's.** The
+ * original claim here was that a Rust change breaks TypeScript
+ * compilation. It is not true of independently hand-written
+ * interfaces, and it hid the stream callback defect for a whole
+ * stage: this file produced `Uint8Array` because `src/wasm.ts` said
+ * `Uint8Array`, while Rust produced a JSON string. Inbound payloads
+ * now go through {@link streamDataEvent}, which reproduces
+ * `LeafEvent::to_json` and is itself pinned against a
+ * Rust-generated fixture by `abi.test.ts`.
  */
 
+import { streamDataEvent } from './leaf-abi.js';
 import type {
   LeafWasmConnectOptions,
   LeafWasmModule,
   LeafWasmNode,
   LeafWasmStream,
   LeafWasmStreamOptions,
+  StreamCallbackPayload,
 } from '../src/wasm.js';
 
 export class FakeStream implements LeafWasmStream {
   readonly sent: Uint8Array[] = [];
   closed = false;
-  private sink: ((payload: Uint8Array) => void) | null = null;
+  /** The decimal id the events it emits carry; `0xff` in hex. */
+  readonly wireId = '255';
+  private seq = 0;
+  private sink: ((event: StreamCallbackPayload) => void) | null = null;
 
   constructor(
     readonly options: LeafWasmStreamOptions,
@@ -33,7 +47,7 @@ export class FakeStream implements LeafWasmStream {
     this.sent.push(payload);
   }
 
-  on_message(callback: (payload: Uint8Array) => void): void {
+  on_message(callback: (event: StreamCallbackPayload) => void): void {
     this.sink = callback;
   }
 
@@ -49,9 +63,15 @@ export class FakeStream implements LeafWasmStream {
     this.closed = true;
   }
 
-  /** Drive an inbound payload from a test. */
+  /** Drive an inbound payload from a test, the way Rust delivers it. */
   arrive(payload: Uint8Array): void {
-    this.sink?.(payload);
+    this.seq += 1;
+    this.sink?.(streamDataEvent(this.wireId, String(this.seq), payload));
+  }
+
+  /** Drive one verbatim callback argument, for ABI probes. */
+  arriveRaw(event: StreamCallbackPayload): void {
+    this.sink?.(event);
   }
 }
 
@@ -59,6 +79,7 @@ export class FakeStream implements LeafWasmStream {
 export interface FakeNodeBehaviour {
   nodeIdHex?: string;
   anchorIdHex?: string;
+  originHashHex?: string;
   countersJson?: string;
   signalError?: unknown;
   enrollError?: unknown;
@@ -131,6 +152,13 @@ export class FakeNode implements LeafWasmNode {
     return this.behaviour.anchorIdHex ?? '00000000000000aa';
   }
 
+  // Was missing while `implements LeafWasmNode` claimed otherwise —
+  // `test/` was outside every tsconfig, so the claim was never
+  // checked. `tsconfig.test.json` checks it now.
+  origin_hash_hex(): string {
+    return this.behaviour.originHashHex ?? '00000000000000bb';
+  }
+
   async signal(peer_hex: string, dialog: number, kind: string, payload: Uint8Array): Promise<void> {
     if (this.behaviour.signalError !== undefined) throw this.behaviour.signalError;
     this.signals.push({ peerHex: peer_hex, dialog, kind, payload });
@@ -160,6 +188,14 @@ export class FakeNode implements LeafWasmNode {
     this.sink(json);
   }
 }
+
+// `effective_ice_servers` / `effective_stream_options` are
+// deliberately ABSENT here. A TypeScript mirror of Rust's option
+// readers is exactly the second implementation that let
+// `channelHash` and `iceServers` drift — it would agree with
+// whatever this package believes, which is the thing under test.
+// That ABI is asserted against the real built `pkg/` by
+// `tests/abi_real_package.mjs`, and nowhere else.
 
 /** A module object satisfying `LeafWasmModule`, with no wasm behind it. */
 export function fakeModule(node: FakeNode | (() => FakeNode | Promise<FakeNode>)): LeafWasmModule {

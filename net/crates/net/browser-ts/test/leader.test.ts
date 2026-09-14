@@ -17,6 +17,7 @@ import { asSessionModule } from '../src/leader/wasm.js';
 import { isLifecycleEvent, parseSessionEvent } from '../src/leader/events.js';
 import { NotLeaderError, RpcError, type LeafError } from '../src/errors.js';
 import type { SessionEvent } from '../src/leader/events.js';
+import type { LeafWasmSessionOptions } from '../src/leader/wasm.js';
 import {
   FakeSession,
   failingSessionModule,
@@ -41,7 +42,7 @@ async function opened(
 
 describe('openSession', () => {
   it('builds its options from the same connect builder, plus the election keys', async () => {
-    const observed: { options?: Record<string, unknown> } = {};
+    const observed: { options?: LeafWasmSessionOptions } = {};
     const fake = new FakeSession();
     await openSession({
       ...BASE,
@@ -66,7 +67,7 @@ describe('openSession', () => {
   });
 
   it('omits the election keys a page did not set rather than sending undefined', async () => {
-    const observed: { options?: Record<string, unknown> } = {};
+    const observed: { options?: LeafWasmSessionOptions } = {};
     await openSession({ ...BASE, wasm: fakeSessionModule(new FakeSession(), observed) });
     expect(Object.keys(observed.options ?? {}).sort()).toEqual([
       'bootstrapUrl',
@@ -179,7 +180,7 @@ describe('MeshSession', () => {
         'not the leader: this tab holds generation 4, the leader holds 5',
       ),
     });
-    const error: LeafError = await session
+    const error: LeafError | Uint8Array = await session
       .call('svc', new Uint8Array())
       .catch((e: unknown) => e as LeafError);
     expect(error).toBeInstanceOf(NotLeaderError);
@@ -213,10 +214,39 @@ describe('MeshSession', () => {
     // Idempotent: a page may close on unload and on an error path.
     session.close();
   });
+
+  it('ends a waiting stream iterator when leadership is lost', async () => {
+    const { session, fake } = await opened();
+    const stream = await session.openStream({ reliability: 'reliable', label: 'app' });
+    // A consumer parked on the next payload, which is the shape a
+    // page actually writes: `for await (const payload of stream)`.
+    const waiting = stream[Symbol.asyncIterator]().next();
+
+    fake.emit('{"type":"leader_lost","generation":"1","failed":"0"}');
+
+    // Settled, and settled as the end of the iteration — not left
+    // pending on a node that no longer exists. A stream is
+    // session-scoped and is NOT restored, so ending it is the honest
+    // disposition; hanging forever is the one that hides the
+    // interruption.
+    expect(await waiting).toEqual({ value: undefined, done: true });
+    expect(fake.streams[0]?.closed).toBe(true);
+  });
+
+  it('ends a waiting stream iterator when this tab discovers it was superseded', async () => {
+    const { session, fake } = await opened();
+    const stream = await session.openStream({ reliability: 'reliable', label: 'app' });
+    const waiting = stream[Symbol.asyncIterator]().next();
+
+    fake.emit('{"type":"not_leader","presented":"1","current":"2"}');
+
+    expect(await waiting).toEqual({ value: undefined, done: true });
+    expect(fake.streams[0]?.closed).toBe(true);
+  });
 });
 
 describe('the lifecycle events', () => {
-  it('delivers all five tags typed, with u64s exact', async () => {
+  it('delivers all six tags typed, with u64s exact', async () => {
     const { session, fake } = await opened();
     const seen: SessionEvent[] = [];
     session.onEvent((event) => seen.push(event));
@@ -226,6 +256,7 @@ describe('the lifecycle events', () => {
     fake.emit('{"type":"leader_lost","generation":"4","failed":"3"}');
     fake.emit('{"type":"generation_fenced","presented":"4","current":"5"}');
     fake.emit('{"type":"not_leader","presented":"4","current":"5"}');
+    fake.emit('{"type":"promotion_failed","generation":"6","detail":"session: no anchor"}');
 
     expect(seen).toEqual([
       { type: 'leader_changed', generation: '18446744073709551615' },
@@ -233,6 +264,7 @@ describe('the lifecycle events', () => {
       { type: 'leader_lost', generation: '4', failed: 3 },
       { type: 'generation_fenced', presented: '4', current: '5' },
       { type: 'not_leader', presented: '4', current: '5' },
+      { type: 'promotion_failed', generation: '6', detail: 'session: no anchor' },
     ]);
     expect(seen.every((event) => isLifecycleEvent(event))).toBe(true);
   });

@@ -100,6 +100,7 @@ export type {
   LeafWasmStream,
   LeafWasmStreamLike,
   LeafWasmStreamOptions,
+  StreamCallbackPayload,
   StreamReliability,
   WasmSource,
 } from './wasm.js';

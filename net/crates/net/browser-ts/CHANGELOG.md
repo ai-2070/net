@@ -44,7 +44,8 @@ the README on why it is a sibling package rather than a sub-path.
   (`wire`, `session`, `control-plane`, `identity`, `not-leader`,
   `ice-timeout`, `udp-blocked`, `channel-closed`, `rtc-unsupported`,
   `rpc-refused`, `rpc-timeout`, `session-lost`, `leader-lost`,
-  `rpc-malformed`). An unrecognised message becomes `UnknownLeafError`
+  `rpc-indeterminate`, `rpc-malformed`). An unrecognised message
+  becomes `UnknownLeafError`
   rather than being folded into a near neighbour.
 
 - **The `udp-blocked` classification, with its evidence.** An ICE
@@ -87,3 +88,36 @@ the README on why it is a sibling package rather than a sub-path.
 
 - **`session-lost` and `leader-lost` are never retried for you.**
   They are surfaced typed, and the caller decides.
+
+- **Stream payloads are decoded here, not encoded twice in Rust.** The
+  wasm boundary delivers the node's `stream_data` event JSON to a
+  stream's callback — `{"type":"stream_data","stream_id":"9",
+  "seq":"1","payload":"AQI="}` — and `LeafStream` parses and
+  base64-decodes it, so `onMessage` and `for await` yield
+  `Uint8Array` on the direct and the leader-proxied surface alike.
+  The declaration in `src/wasm.ts` used to say `Uint8Array` and the
+  argument was forwarded verbatim, so a page received the JSON string.
+  If you wired `LeafWasmStream.on_message` yourself, parse it.
+
+- **`OpenStreamOptions.channelHash` is a `number`**, not a string, and
+  must be a whole number in `0..=65535`. Rust reads it as a number;
+  the string the old type asked for was read as absent, and the stream
+  rode channel hash 0. A string, a fraction or an out-of-range value
+  is now a typed error instead of a silently different channel.
+  `streamId` stays a decimal or `0x`-hex **string** — and a number
+  there is refused rather than ignored.
+
+- **`ConnectOptions.iceServers` is honoured.** The leaf now parses
+  real `RTCIceServer` objects (`urls` as a string or an array, plus
+  `username`/`credential` for TURN) and configures the
+  `RTCPeerConnection` with them. It previously read each entry with
+  `as_string`, so every object a page passed was dropped and its
+  STUN/TURN configuration never reached the offer. A bare URL string
+  is refused rather than accepted as a second spelling.
+
+- **`LeafNode.effective_ice_servers(opts)` and
+  `LeafNode.effective_stream_options(opts)`** are static, pure readers
+  on the wasm surface that report what `connect()` / `open_stream()`
+  would actually use, so the ABI can be asserted against the built
+  package without an anchor. `tests/abi_real_package.mjs` does exactly
+  that against `dist/` and the `pkg/` beside it.

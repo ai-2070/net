@@ -21,9 +21,13 @@
 //!    dispositions all execute in the browser — the same code the
 //!    native suite covers, on the target that matters.
 //!
-//! What is deliberately NOT here: `web_sys`. The RTC transport needs
-//! a real peer, so it is proven by the Playwright matrix against a
-//! native anchor, not by a unit test with no other end.
+//! What is deliberately NOT here: a *peer*. The RTC transport needs
+//! a real other end, so the connection itself is proven by the
+//! Playwright matrix against a native anchor. The one `web_sys`
+//! exception is the ICE-configuration witness below: what a page
+//! declares becoming what the browser actually holds needs no peer
+//! at all, and Stage 5 shipped a boundary that dropped every
+//! `RTCIceServer` a page passed without one observation noticing.
 //!
 //! Run:
 //! ```text
@@ -36,6 +40,7 @@
 
 use bytes::{Bytes, BytesMut};
 use serde_json::Value;
+use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 use net_leaf::announce;
@@ -48,8 +53,9 @@ use net_leaf::node::LeafEvent;
 use net_leaf::rpc_wire::{
     decode_route, encode_request_frame, EventMeta, RpcRequestPayload, DISPATCH_RPC_REQUEST,
 };
+use net_leaf::rtc::{new_connection, IceServer};
 use net_leaf::session::{routing_id, rtc_addr};
-use net_leaf::stream::{Reliability, RxStream};
+use net_leaf::stream::{Reliability, RxStream, StreamRecord};
 use net_leaf::test_vectors;
 use net_wire::aead::AeadKey;
 use net_wire::channel::name::channel_hash;
@@ -458,24 +464,40 @@ fn fragmentation_and_reassembly_run_inside_wasm() {
 }
 
 /// The consumer-side reorder and the fire-and-forget drop, inside
-/// wasm.
+/// wasm — including the property the record rewrite added: a packet
+/// released when a later arrival fills the gap keeps ITS OWN
+/// sequence and header, not the gap-filling arrival's.
 #[wasm_bindgen_test]
 fn the_consumer_side_reorder_runs_inside_wasm() {
+    fn record(seq: u64, tag: u8) -> StreamRecord {
+        StreamRecord {
+            seq,
+            span: 1,
+            stream_id: 7,
+            origin_hash: 0xA0 + seq,
+            channel_hash: tag as u16,
+            payloads: vec![Bytes::from(vec![tag])],
+        }
+    }
+
     let counters = LeafCounters::new();
     let mut reliable = RxStream::new(Reliability::Reliable);
-    assert!(reliable
-        .accept(2, vec![Bytes::from_static(b"c")], &counters)
-        .is_empty());
-    assert!(reliable
-        .accept(1, vec![Bytes::from_static(b"b")], &counters)
-        .is_empty());
-    let released = reliable.accept(0, vec![Bytes::from_static(b"a")], &counters);
-    let order: Vec<u8> = released.iter().map(|batch| batch[0][0]).collect();
-    assert_eq!(order, vec![b'a', b'b', b'c'], "reliable delivers in order");
+    assert!(reliable.accept(record(2, b'c'), &counters).is_empty());
+    assert!(reliable.accept(record(1, b'b'), &counters).is_empty());
+    let released = reliable.accept(record(0, b'a'), &counters);
+    let order: Vec<(u64, u8, u64)> = released
+        .iter()
+        .map(|r| (r.seq, r.payloads[0][0], r.origin_hash))
+        .collect();
+    assert_eq!(
+        order,
+        vec![(0, b'a', 0xA0), (1, b'b', 0xA1), (2, b'c', 0xA2)],
+        "reliable delivers in order, each with its own sequence and origin"
+    );
 
     let mut lossy = RxStream::new(Reliability::FireAndForget);
-    lossy.accept(0, vec![Bytes::from_static(b"a")], &counters);
-    let out = lossy.accept(4, vec![Bytes::from_static(b"e")], &counters);
+    lossy.accept(record(0, b'a'), &counters);
+    let out = lossy.accept(record(4, b'e'), &counters);
     assert_eq!(out.len(), 1, "fire-and-forget must not stall on a gap");
     assert_eq!(counters.drops(DropReason::FireAndForgetGap), 3);
 }
@@ -533,6 +555,82 @@ fn identity_generation_uses_the_browser_csprng() {
     assert_ne!(a.noise().public_key(), &[0u8; 32]);
 }
 
+/// **The effective ICE configuration.** What a page declares is what
+/// the browser ends up holding — read back off a real
+/// `RTCPeerConnection`, not off the argument we handed it.
+///
+/// Stage 5 read `iceServers` with `as_string` on each element, so
+/// the only shape `RTCIceServer` has — an object — evaluated to
+/// nothing: every STUN and TURN server a page configured was
+/// silently absent from the offer, and a recorded-options assertion
+/// could not see it because the options were recorded before the
+/// drop. This asserts the far side of the translation instead: the
+/// URLs arrive, both of a multi-URL entry arrive, and a TURN entry
+/// keeps the credentials without which the browser would not use it.
+#[wasm_bindgen_test]
+fn declared_ice_servers_are_the_connection_s_effective_configuration() {
+    let declared = [
+        IceServer {
+            urls: vec!["stun:stun.example:3478".to_string()],
+            username: None,
+            credential: None,
+        },
+        IceServer {
+            urls: vec![
+                "turn:turn.example:3478".to_string(),
+                "turn:turn.example:3479".to_string(),
+            ],
+            username: Some("leaf".to_string()),
+            credential: Some("secret".to_string()),
+        },
+    ];
+
+    let connection = new_connection(&declared).expect("a peer connection");
+    let effective = js_sys::Reflect::get(
+        &connection.get_configuration(),
+        &JsValue::from_str("iceServers"),
+    )
+    .expect("getConfiguration() reports iceServers")
+    .dyn_into::<js_sys::Array>()
+    .expect("iceServers is an array");
+    connection.close();
+
+    assert_eq!(
+        effective.length(),
+        2,
+        "the browser holds {} of the 2 declared ICE servers",
+        effective.length()
+    );
+
+    let stun = effective.get(0);
+    assert_eq!(
+        configured_urls(&stun),
+        vec!["stun:stun.example:3478".to_string()],
+        "the STUN server a page declared did not reach the connection"
+    );
+
+    let turn = effective.get(1);
+    assert_eq!(
+        configured_urls(&turn),
+        vec![
+            "turn:turn.example:3478".to_string(),
+            "turn:turn.example:3479".to_string()
+        ],
+        "a multi-URL RTCIceServer lost one of its URLs"
+    );
+    assert_eq!(
+        string_field(&turn, "username"),
+        Some("leaf".to_string()),
+        "the TURN username did not survive the boundary"
+    );
+    assert_eq!(
+        string_field(&turn, "credential"),
+        Some("secret".to_string()),
+        "the TURN credential did not survive the boundary — the server \
+         is configured but unusable"
+    );
+}
+
 // ──────────────────────────── helpers ───────────────────────────────
 
 fn json(src: &str) -> Value {
@@ -544,6 +642,25 @@ fn field<'a>(document: &'a Value, pointer: &str) -> &'a str {
         .pointer(pointer)
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("fixture has no {pointer}"))
+}
+
+/// One configured server's `urls`, whichever of the two shapes the
+/// engine normalised it to.
+fn configured_urls(server: &JsValue) -> Vec<String> {
+    let urls = js_sys::Reflect::get(server, &JsValue::from_str("urls")).expect("urls");
+    if let Some(single) = urls.as_string() {
+        return vec![single];
+    }
+    js_sys::Array::from(&urls)
+        .iter()
+        .map(|url| url.as_string().expect("a url string"))
+        .collect()
+}
+
+fn string_field(object: &JsValue, key: &str) -> Option<String> {
+    js_sys::Reflect::get(object, &JsValue::from_str(key))
+        .ok()
+        .and_then(|value| value.as_string())
 }
 
 fn hex(bytes: &[u8]) -> String {

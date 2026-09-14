@@ -9,6 +9,7 @@ import { describe, expect, it } from 'vitest';
 
 import { connect, type BrowserNode } from '../src/node.js';
 import { fromWasmError, isUdpBlocked, type LeafError } from '../src/errors.js';
+import type { LeafWasmConnectOptions } from '../src/wasm.js';
 import { fakeModule, failingModule, FakeNode } from './fake-wasm.js';
 
 const BASE = {
@@ -26,7 +27,7 @@ describe('connect', () => {
     let seen: unknown;
     const module = {
       LeafNode: {
-        async connect(options: unknown) {
+        async connect(options: LeafWasmConnectOptions) {
           seen = options;
           return new FakeNode();
         },
@@ -41,7 +42,7 @@ describe('connect', () => {
     let seen: { credentialB64?: string } = {};
     const module = {
       LeafNode: {
-        async connect(options: { credentialB64: string }) {
+        async connect(options: LeafWasmConnectOptions) {
           seen = options;
           return new FakeNode();
         },
@@ -56,10 +57,10 @@ describe('connect', () => {
     // the caller's bag, so every key the Rust side reads must be named
     // here. Dropping these silently gave two tabs two different node
     // ids and cost the two-tabs-one-identity witness its property.
-    const seen: Array<Record<string, unknown>> = [];
+    const seen: LeafWasmConnectOptions[] = [];
     const module = {
       LeafNode: {
-        async connect(options: Record<string, unknown>) {
+        async connect(options: LeafWasmConnectOptions) {
           seen.push(options);
           return new FakeNode();
         },
@@ -78,18 +79,18 @@ describe('connect', () => {
   });
 
   it('omits the custodial keys entirely when the page did not supply them', async () => {
-    let seen: Record<string, unknown> = {};
+    let seen: LeafWasmConnectOptions | null = null;
     const module = {
       LeafNode: {
-        async connect(options: Record<string, unknown>) {
+        async connect(options: LeafWasmConnectOptions) {
           seen = options;
           return new FakeNode();
         },
       },
     };
     await connect({ ...BASE, wasm: module });
-    expect('entitySecretHex' in seen).toBe(false);
-    expect('noiseSecretHex' in seen).toBe(false);
+    expect(seen !== null && 'entitySecretHex' in seen).toBe(false);
+    expect(seen !== null && 'noiseSecretHex' in seen).toBe(false);
   });
 
   it('fails loudly on an unusable identity option instead of falling through to a generated one', async () => {
@@ -282,7 +283,7 @@ describe('BrowserNode', () => {
       reliability: 'fireAndForget',
       label: 'frames',
       streamId: '18446744073709551615',
-      channelHash: '9007199254740993',
+      channelHash: 9,
     } as const;
     node.openStream(options);
     expect(inner.streams[0]?.options).toEqual(options);

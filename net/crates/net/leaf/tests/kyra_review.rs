@@ -1,3 +1,10 @@
+//! Kyra's Stage 5 review probes, landed VERBATIM.
+//!
+//! Only this header was added, and only because the crate denies
+//! `missing_docs` on every target: not one assertion, helper or name
+//! below is the parent's. They reproduced 12 failures out of 15 when
+//! they landed, and each repair row turns named probes green without
+//! touching the file.
 use net_leaf::rpc_wire::{EventMeta, RpcStatus, DISPATCH_RPC_RESPONSE};
 use net_leaf::stream::LEAF_STREAM_DISCRIMINATOR;
 use net_leaf::{Channel, LeafEvent, LeafIdentity, LeafNode, Reliability};

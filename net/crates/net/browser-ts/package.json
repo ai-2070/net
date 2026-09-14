@@ -40,7 +40,7 @@
   "scripts": {
     "build": "tsc && node scripts/bundle.mjs",
     "size": "node scripts/size.mjs",
-    "test": "vitest run",
+    "test": "tsc -p tsconfig.test.json && vitest run",
     "test:watch": "vitest"
   },
   "devDependencies": {

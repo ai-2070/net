@@ -31,6 +31,7 @@ export type LeafErrorKind =
   | 'rpc-timeout'
   | 'session-lost'
   | 'leader-lost'
+  | 'rpc-indeterminate'
   | 'rpc-malformed'
   | 'unknown';
 
@@ -79,6 +80,7 @@ export type RpcErrorFailure =
   | { readonly type: 'timeout' }
   | { readonly type: 'sessionLost' }
   | { readonly type: 'leaderLost'; readonly generation: number }
+  | { readonly type: 'indeterminate'; readonly deadlineMs: number }
   | { readonly type: 'malformed'; readonly detail: string };
 
 /** The base class of everything this package rejects with. */
@@ -166,7 +168,13 @@ export class RtcError extends LeafError {
 
 /** An nRPC call failed or was disposed of. `kind` is the flattened failure. */
 export class RpcError extends LeafError {
-  readonly kind: 'rpc-refused' | 'rpc-timeout' | 'session-lost' | 'leader-lost' | 'rpc-malformed';
+  readonly kind:
+    | 'rpc-refused'
+    | 'rpc-timeout'
+    | 'session-lost'
+    | 'leader-lost'
+    | 'rpc-indeterminate'
+    | 'rpc-malformed';
 
   constructor(readonly failure: RpcErrorFailure) {
     super(`rpc: ${rpcDisplay(failure)}`);
@@ -209,6 +217,7 @@ const RPC_KINDS = {
   timeout: 'rpc-timeout',
   sessionLost: 'session-lost',
   leaderLost: 'leader-lost',
+  indeterminate: 'rpc-indeterminate',
   malformed: 'rpc-malformed',
 } as const;
 
@@ -242,6 +251,11 @@ function rpcDisplay(failure: RpcErrorFailure): string {
       return 'the session carrying the call went away';
     case 'leaderLost':
       return `the leader holding generation ${failure.generation} was replaced`;
+    case 'indeterminate':
+      return (
+        `the local deadline of ${failure.deadlineMs}ms elapsed before the tab running ` +
+        'the node answered; the remote operation may still have executed (it was not retried)'
+      );
     case 'malformed':
       return `the reply did not decode: ${failure.detail}`;
   }
@@ -352,6 +366,16 @@ export function parseRpcFailure(text: string): RpcErrorFailure | null {
 
   const leaderLost = /^the leader holding generation (\d+) was replaced$/.exec(text);
   if (leaderLost) return { type: 'leaderLost', generation: Number(leaderLost[1]) };
+
+  // A follower's own deadline, not the node's. The distinction is
+  // the whole point: `rpc-timeout` says the call died on the leaf's
+  // deadline, this says nobody knows — the request may be executing
+  // in the tab that holds the node, and this package does not
+  // reissue it.
+  const indeterminate = /^the local deadline of (\d+)ms elapsed before the tab running the node answered; the remote operation may still have executed \(it was not retried\)$/.exec(
+    text,
+  );
+  if (indeterminate) return { type: 'indeterminate', deadlineMs: Number(indeterminate[1]) };
 
   const malformed = after(text, 'the reply did not decode: ');
   if (malformed !== null) return { type: 'malformed', detail: malformed };

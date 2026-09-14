@@ -142,7 +142,7 @@ impl RtcLeafTransport {
     /// The channel is created **before** the offer, which is what
     /// puts the SCTP m-line in the SDP; an offer without it would
     /// negotiate a connection with nothing to carry.
-    pub async fn create_offer(&self, peer: NodeId, ice_servers: &[String]) -> Result<Sdp> {
+    pub async fn create_offer(&self, peer: NodeId, ice_servers: &[IceServer]) -> Result<Sdp> {
         let connection = new_connection(ice_servers)?;
 
         // Reliable, ordered: the Net layer's own reliability rides
@@ -211,7 +211,7 @@ impl RtcLeafTransport {
         &self,
         peer: NodeId,
         offer: &Sdp,
-        ice_servers: &[String],
+        ice_servers: &[IceServer],
     ) -> Result<Sdp> {
         let connection = new_connection(ice_servers)?;
         let ice = self.install_ice_handler(peer, &connection);
@@ -449,6 +449,27 @@ fn flush_link(link: &mut PeerLink, channel: &RtcDataChannel) {
     }
 }
 
+/// One ICE server, exactly as much of `RTCIceServer` as the leaf
+/// configures.
+///
+/// The page-facing option is a web `RTCIceServer` — `urls` is a
+/// string *or* an array of them, and a TURN entry carries
+/// `username`/`credential`. Stage 5 shipped a `Vec<String>` here,
+/// which meant a TURN server configured by a page reached the
+/// `RTCPeerConnection` without its credentials, i.e. not at all.
+/// The parse lives at the wasm boundary
+/// ([`crate::wasm::LeafNode::effective_ice_servers`]); this is the
+/// checked shape it produces and the only one the transport reads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IceServer {
+    /// One or more URLs for the same server. Never empty.
+    pub urls: Vec<String>,
+    /// TURN username, when the entry has one.
+    pub username: Option<String>,
+    /// TURN credential, when the entry has one.
+    pub credential: Option<String>,
+}
+
 /// A peer connection configured with `ice_servers`.
 ///
 /// Shared by the offering and the answering path: two connections
@@ -456,16 +477,31 @@ fn flush_link(link: &mut PeerLink, channel: &RtcDataChannel) {
 /// ICE differently, and a browser ↔ browser attempt where only one
 /// side has a STUN server is a connectivity bug with no symptom
 /// except a deadline.
-fn new_connection(ice_servers: &[String]) -> Result<RtcPeerConnection> {
+///
+/// Public because it is the single point where a page's declared ICE
+/// configuration becomes the browser's *effective* one, and that is
+/// a property worth asserting against a real `RTCPeerConnection`
+/// rather than against the argument we passed in.
+pub fn new_connection(ice_servers: &[IceServer]) -> Result<RtcPeerConnection> {
     let config = RtcConfiguration::new();
     if !ice_servers.is_empty() {
         let servers = js_sys::Array::new();
-        for url in ice_servers {
+        for entry in ice_servers {
             let server = js_sys::Object::new();
             let urls = js_sys::Array::new();
-            urls.push(&JsValue::from_str(url));
+            for url in &entry.urls {
+                urls.push(&JsValue::from_str(url));
+            }
             js_sys::Reflect::set(&server, &JsValue::from_str("urls"), &urls)
                 .map_err(|e| unsupported("iceServers", &e))?;
+            for (key, value) in [
+                ("username", &entry.username),
+                ("credential", &entry.credential),
+            ] {
+                let Some(value) = value else { continue };
+                js_sys::Reflect::set(&server, &JsValue::from_str(key), &JsValue::from_str(value))
+                    .map_err(|e| unsupported("iceServers", &e))?;
+            }
             servers.push(&server);
         }
         config.set_ice_servers(&servers);

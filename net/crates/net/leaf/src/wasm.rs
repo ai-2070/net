@@ -60,7 +60,7 @@ use crate::control_plane::{ControlEvent, ControlPlane, DialogId, NodeId, SignalK
 use crate::error::LeafError;
 use crate::identity::{EntityKeypair, LeafIdentity};
 use crate::node::{LeafEvent, StreamHandle};
-use crate::rtc::RtcLeafTransport;
+use crate::rtc::{IceServer, RtcLeafTransport};
 use crate::stream::Reliability;
 
 /// How long `connect` waits for the DataChannel to open.
@@ -113,9 +113,34 @@ struct Inner {
 }
 
 impl Inner {
+    /// Refuse an outbound operation on a node that has been closed
+    /// or retired.
+    ///
+    /// The fence at the node's own boundary. A leadership stand-down
+    /// closes the node **before** it lets go of the lock, so anything
+    /// that still holds a handle to it — a spawned operation whose
+    /// barrier fired late, a page that kept its `LeafNode` — is
+    /// refused here rather than allowed to put a packet on a
+    /// DataChannel this origin's identity has already moved off.
+    fn admit(&self) -> Result<(), LeafError> {
+        if self.closed {
+            return Err(LeafError::Session(
+                "the node is closed: it no longer holds this origin's identity".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Hand every queued datagram to the node, push everything the
     /// node produced to the transport, and fire the listeners.
+    ///
+    /// A closed node pumps nothing. The ticker's own check is not
+    /// enough on its own: an operation that resumes after a
+    /// stand-down pumps too, and this is the line that stops it.
     fn pump(&mut self) {
+        if self.closed {
+            return;
+        }
         let now = clock::now();
         while let Some((peer, bytes)) = self.inbox.pop_front() {
             if !self.node.has_session(peer) && is_handshake_packet(&bytes) {
@@ -168,7 +193,7 @@ impl LeafNode {
         credential.validate_at(clock::now_unix_secs()).map_err(js)?;
         let bootstrap_url = optional_string(&opts, "bootstrapUrl")
             .unwrap_or_else(|| credential.bootstrap_url.clone());
-        let ice_servers = string_array(&opts, "iceServers");
+        let ice_servers = parse_ice_servers(&opts)?;
         let identity = identity_from(&opts)?;
         let node_id = identity.node_id();
 
@@ -336,6 +361,7 @@ impl LeafNode {
     ) -> Result<Uint8Array, JsError> {
         let receiver = {
             let mut guard = self.inner.borrow_mut();
+            guard.admit().map_err(js)?;
             let peer = guard.anchor;
             let receiver = guard
                 .node
@@ -364,6 +390,7 @@ impl LeafNode {
     /// Subscribe to `channel` on the anchor.
     pub async fn subscribe(&self, channel: String) -> Result<(), JsError> {
         let mut guard = self.inner.borrow_mut();
+        guard.admit().map_err(js)?;
         let peer = guard.anchor;
         guard.node.subscribe(peer, &channel).map_err(js)?;
         guard.pump();
@@ -373,6 +400,7 @@ impl LeafNode {
     /// Publish `payload` on `channel`.
     pub async fn publish(&self, channel: String, payload: Uint8Array) -> Result<(), JsError> {
         let mut guard = self.inner.borrow_mut();
+        guard.admit().map_err(js)?;
         let peer = guard.anchor;
         guard
             .node
@@ -386,36 +414,65 @@ impl LeafNode {
     ///
     /// `opts`: `{ reliability: "reliable" | "fireAndForget",
     /// reliable?: boolean, label?, streamId?, channelHash? }`.
-    /// `streamId` / `channelHash` are used verbatim when present, so
-    /// a stream can match a publish contract a native handler
-    /// dispatches on.
+    /// `streamId` (a decimal or `0x`-hex **string**, because a `u64`
+    /// never crosses as a JS number) and `channelHash` (a **number**
+    /// in `0..=65535`) are used verbatim when present, so a stream
+    /// can match a publish contract a native handler dispatches on.
+    ///
+    /// Both are read by [`stream_options`], which
+    /// [`crate::leader_session::MeshSession::open_stream`] also
+    /// calls: the direct and the proxied surface cannot read the
+    /// same option object two ways.
     pub fn open_stream(&self, opts: JsValue) -> Result<LeafStream, JsError> {
-        let reliability = match optional_string(&opts, "reliability") {
-            Some(spelling) => Reliability::parse(&spelling).ok_or_else(|| {
-                JsError::new("reliability must be \"reliable\" or \"fireAndForget\"")
-            })?,
-            None => match optional_bool(&opts, "reliable") {
-                Some(true) | None => Reliability::Reliable,
-                Some(false) => Reliability::FireAndForget,
-            },
-        };
-        let label = optional_string(&opts, "label").unwrap_or_else(|| "app".to_string());
-        let stream_id = match optional_string(&opts, "streamId") {
-            Some(raw) => Some(parse_u64(&raw)?),
-            None => None,
-        };
-        let channel_hash = optional_f64(&opts, "channelHash").map(|v| v as u16);
+        let options = stream_options(&opts)?;
 
         let mut guard = self.inner.borrow_mut();
+        guard.admit().map_err(js)?;
         let peer = guard.anchor;
         let handle = guard
             .node
-            .open_stream(peer, &label, reliability, stream_id, channel_hash)
+            .open_stream(
+                peer,
+                &options.label,
+                options.reliability,
+                options.stream_id,
+                options.channel_hash,
+            )
             .map_err(js)?;
         Ok(LeafStream {
             inner: Rc::clone(&self.inner),
             handle,
         })
+    }
+
+    /// The ICE servers a `connect(opts)` with this options object
+    /// would configure its `RTCPeerConnection` with, as JSON.
+    ///
+    /// Not a convenience: it is the only way for a caller — or a
+    /// test — to see what the leaf made of the `RTCIceServer[]` it
+    /// was handed *before* a connection attempt consumes it. Stage 5
+    /// read those objects with `as_string`, so every one of them
+    /// dropped and a page's STUN/TURN configuration was silently
+    /// absent from the offer. Reads through exactly the parser
+    /// [`Self::connect`] uses.
+    ///
+    /// Shape: `[{"urls":["stun:host:3478"],"username":"u",
+    /// "credential":"c"}]`, `username`/`credential` present only
+    /// when the entry carried them.
+    pub fn effective_ice_servers(opts: JsValue) -> Result<String, JsError> {
+        Ok(ice_servers_json(&parse_ice_servers(&opts)?))
+    }
+
+    /// What an `open_stream(opts)` with this options object would
+    /// actually ask the node for, as JSON — the same read, without
+    /// the stream.
+    ///
+    /// Shape: `{"reliability":"reliable","label":"app",
+    /// "streamId":"0000000000000009","channelHash":7}`, with
+    /// `streamId` `null` when the caller did not pin one (the node
+    /// allocates) and `channelHash` `null` when absent.
+    pub fn effective_stream_options(opts: JsValue) -> Result<String, JsError> {
+        Ok(stream_options(&opts)?.to_json())
     }
 
     /// Build, sign and publish this leaf's announcement.
@@ -424,6 +481,7 @@ impl LeafNode {
     /// `transport:rtc`; `reflex_addr` and `rtc_addr` stay absent.
     pub async fn announce(&self, capabilities: Vec<String>) -> Result<(), JsError> {
         let mut guard = self.inner.borrow_mut();
+        guard.admit().map_err(js)?;
         let announcement = guard.node.build_announcement(&capabilities).map_err(js)?;
         let peer = guard.anchor;
         // v1's control plane has no publish endpoint; §7's
@@ -469,6 +527,7 @@ impl LeafNode {
         };
         let (control, envelope) = {
             let guard = self.inner.borrow();
+            guard.admit().map_err(js)?;
             let envelope = guard
                 .node
                 .sign_signal(peer, dialog as u64, kind, payload.to_vec());
@@ -497,6 +556,7 @@ impl LeafNode {
     pub async fn enroll(&self) -> Result<(), JsError> {
         let receiver = {
             let mut guard = self.inner.borrow_mut();
+            guard.admit().map_err(js)?;
             if guard.node.is_enrolled() {
                 return Ok(());
             }
@@ -558,6 +618,42 @@ impl LeafNode {
             guard.emit(event);
         }
     }
+
+    /// Retire the node because leadership moved off this tab, and say
+    /// how many pending calls that failed.
+    ///
+    /// [`Self::close`] is the page saying "I am done with this node";
+    /// this is the lifecycle saying "this node no longer holds the
+    /// identity". The difference is the disposition of the pending
+    /// calls, and it matters to the caller: a close is a
+    /// `SessionLost`, and a stand-down is a `LeaderLost` naming the
+    /// generation that owned the call, because "which leader did I
+    /// lose" is the question a page asks next and this is the only
+    /// place that knows the answer.
+    ///
+    /// `closed` is set **first**, so the pump the failure path runs
+    /// through emits nothing, and everything after it is teardown.
+    pub fn retire(&self, generation: u64) -> usize {
+        let mut guard = self.inner.borrow_mut();
+        if guard.closed {
+            return 0;
+        }
+        guard.closed = true;
+        let failed = guard.node.fail_calls_on_leader_loss(generation);
+        let anchor = guard.anchor;
+        guard.node.drop_session(anchor, "leadership was released");
+        let control = guard.control.clone();
+        let dialog = guard.dialog;
+        wasm_bindgen_futures::spawn_local(async move {
+            let _ = control.end_attempt(dialog).await;
+        });
+        guard.transport.close_all();
+        let events = guard.node.drain_events();
+        for event in &events {
+            guard.emit(event);
+        }
+        failed
+    }
 }
 
 /// One application stream.
@@ -583,6 +679,7 @@ impl LeafStream {
     /// packet — no leaf-added framing.
     pub fn send(&self, payload: Uint8Array) -> Result<(), JsError> {
         let mut guard = self.inner.borrow_mut();
+        guard.admit().map_err(js)?;
         guard
             .node
             .stream_send(self.handle, &payload.to_vec())
@@ -591,9 +688,27 @@ impl LeafStream {
         Ok(())
     }
 
-    /// Stream data arrives as `stream_data` events on the node's
-    /// `on_event`; this registers a listener filtered to this
-    /// stream's id.
+    /// Listen for this stream's inbound payloads.
+    ///
+    /// **The callback receives the node's `stream_data` event JSON
+    /// string**, not bytes — the same string
+    /// [`LeafNode::on_event`] delivers, filtered to this stream's
+    /// id:
+    ///
+    /// ```text
+    /// {"type":"stream_data","stream_id":"9","seq":"1","payload":"AQI="}
+    /// ```
+    ///
+    /// `stream_id` and `seq` are decimal `u64` strings and `payload`
+    /// is standard padded base64. One contract, one direction: the
+    /// leaf emits its canonical event JSON and the consumer decodes
+    /// it. Emitting bytes here instead would mean a second encoding
+    /// of an event that already exists, and would throw away `seq`
+    /// and the rest of the event's provenance at the boundary.
+    /// `@net-mesh/browser`'s `LeafStream` does that decode, which is
+    /// why its `onMessage` and its async iterator yield
+    /// `Uint8Array`; a host wiring this callback itself must parse
+    /// the same way.
     pub fn on_message(&self, callback: js_sys::Function) {
         let wanted = format!("\"stream_id\":\"{}\"", self.handle.stream_id);
         let filter = Closure::wrap(Box::new(move |json: JsValue| {
@@ -893,18 +1008,210 @@ fn optional_bool(opts: &JsValue, key: &str) -> Option<bool> {
         .and_then(|v| v.as_bool())
 }
 
-fn optional_f64(opts: &JsValue, key: &str) -> Option<f64> {
-    js_sys::Reflect::get(opts, &JsValue::from_str(key))
-        .ok()
-        .and_then(|v| v.as_f64())
+/// A string option that refuses a present value of another type.
+///
+/// [`optional_string`] answers `None` for anything that is not a
+/// string, which is the right reading for an absent option and the
+/// wrong one for a *supplied* option of the wrong type: a caller
+/// who wrote `streamId: 9` — the exact mistake the `u64`-as-string
+/// rule exists to prevent — would silently get an allocated id
+/// instead of the one their native handler dispatches on.
+fn typed_string(opts: &JsValue, key: &str, expected: &str) -> Result<Option<String>, JsError> {
+    let value = js_sys::Reflect::get(opts, &JsValue::from_str(key))
+        .map_err(|_| JsError::new(&format!("{key} could not be read")))?;
+    if value.is_undefined() || value.is_null() {
+        return Ok(None);
+    }
+    value.as_string().map(Some).ok_or_else(|| {
+        let actual = value.js_typeof().as_string().unwrap_or_default();
+        JsError::new(&format!("{key} must be {expected}, not a {actual}"))
+    })
 }
 
-fn string_array(opts: &JsValue, key: &str) -> Vec<String> {
-    js_sys::Reflect::get(opts, &JsValue::from_str(key))
-        .ok()
-        .and_then(|v| v.dyn_into::<js_sys::Array>().ok())
-        .map(|array| array.iter().filter_map(|v| v.as_string()).collect())
-        .unwrap_or_default()
+/// A `u16` option, or a loud refusal.
+///
+/// `channelHash` used to be read with `as_f64()` and cast. Two
+/// silent failures came out of that: the **string** the published
+/// TypeScript type asked callers for read as `None` and became hash
+/// 0 — a different channel — and `70_000` saturated to `65_535`
+/// instead of being rejected. A hash the caller did not ask for is
+/// worse than an error, so this is the only reader for it.
+fn optional_u16(opts: &JsValue, key: &str) -> Result<Option<u16>, JsError> {
+    let value = js_sys::Reflect::get(opts, &JsValue::from_str(key))
+        .map_err(|_| JsError::new(&format!("{key} could not be read")))?;
+    if value.is_undefined() || value.is_null() {
+        return Ok(None);
+    }
+    let Some(number) = value.as_f64() else {
+        let actual = value.js_typeof().as_string().unwrap_or_default();
+        return Err(JsError::new(&format!(
+            "{key} must be a number in 0..=65535, not a {actual}"
+        )));
+    };
+    if !number.is_finite() || number.fract() != 0.0 || number < 0.0 || number > 65_535.0 {
+        return Err(JsError::new(&format!(
+            "{key} must be a whole number in 0..=65535, got {number}"
+        )));
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    Ok(Some(number as u16))
+}
+
+/// Everything `open_stream` reads from its options object.
+///
+/// One struct rather than four reads at each of the two call sites,
+/// because the direct surface and the proxied one
+/// ([`crate::leader_session::MeshSession::open_stream`]) reading the
+/// same object two different ways is exactly the defect this
+/// replaces.
+pub(crate) struct StreamOptions {
+    pub(crate) reliability: Reliability,
+    pub(crate) label: String,
+    /// The id the caller pinned, or `None` to let the node allocate.
+    pub(crate) stream_id: Option<u64>,
+    pub(crate) channel_hash: Option<u16>,
+}
+
+impl StreamOptions {
+    /// The options as JSON, `streamId` spelled the way
+    /// [`LeafStream::stream_id_hex`] will report it.
+    pub(crate) fn to_json(&self) -> String {
+        let reliability = if self.reliability.is_reliable() {
+            "reliable"
+        } else {
+            "fireAndForget"
+        };
+        let stream_id = self
+            .stream_id
+            .map_or_else(|| "null".to_string(), |id| format!("\"{id:016x}\""));
+        let channel_hash = self
+            .channel_hash
+            .map_or_else(|| "null".to_string(), |hash| hash.to_string());
+        format!(
+            "{{\"reliability\":\"{reliability}\",\"label\":{},\"streamId\":{stream_id},\
+             \"channelHash\":{channel_hash}}}",
+            json_string(&self.label)
+        )
+    }
+}
+
+/// Read `{ reliability?, reliable?, label?, streamId?, channelHash? }`.
+pub(crate) fn stream_options(opts: &JsValue) -> Result<StreamOptions, JsError> {
+    let reliability = match typed_string(opts, "reliability", "\"reliable\" or \"fireAndForget\"")?
+    {
+        Some(spelling) => Reliability::parse(&spelling)
+            .ok_or_else(|| JsError::new("reliability must be \"reliable\" or \"fireAndForget\""))?,
+        None => match optional_bool(opts, "reliable") {
+            Some(true) | None => Reliability::Reliable,
+            Some(false) => Reliability::FireAndForget,
+        },
+    };
+    Ok(StreamOptions {
+        reliability,
+        label: typed_string(opts, "label", "a string")?.unwrap_or_else(|| "app".to_string()),
+        stream_id: match typed_string(opts, "streamId", "a decimal or 0x-hex string")? {
+            Some(raw) => Some(parse_u64(&raw)?),
+            None => None,
+        },
+        channel_hash: optional_u16(opts, "channelHash")?,
+    })
+}
+
+/// Read `iceServers` as what the web platform calls it: an array of
+/// `RTCIceServer`, whose `urls` is a string or an array of them and
+/// which carries `username`/`credential` for TURN.
+///
+/// Stage 5 read this with `as_string` on each element, so every
+/// object a page passed — the only shape `RTCIceServer` has —
+/// evaluated to nothing and the page's ICE configuration was
+/// silently absent from the offer. A bare URL string is refused
+/// rather than quietly accepted as a second spelling: one contract.
+fn parse_ice_servers(opts: &JsValue) -> Result<Vec<IceServer>, JsError> {
+    let value = js_sys::Reflect::get(opts, &JsValue::from_str("iceServers"))
+        .map_err(|_| JsError::new("iceServers could not be read"))?;
+    if value.is_undefined() || value.is_null() {
+        return Ok(Vec::new());
+    }
+    let array = value
+        .dyn_into::<js_sys::Array>()
+        .map_err(|_| JsError::new("iceServers must be an array of RTCIceServer objects"))?;
+    array
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| parse_ice_server(&entry, index))
+        .collect()
+}
+
+fn parse_ice_server(entry: &JsValue, index: usize) -> Result<IceServer, JsError> {
+    let urls_value = js_sys::Reflect::get(entry, &JsValue::from_str("urls"))
+        .map_err(|_| JsError::new(&format!("iceServers[{index}] could not be read")))?;
+    let urls = match urls_value.as_string() {
+        Some(single) => vec![single],
+        None => match urls_value.dyn_into::<js_sys::Array>() {
+            Ok(list) => list
+                .iter()
+                .map(|url| {
+                    url.as_string().ok_or_else(|| {
+                        JsError::new(&format!(
+                            "iceServers[{index}].urls must contain only strings"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<String>, JsError>>()?,
+            Err(_) => {
+                return Err(JsError::new(&format!(
+                    "iceServers[{index}] must be an RTCIceServer object whose `urls` is a \
+                     string or an array of strings"
+                )))
+            }
+        },
+    };
+    if urls.is_empty() {
+        return Err(JsError::new(&format!(
+            "iceServers[{index}].urls is empty, which configures nothing"
+        )));
+    }
+    Ok(IceServer {
+        urls,
+        username: optional_string(entry, "username"),
+        credential: optional_string(entry, "credential"),
+    })
+}
+
+/// The parsed ICE servers as JSON, for
+/// [`LeafNode::effective_ice_servers`].
+fn ice_servers_json(servers: &[IceServer]) -> String {
+    let mut out = String::from("[");
+    for (index, server) in servers.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str("{\"urls\":[");
+        for (position, url) in server.urls.iter().enumerate() {
+            if position > 0 {
+                out.push(',');
+            }
+            out.push_str(&json_string(url));
+        }
+        out.push(']');
+        if let Some(username) = &server.username {
+            out.push_str(",\"username\":");
+            out.push_str(&json_string(username));
+        }
+        if let Some(credential) = &server.credential {
+            out.push_str(",\"credential\":");
+            out.push_str(&json_string(credential));
+        }
+        out.push('}');
+    }
+    out.push(']');
+    out
+}
+
+/// One JSON string literal, escaped — the same one-liner
+/// `node.rs` and `leader_session.rs` use for the same job.
+fn json_string(raw: &str) -> String {
+    serde_json::Value::String(raw.to_string()).to_string()
 }
 
 /// A `u64` from a decimal or `0x`-prefixed hex string. The boundary

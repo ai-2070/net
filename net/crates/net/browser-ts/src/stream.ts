@@ -5,7 +5,8 @@
 
 import { AsyncQueue } from './async-queue.js';
 import { fromWasmError, SessionError } from './errors.js';
-import type { LeafWasmStreamLike, StreamReliability } from './wasm.js';
+import { parseEvent } from './events.js';
+import type { LeafWasmStreamLike, StreamCallbackPayload, StreamReliability } from './wasm.js';
 
 /** Options for {@link BrowserNode.openStream}. */
 export interface OpenStreamOptions {
@@ -22,8 +23,12 @@ export interface OpenStreamOptions {
    * contract a native handler dispatches on.
    */
   streamId?: string;
-  /** Likewise verbatim: the channel hash the stream rides. */
-  channelHash?: string;
+  /**
+   * Likewise verbatim: the `u16` channel hash the stream rides.
+   * A number — see {@link LeafWasmStreamOptions.channelHash} for
+   * why it is not a string.
+   */
+  channelHash?: number;
 }
 
 /**
@@ -39,6 +44,18 @@ export class LeafStream implements AsyncIterable<Uint8Array> {
   private readonly listeners = new Set<(payload: Uint8Array) => void>();
   private readonly pending: Uint8Array[] = [];
   private closed = false;
+  /**
+   * This stream's wire id as a number, or `null` when the inner
+   * object's `stream_id_hex()` was not hex.
+   *
+   * The event JSON spells the id in **decimal** while the handle
+   * spells it in **hex**; comparing the two textually would drop
+   * every payload, so the comparison is numeric. Rust filters the
+   * event stream too — this is the exact check behind its substring
+   * one, and the reason a mismatch is a dropped payload here rather
+   * than someone else's bytes.
+   */
+  private readonly wireId: bigint | null;
 
   /**
    * @internal — built by `BrowserNode.openStream` (a leader-local
@@ -48,7 +65,8 @@ export class LeafStream implements AsyncIterable<Uint8Array> {
    * writes `await stream.send(bytes)` either way.
    */
   constructor(private readonly inner: LeafWasmStreamLike) {
-    inner.on_message((payload) => this.receive(payload));
+    this.wireId = wireId(inner);
+    inner.on_message((event) => this.receive(event));
   }
 
   /**
@@ -104,8 +122,17 @@ export class LeafStream implements AsyncIterable<Uint8Array> {
     this.inner.close();
   }
 
-  private receive(payload: Uint8Array): void {
-    if (this.closed) return;
+  /**
+   * One callback from the wasm boundary.
+   *
+   * Rust emits the node's `stream_data` event JSON; this is where
+   * it becomes the `Uint8Array` the public API promises. Bytes are
+   * taken as an already-decoded payload, which is what a
+   * host-supplied {@link LeafWasmStreamLike} may deliver.
+   */
+  private receive(event: StreamCallbackPayload): void {
+    const payload = this.decode(event);
+    if (payload === null || this.closed) return;
     if (this.queues.size === 0 && this.listeners.size === 0) {
       this.pending.push(payload);
       return;
@@ -120,5 +147,35 @@ export class LeafStream implements AsyncIterable<Uint8Array> {
       }
     }
     for (const queue of this.queues) queue.push(payload);
+  }
+
+  private decode(event: StreamCallbackPayload): Uint8Array | null {
+    if (event instanceof Uint8Array) return event;
+    if (typeof event !== 'string') {
+      console.error('[@net-mesh/browser] stream callback received', typeof event, 'not the leaf event JSON');
+      return null;
+    }
+    const parsed = parseEvent(event);
+    // The node's event stream carries more than this stream: Rust
+    // pre-filters, but the id it filters on is a substring match, so
+    // the exact one lives here.
+    if (parsed.type !== 'stream_data' || !/^\d+$/.test(parsed.streamId)) return null;
+    if (this.wireId !== null && BigInt(parsed.streamId) !== this.wireId) return null;
+    return parsed.payload;
+  }
+}
+
+/**
+ * The inner stream's wire id as a number, or `null` when it does not
+ * spell one — a host-supplied wrapper is allowed not to, and an id
+ * that cannot be read must not become a filter that drops everything.
+ */
+function wireId(inner: LeafWasmStreamLike): bigint | null {
+  try {
+    const hex = inner.stream_id_hex();
+    if (!/^[0-9a-fA-F]{1,16}$/.test(hex)) return null;
+    return BigInt(`0x${hex}`);
+  } catch {
+    return null;
   }
 }

@@ -86,6 +86,13 @@ const VARIANTS: Array<{ error: LeafError; kind: LeafErrorKind; display: string }
     display: 'rpc: the leader holding generation 9 was replaced',
   },
   {
+    error: new RpcError({ type: 'indeterminate', deadlineMs: 100 }),
+    kind: 'rpc-indeterminate',
+    display:
+      'rpc: the local deadline of 100ms elapsed before the tab running the node answered; ' +
+      'the remote operation may still have executed (it was not retried)',
+  },
+  {
     error: new RpcError({ type: 'malformed', detail: 'unexpected end of input' }),
     kind: 'rpc-malformed',
     display: 'rpc: the reply did not decode: unexpected end of input',
