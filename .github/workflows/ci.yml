@@ -1769,6 +1769,20 @@ jobs:
             || die "the positive leg must compile, or the negative leg proves nothing"
           echo "positive leg: bridge resolves with \`fixtures\`"
 
+          # The probe resolves independently of the workspace, so its
+          # lockfile drifts every time the workspace gains or bumps a
+          # dependency the probe also reaches — and `--locked` then
+          # fails BEFORE either leg runs, which reads as "the guard
+          # broke" rather than "the lockfile is stale". Stage 5's
+          # `wasm-bindgen` pin did it for the second time (the first
+          # was 64b0256c9). Say so precisely, and only when it is
+          # actually the cause.
+          if ! cargo metadata --locked --format-version 1 >/dev/null 2>&1; then
+            die "the probe's Cargo.lock is stale — regenerate it with \
+                 \`cargo generate-lockfile --offline\` in \
+                 net/crates/net/guards/fixtures_off_probe and commit it"
+          fi
+
       # === NetDB ==========================================================
       - name: NetDB
         if: ${{ !cancelled() }}
