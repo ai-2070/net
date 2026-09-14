@@ -5,7 +5,7 @@
 //! `RTCPeerConnection` is `ReferenceError: not defined` in both a
 //! dedicated `Worker` and a `SharedWorker` on Chromium 149. That is
 //! why this module is not `Send`, why the
-//! [`ControlPlane`](crate::control_plane::ControlPlane) trait is not
+//! [`ControlPlane`] trait is not
 //! `Send`, and why §8 elects a leader tab instead of moving the node
 //! off the UI thread.
 //!
@@ -14,11 +14,11 @@
 //! §2 separates a **hard bound** from an **advisory reading**:
 //!
 //! - the hard bound is reserved slots and bytes, accounted at
-//!   admission ([`SEND_QUEUE_PACKETS`], [`SEND_QUEUE_BYTES`]).
+//!   admission (`SEND_QUEUE_PACKETS`, `SEND_QUEUE_BYTES`).
 //!   Exceeding it refuses from the send call itself, with nothing
 //!   enqueued;
 //! - the advisory is the SCTP buffered-amount reading
-//!   ([`BUFFERED_AMOUNT_ADVISORY`], 96 KiB — Stage 3's corrected
+//!   (`BUFFERED_AMOUNT_ADVISORY`, 96 KiB — Stage 3's corrected
 //!   default, below str0m's non-configurable 128 KiB cap, which is
 //!   why the original 256 KiB could never fire). It may refuse
 //!   earlier; it never defines the bound.

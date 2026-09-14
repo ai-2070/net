@@ -13,7 +13,7 @@
 //!
 //! # Only this file may classify `UdpBlocked`
 //!
-//! [`stun_probe_failed`] is the second half of the evidence
+//! `stun_probe_failed` is the second half of the evidence
 //! [`UdpBlockedEvidence`] requires. A browser cannot send a raw STUN
 //! datagram, so the probe is the one form available to it: a
 //! throwaway `RTCPeerConnection` whose *only* ICE server is the
@@ -23,7 +23,7 @@
 //! the same anchor succeeded, is the one observation that
 //! distinguishes blocked UDP from an anchor that is simply not
 //! there. Everything weaker stays
-//! [`RtcError::IceTimeout`](crate::error::RtcError::IceTimeout).
+//! [`RtcError::IceTimeout`].
 
 //!
 //! Everything here except the probe itself is pure and tested

@@ -18,7 +18,7 @@ use core::cell::Cell;
 
 /// One reason a packet or event did not become an observable event.
 ///
-/// The enum is the argument to [`LeafCounters::drop`], so a new drop
+/// The enum is the argument to `LeafCounters::drop`, so a new drop
 /// site cannot be added without naming its reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DropReason {
@@ -47,7 +47,7 @@ pub enum DropReason {
     /// held sequence was released early and its gap abandoned.
     ReorderBufferFull,
     /// A fragment arrived for a reassembly this leaf refused to open,
-    /// because [`MAX_OUTSTANDING_REASSEMBLIES`](crate::frame::MAX_OUTSTANDING_REASSEMBLIES)
+    /// because `MAX_OUTSTANDING_REASSEMBLIES`
     /// were already in flight.
     ReassemblyRefused,
     /// A partial reassembly aged out before its last fragment came.

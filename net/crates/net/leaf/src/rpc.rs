@@ -51,7 +51,7 @@ pub const DEFAULT_CALL_TIMEOUT_MS: u64 = 30_000;
 /// A browser tab that leaked call slots would leak the oneshot
 /// senders with them. 256 concurrent calls is far above any
 /// interactive workload and bounds the table; past it, `register`
-/// refuses with [`RpcError::Backpressure`]-shaped honesty rather
+/// refuses with `RpcError::Backpressure`-shaped honesty rather
 /// than growing.
 pub const MAX_IN_FLIGHT_CALLS: usize = 256;
 

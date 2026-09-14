@@ -2,9 +2,9 @@
 //!
 //! Nothing here hand-rolls a payload byte. The `0x0A00` membership
 //! messages come from
-//! [`net_wire::channel::membership`](net_wire::channel::membership)
+//! [`net_wire::channel::membership`]
 //! and the two hashes from
-//! [`net_wire::channel::name`](net_wire::channel::name) — both moved
+//! [`net_wire::channel::name`] — both moved
 //! out of the core into the wire crate in Stage 5 precisely so this
 //! module could reach them (plan §7: the wire-level subprotocol
 //! codecs belong to the wire crate; S0a deferred the move until "the

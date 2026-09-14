@@ -8,7 +8,7 @@
 //! under the identity-rebind rules. So exactly one tab runs the node:
 //!
 //! - Tabs contend for Web Lock `net-mesh/<origin>/<fingerprint>`.
-//! - The holder is the **leader** and runs [`crate::wasm::LeafNode`]
+//! - The holder is the **leader** and runs `crate::wasm::LeafNode`
 //!   on the main thread (S0b: `RTCPeerConnection` is undefined in
 //!   both a dedicated `Worker` and a `SharedWorker`, so there is no
 //!   worker option to weigh).
@@ -20,7 +20,7 @@
 //!
 //! On acquisition the leader reads the generation from IndexedDB,
 //! increments it and writes it back inside one transaction
-//! ([`crate::storage::IdentityVault::next_generation`]), then stamps
+//! (`crate::storage::IdentityVault::next_generation`), then stamps
 //! that value on **every** message it sends and every operation it
 //! performs. Three parties enforce it:
 //!
@@ -29,7 +29,7 @@
 //! 2. The leader refuses any follower request that is not stamped with
 //!    its own generation ([`ProxyServer::on_message`]).
 //! 3. The storage layer refuses to act for a generation it does not
-//!    record ([`crate::storage::IdentityVault::fence`]).
+//!    record (`crate::storage::IdentityVault::fence`).
 //!
 //! A tab that was suspended and resumes therefore cannot act as
 //! leader: its lock is gone *or* it still believes it holds one, and
@@ -758,8 +758,8 @@ impl Drop for Replier {
 /// What the leader's node can do on a follower's behalf.
 ///
 /// The seam between the lifecycle and the node:
-/// [`crate::leader_session::MeshSession`] wires the real
-/// [`crate::wasm::LeafNode`] into it, and the native
+/// `crate::leader_session::MeshSession` wires the real
+/// `crate::wasm::LeafNode` into it, and the native
 /// lifecycle tests wire a recording double, which is how "close the
 /// leader, pending calls fail typed, subscriptions are restored" is
 /// proven without an anchor.

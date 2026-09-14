@@ -1,7 +1,7 @@
 //! The `0x0D02` signalling envelope on the wire, plus its replay
 //! guard.
 //!
-//! [`SignalEnvelope`](crate::control_plane::SignalEnvelope) declares
+//! [`SignalEnvelope`] declares
 //! the signed body; this module is the byte form and the two checks
 //! a receiver owes it:
 //!
@@ -51,7 +51,7 @@ pub const MAX_SIGNAL_LIFETIME_SECS: u64 = 30;
 /// Encode an envelope: the signed body followed by its signature.
 ///
 /// The body is exactly
-/// [`SignalEnvelope::signing_bytes`](crate::control_plane::SignalEnvelope::signing_bytes),
+/// [`SignalEnvelope::signing_bytes`],
 /// so the verifier never re-derives a transcript — it takes the
 /// prefix it was handed. A field the encoder and the signer disagreed
 /// about is impossible by construction.

@@ -5,7 +5,7 @@
 //! secret-at-rest value ([`IdentitySecrets`]) that both the custodial
 //! path and the encrypted-storage path produce. The storage itself —
 //! IndexedDB under a non-extractable WebCrypto AES-GCM key — is
-//! [`crate::storage`], because it needs the browser; everything here
+//! `crate::storage`, because it needs the browser; everything here
 //! is natively testable.
 //!
 //! **The derivations are not ours to choose.** `node_id` and

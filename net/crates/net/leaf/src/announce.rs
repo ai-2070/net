@@ -252,7 +252,7 @@ fn announcement_body(
 
 /// Rebuild the signed transcript of an announcement document.
 ///
-/// This is the whole verification codec: drop [`UNSIGNED_FIELDS`],
+/// This is the whole verification codec: drop `UNSIGNED_FIELDS`,
 /// keep everything else exactly as it arrived, re-serialize. Nothing
 /// here enumerates the announcement's fields, so a field this leaf
 /// has never heard of still enters the transcript and still

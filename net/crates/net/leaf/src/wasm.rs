@@ -17,7 +17,7 @@
 //! ```
 //!
 //! Errors cross as `JsError` whose message is
-//! [`LeafError`](crate::error::LeafError)'s `Display`, and the TS
+//! [`LeafError`]'s `Display`, and the TS
 //! wrapper re-types them. Every `u64` crosses as a decimal
 //! **string**: `JSON.parse` rounds integers above 2^53, so a numeric
 //! `channel_hash` would silently name the wrong channel.
@@ -25,9 +25,9 @@
 //! # The control-plane boundary
 //!
 //! Everything that is not a Net packet crosses
-//! [`ControlPlane`](crate::control_plane::ControlPlane), whose one
+//! [`ControlPlane`], whose one
 //! v1 implementation is
-//! [`AnchorControlPlane`](crate::anchor_control_plane::AnchorControlPlane):
+//! `AnchorControlPlane`:
 //! the anchor info and its pinned-key refusal, the offer, the
 //! candidate trickle in both directions, the signalling envelopes,
 //! and the end of the attempt. This module **drives** that trait and
@@ -537,7 +537,7 @@ impl LeafNode {
     /// Close the node: every session, every channel, every pending
     /// call.
     ///
-    /// Pending calls fail [`RpcError::SessionLost`] — typed, and not
+    /// Pending calls fail `RpcError::SessionLost` — typed, and not
     /// re-issued by anybody.
     pub fn close(&self) {
         let mut guard = self.inner.borrow_mut();

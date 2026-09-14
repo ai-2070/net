@@ -4943,6 +4943,16 @@ jobs:
           cargo clippy --all-targets --features mock-control-plane -- -D warnings
           cargo clippy --target wasm32-unknown-unknown --all-targets -- -D warnings
 
+      # Both documentation configurations, because half the crate is
+      # `#[cfg(target_arch = "wasm32")]`: a link that resolves in one
+      # is an unresolved link in the other, and rustdoc denies it.
+      - name: Documentation, both targets
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          cargo doc --no-deps
+          cargo doc --no-deps --target wasm32-unknown-unknown
+
       # The exit criterion: the `cross_lang_wire` fixtures replayed
       # INSIDE wasm, plus the anchorless session and the leader
       # lifecycle, in a real headless Chromium.
@@ -5056,7 +5066,7 @@ jobs:
     # reads (`$HOME/.pki/nssdb`), removing it again on exit. A
     # harness that skipped verification would prove something no
     # deployment can rely on.
-    name: WebRTC browser harness (Stage 4b)
+    name: WebRTC browser harness (Stage 4b + Stage 5)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -5085,8 +5095,40 @@ jobs:
       # Chromium from Playwright's cache, the same build S0b measured
       # against. `--with-deps` pulls the shared libraries headless
       # Chromium needs on a bare runner.
-      - name: Install Chromium from Playwright's cache
-        run: npx --yes playwright@1.56.0 install --with-deps chromium
+      # Both GATE engines. Stage 5 owns the matrix, and Firefox is a
+      # gate rather than a courtesy: it is the only engine here that
+      # is not Chromium, and the leaf's transport assumptions are
+      # engine-visible.
+      - name: Install Chromium and Firefox from Playwright's cache
+        run: npx --yes playwright@1.56.0 install --with-deps chromium firefox
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      # The Stage 5 half of the runner drives `@net-mesh/browser`
+      # over the real leaf bundle; both are built here so a witness
+      # can never run against a stale artefact.
+      - name: Build the leaf bundle and @net-mesh/browser
+        run: |
+          set -euo pipefail
+          cd net/crates/net/leaf
+          cargo build --release --target wasm32-unknown-unknown
+          wasm-bindgen --target web --out-dir pkg \
+            target/wasm32-unknown-unknown/release/net_leaf.wasm
+          cd ../browser-ts
+          npm install --no-audit --no-fund
+          npm run build
+
+      - name: Install the Playwright driver's dependencies
+        working-directory: net/crates/net/tests/rtc_browser/driver
+        run: npm install --no-audit --no-fund
+
+      # The UDP-blocked witness needs a real rule on Linux; the
+      # runner refuses to record that verdict without one rather
+      # than substituting a weaker mechanism.
+      - name: Install nftables (the UDP-blocked profile)
+        run: sudo apt-get install -y nftables
 
       # The bindgen CLI version must EQUAL the crate version the leaf
       # pins (`wasm-bindgen = "=0.2.128"`); a mismatch is a hard error
@@ -5102,15 +5144,35 @@ jobs:
       # `--disable-features=WebRtcHideLocalIpsWithMdns` (slice 3's
       # measurement is the point), drives every witness through the
       # browser, and exits non-zero on any failed one.
-      - name: Stage 4b browser harness
+      - name: Browser harness — Chromium
         if: ${{ !cancelled() }}
         run: |
           # No `-e`: the exit code is taken from PIPESTATUS below, so
           # a failing harness still leaves a complete log for the
           # inventory step to read.
           set -uo pipefail
-          net/crates/net/tests/rtc_browser/run.sh 2>&1 | tee "$RUNNER_TEMP/rtcb.log"
+          net/crates/net/tests/rtc_browser/run.sh --engine chromium 2>&1 \
+            | tee "$RUNNER_TEMP/rtcb.log"
           exit "${PIPESTATUS[0]}"
+
+      - name: Browser harness — Firefox
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          net/crates/net/tests/rtc_browser/run.sh --engine firefox 2>&1 \
+            | tee "$RUNNER_TEMP/rtcb-firefox.log"
+          exit "${PIPESTATUS[0]}"
+
+      # WebKit is recorded, never a gate: Playwright's WebKit build
+      # is not the engine Safari ships, so its verdicts are evidence
+      # about a related engine, not about Safari.
+      - name: Browser harness — WebKit (recorded, not a gate)
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          net/crates/net/tests/rtc_browser/run.sh --engine webkit 2>&1 \
+            | tee "$RUNNER_TEMP/rtcb-webkit.log" || true
 
       # The floor and the pinned names, on the same discipline the
       # other RTC jobs use. The harness exiting 0 is the
@@ -5123,31 +5185,10 @@ jobs:
       # grep finds a KNOWN line before believing any count, so a
       # changed output format reads as "fix the parser", never as
       # "all clear" or "the witnesses are gone".
-      - name: Stage 4b witness inventory
+      - name: Browser witness inventory (both gate engines)
         if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
-          log="$RUNNER_TEMP/rtcb.log"
-          probe=$(grep -c '^RTCB PASS enrollment_exchange_promotes_this_session ' "$log" || true)
-          if [ "$probe" -eq 0 ]; then
-            echo "::error::witness-verdict parser found no known PASS line — the \
-          harness output format changed; fix the parser before trusting any floor"
-            tail -40 "$log"
-            exit 1
-          fi
-          passes=$(grep -c '^RTCB PASS ' "$log" || true)
-          fails=$(grep -c '^RTCB FAIL ' "$log" || true)
-          echo "rtc_browser: $passes passed, $fails failed (floor 12)"
-          if [ "$fails" -ne 0 ]; then
-            grep '^RTCB FAIL ' "$log"
-            echo "::error::a Stage 4b browser witness failed"
-            exit 1
-          fi
-          if [ "$passes" -lt 12 ]; then
-            echo "::error::rtc_browser emitted $passes witnesses, floor is 12 — \
-          lower the floor deliberately or restore the witness"
-            exit 1
-          fi
           REQUIRED="
           enrollment_exchange_promotes_this_session
           provisional_announcement_is_refused
@@ -5161,15 +5202,62 @@ jobs:
           mdns_on_pair_formed
           browser_enrollment_survives_replacement
           browser_session_bounds_are_enforced
+          stage5_leaf_handshake_over_the_real_listener
+          stage5_reliable_round_trip
+          stage5_nrpc_call_to_a_native_service
+          stage5_fire_and_forget_tolerates_injected_loss
+          stage5_find_best_node_returns_the_browser_node
+          stage5_two_tabs_share_one_identity_without_eviction
+          stage5_udp_blocked_surfaces_a_typed_failure
           "
-          for required in $REQUIRED; do
-            if ! grep -q "^RTCB PASS $required " "$log"; then
-              echo "::error::required browser witness missing or failed: $required"
+          for engine in chromium firefox; do
+            case "$engine" in
+              chromium) log="$RUNNER_TEMP/rtcb.log" ;;
+              firefox)  log="$RUNNER_TEMP/rtcb-firefox.log" ;;
+            esac
+            # Prove the parser finds a KNOWN line before believing
+            # any count, so a changed output format reads as "fix the
+            # parser", never as "all clear".
+            probe=$(grep -c '^RTCB PASS enrollment_exchange_promotes_this_session ' "$log" || true)
+            if [ "$probe" -eq 0 ]; then
+              echo "::error::[$engine] witness-verdict parser found no known PASS line — the \
+          harness output format changed; fix the parser before trusting any floor"
+              tail -40 "$log"
               exit 1
             fi
-            echo "  exact: $required"
+            passes=$(grep -c '^RTCB PASS ' "$log" || true)
+            fails=$(grep -c '^RTCB FAIL ' "$log" || true)
+            echo "[$engine] $passes passed, $fails failed (floor 19)"
+            if [ "$fails" -ne 0 ]; then
+              grep '^RTCB FAIL ' "$log"
+              echo "::error::[$engine] a browser witness failed"
+              exit 1
+            fi
+            if [ "$passes" -lt 19 ]; then
+              echo "::error::[$engine] emitted $passes witnesses, floor is 19 — \
+          lower the floor deliberately or restore the witness"
+              exit 1
+            fi
+            for required in $REQUIRED; do
+              if ! grep -q "^RTCB PASS $required " "$log"; then
+                echo "::error::[$engine] required browser witness missing or failed: $required"
+                exit 1
+              fi
+            done
+            echo "[$engine] inventory complete: 12 Stage 4b + 7 Stage 5"
           done
-          echo "browser witness inventory complete"
+
+      # WebKit's verdicts are surfaced, never gated.
+      - name: WebKit evidence (recorded)
+        if: ${{ !cancelled() }}
+        run: |
+          {
+            echo '### Browser matrix — WebKit (recorded, not a gate)'
+            echo '```'
+            grep -E '^RTCB (PASS|FAIL) ' "$RUNNER_TEMP/rtcb-webkit.log" || \
+              echo "the WebKit leg produced no verdicts; see the job log for the reason it gave"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # The mDNS measurement is evidence, not a gate: surface it in
       # the job summary so a regression in which candidate pair forms

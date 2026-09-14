@@ -1,5 +1,5 @@
 //! `AnchorControlPlane` — the one v1 implementation of
-//! [`ControlPlane`](crate::control_plane::ControlPlane).
+//! [`ControlPlane`].
 //!
 //! Everything Layer 0 needs from a native anchor, expressed over the
 //! three routes the Stage 4b listener actually serves:
@@ -14,7 +14,7 @@
 //! | [`ControlPlane::publish_announcement`] | **no route** — typed refusal |
 //! | [`ControlPlane::query_capability`] | **no route** — typed refusal |
 //!
-//! `GET /rtc/anchor` is not a trait method: it is [`Self::attach`],
+//! `GET /rtc/anchor` is not a trait method: it is `Self::attach`,
 //! because what it exists for is the **pinned-key refusal** and that
 //! has to happen before an offer exists. The credential pins the
 //! anchor's Noise static key; the live key is fetched and *compared*;
@@ -78,7 +78,7 @@ use crate::signal;
 /// The shared interior. `Rc` because every async method holds a
 /// handle across an `await` and the caller reaches this through a
 /// `RefCell` it must not keep borrowed — the same reason
-/// [`RtcLeafTransport`](crate::rtc::RtcLeafTransport) is `Clone`.
+/// [`RtcLeafTransport`] is `Clone`.
 struct State {
     /// The listener's base URL, `https://` (or `http://localhost`).
     bootstrap_url: String,

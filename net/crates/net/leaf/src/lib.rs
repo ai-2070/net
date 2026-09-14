@@ -51,7 +51,7 @@ pub mod identity;
 /// §8 leader election and the D2 leader lifecycle: generations,
 /// fencing, the follower registry and both ends of the follower
 /// proxy. Deliberately `web_sys`-free — the browser half is
-/// [`leader_session`] — so the lifecycle is reviewable and tested
+/// `leader_session` — so the lifecycle is reviewable and tested
 /// without a browser.
 pub mod leader;
 /// The browser half of leader election: the Web Lock, the

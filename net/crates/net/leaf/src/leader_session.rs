@@ -29,13 +29,13 @@
 //!
 //! # The composition
 //!
-//! [`Lifecycle`] is the whole session minus the node: it contends for
+//! `Lifecycle` is the whole session minus the node: it contends for
 //! the lock, bumps the generation, serves followers, promotes itself
 //! when the lock comes free, and restores subscriptions. The node
-//! arrives through a [`BackendFactory`], which is what lets the
+//! arrives through a `BackendFactory`, which is what lets the
 //! lifecycle be driven in a browser test with no anchor in reach.
-//! [`MeshSession`] is [`Lifecycle`] with the real
-//! [`crate::wasm::LeafNode`] wired into that factory, and is the type
+//! [`MeshSession`] is `Lifecycle` with the real
+//! `crate::wasm::LeafNode` wired into that factory, and is the type
 //! `@net-mesh/browser` talks to.
 
 #![cfg(target_arch = "wasm32")]
@@ -230,7 +230,7 @@ impl Role {
     }
 }
 
-/// The future a [`BackendFactory`] returns.
+/// The future a `BackendFactory` returns.
 pub type BackendFuture = Pin<Box<dyn Future<Output = Result<Box<dyn LeaderBackend>>>>>;
 
 /// How a leader gets a node.
@@ -1039,7 +1039,7 @@ fn node_factory() -> BackendFactory {
 /// }
 /// ```
 ///
-/// One honest difference from [`crate::wasm::LeafNode`]: `open_stream`
+/// One honest difference from `crate::wasm::LeafNode`: `open_stream`
 /// returns a promise, because on a follower the stream is opened by
 /// another tab. Everything else has the same shape, and every
 /// operation carries the generation.
