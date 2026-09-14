@@ -4867,6 +4867,176 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo clippy -p net-mesh-wire --features "json webrtc" --all-targets -- -D warnings
 
+  leaf-wasm:
+    # Stage 5: the `net-mesh-leaf` crate. Its own job for the same
+    # reason `webrtc-browser` is one — it pays for a wasm32
+    # toolchain, a bindgen CLI, a browser and a chromedriver, and it
+    # builds a crate that is deliberately NOT a member of the mesh
+    # workspace (the leaf pulls wasm-bindgen/web-sys; a native
+    # `cargo build --workspace` must never resolve them).
+    #
+    # Four things are gated here, and the third is not redundant with
+    # the second: the native tests (the protocol logic is sans-IO and
+    # runs without a browser), the wasm32 *check*, the wasm32
+    # *clippy* — which is the only thing that catches a `RefCell`
+    # borrow held across an await, and did — and the executed wasm
+    # tests, because `Instant::now()` COMPILES on wasm32 and panics
+    # at runtime, so a check job alone cannot guard that seam (S0a).
+    name: Leaf crate + wasm test runner (Stage 5)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: net/crates/net/leaf
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Add wasm32 to the toolchain
+        run: rustup target add wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: leaf-wasm
+          workspaces: net/crates/net/leaf -> target
+
+      # The bindgen CLI version must EQUAL the crate version the leaf
+      # pins (`wasm-bindgen = "=0.2.128"`).
+      - name: Install wasm-bindgen-cli 0.2.128
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@0.2.128
+
+      # `wasm-bindgen-test-runner` drives a real browser over
+      # WebDriver, so the chromedriver must match the Chrome it
+      # launches; installing both from one action is what keeps them
+      # in step.
+      - name: Install Chrome + a matching chromedriver
+        uses: browser-actions/setup-chrome@v2
+        with:
+          install-chromedriver: true
+
+      - name: Formatting
+        run: cargo fmt -- --check
+
+      - name: Native tests (the sans-IO half)
+        run: |
+          set -o pipefail
+          cargo test --features mock-control-plane 2>&1 | tee /tmp/leaf-native.log
+          total=$(grep -c '^test .* \.\.\. ok$' /tmp/leaf-native.log || true)
+          echo "leaf native tests: $total"
+          if [ "$total" -lt 150 ]; then
+            echo "::error::the leaf's native surface ran $total tests, floor is 150 — \
+          lower the floor deliberately or restore the witness"
+            exit 1
+          fi
+
+      - name: wasm32 check
+        run: cargo check --target wasm32-unknown-unknown --all-targets
+
+      - name: Clippy, both targets
+        run: |
+          cargo clippy --all-targets --features mock-control-plane -- -D warnings
+          cargo clippy --target wasm32-unknown-unknown --all-targets -- -D warnings
+
+      # The exit criterion: the `cross_lang_wire` fixtures replayed
+      # INSIDE wasm, plus the anchorless session and the leader
+      # lifecycle, in a real headless Chromium.
+      - name: wasm test runner (headless Chromium)
+        env:
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+        run: |
+          set -o pipefail
+          for suite in wasm_leaf wasm_anchorless wasm_leader; do
+            cargo test --target wasm32-unknown-unknown --features mock-control-plane \
+              --test "$suite" -- --nocapture 2>&1 | tee "/tmp/$suite.log"
+            grep -q "test result: ok" "/tmp/$suite.log" || {
+              echo "::error::$suite did not report a passing result"; exit 1; }
+            ran=$(sed -n 's/.*test result: ok\. \([0-9]*\) passed.*/\1/p' "/tmp/$suite.log" | tail -1)
+            echo "$suite: $ran passed"
+            if [ "${ran:-0}" -lt 1 ]; then
+              echo "::error::$suite ran no tests — a filter that matches nothing exits 0"
+              exit 1
+            fi
+          done
+          # The cross_lang replay is the named exit criterion; assert
+          # it by name rather than trusting the suite's total.
+          grep -q "cross_lang" /tmp/wasm_leaf.log || {
+            echo "::error::the wasm suite did not run the cross_lang replay"; exit 1; }
+
+      # Exit criterion: the shipped bundle stays under 1.5 MB gzipped.
+      - name: Bundle size
+        run: |
+          cargo build --release --target wasm32-unknown-unknown
+          wasm-bindgen --target web --out-dir pkg \
+            target/wasm32-unknown-unknown/release/net_leaf.wasm
+          raw=$(stat -c%s pkg/net_leaf_bg.wasm)
+          gz=$(gzip -9 -c pkg/net_leaf_bg.wasm | wc -c)
+          echo "leaf wasm: raw=$raw gz=$gz (ceiling 1500000 gz)"
+          echo "### Stage 5 leaf bundle" >> "$GITHUB_STEP_SUMMARY"
+          echo "raw=$raw gz=$gz ceiling=1500000" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$gz" -gt 1500000 ]; then
+            echo "::error::the leaf bundle is $gz bytes gzipped, over the 1.5 MB exit criterion"
+            exit 1
+          fi
+
+  browser-package:
+    # Stage 5: `@net-mesh/browser`. A sibling package to
+    # `@net-mesh/sdk` precisely because the SDK's graph contains the
+    # napi addon; this job therefore never touches `bindings/node`.
+    name: "@net-mesh/browser (Stage 5)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: net/crates/net/browser-ts
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Add wasm32 to the toolchain
+        run: rustup target add wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: leaf-wasm
+          workspaces: net/crates/net/leaf -> target
+      - name: Install wasm-bindgen-cli 0.2.128
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@0.2.128
+
+      # The size assertion is about the bundle a page downloads, so
+      # the wasm has to be the real one, built here.
+      - name: Build the leaf bundle
+        working-directory: net/crates/net/leaf
+        run: |
+          cargo build --release --target wasm32-unknown-unknown
+          wasm-bindgen --target web --out-dir pkg \
+            target/wasm32-unknown-unknown/release/net_leaf.wasm
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      # `npm install`, not `npm ci`: the repo ignores package-lock.json,
+      # so there is no committed lockfile (same as sdk-ts).
+      - name: Install
+        run: npm install --no-audit --no-fund
+
+      - name: Build
+        run: npm run build
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Download size (exit criterion)
+        run: node scripts/size.mjs --assert --require-leaf
+
   webrtc-browser:
     # Stage 4b exit criterion 1: the six §12 admission witnesses, the
     # MITM witness and the mDNS measurement, against a REAL Chromium
