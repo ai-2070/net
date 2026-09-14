@@ -4924,13 +4924,33 @@ jobs:
           tool: wasm-bindgen-cli@0.2.128
 
       # `wasm-bindgen-test-runner` drives a real browser over
-      # WebDriver, so the chromedriver must match the Chrome it
-      # launches; installing both from one action is what keeps them
-      # in step.
+      # WebDriver, and chromedriver refuses a Chrome whose major
+      # version differs from its own. `install-chromedriver: true`
+      # alone did NOT keep them in step on the Stage 5 candidate -
+      # it paired ChromeDriver 153 with Chrome 152 and every wasm
+      # test failed before it ran. Pin ONE version for both, from
+      # Chrome-for-Testing, and then assert the two majors match:
+      # the pin is a request, the assertion is the guarantee.
       - name: Install Chrome + a matching chromedriver
         uses: browser-actions/setup-chrome@v2
         with:
+          chrome-version: "153"
           install-chromedriver: true
+
+      - name: Assert Chrome and chromedriver agree
+        run: |
+          set -o pipefail
+          chrome_v=$(chrome --version 2>/dev/null || google-chrome --version)
+          driver_v=$(chromedriver --version)
+          echo "$chrome_v"
+          echo "$driver_v"
+          chrome_major=$(printf '%s' "$chrome_v" | grep -oE '[0-9]+' | head -1)
+          driver_major=$(printf '%s' "$driver_v" | grep -oE '[0-9]+' | head -1)
+          if [ "$chrome_major" != "$driver_major" ]; then
+            echo "::error::chromedriver $driver_major cannot drive Chrome $chrome_major — \
+          the wasm suite would fail before running a single test"
+            exit 1
+          fi
 
       - name: Formatting
         run: cargo fmt -- --check
