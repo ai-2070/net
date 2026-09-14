@@ -419,8 +419,10 @@ dependencies = [
  "ring",
  "snow",
  "subtle",
+ "thiserror",
  "tracing",
  "web-time",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -654,6 +656,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "thiserror"
+version = "2.0.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec86235f5fcc2a73650310756d2ac5b138a5780bbbdfae3eeccec992c435ba4f"
+dependencies = [
+ "thiserror-impl",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "2.0.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc04cd3e1236dd4a98afca4569f2deb3f120e5422a4023be2cb683f8486292af"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.5",
+]
+
+[[package]]
 name = "tracing"
 version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -872,6 +894,12 @@ name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aee1b19627c7c60102ab80d3a9cbe18de90bfe03bfa6c3715447681f0e8c8af6"
 
 [[package]]
 name = "zeroize"

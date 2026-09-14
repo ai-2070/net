@@ -1,0 +1,13 @@
+{
+  "name": "rtc-browser-driver",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Playwright browser-control plane for the merged Stage 4b + Stage 5 browser runner. Spoken to over NDJSON on stdio by runner/src/browser.rs.",
+  "dependencies": {
+    "playwright-core": "1.56.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

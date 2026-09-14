@@ -135,12 +135,12 @@ export interface RtcFailureEvent {
   readonly error: LeafError;
 }
 
-/** The Web Lock changed hands; this tab's generation moved. */
-export interface LeaderChangedEvent {
-  readonly type: 'leader_changed';
-  /** The new generation, exact decimal. */
-  readonly generation: string;
-}
+// `leader_changed` is NOT here: the leaf's own `on_event` never emits
+// it — leader election is §8, so `LeaderChangedEvent` is defined once,
+// in `src/leader/events.ts`, and reaches a page through
+// `SessionEvent`. Declaring it in both unions would put two spellings
+// of one tag on the package root, where the explicit export silently
+// shadows the star one.
 
 /**
  * A tag this version of the package does not know, carried through
@@ -166,7 +166,6 @@ export type LeafEvent =
   | RpcResponseEvent
   | DroppedEvent
   | RtcFailureEvent
-  | LeaderChangedEvent
   | UnknownEvent;
 
 /** `LeafEvent` narrowed by its tag. */
@@ -250,8 +249,6 @@ export function parseEvent(json: string): LeafEvent {
       };
     case 'rtc_failure':
       return { type: 'rtc_failure', error: fromWasmError(str(fields, 'error')) };
-    case 'leader_changed':
-      return { type: 'leader_changed', generation: str(fields, 'generation') };
     default:
       return { type: 'unknown', tag, raw: fields };
   }

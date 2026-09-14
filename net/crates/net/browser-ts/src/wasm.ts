@@ -87,6 +87,12 @@ export interface LeafWasmNode {
   /** The anchor's node id, 16 lowercase hex digits. */
   anchor_id_hex(): string;
   /**
+   * This node's origin hash, 16 lowercase hex digits — the value its
+   * packet headers carry and the one a receiver checks an event
+   * payload's `EventMeta.origin_hash` against.
+   */
+  origin_hash_hex(): string;
+  /**
    * Run the enrollment exchange. `connect` awaits it internally after
    * the handshake; the explicit method exists so a caller can drive or
    * observe the step. Until a leaf is enrolled the anchor keeps the

@@ -1,32 +1,139 @@
-//! Stage 4b — the **Chromium harness**.
-//!
-//! One command starts a real native anchor (`net-mesh` with
-//! `webrtc`), the real Stage 4b bootstrap listener
-//! (`net_sdk::rtc_bootstrap::serve_bootstrap`) over a locally issued
-//! CA/leaf certificate, a real `BrowserBootstrapCredential`, a real
-//! headless Chromium, and drives the six §12 admission witnesses, the
-//! MITM witness and the mDNS measurement through that browser. Every
-//! observable is read **on the anchor** (`RtcStats`,
-//! `peer_is_provisional`, `provisional_count`, handler invocation
-//! counts) and reported as one `RTCB PASS`/`RTCB FAIL` line per
-//! witness. Any failure exits non-zero.
+//! The **merged browser runner** — Stage 4b's witnesses and Stage
+//! 5's, one command, one ledger, one CI job.
 //!
 //! ```text
 //!   cargo run --release --manifest-path \
-//!     net/crates/net/tests/rtc_browser/runner/Cargo.toml
+//!     net/crates/net/tests/rtc_browser/runner/Cargo.toml \
+//!     -- [--engine chromium|firefox|webkit] [--browser-path <exe>] \
+//!        [--no-stage5] [--inverse <defect>]
 //! ```
+//!
+//! One command starts a real native anchor (`net-mesh` with
+//! `webrtc`), the real bootstrap listener
+//! (`net_sdk::rtc_bootstrap::serve_bootstrap`) over a locally issued
+//! CA/leaf certificate, a real `BrowserBootstrapCredential`, a real
+//! headless browser, and drives every witness through it. Every
+//! observable is read **on the anchor** (`RtcStats`,
+//! `peer_is_provisional`, `provisional_count`, handler invocation
+//! counts, `find_best_node`, `peer_session_id`) and reported as one
+//! `RTCB PASS`/`RTCB FAIL` line per witness. Any failure exits
+//! non-zero.
+//!
+//! # Layout
+//!
+//! ```text
+//!   runner/src/main.rs      this file: anchor, listeners, page
+//!                           server, the 12 Stage 4b witnesses
+//!   runner/src/browser.rs   the Playwright driver handle
+//!   runner/src/stage5.rs    the 7 Stage 5 witnesses
+//!   runner/src/udp_block.rs the UDP-blocked profile
+//!   driver/driver.mjs       Playwright, NDJSON over stdio
+//!   page/{index,app}.js     the Stage 4b page (transport only)
+//!   page/leaf5.{html,js}    the Stage 5 page (@net-mesh/browser)
+//! ```
+//!
+//! # ONE runner, and why it stayed here
+//!
+//! Stage 5 owns the browser matrix and had the option of a fresh
+//! `tests/browser_e2e/`. It stayed in `tests/rtc_browser/` because
+//! every witness in both halves is read on a live `MeshNode` **in
+//! this process** — `rtc_stats()`, `peer_session_id`,
+//! `provisional_count`, a real `RpcHandler`'s own call log,
+//! `find_best_node`. A Node-hosted Playwright runner would have to
+//! reach all of that over an IPC bridge it invented, which is a
+//! second wire protocol to trust between the assertion and the fact
+//! it asserts. So the Rust runner stays the witness authority, and
+//! Playwright takes over the one half it is better at: launching and
+//! driving browsers (see `browser.rs`). Keeping the directory also
+//! keeps the CI cache keys, the artifact paths and `run.sh` working.
+//!
+//! # What Playwright replaced
+//!
+//! The bespoke `launch_chromium` — `--headless=new`, a hand-rolled
+//! executable search, one tab, Chromium only. Playwright gives the
+//! three things Stage 5 needs from a browser and a raw `Command`
+//! cannot: **engines** (chromium | firefox | webkit from one code
+//! path, each with the right profile and host-obfuscation handling),
+//! **tabs** (two pages on one origin, independently addressable —
+//! which is what "two tabs share one identity" means), and **tab
+//! lifecycle** (CDP `Page.setWebLifecycleState`). The page↔runner
+//! step protocol stayed on HTTP: it carries Net packet bytes, it is
+//! engine-agnostic, and moving it to CDP would have made Firefox
+//! impossible.
+//!
+//! # The UDP-blocked profile is a FIREWALL RULE, not natsim
+//!
+//! Stage 5's typed-failure witness needs a network where the
+//! anchor's HTTPS bootstrap works and UDP to its `rtc_addr` does
+//! not. `udp_block.rs` installs an `nft` (or `iptables`) rule pair
+//! scoped to that one address and port, for the duration of that one
+//! witness. natsim was rejected: using it would relocate the browser
+//! and the page server into a NAT'd namespace, changing the network
+//! every other witness measures, and its `--drop-direct` models a
+//! dead peer-to-peer path rather than a dead UDP egress. The module
+//! doc has the full argument, including the third option that was
+//! considered and rejected.
+//!
+//! # Safari
+//!
+//! `--engine webkit` drives Playwright's WebKit. It is **best
+//! effort, recorded**: Playwright's WebKit is not Safari, its WebRTC
+//! stack differs from the shipping one, and it has no
+//! mDNS-obfuscation knob. A run that cannot drive it prints why
+//! rather than claiming Safari coverage.
 //!
 //! # TLS
 //!
-//! The listener serves a leaf issued by a CA this harness generates
-//! and installs into the browser's trust store (Windows: the
-//! current user's `Root` store via `certutil -addstore -user Root`,
-//! removed again on exit; Linux: the NSS database Chromium reads,
-//! `certutil -d sql:$HOME/.pki/nssdb`). **There is no
-//! `--ignore-certificate-errors` anywhere**, and there cannot be:
-//! `BootstrapTls` has no self-signed variant, so a harness that
-//! skipped verification would be proving something no deployment
-//! can rely on.
+//! The listener serves a leaf issued by a CA this harness generates,
+//! and each engine is told about it the narrowest prompt-free way
+//! that engine offers:
+//!
+//! * **Chromium on Linux (the CI gate)** — the NSS database Chromium
+//!   reads, `certutil -d sql:$HOME/.pki/nssdb -A`, removed on exit.
+//!   No dialog, no OS store.
+//! * **Chromium on Windows** — `--ignore-certificate-errors-spki-list`
+//!   carrying `base64(SHA-256(SubjectPublicKeyInfo))` of **this run's
+//!   leaf key**. That trusts exactly one public key, in one browser
+//!   process, for its lifetime. It is NOT
+//!   `--ignore-certificate-errors`: verification stays on, every
+//!   other certificate is still verified normally, and an impostor
+//!   presenting a different key still fails — which is what keeps the
+//!   MITM witness meaningful. Nothing is written to the OS trust
+//!   store, so no Windows security dialog is ever raised.
+//! * **Firefox** — its own NSS database inside the profile
+//!   (`cert9.db`), seeded by the driver before launch.
+//!
+//! **No platform certificate store is ever written, on any platform
+//! and under any flag.** Both `certutil -addstore -user Root` and
+//! `certutil -delstore -user Root` raise a modal platform security
+//! dialog on the desktop of whoever runs the harness, and a test that
+//! puts a security prompt in front of a person is not a test anyone
+//! can run. The two legs that have no other mechanism say so and
+//! refuse: WebKit-on-Windows (no SPKI-pin flag, no profile store) and
+//! a Firefox-on-Windows whose `certutil` on PATH is Microsoft's
+//! rather than NSS's. The store is only ever READ, by
+//! `windows_root_has_harness_ca`, and only to sharpen the pin
+//! control's diagnosis — `-store` prints and exits silently.
+//!
+//! # Sockets, and the other prompt
+//!
+//! Windows Firewall prompts whenever a binary binds a NON-loopback
+//! address, and re-prompts after every rebuild because the path and
+//! hash change. So on Windows this harness binds **loopback only** by
+//! default: the page server, both bootstrap listeners and every RTC
+//! socket sit on `127.0.0.1`, and the routable-interface probe
+//! (`lan_ipv4`, which itself binds `0.0.0.0:0`) does not run at all.
+//! `--use-routable-interface` opts in and accepts the prompt;
+//! `--loopback-only` forces the Windows topology on Linux. With it
+//! off, the routable-interface leg is reported UNPROVEN rather than
+//! quietly counted.
+//!
+//! **There is no `--ignore-certificate-errors` anywhere**, and there
+//! cannot be: `BootstrapTls` has no self-signed variant, so a harness
+//! that skipped verification would be proving something no deployment
+//! can rely on. That the SPKI pin is what makes TLS verify — and not
+//! some leftover root — is asserted before the first witness: see
+//! `tls_pin_control`.
 //!
 //! # WHAT THE BROWSER DOES AND DOES NOT DO — read this before
 //! # believing a witness
@@ -63,15 +170,20 @@
 //! wasm work there. Only the *page* rides that sibling server; every
 //! **anchor** endpoint the page talks to is the real HTTPS listener.
 
+mod browser;
+mod stage5;
+mod udp_block;
+
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::State;
+use axum::extract::{Path as AxPath, Query};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -89,14 +201,17 @@ use net::adapter::net::cortex::{
     RPC_FRAME_BODY_OFFSET, RPC_ROUTE_V1_SIZE,
 };
 use net::adapter::net::rtc::{
-    enroll_reply_channel, RtcConfig, ENROLL_SERVICE, MAX_PROVISIONAL_BYTES,
-    MAX_PROVISIONAL_FRAMES, PROVISIONAL_TTL,
+    enroll_reply_channel, RtcConfig, ENROLL_SERVICE, MAX_PROVISIONAL_BYTES, MAX_PROVISIONAL_FRAMES,
+    PROVISIONAL_TTL,
 };
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, PeerAddr};
 use net_sdk::bootstrap_credential::{BrowserBootstrapCredential, Psk};
 use net_sdk::enrollment::InviteToken;
 use net_sdk::identity::Identity;
 use net_sdk::rtc_bootstrap::{serve_bootstrap, BootstrapConfig, BootstrapTls};
+
+use browser::{Driver, Engine, LaunchSpec};
+use stage5::{Bundle, Step5Queue, Step5Sender};
 
 /// The transport trust domain's PSK. One value for the anchor, the
 /// impostor and every credential: the MITM witness must fail on the
@@ -137,11 +252,7 @@ impl Ledger {
             "RTCB {} {name} — {detail}",
             if pass { "PASS" } else { "FAIL" }
         );
-        self.0.push(Verdict {
-            name,
-            pass,
-            detail,
-        });
+        self.0.push(Verdict { name, pass, detail });
     }
 
     fn failed(&self) -> usize {
@@ -422,6 +533,48 @@ struct StepResult {
     sent_frames: Option<u64>,
     #[serde(default)]
     sent_bytes: Option<u64>,
+    /// The node id the Stage 5 leaf reported for itself (hex).
+    #[serde(default)]
+    node_id: Option<String>,
+    /// The leaf's ORIGIN HASH (hex), which is not its node id.
+    ///
+    /// Needed by any witness that hands the leaf a natively encoded
+    /// event payload: the anchor drops a direct peer's frame whose
+    /// packet-header origin and `EventMeta` origin disagree, and the
+    /// header's origin is the leaf's, so the payload's must be the
+    /// leaf's too.
+    #[serde(default)]
+    origin_hash: Option<String>,
+    /// `leader` | `follower`, when the leaf exposes leadership.
+    #[serde(default)]
+    role: Option<String>,
+    /// §8's lock generation, a decimal STRING (it is a u64 and JSON
+    /// numbers are not).
+    #[serde(default)]
+    generation: Option<String>,
+    /// `@net-mesh/browser`'s typed error discriminator.
+    #[serde(default)]
+    kind: Option<String>,
+    /// Verbatim the Rust `LeafError` `Display`.
+    #[serde(default)]
+    message: Option<String>,
+    /// `UdpBlocked`'s evidence object.
+    #[serde(default)]
+    evidence: Option<serde_json::Value>,
+    #[serde(default)]
+    elapsed_ms: Option<f64>,
+    /// One nRPC reply, hex.
+    #[serde(default)]
+    reply: Option<String>,
+    /// Many nRPC replies, hex, in call order.
+    #[serde(default)]
+    replies: Option<Vec<String>>,
+    /// `query()`'s parsed peer list.
+    #[serde(default)]
+    peers: Option<serde_json::Value>,
+    /// How many outbound datagrams the page's drop hook elided.
+    #[serde(default)]
+    dropped: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -437,7 +590,12 @@ type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<StepResult>>>>;
 struct PageState {
     dist: PathBuf,
     page: PathBuf,
+    /// `@net-mesh/browser`'s `dist`, served under `/browser/`.
+    browser_dist: PathBuf,
     steps: Arc<Mutex<mpsc::Receiver<(Step, oneshot::Sender<StepResult>)>>>,
+    /// One Stage 5 queue per tab, so two tabs are driven
+    /// independently and their results never cross.
+    steps5: Arc<HashMap<String, Step5Queue>>,
     pending: Pending,
 }
 
@@ -519,21 +677,24 @@ impl Connector {
 // Page server
 // ===================================================================
 
-async fn serve_page(state: PageState) -> std::io::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
+async fn serve_page(
+    state: PageState,
+) -> std::io::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
     let router = Router::new()
         .route("/", get(index))
         .route("/app.js", get(app_js))
         .route("/leaf.js", get(leaf_js))
         .route("/leaf_bg.wasm", get(leaf_wasm))
+        .route("/leaf5.html", get(leaf5_html))
+        .route("/leaf5.js", get(leaf5_js))
+        .route("/browser/{*path}", get(browser_asset))
         .route("/harness/step", get(next_step))
+        .route("/harness/step5", get(next_step5))
         .route("/harness/result", post(step_result))
         .route("/harness/log", post(browser_log))
         .with_state(state);
-    let listener = tokio::net::TcpListener::bind(SocketAddr::new(
-        IpAddr::V4(Ipv4Addr::LOCALHOST),
-        0,
-    ))
-    .await?;
+    let listener =
+        tokio::net::TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).await?;
     let addr = listener.local_addr()?;
     let task = tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
@@ -549,11 +710,7 @@ fn file_response(path: &Path, content_type: &str) -> Response {
             bytes,
         )
             .into_response(),
-        Err(e) => (
-            StatusCode::NOT_FOUND,
-            format!("{}: {e}", path.display()),
-        )
-            .into_response(),
+        Err(e) => (StatusCode::NOT_FOUND, format!("{}: {e}", path.display())).into_response(),
     }
 }
 
@@ -568,6 +725,32 @@ async fn leaf_js(State(s): State<PageState>) -> Response {
 }
 async fn leaf_wasm(State(s): State<PageState>) -> Response {
     file_response(&s.dist.join("leaf_bg.wasm"), "application/wasm")
+}
+async fn leaf5_html(State(s): State<PageState>) -> Response {
+    file_response(&s.page.join("leaf5.html"), "text/html; charset=utf-8")
+}
+async fn leaf5_js(State(s): State<PageState>) -> Response {
+    file_response(&s.page.join("leaf5.js"), "text/javascript; charset=utf-8")
+}
+
+/// Serve `@net-mesh/browser`'s built bundle under one prefix, so the
+/// entry's own `new URL('./net_leaf.js', import.meta.url)` resolves
+/// without an import map.
+async fn browser_asset(State(s): State<PageState>, AxPath(rel): AxPath<String>) -> Response {
+    let path = Path::new(&rel);
+    if path
+        .components()
+        .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        return (StatusCode::BAD_REQUEST, "no traversal").into_response();
+    }
+    let content_type = match path.extension().and_then(|e| e.to_str()) {
+        Some("js" | "mjs" | "cjs") => "text/javascript; charset=utf-8",
+        Some("wasm") => "application/wasm",
+        Some("json" | "map") => "application/json",
+        _ => "application/octet-stream",
+    };
+    file_response(&s.browser_dist.join(path), content_type)
 }
 
 async fn next_step(State(s): State<PageState>) -> Response {
@@ -590,6 +773,28 @@ async fn next_step(State(s): State<PageState>) -> Response {
         // No step ready, or the script finished: tell the page to
         // poll again rather than leaving it hanging.
         _ => Json(serde_json::json!({ "kind": "idle", "id": 0, "millis": 50 })).into_response(),
+    }
+}
+
+/// Which Stage 5 tab is asking.
+#[derive(Debug, Deserialize)]
+struct TabQuery {
+    #[serde(default)]
+    tab: String,
+}
+
+async fn next_step5(State(s): State<PageState>, Query(q): Query<TabQuery>) -> Response {
+    let idle = || Json(serde_json::json!({ "kind": "idle", "id": 0, "millis": 50 }));
+    let Some(queue) = s.steps5.get(&q.tab) else {
+        return idle().into_response();
+    };
+    let mut rx = queue.lock().await;
+    match tokio::time::timeout(Duration::from_secs(25), rx.recv()).await {
+        Ok(Some((step, reply))) => {
+            s.pending.lock().await.insert(step.id(), reply);
+            Json(step).into_response()
+        }
+        _ => idle().into_response(),
     }
 }
 
@@ -616,6 +821,11 @@ struct Ca {
     cert_pem_path: PathBuf,
     key_pem_path: PathBuf,
     ca_pem_path: PathBuf,
+    /// `base64(SHA-256(SubjectPublicKeyInfo DER))` of the **leaf**
+    /// key — exactly the value Chromium's
+    /// `--ignore-certificate-errors-spki-list` takes, and exactly one
+    /// key wide.
+    spki_pin: String,
 }
 
 fn issue_localhost_certificate(dir: &Path) -> Result<Ca, String> {
@@ -632,8 +842,8 @@ fn issue_localhost_certificate(dir: &Path) -> Result<Ca, String> {
         .map_err(|e| e.to_string())?;
     let issuer = rcgen::Issuer::new(ca_params, ca_key);
 
-    let mut leaf_params = rcgen::CertificateParams::new(vec!["localhost".to_string()])
-        .map_err(|e| e.to_string())?;
+    let mut leaf_params =
+        rcgen::CertificateParams::new(vec!["localhost".to_string()]).map_err(|e| e.to_string())?;
     leaf_params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "localhost");
@@ -641,6 +851,17 @@ fn issue_localhost_certificate(dir: &Path) -> Result<Ca, String> {
     let leaf = leaf_params
         .signed_by(&leaf_key, &issuer)
         .map_err(|e| e.to_string())?;
+
+    // The pin is over the leaf's SubjectPublicKeyInfo, which is what
+    // Chromium hashes when it compares against the list — not over
+    // the certificate, and not over the CA. A new run mints a new
+    // key, so a pin never outlives the process that minted it.
+    let spki_pin = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        <sha2::Sha256 as sha2::Digest>::digest(rcgen::PublicKeyData::subject_public_key_info(
+            &leaf_key,
+        )),
+    );
 
     let ca_pem = ca.pem();
     let cert_pem_path = dir.join("cert.pem");
@@ -655,124 +876,250 @@ fn issue_localhost_certificate(dir: &Path) -> Result<Ca, String> {
         cert_pem_path,
         key_pem_path,
         ca_pem_path,
+        spki_pin,
     })
 }
 
 const CA_COMMON_NAME: &str = "net-mesh stage-4b harness CA";
 const NSS_NICKNAME: &str = "net-mesh-stage4b-harness-ca";
 
-/// Install the CA where **this browser** will look for it. Returns a
-/// description of what was done, and whether an uninstall is owed.
-fn install_ca(ca: &Ca) -> (String, bool) {
-    if cfg!(windows) {
-        // Chromium on Windows reads the OS trust store; a fresh
-        // `--user-data-dir` does not isolate roots. The current
-        // user's store is the narrowest thing that works, and it is
-        // removed again in `uninstall_ca`.
-        //
-        // `-addstore -user Root` raises the system's
-        // add-a-root-certificate confirmation, which on a
-        // non-interactive desktop can come back as
-        // `ERROR_CANCELLED` (0x800704C7). That is transient, so it
-        // is retried — but never worked around: if every attempt
-        // fails, the harness stops rather than weakening TLS.
-        let mut last = String::from("FAILED: certutil never ran");
-        for attempt in 1..=3 {
-            // A leftover from a previous run makes the add a no-op
-            // that still prompts; clear it first.
-            uninstall_ca();
-            match Command::new("certutil")
-                .args(["-addstore", "-user", "Root"])
-                .arg(&ca.ca_pem_path)
-                .output()
-            {
-                Ok(o) if o.status.success() => {
-                    return (
-                        format!(
-                            "certutil -addstore -user Root on attempt {attempt} \
-                             (current user's Root store; removed on exit)"
-                        ),
-                        true,
-                    );
-                }
-                Ok(o) => {
-                    last = format!(
-                        "FAILED: certutil -addstore -user Root exited {:?}: {}",
-                        o.status.code(),
-                        String::from_utf8_lossy(&o.stdout).trim()
-                    );
-                }
-                Err(e) => last = format!("FAILED: certutil not runnable: {e}"),
-            }
-            std::thread::sleep(Duration::from_millis(500));
-        }
-        (last, false)
-    } else {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
-        let db = format!("{home}/.pki/nssdb");
-        let _ = std::fs::create_dir_all(&db);
-        // An absent database is created empty; an existing one is
-        // left alone.
-        let _ = Command::new("certutil")
-            .args(["-N", "--empty-password", "-d", &format!("sql:{db}")])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        let out = Command::new("certutil")
-            .args([
-                "-d",
-                &format!("sql:{db}"),
-                "-A",
-                "-t",
-                "C,,",
-                "-n",
-                NSS_NICKNAME,
-                "-i",
-            ])
-            .arg(&ca.ca_pem_path)
-            .output();
-        match out {
-            Ok(o) if o.status.success() => (
-                format!("certutil -d sql:{db} -A -t C,, (Chromium's NSS store; removed on exit)"),
-                true,
+/// Whether this process wrote the NSS database Chromium reads on
+/// Linux, and so owes a removal on exit.
+///
+/// There is no Windows counterpart on purpose: **nothing in this
+/// harness writes a platform certificate store.** Both `certutil
+/// -addstore -user Root` and `certutil -delstore -user Root` raise a
+/// modal platform security dialog on the desktop of whoever runs the
+/// harness, and a test that puts a security prompt in front of a
+/// person is not a test anyone can run. The Windows legs use a
+/// mechanism that needs no store: Chromium the one-key SPKI pin,
+/// Firefox the NSS database inside its own launch profile.
+static NSS_STORE_OWED: AtomicBool = AtomicBool::new(false);
+
+/// How this run makes the browser trust the harness listener.
+struct Trust {
+    /// What was actually done, printed and carried into the ledger's
+    /// preamble.
+    how: String,
+    /// The leaf SPKI pin, when the pin — rather than a trust store —
+    /// is the mechanism. `Some` means `tls_pin_control` must run.
+    pin: Option<String>,
+}
+
+/// Make **this engine on this platform** trust the harness leaf, the
+/// narrowest way that raises no dialog on the user's desktop.
+///
+/// Nothing here writes a platform trust store, on any platform and
+/// under any flag. Nothing about TLS is weakened by that:
+/// verification stays on, and only this run's freshly minted leaf key
+/// is exempt from the unknown-issuer rejection.
+fn establish_trust(ca: &Ca, engine: Engine) -> Result<Trust, String> {
+    if !cfg!(windows) {
+        return install_nss_store(ca).map(|how| Trust { how, pin: None });
+    }
+    match engine {
+        Engine::Chromium => Ok(Trust {
+            how: format!(
+                "--ignore-certificate-errors-spki-list={} — base64(SHA-256(SPKI)) of THIS \
+                 run's leaf key, one key wide, one browser process wide. Certificate \
+                 verification stays ON (this is not --ignore-certificate-errors) and the OS \
+                 trust store is neither read nor written, so no platform security dialog \
+                 is raised",
+                ca.spki_pin
             ),
-            Ok(o) => (
-                format!(
-                    "FAILED: certutil -A exited {:?}: {}",
-                    o.status.code(),
-                    String::from_utf8_lossy(&o.stderr)
-                ),
-                false,
-            ),
-            Err(e) => (
-                format!("FAILED: certutil (libnss3-tools) not runnable: {e}"),
-                false,
-            ),
-        }
+            pin: Some(ca.spki_pin.clone()),
+        }),
+        // Firefox never reads the platform store unless
+        // `security.enterprise_roots.enabled` is set, and it does read
+        // an NSS database inside its own profile. The driver seeds
+        // that before launch and reports which mechanism it got; a
+        // run that fell back to `enterprise_roots` is refused at the
+        // launch site, because the platform store is empty of this
+        // CA and this harness will not put one there.
+        Engine::Firefox => Ok(Trust {
+            how: "Firefox's own NSS database inside the launch profile (cert9.db), seeded by \
+                  the driver; the OS trust store is untouched"
+                .into(),
+            pin: None,
+        }),
+        // WebKit on Windows has neither an SPKI-pin flag nor a
+        // profile-local trust store: it uses the platform store. This
+        // leg is refused rather than run untrusted, and refused
+        // rather than prompted at.
+        Engine::Webkit => Err(format!(
+            "WebKit on Windows trusts only the platform certificate store, and this harness \
+             never writes one: `certutil -addstore -user Root` raises an OS security dialog \
+             on the desktop of whoever runs the harness, and so does its removal. There is \
+             no SPKI-pin flag for WebKit and no profile-local trust store to seed. Run the \
+             WebKit leg on Linux, where the NSS database is the prompt-free mechanism. The \
+             pin in force for Chromium is {} and is deliberately NOT used to weaken \
+             verification for this engine.",
+            ca.spki_pin
+        )),
     }
 }
 
-fn uninstall_ca() {
-    if cfg!(windows) {
-        let _ = Command::new("certutil")
-            .args(["-delstore", "-user", "Root", CA_COMMON_NAME])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    } else {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
-        let _ = Command::new("certutil")
-            .args([
-                "-d",
-                &format!("sql:{home}/.pki/nssdb"),
-                "-D",
-                "-n",
-                NSS_NICKNAME,
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+/// Is there a leftover harness root in the current user's store?
+///
+/// **Read-only and silent.** `certutil -store -user Root <CN>` prints
+/// and exits; it raises no dialog, unlike `-addstore`/`-delstore`.
+/// Used only to sharpen the pin control's diagnosis when something on
+/// the machine already trusts the harness CA — a leftover from an
+/// older harness that did write the store.
+#[cfg(windows)]
+fn windows_root_has_harness_ca() -> bool {
+    Command::new("certutil")
+        .args(["-store", "-user", "Root", CA_COMMON_NAME])
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+#[cfg(not(windows))]
+fn windows_root_has_harness_ca() -> bool {
+    false
+}
+
+/// The CI path: the NSS database Chromium reads on Linux. No dialog,
+/// no platform store, removed on exit.
+fn install_nss_store(ca: &Ca) -> Result<String, String> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+    let db = format!("{home}/.pki/nssdb");
+    let _ = std::fs::create_dir_all(&db);
+    // An absent database is created empty; an existing one is left
+    // alone.
+    let _ = Command::new("certutil")
+        .args(["-N", "--empty-password", "-d", &format!("sql:{db}")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let out = Command::new("certutil")
+        .args([
+            "-d",
+            &format!("sql:{db}"),
+            "-A",
+            "-t",
+            "C,,",
+            "-n",
+            NSS_NICKNAME,
+            "-i",
+        ])
+        .arg(&ca.ca_pem_path)
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            NSS_STORE_OWED.store(true, Ordering::SeqCst);
+            Ok(format!(
+                "certutil -d sql:{db} -A -t C,, (Chromium's NSS store; removed on exit)"
+            ))
+        }
+        Ok(o) => Err(format!(
+            "certutil -A exited {:?}: {}",
+            o.status.code(),
+            String::from_utf8_lossy(&o.stderr)
+        )),
+        Err(e) => Err(format!("certutil (libnss3-tools) not runnable: {e}")),
     }
+}
+
+/// Remove the NSS entry this process created, and nothing else.
+///
+/// There is deliberately no platform-store branch: this harness never
+/// adds one, so it has nothing to delete — and running `certutil
+/// -delstore -user Root` anyway would raise the platform's
+/// delete-a-root dialog for a certificate it never added, which is
+/// one of the two prompts this policy exists to eliminate.
+fn uninstall_nss_store_if_owed() {
+    if !NSS_STORE_OWED.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+    let _ = Command::new("certutil")
+        .args([
+            "-d",
+            &format!("sql:{home}/.pki/nssdb"),
+            "-D",
+            "-n",
+            NSS_NICKNAME,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// Prove the SPKI pin is what makes this run's TLS verify.
+///
+/// Two throwaway browsers, same engine, same URL, one difference:
+///
+/// * **without** `--ignore-certificate-errors-spki-list` the
+///   navigation MUST be refused — the leaf is issued by a CA nothing
+///   trusts;
+/// * **with** it the same navigation MUST return an HTTP status.
+///
+/// Both halves are needed. The second alone would pass on a machine
+/// with a leftover harness root in its store — and then every TLS
+/// observation in the run would be a statement about that machine
+/// instead of about the pin. The first alone would pass if the flag
+/// were misspelled or ignored, because then nothing would work at
+/// all. Together they pin the mechanism.
+///
+/// It is a NAVIGATION and not a `fetch` for a measured reason: a
+/// cross-origin `fetch(url, {mode: 'no-cors'})` is rejected by
+/// Chromium's Opaque Response Blocking whatever TLS did, so a
+/// fetch-based control reported "refused" for both halves and
+/// discriminated nothing.
+async fn tls_pin_control(
+    driver: &Driver,
+    engine: Engine,
+    pin: &str,
+    url: &str,
+    executable: Option<&str>,
+) -> Result<String, String> {
+    let unpinned = driver.tls_probe(engine, url, None, executable).await?;
+    let pinned = driver.tls_probe(engine, url, Some(pin), executable).await?;
+    if unpinned.verified {
+        // Read the store — never write it — so the diagnosis can say
+        // whether the leftover really is there.
+        let leftover = if windows_root_has_harness_ca() {
+            format!(
+                "and `certutil -store -user Root \"{CA_COMMON_NAME}\"` FINDS one, left by \
+                 an older harness that wrote the platform store. Remove it — `certutil \
+                 -delstore -user Root \"{CA_COMMON_NAME}\"`, which will raise the \
+                 platform's delete-a-root dialog once — and re-run"
+            )
+        } else {
+            format!(
+                "though `certutil -store -user Root \"{CA_COMMON_NAME}\"` finds no harness \
+                 root, so whatever trusts it is something else on this machine"
+            )
+        };
+        return Err(format!(
+            "the SPKI-pin control FAILED: a {} with NO pin already trusts {url} ({}). \
+             Something on this machine trusts the harness CA {leftover}: until then no TLS \
+             observation in this run can be attributed to the pin.",
+            engine.as_str(),
+            unpinned.detail
+        ));
+    }
+    if !pinned.verified {
+        return Err(format!(
+            "the SPKI-pin control FAILED the other way: even WITH \
+             --ignore-certificate-errors-spki-list={pin} a {} could not load {url} ({}). \
+             The pin is not in effect — a wrong digest, a wrong encoding, or a flag this \
+             build ignores — and the harness will not fall back to \
+             --ignore-certificate-errors.",
+            engine.as_str(),
+            pinned.detail
+        ));
+    }
+    Ok(format!(
+        "with the pin ABSENT a {} refused {url} ({}), and with the pin PRESENT the same \
+         navigation succeeded ({}) — so this run's TLS verifies because of the one pinned \
+         leaf key, not because of anything in the machine's trust store, and a certificate \
+         carrying any other key is still rejected",
+        engine.as_str(),
+        unpinned.detail,
+        pinned.detail
+    ))
 }
 
 // ===================================================================
@@ -791,8 +1138,7 @@ fn build_leaf(root: &Path) -> Result<PathBuf, String> {
     if !status.success() {
         return Err("the wasm leaf did not build".into());
     }
-    let wasm = leaf
-        .join("target/wasm32-unknown-unknown/release/rtc_browser_leaf.wasm");
+    let wasm = leaf.join("target/wasm32-unknown-unknown/release/rtc_browser_leaf.wasm");
     let status = Command::new("wasm-bindgen")
         .current_dir(&leaf)
         .args(["--target", "web", "--out-dir"])
@@ -933,109 +1279,67 @@ fn lan_ipv4() -> Option<Ipv4Addr> {
 }
 
 // ===================================================================
-// Chromium
-// ===================================================================
-
-fn find_chromium(explicit: Option<String>) -> Option<PathBuf> {
-    if let Some(p) = explicit {
-        return Some(PathBuf::from(p));
-    }
-    if let Ok(p) = std::env::var("CHROME_PATH") {
-        if !p.is_empty() {
-            return Some(PathBuf::from(p));
-        }
-    }
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        let root = PathBuf::from(local).join("ms-playwright");
-        if let Ok(entries) = std::fs::read_dir(&root) {
-            let mut dirs: Vec<PathBuf> = entries
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| {
-                    p.file_name()
-                        .and_then(|n| n.to_str())
-                        .is_some_and(|n| n.starts_with("chromium-"))
-                })
-                .collect();
-            dirs.sort();
-            dirs.reverse();
-            for d in dirs {
-                candidates.push(d.join("chrome-win64").join("chrome.exe"));
-            }
-        }
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        let root = PathBuf::from(&home).join(".cache/ms-playwright");
-        if let Ok(entries) = std::fs::read_dir(&root) {
-            let mut dirs: Vec<PathBuf> = entries
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| {
-                    p.file_name()
-                        .and_then(|n| n.to_str())
-                        .is_some_and(|n| n.starts_with("chromium-"))
-                })
-                .collect();
-            dirs.sort();
-            dirs.reverse();
-            for d in dirs {
-                candidates.push(d.join("chrome-linux").join("chrome"));
-            }
-        }
-    }
-    candidates.push(PathBuf::from("/usr/bin/chromium"));
-    candidates.push(PathBuf::from("/usr/bin/chromium-browser"));
-    candidates.push(PathBuf::from("/usr/bin/google-chrome"));
-    candidates.into_iter().find(|p| p.exists())
-}
-
-/// Launch Chromium.
-///
-/// `hide_local_ips_with_mdns = true` is Chromium's **default** and is
-/// what slice 3 measures: no `--disable-features=…` flag is passed.
-/// The second launch, if one happens, disables it and says so.
-fn launch_chromium(
-    chrome: &Path,
-    profile: &Path,
-    url: &str,
-    disable_mdns: bool,
-    log: &Path,
-) -> std::io::Result<Child> {
-    let _ = std::fs::remove_dir_all(profile);
-    let _ = std::fs::create_dir_all(profile);
-    let mut cmd = Command::new(chrome);
-    cmd.arg("--headless=new")
-        .arg("--no-sandbox")
-        .arg("--disable-gpu")
-        .arg(format!("--user-data-dir={}", profile.display()))
-        .arg("--enable-logging=stderr")
-        .arg("--v=0")
-        .arg("--no-first-run")
-        .arg("--no-default-browser-check")
-        .arg("--disable-background-timer-throttling")
-        .arg("--disable-renderer-backgrounding");
-    if disable_mdns {
-        cmd.arg("--disable-features=WebRtcHideLocalIpsWithMdns");
-    }
-    cmd.arg(url);
-    let err = std::fs::File::create(log)?;
-    cmd.stdout(Stdio::null()).stderr(Stdio::from(err));
-    cmd.spawn()
-}
-
-// ===================================================================
 // main
 // ===================================================================
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 8)]
 async fn main() {
-    let mut chrome_arg = None;
+    // The anchor's own account of what it discarded. Every
+    // "dropped", "refused" and "malformed" decision in the core is a
+    // `tracing` event, and without a subscriber a witness whose frame
+    // the anchor threw away can only report the absence of an effect.
+    // WARN by default — quiet on a green run — and `RUST_LOG`
+    // overrides it for a diagnosis session
+    // (`RUST_LOG=net_mesh=trace`).
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+    let mut browser_path = None;
+    let mut engine = Engine::Chromium;
+    let mut engine_arg_bad: Option<String> = None;
+    let mut stage5 = true;
     let mut inverse = String::new();
+    // **Off by default on Windows.** Binding the host's routable
+    // IPv4 — which the anchor's and the impostor's RTC sockets do
+    // when a routable interface is used — makes the Windows Firewall
+    // raise its "allow this app to accept connections" prompt, and
+    // it re-raises it after every rebuild because the binary's path
+    // and hash change. So the default topology here is loopback-only
+    // and the routable-interface leg is reported as UNPROVEN rather
+    // than bought with a security prompt on someone's desktop. On
+    // Linux, where no such prompt exists, it stays on.
+    let mut routable = !cfg!(windows);
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
-            "--chrome" => chrome_arg = args.next(),
+            // `--chrome` is the Stage 4b spelling, kept working.
+            "--chrome" | "--browser-path" => browser_path = args.next(),
+            "--engine" => {
+                let raw = args.next().unwrap_or_default();
+                match Engine::parse(&raw) {
+                    Some(e) => engine = e,
+                    None => engine_arg_bad = Some(raw),
+                }
+            }
+            // Run ONLY the Stage 4b half. Every excluded Stage 5
+            // witness is still named on stdout as `RTCB EXCLUDED`,
+            // so the ledger is never quietly short and the CI floor
+            // (which counts `RTCB PASS`) still fails.
+            "--no-stage5" => stage5 = false,
+            // Opt in to the routable-interface topology on Windows,
+            // accepting the Windows Firewall prompt the non-loopback
+            // binds raise. Needed for the mDNS
+            // routable-interface verdict, and for the Firefox MITM
+            // leg, which forms no ICE pair between an obfuscated
+            // `.local` host candidate and a `127.0.0.1` remote.
+            "--use-routable-interface" => routable = true,
+            // …and the way to force loopback-only on Linux, so the
+            // Windows topology can be reproduced on a CI host.
+            "--loopback-only" => routable = false,
             // Deliberate defect injection, so a witness can be shown
             // to be capable of failing:
             //   mitm-pins-the-live-key  — the browser pins the
@@ -1053,9 +1357,9 @@ async fn main() {
             //     arrives and the handler still never runs, so only
             //     the CALL CORRELATION fails (R7d).
             //   mdns-off-from-the-start — the measurement launch
-            //     disables Chromium's mDNS obfuscation. Pairs still
-            //     form, so the diagnostic sweep still passes, but
-            //     `mdns_on_pair_formed` must FAIL.
+            //     disables the engine's mDNS obfuscation. Pairs
+            //     still form, so the diagnostic sweep still passes,
+            //     but `mdns_on_pair_formed` must FAIL.
             //   skip-enrollment-request — the enrollment REQUEST is
             //     never sent, so nothing may be promoted and the
             //     enrollment witness must FAIL.
@@ -1063,9 +1367,22 @@ async fn main() {
             _ => {}
         }
     }
+    if let Some(raw) = engine_arg_bad {
+        println!("RTCB FAIL harness — unknown --engine {raw:?}; use chromium, firefox or webkit");
+        std::process::exit(2);
+    }
     if !inverse.is_empty() {
         println!("[harness] INVERSE MODE: {inverse}");
     }
+    println!(
+        "[harness] engine: {} ({})",
+        engine.as_str(),
+        if engine.is_gate() {
+            "gate"
+        } else {
+            "BEST EFFORT — recorded, never a silent skip"
+        }
+    );
 
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -1075,10 +1392,21 @@ async fn main() {
     let _ = std::fs::create_dir_all(&work);
 
     let mut ledger = Ledger::default();
-    let code = match run(&root, &work, chrome_arg, &inverse, &mut ledger).await {
+    let outcome = run(
+        &root,
+        &work,
+        engine,
+        browser_path,
+        stage5,
+        &inverse,
+        routable,
+        &mut ledger,
+    )
+    .await;
+    let code = match outcome {
         Ok(()) => {
             println!();
-            println!("=== Stage 4b browser-harness ledger ===");
+            println!("=== merged browser-harness ledger (Stage 4b + Stage 5) ===");
             for v in &ledger.0 {
                 println!("  {:<6} {}", if v.pass { "PASS" } else { "FAIL" }, v.name);
                 if !v.pass {
@@ -1086,17 +1414,20 @@ async fn main() {
                 }
             }
             let failed = ledger.failed();
-            println!(
-                "{} witness(es), {} failed",
-                ledger.0.len(),
-                failed
-            );
+            println!("{} witness(es), {} failed", ledger.0.len(), failed);
+            if !engine.is_gate() {
+                println!(
+                    "[harness] NOTE: engine {} is the recorded best-effort leg; its \
+                     verdicts are evidence, and the gate is chromium + firefox.",
+                    engine.as_str()
+                );
+            }
             i32::from(failed > 0)
         }
         Err(e) => {
             println!("RTCB FAIL harness — {e}");
             println!();
-            println!("=== Stage 4b browser-harness ledger (incomplete) ===");
+            println!("=== merged browser-harness ledger (incomplete) ===");
             for v in &ledger.0 {
                 println!("  {:<6} {}", if v.pass { "PASS" } else { "FAIL" }, v.name);
                 if !v.pass {
@@ -1106,7 +1437,7 @@ async fn main() {
             1
         }
     };
-    uninstall_ca();
+    uninstall_nss_store_if_owed();
     std::process::exit(code);
 }
 
@@ -1114,41 +1445,77 @@ async fn main() {
 async fn run(
     root: &Path,
     work: &Path,
-    chrome_arg: Option<String>,
+    engine: Engine,
+    browser_path: Option<String>,
+    stage5: bool,
     inverse: &str,
+    routable: bool,
     ledger: &mut Ledger,
 ) -> Result<(), String> {
     // --- 0. tools ---------------------------------------------------
-    let chrome = find_chromium(chrome_arg)
-        .ok_or_else(|| "no Chromium found; pass --chrome <path> or set CHROME_PATH".to_string())?;
-    println!("[harness] chromium: {}", chrome.display());
+    let driver = Driver::spawn(&root.join("driver")).await?;
+    driver.ensure_engine(engine).await;
     let dist = build_leaf(root)?;
 
     // --- 1. certificate --------------------------------------------
     let ca = issue_localhost_certificate(work)?;
-    let (how, _owed) = install_ca(&ca);
-    println!("[harness] CA install: {how}");
-    if how.starts_with("FAILED") {
-        return Err(format!(
-            "the CA could not be installed into the browser trust store: {how}. \
-             This harness will not fall back to --ignore-certificate-errors."
-        ));
-    }
+    let trust = establish_trust(&ca, engine).map_err(|why| {
+        format!(
+            "this engine could not be made to trust the harness leaf: {why}. This harness \
+             will not fall back to --ignore-certificate-errors."
+        )
+    })?;
+    println!("[harness] TLS trust: {}", trust.how);
     println!(
-        "[harness] CA fingerprint source: {} ({} bytes)",
+        "[harness] CA fingerprint source: {} ({} bytes); leaf SPKI pin {}",
         ca.ca_pem_path.display(),
-        ca.ca_pem.len()
+        ca.ca_pem.len(),
+        ca.spki_pin
     );
 
     // --- 2. nodes ---------------------------------------------------
-    let lan = lan_ipv4();
+    // **The only non-loopback bind in the harness, and it is opt-in
+    // on Windows.** `lan_ipv4()` itself binds `0.0.0.0:0`, and the
+    // anchor's and impostor's RTC sockets then bind the routable
+    // address — three binds the Windows Firewall prompts about, once
+    // per rebuild. When the flag is off the probe does not run at
+    // all, so `lan` is `None` and every socket in this process is on
+    // `127.0.0.1`: the topology and the verdicts that read `lan`
+    // agree, rather than a verdict claiming an interface leg the
+    // sockets never used.
+    let lan = if routable { lan_ipv4() } else { None };
     let anchor_bind: SocketAddr = match lan {
         Some(v4) => SocketAddr::new(IpAddr::V4(v4), 0),
         None => "127.0.0.1:0".parse().expect("addr"),
     };
+    if lan.is_none() {
+        println!(
+            "[harness] topology: LOOPBACK ONLY — every socket this process binds is on \
+             127.0.0.1, so no firewall prompt is raised{}. The routable-interface leg is \
+             therefore UNPROVEN on this host: `mdns_on_pair_formed` is measured on the \
+             loopback pair only, and the MITM impostor shares loopback with the anchor \
+             (on Firefox that pair may not form, because an obfuscated `.local` host \
+             candidate and a 127.0.0.1 remote do not pair). Pass \
+             --use-routable-interface to exercise it and accept the prompt.",
+            if cfg!(windows) {
+                " (the Windows default)"
+            } else {
+                " (--loopback-only)"
+            }
+        );
+    }
     let anchor = spawn_node(Some(anchor_rtc(anchor_bind))).await;
     let loop_anchor = spawn_node(Some(anchor_rtc("127.0.0.1:0".parse().expect("addr")))).await;
-    let impostor = spawn_node(Some(anchor_rtc("127.0.0.1:0".parse().expect("addr")))).await;
+    // The impostor sits on the SAME interface as the real anchor.
+    // Its whole point is a different Noise static key under the same
+    // credential; its address is irrelevant to that. It used to bind
+    // loopback, which Chromium reached through a peer-reflexive
+    // candidate — but Firefox forms no pair at all between an
+    // obfuscated `.local` host candidate and a `127.0.0.1` remote,
+    // so on Firefox the MITM witness failed as a TEST ERROR ("the
+    // DataChannel never opened"), proving nothing about the pinned
+    // key. Same interface, same property, reachable on every engine.
+    let impostor = spawn_node(Some(anchor_rtc(anchor_bind))).await;
     let third_party = spawn_node(None).await;
     // The identity whose *signed* capability announcement witness (b)
     // replays: the announcement's `node_id` has to be the id the
@@ -1223,10 +1590,20 @@ async fn run(
 
     // --- 4. the page server (its origin is the CORS allow-list) ----
     let (step_tx, step_rx) = mpsc::channel(4);
+    let bundle = Bundle::locate(root);
+    let mut step5_tx: HashMap<String, Step5Sender> = HashMap::new();
+    let mut step5_rx: HashMap<String, Step5Queue> = HashMap::new();
+    for tab in stage5::TABS {
+        let (tx, rx) = mpsc::channel(4);
+        step5_tx.insert(tab.to_string(), tx);
+        step5_rx.insert(tab.to_string(), Arc::new(Mutex::new(rx)));
+    }
     let page_state = PageState {
         dist,
         page: root.join("page"),
+        browser_dist: bundle.dist.clone(),
         steps: Arc::new(Mutex::new(step_rx)),
+        steps5: Arc::new(step5_rx),
         pending: Arc::new(Mutex::new(HashMap::new())),
     };
     let (page_addr, _page_task) = serve_page(page_state)
@@ -1265,7 +1642,10 @@ async fn run(
         .map_err(|e| format!("impostor listener: {e}"))?;
     let anchor_base = format!("https://localhost:{}", anchor_listener.local_addr().port());
     let loop_base = format!("https://localhost:{}", loop_listener.local_addr().port());
-    let impostor_base = format!("https://localhost:{}", impostor_listener.local_addr().port());
+    let impostor_base = format!(
+        "https://localhost:{}",
+        impostor_listener.local_addr().port()
+    );
     println!("[harness] anchor   {anchor_base}");
     println!("[harness] impostor {impostor_base} (fresh Noise keypair)");
 
@@ -1290,25 +1670,123 @@ async fn run(
     let anchor_pub_hex = hex(anchor.public_key());
     let psk_hex = hex(&PSK);
 
-    // --- 7. Chromium ------------------------------------------------
-    let profile = work.join("chrome-profile");
-    let chrome_log = work.join("chrome.log");
+    // --- 7. the browser --------------------------------------------
+    let profile = work.join("browser-profile");
     // `mdns-off-from-the-start` is the inverse for the mDNS split:
     // the diagnostic sweep still records pairs (so the old
     // measurement verdict is still satisfied), but nothing ran with
-    // Chromium's obfuscation ON, so `mdns_on_pair_formed` must FAIL.
+    // the engine's obfuscation ON, so `mdns_on_pair_formed` must
+    // FAIL.
     let measure_with_mdns_off = inverse == "mdns-off-from-the-start";
-    let mut child = launch_chromium(&chrome, &profile, &page_url, measure_with_mdns_off, &chrome_log)
-        .map_err(|e| format!("chromium: {e}"))?;
+    // The pin is only trustworthy if it is what makes TLS verify.
+    // ASSERT that, before a single witness runs: a browser without
+    // the flag must fail the handshake against this very listener,
+    // and the same browser with it must succeed. A leftover root in
+    // the OS store would make the first control succeed — and would
+    // silently turn every TLS observation below into a statement
+    // about the machine rather than about the harness.
+    if let Some(pin) = trust.pin.as_deref() {
+        let control = tls_pin_control(
+            &driver,
+            engine,
+            pin,
+            &format!("{anchor_base}/rtc/anchor"),
+            browser_path.as_deref(),
+        )
+        .await?;
+        println!("[harness] TLS pin control: {control}");
+    } else {
+        println!(
+            "[harness] TLS pin control: not applicable — this run's mechanism is a trust \
+             store ({}), so a browser without the pin is SUPPOSED to trust the listener \
+             and the control could not discriminate",
+            trust.how
+        );
+    }
+
+    let launch = LaunchSpec {
+        engine,
+        profile: profile.clone(),
+        ca_pem: ca.ca_pem_path.clone(),
+        ca_nickname: NSS_NICKNAME.to_string(),
+        disable_mdns: measure_with_mdns_off,
+        executable: browser_path.clone(),
+        spki_pin: trust.pin.clone(),
+        // Never at launch: the UDP-blocked profile is one witness's
+        // subject, and it installs and removes it itself.
+        webrtc_udp_off: false,
+    };
+    let launched = driver
+        .launch(&launch)
+        .await
+        .map_err(|e| format!("{}: {e}", engine.as_str()))?;
+    // Firefox on Windows reads its own NSS database, and the driver
+    // seeds it — unless the `certutil` it found was Microsoft's, in
+    // which case it falls back to `security.enterprise_roots.enabled`
+    // and reads the platform store. This harness never writes that
+    // store, so there is nothing there to read and the leg is
+    // refused rather than run against a listener it cannot verify.
+    if launched.trust.contains("enterprise_roots") {
+        return Err(format!(
+            "{} fell back to the platform root store for trust ({}), and this harness never \
+             writes the harness CA there — `certutil -addstore -user Root` raises a modal \
+             security dialog on the desktop of whoever runs it, and so does its removal. \
+             Install NSS's certutil (libnss3-tools / the `nss-tools` package) so the \
+             profile's cert9.db can be seeded, and re-run. Refusing to continue against a \
+             listener this browser cannot verify.",
+            engine.as_str(),
+            launched.trust
+        ));
+    }
+    driver
+        .open_page("main", &page_url)
+        .await
+        .map_err(|e| format!("opening the Stage 4b tab: {e}"))?;
+
+    // Preflight, so "17 witnesses failed" is never the first thing
+    // that tells you the engine has no WebRTC at all. Playwright's
+    // WebKit for Windows is built WITHOUT `RTCPeerConnection`, and
+    // every witness below it then fails with the same sentence.
+    // This is a banner, not a verdict: adding a witness here would
+    // move the floor the CI job pins.
+    match driver
+        .eval("main", "typeof RTCPeerConnection")
+        .await
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+    {
+        Some(kind) if kind == "function" => {
+            println!("[harness] preflight: RTCPeerConnection is available");
+        }
+        other => {
+            println!(
+                "[harness] PREFLIGHT FAILURE: this {} build has NO RTCPeerConnection \
+                 (typeof = {:?}). Every transport witness below will fail for that one \
+                 reason. {}",
+                engine.as_str(),
+                other.unwrap_or_else(|| "unreadable".into()),
+                if engine.is_gate() {
+                    "This engine is a GATE, so that is a hard failure."
+                } else {
+                    "This engine is the recorded best-effort leg; the finding is the result."
+                }
+            );
+        }
+    }
     // Every probe below is attributed to this flag: a pair that
     // formed with the obfuscation DISABLED can never satisfy the
     // mDNS-on verdict.
     let mdns_on_for_measurement = !measure_with_mdns_off;
     println!(
-        "[harness] chromium launched {} --disable-features=WebRtcHideLocalIpsWithMdns \
-         (mDNS obfuscation {})",
-        if measure_with_mdns_off { "WITH" } else { "WITHOUT" },
-        if mdns_on_for_measurement { "ON" } else { "OFF" },
+        "[harness] {} {} launched; host-address obfuscation {}; CA trust: {}",
+        engine.as_str(),
+        launched.version,
+        if launched.mdns_obfuscation {
+            "ON"
+        } else {
+            "OFF"
+        },
+        launched.trust,
     );
 
     let mut script = Script {
@@ -1328,7 +1806,7 @@ async fn run(
     //     comparison. It cannot, and must not, stand in for pair
     //     formation.
     //   `mdns_on_pair_formed` — the REQUIRED verdict: a pair that
-    //     actually formed with Chromium's mDNS obfuscation ON,
+    //     actually formed with the engine's mDNS obfuscation ON,
     //     naming the interface and BOTH halves of the selected pair
     //     (the browser's `getStats()` and the anchor's
     //     `selected_pair`). Previously a nonempty diagnostic log
@@ -1344,7 +1822,7 @@ async fn run(
         label: &'static str,
         /// The interface the ANCHOR is bound to for this probe.
         interface: String,
-        /// Was Chromium's mDNS obfuscation ON for this attempt?
+        /// Was the engine's mDNS obfuscation ON for this attempt?
         mdns_on: bool,
         /// Did the browser reach a Noise session at all?
         session: bool,
@@ -1422,9 +1900,8 @@ async fn run(
             interface: lan_iface.clone(),
         });
     } else {
-        mdns_lines.push(
-            "interface: SKIPPED — this host exposed no routable non-loopback IPv4".into(),
-        );
+        mdns_lines
+            .push("interface: SKIPPED — this host exposed no routable non-loopback IPv4".into());
     }
 
     for probe in &probes {
@@ -1524,17 +2001,31 @@ async fn run(
     let mut mdns_needed_disabling = false;
     if working_stun.is_none() {
         mdns_needed_disabling = true;
-        mdns_lines.push(
-            "NO configuration formed a pair with Chromium's mDNS obfuscation ON; \
-             relaunching with --disable-features=WebRtcHideLocalIpsWithMdns so the \
-             §12 witnesses can run. The plan's answer (c) — an mDNS client on the \
-             anchor — is therefore REQUIRED on this host."
-                .into(),
+        mdns_lines.push(format!(
+            "NO configuration formed a pair with {}'s host-address obfuscation ON; \
+             relaunching with it DISABLED so the §12 witnesses can run. The plan's \
+             answer (c) — an mDNS client on the anchor — is therefore REQUIRED on \
+             this host.",
+            engine.as_str()
+        ));
+        let _ = driver.close_page("main").await;
+        let _ = driver.shutdown_browser().await;
+        let relaunched = driver
+            .launch(&LaunchSpec {
+                disable_mdns: true,
+                ..launch.clone()
+            })
+            .await
+            .map_err(|e| format!("{} relaunch: {e}", engine.as_str()))?;
+        println!(
+            "[harness] relaunched {} {} with host-address obfuscation OFF",
+            engine.as_str(),
+            relaunched.version
         );
-        let _ = child.kill();
-        let _ = child.wait();
-        child = launch_chromium(&chrome, &profile, &page_url, true, &chrome_log)
-            .map_err(|e| format!("chromium relaunch: {e}"))?;
+        driver
+            .open_page("main", &page_url)
+            .await
+            .map_err(|e| format!("reopening the Stage 4b tab: {e}"))?;
         working_stun = Some(Some(format!("stun:{anchor_rtc_addr}")));
     }
     let stun = working_stun.clone().unwrap_or(None);
@@ -1548,11 +2039,14 @@ async fn run(
     ledger.record(
         "mdns_candidate_pair_measured",
         !mdns_lines.is_empty(),
-        format!("DIAGNOSTIC sweep (not pair evidence): {}", mdns_lines.join(" | ")),
+        format!(
+            "DIAGNOSTIC sweep (not pair evidence): {}",
+            mdns_lines.join(" | ")
+        ),
     );
 
     // The REQUIRED verdict: a candidate pair that formed while
-    // Chromium's mDNS obfuscation was ON, with both halves of the
+    // the engine's mDNS obfuscation was ON, with both halves of the
     // pair named. When the host has a routable interface, that
     // interface is where it has to be proven — a loopback pair says
     // nothing about a browser reaching an anchor across a LAN.
@@ -1569,7 +2063,7 @@ async fn run(
         let detail = match formed {
             Some(e) => format!(
                 "interface={} pair=browser{} anchor[{}] — probe {} formed in {:.0} ms with \
-                 Chromium's mDNS obfuscation ON (no --disable-features=WebRtcHideLocalIpsWithMdns)",
+                 the engine's host-address obfuscation ON (no opt-out flag or pref passed)",
                 e.interface,
                 e.browser_pair
                     .as_ref()
@@ -1580,7 +2074,7 @@ async fn run(
                 e.open_ms,
             ),
             None => format!(
-                "NO candidate pair formed with Chromium's mDNS obfuscation ON{}. \
+                "NO candidate pair formed with the engine's host-address obfuscation ON{}. \
                  Evidence per probe: [{}]. The diagnostic sweep above CANNOT satisfy \
                  this verdict; an mDNS client on the anchor (the plan's answer (c)) is \
                  required on this host.",
@@ -1758,7 +2252,10 @@ async fn run(
                      acked accepted={subscribe_accepted}; the BROWSER decrypted an \
                      Admitted JoinOutcome={reply_ok} ({}); peer_is_provisional now {}; \
                      admission_promoted +{promoted_delta}; session {:?} -> {:?}",
-                    reply.error.clone().unwrap_or_else(|| "reply received".into()),
+                    reply
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "reply received".into()),
                     anchor.peer_is_provisional(enroll_node),
                     session_at_install,
                     session_after
@@ -1834,8 +2331,7 @@ async fn run(
                 .as_deref()
                 .map(unhex)
                 .and_then(|f| response_call_and_status(&f));
-            let denied_this_call =
-                observed == Some((protected_call, RpcStatus::AdmissionDenied));
+            let denied_this_call = observed == Some((protected_call, RpcStatus::AdmissionDenied));
             let after = protected_calls.load(Ordering::SeqCst);
             // The caller must still BE there and be enrolled: a
             // session that was reclaimed also never invokes the
@@ -2070,7 +2566,10 @@ async fn run(
                     "the envelope was sent={} ({}); admission_refused_transit {} -> {} \
                      for a third-party dest_id",
                     redirected.ok,
-                    redirected.error.clone().unwrap_or_else(|| "no error".into()),
+                    redirected
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "no error".into()),
                     before_transit,
                     anchor.rtc_stats().admission_refused_transit()
                 ),
@@ -2251,7 +2750,9 @@ async fn run(
                     // a credential the listener must refuse, so the
                     // offer is never accepted. The old code reported
                     // that as a PASS.
-                    println!("[harness] INVERSE: presenting a corrupted credential to the impostor");
+                    println!(
+                        "[harness] INVERSE: presenting a corrupted credential to the impostor"
+                    );
                     let mut bad = anchor_cred.clone();
                     bad.push('x');
                     bad
@@ -2278,7 +2779,8 @@ async fn run(
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false)
         };
-        let owned_an_attempt = signals_delta > 0 && stage_bool("offer_accepted") && stage_bool("dc_open");
+        let owned_an_attempt =
+            signals_delta > 0 && stage_bool("offer_accepted") && stage_bool("dc_open");
         // The terminal owner boundary of THAT attempt, not a sleep:
         // its registration is back to zero, which it reaches only by
         // being retired.
@@ -2298,7 +2800,9 @@ async fn run(
         // The correct-key success control: the real anchor, the same
         // credential, the same `doConnect` path.
         let control_node: u64 = 0xB0B0_0016;
-        let control = conn.connect(&mut script, "mitm-control", control_node).await;
+        let control = conn
+            .connect(&mut script, "mitm-control", control_node)
+            .await;
         let control_session_on_anchor = anchor.peer_session_id(control_node);
         let control_ok = control.ok
             && control.session_id.is_some()
@@ -2446,11 +2950,7 @@ async fn run(
             // The call is INSIDE the provider, parked, with its
             // promotion reservation armed against this incarnation.
             let old_parked = held_sent.ok
-                && wait_for(
-                    || enroll_gate.is_parked(&old_body),
-                    Duration::from_secs(20),
-                )
-                .await;
+                && wait_for(|| enroll_gate.is_parked(&old_body), Duration::from_secs(20)).await;
             let old_reserved = old_session
                 .is_some_and(|s| anchor.kyra_has_enrollment_reservation(node_id, s, call));
 
@@ -2528,11 +3028,7 @@ async fn run(
                 })
                 .await;
             let new_parked = own_sent.ok
-                && wait_for(
-                    || enroll_gate.is_parked(&new_body),
-                    Duration::from_secs(20),
-                )
-                .await;
+                && wait_for(|| enroll_gate.is_parked(&new_body), Duration::from_secs(20)).await;
             // The discriminator's premise, positively armed: a LIVE
             // reservation under the same `(node, call)` that differs
             // from the old one only in the session id.
@@ -2707,10 +3203,8 @@ async fn run(
                     fill: 0xA5,
                 })
                 .await;
-            let sent_bytes =
-                control.sent_bytes.unwrap_or(0) + over.sent_bytes.unwrap_or(0);
-            let sent_frames =
-                control.sent_frames.unwrap_or(0) + over.sent_frames.unwrap_or(0);
+            let sent_bytes = control.sent_bytes.unwrap_or(0) + over.sent_bytes.unwrap_or(0);
+            let sent_frames = control.sent_frames.unwrap_or(0) + over.sent_frames.unwrap_or(0);
             let closed = wait_for(
                 || anchor.peer_session_id(node_id) != session,
                 Duration::from_secs(20),
@@ -2779,15 +3273,52 @@ async fn run(
     // --- done -------------------------------------------------------
     let _ = script.run(Step::Done { id: 0 }).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let _ = child.kill();
-    let _ = child.wait();
+    let _ = driver.close_page("main").await;
+
+    // ================================================================
+    // Stage 5 — the leaf crate and the TypeScript wrapper
+    //
+    // Same browser, same anchor, same ledger. The bundle is a hard
+    // dependency: absent, every witness below is recorded FAIL with
+    // the paths and the build commands. `--no-stage5` excludes the
+    // half explicitly and still NAMES every excluded witness, so a
+    // short ledger is never silent.
+    // ================================================================
+    if stage5 {
+        let cx = stage5::Cx {
+            driver: &driver,
+            engine,
+            anchor: &anchor,
+            anchor_rtc_addr,
+            credential: anchor_cred.clone(),
+            bootstrap_url: anchor_base.clone(),
+            origin: origin.clone(),
+            page_origin: origin.clone(),
+            stun: stun.clone(),
+            bundle,
+            tabs: step5_tx,
+            launch: launch.clone(),
+        };
+        stage5::run(cx, ledger).await?;
+    } else {
+        println!(
+            "[harness] --no-stage5: the Stage 5 half was EXCLUDED by the command line. \
+             The witnesses below were not run; the CI floor counts `RTCB PASS` lines and \
+             will therefore fail, which is the point."
+        );
+        for name in stage5::WITNESSES {
+            println!("RTCB EXCLUDED {name} — --no-stage5 was passed");
+        }
+    }
+
+    driver.quit().await;
     anchor_listener.shutdown().await;
     loop_listener.shutdown().await;
     impostor_listener.shutdown().await;
     let _ = std::fs::remove_dir_all(&authority_dir);
     if mdns_needed_disabling {
         println!(
-            "[mdns] NOTE: the §12 witnesses above ran with Chromium's mDNS \
+            "[mdns] NOTE: the §12 witnesses above ran with the engine's mDNS \
              obfuscation DISABLED, because no pair formed with it on."
         );
     }

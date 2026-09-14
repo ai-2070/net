@@ -27,6 +27,17 @@ the README on why it is a sibling package rather than a sub-path.
   (`{ nodeId, entityId, capabilities, rtcAddr, noisePubkey, version }`)
   and `counters()` parsed counters, both with `u64`s as exact strings.
 
+- **`openSession()` and `MeshSession`** — §8's leader/follower surface:
+  one node per origin, elected by Web Lock, with every tab driving it
+  through the same API. `role()`, `generation()`, `fingerprint()`,
+  `scope()`, `interruptionMs()`, `onLifecycle()` and the five lifecycle
+  events (`leader_changed`, `subscription_restored`, `leader_lost`,
+  `generation_fenced`, `not_leader`) on top of the direct surface's
+  operations. `counters()`, `isEnrolled()` and `openStream()` are
+  promises here because on a follower the work happens in another tab.
+  Prefer it over `connect()`: two tabs calling `connect()` on one origin
+  are two nodes contending for one identity.
+
 - **Typed errors mirroring `net_leaf::error`.** Every rejection is a
   `LeafError` subclass whose `.message` is verbatim the Rust `Display`
   text and whose `.kind` is one flat, stable string per Rust variant

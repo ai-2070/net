@@ -41,7 +41,6 @@ export type {
   ConnectedEvent,
   DisconnectedEvent,
   DroppedEvent,
-  LeaderChangedEvent,
   LeafEvent,
   LeafEventOf,
   RpcResponseEvent,

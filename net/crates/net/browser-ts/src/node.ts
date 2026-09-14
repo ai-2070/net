@@ -149,6 +149,22 @@ export class BrowserNode {
   }
 
   /**
+   * This node's origin hash, hex.
+   *
+   * Distinct from {@link BrowserNode.nodeIdHex} and not a synonym:
+   * the origin hash rides every packet header this node seals, names
+   * its nRPC reply channels (`<service>.replies.<origin>`), and is
+   * what a receiver compares an event payload's
+   * `EventMeta.origin_hash` against — a direct peer whose header
+   * origin and payload origin disagree has the frame dropped before
+   * admission. A page that hands this node a pre-encoded event
+   * payload to send must build it with THIS value.
+   */
+  originHashHex(): string {
+    return this.inner.origin_hash_hex();
+  }
+
+  /**
    * Run the enrollment exchange.
    *
    * {@link connect} already awaits it, so a page needs this only to

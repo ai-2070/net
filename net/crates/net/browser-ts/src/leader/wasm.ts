@@ -103,9 +103,14 @@ export interface LeafWasmSessionModule extends LeafWasmModule {
  */
 export function asSessionModule(module: LeafWasmModule): LeafWasmSessionModule {
   const candidate: unknown = module.MeshSession;
+  // `wasm-bindgen` emits `export class MeshSession { static open(…) }`,
+  // and a class is a FUNCTION, not an object — so the shape check has
+  // to admit both. It used to test `typeof === 'object'` only, which
+  // rejected every real bundle and reported the pre-slice-3 message
+  // for a module that carried the session all along.
   const usable =
     candidate !== null &&
-    typeof candidate === 'object' &&
+    (typeof candidate === 'object' || typeof candidate === 'function') &&
     'open' in candidate &&
     typeof candidate.open === 'function';
   if (!usable) {

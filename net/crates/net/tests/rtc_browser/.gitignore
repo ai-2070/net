@@ -8,3 +8,6 @@ page/dist/
 runner/target/
 work/
 logs/
+# The Playwright driver's single dependency, installed on first use.
+driver/node_modules/
+driver/package-lock.json

@@ -36,6 +36,36 @@ node.close();
 The Rust half is `net-mesh-leaf` (`net/crates/net/leaf`), compiled to
 wasm; this package is the typed surface over it.
 
+## Two entry points: `openSession` for real pages, `connect` for one node
+
+There is **one node per origin** (§8). Tabs contend for a Web Lock, the
+holder runs the node on the main thread — `RTCPeerConnection` does not
+exist in a worker — and every other tab attaches as a follower and
+drives the same node through it.
+
+```typescript
+import { openSession } from '@net-mesh/browser';
+
+const session = await openSession({ credentialB64, capabilities: ['transcribe'], subscriptions: ['jobs'] });
+session.role();            // 'leader' | 'follower' — same surface either way
+session.onLifecycle((event) => log(event.type));  // leader_changed, leader_lost, …
+const reply = await session.call('summarise', bytes, 5_000);
+```
+
+**Use `openSession` unless you know you want otherwise.** `connect`
+gives *this tab* its own node; two tabs calling `connect` on one origin
+are two nodes contending for one identity. `openSession` gives the
+origin's node, whichever tab is running it, and survives that tab
+closing: a follower is promoted, re-bootstraps under the same identity
+with a fenced new generation, and restores the `subscriptions` it was
+opened with.
+
+Three methods are promises on the session and synchronous on the direct
+surface — `counters()`, `isEnrolled()` and `openStream()` — because on
+a follower the work happens in another tab. Everything else has the
+same shape and the same typed errors; a stale tab's operation fails as
+`NotLeaderError` rather than silently doing nothing.
+
 ## Why a sibling package and not `@net-mesh/sdk/browser`
 
 `@net-mesh/sdk` is built on `@net-mesh/core` — the **napi native
@@ -139,6 +169,45 @@ answered at all is neither: it is `rpc-timeout`. That three-way
 distinction plus `node.isEnrolled()` is how a page tells "my invite was
 already redeemed" from "the anchor is slow" from "the anchor is
 broken", all of which otherwise look like a call that never returned.
+
+**A fourth `rpc-timeout` a page should know about: a frozen leader.**
+On a session a call can also time out because the tab running the node
+was frozen by the browser. Two facts, and only one of them is a
+measurement:
+
+- **Measured** (Chromium 152, two real tabs driven over CDP): a frozen
+  tab **keeps** its Web Lock. So no successor is elected while it
+  sleeps, and nothing in this tab's view changes — `role()` still says
+  `'follower'`, `generation()` does not move, and no `leader_lost` or
+  `leader_changed` arrives. Whether the `RTCPeerConnection` itself
+  survives a freeze was *not* measured and is not claimed.
+- **Decisive regardless of the transport**: a frozen document's task
+  queues do not run. The leaf's pump, the DataChannel `onmessage`
+  handler and the `BroadcastChannel` delivery carrying a follower's
+  request are all queued tasks in that document, so even if every
+  packet still arrives, nothing is processed and **nothing is
+  answered** — not the calls, and not the cheap control messages
+  either. A live-but-provisional leader still answers an attach with a
+  `leadership` message; a frozen one answers nothing.
+
+So the signal is: `rpc-timeout` **and** `role() === 'follower'` **and**
+an unchanged `generation()` **and** no reply to anything, including the
+control chatter. Fencing is unaffected — the generation, not lock loss,
+is what fences a resumed tab — but liveness is: the window is bounded
+by the mesh's own failure detection, not by the lock.
+
+**Do not retry on this timeout.** On resume the backlog flushes and the
+frozen tab is still the legitimate leader holding a valid generation —
+no successor was elected, which is exactly the liveness gap — so those
+calls may be answered *late*, after the caller's deadline already threw
+`rpc-timeout`. A page that retries can therefore cause the effect
+twice. Surface it, or wait; do not re-issue.
+
+This package deliberately does **not** paper over it with a
+wrapper-level failure detector. Timing a leader out and forcing an
+election would put a second detector beside the mesh's and race a tab
+that is about to resume holding a valid generation — the stale-holder
+hazard the leaf's three fence enforcers exist to prevent.
 
 **Why `reliability` is required, not defaulted.** The wasm surface
 treats an absent reliability as `reliable`, which is the right default

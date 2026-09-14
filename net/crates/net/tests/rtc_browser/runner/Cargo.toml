@@ -34,3 +34,15 @@ async-trait = "0.1"
 # The local CA + leaf. Same version the SDK's own TLS witness uses, so
 # one rcgen resolves.
 rcgen = { version = "0.14", default-features = false, features = ["pem", "crypto", "aws_lc_rs"] }
+# The Windows trust path: `--ignore-certificate-errors-spki-list` wants
+# base64(SHA-256(SubjectPublicKeyInfo DER)) of the leaf this harness
+# mints, so the pin is computed here rather than shelled out to openssl.
+sha2 = "0.10"
+base64 = "0.22"
+# The anchor's own diagnosis. Every "dropped / refused / malformed"
+# decision inside the core is a `tracing` event; without a subscriber
+# a witness that fails because the anchor discarded a frame reports
+# only the absence of an effect. Installed at WARN, `RUST_LOG`
+# overrides.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi"] }
