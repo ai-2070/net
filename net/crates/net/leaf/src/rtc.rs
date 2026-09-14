@@ -47,9 +47,9 @@ use js_sys::Uint8Array;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{
-    MessageEvent, RtcConfiguration, RtcDataChannel, RtcDataChannelInit, RtcDataChannelState,
-    RtcDataChannelType, RtcIceCandidate, RtcIceCandidateInit, RtcPeerConnection,
-    RtcPeerConnectionIceEvent, RtcSdpType, RtcSessionDescriptionInit,
+    MessageEvent, RtcConfiguration, RtcDataChannel, RtcDataChannelEvent, RtcDataChannelInit,
+    RtcDataChannelState, RtcDataChannelType, RtcIceCandidate, RtcIceCandidateInit,
+    RtcPeerConnection, RtcPeerConnectionIceEvent, RtcSdpType, RtcSessionDescriptionInit,
 };
 
 use crate::control_plane::{IceCandidate, NodeId, Sdp};
@@ -95,6 +95,9 @@ struct PeerLink {
     _closures: Vec<Closure<dyn FnMut(JsValue)>>,
     _message: Option<Closure<dyn FnMut(MessageEvent)>>,
     _ice: Option<Closure<dyn FnMut(RtcPeerConnectionIceEvent)>>,
+    /// The answerer's `ondatachannel` handler. `None` on the
+    /// offering side, which creates the channel itself.
+    _data_channel: Option<Closure<dyn FnMut(RtcDataChannelEvent)>>,
 }
 
 /// The leaf's RTC transport.
@@ -140,21 +143,7 @@ impl RtcLeafTransport {
     /// puts the SCTP m-line in the SDP; an offer without it would
     /// negotiate a connection with nothing to carry.
     pub async fn create_offer(&self, peer: NodeId, ice_servers: &[String]) -> Result<Sdp> {
-        let config = RtcConfiguration::new();
-        if !ice_servers.is_empty() {
-            let servers = js_sys::Array::new();
-            for url in ice_servers {
-                let server = js_sys::Object::new();
-                let urls = js_sys::Array::new();
-                urls.push(&JsValue::from_str(url));
-                js_sys::Reflect::set(&server, &JsValue::from_str("urls"), &urls)
-                    .map_err(|e| unsupported("iceServers", &e))?;
-                servers.push(&server);
-            }
-            config.set_ice_servers(&servers);
-        }
-        let connection = RtcPeerConnection::new_with_configuration(&config)
-            .map_err(|e| unsupported("RTCPeerConnection", &e))?;
+        let connection = new_connection(ice_servers)?;
 
         // Reliable, ordered: the Net layer's own reliability rides
         // inside, and an unordered channel would hand the consumer
@@ -167,9 +156,9 @@ impl RtcLeafTransport {
         channel.set_binary_type(RtcDataChannelType::Arraybuffer);
         channel.set_buffered_amount_low_threshold(BUFFERED_AMOUNT_LOW);
 
-        let message = self.install_message_handler(peer, &channel);
+        let message = message_handler(Rc::clone(&self.inbound), peer, &channel);
         let ice = self.install_ice_handler(peer, &connection);
-        let low = self.install_low_water_handler(peer, &channel);
+        let low = low_water_handler(Rc::clone(&self.peers), peer, &channel);
 
         self.peers.borrow_mut().insert(
             peer,
@@ -182,6 +171,7 @@ impl RtcLeafTransport {
                 _closures: vec![low],
                 _message: Some(message),
                 _ice: Some(ice),
+                _data_channel: None,
             },
         );
 
@@ -194,6 +184,96 @@ impl RtcLeafTransport {
             .ok_or_else(|| LeafError::Rtc(RtcError::Unsupported("offer carried no sdp".into())))?;
 
         let description = RtcSessionDescriptionInit::new(RtcSdpType::Offer);
+        description.set_sdp(&sdp);
+        wasm_bindgen_futures::JsFuture::from(connection.set_local_description(&description))
+            .await
+            .map_err(|e| unsupported("setLocalDescription", &e))?;
+        Ok(Sdp(sdp))
+    }
+
+    /// Answer a peer's offer, and produce the local answer.
+    ///
+    /// The counterpart of [`Self::create_offer`], and §9's browser ↔
+    /// browser attempt needs it: with no anchor in the middle, one
+    /// of the two leaves must be the answerer.
+    ///
+    /// **No channel is created here.** The offerer created it, so
+    /// the answerer installs its handlers when `ondatachannel`
+    /// fires; creating a second one would negotiate two SCTP
+    /// streams and make §3's "one channel per peer" false. Until
+    /// that event arrives [`Self::is_open`] is `false` and
+    /// [`Self::send`] refuses with
+    /// [`RtcError::ChannelClosed`] — the same refusal the offering
+    /// side gets before its channel opens, and every §2 bound
+    /// (reserved slots, reserved bytes, the buffered-amount
+    /// advisory) applies afterwards through the same `send`.
+    pub async fn accept_offer(
+        &self,
+        peer: NodeId,
+        offer: &Sdp,
+        ice_servers: &[String],
+    ) -> Result<Sdp> {
+        let connection = new_connection(ice_servers)?;
+        let ice = self.install_ice_handler(peer, &connection);
+
+        let peers = Rc::clone(&self.peers);
+        let inbound = Rc::clone(&self.inbound);
+        let on_data_channel = Closure::wrap(Box::new(move |event: RtcDataChannelEvent| {
+            let channel = event.channel();
+            channel.set_binary_type(RtcDataChannelType::Arraybuffer);
+            channel.set_buffered_amount_low_threshold(BUFFERED_AMOUNT_LOW);
+            let message = message_handler(Rc::clone(&inbound), peer, &channel);
+            // The low-water handler is what retries a retained
+            // packet; an accepted channel without it would retain
+            // for ever after the first refusal.
+            let low = low_water_handler(Rc::clone(&peers), peer, &channel);
+            if let Some(link) = peers.borrow_mut().get_mut(&peer) {
+                // The first channel the peer opens is the Net one:
+                // a leaf offers exactly one and accepts exactly one
+                // (§3), so matching on the label as well would turn
+                // a label disagreement into a silent hang instead of
+                // a handshake that fails with a reason.
+                if link.channel.is_none() {
+                    link._message = Some(message);
+                    link._closures.push(low);
+                    link.channel = Some(channel);
+                }
+            }
+        }) as Box<dyn FnMut(RtcDataChannelEvent)>);
+        connection.set_ondatachannel(Some(on_data_channel.as_ref().unchecked_ref()));
+
+        self.peers.borrow_mut().insert(
+            peer,
+            PeerLink {
+                connection: connection.clone(),
+                channel: None,
+                retained: VecDeque::new(),
+                retained_bytes: 0,
+                discarded_at_close: 0,
+                _closures: Vec::new(),
+                _message: None,
+                _ice: Some(ice),
+                _data_channel: Some(on_data_channel),
+            },
+        );
+
+        // The remote description first: `createAnswer` has nothing
+        // to answer without it.
+        let remote = RtcSessionDescriptionInit::new(RtcSdpType::Offer);
+        remote.set_sdp(&offer.0);
+        wasm_bindgen_futures::JsFuture::from(connection.set_remote_description(&remote))
+            .await
+            .map_err(|e| unsupported("setRemoteDescription", &e))?;
+
+        let answer = wasm_bindgen_futures::JsFuture::from(connection.create_answer())
+            .await
+            .map_err(|e| unsupported("createAnswer", &e))?;
+        let sdp = js_sys::Reflect::get(&answer, &JsValue::from_str("sdp"))
+            .ok()
+            .and_then(|v| v.as_string())
+            .ok_or_else(|| LeafError::Rtc(RtcError::Unsupported("answer carried no sdp".into())))?;
+
+        let description = RtcSessionDescriptionInit::new(RtcSdpType::Answer);
         description.set_sdp(&sdp);
         wasm_bindgen_futures::JsFuture::from(connection.set_local_description(&description))
             .await
@@ -320,28 +400,6 @@ impl RtcLeafTransport {
         }
     }
 
-    fn install_message_handler(
-        &self,
-        peer: NodeId,
-        channel: &RtcDataChannel,
-    ) -> Closure<dyn FnMut(MessageEvent)> {
-        let inbound = Rc::clone(&self.inbound);
-        let closure = Closure::wrap(Box::new(move |event: MessageEvent| {
-            let data = event.data();
-            let bytes = if let Some(buffer) = data.dyn_ref::<js_sys::ArrayBuffer>() {
-                Uint8Array::new(buffer).to_vec()
-            } else if let Some(array) = data.dyn_ref::<Uint8Array>() {
-                array.to_vec()
-            } else {
-                // A text frame on the Net channel is not ours.
-                return;
-            };
-            inbound(peer, Bytes::from(bytes));
-        }) as Box<dyn FnMut(MessageEvent)>);
-        channel.set_onmessage(Some(closure.as_ref().unchecked_ref()));
-        closure
-    }
-
     fn install_ice_handler(
         &self,
         peer: NodeId,
@@ -367,24 +425,6 @@ impl RtcLeafTransport {
         connection.set_onicecandidate(Some(closure.as_ref().unchecked_ref()));
         closure
     }
-
-    fn install_low_water_handler(
-        &self,
-        peer: NodeId,
-        channel: &RtcDataChannel,
-    ) -> Closure<dyn FnMut(JsValue)> {
-        let peers = Rc::clone(&self.peers);
-        let closure = Closure::wrap(Box::new(move |_event: JsValue| {
-            let mut peers = peers.borrow_mut();
-            if let Some(link) = peers.get_mut(&peer) {
-                if let Some(channel) = link.channel.clone() {
-                    flush_link(link, &channel);
-                }
-            }
-        }) as Box<dyn FnMut(JsValue)>);
-        channel.set_onbufferedamountlow(Some(closure.as_ref().unchecked_ref()));
-        closure
-    }
 }
 
 /// Write as much of the retained queue as the channel will take.
@@ -407,6 +447,72 @@ fn flush_link(link: &mut PeerLink, channel: &RtcDataChannel) {
             Err(_) => return,
         }
     }
+}
+
+/// A peer connection configured with `ice_servers`.
+///
+/// Shared by the offering and the answering path: two connections
+/// built from two copies of this would be two chances to configure
+/// ICE differently, and a browser ↔ browser attempt where only one
+/// side has a STUN server is a connectivity bug with no symptom
+/// except a deadline.
+fn new_connection(ice_servers: &[String]) -> Result<RtcPeerConnection> {
+    let config = RtcConfiguration::new();
+    if !ice_servers.is_empty() {
+        let servers = js_sys::Array::new();
+        for url in ice_servers {
+            let server = js_sys::Object::new();
+            let urls = js_sys::Array::new();
+            urls.push(&JsValue::from_str(url));
+            js_sys::Reflect::set(&server, &JsValue::from_str("urls"), &urls)
+                .map_err(|e| unsupported("iceServers", &e))?;
+            servers.push(&server);
+        }
+        config.set_ice_servers(&servers);
+    }
+    RtcPeerConnection::new_with_configuration(&config)
+        .map_err(|e| unsupported("RTCPeerConnection", &e))
+}
+
+/// The inbound handler for one peer's channel.
+fn message_handler(
+    inbound: InboundSink,
+    peer: NodeId,
+    channel: &RtcDataChannel,
+) -> Closure<dyn FnMut(MessageEvent)> {
+    let closure = Closure::wrap(Box::new(move |event: MessageEvent| {
+        let data = event.data();
+        let bytes = if let Some(buffer) = data.dyn_ref::<js_sys::ArrayBuffer>() {
+            Uint8Array::new(buffer).to_vec()
+        } else if let Some(array) = data.dyn_ref::<Uint8Array>() {
+            array.to_vec()
+        } else {
+            // A text frame on the Net channel is not ours.
+            return;
+        };
+        inbound(peer, Bytes::from(bytes));
+    }) as Box<dyn FnMut(MessageEvent)>);
+    channel.set_onmessage(Some(closure.as_ref().unchecked_ref()));
+    closure
+}
+
+/// The `bufferedamountlow` handler: the retain-and-retry half of
+/// the §2 send rules.
+fn low_water_handler(
+    peers: Rc<RefCell<HashMap<NodeId, PeerLink>>>,
+    peer: NodeId,
+    channel: &RtcDataChannel,
+) -> Closure<dyn FnMut(JsValue)> {
+    let closure = Closure::wrap(Box::new(move |_event: JsValue| {
+        let mut peers = peers.borrow_mut();
+        if let Some(link) = peers.get_mut(&peer) {
+            if let Some(channel) = link.channel.clone() {
+                flush_link(link, &channel);
+            }
+        }
+    }) as Box<dyn FnMut(JsValue)>);
+    channel.set_onbufferedamountlow(Some(closure.as_ref().unchecked_ref()));
+    closure
 }
 
 fn unsupported(what: &str, error: &JsValue) -> LeafError {

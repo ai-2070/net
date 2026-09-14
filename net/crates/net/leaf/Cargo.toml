@@ -81,6 +81,13 @@ serde_json = { version = "1", features = ["preserve_order"] }
 # Credential decoding (`net-bootstrap:` + URL-safe unpadded base64)
 # and the base64 the event JSON carries byte payloads in.
 base64 = "0.22"
+# Overwrite the identity scalars when the at-rest value drops
+# (`identity::IdentitySecrets`). A volatile write plus a compiler
+# fence, which is the part a plain assignment cannot promise; the
+# crate is `forbid(unsafe_code)`, so it cannot do this itself.
+# Already in the graph through both dalek crates — this makes the
+# direct use explicit rather than borrowing a transitive dependency.
+zeroize = "1"
 
 [dependencies.web-sys]
 version = "0.3"
@@ -112,6 +119,34 @@ features = [
   "WebSocket",
   "BinaryType",
   "CloseEvent",
+  # §8 identity at rest: IndexedDB holding a ciphertext plus the
+  # non-extractable AES-GCM `CryptoKey` that unwraps it, and the
+  # generation counter leader election fences on.
+  "IdbFactory",
+  "IdbDatabase",
+  "IdbObjectStore",
+  "IdbObjectStoreParameters",
+  "IdbTransaction",
+  "IdbTransactionMode",
+  "IdbRequest",
+  "IdbOpenDbRequest",
+  "IdbVersionChangeEvent",
+  "DomException",
+  "Crypto",
+  "SubtleCrypto",
+  "CryptoKey",
+  "AesGcmParams",
+  "AesKeyGenParams",
+  # §8 leader election: the cross-tab carrier for the follower proxy.
+  # `Navigator` is here for `navigator.locks`, which web-sys only
+  # exposes behind `--cfg=web_sys_unstable_apis` — see
+  # `leader::web_lock` for why the Web Locks call goes through
+  # `js_sys::Reflect` instead of demanding a crate-wide RUSTFLAGS.
+  "BroadcastChannel",
+  "Navigator",
+  # §9 browser ↔ browser: the answerer does not create the
+  # DataChannel, it receives the offerer's through `ondatachannel`.
+  "RtcDataChannelEvent",
 ]
 
 [dev-dependencies]

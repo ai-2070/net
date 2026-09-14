@@ -82,9 +82,23 @@ pub const MAX_REORDER_HELD: usize = 64;
 ///
 /// `MeshNode::publish_stream_id` packs channel-keyed publisher
 /// streams under bit 48 (`0x0001_0000_0000_0000`); leaf-opened
-/// application streams take bit 49 so the two spaces cannot alias,
-/// and neither can collide with the low subprotocol ids
-/// (`0x0400..0x1000`) that ride as stream ids.
+/// application streams take bit 49. Both are far above the low
+/// subprotocol ids (`0x0400..0x1000`) that also ride as stream ids,
+/// which IS guaranteed: setting a bit at 2^48 or 2^49 puts the
+/// value out of that range unconditionally.
+///
+/// **What it does NOT guarantee**, stated because the obvious
+/// reading is wrong: neither bit *reserves* a space. Both formulas
+/// `OR` the bit into a full 64-bit `xxh3` hash, and roughly half of
+/// all channel hashes already have the bit set — for those the `OR`
+/// is a no-op and the id is indistinguishable from the raw hash
+/// (`0xd1a8…` becomes `0xd1a9…`, one nibble). So a publisher stream
+/// and a leaf stream CAN collide, at hash-collision probability
+/// rather than never. Nothing is broken today because both ends
+/// derive ids the same way and a collision would only mean two
+/// logical streams sharing per-stream state on one session — but
+/// the word "cannot" does not belong in this comment, and the
+/// Stage 5 report carries it as a core-side latent hazard.
 pub const LEAF_STREAM_DISCRIMINATOR: u64 = 0x0002_0000_0000_0000;
 
 /// Derive a stable stream id from a caller-chosen label.
@@ -324,12 +338,15 @@ mod tests {
     fn leaf_stream_ids_cannot_alias_the_publish_or_subprotocol_spaces() {
         let id = stream_id_from_label("app/telemetry");
         assert_eq!(id & LEAF_STREAM_DISCRIMINATOR, LEAF_STREAM_DISCRIMINATOR);
-        assert_eq!(
-            id & 0x0001_0000_0000_0000,
-            0,
-            "must not collide with MeshNode::publish_stream_id's bit 48"
+        // The guarantee that actually holds: out of the subprotocol
+        // id range, unconditionally. NOT asserted: that bit 48 is
+        // clear — `stream_id_from_label` ORs bit 49 into a full
+        // 64-bit hash, so bit 48 carries whatever the hash had, and
+        // asserting otherwise would pin an accident of this label.
+        assert!(
+            id > 0x1_0000,
+            "a leaf stream id must never land in the subprotocol id range"
         );
-        assert!(id > 0x1_0000, "must not land in the subprotocol id range");
         assert_eq!(
             id,
             stream_id_from_label("app/telemetry"),

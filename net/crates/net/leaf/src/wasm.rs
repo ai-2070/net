@@ -22,19 +22,25 @@
 //! **string**: `JSON.parse` rounds integers above 2^53, so a numeric
 //! `channel_hash` would silently name the wrong channel.
 //!
-//! # `AnchorControlPlane`, and what v1 does not have
+//! # The control-plane boundary
 //!
-//! The Stage 4b listener serves exactly three routes:
-//! `POST /rtc/offer`, `GET /rtc/anchor`, `GET /rtc/trickle`. So
-//! `offer`, `trickle` and `end_attempt` are real HTTP/WebSocket
-//! calls, `publish_announcement` rides the **data path** (a `0x1000`
-//! fold frame to the anchor, which is §7's reachability path — the
-//! anchor floods it), and `query_capability` returns a typed refusal
-//! naming the absent endpoint. That is not a placeholder: a leaf
-//! answers [`LeafNode::query`] from the announcements its dispatcher
-//! verified, which is the mechanism §7 describes. The trait's shape
-//! is what lets a serverless Tier A control plane answer it
-//! directly instead.
+//! Everything that is not a Net packet crosses
+//! [`ControlPlane`](crate::control_plane::ControlPlane), whose one
+//! v1 implementation is
+//! [`AnchorControlPlane`](crate::anchor_control_plane::AnchorControlPlane):
+//! the anchor info and its pinned-key refusal, the offer, the
+//! candidate trickle in both directions, the signalling envelopes,
+//! and the end of the attempt. This module **drives** that trait and
+//! owns no `fetch`, no `WebSocket` and no SDP transport of its own —
+//! `tests/control_plane_boundary.rs` asserts that from the outside,
+//! because one inlined HTTP call here is how a boundary stops being
+//! one.
+//!
+//! What deliberately stays on this side: the credential (the page's
+//! own input), the Noise handshake, and the **enrollment exchange**.
+//! Enrollment is an nRPC call on the session that was just
+//! installed — the data path — and a control plane that carried it
+//! would be forwarding Net packets.
 
 #![cfg(target_arch = "wasm32")]
 
@@ -46,14 +52,11 @@ use bytes::Bytes;
 use js_sys::Uint8Array;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use web_sys::{MessageEvent, WebSocket};
 
-use crate::bootstrap::{
-    classify_ice_failure, gloo_timer_sleep, stun_probe_failed, AnchorInfo, Credential,
-    OfferAccepted,
-};
+use crate::anchor_control_plane::AnchorControlPlane;
+use crate::bootstrap::{classify_ice_failure, gloo_timer_sleep, stun_probe_failed, Credential};
 use crate::clock;
-use crate::control_plane::{IceCandidate, NodeId, SignalKind};
+use crate::control_plane::{ControlEvent, ControlPlane, DialogId, NodeId, SignalKind};
 use crate::error::LeafError;
 use crate::identity::{EntityKeypair, LeafIdentity};
 use crate::node::{LeafEvent, StreamHandle};
@@ -92,11 +95,14 @@ struct Inner {
     node: crate::node::LeafNode,
     transport: RtcLeafTransport,
     anchor: NodeId,
-    anchor_rtc_addr: Option<String>,
-    /// The trickle socket for the bootstrap dialog, kept open for
-    /// candidate trickle in both directions.
-    trickle: Option<WebSocket>,
-    dialog: u64,
+    /// The boundary. Every exchange that is not a Net packet goes
+    /// through this and nothing else.
+    control: AnchorControlPlane,
+    /// The bootstrap dialog, as the control plane numbered it.
+    dialog: DialogId,
+    /// The credential's invite, for the enrollment exchange. Held
+    /// because `enroll` is also callable on its own.
+    invite: crate::enroll::Invite,
     /// Inbound bytes the transport delivered but the pump has not
     /// processed. A queue, not direct dispatch: the closure runs
     /// inside a JS callback and must not re-enter a `RefCell` the
@@ -163,50 +169,36 @@ impl LeafNode {
         let bootstrap_url = optional_string(&opts, "bootstrapUrl")
             .unwrap_or_else(|| credential.bootstrap_url.clone());
         let ice_servers = string_array(&opts, "iceServers");
-
-        // Identity: injected if the host supplies one (custodial
-        // model, same shape as `MeshNodeConfig::entity_keypair`),
-        // generated from the platform CSPRNG otherwise.
-        let identity = match optional_string(&opts, "entitySecretHex") {
-            Some(hex) => {
-                let secret: [u8; 32] = crate::identity::unhex(&hex)
-                    .map_err(js)?
-                    .try_into()
-                    .map_err(|_| JsError::new("entitySecretHex must be 32 bytes"))?;
-                let noise: [u8; 32] = match optional_string(&opts, "noiseSecretHex") {
-                    Some(hex) => crate::identity::unhex(&hex)
-                        .map_err(js)?
-                        .try_into()
-                        .map_err(|_| JsError::new("noiseSecretHex must be 32 bytes"))?,
-                    None => random32().map_err(js)?,
-                };
-                LeafIdentity::from_secrets(EntityKeypair::from_secret(secret), noise)
-            }
-            None => LeafIdentity::generate().map_err(js)?,
-        };
-
-        // Layer 0 step 1: the live anchor info, for COMPARISON
-        // against the credential's pinned key.
-        let info = AnchorInfo::from_json(&http_get(&format!("{bootstrap_url}/rtc/anchor")).await?)
-            .map_err(js)?;
-        info.check_pinned_key(&credential).map_err(js)?;
-
+        let identity = identity_from(&opts)?;
         let node_id = identity.node_id();
+
+        // Layer 0 step 1 lives inside `attach`: the live anchor info
+        // is fetched and COMPARED against the key the credential
+        // pins, and a mismatch is refused there — before an offer
+        // exists and before any handshake is attempted. That
+        // ordering is the whole MITM witness, which is why it is a
+        // constructor rather than a step a later edit could move.
+        let control = AnchorControlPlane::attach(bootstrap_url, credential.clone(), node_id)
+            .await
+            .map_err(js)?;
+        let anchor = control.anchor_node();
+        let anchor_rtc_addr = control.anchor_rtc_addr();
+
         let seed = u64::from_le_bytes(
             random32().map_err(js)?[..8]
                 .try_into()
                 .map_err(|_| JsError::new("seed"))?,
         );
         let mut node = crate::node::LeafNode::new(identity, seed);
-        node.set_peer_rtc_addr(info.node_id, info.rtc_addr.clone());
+        node.set_peer_rtc_addr(anchor, anchor_rtc_addr);
 
         let inner = Rc::new(RefCell::new(Inner {
             node,
             transport: RtcLeafTransport::new(Rc::new(|_, _| {})),
-            anchor: info.node_id,
-            anchor_rtc_addr: info.rtc_addr.clone(),
-            trickle: None,
+            anchor,
+            control,
             dialog: 0,
+            invite: credential.invite.clone(),
             inbox: VecDeque::new(),
             listeners: Vec::new(),
             closed: false,
@@ -224,74 +216,61 @@ impl LeafNode {
         });
         inner.borrow_mut().transport = RtcLeafTransport::new(sink);
 
-        // Layer 0 step 2: the offer. The transport is cloned out of
-        // the `RefCell` first: holding the borrow across the await
-        // would deadlock against the pump on the next tick.
-        let transport = inner.borrow().transport.clone();
+        // Layer 0 step 2: the offer, through the boundary. Both
+        // handles are cloned out of the `RefCell` first: holding a
+        // borrow across an await would deadlock against the pump on
+        // the next tick.
+        let (transport, control) = {
+            let guard = inner.borrow();
+            (guard.transport.clone(), guard.control.clone())
+        };
         let offer = transport
-            .create_offer(info.node_id, &ice_servers)
+            .create_offer(anchor, &ice_servers)
             .await
             .map_err(js)?;
-
-        let body = serde_json::json!({
-            "credential": credential.encoded,
-            "node_id": format!("{node_id:#x}"),
-            "sdp": offer.0,
-        })
-        .to_string();
-        let accepted = OfferAccepted::from_json(
-            &http_post_json(&format!("{bootstrap_url}/rtc/offer"), &body).await?,
-        )
-        .map_err(js)?;
-
+        let accepted = control.offer(offer).await.map_err(js)?;
         transport
-            .accept_answer(
-                info.node_id,
-                &crate::control_plane::Sdp(accepted.sdp.clone()),
-            )
+            .accept_answer(anchor, &accepted.answer)
             .await
             .map_err(js)?;
         inner.borrow_mut().dialog = accepted.dialog;
 
-        // Layer 0 step 3: the trickle socket, authorised by the
-        // attempt token presented as the WebSocket subprotocol.
-        let socket = open_trickle(
-            &bootstrap_url,
-            node_id,
-            accepted.dialog,
-            &accepted.attempt_token,
-            Rc::downgrade(&inner),
-        )?;
-        inner.borrow_mut().trickle = Some(socket);
+        // Layer 0 step 3: wait for the channel, trickling both ways
+        // through the boundary.
+        wait_for_channel(&inner, anchor).await?;
 
-        // Layer 0 step 4: wait for the channel, trickling both ways.
-        wait_for_channel(&inner, info.node_id).await?;
-
-        // Layer 1: the NKpsk0 handshake, against the CREDENTIAL's
-        // key. This is the whole MITM property.
+        // Layer 1: the NKpsk0 handshake. `accepted.peer_static` is
+        // the CREDENTIAL's key — the control plane returns what
+        // authenticated the attempt, and `attach` already refused a
+        // live key that differed from it. This is the whole MITM
+        // property.
         let msg1 = {
             let mut guard = inner.borrow_mut();
             let slot = guard.transport.next_slot();
             let packet = guard
                 .node
-                .begin_handshake(
-                    info.node_id,
-                    &credential.psk,
-                    &credential.anchor_noise_pubkey,
-                    slot,
-                )
+                .begin_handshake(anchor, &credential.psk, &accepted.peer_static, slot)
                 .map_err(js)?;
-            guard
-                .transport
-                .send(info.node_id, packet.clone())
-                .map_err(js)?;
+            guard.transport.send(anchor, packet.clone()).map_err(js)?;
             packet
         };
         debug_assert!(!msg1.is_empty());
-        wait_for_session(&inner, info.node_id).await?;
+        wait_for_session(&inner, anchor).await?;
 
+        // Layer 2: enrollment, over the session just installed.
+        // §12 admits a browser's session as **provisional** and
+        // refuses calls, publishes and subscribes above the
+        // transport until the anchor has admitted this leaf, so a
+        // connect that skipped this returns a node whose every
+        // operation dies on its deadline.
+        //
+        // The ticker starts first, deliberately: the enrollment
+        // request only reaches the wire when something pumps, and
+        // the reply only arrives when something drains.
         start_ticker(Rc::downgrade(&inner));
-        Ok(LeafNode { inner })
+        let node = LeafNode { inner };
+        node.enroll().await?;
+        Ok(node)
     }
 
     /// This node's id, as 16 lowercase hex digits.
@@ -430,8 +409,14 @@ impl LeafNode {
         Ok(self.inner.borrow().node.query(&capability))
     }
 
-    /// Sign and send a `0x0D02` signalling envelope to `peer`
-    /// through the control plane — no session with `peer` needed.
+    /// Sign a `0x0D02` signalling envelope for `peer` and hand it to
+    /// the control plane — no session with `peer` needed.
+    ///
+    /// Through the boundary, not the data path. An envelope
+    /// authenticates itself, so the carrier is untrusted and can be
+    /// anything: the anchor's bootstrap dialog here, a room object
+    /// in the serverless follow-on, the in-memory mock in the
+    /// anchorless test.
     pub async fn signal(
         &self,
         peer_hex: String,
@@ -447,29 +432,71 @@ impl LeafNode {
             "reject" => SignalKind::Reject,
             other => return Err(JsError::new(&format!("unknown signal kind {other:?}"))),
         };
-        let envelope =
-            self.inner
-                .borrow()
+        let (control, envelope) = {
+            let guard = self.inner.borrow();
+            let envelope = guard
                 .node
                 .sign_signal(peer, dialog as u64, kind, payload.to_vec());
-        let bytes = crate::signal::encode(&envelope).map_err(js)?;
-        // v1 carries envelopes on the anchor session, which the
-        // anchor forwards blind — it can read nothing that verifies.
-        let mut guard = self.inner.borrow_mut();
-        let anchor = guard.anchor;
-        let handle = guard
-            .node
-            .open_stream(anchor, "signal", Reliability::Reliable, None, None)
-            .map_err(js)?;
-        guard.node.stream_send(handle, &bytes).map_err(js)?;
-        guard.pump();
-        Ok(())
+            (guard.control.clone(), envelope)
+        };
+        control.signal(envelope).await.map_err(js)
     }
 
     /// Register an event listener. Each receives one JSON string per
     /// event.
     pub fn on_event(&self, callback: js_sys::Function) {
         self.inner.borrow_mut().listeners.push(callback);
+    }
+
+    /// Run the enrollment exchange against the anchor.
+    ///
+    /// [`Self::connect`] awaits this already, so a page never needs
+    /// it; it is here because "still provisional" and "the anchor
+    /// was slow" are the same symptom from the outside — an nRPC
+    /// timeout — and a harness needs to be able to drive and
+    /// observe the step that distinguishes them.
+    ///
+    /// A refusal is typed and final: the invite is single-use, so
+    /// nothing here retries. Retrying would burn it and turn a
+    /// legible refusal into an illegible replay.
+    pub async fn enroll(&self) -> Result<(), JsError> {
+        let receiver = {
+            let mut guard = self.inner.borrow_mut();
+            if guard.node.is_enrolled() {
+                return Ok(());
+            }
+            let peer = guard.anchor;
+            let invite = guard.invite.clone();
+            let receiver = guard
+                .node
+                .begin_enrollment(peer, &invite, "net-mesh-leaf", &[], None)
+                .map_err(js)?;
+            guard.pump();
+            receiver
+        };
+        let reply = match receiver.await {
+            Ok(Ok(body)) => body,
+            Ok(Err(e)) => return Err(js(LeafError::Rpc(e))),
+            Err(_) => {
+                return Err(js(LeafError::Rpc(crate::error::RpcError::Malformed(
+                    "the enrollment call was cancelled locally".into(),
+                ))))
+            }
+        };
+        let mut guard = self.inner.borrow_mut();
+        guard.node.finish_enrollment(&reply).map_err(js)?;
+        guard.pump();
+        Ok(())
+    }
+
+    /// Whether the anchor has admitted this leaf.
+    ///
+    /// `false` after a successful handshake means the session is
+    /// still provisional, which is the discriminator a harness needs
+    /// when a call times out: §12 refused it, rather than the
+    /// service being slow.
+    pub fn is_enrolled(&self) -> bool {
+        self.inner.borrow().node.is_enrolled()
     }
 
     /// Close the node: every session, every channel, every pending
@@ -482,9 +509,14 @@ impl LeafNode {
         guard.closed = true;
         let anchor = guard.anchor;
         guard.node.drop_session(anchor, "the node was closed");
-        if let Some(socket) = guard.trickle.take() {
-            let _ = socket.close();
-        }
+        // The attempt ends through the boundary: closing the
+        // carrier's socket is the carrier's business, not this
+        // module's.
+        let control = guard.control.clone();
+        let dialog = guard.dialog;
+        wasm_bindgen_futures::spawn_local(async move {
+            let _ = control.end_attempt(dialog).await;
+        });
         guard.transport.close_all();
         let events = guard.node.drain_events();
         for event in &events {
@@ -561,20 +593,80 @@ fn is_handshake_packet(bytes: &[u8]) -> bool {
         && net_wire::protocol::PacketFlags::from_bits(bytes[3]).is_handshake()
 }
 
-/// Poll until the DataChannel opens, trickling candidates outward,
+/// Pump the control plane, both directions.
+///
+/// Out: the candidates the browser gathered. In: the peer's
+/// candidates, the announcements a control plane delivered, and the
+/// signalling envelopes — which the **leaf** verifies, never the
+/// transport. One function, called from the connect wait and from
+/// the ticker, so the two cannot drift apart.
+async fn service_control_plane(inner: &Rc<RefCell<Inner>>) -> Result<(), LeafError> {
+    let (control, transport, dialog, anchor) = {
+        let guard = inner.borrow();
+        (
+            guard.control.clone(),
+            guard.transport.clone(),
+            guard.dialog,
+            guard.anchor,
+        )
+    };
+    for (peer, candidate) in transport.take_local_candidates() {
+        debug_assert_eq!(peer, anchor);
+        if let Err(e) = control.trickle(dialog, candidate).await {
+            console_error(&format!("net-mesh-leaf: trickle: {e}"));
+        }
+    }
+
+    let mut ended = None;
+    for event in control.drain_events() {
+        match event {
+            ControlEvent::Candidate {
+                dialog: for_dialog,
+                candidate,
+            } => {
+                if for_dialog != dialog {
+                    continue;
+                }
+                if let Err(e) = transport.add_remote_candidate(anchor, &candidate).await {
+                    console_error(&format!("net-mesh-leaf: remote candidate: {e}"));
+                }
+            }
+            ControlEvent::AttemptEnded {
+                dialog: for_dialog,
+                reason,
+            } => {
+                if for_dialog == dialog {
+                    ended = Some(reason);
+                }
+            }
+            ControlEvent::Announcement(announcement) => {
+                inner.borrow_mut().node.ingest_announcement(&announcement.0);
+            }
+            ControlEvent::Signal(envelope) => {
+                let now = clock::now();
+                inner.borrow_mut().node.accept_signal(envelope, now);
+            }
+        }
+    }
+
+    match ended {
+        Some(reason) => Err(LeafError::ControlPlane(reason)),
+        None => Ok(()),
+    }
+}
+
+/// Poll until the DataChannel opens, servicing the control plane,
 /// or fail with the corrected ICE typing.
 async fn wait_for_channel(inner: &Rc<RefCell<Inner>>, peer: NodeId) -> Result<(), JsError> {
     let mut waited = 0;
     while waited < ICE_DEADLINE_MS {
-        {
-            let guard = inner.borrow();
-            for (peer, candidate) in guard.transport.take_local_candidates() {
-                debug_assert_eq!(peer, guard.anchor);
-                send_local_candidate(&guard, &candidate);
-            }
-            if guard.transport.is_open(peer) {
-                return Ok(());
-            }
+        // Serviced before the first sleep: the listener sends its
+        // own candidate as the trickle socket's first frame, and
+        // applying it immediately is the head start S0b measured
+        // (6.6× gather-complete at the floor).
+        service_control_plane(inner).await.map_err(js)?;
+        if inner.borrow().transport.is_open(peer) {
+            return Ok(());
         }
         gloo_timer_sleep(TICK_MS).await.ok();
         waited += TICK_MS;
@@ -583,7 +675,7 @@ async fn wait_for_channel(inner: &Rc<RefCell<Inner>>, peer: NodeId) -> Result<()
     // The deadline passed. The HTTPS bootstrap demonstrably
     // succeeded (we have an answer), so the probe is the one thing
     // that can turn the classification.
-    let rtc_addr = inner.borrow().anchor_rtc_addr.clone();
+    let rtc_addr = inner.borrow().control.anchor_rtc_addr();
     let probe_failed = match &rtc_addr {
         Some(addr) => stun_probe_failed(addr).await,
         None => false,
@@ -599,6 +691,7 @@ async fn wait_for_channel(inner: &Rc<RefCell<Inner>>, peer: NodeId) -> Result<()
 async fn wait_for_session(inner: &Rc<RefCell<Inner>>, peer: NodeId) -> Result<(), JsError> {
     let mut waited = 0;
     while waited < ICE_DEADLINE_MS {
+        service_control_plane(inner).await.map_err(js)?;
         {
             let mut guard = inner.borrow_mut();
             guard.pump();
@@ -614,83 +707,8 @@ async fn wait_for_session(inner: &Rc<RefCell<Inner>>, peer: NodeId) -> Result<()
     )))
 }
 
-fn send_local_candidate(inner: &Inner, candidate: &IceCandidate) {
-    if let Some(socket) = &inner.trickle {
-        let message = serde_json::json!({
-            "candidate": candidate.candidate,
-            "mid": candidate.mid,
-        })
-        .to_string();
-        let _ = socket.send_with_str(&message);
-    }
-}
-
-/// Open `GET /rtc/trickle`, presenting the attempt token as the
-/// WebSocket subprotocol the listener requires.
-fn open_trickle(
-    bootstrap_url: &str,
-    node_id: NodeId,
-    dialog: u64,
-    attempt_token: &str,
-    inner: Weak<RefCell<Inner>>,
-) -> Result<WebSocket, JsError> {
-    let ws_url = format!(
-        "{}/rtc/trickle?dialog={dialog}&node_id={node_id:#x}",
-        bootstrap_url
-            .replacen("https://", "wss://", 1)
-            .replacen("http://", "ws://", 1)
-    );
-    let socket =
-        WebSocket::new_with_str(&ws_url, &format!("net-bootstrap-attempt.{attempt_token}"))
-            .map_err(|e| JsError::new(&format!("the trickle socket did not open: {e:?}")))?;
-
-    let on_message = Closure::wrap(Box::new(move |event: MessageEvent| {
-        let Some(text) = event.data().as_string() else {
-            return;
-        };
-        let Ok(document) = serde_json::from_str::<serde_json::Value>(&text) else {
-            return;
-        };
-        let Some(line) = document.get("candidate").and_then(|v| v.as_str()) else {
-            return;
-        };
-        let mid = document
-            .get("mid")
-            .and_then(|v| v.as_str())
-            .unwrap_or("0")
-            .to_string();
-        let Some(inner) = inner.upgrade() else {
-            return;
-        };
-        let (transport_peer, candidate) = {
-            let guard = inner.borrow();
-            (
-                guard.anchor,
-                IceCandidate {
-                    mid,
-                    candidate: line.to_string(),
-                },
-            )
-        };
-        wasm_bindgen_futures::spawn_local(async move {
-            // Clone the transport out and drop the borrow before
-            // awaiting: the pump borrows the same cell every tick.
-            let transport = inner.borrow().transport.clone();
-            if let Err(e) = transport
-                .add_remote_candidate(transport_peer, &candidate)
-                .await
-            {
-                console_error(&format!("net-mesh-leaf: remote candidate: {e}"));
-            }
-        });
-    }) as Box<dyn FnMut(MessageEvent)>);
-    socket.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
-    on_message.forget();
-    Ok(socket)
-}
-
-/// The periodic tick: deadlines and reassembly expiry keep moving on
-/// an otherwise silent connection.
+/// The periodic tick: the control plane is serviced, deadlines and
+/// reassembly expiry keep moving on an otherwise silent connection.
 fn start_ticker(inner: Weak<RefCell<Inner>>) {
     wasm_bindgen_futures::spawn_local(async move {
         loop {
@@ -698,6 +716,13 @@ fn start_ticker(inner: Weak<RefCell<Inner>>) {
             let Some(inner) = inner.upgrade() else {
                 return;
             };
+            if inner.try_borrow().is_ok_and(|guard| guard.closed) {
+                return;
+            }
+            // A control-plane failure after connect is not fatal to
+            // the node: the session outlives the bootstrap dialog,
+            // and the anchor closing it is normal.
+            let _ = service_control_plane(&inner).await;
             let Ok(mut guard) = inner.try_borrow_mut() else {
                 continue;
             };
@@ -709,55 +734,49 @@ fn start_ticker(inner: Weak<RefCell<Inner>>) {
     });
 }
 
-async fn http_get(url: &str) -> Result<String, JsError> {
-    let window = web_sys::window().ok_or_else(|| JsError::new("no window"))?;
-    let response = wasm_bindgen_futures::JsFuture::from(window.fetch_with_str(url))
-        .await
-        .map_err(|e| JsError::new(&format!("GET {url} failed: {e:?}")))?;
-    read_body(response, url).await
-}
-
-async fn http_post_json(url: &str, body: &str) -> Result<String, JsError> {
-    let window = web_sys::window().ok_or_else(|| JsError::new("no window"))?;
-    let init = web_sys::RequestInit::new();
-    init.set_method("POST");
-    init.set_body(&JsValue::from_str(body));
-    let headers = web_sys::Headers::new().map_err(|e| JsError::new(&format!("headers: {e:?}")))?;
-    headers
-        .set("content-type", "application/json")
-        .map_err(|e| JsError::new(&format!("content-type: {e:?}")))?;
-    init.set_headers(&headers);
-    let request = web_sys::Request::new_with_str_and_init(url, &init)
-        .map_err(|e| JsError::new(&format!("request: {e:?}")))?;
-    let response = wasm_bindgen_futures::JsFuture::from(window.fetch_with_request(&request))
-        .await
-        .map_err(|e| JsError::new(&format!("POST {url} failed: {e:?}")))?;
-    read_body(response, url).await
-}
-
-async fn read_body(response: JsValue, url: &str) -> Result<String, JsError> {
-    let response: web_sys::Response = response
-        .dyn_into()
-        .map_err(|_| JsError::new("fetch did not return a Response"))?;
-    let text = wasm_bindgen_futures::JsFuture::from(
-        response
-            .text()
-            .map_err(|e| JsError::new(&format!("body: {e:?}")))?,
-    )
-    .await
-    .map_err(|e| JsError::new(&format!("body: {e:?}")))?
-    .as_string()
-    .unwrap_or_default();
-    if !response.ok() {
-        // The listener's refusals are typed JSON; surface the body
-        // rather than only the status, or a `BootstrapRefusal`
-        // becomes "400".
-        return Err(JsError::new(&format!(
-            "{url} answered {}: {text}",
-            response.status()
-        )));
+/// The identity `connect` runs under.
+///
+/// Custodial when the host supplies one — the same shape as
+/// `MeshNodeConfig::entity_keypair` — generated from the platform
+/// CSPRNG otherwise. Both spellings are accepted because the page
+/// and the TS wrapper disagree about casing elsewhere in this wave.
+///
+/// **A key that is present but unusable is a hard failure.** Falling
+/// through to `generate()` is what made a dropped option look like a
+/// leaf ignoring custody, and "two tabs sharing one identity" is an
+/// exit criterion nobody can check if the fallback is silent.
+fn identity_from(opts: &JsValue) -> Result<LeafIdentity, JsError> {
+    let entity_hex = optional_string(opts, "entitySecretHex")
+        .or_else(|| optional_string(opts, "entity_secret_hex"));
+    let noise_hex = optional_string(opts, "noiseSecretHex")
+        .or_else(|| optional_string(opts, "noise_secret_hex"));
+    match (entity_hex, noise_hex) {
+        (None, None) => LeafIdentity::generate().map_err(js),
+        (None, Some(_)) => Err(JsError::new(
+            "noiseSecretHex was supplied without entitySecretHex: the Noise static \
+             is not an identity, and generating the entity half beside an injected \
+             Noise half would produce a node id the host did not choose",
+        )),
+        (Some(entity), noise) => {
+            let entity = secret32(&entity, "entitySecretHex")?;
+            let noise = match noise {
+                Some(hex) => secret32(&hex, "noiseSecretHex")?,
+                None => random32().map_err(js)?,
+            };
+            Ok(LeafIdentity::from_secrets(
+                EntityKeypair::from_secret(entity),
+                noise,
+            ))
+        }
     }
-    Ok(text)
+}
+
+/// A 32-byte secret from hex, or a failure naming the option.
+fn secret32(hex: &str, key: &str) -> Result<[u8; 32], JsError> {
+    crate::identity::unhex(hex)
+        .map_err(|e| JsError::new(&format!("{key} is not hex: {e}")))?
+        .try_into()
+        .map_err(|_| JsError::new(&format!("{key} must be 32 bytes")))
 }
 
 fn random32() -> crate::error::Result<[u8; 32]> {

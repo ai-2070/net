@@ -200,3 +200,80 @@ fn unhex(s: &str) -> Vec<u8> {
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex digit"))
         .collect()
 }
+
+/// The enrollment exchange's device-side objects, pinned.
+///
+/// This is the third and last of Stage 5's named second copies
+/// (`InviteToken` / `JoinRequest` / `JoinOutcome` live in
+/// `net-mesh-sdk`, which depends on the core and cannot be linked
+/// from wasm). The pin here is one-directional — see the fixture's
+/// own `description` for the SDK-side test that closes it — but the
+/// signature check below is not cosmetic: it reconstructs the join
+/// challenge from the decoded request, which is exactly what the
+/// anchor's provider does before it admits anyone.
+#[test]
+fn the_leaf_enrollment_encoder_reproduces_the_pinned_objects() {
+    use net_leaf::enroll::{build_join_request, join_challenge, Invite, JoinOutcome};
+    use net_leaf::identity::verify_entity_signature;
+
+    let document: serde_json::Value =
+        serde_json::from_str(test_vectors::ENROLL_EXCHANGE).expect("the fixture parses");
+
+    // The invite decodes to the root and nonce the fixture names.
+    let invite = Invite::decode(&unhex(field(&document, "/invite/invite_hex"))).expect("invite");
+    assert_eq!(hex(&invite.root), field(&document, "/invite/root"));
+    assert_eq!(hex(&invite.nonce), field(&document, "/invite/nonce"));
+    assert_eq!(
+        invite.rendezvous,
+        field(&document, "/invite/rendezvous"),
+        "the rendezvous must survive the length-prefixed round trip"
+    );
+
+    // The signed request reproduces the pinned bytes exactly.
+    let identity = fixture_identity();
+    let tags = vec!["browser".to_string(), "leaf".to_string()];
+    let body = build_join_request(&identity, "chrome-tab", &tags, &invite).expect("build");
+    assert_eq!(
+        hex(&body),
+        field(&document, "/join_request/join_request_hex"),
+        "the leaf's enrollment encoder drifted from the pinned request"
+    );
+    assert!(
+        body.len() <= 16 * 1024,
+        "the request must stay under §12's body bound"
+    );
+
+    // The device's self-signature verifies against a challenge
+    // rebuilt from the pinned bytes, not from the builder's inputs.
+    let device: [u8; 32] = body[4..36].try_into().expect("device id");
+    assert_eq!(hex(&device), field(&document, "/identity/device_entity_id"));
+    // magic(4) device(32) nonce(16) root(32) signature(64)
+    let signature: [u8; 64] = body[84..148].try_into().expect("signature");
+    let challenge = join_challenge(&device, "chrome-tab", &tags, &invite.nonce, &invite.root);
+    verify_entity_signature(&device, &challenge, &signature)
+        .expect("the pinned request's self-signature must verify");
+
+    // Both outcome shapes decode to what the fixture says they mean.
+    let admitted = JoinOutcome::decode(&unhex(field(&document, "/join_outcome/admitted_hex")))
+        .expect("admitted decodes");
+    assert_eq!(
+        admitted.into_chain().expect("tag 0 promotes"),
+        field(&document, "/join_outcome/admitted_chain_utf8")
+            .as_bytes()
+            .to_vec()
+    );
+    let rejected = JoinOutcome::decode(&unhex(field(&document, "/join_outcome/rejected_hex")))
+        .expect("rejected decodes");
+    let err = rejected
+        .into_chain()
+        .expect_err("tag 1 must leave the session provisional");
+    let text = format!("{err}");
+    assert!(
+        text.contains(field(&document, "/join_outcome/rejected_code_name")),
+        "the refusal must name its stable code: {text}"
+    );
+    assert!(
+        text.contains(field(&document, "/join_outcome/rejected_message_utf8")),
+        "the operator's message must survive: {text}"
+    );
+}

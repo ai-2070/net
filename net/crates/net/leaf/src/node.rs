@@ -188,6 +188,24 @@ pub struct LeafNode {
     peer_rtc_addr: HashMap<NodeId, String>,
     /// Subscribe nonces, so an Ack can be correlated.
     next_nonce: u64,
+    /// The delegation chain the anchor issued at enrollment. `None`
+    /// means the session is still PROVISIONAL, and §12 refuses
+    /// everything above the transport.
+    delegation_chain: Option<Vec<u8>>,
+    /// `(peer, reply-channel canonical hash)` this leaf has already
+    /// subscribed to.
+    ///
+    /// **Why a set and not a subscribe per call.** An anchor
+    /// publishes an nRPC RESPONSE on `<service>.replies.<origin>`
+    /// and forwards it only to subscribers, so a call whose reply
+    /// channel was never subscribed runs the handler and then
+    /// strands the reply — the caller sees a bare deadline. But
+    /// re-subscribing per call would put a `0x0A00` membership frame
+    /// on the wire per call, which §2's admission would rightly
+    /// start refusing under load. Once per (peer, service) is the
+    /// only correct cadence; cleared for a peer when its session
+    /// goes, because the anchor's roster entry goes with it.
+    reply_subscriptions: std::collections::HashSet<(NodeId, u64)>,
 }
 
 impl LeafNode {
@@ -212,6 +230,8 @@ impl LeafNode {
             announcement_version: 1,
             peer_rtc_addr: HashMap::new(),
             next_nonce: 1,
+            reply_subscriptions: std::collections::HashSet::new(),
+            delegation_chain: None,
         }
     }
 
@@ -291,6 +311,49 @@ impl LeafNode {
         Ok(())
     }
 
+    /// Accept a peer's NKpsk0 message 1 as **responder**, returning
+    /// the message-2 packet to put on the wire.
+    ///
+    /// §9's browser ↔ browser attempt has no anchor to be the
+    /// responder, so one of the two leaves answers with its own
+    /// Noise static key. Both halves of the discipline the
+    /// initiator has apply here: the PSK is the trust domain's, and
+    /// the initiator's claimed node id enters the handshake
+    /// **prologue** — the same binding `MeshNode::accept_rtc` makes
+    /// for a browser's claimed id — so the installed session is
+    /// bound to the id it is keyed under and a peer that claimed a
+    /// different one cannot complete.
+    ///
+    /// `slot` is the transport slot the DataChannel occupies, the
+    /// same value [`Self::begin_handshake`] takes.
+    pub fn accept_handshake(
+        &mut self,
+        peer: NodeId,
+        psk: &[u8; 32],
+        msg1: &[u8],
+        slot: u32,
+    ) -> Result<Bytes> {
+        let (session, msg2) = PendingHandshake::respond(
+            psk,
+            self.identity.noise(),
+            peer,
+            self.identity.node_id(),
+            rtc_addr(slot, 1),
+            msg1,
+        )?;
+        // A responder that already had a session with this peer is
+        // being re-offered: §9 step 4 replaces rather than joins,
+        // and the table is keyed on identity precisely so that is a
+        // table update.
+        self.sessions.install(session);
+        self.events.push(LeafEvent::Connected {
+            node_id: self.identity.node_id(),
+            peer_node: peer,
+            rtc_addr: self.peer_rtc_addr.get(&peer).cloned(),
+        });
+        Ok(msg2)
+    }
+
     /// Tear down the session with `peer`.
     ///
     /// Pending calls on it fail [`RpcError::SessionLost`] — typed,
@@ -301,6 +364,9 @@ impl LeafNode {
         self.rx_streams.retain(|(p, _), _| *p != peer);
         self.calls.fail_peer(peer);
         self.call_routes.retain(|_, (p, _)| *p != peer);
+        // The anchor's roster entry died with the session, so a
+        // reconnect must re-subscribe or its replies strand again.
+        self.reply_subscriptions.retain(|(p, _)| *p != peer);
         self.events.push(LeafEvent::Disconnected {
             peer_node: peer,
             reason: reason.into(),
@@ -492,6 +558,19 @@ impl LeafNode {
         // The route discriminator is the CANONICAL u64 hash of the
         // channel the frame rides, not the u16 bucket.
         let route = request.canonical();
+
+        // **Subscribe to the reply channel before the REQUEST goes
+        // out.** An anchor forwards an nRPC RESPONSE only to
+        // subscribers of `<service>.replies.<origin>`, so without
+        // this the handler runs, the reply is published, nothing
+        // routes it here, and the caller sees `rpc: the call's
+        // deadline elapsed` — indistinguishable from a service that
+        // never answered. Once per (peer, service): the membership
+        // frame is reliable and ordered ahead of the REQUEST on the
+        // same channel, and re-sending it per call would be traffic
+        // §2's admission should refuse.
+        self.ensure_reply_subscription(peer, service)?;
+
         let timeout_ms = timeout_ms.unwrap_or(DEFAULT_CALL_TIMEOUT_MS);
         let (call_id, receiver) = self
             .calls
@@ -523,10 +602,97 @@ impl LeafNode {
         Ok(receiver)
     }
 
+    /// Subscribe to `service`'s reply channel on `peer`, unless this
+    /// leaf already has.
+    ///
+    /// Idempotent per `(peer, service)`. Returns whether a
+    /// membership frame was queued, so a test can assert the
+    /// cadence rather than infer it from packet counts.
+    pub fn ensure_reply_subscription(&mut self, peer: NodeId, service: &str) -> Result<bool> {
+        let reply = reply_channel(service, self.identity.origin_hash())?;
+        let key = (peer, net_wire::channel::name::channel_hash(reply.as_str()));
+        if self.reply_subscriptions.contains(&key) {
+            return Ok(false);
+        }
+        self.subscribe(peer, reply.as_str())?;
+        // Recorded only after the frame is queued: a refused
+        // subscribe must not mark the channel as subscribed, or
+        // every later call on it strands its reply silently.
+        self.reply_subscriptions.insert(key);
+        Ok(true)
+    }
+
     /// The reply channel this leaf must be subscribed to before a
     /// call to `service` can be answered.
     pub fn reply_channel_for(&self, service: &str) -> Result<String> {
         reply_channel(service, self.identity.origin_hash()).map(|c| c.as_str().to_string())
+    }
+
+    /// **The enrollment exchange** — the nRPC client's first caller,
+    /// and the step that promotes the session out of provisional.
+    ///
+    /// Two packets, in this order, both reliable on the same
+    /// DataChannel so the anchor sees them in order:
+    ///
+    /// 1. a `0x0A00` Subscribe to `net.mesh.enroll.replies.<our
+    ///    origin>` — §12 permits exactly this one channel, with no
+    ///    token and no queue group, and the anchor cannot publish
+    ///    the reply until our roster entry exists;
+    /// 2. the nRPC REQUEST to `net.mesh.enroll` carrying a signed
+    ///    [`JoinRequest`](crate::enroll::build_join_request).
+    ///
+    /// Returns the call's receiver. Feed the reply body to
+    /// [`Self::finish_enrollment`].
+    ///
+    /// Nothing here retries. The invite is single-use, so a silent
+    /// retry would burn it and turn a legible refusal into an
+    /// illegible `REPLAY`.
+    pub fn begin_enrollment(
+        &mut self,
+        peer: NodeId,
+        invite: &crate::enroll::Invite,
+        device_name: &str,
+        tags: &[String],
+        timeout_ms: Option<u64>,
+    ) -> Result<CallResult> {
+        invite.validate_at(clock::now_unix_secs())?;
+        let body = crate::enroll::build_join_request(&self.identity, device_name, tags, invite)?;
+
+        // `call` subscribes to the reply channel itself — the
+        // enrollment special case turned out to BE the general case
+        // (MergedRunner's defect 1). The reply channel is
+        // origin-bound: `authorize_subscribe` admits a subscriber
+        // only to the name carrying its own origin, and §12's
+        // allow-list checks the same equality, so the name is
+        // derived and never taken from a caller.
+        self.call(peer, crate::enroll::ENROLL_SERVICE, &body, timeout_ms)
+    }
+
+    /// Parse an enrollment reply and record the delegation chain.
+    ///
+    /// `Ok(chain)` means the anchor admitted this leaf and the
+    /// session is no longer provisional. A refusal comes back as a
+    /// typed [`LeafError::Identity`] naming the stable reject code
+    /// and the operator's message — never as a timeout, and never
+    /// swallowed into a "connected anyway".
+    pub fn finish_enrollment(&mut self, reply: &[u8]) -> Result<Vec<u8>> {
+        let chain = crate::enroll::JoinOutcome::decode(reply)?.into_chain()?;
+        self.delegation_chain = Some(chain.clone());
+        Ok(chain)
+    }
+
+    /// Whether this leaf holds an admitted delegation chain.
+    ///
+    /// `false` means the session is still provisional, which is the
+    /// single fact that explains a `call` dying on its deadline with
+    /// the service's handler never having run.
+    pub fn is_enrolled(&self) -> bool {
+        self.delegation_chain.is_some()
+    }
+
+    /// The delegation chain the anchor issued, if any.
+    pub fn delegation_chain(&self) -> Option<&[u8]> {
+        self.delegation_chain.as_deref()
     }
 
     /// Build and sign this leaf's announcement, bumping its version.
@@ -700,7 +866,9 @@ impl LeafNode {
             Decoded::Announcement(bytes) | Decoded::Fold(bytes) => {
                 self.ingest_announcement(&bytes);
             }
-            Decoded::Signal(envelope) => self.handle_signal(envelope, now),
+            Decoded::Signal(envelope) => {
+                self.accept_signal(envelope, now);
+            }
             // The wire crate's stream state owns credit and
             // retransmission; the leaf applies grants to it.
             Decoded::StreamWindow(grant) => {
@@ -765,32 +933,63 @@ impl LeafNode {
 
     /// A `0x0D02` envelope: verify against the announcement we hold
     /// for the sender, then admit it once.
-    fn handle_signal(&mut self, envelope: SignalEnvelope, _now: Instant) {
+    ///
+    /// `true` means admitted and [`LeafEvent::Signal`] was pushed;
+    /// `false` means refused, with [`DropReason::SignalRejected`]
+    /// counted and [`LeafEvent::Dropped`] pushed.
+    ///
+    /// **Public because the control plane is the other carrier.**
+    /// §9 routes signalling through
+    /// [`ControlPlane::signal`](crate::control_plane::ControlPlane::signal),
+    /// not the data path, so an envelope can arrive without ever
+    /// passing through the dispatcher. One implementation serves
+    /// both carriers: a parallel one behind the control plane would
+    /// be weaker than this one the first time a step was forgotten,
+    /// and the four steps are the whole security argument —
+    ///
+    /// 1. an announcement must exist for `envelope.from`, or there
+    ///    is nothing to verify against and accepting would make the
+    ///    carrier trusted (§5 Layer 1: key discovery precedes
+    ///    signalling in both the native and the serverless world);
+    /// 2. [`signal::verify`] — the signature, `to == self_node`,
+    ///    and both ends of the `not_after` window;
+    /// 3. [`SeenSignals::admit`] — one `(from, dialog, kind)` per
+    ///    window, so an observer cannot re-offer a still-valid
+    ///    envelope and restart an abandoned dialog;
+    /// 4. any failure counts and surfaces, never silently drops.
+    ///
+    /// `now` is accepted and unused: the window is wall-clock
+    /// (`not_after` is unix seconds) while the caller's reading is
+    /// monotonic. Keeping the parameter means the signature does
+    /// not change when a caller starts threading one clock read
+    /// through a batch.
+    pub fn accept_signal(&mut self, envelope: SignalEnvelope, _now: Instant) -> bool {
         let now_secs = clock::now_unix_secs();
         let Some(announcement) = self.announcements.get(envelope.from) else {
-            // §5 Layer 1: key discovery precedes signalling. With
-            // no announcement there is nothing to verify against,
-            // and accepting it would make the carrier trusted.
+            // Step 1.
             self.reject_signal();
-            return;
+            return false;
         };
         let Ok(entity_bytes) = unhex(&announcement.entity_id) else {
             self.reject_signal();
-            return;
+            return false;
         };
         let Ok(entity_id) = <[u8; 32]>::try_from(entity_bytes.as_slice()) else {
             self.reject_signal();
-            return;
+            return false;
         };
+        // Step 2.
         if signal::verify(&envelope, &entity_id, self.identity.node_id(), now_secs).is_err() {
             self.reject_signal();
-            return;
+            return false;
         }
+        // Step 3.
         if !self.seen_signals.admit(&envelope, now_secs) {
             self.reject_signal();
-            return;
+            return false;
         }
         self.events.push(LeafEvent::Signal(envelope));
+        true
     }
 
     fn reject_signal(&mut self) {
@@ -943,6 +1142,16 @@ mod tests {
         )
     }
 
+    /// Decrypt one packet the leaf built, as the anchor would.
+    fn decrypt(anchor: &NetSession, parsed: &ParsedPacket) -> Bytes {
+        let aad = parsed.header.aad();
+        let counter = u64::from_le_bytes(parsed.header.nonce[4..12].try_into().expect("nonce"));
+        anchor
+            .rx_cipher()
+            .decrypt_to_bytes(counter, &aad, parsed.payload.clone())
+            .expect("the anchor decrypts")
+    }
+
     #[test]
     fn the_handshake_emits_a_connected_event_carrying_the_published_rtc_addr() {
         let (mut node, _anchor) = connected();
@@ -1023,10 +1232,20 @@ mod tests {
             .call(ANCHOR, "net.mesh.enroll", b"join request", Some(5_000))
             .expect("call");
         let out = node.take_outbound();
-        assert_eq!(out.len(), 1);
+        // TWO packets: the reply-channel Subscribe, then the
+        // REQUEST. MergedRunner's defect 1 was this first packet
+        // missing — the anchor forwards a RESPONSE only to
+        // subscribers, so the handler ran and the reply stranded,
+        // and the caller saw a bare deadline.
+        assert_eq!(out.len(), 2, "a first call must subscribe before it asks");
+        let subscribe = ParsedPacket::parse(out[0].packet.clone(), rtc_addr(0, 1)).expect("parses");
+        assert_eq!(
+            subscribe.header.subprotocol_id, 0x0A00,
+            "the membership frame must be ordered ahead of the REQUEST"
+        );
 
         // Read the call_id off the wire, exactly as the anchor would.
-        let parsed = ParsedPacket::parse(out[0].packet.clone(), rtc_addr(0, 1)).expect("parses");
+        let parsed = ParsedPacket::parse(out[1].packet.clone(), rtc_addr(0, 1)).expect("parses");
         let aad = parsed.header.aad();
         let counter = u64::from_le_bytes(parsed.header.nonce[4..12].try_into().expect("nonce"));
         let plain = anchor
@@ -1073,6 +1292,64 @@ mod tests {
             .expect("resolved");
         assert_eq!(outcome.expect("Ok"), Bytes::from_static(b"NMO1"));
         assert_eq!(node.counters().total_drops(), 0);
+    }
+
+    /// **The cadence, which is the other half of defect 1's fix.**
+    ///
+    /// Subscribing per call would be correct and unusable: a
+    /// membership frame per call is traffic §2's admission should
+    /// refuse under load. Subscribing once and never again after a
+    /// reconnect would be the original bug with extra steps, because
+    /// the anchor's roster entry dies with the session. Both
+    /// properties in one test.
+    #[test]
+    fn the_reply_channel_is_subscribed_once_per_service_and_again_after_a_reconnect() {
+        let (mut node, _anchor) = connected();
+        node.drain_events();
+
+        let _first = node
+            .call(ANCHOR, "app.orders", b"a", Some(60_000))
+            .expect("call");
+        assert_eq!(
+            node.take_outbound().len(),
+            2,
+            "the first call subscribes then asks"
+        );
+
+        let _second = node
+            .call(ANCHOR, "app.orders", b"b", Some(60_000))
+            .expect("call");
+        assert_eq!(
+            node.take_outbound().len(),
+            1,
+            "a second call on the same service must NOT re-subscribe"
+        );
+
+        // A different service is a different reply channel.
+        let _other = node
+            .call(ANCHOR, "app.invoices", b"c", Some(60_000))
+            .expect("call");
+        assert_eq!(
+            node.take_outbound().len(),
+            2,
+            "each service has its own reply channel"
+        );
+
+        // The session dies: the anchor's roster entry died with it,
+        // so a reconnect must re-subscribe or every later reply
+        // strands silently.
+        node.drop_session(ANCHOR, "channel closed");
+        node.drain_events();
+        let (mut node, _anchor) = connected();
+        node.drain_events();
+        let _after = node
+            .call(ANCHOR, "app.orders", b"d", Some(60_000))
+            .expect("call");
+        assert_eq!(
+            node.take_outbound().len(),
+            2,
+            "a reconnected session must subscribe again"
+        );
     }
 
     /// The §8 rule end to end: losing the session fails the call
@@ -1305,6 +1582,248 @@ mod tests {
         let packet = anchor_packet(&anchor, 0x0D02, 0x0D02, 0, true, &bytes);
         node.on_datagram(ANCHOR, packet, clock::now());
         assert_eq!(node.counters().drops(DropReason::SignalRejected), 2);
+    }
+
+    /// **The bug MergedRunner found, as a regression test.**
+    ///
+    /// Before this, `connect()` completed the handshake and stopped,
+    /// so the anchor left the peer PROVISIONAL and §12 refused every
+    /// call, publish and announcement above the transport — which
+    /// reached the caller as nothing at all and then a deadline.
+    /// This asserts the exchange that promotes the session: exactly
+    /// two packets, in order, with the shapes §12's allow-list
+    /// admits.
+    #[test]
+    fn enrollment_emits_the_subscribe_then_the_request_and_promotes_on_admission() {
+        let (mut node, anchor) = connected();
+        node.drain_events();
+        assert!(
+            !node.is_enrolled(),
+            "a freshly handshaken session is provisional"
+        );
+
+        let invite = crate::enroll::Invite {
+            root: [0x77; 32],
+            nonce: [0x5A; 16],
+            expires_at: clock::now_unix_secs() + 600,
+            rendezvous: "https://anchor.example/rtc".into(),
+        };
+        let mut rx = node
+            .begin_enrollment(ANCHOR, &invite, "chrome-tab", &[], Some(5_000))
+            .expect("begin enrollment");
+
+        let out = node.take_outbound();
+        assert_eq!(
+            out.len(),
+            2,
+            "enrollment is a Subscribe then a REQUEST — the anchor cannot \
+             publish the reply before our roster entry exists"
+        );
+
+        // Packet 1: the 0x0A00 Subscribe, on OUR origin-bound reply
+        // channel, with no token and no queue group. Anything else
+        // and §12 refuses it.
+        let first = ParsedPacket::parse(out[0].packet.clone(), rtc_addr(0, 1)).expect("parses");
+        assert_eq!(first.header.subprotocol_id, 0x0A00);
+        let expected_reply = format!(
+            "net.mesh.enroll.replies.{:016x}",
+            node.identity().origin_hash()
+        );
+        let reply = Channel::new(&expected_reply).expect("valid");
+        assert_eq!(first.header.channel_hash, reply.wire_hash());
+        let plain = decrypt(&anchor, &first);
+        let events = EventFrame::read_events(plain, first.header.event_count);
+        match net_wire::channel::membership::decode(&events[0]).expect("decodes") {
+            net_wire::channel::membership::MembershipMsg::Subscribe {
+                channel,
+                token,
+                queue_group,
+                ..
+            } => {
+                assert_eq!(channel.as_str(), expected_reply);
+                assert!(token.is_none(), "§12 refuses a Subscribe carrying a token");
+                assert!(
+                    queue_group.is_none(),
+                    "§12 refuses a Subscribe carrying a queue group"
+                );
+            }
+            other => panic!("expected a Subscribe, got {other:?}"),
+        }
+
+        // Packet 2: the nRPC REQUEST for net.mesh.enroll, whose body
+        // is a signed JoinRequest under the 16 KiB bound.
+        let second = ParsedPacket::parse(out[1].packet.clone(), rtc_addr(0, 1)).expect("parses");
+        assert_eq!(second.header.subprotocol_id, 0, "the event plane");
+        let plain = decrypt(&anchor, &second);
+        let frames = EventFrame::read_events(plain, second.header.event_count);
+        let meta = EventMeta::from_bytes(&frames[0]).expect("meta");
+        assert_eq!(meta.dispatch, crate::rpc_wire::DISPATCH_RPC_REQUEST);
+        assert_eq!(
+            meta.origin_hash,
+            node.identity().origin_hash(),
+            "§12 derives the permitted reply channel from THIS field"
+        );
+        let body = &frames[0][crate::rpc_wire::RPC_FRAME_BODY_OFFSET..];
+        let service_len = body[0] as usize;
+        assert_eq!(
+            &body[1..1 + service_len],
+            crate::enroll::ENROLL_SERVICE.as_bytes(),
+            "the one service a provisional session may call"
+        );
+
+        // The anchor admits, on the reply channel.
+        let mut outcome = Vec::new();
+        outcome.extend_from_slice(b"NMO1");
+        outcome.push(0);
+        outcome.extend_from_slice(&(11u32).to_le_bytes());
+        outcome.extend_from_slice(b"chain-bytes");
+
+        let mut response = Vec::new();
+        response.extend_from_slice(
+            &EventMeta::new(DISPATCH_RPC_RESPONSE, 0, 1, meta.seq_or_ts, 0).to_bytes(),
+        );
+        response.extend_from_slice(&reply.canonical().to_le_bytes());
+        response.extend_from_slice(&RpcStatus::Ok.to_wire().to_le_bytes());
+        response.push(0);
+        response.extend_from_slice(&(outcome.len() as u32).to_le_bytes());
+        response.extend_from_slice(&outcome);
+
+        let packet = anchor_packet(
+            &anchor,
+            reply.publish_stream_id(),
+            0,
+            reply.wire_hash(),
+            true,
+            &response,
+        );
+        node.on_datagram(ANCHOR, packet, clock::now());
+
+        let body = rx
+            .try_recv()
+            .expect("alive")
+            .expect("resolved")
+            .expect("admitted");
+        let chain = node.finish_enrollment(&body).expect("admitted");
+        assert_eq!(chain, b"chain-bytes".to_vec());
+        assert!(
+            node.is_enrolled(),
+            "an admitted outcome must promote the session out of provisional"
+        );
+    }
+
+    /// A refusal is typed and does not promote. The four witnesses
+    /// this bug reddened all read as deadlines; a rejection must
+    /// read as a rejection.
+    #[test]
+    fn a_rejected_enrollment_is_typed_and_does_not_promote() {
+        let (mut node, _anchor) = connected();
+        node.drain_events();
+        let mut outcome = Vec::new();
+        outcome.extend_from_slice(b"NMO1");
+        outcome.push(1);
+        outcome.extend_from_slice(&5u16.to_le_bytes()); // REPLAY
+        outcome.extend_from_slice(&(6u32).to_le_bytes());
+        outcome.extend_from_slice(b"redone");
+
+        let err = node
+            .finish_enrollment(&outcome)
+            .expect_err("a rejection is an error, not a silent continue");
+        let text = format!("{err}");
+        assert!(text.contains("replay"), "{text}");
+        assert!(text.contains("redone"), "{text}");
+        assert!(!node.is_enrolled());
+    }
+
+    /// An expired invite is refused before anything hits the wire,
+    /// so the failure names the invite instead of arriving as a
+    /// rejection minutes later.
+    #[test]
+    fn an_expired_invite_is_refused_before_a_packet_is_built() {
+        let (mut node, _anchor) = connected();
+        node.drain_events();
+        let invite = crate::enroll::Invite {
+            root: [0x77; 32],
+            nonce: [0x5A; 16],
+            expires_at: 1,
+            rendezvous: String::new(),
+        };
+        let err = node
+            .begin_enrollment(ANCHOR, &invite, "tab", &[], None)
+            .expect_err("an expired invite must be refused");
+        assert!(format!("{err}").contains("expired"), "{err}");
+        assert!(
+            node.take_outbound().is_empty(),
+            "nothing may reach the wire for an invite that cannot be redeemed"
+        );
+    }
+
+    /// **A far-end test, added because the rule earned it.**
+    ///
+    /// `open_stream`'s `stream_id` / `channel_hash` overrides exist
+    /// for one reason: without them a fire-and-forget stream's
+    /// payload never reaches a native node's real handler, because
+    /// the anchor dispatches on the stream id and channel hint the
+    /// publish contract derives — so the witness would observe a
+    /// counter instead of a handler. Asserting the returned
+    /// `StreamHandle` would be a NEAR-end test and would pass even
+    /// if the values were dropped on the way to the header. This
+    /// asserts them where they have to arrive: on the wire.
+    #[test]
+    fn stream_overrides_arrive_on_the_packet_header_not_just_on_the_handle() {
+        let (mut node, anchor) = connected();
+        node.drain_events();
+
+        let handle = node
+            .open_stream(
+                ANCHOR,
+                "ignored-when-overridden",
+                Reliability::FireAndForget,
+                Some(0x0001_0000_DEAD_BEEF),
+                Some(0xC0DE),
+            )
+            .expect("open");
+        node.stream_send(handle, b"loss-witness payload")
+            .expect("send");
+
+        let out = node.take_outbound();
+        assert_eq!(out.len(), 1);
+        let parsed = ParsedPacket::parse(out[0].packet.clone(), rtc_addr(0, 1)).expect("parses");
+        assert_eq!(
+            parsed.header.stream_id, 0x0001_0000_DEAD_BEEF,
+            "the caller's stream id must ride verbatim, or the anchor never \
+             dispatches the frame"
+        );
+        assert_eq!(
+            parsed.header.channel_hash, 0xC0DE,
+            "the caller's channel hint must ride verbatim"
+        );
+        assert!(
+            !parsed.header.flags.is_reliable(),
+            "fire-and-forget must clear the wire RELIABLE flag, or injected \
+             loss is retransmitted away and the witness passes for the \
+             wrong reason"
+        );
+        let plain = decrypt(&anchor, &parsed);
+        let events = EventFrame::read_events(plain, parsed.header.event_count);
+        assert_eq!(
+            &events[0][..],
+            b"loss-witness payload",
+            "the payload rides as one event with no leaf-added framing"
+        );
+
+        // And with no overrides, the derivation applies instead —
+        // the bit-49 space that cannot alias a publish stream.
+        let derived = node
+            .open_stream(ANCHOR, "app/telemetry", Reliability::Reliable, None, None)
+            .expect("open");
+        node.stream_send(derived, b"x").expect("send");
+        let out = node.take_outbound();
+        let parsed = ParsedPacket::parse(out[0].packet.clone(), rtc_addr(0, 1)).expect("parses");
+        assert_eq!(
+            parsed.header.stream_id,
+            crate::stream::stream_id_from_label("app/telemetry")
+        );
+        assert!(parsed.header.flags.is_reliable());
     }
 
     #[test]

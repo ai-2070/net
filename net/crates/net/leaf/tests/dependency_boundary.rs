@@ -98,12 +98,12 @@ fn the_leaf_depends_on_the_wire_crate_and_nothing_native() {
     // Each of these would either fail to build for wasm32 or defeat
     // the reason the crate exists.
     for forbidden in [
-        "net-mesh =",      // the core: tokio, sockets, the route table
-        "net-mesh-sdk",    // likewise
-        "tokio =",         // no runtime in a browser tab
-        "ring =",          // needs a wasm32-targeting clang (S0a)
-        "str0m =",         // the native RTC driver; the leaf uses web_sys
-        "parking_lot =",   // the leaf is single-threaded (S0b: main thread)
+        "net-mesh =",    // the core: tokio, sockets, the route table
+        "net-mesh-sdk",  // likewise
+        "tokio =",       // no runtime in a browser tab
+        "ring =",        // needs a wasm32-targeting clang (S0a)
+        "str0m =",       // the native RTC driver; the leaf uses web_sys
+        "parking_lot =", // the leaf is single-threaded (S0b: main thread)
     ] {
         assert!(
             !manifest.contains(forbidden),
@@ -113,17 +113,57 @@ fn the_leaf_depends_on_the_wire_crate_and_nothing_native() {
     }
 }
 
-/// `web_sys` is confined to the two modules that need it.
+/// `web_sys` is confined to the modules that must reach the browser.
 ///
 /// Everything else compiles and is tested natively, which is what
 /// keeps the wire-level logic reviewable without a browser. A
 /// `web_sys` import leaking into `session`, `dispatch`, `frame`,
 /// `stream`, `rpc` or `announce` would move protocol behaviour out
 /// of the native suite's reach one line at a time.
+///
+/// `anchor_control_plane` is on the list because the v1 control
+/// plane *is* HTTPS plus a WebSocket. `mock_control_plane` is
+/// deliberately NOT on it: the anchorless mock is in-memory and
+/// needs no browser at all, and keeping it under the guard is what
+/// stops it quietly growing one — a mock that reached the network
+/// would prove nothing about being anchorless.
 #[test]
 fn web_sys_is_confined_to_the_transport_and_the_bindgen_surface() {
     let src = manifest_dir().join("src");
-    let allowed = ["rtc.rs", "wasm.rs", "bootstrap.rs"];
+    // Every entry here is a module that CANNOT be written without
+    // the browser, and the list is kept at exactly that. It has
+    // been tightened twice: `mock_control_plane.rs` came off it
+    // because the anchorless mock turned out to need no
+    // `wasm_bindgen` at all — which is the stronger position, since
+    // a mock that reached the browser could not prove anything
+    // about being anchorless — and `leader.rs` came off it because
+    // §8's browser session was split into `leader_session.rs`,
+    // restoring this guard's protection over the lifecycle logic
+    // (the interruption budget, pending-call disposition, stream
+    // and subscription restoration, and stale-leader fencing) that
+    // a per-file allow-list would otherwise have left to a
+    // convention.
+    let allowed = [
+        // The RTC transport and the bindgen surface.
+        "rtc.rs",
+        "wasm.rs",
+        // Layer 0: the bootstrap listener is HTTPS plus a
+        // WebSocket, and the STUN probe needs a real
+        // `RTCPeerConnection`.
+        "bootstrap.rs",
+        "anchor_control_plane.rs",
+        // §8's at-rest identity: IndexedDB plus a non-extractable
+        // WebCrypto AES-GCM key. There is no native equivalent to
+        // test against, which is why the *format* of what it
+        // stores stays decided in `identity.rs`, on this side of
+        // the line, where it is natively testable.
+        "storage.rs",
+        // §8's browser session: the Web Lock, the
+        // `BroadcastChannel` transport adapter and the follower
+        // proxy's bindgen types. The lifecycle logic above it is
+        // in `leader.rs`, which this guard still protects.
+        "leader_session.rs",
+    ];
     let mut checked = 0;
     for entry in std::fs::read_dir(&src).expect("src is readable") {
         let path = entry.expect("dir entry").path();

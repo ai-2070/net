@@ -55,17 +55,19 @@ pub struct IceCandidate {
 }
 
 /// What the leaf gets back when a control plane accepts its offer.
+///
+/// Candidates are **not** here. The one v1 implementation learns the
+/// anchor's first candidate from the trickle socket's first frame
+/// (`rtc_bootstrap.rs` sends it there, not in the offer response),
+/// and the anchorless path carries every candidate as a signed
+/// [`SignalEnvelope`] — so both worlds deliver candidates through
+/// [`ControlEvent`] and nothing had a candidate to put here.
 #[derive(Debug, Clone)]
 pub struct BootstrapAccepted {
     /// The dialog this attempt owns.
     pub dialog: DialogId,
     /// The answer to install as the remote description.
     pub answer: Sdp,
-    /// The peer's first candidate, when the implementation had one to
-    /// give immediately. `AnchorControlPlane` fills this from the
-    /// offer response so a browser can start checks while it is still
-    /// gathering.
-    pub first_candidate: Option<IceCandidate>,
     /// The peer's Noise static public key, **pinned by whatever
     /// authenticated this attempt** — for `AnchorControlPlane`, the
     /// bootstrap credential. The leaf handshakes against exactly this
@@ -154,7 +156,10 @@ pub struct SignalEnvelope {
 }
 
 /// The `0x0D02` message kinds, as the envelope carries them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// `Ord` so a set of kinds has one printed order: the anchorless
+// mock's accounting ledger is an assertion, and an assertion that
+// reordered between runs would be useless.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SignalKind {
     /// An SDP offer.
     Offer,
@@ -204,17 +209,26 @@ impl SignalEnvelope {
 /// on it, publish and receive announcements, and carry signalling for
 /// a peer with no session yet.
 pub trait ControlPlane {
-    /// Offer to whoever this control plane fronts, and get an
+    /// Offer to **whatever this control plane fronts**, and get an
     /// accepted attempt back.
     ///
-    /// For `AnchorControlPlane` the peer is the anchor itself. For a
-    /// peer-to-peer attempt the offer travels as a
-    /// [`SignalEnvelope`]; `peer` names it.
-    fn offer(
-        &self,
-        peer: Option<NodeId>,
-        offer: Sdp,
-    ) -> impl Future<Output = Result<BootstrapAccepted, LeafError>>;
+    /// One argument, not two. The earlier shape took
+    /// `peer: Option<NodeId>` and promised that `Some(peer)` would
+    /// travel as a [`SignalEnvelope`] — a promise no control plane
+    /// can keep, because an envelope is signed by the *leaf's*
+    /// entity key and a carrier holds no key to sign with. A carrier
+    /// that minted an offer on a leaf's behalf would be precisely
+    /// the trusted relay the envelope exists to remove.
+    ///
+    /// So: this is the front door and nothing else. For
+    /// `AnchorControlPlane` the peer is the anchor, authenticated by
+    /// the bootstrap credential, which is also what pins
+    /// [`BootstrapAccepted::peer_static`]. A peer-to-peer attempt is
+    /// [`ControlPlane::signal`] in both directions, and a control
+    /// plane that fronts nobody — the serverless room object, the
+    /// anchorless mock — refuses this call by contract rather than
+    /// inventing an authority it does not have.
+    fn offer(&self, offer: Sdp) -> impl Future<Output = Result<BootstrapAccepted, LeafError>>;
 
     /// Send one local candidate for a live attempt.
     fn trickle(

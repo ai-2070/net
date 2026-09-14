@@ -23,7 +23,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 
 use bytes::Bytes;
-use net_wire::crypto::{handshake_prologue, NoiseHandshake};
+use net_wire::crypto::{handshake_prologue, NoiseHandshake, StaticKeypair};
 use net_wire::parsed_packet::ParsedPacket;
 use net_wire::peer_addr::{PeerAddr, RtcPeerId};
 use net_wire::pool::PacketBuilder;
@@ -141,6 +141,77 @@ impl PendingHandshake {
             session: NetSession::new(keys, self.addr, POOL_SIZE, false),
             next_fragment_id: Cell::new(1),
         })
+    }
+
+    /// The **responder** half: consume a peer's Noise message 1 and
+    /// return the installed session together with the message-2
+    /// packet to put on the wire.
+    ///
+    /// §9 needs this and the anchor never did: a browser ↔ browser
+    /// attempt has no anchor to be the responder, so one of the two
+    /// leaves answers. There is no `PendingHandshake` to hold in
+    /// between — NKpsk0's responder finishes on message 1 — which is
+    /// why this returns a `LeafSession` directly rather than a
+    /// two-step type.
+    ///
+    /// **The two things that keep this as strong as the initiator
+    /// half.** The PSK is the trust domain's, so an attempt from
+    /// outside it fails the MAC; and `initiator` — a *claim*, since
+    /// nothing has authenticated it yet — goes into the
+    /// **prologue**, exactly as `MeshNode::accept_rtc` puts a
+    /// browser's claimed node id there. A peer that claimed one node
+    /// id and is treated as another cannot complete the handshake,
+    /// so the session this installs is bound to the id it is keyed
+    /// under. The responder's own static key is its identity's,
+    /// never a key read off the wire.
+    pub fn respond(
+        psk: &[u8; 32],
+        static_keypair: &StaticKeypair,
+        initiator: NodeId,
+        self_node: NodeId,
+        addr: PeerAddr,
+        msg1: &[u8],
+    ) -> Result<(LeafSession, Bytes)> {
+        // The initiator computed `prologue(self, peer)`, so the
+        // responder's order is (initiator, us). Getting this
+        // backwards fails with a MAC error and no clue, which is why
+        // both halves live in one module.
+        let prologue = handshake_prologue(routing_id(initiator), routing_id(self_node));
+        let mut handshake = NoiseHandshake::responder_with_prologue(psk, static_keypair, &prologue)
+            .map_err(|e| LeafError::Session(format!("responder handshake state: {e}")))?;
+
+        let parsed = ParsedPacket::parse(Bytes::copy_from_slice(msg1), addr)
+            .ok_or_else(|| LeafError::Wire("message 1 did not parse as a packet".into()))?;
+        if !parsed.header.flags.is_handshake() {
+            return Err(LeafError::Wire(
+                "expected a handshake packet for message 1".into(),
+            ));
+        }
+        handshake
+            .read_message(&parsed.payload)
+            .map_err(|e| LeafError::Session(format!("noise message 1: {e}")))?;
+        let msg2 = handshake
+            .write_message(&[])
+            .map_err(|e| LeafError::Session(format!("noise message 2: {e}")))?;
+        if !handshake.is_finished() {
+            return Err(LeafError::Session(
+                "handshake did not complete after message 2".into(),
+            ));
+        }
+        // Unencrypted, like message 1: the session key does not
+        // exist until both halves have read.
+        let packet = PacketBuilder::new(&[0u8; 32], 0).build_handshake(&msg2);
+        let keys = handshake
+            .into_session_keys()
+            .map_err(|e| LeafError::Session(format!("session keys: {e}")))?;
+        Ok((
+            LeafSession {
+                peer: initiator,
+                session: NetSession::new(keys, addr, POOL_SIZE, false),
+                next_fragment_id: Cell::new(1),
+            },
+            packet,
+        ))
     }
 }
 

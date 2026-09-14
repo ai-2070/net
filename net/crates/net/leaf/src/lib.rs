@@ -33,6 +33,10 @@
 
 #![forbid(unsafe_code)]
 
+/// The one v1 `ControlPlane`: a native anchor behind the Stage 4b
+/// bootstrap listener. `wasm32`-only — it is HTTPS and a WebSocket.
+#[cfg(target_arch = "wasm32")]
+pub mod anchor_control_plane;
 pub mod announce;
 pub mod bootstrap;
 pub mod channel;
@@ -40,9 +44,23 @@ pub mod clock;
 pub mod control_plane;
 pub mod counters;
 pub mod dispatch;
+pub mod enroll;
 pub mod error;
 pub mod frame;
 pub mod identity;
+/// §8 leader election and the D2 leader lifecycle: generations,
+/// fencing, the follower registry and both ends of the follower
+/// proxy. Deliberately `web_sys`-free — the browser half is
+/// [`leader_session`] — so the lifecycle is reviewable and tested
+/// without a browser.
+/// The browser half of leader election: the Web Lock, the
+/// `BroadcastChannel` carrier, and `MeshSession` as JavaScript sees
+/// it. `wasm32`-only.
+/// The genuinely anchorless in-memory `ControlPlane` (slice 6).
+/// Test-only by feature, so a mock cannot become a production path
+/// by accident.
+#[cfg(feature = "mock-control-plane")]
+pub mod mock_control_plane;
 pub mod node;
 pub mod rpc;
 pub mod rpc_wire;
@@ -53,6 +71,10 @@ pub mod rpc_wire;
 pub mod rtc;
 pub mod session;
 pub mod signal;
+/// §8 identity at rest: IndexedDB under a non-extractable WebCrypto
+/// AES-GCM key, plus the fenced generation counter. `wasm32`-only;
+/// the at-rest *format* lives in [`identity`], which is natively
+/// tested.
 pub mod stream;
 /// The `cross_lang_wire` golden vectors, carried inside the
 /// package so the wasm test target can replay them (and so an
@@ -73,9 +95,12 @@ pub use control_plane::{
 };
 pub use counters::{DropReason, LeafCounters};
 pub use dispatch::{Decoded, Subprotocol};
+pub use enroll::{Invite, JoinOutcome};
 pub use error::{LeafError, Result, RpcError, RtcError, UdpBlockedEvidence};
 pub use frame::{Fragment, Reassembler};
 pub use identity::{EntityKeypair, LeafIdentity};
+#[cfg(feature = "mock-control-plane")]
+pub use mock_control_plane::{Carried, CarriedKind, MockControlPlane, MockMesh};
 pub use node::{LeafEvent, LeafNode, Outbound, StreamHandle};
 pub use rpc::{CallResult, CallTable};
 pub use session::{LeafSession, OpenedPacket, PendingHandshake, SessionTable};

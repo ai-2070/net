@@ -41,6 +41,7 @@ use wasm_bindgen::JsCast;
 use web_sys::{RtcConfiguration, RtcDataChannelInit, RtcPeerConnection, RtcPeerConnectionIceEvent};
 
 use crate::control_plane::NodeId;
+use crate::enroll::Invite;
 use crate::error::{LeafError, Result, RtcError, UdpBlockedEvidence};
 
 /// The prefix on the credential string handed to JavaScript.
@@ -71,6 +72,13 @@ pub struct Credential {
     /// The whole credential string, presented verbatim to
     /// `POST /rtc/offer`.
     pub encoded: String,
+    /// The invite whose nonce the enrollment request echoes.
+    ///
+    /// The first pass treated this blob as opaque, which is what
+    /// left every session provisional: the enrollment request has to
+    /// echo `nonce` and bind `root` into its signature, so a leaf
+    /// that cannot read the invite cannot be promoted.
+    pub invite: Invite,
     /// The anchor's pinned Noise static public key.
     pub anchor_noise_pubkey: [u8; 32],
     /// The trust domain's NKpsk0 pre-shared key.
@@ -109,12 +117,14 @@ impl Credential {
                  (this build speaks {CREDENTIAL_VERSION})"
             )));
         }
-        // The invite blob, length-prefixed. Opaque here.
+        // The invite blob, length-prefixed.
         let invite_len = u32::from_le_bytes(take::<4>(&bytes, &mut at)?) as usize;
-        at = at
+        let invite_end = at
             .checked_add(invite_len)
             .filter(|end| *end <= bytes.len())
             .ok_or_else(|| malformed("truncated invite"))?;
+        let invite = Invite::decode(&bytes[at..invite_end])?;
+        at = invite_end;
 
         let anchor_noise_pubkey = take::<32>(&bytes, &mut at)?;
         let psk = take::<32>(&bytes, &mut at)?;
@@ -142,6 +152,7 @@ impl Credential {
         }
         Ok(Self {
             encoded: s.trim().to_string(),
+            invite,
             anchor_noise_pubkey,
             psk,
             bootstrap_url,
@@ -150,6 +161,11 @@ impl Credential {
     }
 
     /// Refuse a credential whose standing PSK half has expired.
+    ///
+    /// The invite's own single-use deadline is checked separately by
+    /// [`Invite::validate_at`], at the point enrollment needs it —
+    /// the two lifetimes are independent, and a credential whose
+    /// invite has been redeemed still bootstraps a transport.
     pub fn validate_at(&self, now_unix_secs: u64) -> Result<()> {
         if self.psk_expires_at < now_unix_secs {
             return Err(LeafError::ControlPlane(format!(
@@ -400,9 +416,15 @@ mod tests {
         let mut buf = Vec::new();
         buf.extend_from_slice(&CREDENTIAL_MAGIC);
         buf.push(CREDENTIAL_VERSION);
-        let invite = b"invite-blob";
+        let mut invite = Vec::new();
+        invite.extend_from_slice(b"NMI1");
+        invite.extend_from_slice(&[0x77u8; 32]); // root
+        invite.extend_from_slice(&[0x5Au8; 16]); // nonce
+        invite.extend_from_slice(&2_000_000_000u64.to_le_bytes());
+        invite.extend_from_slice(&(3u32).to_le_bytes());
+        invite.extend_from_slice(b"rdv");
         buf.extend_from_slice(&(invite.len() as u32).to_le_bytes());
-        buf.extend_from_slice(invite);
+        buf.extend_from_slice(&invite);
         buf.extend_from_slice(&[0xA1u8; 32]); // anchor noise pubkey
         buf.extend_from_slice(&[0x4Bu8; 32]); // psk
         buf.extend_from_slice(&[0x77u8; 16]); // trust domain
@@ -424,6 +446,12 @@ mod tests {
         assert_eq!(credential.anchor_noise_pubkey, [0xA1u8; 32]);
         assert_eq!(credential.psk, [0x4Bu8; 32]);
         assert_eq!(credential.bootstrap_url, "https://anchor.example/rtc");
+        // The invite is parsed, not skipped: without its nonce and
+        // root the leaf cannot build an enrollment request, and the
+        // session stays provisional forever.
+        assert_eq!(credential.invite.nonce, [0x5Au8; 16]);
+        assert_eq!(credential.invite.root, [0x77u8; 32]);
+        assert_eq!(credential.invite.rendezvous, "rdv");
         assert_eq!(
             credential.encoded, encoded,
             "the string must be presented to the listener verbatim"
