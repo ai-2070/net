@@ -310,3 +310,96 @@ ed25519, x25519, serde_json, base64 and the `web_sys` glue.
    probability.
 9. **`enroll_exchange.json` is pinned leaf-side only** — the core's
    `cross_lang_wire` does not yet decode it from the other direction.
+
+---
+
+## 9. What covers the changed native paths, and what payload-size interoperability is claimed
+
+Two questions were flagged for review of `4bb03a069`. Both are
+answered here rather than in a commit message, because both are
+claims about coverage rather than about code.
+
+### 9.1 The completion / quiescence changes, and the witnesses over them
+
+`4bb03a069` changed three native behaviours: when the completion
+owner releases the signalling budget, whether a late bootstrap
+candidate is a refusal, and whether the C3 quiescence gate is
+role-aware. These are the existing Stage 3/4 witnesses that run over
+those paths, by name, all green at this head:
+
+**The completion owner and the install fence** (`tests/rtc_install_race.rs`, 8):
+`a_close_consumed_before_the_commit_refuses_the_dead_endpoint`,
+`a_close_before_the_responder_commits_refuses_the_dead_endpoint`,
+`an_absent_snapshot_cannot_overwrite_a_session_installed_during_the_handshake`,
+`an_expected_present_snapshot_loses_to_a_newer_incarnation`,
+`an_incumbent_that_becomes_busy_during_the_handshake_is_preserved`,
+`a_quiet_incumbent_is_replaced_by_the_parked_exchange`,
+`a_close_inside_the_commit_window_leaves_nothing_published`, and the
+race harness's own `park_initiator_install` scaffolding. The fence
+now takes `require_quiescent` from the snapshot rather than
+re-deciding at the seam; `an_expected_present_snapshot_loses_to_a_
+newer_incarnation` and `an_absent_snapshot_cannot_overwrite_…` are
+the two that would fail if the snapshot and the commit disagreed.
+
+**The quiescence gate** (`tests/rtc_repairs.rs`):
+`a_busy_incumbent_survives_an_rtc_upgrade_attempt` — R3-E, unchanged
+and still green, which is what pins that the **Initiator** still
+defers — beside the new
+`a_peer_that_superseded_its_own_channel_is_not_locked_out_by_it`,
+which drives ONE busy incumbent so the role is the only
+discriminator. Its stated limitation is in its doc comment: it
+asserts the gate's decision (the Responder gets past and parks on
+the handshake inbox; the Initiator is refused and its message names
+`Initiator`), not a full install over a second real DataChannel —
+two channels between the same pair of UDP sockets share a 5-tuple
+and the in-process fixture signalling cannot demux them. The full
+install over a real second channel is what the browser matrix
+measures, and it is green there.
+
+**The routed incumbent** (`tests/rtc_routed_restore.rs`, 4):
+`routed_then_direct_then_loss_then_manually_restored_routed`,
+`an_idle_routed_stream_is_replaced_cleanly_by_the_rtc_pair`,
+`an_nrpc_call_round_trips_over_the_datachannel`,
+`a_capability_fold_applies_a_remote_fact_received_over_rtc`. These
+are what pin the OTHER half of the new role rule — a Responder
+facing a **routed** incumbent still defers, so the routed session is
+still replaced rather than displaced mid-flight.
+
+**The budget's terminal paths** (`sdk/tests/rtc_bootstrap_listener.rs`,
+24): Stage 4b's `an_attempt_that_ended_on_the_anchor_stops_authorizing_
+its_token` and `ending_an_attempt_releases_the_identity_its_ingress_
+was_charged_to` are unchanged and green — the release still happens
+on every terminal path, it happens later — beside the new
+`an_attempt_whose_channel_just_opened_is_not_over_yet`.
+
+Totals at this head: 73 across the five RTC binaries named above, 24
+listener tests, 19 browser witnesses.
+
+### 9.2 Payload-size interoperability: exactly what is claimed
+
+**Claimed.** A leaf fragments an application payload larger than
+`MAX_PAYLOAD_SIZE` (8 104 B) into up to 8 fragments and reassembles
+inbound fragments with a bound (8 concurrent groups, 2 s TTL, every
+refusal counted). Leaf ↔ leaf, an over-cap payload round-trips; this
+is witnessed natively and in wasm.
+
+**Not claimed.** No NATIVE node reassembles fragments.
+`leaf/src/frame.rs` is the first and only reader of `frag_flags` in
+the tree, so a leaf → native payload above 8 104 B arrives as N
+packets each carrying a partial event, and the native side does not
+put them back together. Nothing regresses — the pre-Stage-5
+behaviour for such a payload was S0c's silent drop — but "Stage 5
+made over-cap payloads work" is true only between leaves.
+
+**Also not claimed.** Above 64 832 B nothing is attempted at all:
+`fragment_offset` is a u16 BYTE offset, so the last fragment cannot
+start past byte 65 535. The send path returns a typed
+`LeafError::Wire` naming streams as the way out — never a truncation
+and never a drop.
+
+**What the matrix therefore keeps under the cap.** Every browser
+witness sends payloads below 8 104 B deliberately, because a witness
+that quietly relied on native reassembly would be asserting a
+property this stage does not have. A native-side reassembly arm is
+the prerequisite for leaf → native over-cap payloads, and it is
+named in §8.
