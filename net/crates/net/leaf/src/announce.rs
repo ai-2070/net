@@ -111,6 +111,19 @@ pub struct VerifiedAnnouncement {
 }
 
 impl VerifiedAnnouncement {
+    /// Is this announcement still inside the lifetime it declared?
+    ///
+    /// Literal: `issued + ttl_secs`, with no "0 means forever"
+    /// escape. A record that declares no lifetime has declared an
+    /// expired one, and a peer that wants to be discoverable says
+    /// for how long — which is what the leaf's own writer does.
+    pub fn is_fresh(&self, now_unix_secs: u64) -> bool {
+        let issued = self.timestamp_ns / 1_000_000_000;
+        now_unix_secs <= issued.saturating_add(u64::from(self.ttl_secs))
+    }
+}
+
+impl VerifiedAnnouncement {
     /// JSON for the event stream and for `query`.
     ///
     /// `node_id` rides as a decimal **string**: it exceeds 2^53 and
@@ -306,6 +319,20 @@ pub fn verify_announcement(bytes: &[u8]) -> Result<VerifiedAnnouncement> {
         .get("node_id")
         .and_then(Value::as_u64)
         .ok_or_else(|| LeafError::Wire("announcement carries no node_id".into()))?;
+    // **The signature covers `entity_id`, not `node_id`** (R1). An
+    // attacker signs with its OWN entity key, claims the VICTIM's
+    // node id and a later version, and the store replaces the honest
+    // record — including the verification key every later signal
+    // attributed to that node is checked against. The core refuses
+    // this at its capability arm; the leaf now refuses it here,
+    // BEFORE the record can replace anything or authorise anything.
+    let derived = crate::identity::node_id_for_entity(&entity_id);
+    if derived != node_id {
+        return Err(LeafError::Wire(format!(
+            "announcement claims node {node_id:#018x} but its signing entity derives to \
+             {derived:#018x} — a signature over someone else's node id authorises nothing"
+        )));
+    }
     let capabilities = document
         .pointer("/capabilities/tags")
         .and_then(Value::as_array)
@@ -382,16 +409,37 @@ impl AnnouncementStore {
         }
     }
 
-    /// Every node whose announcement carries `capability` as a tag.
+    /// Every node whose announcement carries `capability` as a tag
+    /// **and is still fresh** (R8).
+    ///
+    /// An expired announcement is not discoverable. It used to be:
+    /// `ttl_secs` was parsed, stored and never consulted, so a peer
+    /// that went away stayed in every answer `query` gave and stayed
+    /// the key authority for every signal attributed to it. Freshness
+    /// is evaluated at READ time rather than by a sweep, so a
+    /// re-announce restores discoverability immediately.
     pub fn query(&self, capability: &str) -> Vec<&VerifiedAnnouncement> {
+        let now = crate::clock::now_unix_secs();
         self.by_node
             .values()
-            .filter(|a| a.capabilities.iter().any(|c| c == capability))
+            .filter(|a| a.is_fresh(now) && a.capabilities.iter().any(|c| c == capability))
             .collect()
     }
 
-    /// The announcement held for `node`, if any.
+    /// The announcement held for `node`, if it is still fresh.
+    ///
+    /// This is the accessor the signal verifier reads its key from,
+    /// so the same expiry that removes a peer from discovery removes
+    /// its authority to authorise a signal.
     pub fn get(&self, node: u64) -> Option<&VerifiedAnnouncement> {
+        let now = crate::clock::now_unix_secs();
+        self.by_node.get(&node).filter(|a| a.is_fresh(now))
+    }
+
+    /// The record for `node` whether or not it is fresh — for the
+    /// version comparison `ingest` makes, which must not let an
+    /// expired record be replaced by an OLDER one.
+    pub fn get_including_expired(&self, node: u64) -> Option<&VerifiedAnnouncement> {
         self.by_node.get(&node)
     }
 
@@ -536,20 +584,32 @@ mod tests {
             .expect("incrementing hop_count must not invalidate the signature");
     }
 
+    /// A `timestamp_ns` inside the announcement's own lifetime.
+    ///
+    /// These two tests pin STORE semantics — newest-wins, tag
+    /// matching, the JSON shape — and used `1` as a stand-in
+    /// timestamp. Since R8 made freshness load-bearing (an expired
+    /// announcement is neither discoverable nor a key authority), a
+    /// 1970 stamp means expired, so the stand-in has to be a real
+    /// one. `nudge` keeps the two versions distinguishable.
+    fn fresh_stamp(nudge: u64) -> u64 {
+        crate::clock::now_unix_secs() * 1_000_000_000 + nudge
+    }
+
     #[test]
     fn the_store_is_newest_wins_per_node_and_query_matches_on_tags() {
         let id = identity();
         let mut store = AnnouncementStore::new();
 
         let v1 = verify_announcement(
-            &build_announcement(&id, &["gpu".to_string()], 1, 1, 300).expect("build"),
+            &build_announcement(&id, &["gpu".to_string()], 1, fresh_stamp(1), 300).expect("build"),
         )
         .expect("verify");
         assert!(store.ingest(v1));
         assert_eq!(store.query("gpu").len(), 1);
 
         let v3 = verify_announcement(
-            &build_announcement(&id, &["tpu".to_string()], 3, 2, 300).expect("build"),
+            &build_announcement(&id, &["tpu".to_string()], 3, fresh_stamp(2), 300).expect("build"),
         )
         .expect("verify");
         assert!(store.ingest(v3));
@@ -561,7 +621,7 @@ mod tests {
         assert_eq!(store.query("tpu").len(), 1);
 
         let v2 = verify_announcement(
-            &build_announcement(&id, &["old".to_string()], 2, 3, 300).expect("build"),
+            &build_announcement(&id, &["old".to_string()], 2, fresh_stamp(3), 300).expect("build"),
         )
         .expect("verify");
         assert!(!store.ingest(v2), "an older version must be refused");
@@ -578,7 +638,7 @@ mod tests {
         let id = identity();
         let mut store = AnnouncementStore::new();
         store.ingest(
-            verify_announcement(&build_announcement(&id, &[], 1, 1, 300).expect("build"))
+            verify_announcement(&build_announcement(&id, &[], 1, fresh_stamp(1), 300).expect("build"))
                 .expect("verify"),
         );
         let json = store.query_json(TAG_LEAF);

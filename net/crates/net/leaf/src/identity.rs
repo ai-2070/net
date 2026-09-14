@@ -109,6 +109,17 @@ fn keyed_u64(label: &[u8], public: &[u8; 32]) -> u64 {
     u64::from_le_bytes(head)
 }
 
+/// The node id a given entity public key derives to.
+///
+/// The same `blake2s` derivation the core's `EntityId::node_id`
+/// performs, exposed so a VERIFIER can recompute it: an
+/// announcement's signature covers its `entity_id` but not its
+/// `node_id`, so binding the two is the receiver's job (R1). The
+/// core does exactly this at `mesh.rs`'s capability arm.
+pub fn node_id_for_entity(entity_public: &[u8; 32]) -> u64 {
+    keyed_u64(NODE_ID_LABEL, entity_public)
+}
+
 /// The Ed25519 half: who this node *is*.
 pub struct EntityKeypair {
     signing: SigningKey,
