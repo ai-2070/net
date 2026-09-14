@@ -40,11 +40,12 @@
 
 #![cfg(target_arch = "wasm32")]
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::pin::Pin;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
+use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use futures_channel::oneshot;
@@ -54,14 +55,53 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{spawn_local, JsFuture};
 use web_sys::{BroadcastChannel, MessageEvent};
 
+use crate::bootstrap::gloo_timer_sleep;
 use crate::error::{LeafError, Result, RpcError};
 use crate::identity::IdentitySecrets;
 use crate::leader::{
-    scope_name, FollowerEvent, LeaderBackend, LeaderRequest, ProxyClient, ProxyFailure,
-    ProxyOutcome, ProxyServer, ProxyTransport, ProxyValue, Replier,
+    scope_name, FollowerEvent, GenerationLease, LeaderBackend, LeaderRequest, ProxyClient,
+    ProxyFailure, ProxyOutcome, ProxyServer, ProxyTransport, ProxyValue, Replier,
 };
 use crate::storage::{IdentityVault, DEFAULT_DB_NAME};
 use crate::stream::Reliability;
+
+/// How often a leader revalidates its generation against the store.
+///
+/// Coarse on purpose. The in-memory [`GenerationLease`] is the
+/// authority at the effect boundary because it costs a `Cell` read;
+/// this is the only check that can see the one takeover no in-memory
+/// state witnesses — a tab frozen while holding its lock, whose
+/// successor bumped the IndexedDB counter while it was not running —
+/// and an IndexedDB transaction in front of every send would be a
+/// worse fence than none, because it would be an await.
+const LEASE_REVALIDATION_MS: i32 = 1_000;
+
+/// What a follower adds to the caller's timeout before giving up on
+/// its own clock.
+///
+/// The caller's deadline belongs to the *operation*; the proxy round
+/// trip is not part of it. Expiring at exactly `timeout_ms` would
+/// refuse replies that were already on the channel, which would turn
+/// a working call into an indeterminate one for no reason.
+const PROXY_DEADLINE_GRACE_MS: u32 = 250;
+
+/// The most inbound proxy messages held while a leader bootstraps.
+///
+/// A ceiling rather than an unbounded queue: the window is one
+/// `connect()`, and anything that fills this is a flood rather than a
+/// startup. Overflow is reported rather than silently forgotten.
+const MAX_QUEUED_INBOUND: usize = 64;
+
+/// How long a tab whose re-bootstrap failed waits before asking for
+/// the lock again.
+///
+/// It has just released the only lock there is, so an immediate
+/// re-request is granted immediately: without a pause a persistently
+/// failing bootstrap would spin on acquisition rather than retry it.
+/// Retrying at all is deliberate — the origin has no node after a
+/// failed promotion, and a tab that gave up would leave the page with
+/// a follower attached to nothing.
+const PROMOTION_RETRY_MS: i32 = 250;
 
 // ────────────────────────────── the Web Lock ───────────────────────────
 
@@ -235,13 +275,21 @@ pub type BackendFuture = Pin<Box<dyn Future<Output = Result<Box<dyn LeaderBacken
 
 /// How a leader gets a node.
 ///
-/// Called with the connect options (already carrying the identity) and
-/// the sink every node event must be handed to. A factory rather than a
-/// concrete type because the lifecycle has to be drivable in a browser
-/// with no anchor in reach: the leaf's own wasm tests supply a backend
-/// with no network behind it and exercise the same promotion,
-/// restoration and fencing code the real one runs.
-pub type BackendFactory = Rc<dyn Fn(JsValue, EventSink) -> BackendFuture>;
+/// Called with the connect options (already carrying the identity),
+/// the sink every node event must be handed to, and the
+/// [`GenerationLease`] the node's outbound effects are admitted
+/// under. A factory rather than a concrete type because the lifecycle
+/// has to be drivable in a browser with no anchor in reach: the
+/// leaf's own wasm tests supply a backend with no network behind it
+/// and exercise the same promotion, restoration and fencing code the
+/// real one runs.
+///
+/// The lease is an argument rather than something the backend reads
+/// off the server later, because the backend exists **before** the
+/// server does: it is connected inside this factory, and the
+/// operations it spawns from that moment on have to be admitted under
+/// the same fence the server's replies are.
+pub type BackendFactory = Rc<dyn Fn(JsValue, EventSink, GenerationLease) -> BackendFuture>;
 
 /// Where a leader's node events go.
 pub type EventSink = Rc<dyn Fn(&str)>;
@@ -252,7 +300,17 @@ struct SessionState {
     scope: String,
     fingerprint: String,
     connect_opts: JsValue,
+    /// What this tab wants announced: its constructor's list, replaced
+    /// by whatever its last successful `announce()` asked for. D2
+    /// promises the *current* announcement is re-published on
+    /// takeover, and a tab that restored its opening options would
+    /// revert every runtime `announce()` at the next handoff.
     capabilities: Vec<String>,
+    /// What this tab, while leader, has actually announced — its own
+    /// intent unioned with its followers'. Kept so reconciliation is
+    /// idempotent and an attach that changes nothing costs no
+    /// announcement.
+    announced: Vec<String>,
     /// The channels this tab itself asked for.
     declared: BTreeSet<String>,
     /// The channels the current leader has actually subscribed.
@@ -267,7 +325,7 @@ struct SessionState {
 
 /// Everything the session shares between its callbacks.
 ///
-/// Three separate `RefCell`s, not one: the node's event callback fires
+/// Separate `RefCell`s, not one: the node's event callback fires
 /// from inside a `perform` that already holds the server borrow, and a
 /// single cell would make that a panic. Events additionally go through
 /// a queue drained on a microtask, for the same reason
@@ -278,6 +336,25 @@ struct Shared {
     server: RefCell<Option<ProxyServer<Box<dyn LeaderBackend>>>>,
     client: RefCell<Option<ProxyClient>>,
     events: RefCell<Vec<String>>,
+    /// The fence in force for this tab while it is the leader.
+    ///
+    /// Held here as well as inside the server because stand-down needs
+    /// it *after* the server is gone: the order is fence, then close
+    /// the node, then release the lock, and a lease that lived only in
+    /// the server would be dropped by step two.
+    lease: RefCell<Option<GenerationLease>>,
+    /// Proxy messages that arrived while this tab was bootstrapping as
+    /// leader — after the lock was granted and before a server
+    /// existed.
+    ///
+    /// Dropping them loses a follower's `Attach`, and a follower that
+    /// attached into that window is taught the generation by the
+    /// Leadership broadcast but re-declares only on a *subsequent*
+    /// one: its subscriptions would simply never reach the node.
+    queued: RefCell<Vec<String>>,
+    /// How many queued messages were dropped for want of room, so the
+    /// ceiling is observable rather than silent.
+    overflowed: Cell<u64>,
     vault: Rc<IdentityVault>,
     transport: Rc<BroadcastTransport>,
     channel: BroadcastChannel,
@@ -333,6 +410,7 @@ impl Lifecycle {
                 fingerprint,
                 connect_opts,
                 capabilities: string_array(&opts, "capabilities"),
+                announced: Vec::new(),
                 declared,
                 subscribed: BTreeSet::new(),
                 restored: Vec::new(),
@@ -344,6 +422,9 @@ impl Lifecycle {
             server: RefCell::new(None),
             client: RefCell::new(None),
             events: RefCell::new(Vec::new()),
+            lease: RefCell::new(None),
+            queued: RefCell::new(Vec::new()),
+            overflowed: Cell::new(0),
             vault,
             transport,
             channel,
@@ -358,14 +439,7 @@ impl Lifecycle {
         match request_web_lock(&scope, true).await? {
             Some(lock) => take_leadership(&shared, lock, None).await?,
             None => {
-                let seed = correlation_seed()?;
-                let follower = follower_id()?;
-                let declared: Vec<String> =
-                    shared.state.borrow().declared.iter().cloned().collect();
-                let mut client =
-                    ProxyClient::new(shared.transport.clone(), follower, declared, seed);
-                client.attach();
-                *shared.client.borrow_mut() = Some(client);
+                attach_as_follower(&shared)?;
                 // Queue for the lock. This resolves only when the
                 // leader lets go, which is the promotion trigger:
                 // no polling, no heartbeat, no timeout to tune.
@@ -443,13 +517,21 @@ impl Lifecycle {
                 .declared
                 .insert(channel.clone());
         }
+        // Read before the request is moved: a follower arms its own
+        // clock over the caller's deadline.
+        let deadline = match &request {
+            LeaderRequest::Call {
+                timeout_ms: Some(ms),
+                ..
+            } => Some(*ms),
+            _ => None,
+        };
 
         let receiver = {
             let mut server = self.shared.server.borrow_mut();
             if let Some(server) = server.as_mut() {
                 let (tx, rx) = oneshot::channel();
-                let generation = server.generation();
-                let reply = Replier::local(tx, generation);
+                let reply = Replier::local(tx, server.lease());
                 server.backend_mut().perform(request, reply);
                 rx
             } else {
@@ -461,7 +543,13 @@ impl Lifecycle {
                         current: None,
                     }));
                 };
-                client.request(request)
+                let (correlation, rx) = client.issue(request);
+                if let (Some(correlation), Some(ms)) = (correlation, deadline) {
+                    // The timer only borrows the client after its own
+                    // await, so this borrow is free to stand.
+                    self.arm_deadline(correlation, ms);
+                }
+                rx
             }
         };
         flush_events(&self.shared);
@@ -475,13 +563,120 @@ impl Lifecycle {
         outcome
     }
 
+    /// Publish the announcement, and record it as this tab's current
+    /// intent.
+    ///
+    /// The recording is the point. D2 promises the announcement is
+    /// re-published on takeover, and `request` alone would publish it
+    /// once: a tab whose `announce()` succeeded and then became the
+    /// leader would re-publish the list it was *constructed* with,
+    /// silently dropping whatever the page announced at runtime.
+    ///
+    /// Restoration (`reconcile`) goes through `request` and not
+    /// through here on purpose — it announces the union of this tab's
+    /// intent and its followers', and folding that union back into
+    /// this tab's own intent would make a detached follower's
+    /// capability permanent.
+    pub async fn announce(&self, capabilities: Vec<String>) -> ProxyOutcome {
+        let outcome = self
+            .request(LeaderRequest::Announce {
+                capabilities: capabilities.clone(),
+            })
+            .await;
+        if outcome.is_ok() {
+            let mut state = self.shared.state.borrow_mut();
+            let leader = state.role == Role::Leader;
+            state.capabilities = capabilities.clone();
+            if leader {
+                state.announced = capabilities;
+            }
+        }
+        outcome
+    }
+
+    /// Arm this tab's own deadline over one follower request.
+    ///
+    /// The `timeout_ms` inside the request is the **leader's**: it
+    /// starts when the leader performs the call and is expired by the
+    /// leader's own tick. A leader that is frozen while holding its
+    /// lock expires nothing, so without this the caller's promise
+    /// waits out the whole suspension and then settles against an
+    /// execution that began minutes late.
+    ///
+    /// What expiry produces is deliberately not `Timeout`: a deadline
+    /// on this tab cannot cancel work already admitted on another, so
+    /// the outcome is [`RpcError::Indeterminate`] and nothing is
+    /// re-issued. A retry here would be a second execution of
+    /// something that may have executed once already.
+    fn arm_deadline(&self, correlation: u64, timeout_ms: u32) {
+        let weak = Rc::downgrade(&self.shared);
+        let wait =
+            i32::try_from(timeout_ms.saturating_add(PROXY_DEADLINE_GRACE_MS)).unwrap_or(i32::MAX);
+        spawn_local(async move {
+            let _ = gloo_timer_sleep(wait).await;
+            let Some(shared) = weak.upgrade() else {
+                return;
+            };
+            let mut client = shared.client.borrow_mut();
+            if let Some(client) = client.as_mut() {
+                client.expire(
+                    correlation,
+                    ProxyFailure::Typed(LeafError::Rpc(RpcError::Indeterminate {
+                        deadline_ms: timeout_ms,
+                    })),
+                );
+            }
+        });
+    }
+
+    /// Open an application stream, bound to the generation that
+    /// opened it.
+    ///
+    /// On the lifecycle rather than on [`MeshSession`] because the
+    /// binding is lifecycle state: the handle has to know which
+    /// generation's node its id belongs to, and only this layer knows
+    /// that. `MeshSession::open_stream` is the `wasm_bindgen`
+    /// spelling of it.
+    pub async fn open_stream(&self, opts: &JsValue) -> Result<ProxyStream, JsError> {
+        let options = crate::wasm::stream_options(opts)?;
+        let reliable = options.reliability.is_reliable();
+        // Read before the request, not after: a request that crosses a
+        // handoff must produce a handle stamped with the generation it
+        // was *issued* under, or the stamp would agree with the
+        // successor it must refuse.
+        let generation = self.generation();
+        let value = self
+            .request(LeaderRequest::StreamOpen {
+                label: options.label,
+                reliability: options.reliability,
+                stream_id: options.stream_id,
+                channel_hash: options.channel_hash,
+            })
+            .await?;
+        let ProxyValue::Stream { stream_id } = value else {
+            return Err(JsError::new("open_stream did not answer with a stream"));
+        };
+        Ok(ProxyStream {
+            lifecycle: self.clone(),
+            stream_id,
+            reliable,
+            generation,
+        })
+    }
+
     /// Register a listener for this session's event JSON.
     pub fn on_event(&self, callback: Function) {
         self.shared.state.borrow_mut().listeners.push(callback);
     }
 
-    /// Stand down: fail this tab's in-flight work, tell the other
-    /// tabs, and let go of the lock so a follower can promote.
+    /// Stand down: fence the generation, retire the node, tell the
+    /// other tabs, and only then let go of the lock so a follower can
+    /// promote.
+    ///
+    /// The order is the whole of it, and it is not this function's to
+    /// improvise: [`ProxyServer::retire`] owns steps one to three and
+    /// has already finished all of them when it returns, so the lock
+    /// release below cannot get ahead of the fence.
     pub fn close(&self) {
         {
             let mut state = self.shared.state.borrow_mut();
@@ -499,16 +694,23 @@ impl Lifecycle {
                 generation,
             })));
         }
-        if let Some(server) = self.shared.server.borrow_mut().as_mut() {
-            // Tell the followers before the lock moves, so their
-            // pending work fails against the generation that owned it
-            // rather than against the successor's.
-            server.announce_leader_lost(generation);
-            server.close();
+        // Taken out of the cell *before* retiring it: retirement runs
+        // the node's close path, which drains events into the sink,
+        // and the sink reaches for this same borrow.
+        let mut server = self.shared.server.borrow_mut().take();
+        if let Some(server) = server.as_mut() {
+            let retirement = server.retire(None);
+            report(&format!(
+                "generation {} stood down: {} pending call(s) failed",
+                retirement.generation, retirement.pending_failed
+            ));
         }
-        *self.shared.server.borrow_mut() = None;
+        drop(server);
         *self.shared.client.borrow_mut() = None;
-        // Releasing the lock is what triggers a follower's promotion.
+        *self.shared.lease.borrow_mut() = None;
+        self.shared.queued.borrow_mut().clear();
+        // Releasing the lock is what triggers a follower's promotion,
+        // and it is last: everything above has already happened.
         self.shared.state.borrow_mut().lock = None;
         self.shared.channel.close();
     }
@@ -548,14 +750,35 @@ impl Lifecycle {
 /// 3. **Re-bootstrap with the same identity** — a rebind through the
 ///    existing address-independent binding, not a new path.
 /// 4. **Announce leadership**, which is also what makes surviving
-///    followers re-declare their subscriptions.
+///    followers re-declare their subscriptions, and replay whatever
+///    arrived while step three was in flight.
 /// 5. **Restore** the subscriptions and re-publish the announcement.
 ///    Streams are deliberately *not* resurrected: a stream is
 ///    session-scoped, and pretending otherwise would hide a real
 ///    interruption.
+///
+/// # Two awaits, and what may have happened across them
+///
+/// Steps one and three both suspend, and a tab can be closed while
+/// either is in flight. The old shape checked `closed` once, before
+/// the acquisition, and then installed the server and the lock
+/// unconditionally — so a session closed during the connect ended up
+/// holding the origin's lock while refusing every operation, and no
+/// other tab could take over for the lifetime of the page. So intent
+/// is re-read after **each** await, and the lock and the server are
+/// published together or not at all.
 async fn take_leadership(shared: &Rc<Shared>, lock: WebLock, previous: Option<u64>) -> Result<()> {
     let started = now_ms();
+    if shared.state.borrow().closed {
+        return Ok(());
+    }
     let generation = shared.vault.next_generation().await?;
+    if shared.state.borrow().closed {
+        // The generation is spent, which costs nothing — it is a
+        // monotonic counter, not a lease on a resource. Dropping the
+        // lock here is the point: a successor gets it immediately.
+        return Ok(());
+    }
 
     if let Some(previous) = previous {
         if let Some(client) = shared.client.borrow_mut().as_mut() {
@@ -569,10 +792,63 @@ async fn take_leadership(shared: &Rc<Shared>, lock: WebLock, previous: Option<u6
     let connect_opts = shared.state.borrow().connect_opts.clone();
     let sink = event_sink(shared);
     let factory = shared.factory.clone();
-    let backend = factory(connect_opts, sink).await?;
+    let lease = GenerationLease::new(generation);
+    let backend = match factory(connect_opts, sink, lease.clone()).await {
+        Ok(backend) => backend,
+        Err(error) => {
+            // The lock goes back with this frame. A promotion that
+            // failed must leave a *functioning follower* queued for
+            // it, not an object with no client, no server and no
+            // acquisition in flight — which is what stranded a tab
+            // whose re-bootstrap did not complete.
+            drop(lock);
+            if previous.is_some() && !shared.state.borrow().closed {
+                emit(
+                    shared,
+                    &format!(
+                        "{{\"type\":\"promotion_failed\",\"generation\":\"{generation}\",\
+                          \"detail\":{}}}",
+                        json_string(&error.to_string())
+                    ),
+                );
+                attach_as_follower(shared)?;
+                // Queued again, after a pause. Queued because the
+                // origin now has no node and *somebody* has to bring
+                // one up — a tab that gave up would leave the page
+                // with a working follower attached to nothing. After
+                // a pause because this tab has just released the only
+                // lock there is, so an immediate re-request is granted
+                // immediately: without the delay a persistently
+                // failing bootstrap would spin on acquisition instead
+                // of retrying it.
+                let waiting = Lifecycle {
+                    shared: shared.clone(),
+                };
+                spawn_local(async move {
+                    let _ = gloo_timer_sleep(PROMOTION_RETRY_MS).await;
+                    if waiting.shared.state.borrow().closed {
+                        return;
+                    }
+                    waiting.await_promotion().await;
+                });
+            }
+            return Err(error);
+        }
+    };
 
-    let mut server = ProxyServer::new(backend, shared.transport.clone(), generation);
-    server.announce_leadership();
+    let mut server = ProxyServer::with_lease(backend, shared.transport.clone(), lease.clone());
+    if shared.state.borrow().closed {
+        // Checked at publish time, not before the connect. The node
+        // exists and nobody asked for it any more, so it is retired
+        // through the same path a stand-down uses and the lock is
+        // released by this frame.
+        server.retire(None);
+        drop(server);
+        drop(lock);
+        return Ok(());
+    }
+
+    *shared.lease.borrow_mut() = Some(lease.clone());
     *shared.server.borrow_mut() = Some(server);
     {
         let mut state = shared.state.borrow_mut();
@@ -580,26 +856,28 @@ async fn take_leadership(shared: &Rc<Shared>, lock: WebLock, previous: Option<u6
         state.generation = generation;
         state.lock = Some(lock);
         state.subscribed.clear();
+        state.announced.clear();
     }
+    if let Some(server) = shared.server.borrow_mut().as_mut() {
+        server.announce_leadership();
+    }
+    // Replayed *after* the Leadership broadcast, because that is the
+    // message a queued `Attach` is waiting to be answered by: the
+    // follower learns the generation, and its declaration is already
+    // in the registry reconciliation is about to read.
+    replay_queued(shared);
     emit(
         shared,
         &format!("{{\"type\":\"leader_changed\",\"generation\":\"{generation}\"}}"),
     );
 
-    reconcile(shared).await;
+    // The storage half of the fence, given the outbound caller D2
+    // always claimed it had.
+    let guarding = Rc::downgrade(shared);
+    let guarded = lease.clone();
+    spawn_local(async move { guard_lease(guarding, guarded).await });
 
-    let capabilities = shared.state.borrow().capabilities.clone();
-    if !capabilities.is_empty() {
-        let lifecycle = Lifecycle {
-            shared: shared.clone(),
-        };
-        if let Err(failure) = lifecycle
-            .request(LeaderRequest::Announce { capabilities })
-            .await
-        {
-            report(&format!("re-publishing the announcement: {failure:?}"));
-        }
-    }
+    reconcile(shared).await;
 
     if previous.is_some() {
         shared.state.borrow_mut().interruption_ms = Some(now_ms() - started);
@@ -607,9 +885,99 @@ async fn take_leadership(shared: &Rc<Shared>, lock: WebLock, previous: Option<u6
     Ok(())
 }
 
+/// Become a functioning follower: a client with this tab's current
+/// declarations, attached.
+///
+/// One helper rather than two copies, because the second copy is the
+/// one that gets forgotten: this runs on the ordinary follower path
+/// *and* on the path where a promotion's re-bootstrap failed, and the
+/// declarations it carries have to be the same both times.
+fn attach_as_follower(shared: &Rc<Shared>) -> Result<()> {
+    let seed = correlation_seed()?;
+    let follower = follower_id()?;
+    let (declared, capabilities) = {
+        let state = shared.state.borrow();
+        (
+            state.declared.iter().cloned().collect::<Vec<String>>(),
+            state.capabilities.clone(),
+        )
+    };
+    let mut client = ProxyClient::new(
+        shared.transport.clone(),
+        follower,
+        declared,
+        capabilities,
+        seed,
+    );
+    client.attach();
+    *shared.client.borrow_mut() = Some(client);
+    Ok(())
+}
+
+/// Hand the freshly installed server every message that arrived while
+/// this tab had no server to give them to.
+fn replay_queued(shared: &Rc<Shared>) {
+    let queued = core::mem::take(&mut *shared.queued.borrow_mut());
+    for text in queued {
+        let served = {
+            let mut server = shared.server.borrow_mut();
+            server.as_mut().map(|server| server.on_message(&text))
+        };
+        if let Some(Err(error)) = served {
+            report(&format!("replaying a queued proxy message: {error}"));
+        }
+    }
+}
+
+/// Revalidate a leader's generation against the store, and stand down
+/// if it has moved.
+///
+/// This is the outbound caller `IdentityVault::fence` never had, and
+/// the case it exists for is the one no in-memory check can see: a tab
+/// frozen while holding its lock. Its lease still reads live, its
+/// `ProxyServer` has seen no higher generation — it saw nothing at all
+/// — and the only thing that moved is the record in IndexedDB, written
+/// by whichever tab acquired the lock in the meantime. So the leader
+/// asks the store, on a timer.
+///
+/// A storage *failure* is not a takeover and does not stand anything
+/// down: a database that cannot be read says nothing about who holds
+/// the lock, and treating it as a loss would be a way to evict a
+/// healthy leader.
+async fn guard_lease(shared: Weak<Shared>, lease: GenerationLease) {
+    loop {
+        let _ = gloo_timer_sleep(LEASE_REVALIDATION_MS).await;
+        if !lease.is_live() {
+            return;
+        }
+        let Some(shared) = shared.upgrade() else {
+            return;
+        };
+        if shared.state.borrow().closed {
+            return;
+        }
+        match shared.vault.fence(lease.generation()).await {
+            Ok(()) => {}
+            Err(LeafError::NotLeader { current, .. }) => {
+                if !lease.is_live() {
+                    return;
+                }
+                let successor = current.unwrap_or_else(|| lease.generation().saturating_add(1));
+                report(&format!(
+                    "the store records generation {successor}; this tab holds {}",
+                    lease.generation()
+                ));
+                stand_down(&shared, successor);
+                return;
+            }
+            Err(error) => report(&format!("revalidating the leader generation: {error}")),
+        }
+    }
+}
+
 /// Subscribe everything the leader owes — this tab's own channels plus
-/// the union of its followers' declared ones — and tell the followers
-/// which ones came back.
+/// the union of its followers' declared ones — re-publish the
+/// announcement the same way, and tell the followers what came back.
 ///
 /// Reconciliation rather than a one-shot restore list, because a
 /// follower can attach at any moment, including after the new leader
@@ -659,6 +1027,46 @@ async fn reconcile(shared: &Rc<Shared>) {
                 failure.message()
             )),
         }
+    }
+
+    reconcile_announcement(shared).await;
+}
+
+/// Re-publish the announcement this origin currently wants.
+///
+/// The union of this tab's intent and every attached follower's, which
+/// is the only definition that survives a handoff: D2 promises the
+/// announcement comes back, and the announcement is not the property
+/// of whichever tab happens to hold the lock. Idempotent — an attach
+/// that declares nothing new costs no network operation.
+async fn reconcile_announcement(shared: &Rc<Shared>) {
+    let wanted: Vec<String> = {
+        let server = shared.server.borrow();
+        let Some(server) = server.as_ref() else {
+            return;
+        };
+        let state = shared.state.borrow();
+        let mut union: BTreeSet<String> = state.capabilities.iter().cloned().collect();
+        union.extend(server.capability_restoration());
+        union.into_iter().collect()
+    };
+    if wanted.is_empty() || shared.state.borrow().announced == wanted {
+        return;
+    }
+    let lifecycle = Lifecycle {
+        shared: shared.clone(),
+    };
+    match lifecycle
+        .request(LeaderRequest::Announce {
+            capabilities: wanted.clone(),
+        })
+        .await
+    {
+        Ok(_) => shared.state.borrow_mut().announced = wanted,
+        Err(failure) => report(&format!(
+            "re-publishing the announcement: {}",
+            failure.message()
+        )),
     }
 }
 
@@ -720,7 +1128,17 @@ fn dispatch(shared: &Rc<Shared>, text: &str) {
         let mut client = shared.client.borrow_mut();
         match client.as_mut() {
             Some(client) => client.on_message(text),
-            None => return,
+            None => {
+                // Neither half exists: this tab holds the lock and is
+                // still awaiting its node. Dropping the message here
+                // is what lost a follower's `Attach` — the follower is
+                // taught the generation by the Leadership broadcast
+                // but re-declares only on a *subsequent* one, so its
+                // subscriptions never reached the node at all.
+                drop(client);
+                queue_inbound(shared, text);
+                return;
+            }
         }
     };
     match event {
@@ -773,26 +1191,54 @@ fn handle_follower_event(shared: &Rc<Shared>, event: FollowerEvent) {
     }
 }
 
+/// Hold one inbound message until this tab has a server for it.
+fn queue_inbound(shared: &Rc<Shared>, text: &str) {
+    let mut queued = shared.queued.borrow_mut();
+    if queued.len() >= MAX_QUEUED_INBOUND {
+        drop(queued);
+        let dropped = shared.overflowed.get().saturating_add(1);
+        shared.overflowed.set(dropped);
+        report(&format!(
+            "the bootstrap queue is full at {MAX_QUEUED_INBOUND}; {dropped} proxy \
+             message(s) dropped"
+        ));
+        return;
+    }
+    queued.push(text.to_string());
+}
+
 /// A leader that has seen a higher generation is not the leader.
 ///
-/// It fails its own in-flight work against the generation that owned
-/// it, drops the node, and stops serving. It does *not* try to reclaim
-/// the lock: the successor holds it, and a tab that fought for it would
-/// be the eviction §8 exists to prevent.
+/// Same order as an orderly close, and for the same reason: the fence
+/// goes up, the node is retired, the followers are told, and only then
+/// is the lock let go. It does *not* try to reclaim the lock — the
+/// successor holds it, and a tab that fought for it would be the
+/// eviction §8 exists to prevent.
 fn stand_down(shared: &Rc<Shared>, successor: u64) {
     let ours = shared.state.borrow().generation;
     report(&format!(
         "generation {ours} was superseded by {successor}; standing down"
     ));
-    if let Some(server) = shared.server.borrow_mut().as_mut() {
-        server.close();
+    // Out of the cell first: retirement runs the node's close path,
+    // which drains events through a sink that reaches for this borrow.
+    let mut server = shared.server.borrow_mut().take();
+    if let Some(server) = server.as_mut() {
+        let retirement = server.retire(Some(successor));
+        report(&format!(
+            "generation {} was fenced; {} pending call(s) failed",
+            retirement.generation, retirement.pending_failed
+        ));
     }
-    *shared.server.borrow_mut() = None;
+    drop(server);
+    *shared.lease.borrow_mut() = None;
+    shared.queued.borrow_mut().clear();
     {
         let mut state = shared.state.borrow_mut();
         state.role = Role::Follower;
-        state.lock = None;
         state.subscribed.clear();
+        state.announced.clear();
+        // Last, as always.
+        state.lock = None;
     }
     emit(
         shared,
@@ -843,11 +1289,122 @@ fn flush_events(shared: &Rc<Shared>) {
 
 // ─────────────────────────── the node's backend ────────────────────────
 
+/// The operations one generation admitted, and the handle that drops
+/// them.
+///
+/// Public because it is the seam a [`LeaderBackend`] implementation
+/// needs in order to honour the fence at all: an implementation that
+/// spawns its own futures with `spawn_local` has no way to let go of
+/// them, and `shutdown` would be a promise it could not keep.
+///
+/// `spawn_local` gives no way to cancel a future from outside: the
+/// executor owns it, and the only thing that ends it is the future
+/// completing. So each spawned operation carries a
+/// `oneshot::Receiver` whose sender lives here, and dropping the
+/// sender *cancels* the receiver — which wakes the task, which then
+/// finds its lease revoked and returns without running the rest of
+/// the operation. The replier it was carrying is dropped with it and
+/// settles its caller typed.
+///
+/// Without the wake this would not work: an operation parked on a
+/// barrier that never fires is never polled again, so a lazily
+/// checked fence would leave its caller's promise pending forever —
+/// which is the failure D2 says is worse than a refusal.
+#[derive(Default)]
+pub struct OpRegistry {
+    next: Cell<u64>,
+    live: RefCell<HashMap<u64, oneshot::Sender<()>>>,
+}
+
+impl OpRegistry {
+    /// Admit one operation and hand back its cancellation receiver.
+    pub fn admit(&self) -> (u64, oneshot::Receiver<()>) {
+        let id = self.next.get().wrapping_add(1);
+        self.next.set(id);
+        let (tx, rx) = oneshot::channel();
+        self.live.borrow_mut().insert(id, tx);
+        (id, rx)
+    }
+
+    /// Forget a finished operation, so a long-lived leader's registry
+    /// does not grow one entry per call it ever made.
+    fn finished(&self, id: u64) {
+        self.live.borrow_mut().remove(&id);
+    }
+
+    /// Cancel every live operation. Returns how many.
+    pub fn cancel_all(&self) -> usize {
+        // Taken, then dropped outside the borrow: dropping a sender
+        // wakes its task, and a woken task's first act is to drop its
+        // `Fenced`, which reaches for this same cell.
+        let live = core::mem::take(&mut *self.live.borrow_mut());
+        let count = live.len();
+        drop(live);
+        count
+    }
+}
+
+/// One spawned backend operation, bound to the generation that
+/// admitted it.
+struct Fenced {
+    op: Pin<Box<dyn Future<Output = ()>>>,
+    cancelled: oneshot::Receiver<()>,
+    lease: GenerationLease,
+    registry: Rc<OpRegistry>,
+    id: u64,
+}
+
+impl Future for Fenced {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if !self.lease.is_live() {
+            return Poll::Ready(());
+        }
+        if Pin::new(&mut self.cancelled).poll(cx).is_ready() {
+            return Poll::Ready(());
+        }
+        self.op.as_mut().poll(cx)
+    }
+}
+
+impl Drop for Fenced {
+    fn drop(&mut self) {
+        self.registry.finished(self.id);
+    }
+}
+
+/// Spawn `op` under `lease`, cancellable through `registry`.
+///
+/// Every operation the leader's node performs goes through here, and
+/// that is the point: an operation admitted under generation *n* must
+/// not produce an effect after *n* has been fenced, and the only way
+/// to guarantee that for work that is already in flight is for the
+/// work itself to be droppable.
+pub fn spawn_fenced(
+    lease: &GenerationLease,
+    registry: &Rc<OpRegistry>,
+    op: impl Future<Output = ()> + 'static,
+) {
+    let (id, cancelled) = registry.admit();
+    spawn_local(Fenced {
+        op: Box::pin(op),
+        cancelled,
+        lease: lease.clone(),
+        registry: registry.clone(),
+        id,
+    });
+}
+
 /// The real backend: the leaf node this tab runs.
 struct NodeBackend {
     node: Rc<crate::wasm::LeafNode>,
     node_id: u64,
     streams: Rc<RefCell<HashMap<u64, crate::wasm::LeafStream>>>,
+    /// The fence this backend's operations are admitted under — the
+    /// same lease the server stamps its replies with.
+    lease: GenerationLease,
+    ops: Rc<OpRegistry>,
 }
 
 impl LeaderBackend for NodeBackend {
@@ -855,14 +1412,38 @@ impl LeaderBackend for NodeBackend {
         self.node_id
     }
 
+    fn shutdown(&mut self, generation: u64) -> usize {
+        // The operations first: each one is holding the node, and a
+        // cancelled one is what stops it reaching the transport after
+        // the lock has moved.
+        let cancelled = self.ops.cancel_all();
+        // A stream is session-scoped. D2 is explicit that it is not
+        // resurrected, so the handles go with the node rather than
+        // becoming a table a successor could be addressed through.
+        self.streams.borrow_mut().clear();
+        let failed = self.node.retire(generation);
+        if cancelled > 0 {
+            report(&format!(
+                "generation {generation} cancelled {cancelled} in-flight operation(s)"
+            ));
+        }
+        failed
+    }
+
     fn perform(&mut self, request: LeaderRequest, reply: Replier) {
         let node = self.node.clone();
+        // Every arm that suspends is spawned under the fence: an
+        // operation admitted by this generation must be droppable when
+        // the generation is, and the synchronous arms below cannot
+        // outlive the call anyway.
+        let lease = self.lease.clone();
+        let ops = self.ops.clone();
         match request {
             LeaderRequest::Call {
                 service,
                 payload,
                 timeout_ms,
-            } => spawn_local(async move {
+            } => spawn_fenced(&lease, &ops, async move {
                 match node
                     .call(
                         service,
@@ -875,25 +1456,25 @@ impl LeaderBackend for NodeBackend {
                     Err(error) => reply.fail(reported(error)),
                 }
             }),
-            LeaderRequest::Subscribe { channel } => spawn_local(async move {
+            LeaderRequest::Subscribe { channel } => spawn_fenced(&lease, &ops, async move {
                 match node.subscribe(channel).await {
                     Ok(()) => reply.bytes(Bytes::new()),
                     Err(error) => reply.fail(reported(error)),
                 }
             }),
-            LeaderRequest::Publish { channel, payload } => spawn_local(async move {
+            LeaderRequest::Publish { channel, payload } => spawn_fenced(&lease, &ops, async move {
                 match node.publish(channel, Uint8Array::from(&payload[..])).await {
                     Ok(()) => reply.bytes(Bytes::new()),
                     Err(error) => reply.fail(reported(error)),
                 }
             }),
-            LeaderRequest::Announce { capabilities } => spawn_local(async move {
+            LeaderRequest::Announce { capabilities } => spawn_fenced(&lease, &ops, async move {
                 match node.announce(capabilities).await {
                     Ok(()) => reply.bytes(Bytes::new()),
                     Err(error) => reply.fail(reported(error)),
                 }
             }),
-            LeaderRequest::Query { capability } => spawn_local(async move {
+            LeaderRequest::Query { capability } => spawn_fenced(&lease, &ops, async move {
                 match node.query(capability).await {
                     Ok(json) => reply.text(json),
                     Err(error) => reply.fail(reported(error)),
@@ -901,7 +1482,7 @@ impl LeaderBackend for NodeBackend {
             }),
             LeaderRequest::Counters => reply.text(node.counters_json()),
             LeaderRequest::IsEnrolled => reply.flag(node.is_enrolled()),
-            LeaderRequest::Enroll => spawn_local(async move {
+            LeaderRequest::Enroll => spawn_fenced(&lease, &ops, async move {
                 match node.enroll().await {
                     Ok(()) => reply.bytes(Bytes::new()),
                     Err(error) => reply.fail(reported(error)),
@@ -912,11 +1493,12 @@ impl LeaderBackend for NodeBackend {
                 dialog,
                 kind,
                 payload,
-            } => spawn_local(async move {
+            } => spawn_fenced(&lease, &ops, async move {
                 match node
                     .signal(
                         format!("{peer:016x}"),
-                        dialog as f64,
+                        #[allow(clippy::cast_precision_loss)]
+                        (dialog as f64),
                         kind,
                         Uint8Array::from(&payload[..]),
                     )
@@ -985,7 +1567,7 @@ impl LeaderBackend for NodeBackend {
 
 /// The production factory: connect a real node and route its events.
 fn node_factory() -> BackendFactory {
-    Rc::new(|opts: JsValue, sink: EventSink| {
+    Rc::new(|opts: JsValue, sink: EventSink, lease: GenerationLease| {
         Box::pin(async move {
             let node =
                 crate::wasm::LeafNode::connect(opts)
@@ -1007,6 +1589,8 @@ fn node_factory() -> BackendFactory {
                 node: Rc::new(node),
                 node_id,
                 streams: Rc::new(RefCell::new(HashMap::new())),
+                lease,
+                ops: Rc::new(OpRegistry::default()),
             });
             Ok(backend)
         }) as BackendFuture
@@ -1142,10 +1726,12 @@ impl MeshSession {
     }
 
     /// Publish this node's capability announcement.
+    ///
+    /// Also records it as this tab's current intent, so a takeover
+    /// re-publishes what the page last announced rather than what it
+    /// opened with.
     pub async fn announce(&self, capabilities: Vec<String>) -> Result<(), JsError> {
-        self.lifecycle
-            .request(LeaderRequest::Announce { capabilities })
-            .await?;
+        self.lifecycle.announce(capabilities).await?;
         Ok(())
     }
 
@@ -1221,36 +1807,7 @@ impl MeshSession {
 
     /// Open an application stream, wherever the node is.
     pub async fn open_stream(&self, opts: JsValue) -> Result<ProxyStream, JsError> {
-        let reliability = match optional_string(&opts, "reliability") {
-            Some(spelling) => Reliability::parse(&spelling).ok_or_else(|| {
-                JsError::new("reliability must be \"reliable\" or \"fireAndForget\"")
-            })?,
-            None => Reliability::Reliable,
-        };
-        let stream_id = match optional_string(&opts, "streamId") {
-            Some(raw) => Some(parse_u64(&raw)?),
-            None => None,
-        };
-        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-        let channel_hash = optional_f64(&opts, "channelHash").map(|value| value as u16);
-
-        let value = self
-            .lifecycle
-            .request(LeaderRequest::StreamOpen {
-                label: optional_string(&opts, "label").unwrap_or_else(|| "app".to_string()),
-                reliability,
-                stream_id,
-                channel_hash,
-            })
-            .await?;
-        let ProxyValue::Stream { stream_id } = value else {
-            return Err(JsError::new("open_stream did not answer with a stream"));
-        };
-        Ok(ProxyStream {
-            lifecycle: self.lifecycle.clone(),
-            stream_id,
-            reliable: reliability.is_reliable(),
-        })
+        self.lifecycle.open_stream(&opts).await
     }
 
     /// Register an event listener. One JSON string per event.
@@ -1271,11 +1828,24 @@ impl MeshSession {
 }
 
 /// One application stream, on whichever tab runs the node.
+///
+/// # Why it remembers its generation
+///
+/// A stream id names per-session state, and leadership moving means a
+/// new node with a new and independently allocated stream table. A
+/// handle that carried only the id would therefore address *whatever*
+/// stream the successor happened to open with that id — so a retained
+/// object's `send` could push a payload into a stranger's stream and
+/// its `close` could tear that stream down. Carrying the opening
+/// generation makes the handle refuse instead, and the refusal is
+/// typed, because "the leader changed" is an answer a page can act on
+/// and silence is not.
 #[wasm_bindgen]
 pub struct ProxyStream {
     lifecycle: Lifecycle,
     stream_id: u64,
     reliable: bool,
+    generation: u64,
 }
 
 #[wasm_bindgen]
@@ -1290,8 +1860,17 @@ impl ProxyStream {
         self.reliable
     }
 
+    /// The generation that opened this stream, as a decimal string.
+    pub fn generation(&self) -> String {
+        self.generation.to_string()
+    }
+
     /// Send one payload.
+    ///
+    /// Refused, typed, once leadership has moved: see the type's own
+    /// documentation for why this is not merely an optimisation.
     pub async fn send(&self, payload: Uint8Array) -> Result<(), JsError> {
+        self.still_ours()?;
         self.lifecycle
             .request(LeaderRequest::StreamSend {
                 stream_id: self.stream_id,
@@ -1305,10 +1884,17 @@ impl ProxyStream {
     ///
     /// Filtered from the session's event stream by stream id, which is
     /// the same mechanism a leader-local stream uses — so a follower's
-    /// stream and a leader's deliver through one path.
+    /// stream and a leader's deliver through one path — **and** by the
+    /// generation that opened it, so a stale handle's consumer stops
+    /// receiving rather than starts receiving a successor's bytes.
     pub fn on_message(&self, callback: Function) {
         let wanted = format!("\"stream_id\":\"{}\"", self.stream_id);
+        let lifecycle = self.lifecycle.clone();
+        let generation = self.generation;
         let filter = Closure::wrap(Box::new(move |json: JsValue| {
+            if lifecycle.generation() != generation {
+                return;
+            }
             if json
                 .as_string()
                 .is_some_and(|text| text.contains(&wanted) && text.contains("\"stream_data\""))
@@ -1325,8 +1911,13 @@ impl ProxyStream {
     ///
     /// Not a resurrection point: D2 is explicit that a stream is
     /// session-scoped and is **not** restored across a leader change.
-    /// A page whose leader went away opens a new stream.
+    /// A page whose leader went away opens a new stream — and this
+    /// handle refuses to close anything on a successor, because the
+    /// stream it named is already gone with the node that owned it.
     pub fn close(&self) {
+        if self.still_ours().is_err() {
+            return;
+        }
         let lifecycle = self.lifecycle.clone();
         let stream_id = self.stream_id;
         spawn_local(async move {
@@ -1334,6 +1925,19 @@ impl ProxyStream {
                 .request(LeaderRequest::StreamClose { stream_id })
                 .await;
         });
+    }
+
+    /// Whether the generation that opened this stream is still the one
+    /// in force.
+    fn still_ours(&self) -> Result<(), JsError> {
+        let current = self.lifecycle.generation();
+        if current == self.generation {
+            return Ok(());
+        }
+        Err(js(LeafError::NotLeader {
+            presented: self.generation,
+            current: Some(current),
+        }))
     }
 }
 
@@ -1468,27 +2072,12 @@ fn optional_string(opts: &JsValue, key: &str) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
-fn optional_f64(opts: &JsValue, key: &str) -> Option<f64> {
-    Reflect::get(opts, &JsValue::from_str(key))
-        .ok()
-        .and_then(|value| value.as_f64())
-}
-
 fn string_array(opts: &JsValue, key: &str) -> Vec<String> {
     Reflect::get(opts, &JsValue::from_str(key))
         .ok()
         .and_then(|value| value.dyn_into::<js_sys::Array>().ok())
         .map(|array| array.iter().filter_map(|item| item.as_string()).collect())
         .unwrap_or_default()
-}
-
-fn parse_u64(raw: &str) -> Result<u64, JsError> {
-    let trimmed = raw.trim();
-    let parsed = match trimmed.strip_prefix("0x") {
-        Some(hex) => u64::from_str_radix(hex, 16),
-        None => trimmed.parse(),
-    };
-    parsed.map_err(|_| JsError::new(&format!("{raw:?} is not a u64")))
 }
 
 impl From<ProxyFailure> for JsError {

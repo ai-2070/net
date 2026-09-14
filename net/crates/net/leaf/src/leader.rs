@@ -49,6 +49,7 @@
 //! part with the subtle failure modes, and it should not need a
 //! browser to review.
 
+use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 
@@ -63,7 +64,12 @@ use crate::stream::Reliability;
 /// envelope carrying anything else is refused rather than guessed at,
 /// because two tabs running different builds of the package is an
 /// ordinary consequence of a deploy.
-pub const PROXY_VERSION: u64 = 1;
+///
+/// `2` because [`ProxyBody::Attach`] now carries the follower's
+/// **capability** intent beside its subscriptions: D2 promises the
+/// current announcement is re-published on takeover, and a successor
+/// that only learned about channels could restore half of it.
+pub const PROXY_VERSION: u64 = 2;
 
 /// The Web Lock and `BroadcastChannel` name for an identity on an
 /// origin.
@@ -137,17 +143,140 @@ impl GenerationGate {
     }
 }
 
+/// The live generation a leader's outbound effects are admitted
+/// under — D2's fence as an object rather than as a number.
+///
+/// [`GenerationGate`] is the *receiving* half: it refuses a message
+/// stamped by a leader that has been superseded. This is the
+/// *emitting* half, and it exists because a number cannot be revoked.
+/// Stand-down revokes the lease **before** the node is closed and
+/// before the lock is released, so everything that could still be
+/// produced by work admitted earlier — a reply from an operation that
+/// was parked before dispatch, that operation's next poll, the node's
+/// ticker — consults a fence that has already moved.
+///
+/// Cheap on purpose: a `Cell` read, not a storage lookup. The storage
+/// generation (`crate::storage::IdentityVault::fence`) is the
+/// authority on *who holds the lock*, and a leader revalidates against
+/// it periodically; but a per-effect IndexedDB transaction would put
+/// an await in front of every send, and an await is exactly the window
+/// this is closing.
+///
+/// A revoked lease is never re-armed. A tab that stood down and later
+/// takes leadership again gets a new lease for its new generation,
+/// which is what makes "admitted under generation *n*" mean something
+/// after the tab has been leader twice.
+#[derive(Debug, Clone)]
+pub struct GenerationLease {
+    inner: Rc<LeaseState>,
+}
+
+#[derive(Debug)]
+struct LeaseState {
+    generation: u64,
+    revoked: Cell<bool>,
+    successor: Cell<Option<u64>>,
+    refused: Cell<u64>,
+}
+
+impl GenerationLease {
+    /// A live lease for `generation`.
+    pub fn new(generation: u64) -> Self {
+        Self {
+            inner: Rc::new(LeaseState {
+                generation,
+                revoked: Cell::new(false),
+                successor: Cell::new(None),
+                refused: Cell::new(0),
+            }),
+        }
+    }
+
+    /// The generation this lease admits.
+    #[inline]
+    pub fn generation(&self) -> u64 {
+        self.inner.generation
+    }
+
+    /// Whether effects are still admitted.
+    #[inline]
+    pub fn is_live(&self) -> bool {
+        !self.inner.revoked.get()
+    }
+
+    /// The generation that displaced this one, when it is known.
+    #[inline]
+    pub fn successor(&self) -> Option<u64> {
+        self.inner.successor.get()
+    }
+
+    /// Revoke the lease. Idempotent: standing down twice fences once.
+    ///
+    /// `successor` is the generation that displaced this one when the
+    /// tab learned it (a higher-generation proxy message), and `None`
+    /// on an orderly close, where nobody has taken over yet.
+    pub fn revoke(&self, successor: Option<u64>) {
+        self.inner.revoked.set(true);
+        if successor.is_some() {
+            self.inner.successor.set(successor);
+        }
+    }
+
+    /// Admit one outbound effect, or refuse it typed.
+    ///
+    /// Every call that refuses is counted, which is what makes "no
+    /// further outbound effects after the fence" an assertion rather
+    /// than an absence a test has to infer.
+    pub fn admit(&self) -> Result<()> {
+        if self.is_live() {
+            return Ok(());
+        }
+        self.inner.refused.set(self.inner.refused.get() + 1);
+        Err(self.refusal())
+    }
+
+    /// How many effects this lease has refused since it was revoked.
+    #[inline]
+    pub fn refused(&self) -> u64 {
+        self.inner.refused.get()
+    }
+
+    /// The refusal a revoked lease produces.
+    pub fn refusal(&self) -> LeafError {
+        LeafError::NotLeader {
+            presented: self.inner.generation,
+            current: self.inner.successor.get(),
+        }
+    }
+}
+
 // ──────────────────────────── follower registry ────────────────────────
 
 /// Which followers are attached and what each one declared.
 ///
 /// The leader keeps this so a *new* leader can re-establish the
-/// subscriptions its followers depend on (D2 "Restoration"). It is
-/// the union, not the last writer: two followers wanting two channels
-/// both get theirs.
+/// subscriptions **and the announcement** its followers depend on
+/// (D2 "Restoration"). It is the union, not the last writer: two
+/// followers wanting two channels both get theirs.
 #[derive(Debug, Clone, Default)]
 pub struct FollowerRegistry {
-    followers: HashMap<u64, BTreeSet<String>>,
+    followers: HashMap<u64, Declaration>,
+}
+
+/// One follower's declared intent: what it needs subscribed, and what
+/// it needs announced.
+///
+/// Both travel the same way for the same reason. A capability a
+/// follower announced through the session API is that tab's current
+/// intent, not a one-off network operation, so a successor that does
+/// not know it would silently narrow the origin's announcement at the
+/// next handoff.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Declaration {
+    /// Channels this follower needs kept subscribed.
+    pub subscriptions: BTreeSet<String>,
+    /// Capabilities this follower needs kept announced.
+    pub capabilities: BTreeSet<String>,
 }
 
 impl FollowerRegistry {
@@ -156,12 +285,22 @@ impl FollowerRegistry {
         Self::default()
     }
 
-    /// Attach `follower` with the subscriptions it declared. Re-attach
-    /// replaces the declaration, which is what a follower that
-    /// survived a leader change sends.
-    pub fn attach(&mut self, follower: u64, subscriptions: impl IntoIterator<Item = String>) {
-        self.followers
-            .insert(follower, subscriptions.into_iter().collect());
+    /// Attach `follower` with what it declared. Re-attach replaces the
+    /// declaration, which is what a follower that survived a leader
+    /// change sends.
+    pub fn attach(
+        &mut self,
+        follower: u64,
+        subscriptions: impl IntoIterator<Item = String>,
+        capabilities: impl IntoIterator<Item = String>,
+    ) {
+        self.followers.insert(
+            follower,
+            Declaration {
+                subscriptions: subscriptions.into_iter().collect(),
+                capabilities: capabilities.into_iter().collect(),
+            },
+        );
     }
 
     /// Record a channel a follower subscribed to after attaching.
@@ -169,7 +308,19 @@ impl FollowerRegistry {
         self.followers
             .entry(follower)
             .or_default()
+            .subscriptions
             .insert(channel.to_string());
+    }
+
+    /// Record the capabilities a follower announced after attaching.
+    ///
+    /// Replaces rather than unions: `announce(caps)` publishes a
+    /// document, and its argument is the whole of what that tab wants
+    /// announced. Accumulating would make a tab that dropped a tag get
+    /// it back at the next handoff.
+    pub fn declare_capabilities(&mut self, follower: u64, capabilities: &[String]) {
+        self.followers.entry(follower).or_default().capabilities =
+            capabilities.iter().cloned().collect();
     }
 
     /// Forget a follower.
@@ -195,7 +346,16 @@ impl FollowerRegistry {
     pub fn subscription_union(&self) -> Vec<String> {
         let mut union = BTreeSet::new();
         for declared in self.followers.values() {
-            union.extend(declared.iter().cloned());
+            union.extend(declared.subscriptions.iter().cloned());
+        }
+        union.into_iter().collect()
+    }
+
+    /// The union of every follower's declared capabilities, sorted.
+    pub fn capability_union(&self) -> Vec<String> {
+        let mut union = BTreeSet::new();
+        for declared in self.followers.values() {
+            union.extend(declared.capabilities.iter().cloned());
         }
         union.into_iter().collect()
     }
@@ -383,6 +543,11 @@ pub enum ProxyBody {
     Attach {
         /// The channels this follower wants kept subscribed.
         subscriptions: Vec<String>,
+        /// The capabilities this follower wants kept announced — its
+        /// constructor's list plus anything a later `announce()`
+        /// declared, so a successor restores the current intent and
+        /// not one tab's opening options.
+        capabilities: Vec<String>,
     },
     /// Follower → leader: "I am going away."
     Detach,
@@ -470,9 +635,13 @@ impl ProxyEnvelope {
             }
         }
         match &self.body {
-            ProxyBody::Attach { subscriptions } => {
+            ProxyBody::Attach {
+                subscriptions,
+                capabilities,
+            } => {
                 map.insert("kind".into(), Value::from("attach"));
                 map.insert("subscriptions".into(), strings(subscriptions));
+                map.insert("capabilities".into(), strings(capabilities));
             }
             ProxyBody::Detach => {
                 map.insert("kind".into(), Value::from("detach"));
@@ -541,6 +710,7 @@ impl ProxyEnvelope {
         let body = match str_field(&value, "kind")? {
             "attach" => ProxyBody::Attach {
                 subscriptions: string_list(&value, "subscriptions")?,
+                capabilities: string_list(&value, "capabilities")?,
             },
             "detach" => ProxyBody::Detach,
             "request" => ProxyBody::Request {
@@ -652,7 +822,7 @@ impl ProxyTransport for RecordingTransport {
 /// on the origin.
 pub struct Replier {
     sink: Option<ReplySink>,
-    generation: u64,
+    lease: GenerationLease,
     correlation: u64,
 }
 
@@ -707,27 +877,63 @@ impl Replier {
     ///
     /// The correlation is `0`: a local answer is delivered to one
     /// waiting future, so there is nothing to correlate against.
-    pub fn local(answer: oneshot::Sender<ProxyOutcome>, generation: u64) -> Self {
+    pub fn local(answer: oneshot::Sender<ProxyOutcome>, lease: GenerationLease) -> Self {
         Self {
             sink: Some(ReplySink::Local(answer)),
-            generation,
+            lease,
             correlation: 0,
         }
+    }
+
+    /// The generation this answer was admitted under.
+    #[inline]
+    pub fn generation(&self) -> u64 {
+        self.lease.generation()
     }
 
     fn send(&mut self, body: ProxyBody) {
         let Some(sink) = self.sink.take() else {
             return;
         };
+        // THE fence, on the emitting side. An operation admitted
+        // before stand-down can still reach this line afterwards —
+        // it was parked on an await, and the reply is the first thing
+        // it does when it resumes. Its answer is not this tab's to
+        // give any more, so what the caller gets is the typed reason
+        // and not a success produced by a node that no longer holds
+        // the identity.
+        let fenced = self.lease.admit().is_err();
+        let body = if fenced {
+            ProxyBody::Failed {
+                correlation: self.correlation,
+                failure: ProxyFailure::Typed(LeafError::Rpc(RpcError::LeaderLost {
+                    generation: self.lease.generation(),
+                })),
+            }
+        } else {
+            body
+        };
         match sink {
-            ReplySink::Channel(transport) => transport.post(
-                &ProxyEnvelope {
-                    generation: self.generation,
-                    from: ProxySide::Leader,
-                    body,
+            ReplySink::Channel(transport) => {
+                // A follower's correlation is already dead by the time
+                // the fence fires: stand-down broadcasts `LeaderLost`
+                // before it closes the node, and the follower's
+                // pending map is drained by that message. Posting a
+                // second answer would be a message from a tab that
+                // has stood down — which is exactly what the fence
+                // exists to stop — so a fenced channel answer is
+                // counted and dropped, not sent.
+                if !fenced {
+                    transport.post(
+                        &ProxyEnvelope {
+                            generation: self.lease.generation(),
+                            from: ProxySide::Leader,
+                            body,
+                        }
+                        .to_json(),
+                    );
                 }
-                .to_json(),
-            ),
+            }
             ReplySink::Local(answer) => {
                 let outcome = match body {
                     ProxyBody::Reply { value, .. } => Ok(value),
@@ -746,6 +952,12 @@ impl Drop for Replier {
     /// A replier dropped without an answer is a lost correlation, and
     /// a follower's promise that never settles is worse than a
     /// failure: it looks like latency forever. So dropping answers.
+    ///
+    /// Which failure depends on the fence, and that is how stand-down
+    /// cancels work: dropping the future an operation was parked in
+    /// drops the replier it moved, and a replier whose lease has been
+    /// revoked settles its caller with `LeaderLost` for the generation
+    /// that admitted the operation — once, because the sink is taken.
     fn drop(&mut self) {
         let correlation = self.correlation;
         self.send(ProxyBody::Failed {
@@ -774,6 +986,22 @@ pub trait LeaderBackend {
     /// forgotten one is caught by its `Drop`. An implementation that
     /// needs to await something moves the replier into the future.
     fn perform(&mut self, request: LeaderRequest, reply: Replier);
+
+    /// Retire the node this backend owns, and say how many of its
+    /// pending calls that failed.
+    ///
+    /// Called by [`ProxyServer::retire`] **after** the generation has
+    /// been fenced and **before** the lock is released. Three things
+    /// are owed, and the fence is what makes them finite: close the
+    /// transport so the node emits nothing further, let go of the
+    /// operations that were admitted under the fenced generation (the
+    /// replier each one carries settles its caller as it is dropped),
+    /// and fail the node's own pending calls once with a typed error.
+    ///
+    /// The count is the observable half. "Pending calls fail exactly
+    /// once" is a claim, and a number a witness can read is the
+    /// difference between checking it and believing it.
+    fn shutdown(&mut self, generation: u64) -> usize;
 }
 
 /// A boxed backend is a backend.
@@ -791,13 +1019,29 @@ impl LeaderBackend for Box<dyn LeaderBackend> {
     fn perform(&mut self, request: LeaderRequest, reply: Replier) {
         (**self).perform(request, reply);
     }
+
+    fn shutdown(&mut self, generation: u64) -> usize {
+        (**self).shutdown(generation)
+    }
+}
+
+/// What retiring a leader did, so a caller can assert on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Retirement {
+    /// The generation that was fenced.
+    pub generation: u64,
+    /// How many of the node's pending calls the backend failed.
+    pub pending_failed: usize,
+    /// Whether this call is the one that fenced the generation, as
+    /// opposed to a second stand-down finding it already fenced.
+    pub fenced_here: bool,
 }
 
 /// The leader's half of the proxy.
 pub struct ProxyServer<B: LeaderBackend> {
     backend: B,
     transport: Rc<dyn ProxyTransport>,
-    generation: u64,
+    lease: GenerationLease,
     followers: FollowerRegistry,
     stamped: u64,
     superseded: Option<u64>,
@@ -805,12 +1049,27 @@ pub struct ProxyServer<B: LeaderBackend> {
 }
 
 impl<B: LeaderBackend> ProxyServer<B> {
-    /// A server for `generation`, posting on `transport`.
+    /// A server for `generation`, posting on `transport`, with a fresh
+    /// lease for that generation.
     pub fn new(backend: B, transport: Rc<dyn ProxyTransport>, generation: u64) -> Self {
+        Self::with_lease(backend, transport, GenerationLease::new(generation))
+    }
+
+    /// A server over a lease the caller already holds.
+    ///
+    /// The lifecycle needs this: the backend is connected *before* the
+    /// server exists, and the operations it spawns have to be admitted
+    /// under the same lease this server's replies are. A lease created
+    /// here would be a second fence, and two fences are none.
+    pub fn with_lease(
+        backend: B,
+        transport: Rc<dyn ProxyTransport>,
+        lease: GenerationLease,
+    ) -> Self {
         Self {
             backend,
             transport,
-            generation,
+            lease,
             followers: FollowerRegistry::new(),
             stamped: 0,
             superseded: None,
@@ -818,10 +1077,51 @@ impl<B: LeaderBackend> ProxyServer<B> {
         }
     }
 
+    /// The lease every effect of this leader is admitted under.
+    pub fn lease(&self) -> GenerationLease {
+        self.lease.clone()
+    }
+
+    /// Retire this leader, in the order D2 requires.
+    ///
+    /// 1. **Fence the generation.** The lease is revoked first, so
+    ///    from here on a reply, a resumed operation or the node's
+    ///    ticker is refused rather than emitted — including the ones
+    ///    admitted a microtask ago.
+    /// 2. **Close the node.** The backend cancels the operations the
+    ///    fenced generation admitted and fails the node's pending
+    ///    calls once, typed.
+    /// 3. **Tell the followers**, so their pending work fails against
+    ///    the generation that owned it rather than against the
+    ///    successor's.
+    ///
+    /// Releasing the lock is deliberately **not** here: the lock is a
+    /// browser object this module cannot see. What is here is the
+    /// guarantee that it is the *last* step — everything above has
+    /// already happened by the time this returns, so a caller whose
+    /// next statement drops the lock cannot get the order wrong.
+    pub fn retire(&mut self, successor: Option<u64>) -> Retirement {
+        let generation = self.lease.generation();
+        let fenced_here = self.lease.is_live();
+        self.lease.revoke(successor);
+        let pending_failed = self.backend.shutdown(generation);
+        self.closed = true;
+        // Announced last, and announced even when the lease was
+        // already revoked: a follower that never heard `LeaderLost`
+        // would keep a promise pending until the successor's higher
+        // generation happened to arrive.
+        self.post_fenced(ProxyBody::LeaderLost { lost: generation });
+        Retirement {
+            generation,
+            pending_failed,
+            fenced_here,
+        }
+    }
+
     /// The generation this leader holds.
     #[inline]
     pub fn generation(&self) -> u64 {
-        self.generation
+        self.lease.generation()
     }
 
     /// The node id this leader runs.
@@ -876,6 +1176,12 @@ impl<B: LeaderBackend> ProxyServer<B> {
         self.followers.subscription_union()
     }
 
+    /// The union of the followers' declared capabilities — what a new
+    /// leader re-announces beside its own.
+    pub fn capability_restoration(&self) -> Vec<String> {
+        self.followers.capability_union()
+    }
+
     /// The backend, for the leader's own local operations.
     pub fn backend_mut(&mut self) -> &mut B {
         &mut self.backend
@@ -892,11 +1198,6 @@ impl<B: LeaderBackend> ProxyServer<B> {
         self.post(ProxyBody::Restored {
             channel: channel.to_string(),
         });
-    }
-
-    /// Tell every tab that `lost`'s in-flight work is dead.
-    pub fn announce_leader_lost(&mut self, lost: u64) {
-        self.post(ProxyBody::LeaderLost { lost });
     }
 
     /// Proxy one node event to the followers.
@@ -936,7 +1237,7 @@ impl<B: LeaderBackend> ProxyServer<B> {
         // serving; if it is behind, it is a stale tab and its
         // messages are not ours to act on either way.
         if envelope.from == ProxySide::Leader {
-            if envelope.generation > self.generation {
+            if envelope.generation > self.generation() {
                 self.superseded = Some(envelope.generation);
             }
             return Ok(());
@@ -949,8 +1250,11 @@ impl<B: LeaderBackend> ProxyServer<B> {
             // `Attach` is the fence's one exemption: a tab that just
             // opened has no generation yet, and this is the message
             // that gets it one.
-            ProxyBody::Attach { subscriptions } => {
-                self.followers.attach(follower, subscriptions);
+            ProxyBody::Attach {
+                subscriptions,
+                capabilities,
+            } => {
+                self.followers.attach(follower, subscriptions, capabilities);
                 self.announce_leadership();
                 Ok(())
             }
@@ -962,20 +1266,30 @@ impl<B: LeaderBackend> ProxyServer<B> {
                 correlation,
                 request,
             } => {
-                if envelope.generation > self.generation {
+                if envelope.generation > self.generation() {
                     self.superseded = Some(envelope.generation);
                 }
-                if envelope.generation != self.generation {
+                if envelope.generation != self.generation() {
                     let error = LeafError::NotLeader {
                         presented: envelope.generation,
-                        current: Some(self.generation),
+                        current: Some(self.generation()),
                     };
                     self.replier(correlation)
                         .fail(ProxyFailure::Typed(error.clone()));
                     return Err(error);
                 }
-                if let LeaderRequest::Subscribe { channel } = &request {
-                    self.followers.declare(follower, channel);
+                // A declaration, not just an operation. Both of these
+                // are that follower's standing intent, and a successor
+                // that only learned the operations would restore the
+                // channels and quietly narrow the announcement.
+                match &request {
+                    LeaderRequest::Subscribe { channel } => {
+                        self.followers.declare(follower, channel);
+                    }
+                    LeaderRequest::Announce { capabilities } => {
+                        self.followers.declare_capabilities(follower, capabilities);
+                    }
+                    _ => {}
                 }
                 let reply = self.replier(correlation);
                 self.backend.perform(request, reply);
@@ -992,16 +1306,37 @@ impl<B: LeaderBackend> ProxyServer<B> {
         self.stamped += 1;
         Replier {
             sink: Some(ReplySink::Channel(self.transport.clone())),
-            generation: self.generation,
+            lease: self.lease.clone(),
             correlation,
         }
     }
 
+    /// Post one leader message, unless the generation has been
+    /// fenced.
+    ///
+    /// The fence covers what this leader *says* as well as what its
+    /// node does: a `Leadership`, `Restored` or `Event` broadcast from
+    /// a tab that has stood down is a stale leader talking, and a
+    /// follower would have to distrust it on arrival instead of never
+    /// receiving it.
     fn post(&mut self, body: ProxyBody) {
+        if self.lease.admit().is_err() {
+            return;
+        }
+        self.post_fenced(body);
+    }
+
+    /// Post one message the fence does not gate.
+    ///
+    /// Exactly one body needs this, and it is the one that *publishes*
+    /// the fence: a stand-down's `LeaderLost`. Gating it behind the
+    /// lease it just revoked would leave every follower's promise
+    /// pending until the successor happened to announce itself.
+    fn post_fenced(&mut self, body: ProxyBody) {
         self.stamped += 1;
         self.transport.post(
             &ProxyEnvelope {
-                generation: self.generation,
+                generation: self.lease.generation(),
                 from: ProxySide::Leader,
                 body,
             }
@@ -1062,12 +1397,14 @@ pub struct ProxyClient {
     gate: GenerationGate,
     leader_node: Option<u64>,
     subscriptions: Vec<String>,
+    capabilities: Vec<String>,
     pending: HashMap<u64, oneshot::Sender<ProxyOutcome>>,
     next_correlation: u64,
 }
 
 impl ProxyClient {
-    /// A client for `follower`, declaring `subscriptions`.
+    /// A client for `follower`, declaring `subscriptions` and
+    /// `capabilities`.
     ///
     /// `correlation_seed` is the first correlation id, for the same
     /// reason [`crate::rpc::CallTable::with_seed`] exists: a follower
@@ -1078,6 +1415,7 @@ impl ProxyClient {
         transport: Rc<dyn ProxyTransport>,
         follower: u64,
         subscriptions: Vec<String>,
+        capabilities: Vec<String>,
         correlation_seed: u64,
     ) -> Self {
         Self {
@@ -1086,6 +1424,7 @@ impl ProxyClient {
             gate: GenerationGate::new(),
             leader_node: None,
             subscriptions,
+            capabilities,
             pending: HashMap::new(),
             next_correlation: correlation_seed,
         }
@@ -1115,11 +1454,15 @@ impl ProxyClient {
         self.follower
     }
 
-    /// Declare the channels this follower depends on and ask whoever
-    /// holds the lock to identify itself.
+    /// Declare what this follower depends on and ask whoever holds
+    /// the lock to identify itself.
     pub fn attach(&mut self) {
         let subscriptions = self.subscriptions.clone();
-        self.post(ProxyBody::Attach { subscriptions });
+        let capabilities = self.capabilities.clone();
+        self.post(ProxyBody::Attach {
+            subscriptions,
+            capabilities,
+        });
     }
 
     /// Say goodbye, so the leader stops keeping this follower's
@@ -1135,6 +1478,23 @@ impl ProxyClient {
     /// silently convert "there is no node" into latency, and D2's rule
     /// is that nothing is retried behind the caller's back.
     pub fn request(&mut self, request: LeaderRequest) -> oneshot::Receiver<ProxyOutcome> {
+        self.issue(request).1
+    }
+
+    /// Issue one request and return its correlation id beside the
+    /// future.
+    ///
+    /// The id is what a **local deadline** needs: a follower's call
+    /// carries the caller's timeout in the request, but the deadline
+    /// that expires it is the leader's, pumped on the leader's node —
+    /// so a leader that is frozen while holding its lock produces no
+    /// expiry at all and the caller waits for the suspension. The
+    /// session arms its own timer over this id and settles the entry
+    /// through [`Self::expire`].
+    pub fn issue(
+        &mut self,
+        request: LeaderRequest,
+    ) -> (Option<u64>, oneshot::Receiver<ProxyOutcome>) {
         let (tx, rx) = oneshot::channel();
         let generation = self.gate.highest();
         if generation == 0 {
@@ -1142,21 +1502,47 @@ impl ProxyClient {
                 presented: 0,
                 current: None,
             })));
-            return rx;
+            return (None, rx);
         }
         let correlation = self.next_correlation;
         self.next_correlation = self.next_correlation.wrapping_add(1);
-        if let LeaderRequest::Subscribe { channel } = &request {
-            if !self.subscriptions.iter().any(|c| c == channel) {
-                self.subscriptions.push(channel.clone());
+        // Standing intent, recorded so a re-attach after a leader
+        // change carries it: whichever tab is promoted restores what
+        // its followers currently want, not what they asked for once.
+        match &request {
+            LeaderRequest::Subscribe { channel } => {
+                if !self.subscriptions.iter().any(|c| c == channel) {
+                    self.subscriptions.push(channel.clone());
+                }
             }
+            LeaderRequest::Announce { capabilities } => {
+                self.capabilities = capabilities.clone();
+            }
+            _ => {}
         }
         self.pending.insert(correlation, tx);
         self.post(ProxyBody::Request {
             correlation,
             request,
         });
-        rx
+        (Some(correlation), rx)
+    }
+
+    /// Settle one in-flight request with `failure`, if it is still
+    /// in flight. `true` when this call is what settled it.
+    ///
+    /// The honest half of a local deadline: it removes the
+    /// correlation so a later reply lands nowhere, and it does **not**
+    /// re-issue anything. The operation may have executed on the
+    /// leader; that is what the failure says.
+    pub fn expire(&mut self, correlation: u64, failure: ProxyFailure) -> bool {
+        match self.pending.remove(&correlation) {
+            Some(tx) => {
+                let _ = tx.send(Err(failure));
+                true
+            }
+            None => false,
+        }
     }
 
     /// Handle one inbound message.
@@ -1203,12 +1589,25 @@ impl ProxyClient {
                     Admission::NewLeader { previous } => previous,
                     Admission::Current => envelope.generation,
                 };
-                // Re-declare: a leader that just took over has no
-                // record of this follower.
-                if let Admission::NewLeader { previous } = admission {
-                    if previous != 0 {
-                        self.attach();
-                    }
+                // Re-declare, on **every** generation this follower
+                // has not yet declared under — including the first.
+                //
+                // The old guard was `previous != 0`, on the reasoning
+                // that the first `Leadership` is the answer to the
+                // `Attach` this follower has just sent. It is not
+                // always: a tab can attach into a leader that has no
+                // server yet (it is inside its backend connect) or
+                // into an incumbent that is itself between states
+                // (still a follower, about to be promoted), and in
+                // both cases the message is not acted on. The
+                // follower then learned the generation and never
+                // re-declared, so its subscriptions reached no node
+                // at all. Re-declaring here costs one extra message
+                // pair at startup and terminates immediately after
+                // it: the answering `Leadership` carries the same
+                // generation, which admits as `Current`.
+                if matches!(admission, Admission::NewLeader { .. }) {
+                    self.attach();
                 }
                 Ok(Some(FollowerEvent::Leader {
                     generation: envelope.generation,
@@ -1262,6 +1661,12 @@ impl ProxyClient {
     /// The channels this follower has declared.
     pub fn subscriptions(&self) -> &[String] {
         &self.subscriptions
+    }
+
+    /// The capabilities this follower has declared — its constructor's
+    /// list, replaced by whatever its last `announce()` asked for.
+    pub fn capabilities(&self) -> &[String] {
+        &self.capabilities
     }
 
     fn post(&mut self, body: ProxyBody) {
@@ -1555,6 +1960,16 @@ fn encode_error(error: &LeafError) -> Value {
             map.insert("kind".into(), Value::from("identity"));
             map.insert("detail".into(), Value::from(detail.clone()));
         }
+        LeafError::Backpressure {
+            stream_id,
+            needed,
+            remaining,
+        } => {
+            map.insert("kind".into(), Value::from("backpressure"));
+            map.insert("stream_id".into(), Value::from(stream_id.to_string()));
+            map.insert("needed".into(), Value::from(*needed));
+            map.insert("remaining".into(), Value::from(*remaining));
+        }
         LeafError::NotLeader { presented, current } => {
             map.insert("kind".into(), Value::from("not_leader"));
             map.insert("presented".into(), Value::from(presented.to_string()));
@@ -1608,6 +2023,10 @@ fn encode_error(error: &LeafError) -> Value {
                 RpcError::LeaderLost { generation } => {
                     map.insert("rpc".into(), Value::from("leader_lost"));
                     map.insert("generation".into(), Value::from(generation.to_string()));
+                }
+                RpcError::Indeterminate { deadline_ms } => {
+                    map.insert("rpc".into(), Value::from("indeterminate"));
+                    map.insert("deadline_ms".into(), Value::from(*deadline_ms));
                 }
                 RpcError::Malformed(detail) => {
                     map.insert("rpc".into(), Value::from("malformed"));
@@ -1669,6 +2088,11 @@ fn decode_error(value: &Value) -> Result<LeafError> {
             "leader_lost" => RpcError::LeaderLost {
                 generation: u64_field(value, "generation")?,
             },
+            "indeterminate" => RpcError::Indeterminate {
+                deadline_ms: u64_field(value, "deadline_ms")?.try_into().map_err(|_| {
+                    LeafError::ControlPlane("proxy rpc deadline_ms does not fit a u32".into())
+                })?,
+            },
             "malformed" => RpcError::Malformed(detail("detail")?),
             other => {
                 return Err(LeafError::ControlPlane(format!(
@@ -1676,6 +2100,15 @@ fn decode_error(value: &Value) -> Result<LeafError> {
                 )))
             }
         }),
+        "backpressure" => LeafError::Backpressure {
+            stream_id: u64_field(value, "stream_id")?,
+            needed: u64_field(value, "needed")?.try_into().map_err(|_| {
+                LeafError::ControlPlane("proxy backpressure needed does not fit a u32".into())
+            })?,
+            remaining: u64_field(value, "remaining")?.try_into().map_err(|_| {
+                LeafError::ControlPlane("proxy backpressure remaining does not fit a u32".into())
+            })?,
+        },
         other => {
             return Err(LeafError::ControlPlane(format!(
                 "unknown proxy error kind {other:?}"
@@ -1703,7 +2136,7 @@ fn bool_field(value: &Value, key: &str) -> Result<bool> {
 }
 
 /// A `u64` from a decimal string, or from a small JSON number where
-/// the field is bounded (`status`).
+/// the field is bounded (`status`, `deadline_ms`).
 fn u64_field(value: &Value, key: &str) -> Result<u64> {
     let raw = field(value, key)?;
     if let Some(text) = raw.as_str() {
@@ -1782,6 +2215,18 @@ mod tests {
             } else {
                 self.held.borrow_mut().push(reply);
             }
+        }
+
+        /// The native double's retirement: let go of every held
+        /// replier, which is what a real backend's cancellation does
+        /// to the operations it spawned. Each dropped replier settles
+        /// its caller through `Replier::Drop`, and the count is how
+        /// many that was.
+        fn shutdown(&mut self, _generation: u64) -> usize {
+            let held = core::mem::take(&mut *self.held.borrow_mut());
+            let count = held.len();
+            drop(held);
+            count
         }
     }
 
@@ -1902,7 +2347,7 @@ mod tests {
     #[test]
     fn udp_blocked_without_both_observations_arrives_as_an_ice_timeout() {
         let forged = serde_json::json!({
-            "v": "1",
+            "v": "2",
             "generation": "1",
             "from": "leader",
             "kind": "failed",
@@ -1968,6 +2413,7 @@ mod tests {
         let bodies = vec![
             ProxyBody::Attach {
                 subscriptions: vec!["a".into(), "b".into()],
+                capabilities: vec!["cap".into()],
             },
             ProxyBody::Detach,
             ProxyBody::Request {
@@ -2080,38 +2526,52 @@ mod tests {
     #[test]
     fn an_unknown_protocol_version_is_refused() {
         let text =
-            envelope(1, ProxySide::Leader, ProxyBody::Detach).replace("\"v\":\"1\"", "\"v\":\"2\"");
-        let error = ProxyEnvelope::from_json(&text).expect_err("a v2 envelope must be refused");
-        assert!(error.to_string().contains("version 2"), "{error}");
+            envelope(1, ProxySide::Leader, ProxyBody::Detach).replace("\"v\":\"2\"", "\"v\":\"3\"");
+        let error = ProxyEnvelope::from_json(&text).expect_err("a v3 envelope must be refused");
+        assert!(error.to_string().contains("version 3"), "{error}");
         assert!(ProxyEnvelope::from_json("not json").is_err());
-        assert!(ProxyEnvelope::from_json("{\"v\":\"1\"}").is_err());
+        assert!(ProxyEnvelope::from_json("{\"v\":\"2\"}").is_err());
     }
 
     // ────────────────────────── the follower registry ────────────────────
 
     /// Restoration is the union, not the last writer: two followers
-    /// wanting two channels both get theirs back.
+    /// wanting two channels both get theirs back. Capability intent
+    /// travels the same way, for the same reason.
     #[test]
     fn restoration_is_the_union_of_every_followers_declaration() {
         let mut registry = FollowerRegistry::new();
         assert!(registry.is_empty());
-        registry.attach(1, ["alpha".to_string(), "beta".to_string()]);
-        registry.attach(2, ["beta".to_string(), "gamma".to_string()]);
+        registry.attach(
+            1,
+            ["alpha".to_string(), "beta".to_string()],
+            ["cap-a".to_string()],
+        );
+        registry.attach(2, ["beta".to_string(), "gamma".to_string()], []);
         registry.declare(2, "delta");
+        registry.declare_capabilities(2, &["cap-b".to_string()]);
         assert_eq!(registry.len(), 2);
         assert_eq!(
             registry.subscription_union(),
             vec!["alpha", "beta", "delta", "gamma"],
             "deduplicated and ordered, so the restoration sequence is deterministic"
         );
+        assert_eq!(registry.capability_union(), vec!["cap-a", "cap-b"]);
 
         registry.detach(2);
         assert_eq!(registry.subscription_union(), vec!["alpha", "beta"]);
+        assert_eq!(registry.capability_union(), vec!["cap-a"]);
         // Re-attach replaces a declaration rather than merging into
         // it: a follower that dropped a channel must not have it kept
         // alive forever.
-        registry.attach(1, ["alpha".to_string()]);
+        registry.attach(1, ["alpha".to_string()], []);
         assert_eq!(registry.subscription_union(), vec!["alpha"]);
+        assert!(registry.capability_union().is_empty());
+        // The same rule for capabilities declared after attaching: a
+        // second `announce()` publishes a document, so it replaces.
+        registry.declare_capabilities(1, &["cap-c".to_string()]);
+        registry.declare_capabilities(1, &["cap-d".to_string()]);
+        assert_eq!(registry.capability_union(), vec!["cap-d"]);
     }
 
     // ─────────────────────────── the leader's half ───────────────────────
@@ -2128,7 +2588,6 @@ mod tests {
         server.announce_leadership();
         server.announce_restored("chan");
         server.broadcast_event("{\"type\":\"connected\"}");
-        server.announce_leader_lost(6);
         server
             .on_message(&envelope(
                 7,
@@ -2141,6 +2600,10 @@ mod tests {
                 },
             ))
             .expect("served");
+        // Stand-down's own broadcast is stamped too — and it is the
+        // one message the fence does not gate, because it is what
+        // publishes the fence.
+        server.retire(None);
 
         let posted = transport.envelopes();
         assert_eq!(posted.len(), 5);
@@ -2228,6 +2691,7 @@ mod tests {
                 ProxySide::Follower(11),
                 ProxyBody::Attach {
                     subscriptions: vec!["chan".into()],
+                    capabilities: vec![],
                 },
             ))
             .expect("attach must be served at generation zero");
@@ -2330,7 +2794,7 @@ mod tests {
         transport.clear();
 
         let (tx, mut rx) = oneshot::channel();
-        let reply = Replier::local(tx, server.generation());
+        let reply = Replier::local(tx, server.lease());
         server.backend_mut().perform(
             LeaderRequest::Call {
                 service: "svc".into(),
@@ -2357,7 +2821,7 @@ mod tests {
     #[test]
     fn a_leader_change_fails_the_old_generations_calls_typed_and_retries_nothing() {
         let transport = Rc::new(RecordingTransport::new());
-        let mut client = ProxyClient::new(transport.clone(), 42, vec!["chan".into()], 100);
+        let mut client = ProxyClient::new(transport.clone(), 42, vec!["chan".into()], vec![], 100);
 
         client
             .on_message(&envelope(
@@ -2409,7 +2873,8 @@ mod tests {
         assert!(
             posted.iter().any(|message| matches!(
                 &message.body,
-                ProxyBody::Attach { subscriptions } if subscriptions == &vec!["chan".to_string()]
+                ProxyBody::Attach { subscriptions, .. }
+                    if subscriptions == &vec!["chan".to_string()]
             )),
             "a surviving follower must re-declare its subscriptions: {posted:?}"
         );
@@ -2425,7 +2890,7 @@ mod tests {
     #[test]
     fn a_resumed_leaders_messages_are_fenced_and_change_nothing() {
         let transport = Rc::new(RecordingTransport::new());
-        let mut client = ProxyClient::new(transport.clone(), 42, vec![], 100);
+        let mut client = ProxyClient::new(transport.clone(), 42, vec![], vec![], 100);
         client
             .on_message(&envelope(
                 9,
@@ -2481,7 +2946,7 @@ mod tests {
     #[test]
     fn an_announced_leader_loss_fails_the_pending_work_it_names() {
         let transport = Rc::new(RecordingTransport::new());
-        let mut client = ProxyClient::new(transport, 42, vec![], 100);
+        let mut client = ProxyClient::new(transport, 42, vec![], vec![], 100);
         client
             .on_message(&envelope(
                 3,
@@ -2513,7 +2978,7 @@ mod tests {
     #[test]
     fn a_request_with_no_leader_is_refused_immediately() {
         let transport = Rc::new(RecordingTransport::new());
-        let mut client = ProxyClient::new(transport.clone(), 42, vec![], 100);
+        let mut client = ProxyClient::new(transport.clone(), 42, vec![], vec![], 100);
 
         let mut pending = client.request(LeaderRequest::Counters);
         let outcome = pending.try_recv().expect("not cancelled").expect("settled");
@@ -2543,7 +3008,7 @@ mod tests {
         let backend = TestBackend::new(0x5151);
         let seen = backend.seen.clone();
         let mut server = ProxyServer::new(backend, to_follower.clone(), 6);
-        let mut client = ProxyClient::new(to_leader.clone(), 77, vec!["chan".into()], 500);
+        let mut client = ProxyClient::new(to_leader.clone(), 77, vec!["chan".into()], vec![], 500);
 
         client.attach();
         for text in to_leader.raw() {

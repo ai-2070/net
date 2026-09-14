@@ -36,7 +36,7 @@
 //! large. The same reason every `u64` crosses this crate's
 //! JavaScript boundary as text.
 //!
-//! # Atomicity
+//! # Atomicity, and where a write becomes durable
 //!
 //! Two separate atomic operations, both of which two tabs race for:
 //!
@@ -52,6 +52,18 @@
 //!   transactions over the same store, so two tabs acquiring the lock
 //!   in sequence cannot observe the same value — which is the whole
 //!   basis of the fence.
+//!
+//! Both then **await the transaction's `complete`**, and both
+//! propagate its `abort`. A `put` request's `success` is not a
+//! commit: it says the write was accepted into the transaction, and a
+//! transaction can still abort afterwards — on quota, on a browser
+//! eviction, on any unhandled request error, or because something
+//! called `abort()`. Returning at request success is therefore
+//! returning a generation that can roll back and be handed out twice,
+//! which is a fence that admits two leaders, or an identity that was
+//! never stored, which is a node id that changes on the next load.
+//! Neither is a failure a caller can see after the fact, so the
+//! commit is awaited before the value is returned.
 
 #![cfg(target_arch = "wasm32")]
 
@@ -65,7 +77,7 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     AesGcmParams, AesKeyGenParams, CryptoKey, IdbDatabase, IdbObjectStore, IdbRequest,
-    IdbTransactionMode,
+    IdbTransaction, IdbTransactionMode,
 };
 
 use crate::error::{LeafError, Result};
@@ -180,6 +192,12 @@ impl IdentityVault {
                 .map_err(|e| storage_err("put identity", &e))?,
         )
         .await?;
+        // The identity is not this node's until the transaction that
+        // wrote it commits. Returning at the put's success would hand
+        // back a keypair that a later abort erases — and the next
+        // load would generate a different one, so the node id would
+        // change under a page that had already announced it.
+        committed(tx, "the identity was not committed").await?;
         Ok(secrets)
     }
 
@@ -213,15 +231,37 @@ impl IdentityVault {
         awaited(get(&store, KEY_IDENTITY)?).await
     }
 
-    /// Read, increment and write the generation inside **one**
-    /// `readwrite` transaction, and return the new value.
+    /// Read, increment, write **and commit** the generation inside
+    /// **one** `readwrite` transaction, and return the new value.
     ///
     /// D2's acquisition step. Both requests are issued on the same
     /// transaction and the second is issued from the first's
     /// completion, which is what keeps the transaction alive across
     /// them; nothing that is not an IndexedDB request is awaited in
-    /// between.
+    /// between. The commit is then awaited, because the whole basis
+    /// of the fence is that no two acquisitions see the same number,
+    /// and a generation returned at the put's success can still roll
+    /// back and be handed out a second time.
     pub async fn next_generation(&self) -> Result<u64> {
+        self.next_generation_observed(|_| {}).await
+    }
+
+    /// [`Self::next_generation`], with the live transaction handed to
+    /// `inspect` after the put has been accepted and **before** the
+    /// commit.
+    ///
+    /// The seam exists because that window is exactly where the
+    /// interesting failure lives and nothing else can reach it: the
+    /// production path passes a closure that does nothing, so this
+    /// *is* the production path, and a witness passes one that calls
+    /// `abort()` — standing in for the quota failure, the eviction or
+    /// the foreign `abort()` that would land in the same place on a
+    /// real page. A test that opened its own transaction instead
+    /// would be testing its own code.
+    pub async fn next_generation_observed(
+        &self,
+        inspect: impl FnOnce(&IdbTransaction),
+    ) -> Result<u64> {
         let tx = self
             .db
             .transaction_with_str_and_mode(STORE_LEADER, IdbTransactionMode::Readwrite)
@@ -243,6 +283,8 @@ impl IdentityVault {
                 .map_err(|e| storage_err("put generation", &e))?,
         )
         .await?;
+        inspect(&tx);
+        committed(tx, "the leader generation was not committed").await?;
         Ok(next)
     }
 
@@ -362,6 +404,10 @@ impl IdentityVault {
 
     /// Drop both records. The test path, and the honest answer to "how
     /// does a page forget an identity".
+    ///
+    /// Committed, for the same reason the writes are: a caller that
+    /// was told the identity was forgotten and then finds it back
+    /// after a reload was not told the truth.
     pub async fn clear(&self) -> Result<()> {
         for store_name in [STORE_IDENTITY, STORE_LEADER] {
             let tx = self
@@ -372,6 +418,7 @@ impl IdentityVault {
                 .object_store(store_name)
                 .map_err(|e| storage_err("object store", &e))?;
             awaited(store.clear().map_err(|e| storage_err("clear", &e))?).await?;
+            committed(tx, "the records were not cleared").await?;
         }
         Ok(())
     }
@@ -478,6 +525,72 @@ async fn awaited(request: IdbRequest) -> Result<JsValue> {
     request.set_onsuccess(None);
     request.set_onerror(None);
     drop(onsuccess);
+    drop(onerror);
+    outcome
+}
+
+/// Await one transaction's commit, and report an abort as a typed
+/// failure.
+///
+/// The boundary a `put` request's `success` is not. Three handlers,
+/// because IndexedDB has three ways to end a transaction and only one
+/// of them is durable: `complete` is the commit, `abort` is the
+/// rollback (quota, an unhandled request error, or an explicit
+/// `abort()`), and `error` is a request failure that will be followed
+/// by the abort. Whichever fires first settles, and the other two find
+/// the slot taken.
+async fn committed(tx: IdbTransaction, what: &str) -> Result<()> {
+    let (sender, receiver) = oneshot::channel::<Result<()>>();
+    let slot = Rc::new(RefCell::new(Some(sender)));
+
+    let done = slot.clone();
+    let oncomplete = Closure::once(move |_e: web_sys::Event| {
+        if let Some(sender) = done.borrow_mut().take() {
+            let _ = sender.send(Ok(()));
+        }
+    });
+
+    let aborted_tx = tx.clone();
+    let aborted = slot.clone();
+    let reason = what.to_string();
+    let onabort = Closure::once(move |_e: web_sys::Event| {
+        if let Some(sender) = aborted.borrow_mut().take() {
+            let detail = aborted_tx
+                .error()
+                .map(|e| e.message())
+                .unwrap_or_else(|| "the transaction was aborted".into());
+            let _ = sender.send(Err(LeafError::Identity(format!("{reason}: {detail}"))));
+        }
+    });
+
+    let failed_tx = tx.clone();
+    let failed = slot;
+    let failure = what.to_string();
+    let onerror = Closure::once(move |_e: web_sys::Event| {
+        if let Some(sender) = failed.borrow_mut().take() {
+            let detail = failed_tx
+                .error()
+                .map(|e| e.message())
+                .unwrap_or_else(|| "the transaction failed".into());
+            let _ = sender.send(Err(LeafError::Identity(format!("{failure}: {detail}"))));
+        }
+    });
+
+    tx.set_oncomplete(Some(oncomplete.as_ref().unchecked_ref()));
+    tx.set_onabort(Some(onabort.as_ref().unchecked_ref()));
+    tx.set_onerror(Some(onerror.as_ref().unchecked_ref()));
+
+    let outcome = receiver.await.unwrap_or_else(|_| {
+        Err(LeafError::Identity(
+            "the IndexedDB transaction was dropped before it settled".into(),
+        ))
+    });
+
+    tx.set_oncomplete(None);
+    tx.set_onabort(None);
+    tx.set_onerror(None);
+    drop(oncomplete);
+    drop(onabort);
     drop(onerror);
     outcome
 }

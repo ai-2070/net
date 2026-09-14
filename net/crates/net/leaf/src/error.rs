@@ -36,6 +36,21 @@ pub enum LeafError {
         /// The generation the leader currently holds, when known.
         current: Option<u64>,
     },
+    /// A send was refused because the stream's send window is
+    /// exhausted until the peer returns credit.
+    ///
+    /// Synchronous and bounded on purpose: the leaf runs on the
+    /// browser's main thread and has no runtime to park a send on,
+    /// so a full window is a typed refusal the caller sees now,
+    /// never a queue that grows behind its back.
+    Backpressure {
+        /// The stream whose window is full.
+        stream_id: u64,
+        /// On-wire bytes the refused message needed.
+        needed: u32,
+        /// Credit the stream had.
+        remaining: u32,
+    },
 }
 
 /// Why an RTC attempt did not produce a DataChannel.
@@ -126,6 +141,22 @@ pub enum RpcError {
         /// The generation that owned the call.
         generation: u64,
     },
+    /// The caller's **local** deadline elapsed before the tab running
+    /// the node answered.
+    ///
+    /// Not [`RpcError::Timeout`], and the difference is the whole
+    /// point of the variant: a `Timeout` is the node's own deadline
+    /// expiring on the call it owns, so nothing happened. This one is
+    /// a follower's deadline expiring on a call the *leader* owns —
+    /// the leader may have executed it, may be executing it, and a
+    /// deadline on this tab cannot cancel work already admitted on
+    /// another. So the outcome is stated as what it is: indeterminate,
+    /// and never retried, because a retry would be a second execution
+    /// of something that may have executed once already.
+    Indeterminate {
+        /// The local deadline that elapsed, in milliseconds.
+        deadline_ms: u32,
+    },
     /// The reply did not decode.
     Malformed(String),
 }
@@ -146,6 +177,15 @@ impl fmt::Display for LeafError {
                 ),
                 None => write!(f, "not the leader: this tab holds generation {presented}"),
             },
+            Self::Backpressure {
+                stream_id,
+                needed,
+                remaining,
+            } => write!(
+                f,
+                "backpressure: stream {stream_id:#x} needs {needed} bytes of send \
+                 credit and has {remaining}; the peer has not granted more yet"
+            ),
         }
     }
 }
@@ -177,6 +217,12 @@ impl fmt::Display for RpcError {
             Self::LeaderLost { generation } => {
                 write!(f, "the leader holding generation {generation} was replaced")
             }
+            Self::Indeterminate { deadline_ms } => write!(
+                f,
+                "the local deadline of {deadline_ms}ms elapsed before the tab running \
+                 the node answered; the remote operation may still have executed \
+                 (it was not retried)"
+            ),
             Self::Malformed(e) => write!(f, "the reply did not decode: {e}"),
         }
     }

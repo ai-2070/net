@@ -76,13 +76,32 @@ export interface NotLeaderEvent {
   readonly current: string;
 }
 
-/** The five lifecycle tags a session adds. */
+/**
+ * This tab was granted the lock and then failed to re-bootstrap its
+ * node.
+ *
+ * It is a follower again, re-declared to whoever takes the lock next,
+ * and it will ask for the lock again shortly — the origin has no node
+ * after a failed promotion, so somebody has to keep trying. Surfaced
+ * rather than logged because "the page briefly had no node and you
+ * could not see why" is the symptom this used to produce.
+ */
+export interface PromotionFailedEvent {
+  readonly type: 'promotion_failed';
+  /** The generation the failed acquisition had been allocated. */
+  readonly generation: string;
+  /** The typed failure, as its message. */
+  readonly detail: string;
+}
+
+/** The six lifecycle tags a session adds. */
 export type SessionLifecycleEvent =
   | LeaderChangedEvent
   | SubscriptionRestoredEvent
   | LeaderLostEvent
   | GenerationFencedEvent
-  | NotLeaderEvent;
+  | NotLeaderEvent
+  | PromotionFailedEvent;
 
 /** Everything a session can deliver. */
 export type SessionEvent = LeafEvent | SessionLifecycleEvent;
@@ -107,7 +126,7 @@ export function parseSessionEvent(json: string): SessionEvent {
 }
 
 /**
- * `true` for the five tags a session adds, so a page can filter the
+ * `true` for the six tags a session adds, so a page can filter the
  * lifecycle out of the event stream without listing them.
  */
 export function isLifecycleEvent(event: SessionEvent): event is SessionLifecycleEvent {
@@ -117,6 +136,7 @@ export function isLifecycleEvent(event: SessionEvent): event is SessionLifecycle
     case 'leader_lost':
     case 'generation_fenced':
     case 'not_leader':
+    case 'promotion_failed':
       return true;
     default:
       return false;
@@ -166,6 +186,12 @@ function refine(event: UnknownEvent): SessionLifecycleEvent | null {
         type: 'not_leader',
         presented: exact(fields.presented),
         current: exact(fields.current),
+      };
+    case 'promotion_failed':
+      return {
+        type: 'promotion_failed',
+        generation: exact(fields.generation),
+        detail: typeof fields.detail === 'string' ? fields.detail : '',
       };
     default:
       return null;

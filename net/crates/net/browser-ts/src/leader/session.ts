@@ -86,11 +86,33 @@ export class MeshSession {
    * identically on both surfaces.
    */
   private readonly hub = new EventHub<SessionEvent>();
+  /**
+   * Streams this session handed out, so the ones still open can be
+   * ended when leadership moves.
+   *
+   * A stream is session-scoped and is **not** restored across a
+   * leader change, which the Rust side enforces by binding each
+   * handle to its opening generation. That enforcement makes a stale
+   * `send` reject — but it says nothing about a consumer sitting in
+   * `await stream[Symbol.asyncIterator]().next()`, which would simply
+   * never settle: the wasm stream stops emitting and nothing tells
+   * the queue to end. So the session owns the set and closes it,
+   * which is what turns "no more data, ever" into the end of the
+   * iteration a page is already written to handle.
+   */
+  private readonly streams = new Set<LeafStream>();
   private closed = false;
 
   /** @internal — use {@link openSession}. */
   constructor(private readonly inner: LeafWasmSession) {
     inner.on_event((json) => this.hub.deliver(json, parseSessionEvent));
+    this.hub.onAny((event) => {
+      // `leader_lost` is this tab losing the leader it was talking
+      // to; `not_leader` is this tab discovering it *was* the leader
+      // and is not any more. Either way every stream this session
+      // handed out belonged to a node that is gone.
+      if (event.type === 'leader_lost' || event.type === 'not_leader') this.endStreams();
+    });
   }
 
   /** `'leader'` if this tab runs the node, `'follower'` if another does. */
@@ -214,10 +236,24 @@ export class MeshSession {
    *
    * A stream is **not** restored across a leader change — it is
    * session-scoped, and pretending otherwise would hide a real
-   * interruption. A page that wants one back opens one.
+   * interruption. A page that wants one back opens one. What this
+   * session does guarantee is that the interruption is *observable*:
+   * the handle is retained here and ended when leadership moves, so
+   * `for await (const payload of stream)` finishes instead of hanging
+   * on a node that is gone.
    */
   async openStream(options: OpenStreamOptions): Promise<LeafStream> {
-    return new LeafStream(await this.guard(() => this.inner.open_stream(options)));
+    const stream = new LeafStream(await this.guard(() => this.inner.open_stream(options)));
+    if (this.closed) {
+      // Leadership (or this session) went away while the open was in
+      // flight. Ending it here is the same disposition a consumer
+      // would have got a microtask later, rather than a live handle
+      // on a dead node.
+      stream.close();
+      return stream;
+    }
+    this.streams.add(stream);
+    return stream;
   }
 
   /** Listen for one event tag. Returns a cancel handle. */
@@ -258,12 +294,34 @@ export class MeshSession {
    * On a leader this is what lets a follower promote, so a page that
    * navigates away without calling it leaves the handoff to the
    * browser's own lock release.
+   *
+   * Every stream this session handed out is ended first, in that
+   * order: a consumer awaiting the next payload has to be settled by
+   * something, and after `inner.close()` nothing will ever emit
+   * again.
    */
   close(): void {
     if (this.closed) return;
     this.closed = true;
+    this.endStreams();
     this.hub.close();
     this.inner.close();
+  }
+
+  /**
+   * End every stream this session handed out.
+   *
+   * `LeafStream.close` ends each waiting consumer and clears the
+   * listeners, which is precisely the disposition D2 specifies for a
+   * stream across a leader change: failed and observable, never
+   * resurrected and never left pending. Called on leadership loss and
+   * on close; idempotent, because a page may have closed a stream
+   * itself.
+   */
+  private endStreams(): void {
+    const open = [...this.streams];
+    this.streams.clear();
+    for (const stream of open) stream.close();
   }
 
   /**
