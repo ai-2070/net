@@ -4946,15 +4946,40 @@ jobs:
       # Chrome-for-Testing, and then assert the two majors match:
       # the pin is a request, the assertion is the guarantee.
       - name: Install Chrome + a matching chromedriver
+        id: chrome
         uses: browser-actions/setup-chrome@v2
         with:
           chrome-version: "153"
           install-chromedriver: true
 
-      - name: Assert Chrome and chromedriver agree
+      # …and the runner must launch THAT Chrome. chromedriver starts
+      # whatever `google-chrome` it finds on PATH, and the hosted
+      # image ships its own — which is how a matched 153/153 pair
+      # still produced "This version of ChromeDriver only supports
+      # Chrome version 153" against a 152 binary. The webdriver
+      # capabilities name the binary explicitly.
+      - name: Point the wasm runner at the installed Chrome
+        env:
+          CHROME_BIN: ${{ steps.chrome.outputs.chrome-path }}
         run: |
           set -o pipefail
-          chrome_v=$(chrome --version 2>/dev/null || google-chrome --version)
+          python3 - "$CHROME_BIN" <<'PY'
+          import json, sys
+          path = "net/crates/net/leaf/webdriver.json"
+          with open(path) as f:
+              caps = json.load(f)
+          caps.setdefault("goog:chromeOptions", {})["binary"] = sys.argv[1]
+          with open(path, "w") as f:
+              json.dump(caps, f, indent=2)
+          print(json.dumps(caps, indent=2))
+          PY
+
+      - name: Assert Chrome and chromedriver agree
+        env:
+          CHROME_BIN: ${{ steps.chrome.outputs.chrome-path }}
+        run: |
+          set -o pipefail
+          chrome_v=$("$CHROME_BIN" --version)
           driver_v=$(chromedriver --version)
           echo "$chrome_v"
           echo "$driver_v"
@@ -5137,16 +5162,28 @@ jobs:
       # 'core'` when building the leaf bundle. Add the target FROM
       # the pinned directory, and assert it, as the wasm-wire job
       # already does.
-      - name: Add wasm32 to the pinned toolchain
-        working-directory: net/crates/net
+      - name: Add wasm32 to every toolchain that builds for it
         run: |
           set -o pipefail
-          rustup target add wasm32-unknown-unknown
-          rustup show active-toolchain
-          rustup target list --installed | tee /dev/stderr | grep -qx wasm32-unknown-unknown || {
-            echo "::error::wasm32-unknown-unknown is not installed for the toolchain this directory selects"
-            exit 1
-          }
+          # THREE directories build for wasm32 in this job and they do
+          # not all resolve the same toolchain: the Stage 5 leaf and
+          # the Stage 4b harness leaf sit under `net/crates/net`
+          # (pinned by `rust-toolchain.toml`), while anything the
+          # runner spawns from the repo root gets `stable`. The
+          # candidate installed the target for one of them and then
+          # asked another to build: `E0463: can't find crate for
+          # 'core'`. Install it for both, and assert from each
+          # directory that actually runs a wasm build.
+          rustup target add --toolchain stable wasm32-unknown-unknown
+          for dir in net/crates/net net/crates/net/leaf net/crates/net/tests/rtc_browser/leaf; do
+            ( cd "$dir"
+              rustup target add wasm32-unknown-unknown
+              echo "== $dir: $(rustup show active-toolchain)"
+              rustup target list --installed | grep -qx wasm32-unknown-unknown || {
+                echo "::error::wasm32-unknown-unknown is missing for the toolchain $dir selects"
+                exit 1
+              } ) || exit 1
+          done
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -5179,17 +5216,6 @@ jobs:
       # The Stage 5 half of the runner drives `@net-mesh/browser`
       # over the real leaf bundle; both are built here so a witness
       # can never run against a stale artefact.
-      - name: Build the leaf bundle and @net-mesh/browser
-        run: |
-          set -euo pipefail
-          cd net/crates/net/leaf
-          cargo build --release --target wasm32-unknown-unknown
-          wasm-bindgen --target web --out-dir pkg \
-            target/wasm32-unknown-unknown/release/net_leaf.wasm
-          cd ../browser-ts
-          npm install --no-audit --no-fund
-          npm run build
-
       - name: Install the Playwright driver's dependencies
         working-directory: net/crates/net/tests/rtc_browser/driver
         run: npm install --no-audit --no-fund
@@ -5207,6 +5233,17 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: wasm-bindgen-cli@0.2.128
+
+      - name: Build the leaf bundle and @net-mesh/browser
+        run: |
+          set -euo pipefail
+          cd net/crates/net/leaf
+          cargo build --release --target wasm32-unknown-unknown
+          wasm-bindgen --target web --out-dir pkg \
+            target/wasm32-unknown-unknown/release/net_leaf.wasm
+          cd ../browser-ts
+          npm install --no-audit --no-fund
+          npm run build
 
       # One command. It builds the wasm leaf against `net-mesh-wire`,
       # issues and installs the CA, starts the anchor + the impostor +
