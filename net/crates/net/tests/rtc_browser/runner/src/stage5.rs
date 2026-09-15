@@ -93,6 +93,23 @@ const ABI_DIRECT_STREAM_ID: u64 = 0x0002_0000_0000_5A01;
 const ABI_WINDOW_STREAM_ID: u64 = 0x0002_0000_0000_5A02;
 const ABI_PROXY_STREAM_ID: u64 = 0x0002_0000_0000_5A03;
 
+/// The large-message witness's OWN stream, and why it has one.
+///
+/// Its native → leaf legs used to ride `ABI_DIRECT_STREAM_ID` and
+/// count payloads by INDEX — "everything after the twelve that
+/// stream already carried". That coupling made one leg's verdict a
+/// function of another leg's arrival count, and it misreported both
+/// directions: a short earlier list shifted the index, so the
+/// ceiling payload landed inside the skipped prefix and the leg
+/// reported "REFUSED typed, but something else also arrived" for a
+/// stream on which NOTHING had arrived; and a payload recovered
+/// late by a retransmit would have shifted it the other way. A
+/// dedicated stream makes both structurally impossible: this
+/// witness asserts on payloads that can only be its own, from
+/// sequence zero, and needs no index arithmetic to say what
+/// arrived.
+const ABI_LARGE_STREAM_ID: u64 = 0x0002_0000_0000_5A04;
+
 /// Payloads the direct stream witness pushes native → leaf, and
 /// their size.
 const ABI_DIRECT_EVENTS: usize = 12;
@@ -459,6 +476,58 @@ fn peer_state(anchor: &MeshNode, node_id: u64) -> String {
          defect in the path under test and not an admission gate"
     };
     format!("session={session:?} provisional={provisional} — {reading}")
+}
+
+/// The ANCHOR's own reliable-stream ledger for `stream_id`, as the
+/// sender side of a payload that did not arrive.
+///
+/// The three questions a missing payload raises, and none of them is
+/// answerable from the page: does the sender still OWN the packet
+/// (a retransmit is still coming), did it ABANDON a sequence (its
+/// retry budget ran out and the peer has been told to reset), and
+/// what has the peer ACKNOWLEDGED (a frontier short of `tx_seq` is
+/// an unacknowledged tail; one that covers everything with a payload
+/// still missing means the loss is downstream of the acknowledgement
+/// — at the receiver, not on the wire).
+fn sender_ledger(anchor: &MeshNode, node_id: u64, stream_id: u64) -> String {
+    let Some(session) = anchor.peer_session_for_test(node_id) else {
+        return "no session: the anchor has no peer to have sent on".into();
+    };
+    let Some(state) = session.try_stream(stream_id) else {
+        return format!("no stream state for {stream_id:#x} on the anchor's session");
+    };
+    let (pending, frontier, abandoned, nack) = state.with_reliability(|r| {
+        (
+            r.has_pending(),
+            r.ack_frontier(),
+            r.abandoned_seq(),
+            r.build_nack(),
+        )
+    });
+    let stats = anchor.stream_stats(node_id, stream_id);
+    let tx_seq = stats.map_or(0, |s| s.tx_seq);
+    let grants = stats.map_or(0, |s| s.credit_grants_received);
+    let reading = match (abandoned, frontier) {
+        (Some(seq), f) => format!(
+            "GAVE UP on sequence {seq} (acknowledgement frontier {f:?}): the retry budget \
+             ran out, the peer was sent a reset, and its receive half is retired — every \
+             later payload on this stream is dropped there"
+        ),
+        (None, Some(f)) if f >= tx_seq => "fully acknowledged: every sequence this stream \
+                                           issued was reported received, so a payload the \
+                                           consumer never saw was lost at the receiver, \
+                                           after the acknowledgement"
+            .into(),
+        (None, f) => format!(
+            "still owned (pending={pending}, frontier {f:?} of {tx_seq} issued): a \
+             retransmit is still due, so a payload missing here is in flight rather than \
+             lost"
+        ),
+    };
+    format!(
+        "tx_seq={tx_seq} pending={pending} ack_frontier={frontier:?} abandoned={abandoned:?} \
+         outstanding_gap={nack:?} credit_grants_received={grants} — {reading}"
+    )
 }
 
 struct Script5 {
@@ -1305,8 +1374,7 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
         match &direct_native {
             Ok(stream) => {
                 for i in 0..ABI_DIRECT_EVENTS {
-                    let payload =
-                        Bytes::from(gen_bytes(direct_seed + i as u64, ABI_DIRECT_SIZE));
+                    let payload = Bytes::from(gen_bytes(direct_seed + i as u64, ABI_DIRECT_SIZE));
                     if let Err(e) = cx
                         .anchor
                         .send_with_retry(stream, std::slice::from_ref(&payload), 40)
@@ -1336,6 +1404,21 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
         let iterator_got = marks(&direct_inbox, "iterator");
         let callback_exact = callback_got == want_direct;
         let iterator_exact = iterator_got == want_direct;
+        // WHERE a short list went, printed with the verdict. The CI
+        // row that lost one of these twelve payloads carried no
+        // counters at all, so "11 of 12 arrived" could not be told
+        // apart from "the sender gave up", "the receive half was
+        // reset", "the retransmit arrived and was deduped" or "the
+        // bytes never left" without a local reproduction. All four
+        // are distinguishable from these three readings: the leaf's
+        // own drop counters, how long the wait actually took, and
+        // the ANCHOR's reliable-stream ledger — whether it still
+        // owned the packet, what the peer acknowledged, and which
+        // sequence (if any) it abandoned.
+        let direct_counters = stat_str(&direct_inbox, "counters");
+        let direct_waited = stat_u64(&direct_inbox, "waited_ms");
+        let direct_terminal = stat_str(&direct_inbox, "iterator_ended");
+        let direct_sender = sender_ledger(cx.anchor, node_id, ABI_DIRECT_STREAM_ID);
 
         ledger.record(
             WITNESSES[9],
@@ -1367,7 +1450,17 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                  order={iterator_exact} — both consumers were attached at open, before a \
                  byte could arrive, so this is the package's fan-out and not whichever \
                  registered first. Comparison is length + FNV-1a/32 per payload against \
-                 the generator the runner and the page both implement. ANCHOR STATE: {}",
+                 the generator the runner and the page both implement. The wait for those \
+                 payloads is a CONDITION, not a nap — it ended as soon as both consumers \
+                 held {ABI_DIRECT_EVENTS}, or at its 30 s ceiling, or early if the stream \
+                 went terminal — and it took {direct_waited} ms with \
+                 iterator_ended={direct_terminal}. WHERE A SHORT LIST WENT, so the next \
+                 occurrence is diagnosable from this line alone: the LEAF's own counters \
+                 at judgement were {direct_counters}, and the ANCHOR's ledger for this \
+                 stream was {direct_sender}. A payload dropped at the leaf moves one of \
+                 those drop counters; a sender that gave up names the sequence it \
+                 abandoned; a sender that still owns the packet has pending=true with the \
+                 peer's acknowledgement frontier short of what it issued. ANCHOR STATE: {}",
                 direct_open.ok,
                 callback_got.len(),
                 iterator_got.len(),
@@ -1402,8 +1495,7 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
         match &window_native {
             Ok(stream) => {
                 for i in 0..ABI_WINDOW_EVENTS {
-                    let payload =
-                        Bytes::from(gen_bytes(window_seed + i as u64, ABI_WINDOW_SIZE));
+                    let payload = Bytes::from(gen_bytes(window_seed + i as u64, ABI_WINDOW_SIZE));
                     if let Err(e) = cx
                         .anchor
                         .send_with_retry(stream, std::slice::from_ref(&payload), 200)
@@ -1445,8 +1537,8 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
         let credit_left = window_stats.map_or(0, |s| u64::from(s.tx_credit_remaining));
         // Conservation, at a settled point: credit + in-flight ==
         // the window.
-        let conserved = window_bytes > 0
-            && credit_left + sent_bytes.saturating_sub(consumed) == window_bytes;
+        let conserved =
+            window_bytes > 0 && credit_left + sent_bytes.saturating_sub(consumed) == window_bytes;
         let past_the_window = sent_bytes > window_bytes;
 
         ledger.record(
@@ -1493,8 +1585,12 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
         let mut recover_stream_num = 0u64;
         for i in 0..ABI_RELIABLE_EVENTS {
             let body = format!("s5-recover-{i:04}");
-            let frame =
-                rpc_request_frame(SINK_SERVICE, origin_hash, 0x5B00 + i as u64, body.as_bytes());
+            let frame = rpc_request_frame(
+                SINK_SERVICE,
+                origin_hash,
+                0x5B00 + i as u64,
+                body.as_bytes(),
+            );
             recover_stream_id = format!("{}", frame.stream_id);
             recover_channel = frame.channel_hash_u16;
             recover_stream_num = frame.stream_id;
@@ -1759,6 +1855,41 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
         // application N partial events, trading a silent drop for a
         // silent corruption. The contract now reads the same in both
         // directions (§9.2), so this leg gates.
+        //
+        // BOTH legs ride a stream of their OWN
+        // (`ABI_LARGE_STREAM_ID`), opened here, used by nothing
+        // else. They used to share the direct witness's stream and
+        // identify their payloads by INDEX — "everything after the
+        // twelve that stream already carried" — which made this
+        // verdict a function of another leg's arrival count in both
+        // directions: a payload that arrived LATE there would have
+        // shifted the index and leaked into `extra` here, and a
+        // payload that never arrived there shifted it the other way
+        // and hid the ceiling payload inside the skipped prefix, so
+        // this leg reported "something else also arrived" about a
+        // stream on which nothing had. On its own stream the
+        // payloads are its own from sequence zero, `extra` is
+        // literally everything that arrived, and no arithmetic
+        // stands between the observation and the claim.
+        let large_open = script
+            .run(
+                "a",
+                Step5::StreamOpen {
+                    id: 0,
+                    session: "main".into(),
+                    handle: "large".into(),
+                    reliable: true,
+                    label: Some("abi-large".into()),
+                    stream_id: Some(ABI_LARGE_STREAM_ID.to_string()),
+                    channel_hash: None,
+                },
+            )
+            .await;
+        let large_native = cx.anchor.open_stream(
+            node_id,
+            ABI_LARGE_STREAM_ID,
+            StreamConfig::new().with_reliability(Reliability::Reliable),
+        );
         let stream_ceiling = gen_bytes(over_seed ^ 0x3C3C, ABI_CEILING_SIZE);
         let want_stream_ceiling = Mark::of(&stream_ceiling);
         let stream_large = gen_bytes(over_seed ^ 0x5A5A, ABI_STREAM_LARGE_SIZE);
@@ -1769,7 +1900,7 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
         // check would pass on any error at all, including the
         // transport faults this leg must not accept.
         let mut stream_large_refusal: Option<(usize, usize)> = None;
-        if let Ok(stream) = &direct_native {
+        if let Ok(stream) = &large_native {
             let at_ceiling = Bytes::from(stream_ceiling.clone());
             if let Err(e) = cx
                 .anchor
@@ -1790,20 +1921,22 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                 }
             }
         } else {
-            ceiling_send_error = Some("the anchor never opened the direct stream".into());
+            ceiling_send_error = Some("the anchor never opened the large-message stream".into());
             stream_large_error = ceiling_send_error.clone();
         }
-        // Only the CEILING payload is expected to arrive, so the wait
-        // ends as soon as it does. The settle below is what catches a
-        // regression that put the over-cap payload on the wire after
-        // all: a second read once the link has gone quiet.
-        let _ceiling_wait = script
+        // Exactly ONE payload is expected on this stream, so the wait
+        // ends as soon as it arrives — a condition, not a nap, and a
+        // ceiling that still FAILS if it never comes. The settle
+        // below is what catches a regression that put the over-cap
+        // payload on the wire after all: a second read once the link
+        // has gone quiet.
+        let ceiling_wait = script
             .run(
                 "a",
                 Step5::StreamInbox {
                     id: 0,
-                    handle: "direct".into(),
-                    expect: ABI_DIRECT_EVENTS + 1,
+                    handle: "large".into(),
+                    expect: 1,
                     timeout_ms: 30_000,
                 },
             )
@@ -1814,28 +1947,24 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                 "a",
                 Step5::StreamInbox {
                     id: 0,
-                    handle: "direct".into(),
-                    expect: ABI_DIRECT_EVENTS + 1,
+                    handle: "large".into(),
+                    expect: 1,
                     timeout_ms: 5_000,
                 },
             )
             .await;
-        let large_callback = marks(&large_inbox, "callback");
-        let large_iterator = marks(&large_inbox, "iterator");
-        let extra: Vec<Mark> = large_callback
-            .iter()
-            .skip(ABI_DIRECT_EVENTS)
-            .copied()
-            .collect();
-        let extra_iter: Vec<Mark> = large_iterator
-            .iter()
-            .skip(ABI_DIRECT_EVENTS)
-            .copied()
-            .collect();
-        // GATED: the ceiling payload must be the FIRST thing that
-        // arrived after this stream's earlier traffic, byte-exact,
-        // on both consumers.
-        let stream_down = ceiling_send_error.is_none()
+        let extra = marks(&large_inbox, "callback");
+        let extra_iter = marks(&large_inbox, "iterator");
+        let large_counters = stat_str(&large_inbox, "counters");
+        let large_waited = stat_u64(&ceiling_wait, "waited_ms");
+        let large_terminal = stat_str(&large_inbox, "iterator_ended");
+        let large_sender = sender_ledger(cx.anchor, node_id, ABI_LARGE_STREAM_ID);
+        // GATED: the ceiling payload must be the FIRST — and, with
+        // this stream carrying nothing else, the only — payload to
+        // arrive, byte-exact, on both consumers.
+        let large_open_ok = large_open.ok;
+        let stream_down = large_open_ok
+            && ceiling_send_error.is_none()
             && extra.first() == Some(&want_stream_ceiling)
             && extra_iter.first() == Some(&want_stream_ceiling);
         // GATED: the over-cap send is refused TYPED, the error names
@@ -1847,18 +1976,37 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
             == Some((ABI_STREAM_LARGE_SIZE, MAX_EVENT_SIZE))
             && extra.len() == 1
             && extra_iter.len() == 1;
+        // Each branch says what was actually OBSERVED. The old
+        // wording claimed "something else also arrived" for every
+        // failure that still had the typed refusal, so the round
+        // where NOTHING arrived — the ceiling payload included —
+        // was reported as a surplus when it was a shortfall, and
+        // read as a defect in the refusal rather than in delivery.
+        let arrived = extra.len().max(extra_iter.len());
         let over_cap_outcome = if over_cap_refused {
-            "REFUSED at the native sender, typed, naming the limit, and nothing arrived"
+            "REFUSED at the native sender, typed, naming the limit, and nothing arrived".to_string()
+        } else if stream_large_refusal.is_some() && arrived == 0 {
+            "REFUSED typed, but the CEILING payload never arrived either — nothing at all \
+             was delivered on this stream, so the failure is in delivery, not in the \
+             refusal"
+                .to_string()
+        } else if stream_large_refusal.is_some() && extra.iter().any(|m| *m == want_stream_large) {
+            "REFUSED typed at the sender, yet the over-cap payload ARRIVED — two senders \
+             disagree about the cap"
+                .to_string()
         } else if stream_large_refusal.is_some() {
-            "REFUSED typed, but something else also arrived on the stream"
+            format!(
+                "REFUSED typed, but {arrived} payload(s) arrived where exactly one (the \
+                 ceiling) was due"
+            )
         } else if stream_large_error.is_some() {
-            "refused with the WRONG error — not EventTooLarge"
+            "refused with the WRONG error — not EventTooLarge".to_string()
         } else if extra.iter().any(|m| *m == want_stream_large) {
-            "ACCEPTED and delivered byte-exact — the sender no longer refuses"
-        } else if extra.len() > 1 || extra_iter.len() > 1 {
-            "ACCEPTED and something OTHER than the payload arrived — a truncation"
+            "ACCEPTED and delivered byte-exact — the sender no longer refuses".to_string()
+        } else if arrived > 1 {
+            "ACCEPTED and something OTHER than the payload arrived — a truncation".to_string()
         } else {
-            "ACCEPTED with Ok and NOTHING arrived — the silent drop is back"
+            "ACCEPTED with Ok and NOTHING arrived — the silent drop is back".to_string()
         };
 
         ledger.record(
@@ -1893,10 +2041,22 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                  partial body dispatched to the handler each fail this leg. \
                  LEG 3a, GATED, NATIVE → LEAF ON A STREAM at the same ceiling \
                  ({ABI_CEILING_SIZE} B), so `both directions` covers the stream API and \
-                 not only nRPC: the anchor's send returned {ceiling_send_error:?} and the \
-                 package's callback AND iterator each received {want_stream_ceiling:?} \
-                 byte-exact as the first payload after the {ABI_DIRECT_EVENTS} this stream \
-                 already carried={stream_down}. \
+                 not only nRPC. Both stream legs ride a stream of their OWN \
+                 ({ABI_LARGE_STREAM_ID:#x}, page open ok={large_open_ok}), used by no \
+                 other witness: \
+                 they used to share the direct witness's stream and identify their \
+                 payloads by INDEX — everything past the {ABI_DIRECT_EVENTS} that stream \
+                 had carried — which made this verdict a function of ANOTHER leg's arrival \
+                 count. A payload recovered late there would have leaked into this leg's \
+                 surplus; a payload lost there shifted the index and hid THIS leg's \
+                 ceiling payload inside the skipped prefix, so a round where nothing \
+                 arrived was reported as a round where something extra did. On its own \
+                 stream the payloads are its own from sequence zero and `extra` is \
+                 literally everything delivered. The anchor's send returned \
+                 {ceiling_send_error:?} and the package's callback AND iterator each \
+                 received {want_stream_ceiling:?} byte-exact as the first payload on this \
+                 stream={stream_down}; that wait is a CONDITION with a 30 s ceiling, not a \
+                 sleep, and it took {large_waited} ms. \
                  LEG 3b, NOW GATED — the contract, not a measurement: the same send at \
                  {ABI_STREAM_LARGE_SIZE} B, over MAX_EVENT_SIZE = {MAX_EVENT_SIZE} B. This \
                  leg was RECORDED for one round, because §9.2 stated the LEAF → NATIVE \
@@ -1908,12 +2068,14 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                  {stream_large_refusal:?}, required \
                  Some(({ABI_STREAM_LARGE_SIZE}, {MAX_EVENT_SIZE})); Display was \
                  {stream_large_error:?}. AND the payload must never appear: after a 2 s \
-                 settle on a quiet link, everything that arrived beyond the \
-                 {ABI_DIRECT_EVENTS} this stream already carried is {extra:?} (iterator: \
-                 {extra_iter:?}) — exactly ONE payload, the ceiling one, with \
-                 {want_stream_large:?} absent. Outcome: {over_cap_outcome} \
+                 settle on a quiet link, everything that arrived on this stream is \
+                 {extra:?} (iterator: {extra_iter:?}) — exactly ONE payload, the ceiling \
+                 one, with {want_stream_large:?} absent. Outcome: {over_cap_outcome} \
                  (over_cap_refused={over_cap_refused}). An `Ok` with nothing delivered, a \
                  truncation, a late delivery, or an untyped/misnamed error each FAIL. \
+                 WHERE A MISSING PAYLOAD WENT: the LEAF's counters at judgement were \
+                 {large_counters} (iterator_ended={large_terminal}), and the ANCHOR's \
+                 ledger for this stream was {large_sender}. \
                  Fragmenting instead was rejected on the merits: `send_on_stream` is \
                  transport-agnostic and only the browser leaf and the native RTC ingress \
                  reassemble, so fragmenting there would hand a native peer's application N \

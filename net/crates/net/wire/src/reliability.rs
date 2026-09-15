@@ -475,8 +475,28 @@ impl ReliableStream {
     /// queue's worst-case growth under sustained loss.
     pub const MAX_RETRANSMIT_WINDOW: usize = 16_384;
 
-    /// Default max retries
-    pub const DEFAULT_MAX_RETRIES: u8 = 3;
+    /// Retransmit attempts a packet gets before the reliable layer
+    /// declares its gap unrecoverable and fails the stream (H-3).
+    ///
+    /// **The count only means anything together with the backoff.**
+    /// `retries` counts ATTEMPTS, not evidence of loss: a receiver
+    /// whose acknowledgement is merely late is indistinguishable,
+    /// from here, from one that never got the packet. With a fixed
+    /// RTO and three attempts the budget expired 200 ms after a
+    /// packet went unacked, so a browser tab starved for a second —
+    /// a loaded CI runner, a GC pause, a layout storm — had its
+    /// healthy reliable stream RESET with every byte delivered and
+    /// nothing lost, and every later payload on that stream dropped
+    /// against the receive half it had just retired. Attempts are
+    /// now paced by [`Self::retransmit_timeout`]'s doubling ladder,
+    /// so the budget spans a real horizon instead of a burst:
+    /// `50 + 100 + 200 + 400 + 800 + 1600 + 2000` ms ≈ 5.15 s at
+    /// [`Self::DEFAULT_RTO`], capped per attempt by
+    /// [`Self::MAX_RTO`]. That is 25× the worst receiver stall
+    /// measured against this transport and well inside the 30 s
+    /// transfer timeout above it, while a genuinely dead peer still
+    /// fails its stream loudly and bounded.
+    pub const DEFAULT_MAX_RETRIES: u8 = 7;
 
     /// Cap on tracked out-of-order received ranges (R-2). An insert
     /// that would create a fresh range beyond this cap is rejected
@@ -569,6 +589,41 @@ impl ReliableStream {
             ack_frontier: None,
             abandoned_seq: None,
         }
+    }
+
+    /// How long a packet that has already been retransmitted
+    /// `retries` times waits before the timeout backstop resends it
+    /// again: the RTO doubled once per attempt (RFC 6298 §5.5's
+    /// `RTO ← RTO * 2`), capped per attempt at [`Self::MAX_RTO`].
+    ///
+    /// Backoff is what makes a retransmit budget a horizon rather
+    /// than a burst. Re-sending every [`Self::DEFAULT_RTO`]
+    /// regardless of how many attempts have already failed spends
+    /// the whole budget inside one receiver stall — and the layer
+    /// then reports a gap it cannot recover for a packet the peer
+    /// was about to acknowledge. The first retransmit is still
+    /// prompt (one RTO), so recovery of genuine loss is unchanged;
+    /// only the pacing of repeated failures stretches.
+    #[inline]
+    pub fn retransmit_timeout(rto: Duration, retries: u8) -> Duration {
+        rto.saturating_mul(1u32 << retries.min(16))
+            .min(Self::MAX_RTO)
+    }
+
+    /// How long a packet can stay unacknowledged before the layer
+    /// declares its gap unrecoverable and fails the stream: the whole
+    /// [`Self::retransmit_timeout`] ladder, `max_retries` attempts
+    /// plus the final timeout that gives up.
+    ///
+    /// Public because it is the number every layer above has to
+    /// reason against — how long a reliable stream keeps trying
+    /// before the peer is treated as gone — and because a test that
+    /// waits for a real give-up must wait THIS, not a magic constant
+    /// that silently stops matching the pacing.
+    pub fn give_up_horizon(rto: Duration, max_retries: u8) -> Duration {
+        (0..=u32::from(max_retries))
+            .map(|n| Self::retransmit_timeout(rto, n.min(u32::from(u8::MAX)) as u8))
+            .fold(Duration::ZERO, |sum, step| sum.saturating_add(step))
     }
 
     /// Multiplicative decrease on a NACK-driven (fast-retransmit) loss:
@@ -1091,8 +1146,15 @@ impl ReliabilityMode for ReliableStream {
         // dropped from the window (it can't be recovered) and flags the
         // stream as failed (H-3) — previously such packets stayed stuck
         // in `pending` forever, leaking and stalling silently.
+        //
+        // The due-ness test is the packet's OWN backed-off timeout
+        // (`Self::retransmit_timeout`), not the bare RTO: a packet on
+        // its fourth attempt waits eight RTOs, so the retry budget
+        // spans seconds and a receiver that is late rather than gone
+        // keeps its stream.
         self.pending.retain_mut(|unacked| {
-            if now.duration_since(unacked.sent_at) > rto {
+            if now.duration_since(unacked.sent_at) > Self::retransmit_timeout(rto, unacked.retries)
+            {
                 if unacked.retries < max_retries {
                     retransmits.push(Arc::clone(&unacked.descriptor));
                     unacked.retries += 1;
@@ -1459,21 +1521,29 @@ mod tests {
         // H-3: a packet that times out past `max_retries` is dropped from
         // the window and flags the stream failed (so the owner can send a
         // reset) — instead of staying stuck forever and stalling silently.
+        //
+        // Each attempt waits its OWN backed-off timeout (RFC 6298 §5.5),
+        // so the waits below walk the doubling ladder rather than one
+        // fixed RTO. That pacing is the contract, not an artefact: a
+        // budget spent at a fixed RTO expires inside a single receiver
+        // stall, which is what used to reset healthy streams.
         let rto = Duration::from_millis(5);
         let max_retries = 2u8;
         let mut s = ReliableStream::with_settings(rto, 32, max_retries);
         s.on_send(descriptor(0, Bytes::from_static(b"x")));
         assert!(!s.take_failed());
 
-        // Each RTO elapse → one retransmit, until retries are exhausted.
-        for _ in 0..max_retries {
-            std::thread::sleep(rto * 2);
+        // Each backed-off timeout elapse → one retransmit, until the
+        // attempts are spent. `sent_at` is reset per attempt, so attempt
+        // `n` has to wait `rto << n`.
+        for attempt in 0..max_retries {
+            std::thread::sleep(ReliableStream::retransmit_timeout(rto, attempt) * 2);
             assert_eq!(s.get_timed_out().len(), 1, "still retransmitting");
             assert!(!s.take_failed(), "not failed while retries remain");
         }
 
-        // Next timeout: retries exhausted → give up.
-        std::thread::sleep(rto * 2);
+        // Next timeout: attempts exhausted → give up.
+        std::thread::sleep(ReliableStream::retransmit_timeout(rto, max_retries) * 2);
         assert!(
             s.get_timed_out().is_empty(),
             "no retransmit emitted once max_retries is hit"
@@ -1481,6 +1551,52 @@ mod tests {
         assert!(s.take_failed(), "stream flagged failed after giving up");
         assert!(!s.take_failed(), "take_failed clears the flag");
         assert!(!s.has_pending(), "given-up packet dropped from the window");
+    }
+
+    /// The Stage 5 browser defect, at the unit level: a receiver that
+    /// is LATE, not gone, must not cost its sender the stream.
+    ///
+    /// One packet goes unacknowledged for 700 ms — a browser tab
+    /// starved by a loaded runner, which is what Chromium-on-Linux
+    /// did to the Stage 5 direct-stream witness. Under a fixed RTO
+    /// and three attempts the layer declared the gap unrecoverable
+    /// ~200 ms in, the owning node reset the stream, and the
+    /// receiver retired a receive half through which every byte had
+    /// in fact arrived; the next payload on that stream was then
+    /// dropped against the retired half, with no loss anywhere.
+    /// The backed-off ladder must still be RETRYING at 700 ms, and
+    /// the packet must still be recoverable when the late ack lands.
+    #[test]
+    fn a_slow_receiver_does_not_cost_the_sender_its_stream() {
+        let mut s = ReliableStream::new();
+        s.on_send(descriptor(0, Bytes::from_static(b"x")));
+
+        // Sweep as the owning node's retransmit loop does, faster than
+        // any timeout in the ladder, for the length of the stall.
+        let started = std::time::Instant::now();
+        let mut emitted = 0usize;
+        while started.elapsed() < Duration::from_millis(700) {
+            std::thread::sleep(Duration::from_millis(25));
+            emitted += s.get_timed_out().len();
+            assert!(
+                !s.take_failed(),
+                "the stream was declared failed after {:?} of receiver silence",
+                started.elapsed()
+            );
+        }
+        assert!(
+            emitted >= 3,
+            "the backstop must keep resending across the stall, got {emitted}"
+        );
+        assert!(
+            s.has_pending(),
+            "the packet is still owned, so a late ack can still retire it"
+        );
+
+        // The ack the old horizon never waited for.
+        s.on_ack(1);
+        assert!(!s.has_pending(), "a late ack retires the packet");
+        assert!(!s.take_failed(), "and nothing was ever given up on");
     }
 
     #[test]
@@ -2083,31 +2199,6 @@ mod tests {
     }
 
     #[test]
-    fn test_reliable_stream_max_retries_exhausted() {
-        let mut mode = ReliableStream::with_settings(
-            Duration::from_millis(50),
-            32,
-            2, // max 2 retries
-        );
-
-        mode.on_send(descriptor(0, Bytes::from_static(b"pkt-0")));
-
-        // Exhaust retries (each iteration waits past RTO then triggers retransmit)
-        for _ in 0..3 {
-            std::thread::sleep(Duration::from_millis(80));
-            let _ = mode.get_timed_out();
-        }
-
-        // After max_retries, the packet should no longer be retransmitted
-        std::thread::sleep(Duration::from_millis(80));
-        let timed_out = mode.get_timed_out();
-        assert!(
-            timed_out.is_empty(),
-            "packet should stop being retransmitted after max_retries"
-        );
-    }
-
-    #[test]
     fn test_regression_has_gaps_misses_interior_holes() {
         // Regression: has_gaps() used `trailing_zeros() > 0` which relied
         // on the subtle invariant that bit 0 of sack_bitmap is always 0
@@ -2468,8 +2559,10 @@ mod tests {
         );
 
         // Timeout path: re-arm the timer, sleep, drain. Same
-        // pointer-identity assertion as the NACK path.
-        std::thread::sleep(Duration::from_millis(35));
+        // pointer-identity assertion as the NACK path. The NACK above
+        // already spent one attempt, so the wait is that attempt's
+        // backed-off timeout, not the bare RTO.
+        std::thread::sleep(ReliableStream::retransmit_timeout(Duration::from_millis(20), 1) * 2);
         let from_timeout = mode.get_timed_out();
         assert!(
             !from_timeout.is_empty(),

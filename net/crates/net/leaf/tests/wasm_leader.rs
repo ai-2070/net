@@ -2841,13 +2841,18 @@ async fn a_proxied_send_broadcasts_another_streams_terminal_event_instead_of_pan
         .await
         .expect("open Y");
 
-    // Three sweeps outside any server borrow spend X's three
-    // retries: `ReliableStream::DEFAULT_RTO` is 50 ms and
-    // `DEFAULT_MAX_RETRIES` is 3, and each sweep that fires resets
-    // the packet's `sent_at`, so each one needs its own wait. None of
-    // them can give up yet.
-    for _ in 0..3 {
-        wait_ms(90).await;
+    // One sweep per attempt outside any server borrow spends X's
+    // retry budget. Attempts are paced by the wire's backed-off RTO
+    // (`ReliableStream::retransmit_timeout`), so attempt `n` needs
+    // `DEFAULT_RTO << n` to come due and each sweep that fires resets
+    // the packet's `sent_at` — the waits are read off that ladder
+    // rather than assumed to be one fixed RTO apart. None of these
+    // sweeps can give up yet.
+    let rto = net_wire::reliability::ReliableStream::DEFAULT_RTO;
+    let attempts = net_wire::reliability::ReliableStream::DEFAULT_MAX_RETRIES;
+    for attempt in 0..attempts {
+        let due = net_wire::reliability::ReliableStream::retransmit_timeout(rto, attempt);
+        wait_ms(due.as_millis() as i32 + 40).await;
         let mut node = handles.node.borrow_mut();
         node.tick(net_leaf::clock::now());
         node.take_outbound();
@@ -2864,9 +2869,12 @@ async fn a_proxied_send_broadcasts_another_streams_terminal_event_instead_of_pan
         "the premise: nothing has failed yet"
     );
 
-    // The fourth sweep is the one that gives up, and it runs inside
-    // Y's synchronous send — under the caller's server borrow.
-    wait_ms(90).await;
+    // The sweep after the budget is spent is the one that gives up,
+    // and it runs inside Y's synchronous send — under the caller's
+    // server borrow. Its wait is the exhausted attempt's own
+    // backed-off timeout.
+    let final_due = net_wire::reliability::ReliableStream::retransmit_timeout(rto, attempts);
+    wait_ms(final_due.as_millis() as i32 + 40).await;
     handles.sweeps.set(1);
     let sent = leader
         .request(LeaderRequest::StreamSend {

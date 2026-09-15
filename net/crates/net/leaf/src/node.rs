@@ -3714,9 +3714,18 @@ mod tests {
 
         // Nothing is ever delivered to `b`, so nothing is ever
         // acknowledged. Retransmits are driven by the wire clock, so
-        // this waits on it rather than reaching into the window.
+        // this waits on it rather than reaching into the window — and
+        // it waits the wire's OWN give-up horizon (the doubling RTO
+        // ladder, `DEFAULT_MAX_RETRIES` attempts) rather than a magic
+        // iteration count, so a change to that pacing moves this test
+        // with it instead of breaking it.
+        let horizon = net_wire::reliability::ReliableStream::give_up_horizon(
+            net_wire::reliability::ReliableStream::DEFAULT_RTO,
+            net_wire::reliability::ReliableStream::DEFAULT_MAX_RETRIES,
+        );
+        let started = std::time::Instant::now();
         let mut failure = None;
-        for _ in 0..40 {
+        while started.elapsed() < horizon * 2 {
             std::thread::sleep(std::time::Duration::from_millis(30));
             a.tick(clock::now());
             a.take_outbound();

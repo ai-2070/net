@@ -597,18 +597,34 @@ async function execute(step) {
     }
 
     // What the two consumers of an open stream have received so far.
-    // Waits for `expect` payloads on the CALLBACK and then reports
-    // both lists; a short list is the result, never a hang.
+    //
+    // The wait is a CONDITION, never a nap: it ends the moment both
+    // consumers hold `expect` payloads, so a payload recovered by a
+    // retransmit is waited for rather than sampled past — and the
+    // `timeout_ms` ceiling is a ceiling, not a duration, so a payload
+    // that never arrives still comes back as a short list and fails
+    // the witness.
+    //
+    // It also ends EARLY on a terminal stream: once the async
+    // iterator has ended, the stream has been reset or failed and no
+    // further payload can arrive on it, so waiting out the rest of
+    // the ceiling would only delay the same verdict. `waited_ms` and
+    // `iterator_ended` are reported so the runner's ledger can say
+    // which of the three it was — complete, still empty-handed at the
+    // ceiling, or terminated under it.
     case 'stream_inbox': {
       const state = streams.get(step.handle);
       if (!state) return { ok: false, error: 'no such open stream ' + step.handle };
-      const deadline = performance.now() + (step.timeout_ms || 15000);
+      const started = performance.now();
+      const deadline = started + (step.timeout_ms || 15000);
       while (
         performance.now() < deadline &&
+        !state.iteratorEnded &&
         (state.callback.length < step.expect || state.iterator.length < step.expect)
       ) {
         await sleep(25);
       }
+      const waited = Math.round(performance.now() - started);
       // The leaf's own counters, sampled at the same instant, as the
       // RAW `counters_json()` string. A short list is then
       // attributable: a `stream_failed` event or an
@@ -635,6 +651,7 @@ async function execute(step) {
           stream_id: state.stream.streamId,
           reliability: state.stream.reliability,
           counters,
+          waited_ms: waited,
         },
       };
     }
