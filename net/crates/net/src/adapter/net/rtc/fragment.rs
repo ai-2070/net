@@ -501,6 +501,38 @@ impl SessionState {
         out.push(partial.abandoned(session_id, fragment_id, reason));
         self.fence(fragment_id, now);
     }
+
+    /// Release every group of `stream_id`'s receive lifetime and
+    /// fence their ids, returning how many were released.
+    ///
+    /// **NR6.** A RESET ends that stream's receive lifetime: the
+    /// peer's send half gave up and may restart from sequence zero,
+    /// so the receive cursor and the reliability ranges are dropped.
+    /// A partial group retained from before the reset is not part of
+    /// the lifetime that follows it — leave it and an old delayed
+    /// tail completes it afterwards, and a payload from before the
+    /// reset is dispatched against the fresh cursor. Session
+    /// retirement does not cover this: the session is still live.
+    ///
+    /// Nothing is reported as abandoned, exactly as the leaf's
+    /// `Reassembler::retire_stream` reports nothing: the reset **is**
+    /// that stream's terminal disposition and its owner has already
+    /// been told. Reporting again would ask the ingress to reset a
+    /// stream because it was reset.
+    fn retire_stream_groups(&mut self, stream_id: u64, now: Instant) -> usize {
+        let mut fence = Vec::new();
+        self.groups.retain(|(id, partial)| {
+            if partial.provenance.stream_id != stream_id {
+                return true;
+            }
+            fence.push(*id);
+            false
+        });
+        for id in &fence {
+            self.fence(*id, now);
+        }
+        fence.len()
+    }
 }
 
 /// A pause the ingress takes **inside** a session's guard, between
@@ -534,13 +566,34 @@ impl std::fmt::Debug for IngressPause {
 #[derive(Debug, Default)]
 pub struct RtcReassembly {
     sessions: DashMap<u64, SessionState>,
-    /// Terminal dispositions waiting for the ingress to drain.
+    /// The DIAGNOSTIC record of what was lost: drained by operators
+    /// and by witnesses, and deliberately independent of whether the
+    /// ingress has carried the loss into the conversation yet.
     abandoned: Mutex<VecDeque<AbandonedGroup>>,
+    /// The PRODUCTION queue: terminal dispositions the RTC ingress
+    /// has not yet turned into a receive-half reset on the stream
+    /// that lost the bytes (NR2). Consumed exactly once, by
+    /// `MeshNode::dispose_abandoned_rtc_groups`, so one destroyed
+    /// group produces one terminal — which is why it cannot be the
+    /// same queue a diagnostic reader drains.
+    terminals: Mutex<VecDeque<AbandonedGroup>>,
     abandoned_total: AtomicU64,
     abandoned_bytes_total: AtomicU64,
     abandoned_dropped: AtomicU64,
+    /// Groups released because their stream's receive lifetime ended
+    /// in a RESET. Counted rather than reported: the reset is the
+    /// terminal (NR6).
+    reset_retired_total: AtomicU64,
     #[cfg(any(test, feature = "fixtures"))]
     pause: Mutex<Option<IngressPause>>,
+    /// The seam the NR3 schedule needs, which
+    /// [`RtcReassembly::pause`] cannot provide: it fires in the
+    /// ingress BEFORE the admission decision, where a resolved
+    /// session handle has been captured and the packet has not yet
+    /// reached reassembly. That is the interval a retirement's
+    /// bounded marker used to have to outlive.
+    #[cfg(any(test, feature = "fixtures"))]
+    dispatch_pause: Mutex<Option<IngressPause>>,
 }
 
 impl RtcReassembly {
@@ -557,6 +610,29 @@ impl RtcReassembly {
     #[cfg(any(test, feature = "fixtures"))]
     pub fn set_ingress_pause(&self, pause: Option<IngressPause>) {
         *self.pause.lock() = pause;
+    }
+
+    /// Install (or clear) the DISPATCH pause: a fixtures-only seam
+    /// the RTC ingress runs before it asks whether the resolved
+    /// session is still live, so the NR3 schedule — a frame captured
+    /// under an incarnation that is retired while the frame waits —
+    /// is scheduled rather than hoped for. No lock is held while it
+    /// runs.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn set_dispatch_pause(&self, pause: Option<IngressPause>) {
+        *self.dispatch_pause.lock() = pause;
+    }
+
+    /// Run the dispatch pause, if one is installed. Cloned out from
+    /// under its lock first: the hook blocks by design, and blocking
+    /// with the lock held would serialize the retirement this seam
+    /// exists to let through.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn run_dispatch_pause(&self) {
+        let hook = self.dispatch_pause.lock().clone();
+        if let Some(hook) = hook {
+            (hook.0)();
+        }
     }
 
     /// How many groups are open. Observable so a test asserts the
@@ -598,6 +674,25 @@ impl RtcReassembly {
         queue.drain(..).collect()
     }
 
+    /// Take the terminal dispositions the ingress owes the
+    /// conversation (NR2).
+    ///
+    /// Separate from [`Self::take_abandoned`] on purpose: the
+    /// diagnostic drain must not be able to swallow a production
+    /// terminal, and a production drain must not erase the record an
+    /// operator is about to read.
+    pub fn take_terminals(&self) -> Vec<AbandonedGroup> {
+        let mut queue = self.terminals.lock();
+        queue.drain(..).collect()
+    }
+
+    /// Groups released because a RESET ended their stream's receive
+    /// lifetime. The reset itself is the terminal, so these are
+    /// counted rather than reported (NR6).
+    pub fn reset_retired_total(&self) -> u64 {
+        self.reset_retired_total.load(Ordering::Relaxed)
+    }
+
     /// Release every group belonging to `session_id`, and fence it.
     ///
     /// The map outlives any one session, so a session that ends has
@@ -618,6 +713,16 @@ impl RtcReassembly {
     /// takes to decide and insert. There is no interleaving in which
     /// an admitted packet observes "not retired" and then inserts
     /// into a swept session.
+    ///
+    /// **NR3:** the marker is a *bounded* fence — it expires with
+    /// [`GROUP_TTL`] and gives way to [`MAX_RETIRED_SESSIONS`]
+    /// churn — so it cannot be the whole retirement authority. The
+    /// authority is the session handle itself: every caller of this
+    /// function deactivates the `NetSession` it is retiring, and the
+    /// ingress refuses a frame whose session is no longer active
+    /// before it ever reaches here. That flag is captured with the
+    /// frame, is one-way, and expires with nothing. The marker
+    /// remains as the cheap in-window refusal.
     pub fn retire_session(&self, session_id: u64, now: Instant) {
         let mut abandoned = Vec::new();
         {
@@ -637,6 +742,63 @@ impl RtcReassembly {
         }
         self.record_abandoned(abandoned);
         self.bound_retired(now);
+    }
+
+    /// Release every group of one stream's receive lifetime on
+    /// `session_id`, and fence their ids (NR6).
+    ///
+    /// The session survives — only this stream's receive half ended.
+    /// See [`SessionState::retire_stream_groups`] for why the
+    /// released groups are counted rather than reported.
+    pub fn retire_stream(&self, session_id: u64, stream_id: u64, now: Instant) {
+        let released = {
+            let Some(mut entry) = self.sessions.get_mut(&session_id) else {
+                return;
+            };
+            entry.value_mut().retire_stream_groups(stream_id, now)
+        };
+        if released > 0 {
+            self.reset_retired_total
+                .fetch_add(released as u64, Ordering::Relaxed);
+            tracing::debug!(
+                session_id,
+                stream_id = format!("{stream_id:#x}"),
+                released,
+                "rtc: reset retired the stream's partial fragment groups"
+            );
+        }
+    }
+
+    /// Retire EVERY session's reassembly (NR3, shutdown).
+    ///
+    /// A shut-down node's reassembly map is mesh-owned, so nothing
+    /// else releases it: the close notifications that would have
+    /// retired each session are produced by the driver's teardown,
+    /// which happens while this node's consumers are being joined,
+    /// and a retained `MeshNode` therefore kept every partial group
+    /// it had buffered. Shutdown owns those bytes and says so here
+    /// instead of depending on a notification arriving in time.
+    ///
+    /// Returns how many groups were released.
+    pub fn retire_all(&self, now: Instant) -> usize {
+        let mut abandoned = Vec::new();
+        for mut entry in self.sessions.iter_mut() {
+            let session_id = *entry.key();
+            let state = entry.value_mut();
+            state.retired = Some(now);
+            let released = std::mem::take(&mut state.groups);
+            state.abandoned.clear();
+            for (fragment_id, partial) in released {
+                abandoned.push(partial.abandoned(
+                    session_id,
+                    fragment_id,
+                    AbandonReason::SessionRetired,
+                ));
+            }
+        }
+        let released = abandoned.len();
+        self.record_abandoned(abandoned);
+        released
     }
 
     /// Offer one inbound piece.
@@ -764,12 +926,21 @@ impl RtcReassembly {
                 // a duplicate adds no bytes: charging it against the
                 // session budget would let an ordinary retransmission
                 // refuse the group it is trying to complete.
-                if state.groups[slot]
-                    .1
-                    .pieces
-                    .iter()
-                    .any(|p| p.offset == piece.offset && p.last == last && p.data == piece.data)
-                {
+                //
+                // NR6: the SEQUENCE is part of what makes it a
+                // duplicate. A sender rebuilding a lost piece resends
+                // it with the sequence it was stamped with, so the
+                // legitimate retransmission still matches; a second
+                // packet carrying the same bytes at the same offset
+                // on a DIFFERENT sequence is a second acknowledged
+                // sequence claiming one piece's place, which is
+                // exactly what the span rule below forbids.
+                if state.groups[slot].1.pieces.iter().any(|p| {
+                    p.offset == piece.offset
+                        && p.last == last
+                        && p.sequence == piece.sequence
+                        && p.data == piece.data
+                }) {
                     return Err(FragmentOutcome::Duplicate);
                 }
                 if held.saturating_add(piece.data.len() as u64) > MAX_PROVISIONAL_STREAM_BYTES {
@@ -782,6 +953,28 @@ impl RtcReassembly {
                 if state.groups.len() >= MAX_GROUPS_PER_SESSION
                     || held.saturating_add(piece.data.len() as u64) > MAX_PROVISIONAL_STREAM_BYTES
                 {
+                    // **NR2.** This piece's sequence was recorded and
+                    // its credit returned before reassembly ever saw
+                    // it, so refusing to open its group loses
+                    // acknowledged bytes exactly as destroying a live
+                    // group does — and pre-fix this branch produced
+                    // neither a record nor a fence. The consequence
+                    // was worse than the silence: once the capacity
+                    // pressure eased, a TAIL of the refused group
+                    // opened a fresh headless group that could never
+                    // complete. The record names the loss and the
+                    // fence refuses the rest of the group.
+                    abandoned.push(AbandonedGroup {
+                        session_id,
+                        fragment_id: piece.fragment_id,
+                        provenance: piece.provenance,
+                        first_sequence: piece.sequence,
+                        last_sequence: piece.sequence,
+                        pieces: 1,
+                        held: piece.data.len(),
+                        reason: AbandonReason::Refused,
+                    });
+                    state.fence(piece.fragment_id, now);
                     return Err(FragmentOutcome::Refused);
                 }
                 state
@@ -795,8 +988,12 @@ impl RtcReassembly {
         let contradicts = partial.pieces.iter().any(|p| {
             let (s, e) = (p.offset as usize, p.offset as usize + p.data.len());
             // Any overlap that is not the exact duplicate handled
-            // above: a group is written once.
-            s < end && (piece.offset as usize) < e
+            // above: a group is written once. NR6: or a sequence the
+            // group already holds a piece for — one acknowledged
+            // sequence carries one piece, and two pieces sharing a
+            // sequence would let a group claim coverage it never
+            // received.
+            (s < end && (piece.offset as usize) < e) || p.sequence == piece.sequence
         }) || partial.pieces.len() >= MAX_PIECES_PER_GROUP
             || partial.total.is_some_and(|t| end > t || (last && end != t))
             // The declared end binds the pieces that arrived before
@@ -828,6 +1025,27 @@ impl RtcReassembly {
         let (fragment_id, mut partial) = state.groups.swap_remove(slot);
         let total = partial.total.unwrap_or(0);
         partial.pieces.sort_unstable_by_key(|p| p.offset);
+        // **NR6: sequence-to-offset provenance.** Byte coverage
+        // alone cannot tell one message's pieces from two. A head on
+        // sequence 0 and a tail on sequence 2 cover their bytes
+        // exactly while the group silently claims sequence 1 — a
+        // packet that belonged to whatever arrived in between and has
+        // already advanced this stream's FIFO. The leaf's sender
+        // allocates the pieces of one payload contiguous sequences in
+        // offset order, synchronously, inside one `build_packets`
+        // call, so that is the rule the receiver holds it to: sorted
+        // by offset, the sequences ascend by exactly one. The span
+        // needs no separate bound — it is the piece count, which
+        // `MAX_PIECES_PER_GROUP` already caps.
+        let contiguous = partial
+            .pieces
+            .windows(2)
+            .all(|w| w[0].sequence.checked_add(1) == Some(w[1].sequence));
+        if !contiguous {
+            abandoned.push(partial.abandoned(session_id, fragment_id, AbandonReason::Malformed));
+            state.fence(fragment_id, now);
+            return Err(FragmentOutcome::Malformed);
+        }
         // Prove the coverage rather than infer it from the byte
         // count: every piece must start exactly where the previous
         // one ended, from zero to the declared total.
@@ -903,8 +1121,9 @@ impl RtcReassembly {
         let _ = now;
     }
 
-    /// Report terminal dispositions: count them, log them, and queue
-    /// them for the ingress to drain.
+    /// Report terminal dispositions: count them, log them, queue
+    /// them for the ingress to carry into the conversation (NR2),
+    /// and keep the diagnostic detail an operator can read.
     fn record_abandoned(&self, groups: Vec<AbandonedGroup>) {
         if groups.is_empty() {
             return;
@@ -916,6 +1135,7 @@ impl RtcReassembly {
             Ordering::Relaxed,
         );
         let mut queue = self.abandoned.lock();
+        let mut terminals = self.terminals.lock();
         for group in groups {
             tracing::warn!(
                 session_id = group.session_id,
@@ -932,6 +1152,15 @@ impl RtcReassembly {
                 reason = group.reason.as_str(),
                 "rtc: reassembly abandoned acknowledged fragment bytes"
             );
+            // The production queue bounds the same way, and for the
+            // same reason: a consumer that stopped draining must not
+            // be able to grow this map. The OLDEST terminal gives
+            // way, because the newest loss is the one whose stream
+            // is most likely still waiting on a disposition.
+            if terminals.len() >= MAX_ABANDONMENT_RECORDS {
+                terminals.pop_front();
+            }
+            terminals.push_back(group.clone());
             if queue.len() >= MAX_ABANDONMENT_RECORDS {
                 queue.pop_front();
                 self.abandoned_dropped.fetch_add(1, Ordering::Relaxed);
@@ -963,12 +1192,13 @@ mod tests {
     }
 
     /// One piece, with the group identity every piece of a group
-    /// shares.
-    fn part(
+    /// shares, on an explicit stream sequence.
+    fn part_seq(
         session_id: u64,
         fragment_id: u16,
         offset: u16,
         flags: u8,
+        sequence: u64,
         data: Bytes,
     ) -> FragmentPiece {
         FragmentPiece {
@@ -976,10 +1206,27 @@ mod tests {
             fragment_id,
             offset,
             flags,
-            sequence: offset as u64,
+            sequence,
             provenance: provenance(),
             data,
         }
+    }
+
+    /// The same, stamping the piece's own offset as its sequence.
+    ///
+    /// Honest for the single-piece cases and for the contradiction
+    /// cases below, which never complete a group; a group that
+    /// COMPLETES must use [`part_seq`], because a real sender
+    /// allocates its pieces contiguous sequences rather than
+    /// offset-shaped ones.
+    fn part(
+        session_id: u64,
+        fragment_id: u16,
+        offset: u16,
+        flags: u8,
+        data: Bytes,
+    ) -> FragmentPiece {
+        part_seq(session_id, fragment_id, offset, flags, offset as u64, data)
     }
 
     #[test]
@@ -989,16 +1236,20 @@ mod tests {
         let head = Bytes::from_static(b"native ");
         let tail = Bytes::from_static(b"reassembly");
         assert_eq!(
-            r.accept(part(SESSION, 1, 0, FRAG_FRAGMENTED, head.clone()), now),
+            r.accept(
+                part_seq(SESSION, 1, 0, FRAG_FRAGMENTED, 0, head.clone()),
+                now
+            ),
             Err(FragmentOutcome::Buffered)
         );
         let whole = r
             .accept(
-                part(
+                part_seq(
                     SESSION,
                     1,
                     head.len() as u16,
                     FRAG_FRAGMENTED | FRAG_LAST,
+                    1,
                     tail,
                 ),
                 now,
@@ -1130,11 +1381,12 @@ mod tests {
         );
         let whole = r
             .accept(
-                part(
+                part_seq(
                     SESSION + 1,
                     1,
                     4,
                     FRAG_FRAGMENTED | FRAG_LAST,
+                    1,
                     Bytes::from_static(b"tail"),
                 ),
                 now,
@@ -1179,11 +1431,12 @@ mod tests {
         assert_eq!(r.held_bytes(SESSION), head.len() as u64, "nothing doubled");
         let whole = r
             .accept(
-                part(
+                part_seq(
                     SESSION,
                     1,
                     head.len() as u16,
                     FRAG_FRAGMENTED | FRAG_LAST,
+                    1,
                     Bytes::from_static(b"reassembly"),
                 ),
                 now,
@@ -1522,5 +1775,262 @@ mod tests {
         let released = r.take_abandoned();
         assert_eq!(released.len(), 1, "and said so");
         assert_eq!(released[0].reason, AbandonReason::SessionRetired);
+    }
+
+    /// **NR6.** Two pieces that cover their bytes exactly but arrived
+    /// on sequences 0 and 2 are not one message: the group would
+    /// silently claim sequence 1, which belonged to whatever arrived
+    /// between them and has already advanced this stream's FIFO.
+    ///
+    /// Inverse: delete the `contiguous` check in `accept_locked` —
+    /// the payload assembles and is dispatched as if the sender had
+    /// sent it in one run.
+    #[test]
+    fn a_group_cannot_claim_a_sequence_none_of_its_pieces_arrived_on() {
+        let r = RtcReassembly::new();
+        let now = Instant::now();
+        assert_eq!(
+            r.accept(
+                part_seq(
+                    SESSION,
+                    1,
+                    0,
+                    FRAG_FRAGMENTED,
+                    0,
+                    Bytes::from_static(b"head")
+                ),
+                now
+            ),
+            Err(FragmentOutcome::Buffered)
+        );
+        assert_eq!(
+            r.accept(
+                part_seq(
+                    SESSION,
+                    1,
+                    4,
+                    FRAG_FRAGMENTED | FRAG_LAST,
+                    2,
+                    Bytes::from_static(b"tail")
+                ),
+                now
+            ),
+            Err(FragmentOutcome::Malformed),
+            "a gap in the group's sequences is not a group"
+        );
+        assert_eq!(r.outstanding(), 0, "and the group goes with it");
+        let records = r.take_abandoned();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].reason, AbandonReason::Malformed);
+        assert_eq!(
+            r.accept(
+                part_seq(
+                    SESSION,
+                    1,
+                    4,
+                    FRAG_FRAGMENTED | FRAG_LAST,
+                    1,
+                    Bytes::from_static(b"tail")
+                ),
+                now
+            ),
+            Err(FragmentOutcome::Abandoned),
+            "and the id is fenced, so the honest tail cannot open a \
+             headless successor either"
+        );
+    }
+
+    /// **NR6.** One acknowledged sequence carries one piece: a second
+    /// piece on a sequence the group already holds is a contradiction,
+    /// not a second piece.
+    #[test]
+    fn two_pieces_cannot_share_one_acknowledged_sequence() {
+        let r = RtcReassembly::new();
+        let now = Instant::now();
+        let _ = r.accept(
+            part_seq(
+                SESSION,
+                1,
+                0,
+                FRAG_FRAGMENTED,
+                7,
+                Bytes::from_static(b"head"),
+            ),
+            now,
+        );
+        assert_eq!(
+            r.accept(
+                part_seq(
+                    SESSION,
+                    1,
+                    4,
+                    FRAG_FRAGMENTED | FRAG_LAST,
+                    7,
+                    Bytes::from_static(b"tail")
+                ),
+                now
+            ),
+            Err(FragmentOutcome::Malformed)
+        );
+        assert_eq!(r.outstanding(), 0);
+    }
+
+    /// **NR2.** A NEW group refused by the capacity bound has already
+    /// had its piece acknowledged, so the refusal is a loss: it is
+    /// reported, and the group id is fenced so the rest of the group
+    /// cannot open a headless successor once the pressure eases.
+    ///
+    /// Inverse: return a bare `Refused` from the `None` arm of
+    /// `accept_locked`'s slot match — `abandoned_total` stays at the
+    /// pre-refusal value and the tail opens a group of its own.
+    #[test]
+    fn a_refused_first_piece_is_reported_and_fences_its_group() {
+        let r = RtcReassembly::new();
+        let now = Instant::now();
+        let chunk = MAX_PAYLOAD_SIZE - 1;
+        for id in 1..=MAX_GROUPS_PER_SESSION as u16 {
+            if r.accept(part(SESSION, id, 0, FRAG_FRAGMENTED, piece(chunk)), now)
+                == Err(FragmentOutcome::Refused)
+            {
+                break;
+            }
+        }
+        let before = r.abandoned_total();
+        let _ = r.take_abandoned();
+        let _ = r.take_terminals();
+        // A group the session has never seen, whose first piece the
+        // byte budget cannot admit.
+        assert_eq!(
+            r.accept(
+                part_seq(SESSION, 400, 0, FRAG_FRAGMENTED, 90, piece(64)),
+                now
+            ),
+            Err(FragmentOutcome::Refused)
+        );
+        assert_eq!(
+            r.abandoned_total(),
+            before + 1,
+            "refusing a first piece loses acknowledged bytes, so it is \
+             reported like every other destruction"
+        );
+        let records = r.take_abandoned();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].reason, AbandonReason::Refused);
+        assert_eq!(records[0].fragment_id, 400);
+        assert_eq!(records[0].held, 64, "the piece's acknowledged bytes");
+        assert_eq!(records[0].first_sequence, 90);
+        assert_eq!(
+            r.accept(
+                part_seq(SESSION, 400, 64, FRAG_FRAGMENTED | FRAG_LAST, 91, piece(8)),
+                now
+            ),
+            Err(FragmentOutcome::Abandoned),
+            "and the refused group is fenced: its tail must not open a \
+             group whose head was never admitted"
+        );
+    }
+
+    /// **NR6.** A RESET ends one stream's receive lifetime, so that
+    /// stream's partial groups go with it — and only that stream's.
+    /// Nothing is reported: the reset is the terminal.
+    ///
+    /// Inverse: make `retire_stream` a no-op — the pre-reset head
+    /// survives and a delayed old tail completes it against the
+    /// lifetime that followed the reset.
+    #[test]
+    fn a_stream_reset_retires_only_that_streams_groups() {
+        let r = RtcReassembly::new();
+        let now = Instant::now();
+        let mut other = part_seq(SESSION, 2, 0, FRAG_FRAGMENTED, 5, piece(16));
+        other.provenance.stream_id = STREAM + 1;
+        let _ = r.accept(part_seq(SESSION, 1, 0, FRAG_FRAGMENTED, 4, piece(32)), now);
+        let _ = r.accept(other, now);
+        assert_eq!(r.held_bytes(SESSION), 48);
+
+        r.retire_stream(SESSION, STREAM, now);
+        assert_eq!(
+            r.held_bytes(SESSION),
+            16,
+            "the reset stream's group is released; the other stream's is not"
+        );
+        assert_eq!(r.reset_retired_total(), 1);
+        assert!(
+            r.take_abandoned().is_empty(),
+            "the reset IS the terminal disposition — reporting it again \
+             would ask the ingress to reset a stream because it was reset"
+        );
+        assert_eq!(
+            r.accept(
+                part_seq(SESSION, 1, 32, FRAG_FRAGMENTED | FRAG_LAST, 5, piece(8)),
+                now
+            ),
+            Err(FragmentOutcome::Abandoned),
+            "and the released group is fenced, so an old delayed tail \
+             cannot complete it against the lifetime after the reset"
+        );
+    }
+
+    /// **NR3.** Shutdown owns the mesh's reassembly: every session's
+    /// partial groups are released and every session is fenced,
+    /// without waiting for a close notification that arrives after
+    /// its consumer has been joined.
+    ///
+    /// Inverse: drop the `retire_all` call from `MeshNode::shutdown`
+    /// — a retained shut-down node keeps every buffered group.
+    #[test]
+    fn shutting_down_retires_every_sessions_groups() {
+        let r = RtcReassembly::new();
+        let now = Instant::now();
+        let _ = r.accept(part_seq(SESSION, 1, 0, FRAG_FRAGMENTED, 0, piece(32)), now);
+        let _ = r.accept(
+            part_seq(SESSION + 1, 1, 0, FRAG_FRAGMENTED, 0, piece(8)),
+            now,
+        );
+        assert_eq!(r.outstanding(), 2);
+
+        assert_eq!(r.retire_all(now), 2);
+        assert_eq!(r.outstanding(), 0);
+        assert_eq!(r.held_bytes(SESSION), 0);
+        assert_eq!(r.held_bytes(SESSION + 1), 0);
+        let released = r.take_abandoned();
+        assert_eq!(released.len(), 2, "and both losses are named");
+        assert!(released
+            .iter()
+            .all(|g| g.reason == AbandonReason::SessionRetired));
+        assert_eq!(
+            r.accept(part_seq(SESSION, 1, 32, FRAG_FRAGMENTED, 1, piece(8)), now),
+            Err(FragmentOutcome::Retired),
+            "and a frame already past its session lookup cannot rebuild \
+             state on a node that has shut down"
+        );
+    }
+
+    /// **NR2.** The production terminal queue and the diagnostic
+    /// record are independent: draining one does not consume the
+    /// other, so an operator reading `take_abandoned` cannot swallow
+    /// the ingress's obligation to end the stream — which is the
+    /// shape that let abandonment be diagnostic-only.
+    #[test]
+    fn a_destroyed_group_owes_a_terminal_and_records_a_diagnostic() {
+        let r = RtcReassembly::new();
+        let now = Instant::now();
+        let _ = r.accept(part_seq(SESSION, 1, 0, FRAG_FRAGMENTED, 0, piece(32)), now);
+        r.retire_session(SESSION, now);
+
+        let diagnostics = r.take_abandoned();
+        assert_eq!(diagnostics.len(), 1);
+        let terminals = r.take_terminals();
+        assert_eq!(
+            terminals.len(),
+            1,
+            "the diagnostic drain must not consume the terminal the \
+             ingress owes this stream"
+        );
+        assert_eq!(terminals[0].provenance.stream_id, STREAM);
+        assert!(
+            r.take_terminals().is_empty(),
+            "and a terminal is consumed exactly once: one destroyed group \
+             is one reset, not one per drainer"
+        );
     }
 }

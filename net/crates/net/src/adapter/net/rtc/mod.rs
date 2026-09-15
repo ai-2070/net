@@ -55,6 +55,8 @@ pub use driver::{RtcInstallPause, RtcTestHooks};
 pub use engine::{
     expire_dialogs, handle_signal, start_dialog, Dialog, DialogTable, SharedDialogs, SignalOutcome,
 };
+#[cfg(any(test, feature = "fixtures"))]
+pub use fragment::IngressPause;
 pub use fragment::{
     AbandonReason, AbandonedGroup, Assembled, FragmentOutcome, FragmentPiece, FragmentProvenance,
     RtcReassembly, GROUP_TTL, MAX_ABANDONED_GROUPS_PER_SESSION, MAX_ABANDONMENT_RECORDS,

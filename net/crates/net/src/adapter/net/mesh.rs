@@ -299,12 +299,21 @@ struct PendingStreamGrant {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InboundDisposition {
     /// Dispatch it now. Either the stream is not ordered, or this
-    /// arrival advanced the contiguous frontier.
-    Deliver,
+    /// arrival advanced the contiguous frontier. Carries the
+    /// lifetime that accepted it, because a deliverable frame still
+    /// joins the hold when the stream is already holding a run.
+    Deliver(StreamLifetime),
     /// A reliable stream's future sequence: the receiver holds it
     /// until the sequences before it are delivered
     /// ([`net_wire::session::StreamState::hold_out_of_order`]).
-    Hold,
+    ///
+    /// **NR4:** the `StreamLifetime` is the exact
+    /// `(session_id, epoch)` of the state that accepted the
+    /// sequence. Acceptance releases that state's map guard and the
+    /// hold re-acquires it by id, so without carrying the lifetime a
+    /// close/reopen in between put this frame into a replacement's
+    /// reorder buffer.
+    Hold(StreamLifetime),
     /// Not the consumer's: a duplicate, a sequence past the
     /// acceptance horizon, a provisional sender's refused stream
     /// allocation, or an out-of-order frame there was no room to
@@ -338,6 +347,96 @@ fn group_grants_by_session(
             .push((stream_id, total_consumed));
     }
     by_session
+}
+
+/// Carry every abandoned RTC fragment group into its stream's
+/// terminal disposition (**NR2**).
+///
+/// **An acknowledged group is owned.** The RTC ingress records a
+/// fragment's sequence and returns its credit *before* reassembly
+/// sees the piece — it has to, or the sender's window never opens —
+/// and that acknowledgement retires the sender's only copy. When a
+/// bound then ends the group (deadline, capacity refusal,
+/// contradiction, session end) there is nothing left to rebuild from
+/// and no wire gap left to NACK, because the sequences were
+/// consumed. Counting the loss and returning is the silence P1
+/// named: the peer goes on waiting for a reply to a request this
+/// node threw away.
+///
+/// So the loss becomes an event, on the conversation that suffered
+/// it, in three parts:
+///
+/// * the stream's local receive lifetime ends
+///   ([`NetSession::reset_rx_stream`]) — the cursor and reliability
+///   ranges go, so the peer's restarted sequences are admitted
+///   rather than dropped below a stale frontier;
+/// * the peer is told ([`NetSession::note_receive_terminal`], which
+///   the retransmit tick drains into a `StreamReset`), so its
+///   pending read fails fast instead of timing out;
+/// * the stream's remaining groups are fenced
+///   ([`super::rtc::RtcReassembly::retire_stream`]), so a delayed
+///   old tail cannot complete a pre-reset group against the
+///   lifetime that follows.
+///
+/// A record whose session is gone is skipped: its whole receive
+/// lifetime was retired with the session and there is no live stream
+/// left to end — the same rule the leaf's `dispose_abandoned_groups`
+/// applies to a scope it can no longer resolve.
+#[cfg(feature = "webrtc")]
+fn dispose_abandoned_rtc_groups(
+    reassembly: &super::rtc::RtcReassembly,
+    peers: &DashMap<u64, PeerInfo>,
+) {
+    let terminals = reassembly.take_terminals();
+    if terminals.is_empty() {
+        return;
+    }
+    let now = std::time::Instant::now();
+    for group in terminals {
+        // One owner or none: a session id is process-unique.
+        let owner = peers
+            .iter()
+            .find(|e| e.value().session.session_id() == group.session_id)
+            .map(|e| e.value().session.clone());
+        let Some(session) = owner else {
+            continue;
+        };
+        let stream_id = group.provenance.stream_id;
+        session.reset_rx_stream(stream_id);
+        session.note_receive_terminal(stream_id);
+        reassembly.retire_stream(group.session_id, stream_id, now);
+        tracing::warn!(
+            session_id = group.session_id,
+            stream_id = format!("{stream_id:#x}"),
+            first_sequence = group.first_sequence,
+            last_sequence = group.last_sequence,
+            held = group.held,
+            reason = group.reason.as_str(),
+            "rtc: reassembly loss ended the stream's receive half; the peer \
+             is being reset"
+        );
+    }
+}
+
+/// End one session's receive lifetime for reassembly purposes
+/// (**NR3**).
+///
+/// Two acts, always together. The reassembly marker is a *bounded*
+/// fence — it expires with `GROUP_TTL` and gives way under
+/// `MAX_RETIRED_SESSIONS` churn — so it cannot be the whole
+/// retirement authority for work that was captured before it ran.
+/// Deactivating the session is: the dispatch path holds that exact
+/// `Arc` alongside the frame, the flag is one-way, and it expires
+/// with nothing. `MeshNode::process_local_packet` refuses a frame
+/// whose session is no longer active, which is what bounds
+/// capture-to-dispatch rather than hoping the marker outlives it.
+#[cfg(feature = "webrtc")]
+fn retire_session_receive_lifetime(
+    reassembly: &super::rtc::RtcReassembly,
+    session: &Arc<NetSession>,
+) {
+    session.deactivate();
+    reassembly.retire_session(session.session_id(), std::time::Instant::now());
 }
 
 /// Capability gate for `StreamAckRanges` emission (STREAM_ACK_BATCHING
@@ -635,8 +734,8 @@ use super::reroute::ReroutePolicy;
 use super::route::{RoutingHeader, ROUTING_HEADER_SIZE, ROUTING_MAGIC};
 use super::router::{NetRouter, RouterConfig};
 use super::session::{
-    ControlDebitGuard, NetSession, StreamCloseOutcome, StreamDrainState, StreamState, TxAdmit,
-    CONTROL_STREAM_ID,
+    ControlDebitGuard, NetSession, StreamCloseOutcome, StreamDrainState, StreamLifetime,
+    StreamState, TxAdmit, CONTROL_STREAM_ID,
 };
 use super::stream::{Stream, StreamConfig, StreamError, StreamStats};
 use super::subnet::{
@@ -1009,9 +1108,11 @@ impl PeerEvictionCtx {
                     // N3: the session is gone, so the partial
                     // fragment groups it opened are released and
                     // the session is fenced against the packets
-                    // already past their session lookup.
-                    self.rtc_reassembly
-                        .retire_session(session_id, std::time::Instant::now());
+                    // already past their session lookup. NR3: and
+                    // the session handle itself is deactivated, so a
+                    // frame captured under it is refused at dispatch
+                    // however long it was held.
+                    retire_session_receive_lifetime(&self.rtc_reassembly, &old_info.session);
                     true
                 });
                 (evicted, evicted)
@@ -1047,9 +1148,8 @@ impl PeerEvictionCtx {
                     // exact-session path.
                     #[cfg(feature = "webrtc")]
                     self.provisional_endpoints.remove(&old_info.addr());
-                    // N3, on the exact-session path.
-                    self.rtc_reassembly
-                        .retire_session(session_id, std::time::Instant::now());
+                    // N3 + NR3, on the exact-session path.
+                    retire_session_receive_lifetime(&self.rtc_reassembly, &old_info.session);
                     true
                 });
                 (evicted, evicted)
@@ -1096,9 +1196,8 @@ impl PeerEvictionCtx {
                     // peer's state, so ordinary eviction clears it.
                     #[cfg(feature = "webrtc")]
                     self.provisional_endpoints.remove(&addr);
-                    // N3, on the ordinary close path.
-                    self.rtc_reassembly
-                        .retire_session(old_session_id, std::time::Instant::now());
+                    // N3 + NR3, on the ordinary close path.
+                    retire_session_receive_lifetime(&self.rtc_reassembly, &old_info.session);
                     true
                 });
                 (evicted, evicted)
@@ -23529,10 +23628,12 @@ impl MeshNode {
             // session — its held bytes would sit in the mesh-owned
             // reassembly map until some unrelated fragment happened
             // to arrive and age them out, which on a quiet mesh is
-            // never.
+            // never. NR3: and the displaced session is DEACTIVATED,
+            // which normal replacement never did — so a frame already
+            // captured under it is refused at dispatch rather than
+            // relying on a fence that expires in two seconds.
             #[cfg(feature = "webrtc")]
-            self.rtc_reassembly
-                .retire_session(old.session.session_id(), std::time::Instant::now());
+            retire_session_receive_lifetime(&self.rtc_reassembly, &old.session);
             // C4 hygiene (`NAT_TRAVERSAL_V2_PLAN.md`): drop the
             // displaced session's OWNED address when it differs from
             // the new one (a relay→direct swap leaves the old address
@@ -26572,24 +26673,9 @@ impl MeshNode {
         let paused = Arc::clone(&self.rtc_close_consumer_paused);
         let shutdown = self.shutdown.clone();
         let handle = tokio::spawn(async move {
-            while !shutdown.load(Ordering::Acquire) {
-                // A bounded wait, not a bare `recv().await`: this
-                // handle is joined by `shutdown`, and a task parked
-                // forever on an empty channel would make that join
-                // the deadlock instead of the teardown.
-                // H3 witness seam: a held consumer is how the
-                // bounded channel is made to overflow on purpose.
-                #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
-                if paused.load(Ordering::Acquire) {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                    continue;
-                }
-                let next = tokio::time::timeout(Duration::from_millis(100), closed.recv()).await;
-                let id = match next {
-                    Ok(Some(id)) => id,
-                    Ok(None) => break,
-                    Err(_) => continue,
-                };
+            // One implementation of the removal transaction, shared
+            // by the steady-state loop and the shutdown drain below.
+            let on_close = |id: super::rtc::RtcPeerId| {
                 // H3: a closed or recycled endpoint also drops any
                 // handshake inbox registered under it. Nothing else
                 // visits this registry for RTC, and a recycled slot
@@ -26647,6 +26733,38 @@ impl MeshNode {
                         }
                     }
                 }
+            };
+            while !shutdown.load(Ordering::Acquire) {
+                // A bounded wait, not a bare `recv().await`: this
+                // handle is joined by `shutdown`, and a task parked
+                // forever on an empty channel would make that join
+                // the deadlock instead of the teardown.
+                // H3 witness seam: a held consumer is how the
+                // bounded channel is made to overflow on purpose.
+                #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+                if paused.load(Ordering::Acquire) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    continue;
+                }
+                let next = tokio::time::timeout(Duration::from_millis(100), closed.recv()).await;
+                let id = match next {
+                    Ok(Some(id)) => id,
+                    Ok(None) => break,
+                    Err(_) => continue,
+                };
+                on_close(id);
+            }
+            // **NR3.** The driver's teardown announces every
+            // remaining channel close, and `MeshNode::shutdown`
+            // joins the driver BEFORE it joins this task precisely
+            // so those announcements exist by now. Exiting on the
+            // shutdown flag alone dropped them: the peer entries,
+            // address indexes and enrollment reservations of every
+            // channel open at teardown were left installed on a node
+            // that had stopped. Bounded — `try_recv` drains what is
+            // queued and never waits.
+            while let Ok(id) = closed.try_recv() {
+                on_close(id);
             }
         });
         self.tasks.lock().push(handle);
@@ -27980,7 +28098,8 @@ impl MeshNode {
                                     // the existing session — evict its reverse-
                                     // index entry, otherwise every accepted
                                     // rotation leaks one stale entry forever.
-                                    let displaced_session_id = occ.get().session.session_id();
+                                    let displaced = occ.get().session.clone();
+                                    let displaced_session_id = displaced.session_id();
                                     ctx.session_id_to_node
                                         .remove_if(&displaced_session_id, |_, n| {
                                             *n == peer_node_id
@@ -27992,10 +28111,11 @@ impl MeshNode {
                                     // Nothing else will: the rotation
                                     // leaves no close notification and
                                     // no endpoint removal behind it.
+                                    // NR3: deactivated with it.
                                     #[cfg(feature = "webrtc")]
-                                    ctx.rtc_reassembly.retire_session(
-                                        displaced_session_id,
-                                        std::time::Instant::now(),
+                                    retire_session_receive_lifetime(
+                                        &ctx.rtc_reassembly,
+                                        &displaced,
                                     );
                                     let session = Arc::new(NetSession::new(
                                         keys,
@@ -28286,12 +28406,36 @@ impl MeshNode {
     /// [`Self::dispatch_local_packet`] rather than here — paying AEAD
     /// twice is impossible anyway, since the replay window admits a
     /// counter exactly once.
+    ///
+    /// **NR3: capture-to-dispatch is bounded here.** The receive
+    /// loop clones the resolved session `Arc` and releases the peer
+    /// lookup before this call, and nothing bounds how long a worker
+    /// can be descheduled in between — so a frame can arrive at
+    /// dispatch after its session has been closed, replaced, swept or
+    /// shut down. Reassembly's retirement marker could not be the
+    /// answer: it expires with `GROUP_TTL` and is evicted under
+    /// churn, and a frame that outlives it recreated state under the
+    /// retired session id. The session handle CAN be: it is the very
+    /// object this frame was admitted against, deactivation is
+    /// one-way, and `retire_session_receive_lifetime` performs it on
+    /// every retirement path. A frame whose incarnation is gone is
+    /// refused before it is decrypted, dispatched or reassembled.
     fn process_local_packet(
         mut parsed: ParsedPacket,
         from_node: u64,
         session: &NetSession,
         ctx: &DispatchCtx,
     ) {
+        if !session.is_active() {
+            tracing::debug!(
+                session_id = session.session_id(),
+                from_node = format!("{from_node:#x}"),
+                stream_id = format!("{:#x}", parsed.header.stream_id),
+                "dispatch: frame captured under a retired session incarnation \
+                 refused"
+            );
+            return;
+        }
         // Validate payload length
         if !parsed.header.flags.is_handshake()
             && !parsed.header.flags.is_heartbeat()
@@ -28396,14 +28540,16 @@ impl MeshNode {
                 // sequence order. Frames held BELOW this sequence —
                 // what a conceded boundary gap leaves behind —
                 // would otherwise be delivered after it.
-                InboundDisposition::Deliver if session.holds_in_order(parsed.header.stream_id) => {
-                    Self::hold_inbound_in_order(parsed, decrypted, session);
+                InboundDisposition::Deliver(lifetime)
+                    if session.holds_in_order(parsed.header.stream_id) =>
+                {
+                    Self::hold_inbound_in_order(parsed, decrypted, session, lifetime);
                     return;
                 }
-                InboundDisposition::Deliver => {}
+                InboundDisposition::Deliver(_) => {}
                 InboundDisposition::Drop => return,
-                InboundDisposition::Hold => {
-                    Self::hold_inbound_in_order(parsed, decrypted, session);
+                InboundDisposition::Hold(lifetime) => {
+                    Self::hold_inbound_in_order(parsed, decrypted, session, lifetime);
                     return;
                 }
             }
@@ -28777,6 +28923,22 @@ impl MeshNode {
                     }
                 }
                 session.reset_rx_stream(reset.stream_id);
+                // **NR6:** the reset ends that stream's RECEIVE
+                // lifetime, so its partial fragment groups end with
+                // it. Leave them and a delayed old tail completes a
+                // pre-reset group afterwards, and a payload from
+                // before the reset is dispatched against the fresh
+                // cursor — behind the reset the consumer has already
+                // been given. Session retirement does not cover this:
+                // the session is still live. Mirrors the leaf's
+                // `Reassembler::retire_stream`, including reporting
+                // nothing: the reset IS the terminal disposition.
+                #[cfg(feature = "webrtc")]
+                ctx.rtc_reassembly.retire_stream(
+                    session.session_id(),
+                    reset.stream_id,
+                    std::time::Instant::now(),
+                );
             }
             return;
         }
@@ -29523,14 +29685,16 @@ impl MeshNode {
         if !released && parsed.header.subprotocol_id == 0 {
             match Self::account_inbound_stream_packet(&parsed, payload_bytes, true, session, ctx) {
                 // Same ordering rule as the control-plane site above.
-                InboundDisposition::Deliver if session.holds_in_order(parsed.header.stream_id) => {
-                    Self::hold_inbound_in_order(parsed, decrypted, session);
+                InboundDisposition::Deliver(lifetime)
+                    if session.holds_in_order(parsed.header.stream_id) =>
+                {
+                    Self::hold_inbound_in_order(parsed, decrypted, session, lifetime);
                     return;
                 }
-                InboundDisposition::Deliver => {}
+                InboundDisposition::Deliver(_) => {}
                 InboundDisposition::Drop => return,
-                InboundDisposition::Hold => {
-                    Self::hold_inbound_in_order(parsed, decrypted, session);
+                InboundDisposition::Hold(lifetime) => {
+                    Self::hold_inbound_in_order(parsed, decrypted, session, lifetime);
                     return;
                 }
             }
@@ -29988,7 +30152,20 @@ impl MeshNode {
     ) -> InboundDisposition {
         let stream_id = parsed.header.stream_id;
         let seq = parsed.header.sequence;
-        let mut disposition = InboundDisposition::Deliver;
+        // **NR4.** The lifetime that ACCEPTS the sequence, captured
+        // while its map guard is still held and carried out of this
+        // call, so the hold can prove it is inserting into the same
+        // state rather than into whatever answers to this id by the
+        // time it looks.
+        let mut lifetime = StreamLifetime {
+            session_id: session.session_id(),
+            epoch: 0,
+        };
+        // Assigned as soon as the accepting state is in hand, below:
+        // there is no meaningful disposition before its epoch is
+        // known, and the one early return above it returns `Drop`
+        // outright rather than reading this.
+        let mut disposition;
         let total_consumed = {
             // Make the receive-side stream reliable when the packet is
             // RELIABLE-flagged, so it tracks SACK and can NACK lost
@@ -30030,6 +30207,8 @@ impl MeshNode {
             // They still consume a sequence, so they are still
             // recorded and acknowledged — only never parked. Same
             // exemption, same reason, as the leaf's receive half.
+            lifetime.epoch = stream.epoch();
+            disposition = InboundDisposition::Deliver(lifetime);
             let ordered =
                 stream.reliable_mode() && Self::charges_inbound_bytes(parsed.header.subprotocol_id);
             let frontier = ordered.then(|| stream.with_reliability(|r| r.rx_ack_seq()));
@@ -30047,7 +30226,7 @@ impl MeshNode {
                 // recorded and acknowledged, but not the consumer's
                 // until what precedes it has been delivered.
                 if ordered && seq >= stream.with_reliability(|r| r.rx_ack_seq()) {
-                    disposition = InboundDisposition::Hold;
+                    disposition = InboundDisposition::Hold(lifetime);
                 }
             } else {
                 disposition = InboundDisposition::Drop;
@@ -30113,18 +30292,37 @@ impl MeshNode {
     /// the sequences in front of it are delivered first.
     ///
     /// The room was reserved before the sequence was accepted, so
-    /// there is nothing to refuse here. A stream that vanished
-    /// between the two (close, or session replacement) drops the
-    /// frame: its consumer is gone, and the sender's own reset
-    /// machinery is what reports that.
-    fn hold_inbound_in_order(parsed: ParsedPacket, decrypted: Bytes, session: &NetSession) {
+    /// there is nothing to refuse on capacity grounds. What CAN
+    /// refuse it is identity: `lifetime` is the exact
+    /// `(session_id, epoch)` of the state that accepted this
+    /// sequence, and a stream that vanished OR WAS REPLACED between
+    /// acceptance and insertion is not that state (NR4). The old
+    /// comment was half right — a vanished stream's consumer is
+    /// gone, so dropping is correct — but a REPLACED stream has a
+    /// live consumer that never accepted this sequence and never
+    /// reserved its bytes, and handing it the predecessor's frame is
+    /// a cross-lifetime delivery, not a drop.
+    fn hold_inbound_in_order(
+        parsed: ParsedPacket,
+        decrypted: Bytes,
+        session: &NetSession,
+        lifetime: StreamLifetime,
+    ) {
         let stream_id = parsed.header.stream_id;
         let seq = parsed.header.sequence;
-        session.hold_in_order_frame(
+        if !session.hold_in_order_frame(
             stream_id,
             seq,
+            lifetime,
             net_wire::session::HeldFrame { parsed, decrypted },
-        );
+        ) {
+            tracing::debug!(
+                stream_id = format!("{stream_id:#x}"),
+                seq,
+                epoch = lifetime.epoch,
+                "in-order hold not taken: the accepting stream lifetime is gone"
+            );
+        }
     }
 
     /// Does this node DISPATCH `subprotocol_id`, and therefore owe
@@ -30455,9 +30653,23 @@ impl MeshNode {
                 // H-3: any stream whose reliable layer gave up
                 // retransmitting → tell the peer to fail its pending read
                 // now (a `StreamReset`) instead of stalling to a timeout.
+                //
+                // NR2/NR4: and any stream whose RECEIVE half ended
+                // locally, for the same reason from the other
+                // direction. A reassembly group that acknowledged
+                // bytes it can never deliver, or a cap sweep that
+                // evicted arrivals only this receiver still held, both
+                // leave the SENDER waiting on data it has already
+                // discarded its copy of. One egress, one frame type:
+                // the peer's read fails fast either way.
                 let mut resets: Vec<(PeerAddr, Arc<NetSession>, Vec<u64>)> = Vec::new();
                 for peer in peers.iter() {
-                    let failed = peer.value().session.take_failed_stream_ids();
+                    let mut failed = peer.value().session.take_failed_stream_ids();
+                    for stream_id in peer.value().session.take_receive_terminals() {
+                        if !failed.contains(&stream_id) {
+                            failed.push(stream_id);
+                        }
+                    }
                     if !failed.is_empty() {
                         resets.push((peer.value().addr(), peer.value().session.clone(), failed));
                     }
@@ -31265,6 +31477,23 @@ impl MeshNode {
                             );
                         }
 
+                        // **NR2: the reassembly deadline is a
+                        // deadline.** Expiry used to run only from
+                        // `accept`, i.e. only when some later
+                        // fragment happened to arrive — so a quiet
+                        // live session held an incomplete group's
+                        // acknowledged bytes indefinitely, and the
+                        // stream that lost them was never told. This
+                        // tick is the deadline's owner: it reaps on
+                        // the clock and then carries whatever it
+                        // reaped into the losing stream's terminal,
+                        // exactly as the ingress does.
+                        #[cfg(feature = "webrtc")]
+                        {
+                            rtc_reassembly_evict.expire(std::time::Instant::now());
+                            dispose_abandoned_rtc_groups(&rtc_reassembly_evict, &peers);
+                        }
+
                         // Dead-peer eviction: walk peers in Failed
                         // state whose session has been inactive for
                         // longer than `dead_peer_timeout`. The
@@ -31378,11 +31607,12 @@ impl MeshNode {
                                 // runs. Without this, a peer the
                                 // failure detector gave up on left
                                 // its acknowledged partial bytes
-                                // pinned in the mesh-owned map.
+                                // pinned in the mesh-owned map. NR3:
+                                // deactivated with it.
                                 #[cfg(feature = "webrtc")]
-                                rtc_reassembly_evict.retire_session(
-                                    old_session_id,
-                                    std::time::Instant::now(),
+                                retire_session_receive_lifetime(
+                                    &rtc_reassembly_evict,
+                                    &old_info.session,
                                 );
                                 true
                             });
@@ -37128,14 +37358,42 @@ impl MeshNode {
             );
             return None;
         };
-        match ctx.rtc_reassembly.accept(
+        // The NR3 seam: a captured-but-not-yet-admitted frame, held
+        // here on purpose so a retirement can land while it waits.
+        // Fixtures/test builds only, `None` by default, and it runs
+        // with no lock held.
+        #[cfg(any(test, feature = "fixtures"))]
+        ctx.rtc_reassembly.run_dispatch_pause();
+        // NR3, second half of the capture-to-dispatch bound. The
+        // top-of-dispatch check refuses a frame whose incarnation is
+        // gone; this is the same question asked immediately before the
+        // only write that could recreate retired state, so a
+        // retirement that lands between the two still finds the
+        // session's own entry guard (X9) and the marker behind it.
+        if !session.is_active() {
+            tracing::debug!(
+                session_id = session.session_id(),
+                fragment_id = parsed.header.fragment_id,
+                "rtc: leaf fragment refused, its session incarnation is retired"
+            );
+            return None;
+        }
+        let outcome = ctx.rtc_reassembly.accept(
             super::rtc::FragmentPiece::from_header(
                 session.session_id(),
                 &parsed.header,
                 piece.clone(),
             ),
             std::time::Instant::now(),
-        ) {
+        );
+        // **NR2: the production drain.** Whatever that call destroyed
+        // — this piece's own refused group, a deadline this piece's
+        // arrival applied to some other group, a contradiction — is
+        // acknowledged data, and it becomes a terminal on the stream
+        // that lost it HERE, at the conversation boundary, rather
+        // than a diagnostic record nobody reads.
+        dispose_abandoned_rtc_groups(&ctx.rtc_reassembly, &ctx.peers);
+        match outcome {
             // X11: the group's identity was bound by its FIRST piece
             // and every later piece had to match it, so the context
             // this dispatch continues with — stream, origin, channel,
@@ -37349,24 +37607,20 @@ impl MeshNode {
         // alone and take its side effects unconditionally — so a
         // breach charged against one incarnation could close a
         // successor's channel.
-        let owned = ctx
-            .peers
-            .remove_if(&node_id, |_, info| {
-                info.session.session_id() == session_id
-                    && info.addr() == endpoint
-                    && info.admission.is_provisional()
-            })
-            .is_some();
-        if !owned {
+        let removed = ctx.peers.remove_if(&node_id, |_, info| {
+            info.session.session_id() == session_id
+                && info.addr() == endpoint
+                && info.admission.is_provisional()
+        });
+        let Some((_, breached)) = removed else {
             return;
-        }
+        };
         ctx.peer_addrs.remove_if(&node_id, |_, a| *a == endpoint);
         ctx.addr_to_node.remove_if(&endpoint, |_, n| *n == node_id);
         ctx.provisional_endpoints.remove(&endpoint);
         // N3: the breach path ends the session too, so its partial
-        // fragment groups go with it.
-        ctx.rtc_reassembly
-            .retire_session(session_id, std::time::Instant::now());
+        // fragment groups go with it. NR3: deactivated with it.
+        retire_session_receive_lifetime(&ctx.rtc_reassembly, &breached.session);
         if let Some(stats) = ctx.rtc_stats.as_ref() {
             stats.note_admission_reclaimed();
         }
@@ -46733,9 +46987,33 @@ impl Adapter for MeshNode {
             egress.close_and_join().await;
         }
 
-        // Deactivate all sessions
+        // Deactivate all sessions. NR3: this is also what refuses
+        // every frame still in flight past its session lookup — a
+        // deactivated session is not dispatched
+        // (`process_local_packet`), so no late arrival can rebuild
+        // receive state on a node that is going away.
         for entry in self.peers.iter() {
             entry.value().session.deactivate();
+        }
+
+        // R3-B: the RTC driver is this node's task and its socket is
+        // this node's socket, so this call owns ending both. Signalled
+        // AND joined: without the join, "shut down" would only mean
+        // "asked to stop", and a successor trying to rebind an
+        // explicit RTC port would lose a race it cannot see.
+        //
+        // **NR3: joined BEFORE the general task drain, not after.**
+        // `SessionTable::drop` announces every remaining channel
+        // close as it tears down, and the consumer of those
+        // announcements is one of the tasks below. Draining the tasks
+        // first stopped that consumer before the announcements
+        // existed, so the driver's final closes went into a channel
+        // nobody would ever read. In this order the notifier is still
+        // alive when they are queued, and its shutdown path drains
+        // what is already queued before it exits.
+        #[cfg(feature = "webrtc")]
+        if let Some(driver) = self.rtc_driver.as_ref() {
+            driver.shutdown_and_join().await;
         }
 
         // Wait for background tasks. Taken under the synchronous lock in its own
@@ -46745,14 +47023,23 @@ impl Adapter for MeshNode {
             let _ = handle.await;
         }
 
-        // R3-B: the RTC driver is this node's task and its socket is
-        // this node's socket, so this call owns ending both. Signalled
-        // AND joined: without the join, "shut down" would only mean
-        // "asked to stop", and a successor trying to rebind an
-        // explicit RTC port would lose a race it cannot see.
+        // **NR3: shutdown owns the mesh's reassembly.** The map
+        // outlives every session in it, so a retained shut-down node
+        // kept every partial group it had buffered — and the close
+        // notifications that would have retired them are exactly the
+        // ones whose consumer this call has just joined. Retiring
+        // here does not depend on any notification arriving: it runs
+        // last, after every producer of new groups is gone.
         #[cfg(feature = "webrtc")]
-        if let Some(driver) = self.rtc_driver.as_ref() {
-            driver.shutdown_and_join().await;
+        {
+            let released = self.rtc_reassembly.retire_all(std::time::Instant::now());
+            if released > 0 {
+                tracing::info!(
+                    released,
+                    "shutdown: released partial leaf-fragment groups the mesh \
+                     was holding"
+                );
+            }
         }
 
         Ok(())
