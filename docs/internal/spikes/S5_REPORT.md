@@ -71,15 +71,24 @@ Five properties, and why each is needed:
    provisioned, which is exactly why Tier A can run it with a dumb
    store.
 
-**What v1 implements.** `AnchorControlPlane` carries envelopes for
-the bootstrap dialog it already owns; the leaf verifies every inbound
-envelope through the same path a serverless carrier would use. The
-trait admits the specified path because `ControlPlane::signal` takes
-a peer id and an envelope, *not* a session — that is the shape
-decision the follow-on depends on. The native side's `0x0D02`
-in-session frames are untouched: this is an additional, weaker-coupled
-path, not a replacement, and Stage 5 does not change any native
-signalling behaviour.
+**What v1 implements — corrected.** This paragraph originally said
+`AnchorControlPlane` carries envelopes for the bootstrap dialog it
+already owns. **It does not, and R14 is why.** The Stage 4b anchor
+listener discards a `type: "signal"` frame, so serialising one and
+reporting delivery told the caller something false; the shipped
+behaviour is a typed REFUSAL naming the peer, and the adapter's route
+table says "no route" rather than listing a signalling route. Carrying
+envelopes end to end needs a forwarding route with an acknowledgement
+— generic peer coordination, which is Stage 6's, not this stage's.
+What v1 does implement is the SHAPE the follow-on depends on:
+`ControlPlane::signal` takes a peer id and an envelope, *not* a
+session, and the anchorless mock carries the identical envelopes for
+real, so the seam is exercised even though the anchor refuses. The
+production refusal is now pinned by
+`the_anchor_control_plane_refuses_to_carry_a_signalling_envelope`
+(`wasm_leaf.rs`), so the corrected claim has a witness rather than a
+promise. The native side's `0x0D02` in-session frames are untouched:
+Stage 5 changes no native signalling behaviour.
 
 **The honest residue.** An envelope proves who *sent* the SDP; it
 does not prove the sender is reachable, nor does it replace admission.
@@ -280,11 +289,16 @@ ed25519, x25519, serde_json, base64 and the `web_sys` glue.
    it. The announcement VERIFIER is codec-free — it canonicalises
    inbound JSON without enumerating a field — which is what makes the
    writer's copy tolerable.
-4. **No native node reassembles fragments.** `leaf/src/frame.rs` is
-   the first and only reader of `frag_flags` in the tree, so an
-   over-cap payload works leaf ↔ leaf but a native peer sees N
-   partial events. Nothing regresses (the prior behaviour was S0c's
-   silent drop) and the harness keeps payloads under 8 104 B.
+4. **No plain native node reassembles fragments.** `leaf/src/frame.rs`
+   and the native RTC ingress (`src/adapter/net/rtc/fragment.rs`) are
+   the only readers of `frag_flags` in the tree, so an over-cap
+   payload works leaf ↔ leaf and leaf → RTC ingress, while a plain
+   native peer sees N partial events. The reverse direction is no
+   longer a gap: nothing on the native side fragments, so
+   `send_on_stream` refuses an event above `MAX_EVENT_SIZE` with a
+   typed `StreamError::EventTooLarge` naming the limit instead of
+   answering `Ok` and delivering nothing (§9.2). The harness keeps
+   payloads under 8 104 B and GATES the refusal above it.
 5. **`ControlPlane::query_capability` has no v1 anchor endpoint.** The
    4b listener serves three routes, so `query` answers from the
    announcements the dispatcher verified — §7's own mechanism. The
@@ -375,34 +389,74 @@ on every terminal path, it happens later — beside the new
 Totals at this head: 73 across the five RTC binaries named above, 24
 listener tests, 19 browser witnesses.
 
-### 9.2 Payload-size interoperability: exactly what is claimed
+### 9.2 Payload-size interoperability: exactly what is claimed, in BOTH directions
 
-**Claimed.** A leaf fragments an application payload larger than
-`MAX_PAYLOAD_SIZE` (8 104 B) into up to 8 fragments and reassembles
+The bound both directions are measured against is `MAX_EVENT_SIZE` =
+8 104 B — `MAX_PAYLOAD_SIZE` (8 108) minus the event frame's 4-byte
+length prefix. It is defined once, in `net_wire::protocol`, and the
+leaf's `MAX_FRAGMENT_PAYLOAD` is an alias of it: the native sender
+refuses above exactly the bound the leaf fragments at, and two
+derivations of the same number could drift apart and turn a refusal
+back into a drop.
+
+**LEAF → NATIVE.** *Claimed:* a leaf fragments an application payload
+larger than `MAX_EVENT_SIZE` into up to 8 fragments and reassembles
 inbound fragments with a bound (8 concurrent groups, 2 s TTL, every
 refusal counted). Leaf ↔ leaf, an over-cap payload round-trips; this
-is witnessed natively and in wasm.
-
-**Not claimed.** No NATIVE node reassembles fragments.
-`leaf/src/frame.rs` is the first and only reader of `frag_flags` in
-the tree, so a leaf → native payload above 8 104 B arrives as N
-packets each carrying a partial event, and the native side does not
-put them back together. Nothing regresses — the pre-Stage-5
-behaviour for such a payload was S0c's silent drop — but "Stage 5
-made over-cap payloads work" is true only between leaves.
-
-**Also not claimed.** Above 64 832 B nothing is attempted at all:
+is witnessed natively and in wasm, and the native RTC ingress
+(`src/adapter/net/rtc/fragment.rs`) reassembles what a leaf sent to
+it. *Not claimed:* no other NATIVE receive path reassembles, so a
+leaf → native payload above 8 104 B arrives as N packets each
+carrying a partial event and is not put back together. *Also not
+claimed:* above 64 832 B nothing is attempted at all —
 `fragment_offset` is a u16 BYTE offset, so the last fragment cannot
-start past byte 65 535. The send path returns a typed
+start past byte 65 535. The leaf send path returns a typed
 `LeafError::Wire` naming streams as the way out — never a truncation
 and never a drop.
+
+**NATIVE → LEAF.** *Claimed, and this is the round-3 repair.* One
+event must fit one packet, and nothing on the native side fragments:
+`MeshNode::send_on_stream` refuses any event above `MAX_EVENT_SIZE`
+with a typed `StreamError::EventTooLarge { size, limit }` that NAMES
+the limit. The refusal happens before the peer is resolved, before a
+sequence is consumed, and it is whole — the fitting prefix of a mixed
+batch does not reach the wire either. `MAX_EVENT_SIZE` is re-exported
+from `net::adapter::net` so a caller can check before sending, and the
+bound is mirrored through every binding (`SdkError::EventTooLarge`,
+`NET_ERR_MESH_EVENT_TOO_LARGE = -118`, a Node `Error` and a Python
+`ValueError`, each carrying size and limit).
+
+Round 3's ABI evidence lane measured this direction rather than
+assuming it, and found the defect it was built to find: a 32 KiB
+`send_on_stream` returned **`Ok`** and delivered **nothing**. The
+batching loop splits a batch across packets but cannot split one
+event, so the builder stamped a `payload_len` no receiver accepts —
+every native receive path reads into a `MAX_PACKET_SIZE` buffer and
+`NetHeader::validate` refuses an over-cap length — and the bytes went
+nowhere. Under the cap the identical send arrived byte-exact, so the
+limit was a caller-visible cliff with no signature, no counter and no
+error.
+
+**Why a typed refusal and not fragmentation.** `send_on_stream` is
+transport-agnostic. Only two receivers interpret `frag_flags` — the
+browser leaf and the native RTC ingress — and no plain native peer
+reassembles anything. Fragmenting in the generic send would therefore
+hand a native peer's application N partial events as if each were a
+message: a silent corruption in place of a silent drop, on the much
+more common native ↔ native path, with no per-peer "reassembles
+fragments" capability to gate on. And `fragment_offset` being a u16
+means any fragmentation scheme still ends at 64 832 B — a second
+undiscoverable cliff. A refusal that names the limit is uniform
+across every transport and discoverable on the first call.
 
 **What the matrix therefore keeps under the cap.** Every browser
 witness sends payloads below 8 104 B deliberately, because a witness
 that quietly relied on native reassembly would be asserting a
-property this stage does not have. A native-side reassembly arm is
-the prerequisite for leaf → native over-cap payloads, and it is
-named in §8.
+property this stage does not have. The over-cap leg of
+`stage5_large_messages_cross_the_public_api_in_both_directions` is
+now GATED on the typed refusal *and* on the payload never arriving —
+it was RECORDED for one round, while the native → leaf answer was
+unwritten.
 
 ---
 
@@ -712,36 +766,79 @@ the production diff is empty. That is the finding, not an excuse:
 two witnesses were asserting interleavings rather than invariants,
 and one was modelling a transport the leaf does not ship.
 
+**Evidence status of this section.** Kyra's round-2 review (E4) was
+right that the causality claims below originally rested on traces
+that had been captured and then not kept. Each paragraph now says
+which of its sentences is a re-captured receipt with a path, which
+is a cited source fact, and which is inference. Nothing here stands
+on evidence that no longer exists.
+
 **(1) `rtc_repairs::a_control_frame_shares_the_sequence_space_of_the
 _stream_it_rides`** — `retransmit_packets_sent == 1` after a 1 s
 settle on a loss-free link. NOT the control frame: it is built with
 `PacketFlags::NONE` and `register_retransmit` returns immediately
-for non-reliable flags, so it can never be in a retransmit window.
-The resent packet was an application payload (seq 8 in 15 of 17
-reproductions), and its ACK was always SENT — `ack_seq=2
-consumed=253` shows the peer stepping over the control frame at
-seq 1 and charging its bytes, which is N1 working. `flush_stream_
-batch` awaits the socket and only then registers the descriptor,
-while the peer's grant drainer answers on a 1 ms cadence, so under
-load the covering ACK is applied BEFORE the sender registers the
-packet it covers — measured at 66 µs. The packet misses its own
-prune, times out once, and the duplicate's grant prunes it. That
-ordering predates this round. Reproduced 17/20 by pinning to one
-logical CPU against 24 burners; 0/12 unloaded. The assertion was
-therefore falsifiable by scheduling on a margin of one RTO (10 ms
-after the adaptive estimate floors on loopback), and is replaced by
-what the witness means: the window DRAINED, and drained by
-acknowledgement rather than by the give-up path —
-`max_consumed_seen == tx_bytes_sent`. Under the inverse (the
-receive-side accounting block deleted) that fires with `gap 111`,
-exactly the membership frame's wire bytes. `reset_packets_sent == 0`
-went with it: the same race at 4× the margin, measured failing 2/15,
-with its coverage subsumed. Under the conditions that failed the old
-assertion 17/20, the new one passes 20/20 with the spurious
-retransmits still occurring.
+for non-reliable flags (**cited source fact**), so it can never be
+in a retransmit window. The resent packet was an application
+payload, and its ACK was always SENT — the peer steps over the
+control frame's sequence and charges its bytes, which is N1
+working. `flush_stream_batch` awaits the socket and only then
+registers the descriptor, while the peer's grant drainer answers on
+a 1 ms cadence, so under load the covering ACK can be applied
+BEFORE the sender registers the packet it covers; the packet misses
+its own prune, times out once, and the duplicate's grant prunes it.
+That ordering predates this round.
 
-**(2) `wasm_anchorless.rs:647`** — closed; see §11.7. Also a
-fixture modelling a slower wire than production.
+**[INFERENCE], and only these three numbers:** the "17/20
+reproductions by pinning to one logical CPU against 24 burners",
+"0/12 unloaded" and the "66 µs" measurement. Those traces were not
+kept, reproducing them needs CPU pinning against burners, and this
+round did not re-run them. The *mechanism* they illustrate —
+register-after-ack — is not inference: it is readable in
+`flush_stream_batch`'s ordering and is now named in the witness's
+own doc comment and explicitly permitted by its disposition
+assertion.
+
+**What IS re-captured, at this head.** The oracle itself changed
+this round, because "empty pending ∧ `max_consumed_seen ==
+tx_bytes_sent`" does not distinguish acknowledgement from give-up
+(Kyra, evidence row 2). It is replaced by: the receiver's
+cumulative ACK cursor observed to have advanced ACROSS the control
+frame's sequence; the sender's ACK frontier covering every
+registered descriptor; the byte ledger retained; and an explicit
+same-lifetime disposition. The flaky zero-retransmit and zero-reset
+assertions stay retired. Two inverses were executed and restored,
+with diffs, commands, exits and logs, at
+`spikes/S5_R3_NATIVE_RECEIPTS/README.md`:
+
+- **Inverse A**, the whole `account_inbound_stream_packet` block
+  deleted — exit 100, reporting `tx_bytes_sent=1247
+  max_consumed_seen=1136 gap=111 tx_seq=9`. This is a
+  **byte-accounting** receipt and is cited for nothing else.
+- **Inverse B**, the load-bearing one: the control frame keeps its
+  byte consumption and only `on_receive(sequence)` is omitted. The
+  new oracle fails (exit 100, `frontier Some(1)`) while the RETIRED
+  oracle *passes* under the same mutation (exit 0,
+  `tx_bytes_sent=1247 max_consumed_seen=1247 gap=0 tx_seq=9`) —
+  empty window, byte ledger exactly closed, nine sequences issued,
+  cumulative ack never past 1. That is the old oracle's blind spot,
+  executed rather than argued, and it is why the sequence-only
+  sensitivity claim cites B and not A.
+
+**(2) `wasm_anchorless.rs:647`** — closed; see §11.7. A fixture
+modelling a slower wire than production.
+
+**RE-CAPTURED**, because the original trace was not kept:
+`spikes/S5_R3_EVIDENCE/anchorless-fixture-causality.log` carries the
+bounded inverse diff (remove the inbound sink's
+`deliver_on_arrival()` call, putting the fixture back on the
+tick-delivery wire it had invented), the exact command, and both
+runs. Inverse: **exit 1**, `duplicate_sequence` A=1 B=3, `left: (1,
+3)  right: (0, 0)` — that drop counter and no other. Restored via
+`git checkout --` (empty `git status --porcelain` for the path,
+md5 unchanged): **exit 0, 2 passed, 0 failed**. The mechanism
+reproduces on demand. The figure differs from the single drop
+described in §11.7 only because the assertion was strengthened from
+A-only to `(A, B) == (0, 0)`, which is what exposed B's three.
 
 **(3) Chromium `mdns_on_pair_formed`** — neither of the two
 hypotheses. Not a peer-reflexive race: Chromium reached `connected`
@@ -750,16 +847,40 @@ reflexive candidate: the obfuscated `.local` host candidate paired,
 and the anchor-stun variant that DID produce an srflx failed the
 same way. The pair formed, the DataChannel opened, and the attempt
 died at the Noise handshake — then the probe discarded the pair it
-had and reported the anchor as lacking mDNS support. `page/app.js`
-opened the channel `{ordered: false, maxRetransmits: 0}`; the leaf
-opens it ordered and reliable because the AEAD replay window refuses
-packet-level reorder. Noise `msg1`/`msg2` are `build_handshake`
-packets outside the reliable-stream machinery, so `reliability.rs`
-cannot retransmit them and SCTP is their only recovery — which the
-harness had switched off. One lost datagram was terminal.
-Reproduced by dropping exactly one real inbound datagram: old config
-`NO PAIR — timeout: noise msg2… disconnected@12824ms` against CI's
-12.7 s; new config, identical drop, PAIR FORMED in 25 ms, 21/21.
+had and reported the anchor as lacking mDNS support.
+
+**Cited source facts, not inference:** `page/app.js` opened the
+channel `{ordered: false, maxRetransmits: 0}` while the leaf opens
+it ordered and reliable (`leaf/src/rtc.rs:145–155`, unchanged
+production), because the AEAD replay window refuses packet-level
+reorder; and Noise `msg1`/`msg2` are `build_handshake` packets
+outside the reliable-stream machinery, so `reliability.rs` cannot
+retransmit them and SCTP is their only recovery — which the harness
+had switched off. One lost datagram was therefore terminal.
+
+**[INFERENCE], and only this:** the specific A/B figures reported
+last round — "old config `NO PAIR — timeout: noise msg2…
+disconnected@12824ms`", "new config, identical drop, PAIR FORMED in
+25 ms". Those traces were not kept and are not re-captured here.
+
+What this round did instead of leaving that unfalsifiable: the
+repository had **no injector that could produce that A/B at all**.
+`RtcTestHooks::set_ingress_drop_one_in` discards an
+`Event::ChannelData` — SCTP has already delivered it, so the loss is
+ABOVE SCTP and is terminal under both negotiations; the page's
+`RTCDataChannel.prototype.send` hook is above SCTP for the same
+reason; and `UdpProfile` removes all UDP rather than one datagram.
+An instrument that cannot distinguish the two configurations is not
+evidence about the difference between them. So
+`RtcTestHooks::set_raw_egress_drop_at` was added beside the existing
+hook (`src/adapter/net/rtc/driver.rs`, same
+`cfg(any(test, feature = "fixtures"))` gating, unreachable in a
+production build): it drops the **Nth** — deterministic, never
+probabilistic — outbound datagram carrying DTLS `application_data`,
+at the socket, before the peer's SCTP sees the chunk. A reliable
+channel retransmits it; a `maxRetransmits: 0` channel does not. The
+claim is now re-checkable by anyone, which the numbers above were
+not.
 
 R7's gate is untouched — mDNS-on remains its own verdict requiring a
 session, with no fallback, no retry and no widened deadline. What
@@ -910,3 +1031,174 @@ here because they were right and the draft was not:
    here; the API-extension policy and the migration-relevant
    contract (propagate unknown errors; use `empty()` to construct)
    are what this commit lands.
+
+### 12.3 The executed counterexamples — P1, P2, P3
+
+Every row below cites a receipt containing the bounded diff, the
+exact command, its exit code and the restored run's output. The
+receipts are in the tree; paths are given rather than summarised,
+because Kyra's standard for this round was explicit: *mutation
+descriptions are not complete attributable diffs, commands, exits and
+restored logs.*
+
+| row | defect | repair | receipt |
+|---|---|---|---|
+| **P1** | a head fragment received and ACKed — so the sender retired its descriptor and will never resend — then the group expired in silence: the tail arrived, was ACKed into an orphan, the caller got nothing, no `StreamFailed` | an acknowledged group is OWNED. Typed terminal disposition, not retention: eight acknowledged-but-incomplete groups would otherwise pin every reassembly slot for the session, so backpressure never clears. Every non-completion destruction of a sequenced group names the stream it owned; the TTL sweep runs before the open-group shortcut AND before the acknowledgement decision, so a tail can never be ACKed into a group that has lost its head | `spikes/s5r3_inverse/P1{a,b,c}-*.log` (three inverses, because it is three production changes) |
+| **P2** | close deleted the consumer cursor while the wire's receive state and the peer's TX sequence stayed live: reopen waited for sequence 0 while the peer sent 1, permanently stranded | close RETAINS the receive cursor for the stream's lifetime within the session; a reopen resumes at the peer's next sequence. The alternative — refusing reopen — was rejected because `open_stream` returns one bidirectional handle, so refusing it would kill the send half too. Records for a closed stream still advance the cursor (the credit and ack loop stays live) and are counted `stream_closed` | `spikes/s5r3_inverse/P2-close-retains-receive-cursor.log` |
+| **P3** | a 30-byte unconditional control debit floored credit at zero with 100 application bytes outstanding, and the next 30-byte grant refunded application credit that was still owed | the shortfall is DEBT, not forgiveness. `StreamState` carries an `overdraft`; the debit still floors at zero, because feedback must never sit behind the window it refills; an authoritative grant retires the debt with its newly-consumed delta BEFORE any of it reopens application credit. The identity becomes `remaining + (sent − max_consumed) == window + overdraft` | in the P3 row's lane report; mutation `shortfall = 0`, exit 101, `left: 30 right: 0`, restored exit 0 |
+
+### 12.4 The source-established rows — X1 to X11
+
+| row | what was wrong | what ships |
+|---|---|---|
+| **X1** | RESET left the old receive lifetime's partial groups behind | a reset retires that stream's fragments |
+| **X2** | `send_subprotocol` bypassed the `send_failed` terminal guard, so every non-handle producer could still send on a stream that had given up | the fence moves to the shared admission path, before packets are built. Stream-control subprotocols stay exempt: the RESET that reports the failure, and the feedback the credit loop runs on, must not be refused by the condition they report |
+| **X3** | `PieceMeta` had no plane or mode provenance; completion took them from whichever packet finished the group | bound group-wide, exactly as F6 bound stream, origin and channel |
+| **X4** | the 1 024-entry retransmit stamp cap could evict admitted ownership across streams | admission reserves the stamp, so a new stream is refused rather than an owned one silently evicted |
+| **X5** | cancelling the bootstrap released the lock without closing the RTC resources it had built; the offering transport held a strong cycle that kept the connection alive regardless | the cycle is broken with weak references, the close is intrinsic to ownership (`PeerLink` closes on drop rather than relying on a caller to remember), and a drop guard runs `close_all` synchronously before the lock moves. The accepted dialog is recorded before `accept_answer`'s await, so an attempt abandoned mid-`setRemoteDescription` is still handed back |
+| **X6** | a follower's unchanged announcement was performed raw and overwrote the union, silently dropping every other follower's capabilities | follower declarations route through the authoritative union publisher only, settled against the same snapshot the union was computed from; a retired server settles every parked reply typed rather than dropping promises |
+| **X7** | a proxied synchronous send held `Shared.server` while the pump could emit another stream's terminal event that reborrowed it | the broadcast is queued and drained after the synchronous frame returns, followers before local listeners. Nothing is suppressed — suppressing the terminal event would have been the easy fix and the wrong one, since that event is how a consumer learns its stream ended |
+| **X8** | the pre-send control debit had no refund for work the transport never admitted | lifetime-scoped refund across the helper and sixteen producers. Transport-owned LOSS is never refunded: a packet that reached the wire and vanished is spent, and refunding it would reopen a window the peer never credited |
+| **X9** | native group retirement was not atomic with ingress — two maps, with an interval between check and insert | one aggregate per session, one entry guard for the whole decision; `retire_session` publishes the marker first and releases the groups second under that same guard. Both of Kyra's schedules are structurally unreachable rather than defensively handled: there is no interval left to interleave with. Tombstones bounded, expired markers evicted before live ones |
+| **X10** | the replacement installer, the dead-peer sweep and the routed responder rotation each ended a lifetime without retiring its reassembly state | retirement is wired to every lifetime end. The rotation arm mattered most: no close notification and no endpoint removal follow it, so nothing else would ever have cleaned up behind it |
+| **X11** | native fragments could not bind stream, channel, origin, sequence or reliability, and native ACK-before-capacity/expiry had no complete-or-terminal disposition | the leaf's F6 and P1 repairs mirrored natively, so one model governs both sides |
+
+Leadership receipts: `spikes/s5r3-leadership-inverse.md` (five rows).
+Native receipts: `spikes/S5_R3_NATIVE_RECEIPTS/`. Leaf receipts:
+`spikes/s5r3_inverse/`.
+
+### 12.5 Evidence items
+
+- **Rosters and floors** — §12.0. Every roster is now checked against
+  its source before its suite runs; floors raised to the real counts.
+- **Firefox log** uploaded as an artifact alongside Chromium's and
+  WebKit's. Firefox is a gate; its evidence should not require
+  scrolling a job log.
+- **The native control ACK oracle** was "empty pending ∧
+  `max_consumed_seen == tx_bytes_sent`", which cannot tell an
+  acknowledgement from a give-up — both drain the window. It now
+  observes the real ACK frontier and the terminal/reset disposition.
+  The flaky zero-retransmit assertion stays retired.
+- **Retirement evidence** no longer runs against a custom backend
+  (which proved the harness retires, not the leaf): the witness drives
+  the production `RtcLeafTransport` with a real `RTCPeerConnection`
+  and the production event sink, asserts the engine's own observed
+  `connectionState` after retirement, and compares generations by
+  EQUALITY rather than substring.
+- **ABI** — the Node probes hand-drove inner stream objects while the
+  output claimed "no test doubles". Node has no `RTCPeerConnection`,
+  so a wasm-owned `LeafStream` cannot exist in that process; the file
+  now states exactly what is real and names the browser witnesses
+  that carry the real exercises. Five of those are new, against the
+  built package over real WebRTC: direct stream to callback AND async
+  iterator with forwarded options agreeing, sustained native traffic
+  at 8× the credit window with the grant round trip counted and the
+  conservation identity asserted, and a leader-proxied stream both
+  ways — gated on the proxied surface returning a PROMISE, so that leg
+  cannot silently retest the direct one.
+- **R14/D1** — the report claimed the adapter carries envelopes. It
+  does not, and §D1 is corrected in place rather than left to age.
+  The production refusal is pinned by
+  `the_anchor_control_plane_refuses_to_carry_a_signalling_envelope`,
+  and `browser-ts/README.md`'s example now shows the refusal instead
+  of implying success.
+- **Uncharged event-batch producers** predate Stage 5 (Kyra verified
+  this independently). The byte-conservation claim is scoped
+  explicitly to the admitted and control-debited producers; it is not
+  attributed to N1, and it is not quietly widened either.
+- **§11.8 causality** — re-captured rather than asserted. The
+  anchorless fixture receipt reproduces on demand
+  (`spikes/S5_R3_EVIDENCE/anchorless-fixture-causality.log`: inverse
+  diff, command, exit 1, `left: (1, 3) right: (0, 0)`, restore, exit
+  0). The mDNS A/B needed a drop BELOW SCTP, which no existing hook
+  could do — the pre-SCTP injector now exists, so that claim is
+  re-checkable instead of historical. Sentences that remain inference
+  are marked as such, one by one, rather than the section carrying a
+  blanket disclaimer.
+
+### 12.6 Three defects the round's own new witnesses found
+
+The ABI evidence work was supposed to be evidence. It found two live
+defects, and repairing the first surfaced a third. That is the
+argument for making evidence real rather than shaped to pass.
+
+**P4 — a reliable stream silently running on fire-and-forget
+machinery.** 40 nRPC requests on one reliable stream through the
+built package, every 5th datagram elided above SCTP and every 3rd
+reordered: the handler saw 32 of 40, the 8 missing bodies were
+exactly the 8 elided ones, and `stream_failed` was 0. No recovery AND
+no terminal disposition — P1's family, on the mode whose contract is
+that there is no loss.
+
+One root cause, three faces. `open_stream_full` was first-open-wins
+for the RELIABILITY MODE, and a channel's publish stream id is
+derived from the channel, so the harness sink's fire-and-forget leg
+and its reliable leg shared one id. The log says it verbatim:
+`ignoring conflicting config; first open wins … existing_reliable=
+false new_reliable=true`. `FireAndForget::on_send` retains nothing,
+so there was no descriptor to rebuild from; `build_nack` is `None`,
+so the receiver never NACKed; and `stream_failed: 0` was an
+unreachable give-up path rather than a missing one — with no
+descriptor there is no RTO to exhaust. An intermediate build with
+descriptors registered and the receiver still stalled reported
+`stream_failed: 2`, which is how we know the path fires when it can.
+
+RELIABLE is now authoritative and monotonic, on the wire and in the
+leaf's `RxStream`, and applies to existing traffic rather than only
+at first touch. The boundary hole a fire-and-forget prefix leaves is
+NACKed first and conceded only after eight later sequences arrive
+without it: conceding at once discards a recoverable packet, never
+conceding stalls the stream on a hole no retransmit can fill.
+
+**A third defect on the way through.** The native core had no
+in-order delivery for reliable streams at all — `process_local_packet`
+pushed arrivals in wire order, its own comment saying so while
+`TRANSPORT.md` promised the receive side reorders into sequence. The
+receive path now holds out-of-order arrivals per reliable stream in a
+window-bounded buffer, drops duplicates and releases in sequence
+order, with room reserved before the sequence is accepted so nothing
+is acknowledged that cannot be delivered. `RELIABLE_STREAM_
+HARDENING_PLAN.md`'s H-8 bullet deferred exactly this buffer
+"because no consumer needs it"; the browser leaf is that consumer,
+and the bullet now says so rather than quietly contradicting the
+transport.
+
+**In-order handler entry.** With the transport delivering strictly in
+sequence (release order measured as ascending 40..79, each
+retransmitted sequence becoming the head), one flag stayed false:
+the unary nRPC fold spawned a task per call, handing ENTRY order to
+the scheduler. This is a guarantee Net makes — `TRANSPORT.md`'s
+ordering contract is FIFO within the stream with "no ordering across
+streams" as the single named exception, one service's requests from
+one caller ride one stream, and the serve bridge is a single task
+draining one receiver, so delivery order survived intact right up to
+the fold. The fold now chains handler entry per source, polling each
+handler future exactly once to its first await before passing the
+baton. Signalling *before* invoking the handler — the obvious shape —
+races: the successor can enter first by a few instructions on a
+multi-worker runtime. Only the synchronous prefix is serialized; 128
+parked handlers were all inside their bodies simultaneously in the
+unit witness, and a handler that parks passes its baton at its first
+await, so it cannot wedge its successors.
+
+**Over-cap stream events.** A 32 KiB native → leaf send returned `Ok`
+and delivered nothing; 7 800 bytes arrived byte-exact. Refused typed
+at the sender rather than fragmented, because `send_on_stream` is
+transport-agnostic and only two receivers in the tree reassemble —
+fragmenting generically would hand a native peer's application N
+partial events as if each were a message, replacing a silent drop on
+the rare path with silent corruption on the common one. `MAX_EVENT_
+SIZE` is defined once, re-exported for pre-checking, and reaches
+every consumer as its own error rather than a generic transport
+failure. The harness leg that merely RECORDED this outcome is now a
+gate that `Ok`-plus-silence, a truncation, a late delivery and an
+untyped error each fail.
+
+**One honest note on the matrix runs.** Two runs during this round
+each failed a different witness — once a Stage 5 stream row, once a
+Stage 4b handshake row with no stream involvement — while other work
+was running on the same host. Neither reproduced. Serialized, with
+nothing else running, the matrix is 26/26 exit 0 twice consecutively.
+Recorded rather than omitted: an intermittent failure under host
+contention is worth knowing about even when it is not a defect in the
+tree.

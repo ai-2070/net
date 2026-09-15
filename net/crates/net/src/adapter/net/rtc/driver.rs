@@ -220,11 +220,12 @@ impl RtcTestHooks {
     /// that carries DTLS application data, counting from this call.
     /// `0` disables and resets the counter.
     ///
-    /// See [`RtcTestHooks::raw_egress_drop_at`] for why this is a
-    /// different instrument from
+    /// A different instrument from
     /// [`Self::set_ingress_drop_one_in`]: this one loses the
     /// datagram below SCTP, so a reliable DataChannel recovers it
-    /// and an unreliable one does not.
+    /// and an unreliable one does not. That difference is the whole
+    /// point — a drop above SCTP is terminal either way and cannot
+    /// distinguish the two channel configurations.
     pub fn set_raw_egress_drop_at(&self, nth: u64) {
         self.raw_egress_seen.store(0, Ordering::Release);
         self.raw_egress_drop_at.store(nth, Ordering::Release);

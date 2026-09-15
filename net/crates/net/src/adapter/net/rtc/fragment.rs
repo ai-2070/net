@@ -549,7 +549,11 @@ impl RtcReassembly {
         Self::default()
     }
 
-    /// Install (or clear) the ingress pause — see [`IngressPause`].
+    /// Install (or clear) the ingress pause: a fixtures-only seam
+    /// that fires INSIDE the session guard, between the admission
+    /// decision and the write, so a retirement racing an in-flight
+    /// accept can be scheduled deterministically instead of hoped
+    /// for.
     #[cfg(any(test, feature = "fixtures"))]
     pub fn set_ingress_pause(&self, pause: Option<IngressPause>) {
         *self.pause.lock() = pause;
