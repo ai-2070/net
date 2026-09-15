@@ -40,7 +40,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use bytes::Bytes;
 use js_sys::Uint8Array;
@@ -98,6 +98,35 @@ struct PeerLink {
     /// The answerer's `ondatachannel` handler. `None` on the
     /// offering side, which creates the channel itself.
     _data_channel: Option<Closure<dyn FnMut(RtcDataChannelEvent)>>,
+}
+
+impl Drop for PeerLink {
+    /// A link that goes away closes what it owns.
+    ///
+    /// The link **is** the ownership of an `RTCPeerConnection` and
+    /// its channel, so releasing it has to be the close — not a
+    /// step some caller remembers to take first. Every path that
+    /// drops a link is a path on which the browser must stop
+    /// gathering, stop keeping an ICE agent and stop holding an
+    /// SCTP association for a peer nobody is talking to any more:
+    /// [`RtcLeafTransport::close`] removing one, the whole map
+    /// going away with the transport, and — the case this exists
+    /// for — a **cancelled** bootstrap, whose future is simply
+    /// dropped. `wasm::LeafNode::connect` creates the link before
+    /// its first suspension, so a promotion cancelled while it
+    /// waited on an answer, a channel or enrollment left a live
+    /// `RTCPeerConnection` behind with no owner left to close it,
+    /// and did so *before* releasing the origin's lock to a
+    /// successor.
+    ///
+    /// `close()` on an already-closed connection is a no-op in
+    /// every engine, so the explicit path and this one compose.
+    fn drop(&mut self) {
+        if let Some(channel) = &self.channel {
+            channel.close();
+        }
+        self.connection.close();
+    }
 }
 
 /// The leaf's RTC transport.
@@ -158,7 +187,7 @@ impl RtcLeafTransport {
 
         let message = message_handler(Rc::clone(&self.inbound), peer, &channel);
         let ice = self.install_ice_handler(peer, &connection);
-        let low = low_water_handler(Rc::clone(&self.peers), peer, &channel);
+        let low = low_water_handler(Rc::downgrade(&self.peers), peer, &channel);
 
         self.peers.borrow_mut().insert(
             peer,
@@ -216,18 +245,27 @@ impl RtcLeafTransport {
         let connection = new_connection(ice_servers)?;
         let ice = self.install_ice_handler(peer, &connection);
 
-        let peers = Rc::clone(&self.peers);
+        // **`Weak`.** The handler lives in the `PeerLink` this map
+        // holds, so a strong clone here would be a cycle — map →
+        // link → closure → map — and a cycle is a map whose
+        // refcount never reaches zero, i.e. a transport that can be
+        // dropped without closing a single connection.
+        let peers = Rc::downgrade(&self.peers);
         let inbound = Rc::clone(&self.inbound);
         let on_data_channel = Closure::wrap(Box::new(move |event: RtcDataChannelEvent| {
             let channel = event.channel();
             channel.set_binary_type(RtcDataChannelType::Arraybuffer);
             channel.set_buffered_amount_low_threshold(BUFFERED_AMOUNT_LOW);
+            let Some(peers) = peers.upgrade() else {
+                return;
+            };
             let message = message_handler(Rc::clone(&inbound), peer, &channel);
             // The low-water handler is what retries a retained
             // packet; an accepted channel without it would retain
             // for ever after the first refusal.
-            let low = low_water_handler(Rc::clone(&peers), peer, &channel);
-            if let Some(link) = peers.borrow_mut().get_mut(&peer) {
+            let low = low_water_handler(Rc::downgrade(&peers), peer, &channel);
+            let mut links = peers.borrow_mut();
+            if let Some(link) = links.get_mut(&peer) {
                 // The first channel the peer opens is the Net one:
                 // a leaf offers exactly one and accepts exactly one
                 // (§3), so matching on the label as well would turn
@@ -385,11 +423,26 @@ impl RtcLeafTransport {
             return 0;
         };
         link.discarded_at_close += link.retained.len() as u64;
-        if let Some(channel) = &link.channel {
-            channel.close();
-        }
-        link.connection.close();
+        // Taking the link out of the map is the close: `PeerLink`'s
+        // `Drop` shuts the channel and the connection.
         link.discarded_at_close
+    }
+
+    /// The browser's own `RTCPeerConnection` for `peer`, when this
+    /// transport has one.
+    ///
+    /// The single seam through which a caller can observe what the
+    /// engine believes about a connection this transport owns — its
+    /// `connectionState`, its effective configuration — rather than
+    /// about the arguments we passed in. That distinction is the
+    /// whole of "the cancelled attempt's connection was really
+    /// closed": a transport-side count of zero peers is equally
+    /// consistent with a map that was merely emptied.
+    pub fn peer_connection(&self, peer: NodeId) -> Option<RtcPeerConnection> {
+        self.peers
+            .borrow()
+            .get(&peer)
+            .map(|link| link.connection.clone())
     }
 
     /// Close everything.
@@ -535,11 +588,18 @@ fn message_handler(
 /// The `bufferedamountlow` handler: the retain-and-retry half of
 /// the §2 send rules.
 fn low_water_handler(
-    peers: Rc<RefCell<HashMap<NodeId, PeerLink>>>,
+    peers: Weak<RefCell<HashMap<NodeId, PeerLink>>>,
     peer: NodeId,
     channel: &RtcDataChannel,
 ) -> Closure<dyn FnMut(JsValue)> {
     let closure = Closure::wrap(Box::new(move |_event: JsValue| {
+        // `Weak`, and that is load-bearing rather than defensive:
+        // this closure is retained by the very `PeerLink` the map
+        // holds, so a strong reference would make the map immortal
+        // and every connection it owns unclosable by drop.
+        let Some(peers) = peers.upgrade() else {
+            return;
+        };
         let mut peers = peers.borrow_mut();
         if let Some(link) = peers.get_mut(&peer) {
             if let Some(channel) = link.channel.clone() {

@@ -43,9 +43,13 @@ use serde_json::Value;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
+use net_leaf::anchor_control_plane::AnchorControlPlane;
 use net_leaf::announce;
+use net_leaf::bootstrap::{AnchorInfo, Credential};
 use net_leaf::clock;
+use net_leaf::control_plane::{ControlPlane, SignalKind};
 use net_leaf::counters::{DropReason, LeafCounters};
+use net_leaf::enroll::Invite;
 use net_leaf::error::RpcError;
 use net_leaf::frame::{self, Reassembler};
 use net_leaf::identity::{EntityKeypair, LeafIdentity};
@@ -55,6 +59,7 @@ use net_leaf::rpc_wire::{
 };
 use net_leaf::rtc::{new_connection, IceServer};
 use net_leaf::session::{routing_id, rtc_addr};
+use net_leaf::signal;
 use net_leaf::stream::{Reliability, ReorderOverflow, RxStream, StreamRecord};
 use net_leaf::test_vectors;
 use net_wire::aead::AeadKey;
@@ -475,6 +480,7 @@ fn the_consumer_side_reorder_runs_inside_wasm() {
             span: 1,
             stream_id: 7,
             subprotocol_id: 0,
+            reliable: true,
             origin_hash: 0xA0 + seq,
             channel_hash: tag as u16,
             payloads: vec![Bytes::from(vec![tag])],
@@ -633,6 +639,95 @@ fn declared_ice_servers_are_the_connection_s_effective_configuration() {
         "the TURN credential did not survive the boundary — the server \
          is configured but unusable"
     );
+}
+
+/// R14: the **production** anchor control plane refuses to carry a
+/// signalling envelope, typed, and names the peer it could not
+/// reach.
+///
+/// The first cut of this adapter serialised the envelope into a
+/// `type: "signal"` trickle frame and reported the local send as a
+/// delivery. The Stage 4b listener reads exactly one frame type —
+/// `candidate` — and forwards nothing to a third party, so every one
+/// of those envelopes was discarded while the caller was told it had
+/// arrived. A carrier that reports a delivery it cannot perform is
+/// worse than one that says it cannot.
+///
+/// So the refusal is the shipped v1 contract, and this is its
+/// witness. Two things make it one:
+///
+/// 1. **The subject is the real adapter**, not the anchorless
+///    `MockControlPlane` (which genuinely does carry envelopes, and
+///    whose successful delivery is a different claim about a
+///    different carrier). `AnchorControlPlane::bind` performs the
+///    same pinned-key comparison `attach` does, below the `GET
+///    /rtc/anchor` fetch this test has no listener for.
+/// 2. **The envelope is legitimate.** It is signed by a real
+///    identity through the production `sign_signal`, verifies at its
+///    addressee, and round-trips through the wire codec. The refusal
+///    is therefore about the carrier, not about the envelope — which
+///    is the only version of this assertion worth anything.
+#[wasm_bindgen_test]
+async fn the_anchor_control_plane_refuses_to_carry_a_signalling_envelope() {
+    let anchor = anchor_static();
+    let credential = Credential {
+        encoded: "net-bootstrap:witness".to_string(),
+        invite: Invite {
+            root: [7u8; 32],
+            nonce: [9u8; 16],
+            expires_at: clock::now_unix_secs() + 600,
+            rendezvous: "https://anchor.test".to_string(),
+        },
+        anchor_noise_pubkey: *anchor.public_key(),
+        psk: [3u8; 32],
+        bootstrap_url: "https://anchor.test".to_string(),
+        psk_expires_at: clock::now_unix_secs() + 600,
+    };
+    let info = AnchorInfo {
+        node_id: 0x00A1_1C00_0000_0001,
+        // The live key the credential pins: `bind` refuses any other,
+        // and that refusal is what must NOT be what this test sees.
+        noise_pubkey: *anchor.public_key(),
+        rtc_addr: None,
+    };
+
+    let self_node = 0x0000_0000_0000_0011;
+    let control = AnchorControlPlane::bind(
+        credential.bootstrap_url.clone(),
+        credential,
+        self_node,
+        &info,
+    )
+    .expect("a credential that pins the anchor's live key binds");
+    assert_eq!(control.anchor_node(), info.node_id);
+
+    // A legitimate envelope, signed by a real identity.
+    let sender = net_leaf::node::LeafNode::new(LeafIdentity::generate().expect("identity"), 5);
+    let sender_entity = *sender.identity().entity().entity_id();
+    let peer = 0x0000_0000_0000_00BE;
+    let envelope = sender.sign_signal(peer, 7, SignalKind::Offer, b"v=0".to_vec());
+    assert_eq!(envelope.to, peer);
+    signal::verify(&envelope, &sender_entity, peer, clock::now_unix_secs())
+        .expect("the envelope must be valid at its addressee");
+    assert_eq!(
+        signal::decode(&signal::encode(&envelope).expect("encode")).expect("decode"),
+        envelope,
+        "and it must be a wire-legal envelope, not a value only this test accepts"
+    );
+
+    let refusal = control
+        .signal(envelope)
+        .await
+        .expect_err("the v1 anchor carrier must refuse, never report a delivery");
+    match &refusal {
+        net_leaf::error::LeafError::ControlPlane(message) => {
+            assert!(
+                message.contains(&format!("{peer:#x}")),
+                "the refusal must name the peer it could not reach: {message}"
+            );
+        }
+        other => panic!("the refusal must be typed as a control-plane one: {other:?}"),
+    }
 }
 
 // ──────────────────────────── helpers ───────────────────────────────

@@ -1045,6 +1045,9 @@ pub struct ProxyServer<B: LeaderBackend> {
     followers: FollowerRegistry,
     stamped: u64,
     superseded: Option<u64>,
+    /// Follower announcements parked on the next authoritative union
+    /// publication. See [`Self::take_pending_announcements`].
+    pending_announcements: Vec<Replier>,
     closed: bool,
 }
 
@@ -1073,6 +1076,7 @@ impl<B: LeaderBackend> ProxyServer<B> {
             followers: FollowerRegistry::new(),
             stamped: 0,
             superseded: None,
+            pending_announcements: Vec::new(),
             closed: false,
         }
     }
@@ -1182,6 +1186,17 @@ impl<B: LeaderBackend> ProxyServer<B> {
         self.followers.capability_union()
     }
 
+    /// Take the follower announcements waiting on the origin's next
+    /// authoritative union publication, so their callers can be
+    /// settled with its actual outcome.
+    ///
+    /// The counterpart of the `Announce` arm in [`Self::on_message`]:
+    /// a follower's declaration is recorded here and published there,
+    /// and this is the handoff between the two.
+    pub fn take_pending_announcements(&mut self) -> Vec<Replier> {
+        core::mem::take(&mut self.pending_announcements)
+    }
+
     /// The backend, for the leader's own local operations.
     pub fn backend_mut(&mut self) -> &mut B {
         &mut self.backend
@@ -1282,14 +1297,34 @@ impl<B: LeaderBackend> ProxyServer<B> {
                 // are that follower's standing intent, and a successor
                 // that only learned the operations would restore the
                 // channels and quietly narrow the announcement.
-                match &request {
-                    LeaderRequest::Subscribe { channel } => {
-                        self.followers.declare(follower, channel);
-                    }
-                    LeaderRequest::Announce { capabilities } => {
-                        self.followers.declare_capabilities(follower, capabilities);
-                    }
-                    _ => {}
+                if let LeaderRequest::Subscribe { channel } = &request {
+                    self.followers.declare(follower, channel);
+                }
+                // # A follower does not publish the document
+                //
+                // An `Announce` performed verbatim publishes *that
+                // tab's* list, and the announcement is the origin's
+                // union — this leader's own intent beside every
+                // attached follower's. Performing the raw request
+                // withdrew the leader's live capabilities, and the
+                // union publisher could not repair it: its cache
+                // still recorded the union as the published
+                // document, so a follower re-declaring the intent it
+                // already held narrowed the network indefinitely.
+                //
+                // The declaration is recorded, and the caller is
+                // parked on the publication that actually happens.
+                // Its completion therefore still means what it says:
+                // the outcome the follower gets is the union
+                // publication's, not a success for a document that
+                // was never the one published. A retirement that
+                // drops these repliers settles each of them typed,
+                // like any other admitted operation.
+                if let LeaderRequest::Announce { capabilities } = &request {
+                    self.followers.declare_capabilities(follower, capabilities);
+                    let reply = self.replier(correlation);
+                    self.pending_announcements.push(reply);
+                    return Ok(());
                 }
                 let reply = self.replier(correlation);
                 self.backend.perform(request, reply);

@@ -29,8 +29,8 @@
 //! v1 implementation is
 //! `AnchorControlPlane`:
 //! the anchor info and its pinned-key refusal, the offer, the
-//! candidate trickle in both directions, the signalling envelopes,
-//! and the end of the attempt. This module **drives** that trait and
+//! candidate trickle in both directions, and the end of the
+//! attempt. This module **drives** that trait and
 //! owns no `fetch`, no `WebSocket` and no SDP transport of its own —
 //! `tests/control_plane_boundary.rs` asserts that from the outside,
 //! because one inlined HTTP call here is how a boundary stops being
@@ -44,7 +44,7 @@
 
 #![cfg(target_arch = "wasm32")]
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::{Rc, Weak};
 
@@ -373,16 +373,29 @@ impl LeafNode {
             let guard = inner.borrow();
             (guard.transport.clone(), guard.control.clone())
         };
+        // The cancellation owner, armed **before the first
+        // resource-bearing suspension**. Every branch below that
+        // *returns* cleans up after itself; this covers the branch
+        // that returns nothing because the future stopped existing.
+        // See [`ConnectGuard`].
+        let attempt = ConnectGuard::new(&inner, &transport, &control);
         let offer = transport
             .create_offer(anchor, &ice_servers)
             .await
             .map_err(js)?;
         let accepted = control.offer(offer).await.map_err(js)?;
+        // Recorded **before** the next await, not after
+        // `accept_answer`: from the anchor's answer onwards there is
+        // an accepted attempt registered for this node id, and a
+        // dialog id living only in a local is a dialog nobody can
+        // hand back if the page walks away during
+        // `setRemoteDescription`.
+        inner.borrow_mut().dialog = accepted.dialog;
+        attempt.accepted(accepted.dialog);
         transport
             .accept_answer(anchor, &accepted.answer)
             .await
             .map_err(js)?;
-        inner.borrow_mut().dialog = accepted.dialog;
 
         // From here on the anchor has an ACCEPTED ATTEMPT registered
         // for this node id, so every failure below must hand it back:
@@ -418,6 +431,7 @@ impl LeafNode {
         .await;
         if let Err(failure) = brought_up {
             abandon_attempt(&inner).await;
+            attempt.disarm();
             return Err(failure);
         }
 
@@ -437,8 +451,10 @@ impl LeafNode {
             // Same rule one layer up: the session and the attempt
             // both go back, so the anchor is not left holding either.
             node.close();
+            attempt.disarm();
             return Err(failure);
         }
+        attempt.disarm();
         Ok(node)
     }
 
@@ -628,9 +644,19 @@ impl LeafNode {
     ///
     /// Through the boundary, not the data path. An envelope
     /// authenticates itself, so the carrier is untrusted and can be
-    /// anything: the anchor's bootstrap dialog here, a room object
-    /// in the serverless follow-on, the in-memory mock in the
-    /// anchorless test.
+    /// anything.
+    ///
+    /// **The v1 anchor carrier refuses** (R14). `AnchorControlPlane`
+    /// does not carry envelopes: the Stage 4b listener reads one
+    /// trickle frame type, `candidate`, and forwards nothing to a
+    /// third party, so `signal` on a node connected to a real anchor
+    /// returns `LeafError::ControlPlane` naming the peer it could not
+    /// reach. That is deliberate — the first cut reported the local
+    /// send as a delivery the anchor discarded. The carrier that does
+    /// deliver today is the anchorless `MockControlPlane`; a
+    /// forwarding anchor route is Stage 6's, and the trait's shape
+    /// already admits it, which is why this takes a peer id and an
+    /// envelope rather than a session.
     pub async fn signal(
         &self,
         peer_hex: String,
@@ -1059,6 +1085,97 @@ async fn abandon_attempt(inner: &Rc<RefCell<Inner>>) {
         let _ = control.end_attempt(dialog).await;
     }
     transport.close_all();
+}
+
+/// The cleanup owner of a `connect` that never returns a node.
+///
+/// # Why a guard rather than one more error branch
+///
+/// Every failure `connect` *returns* hands its resources back on the
+/// way out. A future can also simply stop existing, and nothing in
+/// the function body observes that: no `?`, no `if let Err`, no
+/// `match`. §8's promotion is exactly that case — the origin's Web
+/// Lock is held across this call, and `close()` on a tab whose
+/// promotion is still bootstrapping cancels it by **dropping** this
+/// future. By then the attempt owns a real `RTCPeerConnection` and
+/// its DataChannel ([`crate::rtc::RtcLeafTransport::create_offer`]
+/// installs the link before its first await) and, past the anchor's
+/// answer, a dialog on the anchor.
+///
+/// So the cleanup belongs to a value that dies with the future.
+/// Closing the RTC resources is **synchronous**, deliberately: the
+/// frame that dropped the future goes on to release the bootstrap's
+/// lock, and a successor granted that lock must not find its
+/// predecessor's ICE agent still gathering and its channel still
+/// open. Handing the accepted attempt back is a network round trip
+/// and cannot be awaited from `Drop`, so it is spawned — the anchor
+/// learns a moment later, which is the same ordering
+/// [`LeafNode::close`] already uses.
+///
+/// Disarmed on the two paths that have already cleaned up
+/// ([`abandon_attempt`] and [`LeafNode::close`]) and on success,
+/// where the node — and its transport — belong to the caller.
+struct ConnectGuard {
+    inner: Rc<RefCell<Inner>>,
+    transport: RtcLeafTransport,
+    control: AnchorControlPlane,
+    /// `0` until the anchor has accepted the attempt; there is
+    /// nothing to hand back before that.
+    dialog: Cell<u64>,
+    armed: Cell<bool>,
+}
+
+impl ConnectGuard {
+    fn new(
+        inner: &Rc<RefCell<Inner>>,
+        transport: &RtcLeafTransport,
+        control: &AnchorControlPlane,
+    ) -> Self {
+        Self {
+            inner: Rc::clone(inner),
+            transport: transport.clone(),
+            control: control.clone(),
+            dialog: Cell::new(0),
+            armed: Cell::new(true),
+        }
+    }
+
+    /// The anchor accepted the attempt: a cancellation from here on
+    /// owes it an `end_attempt`.
+    fn accepted(&self, dialog: DialogId) {
+        self.dialog.set(dialog);
+    }
+
+    /// The node reached its caller, or the failing branch has
+    /// already handed everything back.
+    fn disarm(&self) {
+        self.armed.set(false);
+    }
+}
+
+impl Drop for ConnectGuard {
+    fn drop(&mut self) {
+        if !self.armed.get() {
+            return;
+        }
+        // The ticker and the inbound sink both hold `Weak`s, so they
+        // stop on their own once this frame's strong references go.
+        // `closed` is for anything that got a handle in between: a
+        // cancelled attempt's node refuses rather than pumps.
+        if let Ok(mut guard) = self.inner.try_borrow_mut() {
+            guard.closed = true;
+        }
+        // Before this function returns, and therefore before the
+        // lock: this is the whole ordering claim.
+        self.transport.close_all();
+        let dialog = self.dialog.get();
+        if dialog != 0 {
+            let control = self.control.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let _ = control.end_attempt(dialog).await;
+            });
+        }
+    }
 }
 
 /// The periodic tick: the control plane is serviced, deadlines and

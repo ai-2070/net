@@ -48,6 +48,7 @@
 #![cfg(target_arch = "wasm32")]
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use bytes::Bytes;
@@ -57,6 +58,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{spawn_local, JsFuture};
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
+use web_sys::{RtcPeerConnection, RtcPeerConnectionState};
 
 use net_leaf::bootstrap::gloo_timer_sleep;
 use net_leaf::error::{LeafError, RpcError};
@@ -64,9 +66,13 @@ use net_leaf::identity::{IdentitySecrets, IDENTITY_BLOB_MAGIC};
 use net_leaf::leader::{
     GenerationLease, LeaderBackend, LeaderRequest, ProxyFailure, ProxyValue, Replier,
 };
-use net_leaf::leader_session::{spawn_fenced, BackendFactory, Lifecycle, OpRegistry, Role};
+use net_leaf::leader_session::{
+    spawn_fenced, BackendFactory, EventSink, Lifecycle, OpRegistry, Role,
+};
+use net_leaf::rtc::RtcLeafTransport;
 use net_leaf::storage::IdentityVault;
-use net_leaf::LeafIdentity;
+use net_leaf::stream::Reliability;
+use net_leaf::{LeafIdentity, StreamHandle};
 
 // The point is a real browser engine: IndexedDB, `crypto.subtle`,
 // `navigator.locks` and `BroadcastChannel` do not exist in Node.
@@ -319,6 +325,112 @@ fn observed_factory(
     })
 }
 
+/// What a bootstrap that really built RTC state left behind.
+///
+/// A **constructor observer**, not a replacement transport: the
+/// factory below drives the production
+/// [`RtcLeafTransport::create_offer`], which is the call
+/// `wasm::LeafNode::connect` makes before its first suspension, and
+/// keeps the `RTCPeerConnection` the browser actually created. Every
+/// state read off it afterwards is the engine's own.
+#[derive(Default)]
+struct RtcAttempt {
+    /// The real connection the parked bootstrap created.
+    connection: RefCell<Option<RtcPeerConnection>>,
+    /// Whether the browser produced a real offer with SDP for it.
+    offered: Cell<bool>,
+    /// That connection's state, sampled by the **successor's**
+    /// factory — i.e. at the moment the origin's lock was granted
+    /// onwards. This is the ordering oracle: a successor can only be
+    /// running because the cancelled bootstrap released the lock, so
+    /// a reading of `closed` here is a close that happened *before*
+    /// the release.
+    at_successor: Cell<Option<RtcPeerConnectionState>>,
+}
+
+/// The peer id the parked bootstrap offers to. Any id: the offer is
+/// local, and nothing answers it.
+const RTC_PEER: u64 = 0x00AB_CDEF_1234_5678;
+
+/// A factory whose `nth` invocation creates a **real** production RTC
+/// attempt — an `RTCPeerConnection` with its Net DataChannel and a
+/// local offer — and then parks, exactly where a real `connect()`
+/// parks while it waits for an answer, a channel, Noise and
+/// enrollment.
+///
+/// The transport is a local of the factory future, as the real one is
+/// a local of `connect`'s. Cancelling the bootstrap drops that
+/// future, and what happens to the browser's connection then is the
+/// property under test.
+fn rtc_parking_factory(
+    node_id: u64,
+    log: Rc<RefCell<Log>>,
+    nth: usize,
+    barrier: oneshot::Receiver<()>,
+    attempt: Rc<RtcAttempt>,
+) -> BackendFactory {
+    let barrier = Rc::new(RefCell::new(Some(barrier)));
+    let invocations = Rc::new(Cell::new(0usize));
+    Rc::new(move |_opts, _sink, _lease| {
+        let log = log.clone();
+        let barrier = barrier.clone();
+        let attempt = attempt.clone();
+        let invocation = invocations.get();
+        invocations.set(invocation + 1);
+        Box::pin(async move {
+            if invocation == nth {
+                let transport = RtcLeafTransport::new(Rc::new(|_, _| {}));
+                let offer = transport
+                    .create_offer(RTC_PEER, &[])
+                    .await
+                    .map_err(|error| LeafError::Session(format!("create_offer: {error}")))?;
+                attempt.offered.set(!offer.0.is_empty());
+                *attempt.connection.borrow_mut() = transport.peer_connection(RTC_PEER);
+                let parked = barrier.borrow_mut().take();
+                if let Some(parked) = parked {
+                    let _ = parked.await;
+                }
+                // Reached only by a bootstrap that was NOT cancelled;
+                // `transport` is dropped here either way.
+                drop(transport);
+            }
+            let backend: Box<dyn LeaderBackend> = Box::new(TestBackend {
+                node_id,
+                log,
+                hold_calls: false,
+            });
+            Ok(backend)
+        })
+    })
+}
+
+/// A factory that samples the predecessor's connection state on the
+/// way in, then behaves like any other.
+fn sampling_factory(
+    node_id: u64,
+    log: Rc<RefCell<Log>>,
+    attempt: Rc<RtcAttempt>,
+) -> BackendFactory {
+    Rc::new(move |_opts, _sink, _lease| {
+        let log = log.clone();
+        attempt.at_successor.set(
+            attempt
+                .connection
+                .borrow()
+                .as_ref()
+                .map(RtcPeerConnection::connection_state),
+        );
+        Box::pin(async move {
+            let backend: Box<dyn LeaderBackend> = Box::new(TestBackend {
+                node_id,
+                log,
+                hold_calls: false,
+            });
+            Ok(backend)
+        })
+    })
+}
+
 // ──────────────── a backend over a REAL leaf node ────────────────
 
 /// The handles a test keeps on its real-node backend.
@@ -339,6 +451,27 @@ struct RealNode {
     barrier: Rc<RefCell<Option<oneshot::Receiver<()>>>>,
     /// Operations that dispatched after being parked.
     dispatched: Rc<Cell<usize>>,
+    /// The **production** event sink this backend was handed by the
+    /// lifecycle, so a synchronous arm can deliver a real node event
+    /// exactly where production's `StreamSend` delivers one.
+    sink: Rc<RefCell<Option<EventSink>>>,
+    /// Stream handles the backend opened, by wire id — production
+    /// `NodeBackend` keeps the same table.
+    streams: Rc<RefCell<HashMap<u64, StreamHandle>>>,
+    /// How many reliability sweeps a synchronous send's pump runs,
+    /// and how far each one moves the node's clock argument. Zero for
+    /// every test but the one whose subject is a retransmit budget
+    /// expiring inside another stream's send.
+    sweeps: Rc<Cell<u32>>,
+    /// A **production** [`RtcLeafTransport`] holding a real
+    /// `RTCPeerConnection`, installed by [`attach_real_rtc`].
+    ///
+    /// So that retirement's resource effect is observed where it
+    /// actually happens — in the browser — rather than only in this
+    /// file's bookkeeping. `wasm::LeafNode::retire` ends in
+    /// `transport.close_all()`, and this is that call's real
+    /// subject.
+    transport: Rc<RefCell<Option<RtcLeafTransport>>>,
 }
 
 /// A backend that owns a **real** sans-IO leaf node: a real session, a
@@ -448,7 +581,82 @@ impl LeaderBackend for RealNodeBackend {
             }
             LeaderRequest::Counters | LeaderRequest::Query { .. } => reply.text("[]".into()),
             LeaderRequest::IsEnrolled => reply.flag(true),
-            LeaderRequest::StreamOpen { stream_id, .. } => reply.stream(stream_id.unwrap_or(9)),
+            // A real stream on the real node, in the real stream
+            // table — the same shape production's `NodeBackend` keeps.
+            LeaderRequest::StreamOpen {
+                label,
+                reliability,
+                stream_id,
+                channel_hash,
+            } => {
+                let opened = handles.node.borrow_mut().open_stream(
+                    handles.peer,
+                    &label,
+                    reliability,
+                    stream_id,
+                    channel_hash,
+                );
+                match opened {
+                    Ok(handle) => {
+                        handles
+                            .streams
+                            .borrow_mut()
+                            .insert(handle.stream_id, handle);
+                        reply.stream(handle.stream_id);
+                    }
+                    Err(error) => reply.fail(ProxyFailure::Reported(error.to_string())),
+                }
+            }
+            // **Synchronous, and that is the whole point.**
+            // Production's `NodeBackend::StreamSend` is this arm: it
+            // calls a real `wasm::LeafStream::send`, which pumps the
+            // node, drives reliability and *dispatches every event
+            // that produced* before returning — all of it inside the
+            // `Shared.server` borrow its caller is holding. So this
+            // arm pumps and delivers to the production sink in the
+            // same frame, rather than spawning.
+            LeaderRequest::StreamSend { stream_id, payload } => {
+                let handle = handles.streams.borrow().get(&stream_id).copied();
+                let Some(handle) = handle else {
+                    reply.fail(ProxyFailure::Typed(LeafError::Session(format!(
+                        "no open stream {stream_id:#018x}"
+                    ))));
+                    return;
+                };
+                let sink = handles.sink.borrow().clone();
+                let (outcome, events) = {
+                    let mut node = handles.node.borrow_mut();
+                    let outcome = node.stream_send(handle, &payload);
+                    // The pump. `wasm::LeafStream::send` ends in
+                    // `Inner::pump`, which ticks the node — so a
+                    // retransmit budget really can expire inside one
+                    // synchronous send. `sweeps` is how many ticks
+                    // this pump runs; the elapsed time is real,
+                    // because `ReliableStream::get_timed_out` reads
+                    // the clock itself rather than taking the tick's
+                    // argument, which is why the test waits between
+                    // sweeps instead of arithmetic on `now`.
+                    for _ in 0..handles.sweeps.get() {
+                        node.tick(net_leaf::clock::now());
+                    }
+                    let produced = node.take_outbound();
+                    handles.sent.set(handles.sent.get() + produced.len());
+                    handles
+                        .wire
+                        .borrow_mut()
+                        .extend(produced.into_iter().map(|out| (out.peer, out.packet)));
+                    (outcome, node.drain_events())
+                };
+                if let Some(sink) = sink {
+                    for event in &events {
+                        sink(&event.to_json());
+                    }
+                }
+                match outcome {
+                    Ok(()) => reply.bytes(Bytes::new()),
+                    Err(error) => reply.fail(ProxyFailure::Reported(error.to_string())),
+                }
+            }
             _ => reply.bytes(Bytes::new()),
         }
     }
@@ -465,6 +673,15 @@ impl LeaderBackend for RealNodeBackend {
         // fenced operation produced, so they are not charged to the
         // counter the witness reads.
         node.take_outbound();
+        drop(node);
+        // And the resource half, which is the last thing
+        // `wasm::LeafNode::retire` does: the node's RTC links go with
+        // it. Real here, not recorded — the connection this closes is
+        // the browser's, and its state afterwards is the engine's own
+        // answer rather than this file's.
+        if let Some(transport) = self.handles.transport.borrow().as_ref() {
+            transport.close_all();
+        }
         self.handles.failed.set(failed);
         failed
     }
@@ -574,15 +791,23 @@ fn real_pair() -> (RealNode, net_leaf::LeafNode) {
             failed: Rc::new(Cell::new(0)),
             barrier: Rc::new(RefCell::new(None)),
             dispatched: Rc::new(Cell::new(0)),
+            sink: Rc::new(RefCell::new(None)),
+            streams: Rc::new(RefCell::new(HashMap::new())),
+            sweeps: Rc::new(Cell::new(0)),
+            transport: Rc::new(RefCell::new(None)),
         },
         peer,
     )
 }
 
 fn real_factory(handles: RealNode) -> BackendFactory {
-    Rc::new(move |_opts, _sink, lease: GenerationLease| {
+    Rc::new(move |_opts, sink: EventSink, lease: GenerationLease| {
         let handles = handles.clone();
         let node_id = handles.node.borrow().node_id();
+        // The lifecycle's own sink, kept so the synchronous
+        // `StreamSend` arm delivers through the production path
+        // rather than through a test channel.
+        *handles.sink.borrow_mut() = Some(sink);
         Box::pin(async move {
             let backend: Box<dyn LeaderBackend> = Box::new(RealNodeBackend {
                 handles,
@@ -593,6 +818,36 @@ fn real_factory(handles: RealNode) -> BackendFactory {
             Ok(backend)
         })
     })
+}
+
+/// Give `handles` a **production** RTC transport carrying one real
+/// `RTCPeerConnection`, and hand back that connection.
+///
+/// The same production call `wasm::LeafNode::connect` makes —
+/// `create_offer` creates the connection, creates the Net
+/// DataChannel and produces a local offer — so what a later
+/// retirement or cancellation closes is a connection the browser
+/// really built, and its state afterwards is the engine's answer.
+async fn attach_real_rtc(handles: &RealNode) -> RtcPeerConnection {
+    let transport = RtcLeafTransport::new(Rc::new(|_, _| {}));
+    let offer = transport
+        .create_offer(RTC_PEER, &[])
+        .await
+        .expect("the browser must create a real offer");
+    assert!(
+        !offer.0.is_empty(),
+        "an offer with no SDP is not a real attempt"
+    );
+    let connection = transport
+        .peer_connection(RTC_PEER)
+        .expect("the transport keeps the link it created");
+    assert_ne!(
+        connection.connection_state(),
+        RtcPeerConnectionState::Closed,
+        "the premise: the connection is live before anything retires it"
+    );
+    *handles.transport.borrow_mut() = Some(transport);
+    connection
 }
 
 /// Drive `request` on `lifecycle` in the background and hand back the
@@ -1300,6 +1555,22 @@ async fn standing_down_fences_then_retires_the_node_then_releases_the_lock() {
 ///    off the sender's own `take_outbound`: a sender-side counter
 ///    cannot distinguish "produced nothing" from "produced something
 ///    nobody charged".
+/// 5. **The resource is the browser's.** Retirement's last step is
+///    `transport.close_all()`, so this backend owns a **production**
+///    [`RtcLeafTransport`] carrying a real `RTCPeerConnection`, and
+///    the assertion after retirement is the engine's own
+///    `connectionState`. A transport whose map was merely emptied,
+///    or whose link was retained by the low-water closure it
+///    installed, leaves that connection open — which is the
+///    difference between a retirement and a forgotten one.
+///
+/// Still absent, and named rather than implied: production
+/// `NodeBackend::shutdown` itself, which needs a `wasm::LeafNode`
+/// from a real `connect()` and therefore an anchor. This file's
+/// premise is that there is none; the installed-node chain is
+/// covered against a real anchor by the two-tab witness in
+/// `net/crates/net/tests/rtc_browser/`. What is production here is
+/// the node, the call table, the transport and the connection.
 #[wasm_bindgen_test]
 async fn an_explicitly_retired_leader_goes_quiet_at_its_peer_while_its_page_stays_alive() {
     let db = unique("quiet-db");
@@ -1308,6 +1579,7 @@ async fn an_explicitly_retired_leader_goes_quiet_at_its_peer_while_its_page_stay
 
     let (release, parked) = oneshot::channel();
     *handles.barrier.borrow_mut() = Some(parked);
+    let connection = attach_real_rtc(&handles).await;
 
     let leader = Lifecycle::open(opts(&db, &scope, &[], &[]), real_factory(handles.clone()))
         .await
@@ -1372,6 +1644,21 @@ async fn an_explicitly_retired_leader_goes_quiet_at_its_peer_while_its_page_stay
     assert!(
         !handles.node.borrow().has_session(handles.peer),
         "retirement must close the node's session"
+    );
+    assert_eq!(
+        connection.connection_state(),
+        RtcPeerConnectionState::Closed,
+        "and it must close the RTC connection the node held — the engine's own \
+         state, not a count of links the transport forgot"
+    );
+    assert!(
+        handles
+            .transport
+            .borrow()
+            .as_ref()
+            .and_then(|transport| transport.peer_connection(RTC_PEER))
+            .is_none(),
+        "the retired link must be out of the transport as well"
     );
 
     // Recovery: a successor is installed and leading.
@@ -1761,6 +2048,147 @@ async fn closing_a_promoting_tab_cancels_its_parked_bootstrap_and_frees_the_lock
         log.borrow().performed.is_empty(),
         "the cancelled tab must perform nothing, ever: {:?}",
         log.borrow().performed
+    );
+
+    third.close();
+    settle().await;
+}
+
+/// A cancelled bootstrap **closes the RTC resources it had already
+/// created**, and does so before the origin's lock reaches a
+/// successor.
+///
+/// The test above establishes that cancellation drops the parked
+/// factory future and frees the lock. That is not the same claim as
+/// this one. A real bootstrap is `wasm::LeafNode::connect`, and by
+/// the time it parks — on the answer, on the channel, on Noise, on
+/// enrollment — it owns a live `RTCPeerConnection` with the Net
+/// DataChannel on it: `create_offer` installs the link *before* its
+/// first await. Dropping the future used to leave all of that
+/// running, because the transport's peers map was kept alive by a
+/// cycle through the very handler it stored —
+///
+/// ```text
+/// peers map -> PeerLink._closures -> low_water_handler -> peers map
+/// ```
+///
+/// — so nothing reached zero, nothing was dropped, and no
+/// `RTCPeerConnection.close()` ever ran. The successor was then
+/// granted the origin's lock while its predecessor's ICE agent was
+/// still gathering and its channel still open.
+///
+/// Two things make this a witness rather than a restatement:
+///
+/// 1. **The connection is the browser's.** The factory drives the
+///    production [`RtcLeafTransport::create_offer`] and keeps the
+///    `RTCPeerConnection` the engine created; every state below is
+///    read off that object. Nothing replaces the transport.
+/// 2. **The ordering is observed, not assumed.** The successor's own
+///    factory samples that state on the way in. A successor can only
+///    be running because the cancelled bootstrap released the lock,
+///    so `closed` sampled there is a close that happened *before*
+///    the release — which is the whole lock-ordering claim, and the
+///    one a "drop the lock and clean up later" repair would fail.
+#[wasm_bindgen_test]
+async fn a_cancelled_bootstraps_real_rtc_connection_is_closed_before_the_lock_moves() {
+    let db = unique("rtc-cancel-db");
+    let scope = unique("rtc-cancel-scope");
+    let attempt = Rc::new(RtcAttempt::default());
+    let (release, parked) = oneshot::channel();
+
+    let first = Lifecycle::open(
+        opts(&db, &scope, &[], &[]),
+        factory(0x1111, Rc::new(RefCell::new(Log::default())), false),
+    )
+    .await
+    .expect("first leader");
+    settle().await;
+
+    // The tab whose promotion will really build RTC state and park.
+    let second = Lifecycle::open(
+        opts(&db, &scope, &[], &[]),
+        rtc_parking_factory(
+            0x2222,
+            Rc::new(RefCell::new(Log::default())),
+            0,
+            parked,
+            attempt.clone(),
+        ),
+    )
+    .await
+    .expect("second tab");
+    settle().await;
+    assert_eq!(second.role(), Role::Follower);
+
+    first.close();
+    // `create_offer` is two real promises deep, so this waits for the
+    // connection rather than assuming one turn is enough.
+    while attempt.connection.borrow().is_none() {
+        settle().await;
+    }
+    let connection = attempt
+        .connection
+        .borrow()
+        .clone()
+        .expect("the parked bootstrap created a real connection");
+
+    // The premise. Without it "closed" afterwards would be consistent
+    // with a connection that was never brought up at all.
+    assert!(
+        attempt.offered.get(),
+        "the parked bootstrap must really have produced an offer with SDP"
+    );
+    assert_ne!(
+        connection.connection_state(),
+        RtcPeerConnectionState::Closed,
+        "the bootstrap's connection is live while it is parked"
+    );
+
+    // A successor queues for the lock *before* the cancellation, so
+    // its factory is what runs at the release.
+    let third_log = Rc::new(RefCell::new(Log::default()));
+    let third = Lifecycle::open(
+        opts(&db, &scope, &[], &[]),
+        sampling_factory(0x3333, third_log.clone(), attempt.clone()),
+    )
+    .await
+    .expect("third tab");
+    settle().await;
+    assert_eq!(third.role(), Role::Follower);
+    assert_eq!(
+        attempt.at_successor.get(),
+        None,
+        "nothing has been promoted yet, so nothing has sampled yet"
+    );
+
+    // The page closes the tab whose promotion is still parked.
+    second.close();
+    while third.role() != Role::Leader {
+        settle().await;
+    }
+    settle().await;
+
+    assert_eq!(third.generation(), 3);
+    assert_eq!(
+        attempt.at_successor.get(),
+        Some(RtcPeerConnectionState::Closed),
+        "the cancelled bootstrap's real connection must already be closed at the \
+         moment the lock reaches its successor"
+    );
+    assert_eq!(
+        connection.connection_state(),
+        RtcPeerConnectionState::Closed,
+        "and it must stay closed"
+    );
+
+    // Releasing the barrier afterwards resumes nothing: there is no
+    // future left, and no second connection appears.
+    let _ = release.send(());
+    settle().await;
+    settle().await;
+    assert_eq!(
+        connection.connection_state(),
+        RtcPeerConnectionState::Closed
     );
 
     third.close();
@@ -2262,6 +2690,214 @@ async fn the_last_capability_declaring_followers_tag_is_withdrawn() {
          announcement, not merely dropped from a set nobody publishes: {:?}",
         leader_log.borrow().performed
     );
+
+    leader.close();
+    settle().await;
+}
+
+/// An **unchanged** follower announcement leaves the published union
+/// alone.
+///
+/// The sibling of the leader-local overwrite above, and the one that
+/// survived it. A follower's `Announce` was performed verbatim: the
+/// backend published *that tab's* list, so the leader's own live
+/// capability — and every other follower's — was withdrawn by a tab
+/// that had merely repeated what it already wanted. Reconciliation
+/// could not repair it either, because the union publisher's cache
+/// still recorded the union as the published document, so its
+/// equality check returned early. Nothing later corrected it: the
+/// follower has no reason to speak again.
+///
+/// The follower's declaration therefore does not publish anything. It
+/// is recorded, and its caller is parked on the authoritative union
+/// publication that follows — so the promise still settles, and still
+/// means what it says.
+#[wasm_bindgen_test]
+async fn an_unchanged_follower_announcement_keeps_the_published_union() {
+    let db = unique("refresh-db");
+    let scope = unique("refresh-scope");
+    let leader_log = Rc::new(RefCell::new(Log::default()));
+
+    let leader = Lifecycle::open(
+        opts(&db, &scope, &[], &["cap:leader"]),
+        factory(0x1111, leader_log.clone(), false),
+    )
+    .await
+    .expect("leader");
+    settle().await;
+    let follower = Lifecycle::open(
+        opts(&db, &scope, &[], &["cap:follower"]),
+        factory(0x2222, Rc::new(RefCell::new(Log::default())), false),
+    )
+    .await
+    .expect("follower");
+    settle().await;
+    settle().await;
+
+    let union = vec!["cap:follower".to_string(), "cap:leader".to_string()];
+    assert_eq!(
+        last_announcement(&leader_log),
+        Some(union.clone()),
+        "the premise: reconciliation has already published the union"
+    );
+    let before = leader_log.borrow().performed.len();
+
+    // The follower re-declares exactly the intent it already holds.
+    follower
+        .announce(vec!["cap:follower".to_string()])
+        .await
+        .expect("a follower's announcement must still complete");
+    settle().await;
+    settle().await;
+
+    assert_eq!(
+        last_announcement(&leader_log),
+        Some(union.clone()),
+        "an unchanged follower announcement must not narrow the published \
+         document: {:?}",
+        leader_log.borrow().performed
+    );
+    assert!(
+        leader_log
+            .borrow()
+            .performed
+            .iter()
+            .skip(before)
+            .all(|request| match request {
+                LeaderRequest::Announce { capabilities } => capabilities == &union,
+                _ => true,
+            }),
+        "and no announcement carrying one tab's list alone may reach the node at \
+         all: {:?}",
+        leader_log.borrow().performed
+    );
+
+    follower.close();
+    leader.close();
+    settle().await;
+}
+
+/// A proxied synchronous send that makes **another** stream fail
+/// broadcasts that failure instead of panicking on the server borrow.
+///
+/// `Lifecycle::request` and the incoming-proxy `dispatch` both hold
+/// `Shared.server` while the backend performs. Most arms spawn, but
+/// `StreamSend` does not: it calls a real `wasm::LeafStream::send`,
+/// which pumps the node, drives reliability and dispatches whatever
+/// that produced — all inside the outer borrow. A reliable
+/// descriptor on a *different* stream whose retry budget runs out in
+/// that sweep therefore reaches the production `event_sink` while the
+/// server is already borrowed, and the sink's own
+/// `server.borrow_mut()` was a panic. No application callback is
+/// needed to trigger it.
+///
+/// `try_borrow_mut` and dropping the event would have traded the
+/// panic for a follower that is never told its stream died, so the
+/// broadcast is **deferred**, not suppressed: queued by the sink and
+/// taken by the flush that runs once the borrow is gone.
+///
+/// The schedule is the reachable one: stream X is sent on and never
+/// acknowledged, the periodic ticker has not swept, and the page
+/// sends on healthy stream Y. Y's own pump is what notices X.
+#[wasm_bindgen_test]
+async fn a_proxied_send_broadcasts_another_streams_terminal_event_instead_of_panicking() {
+    let db = unique("reborrow-db");
+    let scope = unique("reborrow-scope");
+    let (handles, _peer) = real_pair();
+
+    let leader = Lifecycle::open(opts(&db, &scope, &[], &[]), real_factory(handles.clone()))
+        .await
+        .expect("leader");
+    let seen = record_events(&leader);
+    settle().await;
+    assert_eq!(leader.role(), Role::Leader);
+
+    // X: reliable, sent once, never acknowledged. Its retransmit
+    // budget starts running now, against the wall clock the
+    // reliability layer reads for itself.
+    leader
+        .request(LeaderRequest::StreamOpen {
+            label: "doomed".into(),
+            reliability: Reliability::Reliable,
+            stream_id: Some(17),
+            channel_hash: None,
+        })
+        .await
+        .expect("open X");
+    leader
+        .request(LeaderRequest::StreamSend {
+            stream_id: 17,
+            payload: Bytes::from_static(b"unacknowledged"),
+        })
+        .await
+        .expect("send on X");
+    leader
+        .request(LeaderRequest::StreamOpen {
+            label: "healthy".into(),
+            reliability: Reliability::Reliable,
+            stream_id: Some(34),
+            channel_hash: None,
+        })
+        .await
+        .expect("open Y");
+
+    // Three sweeps outside any server borrow spend X's three
+    // retries: `ReliableStream::DEFAULT_RTO` is 50 ms and
+    // `DEFAULT_MAX_RETRIES` is 3, and each sweep that fires resets
+    // the packet's `sent_at`, so each one needs its own wait. None of
+    // them can give up yet.
+    for _ in 0..3 {
+        wait_ms(90).await;
+        let mut node = handles.node.borrow_mut();
+        node.tick(net_leaf::clock::now());
+        node.take_outbound();
+        assert!(
+            node.drain_events().is_empty(),
+            "the premise: X is still recoverable after this sweep"
+        );
+    }
+    assert!(
+        !seen
+            .borrow()
+            .iter()
+            .any(|json| json.contains("\"type\":\"stream_failed\"")),
+        "the premise: nothing has failed yet"
+    );
+
+    // The fourth sweep is the one that gives up, and it runs inside
+    // Y's synchronous send — under the caller's server borrow.
+    wait_ms(90).await;
+    handles.sweeps.set(1);
+    let sent = leader
+        .request(LeaderRequest::StreamSend {
+            stream_id: 34,
+            payload: Bytes::from_static(b"healthy"),
+        })
+        .await;
+    assert!(
+        sent.is_ok(),
+        "the healthy stream's send must have a defined result: {sent:?}"
+    );
+    settle().await;
+    settle().await;
+
+    assert!(
+        seen.borrow().iter().any(|json| {
+            json.contains("\"type\":\"stream_failed\"")
+                && json.contains("\"stream_id\":\"17\"")
+                && json.contains("\"reason\":\"retransmits_exhausted\"")
+        }),
+        "X's terminal event must reach the session rather than being lost to a \
+         failed borrow: {:?}",
+        seen.borrow()
+    );
+
+    // And the session still serves afterwards, which a panicked
+    // callback frame would not have left true.
+    leader
+        .request(LeaderRequest::Counters)
+        .await
+        .expect("the session must still serve after the deferred broadcast");
 
     leader.close();
     settle().await;

@@ -383,6 +383,14 @@ struct Shared {
     server: RefCell<Option<ProxyServer<Box<dyn LeaderBackend>>>>,
     client: RefCell<Option<ProxyClient>>,
     events: RefCell<Vec<String>>,
+    /// Node events owed to the **followers**, held until no server
+    /// borrow is outstanding.
+    ///
+    /// Separate from `events` because the two have different owners:
+    /// `events` goes to this tab's listeners and touches nothing
+    /// else, while a broadcast needs the server that a synchronous
+    /// backend arm may already be holding. See [`event_sink`].
+    broadcasts: RefCell<Vec<String>>,
     /// The fence in force for this tab while it is the leader.
     ///
     /// Held here as well as inside the server because stand-down needs
@@ -473,6 +481,7 @@ impl Lifecycle {
             server: RefCell::new(None),
             client: RefCell::new(None),
             events: RefCell::new(Vec::new()),
+            broadcasts: RefCell::new(Vec::new()),
             lease: RefCell::new(None),
             queued: RefCell::new(Vec::new()),
             overflowed: Cell::new(0),
@@ -1301,9 +1310,14 @@ async fn reconcile(shared: &Rc<Shared>) {
 /// The equality check still covers the ordinary case of *nothing to
 /// announce and nothing announced*, which costs no operation.
 async fn announce_union(shared: &Rc<Shared>) -> ProxyOutcome {
-    let wanted: Vec<String> = {
-        let server = shared.server.borrow();
-        let Some(server) = server.as_ref() else {
+    // The parked follower declarations are taken with the same
+    // snapshot the union is computed from, deliberately: a
+    // declaration recorded after this line is not in `wanted`, and
+    // settling it here would report a publication that does not
+    // carry it. Its own reconciliation is already scheduled.
+    let (wanted, declarations) = {
+        let mut server = shared.server.borrow_mut();
+        let Some(server) = server.as_mut() else {
             // Not the leader: there is no union to publish, and the
             // follower path does not come through here.
             return Err(ProxyFailure::Typed(LeafError::NotLeader {
@@ -1314,9 +1328,11 @@ async fn announce_union(shared: &Rc<Shared>) -> ProxyOutcome {
         let state = shared.state.borrow();
         let mut union: BTreeSet<String> = state.capabilities.iter().cloned().collect();
         union.extend(server.capability_restoration());
-        union.into_iter().collect()
+        let declarations = server.take_pending_announcements();
+        (union.into_iter().collect::<Vec<String>>(), declarations)
     };
     if shared.state.borrow().announced == wanted {
+        settle_declarations(declarations, &Ok(ProxyValue::Bytes(Bytes::new())));
         return Ok(ProxyValue::Bytes(Bytes::new()));
     }
     let lifecycle = Lifecycle {
@@ -1330,7 +1346,25 @@ async fn announce_union(shared: &Rc<Shared>) -> ProxyOutcome {
     if outcome.is_ok() {
         shared.state.borrow_mut().announced = wanted;
     }
+    settle_declarations(declarations, &outcome);
     outcome
+}
+
+/// Answer the followers whose `announce()` was parked on this
+/// publication, with the outcome it actually had.
+///
+/// A follower's declaration is recorded by the server and published
+/// here as part of the union, so its caller's promise settles on the
+/// union publication rather than on a document that was never
+/// published. Held repliers that are never settled are not silently
+/// lost either: dropping one answers it typed.
+fn settle_declarations(declarations: Vec<Replier>, outcome: &ProxyOutcome) {
+    for replier in declarations {
+        match outcome {
+            Ok(_) => replier.bytes(Bytes::new()),
+            Err(failure) => replier.fail(failure.clone()),
+        }
+    }
 }
 
 /// Install the one `BroadcastChannel` listener.
@@ -1518,11 +1552,47 @@ fn event_sink(shared: &Rc<Shared>) -> EventSink {
         let Some(shared) = weak.upgrade() else {
             return;
         };
-        if let Some(server) = shared.server.borrow_mut().as_mut() {
-            server.broadcast_event(json);
-        }
+        // **Queued, never broadcast from here.** This sink is called
+        // by the node, and the node is pumped synchronously by
+        // backend arms that run under `shared.server.borrow_mut()` —
+        // `NodeBackend::StreamSend` invokes a real
+        // `wasm::LeafStream::send`, which pumps, drives reliability
+        // and dispatches whatever that produced before it returns. A
+        // terminal event for *another* stream therefore arrives
+        // inside the outer server borrow, and taking a second one
+        // here was a panic. Discarding the event on a failed borrow
+        // would trade the panic for a follower that never hears its
+        // stream died, so the event is held and broadcast by
+        // [`flush_broadcasts`] once the borrow is gone.
+        shared.broadcasts.borrow_mut().push(json.to_string());
         emit(&shared, json);
     })
+}
+
+/// Broadcast every event owed to the followers, if the server is
+/// free.
+///
+/// Leaves the queue untouched when it is not: the caller that holds
+/// the server borrow is a synchronous frame, and [`emit`] has already
+/// scheduled the drain that runs after it returns. Nothing is
+/// dropped.
+fn flush_broadcasts(shared: &Rc<Shared>) {
+    if shared.broadcasts.borrow().is_empty() {
+        return;
+    }
+    let Ok(mut server) = shared.server.try_borrow_mut() else {
+        return;
+    };
+    let Some(server) = server.as_mut() else {
+        // No server: this tab is not the leader any more, and a
+        // stale leader's broadcast is exactly what the fence exists
+        // to stop.
+        shared.broadcasts.borrow_mut().clear();
+        return;
+    };
+    for json in core::mem::take(&mut *shared.broadcasts.borrow_mut()) {
+        server.broadcast_event(&json);
+    }
 }
 
 /// Queue one event and schedule the drain.
@@ -1536,7 +1606,14 @@ fn emit(shared: &Rc<Shared>, json: &str) {
 }
 
 /// Deliver every queued event, holding no borrow while a listener runs.
+///
+/// The followers first: a node event is one fact, and the tab that
+/// runs the node must not see it arbitrarily earlier than the tabs it
+/// serves. This is also the drain [`event_sink`] depends on — the
+/// broadcast it could not take the server for is taken here, once
+/// every synchronous backend frame has returned.
 fn flush_events(shared: &Rc<Shared>) {
+    flush_broadcasts(shared);
     let queued = core::mem::take(&mut *shared.events.borrow_mut());
     if queued.is_empty() {
         return;

@@ -8,7 +8,7 @@
 //! |---|---|
 //! | [`ControlPlane::offer`] | `POST /rtc/offer` |
 //! | [`ControlPlane::trickle`] | `GET /rtc/trickle` (WebSocket) |
-//! | [`ControlPlane::signal`] | the same trickle socket |
+//! | [`ControlPlane::signal`] | **no route** — typed refusal |
 //! | [`ControlPlane::end_attempt`] | closing that socket |
 //! | [`ControlPlane::drain_events`] | frames arriving on it |
 //! | [`ControlPlane::publish_announcement`] | **no route** — typed refusal |
@@ -111,14 +111,37 @@ impl AnchorControlPlane {
     /// Fetch `GET /rtc/anchor`, **refuse a key the credential does
     /// not pin**, and return a control plane bound to that anchor.
     ///
-    /// The refusal is here, in the constructor, so that no ordering
-    /// of the connect sequence can put a handshake before it.
+    /// The refusal is in [`Self::bind`], below the fetch, so that no
+    /// ordering of the connect sequence can put a handshake before
+    /// it.
     pub async fn attach(
         bootstrap_url: String,
         credential: Credential,
         self_node: NodeId,
     ) -> Result<Self> {
         let info = AnchorInfo::from_json(&http_get(&format!("{bootstrap_url}/rtc/anchor")).await?)?;
+        Self::bind(bootstrap_url, credential, self_node, &info)
+    }
+
+    /// Bind to an anchor whose info is already in hand, refusing a
+    /// key the credential does not pin.
+    ///
+    /// Split from [`Self::attach`] because the two halves answer to
+    /// different things. The fetch is the listener's; the comparison
+    /// and everything it gates — including this adapter's typed
+    /// signalling refusal (R14) — is the credential's, and belongs
+    /// somewhere a caller holding an anchor document can reach
+    /// without a listener to fetch it from. `attach` is that caller
+    /// with the fetch; the browser witness for the refusal is that
+    /// caller with a document it minted itself, which is the only
+    /// way this adapter's own refusal can be observed rather than
+    /// a mock's.
+    pub fn bind(
+        bootstrap_url: String,
+        credential: Credential,
+        self_node: NodeId,
+        info: &AnchorInfo,
+    ) -> Result<Self> {
         info.check_pinned_key(&credential)?;
         Ok(Self {
             state: Rc::new(State {
@@ -126,7 +149,7 @@ impl AnchorControlPlane {
                 credential,
                 self_node,
                 anchor_node: info.node_id,
-                anchor_rtc_addr: info.rtc_addr,
+                anchor_rtc_addr: info.rtc_addr.clone(),
                 dialog: Cell::new(None),
                 trickle: RefCell::new(None),
                 events: Rc::new(RefCell::new(VecDeque::new())),
