@@ -809,7 +809,19 @@ class NetMesh:
     def send_on_stream(self, stream: "NetStream", events: List[bytes]) -> None:
         """Send a batch of events on a stream. Raises
         `BackpressureError` if the window is full, `NotConnectedError`
-        if the peer session is gone."""
+        if the peer session is gone.
+
+        Raises `ValueError` when any ONE event is larger than a single
+        Net packet can carry. The message names both numbers — the
+        offending event's size and the per-event limit in bytes
+        (`MAX_PAYLOAD_SIZE` minus the event frame's 4-byte length
+        prefix, 8104 on the current wire format) — because a caller
+        that cannot see the limit has no way to discover its send
+        bound except by being refused. Nothing in the batch is sent:
+        the check runs before the peer is even resolved. It is not a
+        transport fault and retrying cannot help, so `ValueError`
+        rather than `RuntimeError`; split the payload, or carry it on
+        a producer that fragments."""
         ...
     def send_with_retry(
         self,
@@ -818,11 +830,15 @@ class NetMesh:
         max_retries: int = 8,
     ) -> None:
         """Retry `BackpressureError` with 5–200 ms exponential backoff
-        up to `max_retries` times. Transport errors propagate."""
+        up to `max_retries` times. Transport errors propagate, and so
+        does the oversize `ValueError` — it is the payload, not the
+        window, so no number of retries clears it."""
         ...
     def send_blocking(self, stream: "NetStream", events: List[bytes]) -> None:
         """Retry until the send succeeds or the ~13-minute upper bound
-        is hit. Releases the GIL while waiting."""
+        is hit. Releases the GIL while waiting. Only
+        `BackpressureError` is absorbed; the oversize `ValueError`
+        propagates immediately."""
         ...
     def stream_stats(
         self, peer_node_id: int, stream_id: int

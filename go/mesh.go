@@ -48,6 +48,23 @@ var (
 	// it like ErrBackpressure.
 	ErrSessionSuperseded = errors.New("stream session superseded")
 
+	// One payload in the batch is larger than a single Net packet can
+	// carry (NET_ERR_MESH_EVENT_TOO_LARGE, -118). Nothing was sent:
+	// the refusal happens inside `send_on_stream` before the peer is
+	// even resolved, so it takes precedence over ErrNotConnected.
+	//
+	// Not a transport fault and not retryable — no receive path
+	// accepts an over-cap packet, so `SendWithRetry` and
+	// `SendBlocking` propagate it immediately. The payload has to be
+	// split by the application.
+	//
+	// The send methods return an *EventTooLargeError wrapping this
+	// sentinel, so `errors.Is(err, net.ErrEventTooLarge)` matches and
+	// `errors.As(err, &e)` reads e.Size / e.Limit. Reached through a
+	// non-send path (an FFI entry point that has no payload array),
+	// the bare sentinel is returned.
+	ErrEventTooLarge = errors.New("stream event too large")
+
 	// NAT traversal errors. One sentinel per `TraversalError`
 	// variant so callers can `errors.Is(err, net.ErrTraversalPunchFailed)`.
 	// Framing (plan §5): every one of these represents a missed
@@ -89,6 +106,8 @@ func meshErrorFromCode(code C.int) error {
 		return ErrChannelAuth
 	case -117:
 		return ErrSessionSuperseded
+	case netErrMeshEventTooLarge:
+		return ErrEventTooLarge
 	case -130:
 		return ErrTraversalReflexTimeout
 	case -131:
@@ -109,6 +128,92 @@ func meshErrorFromCode(code C.int) error {
 		return fmt.Errorf("mesh unknown error (code %d)", code)
 	}
 }
+
+// netErrMeshEventTooLarge is NET_ERR_MESH_EVENT_TOO_LARGE read from
+// `go/net.h` — the header cgo actually compiles against, not a
+// transcribed literal. Every other arm above is a literal for
+// historical reasons; this one is bound to the header so a renumbered
+// enum is a compile-time mismatch here rather than a silent
+// "mesh unknown error (code -118)" at runtime, which is exactly how
+// the gap this const closes went unnoticed.
+// `TestEventTooLargeHeaderParity` pins its value.
+const netErrMeshEventTooLarge = C.NET_ERR_MESH_EVENT_TOO_LARGE
+
+// MaxEventSize reports the largest single event any Net send path
+// will carry, in bytes — `MAX_PAYLOAD_SIZE` minus the event frame's
+// 4-byte length prefix, read from the linked cdylib rather than
+// duplicated here.
+//
+// This is the bound ErrEventTooLarge is measured against. Constant
+// for the life of the loaded library, so it is safe to query once
+// and cache. Use it to size payloads *before* sending; it is not a
+// second admission check, and nothing in the Go layer refuses a
+// payload — the refusal lives in `send_on_stream`.
+func MaxEventSize() int {
+	return int(C.net_mesh_max_event_size())
+}
+
+// sendErrorFromCode maps a send return code to a Go error, promoting
+// NET_ERR_MESH_EVENT_TOO_LARGE to the typed *EventTooLargeError.
+//
+// The C ABI returns an int, so the core's `EventTooLarge { size,
+// limit }` arrives with both fields gone. `limit` comes back from
+// the cdylib; `size` is recovered from `payloads`, the caller's own
+// slice, by the same first-match rule the core uses. That scan is
+// ATTRIBUTION, not admission control: it runs only after the core
+// has already refused, it decides nothing, and if it somehow finds
+// no oversize payload the error reports Size 0 ("unattributed")
+// rather than inventing a length.
+func sendErrorFromCode(code C.int, payloads [][]byte) error {
+	if code != netErrMeshEventTooLarge {
+		return meshErrorFromCode(code)
+	}
+	limit := MaxEventSize()
+	size := 0
+	for _, p := range payloads {
+		if len(p) > limit {
+			size = len(p)
+			break
+		}
+	}
+	return &EventTooLargeError{Size: size, Limit: limit}
+}
+
+// EventTooLargeError is the typed form of ErrEventTooLarge returned
+// by the send methods. It carries the two numbers the C ABI discards:
+// the offending payload's length and the transport's per-event limit.
+//
+// `errors.Is(err, net.ErrEventTooLarge)` matches it;
+// `errors.As(err, &e)` reads the numbers.
+type EventTooLargeError struct {
+	// Size is the offending payload's length in bytes, or 0 when the
+	// refusal could not be attributed to one element of the batch
+	// (never a real length — a zero-byte payload is never too large).
+	Size int
+	// Limit is the largest event this transport will carry, in bytes.
+	// Equal to MaxEventSize().
+	Limit int
+}
+
+func (e *EventTooLargeError) Error() string {
+	if e.Size == 0 {
+		return fmt.Sprintf(
+			"stream event too large: one payload exceeds the %d-byte "+
+				"per-event limit; nothing was sent",
+			e.Limit,
+		)
+	}
+	return fmt.Sprintf(
+		"stream event too large: %d bytes exceeds the %d-byte per-event "+
+			"limit; nothing was sent — split the payload at the "+
+			"application layer",
+		e.Size, e.Limit,
+	)
+}
+
+// Unwrap exposes the sentinel so `errors.Is(err, ErrEventTooLarge)`
+// succeeds without callers knowing the concrete type.
+func (e *EventTooLargeError) Unwrap() error { return ErrEventTooLarge }
 
 // ---------------------------------------------------------------------------
 // Config types
@@ -920,6 +1025,12 @@ func payloadPtrs(payloads [][]byte) (
 // retry / buffer), ErrNotConnected when the peer is gone, or a
 // transport error.
 //
+// Returns an *EventTooLargeError (matching ErrEventTooLarge, and
+// carrying the offending size plus MaxEventSize()) when one payload
+// is larger than a single packet can carry. That refusal happens
+// before the peer is resolved, so it takes precedence over
+// ErrNotConnected, and nothing in the batch is sent.
+//
 // Holds the stream AND node read-locks through the C call so a
 // concurrent Close/Shutdown can't race the native handles into a
 // use-after-free. Concurrent sends run in parallel; Close waits.
@@ -938,11 +1049,12 @@ func (s *MeshStream) Send(payloads [][]byte) error {
 		return ErrShuttingDown
 	}
 	code := C.net_mesh_send(s.handle, ptrs, lens, count, n.handle)
-	return meshErrorFromCode(code)
+	return sendErrorFromCode(code, payloads)
 }
 
 // SendWithRetry absorbs ErrBackpressure with exponential backoff up
-// to `maxRetries`. Other errors propagate immediately.
+// to `maxRetries`. Other errors propagate immediately — including
+// ErrEventTooLarge, which no amount of retrying can clear.
 func (s *MeshStream) SendWithRetry(payloads [][]byte, maxRetries uint32) error {
 	ptrs, lens, count, release := payloadPtrs(payloads)
 	defer release()
@@ -958,10 +1070,12 @@ func (s *MeshStream) SendWithRetry(payloads [][]byte, maxRetries uint32) error {
 		return ErrShuttingDown
 	}
 	code := C.net_mesh_send_with_retry(s.handle, ptrs, lens, count, C.uint32_t(maxRetries), n.handle)
-	return meshErrorFromCode(code)
+	return sendErrorFromCode(code, payloads)
 }
 
 // SendBlocking retries ErrBackpressure up to ~13 min worst case.
+// ErrEventTooLarge is not retried: the payload, not the window, is
+// the problem.
 func (s *MeshStream) SendBlocking(payloads [][]byte) error {
 	ptrs, lens, count, release := payloadPtrs(payloads)
 	defer release()
@@ -977,7 +1091,7 @@ func (s *MeshStream) SendBlocking(payloads [][]byte) error {
 		return ErrShuttingDown
 	}
 	code := C.net_mesh_send_blocking(s.handle, ptrs, lens, count, n.handle)
-	return meshErrorFromCode(code)
+	return sendErrorFromCode(code, payloads)
 }
 
 // StreamStats returns a snapshot. `nil` if the stream isn't open.

@@ -2047,6 +2047,20 @@ mod mesh_bindings {
         /// `"stream not connected"` = `NotConnectedError`; anything
         /// else is a real transport failure. See `sdk-ts` for the
         /// class-based re-throw layer.
+        ///
+        /// **Oversize events** reject with a plain `Error` whose
+        /// message names BOTH numbers — the offending event's size
+        /// and the per-event limit in bytes (`MAX_PAYLOAD_SIZE` minus
+        /// the event frame's 4-byte length prefix; 8 104 on the
+        /// current wire format). Deliberately NOT given a sniffable
+        /// prefix: those route to `BackpressureError` /
+        /// `NotConnectedError`, i.e. to a retry or a reconnect, and
+        /// neither is a sane response to a payload that no receive
+        /// path will ever accept. The message carries the limit
+        /// because it is the only place a JS caller can read it — a
+        /// caller that cannot see the bound can only discover it by
+        /// being refused. Nothing in the batch is sent; the check
+        /// runs before the peer is resolved.
         #[napi]
         pub async fn send_on_stream(&self, stream: &NetStream, events: Vec<Buffer>) -> Result<()> {
             let guard = self.load_node()?;
@@ -2062,7 +2076,9 @@ mod mesh_bindings {
 
         /// Send events, retrying on `Backpressure` with 5 ms → 200 ms
         /// exponential backoff up to `maxRetries` times. Transport
-        /// errors are returned immediately (not retried).
+        /// errors are returned immediately (not retried), and so is
+        /// an oversize-event rejection — it is the payload, not the
+        /// window, so retrying cannot clear it.
         #[napi]
         pub async fn send_with_retry(
             &self,
@@ -2087,7 +2103,9 @@ mod mesh_bindings {
         /// case) — effectively "block until the network lets up" for
         /// practical workloads, but with a hard upper bound so runaway
         /// pressure can't hang a caller forever. Use `sendWithRetry`
-        /// directly if you need a tighter bound.
+        /// directly if you need a tighter bound. Only `Backpressure`
+        /// is absorbed; an oversize-event rejection propagates at
+        /// once.
         #[napi]
         pub async fn send_blocking(&self, stream: &NetStream, events: Vec<Buffer>) -> Result<()> {
             let guard = self.load_node()?;

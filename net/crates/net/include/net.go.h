@@ -70,7 +70,10 @@ typedef enum {
      * carry (MAX_EVENT_SIZE = MAX_PAYLOAD_SIZE - 4). Nothing was sent.
      * Not a transport fault and not retryable: no receive path accepts
      * an over-cap packet, so the payload must be split by the caller.
-     * The detail string names the limit. */
+     * Read the limit with `net_mesh_max_event_size()`; the offending
+     * size is the caller's own `lens[i]`. No send function returns a
+     * detail string — earlier revisions of this comment promised one
+     * that never existed. */
     NET_ERR_MESH_EVENT_TOO_LARGE = -118,
     /* Identity + permission-token surface (compiled when the Rust
      * cdylib has the `net` feature on). Codes below -119 — one per
@@ -443,8 +446,10 @@ int      net_mesh_close_stream(net_mesh_stream_t* handle);
  * `NET_ERR_MESH_SESSION_SUPERSEDED` when the peer's session was
  * replaced since this handle was opened,
  * `NET_ERR_MESH_EVENT_TOO_LARGE` when one payload exceeds what a
- * single packet can carry (nothing is sent; the detail string names
- * the limit), and `NET_ERR_MESH_TRANSPORT` for other I/O errors.
+ * single packet can carry (nothing is sent; the limit is
+ * `net_mesh_max_event_size()` and the offending size is the
+ * caller's own `lens[i]` — there is no detail string), and
+ * `NET_ERR_MESH_TRANSPORT` for other I/O errors.
  */
 int      net_mesh_send(net_mesh_stream_t* stream,
                        const uint8_t* const* payloads,
@@ -462,6 +467,20 @@ int      net_mesh_send_blocking(net_mesh_stream_t* stream,
                                 const size_t* lens,
                                 size_t count,
                                 net_meshnode_t* node_handle);
+
+/* The largest single event any send path will carry, in bytes:
+ * MAX_PAYLOAD_SIZE minus the event frame's 4-byte length prefix.
+ *
+ * This is the `limit` a NET_ERR_MESH_EVENT_TOO_LARGE refusal is
+ * measured against. That refusal is an int, so the Rust error's
+ * {size, limit} pair does not cross the ABI; `size` is an element
+ * of the caller's own `lens`, but `limit` is a build constant of
+ * this cdylib and is otherwise undiscoverable. Query it once — it
+ * cannot change for the life of the loaded library, needs no node
+ * or stream, and never returns 0. It admits nothing: the refusal
+ * remains inside the send path.
+ */
+size_t   net_mesh_max_event_size(void);
 
 /* Stream stats — JSON shape mirrors `StreamStats`. Writes `null` to
  * *out_json when the stream isn't open. */

@@ -67,7 +67,7 @@ use crate::adapter::net::{
     ChannelName as InnerChannelName, ChannelPublisher, EntityKeypair, MeshNode, MeshNodeConfig,
     OnFailure as InnerOnFailure, PublishConfig as InnerPublishConfig,
     PublishReport as InnerPublishReport, Reliability, Stream as CoreStream, StreamConfig,
-    StreamError, Visibility as InnerVisibility, DEFAULT_STREAM_WINDOW_BYTES,
+    StreamError, Visibility as InnerVisibility, DEFAULT_STREAM_WINDOW_BYTES, MAX_EVENT_SIZE,
 };
 use crate::adapter::net::{SubnetId, SubnetPolicy, SubnetRule};
 use crate::adapter::Adapter;
@@ -1932,6 +1932,29 @@ pub unsafe extern "C" fn net_mesh_send_blocking(
         Ok(()) => 0,
         Err(e) => stream_err_to_code(&e),
     }
+}
+
+/// The largest single event any native send path will carry, in
+/// bytes — the `limit` half of every
+/// `NET_ERR_MESH_EVENT_TOO_LARGE` refusal.
+///
+/// The refusal itself is a `c_int`, so `StreamError::EventTooLarge
+/// { size, limit }` loses both fields crossing the ABI. `size` is
+/// not lost in any meaningful sense — it is an element of the
+/// caller's own `lens` array — but `limit` is a build constant of
+/// the linked cdylib (`MAX_PAYLOAD_SIZE` minus the event frame's
+/// 4-byte length prefix), and a caller that cannot read it has no
+/// way to discover its send bound except by being refused. This is
+/// that read.
+///
+/// Does **not** admit or refuse anything: it is a pure accessor on
+/// a constant, needs no node and no stream, and never returns 0.
+/// The refusal stays exactly where it is — inside
+/// `MeshNode::send_on_stream`, before the peer is resolved — and
+/// nothing here extends it to a path that bypasses that function.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_mesh_max_event_size() -> usize {
+    MAX_EVENT_SIZE
 }
 
 #[derive(Serialize)]
