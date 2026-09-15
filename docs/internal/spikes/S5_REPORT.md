@@ -704,3 +704,83 @@ recurs.
   the impostor-timing leg ("timeout: noise msg2") and passed on the
   next run with identical source. Reported rather than buried: 3/4
   green, in a Stage 4b witness untouched this round.
+
+### 11.8 The three CI failures at `72c8abd6b`, each diagnosed at its cause
+
+52 jobs green, three red, three different causes — and in all three
+the production diff is empty. That is the finding, not an excuse:
+two witnesses were asserting interleavings rather than invariants,
+and one was modelling a transport the leaf does not ship.
+
+**(1) `rtc_repairs::a_control_frame_shares_the_sequence_space_of_the
+_stream_it_rides`** — `retransmit_packets_sent == 1` after a 1 s
+settle on a loss-free link. NOT the control frame: it is built with
+`PacketFlags::NONE` and `register_retransmit` returns immediately
+for non-reliable flags, so it can never be in a retransmit window.
+The resent packet was an application payload (seq 8 in 15 of 17
+reproductions), and its ACK was always SENT — `ack_seq=2
+consumed=253` shows the peer stepping over the control frame at
+seq 1 and charging its bytes, which is N1 working. `flush_stream_
+batch` awaits the socket and only then registers the descriptor,
+while the peer's grant drainer answers on a 1 ms cadence, so under
+load the covering ACK is applied BEFORE the sender registers the
+packet it covers — measured at 66 µs. The packet misses its own
+prune, times out once, and the duplicate's grant prunes it. That
+ordering predates this round. Reproduced 17/20 by pinning to one
+logical CPU against 24 burners; 0/12 unloaded. The assertion was
+therefore falsifiable by scheduling on a margin of one RTO (10 ms
+after the adaptive estimate floors on loopback), and is replaced by
+what the witness means: the window DRAINED, and drained by
+acknowledgement rather than by the give-up path —
+`max_consumed_seen == tx_bytes_sent`. Under the inverse (the
+receive-side accounting block deleted) that fires with `gap 111`,
+exactly the membership frame's wire bytes. `reset_packets_sent == 0`
+went with it: the same race at 4× the margin, measured failing 2/15,
+with its coverage subsumed. Under the conditions that failed the old
+assertion 17/20, the new one passes 20/20 with the spurious
+retransmits still occurring.
+
+**(2) `wasm_anchorless.rs:647`** — closed; see §11.7. Also a
+fixture modelling a slower wire than production.
+
+**(3) Chromium `mdns_on_pair_formed`** — neither of the two
+hypotheses. Not a peer-reflexive race: Chromium reached `connected`
+1.1 ms after receiving the anchor's host candidate. Not a missing
+reflexive candidate: the obfuscated `.local` host candidate paired,
+and the anchor-stun variant that DID produce an srflx failed the
+same way. The pair formed, the DataChannel opened, and the attempt
+died at the Noise handshake — then the probe discarded the pair it
+had and reported the anchor as lacking mDNS support. `page/app.js`
+opened the channel `{ordered: false, maxRetransmits: 0}`; the leaf
+opens it ordered and reliable because the AEAD replay window refuses
+packet-level reorder. Noise `msg1`/`msg2` are `build_handshake`
+packets outside the reliable-stream machinery, so `reliability.rs`
+cannot retransmit them and SCTP is their only recovery — which the
+harness had switched off. One lost datagram was terminal.
+Reproduced by dropping exactly one real inbound datagram: old config
+`NO PAIR — timeout: noise msg2… disconnected@12824ms` against CI's
+12.7 s; new config, identical drop, PAIR FORMED in 25 ms, 21/21.
+
+R7's gate is untouched — mDNS-on remains its own verdict requiring a
+session, with no fallback, no retry and no widened deadline. What
+changed is that a failure now carries its own evidence: candidate
+types per side with the `.local` flag, the ICE timeline, DataChannel
+and msg1 timings, the anchor's pair sampled while the attempt runs,
+and the browser's selected pair snapshotted BEFORE the connection
+closes — closing it empties `getStats`, which is why a pair that
+formed used to leave no trace at all. The verdict no longer asserts
+that an anchor-side mDNS client is required, which was false for
+exactly this failure.
+
+`BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md` §3 specified the
+unordered, zero-retransmit channel and is corrected in place: it
+described the transport the harness was still modelling, and the
+leaf had already chosen otherwise, for a reason its code states.
+
+**[INFERENCE]** why the loss happened on that leg in that run: the
+routable-interface probe is the only one whose datagrams traverse
+the runner's real NIC stack, so it is the only one exposed to queue
+drop under load. The loss itself is environmental and not fixable in
+a harness. What was fixable — and is fixed — is that a single loss
+was unrecoverable, and was then reported as a missing anchor
+capability.
