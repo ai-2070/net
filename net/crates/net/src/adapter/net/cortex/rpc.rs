@@ -1614,18 +1614,23 @@ pub trait RpcHandler: Send + Sync + 'static {
     /// block on it. Handlers should respect `ctx.cancellation` for
     /// cooperative early-abort.
     ///
-    /// **Entry order.** Calls from one source — the same
-    /// `(session_peer, receiving session, caller_origin)`, which is
-    /// one ordered publisher stream — are ENTERED in the order the
-    /// transport delivered them: the body of call *n* starts running
-    /// only after the body of call *n − 1* has started. Everything
-    /// after a handler's first await point runs concurrently with
-    /// later calls, so this is an ordering on entry, not a lock: a
-    /// handler that parks (or never returns) does not delay its
-    /// successors. Work that must be observed in request order
-    /// belongs before the handler's first `.await`; anything after it
-    /// is ordered only by the handler itself. Calls from different
-    /// sources are unordered, exactly as two streams are.
+    /// **Ordering, and where it lives.** The transport orders
+    /// *delivery*; the fold preserves that for the part that is
+    /// the fold's to preserve. A `Reliable` stream delivers one
+    /// source's REQUESTs in sequence order, the serve bridge
+    /// drains its inbound receiver from a single task, and
+    /// `apply_frame` disposes of each frame — deadline refusal,
+    /// duplicate refusal, in-flight registration, dispatch —
+    /// before it looks at the next one.
+    ///
+    /// Handler **bodies** then run concurrently: each call is its
+    /// own task, so which body starts first, and how they
+    /// interleave, is the runtime's and is not a contract. Work
+    /// that must be observed in request order belongs in something
+    /// with one owner — a channel the handler sends to, an actor, a
+    /// lock — not in the order handlers happen to be polled. Calls
+    /// from different sources are unordered, exactly as two streams
+    /// are.
     async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError>;
 }
 
@@ -1686,36 +1691,6 @@ type InFlightCalls = Arc<Mutex<HashMap<(u64, u64, u64), RpcCancellationToken>>>;
 /// own ownership work is separate.)
 type UnaryInFlightCalls = Arc<Mutex<HashMap<(u64, u64, u64, u64), RpcCancellationToken>>>;
 
-/// The unary server fold's handler-**ENTRY** chain, keyed by call
-/// SOURCE: `(from_node, receiving_session_id, caller_origin)`.
-///
-/// One source is one ordered stream. Requests for a service ride the
-/// channel-keyed publisher stream (`MeshNode::publish_stream_id` —
-/// `0x0001_0000_0000_0000 | channel_hash`), so every REQUEST a given
-/// caller sends to a given service on a given session arrives on the
-/// same stream; `Reliability::Reliable` delivers that stream in
-/// sequence order (`docs/TRANSPORT.md`, "Reliability modes"), and the
-/// serve bridge drains its inbound receiver from a single task, so
-/// `RpcServerFold::apply_frame` runs in delivery order. Keeping the
-/// chain per source is what stops two unrelated callers (or two
-/// incarnations of one caller) from being ordered against each other:
-/// the transport makes no cross-stream ordering promise, and neither
-/// does this.
-///
-/// The value is the receiver half of the *entry baton* held by the
-/// most recently dispatched call from that source. The next call on
-/// the same source awaits it before polling its own handler; a
-/// resolved baton (predecessor already entered, or its task dropped)
-/// orders nothing, which is what makes the map prunable.
-type EntryChains = Arc<Mutex<HashMap<(u64, u64, u64), tokio::sync::oneshot::Receiver<()>>>>;
-
-/// Prune the entry-chain map on the next REQUEST once it holds this
-/// many sources. Every reconnect mints a new session id and therefore
-/// a new source key, so without a sweep a long-lived server would
-/// accumulate one dead entry per departed incarnation. A baton that
-/// has already been passed orders nothing, so dropping it is free.
-const ENTRY_CHAIN_SWEEP_LEN: usize = 64;
-
 /// Server-side fold. Sees REQUEST events on the configured channel,
 /// dispatches to the user-supplied handler, emits RESPONSE events
 /// via the supplied emitter. CANCEL events flip the matching
@@ -1745,11 +1720,6 @@ pub struct RpcServerFold {
     /// tasks can remove their own entries without going back through
     /// the fold.
     in_flight: UnaryInFlightCalls,
-    /// Per-source handler-entry chain — see [`EntryChains`]. Shared
-    /// with the spawned handler tasks: the fold hands each task the
-    /// predecessor's baton and the task passes its own on the moment
-    /// its handler has entered.
-    entry_chains: EntryChains,
     /// Optional per-service metrics handle. When `Some`, the
     /// spawned handler task bumps `handler_invocations_total` /
     /// `handler_in_flight` / `handler_panics_total` and records
@@ -1778,7 +1748,6 @@ impl RpcServerFold {
             emit,
             session_id: 0,
             in_flight: Arc::new(Mutex::new(HashMap::new())),
-            entry_chains: Arc::new(Mutex::new(HashMap::new())),
             metrics: None,
             #[cfg(test)]
             test_now_ns: None,
@@ -2035,67 +2004,33 @@ impl RpcServerFold {
                 // a CANCEL that fired during handler execution and
                 // override its response with `RpcStatus::Cancelled`.
                 let cancel_probe = cancellation.clone();
-                // Handler ENTRY order on one ordered stream.
+                // One task per call. The fold does not block on the
+                // handler and does not order handlers against each
+                // other — see `RpcHandler::call`'s ordering note.
+                // Ordering is the transport's (a `Reliable` stream
+                // delivers in sequence order) and the dispatch
+                // loop's (one bridge task, one `apply_frame` per
+                // frame, run to completion); what the scheduler
+                // owns is when each handler body starts, which is
+                // what `tokio::spawn` has always meant.
                 //
-                // The serve bridge drains its inbound receiver from
-                // a single task, so `apply_frame` sees this source's
-                // REQUESTs in transport DELIVERY order — which on a
-                // `Reliable` stream is sequence order. The per-call
-                // `tokio::spawn` below would then hand entry order
-                // to the scheduler: a burst of N requests delivered
-                // 0..N enters its handlers in whatever order the
-                // workers happen to pick the tasks up, erasing the
-                // one property an ordered stream exists to provide.
-                //
-                // So each task waits for its predecessor's baton,
-                // polls its handler future exactly ONCE — which runs
-                // the handler to its first await point, i.e. its
-                // entry — and only then passes the baton on. Entry
-                // order is delivery order; EXECUTION stays
-                // concurrent, because the remainder of a handler
-                // that awaits runs alongside every later call on the
-                // same source.
-                //
-                // Bounded by construction:
-                // * a handler that never completes passes the baton
-                //   at its first await, so it cannot wedge later
-                //   calls — a parked handler is the normal shape of
-                //   "never completes";
-                // * a task dropped before it polls at all drops the
-                //   sender, which resolves the successor's wait with
-                //   `Err` and advances the chain;
-                // * the only thing that can hold a chain up is a
-                //   handler that never reaches an await point, and
-                //   such a handler is already occupying a runtime
-                //   worker. It delays exactly its own source's later
-                //   entries, by its own synchronous prefix.
-                let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
-                let predecessor = {
-                    let mut chains = self.entry_chains.lock();
-                    // A baton that has already been passed (or whose
-                    // task went away) orders nothing. Prune those
-                    // before the map can accumulate one dead entry
-                    // per departed source.
-                    if chains.len() >= ENTRY_CHAIN_SWEEP_LEN {
-                        chains.retain(|_, rx| {
-                            matches!(
-                                rx.try_recv(),
-                                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-                            )
-                        });
-                    }
-                    chains.insert((from_node, self.session_id, meta.origin_hash), entered_rx)
-                };
+                // An earlier round chained these tasks so that call
+                // *n* could not be polled until call *n − 1* had
+                // been polled once. That bought an ordering on
+                // handler entry and cost more than it bought: a
+                // ready `.await` does not yield, so one long first
+                // poll held every successor from that source; the
+                // wait on the predecessor raced neither
+                // cancellation, nor the deadline, nor shutdown, so
+                // a request CANCELled while queued still entered
+                // its handler afterwards; and the map's sweep
+                // constant bounded the map, not the queued tasks
+                // holding request bytes behind a stalled
+                // predecessor. Application-level ordering is a
+                // policy an owner asks for, with its own queued
+                // ownership and cancellation disposition — not a
+                // side effect of a transport repair.
                 tokio::spawn(async move {
-                    // Wait for the predecessor on this source to
-                    // have ENTERED its handler (not completed it) —
-                    // see the chain note above the spawn. `Err`
-                    // means that task was dropped before it entered,
-                    // in which case there is nothing left to order
-                    // against and the chain advances.
-                    if let Some(prev) = predecessor {
-                        let _ = prev.await;
-                    }
                     // Server-side metrics: count this invocation;
                     // bump in_flight; time the handler; tally
                     // panics. Only fires when a metrics handle was
@@ -2125,26 +2060,10 @@ impl RpcServerFold {
                     // accept the assertion because the handler's
                     // state is untouched on panic (we just don't
                     // observe its in-progress mutations).
-                    let mut handler_future = std::pin::pin!(futures::FutureExt::catch_unwind(
-                        std::panic::AssertUnwindSafe(handler.call(ctx)),
-                    ));
-                    // Exactly ONE poll: the handler body runs to its
-                    // first await point (or to completion, if it
-                    // never awaits). That is the handler's ENTRY,
-                    // and it happens strictly after the predecessor
-                    // on this source entered. `poll_immediate`
-                    // polls with this task's own waker, so a handler
-                    // that returns `Pending` is woken exactly as it
-                    // would be by a plain `.await`.
-                    let entered = futures::future::poll_immediate(handler_future.as_mut()).await;
-                    // The baton passes at ENTRY, so the next call on
-                    // this source enters while this handler is still
-                    // running.
-                    let _ = entered_tx.send(());
-                    let outcome = match entered {
-                        Some(outcome) => outcome,
-                        None => handler_future.await,
-                    };
+                    let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+                        handler.call(ctx),
+                    ))
+                    .await;
                     if let Some(m) = metrics.as_ref() {
                         m.handler_in_flight
                             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -5468,22 +5387,20 @@ mod tests {
         assert!(fold.in_flight_keys().is_empty());
     }
 
-    /// `(source, body)` pairs in handler-entry order. Test-local
-    /// typedef for the same reason as [`CapturedResponses`] — it
-    /// keeps the field and the local under
-    /// `clippy::type_complexity`.
+    /// `(source, body)` pairs recorded when a handler body starts.
+    /// Test-local typedef for the same reason as
+    /// [`CapturedResponses`] — it keeps the field and the local
+    /// under `clippy::type_complexity`.
     type EntryLog = Arc<Mutex<Vec<(u64, String)>>>;
 
-    /// Records the request body at the instant the handler is
-    /// ENTERED, tagged with the source that delivered it, and then
-    /// parks on a semaphore the test controls.
+    /// Records the request body when the handler body starts,
+    /// tagged with the source that delivered it, then parks on a
+    /// semaphore the test controls.
     ///
-    /// The record happens synchronously at the top of the body —
-    /// before any await — so `entered` IS the handler-entry order.
-    /// Parking afterwards means no call can complete until the test
-    /// lets it, so `peak_parked` measures how many handlers were
-    /// inside the handler body at once.
-    struct EntryOrderHandler {
+    /// Parking means no call can complete until the test lets it,
+    /// so `peak_parked` measures how many handlers were inside the
+    /// handler body at once.
+    struct ParkingHandler {
         entered: EntryLog,
         parked: Arc<AtomicUsize>,
         peak_parked: Arc<AtomicUsize>,
@@ -5491,7 +5408,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl RpcHandler for EntryOrderHandler {
+    impl RpcHandler for ParkingHandler {
         async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
             let body = String::from_utf8_lossy(&ctx.payload.body).into_owned();
             self.entered.lock().push((ctx.session_peer, body));
@@ -5511,28 +5428,109 @@ mod tests {
         }
     }
 
-    /// Requests that arrive on ONE ordered stream enter their
-    /// handlers in the order the transport delivered them — and
-    /// per SOURCE, so two unrelated peers are not ordered against
-    /// each other.
+    /// **Where the fold's ordering is measured: the DISPATCH
+    /// boundary.** Not at handler entry — the fold spawns one task
+    /// per call and deliberately does not order those tasks against
+    /// each other (see `RpcHandler::call`). What the fold owns is
+    /// that it disposes of each delivered frame, in the order it
+    /// was delivered, before it looks at the next one.
     ///
-    /// A service's REQUESTs ride one channel-keyed publisher stream
-    /// (`publish_stream_id`), a `Reliable` stream delivers in
-    /// sequence order, and the serve bridge drains inbound from a
-    /// single task — so the fold sees a burst in delivery order,
-    /// exactly as this test drives it. Without the entry chain the
-    /// per-call `tokio::spawn` hands entry order to the scheduler
-    /// and a multi-worker runtime shuffles it.
+    /// The observable is the fold's own synchronous refusal: a
+    /// REQUEST whose deadline has already passed (beyond the skew
+    /// tolerance) is answered `Timeout` from *inside*
+    /// `apply_inbound`, before it returns, with no handler and no
+    /// task in the picture. So for one source the emitted sequence
+    /// IS the order `apply_frame` processed that source's frames,
+    /// and interleaving two sources cannot reorder either one.
     ///
-    /// The same test pins that ordering ENTRY did not serialize
-    /// EXECUTION: every handler parks on a zero-permit semaphore
-    /// after recording its entry, so a handler can only have
-    /// entered while all of its predecessors were still running.
-    /// All `2 × CALLS` are inside the handler body simultaneously —
-    /// which is also the statement that a handler which never
-    /// completes cannot wedge later calls on its source.
+    /// The other two thirds of the ordering contract are not this
+    /// file's: the transport half (a `Reliable` stream releases in
+    /// sequence order, and the native ingress holds an out-of-order
+    /// frame rather than delivering past a gap) is witnessed in the
+    /// wire and RTC layers, and the bridge half (one task drains
+    /// the inbound receiver) is structural in `mesh_rpc.rs`. This
+    /// pins the piece that lives here: the fold neither reorders,
+    /// batches nor defers what it was handed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn server_fold_enters_handlers_in_delivery_order_per_source() {
+    async fn server_fold_disposes_of_one_sources_requests_in_delivery_order() {
+        const CALLS: u64 = 64;
+        const NODE_A: u64 = 0xA1;
+        const NODE_B: u64 = 0xB2;
+        const ORIGIN: u64 = 0xD1A9;
+        /// The fold's pinned "now". A deadline a minute behind it is
+        /// past the 10 s skew tolerance, so every REQUEST below
+        /// takes the synchronous refusal path.
+        const NOW_NS: u64 = 1_000_000_000_000;
+
+        type Disposed = Arc<Mutex<Vec<(u64, u64, RpcStatus)>>>;
+        let disposed: Disposed = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&disposed);
+        let emit: RpcResponseEmitter = Arc::new(
+            move |from_node, _session_id, _origin, call_id, resp: RpcResponsePayload| {
+                sink.lock().push((from_node, call_id, resp.status));
+            },
+        );
+        let mut fold = RpcServerFold::new(Arc::new(EchoHandler), emit).with_test_now_ns(NOW_NS);
+
+        for i in 0..CALLS {
+            for node in [NODE_A, NODE_B] {
+                let req = RpcRequestPayload {
+                    service: "ordered".to_string(),
+                    deadline_ns: NOW_NS - 60_000_000_000,
+                    flags: 0,
+                    headers: vec![],
+                    body: Bytes::from(format!("call-{i:04}")),
+                };
+                fold.apply_inbound(&inbound(node, rpc_request_event(ORIGIN, i, req).payload))
+                    .expect("the fold accepts a well-formed REQUEST");
+            }
+        }
+
+        let log = disposed.lock().clone();
+        assert_eq!(
+            log.len(),
+            (CALLS * 2) as usize,
+            "every frame must be disposed of before `apply_inbound` returns — \
+             nothing here is allowed to wait on a task; log={log:?}"
+        );
+        let want: Vec<u64> = (0..CALLS).collect();
+        for node in [NODE_A, NODE_B] {
+            let seen: Vec<u64> = log
+                .iter()
+                .filter(|(n, _, _)| *n == node)
+                .map(|(_, call_id, _)| *call_id)
+                .collect();
+            assert_eq!(
+                seen, want,
+                "source {node:#x} was dispatched out of delivery order"
+            );
+        }
+        assert!(
+            log.iter()
+                .all(|(_, _, status)| *status == RpcStatus::Timeout),
+            "the synchronous refusal is what this measures; log={log:?}"
+        );
+        assert!(
+            fold.in_flight_keys().is_empty(),
+            "an inline refusal registers no call"
+        );
+    }
+
+    /// The other half, and the reason handler ENTRY is not ordered:
+    /// one source's handlers run **concurrently**, so a slow or
+    /// parked call never holds its successors.
+    ///
+    /// Every handler parks on a zero-permit semaphore after
+    /// recording that it started, so a handler can only have
+    /// started while all of its predecessors were still inside
+    /// their bodies. All `2 × CALLS` are in there at once — which
+    /// is also the statement that a handler which never completes
+    /// cannot wedge later calls from its source. This is what the
+    /// removed per-source entry chain put at risk: a chained
+    /// successor could not be polled until its predecessor's first
+    /// poll returned, and a ready `.await` is not a yield.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_fold_runs_one_sources_handlers_concurrently() {
         const CALLS: u64 = 64;
         const NODE_A: u64 = 0xA1;
         const NODE_B: u64 = 0xB2;
@@ -5544,7 +5542,7 @@ mod tests {
         let release = Arc::new(tokio::sync::Semaphore::new(0));
         let (emit, captured) = capturing_emitter();
         let mut fold = RpcServerFold::new(
-            Arc::new(EntryOrderHandler {
+            Arc::new(ParkingHandler {
                 entered: Arc::clone(&entered),
                 parked: Arc::clone(&parked),
                 peak_parked: Arc::clone(&peak_parked),
@@ -5574,28 +5572,15 @@ mod tests {
                 Duration::from_secs(20)
             )
             .await,
-            "only {} of {want_entries} handlers entered",
+            "only {} of {want_entries} handlers started",
             entered.lock().len()
         );
-        let log = entered.lock().clone();
-        let want: Vec<String> = (0..CALLS).map(|i| format!("call-{i:04}")).collect();
-        for node in [NODE_A, NODE_B] {
-            let seen: Vec<String> = log
-                .iter()
-                .filter(|(n, _)| *n == node)
-                .map(|(_, body)| body.clone())
-                .collect();
-            assert_eq!(
-                seen, want,
-                "source {node:#x} entered its handlers out of delivery order"
-            );
-        }
         assert_eq!(
             peak_parked.load(Ordering::SeqCst),
             want_entries,
-            "entry ordering serialized handler EXECUTION: only {} handler(s) were ever \
-             running at once, so a call entered after a predecessor had finished rather \
-             than alongside it",
+            "handler execution was serialized: only {} handler(s) were ever \
+             running at once, so a call started after a predecessor had \
+             finished rather than alongside it",
             peak_parked.load(Ordering::SeqCst)
         );
 
@@ -5608,6 +5593,109 @@ mod tests {
             )
             .await,
             "only {} of {want_entries} responses were emitted",
+            captured.lock().len()
+        );
+        assert!(fold.in_flight_keys().is_empty());
+    }
+
+    /// **The hazard the removed entry chain created, as a test.** A
+    /// handler whose FIRST POLL is long must not delay the next call
+    /// from the same source.
+    ///
+    /// This is the case the parked-handler witness above cannot see.
+    /// The chain passed its baton when the predecessor's first poll
+    /// *returned*, and a handler that parks on a semaphore returns
+    /// `Pending` almost immediately — so parked handlers looked
+    /// concurrent while a handler that computes (or blocks) before
+    /// its first await held every successor from its source for as
+    /// long as it ran. A ready `.await` is not a yield, so "put the
+    /// slow work after an await" was never a defence either.
+    ///
+    /// Handler A's body runs `std::ready(()).await` — a completed
+    /// future, which does NOT return control to the executor — and
+    /// then blocks its worker on a channel until the test releases
+    /// it. So A's first poll is still in progress, on this runtime's
+    /// worker, while the test waits for B. B must enter anyway. The
+    /// release always fires, so a failure reports rather than hangs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_long_first_poll_does_not_delay_its_sources_successors() {
+        const NODE: u64 = 0xA1;
+        const ORIGIN: u64 = 0xD1A9;
+
+        struct BlockingFirstPoll {
+            entered: EntryLog,
+            hold: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+        }
+        #[async_trait::async_trait]
+        impl RpcHandler for BlockingFirstPoll {
+            async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+                let body = String::from_utf8_lossy(&ctx.payload.body).into_owned();
+                self.entered.lock().push((ctx.session_peer, body.clone()));
+                if body == "slow" {
+                    // A ready await: polls through without yielding.
+                    std::future::ready(()).await;
+                    // Now occupy this worker, inside the first poll.
+                    let hold = self.hold.lock().take().expect("one slow call");
+                    let _ = hold.recv();
+                }
+                Ok(RpcResponsePayload {
+                    status: RpcStatus::Ok,
+                    headers: vec![],
+                    body: ctx.payload.body,
+                })
+            }
+        }
+
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        let entered: EntryLog = Arc::new(Mutex::new(Vec::new()));
+        let (emit, captured) = capturing_emitter();
+        let mut fold = RpcServerFold::new(
+            Arc::new(BlockingFirstPoll {
+                entered: Arc::clone(&entered),
+                hold: Mutex::new(Some(hold)),
+            }),
+            emit,
+        );
+
+        for (call_id, body) in [(1u64, "slow"), (2, "after")] {
+            let req = RpcRequestPayload {
+                service: "ordered".to_string(),
+                deadline_ns: 0,
+                flags: 0,
+                headers: vec![],
+                body: Bytes::from(body),
+            };
+            fold.apply_inbound(&inbound(
+                NODE,
+                rpc_request_event(ORIGIN, call_id, req).payload,
+            ))
+            .expect("the fold accepts a well-formed REQUEST");
+        }
+
+        let successor_entered = wait_until(
+            || {
+                entered
+                    .lock()
+                    .iter()
+                    .any(|(_, body)| body.as_str() == "after")
+            },
+            Duration::from_secs(10),
+        )
+        .await;
+        // Unconditional: a failed assertion must not leave a worker
+        // blocked for the rest of the suite.
+        let _ = release.send(());
+        assert!(
+            successor_entered,
+            "the successor never entered while its predecessor's first poll \
+             was still running: one source's calls are serialized on their \
+             synchronous prefix, which is the head-of-line effect the \
+             per-source entry chain introduced; entered={:?}",
+            entered.lock().clone()
+        );
+        assert!(
+            wait_until(|| captured.lock().len() == 2, Duration::from_secs(20)).await,
+            "only {} of 2 responses were emitted",
             captured.lock().len()
         );
         assert!(fold.in_flight_keys().is_empty());
