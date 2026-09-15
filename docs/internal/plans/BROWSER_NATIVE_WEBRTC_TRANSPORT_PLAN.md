@@ -2512,6 +2512,25 @@ iterator lifetime (pre-existing); whether multi-fragment
 interoperability in both directions is a Stage 5 contract or an
 explicit bound.
 
+**Fourth repair round delivered (`ae690a8c5`…`e342007a0`, 2026-09-15);
+forwarded to Kyra; product owner authorizes Stage 6 on top.** First
+commit corrects the N4 attribution ("that decision was mine, not the
+owner's"). Then: Kyra's 12 round-3 probes verbatim; **one signalled
+mode boundary** (stamped by the leaf and now read by wire accounting,
+the consumer cursor and every producer — R3-1..4); lifetime-owned
+credit for implicit streams and full-width debt settlement (R3-5/6);
+RPC classification from plane ownership (R3-7); native abandonment
+reaching a real consumer and retired lifetimes that cannot be revived
+(NR2/3/4/6); L5 stamps retired with their owner; the nRPC
+handler-entry serialization **removed** with ordering measured where
+Net promises it; Go `-118` arm and a readable limit; the ungated
+native names pinned and three stale floors raised; §13 with raw
+receipts, naming two self-inflicted regressions the round found and
+fixed. Reviewer quick verification: all 42 reviewer probes green as
+committed; leaf 249; eleven RTC binaries 126/126 at retries 0. CI at
+`e342007a0` pending. Stage 6 brief: `spikes/S6_BRIEF.md`. Owner
+questions remain open as stated in §12.1/§12.2/§13.
+
 ## Stage 6 — Browser ↔ browser direct, NAT conformance, telemetry, demo
 
 - §9 end to end; `RtcStats`; browser network-change retry trigger; per-pair
