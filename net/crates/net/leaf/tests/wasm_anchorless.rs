@@ -41,9 +41,9 @@
 
 #![cfg(all(target_arch = "wasm32", feature = "mock-control-plane"))]
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, VecDeque};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use bytes::Bytes;
 use net_leaf::bootstrap::gloo_timer_sleep;
@@ -113,12 +113,25 @@ fn leaf(
     let node_id = identity.node_id();
     let node = LeafNode::new(identity, 0x5000 | u64::from(entity_secret[0]));
     let inbox: Rc<RefCell<VecDeque<(NodeId, Bytes)>>> = Rc::new(RefCell::new(VecDeque::new()));
-    let sink = Rc::clone(&inbox);
+    let sink_inbox = Rc::clone(&inbox);
+    // **The sink delivers as well as queues.** It reaches the leaf
+    // through a `Weak` installed once the leaf exists — the shape
+    // the bindgen surface's own inbound sink uses, and for the
+    // reason it documents: a datagram that only sat in a queue
+    // until the next tick was acknowledged one tick late, and the
+    // sender read the ack one tick later still, so its 50 ms RTO
+    // always expired first. See [`Leaf::deliver`].
+    let me: Rc<RefCell<Weak<Leaf>>> = Rc::new(RefCell::new(Weak::new()));
+    let sink_me = Rc::clone(&me);
     let transport = RtcLeafTransport::new(Rc::new(move |peer, bytes| {
-        sink.borrow_mut().push_back((peer, bytes));
+        sink_inbox.borrow_mut().push_back((peer, bytes));
+        let arrived_at = sink_me.borrow().upgrade();
+        if let Some(leaf) = arrived_at {
+            leaf.deliver_on_arrival();
+        }
     }));
     let control = mesh.admit(node_id, label);
-    Rc::new(Leaf {
+    let leaf = Rc::new(Leaf {
         label,
         role,
         node: RefCell::new(node),
@@ -126,7 +139,9 @@ fn leaf(
         control,
         inbox,
         events: RefCell::new(Vec::new()),
-    })
+    });
+    *me.borrow_mut() = Rc::downgrade(&leaf);
+    leaf
 }
 
 impl Leaf {
@@ -238,45 +253,85 @@ impl Leaf {
             .expect("the carrier carries signalling");
     }
 
-    /// Feed the transport's inbound queue to the node and put
-    /// everything the node produced on the wire.
+    /// Deliver everything that has arrived, and put back on the
+    /// wire whatever the node produced in answer.
+    ///
+    /// **This is the arrival path, and it does not wait for the
+    /// ticker.** What an inbound reliable packet owes its sender is
+    /// a cumulative acknowledgement, and `ReliableStream`'s initial
+    /// RTO is 50 ms — the same order as this fixture's tick. A
+    /// fixture that merely queued on arrival and delivered on the
+    /// next tick therefore put one tick between a packet arriving
+    /// and its ack leaving, and a second tick before the sender
+    /// could read that ack: the sender's RTO always expired first,
+    /// so **every** reliable packet was retransmitted once and the
+    /// peer correctly dropped the duplicate and counted it. That
+    /// drop was the wire telling the truth about a transport this
+    /// fixture had invented. The bindgen surface's inbound sink
+    /// delivers on arrival for exactly this reason — the RTO
+    /// arithmetic is written out at `wasm.rs`'s sink — so the
+    /// witness models the same transport rather than a slower one.
     ///
     /// The handshake arm is the browser ↔ browser half that no
     /// anchored path needed: whichever leaf is the responder answers
     /// message 1 with its own Noise static key.
-    fn pump(&self) {
+    fn deliver(&self) {
         let now = clock::now();
         loop {
             let next = self.inbox.borrow_mut().pop_front();
             let Some((from, bytes)) = next else { break };
             let handshake = is_handshake_packet(&bytes);
-            let mut node = self.node.borrow_mut();
-            if handshake && !node.has_session(from) {
-                match self.role {
-                    Role::Responder => {
-                        let slot = self.transport.next_slot();
-                        let msg2 = node
-                            .accept_handshake(from, &PSK, &bytes, slot)
-                            .expect("the responder half completes on message 1");
-                        drop(node);
-                        self.transport
-                            .send(from, msg2)
-                            .expect("message 2 goes out on the open channel");
+            // The borrow ends with this block, so nothing is held
+            // across the `send` below.
+            let answer = {
+                let mut node = self.node.borrow_mut();
+                if handshake && !node.has_session(from) {
+                    match self.role {
+                        Role::Responder => {
+                            let slot = self.transport.next_slot();
+                            Some(
+                                node.accept_handshake(from, &PSK, &bytes, slot)
+                                    .expect("the responder half completes on message 1"),
+                            )
+                        }
+                        Role::Initiator => {
+                            node.complete_handshake(from, &bytes)
+                                .expect("the initiator installs the session from message 2");
+                            None
+                        }
                     }
-                    Role::Initiator => node
-                        .complete_handshake(from, &bytes)
-                        .expect("the initiator installs the session from message 2"),
+                } else {
+                    node.on_datagram(from, bytes, now);
+                    None
                 }
-                continue;
+            };
+            if let Some(msg2) = answer {
+                self.transport
+                    .send(from, msg2)
+                    .expect("message 2 goes out on the open channel");
             }
-            node.on_datagram(from, bytes, now);
         }
+        self.flush();
+    }
 
-        let outbound = {
-            let mut node = self.node.borrow_mut();
-            node.tick(now);
-            node.take_outbound()
-        };
+    /// [`Self::deliver`], called from the inbound sink.
+    ///
+    /// A datagram that arrives while something already holds the
+    /// node is left in the queue for whoever holds it — the same
+    /// disposition the surface's sink reaches with its
+    /// `try_borrow_mut`. Single-threaded: nothing can take the
+    /// borrow between the probe and the delivery.
+    fn deliver_on_arrival(&self) {
+        let idle = self.node.try_borrow_mut().is_ok();
+        if idle {
+            self.deliver();
+        }
+    }
+
+    /// Everything the node queued, on the wire; everything it
+    /// surfaced, in `events`.
+    fn flush(&self) {
+        let outbound = self.node.borrow_mut().take_outbound();
         for out in outbound {
             self.transport
                 .send(out.peer, out.packet)
@@ -284,6 +339,34 @@ impl Leaf {
         }
         let mut drained = self.node.borrow_mut().drain_events();
         self.events.borrow_mut().append(&mut drained);
+    }
+
+    /// Deliver, then run the node's time-driven work — retransmit
+    /// timers, call deadlines, reassembly expiry — exactly the split
+    /// the surface's `Inner::pump` makes.
+    fn pump(&self) {
+        self.deliver();
+        self.node.borrow_mut().tick(clock::now());
+        self.flush();
+    }
+
+    /// Run one send-side operation and put what it queued on the
+    /// wire **at once**.
+    ///
+    /// Not a convenience. A reliable packet's retransmit timer
+    /// starts when the wire builds the packet, not when the driver
+    /// gets round to sending it, so a packet left sitting in
+    /// `take_outbound` until the next tick has already spent one
+    /// tick of its 50 ms RTO before existing on the wire — and the
+    /// peer's ack cannot come back inside what is left. Every entry
+    /// point on the bindgen surface flushes in exactly this place
+    /// (`with_node(..) { .. guard.pump() }` in `wasm.rs`), so a
+    /// witness that queued instead would be asserting about a
+    /// driver nothing ships.
+    fn send<T>(&self, work: impl FnOnce(&mut LeafNode) -> T) -> T {
+        let outcome = work(&mut self.node.borrow_mut());
+        self.flush();
+        outcome
     }
 
     /// Every stream or channel payload the node has surfaced.
@@ -365,15 +448,29 @@ async fn poll_until<T>(what: &str, mut ready: impl FnMut() -> Option<T>) -> T {
 /// Pump both leaves on a timer, the way the bindgen surface's ticker
 /// does, so a future that resolves on an inbound packet — an nRPC
 /// call's — can simply be awaited.
-fn start_ticker(left: Rc<Leaf>, right: Rc<Leaf>) {
+///
+/// Returns the switch that stops it, which the caller **must**
+/// throw. A `wasm_bindgen_test` panic aborts rather than unwinds, so
+/// a spawned pump that outlives its test keeps running — over leaves
+/// whose `RefCell` guards the abort never released — and re-borrows
+/// them inside whichever test happens to be running next, reporting
+/// one failure as two in a file the next reader has to untangle.
+#[must_use]
+fn start_ticker(left: Rc<Leaf>, right: Rc<Leaf>) -> Rc<Cell<bool>> {
+    let stop = Rc::new(Cell::new(false));
+    let stopped = Rc::clone(&stop);
     wasm_bindgen_futures::spawn_local(async move {
         let ticks = DEADLINE_MS / TICK_MS;
         for _ in 0..ticks {
             gloo_timer_sleep(TICK_MS).await.ok();
+            if stopped.get() {
+                return;
+            }
             left.pump();
             right.pump();
         }
     });
+    stop
 }
 
 /// The server half of one nRPC call, which a leaf does not have.
@@ -499,13 +596,9 @@ async fn two_leaves_reach_one_direct_session_through_a_carrier_that_relays_no_pa
 
     // ── The session is real, part 1: a reliable round trip. ───────
     let out = a
-        .node
-        .borrow_mut()
-        .open_stream(bn, "pingpong", Reliability::Reliable, None, None)
+        .send(|node| node.open_stream(bn, "pingpong", Reliability::Reliable, None, None))
         .expect("A opens a reliable stream");
-    a.node
-        .borrow_mut()
-        .stream_send(out, b"ping over a direct browser-to-browser session")
+    a.send(|node| node.stream_send(out, b"ping over a direct browser-to-browser session"))
         .expect("A sends");
 
     settle_until(&a, &b, "B receiving A's reliable payload", || {
@@ -517,13 +610,9 @@ async fn two_leaves_reach_one_direct_session_through_a_carrier_that_relays_no_pa
     .await;
 
     let back = b
-        .node
-        .borrow_mut()
-        .open_stream(an, "pingpong", Reliability::Reliable, None, None)
+        .send(|node| node.open_stream(an, "pingpong", Reliability::Reliable, None, None))
         .expect("B opens a reliable stream");
-    b.node
-        .borrow_mut()
-        .stream_send(back, b"pong")
+    b.send(|node| node.stream_send(back, b"pong"))
         .expect("B answers");
 
     settle_until(&a, &b, "A receiving B's reply", || {
@@ -537,11 +626,9 @@ async fn two_leaves_reach_one_direct_session_through_a_carrier_that_relays_no_pa
     // ── The session is real, part 2: an nRPC call over it. ────────
     // From here a ticker pumps both leaves, exactly as the bindgen
     // surface's does, so the call's future can be awaited.
-    start_ticker(Rc::clone(&a), Rc::clone(&b));
+    let ticker = start_ticker(Rc::clone(&a), Rc::clone(&b));
     let call = a
-        .node
-        .borrow_mut()
-        .call(bn, "echo", b"ping", Some(10_000))
+        .send(|node| node.call(bn, "echo", b"ping", Some(10_000)))
         .expect("A calls B");
 
     let request = poll_until("B receiving the nRPC request frame", || {
@@ -579,9 +666,7 @@ async fn two_leaves_reach_one_direct_session_through_a_carrier_that_relays_no_pa
     // correctly ignored. The canonical route is
     // `<service>.replies.<caller origin>`, which is what the caller
     // subscribed to when it issued the call.
-    b.node
-        .borrow_mut()
-        .publish(an, &reply_channel, &reply)
+    b.send(|node| node.publish(an, &reply_channel, &reply))
         .expect("B answers the call");
 
     let body = call
@@ -593,6 +678,14 @@ async fn two_leaves_reach_one_direct_session_through_a_carrier_that_relays_no_pa
         b"pong",
         "the nRPC reply must arrive over the direct session"
     );
+
+    // The conversation is over, so the pump that was driving it
+    // stops before anything is counted: the accounting below is a
+    // statement about a quiesced session, and a `wasm_bindgen_test`
+    // panic aborts without running a single destructor, so a pump
+    // left spawned here would outlive this test and re-borrow these
+    // leaves inside the next one.
+    ticker.set(true);
 
     // ── The accounting the brief demands. ─────────────────────────
     let table = mesh.accounting_table();
@@ -631,23 +724,35 @@ async fn two_leaves_reach_one_direct_session_through_a_carrier_that_relays_no_pa
     // packet predates the session. `>=` rather than `==` because the
     // point is that traffic went direct, not how the wire chose to
     // batch it.
+    let (a_out, b_out) = (a.packets_out(), b.packets_out());
     assert!(
-        a.packets_out() >= 2 && b.packets_out() >= 2,
+        a_out >= 2 && b_out >= 2,
         "both leaves must have put real packets on the direct link \
-         (A: {}, B: {})",
-        a.packets_out(),
-        b.packets_out()
+         (A: {a_out}, B: {b_out})"
     );
+    let (a_in, b_in) = (a.packets_in(), b.packets_in());
     assert!(
-        a.packets_in() >= 2 && b.packets_in() >= 2,
-        "and both must have received them (A: {}, B: {})",
-        a.packets_in(),
-        b.packets_in()
+        a_in >= 2 && b_in >= 2,
+        "and both must have received them (A: {a_in}, B: {b_in})"
+    );
+    // Read out from under the borrow before the comparison: an
+    // assertion that fails while holding a `Ref` aborts with the
+    // guard still counted, and every later borrow of that cell —
+    // including the next test's — fails for a reason that has
+    // nothing to do with what it was testing.
+    let (a_drops, b_drops) = (
+        a.node.borrow().counters().total_drops(),
+        b.node.borrow().counters().total_drops(),
+    );
+    let (a_counters, b_counters) = (
+        a.node.borrow().counters().to_json(),
+        b.node.borrow().counters().to_json(),
     );
     assert_eq!(
-        a.node.borrow().counters().total_drops(),
-        0,
-        "nothing on the direct session should have been dropped"
+        (a_drops, b_drops),
+        (0, 0),
+        "nothing on the direct session should have been dropped, at either end\
+         \nA: {a_counters}\nB: {b_counters}"
     );
 }
 
