@@ -27,12 +27,18 @@
 //! ([`DropReason::FireAndForgetGap`]) so loss is measurable rather
 //! than invisible.
 //!
-//! The reliable buffer is **bounded**. A peer that withholds one
-//! sequence forever must not pin a browser tab's memory, so at
-//! [`MAX_REORDER_HELD`] held sequences the head gap is abandoned:
-//! the buffer releases from the lowest held sequence onwards and
-//! counts [`DropReason::ReorderBufferFull`]. Stalling forever and
-//! growing forever are both worse.
+//! The reliable buffer is **bounded**, and the bound is not a
+//! licence to lose data. A peer that withholds one sequence forever
+//! must not pin a browser tab's memory, so past
+//! [`MAX_REORDER_HELD`] held sequences the stream **fails**, typed
+//! ([`ReorderOverflow`], surfaced as
+//! [`StreamFailure::ReorderOverflow`](crate::node::StreamFailure::ReorderOverflow)):
+//! the consumer is told its reliable stream ended and which
+//! sequence was never filled. Releasing past the hole and counting
+//! it — what this did before — is silent loss on a stream whose
+//! whole contract is that nothing is lost, and a counter is not a
+//! disposition. Stalling forever, growing forever and lying are all
+//! worse than a terminal failure.
 
 use std::collections::BTreeMap;
 
@@ -126,8 +132,8 @@ pub const MAX_SEQUENCE_GAP: u64 = 65_536;
 ///
 /// The reorder buffer holds these rather than bare bytes: a packet
 /// released when a later arrival fills the gap keeps **its own**
-/// sequence, origin and channel, instead of borrowing the metadata
-/// of whichever packet happened to unblock it.
+/// sequence, origin, channel and subprotocol, instead of borrowing
+/// the metadata of whichever packet happened to unblock it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamRecord {
     /// The sequence this delivery owns — the first of its span.
@@ -138,12 +144,41 @@ pub struct StreamRecord {
     pub span: u64,
     /// The stream it belongs to.
     pub stream_id: u64,
+    /// The subprotocol that put it on this stream.
+    ///
+    /// Held with the record because dispatch is **deferred**: a
+    /// publication held behind a membership frame is released by
+    /// the membership frame's arrival, and dispatching the released
+    /// record under the arriving packet's subprotocol would decode
+    /// an application body as channel membership. One sequence
+    /// space, one cursor, and every record keeps its own plane.
+    pub subprotocol_id: u16,
     /// The publisher's full 64-bit origin hash.
     pub origin_hash: u64,
     /// The `u16` channel-hash hint from its header.
     pub channel_hash: u16,
     /// The events it carries.
     pub payloads: Vec<Bytes>,
+}
+
+/// A reliable stream whose reorder bound was exceeded with its head
+/// gap still unfilled — terminal.
+///
+/// The alternative disposition, kept honest: a reliable stream may
+/// **grow** its hold up to [`MAX_REORDER_HELD`] and it may
+/// back-pressure its sender by withholding credit, but once the
+/// bound is reached the two remaining choices are unbounded memory
+/// or an ended stream. Delivering the records behind the hole is not
+/// a third choice; it is reliable delivery with the reliability
+/// removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReorderOverflow {
+    /// The stream that ended.
+    pub stream_id: u64,
+    /// The sequence that was never filled — the head gap.
+    pub missing: u64,
+    /// How many records were being held when the bound went.
+    pub held: usize,
 }
 
 /// The consumer side of one inbound stream.
@@ -197,20 +232,31 @@ impl RxStream {
 
     /// Offer one delivery record.
     ///
-    /// Returns what is now deliverable, **in sequence order** — zero
-    /// entries when the record was held or dropped, more than one
-    /// when it filled a gap and released everything behind it. Each
-    /// returned record is the one that was buffered, carrying the
-    /// sequence and header it arrived with.
-    pub fn accept(&mut self, record: StreamRecord, counters: &LeafCounters) -> Vec<StreamRecord> {
+    /// `Ok` carries what is now deliverable, **in sequence order** —
+    /// zero entries when the record was held or dropped, more than
+    /// one when it filled a gap and released everything behind it.
+    /// Each returned record is the one that was buffered, carrying
+    /// the sequence, header and subprotocol it arrived with.
+    ///
+    /// `Err` is terminal: a reliable stream held
+    /// [`MAX_REORDER_HELD`] records and the head gap is still open,
+    /// so the stream ends rather than silently release past it. The
+    /// buffer is emptied with the error — the caller retires the
+    /// stream, and nothing is delivered out of order on the way out.
+    pub fn accept(
+        &mut self,
+        record: StreamRecord,
+        counters: &LeafCounters,
+    ) -> core::result::Result<Vec<StreamRecord>, ReorderOverflow> {
         let seq = record.seq;
+        let stream_id = record.stream_id;
         if self.already_owned(seq) {
             counters.drop_for(DropReason::DuplicateSequence);
-            return Vec::new();
+            return Ok(Vec::new());
         }
         if seq.saturating_sub(self.next_expected) > MAX_SEQUENCE_GAP {
             counters.drop_for(DropReason::SequenceGapTooLarge);
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         if seq > self.next_expected && !self.reliability.is_reliable() {
@@ -223,15 +269,18 @@ impl RxStream {
 
         self.held.insert(seq, record);
         if self.held.len() > MAX_REORDER_HELD {
-            // Abandon the head gap: release from the lowest held
-            // sequence rather than hold unboundedly.
-            if let Some(lowest) = self.held.keys().next().copied() {
-                counters.drop_n(
-                    DropReason::ReorderBufferFull,
-                    lowest.saturating_sub(self.next_expected),
-                );
-                self.next_expected = lowest;
-            }
+            // Structurally a reliable-only outcome: a
+            // fire-and-forget gap moves the cursor to the arriving
+            // sequence above, so its drain always empties the
+            // buffer and it holds nothing to overflow. Reaching
+            // here means a reliable head gap outlasted the bound.
+            let overflow = ReorderOverflow {
+                stream_id,
+                missing: self.next_expected,
+                held: self.held.len(),
+            };
+            self.held.clear();
+            return Err(overflow);
         }
 
         let mut out = Vec::new();
@@ -239,7 +288,7 @@ impl RxStream {
             self.next_expected = self.next_expected.saturating_add(record.span.max(1));
             out.push(record);
         }
-        out
+        Ok(out)
     }
 }
 
@@ -252,10 +301,17 @@ mod tests {
             seq,
             span: 1,
             stream_id: LEAF_STREAM_DISCRIMINATOR | 1,
+            subprotocol_id: 0,
             origin_hash: 0xA1 + seq,
             channel_hash: tag as u16,
             payloads: vec![Bytes::from(vec![tag])],
         }
+    }
+
+    /// Every accept below is on a stream that must not overflow;
+    /// the one that must is asserted on directly.
+    fn ok(out: core::result::Result<Vec<StreamRecord>, ReorderOverflow>) -> Vec<StreamRecord> {
+        out.expect("this schedule must not overflow the reorder bound")
     }
 
     fn tags(records: &[StreamRecord]) -> Vec<u8> {
@@ -270,11 +326,14 @@ mod tests {
         let c = LeafCounters::new();
         let mut s = RxStream::new(Reliability::Reliable);
 
-        assert!(s.accept(rec(2, 2), &c).is_empty(), "2 waits for 0 and 1");
-        assert!(s.accept(rec(1, 1), &c).is_empty(), "1 waits for 0");
+        assert!(
+            ok(s.accept(rec(2, 2), &c)).is_empty(),
+            "2 waits for 0 and 1"
+        );
+        assert!(ok(s.accept(rec(1, 1), &c)).is_empty(), "1 waits for 0");
         assert_eq!(s.held(), 2);
 
-        let released = s.accept(rec(0, 0), &c);
+        let released = ok(s.accept(rec(0, 0), &c));
         assert_eq!(
             released
                 .iter()
@@ -297,11 +356,11 @@ mod tests {
     fn a_reliable_stream_holds_a_gap_rather_than_delivering_past_it() {
         let c = LeafCounters::new();
         let mut s = RxStream::new(Reliability::Reliable);
-        assert_eq!(tags(&s.accept(rec(0, 0), &c)), vec![0]);
-        assert!(s.accept(rec(2, 2), &c).is_empty());
-        assert!(s.accept(rec(3, 3), &c).is_empty());
+        assert_eq!(tags(&ok(s.accept(rec(0, 0), &c))), vec![0]);
+        assert!(ok(s.accept(rec(2, 2), &c)).is_empty());
+        assert!(ok(s.accept(rec(3, 3), &c)).is_empty());
         assert_eq!(s.next_expected(), 1, "the stream is waiting for 1");
-        assert_eq!(tags(&s.accept(rec(1, 1), &c)), vec![1, 2, 3]);
+        assert_eq!(tags(&ok(s.accept(rec(1, 1), &c))), vec![1, 2, 3]);
     }
 
     /// Fire-and-forget's whole point: a gap does not stall.
@@ -309,9 +368,9 @@ mod tests {
     fn fire_and_forget_skips_a_gap_and_counts_every_lost_sequence() {
         let c = LeafCounters::new();
         let mut s = RxStream::new(Reliability::FireAndForget);
-        assert_eq!(tags(&s.accept(rec(0, 0), &c)), vec![0]);
+        assert_eq!(tags(&ok(s.accept(rec(0, 0), &c))), vec![0]);
 
-        let out = s.accept(rec(4, 4), &c);
+        let out = ok(s.accept(rec(4, 4), &c));
         assert_eq!(
             tags(&out),
             vec![4],
@@ -330,10 +389,10 @@ mod tests {
     fn a_late_arrival_after_a_fire_and_forget_skip_is_dropped_as_a_duplicate() {
         let c = LeafCounters::new();
         let mut s = RxStream::new(Reliability::FireAndForget);
-        s.accept(rec(0, 0), &c);
-        s.accept(rec(4, 4), &c);
+        ok(s.accept(rec(0, 0), &c));
+        ok(s.accept(rec(4, 4), &c));
         assert!(
-            s.accept(rec(2, 2), &c).is_empty(),
+            ok(s.accept(rec(2, 2), &c)).is_empty(),
             "a sequence the stream already skipped past cannot be delivered"
         );
         assert_eq!(c.drops(DropReason::DuplicateSequence), 1);
@@ -343,46 +402,53 @@ mod tests {
     fn a_retransmitted_duplicate_is_delivered_once() {
         let c = LeafCounters::new();
         let mut s = RxStream::new(Reliability::Reliable);
-        assert_eq!(tags(&s.accept(rec(0, 0), &c)), vec![0]);
+        assert_eq!(tags(&ok(s.accept(rec(0, 0), &c))), vec![0]);
         assert!(
-            s.accept(rec(0, 0), &c).is_empty(),
+            ok(s.accept(rec(0, 0), &c)).is_empty(),
             "the same sequence must never be delivered twice"
         );
         assert_eq!(c.drops(DropReason::DuplicateSequence), 1);
 
         // A duplicate of a HELD (not yet delivered) sequence too.
-        assert!(s.accept(rec(2, 2), &c).is_empty());
-        assert!(s.accept(rec(2, 2), &c).is_empty());
+        assert!(ok(s.accept(rec(2, 2), &c)).is_empty());
+        assert!(ok(s.accept(rec(2, 2), &c)).is_empty());
         assert_eq!(c.drops(DropReason::DuplicateSequence), 2);
     }
 
-    /// The bound: hold, but not forever.
+    /// The bound: hold, but not forever — and not by releasing past
+    /// the hole either. A reliable stream that reaches the bound
+    /// **ends**, and says which sequence it never got.
     #[test]
-    fn a_reliable_stream_abandons_its_head_gap_at_the_buffer_bound() {
+    fn a_reliable_stream_fails_typed_at_the_buffer_bound_rather_than_losing_its_head_gap() {
         let c = LeafCounters::new();
         let mut s = RxStream::new(Reliability::Reliable);
         // Sequence 0 never arrives; 1..=MAX_REORDER_HELD do.
         for seq in 1..=MAX_REORDER_HELD as u64 {
-            assert!(s.accept(rec(seq, 1), &c).is_empty(), "seq {seq} must hold");
+            assert!(
+                ok(s.accept(rec(seq, 1), &c)).is_empty(),
+                "seq {seq} must hold"
+            );
         }
         assert_eq!(s.held(), MAX_REORDER_HELD);
         assert_eq!(s.next_expected(), 0, "still waiting for 0");
         assert_eq!(c.total_drops(), 0);
 
-        // One more, and the head gap is abandoned.
-        let released = s.accept(rec(MAX_REORDER_HELD as u64 + 1, 2), &c);
+        // One more, and the stream is over. Nothing behind the hole
+        // is delivered: that would be silent loss on a reliable
+        // stream, which is what a counter used to paper over.
+        let overflow = s
+            .accept(rec(MAX_REORDER_HELD as u64 + 1, 2), &c)
+            .expect_err("exceeding the bound with an open head gap must be terminal");
         assert_eq!(
-            released.len(),
-            MAX_REORDER_HELD + 1,
-            "abandoning the gap must release the whole buffer"
+            overflow,
+            ReorderOverflow {
+                stream_id: LEAF_STREAM_DISCRIMINATOR | 1,
+                missing: 0,
+                held: MAX_REORDER_HELD + 1,
+            },
+            "the failure must name the sequence that was never filled"
         );
-        assert_eq!(
-            c.drops(DropReason::ReorderBufferFull),
-            1,
-            "exactly the one abandoned sequence (0) is counted"
-        );
-        assert_eq!(s.held(), 0);
-        assert_eq!(s.next_expected(), MAX_REORDER_HELD as u64 + 2);
+        assert_eq!(s.held(), 0, "the buffer is released with the failure");
     }
 
     #[test]

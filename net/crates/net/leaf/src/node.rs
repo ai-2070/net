@@ -108,7 +108,7 @@ pub enum LeafEvent {
     },
 }
 
-/// Which end of a reliable stream gave up.
+/// Which end of a reliable stream gave up, and how.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamFailure {
     /// This leaf resent a packet `max_retries` times and the peer
@@ -117,6 +117,26 @@ pub enum StreamFailure {
     /// The peer sent a `StreamReset`: its own retransmits are
     /// exhausted, so the rest of the stream is never coming.
     PeerReset,
+    /// This leaf held [`MAX_REORDER_HELD`](crate::stream::MAX_REORDER_HELD)
+    /// records on a reliable stream and the head gap was still
+    /// open.
+    ///
+    /// The bound is memory, and memory is finite; what is *not*
+    /// forced is releasing the records behind the hole and moving a
+    /// counter, which is silent loss on the one stream mode whose
+    /// contract is that nothing is lost. So the receive half ends
+    /// here, typed, naming the stream.
+    ///
+    /// **No RESET is sent for this.** A `StreamReset` means "my
+    /// send half gave up", and its receiver answers by resetting
+    /// its own receive cursor to zero so the sender can restart the
+    /// id — send it for a receive-side failure and the peer would
+    /// re-accept sequences it had already delivered on a stream
+    /// this leaf is still sending on. The sender learns instead
+    /// from the fact it is holding: the head gap it never got an
+    /// ack for is exactly the packet its own retransmit loop
+    /// exhausts and RESETs.
+    ReorderOverflow,
 }
 
 impl StreamFailure {
@@ -125,6 +145,7 @@ impl StreamFailure {
         match self {
             Self::RetransmitsExhausted => "retransmits_exhausted",
             Self::PeerReset => "peer_reset",
+            Self::ReorderOverflow => "reorder_overflow",
         }
     }
 }
@@ -199,10 +220,24 @@ pub struct Outbound {
 }
 
 /// An open application stream's parameters.
+///
+/// **The handle carries the incarnation it was opened on**, and
+/// [`LeafNode::stream_send`] / [`LeafNode::close_stream`] refuse a
+/// handle whose incarnation is not the peer's current session. A
+/// replacement retires the predecessor's receive cursors, partial
+/// reassemblies and pending calls, but it cannot reach into a
+/// `StreamHandle` the caller already holds: a value is not a table
+/// entry. Without the fence, a stale handle's `stream_send`
+/// resolved the peer's *current* session and pushed application
+/// bytes onto a stream the far end never opened under that
+/// incarnation — the same alias the native R12 fix closed by
+/// binding session incarnation into the native handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamHandle {
     /// The peer.
     pub peer: NodeId,
+    /// The incarnation of the session this stream was opened on.
+    pub incarnation: u64,
     /// The wire stream id.
     pub stream_id: u64,
     /// The `u16` channel hint stamped on its packets.
@@ -284,6 +319,38 @@ pub struct LeafNode {
     /// only correct cadence; cleared for a peer when its session
     /// goes, because the anchor's roster entry goes with it.
     reply_subscriptions: std::collections::HashSet<(NodeId, u64)>,
+    /// `(incarnation, stream id)` whose **send** half this leaf gave
+    /// up on, and will not send on again.
+    ///
+    /// **A `StreamFailed` event is a notification, not retirement.**
+    /// When this leaf's retransmits are exhausted it sends a RESET
+    /// and the wire drops the given-up packet — but `next_tx_seq`
+    /// does not rewind, and the peer answers a RESET by resetting
+    /// its *receive* half to sequence zero
+    /// (`NetSession::reset_rx_stream`, the same thing this leaf
+    /// does). So the next byte pushed onto that id would arrive as
+    /// sequence *K* against a cursor expecting zero: a K-deep hole
+    /// the peer NACKs for sequences that were never lost, behind
+    /// which nothing is delivered. The disposition is therefore
+    /// explicit rather than assumed: the id is terminal for this
+    /// incarnation, handle-addressed send and close refuse typed,
+    /// [`Self::open_stream`] refuses to hand out a fresh handle for
+    /// it, and a new session is what makes the id usable again —
+    /// which is what [`Self::retire_incarnation`] clears it for.
+    send_failed: std::collections::HashSet<(u64, u64)>,
+    /// `(incarnation, stream id)` whose **receive** half this leaf
+    /// gave up on, and will not reassemble again.
+    ///
+    /// Set only by a reliable reorder overflow
+    /// ([`StreamFailure::ReorderOverflow`]). Without it the
+    /// consumer's failure would not be terminal: the very next
+    /// arrival would build a fresh `RxStream` at sequence zero,
+    /// hold the same 64 records against the same unfillable hole
+    /// and fail again, once per bound, forever. Further arrivals
+    /// are dropped and counted instead. A peer RESET **clears**
+    /// it — that is the peer's send half restarting, which is
+    /// exactly the case a new receive cursor is correct for.
+    recv_failed: std::collections::HashSet<(u64, u64)>,
 }
 
 impl LeafNode {
@@ -311,6 +378,8 @@ impl LeafNode {
             peer_rtc_addr: HashMap::new(),
             next_nonce: 1,
             reply_subscriptions: std::collections::HashSet::new(),
+            send_failed: std::collections::HashSet::new(),
+            recv_failed: std::collections::HashSet::new(),
             delegation_chain: None,
         }
     }
@@ -464,6 +533,8 @@ impl LeafNode {
         self.rx_streams.retain(|(i, _), _| *i != incarnation);
         self.grants_sent.retain(|(i, _), _| *i != incarnation);
         self.acks_sent.retain(|(i, _), _| *i != incarnation);
+        self.send_failed.retain(|(i, _)| *i != incarnation);
+        self.recv_failed.retain(|(i, _)| *i != incarnation);
         self.reassembler.retire(incarnation);
         self.calls.fail_incarnation(incarnation);
     }
@@ -547,6 +618,7 @@ impl LeafNode {
             let mut queued: Vec<Bytes> = session.due_retransmits();
             let failed = session.wire().take_failed_stream_ids();
             let nacks = session.gap_nacks();
+            let incarnation = session.incarnation();
             let origin = self.identity.origin_hash();
             for stream_id in &failed {
                 if let Ok(packets) = session.build_packets(
@@ -580,6 +652,11 @@ impl LeafNode {
                 self.outbound.push_back(Outbound { peer, packet });
             }
             for stream_id in failed {
+                // Terminal, not merely reported: the RESET queued
+                // above tells the peer to reset its receive cursor
+                // for this id, and `next_tx_seq` does not rewind to
+                // match it.
+                self.send_failed.insert((incarnation, stream_id));
                 self.counters.drop_for(DropReason::StreamFailed);
                 self.events.push(LeafEvent::StreamFailed {
                     peer_node: peer,
@@ -704,6 +781,17 @@ impl LeafNode {
     /// the caller must match a specific publish contract — which is
     /// how a stream's payload reaches a native node's real handler
     /// rather than only moving a counter.
+    ///
+    /// The returned handle is **scoped to the session that is
+    /// current now**: it carries that session's incarnation, and
+    /// [`Self::stream_send`] refuses it once the peer's session has
+    /// been replaced. An unfenced id-addressed send is a different
+    /// operation and is not what this returns.
+    ///
+    /// Refuses an id whose send half already failed terminally on
+    /// this session — its sequence space cannot rewind to meet the
+    /// peer's reset receive cursor, so a handle for it would be a
+    /// handle onto a stream that cannot deliver.
     pub fn open_stream(
         &mut self,
         peer: NodeId,
@@ -712,10 +800,16 @@ impl LeafNode {
         stream_id: Option<u64>,
         channel_hash: Option<u16>,
     ) -> Result<StreamHandle> {
-        if self.sessions.get(peer).is_none() {
+        let Some(incarnation) = self.sessions.get(peer).map(|s| s.incarnation()) else {
             return Err(LeafError::Session(format!("no session with {peer:#x}")));
-        }
+        };
         let stream_id = stream_id.unwrap_or_else(|| stream_id_from_label(label));
+        if self.send_failed.contains(&(incarnation, stream_id)) {
+            return Err(LeafError::Session(format!(
+                "stream {stream_id:#x} on the session with {peer:#x} failed terminally \
+                 (incarnation {incarnation}); reconnect or use another stream id"
+            )));
+        }
         // The registry is what the receive path classifies on: an
         // id this leaf opened as a stream is a stream, whatever
         // bits its hash happens to carry.
@@ -723,6 +817,7 @@ impl LeafNode {
             .insert((peer, stream_id), StreamKind::Stream);
         Ok(StreamHandle {
             peer,
+            incarnation,
             stream_id,
             channel_hash: channel_hash.unwrap_or(0),
             reliability,
@@ -730,7 +825,14 @@ impl LeafNode {
     }
 
     /// Send on an open stream.
+    ///
+    /// Refuses a handle opened on a session that has since been
+    /// replaced, and a stream whose send half failed terminally.
+    /// Both refusals are typed and nothing is queued — the caller
+    /// holding a stale value learns it now rather than having its
+    /// bytes land on the successor's stream.
     pub fn stream_send(&mut self, handle: StreamHandle, payload: &[u8]) -> Result<()> {
+        self.check_handle(handle)?;
         self.send_event_plane(
             handle.peer,
             handle.stream_id,
@@ -738,6 +840,51 @@ impl LeafNode {
             payload,
             handle.reliability.is_reliable(),
         )
+    }
+
+    /// Close an open stream: drop this leaf's per-stream receive
+    /// state and its stream registration.
+    ///
+    /// Fenced exactly like [`Self::stream_send`], and for the same
+    /// reason — a stale handle must not retire the successor's
+    /// stream state. Nothing goes on the wire: one DataChannel
+    /// carries every stream and the peer's half is its own to
+    /// close.
+    pub fn close_stream(&mut self, handle: StreamHandle) -> Result<()> {
+        self.check_handle(handle)?;
+        self.rx_streams
+            .remove(&(handle.incarnation, handle.stream_id));
+        self.stream_kinds.remove(&(handle.peer, handle.stream_id));
+        Ok(())
+    }
+
+    /// The fence both handle-addressed operations share.
+    ///
+    /// A `StreamHandle` is a value the caller keeps. Replacement
+    /// retires the predecessor's tables, but it cannot reach a
+    /// value already handed out, so the check belongs where the
+    /// handle is *used*: the incarnation it was opened on must
+    /// still be the peer's current session.
+    fn check_handle(&self, handle: StreamHandle) -> Result<()> {
+        let current = self
+            .sessions
+            .get(handle.peer)
+            .map(|s| s.incarnation())
+            .ok_or_else(|| LeafError::Session(format!("no session with {:#x}", handle.peer)))?;
+        if current != handle.incarnation {
+            return Err(LeafError::Session(format!(
+                "stale stream handle: opened on incarnation {} of the session with {:#x}, \
+                 which now holds incarnation {current}; reopen the stream",
+                handle.incarnation, handle.peer
+            )));
+        }
+        if self.send_failed.contains(&(current, handle.stream_id)) {
+            return Err(LeafError::Session(format!(
+                "stream {:#x} failed terminally on this session (incarnation {current})",
+                handle.stream_id
+            )));
+        }
+        Ok(())
     }
 
     /// Make an nRPC call. The future resolves to the reply body or a
@@ -782,6 +929,11 @@ impl LeafNode {
             .incarnation();
         let reply_route =
             Channel::from_name(reply_channel(service, self.identity.origin_hash())?).canonical();
+        // The channel the reply must ride, as a stream id: the same
+        // derivation the publisher uses for that channel name, so
+        // the expected carrier is computed from the reply channel
+        // this leaf subscribed to and never taken from the frame.
+        let carrier_stream_id = route_stream_id(reply_route);
 
         let timeout_ms = timeout_ms.unwrap_or(DEFAULT_CALL_TIMEOUT_MS);
         let (call_id, receiver) = self
@@ -791,6 +943,7 @@ impl LeafNode {
                     peer,
                     incarnation,
                     reply_route,
+                    carrier_stream_id,
                 },
                 route,
                 timeout_ms,
@@ -1024,6 +1177,40 @@ impl LeafNode {
         let incarnation = session.incarnation();
         let subprotocol_id = opened.subprotocol_id;
 
+        // A stream whose receive half this leaf gave up on takes
+        // nothing further: not a new reorder cursor (the hole that
+        // ended it does not refill), not a partial reassembly
+        // nothing will complete, and not credit or an ack — those
+        // would tell the sender its bytes became progress. The
+        // sender's own retransmit loop is already stuck on the
+        // sequence this leaf never got, and that is what ends its
+        // half. Dropped and counted, never silent.
+        if !crate::session::is_stream_control(subprotocol_id)
+            && self.recv_failed.contains(&(incarnation, opened.stream_id))
+        {
+            self.counters.drop_for(DropReason::StreamFailed);
+            return;
+        }
+
+        // **Admission before acknowledgement.** A fragment the
+        // reassembler will not retain must stay the peer's to send
+        // again: acknowledging it cumulatively takes that freedom
+        // away, and the group's bytes are then lost with nothing
+        // left to rebuild them from. Refusing here leaves the
+        // sequence outstanding, so the ordinary retransmit brings
+        // the piece back once a slot frees — capacity pressure
+        // becomes backpressure instead of silent loss. Counted by
+        // `admits`, which owns the reason.
+        if !self.reassembler.admits(
+            incarnation,
+            opened.fragment_id,
+            opened.frag_flags,
+            now,
+            &self.counters,
+        ) {
+            return;
+        }
+
         // **Feed the credit and acknowledgement loop.** Sharing a
         // `NetSession` does not advance its receive state; a leaf
         // that never did this let a native sender's window drain to
@@ -1092,6 +1279,7 @@ impl LeafNode {
                     seq: assembled.meta.sequence,
                     span: assembled.span,
                     stream_id: assembled.meta.stream_id,
+                    subprotocol_id,
                     origin_hash: assembled.meta.origin_hash,
                     channel_hash: assembled.meta.channel_hash,
                     payloads: vec![assembled.data],
@@ -1102,11 +1290,35 @@ impl LeafNode {
             return;
         }
 
-        // The consumer-side reorder, per stream. Control
-        // subprotocols ride the control stream and are not
-        // reordered: a credit grant held behind a gap would deadlock
-        // the very stream it is trying to refill.
-        let delivered: Vec<StreamRecord> = if subprotocol_id == SUBPROTOCOL_EVENT_PLANE {
+        // **One sequence-disposition model.** A stream's sequence
+        // space is shared by every subprotocol that rides real
+        // stream ids, and `subscribe` puts a reliable `0x0A00`
+        // membership frame on the *channel's publisher stream* —
+        // sequence zero of exactly the stream the following
+        // publication uses. Reordering only the event plane left
+        // that zero consumed on the wire and unconsumed by the
+        // consumer, so the publication at sequence one was held
+        // against a hole nothing could ever fill: a subscribe
+        // followed by a publish on one channel never delivered,
+        // with no loss anywhere. So every non-feedback subprotocol
+        // advances the cursor when it is consumed.
+        //
+        // The exemption is **feedback**, not "control": the four
+        // stream-control messages (window/ack/nack/reset) are the
+        // credit and reliability loop itself, ride
+        // `CONTROL_STREAM_ID`, and holding one behind a gap would
+        // deadlock the stream it exists to unblock. That is the
+        // same set `is_stream_control` exempts from receive
+        // accounting, and the same distinction the native side
+        // makes.
+        //
+        // Dispatch is therefore deferred per record, not per
+        // packet: each record carries the subprotocol that put it
+        // on the stream, so a publication released by a later
+        // membership frame is still decoded as a publication.
+        let delivered: Vec<StreamRecord> = if crate::session::is_stream_control(subprotocol_id) {
+            records
+        } else {
             let reliability = if opened.reliable {
                 Reliability::Reliable
             } else {
@@ -1114,21 +1326,53 @@ impl LeafNode {
             };
             let mut out = Vec::new();
             for record in records {
-                let stream = self
-                    .rx_streams
-                    .entry((incarnation, record.stream_id))
-                    .or_insert_with(|| RxStream::new(reliability));
-                out.extend(stream.accept(record, &self.counters));
+                let outcome = {
+                    let stream = self
+                        .rx_streams
+                        .entry((incarnation, record.stream_id))
+                        .or_insert_with(|| RxStream::new(reliability));
+                    stream.accept(record, &self.counters)
+                };
+                match outcome {
+                    Ok(released) => out.extend(released),
+                    // Terminal. Everything released before it is
+                    // still in order and is still delivered; the
+                    // stream takes nothing more.
+                    Err(overflow) => {
+                        self.fail_receive_half(peer, incarnation, overflow);
+                        break;
+                    }
+                }
             }
             out
-        } else {
-            records
         };
         for record in delivered {
             for payload in record.payloads.clone() {
-                self.handle_event(peer, subprotocol_id, &record, payload, now);
+                self.handle_event(peer, &record, payload, now);
             }
         }
+    }
+
+    /// End the receive half of one reliable stream, typed.
+    ///
+    /// The reorder bound was reached with the head gap still open.
+    /// The cursor is dropped, the id is marked so nothing rebuilds
+    /// one, and the consumer is told which stream ended — the whole
+    /// point of [`LeafEvent::StreamFailed`] over a drop counter.
+    fn fail_receive_half(
+        &mut self,
+        peer: NodeId,
+        incarnation: u64,
+        overflow: crate::stream::ReorderOverflow,
+    ) {
+        self.rx_streams.remove(&(incarnation, overflow.stream_id));
+        self.recv_failed.insert((incarnation, overflow.stream_id));
+        self.counters.drop_for(DropReason::StreamFailed);
+        self.events.push(LeafEvent::StreamFailed {
+            peer_node: peer,
+            stream_id: overflow.stream_id,
+            reason: StreamFailure::ReorderOverflow,
+        });
     }
 
     /// Queue the stream-window frame `peer` is owed for what just
@@ -1207,16 +1451,13 @@ impl LeafNode {
         }
     }
 
-    /// One decoded event.
-    fn handle_event(
-        &mut self,
-        peer: NodeId,
-        subprotocol_id: u16,
-        record: &StreamRecord,
-        payload: Bytes,
-        now: Instant,
-    ) {
-        let Some(decoded) = dispatch::dispatch_event(subprotocol_id, payload, &self.counters)
+    /// One decoded event, dispatched under **the record's own**
+    /// subprotocol rather than the arriving packet's: a record
+    /// released from the reorder buffer was put there by a
+    /// different frame than the one that unblocked it.
+    fn handle_event(&mut self, peer: NodeId, record: &StreamRecord, payload: Bytes, now: Instant) {
+        let Some(decoded) =
+            dispatch::dispatch_event(record.subprotocol_id, payload, &self.counters)
         else {
             self.events.push(LeafEvent::Dropped {
                 reason: DropReason::UnknownSubprotocol,
@@ -1264,11 +1505,24 @@ impl LeafNode {
                 }
             }
             Decoded::StreamReset(reset) => {
-                // The sender gave up. Nothing else is coming on that
-                // stream, so the consumer is told rather than left
-                // waiting on a hole it will never see filled.
-                if let Some(incarnation) = self.sessions.get(peer).map(|s| s.incarnation()) {
+                // The peer's send half gave up: nothing else is
+                // coming under the sequences it was using, and it
+                // may restart the id from zero — which is why the
+                // *whole* receive half goes, the wire's cursor and
+                // reliability ranges included
+                // (`NetSession::reset_rx_stream`, the same call the
+                // native ingress makes on a RESET). Dropping only
+                // the leaf's own `RxStream` left the wire refusing
+                // the restarted sequence zero as a duplicate.
+                if let Some(session) = self.sessions.get(peer) {
+                    let incarnation = session.incarnation();
+                    session.wire().reset_rx_stream(reset.stream_id);
                     self.rx_streams.remove(&(incarnation, reset.stream_id));
+                    // A fresh receive half is exactly what an
+                    // overflow-terminated one needed, so this
+                    // clears that verdict. The send half's is a
+                    // different direction and is untouched.
+                    self.recv_failed.remove(&(incarnation, reset.stream_id));
                 }
                 self.counters.drop_for(DropReason::StreamFailed);
                 self.events.push(LeafEvent::StreamFailed {
@@ -1287,12 +1541,32 @@ impl LeafNode {
     fn handle_event_plane(&mut self, peer: NodeId, record: &StreamRecord, payload: Bytes) {
         match rpc_wire::decode_reply_frame(payload.clone()) {
             Ok(Some(frame)) => {
-                // The reply's claim to the call is the triple, not
-                // the call id: the authenticated peer it arrived
-                // from, the incarnation of that session, and the
-                // canonical reply route the frame declares. A frame
-                // that carries no route cannot present one, so it
-                // cannot end a call either.
+                // What a reply must present to be *this* call's
+                // reply: the authenticated peer it arrived from,
+                // the incarnation of that session, the canonical
+                // reply route the frame declares, **and the
+                // channel that actually carried it**. The route
+                // field alone is a self-declared claim — a
+                // contacted peer can stamp the expected reply
+                // route inside a RESPONSE it publishes on any
+                // channel at all, and before this the pending call
+                // completed on that unrelated carrier. Four facts
+                // now, all checked before the entry is removed.
+                //
+                // **Forwarded logical origin, stated rather than
+                // assumed.** The carrier is bound by the *stream
+                // id* the reply channel derives, not by the
+                // publisher: an anchor forwarding a service's
+                // RESPONSE is the transport anchor, and the
+                // service's own `origin_hash` travels inside the
+                // frame. So the transport peer proves who handed
+                // the frame over, the carrier stream proves which
+                // channel it was published on, and neither is
+                // treated as proof of who *produced* it. Equating
+                // the transport anchor with the logical publisher
+                // would break every routed call; equating an
+                // inner claim with the carrier is what let the
+                // wrong channel answer.
                 let Some(incarnation) = self.sessions.get(peer).map(|s| s.incarnation()) else {
                     self.counters.drop_for(DropReason::UnknownCall);
                     return;
@@ -1307,6 +1581,7 @@ impl LeafNode {
                         peer,
                         incarnation,
                         reply_route,
+                        carrier_stream_id: record.stream_id,
                     },
                     &self.counters,
                 );
@@ -1358,8 +1633,10 @@ impl LeafNode {
     /// for the sender, then admit it once.
     ///
     /// `true` means admitted and [`LeafEvent::Signal`] was pushed;
-    /// `false` means refused, with [`DropReason::SignalRejected`]
-    /// counted and [`LeafEvent::Dropped`] pushed.
+    /// `false` means refused, with [`LeafEvent::Dropped`] pushed and
+    /// either [`DropReason::SignalRejected`] or, under replay-set
+    /// capacity pressure, [`DropReason::SignalCapacityRefused`]
+    /// counted.
     ///
     /// **Public because the control plane is the other carrier.**
     /// §9 routes signalling through
@@ -1376,9 +1653,11 @@ impl LeafNode {
     ///    signalling in both the native and the serverless world);
     /// 2. [`signal::verify`] — the signature, `to == self_node`,
     ///    and both ends of the `not_after` window;
-    /// 3. [`SeenSignals::admit`] — one `(from, dialog, kind)` per
-    ///    window, so an observer cannot re-offer a still-valid
-    ///    envelope and restart an abandoned dialog;
+    /// 3. [`SeenSignals::admit_checked`] — one
+    ///    `(from, dialog, kind, payload)` per window, so an observer
+    ///    cannot re-offer a still-valid envelope and restart an
+    ///    abandoned dialog, and a full replay set refuses **new**
+    ///    work rather than forgetting a record it still needs;
     /// 4. any failure counts and surfaces, never silently drops.
     ///
     /// `now` is accepted and unused: the window is wall-clock
@@ -1406,20 +1685,34 @@ impl LeafNode {
             self.reject_signal();
             return false;
         }
-        // Step 3.
-        if !self.seen_signals.admit(&envelope, now_secs) {
-            self.reject_signal();
-            return false;
+        // Step 3. The two refusals are different facts and are
+        // counted apart: a replay is a thing this leaf has already
+        // acted on, while a capacity refusal is an envelope nothing
+        // is wrong with, refused because admitting it would mean
+        // forgetting a replay record that is still inside its own
+        // validity window.
+        match self.seen_signals.admit_checked(&envelope, now_secs) {
+            signal::SignalAdmission::Fresh => {}
+            signal::SignalAdmission::Replay => {
+                self.reject_signal();
+                return false;
+            }
+            signal::SignalAdmission::AtCapacity => {
+                self.drop_signal(DropReason::SignalCapacityRefused);
+                return false;
+            }
         }
         self.events.push(LeafEvent::Signal(envelope));
         true
     }
 
     fn reject_signal(&mut self) {
-        self.counters.drop_for(DropReason::SignalRejected);
-        self.events.push(LeafEvent::Dropped {
-            reason: DropReason::SignalRejected,
-        });
+        self.drop_signal(DropReason::SignalRejected);
+    }
+
+    fn drop_signal(&mut self, reason: DropReason) {
+        self.counters.drop_for(reason);
+        self.events.push(LeafEvent::Dropped { reason });
     }
 
     /// Sign an outbound signalling envelope for `peer`.
@@ -2343,10 +2636,81 @@ mod tests {
             vec![b"two".to_vec(), b"three".to_vec()],
             "recovery must release the held sequence too, in order"
         );
+        assert!(
+            !b.drain_events()
+                .iter()
+                .any(|e| matches!(e, LeafEvent::StreamFailed { .. })),
+            "the hole was recovered, so the stream must not have been failed"
+        );
+    }
+
+    /// **Admission before acknowledgement.** A fragment the
+    /// reassembler has no slot for must stay the sender's to send
+    /// again. Fill the reassembly table with partial groups, offer a
+    /// ninth message's head into the refusal, and require that the
+    /// ordinary retransmit still delivers it once the slots free —
+    /// which it can only do if the refused sequence was never
+    /// acknowledged.
+    #[test]
+    fn a_fragment_refused_for_capacity_is_recovered_by_the_ordinary_retransmit() {
+        let (mut a, mut b) = pair();
+        let (aid, bid) = (a.node_id(), b.node_id());
+        let filler = vec![0x11u8; crate::frame::MAX_FRAGMENT_PAYLOAD + 1];
+        let wanted = vec![0x22u8; crate::frame::MAX_FRAGMENT_PAYLOAD + 1];
+
+        // Every group the table holds, opened by a head whose tail is
+        // withheld. One stream each so no single stream's send
+        // credit, rather than the reassembly bound, is what refuses.
+        for n in 0..crate::frame::MAX_OUTSTANDING_REASSEMBLIES {
+            let hold = a
+                .open_stream(bid, &format!("hold/{n}"), Reliability::Reliable, None, None)
+                .expect("open");
+            a.stream_send(hold, &filler).expect("send");
+            let out = a.take_outbound();
+            assert_eq!(out.len(), 2, "two fragments per message");
+            b.on_datagram(aid, out[0].packet.clone(), clock::now());
+        }
+        assert!(delivered(&mut b).is_empty(), "no group is complete yet");
+        assert_eq!(b.counters().drops(DropReason::ReassemblyRefused), 0);
+
+        let ninth = a
+            .open_stream(bid, "ninth", Reliability::Reliable, None, None)
+            .expect("open");
+        a.stream_send(ninth, &wanted).expect("send");
+        let offered = a.take_outbound();
+        assert_eq!(offered.len(), 2);
+        b.on_datagram(aid, offered[0].packet.clone(), clock::now());
         assert_eq!(
-            b.counters().drops(DropReason::ReorderBufferFull),
-            0,
-            "the hole was recovered, not abandoned"
+            b.counters().drops(DropReason::ReassemblyRefused),
+            1,
+            "the ninth group must be refused and counted"
+        );
+
+        // Everything the receive side has to say goes back, which is
+        // what makes this discriminating: an acknowledgement that
+        // covered the refused sequence would retire the sender's
+        // only copy of it.
+        pump(&mut b, &mut a);
+
+        // The sender's own timer rebuilds what it was never told
+        // arrived. The receive side is given a reading past the
+        // reassembly TTL, so the slots the filler heads hold are
+        // reaped as those rebuilt pieces arrive.
+        std::thread::sleep(core::time::Duration::from_millis(80));
+        a.tick(clock::now());
+        let later =
+            clock::now() + core::time::Duration::from_millis(crate::frame::REASSEMBLY_TTL_MS + 1);
+        let rebuilt = a.take_outbound();
+        assert!(
+            !rebuilt.is_empty(),
+            "the retransmit timer must have rebuilt the unacknowledged pieces"
+        );
+        for packet in rebuilt {
+            b.on_datagram(aid, packet.packet, later);
+        }
+        assert!(
+            delivered(&mut b).contains(&wanted),
+            "a fragment refused for capacity was acknowledged and lost instead of resent"
         );
     }
 
@@ -2438,5 +2802,105 @@ mod tests {
             }
             other => panic!("expected a typed bounded refusal, got {other:?}"),
         }
+    }
+
+    /// **Byte credit and packet ownership are different bounds**, and
+    /// the one tiny reliable messages reach is the second.
+    ///
+    /// One-byte sends cost ~89 on-wire bytes each, so ~736 of them
+    /// fit inside the 64 KiB window while the retransmit window
+    /// tracks 128 descriptors. Admitting on bytes alone therefore
+    /// accepted hundreds of packets the stream could not own:
+    /// `ReliableStream::on_send` evicts the oldest unacknowledged
+    /// descriptor to make room, the packet stays on the wire, and
+    /// nothing can rebuild it afterwards. `has_unacked()` still
+    /// reported `true` throughout — it says *something* is tracked,
+    /// not that everything accepted is.
+    ///
+    /// So the refusal is asserted at the bound, and then the
+    /// ownership it protects is asserted where it has to hold: the
+    /// FIRST packet of the burst is withheld, the receiver's real
+    /// NACK asks for it, and the sender must still be able to
+    /// rebuild it.
+    #[test]
+    fn a_tiny_reliable_burst_is_refused_at_the_descriptor_bound_with_every_packet_still_owned() {
+        const STREAM: u64 = crate::stream::LEAF_STREAM_DISCRIMINATOR | 15;
+        let (mut a, mut b) = pair();
+        let bid = b.node_id();
+        let handle = a
+            .open_stream(bid, "tiny", Reliability::Reliable, Some(STREAM), Some(15))
+            .expect("open");
+
+        let mut admitted = 0usize;
+        let mut refusal = None;
+        for _ in 0..1_000 {
+            match a.stream_send(handle, b"x") {
+                Ok(()) => admitted += 1,
+                Err(e) => {
+                    refusal = Some(e);
+                    break;
+                }
+            }
+        }
+
+        let bound = net_wire::reliability::ReliableStream::max_pending_for_window(
+            net_wire::stream::DEFAULT_STREAM_WINDOW_BYTES,
+        );
+        assert_eq!(
+            admitted, bound,
+            "admission must stop at the retransmit window's packet capacity"
+        );
+        match refusal {
+            Some(LeafError::ReliableWindowFull {
+                stream_id,
+                needed,
+                remaining,
+            }) => {
+                assert_eq!(stream_id, STREAM);
+                assert_eq!(
+                    (needed, remaining),
+                    (1, 0),
+                    "the refusal must name packet capacity, not bytes"
+                );
+            }
+            other => panic!("expected a typed packet-capacity refusal, got {other:?}"),
+        }
+        let credit = a
+            .sessions
+            .get(bid)
+            .expect("session")
+            .wire()
+            .try_stream(STREAM)
+            .expect("stream")
+            .tx_credit_remaining();
+        assert!(
+            credit > 4_000,
+            "bytes were never the bound — {credit} credit was still unspent, \
+             which is exactly why admitting on bytes alone overran the window"
+        );
+
+        // Every admitted packet is still owned. Withhold the first
+        // and deliver a reorder-bounded run behind it, so the
+        // receiver's own gap detection asks for sequence 0.
+        let packets = a.take_outbound();
+        assert_eq!(packets.len(), admitted);
+        let run = 50;
+        let aid = a.node_id();
+        for packet in &packets[1..=run] {
+            b.on_datagram(aid, packet.packet.clone(), clock::now());
+        }
+        assert!(
+            delivered(&mut b).is_empty(),
+            "everything must be held behind the withheld sequence 0"
+        );
+        b.tick(clock::now());
+        pump(&mut b, &mut a);
+        pump(&mut a, &mut b);
+        assert_eq!(
+            delivered(&mut b).len(),
+            run + 1,
+            "sequence 0 must have survived {admitted} sends, been rebuilt on the \
+             real NACK, and released the whole held run in order"
+        );
     }
 }

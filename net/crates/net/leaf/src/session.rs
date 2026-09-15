@@ -432,6 +432,33 @@ impl LeafSession {
         // they ride outside the window — the same reason the receive
         // path does not reorder them.
         if !is_stream_control(subprotocol_id) {
+            // **Two independent bounds, both checked before any
+            // sequence is consumed.** Credit is bytes; the
+            // retransmit window is a count of descriptors, and
+            // small messages exhaust the second first — 129
+            // one-byte reliable sends cost ~11.5 KiB against a
+            // 64 KiB window and overrun a 128-descriptor cap. Past
+            // it `ReliableStream::on_send` evicts the oldest
+            // still-unacknowledged descriptor: the packet is on the
+            // wire, nothing can rebuild it, and neither a NACK nor
+            // an RTO recovers it. So packet ownership is reserved
+            // as well as byte credit, and the whole message is
+            // admitted or refused — never half-owned.
+            if reliable {
+                let headroom = self
+                    .session
+                    .get_or_create_stream(stream_id)
+                    .with_reliability(|r| r.retransmit_headroom());
+                if let Some(remaining) = headroom {
+                    if fragments.len() > remaining {
+                        return Err(LeafError::ReliableWindowFull {
+                            stream_id,
+                            needed: fragments.len(),
+                            remaining,
+                        });
+                    }
+                }
+            }
             let needed: u32 = fragments
                 .iter()
                 .map(|f| wire_bytes(EventFrame::LEN_SIZE + f.data.len()))

@@ -51,6 +51,27 @@ pub enum LeafError {
         /// Credit the stream had.
         remaining: u32,
     },
+    /// A reliable send was refused because the stream's retransmit
+    /// window has no room to **own** the packets it would produce.
+    ///
+    /// Distinct from [`Self::Backpressure`] because the bounds are
+    /// distinct: credit is bytes, and the retransmit window is a
+    /// count of descriptors. Tiny reliable messages exhaust the
+    /// second long before the first — 129 one-byte sends fit
+    /// comfortably inside a 64 KiB window and overrun a
+    /// 128-descriptor bound — and past it the wire evicts the
+    /// oldest still-unacknowledged descriptor, so the packet stays
+    /// sent and becomes unrecoverable by NACK or RTO. A refusal the
+    /// caller sees is the only disposition that keeps every
+    /// admitted packet owned.
+    ReliableWindowFull {
+        /// The stream whose retransmit window is full.
+        stream_id: u64,
+        /// Packets the refused message needed to own.
+        needed: usize,
+        /// Descriptor slots the stream had.
+        remaining: usize,
+    },
 }
 
 /// Why an RTC attempt did not produce a DataChannel.
@@ -185,6 +206,16 @@ impl fmt::Display for LeafError {
                 f,
                 "backpressure: stream {stream_id:#x} needs {needed} bytes of send \
                  credit and has {remaining}; the peer has not granted more yet"
+            ),
+            Self::ReliableWindowFull {
+                stream_id,
+                needed,
+                remaining,
+            } => write!(
+                f,
+                "reliable window full: stream {stream_id:#x} needs {needed} retransmit \
+                 descriptor(s) and has room for {remaining}; the peer has not \
+                 acknowledged enough packets yet"
             ),
         }
     }

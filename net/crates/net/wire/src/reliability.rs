@@ -136,6 +136,26 @@ pub trait ReliabilityMode: Send + Sync {
         true
     }
 
+    /// How many more packets may be tracked for retransmission
+    /// before [`Self::on_send`] would have to evict a still-
+    /// unacknowledged descriptor, or `None` when this mode tracks
+    /// no descriptors at all.
+    ///
+    /// Byte credit and descriptor capacity are **independent
+    /// bounds**, and a sender that admits on bytes alone can outrun
+    /// this one: with the default 64 KiB window and the default
+    /// 128-descriptor cap, 129 one-byte reliable messages cost
+    /// ~11.5 KiB — admitted on credit, and the 129th silently
+    /// evicts the oldest unacknowledged descriptor, which no NACK
+    /// or RTO can recover afterwards. `has_pending` cannot answer
+    /// that question: it says *something* is tracked, not that
+    /// *everything* accepted still is. A send path that wants
+    /// ownership of every packet it admits checks this first and
+    /// refuses instead.
+    fn retransmit_headroom(&self) -> Option<usize> {
+        None
+    }
+
     /// Check if there are unacknowledged packets
     fn has_pending(&self) -> bool;
 
@@ -1099,6 +1119,11 @@ impl ReliabilityMode for ReliableStream {
         // `pending.len()` (also ≤ retransmit window) never reaches it —
         // the gate only bites under sustained loss, which is the point.
         (self.pending.len() as f64) < self.cwnd
+    }
+
+    #[inline]
+    fn retransmit_headroom(&self) -> Option<usize> {
+        Some(self.max_pending.saturating_sub(self.pending.len()))
     }
 
     #[inline]

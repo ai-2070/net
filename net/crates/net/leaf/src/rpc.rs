@@ -62,12 +62,22 @@ pub type CallResult = oneshot::Receiver<Result<Bytes, RpcError>>;
 ///
 /// A `call_id` is a correlation handle, not an authorization: it is
 /// minted locally, it increments, and the peer a call was sent to
-/// observes it. Three facts together say the reply is *this* call's
-/// — the authenticated transport peer, the incarnation of the
-/// session it arrived on, and the canonical reply channel the frame
-/// declares. A pending entry records all three and is matched on all
-/// three **before** it is consumed, so a wrong-owner frame neither
-/// completes the call nor removes it.
+/// observes it. **Four** facts together say the reply is *this*
+/// call's — the authenticated transport peer, the incarnation of
+/// the session it arrived on, the canonical reply channel the frame
+/// declares, and the channel that actually carried it. A pending
+/// entry records all four and is matched on all four **before** it
+/// is consumed, so a wrong-owner frame neither completes the call
+/// nor removes it.
+///
+/// The fourth exists because the third is a **claim**. The reply
+/// route is a field inside the response body, written by the
+/// responder; a contacted peer that stamped the expected route into
+/// a RESPONSE published on an unrelated channel presented a
+/// perfectly correct inner route on a carrier the caller never
+/// subscribed to, and that completed the call. Route and carrier
+/// are now checked together, and the carrier is derived locally
+/// from the reply channel — never read from the frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CallOwner {
     /// The authenticated peer the call was issued to.
@@ -77,6 +87,10 @@ pub struct CallOwner {
     /// Canonical `u64` hash of the reply channel the response must
     /// declare (`RpcRouteV1`).
     pub reply_route: u64,
+    /// The stream id of the channel the response must be published
+    /// on — `publish_stream_id(reply_route)`, the same derivation
+    /// any publisher of that channel name uses.
+    pub carrier_stream_id: u64,
 }
 
 /// A call the sweep ended, and where its CANCEL must go.
@@ -187,10 +201,10 @@ impl CallTable {
     /// Deliver an inbound reply frame presented by `presented`.
     ///
     /// The entry is inspected before it is removed: an id that
-    /// matches but whose peer, session incarnation or reply route
-    /// does not is **not** this call's reply, so it neither
-    /// completes the call nor takes its slot, and the correct reply
-    /// can still arrive afterwards.
+    /// matches but whose peer, session incarnation, reply route or
+    /// carrying channel does not is **not** this call's reply, so
+    /// it neither completes the call nor takes its slot, and the
+    /// correct reply can still arrive afterwards.
     ///
     /// `false` means nothing matched — a late reply to a call that
     /// already ended, or a wrong-owner frame — and the counter
@@ -324,12 +338,14 @@ mod tests {
     const INCARNATION: u64 = 42;
     const REQUEST_ROUTE: u64 = 0x1111_2222_3333_4444;
     const REPLY_ROUTE: u64 = 0x5555_6666_7777_8888;
+    const CARRIER: u64 = 0x0001_9999_AAAA_BBBB;
 
     fn owner(peer: NodeId) -> CallOwner {
         CallOwner {
             peer,
             incarnation: INCARNATION,
             reply_route: REPLY_ROUTE,
+            carrier_stream_id: CARRIER,
         }
     }
 
@@ -511,26 +527,29 @@ mod tests {
         assert_eq!(c.total_drops(), 0);
     }
 
-    /// The ownership triple, one field at a time: each mismatch
-    /// must leave the entry where it is, and the right reply must
-    /// still succeed afterwards.
+    /// The ownership facts, one field at a time: each mismatch must
+    /// leave the entry where it is, and the right reply must still
+    /// succeed afterwards. The carrier row is the one an inner
+    /// route alone could not catch — a correct `reply_route`
+    /// carried by a channel the caller never subscribed to.
     #[test]
-    fn a_reply_is_refused_unless_peer_incarnation_and_route_all_match() {
+    fn a_reply_is_refused_unless_peer_incarnation_route_and_carrier_all_match() {
         for wrong in [
             CallOwner {
                 peer: OTHER,
-                incarnation: INCARNATION,
-                reply_route: REPLY_ROUTE,
+                ..owner(PEER)
             },
             CallOwner {
-                peer: PEER,
                 incarnation: INCARNATION + 1,
-                reply_route: REPLY_ROUTE,
+                ..owner(PEER)
             },
             CallOwner {
-                peer: PEER,
-                incarnation: INCARNATION,
                 reply_route: REPLY_ROUTE ^ 1,
+                ..owner(PEER)
+            },
+            CallOwner {
+                carrier_stream_id: CARRIER ^ 1,
+                ..owner(PEER)
             },
         ] {
             let c = LeafCounters::new();
@@ -559,9 +578,8 @@ mod tests {
             .register(owner(PEER), REQUEST_ROUTE, 60_000)
             .expect("register");
         let successor = CallOwner {
-            peer: PEER,
             incarnation: INCARNATION + 1,
-            reply_route: REPLY_ROUTE,
+            ..owner(PEER)
         };
         let (_new, mut new_rx) = table
             .register(successor, REQUEST_ROUTE, 60_000)

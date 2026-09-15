@@ -30,11 +30,19 @@
 //! enforces on receive-stream allocation, reused rather than
 //! re-invented so one number governs how much unenrolled receive
 //! state a session can pin. A group that sits incomplete past
-//! [`GROUP_TTL`] is reaped.
+//! [`GROUP_TTL`] is reaped — on every piece, not only when some
+//! unrelated new group needs a slot.
 //!
-//! The state is keyed by wire session id and dropped with the
-//! session, so a reconnect never inherits a predecessor's partial
-//! group — leaf fragment ids restart at 1 on every new session.
+//! The state is keyed by wire session id, and a session that ends
+//! **retires** its groups through [`RtcReassembly::retire_session`]:
+//! the map outlives any one session, so leaving them behind would
+//! pin a dead peer's bytes for as long as the mesh ran. Retirement
+//! also fences the session for [`GROUP_TTL`], because a packet that
+//! had already passed its session lookup when the retirement ran
+//! would otherwise recreate exactly the state that was released.
+//! Leaf fragment ids restart at 1 on every new session, so a
+//! reconnect never inherits a predecessor's partial group either
+//! way.
 
 use std::time::{Duration, Instant};
 
@@ -64,16 +72,36 @@ pub const MAX_REASSEMBLED_BYTES: usize = MAX_PAYLOAD_SIZE * MAX_PIECES_PER_GROUP
 /// How long an incomplete group may sit before it is reaped.
 pub const GROUP_TTL: Duration = Duration::from_secs(2);
 
+/// Sessions whose retirement is remembered at once.
+///
+/// The marker only has to outlive the packets that were already
+/// in flight past their session lookup when the retirement ran, so
+/// it expires with [`GROUP_TTL`]. Sixty-four is far above the
+/// number of sessions that can end inside one such window, and past
+/// it the oldest marker gives way: losing one re-opens nothing but
+/// that microscopic window, and the group TTL still reaps whatever
+/// a straggler recreated.
+pub const MAX_RETIRED_SESSIONS: usize = 64;
+
 /// Why a piece did not become a payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FragmentOutcome {
     /// Buffered; the group is not complete yet.
     Buffered,
+    /// Byte-identical to a piece the group already holds, at the
+    /// same offset: the legitimate retransmission a sender builds
+    /// whenever an acknowledgement is lost. The group keeps what it
+    /// has — treating this as a contradiction and discarding the
+    /// group is how one lost ack destroyed a whole message.
+    Duplicate,
     /// The group contradicted itself and was discarded.
     Malformed,
     /// The session is already holding as much partial state as it
     /// may.
     Refused,
+    /// The piece's session has been retired. Its state is gone on
+    /// purpose and this packet does not get to bring it back.
+    Retired,
 }
 
 /// One partially reassembled group.
@@ -85,13 +113,23 @@ struct Partial {
     /// Known once the `FRAG_LAST` piece arrives.
     total: Option<usize>,
     held: usize,
-    opened: Instant,
+    /// When the group last accepted a piece.
+    ///
+    /// Last progress rather than opening: a sender whose retransmit
+    /// timer is longer than [`GROUP_TTL`] would otherwise have its
+    /// group reaped between two pieces it is still legitimately
+    /// resending, and the piece that then arrives opens a group that
+    /// can never complete. The lifetime stays bounded because a
+    /// group accepts at most [`MAX_PIECES_PER_GROUP`] pieces.
+    touched: Instant,
 }
 
 /// Per-session leaf-fragment reassembly for the RTC ingress.
 #[derive(Debug, Default)]
 pub struct RtcReassembly {
     groups: DashMap<(u64, u16), Partial>,
+    /// Sessions retired within the last [`GROUP_TTL`].
+    retired: DashMap<u64, Instant>,
 }
 
 impl RtcReassembly {
@@ -115,12 +153,43 @@ impl RtcReassembly {
             .sum()
     }
 
+    /// Release every group belonging to `session_id`, and fence it.
+    ///
+    /// The map outlives any one session, so a session that ends has
+    /// to say so: otherwise its incomplete groups hold their bytes
+    /// for as long as the mesh lives, and only the TTL — which
+    /// nothing guarantees will be reached while the process is
+    /// quiet — ever releases them.
+    ///
+    /// The fence is the other half. Ingress clones the session Arc
+    /// before the packet reaches reassembly, so a packet that was
+    /// already past that lookup when this ran would otherwise insert
+    /// a fresh group under the very key just released. For
+    /// [`GROUP_TTL`] after retirement, pieces for `session_id` are
+    /// refused with [`FragmentOutcome::Retired`] instead.
+    pub fn retire_session(&self, session_id: u64, now: Instant) {
+        self.groups.retain(|(s, _), _| *s != session_id);
+        self.sweep_retired(now);
+        while self.retired.len() >= MAX_RETIRED_SESSIONS {
+            let Some(oldest) = self
+                .retired
+                .iter()
+                .min_by_key(|e| *e.value())
+                .map(|e| *e.key())
+            else {
+                break;
+            };
+            self.retired.remove(&oldest);
+        }
+        self.retired.insert(session_id, now);
+    }
+
     /// Offer one inbound piece.
     ///
     /// `Ok(Some(payload))` when it completed its group, `Ok(None)`
     /// when the packet was not a fragment at all (the caller keeps
     /// its event as-is), and `Err(outcome)` when the piece was
-    /// buffered, refused or discarded.
+    /// buffered, duplicated, refused, retired or discarded.
     pub fn accept(
         &self,
         session_id: u64,
@@ -140,8 +209,18 @@ impl RtcReassembly {
             return Err(FragmentOutcome::Malformed);
         }
 
-        if !self.groups.contains_key(&key) {
-            self.expire(now);
+        // Age groups out on every piece, not only when a new group
+        // wants a slot. A deadline applied when unrelated traffic
+        // happens to arrive is not a deadline: without this a group
+        // could sit for as long as the mesh lived, and a piece
+        // arriving arbitrarily late could still complete it.
+        self.expire(now);
+        if !self.retired.is_empty() && self.retired.contains_key(&session_id) {
+            return Err(FragmentOutcome::Retired);
+        }
+
+        let fresh = !self.groups.contains_key(&key);
+        if fresh {
             let (groups, held) = self.session_usage(session_id);
             if groups >= MAX_GROUPS_PER_SESSION
                 || held.saturating_add(data.len() as u64) > MAX_PROVISIONAL_STREAM_BYTES
@@ -155,16 +234,33 @@ impl RtcReassembly {
                     pieces: Vec::with_capacity(MAX_PIECES_PER_GROUP),
                     total: None,
                     held: 0,
-                    opened: now,
+                    touched: now,
                 },
             );
-        } else if self
-            .held_bytes(session_id)
-            .saturating_add(data.len() as u64)
-            > MAX_PROVISIONAL_STREAM_BYTES
-        {
-            self.groups.remove(&key);
-            return Err(FragmentOutcome::Refused);
+        } else {
+            // Both of these read the map, so neither may run while
+            // the write guard below is held.
+            //
+            // The duplicate check comes first because a duplicate
+            // adds no bytes: charging it against the session budget
+            // would let an ordinary retransmission refuse the group
+            // it is trying to complete.
+            if self.groups.get(&key).is_some_and(|e| {
+                e.value()
+                    .pieces
+                    .iter()
+                    .any(|(o, d)| *o == offset && d == &data)
+            }) {
+                return Err(FragmentOutcome::Duplicate);
+            }
+            if self
+                .held_bytes(session_id)
+                .saturating_add(data.len() as u64)
+                > MAX_PROVISIONAL_STREAM_BYTES
+            {
+                self.groups.remove(&key);
+                return Err(FragmentOutcome::Refused);
+            }
         }
 
         let complete = {
@@ -174,8 +270,8 @@ impl RtcReassembly {
             let partial = entry.value_mut();
             let contradicts = partial.pieces.iter().any(|(o, d)| {
                 let (s, e) = (*o as usize, *o as usize + d.len());
-                // Any overlap, including an exact duplicate: a group
-                // is written once.
+                // Any overlap that is not the exact duplicate
+                // handled above: a group is written once.
                 s < end && (offset as usize) < e
             }) || partial.pieces.len() >= MAX_PIECES_PER_GROUP
                 || partial.total.is_some_and(|t| end > t || (last && end != t))
@@ -193,6 +289,7 @@ impl RtcReassembly {
             }
             partial.held += data.len();
             partial.pieces.push((offset, data));
+            partial.touched = now;
             if last {
                 partial.total = Some(end);
             }
@@ -239,10 +336,20 @@ impl RtcReassembly {
         (groups, held)
     }
 
-    /// Reap groups older than [`GROUP_TTL`].
+    /// Reap groups whose last progress is older than [`GROUP_TTL`],
+    /// and retirement markers past the same horizon.
     pub fn expire(&self, now: Instant) {
         self.groups
-            .retain(|_, p| now.saturating_duration_since(p.opened) < GROUP_TTL);
+            .retain(|_, p| now.saturating_duration_since(p.touched) < GROUP_TTL);
+        self.sweep_retired(now);
+    }
+
+    fn sweep_retired(&self, now: Instant) {
+        if self.retired.is_empty() {
+            return;
+        }
+        self.retired
+            .retain(|_, at| now.saturating_duration_since(*at) < GROUP_TTL);
     }
 }
 
@@ -418,5 +525,130 @@ mod tests {
         assert_eq!(r.outstanding(), 1);
         r.expire(now + GROUP_TTL + Duration::from_millis(1));
         assert_eq!(r.outstanding(), 0);
+    }
+
+    /// The retransmission a sender builds whenever an ack is lost:
+    /// the same piece arrives twice, and the retained head has to
+    /// survive it so the tail can still complete the message.
+    #[test]
+    fn an_exact_duplicate_piece_leaves_the_group_intact() {
+        let r = RtcReassembly::new();
+        let now = Instant::now();
+        let head = Bytes::from_static(b"native ");
+        assert_eq!(
+            r.accept(SESSION, 1, 0, FRAG_FRAGMENTED, head.clone(), now),
+            Err(FragmentOutcome::Buffered)
+        );
+        assert_eq!(
+            r.accept(SESSION, 1, 0, FRAG_FRAGMENTED, head.clone(), now),
+            Err(FragmentOutcome::Duplicate),
+            "a repeated piece is recovery, not a contradiction"
+        );
+        assert_eq!(r.held_bytes(SESSION), head.len() as u64, "nothing doubled");
+        let whole = r
+            .accept(
+                SESSION,
+                1,
+                head.len() as u16,
+                FRAG_FRAGMENTED | FRAG_LAST,
+                Bytes::from_static(b"reassembly"),
+                now,
+            )
+            .expect("completes after the duplicate")
+            .expect("payload");
+        assert_eq!(whole.as_ref(), b"native reassembly");
+    }
+
+    /// Same offset, same length, different bytes: not a
+    /// retransmission of anything.
+    #[test]
+    fn a_conflicting_piece_at_a_held_offset_is_malformed() {
+        let r = RtcReassembly::new();
+        let now = Instant::now();
+        let _ = r.accept(SESSION, 1, 0, FRAG_FRAGMENTED, piece(16), now);
+        assert_eq!(
+            r.accept(
+                SESSION,
+                1,
+                0,
+                FRAG_FRAGMENTED,
+                Bytes::from(vec![0xFFu8; 16]),
+                now
+            ),
+            Err(FragmentOutcome::Malformed)
+        );
+        assert_eq!(r.outstanding(), 0);
+    }
+
+    /// A session that ends releases its bytes, and a packet that was
+    /// already in flight past its session lookup cannot bring them
+    /// back. The successor is untouched by either.
+    #[test]
+    fn retiring_a_session_releases_its_groups_and_fences_late_packets() {
+        let r = RtcReassembly::new();
+        let now = Instant::now();
+        let _ = r.accept(SESSION, 1, 0, FRAG_FRAGMENTED, piece(64), now);
+        let _ = r.accept(SESSION + 1, 1, 0, FRAG_FRAGMENTED, piece(32), now);
+
+        r.retire_session(SESSION, now);
+        assert_eq!(r.held_bytes(SESSION), 0, "the old session held nothing now");
+        assert_eq!(
+            r.held_bytes(SESSION + 1),
+            32,
+            "retirement is exact: the successor keeps its own group"
+        );
+
+        assert_eq!(
+            r.accept(SESSION, 2, 0, FRAG_FRAGMENTED, piece(64), now),
+            Err(FragmentOutcome::Retired),
+            "an already-admitted packet must not recreate retired state"
+        );
+        assert_eq!(r.held_bytes(SESSION), 0);
+
+        // Past the horizon the marker is gone; nothing of the old
+        // session survives it either way.
+        let later = now + GROUP_TTL + Duration::from_millis(1);
+        assert_eq!(
+            r.accept(SESSION, 2, 0, FRAG_FRAGMENTED, piece(64), later),
+            Err(FragmentOutcome::Buffered)
+        );
+    }
+
+    /// The deadline is a deadline: a tail arriving long afterwards
+    /// must not complete a group whose TTL has passed, and reaping
+    /// must not wait for some unrelated new group to arrive.
+    #[test]
+    fn a_tail_past_the_ttl_cannot_complete_a_group() {
+        let r = RtcReassembly::new();
+        let now = Instant::now();
+        assert_eq!(
+            r.accept(
+                SESSION,
+                1,
+                0,
+                FRAG_FRAGMENTED,
+                Bytes::from_static(b"head"),
+                now
+            ),
+            Err(FragmentOutcome::Buffered)
+        );
+        let late = now + GROUP_TTL + Duration::from_millis(1);
+        assert_eq!(
+            r.accept(
+                SESSION,
+                1,
+                4,
+                FRAG_FRAGMENTED | FRAG_LAST,
+                Bytes::from_static(b"tail"),
+                late
+            ),
+            Err(FragmentOutcome::Buffered),
+            "the head was reaped, so the tail is a new group's first piece"
+        );
+        assert_eq!(
+            r.held_bytes(SESSION),
+            4,
+            "and it holds only its own bytes — no payload was assembled"
+        );
     }
 }

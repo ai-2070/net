@@ -43,17 +43,22 @@ pub enum DropReason {
     /// A fire-and-forget stream skipped past this sequence. Dropping
     /// is the contract: fire-and-forget never stalls the consumer.
     FireAndForgetGap,
-    /// A reliable stream's reorder buffer was full, so the oldest
-    /// held sequence was released early and its gap abandoned.
-    ReorderBufferFull,
     /// A fragment arrived for a reassembly this leaf refused to open,
     /// because `MAX_OUTSTANDING_REASSEMBLIES`
     /// were already in flight.
     ReassemblyRefused,
     /// A partial reassembly aged out before its last fragment came.
     ReassemblyExpired,
-    /// A fragment that contradicted its group (overlapping offset,
-    /// inconsistent total, or a piece past the declared end).
+    /// A fragment byte-identical to one the group already holds, on
+    /// the same offset and the same stream sequence — a legitimate
+    /// retransmission of a piece whose acknowledgement was lost.
+    /// The group keeps what it has and the ack is repeated; this
+    /// counts the no-op so the recovery is observable.
+    ReassemblyDuplicate,
+    /// A fragment that contradicted its group: an overlapping or
+    /// conflicting offset, an inconsistent total, a piece past the
+    /// declared end, delivery metadata differing from the group's
+    /// first piece, or a sequence the group cannot own.
     ReassemblyInconsistent,
     /// A signed announcement whose signature did not verify. It is
     /// never ingested: `query` answers from verified state only.
@@ -61,6 +66,15 @@ pub enum DropReason {
     /// A `0x0D02` signalling envelope that failed verification or
     /// replay checks.
     SignalRejected,
+    /// A `0x0D02` envelope refused because the replay set already
+    /// holds [`MAX_REMEMBERED_SIGNALS`] *unexpired* admissions.
+    /// Distinct from [`DropReason::SignalRejected`]: nothing is
+    /// wrong with this envelope, and the alternative — evicting a
+    /// live entry to make room — would trade replay protection for
+    /// cardinality.
+    ///
+    /// [`MAX_REMEMBERED_SIGNALS`]: crate::signal::MAX_REMEMBERED_SIGNALS
+    SignalCapacityRefused,
     /// A stream sequence that was already delivered — a retransmit
     /// arriving after its original, or a replayed packet. Distinct
     /// from [`DropReason::Replay`], which is the AEAD counter
@@ -92,12 +106,13 @@ impl DropReason {
             Self::Replay => "replay",
             Self::NoSession => "no_session",
             Self::FireAndForgetGap => "fire_and_forget_gap",
-            Self::ReorderBufferFull => "reorder_buffer_full",
             Self::ReassemblyRefused => "reassembly_refused",
             Self::ReassemblyExpired => "reassembly_expired",
+            Self::ReassemblyDuplicate => "reassembly_duplicate",
             Self::ReassemblyInconsistent => "reassembly_inconsistent",
             Self::AnnouncementUnverified => "announcement_unverified",
             Self::SignalRejected => "signal_rejected",
+            Self::SignalCapacityRefused => "signal_capacity_refused",
             Self::DuplicateSequence => "duplicate_sequence",
             Self::UnknownCall => "unknown_call",
             Self::SequenceGapTooLarge => "sequence_gap_too_large",
@@ -107,7 +122,7 @@ impl DropReason {
 
     /// Every reason, in declaration order. Used by the snapshot so a
     /// new variant appears in the JSON without a second edit.
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 18] = [
         Self::NotAddressedToUs,
         Self::RoutingExpired,
         Self::UnknownSubprotocol,
@@ -115,12 +130,13 @@ impl DropReason {
         Self::Replay,
         Self::NoSession,
         Self::FireAndForgetGap,
-        Self::ReorderBufferFull,
         Self::ReassemblyRefused,
         Self::ReassemblyExpired,
+        Self::ReassemblyDuplicate,
         Self::ReassemblyInconsistent,
         Self::AnnouncementUnverified,
         Self::SignalRejected,
+        Self::SignalCapacityRefused,
         Self::DuplicateSequence,
         Self::UnknownCall,
         Self::SequenceGapTooLarge,

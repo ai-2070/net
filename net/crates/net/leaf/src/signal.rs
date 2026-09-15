@@ -22,7 +22,7 @@
 //! object, an in-memory mock — forward these blind: it learns
 //! nothing and can tamper with nothing that verifies.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 
 use crate::control_plane::{DialogId, NodeId, SignalEnvelope, SignalKind};
 use crate::error::{LeafError, Result};
@@ -186,9 +186,29 @@ fn payload_digest(payload: &[u8]) -> [u8; 32] {
 /// The set used to be bounded only by what fits inside the lifetime
 /// ceiling, which is a bound on nothing an attacker respects: a peer
 /// that signs envelopes faster than they expire grows it without
-/// limit. At the cap the OLDEST admission is evicted, so the window
-/// is a window.
+/// limit. At the cap **new** admissions are refused; an unexpired
+/// entry is never evicted, because an evicted entry is a replay
+/// that will be accepted, and trading replay protection for
+/// cardinality would hand any carrier able to deliver valid traffic
+/// the ability to replay an envelope it never signed.
 pub const MAX_REMEMBERED_SIGNALS: usize = 4096;
+
+/// What the replay set did with an envelope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalAdmission {
+    /// First sight inside its window. The caller may act on it.
+    Fresh,
+    /// Byte-identical to an envelope already admitted and not yet
+    /// past its `not_after`.
+    Replay,
+    /// The set already holds [`MAX_REMEMBERED_SIGNALS`] *unexpired*
+    /// admissions, so this envelope is refused. Nothing is wrong
+    /// with it: this is the fail-closed half of a bounded window,
+    /// and it is a distinct outcome precisely so a caller can count
+    /// and report pressure instead of reporting a replay that did
+    /// not happen.
+    AtCapacity,
+}
 
 /// The exact-replay set for the signalling window.
 ///
@@ -204,8 +224,6 @@ pub struct SeenSignals {
     /// Key → the `not_after` it was admitted under, so a prune needs
     /// no second timestamp.
     seen: HashMap<(NodeId, DialogId, u8, [u8; 32]), u64>,
-    /// Admission order, for the eviction the cap needs.
-    order: VecDeque<(NodeId, DialogId, u8, [u8; 32])>,
 }
 
 impl SeenSignals {
@@ -214,14 +232,29 @@ impl SeenSignals {
         Self::default()
     }
 
-    /// Admit an envelope once. `false` means it is a replay.
+    /// Admit an envelope once. `false` means it was not admitted —
+    /// a replay, or refused under capacity pressure.
+    ///
+    /// [`Self::admit_checked`] distinguishes the two; this is the
+    /// predicate for callers that only need to know whether they may
+    /// act on the envelope.
+    pub fn admit(&mut self, envelope: &SignalEnvelope, now_unix_secs: u64) -> bool {
+        self.admit_checked(envelope, now_unix_secs) == SignalAdmission::Fresh
+    }
+
+    /// Admit an envelope once, naming the outcome.
     ///
     /// Prunes expired entries on the way through, so the set's size
     /// is bounded by the dialogs actually live inside
-    /// [`MAX_SIGNAL_LIFETIME_SECS`] rather than by uptime.
-    pub fn admit(&mut self, envelope: &SignalEnvelope, now_unix_secs: u64) -> bool {
+    /// [`MAX_SIGNAL_LIFETIME_SECS`] rather than by uptime — and, at
+    /// the cap, by refusing new work rather than by forgetting an
+    /// envelope that is still inside its own validity window.
+    pub fn admit_checked(
+        &mut self,
+        envelope: &SignalEnvelope,
+        now_unix_secs: u64,
+    ) -> SignalAdmission {
         self.seen.retain(|_, not_after| *not_after >= now_unix_secs);
-        self.order.retain(|key| self.seen.contains_key(key));
         let key = (
             envelope.from,
             envelope.dialog,
@@ -229,23 +262,17 @@ impl SeenSignals {
             payload_digest(&envelope.payload),
         );
         if self.seen.contains_key(&key) {
-            return false;
+            return SignalAdmission::Replay;
         }
-        // The cap is a hard one: evict the oldest admission rather
-        // than grow. An evicted entry can be replayed once more,
-        // which is the honest cost of a bounded window and is why
-        // the bound is thousands rather than tens.
-        while self.seen.len() >= MAX_REMEMBERED_SIGNALS {
-            match self.order.pop_front() {
-                Some(oldest) => {
-                    self.seen.remove(&oldest);
-                }
-                None => break,
-            }
+        // Every entry left after the prune is unexpired, so every
+        // one of them is protection this leaf is still relying on.
+        // There is nothing here it is safe to drop, and refusing is
+        // the only disposition that does not weaken the guarantee.
+        if self.seen.len() >= MAX_REMEMBERED_SIGNALS {
+            return SignalAdmission::AtCapacity;
         }
         self.seen.insert(key, envelope.not_after);
-        self.order.push_back(key);
-        true
+        SignalAdmission::Fresh
     }
 
     /// How many envelopes are remembered.

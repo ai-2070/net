@@ -173,23 +173,51 @@ pub struct Assembled {
     pub data: Bytes,
 }
 
+/// One piece of a group, as it arrived.
+#[derive(Debug)]
+struct Piece {
+    /// Byte offset the piece starts at.
+    offset: u16,
+    /// Stream sequence the piece's packet carried. Zero on the
+    /// sequence-less control path, where no piece owns a sequence.
+    sequence: u64,
+    /// The piece's bytes.
+    data: Bytes,
+}
+
 /// One partially reassembled group.
 #[derive(Debug)]
 struct Partial {
-    /// Pieces by offset. A `Vec` and not a map: at most
+    /// Pieces as they arrived. A `Vec` and not a map: at most
     /// [`MAX_FRAGMENTS`] entries, so a linear scan beats hashing.
-    pieces: Vec<(u16, Bytes)>,
+    pieces: Vec<Piece>,
     /// Reassembled length, known once the `FRAG_LAST` piece arrives.
     total: Option<usize>,
     /// Bytes held so far.
     held: usize,
-    /// When the group opened, for the TTL sweep.
-    opened: Instant,
-    /// Provenance of the lowest-sequence piece seen so far.
+    /// When the group last accepted a piece, for the TTL sweep.
+    ///
+    /// Last progress rather than opening. A sender whose retransmit
+    /// timer is longer than [`REASSEMBLY_TTL_MS`] would otherwise
+    /// have its group reaped between two pieces it is still
+    /// legitimately resending, and the tail arriving afterwards
+    /// opens a group that can never complete — silent loss of bytes
+    /// the receive side has already acknowledged. The lifetime
+    /// stays bounded: a group accepts at most [`MAX_FRAGMENTS`]
+    /// pieces, so it can be extended at most that many times.
+    touched: Instant,
+    /// The delivery metadata every piece of the group must agree
+    /// on, fixed by its first arrival, with `sequence` holding the
+    /// lowest sequence seen so far.
+    ///
+    /// Fixing it is the point. The group key is only
+    /// `(scope, fragment_id)`, so without this one payload could be
+    /// assembled out of pieces claiming different streams, origins
+    /// and channels, and would be delivered under whichever piece
+    /// happened to carry the lowest sequence.
     first: PieceMeta,
-    /// Highest sequence seen, so the group's span is known without
-    /// assuming the pieces arrived in order.
-    highest_seq: u64,
+    /// Whether the caller supplies stream sequences for this group.
+    sequenced: bool,
 }
 
 /// Inbound reassembly, bounded in both directions.
@@ -245,17 +273,8 @@ impl Reassembler {
         now: Instant,
         counters: &LeafCounters,
     ) -> Option<Bytes> {
-        self.accept_piece(
-            scope,
-            PieceMeta::default(),
-            fragment_id,
-            offset,
-            flags,
-            data,
-            now,
-            counters,
-        )
-        .map(|assembled| assembled.data)
+        self.accept_inner(scope, None, fragment_id, offset, flags, data, now, counters)
+            .map(|assembled| assembled.data)
     }
 
     /// Offer one inbound piece carrying its packet's provenance.
@@ -285,9 +304,77 @@ impl Reassembler {
         now: Instant,
         counters: &LeafCounters,
     ) -> Option<Assembled> {
+        self.accept_inner(
+            scope,
+            Some(meta),
+            fragment_id,
+            offset,
+            flags,
+            data,
+            now,
+            counters,
+        )
+    }
+
+    /// Whether a piece of `fragment_id` would be retained right now.
+    ///
+    /// A caller asks this **before** it acknowledges the packet's
+    /// sequence, because the two decisions have to agree. A fragment
+    /// refused for capacity is a fragment the peer must stay free to
+    /// send again; a cumulative acknowledgement takes that freedom
+    /// away, and the group's bytes are then lost for good with
+    /// nothing left to recover them from. Refusing before the
+    /// acknowledgement leaves the sequence outstanding, so the
+    /// ordinary retransmit brings the piece back once a slot frees —
+    /// capacity pressure becomes backpressure rather than silent
+    /// loss.
+    ///
+    /// `true` for anything that is not a fragment, and for a group
+    /// that is already open: an open group is never blocked by the
+    /// bound. A refusal is counted here, so the caller reports it by
+    /// returning rather than by inventing a second reason.
+    pub fn admits(
+        &mut self,
+        scope: u64,
+        fragment_id: u16,
+        flags: u8,
+        now: Instant,
+        counters: &LeafCounters,
+    ) -> bool {
+        if flags & FRAG_FRAGMENTED == 0 || self.groups.contains_key(&(scope, fragment_id)) {
+            return true;
+        }
+        self.expire(now, counters);
+        if self.groups.len() < MAX_OUTSTANDING_REASSEMBLIES {
+            return true;
+        }
+        counters.drop_for(DropReason::ReassemblyRefused);
+        false
+    }
+
+    /// The one reassembly rule. `meta` is `None` on the
+    /// sequence-less control path, where no piece owns a sequence
+    /// and the group has no provenance to keep consistent.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the fragment header's four wire fields plus the scope, the \
+                  arrival's provenance, the clock reading and the counter \
+                  sink; a struct would only move the list"
+    )]
+    fn accept_inner(
+        &mut self,
+        scope: u64,
+        meta: Option<PieceMeta>,
+        fragment_id: u16,
+        offset: u16,
+        flags: u8,
+        data: Bytes,
+        now: Instant,
+        counters: &LeafCounters,
+    ) -> Option<Assembled> {
         if flags & FRAG_FRAGMENTED == 0 {
             return Some(Assembled {
-                meta,
+                meta: meta.unwrap_or_default(),
                 span: 1,
                 data,
             });
@@ -301,12 +388,14 @@ impl Reassembler {
             return None;
         }
 
+        // Age groups out on every piece, not only when a new group
+        // wants a slot. A deadline that is applied when unrelated
+        // traffic happens to arrive is not a deadline: without this,
+        // a group could sit for as long as the session lived and a
+        // tail arriving arbitrarily late could still complete it.
+        self.expire(now, counters);
+
         if !self.groups.contains_key(&key) {
-            if self.groups.len() >= MAX_OUTSTANDING_REASSEMBLIES {
-                // Try the cheap remedy first — a full table is often
-                // full of dead groups — then refuse.
-                self.expire(now, counters);
-            }
             if self.groups.len() >= MAX_OUTSTANDING_REASSEMBLIES {
                 counters.drop_for(DropReason::ReassemblyRefused);
                 return None;
@@ -317,9 +406,9 @@ impl Reassembler {
                     pieces: Vec::with_capacity(MAX_FRAGMENTS),
                     total: None,
                     held: 0,
-                    opened: now,
-                    first: meta,
-                    highest_seq: meta.sequence,
+                    touched: now,
+                    first: meta.unwrap_or_default(),
+                    sequenced: meta.is_some(),
                 },
             );
         }
@@ -330,11 +419,48 @@ impl Reassembler {
             return None;
         };
 
-        let inconsistent = partial.pieces.iter().any(|(o, d)| {
-            let (s, e) = (*o as usize, *o as usize + d.len());
-            // Any overlap with an already-held piece, including an
-            // exact duplicate: a group is written once.
-            s < end && (offset as usize) < e
+        // Group-wide delivery metadata. Every piece must claim the
+        // stream, origin and channel the group's first piece
+        // claimed. A piece that does not is not a piece of this
+        // group, whatever its fragment id says — and accepting it
+        // would deliver one peer's bytes under another's stream.
+        if meta.is_some_and(|m| {
+            m.stream_id != partial.first.stream_id
+                || m.origin_hash != partial.first.origin_hash
+                || m.channel_hash != partial.first.channel_hash
+        }) {
+            self.groups.remove(&key);
+            counters.drop_for(DropReason::ReassemblyInconsistent);
+            return None;
+        }
+
+        let sequence = meta.map_or(0, |m| m.sequence);
+
+        // A legitimate retransmission: the same offset, the same
+        // sequence, the same bytes. The sender rebuilds an
+        // unacknowledged fragment with a fresh AEAD counter whenever
+        // its acknowledgement is lost, so this arrives in ordinary
+        // recovery, and the caller has already repeated the
+        // acknowledgement the peer is missing. Here it is a no-op.
+        // Treating it as an overlap and discarding the group is what
+        // destroyed a partial message every time one ack was lost.
+        if partial
+            .pieces
+            .iter()
+            .any(|p| p.offset == offset && p.sequence == sequence && p.data == data)
+        {
+            counters.drop_for(DropReason::ReassemblyDuplicate);
+            return None;
+        }
+
+        let inconsistent = partial.pieces.iter().any(|p| {
+            let (s, e) = (p.offset as usize, p.offset as usize + p.data.len());
+            // Conflicting bytes: any overlap that is not the exact
+            // duplicate handled above. Or a sequence the group
+            // already holds a piece for — one sequence carries one
+            // piece, and two pieces on one sequence would let a
+            // group claim a span it does not own.
+            (s < end && (offset as usize) < e) || (partial.sequenced && p.sequence == sequence)
         }) || partial.pieces.len() >= MAX_FRAGMENTS
             || partial.total.is_some_and(|t| end > t || (last && end != t))
             // The declared end binds pieces that arrived BEFORE it.
@@ -346,7 +472,7 @@ impl Reassembler {
                 && partial
                     .pieces
                     .iter()
-                    .any(|(o, d)| *o as usize + d.len() > end));
+                    .any(|p| p.offset as usize + p.data.len() > end));
         if inconsistent {
             self.groups.remove(&key);
             counters.drop_for(DropReason::ReassemblyInconsistent);
@@ -354,11 +480,15 @@ impl Reassembler {
         }
 
         partial.held += data.len();
-        partial.pieces.push((offset, data));
-        if meta.sequence < partial.first.sequence {
-            partial.first = meta;
+        partial.pieces.push(Piece {
+            offset,
+            sequence,
+            data,
+        });
+        partial.touched = now;
+        if sequence < partial.first.sequence {
+            partial.first.sequence = sequence;
         }
-        partial.highest_seq = partial.highest_seq.max(meta.sequence);
         if last {
             partial.total = Some(end);
         }
@@ -368,7 +498,7 @@ impl Reassembler {
             return None;
         }
         let mut partial = self.groups.remove(&key)?;
-        partial.pieces.sort_unstable_by_key(|(o, _)| *o);
+        partial.pieces.sort_unstable_by_key(|p| p.offset);
 
         // Prove the coverage rather than infer it from the byte
         // count: walk the sorted pieces and require each to start
@@ -376,35 +506,44 @@ impl Reassembler {
         // total. Eight pieces at most, so this is cheaper than the
         // reasoning needed to be sure the byte count implied it.
         let mut covered = 0usize;
-        for (o, piece) in &partial.pieces {
-            if *o as usize != covered {
+        for piece in &partial.pieces {
+            if piece.offset as usize != covered {
                 counters.drop_for(DropReason::ReassemblyInconsistent);
                 return None;
             }
-            covered += piece.len();
+            covered += piece.data.len();
         }
         if covered != total {
             counters.drop_for(DropReason::ReassemblyInconsistent);
             return None;
         }
 
-        // The group owns the sequences its fragments arrived on. The
-        // span is the range they cover, bounded by the number of
-        // fragments a group may have — a peer that scattered one
-        // group across a wide sequence range does not get to advance
-        // its stream's reorder cursor by that range.
-        let span = partial
-            .highest_seq
-            .saturating_sub(partial.first.sequence)
-            .saturating_add(1);
-        if span > MAX_FRAGMENTS as u64 {
-            counters.drop_for(DropReason::ReassemblyInconsistent);
-            return None;
-        }
+        // The group owns exactly the sequences its pieces arrived on,
+        // and they must be contiguous. A `max - min + 1` span would
+        // let two pieces on sequences 0 and 2 claim sequence 1 — a
+        // record that was never part of this group, whose own payload
+        // the advancing reorder cursor would then step over. The span
+        // needs no separate bound: it is the piece count, which
+        // `MAX_FRAGMENTS` already caps.
+        let span = if partial.sequenced {
+            let mut seqs = [0u64; MAX_FRAGMENTS];
+            for (slot, piece) in seqs.iter_mut().zip(&partial.pieces) {
+                *slot = piece.sequence;
+            }
+            let seqs = &mut seqs[..partial.pieces.len()];
+            seqs.sort_unstable();
+            if seqs.windows(2).any(|w| w[1] != w[0] + 1) {
+                counters.drop_for(DropReason::ReassemblyInconsistent);
+                return None;
+            }
+            seqs.len() as u64
+        } else {
+            1
+        };
 
         let mut out = BytesMut::with_capacity(total);
-        for (_, piece) in &partial.pieces {
-            out.extend_from_slice(piece);
+        for piece in &partial.pieces {
+            out.extend_from_slice(&piece.data);
         }
         counters.reassembled();
         Some(Assembled {
@@ -419,7 +558,7 @@ impl Reassembler {
         let ttl = core::time::Duration::from_millis(REASSEMBLY_TTL_MS);
         let before = self.groups.len();
         self.groups
-            .retain(|_, p| now.saturating_duration_since(p.opened) < ttl);
+            .retain(|_, p| now.saturating_duration_since(p.touched) < ttl);
         for _ in 0..(before - self.groups.len()) {
             counters.drop_for(DropReason::ReassemblyExpired);
         }
@@ -603,15 +742,205 @@ mod tests {
         );
     }
 
+    fn provenance(sequence: u64) -> PieceMeta {
+        PieceMeta {
+            sequence,
+            stream_id: 4,
+            origin_hash: 5,
+            channel_hash: 6,
+        }
+    }
+
+    /// The retransmission production itself creates: when an ack is
+    /// lost the sender rebuilds the very same fragment, so the same
+    /// piece arrives twice. The retained partial has to survive it
+    /// and still complete — discarding the group on the duplicate is
+    /// how a legitimate recovery lost a whole message.
     #[test]
-    fn a_duplicate_fragment_is_inconsistent_rather_than_double_counted() {
+    fn an_exact_duplicate_fragment_is_a_counted_no_op() {
         let c = LeafCounters::new();
         let mut r = Reassembler::new();
-        let piece = Bytes::from(payload(32));
-        r.accept(1, 9, 0, FRAG_FRAGMENTED, piece.clone(), now(), &c);
+        let head = Bytes::from(payload(32));
         assert!(r
-            .accept(1, 9, 0, FRAG_FRAGMENTED, piece, now(), &c)
+            .accept_piece(
+                1,
+                provenance(0),
+                9,
+                0,
+                FRAG_FRAGMENTED,
+                head.clone(),
+                now(),
+                &c
+            )
             .is_none());
+        assert!(r
+            .accept_piece(1, provenance(0), 9, 0, FRAG_FRAGMENTED, head, now(), &c)
+            .is_none());
+        assert_eq!(c.drops(DropReason::ReassemblyDuplicate), 1);
+        assert_eq!(c.drops(DropReason::ReassemblyInconsistent), 0);
+        assert_eq!(r.outstanding(), 1, "the retained partial must survive");
+
+        let done = r
+            .accept_piece(
+                1,
+                provenance(1),
+                9,
+                32,
+                FRAG_FRAGMENTED | FRAG_LAST,
+                Bytes::from_static(b"tail"),
+                now(),
+                &c,
+            )
+            .expect("the group completes after the duplicate");
+        assert_eq!(done.data.len(), 36);
+        assert_eq!(done.span, 2, "the group owns both its sequences");
+        assert_eq!(done.meta.sequence, 0, "delivery keys on the first piece");
+    }
+
+    /// Same offset, same length, different bytes: not a retransmit
+    /// of anything, and the group cannot be written twice.
+    #[test]
+    fn a_fragment_conflicting_with_a_held_piece_is_refused() {
+        let c = LeafCounters::new();
+        let mut r = Reassembler::new();
+        r.accept(
+            1,
+            9,
+            0,
+            FRAG_FRAGMENTED,
+            Bytes::from(payload(32)),
+            now(),
+            &c,
+        );
+        assert!(r
+            .accept(
+                1,
+                9,
+                0,
+                FRAG_FRAGMENTED,
+                Bytes::from(vec![0xFF; 32]),
+                now(),
+                &c
+            )
+            .is_none());
+        assert_eq!(c.drops(DropReason::ReassemblyDuplicate), 0);
         assert_eq!(c.drops(DropReason::ReassemblyInconsistent), 1);
+        assert_eq!(r.outstanding(), 0);
+    }
+
+    /// Two pieces on sequences 0 and 2 cover their bytes exactly,
+    /// but the group would claim sequence 1 — a record that was
+    /// never a fragment of it, and whose own payload the reorder
+    /// cursor would then step over.
+    #[test]
+    fn a_group_cannot_claim_a_sequence_none_of_its_pieces_arrived_on() {
+        let c = LeafCounters::new();
+        let mut r = Reassembler::new();
+        assert!(r
+            .accept_piece(
+                1,
+                provenance(0),
+                3,
+                0,
+                FRAG_FRAGMENTED,
+                Bytes::from_static(b"head"),
+                now(),
+                &c
+            )
+            .is_none());
+        assert!(
+            r.accept_piece(
+                1,
+                provenance(2),
+                3,
+                4,
+                FRAG_FRAGMENTED | FRAG_LAST,
+                Bytes::from_static(b"tail"),
+                now(),
+                &c
+            )
+            .is_none(),
+            "a gap in the group's sequences is not a group"
+        );
+        assert_eq!(c.drops(DropReason::ReassemblyInconsistent), 1);
+    }
+
+    /// One group, two streams. The group key is only
+    /// `(scope, fragment_id)`, so nothing but this check stops a
+    /// peer assembling one payload out of pieces that claim
+    /// different delivery metadata.
+    #[test]
+    fn a_group_cannot_change_its_stream_origin_or_channel() {
+        let c = LeafCounters::new();
+        let mut r = Reassembler::new();
+        assert!(r
+            .accept_piece(
+                1,
+                provenance(0),
+                3,
+                0,
+                FRAG_FRAGMENTED,
+                Bytes::from_static(b"head"),
+                now(),
+                &c
+            )
+            .is_none());
+        let elsewhere = PieceMeta {
+            sequence: 1,
+            stream_id: 40,
+            origin_hash: 5,
+            channel_hash: 6,
+        };
+        assert!(
+            r.accept_piece(
+                1,
+                elsewhere,
+                3,
+                4,
+                FRAG_FRAGMENTED | FRAG_LAST,
+                Bytes::from_static(b"tail"),
+                now(),
+                &c
+            )
+            .is_none(),
+            "a piece claiming another stream is not a piece of this group"
+        );
+        assert_eq!(c.drops(DropReason::ReassemblyInconsistent), 1);
+        assert_eq!(r.outstanding(), 0);
+    }
+
+    /// The deadline is a deadline: a group must not be completable
+    /// long afterwards just because no other group needed its slot.
+    #[test]
+    fn a_tail_arriving_past_the_ttl_cannot_complete_a_reaped_group() {
+        let c = LeafCounters::new();
+        let mut r = Reassembler::new();
+        let t0 = now();
+        assert!(r
+            .accept(
+                1,
+                7,
+                0,
+                FRAG_FRAGMENTED,
+                Bytes::from_static(b"head"),
+                t0,
+                &c
+            )
+            .is_none());
+        let late = t0 + core::time::Duration::from_millis(REASSEMBLY_TTL_MS + 1);
+        assert!(
+            r.accept(
+                1,
+                7,
+                4,
+                FRAG_FRAGMENTED | FRAG_LAST,
+                Bytes::from_static(b"tail"),
+                late,
+                &c
+            )
+            .is_none(),
+            "the head was reaped, so the tail cannot assemble a payload"
+        );
+        assert_eq!(c.drops(DropReason::ReassemblyExpired), 1);
     }
 }

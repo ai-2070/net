@@ -1970,6 +1970,16 @@ fn encode_error(error: &LeafError) -> Value {
             map.insert("needed".into(), Value::from(*needed));
             map.insert("remaining".into(), Value::from(*remaining));
         }
+        LeafError::ReliableWindowFull {
+            stream_id,
+            needed,
+            remaining,
+        } => {
+            map.insert("kind".into(), Value::from("reliable_window_full"));
+            map.insert("stream_id".into(), Value::from(stream_id.to_string()));
+            map.insert("needed".into(), Value::from(*needed as u64));
+            map.insert("remaining".into(), Value::from(*remaining as u64));
+        }
         LeafError::NotLeader { presented, current } => {
             map.insert("kind".into(), Value::from("not_leader"));
             map.insert("presented".into(), Value::from(presented.to_string()));
@@ -2108,6 +2118,11 @@ fn decode_error(value: &Value) -> Result<LeafError> {
             remaining: u64_field(value, "remaining")?.try_into().map_err(|_| {
                 LeafError::ControlPlane("proxy backpressure remaining does not fit a u32".into())
             })?,
+        },
+        "reliable_window_full" => LeafError::ReliableWindowFull {
+            stream_id: u64_field(value, "stream_id")?,
+            needed: u64_field(value, "needed")? as usize,
+            remaining: u64_field(value, "remaining")? as usize,
         },
         other => {
             return Err(LeafError::ControlPlane(format!(

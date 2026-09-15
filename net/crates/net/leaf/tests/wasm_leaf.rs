@@ -55,7 +55,7 @@ use net_leaf::rpc_wire::{
 };
 use net_leaf::rtc::{new_connection, IceServer};
 use net_leaf::session::{routing_id, rtc_addr};
-use net_leaf::stream::{Reliability, RxStream, StreamRecord};
+use net_leaf::stream::{Reliability, ReorderOverflow, RxStream, StreamRecord};
 use net_leaf::test_vectors;
 use net_wire::aead::AeadKey;
 use net_wire::channel::name::channel_hash;
@@ -474,17 +474,21 @@ fn the_consumer_side_reorder_runs_inside_wasm() {
             seq,
             span: 1,
             stream_id: 7,
+            subprotocol_id: 0,
             origin_hash: 0xA0 + seq,
             channel_hash: tag as u16,
             payloads: vec![Bytes::from(vec![tag])],
         }
     }
+    fn ok(out: Result<Vec<StreamRecord>, ReorderOverflow>) -> Vec<StreamRecord> {
+        out.expect("this schedule must not overflow the reorder bound")
+    }
 
     let counters = LeafCounters::new();
     let mut reliable = RxStream::new(Reliability::Reliable);
-    assert!(reliable.accept(record(2, b'c'), &counters).is_empty());
-    assert!(reliable.accept(record(1, b'b'), &counters).is_empty());
-    let released = reliable.accept(record(0, b'a'), &counters);
+    assert!(ok(reliable.accept(record(2, b'c'), &counters)).is_empty());
+    assert!(ok(reliable.accept(record(1, b'b'), &counters)).is_empty());
+    let released = ok(reliable.accept(record(0, b'a'), &counters));
     let order: Vec<(u64, u8, u64)> = released
         .iter()
         .map(|r| (r.seq, r.payloads[0][0], r.origin_hash))
@@ -496,8 +500,8 @@ fn the_consumer_side_reorder_runs_inside_wasm() {
     );
 
     let mut lossy = RxStream::new(Reliability::FireAndForget);
-    lossy.accept(record(0, b'a'), &counters);
-    let out = lossy.accept(record(4, b'e'), &counters);
+    ok(lossy.accept(record(0, b'a'), &counters));
+    let out = ok(lossy.accept(record(4, b'e'), &counters));
     assert_eq!(out.len(), 1, "fire-and-forget must not stall on a gap");
     assert_eq!(counters.drops(DropReason::FireAndForgetGap), 3);
 }
