@@ -5031,8 +5031,22 @@ jobs:
             kyra_fragment_group_cannot_change_stream_or_provenance
             kyra_unexpired_signal_replay_stays_refused_under_capacity_pressure
             kyra_lossfree_fragment_delivery_control
+            kyra_same_session_close_reopen_preserves_receive_progress
+            kyra_control_overdraft_grant_does_not_refund_withheld_application
+            kyra_control_debit_below_window_control
+            kyra_expired_acknowledged_partial_delivers_or_fails_typed
+            kyra_unexpired_partial_delivery_control
           "
           set -o pipefail
+          # A pin that names nothing can never be satisfied and reads
+          # exactly like a regression when it fails. Check the roster
+          # against the source BEFORE running anything.
+          python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" \
+            --label "leaf review probes" --mode fn \
+            --source tests/kyra_review.rs \
+            --source tests/kyra_followup.rs \
+            --source tests/kyra_round2_review.rs \
+            $REQUIRED
           # No `--test` form: the integration-test pin guard
           # inventories the root crate's `tests/`, and the leaf is
           # its own workspace, so a `--test kyra_review` pin reads to
@@ -5045,7 +5059,7 @@ jobs:
             grep -q "^test $required \.\.\. ok$" /tmp/kyra-review.log || {
               echo "::error::Kyra's probe $required did not run and pass"; exit 1; }
           done
-          echo "Kyra's Stage 5 probes: 15/15"
+          echo "Kyra's Stage 5 probes: 30/30"
 
       - name: Native tests (the sans-IO half)
         run: |
@@ -5053,8 +5067,8 @@ jobs:
           cargo test --features mock-control-plane 2>&1 | tee /tmp/leaf-native.log
           total=$(grep -c '^test .* \.\.\. ok$' /tmp/leaf-native.log || true)
           echo "leaf native tests: $total"
-          if [ "$total" -lt 150 ]; then
-            echo "::error::the leaf's native surface ran $total tests, floor is 150 — \
+          if [ "$total" -lt 209 ]; then
+            echo "::error::the leaf's native surface ran $total tests, floor is 209 — \
           lower the floor deliberately or restore the witness"
             exit 1
           fi
@@ -5093,6 +5107,54 @@ jobs:
           WASM_BINDGEN_TEST_TIMEOUT: "120"
         run: |
           set -o pipefail
+          # Both wasm rosters are declared ONCE here and used twice:
+          # checked against their source before anything runs, and
+          # verified by name against the run's log afterwards. A
+          # pinned name that no source declares can never pass, and
+          # its failure reads exactly like a witness that regressed —
+          # which is how an invented 18-name roster produced a red job
+          # whose suite was 24/24 green.
+          REPLAYS="
+          the_net_header_vector_replays_inside_wasm
+          the_routing_header_vector_replays_inside_wasm
+          the_event_frame_vector_replays_inside_wasm
+          the_stream_control_vectors_replay_inside_wasm
+          the_aead_vector_replays_on_the_wasm_backend
+          the_leaf_announcement_vector_replays_inside_wasm
+          the_nrpc_frame_vector_replays_inside_wasm
+          the_enrollment_request_replays_inside_wasm
+          "
+          LEADER_WITNESSES="
+          a_custodial_identity_is_used_verbatim_and_never_stored
+          a_follower_call_expires_on_its_own_deadline_as_an_indeterminate_outcome
+          a_follower_call_without_a_timeout_expires_on_the_leafs_default_deadline
+          a_leader_revalidates_its_generation_against_the_store_and_stands_down
+          a_leaders_own_announcement_keeps_its_followers_capabilities
+          a_promotion_whose_backend_fails_reattaches_instead_of_stranding_the_tab
+          a_promotion_whose_generation_transaction_fails_requeues_instead_of_stranding_the_tab
+          a_retained_stream_handle_cannot_address_a_same_id_successor
+          a_runtime_announcement_is_restored_by_the_promoted_tab
+          a_superseded_session_is_refused_by_the_leader_and_by_storage
+          a_tampered_identity_record_does_not_decrypt
+          an_aborted_generation_transaction_is_a_typed_failure_and_moves_nothing
+          an_attach_during_the_initial_backend_await_is_replayed
+          an_explicitly_retired_leader_goes_quiet_at_its_peer_while_its_page_stays_alive
+          closing_a_promoting_tab_cancels_its_parked_bootstrap_and_frees_the_lock
+          closing_a_tab_during_its_promotion_never_publishes_a_lock_holding_leader
+          closing_the_leader_promotes_a_follower_fails_its_calls_and_restores_its_channels
+          standing_down_fences_then_retires_the_node_then_releases_the_lock
+          the_generation_counter_is_monotonic_and_fences_a_stale_holder
+          the_last_capability_declaring_followers_tag_is_withdrawn
+          the_stored_identity_is_stable_and_encrypted_under_a_non_extractable_key
+          the_wrapping_key_refuses_export
+          two_concurrent_first_creations_converge_on_one_identity
+          two_sessions_share_one_identity_without_evicting_each_other
+          "
+          CHECK="$GITHUB_WORKSPACE/.github/scripts/check-roster.py"
+          python3 "$CHECK" --label wasm_leaf --mode fn \
+            --source tests/wasm_leaf.rs $REPLAYS
+          python3 "$CHECK" --label wasm_leader --mode fn \
+            --source tests/wasm_leader.rs $LEADER_WITNESSES
           for suite in wasm_leaf wasm_anchorless wasm_leader; do
             cargo test --target wasm32-unknown-unknown --features mock-control-plane \
               --test "$suite" -- --nocapture 2>&1 | tee "/tmp/$suite.log"
@@ -5104,7 +5166,7 @@ jobs:
             # that lost half its witnesses would otherwise still pass
             # this step.
             case "$suite" in
-              wasm_leaf)       floor=14 ;;
+              wasm_leaf)       floor=15 ;;
               wasm_leader)     floor=24 ;;
               wasm_anchorless) floor=2  ;;
             esac
@@ -5120,14 +5182,7 @@ jobs:
           # criterion silently unmet. (The first cut grepped for the
           # string "cross_lang", which appears in the fixtures' paths
           # but in none of the test names.)
-          for replay in the_net_header_vector_replays_inside_wasm \
-                        the_routing_header_vector_replays_inside_wasm \
-                        the_event_frame_vector_replays_inside_wasm \
-                        the_stream_control_vectors_replay_inside_wasm \
-                        the_aead_vector_replays_on_the_wasm_backend \
-                        the_leaf_announcement_vector_replays_inside_wasm \
-                        the_nrpc_frame_vector_replays_inside_wasm \
-                        the_enrollment_request_replays_inside_wasm; do
+          for replay in $REPLAYS; do
             grep -q "^test $replay \.\.\. ok$" /tmp/wasm_leaf.log || {
               echo "::error::the cross_lang replay witness $replay did not run and pass inside wasm"
               exit 1
@@ -5139,30 +5194,7 @@ jobs:
           # twelve lifecycle tests could vanish and the job would stay
           # green. Every name is pinned, exactly as the leaf and
           # anchorless rosters are.
-          for witness in a_custodial_identity_is_used_verbatim_and_never_stored \
-                         a_follower_call_expires_on_its_own_deadline_as_an_indeterminate_outcome \
-                         a_follower_call_without_a_timeout_expires_on_the_leafs_default_deadline \
-                         a_leader_revalidates_its_generation_against_the_store_and_stands_down \
-                         a_leaders_own_announcement_keeps_its_followers_capabilities \
-                         a_promotion_whose_backend_fails_reattaches_instead_of_stranding_the_tab \
-                         a_promotion_whose_generation_transaction_fails_requeues_instead_of_stranding_the_tab \
-                         a_retained_stream_handle_cannot_address_a_same_id_successor \
-                         a_runtime_announcement_is_restored_by_the_promoted_tab \
-                         a_superseded_session_is_refused_by_the_leader_and_by_storage \
-                         a_tampered_identity_record_does_not_decrypt \
-                         an_aborted_generation_transaction_is_a_typed_failure_and_moves_nothing \
-                         an_attach_during_the_initial_backend_await_is_replayed \
-                         an_explicitly_retired_leader_goes_quiet_at_its_peer_while_its_page_stays_alive \
-                         closing_a_promoting_tab_cancels_its_parked_bootstrap_and_frees_the_lock \
-                         closing_a_tab_during_its_promotion_never_publishes_a_lock_holding_leader \
-                         closing_the_leader_promotes_a_follower_fails_its_calls_and_restores_its_channels \
-                         standing_down_fences_then_retires_the_node_then_releases_the_lock \
-                         the_generation_counter_is_monotonic_and_fences_a_stale_holder \
-                         the_last_capability_declaring_followers_tag_is_withdrawn \
-                         the_stored_identity_is_stable_and_encrypted_under_a_non_extractable_key \
-                         the_wrapping_key_refuses_export \
-                         two_concurrent_first_creations_converge_on_one_identity \
-                         two_sessions_share_one_identity_without_evicting_each_other; do
+          for witness in $LEADER_WITNESSES; do
             grep -q "^test $witness \.\.\. ok$" /tmp/wasm_leader.log || {
               echo "::error::the leader lifecycle witness $witness did not run and pass inside wasm"
               exit 1
@@ -5489,7 +5521,18 @@ jobs:
           stage5_find_best_node_returns_the_browser_node
           stage5_two_tabs_share_one_identity_without_eviction
           stage5_udp_blocked_surfaces_a_typed_failure
+          stage5_reconnect_displaces_a_busy_incumbent
+          stage5_direct_event_callback_may_reenter_the_node
           "
+          # The roster is checked against the harness source before the
+          # logs are read: a witness name that the runner never emits
+          # can never be found, and its absence reads identically to a
+          # witness that failed.
+          python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" \
+            --label "browser matrix" --mode literal \
+            --source net/crates/net/tests/rtc_browser/runner/src/main.rs \
+            --source net/crates/net/tests/rtc_browser/runner/src/stage5.rs \
+            $REQUIRED
           for engine in chromium firefox; do
             case "$engine" in
               chromium) log="$RUNNER_TEMP/rtcb.log" ;;
@@ -5507,14 +5550,14 @@ jobs:
             fi
             passes=$(grep -c '^RTCB PASS ' "$log" || true)
             fails=$(grep -c '^RTCB FAIL ' "$log" || true)
-            echo "[$engine] $passes passed, $fails failed (floor 19)"
+            echo "[$engine] $passes passed, $fails failed (floor 21)"
             if [ "$fails" -ne 0 ]; then
               grep '^RTCB FAIL ' "$log"
               echo "::error::[$engine] a browser witness failed"
               exit 1
             fi
-            if [ "$passes" -lt 19 ]; then
-              echo "::error::[$engine] emitted $passes witnesses, floor is 19 — \
+            if [ "$passes" -lt 21 ]; then
+              echo "::error::[$engine] emitted $passes witnesses, floor is 21 — \
           lower the floor deliberately or restore the witness"
               exit 1
             fi
@@ -5524,7 +5567,7 @@ jobs:
                 exit 1
               fi
             done
-            echo "[$engine] inventory complete: 12 Stage 4b + 7 Stage 5"
+            echo "[$engine] inventory complete: 12 Stage 4b + 9 Stage 5"
           done
 
       # WebKit's verdicts are surfaced, never gated.
@@ -5552,12 +5595,20 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload harness log
+      - name: Upload harness logs (every engine, gating or not)
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
           name: rtc-browser-harness-log
-          path: ${{ runner.temp }}/rtcb.log
+          # Firefox is a GATE, so its log is evidence, not a curiosity —
+          # uploading only Chromium's meant half the gated matrix could
+          # only be read by scrolling the job log. WebKit is recorded
+          # rather than gated and its log is uploaded for the same
+          # reason: a launch failure is a fact about the run.
+          path: |
+            ${{ runner.temp }}/rtcb.log
+            ${{ runner.temp }}/rtcb-firefox.log
+            ${{ runner.temp }}/rtcb-webkit.log
           if-no-files-found: warn
 
   acme-cold-start:
