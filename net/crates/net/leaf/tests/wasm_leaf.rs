@@ -505,9 +505,18 @@ fn the_consumer_side_reorder_runs_inside_wasm() {
         "reliable delivers in order, each with its own sequence and origin"
     );
 
+    // The fire-and-forget leg's records must be fire-and-forget
+    // ones: a record's `reliable` flag is the packet's, and the
+    // stream's mode follows it (`RxStream::ensure_reliable`), so a
+    // reliable record on a fire-and-forget stream is a shape the
+    // wire cannot produce.
+    let faf = |seq: u64, tag: u8| StreamRecord {
+        reliable: false,
+        ..record(seq, tag)
+    };
     let mut lossy = RxStream::new(Reliability::FireAndForget);
-    ok(lossy.accept(record(0, b'a'), &counters));
-    let out = ok(lossy.accept(record(4, b'e'), &counters));
+    ok(lossy.accept(faf(0, b'a'), &counters));
+    let out = ok(lossy.accept(faf(4, b'e'), &counters));
     assert_eq!(out.len(), 1, "fire-and-forget must not stall on a gap");
     assert_eq!(counters.drops(DropReason::FireAndForgetGap), 3);
 }

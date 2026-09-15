@@ -288,6 +288,30 @@ struct PendingStreamGrant {
     total_consumed: u64,
 }
 
+/// What the receive path must do with one arrival, decided by
+/// [`MeshNode::account_inbound_stream_packet`] once the stream's
+/// receive state has recorded it.
+///
+/// The credit and acknowledgement half of that call is unconditional
+/// — every outcome below still leaves the sender owed whatever grant
+/// or repeated ack it earned. This is only about the *bytes*: whether
+/// they are the consumer's now, later, or never.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InboundDisposition {
+    /// Dispatch it now. Either the stream is not ordered, or this
+    /// arrival advanced the contiguous frontier.
+    Deliver,
+    /// A reliable stream's future sequence: the receiver holds it
+    /// until the sequences before it are delivered
+    /// ([`net_wire::session::StreamState::hold_out_of_order`]).
+    Hold,
+    /// Not the consumer's: a duplicate, a sequence past the
+    /// acceptance horizon, a provisional sender's refused stream
+    /// allocation, or an out-of-order frame there was no room to
+    /// hold in order.
+    Drop,
+}
+
 /// Group drained pending grants by session (STREAM_ACK_BATCHING B-1).
 ///
 /// The session — not the peer address — owns the outbound AEAD
@@ -28250,14 +28274,24 @@ impl MeshNode {
             })
     }
 
+    /// Decrypt one packet addressed to this node, dispatch it, and
+    /// then release whatever its stream was holding behind it.
+    ///
+    /// The release loop is what makes a reliable stream's delivery
+    /// FIFO: an out-of-order arrival is recorded, acknowledged and
+    /// parked by the accounting step, and the arrival that fills the
+    /// gap in front of it lets every parked successor through, in
+    /// sequence order, before this call returns. Held frames are
+    /// already decrypted and already accounted, so they re-enter at
+    /// [`Self::dispatch_local_packet`] rather than here — paying AEAD
+    /// twice is impossible anyway, since the replay window admits a
+    /// counter exactly once.
     fn process_local_packet(
         mut parsed: ParsedPacket,
         from_node: u64,
         session: &NetSession,
         ctx: &DispatchCtx,
     ) {
-        let inbound = &ctx.inbound;
-        let num_shards = ctx.num_shards;
         // Validate payload length
         if !parsed.header.flags.is_handshake()
             && !parsed.header.flags.is_heartbeat()
@@ -28296,6 +28330,33 @@ impl MeshNode {
             Err(_) => return,
         };
 
+        let stream_id = parsed.header.stream_id;
+        Self::dispatch_local_packet(parsed, decrypted, from_node, session, ctx, false);
+        while let Some(held) = session.take_in_order_frame(stream_id) {
+            Self::dispatch_local_packet(held.parsed, held.decrypted, from_node, session, ctx, true);
+        }
+    }
+
+    /// Dispatch one decrypted packet: stream accounting, then the
+    /// subprotocol chain, then the event plane.
+    ///
+    /// `released` marks a frame coming back out of its stream's
+    /// in-order hold. Such a frame was accounted when it arrived —
+    /// its sequence is recorded, its bytes are charged and its ack is
+    /// on the way — so re-running the accounting would offer the
+    /// sequence a second time and be told, correctly, that it is a
+    /// duplicate.
+    fn dispatch_local_packet(
+        parsed: ParsedPacket,
+        decrypted: Bytes,
+        from_node: u64,
+        session: &NetSession,
+        ctx: &DispatchCtx,
+        released: bool,
+    ) {
+        let inbound = &ctx.inbound;
+        let num_shards = ctx.num_shards;
+
         // **One stream, one sequence space.** A peer allocates every
         // sequence on a stream from that stream's single counter,
         // whatever subprotocol the frame carries: a browser leaf's
@@ -28317,18 +28378,35 @@ impl MeshNode {
         // session's own control-sequence counter
         // (`NetSession::next_control_tx_seq`), not a stream's, and no
         // sender tracks them for retransmit.
-        if Self::accounts_inbound_subprotocol(parsed.header.subprotocol_id)
+        if !released
+            && Self::accounts_inbound_subprotocol(parsed.header.subprotocol_id)
             && parsed.header.stream_id != CONTROL_STREAM_ID
             && !parsed.header.flags.is_handshake()
-            && !Self::account_inbound_stream_packet(
+        {
+            match Self::account_inbound_stream_packet(
                 &parsed,
                 (decrypted.len() + PACKET_WIRE_OVERHEAD) as u64,
                 Self::charges_inbound_bytes(parsed.header.subprotocol_id),
                 session,
                 ctx,
-            )
-        {
-            return;
+            ) {
+                // Deliverable, but ordering is ordering: if the
+                // stream is already holding frames, this one joins
+                // them so the drain releases the whole run in
+                // sequence order. Frames held BELOW this sequence —
+                // what a conceded boundary gap leaves behind —
+                // would otherwise be delivered after it.
+                InboundDisposition::Deliver if session.holds_in_order(parsed.header.stream_id) => {
+                    Self::hold_inbound_in_order(parsed, decrypted, session);
+                    return;
+                }
+                InboundDisposition::Deliver => {}
+                InboundDisposition::Drop => return,
+                InboundDisposition::Hold => {
+                    Self::hold_inbound_in_order(parsed, decrypted, session);
+                    return;
+                }
+            }
         }
 
         // Check subprotocol — migration messages are sent as single event frames
@@ -29429,6 +29507,35 @@ impl MeshNode {
         // symmetric — the sender debits the same quantity via
         // `wire_bytes_for_payload` on admission.
         let payload_bytes = (decrypted.len() + PACKET_WIRE_OVERHEAD) as u64;
+
+        // Credit-window bookkeeping, the ack this receiver owes the
+        // sender, and the FIFO decision — see
+        // `account_inbound_stream_packet`. This is the event plane's
+        // turn: every other subprotocol was accounted at the top of
+        // this function ("one stream, one sequence space"), and an
+        // unrecognised subprotocol id returned above, so the guard
+        // keeps a packet from being charged twice.
+        //
+        // It runs BEFORE the frame is parsed into events because an
+        // out-of-order arrival is parked whole — the bytes, and the
+        // header they were parsed with — and released once the
+        // sequences in front of it have been delivered.
+        if !released && parsed.header.subprotocol_id == 0 {
+            match Self::account_inbound_stream_packet(&parsed, payload_bytes, true, session, ctx) {
+                // Same ordering rule as the control-plane site above.
+                InboundDisposition::Deliver if session.holds_in_order(parsed.header.stream_id) => {
+                    Self::hold_inbound_in_order(parsed, decrypted, session);
+                    return;
+                }
+                InboundDisposition::Deliver => {}
+                InboundDisposition::Drop => return,
+                InboundDisposition::Hold => {
+                    Self::hold_inbound_in_order(parsed, decrypted, session);
+                    return;
+                }
+            }
+        }
+
         let events = EventFrame::read_events(decrypted, parsed.header.event_count);
 
         let stream_id = parsed.header.stream_id;
@@ -29474,20 +29581,6 @@ impl MeshNode {
                 }
             }
         }
-
-        // Credit-window bookkeeping and the ack this receiver owes
-        // the sender — see `account_inbound_stream_packet`. This is
-        // the event plane's turn: every other subprotocol was
-        // accounted at the top of this function ("one stream, one
-        // sequence space"), and an unrecognised subprotocol id falls
-        // through to here, so the guard keeps a packet from being
-        // charged twice.
-        if parsed.header.subprotocol_id == 0
-            && !Self::account_inbound_stream_packet(&parsed, payload_bytes, true, session, ctx)
-        {
-            return;
-        }
-
         // **Leaf fragments become one event here (Stage 5 R4).**
         //
         // A browser leaf cannot exceed `MAX_PAYLOAD_SIZE` in one
@@ -29790,15 +29883,24 @@ impl MeshNode {
             None
         };
 
-        // Delivery-order contract (H-8): events are pushed in ARRIVAL
-        // order, each tagged with the packet's `seq`. The reliability
-        // layer guarantees gap-free eventual delivery (retransmit), but
-        // NOT ordering at this point — an out-of-order arrival or a
-        // retransmit lands here in the order it hit the wire. Consumers
-        // needing strict order reassemble by `StoredEvent::seq` (see the
-        // blob-transfer engine's reorder buffer); ones that frame their
-        // own ordering (nRPC keys on EventMeta/call_id) or tolerate
-        // reordering ignore it.
+        // Delivery-order contract: events are pushed in DELIVERY
+        // order, each tagged with the packet's `seq`.
+        //
+        // On a RELIABLE stream that is sequence order — the receive
+        // path holds an out-of-order arrival and releases it once the
+        // sequences in front of it have been delivered, so a wire
+        // reorder or a late retransmit is invisible here (see
+        // `account_inbound_stream_packet` and
+        // `StreamState::hold_out_of_order`). Ordering used to be the
+        // consumer's problem, which meant every consumer that did not
+        // implement a reorder buffer — an nRPC service handler, for
+        // one — observed the wire's order on a stream whose contract
+        // says it will not.
+        //
+        // On a fire-and-forget stream it is still arrival order,
+        // which is that mode's whole point: nothing is held, nothing
+        // is recovered, and a gap is reported rather than waited for.
+        //
         // **R1: the application queue is a local effect.** Gate 5
         // sat on the unary RPC bridge only, so an ordinary event
         // from a provisional peer was pushed straight into the
@@ -29834,11 +29936,17 @@ impl MeshNode {
     }
 
     /// Record one inbound packet against **its stream's** receive
-    /// state and enqueue the `StreamWindow` its sender is owed.
+    /// state, enqueue the `StreamWindow` its sender is owed, and say
+    /// what the dispatch path must do with the bytes.
     ///
-    /// Returns `false` when a provisional sender's stream allocation
-    /// was refused (R3) — the caller must drop the frame before any
-    /// further receive state exists.
+    /// [`InboundDisposition::Drop`] covers a provisional sender's
+    /// refused stream allocation (R3), a duplicate, and a sequence
+    /// there is no room to hold in order;
+    /// [`InboundDisposition::Hold`] is a reliable stream's
+    /// out-of-order arrival, which the caller parks on the stream and
+    /// the dispatch loop releases once the gap in front of it is
+    /// filled. Only [`InboundDisposition::Deliver`] may be dispatched
+    /// by the caller.
     ///
     /// Two properties this centralises, both of which a stream's
     /// *sender* depends on to make progress:
@@ -29877,13 +29985,17 @@ impl MeshNode {
         charge_bytes: bool,
         session: &NetSession,
         ctx: &DispatchCtx,
-    ) -> bool {
+    ) -> InboundDisposition {
         let stream_id = parsed.header.stream_id;
+        let seq = parsed.header.sequence;
+        let mut disposition = InboundDisposition::Deliver;
         let total_consumed = {
-            // Create the receive-side stream reliable when the packet is
+            // Make the receive-side stream reliable when the packet is
             // RELIABLE-flagged, so it tracks SACK and can NACK lost
             // sequences. The sender's reliability is a property of the
-            // traffic (the flag), not the receiver's default_reliable.
+            // traffic (the flag), not the receiver's default_reliable,
+            // and not of whichever mode happened to open the id first
+            // — see `StreamState::ensure_reliable`.
             let reliable_pkt = parsed.header.flags.contains(PacketFlags::RELIABLE);
             // R3: a provisional sender's stream allocation is
             // reserved BEFORE it happens — the two-stream and
@@ -29898,13 +30010,47 @@ impl MeshNode {
                 session,
                 ctx,
             ) {
-                return false;
+                return InboundDisposition::Drop;
             }
             let stream = session
                 .get_or_create_stream_for_packet(stream_id, ctx.default_reliable || reliable_pkt);
-            let accepted = stream.with_reliability(|r| r.on_receive(parsed.header.sequence));
+            // **FIFO within a reliable stream.** Room to hold an
+            // out-of-order arrival is reserved BEFORE the sequence is
+            // offered to the reliability mode, because acceptance
+            // records it as received and SACKs it — after which the
+            // sender drops its descriptor and this side holds the
+            // only copy. No room therefore means "not accepted": the
+            // sequence stays the sender's to send again.
+            //
+            // The exemption is **feedback**, not "control": the four
+            // stream-control messages are the credit and reliability
+            // loop itself (`Self::charges_inbound_bytes` names
+            // exactly that set and says why), and holding one behind
+            // a gap would deadlock the stream it exists to unblock.
+            // They still consume a sequence, so they are still
+            // recorded and acknowledged — only never parked. Same
+            // exemption, same reason, as the leaf's receive half.
+            let ordered =
+                stream.reliable_mode() && Self::charges_inbound_bytes(parsed.header.subprotocol_id);
+            let frontier = ordered.then(|| stream.with_reliability(|r| r.rx_ack_seq()));
+            let accepted = if frontier.is_some_and(|next_expected| {
+                seq > next_expected && !stream.has_reorder_room(payload_bytes as usize)
+            }) {
+                disposition = InboundDisposition::Drop;
+                false
+            } else {
+                stream.with_reliability(|r| r.on_receive(seq))
+            };
             if accepted {
-                stream.update_rx_seq(parsed.header.sequence);
+                stream.update_rx_seq(seq);
+                // Ordered and still above the contiguous frontier:
+                // recorded and acknowledged, but not the consumer's
+                // until what precedes it has been delivered.
+                if ordered && seq >= stream.with_reliability(|r| r.rx_ack_seq()) {
+                    disposition = InboundDisposition::Hold;
+                }
+            } else {
+                disposition = InboundDisposition::Drop;
             }
             if accepted && charge_bytes {
                 stream.on_bytes_consumed(payload_bytes)
@@ -29922,7 +30068,7 @@ impl MeshNode {
         };
 
         let Some(total_consumed) = total_consumed else {
-            return true;
+            return disposition;
         };
         // Resolve the sending peer.
         //
@@ -29934,10 +30080,10 @@ impl MeshNode {
         let Some((peer_addr, peer_session)) =
             Self::resolve_grant_peer(&ctx.peers, &ctx.addr_to_node, session)
         else {
-            return true;
+            return disposition;
         };
         if ctx.partition_filter.contains(&peer_addr) {
-            return true;
+            return disposition;
         }
         // Enqueue for the per-mesh drainer
         // (`spawn_stream_grant_drainer_loop`). Same-key
@@ -29960,7 +30106,25 @@ impl MeshNode {
             );
         }
         ctx.pending_stream_grants_notify.notify_one();
-        true
+        disposition
+    }
+
+    /// Park one accounted-but-out-of-order arrival on its stream so
+    /// the sequences in front of it are delivered first.
+    ///
+    /// The room was reserved before the sequence was accepted, so
+    /// there is nothing to refuse here. A stream that vanished
+    /// between the two (close, or session replacement) drops the
+    /// frame: its consumer is gone, and the sender's own reset
+    /// machinery is what reports that.
+    fn hold_inbound_in_order(parsed: ParsedPacket, decrypted: Bytes, session: &NetSession) {
+        let stream_id = parsed.header.stream_id;
+        let seq = parsed.header.sequence;
+        session.hold_in_order_frame(
+            stream_id,
+            seq,
+            net_wire::session::HeldFrame { parsed, decrypted },
+        );
     }
 
     /// Does this node DISPATCH `subprotocol_id`, and therefore owe
@@ -43985,11 +44149,46 @@ impl MeshNode {
     /// session is no longer the incarnation the handle was opened
     /// against (R12) — the handle is inert for good, and the stream id
     /// it names may be live on the successor with a different config.
+    ///
+    /// Returns [`StreamError::EventTooLarge`] when any single event in
+    /// `events` exceeds [`protocol::MAX_EVENT_SIZE`], and returns it
+    /// **before the peer is even resolved** — nothing is enqueued and
+    /// no packet of the call reaches the wire.
+    ///
+    /// This is the *only* honest disposition, and it is deliberately
+    /// not fragmentation. The batching loop below splits a batch
+    /// across packets, but it cannot split one event, and no native
+    /// send path stamps `frag_flags`: the only producer in the tree
+    /// that fragments is the browser leaf's `frame` module. Pre-repair
+    /// this path built an over-cap packet anyway, whose `payload_len`
+    /// no receiver accepts — every native receive path reads into a
+    /// `MAX_PACKET_SIZE` buffer and `NetHeader::validate` refuses an
+    /// over-cap length — so the call returned `Ok` and the bytes were
+    /// never delivered anywhere. Fragmenting here instead would be
+    /// worse: a native peer has no reassembly arm (only the RTC
+    /// ingress and the browser leaf do), so its application would be
+    /// handed N partial events as if each were a message. A refusal
+    /// that names the limit is discoverable; `Ok` plus silence is not.
     pub async fn send_on_stream(
         &self,
         stream: &Stream,
         events: &[Bytes],
     ) -> Result<(), StreamError> {
+        // Refused before any state is touched, so the answer is the
+        // same whether or not the peer is connected: this is a
+        // property of the caller's bytes, not of the session. Checked
+        // over the WHOLE slice up front — the batching loop flushes
+        // as it goes, so validating inline would put the events
+        // before the offending one on the wire and then report a
+        // failure, which is exactly the partial delivery the typed
+        // refusal exists to prevent.
+        if let Some(event) = events.iter().find(|e| e.len() > protocol::MAX_EVENT_SIZE) {
+            return Err(StreamError::EventTooLarge {
+                size: event.len(),
+                limit: protocol::MAX_EVENT_SIZE,
+            });
+        }
+
         let peer = self
             .peers
             .get(&stream.peer_node_id())

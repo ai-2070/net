@@ -189,6 +189,27 @@ pub trait ReliabilityMode: Send + Sync {
     /// Default no-op (fire-and-forget tracks no receive state).
     fn reset_rx(&mut self) {}
 
+    /// Receiver-side: the highest sequence this mode has accepted on
+    /// this stream, or `None` when it has accepted none.
+    ///
+    /// Read by [`StreamState::ensure_reliable`] so a reliable mode
+    /// replacing a fire-and-forget one resumes at the sequence the
+    /// peer is actually sending. Default `None` — "nothing accepted"
+    /// is the safe answer for a mode that tracks no receive state,
+    /// because it leaves the replacement's cursor at zero.
+    fn rx_accepted_high_water(&self) -> Option<u64> {
+        None
+    }
+
+    /// Receiver-side: expect `next_expected` next, with nothing
+    /// recorded as missing below it.
+    ///
+    /// The other half of the upgrade handoff: everything below
+    /// `next_expected` arrived under a mode that retained no
+    /// descriptor for it, so it is as acknowledged as it will ever
+    /// be and must not be NACKed. Default no-op.
+    fn resume_rx_at(&mut self, _next_expected: u64) {}
+
     /// Get the name of this reliability mode
     fn name(&self) -> &'static str;
 }
@@ -203,8 +224,14 @@ pub trait ReliabilityMode: Send + Sync {
 /// - Metrics/telemetry
 #[derive(Debug, Default)]
 pub struct FireAndForget {
-    /// Last sequence received (for ordering check)
+    /// Highest sequence received, and whether any has been. Read by
+    /// the fire-and-forget → reliable upgrade
+    /// ([`crate::session::StreamState::ensure_reliable`]) to place
+    /// the replacement's receive cursor: sequence 0 having arrived
+    /// and nothing having arrived are different facts, so the
+    /// high-water mark alone cannot carry it.
     last_seq: AtomicU64,
+    received: bool,
 }
 
 impl FireAndForget {
@@ -222,9 +249,15 @@ impl ReliabilityMode for FireAndForget {
 
     #[inline]
     fn on_receive(&mut self, seq: u64) -> bool {
-        // Update last sequence (informational only)
         self.last_seq.fetch_max(seq, Ordering::Relaxed);
+        self.received = true;
         true // Always accept
+    }
+
+    #[inline]
+    fn rx_accepted_high_water(&self) -> Option<u64> {
+        self.received
+            .then(|| self.last_seq.load(Ordering::Relaxed))
     }
 
     #[inline]
@@ -313,6 +346,17 @@ pub struct ReliableStream {
     /// order and reassembled by seq — so memory is
     /// O([`Self::MAX_REORDER_RANGES`]).
     received_ranges: VecDeque<(u64, u64)>,
+    /// Set while this mode is RESUMING a stream that carried
+    /// fire-and-forget traffic before it became reliable
+    /// ([`crate::session::StreamState::ensure_reliable`]): the
+    /// sequence below which everything is conceded, and above which
+    /// the first arrival defines the reliable baseline. `None` once
+    /// that arrival has landed, which is every ordinary stream from
+    /// its first packet.
+    resume_floor: Option<u64>,
+    /// Sequences above [`Self::resume_floor`] that have arrived while
+    /// the floor itself has not. The evidence a concession needs.
+    resume_above: u64,
     /// Out-of-order arrivals accepted into the range index (R-2).
     oo_accepted: u64,
     /// Arrivals rejected past the reorder horizon (R-2).
@@ -444,6 +488,20 @@ impl ReliableStream {
     /// recovers whatever a reject drops.
     pub const MAX_REORDER_RANGES: usize = 32;
 
+    /// How many later sequences must arrive without the resume floor
+    /// before a RESUMED stream concedes it (see `on_receive`).
+    ///
+    /// Two properties fix the number. It has to exceed ordinary
+    /// reordering depth, or a reliable packet merely late would be
+    /// conceded while its own retransmit was in flight. And it has to
+    /// be small enough that a boundary hole the sender genuinely
+    /// cannot rebuild — a fire-and-forget sequence it retained
+    /// nothing for — is conceded within the same burst rather than
+    /// stalling the stream to its transfer timeout. Eight arrivals is
+    /// several NACK ticks' worth of chances for a recoverable packet
+    /// and a small fraction of any real burst.
+    pub const RESUME_CONCESSION_ARRIVALS: u64 = 8;
+
     /// Cap on the reorder-acceptance horizon in packets (R-2). Equal
     /// to the retransmit-window cap — accepting further ahead than
     /// the sender can even track for retransmit is pointless.
@@ -491,6 +549,8 @@ impl ReliableStream {
         Self {
             next_expected: 0,
             received_ranges: VecDeque::new(),
+            resume_floor: None,
+            resume_above: 0,
             oo_accepted: 0,
             oo_dropped_horizon: 0,
             oo_dropped_capacity: 0,
@@ -846,6 +906,51 @@ impl ReliabilityMode for ReliableStream {
     }
 
     fn on_receive(&mut self, seq: u64) -> bool {
+        // **A RESUMED stream's head gap is ambiguous, and is asked
+        // for before it is conceded.** A stream that carried
+        // fire-and-forget traffic before it became reliable
+        // (`crate::session::StreamState::ensure_reliable`) resumes at
+        // the sequence after the last one it observed — but under
+        // fire-and-forget a sequence can simply have been lost, so
+        // that floor may name a hole no retransmit can ever produce:
+        // its sender retained no descriptor for it. Waiting on it
+        // forever holds every reliable arrival behind a permanent
+        // stall, which is worse than the loss.
+        //
+        // So the floor is treated as a gap FIRST — it is NACKed like
+        // any other, and a genuinely reliable packet lost at the
+        // boundary is recovered normally — and conceded only once
+        // [`Self::RESUME_CONCESSION_ARRIVALS`] later sequences have
+        // arrived without it. That is the evidence that the sender
+        // has moved on and cannot rebuild it. The concession then
+        // starts the stream at the lowest sequence actually received,
+        // so everything held behind the phantom hole is released in
+        // order rather than discarded.
+        if let Some(floor) = self.resume_floor {
+            if seq < floor {
+                return false;
+            }
+            if seq == floor {
+                self.resume_floor = None;
+                self.resume_above = 0;
+            } else {
+                self.resume_above += 1;
+                if self.resume_above >= Self::RESUME_CONCESSION_ARRIVALS {
+                    self.resume_floor = None;
+                    self.resume_above = 0;
+                    self.next_expected = self
+                        .received_ranges
+                        .front()
+                        .map_or(seq, |&(start, _)| start.min(seq));
+                    if let Some(&(start, end)) = self.received_ranges.front() {
+                        if start == self.next_expected {
+                            self.next_expected = end;
+                            self.received_ranges.pop_front();
+                        }
+                    }
+                }
+            }
+        }
         // Anything below next_expected has already been received
         // contiguously; reject as a duplicate.
         if seq < self.next_expected {
@@ -1224,6 +1329,26 @@ impl ReliabilityMode for ReliableStream {
     fn reset_rx(&mut self) {
         self.next_expected = 0;
         self.received_ranges.clear();
+        self.resume_floor = None;
+        self.resume_above = 0;
+    }
+
+    /// The contiguous frontier: everything below `next_expected` is
+    /// received, so the highest accepted contiguous sequence is one
+    /// below it. `None` before anything arrives.
+    #[inline]
+    fn rx_accepted_high_water(&self) -> Option<u64> {
+        self.next_expected.checked_sub(1)
+    }
+
+    fn resume_rx_at(&mut self, next_expected: u64) {
+        self.next_expected = next_expected;
+        self.received_ranges.clear();
+        // The floor is a GAP, not a concession: it is NACKed first,
+        // and only conceded once enough later sequences have arrived
+        // without it. See `on_receive`.
+        self.resume_floor = Some(next_expected);
+        self.resume_above = 0;
     }
 
     #[inline]

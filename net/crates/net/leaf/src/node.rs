@@ -2933,6 +2933,75 @@ mod tests {
         );
     }
 
+    /// **P4's recovery witness: one stream id, two modes.** A leaf
+    /// publishing nRPC requests derives the stream id from the
+    /// channel, so a fire-and-forget leg and a reliable leg on the
+    /// same service ride ONE id — which is exactly what the browser
+    /// matrix does with `app.stage5.sink`.
+    ///
+    /// `NetSession::open_stream_full` was first-open-wins for the
+    /// reliability mode as well as for the window, so the reliable
+    /// leg was admitted onto the fire-and-forget machinery:
+    /// `FireAndForget::on_send` retains nothing, so the sender had
+    /// no descriptor to rebuild from, the receiver kept no gap state
+    /// to NACK against, and a lost packet was silent loss — no
+    /// retransmit, and no terminal failure to report it either.
+    /// RELIABLE is now authoritative and monotonic on both halves.
+    #[test]
+    fn a_reliable_send_recovers_on_an_id_that_first_carried_fire_and_forget() {
+        let (mut a, mut b) = pair();
+        let (aid, bid) = (a.node_id(), b.node_id());
+        let id = crate::stream::LEAF_STREAM_DISCRIMINATOR | 0x5b;
+
+        // The fire-and-forget leg. It opens the id on both halves.
+        let faf = a
+            .open_stream(bid, "shared", Reliability::FireAndForget, Some(id), Some(9))
+            .expect("open");
+        a.stream_send(faf, b"faf").expect("send");
+        assert_eq!(pump(&mut a, &mut b), 1);
+        assert_eq!(delivered(&mut b), vec![b"faf".to_vec()]);
+        assert!(
+            !a.sessions.get(bid).expect("session").wire().has_unacked(),
+            "fire-and-forget retains no retransmit owner"
+        );
+
+        // The same id, now RELIABLE. Three packets, the middle one
+        // lost and the last one arriving early.
+        let rel = a
+            .open_stream(bid, "shared", Reliability::Reliable, Some(id), Some(9))
+            .expect("open");
+        for body in [b"one".as_slice(), b"two".as_slice(), b"three".as_slice()] {
+            a.stream_send(rel, body).expect("send");
+        }
+        let packets = a.take_outbound();
+        assert_eq!(packets.len(), 3);
+        assert!(
+            a.sessions.get(bid).expect("session").wire().has_unacked(),
+            "a reliable send must leave a retransmit owner behind whatever \
+             mode opened the id first"
+        );
+
+        b.on_datagram(aid, packets[2].packet.clone(), clock::now());
+        b.on_datagram(aid, packets[0].packet.clone(), clock::now());
+        assert_eq!(
+            delivered(&mut b),
+            vec![b"one".to_vec()],
+            "the reorder buffer must hold 'three' behind the missing 'two'"
+        );
+
+        b.tick(clock::now());
+        assert!(pump(&mut b, &mut a) > 0, "the gap must produce a NACK");
+        assert!(
+            pump(&mut a, &mut b) > 0,
+            "the NACK must produce a retransmit"
+        );
+        assert_eq!(
+            delivered(&mut b),
+            vec![b"two".to_vec(), b"three".to_vec()],
+            "recovery must release the held sequence too, in order"
+        );
+    }
+
     /// **R3's replenishment witness, leaf to leaf.** More bytes than
     /// one send window, through the ordinary send path. Without the
     /// receiver returning grants the sender's credit reaches zero and

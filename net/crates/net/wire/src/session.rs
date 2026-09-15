@@ -6,7 +6,7 @@
 use bytes::Bytes;
 use crossbeam_queue::SegQueue;
 use dashmap::DashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -80,6 +80,17 @@ pub struct NetSession {
     // thread-local pool's nonce sequencing).
     /// Per-stream state
     streams: DashMap<u64, StreamState>,
+    /// Out-of-order arrivals this session's reliable streams are
+    /// holding, summed across streams.
+    ///
+    /// Exists so the dispatch path's post-delivery release check is
+    /// one relaxed load on the overwhelmingly common path — no
+    /// reordering in flight, nothing held, nothing to release —
+    /// instead of a `DashMap` probe plus two mutex acquisitions per
+    /// inbound packet. Maintained by
+    /// [`Self::hold_in_order_frame`] / [`Self::take_in_order_frame`]
+    /// and by every path that drops a hold.
+    inorder_held: AtomicUsize,
     /// Last activity timestamp (for session timeout)
     last_activity: AtomicU64,
     /// Thread-local pool for zero-contention hot path. The single
@@ -188,6 +199,7 @@ impl NetSession {
             peer_addr,
             rx_cipher,
             streams: DashMap::new(),
+            inorder_held: AtomicUsize::new(0),
             last_activity: AtomicU64::new(current_timestamp()),
             thread_local_pool,
             default_reliable,
@@ -404,21 +416,32 @@ impl NetSession {
     }
 
     /// Like [`Self::get_or_create_stream`], but the receiver-side stream
-    /// is created reliable when the arriving packet is `RELIABLE`-flagged
+    /// is made reliable when the arriving packet is `RELIABLE`-flagged
     /// — the sender's reliability is a property of the traffic, not of
-    /// the receiver's `default_reliable`. Without this the auto-created
-    /// receive stream is `FireAndForget` and never builds a NACK, so a
-    /// reliable sender's lost packets are unrecoverable. Only affects the
-    /// reliability mode at first-touch (creation); an existing stream
-    /// keeps its mode.
+    /// the receiver's `default_reliable`. Without this the receive
+    /// stream is `FireAndForget` and never builds a NACK, so a
+    /// reliable sender's lost packets are unrecoverable.
+    ///
+    /// This holds for an **existing** stream too, not only at
+    /// first-touch: a channel's publish stream id is derived from the
+    /// channel, so fire-and-forget and reliable traffic to one
+    /// channel share one id, and whichever arrived first used to pin
+    /// the mode for the session's lifetime. See
+    /// [`StreamState::ensure_reliable`] — the upgrade is one-way, so
+    /// unreliable traffic on a reliable stream changes nothing.
     pub fn get_or_create_stream_for_packet(
         &self,
         stream_id: u64,
         reliable: bool,
     ) -> dashmap::mapref::one::RefMut<'_, u64, StreamState> {
-        self.streams
+        let stream = self
+            .streams
             .entry(stream_id)
-            .or_insert_with(|| StreamState::new(reliable))
+            .or_insert_with(|| StreamState::new(reliable));
+        if reliable {
+            stream.ensure_reliable();
+        }
+        stream
     }
 
     /// Collect retransmit descriptors for every reliable stream whose
@@ -913,10 +936,13 @@ impl NetSession {
     /// Open a stream with an explicit reliability mode and fair-scheduler
     /// weight.
     ///
-    /// Idempotent: if the stream already exists, this is a no-op and the
-    /// caller's config is **ignored with a warning log** — the first open
-    /// wins. Callers that want to change a stream's config must close +
-    /// re-open it.
+    /// Idempotent for an existing stream: the window and the weight are
+    /// the first opener's and a later disagreement is **ignored with a
+    /// warning log**. Reliability is not first-open-wins — a reliable
+    /// open UPGRADES a fire-and-forget stream in place
+    /// ([`StreamState::ensure_reliable`]); a fire-and-forget open on a
+    /// reliable stream is the ignored direction. Callers that want to
+    /// change a stream's window or weight must close + re-open it.
     pub fn open_stream_with(&self, stream_id: u64, reliable: bool, fairness_weight: u8) -> u64 {
         // Inherit `DEFAULT_STREAM_WINDOW_BYTES` so callers that go
         // through this convenience wrapper (notably `publish_to_peer`)
@@ -947,30 +973,54 @@ impl NetSession {
         fairness_weight: u8,
         tx_window: u32,
     ) -> u64 {
-        // First-open-wins: warn when a caller's config disagrees
-        // with the live stream's. Shared by the read-probe hit and
-        // the lost-creation-race Occupied arm below so both
-        // occupied shapes keep the pre-§2.12 warning behavior.
+        // Window and weight are first-open-wins: warn when a
+        // caller's disagrees with the live stream's. Shared by the
+        // read-probe hit and the lost-creation-race Occupied arm
+        // below so both occupied shapes keep the pre-§2.12 warning
+        // behavior.
+        //
+        // Reliability is deliberately NOT in this comparison: a
+        // reliable open is applied rather than warned about, and the
+        // reverse direction is reported by `ensure_reliable`'s own
+        // caller below. A warning is what a caller can do nothing
+        // about; silent loss on a stream whose contract says there
+        // is none is not.
         fn warn_if_config_conflicts(
             existing: &StreamState,
             stream_id: u64,
-            reliable: bool,
             fairness_weight: u8,
             tx_window: u32,
         ) {
-            if existing.reliable_mode() != reliable
-                || existing.fairness_weight() != fairness_weight.max(1)
+            if existing.fairness_weight() != fairness_weight.max(1)
                 || existing.tx_window() != tx_window
             {
                 tracing::warn!(
                     stream_id = format!("{:#x}", stream_id),
-                    existing_reliable = existing.reliable_mode(),
-                    new_reliable = reliable,
                     existing_weight = existing.fairness_weight(),
                     new_weight = fairness_weight,
                     existing_tx_window = existing.tx_window(),
                     new_tx_window = tx_window,
                     "open_stream: ignoring conflicting config; first open wins"
+                );
+            }
+        }
+
+        /// Apply the reliability half of an open to a stream that
+        /// already exists: upgrade to reliable, or report the
+        /// downgrade that is not happening.
+        fn reconcile_reliability(existing: &StreamState, stream_id: u64, reliable: bool) {
+            if reliable {
+                if existing.ensure_reliable() {
+                    tracing::debug!(
+                        stream_id = format!("{:#x}", stream_id),
+                        "open_stream: upgraded a fire-and-forget stream to reliable"
+                    );
+                }
+            } else if existing.reliable_mode() {
+                tracing::warn!(
+                    stream_id = format!("{:#x}", stream_id),
+                    "open_stream: ignoring a fire-and-forget open on a reliable \
+                     stream; reliability never downgrades"
                 );
             }
         }
@@ -984,7 +1034,8 @@ impl NetSession {
         // concurrent opens on other streams don't contend.
         if let Some(existing_ref) = self.streams.get(&stream_id) {
             let existing = existing_ref.value();
-            warn_if_config_conflicts(existing, stream_id, reliable, fairness_weight, tx_window);
+            warn_if_config_conflicts(existing, stream_id, fairness_weight, tx_window);
+            reconcile_reliability(existing, stream_id, reliable);
             return existing.epoch();
         }
         // Slow path: stream missing. Take the write lock and
@@ -997,7 +1048,8 @@ impl NetSession {
                 // same first-open-wins semantics (and the same
                 // conflict warning) as the read-probe hit above.
                 let existing = existing.get();
-                warn_if_config_conflicts(existing, stream_id, reliable, fairness_weight, tx_window);
+                warn_if_config_conflicts(existing, stream_id, fairness_weight, tx_window);
+                reconcile_reliability(existing, stream_id, reliable);
                 existing.epoch()
             }
             Entry::Vacant(v) => {
@@ -1027,6 +1079,9 @@ impl NetSession {
         if let Some((_, state)) = self.streams.remove(&stream_id) {
             state.deactivate();
             self.recently_closed.insert(stream_id, SystemClock::now());
+            // Whatever it was holding goes with it: the consumer
+            // that was owed those frames is the one closing.
+            self.forget_in_order_hold(&state);
         }
     }
 
@@ -1067,6 +1122,7 @@ impl NetSession {
                 let (_, state) = occupied.remove_entry();
                 state.deactivate();
                 self.recently_closed.insert(stream_id, SystemClock::now());
+                self.forget_in_order_hold(&state);
                 StreamCloseOutcome::Closed
             }
         }
@@ -1124,7 +1180,80 @@ impl NetSession {
         if let Some(state) = self.streams.get(&stream_id) {
             state.reset_rx_seq();
             state.with_reliability(|r| r.reset_rx());
+            // The gap those frames are queued behind is the gap the
+            // peer just gave up on, so it never fills. Releasing
+            // them now would be delivery out of order; keeping them
+            // would be a hold nothing can drain. They are data this
+            // receiver accepted and will not deliver, so the drop is
+            // reported rather than silent.
+            let discarded = self.forget_in_order_hold(&state);
+            if discarded > 0 {
+                tracing::warn!(
+                    stream_id = format!("{stream_id:#x}"),
+                    discarded,
+                    "stream reset: the sender gave up on a gap, so arrivals held \
+                     behind it can never be delivered in order"
+                );
+            }
         }
+    }
+
+    /// Whether this stream is holding any out-of-order arrival.
+    ///
+    /// The dispatch path asks before delivering an in-order packet
+    /// directly: if anything is already parked, the packet joins the
+    /// hold instead, so ONE drain releases the whole run in sequence
+    /// order. Delivering it first would put it ahead of frames that
+    /// precede it — which is what a conceded boundary gap looks like.
+    /// One relaxed load when nothing is held anywhere.
+    pub fn holds_in_order(&self, stream_id: u64) -> bool {
+        self.inorder_held.load(Ordering::Relaxed) != 0
+            && self
+                .streams
+                .get(&stream_id)
+                .is_some_and(|state| state.reorder_held() != 0)
+    }
+
+    /// Hold one out-of-order arrival on `stream_id` until the
+    /// sequences in front of it have been delivered. A no-op for a
+    /// stream that no longer exists — its consumer is gone.
+    pub fn hold_in_order_frame(&self, stream_id: u64, seq: u64, frame: HeldFrame) {
+        if let Some(state) = self.streams.get(&stream_id) {
+            if state.hold_out_of_order(seq, frame) {
+                self.inorder_held.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Take the next arrival a reliable stream is holding that is
+    /// now in order, or `None` when there is nothing to release.
+    ///
+    /// The dispatch path calls this in a loop after every packet it
+    /// delivers: one arrival filling a head gap can release
+    /// everything queued behind it, and `next_expected` — the
+    /// receiver's contiguous frontier — is what decides how much.
+    /// Nothing held anywhere in the session is one relaxed load.
+    pub fn take_in_order_frame(&self, stream_id: u64) -> Option<HeldFrame> {
+        if self.inorder_held.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        let state = self.streams.get(&stream_id)?;
+        let next_expected = state.with_reliability(|r| r.rx_ack_seq());
+        let frame = state.take_in_order_below(next_expected)?;
+        self.inorder_held.fetch_sub(1, Ordering::Relaxed);
+        Some(frame)
+    }
+
+    /// Drop a stream's hold and take its frames out of the session's
+    /// count. The one path allowed to discard held bytes, because it
+    /// is the one place that knows they can never be released in
+    /// order: the peer reset the stream, or the stream is gone.
+    fn forget_in_order_hold(&self, state: &StreamState) -> usize {
+        let dropped = state.clear_in_order_hold();
+        if dropped > 0 {
+            self.inorder_held.fetch_sub(dropped, Ordering::Relaxed);
+        }
+        dropped
     }
 
     /// Whether a `StreamWindow` grant for `stream_id` should be
@@ -1444,10 +1573,17 @@ pub struct StreamState {
     /// Nanoseconds since epoch of the last activity (send or receive).
     /// Used by the session's idle-eviction sweep.
     last_activity: AtomicU64,
-    /// Reliability mode this stream was created with. Stored so
-    /// `open_stream` can warn when a caller re-opens with a different
-    /// config (config is immutable for the stream's lifetime).
-    reliable_mode: bool,
+    /// Whether this stream's reliability mode is the reliable one.
+    /// Mirrors the boxed mode behind `reliability` so the common
+    /// "is this stream reliable" question costs one atomic load
+    /// instead of a mutex acquisition.
+    ///
+    /// **Monotonic, never a downgrade.** A stream opens with the
+    /// mode its first opener asked for, but RELIABLE is a strictly
+    /// stronger contract than fire-and-forget and the traffic, not
+    /// the first open, is what decides whether it is owed: see
+    /// [`Self::ensure_reliable`].
+    reliable_mode: AtomicBool,
     /// Fair-scheduler quantum multiplier (1 = equal share).
     fairness_weight: u8,
     /// Configured initial credit window in **bytes** for this stream's
@@ -1517,6 +1653,56 @@ pub struct StreamState {
     /// (`get_or_create_stream`, `send_to_peer` / `send_routed`) that
     /// don't go through the typed handle API.
     epoch: u64,
+    /// Out-of-order arrivals this receiver is holding so a reliable
+    /// stream delivers in sequence order. Empty for every
+    /// fire-and-forget stream and for every reliable stream on a
+    /// link that is not reordering, which is why it is created lazily
+    /// rather than allocated per stream. See [`InOrderBuffer`].
+    inorder: parking_lot::Mutex<InOrderBuffer>,
+}
+
+/// One arrival a reliable stream is holding until the sequences
+/// before it are delivered.
+///
+/// Keeps the decrypted bytes and the header they were parsed from,
+/// because that is what the dispatch path consumes: the packet has
+/// already paid AEAD and been admitted by the replay window, and
+/// neither is repeatable.
+pub struct HeldFrame {
+    /// The header (and source) the frame arrived with.
+    pub parsed: ParsedPacket,
+    /// The frame's decrypted payload.
+    pub decrypted: Bytes,
+}
+
+/// The bounded per-stream hold that makes reliable delivery FIFO.
+///
+/// **Why the receiver holds rather than the consumer reassembling.**
+/// `Reliability::Reliable` promises gap-free delivery *in sequence
+/// order*; a receiver that pushed arrivals through in wire order
+/// delegated that promise to every consumer, and the consumers that
+/// did not implement a reorder buffer (an nRPC service handler, for
+/// one) simply observed the wire's order — so a link that reordered,
+/// or a retransmit that healed a gap late, was silently delivered
+/// out of order on the one mode whose contract forbids it.
+///
+/// **The bound is the receive window, and the refusal is the point.**
+/// Capacity is reserved *before* the sequence is accepted, because
+/// accepting one records it as received (and SACKs it), after which
+/// the sender drops it from its retransmit window and this side is
+/// the only copy. A frame that does not fit is therefore never
+/// accepted: the sequence stays outstanding, the sender keeps its
+/// descriptor, and the ordinary NACK/RTO path brings it back.
+/// Holding is bounded by the bytes this receiver already promised as
+/// credit — the window the sender may have in flight is exactly the
+/// window that may need holding.
+#[derive(Default)]
+struct InOrderBuffer {
+    /// Held frames by sequence. A repeat of a held sequence replaces
+    /// its entry rather than queueing a second copy of it.
+    held: std::collections::BTreeMap<u64, HeldFrame>,
+    /// Decrypted bytes currently held, for the budget check.
+    bytes: usize,
 }
 
 /// Receive-side credit bookkeeping for the v2 round-trip window.
@@ -1723,7 +1909,7 @@ impl StreamState {
             inbound: SegQueue::new(),
             active: AtomicBool::new(true),
             last_activity: AtomicU64::new(current_timestamp()),
-            reliable_mode: reliable,
+            reliable_mode: AtomicBool::new(reliable),
             fairness_weight: fairness_weight.max(1),
             tx_window,
             // Implicit initial window: the sender starts with full
@@ -1738,6 +1924,7 @@ impl StreamState {
             credit_grants_sent: AtomicU64::new(0),
             rx_credit: RxCreditState::new(tx_window),
             epoch,
+            inorder: parking_lot::Mutex::new(InOrderBuffer::default()),
         }
     }
 
@@ -1755,10 +1942,158 @@ impl StreamState {
         self.last_activity.load(Ordering::Acquire)
     }
 
-    /// Reliability mode this stream was created with.
+    /// Whether this stream's reliability mode is the reliable one
+    /// **right now** — see [`Self::ensure_reliable`] for why that is
+    /// not always the mode it was created with.
     #[inline]
     pub fn reliable_mode(&self) -> bool {
-        self.reliable_mode
+        self.reliable_mode.load(Ordering::Acquire)
+    }
+
+    /// Make this stream reliable if it is not already. Returns
+    /// whether the mode was upgraded.
+    ///
+    /// **Why reliability is not first-open-wins.** A stream's window
+    /// and fair-share weight are the first opener's to choose: they
+    /// are local resource policy, and a second opener's disagreement
+    /// is nothing worse than a preference that lost. Reliability is
+    /// not policy. It is the delivery contract, it is strictly
+    /// stronger than fire-and-forget, and the traffic decides who is
+    /// owed it: a reliable sender's packets carry
+    /// [`PacketFlags::RELIABLE`], register retransmit descriptors,
+    /// and require the receiver to hold gap state to NACK against.
+    ///
+    /// Ignoring a reliable open because some earlier fire-and-forget
+    /// traffic created the id first — which is ordinary, since a
+    /// channel's publish stream id is derived from the channel, so
+    /// every mode publishing to one channel shares one id — admitted
+    /// the reliable sender onto fire-and-forget machinery:
+    /// [`FireAndForget::on_send`] retains nothing, so nothing could
+    /// be rebuilt, [`FireAndForget::build_nack`] is `None`, so no gap
+    /// was ever reported, and the loss was therefore silent on the
+    /// one mode whose whole contract is that it is not.
+    ///
+    /// The upgrade is one-way. A fire-and-forget open on a reliable
+    /// stream stays ignored (and warned about): downgrading would
+    /// abandon descriptors the peer is still owed.
+    ///
+    /// **What carries over.** The receive cursor, and only it.
+    /// Fire-and-forget retained no descriptor for anything it sent,
+    /// so there is no in-flight obligation for the new mode to
+    /// inherit and `pending` starts empty. The receive half must
+    /// resume at the next sequence the peer will send: starting a
+    /// fresh reliable cursor at zero would open a phantom hole as
+    /// deep as the traffic the id already carried, NACK sequences
+    /// that were never lost, and hold every later arrival behind a
+    /// gap nothing can fill.
+    pub fn ensure_reliable(&self) -> bool {
+        if self.reliable_mode.load(Ordering::Acquire) {
+            return false;
+        }
+        let mut guard = self.reliability.lock();
+        // Re-check under the lock: two concurrent upgraders must
+        // produce one replacement, not two.
+        if self.reliable_mode.load(Ordering::Acquire) {
+            return false;
+        }
+        // Always a RESUME, never a fresh cursor: an upgraded stream
+        // has a peer that is already mid-sequence, and the arrival
+        // that lands next is what places the cursor
+        // (`ReliableStream::on_receive`). The high-water mark is the
+        // floor below which everything is conceded — those sequences
+        // were sent under a mode that retained nothing, so no NACK
+        // could ever produce them.
+        let floor = guard.rx_accepted_high_water().map_or(0, |seen| seen + 1);
+        let mut upgraded =
+            create_reliability_mode(true, ReliableStream::max_pending_for_window(self.tx_window));
+        upgraded.resume_rx_at(floor);
+        *guard = upgraded;
+        self.reliable_mode.store(true, Ordering::Release);
+        drop(guard);
+        true
+    }
+
+    /// Bytes of out-of-order frames this stream may hold at once.
+    ///
+    /// The receive window is the natural budget: it is the amount
+    /// this receiver has already told the sender it may have in
+    /// flight, so it is exactly the amount that can need holding.
+    /// A window of `0` disables backpressure rather than the hold,
+    /// so the floor keeps at least one maximum-size packet holdable
+    /// — otherwise the first reordered arrival on such a stream
+    /// would be refused forever.
+    #[inline]
+    fn reorder_budget(&self) -> usize {
+        (self.tx_window as usize).max(crate::protocol::MAX_PACKET_SIZE)
+    }
+
+    /// Whether a `bytes`-long frame can be held without exceeding
+    /// [`Self::reorder_budget`].
+    ///
+    /// Asked BEFORE the sequence is offered to the reliability mode:
+    /// a sequence that is accepted is recorded as received and
+    /// SACKed, and the sender then stops owning it.
+    #[inline]
+    pub fn has_reorder_room(&self, bytes: usize) -> bool {
+        let buffer = self.inorder.lock();
+        buffer.held.is_empty() || buffer.bytes.saturating_add(bytes) <= self.reorder_budget()
+    }
+
+    /// Hold one out-of-order arrival until the sequences before it
+    /// have been delivered. Returns whether this was a NEW hold.
+    ///
+    /// A repeat of a sequence already held replaces it: the bytes are
+    /// the same bytes, and a second copy would be delivered twice.
+    /// Prefer [`NetSession::hold_in_order_frame`], which keeps the
+    /// session's release fast path in step.
+    pub fn hold_out_of_order(&self, seq: u64, frame: HeldFrame) -> bool {
+        let mut buffer = self.inorder.lock();
+        let bytes = frame.decrypted.len();
+        let replaced = buffer.held.insert(seq, frame);
+        buffer.bytes = buffer.bytes.saturating_add(bytes);
+        match replaced {
+            Some(previous) => {
+                buffer.bytes = buffer.bytes.saturating_sub(previous.decrypted.len());
+                false
+            }
+            None => true,
+        }
+    }
+
+    /// Take the lowest held frame whose sequence is now covered —
+    /// strictly below `next_expected`, the receiver's contiguous
+    /// frontier — or `None` when the hold is empty or still gapped.
+    ///
+    /// Called in a loop by the dispatch path, so one arrival that
+    /// fills a gap releases everything that was queued behind it, in
+    /// sequence order.
+    pub fn take_in_order_below(&self, next_expected: u64) -> Option<HeldFrame> {
+        let mut buffer = self.inorder.lock();
+        let &seq = buffer.held.keys().next()?;
+        if seq >= next_expected {
+            return None;
+        }
+        let frame = buffer.held.remove(&seq)?;
+        buffer.bytes = buffer.bytes.saturating_sub(frame.decrypted.len());
+        Some(frame)
+    }
+
+    /// How many out-of-order arrivals this stream is holding.
+    #[inline]
+    pub fn reorder_held(&self) -> usize {
+        self.inorder.lock().held.len()
+    }
+
+    /// Drop everything held, returning how many frames went. The
+    /// peer reset the stream or gave up on the gap, so the sequences
+    /// in front of these frames are never arriving and releasing
+    /// them would be delivery out of order.
+    pub fn clear_in_order_hold(&self) -> usize {
+        let mut buffer = self.inorder.lock();
+        let dropped = buffer.held.len();
+        buffer.held.clear();
+        buffer.bytes = 0;
+        dropped
     }
 
     /// Fair-scheduler weight for this stream.
@@ -2576,6 +2911,61 @@ mod tests {
         let ids = session.stream_ids();
         assert!(ids.contains(&0));
         assert!(ids.contains(&1));
+    }
+
+    /// **A reliable open is applied, not warned about.** A channel's
+    /// publish stream id is derived from the channel, so
+    /// fire-and-forget and reliable traffic to one channel share one
+    /// id. First-open-wins on the reliability mode left the reliable
+    /// half on fire-and-forget machinery: nothing retained to
+    /// retransmit, and `build_nack` permanently `None`, so its loss
+    /// was silent.
+    ///
+    /// The cursor half matters as much as the mode: the upgrade must
+    /// resume where the peer's traffic actually is. Starting a fresh
+    /// reliable cursor at zero would report the sequences the
+    /// fire-and-forget half already delivered as a hole nothing can
+    /// fill.
+    #[test]
+    fn a_reliable_open_upgrades_a_fire_and_forget_stream_and_keeps_its_cursor() {
+        let keys = test_keys();
+        let peer_addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9999".parse().unwrap());
+        let session = NetSession::new(keys, peer_addr, 4, false);
+        let id = 0x5B;
+
+        // Three fire-and-forget arrivals, then the reliable open.
+        session.open_stream_with(id, false, 1);
+        for seq in 0..3 {
+            let stream = session.get_or_create_stream_for_packet(id, false);
+            assert!(stream.with_reliability(|r| r.on_receive(seq)));
+        }
+        assert!(!session.try_stream(id).expect("open").reliable_mode());
+
+        session.open_stream_with(id, true, 1);
+        let stream = session.try_stream(id).expect("still open");
+        assert!(stream.reliable_mode(), "a reliable open must be applied");
+        assert!(
+            session.collect_gap_reports(false, 0).is_empty(),
+            "the sequences the fire-and-forget half delivered are not a gap"
+        );
+
+        // The next sequence the peer sends is the one the upgraded
+        // cursor expects, and only a genuine hole after it reports.
+        assert!(
+            stream.with_reliability(|r| r.on_receive(3)),
+            "sequence 3 is the peer's next, not a duplicate"
+        );
+        assert!(session.collect_gap_reports(false, 0).is_empty());
+        assert!(stream.with_reliability(|r| r.on_receive(5)));
+        let gaps = session.collect_gap_reports(false, 0);
+        assert_eq!(gaps.len(), 1, "sequence 4 is missing and must be NACKed");
+        assert_eq!(gaps[0].nack.next_expected, 4);
+        drop(stream);
+
+        // One-way: a later fire-and-forget open cannot abandon the
+        // descriptors the peer is owed.
+        session.open_stream_with(id, false, 1);
+        assert!(session.try_stream(id).expect("open").reliable_mode());
     }
 
     #[test]

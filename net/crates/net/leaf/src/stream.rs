@@ -239,6 +239,33 @@ impl RxStream {
             .is_some_and(|(start, rec)| start.saturating_add(rec.span) > seq)
     }
 
+    /// Make this stream reliable if it is not already, returning
+    /// whether the mode was upgraded.
+    ///
+    /// **Reliability is decided by the traffic, not by whichever
+    /// record touched the id first.** A channel's publish stream id
+    /// is derived from the channel, so fire-and-forget and reliable
+    /// publications to one channel share one id; creating the
+    /// consumer's stream from the first record's mode meant a
+    /// reliable record arriving after fire-and-forget traffic was
+    /// released in ARRIVAL order, with its gaps counted as
+    /// fire-and-forget loss. A reliable stream's contract is
+    /// gap-free delivery in sequence order, so the stronger mode
+    /// wins and never downgrades.
+    ///
+    /// The cursor needs no adjustment: the fire-and-forget half
+    /// advanced `next_expected` past every sequence it skipped or
+    /// delivered, which is exactly where the reliable half must
+    /// resume — those sequences are unrecoverable (their sender
+    /// retained nothing) and must not be waited for.
+    pub fn ensure_reliable(&mut self) -> bool {
+        if self.reliability.is_reliable() {
+            return false;
+        }
+        self.reliability = Reliability::Reliable;
+        true
+    }
+
     /// Offer one delivery record.
     ///
     /// `Ok` carries what is now deliverable, **in sequence order** —
@@ -259,6 +286,11 @@ impl RxStream {
     ) -> core::result::Result<Vec<StreamRecord>, ReorderOverflow> {
         let seq = record.seq;
         let stream_id = record.stream_id;
+        // A reliable record makes the stream reliable, whatever
+        // opened it — see `ensure_reliable`.
+        if record.reliable {
+            self.ensure_reliable();
+        }
         if self.already_owned(seq) {
             counters.drop_for(DropReason::DuplicateSequence);
             return Ok(Vec::new());
@@ -315,6 +347,17 @@ mod tests {
             channel_hash: tag as u16,
             payloads: vec![Bytes::from(vec![tag])],
             reliable: true,
+        }
+    }
+
+    /// The same record as a FIRE-AND-FORGET arrival. A record's
+    /// `reliable` flag is the packet's, and the stream's mode follows
+    /// it (`RxStream::ensure_reliable`), so a fire-and-forget stream
+    /// can only be fed fire-and-forget records.
+    fn faf_rec(seq: u64, tag: u8) -> StreamRecord {
+        StreamRecord {
+            reliable: false,
+            ..rec(seq, tag)
         }
     }
 
@@ -378,9 +421,9 @@ mod tests {
     fn fire_and_forget_skips_a_gap_and_counts_every_lost_sequence() {
         let c = LeafCounters::new();
         let mut s = RxStream::new(Reliability::FireAndForget);
-        assert_eq!(tags(&ok(s.accept(rec(0, 0), &c))), vec![0]);
+        assert_eq!(tags(&ok(s.accept(faf_rec(0, 0), &c))), vec![0]);
 
-        let out = ok(s.accept(rec(4, 4), &c));
+        let out = ok(s.accept(faf_rec(4, 4), &c));
         assert_eq!(
             tags(&out),
             vec![4],
@@ -399,10 +442,10 @@ mod tests {
     fn a_late_arrival_after_a_fire_and_forget_skip_is_dropped_as_a_duplicate() {
         let c = LeafCounters::new();
         let mut s = RxStream::new(Reliability::FireAndForget);
-        ok(s.accept(rec(0, 0), &c));
-        ok(s.accept(rec(4, 4), &c));
+        ok(s.accept(faf_rec(0, 0), &c));
+        ok(s.accept(faf_rec(4, 4), &c));
         assert!(
-            ok(s.accept(rec(2, 2), &c)).is_empty(),
+            ok(s.accept(faf_rec(2, 2), &c)).is_empty(),
             "a sequence the stream already skipped past cannot be delivered"
         );
         assert_eq!(c.drops(DropReason::DuplicateSequence), 1);
