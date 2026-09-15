@@ -192,7 +192,7 @@ pub trait ReliabilityMode: Send + Sync {
     /// Receiver-side: the highest sequence this mode has accepted on
     /// this stream, or `None` when it has accepted none.
     ///
-    /// Read by [`StreamState::ensure_reliable`] so a reliable mode
+    /// Read by `StreamState::ensure_reliable` so a reliable mode
     /// replacing a fire-and-forget one resumes at the sequence the
     /// peer is actually sending. Default `None` — "nothing accepted"
     /// is the safe answer for a mode that tracks no receive state,
@@ -256,8 +256,7 @@ impl ReliabilityMode for FireAndForget {
 
     #[inline]
     fn rx_accepted_high_water(&self) -> Option<u64> {
-        self.received
-            .then(|| self.last_seq.load(Ordering::Relaxed))
+        self.received.then(|| self.last_seq.load(Ordering::Relaxed))
     }
 
     #[inline]

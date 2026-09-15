@@ -1960,7 +1960,7 @@ impl StreamState {
     /// not policy. It is the delivery contract, it is strictly
     /// stronger than fire-and-forget, and the traffic decides who is
     /// owed it: a reliable sender's packets carry
-    /// [`PacketFlags::RELIABLE`], register retransmit descriptors,
+    /// `PacketFlags::RELIABLE`, register retransmit descriptors,
     /// and require the receiver to hold gap state to NACK against.
     ///
     /// Ignoring a reliable open because some earlier fire-and-forget
@@ -1968,8 +1968,8 @@ impl StreamState {
     /// channel's publish stream id is derived from the channel, so
     /// every mode publishing to one channel shares one id — admitted
     /// the reliable sender onto fire-and-forget machinery:
-    /// [`FireAndForget::on_send`] retains nothing, so nothing could
-    /// be rebuilt, [`FireAndForget::build_nack`] is `None`, so no gap
+    /// `FireAndForget::on_send` retains nothing, so nothing could
+    /// be rebuilt, `FireAndForget::build_nack` is `None`, so no gap
     /// was ever reported, and the loss was therefore silent on the
     /// one mode whose whole contract is that it is not.
     ///
@@ -2028,7 +2028,7 @@ impl StreamState {
     }
 
     /// Whether a `bytes`-long frame can be held without exceeding
-    /// [`Self::reorder_budget`].
+    /// this stream's reorder budget.
     ///
     /// Asked BEFORE the sequence is offered to the reliability mode:
     /// a sequence that is accepted is recorded as received and

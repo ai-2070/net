@@ -996,6 +996,14 @@ mod mesh_bindings {
                  nothing was sent",
                 size, limit
             )),
+            // `StreamError` is `#[non_exhaustive]`: a variant this
+            // binding predates becomes a plain `RuntimeError`
+            // carrying the core's own message. Never one of the
+            // typed classes above — `BackpressureError` invites a
+            // retry and `NotConnectedError` a reconnect, and both
+            // would be confident guesses about a failure this build
+            // cannot name.
+            other => PyRuntimeError::new_err(other.to_string()),
         }
     }
 

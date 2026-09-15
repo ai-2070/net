@@ -1169,6 +1169,14 @@ mod mesh_bindings {
                  nothing was sent",
                 size, limit
             )),
+            // `StreamError` is `#[non_exhaustive]`: a variant this
+            // binding predates surfaces as a plain failure carrying
+            // whatever the core said. Deliberately NOT given one of
+            // the sniffable prefixes — `sdk-ts` turns those into
+            // `BackpressureError` / `NotConnectedError`, i.e. into a
+            // retry or a reconnect, and neither is a safe guess about
+            // a condition this build cannot name.
+            other => Error::from_reason(other.to_string()),
         }
     }
 
