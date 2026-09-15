@@ -299,9 +299,18 @@ impl RxStream {
     /// once, so a second signal naming a different one can only be
     /// a retransmit of the first — or a peer asking this consumer to
     /// concede reliable sequences it is already holding.
-    pub fn promote(&mut self, signalled: Option<u64>, counters: &LeafCounters) -> Vec<StreamRecord> {
+    pub fn promote(
+        &mut self,
+        signalled: Option<u64>,
+        counters: &LeafCounters,
+    ) -> Vec<StreamRecord> {
         let boundary = match (self.mode, signalled) {
-            (StreamMode::Reliable { signalled: true, .. }, _) => return Vec::new(),
+            (
+                StreamMode::Reliable {
+                    signalled: true, ..
+                },
+                _,
+            ) => return Vec::new(),
             (StreamMode::Reliable { .. }, None) => return Vec::new(),
             (StreamMode::FireAndForget, None) => {
                 self.mode = StreamMode::Reliable {

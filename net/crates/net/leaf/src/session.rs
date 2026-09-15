@@ -801,11 +801,8 @@ impl LeafSession {
     /// cannot do this job.
     pub fn opened_gap_nack(&self, stream_id: u64) -> Option<StreamNack> {
         let stream = self.session.try_stream(stream_id)?;
-        let payload = stream.with_reliability(|r| {
-            r.take_gap_opened()
-                .then(|| r.build_nack())
-                .flatten()
-        })?;
+        let payload =
+            stream.with_reliability(|r| r.take_gap_opened().then(|| r.build_nack()).flatten())?;
         Some(StreamNack {
             stream_id,
             next_expected: payload.next_expected,
