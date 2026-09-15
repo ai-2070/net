@@ -32,14 +32,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
 use net::adapter::net::behavior::capability::{CapabilityFilter, CapabilityRequirement};
 use net::adapter::net::cortex::{
     RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus,
 };
-use net::adapter::net::MeshNode;
+use net::adapter::net::{MeshNode, Reliability, StreamConfig};
 
 use crate::browser::{Driver, Engine, LaunchSpec};
 use crate::udp_block::UdpProfile;
@@ -82,10 +82,71 @@ const RELIABLE_IN_FLIGHT: usize = 16;
 const FAF_EVENTS: usize = 40;
 const FAF_DROP_EVERY: u64 = 4;
 
+// --- the REAL stream-ABI exercises (R11 / E6) ----------------------
+//
+// Stream ids the page PINS at `openStream` so the anchor can open
+// the same id from its side and push bytes down it. Bit 49 is the
+// leaf's own stream discriminator and bit 48 (a channel
+// publication) is deliberately clear, so an id the leaf did not
+// register would still classify as a stream rather than a channel.
+const ABI_DIRECT_STREAM_ID: u64 = 0x0002_0000_0000_5A01;
+const ABI_WINDOW_STREAM_ID: u64 = 0x0002_0000_0000_5A02;
+const ABI_PROXY_STREAM_ID: u64 = 0x0002_0000_0000_5A03;
+
+/// Payloads the direct stream witness pushes native → leaf, and
+/// their size.
+const ABI_DIRECT_EVENTS: usize = 12;
+const ABI_DIRECT_SIZE: usize = 512;
+
+/// The credit window the anchor opens its sustained-traffic stream
+/// with, and the traffic it then puts through it.
+///
+/// `ABI_WINDOW_EVENTS * ABI_WINDOW_SIZE` is eight times the window,
+/// so the sender's initial credit is exhausted seven times over and
+/// the transfer can only complete if the RECEIVER — the browser leaf
+/// — kept emitting `StreamWindow` grants and they kept arriving.
+const ABI_WINDOW_BYTES: u32 = 16_384;
+const ABI_WINDOW_EVENTS: usize = 64;
+const ABI_WINDOW_SIZE: usize = 2_048;
+
+/// The reliable loss/reorder exercise: how many nRPC REQUEST events
+/// ride one RELIABLE stream, and the drop / reorder periods the
+/// page's transport hooks are armed with.
+///
+/// Both hooks are armed at once and both must fire: the witness
+/// requires `dropped > 0` and `reordered > 0` before it will accept
+/// the recovery it observes as recovery from anything.
+const ABI_RELIABLE_EVENTS: usize = 40;
+const ABI_RELIABLE_DROP_EVERY: u64 = 5;
+const ABI_RELIABLE_REORDER_EVERY: u64 = 3;
+
+/// The three sizes the large-message witness uses, and why each is
+/// the size it is.
+///
+/// `MAX_PAYLOAD_SIZE` is 8 104 B and no NATIVE node reassembles leaf
+/// fragments (§9.2), so the largest body that can round-trip leaf →
+/// native → leaf through `call()` is one that fits, with its nRPC
+/// framing, in a single event. `ABI_CEILING_SIZE` sits just under
+/// that: the reply is `echo:` + the body, so it must fit too.
+const ABI_CEILING_SIZE: usize = 7_800;
+/// Past 64 832 B, where §9.2 says the leaf attempts nothing and
+/// returns a typed `LeafError::Wire` naming streams. The witness
+/// asserts the refusal is typed and that nothing truncated reaches
+/// the far side — which is the contract, where "96 KiB works" is
+/// not.
+const ABI_OVER_LIMIT_SIZE: usize = 96 * 1024;
+/// Native → leaf on a stream, over `MAX_PAYLOAD_SIZE`, so the
+/// fragment/reassembly path carries it rather than the nRPC one.
+const ABI_STREAM_LARGE_SIZE: usize = 32 * 1024;
+
+/// Payloads the leader-PROXIED stream witness pushes native → leaf.
+const ABI_PROXY_EVENTS: usize = 8;
+const ABI_PROXY_SIZE: usize = 700;
+
 /// Every Stage 5 witness name, in ledger order. The CI job pins these
 /// exactly; the list is here so a rename is one edit and a drop is
 /// impossible to do quietly.
-pub const WITNESSES: [&str; 9] = [
+pub const WITNESSES: [&str; 14] = [
     "stage5_leaf_handshake_over_the_real_listener",
     "stage5_reliable_round_trip",
     "stage5_nrpc_call_to_a_native_service",
@@ -95,6 +156,11 @@ pub const WITNESSES: [&str; 9] = [
     "stage5_reconnect_displaces_a_busy_incumbent",
     "stage5_udp_blocked_surfaces_a_typed_failure",
     "stage5_direct_event_callback_may_reenter_the_node",
+    "stage5_direct_stream_carries_native_bytes_to_callback_and_iterator",
+    "stage5_native_stream_sustains_traffic_beyond_the_credit_window",
+    "stage5_reliable_stream_recovers_injected_loss_and_reorder",
+    "stage5_large_messages_cross_the_public_api_in_both_directions",
+    "stage5_leader_proxied_stream_carries_native_bytes_both_ways",
 ];
 
 // ===================================================================
@@ -204,6 +270,62 @@ pub enum Step5 {
         payloads: Vec<String>,
         drop_every: u64,
     },
+    /// `openStream(opts)` through the built package, held open
+    /// across steps under `handle`, with BOTH of its consumers —
+    /// the `onMessage` callback and the `for await` async iterator —
+    /// attached before a byte can arrive.
+    ///
+    /// Works unchanged on a direct `connect()` node and on a
+    /// leader-proxied `MeshSession`; which one it was comes back in
+    /// the result, read off the object the package returned.
+    StreamOpen {
+        id: u64,
+        session: String,
+        handle: String,
+        reliable: bool,
+        label: Option<String>,
+        /// Pinned so the ANCHOR can open the same id from its side
+        /// and send on it. Decimal, because a u64 is not a JS number.
+        stream_id: Option<String>,
+        channel_hash: Option<u16>,
+    },
+    /// Send on a stream [`Step5::StreamOpen`] already opened.
+    ///
+    /// Either verbatim `frames` (the natively encoded nRPC requests a
+    /// real handler dispatches) or `count` payloads of `size` bytes
+    /// from the deterministic generator both sides implement — which
+    /// is what keeps a multi-megabyte exercise off the step channel.
+    /// `drop_every` and `reorder_every` arm the page's transport
+    /// hooks for the duration of the step.
+    StreamWrite {
+        id: u64,
+        handle: String,
+        frames: Vec<String>,
+        seed: u64,
+        size: usize,
+        count: usize,
+        drop_every: u64,
+        reorder_every: u64,
+    },
+    /// What the open stream's callback and iterator have received.
+    /// Waits for `expect` payloads on both and reports either way.
+    StreamInbox {
+        id: u64,
+        handle: String,
+        expect: usize,
+        timeout_ms: u64,
+    },
+    /// One `call()` whose request and reply are both large enough to
+    /// fragment. Bodies are generated from `(seed, size)` on both
+    /// sides and compared by length + FNV-1a/32.
+    CallSized {
+        id: u64,
+        session: String,
+        service: String,
+        seed: u64,
+        size: usize,
+        timeout_ms: u64,
+    },
     Announce {
         id: u64,
         session: String,
@@ -258,6 +380,10 @@ impl Step5 {
             | Self::CallAwait { id, .. }
             | Self::CallMany { id, .. }
             | Self::StreamSend { id, .. }
+            | Self::StreamOpen { id, .. }
+            | Self::StreamWrite { id, .. }
+            | Self::StreamInbox { id, .. }
+            | Self::CallSized { id, .. }
             | Self::Announce { id, .. }
             | Self::Query { id, .. }
             | Self::StunProbe { id, .. }
@@ -277,6 +403,10 @@ impl Step5 {
             | Self::CallAwait { id, .. }
             | Self::CallMany { id, .. }
             | Self::StreamSend { id, .. }
+            | Self::StreamOpen { id, .. }
+            | Self::StreamWrite { id, .. }
+            | Self::StreamInbox { id, .. }
+            | Self::CallSized { id, .. }
             | Self::Announce { id, .. }
             | Self::Query { id, .. }
             | Self::StunProbe { id, .. }
@@ -1086,6 +1216,656 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
     }
 
     // ================================================================
+    // 4b — the REAL stream ABI, native → leaf and back (R11 / E6)
+    //
+    // Everything in this block is a call through the BUILT
+    // `@net-mesh/browser` the page loaded from `/browser/index.js`,
+    // against this process's real `MeshNode` over real WebRTC. No
+    // inner stream object is constructed anywhere: the page calls
+    // `openStream(...)` and the object it gets back is whatever the
+    // package returns, with its `onMessage` callback AND its
+    // `for await` async iterator both attached before a byte can
+    // arrive.
+    //
+    // The four things it establishes, each its own witness because
+    // each fails for its own reason:
+    //
+    //   * bytes the ANCHOR put on a stream reach both consumers of
+    //     the package's `LeafStream`, in order and byte-exact, and
+    //     the options the page asked for are the options the stream
+    //     actually has (read from the stream, and from the built
+    //     wasm's own option parser on the same object);
+    //   * eight windows' worth of native-originated traffic gets
+    //     through a deliberately small credit window, which is only
+    //     possible if the browser leaf kept granting credit back —
+    //     the grant round trip, counted on the sender;
+    //   * a RELIABLE stream recovers real injected loss AND real
+    //     injected reorder, observed as the native handler seeing
+    //     every event in the order sent (the fire-and-forget witness
+    //     above loses them, which is the contrast that makes this
+    //     mean something);
+    //   * a 96 KiB body fragments and reassembles in BOTH directions
+    //     through the public API.
+    // ================================================================
+    {
+        // ---- the stream the page holds open for this whole block --
+        let direct_open = script
+            .run(
+                "a",
+                Step5::StreamOpen {
+                    id: 0,
+                    session: "main".into(),
+                    handle: "direct".into(),
+                    reliable: true,
+                    label: Some("abi-direct".into()),
+                    stream_id: Some(ABI_DIRECT_STREAM_ID.to_string()),
+                    channel_hash: None,
+                },
+            )
+            .await;
+        let want_direct_hex = format!("{ABI_DIRECT_STREAM_ID:016x}");
+        let reported_id = stat_str(&direct_open, "stream_id");
+        let reported_reliability = stat_str(&direct_open, "reliability");
+        let effective = direct_open
+            .stats
+            .as_ref()
+            .and_then(|s| s.get("effective_options"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        // The stream's OWN answers, not the options object: a
+        // package that silently dropped `streamId` would open a
+        // node-allocated id and fail here.
+        let handle_matches = reported_id == format!("\"{want_direct_hex}\"")
+            && reported_reliability == "\"reliable\"";
+        // And the built wasm's own parser, on the same object the
+        // package forwarded — the option-forwarding half Kyra's E3
+        // says an option-reader inverse does not establish.
+        let options_forwarded = effective.get("streamId").and_then(|v| v.as_str())
+            == Some(want_direct_hex.as_str())
+            && effective.get("reliability").and_then(|v| v.as_str()) == Some("reliable")
+            && effective.get("label").and_then(|v| v.as_str()) == Some("abi-direct");
+        let direct_is_direct = direct_open
+            .stats
+            .as_ref()
+            .and_then(|s| s.get("proxied"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(false);
+
+        // ---- the anchor's side of the same id --------------------
+        let direct_native = cx.anchor.open_stream(
+            node_id,
+            ABI_DIRECT_STREAM_ID,
+            StreamConfig::new().with_reliability(Reliability::Reliable),
+        );
+        let direct_seed = 0x2100 ^ (rand_u64() & 0xFFFF);
+        let mut native_send_error: Option<String> = None;
+        match &direct_native {
+            Ok(stream) => {
+                for i in 0..ABI_DIRECT_EVENTS {
+                    let payload =
+                        Bytes::from(gen_bytes(direct_seed + i as u64, ABI_DIRECT_SIZE));
+                    if let Err(e) = cx
+                        .anchor
+                        .send_with_retry(stream, std::slice::from_ref(&payload), 40)
+                        .await
+                    {
+                        native_send_error = Some(format!("payload {i}: {e}"));
+                        break;
+                    }
+                }
+            }
+            Err(e) => native_send_error = Some(e.to_string()),
+        }
+
+        let direct_inbox = script
+            .run(
+                "a",
+                Step5::StreamInbox {
+                    id: 0,
+                    handle: "direct".into(),
+                    expect: ABI_DIRECT_EVENTS,
+                    timeout_ms: 30_000,
+                },
+            )
+            .await;
+        let want_direct = expected_marks(direct_seed, ABI_DIRECT_SIZE, ABI_DIRECT_EVENTS);
+        let callback_got = marks(&direct_inbox, "callback");
+        let iterator_got = marks(&direct_inbox, "iterator");
+        let callback_exact = callback_got == want_direct;
+        let iterator_exact = iterator_got == want_direct;
+
+        ledger.record(
+            WITNESSES[9],
+            direct_open.ok
+                && direct_is_direct
+                && handle_matches
+                && options_forwarded
+                && native_send_error.is_none()
+                && callback_exact
+                && iterator_exact,
+            format!(
+                "A stream opened through the BUILT package's public API on the DIRECT \
+                 `connect()` object (open ok={}, the package returned a synchronous handle \
+                 so this really is the direct surface={direct_is_direct}); nothing is \
+                 hand-constructed — `LeafStream`'s inner object is the wasm stream \
+                 `LeafNode.open_stream` returned. The stream reports \
+                 streamId={reported_id} reliability={reported_reliability}, which is the \
+                 id and mode the page ASKED for ({want_direct_hex}, \
+                 reliable)={handle_matches}; the built wasm's own \
+                 `effective_stream_options` on the very object the package forwarded reads \
+                 back {effective} — same id, same reliability, same \
+                 label={options_forwarded}, which is option FORWARDING and not an option \
+                 reader called in isolation. This process's `MeshNode` then opened the \
+                 SAME stream id from its side and sent {ABI_DIRECT_EVENTS} payload(s) of \
+                 {ABI_DIRECT_SIZE} B generated from seed {direct_seed:#x} (native send \
+                 error: {native_send_error:?}). The package's `onMessage` CALLBACK \
+                 received {} payload(s), byte-exact and in order={callback_exact}; its \
+                 `for await` ASYNC ITERATOR received {} payload(s), byte-exact and in \
+                 order={iterator_exact} — both consumers were attached at open, before a \
+                 byte could arrive, so this is the package's fan-out and not whichever \
+                 registered first. Comparison is length + FNV-1a/32 per payload against \
+                 the generator the runner and the page both implement. ANCHOR STATE: {}",
+                direct_open.ok,
+                callback_got.len(),
+                iterator_got.len(),
+                peer_state(cx.anchor, node_id),
+            ),
+        );
+
+        // ---- sustained native → leaf past the credit window ------
+        let window_open = script
+            .run(
+                "a",
+                Step5::StreamOpen {
+                    id: 0,
+                    session: "main".into(),
+                    handle: "window".into(),
+                    reliable: true,
+                    label: Some("abi-window".into()),
+                    stream_id: Some(ABI_WINDOW_STREAM_ID.to_string()),
+                    channel_hash: None,
+                },
+            )
+            .await;
+        let window_native = cx.anchor.open_stream(
+            node_id,
+            ABI_WINDOW_STREAM_ID,
+            StreamConfig::new()
+                .with_reliability(Reliability::Reliable)
+                .with_window_bytes(ABI_WINDOW_BYTES),
+        );
+        let window_seed = 0x3300 ^ (rand_u64() & 0xFFFF);
+        let mut window_error: Option<String> = None;
+        match &window_native {
+            Ok(stream) => {
+                for i in 0..ABI_WINDOW_EVENTS {
+                    let payload =
+                        Bytes::from(gen_bytes(window_seed + i as u64, ABI_WINDOW_SIZE));
+                    if let Err(e) = cx
+                        .anchor
+                        .send_with_retry(stream, std::slice::from_ref(&payload), 200)
+                        .await
+                    {
+                        window_error = Some(format!("payload {i}: {e}"));
+                        break;
+                    }
+                }
+            }
+            Err(e) => window_error = Some(e.to_string()),
+        }
+        let window_inbox = script
+            .run(
+                "a",
+                Step5::StreamInbox {
+                    id: 0,
+                    handle: "window".into(),
+                    expect: ABI_WINDOW_EVENTS,
+                    timeout_ms: 60_000,
+                },
+            )
+            .await;
+        let want_window = expected_marks(window_seed, ABI_WINDOW_SIZE, ABI_WINDOW_EVENTS);
+        let window_callback = marks(&window_inbox, "callback");
+        let window_iterator = marks(&window_inbox, "iterator");
+        let window_delivered = window_callback == want_window && window_iterator == want_window;
+        // The sender's own ledger. `credit_grants_received` is the
+        // observable the criterion is named after: without a grant
+        // round trip the transfer stops at the first window and the
+        // retry loop exhausts.
+        let window_stats = cx.anchor.stream_stats(node_id, ABI_WINDOW_STREAM_ID);
+        let offered = (ABI_WINDOW_EVENTS * ABI_WINDOW_SIZE) as u64;
+        let grants = window_stats.map_or(0, |s| s.credit_grants_received);
+        let sent_bytes = window_stats.map_or(0, |s| s.tx_bytes_sent);
+        let window_bytes = window_stats.map_or(0, |s| u64::from(s.tx_window));
+        let backpressure = window_stats.map_or(0, |s| s.backpressure_events);
+        let consumed = window_stats.map_or(0, |s| s.max_consumed_seen);
+        let credit_left = window_stats.map_or(0, |s| u64::from(s.tx_credit_remaining));
+        // Conservation, at a settled point: credit + in-flight ==
+        // the window.
+        let conserved = window_bytes > 0
+            && credit_left + sent_bytes.saturating_sub(consumed) == window_bytes;
+        let past_the_window = sent_bytes > window_bytes;
+
+        ledger.record(
+            WITNESSES[10],
+            window_open.ok
+                && window_error.is_none()
+                && window_delivered
+                && grants > 0
+                && past_the_window
+                && conserved,
+            format!(
+                "SUSTAINED NATIVE → LEAF TRAFFIC PAST THE CREDIT WINDOW. The anchor opened \
+                 stream {ABI_WINDOW_STREAM_ID:#018x} with a deliberately small \
+                 `window_bytes = {ABI_WINDOW_BYTES}` and pushed {ABI_WINDOW_EVENTS} × \
+                 {ABI_WINDOW_SIZE} B = {offered} B through it — {:.1}× the window, so the \
+                 sender's initial credit is exhausted and the transfer can only finish if \
+                 the BROWSER LEAF kept emitting `StreamWindow` grants and they kept \
+                 arriving (page open ok={}, native send error: {window_error:?}). The \
+                 sender's own ledger afterwards: credit_grants_received={grants} (this is \
+                 the grant ROUND TRIP, counted where it lands), \
+                 tx_bytes_sent={sent_bytes} > tx_window={window_bytes}={past_the_window}, \
+                 backpressure_events={backpressure} (the typed, bounded exhaustion the \
+                 retry loop rode), max_consumed_seen={consumed}, \
+                 tx_credit_remaining={credit_left}; byte conservation \
+                 `credit + (sent - consumed) == window` holds={conserved}. On the page, the \
+                 package's callback and iterator each received all {ABI_WINDOW_EVENTS} \
+                 payloads byte-exact and in order={window_delivered} (callback {}, \
+                 iterator {}). ANCHOR STATE: {}",
+                offered as f64 / f64::from(ABI_WINDOW_BYTES),
+                window_open.ok,
+                window_callback.len(),
+                window_iterator.len(),
+                peer_state(cx.anchor, node_id),
+            ),
+        );
+
+        // ---- reliable recovery from injected loss AND reorder ----
+        sink_log.lock().expect("sink log").clear();
+        sink_count.store(0, Ordering::SeqCst);
+        let mut recover_frames = Vec::with_capacity(ABI_RELIABLE_EVENTS);
+        let mut recover_bodies = Vec::with_capacity(ABI_RELIABLE_EVENTS);
+        let mut recover_stream_id = String::new();
+        let mut recover_channel = 0u16;
+        let mut recover_stream_num = 0u64;
+        for i in 0..ABI_RELIABLE_EVENTS {
+            let body = format!("s5-recover-{i:04}");
+            let frame =
+                rpc_request_frame(SINK_SERVICE, origin_hash, 0x5B00 + i as u64, body.as_bytes());
+            recover_stream_id = format!("{}", frame.stream_id);
+            recover_channel = frame.channel_hash_u16;
+            recover_stream_num = frame.stream_id;
+            recover_frames.push(hex(&frame.payload));
+            recover_bodies.push(body);
+        }
+        // The ANCHOR opens its side of the same stream, as a real
+        // peer does. Without it the receiving session has no
+        // per-stream reliability state to acknowledge or NACK
+        // against, so the sender's retransmit has nothing to react
+        // to and "the loss was not recovered" would be a fact about
+        // the harness rather than about the path.
+        let recover_native = cx
+            .anchor
+            .open_stream(
+                node_id,
+                recover_stream_num,
+                StreamConfig::new().with_reliability(Reliability::Reliable),
+            )
+            .map_err(|e| e.to_string());
+        let recover_open = script
+            .run(
+                "a",
+                Step5::StreamOpen {
+                    id: 0,
+                    session: "main".into(),
+                    handle: "recover".into(),
+                    reliable: true,
+                    label: Some("abi-recover".into()),
+                    stream_id: Some(recover_stream_id.clone()),
+                    channel_hash: Some(recover_channel),
+                },
+            )
+            .await;
+        let recover_write = script
+            .run(
+                "a",
+                Step5::StreamWrite {
+                    id: 0,
+                    handle: "recover".into(),
+                    frames: recover_frames,
+                    seed: 0,
+                    size: 0,
+                    count: 0,
+                    drop_every: ABI_RELIABLE_DROP_EVERY,
+                    reorder_every: ABI_RELIABLE_REORDER_EVERY,
+                },
+            )
+            .await;
+        let dropped = stat_u64(&recover_write, "dropped");
+        let reordered = stat_u64(&recover_write, "reordered");
+        // Recovery is not instant: the leaf's RTO sweep runs on the
+        // 50 ms tick and the peer's NACKs have to get back.
+        let recovered = wait_for(
+            || sink_count.load(Ordering::SeqCst) >= ABI_RELIABLE_EVENTS,
+            Duration::from_secs(45),
+        )
+        .await;
+        let recover_seen: Vec<String> = sink_log
+            .lock()
+            .expect("sink log")
+            .iter()
+            .map(|b| String::from_utf8_lossy(b).to_string())
+            .collect();
+        let all_arrived = recover_bodies
+            .iter()
+            .all(|body| recover_seen.contains(body));
+        // A RELIABLE stream delivers in sequence order, so the
+        // handler's arrival order must be the send order even though
+        // the wire order was deliberately scrambled. Duplicates are
+        // tolerated in the ORDER check only to the extent that the
+        // first occurrence of each body is monotonic; an out-of-order
+        // first delivery fails it.
+        let mut first_seen: Vec<usize> = Vec::with_capacity(recover_bodies.len());
+        for body in &recover_bodies {
+            if let Some(at) = recover_seen.iter().position(|s| s == body) {
+                first_seen.push(at);
+            }
+        }
+        let in_order =
+            first_seen.len() == recover_bodies.len() && first_seen.windows(2).all(|w| w[0] < w[1]);
+        let exactly_once = recover_bodies
+            .iter()
+            .all(|body| recover_seen.iter().filter(|s| *s == body).count() == 1);
+        // The leaf's own counters at the moment of judgement. A
+        // short list has to be ATTRIBUTABLE: `stream_failed` /
+        // `retransmits_exhausted` means the sender gave up,
+        // `duplicate_sequence` means the retransmit did arrive, and
+        // nothing moving at all means the events never left.
+        let recover_counters = script
+            .run(
+                "a",
+                Step5::StreamInbox {
+                    id: 0,
+                    handle: "recover".into(),
+                    expect: 0,
+                    timeout_ms: 1_000,
+                },
+            )
+            .await;
+        let leaf_counters = stat_str(&recover_counters, "counters");
+
+        ledger.record(
+            WITNESSES[11],
+            recover_open.ok
+                && recover_write.ok
+                && dropped > 0
+                && reordered > 0
+                && recovered
+                && all_arrived
+                && in_order
+                && exactly_once,
+            format!(
+                "DELIBERATE RELIABLE LOSS **AND** REORDER, recovered. \
+                 {ABI_RELIABLE_EVENTS} natively encoded nRPC REQUEST events were sent on ONE \
+                 stream opened `reliability: 'reliable'` through the package's public API \
+                 (open ok={}, write ok={}), with two transport hooks armed together on the \
+                 page: every {ABI_RELIABLE_DROP_EVERY}th outbound datagram ELIDED, and \
+                 every {ABI_RELIABLE_REORDER_EVERY}th held back and submitted AFTER the \
+                 datagram behind it — a real Net-level reorder on a DataChannel that is \
+                 ordered and reliable and therefore cannot produce one by itself. Both \
+                 hooks are required to have fired: {dropped} datagram(s) elided (>0={}) and \
+                 {reordered} pair(s) swapped (>0={}); a run in which nothing was lost or \
+                 nothing was reordered proves nothing and FAILS here. The anchor's REAL \
+                 handler then saw {} invocation(s) within 45 s (settled={recovered}); every \
+                 one of the {ABI_RELIABLE_EVENTS} bodies arrived={all_arrived}, each \
+                 exactly once={exactly_once}, and their FIRST deliveries are strictly \
+                 increasing in send order={in_order} — so the receiver reassembled the \
+                 scrambled wire order back into sequence order and the sender's retransmit \
+                 replaced what was elided. The fire-and-forget witness above, on the same \
+                 path with only the drop hook, LOSES those events; that contrast is what \
+                 makes this a reliability result rather than a link that happened to be \
+                 clean. The ANCHOR had opened its side of the same stream \
+                 ({recover_native:?}), so the receiver holds reliability state to \
+                 acknowledge and NACK against. LEAF COUNTERS at judgement: \
+                 {leaf_counters}. ANCHOR STATE: {}",
+                recover_open.ok,
+                recover_write.ok,
+                dropped > 0,
+                reordered > 0,
+                recover_seen.len(),
+                peer_state(cx.anchor, node_id),
+            ),
+        );
+
+        // ---- large messages, both directions ---------------------
+        //
+        // WHAT THIS MEASURES, AND WHY IT IS NOT "96 KiB WORKS".
+        //
+        // §9.2 of the report states the payload-size interoperability
+        // this stage has and the two it does NOT: no native node
+        // reassembles leaf fragments, so a leaf → native payload
+        // above `MAX_PAYLOAD_SIZE` (8 104 B) arrives as N partial
+        // events and is not put back together; and above 64 832 B
+        // the leaf does not even attempt it, returning a typed
+        // `LeafError::Wire` that names streams as the way out —
+        // never a truncation and never a silent drop.
+        //
+        // A witness that asserted a 96 KiB `call()` round trip would
+        // therefore be asserting a property the stage explicitly
+        // disclaims — measuring the wrong layer, and failing for a
+        // reason that is documentation rather than defect. So the
+        // three legs here are the three things that ARE contracts:
+        //
+        //   1. at the ceiling, the round trip is byte-exact in both
+        //      directions through the public `call()`;
+        //   2. past the hard limit, the refusal is TYPED and the
+        //      anchor's handler is never entered — no truncation,
+        //      no partial delivery, no silence;
+        //   3. native → leaf on a stream, an over-`MAX_PAYLOAD_SIZE`
+        //      payload either arrives byte-exact or is refused at
+        //      the sender with a typed `StreamError`; what it may
+        //      never do is arrive truncated or vanish after an `Ok`.
+        echo_log.lock().expect("echo log").clear();
+        let ceiling_seed = 0x4400 ^ (rand_u64() & 0xFFFF);
+        let ceiling_body = gen_bytes(ceiling_seed, ABI_CEILING_SIZE);
+        let mut ceiling_reply = b"echo:".to_vec();
+        ceiling_reply.extend_from_slice(&ceiling_body);
+        let want_request = Mark::of(&ceiling_body);
+        let want_reply = Mark::of(&ceiling_reply);
+        let sized = script
+            .run(
+                "a",
+                Step5::CallSized {
+                    id: 0,
+                    session: "main".into(),
+                    service: ECHO_SERVICE.into(),
+                    seed: ceiling_seed,
+                    size: ABI_CEILING_SIZE,
+                    timeout_ms: 60_000,
+                },
+            )
+            .await;
+        let got_request = sized
+            .stats
+            .as_ref()
+            .and_then(|s| s.get("request"))
+            .and_then(|v| serde_json::from_value::<Mark>(v.clone()).ok());
+        let got_reply = sized
+            .stats
+            .as_ref()
+            .and_then(|s| s.get("reply"))
+            .and_then(|v| serde_json::from_value::<Mark>(v.clone()).ok());
+        // The native handler's own record of the body it was given:
+        // a reply the wrapper synthesised locally cannot satisfy it.
+        let handler_got_ceiling = echo_log
+            .lock()
+            .expect("echo log")
+            .iter()
+            .any(|b| Mark::of(b) == want_request);
+        let request_up = got_request == Some(want_request) && handler_got_ceiling;
+        let reply_down = got_reply == Some(want_reply);
+
+        // Leg 2: past the hard limit. A TYPED refusal, and the
+        // handler must not have run — a truncated body reaching it
+        // is the outcome §9.2 says can never happen, and it would
+        // show up here as an extra echo-log entry.
+        echo_log.lock().expect("echo log").clear();
+        let over_seed = 0x4800 ^ (rand_u64() & 0xFFFF);
+        let oversized = script
+            .run(
+                "a",
+                Step5::CallSized {
+                    id: 0,
+                    session: "main".into(),
+                    service: ECHO_SERVICE.into(),
+                    seed: over_seed,
+                    size: ABI_OVER_LIMIT_SIZE,
+                    timeout_ms: 30_000,
+                },
+            )
+            .await;
+        let over_kind = oversized.kind.clone().unwrap_or_default();
+        let over_message = oversized.message.clone().unwrap_or_default();
+        // Settle, then read: a body that was going to arrive
+        // truncated would have arrived by now.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let handler_untouched = echo_log.lock().expect("echo log").is_empty();
+        let refused_typed = !oversized.ok && !over_kind.is_empty() && handler_untouched;
+
+        // Leg 3a, GATED: native → leaf on a stream at the same
+        // ceiling, so "both directions" covers the stream API and
+        // not only nRPC.
+        //
+        // Leg 3b, RECORDED and deliberately NOT gated: the same
+        // send at 32 KiB, over `MAX_PAYLOAD_SIZE`. §9.2 states the
+        // leaf → native direction (native does not reassemble); it
+        // says nothing about native → leaf, and this probe is how
+        // that direction gets a measured answer instead of an
+        // assumption. Gating it would be asserting a contract
+        // nobody has written; dropping it would be hiding the
+        // measurement. It is reported with its exact outcome and
+        // named in §12 for the owner.
+        let stream_ceiling = gen_bytes(over_seed ^ 0x3C3C, ABI_CEILING_SIZE);
+        let want_stream_ceiling = Mark::of(&stream_ceiling);
+        let stream_large = gen_bytes(over_seed ^ 0x5A5A, ABI_STREAM_LARGE_SIZE);
+        let want_stream_large = Mark::of(&stream_large);
+        let mut ceiling_send_error: Option<String> = None;
+        let mut stream_large_error: Option<String> = None;
+        if let Ok(stream) = &direct_native {
+            let at_ceiling = Bytes::from(stream_ceiling.clone());
+            if let Err(e) = cx
+                .anchor
+                .send_with_retry(stream, std::slice::from_ref(&at_ceiling), 200)
+                .await
+            {
+                ceiling_send_error = Some(e.to_string());
+            }
+            let over = Bytes::from(stream_large.clone());
+            if let Err(e) = cx
+                .anchor
+                .send_with_retry(stream, std::slice::from_ref(&over), 200)
+                .await
+            {
+                stream_large_error = Some(e.to_string());
+            }
+        } else {
+            ceiling_send_error = Some("the anchor never opened the direct stream".into());
+            stream_large_error = ceiling_send_error.clone();
+        }
+        let large_inbox = script
+            .run(
+                "a",
+                Step5::StreamInbox {
+                    id: 0,
+                    handle: "direct".into(),
+                    expect: ABI_DIRECT_EVENTS + 2,
+                    timeout_ms: 30_000,
+                },
+            )
+            .await;
+        let large_callback = marks(&large_inbox, "callback");
+        let large_iterator = marks(&large_inbox, "iterator");
+        let extra: Vec<Mark> = large_callback
+            .iter()
+            .skip(ABI_DIRECT_EVENTS)
+            .copied()
+            .collect();
+        let extra_iter: Vec<Mark> = large_iterator
+            .iter()
+            .skip(ABI_DIRECT_EVENTS)
+            .copied()
+            .collect();
+        // GATED: the ceiling payload must be the FIRST thing that
+        // arrived after this stream's earlier traffic, byte-exact,
+        // on both consumers.
+        let stream_down = ceiling_send_error.is_none()
+            && extra.first() == Some(&want_stream_ceiling)
+            && extra_iter.first() == Some(&want_stream_ceiling);
+        // RECORDED: what the over-cap one did.
+        let over_cap_outcome = if stream_large_error.is_some() {
+            "REFUSED at the native sender with a typed StreamError"
+        } else if extra.iter().any(|m| *m == want_stream_large) {
+            "ACCEPTED and delivered byte-exact"
+        } else if extra.len() > 1 || extra_iter.len() > 1 {
+            "ACCEPTED and something OTHER than the payload arrived — a truncation"
+        } else {
+            "ACCEPTED with Ok and NOTHING arrived — a silent drop in the native → leaf \
+             direction, which §9.2 does not cover"
+        };
+
+        ledger.record(
+            WITNESSES[12],
+            sized.ok && request_up && reply_down && refused_typed && stream_down,
+            format!(
+                "LARGE MESSAGES THROUGH THE PUBLIC API, BOTH DIRECTIONS — measured against \
+                 the interoperability §9.2 actually claims, not against a size it \
+                 explicitly disclaims. (§9.2: no NATIVE node reassembles leaf fragments, so \
+                 leaf → native above MAX_PAYLOAD_SIZE = 8 104 B is not put back together; \
+                 above 64 832 B the leaf attempts nothing and returns a typed \
+                 `LeafError::Wire` naming streams — never a truncation, never a drop.) \
+                 LEG 1, AT THE CEILING: one `call('{ECHO_SERVICE}', <{ABI_CEILING_SIZE} B>)` \
+                 through the package's public API (ok={}{}); the page built \
+                 {got_request:?} and the ANCHOR's real handler recorded a body matching \
+                 {want_request:?} byte for byte={handler_got_ceiling} — so a locally \
+                 synthesised round trip cannot pass this. DOWN the same way: the echo \
+                 service answers `echo:` + that body, {} B, and the page received \
+                 {got_reply:?} against the expected {want_reply:?}={reply_down}. \
+                 LEG 2, PAST THE HARD LIMIT: `call(<{ABI_OVER_LIMIT_SIZE} B>)` was refused \
+                 with kind={over_kind:?} Display={over_message:?}, and the anchor's handler \
+                 was entered ZERO times afterwards={handler_untouched} — so the refusal is \
+                 typed AND nothing truncated reached the far side \
+                 (refused_typed={refused_typed}). A silent drop, a truncation, or a \
+                 partial body dispatched to the handler each fail this leg. \
+                 LEG 3a, GATED, NATIVE → LEAF ON A STREAM at the same ceiling \
+                 ({ABI_CEILING_SIZE} B), so `both directions` covers the stream API and \
+                 not only nRPC: the anchor's send returned {ceiling_send_error:?} and the \
+                 package's callback AND iterator each received {want_stream_ceiling:?} \
+                 byte-exact as the first payload after the {ABI_DIRECT_EVENTS} this stream \
+                 already carried={stream_down}. \
+                 LEG 3b, RECORDED AND NOT GATED — a measurement, not a contract: the same \
+                 send at {ABI_STREAM_LARGE_SIZE} B, over MAX_PAYLOAD_SIZE. §9.2 states the \
+                 LEAF → NATIVE direction only (native does not reassemble leaf fragments); \
+                 it says nothing about NATIVE → LEAF, so this probe measures it rather \
+                 than assuming it. Outcome: {over_cap_outcome}. Native send result \
+                 {stream_large_error:?}; expected {want_stream_large:?}; everything that \
+                 actually arrived beyond the earlier traffic: {extra:?} (iterator: \
+                 {extra_iter:?}). This is NOT gated, because gating it would assert a \
+                 contract nobody has written; it is reported here and named for the owner \
+                 in §12 rather than dropped. \
+                 ANCHOR STATE: {}",
+                sized.ok,
+                sized
+                    .error
+                    .as_deref()
+                    .map(|e| format!("; error: {e}"))
+                    .unwrap_or_default(),
+                ceiling_reply.len(),
+                peer_state(cx.anchor, node_id),
+            ),
+        );
+    }
+
+    // ================================================================
     // 5 — a native peer's `find_best_node` returns the browser node
     //
     // The anchor is the browser's native peer, and the only one it
@@ -1811,6 +2591,241 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
     }
 
     // ================================================================
+    // 6c — the same stream ABI, LEADER-PROXIED
+    //
+    // The other half of R11. Everything in 4b ran on the direct
+    // `connect()` object, whose `openStream` is synchronous and whose
+    // packets go straight onto its own DataChannel. A FOLLOWER's
+    // `MeshSession.openStream` is a different code path end to end:
+    // the open is a proxy round trip over BroadcastChannel, the
+    // handle Rust stamps is carried back across it, `send` resolves
+    // only once the LEADER tab has put the packet on the wire, and
+    // inbound payloads make the same trip in reverse before the
+    // package's `LeafStream` ever sees them.
+    //
+    // It runs here because this is the only point in the script
+    // where a real leader and a real follower coexist on one
+    // identity: tab b was promoted by the witness above, so tab a
+    // can join its lock scope as a follower without minting a second
+    // node or displacing the anchor's session.
+    // ================================================================
+    {
+        let joined = script.run("a", connect_as("abi-follow", false, true)).await;
+        let role_info = script
+            .run(
+                "a",
+                Step5::Info {
+                    id: 0,
+                    session: "abi-follow".into(),
+                },
+            )
+            .await;
+        let follower_role = role_info.role.clone().unwrap_or_default();
+        let is_follower = follower_role == "follower";
+
+        let proxy_open = if is_follower {
+            script
+                .run(
+                    "a",
+                    Step5::StreamOpen {
+                        id: 0,
+                        session: "abi-follow".into(),
+                        handle: "proxied".into(),
+                        reliable: true,
+                        label: Some("abi-proxied".into()),
+                        stream_id: Some(ABI_PROXY_STREAM_ID.to_string()),
+                        channel_hash: None,
+                    },
+                )
+                .await
+        } else {
+            fail(format!(
+                "not attempted: tab a joined as role={follower_role:?}, not a follower, so \
+                 there is no proxied surface to exercise"
+            ))
+        };
+        let want_proxy_hex = format!("{ABI_PROXY_STREAM_ID:016x}");
+        // The package returned a PROMISE, which is the declared
+        // difference between the two surfaces — a direct handle here
+        // would mean this leg silently retested 4b.
+        let really_proxied = proxy_open
+            .stats
+            .as_ref()
+            .and_then(|s| s.get("proxied"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        let proxy_handle_matches = stat_str(&proxy_open, "stream_id")
+            == format!("\"{want_proxy_hex}\"")
+            && stat_str(&proxy_open, "reliability") == "\"reliable\"";
+
+        // Native → follower.
+        let proxy_native = if proxy_open.ok {
+            cx.anchor
+                .open_stream(
+                    node_id,
+                    ABI_PROXY_STREAM_ID,
+                    StreamConfig::new().with_reliability(Reliability::Reliable),
+                )
+                .map_err(|e| e.to_string())
+        } else {
+            Err("not attempted: the follower never opened a stream".into())
+        };
+        let proxy_seed = 0x6600 ^ (rand_u64() & 0xFFFF);
+        let mut proxy_send_error: Option<String> = None;
+        match &proxy_native {
+            Ok(stream) => {
+                for i in 0..ABI_PROXY_EVENTS {
+                    let payload = Bytes::from(gen_bytes(proxy_seed + i as u64, ABI_PROXY_SIZE));
+                    if let Err(e) = cx
+                        .anchor
+                        .send_with_retry(stream, std::slice::from_ref(&payload), 60)
+                        .await
+                    {
+                        proxy_send_error = Some(format!("payload {i}: {e}"));
+                        break;
+                    }
+                }
+            }
+            Err(e) => proxy_send_error = Some(e.clone()),
+        }
+        let proxy_inbox = if proxy_open.ok {
+            script
+                .run(
+                    "a",
+                    Step5::StreamInbox {
+                        id: 0,
+                        handle: "proxied".into(),
+                        expect: ABI_PROXY_EVENTS,
+                        timeout_ms: 45_000,
+                    },
+                )
+                .await
+        } else {
+            fail("not attempted")
+        };
+        let want_proxy = expected_marks(proxy_seed, ABI_PROXY_SIZE, ABI_PROXY_EVENTS);
+        let proxy_callback = marks(&proxy_inbox, "callback");
+        let proxy_iterator = marks(&proxy_inbox, "iterator");
+        let proxy_callback_exact = proxy_callback == want_proxy;
+        let proxy_iterator_exact = proxy_iterator == want_proxy;
+
+        // Follower → native, through the same proxy in reverse: a
+        // natively encoded nRPC REQUEST on a proxied stream must
+        // reach the anchor's REAL handler.
+        sink_log.lock().expect("sink log").clear();
+        let out_body = format!("s5-proxied-out-{:016x}", rand_u64());
+        let out_frame = rpc_request_frame(SINK_SERVICE, origin_hash, 0x6C00, out_body.as_bytes());
+        let out_open = if is_follower {
+            script
+                .run(
+                    "a",
+                    Step5::StreamOpen {
+                        id: 0,
+                        session: "abi-follow".into(),
+                        handle: "proxied-out".into(),
+                        reliable: true,
+                        label: Some("abi-proxied-out".into()),
+                        stream_id: Some(format!("{}", out_frame.stream_id)),
+                        channel_hash: Some(out_frame.channel_hash_u16),
+                    },
+                )
+                .await
+        } else {
+            fail("not attempted")
+        };
+        let out_write = if out_open.ok {
+            script
+                .run(
+                    "a",
+                    Step5::StreamWrite {
+                        id: 0,
+                        handle: "proxied-out".into(),
+                        frames: vec![hex(&out_frame.payload)],
+                        seed: 0,
+                        size: 0,
+                        count: 0,
+                        drop_every: 0,
+                        reorder_every: 0,
+                    },
+                )
+                .await
+        } else {
+            fail("not attempted")
+        };
+        let outbound_landed = out_write.ok
+            && wait_for(
+                || {
+                    sink_log
+                        .lock()
+                        .expect("sink log")
+                        .iter()
+                        .any(|b| b.as_slice() == out_body.as_bytes())
+                },
+                Duration::from_secs(30),
+            )
+            .await;
+
+        ledger.record(
+            WITNESSES[13],
+            joined.ok
+                && is_follower
+                && proxy_open.ok
+                && really_proxied
+                && proxy_handle_matches
+                && proxy_send_error.is_none()
+                && proxy_callback_exact
+                && proxy_iterator_exact
+                && outbound_landed,
+            format!(
+                "THE LEADER-PROXIED STREAM SURFACE, exercised through the built package. \
+                 Tab a rejoined the promoted leader's lock scope through §8's \
+                 `openSession` (ok={}) and reports role={follower_role:?} — a \
+                 FOLLOWER={is_follower}, so every stream operation below is a proxy round \
+                 trip over BroadcastChannel to the tab that owns the DataChannel, not the \
+                 direct path 4b exercised. `MeshSession.openStream` returned a PROMISE \
+                 rather than a handle, which is the declared difference between the two \
+                 surfaces={really_proxied}, and the stream it resolved to reports \
+                 streamId={} reliability={} — the id and mode asked for \
+                 ({want_proxy_hex}, reliable)={proxy_handle_matches}, so the options \
+                 survived the proxy hop and the handle Rust stamped came back across it. \
+                 NATIVE → FOLLOWER: the anchor opened the same id and sent \
+                 {ABI_PROXY_EVENTS} × {ABI_PROXY_SIZE} B from seed {proxy_seed:#x} (error: \
+                 {proxy_send_error:?}); the package's `onMessage` callback received {} \
+                 payload(s) byte-exact and in order={proxy_callback_exact} and its async \
+                 iterator received {} byte-exact and in order={proxy_iterator_exact} — both \
+                 after leader → follower relay. FOLLOWER → NATIVE: a natively encoded nRPC \
+                 REQUEST written to a second proxied stream reached the anchor's REAL \
+                 `{SINK_SERVICE}` handler with body {out_body:?}={outbound_landed} (open \
+                 ok={}, write ok={}), so the proxy carries bytes in both directions and \
+                 not merely the open. ANCHOR STATE: {}",
+                joined.ok,
+                stat_str(&proxy_open, "stream_id"),
+                stat_str(&proxy_open, "reliability"),
+                proxy_callback.len(),
+                proxy_iterator.len(),
+                out_open.ok,
+                out_write.ok,
+                peer_state(cx.anchor, node_id),
+            ),
+        );
+
+        // Hand the follower back before the displacement witness
+        // runs: a live follower in tab a would promote itself when
+        // tab b's page closes and bootstrap a node of its own, which
+        // the UDP witness's "the identity is free" wait cannot see
+        // coming.
+        let _ = script
+            .run(
+                "a",
+                Step5::Close {
+                    id: 0,
+                    session: "abi-follow".into(),
+                },
+            )
+            .await;
+    }
+
+    // ================================================================
     // 6b — a reconnect that DISPLACES an extant busy incumbent
     //
     // The browser counterpart of the native R12 witness, and the O2
@@ -2240,4 +3255,91 @@ fn random_32() -> [u8; 32] {
     out[0] &= 0xF8;
     out[31] = (out[31] & 0x7F) | 0x40;
     out
+}
+
+// ===================================================================
+// The byte vocabulary the page and the runner share
+// ===================================================================
+
+/// The deterministic payload generator, implemented identically in
+/// `page/leaf5.js` (`genBytes`).
+///
+/// Both sides derive the bytes from `(seed, len)`, so a
+/// multi-megabyte exercise costs nothing on the HTTP step channel
+/// and the comparison is still byte-exact. Keep the two in step: a
+/// drift shows up as every payload mismatching, which is loud.
+fn gen_bytes(seed: u64, len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|i| {
+            let i = i as u64;
+            (seed.wrapping_add(i * 167).wrapping_add((i >> 8) * 13) & 0xFF) as u8
+        })
+        .collect()
+}
+
+/// FNV-1a/32, identical to the page's `fnv1a`.
+///
+/// Reported beside the length, so a payload that arrived truncated,
+/// duplicated, reordered or corrupted is a mismatch rather than a
+/// count that happens to agree.
+fn fnv1a(bytes: &[u8]) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for b in bytes {
+        h ^= u32::from(*b);
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
+}
+
+/// One payload as both sides describe it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+struct Mark {
+    len: usize,
+    fnv: u32,
+}
+
+impl Mark {
+    fn of(bytes: &[u8]) -> Self {
+        Self {
+            len: bytes.len(),
+            fnv: fnv1a(bytes),
+        }
+    }
+}
+
+/// The marks the page reported under `field`, in arrival order.
+fn marks(result: &StepResult, field: &str) -> Vec<Mark> {
+    result
+        .stats
+        .as_ref()
+        .and_then(|stats| stats.get(field))
+        .and_then(|value| serde_json::from_value::<Vec<Mark>>(value.clone()).ok())
+        .unwrap_or_default()
+}
+
+/// The marks `count` generated payloads from `seed` must produce.
+fn expected_marks(seed: u64, size: usize, count: usize) -> Vec<Mark> {
+    (0..count)
+        .map(|i| Mark::of(&gen_bytes(seed + i as u64, size)))
+        .collect()
+}
+
+/// A `stats` field read as a string, for the ledger text.
+fn stat_str(result: &StepResult, field: &str) -> String {
+    result
+        .stats
+        .as_ref()
+        .and_then(|stats| stats.get(field))
+        .map(std::string::ToString::to_string)
+        .unwrap_or_else(|| "absent".into())
+}
+
+/// A `stats` field read as a `u64`.
+fn stat_u64(result: &StepResult, field: &str) -> u64 {
+    result
+        .stats
+        .as_ref()
+        .and_then(|stats| stats.get(field))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
 }

@@ -1,0 +1,161 @@
+### P1 (a) RAW INVERSE — Reassembler::expire stops surrendering the reaped group's stream ownership
+### repaired snapshot: spikes/s5r3_inverse/repaired/frame.rs
+
+## bounded source diff
+$ diff -u spikes/s5r3_inverse/repaired/frame.rs net/crates/net/leaf/src/frame.rs
+--- spikes/s5r3_inverse/repaired/frame.rs	2026-09-15 14:07:42.500842100 +0200
++++ net/crates/net/leaf/src/frame.rs	2026-09-15 14:07:52.196887800 +0200
+@@ -672,7 +672,6 @@
+             if now.saturating_duration_since(p.touched) < ttl {
+                 return true;
+             }
+-            note_abandoned(abandoned, key.0, p);
+             false
+         });
+         for _ in 0..(before - self.groups.len()) {
+EXIT=1
+
+## mutated run 1
+$ cd net/crates/net/leaf && cargo test --lib -- reaped_at_the_ttl unreaped_group a_reaped_sequenced_group a_reaped_control_group
+warning: C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\Cargo.toml: `panic` setting is ignored for `bench` profile
+warning: `net-mesh` (manifest) generated 1 warning
+   Compiling net-mesh-leaf v0.36.0 (C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\leaf)
+warning: unused variable: `key`
+   --> src\frame.rs:671:29
+    |
+671 |         self.groups.retain(|key, p| {
+    |                             ^^^ help: if this is intentional, prefix it with an underscore: `_key`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `abandoned`
+   --> src\frame.rs:670:13
+    |
+670 |         let abandoned = &mut self.abandoned;
+    |             ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_abandoned`
+
+warning: `net-mesh-leaf` (lib) generated 2 warnings (run `cargo fix --lib -p net-mesh-leaf` to apply 2 suggestions)
+warning: `net-mesh-leaf` (lib test) generated 2 warnings (2 duplicates)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.30s
+     Running unittests src\lib.rs (target\debug\deps\net_leaf-07dd5be407959f6e.exe)
+
+running 4 tests
+test frame::tests::a_reaped_control_group_strands_no_stream ... ok
+test frame::tests::a_reaped_sequenced_group_names_the_stream_it_owned ... FAILED
+test node::tests::an_acknowledged_group_reaped_at_the_ttl_ends_its_stream_and_stops_acknowledging ... FAILED
+test node::tests::an_unreaped_group_completes_and_ends_no_stream ... ok
+
+failures:
+
+---- frame::tests::a_reaped_sequenced_group_names_the_stream_it_owned stdout ----
+
+thread 'frame::tests::a_reaped_sequenced_group_names_the_stream_it_owned' (107544) panicked at src\frame.rs:1172:9:
+assertion `left == right` failed: the reap must surrender the stream's ownership, not just count it
+  left: []
+ right: [Abandoned { scope: 9, stream_id: 4 }]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- node::tests::an_acknowledged_group_reaped_at_the_ttl_ends_its_stream_and_stops_acknowledging stdout ----
+
+thread 'node::tests::an_acknowledged_group_reaped_at_the_ttl_ends_its_stream_and_stops_acknowledging' (43028) panicked at src\node.rs:3208:9:
+assertion `left == right` failed: the reap must name the stream whose acknowledged bytes it took
+  left: []
+ right: [(562949953421333, ReassemblyAbandoned)]
+
+
+failures:
+    frame::tests::a_reaped_sequenced_group_names_the_stream_it_owned
+    node::tests::an_acknowledged_group_reaped_at_the_ttl_ends_its_stream_and_stops_acknowledging
+
+test result: FAILED. 2 passed; 2 failed; 0 ignored; 0 measured; 167 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `--lib`
+EXIT=101
+
+## mutated run 2
+$ cd net/crates/net/leaf && cargo test --test kyra_round2_review
+warning: C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\Cargo.toml: `panic` setting is ignored for `bench` profile
+warning: `net-mesh` (manifest) generated 1 warning
+   Compiling net-mesh-leaf v0.36.0 (C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\leaf)
+warning: unused variable: `key`
+   --> src\frame.rs:671:29
+    |
+671 |         self.groups.retain(|key, p| {
+    |                             ^^^ help: if this is intentional, prefix it with an underscore: `_key`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `abandoned`
+   --> src\frame.rs:670:13
+    |
+670 |         let abandoned = &mut self.abandoned;
+    |             ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_abandoned`
+
+warning: `net-mesh-leaf` (lib) generated 2 warnings (run `cargo fix --lib -p net-mesh-leaf` to apply 2 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.49s
+     Running tests\kyra_round2_review.rs (target\debug\deps\kyra_round2_review-7f3a156a0a521db2.exe)
+
+running 5 tests
+test kyra_control_debit_below_window_control ... ok
+test kyra_control_overdraft_grant_does_not_refund_withheld_application ... ok
+test kyra_expired_acknowledged_partial_delivers_or_fails_typed ... FAILED
+test kyra_unexpired_partial_delivery_control ... ok
+test kyra_same_session_close_reopen_preserves_receive_progress ... ok
+
+failures:
+
+---- kyra_expired_acknowledged_partial_delivers_or_fails_typed stdout ----
+
+thread 'kyra_expired_acknowledged_partial_delivers_or_fails_typed' (24580) panicked at tests\kyra_round2_review.rs:159:5:
+ACKed fragment state expired without complete delivery or typed terminal failure; events=[]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    kyra_expired_acknowledged_partial_delivers_or_fails_typed
+
+test result: FAILED. 4 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `--test kyra_round2_review`
+EXIT=101
+
+## restoration
+$ diff -u spikes/s5r3_inverse/repaired/frame.rs net/crates/net/leaf/src/frame.rs
+EXIT=0 (0 = byte-identical to the repaired snapshot)
+
+## restored run 1
+$ cd net/crates/net/leaf && cargo test --lib -- reaped_at_the_ttl unreaped_group a_reaped_sequenced_group a_reaped_control_group
+warning: C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\Cargo.toml: `panic` setting is ignored for `bench` profile
+warning: `net-mesh` (manifest) generated 1 warning
+   Compiling net-mesh-leaf v0.36.0 (C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\leaf)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.05s
+     Running unittests src\lib.rs (target\debug\deps\net_leaf-07dd5be407959f6e.exe)
+
+running 4 tests
+test frame::tests::a_reaped_control_group_strands_no_stream ... ok
+test frame::tests::a_reaped_sequenced_group_names_the_stream_it_owned ... ok
+test node::tests::an_acknowledged_group_reaped_at_the_ttl_ends_its_stream_and_stops_acknowledging ... ok
+test node::tests::an_unreaped_group_completes_and_ends_no_stream ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 167 filtered out; finished in 0.02s
+
+EXIT=0
+
+## restored run 2
+$ cd net/crates/net/leaf && cargo test --test kyra_round2_review
+warning: C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\Cargo.toml: `panic` setting is ignored for `bench` profile
+warning: `net-mesh` (manifest) generated 1 warning
+   Compiling net-mesh-leaf v0.36.0 (C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\leaf)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.53s
+     Running tests\kyra_round2_review.rs (target\debug\deps\kyra_round2_review-7f3a156a0a521db2.exe)
+
+running 5 tests
+test kyra_control_debit_below_window_control ... ok
+test kyra_control_overdraft_grant_does_not_refund_withheld_application ... ok
+test kyra_expired_acknowledged_partial_delivers_or_fails_typed ... ok
+test kyra_same_session_close_reopen_preserves_receive_progress ... ok
+test kyra_unexpired_partial_delivery_control ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+EXIT=0

@@ -78,6 +78,17 @@ const pending = new Map();
 /// session's own teardown: the report has to be readable after the
 /// node it belonged to is gone.
 const reentry = new Map();
+/// Streams opened by `stream_open`, keyed by the runner's handle.
+///
+/// Each entry holds the PACKAGE's `LeafStream` — the object
+/// `BrowserNode.openStream` (direct) or `MeshSession.openStream`
+/// (leader-proxied) returned — together with what its `onMessage`
+/// callback and its `for await` async iterator each saw, in arrival
+/// order. Both consumers are attached at open, before a single byte
+/// can arrive, so "the callback and the iterator received the same
+/// payloads" is a property of the package's fan-out and not of
+/// whichever one happened to be registered first.
+const streams = new Map();
 
 function log(line) {
   const text = '[' + TAB + '] ' + line;
@@ -98,15 +109,59 @@ function unhex(s) {
   return out;
 }
 
+/// The deterministic payload generator the RUNNER also implements,
+/// byte for byte. Both sides compute the same bytes from `(seed,
+/// len)`, so a multi-megabyte exercise costs no HTTP payload and the
+/// comparison is still exact.
+function genBytes(seed, len) {
+  const out = new Uint8Array(len);
+  for (let i = 0; i < len; i += 1) out[i] = (seed + i * 167 + (i >> 8) * 13) & 0xff;
+  return out;
+}
+
+/// FNV-1a/32 over a payload, identical to the runner's. Reported
+/// alongside the length, so a payload that arrived truncated,
+/// duplicated, reordered or corrupted is a mismatch rather than a
+/// count that happens to agree.
+function fnv1a(bytes) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < bytes.length; i += 1) {
+    h = (h ^ bytes[i]) >>> 0;
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h >>> 0;
+}
+
+/// One payload, as the runner compares them.
+function mark(payload) {
+  return { len: payload.length, fnv: fnv1a(payload) };
+}
+
 // ---------------------------------------------------------------------
-// the drop hook
+// the drop hook, and the reorder hook beside it
 // ---------------------------------------------------------------------
+//
+// REORDER. The leaf opens its DataChannel ordered and reliable (the
+// AEAD replay window refuses packet-level reorder), so SCTP will not
+// reorder anything for us — which means the only honest way to
+// deliver two Net packets to the peer out of order is to SUBMIT them
+// out of order. With `reorderEvery = N` the Nth outbound message is
+// held back and sent immediately AFTER the next one, so the receiver
+// really does see seq k+1 before seq k. That is a genuine Net-level
+// reorder on a transport that cannot produce one by itself, and it
+// is engine-agnostic.
+//
+// A held datagram is never abandoned: `flushHeld()` runs at the end
+// of every step that armed the hook, so "reordered" never silently
+// becomes "lost".
 
 const loss = { dropEvery: 0, seen: 0, dropped: 0 };
+const reorder = { every: 0, seen: 0, swapped: 0, held: null };
 
 (function installDropHook() {
   if (typeof RTCDataChannel === 'undefined') return;
   const original = RTCDataChannel.prototype.send;
+  reorder.send = (channel, data) => original.call(channel, data);
   RTCDataChannel.prototype.send = function patched(data) {
     if (loss.dropEvery > 0) {
       loss.seen += 1;
@@ -115,9 +170,37 @@ const loss = { dropEvery: 0, seen: 0, dropped: 0 };
         return; // the datagram never leaves the browser
       }
     }
+    if (reorder.every > 0) {
+      reorder.seen += 1;
+      if (reorder.held === null && reorder.seen % reorder.every === 0) {
+        // Held back — the NEXT datagram overtakes it.
+        reorder.held = { channel: this, data };
+        reorder.swapped += 1;
+        return;
+      }
+      if (reorder.held !== null) {
+        const held = reorder.held;
+        reorder.held = null;
+        const out = original.call(this, data); // the later one first
+        original.call(held.channel, held.data); // then the overtaken one
+        return out;
+      }
+    }
     return original.call(this, data);
   };
 })();
+
+/// Release a datagram the reorder hook is still holding. Called at
+/// the end of every step that armed it, so the last message of a
+/// batch can never be silently dropped by the swap.
+function flushHeld() {
+  if (reorder.held !== null && typeof reorder.send === 'function') {
+    const held = reorder.held;
+    reorder.held = null;
+    reorder.send(held.channel, held.data);
+  }
+  reorder.held = null;
+}
 
 // ---------------------------------------------------------------------
 // error typing
@@ -377,6 +460,207 @@ async function execute(step) {
         loss.dropEvery = 0;
         const out = typedFailure(e);
         out.dropped = loss.dropped;
+        return out;
+      }
+    }
+
+    // -----------------------------------------------------------------
+    // The REAL stream ABI: one stream from the built package, held
+    // open across steps, with both of its consumers attached.
+    //
+    // `await node.openStream(...)` covers both surfaces without a
+    // branch: `BrowserNode.openStream` is synchronous and
+    // `MeshSession.openStream` is a promise, and awaiting a
+    // non-promise is a no-op. Which one this is comes back in the
+    // result as `proxied`, read from the object the package
+    // actually returned rather than from what the runner asked for.
+    // -----------------------------------------------------------------
+    case 'stream_open': {
+      const node = nodes.get(step.session);
+      if (!node) return { ok: false, error: 'no such session ' + step.session };
+      const opts = {
+        reliability: step.reliable ? 'reliable' : 'fireAndForget',
+        reliable: step.reliable,
+      };
+      if (step.label) opts.label = step.label;
+      if (step.stream_id) opts.streamId = step.stream_id;
+      if (step.channel_hash !== null && step.channel_hash !== undefined) {
+        opts.channelHash = step.channel_hash;
+      }
+      // What the BUILT wasm makes of this exact options object,
+      // read through the same parser `open_stream` uses. Reached
+      // off the generated node's own constructor, so it is the
+      // artifact the page loaded and not a second copy: a page that
+      // has no direct wasm node (a follower) reports `null` here and
+      // the runner gates that leg on the opened stream's own
+      // answers instead.
+      let effective = null;
+      const generated = node.inner && node.inner.constructor;
+      if (generated && typeof generated.effective_stream_options === 'function') {
+        try {
+          effective = JSON.parse(generated.effective_stream_options(opts));
+        } catch (e) {
+          effective = { error: (e && (e.message || String(e))) || 'unknown' };
+        }
+      }
+      let stream;
+      const openPromise = (() => {
+        try {
+          return node.openStream(opts);
+        } catch (e) {
+          return Promise.reject(e);
+        }
+      })();
+      const proxied = typeof openPromise?.then === 'function';
+      try {
+        stream = await openPromise;
+      } catch (e) {
+        return typedFailure(e);
+      }
+      const state = { stream, node, callback: [], iterator: [], iteratorEnded: false };
+      // Callback first, iterator second, both before any byte can
+      // arrive: `LeafStream` hands buffered payloads to whichever
+      // consumer registers first, so registering both up front is
+      // what makes the two lists comparable.
+      state.cancel = stream.onMessage((payload) => state.callback.push(mark(payload)));
+      state.draining = (async () => {
+        try {
+          for await (const payload of stream) state.iterator.push(mark(payload));
+        } catch (e) {
+          state.iteratorError = (e && (e.message || String(e))) || 'unknown';
+        }
+        state.iteratorEnded = true;
+      })();
+      streams.set(step.handle, state);
+      return {
+        ok: true,
+        stats: {
+          stream_id: stream.streamId,
+          reliability: stream.reliability,
+          proxied,
+          effective_options: effective,
+        },
+      };
+    }
+
+    // Send on a stream `stream_open` already opened, optionally with
+    // the drop and reorder hooks armed. Payloads are either the
+    // runner's verbatim frames (`frames`) or the shared deterministic
+    // generator (`seed`/`size`/`count`), which is what keeps a
+    // multi-megabyte exercise off the HTTP step channel.
+    case 'stream_write': {
+      const state = streams.get(step.handle);
+      if (!state) return { ok: false, error: 'no such open stream ' + step.handle };
+      loss.dropEvery = step.drop_every || 0;
+      loss.seen = 0;
+      loss.dropped = 0;
+      reorder.every = step.reorder_every || 0;
+      reorder.seen = 0;
+      reorder.swapped = 0;
+      reorder.held = null;
+      const sent = [];
+      const disarm = () => {
+        flushHeld();
+        loss.dropEvery = 0;
+        reorder.every = 0;
+      };
+      try {
+        if (step.frames && step.frames.length) {
+          for (const frame of step.frames) {
+            const payload = unhex(frame);
+            await state.stream.send(payload);
+            sent.push(mark(payload));
+          }
+        } else {
+          for (let i = 0; i < step.count; i += 1) {
+            const payload = genBytes(step.seed + i, step.size);
+            await state.stream.send(payload);
+            sent.push(mark(payload));
+          }
+        }
+      } catch (e) {
+        const dropped = loss.dropped;
+        const swapped = reorder.swapped;
+        disarm();
+        const out = typedFailure(e);
+        out.stats = { sent, dropped, reordered: swapped, failed_at: sent.length };
+        return out;
+      }
+      const stats = {
+        sent,
+        dropped: loss.dropped,
+        reordered: reorder.swapped,
+        outbound_messages: Math.max(loss.seen, reorder.seen),
+      };
+      disarm();
+      return { ok: true, stats };
+    }
+
+    // What the two consumers of an open stream have received so far.
+    // Waits for `expect` payloads on the CALLBACK and then reports
+    // both lists; a short list is the result, never a hang.
+    case 'stream_inbox': {
+      const state = streams.get(step.handle);
+      if (!state) return { ok: false, error: 'no such open stream ' + step.handle };
+      const deadline = performance.now() + (step.timeout_ms || 15000);
+      while (
+        performance.now() < deadline &&
+        (state.callback.length < step.expect || state.iterator.length < step.expect)
+      ) {
+        await sleep(25);
+      }
+      // The leaf's own counters, sampled at the same instant, as the
+      // RAW `counters_json()` string. A short list is then
+      // attributable: a `stream_failed` event or an
+      // `unknown_subprotocol` / `duplicate_sequence` / `no_session`
+      // drop each say a different thing, and the nested `drops`
+      // object is exactly what the flattened `counters()` record
+      // loses.
+      let counters = null;
+      try {
+        counters =
+          state.node.inner && typeof state.node.inner.counters_json === 'function'
+            ? state.node.inner.counters_json()
+            : JSON.stringify(state.node.counters());
+      } catch (e) {
+        counters = 'ERROR ' + ((e && (e.message || String(e))) || 'unknown');
+      }
+      return {
+        ok: true,
+        stats: {
+          callback: state.callback,
+          iterator: state.iterator,
+          iterator_ended: state.iteratorEnded,
+          iterator_error: state.iteratorError || null,
+          stream_id: state.stream.streamId,
+          reliability: state.stream.reliability,
+          counters,
+        },
+      };
+    }
+
+    // One `call()` whose request AND reply are large enough to
+    // fragment, through the package's public API in both
+    // directions. The bodies never cross the step channel: both
+    // sides build them from `(seed, size)` and compare length + FNV.
+    case 'call_sized': {
+      const node = nodes.get(step.session);
+      if (!node) return { ok: false, error: 'no such session ' + step.session };
+      const body = genBytes(step.seed, step.size);
+      const started = performance.now();
+      try {
+        const reply = new Uint8Array(await node.call(step.service, body, step.timeout_ms));
+        return {
+          ok: true,
+          stats: {
+            request: mark(body),
+            reply: mark(reply),
+            elapsed_ms: performance.now() - started,
+          },
+        };
+      } catch (e) {
+        const out = typedFailure(e);
+        out.stats = { request: mark(body), elapsed_ms: performance.now() - started };
         return out;
       }
     }

@@ -56,7 +56,9 @@ pub use engine::{
     expire_dialogs, handle_signal, start_dialog, Dialog, DialogTable, SharedDialogs, SignalOutcome,
 };
 pub use fragment::{
-    FragmentOutcome, RtcReassembly, GROUP_TTL, MAX_GROUPS_PER_SESSION, MAX_REASSEMBLED_BYTES,
+    AbandonReason, AbandonedGroup, Assembled, FragmentOutcome, FragmentPiece, FragmentProvenance,
+    RtcReassembly, GROUP_TTL, MAX_ABANDONED_GROUPS_PER_SESSION, MAX_ABANDONMENT_RECORDS,
+    MAX_GROUPS_PER_SESSION, MAX_REASSEMBLED_BYTES, MAX_RETIRED_SESSIONS,
 };
 #[cfg(any(test, feature = "fixtures"))]
 pub use loopback::{connect_rtc_loopback, open_rtc_channel};

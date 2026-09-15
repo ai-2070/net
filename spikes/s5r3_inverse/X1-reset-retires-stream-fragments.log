@@ -1,0 +1,68 @@
+### X1 RAW INVERSE — a RESET stops retiring the reset stream's retained fragment groups
+### repaired snapshot: spikes/s5r3_inverse/repaired/node.rs
+
+## bounded source diff
+$ diff -u spikes/s5r3_inverse/repaired/node.rs net/crates/net/leaf/src/node.rs
+--- spikes/s5r3_inverse/repaired/node.rs	2026-09-15 14:09:21.132231200 +0200
++++ net/crates/net/leaf/src/node.rs	2026-09-15 14:10:26.688578100 +0200
+@@ -1708,8 +1708,6 @@
+                     let incarnation = session.incarnation();
+                     session.wire().reset_rx_stream(reset.stream_id);
+                     self.rx_streams.remove(&(incarnation, reset.stream_id));
+-                    self.reassembler
+-                        .retire_stream(incarnation, reset.stream_id, &self.counters);
+                     // A fresh receive half is exactly what an
+                     // overflow-terminated one needed, so this
+                     // clears that verdict. The send half's is a
+EXIT=1
+
+## mutated run
+$ cd net/crates/net/leaf && cargo test --lib -- a_reset_retires retiring_one_stream
+warning: C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\Cargo.toml: `panic` setting is ignored for `bench` profile
+warning: `net-mesh` (manifest) generated 1 warning
+   Compiling net-mesh-leaf v0.36.0 (C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\leaf)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.20s
+     Running unittests src\lib.rs (target\debug\deps\net_leaf-07dd5be407959f6e.exe)
+
+running 2 tests
+test frame::tests::retiring_one_stream_takes_only_its_own_groups ... ok
+test node::tests::a_reset_retires_the_streams_partial_groups_and_leaves_the_send_half ... FAILED
+
+failures:
+
+---- node::tests::a_reset_retires_the_streams_partial_groups_and_leaves_the_send_half stdout ----
+
+thread 'node::tests::a_reset_retires_the_streams_partial_groups_and_leaves_the_send_half' (111236) panicked at src\node.rs:3424:9:
+assertion `left == right` failed: a payload from the retired receive lifetime must not be delivered after the reset that ended it, and nothing new ends either
+  left: ([[104, 101, 97, 100, 45, 116, 97, 105, 108]], [])
+ right: ([], [])
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    node::tests::a_reset_retires_the_streams_partial_groups_and_leaves_the_send_half
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 170 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `--lib`
+EXIT=101
+
+## restoration
+$ diff -u spikes/s5r3_inverse/repaired/node.rs net/crates/net/leaf/src/node.rs
+EXIT=0 (0 = byte-identical to the repaired snapshot)
+
+## restored run
+$ cd net/crates/net/leaf && cargo test --lib -- a_reset_retires retiring_one_stream
+warning: C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\Cargo.toml: `panic` setting is ignored for `bench` profile
+warning: `net-mesh` (manifest) generated 1 warning
+   Compiling net-mesh-leaf v0.36.0 (C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\leaf)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.47s
+     Running unittests src\lib.rs (target\debug\deps\net_leaf-07dd5be407959f6e.exe)
+
+running 2 tests
+test frame::tests::retiring_one_stream_takes_only_its_own_groups ... ok
+test node::tests::a_reset_retires_the_streams_partial_groups_and_leaves_the_send_half ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 170 filtered out; finished in 0.02s
+
+EXIT=0

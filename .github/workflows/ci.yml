@@ -4767,7 +4767,7 @@ jobs:
             --junit "$RUNNER_TEMP/rtc-junit.xml" --multi \
             --floor rtc_loopback=5 \
             --floor rtc_backpressure=7 \
-            --floor rtc_repairs=22 \
+            --floor rtc_repairs=34 \
             --floor rtc_routed_restore=4 \
             --floor rtc_install_race=8 \
             --floor rtc_reclaim=5 \
@@ -4810,6 +4810,12 @@ jobs:
           rtc_repairs:a_stalled_driver_is_aborted_and_joined_before_shutdown_returns
           rtc_repairs:two_concurrent_joiners_both_observe_completed_teardown
           rtc_repairs:dropping_a_node_tears_down_the_transport_not_just_the_socket
+          rtc_repairs:an_acknowledged_fragment_groups_expiry_is_terminal_not_silent
+          rtc_repairs:a_fragment_from_another_stream_cannot_join_a_live_group
+          rtc_repairs:a_replaced_sessions_partial_fragment_group_is_retired
+          rtc_repairs:a_swept_dead_peers_partial_fragment_group_is_retired
+          rtc_repairs:a_closed_sessions_partial_fragment_group_is_retired_and_cannot_be_recreated
+          rtc_repairs:a_control_frame_shares_the_sequence_space_of_the_stream_it_rides
           rtc_routed_restore:routed_then_direct_then_loss_then_manually_restored_routed
           rtc_routed_restore:an_nrpc_call_round_trips_over_the_datachannel
           rtc_routed_restore:a_capability_fold_applies_a_remote_fact_received_over_rtc
@@ -5125,6 +5131,7 @@ jobs:
           the_enrollment_request_replays_inside_wasm
           "
           LEADER_WITNESSES="
+          a_cancelled_bootstraps_real_rtc_connection_is_closed_before_the_lock_moves
           a_custodial_identity_is_used_verbatim_and_never_stored
           a_follower_call_expires_on_its_own_deadline_as_an_indeterminate_outcome
           a_follower_call_without_a_timeout_expires_on_the_leafs_default_deadline
@@ -5132,6 +5139,7 @@ jobs:
           a_leaders_own_announcement_keeps_its_followers_capabilities
           a_promotion_whose_backend_fails_reattaches_instead_of_stranding_the_tab
           a_promotion_whose_generation_transaction_fails_requeues_instead_of_stranding_the_tab
+          a_proxied_send_broadcasts_another_streams_terminal_event_instead_of_panicking
           a_retained_stream_handle_cannot_address_a_same_id_successor
           a_runtime_announcement_is_restored_by_the_promoted_tab
           a_superseded_session_is_refused_by_the_leader_and_by_storage
@@ -5139,6 +5147,7 @@ jobs:
           an_aborted_generation_transaction_is_a_typed_failure_and_moves_nothing
           an_attach_during_the_initial_backend_await_is_replayed
           an_explicitly_retired_leader_goes_quiet_at_its_peer_while_its_page_stays_alive
+          an_unchanged_follower_announcement_keeps_the_published_union
           closing_a_promoting_tab_cancels_its_parked_bootstrap_and_frees_the_lock
           closing_a_tab_during_its_promotion_never_publishes_a_lock_holding_leader
           closing_the_leader_promotes_a_follower_fails_its_calls_and_restores_its_channels
@@ -5151,8 +5160,14 @@ jobs:
           two_sessions_share_one_identity_without_evicting_each_other
           "
           CHECK="$GITHUB_WORKSPACE/.github/scripts/check-roster.py"
+          # R14's production refusal: the anchor control plane does NOT
+          # carry signalling envelopes, and this is the witness that
+          # the refusal is real rather than a claim in a document.
+          LEAF_WITNESSES="
+          the_anchor_control_plane_refuses_to_carry_a_signalling_envelope
+          "
           python3 "$CHECK" --label wasm_leaf --mode fn \
-            --source tests/wasm_leaf.rs $REPLAYS
+            --source tests/wasm_leaf.rs $REPLAYS $LEAF_WITNESSES
           python3 "$CHECK" --label wasm_leader --mode fn \
             --source tests/wasm_leader.rs $LEADER_WITNESSES
           for suite in wasm_leaf wasm_anchorless wasm_leader; do
@@ -5166,8 +5181,8 @@ jobs:
             # that lost half its witnesses would otherwise still pass
             # this step.
             case "$suite" in
-              wasm_leaf)       floor=15 ;;
-              wasm_leader)     floor=24 ;;
+              wasm_leaf)       floor=16 ;;
+              wasm_leader)     floor=27 ;;
               wasm_anchorless) floor=2  ;;
             esac
             if [ "${ran:-0}" -lt "$floor" ]; then
@@ -5189,6 +5204,12 @@ jobs:
             }
           done
           echo "cross_lang replay: 8 vectors replayed inside wasm"
+          for witness in $LEAF_WITNESSES; do
+            grep -q "^test $witness \.\.\. ok$" /tmp/wasm_leaf.log || {
+              echo "::error::the leaf wasm witness $witness did not run and pass inside wasm"
+              exit 1
+            }
+          done
           # E1 (Kyra, Stage 5 round 2): `wasm_leader` had a floor of 6
           # against 18 witnesses and pinned none of them by name, so
           # twelve lifecycle tests could vanish and the job would stay
@@ -5200,7 +5221,7 @@ jobs:
               exit 1
             }
           done
-          echo "leader lifecycle: 24 witnesses executed in headless Chromium"
+          echo "leader lifecycle: 27 witnesses executed in headless Chromium"
 
       # Exit criterion: the shipped bundle stays under 1.5 MB gzipped.
       - name: Bundle size

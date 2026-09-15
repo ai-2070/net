@@ -156,6 +156,41 @@ pub struct RtcTestHooks {
     ingress_drop_one_in: std::sync::atomic::AtomicU64,
     /// Counter for the loss injector.
     ingress_seen: std::sync::atomic::AtomicU64,
+    /// Drop the Nth RAW outbound datagram carrying DTLS
+    /// application data — i.e. below SCTP (0 = disabled).
+    ///
+    /// # Why this exists beside `ingress_drop_one_in`
+    ///
+    /// The two injectors lose a packet at **different layers**, and
+    /// only one of them can say anything about SCTP.
+    ///
+    /// `ingress_drop_one_in` discards an `Event::ChannelData` —
+    /// SCTP has already delivered it, so the loss is above SCTP and
+    /// is terminal no matter how the DataChannel was negotiated.
+    /// That is what makes it the right tool for "`reliability.rs`
+    /// is the only recovery mechanism".
+    ///
+    /// This one discards the datagram on the socket, before the
+    /// peer's SCTP ever sees the chunk. A reliable channel
+    /// retransmits it; a `{ordered: false, maxRetransmits: 0}`
+    /// channel does not. It therefore DISTINGUISHES the two
+    /// negotiations, which the other hook cannot — and that
+    /// difference is the whole of the Stage 5 §11.8 mDNS finding:
+    /// Noise `msg1`/`msg2` are `build_handshake` packets outside
+    /// the reliable-stream machinery, so SCTP is their only
+    /// recovery, and a harness that switched SCTP recovery off made
+    /// a single lost datagram terminal.
+    ///
+    /// Deterministic, never probabilistic: it drops the **Nth**
+    /// qualifying datagram counted from the moment it is armed, so
+    /// a receipt taken with it is reproducible. Only DTLS
+    /// `application_data` records (content type `0x17`) are
+    /// counted; STUN checks and the DTLS handshake are left alone,
+    /// because losing those exercises ICE and DTLS recovery rather
+    /// than SCTP's.
+    raw_egress_drop_at: std::sync::atomic::AtomicU64,
+    /// Qualifying datagrams seen since [`Self::set_raw_egress_drop_at`].
+    raw_egress_seen: std::sync::atomic::AtomicU64,
     /// Make the next socket read fail with `ConnectionReset`.
     inject_conn_reset: AtomicBool,
     /// Park the loop in a long sleep so a caller can exercise the
@@ -179,6 +214,27 @@ impl RtcTestHooks {
     /// Drop one in `n` inbound DataChannel messages; `0` disables.
     pub fn set_ingress_drop_one_in(&self, n: u64) {
         self.ingress_drop_one_in.store(n, Ordering::Release);
+    }
+
+    /// Arm the PRE-SCTP injector: drop the `nth` outbound datagram
+    /// that carries DTLS application data, counting from this call.
+    /// `0` disables and resets the counter.
+    ///
+    /// See [`RtcTestHooks::raw_egress_drop_at`] for why this is a
+    /// different instrument from
+    /// [`Self::set_ingress_drop_one_in`]: this one loses the
+    /// datagram below SCTP, so a reliable DataChannel recovers it
+    /// and an unreliable one does not.
+    pub fn set_raw_egress_drop_at(&self, nth: u64) {
+        self.raw_egress_seen.store(0, Ordering::Release);
+        self.raw_egress_drop_at.store(nth, Ordering::Release);
+    }
+
+    /// How many qualifying datagrams the injector has counted since
+    /// it was armed — so a receipt can state that the drop really
+    /// happened rather than that it was merely requested.
+    pub fn raw_egress_counted(&self) -> u64 {
+        self.raw_egress_seen.load(Ordering::Acquire)
     }
 
     /// Make the driver's next socket read surface a
@@ -216,6 +272,21 @@ impl RtcTestHooks {
         let seen = self.ingress_seen.fetch_add(1, Ordering::Relaxed) + 1;
         seen.is_multiple_of(n)
     }
+
+    /// Whether this raw outbound datagram is the armed one.
+    ///
+    /// Only DTLS `application_data` records (content type `0x17`)
+    /// are counted: a STUN check or a DTLS handshake record lost
+    /// here would exercise ICE or DTLS recovery, which is a
+    /// different claim.
+    fn drop_this_raw_egress(&self, datagram: &[u8]) -> bool {
+        let nth = self.raw_egress_drop_at.load(Ordering::Acquire);
+        if nth == 0 || datagram.first() != Some(&0x17) {
+            return false;
+        }
+        let seen = self.raw_egress_seen.fetch_add(1, Ordering::Relaxed) + 1;
+        seen == nth
+    }
 }
 
 /// A pausable seam between "the RTC Noise exchange completed" and
@@ -236,6 +307,7 @@ pub struct RtcInstallPause {
     park_budget: std::sync::atomic::AtomicU32,
     reached: tokio::sync::Notify,
     release: tokio::sync::Notify,
+
     arrivals: std::sync::atomic::AtomicU32,
 }
 
@@ -1029,6 +1101,17 @@ async fn drain_session(
             }
             Ok(Output::Transmit(t)) => {
                 session.last_transmit = Some(t.destination);
+                // Injected PRE-SCTP loss: the datagram never leaves
+                // the socket, so the peer's SCTP never sees the
+                // chunk. A reliable DataChannel retransmits it; a
+                // `maxRetransmits: 0` one does not — which is the
+                // difference the `ChannelData` injector above
+                // cannot express, because by then SCTP has already
+                // delivered.
+                #[cfg(any(test, feature = "fixtures"))]
+                if hooks.drop_this_raw_egress(&t.contents) {
+                    continue;
+                }
                 let _ = socket.send_to(&t.contents, t.destination).await;
             }
             Ok(Output::Event(event)) => match event {

@@ -26,7 +26,15 @@ for await (const payload of stream) consume(payload);
 
 node.anchorIdHex();     // the anchor this leaf is bootstrapped to
 node.counters();        // every leaf counter, u64s as exact strings
-await node.signal(peerHex, dialog, 'offer', sdpBytes);  // 0x0D02, no session needed
+// `signal` addresses §9's session-independent 0x0D02 envelope. Against an
+// ANCHOR it is REFUSED, deliberately and always: `AnchorControlPlane::signal`
+// rejects unconditionally with `LeafError::ControlPlane`, because the anchor
+// control plane does not carry signalling envelopes. The carrier that does is
+// the anchorless one (§9 / `wasm_anchorless`), and this call is how a page
+// reaches it once one is attached.
+await node.signal(peerHex, dialog, 'offer', sdpBytes).catch((e) => {
+  e.kind; // 'control-plane' — the anchor refused; attach an anchorless carrier
+});
 await node.enroll();    // connect() already did this; explicit for harnesses
 node.isEnrolled();      // false => the anchor still has this peer provisional
 

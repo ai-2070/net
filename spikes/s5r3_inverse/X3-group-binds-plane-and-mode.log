@@ -1,0 +1,94 @@
+### X3 RAW INVERSE — the group-wide check stops binding subprotocol and reliability, leaving them to whichever packet completes the group
+### repaired snapshot: spikes/s5r3_inverse/repaired/frame.rs
+
+## bounded source diff
+$ diff -u spikes/s5r3_inverse/repaired/frame.rs net/crates/net/leaf/src/frame.rs
+--- spikes/s5r3_inverse/repaired/frame.rs	2026-09-15 14:07:42.500842100 +0200
++++ net/crates/net/leaf/src/frame.rs	2026-09-15 14:10:55.778219500 +0200
+@@ -532,8 +532,6 @@
+             m.stream_id != partial.first.stream_id
+                 || m.origin_hash != partial.first.origin_hash
+                 || m.channel_hash != partial.first.channel_hash
+-                || m.subprotocol_id != partial.first.subprotocol_id
+-                || m.reliable != partial.first.reliable
+         }) {
+             self.abandon(key);
+             counters.drop_for(DropReason::ReassemblyInconsistent);
+EXIT=1
+
+## mutated run
+$ cd net/crates/net/leaf && cargo test --lib -- cannot_change_its_plane cannot_change_its_mode cannot_be_completed_under_another_plane out_of_order_still_assembles
+warning: C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\Cargo.toml: `panic` setting is ignored for `bench` profile
+warning: `net-mesh` (manifest) generated 1 warning
+   Compiling net-mesh-leaf v0.36.0 (C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\leaf)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.00s
+     Running unittests src\lib.rs (target\debug\deps\net_leaf-07dd5be407959f6e.exe)
+
+running 5 tests
+test frame::tests::a_group_cannot_change_its_mode ... FAILED
+test frame::tests::a_group_cannot_change_its_plane ... FAILED
+test node::tests::a_fragment_group_cannot_change_its_mode_between_pieces ... FAILED
+test node::tests::a_consistent_group_arriving_out_of_order_still_assembles ... ok
+test node::tests::a_fragment_group_cannot_be_completed_under_another_plane ... FAILED
+
+failures:
+
+---- frame::tests::a_group_cannot_change_its_mode stdout ----
+
+thread 'frame::tests::a_group_cannot_change_its_mode' (109088) panicked at src\frame.rs:1128:9:
+a piece claiming another mode is not a piece of this group
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- frame::tests::a_group_cannot_change_its_plane stdout ----
+
+thread 'frame::tests::a_group_cannot_change_its_plane' (104508) panicked at src\frame.rs:1087:9:
+a piece claiming another plane is not a piece of this group
+
+---- node::tests::a_fragment_group_cannot_change_its_mode_between_pieces stdout ----
+
+thread 'node::tests::a_fragment_group_cannot_change_its_mode_between_pieces' (109804) panicked at src\node.rs:3579:9:
+assertion `left == right` failed: a piece claiming another mode is not a piece of this group
+  left: 0
+ right: 1
+
+---- node::tests::a_fragment_group_cannot_be_completed_under_another_plane stdout ----
+
+thread 'node::tests::a_fragment_group_cannot_be_completed_under_another_plane' (95372) panicked at src\node.rs:3488:9:
+assertion `left == right` failed: the contradicting piece is refused and counted
+  left: 0
+ right: 1
+
+
+failures:
+    frame::tests::a_group_cannot_change_its_mode
+    frame::tests::a_group_cannot_change_its_plane
+    node::tests::a_fragment_group_cannot_be_completed_under_another_plane
+    node::tests::a_fragment_group_cannot_change_its_mode_between_pieces
+
+test result: FAILED. 1 passed; 4 failed; 0 ignored; 0 measured; 167 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `--lib`
+EXIT=101
+
+## restoration
+$ diff -u spikes/s5r3_inverse/repaired/frame.rs net/crates/net/leaf/src/frame.rs
+EXIT=0 (0 = byte-identical to the repaired snapshot)
+
+## restored run
+$ cd net/crates/net/leaf && cargo test --lib -- cannot_change_its_plane cannot_change_its_mode cannot_be_completed_under_another_plane out_of_order_still_assembles
+warning: C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\Cargo.toml: `panic` setting is ignored for `bench` profile
+warning: `net-mesh` (manifest) generated 1 warning
+   Compiling net-mesh-leaf v0.36.0 (C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\leaf)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.03s
+     Running unittests src\lib.rs (target\debug\deps\net_leaf-07dd5be407959f6e.exe)
+
+running 5 tests
+test frame::tests::a_group_cannot_change_its_plane ... ok
+test frame::tests::a_group_cannot_change_its_mode ... ok
+test node::tests::a_fragment_group_cannot_change_its_mode_between_pieces ... ok
+test node::tests::a_fragment_group_cannot_be_completed_under_another_plane ... ok
+test node::tests::a_consistent_group_arriving_out_of_order_still_assembles ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 167 filtered out; finished in 0.02s
+
+EXIT=0
