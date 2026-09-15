@@ -2500,7 +2500,7 @@ jobs:
       #     exact incarnation.
       #   - a_rejected_sdk_enrollment_leaves_the_session_provisional — the
       #     negative half; a refusal admits nothing.
-      - name: SDK WebRTC enrollment (Stage 4a)
+      - name: SDK WebRTC enrollment
         if: ${{ !cancelled() }}
         run: |
           set -uo pipefail
@@ -2532,7 +2532,7 @@ jobs:
       # landed verbatim. They reproduced 0/6 before the repairs and
       # are pinned individually: a repair that regresses must fail
       # here by name, not shrink the roster.
-      - name: SDK bootstrap listener (Stage 4b)
+      - name: SDK bootstrap listener
         if: ${{ !cancelled() }}
         run: |
           set -uo pipefail
@@ -2568,7 +2568,7 @@ jobs:
       # horizon) were compiled out of every job. On Linux the Unix
       # branch of that protection check is real code, which is exactly
       # where it has to run.
-      - name: SDK library witnesses under rtc-bootstrap (Stage 4b)
+      - name: SDK library witnesses under rtc-bootstrap
         if: ${{ !cancelled() }}
         run: |
           set -uo pipefail
@@ -2595,7 +2595,7 @@ jobs:
       # The SDK's `webrtc` surface under the same lint bar as the rest of
       # the crate, and its rustdoc — neither was reachable from any step's
       # feature list before Stage 4a.
-      - name: Lint and document the SDK's WebRTC surface (Stage 4a)
+      - name: Lint and document the SDK's WebRTC surface
         if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
@@ -4138,7 +4138,7 @@ jobs:
       # been bitten by twice. No `--test` pin — the integration-test
       # guard inventories the root crate's `tests/`, and `net-cli` is
       # auto-discovered by design.
-      - name: Run net-cli tests with rtc-bootstrap (Stage 4b)
+      - name: Run net-cli tests with rtc-bootstrap
         run: |
           set -o pipefail
           cargo test -p net-cli --features rtc-bootstrap 2>&1 | tee /tmp/cli_rtc.log
@@ -4642,7 +4642,7 @@ jobs:
     # driver's test-only hooks and `connect_rtc_loopback`, which are
     # `cfg(any(test, feature = "fixtures"))` — a production build
     # cannot reach them.
-    name: WebRTC feature (Stage 3)
+    name: WebRTC feature (native driver)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     defaults:
@@ -4716,7 +4716,7 @@ jobs:
       # The run's result set is preserved for the inventory step
       # below, which is what turned 100 `cargo nextest list`
       # invocations (one per floor, one per pinned name) into zero.
-      - name: Stage 3 harnesses
+      - name: RTC harnesses
         if: ${{ !cancelled() }}
         run: |
           set -uo pipefail
@@ -4759,7 +4759,7 @@ jobs:
       # explicit "suite absent from the run" error, so a tooling
       # change still cannot read as "all clear". The checker's own
       # `--self-test` (run in the sensing jobs) covers its predicates.
-      - name: Stage 3 + 4a witness inventory
+      - name: RTC witness inventory
         if: ${{ !cancelled() }}
         run: |
           set -uo pipefail
@@ -4900,7 +4900,7 @@ jobs:
     # borrow held across an await, and did — and the executed wasm
     # tests, because `Instant::now()` COMPILES on wasm32 and panics
     # at runtime, so a check job alone cannot guard that seam (S0a).
-    name: Leaf crate + wasm test runner (Stage 5)
+    name: Leaf crate + wasm test runner
     runs-on: ubuntu-latest
     timeout-minutes: 30
     defaults:
@@ -5002,7 +5002,7 @@ jobs:
       # untouched) and pinned by name. They reproduced 12 failures
       # out of 15 when they landed; a repair that regresses one must
       # fail here by name rather than shrink the roster.
-      - name: Kyra's review probes (Stage 5)
+      - name: Leaf review probes
         run: |
           set -uo pipefail
           REQUIRED="
@@ -5137,7 +5137,7 @@ jobs:
     # Stage 5: `@net-mesh/browser`. A sibling package to
     # `@net-mesh/sdk` precisely because the SDK's graph contains the
     # napi addon; this job therefore never touches `bindings/node`.
-    name: "@net-mesh/browser (Stage 5)"
+    name: "@net-mesh/browser"
     runs-on: ubuntu-latest
     timeout-minutes: 20
     defaults:
@@ -5223,7 +5223,7 @@ jobs:
           echo "R11 ABI probes: 10/10 against the real package"
 
       # Kyra's JS probes, landed verbatim beside her leaf ones.
-      - name: Kyra's JS review probes (Stage 5)
+      - name: Browser-package review probes
         run: |
           set -o pipefail
           node tests/kyra_review.mjs | tee /tmp/kyra-js.log
@@ -5261,7 +5261,7 @@ jobs:
     # reads (`$HOME/.pki/nssdb`), removing it again on exit. A
     # harness that skipped verification would prove something no
     # deployment can rely on.
-    name: WebRTC browser harness (Stage 4b + Stage 5)
+    name: Browser matrix (Chromium + Firefox)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -5555,7 +5555,7 @@ jobs:
     # witness would prove nothing); `PEBBLE_WFE_NONCEREJECT=0` turns
     # off pebble's deliberate 5% nonce rejection, which is a client
     # retry exercise and not what this job is about.
-    name: ACME cold start (pebble, Stage 4b)
+    name: ACME cold start (pebble)
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
