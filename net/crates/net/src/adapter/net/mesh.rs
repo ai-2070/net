@@ -548,29 +548,71 @@ fn wire_bytes_for_payload(payload_bytes: usize) -> u32 {
 ///
 /// Handshake frames are excluded on the receive side by
 /// `flags.is_handshake()`; no producer here builds one.
+///
+/// Returns the debit BOUND TO THE SEND, not a bare sequence. The
+/// charge happens here and the transport decision happens later and
+/// elsewhere — awaited, spawned, or queued behind an ordered
+/// consumer — so the producer must say which outcome it got:
+/// [`ControlDebitGuard::commit`] once the transport accepted the
+/// packet, and otherwise nothing at all, because dropping the guard
+/// uncommitted is what gives the bytes back and reclaims the
+/// sequence. A refused enqueue, a failed or deadline-exceeded send, an
+/// evicted queue entry and a producer cancelled before admission are
+/// all the same case: bytes recorded as sent that the receiver can
+/// never report consumed, which on a stream shared with application
+/// traffic close the application window for good.
+///
+/// Accepted-then-lost is NOT that case and is never refunded — see
+/// [`ControlDebitGuard`].
 fn outbound_subprotocol_tx_seq(
-    session: &NetSession,
+    session: &Arc<NetSession>,
     stream_id: u64,
     subprotocol_id: u16,
     events: &[Bytes],
-) -> u64 {
-    if stream_id != CONTROL_STREAM_ID
+) -> ControlDebitGuard {
+    let charged = stream_id != CONTROL_STREAM_ID
         && MeshNode::accounts_inbound_subprotocol(subprotocol_id)
-        && MeshNode::charges_inbound_bytes(subprotocol_id)
-    {
-        session.next_tx_seq_charged(
-            stream_id,
-            wire_bytes_for_payload(EventFrame::calculate_size(events)),
-        )
+        && MeshNode::charges_inbound_bytes(subprotocol_id);
+    let wire_bytes = if charged {
+        wire_bytes_for_payload(EventFrame::calculate_size(events))
     } else {
-        session.get_or_create_stream(stream_id).next_tx_seq()
-    }
+        0
+    };
+    session.next_tx_seq_charged(stream_id, wire_bytes)
+}
+
+/// Snapshot one live [`StreamState`] as a [`StreamStats`].
+///
+/// THE place a new counter is surfaced. `StreamStats` is
+/// `#[non_exhaustive]` and this crate is downstream of
+/// `net-mesh-wire`, so it cannot be built with a struct expression at
+/// all — functional-update syntax (`..StreamStats::empty()`) is a
+/// struct expression too and is refused identically. Field assignment
+/// off [`StreamStats::empty`] is the supported construction, and
+/// doing it once here is what keeps the next counter from being a
+/// per-call-site edit.
+fn stream_stats_of(state: &StreamState) -> StreamStats {
+    let mut stats = StreamStats::empty();
+    stats.tx_seq = state.current_tx_seq();
+    stats.rx_seq = state.current_rx_seq();
+    stats.inbound_pending = state.inbound_len() as u64;
+    stats.last_activity_ns = state.last_activity_ns();
+    stats.active = state.is_active();
+    stats.backpressure_events = state.backpressure_events();
+    stats.tx_credit_remaining = state.tx_credit_remaining();
+    stats.tx_window = state.tx_window();
+    stats.credit_grants_received = state.credit_grants_received();
+    stats.credit_grants_sent = state.credit_grants_sent();
+    stats.tx_bytes_sent = state.tx_bytes_sent();
+    stats.max_consumed_seen = state.max_consumed_seen();
+    stats
 }
 use super::reroute::ReroutePolicy;
 use super::route::{RoutingHeader, ROUTING_HEADER_SIZE, ROUTING_MAGIC};
 use super::router::{NetRouter, RouterConfig};
 use super::session::{
-    NetSession, StreamCloseOutcome, StreamDrainState, TxAdmit, CONTROL_STREAM_ID,
+    ControlDebitGuard, NetSession, StreamCloseOutcome, StreamDrainState, StreamState, TxAdmit,
+    CONTROL_STREAM_ID,
 };
 use super::stream::{Stream, StreamConfig, StreamError, StreamStats};
 use super::subnet::{
@@ -5475,19 +5517,21 @@ async fn run_route_withdrawal_flood(
     let stream_id = SUBPROTOCOL_ROUTE_WITHDRAW as u64;
     let events = [Bytes::copy_from_slice(&payload)];
     for (addr, session) in targets {
-        let seq =
+        let debit =
             outbound_subprotocol_tx_seq(&session, stream_id, SUBPROTOCOL_ROUTE_WITHDRAW, &events);
         let packet = {
             let mut builder = session.thread_local_pool().get();
             builder.build_subprotocol(
                 stream_id,
-                seq,
+                debit.seq(),
                 &events,
                 PacketFlags::NONE,
                 SUBPROTOCOL_ROUTE_WITHDRAW,
             )
         };
-        let _ = sink.send(&packet, addr).await;
+        if sink.send(&packet, addr).await.is_ok() {
+            debit.commit();
+        }
     }
 }
 
@@ -6707,7 +6751,7 @@ fn build_sensing_frame_datagram(
     stream_id: u64,
     subprotocol: u16,
     payload: Vec<u8>,
-) -> Option<(Bytes, PeerAddr)> {
+) -> Option<(Bytes, PeerAddr, ControlDebitGuard)> {
     let next_addr = peers
         .get(&target)
         .map(|p| p.value().addr())
@@ -6738,12 +6782,24 @@ fn build_sensing_frame_datagram(
     // SI-4a: the stream id is the hop-authored ENVELOPE — for 0x0C03 it
     // carries the §4.4 continuity-bearing flag (see
     // `sensing::SENSING_PROVISIONAL_STREAM`).
-    let seq = outbound_subprotocol_tx_seq(&session, stream_id, subprotocol, &events);
+    // The debit rides OUT with the datagram. This function only
+    // builds; the transport decision belongs to whoever performs the
+    // `send_to` (a spawned task on the legacy lane, the ordered
+    // consumer on the organization lane, and the queue itself when it
+    // evicts or refuses), so that owner is the one who can say
+    // whether the bytes were admitted.
+    let debit = outbound_subprotocol_tx_seq(&session, stream_id, subprotocol, &events);
     let packet = {
         let mut builder = session.thread_local_pool().get();
-        builder.build_subprotocol(stream_id, seq, &events, PacketFlags::NONE, subprotocol)
+        builder.build_subprotocol(
+            stream_id,
+            debit.seq(),
+            &events,
+            PacketFlags::NONE,
+            subprotocol,
+        )
     };
-    Some((packet, addr))
+    Some((packet, addr, debit))
 }
 
 /// ORDERED ORGANIZATION EGRESS.
@@ -6870,6 +6926,18 @@ struct PendingDatagram {
     seq: u64,
     packet: Bytes,
     addr: PeerAddr,
+    /// The pre-send control debit these bytes were charged against,
+    /// scoped to this datagram's lifetime in the queue.
+    ///
+    /// Every way a queued datagram can end without reaching the
+    /// socket — refused by a closed queue, evicted by the bound,
+    /// released by teardown, or failed/deadline-exceeded at the send
+    /// — drops this guard and gives the bytes back. Only the
+    /// consumer's accepted send commits it. That is why the guard
+    /// travels WITH the datagram instead of being committed by
+    /// whoever built it: the builder does not know which of those
+    /// happened.
+    debit: ControlDebitGuard,
 }
 
 /// Shared, monotonic counters for [`OrderedSensingEgress`].
@@ -7231,9 +7299,19 @@ impl OrderedSensingEgress {
                 queue.lock().in_flight = false;
                 match outcome {
                     Ok(()) => {
+                        // Accepted by the transport. Commit BEFORE any
+                        // await: an abort can only land at an await
+                        // point, so the commit cannot be skipped after
+                        // the socket took the datagram, and these bytes
+                        // are never refunded.
+                        next.debit.commit();
                         counters.sent.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(err) => {
+                        // Not sent: the guard drops with `next` and the
+                        // bytes go back. A datagram the socket did not
+                        // take never entered the receiver's accounting,
+                        // so it can never be reported consumed.
                         counters.send_failed.fetch_add(1, Ordering::Relaxed);
                         tracing::warn!(
                             addr = %next.addr,
@@ -7266,7 +7344,13 @@ impl OrderedSensingEgress {
     /// datagram rather than stalling the caller. A closed queue refuses; the
     /// closure test and the push happen under one lock acquisition, so an
     /// accepted datagram is always one a live consumer will still observe.
-    fn enqueue(&self, packet: Bytes, addr: PeerAddr) -> bool {
+    ///
+    /// Takes the datagram's control debit and does not commit it: a refusal
+    /// keeps `debit` in this frame and an eviction hands the casualty's guard
+    /// back out, so both refund. Both drops happen with the queue lock already
+    /// RELEASED — the refund touches the session's stream map, and this lock is
+    /// held for a single push/pop with no other lock under it.
+    fn enqueue(&self, packet: Bytes, addr: PeerAddr, debit: ControlDebitGuard) -> bool {
         #[cfg(any(test, feature = "fixtures"))]
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         /// What one enqueue attempt resolved to under the queue lock.
@@ -7278,11 +7362,15 @@ impl OrderedSensingEgress {
             /// Pushed within the bound.
             Queued,
         }
+        // Outlives the lock guard below, so the evicted datagram's debit is
+        // refunded after the queue lock is dropped rather than under it.
+        let evicted: Option<PendingDatagram>;
         let accepted = {
             let mut queue = self.queue.lock();
             #[cfg(any(test, feature = "fixtures"))]
             self.fire_lifecycle(OrgEgressLifecyclePoint::EnqueueUnderQueueLock);
             if queue.closed {
+                evicted = None;
                 Accepted::Refused
             } else {
                 queue.pending.push_back(PendingDatagram {
@@ -7290,15 +7378,18 @@ impl OrderedSensingEgress {
                     seq,
                     packet,
                     addr,
+                    debit,
                 });
                 if queue.pending.len() > MAX_PENDING_ORG_EGRESS {
-                    queue.pending.pop_front();
+                    evicted = queue.pending.pop_front();
                     Accepted::Evicted
                 } else {
+                    evicted = None;
                     Accepted::Queued
                 }
             }
         };
+        drop(evicted);
         match accepted {
             Accepted::Refused => {
                 self.counters.refused_closed.fetch_add(1, Ordering::Relaxed);
@@ -7352,15 +7443,21 @@ impl OrderedSensingEgress {
     /// the teardown log already claimed had been dropped.
     ///
     /// Forced-drop work is counted as `dropped_forced`, NEVER as `sent` and
-    /// never as `send_failed`: no send was attempted for it.
+    /// never as `send_failed`: no send was attempted for it — so each released
+    /// datagram's control debit is refunded when its guard drops, which
+    /// happens after the queue lock is released.
     fn retire_outstanding(&self) -> u64 {
+        // Taken, not cleared: the released datagrams' debits refund on drop,
+        // and that drop must not run under the queue lock.
+        let released;
         let forced = {
             let mut queue = self.queue.lock();
             let forced = queue.outstanding();
-            queue.pending.clear();
+            released = std::mem::take(&mut queue.pending);
             queue.in_flight = false;
             forced
         };
+        drop(released);
         if forced > 0 {
             self.counters
                 .dropped_forced
@@ -8213,7 +8310,7 @@ fn spawn_sensing_frame_send(
     subprotocol: u16,
     payload: Vec<u8>,
 ) {
-    let Some((packet, addr)) = build_sensing_frame_datagram(
+    let Some((packet, addr, debit)) = build_sensing_frame_datagram(
         peers,
         addr_to_node,
         router,
@@ -8228,7 +8325,9 @@ fn spawn_sensing_frame_send(
     };
     let sink = sink.clone();
     tokio::spawn(async move {
-        let _ = sink.send(&packet, addr).await;
+        if sink.send(&packet, addr).await.is_ok() {
+            debit.commit();
+        }
     });
 }
 
@@ -15008,7 +15107,7 @@ impl MeshNode {
             // order — and handed to the single ordered consumer, which performs
             // the `send_to` sequentially. That is what makes the transition order
             // visible to the peer rather than merely visible to the scheduler.
-            if let Some((packet, addr)) = build_sensing_frame_datagram(
+            if let Some((packet, addr, debit)) = build_sensing_frame_datagram(
                 &self.peers,
                 &self.addr_to_node,
                 &self.router,
@@ -15019,7 +15118,7 @@ impl MeshNode {
                 sensing::SUBPROTOCOL_SENSING_INTEREST,
                 bytes,
             ) {
-                self.enqueue_org_datagram(packet, addr);
+                self.enqueue_org_datagram(packet, addr, debit);
             }
         }
     }
@@ -15035,7 +15134,7 @@ impl MeshNode {
             target: Some(key.provider),
         };
         if let Ok(bytes) = sensing::encode_interest_frame(&frame) {
-            if let Some((packet, addr)) = build_sensing_frame_datagram(
+            if let Some((packet, addr, debit)) = build_sensing_frame_datagram(
                 &self.peers,
                 &self.addr_to_node,
                 &self.router,
@@ -15046,7 +15145,7 @@ impl MeshNode {
                 sensing::SUBPROTOCOL_SENSING_INTEREST,
                 bytes,
             ) {
-                self.enqueue_org_datagram(packet, addr);
+                self.enqueue_org_datagram(packet, addr, debit);
             }
         }
     }
@@ -15058,10 +15157,15 @@ impl MeshNode {
     /// nothing left to order — and a refused enqueue means the queue closed;
     /// both are counted rather than silently swallowed, and neither is a
     /// delivery claim.
-    fn enqueue_org_datagram(&self, packet: Bytes, addr: PeerAddr) {
+    ///
+    /// Neither is an admission either, which is why the datagram's control
+    /// debit comes in with it: a terminal lifecycle drops the guard here, a
+    /// refusal drops it inside `enqueue`, and an accepted datagram carries it
+    /// to the consumer that learns whether the socket took it.
+    fn enqueue_org_datagram(&self, packet: Bytes, addr: PeerAddr, debit: ControlDebitGuard) {
         match self.org_egress() {
             Some(egress) => {
-                if !egress.enqueue(packet, addr) {
+                if !egress.enqueue(packet, addr, debit) {
                     tracing::debug!(
                         addr = %addr,
                         "ordered organization egress closed; the transition's frame is \
@@ -23392,6 +23496,19 @@ impl MeshNode {
         if let Some(old) = &displaced {
             self.session_id_to_node
                 .remove_if(&old.session.session_id(), |_, n| *n == peer_node_id);
+            // X10: a REPLACEMENT is a lifetime end like any other,
+            // so the displaced session's partial fragment groups go
+            // with it. A late endpoint-close notification is not a
+            // fallback: the reverse mapping this block is about to
+            // remove is exactly what `evict_endpoint` requires to
+            // find the peer, so nothing else ever retires this
+            // session — its held bytes would sit in the mesh-owned
+            // reassembly map until some unrelated fragment happened
+            // to arrive and age them out, which on a quiet mesh is
+            // never.
+            #[cfg(feature = "webrtc")]
+            self.rtc_reassembly
+                .retire_session(old.session.session_id(), std::time::Instant::now());
             // C4 hygiene (`NAT_TRAVERSAL_V2_PLAN.md`): drop the
             // displaced session's OWNED address when it differs from
             // the new one (a relay→direct swap leaves the old address
@@ -27844,6 +27961,18 @@ impl MeshNode {
                                         .remove_if(&displaced_session_id, |_, n| {
                                             *n == peer_node_id
                                         });
+                                    // X10: the displaced session's
+                                    // lifetime ends here too, so its
+                                    // partial fragment groups are
+                                    // retired and the session fenced.
+                                    // Nothing else will: the rotation
+                                    // leaves no close notification and
+                                    // no endpoint removal behind it.
+                                    #[cfg(feature = "webrtc")]
+                                    ctx.rtc_reassembly.retire_session(
+                                        displaced_session_id,
+                                        std::time::Instant::now(),
+                                    );
                                     let session = Arc::new(NetSession::new(
                                         keys,
                                         source,
@@ -28324,7 +28453,7 @@ impl MeshNode {
                                         let pool = dest_sess.thread_local_pool();
                                         let mut builder = pool.get();
                                         let events = vec![payload];
-                                        let seq = outbound_subprotocol_tx_seq(
+                                        let debit = outbound_subprotocol_tx_seq(
                                             &dest_sess,
                                             SUBPROTOCOL_MIGRATION as u64,
                                             SUBPROTOCOL_MIGRATION,
@@ -28332,12 +28461,14 @@ impl MeshNode {
                                         );
                                         let packet = builder.build_subprotocol(
                                             SUBPROTOCOL_MIGRATION as u64,
-                                            seq,
+                                            debit.seq(),
                                             &events,
                                             PacketFlags::NONE,
                                             SUBPROTOCOL_MIGRATION,
                                         );
-                                        let _ = sink.send(&packet, dest_addr).await;
+                                        if sink.send(&packet, dest_addr).await.is_ok() {
+                                            debit.commit();
+                                        }
                                     });
                                 }
                             }
@@ -28376,7 +28507,7 @@ impl MeshNode {
                                 let pool = dest_sess.thread_local_pool();
                                 let mut builder = pool.get();
                                 let events = vec![reply];
-                                let seq = outbound_subprotocol_tx_seq(
+                                let debit = outbound_subprotocol_tx_seq(
                                     &dest_sess,
                                     SUBPROTOCOL_MIGRATION as u64,
                                     SUBPROTOCOL_MIGRATION,
@@ -28384,12 +28515,14 @@ impl MeshNode {
                                 );
                                 let packet = builder.build_subprotocol(
                                     SUBPROTOCOL_MIGRATION as u64,
-                                    seq,
+                                    debit.seq(),
                                     &events,
                                     PacketFlags::NONE,
                                     SUBPROTOCOL_MIGRATION,
                                 );
-                                let _ = sink.send(&packet, dest_addr).await;
+                                if sink.send(&packet, dest_addr).await.is_ok() {
+                                    debit.commit();
+                                }
                             });
                         }
                     }
@@ -29018,7 +29151,7 @@ impl MeshNode {
                             let pool = dest_sess.thread_local_pool();
                             let mut builder = pool.get();
                             let events = vec![response];
-                            let seq = outbound_subprotocol_tx_seq(
+                            let debit = outbound_subprotocol_tx_seq(
                                 &dest_sess,
                                 super::traversal::SUBPROTOCOL_REFLEX as u64,
                                 super::traversal::SUBPROTOCOL_REFLEX,
@@ -29026,12 +29159,14 @@ impl MeshNode {
                             );
                             let packet = builder.build_subprotocol(
                                 super::traversal::SUBPROTOCOL_REFLEX as u64,
-                                seq,
+                                debit.seq(),
                                 &events,
                                 PacketFlags::NONE,
                                 super::traversal::SUBPROTOCOL_REFLEX,
                             );
-                            let _ = sink.send(&packet, dest_addr).await;
+                            if sink.send(&packet, dest_addr).await.is_ok() {
+                                debit.commit();
+                            }
                         });
                     }
                     reflex::ReflexMsg::Response(observed) => {
@@ -30307,6 +30442,11 @@ impl MeshNode {
         let ack_ranges_peer_cache = self.ack_ranges_peer_cache.clone();
         let subnet_challenges_evict = self.subnet_challenges.clone();
         let subnet_contexts_evict = self.subnet_contexts.clone();
+        // X10: the failure sweep ends a session's lifetime, so it
+        // retires that session's reassembly state exactly like the
+        // ordinary close path does.
+        #[cfg(feature = "webrtc")]
+        let rtc_reassembly_evict = Arc::clone(&self.rtc_reassembly);
         // Eviction is a peer-state transition like any other and runs
         // through the same handle as the installers.
         let peer_transitions_evict = self.peer_transitions.clone();
@@ -31065,6 +31205,21 @@ impl MeshNode {
                                 // security boundary.
                                 subnet_challenges_evict.forget_peer(node_id);
                                 subnet_contexts_evict.forget_peer(node_id);
+                                // X10: the session is gone, so its
+                                // partial fragment groups are
+                                // released and it is fenced against
+                                // the packets already past their
+                                // session lookup — the same
+                                // transaction the ordinary close
+                                // runs. Without this, a peer the
+                                // failure detector gave up on left
+                                // its acknowledged partial bytes
+                                // pinned in the mesh-owned map.
+                                #[cfg(feature = "webrtc")]
+                                rtc_reassembly_evict.retire_session(
+                                    old_session_id,
+                                    std::time::Instant::now(),
+                                );
                                 true
                             });
                                     // An eviction that declined (the
@@ -35912,7 +36067,7 @@ impl MeshNode {
 
         let stream_id = super::rtc::SUBPROTOCOL_RTC_SIGNAL as u64;
         let events = [Bytes::from(encoded)];
-        let seq = outbound_subprotocol_tx_seq(
+        let debit = outbound_subprotocol_tx_seq(
             &session,
             stream_id,
             super::rtc::SUBPROTOCOL_RTC_SIGNAL,
@@ -35922,7 +36077,7 @@ impl MeshNode {
         let mut builder = pool.get();
         let packet = builder.build_subprotocol(
             stream_id,
-            seq,
+            debit.seq(),
             &events,
             PacketFlags::NONE,
             super::rtc::SUBPROTOCOL_RTC_SIGNAL,
@@ -35940,7 +36095,9 @@ impl MeshNode {
             .send(&routed, next_hop)
             .await
             .map(|_| ())
-            .map_err(|e| AdapterError::Connection(format!("rtc signal send failed: {e}")))
+            .map_err(|e| AdapterError::Connection(format!("rtc signal send failed: {e}")))?;
+        debit.commit();
+        Ok(())
     }
 
     /// Attach the Stage 4a RTC fields to an announcement being
@@ -36808,23 +36965,43 @@ impl MeshNode {
             return None;
         };
         match ctx.rtc_reassembly.accept(
-            session.session_id(),
-            parsed.header.fragment_id,
-            parsed.header.fragment_offset,
-            parsed.header.frag_flags,
-            piece.clone(),
+            super::rtc::FragmentPiece::from_header(
+                session.session_id(),
+                &parsed.header,
+                piece.clone(),
+            ),
             std::time::Instant::now(),
         ) {
-            Ok(Some(whole)) => Some(vec![whole]),
+            // X11: the group's identity was bound by its FIRST piece
+            // and every later piece had to match it, so the context
+            // this dispatch continues with — stream, origin, channel,
+            // subprotocol, reliability — is provably the group's own
+            // rather than whichever piece happened to finish it.
+            Ok(Some(assembled)) => {
+                debug_assert_eq!(
+                    assembled.provenance,
+                    super::rtc::FragmentProvenance::from_header(&parsed.header),
+                    "a completing piece that disagreed with its group must have \
+                     been refused as inconsistent"
+                );
+                Some(vec![assembled.payload])
+            }
             // Not a fragment after all — the flag check above means
             // this cannot happen, but the codec, not this caller,
             // owns that decision.
             Ok(None) => Some(events),
             Err(super::rtc::FragmentOutcome::Buffered) => None,
+            // X11/P1: a refusal is no longer silence. Every group
+            // this reassembler destroys is reported against the
+            // stream that owned it — by the reassembler, on every
+            // path including the quiet-mesh close — and a piece whose
+            // group is gone is refused as `Abandoned` rather than
+            // opening a headless successor that can never complete.
             Err(outcome) => {
                 tracing::debug!(
                     session_id = session.session_id(),
                     fragment_id = parsed.header.fragment_id,
+                    stream_id = parsed.header.stream_id,
                     ?outcome,
                     "rtc: leaf fragment refused"
                 );
@@ -37658,7 +37835,7 @@ impl MeshNode {
                 let pool = session.thread_local_pool();
                 let mut builder = pool.get();
                 let events = vec![Bytes::copy_from_slice(&frame)];
-                let seq = outbound_subprotocol_tx_seq(
+                let debit = outbound_subprotocol_tx_seq(
                     session,
                     stream_id,
                     SUBPROTOCOL_SCOPED_CAPABILITY_ANN,
@@ -37666,12 +37843,14 @@ impl MeshNode {
                 );
                 let packet = builder.build_subprotocol(
                     stream_id,
-                    seq,
+                    debit.seq(),
                     &events,
                     PacketFlags::NONE,
                     SUBPROTOCOL_SCOPED_CAPABILITY_ANN,
                 );
-                let _ = send_datagram(&sink, &packet, peer.addr).await;
+                if send_datagram(&sink, &packet, peer.addr).await.is_ok() {
+                    debit.commit();
+                }
                 drop(builder);
                 session.touch();
             }
@@ -37723,7 +37902,7 @@ impl MeshNode {
                 let pool = session.thread_local_pool();
                 let mut builder = pool.get();
                 let events = vec![Bytes::copy_from_slice(&payload)];
-                let seq = outbound_subprotocol_tx_seq(
+                let debit = outbound_subprotocol_tx_seq(
                     session,
                     stream_id,
                     SUBPROTOCOL_CAPABILITY_ANN,
@@ -37731,12 +37910,14 @@ impl MeshNode {
                 );
                 let packet = builder.build_subprotocol(
                     stream_id,
-                    seq,
+                    debit.seq(),
                     &events,
                     PacketFlags::NONE,
                     SUBPROTOCOL_CAPABILITY_ANN,
                 );
-                let _ = send_datagram(&sink, &packet, peer.addr).await;
+                if send_datagram(&sink, &packet, peer.addr).await.is_ok() {
+                    debit.commit();
+                }
                 drop(builder);
                 session.touch();
             }
@@ -37826,7 +38007,7 @@ impl MeshNode {
                 let pool = session.thread_local_pool();
                 let mut builder = pool.get();
                 let events = vec![body];
-                let seq = outbound_subprotocol_tx_seq(
+                let debit = outbound_subprotocol_tx_seq(
                     &session,
                     super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
                     super::traversal::SUBPROTOCOL_RENDEZVOUS,
@@ -37834,12 +38015,14 @@ impl MeshNode {
                 );
                 let packet = builder.build_subprotocol(
                     super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
-                    seq,
+                    debit.seq(),
                     &events,
                     PacketFlags::NONE,
                     super::traversal::SUBPROTOCOL_RENDEZVOUS,
                 );
-                let _ = sink.send(&packet, a_addr).await;
+                if sink.send(&packet, a_addr).await.is_ok() {
+                    debit.commit();
+                }
             });
         };
 
@@ -37995,7 +38178,7 @@ impl MeshNode {
             let pool = a_session.thread_local_pool();
             let mut builder = pool.get();
             let events = vec![intro_to_a];
-            let seq = outbound_subprotocol_tx_seq(
+            let debit = outbound_subprotocol_tx_seq(
                 &a_session,
                 super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
                 super::traversal::SUBPROTOCOL_RENDEZVOUS,
@@ -38003,22 +38186,26 @@ impl MeshNode {
             );
             let packet = builder.build_subprotocol(
                 super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
-                seq,
+                debit.seq(),
                 &events,
                 PacketFlags::NONE,
                 super::traversal::SUBPROTOCOL_RENDEZVOUS,
             );
             // A discarded send error here used to be indistinguishable
-            // from a delivered introduce.
-            if let Err(e) = sink_a.send(&packet, a_addr).await {
-                tracing::debug!(dest = %a_addr, error = %e, "rendezvous: introduce send to requester failed");
+            // from a delivered introduce — and an introduce that never
+            // reached the transport must not keep its bytes charged.
+            match sink_a.send(&packet, a_addr).await {
+                Ok(_) => debit.commit(),
+                Err(e) => {
+                    tracing::debug!(dest = %a_addr, error = %e, "rendezvous: introduce send to requester failed");
+                }
             }
         });
         tokio::spawn(async move {
             let pool = b_session.thread_local_pool();
             let mut builder = pool.get();
             let events = vec![intro_to_b];
-            let seq = outbound_subprotocol_tx_seq(
+            let debit = outbound_subprotocol_tx_seq(
                 &b_session,
                 super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
                 super::traversal::SUBPROTOCOL_RENDEZVOUS,
@@ -38026,13 +38213,16 @@ impl MeshNode {
             );
             let packet = builder.build_subprotocol(
                 super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
-                seq,
+                debit.seq(),
                 &events,
                 PacketFlags::NONE,
                 super::traversal::SUBPROTOCOL_RENDEZVOUS,
             );
-            if let Err(e) = sink_b.send(&packet, b_addr).await {
-                tracing::debug!(dest = %b_addr, error = %e, "rendezvous: introduce send to target failed");
+            match sink_b.send(&packet, b_addr).await {
+                Ok(_) => debit.commit(),
+                Err(e) => {
+                    tracing::debug!(dest = %b_addr, error = %e, "rendezvous: introduce send to target failed");
+                }
             }
         });
     }
@@ -38358,7 +38548,7 @@ impl MeshNode {
             let pool = coord_session.thread_local_pool();
             let mut builder = pool.get();
             let events = vec![ack_body];
-            let seq = outbound_subprotocol_tx_seq(
+            let debit = outbound_subprotocol_tx_seq(
                 &coord_session,
                 super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
                 super::traversal::SUBPROTOCOL_RENDEZVOUS,
@@ -38366,13 +38556,16 @@ impl MeshNode {
             );
             let packet = builder.build_subprotocol(
                 super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
-                seq,
+                debit.seq(),
                 &events,
                 PacketFlags::NONE,
                 super::traversal::SUBPROTOCOL_RENDEZVOUS,
             );
-            if let Err(e) = sink_ack.send(&packet, coord_addr).await {
-                tracing::debug!(dest = %coord_addr, error = %e, "rendezvous: ack send to coordinator failed");
+            match sink_ack.send(&packet, coord_addr).await {
+                Ok(_) => debit.commit(),
+                Err(e) => {
+                    tracing::debug!(dest = %coord_addr, error = %e, "rendezvous: ack send to coordinator failed");
+                }
             }
         });
     }
@@ -38435,7 +38628,7 @@ impl MeshNode {
             let pool = dest_session.thread_local_pool();
             let mut builder = pool.get();
             let events = vec![body];
-            let seq = outbound_subprotocol_tx_seq(
+            let debit = outbound_subprotocol_tx_seq(
                 &dest_session,
                 super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
                 super::traversal::SUBPROTOCOL_RENDEZVOUS,
@@ -38443,12 +38636,14 @@ impl MeshNode {
             );
             let packet = builder.build_subprotocol(
                 super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
-                seq,
+                debit.seq(),
                 &events,
                 PacketFlags::NONE,
                 super::traversal::SUBPROTOCOL_RENDEZVOUS,
             );
-            let _ = sink.send(&packet, dest_addr).await;
+            if sink.send(&packet, dest_addr).await.is_ok() {
+                debit.commit();
+            }
         });
     }
 
@@ -39213,7 +39408,7 @@ impl MeshNode {
             let mut builder = pool.get();
             let stream_id = SUBPROTOCOL_CHANNEL_MEMBERSHIP as u64;
             let events = vec![bytes];
-            let seq = outbound_subprotocol_tx_seq(
+            let debit = outbound_subprotocol_tx_seq(
                 &dest_sess,
                 stream_id,
                 SUBPROTOCOL_CHANNEL_MEMBERSHIP,
@@ -39221,12 +39416,17 @@ impl MeshNode {
             );
             let packet = builder.build_subprotocol(
                 stream_id,
-                seq,
+                debit.seq(),
                 &events,
                 PacketFlags::NONE,
                 SUBPROTOCOL_CHANNEL_MEMBERSHIP,
             );
-            let _ = sink.send(&packet, dest_addr).await;
+            // A discarded send error is still a send that did not
+            // happen: commit only on acceptance, and let the drop
+            // give the ack's bytes back otherwise.
+            if sink.send(&packet, dest_addr).await.is_ok() {
+                debit.commit();
+            }
         });
     }
 
@@ -40206,12 +40406,26 @@ impl MeshNode {
         // total without moving the sender's watermark, and the next
         // grant refunded window for application bytes the receiver
         // had never seen.
-        let seq = outbound_subprotocol_tx_seq(&session, stream_id, subprotocol_id, &events);
+        //
+        // The debit is scoped to THIS send. `send_datagram` below is
+        // bounded transport admission: it refuses, it can exceed its
+        // deadline, and this whole future can be cancelled while
+        // suspended on it. Every one of those leaves the packet
+        // un-admitted, and the `?` / the cancellation drops `debit`,
+        // which returns the bytes and reclaims the sequence. Only an
+        // accepted datagram reaches `commit`.
+        let debit = outbound_subprotocol_tx_seq(&session, stream_id, subprotocol_id, &events);
 
-        let packet =
-            builder.build_subprotocol(stream_id, seq, &events, PacketFlags::NONE, subprotocol_id);
+        let packet = builder.build_subprotocol(
+            stream_id,
+            debit.seq(),
+            &events,
+            PacketFlags::NONE,
+            subprotocol_id,
+        );
 
         send_datagram(&self.sink, &packet, peer_addr).await?;
+        debit.commit();
 
         drop(builder);
         session.touch();
@@ -41959,7 +42173,7 @@ impl MeshNode {
         let pool = session.thread_local_pool();
         let mut builder = pool.get();
         let events = [bytes];
-        let seq = outbound_subprotocol_tx_seq(
+        let debit = outbound_subprotocol_tx_seq(
             &session,
             stream_id,
             super::dataforts::blob::SUBPROTOCOL_BLOB_TRANSFER,
@@ -41967,7 +42181,7 @@ impl MeshNode {
         );
         let packet = builder.build_subprotocol(
             stream_id,
-            seq,
+            debit.seq(),
             &events,
             PacketFlags::RELIABLE,
             super::dataforts::blob::SUBPROTOCOL_BLOB_TRANSFER,
@@ -41975,6 +42189,7 @@ impl MeshNode {
         self.sink.send(&packet, dest_addr).await.map_err(|e| {
             super::AdapterError::Connection(format!("transfer control: send failed: {e}"))
         })?;
+        debit.commit();
         Ok(())
     }
 }
@@ -44195,20 +44410,7 @@ impl MeshNode {
     pub fn stream_stats(&self, peer_node_id: u64, stream_id: u64) -> Option<StreamStats> {
         let peer = self.peers.get(&peer_node_id)?;
         let state = peer.session.get_stream(stream_id)?;
-        Some(StreamStats {
-            tx_seq: state.current_tx_seq(),
-            rx_seq: state.current_rx_seq(),
-            inbound_pending: state.inbound_len() as u64,
-            last_activity_ns: state.last_activity_ns(),
-            active: state.is_active(),
-            backpressure_events: state.backpressure_events(),
-            tx_credit_remaining: state.tx_credit_remaining(),
-            tx_window: state.tx_window(),
-            credit_grants_received: state.credit_grants_received(),
-            credit_grants_sent: state.credit_grants_sent(),
-            tx_bytes_sent: state.tx_bytes_sent(),
-            max_consumed_seen: state.max_consumed_seen(),
-        })
+        Some(stream_stats_of(&state))
     }
 
     /// Snapshot of per-stream stats for every stream in the session to
@@ -44225,23 +44427,7 @@ impl MeshNode {
             .into_iter()
             .filter_map(|sid| {
                 let state = session.get_stream(sid)?;
-                Some((
-                    sid,
-                    StreamStats {
-                        tx_seq: state.current_tx_seq(),
-                        rx_seq: state.current_rx_seq(),
-                        inbound_pending: state.inbound_len() as u64,
-                        last_activity_ns: state.last_activity_ns(),
-                        active: state.is_active(),
-                        backpressure_events: state.backpressure_events(),
-                        tx_credit_remaining: state.tx_credit_remaining(),
-                        tx_window: state.tx_window(),
-                        credit_grants_received: state.credit_grants_received(),
-                        credit_grants_sent: state.credit_grants_sent(),
-                        tx_bytes_sent: state.tx_bytes_sent(),
-                        max_consumed_seen: state.max_consumed_seen(),
-                    },
-                ))
+                Some((sid, stream_stats_of(&state)))
             })
             .collect()
     }
@@ -55066,6 +55252,43 @@ mod sensing_authority_witness_tests {
 
     // ---- BOUNDED ORDERED EGRESS -------------------------------------------
 
+    /// A control debit for one test datagram on the ordered egress.
+    ///
+    /// The datagram the egress tests enqueue was never built by
+    /// `build_sensing_frame_datagram`, so it has no debit of its own; these
+    /// tests are about ORDER and teardown, not about credit. Charging zero
+    /// bytes against a standalone session gives the guard a real ledger to
+    /// commit or refund against while moving no counter any of them assert
+    /// on. The refund witness below charges real bytes instead.
+    fn egress_test_debit() -> ControlDebitGuard {
+        egress_debit_on(&egress_debit_session(), 0)
+    }
+
+    /// A standalone session whose stream ledger a test debit can be charged
+    /// against. Not installed on any node: the guard holds the `Arc`, so the
+    /// ledger outlives the datagram it belongs to.
+    fn egress_debit_session() -> Arc<NetSession> {
+        Arc::new(NetSession::new(
+            super::super::crypto::SessionKeys {
+                tx_key: [0x31u8; 32],
+                rx_key: [0x32u8; 32],
+                session_id: 0x5555_5555,
+                remote_static_pub: [0u8; 32],
+                route_hop_tx_key: [0u8; 32],
+                route_hop_rx_key: [0u8; 32],
+            },
+            PeerAddr::Udp("127.0.0.1:9".parse().expect("addr")),
+            2,
+            false,
+        ))
+    }
+
+    /// Charge `wire_bytes` on the sensing interest stream, exactly as
+    /// `build_sensing_frame_datagram` does.
+    fn egress_debit_on(session: &Arc<NetSession>, wire_bytes: u32) -> ControlDebitGuard {
+        session.next_tx_seq_charged(sensing::SUBPROTOCOL_SENSING_INTEREST as u64, wire_bytes)
+    }
+
     /// One unwritable socket cannot wedge the ordered egress forever: the
     /// stuck send is RETIRED at the deadline, is NOT counted as sent, and the
     /// next queued datagram advances.
@@ -55093,8 +55316,8 @@ mod sensing_authority_witness_tests {
             .expect("a fresh node's egress is creatable");
         let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9".parse().unwrap());
 
-        assert!(egress.enqueue(Bytes::from_static(b"stuck"), addr));
-        assert!(egress.enqueue(Bytes::from_static(b"next"), addr));
+        assert!(egress.enqueue(Bytes::from_static(b"stuck"), addr, egress_test_debit()));
+        assert!(egress.enqueue(Bytes::from_static(b"next"), addr, egress_test_debit()));
 
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -55184,12 +55407,117 @@ mod sensing_authority_witness_tests {
         );
 
         assert!(
-            !egress.enqueue(Bytes::from_static(b"late"), addr),
+            !egress.enqueue(Bytes::from_static(b"late"), addr, egress_test_debit()),
             "a closed queue accepted a datagram no consumer will ever observe"
         );
         let state = node.org_egress_state_for_test();
         assert_eq!(state.depth, 0, "a stranded nonzero queue with no consumer");
         assert_eq!(state.refused_closed, 1, "and the refusal must be counted");
+    }
+
+    /// X8: a control datagram the transport NEVER ADMITTED must not keep its
+    /// pre-send debit — and one the transport accepted must keep it.
+    ///
+    /// The charge happens before asynchronous admission, so the producer's
+    /// watermark moves for bytes the receiver may never be given the chance
+    /// to report consumed. On a stream shared with application traffic those
+    /// bytes close the application window permanently: the receiver cannot
+    /// refund what it never saw. Both halves are asserted here, because the
+    /// refund is only safe if it stops at admission — a datagram the socket
+    /// took may still arrive and be charged, and refunding it would credit
+    /// the sender for the same bytes twice.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_never_admitted_control_debit_is_refunded_and_an_accepted_one_is_not() {
+        let node = sensing_org_node("egress-debit-refund").await;
+        let egress = node.org_egress().expect("creatable");
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9".parse().unwrap());
+        let stream_id = sensing::SUBPROTOCOL_SENSING_INTEREST as u64;
+        let session = egress_debit_session();
+
+        // ── never admitted: the queue is closed, so the enqueue is refused
+        let refused = egress_debit_on(&session, 400);
+        let (charged_sent, charged_remaining, charged_seq) = {
+            let s = session.get_stream(stream_id).expect("charged stream");
+            (
+                s.tx_bytes_sent(),
+                s.tx_credit_remaining(),
+                s.current_tx_seq(),
+            )
+        };
+        assert_eq!(
+            charged_sent, 400,
+            "precondition: the debit moved the watermark"
+        );
+        assert_eq!(
+            charged_seq, 1,
+            "precondition: the debit consumed one sequence"
+        );
+        let window = session
+            .get_stream(stream_id)
+            .expect("charged stream")
+            .tx_window();
+        assert_eq!(
+            charged_remaining,
+            window - 400,
+            "precondition: the debit closed 400 bytes of window"
+        );
+
+        egress.close_and_join().await;
+        assert!(
+            !egress.enqueue(Bytes::from_static(b"refused"), addr, refused),
+            "precondition: a closed queue refuses"
+        );
+        {
+            let s = session.get_stream(stream_id).expect("stream");
+            assert_eq!(
+                s.tx_bytes_sent(),
+                0,
+                "the watermark must exclude bytes no transport ever took"
+            );
+            assert_eq!(
+                s.tx_credit_remaining(),
+                window,
+                "and the window they closed must reopen"
+            );
+            assert_eq!(
+                s.current_tx_seq(),
+                0,
+                "a refused datagram must leave no sequence gap behind"
+            );
+        }
+
+        // ── admitted: a fresh node whose consumer really performs the send
+        let sender = sensing_org_node("egress-debit-commit").await;
+        let live = sender.org_egress().expect("creatable");
+        let accepted = egress_debit_on(&session, 400);
+        assert!(
+            live.enqueue(Bytes::from_static(b"accepted"), addr, accepted),
+            "precondition: a live queue accepts"
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let state = sender.org_egress_state_for_test();
+            if state.sent >= 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the consumer never sent the accepted datagram: {state:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let s = session.get_stream(stream_id).expect("stream");
+        assert_eq!(
+            s.tx_bytes_sent(),
+            400,
+            "bytes the socket accepted are the receiver's to report consumed, \
+             never the sender's to refund"
+        );
+        assert_eq!(
+            s.tx_credit_remaining(),
+            window - 400,
+            "and the window they closed stays closed until the receiver grants it"
+        );
     }
 
     // ---- TEARDOWN OWNERSHIP AND GRACE EXPIRY ------------------------------
@@ -55227,7 +55555,7 @@ mod sensing_authority_witness_tests {
         let egress = node.org_egress().expect("creatable");
         let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9".parse().unwrap());
         for _ in 0..3 {
-            assert!(egress.enqueue(Bytes::from_static(b"stalled"), addr));
+            assert!(egress.enqueue(Bytes::from_static(b"stalled"), addr, egress_test_debit()));
         }
         // The FIRST datagram is provably in flight — not merely queued — so the
         // in-flight half of the accounting is genuinely exercised.
@@ -55284,7 +55612,7 @@ mod sensing_authority_witness_tests {
             "no egress may be created after settlement"
         );
         assert!(
-            !egress.enqueue(Bytes::from_static(b"late"), addr),
+            !egress.enqueue(Bytes::from_static(b"late"), addr, egress_test_debit()),
             "no datagram may be accepted after settlement"
         );
         node.clear_org_egress_lifecycle_seam_for_test();
@@ -55338,7 +55666,7 @@ mod sensing_authority_witness_tests {
 
         let egress = node.org_egress().expect("creatable");
         let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9".parse().unwrap());
-        assert!(egress.enqueue(Bytes::from_static(b"stalled"), addr));
+        assert!(egress.enqueue(Bytes::from_static(b"stalled"), addr, egress_test_debit()));
 
         // FIRST attempt: parks holding teardown ownership.
         let (first_done_tx, first_done_rx) = mpsc::sync_channel::<OrgEgressState>(1);
@@ -55443,7 +55771,7 @@ mod sensing_authority_witness_tests {
         });
         let egress = node.org_egress().expect("creatable");
         let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9".parse().unwrap());
-        assert!(egress.enqueue(Bytes::from_static(b"stalled"), addr));
+        assert!(egress.enqueue(Bytes::from_static(b"stalled"), addr, egress_test_debit()));
 
         // CANCELLED WHILE DRAINING: well inside the grace window, so the
         // attempt was demonstrably still awaiting the drain timeout.
@@ -55525,7 +55853,7 @@ mod sensing_authority_witness_tests {
 
         let egress = node.org_egress().expect("creatable");
         let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9".parse().unwrap());
-        assert!(egress.enqueue(Bytes::from_static(b"stalled"), addr));
+        assert!(egress.enqueue(Bytes::from_static(b"stalled"), addr, egress_test_debit()));
 
         let attempt = {
             let egress = Arc::clone(&egress);
@@ -55726,7 +56054,9 @@ mod sensing_authority_witness_tests {
 
         let enqueuing = {
             let egress = Arc::clone(&egress);
-            tokio::task::spawn_blocking(move || egress.enqueue(Bytes::from_static(b"racer"), addr))
+            tokio::task::spawn_blocking(move || {
+                egress.enqueue(Bytes::from_static(b"racer"), addr, egress_test_debit())
+            })
         };
         parked_rx
             .recv_timeout(Duration::from_secs(5))

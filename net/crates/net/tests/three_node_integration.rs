@@ -5041,6 +5041,7 @@ async fn test_send_on_stream_backpressure_when_concurrent() {
             Err(StreamError::Transport(_)) => transport += 1,
             Err(StreamError::NotConnected) => panic!("unexpected NotConnected"),
             Err(StreamError::SessionSuperseded) => panic!("unexpected SessionSuperseded"),
+            Err(e) => panic!("concurrent send_on_stream failed unexpectedly: {e}"),
         }
     }
     // At least one caller must have hit the cap. We don't assert an
@@ -5216,6 +5217,7 @@ async fn test_v2_serial_sender_sees_backpressure_on_slow_receiver() {
             ),
             Err(StreamError::NotConnected) => panic!("unexpected NotConnected"),
             Err(StreamError::SessionSuperseded) => panic!("unexpected SessionSuperseded"),
+            Err(e) => panic!("serial send_on_stream failed unexpectedly: {e}"),
         }
     }
 

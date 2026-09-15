@@ -1982,49 +1982,60 @@ async fn udp_pair() -> (Arc<MeshNode>, Arc<MeshNode>) {
 /// the control frame's included — and A's retransmit window has to
 /// empty against those acks.
 ///
-/// **Why the window and the ledger, not the counters.** Two
-/// zero-counter readings look like that claim and are not:
-/// `retransmit_packets_sent == 0` and `reset_packets_sent == 0` are
-/// both falsified by scheduling alone, with every ack sent and
-/// received.
+/// **Why the ACK frontier, not the window's emptiness.** Three
+/// readings look like that claim and are not.
 ///
+/// `retransmit_packets_sent == 0` and `reset_packets_sent == 0` are
+/// falsified by scheduling alone, with every ack sent and received.
 /// `flush_stream_batch` awaits `deliver_stream_packet` and registers
 /// the packet for retransmit *after* that await, while the peer's
 /// grant drainer answers on a 1 ms cadence — so a starved sender can
 /// have the ack for its own last packet applied BEFORE
-/// `register_retransmit` puts that packet in the window. Measured,
-/// pinned to one core under load: `ack_seq=9` at `t=…651679`,
-/// `seq=8` registered 66 µs later at `t=…651745`, resent at
-/// `+128 ms`, then pruned by the duplicate's fresh grant. `on_ack`'s
-/// straggler sweep documents that same ordering, and one RTO-late
-/// ack does it too — `DEFAULT_RTO` starts at 50 ms and the adaptive
-/// estimate floors at `MIN_RTO` (10 ms) on a loopback link. The
-/// give-up is the same arithmetic times `DEFAULT_MAX_RETRIES`: 40 ms
-/// of ack starvation resets a stream whose every packet arrived, and
-/// the same pinned run produced that too. Neither counter is a
-/// property of a loss-free link; both are properties of the
-/// interleaving.
+/// `register_retransmit` puts that packet in the window, leaving an
+/// acknowledged packet to age out and resend. `on_ack`'s straggler
+/// sweep documents that same ordering, and one RTO-late ack does it
+/// too — `DEFAULT_RTO` starts at 50 ms and the adaptive estimate
+/// floors at `MIN_RTO` (10 ms) on a loopback link. The give-up is
+/// the same arithmetic times `DEFAULT_MAX_RETRIES`. Neither counter
+/// is a property of a loss-free link; both are properties of the
+/// interleaving, and both stay RETIRED.
 ///
-/// What the repair is about survives any interleaving: A's
-/// retransmit window DRAINS, and it drains by ACKNOWLEDGEMENT — the
-/// receiver reports consuming every byte A put on the stream, the
-/// control frame's among them — rather than by the give-up dropping
-/// its contents. A frame the receiver never records is a frame it
-/// never charges, so that ledger gap cannot be closed by waiting,
-/// and no scheduler can open it.
+/// The third is subtler and is why this witness was rewritten:
+/// `!has_unacked()` is not evidence of acknowledgement. A packet
+/// that exhausts its retries is DELETED from the window and the
+/// stream flagged failed (`ReliableStream::get_timed_out`), so an
+/// empty window is equally consistent with "the peer acked
+/// everything" and "the sender gave up". Byte equality does not
+/// close that gap either: `max_consumed_seen` rides the receiver's
+/// credit ledger, which is a different piece of state from its
+/// cumulative sequence cursor — a receiver could charge a frame's
+/// bytes while never recording its sequence, and the byte oracle
+/// would be satisfied by a stream whose cumulative ack never moved.
 ///
-/// Inverse: delete the `account_inbound_stream_packet` call above
-/// the subprotocol branches in `process_local_packet`. B stops
-/// recording the membership frame's sequence and stops charging its
-/// bytes, so A's cumulative ack freezes on the hole and the ledger
-/// gap stays open at exactly the control frame's wire bytes
-/// (`gap 111`), which is the assertion that goes red. A also gives
-/// up on the stream and resets it — the H-3 consequence the leaf
-/// hit, and the reason the window is empty by then rather than full.
+/// So this witness observes the acknowledgement itself, from both
+/// ends: B's cumulative receive cursor must have advanced ACROSS the
+/// control frame's sequence (a hole at that sequence freezes it
+/// forever, whatever arrives later), and A's applied ACK FRONTIER
+/// must cover every sequence it issued. The byte ledger is kept
+/// beside them, and the lifetime's disposition is stated rather than
+/// assumed: whatever the reliable layer may have given up on, it was
+/// a sequence the frontier already covers, and the stream is still
+/// the lifetime it started as.
+///
+/// Inverses: (A) delete the `account_inbound_stream_packet` call
+/// above the subprotocol branches in `process_local_packet` — B
+/// records neither the membership frame's sequence nor its bytes, so
+/// the cursor, the frontier and the ledger gap all go red together.
+/// (B) the sequence-only inverse, which is the one the byte oracle
+/// could not see: keep the byte consumption and omit only
+/// `r.on_receive(sequence)` for that frame. Every payload still
+/// arrives, consumed-byte equality still holds — and B's cursor
+/// stalls at 1 while A's frontier never passes 1, which is exactly
+/// the hole the leaf hit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_control_frame_shares_the_sequence_space_of_the_stream_it_rides() {
     let (a, b) = udp_pair().await;
-    let b_id = b.node_id();
+    let (a_id, b_id) = (a.node_id(), b.node_id());
     // The stream the membership frame is addressed to.
     const SHARED: u64 = net_wire::channel::membership::SUBPROTOCOL_CHANNEL_MEMBERSHIP as u64;
 
@@ -2073,22 +2084,65 @@ async fn a_control_frame_shares_the_sequence_space_of_the_stream_it_rides() {
     // exhaustion and reset by now — and a ledger gap left by one is
     // permanent either way.
     tokio::time::sleep(Duration::from_secs(1)).await;
-    // The window DRAINED: nothing A sent on any stream to B is still
-    // waiting for an ack. This is what an idle RTO sweep was standing
-    // in for, minus the interleaving — and it covers the whole
-    // session, not just the shared stream.
-    let session = a.peer_session_for_test(b_id).expect("A's session to B");
+    // The window's contents are not the question (see the doc
+    // comment): a give-up empties it too. What a repaired receiver
+    // owes is an ACKNOWLEDGEMENT, and these are the two halves of
+    // one — the receiver's cumulative cursor and the frontier the
+    // sender applied from it.
+    let b_cursor = || {
+        b.peer_session_for_test(a_id)
+            .expect("B's session to A")
+            .get_or_create_stream(SHARED)
+            .with_reliability(|r| r.rx_ack_seq())
+    };
+    let a_frontier = || {
+        a.peer_session_for_test(b_id)
+            .expect("A's session to B")
+            .get_or_create_stream(SHARED)
+            .with_reliability(|r| r.ack_frontier())
+    };
+    // `N + 1` sequences were issued on this stream: 0 for the first
+    // payload, 1 for the membership frame, 2..=N for the rest. The
+    // cursor is exclusive, so contiguous receipt of all of them reads
+    // `N + 1` — and a receiver that skipped the control frame's
+    // sequence is stuck at 1 no matter how long anything waits.
+    let issued = N as u64 + 1;
     assert!(
-        !session.has_unacked(),
-        "on a loss-free link every packet is acknowledged, so the \
-         retransmit window drains"
+        wait_for(|| a_frontier() == Some(issued), Duration::from_secs(5)).await,
+        "the window must drain by ACKNOWLEDGEMENT: A applied a cumulative \
+         ack covering every one of the {issued} sequences it issued on the \
+         shared stream, the control frame's among them (frontier {:?})",
+        a_frontier()
     );
-    // And it drained by ACKNOWLEDGEMENT, not by the give-up dropping
-    // its contents: the receiver reported consuming every byte A put
-    // on the shared stream, the control frame's among them. A frame
-    // whose sequence the receiver never recorded is a frame whose
-    // bytes it never charged, so this gap stays open forever —
-    // whatever the retransmit window does afterwards.
+    assert_eq!(
+        b_cursor(),
+        issued,
+        "and the receiver's own cumulative cursor must have advanced ACROSS \
+         the control frame's sequence — a frame whose sequence it never \
+         recorded leaves a hole below `next_expected` that no later packet \
+         can fill"
+    );
+    // The disposition, stated rather than assumed. A spurious RTO
+    // give-up on an ALREADY-acknowledged packet is permitted here —
+    // it is the register-after-ack interleaving above, and forbidding
+    // it is what made the retired counter assertions flaky. Giving up
+    // on a sequence the peer never acknowledged is not permitted.
+    let session = a.peer_session_for_test(b_id).expect("A's session to B");
+    let gave_up = session
+        .get_or_create_stream(SHARED)
+        .with_reliability(|r| r.abandoned_seq());
+    if let Some(seq) = gave_up {
+        assert!(
+            seq < issued,
+            "the reliable layer gave up on sequence {seq}, which the \
+             acknowledgement frontier ({issued}) does not cover: that is a \
+             genuine unacknowledged loss, not the register-after-ack race"
+        );
+    }
+    // And it drained with the byte ledger closed too: the receiver
+    // reported consuming every byte A put on the shared stream, the
+    // control frame's among them. Bytes and sequences are separate
+    // state, so this is a separate claim.
     let ledger = a.stream_stats(b_id, SHARED).expect("stream stats");
     assert_eq!(
         ledger.max_consumed_seen,
@@ -2101,12 +2155,11 @@ async fn a_control_frame_shares_the_sequence_space_of_the_stream_it_rides() {
         ledger.tx_bytes_sent - ledger.max_consumed_seen
     );
     // And the stream is still the one it was: no close, no reopen.
+    assert!(ledger.active, "the lifetime must not have ended");
     assert_eq!(
-        ledger.tx_seq,
-        N as u64 + 1,
+        ledger.tx_seq, issued,
         "the membership frame and the {N} payloads share one sequence \
-         counter, so the stream has issued {} sequences",
-        N + 1
+         counter, so the stream has issued {issued} sequences"
     );
 }
 
@@ -2597,12 +2650,12 @@ async fn a_reopened_streams_state_survives_its_predecessors_close() {
 /// helper directly, which is the one part of this that is not
 /// production ingress.
 ///
-/// Inverses: drop `retire_session`'s `groups.retain` — the held
-/// bytes survive the close; drop the retirement fence in `accept` —
-/// the late piece re-opens the group that was just released.
+/// Inverses: drop `retire_session`'s group release — the held bytes
+/// survive the close; drop the retirement marker in `retire_session`
+/// — the late piece re-opens the group that was just released.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_closed_sessions_partial_fragment_group_is_retired_and_cannot_be_recreated() {
-    use net::adapter::net::rtc::FragmentOutcome;
+    use net::adapter::net::rtc::{AbandonReason, FragmentOutcome, FragmentPiece};
     use net_wire::protocol::{PacketFlags, FRAG_FRAGMENTED};
 
     const STREAM: u64 = 0x0779;
@@ -2661,17 +2714,537 @@ async fn a_closed_sessions_partial_fragment_group_is_retired_and_cannot_be_recre
         0,
         "the retired session must hold no bytes"
     );
+    let released = a.rtc_reassembly().take_abandoned();
+    assert_eq!(
+        released.len(),
+        1,
+        "the released group is DISPOSED of, not dropped: a close that \
+         throws away acknowledged bytes says which stream lost them"
+    );
+    assert_eq!(released[0].reason, AbandonReason::SessionRetired);
+    assert_eq!(
+        released[0].provenance.stream_id, STREAM,
+        "the disposition names the stream whose bytes were released"
+    );
     assert_eq!(
         a.rtc_reassembly().accept(
-            session_id,
-            9,
-            0,
-            FRAG_FRAGMENTED,
-            Bytes::from_static(b"late"),
+            FragmentPiece {
+                session_id,
+                fragment_id: 9,
+                offset: 0,
+                flags: FRAG_FRAGMENTED,
+                sequence: 1,
+                provenance: net::adapter::net::rtc::FragmentProvenance {
+                    stream_id: STREAM,
+                    origin_hash: b_id,
+                    channel_hash: 0,
+                    subprotocol_id: 0,
+                    reliable: false,
+                },
+                data: Bytes::from_static(b"late"),
+            },
             std::time::Instant::now(),
         ),
         Err(FragmentOutcome::Retired),
         "a packet already admitted before the retirement must not recreate it"
     );
     assert_eq!(a.rtc_reassembly().held_bytes(session_id), 0);
+}
+
+/// A leaf-shaped fragment packet, sealed by `from`'s real session to
+/// `to_node` and addressed to `stream_id`.
+///
+/// Only a browser leaf fragments, so no native send path produces
+/// one of these: the witnesses below have to build them to drive the
+/// real ingress at all. Everything else about the packet is
+/// production — the session's cipher, its stream sequence, the
+/// builder's framing.
+fn leaf_fragment(
+    from: &Arc<MeshNode>,
+    to_node: u64,
+    stream_id: u64,
+    frag: (u16, u16, u8),
+    channel_hash: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    use net_wire::protocol::PacketFlags;
+
+    let (fragment_id, offset, flags) = frag;
+    let session = from
+        .peer_session_for_test(to_node)
+        .expect("a session to the peer")
+        .clone();
+    let seq = session.get_or_create_stream(stream_id).next_tx_seq();
+    let mut builder = session.thread_local_pool().get();
+    builder.set_channel_hash(channel_hash);
+    builder.set_origin_hash(from.node_id());
+    builder.set_fragment(fragment_id, offset, flags);
+    builder
+        .build_subprotocol(
+            stream_id,
+            seq,
+            &[Bytes::copy_from_slice(payload)],
+            // RELIABLE: a fragment's sequence has to be RECORDED by
+            // the receiver for the piece to be acknowledged at all,
+            // and "the receiver acknowledged it" is the premise that
+            // makes an abandoned group a loss rather than a dropped
+            // datagram. A fire-and-forget stream tracks no sequence.
+            PacketFlags::RELIABLE,
+            0,
+        )
+        .to_vec()
+}
+
+/// X11/P1: expiring an **acknowledged** fragment group is a terminal
+/// disposition, and the tail that follows cannot open a headless
+/// group.
+///
+/// The native ingress records a packet's sequence and returns its
+/// credit BEFORE reassembly sees it — deliberately, because the
+/// bytes did cross the wire. The consequence is that every buffered
+/// piece is a piece this node has acknowledged, so its sender is
+/// entitled to discard that descriptor. Pre-fix, expiring such a
+/// head and then accepting the tail produced a NEW tail-only group:
+/// the message was gone, the head unrecoverable, and the only trace
+/// was a debug log — no completion, no terminal signal, nothing the
+/// stream's owner could observe. `a_tail_past_the_ttl_cannot_complete_
+/// a_group` even *required* that orphan `Buffered`.
+///
+/// Both pieces here go through the real RTC DataChannel into the
+/// real ingress. The clock is real too: the head is left to sit past
+/// `GROUP_TTL`, which is what a sender with a retransmit timer
+/// longer than the TTL actually does.
+///
+/// Inverses: drop the abandonment fence lookup in `accept_locked` —
+/// the tail opens its own group (`held_bytes == 4`) and the
+/// disposition assertion still holds but the "no headless successor"
+/// one fails; drop `SessionState::expire`'s abandonment push — the
+/// tail is still refused but `abandoned_total` stays 0, which is the
+/// silence this witness exists to forbid.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_acknowledged_fragment_groups_expiry_is_terminal_not_silent() {
+    use net::adapter::net::rtc::{AbandonReason, GROUP_TTL};
+    use net_wire::protocol::{FRAG_FRAGMENTED, FRAG_LAST};
+
+    const STREAM: u64 = 0x077A;
+    const GROUP: u16 = 11;
+    let (a, b, _, _) = pair_with(rtc_config(), rtc_config()).await;
+    let (a_id, b_id) = (a.node_id(), b.node_id());
+    let session_id = a.peer_session_id(b_id).expect("an installed session");
+
+    let head = leaf_fragment(
+        &b,
+        a_id,
+        STREAM,
+        (GROUP, 0, FRAG_FRAGMENTED),
+        0,
+        b"S5X11-head",
+    );
+    b.send_built_packet_for_test(a_id, &head)
+        .await
+        .expect("the head leaves B");
+    assert!(
+        wait_for(
+            || a.rtc_reassembly().held_bytes(session_id) == 10,
+            Duration::from_secs(5)
+        )
+        .await,
+        "the head must reach production ingress and be buffered, or this \
+         witness proves nothing about what its loss costs (held {})",
+        a.rtc_reassembly().held_bytes(session_id)
+    );
+    // The premise that makes this loss silent-data-loss rather than a
+    // dropped datagram: the head was ACKNOWLEDGED. Its sequence is in
+    // A's receive state, so B may discard its retransmit descriptor
+    // and will never send it again.
+    let recorded = a
+        .peer_session_for_test(b_id)
+        .expect("A's session to B")
+        .get_or_create_stream(STREAM)
+        .with_reliability(|r| r.rx_ack_seq());
+    assert_eq!(
+        recorded, 1,
+        "the head's sequence must be recorded — an unacknowledged piece \
+         would be resent and nothing would be lost"
+    );
+
+    // Let the group age past its deadline, exactly as a sender whose
+    // retransmit timer is longer than the TTL would.
+    tokio::time::sleep(GROUP_TTL + Duration::from_millis(300)).await;
+
+    let tail = leaf_fragment(
+        &b,
+        a_id,
+        STREAM,
+        (GROUP, 10, FRAG_FRAGMENTED | FRAG_LAST),
+        0,
+        b"tail",
+    );
+    b.send_built_packet_for_test(a_id, &tail)
+        .await
+        .expect("the tail leaves B");
+
+    assert!(
+        wait_for(
+            || a.rtc_reassembly().abandoned_total() == 1,
+            Duration::from_secs(5)
+        )
+        .await,
+        "the reaped group held acknowledged bytes, so its loss must be \
+         reported — not logged at debug and forgotten (reported {})",
+        a.rtc_reassembly().abandoned_total()
+    );
+    let records = a.rtc_reassembly().take_abandoned();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].reason,
+        AbandonReason::Expired,
+        "the disposition says WHY the bytes were abandoned"
+    );
+    assert_eq!(
+        records[0].provenance.stream_id, STREAM,
+        "and WHICH stream lost them — which is only knowable because the \
+         group binds its provenance"
+    );
+    assert_eq!(records[0].held, 10, "and how much was lost");
+    assert_eq!(
+        records[0].first_sequence, 0,
+        "and the acknowledged sequence it covers"
+    );
+
+    assert_eq!(
+        a.rtc_reassembly().held_bytes(session_id),
+        0,
+        "the tail must NOT open a group whose head is gone: a group that \
+         can never complete is not progress, it is a second loss"
+    );
+    assert_eq!(
+        a.rtc_reassembly().abandoned_total(),
+        1,
+        "and refusing the tail is not itself an abandonment — there was \
+         nothing left to abandon"
+    );
+    // Nothing was dispatched: no partial payload, no lone tail.
+    let delivered = collect_tagged(&a, b"S5X11", 1, Duration::from_millis(500)).await;
+    assert!(
+        delivered.is_empty(),
+        "an incomplete group must not reach a subscriber: {delivered:?}"
+    );
+}
+
+/// X11: a group's identity is its FIRST piece's, and a piece that
+/// disagrees is refused rather than merged.
+///
+/// `fragment_id` is 16 bits of sender-chosen namespace. Pre-fix the
+/// only thing a group required of its pieces was that they be
+/// disjoint and inside the declared total — so two pieces from
+/// DIFFERENT streams that happened to share a session and a group id
+/// were concatenated into one payload and dispatched with whichever
+/// piece's stream, channel, origin and subprotocol happened to
+/// complete the group. Both pieces are authenticated here; this is a
+/// protocol-integrity failure of an honest-looking producer, not a
+/// forged identity.
+///
+/// Inverse: drop the `provenance != piece.provenance` check in
+/// `accept_locked` — the two streams' bytes are assembled into one
+/// payload and delivered as `S5X11Bhead-tail`, and both assertions
+/// below fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fragment_from_another_stream_cannot_join_a_live_group() {
+    use net::adapter::net::rtc::AbandonReason;
+    use net_wire::protocol::{FRAG_FRAGMENTED, FRAG_LAST};
+
+    const OWNER: u64 = 0x077B;
+    const OTHER: u64 = 0x077C;
+    const GROUP: u16 = 13;
+    let (a, b, _, _) = pair_with(rtc_config(), rtc_config()).await;
+    let (a_id, b_id) = (a.node_id(), b.node_id());
+    let session_id = a.peer_session_id(b_id).expect("an installed session");
+
+    let head = leaf_fragment(
+        &b,
+        a_id,
+        OWNER,
+        (GROUP, 0, FRAG_FRAGMENTED),
+        0,
+        b"S5X11Bhead",
+    );
+    b.send_built_packet_for_test(a_id, &head)
+        .await
+        .expect("the head leaves B");
+    assert!(
+        wait_for(
+            || a.rtc_reassembly().held_bytes(session_id) == 10,
+            Duration::from_secs(5)
+        )
+        .await,
+        "the owning stream's head must be buffered first"
+    );
+
+    // Same session, same group id, same declared total — a different
+    // STREAM. Nothing about the bytes contradicts the group; only
+    // their provenance does.
+    let alien = leaf_fragment(
+        &b,
+        a_id,
+        OTHER,
+        (GROUP, 10, FRAG_FRAGMENTED | FRAG_LAST),
+        0,
+        b"-tail",
+    );
+    b.send_built_packet_for_test(a_id, &alien)
+        .await
+        .expect("the alien piece leaves B");
+
+    assert!(
+        wait_for(
+            || a.rtc_reassembly().abandoned_total() == 1,
+            Duration::from_secs(5)
+        )
+        .await,
+        "the mixed group must be destroyed and reported"
+    );
+    let records = a.rtc_reassembly().take_abandoned();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].reason, AbandonReason::Inconsistent);
+    assert_eq!(
+        records[0].provenance.stream_id, OWNER,
+        "the group belonged to the stream that OPENED it, and that is the \
+         stream whose bytes were lost"
+    );
+    assert_eq!(
+        a.rtc_reassembly().held_bytes(session_id),
+        0,
+        "neither stream's bytes are kept: a group is not half-valid"
+    );
+    let delivered = collect_tagged(&a, b"S5X11B", 1, Duration::from_millis(500)).await;
+    assert!(
+        delivered.is_empty(),
+        "two streams' pieces must never be assembled into one payload: \
+         {delivered:?}"
+    );
+}
+
+/// X10: a session REPLACED by its successor releases its partial
+/// fragment groups.
+///
+/// The common installer swaps the peer entry and then cleans the
+/// displaced session's reverse and address indexes — but it never
+/// retired its reassembly state, and no later path can: a close
+/// notification arriving afterwards goes to `evict_endpoint`, which
+/// starts by requiring the reverse mapping this installer has just
+/// removed, and only retires a session it actually removes. So a
+/// quiet mesh kept the displaced session's acknowledged partial
+/// bytes for as long as it ran — TTL reaping only happens when a
+/// fragment arrives, and there is no successor traffic on a dead
+/// session's group.
+///
+/// This is Kyra's busy-responder replacement scenario with a
+/// retained partial: A is the responder on a DataChannel it has
+/// never seen, so the install runs with `require_quiescent: false`
+/// and replaces an incumbent that is genuinely busy — the buffered
+/// group's own stream is open on it.
+///
+/// Inverse: drop the `retire_session` call from the installer's
+/// displaced-session block — `held_bytes` stays at 10 and the late
+/// piece re-opens the dead session's group.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_replaced_sessions_partial_fragment_group_is_retired() {
+    use net::adapter::net::rtc::{
+        AbandonReason, FragmentOutcome, FragmentPiece, FragmentProvenance,
+    };
+    use net_wire::protocol::FRAG_FRAGMENTED;
+
+    const STREAM: u64 = 0x077D;
+    let b_secret = [0xB7u8; 32];
+    let a = node(Some(rtc_config())).await;
+    let b = node_with_identity(b_secret, rtc_config()).await;
+    a.start();
+    b.start();
+    connect_rtc_loopback(&a, &b)
+        .await
+        .expect("DataChannel + Noise handshake");
+    let (a_id, b_id) = (a.node_id(), b.node_id());
+    let displaced_sid = a.peer_session_id(b_id).expect("an installed session");
+
+    let head = leaf_fragment(&b, a_id, STREAM, (17, 0, FRAG_FRAGMENTED), 0, b"S5X10-head");
+    b.send_built_packet_for_test(a_id, &head)
+        .await
+        .expect("the head leaves B");
+    assert!(
+        wait_for(
+            || a.rtc_reassembly().held_bytes(displaced_sid) == 10,
+            Duration::from_secs(5)
+        )
+        .await,
+        "the incumbent must be holding a real partial group before it is \
+         replaced, or this witness proves nothing"
+    );
+
+    // The displacement, end to end: same identity, fresh socket, A as
+    // responder.
+    let b2 = node_with_identity(b_secret, rtc_config()).await;
+    b2.start();
+    assert_eq!(b2.node_id(), b_id, "b2 must be the same identity");
+    let (a_endpoint, b2_endpoint) = open_rtc_channel(&a, &b2)
+        .await
+        .expect("a second DataChannel on its own socket");
+    let accept = {
+        let a = Arc::clone(&a);
+        tokio::spawn(async move { a.accept_rtc(a_endpoint, b_id).await })
+    };
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let a_pub = *a.public_key();
+    b2.connect_rtc(b2_endpoint, &a_pub, a.node_id())
+        .await
+        .expect("b2 initiates Noise over the fresh channel");
+    accept
+        .await
+        .expect("join")
+        .expect("the responder must install over the incumbent");
+    let successor_sid = a.peer_session_id(b_id).expect("a successor session");
+    assert_ne!(
+        successor_sid, displaced_sid,
+        "the incumbent must actually have been replaced"
+    );
+
+    assert_eq!(
+        a.rtc_reassembly().held_bytes(displaced_sid),
+        0,
+        "a replacement ends the displaced session's lifetime, so its \
+         acknowledged partial bytes are released with it"
+    );
+    let released = a.rtc_reassembly().take_abandoned();
+    assert_eq!(released.len(), 1, "and the loss is reported, not silent");
+    assert_eq!(released[0].reason, AbandonReason::SessionRetired);
+    assert_eq!(released[0].provenance.stream_id, STREAM);
+    assert_eq!(
+        a.rtc_reassembly().accept(
+            FragmentPiece {
+                session_id: displaced_sid,
+                fragment_id: 17,
+                offset: 10,
+                flags: FRAG_FRAGMENTED,
+                sequence: 2,
+                provenance: FragmentProvenance {
+                    stream_id: STREAM,
+                    origin_hash: b_id,
+                    channel_hash: 0,
+                    subprotocol_id: 0,
+                    reliable: true,
+                },
+                data: Bytes::from_static(b"late"),
+            },
+            std::time::Instant::now(),
+        ),
+        Err(FragmentOutcome::Retired),
+        "and a packet already past its session lookup when the replacement \
+         landed cannot bring the displaced session's state back"
+    );
+}
+
+/// X10: the permanently-dead peer sweep releases the swept session's
+/// partial fragment groups.
+///
+/// The sweep removes the peer, its addresses, its reverse index, its
+/// gate cache and its admission state — and left its reassembly
+/// groups behind. This is the one eviction a quiet mesh reaches on
+/// its own, so it is exactly the path on which leftover bytes are
+/// never reclaimed.
+///
+/// The DataChannel is never closed here: B's heartbeat interval is
+/// ten minutes, so A's session to B simply goes silent past
+/// `session_timeout × 30` and the heartbeat loop's sweep is the only
+/// eviction that can fire. The ordinary close path needs a close
+/// notification that this test never produces, and the provisional
+/// eviction paths need an admission state A — which serves no
+/// bootstrap — never assigns.
+///
+/// Inverse: drop the `rtc_reassembly_evict.retire_session` call from
+/// the sweep — the swept session's 10 bytes stay held forever and the
+/// late piece re-opens its group.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_swept_dead_peers_partial_fragment_group_is_retired() {
+    use net::adapter::net::rtc::{
+        AbandonReason, FragmentOutcome, FragmentPiece, FragmentProvenance,
+    };
+    use net_wire::protocol::FRAG_FRAGMENTED;
+
+    const STREAM: u64 = 0x077E;
+    // A sweeps fast: `dead_peer_timeout` is `session_timeout × 30`,
+    // and the sweep rides the heartbeat tick.
+    let mut a_cfg = config(Some(rtc_config()));
+    a_cfg.session_timeout = Duration::from_millis(100);
+    a_cfg.heartbeat_interval = Duration::from_millis(50);
+    // B never refreshes A's view of it, which is what "permanently
+    // dead" means to the detector.
+    let mut b_cfg = config(Some(rtc_config()));
+    b_cfg.heartbeat_interval = Duration::from_secs(600);
+    let a = Arc::new(
+        MeshNode::new(EntityKeypair::generate(), a_cfg)
+            .await
+            .expect("MeshNode::new"),
+    );
+    let b = Arc::new(
+        MeshNode::new(EntityKeypair::generate(), b_cfg)
+            .await
+            .expect("MeshNode::new"),
+    );
+    a.start();
+    b.start();
+    connect_rtc_loopback(&a, &b)
+        .await
+        .expect("DataChannel + Noise handshake");
+    let (a_id, b_id) = (a.node_id(), b.node_id());
+    let session_id = a.peer_session_id(b_id).expect("an installed session");
+
+    let head = leaf_fragment(&b, a_id, STREAM, (19, 0, FRAG_FRAGMENTED), 0, b"S5X10-swee");
+    b.send_built_packet_for_test(a_id, &head)
+        .await
+        .expect("the head leaves B");
+    assert!(
+        wait_for(
+            || a.rtc_reassembly().held_bytes(session_id) == 10,
+            Duration::from_secs(5)
+        )
+        .await,
+        "the partial group must exist before the peer is swept"
+    );
+
+    assert!(
+        wait_for(|| a.peer_endpoint(b_id).is_none(), Duration::from_secs(15)).await,
+        "the failure sweep must evict the silent peer"
+    );
+    assert_eq!(
+        a.rtc_reassembly().held_bytes(session_id),
+        0,
+        "the swept session's acknowledged partial bytes go with it — \
+         nothing else will ever release them on a quiet mesh"
+    );
+    let released = a.rtc_reassembly().take_abandoned();
+    assert_eq!(released.len(), 1, "and the loss is reported, not silent");
+    assert_eq!(released[0].reason, AbandonReason::SessionRetired);
+    assert_eq!(released[0].provenance.stream_id, STREAM);
+    assert_eq!(
+        a.rtc_reassembly().accept(
+            FragmentPiece {
+                session_id,
+                fragment_id: 19,
+                offset: 10,
+                flags: FRAG_FRAGMENTED,
+                sequence: 2,
+                provenance: FragmentProvenance {
+                    stream_id: STREAM,
+                    origin_hash: b_id,
+                    channel_hash: 0,
+                    subprotocol_id: 0,
+                    reliable: true,
+                },
+                data: Bytes::from_static(b"late"),
+            },
+            std::time::Instant::now(),
+        ),
+        Err(FragmentOutcome::Retired),
+        "and the sweep fences the session it swept"
+    );
 }

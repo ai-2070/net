@@ -124,6 +124,12 @@ impl From<net::adapter::net::StreamError> for SdkError {
             StreamError::NotConnected => SdkError::NotConnected,
             StreamError::SessionSuperseded => SdkError::SessionSuperseded,
             StreamError::Transport(msg) => SdkError::Adapter(msg),
+            // `StreamError` is `#[non_exhaustive]`: a variant this SDK
+            // predates must surface as a failure, and specifically not
+            // as `Backpressure` (which a caller retries) or
+            // `NotConnected` (which a caller reconnects on). Both would
+            // be confident claims about a condition we cannot name.
+            other => SdkError::Adapter(other.to_string()),
         }
     }
 }

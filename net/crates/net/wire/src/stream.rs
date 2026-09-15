@@ -261,22 +261,42 @@ pub struct StreamStats {
     /// stream opened (receiver side).
     pub credit_grants_sent: u64,
     /// Cumulative wire bytes this side has committed to the wire on
-    /// this stream — the sender-side half of the byte ledger. Every
-    /// producer that puts a packet on this stream moves it, whether
-    /// it went through credit admission
-    /// (`try_acquire_tx_credit`) or through the control-plane debit
-    /// (`note_tx_bytes_sent`).
+    /// this stream — the sender-side half of the byte ledger. Moved
+    /// both by credit admission (`try_acquire_tx_credit`) and by the
+    /// control-plane debit (`note_tx_bytes_sent`).
+    ///
+    /// Not by *every* producer: the event-batch producers that
+    /// predate the byte ledger put packets on a stream without
+    /// debiting it, so a stream shared between one of those and an
+    /// admitted producer still sees the receiver's total run ahead of
+    /// this watermark. Byte conservation below is a property of the
+    /// admitted and control-debited producers, not of the stream map.
     pub tx_bytes_sent: u64,
     /// Highest cumulative-consumed total the receiver has reported
     /// for this stream — the receiver-side half of the same ledger.
     ///
-    /// Conservation: `tx_credit_remaining + (tx_bytes_sent -
-    /// max_consumed_seen) == tx_window` at every settled point, and
+    /// Conservation, over the producers that move `tx_bytes_sent`:
+    /// `tx_credit_remaining + (tx_bytes_sent - max_consumed_seen)
+    /// == tx_window + overdraft` at every settled point, and
     /// `tx_bytes_sent - max_consumed_seen` is exactly the bytes in
-    /// flight or lost. A producer that skips its debit breaks the
-    /// identity by letting the receiver's total run past
-    /// `tx_bytes_sent`, whereupon the grant clamp refunds window for
-    /// data that never arrived.
+    /// flight or lost.
+    ///
+    /// The `overdraft` term is control debt. A control-plane producer
+    /// has no caller to refuse, so it debits unconditionally and
+    /// `tx_credit_remaining` floors at zero; the part of the debit
+    /// the window could not pay for is carried as debt rather than
+    /// forgiven. It is retired by the next authoritative grant —
+    /// which pays debt down before it reopens application credit —
+    /// or given back if the transport never admitted the send.
+    /// Without the term, a grant reporting only a control frame's own
+    /// bytes as consumed reopened the window for application bytes
+    /// still outstanding. `overdraft` is internal to `StreamState`;
+    /// it is the difference between this identity and the one a
+    /// stream with no control traffic satisfies.
+    ///
+    /// A producer that skips its debit breaks the identity by letting
+    /// the receiver's total run past `tx_bytes_sent`, whereupon the
+    /// grant clamp refunds window for data that never arrived.
     pub max_consumed_seen: u64,
 }
 

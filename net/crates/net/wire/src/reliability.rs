@@ -100,6 +100,27 @@ pub trait ReliabilityMode: Send + Sync {
         0
     }
 
+    /// Sender-side: the peer's cumulative acknowledgement frontier
+    /// as this sender applied it — every sequence below it was
+    /// reported received. `None` when no cumulative ack has been
+    /// applied (and always, for a mode that tracks nothing).
+    ///
+    /// [`Self::has_pending`] cannot stand in for this: exhausted
+    /// descriptors are DELETED, so an empty window is equally
+    /// consistent with "everything was acknowledged" and "the layer
+    /// gave up". This is the acknowledgement half of that question
+    /// and [`Self::abandoned_seq`] is the give-up half.
+    fn ack_frontier(&self) -> Option<u64> {
+        None
+    }
+
+    /// Sender-side: the highest sequence this layer gave up on —
+    /// deleted from the window with its retransmits exhausted.
+    /// `None` when it has never given up on anything.
+    fn abandoned_seq(&self) -> Option<u64> {
+        None
+    }
+
     /// Sender-side: a cumulative ack arrived — every sequence below
     /// `ack_seq` has been received, so drop them from the retransmit
     /// window (H-9). Without this, packets linger in `pending` on the
@@ -359,6 +380,24 @@ pub struct ReliableStream {
     /// re-halve cwnd, or bump `retries` toward a spurious give-up.
     /// Cleared (`None`) once a cumulative ack advances past `r`.
     recover: Option<u64>,
+    /// Highest cumulative ack this sender has APPLIED, as an
+    /// exclusive frontier: `Some(f)` means the peer reported having
+    /// contiguously received every sequence below `f`. `None` until
+    /// the first cumulative ack arrives.
+    ///
+    /// An empty `pending` does not mean the window drained by
+    /// acknowledgement — [`Self::get_timed_out`] deletes exhausted
+    /// descriptors, so a give-up empties it too. This is the
+    /// positive half of that distinction: what the receiver actually
+    /// reported. Only CUMULATIVE acks move it; a SACK names
+    /// non-contiguous runs and would make the frontier a lie.
+    ack_frontier: Option<u64>,
+    /// Highest sequence whose descriptor was deleted because its
+    /// retransmits were exhausted (H-3) — the other half of the same
+    /// distinction. `None` until the layer gives up on something.
+    /// Kept beside [`Self::failed`], which is taken-and-cleared by
+    /// the owning node and so cannot answer the question later.
+    abandoned_seq: Option<u64>,
 }
 
 impl ReliableStream {
@@ -468,6 +507,8 @@ impl ReliableStream {
             cwnd: Self::INIT_CWND,
             ssthresh: f64::MAX,
             recover: None,
+            ack_frontier: None,
+            abandoned_seq: None,
         }
     }
 
@@ -564,6 +605,26 @@ impl ReliableStream {
     /// [`Self::last_received_contiguous`] instead.
     pub fn ack_seq(&self) -> u64 {
         self.next_expected.saturating_sub(1)
+    }
+
+    /// The peer's cumulative acknowledgement frontier as this sender
+    /// applied it: every sequence below it was reported received.
+    /// `None` until a cumulative ack arrives.
+    ///
+    /// Distinguishes a window that drained by ACKNOWLEDGEMENT from
+    /// one the give-up emptied: an empty `pending` proves neither,
+    /// because exhausted descriptors are deleted.
+    #[inline]
+    pub fn ack_frontier(&self) -> Option<u64> {
+        self.ack_frontier
+    }
+
+    /// The highest sequence this layer gave up on — deleted from the
+    /// retransmit window with its retries exhausted. `None` when it
+    /// has never given up on anything.
+    #[inline]
+    pub fn abandoned_seq(&self) -> Option<u64> {
+        self.abandoned_seq
     }
 
     /// Check if there are gaps in received sequences.
@@ -918,6 +979,7 @@ impl ReliabilityMode for ReliableStream {
         let max_retries = self.max_retries;
         let mut retransmits = Vec::new();
         let mut gave_up = false;
+        let mut gave_up_seq = None;
 
         // Per perf #133 — `Arc::clone` bumps a refcount instead of
         // deep-cloning the `Vec<Bytes>` events list per timed-out packet.
@@ -934,6 +996,8 @@ impl ReliabilityMode for ReliableStream {
                     true // keep — still recoverable
                 } else {
                     gave_up = true;
+                    gave_up_seq =
+                        Some(gave_up_seq.map_or(unacked.seq(), |s: u64| s.max(unacked.seq())));
                     false // drop — retransmits exhausted
                 }
             } else {
@@ -942,6 +1006,13 @@ impl ReliabilityMode for ReliableStream {
         });
         if gave_up {
             self.failed = true;
+            // Kept beyond `failed`'s take-and-clear: "the window is
+            // empty" and "the window was acknowledged" are different
+            // claims, and this is what tells them apart afterwards.
+            self.abandoned_seq = match (self.abandoned_seq, gave_up_seq) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            };
         }
         // A timeout retransmit is a stronger congestion signal than a
         // NACK → restart slow-start from the floor (H-6).
@@ -954,6 +1025,14 @@ impl ReliabilityMode for ReliableStream {
 
     fn take_failed(&mut self) -> bool {
         std::mem::take(&mut self.failed)
+    }
+
+    fn ack_frontier(&self) -> Option<u64> {
+        self.ack_frontier
+    }
+
+    fn abandoned_seq(&self) -> Option<u64> {
+        self.abandoned_seq
     }
 
     fn rx_ack_seq(&self) -> u64 {
@@ -975,6 +1054,14 @@ impl ReliabilityMode for ReliableStream {
         // freshest such sample wins because we walk front-to-
         // back — same direction `retain` did pre-fix.
         let now = SystemClock::now();
+        // The positive receipt, recorded whether or not anything was
+        // still in the window to prune: the receiver reported
+        // contiguous receipt below `ack_seq`. A descriptor registered
+        // AFTER its own ack was applied (mesh.rs awaits the socket
+        // before registering) is the one case where the window
+        // outlives the acknowledgement of its contents, and this
+        // frontier is what still proves the acknowledgement happened.
+        self.ack_frontier = Some(self.ack_frontier.map_or(ack_seq, |f| f.max(ack_seq)));
         let mut sample = None;
         let mut acked = 0usize;
         while let Some(front) = self.pending.front() {

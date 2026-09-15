@@ -351,6 +351,15 @@ fn stream_err_to_code(err: &StreamError) -> c_int {
         StreamError::NotConnected => NET_ERR_MESH_NOT_CONNECTED,
         StreamError::SessionSuperseded => NET_ERR_MESH_SESSION_SUPERSEDED,
         StreamError::Transport(_) => NET_ERR_MESH_TRANSPORT,
+        // `StreamError` is `#[non_exhaustive]`, so a variant this ABI
+        // has never heard of can reach here. It becomes the generic
+        // failure code and NOTHING else: mapping an unrecognised
+        // failure onto an existing variant's code would tell a C
+        // caller something specific and false — `BACKPRESSURE` invites
+        // a retry loop, `NOT_CONNECTED` invites a reconnect — and both
+        // are guesses about a condition we do not know. A caller that
+        // sees this has failed, and can ask for the detail string.
+        _ => NetError::Unknown.into(),
     }
 }
 

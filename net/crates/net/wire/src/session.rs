@@ -359,9 +359,10 @@ impl NetSession {
             .or_insert_with(|| StreamState::new(self.default_reliable))
     }
 
-    /// Allocate the next TX sequence on `stream_id` **and** debit
-    /// `wire_bytes` against the same stream's send ledger, under one
-    /// map lookup.
+    /// Allocate the next TX sequence on `stream_id`, debit
+    /// `wire_bytes` against the same stream's send ledger under one
+    /// map lookup, and return the debit **bound to the lifetime of
+    /// the send it pays for**.
     ///
     /// The control-plane counterpart of the admission path
     /// ([`Self::try_acquire_tx_credit_for_lifetime`], which returns
@@ -374,10 +375,32 @@ impl NetSession {
     /// no refusal path. `wire_bytes` must be what the *receiver*
     /// charges for the same packet — payload plus fixed per-packet
     /// wire overhead — or the two halves of the ledger drift.
-    pub fn next_tx_seq_charged(&self, stream_id: u64, wire_bytes: u32) -> u64 {
-        let stream = self.get_or_create_stream(stream_id);
-        stream.note_tx_bytes_sent(wire_bytes);
-        stream.next_tx_seq()
+    /// `wire_bytes == 0` allocates the sequence and charges nothing,
+    /// for the producers whose frames the receiver does not account.
+    ///
+    /// The caller MUST [`ControlDebitGuard::commit`] the returned
+    /// guard once the transport has accepted the packet. Dropping it
+    /// uncommitted is the never-admitted path: the bytes go back and
+    /// the sequence is reclaimed. See [`ControlDebitGuard`] for why
+    /// accepted-then-lost is deliberately not that path.
+    pub fn next_tx_seq_charged(
+        self: &Arc<Self>,
+        stream_id: u64,
+        wire_bytes: u32,
+    ) -> ControlDebitGuard {
+        let (epoch, seq) = {
+            let stream = self.get_or_create_stream(stream_id);
+            stream.note_tx_bytes_sent(wire_bytes);
+            (stream.epoch(), stream.next_tx_seq())
+        };
+        ControlDebitGuard {
+            session: Arc::clone(self),
+            stream_id,
+            epoch,
+            bytes: wire_bytes,
+            seq,
+            active: true,
+        }
     }
 
     /// Like [`Self::get_or_create_stream`], but the receiver-side stream
@@ -782,6 +805,105 @@ impl Drop for TxSlotGuard {
             // bytes on a slot we never acquired.
             if state.epoch() == self.epoch {
                 state.refund_tx_credit(self.bytes);
+            }
+        }
+    }
+}
+
+/// RAII guard over a **pre-send control debit**: the sequence a
+/// control-plane producer stamped, plus the ledger coordinates needed
+/// to give the debit back if the transport never took the packet.
+///
+/// A control producer has no caller to refuse
+/// ([`StreamState::note_tx_bytes_sent`]), so it debits, stamps a
+/// sequence, and only then reaches asynchronous transport admission.
+/// Every outcome of that admission that is not acceptance — a refused
+/// enqueue, a send that failed or exceeded its deadline, a queue that
+/// evicted the datagram, a producer cancelled while suspended before
+/// the send — leaves bytes recorded as sent that the receiver can
+/// never report as consumed, and on a stream shared with application
+/// traffic those bytes close the application window permanently.
+///
+/// So the debit is scoped to the send's lifetime: `Drop` without a
+/// preceding [`Self::commit`] refunds the bytes
+/// ([`StreamState::refund_control_debit`]) and rolls the sequence back
+/// when it is still the most recently issued one, leaving no
+/// receiver-visible gap.
+///
+/// **`commit` means the transport accepted the packet, not that the
+/// peer received it.** Wire loss after acceptance is the receiver's to
+/// reconcile through the next grant and must NEVER be refunded: the
+/// packet may still arrive and be charged, and a sender that refunded
+/// it would credit those bytes twice. Admission is the line this guard
+/// draws; delivery is not.
+///
+/// Epoch-fenced exactly like [`TxSlotGuard`]: if the stream was closed
+/// and reopened under a new epoch before the guard dropped, neither
+/// the refund nor the rollback touches the successor's ledger.
+pub struct ControlDebitGuard {
+    session: Arc<NetSession>,
+    stream_id: u64,
+    /// Epoch of the `StreamState` this debit was charged against.
+    epoch: u64,
+    /// Wire bytes debited. `0` for a producer whose frame the receiver
+    /// does not charge (the sequence is still rolled back).
+    bytes: u32,
+    /// The sequence stamped on the packet this debit paid for.
+    seq: u64,
+    active: bool,
+}
+
+impl std::fmt::Debug for ControlDebitGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlDebitGuard")
+            .field("stream_id", &format_args!("{:#x}", self.stream_id))
+            .field("epoch", &self.epoch)
+            .field("bytes", &self.bytes)
+            .field("seq", &self.seq)
+            .field("active", &self.active)
+            .finish()
+    }
+}
+
+impl ControlDebitGuard {
+    /// The sequence this debit paid for. Stamp it on the packet.
+    #[inline]
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// Which stream the debit was charged on.
+    #[inline]
+    pub fn stream_id(&self) -> u64 {
+        self.stream_id
+    }
+
+    /// Wire bytes this guard would refund.
+    #[inline]
+    pub fn bytes(&self) -> u32 {
+        self.bytes
+    }
+
+    /// The transport ACCEPTED the packet. Drop refunds nothing and
+    /// rolls nothing back — the bytes are the receiver's to report
+    /// consumed, and the sequence is on the wire.
+    #[inline]
+    pub fn commit(mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for ControlDebitGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        if let Some(state) = self.session.try_stream(self.stream_id) {
+            if state.epoch() == self.epoch {
+                state.refund_control_debit(self.bytes);
+                // Same order as the admitted path: refund the bytes,
+                // then reclaim the sequence if nothing raced ahead.
+                state.try_rollback_tx_seq(self.seq);
             }
         }
     }
@@ -1353,6 +1475,27 @@ pub struct StreamState {
     /// ignored. Updated under CAS to protect the monotonicity
     /// invariant against concurrent grant-dispatch tasks.
     max_consumed_seen: AtomicU64,
+    /// Control-plane bytes this sender put on the wire that
+    /// `tx_credit_remaining` could not pay for: **debt**, not
+    /// forgiveness.
+    ///
+    /// An unconditional control debit
+    /// ([`StreamState::note_tx_bytes_sent`]) has no caller to refuse,
+    /// so the remaining credit floors at zero and the shortfall
+    /// accrues here. Without the debt term the next authoritative
+    /// grant credited the control frame's newly-consumed delta back
+    /// into `tx_credit_remaining` while the application bytes that
+    /// were holding the window were still outstanding — the window
+    /// reopened for data the receiver had never seen.
+    ///
+    /// [`StreamState::apply_authoritative_grant`] retires debt before
+    /// it reopens application credit, and a never-admitted control
+    /// send gives its debt back through
+    /// [`StreamState::refund_control_debit`]. The conservation
+    /// identity every operation on this ledger preserves is
+    /// `tx_credit_remaining + (tx_bytes_sent - max_consumed_seen)
+    /// == tx_window + overdraft`.
+    overdraft: AtomicU64,
     /// Number of `send_on_stream` calls that returned
     /// `StreamError::Backpressure` since this stream opened.
     backpressure_events: AtomicU64,
@@ -1589,6 +1732,7 @@ impl StreamState {
             tx_credit_remaining: AtomicU32::new(tx_window),
             tx_bytes_sent: AtomicU64::new(0),
             max_consumed_seen: AtomicU64::new(0),
+            overdraft: AtomicU64::new(0),
             backpressure_events: AtomicU64::new(0),
             credit_grants_received: AtomicU64::new(0),
             credit_grants_sent: AtomicU64::new(0),
@@ -1734,9 +1878,17 @@ impl StreamState {
     /// `Backpressure` to (a membership ack or a capability
     /// announcement is protocol progress, not application traffic), so
     /// they debit unconditionally and the remaining credit floors at
-    /// zero rather than refusing. The bytes are still fully refunded
-    /// by the grant that reports them consumed, so a control frame
-    /// costs the application window only while it is in flight.
+    /// zero rather than refusing. Feedback is never put behind the
+    /// window it exists to refill.
+    ///
+    /// Flooring at zero is not forgiveness. The part of the debit the
+    /// remaining credit could not pay for is carried as
+    /// [`overdraft`](Self::tx_overdraft) — debt the next
+    /// authoritative grant retires *before* it reopens application
+    /// credit. Forgetting it let a grant reporting only the control
+    /// frame's own bytes as consumed hand that credit to the
+    /// application window while every admitted application byte was
+    /// still outstanding.
     ///
     /// Same publication order as `try_acquire_tx_credit`: remaining
     /// first, then the watermark.
@@ -1744,13 +1896,78 @@ impl StreamState {
         if self.tx_window == 0 {
             return;
         }
-        self.tx_credit_remaining
+        // `fetch_update` returns the PREVIOUS value on success, and
+        // the closure is infallible, so `prev` is always the credit
+        // this debit found. `prev.min(bytes)` is what the window
+        // actually paid; the rest is the overdraft.
+        let prev = self
+            .tx_credit_remaining
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
                 Some(v.saturating_sub(bytes))
             })
-            .ok();
+            .unwrap_or(bytes);
+        let shortfall = bytes.saturating_sub(prev);
+        if shortfall > 0 {
+            self.overdraft.fetch_add(shortfall as u64, Ordering::AcqRel);
+        }
         self.tx_bytes_sent
             .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// Give back a control debit taken by
+    /// [`Self::note_tx_bytes_sent`] for work the transport **never
+    /// admitted** — a refused enqueue, a send that failed its
+    /// deadline, or a producer cancelled while suspended before
+    /// admission.
+    ///
+    /// Unlike [`Self::refund_tx_credit`], this reverses a debit that
+    /// may have landed partly or wholly in
+    /// [`overdraft`](Self::tx_overdraft), so it pays the debt down
+    /// first and only returns the remainder to
+    /// `tx_credit_remaining`. Applied in that order it is the exact
+    /// inverse of the debit: a frame whose whole cost floored at zero
+    /// clears exactly its own debt and mints no credit.
+    ///
+    /// **Never call this for a packet the transport accepted.** Wire
+    /// loss after admission is the receiver's to reconcile through the
+    /// next grant — refunding it would credit the sender for bytes
+    /// that may still arrive and be charged, which is the
+    /// double-credit this whole ledger exists to prevent. The
+    /// distinction is admission, not delivery.
+    pub fn refund_control_debit(&self, bytes: u32) {
+        if self.tx_window == 0 {
+            return;
+        }
+        let paid = self.retire_overdraft(bytes as u64) as u32;
+        let back = bytes - paid;
+        if back > 0 {
+            self.tx_credit_remaining
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                    Some(v.saturating_add(back))
+                })
+                .ok();
+        }
+        self.tx_bytes_sent
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(bytes as u64))
+            })
+            .ok();
+    }
+
+    /// Pay up to `amount` off the outstanding control overdraft and
+    /// return how much was actually retired. The remainder is the
+    /// caller's to spend on application credit.
+    fn retire_overdraft(&self, amount: u64) -> u64 {
+        if amount == 0 {
+            return 0;
+        }
+        let prev = self
+            .overdraft
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |d| {
+                Some(d.saturating_sub(amount))
+            })
+            .unwrap_or(0);
+        prev.min(amount)
     }
 
     /// Refund `bytes` of send credit. Called by `TxSlotGuard::drop`
@@ -1819,10 +2036,24 @@ impl StreamState {
     /// via `fetch_update`. The additive form composes atomically with
     /// the CAS in `try_acquire_tx_credit` and the `fetch_update` in
     /// `refund_tx_credit`: every operation preserves the invariant
-    /// `remaining + (sent - max_consumed) == window` regardless of
-    /// interleaving. An earlier `.store()`-based implementation
-    /// recomputed from a racy snapshot of `tx_bytes_sent`, which could
-    /// silently overwrite a concurrent acquire's CAS result.
+    /// `remaining + (sent - max_consumed) == window + overdraft`
+    /// regardless of interleaving. An earlier `.store()`-based
+    /// implementation recomputed from a racy snapshot of
+    /// `tx_bytes_sent`, which could silently overwrite a concurrent
+    /// acquire's CAS result.
+    ///
+    /// **The delta pays control debt first.** Newly-consumed bytes
+    /// are the sender's only evidence that anything left the window,
+    /// and an unconditional control debit
+    /// ([`Self::note_tx_bytes_sent`]) can have spent window the
+    /// application had already been admitted against. Crediting the
+    /// delta straight into `tx_credit_remaining` therefore reopened
+    /// the window for application bytes the receiver had never seen —
+    /// the grant "refunded" a debit that was only floored, not paid.
+    /// So the delta retires [`overdraft`](Self::tx_overdraft) first
+    /// and only the remainder becomes application credit. The
+    /// `min(window)` clamp bounds a hostile grant; it never
+    /// substituted for this.
     pub fn apply_authoritative_grant(&self, total_consumed: u64) {
         self.credit_grants_received.fetch_add(1, Ordering::Relaxed);
         if self.tx_window == 0 {
@@ -1870,10 +2101,15 @@ impl StreamState {
         // the reported delta — a safety bound, not a correctness
         // requirement under honest operation.
         let grant_add = delta.min(u32::MAX as u64) as u32;
+        let paid = self.retire_overdraft(grant_add as u64) as u32;
+        let credit_add = grant_add - paid;
+        if credit_add == 0 {
+            return;
+        }
         let window = self.tx_window;
         self.tx_credit_remaining
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
-                Some(v.saturating_add(grant_add).min(window))
+                Some(v.saturating_add(credit_add).min(window))
             })
             .ok();
     }
@@ -1890,6 +2126,20 @@ impl StreamState {
     #[inline]
     pub fn max_consumed_seen(&self) -> u64 {
         self.max_consumed_seen.load(Ordering::Acquire)
+    }
+
+    /// Outstanding control debt in bytes: the part of the
+    /// unconditional control debits on this stream that
+    /// `tx_credit_remaining` could not pay for.
+    ///
+    /// Non-zero means the application window is closed *and* owes
+    /// bytes — the next grant retires this before it reopens
+    /// application credit. Zero on a stream that has never
+    /// overdrawn, which is every stream carrying application traffic
+    /// alone.
+    #[inline]
+    pub fn tx_overdraft(&self) -> u64 {
+        self.overdraft.load(Ordering::Acquire)
     }
 
     /// Record that the receiver side has accepted `bytes` off the
