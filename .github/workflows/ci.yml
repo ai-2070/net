@@ -5139,30 +5139,30 @@ jobs:
           # twelve lifecycle tests could vanish and the job would stay
           # green. Every name is pinned, exactly as the leaf and
           # anchorless rosters are.
-          for witness in a_promoted_tab_becomes_the_leader_and_serves_its_followers \
-                         a_follower_call_is_proxied_through_the_leader \
-                         a_follower_call_surfaces_the_leaders_typed_failure \
-                         a_follower_stream_is_proxied_bidirectionally \
-                         a_leader_that_goes_away_is_replaced_by_a_follower \
-                         a_replacement_leader_serves_the_surviving_followers \
-                         an_in_flight_call_across_a_leader_change_fails_indeterminate \
-                         a_call_after_the_change_reaches_the_new_leader \
-                         a_stale_generations_proxy_frame_is_refused \
-                         the_lock_is_released_when_the_leader_retires \
-                         a_follower_that_never_sees_a_leader_surfaces_no_leader \
-                         two_tabs_cannot_both_hold_the_leader_lock \
-                         a_followers_capabilities_are_announced_by_the_leader \
-                         a_departed_followers_capabilities_are_withdrawn \
-                         the_leaders_identity_survives_a_generation_change \
-                         a_followers_subscription_is_carried_by_the_leader \
-                         an_unroutable_follower_call_fails_typed_not_silently \
-                         a_second_promotion_does_not_duplicate_the_announcement \
-                         closing_a_promoting_tab_cancels_its_parked_bootstrap_and_frees_the_lock \
-                         a_promotion_whose_generation_transaction_fails_requeues_instead_of_stranding_the_tab \
-                         a_leaders_own_announcement_keeps_its_followers_capabilities \
-                         the_last_capability_declaring_followers_tag_is_withdrawn \
+          for witness in a_custodial_identity_is_used_verbatim_and_never_stored \
+                         a_follower_call_expires_on_its_own_deadline_as_an_indeterminate_outcome \
                          a_follower_call_without_a_timeout_expires_on_the_leafs_default_deadline \
-                         an_explicitly_retired_leader_goes_quiet_at_its_peer_while_its_page_stays_alive; do
+                         a_leader_revalidates_its_generation_against_the_store_and_stands_down \
+                         a_leaders_own_announcement_keeps_its_followers_capabilities \
+                         a_promotion_whose_backend_fails_reattaches_instead_of_stranding_the_tab \
+                         a_promotion_whose_generation_transaction_fails_requeues_instead_of_stranding_the_tab \
+                         a_retained_stream_handle_cannot_address_a_same_id_successor \
+                         a_runtime_announcement_is_restored_by_the_promoted_tab \
+                         a_superseded_session_is_refused_by_the_leader_and_by_storage \
+                         a_tampered_identity_record_does_not_decrypt \
+                         an_aborted_generation_transaction_is_a_typed_failure_and_moves_nothing \
+                         an_attach_during_the_initial_backend_await_is_replayed \
+                         an_explicitly_retired_leader_goes_quiet_at_its_peer_while_its_page_stays_alive \
+                         closing_a_promoting_tab_cancels_its_parked_bootstrap_and_frees_the_lock \
+                         closing_a_tab_during_its_promotion_never_publishes_a_lock_holding_leader \
+                         closing_the_leader_promotes_a_follower_fails_its_calls_and_restores_its_channels \
+                         standing_down_fences_then_retires_the_node_then_releases_the_lock \
+                         the_generation_counter_is_monotonic_and_fences_a_stale_holder \
+                         the_last_capability_declaring_followers_tag_is_withdrawn \
+                         the_stored_identity_is_stable_and_encrypted_under_a_non_extractable_key \
+                         the_wrapping_key_refuses_export \
+                         two_concurrent_first_creations_converge_on_one_identity \
+                         two_sessions_share_one_identity_without_evicting_each_other; do
             grep -q "^test $witness \.\.\. ok$" /tmp/wasm_leader.log || {
               echo "::error::the leader lifecycle witness $witness did not run and pass inside wasm"
               exit 1
