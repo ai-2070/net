@@ -5042,6 +5042,18 @@ jobs:
             kyra_control_debit_below_window_control
             kyra_expired_acknowledged_partial_delivers_or_fails_typed
             kyra_unexpired_partial_delivery_control
+            kyra_promotion_lossfree_control
+            kyra_promotion_delayed_packet_still_delivers_control
+            kyra_promotion_lost_reliable_boundary_delivers_or_fails
+            kyra_promotion_wire_ack_does_not_claim_missing_sequence
+            kyra_promotion_past_lost_faf_boundary_settles_consumer
+            kyra_reliable_fragment_head_promotes_consumer_before_faf_tail_traffic
+            kyra_faf_fragment_loss_does_not_kill_following_faf_messages
+            kyra_explicit_epoch_debit_replacement_control
+            kyra_implicit_epoch_debit_cannot_rewind_successor
+            kyra_large_cumulative_grant_retires_all_control_debt
+            kyra_deadline_shaped_application_bytes_other_route_control
+            kyra_deadline_shaped_application_bytes_matching_route_are_data
           "
           set -o pipefail
           # A pin that names nothing can never be satisfied and reads
@@ -5052,6 +5064,7 @@ jobs:
             --source tests/kyra_review.rs \
             --source tests/kyra_followup.rs \
             --source tests/kyra_round2_review.rs \
+            --source tests/kyra_round3_review.rs \
             $REQUIRED
           # No `--test` form: the integration-test pin guard
           # inventories the root crate's `tests/`, and the leaf is
@@ -5065,7 +5078,7 @@ jobs:
             grep -q "^test $required \.\.\. ok$" /tmp/kyra-review.log || {
               echo "::error::Kyra's probe $required did not run and pass"; exit 1; }
           done
-          echo "Kyra's Stage 5 probes: 30/30"
+          echo "Kyra's Stage 5 probes: 42/42"
 
       - name: Native tests (the sans-IO half)
         run: |
