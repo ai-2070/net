@@ -4,7 +4,7 @@
 //
 //   POST https://<anchor>/rtc/offer   (the real Stage 4b listener)
 //   wss  https://<anchor>/rtc/trickle (candidates both ways)
-//   RTCDataChannel "net", ordered:false, maxRetransmits:0
+//   RTCDataChannel "net", ordered:true, reliable (the leaf's own)
 //   NKpsk0 as initiator, against the key the CREDENTIAL pins
 //   every packet built and sealed by net-mesh-wire compiled to wasm
 //
@@ -78,6 +78,76 @@ function waitOpen(dc) {
   });
 }
 
+/// One candidate, reduced to the facts the mDNS verdict needs:
+/// its TYPE (`host` / `srflx` / `prflx` / `relay`), whether the
+/// address is an obfuscated `.local` name, and when it appeared.
+///
+/// `RTCIceCandidate` exposes `type`/`address`/`port`/`protocol`
+/// directly; the SDP line is parsed only for the fields an engine
+/// leaves null. Accepts either an `RTCIceCandidate` or a bare
+/// candidate line (the anchor's, which arrives as a string).
+function describeCandidate(candidate, ms) {
+  const line = typeof candidate === 'string' ? candidate : candidate.candidate || '';
+  const tok = line.split(' ');
+  const typ = tok.indexOf('typ');
+  const obj = typeof candidate === 'string' ? {} : candidate;
+  const address = obj.address || (typ > 0 ? tok[typ - 2] : null);
+  return {
+    type: obj.type || (typ > 0 ? tok[typ + 1] : null),
+    address,
+    port: obj.port || (typ > 0 ? Number(tok[typ - 1]) : null),
+    protocol: obj.protocol || tok[2] || null,
+    mdns: !!address && address.endsWith('.local'),
+    ms,
+  };
+}
+
+/// The selected candidate pair with both halves resolved, or
+/// `null` when `getStats()` reports none.
+///
+/// ONE implementation, used by the `stats` step and by the
+/// snapshot a FAILED attempt takes before it settles its handles.
+/// A pair that formed and then lost its session is still evidence
+/// about ICE, and discarding it is what made a `noise msg2`
+/// timeout read as "NO candidate pair formed" in the mDNS verdict.
+async function selectedPair(pc) {
+  if (!pc) return null;
+  let report;
+  try {
+    report = await pc.getStats();
+  } catch (e) {
+    return null;
+  }
+  const byId = new Map();
+  report.forEach((r) => byId.set(r.id, r));
+  let pair = null;
+  report.forEach((r) => {
+    if (r.type === 'candidate-pair' && (r.selected || r.nominated || r.state === 'succeeded')) {
+      if (!pair || r.state === 'succeeded') pair = r;
+    }
+  });
+  if (!pair) return null;
+  const local = byId.get(pair.localCandidateId) || {};
+  const remote = byId.get(pair.remoteCandidateId) || {};
+  return {
+    state: pair.state,
+    nominated: !!pair.nominated,
+    local: {
+      type: local.candidateType,
+      protocol: local.protocol,
+      address: local.address,
+      port: local.port,
+      relatedAddress: local.relatedAddress,
+    },
+    remote: {
+      type: remote.candidateType,
+      protocol: remote.protocol,
+      address: remote.address,
+      port: remote.port,
+    },
+  };
+}
+
 /// Close every handle one attempt owns: the DataChannel, the
 /// trickle socket and the `RTCPeerConnection`.
 ///
@@ -147,6 +217,11 @@ async function connectAttempt(step, stage) {
     inflight.ws = null;
     return r;
   } catch (e) {
+    // **The pair is read BEFORE the handles are settled.** Closing
+    // the `RTCPeerConnection` empties `getStats()`, so an attempt
+    // that failed downstream of ICE — a lost Noise msg1, say —
+    // used to report nothing about the pair it had already formed.
+    if (stage) stage.selected = await selectedPair(inflight.pc);
     settleHandles(step.session, inflight.pc, inflight.dc, inflight.ws);
     inflight.pc = null;
     inflight.dc = null;
@@ -168,7 +243,17 @@ async function doConnect(step, stage) {
   const t0 = performance.now();
   const iceServers = step.stun ? [{ urls: step.stun }] : [];
   const pc = new RTCPeerConnection({ iceServers });
-  const dc = pc.createDataChannel('net', { ordered: false, maxRetransmits: 0 });
+  // **The channel the leaf ships.** `RtcLeafTransport::create_offer`
+  // sets `ordered: true` and leaves the channel RELIABLE, and says
+  // why: Net's own reliability rides inside, and reorder at the
+  // packet level is what the AEAD replay window refuses. This page
+  // used `{ ordered: false, maxRetransmits: 0 }` — a channel that
+  // NEVER retransmits — and then sent the single Noise msg1
+  // datagram on it. One lost packet on a loaded runner was
+  // therefore unrecoverable, and surfaced as `timeout: noise
+  // msg2`, i.e. as the anchor's fault. The witness has to model the
+  // transport that ships, not a lossier one.
+  const dc = pc.createDataChannel('net', { ordered: true });
   const q = messageQueue(dc);
   // R7 settlement: publish the handles as they come into
   // existence, so `connectAttempt` can retire them if this attempt
@@ -186,10 +271,23 @@ async function doConnect(step, stage) {
   // Candidates raised before the dialog id exists are buffered.
   const outbox = [];
   let sendCandidate = (line, mid) => outbox.push([line, mid]);
+  // The candidate types this attempt GATHERED, and the ICE state
+  // timeline, both recorded with timings. A failed attempt reports
+  // them (see `connectAttempt`), so the next occurrence is
+  // diagnosable from the log alone: whether the engine produced a
+  // reflexive candidate at all on this interface, whether the host
+  // candidate was an obfuscated `.local` name, and when the check
+  // succeeded relative to the anchor's peer-reflexive learn.
+  st.local_candidates = [];
+  st.remote_candidates = [];
+  st.ice = [];
+  const at = () => Math.round(performance.now() - t0);
   pc.onicegatheringstatechange = () =>
     log('[cand ' + step.session + '] gathering=' + pc.iceGatheringState);
-  pc.oniceconnectionstatechange = () =>
+  pc.oniceconnectionstatechange = () => {
+    st.ice.push({ state: pc.iceConnectionState, ms: at() });
     log('[cand ' + step.session + '] iceConnectionState=' + pc.iceConnectionState);
+  };
   pc.onicecandidateerror = (ev) =>
     log(
       '[cand ' + step.session + '] ERROR url=' + ev.url + ' code=' + ev.errorCode + ' ' +
@@ -200,6 +298,7 @@ async function doConnect(step, stage) {
       log('[cand ' + step.session + '] -> end-of-candidates');
       return;
     }
+    st.local_candidates.push(describeCandidate(ev.candidate, at()));
     log('[cand ' + step.session + '] -> ' + ev.candidate.candidate);
     sendCandidate(ev.candidate.candidate, ev.candidate.sdpMid || '0');
   };
@@ -224,6 +323,7 @@ async function doConnect(step, stage) {
 
   await pc.setRemoteDescription({ type: 'answer', sdp: body.sdp });
   if (body.candidate) {
+    st.remote_candidates.push(describeCandidate(body.candidate, at()));
     await log('[cand ' + step.session + '] <- anchor (offer body) ' + body.candidate);
     try {
       await pc.addIceCandidate({ candidate: body.candidate, sdpMid: '0', sdpMLineIndex: 0 });
@@ -258,6 +358,7 @@ async function doConnect(step, stage) {
     try {
       const msg = JSON.parse(ev.data);
       if (msg.type === 'candidate' && msg.candidate) {
+        st.remote_candidates.push(describeCandidate(msg.candidate, at()));
         await log('[cand ' + step.session + '] <- anchor ' + msg.candidate);
         await pc.addIceCandidate({
           candidate: msg.candidate,
@@ -290,11 +391,13 @@ async function doConnect(step, stage) {
   await withTimeout(waitOpen(dc), step.timeout_ms, 'datachannel open');
   st.dc_open = true;
   const openMs = performance.now() - t0;
+  st.dc_open_ms = Math.round(openMs);
 
   const ep = new LeafEndpoint(step.psk, step.anchor_pub, step.node_id, step.anchor_node_id);
   st.noise_constructed = true;
   dc.send(ep.msg1_packet());
   st.msg1_sent = true;
+  st.msg1_sent_ms = at();
   const pkt = await q.next(step.timeout_ms, 'noise msg2');
   st.msg2_received = true;
   ep.read_msg2_packet(pkt);
@@ -414,7 +517,22 @@ async function execute(step) {
               'authenticating msg2 ever arrived: ' + f,
         };
       }
-      return await connectAttempt(step, {});
+      // A connect reports its stage whether it succeeded or not.
+      // The exception alone says only where the wait expired; the
+      // stage says what the engine gathered, when the check
+      // succeeded, and which pair carried it — the difference
+      // between "no pair formed" and "a pair formed and something
+      // after it went wrong". On the passing path the same record
+      // is what the mDNS verdict quotes as its own baseline.
+      const stage = {};
+      try {
+        const r = await connectAttempt(step, stage);
+        r.stage = stage;
+        return r;
+      } catch (e) {
+        stage.failure = e.message || String(e);
+        return { ok: false, error: stage.failure, stage };
+      }
     }
 
     case 'send': {
@@ -578,38 +696,9 @@ async function execute(step) {
     case 'stats': {
       const s = sessions.get(step.session);
       if (!s) return { ok: false, error: 'no session ' + step.session };
-      const report = await s.pc.getStats();
-      const byId = new Map();
-      report.forEach((r) => byId.set(r.id, r));
-      let pair = null;
-      report.forEach((r) => {
-        if (r.type === 'candidate-pair' && (r.selected || r.nominated || r.state === 'succeeded')) {
-          if (!pair || r.state === 'succeeded') pair = r;
-        }
-      });
+      const pair = await selectedPair(s.pc);
       if (!pair) return { ok: true, stats: { selected: null } };
-      const local = byId.get(pair.localCandidateId) || {};
-      const remote = byId.get(pair.remoteCandidateId) || {};
-      return {
-        ok: true,
-        stats: {
-          state: pair.state,
-          nominated: !!pair.nominated,
-          local: {
-            type: local.candidateType,
-            protocol: local.protocol,
-            address: local.address,
-            port: local.port,
-            relatedAddress: local.relatedAddress,
-          },
-          remote: {
-            type: remote.candidateType,
-            protocol: remote.protocol,
-            address: remote.address,
-            port: remote.port,
-          },
-        },
-      };
+      return { ok: true, stats: pair };
     }
 
     case 'idle':

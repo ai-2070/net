@@ -610,9 +610,28 @@ to `Output::Timeout` before the next mutation. The driver therefore pops one
 queued packet per `Channel::write` + drain; the per-peer queue is the only
 cross-task structure and is consumed only by the driver.
 
-### 3. One Net packet per DataChannel message; unordered, zero-retransmit; Net's reliability stays authoritative
+### 3. One Net packet per DataChannel message; ORDERED and reliable, with Net's reliability still authoritative above it
 
-Channels open with `ordered: false, maxRetransmits: 0` on both sides.
+**Superseded by what shipped.** This section originally specified
+`ordered: false, maxRetransmits: 0` on both sides. The shipping leaf
+opens the channel `ordered: true` and reliable
+(`leaf/src/rtc.rs`), and the reason is in the code: the AEAD replay
+window refuses packet-level reorder, so an unordered channel turns a
+reordered datagram into a dropped one. The Noise handshake settles
+it — `msg1`/`msg2` are `build_handshake` packets OUTSIDE the
+reliable-stream machinery, so `reliability.rs` cannot retransmit
+them and SCTP's retransmission is their ONLY recovery. With
+`maxRetransmits: 0` a single lost handshake datagram is terminal.
+That is not hypothetical: the Stage 5 browser harness was still
+modelling this section's transport, and one lost datagram on a
+routable interface surfaced as a Chromium-only `mdns_on_pair_formed`
+failure in CI run 34930600190 — reproduced locally by dropping
+exactly one inbound datagram, and fixed by opening the channel the
+way the leaf does.
+
+The bullets below remain correct with SCTP retransmission underneath
+rather than removed: Net's reliability stays authoritative for
+streams, and SCTP recovers the handshake that Net cannot.
 
 - `Reliability::Reliable` streams get NACK-driven retransmission from
   `reliability.rs`, identical to UDP. No retransmission stacking, no

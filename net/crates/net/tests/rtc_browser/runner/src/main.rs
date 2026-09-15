@@ -1520,6 +1520,189 @@ async fn main() {
     std::process::exit(code);
 }
 
+// ===================================================================
+// The mDNS probe's transport evidence
+// ===================================================================
+
+/// What the ANCHOR saw of one attempt's pair, sampled while the
+/// attempt was still running.
+///
+/// The anchor's `selected_pair` is addressed through the peer's
+/// mesh endpoint, and a failed attempt settles its handles before
+/// the step returns — so an after-the-fact read reports nothing
+/// whether the anchor had answered this peer for ten seconds or had
+/// never heard from it. Those are opposite diagnoses.
+///
+/// **What this does and does not establish.** The mesh endpoint
+/// exists once the Noise handshake completes, so a readable pair
+/// says the handshake completed and names the address str0m
+/// transmits to plus `learned` — `signalled` or `peer-reflexive` —
+/// which is the substantive mDNS fact. It does NOT timestamp the
+/// instant str0m learned that address; the instant the check
+/// succeeded is the browser's `connected` timing, and for an
+/// obfuscated `.local` candidate with nothing but the anchor's own
+/// host address signalled, a check that succeeded at all can only
+/// have succeeded peer-reflexively.
+#[derive(Default, Clone)]
+struct AnchorWatch {
+    /// ms from the start of the attempt to the anchor holding a
+    /// mesh endpoint for this peer — i.e. to the handshake landing.
+    endpoint_ms: Option<u128>,
+    /// ms to the pair becoming readable, sampled. An upper bound on
+    /// the handshake, not the address learn.
+    learned_ms: Option<u128>,
+    /// `local=… remote=… learned=signalled|peer-reflexive`.
+    pair: Option<String>,
+}
+
+impl AnchorWatch {
+    fn describe(&self) -> String {
+        let endpoint = match self.endpoint_ms {
+            Some(ms) => format!("mesh peer @{ms}ms"),
+            None => "never installed a mesh peer for this node".into(),
+        };
+        match (&self.pair, self.learned_ms) {
+            (Some(pair), Some(ms)) => format!("{pair}, readable by @{ms}ms ({endpoint})"),
+            // Said explicitly, because the tempting misreading is
+            // "the anchor never learned the peer-reflexive address".
+            _ => format!(
+                "pair NOT readable — {endpoint} — so the handshake did not complete; \
+                 this says nothing about whether the pair formed, which the browser \
+                 half above answers"
+            ),
+        }
+    }
+}
+
+/// Sample the anchor's half of one attempt, every 20 ms, until
+/// `stop`.
+///
+/// `learned` is str0m's own account of where the remote address came
+/// from: `peer-reflexive` means it was discovered from the peer's
+/// inbound binding request and the signalling contributed nothing,
+/// which is exactly the mechanism a browser hiding its host IPs
+/// behind `<uuid>.local` depends on.
+async fn watch_anchor_pair(node: Arc<MeshNode>, peer: u64, stop: Arc<AtomicBool>) -> AnchorWatch {
+    let t0 = std::time::Instant::now();
+    let mut watch = AnchorWatch::default();
+    while !stop.load(Ordering::Relaxed) {
+        if let Some(PeerAddr::Rtc(id)) = node.peer_endpoint(peer) {
+            if watch.endpoint_ms.is_none() {
+                watch.endpoint_ms = Some(t0.elapsed().as_millis());
+            }
+            if let Some(driver) = node.rtc_driver() {
+                if let Some((local, remote, learned)) = driver.selected_pair(id).await {
+                    watch.learned_ms = Some(t0.elapsed().as_millis());
+                    watch.pair = Some(format!("local={local} remote={remote} learned={learned}"));
+                    return watch;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    watch
+}
+
+/// The candidate TYPES one side produced, in the order they
+/// appeared: `host mdns <uuid>.local:51829 @2ms`.
+///
+/// This is what tells a reflexive candidate that never existed
+/// apart from a pair that formed and then lost its session — the
+/// two mechanisms an mDNS-on failure can have, and a bare verdict
+/// cannot distinguish them.
+fn candidate_types(list: Option<&serde_json::Value>) -> String {
+    let Some(items) = list.and_then(serde_json::Value::as_array) else {
+        return "<not recorded>".into();
+    };
+    if items.is_empty() {
+        return "NONE gathered".into();
+    }
+    items
+        .iter()
+        .map(|c| {
+            let text = |k: &str| c.get(k).and_then(serde_json::Value::as_str).unwrap_or("?");
+            let num = |k: &str| c.get(k).and_then(serde_json::Value::as_u64);
+            format!(
+                "{} {}{}:{} @{}ms",
+                text("type"),
+                if c.get("mdns") == Some(&serde_json::Value::Bool(true)) {
+                    "mdns "
+                } else {
+                    ""
+                },
+                text("address"),
+                num("port").map_or_else(|| "?".into(), |p| p.to_string()),
+                num("ms").unwrap_or_default(),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `checking@7ms connected@11ms disconnected@12748ms` — when the
+/// connectivity check actually succeeded, and whether the pair then
+/// went away.
+fn ice_timeline(list: Option<&serde_json::Value>) -> String {
+    let Some(items) = list.and_then(serde_json::Value::as_array) else {
+        return "<not recorded>".into();
+    };
+    if items.is_empty() {
+        return "no state change".into();
+    }
+    items
+        .iter()
+        .map(|s| {
+            format!(
+                "{}@{}ms",
+                s.get("state")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?"),
+                s.get("ms")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default(),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// One attempt's transport evidence, on one line: the candidate
+/// types each side produced, the ICE state timeline, when the
+/// DataChannel opened and msg1 left, the pair `getStats()`
+/// selected, and the anchor's half.
+///
+/// Recorded for a FAILED attempt as well as a passing one, which is
+/// the point: the next occurrence has to be diagnosable from the
+/// log without a re-run. Reading it, `ice connected@Nms` with only
+/// an obfuscated `.local` candidate gathered is the peer-reflexive
+/// learn — nothing else could have made that check succeed — and a
+/// failure after it is a failure downstream of ICE.
+fn attempt_evidence(stage: Option<&serde_json::Value>, watch: &AnchorWatch) -> String {
+    let field = |k: &str| stage.and_then(|s| s.get(k));
+    let mut out = format!(
+        "browser gathered [{}]; anchor signalled [{}]; ice {}",
+        candidate_types(field("local_candidates")),
+        candidate_types(field("remote_candidates")),
+        ice_timeline(field("ice")),
+    );
+    match field("dc_open_ms").and_then(serde_json::Value::as_u64) {
+        Some(ms) => out.push_str(&format!("; datachannel open @{ms}ms")),
+        None => out.push_str("; datachannel NEVER opened"),
+    }
+    if let Some(ms) = field("msg1_sent_ms").and_then(serde_json::Value::as_u64) {
+        out.push_str(&format!("; noise msg1 sent @{ms}ms"));
+    }
+    // Only a FAILED attempt snapshots `getStats()` itself — a
+    // passing one is read by the `Stats` step, which the verdict
+    // already quotes. Printing "<none>" for the passing case would
+    // be an absence the page never reported.
+    if let Some(selected) = field("selected").filter(|v| !v.is_null()) {
+        out.push_str(&format!("; browser selected at failure {selected}"));
+    }
+    out.push_str(&format!("; anchor {}", watch.describe()));
+    out
+}
+
 #[expect(clippy::too_many_lines, reason = "one linear harness script")]
 async fn run(
     root: &Path,
@@ -1927,6 +2110,12 @@ async fn run(
         /// The anchor's own transmit destination for this peer.
         anchor_pair: Option<String>,
         open_ms: f64,
+        /// Everything the attempt's transport left behind, pass or
+        /// fail: candidate types per side, the ICE timeline, the
+        /// selected pair, and when the anchor learned where to
+        /// answer. The verdict carries this instead of a bare
+        /// "no pair formed".
+        transport: String,
     }
     let mut pair_evidence: Vec<PairEvidence> = Vec::new();
 
@@ -2006,6 +2195,17 @@ async fn run(
         } else {
             &anchor
         };
+        // The anchor's half is sampled WHILE the attempt runs. A
+        // failed attempt has closed its `RTCPeerConnection` and the
+        // anchor's session is gone by the time the step returns, so
+        // an after-the-fact read cannot tell "the anchor learned the
+        // peer and answered" from "the anchor never heard from it".
+        let stop = Arc::new(AtomicBool::new(false));
+        let watching = tokio::spawn(watch_anchor_pair(
+            Arc::clone(node),
+            probe.node_id,
+            Arc::clone(&stop),
+        ));
         let r = script
             .run(Step::Connect {
                 id: 0,
@@ -2021,9 +2221,12 @@ async fn run(
                 expect_failure: false,
             })
             .await;
+        stop.store(true, Ordering::Relaxed);
+        let watch = watching.await.unwrap_or_default();
+        let transport = attempt_evidence(r.stage.as_ref(), &watch);
         if !r.ok {
             mdns_lines.push(format!(
-                "{}: NO PAIR — {}",
+                "{}: NO PAIR — {}; {transport}",
                 probe.label,
                 r.error.clone().unwrap_or_else(|| "unknown".into())
             ));
@@ -2032,9 +2235,21 @@ async fn run(
                 interface: probe.interface.clone(),
                 mdns_on: mdns_on_for_measurement,
                 session: false,
-                browser_pair: None,
-                anchor_pair: None,
+                // The pair the attempt DID form, snapshotted by the
+                // page before it settled its handles. It cannot
+                // satisfy the verdict — that needs `session` — and
+                // it is the difference between a mechanism that
+                // never reached the interface and one that failed
+                // after it did.
+                browser_pair: r
+                    .stage
+                    .as_ref()
+                    .and_then(|s| s.get("selected"))
+                    .filter(|v| v.get("state").is_some())
+                    .cloned(),
+                anchor_pair: watch.pair.clone(),
                 open_ms: f64::NAN,
+                transport,
             });
             continue;
         }
@@ -2077,7 +2292,8 @@ async fn run(
             .clone()
             .unwrap_or_else(|| "<no transmit destination recorded yet>".into());
         mdns_lines.push(format!(
-            "{}: PAIR FORMED in {:.0} ms; browser getStats {browser_pair}; anchor {anchor_pair}",
+            "{}: PAIR FORMED in {:.0} ms; browser getStats {browser_pair}; anchor \
+             {anchor_pair}; {transport}",
             probe.label,
             r.open_ms.unwrap_or(f64::NAN)
         ));
@@ -2089,6 +2305,7 @@ async fn run(
             browser_pair: browser_selected,
             anchor_pair: anchor_selected,
             open_ms: r.open_ms.unwrap_or(f64::NAN),
+            transport,
         });
     }
 
@@ -2159,7 +2376,7 @@ async fn run(
         let detail = match formed {
             Some(e) => format!(
                 "interface={} pair=browser{} anchor[{}] — probe {} formed in {:.0} ms with \
-                 the engine's host-address obfuscation ON (no opt-out flag or pref passed)",
+                 the engine's host-address obfuscation ON (no opt-out flag or pref passed); {}",
                 e.interface,
                 e.browser_pair
                     .as_ref()
@@ -2168,12 +2385,24 @@ async fn run(
                 e.anchor_pair.clone().unwrap_or_default(),
                 e.label,
                 e.open_ms,
+                e.transport,
             ),
+            // The gate is unchanged — a pair, a session, both
+            // halves named, on the routable interface. What changed
+            // is that the failure now SAYS which mechanism it was.
+            // It used to assert one ("an mDNS client on the anchor
+            // is required"), and that is only one of the two
+            // mechanisms. The discriminator is the browser's ice
+            // timeline against what it gathered.
             None => format!(
-                "NO candidate pair formed with the engine's host-address obfuscation ON{}. \
-                 Evidence per probe: [{}]. The diagnostic sweep above CANNOT satisfy \
-                 this verdict; an mDNS client on the anchor (the plan's answer (c)) is \
-                 required on this host.",
+                "no probe formed a pair that carried a session with the engine's \
+                 host-address obfuscation ON{}. The diagnostic sweep above CANNOT satisfy \
+                 this verdict. Evidence per probe — the discriminator is `ice` against \
+                 `browser gathered`: a `connected@Nms` reached with nothing but an \
+                 obfuscated `.local` candidate IS the peer-reflexive learn, so a failure \
+                 after that instant is downstream of ICE and not the anchor's mDNS \
+                 support; no `connected` at all, or no candidate but `.local` with no \
+                 pair, is the anchor-side mDNS question: [{}]",
                 if want_interface {
                     format!(" on the routable interface {lan_iface}")
                 } else {
@@ -2182,15 +2411,16 @@ async fn run(
                 pair_evidence
                     .iter()
                     .map(|e| format!(
-                        "{}: mdns_on={} session={} browser_pair={} anchor_pair={}",
+                        "{}: mdns_on={} session={} browser_pair={} anchor_pair={} — {}",
                         e.label,
                         e.mdns_on,
                         e.session,
                         e.browser_pair.is_some(),
-                        e.anchor_pair.is_some()
+                        e.anchor_pair.is_some(),
+                        e.transport,
                     ))
                     .collect::<Vec<_>>()
-                    .join("; ")
+                    .join(" | ")
             ),
         };
         ledger.record("mdns_on_pair_formed", formed.is_some(), detail);
