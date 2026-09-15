@@ -552,7 +552,20 @@ async fn two_leaves_reach_one_direct_session_through_a_carrier_that_relays_no_pa
     .await;
 
     let meta = EventMeta::from_bytes(&request).expect("the request carries an EventMeta");
-    let route = rpc_wire::decode_route(&request).expect("the request carries its route");
+    // **The route a RESPONSE carries is the REPLY channel's
+    // canonical hash, not the request's** — `mesh_rpc.rs` stamps
+    // exactly that on every server-to-caller frame, and R2 matches
+    // the pending entry against it. This witness previously echoed
+    // the REQUEST's route back, which a native responder never does;
+    // the mock was under-specified, and R2 is what surfaced it.
+    let _request_route = rpc_wire::decode_route(&request).expect("the request carries its route");
+    let reply_channel = format!(
+        "echo.replies.{:016x}",
+        a.node.borrow().identity().origin_hash()
+    );
+    let route = net_leaf::Channel::new(&reply_channel)
+        .expect("the reply channel is a valid name")
+        .canonical();
     let reply = response_frame(
         b.node.borrow().identity().origin_hash(),
         meta.seq_or_ts,
@@ -566,10 +579,6 @@ async fn two_leaves_reach_one_direct_session_through_a_carrier_that_relays_no_pa
     // correctly ignored. The canonical route is
     // `<service>.replies.<caller origin>`, which is what the caller
     // subscribed to when it issued the call.
-    let reply_channel = format!(
-        "echo.replies.{:016x}",
-        a.node.borrow().identity().origin_hash()
-    );
     b.node
         .borrow_mut()
         .publish(an, &reply_channel, &reply)

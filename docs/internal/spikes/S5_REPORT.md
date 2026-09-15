@@ -474,6 +474,32 @@ restore `close_stream` → the anchor loses its own stream). This is
 R3's native-window closure arriving through the witness that demanded
 it rather than as a separate exercise.
 
+### Two things the first repair push got wrong, and what they say
+
+**The dispatched-subprotocol table was not feature-aware.** R3's
+accounting hoist has to know which subprotocols this node dispatches,
+and the first list named `traversal`, `sensing`, `redex`, `meshdb`,
+`fold` and `blob` unconditionally — modules that exist only under
+their own features. Default and `webrtc` builds were fine; the narrow
+configurations (`--no-default-features --features net` and the six
+FFI shims) failed to compile. Each gated entry now sits behind its
+own `cfg`, and the 13-configuration matrix from `ci.yml` is part of
+what gets run before a push rather than after.
+
+**R2's witness set was incomplete — in the tests, not in
+production.** Kyra's `kyra_same_peer_wrong_reply_route_cannot_complete
+_call` passes because it constructs a reply carrying a route that is
+genuinely wrong. The anchorless wasm witness then failed at the real
+path, and the reason is worth stating: it echoed the REQUEST's route
+back on the response, which no native responder does —
+`mesh_rpc.rs` stamps the REPLY channel's canonical hash on every
+server-to-caller frame, and R2 matches against exactly that. So the
+production side was right and the mock was under-specified; R2 is
+what surfaced it. The witness now stamps the reply route the way the
+native responder does, and the discriminating case (a responder
+stamping the request route completes nothing) is precisely Kyra's
+wrong-route probe, which is why production needed no change.
+
 ### Secondary audit notes, adjudicated
 
 - **Credential `Debug` in the leaf** — redacted with the same

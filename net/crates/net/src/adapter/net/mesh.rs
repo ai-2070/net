@@ -29769,10 +29769,6 @@ impl MeshNode {
             super::behavior::broadcast::SUBPROTOCOL_CAPABILITY_ANN,
             super::behavior::broadcast::SUBPROTOCOL_ROUTE_WITHDRAW,
             super::behavior::broadcast::SUBPROTOCOL_SCOPED_CAPABILITY_ANN,
-            super::traversal::SUBPROTOCOL_REFLEX,
-            super::traversal::SUBPROTOCOL_RENDEZVOUS,
-            sensing::SUBPROTOCOL_SENSING_INTEREST,
-            sensing::SUBPROTOCOL_READINESS_ATTESTATION,
         ];
         ACCOUNTED.contains(&subprotocol_id)
             || Self::accounts_inbound_subprotocol_gated(subprotocol_id)
@@ -29780,6 +29776,18 @@ impl MeshNode {
 
     /// The feature-gated half of [`Self::accounts_inbound_subprotocol`].
     fn accounts_inbound_subprotocol_gated(subprotocol_id: u16) -> bool {
+        // Each of these modules exists only under its own feature,
+        // so naming them in the unconditional table above made the
+        // narrow configurations fail to compile (`E0433` on
+        // `traversal` in a `--no-default-features --features net`
+        // build). A `cfg`-gated arm per feature is the form that
+        // survives the narrow-config matrix.
+        #[cfg(feature = "nat-traversal")]
+        if subprotocol_id == super::traversal::SUBPROTOCOL_REFLEX
+            || subprotocol_id == super::traversal::SUBPROTOCOL_RENDEZVOUS
+        {
+            return true;
+        }
         #[cfg(feature = "webrtc")]
         if subprotocol_id == super::rtc::SUBPROTOCOL_RTC_SIGNAL {
             return true;
