@@ -421,10 +421,35 @@ with a typed `StreamError::EventTooLarge { size, limit }` that NAMES
 the limit. The refusal happens before the peer is resolved, before a
 sequence is consumed, and it is whole — the fitting prefix of a mixed
 batch does not reach the wire either. `MAX_EVENT_SIZE` is re-exported
-from `net::adapter::net` so a caller can check before sending, and the
-bound is mirrored through every binding (`SdkError::EventTooLarge`,
-`NET_ERR_MESH_EVENT_TOO_LARGE = -118`, a Node `Error` and a Python
-`ValueError`, each carrying size and limit).
+from `net::adapter::net` so a caller can check before sending.
+
+**The bindings, stated per language, because "mirrored through every
+binding" was not true when it was written.** Rust keeps
+`SdkError::EventTooLarge { size, limit }`. Node rejects with a plain
+`Error` — deliberately not one of the prefix-sniffable classes,
+which route to a retry or a reconnect — whose message names size and
+limit. Python raises `ValueError`, not a transport error, with the
+same two numbers. C returns `NET_ERR_MESH_EVENT_TOO_LARGE = -118`.
+
+**Go was the hole, and it is now closed.** `meshErrorFromCode` went
+from `-117` straight to `-130`: every oversize send surfaced as
+`mesh unknown error (code -118)`, untypeable and indistinguishable
+from a variant the binding predates. The header also promised a
+"detail string" that no send function has ever returned, and the C
+ABI's `int` return discarded the error's `size` and `limit`
+outright. Closure: a `net.ErrEventTooLarge` sentinel, an
+`*EventTooLargeError{Size, Limit}` that wraps it so `errors.Is` and
+`errors.As` both work, and a new export `net_mesh_max_event_size()`
+— because `size` is an element of the caller's own `lens` array but
+`limit` is a build constant of the linked cdylib that a caller could
+otherwise discover only by being refused. The Go arm reads
+`C.NET_ERR_MESH_EVENT_TOO_LARGE` from the header cgo compiles rather
+than a transcribed literal, so a renumbered enum is a compile error
+rather than another silent unknown. The false detail-string promise
+is deleted from both headers and replaced by the accessor. Nothing
+about the preflight moved: it stays inside `send_on_stream`, and the
+nRPC and channel-publication paths that bypass that function are
+untouched and separately scoped.
 
 Round 3's ABI evidence lane measured this direction rather than
 assuming it, and found the defect it was built to find: a 32 KiB
@@ -929,13 +954,33 @@ twenty-four names I had pinned did not exist. A pin that names
 nothing can never be satisfied, and when it fails it reads exactly
 like a witness that regressed.
 
-`.github/scripts/check-roster.py` makes that class impossible: every
-roster is checked against its SOURCE before the suite runs (`fn
-<name>(` for Rust, a quoted literal for harness witnesses), and the
-by-name log check still runs afterwards. They are complements —
-*pinned but absent from source* is caught up front, *present but did
-not run* is caught after. All four rosters are wired: leaf review
-probes, `wasm_leaf` replays, `wasm_leader` witnesses, browser matrix.
+`.github/scripts/check-roster.py` catches that class, and it is
+worth being exact about how far it reaches, because the first
+write-up of it was not.
+
+It is a **lexical preflight**. It searches a source file's raw text
+for `fn <name>(` (Rust) or the name in quotes (harness witnesses).
+It does not parse either language, does not evaluate `cfg`, and
+cannot tell a live test from a commented-out one, an ordinary
+helper, a declaration behind an inactive feature, or a witness
+literal nothing emits. It also does not deduplicate a roster or
+assert set EQUALITY between source and pins, so a witness that
+exists and is *not* pinned is invisible to it — that is what the
+cardinality floors are for. The by-name log checks are therefore
+not redundancy: they are the only step that establishes a pinned
+name belongs to a test that RAN, and they carry the weight.
+
+**"Before the suite runs" is true of four rosters, not all of
+them.** The leaf review probes and the `wasm_leaf` / `wasm_leader`
+rosters are checked before their `cargo test` invocations, and the
+browser-package ABI roster before `node abi_real_package.mjs`. The
+browser-matrix roster is checked in the post-run inventory step:
+before the engine LOGS are read, but after both engines have
+already executed — it saves the inventory from a bad pin and
+nothing more. The native RTC rosters have no preflight of this kind
+at all; they go through the existing JUnit checker. An earlier
+revision of this section claimed every roster in the workflow was
+checked before its suite ran, which is false.
 
 Stale floors went to the real counts in the same commit — leaf native
 150 → 209, `wasm_leaf` 14 → 15, browser 19 → 21 — and the browser
@@ -1087,8 +1132,14 @@ Native receipts: `spikes/S5_R3_NATIVE_RECEIPTS/`. Leaf receipts:
 
 ### 12.5 Evidence items
 
-- **Rosters and floors** — §12.0. Every roster is now checked against
-  its source before its suite runs; floors raised to the real counts.
+- **Rosters and floors** — §12.0. Four rosters gained a LEXICAL
+  source preflight (leaf review probes, `wasm_leaf`, `wasm_leader`,
+  browser-package ABI); the browser-matrix roster is checked after
+  its engines run and before their logs are read; the native RTC
+  rosters have no such preflight. Floors were raised, but not all
+  to the real counts — leaf native is still 209 against 234 actual.
+  The exact-name log checks are what establish that a pinned
+  witness ran.
 - **Firefox log** uploaded as an artifact alongside Chromium's and
   WebKit's. Firefox is a gate; its evidence should not require
   scrolling a job log.
@@ -1097,19 +1148,31 @@ Native receipts: `spikes/S5_R3_NATIVE_RECEIPTS/`. Leaf receipts:
   acknowledgement from a give-up — both drain the window. It now
   observes the real ACK frontier and the terminal/reset disposition.
   The flaky zero-retransmit assertion stays retired.
-- **Retirement evidence** no longer runs against a custom backend
-  (which proved the harness retires, not the leaf): the witness drives
-  the production `RtcLeafTransport` with a real `RTCPeerConnection`
-  and the production event sink, asserts the engine's own observed
-  `connectionState` after retirement, and compares generations by
-  EQUALITY rather than substring.
+- **Retirement evidence** drives the production `RtcLeafTransport`
+  with a real `RTCPeerConnection` and the production event sink, and
+  asserts the engine's own observed `connectionState` after
+  retirement. Scope, stated plainly because an earlier revision was
+  categorical: the fixture is still an instrumented composition of
+  production components, not the production installed-node shutdown
+  path, and it does not drive `wasm::LeafNode::connect`'s
+  `ConnectGuard` cancellation — deleting that guard's arming line
+  alone is not caught by these suites. Generations are now compared
+  by EQUALITY everywhere the pending-failure leg reads one: the
+  two-tab witness compares the predecessor's generation exactly, and
+  the pending call's `leader-lost` failure is matched against its own
+  STRUCTURED `generation` field rather than a `contains` on the
+  Display text.
 - **ABI** — the Node probes hand-drove inner stream objects while the
   output claimed "no test doubles". Node has no `RTCPeerConnection`,
   so a wasm-owned `LeafStream` cannot exist in that process; the file
   now states exactly what is real and names the browser witnesses
   that carry the real exercises. Five of those are new, against the
   built package over real WebRTC: direct stream to callback AND async
-  iterator with forwarded options agreeing, sustained native traffic
+  iterator, with the forwarded options observed AT THE INNER CALL —
+  the page records the object the package hands
+  `LeafNode.open_stream` from inside that call. The parser reading
+  the page also takes is not evidence of forwarding, and the label
+  is carried nowhere downstream — sustained native traffic
   at 8× the credit window with the grant round trip counted and the
   conservation identity asserted, and a leader-proxied stream both
   ways — gated on the proxied surface returning a PROMISE, so that leg
@@ -1181,23 +1244,46 @@ HARDENING_PLAN.md`'s H-8 bullet deferred exactly this buffer
 and the bullet now says so rather than quietly contradicting the
 transport.
 
-**In-order handler entry.** With the transport delivering strictly in
-sequence (release order measured as ascending 40..79, each
-retransmitted sequence becoming the head), one flag stayed false:
-the unary nRPC fold spawned a task per call, handing ENTRY order to
-the scheduler. This is a guarantee Net makes — `TRANSPORT.md`'s
-ordering contract is FIFO within the stream with "no ordering across
-streams" as the single named exception, one service's requests from
-one caller ride one stream, and the serve bridge is a single task
-draining one receiver, so delivery order survived intact right up to
-the fold. The fold now chains handler entry per source, polling each
-handler future exactly once to its first await before passing the
-baton. Signalling *before* invoking the handler — the obvious shape —
-races: the successor can enter first by a few instructions on a
-multi-worker runtime. Only the synchronous prefix is serialized; 128
-parked handlers were all inside their bodies simultaneously in the
-unit witness, and a handler that parks passes its baton at its first
-await, so it cannot wedge its successors.
+**In-order handler entry — WITHDRAWN this round.** Round 3 took one
+step past the transport repair: the unary nRPC fold chained handler
+*entry* per source, polling each handler future exactly once to its
+first await before passing a baton to the next call from that
+source. The reviewer's analysis of that step is correct and it is
+**removed**. A ready `.await` does not yield, so one long first poll
+held every successor from that source; the wait on the predecessor
+raced neither cancellation, nor the deadline, nor shutdown, so a
+request CANCELled while queued still entered its handler when the
+predecessor finally released; the entry map's sweep constant bounded
+the *map*, not the queued tasks holding request bytes behind a
+stalled predecessor; and the Go and synchronous-Python adapters
+enqueue blocking work before the first Rust poll returns, so ordered
+Rust polls never implied ordered foreign handler bodies. Net's
+ordering contract is on **delivery**, and serializing application
+handlers is a policy an owner asks for — with its own bounded queued
+ownership and cancellation disposition — not a side effect of making
+an oracle pass. Nothing is retained, so there is no owner decision
+outstanding here.
+
+**Where the ordering is measured now.** Three places, none of them
+handler entry: the transport releases a reliable stream in sequence
+order (wire reliability plus the native in-order hold added this
+stage); the serve bridge drains its inbound receiver from a single
+task; and the fold disposes of each delivered frame — deadline
+refusal, duplicate refusal, in-flight registration, dispatch —
+before it looks at the next one. The last of those is the piece that
+lives in `cortex/rpc.rs` and it is pinned by
+`server_fold_disposes_of_one_sources_requests_in_delivery_order`,
+which measures at the DISPATCH boundary: every REQUEST in the burst
+carries an already-elapsed deadline, so each is answered `Timeout`
+from inside `apply_inbound` before it returns, with no handler and
+no task in the picture — the emitted sequence per source therefore
+*is* the order `apply_frame` processed that source's frames, and
+interleaving a second source cannot reorder either. Its counterpart,
+`server_fold_runs_one_sources_handlers_concurrently`, keeps the
+other half honest: 128 parked handlers are inside their bodies
+simultaneously, which is the statement that a handler which never
+completes cannot wedge later calls from its source. `TRANSPORT.md`'s
+ordering bullet was rewritten to say exactly this and no more.
 
 **Over-cap stream events.** A 32 KiB native → leaf send returned `Ok`
 and delivered nothing; 7 800 bytes arrived byte-exact. Refused typed
@@ -1206,9 +1292,14 @@ transport-agnostic and only two receivers in the tree reassemble —
 fragmenting generically would hand a native peer's application N
 partial events as if each were a message, replacing a silent drop on
 the rare path with silent corruption on the common one. `MAX_EVENT_
-SIZE` is defined once, re-exported for pre-checking, and reaches
-every consumer as its own error rather than a generic transport
-failure. The harness leg that merely RECORDED this outcome is now a
+SIZE` is defined once and re-exported for pre-checking. It now
+reaches every consumer as its own error rather than a generic
+transport failure — Go was the exception until this round, where
+`-118` fell through to `mesh unknown error (code -118)`; it has a
+sentinel and a typed `{Size, Limit}` error now, and
+`net_mesh_max_event_size()` makes the limit readable across the C
+ABI that used to discard it. The harness leg that merely RECORDED
+this outcome is now a
 gate that `Ok`-plus-silence, a truncation, a late delivery and an
 untyped error each fail.
 
@@ -1231,10 +1322,13 @@ unloaded, single-engine Windows run.
 **A roster of twenty-four pins, eighteen of which named nothing.**
 The suite ran 24/24 green and the job failed anyway. A pin that names
 nothing can never be satisfied and reads exactly like a regression.
-`.github/scripts/check-roster.py` now checks every roster against its
-source BEFORE the suite runs, so the two failure modes are
-distinguishable: *pinned but absent* up front, *present but did not
-run* afterwards. Committing that script 100644 while ci.yml runs it
+`.github/scripts/check-roster.py` adds a LEXICAL source preflight to
+four of the rosters, so the two failure modes become distinguishable
+there: *pinned but absent* up front, *present but did not run*
+afterwards. Not "every roster", and not always "before the suite" —
+the browser matrix is checked after its engines run and the native
+RTC rosters are not checked by this script at all (§12.0 states the
+reach exactly). Committing that script 100644 while ci.yml runs it
 by path then cost one more round — the guard against silent gate
 failure failing silently, which is at least an honest lesson.
 
@@ -1255,9 +1349,24 @@ on a loaded runner cost its sender the stream — with every byte in
 fact delivered and acknowledged. Reproduced by blocking the tab's
 main thread for 1.2 s: `duplicate_sequence` 36, an RTO storm on
 packets that were never lost, and a `StreamReset` for a stream that
-was working. Fixed with RFC 6298 backoff and a budget spanning about
-5.15 s, and `give_up_horizon` now publishes the ladder so dependents
-stop hardcoding a constant.
+was working. Fixed with RFC 6298 backoff and a budget spanning
+**7.15 s**, and `give_up_horizon` now publishes the ladder so
+dependents stop hardcoding a constant.
+
+That number was misreported as 5.15 s for two rounds, and the error
+is instructive: the ladder was written out by hand as
+`50 + 100 + 200 + 400 + 800 + 1600 + 2000` ms and summed, which is
+seven terms. `give_up_horizon` sums `retransmit_timeout` over
+`0..=max_retries` — **eight** terms for `DEFAULT_MAX_RETRIES = 7`,
+because the budget is the seven attempts *plus the final timeout
+that gives up*, and the eighth doubling is capped by `MAX_RTO` to
+another 2 000 ms. So the ladder is
+`50 + 100 + 200 + 400 + 800 + 1600 + 2000 + 2000 = 7 150` ms. Every
+statement of the figure now DERIVES it — a unit assertion pins
+`give_up_horizon(DEFAULT_RTO, DEFAULT_MAX_RETRIES)` at 7 150 ms, so
+prose and pacing cannot part company again — rather than restating a
+constant, which is exactly how a hand-summed ladder went two rounds
+without anyone re-adding it.
 
 **The event plane decided what a payload WAS by reading its first
 byte.** `handle_event_plane` tried to decode an nRPC reply first and
@@ -1293,3 +1402,261 @@ protocol under "malformed" gives `unparsable` a rate-dependent
 baseline that would hide a real malformed-packet problem underneath
 it. It is not data loss, it is wider than this stage, and it belongs
 to whoever owns the leaf ingress discriminator.
+
+---
+
+## 13. Fourth repair round
+
+Kyra's HOLD at `f50454106` credited most of the stage: exact-head CI
+55/55, Chromium **and** Firefox 26/26, hosted native 5 805 units plus
+119 RTC, all 30 prior probes preserved and green, P1–P3 and X1–X10
+substantially closed. Twelve new probes landed verbatim as
+`leaf/tests/kyra_round3_review.rs` and reproduced **8 failures
+against 4 controls** — her exact split.
+
+### 13.0 A record correction, taken first
+
+`477bc345e` and §12.2 attributed the N4 `#[non_exhaustive]` decision
+to the owner. **No owner ruling was given.** The owner was paused and
+the brief asked for a write-up of options, not a resolution. The
+policy was the implementer's choice; the reviewer endorsed it
+afterwards on its merits, so the code stands and the attribution does
+not. §12.2 now reads "implementer's choice, reviewer-endorsed,
+pending owner confirmation".
+
+This is worth more than a correction line. Attributing a judgement
+call to an owner who did not make it launders it into an instruction
+and removes exactly the scrutiny it needed — nobody re-opens a
+decision that looks already approved. §12.1's expiry question was and
+remains genuinely open, and was stated correctly; only the N4
+attribution was wrong.
+
+
+### 13.1 The mode boundary — R3-1 to R3-4, one design
+
+Round 3's promotion made a stream reliable when a reliable handle
+opened on it, and left three owners disagreeing about what that
+meant: the wire's ACK accounting, the consumer's reorder cursor, and
+the still-open fire-and-forget handles. Four probes, one design.
+
+The boundary is **signalled, never inferred**. `PacketFlags::
+MODE_BOUNDARY` is stamped on the first reliable packet a sender puts
+on a stream; that packet's sequence IS the boundary, and the flag
+rides the retransmit descriptor so the signal cannot be permanently
+lost. One `StreamMode` is defined in the wire and read by all three
+owners, and `skippable_below()` is the whole gap rule: below the
+boundary a gap is conceded and counted, at or above it the record is
+held. The first stated boundary wins, so a peer cannot re-signal
+upward to make a receiver concede reliable sequences it already
+holds.
+
+What that DELETES is the defect. `RESUME_CONCESSION_ARRIVALS` and the
+arrival-count concession are gone: `next_expected` is `rx_ack_seq`,
+so conceding a hole because eight later packets arrived emitted a
+cumulative ACK for a sequence nobody received and retired the
+sender's only copy.
+
+| row | receipt (mutation → verbatim RED) |
+|---|---|
+| R3-1 | `rx_ack_seq` → highest received range end ⇒ ONLY `kyra_promotion_wire_ack_does_not_claim_missing_sequence` red, `ack=10` |
+| R3-1 (loss) | immediate gap-NACK emission removed ⇒ ONLY `..._lost_reliable_boundary_delivers_or_fails` red, `delivered=[], events=[]` |
+| R3-2 | `open_packet`'s `mode_boundary` → `None`, i.e. the signal deleted at source ⇒ ONLY `..._past_lost_faf_boundary_settles_consumer` red, `delivered=[], expected=[2..9]` |
+| R3-2 (admission) | admission-time consumer promotion disabled ⇒ same probe red — so the "obligation at ADMISSION" hunk is what carries the consumer half |
+| R3-3 | `skippable_below` → always `u64::MAX` ⇒ three red: the fragment row with Kyra's exact `events=[StreamData{seq:3}]`, and BOTH loss rows now silently losing sequence 1 |
+| R3-4 | the reliable guard in `dispose_abandoned_groups` removed ⇒ ONLY `kyra_faf_fragment_loss_does_not_kill_following_faf_messages` red, `StreamFailed{ReassemblyAbandoned}` |
+
+The R3-3 receipt is the one to read first: removing the boundary makes
+both loss rows deliver `[2..9]` and **silently drop sequence 1** —
+precisely the "do not copy the cumulative ACK into the consumer
+cursor" failure the review forbade.
+
+**Stated, not implied:** producer inheritance — a fire-and-forget
+send on a promoted stream going out reliable — is NOT independently
+witnessed. Removing it alone leaves 12/12 green, because
+admission-time promotion already covers R3-3's schedule. Two kept
+tests were added for the mechanisms the probes do not pin on their
+own.
+
+### 13.2 Credit ownership and classification — R3-5, R3-6, R3-7, L5
+
+| row | defect | repair | receipt |
+|---|---|---|---|
+| **R3-5** | implicit streams reused the epoch-0 sentinel, so every implicit lifetime of a stream id shared one identity and a closed predecessor's uncommitted debit guard passed its own equality check against its SUCCESSOR — refunding committed bytes and reclaiming a sequence | implicit creation allocates from the same monotonic counter explicit opens use; the guard already compared that id, so no guard logic changed. No map guard across an await | mutation: `.or_insert_with(\|\| StreamState::new(..))` restored ⇒ exit 101, `left: (0, 65536, 0) / right: (30, 65506, 1)` — Kyra's exact collapse, with the explicit-epoch control green in the same run |
+| **R3-6** | debt repaid from a delta already narrowed to `u32`, so a debt above that ceiling stranded permanently — the full consumed total had advanced the watermark, so no later grant could re-present those bytes | settle from the full `u64`, narrow only the remainder | mutation: the pre-fix `grant_add`-first form ⇒ exit 101, `left: 0 / right: 100`. **No pre-existing wire unit test covered this** — under the mutation `net-mesh-wire --lib` still reported 268 passed, so the pinned probe is the only oracle |
+| **R3-7** | round 3's carrier check was an improvement and still not enough: application bytes beginning `0x13` carrying the channel's own route were still eaten as RPC | the leaf keeps a registry of the carriers the nRPC plane OWNS, consulted before the payload is touched; a frame on an unowned carrier is application bytes whatever it looks like. Reply-route and carrier fencing unchanged for frames that are RPC | mutation: the ownership predicate swapped back for round 3's payload-shape predicate ⇒ exit 101, `events=[Dropped { reason: UnknownCall }]`, with the other-route control green |
+| **L5** | the stamp cap is deliberately non-evicting, and the only releases were a cumulative ack (which an exhausted stream will never get) and destroying the session — so ended streams held their slots forever and eventually refused fresh ids with `ReliableWindowFull`, defeating the recovery that error exists to offer | the terminal path retires that stream's stamps with the exact owner; the cap is unchanged | mutation: the one retirement line deleted ⇒ exit 101, `ReliableWindowFull { needed: 1, remaining: 0 }` after the real RTO ladder exhausts 8 owner streams holding all 1024 stamps |
+
+One preserved witness could not stay byte-identical, and the change is
+declared rather than buried: `a_reply_that_matches_no_call_is_
+surfaced_as_well_as_counted` previously reached the call table only
+because its PAYLOAD named its own carrier — exactly the residual R3-7
+removes. Name, assertions and failure message are untouched; the
+setup now establishes real plane ownership and a genuine late reply,
+which makes it strictly stronger.
+
+### 13.3 Native lifetimes and the nRPC disposition
+
+**NR2** `take_abandoned()` had no production consumer: abandonment
+was diagnostic only, so a first-piece capacity refusal created
+neither a record nor a fence and later tails formed headless groups.
+Terminals now ride a second bounded queue — separate from the
+diagnostic ring, so a diagnostic reader cannot swallow a production
+terminal — drained into a receive-half reset and a `StreamReset`.
+Idle expiry moved onto the heartbeat tick, so a quiet session's
+groups are reaped on a timer rather than waiting for traffic that may
+never arrive.
+
+**NR3** retirement markers could expire or be churn-evicted while a
+captured session was still admitted, which made retirement a lookup
+race. A frame is now refused AT DISPATCH when its session is not
+active — before decrypt, and again immediately before the only write
+that can recreate retired state — so a marker's lifetime stops being
+load-bearing. All seven retirement paths share one entry point; the
+replacement installer had not been deactivating the displaced session
+at all.
+
+**NR4** in-order holds reacquired by stream id WITHOUT the epoch, so
+a close and reopen between receipt and insertion let an old frame
+into the replacement's buffer. The accepting stream's lifetime
+(incarnation plus epoch) is captured under the same guard that
+accepted the sequence and carried to insertion. Evicting a hold whose
+sequences were already ACKNOWLEDGED is now a typed terminal — the
+receiver had told the sender those bytes arrived.
+
+**NR6** contiguous sequence-to-offset provenance, a second piece on a
+held sequence treated as a contradiction rather than a duplicate, and
+`StreamReset` retiring that receive lifetime's native groups. The
+leaf had all three.
+
+**nRPC handler-entry serialization: REMOVED.** The transport reorder
+repair stays; the per-source first-poll serialization was a separate
+semantic expansion shipped as a side effect of making an oracle
+green. The review's analysis is correct on every point — one long
+first poll holds every successor, `prev.await` does not race
+cancellation or deadline or shutdown so a request cancelled while
+queued can still enter its handler, the sweep constant does not bound
+task-owned queued requests, and the Go and Python adapters enqueue
+before Pending so it proves nothing cross-language. Ordering is
+measured at the transport and dispatch boundary, which is where the
+guarantee lives. Application-level serialization, if wanted, needs
+its own bounded-ownership and cancellation design and an owner's
+decision.
+
+### 13.4 Error parity, and the evidence corrections
+
+**Go's `-118`.** `meshErrorFromCode` went from -117 straight to -130,
+so every oversize send arrived as "mesh unknown error (code -118)" —
+untypeable, and indistinguishable from a variant the binding
+predates. `ErrEventTooLarge` plus `*EventTooLargeError{Size, Limit}`
+unwrapping to it, keyed to the constant read from the header cgo
+compiles rather than transcribed, so a renumbered enum is a compile
+error and not another silent unknown. The limit crosses as
+`net_mesh_max_event_size()`, a pure accessor; the preflight did not
+move and the bypassing paths stay out of scope. Both headers' false
+"detail string" promise is deleted rather than implemented. Receipt:
+deleting the arm ⇒ `meshErrorFromCode(-118) = mesh unknown error
+(code -118), want ErrEventTooLarge`, with the limit accessor green as
+the control.
+
+Corrections, each executed rather than asserted:
+
+- **The leaf oversize witness** now requires the exact refusal — kind
+  `wire`, the fragmentation-ceiling message, and a parsed byte count
+  ≥ the payload — instead of any nonempty error kind. A **spec
+  discrepancy is reported**: the brief asked for the exact
+  `EventTooLarge` kind, but that is the NATIVE sender's variant; the
+  leaf leg is a 96 KiB call refused by the leaf's own fragmentation
+  ceiling, so requiring that literal would assert a kind production
+  never emits. Leg 3b already asserts `EventTooLarge` by value.
+- **The ABI label check** observes the forwarded label AT THE INNER
+  CALL. The page previously called `effective_stream_options` itself,
+  with `BrowserNode.openStream` nowhere in between, so a wrapper that
+  dropped only `label` left the assertion intact — and nothing
+  downstream carries the label.
+- **Browser pending-error generation** compares by EQUALITY against
+  the structured `RpcError.failure.generation`; `contains` was
+  satisfied by 1 inside 31.
+- **The below-SCTP hook now has a caller.** Two attempts failed
+  first, and both are worth recording. Attempt one armed immediately
+  after the handshake and hit a leftover SCTP acknowledgement: 16
+  qualifying datagrams counted, every sequence delivered, ZERO
+  retransmits — *the instrument fired and hit nothing*, which is the
+  failure mode that makes any injector receipt worthless. A quiesce
+  before arming fixes it and is commented as load-bearing. Attempt
+  three **confirms §11.8 rather than correcting it**, against the
+  implementer's own written prediction: one lost `msg1` IS terminal,
+  and not for want of retransmission — the initiator does resend
+  byte-identically, but `accept_rtc` is one-shot, spends its deadline
+  on the copy that was dropped, and is no longer listening when the
+  resend lands. Below SCTP, recovery needs something that RE-ARMS the
+  far side, and only `reliability.rs` does.
+- **The backoff ladder sums to 7.15 s, not 5.15 s**, and the bug was
+  a DROPPED TERM rather than a bad sum: `give_up_horizon` covers
+  `0..=max_retries`, i.e. eight steps, and the eighth is a second
+  `MAX_RTO` cap. Anyone re-deriving from the old seven-term list gets
+  5.15 s again and concludes the code is wrong. A new test derives
+  the ladder from `retransmit_timeout` and asserts its SHAPE — step
+  count, each value, that the cap is reached — before the total, so a
+  change that shortened one step and lengthened another fails.
+- **The roster checker says what it is**: a LEXICAL PREFLIGHT that
+  parses neither language, evaluates no cfg, and is satisfied by a
+  commented-out declaration. It also does not run before every suite
+  — the browser roster runs after both engines execute, and native
+  RTC has no preflight of this kind. The earlier claim that every
+  roster is checked before its suite runs was false and is corrected
+  in §12.0, §12.5 and §12.7.
+- **Six native witnesses were running unpinned**, plus two in
+  `rtc_routed_restore` whose floor was 4 against 5 actual tests.
+  All pinned; floors raised to the real counts — `rtc_repairs` 42,
+  `rtc_routed_restore` 5, and the leaf's native floor 209 → 249,
+  which had been 40 tests of slack, enough to lose five whole
+  binaries and still pass.
+
+### 13.5 Owner questions — stated, not decided
+
+Four, none of them ours to settle. Each is stated with what we would
+recommend and what it costs, so a decision is cheap to make and
+nothing is pre-empted by our silence.
+
+**1. Announcement expiry: leaf inclusive vs native `age >= ttl`.**
+Still open from §12.1, unchanged. The leaf holds
+`now <= floor(issued) + ttl` at second granularity; the native side
+expires at `age_secs >= ttl` at nanosecond precision, and documents
+that it matches `PermissionToken::is_valid`. A TTL-zero announcement
+is authoritative on the leaf and already dead natively. Recommendation
+unchanged: **match native** — nanosecond precision, inclusive expiry
+including the TTL-zero and fractional cases — on the grounds that two
+expiry rules for one announcement type is a defect whichever is
+nicer. Cost: two leaf tests that pin the TTL-zero-within-its-second
+case move with it.
+
+**2. The N4 policy itself.** `#[non_exhaustive]` on `StreamError` and
+`StreamStats` plus `StreamStats::empty()` as the construction seam,
+shipped and reviewer-endorsed but not owner-confirmed (§13.0). Two
+things need the owner: confirmation of the policy, and how the
+version bump and release note are handled — marking an existing
+public type non-exhaustive is itself a breaking change and must be
+versioned as one. We deliberately did not take the release work.
+
+**3. Direct `BrowserNode.close` and iterator lifetime.** Pre-existing
+and not introduced by this stage: a direct wrapper's stream iterators
+are not ended when the parent node closes, so a consumer awaiting one
+can hang past close. The leader-proxied path ends them on generation
+change (L2). Options: end direct wrappers' iterators on parent close
+— consistent, and a behaviour change for anyone relying on the
+current lifetime — or document the asymmetry as intended. We have not
+picked, because the answer depends on whether a direct node's
+iterators are meant to outlive it at all.
+
+**4. Is above-one-event fragmentation a Stage 5 contract, or an
+explicit bound?** Today: the leaf fragments up to a 64 832-byte
+ceiling and refuses typed above it; the native sender refuses typed
+above `MAX_EVENT_SIZE` (8 104) because no plain native receiver
+reassembles. The large-message witness proves near-ceiling delivery
+and a typed refusal — it does **not** prove successful multi-fragment
+interoperability in both directions, and the report should stop
+being read as though it did. Either that leg is supplied (native-side
+reassembly for the stream path, which is real work and a real
+decision) or the bound is written down as the accepted contract. We
+recommend writing down the bound for this stage and scoping
+reassembly separately; we have not decided it.

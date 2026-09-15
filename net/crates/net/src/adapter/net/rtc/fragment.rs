@@ -748,8 +748,9 @@ impl RtcReassembly {
     /// `session_id`, and fence their ids (NR6).
     ///
     /// The session survives — only this stream's receive half ended.
-    /// See [`SessionState::retire_stream_groups`] for why the
-    /// released groups are counted rather than reported.
+    /// The released groups are COUNTED rather than reported: the
+    /// peer's RESET is itself the terminal for that stream, so
+    /// raising a second one would end the same receive half twice.
     pub fn retire_stream(&self, session_id: u64, stream_id: u64, now: Instant) {
         let released = {
             let Some(mut entry) = self.sessions.get_mut(&session_id) else {

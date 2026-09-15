@@ -218,6 +218,24 @@ function typedFailure(e) {
     kind: (e && e.kind) || null,
     message: (e && e.message) || null,
   };
+  // The STRUCTURED generation of a `leader-lost` / `not-leader`
+  // failure, so the runner can compare it by EQUALITY instead of
+  // asking whether the Display text happens to contain a decimal
+  // string. `contains` is satisfied by any generation that has the
+  // expected one as a substring — "1" is inside "31" and inside
+  // "12" — and by the number turning up anywhere in the message for
+  // any unrelated reason, so it could not distinguish "the failure
+  // named the predecessor" from "the failure named someone else".
+  // Reported as a decimal STRING because that is how the runner
+  // reads generations everywhere else.
+  const failure = e && e.failure;
+  const generation =
+    failure && failure.generation !== undefined && failure.generation !== null
+      ? failure.generation
+      : e && e.presented !== undefined && e.presented !== null
+        ? e.presented
+        : null;
+  if (generation !== null) out.generation = String(generation);
   const evidence = e && e.failure && e.failure.evidence;
   if (evidence) out.evidence = evidence;
   return out;
@@ -503,14 +521,75 @@ async function execute(step) {
           effective = { error: (e && (e.message || String(e))) || 'unknown' };
         }
       }
+      // What the PRODUCTION wrapper actually FORWARDS to the inner
+      // wasm call.
+      //
+      // `effective` above is the built parser's reading of the object
+      // the PAGE built, obtained by calling the parser directly —
+      // `BrowserNode.openStream` is never between the two, so a
+      // wrapper that reconstructed its argument and dropped `label`
+      // on the way in would leave that assertion perfectly intact.
+      // The stream's own answers cover `streamId` and `reliability`,
+      // but nothing observable downstream carries the label, so the
+      // label was the one option asserted only against the page's own
+      // input. This closes it at the seam that matters: the generated
+      // node's `open_stream` is wrapped for exactly this call, the
+      // object it receives is recorded, and the method is restored
+      // immediately — so no other step in the page ever runs against
+      // a patched method, and the recorded object is the production
+      // argument, not a copy the page made.
+      //
+      // `same_object` distinguishes forwarding from reconstruction.
+      // Forwarding is what `node.ts` does today; a reconstruction
+      // that happened to preserve every field would still be honest,
+      // so it is REPORTED rather than required, and the per-field
+      // readings below are what gate.
+      let forwarded = null;
+      const inner = node.inner;
+      const realOpen =
+        inner && typeof inner.open_stream === 'function' ? inner.open_stream : null;
+      const hadOwnOpen = realOpen
+        ? Object.prototype.hasOwnProperty.call(inner, 'open_stream')
+        : false;
+      if (realOpen) {
+        inner.open_stream = function (received) {
+          forwarded = {
+            present: true,
+            same_object: received === opts,
+            label: received && received.label !== undefined ? received.label : null,
+            reliability:
+              received && received.reliability !== undefined ? received.reliability : null,
+            stream_id: received && received.streamId !== undefined ? received.streamId : null,
+            channel_hash:
+              received && received.channelHash !== undefined ? received.channelHash : null,
+            keys: received ? Object.keys(received).sort() : [],
+          };
+          return realOpen.call(this, received);
+        };
+      }
       let stream;
-      const openPromise = (() => {
-        try {
-          return node.openStream(opts);
-        } catch (e) {
-          return Promise.reject(e);
+      let openPromise;
+      try {
+        openPromise = (() => {
+          try {
+            return node.openStream(opts);
+          } catch (e) {
+            return Promise.reject(e);
+          }
+        })();
+      } finally {
+        // Restored on every path, including the throwing one, and
+        // synchronously: the DIRECT surface is synchronous, so the
+        // inner call has already happened by the time `openStream`
+        // returns. A PROXIED open resolves later, after this restore,
+        // so `forwarded` stays null there — reported as unobserved
+        // rather than guessed, exactly like `effective_options` on a
+        // page that has no direct wasm node.
+        if (realOpen) {
+          if (hadOwnOpen) inner.open_stream = realOpen;
+          else delete inner.open_stream;
         }
-      })();
+      }
       const proxied = typeof openPromise?.then === 'function';
       try {
         stream = await openPromise;
@@ -539,6 +618,7 @@ async function execute(step) {
           reliability: stream.reliability,
           proxied,
           effective_options: effective,
+          forwarded_options: forwarded,
         },
       };
     }

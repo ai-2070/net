@@ -7148,6 +7148,30 @@ pub type SensingDarkDropObserver = Arc<dyn Fn(u64, &[u8]) + Send + Sync>;
 #[cfg(any(test, feature = "fixtures"))]
 type SensingDarkDropSlot = Arc<parking_lot::Mutex<Option<SensingDarkDropObserver>>>;
 
+/// Observer of the unary nRPC serve bridge's HAND-OFF to the fold:
+/// `(service, from_node, frame)` for one inbound REQUEST frame, fired
+/// synchronously in the bridge's own task immediately before
+/// `RpcServerFold::apply_inbound` sees it.
+///
+/// This is the boundary Net's ordering contract is stated at, and the
+/// only place it is observable. Per-stream DELIVERY order survives to
+/// here — one reliable stream releases in sequence order and one
+/// bridge task drains the receiver — whereas handler ENTRY order does
+/// not and deliberately does not: the fold spawns one task per call so
+/// a slow or parked handler cannot hold its source's successors
+/// (`server_fold_runs_one_sources_handlers_concurrently`,
+/// `a_long_first_poll_does_not_delay_its_sources_successors`). A
+/// witness that wants to measure the ordering Net promises has to
+/// measure it here; measuring it at a handler measures the scheduler.
+#[cfg(any(test, feature = "fixtures"))]
+#[doc(hidden)]
+pub type RpcDispatchObserver = Arc<dyn Fn(&str, u64, &[u8]) + Send + Sync>;
+
+/// The shared slot, so a witness can install the observation on a
+/// running node without reaching into the bridge.
+#[cfg(any(test, feature = "fixtures"))]
+type RpcDispatchSlot = Arc<parking_lot::Mutex<Option<RpcDispatchObserver>>>;
+
 /// Instrumented-only override of the egress' per-datagram send policy.
 ///
 /// The consumer bounds every send through the SAME
@@ -11748,6 +11772,12 @@ pub struct MeshNode {
     /// install it on a running node.
     #[cfg(any(test, feature = "fixtures"))]
     sensing_dark_drop_observer: SensingDarkDropSlot,
+    /// Fixtures-only observation of the unary nRPC serve bridge's
+    /// hand-off to the fold, in hand-off order. Held on the node
+    /// rather than on the handle so a witness may install it before
+    /// or after `serve_rpc`.
+    #[cfg(any(test, feature = "fixtures"))]
+    rpc_dispatch_observer: RpcDispatchSlot,
     /// Fixtures-only observer of the PRODUCTION organization send boundary.
     /// Shared with the consumer at spawn, so a witness may install it before or
     /// after the lazily created egress exists.
@@ -13872,6 +13902,8 @@ impl MeshNode {
             #[cfg(any(test, feature = "fixtures"))]
             sensing_dark_drop_observer: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(any(test, feature = "fixtures"))]
+            rpc_dispatch_observer: Arc::new(parking_lot::Mutex::new(None)),
+            #[cfg(any(test, feature = "fixtures"))]
             org_egress_send_observer: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(any(test, feature = "fixtures"))]
             org_egress_send_policy: Arc::new(parking_lot::Mutex::new(None)),
@@ -14566,6 +14598,27 @@ impl MeshNode {
     #[doc(hidden)]
     pub fn set_sensing_dark_drop_observer_for_test(&self, observer: SensingDarkDropObserver) {
         *self.sensing_dark_drop_observer.lock() = Some(observer);
+    }
+
+    /// Observe what the unary nRPC serve bridge hands to the fold, in
+    /// HAND-OFF order.
+    ///
+    /// The observation is the ordering contract's own boundary: one
+    /// reliable stream releases in sequence order and one bridge task
+    /// drains the inbound receiver, so the sequence seen here is the
+    /// order that stream delivered. It is NOT handler entry order —
+    /// the fold spawns one task per call on purpose, so handler bodies
+    /// start concurrently and their order belongs to the scheduler.
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn set_rpc_dispatch_observer_for_test(&self, observer: RpcDispatchObserver) {
+        *self.rpc_dispatch_observer.lock() = Some(observer);
+    }
+
+    /// The installed hand-off observation, if any.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub(crate) fn rpc_dispatch_observer(&self) -> Option<RpcDispatchObserver> {
+        self.rpc_dispatch_observer.lock().clone()
     }
 
     /// Install the release pre-apply seam. It fires after a release's authority
@@ -30174,6 +30227,23 @@ impl MeshNode {
             // and not of whichever mode happened to open the id first
             // — see `StreamState::ensure_reliable`.
             let reliable_pkt = parsed.header.flags.contains(PacketFlags::RELIABLE);
+            // And WHERE it became reliable is the sender's to state,
+            // not this receiver's to infer: a packet carrying
+            // `MODE_BOUNDARY` declares its own sequence to be the
+            // first reliable one on the stream, so everything below
+            // is a fire-and-forget prefix nothing can rebuild.
+            // Promoting on the flag alone leaves the conservative
+            // assumed boundary in place, which names the sender's
+            // last fire-and-forget sequence whenever THAT was the
+            // one lost — and then every reliable arrival is held
+            // behind a hole no retransmit can fill, until the
+            // sender's retries exhaust and it fails a stream that
+            // lost nothing reliable.
+            let stated_boundary = parsed
+                .header
+                .flags
+                .is_mode_boundary()
+                .then_some(parsed.header.sequence);
             // R3: a provisional sender's stream allocation is
             // reserved BEFORE it happens — the two-stream and
             // 64 KiB rules were declared constants that nothing
@@ -30189,8 +30259,11 @@ impl MeshNode {
             ) {
                 return InboundDisposition::Drop;
             }
-            let stream = session
-                .get_or_create_stream_for_packet(stream_id, ctx.default_reliable || reliable_pkt);
+            let stream = session.get_or_create_stream_for_packet(
+                stream_id,
+                ctx.default_reliable || reliable_pkt,
+                stated_boundary,
+            );
             // **FIFO within a reliable stream.** Room to hold an
             // out-of-order arrival is reserved BEFORE the sequence is
             // offered to the reliability mode, because acceptance
@@ -51636,7 +51709,7 @@ mod stream_ack_batching_tests {
         let addr = "127.0.0.1:7005";
         let s = session_at(addr);
         let sid = 42u64;
-        s.get_or_create_stream_for_packet(sid, true);
+        s.get_or_create_stream_for_packet(sid, true, None);
 
         let grants = vec![(sid, 1000u64)];
         let (entries, _nacks, _acks) = build_session_control_events(&s, &grants, false);
@@ -51666,11 +51739,11 @@ mod stream_ack_batching_tests {
         let s = session_at(addr);
         // Stream 1: clean in-order receive. Stream 2: gapped (0
         // received, 5 out of order → head gap at 1).
-        s.get_or_create_stream_for_packet(1, true)
+        s.get_or_create_stream_for_packet(1, true, None)
             .with_reliability(|r| {
                 assert!(r.on_receive(0));
             });
-        s.get_or_create_stream_for_packet(2, true)
+        s.get_or_create_stream_for_packet(2, true, None)
             .with_reliability(|r| {
                 assert!(r.on_receive(0));
                 assert!(r.on_receive(5));
@@ -51809,7 +51882,7 @@ mod stream_ack_batching_tests {
         // A gapped receive stream: 0 received, 5 out of order ⇒ head gap
         // at 1 (so there IS a NACK and there WOULD be SACK ranges).
         session
-            .get_or_create_stream_for_packet(3, true)
+            .get_or_create_stream_for_packet(3, true, None)
             .with_reliability(|r| {
                 assert!(r.on_receive(0));
                 assert!(r.on_receive(5));

@@ -479,17 +479,55 @@ impl NetSession {
     /// the mode for the session's lifetime. See
     /// [`StreamState::ensure_reliable`] — the upgrade is one-way, so
     /// unreliable traffic on a reliable stream changes nothing.
+    ///
+    /// `mode_boundary` is the arriving packet's stated boundary —
+    /// `Some(header.sequence)` exactly when it carries
+    /// [`PacketFlags::MODE_BOUNDARY`](crate::protocol::PacketFlags::MODE_BOUNDARY)
+    /// — and it is applied HERE, on the one call every receive path
+    /// already makes, for two reasons.
+    ///
+    /// It has to be applied **before** the sequence is offered to
+    /// the reliability mode: the boundary decides whether the
+    /// sequences below it are a conceded fire-and-forget prefix or a
+    /// reliable gap this receiver must keep NACKing, so a boundary
+    /// applied afterwards measures the arrival against a cursor it
+    /// was about to move.
+    ///
+    /// And it has to be applied by the **wire**, not by each
+    /// receiver. A receive path that promotes with
+    /// [`StreamState::ensure_reliable`] alone gets the conservative
+    /// ASSUMED boundary — its own contiguous frontier — which names
+    /// the sender's last fire-and-forget sequence whenever that
+    /// sequence was lost. Nothing can ever rebuild it (its sender
+    /// retained no descriptor), so every reliable arrival above it
+    /// is held behind a permanent hole, the cumulative ack never
+    /// advances, and the sender's retransmits exhaust into a typed
+    /// stream failure on a stream that lost nothing reliable. That
+    /// was live: the native core promoted here and dropped the
+    /// signal on the floor, because the boundary was applied by one
+    /// caller instead of by the call they share.
     pub fn get_or_create_stream_for_packet(
         &self,
         stream_id: u64,
         reliable: bool,
+        mode_boundary: Option<u64>,
     ) -> dashmap::mapref::one::RefMut<'_, u64, StreamState> {
         let stream = self
             .streams
             .entry(stream_id)
             .or_insert_with(|| self.implicit_stream_state(reliable));
-        if reliable {
-            stream.ensure_reliable();
+        match mode_boundary {
+            // A stated boundary promotes as well as places: it is
+            // the sender saying "reliable from here", which is
+            // strictly more than `ensure_reliable` would have
+            // inferred from the flag alone.
+            Some(boundary) => {
+                stream.ensure_reliable_at(boundary);
+            }
+            None if reliable => {
+                stream.ensure_reliable();
+            }
+            None => {}
         }
         stream
     }
@@ -3281,7 +3319,7 @@ mod tests {
         // Three fire-and-forget arrivals, then the reliable open.
         session.open_stream_with(id, false, 1);
         for seq in 0..3 {
-            let stream = session.get_or_create_stream_for_packet(id, false);
+            let stream = session.get_or_create_stream_for_packet(id, false, None);
             assert!(stream.with_reliability(|r| r.on_receive(seq)));
         }
         assert!(!session.try_stream(id).expect("open").reliable_mode());

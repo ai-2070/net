@@ -749,13 +749,16 @@ impl LeafSession {
     /// receive state, and return the grant owed to its sender.
     ///
     /// `mode_boundary` is the arriving packet's
-    /// [`OpenedPacket::mode_boundary`]: applied BEFORE the sequence
-    /// is offered to the reliability mode, because it is what
-    /// decides whether the sequences below it are a conceded
-    /// fire-and-forget prefix or a reliable gap this receiver must
-    /// keep NACKing. Applied after, the boundary packet's own
-    /// sequence would be measured against a cursor the boundary was
-    /// about to move.
+    /// [`OpenedPacket::mode_boundary`], handed to
+    /// [`NetSession::get_or_create_stream_for_packet`](net_wire::session::NetSession::get_or_create_stream_for_packet)
+    /// so the wire applies it BEFORE the sequence is offered to the
+    /// reliability mode: it is what decides whether the sequences
+    /// below it are a conceded fire-and-forget prefix or a reliable
+    /// gap this receiver must keep NACKing. Applied after, the
+    /// boundary packet's own sequence would be measured against a
+    /// cursor the boundary was about to move — and applied by this
+    /// caller rather than by the shared call, a second receive path
+    /// silently gets the assumed boundary instead.
     ///
     /// `None` when the reliability layer refused the sequence (a
     /// duplicate, or past its acceptance horizon): crediting those
@@ -769,12 +772,9 @@ impl LeafSession {
         sequence: u64,
         event_bytes: usize,
     ) -> Option<StreamWindow> {
-        let stream = self
-            .session
-            .get_or_create_stream_for_packet(stream_id, reliable);
-        if let Some(boundary) = mode_boundary {
-            stream.ensure_reliable_at(boundary);
-        }
+        let stream =
+            self.session
+                .get_or_create_stream_for_packet(stream_id, reliable, mode_boundary);
         if !stream.with_reliability(|r| r.on_receive(sequence)) {
             return None;
         }

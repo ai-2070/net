@@ -153,6 +153,14 @@ const ABI_CEILING_SIZE: usize = 7_800;
 /// the far side — which is the contract, where "96 KiB works" is
 /// not.
 const ABI_OVER_LIMIT_SIZE: usize = 96 * 1024;
+/// The leaf's fragmentation ceiling, DERIVED rather than restated:
+/// `net_leaf::frame::MAX_FRAGMENTED_PAYLOAD` is `MAX_FRAGMENT_PAYLOAD`
+/// (= `MAX_EVENT_SIZE`) times `MAX_FRAGMENTS`. The runner does not
+/// depend on the leaf crate, so the eight is the one number written
+/// here; if either factor moves, this moves with it and leg 2's
+/// classifier below follows.
+const ABI_LEAF_MAX_FRAGMENTS: usize = 8;
+const ABI_LEAF_FRAG_CEILING: usize = MAX_EVENT_SIZE * ABI_LEAF_MAX_FRAGMENTS;
 /// Native → leaf on a stream, over `MAX_EVENT_SIZE`. Nothing on the
 /// native side fragments a stream event, so this is the size at which
 /// the sender must REFUSE, typed, naming the limit — the leg that
@@ -1349,13 +1357,49 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
         // node-allocated id and fail here.
         let handle_matches = reported_id == format!("\"{want_direct_hex}\"")
             && reported_reliability == "\"reliable\"";
-        // And the built wasm's own parser, on the same object the
-        // package forwarded — the option-forwarding half Kyra's E3
-        // says an option-reader inverse does not establish.
-        let options_forwarded = effective.get("streamId").and_then(|v| v.as_str())
+        // The built wasm's own parser, on the object the page built.
+        // This half is a PARSER reading, and on its own it proves
+        // only that the artifact understands the options — the page
+        // calls `effective_stream_options` itself, with
+        // `BrowserNode.openStream` nowhere in between.
+        let options_parsed = effective.get("streamId").and_then(|v| v.as_str())
             == Some(want_direct_hex.as_str())
             && effective.get("reliability").and_then(|v| v.as_str()) == Some("reliable")
             && effective.get("label").and_then(|v| v.as_str()) == Some("abi-direct");
+        // FORWARDING, observed at the INNER call: the object the
+        // production wrapper actually handed to
+        // `LeafNode.open_stream`, recorded by the page from inside
+        // that call. `streamId` and `reliability` are corroborated
+        // downstream by the stream's own answers, but the LABEL is
+        // not observable anywhere else — a wrapper that dropped only
+        // `label` would satisfy `options_parsed`, `handle_matches`
+        // and every byte of traffic below. So the label is required
+        // HERE, at the seam, and the absence of a recording is a
+        // failure rather than a pass: this is the direct surface, so
+        // the inner call is synchronous and must have been seen.
+        let forwarded = direct_open
+            .stats
+            .as_ref()
+            .and_then(|s| s.get("forwarded_options"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        // The id is compared BY VALUE, not by spelling. The page asks
+        // in hex and the production wrapper forwards the same u64 as
+        // a decimal string (u64s stay off the JS number path), so a
+        // string comparison here would fail on a correct forward —
+        // and "the witness disagreed about base" is not a defect
+        // worth reporting as one.
+        let forwarded_id = forwarded
+            .get("stream_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<u64>().ok());
+        let want_direct_id = u64::from_str_radix(&want_direct_hex, 16).ok();
+        let label_forwarded_inner =
+            forwarded.get("label").and_then(|v| v.as_str()) == Some("abi-direct")
+                && forwarded_id.is_some()
+                && forwarded_id == want_direct_id
+                && forwarded.get("reliability").and_then(|v| v.as_str()) == Some("reliable");
+        let options_forwarded = options_parsed && label_forwarded_inner;
         let direct_is_direct = direct_open
             .stats
             .as_ref()
@@ -1437,11 +1481,21 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                  `LeafNode.open_stream` returned. The stream reports \
                  streamId={reported_id} reliability={reported_reliability}, which is the \
                  id and mode the page ASKED for ({want_direct_hex}, \
-                 reliable)={handle_matches}; the built wasm's own \
-                 `effective_stream_options` on the very object the package forwarded reads \
-                 back {effective} — same id, same reliability, same \
-                 label={options_forwarded}, which is option FORWARDING and not an option \
-                 reader called in isolation. This process's `MeshNode` then opened the \
+                 reliable)={handle_matches}. OPTIONS, in two separate readings, because \
+                 the first one alone was overbroad: the built wasm's own \
+                 `effective_stream_options` on the object the page built reads back \
+                 {effective} ({options_parsed}) — that is a PARSER reading, taken with \
+                 `BrowserNode.openStream` nowhere in between, so a wrapper that dropped \
+                 `label` on the way in would leave it intact. The forwarding itself is \
+                 observed AT THE INNER CALL: the page records the object the production \
+                 wrapper actually hands `LeafNode.open_stream`, from inside that call, \
+                 and it read {forwarded} — label, id and mode all as asked \
+                 ({label_forwarded_inner}). The label is the option that needs this: id \
+                 and mode are corroborated by the stream's own answers and by the traffic \
+                 below, while nothing downstream carries the label at all. No recording \
+                 FAILS the leg — this is the synchronous direct surface, so the inner \
+                 call must have been seen (forwarded={options_forwarded}). \
+                 This process's `MeshNode` then opened the \
                  SAME stream id from its side and sent {ABI_DIRECT_EVENTS} payload(s) of \
                  {ABI_DIRECT_SIZE} B generated from seed {direct_seed:#x} (native send \
                  error: {native_send_error:?}). The package's `onMessage` CALLBACK \
@@ -1832,7 +1886,44 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
         // truncated would have arrived by now.
         tokio::time::sleep(Duration::from_secs(2)).await;
         let handler_untouched = echo_log.lock().expect("echo log").is_empty();
-        let refused_typed = !oversized.ok && !over_kind.is_empty() && handler_untouched;
+        // The EXACT refusal, not "some error happened".
+        //
+        // `!over_kind.is_empty()` was satisfied by ANY failure that
+        // reached the page before dispatch — a deadline, a session
+        // replacement, a leader loss — and every one of those also
+        // leaves the handler untouched, so this leg could stay green
+        // while the over-cap refusal it names had stopped happening
+        // altogether. The no-delivery half was never the weak half;
+        // the classifier was.
+        //
+        // The leaf-side identity of this refusal is
+        // `LeafError::Wire` (kind `"wire"`, the browser package's
+        // `WireError`) raised by `frame::split_payload`, whose text
+        // names the framed length and the fragmentation ceiling.
+        // Note it is NOT the `EventTooLarge` kind: that is the
+        // NATIVE sender's `StreamError` variant, measured against
+        // `MAX_EVENT_SIZE`, and leg 3b below requires it by value.
+        // The leaf refuses EARLIER and for a different reason — at
+        // `ABI_LEAF_FRAG_CEILING`, past which it will not even
+        // attempt the eight-fragment split — so there is no
+        // `EventTooLarge` kind on the leaf boundary to require here.
+        // Requiring the ceiling clause is the equivalent exactness.
+        //
+        // The named byte count must also be OUR payload's: a
+        // refusal about some smaller body would name a smaller
+        // number, and the framed length is the request body plus its
+        // nRPC framing, hence `>=` rather than `==` (pinning the
+        // framing overhead would make this leg fail on an unrelated
+        // header change).
+        let over_named_bytes = refused_payload_bytes(&over_message);
+        let refused_typed = !oversized.ok
+            && over_kind == "wire"
+            && over_message.contains(&format!(
+                "exceeds the {ABI_LEAF_FRAG_CEILING}-byte fragmentation ceiling"
+            ))
+            && over_message.contains("use a stream")
+            && over_named_bytes.is_some_and(|n| n >= ABI_OVER_LIMIT_SIZE)
+            && handler_untouched;
 
         // Leg 3a, GATED: native → leaf on a stream at the same
         // ceiling, so "both directions" covers the stream API and
@@ -2034,11 +2125,21 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                  service answers `echo:` + that body, {} B, and the page received \
                  {got_reply:?} against the expected {want_reply:?}={reply_down}. \
                  LEG 2, PAST THE HARD LIMIT: `call(<{ABI_OVER_LIMIT_SIZE} B>)` was refused \
-                 with kind={over_kind:?} Display={over_message:?}, and the anchor's handler \
-                 was entered ZERO times afterwards={handler_untouched} — so the refusal is \
-                 typed AND nothing truncated reached the far side \
-                 (refused_typed={refused_typed}). A silent drop, a truncation, or a \
-                 partial body dispatched to the handler each fail this leg. \
+                 with kind={over_kind:?} Display={over_message:?}, naming \
+                 {over_named_bytes:?} framed bytes, and the anchor's handler was entered \
+                 ZERO times afterwards={handler_untouched} (refused_typed={refused_typed}). \
+                 The classifier is EXACT, not `some error`: kind must be `\"wire\"` — the \
+                 leaf's `LeafError::Wire` from `frame::split_payload`, not the native \
+                 sender's `EventTooLarge`, which measures `MAX_EVENT_SIZE` and is leg 3b's \
+                 subject — the text must name the {ABI_LEAF_FRAG_CEILING}-byte \
+                 fragmentation ceiling ({ABI_LEAF_MAX_FRAGMENTS} fragments of \
+                 {MAX_EVENT_SIZE}) and the stream it points at, and the byte count it \
+                 names must be at least the {ABI_OVER_LIMIT_SIZE} B we sent. It used to \
+                 accept ANY nonempty kind, which a deadline, a session replacement or a \
+                 leader loss would each have satisfied while also leaving the handler \
+                 untouched — a green leg with the refusal gone. A silent drop, a \
+                 truncation, a partial body dispatched to the handler, or a refusal for \
+                 the wrong reason each fail this leg. \
                  LEG 3a, GATED, NATIVE → LEAF ON A STREAM at the same ceiling \
                  ({ABI_CEILING_SIZE} B), so `both directions` covers the stream API and \
                  not only nRPC. Both stream legs ride a stream of their OWN \
@@ -2584,7 +2685,19 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
         // asks next, which is *which* leader it lost.
         let pending_kind = pending_outcome.kind.clone().unwrap_or_default();
         let pending_message = pending_outcome.message.clone().unwrap_or_default();
-        let names_old_generation = !gen_a.is_empty() && pending_message.contains(&gen_a);
+        // EXACT equality against the predecessor's generation, read
+        // from the failure's own STRUCTURED field (the browser
+        // package's `RpcError.failure.generation`), not asked of the
+        // Display text. `pending_message.contains(&gen_a)` accepted
+        // any generation with the expected one as a substring — "1"
+        // sits inside "31" and inside "12" — and any message that
+        // mentioned the number for an unrelated reason, so it could
+        // not tell "named the predecessor" from "named someone
+        // else". An absent structured generation now FAILS: the
+        // typed error's whole point is that a page does not have to
+        // parse prose to learn which leader it lost.
+        let pending_generation = pending_outcome.generation.clone().unwrap_or_default();
+        let names_old_generation = !gen_a.is_empty() && pending_generation == gen_a;
         let pending_failed_typed = !pending_outcome.ok
             && pending_outcome.info.as_deref() != Some("never settled")
             && pending_kind == "leader-lost"
@@ -2765,7 +2878,10 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                  confirmed it ENTERED={park_entered}; tab a's session then stood down \
                  (ok={}) and **its page was left alive**. The pending call failed with a \
                  TYPED rejection={pending_failed_typed} (kind={:?} message={:?} info={:?}), \
-                 naming the predecessor's own generation {gen_a:?}={names_old_generation}, \
+                 carrying the predecessor's own generation in its STRUCTURED field: \
+                 {pending_generation:?} compared by EQUALITY against {gen_a:?} \
+                 ={names_old_generation} — not a `contains` on the Display text, which \
+                 a generation of 1 would satisfy inside a generation of 31, \
                  and the anchor's parked handler was entered {park_invocations} time(s) — \
                  exactly once is the requirement, so a silent replay fails here. Tab b was \
                  promoted to role={promoted_role:?} at generation={promoted_gen:?}, strictly \
@@ -3550,6 +3666,25 @@ fn expected_marks(seed: u64, size: usize, count: usize) -> Vec<Mark> {
     (0..count)
         .map(|i| Mark::of(&gen_bytes(seed + i as u64, size)))
         .collect()
+}
+
+/// The byte count a leaf over-cap refusal names, read out of its
+/// `Display` text: `"wire: payload of <N> bytes exceeds the …"`.
+///
+/// `None` when the message is not that refusal at all, which is
+/// exactly the discrimination leg 2 of the large-message witness
+/// needs: a deadline or session error carries no such number, so it
+/// cannot satisfy the predicate by accident. Split-based rather than
+/// prefix-based so the `wire: ` the browser package prepends does
+/// not have to be spelled here twice.
+fn refused_payload_bytes(message: &str) -> Option<usize> {
+    message
+        .split("payload of ")
+        .nth(1)?
+        .split(" bytes")
+        .next()?
+        .parse()
+        .ok()
 }
 
 /// A `stats` field read as a string, for the ledger text.

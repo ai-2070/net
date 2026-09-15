@@ -3734,7 +3734,10 @@ async fn a_frame_captured_under_a_retired_incarnation_cannot_revive_its_reassemb
     // packets.
     let (entered_tx, entered_rx) = mpsc::channel::<()>();
     let (release_tx, release_rx) = mpsc::channel::<()>();
-    let release_rx = std::sync::Mutex::new(release_rx);
+    // `parking_lot`, per the workspace lint: std's lock poisoning is
+    // not handled anywhere in this tree, so a poisoned std mutex here
+    // would turn an unrelated panic into a confusing second failure.
+    let release_rx = parking_lot::Mutex::new(release_rx);
     let armed = Arc::new(AtomicBool::new(true));
     {
         let armed = Arc::clone(&armed);
@@ -3746,7 +3749,6 @@ async fn a_frame_captured_under_a_retired_incarnation_cannot_revive_its_reassemb
                 entered_tx.send(()).expect("the test is waiting for this");
                 release_rx
                     .lock()
-                    .expect("release lock")
                     .recv()
                     .expect("the test releases the ingress");
             })));
@@ -4027,6 +4029,155 @@ async fn evicting_an_acknowledged_in_order_hold_ends_the_receive_half() {
     );
 }
 
+/// **R3-1..R3-4, the receiving half:** a reliable stream whose
+/// fire-and-forget prefix lost its LAST sequence recovers, because
+/// the native receive path applies the boundary its sender STATED
+/// instead of the one it could infer.
+///
+/// # The defect this exists for
+///
+/// A stream id carries both modes — a channel's publish id is
+/// derived from the channel, and nRPC's from the route — so a
+/// fire-and-forget burst and a reliable one share one sequence
+/// space. On promotion the receiver has to know WHERE reliability
+/// began. Until the sender's `MODE_BOUNDARY` arrives it assumes the
+/// conservative boundary — its own contiguous frontier — and that
+/// assumption names the sender's last fire-and-forget sequence
+/// whenever that sequence was the one lost. Nothing can rebuild it:
+/// fire-and-forget retained no descriptor, so there is no NACK that
+/// can produce it and no ack the receiver can honestly emit. Every
+/// reliable arrival is then held behind a permanent hole, the
+/// cumulative ack never advances, and the SENDER's retransmits
+/// exhaust into a typed `stream_failed` on a stream that lost
+/// nothing reliable at all.
+///
+/// That was live on this path: `MODE_BOUNDARY` was stamped by leaf
+/// senders, read by the leaf's receive half, and dropped on the
+/// floor by the native core, which promoted with
+/// `StreamState::ensure_reliable` and never looked at the flag. The
+/// arrival-count concession that had covered it until then
+/// (`RESUME_CONCESSION_ARRIVALS`) was deleted in the same change
+/// that introduced the signal, so the native receiver was left with
+/// neither mechanism.
+///
+/// # Why it is built by hand
+///
+/// The sender has to state a boundary, and no native send path
+/// stamps one — a leaf does. So the packets are built from A's real
+/// session (real AEAD, real header, real sequence space) and
+/// submitted through A's real RTC transport, which is exactly the
+/// datagram a browser leaf puts on the channel. Everything on B's
+/// side is production: prefilter, decrypt, replay window,
+/// `account_inbound_stream_packet`, the in-order hold, dispatch.
+///
+/// The reorder is deliberate and is the hazard's own shape: the
+/// boundary packet arrives AFTER the sequence behind it, so a
+/// receiver that only applied the boundary at first-touch of the
+/// reliable region would already have promoted at the assumed one.
+///
+/// Inverse: pass `None` for `mode_boundary` at
+/// `account_inbound_stream_packet`'s
+/// `get_or_create_stream_for_packet` call — none of the six
+/// reliable payloads is ever delivered, because the receiver holds
+/// them all behind the conceded prefix's final sequence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stated_mode_boundary_releases_a_reliable_stream_over_a_lost_prefix() {
+    use net_wire::protocol::PacketFlags;
+
+    const STREAM: u64 = 0x07B1;
+    // Sequences 0..=4 are fire-and-forget and arrive; 5 is
+    // fire-and-forget, is built, and is never submitted — the
+    // unrebuildable tail. The reliable region is 6..=11, and 6 is
+    // the sender's stated boundary.
+    const PREFIX: usize = 5;
+    const LOST_PREFIX_SEQ: u64 = 5;
+    const BOUNDARY_SEQ: u64 = 6;
+    const RELIABLE: usize = 6;
+
+    let (a, b, id_a, _) = pair_with(rtc_config(), rtc_config()).await;
+    let session = a
+        .peer_session_for_test(b.node_id())
+        .expect("A's session to B")
+        .clone();
+    let transport = a.rtc_driver().expect("driver").transport();
+
+    let build = |seq: u64, payload: &Bytes, flags: PacketFlags| -> Vec<u8> {
+        let mut builder = session.thread_local_pool().get();
+        builder
+            .build(STREAM, seq, std::slice::from_ref(payload), flags)
+            .to_vec()
+    };
+
+    // ---- the fire-and-forget prefix ------------------------------
+    let prefix = tagged_payloads(b"MBPFX", PREFIX);
+    for (i, payload) in prefix.iter().enumerate() {
+        let packet = build(i as u64, payload, PacketFlags::NONE);
+        transport.submit(&packet, id_a).expect("admission");
+    }
+    let prefix_seen = collect_tagged(&b, b"MBPFX", PREFIX, Duration::from_secs(20)).await;
+    assert_eq!(
+        prefix_seen
+            .iter()
+            .map(|p| p[b"MBPFX".len()])
+            .collect::<HashSet<_>>()
+            .len(),
+        PREFIX,
+        "premise: the fire-and-forget prefix must arrive, so the receiver's \
+         assumed boundary really is one sequence above it — {} of {PREFIX} did",
+        prefix_seen.len()
+    );
+
+    // Built and withheld. Its sender kept no descriptor for it
+    // (fire-and-forget), so this sequence can never be produced
+    // again by anything — which is the whole point: the receiver
+    // must not wait on it, and must not acknowledge it either.
+    let _never_sent = build(
+        LOST_PREFIX_SEQ,
+        &tagged_payloads(b"MBLOST", 1)[0],
+        PacketFlags::NONE,
+    );
+
+    // ---- the reliable region, boundary stated and reordered ------
+    let reliable = tagged_payloads(b"MBREL", RELIABLE);
+    let mut packets: Vec<(u64, Vec<u8>)> = Vec::with_capacity(RELIABLE);
+    for (i, payload) in reliable.iter().enumerate() {
+        let seq = BOUNDARY_SEQ + i as u64;
+        let flags = if seq == BOUNDARY_SEQ {
+            PacketFlags::RELIABLE.with(PacketFlags::MODE_BOUNDARY)
+        } else {
+            PacketFlags::RELIABLE
+        };
+        packets.push((seq, build(seq, payload, flags)));
+    }
+    // 7 before 6 — the boundary overtaken — then 9 before 8, then
+    // the tail in order. Built in submission order so the AEAD
+    // counters ascend and it is the Net sequence, not the cipher
+    // counter, that is out of order.
+    for idx in [1usize, 0, 3, 2, 4, 5] {
+        transport.submit(&packets[idx].1, id_a).expect("admission");
+    }
+
+    let seen = collect_tagged(&b, b"MBREL", RELIABLE, Duration::from_secs(30)).await;
+    let order: Vec<u8> = seen.iter().map(|p| p[b"MBREL".len()]).collect();
+    let distinct: HashSet<u8> = order.iter().copied().collect();
+    assert_eq!(
+        distinct.len(),
+        RELIABLE,
+        "every reliable payload must be delivered: the prefix sequence the \
+         receiver could not have is BELOW the stated boundary, so it is \
+         conceded, not waited on. {} of {RELIABLE} arrived ({order:?}) — zero \
+         is what the assumed boundary produces, and what the sender then \
+         answers with exhausted retransmits and a failed stream",
+        distinct.len()
+    );
+    assert_eq!(
+        order,
+        (0..RELIABLE as u8).collect::<Vec<u8>>(),
+        "and in sequence order, exactly once each: the reorder is restored by \
+         the in-order hold, not tolerated by the consumer — got {order:?}"
+    );
+}
+
 /// Let a quiet RTC link flush whatever SCTP acknowledgements it still
 /// owes, so the NEXT qualifying egress datagram is the one the caller
 /// is about to send.
@@ -4176,7 +4327,7 @@ async fn one_datagram_lost_below_sctp_is_recovered_only_where_net_covers_it() {
     let mut faf_cfg = StreamConfig::new();
     faf_cfg.reliability = Reliability::FireAndForget;
     let control = a
-        .open_stream(b.node_id(), 0x0072, faf_cfg.clone())
+        .open_stream(b.node_id(), 0x0072, faf_cfg)
         .expect("open_stream");
     let control_payloads = tagged_payloads(b"RAWCTL", N);
     for payload in &control_payloads {
