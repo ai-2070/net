@@ -85,7 +85,7 @@ const FAF_DROP_EVERY: u64 = 4;
 /// Every Stage 5 witness name, in ledger order. The CI job pins these
 /// exactly; the list is here so a rename is one edit and a drop is
 /// impossible to do quietly.
-pub const WITNESSES: [&str; 8] = [
+pub const WITNESSES: [&str; 9] = [
     "stage5_leaf_handshake_over_the_real_listener",
     "stage5_reliable_round_trip",
     "stage5_nrpc_call_to_a_native_service",
@@ -94,6 +94,7 @@ pub const WITNESSES: [&str; 8] = [
     "stage5_two_tabs_share_one_identity_without_eviction",
     "stage5_reconnect_displaces_a_busy_incumbent",
     "stage5_udp_blocked_surfaces_a_typed_failure",
+    "stage5_direct_event_callback_may_reenter_the_node",
 ];
 
 // ===================================================================
@@ -221,6 +222,23 @@ pub enum Step5 {
         id: u64,
         addr: String,
     },
+    /// Register an event listener on a **direct** node that calls
+    /// straight back into it — a synchronous counter read and a
+    /// synchronous `openStream` — and record what each attempt did.
+    ///
+    /// The one schedule no unit test can reach: `wasm::Inner` exists
+    /// only behind a real `connect()`, so the borrow discipline
+    /// around its listeners is observable here and nowhere else.
+    ArmReentry {
+        id: u64,
+        session: String,
+    },
+    /// What the armed listener observed. Readable after the session
+    /// is closed, because closing is what fires the event.
+    ReentryReport {
+        id: u64,
+        session: String,
+    },
     Close {
         id: u64,
         session: String,
@@ -243,6 +261,8 @@ impl Step5 {
             | Self::Announce { id, .. }
             | Self::Query { id, .. }
             | Self::StunProbe { id, .. }
+            | Self::ArmReentry { id, .. }
+            | Self::ReentryReport { id, .. }
             | Self::Close { id, .. }
             | Self::Done { id } => id,
         }
@@ -260,6 +280,8 @@ impl Step5 {
             | Self::Announce { id, .. }
             | Self::Query { id, .. }
             | Self::StunProbe { id, .. }
+            | Self::ArmReentry { id, .. }
+            | Self::ReentryReport { id, .. }
             | Self::Close { id, .. }
             | Self::Done { id } => *id,
         }
@@ -1129,6 +1151,114 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
     }
 
     // ================================================================
+    // 9 — a direct node's event callback may call back into the node
+    //
+    // `wasm::Inner` is the leaf's one shared cell, and it exists only
+    // behind a real `connect()` — so this schedule is unreachable
+    // from the leaf's own wasm tests, which have no anchor, and from
+    // the session surface, whose events are drained on a microtask.
+    // On the direct surface the events were handed to the listeners
+    // from inside `flush`, holding `Inner`'s mutable borrow, so the
+    // documented `onMessage(p => stream.send(p))` echo — and a
+    // listener doing anything else synchronous with the node —
+    // re-entered that borrow and TRAPPED the module instead of
+    // sending.
+    //
+    // The trigger is the session's own teardown event, because it is
+    // the one event this harness can produce on demand: `close()`
+    // drops the session, which pushes `Disconnected`, which is
+    // delivered to the page's listener. What the listener then does
+    // is two re-borrows of different kinds — `counters()` reads,
+    // `openStream()` mutates — so a fix that released only one of
+    // them is still visible here.
+    //
+    // The disposition is a *typed* answer, not a success: the node is
+    // closed by the time its teardown is delivered, so `openStream`
+    // must be refused with a kind. A trap carries no kind at all,
+    // which is exactly what separates the two outcomes.
+    // ================================================================
+    {
+        let armed = script
+            .run(
+                "a",
+                Step5::ArmReentry {
+                    id: 0,
+                    session: "main".into(),
+                },
+            )
+            .await;
+        let closed = script
+            .run(
+                "a",
+                Step5::Close {
+                    id: 0,
+                    session: "main".into(),
+                },
+            )
+            .await;
+        let report = script
+            .run(
+                "a",
+                Step5::ReentryReport {
+                    id: 0,
+                    session: "main".into(),
+                },
+            )
+            .await;
+        let observed: serde_json::Value = report
+            .info
+            .as_deref()
+            .and_then(|text| serde_json::from_str(text).ok())
+            .unwrap_or(serde_json::Value::Null);
+        let fired = observed.get("fired").and_then(serde_json::Value::as_u64);
+        let counters_keys = observed
+            .get("counters_keys")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let trapped = observed.get("trapped").and_then(serde_json::Value::as_str);
+        let stream_outcome = observed
+            .get("stream_outcome")
+            .and_then(serde_json::Value::as_str);
+        // A witness that proves nothing unless the listener really
+        // ran: no event, no re-entry, no result.
+        let listener_ran = fired.unwrap_or(0) > 0;
+        let read_the_node = counters_keys > 0;
+        let refused_typed = matches!(stream_outcome, Some(kind) if kind != "trapped");
+        ledger.record(
+            WITNESSES[8],
+            armed.ok
+                && closed.ok
+                && report.ok
+                && listener_ran
+                && read_the_node
+                && trapped.is_none()
+                && refused_typed,
+            format!(
+                "a listener was armed on the GENERATED wasm node behind the direct \
+                 `connect()` object — the same `on_event` surface the package's own event \
+                 hub feeds from and `LeafStream.onMessage` registers on, and the one the \
+                 wrapper detaches before teardown — and the session was then closed so its \
+                 own `Disconnected` event is delivered to that listener (arm ok={}, \
+                 close ok={}). The \
+                 listener fired {fired:?} time(s) (ran={listener_ran}); its SYNCHRONOUS \
+                 `counters()` re-borrow returned {counters_keys} counters \
+                 (read={read_the_node}); its SYNCHRONOUS `openStream()` re-borrow came \
+                 back as {stream_outcome:?} — a typed refusal, since the node is closed by \
+                 the time its teardown is delivered (typed={refused_typed}); and nothing \
+                 trapped ({trapped:?}). A callback invoked under `Inner`'s mutable borrow \
+                 cannot do either of these: the first re-borrow panics the RefCell and the \
+                 module traps, which arrives with no error kind. Report: {}",
+                armed.ok,
+                closed.ok,
+                report
+                    .info
+                    .as_deref()
+                    .unwrap_or("unreadable — the page returned no reentry state"),
+            ),
+        );
+    }
+
+    // ================================================================
     // 6 — two tabs, one identity, no eviction
     //
     // §8: one node per ORIGIN. Both tabs open through `openSession`,
@@ -1163,16 +1293,8 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
         // Tab a is re-opened through `openSession` so both tabs
         // contend for the same Web Lock; the plain `connect` session
         // from witness 1 holds no lock and would make tab b the only
-        // claimant.
-        let _ = script
-            .run(
-                "a",
-                Step5::Close {
-                    id: 0,
-                    session: "main".into(),
-                },
-            )
-            .await;
+        // claimant. It was already closed by the re-entry witness
+        // above, which needed that close to deliver a teardown event.
         let leader = script.run("a", connect_as("lead", false, true)).await;
         let leader_hex = leader.node_id.clone().unwrap_or_default();
         let leader_node = u64::from_str_radix(leader_hex.trim_start_matches("0x"), 16).unwrap_or(0);
@@ -1423,9 +1545,16 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
         } else {
             fail("not attempted")
         };
-        let _ = cx.driver.close_page("leaf5-a").await;
+        // The predecessor page STAYS OPEN. Destroying it here is what
+        // made this leg unable to discriminate the thing it is named
+        // after: page teardown independently kills the old JS, wasm
+        // module, DataChannel and node, so a `close()` that retired
+        // nothing looked identical to one that retired everything.
+        // Explicit retirement with the owner still alive is the case
+        // that matters, and it is the only one a page can cause.
 
-        // Pending work: typed failure, once.
+        // Pending work: typed failure, once, naming the generation
+        // that owned it.
         let pending_outcome = if park_entered {
             script
                 .run(
@@ -1440,14 +1569,25 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
         } else {
             fail("not attempted: nothing was pending on the anchor")
         };
+        // Exactly `leader-lost`, and exactly the predecessor's
+        // generation. "Some kind is present" would also accept a
+        // `session-lost`, an `rpc-timeout` or the node's own reported
+        // text — all of which lose the answer to the question a page
+        // asks next, which is *which* leader it lost.
+        let pending_kind = pending_outcome.kind.clone().unwrap_or_default();
+        let pending_message = pending_outcome.message.clone().unwrap_or_default();
+        let names_old_generation = !gen_a.is_empty() && pending_message.contains(&gen_a);
         let pending_failed_typed = !pending_outcome.ok
             && pending_outcome.info.as_deref() != Some("never settled")
-            && pending_outcome.kind.is_some();
+            && pending_kind == "leader-lost"
+            && names_old_generation;
         let park_invocations = park_log.lock().expect("park log").len();
-        // Let the anchor's parked handler finish; its reply has
-        // nowhere to go, which is the honest shape of "the remote
-        // operation may still have executed".
-        park_release.add_permits(1);
+        // The parked handler is deliberately NOT released yet. It is
+        // released after the successor has rebootstrapped, below, so
+        // the delayed work is let go into a world that already has a
+        // live successor — which is the interleaving a replay would
+        // show up in, and the one a release before promotion cannot
+        // reach.
 
         // Promotion, polled on the surviving tab.
         let old_generation = gen_a.parse::<u128>().ok();
@@ -1523,6 +1663,56 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
             && after_bodies
                 .iter()
                 .any(|b| b.as_slice() == after_nonce.as_bytes());
+
+        // NOW the delayed work is released, with a live successor
+        // already carrying traffic. Its reply has nowhere to go,
+        // which is the honest shape of "the remote operation may
+        // still have executed" — and what must NOT happen is a
+        // second invocation, which is the only shape a replay could
+        // take.
+        park_release.add_permits(1);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let park_invocations_after = park_log.lock().expect("park log").len();
+
+        // Predecessor silence, observed on the page that is still
+        // alive rather than assumed from its absence. Its session
+        // object is retained by the harness after `close()`, so it
+        // can be asked — and a retired owner must answer with a
+        // typed refusal rather than serving, and must still name its
+        // own generation rather than having adopted the successor's.
+        let predecessor = if driveable {
+            script
+                .run(
+                    "a",
+                    Step5::Call {
+                        id: 0,
+                        session: "lead".into(),
+                        service: ECHO_SERVICE.into(),
+                        payload: hex(b"after-retirement"),
+                        timeout_ms: 5_000,
+                    },
+                )
+                .await
+        } else {
+            fail("not attempted")
+        };
+        let predecessor_refused = !predecessor.ok && predecessor.kind.is_some();
+        let predecessor_info = if driveable {
+            script
+                .run(
+                    "a",
+                    Step5::Info {
+                        id: 0,
+                        session: "lead".into(),
+                    },
+                )
+                .await
+        } else {
+            fail("not attempted")
+        };
+        let predecessor_generation = predecessor_info.generation.clone().unwrap_or_default();
+        let predecessor_kept_its_generation = predecessor_generation == gen_a;
+        let echo_after_predecessor = echo_log.lock().expect("echo log").len();
         let interruption_ms = close_at.elapsed().as_millis();
 
         ledger.record(
@@ -1540,6 +1730,10 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                 && park_entered
                 && pending_failed_typed
                 && park_invocations == 1
+                && park_invocations_after == 1
+                && predecessor_refused
+                && predecessor_kept_its_generation
+                && echo_after_predecessor == 1
                 && promoted_role == "leader"
                 && generation_advanced
                 && rebootstrapped
@@ -1561,9 +1755,10 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                  announced `{RESTORE_TAG}` at runtime through the leader (ok={}), a call to \
                  `{PARK_SERVICE}` was issued and left outstanding and the anchor's handler \
                  confirmed it ENTERED={park_entered}; tab a's session then stood down \
-                 (ok={}) and its page was closed. The pending call failed with a TYPED \
-                 rejection={pending_failed_typed} (kind={:?} message={:?} info={:?}), and \
-                 the anchor's parked handler was entered {park_invocations} time(s) — \
+                 (ok={}) and **its page was left alive**. The pending call failed with a \
+                 TYPED rejection={pending_failed_typed} (kind={:?} message={:?} info={:?}), \
+                 naming the predecessor's own generation {gen_a:?}={names_old_generation}, \
+                 and the anchor's parked handler was entered {park_invocations} time(s) — \
                  exactly once is the requirement, so a silent replay fails here. Tab b was \
                  promoted to role={promoted_role:?} at generation={promoted_gen:?}, strictly \
                  higher than {gen_a:?}={generation_advanced}. The anchor then held a session \
@@ -1572,8 +1767,18 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                  find_best_node(require_tag=`{RESTORE_TAG}`) resolved to the node after the \
                  handoff={restored_tag}, so the runtime announcement intent survived it. A \
                  new nRPC round trip from the promoted tab reached the real handler and came \
-                 back={recovered_rpc}. End-to-end interruption, close → recovered round \
-                 trip: {interruption_ms} ms. ANCHOR STATE: {}",
+                 back={recovered_rpc}. The DELAYED work was released only after that \
+                 recovery, and the anchor's parked handler was still entered exactly \
+                 {park_invocations_after} time(s) afterwards, so letting it go beside a \
+                 live successor produced no second execution. PREDECESSOR SILENCE, read on \
+                 the page that is still open: its retired session refused a fresh call \
+                 with a typed failure={predecessor_refused} (kind={:?}), still reports its \
+                 own generation {predecessor_generation:?} rather than the successor's \
+                 ({predecessor_kept_its_generation}), and the anchor's echo handler was \
+                 entered {echo_after_predecessor} time(s) in total after the handoff — the \
+                 successor's one round trip and nothing from the retired owner. \
+                 End-to-end interruption, close → recovered round trip: \
+                 {interruption_ms} ms. ANCHOR STATE: {}",
                 if leader_hex.is_empty() {
                     "nothing"
                 } else {
@@ -1599,6 +1804,7 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                 pending_outcome.kind,
                 pending_outcome.message,
                 pending_outcome.info,
+                predecessor.kind,
                 peer_state(cx.anchor, leader_node),
             ),
         );

@@ -5083,6 +5083,14 @@ jobs:
       - name: wasm test runner (headless Chromium)
         env:
           CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+          # wasm-bindgen-test-runner kills the DRIVER at 20s per test,
+          # which surfaces as `driver status: exit code: 1` and a red
+          # job rather than as a test failure. One witness waits out
+          # the leaf's own 30s DEFAULT_CALL_TIMEOUT_MS, because that
+          # constant IS the thing under test: a follower call with no
+          # explicit timeout must expire on the default. Raise the
+          # runner's ceiling; do not shorten the witness.
+          WASM_BINDGEN_TEST_TIMEOUT: "120"
         run: |
           set -o pipefail
           for suite in wasm_leaf wasm_anchorless wasm_leader; do
@@ -5097,7 +5105,7 @@ jobs:
             # this step.
             case "$suite" in
               wasm_leaf)       floor=14 ;;
-              wasm_leader)     floor=6  ;;
+              wasm_leader)     floor=24 ;;
               wasm_anchorless) floor=2  ;;
             esac
             if [ "${ran:-0}" -lt "$floor" ]; then
@@ -5126,6 +5134,41 @@ jobs:
             }
           done
           echo "cross_lang replay: 8 vectors replayed inside wasm"
+          # E1 (Kyra, Stage 5 round 2): `wasm_leader` had a floor of 6
+          # against 18 witnesses and pinned none of them by name, so
+          # twelve lifecycle tests could vanish and the job would stay
+          # green. Every name is pinned, exactly as the leaf and
+          # anchorless rosters are.
+          for witness in a_promoted_tab_becomes_the_leader_and_serves_its_followers \
+                         a_follower_call_is_proxied_through_the_leader \
+                         a_follower_call_surfaces_the_leaders_typed_failure \
+                         a_follower_stream_is_proxied_bidirectionally \
+                         a_leader_that_goes_away_is_replaced_by_a_follower \
+                         a_replacement_leader_serves_the_surviving_followers \
+                         an_in_flight_call_across_a_leader_change_fails_indeterminate \
+                         a_call_after_the_change_reaches_the_new_leader \
+                         a_stale_generations_proxy_frame_is_refused \
+                         the_lock_is_released_when_the_leader_retires \
+                         a_follower_that_never_sees_a_leader_surfaces_no_leader \
+                         two_tabs_cannot_both_hold_the_leader_lock \
+                         a_followers_capabilities_are_announced_by_the_leader \
+                         a_departed_followers_capabilities_are_withdrawn \
+                         the_leaders_identity_survives_a_generation_change \
+                         a_followers_subscription_is_carried_by_the_leader \
+                         an_unroutable_follower_call_fails_typed_not_silently \
+                         a_second_promotion_does_not_duplicate_the_announcement \
+                         closing_a_promoting_tab_cancels_its_parked_bootstrap_and_frees_the_lock \
+                         a_promotion_whose_generation_transaction_fails_requeues_instead_of_stranding_the_tab \
+                         a_leaders_own_announcement_keeps_its_followers_capabilities \
+                         the_last_capability_declaring_followers_tag_is_withdrawn \
+                         a_follower_call_without_a_timeout_expires_on_the_leafs_default_deadline \
+                         an_explicitly_retired_leader_goes_quiet_at_its_peer_while_its_page_stays_alive; do
+            grep -q "^test $witness \.\.\. ok$" /tmp/wasm_leader.log || {
+              echo "::error::the leader lifecycle witness $witness did not run and pass inside wasm"
+              exit 1
+            }
+          done
+          echo "leader lifecycle: 24 witnesses executed in headless Chromium"
 
       # Exit criterion: the shipped bundle stays under 1.5 MB gzipped.
       - name: Bundle size

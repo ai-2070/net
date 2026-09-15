@@ -72,6 +72,12 @@ const nodes = new Map();
 /// always fulfils, carrying either the reply or the typed failure, so
 /// an unhandled rejection can never escape between the two steps.
 const pending = new Map();
+/// What an armed re-entrant listener observed, keyed by session name.
+///
+/// Kept outside `nodes` because the event that fires it is the
+/// session's own teardown: the report has to be readable after the
+/// node it belonged to is gone.
+const reentry = new Map();
 
 function log(line) {
   const text = '[' + TAB + '] ' + line;
@@ -417,10 +423,81 @@ async function execute(step) {
       }
     }
 
+    // A listener on a DIRECT node that calls straight back into it.
+    //
+    // Both re-entrant calls are SYNCHRONOUS on the direct surface —
+    // `counters()` reads the node, `openStream()` mutates it — so
+    // each one lands inside whatever borrow the callback was invoked
+    // under. A page doing this is ordinary ("log the final counters
+    // when the session drops"), and the documented echo shape
+    // (`onMessage(p => stream.send(p))`) is the same schedule. If the
+    // events are dispatched while the node is borrowed, the first of
+    // these traps the wasm module instead of answering.
+    case 'arm_reentry': {
+      const node = nodes.get(step.session);
+      if (!node) return { ok: false, error: 'no such session ' + step.session };
+      // Registered on the GENERATED wasm node, not on the wrapper's
+      // event hub. Two reasons, both about testing the real thing:
+      // the wrapper detaches its own listeners before it calls
+      // `inner.close()`, so a hub listener never sees the teardown
+      // event at all; and the callback path under test *is* the raw
+      // `on_event`/`on_message` one — it is what the wrapper feeds
+      // from and what `LeafStream.onMessage` registers.
+      const wasmNode = node.inner && typeof node.inner.on_event === 'function' ? node.inner : null;
+      if (!wasmNode) {
+        return {
+          ok: false,
+          error: 'the generated wasm node is not reachable through the package object',
+        };
+      }
+      const state = {
+        fired: 0,
+        counters_keys: 0,
+        counters_error: null,
+        stream_outcome: null,
+        trapped: null,
+      };
+      reentry.set(step.session, state);
+      wasmNode.on_event(() => {
+        state.fired += 1;
+        // One shot: the report is about the first re-entry, and a
+        // second listener call must not overwrite what it saw.
+        if (state.fired > 1) return;
+        try {
+          const counters = node.counters();
+          state.counters_keys = Object.keys(counters || {}).length;
+        } catch (e) {
+          state.counters_error = (e && (e.message || String(e))) || 'unknown';
+          state.trapped = 'counters';
+          return;
+        }
+        try {
+          node.openStream({ reliability: 'fireAndForget', reliable: false });
+          state.stream_outcome = 'opened';
+        } catch (e) {
+          // A typed refusal is a correct answer here — the node is
+          // closed by the time its teardown event is delivered. A
+          // RefCell trap is not, and carries no `kind`.
+          state.stream_outcome = (e && e.kind) || 'trapped';
+          if (!(e && e.kind)) state.trapped = 'openStream';
+        }
+      });
+      return { ok: true };
+    }
+
+    case 'reentry_report': {
+      const state = reentry.get(step.session);
+      if (!state) return { ok: false, error: 'nothing armed on ' + step.session };
+      return { ok: true, info: JSON.stringify(state) };
+    }
+
     case 'close': {
       const node = nodes.get(step.session);
       if (!node) return { ok: false, error: 'no such session ' + step.session };
-      nodes.delete(step.session);
+      // Deliberately still addressable. A closed session that
+      // refuses is the observation a retirement witness needs, and a
+      // later `connect` under the same name replaces the entry
+      // anyway.
       try {
         node.close();
       } catch (e) {

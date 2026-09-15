@@ -96,15 +96,53 @@ export class FakeSession implements LeafWasmSession {
   enrollCalls = 0;
   closed = false;
   private sink: ((json: string) => void) | null = null;
+  /**
+   * The generation this tab currently holds.
+   *
+   * Mutable because a handoff is the one thing about this boundary
+   * the TypeScript layer has to react to on its own: an abrupt
+   * leader disappearance produces a `leader_changed` and a moved
+   * generation, and nothing else.
+   */
+  private current: string;
+  /**
+   * Held by the next `open_stream`, so a test can have an open in
+   * flight across a notification.
+   */
+  private openBarrier: Promise<void> | null = null;
 
-  constructor(private readonly behaviour: FakeSessionBehaviour = {}) {}
+  constructor(private readonly behaviour: FakeSessionBehaviour = {}) {
+    this.current = behaviour.generation ?? '1';
+  }
+
+  /**
+   * Park the next `open_stream` until the returned function is
+   * called, the way a follower's proxy round trip parks.
+   */
+  parkNextOpen(): () => void {
+    let release = (): void => {};
+    this.openBarrier = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    return release;
+  }
+
+  /**
+   * A successor took over: the generation moves and the tab is told
+   * it changed. What an abrupt disappearance looks like — no
+   * `leader_lost`, because the page that vanished never sent one.
+   */
+  handoff(generation: string): void {
+    this.current = generation;
+    this.emit(`{"type":"leader_changed","generation":"${generation}"}`);
+  }
 
   role(): string {
     return this.behaviour.role ?? 'leader';
   }
 
   generation(): string {
-    return this.behaviour.generation ?? '1';
+    return this.current;
   }
 
   node_id_hex(): string | undefined {
@@ -164,6 +202,11 @@ export class FakeSession implements LeafWasmSession {
 
   async open_stream(options: LeafWasmStreamOptions): Promise<LeafWasmProxyStream> {
     if (this.behaviour.streamError !== undefined) throw this.behaviour.streamError;
+    const parked = this.openBarrier;
+    if (parked) {
+      this.openBarrier = null;
+      await parked;
+    }
     const stream = new FakeProxyStream(options, this.behaviour.streamSendError ?? null);
     this.streams.push(stream);
     return stream;

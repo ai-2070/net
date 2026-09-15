@@ -96,3 +96,8 @@ net/crates/net/sdk-py/build/
 
 # Notes
 notes/*.md
+
+# Locally installed browser drivers for the Stage 5 browser matrix. The
+# harness resolves a chromedriver from CHROMEDRIVER or PATH; keeping one
+# in-tree is convenient and must never be committed.
+.tools/

@@ -108,6 +108,27 @@ struct Inner {
     /// inside a JS callback and must not re-enter a `RefCell` the
     /// pump may already hold.
     inbox: VecDeque<(NodeId, Bytes)>,
+    /// Event JSON the node produced and no listener has seen yet.
+    ///
+    /// The outbound twin of `inbox`, and it exists for the same
+    /// reason: a listener must not be called while this cell is
+    /// borrowed. It used to be — `flush` emitted straight out of
+    /// `&mut self` — so the documented
+    /// `stream.onMessage(p => stream.send(p))` re-entered
+    /// `borrow_mut` and trapped, and so did closing the node from a
+    /// callback. Collected here, handed out by
+    /// [`dispatch_events`] with no borrow held.
+    outbox: Vec<String>,
+    /// Whether a dispatch is already walking the outbox.
+    ///
+    /// A callback that sends re-enters [`dispatch_events`] through
+    /// the pump it triggers. Without this the events that send
+    /// produced would be delivered *inside* the listener that caused
+    /// them — a listener seeing its own consequence before returning
+    /// — and a chatty callback would recurse as deep as it sent.
+    /// The inner call leaves them in the outbox and the outer loop
+    /// picks them up, so order is arrival order either way.
+    dispatching: bool,
     listeners: Vec<js_sys::Function>,
     closed: bool,
 }
@@ -133,7 +154,10 @@ impl Inner {
 
     /// Deliver everything that has arrived: hand each queued
     /// datagram to the node, push everything the node produced to
-    /// the transport, and fire the listeners.
+    /// the transport, and collect its events for dispatch.
+    ///
+    /// Collect, not dispatch: see [`Inner::outbox`]. The listeners
+    /// are called by [`dispatch_events`] once this borrow is gone.
     ///
     /// This is the arrival path, and it runs **without** the
     /// periodic sweep: what an inbound packet owes its sender is an
@@ -173,8 +197,8 @@ impl Inner {
         self.flush();
     }
 
-    /// Put everything the node queued on the wire and hand the
-    /// application everything it produced.
+    /// Put everything the node queued on the wire and collect
+    /// everything it produced for the application.
     fn flush(&mut self) {
         for out in self.node.take_outbound() {
             if let Err(e) = self.transport.send(out.peer, out.packet) {
@@ -184,17 +208,67 @@ impl Inner {
             }
         }
         let events = self.node.drain_events();
-        for event in &events {
-            self.emit(event);
-        }
+        self.collect(events);
     }
 
-    fn emit(&self, event: &LeafEvent) {
-        let json = JsValue::from_str(&event.to_json());
-        for listener in &self.listeners {
-            let _ = listener.call1(&JsValue::NULL, &json);
+    /// Queue `events` for the listeners.
+    fn collect(&mut self, events: Vec<LeafEvent>) {
+        self.outbox
+            .extend(events.iter().map(crate::node::LeafEvent::to_json));
+    }
+}
+
+/// Hand every collected event to the listeners, holding no borrow
+/// while one runs.
+///
+/// The whole point of the outbox. A listener is application code and
+/// is documented to be able to call back in — `stream.send` from
+/// `onMessage` is the shape the TypeScript surface advertises — so
+/// the borrow has to be released *between* collecting an event and
+/// delivering it, not merely dropped afterwards. Each turn of the
+/// loop takes the outbox and the listener list under a short borrow
+/// and then lets go, so a callback's own send is admitted, pumps,
+/// and leaves its events for the next turn.
+fn dispatch_events(inner: &Rc<RefCell<Inner>>) {
+    loop {
+        let (events, listeners) = {
+            // A pump that is already running owns this cell, and its
+            // own dispatch will deliver what we would have.
+            let Ok(mut guard) = inner.try_borrow_mut() else {
+                return;
+            };
+            if guard.dispatching || guard.outbox.is_empty() {
+                return;
+            }
+            guard.dispatching = true;
+            (core::mem::take(&mut guard.outbox), guard.listeners.clone())
+        };
+        for json in events {
+            let value = JsValue::from_str(&json);
+            for listener in &listeners {
+                let _ = listener.call1(&JsValue::NULL, &value);
+            }
+        }
+        // Cleared after delivery, so a callback's re-entrant dispatch
+        // during the loop above was the one this guard shut out.
+        if let Ok(mut guard) = inner.try_borrow_mut() {
+            guard.dispatching = false;
+        } else {
+            return;
         }
     }
+}
+
+/// Run `work` under the node's borrow, then deliver whatever it
+/// produced with no borrow held.
+///
+/// Every entry point that pumps goes through here, which is what
+/// makes the no-borrow-during-a-callback rule a property of the
+/// module rather than a discipline each method has to remember.
+fn with_node<T>(inner: &Rc<RefCell<Inner>>, work: impl FnOnce(&mut Inner) -> T) -> T {
+    let outcome = work(&mut inner.borrow_mut());
+    dispatch_events(inner);
+    outcome
 }
 
 /// A browser node.
@@ -249,6 +323,8 @@ impl LeafNode {
             dialog: 0,
             invite: credential.invite.clone(),
             inbox: VecDeque::new(),
+            outbox: Vec::new(),
+            dispatching: false,
             listeners: Vec::new(),
             closed: false,
         }));
@@ -271,12 +347,21 @@ impl LeafNode {
         // which the leaf can answer in time.
         let weak: Weak<RefCell<Inner>> = Rc::downgrade(&inner);
         let sink: crate::rtc::InboundSink = Rc::new(move |peer, bytes| {
-            if let Some(inner) = weak.upgrade() {
-                if let Ok(mut inner) = inner.try_borrow_mut() {
-                    inner.inbox.push_back((peer, bytes));
-                    inner.deliver();
-                }
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
+            {
+                let Ok(mut guard) = inner.try_borrow_mut() else {
+                    return;
+                };
+                guard.inbox.push_back((peer, bytes));
+                guard.deliver();
             }
+            // Outside the borrow, deliberately: a `stream_data`
+            // listener is where an application answers, and the
+            // answer is a synchronous `send` back into this same
+            // cell.
+            dispatch_events(&inner);
         });
         inner.borrow_mut().transport = RtcLeafTransport::new(sink);
 
@@ -398,23 +483,20 @@ impl LeafNode {
         payload: Uint8Array,
         timeout_ms: Option<f64>,
     ) -> Result<Uint8Array, JsError> {
-        let receiver = {
-            let mut guard = self.inner.borrow_mut();
-            guard.admit().map_err(js)?;
+        let receiver = with_node(&self.inner, |guard| {
+            guard.admit()?;
             let peer = guard.anchor;
-            let receiver = guard
-                .node
-                .call(
-                    peer,
-                    &service,
-                    &payload.to_vec(),
-                    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-                    timeout_ms.map(|ms| ms.max(0.0) as u64),
-                )
-                .map_err(js)?;
+            let receiver = guard.node.call(
+                peer,
+                &service,
+                &payload.to_vec(),
+                #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                timeout_ms.map(|ms| ms.max(0.0) as u64),
+            )?;
             guard.pump();
-            receiver
-        };
+            Ok::<_, LeafError>(receiver)
+        })
+        .map_err(js)?;
         match receiver.await {
             Ok(Ok(body)) => Ok(Uint8Array::from(&body[..])),
             Ok(Err(e)) => Err(js(LeafError::Rpc(e))),
@@ -428,25 +510,26 @@ impl LeafNode {
 
     /// Subscribe to `channel` on the anchor.
     pub async fn subscribe(&self, channel: String) -> Result<(), JsError> {
-        let mut guard = self.inner.borrow_mut();
-        guard.admit().map_err(js)?;
-        let peer = guard.anchor;
-        guard.node.subscribe(peer, &channel).map_err(js)?;
-        guard.pump();
-        Ok(())
+        with_node(&self.inner, |guard| {
+            guard.admit()?;
+            let peer = guard.anchor;
+            guard.node.subscribe(peer, &channel)?;
+            guard.pump();
+            Ok::<_, LeafError>(())
+        })
+        .map_err(js)
     }
 
     /// Publish `payload` on `channel`.
     pub async fn publish(&self, channel: String, payload: Uint8Array) -> Result<(), JsError> {
-        let mut guard = self.inner.borrow_mut();
-        guard.admit().map_err(js)?;
-        let peer = guard.anchor;
-        guard
-            .node
-            .publish(peer, &channel, &payload.to_vec())
-            .map_err(js)?;
-        guard.pump();
-        Ok(())
+        with_node(&self.inner, |guard| {
+            guard.admit()?;
+            let peer = guard.anchor;
+            guard.node.publish(peer, &channel, &payload.to_vec())?;
+            guard.pump();
+            Ok::<_, LeafError>(())
+        })
+        .map_err(js)
     }
 
     /// Open an application stream.
@@ -519,19 +602,18 @@ impl LeafNode {
     /// `capabilities` become tags alongside the mandatory `leaf` and
     /// `transport:rtc`; `reflex_addr` and `rtc_addr` stay absent.
     pub async fn announce(&self, capabilities: Vec<String>) -> Result<(), JsError> {
-        let mut guard = self.inner.borrow_mut();
-        guard.admit().map_err(js)?;
-        let announcement = guard.node.build_announcement(&capabilities).map_err(js)?;
-        let peer = guard.anchor;
-        // v1's control plane has no publish endpoint; §7's
-        // reachability path is the data one — the anchor floods what
-        // it receives.
-        guard
-            .node
-            .announce_to_peer(peer, &announcement)
-            .map_err(js)?;
-        guard.pump();
-        Ok(())
+        with_node(&self.inner, |guard| {
+            guard.admit()?;
+            let announcement = guard.node.build_announcement(&capabilities)?;
+            let peer = guard.anchor;
+            // v1's control plane has no publish endpoint; §7's
+            // reachability path is the data one — the anchor floods
+            // what it receives.
+            guard.node.announce_to_peer(peer, &announcement)?;
+            guard.pump();
+            Ok::<_, LeafError>(())
+        })
+        .map_err(js)
     }
 
     /// Answer a capability query from the announcements this leaf
@@ -593,20 +675,23 @@ impl LeafNode {
     /// nothing here retries. Retrying would burn it and turn a
     /// legible refusal into an illegible replay.
     pub async fn enroll(&self) -> Result<(), JsError> {
-        let receiver = {
-            let mut guard = self.inner.borrow_mut();
-            guard.admit().map_err(js)?;
+        let Some(receiver) = with_node(&self.inner, |guard| {
+            guard.admit()?;
             if guard.node.is_enrolled() {
-                return Ok(());
+                return Ok(None);
             }
             let peer = guard.anchor;
             let invite = guard.invite.clone();
-            let receiver = guard
-                .node
-                .begin_enrollment(peer, &invite, "net-mesh-leaf", &[], None)
-                .map_err(js)?;
+            let receiver =
+                guard
+                    .node
+                    .begin_enrollment(peer, &invite, "net-mesh-leaf", &[], None)?;
             guard.pump();
-            receiver
+            Ok::<_, LeafError>(Some(receiver))
+        })
+        .map_err(js)?
+        else {
+            return Ok(());
         };
         let reply = match receiver.await {
             Ok(Ok(body)) => body,
@@ -617,10 +702,12 @@ impl LeafNode {
                 ))))
             }
         };
-        let mut guard = self.inner.borrow_mut();
-        guard.node.finish_enrollment(&reply).map_err(js)?;
-        guard.pump();
-        Ok(())
+        with_node(&self.inner, |guard| {
+            guard.node.finish_enrollment(&reply)?;
+            guard.pump();
+            Ok::<_, LeafError>(())
+        })
+        .map_err(js)
     }
 
     /// Whether the anchor has admitted this leaf.
@@ -639,23 +726,22 @@ impl LeafNode {
     /// Pending calls fail `RpcError::SessionLost` — typed, and not
     /// re-issued by anybody.
     pub fn close(&self) {
-        let mut guard = self.inner.borrow_mut();
-        guard.closed = true;
-        let anchor = guard.anchor;
-        guard.node.drop_session(anchor, "the node was closed");
-        // The attempt ends through the boundary: closing the
-        // carrier's socket is the carrier's business, not this
-        // module's.
-        let control = guard.control.clone();
-        let dialog = guard.dialog;
-        wasm_bindgen_futures::spawn_local(async move {
-            let _ = control.end_attempt(dialog).await;
+        with_node(&self.inner, |guard| {
+            guard.closed = true;
+            let anchor = guard.anchor;
+            guard.node.drop_session(anchor, "the node was closed");
+            // The attempt ends through the boundary: closing the
+            // carrier's socket is the carrier's business, not this
+            // module's.
+            let control = guard.control.clone();
+            let dialog = guard.dialog;
+            wasm_bindgen_futures::spawn_local(async move {
+                let _ = control.end_attempt(dialog).await;
+            });
+            guard.transport.close_all();
+            let events = guard.node.drain_events();
+            guard.collect(events);
         });
-        guard.transport.close_all();
-        let events = guard.node.drain_events();
-        for event in &events {
-            guard.emit(event);
-        }
     }
 
     /// Retire the node because leadership moved off this tab, and say
@@ -673,25 +759,24 @@ impl LeafNode {
     /// `closed` is set **first**, so the pump the failure path runs
     /// through emits nothing, and everything after it is teardown.
     pub fn retire(&self, generation: u64) -> usize {
-        let mut guard = self.inner.borrow_mut();
-        if guard.closed {
-            return 0;
-        }
-        guard.closed = true;
-        let failed = guard.node.fail_calls_on_leader_loss(generation);
-        let anchor = guard.anchor;
-        guard.node.drop_session(anchor, "leadership was released");
-        let control = guard.control.clone();
-        let dialog = guard.dialog;
-        wasm_bindgen_futures::spawn_local(async move {
-            let _ = control.end_attempt(dialog).await;
-        });
-        guard.transport.close_all();
-        let events = guard.node.drain_events();
-        for event in &events {
-            guard.emit(event);
-        }
-        failed
+        with_node(&self.inner, |guard| {
+            if guard.closed {
+                return 0;
+            }
+            guard.closed = true;
+            let failed = guard.node.fail_calls_on_leader_loss(generation);
+            let anchor = guard.anchor;
+            guard.node.drop_session(anchor, "leadership was released");
+            let control = guard.control.clone();
+            let dialog = guard.dialog;
+            wasm_bindgen_futures::spawn_local(async move {
+                let _ = control.end_attempt(dialog).await;
+            });
+            guard.transport.close_all();
+            let events = guard.node.drain_events();
+            guard.collect(events);
+            failed
+        })
     }
 }
 
@@ -716,15 +801,20 @@ impl LeafStream {
 
     /// Send one payload. The bytes ride verbatim as one event in one
     /// packet — no leaf-added framing.
+    ///
+    /// Callable from [`Self::on_message`]: the borrow this takes is
+    /// released before any listener runs, which is what makes
+    /// `stream.onMessage(p => stream.send(p))` — the echo shape the
+    /// TypeScript surface advertises — a supported operation rather
+    /// than a `RefCell` trap.
     pub fn send(&self, payload: Uint8Array) -> Result<(), JsError> {
-        let mut guard = self.inner.borrow_mut();
-        guard.admit().map_err(js)?;
-        guard
-            .node
-            .stream_send(self.handle, &payload.to_vec())
-            .map_err(js)?;
-        guard.pump();
-        Ok(())
+        with_node(&self.inner, |guard| {
+            guard.admit()?;
+            guard.node.stream_send(self.handle, &payload.to_vec())?;
+            guard.pump();
+            Ok::<_, LeafError>(())
+        })
+        .map_err(js)
     }
 
     /// Listen for this stream's inbound payloads.
@@ -748,6 +838,12 @@ impl LeafStream {
     /// why its `onMessage` and its async iterator yield
     /// `Uint8Array`; a host wiring this callback itself must parse
     /// the same way.
+    ///
+    /// The callback runs with **no** borrow of the node held, so it
+    /// may call straight back in: [`Self::send`], [`LeafNode::close`]
+    /// and the rest are all reachable from here. That was not true
+    /// before — the event was emitted from inside `flush`'s `&mut
+    /// self` — so the advertised echo trapped instead of sending.
     pub fn on_message(&self, callback: js_sys::Function) {
         let wanted = format!("\"stream_id\":\"{}\"", self.handle.stream_id);
         let filter = Closure::wrap(Box::new(move |json: JsValue| {
@@ -766,10 +862,27 @@ impl LeafStream {
 
     /// Stop using the stream. The session stays; a stream is
     /// per-stream state, not a connection.
+    ///
+    /// Nothing leaves the wire: one DataChannel carries every stream
+    /// and there is no per-stream teardown frame. What it does do is
+    /// release the node's own per-stream state — the receive cursor
+    /// and the stream's classification — through the same fenced
+    /// entry point a stale handle is refused by. It used to do
+    /// literally nothing, which meant a proxied `StreamClose`
+    /// removed the leader's handle and left the node holding the
+    /// stream: a page that closed and reopened the same id got the
+    /// old cursor.
+    ///
+    /// A refusal here is reported rather than returned: the handle is
+    /// being discarded either way, and `close` is the one operation
+    /// for which "it was already gone" is the outcome the caller
+    /// wanted.
     pub fn close(&self) {
-        // Nothing to tear down transport-side: one DataChannel
-        // carries every stream, and the wire session owns the
-        // per-stream state. Kept so the TS surface is symmetric.
+        with_node(&self.inner, |guard| {
+            if let Err(e) = guard.node.close_stream(self.handle) {
+                console_error(&format!("net-mesh-leaf: stream close: {e}"));
+            }
+        });
     }
 }
 
@@ -902,12 +1015,12 @@ async fn wait_for_session(inner: &Rc<RefCell<Inner>>, peer: NodeId) -> Result<()
         if let Err(e) = service_control_plane(inner).await {
             dialog_ended = Some(e);
         }
-        {
-            let mut guard = inner.borrow_mut();
+        let installed = with_node(inner, |guard| {
             guard.pump();
-            if guard.node.has_session(peer) {
-                return Ok(());
-            }
+            guard.node.has_session(peer)
+        });
+        if installed {
+            return Ok(());
         }
         gloo_timer_sleep(TICK_MS).await.ok();
         waited += TICK_MS;
@@ -964,13 +1077,23 @@ fn start_ticker(inner: Weak<RefCell<Inner>>) {
             // the node: the session outlives the bootstrap dialog,
             // and the anchor closing it is normal.
             let _ = service_control_plane(&inner).await;
-            let Ok(mut guard) = inner.try_borrow_mut() else {
-                continue;
+            let stopped = {
+                let Ok(mut guard) = inner.try_borrow_mut() else {
+                    continue;
+                };
+                if guard.closed {
+                    true
+                } else {
+                    guard.pump();
+                    false
+                }
             };
-            if guard.closed {
+            if stopped {
                 return;
             }
-            guard.pump();
+            // After the borrow, so a listener that sends or closes
+            // from here is doing so on an unborrowed node.
+            dispatch_events(&inner);
         }
     });
 }

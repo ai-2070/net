@@ -101,17 +101,46 @@ export class MeshSession {
    * iteration a page is already written to handle.
    */
   private readonly streams = new Set<LeafStream>();
+  /**
+   * The generation the streams in that set were opened under.
+   *
+   * Tracked because the generation moving is the *only* signal an
+   * abrupt leader disappearance gives. A page that crashes or
+   * navigates away never sends its `leader_lost` announcement: the
+   * promoted follower fails its own pending requests and reports
+   * `leader_changed`, and so does every other surviving follower
+   * when the successor's Leadership arrives. The Rust handle then
+   * correctly suppresses the old stream's bytes by its opening
+   * generation — which is precisely what leaves a consumer sitting
+   * in `await iterator.next()` forever, waiting on a stream that is
+   * now guaranteed never to emit again.
+   */
+  private streamGeneration: string;
   private closed = false;
 
   /** @internal — use {@link openSession}. */
   constructor(private readonly inner: LeafWasmSession) {
+    this.streamGeneration = inner.generation();
     inner.on_event((json) => this.hub.deliver(json, parseSessionEvent));
     this.hub.onAny((event) => {
       // `leader_lost` is this tab losing the leader it was talking
       // to; `not_leader` is this tab discovering it *was* the leader
       // and is not any more. Either way every stream this session
-      // handed out belonged to a node that is gone.
-      if (event.type === 'leader_lost' || event.type === 'not_leader') this.endStreams();
+      // handed out belonged to a node that is gone — and neither
+      // moves this tab's generation, so both are named explicitly.
+      if (event.type === 'leader_lost' || event.type === 'not_leader') {
+        this.endStreams();
+        return;
+      }
+      // And the abrupt case: a generation that moved under us. Read
+      // off the session rather than out of the event, so a
+      // `leader_changed` that merely repeats the generation this
+      // tab already holds ends nothing — a duplicate notification
+      // must not kill the streams the new generation just opened.
+      const current = this.inner.generation();
+      if (current === this.streamGeneration) return;
+      this.streamGeneration = current;
+      this.endStreams();
     });
   }
 
@@ -166,6 +195,13 @@ export class MeshSession {
    * tab running the node was replaced while the call was in flight.
    * Never a silent retry: §8's rule is that the caller is told and
    * decides.
+   *
+   * On a follower the deadline is armed here as well as on the
+   * leader, and that is true whether or not `timeoutMs` was given:
+   * omitting it takes the leaf's own 30 s default rather than
+   * leaving the promise to a leader that may be frozen. Either way
+   * expiry is `rpc-indeterminate` — the work may already have been
+   * admitted in the other tab, and nothing here re-issues it.
    */
   async call(service: string, payload: Uint8Array, timeoutMs?: number): Promise<Uint8Array> {
     return await this.guard(() => this.inner.call(service, payload, timeoutMs));
@@ -241,10 +277,22 @@ export class MeshSession {
    * the handle is retained here and ended when leadership moves, so
    * `for await (const payload of stream)` finishes instead of hanging
    * on a node that is gone.
+   *
+   * That guarantee has to cover the open itself. On a follower this
+   * is a proxy round trip, so a result can arrive *after* the
+   * leadership-loss notification that already drained the retained
+   * set — and the handle it carries was stamped by Rust with the
+   * generation the request was issued under, so it is stale on
+   * arrival. Registering it would put a permanently silent stream
+   * into a set nothing will drain again. The generation is therefore
+   * captured before the await and compared after it, and a crossing
+   * result is ended exactly as a consumer a microtask later would
+   * have seen it.
    */
   async openStream(options: OpenStreamOptions): Promise<LeafStream> {
+    const openedUnder = this.inner.generation();
     const stream = new LeafStream(await this.guard(() => this.inner.open_stream(options)));
-    if (this.closed) {
+    if (this.closed || this.inner.generation() !== openedUnder) {
       // Leadership (or this session) went away while the open was in
       // flight. Ending it here is the same disposition a consumer
       // would have got a microtask later, rather than a live handle
@@ -314,7 +362,8 @@ export class MeshSession {
    * `LeafStream.close` ends each waiting consumer and clears the
    * listeners, which is precisely the disposition D2 specifies for a
    * stream across a leader change: failed and observable, never
-   * resurrected and never left pending. Called on leadership loss and
+   * resurrected and never left pending. Called on explicit
+   * leadership loss, on a generation that moved under this tab, and
    * on close; idempotent, because a page may have closed a stream
    * itself.
    */

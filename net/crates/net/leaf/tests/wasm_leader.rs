@@ -35,8 +35,15 @@
 //! ```text
 //! CHROMEDRIVER=<chromedriver matching the system Chrome> \
 //! CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
+//! WASM_BINDGEN_TEST_TIMEOUT=120 \
 //! cargo test --target wasm32-unknown-unknown --test wasm_leader
 //! ```
+//!
+//! `WASM_BINDGEN_TEST_TIMEOUT` is required, not advisory: the
+//! runner's default is 20 seconds per test and
+//! `a_follower_call_without_a_timeout_expires_on_the_leafs_default_deadline`
+//! waits out the leaf's own 30-second call default. Without it that
+//! test kills the driver rather than failing an assertion.
 
 #![cfg(target_arch = "wasm32")]
 
@@ -241,6 +248,77 @@ fn delayed_factory(
     })
 }
 
+/// What a parked bootstrap did, as seen from inside the factory.
+///
+/// The discriminator L1 needs. A factory barrier alone cannot tell
+/// "the bootstrap was cancelled" from "the bootstrap finished late":
+/// both leave the log empty until the barrier is released. So the
+/// factory future itself records whether it was **dropped while
+/// parked**, which is only possible if something owned and cancelled
+/// it.
+#[derive(Default)]
+struct BootstrapMarks {
+    entered: Cell<usize>,
+    resumed: Cell<usize>,
+    abandoned: Cell<usize>,
+}
+
+/// Armed while a factory future is parked; counts an abandonment if
+/// that future is dropped before it resumed.
+struct Abandonment {
+    marks: Rc<BootstrapMarks>,
+    armed: Cell<bool>,
+}
+
+impl Drop for Abandonment {
+    fn drop(&mut self) {
+        if self.armed.get() {
+            self.marks.abandoned.set(self.marks.abandoned.get() + 1);
+        }
+    }
+}
+
+/// A factory whose `nth` invocation parks on `barrier` and reports,
+/// through `marks`, whether it was cancelled there.
+fn observed_factory(
+    node_id: u64,
+    log: Rc<RefCell<Log>>,
+    nth: usize,
+    barrier: oneshot::Receiver<()>,
+    marks: Rc<BootstrapMarks>,
+) -> BackendFactory {
+    let barrier = Rc::new(RefCell::new(Some(barrier)));
+    let invocations = Rc::new(Cell::new(0usize));
+    Rc::new(move |_opts, _sink, _lease| {
+        let log = log.clone();
+        let barrier = barrier.clone();
+        let marks = marks.clone();
+        let invocation = invocations.get();
+        invocations.set(invocation + 1);
+        Box::pin(async move {
+            if invocation == nth {
+                marks.entered.set(marks.entered.get() + 1);
+                let abandonment = Abandonment {
+                    marks: marks.clone(),
+                    armed: Cell::new(true),
+                };
+                let parked = barrier.borrow_mut().take();
+                if let Some(parked) = parked {
+                    let _ = parked.await;
+                }
+                abandonment.armed.set(false);
+                marks.resumed.set(marks.resumed.get() + 1);
+            }
+            let backend: Box<dyn LeaderBackend> = Box::new(TestBackend {
+                node_id,
+                log,
+                hold_calls: false,
+            });
+            Ok(backend)
+        })
+    })
+}
+
 // ──────────────── a backend over a REAL leaf node ────────────────
 
 /// The handles a test keeps on its real-node backend.
@@ -250,6 +328,10 @@ struct RealNode {
     peer: u64,
     /// Packets the node produced, counted as operations complete.
     sent: Rc<Cell<usize>>,
+    /// And the packets themselves, so the **peer** can be the oracle
+    /// rather than the sender's own counter: "the retired node went
+    /// quiet" is a claim about what arrived somewhere else.
+    wire: Rc<RefCell<Vec<(u64, Bytes)>>>,
     /// How many pending calls the retirement failed.
     failed: Rc<Cell<usize>>,
     /// Released by the test: the operation that parks before it
@@ -299,8 +381,12 @@ impl LeaderBackend for RealNodeBackend {
                     let mut node = handles.node.borrow_mut();
                     let issued =
                         node.call(handles.peer, &service, &payload, timeout_ms.map(u64::from));
-                    let produced = node.take_outbound().len();
-                    handles.sent.set(handles.sent.get() + produced);
+                    let produced = node.take_outbound();
+                    handles.sent.set(handles.sent.get() + produced.len());
+                    handles
+                        .wire
+                        .borrow_mut()
+                        .extend(produced.into_iter().map(|out| (out.peer, out.packet)));
                     issued
                 };
                 match issued {
@@ -329,8 +415,12 @@ impl LeaderBackend for RealNodeBackend {
                     let outcome = {
                         let mut node = handles.node.borrow_mut();
                         let outcome = node.publish(handles.peer, &channel, &payload);
-                        let produced = node.take_outbound().len();
-                        handles.sent.set(handles.sent.get() + produced);
+                        let produced = node.take_outbound();
+                        handles.sent.set(handles.sent.get() + produced.len());
+                        handles
+                            .wire
+                            .borrow_mut()
+                            .extend(produced.into_iter().map(|out| (out.peer, out.packet)));
                         outcome
                     };
                     match outcome {
@@ -343,8 +433,12 @@ impl LeaderBackend for RealNodeBackend {
                 let outcome = {
                     let mut node = handles.node.borrow_mut();
                     let outcome = node.subscribe(handles.peer, &channel);
-                    let produced = node.take_outbound().len();
-                    handles.sent.set(handles.sent.get() + produced);
+                    let produced = node.take_outbound();
+                    handles.sent.set(handles.sent.get() + produced.len());
+                    handles
+                        .wire
+                        .borrow_mut()
+                        .extend(produced.into_iter().map(|out| (out.peer, out.packet)));
                     outcome
                 };
                 match outcome {
@@ -374,6 +468,76 @@ impl LeaderBackend for RealNodeBackend {
         self.handles.failed.set(failed);
         failed
     }
+}
+
+/// Collect this session's event JSON, so a test can assert on what a
+/// page would have observed.
+fn record_events(lifecycle: &Lifecycle) -> Rc<RefCell<Vec<String>>> {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let writing = seen.clone();
+    let callback = Closure::wrap(Box::new(move |json: JsValue| {
+        if let Some(text) = json.as_string() {
+            writing.borrow_mut().push(text);
+        }
+    }) as Box<dyn FnMut(JsValue)>);
+    lifecycle.on_event(
+        callback
+            .as_ref()
+            .unchecked_ref::<js_sys::Function>()
+            .clone(),
+    );
+    callback.forget();
+    seen
+}
+
+/// The capability list of the most recent `Announce` a backend
+/// performed.
+///
+/// The *last* one, deliberately: what the network currently believes
+/// is the document published most recently, and an earlier correct
+/// announcement followed by a narrower one is precisely the defect
+/// reconciliation exists to prevent.
+fn last_announcement(log: &Rc<RefCell<Log>>) -> Option<Vec<String>> {
+    log.borrow()
+        .performed
+        .iter()
+        .rev()
+        .find_map(|request| match request {
+            LeaderRequest::Announce { capabilities } => Some(capabilities.clone()),
+            _ => None,
+        })
+}
+
+/// Hand every packet the leader's node produced to the real peer, and
+/// say how many arrived.
+///
+/// The peer is the oracle. "The retired node sent nothing more" read
+/// off the sender's own queue cannot tell "produced nothing" from
+/// "produced something that was never charged"; the peer's
+/// authenticated ingress can.
+fn deliver_to_peer(handles: &RealNode, peer: &mut net_leaf::LeafNode) -> usize {
+    let packets = core::mem::take(&mut *handles.wire.borrow_mut());
+    let count = packets.len();
+    let now = net_leaf::clock::now();
+    for (to, packet) in packets {
+        assert_eq!(to, peer.node_id(), "the leader's packets are for its peer");
+        peer.on_datagram(handles.node.borrow().node_id(), packet, now);
+    }
+    peer.take_outbound();
+    peer.drain_events();
+    count
+}
+
+/// The peer's own authenticated-ingress count, read through the
+/// counter JSON the surface publishes.
+fn peer_packets_in(peer: &net_leaf::LeafNode) -> u64 {
+    let json: serde_json::Value =
+        serde_json::from_str(&peer.counters().to_json()).expect("the counters are JSON");
+    json["packets_in"]
+        .as_str()
+        .expect("u64s cross as decimal strings")
+        .parse()
+        .expect("decimal")
 }
 
 /// Two real leaf nodes with a real session between them, and the
@@ -406,6 +570,7 @@ fn real_pair() -> (RealNode, net_leaf::LeafNode) {
             node: Rc::new(RefCell::new(leader)),
             peer: peer_id,
             sent: Rc::new(Cell::new(0)),
+            wire: Rc::new(RefCell::new(Vec::new())),
             failed: Rc::new(Cell::new(0)),
             barrier: Rc::new(RefCell::new(None)),
             dispatched: Rc::new(Cell::new(0)),
@@ -1111,6 +1276,165 @@ async fn standing_down_fences_then_retires_the_node_then_releases_the_lock() {
     settle().await;
 }
 
+/// An explicitly retired leader goes quiet **at its peer**, while the
+/// tab that owned it stays alive and answers for itself.
+///
+/// The strengthened schedule, and the four things the witness above
+/// does not discriminate:
+///
+/// 1. **The old owner stays alive.** Nothing here drops the
+///    predecessor `Lifecycle`. A browser handoff that destroys the
+///    page cannot tell "retirement stopped the old node" from "the
+///    process that owned it died", and explicit `close()` is exactly
+///    the case where the owner is still there.
+/// 2. **The failure is named exactly.** Not "some typed error": the
+///    `LeaderLost` variant *and* the generation that owned the call,
+///    because a predicate that accepts any kind would pass on a
+///    stand-down that reported the node's own text and lost the
+///    generation.
+/// 3. **The parked work is released after recovery**, with the
+///    successor already installed — the interleaving where a
+///    cancelled operation would be running beside a live successor.
+/// 4. **The count is the peer's.** "It sent nothing more" is read off
+///    the real peer node's authenticated ingress after recovery, not
+///    off the sender's own `take_outbound`: a sender-side counter
+///    cannot distinguish "produced nothing" from "produced something
+///    nobody charged".
+#[wasm_bindgen_test]
+async fn an_explicitly_retired_leader_goes_quiet_at_its_peer_while_its_page_stays_alive() {
+    let db = unique("quiet-db");
+    let scope = unique("quiet-scope");
+    let (handles, mut peer) = real_pair();
+
+    let (release, parked) = oneshot::channel();
+    *handles.barrier.borrow_mut() = Some(parked);
+
+    let leader = Lifecycle::open(opts(&db, &scope, &[], &[]), real_factory(handles.clone()))
+        .await
+        .expect("leader");
+    settle().await;
+    assert_eq!(leader.role(), Role::Leader);
+    assert_eq!(leader.generation(), 1);
+
+    // Real production work: a call in the node's real call table, and
+    // an operation admitted under generation 1 and parked before it
+    // touches the node at all.
+    let call = in_flight(
+        &leader,
+        LeaderRequest::Call {
+            service: "held".into(),
+            payload: Bytes::from_static(b"body"),
+            timeout_ms: None,
+        },
+    );
+    let publish = in_flight(
+        &leader,
+        LeaderRequest::Publish {
+            channel: "late".into(),
+            payload: Bytes::from_static(b"never"),
+        },
+    );
+    settle().await;
+    assert!(call.borrow().is_empty());
+    assert!(publish.borrow().is_empty());
+    assert_eq!(handles.dispatched.get(), 0);
+
+    // The call's packet really reaches the peer, which authenticates
+    // it. This is the baseline the silence is measured against: an
+    // assertion that nothing arrives is worth nothing unless
+    // something does first.
+    let delivered = deliver_to_peer(&handles, &mut peer);
+    assert!(
+        delivered > 0,
+        "the pending call must have put an authenticated packet on the peer"
+    );
+    let executed_before = peer_packets_in(&peer);
+    assert_eq!(executed_before, delivered as u64);
+
+    // Explicit retirement. The page — and this `Lifecycle` — stay.
+    leader.close();
+    settle().await;
+
+    assert_eq!(
+        call.borrow().len(),
+        1,
+        "the caller must be settled exactly once: {:?}",
+        call.borrow()
+    );
+    assert_eq!(
+        call.borrow()[0]
+            .clone()
+            .expect_err("a call the retired node owned must fail")
+            .typed(),
+        Some(&LeafError::Rpc(RpcError::LeaderLost { generation: 1 })),
+        "the exact typed failure and the exact generation, not merely some kind"
+    );
+    assert!(
+        !handles.node.borrow().has_session(handles.peer),
+        "retirement must close the node's session"
+    );
+
+    // Recovery: a successor is installed and leading.
+    let successor_log = Rc::new(RefCell::new(Log::default()));
+    let successor = Lifecycle::open(
+        opts(&db, &scope, &[], &[]),
+        factory(0x2222, successor_log.clone(), false),
+    )
+    .await
+    .expect("successor");
+    settle().await;
+    assert_eq!(successor.role(), Role::Leader);
+    assert_eq!(successor.generation(), 2);
+
+    // Only now is the delayed work released.
+    let _ = release.send(());
+    settle().await;
+    settle().await;
+
+    assert_eq!(
+        handles.dispatched.get(),
+        0,
+        "an operation admitted by the retired generation must be cancelled, not run"
+    );
+    assert_eq!(
+        deliver_to_peer(&handles, &mut peer),
+        0,
+        "and the retired node must have produced no further packet at all"
+    );
+    assert_eq!(
+        peer_packets_in(&peer),
+        executed_before,
+        "the peer's own execution count must not move after the predecessor was \
+         retired: this is the silence, observed where it matters"
+    );
+    assert_eq!(
+        publish.borrow()[0]
+            .clone()
+            .expect_err("a cancelled operation cannot succeed")
+            .typed(),
+        Some(&LeafError::Rpc(RpcError::LeaderLost { generation: 1 }))
+    );
+
+    // The predecessor is still here, and says so: a retired owner
+    // refuses rather than disappears.
+    assert_eq!(
+        leader
+            .request(LeaderRequest::Counters)
+            .await
+            .expect_err("a closed session refuses")
+            .typed(),
+        Some(&LeafError::Session("the session is closed".into())),
+    );
+    assert_eq!(
+        leader.generation(),
+        1,
+        "and it still names its own generation"
+    );
+
+    successor.close();
+    settle().await;
+}
+
 /// The storage fence has an outbound caller: a leader revalidates its
 /// generation and stands down when the store has moved.
 ///
@@ -1144,23 +1468,7 @@ async fn a_leader_revalidates_its_generation_against_the_store_and_stands_down()
     );
 
     let mut seen = Vec::new();
-    let recorder = {
-        let events = Rc::new(RefCell::new(Vec::new()));
-        let writing = events.clone();
-        let callback = Closure::wrap(Box::new(move |json: JsValue| {
-            if let Some(text) = json.as_string() {
-                writing.borrow_mut().push(text);
-            }
-        }) as Box<dyn FnMut(JsValue)>);
-        leader.on_event(
-            callback
-                .as_ref()
-                .unchecked_ref::<js_sys::Function>()
-                .clone(),
-        );
-        callback.forget();
-        events
-    };
+    let recorder = record_events(&leader);
 
     // One revalidation interval, plus slack for the transaction.
     wait_ms(1_600).await;
@@ -1352,6 +1660,210 @@ async fn closing_a_tab_during_its_promotion_never_publishes_a_lock_holding_leade
     settle().await;
 }
 
+/// Closing a tab whose promotion is still parked **cancels** that
+/// bootstrap and frees the origin's lock, without waiting for the
+/// factory.
+///
+/// The difference from the test above is the whole of L1. That one
+/// releases the barrier and *then* asks whether a third tab can have
+/// the lock, so it establishes the post-await publication refusal:
+/// the bootstrap completed, and its result was discarded. It says
+/// nothing about a bootstrap that has not completed — and a real one
+/// is a `connect()`: an attach, an offer, a trickle, a Noise
+/// handshake, an enrollment. The granted lock lived in
+/// `take_leadership`'s own suspended stack, so `close()` found no
+/// server to retire, no lease to revoke and no lock to release, and
+/// could not cancel the factory either. The origin's only lock
+/// therefore stayed held until that connect finished on its own,
+/// while the work it was doing went on for a session the page had
+/// already closed.
+///
+/// So here the barrier is **never** released before the successor is
+/// required to be leading, and the factory future itself reports
+/// whether it was dropped while parked — which is the one thing a
+/// late completion cannot look like.
+#[wasm_bindgen_test]
+async fn closing_a_promoting_tab_cancels_its_parked_bootstrap_and_frees_the_lock() {
+    let db = unique("cancel-db");
+    let scope = unique("cancel-scope");
+    let log = Rc::new(RefCell::new(Log::default()));
+    let marks = Rc::new(BootstrapMarks::default());
+    let (release, parked) = oneshot::channel();
+
+    let first = Lifecycle::open(
+        opts(&db, &scope, &[], &[]),
+        factory(0x1111, Rc::new(RefCell::new(Log::default())), false),
+    )
+    .await
+    .expect("first leader");
+    settle().await;
+
+    let second = Lifecycle::open(
+        opts(&db, &scope, &[], &[]),
+        observed_factory(0x2222, log.clone(), 0, parked, marks.clone()),
+    )
+    .await
+    .expect("second tab");
+    settle().await;
+    assert_eq!(second.role(), Role::Follower);
+
+    first.close();
+    settle().await;
+    assert_eq!(
+        marks.entered.get(),
+        1,
+        "the promotion must really have reached the factory and parked there"
+    );
+    assert_eq!(marks.resumed.get(), 0);
+    assert_eq!(marks.abandoned.get(), 0, "and must not be cancelled yet");
+
+    // The page closes the tab while that bootstrap is still parked.
+    second.close();
+    settle().await;
+
+    assert_eq!(
+        marks.abandoned.get(),
+        1,
+        "close must cancel the bootstrap, not wait for it: the factory future \
+         has to be dropped while parked"
+    );
+    assert_eq!(
+        marks.resumed.get(),
+        0,
+        "a cancelled bootstrap must not go on to build a backend"
+    );
+
+    // And the lock is free *now*, with the barrier still parked —
+    // which is what a queued successor is entitled to.
+    let third = Lifecycle::open(
+        opts(&db, &scope, &["third-chan"], &[]),
+        factory(0x3333, Rc::new(RefCell::new(Log::default())), false),
+    )
+    .await
+    .expect("third tab");
+    settle().await;
+    assert_eq!(
+        third.role(),
+        Role::Leader,
+        "the cancelled bootstrap must have released the origin's lock before its \
+         factory finished, or no successor can ever take over from a parked connect"
+    );
+    assert_eq!(third.generation(), 3);
+
+    // Releasing the barrier afterwards changes nothing: there is no
+    // future left to resume.
+    let _ = release.send(());
+    settle().await;
+    settle().await;
+    assert_eq!(marks.resumed.get(), 0);
+    assert_eq!(second.role(), Role::Follower);
+    assert!(
+        log.borrow().performed.is_empty(),
+        "the cancelled tab must perform nothing, ever: {:?}",
+        log.borrow().performed
+    );
+
+    third.close();
+    settle().await;
+}
+
+/// A promotion whose **generation transaction** fails re-attaches and
+/// queues again, exactly as a failed backend does.
+///
+/// R13 stopped reporting an uncommitted write as a success, which is
+/// the repair this schedule needs in order to exist at all: the
+/// abort now arrives as a typed failure. But it arrived above the
+/// recovery path — `next_generation().await?` propagated straight
+/// out of `take_leadership`, past the reattach-and-requeue the
+/// backend branch had — so `await_promotion` logged it and returned.
+/// The sole surviving tab was then holding the origin's lock with no
+/// node, no client and no acquisition in flight: stranded by the
+/// very honesty that was added to help it.
+///
+/// The break is a real storage failure, not an injected one: a
+/// database at the vault's own version whose generation store is
+/// missing — what a build with one store, or an upgrade interrupted
+/// between two `createObjectStore` calls, leaves behind. The vault
+/// opens it without an upgrade, the identity loads, and
+/// `next_generation` is the operation that cannot run. The two tabs
+/// are given different databases and the **same** lock scope, which
+/// is how one tab can have a working store while the other does not.
+#[wasm_bindgen_test]
+async fn a_promotion_whose_generation_transaction_fails_requeues_instead_of_stranding_the_tab() {
+    let scope = unique("gen-fail-scope");
+    let healthy = unique("gen-fail-db");
+    let broken = unique("gen-fail-broken-db");
+    create_db_without_the_generation_store(&broken).await;
+
+    let first = Lifecycle::open(
+        opts(&healthy, &scope, &[], &[]),
+        factory(0x1111, Rc::new(RefCell::new(Log::default())), false),
+    )
+    .await
+    .expect("first leader");
+    settle().await;
+    assert_eq!(first.role(), Role::Leader);
+
+    let second = Lifecycle::open(
+        opts(&broken, &scope, &["second-chan"], &[]),
+        factory(0x2222, Rc::new(RefCell::new(Log::default())), false),
+    )
+    .await
+    .expect("second tab");
+    settle().await;
+    assert_eq!(second.role(), Role::Follower);
+    let events = record_events(&second);
+
+    first.close();
+    settle().await;
+
+    assert_eq!(
+        second.role(),
+        Role::Follower,
+        "a tab whose generation could not be allocated is not the leader"
+    );
+    let seen: Vec<String> = events.borrow().clone();
+    assert!(
+        seen.iter()
+            .any(|json| json.contains("\"promotion_failed\"")
+                && json.contains("\"generation\":\"0\"")),
+        "the failure must be surfaced to the page, naming generation zero because \
+         none was allocated — the counter starts at one: {seen:?}"
+    );
+
+    // A *functioning* follower, which is the whole point: the origin
+    // now has no node, and the next tab to bring one up must find
+    // this tab's declarations waiting for it.
+    let third_log = Rc::new(RefCell::new(Log::default()));
+    let third = Lifecycle::open(
+        opts(&healthy, &scope, &[], &[]),
+        factory(0x3333, third_log.clone(), false),
+    )
+    .await
+    .expect("third tab");
+    settle().await;
+    settle().await;
+    assert_eq!(
+        third.role(),
+        Role::Leader,
+        "the failed promotion must have given the lock back"
+    );
+    assert!(
+        third_log.borrow().performed.iter().any(|request| matches!(
+            request,
+            LeaderRequest::Subscribe { channel } if channel == "second-chan"
+        )),
+        "the failed tab must have re-attached and re-declared: {:?}",
+        third_log.borrow().performed
+    );
+
+    // Closed first, so its requeued acquisition stops retrying
+    // against a store that will never work.
+    second.close();
+    third.close();
+    settle().await;
+}
+
 /// A promotion whose backend fails leaves a functioning follower, and
 /// the next tab in the lock queue becomes the leader it re-attaches
 /// to.
@@ -1397,22 +1909,7 @@ async fn a_promotion_whose_backend_fails_reattaches_instead_of_stranding_the_tab
     assert_eq!(second.role(), Role::Follower);
     assert_eq!(third.role(), Role::Follower);
 
-    let events = Rc::new(RefCell::new(Vec::new()));
-    {
-        let writing = events.clone();
-        let callback = Closure::wrap(Box::new(move |json: JsValue| {
-            if let Some(text) = json.as_string() {
-                writing.borrow_mut().push(text);
-            }
-        }) as Box<dyn FnMut(JsValue)>);
-        second.on_event(
-            callback
-                .as_ref()
-                .unchecked_ref::<js_sys::Function>()
-                .clone(),
-        );
-        callback.forget();
-    }
+    let events = record_events(&second);
 
     first.close();
     settle().await;
@@ -1652,6 +2149,124 @@ async fn a_runtime_announcement_is_restored_by_the_promoted_tab() {
     settle().await;
 }
 
+/// A leader's own `announce()` publishes the origin's union, not just
+/// its own list — so it cannot withdraw a live follower's capability.
+///
+/// `Lifecycle::announce` published its argument verbatim and recorded
+/// it as everything this tab had announced. Reconciliation had
+/// already published A∪B, so a leader with intent A beside a
+/// follower with intent B that called `announce(C)` replaced A∪B with
+/// C: the follower's tag vanished from the network document
+/// indefinitely, because nothing schedules reconciliation for a
+/// leader-local request and B has no reason to say anything again.
+/// A querying peer then picks a node that no longer offers what it
+/// asked for.
+///
+/// The assertion is on the **last** announcement performed, not on
+/// the presence of one somewhere in the log: an earlier correct union
+/// followed by a narrower replacement is exactly the defect.
+#[wasm_bindgen_test]
+async fn a_leaders_own_announcement_keeps_its_followers_capabilities() {
+    let db = unique("union-db");
+    let scope = unique("union-scope");
+    let leader_log = Rc::new(RefCell::new(Log::default()));
+
+    let leader = Lifecycle::open(
+        opts(&db, &scope, &[], &["cap:leader"]),
+        factory(0x1111, leader_log.clone(), false),
+    )
+    .await
+    .expect("leader");
+    settle().await;
+    let follower = Lifecycle::open(
+        opts(&db, &scope, &[], &["cap:follower"]),
+        factory(0x2222, Rc::new(RefCell::new(Log::default())), false),
+    )
+    .await
+    .expect("follower");
+    settle().await;
+    settle().await;
+
+    assert_eq!(
+        last_announcement(&leader_log),
+        Some(vec!["cap:follower".to_string(), "cap:leader".to_string()]),
+        "the premise: reconciliation has already published the union"
+    );
+
+    // The page on the leading tab changes its own intent.
+    leader
+        .announce(vec!["cap:leader-2".to_string()])
+        .await
+        .expect("the leader's own announcement");
+    settle().await;
+
+    assert_eq!(
+        last_announcement(&leader_log),
+        Some(vec!["cap:follower".to_string(), "cap:leader-2".to_string()]),
+        "a leader's announce() is its own intent, and the document is the union: \
+         the still-attached follower's tag must survive it"
+    );
+
+    follower.close();
+    leader.close();
+    settle().await;
+}
+
+/// When the last capability-declaring follower detaches, its tag is
+/// **withdrawn** rather than left published.
+///
+/// `reconcile_announcement` returned early on an empty union, so the
+/// departed tab's capability stayed in the document that was last
+/// published — forever, because every later reconciliation computed
+/// the same empty set and returned at the same line. An announced tag
+/// the origin does not offer is worse than no tag: it is what a
+/// querying peer dials before being refused.
+#[wasm_bindgen_test]
+async fn the_last_capability_declaring_followers_tag_is_withdrawn() {
+    let db = unique("withdraw-db");
+    let scope = unique("withdraw-scope");
+    let leader_log = Rc::new(RefCell::new(Log::default()));
+
+    // The leader declares nothing of its own, so the follower is the
+    // only source of a capability and the union goes to empty.
+    let leader = Lifecycle::open(
+        opts(&db, &scope, &[], &[]),
+        factory(0x1111, leader_log.clone(), false),
+    )
+    .await
+    .expect("leader");
+    settle().await;
+    let follower = Lifecycle::open(
+        opts(&db, &scope, &[], &["cap:only"]),
+        factory(0x2222, Rc::new(RefCell::new(Log::default())), false),
+    )
+    .await
+    .expect("follower");
+    settle().await;
+    settle().await;
+    assert_eq!(
+        last_announcement(&leader_log),
+        Some(vec!["cap:only".to_string()]),
+        "the premise: the follower's tag is published"
+    );
+
+    // The tab offering it goes away.
+    follower.close();
+    settle().await;
+    settle().await;
+
+    assert_eq!(
+        last_announcement(&leader_log),
+        Some(Vec::new()),
+        "the departed follower's capability must be withdrawn by an actual \
+         announcement, not merely dropped from a set nobody publishes: {:?}",
+        leader_log.borrow().performed
+    );
+
+    leader.close();
+    settle().await;
+}
+
 /// A follower's call owns its own deadline, and its expiry is an
 /// honest "the remote may have executed" — never a silent replay.
 ///
@@ -1717,6 +2332,83 @@ async fn a_follower_call_expires_on_its_own_deadline_as_an_indeterminate_outcome
         1,
         "and nothing may be re-issued: a local deadline cannot cancel a remote \
          effect, so a retry would be a second execution"
+    );
+
+    leader.close();
+    follower.close();
+    settle().await;
+}
+
+/// A follower's call with **no** timeout expires too, on the leaf's
+/// own default, with the same disposition.
+///
+/// This is the branch the explicit-timeout repair left open, and it
+/// is the one an ordinary page takes: `session.call(service, bytes)`
+/// passes `None`. The node reads `None` as
+/// [`net_leaf::rpc::DEFAULT_CALL_TIMEOUT_MS`] — but it applies that
+/// default only when it *executes* the request, so a leader frozen
+/// while holding its lock applied nothing and the caller's promise
+/// had no deadline anywhere in the system. The follower now arms the
+/// same default locally.
+///
+/// The wait is the default, and that is why this test is slow: there
+/// is no shorter honest way to observe a 30-second deadline, and
+/// asserting the number inside `Indeterminate` is what pins it to the
+/// node's own constant rather than to a value invented here.
+#[wasm_bindgen_test]
+async fn a_follower_call_without_a_timeout_expires_on_the_leafs_default_deadline() {
+    let db = unique("default-deadline-db");
+    let scope = unique("default-deadline-scope");
+    let leader_log = Rc::new(RefCell::new(Log::default()));
+
+    let leader = Lifecycle::open(
+        opts(&db, &scope, &[], &[]),
+        factory(0x1111, leader_log.clone(), true),
+    )
+    .await
+    .expect("leader");
+    settle().await;
+    let follower = Lifecycle::open(
+        opts(&db, &scope, &[], &[]),
+        factory(0x2222, Rc::new(RefCell::new(Log::default())), false),
+    )
+    .await
+    .expect("follower");
+    settle().await;
+    assert_eq!(follower.role(), Role::Follower);
+
+    let started = now_ms();
+    let failure = follower
+        .request(LeaderRequest::Call {
+            service: "never".into(),
+            payload: Bytes::new(),
+            timeout_ms: None,
+        })
+        .await
+        .expect_err("an ordinary call nobody answers must still settle");
+    let elapsed = now_ms() - started;
+
+    assert_eq!(
+        failure.typed(),
+        Some(&LeafError::Rpc(RpcError::Indeterminate {
+            deadline_ms: 30_000
+        })),
+        "the armed default must be the node's own, and the disposition the same \
+         Indeterminate an explicit deadline produces: {failure:?}"
+    );
+    assert!(
+        (30_000.0..40_000.0).contains(&elapsed),
+        "it must expire on the default, not sooner and not never; took {elapsed} ms"
+    );
+    assert_eq!(
+        leader_log
+            .borrow()
+            .performed
+            .iter()
+            .filter(|request| matches!(request, LeaderRequest::Call { .. }))
+            .count(),
+        1,
+        "and still nothing is re-issued"
     );
 
     leader.close();
@@ -1943,6 +2635,44 @@ async fn overwrite_identity_record(db_name: &str, record: &JsValue) {
     let _ = waiting.await;
     tx.set_oncomplete(None);
     drop(done);
+    database.close();
+}
+
+/// Create `db_name` at the vault's own version with the identity
+/// store only, so the generation counter's store is missing.
+///
+/// Not an injected failure: this is the state a build with one store,
+/// or an upgrade interrupted between the two `createObjectStore`
+/// calls, leaves on a real page. The vault opens it without running
+/// an upgrade — the version already matches — so the identity path
+/// works and the generation transaction is the one that cannot.
+async fn create_db_without_the_generation_store(db_name: &str) {
+    let factory = web_sys::window()
+        .expect("window")
+        .indexed_db()
+        .expect("indexedDB")
+        .expect("indexedDB is available");
+    let open = factory.open_with_u32(db_name, 1).expect("open");
+    let target = open.clone();
+    let upgrade = Closure::once(Box::new(move |_e: web_sys::Event| {
+        let database: web_sys::IdbDatabase = target
+            .result()
+            .expect("result")
+            .dyn_into()
+            .expect("a database");
+        database
+            .create_object_store("identity")
+            .expect("the identity store, and deliberately not the leader one");
+    }) as Box<dyn FnOnce(web_sys::Event)>);
+    open.set_onupgradeneeded(Some(upgrade.as_ref().unchecked_ref()));
+    await_request(&open).await;
+    open.set_onupgradeneeded(None);
+    drop(upgrade);
+    let database: web_sys::IdbDatabase = open
+        .result()
+        .expect("result")
+        .dyn_into()
+        .expect("a database");
     database.close();
 }
 

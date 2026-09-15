@@ -171,10 +171,9 @@ distinction plus `node.isEnrolled()` is how a page tells "my invite was
 already redeemed" from "the anchor is slow" from "the anchor is
 broken", all of which otherwise look like a call that never returned.
 
-**A fourth `rpc-timeout` a page should know about: a frozen leader.**
-On a session a call can also time out because the tab running the node
-was frozen by the browser. Two facts, and only one of them is a
-measurement:
+**A frozen leader, and why it is `rpc-indeterminate`.** On a session a
+call can also fail because the tab running the node was frozen by the
+browser. Two facts, and only one of them is a measurement:
 
 - **Measured** (Chromium 152, two real tabs driven over CDP): a frozen
   tab **keeps** its Web Lock. So no successor is elected while it
@@ -191,18 +190,31 @@ measurement:
   either. A live-but-provisional leader still answers an attach with a
   `leadership` message; a frozen one answers nothing.
 
-So the signal is: `rpc-timeout` **and** `role() === 'follower'` **and**
-an unchanged `generation()` **and** no reply to anything, including the
-control chatter. Fencing is unaffected — the generation, not lock loss,
-is what fences a resumed tab — but liveness is: the window is bounded
-by the mesh's own failure detection, not by the lock.
+The follower arms its **own** deadline over the proxy round trip — the
+caller's `timeoutMs` when one was given, the leaf's 30 s default when
+it was not, plus a 250 ms grace for a reply already on the channel —
+and what that deadline produces is `rpc-indeterminate`, not
+`rpc-timeout`. The distinction is the whole disposition: a deadline on
+*this* tab cannot cancel work that may already have been admitted on
+another, so the honest answer is "the remote may have executed this",
+which is what `rpc-indeterminate` means. A `rpc-timeout` from a
+session is the node's own deadline, reported by a leader that was
+running.
 
-**Do not retry on this timeout.** On resume the backlog flushes and the
-frozen tab is still the legitimate leader holding a valid generation —
-no successor was elected, which is exactly the liveness gap — so those
-calls may be answered *late*, after the caller's deadline already threw
-`rpc-timeout`. A page that retries can therefore cause the effect
-twice. Surface it, or wait; do not re-issue.
+So the signal is: `rpc-indeterminate` **and** `role() === 'follower'`
+**and** an unchanged `generation()` **and** no reply to anything,
+including the control chatter. Fencing is unaffected — the generation,
+not lock loss, is what fences a resumed tab — but liveness is: the
+window is bounded by this deadline, and the *work* is bounded only by
+the mesh's own failure detection.
+
+**Do not retry on it.** On resume the backlog flushes and the frozen
+tab is still the legitimate leader holding a valid generation — no
+successor was elected, which is exactly the liveness gap — so those
+calls may be executed *late*, after the caller already saw
+`rpc-indeterminate`. A page that retries can therefore cause the
+effect twice. Neither the follower's timer nor this package re-issues
+anything: surface it, or wait.
 
 This package deliberately does **not** paper over it with a
 wrapper-level failure detector. Timing a leader out and forcing an

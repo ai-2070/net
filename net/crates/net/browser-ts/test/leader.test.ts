@@ -243,6 +243,72 @@ describe('MeshSession', () => {
     expect(await waiting).toEqual({ value: undefined, done: true });
     expect(fake.streams[0]?.closed).toBe(true);
   });
+
+  it('ends a waiting stream iterator when the leader vanished without announcing it', async () => {
+    // The abrupt schedule, and the one the old code could not see: a
+    // leader page that crashes or navigates away never sends its
+    // `leader_lost`. A promoted follower reports `leader_changed`,
+    // and so does every other surviving follower when the
+    // successor's Leadership arrives. Rust then correctly suppresses
+    // the old stream's bytes by its opening generation — which is
+    // exactly what left this consumer pending forever.
+    const { session, fake } = await opened({ generation: '1' });
+    const stream = await session.openStream({ reliability: 'reliable', label: 'app' });
+    const waiting = stream[Symbol.asyncIterator]().next();
+
+    fake.handoff('2');
+
+    expect(await waiting).toEqual({ value: undefined, done: true });
+    expect(fake.streams[0]?.closed).toBe(true);
+    expect(session.generation()).toBe('2');
+  });
+
+  it('keeps a new generation’s streams when its own notification repeats', async () => {
+    // The other half of ending on a transition: the notification is
+    // not the transition. A duplicate `leader_changed` for the
+    // generation already in force — a second surviving follower
+    // rebroadcasting, a replayed Leadership — must not kill the
+    // streams that generation just opened.
+    const { session, fake } = await opened({ generation: '1' });
+    fake.handoff('2');
+    const stream = await session.openStream({ reliability: 'reliable', label: 'app' });
+    const waiting = stream[Symbol.asyncIterator]().next();
+
+    fake.emit('{"type":"leader_changed","generation":"2"}');
+
+    const settled = await Promise.race([
+      waiting.then(() => 'ended' as const),
+      Promise.resolve('pending' as const),
+    ]);
+    expect(settled).toBe('pending');
+    expect(fake.streams[0]?.closed).toBe(false);
+
+    // And it is a live stream, not merely an unended one.
+    await stream.send(new Uint8Array([1]));
+    expect(fake.streams[0]?.sent).toEqual([new Uint8Array([1])]);
+  });
+
+  it('ends an openStream result that crossed the leadership change', async () => {
+    // On a follower an open is a proxy round trip, so its result can
+    // arrive after the notification that already drained the
+    // retained set — and the handle it carries was stamped by Rust
+    // with the generation the request was *issued* under, so it is
+    // stale on arrival. Registering it would put a permanently
+    // silent stream into a set nothing will drain again.
+    const { session, fake } = await opened({ role: 'follower', generation: '1' });
+    const release = fake.parkNextOpen();
+    const opening = session.openStream({ reliability: 'reliable', label: 'app' });
+
+    fake.handoff('2');
+    release();
+    const stream = await opening;
+
+    expect(fake.streams[0]?.closed).toBe(true);
+    expect(await stream[Symbol.asyncIterator]().next()).toEqual({
+      value: undefined,
+      done: true,
+    });
+  });
 });
 
 describe('the lifecycle events', () => {
