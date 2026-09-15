@@ -200,6 +200,7 @@ try:
         NetStream,
         NetStreamStats,
         NotConnectedError,
+        SessionSupersededError,
         generate_net_keypair,
     )
 except ImportError:
@@ -218,6 +219,7 @@ else:
             "NetStream",
             "NetStreamStats",
             "NotConnectedError",
+            "SessionSupersededError",
             "generate_net_keypair",
         ]
     )
