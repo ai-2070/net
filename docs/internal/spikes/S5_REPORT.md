@@ -673,13 +673,26 @@ recurs.
 
 ### 11.7 Residues named rather than silently carried
 
-- **`wasm_anchorless.rs:647`** and its fixture RefCell panic at
-  `:253` are NOT closed. The panic is the FIXTURE's own RefCell
-  (`Leaf::node`), not `wasm::Inner`, so L6 cannot address it: the
-  fixture holds `self.node.borrow_mut()` across `self.transport.
-  send(...)` in the responder arm and re-borrows within one pump.
-  Whoever takes it should look for a nested pump, not assume it is
-  the production re-entry finding.
+- **`wasm_anchorless.rs:647`** and its RefCell panic at `:253` are
+  now CLOSED, and neither was what either of us guessed. Production
+  is unchanged; both were harness defects. The single
+  `duplicate_sequence` drop was traced to the exact packet — event
+  plane, stream "pingpong", sequence 0, arriving at `next_expected`
+  1, i.e. B's retransmit of the pong landing beside the original —
+  because the fixture's inbound sink only QUEUED and delivered on
+  the next 50 ms tick while `DEFAULT_RTO` is also 50 ms, so every
+  reliable packet was retransmitted once. `wasm.rs` documents that
+  arithmetic and delivers on arrival for precisely this reason: the
+  fixture had invented a slower wire than the one that ships, and
+  the drop, its reason and its accounting were all correct. The
+  RefCell panic was a cascade: `assert_eq!(a.node.borrow()…)` keeps
+  the guard alive as a statement temporary, a wasm-bindgen panic is
+  `panic=abort` and runs no destructor, so the borrow count was
+  never decremented and the earlier test's unbounded ticker then hit
+  `borrow_mut()` on a permanently-read cell — charging one failure
+  to a second test. The drops assertion was STRENGTHENED to cover
+  both ends of the session, which is how a second retransmit cause
+  had stayed invisible.
 - **Event-plane batch senders** (`send_to_peer_node` / `send_routed`,
   subprotocol 0) put bytes on the wire without a debit. That
   asymmetry predates Stage 5 and was not raised; charging it would

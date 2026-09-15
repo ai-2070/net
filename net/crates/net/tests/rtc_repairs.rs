@@ -1978,13 +1978,49 @@ async fn udp_pair() -> (Arc<MeshNode>, Arc<MeshNode>) {
 /// `subscribe_channel` — addresses its frame to
 /// `stream_id == subprotocol_id`, so a reliable stream opened at
 /// that id shares one sequence space with it. The link is loss-free,
-/// so every retransmit counted here is a retransmit of a packet the
-/// receiver already has.
+/// so the receiver owes an ack for every one of those sequences —
+/// the control frame's included — and A's retransmit window has to
+/// empty against those acks.
+///
+/// **Why the window and the ledger, not the counters.** Two
+/// zero-counter readings look like that claim and are not:
+/// `retransmit_packets_sent == 0` and `reset_packets_sent == 0` are
+/// both falsified by scheduling alone, with every ack sent and
+/// received.
+///
+/// `flush_stream_batch` awaits `deliver_stream_packet` and registers
+/// the packet for retransmit *after* that await, while the peer's
+/// grant drainer answers on a 1 ms cadence — so a starved sender can
+/// have the ack for its own last packet applied BEFORE
+/// `register_retransmit` puts that packet in the window. Measured,
+/// pinned to one core under load: `ack_seq=9` at `t=…651679`,
+/// `seq=8` registered 66 µs later at `t=…651745`, resent at
+/// `+128 ms`, then pruned by the duplicate's fresh grant. `on_ack`'s
+/// straggler sweep documents that same ordering, and one RTO-late
+/// ack does it too — `DEFAULT_RTO` starts at 50 ms and the adaptive
+/// estimate floors at `MIN_RTO` (10 ms) on a loopback link. The
+/// give-up is the same arithmetic times `DEFAULT_MAX_RETRIES`: 40 ms
+/// of ack starvation resets a stream whose every packet arrived, and
+/// the same pinned run produced that too. Neither counter is a
+/// property of a loss-free link; both are properties of the
+/// interleaving.
+///
+/// What the repair is about survives any interleaving: A's
+/// retransmit window DRAINS, and it drains by ACKNOWLEDGEMENT — the
+/// receiver reports consuming every byte A put on the stream, the
+/// control frame's among them — rather than by the give-up dropping
+/// its contents. A frame the receiver never records is a frame it
+/// never charges, so that ledger gap cannot be closed by waiting,
+/// and no scheduler can open it.
 ///
 /// Inverse: delete the `account_inbound_stream_packet` call above
 /// the subprotocol branches in `process_local_packet`. B stops
-/// recording the membership frame's sequence, A's window stalls on
-/// it, and both the retransmit and the reset assertions go red.
+/// recording the membership frame's sequence and stops charging its
+/// bytes, so A's cumulative ack freezes on the hole and the ledger
+/// gap stays open at exactly the control frame's wire bytes
+/// (`gap 111`), which is the assertion that goes red. A also gives
+/// up on the stream and resets it — the H-3 consequence the leaf
+/// hit, and the reason the window is empty by then rather than full.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_control_frame_shares_the_sequence_space_of_the_stream_it_rides() {
     let (a, b) = udp_pair().await;
@@ -2031,36 +2067,42 @@ async fn a_control_frame_shares_the_sequence_space_of_the_stream_it_rides() {
         seen.len()
     );
 
-    // Past the give-up horizon: DEFAULT_RTO is 50 ms and the window
-    // is retried DEFAULT_MAX_RETRIES times, so anything still
-    // unacknowledged has resent several times and then reset the
-    // stream by now. A silent sender here IS an emptied retransmit
-    // window — that is the only way for the RTO sweep to have
-    // nothing to do.
+    // Past the give-up horizon: DEFAULT_RTO starts at 50 ms and the
+    // window is retried DEFAULT_MAX_RETRIES times, so a stream that
+    // is genuinely stalled on an unrecorded sequence has resent to
+    // exhaustion and reset by now — and a ledger gap left by one is
+    // permanent either way.
     tokio::time::sleep(Duration::from_secs(1)).await;
-    let retransmits = a
-        .control_plane_stats()
-        .retransmit_packets_sent
-        .load(std::sync::atomic::Ordering::Relaxed);
-    assert_eq!(
-        retransmits, 0,
-        "on a loss-free link every packet is acknowledged, so the retransmit \
-         window drains and the RTO sweep has nothing to resend \
-         (retransmit_packets_sent = {retransmits})"
+    // The window DRAINED: nothing A sent on any stream to B is still
+    // waiting for an ack. This is what an idle RTO sweep was standing
+    // in for, minus the interleaving — and it covers the whole
+    // session, not just the shared stream.
+    let session = a.peer_session_for_test(b_id).expect("A's session to B");
+    assert!(
+        !session.has_unacked(),
+        "on a loss-free link every packet is acknowledged, so the \
+         retransmit window drains"
     );
-    let resets = a
-        .control_plane_stats()
-        .reset_packets_sent
-        .load(std::sync::atomic::Ordering::Relaxed);
+    // And it drained by ACKNOWLEDGEMENT, not by the give-up dropping
+    // its contents: the receiver reported consuming every byte A put
+    // on the shared stream, the control frame's among them. A frame
+    // whose sequence the receiver never recorded is a frame whose
+    // bytes it never charged, so this gap stays open forever —
+    // whatever the retransmit window does afterwards.
+    let ledger = a.stream_stats(b_id, SHARED).expect("stream stats");
     assert_eq!(
-        resets, 0,
-        "a stream whose every packet arrived must never be given up on \
-         (reset_packets_sent = {resets})"
+        ledger.max_consumed_seen,
+        ledger.tx_bytes_sent,
+        "the receiver must report consuming every byte sent on the \
+         shared stream, control frame included (sent {}, reported \
+         consumed {}, gap {})",
+        ledger.tx_bytes_sent,
+        ledger.max_consumed_seen,
+        ledger.tx_bytes_sent - ledger.max_consumed_seen
     );
     // And the stream is still the one it was: no close, no reopen.
-    let stats = a.stream_stats(b_id, SHARED).expect("stream stats");
     assert_eq!(
-        stats.tx_seq,
+        ledger.tx_seq,
         N as u64 + 1,
         "the membership frame and the {N} payloads share one sequence \
          counter, so the stream has issued {} sequences",
