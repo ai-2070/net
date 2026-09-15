@@ -1202,3 +1202,75 @@ nothing else running, the matrix is 26/26 exit 0 twice consecutively.
 Recorded rather than omitted: an intermittent failure under host
 contention is worth knowing about even when it is not a defect in the
 tree.
+
+### 12.7 What CI found that this workstation could not
+
+Three rounds of local checklists were green before each push, and CI
+still found four things. Each is worth naming, because the pattern is
+the interesting part: none of them was reachable from a clean,
+unloaded, single-engine Windows run.
+
+**A roster of twenty-four pins, eighteen of which named nothing.**
+The suite ran 24/24 green and the job failed anyway. A pin that names
+nothing can never be satisfied and reads exactly like a regression.
+`.github/scripts/check-roster.py` now checks every roster against its
+source BEFORE the suite runs, so the two failure modes are
+distinguishable: *pinned but absent* up front, *present but did not
+run* afterwards. Committing that script 100644 while ci.yml runs it
+by path then cost one more round — the guard against silent gate
+failure failing silently, which is at least an honest lesson.
+
+**`#[non_exhaustive]` binds crates, not workspaces.** The attribute
+was added having checked `net-mesh-wire`, forgetting that `net-mesh`,
+the SDK and both bindings are downstream of it and bind exactly like
+any external consumer. Four crates, three separate CI jobs. The
+owner's ruling — handle known cases, PROPAGATE unknown ones, and a
+wildcard is not permission to retry — is now applied at each of
+those boundaries, and neither binding maps an unknown variant onto
+something a caller would retry or reconnect on.
+
+**A healthy reliable stream reset after 200 ms of receiver silence.**
+`retries` counted retransmit ATTEMPTS rather than evidence of loss,
+and the RTO never backed off, so a browser tab starved for a second
+on a loaded runner cost its sender the stream — with every byte in
+fact delivered and acknowledged. Reproduced by blocking the tab's
+main thread for 1.2 s: `duplicate_sequence` 36, an RTO storm on
+packets that were never lost, and a `StreamReset` for a stream that
+was working. Fixed with RFC 6298 backoff and a budget spanning about
+5.15 s, and `give_up_horizon` now publishes the ladder so dependents
+stop hardcoding a constant.
+
+**The event plane decided what a payload WAS by reading its first
+byte.** `handle_event_plane` tried to decode an nRPC reply first and
+treated the bytes as application data only if that failed;
+`DISPATCH_RPC_DEADLINE_EXCEEDED` is a single `0x13` with no body, so
+any payload of 24+ bytes starting with `0x13` was consumed as a reply
+that matched no call. One message in 256 on a subscribed channel,
+swallowed with no event at all, and 4.7% of harness runs losing one
+of twelve stream payloads — the arithmetic of consecutive seeds, not
+luck. The plane is now decided by the CARRIER: a reply is honoured
+only when the route it declares hashes to the stream it arrived on,
+which turns away nothing the call table could have accepted.
+
+The last one is the one to dwell on. It was found by the ANCHOR
+LEDGER the previous round added to a failing witness — `ack_frontier=
+12 pending=false` against a consumer holding 11, with every drop
+counter zero. Without that line it is a flake; with it, it is a
+one-hypothesis diagnosis. Evidence that only prints on success tells
+you nothing you did not already believe.
+
+**And the second half of that repair matters as much as the first:**
+no post-acknowledgement discard on the event plane is silent any
+more. A record could be acknowledged on the wire and then dropped
+inside the leaf with nothing but a counter nobody polls, which is
+precisely why this survived a round of review. Both remaining
+refusals now raise a typed `Dropped` event beside their counter.
+
+One finding is reported and NOT fixed here: `unparsable` on a healthy
+session is the anchor's 72-byte discovery beacons, which the leaf has
+no discriminator for. The drop is correct — a leaf must not act on
+mesh proximity gossip — but filing well-formed frames of another
+protocol under "malformed" gives `unparsable` a rate-dependent
+baseline that would hide a real malformed-packet problem underneath
+it. It is not data loss, it is wider than this stage, and it belongs
+to whoever owns the leaf ingress discriminator.
